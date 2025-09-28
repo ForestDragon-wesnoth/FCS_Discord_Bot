@@ -153,7 +153,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # Report final position and facing for clarity
         e = m.entities[eid]
         return await ctx.send(
-            f"Moved `{eid}` {total_steps} step(s)"
+            f"Moved `{eid}` {total_steps} step(s) "
             f"to ({e.x},{e.y}); facing {e.facing}."
         )
 
