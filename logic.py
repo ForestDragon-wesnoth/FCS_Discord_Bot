@@ -163,6 +163,39 @@ class Match:
             raise Occupied(f"Cell ({x},{y}) already occupied")
         e.move_to(x, y)
 
+    # stepwise movement with facing + final-tile occupancy check
+    def move_entity_by_directions(self, entity_id: str, moves: list[tuple[str,int]]):
+        """
+        Move an entity in a sequence of direction steps (up/down/left/right).
+
+        We allow passing through other entities during the path, but the FINAL tile must be free.
+
+        #TODO: maybe add a version with collision check along the way too
+
+        Facing is updated to the direction of each step.
+        """
+        e = self.entities.get(entity_id)
+        if not e: raise NotFound("Entity not found")
+        x, y = e.x, e.y
+        for direction, count in moves:
+            direction = direction.lower()
+            dx, dy = 0, 0
+            if direction in ("up","u"): dy = -1
+            elif direction in ("down","d"): dy = 1
+            elif direction in ("left","l"): dx = -1
+            elif direction in ("right","r"): dx = 1
+            else: raise VTTError(f"Unknown direction '{direction}'")
+            for _ in range(max(1, int(count))):
+                nx, ny = x + dx, y + dy
+                if not self.in_bounds(nx, ny):
+                    raise OutOfBounds(f"({nx},{ny}) outside {self.grid_width}x{self.grid_height}")
+                e.facing = {(-1,0):"left",(1,0):"right",(0,-1):"up",(0,1):"down"}[(dx,dy)]
+                x, y = nx, ny
+        if self.is_occupied(x, y, ignore_entity_id=entity_id):
+            raise Occupied(f"Cell ({x},{y}) already occupied")
+        e.move_to(x, y)
+
+
     def damage(self, entity_id: str, amount: int):
         e = self.entities.get(entity_id)
         if not e:
