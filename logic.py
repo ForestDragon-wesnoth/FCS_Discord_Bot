@@ -40,7 +40,6 @@ class Entity:
     # Optional / defaulted fields
     max_hp: Optional[int] = None
     team: Optional[str] = None
-    ac: Optional[int] = None
     status: Set[str] = field(default_factory=set)
     initiative: Optional[int] = None
 
@@ -298,19 +297,3 @@ class MatchManager:
             data = json.load(f)
         self.matches = {mid: Match.from_dict(md) for mid, md in data.get("matches", {}).items()}
         self.active_by_channel = data.get("active_by_channel", {})
-
-#unused, now cli.py is used for local testing instead
-## For quick local testing
-#if __name__ == "__main__":
-#    mgr = MatchManager()
-#    mid = mgr.create_match("test", "Test Skirmish", 8, 6)
-#    m = mgr.get(mid)
-#    e1 = Entity(id="rogue", name="Rogue", hp=12, x=0, y=0)
-#    e2 = Entity(id="goblin1", name="Goblin", hp=7, x=1, y=0)
-#    m.add_entity(e1, 0, 0, initiative=17)
-#    m.add_entity(e2, 1, 0, initiative=12)
-#    print("Match:", m.name, m.id)
-#    print(m.render_ascii())
-#    print("Turn order:", m.turn_order)
-#    print("Current:", m.current_entity_id())
-#    m.next_turn(); print("After next:", m.current_entity_id())
