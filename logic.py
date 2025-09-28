@@ -63,13 +63,32 @@ class Entity:
     extras: Dict[str, Any] = field(default_factory=dict)  # arbitrary stats/resources
     facing: Direction = "up"  # will be set to a default by Match when adding
 
+    #connect Entity to the Match (so functions like moving an entity can still access map size data)
+
+    #back-reference (not serialized)
+    _match: "Match | None" = field(default=None, repr=False, compare=False)
+
     def __post_init__(self):
         if self.max_hp is None:
             self.max_hp = self.hp
         if self.facing not in ALLOWED_DIRECTIONS:
             self.facing = "up"
 
-    # ------------- runtime helpers -------------
+    # ---------- binding ----------
+    def bind(self, match: "Match"):
+        self._match = match
+        if match.in_bounds(self.x, self.y):
+            try:
+                self.facing = _default_facing_for(self.x, self.y, match.grid_width, match.grid_height)
+            except Exception:
+                pass
+
+    def _require_match(self) -> "Match":
+        if not self._match:
+            raise VTTError("Entity is not bound to a match")
+        return self._match
+
+    # ---------- minimal primitives ----------
     @property
     def is_alive(self) -> bool:
         return self.hp > 0
@@ -78,142 +97,137 @@ class Entity:
         self.x, self.y = x, y
 
     def take_damage(self, amount: int):
-        #health CAN go into the negatives, 
         self.hp = self.hp - max(0, amount)
-        #TODO: add a die event if hp becomes equal or below 0 (with the possible revive support)
 
     def heal(self, amount: int):
         self.hp = min(self.max_hp, self.hp + max(0, amount))
 
-    def to_dict(self) -> Dict:
+    # ---------- high-level actions (Entity-owned) ----------
+    def spawn(self, match: "Match", x: int, y: int, initiative: Optional[int] = None):
+        """
+        Add this entity to a match at (x,y).
+        Validates bounds/occupancy, sets facing, registers in turn order.
+        """
+        if self._match is not None:
+            raise VTTError(f"Entity '{self.id}' is already in a match")
+        if not match.in_bounds(x, y):
+            raise OutOfBounds(f"({x},{y}) outside {match.grid_width}x{match.grid_height}")
+        if match.is_occupied(x, y):
+            raise Occupied(f"Cell ({x},{y}) already occupied")
+
+        self.move_to(x, y)
+        self.bind(match)
+        if initiative is not None:
+            self.initiative = initiative
+
+        if self.id in match.entities:
+            raise DuplicateId(f"Entity id '{self.id}' already exists in this match")
+        match.entities[self.id] = self
+        match._rebuild_turn_order()
+        return self.id
+
+    def remove(self):
+        """
+        Remove this entity from its match and turn order.
+        """
+        m = self._require_match()
+        if self.id in m.entities:
+            del m.entities[self.id]
+        # scrub from turn order & clamp active index
+        if self.id in m.turn_order:
+            idx = m.turn_order.index(self.id)
+            m.turn_order.remove(self.id)
+            if m.active_index >= len(m.turn_order):
+                m.active_index = max(0, len(m.turn_order) - 1)
+            elif m.active_index > idx:
+                m.active_index = max(0, m.active_index - 1)
+        self._match = None
+        m._rebuild_turn_order()
+
+    # Teleport (absolute move)
+    def tp(self, x: int, y: int):
+        m = self._require_match()
+        if not m.in_bounds(x, y):
+            raise OutOfBounds(f"({x},{y}) outside {m.grid_width}x{m.grid_height}")
+        if m.is_occupied(x, y, ignore_entity_id=self.id):
+            raise Occupied(f"Cell ({x},{y}) already occupied")
+        self.move_to(x, y)
+
+    # Stepwise move (final cell must be free; rotate per step)
+    def move_dirs(self, moves: list[tuple[str, int]]):
+        m = self._require_match()
+        x, y = self.x, self.y
+        for direction, count in moves:
+            d = direction.lower()
+            dx, dy = 0, 0
+            if d in ("up", "u"): dy = -1
+            elif d in ("down", "d"): dy = 1
+            elif d in ("left", "l"): dx = -1
+            elif d in ("right", "r"): dx = 1
+            else: raise VTTError(f"Unknown direction '{direction}'")
+            for _ in range(max(1, int(count))):
+                nx, ny = x + dx, y + dy
+                if not m.in_bounds(nx, ny):
+                    raise OutOfBounds(f"({nx},{ny}) outside {m.grid_width}x{m.grid_height}")
+                self.facing = {(-1,0):"left",(1,0):"right",(0,-1):"up",(0,1):"down"}[(dx,dy)]
+                x, y = nx, ny
+        if m.is_occupied(x, y, ignore_entity_id=self.id):
+            raise Occupied(f"Cell ({x},{y}) already occupied")
+        self.move_to(x, y)
+
+    # Stats/initiative (entity-owned)
+    def damage_entity(self, amount: int):
+        was_alive = self.is_alive
+        self.take_damage(amount)
+        if was_alive and not self.is_alive:
+            self._require_match()._rebuild_turn_order()
+
+    def heal_entity(self, amount: int):
+        was_alive = self.is_alive
+        self.heal(amount)
+        if (not was_alive) and self.is_alive:
+            self._require_match()._rebuild_turn_order()
+
+    def set_initiative_entity(self, value: int):
+        self.initiative = value
+        self._require_match()._rebuild_turn_order()
+
+    # ---------- serialization ----------
+    def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
+        d.pop("_match", None)  # do not serialize backref
         d["status"] = list(self.status)
         return d
 
     @staticmethod
-    def from_dict(data: Dict) -> "Entity":
-        data = dict(data)
-        data["status"] = set(data.get("status", []))
-        return Entity(**data)
-
+    def from_dict(data: Dict[str, Any]) -> "Entity":
+        d = dict(data)
+        d["status"] = set(d.get("status", []))
+        d.pop("_match", None)
+        return Entity(**d)
 
 @dataclass
 class Match:
-    # explicit, user-provided id
+    id: str
     name: str
-    #important: coordinates start from 1, not 0
     grid_width: int
     grid_height: int
-    id: str
     entities: Dict[str, Entity] = field(default_factory=dict)
-    turn_order: List[str] = field(default_factory=list)  # list of entity ids
+    turn_order: List[str] = field(default_factory=list)
     active_index: int = 0
-    rules: Dict[str, str] = field(default_factory=dict)  # arbitrary key→value
+    rules: Dict[str, Any] = field(default_factory=dict)
 
-    # ------------- grid helpers -------------
+    # ---- global constraints / helpers (unchanged in spirit) ----
     def in_bounds(self, x: int, y: int) -> bool:
-        """
-        1-based coordinates: valid cells are
-        x in [1, grid_width], y in [1, grid_height].
-        """
         return 1 <= x <= self.grid_width and 1 <= y <= self.grid_height
 
     def is_occupied(self, x: int, y: int, ignore_entity_id: Optional[str] = None) -> bool:
-        #only alive entities can occupy a space for now
-
-        #TODO: test edge cases once I implement reviving
-
-        for e in self.entities.values():
-            if ignore_entity_id and e.id == ignore_entity_id:
+        for eid, e in self.entities.items():
+            if ignore_entity_id and eid == ignore_entity_id:
                 continue
             if e.x == x and e.y == y and e.is_alive:
                 return True
         return False
-
-    # ------------- entity management -------------
-    def add_entity(self, e: Entity, x: int, y: int, initiative: Optional[int] = None):
-        if not self.in_bounds(x, y):
-            raise OutOfBounds(f"({x},{y}) outside {self.grid_width}x{self.grid_height}")
-        if self.is_occupied(x, y):
-            raise Occupied(f"Cell ({x},{y}) already occupied")
-        if e.id in self.entities:
-            raise DuplicateId(f"Entity id '{e.id}' already exists in this match")
-        e.move_to(x, y)
-        if initiative is not None:
-            e.initiative = initiative
-        self.entities[e.id] = e
-        self._rebuild_turn_order()
-        return e.id
-
-    def remove_entity(self, entity_id: str):
-        if entity_id not in self.entities:
-            raise NotFound("Entity not found")
-        del self.entities[entity_id]
-        self._rebuild_turn_order()
-        if self.active_index >= len(self.turn_order):
-            self.active_index = 0
-
-    def move_entity(self, entity_id: str, x: int, y: int):
-        e = self.entities.get(entity_id)
-        if not e:
-            raise NotFound("Entity not found")
-        if not self.in_bounds(x, y):
-            raise OutOfBounds(f"({x},{y}) outside {self.grid_width}x{self.grid_height}")
-        if self.is_occupied(x, y, ignore_entity_id=entity_id):
-            raise Occupied(f"Cell ({x},{y}) already occupied")
-        e.move_to(x, y)
-
-    # stepwise movement with facing + final-tile occupancy check
-    def move_entity_by_directions(self, entity_id: str, moves: list[tuple[str,int]]):
-        """
-        Move an entity in a sequence of direction steps (up/down/left/right).
-
-        We allow passing through other entities during the path, but the FINAL tile must be free.
-
-        #TODO: maybe add a version with collision check along the way too
-
-        Facing is updated to the direction of each step.
-        """
-        e = self.entities.get(entity_id)
-        if not e: raise NotFound("Entity not found")
-        x, y = e.x, e.y
-        for direction, count in moves:
-            direction = direction.lower()
-            dx, dy = 0, 0
-            if direction in ("up","u"): dy = -1
-            elif direction in ("down","d"): dy = 1
-            elif direction in ("left","l"): dx = -1
-            elif direction in ("right","r"): dx = 1
-            else: raise VTTError(f"Unknown direction '{direction}'")
-            for _ in range(max(1, int(count))):
-                nx, ny = x + dx, y + dy
-                if not self.in_bounds(nx, ny):
-                    raise OutOfBounds(f"({nx},{ny}) outside {self.grid_width}x{self.grid_height}")
-                e.facing = {(-1,0):"left",(1,0):"right",(0,-1):"up",(0,1):"down"}[(dx,dy)]
-                x, y = nx, ny
-        if self.is_occupied(x, y, ignore_entity_id=entity_id):
-            raise Occupied(f"Cell ({x},{y}) already occupied")
-        e.move_to(x, y)
-
-
-    def damage(self, entity_id: str, amount: int):
-        e = self.entities.get(entity_id)
-        if not e:
-            raise NotFound("Entity not found")
-        e.take_damage(amount)
-
-    def heal(self, entity_id: str, amount: int):
-        e = self.entities.get(entity_id)
-        if not e:
-            raise NotFound("Entity not found")
-        e.heal(amount)
-
-    def set_initiative(self, entity_id: str, init_value: int):
-        e = self.entities.get(entity_id)
-        if not e:
-            raise NotFound("Entity not found")
-        e.initiative = init_value
-        self._rebuild_turn_order()
 
     # ------------- turns -------------
     def _rebuild_turn_order(self):
@@ -240,27 +254,32 @@ class Match:
         self.active_index = (self.active_index + 1) % len(self.turn_order)
         return self.current_entity_id()
 
-    def to_dict(self) -> Dict:
+    # ---- persistence ----
+    def to_dict(self) -> Dict[str, Any]:
         return {
+            "id": self.id,
             "name": self.name,
             "grid_width": self.grid_width,
             "grid_height": self.grid_height,
-            "id": self.id,
             "entities": {eid: e.to_dict() for eid, e in self.entities.items()},
-            "turn_order": list(self.turn_order),
+            "turn_order": self.turn_order,
             "active_index": self.active_index,
-            "rules": dict(self.rules),
+            "rules": self.rules,
         }
 
     @staticmethod
-    def from_dict(data: Dict) -> "Match":
+    def from_dict(data: Dict[str, Any]) -> "Match":
         m = Match(
+            id=data["id"],
             name=data["name"],
             grid_width=data["grid_width"],
             grid_height=data["grid_height"],
-            id=data["id"],
         )
-        m.entities = {eid: Entity.from_dict(ed) for eid, ed in data.get("entities", {}).items()}
+        # Recreate entities & bind to match; insert directly (trusted from save)
+        for eid, ed in data.get("entities", {}).items():
+            e = Entity.from_dict(ed)
+            e.bind(m)
+            m.entities[eid] = e
         m.turn_order = data.get("turn_order", [])
         m.active_index = data.get("active_index", 0)
         m.rules = data.get("rules", {})

@@ -84,89 +84,85 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if eid not in m.entities:
             return await ctx.send(f"Entity `{eid}` not found.")
         return await ctx.send(_entity_line(m.entities[eid]))
+    # add
     if sub == "add" and len(args) >= 6:
         eid = args[1]; name = args[2]; hp = int(args[3]); x = int(args[4]); y = int(args[5])
         init = int(args[6]) if len(args) >= 7 else None
-        eid_ret = m.add_entity(Entity(id=eid, name=name, hp=hp, x=x, y=y), x, y, initiative=init)
-        return await ctx.send(f"Added `{name}` with id `{eid_ret}` at ({x},{y}).")
-
-    # teleport (instantly move unit to specific coordinates)
+        e = Entity(id=eid, name=name, hp=hp, x=x, y=y)
+        e.spawn(m, x, y, initiative=init)
+        return await ctx.send(f"Added `{name}` with id `{eid}` at ({x},{y}).")
+    
+    # delete / remove
+    if sub in ("del", "rm", "remove") and len(args) >= 2:
+        eid = args[1]
+        if eid not in m.entities:
+            return await ctx.send(f"Entity `{eid}` not found.")
+        m.entities[eid].remove()
+        return await ctx.send(f"Removed `{eid}` from match.")
+    
+    # tp (absolute)
     if sub == "tp" and len(args) >= 4:
         eid = args[1]; x = int(args[2]); y = int(args[3])
-        m.move_entity(eid, x, y)
+        m.entities[eid].tp(x, y)
         return await ctx.send(f"Teleported `{eid}` to ({x},{y}).")
-
-    # face (make a specific entity face a specific direction)
-    if sub == "face" and len(args) >= 3:
-        eid = args[1]; dir_ = args[2].lower()
-        if dir_ not in ("up","down","left","right","u","d","l","r"):
-            return await ctx.send("Use: up/down/left/right")
-        mapping = {"u":"up","d":"down","l":"left","r":"right"}
-        dir_full = mapping.get(dir_, dir_)
-        m.entities[eid].facing = dir_full
-        return await ctx.send(f"Facing of `{eid}` set to {dir_full}.")
-
-    # move with directions
-
-    #valid syntax examples: "!ent move ruffian 3 up 2 right", "!ent move ruffian up, up, up, right, left"
-
-    # move with directions
+    
+    # move (stepwise)
     if sub == "move" and len(args) >= 3:
         eid = args[1]
         tokens = " ".join(args[2:]).replace(",", " ").split()
         if not tokens:
-            return await ctx.send(
-                "Usage: `!ent move <id> <dir[,dir...]>` or "
-                "`!ent move <id> <n> <dir> [<n> <dir> ...]`"
-            )
-
-        moves: list[tuple[str, int]] = []
+            return await ctx.send("Usage: `!ent move <id> <dir[,dir...]>` or `!ent move <id> <n> <dir> [<n> <dir> ...]`")
+    
+        moves: list[tuple[str,int]] = []
         i = 0
-        dirs = {"up", "down", "left", "right", "u", "d", "l", "r"}
+        dirs = {"up","down","left","right","u","d","l","r"}
         while i < len(tokens):
             t = tokens[i].lower()
             if t in dirs:
                 moves.append((t, 1)); i += 1
             else:
-                try:
-                    n = int(t)
+                try: n = int(t)
                 except ValueError:
-                    return await ctx.send(
-                        f"Unexpected token '{t}'. Use directions (up/down/left/right) "
-                        "optionally preceded by counts."
-                    )
-                if i + 1 >= len(tokens):
-                    return await ctx.send("Count must be followed by a direction.")
-                d = tokens[i + 1].lower()
-                if d not in dirs:
-                    return await ctx.send(f"'{d}' is not a direction.")
+                    return await ctx.send(f"Unexpected token '{t}'.")
+                if i + 1 >= len(tokens): return await ctx.send("Count must be followed by a direction.")
+                d = tokens[i+1].lower()
+                if d not in dirs: return await ctx.send(f"'{d}' is not a direction.")
                 moves.append((d, n)); i += 2
-
-        # Compute total step count (so '3 up' = 3 steps, not 1)
+    
         total_steps = sum(max(1, int(n)) for _, n in moves)
-
         try:
-            m.move_entity_by_directions(eid, moves)
+            m.entities[eid].move_dirs(moves)
         except VTTError as e:
             return await ctx.send(f"❌ {e}")
-
-        # Report final position and facing for clarity
         e = m.entities[eid]
-        return await ctx.send(
-            f"Moved `{eid}` {total_steps} step(s) "
-            f"to ({e.x},{e.y}); facing {e.facing}."
-        )
-
-
-    #TODO: DEPRECATE THE "hp" command in favor of clearer "set_hp", "damage", "heal" etc.
+        return await ctx.send(f"Moved `{eid}` {total_steps} step(s) to ({e.x},{e.y}); facing {e.facing}.")
+    
+    # face
+    if sub == "face" and len(args) >= 3:
+        eid = args[1]; dir_ = args[2].lower()
+        mapping = {"u":"up","d":"down","l":"left","r":"right"}
+        dir_full = mapping.get(dir_, dir_)
+        if dir_full not in ("up","down","left","right"):
+            return await ctx.send("Use: up/down/left/right")
+        m.entities[eid].facing = dir_full
+        return await ctx.send(f"Facing of `{eid}` set to {dir_full}.")
+    
+    # hp
     if sub == "hp" and len(args) >= 3:
         eid = args[1]; delta = int(args[2])
-        if delta >= 0: m.heal(eid, delta); msg = f"Healed `{eid}` by {delta}."
-        else: m.damage(eid, -delta); msg = f"Damaged `{eid}` by {-delta}."
-        return await ctx.send(msg)
+        if delta >= 0:
+            m.entities[eid].heal_entity(delta)
+            return await ctx.send(f"Healed `{eid}` by {delta}.")
+        else:
+            m.entities[eid].damage_entity(-delta)
+            return await ctx.send(f"Damaged `{eid}` by {-delta}.")
+    
+    # init
     if sub == "init" and len(args) >= 3:
-        eid = args[1]; value = int(args[2]); m.set_initiative(eid, value)
+        eid = args[1]; value = int(args[2])
+        m.entities[eid].set_initiative_entity(value)
         return await ctx.send(f"Set initiative of `{eid}` to {value}.")
+
     return await ctx.send(
         "Usage: "
         "`!ent info <id>` | "
