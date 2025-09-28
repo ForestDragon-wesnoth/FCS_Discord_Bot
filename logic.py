@@ -289,11 +289,25 @@ class MatchManager:
             "matches": {mid: m.to_dict() for mid, m in self.matches.items()},
             "active_by_channel": dict(self.active_by_channel),
         }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except (OSError, TypeError) as e:
+            # OSError: permission / dir missing; TypeError: unserializable data (shouldn't happen)
+            raise VTTError(f"Failed to save to '{path}': {e}")
+    
     def load(self, path: str):
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        self.matches = {mid: Match.from_dict(md) for mid, md in data.get("matches", {}).items()}
-        self.active_by_channel = data.get("active_by_channel", {})
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            raise VTTError(f"File not found: '{path}'")
+        except (OSError, json.JSONDecodeError) as e:
+            raise VTTError(f"Failed to load from '{path}': {e}")
+        try:
+            self.matches = {mid: Match.from_dict(md) for mid, md in data.get("matches", {}).items()}
+            self.active_by_channel = data.get("active_by_channel", {})
+        except Exception as e:
+            # Defensive: any schema mismatch should be surfaced as a friendly VTTError
+            raise VTTError(f"Invalid save file format in '{path}': {e}")
+    

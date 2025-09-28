@@ -17,14 +17,6 @@ def parse(line: str):
     except ValueError as e:
         # Catch unclosed quotes or other shlex errors
         raise RuntimeError(f"Parse error: {e}")
-import shlex
-
-def parse(line: str):
-    try:
-        return shlex.split(line)
-    except ValueError as e:
-        # e.g., No closing quotation
-        raise RuntimeError(f"Parse error: {e}")
 
 async def main():
     mgr = MatchManager()

@@ -74,9 +74,8 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 @registry.command("ent")
 async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
-        m = active_match(mgr, ctx)
-        lines = [f"`{e.id[:8]}` **{e.name}** HP:{e.hp}/{e.max_hp} at ({e.x},{e.y}) init:{e.initiative}" for e in m.entities.values()]
-        return await ctx.send("Entities:\n" + ("\n".join(lines) or "(none)"))
+        # if !end has no arguments, then mirror the "!list" command: show entities in turn order (active first) with the same format.
+        return await list_cmd(ctx, [], mgr)
     sub = args[0]
     m = active_match(mgr, ctx)
     # --- info (single entity line) ---
