@@ -18,7 +18,7 @@ def parse(line: str) -> List[str]:
 async def main():
     mgr = MatchManager()
     ctx = CLICtx()
-    print("VTT CLI. Type commands like: !match new Test 10 8 | !match use <id> | !ent add Rogue 12 0 0 17 | !turn next | !state")
+    print("VTT CLI. Type commands like: !match new id_test Test 10 8 | !match use <id> | !ent add rogueid Rogue 12 0 0 17 | !turn next | !state")
     while True:
         try:
             line = input("> ").strip()

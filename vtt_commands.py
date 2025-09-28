@@ -2,7 +2,7 @@
 # vtt_commands.py
 from __future__ import annotations
 from typing import Callable, Dict, List, Optional, Protocol, Any
-from logic import MatchManager, Entity, VTTError, OutOfBounds, Occupied, NotFound
+from logic import MatchManager, Entity, VTTError, OutOfBounds, Occupied, NotFound, DuplicateId
 
 # ---- Context abstraction -----------------------------------------------------
 class ReplyContext(Protocol):
@@ -52,9 +52,9 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         lines = [f"**{name}** — `{mid}`" for mid, name in pairs]
         return await ctx.send("Matches:\n" + "\n".join(lines))
     sub = args[0]
-    if sub == "new" and len(args) >= 4:
-        name = args[1]; w = int(args[2]); h = int(args[3])
-        mid = mgr.create_match(name, w, h)
+    if sub == "new" and len(args) >= 5:
+        match_id = args[1]; name = args[2]; w = int(args[3]); h = int(args[4])
+        mid = mgr.create_match(match_id, name, w, h)
         return await ctx.send(f"Created **{name}** with id `{mid}`.")
     if sub == "use" and len(args) >= 2:
         mid = args[1]
@@ -63,7 +63,7 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "delete" and len(args) >= 2:
         mgr.delete_match(args[1])
         return await ctx.send(f"Deleted `{args[1]}`.")
-    return await ctx.send("Usage: `!match new <name> <w> <h>` | `!match use <id>` | `!match delete <id>`")
+    return await ctx.send("Usage: `!match new <id> <name> <w> <h>` | `!match use <id>` | `!match delete <id>`")
 
 @registry.command("ent")
 async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -73,11 +73,11 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send("Entities:\n" + ("\n".join(lines) or "(none)"))
     sub = args[0]
     m = active_match(mgr, ctx)
-    if sub == "add" and len(args) >= 5:
-        name = args[1]; hp = int(args[2]); x = int(args[3]); y = int(args[4])
-        init = int(args[5]) if len(args) >= 6 else None
-        eid = m.add_entity(Entity(name=name, hp=hp, x=x, y=y), x, y, initiative=init)
-        return await ctx.send(f"Added `{name}` with id `{eid}` at ({x},{y}).")
+    if sub == "add" and len(args) >= 6:
+        eid = args[1]; name = args[2]; hp = int(args[3]); x = int(args[4]); y = int(args[5])
+        init = int(args[6]) if len(args) >= 7 else None
+        eid_ret = m.add_entity(Entity(id=eid, name=name, hp=hp, x=x, y=y), x, y, initiative=init)
+        return await ctx.send(f"Added `{name}` with id `{eid_ret}` at ({x},{y}).")
     if sub == "move" and len(args) >= 4:
         eid = args[1]; x = int(args[2]); y = int(args[3]); m.move_entity(eid, x, y)
         return await ctx.send(f"Moved `{eid}` to ({x},{y}).")
@@ -89,7 +89,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "init" and len(args) >= 3:
         eid = args[1]; value = int(args[2]); m.set_initiative(eid, value)
         return await ctx.send(f"Set initiative of `{eid}` to {value}.")
-    return await ctx.send("Usage: `!ent add <name> <hp> <x> <y> [init]` | `!ent move <id> <x> <y>` | `!ent hp <id> <±n>` | `!ent init <id> <n>`")
+    return await ctx.send("Usage: `!ent add <id> <name> <hp> <x> <y> [init]` | `!ent move <id> <x> <y>` | `!ent hp <id> <±n>` | `!ent init <id> <n>`")
 
 @registry.command("turn")
 async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):

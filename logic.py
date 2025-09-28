@@ -22,21 +22,27 @@ class Occupied(VTTError):
 class NotFound(VTTError):
     pass
 
+class DuplicateId(VTTError):
+    pass
+
 # -------------------------
 # Data Models
 # -------------------------
+
 @dataclass
 class Entity:
+    # Required (no defaults) must come first in a dataclass
     name: str
     hp: int
     x: int
     y: int
+    id: str  # explicit, user-provided
+    # Optional / defaulted fields
     max_hp: Optional[int] = None
     team: Optional[str] = None
     ac: Optional[int] = None
     status: Set[str] = field(default_factory=set)
     initiative: Optional[int] = None
-    id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
     def __post_init__(self):
         if self.max_hp is None:
@@ -69,12 +75,14 @@ class Entity:
         data["status"] = set(data.get("status", []))
         return Entity(**data)
 
+
 @dataclass
 class Match:
+    # explicit, user-provided id
     name: str
     grid_width: int
     grid_height: int
-    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    id: str
     entities: Dict[str, Entity] = field(default_factory=dict)
     turn_order: List[str] = field(default_factory=list)  # list of entity ids
     active_index: int = 0
@@ -98,6 +106,8 @@ class Match:
             raise OutOfBounds(f"({x},{y}) outside {self.grid_width}x{self.grid_height}")
         if self.is_occupied(x, y):
             raise Occupied(f"Cell ({x},{y}) already occupied")
+        if e.id in self.entities:
+            raise DuplicateId(f"Entity id '{e.id}' already exists in this match")
         e.move_to(x, y)
         if initiative is not None:
             e.initiative = initiative
@@ -185,7 +195,7 @@ class Match:
             name=data["name"],
             grid_width=data["grid_width"],
             grid_height=data["grid_height"],
-            id=data.get("id", str(uuid.uuid4())),
+            id=data["id"],
         )
         m.entities = {eid: Entity.from_dict(ed) for eid, ed in data.get("entities", {}).items()}
         m.turn_order = data.get("turn_order", [])
@@ -213,8 +223,10 @@ class MatchManager:
         # optional: track per-channel active match
         self.active_by_channel: Dict[str, str] = {}
 
-    def create_match(self, name: str, width: int, height: int) -> str:
-        m = Match(name=name, grid_width=width, grid_height=height)
+    def create_match(self, match_id: str, name: str, width: int, height: int) -> str:
+        if match_id in self.matches:
+            raise DuplicateId(f"Match id '{match_id}' already exists")
+        m = Match(name=name, grid_width=width, grid_height=height, id=match_id)
         self.matches[m.id] = m
         return m.id
 
@@ -259,17 +271,18 @@ class MatchManager:
         self.matches = {mid: Match.from_dict(md) for mid, md in data.get("matches", {}).items()}
         self.active_by_channel = data.get("active_by_channel", {})
 
-# For quick local testing
-if __name__ == "__main__":
-    mgr = MatchManager()
-    mid = mgr.create_match("Test Skirmish", 8, 6)
-    m = mgr.get(mid)
-    e1 = Entity(name="Rogue", hp=12, x=0, y=0)
-    e2 = Entity(name="Goblin", hp=7, x=1, y=0)
-    m.add_entity(e1, 0, 0, initiative=17)
-    m.add_entity(e2, 1, 0, initiative=12)
-    print("Match:", m.name, m.id)
-    print(m.render_ascii())
-    print("Turn order:", m.turn_order)
-    print("Current:", m.current_entity_id())
-    m.next_turn(); print("After next:", m.current_entity_id())
+#unused, now cli.py is used for local testing instead
+## For quick local testing
+#if __name__ == "__main__":
+#    mgr = MatchManager()
+#    mid = mgr.create_match("test", "Test Skirmish", 8, 6)
+#    m = mgr.get(mid)
+#    e1 = Entity(id="rogue", name="Rogue", hp=12, x=0, y=0)
+#    e2 = Entity(id="goblin1", name="Goblin", hp=7, x=1, y=0)
+#    m.add_entity(e1, 0, 0, initiative=17)
+#    m.add_entity(e2, 1, 0, initiative=12)
+#    print("Match:", m.name, m.id)
+#    print(m.render_ascii())
+#    print("Turn order:", m.turn_order)
+#    print("Current:", m.current_entity_id())
+#    m.next_turn(); print("After next:", m.current_entity_id())
