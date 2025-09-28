@@ -56,7 +56,7 @@ class Entity:
         #TODO: add a die event if hp becomes equal or below 0 (with the possible revive support)
 
     def heal(self, amount: int):
-        self.hp = min(self.max_hp or self.hp + amount, self.hp + max(0, amount))
+        self.hp = min(self.max_hp, self.hp + max(0, amount))
 
     def to_dict(self) -> Dict:
         d = asdict(self)

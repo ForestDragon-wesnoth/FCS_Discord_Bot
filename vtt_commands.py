@@ -111,7 +111,7 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 @registry.command("state")
 async def state_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
-    return await ctx.send(f"**{m.name}** `{m.id}`\n```\n{m.render_ascii()}\n````")
+    return await ctx.send(f"**{m.name}** `{m.id}`\n```\n{m.render_ascii()}\n```")
 
 @registry.command("store")
 async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
