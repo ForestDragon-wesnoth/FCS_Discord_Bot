@@ -80,6 +80,7 @@ class Entity:
 class Match:
     # explicit, user-provided id
     name: str
+    #important: coordinates start from 1, not 0
     grid_width: int
     grid_height: int
     id: str
@@ -90,9 +91,17 @@ class Match:
 
     # ------------- grid helpers -------------
     def in_bounds(self, x: int, y: int) -> bool:
-        return 0 <= x < self.grid_width and 0 <= y < self.grid_height
+        """
+        1-based coordinates: valid cells are
+        x in [1, grid_width], y in [1, grid_height].
+        """
+        return 1 <= x <= self.grid_width and 1 <= y <= self.grid_height
 
     def is_occupied(self, x: int, y: int, ignore_entity_id: Optional[str] = None) -> bool:
+        #only alive entities can occupy a space for now
+
+        #TODO: test edge cases once I implement reviving
+
         for e in self.entities.values():
             if ignore_entity_id and e.id == ignore_entity_id:
                 continue
@@ -205,14 +214,33 @@ class Match:
 
     # ------------- simple ASCII render for quick debugging -------------
     def render_ascii(self) -> str:
-        grid = [["." for _ in range(self.grid_width)] for _ in range(self.grid_height)]
+        # Build grid with an unused 0th row/col so coordinates can be 1-based
+        grid = [
+            ["." for _ in range(self.grid_width + 1)]
+            for _ in range(self.grid_height + 1)
+        ]
         for e in self.entities.values():
             if not e.is_alive:
                 continue
             if self.in_bounds(e.x, e.y):
                 grid[e.y][e.x] = "@"  # you can customize symbols per team
-        lines = [" ".join(row) for row in grid]
+
+        # Skip the 0th row entirely
+        lines = [" ".join(row[1:]) for row in grid[1:]]
         return "\n".join(lines)
+
+    def entities_in_turn_order(self) -> List["Entity"]:
+        # Returns Entity objects in current turn order; appends any missing at the end
+        ordered = []
+        seen = set()
+        for eid in getattr(self, "turn_order", []):
+            if eid in self.entities:
+                ordered.append(self.entities[eid])
+                seen.add(eid)
+        for eid, e in self.entities.items():
+            if eid not in seen:
+                ordered.append(e)
+        return ordered
 
 # -------------------------
 # Manager (multi-match + simple persistence)

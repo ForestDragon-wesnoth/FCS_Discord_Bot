@@ -37,6 +37,12 @@ registry = CommandRegistry()
 
 # ---- Helpers ----------------------------------------------------------------
 
+def _entity_line(e: Entity) -> str:
+    # If max_hp wasn't set, many tables treat it as current hp initially
+    max_hp = e.max_hp if getattr(e, "max_hp", None) is not None else e.hp
+    return f"{e.name} ({e.id}): HP: {e.hp}/{max_hp}"
+    #TODO: add a way to dynamically define what variables are shown for entities!
+
 def active_match(mgr: MatchManager, ctx: ReplyContext):
     mid = mgr.get_active_for_channel(ctx.channel_key)
     if not mid:
@@ -73,6 +79,12 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send("Entities:\n" + ("\n".join(lines) or "(none)"))
     sub = args[0]
     m = active_match(mgr, ctx)
+    # --- info (single entity line) ---
+    if sub == "info" and len(args) >= 2:
+        eid = args[1]
+        if eid not in m.entities:
+            return await ctx.send(f"Entity `{eid}` not found.")
+        return await ctx.send(_entity_line(m.entities[eid]))
     if sub == "add" and len(args) >= 6:
         eid = args[1]; name = args[2]; hp = int(args[3]); x = int(args[4]); y = int(args[5])
         init = int(args[6]) if len(args) >= 7 else None
@@ -81,6 +93,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "move" and len(args) >= 4:
         eid = args[1]; x = int(args[2]); y = int(args[3]); m.move_entity(eid, x, y)
         return await ctx.send(f"Moved `{eid}` to ({x},{y}).")
+    #TODO: DEPRECATE THE "hp" command in favor of clearer "set_hp", "damage", "heal" etc.
     if sub == "hp" and len(args) >= 3:
         eid = args[1]; delta = int(args[2])
         if delta >= 0: m.heal(eid, delta); msg = f"Healed `{eid}` by {delta}."
@@ -89,7 +102,14 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "init" and len(args) >= 3:
         eid = args[1]; value = int(args[2]); m.set_initiative(eid, value)
         return await ctx.send(f"Set initiative of `{eid}` to {value}.")
-    return await ctx.send("Usage: `!ent add <id> <name> <hp> <x> <y> [init]` | `!ent move <id> <x> <y>` | `!ent hp <id> <±n>` | `!ent init <id> <n>`")
+    return await ctx.send(
+        "Usage: "
+        "`!ent info <id>` | "
+        "`!ent add <id> <name> <hp> <x> <y> [init]` | "
+        "`!ent move <id> <x> <y>` | "
+        "`!ent hp <id> <±n>` | "
+        "`!ent init <id> <n>`"
+    )
 
 @registry.command("turn")
 async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -108,10 +128,25 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(f"It is now **{e.name}**'s turn (id `{eid[:8]}`)")
     return await ctx.send("Usage: `!turn` | `!turn next`")
 
-@registry.command("state")
-async def state_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+@registry.command("map")
+async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     return await ctx.send(f"**{m.name}** `{m.id}`\n```\n{m.render_ascii()}\n```")
+
+@registry.command("list")
+async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    m = active_match(mgr, ctx)
+    es = m.entities_in_turn_order()
+    if not es:
+        return await ctx.send("(no entities)")
+    lines = [_entity_line(e) for e in es]
+    return await ctx.send("\n".join(lines))
+
+@registry.command("state")
+async def state_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    # New behavior: show list (turn-order) then map
+    await list_cmd(ctx, args, mgr)
+    await map_cmd(ctx, args, mgr)
 
 @registry.command("store")
 async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
