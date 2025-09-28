@@ -17,6 +17,9 @@ class DiscordCtxWrapper:
 # Attach a single dynamic dispatcher to the bot.
 # Users still type commands like: !match ..., !ent ..., etc.
 
+
+#TODO: when I add more commands to vtt_commands.py, add them here too!
+
 def wire_commands(bot: commands.Bot, mgr: MatchManager):
     async def _dispatch(ctx, root: str, *args: str):
         await registry.run(root, list(args), DiscordCtxWrapper(ctx), mgr)
