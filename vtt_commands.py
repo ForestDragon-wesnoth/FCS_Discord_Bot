@@ -40,7 +40,7 @@ registry = CommandRegistry()
 def _entity_line(e: Entity) -> str:
     # If max_hp wasn't set, many tables treat it as current hp initially
     max_hp = e.max_hp if getattr(e, "max_hp", None) is not None else e.hp
-    return f"{e.name} ({e.id}): HP: {e.hp}/{max_hp}"
+    return f"{e.name} ({e.id}): HP: {e.hp}/{max_hp} facing {e.facing}"
     #TODO: add a way to dynamically define what variables are shown for entities!
 
 def active_match(mgr: MatchManager, ctx: ReplyContext):

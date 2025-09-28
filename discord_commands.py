@@ -18,11 +18,6 @@ class DiscordCtxWrapper:
 # Attach a single dynamic dispatcher to the bot.
 # Users still type commands like: !match ..., !ent ..., etc.
 
-
-#TODO: when I add more commands to vtt_commands.py, add them here too!!!
-
-#CURRENTLY THE COMMAND LIST IS OUT-OF-DATE WITH vtt_commands.py!!! UPDATE THIS LATER!!!
-
 def wire_commands(bot: commands.Bot, mgr: MatchManager):
     async def _dispatch(ctx, root: str):
         """
@@ -46,23 +41,32 @@ def wire_commands(bot: commands.Bot, mgr: MatchManager):
             return await ctx.send(f"❌ Parse error: {e}")
         await registry.run(root, args, DiscordCtxWrapper(ctx), mgr)
 
-    # Register top-level commands that forward into the registry
-    @bot.command(name="match")
-    async def match(ctx, *args):
-        await _dispatch(ctx, "match")
+#automatically adds support for all commands from vtt_commands.py
+    for root in registry._handlers.keys():
+        @bot.command(name=root)
+        async def _(ctx, _root=root):
+            await _dispatch(ctx, _root)
 
-    @bot.command(name="ent")
-    async def ent(ctx, *args):
-        await _dispatch(ctx, "ent")
+#UNUSED CODE: OLD MANUAL CONNECTION
 
-    @bot.command(name="turn")
-    async def turn(ctx, *args):
-        await _dispatch(ctx, "turn")
+#    # Register top-level commands that forward into the registry
+#    @bot.command(name="match")
+#    async def match(ctx, *args):
+#        await _dispatch(ctx, "match")
 
-    @bot.command(name="state")
-    async def state(ctx, *args):
-        await _dispatch(ctx, "state")
+#    @bot.command(name="ent")
+#    async def ent(ctx, *args):
+#        await _dispatch(ctx, "ent")
 
-    @bot.command(name="store")
-    async def store(ctx, *args):
-        await _dispatch(ctx, "store")
+#    @bot.command(name="turn")
+#    async def turn(ctx, *args):
+#        await _dispatch(ctx, "turn")
+
+#    @bot.command(name="state")
+#    async def state(ctx, *args):
+#        await _dispatch(ctx, "state")
+
+#    @bot.command(name="store")
+#    async def store(ctx, *args):
+#        await _dispatch(ctx, "store")
+

@@ -3,7 +3,7 @@
 # logic.py
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Literal, Any, Dict, List, Optional, Tuple, Set
 import uuid
 import json
 
@@ -29,6 +29,24 @@ class DuplicateId(VTTError):
 # Data Models
 # -------------------------
 
+Direction = Literal["up", "down", "left", "right"]
+ALLOWED_DIRECTIONS: tuple[Direction, ...] = ("up", "down", "left", "right")
+
+def _dominant_axis_dir(dx: int, dy: int) -> Direction:
+    # ties prefer vertical (feel free to change)
+    if abs(dy) >= abs(dx):
+        return "down" if dy > 0 else "up"
+    else:
+        return "right" if dx > 0 else "left"
+
+def _default_facing_for(x: int, y: int, width: int, height: int) -> Direction:
+    # Face toward the map's center (1-based grid). Center can be fractional; use dominant axis.
+    cx = (width + 1) / 2
+    cy = (height + 1) / 2
+    dx = cx - x
+    dy = cy - y
+    return _dominant_axis_dir(int(round(dx)), int(round(dy)))
+
 @dataclass
 class Entity:
     # Required (no defaults) must come first in a dataclass
@@ -42,10 +60,14 @@ class Entity:
     team: Optional[str] = None
     status: Set[str] = field(default_factory=set)
     initiative: Optional[int] = None
+    extras: Dict[str, Any] = field(default_factory=dict)  # arbitrary stats/resources
+    facing: Direction = "up"  # will be set to a default by Match when adding
 
     def __post_init__(self):
         if self.max_hp is None:
             self.max_hp = self.hp
+        if self.facing not in ALLOWED_DIRECTIONS:
+            self.facing = "up"
 
     # ------------- runtime helpers -------------
     @property
@@ -218,13 +240,18 @@ class Match:
             ["." for _ in range(self.grid_width + 1)]
             for _ in range(self.grid_height + 1)
         ]
+    
+        arrows = {"up": "^", "down": "v", "left": "<", "right": ">"}
+    
         for e in self.entities.values():
-            if not e.is_alive:
+            # Keep old semantics: skip dead entities
+            if not getattr(e, "is_alive", True):
                 continue
             if self.in_bounds(e.x, e.y):
-                grid[e.y][e.x] = "@"  # you can customize symbols per team
-
-        # Skip the 0th row entirely
+                sym = arrows.get(getattr(e, "facing", ""), "@")
+                grid[e.y][e.x] = sym
+    
+        # Skip the 0th row entirely to preserve 1-based coordinates
         lines = [" ".join(row[1:]) for row in grid[1:]]
         return "\n".join(lines)
 
