@@ -216,6 +216,8 @@ class Match:
     turn_order: List[str] = field(default_factory=list)
     active_index: int = 0
     rules: Dict[str, Any] = field(default_factory=dict)
+    #global turn counter, starts at 1. global turn here increments by 1 after EVERY entity had its turn and the cycle resets
+    turn_number: int = 1
 
     # ---- global constraints / helpers (unchanged in spirit) ----
     def in_bounds(self, x: int, y: int) -> bool:
@@ -230,29 +232,39 @@ class Match:
         return False
 
     # ------------- turns -------------
+
     def _rebuild_turn_order(self):
-        # Sort: higher initiative first; stable by name then id for determinism
+        prev_current_id = None
+        if 0 <= self.active_index < len(self.turn_order):
+            prev_current_id = self.turn_order[self.active_index]
+
         ordered = sorted(
             [e for e in self.entities.values() if e.initiative is not None and e.is_alive],
             key=lambda e: (-e.initiative, e.name.lower(), e.id)
         )
         self.turn_order = [e.id for e in ordered]
-        # Clamp active index
-        if self.turn_order:
-            self.active_index %= len(self.turn_order)
+
+        if prev_current_id and prev_current_id in self.turn_order:
+            self.active_index = self.turn_order.index(prev_current_id)
         else:
-            self.active_index = 0
+            self.active_index = 0 if self.turn_order else 0
 
     def current_entity_id(self) -> Optional[str]:
         if not self.turn_order:
             return None
         return self.turn_order[self.active_index]
 
-    def next_turn(self) -> Optional[str]:
+    def next_turn(self) -> str | None:
         if not self.turn_order:
             return None
+        prev_index = self.active_index
         self.active_index = (self.active_index + 1) % len(self.turn_order)
-        return self.current_entity_id()
+
+        #increment turn counter when we loop around
+        if self.active_index == 0 and len(self.turn_order) > 0:
+            # We wrapped around to the first position => new round
+            self.turn_number += 1
+        return self.turn_order[self.active_index]
 
     # ---- persistence ----
     def to_dict(self) -> Dict[str, Any]:
@@ -265,6 +277,7 @@ class Match:
             "turn_order": self.turn_order,
             "active_index": self.active_index,
             "rules": self.rules,
+            "turn_number": self.turn_number,
         }
 
     @staticmethod
@@ -275,7 +288,6 @@ class Match:
             grid_width=data["grid_width"],
             grid_height=data["grid_height"],
         )
-        # Recreate entities & bind to match; insert directly (trusted from save)
         for eid, ed in data.get("entities", {}).items():
             e = Entity.from_dict(ed)
             e.bind(m)
@@ -283,6 +295,8 @@ class Match:
         m.turn_order = data.get("turn_order", [])
         m.active_index = data.get("active_index", 0)
         m.rules = data.get("rules", {})
+        # default to 1 if absent in saves
+        m.turn_number = int(data.get("turn_number", 1))
         return m
 
     # ------------- simple ASCII render for quick debugging -------------

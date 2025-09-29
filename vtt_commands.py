@@ -189,10 +189,16 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(f"It is now **{e.name}**'s turn (id `{eid[:8]}`)")
     return await ctx.send("Usage: `!turn` | `!turn next`")
 
+#global info about the match that isn't the map or entities
+@registry.command("match_toplevel")
+async def match_top_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    m = active_match(mgr, ctx)
+    return await ctx.send(f"**{m.name}** `{m.id}`\nCurrent Turn Number: **{m.turn_number}**\n")
+
 @registry.command("map")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
-    return await ctx.send(f"**{m.name}** `{m.id}`\n```\n{m.render_ascii()}\n```")
+    return await ctx.send(f"\n{m.render_ascii()}\n```")
 
 @registry.command("list")
 async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -200,12 +206,19 @@ async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     es = m.entities_in_turn_order()
     if not es:
         return await ctx.send("(no entities)")
-    lines = [_entity_line(e) for e in es]
+
+    active_id = m.turn_order[m.active_index] if m.turn_order else None
+    lines = []
+    #add a right arrow to show which entity's turn it is right now
+    for e in es:
+        marker = ">" if e.id == active_id else " "
+        lines.append(f"{marker} {_entity_line(e)}")
     return await ctx.send("\n".join(lines))
 
 @registry.command("state")
 async def state_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # New behavior: show list (turn-order) then map
+    await match_top_cmd(ctx, args, mgr)
     await list_cmd(ctx, args, mgr)
     await map_cmd(ctx, args, mgr)
 
