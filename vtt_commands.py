@@ -339,9 +339,9 @@ registry.annotate_sub(
     desc="Create and place a new entity; optional initiative."
 )
 registry.annotate_sub(
-    "ent", "remove", "del", "rm",
+    "ent", "remove", #"del", "rm",
     usage="!ent remove <id>",
-    desc="Remove an entity from the match. Aliases: del, rm."
+    desc="Remove an entity from the match. Alt aliases: del, rm."
 )
 registry.annotate_sub(
     "ent", "tp",
