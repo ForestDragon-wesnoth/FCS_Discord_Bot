@@ -1,7 +1,7 @@
 ## vtt_commands.py (framework‑agnostic commands + registry)
 # vtt_commands.py
 from __future__ import annotations
-from typing import Callable, Dict, List, Optional, Protocol, Any
+from typing import Callable, Dict, List, Optional, Protocol, Any, Tuple
 from logic import MatchManager, Entity, VTTError, OutOfBounds, Occupied, NotFound, DuplicateId
 
 # ---- Context abstraction -----------------------------------------------------
@@ -15,11 +15,69 @@ Handler = Callable[[ReplyContext, List[str], MatchManager], Any]
 class CommandRegistry:
     def __init__(self):
         self._handlers: Dict[str, Handler] = {}
-    def command(self, name: str):
+        # help metadata: {root: {"usage": str, "desc": str, "subs": {sub: {"usage": str, "desc": str}}}}
+        self._help: Dict[str, Dict[str, Any]] = {}
+    def command(self, name: str, *, usage: Optional[str] = None, desc: Optional[str] = None):
         def deco(fn: Handler):
             self._handlers[name] = fn
+            meta = self._help.setdefault(name, {"usage": None, "desc": None, "subs": {}})
+            if usage:
+                meta["usage"] = usage
+            if desc:
+                meta["desc"] = desc
             return fn
         return deco
+
+    #usage/help for commands is partially automated instead of a hardcoded help menu, the usage/help info is included in each command definition, then it's pulled from that
+
+    def annotate_sub(self, root: str, *subs: str, usage: str, desc: Optional[str] = None):
+        meta = self._help.setdefault(root, {"usage": None, "desc": None, "subs": {}})
+        for sub in subs:
+            meta["subs"][sub] = {"usage": usage, "desc": (desc or "")}
+
+    def help_for(self, path: List[str]) -> Tuple[str, str]:
+        """
+        Returns (title, text) for a given help path:
+        [] => all commands
+        [root] => command details + subcommands
+        [root, sub] => specific subcommand
+        """
+        if not path:
+            # All commands
+            lines = ["**Commands**"]
+            for root in sorted(self._handlers.keys()):
+                m = self._help.get(root, {})
+                usage = m.get("usage") or f"!{root}"
+                desc = m.get("desc") or ""
+                lines.append(f"`{usage}` — {desc}".rstrip())
+            return ("Help", "\n".join(lines))
+        root = path[0]
+        if root not in self._handlers:
+            return ("Help", f"Unknown command `{root}`. Try `!help`.")
+        meta = self._help.get(root, {"subs": {}})
+        if len(path) == 1:
+            # Root details
+            usage = meta.get("usage") or f"!{root}"
+            desc = meta.get("desc") or ""
+            lines = [f"**!{root}**", f"Usage: `{usage}`"]
+            if desc:
+                lines.append(desc)
+            subs = meta.get("subs") or {}
+            if subs:
+                lines.append("\n**Subcommands**")
+                for s, sm in sorted(subs.items()):
+                    lines.append(f"- `{sm['usage']}` — {sm.get('desc','')}".rstrip())
+            return (f"Help: {root}", "\n".join(lines))
+        # Subcommand
+        sub = path[1]
+        sm = (meta.get("subs") or {}).get(sub)
+        if not sm:
+            return (f"Help: {root}", f"No help found for `{root} {sub}`.")
+        lines = [f"**!{root} {sub}**", f"Usage: `{sm['usage']}`"]
+        if sm.get("desc"):
+            lines.append(sm["desc"])
+        return (f"Help: {root} {sub}", "\n".join(lines))
+
     async def run(self, name: str, args: List[str], ctx: ReplyContext, mgr: MatchManager):
         h = self._handlers.get(name)
         if not h:
@@ -40,7 +98,7 @@ registry = CommandRegistry()
 def _entity_line(e: Entity) -> str:
     # If max_hp wasn't set, many tables treat it as current hp initially
     max_hp = e.max_hp if getattr(e, "max_hp", None) is not None else e.hp
-    return f"{e.name} ({e.id}): HP: {e.hp}/{max_hp} facing {e.facing}"
+    return f"{e.name} ({e.id}): HP: {e.hp}/{max_hp} X,Y: {e.x},{e.y} facing {e.facing}"
     #TODO: add a way to dynamically define what variables are shown for entities!
 
 def active_match(mgr: MatchManager, ctx: ReplyContext):
@@ -50,7 +108,7 @@ def active_match(mgr: MatchManager, ctx: ReplyContext):
     return mgr.get(mid)
 
 # ---- Commands ----------------------------------------------------------------
-@registry.command("match")
+@registry.command("match", usage="!match | !match new <id> <name> <w> <h> | !match use <id>", desc="List matches, create one, or switch the active match for this channel.")
 async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
         pairs = mgr.list()
@@ -69,13 +127,16 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "delete" and len(args) >= 2:
         mgr.delete_match(args[1])
         return await ctx.send(f"Deleted `{args[1]}`.")
-    return await ctx.send("Usage: `!match new <id> <name> <w> <h>` | `!match use <id>` | `!match delete <id>`")
+    # Fallback: show help menu for the command if it's not properly typed
+    title, body = registry.help_for(["match"])
+    return await ctx.send(f"**{title}**\n{body}")
 
-@registry.command("ent")
+@registry.command("ent", usage="!ent <subcommand> ...", desc="Manage entities in the active match, lots of available sub-commands.")
 async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
-        # if !end has no arguments, then mirror the "!list" command: show entities in turn order (active first) with the same format.
-        return await list_cmd(ctx, [], mgr)
+        # if no subcommand: just show the authoritative help for !ent
+        title, body = registry.help_for(["ent"])
+        return await ctx.send(f"**{title}**\n{body}")
     sub = args[0]
     m = active_match(mgr, ctx)
     # --- info (single entity line) ---
@@ -84,6 +145,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if eid not in m.entities:
             return await ctx.send(f"Entity `{eid}` not found.")
         return await ctx.send(_entity_line(m.entities[eid]))
+
     # add
     if sub == "add" and len(args) >= 6:
         eid = args[1]; name = args[2]; hp = int(args[3]); x = int(args[4]); y = int(args[5])
@@ -99,19 +161,21 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(f"Entity `{eid}` not found.")
         m.entities[eid].remove()
         return await ctx.send(f"Removed `{eid}` from match.")
-    
+
     # tp (absolute)
     if sub == "tp" and len(args) >= 4:
         eid = args[1]; x = int(args[2]); y = int(args[3])
         m.entities[eid].tp(x, y)
         return await ctx.send(f"Teleported `{eid}` to ({x},{y}).")
-    
+
     # move (stepwise)
     if sub == "move" and len(args) >= 3:
         eid = args[1]
         tokens = " ".join(args[2:]).replace(",", " ").split()
         if not tokens:
-            return await ctx.send("Usage: `!ent move <id> <dir[,dir...]>` or `!ent move <id> <n> <dir> [<n> <dir> ...]`")
+            # Defer to help for usage details
+            title, body = registry.help_for(["ent","move"])
+            return await ctx.send(f"**{title}**\n{body}")
     
         moves: list[tuple[str,int]] = []
         i = 0
@@ -146,7 +210,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send("Use: up/down/left/right")
         m.entities[eid].facing = dir_full
         return await ctx.send(f"Facing of `{eid}` set to {dir_full}.")
-    
+
     # hp
     if sub == "hp" and len(args) >= 3:
         eid = args[1]; delta = int(args[2])
@@ -162,17 +226,11 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         eid = args[1]; value = int(args[2])
         m.entities[eid].set_initiative_entity(value)
         return await ctx.send(f"Set initiative of `{eid}` to {value}.")
+    # Fallback: show authoritative help for the root command
+    title, body = registry.help_for(["ent"])
+    return await ctx.send(f"**{title}**\n{body}")
 
-    return await ctx.send(
-        "Usage: "
-        "`!ent info <id>` | "
-        "`!ent add <id> <name> <hp> <x> <y> [init]` | "
-        "`!ent move <id> <x> <y>` | "
-        "`!ent hp <id> <±n>` | "
-        "`!ent init <id> <n>`"
-    )
-
-@registry.command("turn")
+@registry.command("turn", usage="!turn | !turn next", desc="Show turn order or advance to the next turn.")
 async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     if not args:
@@ -187,20 +245,22 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if not eid: return await ctx.send("No turn order yet.")
         e = m.entities[eid]
         return await ctx.send(f"It is now **{e.name}**'s turn (id `{eid[:8]}`)")
-    return await ctx.send("Usage: `!turn` | `!turn next`")
+    # Fallback: show authoritative help
+    title, body = registry.help_for(["turn"])
+    return await ctx.send(f"**{title}**\n{body}")
 
 #global info about the match that isn't the map or entities
-@registry.command("match_toplevel")
+@registry.command("match_toplevel", usage="!match_toplevel", desc="Show active match summary (name/id/turn number).")
 async def match_top_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     return await ctx.send(f"**{m.name}** `{m.id}`\nCurrent Turn Number: **{m.turn_number}**\n")
 
-@registry.command("map")
+@registry.command("map", usage="!map", desc="Render the ASCII map for the active match.")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
-    return await ctx.send(f"\n{m.render_ascii()}\n```")
+    return await ctx.send(f"```\n{m.render_ascii()}\n```")
 
-@registry.command("list")
+@registry.command("list", usage="!list", desc="List entities in a match, sorted by turn order")
 async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     es = m.entities_in_turn_order()
@@ -215,18 +275,112 @@ async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         lines.append(f"{marker} {_entity_line(e)}")
     return await ctx.send("\n".join(lines))
 
-@registry.command("state")
+@registry.command("state", usage="!state", desc="Show match summary, entities, and map.")
 async def state_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # New behavior: show list (turn-order) then map
     await match_top_cmd(ctx, args, mgr)
     await list_cmd(ctx, args, mgr)
     await map_cmd(ctx, args, mgr)
 
-@registry.command("store")
+@registry.command("store", usage="!store save <path> | !store load <path>", desc="Save/load all matches and channel bindings.")
 async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
-    if not args: return await ctx.send("Use: `!store save <path>` | `!store load <path>`")
+    if not args:
+        title, body = registry.help_for(["store"])
+        return await ctx.send(f"**{title}**\n{body}")
     if args[0] == "save" and len(args) >= 2:
         mgr.save(args[1]); return await ctx.send(f"Saved to `{args[1]}`")
     if args[0] == "load" and len(args) >= 2:
         mgr.load(args[1]); return await ctx.send(f"Loaded from `{args[1]}`")
-    return await ctx.send("Use: `!store save <path>` | `!store load <path>`")
+    # Fallback: show authoritative help
+    title, body = registry.help_for(["store"])
+    return await ctx.send(f"**{title}**\n{body}")
+
+# ---- Automated Help command (shows available commands----------------------------------------------------------
+@registry.command("help", usage="!help [command [sub]]", desc="Show command usage. Try `!help ent` or `!help ent move`.")
+async def help_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    title, body = registry.help_for(args)
+    await ctx.send(f"**{title}**\n{body}")
+
+
+
+# ---- Help annotations for sub-commands (module scope: run at import time) ---------------------
+
+#IMPORTANT: KEEP IT UPDATED WHENEVER I MAKE CHANGES TO THE COMMANDS THEMSELVES!!!!!!
+
+# match
+registry.annotate_sub(
+    "match", "new",
+    usage="!match new <id> <name> <w> <h>",
+    desc="Create a match with an explicit id, display name, and grid size."
+)
+registry.annotate_sub(
+    "match", "use",
+    usage="!match use <id>",
+    desc="Set the current channel's active match."
+)
+registry.annotate_sub(
+    "match", "delete",
+    usage="!match delete <id>",
+    desc="Delete a match by id."
+)
+
+# ent
+registry.annotate_sub(
+    "ent", "info",
+    usage="!ent info <id>",
+    desc="Show a single entity summary."
+)
+registry.annotate_sub(
+    "ent", "add",
+    usage="!ent add <id> <name> <hp> <x> <y> [init]",
+    desc="Create and place a new entity; optional initiative."
+)
+registry.annotate_sub(
+    "ent", "remove", "del", "rm",
+    usage="!ent remove <id>",
+    desc="Remove an entity from the match. Aliases: del, rm."
+)
+registry.annotate_sub(
+    "ent", "tp",
+    usage="!ent tp <id> <x> <y>",
+    desc="Teleport entity to an absolute cell (requires free cell)."
+)
+registry.annotate_sub(
+    "ent", "move",
+    usage="!ent move <id> <dir[,dir...]> | !ent move <id> <n> <dir> [<n> <dir> ...]",
+    desc="Stepwise move; directions: up/down/left/right (u/d/l/r). Final cell must be free."
+)
+registry.annotate_sub(
+    "ent", "hp",
+    usage="!ent hp <id> <±n>",
+    desc="Adjust HP by a signed amount; death/prone handled by rules."
+)
+registry.annotate_sub(
+    "ent", "init",
+    usage="!ent init <id> <n>",
+    desc="Set (or update) entity initiative to a fixed value."
+)
+registry.annotate_sub(
+    "ent", "face",
+    usage="!ent face <id> <dir>",
+    desc="Set facing to up/down/left/right (aliases: u/d/l/r)."
+)
+
+# turn
+registry.annotate_sub(
+    "turn", "next",
+    usage="!turn next",
+    desc="Advance to the next entity's turn (turn number wraps/increments)."
+)
+
+# store
+registry.annotate_sub(
+    "store", "save",
+    usage="!store save <path>",
+    desc="Save all matches and channel bindings to a JSON file."
+)
+registry.annotate_sub(
+    "store", "load",
+    usage="!store load <path>",
+    desc="Load matches and channel bindings from a JSON file."
+)

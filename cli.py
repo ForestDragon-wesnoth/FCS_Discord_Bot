@@ -22,10 +22,7 @@ async def main():
     mgr = MatchManager()
     ctx = CLICtx()
     print(
-        "VTT CLI. Examples:\n"
-        "  !match new test_id \"Test Match\" 10 8 | !match use <id>\n"
-        "  !ent add rogueid \"Sir Robert\" 50 5 5 2 | !ent info rogueid\n"
-        "  !list | !map | !state | !turn next\n"
+        "VTT CLI. Type !help to see available commands\n"
         "Type 'exit' or 'quit' to leave."
     )
     while True:
