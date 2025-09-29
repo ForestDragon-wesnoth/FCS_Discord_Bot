@@ -140,6 +140,11 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     sub = args[0]
     m = active_match(mgr, ctx)
 
+    #before any entity operations EXCEPT add, check whether the entity even exists
+    eid = args[1]
+    if eid not in m.entities and sub != "add":
+        return await ctx.send(f"Entity `{eid}` not found.")
+
     # add
     if sub == "add" and len(args) >= 6:
         eid = args[1]; name = args[2]; hp = int(args[3]); x = int(args[4]); y = int(args[5])
@@ -147,11 +152,6 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         e = Entity(id=eid, name=name, hp=hp, x=x, y=y)
         e.spawn(m, x, y, initiative=init)
         return await ctx.send(f"Added `{name}` with id `{eid}` at ({x},{y}).")
-
-    #before any entity operations EXCEPT add, check whether the entity even exists
-    eid = args[1]
-    if eid not in m.entities:
-        return await ctx.send(f"Entity `{eid}` not found.")
 
     # --- info (single entity line) ---
     if sub == "info" and len(args) >= 2:
