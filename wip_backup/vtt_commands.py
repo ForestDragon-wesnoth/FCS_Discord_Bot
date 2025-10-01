@@ -130,7 +130,7 @@ async def return_help_if_not_enough_args(
 async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
         pairs = mgr.list()
-        if not pairs: return await ctx.send("No matches. Create a new match with first (see '!help match new')")
+        if not pairs: return await ctx.send("No matches. `!match new <name> <w> <h>`")
         lines = [f"**{name}** — `{mid}`" for mid, name in pairs]
         return await ctx.send("Matches:\n" + "\n".join(lines))
     sub = args[0]
@@ -166,13 +166,13 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 @registry.command("ent", usage="!ent <subcommand> ...", desc="Manage entities in the active match, lots of available sub-commands.")
 async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
-    # Show authoritative help if no subcommand was given
+    sub = args[0]
+
+    m = active_match(ctx, mgr)
     if not args:
         # if no subcommand: just show the authoritative help for !ent
         title, body = registry.help_for(["ent"])
         return await ctx.send(f"**{title}**\n{body}")
-
-    m = active_match(mgr, ctx)
 
     sub = args[0].lower()#makes the first arg lowercase, so "ADD", "aDD", etc. become "add"
 
