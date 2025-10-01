@@ -359,7 +359,7 @@ registry.annotate_sub(
     desc="Set (or update) entity initiative to a fixed value."
 )
 
-@registry.command("turn", usage="!turn | !turn next", desc="Show turn order or advance to the next turn.")
+@registry.command("turn", usage="!turn | !turn next | ...", desc="See/advance/set/etc. turns")
 async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     if not args:

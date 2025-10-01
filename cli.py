@@ -23,6 +23,7 @@ async def main():
     ctx = CLICtx()
     print(
         "VTT CLI. Type !help to see available commands\n"
+        "Type !help [command] to see available subcommands for a specific command\n"
         "Type 'exit' or 'quit' to leave."
     )
     while True:
