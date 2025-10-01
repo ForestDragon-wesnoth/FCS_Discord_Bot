@@ -163,6 +163,27 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # Fallback: show help menu for the command if it's not properly typed
     title, body = registry.help_for(["match"])
     return await ctx.send(f"**{title}**\n{body}")
+#annonate subcommands next to the command itself:
+registry.annotate_sub(
+    "match", "new",
+    usage="!match new <id> <name> <w> <h>",
+    desc="Create a match with an explicit id, display name, and grid size."
+)
+registry.annotate_sub(
+    "match", "use",
+    usage="!match use <id>",
+    desc="Set the current channel's active match."
+)
+registry.annotate_sub(
+    "match", "delete",
+    usage="!match delete <id>",
+    desc="Delete a match by id."
+)
+registry.annotate_sub(
+    "match", "rename",
+    usage="!match rename <id> <new_name>",
+    desc="Rename a selected match."
+)
 
 @registry.command("ent", usage="!ent <subcommand> ...", desc="Manage entities in the active match, lots of available sub-commands.")
 async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -291,6 +312,52 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # Fallback: show authoritative help for the root command
     title, body = registry.help_for(["ent"])
     return await ctx.send(f"**{title}**\n{body}")
+#annonate subcommands next to the command itself:
+registry.annotate_sub(
+    "ent", "info",
+    usage="!ent info <id>",
+    desc="Show a single entity summary."
+)
+registry.annotate_sub(
+    "ent", "add",
+    usage="!ent add <id> <name> <hp> <x> <y> [init]",
+    desc="Create and place a new entity; optional initiative."
+)
+registry.annotate_sub(
+    "ent", "remove", #"del", "rm",
+    usage="!ent remove <id>",
+    desc="Remove an entity from the match. Alt aliases: del, rm."
+)
+registry.annotate_sub(
+    "ent", "rename",
+    usage="!ent rename <id> <new_name>",
+    desc="Rename an entity."
+)
+registry.annotate_sub(
+    "ent", "tp",
+    usage="!ent tp <id> <x> <y>",
+    desc="Teleport entity to an absolute cell (requires free cell)."
+)
+registry.annotate_sub(
+    "ent", "move",
+    usage="!ent move <id> <dir[,dir...]> | !ent move <id> <n> <dir> [<n> <dir> ...]",
+    desc="Stepwise move; directions: up/down/left/right (u/d/l/r). Final cell must be free."
+)
+registry.annotate_sub(
+    "ent", "face",
+    usage="!ent face <id> <dir>",
+    desc="Set facing to up/down/left/right (aliases: u/d/l/r)."
+)
+registry.annotate_sub(
+    "ent", "hp",
+    usage="!ent hp <id> <±n>",
+    desc="Adjust HP by a signed amount; death/prone handled by rules."
+)
+registry.annotate_sub(
+    "ent", "init",
+    usage="!ent init <id> <n>",
+    desc="Set (or update) entity initiative to a fixed value."
+)
 
 @registry.command("turn", usage="!turn | !turn next", desc="Show turn order or advance to the next turn.")
 async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -319,6 +386,18 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # Fallback: show authoritative help
     title, body = registry.help_for(["turn"])
     return await ctx.send(f"**{title}**\n{body}")
+#annonate subcommands next to the command itself:
+registry.annotate_sub(
+    "turn", "next",
+    usage="!turn next",
+    desc="Advance to the next entity's turn (turn number wraps/increments)."
+)
+registry.annotate_sub(
+    "turn", "set",
+    usage="!turn set <id>",
+    desc="Set the current turn to be the turn of entity <id>"
+)
+
 
 #global info about the match that isn't the map or entities
 @registry.command("match_toplevel", usage="!match_toplevel", desc="Show active match summary (name/id/turn number).")
@@ -370,86 +449,7 @@ async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # Fallback: show authoritative help
     title, body = registry.help_for(["store"])
     return await ctx.send(f"**{title}**\n{body}")
-
-# ---- Automated Help command (shows available commands----------------------------------------------------------
-@registry.command("help", usage="!help [command [sub]]", desc="Show command usage. Try `!help ent` or `!help ent move`.")
-async def help_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
-    title, body = registry.help_for(args)
-    await ctx.send(f"**{title}**\n{body}")
-
-
-
-# ---- Help annotations for sub-commands (module scope: run at import time) ---------------------
-
-#IMPORTANT: KEEP IT UPDATED WHENEVER I MAKE CHANGES TO THE COMMANDS THEMSELVES!!!!!!
-
-# match
-registry.annotate_sub(
-    "match", "new",
-    usage="!match new <id> <name> <w> <h>",
-    desc="Create a match with an explicit id, display name, and grid size."
-)
-registry.annotate_sub(
-    "match", "use",
-    usage="!match use <id>",
-    desc="Set the current channel's active match."
-)
-registry.annotate_sub(
-    "match", "delete",
-    usage="!match delete <id>",
-    desc="Delete a match by id."
-)
-
-# ent
-registry.annotate_sub(
-    "ent", "info",
-    usage="!ent info <id>",
-    desc="Show a single entity summary."
-)
-registry.annotate_sub(
-    "ent", "add",
-    usage="!ent add <id> <name> <hp> <x> <y> [init]",
-    desc="Create and place a new entity; optional initiative."
-)
-registry.annotate_sub(
-    "ent", "remove", #"del", "rm",
-    usage="!ent remove <id>",
-    desc="Remove an entity from the match. Alt aliases: del, rm."
-)
-registry.annotate_sub(
-    "ent", "tp",
-    usage="!ent tp <id> <x> <y>",
-    desc="Teleport entity to an absolute cell (requires free cell)."
-)
-registry.annotate_sub(
-    "ent", "move",
-    usage="!ent move <id> <dir[,dir...]> | !ent move <id> <n> <dir> [<n> <dir> ...]",
-    desc="Stepwise move; directions: up/down/left/right (u/d/l/r). Final cell must be free."
-)
-registry.annotate_sub(
-    "ent", "hp",
-    usage="!ent hp <id> <±n>",
-    desc="Adjust HP by a signed amount; death/prone handled by rules."
-)
-registry.annotate_sub(
-    "ent", "init",
-    usage="!ent init <id> <n>",
-    desc="Set (or update) entity initiative to a fixed value."
-)
-registry.annotate_sub(
-    "ent", "face",
-    usage="!ent face <id> <dir>",
-    desc="Set facing to up/down/left/right (aliases: u/d/l/r)."
-)
-
-# turn
-registry.annotate_sub(
-    "turn", "next",
-    usage="!turn next",
-    desc="Advance to the next entity's turn (turn number wraps/increments)."
-)
-
-# store
+#annonate subcommands next to the command itself:
 registry.annotate_sub(
     "store", "save",
     usage="!store save <path>",
@@ -460,3 +460,9 @@ registry.annotate_sub(
     usage="!store load <path>",
     desc="Load matches and channel bindings from a JSON file."
 )
+
+# ---- Automated Help command (shows available commands----------------------------------------------------------
+@registry.command("help", usage="!help [command [sub]]", desc="Show command usage. Try `!help ent` or `!help ent move`.")
+async def help_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    title, body = registry.help_for(args)
+    await ctx.send(f"**{title}**\n{body}")
