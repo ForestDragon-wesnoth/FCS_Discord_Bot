@@ -206,18 +206,31 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         lines = [f"`{n}`" + ("  ← default" if n == mgr.default_system_name else "") for n in names]
         return await ctx.send("Systems:\n" + ("\n".join(lines) or "(none)"))
     sub = args[0]
+    if sub == "list":
+        systems = mgr.systems
+        if not systems:
+            return await ctx.send("No game systems exist yet.")
+        lines = [f"- **{name}**" for name in systems]
+        return await ctx.send("Current game systems:\n" + "\n".join(lines))
+    if sub == "info":
+        if await return_help_if_not_enough_args(ctx, args, 2, "system", "info"):
+            return
+        name = args[1]
+        s = mgr.get_system(name)
+        # Show whether it's the current default
+        default_badge = " (default)" if name == mgr.default_system_name else ""
+        settings = (getattr(s, "settings", {}) or {})
+        if not settings:
+            return await ctx.send(f"**{name}**{default_badge} has no custom settings (using engine defaults).")
+        # Pretty-print key/values in a stable order
+        lines = [f"- `{k}` = {repr(v)}" for k, v in sorted(settings.items(), key=lambda kv: kv[0])]
+        return await ctx.send(f"**{name}**{default_badge} settings:\n" + "\n".join(lines))
     if sub == "new":
         if await return_help_if_not_enough_args(ctx, args, 2, "system", "new"):
             return
         name = args[1]
         mgr.create_system(name)
         return await ctx.send(f"Created GameSystem `{name}`.")
-    if sub == "show":
-        if await return_help_if_not_enough_args(ctx, args, 2, "system", "show"):
-            return
-        name = args[1]
-        s = mgr.get_system(name)
-        return await ctx.send(f"**{name}** settings = {s.settings or '{}'}")
     if sub == "set":
         if await return_help_if_not_enough_args(ctx, args, 4, "system", "set"):
             return
@@ -252,9 +265,9 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send("Scope must be one of: global | server | channel")
     title, body = registry.help_for(["system"])
     return await ctx.send(f"**{title}**\n{body}")
-
+registry.annotate_sub("system", "list", usage="!system list", desc="List existing GameSystems.")
+registry.annotate_sub("system", "info", usage="!system info <name>", desc="Show a GameSystem's settings.")
 registry.annotate_sub("system", "new", usage="!system new <name>", desc="Create a GameSystem.")
-registry.annotate_sub("system", "show", usage="!system show <name>", desc="Show a GameSystem's settings.")
 registry.annotate_sub("system", "set", usage="!system set <name> <key> <value>", desc="Change a GameSystem setting (booleans/int auto-coerced).")
 registry.annotate_sub("system", "default", usage="!system default <global|server|channel> <name>", desc="Set default GameSystem.")
 
