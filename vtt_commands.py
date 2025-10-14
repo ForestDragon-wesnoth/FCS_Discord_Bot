@@ -202,6 +202,8 @@ registry.annotate_sub(
 )
 
 # ---- system (gamesystem commands)-----
+
+#TODO: add "delete" command for gamesystems (but TEST IT VERY CAREFULLY, like making sure there is always at least one gamesystem per server that's defaulted to, etc.)
 @registry.command("system", usage="!system <subcommand> ...", desc="Manage GameSystems and defaults (global/server/channel).")
 async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
