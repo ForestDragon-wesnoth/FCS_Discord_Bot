@@ -57,6 +57,17 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "desc": "Default facing used when spawn_face_toward_center is False.",
     },
     # OPTIONS THAT ARE NOT YET IMPLEMENTED (examples for future)
+    ##UI rules:
+    ## Entity line formatting (shown in !ent info / !state listings)
+    #"entity_line_format": {
+    #    "default": "{name} ({id}): HP: {hp}/{max_hp} X,Y: {x},{y} facing {facing}",
+    #    "schema": {"type": "str"},
+    #    "desc": (
+    #        "Template for a single entity row. Allowed placeholders are simple identifiers like {name}, "
+    #        "{hp}, {max_hp}, {x}, {y}, {facing}, {team}, {initiative}, {status_csv}, and any valid-identifier "
+    #        "keys from extras (e.g. {stamina}). No attribute/item access, conversions, or format specs."
+    #    ),
+    #},
     # "movement_block_through": {
     #     "default": False,
     #     "schema": {"type": "bool"},
@@ -118,6 +129,11 @@ def _coerce_rule_value(key: str, raw_value: str):
             return v
         allowed = ", ".join(sorted(choices))
         raise VTTError(f"Setting '{key}' must be one of: {allowed}")
+
+    if t == "str":
+        # keep raw as-is; CLI passes a single token
+        # (you can extend later to join the rest of args for multi-word strings)
+        return raw_value
 
     raise VTTError(f"Invalid schema for setting '{key}'.")
 
