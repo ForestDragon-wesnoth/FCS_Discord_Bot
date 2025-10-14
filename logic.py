@@ -37,6 +37,8 @@ ALLOWED_DIRECTIONS: Set[str] = {"up", "down", "left", "right"}
 
 #default rules for GameSystem
 
+#IMPORTANT: each time I add new rules, add them to RULE_SCHEMA for acceptable values!!!
+
 DEFAULT_SYSTEM_SETTINGS: Dict[str, Any] = {
 # Spawning / facing
 "spawn_face_toward_center": True,
@@ -49,6 +51,51 @@ DEFAULT_SYSTEM_SETTINGS: Dict[str, Any] = {
 #"friendlyfire": False, # if True, there is no automatic restrictions about attacks hitting units on the same team, if False, then attacks including AOE attacks can't hit allies
 
 }
+# ---- GameSystem setting schema (strict validation) ---------------------------
+# type can be: "bool", "int", "enum"
+RULE_SCHEMA = {
+    "spawn_face_toward_center": {"type": "bool"},
+    "spawn_default_facing": {"type": "enum", "choices": ALLOWED_DIRECTIONS},
+    # Future examples:
+    # "movement_blocks_through": {"type": "bool"},
+    # "some_integer_rule": {"type": "int"},
+}
+
+#functions to use alongside RULE_SCHEMA
+def _parse_bool(token: str) -> bool:
+    t = token.strip().lower()
+    if t in ("true", "t"): return True
+    if t in ("false", "f"): return False
+    # If you prefer *only* true/false, delete lines above and use the two ifs.
+    raise VTTError("Expected a boolean: use 'true' or 'false'.")
+
+def _coerce_rule_value(key: str, raw_value: str):
+    # Unknown key? block (prevents typos or unimplemented settings)
+    if key not in RULE_SCHEMA:
+        allowed = ", ".join(sorted(RULE_SCHEMA.keys()))
+        raise VTTError(f"Unknown setting '{key}'. Allowed: {allowed}")
+
+    spec = RULE_SCHEMA[key]
+    t = spec["type"]
+
+    if t == "bool":
+        return _parse_bool(raw_value)
+
+    if t == "int":
+        try:
+            return int(raw_value, 10)
+        except ValueError:
+            raise VTTError(f"Setting '{key}' expects an integer.")
+
+    if t == "enum":
+        choices = spec["choices"]
+        v = raw_value.strip().lower()
+        if v in choices:
+            return v
+        allowed = ", ".join(sorted(choices))
+        raise VTTError(f"Setting '{key}' must be one of: {allowed}")
+
+    raise VTTError(f"Invalid schema for setting '{key}'.")
 
 
 def _dominant_axis_dir(dx: int, dy: int) -> Direction:

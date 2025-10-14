@@ -2,7 +2,10 @@
 # vtt_commands.py
 from __future__ import annotations
 from typing import Callable, Dict, List, Optional, Protocol, Any, Tuple
-from logic import MatchManager, Entity, VTTError, OutOfBounds, Occupied, NotFound, DuplicateId
+from logic import MatchManager, Entity, VTTError, OutOfBounds, Occupied, NotFound, DuplicateId, _coerce_rule_value, _parse_bool
+
+#used for Gamesystem-related commands
+from logic import DEFAULT_SYSTEM_SETTINGS, ALLOWED_DIRECTIONS, RULE_SCHEMA
 
 # ---- Context abstraction -----------------------------------------------------
 class ReplyContext(Protocol):
@@ -230,22 +233,24 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         name = args[1]
         mgr.create_system(name)
-        return await ctx.send(f"Created GameSystem `{name}`.")
+        return await ctx.send(f"Created GameSystem `{name}`.")    
     if sub == "set":
         if await return_help_if_not_enough_args(ctx, args, 4, "system", "set"):
             return
-        name, key, value = args[1], args[2], args[3]
-        # coerce booleans/ints where reasonable
-        if value.lower() in ("true", "false"):
-            value = value.lower() == "true"
-        else:
-            try:
-                value = int(value)
-            except ValueError:
-                pass
+        name, key, raw_value = args[1], args[2], args[3]
+    
+        # hard block unknown keys (also guards against keys that exist in DEFAULT_SYSTEM_SETTINGS
+        # but we haven't made safe yet)
+        value = _coerce_rule_value(key, raw_value)
+    
+        # optional: ensure the key exists in defaults too, so saves show a stable shape
+        if key not in DEFAULT_SYSTEM_SETTINGS:
+            # You can relax this if you want to allow brand-new custom keys
+            raise VTTError(f"'{key}' is not in engine defaults. Add it to DEFAULT_SYSTEM_SETTINGS first.")
+    
         s = mgr.get_system(name)
         s.set(key, value)
-        return await ctx.send(f"`{name}`.{key} = {value}")
+        return await ctx.send(f"`{name}`.{key} = {value!r}")
     if sub == "default":
         if await return_help_if_not_enough_args(ctx, args, 3, "system", "default"):
             return
@@ -328,7 +333,10 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "tp":#and len(args) >= 4:
         if await return_help_if_not_enough_args(ctx, args, 4, "ent", "tp"):
             return
-        eid = args[1]; x = int(args[2]); y = int(args[3])
+        eid = args[1]; 
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        x = int(args[2]); y = int(args[3])
         m.entities[eid].tp(x, y)
         return await ctx.send(f"Teleported `{eid}` to ({x},{y}).")
 
@@ -336,7 +344,9 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "move":# and len(args) >= 3:
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "move"):
             return
-        eid = args[1]
+        eid = args[1]; 
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
         tokens = " ".join(args[2:]).replace(",", " ").split()
         if not tokens:
             # Defer to help for usage details
@@ -371,7 +381,10 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "face":# and len(args) >= 3:
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "face"):
             return
-        eid = args[1]; dir_ = args[2].lower()
+        eid = args[1]; 
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        dir_ = args[2].lower()
         mapping = {"u":"up","d":"down","l":"left","r":"right"}
         dir_full = mapping.get(dir_, dir_)
         if dir_full not in ("up","down","left","right"):
@@ -383,7 +396,10 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "hp":# and len(args) >= 3:
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "hp"):
             return
-        eid = args[1]; delta = int(args[2])
+        eid = args[1]; 
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")        
+        delta = int(args[2])
         if delta >= 0:
             m.entities[eid].heal_entity(delta)
             return await ctx.send(f"Healed `{eid}` by {delta}.")
@@ -395,7 +411,10 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "init":# and len(args) >= 3:
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "init"):
             return
-        eid = args[1]; value = int(args[2])
+        eid = args[1]; 
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")        
+        value = int(args[2])
         m.entities[eid].set_initiative_entity(value)
         return await ctx.send(f"Set initiative of `{eid}` to {value}.")
     # Fallback: show authoritative help for the root command
