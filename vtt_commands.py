@@ -5,7 +5,7 @@ from typing import Callable, Dict, List, Optional, Protocol, Any, Tuple
 from logic import MatchManager, Entity, VTTError, OutOfBounds, Occupied, NotFound, DuplicateId, _coerce_rule_value, _parse_bool
 
 #used for Gamesystem-related commands
-from logic import DEFAULT_SYSTEM_SETTINGS, ALLOWED_DIRECTIONS, RULE_SCHEMA
+from logic import DEFAULT_SYSTEM_SETTINGS, ALLOWED_DIRECTIONS, RULE_SCHEMA, RULES_REGISTRY
 
 # ---- Context abstraction -----------------------------------------------------
 class ReplyContext(Protocol):
@@ -218,16 +218,66 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "info":
         if await return_help_if_not_enough_args(ctx, args, 2, "system", "info"):
             return
+    
         name = args[1]
         s = mgr.get_system(name)
-        # Show whether it's the current default
         default_badge = " (default)" if name == mgr.default_system_name else ""
-        settings = (getattr(s, "settings", {}) or {})
-        if not settings:
-            return await ctx.send(f"**{name}**{default_badge} has no custom settings (using engine defaults).")
-        # Pretty-print key/values in a stable order
-        lines = [f"- `{k}` = {repr(v)}" for k, v in sorted(settings.items(), key=lambda kv: kv[0])]
-        return await ctx.send(f"**{name}**{default_badge} settings:\n" + "\n".join(lines))
+    
+        overridden_lines: List[str] = []
+        inherited_lines: List[str] = []
+    
+        for k in sorted(RULES_REGISTRY.keys()):
+            spec = RULES_REGISTRY[k]
+            schema = spec["schema"]
+            t = schema.get("type")
+            extra = ""
+            if t == "enum":
+                extra = f", one of {{{', '.join(sorted(schema.get('choices', [])))}}}"
+    
+            effective_val = s.get(k)
+            default_val = DEFAULT_SYSTEM_SETTINGS.get(k)
+            desc = spec.get("desc", "")
+    
+            if k in (s.settings or {}) and s.settings[k].value != default_val:
+                overridden_lines.append(
+                    f"- `{k}` = {effective_val!r} — {desc} (type: {t}{extra})"
+                )
+            else:
+                inherited_lines.append(
+                    f"- `{k}` = {default_val!r} — {desc} (type: {t}{extra})"
+                )
+    
+        if not overridden_lines:
+            overridden_lines = ["(none)"]
+        if not inherited_lines:
+            inherited_lines = ["(none)"]
+    
+        header = f"**{name}**{default_badge} — rule breakdown"
+        msg = (
+            f"{header}\n\n"
+            f"**Rules overwritten by this system:**\n"
+            + "\n".join(overridden_lines)
+            + "\n\n**Rules inherited from default:**\n"
+            + "\n".join(inherited_lines)
+        )
+    
+        return await ctx.send(msg)
+
+    if sub == "rules":
+        lines: List[str] = []
+        for k in sorted(RULES_REGISTRY.keys()):
+            spec = RULES_REGISTRY[k]
+            schema = spec["schema"]
+            t = schema.get("type")
+            extra = ""
+            if t == "enum":
+                extra = f", one of {{{', '.join(sorted(schema.get('choices', [])))}}}"
+            default_val = DEFAULT_SYSTEM_SETTINGS.get(k)
+            desc = spec.get("desc", "")
+            lines.append(
+                f"- `{k}` — {desc} (type: {t}{extra}; default: {default_val!r})"
+            )
+        return await ctx.send("**All rules**\n" + ("\n".join(lines) or "(none)"))
     if sub == "new":
         if await return_help_if_not_enough_args(ctx, args, 2, "system", "new"):
             return
@@ -272,6 +322,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     return await ctx.send(f"**{title}**\n{body}")
 registry.annotate_sub("system", "list", usage="!system list", desc="List existing GameSystems.")
 registry.annotate_sub("system", "info", usage="!system info <name>", desc="Show a GameSystem's settings.")
+registry.annotate_sub("system", "rules", usage="!system rules", desc="List all available rules, their defaults, their types, and descriptions")
 registry.annotate_sub("system", "new", usage="!system new <name>", desc="Create a GameSystem.")
 registry.annotate_sub("system", "set", usage="!system set <name> <key> <value>", desc="Change a GameSystem setting (booleans/int auto-coerced).")
 registry.annotate_sub("system", "default", usage="!system default <global|server|channel> <name>", desc="Set default GameSystem.")

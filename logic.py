@@ -35,31 +35,52 @@ class DuplicateId(VTTError):
 Direction = Literal["up", "down", "left", "right"]
 ALLOWED_DIRECTIONS: Set[str] = {"up", "down", "left", "right"}
 
-#default rules for GameSystem
 
-#IMPORTANT: each time I add new rules, add them to RULE_SCHEMA for acceptable values!!!
+# ---- Rule registry & model ---------------------------------------------------
+# Each rule now has a default, schema, and description. GameSystems store
+# per-system overrides as Rule objects (key/value/schema/description).
+#
+# Schema types: "bool", "int", "enum"
+RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
+    # Spawning / facing
+    "spawn_face_toward_center": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": "If True, new entities face toward the map center at spawn; if False, use spawn_default_facing.",
+    },
+    "spawn_default_facing": {
+        "default": "up",
+        "schema": {"type": "enum", "choices": ALLOWED_DIRECTIONS},
+        "desc": "Default facing used when spawn_face_toward_center is False.",
+    },
+    # OPTIONS THAT ARE NOT YET IMPLEMENTED (examples for future)
+    # "movement_block_through": {
+    #     "default": False,
+    #     "schema": {"type": "bool"},
+    #     "desc": "If True, stepwise movement collides with units.",
+    # },
+    # "friendlyfire": {
+    #     "default": False,
+    #     "schema": {"type": "bool"},
+    #     "desc": "If True, attacks can hit allies; if False, allies are auto-excluded.",
+    # },
+}
 
+# Backwards-compatibility helpers (engine defaults & bare schema maps)
 DEFAULT_SYSTEM_SETTINGS: Dict[str, Any] = {
-# Spawning / facing
-"spawn_face_toward_center": True,
-"spawn_default_facing": "up", # used when ^ is False
-
-#OPTIONS THAT ARE NOT YET IMPLEMENTED
-## Movement
-#"movement_block_through": False, # if True, stepwise movement collides with units
-## Combat
-#"friendlyfire": False, # if True, there is no automatic restrictions about attacks hitting units on the same team, if False, then attacks including AOE attacks can't hit allies
-
+    k: v["default"] for k, v in RULES_REGISTRY.items()
 }
-# ---- GameSystem setting schema (strict validation) ---------------------------
-# type can be: "bool", "int", "enum"
-RULE_SCHEMA = {
-    "spawn_face_toward_center": {"type": "bool"},
-    "spawn_default_facing": {"type": "enum", "choices": ALLOWED_DIRECTIONS},
-    # Future examples:
-    # "movement_blocks_through": {"type": "bool"},
-    # "some_integer_rule": {"type": "int"},
+RULE_SCHEMA: Dict[str, Dict[str, Any]] = {
+    k: v["schema"] for k, v in RULES_REGISTRY.items()
 }
+
+@dataclass
+class Rule:
+    key: str
+    value: Any
+    schema: Dict[str, Any]
+    description: str
+
 
 #functions to use alongside RULE_SCHEMA
 def _parse_bool(token: str) -> bool:
@@ -118,25 +139,57 @@ def _default_facing_for(x: int, y: int, width: int, height: int) -> Direction:
 @dataclass
 class GameSystem:
     name: str
-    settings: Dict[str, Any] = field(default_factory=dict)
-
-
+    # Per-system overrides now stored as Rule objects keyed by rule key
+    settings: Dict[str, Rule] = field(default_factory=dict)
+ 
     def get(self, key: str) -> Any:
         if key in self.settings:
-            return self.settings[key]
+            return self.settings[key].value
+        # fall back to engine default from registry
         return DEFAULT_SYSTEM_SETTINGS.get(key)
     
     def set(self, key: str, value: Any) -> None:
-        self.settings[key] = value
-    
+        # Build a Rule object from the registry entry and store/overwrite it
+        if key not in RULES_REGISTRY:
+            allowed = ", ".join(sorted(RULES_REGISTRY.keys()))
+            raise VTTError(f"Unknown setting '{key}'. Allowed: {allowed}")
+        reg = RULES_REGISTRY[key]
+        self.settings[key] = Rule(
+            key=key,
+            value=value,
+            schema=reg["schema"],
+            description=reg["desc"],
+        )
     
     def to_dict(self) -> Dict[str, Any]:
-        return {"name": self.name, "settings": self.settings}
-    
+        # Serialize Rule objects in a stable shape
+        return {
+            "name": self.name,
+            "settings": {
+                k: {
+                    "value": r.value,
+                    "schema": r.schema,
+                    "description": r.description,
+                } for k, r in self.settings.items()
+            },
+        }
     
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "GameSystem":
-        return GameSystem(name=d["name"], settings=d.get("settings", {}))
+        raw = d.get("settings", {}) or {}
+        settings: Dict[str, Rule] = {}
+        # Back-compat: allow old saves that stored plain values
+        for k, v in raw.items():
+            if isinstance(v, dict) and "value" in v and "schema" in v:
+                val = v["value"]
+                schema = v.get("schema") or RULES_REGISTRY.get(k, {}).get("schema", {})
+                desc = v.get("description") or RULES_REGISTRY.get(k, {}).get("desc", "")
+            else:
+                val = v
+                schema = RULES_REGISTRY.get(k, {}).get("schema", {})
+                desc = RULES_REGISTRY.get(k, {}).get("desc", "")
+            settings[k] = Rule(key=k, value=val, schema=schema, description=desc)
+        return GameSystem(name=d["name"], settings=settings)
 
 # -------------------------
 # Entity
@@ -457,7 +510,7 @@ class MatchManager:
         self.active_by_channel: Dict[str, str] = {}
         # GameSystems
         self.systems: Dict[str, GameSystem] = {
-            "default": GameSystem("default", settings=dict(DEFAULT_SYSTEM_SETTINGS))
+            "default": GameSystem("default", settings={})
         }
         self.default_system_name: str = "default"
         self.default_system_per_server: Dict[str, str] = {}
@@ -507,8 +560,11 @@ class MatchManager:
         sysobj = self.get_system(system_name) if system_name else (
             self.effective_system(channel_key or "CLI")
         )
+        # Denormalized rule values for quick access in Match:
         rules = dict(DEFAULT_SYSTEM_SETTINGS)
-        rules.update(sysobj.settings)
+        # Overlay system overrides
+        for k, r in (getattr(sysobj, "settings", {}) or {}).items():
+            rules[k] = r.value
         m = Match(id=match_id, name=name, grid_width=width, grid_height=height,
                   system_name=sysobj.name, rules=rules)
         self.matches[m.id] = m
