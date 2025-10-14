@@ -264,14 +264,15 @@ class Entity:
             raise OutOfBounds(f"({x},{y}) outside {match.grid_width}x{match.grid_height}")
         if match.is_occupied(x, y):
             raise Occupied(f"Cell ({x},{y}) already occupied")
+        if self.id in match.entities:
+            raise DuplicateId(f"Entity id '{self.id}' already exists in this match")
 
         self.move_to(x, y)
+
         self.bind(match)
         if initiative is not None:
             self.initiative = initiative
 
-        if self.id in match.entities:
-            raise DuplicateId(f"Entity id '{self.id}' already exists in this match")
         match.entities[self.id] = self
         match._rebuild_turn_order()
         return self.id
@@ -637,7 +638,9 @@ class MatchManager:
                     m.system_name = self.default_system_name
                 # refresh rules = defaults + system settings
                 base = dict(DEFAULT_SYSTEM_SETTINGS)
-                base.update(self.systems[m.system_name].settings)
+                base = dict(DEFAULT_SYSTEM_SETTINGS)
+                for k, r in (self.systems[m.system_name].settings or {}).items():
+                    base[k] = r.value
                 m.rules = base
                 for e in m.entities.values():
                     e.bind(m)
