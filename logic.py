@@ -224,11 +224,11 @@ class Entity:
 
     # ---------- binding ----------
     #bind this entity to a specific match
-    def bind(self, match: "Match"):
+    def bind(self, match: "Match", *, set_spawn_facing: bool = True):
         self._match = match
-        if match.in_bounds(self.x, self.y):
+        if set_spawn_facing and match.in_bounds(self.x, self.y):
             try:
-                # Initial facing according to system
+                # Initial facing according to system (only when spawning, not loading)
                 self.facing = match._spawn_facing(self.x, self.y)
             except Exception:
                 pass
@@ -269,7 +269,7 @@ class Entity:
 
         self.move_to(x, y)
 
-        self.bind(match)
+        self.bind(match, set_spawn_facing=True)
         if initiative is not None:
             self.initiative = initiative
 
@@ -454,7 +454,7 @@ class Match:
         )
         for eid, ed in d.get("entities", {}).items():
             e = Entity.from_dict(ed)
-            e.bind(m)
+            e.bind(m, set_spawn_facing=False)
             m.entities[eid] = e
         m.turn_order = d.get("turn_order", [])
         m.active_index = d.get("active_index", 0)
@@ -645,7 +645,7 @@ class MatchManager:
                     base[k] = r.value
                 m.rules = base
                 for e in m.entities.values():
-                    e.bind(m)
+                    e.bind(m, set_spawn_facing=False)
         except Exception as e:
             # Defensive: any schema mismatch should be surfaced as a friendly VTTError
             raise VTTError(f"Invalid save file format in '{path}': {e}")
