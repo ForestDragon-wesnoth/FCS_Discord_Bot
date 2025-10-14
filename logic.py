@@ -29,23 +29,71 @@ class DuplicateId(VTTError):
 # Data Models
 # -------------------------
 
+# -------------------------
+# Types & helpers
+# -------------------------
 Direction = Literal["up", "down", "left", "right"]
-ALLOWED_DIRECTIONS: tuple[Direction, ...] = ("up", "down", "left", "right")
+ALLOWED_DIRECTIONS: Set[str] = {"up", "down", "left", "right"}
+
+#default rules for GameSystem
+
+DEFAULT_SYSTEM_SETTINGS: Dict[str, Any] = {
+# Spawning / facing
+"spawn_face_toward_center": True,
+"spawn_default_facing": "up", # used when ^ is False
+
+#OPTIONS THAT ARE NOT YET IMPLEMENTED
+## Movement
+#"movement_block_through": False, # if True, stepwise movement collides with units
+## Combat
+#"friendlyfire": False, # if True, there is no automatic restrictions about attacks hitting units on the same team, if False, then attacks including AOE attacks can't hit allies
+
+}
+
 
 def _dominant_axis_dir(dx: int, dy: int) -> Direction:
-    # ties prefer vertical (feel free to change)
+    # ties prefer vertical
     if abs(dy) >= abs(dx):
         return "down" if dy > 0 else "up"
     else:
         return "right" if dx > 0 else "left"
 
 def _default_facing_for(x: int, y: int, width: int, height: int) -> Direction:
-    # Face toward the map's center (1-based grid). Center can be fractional; use dominant axis.
     cx = (width + 1) / 2
     cy = (height + 1) / 2
     dx = cx - x
     dy = cy - y
     return _dominant_axis_dir(int(round(dx)), int(round(dy)))
+
+# -------------------------
+# GameSystem (stores global rules for a game system, so not everything has to be manually set each match)
+# -------------------------
+@dataclass
+class GameSystem:
+    name: str
+    settings: Dict[str, Any] = field(default_factory=dict)
+
+
+    def get(self, key: str) -> Any:
+        if key in self.settings:
+            return self.settings[key]
+        return DEFAULT_SYSTEM_SETTINGS.get(key)
+    
+    def set(self, key: str, value: Any) -> None:
+        self.settings[key] = value
+    
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {"name": self.name, "settings": self.settings}
+    
+    
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> "GameSystem":
+        return GameSystem(name=d["name"], settings=d.get("settings", {}))
+
+# -------------------------
+# Entity
+# -------------------------
 
 @dataclass
 class Entity:
@@ -75,11 +123,13 @@ class Entity:
             self.facing = "up"
 
     # ---------- binding ----------
+    #bind this entity to a specific match
     def bind(self, match: "Match"):
         self._match = match
         if match.in_bounds(self.x, self.y):
             try:
-                self.facing = _default_facing_for(self.x, self.y, match.grid_width, match.grid_height)
+                # Initial facing according to system
+                self.facing = match._spawn_facing(self.x, self.y)
             except Exception:
                 pass
 
@@ -206,19 +256,27 @@ class Entity:
         d.pop("_match", None)
         return Entity(**d)
 
+# -------------------------
+# Match
+# -------------------------
 @dataclass
 class Match:
     id: str
     name: str
     grid_width: int
     grid_height: int
+
+    # Game system binding - currently NOT YET DIRECTLY CONNECTED TO A GAMESYSTEM CLASS, JUST COPYING THE NAME AND DICTIONARY OF RULES FROM IT.
+    system_name: str
+
     entities: Dict[str, Entity] = field(default_factory=dict)
     turn_order: List[str] = field(default_factory=list)
     active_index: int = 0
-    rules: Dict[str, Any] = field(default_factory=dict)
     #global turn counter, starts at 1. global turn here increments by 1 after EVERY entity had its turn and the cycle resets
     turn_number: int = 1
-
+    # Game system binding - currently NOT YET DIRECTLY CONNECTED TO A GAMESYSTEM CLASS, JUST COPYING THE DICTIONARY OF RULES FROM IT.
+    rules: Dict[str, Any] = field(default_factory=dict)  # denormalized copy for fast access
+ 
     # ---- global constraints / helpers (unchanged in spirit) ----
     def in_bounds(self, x: int, y: int) -> bool:
         return 1 <= x <= self.grid_width and 1 <= y <= self.grid_height
@@ -276,27 +334,29 @@ class Match:
             "entities": {eid: e.to_dict() for eid, e in self.entities.items()},
             "turn_order": self.turn_order,
             "active_index": self.active_index,
+            "system_name": self.system_name,
             "rules": self.rules,
             "turn_number": self.turn_number,
         }
 
     @staticmethod
-    def from_dict(data: Dict[str, Any]) -> "Match":
+    def from_dict(d: Dict[str, Any]) -> "Match":
         m = Match(
-            id=data["id"],
-            name=data["name"],
-            grid_width=data["grid_width"],
-            grid_height=data["grid_height"],
+            id=d["id"],
+            name=d["name"],
+            grid_width=d["grid_width"],
+            grid_height=d["grid_height"],
+            system_name=d.get("system_name", "default"),
+            rules=d.get("rules", {}),
         )
-        for eid, ed in data.get("entities", {}).items():
+        for eid, ed in d.get("entities", {}).items():
             e = Entity.from_dict(ed)
             e.bind(m)
             m.entities[eid] = e
-        m.turn_order = data.get("turn_order", [])
-        m.active_index = data.get("active_index", 0)
-        m.rules = data.get("rules", {})
-        # default to 1 if absent in saves
-        m.turn_number = int(data.get("turn_number", 1))
+        m.turn_order = d.get("turn_order", [])
+        m.active_index = d.get("active_index", 0)
+        # m.rules already set above
+        m.turn_number = int(d.get("turn_number", 1))
         return m
 
     # ------------- simple ASCII render for quick debugging -------------
@@ -321,6 +381,12 @@ class Match:
         lines = [" ".join(row[1:]) for row in grid[1:]]
         return "\n".join(lines)
 
+    def _spawn_facing(self, x: int, y: int) -> Direction:
+        if self.rules.get("spawn_face_toward_center", True):
+            return _default_facing_for(x, y, self.grid_width, self.grid_height)
+        d = self.rules.get("spawn_default_facing", "up")
+        return d if d in ALLOWED_DIRECTIONS else "up"
+
     def entities_in_turn_order(self) -> List["Entity"]:
         # Returns Entity objects in current turn order; appends any missing at the end
         ordered = []
@@ -335,18 +401,69 @@ class Match:
         return ordered
 
 # -------------------------
-# Manager (multi-match + simple persistence)
+# Match Manager (multi-match, now stores GameSystems and defaults))
 # -------------------------
 class MatchManager:
     def __init__(self):
         self.matches: Dict[str, Match] = {}
         # optional: track per-channel active match
         self.active_by_channel: Dict[str, str] = {}
+        # GameSystems
+        self.systems: Dict[str, GameSystem] = {
+            "default": GameSystem("default", settings=dict(DEFAULT_SYSTEM_SETTINGS))
+        }
+        self.default_system_name: str = "default"
+        self.default_system_per_server: Dict[str, str] = {}
+        self.default_system_per_channel: Dict[str, str] = {}
 
-    def create_match(self, match_id: str, name: str, width: int, height: int) -> str:
+    # ----- game systems -----
+    def list_systems(self) -> List[str]:
+        return sorted(self.systems.keys())
+
+    def get_system(self, name: str) -> GameSystem:
+        if name not in self.systems:
+            raise NotFound(f"GameSystem '{name}' not found")
+        return self.systems[name]
+
+    def create_system(self, name: str, settings: Optional[Dict[str, Any]] = None):
+        if name in self.systems:
+            raise DuplicateId(f"GameSystem '{name}' already exists")
+        self.systems[name] = GameSystem(name, settings or {})
+
+    def set_global_default_system(self, name: str):
+        self.get_system(name)
+        self.default_system_name = name
+
+    def set_server_default_system(self, server_id: str, name: str):
+        self.get_system(name)
+        self.default_system_per_server[server_id] = name
+
+    def set_channel_default_system(self, channel_key: str, name: str):
+        self.get_system(name)
+        self.default_system_per_channel[channel_key] = name
+
+    def effective_system_name(self, channel_key: str) -> str:
+        # channel_key is typically "<server_id>:<channel_id>"
+        server_id = channel_key.split(":", 1)[0] if ":" in channel_key else channel_key
+        return self.default_system_per_channel.get(
+            channel_key,
+            self.default_system_per_server.get(server_id, self.default_system_name)
+        )
+
+    def effective_system(self, channel_key: str) -> GameSystem:
+        return self.get_system(self.effective_system_name(channel_key))
+
+    # ----- matches -----
+    def create_match(self, match_id: str, name: str, width: int, height: int, channel_key: Optional[str] = None, system_name: Optional[str] = None) -> str:
         if match_id in self.matches:
             raise DuplicateId(f"Match id '{match_id}' already exists")
-        m = Match(name=name, grid_width=width, grid_height=height, id=match_id)
+        sysobj = self.get_system(system_name) if system_name else (
+            self.effective_system(channel_key or "CLI")
+        )
+        rules = dict(DEFAULT_SYSTEM_SETTINGS)
+        rules.update(sysobj.settings)
+        m = Match(id=match_id, name=name, grid_width=width, grid_height=height,
+                  system_name=sysobj.name, rules=rules)
         self.matches[m.id] = m
         return m.id
 
@@ -380,7 +497,11 @@ class MatchManager:
     def save(self, path: str):
         data = {
             "matches": {mid: m.to_dict() for mid, m in self.matches.items()},
-            "active_by_channel": dict(self.active_by_channel),
+            "active_by_channel": self.active_by_channel,
+            "systems": {name: s.to_dict() for name, s in self.systems.items()},
+            "default_system_name": self.default_system_name,
+            "default_system_per_server": self.default_system_per_server,
+            "default_system_per_channel": self.default_system_per_channel,
         }
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -400,6 +521,23 @@ class MatchManager:
         try:
             self.matches = {mid: Match.from_dict(md) for mid, md in data.get("matches", {}).items()}
             self.active_by_channel = data.get("active_by_channel", {})
+            # systems
+            sysdict = data.get("systems", {"default": {"name": "default", "settings": dict(DEFAULT_SYSTEM_SETTINGS)}})
+            self.systems = {name: GameSystem.from_dict(sd) for name, sd in sysdict.items()}
+            self.default_system_name = data.get("default_system_name", "default")
+            self.default_system_per_server = data.get("default_system_per_server", {})
+            self.default_system_per_channel = data.get("default_system_per_channel", {})
+            # re-bind matches to ensure entity defaults consistent
+            for m in self.matches.values():
+                # If system missing, fall back to global default
+                if m.system_name not in self.systems:
+                    m.system_name = self.default_system_name
+                # refresh rules = defaults + system settings
+                base = dict(DEFAULT_SYSTEM_SETTINGS)
+                base.update(self.systems[m.system_name].settings)
+                m.rules = base
+                for e in m.entities.values():
+                    e.bind(m)
         except Exception as e:
             # Defensive: any schema mismatch should be surfaced as a friendly VTTError
             raise VTTError(f"Invalid save file format in '{path}': {e}")

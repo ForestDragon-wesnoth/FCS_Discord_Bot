@@ -126,7 +126,7 @@ async def return_help_if_not_enough_args(
     return False
 
 # ---- Commands ----------------------------------------------------------------
-@registry.command("match", usage="!match | !match new <id> <name> <w> <h> | !match use <id>", desc="List matches, create one, or switch the active match for this channel.")
+@registry.command("match", usage="!match <subcommand> ...", desc="List matches, create one, or switch the active match for this channel.")
 async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
         pairs = mgr.list()
@@ -137,15 +137,28 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "new":# and len(args) >= 5:
         if await return_help_if_not_enough_args(ctx, args, 5, "match", "new"):
             return
-        match_id = args[1]; name = args[2]; w = int(args[3]); h = int(args[4])
-        mid = mgr.create_match(match_id, name, w, h)
-        return await ctx.send(f"Created **{name}** with id `{mid}`.")
+        match_id, name, w, h = args[1], args[2], int(args[3]), int(args[4])
+        system_name = None
+        # parse optional --system <name>
+        i = 5
+        while i < len(args):
+            if args[i] in ("--system", "-s") and i + 1 < len(args):
+                system_name = args[i+1]
+                i += 2
+            elif args[i].startswith("system="):
+                system_name = args[i].split("=", 1)[1]
+                i += 1
+            else:
+                i += 1
+        mid = mgr.create_match(match_id, name, w, h, channel_key=ctx.channel_key, system_name=system_name)
+        return await ctx.send(f"Created match `{name}` with id `{mid}` using system `{mgr.get(mid).system_name}`.")
     if sub == "use":# and len(args) >= 2:
         if await return_help_if_not_enough_args(ctx, args, 2, "match", "use"):
             return
         mid = args[1]
         mgr.set_active_for_channel(ctx.channel_key, mid)
-        return await ctx.send(f"Channel using match `{mid}`.")
+        m = mgr.matches.get(mid)
+        return await ctx.send(f"Active match is now **{m.name}** (`{mid}`, system `{m.system_name}`).")
     if sub == "delete":# and len(args) >= 2:
         if await return_help_if_not_enough_args(ctx, args, 2, "match", "delete"):
             return
@@ -166,8 +179,8 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 #annonate subcommands next to the command itself:
 registry.annotate_sub(
     "match", "new",
-    usage="!match new <id> <name> <w> <h>",
-    desc="Create a match with an explicit id, display name, and grid size."
+    usage="!match new <id> <name> <w> <h> [--system <name>]", 
+    desc="Create a match; optionally override the default GameSystem, the argument has to be started with --system."
 )
 registry.annotate_sub(
     "match", "use",
@@ -184,6 +197,66 @@ registry.annotate_sub(
     usage="!match rename <id> <new_name>",
     desc="Rename a selected match."
 )
+
+# ---- system (gamesystem commands)-----
+@registry.command("system", usage="!system <subcommand> ...", desc="Manage GameSystems and defaults (global/server/channel).")
+async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        names = mgr.list_systems()
+        lines = [f"`{n}`" + ("  ← default" if n == mgr.default_system_name else "") for n in names]
+        return await ctx.send("Systems:\n" + ("\n".join(lines) or "(none)"))
+    sub = args[0]
+    if sub == "new":
+        if await return_help_if_not_enough_args(ctx, args, 2, "system", "new"):
+            return
+        name = args[1]
+        mgr.create_system(name)
+        return await ctx.send(f"Created GameSystem `{name}`.")
+    if sub == "show":
+        if await return_help_if_not_enough_args(ctx, args, 2, "system", "show"):
+            return
+        name = args[1]
+        s = mgr.get_system(name)
+        return await ctx.send(f"**{name}** settings = {s.settings or '{}'}")
+    if sub == "set":
+        if await return_help_if_not_enough_args(ctx, args, 4, "system", "set"):
+            return
+        name, key, value = args[1], args[2], args[3]
+        # coerce booleans/ints where reasonable
+        if value.lower() in ("true", "false"):
+            value = value.lower() == "true"
+        else:
+            try:
+                value = int(value)
+            except ValueError:
+                pass
+        s = mgr.get_system(name)
+        s.set(key, value)
+        return await ctx.send(f"`{name}`.{key} = {value}")
+    if sub == "default":
+        if await return_help_if_not_enough_args(ctx, args, 3, "system", "default"):
+            return
+        scope = args[1]
+        name = args[2]
+        if scope == "global":
+            mgr.set_global_default_system(name)
+            return await ctx.send(f"Global default GameSystem is now `{name}`.")
+        elif scope == "server":
+            server_id = (ctx.channel_key.split(":",1)[0])
+            mgr.set_server_default_system(server_id, name)
+            return await ctx.send(f"Server default GameSystem for `{server_id}` is now `{name}`.")
+        elif scope == "channel":
+            mgr.set_channel_default_system(ctx.channel_key, name)
+            return await ctx.send(f"Channel default GameSystem is now `{name}`.")
+        else:
+            return await ctx.send("Scope must be one of: global | server | channel")
+    title, body = registry.help_for(["system"])
+    return await ctx.send(f"**{title}**\n{body}")
+
+registry.annotate_sub("system", "new", usage="!system new <name>", desc="Create a GameSystem.")
+registry.annotate_sub("system", "show", usage="!system show <name>", desc="Show a GameSystem's settings.")
+registry.annotate_sub("system", "set", usage="!system set <name> <key> <value>", desc="Change a GameSystem setting (booleans/int auto-coerced).")
+registry.annotate_sub("system", "default", usage="!system default <global|server|channel> <name>", desc="Set default GameSystem.")
 
 @registry.command("ent", usage="!ent <subcommand> ...", desc="Manage entities in the active match, lots of available sub-commands.")
 async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -211,6 +284,9 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "info":# and len(args) >= 2:
         if await return_help_if_not_enough_args(ctx, args, 2, "ent", "info"):
             return
+        eid = args[1]
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
         return await ctx.send(_entity_line(m.entities[eid]))
 
     # delete / remove
@@ -382,7 +458,7 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if eid not in m.turn_order:
             raise NotFound(f"Entity '{eid}' not in turn order.")
         m.active_index = m.turn_order.index(eid)
-        return await ctx.send(f"Turn set to `{eid}`.")
+        return await ctx.send(f"Active turn set to `{eid}` (round {m.turn_number})")
     # Fallback: show authoritative help
     title, body = registry.help_for(["turn"])
     return await ctx.send(f"**{title}**\n{body}")
@@ -403,7 +479,7 @@ registry.annotate_sub(
 @registry.command("match_toplevel", usage="!match_toplevel", desc="Show active match summary (name/id/turn number).")
 async def match_top_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
-    return await ctx.send(f"**{m.name}** `{m.id}`\nCurrent Turn Number: **{m.turn_number}**\n")
+    return await ctx.send(f"**{m.name}** `{m.id}`\nGame System: **{m.system_name}**\nCurrent Turn Number: **{m.turn_number}**\n")
 
 @registry.command("map", usage="!map", desc="Render the ASCII map for the active match.")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
