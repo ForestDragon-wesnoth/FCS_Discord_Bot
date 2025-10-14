@@ -343,6 +343,8 @@ class Entity:
         self.initiative = value
         self._require_match()._rebuild_turn_order()
 
+#SERIALIZING ENTITIES TO DICT CURRENTLY DOESN'T WORK BECAUSE OF RECURSION in asdict, since removal of match back-reference is done AFTER asdict
+#TODO: eventually return to fix saving/loading later, but for now it's put on hold
     # ---------- serialization ----------
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
