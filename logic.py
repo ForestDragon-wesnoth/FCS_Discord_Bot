@@ -25,6 +25,9 @@ class NotFound(VTTError):
 class DuplicateId(VTTError):
     pass
 
+class ReservedId(VTTError):
+    pass
+
 # -------------------------
 # Data Models
 # -------------------------
@@ -217,6 +220,9 @@ class Entity:
     _match: "Match | None" = field(default=None, repr=False, compare=False)
 
     def __post_init__(self):
+        # Disallow reserved ids that the CLI uses as shorthands (current/this are used if you want to get the id of the entity whose turn it is right now)
+        if str(self.id).strip().lower() in {"current", "this"}:
+            raise ReservedId("Entity id 'current'/'this' is reserved and cannot be used when creating entities- 'current'/'this' are used in !ent commands to access the entity whose turn it is right now.")
         if self.max_hp is None:
             self.max_hp = self.hp
         if self.facing not in ALLOWED_DIRECTIONS:

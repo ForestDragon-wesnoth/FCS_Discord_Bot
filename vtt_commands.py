@@ -2,7 +2,7 @@
 # vtt_commands.py
 from __future__ import annotations
 from typing import Callable, Dict, List, Optional, Protocol, Any, Tuple
-from logic import MatchManager, Entity, VTTError, OutOfBounds, Occupied, NotFound, DuplicateId, _coerce_rule_value, _parse_bool
+from logic import MatchManager, Entity, VTTError, OutOfBounds, Occupied, NotFound, DuplicateId, ReservedId, _coerce_rule_value, _parse_bool
 
 #used for Gamesystem-related commands
 from logic import DEFAULT_SYSTEM_SETTINGS, ALLOWED_DIRECTIONS, RULE_SCHEMA, RULES_REGISTRY
@@ -127,6 +127,21 @@ async def return_help_if_not_enough_args(
         await ctx.send(f"**{title}**\n{body}")
         return True
     return False
+
+
+def _resolve_eid(m, token: str) -> str:
+    """
+    Accepts an entity id token and returns a concrete entity id.
+    Supports the shorthands 'current' / 'this' to mean the entity
+    whose turn it currently is.
+    """
+    t = str(token).strip().lower()
+    if t in {"current", "this"}:
+        eid = m.current_entity_id()
+        if not eid:
+            raise NotFound("No current entity (turn order is empty).")
+        return eid
+    return token
 
 # ---- Commands ----------------------------------------------------------------
 @registry.command("match", usage="!match <subcommand> ...", desc="List matches, create one, or switch the active match for this channel.")
@@ -329,7 +344,7 @@ registry.annotate_sub("system", "new", usage="!system new <name>", desc="Create 
 registry.annotate_sub("system", "set", usage="!system set <name> <key> <value>", desc="Change a GameSystem setting (booleans/int auto-coerced).")
 registry.annotate_sub("system", "default", usage="!system default <global|server|channel> <name>", desc="Set default GameSystem.")
 
-@registry.command("ent", usage="!ent <subcommand> ...", desc="Manage entities in the active match, lots of available sub-commands.")
+@registry.command("ent", usage="!ent <subcommand> ...", desc="Manage entities in the active match, lots of available sub-commands. Note: <id> parameter also accepts 'this' or 'current', to target the entity whose turn it is right now")
 async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # Show authoritative help if no subcommand was given
     if not args:
@@ -355,7 +370,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "info":# and len(args) >= 2:
         if await return_help_if_not_enough_args(ctx, args, 2, "ent", "info"):
             return
-        eid = args[1]
+        eid = _resolve_eid(m, args[1])
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
         return await ctx.send(_entity_line(m.entities[eid]))
@@ -364,7 +379,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub in ("remove", "del", "rm"):# and len(args) >= 2:
         if await return_help_if_not_enough_args(ctx, args, 2, "ent", "remove"):
             return
-        eid = args[1]
+        eid = _resolve_eid(m, args[1])
         if eid not in m.entities:
             return await ctx.send(f"Entity `{eid}` not found.")
         m.entities[eid].remove()
@@ -374,7 +389,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "rename":
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "rename"):
             return
-        eid = args[1]
+        eid = _resolve_eid(m, args[1])
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
         new_name = " ".join(args[2:])
@@ -386,7 +401,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "tp":#and len(args) >= 4:
         if await return_help_if_not_enough_args(ctx, args, 4, "ent", "tp"):
             return
-        eid = args[1]; 
+        eid = _resolve_eid(m, args[1]); 
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
         x = int(args[2]); y = int(args[3])
@@ -397,7 +412,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "move":# and len(args) >= 3:
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "move"):
             return
-        eid = args[1]; 
+        eid = _resolve_eid(m, args[1]); 
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
         tokens = " ".join(args[2:]).replace(",", " ").split()
@@ -434,7 +449,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "face":# and len(args) >= 3:
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "face"):
             return
-        eid = args[1]; 
+        eid = _resolve_eid(m, args[1]); 
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
         dir_ = args[2].lower()
@@ -449,7 +464,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "hp":# and len(args) >= 3:
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "hp"):
             return
-        eid = args[1]; 
+        eid = _resolve_eid(m, args[1]); 
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")        
         delta = int(args[2])
@@ -464,7 +479,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "init":# and len(args) >= 3:
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "init"):
             return
-        eid = args[1]; 
+        eid = _resolve_eid(m, args[1]); 
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")        
         value = int(args[2])
@@ -539,7 +554,7 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "set":
         if await return_help_if_not_enough_args(ctx, args, 2, "turn", "set"):
             return
-        eid = args[1]
+        eid = _resolve_eid(m, args[1])
         if eid not in m.turn_order:
             raise NotFound(f"Entity '{eid}' not in turn order.")
         m.active_index = m.turn_order.index(eid)
