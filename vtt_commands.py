@@ -7,6 +7,13 @@ from logic import MatchManager, Entity, VTTError, OutOfBounds, Occupied, NotFoun
 #used for Gamesystem-related commands
 from logic import DEFAULT_SYSTEM_SETTINGS, ALLOWED_DIRECTIONS, RULE_SCHEMA, RULES_REGISTRY
 
+import re
+
+#TODO:
+#from logic import FormulaEngine  # tiny expression/assignment runtime
+#from logic import expand_inline_formulas, coerce_number
+#from logic import compute_default_specials, reserved_special_id_names
+
 # ---- Context abstraction -----------------------------------------------------
 class ReplyContext(Protocol):
     channel_key: str  # unique per chat location (e.g., guild:channel). For CLI, just "CLI".
@@ -142,6 +149,8 @@ def _resolve_eid(m, token: str) -> str:
             raise NotFound("No current entity (turn order is empty).")
         return eid
     return token
+
+
 
 # ---- Commands ----------------------------------------------------------------
 @registry.command("match", usage="!match <subcommand> ...", desc="List matches, create one, or switch the active match for this channel.")
@@ -671,8 +680,12 @@ registry.annotate_sub(
     desc="Load matches and channel bindings from a JSON file."
 )
 
+
+
+
 # ---- Automated Help command (shows available commands----------------------------------------------------------
 @registry.command("help", usage="!help [command [sub]]", desc="Show command usage. Try `!help ent` or `!help ent move`.")
 async def help_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     title, body = registry.help_for(args)
     await ctx.send(f"**{title}**\n{body}")
+

@@ -6,6 +6,8 @@ from dataclasses import dataclass, field, asdict
 from typing import Literal, Any, Dict, List, Optional, Tuple, Set
 import uuid
 import json
+import ast
+import re
 
 # -------------------------
 # Exceptions
@@ -152,6 +154,16 @@ def _default_facing_for(x: int, y: int, width: int, height: int) -> Direction:
     dy = cy - y
     return _dominant_axis_dir(int(round(dx)), int(round(dy)))
 
+
+# ---------- Special/reserved id registry (like how "this" or "current" is the entity whose turn it is right now, "self" is usually the entity directly affected ay a command regardless of turn order") ----------
+
+
+RESERVED_IDS: Set[str] = {"current", "this", "self"}
+
+
+#TODO: flesh it out into a proper system later
+
+
 # -------------------------
 # GameSystem (stores global rules for a game system, so not everything has to be manually set each match)
 # -------------------------
@@ -216,29 +228,33 @@ class GameSystem:
 
 @dataclass
 class Entity:
-    # Required (no defaults) must come first in a dataclass
     name: str
     hp: int
     x: int
     y: int
-    id: str  # explicit, user-provided
-    # Optional / defaulted fields
+    id: str# explicit, user-provided
     max_hp: Optional[int] = None
     team: Optional[str] = None
     status: Set[str] = field(default_factory=set)
     initiative: Optional[int] = None
-    extras: Dict[str, Any] = field(default_factory=dict)  # arbitrary stats/resources
-    facing: Direction = "up"  # will be set to a default by Match when adding
 
-    #connect Entity to the Match (so functions like moving an entity can still access map size data)
+    # structured variable bag
+    vars: Dict[str, Any] = field(default_factory=dict)
 
-    #back-reference (not serialized)
+#PASSIVES NOT YET TRULY IMPLEMENTED 
+#    #entity-scoped passives
+    passives: Dict[str, Passive] = field(default_factory=dict)
+
+    facing: Direction = "up"# will be set to a default by Match when adding
+
+    #connect Entity to the Match (so functions like moving an entity can still access map size data, etc.)
     _match: "Match | None" = field(default=None, repr=False, compare=False)
 
     def __post_init__(self):
+        tested_id = str(self.id.strip().lower())
         # Disallow reserved ids that the CLI uses as shorthands (current/this are used if you want to get the id of the entity whose turn it is right now)
-        if str(self.id).strip().lower() in {"current", "this"}:
-            raise ReservedId("Entity id 'current'/'this' is reserved and cannot be used when creating entities- 'current'/'this' are used in !ent commands to access the entity whose turn it is right now.")
+        if tested_id in RESERVED_IDS:
+            raise ReservedId(f"Entity id '{tested_id}' is a special reserved id and cannot be used when creating entities. Reserved ids are used for formulas and commands, like 'this' being used to automatically get the id of the entity whose turn it is.")
         if self.max_hp is None:
             self.max_hp = self.hp
         if self.facing not in ALLOWED_DIRECTIONS:
@@ -367,7 +383,6 @@ class Entity:
 
     # ---------- serialization ----------
     def to_dict(self) -> Dict[str, Any]:
-        # Manual, safe serialization — do NOT recurse into _match to avoid cycles.
         return {
             "name": self.name,
             "hp": self.hp,
@@ -376,19 +391,16 @@ class Entity:
             "id": self.id,
             "max_hp": self.max_hp,
             "team": self.team,
-            "status": list(self.status),         # sets → lists
+            "status": list(self.status),
             "initiative": self.initiative,
-            "extras": dict(self.extras),         # shallow copy is fine
+            "vars": dict(self.vars),
+            "passives": {pid: vars(p) for pid, p in self.passives.items()},
             "facing": self.facing,
-            # _match intentionally omitted
         }
 
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "Entity":
-        # Recreate the entity without a bound match; callers (e.g., Match.from_dict)
-        # should bind to the appropriate match context.
-        #IMPORTANT: whenever using from_dict, make sure to manually bind the entity to current match (for example, using spawn() function )
-        return Entity(
+        e = Entity(
             name=data["name"],
             hp=int(data["hp"]),
             x=int(data["x"]),
@@ -398,9 +410,11 @@ class Entity:
             team=data.get("team"),
             status=set(data.get("status", [])),
             initiative=data.get("initiative"),
-            extras=dict(data.get("extras", {})),
+            vars=dict(data.get("vars", {})),  # NEW
             facing=data.get("facing", "up"),
         )
+        for pid, pd in (data.get("passives", {}) or {}).items():
+            e.passives[pid] = Passive(**pd)
 
 # -------------------------
 # Match
@@ -422,8 +436,15 @@ class Match:
     turn_number: int = 1
     # Game system binding - currently NOT YET DIRECTLY CONNECTED TO A GAMESYSTEM CLASS, JUST COPYING THE DICTIONARY OF RULES FROM IT.
     rules: Dict[str, Any] = field(default_factory=dict)  # denormalized copy for fast access
- 
+
+#PASSIVES NOT YET TRULY IMPLEMENTED 
+#    #global passives that apply to every unit on the match, could be useful for stuff like environmental effects, gamemode rules, etc. 
+    global_passives: Dict[str, Passive] = field(default_factory=dict)
+
     # ---- global constraints / helpers (unchanged in spirit) ----
+    def _engine(self) -> "FormulaEngine":
+        return FormulaEngine()
+
     def in_bounds(self, x: int, y: int) -> bool:
         return 1 <= x <= self.grid_width and 1 <= y <= self.grid_height
 
@@ -692,4 +713,45 @@ class MatchManager:
         except Exception as e:
             # Defensive: any schema mismatch should be surfaced as a friendly VTTError
             raise VTTError(f"Invalid save file format in '{path}': {e}")
-    
+
+
+
+# -------------------------
+# Formula & variable helpers
+# -------------------------
+
+
+#WIP:
+
+_REF = re.compile(r"entity\[(?P<who>[^\]]+)\]\.(?P<path>[A-Za-z_][A-Za-z0-9_\.]*)")
+_INLINE = re.compile(r'\$\("(?P<formula>.*?)"\)', flags=re.DOTALL)
+
+@dataclass
+class EvalCtx:
+    specials: Dict[str, Optional[str]]  # e.g. {"this": "e1", "current": "e1", "self": "hero"}
+
+class FormulaEngine:
+    ALLOWED_FUNCS = {"min": min, "max": max, "abs": abs}
+    ALLOWED_NODES = (
+        ast.Expression, ast.BinOp, ast.UnaryOp, ast.Num, ast.Constant,
+        ast.Call, ast.Name, ast.Load, ast.Tuple, ast.List, ast.keyword,
+        ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow,
+        ast.UAdd, ast.USub, ast.Compare, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+        ast.BoolOp, ast.And, ast.Or, ast.IfExp
+    )
+
+
+
+#NOT YET IMPLEMENTED:
+
+
+##IMPORTANT: right now the system is mostly intended for stuff like regen/poison/etc. "ticking" passives,
+##it does not yet ones like a cosntant "+X% stat" or "+X% damage if Y condition"
+##TODO: implement non-ticking passives too!!!
+## --- Passive definition ---
+#@dataclass
+#class Passive:
+#    id: str
+#    name: str
+#    when: Literal["on_turn_start", "on_turn_end"] = "on_turn_start"
+#    formula: str = ""  # can be assignment or pure expression (ignored return for hooks)
