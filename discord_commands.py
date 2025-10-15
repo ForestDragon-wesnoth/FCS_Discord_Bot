@@ -7,7 +7,8 @@ from logic import MatchManager
 from vtt_commands import registry
 import shlex
 
-DEBUG_CMDS = True         # console logging
+#DEBUG_CMDS = True         # console logging
+DEBUG_CMDS = False         # console logging
 DEBUG_CMDS_CHAT = False   # set True to also echo minimal info into Discord
 
 def _dbg(ctx, **kv):
@@ -53,7 +54,7 @@ async def _parse_and_run_single_line(ctx, line: str, mgr, known_roots) -> bool:
         # After this, s should be "root arg1 arg2 ..."
         parts = shlex.split(s)
         if not parts:
-            _dbg(ctx, batch_skip="empty_after_strip", line=line)
+            #_dbg(ctx, batch_skip="empty_after_strip", line=line)
             return False
 
         root = parts[0]
