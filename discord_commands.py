@@ -27,6 +27,55 @@ async def _dbg_chat(ctx, text: str):
         except Exception:
             pass
 
+# Max commands to run from a single paste to avoid accidental spam
+BATCH_MAX_LINES = 200
+
+def _is_comment_or_blank(line: str) -> bool:
+    s = (line or "").strip()
+    return not s or s.startswith("#")
+
+def _strip_prefix(line: str, prefix: str) -> str:
+    s = line.lstrip()
+    if prefix and s.startswith(prefix):
+        s = s[len(prefix):].lstrip()
+    return s
+
+async def _parse_and_run_single_line(ctx, line: str, mgr, known_roots) -> bool:
+    """
+    Returns True if it executed something, False if skipped.
+    """
+    try:
+        prefix = getattr(ctx, "prefix", "")
+        s = _strip_prefix(line, prefix)
+
+        # If user omitted '!' but started with a known root, allow it.
+        # Otherwise, if they included '!', the prefix strip already handled it.
+        # After this, s should be "root arg1 arg2 ..."
+        parts = shlex.split(s)
+        if not parts:
+            _dbg(ctx, batch_skip="empty_after_strip", line=line)
+            return False
+
+        root = parts[0]
+        # If the line didn't have '!' and the first token isn't a known root, skip
+        if not line.strip().startswith(prefix) and root not in known_roots:
+            _dbg(ctx, batch_skip="not_a_root", line=line, first_token=root)
+            return False
+
+        args = parts[1:]
+        _dbg(ctx, batch_exec_line=line, parsed_root=root, parsed_args=args)
+        await registry.run(root, args, DiscordCtxWrapper(ctx), mgr)
+        return True
+    except ValueError as e:
+        _dbg(ctx, batch_parse_error=str(e), line=line)
+        await ctx.send(f"❌ Parse error in line: `{line}`\n→ {e}")
+        return False
+    except Exception as e:
+        _dbg(ctx, batch_unexpected_error=str(e), line=line)
+        await ctx.send(f"❌ Error executing line: `{line}`\n→ {e}")
+        return False
+
+
 class DiscordCtxWrapper:
     def __init__(self, ctx):
         self._ctx = ctx
@@ -35,15 +84,34 @@ class DiscordCtxWrapper:
     async def send(self, message: str):
         await self._ctx.send(message)
 
+#now supports-multiple commands in one message - one command per line
 def wire_commands(bot: commands.Bot, mgr: MatchManager):
     async def _dispatch(ctx, bound_root: str):
-        """
-        Parse only the tail (args) and always use the decorator-bound root.
-        """
         content = ctx.message.content or ""
         s = content.lstrip()
-
-        # --- INITIAL SNAPSHOT ---
+    
+        # --- BATCH MODE: multiple non-empty lines pasted in one message ---
+        lines = [ln for ln in content.splitlines() if not _is_comment_or_blank(ln)]
+        if len(lines) > 1:
+            known_roots = set(registry._handlers.keys())
+            _dbg(ctx, batch_detected=True, line_count=len(lines))
+    
+            if len(lines) > BATCH_MAX_LINES:
+                await ctx.send(f"⚠️ Paste has {len(lines)} lines; max allowed is {BATCH_MAX_LINES}. Aborting.")
+                return
+    
+            executed = 0
+            for i, line in enumerate(lines, 1):
+                ok = await _parse_and_run_single_line(ctx, line, mgr, known_roots)
+                executed += int(ok)
+    
+            _dbg(ctx, batch_done=True, executed=executed, total=len(lines))
+            # Optional: summarize; individual commands will have already sent their outputs
+            await _dbg_chat(ctx, f"batch executed {executed}/{len(lines)} lines")
+            return
+        # --- END BATCH MODE ---
+    
+        # (keep your existing single-line logic below)
         _dbg(
             ctx,
             content=content,
@@ -52,34 +120,29 @@ def wire_commands(bot: commands.Bot, mgr: MatchManager):
             command=getattr(getattr(ctx, "command", None), "name", None),
             bound_root=bound_root,
         )
-
-        # 1) Strip the prefix if it’s actually at the start of the message
+    
         prefix = getattr(ctx, "prefix", "")
         if prefix and s.startswith(prefix):
             s = s[len(prefix):].lstrip()
         _dbg(ctx, after_prefix=s)
-
-        # 2) Strip the known root token (bound_root), case-insensitive
+    
         if s[:len(bound_root)].lower() == bound_root.lower():
             s = s[len(bound_root):].lstrip()
             _dbg(ctx, root_stripped_by="bound_root", after_root=s)
         else:
-            # Fallback: pop the first token (just in case of aliases or odd prefixes)
             parts = s.split(maxsplit=1)
             s = parts[1] if len(parts) > 1 else ""
             _dbg(ctx, root_stripped_by="fallback_first_token", after_root=s)
-
-        # 3) shlex split the remainder for quotes support
+    
         try:
             args = shlex.split(s)
         except ValueError as e:
             _dbg(ctx, parse_error=str(e), raw_tail=s)
             await _dbg_chat(ctx, f"parse error: {e}")
             return await ctx.send(f"❌ Parse error: {e}")
-
+    
         _dbg(ctx, final_args=args)
         await _dbg_chat(ctx, f"root={bound_root} args={args}")
-
         await registry.run(bound_root, args, DiscordCtxWrapper(ctx), mgr)
 
     # Make sure discord.py’s default help is gone (your registry defines its own help)

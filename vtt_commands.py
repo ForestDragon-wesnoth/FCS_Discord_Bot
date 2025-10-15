@@ -630,7 +630,7 @@ async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     lines = []
     #add a right arrow to show which entity's turn it is right now
     for e in es:
-        marker = ">" if e.id == active_id else " "
+        marker = "→" if e.id == active_id else " "
         lines.append(f"{marker} {_entity_line(e)}")
     return await ctx.send("\n".join(lines))
 
