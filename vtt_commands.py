@@ -8,6 +8,7 @@ from logic import MatchManager, Entity, VTTError, OutOfBounds, Occupied, NotFoun
 from logic import DEFAULT_SYSTEM_SETTINGS, ALLOWED_DIRECTIONS, RULE_SCHEMA, RULES_REGISTRY
 
 import re
+import json
 
 #TODO:
 #from logic import FormulaEngine  # tiny expression/assignment runtime
@@ -149,6 +150,39 @@ def _resolve_eid(m, token: str) -> str:
             raise NotFound("No current entity (turn order is empty).")
         return eid
     return token
+
+
+
+
+def _parse_scalar(token: str):
+    # int → float → str
+    try:
+        return int(token, 10)
+    except ValueError:
+        pass
+    try:
+        return float(token)
+    except ValueError:
+        return token  # leave as string
+
+#for creating more dictionaries inside vars, like inventory/skills/etc.
+
+def _set_deep_key(root: Dict[str, Any], dotted: str, value: Any):
+    """
+    Create/descend dicts along a dotted path and set the final key to value.
+    Example: _set_deep_key(e.vars, "parts.effects.slow.duration", 2.5)
+    """
+    if not dotted:
+        raise VTTError("Key path cannot be empty.")
+    keys = dotted.split(".")
+    cur = root
+    for k in keys[:-1]:
+        node = cur.get(k)
+        if not isinstance(node, dict):
+            node = {}
+            cur[k] = node
+        cur = node
+    cur[keys[-1]] = value
 
 
 
@@ -376,13 +410,16 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(f"Added `{name}` with id `{eid}` at ({x},{y}).")
 
     # --- info (single entity line) ---
-    if sub == "info":# and len(args) >= 2:
+    if sub == "info":
         if await return_help_if_not_enough_args(ctx, args, 2, "ent", "info"):
             return
         eid = _resolve_eid(m, args[1])
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
-        return await ctx.send(_entity_line(m.entities[eid]))
+        e = m.entities[eid]
+        # Show normal line plus full dump of the vars data
+        vars_block = json.dumps(e.vars or {}, indent=2, sort_keys=True)
+        return await ctx.send(f"{_entity_line(e)}\n\n**vars (json)**:\n```{vars_block}\n```")
 
     # delete / remove
     if sub in ("remove", "del", "rm"):# and len(args) >= 2:
@@ -522,6 +559,26 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         clone.facing = src.facing
 
         return await ctx.send(f"Cloned `{src_id}` → `{new_id}` at ({x},{y}).")
+    # set_var
+    if sub == "set_var":
+        # Usage: !ent set_var <id> <key> <value>
+        if await return_help_if_not_enough_args(ctx, args, 4, "ent", "set_var"):
+            return
+
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+
+        key_path = args[2]                # dotted path: e.g., "parts.effects.slow.duration"
+        raw_value = args[3]               # use quotes for spaces: "burning aura"
+        value = _parse_scalar(raw_value)  # int → float → str
+
+        e = m.entities[eid]
+        _set_deep_key(e.vars, key_path, value)
+
+        # Optional: echo the new value for quick confirmation
+        return await ctx.send(f"`{eid}` vars.{key_path} = {value!r}")
+
     # Fallback: show authoritative help for the root command
     title, body = registry.help_for(["ent"])
     return await ctx.send(f"**{title}**\n{body}")
@@ -575,6 +632,11 @@ registry.annotate_sub(
     "ent", "clone",
     usage="!ent clone <id> <new_id> <x> <y>",
     desc="Create a perfect copy of <id> with new id <new_id> at position (x,y)."
+)
+registry.annotate_sub(
+    "ent", "set_var",
+    usage="!ent set_var <id> <key> <value>",
+    desc="Set a value in the entity's vars. <key> supports dotted paths (for example '!ent set_var adventurer inventory.sword.damage 10' will do sub-containers for inventory and sword); value auto-coerces int/float/string."
 )
 
 @registry.command("turn", usage="!turn | !turn next | ...", desc="See/advance/set/etc. turns")
