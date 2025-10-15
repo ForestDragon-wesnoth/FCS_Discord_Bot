@@ -184,7 +184,34 @@ def _set_deep_key(root: Dict[str, Any], dotted: str, value: Any):
         cur = node
     cur[keys[-1]] = value
 
+def _del_deep(d: dict, path: str):
+    """
+    Delete key at dotted path. Raises NotFound if path or key is missing.
+    """
+    keys = [k for k in path.split(".") if k]
+    if not keys:
+        raise VTTError("Key path cannot be empty.")
+    cur = d
+    for k in keys[:-1]:
+        if k not in cur:
+            raise NotFound(f"Missing path: '{k}'")
+        cur = cur[k]
+        if not isinstance(cur, dict):
+            raise VTTError(f"Cannot descend into '{k}': not a dict.")
+    last = keys[-1]
+    if last not in cur:
+        raise NotFound(f"Key '{last}' not found.")
+    del cur[last]
 
+def _format_vars_blob(vars_dict: dict) -> str:
+    if not vars_dict:
+        return "**vars**: (empty)"
+    try:
+        blob = json.dumps(vars_dict, indent=2, ensure_ascii=False)
+    except Exception:
+        # Fallback if something unserializable sneaks in
+        blob = str(vars_dict)
+    return "**vars**:\n```json\n" + blob + "\n```"
 
 # ---- Commands ----------------------------------------------------------------
 @registry.command("match", usage="!match <subcommand> ...", desc="List matches, create one, or switch the active match for this channel.")
@@ -578,6 +605,17 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
         # Optional: echo the new value for quick confirmation
         return await ctx.send(f"`{eid}` vars.{key_path} = {value!r}")
+    # delete_var
+    if sub == "delete_var":
+        if await return_help_if_not_enough_args(ctx, args, 3, "ent", "delete_var"):
+            return
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        key_path = args[2]
+        _del_deep(m.entities[eid].vars, key_path)
+        return await ctx.send(f"Deleted `{eid}` vars.{key_path}")
+    
 
     # Fallback: show authoritative help for the root command
     title, body = registry.help_for(["ent"])
@@ -637,6 +675,11 @@ registry.annotate_sub(
     "ent", "set_var",
     usage="!ent set_var <id> <key> <value>",
     desc="Set a value in the entity's vars. <key> supports dotted paths (for example '!ent set_var adventurer inventory.sword.damage 10' will do sub-containers for inventory and sword); value auto-coerces int/float/string."
+)
+registry.annotate_sub(
+    "ent", "delete_var",
+    usage="!ent delete_var <id> <key>",
+    desc="Delete a variable from e.vars. Supports dotted keys for nested dicts (for example, if you have inventory.weapons.club, deleting 'inventory.weapons' will delete the whole 'weapons' sub-dictionary, etc.."
 )
 
 @registry.command("turn", usage="!turn | !turn next | ...", desc="See/advance/set/etc. turns")
