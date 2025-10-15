@@ -485,6 +485,34 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         value = int(args[2])
         m.entities[eid].set_initiative_entity(value)
         return await ctx.send(f"Set initiative of `{eid}` to {value}.")
+    # clone
+    if sub == "clone":
+        if await return_help_if_not_enough_args(ctx, args, 5, "ent", "clone"):
+            return
+
+        src_id = _resolve_eid(m, args[1])
+        new_id = args[2]
+        x, y = int(args[3]), int(args[4])
+
+        if src_id not in m.entities:
+            raise NotFound(f"Entity '{src_id}' not found.")
+        if new_id in m.entities:
+            raise DuplicateId(f"Entity id '{new_id}' already exists.")
+        if not m.in_bounds(x, y):
+            raise OutOfBounds(f"({x},{y}) outside {m.grid_width}x{m.grid_height}")
+        if m.is_occupied(x, y):
+            raise Occupied(f"Cell ({x},{y}) already occupied.")
+
+        src = m.entities[src_id]
+        payload = src.to_dict()
+        payload.update({"id": new_id, "x": x, "y": y})
+
+        clone = Entity.from_dict(payload)
+        # Use spawn to register/validate; preserve original facing after spawn
+        clone.spawn(m, x, y, initiative=src.initiative)
+        clone.facing = src.facing
+
+        return await ctx.send(f"Cloned `{src_id}` → `{new_id}` at ({x},{y}).")
     # Fallback: show authoritative help for the root command
     title, body = registry.help_for(["ent"])
     return await ctx.send(f"**{title}**\n{body}")
@@ -533,6 +561,11 @@ registry.annotate_sub(
     "ent", "init",
     usage="!ent init <id> <n>",
     desc="Set (or update) entity initiative to a fixed value."
+)
+registry.annotate_sub(
+    "ent", "clone",
+    usage="!ent clone <id> <new_id> <x> <y>",
+    desc="Create a perfect copy of <id> with new id <new_id> at position (x,y)."
 )
 
 @registry.command("turn", usage="!turn | !turn next | ...", desc="See/advance/set/etc. turns")

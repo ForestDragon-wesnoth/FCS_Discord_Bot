@@ -365,21 +365,42 @@ class Entity:
         self.initiative = value
         self._require_match()._rebuild_turn_order()
 
-#SERIALIZING ENTITIES TO DICT CURRENTLY DOESN'T WORK BECAUSE OF RECURSION in asdict, since removal of match back-reference is done AFTER asdict
-#TODO: eventually return to fix saving/loading later, but for now it's put on hold
     # ---------- serialization ----------
     def to_dict(self) -> Dict[str, Any]:
-        d = asdict(self)
-        d.pop("_match", None)  # do not serialize backref
-        d["status"] = list(self.status)
-        return d
+        # Manual, safe serialization — do NOT recurse into _match to avoid cycles.
+        return {
+            "name": self.name,
+            "hp": self.hp,
+            "x": self.x,
+            "y": self.y,
+            "id": self.id,
+            "max_hp": self.max_hp,
+            "team": self.team,
+            "status": list(self.status),         # sets → lists
+            "initiative": self.initiative,
+            "extras": dict(self.extras),         # shallow copy is fine
+            "facing": self.facing,
+            # _match intentionally omitted
+        }
 
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "Entity":
-        d = dict(data)
-        d["status"] = set(d.get("status", []))
-        d.pop("_match", None)
-        return Entity(**d)
+        # Recreate the entity without a bound match; callers (e.g., Match.from_dict)
+        # should bind to the appropriate match context.
+        #IMPORTANT: whenever using from_dict, make sure to manually bind the entity to current match (for example, using spawn() function )
+        return Entity(
+            name=data["name"],
+            hp=int(data["hp"]),
+            x=int(data["x"]),
+            y=int(data["y"]),
+            id=str(data["id"]),
+            max_hp=data.get("max_hp"),
+            team=data.get("team"),
+            status=set(data.get("status", [])),
+            initiative=data.get("initiative"),
+            extras=dict(data.get("extras", {})),
+            facing=data.get("facing", "up"),
+        )
 
 # -------------------------
 # Match
