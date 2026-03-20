@@ -107,9 +107,16 @@ registry = CommandRegistry()
 # ---- Helpers ----------------------------------------------------------------
 
 def _entity_line(e: Entity) -> str:
-    # If max_hp wasn't set, many tables treat it as current hp initially
-    max_hp = e.max_hp if getattr(e, "max_hp", None) is not None else e.hp
-    return f"{e.name} ({e.id}): HP: {e.hp}/{max_hp} X,Y: {e.x},{e.y} facing {e.facing}"
+    # Use the entity's vital var names (from bound match rules)
+    hp_var, max_hp_var, _ = e._vital_var_names()
+    hp_val = e.hp
+    max_hp_val = e.max_hp if e.max_hp is not None else hp_val
+    # Show the actual var name if it's not the default "hp"/"max_hp"
+    if hp_var == "hp":
+        hp_label = "HP"
+    else:
+        hp_label = hp_var
+    return f"{e.name} ({e.id}): {hp_label}: {hp_val}/{max_hp_val} X,Y: {e.x},{e.y} facing {e.facing}"
     #TODO: add a way to dynamically define what variables are shown for entities!
 
 def active_match(mgr: MatchManager, ctx: ReplyContext):
@@ -432,8 +439,15 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         eid, name, hp, x, y = args[1], args[2], int(args[3]), int(args[4]), int(args[5])
         init = int(args[6]) if len(args) >= 7 else None
-        e = Entity(id=eid, name=name, hp=hp, x=x, y=y)
-        e.spawn(m, x, y, initiative=init)
+        # Populate vars using the match's game-system variable names
+        hp_var = m.rules.get("hp_var", "hp")
+        max_hp_var = m.rules.get("max_hp_var", "max_hp")
+        init_var = m.rules.get("turnorder_var", "initiative")
+        initial_vars = {hp_var: hp, max_hp_var: hp}
+        if init is not None:
+            initial_vars[init_var] = init
+        e = Entity(id=eid, name=name, x=x, y=y, vars=initial_vars)
+        e.spawn(m, x, y)
         return await ctx.send(f"Added `{name}` with id `{eid}` at ({x},{y}).")
 
     # --- info (single entity line) ---
@@ -613,7 +627,17 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
         key_path = args[2]
-        _del_deep(m.entities[eid].vars, key_path)
+        e = m.entities[eid]
+        # Protect vital variables (hp/max_hp/initiative equivalents) from deletion
+        top_key = key_path.split(".")[0]
+        protected = e.protected_var_names()
+        if top_key in protected:
+            hp_var, max_hp_var, init_var = e._vital_var_names()
+            raise VTTError(
+                f"Cannot delete '{key_path}': '{top_key}' is a vital variable "
+                f"for the current game system (protected vars: {hp_var}, {max_hp_var}, {init_var})."
+            )
+        _del_deep(e.vars, key_path)
         return await ctx.send(f"Deleted `{eid}` vars.{key_path}")
     
 
@@ -679,7 +703,7 @@ registry.annotate_sub(
 registry.annotate_sub(
     "ent", "delete_var",
     usage="!ent delete_var <id> <key>",
-    desc="Delete a variable from e.vars. Supports dotted keys for nested dicts (for example, if you have inventory.weapons.club, deleting 'inventory.weapons' will delete the whole 'weapons' sub-dictionary, etc.."
+    desc="Delete a variable from e.vars. Supports dotted keys for nested dicts. **Vital variables** (HP/MaxHP/initiative equivalents defined by the game system) are protected and cannot be deleted."
 )
 
 @registry.command("turn", usage="!turn | !turn next | ...", desc="See/advance/set/etc. turns")
@@ -687,10 +711,12 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     if not args:
         order_lines = []
+        # Get the initiative var name for display
+        init_label = m.rules.get("turnorder_var", "initiative")
         for idx, eid in enumerate(m.turn_order):
             mark = "➡️" if idx == m.active_index else "  "
             e = m.entities.get(eid)
-            if e: order_lines.append(f"{mark} `{eid[:8]}` **{e.name}** (init {e.initiative})")
+            if e: order_lines.append(f"{mark} `{eid[:8]}` **{e.name}** ({init_label} {e.initiative})")
         return await ctx.send("Turn order:\n" + ("\n".join(order_lines) or "(empty)"))
     sub = args[0].lower()
     if sub == "next":

@@ -48,6 +48,22 @@ ALLOWED_DIRECTIONS: Set[str] = {"up", "down", "left", "right"}
 #
 # Schema types: "bool", "int", "enum"
 RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
+    # --- Vital variable names (what var keys map to HP / MaxHP / turn-order) ---
+    "hp_var": {
+        "default": "hp",
+        "schema": {"type": "str"},
+        "desc": "Variable name in entity vars used as hit points (e.g. 'hp', 'hull').",
+    },
+    "max_hp_var": {
+        "default": "max_hp",
+        "schema": {"type": "str"},
+        "desc": "Variable name in entity vars used as maximum hit points (e.g. 'max_hp', 'max_hull').",
+    },
+    "turnorder_var": {
+        "default": "initiative",
+        "schema": {"type": "str"},
+        "desc": "Variable name in entity vars used for turn-order priority (e.g. 'initiative', 'ship_agility').",
+    },
     # Spawning / facing
     "spawn_face_toward_center": {
         "default": True,
@@ -230,16 +246,14 @@ class GameSystem:
 @dataclass
 class Entity:
     name: str
-    hp: int
     x: int
     y: int
     id: str# explicit, user-provided
-    max_hp: Optional[int] = None
     team: Optional[str] = None
     status: Set[str] = field(default_factory=set)
-    initiative: Optional[int] = None
 
-    # structured variable bag
+    # structured variable bag — hp, max_hp, and initiative now live HERE
+    # under keys defined by the GameSystem (defaults: "hp", "max_hp", "initiative")
     vars: Dict[str, Any] = field(default_factory=dict)
 
 #PASSIVES NOT YET TRULY IMPLEMENTED 
@@ -256,10 +270,64 @@ class Entity:
         # Disallow reserved ids that the CLI uses as shorthands (current/this are used if you want to get the id of the entity whose turn it is right now)
         if tested_id in RESERVED_IDS:
             raise ReservedId(f"Entity id '{tested_id}' is a special reserved id and cannot be used when creating entities. Reserved ids are used for formulas and commands, like 'this' being used to automatically get the id of the entity whose turn it is.")
-        if self.max_hp is None:
-            self.max_hp = self.hp
         if self.facing not in ALLOWED_DIRECTIONS:
             self.facing = "up"
+
+    # ---------- vital variable name helpers ----------
+    def _vital_var_names(self) -> Tuple[str, str, str]:
+        """Return (hp_var, max_hp_var, turnorder_var) from bound match rules, or engine defaults."""
+        if self._match:
+            rules = self._match.rules
+            return (
+                rules.get("hp_var", "hp"),
+                rules.get("max_hp_var", "max_hp"),
+                rules.get("turnorder_var", "initiative"),
+            )
+        return ("hp", "max_hp", "initiative")
+
+    def protected_var_names(self) -> Set[str]:
+        """Return the set of top-level var keys that must not be deleted."""
+        hp_v, mhp_v, init_v = self._vital_var_names()
+        return {hp_v, mhp_v, init_v}
+
+    # ---------- property accessors (transparent to rest of codebase) ----------
+    @property
+    def hp(self) -> int:
+        hp_var, _, _ = self._vital_var_names()
+        return int(self.vars.get(hp_var, 0))
+
+    @hp.setter
+    def hp(self, value: int):
+        hp_var, _, _ = self._vital_var_names()
+        self.vars[hp_var] = int(value)
+
+    @property
+    def max_hp(self) -> Optional[int]:
+        _, max_hp_var, _ = self._vital_var_names()
+        v = self.vars.get(max_hp_var)
+        return int(v) if v is not None else None
+
+    @max_hp.setter
+    def max_hp(self, value):
+        _, max_hp_var, _ = self._vital_var_names()
+        if value is None:
+            self.vars.pop(max_hp_var, None)
+        else:
+            self.vars[max_hp_var] = int(value)
+
+    @property
+    def initiative(self) -> Optional[int]:
+        _, _, init_var = self._vital_var_names()
+        v = self.vars.get(init_var)
+        return int(v) if v is not None else None
+
+    @initiative.setter
+    def initiative(self, value):
+        _, _, init_var = self._vital_var_names()
+        if value is None:
+            self.vars.pop(init_var, None)
+        else:
+            self.vars[init_var] = int(value)
 
     # ---------- binding ----------
     #bind this entity to a specific match
@@ -296,6 +364,8 @@ class Entity:
         """
         Add this entity to a match at (x,y).
         Validates bounds/occupancy, sets facing, registers in turn order.
+        Also validates that the entity has the required vital variables
+        (HP var) for the match's game system.
         """
         if self._match is not None:
             raise VTTError(f"Entity '{self.id}' is already in a match")
@@ -305,6 +375,20 @@ class Entity:
             raise Occupied(f"Cell ({x},{y}) already occupied")
         if self.id in match.entities:
             raise DuplicateId(f"Entity id '{self.id}' already exists in this match")
+
+        # --- Validate vital vars against game system ---
+        hp_var = match.rules.get("hp_var", "hp")
+        if hp_var not in self.vars:
+            existing = ", ".join(sorted(self.vars.keys())) or "(none)"
+            raise VTTError(
+                f"Entity '{self.id}' is missing required HP variable '{hp_var}' "
+                f"for game system '{match.system_name}'. "
+                f"Entity vars have: {existing}"
+            )
+        # Auto-fill max_hp if missing
+        max_hp_var = match.rules.get("max_hp_var", "max_hp")
+        if max_hp_var not in self.vars:
+            self.vars[max_hp_var] = self.vars[hp_var]
 
         self.move_to(x, y)
 
@@ -384,38 +468,51 @@ class Entity:
 
     # ---------- serialization ----------
     def to_dict(self) -> Dict[str, Any]:
+        # hp/max_hp/initiative now live in vars; include top-level copies for save-file readability
+        # and backwards compatibility with older loaders
+        hp_var, max_hp_var, init_var = self._vital_var_names()
         return {
             "name": self.name,
-            "hp": self.hp,
+            "hp": self.vars.get(hp_var, 0),         # backwards-compat mirror
             "x": self.x,
             "y": self.y,
             "id": self.id,
-            "max_hp": self.max_hp,
+            "max_hp": self.vars.get(max_hp_var),     # backwards-compat mirror
             "team": self.team,
             "status": list(self.status),
-            "initiative": self.initiative,
+            "initiative": self.vars.get(init_var),   # backwards-compat mirror
             "vars": dict(self.vars),
+            "_vital_in_vars": True,                  # flag: vital data lives in vars
             "passives": {pid: vars(p) for pid, p in self.passives.items()},
             "facing": self.facing,
         }
 
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "Entity":
+        vars_dict = dict(data.get("vars", {}))
+        # Migrate legacy saves ONLY (before vital vars moved into vars).
+        # New-format saves set _vital_in_vars=True; skip migration for those
+        # to avoid creating duplicate keys when custom var names are used.
+        if not data.get("_vital_in_vars", False):
+            if "hp" in data and "hp" not in vars_dict:
+                vars_dict["hp"] = int(data["hp"])
+            if "max_hp" in data and data.get("max_hp") is not None and "max_hp" not in vars_dict:
+                vars_dict["max_hp"] = int(data["max_hp"])
+            if "initiative" in data and data.get("initiative") is not None and "initiative" not in vars_dict:
+                vars_dict["initiative"] = int(data["initiative"])
         e = Entity(
             name=data["name"],
-            hp=int(data["hp"]),
             x=int(data["x"]),
             y=int(data["y"]),
             id=str(data["id"]),
-            max_hp=data.get("max_hp"),
             team=data.get("team"),
             status=set(data.get("status", [])),
-            initiative=data.get("initiative"),
-            vars=dict(data.get("vars", {})),  # NEW
+            vars=vars_dict,
             facing=data.get("facing", "up"),
         )
         for pid, pd in (data.get("passives", {}) or {}).items():
             e.passives[pid] = Passive(**pd)
+        return e
 
 # -------------------------
 # Match
