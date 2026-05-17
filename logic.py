@@ -6,9 +6,6 @@ from dataclasses import dataclass, field, asdict
 from typing import Literal, Any, Dict, List, Optional, Tuple, Set
 import uuid
 import json
-import ast
-import re
-import json
 
 # -------------------------
 # Exceptions
@@ -540,9 +537,6 @@ class Match:
     global_passives: Dict[str, Passive] = field(default_factory=dict)
 
     # ---- global constraints / helpers (unchanged in spirit) ----
-    def _engine(self) -> "FormulaEngine":
-        return FormulaEngine()
-
     def in_bounds(self, x: int, y: int) -> bool:
         return 1 <= x <= self.grid_width and 1 <= y <= self.grid_height
 
@@ -812,44 +806,3 @@ class MatchManager:
             # Defensive: any schema mismatch should be surfaced as a friendly VTTError
             raise VTTError(f"Invalid save file format in '{path}': {e}")
 
-
-
-# -------------------------
-# Formula & variable helpers
-# -------------------------
-
-
-#WIP:
-
-_REF = re.compile(r"entity\[(?P<who>[^\]]+)\]\.(?P<path>[A-Za-z_][A-Za-z0-9_\.]*)")
-_INLINE = re.compile(r'\$\("(?P<formula>.*?)"\)', flags=re.DOTALL)
-
-@dataclass
-class EvalCtx:
-    specials: Dict[str, Optional[str]]  # e.g. {"this": "e1", "current": "e1", "self": "hero"}
-
-class FormulaEngine:
-    ALLOWED_FUNCS = {"min": min, "max": max, "abs": abs}
-    ALLOWED_NODES = (
-        ast.Expression, ast.BinOp, ast.UnaryOp, ast.Num, ast.Constant,
-        ast.Call, ast.Name, ast.Load, ast.Tuple, ast.List, ast.keyword,
-        ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow,
-        ast.UAdd, ast.USub, ast.Compare, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
-        ast.BoolOp, ast.And, ast.Or, ast.IfExp
-    )
-
-
-
-#NOT YET IMPLEMENTED:
-
-
-##IMPORTANT: right now the system is mostly intended for stuff like regen/poison/etc. "ticking" passives,
-##it does not yet ones like a cosntant "+X% stat" or "+X% damage if Y condition"
-##TODO: implement non-ticking passives too!!!
-## --- Passive definition ---
-#@dataclass
-#class Passive:
-#    id: str
-#    name: str
-#    when: Literal["on_turn_start", "on_turn_end"] = "on_turn_start"
-#    formula: str = ""  # can be assignment or pure expression (ignored return for hooks)

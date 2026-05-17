@@ -7,13 +7,11 @@ from logic import MatchManager, Entity, VTTError, OutOfBounds, Occupied, NotFoun
 #used for Gamesystem-related commands
 from logic import DEFAULT_SYSTEM_SETTINGS, ALLOWED_DIRECTIONS, RULE_SCHEMA, RULES_REGISTRY
 
+# Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
+from formula import resolve_arg_token, FormulaEngine, EvalCtx
+
 import re
 import json
-
-#TODO:
-#from logic import FormulaEngine  # tiny expression/assignment runtime
-#from logic import expand_inline_formulas, coerce_number
-#from logic import compute_default_specials, reserved_special_id_names
 
 # ---- Context abstraction -----------------------------------------------------
 class ReplyContext(Protocol):
@@ -433,6 +431,27 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
     sub = args[0].lower()#makes the first arg lowercase, so "ADD", "aDD", etc. become "add"
 
+    # ---- formula substitution ----------------------------------------------
+    # args[1] (if present) is treated as the self-target for $() resolution in
+    # args[2:]. args[1] may itself be a $() expression — resolved first with
+    # self_id=None (self isn't bound yet at that point).
+    args = list(args)
+    if len(args) >= 2:
+        args[1] = resolve_arg_token(args[1], m, self_id=None)
+
+    self_id: Optional[str] = None
+    if len(args) >= 2:
+        try:
+            candidate = _resolve_eid(m, args[1])
+            if candidate in m.entities:
+                self_id = candidate
+        except (NotFound, VTTError):
+            pass  # not a real entity reference; self stays None
+
+    for i in range(2, len(args)):
+        args[i] = resolve_arg_token(args[i], m, self_id)
+    # ---- end formula substitution ------------------------------------------
+
     # add
     if sub == "add":# and len(args) >= 6:
         if await return_help_if_not_enough_args(ctx, args, 6, "ent", "add"):
@@ -812,6 +831,25 @@ registry.annotate_sub(
 )
 
 
+
+
+@registry.command(
+    "eval",
+    usage='!eval "<formula>"',
+    desc=("Evaluate a formula against the active match (for testing). "
+          "`this` = current-turn entity; `self` is unbound here. "
+          "Supports assignments and multi-statement bodies; if the source ends with "
+          "an expression, its value is returned. Quote the whole formula to preserve spaces."),
+)
+async def eval_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["eval"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    src = " ".join(args)  # rejoin in case shlex split on internal spaces
+    eval_ctx = EvalCtx(this=m.current_entity_id(), target=None)
+    val = FormulaEngine(m).eval_program(src, eval_ctx)
+    return await ctx.send(f"= `{val!r}`")
 
 
 # ---- Automated Help command (shows available commands----------------------------------------------------------
