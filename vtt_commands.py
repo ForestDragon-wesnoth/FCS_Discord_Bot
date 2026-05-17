@@ -7,8 +7,11 @@ from logic import MatchManager, Entity, VTTError, OutOfBounds, Occupied, NotFoun
 #used for Gamesystem-related commands
 from logic import DEFAULT_SYSTEM_SETTINGS, ALLOWED_DIRECTIONS, RULE_SCHEMA, RULES_REGISTRY
 
+# Passive system
+from logic import Passive, HOOK_NAMES
+
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
-from formula import resolve_arg_token, FormulaEngine, EvalCtx
+from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program
 
 import re
 import json
@@ -104,18 +107,164 @@ registry = CommandRegistry()
 
 # ---- Helpers ----------------------------------------------------------------
 
+# Template engine for entity_line_format / entity_info_format rules.
+# Syntax:
+#   {key}              substitute value (str()-formatted), missing -> "<?key?>" sentinel
+#   {key.sub.sub}      dotted-path traversal through nested dicts in vars
+#   {?key?}...{/?}     conditional section; renders inner only if value is truthy
+#                      (None/""/{}/[]  are falsy; 0 and False are too — standard Python bool())
+#   \n                 literal backslash-n in rule string becomes a real newline
+# No nesting of conditionals in v1; sequential conditionals work fine.
+
+import re as _re
+_TMPL_COND_RE = _re.compile(r"\{\?([a-zA-Z_][\w.]*)\?\}(.*?)\{/\?\}", _re.DOTALL)
+_TMPL_PLACE_RE = _re.compile(r"\{([a-zA-Z_][\w.]*)\}")
+
+
+def _tmpl_fmt_value(v: Any) -> str:
+    """Format a value for placeholder substitution."""
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, dict):
+        if not v:
+            return ""
+        keys = list(v.keys())
+        if len(keys) > 6:
+            return "{" + ", ".join(keys[:6]) + f", ... ({len(keys)} total)" + "}"
+        return "{" + ", ".join(keys) + "}"
+    if isinstance(v, (list, tuple, set)):
+        items = list(v)
+        if not items:
+            return ""
+        if len(items) > 6:
+            return "[" + ", ".join(str(x) for x in items[:6]) + f", ... ({len(items)} total)" + "]"
+        return "[" + ", ".join(str(x) for x in items) + "]"
+    return str(v)
+
+
+def _tmpl_resolve(ctx: Dict[str, Any], path: str) -> Tuple[bool, Any]:
+    """Resolve a dotted path. Returns (found, value)."""
+    parts = path.split(".")
+    cur: Any = ctx
+    for p in parts:
+        if isinstance(cur, dict) and p in cur:
+            cur = cur[p]
+        else:
+            return False, None
+    return True, cur
+
+
+def _tmpl_truthy(found: bool, val: Any) -> bool:
+    """Conditional truthiness — missing path always falsy; otherwise Python bool()."""
+    if not found:
+        return False
+    if val is None:
+        return False
+    return bool(val)
+
+
+def _render_template(tmpl: str, ctx: Dict[str, Any]) -> str:
+    """Render a template string with placeholders and conditionals."""
+    # Allow \n in the stored rule string to produce real newlines
+    s = tmpl.replace("\\n", "\n").replace("\\t", "\t")
+
+    # Pass 1: conditionals
+    def _cond_sub(m):
+        path, inner = m.group(1), m.group(2)
+        found, val = _tmpl_resolve(ctx, path)
+        if not _tmpl_truthy(found, val):
+            return ""
+        return inner
+    # Run multiple times in case conditional bodies become eligible for more (rare).
+    for _ in range(4):
+        new_s = _TMPL_COND_RE.sub(_cond_sub, s)
+        if new_s == s:
+            break
+        s = new_s
+
+    # Pass 2: placeholders
+    def _place_sub(m):
+        path = m.group(1)
+        found, val = _tmpl_resolve(ctx, path)
+        if not found:
+            return f"<?{path}?>"
+        return _tmpl_fmt_value(val)
+    return _TMPL_PLACE_RE.sub(_place_sub, s)
+
+
+def _entity_template_context(e: Entity) -> Dict[str, Any]:
+    """Build the placeholder context for an Entity."""
+    hp_var, max_hp_var, init_var = e._vital_var_names()
+    # Start with entity attributes (these win over var keys on collision).
+    ctx: Dict[str, Any] = {
+        "id": e.id,
+        "name": e.name,
+        "x": e.x,
+        "y": e.y,
+        "facing": e.facing,
+        "team": e.team if e.team else "",
+        "initiative": e.vars.get(init_var, 0),
+        "hp": e.hp,
+        "max_hp": e.max_hp if e.max_hp is not None else e.hp,
+        "status_csv": ", ".join(sorted(e.status)) if e.status else "",
+        "passives_csv": ", ".join(sorted(e.passives.keys())) if e.passives else "",
+    }
+    # Merge vars — vars win for keys NOT already in the well-known set above.
+    # (So a user's `hp` var won't override the computed alias, since `hp` is in ctx.)
+    for k, v in e.vars.items():
+        if k not in ctx:
+            ctx[k] = v
+    return ctx
+
+
 def _entity_line(e: Entity) -> str:
-    # Use the entity's vital var names (from bound match rules)
-    hp_var, max_hp_var, _ = e._vital_var_names()
-    hp_val = e.hp
-    max_hp_val = e.max_hp if e.max_hp is not None else hp_val
-    # Show the actual var name if it's not the default "hp"/"max_hp"
-    if hp_var == "hp":
-        hp_label = "HP"
+    """Single-line entity summary, rendered from the active match's entity_line_format rule."""
+    tmpl = None
+    if e._match is not None:
+        tmpl = e._match.rules.get("entity_line_format")
+    if not tmpl:
+        # Fallback to the engine default (shouldn't happen if system rules are populated)
+        tmpl = DEFAULT_SYSTEM_SETTINGS.get(
+            "entity_line_format",
+            "{name} ({id}): HP: {hp}/{max_hp} X,Y: {x},{y} facing {facing}",
+        )
+    return _render_template(tmpl, _entity_template_context(e))
+
+
+def _entity_card(e: Entity) -> str:
+    """Multi-line entity card, rendered from the active match's entity_info_format rule."""
+    tmpl = None
+    if e._match is not None:
+        tmpl = e._match.rules.get("entity_info_format")
+    if not tmpl:
+        tmpl = DEFAULT_SYSTEM_SETTINGS.get("entity_info_format", "")
+    return _render_template(tmpl, _entity_template_context(e))
+
+
+def _entity_dump(e: Entity) -> str:
+    """Raw 'show everything' view — template-free, complete state of the entity."""
+    parts: List[str] = []
+    parts.append(f"**{e.name}** (`{e.id}`)")
+    parts.append(f"Position: ({e.x}, {e.y}) facing {e.facing}")
+    parts.append(f"Team: {e.team if e.team else '(none)'}")
+    parts.append(f"Status: {', '.join(sorted(e.status)) if e.status else '(none)'}")
+    hp_var, max_hp_var, init_var = e._vital_var_names()
+    parts.append(
+        f"Vitals: hp_var=`{hp_var}` max_hp_var=`{max_hp_var}` turnorder_var=`{init_var}`"
+    )
+    parts.append("")
+    parts.append("**vars (full json):**")
+    parts.append(f"```{json.dumps(e.vars or {}, indent=2, sort_keys=True)}\n```")
+    if e.passives:
+        parts.append("**passives:**")
+        for pid, p in e.passives.items():
+            parts.append(f"- `{pid}` ({p.when}): `{p.formula}`")
     else:
-        hp_label = hp_var
-    return f"{e.name} ({e.id}): {hp_label}: {hp_val}/{max_hp_val} X,Y: {e.x},{e.y} facing {e.facing}"
-    #TODO: add a way to dynamically define what variables are shown for entities!
+        parts.append("**passives:** (none)")
+    return "\n".join(parts)
+
 
 def active_match(mgr: MatchManager, ctx: ReplyContext):
     mid = mgr.get_active_for_channel(ctx.channel_key)
@@ -392,7 +541,9 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     
         s = mgr.get_system(name)
         s.set(key, value)
-        return await ctx.send(f"`{name}`.{key} = {value!r}")
+        refreshed = mgr.refresh_match_rules(name)
+        suffix = f" (refreshed {refreshed} live match{'es' if refreshed != 1 else ''})" if refreshed else ""
+        return await ctx.send(f"`{name}`.{key} = {value!r}{suffix}")
     if sub == "default":
         if await return_help_if_not_enough_args(ctx, args, 3, "system", "default"):
             return
@@ -466,10 +617,13 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if init is not None:
             initial_vars[init_var] = init
         e = Entity(id=eid, name=name, x=x, y=y, vars=initial_vars)
-        e.spawn(m, x, y)
-        return await ctx.send(f"Added `{name}` with id `{eid}` at ({x},{y}).")
+        _, spawn_log = e.spawn(m, x, y)
+        msg = f"Added `{name}` with id `{eid}` at ({x},{y})."
+        if spawn_log:
+            msg += "\n" + "\n".join(spawn_log)
+        return await ctx.send(msg)
 
-    # --- info (single entity line) ---
+    # --- info (entity card per entity_info_format rule) ---
     if sub == "info":
         if await return_help_if_not_enough_args(ctx, args, 2, "ent", "info"):
             return
@@ -477,9 +631,16 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
         e = m.entities[eid]
-        # Show normal line plus full dump of the vars data
-        vars_block = json.dumps(e.vars or {}, indent=2, sort_keys=True)
-        return await ctx.send(f"{_entity_line(e)}\n\n**vars (json)**:\n```{vars_block}\n```")
+        return await ctx.send(_entity_card(e))
+
+    # --- dump (raw, template-free view of everything stored on the entity) ---
+    if sub == "dump":
+        if await return_help_if_not_enough_args(ctx, args, 2, "ent", "dump"):
+            return
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        return await ctx.send(_entity_dump(m.entities[eid]))
 
     # delete / remove
     if sub in ("remove", "del", "rm"):# and len(args) >= 2:
@@ -615,10 +776,13 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
         clone = Entity.from_dict(payload)
         # Use spawn to register/validate; preserve original facing after spawn
-        clone.spawn(m, x, y, initiative=src.initiative)
+        _, spawn_log = clone.spawn(m, x, y, initiative=src.initiative)
         clone.facing = src.facing
 
-        return await ctx.send(f"Cloned `{src_id}` → `{new_id}` at ({x},{y}).")
+        msg = f"Cloned `{src_id}` → `{new_id}` at ({x},{y})."
+        if spawn_log:
+            msg += "\n" + "\n".join(spawn_log)
+        return await ctx.send(msg)
     # set_var
     if sub == "set_var":
         # Usage: !ent set_var <id> <key> <value>
@@ -667,7 +831,14 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 registry.annotate_sub(
     "ent", "info",
     usage="!ent info <id>",
-    desc="Show a single entity summary."
+    desc=("Show an entity card per the game system's entity_info_format rule. "
+          "For complete raw state regardless of template, use !ent dump."),
+)
+registry.annotate_sub(
+    "ent", "dump",
+    usage="!ent dump <id>",
+    desc=("Show ALL state stored on an entity (raw, template-free): every "
+          "attribute, full vars JSON, all passives. Useful for debugging."),
 )
 registry.annotate_sub(
     "ent", "add",
@@ -739,10 +910,13 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send("Turn order:\n" + ("\n".join(order_lines) or "(empty)"))
     sub = args[0].lower()
     if sub == "next":
-        eid = m.next_turn()
+        eid, fire_log = m.next_turn()
         if not eid: return await ctx.send("No turn order yet.")
         e = m.entities[eid]
-        return await ctx.send(f"It is now **{e.name}**'s turn (id `{eid[:8]}`)")
+        out = f"It is now **{e.name}**'s turn (id `{eid[:8]}`)"
+        if fire_log:
+            out += "\n" + "\n".join(fire_log)
+        return await ctx.send(out)
     if sub == "set":
         if await return_help_if_not_enough_args(ctx, args, 2, "turn", "set"):
             return
@@ -771,7 +945,17 @@ registry.annotate_sub(
 @registry.command("match_toplevel", usage="!match_toplevel", desc="Show active match summary (name/id/turn number).")
 async def match_top_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
-    return await ctx.send(f"**{m.name}** `{m.id}`\nGame System: **{m.system_name}**\nCurrent Turn Number: **{m.turn_number}**\n")
+    parts = [
+        f"**{m.name}** `{m.id}`",
+        f"Game System: **{m.system_name}**",
+        f"Current Turn Number: **{m.turn_number}**",
+    ]
+    if m.global_passives:
+        parts.append("")
+        parts.append("**Global passives:**")
+        for pid, p in m.global_passives.items():
+            parts.append(f"- `{pid}` ({p.when}): `{p.formula}`")
+    return await ctx.send("\n".join(parts))
 
 @registry.command("map", usage="!map", desc="Render the ASCII map for the active match.")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -834,6 +1018,237 @@ registry.annotate_sub(
 
 
 @registry.command(
+    "passive",
+    usage="!passive <subcommand> ...",
+    desc=("Manage entity-level passives. Each passive fires its formula when "
+          "the given hook triggers for the owning entity (or, for on_round_*, "
+          "for every entity in turn order)."),
+)
+async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["passive"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    sub = args[0].lower()
+
+    if sub == "hooks":
+        return await ctx.send(
+            "**Passive hooks:** " + ", ".join(f"`{h}`" for h in sorted(HOOK_NAMES))
+        )
+
+    if sub == "add":
+        if await return_help_if_not_enough_args(ctx, args, 5, "passive", "add"):
+            return
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        pid = args[2]
+        when = args[3].lower()
+        # Rejoin in case user didn't quote the formula
+        formula = " ".join(args[4:]).strip()
+        if not formula:
+            raise VTTError("Passive formula cannot be empty.")
+        if when not in HOOK_NAMES:
+            allowed = ", ".join(sorted(HOOK_NAMES))
+            raise VTTError(f"Unknown hook '{when}'. Allowed: {allowed}")
+        # Eagerly validate formula syntax so broken passives are caught at add time.
+        try:
+            validate_program(formula)
+        except FormulaError as ex:
+            raise VTTError(f"Invalid passive formula: {ex}")
+        e = m.entities[eid]
+        if pid in e.passives:
+            raise DuplicateId(f"Passive '{pid}' already exists on entity '{eid}'.")
+        e.passives[pid] = Passive(id=pid, when=when, formula=formula)
+        return await ctx.send(f"Added passive `{pid}` ({when}) to `{eid}`.")
+
+    if sub in ("remove", "del", "rm"):
+        if await return_help_if_not_enough_args(ctx, args, 3, "passive", "remove"):
+            return
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        pid = args[2]
+        e = m.entities[eid]
+        if pid not in e.passives:
+            raise NotFound(f"Passive '{pid}' not found on entity '{eid}'.")
+        del e.passives[pid]
+        return await ctx.send(f"Removed passive `{pid}` from `{eid}`.")
+
+    if sub == "list":
+        # Specific entity
+        if len(args) >= 2:
+            eid = _resolve_eid(m, args[1])
+            if eid not in m.entities:
+                raise NotFound(f"Entity '{eid}' not found.")
+            e = m.entities[eid]
+            if not e.passives:
+                return await ctx.send(f"`{eid}` has no passives.")
+            lines = [f"**Passives on `{eid}`:**"]
+            for pid, p in e.passives.items():
+                lines.append(f"- `{pid}` ({p.when}): `{p.formula}`")
+            return await ctx.send("\n".join(lines))
+        # All entities
+        lines = ["**All entity passives in this match:**"]
+        any_found = False
+        for eid, e in m.entities.items():
+            if not e.passives:
+                continue
+            any_found = True
+            for pid, p in e.passives.items():
+                lines.append(f"- `{eid}.{pid}` ({p.when}): `{p.formula}`")
+        if not any_found:
+            return await ctx.send("No entity passives in this match.")
+        return await ctx.send("\n".join(lines))
+
+    if sub == "info":
+        if await return_help_if_not_enough_args(ctx, args, 3, "passive", "info"):
+            return
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        pid = args[2]
+        e = m.entities[eid]
+        if pid not in e.passives:
+            raise NotFound(f"Passive '{pid}' not found on entity '{eid}'.")
+        p = e.passives[pid]
+        return await ctx.send(
+            f"**Passive `{eid}.{pid}`**\nHook: `{p.when}`\nFormula:\n```\n{p.formula}\n```"
+        )
+
+    title, body = registry.help_for(["passive"])
+    return await ctx.send(f"**{title}**\n{body}")
+
+registry.annotate_sub(
+    "passive", "add",
+    usage='!passive add <entity_id> <passive_id> <when> "<formula>"',
+    desc=("Attach a passive to an entity. <when> must be one of the hook names "
+          "(see `!passive hooks`). Formula is run as a program when the hook fires; "
+          "inside it, `self` = the owning entity, `this` = current-turn entity. "
+          "Quote the formula to preserve spaces."),
+)
+registry.annotate_sub(
+    "passive", "remove",
+    usage="!passive remove <entity_id> <passive_id>",
+    desc="Remove a passive from an entity. Aliases: del, rm.",
+)
+registry.annotate_sub(
+    "passive", "list",
+    usage="!passive list [entity_id]",
+    desc="List passives on a specific entity, or across all entities in the match.",
+)
+registry.annotate_sub(
+    "passive", "info",
+    usage="!passive info <entity_id> <passive_id>",
+    desc="Show full info (hook + formula source) for a single passive.",
+)
+registry.annotate_sub(
+    "passive", "hooks",
+    usage="!passive hooks",
+    desc="List the available passive hook names.",
+)
+
+
+@registry.command(
+    "gpassive",
+    usage="!gpassive <subcommand> ...",
+    desc=("Manage global (match-level) passives. Each global passive fires once "
+          "per entity in turn order on each matching hook event — `self` = the "
+          "entity being iterated, `this` = current-turn entity."),
+)
+async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["gpassive"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    sub = args[0].lower()
+
+    if sub == "hooks":
+        return await ctx.send(
+            "**Passive hooks:** " + ", ".join(f"`{h}`" for h in sorted(HOOK_NAMES))
+        )
+
+    if sub == "add":
+        if await return_help_if_not_enough_args(ctx, args, 4, "gpassive", "add"):
+            return
+        pid = args[1]
+        when = args[2].lower()
+        formula = " ".join(args[3:]).strip()
+        if not formula:
+            raise VTTError("Passive formula cannot be empty.")
+        if when not in HOOK_NAMES:
+            allowed = ", ".join(sorted(HOOK_NAMES))
+            raise VTTError(f"Unknown hook '{when}'. Allowed: {allowed}")
+        try:
+            validate_program(formula)
+        except FormulaError as ex:
+            raise VTTError(f"Invalid passive formula: {ex}")
+        if pid in m.global_passives:
+            raise DuplicateId(f"Global passive '{pid}' already exists.")
+        m.global_passives[pid] = Passive(id=pid, when=when, formula=formula)
+        return await ctx.send(f"Added global passive `{pid}` ({when}).")
+
+    if sub in ("remove", "del", "rm"):
+        if await return_help_if_not_enough_args(ctx, args, 2, "gpassive", "remove"):
+            return
+        pid = args[1]
+        if pid not in m.global_passives:
+            raise NotFound(f"Global passive '{pid}' not found.")
+        del m.global_passives[pid]
+        return await ctx.send(f"Removed global passive `{pid}`.")
+
+    if sub == "list":
+        if not m.global_passives:
+            return await ctx.send("No global passives in this match.")
+        lines = ["**Global passives:**"]
+        for pid, p in m.global_passives.items():
+            lines.append(f"- `{pid}` ({p.when}): `{p.formula}`")
+        return await ctx.send("\n".join(lines))
+
+    if sub == "info":
+        if await return_help_if_not_enough_args(ctx, args, 2, "gpassive", "info"):
+            return
+        pid = args[1]
+        if pid not in m.global_passives:
+            raise NotFound(f"Global passive '{pid}' not found.")
+        p = m.global_passives[pid]
+        return await ctx.send(
+            f"**Global passive `{pid}`**\nHook: `{p.when}`\nFormula:\n```\n{p.formula}\n```"
+        )
+
+    title, body = registry.help_for(["gpassive"])
+    return await ctx.send(f"**{title}**\n{body}")
+
+registry.annotate_sub(
+    "gpassive", "add",
+    usage='!gpassive add <passive_id> <when> "<formula>"',
+    desc=("Add a global passive. Fires once per entity in turn order on the given "
+          "hook. Inside the formula: `self` = the entity being iterated, "
+          "`this` = current-turn entity."),
+)
+registry.annotate_sub(
+    "gpassive", "remove",
+    usage="!gpassive remove <passive_id>",
+    desc="Remove a global passive. Aliases: del, rm.",
+)
+registry.annotate_sub(
+    "gpassive", "list",
+    usage="!gpassive list",
+    desc="List all global passives in the active match.",
+)
+registry.annotate_sub(
+    "gpassive", "info",
+    usage="!gpassive info <passive_id>",
+    desc="Show full info (hook + formula source) for a global passive.",
+)
+registry.annotate_sub(
+    "gpassive", "hooks",
+    usage="!gpassive hooks",
+    desc="List the available passive hook names.",
+)
+
+
+@registry.command(
     "eval",
     usage='!eval "<formula>"',
     desc=("Evaluate a formula against the active match (for testing). "
@@ -857,4 +1272,3 @@ async def eval_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 async def help_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     title, body = registry.help_for(args)
     await ctx.send(f"**{title}**\n{body}")
-

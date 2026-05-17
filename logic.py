@@ -74,16 +74,36 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     # OPTIONS THAT ARE NOT YET IMPLEMENTED (examples for future)
     ##UI rules:
-    ## Entity line formatting (shown in !ent info / !state listings)
-    #"entity_line_format": {
-    #    "default": "{name} ({id}): HP: {hp}/{max_hp} X,Y: {x},{y} facing {facing}",
-    #    "schema": {"type": "str"},
-    #    "desc": (
-    #        "Template for a single entity row. Allowed placeholders are simple identifiers like {name}, "
-    #        "{hp}, {max_hp}, {x}, {y}, {facing}, {team}, {initiative}, {status_csv}, and any valid-identifier "
-    #        "keys from extras (e.g. {stamina}). No attribute/item access, conversions, or format specs."
-    #    ),
-    #},
+    ## Entity line formatting (shown in !state listings, turn order rows)
+    "entity_line_format": {
+        "default": "{name} ({id}): HP: {hp}/{max_hp} X,Y: {x},{y} facing {facing}",
+        "schema": {"type": "str"},
+        "desc": (
+            "Single-line template for an entity row (used in !list, !state). "
+            "Placeholders: {key} substitutes a value; {?key?}...{/?} renders inner "
+            "only if the key is present and truthy. Dotted paths supported: "
+            "{inventory.sword.damage}. Built-in keys: id, name, x, y, facing, team, "
+            "initiative, hp, max_hp, status_csv, passives_csv. Any top-level "
+            "entity var is also available by name. Use \\n for newlines."
+        ),
+    },
+    ## Entity card formatting (shown in !ent info)
+    "entity_info_format": {
+        "default": (
+            "**{name}** (`{id}`)\\n"
+            "HP: {hp}/{max_hp}   Position: ({x},{y}) facing {facing}"
+            "{?team?}   Team: {team}{/?}\\n"
+            "{?status_csv?}Status: {status_csv}\\n{/?}"
+            "{?passives_csv?}Passives: {passives_csv}\\n{/?}"
+            "{?inventory?}Inventory: {inventory}\\n{/?}"
+        ),
+        "schema": {"type": "str"},
+        "desc": (
+            "Multi-line template for the !ent info card. Same syntax as "
+            "entity_line_format. Use \\n for newlines. For complete raw info "
+            "regardless of template, use !ent dump."
+        ),
+    },
     # "movement_block_through": {
     #     "default": False,
     #     "schema": {"type": "bool"},
@@ -176,6 +196,80 @@ RESERVED_IDS: Set[str] = {"current", "this", "self"}
 
 
 #TODO: flesh it out into a proper system later
+
+
+# -------------------------
+# Passive hooks & Passive dataclass
+# -------------------------
+
+# Valid `when` values for passives. Entity passives fire on the owning
+# entity's own turn/round; global passives fire once per entity in turn order
+# on each hook (per-entity iteration).
+HOOK_NAMES: Set[str] = {
+    "on_turn_start",
+    "on_turn_end",
+    "on_round_start",
+    "on_round_end",
+    "on_entity_spawned",
+}
+
+
+@dataclass
+class Passive:
+    """
+    A passive ability — either entity-scoped (stored on Entity.passives) or
+    global (stored on Match.global_passives). The `formula` is run as a
+    program (assignments allowed; trailing expression value is logged) each
+    time `when` fires for the appropriate target entity.
+
+    Inside the formula:
+      this = entity whose turn it currently is (Match.current_entity_id())
+      self = the target entity for this firing
+             - for entity passives: always the owning entity
+             - for global passives: each entity iterated for the hook
+    """
+    id: str
+    when: str
+    formula: str
+
+    def __post_init__(self):
+        if not isinstance(self.id, str) or not self.id.strip():
+            raise VTTError("Passive id must be a non-empty string.")
+        if self.when not in HOOK_NAMES:
+            allowed = ", ".join(sorted(HOOK_NAMES))
+            raise VTTError(
+                f"Unknown passive hook '{self.when}'. Allowed: {allowed}"
+            )
+        if not isinstance(self.formula, str):
+            raise VTTError("Passive formula must be a string.")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"id": self.id, "when": self.when, "formula": self.formula}
+
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> "Passive":
+        return Passive(id=d["id"], when=d["when"], formula=d["formula"])
+
+
+def _run_passive_safely(engine, p: "Passive", ctx, *, target_id: str, is_global: bool) -> str:
+    """
+    Run a single passive's formula and return a one-line human-readable log
+    string. Catches FormulaError (and any other exception, defensively) so one
+    broken passive can't cripple the whole hook fire.
+    """
+    # Lazy import to avoid logic <-> formula import cycle.
+    from formula import FormulaError
+    label = f"global passive `{p.id}`" if is_global else f"passive `{target_id}.{p.id}`"
+    try:
+        result = engine.eval_program(p.formula, ctx)
+        if result is None:
+            return f"⚙️ {label} fired on `{target_id}` ({p.when})"
+        return f"⚙️ {label} fired on `{target_id}` ({p.when}) → {result!r}"
+    except FormulaError as ex:
+        return f"⚠️ {label} on `{target_id}` ({p.when}) FAILED: {ex}"
+    except Exception as ex:
+        # Defensive: programmer-error or unexpected bug shouldn't nuke a turn.
+        return f"💥 {label} on `{target_id}` ({p.when}) CRASHED: {type(ex).__name__}: {ex}"
 
 
 # -------------------------
@@ -357,12 +451,17 @@ class Entity:
         self.hp = min(self.max_hp, self.hp + max(0, amount))
 
     # ---------- high-level actions (Entity-owned) ----------
-    def spawn(self, match: "Match", x: int, y: int, initiative: Optional[int] = None):
+    def spawn(self, match: "Match", x: int, y: int, initiative: Optional[int] = None) -> Tuple[str, List[str]]:
         """
         Add this entity to a match at (x,y).
         Validates bounds/occupancy, sets facing, registers in turn order.
         Also validates that the entity has the required vital variables
         (HP var) for the match's game system.
+
+        Returns (entity_id, log_lines). log_lines contains any passive-fire
+        messages produced by the on_entity_spawned hook. NOTE: Match.from_dict
+        uses Entity.bind() instead of spawn(), so loading a save does NOT
+        re-trigger on_entity_spawned.
         """
         if self._match is not None:
             raise VTTError(f"Entity '{self.id}' is already in a match")
@@ -395,7 +494,8 @@ class Entity:
 
         match.entities[self.id] = self
         match._rebuild_turn_order()
-        return self.id
+        log = match.fire_hook("on_entity_spawned", target_ids=[self.id])
+        return (self.id, log)
 
     def remove(self):
         """
@@ -463,6 +563,24 @@ class Entity:
         self.initiative = value
         self._require_match()._rebuild_turn_order()
 
+    # ---------- passive management (entity-scoped) ----------
+    def add_passive(self, p: "Passive") -> None:
+        """Attach a Passive to this entity. Validates that its formula parses."""
+        if p.id in self.passives:
+            raise DuplicateId(
+                f"Passive id '{p.id}' already exists on entity '{self.id}'."
+            )
+        # Early-fail on a malformed formula so the user sees the error now,
+        # not later when the hook fires.
+        from formula import validate_formula
+        validate_formula(p.formula, mode="exec")
+        self.passives[p.id] = p
+
+    def remove_passive(self, pid: str) -> None:
+        if pid not in self.passives:
+            raise NotFound(f"Passive '{pid}' not found on entity '{self.id}'.")
+        del self.passives[pid]
+
     # ---------- serialization ----------
     def to_dict(self) -> Dict[str, Any]:
         # hp/max_hp/initiative now live in vars; include top-level copies for save-file readability
@@ -480,7 +598,7 @@ class Entity:
             "initiative": self.vars.get(init_var),   # backwards-compat mirror
             "vars": dict(self.vars),
             "_vital_in_vars": True,                  # flag: vital data lives in vars
-            "passives": {pid: vars(p) for pid, p in self.passives.items()},
+            "passives": {pid: p.to_dict() for pid, p in self.passives.items()},
             "facing": self.facing,
         }
 
@@ -508,7 +626,7 @@ class Entity:
             facing=data.get("facing", "up"),
         )
         for pid, pd in (data.get("passives", {}) or {}).items():
-            e.passives[pid] = Passive(**pd)
+            e.passives[pid] = Passive.from_dict(pd)
         return e
 
 # -------------------------
@@ -529,11 +647,15 @@ class Match:
     active_index: int = 0
     #global turn counter, starts at 1. global turn here increments by 1 after EVERY entity had its turn and the cycle resets
     turn_number: int = 1
+    # Tracks whether the very first `on_round_start`/`on_turn_start` have fired
+    # for this match. False until the first `Match.next_turn()` call. Used to
+    # make that first call begin the round (fire start-hooks for active_index)
+    # rather than advance past entity 0.
+    round_started: bool = False
     # Game system binding - currently NOT YET DIRECTLY CONNECTED TO A GAMESYSTEM CLASS, JUST COPYING THE DICTIONARY OF RULES FROM IT.
     rules: Dict[str, Any] = field(default_factory=dict)  # denormalized copy for fast access
 
-#PASSIVES NOT YET TRULY IMPLEMENTED 
-#    #global passives that apply to every unit on the match, could be useful for stuff like environmental effects, gamemode rules, etc. 
+    #global passives that apply to every entity in turn order on each hook fire
     global_passives: Dict[str, Passive] = field(default_factory=dict)
 
     # ---- global constraints / helpers (unchanged in spirit) ----
@@ -571,17 +693,100 @@ class Match:
             return None
         return self.turn_order[self.active_index]
 
-    def next_turn(self) -> str | None:
-        if not self.turn_order:
-            return None
-        prev_index = self.active_index
-        self.active_index = (self.active_index + 1) % len(self.turn_order)
+    def next_turn(self) -> Tuple[Optional[str], List[str]]:
+        """
+        Advance the turn. Returns (new_active_entity_id, log_lines) where
+        log_lines contains human-readable messages for any passives that
+        fired (or failed) during the transition.
 
-        #increment turn counter when we loop around
-        if self.active_index == 0 and len(self.turn_order) > 0:
-            # We wrapped around to the first position => new round
+        The FIRST call after match creation behaves specially: it does NOT
+        advance, but instead fires `on_round_start` then `on_turn_start` for
+        the entity already at active_index, marking the match as started.
+        Subsequent calls run the normal end → advance → start cycle.
+        """
+        if not self.turn_order:
+            return (None, [])
+        log: List[str] = []
+        # First-ever next_turn call: begin round 1 without advancing.
+        if not self.round_started:
+            self.round_started = True
+            log.extend(self.fire_hook("on_round_start"))
+            cur = self.turn_order[self.active_index]
+            log.extend(self.fire_hook("on_turn_start", target_ids=[cur]))
+            return (cur, log)
+
+        # Normal transition.
+        cur = self.turn_order[self.active_index]
+        log.extend(self.fire_hook("on_turn_end", target_ids=[cur]))
+        new_index = (self.active_index + 1) % len(self.turn_order)
+        wrapped = (new_index == 0)
+        if wrapped:
+            log.extend(self.fire_hook("on_round_end"))
+        self.active_index = new_index
+        if wrapped:
             self.turn_number += 1
-        return self.turn_order[self.active_index]
+            log.extend(self.fire_hook("on_round_start"))
+        new_cur = self.turn_order[self.active_index]
+        log.extend(self.fire_hook("on_turn_start", target_ids=[new_cur]))
+        return (new_cur, log)
+
+    def fire_hook(self, when: str, *, target_ids: Optional[List[str]] = None) -> List[str]:
+        """
+        Fire every passive matching `when` for each target entity.
+
+        target_ids defaults to entities currently in `turn_order` (alive and
+        with initiative). For each target, fires global passives first (in
+        insertion order), then the target's own entity passives (in insertion
+        order). Only passives whose own `when` matches are run.
+
+        For each fire: `self` = the target entity; `this` = current_entity_id().
+
+        Returns a list of human-readable log lines (one per fired passive).
+        Empty if no passives matched.
+        """
+        if when not in HOOK_NAMES:
+            return []
+        # Lazy import to avoid logic <-> formula import cycle.
+        from formula import FormulaEngine, EvalCtx
+
+        log: List[str] = []
+        if target_ids is None:
+            target_ids = list(self.turn_order)
+        this_id = self.current_entity_id()
+        engine = FormulaEngine(self)
+
+        for tid in target_ids:
+            e = self.entities.get(tid)
+            if e is None:
+                continue
+            ctx = EvalCtx(this=this_id, target=tid)
+            # Globals first (in insertion order).
+            for pid, p in list(self.global_passives.items()):
+                if p.when != when:
+                    continue
+                log.append(_run_passive_safely(engine, p, ctx, target_id=tid, is_global=True))
+            # Then entity-owned passives.
+            for pid, p in list(e.passives.items()):
+                if p.when != when:
+                    continue
+                log.append(_run_passive_safely(engine, p, ctx, target_id=tid, is_global=False))
+        return log
+
+    # ---- passive management (match-scoped / global) ----
+    def add_global_passive(self, p: "Passive") -> None:
+        """Attach a global Passive to this match. Validates formula parses."""
+        if p.id in self.global_passives:
+            raise DuplicateId(
+                f"Global passive id '{p.id}' already exists in match '{self.id}'."
+            )
+        from formula import validate_formula
+        validate_formula(p.formula, mode="exec")
+        self.global_passives[p.id] = p
+
+    def remove_global_passive(self, pid: str) -> None:
+        if pid not in self.global_passives:
+            raise NotFound(f"Global passive '{pid}' not found in match '{self.id}'.")
+        del self.global_passives[pid]
 
     # ---- persistence ----
     def to_dict(self) -> Dict[str, Any]:
@@ -596,6 +801,8 @@ class Match:
             "system_name": self.system_name,
             "rules": self.rules,
             "turn_number": self.turn_number,
+            "round_started": self.round_started,
+            "global_passives": {pid: p.to_dict() for pid, p in self.global_passives.items()},
         }
 
     @staticmethod
@@ -616,6 +823,11 @@ class Match:
         m.active_index = d.get("active_index", 0)
         # m.rules already set above
         m.turn_number = int(d.get("turn_number", 1))
+        m.round_started = bool(d.get("round_started", False))
+        m.global_passives = {
+            pid: Passive.from_dict(pd)
+            for pid, pd in (d.get("global_passives", {}) or {}).items()
+        }
         return m
 
     # ------------- simple ASCII render for quick debugging -------------
@@ -713,21 +925,38 @@ class MatchManager:
         return self.get_system(self.effective_system_name(channel_key))
 
     # ----- matches -----
+    def _build_rules_dict(self, sysobj) -> Dict[str, Any]:
+        """Denormalized rule snapshot: engine defaults overlaid with system overrides."""
+        rules = dict(DEFAULT_SYSTEM_SETTINGS)
+        for k, r in (getattr(sysobj, "settings", {}) or {}).items():
+            rules[k] = r.value
+        return rules
+
     def create_match(self, match_id: str, name: str, width: int, height: int, channel_key: Optional[str] = None, system_name: Optional[str] = None) -> str:
         if match_id in self.matches:
             raise DuplicateId(f"Match id '{match_id}' already exists")
         sysobj = self.get_system(system_name) if system_name else (
             self.effective_system(channel_key or "CLI")
         )
-        # Denormalized rule values for quick access in Match:
-        rules = dict(DEFAULT_SYSTEM_SETTINGS)
-        # Overlay system overrides
-        for k, r in (getattr(sysobj, "settings", {}) or {}).items():
-            rules[k] = r.value
+        rules = self._build_rules_dict(sysobj)
         m = Match(id=match_id, name=name, grid_width=width, grid_height=height,
                   system_name=sysobj.name, rules=rules)
         self.matches[m.id] = m
         return m.id
+
+    def refresh_match_rules(self, system_name: str) -> int:
+        """Re-snapshot rules onto every match bound to `system_name`. Returns count refreshed.
+        Call this after mutating a GameSystem so live matches pick up the change.
+        """
+        if system_name not in self.systems:
+            return 0
+        sysobj = self.systems[system_name]
+        count = 0
+        for m in self.matches.values():
+            if m.system_name == system_name:
+                m.rules = self._build_rules_dict(sysobj)
+                count += 1
+        return count
 
     def delete_match(self, match_id: str):
         if match_id not in self.matches:
@@ -805,4 +1034,3 @@ class MatchManager:
         except Exception as e:
             # Defensive: any schema mismatch should be surfaced as a friendly VTTError
             raise VTTError(f"Invalid save file format in '{path}': {e}")
-
