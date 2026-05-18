@@ -1,21 +1,140 @@
 """
-formula.py — formula engine for the VTT.
+formula.py — Formula engine for the VTT.
 
-Supports two evaluation modes:
-  - eval_expression(src, ctx)  -> value           (used for $(...) arg substitution)
-  - eval_program(src, ctx)     -> value | None    (assignments; optional trailing expr)
+================================================================================
+OVERVIEW
+================================================================================
+Formulas are small, sandboxed snippets of Python-like code that can read and
+write entity variables. They power:
+  - $("...") substitution in command arguments (e.g. !ent hp hero "$(...)")
+  - The !eval command, for ad-hoc inspection
+  - The body of every passive — both entity-scoped and match-scoped global
 
-Formula syntax:
-  entity[X]              X is a bare identifier or string literal.
-                         Special: 'this'/'current' = current-turn entity,
-                                  'self' = the command/passive frame's target.
-  entity[X].path.to.var  reads/writes entity.vars under a dotted path.
+Two evaluation modes are exposed:
+  - eval_expression(src, ctx) -> value
+      Parses src as a single expression. Used for $(...) substitution.
+  - eval_program(src, ctx)    -> value | None
+      Parses src as a sequence of statements. If the final statement is an
+      expression, its value is returned; otherwise returns None. This is what
+      passive formulas use.
 
-Reading a missing variable raises FormulaError (no silent defaults).
-Allowed functions: min, max, abs, round, int, float, str.
-Allowed ops: arithmetic, comparisons, boolean ops, ternaries.
-Everything else (subscripting, attribute access on non-entity, imports,
-comprehensions, lambdas, augmented assigns, etc.) is rejected.
+Validation also has a public helper: validate_formula(src, mode="exec"), used
+to catch malformed formulas at registration time rather than at fire time.
+
+================================================================================
+VARIABLE ACCESS
+================================================================================
+The only way to touch entity state is the magic `entity[X].path` form:
+
+  entity[hero].hp                  reads `vars["hp"]` of entity with id "hero"
+  entity[hero].inventory.sword     reads `vars["inventory"]["sword"]`
+  entity[hero].hp = 30             writes 30 to `vars["hp"]`
+  entity["rogue"].hp               same as entity[rogue].hp (string-literal id)
+
+The X inside the brackets may be:
+  - A bare identifier:      entity[hero]
+  - A string literal:       entity["hero"]
+  - One of two specials:
+      entity[this]    or entity[current]   -> the entity whose turn it is now
+      entity[self]                          -> the entity bound by the current
+                                               frame (the passive's owner, or
+                                               the target of a command). In an
+                                               !eval call `self` is unbound.
+
+Reading a path that does not exist raises FormulaError. There are no silent
+defaults. If you need a default, write it explicitly: e.g.
+  entity[self].hp = entity[self].hp + 5
+will fail loudly if `hp` was never set — which is usually what you want.
+
+Writing creates intermediate dicts as needed:
+  entity[hero].inventory.bow.damage = 8
+will produce `vars["inventory"] = {"bow": {"damage": 8}}` even if `inventory`
+didn't previously exist.
+
+================================================================================
+OPERATORS AND BUILT-INS
+================================================================================
+Arithmetic:        +  -  *  /  //  %  **       (binary)
+Unary:             +x   -x   not x
+Comparison:        ==  !=  <  <=  >  >=
+Boolean:           and  or  not
+Ternary:           value_if_true if cond else value_if_false
+
+Allowed functions: min, max, abs, round, int, float, str
+
+Everything else is rejected: list comprehensions, lambdas, augmented
+assignment (`+=`), subscripting (other than `entity[X]`), attribute access on
+non-entity values, imports, function definitions, decorators, exception
+handling, loops, with-blocks, etc.
+
+================================================================================
+CONDITIONAL FLOW
+================================================================================
+Two forms of conditional are supported.
+
+(1) Ternary expressions — preferred when picking a single value:
+
+  entity[self].hp = entity[self].hp + (5 if entity[self].resting == "yes" else 2)
+
+(2) if / elif / else statements — preferred when whole assignments differ:
+
+  if entity[self].resting == "yes":
+      entity[self].stamina = (entity[self].stamina + 10) * 2
+  elif entity[self].resting == "light":
+      entity[self].stamina = entity[self].stamina + 6
+  else:
+      entity[self].stamina = entity[self].stamina + 2
+
+Both forms compose freely: ternaries can appear inside if-bodies, conditions
+can be compound boolean expressions, ifs can nest:
+
+  if entity[self].hp <= 0 and entity[self].revives > 0:
+      entity[self].hp = entity[self].max_hp // 2
+      entity[self].revives = entity[self].revives - 1
+
+`elif` is just Python's `elif` — chain as many as needed. `else` is optional.
+An `if` without an `else` simply does nothing on the false branch.
+
+There is NO match/case statement; use an elif chain. There are NO local
+variables; if you need an intermediate value, recompute it or use a ternary
+inside a single assignment.
+
+================================================================================
+TIPS AND COMMON PATTERNS
+================================================================================
+Clamp a value within bounds:
+  entity[self].hp = min(max(entity[self].hp + 5, 0), entity[self].max_hp)
+
+Conditional damage based on status:
+  if entity[self].defending == "yes":
+      entity[self].hp = entity[self].hp - max(entity[attacker].atk - 5, 0)
+  else:
+      entity[self].hp = entity[self].hp - entity[attacker].atk
+
+Conditional self-heal in a passive (on_turn_start):
+  if entity[self].hp < entity[self].max_hp:
+      entity[self].hp = min(entity[self].hp + 3, entity[self].max_hp)
+
+Multi-step assignment cascade:
+  entity[self].turns_alive = entity[self].turns_alive + 1
+  if entity[self].turns_alive >= 5:
+      entity[self].state = "veteran"
+
+Ternary inside a $() substitution token (note the outer quoting at the
+command layer — required so the shell doesn't split on spaces):
+  !ent hp hero "$(entity[self].max_hp if entity[self].blessed else entity[self].hp + 5)"
+
+================================================================================
+SECURITY NOTES
+================================================================================
+Formulas run with __builtins__ disabled and a curated namespace. The AST is
+walked and every node is checked against an explicit whitelist before any
+code is compiled. Identifiers are restricted to the small set above plus
+the internal __read/__write helpers injected by the transformer. There is
+no path to import modules, open files, or escape the sandbox through normal
+formula source. (Defensive note: a buggy formula that raises at runtime is
+caught by the passive runner and reported as a "CRASHED" log line; sibling
+passives still fire.)
 """
 from __future__ import annotations
 import ast
@@ -41,6 +160,11 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
 _ALLOWED_NODES: Tuple[type, ...] = (
     ast.Module, ast.Expression,
     ast.Expr, ast.Assign,
+    # Control flow:
+    #   If         -> if / elif / else statements (elif is encoded as else: If)
+    #   Pass       -> empty bodies, e.g. `if cond: pass`
+    #   IfExp      -> ternary  (value_a if cond else value_b)
+    ast.If, ast.Pass,
     ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.IfExp, ast.Compare,
     ast.Call, ast.keyword,
     ast.Name, ast.Constant, ast.Load, ast.Store,

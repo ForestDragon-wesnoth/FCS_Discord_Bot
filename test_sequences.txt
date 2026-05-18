@@ -1,0 +1,281 @@
+VTT Bot Test Sequences
+======================
+
+Each scenario starts fresh with its own match id (m1, m2, ...). You can run
+any scenario independently, or run all in sequence and they won't collide.
+Quote any argument containing spaces, just like in a shell.
+
+
+SCENARIO 1 — Setup, formulas, and inline $() substitution
+----------------------------------------------------------
+
+!match new m1 demo 8 8
+!match use m1
+!ent add hero Hero 30 4 4 10
+!ent add rogue Rogue 25 5 5 20
+!list
+!eval "entity[rogue].hp + entity[hero].hp"
+!eval "min(entity[hero].hp, entity[rogue].hp)"
+!ent set_var hero regen 7
+!ent hp hero "$(entity[this].hp * -1 + 5)"
+!eval "entity[hero].hp"
+!ent hp hero "$(entity[self].regen)"
+!eval "entity[hero].hp"
+
+Expected: list shows two entities; sum eval returns 55; min returns 25; the
+$(entity[this].hp * -1 + 5) expression damages Hero by 25 (HP 30 -> 5);
+$(entity[self].regen) then heals by 7 (HP 5 -> 12).
+
+
+SCENARIO 2 — Entity passives + hook firing
+-------------------------------------------
+
+!match new m2 passives 8 8
+!match use m2
+!ent add hero Hero 30 4 4 10
+!ent add rogue Rogue 25 5 5 20
+!ent set_var hero stamina 5
+!ent set_var hero max_stamina 50
+!passive hooks
+!passive add hero regen on_turn_start "entity[self].stamina = min(entity[self].stamina + 10, entity[self].max_stamina)"
+!passive list hero
+!passive info hero regen
+!eval "entity[hero].stamina"
+!turn next
+!eval "entity[hero].stamina"
+!turn next
+!eval "entity[hero].stamina"
+!turn next
+!eval "entity[hero].stamina"
+!passive remove hero regen
+!passive list hero
+
+Expected: stamina starts at 5. First !turn next fires on_round_start +
+on_turn_start (regen 5 -> 15). Second !turn next is Rogue's turn (no regen,
+still 15). Third !turn next is Hero again (15 -> 25). After remove, list
+reports no passives.
+
+
+SCENARIO 3 — Global passives + buggy passive isolation
+-------------------------------------------------------
+
+!match new m3 globals 8 8
+!match use m3
+!ent add hero Hero 30 4 4 10
+!ent add rogue Rogue 25 5 5 20
+!gpassive add gas on_round_start "entity[self].hp = entity[self].hp - 1"
+!gpassive list
+!gpassive info gas
+!turn next
+!eval "entity[hero].hp"
+!eval "entity[rogue].hp"
+!passive add hero broken on_turn_start "entity[self].hp = 1 / 0"
+!turn next
+!turn next
+!eval "entity[hero].hp"
+!gpassive remove gas
+!passive remove hero broken
+!gpassive list
+
+Expected: First !turn next applies gas to both (Hero 30 -> 29, Rogue 25 ->
+24). The broken passive fires on Hero's next turn and shows a "CRASHED"
+log line, but Hero's hp is unaffected and the turn cycle continues
+normally. Final gpassive list reports none.
+
+
+SCENARIO 4 — Custom entity_line_format
+---------------------------------------
+
+!match new m4 templates 8 8
+!match use m4
+!ent add hero Hero 30 4 4 10
+!ent add rogue Rogue 25 5 5 20
+!list
+!system set default entity_line_format "{name} | HP {hp}/{max_hp} | ({x},{y})"
+!list
+!ent set_var hero shields 50
+!system set default entity_line_format "{name} | HP {hp}/{max_hp}{?shields?} | Shields {shields}{/?}"
+!list
+!system set default entity_line_format "{name} (init {initiative}) HP:{hp}/{max_hp}"
+!list
+
+Expected: First list uses the default format. After first set, both lines
+use pipe-separated format with no shields section. After adding shields
+to hero and using a conditional template, only Hero shows the Shields
+section; Rogue does not. Final template shows initiative in parens.
+
+
+SCENARIO 5 — Conditional + dotted-path placeholders (inventory display)
+------------------------------------------------------------------------
+
+!match new m5 inventory 8 8
+!match use m5
+!ent add hero Hero 30 4 4 10
+!ent add rogue Rogue 25 5 5 20
+!ent set_var hero inventory.sword.damage 12
+!ent set_var hero inventory.sword.type melee
+!ent set_var hero inventory.bow.damage 8
+!ent set_var hero inventory.bow.type ranged
+!system set default entity_line_format "{name}: HP {hp}{?inventory?} carrying {inventory}{/?}"
+!list
+!system set default entity_line_format "{name}: HP {hp} sword_dmg={inventory.sword.damage} bow_dmg={inventory.bow.damage}"
+!list
+!system set default entity_line_format "{name}: HP {hp} weapon_type={inventory.sword.type}"
+!list
+
+Expected: First custom template shows Hero with "carrying {sword, bow}"
+summary; Rogue has no inventory so the conditional collapses. Second
+template renders concrete numeric values via dotted paths. Third shows the
+nested string "melee" for Hero and a "<?inventory.sword.type?>" sentinel
+for Rogue (path not present).
+
+
+SCENARIO 6 — Custom entity_info_format + !ent dump
+---------------------------------------------------
+
+!match new m6 info_card 8 8
+!match use m6
+!ent add hero Hero 30 4 4 10
+!ent set_var hero stamina 25
+!ent set_var hero max_stamina 50
+!ent set_var hero inventory.sword.damage 12
+!passive add hero regen on_turn_start "entity[self].stamina = entity[self].stamina + 5"
+!ent info hero
+!system set default entity_info_format "{name} [{id}]\nHP: {hp}/{max_hp}\nStamina: {stamina}/{max_stamina}\nPos: ({x},{y}) facing {facing}{?passives_csv?}\nPassives: {passives_csv}{/?}{?inventory.sword?}\nSword damage: {inventory.sword.damage}{/?}"
+!ent info hero
+!system set default entity_info_format "BROKEN_TEMPLATE_NO_PLACEHOLDERS"
+!ent info hero
+!ent dump hero
+
+Expected: First !ent info uses the default multi-line card. Second uses
+the custom card with stamina line, passive list, and sword damage all
+populated. Third deliberately breaks the template (info renders the
+literal string). !ent dump still shows everything: name, position, team,
+status, vital var config, full vars json (with nested inventory dict),
+and the passives section.
+
+
+SCENARIO 7 — Help text reflects template-aware behavior
+--------------------------------------------------------
+
+!help ent info
+!help ent dump
+!help passive
+!help gpassive add
+!help system set
+!system rules
+
+Expected: !help ent info and !help ent dump describe the template/raw
+distinction. !system rules lists entity_line_format and entity_info_format
+with their full descriptions of placeholder + conditional syntax.
+
+
+SCENARIO 8 — Save/load round-trips templates, passives, state
+--------------------------------------------------------------
+
+!match new m8 saveload 8 8
+!match use m8
+!ent add hero Hero 30 4 4 10
+!ent add rogue Rogue 25 5 5 20
+!ent set_var hero inventory.sword.damage 12
+!passive add hero regen on_turn_start "entity[self].hp = entity[self].hp + 1"
+!gpassive add gas on_round_start "entity[self].hp = entity[self].hp - 1"
+!system set default entity_line_format "{name} HP:{hp} sword:{inventory.sword.damage}"
+!turn next
+!store save savetest.json
+!match delete m8
+!store load savetest.json
+!match use m8
+!list
+!ent info hero
+!passive list hero
+!gpassive list
+!turn next
+!eval "entity[hero].hp"
+
+Expected: After load, !list still uses the custom template. !ent info
+shows the same data. Passives and global passives are restored. The
+round_started flag was True after the first !turn next, so on the
+loaded match the next !turn next runs the normal advance-and-fire cycle.
+
+
+SCENARIO 9 — Error handling sanity checks
+------------------------------------------
+
+!match new m9 errors 8 8
+!match use m9
+!ent add hero Hero 30 4 4 10
+!eval "entity[hero].does_not_exist"
+!eval "entity[ghost].hp"
+!eval "[x for x in range(3)]"
+!eval "__import__('os')"
+!ent hp self 5
+!passive add hero bad on_lunch_break "entity[self].hp = 1"
+!passive add hero bad on_turn_start "entity[self].x[0]"
+!passive add ghost x on_turn_start "1"
+!passive add hero empty on_turn_start ""
+
+Expected: every command in this block should respond with a clear error
+message (most prefixed by an X-mark). None should crash or silently
+succeed. Specifically: unknown var, unknown entity, list comprehension
+not allowed, __import__ not allowed, "self" cannot be used at command
+level, bad hook name, subscripting not allowed, ghost entity not found,
+empty formula rejected.
+
+
+SCENARIO 10 — Conditional flow in formulas (if/elif/else, ternary)
+-------------------------------------------------------------------
+
+!match new m10 conds 8 8
+!match use m10
+!ent add hero Hero 30 4 4 10
+!ent set_var hero resting yes
+!ent set_var hero stamina 5
+!eval "5 if entity[hero].hp > 10 else 99"
+!eval "if entity[hero].resting == \"yes\":\n    entity[hero].stamina = (entity[hero].stamina + 10) * 2\nelse:\n    entity[hero].stamina = entity[hero].stamina + 2"
+!eval "entity[hero].stamina"
+!ent set_var hero resting no
+!ent set_var hero stamina 5
+!eval "if entity[hero].resting == \"yes\":\n    entity[hero].stamina = (entity[hero].stamina + 10) * 2\nelse:\n    entity[hero].stamina = entity[hero].stamina + 2"
+!eval "entity[hero].stamina"
+!ent set_var hero mode medium
+!eval "if entity[hero].mode == \"easy\":\n    entity[hero].hp = 100\nelif entity[hero].mode == \"medium\":\n    entity[hero].hp = 50\nelse:\n    entity[hero].hp = 1"
+!eval "entity[hero].hp"
+!ent set_var hero revives 1
+!eval "if entity[hero].hp <= 50 and entity[hero].revives > 0:\n    entity[hero].hp = entity[hero].max_hp\n    entity[hero].revives = entity[hero].revives - 1"
+!eval "entity[hero].hp"
+!eval "entity[hero].revives"
+!passive add hero conditional_heal on_turn_start "if entity[self].hp < entity[self].max_hp:\n    entity[self].hp = min(entity[self].hp + 5, entity[self].max_hp)"
+!ent set_var hero hp 10
+!turn next
+!eval "entity[hero].hp"
+!ent set_var hero blessed 1
+!ent set_var hero hp 10
+!ent hp hero "$(15 if entity[self].blessed else 5)"
+!eval "entity[hero].hp"
+
+Expected: ternary returns 5; first if/else hits then-branch (stamina 5 ->
+30); second hits else-branch (5 -> 7); elif chain picks middle branch (hp
+-> 50); compound boolean fires revive (hp -> 30, revives -> 0); registered
+conditional passive fires on next turn (hp 10 -> 15); ternary inside $()
+adds 15 to hp (10 -> 25).
+
+
+SCENARIO 11 — Rejections still hold
+------------------------------------
+
+!match new m11 rejects 8 8
+!match use m11
+!ent add hero Hero 30 4 4 10
+!eval "for x in entity[hero].hp:\n    entity[hero].hp = x"
+!eval "while True:\n    entity[hero].hp = 0"
+!eval "lambda: entity[hero].hp"
+!eval "[x for x in range(3)]"
+!eval "x = 5\nentity[hero].hp = x"
+!eval "import os"
+!passive add hero bad on_turn_start "if True:\n    for x in [1]: entity[self].hp = x"
+
+Expected: every line should print an error (most with an X-mark). Loops,
+lambdas, list comprehensions, local-variable assignment, imports, and
+disallowed constructs nested inside an otherwise-valid if are all rejected
+clearly. None should crash or silently succeed.
