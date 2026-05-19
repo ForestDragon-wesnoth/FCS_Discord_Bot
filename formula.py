@@ -128,22 +128,31 @@ command layer — required so the shell doesn't split on spaces):
 VAR HOOK CONTEXT
 ================================================================================
 Formulas running inside a var-event hook (on_var_created, on_var_changed,
-on_var_removed, or on_var_written) have access to six extra identifiers,
-which are bound to None (or False, for was_clamped) when the formula runs
-in any other context:
+on_var_removed, on_var_written, or on_var_write_attempt) have access to
+six extra identifiers, which are bound to None (or False, for was_clamped)
+when the formula runs in any other context:
 
   changed_key      The dotted path of the var that fired this event, e.g.
                    "hp" or "inventory.sword.damage".
   old_value        Previous value at that path. None for on_var_created.
                    For on_var_removed on a subtree, this is the full removed
                    subtree as a dict, so a passive can inspect what was lost.
+                   For on_var_write_attempt, this reflects the PRE-write
+                   state (the attempt hasn't committed yet).
   new_value        New value at that path. None for on_var_removed. This is
                    the value actually stored — post-clamp if a clamp engaged.
-  hook_name        One of "on_var_created", "on_var_changed", or
-                   "on_var_removed". Use this inside an on_var_written
-                   catch-all to discriminate between the sub-events. (It is
-                   never literally "on_var_written" — that's a subscription
-                   name, not an event kind.)
+                   For on_var_write_attempt, this is the proposed value the
+                   write is ABOUT to store (the mutation hasn't happened
+                   yet, but you can see what's coming).
+  hook_name        One of "on_var_created", "on_var_changed",
+                   "on_var_removed", or "on_var_write_attempt". Use this
+                   inside an on_var_written catch-all to discriminate
+                   between the sub-events. (It is never literally
+                   "on_var_written" — that's a subscription name, not an
+                   event kind. NOTE: on_var_written does NOT include
+                   on_var_write_attempt events. Attempts are a separate
+                   channel; subscribe to both if you want to audit all
+                   write activity.)
   intended_value   The value the caller passed in BEFORE clamping. Equal to
                    new_value when no clamp engaged. For on_var_removed, this
                    is None (the caller intended absence). Use the difference
@@ -154,6 +163,15 @@ in any other context:
                    engaged OR when the write used bypass_clamp at the
                    command layer (bypass is a deliberate override, not a
                    clamp engagement).
+
+A note on on_var_write_attempt vs on_var_changed: the latter fires only
+when the diff produces an event (i.e. the value actually changed). The
+former fires for every write call. So a heal of 50 at full HP produces
+NO on_var_changed event (since the clamped result equals the prior value,
+diff is empty) — but it DOES produce an on_var_write_attempt event. Use
+on_var_changed for "tell me when hp goes down/up"; use
+on_var_write_attempt for "tell me about every heal/damage attempt
+including ones that did nothing."
 
 Typical patterns:
 
@@ -169,6 +187,15 @@ Typical patterns:
   Track overheal magnitude (target="hp" scope=exact, on_var_changed):
     if was_clamped and intended_value > new_value:
         entity[self].overheal_total = entity[self].overheal_total + (intended_value - new_value)
+
+  Track ALL wasted heal magnitude including heals at full HP (target="hp"
+  scope=exact, on_var_write_attempt — fires regardless of whether the diff
+  produces a change event):
+    if intended_value > new_value:
+        entity[self].wasted_heal = entity[self].wasted_heal + (intended_value - new_value)
+    # Note: this also catches heals where intended<=old (no actual heal
+    # attempted, just a write at-or-below current value). Filter further if
+    # needed: `if intended_value > old_value and intended_value > new_value:`
 
   Generic write-logger (target="" scope=deep, on_var_written):
     entity[self].audit_log = entity[self].audit_log + "|" + hook_name + ":" + changed_key

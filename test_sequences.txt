@@ -554,3 +554,111 @@ scalars). So overheal_log stays at 75 — the overheal-as-event model
 deliberately doesn't count "tried to heal at full hp" as overheal. If you
 want that distinction, route through a separate command/passive that
 inspects the heal attempt before it reaches write_var.
+
+
+SCENARIO 26 — Overheal demo: full mechanic with on_var_write_attempt
+---------------------------------------------------------------------
+
+This scenario walks through the three-stage story of overheal tracking:
+
+(A) The existing was_clamped + intended_value mechanism handles "heal
+    from below into cap" correctly.
+(B) That mechanism misses heals at full HP because they produce no diff.
+(C) on_var_write_attempt closes the gap.
+
+!match new m26 overheal_demo 8 8
+!match use m26
+!ent add hero Hero 30 4 4 10
+
+Setup: Hero has hp=30/30 by default.
+
+Stage A: on_var_changed catches heal-from-below clamping
+
+!ent set_var hero overheal_changed 0
+!passive add hero track_changed on_var_changed target=hp scope=exact "entity[self].overheal_changed = entity[self].overheal_changed + (intended_value - new_value) if was_clamped else entity[self].overheal_changed"
+!ent set_var hero hp 5
+!ent hp hero 100
+!ent info hero
+
+Expected: hp goes from 5 toward 105 but the default soft clamp engages at
+max_hp=30. The on_var_changed event fires with intended_value=105 and
+new_value=30, so overheal_changed = 75. This part works perfectly with
+just the existing hooks.
+
+Stage B: the gap — heal at full HP produces NO on_var_changed event
+
+!ent hp hero 50
+!ent info hero
+
+Expected: hp stays at 30 (already at cap, soft clamp dormant from below
+since old=30=cap, write 80 → clamped to 30 — but 30==30 means the diff is
+empty and on_var_changed does NOT fire). overheal_changed is still 75
+because the tracker never ran. So 50 wasted heal points went unrecorded.
+This is the gap the user identified.
+
+Stage C: on_var_write_attempt closes the gap
+
+!ent set_var hero overheal_attempt 0
+!passive add hero track_attempt on_var_write_attempt target=hp scope=exact "entity[self].overheal_attempt = entity[self].overheal_attempt + (intended_value - new_value) if intended_value > new_value else entity[self].overheal_attempt"
+!ent set_var hero hp 5
+!ent hp hero 100
+!ent info hero
+!ent hp hero 50
+!ent info hero
+
+Expected: overheal_attempt = 75 + 50 = 125. The attempt hook fires for
+EVERY write to hp regardless of whether the diff produces a change event.
+The first heal (5 → clamped to 30) contributes 75; the second heal (30 →
+clamped to 30) contributes 50. The user sees the full 125 wasted points.
+
+Why two hooks exist: on_var_changed says "the data actually changed,"
+on_var_write_attempt says "a write was attempted." Most game mechanics
+want one or the other:
+  - HP regen tracking only cares about actual hp gains: on_var_changed
+  - Damage taken: on_var_changed (only when hp actually goes down)
+  - Overheal accounting: on_var_write_attempt (count all wasted heal)
+  - "Audit every interaction with this var": on_var_write_attempt
+The on_var_written catch-all subscribes to created/changed/removed but
+NOT to attempts, so subscribe to both write_attempt AND written if you
+want truly comprehensive auditing.
+
+
+SCENARIO 27 — on_var_write_attempt fires on bypassed writes
+------------------------------------------------------------
+
+!match new m27 bypass_attempt 8 8
+!match use m27
+!ent add hero Hero 30 4 4 10
+!ent set_var hero attempt_log ""
+!passive add hero audit on_var_write_attempt target=hp scope=exact "entity[self].attempt_log = entity[self].attempt_log + \"|\" + str(intended_value) + \"->\" + str(new_value)"
+!ent set_var hero hp 25
+!ent hp hero 100 bypass_clamp=yes
+!ent set_var hero hp 5
+!ent info hero
+
+Expected: attempt_log contains three entries:
+  |25->25  (normal write, value under cap, no clamp)
+  |130->130  (bypass — was_clamped=False, intended==new)
+  |5->5    (normal write)
+The bypass write fires the attempt just like any other write — bypass
+affects clamping, not observability.
+
+
+SCENARIO 28 — on_var_write_attempt does NOT fire on removals
+-------------------------------------------------------------
+
+!match new m28 no_attempt_on_remove 8 8
+!match use m28
+!ent add hero Hero 30 4 4 10
+!ent set_var hero secret 42
+!ent set_var hero remove_attempt_count 0
+!passive add hero watch_secret on_var_write_attempt target=secret scope=exact "entity[self].remove_attempt_count = entity[self].remove_attempt_count + 1"
+!ent set_var hero secret 99
+!ent delete_var hero secret
+!ent info hero
+
+Expected: remove_attempt_count = 1 (only the set_var fired the attempt
+hook; the delete_var does NOT). Removals have no "no-op gap" — they
+either succeed (firing on_var_removed) or raise. There's no need for a
+separate "remove attempt" hook, and adding one would be conceptually
+muddled.

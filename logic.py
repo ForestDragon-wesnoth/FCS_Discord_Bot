@@ -318,6 +318,38 @@ RESERVED_IDS: Set[str] = {"current", "this", "self"}
 #                          removed event. Use the `hook_name` context binding
 #                          to discriminate (it'll be one of the three above,
 #                          NOT 'on_var_written' itself).
+#                          NOTE: on_var_written does NOT include attempt
+#                          events. on_var_write_attempt is a separate channel
+#                          for "an attempt happened" vs "data changed." A
+#                          passive that wants to audit literally every write
+#                          activity should subscribe to BOTH on_var_written
+#                          AND on_var_write_attempt.
+#
+#    - on_var_write_attempt
+#                          Fires for every write call BEFORE the mutation,
+#                          regardless of whether the resulting diff is empty.
+#                          This closes the "no-event" gap: a heal at full HP
+#                          produces no on_var_changed event (since old==new
+#                          after clamping), but on_var_write_attempt still
+#                          fires — so passives that need to count attempted
+#                          actions (overheal magnitude tracking, "every heal
+#                          ever logged") can observe them.
+#
+#                          The hook fires AFTER clamp computation but BEFORE
+#                          the actual mutation. Context bindings:
+#                            old_value      current state at the path
+#                            new_value      what will be stored (post-clamp)
+#                            intended_value what the caller requested (pre-clamp)
+#                            was_clamped    True iff clamping changed new_value
+#                                           (False on bypassed writes — bypass
+#                                           skips clamping, so nothing was
+#                                           clamped)
+#                            hook_name      "on_var_write_attempt"
+#
+#                          Fires on bypassed writes (bypass affects clamping,
+#                          not observability). Does NOT fire on remove_var or
+#                          remove_var_silent — those have no "no-op" gap that
+#                          needs filling (remove raises if the path is absent).
 #
 # Passives subscribing to var hooks use the `target` + `scope` fields on
 # Passive to filter which events they care about. See the Passive class
@@ -333,6 +365,7 @@ HOOK_NAMES: Set[str] = {
     "on_var_changed",
     "on_var_removed",
     "on_var_written",
+    "on_var_write_attempt",
 }
 
 # Var hooks distinguished from lifecycle hooks. Useful for code paths that
@@ -342,6 +375,7 @@ VAR_HOOKS: Set[str] = {
     "on_var_changed",
     "on_var_removed",
     "on_var_written",
+    "on_var_write_attempt",
 }
 
 # Valid values for Passive.scope (var-hook filtering).
@@ -1332,21 +1366,45 @@ class Entity:
         if not path:
             raise VTTError("Variable path cannot be empty.")
 
+        # Snapshot whether this is the top-level entry into a write/event
+        # chain. We only drain the warning buffer at top-level exit so
+        # nested writes (from passive formulas) don't surface warnings to
+        # their immediate caller — those bubble up to the outermost write.
+        is_top_level_write = (
+            self._match is not None and self._match._var_event_depth == 0
+        )
+
         # Remember the raw intent BEFORE any clamping — this becomes
-        # intended_value on the leaf event.
+        # intended_value on the leaf event AND on the attempt hook.
         intended_value = value
         was_clamped = False
+
+        # Capture the prior value at the exact path (may be _MISSING). Used
+        # by both the clamp logic AND the attempt hook (the attempt fires
+        # BEFORE the write, so old_value reflects pre-write state).
+        old = _path_resolve(self.vars, path)
 
         # Apply clamp, unless bypassed or there's no match to consult for
         # clamp rules. Clamps only meaningful for numeric writes; _apply_clamp
         # short-circuits non-numeric values.
         if not bypass_clamp and self._match is not None:
-            old_for_clamp = _path_resolve(self.vars, path)
             spec = self._match._effective_clamp(self, path)
             if spec is not None:
                 value, was_clamped = _apply_clamp(
-                    spec, old_for_clamp, value, self.vars
+                    spec, old, value, self.vars
                 )
+
+        # Fire on_var_write_attempt BEFORE mutation. This fires for every
+        # write call regardless of whether the resulting diff produces
+        # events — so passives that need to track attempted actions
+        # (overheal magnitude even when hp is already at cap) observe them.
+        # The attempt log is collected and merged with the post-write event
+        # log in the final return.
+        attempt_log: List[str] = []
+        if self._match is not None:
+            attempt_log = self._match._fire_var_attempt(
+                self.id, path, old, value, intended_value, was_clamped
+            )
 
         # Identify which ancestor segments along the path are missing BEFORE
         # the write. The keys are accumulated dotted paths (e.g. "inventory",
@@ -1365,12 +1423,15 @@ class Entity:
                     old_value=None, new_value=None,  # filled after write
                 ))
 
-        # Capture the prior value at the exact path (may be _MISSING)
-        old = _path_resolve(self.vars, path)
-        # Apply the (possibly clamped) write (creating intermediates as needed)
+        # Apply the (possibly clamped) write (creating intermediates as needed).
+        # NOTE: an attempt-hook passive that ran above may have already
+        # mutated vars (legitimately, through write_var). That's fine — we
+        # re-resolve `old` against the current state for the diff, so we
+        # capture only the change attributable to THIS write call.
+        old_post_attempt = _path_resolve(self.vars, path)
         self._set_path(path, value)
         # Diff old vs new at this path and collect the resulting events
-        leaf_events = _diff_subtree(path, old, value)
+        leaf_events = _diff_subtree(path, old_post_attempt, value)
         # Now we can fill in new_value for the ancestor events by re-resolving
         # each ancestor's current value (post-write, the intermediates exist).
         for ev in ancestor_events:
@@ -1394,7 +1455,17 @@ class Entity:
         # Fire ancestors first (top-down), then the leaf events. The leaf
         # event for the written path itself is also a 'created' if old was
         # _MISSING — _diff_subtree already produced it as the first event.
-        return self._fire_var_events(ancestor_events + leaf_events)
+        # Combine the attempt log (fired first) with the event log so the
+        # caller sees everything in chronological order.
+        event_log = self._fire_var_events(ancestor_events + leaf_events)
+        combined = attempt_log + event_log
+        # Drain accumulated warnings ONLY at top-level. Nested writes
+        # (from passive formulas) accumulate warnings on the match but
+        # don't surface them — the outermost call collects them all.
+        if is_top_level_write and self._match is not None and self._match._var_event_warnings:
+            combined.extend(self._match._var_event_warnings)
+            self._match._var_event_warnings = []
+        return combined
 
     def remove_var(self, path: str) -> List[str]:
         """Remove the var at `path`, firing on_var_removed (plus on_var_written).
@@ -1408,12 +1479,19 @@ class Entity:
         """
         if not path:
             raise VTTError("Variable path cannot be empty.")
+        is_top_level_write = (
+            self._match is not None and self._match._var_event_depth == 0
+        )
         old = _path_resolve(self.vars, path)
         if old is _MISSING:
             raise NotFound(f"Variable '{path}' not found on entity '{self.id}'.")
         self._del_path(path)
         events = _diff_subtree(path, old, _MISSING)
-        return self._fire_var_events(events)
+        log = self._fire_var_events(events)
+        if is_top_level_write and self._match is not None and self._match._var_event_warnings:
+            log.extend(self._match._var_event_warnings)
+            self._match._var_event_warnings = []
+        return log
 
     def remove_var_silent(self, path: str) -> None:
         """Remove the var at `path` without firing any hooks. The escape
@@ -1461,30 +1539,20 @@ class Entity:
 
         The recursion-depth safeguard lives in Match._fire_var_event (not
         here) since it's a property of the match-wide firing context. The
-        warning buffer on the match is drained here ONLY when this call is
-        the top-level entry into the chain (depth==0 at entry); otherwise
-        we're in a nested firing and the outer call will do the draining.
+        warning buffer on the match is drained by the public entry points
+        (write_var/remove_var) at top-level chain exit — NOT here, because
+        attempt firing also accumulates warnings and we want a single drain
+        site per top-level write call.
         """
         if not events:
             return []
         m = self._match
         if m is None:
             # Detached entity (rare — only during construction before bind/spawn).
-            # Skip firing; events would have nowhere to route.
             return []
-        # We're top-level iff depth is 0 at entry. (write_var/remove_var
-        # always come through us at top-level — but a passive's formula
-        # writing vars goes through formula._write -> Entity.write_var
-        # -> Entity._fire_var_events with depth > 0, and that nested call
-        # should NOT drain the buffer.)
-        is_top_level = (m._var_event_depth == 0)
         log: List[str] = []
         for ev in events:
             log.extend(m._fire_var_event(self.id, ev))
-        if is_top_level and m._var_event_warnings:
-            # Drain accumulated warnings to the caller and clear for next chain.
-            log.extend(m._var_event_warnings)
-            m._var_event_warnings = []
         return log
 
     # ---------- passive management (entity-scoped) ----------
@@ -1845,6 +1913,112 @@ class Match:
                 _maybe_fire(p, is_global=True)
         for p in e.passives.values():
             if p.when == "on_var_written":
+                _maybe_fire(p, is_global=False)
+
+        return log
+
+    # ---- var-write-attempt firing ----
+    # _fire_var_attempt is a separate channel from _fire_var_event for
+    # "an attempt happened" vs "the data changed." Fires BEFORE the
+    # mutation, so a passive subscribing to on_var_write_attempt can
+    # observe the request even when it produces no diff (e.g. heal at
+    # full HP that gets clamped back to the same value).
+    #
+    # Important design note: this method does NOT fire on_var_written
+    # catch-all passives. on_var_written is reserved for actual data
+    # events; conflating "attempted" and "happened" would muddy the
+    # semantics. A passive that wants to observe both must subscribe to
+    # both hooks.
+    #
+    # The recursion-depth guard from _fire_var_event is shared: an
+    # attempt-hook formula that writes vars produces more attempts,
+    # which produce more events, all under the same depth counter.
+    def _fire_var_attempt(
+        self,
+        entity_id: str,
+        path: str,
+        old_value: Any,
+        new_value: Any,
+        intended_value: Any,
+        was_clamped: bool,
+    ) -> List[str]:
+        """Fire on_var_write_attempt passives matching `path`. Returns log lines.
+
+        Called from Entity.write_var AFTER clamp computation but BEFORE the
+        actual mutation. Passives see the pre-write state (old_value reflects
+        current data, since the write hasn't happened yet) and the proposed
+        post-write state (new_value, possibly clamped). intended_value carries
+        the caller's pre-clamp request, and was_clamped flags whether clamping
+        modified anything.
+
+        Shares the recursion-depth guard with _fire_var_event so that
+        attempt-hook chains can't loop indefinitely.
+        """
+        # Recursion-depth guard (same limit as event firing)
+        limit = int(self.rules.get("var_hook_recursion_limit", 128))
+        if self._var_event_depth >= limit:
+            if not self._var_event_warned:
+                self._var_event_warned = True
+                self._var_event_warnings.append(
+                    f"⚠️ var-hook recursion limit ({limit}) reached on "
+                    f"on_var_write_attempt for `{entity_id}.{path}`; "
+                    f"suppressing further hook firing for this chain."
+                )
+            return []
+
+        self._var_event_depth += 1
+        try:
+            return self._fire_var_attempt_inner(
+                entity_id, path, old_value, new_value, intended_value, was_clamped
+            )
+        finally:
+            self._var_event_depth -= 1
+            if self._var_event_depth == 0:
+                self._var_event_warned = False
+
+    def _fire_var_attempt_inner(
+        self,
+        entity_id: str,
+        path: str,
+        old_value: Any,
+        new_value: Any,
+        intended_value: Any,
+        was_clamped: bool,
+    ) -> List[str]:
+        """Inner firing logic for attempt hook (separated for depth guard)."""
+        from formula import FormulaEngine, EvalCtx
+        e = self.entities.get(entity_id)
+        if e is None:
+            return []
+
+        engine = FormulaEngine(self)
+        this_id = self.current_entity_id()
+        extras = {
+            "changed_key":    path,
+            "old_value":      old_value if old_value is not _MISSING else None,
+            "new_value":      new_value,
+            "hook_name":      "on_var_write_attempt",
+            "intended_value": intended_value,
+            "was_clamped":    was_clamped,
+        }
+        ctx = EvalCtx(this=this_id, target=entity_id, extras=extras)
+
+        log: List[str] = []
+
+        def _maybe_fire(p: "Passive", is_global: bool) -> None:
+            if not p.matches_event(path):
+                return
+            log.append(_run_passive_safely(
+                engine, p, ctx, target_id=entity_id, is_global=is_global,
+            ))
+
+        # ONLY fire passives subscribed to on_var_write_attempt. We do NOT
+        # fire on_var_written here — see comment on _fire_var_attempt.
+        for p in self.global_passives.values():
+            if p.when == "on_var_write_attempt":
+                _maybe_fire(p, is_global=True)
+        for p in e.passives.values():
+            if p.when == "on_var_write_attempt":
                 _maybe_fire(p, is_global=False)
 
         return log
