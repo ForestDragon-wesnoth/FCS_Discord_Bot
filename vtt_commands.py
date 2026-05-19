@@ -10,6 +10,9 @@ from logic import DEFAULT_SYSTEM_SETTINGS, ALLOWED_DIRECTIONS, RULE_SCHEMA, RULE
 # Passive system
 from logic import Passive, HOOK_NAMES
 
+# Clamp system
+from logic import ClampSpec
+
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program
 
@@ -319,43 +322,15 @@ def _parse_scalar(token: str):
     except ValueError:
         return token  # leave as string
 
-#for creating more dictionaries inside vars, like inventory/skills/etc.
+# Note: the former _set_deep_key and _del_deep helpers used to live here.
+# They've been removed because Entity.write_var and Entity.remove_var now
+# do the equivalent work in logic.py — going through the chokepoint so that
+# var hooks fire correctly. The command-layer subcommands (!ent set_var,
+# !ent delete_var) now call those methods directly. If you need a raw deep
+# set/delete that bypasses hooks for some new purpose, use the existing
+# remove_var_silent escape hatch or add a write_var_silent if the need is
+# strong enough to justify another escape API.
 
-def _set_deep_key(root: Dict[str, Any], dotted: str, value: Any):
-    """
-    Create/descend dicts along a dotted path and set the final key to value.
-    Example: _set_deep_key(e.vars, "parts.effects.slow.duration", 2.5)
-    """
-    if not dotted:
-        raise VTTError("Key path cannot be empty.")
-    keys = dotted.split(".")
-    cur = root
-    for k in keys[:-1]:
-        node = cur.get(k)
-        if not isinstance(node, dict):
-            node = {}
-            cur[k] = node
-        cur = node
-    cur[keys[-1]] = value
-
-def _del_deep(d: dict, path: str):
-    """
-    Delete key at dotted path. Raises NotFound if path or key is missing.
-    """
-    keys = [k for k in path.split(".") if k]
-    if not keys:
-        raise VTTError("Key path cannot be empty.")
-    cur = d
-    for k in keys[:-1]:
-        if k not in cur:
-            raise NotFound(f"Missing path: '{k}'")
-        cur = cur[k]
-        if not isinstance(cur, dict):
-            raise VTTError(f"Cannot descend into '{k}': not a dict.")
-    last = keys[-1]
-    if last not in cur:
-        raise NotFound(f"Key '{last}' not found.")
-    del cur[last]
 
 def _format_vars_blob(vars_dict: dict) -> str:
     if not vars_dict:
@@ -366,6 +341,78 @@ def _format_vars_blob(vars_dict: dict) -> str:
         # Fallback if something unserializable sneaks in
         blob = str(vars_dict)
     return "**vars**:\n```json\n" + blob + "\n```"
+
+
+def _format_passive_line(label: str, p) -> str:
+    """One-line summary of a passive for `!passive list` / `!gpassive list`.
+
+    For non-var hooks, omits target/scope (they're meaningless there) for
+    a compact display. For var hooks, includes them so the GM can see at
+    a glance what each passive watches.
+    """
+    # Late import to avoid module-level coupling with logic's hook sets
+    from logic import VAR_HOOKS
+    if p.when in VAR_HOOKS:
+        return (f"- `{label}` ({p.when} on `{p.target or '(root)'}` "
+                f"scope=`{p.scope}`): `{p.formula}`")
+    return f"- `{label}` ({p.when}): `{p.formula}`"
+
+
+def _parse_clamp_bound(raw: str) -> Any:
+    """Parse a clamp bound from a command-line token.
+
+    Strategy: try int, then float, then fall back to treating as a var path
+    string. This means '50' → 50, '3.14' → 3.14, 'max_hp' → 'max_hp', and
+    'inventory.gold.cap' → 'inventory.gold.cap'. The clamp engine resolves
+    string paths against entity vars at write time (see _resolve_clamp_bound
+    in logic.py); if the path doesn't exist or isn't numeric, the bound
+    gracefully degrades to "no bound."
+    """
+    s = raw.strip()
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    return s  # treat as path
+
+
+def _parse_clamp_args(tokens: List[str]) -> Dict[str, Any]:
+    """Parse [max=X] [min=X] [mode=hard|soft] tokens. Returns a dict with
+    the named values present. Tokens unrelated to clamps are ignored (lets
+    callers chain other args). Unknown clamp-namespace tokens raise."""
+    out: Dict[str, Any] = {}
+    for tok in tokens:
+        if tok.startswith("max="):
+            out["max"] = _parse_clamp_bound(tok[len("max="):])
+        elif tok.startswith("min="):
+            out["min"] = _parse_clamp_bound(tok[len("min="):])
+        elif tok.startswith("mode="):
+            mode = tok[len("mode="):].lower().strip()
+            if mode not in ("soft", "hard"):
+                raise VTTError(
+                    f"Clamp mode must be 'soft' or 'hard', got '{mode}'."
+                )
+            out["mode"] = mode
+        # Other tokens silently passed through — we don't error on unknown
+        # so callers can interleave (e.g. !ent clamp add ... target=... in
+        # the future if needed).
+    return out
+
+
+def _format_clamp_line(path: str, c: "ClampSpec") -> str:
+    """One-line clamp summary for !clamp list / !gclamp list output."""
+    parts = []
+    if c.max is not None:
+        parts.append(f"max={c.max!r}")
+    if c.min is not None:
+        parts.append(f"min={c.min!r}")
+    parts.append(f"mode={c.mode}")
+    return f"- `{path}`: {', '.join(parts)}"
+
 
 # ---- Commands ----------------------------------------------------------------
 @registry.command("match", usage="!match <subcommand> ...", desc="List matches, create one, or switch the active match for this channel.")
@@ -735,11 +782,30 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")        
         delta = int(args[2])
+        # Optional bypass_clamp arg for overheal effects
+        bypass_clamp = False
+        for extra in args[3:]:
+            if extra.startswith("bypass_clamp="):
+                bypass_clamp = _parse_bool(extra[len("bypass_clamp="):])
+        e = m.entities[eid]
+        if bypass_clamp:
+            # Direct write through chokepoint, skipping the heal/damage
+            # clamp pipeline. The property setter would re-apply clamps,
+            # so we go through write_var explicitly with the bypass flag.
+            hp_var, _, _ = e._vital_var_names()
+            new_hp = e.hp + delta
+            hook_log = e.write_var(hp_var, new_hp, bypass_clamp=True)
+            action = "Healed" if delta >= 0 else "Damaged"
+            mag = delta if delta >= 0 else -delta
+            ack = f"{action} `{eid}` by {mag} (clamp bypassed)."
+            if hook_log:
+                ack += "\n" + "\n".join(hook_log)
+            return await ctx.send(ack)
         if delta >= 0:
-            m.entities[eid].heal_entity(delta)
+            e.heal_entity(delta)
             return await ctx.send(f"Healed `{eid}` by {delta}.")
         else:
-            m.entities[eid].damage_entity(-delta)
+            e.damage_entity(-delta)
             return await ctx.send(f"Damaged `{eid}` by {-delta}.")
     
     # init
@@ -785,7 +851,11 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(msg)
     # set_var
     if sub == "set_var":
-        # Usage: !ent set_var <id> <key> <value>
+        # Usage: !ent set_var <id> <key> <value> [bypass_clamp=yes]
+        # Routes through Entity.write_var so on_var_created / on_var_changed /
+        # on_var_written hooks fire for any passives watching this path.
+        # bypass_clamp=yes skips clamp evaluation entirely — use for overheal
+        # effects, GM debugging, or any deliberate override.
         if await return_help_if_not_enough_args(ctx, args, 4, "ent", "set_var"):
             return
 
@@ -797,12 +867,25 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         raw_value = args[3]               # use quotes for spaces: "burning aura"
         value = _parse_scalar(raw_value)  # int → float → str
 
-        e = m.entities[eid]
-        _set_deep_key(e.vars, key_path, value)
+        # Optional bypass_clamp named arg in any trailing position
+        bypass_clamp = False
+        for extra in args[4:]:
+            if extra.startswith("bypass_clamp="):
+                bypass_clamp = _parse_bool(extra[len("bypass_clamp="):])
 
-        # Optional: echo the new value for quick confirmation
-        return await ctx.send(f"`{eid}` vars.{key_path} = {value!r}")
-    # delete_var
+        e = m.entities[eid]
+        # write_var returns log lines from any passives that fired in response
+        # to the resulting var events. We append them to the ack message so
+        # the GM can see chain effects from a single write.
+        hook_log = e.write_var(key_path, value, bypass_clamp=bypass_clamp)
+        ack = f"`{eid}` vars.{key_path} = {value!r}"
+        if bypass_clamp:
+            ack += " (clamp bypassed)"
+        if hook_log:
+            ack += "\n" + "\n".join(hook_log)
+        return await ctx.send(ack)
+    # delete_var: removes a var and FIRES on_var_removed hooks (plus
+    # on_var_written) for every level of the removed subtree (bottom-up).
     if sub == "delete_var":
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "delete_var"):
             return
@@ -820,8 +903,33 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"Cannot delete '{key_path}': '{top_key}' is a vital variable "
                 f"for the current game system (protected vars: {hp_var}, {max_hp_var}, {init_var})."
             )
-        _del_deep(e.vars, key_path)
-        return await ctx.send(f"Deleted `{eid}` vars.{key_path}")
+        hook_log = e.remove_var(key_path)
+        ack = f"Deleted `{eid}` vars.{key_path}"
+        if hook_log:
+            ack += "\n" + "\n".join(hook_log)
+        return await ctx.send(ack)
+    # delete_var_silent: escape hatch — removes a var WITHOUT firing any
+    # hooks. Use sparingly; passives watching the path won't observe the
+    # removal. Useful for cleanup operations where cascading effects would
+    # be unwanted.
+    if sub == "delete_var_silent":
+        if await return_help_if_not_enough_args(ctx, args, 3, "ent", "delete_var_silent"):
+            return
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        key_path = args[2]
+        e = m.entities[eid]
+        top_key = key_path.split(".")[0]
+        protected = e.protected_var_names()
+        if top_key in protected:
+            hp_var, max_hp_var, init_var = e._vital_var_names()
+            raise VTTError(
+                f"Cannot delete '{key_path}': '{top_key}' is a vital variable "
+                f"for the current game system (protected vars: {hp_var}, {max_hp_var}, {init_var})."
+            )
+        e.remove_var_silent(key_path)
+        return await ctx.send(f"Deleted (silent) `{eid}` vars.{key_path}")
     
 
     # Fallback: show authoritative help for the root command
@@ -872,8 +980,9 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "ent", "hp",
-    usage="!ent hp <id> <±n>",
-    desc="Adjust HP by a signed amount; death/prone handled by rules."
+    usage="!ent hp <id> <±n> [bypass_clamp=yes]",
+    desc=("Adjust HP by a signed amount; death/prone handled by rules. "
+          "Optional bypass_clamp=yes lets a heal exceed max_hp for overheal effects.")
 )
 registry.annotate_sub(
     "ent", "init",
@@ -887,13 +996,39 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "ent", "set_var",
-    usage="!ent set_var <id> <key> <value>",
-    desc="Set a value in the entity's vars. <key> supports dotted paths (for example '!ent set_var adventurer inventory.sword.damage 10' will do sub-containers for inventory and sword); value auto-coerces int/float/string."
+    usage="!ent set_var <id> <key> <value> [bypass_clamp=yes]",
+    desc=(
+        "Set a value in the entity's vars. <key> supports dotted paths (e.g. "
+        "'!ent set_var adventurer inventory.sword.damage 10' creates "
+        "inventory/sword sub-dicts as needed); value auto-coerces int/float/string. "
+        "Fires `on_var_created` for any newly-created path levels and "
+        "`on_var_changed` if the value differs from before. The catch-all "
+        "`on_var_written` also fires alongside each. "
+        "Optional bypass_clamp=yes skips clamp evaluation for this write — use "
+        "for overheal effects or deliberate GM overrides."
+    ),
 )
 registry.annotate_sub(
     "ent", "delete_var",
     usage="!ent delete_var <id> <key>",
-    desc="Delete a variable from e.vars. Supports dotted keys for nested dicts. **Vital variables** (HP/MaxHP/initiative equivalents defined by the game system) are protected and cannot be deleted."
+    desc=(
+        "Delete a variable from e.vars and fire `on_var_removed` for every "
+        "level of the removed subtree (bottom-up: leaves first). Supports "
+        "dotted keys for nested dicts. **Vital variables** (HP/MaxHP/initiative "
+        "equivalents defined by the game system) are protected and cannot be "
+        "deleted. To remove without firing events, use !ent delete_var_silent."
+    ),
+)
+registry.annotate_sub(
+    "ent", "delete_var_silent",
+    usage="!ent delete_var_silent <id> <key>",
+    desc=(
+        "Escape hatch: remove a variable WITHOUT firing any var hooks. Use "
+        "sparingly — passives watching the path won't observe the removal. "
+        "Useful for cleanup operations where cascading effects would be "
+        "unwanted (e.g. resetting an entity between scenarios). Vital "
+        "variables are still protected from deletion."
+    ),
 )
 
 @registry.command("turn", usage="!turn | !turn next | ...", desc="See/advance/set/etc. turns")
@@ -1037,6 +1172,13 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         )
 
     if sub == "add":
+        # Syntax:
+        #   !passive add <eid> <pid> <when> [target=PATH] [scope=exact|children|deep] "<formula>"
+        #
+        # target/scope are optional and only meaningful for var hooks
+        # (on_var_*). For other hooks they're stored but ignored at fire time.
+        # If omitted, target defaults to "" and scope to "deep", which for
+        # var hooks means "fire on any var event on this entity" (entity-wide).
         if await return_help_if_not_enough_args(ctx, args, 5, "passive", "add"):
             return
         eid = _resolve_eid(m, args[1])
@@ -1044,14 +1186,28 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             raise NotFound(f"Entity '{eid}' not found.")
         pid = args[2]
         when = args[3].lower()
-        # Rejoin in case user didn't quote the formula
-        formula = " ".join(args[4:]).strip()
+
+        # Walk args[4:] looking for target=/scope= named args; the rest is
+        # the formula. We allow named args in any order, but they must all
+        # come before any formula content. This keeps simple cases
+        # (no target/scope) backward-compatible with the original syntax.
+        target_val = ""
+        scope_val = "deep"
+        formula_parts: List[str] = []
+        for tok in args[4:]:
+            if not formula_parts and tok.startswith("target="):
+                target_val = tok[len("target="):]
+            elif not formula_parts and tok.startswith("scope="):
+                scope_val = tok[len("scope="):].lower()
+            else:
+                formula_parts.append(tok)
+        formula = " ".join(formula_parts).strip()
+
         if not formula:
             raise VTTError("Passive formula cannot be empty.")
         if when not in HOOK_NAMES:
             allowed = ", ".join(sorted(HOOK_NAMES))
             raise VTTError(f"Unknown hook '{when}'. Allowed: {allowed}")
-        # Eagerly validate formula syntax so broken passives are caught at add time.
         try:
             validate_program(formula)
         except FormulaError as ex:
@@ -1059,8 +1215,18 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         e = m.entities[eid]
         if pid in e.passives:
             raise DuplicateId(f"Passive '{pid}' already exists on entity '{eid}'.")
-        e.passives[pid] = Passive(id=pid, when=when, formula=formula)
-        return await ctx.send(f"Added passive `{pid}` ({when}) to `{eid}`.")
+        # Passive __post_init__ validates scope value, so a typo here will
+        # surface as a clear error rather than silently storing garbage.
+        e.passives[pid] = Passive(
+            id=pid, when=when, formula=formula,
+            target=target_val, scope=scope_val,
+        )
+        # Mention target/scope in the ack only for var hooks where they apply
+        scope_note = ""
+        from logic import VAR_HOOKS
+        if when in VAR_HOOKS:
+            scope_note = f" watching `{target_val or '(root)'}` scope=`{scope_val}`"
+        return await ctx.send(f"Added passive `{pid}` ({when}){scope_note} to `{eid}`.")
 
     if sub in ("remove", "del", "rm"):
         if await return_help_if_not_enough_args(ctx, args, 3, "passive", "remove"):
@@ -1086,7 +1252,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return await ctx.send(f"`{eid}` has no passives.")
             lines = [f"**Passives on `{eid}`:**"]
             for pid, p in e.passives.items():
-                lines.append(f"- `{pid}` ({p.when}): `{p.formula}`")
+                lines.append(_format_passive_line(pid, p))
             return await ctx.send("\n".join(lines))
         # All entities
         lines = ["**All entity passives in this match:**"]
@@ -1096,7 +1262,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 continue
             any_found = True
             for pid, p in e.passives.items():
-                lines.append(f"- `{eid}.{pid}` ({p.when}): `{p.formula}`")
+                lines.append(_format_passive_line(f"{eid}.{pid}", p))
         if not any_found:
             return await ctx.send("No entity passives in this match.")
         return await ctx.send("\n".join(lines))
@@ -1112,8 +1278,18 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if pid not in e.passives:
             raise NotFound(f"Passive '{pid}' not found on entity '{eid}'.")
         p = e.passives[pid]
+        from logic import VAR_HOOKS
+        scope_block = ""
+        if p.when in VAR_HOOKS:
+            scope_block = (
+                f"Target: `{p.target or '(root)'}`\n"
+                f"Scope: `{p.scope}`\n"
+            )
         return await ctx.send(
-            f"**Passive `{eid}.{pid}`**\nHook: `{p.when}`\nFormula:\n```\n{p.formula}\n```"
+            f"**Passive `{eid}.{pid}`**\n"
+            f"Hook: `{p.when}`\n"
+            f"{scope_block}"
+            f"Formula:\n```\n{p.formula}\n```"
         )
 
     title, body = registry.help_for(["passive"])
@@ -1121,11 +1297,19 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 registry.annotate_sub(
     "passive", "add",
-    usage='!passive add <entity_id> <passive_id> <when> "<formula>"',
-    desc=("Attach a passive to an entity. <when> must be one of the hook names "
-          "(see `!passive hooks`). Formula is run as a program when the hook fires; "
-          "inside it, `self` = the owning entity, `this` = current-turn entity. "
-          "Quote the formula to preserve spaces."),
+    usage='!passive add <entity_id> <passive_id> <when> [target=PATH] [scope=exact|children|deep] "<formula>"',
+    desc=(
+        "Attach a passive to an entity. <when> must be one of the hook names "
+        "(see `!passive hooks`). Formula is run as a program when the hook fires; "
+        "inside it, `self` = the owning entity, `this` = current-turn entity. "
+        "Quote the formula to preserve spaces. "
+        "For VAR HOOKS (on_var_*) target+scope filter which events fire this passive: "
+        "target=PATH (e.g. `inventory` or `inventory.sword`; empty=root); "
+        "scope=exact (only this exact path), children (one segment deeper), "
+        "or deep (this path or any descendant). Defaults: target=root, scope=deep "
+        "(catches every var-event on the entity). Inside a var-hook formula you "
+        "also have access to: changed_key, old_value, new_value, hook_name."
+    ),
 )
 registry.annotate_sub(
     "passive", "remove",
@@ -1169,11 +1353,30 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         )
 
     if sub == "add":
+        # Syntax:
+        #   !gpassive add <pid> <when> [target=PATH] [scope=exact|children|deep] "<formula>"
+        #
+        # See passive_cmd `add` for the rationale on the named-arg parsing.
+        # Globals follow the same per-entity iteration model — for var hooks,
+        # the events fire on the entity whose vars changed, and target/scope
+        # filter against that event's changed_key.
         if await return_help_if_not_enough_args(ctx, args, 4, "gpassive", "add"):
             return
         pid = args[1]
         when = args[2].lower()
-        formula = " ".join(args[3:]).strip()
+
+        target_val = ""
+        scope_val = "deep"
+        formula_parts: List[str] = []
+        for tok in args[3:]:
+            if not formula_parts and tok.startswith("target="):
+                target_val = tok[len("target="):]
+            elif not formula_parts and tok.startswith("scope="):
+                scope_val = tok[len("scope="):].lower()
+            else:
+                formula_parts.append(tok)
+        formula = " ".join(formula_parts).strip()
+
         if not formula:
             raise VTTError("Passive formula cannot be empty.")
         if when not in HOOK_NAMES:
@@ -1185,8 +1388,15 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             raise VTTError(f"Invalid passive formula: {ex}")
         if pid in m.global_passives:
             raise DuplicateId(f"Global passive '{pid}' already exists.")
-        m.global_passives[pid] = Passive(id=pid, when=when, formula=formula)
-        return await ctx.send(f"Added global passive `{pid}` ({when}).")
+        m.global_passives[pid] = Passive(
+            id=pid, when=when, formula=formula,
+            target=target_val, scope=scope_val,
+        )
+        scope_note = ""
+        from logic import VAR_HOOKS
+        if when in VAR_HOOKS:
+            scope_note = f" watching `{target_val or '(root)'}` scope=`{scope_val}`"
+        return await ctx.send(f"Added global passive `{pid}` ({when}){scope_note}.")
 
     if sub in ("remove", "del", "rm"):
         if await return_help_if_not_enough_args(ctx, args, 2, "gpassive", "remove"):
@@ -1202,7 +1412,7 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send("No global passives in this match.")
         lines = ["**Global passives:**"]
         for pid, p in m.global_passives.items():
-            lines.append(f"- `{pid}` ({p.when}): `{p.formula}`")
+            lines.append(_format_passive_line(pid, p))
         return await ctx.send("\n".join(lines))
 
     if sub == "info":
@@ -1212,8 +1422,18 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if pid not in m.global_passives:
             raise NotFound(f"Global passive '{pid}' not found.")
         p = m.global_passives[pid]
+        from logic import VAR_HOOKS
+        scope_block = ""
+        if p.when in VAR_HOOKS:
+            scope_block = (
+                f"Target: `{p.target or '(root)'}`\n"
+                f"Scope: `{p.scope}`\n"
+            )
         return await ctx.send(
-            f"**Global passive `{pid}`**\nHook: `{p.when}`\nFormula:\n```\n{p.formula}\n```"
+            f"**Global passive `{pid}`**\n"
+            f"Hook: `{p.when}`\n"
+            f"{scope_block}"
+            f"Formula:\n```\n{p.formula}\n```"
         )
 
     title, body = registry.help_for(["gpassive"])
@@ -1221,10 +1441,17 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 registry.annotate_sub(
     "gpassive", "add",
-    usage='!gpassive add <passive_id> <when> "<formula>"',
-    desc=("Add a global passive. Fires once per entity in turn order on the given "
-          "hook. Inside the formula: `self` = the entity being iterated, "
-          "`this` = current-turn entity."),
+    usage='!gpassive add <passive_id> <when> [target=PATH] [scope=exact|children|deep] "<formula>"',
+    desc=(
+        "Add a global passive. Fires once per entity in turn order on the given "
+        "hook. Inside the formula: `self` = the entity being iterated, "
+        "`this` = current-turn entity. "
+        "For VAR HOOKS (on_var_*) target+scope filter which events fire this passive: "
+        "target=PATH (e.g. `inventory` or `inventory.sword`; empty=root); "
+        "scope=exact (fires only on exactly this path), children (one segment "
+        "deeper), or deep (this path or any descendant). Defaults: target=root, "
+        "scope=deep (catches every var-event)."
+    ),
 )
 registry.annotate_sub(
     "gpassive", "remove",
@@ -1245,6 +1472,253 @@ registry.annotate_sub(
     "gpassive", "hooks",
     usage="!gpassive hooks",
     desc="List the available passive hook names.",
+)
+
+
+# ==============================================================================
+# Clamp CRUD commands
+# ==============================================================================
+# Clamps constrain numeric writes to vars. Two scopes:
+#   - !clamp  (entity-level) — overrides system-level clamps on the same path
+#   - !gclamp (system-level) — applies to all entities in matches using the
+#                              active match's bound game system
+# Both follow the same sub-command shape (add/remove/list).
+#
+# A clamp spec needs path + at least one of (max, min) + optional mode.
+# max/min accept numeric literals OR var path strings — the latter resolves
+# dynamically at write time against the entity's vars (so "hp clamped by
+# max_hp" works regardless of what max_hp's value is at any given moment).
+# Mode is "soft" (default) or "hard" — see ClampSpec docstring for semantics.
+# ==============================================================================
+
+@registry.command(
+    "clamp",
+    usage="!clamp <add|remove|list> ...",
+    desc=("Manage entity-scoped clamps. Entity clamps override system-level "
+          "default_clamps on the same path. See `!clamp add` for full syntax."),
+)
+async def clamp_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["clamp"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    sub = args[0].lower()
+
+    if sub == "add":
+        # !clamp add <eid> <path> [max=...] [min=...] [mode=hard|soft]
+        if await return_help_if_not_enough_args(ctx, args, 4, "clamp", "add"):
+            return
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        path = args[2]
+        parsed = _parse_clamp_args(args[3:])
+        if "max" not in parsed and "min" not in parsed:
+            raise VTTError(
+                "Clamp must specify at least one of max=... or min=..."
+            )
+        # ClampSpec.__post_init__ validates types, min<=max, etc. Errors
+        # surface as VTTError to the user.
+        spec = ClampSpec(
+            path=path,
+            max=parsed.get("max"),
+            min=parsed.get("min"),
+            mode=parsed.get("mode", "soft"),
+        )
+        e = m.entities[eid]
+        if path in e.clamps:
+            raise DuplicateId(
+                f"Entity '{eid}' already has a clamp on '{path}'. "
+                f"Remove it first with !clamp remove, or replace by remove+add."
+            )
+        e.clamps[path] = spec
+        return await ctx.send(
+            f"Added clamp on `{eid}.{path}` ({_format_clamp_line(path, spec)})"
+        )
+
+    if sub in ("remove", "del", "rm"):
+        if await return_help_if_not_enough_args(ctx, args, 3, "clamp", "remove"):
+            return
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        path = args[2]
+        e = m.entities[eid]
+        if path not in e.clamps:
+            raise NotFound(f"No clamp on '{path}' for entity '{eid}'.")
+        del e.clamps[path]
+        return await ctx.send(f"Removed clamp on `{eid}.{path}`.")
+
+    if sub == "list":
+        # Specific entity
+        if len(args) >= 2:
+            eid = _resolve_eid(m, args[1])
+            if eid not in m.entities:
+                raise NotFound(f"Entity '{eid}' not found.")
+            e = m.entities[eid]
+            if not e.clamps:
+                return await ctx.send(f"`{eid}` has no entity-level clamps.")
+            lines = [f"**Entity clamps on `{eid}`:**"]
+            for path, c in e.clamps.items():
+                lines.append(_format_clamp_line(path, c))
+            return await ctx.send("\n".join(lines))
+        # All entities
+        any_found = False
+        lines = ["**All entity-level clamps in this match:**"]
+        for eid, e in m.entities.items():
+            if not e.clamps:
+                continue
+            any_found = True
+            for path, c in e.clamps.items():
+                lines.append(_format_clamp_line(f"{eid}.{path}", c))
+        if not any_found:
+            return await ctx.send("No entity-level clamps in this match.")
+        return await ctx.send("\n".join(lines))
+
+    raise VTTError(f"Unknown !clamp subcommand: {sub}")
+
+
+registry.annotate_sub(
+    "clamp", "add",
+    usage="!clamp add <eid> <path> [max=N|varpath] [min=N|varpath] [mode=soft|hard]",
+    desc=(
+        "Add an entity-level clamp. <path> is the var being clamped (e.g. "
+        "'hp' or 'inventory.gold.coins'). At least one of max/min required; "
+        "each can be a numeric literal (e.g. max=100) or a var path string "
+        "(e.g. max=max_hp) that resolves dynamically at write time. "
+        "Mode defaults to 'soft' (engages only when crossing the bound from "
+        "the legal side); 'hard' always enforces. Entity-level clamps "
+        "completely override system-level clamps on the same path."
+    ),
+)
+registry.annotate_sub(
+    "clamp", "remove",
+    usage="!clamp remove <eid> <path>",
+    desc="Remove an entity-level clamp. Aliases: del, rm.",
+)
+registry.annotate_sub(
+    "clamp", "list",
+    usage="!clamp list [eid]",
+    desc="List entity-level clamps for one entity (if eid given) or all.",
+)
+
+
+@registry.command(
+    "gclamp",
+    usage="!gclamp <add|remove|list> ...",
+    desc=("Manage system-level default clamps (stored in the active match's "
+          "game system's `default_clamps` rule). Apply to every entity in "
+          "matches using this system. See `!gclamp add` for full syntax."),
+)
+async def gclamp_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["gclamp"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    sub = args[0].lower()
+
+    # Resolve the game system bound to the active match. Edits live on the
+    # GameSystem so they persist across saves and apply to other matches
+    # using the same system. We also refresh the active match's rules dict
+    # so the change takes effect immediately on the current match (other
+    # matches will pick it up next time their rules are refreshed; see
+    # MatchManager.refresh_match_rules used by !system set).
+    sys_name = m.system_name
+    sysobj = mgr.get_system(sys_name)
+
+    def _read_clamps() -> List[Dict[str, Any]]:
+        """Read the current default_clamps list, copying so we mutate freely."""
+        cur = sysobj.settings.get("default_clamps")
+        if cur is None:
+            # System never explicitly set; fall back to engine default
+            return list(DEFAULT_SYSTEM_SETTINGS.get("default_clamps", []))
+        return list(cur.value or [])
+
+    def _write_clamps(new_list: List[Dict[str, Any]]) -> int:
+        """Persist the new clamp list onto the system and refresh live matches."""
+        sysobj.set("default_clamps", new_list)
+        return mgr.refresh_match_rules(sys_name)
+
+    if sub == "add":
+        # !gclamp add <path> [max=...] [min=...] [mode=hard|soft]
+        if await return_help_if_not_enough_args(ctx, args, 3, "gclamp", "add"):
+            return
+        path = args[1]
+        parsed = _parse_clamp_args(args[2:])
+        if "max" not in parsed and "min" not in parsed:
+            raise VTTError("Clamp must specify at least one of max=... or min=...")
+        spec = ClampSpec(
+            path=path,
+            max=parsed.get("max"),
+            min=parsed.get("min"),
+            mode=parsed.get("mode", "soft"),
+        )
+        existing = _read_clamps()
+        if any(c.get("path") == path for c in existing):
+            raise DuplicateId(
+                f"System '{sys_name}' already has a default clamp on '{path}'. "
+                f"Remove it first with !gclamp remove."
+            )
+        existing.append(spec.to_dict())
+        refreshed = _write_clamps(existing)
+        return await ctx.send(
+            f"Added default clamp on `{path}` to system `{sys_name}` "
+            f"({_format_clamp_line(path, spec)}) "
+            f"[refreshed {refreshed} live match{'es' if refreshed != 1 else ''}]"
+        )
+
+    if sub in ("remove", "del", "rm"):
+        if await return_help_if_not_enough_args(ctx, args, 2, "gclamp", "remove"):
+            return
+        path = args[1]
+        existing = _read_clamps()
+        new_list = [c for c in existing if c.get("path") != path]
+        if len(new_list) == len(existing):
+            raise NotFound(
+                f"No default clamp on '{path}' in system '{sys_name}'."
+            )
+        refreshed = _write_clamps(new_list)
+        return await ctx.send(
+            f"Removed default clamp on `{path}` from system `{sys_name}` "
+            f"[refreshed {refreshed} live match{'es' if refreshed != 1 else ''}]"
+        )
+
+    if sub == "list":
+        existing = _read_clamps()
+        if not existing:
+            return await ctx.send(
+                f"System `{sys_name}` has no default clamps."
+            )
+        lines = [f"**System `{sys_name}` default clamps:**"]
+        for cd in existing:
+            try:
+                spec = ClampSpec.from_dict(cd)
+                lines.append(_format_clamp_line(spec.path, spec))
+            except VTTError as ex:
+                lines.append(f"- ⚠️ malformed: {cd!r} ({ex})")
+        return await ctx.send("\n".join(lines))
+
+    raise VTTError(f"Unknown !gclamp subcommand: {sub}")
+
+
+registry.annotate_sub(
+    "gclamp", "add",
+    usage="!gclamp add <path> [max=N|varpath] [min=N|varpath] [mode=soft|hard]",
+    desc=(
+        "Add a system-level default clamp (persists on the GameSystem; "
+        "applies to every entity in matches using this system). Syntax "
+        "identical to !clamp add but without the <eid> argument."
+    ),
+)
+registry.annotate_sub(
+    "gclamp", "remove",
+    usage="!gclamp remove <path>",
+    desc="Remove a system-level default clamp. Aliases: del, rm.",
+)
+registry.annotate_sub(
+    "gclamp", "list",
+    usage="!gclamp list",
+    desc="List default clamps for the active match's game system.",
 )
 
 

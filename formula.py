@@ -125,6 +125,59 @@ command layer — required so the shell doesn't split on spaces):
   !ent hp hero "$(entity[self].max_hp if entity[self].blessed else entity[self].hp + 5)"
 
 ================================================================================
+VAR HOOK CONTEXT
+================================================================================
+Formulas running inside a var-event hook (on_var_created, on_var_changed,
+on_var_removed, or on_var_written) have access to six extra identifiers,
+which are bound to None (or False, for was_clamped) when the formula runs
+in any other context:
+
+  changed_key      The dotted path of the var that fired this event, e.g.
+                   "hp" or "inventory.sword.damage".
+  old_value        Previous value at that path. None for on_var_created.
+                   For on_var_removed on a subtree, this is the full removed
+                   subtree as a dict, so a passive can inspect what was lost.
+  new_value        New value at that path. None for on_var_removed. This is
+                   the value actually stored — post-clamp if a clamp engaged.
+  hook_name        One of "on_var_created", "on_var_changed", or
+                   "on_var_removed". Use this inside an on_var_written
+                   catch-all to discriminate between the sub-events. (It is
+                   never literally "on_var_written" — that's a subscription
+                   name, not an event kind.)
+  intended_value   The value the caller passed in BEFORE clamping. Equal to
+                   new_value when no clamp engaged. For on_var_removed, this
+                   is None (the caller intended absence). Use the difference
+                   intended_value - new_value to compute overheal/overdamage
+                   magnitudes.
+  was_clamped      Boolean: True iff a clamp modified the value on this
+                   event (intended_value != new_value). False when no clamp
+                   engaged OR when the write used bypass_clamp at the
+                   command layer (bypass is a deliberate override, not a
+                   clamp engagement).
+
+Typical patterns:
+
+  Detect a particular item picked up (target="inventory" scope=children,
+  on_var_created):
+    if changed_key == "inventory.legendary_sword":
+        entity[self].epic_quest_started = 1
+
+  Track all HP losses (target="hp" scope=exact, on_var_changed):
+    if new_value < old_value:
+        entity[self].damage_taken_total = entity[self].damage_taken_total + (old_value - new_value)
+
+  Track overheal magnitude (target="hp" scope=exact, on_var_changed):
+    if was_clamped and intended_value > new_value:
+        entity[self].overheal_total = entity[self].overheal_total + (intended_value - new_value)
+
+  Generic write-logger (target="" scope=deep, on_var_written):
+    entity[self].audit_log = entity[self].audit_log + "|" + hook_name + ":" + changed_key
+
+Note: list literals aren't allowed in formulas, so accumulating multiple
+values across passive firings is typically done via string concatenation
+with a separator (see the audit_log example above).
+
+================================================================================
 SECURITY NOTES
 ================================================================================
 Formulas run with __builtins__ disabled and a curated namespace. The AST is
@@ -177,11 +230,48 @@ _ALLOWED_NODES: Tuple[type, ...] = (
 
 # --- evaluation context ------------------------------------------------------
 
+# Identifier names that var hooks bind into the formula namespace. Stored as
+# a module-level constant so both the validator (allowed-identifier check)
+# and the namespace builder agree on the same list. Adding a new hook
+# context binding means adding a name here AND making sure EvalCtx.extras
+# (or its consumers) populates it.
+HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
+    "changed_key",
+    "old_value",
+    "new_value",
+    "hook_name",
+    "intended_value",   # pre-clamp value the caller requested; same as
+                        # new_value when no clamp engaged. Used for overheal
+                        # tracking: intended_value - new_value gives the
+                        # "lost" magnitude.
+    "was_clamped",      # True iff new_value differs from intended_value
+                        # because a clamp engaged. False if no clamp applied
+                        # OR if the write used bypass_clamp at the command
+                        # layer (bypassing was a deliberate choice, not a
+                        # clamp engagement).
+)
+
+
 @dataclass
 class EvalCtx:
-    """Bindings for special who-references during formula evaluation."""
-    this: Optional[str] = None       # entity whose turn it currently is
-    target: Optional[str] = None     # what 'self' resolves to
+    """Bindings exposed to a formula during evaluation.
+
+    Always available:
+      this    — entity whose turn it currently is (or None if unbound)
+      target  — entity bound to `self` in this frame (or None if unbound)
+
+    Var-hook-specific (populated only when firing on_var_*):
+      extras  — dict of additional identifier bindings. Currently the var
+                hooks populate {changed_key, old_value, new_value, hook_name}.
+                Identifiers in HOOK_CONTEXT_NAMES that aren't in extras are
+                bound to None in the namespace, so a formula using them in
+                a non-var-hook context sees None (and probably errors at
+                comparison time, which is a useful failure mode — better
+                than a parse error that surprises the GM).
+    """
+    this: Optional[str] = None
+    target: Optional[str] = None
+    extras: Optional[Dict[str, Any]] = None
 
     def resolve_who(self, token: str) -> str:
         if token in ("this", "current"):
@@ -291,7 +381,15 @@ def _validate_tree(tree: ast.AST) -> None:
         if not isinstance(n, _ALLOWED_NODES):
             raise FormulaError(f"Disallowed syntax: {type(n).__name__}")
         if isinstance(n, ast.Name):
-            if n.id not in ("__read", "__write") and n.id not in _ALLOWED_FUNCS:
+            # Allowed Names: __read/__write (transformer-injected), the
+            # built-in funcs (min, max, etc.), and the hook context names
+            # (changed_key, old_value, new_value, hook_name). The latter are
+            # bound to None outside var-hook contexts so a formula using them
+            # in the wrong context fails at comparison time rather than
+            # parse time — keeps the validator hook-agnostic.
+            if (n.id not in ("__read", "__write")
+                    and n.id not in _ALLOWED_FUNCS
+                    and n.id not in HOOK_CONTEXT_NAMES):
                 raise FormulaError(f"Unknown identifier '{n.id}'.")
         if isinstance(n, ast.Call):
             if not isinstance(n.func, ast.Name):
@@ -356,19 +454,50 @@ class FormulaEngine:
         return _get_path(e.vars, path)
 
     def _write(self, who: str, path: str, value: Any, ctx: EvalCtx) -> Any:
+        """Route formula writes through Entity.write_var so var hooks fire.
+
+        write_var returns log lines for any passives that matched the
+        resulting events; we ignore them here because the formula engine
+        has no place to surface them (the caller — _run_passive_safely or
+        a command — doesn't have access). The events still fire and the
+        passives still run; only the log lines are discarded. If a passive
+        chain needs to surface logs, it should originate from a command
+        path that captures them.
+        """
         eid = ctx.resolve_who(who)
         e = self._match.entities.get(eid)
         if e is None:
             raise FormulaError(f"Entity '{eid}' not found.")
-        _set_path(e.vars, path, value)
+        # write_var does the diff + event firing + mutation in one shot.
+        # _ = e.write_var(path, value)  # log lines discarded
+        e.write_var(path, value)
         return value
 
     def _namespace(self, ctx: EvalCtx) -> Dict[str, Any]:
-        return {
+        """Build the safe namespace for evaluating a formula.
+
+        Includes:
+          - __read/__write (transformer-injected helpers)
+          - The allowed built-in functions (min, max, etc.)
+          - Hook context names (changed_key, old_value, new_value, hook_name,
+            intended_value, was_clamped) bound from ctx.extras. Defaults:
+            was_clamped -> False (boolean-meaningful default), all others
+            -> None. Unconditional binding keeps the validator simple — a
+            formula referencing changed_key in a non-var-hook context just
+            sees None (or False).
+        """
+        extras = ctx.extras or {}
+        ns: Dict[str, Any] = {
             "__read":  lambda who, path:        self._read(who, path, ctx),
             "__write": lambda who, path, value: self._write(who, path, value, ctx),
             **_ALLOWED_FUNCS,
         }
+        # Per-name default: was_clamped is boolean-flavored (default False);
+        # everything else defaults to None.
+        _CONTEXT_DEFAULTS = {"was_clamped": False}
+        for name in HOOK_CONTEXT_NAMES:
+            ns[name] = extras.get(name, _CONTEXT_DEFAULTS.get(name))
+        return ns
 
     @staticmethod
     def _prepare(src: str, mode: str) -> ast.AST:

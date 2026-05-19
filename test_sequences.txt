@@ -279,3 +279,278 @@ Expected: every line should print an error (most with an X-mark). Loops,
 lambdas, list comprehensions, local-variable assignment, imports, and
 disallowed constructs nested inside an otherwise-valid if are all rejected
 clearly. None should crash or silently succeed.
+
+
+SCENARIO 12 — Var hooks: creation events fire at every level
+-------------------------------------------------------------
+
+!match new m12 varhooks 8 8
+!match use m12
+!ent add hero Hero 30 4 4 10
+!passive add hero log_creates on_var_created target=inventory scope=deep "entity[self].create_log = entity[self].create_log + \"|\" + changed_key"
+!ent set_var hero create_log start
+!ent set_var hero inventory.gold_pouch.coins 50
+!ent set_var hero create_log
+
+Expected: After the !ent set_var to inventory.gold_pouch.coins, the
+create_log should read "start|inventory|inventory.gold_pouch|inventory.gold_pouch.coins"
+- creation events fire at every newly-created level along the path,
+top-down.
+
+
+SCENARIO 13 — Var hooks: changed only when value differs; removed bottom-up
+----------------------------------------------------------------------------
+
+!match new m13 varhooks 8 8
+!match use m13
+!ent add hero Hero 30 4 4 10
+!passive add hero log_changes on_var_changed target=hp scope=exact "entity[self].change_log = entity[self].change_log + \"|\" + str(old_value) + \"->\" + str(new_value)"
+!ent set_var hero change_log start
+!ent set_var hero hp 30
+!ent set_var hero hp 20
+!ent set_var hero hp 20
+!ent set_var hero hp 5
+!ent set_var hero change_log
+
+Expected: change_log should be "start|30->20|20->5" — no change event
+fires when the same value is written.
+
+!ent set_var hero inventory.spell.fire 10
+!ent set_var hero inventory.spell.ice 5
+!passive add hero log_removes on_var_removed target=inventory scope=deep "entity[self].removal_log = entity[self].removal_log + \"|\" + changed_key"
+!ent set_var hero removal_log start
+!ent delete_var hero inventory.spell
+!ent set_var hero removal_log
+
+Expected: removal_log reads "start|inventory.spell.fire|inventory.spell.ice|inventory.spell"
+- leaves first, then container (bottom-up).
+
+
+SCENARIO 14 — Scope filtering: exact vs children vs deep
+---------------------------------------------------------
+
+!match new m14 scopes 8 8
+!match use m14
+!ent add hero Hero 30 4 4 10
+!passive add hero ex on_var_created target=inventory scope=exact "entity[self].ex_log = entity[self].ex_log + \"|\" + changed_key"
+!passive add hero ch on_var_created target=inventory scope=children "entity[self].ch_log = entity[self].ch_log + \"|\" + changed_key"
+!passive add hero dp on_var_created target=inventory scope=deep "entity[self].dp_log = entity[self].dp_log + \"|\" + changed_key"
+!ent set_var hero ex_log start
+!ent set_var hero ch_log start
+!ent set_var hero dp_log start
+!ent set_var hero inventory.sword.damage 12
+!ent set_var hero ex_log
+!ent set_var hero ch_log
+!ent set_var hero dp_log
+
+Expected:
+- ex_log = "start|inventory" (only the exact path)
+- ch_log = "start|inventory.sword" (direct child only, not the leaf damage)
+- dp_log = "start|inventory|inventory.sword|inventory.sword.damage" (all three)
+
+
+SCENARIO 15 — on_var_written catch-all with hook_name discrimination
+---------------------------------------------------------------------
+
+!match new m15 catchall 8 8
+!match use m15
+!ent add hero Hero 30 4 4 10
+!passive add hero audit on_var_written target=mood scope=exact "entity[self].audit_log = entity[self].audit_log + \"|\" + hook_name"
+!ent set_var hero audit_log start
+!ent set_var hero mood happy
+!ent set_var hero mood angry
+!ent delete_var hero mood
+!ent set_var hero audit_log
+
+Expected: audit_log reads "start|on_var_created|on_var_changed|on_var_removed"
+- the catch-all on_var_written fires alongside each kind, and hook_name
+inside the formula gives you which kind it was.
+
+
+SCENARIO 16 — Silent removal bypasses hooks
+--------------------------------------------
+
+!match new m16 silent 8 8
+!match use m16
+!ent add hero Hero 30 4 4 10
+!ent set_var hero secret 42
+!passive add hero observer on_var_removed target=secret scope=exact "entity[self].observed = 1"
+!ent delete_var_silent hero secret
+!ent info hero
+
+Expected: secret is gone from vars (silent delete worked) but `observed`
+is NOT set on the entity — the silent variant bypasses the hook.
+
+
+SCENARIO 17 — Recursion limit catches infinite loops
+-----------------------------------------------------
+
+!match new m17 recurse 8 8
+!match use m17
+!ent add hero Hero 30 4 4 10
+!system set default var_hook_recursion_limit 5
+!ent set_var hero counter 0
+!passive add hero loop on_var_changed target=counter scope=exact "entity[self].counter = entity[self].counter + 1"
+!ent set_var hero counter 1
+
+Expected: counter advances some number of times bounded by the limit (5),
+and the response includes a warning line beginning with "var-hook
+recursion limit (5) reached". The chain halts gracefully rather than
+hanging the bot.
+
+!system set default var_hook_recursion_limit 128
+
+
+SCENARIO 18 — Reactive passive: poison drains hp on item removal
+-----------------------------------------------------------------
+
+!match new m18 reactive 8 8
+!match use m18
+!ent add hero Hero 30 4 4 10
+!ent set_var hero antidote 1
+!passive add hero poison_kicks_in on_var_removed target=antidote scope=exact "entity[self].hp = entity[self].hp - 10"
+!ent info hero
+!ent delete_var hero antidote
+!ent info hero
+
+Expected: Hero starts at HP 30. After deleting antidote, the passive
+fires on_var_removed and reduces HP to 20. This is a complete reactive
+mechanic written entirely in passives + var hooks — no engine code
+changes needed for "thing removed -> consequence."
+
+
+SCENARIO 19 — Save/load preserves target/scope
+-----------------------------------------------
+
+!match new m19 saveload 8 8
+!match use m19
+!ent add hero Hero 30 4 4 10
+!passive add hero spy on_var_created target=inventory scope=children "entity[self].spy_log = changed_key"
+!passive info hero spy
+!store save /tmp/m19_save.json
+!match delete m19
+!store load /tmp/m19_save.json
+!match use m19
+!passive info hero spy
+
+Expected: !passive info before and after save/load shows the same Target
+and Scope fields. The new fields round-trip correctly.
+
+
+SCENARIO 20 — Property setters route through chokepoint (no more limitation)
+-----------------------------------------------------------------------------
+
+!match new m20 chokepoint 8 8
+!match use m20
+!ent add hero Hero 30 4 4 10
+!passive add hero hp_audit on_var_changed target=hp scope=exact "entity[self].hp_audit_log = entity[self].hp_audit_log + \"|\" + str(old_value) + \"->\" + str(new_value)"
+!ent set_var hero hp_audit_log start
+!ent hp hero -5
+!ent hp hero 10
+!ent hp hero -8
+!ent set_var hero hp_audit_log
+
+Expected: hp_audit_log reads "start|30->25|25->30|30->22" — every !ent hp
+command fires on_var_changed via the property setter, which now routes
+through the same write_var chokepoint as !ent set_var. (The 25->30 jump
+instead of 25->35 is because heal clamps at max_hp=30; not a hook issue.)
+Previously these mutations bypassed hooks; now they don't.
+
+
+SCENARIO 21 — Default soft clamp on hp via max_hp
+--------------------------------------------------
+
+!match new m21 clamps 8 8
+!match use m21
+!ent add hero Hero 30 4 4 10
+!ent set_var hero hp 10
+!ent hp hero 100
+!ent info hero
+!ent set_var hero hp 50
+!ent set_var hero hp 80
+
+Expected: Hero starts at hp=30/30. After !ent set_var hp 10, hp=10. The
+huge heal !ent hp hero 100 raises hp from 10 toward 110 but the default
+soft clamp engages (crossing from below max_hp=30), so hp lands at 30.
+Then setting hp directly to 50 puts hp above max (since soft is dormant
+when not crossing from below — but setting 50 is a write from below the
+prior value 30, soft engages, lands at 30). Setting hp to 80 same thing,
+soft engages from below, lands at 30.
+
+
+SCENARIO 22 — Bypass clamp for overheal
+----------------------------------------
+
+!match new m22 overheal 8 8
+!match use m22
+!ent add hero Hero 30 4 4 10
+!ent set_var hero hp 10
+!ent hp hero 100 bypass_clamp=yes
+!ent info hero
+!ent set_var hero hp 999 bypass_clamp=yes
+!ent info hero
+
+Expected: hp goes from 10 → 110 (bypass lets it exceed max_hp=30), then
+the !ent set_var with bypass sets hp=999. Both ack messages mention
+"clamp bypassed".
+
+
+SCENARIO 23 — Entity clamp overrides system clamp
+--------------------------------------------------
+
+!match new m23 entclamp 8 8
+!match use m23
+!ent add hero Hero 30 4 4 10
+!clamp add hero hp max=50 mode=hard
+!clamp list hero
+!ent set_var hero hp 999
+
+Expected: Hero has an entity-level hard clamp on hp at literal 50, which
+overrides the system-level soft clamp by max_hp=30. Writing hp=999 goes
+through the entity clamp and lands at 50 (hard clamps always enforce).
+
+
+SCENARIO 24 — System-level clamp via !gclamp commands
+------------------------------------------------------
+
+!match new m24 sysclamp 8 8
+!match use m24
+!ent add hero Hero 30 4 4 10
+!gclamp list
+!gclamp add mana max=100 min=0 mode=soft
+!gclamp list
+!ent set_var hero mana 150
+!ent info hero
+!ent set_var hero mana -50
+!ent info hero
+!gclamp remove mana
+
+Expected: !gclamp list initially shows the default hp clamp shipped in
+DEFAULT_SYSTEM_SETTINGS. After adding the mana clamp, the list grows.
+Writing mana=150 clamps to 100 (soft, from below). Then writing mana=-50
+clamps to 0 (min bound, soft, from above). Removing the clamp shows
+"refreshed 1 live match" indicating the active match's rules updated.
+
+
+SCENARIO 25 — Overheal tracking passive via was_clamped/intended_value
+-----------------------------------------------------------------------
+
+!match new m25 overheal_track 8 8
+!match use m25
+!ent add hero Hero 30 4 4 10
+!ent set_var hero hp 5
+!ent set_var hero overheal_log 0
+!passive add hero overheal_track on_var_changed target=hp scope=exact "entity[self].overheal_log = entity[self].overheal_log + (intended_value - new_value) if was_clamped else entity[self].overheal_log"
+!ent hp hero 100
+!ent info hero
+!ent hp hero 50
+
+Expected: Hero hp goes from 5 toward 105 but clamps at max_hp=30, so the
+overheal passive sees intended_value=105, new_value=30, was_clamped=True
+and adds 75 to overheal_log. Second heal of 50: heal_entity computes
+30+50=80, write_var clamps to 30. Since new_value=30 equals old_value=30,
+no on_var_changed event fires at all (diff produces nothing for unchanged
+scalars). So overheal_log stays at 75 — the overheal-as-event model
+deliberately doesn't count "tried to heal at full hp" as overheal. If you
+want that distinction, route through a separate command/passive that
+inspects the heal attempt before it reaches write_var.
