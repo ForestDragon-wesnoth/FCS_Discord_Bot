@@ -3135,3 +3135,4 @@ diagonals just long enough to reset facing back to up_right, then
 disable again and rotate ccw — snaps back the other way to up. Off-ring
 rotation always resolves in one step, never spinning through directions
 the current system has disallowed.
+normally; good_tick=1. Per-passive errors don't abort other passives.
