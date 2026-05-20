@@ -664,7 +664,2375 @@ separate "remove attempt" hook, and adding one would be conceptually
 muddled.
 
 
-SCENARIO 29 — Diagonal directions rejected by default; new arrow glyphs
+===============================================================================
+BASIC COMMAND COVERAGE
+===============================================================================
+
+
+SCENARIO 29 — Creating and switching between multiple matches
+--------------------------------------------------------------
+
+!match new arena_a Arena 8 8
+!match new arena_b Battlefield 12 12
+!match list
+!match use arena_a
+!ent add a1 Alpha 30 3 3 10
+!match use arena_b
+!ent add b1 Bravo 30 5 5 10
+!list
+!match use arena_a
+!list
+
+Expected: !match list shows both arenas. After !match use arena_a, the
+list shows Alpha. After switching to arena_b, the list shows Bravo. Each
+match has its own entity registry; entity ids don't conflict across
+matches.
+
+
+SCENARIO 30 — Match info and deletion
+--------------------------------------
+
+!match new doomed Doomed 6 6
+!match use doomed
+!ent add x Xavier 20 1 1 5
+!match info
+!match delete doomed
+!match list
+
+Expected: !match info shows the match's grid size, current system,
+turn order, and active entity. After !match delete, the match is gone
+from !match list. (Note: if the match was active in this channel, the
+channel no longer has an active match.)
+
+
+SCENARIO 31 — Listing available systems and their rules
+--------------------------------------------------------
+
+!match new s31 demo 8 8
+!match use s31
+!system list
+!system rules
+!system info default
+
+Expected: !system list shows the bundled "default" system plus any
+others created in this session. !system rules lists every registered
+rule with its current value and description. !system info gives a
+focused view of one system.
+
+
+SCENARIO 32 — Custom system with renamed vital vars
+----------------------------------------------------
+
+!system new spaceship
+!system set spaceship hp_var hull
+!system set spaceship max_hp_var max_hull
+!system set spaceship turnorder_var pilot_skill
+!match new battle1 SpaceBattle 10 10 spaceship
+!match use battle1
+!ent add ship1 Falcon 100 4 4 15
+
+Expected: Match is bound to the spaceship system. The entity's hp=100
+gets stored under "hull" (per the system's hp_var rule), not "hp".
+!ent info shows the values correctly. The default clamp's "hp"/"max_hp"
+references won't engage for this entity (those vars don't exist on it),
+which is documented behavior — the GM can add a !gclamp for hull if
+they want a cap.
+
+
+SCENARIO 33 — Map rendering and movement
+-----------------------------------------
+
+!match new mappy MapDemo 6 6
+!match use mappy
+!ent add alpha A 10 1 1 5
+!ent add bravo B 10 4 4 8
+!map
+!ent tp alpha 3 3
+!map
+
+Expected: !map renders the grid with entity initials shown at their
+positions. After teleporting alpha, the map updates.
+
+
+SCENARIO 34 — Help command navigation
+--------------------------------------
+
+!help
+!help ent
+!help ent add
+!help passive
+!help gclamp add
+
+Expected: !help (no args) lists all top-level commands. !help <cmd>
+shows that command's subcommands. !help <cmd> <sub> shows full usage
+and description for the specific subcommand.
+
+
+SCENARIO 35 — Listing entities with !list
+------------------------------------------
+
+!match new listy ListTest 8 8
+!match use listy
+!ent add a1 Alpha 30 1 1 10
+!ent add a2 Beta 25 2 2 15
+!ent add a3 Gamma 20 3 3 5
+!list
+
+Expected: !list shows all three entities in turn order (initiative
+descending: Beta 15, Alpha 10, Gamma 5). The arrow marker indicates
+which entity has the current turn.
+
+
+===============================================================================
+ENTITY OPERATIONS
+===============================================================================
+
+
+SCENARIO 36 — Entity rename
+----------------------------
+
+!match new ren36 Rename 6 6
+!match use ren36
+!ent add hero Hero 30 3 3 10
+!ent info hero
+!ent rename hero "The Chosen One"
+!ent info hero
+
+Expected: The entity's display name changes; its id (hero) stays the
+same. Subsequent !ent commands still use the id.
+
+
+SCENARIO 37 — Entity clone preserves stats and creates new id
+--------------------------------------------------------------
+
+!match new clone37 Clone 8 8
+!match use clone37
+!ent add original Hero 30 2 2 10
+!ent set_var original mana 50
+!ent clone original copy 5 5
+!ent info copy
+
+Expected: A second entity with id "copy" appears at (5,5). It has the
+same hp, mana, and other vars as the original (deep copy). Initiative
+is preserved unless overridden.
+
+
+SCENARIO 38 — Entity removal
+-----------------------------
+
+!match new rm38 Remove 6 6
+!match use rm38
+!ent add doomed Doomed 10 2 2 5
+!list
+!ent remove doomed
+!list
+
+Expected: After removal, !list no longer shows the entity. Turn order
+rebuilds automatically.
+
+
+SCENARIO 39 — Entity facing direction
+--------------------------------------
+
+!match new face39 Face 8 8
+!match use face39
+!ent add hero Hero 30 4 4 10
+!ent info hero
+!ent set_facing hero left
+!ent info hero
+!ent set_facing hero down
+!ent info hero
+
+Expected: Initial facing is set by spawn rules (typically toward map
+center). After !ent set_facing, the facing updates to the specified
+direction (up/down/left/right).
+
+
+SCENARIO 40 — Entity status flags
+----------------------------------
+
+!match new stat40 Status 6 6
+!match use stat40
+!ent add hero Hero 30 3 3 10
+!ent status hero add poisoned
+!ent status hero add bleeding
+!ent info hero
+!ent status hero remove poisoned
+!ent info hero
+
+Expected: Status flags are a set of strings on the entity. The info card
+shows them (or the entity_info_format template's status section). After
+removing "poisoned", only "bleeding" remains.
+
+
+SCENARIO 41 — Entity team assignment
+-------------------------------------
+
+!match new team41 Team 8 8
+!match use team41
+!ent add ally Ally 30 1 1 10
+!ent add enemy Enemy 25 6 6 8
+!ent team ally blue
+!ent team enemy red
+!ent info ally
+!ent info enemy
+
+Expected: Each entity's team field is set. The default entity_info_format
+template shows the team field when populated. Teams are used by some
+game-system rules (e.g. friendly fire) and can be referenced from
+passives via `entity[X].team`.
+
+
+SCENARIO 42 — Entity teleport (instant move, no movement passives)
+-------------------------------------------------------------------
+
+!match new tp42 Teleport 8 8
+!match use tp42
+!ent add hero Hero 30 1 1 10
+!ent tp hero 5 5
+!ent info hero
+
+Expected: Hero moves from (1,1) to (5,5) in one operation. !ent tp does
+no path-checking or movement-cost validation; it's an instant relocate.
+
+
+SCENARIO 43 — Listing all vars on an entity
+--------------------------------------------
+
+!match new vars43 Vars 6 6
+!match use vars43
+!ent add hero Hero 30 3 3 10
+!ent set_var hero mana 50
+!ent set_var hero inventory.gold 100
+!ent set_var hero inventory.gems 3
+!ent list_vars hero
+!ent dump hero
+
+Expected: !ent list_vars enumerates the top-level keys. !ent dump shows
+the full JSON tree including nested structure (inventory.gold,
+inventory.gems).
+
+
+===============================================================================
+VARIABLE OPERATIONS
+===============================================================================
+
+
+SCENARIO 44 — Numeric vs string vs structured vars
+---------------------------------------------------
+
+!match new types44 Types 6 6
+!match use types44
+!ent add hero Hero 30 3 3 10
+!ent set_var hero level 5
+!ent set_var hero title "Apprentice Mage"
+!ent set_var hero stats.str 12
+!ent set_var hero stats.dex 14
+!ent set_var hero stats.int 18
+!ent dump hero
+
+Expected: level is stored as int 5, title as string, stats as a dict
+{str: 12, dex: 14, int: 18}. Auto-coercion turns numeric tokens into
+int/float; quoted strings stay strings.
+
+
+SCENARIO 45 — Deep nested var creation
+---------------------------------------
+
+!match new nest45 Nested 6 6
+!match use nest45
+!ent add hero Hero 30 3 3 10
+!ent set_var hero quests.main.dragon.stage 2
+!ent set_var hero quests.main.dragon.objective "Find the lair"
+!ent set_var hero quests.side.tavern.complete 1
+!ent dump hero
+
+Expected: Intermediate dicts (quests, main, dragon, side, tavern) are
+created automatically. The dump shows the full tree.
+
+
+SCENARIO 46 — Deleting a single var
+------------------------------------
+
+!match new del46 Delete 6 6
+!match use del46
+!ent add hero Hero 30 3 3 10
+!ent set_var hero buff_strength 5
+!ent set_var hero buff_speed 3
+!ent info hero
+!ent delete_var hero buff_strength
+!ent info hero
+
+Expected: buff_strength is removed from the entity's vars. buff_speed
+remains. !ent info reflects the updated state.
+
+
+SCENARIO 47 — Deleting a nested subtree drops everything inside it
+-------------------------------------------------------------------
+
+!match new del47 DelSub 6 6
+!match use del47
+!ent add hero Hero 30 3 3 10
+!ent set_var hero inventory.sword.damage 12
+!ent set_var hero inventory.sword.weight 5
+!ent set_var hero inventory.potion.healing 20
+!ent dump hero
+!ent delete_var hero inventory.sword
+!ent dump hero
+
+Expected: The entire inventory.sword subtree is gone (damage AND weight
+keys). inventory.potion is unaffected.
+
+
+SCENARIO 48 — Vital vars cannot be deleted
+-------------------------------------------
+
+!match new vital48 Vital 6 6
+!match use vital48
+!ent add hero Hero 30 3 3 10
+!ent delete_var hero hp
+!ent delete_var hero max_hp
+!ent delete_var hero initiative
+!ent delete_var hero inventory
+
+Expected: First three deletions fail with a clear error ("Cannot
+delete… vital variable"). The fourth (inventory, not a vital var) would
+succeed but doesn't exist, so it also fails — different reason. The
+protection prevents accidental destruction of HP-tracking data.
+
+
+SCENARIO 49 — Silent deletion bypasses hooks
+---------------------------------------------
+
+!match new sd49 SilentDel 6 6
+!match use sd49
+!ent add hero Hero 30 3 3 10
+!ent set_var hero observed 0
+!ent set_var hero junk 42
+!passive add hero watch on_var_removed target=junk scope=exact "entity[self].observed = 1"
+!ent delete_var_silent hero junk
+!ent info hero
+
+Expected: junk is removed from vars, but the watching passive does NOT
+fire. observed stays at 0. The silent variant is for cleanup operations
+where cascading effects would be unwanted.
+
+
+SCENARIO 50 — Reading and writing inside formulas via $(...)
+-------------------------------------------------------------
+
+!match new sub50 Subst 6 6
+!match use sub50
+!ent add hero Hero 30 3 3 10
+!ent set_var hero strength 8
+!ent hp hero "$(entity[this].strength * -2)"
+!ent info hero
+!ent hp hero "$(entity[this].strength)"
+!ent info hero
+
+Expected: First $() evaluates to strength*-2 = -16, applied as damage
+(hp drops to 14). Second $() evaluates to strength = 8, applied as heal
+(hp goes back up, clamping at max_hp=30 if it exceeds).
+
+
+===============================================================================
+TURN ORDER AND ROUND MECHANICS
+===============================================================================
+
+
+SCENARIO 51 — Initiative determines turn order
+-----------------------------------------------
+
+!match new init51 Init 8 8
+!match use init51
+!ent add slow Slowpoke 30 1 1 5
+!ent add fast Speedy 30 2 2 20
+!ent add med Average 30 3 3 12
+!list
+
+Expected: Turn order is by initiative descending: Speedy (20), Average
+(12), Slowpoke (5). The arrow marker shows whoever's turn is current.
+
+
+SCENARIO 52 — Cycling through turns
+------------------------------------
+
+!match new cyc52 Cycle 6 6
+!match use cyc52
+!ent add a1 Alpha 30 1 1 10
+!ent add a2 Beta 30 2 2 5
+!turn next
+!turn next
+!turn next
+!turn next
+
+Expected: First !turn next initializes round 1 (fires on_round_start +
+on_turn_start, no advance). Subsequent !turn next moves through the
+order: Beta→Alpha→Beta (wrap, increment round)→Alpha…
+
+
+SCENARIO 53 — Manually setting the current turn
+------------------------------------------------
+
+!match new tset53 TurnSet 6 6
+!match use tset53
+!ent add a1 Alpha 30 1 1 10
+!ent add a2 Beta 30 2 2 8
+!ent add a3 Gamma 30 3 3 12
+!turn next
+!list
+!turn set a3
+!list
+
+Expected: !turn set jumps the current-turn marker to a specific entity.
+Useful for GM adjudication (e.g. "wait, Gamma uses a delayed action").
+
+
+SCENARIO 54 — Changing initiative mid-match reshuffles turn order
+------------------------------------------------------------------
+
+!match new ish54 Ishuffle 6 6
+!match use ish54
+!ent add a1 Alpha 30 1 1 10
+!ent add a2 Beta 30 2 2 5
+!list
+!ent init a2 20
+!list
+
+Expected: Beta's new initiative (20) bumps it above Alpha in turn order.
+The currently-active entity (Alpha) stays current; the rebuild preserves
+who's mid-turn.
+
+
+===============================================================================
+LIFECYCLE PASSIVE EXAMPLES
+===============================================================================
+
+
+SCENARIO 55 — Stamina regen each turn
+--------------------------------------
+
+!match new sta55 Stamina 6 6
+!match use sta55
+!ent add hero Hero 30 3 3 10
+!ent set_var hero stamina 10
+!ent set_var hero max_stamina 50
+!passive add hero stamina_regen on_turn_start "entity[self].stamina = min(entity[self].stamina + 8, entity[self].max_stamina)"
+!turn next
+!ent info hero
+!turn next
+!turn next
+!ent info hero
+
+Expected: Each on_turn_start fires, stamina increases by 8 capped at 50.
+After first turn: 18. After second: 26. (The first !turn next is the
+round-1 init that fires on_turn_start without advancing.)
+
+
+SCENARIO 56 — Poison damage over time
+--------------------------------------
+
+!match new pois56 Poison 6 6
+!match use pois56
+!ent add hero Hero 30 3 3 10
+!ent set_var hero poison_stacks 3
+!passive add hero poison_dot on_turn_start "entity[self].hp = entity[self].hp - entity[self].poison_stacks"
+!ent info hero
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+
+Expected: At the start of each turn, hero loses HP equal to poison_stacks
+(3 per turn). Note this passive doesn't decrement stacks — that's a
+separate concern, see scenario 57.
+
+
+SCENARIO 57 — Poison with decaying stacks
+------------------------------------------
+
+!match new pois57 PoisonDecay 6 6
+!match use pois57
+!ent add hero Hero 30 3 3 10
+!ent set_var hero poison_stacks 5
+!passive add hero poison_tick on_turn_start "if entity[self].poison_stacks > 0:\n    entity[self].hp = entity[self].hp - entity[self].poison_stacks\n    entity[self].poison_stacks = entity[self].poison_stacks - 1"
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+
+Expected: Each turn the dot ticks AND poison_stacks decrements by 1.
+After three turns: 5+4+3 = 12 damage taken, stacks down to 2. After
+poison_stacks hits 0 the conditional skips the body.
+
+
+SCENARIO 58 — Regen that scales with missing HP (more powerful when wounded)
+-----------------------------------------------------------------------------
+
+!match new heal58 ScaleHeal 6 6
+!match use heal58
+!ent add hero Hero 30 3 3 10
+!ent set_var hero hp 10
+!passive add hero adaptive_regen on_turn_start "entity[self].hp = entity[self].hp + max(2, (entity[self].max_hp - entity[self].hp) // 4)"
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+
+Expected: Heal amount is max(2, missing_hp / 4). At 10/30 (missing 20):
+heal 5 → 15/30. At 15/30 (missing 15): heal 3 → 18/30. At 18/30 (missing
+12): heal 3 → 21/30. Etc. Adaptive regen heals more when more wounded.
+
+
+SCENARIO 59 — Round-start global passive: all entities get a small heal
+------------------------------------------------------------------------
+
+!match new heal59 Hearth 6 6
+!match use heal59
+!ent add a1 Alpha 30 1 1 10
+!ent add a2 Beta 30 2 2 8
+!ent set_var a1 hp 15
+!ent set_var a2 hp 20
+!gpassive add hearth_heal on_round_start "entity[self].hp = entity[self].hp + 2"
+!turn next
+!ent info a1
+!ent info a2
+
+Expected: on_round_start fires once per entity in turn order. Both
+entities heal by 2 at the start of round 1.
+
+
+SCENARIO 60 — Decrementing duration counters
+---------------------------------------------
+
+!match new dur60 Duration 6 6
+!match use dur60
+!ent add hero Hero 30 3 3 10
+!ent set_var hero buff_turns 3
+!passive add hero buff_tick on_turn_start "if entity[self].buff_turns > 0:\n    entity[self].buff_turns = entity[self].buff_turns - 1"
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+
+Expected: buff_turns decrements each turn until it hits 0 and stays
+there. After 3 !turn next cycles, buff_turns is 0.
+
+
+SCENARIO 61 — On_entity_spawned: initialize entity-specific state
+------------------------------------------------------------------
+
+!match new spawn61 Spawn 6 6
+!match use spawn61
+!gpassive add init_action_economy on_entity_spawned "entity[self].actions_remaining = 2"
+!ent add hero Hero 30 3 3 10
+!ent info hero
+
+Expected: When Hero is spawned, the global passive fires with self=hero
+and initializes actions_remaining to 2.
+
+
+SCENARIO 62 — Round-end cleanup
+--------------------------------
+
+!match new clean62 Cleanup 6 6
+!match use clean62
+!ent add a1 Alpha 30 1 1 10
+!ent add a2 Beta 30 2 2 8
+!gpassive add reset_actions on_round_end "entity[self].actions_remaining = 2"
+!ent set_var a1 actions_remaining 0
+!ent set_var a2 actions_remaining 1
+!turn next
+!turn next
+!turn next
+!ent info a1
+!ent info a2
+
+Expected: After the round wraps (on_round_end fires), both entities have
+actions_remaining reset to 2. The on_round_end fires once per entity in
+turn order.
+
+
+SCENARIO 63 — Turn-end vs turn-start: when to put each kind of tick
+--------------------------------------------------------------------
+
+!match new tick63 Tick 6 6
+!match use tick63
+!ent add hero Hero 30 3 3 10
+!ent set_var hero start_count 0
+!ent set_var hero end_count 0
+!passive add hero start_ticker on_turn_start "entity[self].start_count = entity[self].start_count + 1"
+!passive add hero end_ticker on_turn_end "entity[self].end_count = entity[self].end_count + 1"
+!turn next
+!turn next
+!turn next
+!ent info hero
+
+Expected: First !turn next: start_count goes 0→1, no advance. Second:
+end_count 0→1, advance (only one entity so wraps), start_count 1→2.
+Third: end_count 1→2, start_count 2→3.
+
+Useful guidance: on_turn_start for "wake up" effects (regen, buff
+refresh); on_turn_end for "end of day" effects (status decay, cooldown
+ticks).
+
+
+===============================================================================
+REAL-WORLD GAME MECHANICS
+===============================================================================
+
+
+SCENARIO 64 — Life-to-mana conversion: damage taken refunds mana
+-----------------------------------------------------------------
+
+!match new l2m64 LifeToMana 6 6
+!match use l2m64
+!ent add hero Hero 30 3 3 10
+!ent set_var hero mana 0
+!ent set_var hero max_mana 100
+!passive add hero blood_mage on_var_changed target=hp scope=exact "if new_value < old_value:\n    entity[self].mana = min(entity[self].mana + (old_value - new_value) // 2, entity[self].max_mana)"
+!ent hp hero -10
+!ent info hero
+!ent hp hero -8
+!ent info hero
+
+Expected: First damage: 30→20, hero gains 5 mana. Second damage: 20→12,
+hero gains 4 mana (8 damage / 2 = 4). Mana caps at max_mana.
+
+
+SCENARIO 65 — Thorns: attacker takes damage equal to half what you took
+------------------------------------------------------------------------
+
+!match new thorn65 Thorns 6 6
+!match use thorn65
+!ent add hero Hero 30 1 1 10
+!ent add foe Foe 25 5 5 20
+!turn next
+!list
+!passive add hero thorns on_var_changed target=hp scope=exact "if new_value < old_value:\n    entity[this].hp = entity[this].hp - (old_value - new_value) // 2"
+!ent hp hero -10
+!ent info hero
+!ent info foe
+
+Expected: Foe has higher initiative so it's the current entity (this).
+When hero takes 10 damage, the thorns passive runs with self=hero and
+this=foe. Foe takes 5 damage in return (10/2). Note: this is a
+simplistic model — a real "attacker" concept will come later with the
+damage system.
+
+
+SCENARIO 66 — Mana shield: damage drains mana first, hp only when mana=0
+-------------------------------------------------------------------------
+
+!match new shield66 ManaShield 6 6
+!match use shield66
+!ent add hero Hero 30 3 3 10
+!ent set_var hero mana 20
+!ent set_var hero max_mana 50
+!passive add hero mana_shield on_var_changed target=hp scope=exact "if new_value < old_value:\n    entity[self].mana = max(0, entity[self].mana - (old_value - new_value))\n    entity[self].hp = old_value - max(0, (old_value - new_value) - old_mana_amount) if entity[self].mana > 0 else new_value"
+
+This is getting complex. A simpler version:
+
+!passive remove hero mana_shield
+!passive add hero mana_absorbs on_var_changed target=hp scope=exact "if new_value < old_value and entity[self].mana > 0:\n    entity[self].hp = old_value\n    entity[self].mana = max(0, entity[self].mana - (old_value - new_value))"
+!ent hp hero -15
+!ent info hero
+!ent hp hero -15
+!ent info hero
+!ent hp hero -15
+!ent info hero
+
+Expected: When hp drops, mana absorbs the damage (hp is restored, mana
+takes the hit). At mana=20, taking 15 damage restores hp and drops mana
+to 5. Next 15 damage: hp would drop to 15, but mana>0 absorbs it (mana
+to 0, hp restored). Once mana=0 the passive's condition fails and
+damage applies normally.
+
+Note: the mana_absorbs passive itself writes hp, which retriggers
+on_var_changed. To avoid infinite loops, the condition mana > 0 must
+become false before recursion reaches the limit.
+
+
+SCENARIO 67 — Lifesteal: healing on every successful hp drop on opponents
+--------------------------------------------------------------------------
+
+!match new ls67 Lifesteal 6 6
+!match use ls67
+!ent add hero Hero 30 1 1 20
+!ent add foe Foe 50 5 5 5
+!gpassive add lifesteal_for_attacker on_var_changed target=hp scope=exact "if new_value < old_value and entity[this].id != entity[self].id:\n    entity[this].hp = entity[this].hp + (old_value - new_value) // 2"
+!turn next
+!list
+!ent hp foe -20
+!ent info hero
+!ent info foe
+
+Expected: Hero is current (higher init). When foe takes 20 damage, the
+global lifesteal passive fires with self=foe and this=hero. Since
+this.id (hero) != self.id (foe), the conditional triggers and hero
+heals for 10 (half of 20).
+
+Note: comparison `entity[this].id != entity[self].id` uses the implicit
+id var that gets exposed via the ctx; in your version of the engine,
+this might be exposed differently. If `.id` doesn't resolve, store a
+duplicate id var: `!ent set_var hero my_id "hero"` and compare those.
+
+
+SCENARIO 68 — Berserker: damage output scales with missing HP
+--------------------------------------------------------------
+
+!match new ber68 Berserker 6 6
+!match use ber68
+!ent add hero Berserker 30 1 1 10
+!ent set_var hero base_damage 5
+!ent set_var hero hp 6
+!eval "entity[hero].base_damage + (entity[hero].max_hp - entity[hero].hp) // 5"
+
+Expected: Damage formula evaluates to base + missing_hp/5 = 5 + 24/5 =
+5 + 4 = 9. At full HP it would be 5; at 6 HP it's 9. Use the result
+as a damage value: !ent hp foe "$(...)".
+
+
+SCENARIO 69 — Phase transition: boss changes state below 50% hp
+----------------------------------------------------------------
+
+!match new boss69 Boss 8 8
+!match use boss69
+!ent add boss Boss 100 4 4 10
+!ent set_var boss phase 1
+!ent set_var boss base_attack 5
+!passive add boss enrage on_var_changed target=hp scope=exact "if new_value <= entity[self].max_hp // 2 and entity[self].phase == 1:\n    entity[self].phase = 2\n    entity[self].base_attack = entity[self].base_attack * 2"
+!ent hp boss -40
+!ent info boss
+!ent hp boss -15
+!ent info boss
+
+Expected: First damage: hp 100→60, still above 50% (=50), phase stays
+1. Second damage: hp 60→45, drops below 50% threshold. Phase becomes 2,
+base_attack doubles to 10. The conditional `phase == 1` ensures this
+only fires once.
+
+
+SCENARIO 70 — Shield variable absorbs damage before hp
+-------------------------------------------------------
+
+!match new sh70 Shield 6 6
+!match use sh70
+!ent add hero Hero 30 3 3 10
+!ent set_var hero shield 20
+!passive add hero shield_absorb on_var_write_attempt target=hp scope=exact "if intended_value < old_value and entity[self].shield > 0:\n    entity[self].shield = max(0, entity[self].shield - (old_value - intended_value))"
+!ent info hero
+!ent hp hero -15
+!ent info hero
+!ent hp hero -15
+!ent info hero
+
+Expected: Note this uses on_var_write_attempt because we want to react
+even when the resulting hp is unchanged. The passive doesn't actually
+prevent hp loss (that would need write modification, deferred). It just
+drains shield in parallel: first damage drops shield 20→5 and hp 30→15;
+second damage drops shield 5→0 and hp 15→0. For full damage prevention,
+wait for the damage system / write modification feature.
+
+
+SCENARIO 71 — Cooldown timer on a special ability
+--------------------------------------------------
+
+!match new cd71 Cooldown 6 6
+!match use cd71
+!ent add hero Hero 30 3 3 10
+!ent set_var hero ult_cooldown 0
+!passive add hero cooldown_tick on_turn_end "if entity[self].ult_cooldown > 0:\n    entity[self].ult_cooldown = entity[self].ult_cooldown - 1"
+!ent set_var hero ult_cooldown 3
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+
+Expected: ult_cooldown decrements each turn end until it hits 0. The
+GM checks `ult_cooldown > 0` before letting the player use the ability,
+and sets `ult_cooldown` back to its max value (e.g. 3) when it's used.
+
+
+SCENARIO 72 — Death save: when hp hits 0, roll a save (counter)
+----------------------------------------------------------------
+
+!match new ds72 DeathSave 6 6
+!match use ds72
+!ent add hero Hero 30 3 3 10
+!ent set_var hero death_saves 0
+!ent set_var hero status_downed 0
+!passive add hero on_dying on_var_changed target=hp scope=exact "if new_value <= 0 and entity[self].status_downed == 0:\n    entity[self].status_downed = 1\n    entity[self].hp = 0"
+!ent hp hero -50
+!ent info hero
+!ent hp hero -5
+!ent info hero
+
+Expected: First massive damage brings hp to 0 (it would have gone
+negative but the passive forces it to 0 and sets status_downed). Second
+damage: hp is already 0, the conditional doesn't trigger again
+(status_downed == 1). The GM can now adjudicate death-save rolls
+externally and write back to hp/status_downed.
+
+
+SCENARIO 73 — Mana cost validation via formula in $()
+------------------------------------------------------
+
+!match new mana73 ManaCost 6 6
+!match use mana73
+!ent add hero Hero 30 3 3 10
+!ent set_var hero mana 20
+!eval "entity[hero].mana >= 15"
+!ent set_var hero mana "$(entity[hero].mana - 15)"
+!ent info hero
+!eval "entity[hero].mana >= 15"
+
+Expected: First eval returns True (20 >= 15). Cast the spell: mana goes
+to 5. Second eval returns False — the GM should reject a further cast.
+This pattern lets the GM check resource availability before letting an
+action go through.
+
+
+SCENARIO 74 — Splash damage: write to multiple entities in sequence
+--------------------------------------------------------------------
+
+!match new aoe74 AOE 8 8
+!match use aoe74
+!ent add hero Hero 30 1 1 10
+!ent add foe1 Foe1 20 3 3 8
+!ent add foe2 Foe2 20 4 4 6
+!ent add foe3 Foe3 20 5 5 4
+!ent hp foe1 -10
+!ent hp foe2 -10
+!ent hp foe3 -10
+!list
+
+Expected: AOE damage is just multiple !ent hp commands in sequence. No
+special machinery — the GM picks the targets. (Or define a passive on
+"hp changed on any team-X entity → damage all team-X" using deep scope.)
+
+
+SCENARIO 75 — Crit chance simulated by GM (manual roll, conditional damage)
+----------------------------------------------------------------------------
+
+!match new crit75 Crit 6 6
+!match use crit75
+!ent add hero Hero 30 3 3 10
+!ent set_var hero crit_chance 25
+!ent set_var hero last_roll 17
+!eval "entity[hero].last_roll < entity[hero].crit_chance"
+!eval "10 * 2 if entity[hero].last_roll < entity[hero].crit_chance else 10"
+
+Expected: The GM rolls dice externally and writes the result to
+last_roll. The eval shows whether a crit occurred, then computes the
+final damage (doubled if crit). This pattern keeps the random source
+outside the engine — the engine just computes consequences.
+
+
+SCENARIO 76 — Buff with duration tied to round count
+-----------------------------------------------------
+
+!match new buf76 Buff 6 6
+!match use buf76
+!ent add hero Hero 30 3 3 10
+!ent set_var hero rage_turns 0
+!ent set_var hero damage_bonus 0
+!passive add hero rage_tick on_turn_start "if entity[self].rage_turns > 0:\n    entity[self].rage_turns = entity[self].rage_turns - 1\n    entity[self].damage_bonus = 5\nelse:\n    entity[self].damage_bonus = 0"
+!ent set_var hero rage_turns 3
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+
+Expected: When rage_turns is activated to 3, the next 3 turn_starts
+keep damage_bonus at 5 and decrement rage_turns. On the 4th turn,
+rage_turns is 0, so damage_bonus is set to 0 — buff has expired.
+
+
+SCENARIO 77 — Aura: global passive applies to every entity each round
+----------------------------------------------------------------------
+
+!match new aura77 Aura 6 6
+!match use aura77
+!ent add hero Hero 30 1 1 10
+!ent add ally Ally 25 2 2 8
+!ent add enemy Enemy 30 5 5 12
+!gpassive add inspiring_aura on_round_start "if entity[self].team == \"blue\":\n    entity[self].morale_bonus = 2\nelse:\n    entity[self].morale_bonus = 0"
+!ent team hero blue
+!ent team ally blue
+!ent team enemy red
+!turn next
+!ent info hero
+!ent info ally
+!ent info enemy
+
+Expected: At round start, the aura fires once per entity. Blue team
+members (hero, ally) get morale_bonus=2; red team (enemy) gets
+morale_bonus=0. Globals iterate over every entity in turn order.
+
+
+SCENARIO 78 — XP gain tracked on entity, level-up via passive
+--------------------------------------------------------------
+
+!match new xp78 XP 6 6
+!match use xp78
+!ent add hero Hero 30 3 3 10
+!ent set_var hero level 1
+!ent set_var hero xp 0
+!ent set_var hero xp_to_next 100
+!passive add hero level_up on_var_changed target=xp scope=exact "if new_value >= entity[self].xp_to_next:\n    entity[self].level = entity[self].level + 1\n    entity[self].xp = new_value - entity[self].xp_to_next\n    entity[self].xp_to_next = entity[self].xp_to_next + 50"
+!ent set_var hero xp 60
+!ent info hero
+!ent set_var hero xp 110
+
+Expected: First xp gain: 60 stays below threshold (100), level stays 1.
+Second: xp=110 triggers level up. Level becomes 2, leftover xp = 110-100
+= 10, threshold raises to 150. The level_up passive fires when xp
+changes — recursion from the passive's own writes is contained because
+the conditions stop triggering after the level-up.
+
+
+SCENARIO 79 — Spell that costs mana AND has a duration
+-------------------------------------------------------
+
+!match new spell79 Spell 6 6
+!match use spell79
+!ent add hero Hero 30 3 3 10
+!ent set_var hero mana 50
+!ent set_var hero shield_turns 0
+!ent set_var hero shield_active 0
+!ent set_var hero mana "$(entity[this].mana - 20)"
+!ent set_var hero shield_turns 3
+!ent set_var hero shield_active 1
+!passive add hero shield_decay on_turn_start "if entity[self].shield_turns > 0:\n    entity[self].shield_turns = entity[self].shield_turns - 1\nelse:\n    entity[self].shield_active = 0"
+!ent info hero
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+
+Expected: Casting the spell costs 20 mana (50→30) and sets shield_turns
+to 3 + shield_active to 1. Each turn_start, the decay passive ticks
+turns down. After 3 turns reach 0, shield_active goes to 0 on the next
+turn_start where shield_turns is already 0.
+
+
+SCENARIO 80 — Resistance: damage multiplier based on type
+----------------------------------------------------------
+
+!match new res80 Resist 6 6
+!match use res80
+!ent add hero Hero 30 3 3 10
+!ent set_var hero resist_fire 50
+!ent set_var hero resist_ice 0
+!eval "20 * (100 - entity[hero].resist_fire) // 100"
+!eval "20 * (100 - entity[hero].resist_ice) // 100"
+
+Expected: Hero has 50% fire resistance and 0% ice resistance. Computed
+damage: fire 20 * 50/100 = 10, ice 20 * 100/100 = 20. Apply via
+!ent hp hero "$(...)" with the appropriate calculation.
+
+
+SCENARIO 81 — Counter-attack: when you dodge, you hit back
+-----------------------------------------------------------
+
+!match new ctr81 Counter 6 6
+!match use ctr81
+!ent add hero Hero 30 1 1 10
+!ent add foe Foe 25 5 5 20
+!turn next
+!list
+!ent set_var hero counter_damage 7
+!passive add hero counter_strike on_var_changed target=last_dodge scope=exact "if new_value == 1:\n    entity[this].hp = entity[this].hp - entity[self].counter_damage\n    entity[self].last_dodge = 0"
+!ent set_var hero last_dodge 1
+!ent info foe
+
+Expected: When the GM signals a dodge by setting last_dodge=1, the
+passive fires: applies counter_damage to "this" (the current turn entity
+= foe), then resets last_dodge so the passive doesn't loop. Foe takes 7
+damage from the counter.
+
+
+SCENARIO 82 — Status durations stored as a dict
+------------------------------------------------
+
+!match new sd82 StatusDict 6 6
+!match use sd82
+!ent add hero Hero 30 3 3 10
+!ent set_var hero effects.burning.duration 3
+!ent set_var hero effects.burning.damage 2
+!ent set_var hero effects.frozen.duration 2
+!ent dump hero
+
+Expected: effects is a nested dict mapping status name → its parameters.
+A passive could iterate (in pseudocode) but the formula language doesn't
+support iteration — so the GM would write one passive per status or
+hardcode the dotted paths. See scenario 83 for a workable pattern.
+
+
+SCENARIO 83 — Multiple-status DOT with per-status passives
+-----------------------------------------------------------
+
+!match new mdot83 MultiDot 6 6
+!match use mdot83
+!ent add hero Hero 50 3 3 10
+!ent set_var hero burn_turns 3
+!ent set_var hero poison_turns 2
+!passive add hero burn_tick on_turn_start "if entity[self].burn_turns > 0:\n    entity[self].hp = entity[self].hp - 3\n    entity[self].burn_turns = entity[self].burn_turns - 1"
+!passive add hero poison_tick on_turn_start "if entity[self].poison_turns > 0:\n    entity[self].hp = entity[self].hp - 2\n    entity[self].poison_turns = entity[self].poison_turns - 1"
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+
+Expected: Two passives fire on each turn_start. First turn: burn 3,
+poison 2, hp 50→45. Burn_turns 2, poison_turns 1. Second turn: burn 3,
+poison 2, hp 45→40. Burn_turns 1, poison_turns 0. Third turn: burn 3
+only, hp 40→37. Burn_turns 0.
+
+
+===============================================================================
+VAR HOOK ADVANCED EXAMPLES
+===============================================================================
+
+
+SCENARIO 84 — On_var_created: trigger when first picked up
+-----------------------------------------------------------
+
+!match new pickup84 Pickup 6 6
+!match use pickup84
+!ent add hero Hero 30 3 3 10
+!ent set_var hero pickup_log ""
+!passive add hero on_pickup on_var_created target=inventory scope=children "entity[self].pickup_log = entity[self].pickup_log + \"|\" + changed_key"
+!ent set_var hero inventory.sword.damage 12
+!ent set_var hero inventory.potion.healing 20
+!ent set_var hero inventory.sword.weight 5
+!ent info hero
+
+Expected: pickup_log shows "|inventory.sword|inventory.potion" — both
+were direct children of inventory and were newly created. The sword.weight
+write doesn't fire the children-scope passive because weight is two
+levels deep.
+
+
+SCENARIO 85 — On_var_removed: clean up when an item leaves
+-----------------------------------------------------------
+
+!match new rm85 RemoveItem 6 6
+!match use rm85
+!ent add hero Hero 30 3 3 10
+!ent set_var hero inventory.sword.damage 12
+!ent set_var hero attuned_to "sword"
+!passive add hero unattune on_var_removed target=inventory.sword scope=exact "if entity[self].attuned_to == \"sword\":\n    entity[self].attuned_to = \"\""
+!ent delete_var hero inventory.sword
+!ent info hero
+
+Expected: When the sword is removed, the passive checks if the entity
+was attuned to it. Since attuned_to == "sword", it gets cleared.
+
+
+SCENARIO 86 — Deep watch: track every change inside an inventory subtree
+-------------------------------------------------------------------------
+
+!match new dw86 DeepWatch 6 6
+!match use dw86
+!ent add hero Hero 30 3 3 10
+!ent set_var hero audit_log ""
+!passive add hero inv_audit on_var_written target=inventory scope=deep "entity[self].audit_log = entity[self].audit_log + \"|\" + hook_name + \":\" + changed_key"
+!ent set_var hero inventory.sword.damage 12
+!ent set_var hero inventory.sword.damage 15
+!ent delete_var hero inventory.sword
+!ent info hero
+
+Expected: audit_log accumulates created events for inventory, sword,
+damage; one changed event for damage (12→15); removed events for damage
+and sword (bottom-up). The catch-all on_var_written catches all of
+created/changed/removed but NOT on_var_write_attempt.
+
+
+SCENARIO 87 — Use intended_value to validate writes that would have been wasted
+--------------------------------------------------------------------------------
+
+!match new iv87 IntendedValue 6 6
+!match use iv87
+!ent add hero Hero 30 3 3 10
+!ent set_var hero wasted_heal_log 0
+!passive add hero heal_audit on_var_write_attempt target=hp scope=exact "if intended_value > old_value and intended_value > new_value:\n    entity[self].wasted_heal_log = entity[self].wasted_heal_log + (intended_value - new_value)"
+!ent set_var hero hp 25
+!ent hp hero 100
+!ent info hero
+!ent hp hero 30
+
+Expected: First heal: intended=125, new=30, wasted=95. Counter += 95.
+Second heal at full: intended=60, new=30, wasted=30. Counter += 30.
+Final wasted_heal_log = 125. The passive catches both because it fires
+on every write attempt, not just diff-producing ones.
+
+
+SCENARIO 88 — Root-watch passive (target="" scope=deep): audit everything
+--------------------------------------------------------------------------
+
+!match new root88 RootWatch 6 6
+!match use root88
+!ent add hero Hero 30 3 3 10
+!ent set_var hero touches 0
+!passive add hero touch_count on_var_changed target= scope=deep "entity[self].touches = entity[self].touches + 1"
+!ent set_var hero mana 50
+!ent set_var hero stamina 30
+!ent set_var hero gold 100
+!ent info hero
+
+Expected: Empty target with deep scope catches every var change on the
+entity. Note: writes to "touches" itself also count, which leads to
+quick recursion — the formula increments touches, which fires another
+on_var_changed, etc. The recursion limit catches it. To avoid: scope
+narrower, or check `if changed_key != "touches"` in the formula.
+
+
+SCENARIO 89 — Was_clamped flag distinguishes natural changes from clamped ones
+-------------------------------------------------------------------------------
+
+!match new wc89 WasClamped 6 6
+!match use wc89
+!ent add hero Hero 30 3 3 10
+!ent set_var hero hp 5
+!ent set_var hero clamped_count 0
+!ent set_var hero unclamped_count 0
+!passive add hero distinguish on_var_changed target=hp scope=exact "if was_clamped:\n    entity[self].clamped_count = entity[self].clamped_count + 1\nelse:\n    entity[self].unclamped_count = entity[self].unclamped_count + 1"
+!ent hp hero 3
+!ent hp hero 100
+!ent hp hero -10
+!ent info hero
+
+Expected: First heal (+3): hp 5→8, no clamp, unclamped_count → 1.
+Second heal (+100): hp 8→30 (clamped), clamped_count → 1.
+Third damage (-10): hp 30→20, no clamp, unclamped_count → 2.
+
+
+SCENARIO 90 — Hook_name discriminator inside on_var_written
+------------------------------------------------------------
+
+!match new hn90 HookName 6 6
+!match use hn90
+!ent add hero Hero 30 3 3 10
+!ent set_var hero created_count 0
+!ent set_var hero changed_count 0
+!ent set_var hero removed_count 0
+!passive add hero discriminator on_var_written target=mana scope=exact "if hook_name == \"on_var_created\":\n    entity[self].created_count = entity[self].created_count + 1\nelif hook_name == \"on_var_changed\":\n    entity[self].changed_count = entity[self].changed_count + 1\nelse:\n    entity[self].removed_count = entity[self].removed_count + 1"
+!ent set_var hero mana 50
+!ent set_var hero mana 30
+!ent set_var hero mana 30
+!ent delete_var hero mana
+!ent info hero
+
+Expected: created_count=1 (first set), changed_count=1 (50→30; same
+value 30→30 fires nothing because no diff), removed_count=1 (delete).
+
+
+===============================================================================
+CLAMP MECHANICS AND EDGE CASES
+===============================================================================
+
+
+SCENARIO 91 — Multiple clamps on one entity
+--------------------------------------------
+
+!match new mc91 MultiClamp 6 6
+!match use mc91
+!ent add hero Hero 30 3 3 10
+!clamp add hero mana max=100 min=0 mode=soft
+!clamp add hero stamina max=50 min=0 mode=hard
+!clamp add hero rage max=10 mode=soft
+!clamp list hero
+!ent set_var hero mana 150
+!ent set_var hero stamina -10
+!ent set_var hero rage 20
+!ent info hero
+
+Expected: mana clamps to 100, stamina to 0 (hard min), rage to 10.
+
+
+SCENARIO 92 — Cross-variable clamp: damage clamped by armor
+------------------------------------------------------------
+
+!match new cv92 CrossVarClamp 6 6
+!match use cv92
+!ent add hero Hero 30 3 3 10
+!ent set_var hero max_focus 50
+!clamp add hero focus max=max_focus min=0 mode=soft
+!ent set_var hero focus 100
+!ent info hero
+!ent set_var hero max_focus 30
+!ent set_var hero focus 100
+
+Expected: First write of focus=100 clamps to 50. Lowering max_focus to
+30 doesn't retroactively clamp the existing focus value (still 50 due
+to soft semantics — "no retroactive"). But the next write attempt uses
+the new max: focus=100 clamps to 30.
+
+
+SCENARIO 93 — Hard clamp pulls a value down when it's already over
+-------------------------------------------------------------------
+
+!match new hc93 HardClamp 6 6
+!match use hc93
+!ent add hero Hero 30 3 3 10
+!ent set_var hero hp 999 bypass_clamp=yes
+!ent info hero
+!clamp add hero hp max=max_hp mode=hard
+!ent hp hero -1
+!ent info hero
+
+Expected: Hp is 999 (bypassed). Adding a hard clamp. The next hp
+adjustment (heal/damage) goes through write_var, which engages the
+clamp on the NEW value (999 - 1 = 998, clamped to 30 because hard
+always enforces).
+
+
+SCENARIO 94 — Soft clamp DOES NOT pull a value down when it's already over
+---------------------------------------------------------------------------
+
+!match new sc94 SoftClamp 6 6
+!match use sc94
+!ent add hero Hero 30 3 3 10
+!ent set_var hero hp 999 bypass_clamp=yes
+!ent hp hero -1
+!ent info hero
+
+Expected: hp is 999 (bypassed). Hp loss of 1 brings it to 998. The
+default soft clamp doesn't engage because the prior value (999) was
+already over the cap — soft is dormant in this direction.
+
+
+SCENARIO 95 — Bypass clamp for overheal scaling
+------------------------------------------------
+
+!match new oh95 Overheal 6 6
+!match use oh95
+!ent add hero Hero 30 3 3 10
+!ent set_var hero hp 25
+!ent hp hero 50 bypass_clamp=yes
+!ent info hero
+
+Expected: Heal 25→75, bypassing the max_hp=30 clamp. Useful for
+characters with explicit overheal mechanics where the normal cap
+doesn't apply (e.g. a paladin's overheal-as-shield).
+
+
+SCENARIO 96 — System-level clamp via !gclamp commands
+------------------------------------------------------
+
+!match new syscl96 SysClamp 6 6
+!match use syscl96
+!ent add hero Hero 30 3 3 10
+!gclamp list
+!gclamp add stamina max=50 min=0 mode=soft
+!gclamp list
+!ent set_var hero stamina 999
+!ent info hero
+!ent set_var hero stamina -5
+!ent info hero
+!gclamp remove stamina
+
+Expected: gclamp shows the default hp clamp and the new stamina clamp.
+Stamina writes get clamped per the rule: 999→50, -5→0.
+
+
+SCENARIO 97 — Removing the default hp clamp lets hp go free
+------------------------------------------------------------
+
+!match new free97 FreeHp 6 6
+!match use free97
+!ent add hero Hero 30 3 3 10
+!gclamp remove hp
+!ent hp hero 100
+!ent info hero
+!gclamp add hp max=max_hp mode=soft
+
+Expected: Without the hp clamp, hp goes to 130 freely after a +100 heal.
+(Reminder: re-add the clamp for normal use — most game systems want it
+on by default.)
+
+
+SCENARIO 98 — Min-only clamp (floor without ceiling)
+-----------------------------------------------------
+
+!match new floor98 MinOnly 6 6
+!match use floor98
+!ent add hero Hero 30 3 3 10
+!clamp add hero debt min=0 mode=hard
+!ent set_var hero debt 100
+!ent set_var hero debt -50
+!ent info hero
+
+Expected: Setting debt to 100 succeeds (no max). Setting it to -50 hits
+the hard min and clamps to 0.
+
+
+SCENARIO 99 — Min > max at config time → fails fast
+----------------------------------------------------
+
+!match new bad99 BadClamp 6 6
+!match use bad99
+!ent add hero Hero 30 3 3 10
+!clamp add hero x min=10 max=5 mode=hard
+
+Expected: Error message about min > max. The clamp is NOT added; !clamp
+list shows nothing.
+
+
+SCENARIO 100 — Non-numeric writes bypass clamps
+------------------------------------------------
+
+!match new str100 StringWrite 6 6
+!match use str100
+!ent add hero Hero 30 3 3 10
+!clamp add hero status max=10 mode=hard
+!ent set_var hero status "knocked_out"
+!ent info hero
+
+Expected: status is a string. The clamp only applies to numeric writes,
+so the string passes through unchanged.
+
+
+
+===============================================================================
+TEMPLATE AND RENDERING EXAMPLES
+===============================================================================
+
+
+SCENARIO 101 — Compact one-line entity line template
+-----------------------------------------------------
+
+!match new tmpl101 Templ 6 6
+!match use tmpl101
+!ent add hero Hero 30 3 3 10
+!ent set_var hero mana 50
+!system set default entity_line_format "{name}: {hp}hp {mana}mp"
+!list
+
+Expected: List shows "Hero: 30hp 50mp" instead of the default format.
+
+
+SCENARIO 102 — Conditional template section appears only when populated
+------------------------------------------------------------------------
+
+!match new tmpl102 Cond 6 6
+!match use tmpl102
+!ent add hero Hero 30 3 3 10
+!ent add ally Ally 25 5 5 8
+!ent team ally blue
+!system set default entity_line_format "{name}{?team?} ({team}){/?}: {hp}hp"
+!list
+
+Expected: hero (no team) shows "Hero: 30hp". Ally (team=blue) shows
+"Ally (blue): 25hp". The conditional section only renders when the
+referenced key is present and truthy.
+
+
+SCENARIO 103 — Template with dotted-path placeholder
+-----------------------------------------------------
+
+!match new tmpl103 Dotted 6 6
+!match use tmpl103
+!ent add hero Hero 30 3 3 10
+!ent set_var hero stats.str 14
+!ent set_var hero stats.dex 12
+!system set default entity_line_format "{name}: STR={stats.str} DEX={stats.dex}"
+!list
+
+Expected: Hero displays as "Hero: STR=14 DEX=12". Dotted paths walk
+nested dicts and substitute the leaf value.
+
+
+SCENARIO 104 — Missing placeholder shows sentinel for debugging
+----------------------------------------------------------------
+
+!match new tmpl104 Sentinel 6 6
+!match use tmpl104
+!ent add hero Hero 30 3 3 10
+!system set default entity_line_format "{name}: {nonexistent_var}"
+!list
+
+Expected: Hero shows "Hero: <?nonexistent_var?>" — the sentinel makes
+template typos visible rather than silently rendering empty.
+
+
+SCENARIO 105 — Multi-line entity_info_format
+---------------------------------------------
+
+!match new tmpl105 MultiLine 6 6
+!match use tmpl105
+!ent add hero Hero 30 3 3 10
+!ent set_var hero level 5
+!ent set_var hero stats.str 14
+!system set default entity_info_format "**{name}** L{level}\nHP: {hp}/{max_hp}\nSTR: {stats.str}{?team?}\nTeam: {team}{/?}"
+!ent info hero
+!ent team hero blue
+!ent info hero
+
+Expected: !ent info shows a 3-line card initially. After setting the
+team, the conditional section adds a 4th line. The \n in the template
+becomes a real newline.
+
+
+SCENARIO 106 — Custom system with sci-fi vital vars and a tailored template
+----------------------------------------------------------------------------
+
+!match new tmpl106 SciFi 8 8
+!system new scifi
+!system set scifi hp_var hull
+!system set scifi max_hp_var max_hull
+!system set scifi entity_line_format "{name} (hull {hull}/{max_hull}){?shields?} [shields {shields}]{/?}"
+!match new starbattle SpaceBattle 8 8 scifi
+!match use starbattle
+!ent add ship1 Falcon 100 3 3 10
+!ent set_var ship1 shields 25
+!list
+
+Expected: Falcon shows "Falcon (hull 100/100) [shields 25]" using the
+scifi system's template. The default 'hp' clamp doesn't engage because
+the entity stores its hp under 'hull' instead.
+
+
+SCENARIO 107 — !ent dump shows everything regardless of template
+-----------------------------------------------------------------
+
+!match new dump107 Dump 6 6
+!match use dump107
+!ent add hero Hero 30 3 3 10
+!ent set_var her
+
+===============================================================================
+SAVE/LOAD AND PERSISTENCE
+===============================================================================
+
+
+SCENARIO 108 — Full match round-trip
+-------------------------------------
+
+!match new save108 SaveTest 6 6
+!match use save108
+!ent add hero Hero 30 3 3 10
+!ent set_var hero mana 50
+!ent set_var hero inventory.sword.damage 12
+!passive add hero regen on_turn_start "entity[self].mana = entity[self].mana + 5"
+!clamp add hero mana max=100 mode=soft
+!turn next
+!store save /tmp/save108.json
+!match delete save108
+!store load /tmp/save108.json
+!match use save108
+!list
+!ent info hero
+!passive list hero
+!clamp list hero
+
+Expected: All state survives the round-trip: entity vars including
+nested inventory, the regen passive, the mana clamp, the current turn
+state (round_started=True).
+
+
+SCENARIO 109 — Save/load preserves global passives
+---------------------------------------------------
+
+!match new save109 SaveGlobal 6 6
+!match use save109
+!ent add hero Hero 30 3 3 10
+!gpassive add gas on_round_start "entity[self].hp = entity[self].hp - 1"
+!store save /tmp/save109.json
+!match delete save109
+!store load /tmp/save109.json
+!match use save109
+!gpassive list
+
+Expected: The gas global passive survives the round-trip.
+
+
+SCENARIO 110 — Save/load preserves system-level clamps
+-------------------------------------------------------
+
+!match new sl110 SysSave 6 6
+!match use sl110
+!ent add hero Hero 30 3 3 10
+!gclamp add mp max=100 min=0 mode=soft
+!gclamp list
+!store save /tmp/sl110.json
+!match delete sl110
+!store load /tmp/sl110.json
+!match use sl110
+!gclamp list
+
+Expected: The custom mp clamp survives. It was stored on the GameSystem
+which serializes alongside the match data.
+
+
+SCENARIO 111 — Saving multiple matches in one file
+---------------------------------------------------
+
+!match new m111a Arena1 6 6
+!match new m111b Arena2 6 6
+!match use m111a
+!ent add a1 Alpha 30 1 1 10
+!match use m111b
+!ent add b1 Bravo 25 2 2 8
+!store save /tmp/multi111.json
+!match delete m111a
+!match delete m111b
+!store load /tmp/multi111.json
+!match list
+!match use m111a
+!list
+!match use m111b
+!list
+
+Expected: Both matches round-trip with their entities preserved.
+
+
+===============================================================================
+COMMAND ARGUMENT FORMULAS
+===============================================================================
+
+
+SCENARIO 112 — $() with self binding
+-------------------------------------
+
+!match new arg112 ArgSelf 6 6
+!match use arg112
+!ent add hero Hero 30 3 3 10
+!ent set_var hero atk 8
+!ent hp hero "$(entity[self].atk * -1)"
+!ent info hero
+
+Expected: $() evaluates with self=hero (the entity in arg[1] of !ent hp).
+entity[self].atk * -1 = -8, applied as damage. Hp: 30→22.
+
+
+SCENARIO 113 — $() with this binding (current-turn entity)
+-----------------------------------------------------------
+
+!match new arg113 ArgThis 6 6
+!match use arg113
+!ent add hero Hero 30 1 1 10
+!ent add foe Foe 25 5 5 20
+!turn next
+!ent set_var foe weapon_dmg 12
+!ent hp hero "$(entity[this].weapon_dmg * -1)"
+!ent info hero
+
+Expected: Foe is current (init=20). $() resolves this=foe. Foe's
+weapon_dmg=12 becomes -12 damage to hero. Hero hp: 30→18.
+
+
+SCENARIO 114 — $() in set_var, computing a derived value
+---------------------------------------------------------
+
+!match new arg114 Derived 6 6
+!match use arg114
+!ent add hero Hero 30 3 3 10
+!ent set_var hero level 5
+!ent set_var hero max_mana "$(entity[self].level * 20)"
+!ent info hero
+
+Expected: max_mana = level * 20 = 100.
+
+
+SCENARIO 115 — Conditional damage via $()
+------------------------------------------
+
+!match new arg115 CondArg 6 6
+!match use arg115
+!ent add hero Hero 30 3 3 10
+!ent set_var hero dodging 0
+!ent hp hero "$(0 if entity[self].dodging else -10)"
+!ent info hero
+!ent set_var hero dodging 1
+!ent hp hero "$(0 if entity[self].dodging else -10)"
+!ent info hero
+
+Expected: First hit: dodging=0, takes -10, hp 30→20. Second hit:
+dodging=1, takes 0, hp stays at 20.
+
+
+SCENARIO 116 — Computed initiative based on stats
+--------------------------------------------------
+
+!match new arg116 CompInit 6 6
+!match use arg116
+!ent add hero Hero 30 3 3 10
+!ent set_var hero dex 14
+!ent set_var hero base_init 5
+!ent init hero "$(entity[self].base_init + entity[self].dex // 2)"
+!ent info hero
+
+Expected: Initiative = base + dex/2 = 5 + 7 = 12.
+
+
+===============================================================================
+FORMULA LANGUAGE CONSTRUCTS
+===============================================================================
+
+
+SCENARIO 117 — Ternary in $(): inline control flow
+---------------------------------------------------
+
+!match new tern117 Ternary 6 6
+!match use tern117
+!ent add hero Hero 30 3 3 10
+!ent set_var hero strength 14
+!eval "10 if entity[hero].strength >= 12 else 5"
+!eval "10 if entity[hero].strength >= 15 else 5"
+
+Expected: First returns 10, second returns 5.
+
+
+SCENARIO 118 — If/elif/else statement
+--------------------------------------
+
+!match new if118 IfElif 6 6
+!match use if118
+!ent add hero Hero 30 3 3 10
+!ent set_var hero mode normal
+!eval "if entity[hero].mode == \"easy\":\n    entity[hero].score = 100\nelif entity[hero].mode == \"normal\":\n    entity[hero].score = 50\nelse:\n    entity[hero].score = 10"
+!ent info hero
+
+Expected: mode=normal hits elif, score=50.
+
+
+SCENARIO 119 — Compound boolean conditions
+-------------------------------------------
+
+!match new bool119 Bool 6 6
+!match use bool119
+!ent add hero Hero 30 3 3 10
+!ent set_var hero level 5
+!ent set_var hero quest_done 1
+!eval "entity[hero].level >= 5 and entity[hero].quest_done == 1"
+!eval "entity[hero].level >= 10 or entity[hero].quest_done == 1"
+!eval "not (entity[hero].level < 3)"
+
+Expected: True, True, True. Standard Python boolean ops work in formulas.
+
+
+SCENARIO 120 — Built-in functions
+----------------------------------
+
+!match new fn120 Funcs 6 6
+!match use fn120
+!ent add hero Hero 30 3 3 10
+!eval "min(5, 10)"
+!eval "max(5, 10, 8)"
+!eval "abs(-7)"
+!eval "round(3.6)"
+!eval "int(3.9)"
+!eval "float(5)"
+
+Expected: 5, 10, 7, 4, 3, 5.0. Whitelisted: min, max, abs, round, int,
+float, str.
+
+
+SCENARIO 121 — Disallowed: loops
+---------------------------------
+
+!match new rej121 Reject 6 6
+!match use rej121
+!ent add hero Hero 30 3 3 10
+!eval "for x in range(3): entity[hero].hp = x"
+!eval "while True: entity[hero].hp = 0"
+
+Expected: Both rejected with "Disallowed syntax" errors.
+
+
+SCENARIO 122 — Disallowed: lambdas, comprehensions, imports
+------------------------------------------------------------
+
+!match new rej122 Reject 6 6
+!match use rej122
+!ent add hero Hero 30 3 3 10
+!eval "(lambda x: x)(5)"
+!eval "[x for x in range(3)]"
+!eval "import os"
+
+Expected: All three rejected.
+
+
+SCENARIO 123 — Disallowed: subscripting non-entity values
+----------------------------------------------------------
+
+!match new rej123 Reject 6 6
+!match use rej123
+!ent add hero Hero 30 3 3 10
+!eval "entity[hero].x[0]"
+
+Expected: Rejected. The only allowed subscript is `entity[X]`.
+
+
+SCENARIO 124 — Disallowed: attribute access on non-entity
+----------------------------------------------------------
+
+!match new rej124 Reject 6 6
+!match use rej124
+!ent add hero Hero 30 3 3 10
+!eval "min.foo"
+
+Expected: Rejected. Attribute access is only valid on `entity[X].path`.
+
+
+SCENARIO 125 — Self unbound at command level
+---------------------------------------------
+
+!match new self125 SelfUnbound 6 6
+!match use self125
+!ent add hero Hero 30 3 3 10
+!ent hp self 5
+!eval "entity[self].hp"
+
+Expected: Both fail. `self` is only bound inside passive formulas and
+as the implicit "target entity" in $() arg substitution.
+
+
+SCENARIO 126 — Missing var raises (no silent defaults)
+-------------------------------------------------------
+
+!match new miss126 Missing 6 6
+!match use miss126
+!ent add hero Hero 30 3 3 10
+!eval "entity[hero].does_not_exist"
+!eval "entity[hero].mana + 5"
+
+Expected: Both raise FormulaError. If you want a default, initialize
+the var first or use a ternary.
+
+
+SCENARIO 127 — String concatenation
+------------------------------------
+
+!match new str127 Strings 6 6
+!match use str127
+!ent add hero Hero 30 3 3 10
+!eval "\"Hello, \" + entity[hero].name"
+
+Expected: Returns "Hello, Hero".
+
+
+SCENARIO 128 — Mixing numbers and strings needs str()
+------------------------------------------------------
+
+!match new sc128 StrConv 6 6
+!match use sc128
+!ent add hero Hero 30 3 3 10
+!eval "\"HP: \" + str(entity[hero].hp)"
+
+Expected: "HP: 30". str() converts the int before concatenation.
+
+
+
+===============================================================================
+ADVANCED GAME MECHANICS
+===============================================================================
+
+
+SCENARIO 129 — Charge-up ability: build resource over turns
+------------------------------------------------------------
+
+!match new chg129 Charge 6 6
+!match use chg129
+!ent add hero Hero 30 3 3 10
+!ent set_var hero charge 0
+!ent set_var hero charge_max 100
+!passive add hero build_charge on_turn_start "entity[self].charge = min(entity[self].charge + 20, entity[self].charge_max)"
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+
+Expected: Charge builds 20 per turn: 20, 40, 60, 80, 100, then caps at
+100. At 100 the GM lets the player unleash a powerful ability and
+resets charge.
+
+
+SCENARIO 130 — Conditional damage tier (rage-based)
+----------------------------------------------------
+
+!match new rage130 RageTier 6 6
+!match use rage130
+!ent add hero Hero 30 3 3 10
+!ent set_var hero rage 0
+!eval "5 if entity[hero].rage < 30 else (10 if entity[hero].rage < 70 else 20)"
+!ent set_var hero rage 50
+!eval "5 if entity[hero].rage < 30 else (10 if entity[hero].rage < 70 else 20)"
+!ent set_var hero rage 80
+!eval "5 if entity[hero].rage < 30 else (10 if entity[hero].rage < 70 else 20)"
+
+Expected: 5 (rage<30), 10 (30<=rage<70), 20 (rage>=70). Nested ternaries
+let the GM tier damage by a resource level.
+
+
+SCENARIO 131 — Curse mark that triggers when crossed
+-----------------------------------------------------
+
+!match new curse131 Curse 6 6
+!match use curse131
+!ent add hero Hero 30 3 3 10
+!ent set_var hero hp 25
+!ent set_var hero curse_triggered 0
+!passive add hero curse_mark on_var_changed target=hp scope=exact "if new_value < 10 and entity[self].curse_triggered == 0:\n    entity[self].curse_triggered = 1\n    entity[self].hp = entity[self].hp - 5"
+!ent hp hero -10
+!ent info hero
+!ent hp hero -8
+!ent info hero
+!ent hp hero -1
+!ent info hero
+
+Expected: First damage 25→15, not yet below 10. Second damage 15→7,
+crosses below 10, curse triggers — extra -5 → hp=2. curse_triggered=1
+so subsequent damage doesn't retrigger. Third damage 2→1.
+
+
+SCENARIO 132 — Counter-attack damage based on enemy's missing HP
+-----------------------------------------------------------------
+
+!match new ca132 ExecCounter 6 6
+!match use ca132
+!ent add hero Hero 30 1 1 10
+!ent add foe Foe 100 5 5 20
+!turn next
+!ent set_var foe hp 20
+!ent hp hero "$((entity[this].max_hp - entity[this].hp) // 5)"
+!ent info hero
+
+Expected: Foe (this) is at 20/100, missing 80. Execute heal scales with
+foe's wound: 80/5 = 16 heal for hero. Hero hp 30 + 16 = 46, but clamps
+to max_hp=30 due to default soft clamp. Hero info shows 30.
+
+
+SCENARIO 133 — Damage reflect that bypasses clamp for "true damage"
+--------------------------------------------------------------------
+
+!match new ref133 TrueDmg 6 6
+!match use ref133
+!ent add hero Hero 30 1 1 10
+!ent add foe Foe 50 5 5 20
+!turn next
+!ent hp foe -25
+!ent set_var foe hp 5 bypass_clamp=yes
+!ent info foe
+
+Expected: First, foe takes 25 damage (50→25, well within max). Second,
+the GM uses bypass_clamp to force hp to 5 (simulating "true damage" or
+a debug override that ignores clamps).
+
+
+SCENARIO 134 — Multi-stage boss with health gates
+--------------------------------------------------
+
+!match new boss134 BossGates 8 8
+!match use boss134
+!ent add boss Boss 200 4 4 10
+!ent set_var boss phase 1
+!ent set_var boss enraged 0
+!passive add boss phase_2_gate on_var_changed target=hp scope=exact "if new_value <= entity[self].max_hp * 3 // 4 and entity[self].phase < 2:\n    entity[self].phase = 2"
+!passive add boss phase_3_gate on_var_changed target=hp scope=exact "if new_value <= entity[self].max_hp // 2 and entity[self].phase < 3:\n    entity[self].phase = 3"
+!passive add boss enrage_gate on_var_changed target=hp scope=exact "if new_value <= entity[self].max_hp // 4 and entity[self].enraged == 0:\n    entity[self].enraged = 1"
+!ent hp boss -60
+!ent info boss
+!ent hp boss -50
+!ent info boss
+!ent hp boss -60
+!ent info boss
+
+Expected: Phase advances as hp crosses 75%, 50%, 25% thresholds.
+Damage 60→140: phase 2 triggers (140 <= 150). Damage 50→90: phase 3
+triggers (90 <= 100). Damage 60→30: enraged triggers (30 <= 50).
+Multiple passives on the same hook all fire; conditions ensure each
+transition runs exactly once.
+
+
+SCENARIO 135 — Heal-on-kill: when enemy hp hits 0, allies heal
+---------------------------------------------------------------
+
+!match new hok135 HealKill 6 6
+!match use hok135
+!ent add hero Hero 30 1 1 10
+!ent team hero blue
+!ent add foe Foe 20 5 5 20
+!ent team foe red
+!gpassive add heal_on_kill on_var_changed target=hp scope=exact "if new_value <= 0 and entity[self].team != entity[this].team and entity[this].team == \"blue\":\n    entity[this].hp = entity[this].hp + 5"
+!turn next
+!ent set_var hero hp 15
+!ent hp foe -25
+!ent info hero
+!ent info foe
+
+Expected: Foe is current (init=20). Hero damages foe; foe.hp drops to
+-5 (or 0 depending on min clamp). The heal_on_kill global fires with
+self=foe and this=foe (since on_var_changed fires for the entity whose
+var changed, "this" is the current-turn entity)... actually wait, the
+intent here is to heal the OPPOSING team's ally. The model would need
+an attacker concept. For now this scenario demonstrates the conditional
+syntax but the actual mechanic needs the future damage system.
+
+
+SCENARIO 136 — Stack count with cap
+------------------------------------
+
+!match new stk136 StackCap 6 6
+!match use stk136
+!ent add hero Hero 30 3 3 10
+!ent set_var hero stacks 0
+!clamp add hero stacks max=5 min=0 mode=hard
+!ent set_var hero stacks 3
+!ent info hero
+!ent set_var hero stacks 8
+!ent info hero
+!ent set_var hero stacks -1
+!ent info hero
+
+Expected: Stacks always stays in [0, 5]. Writes of 3, 8, -1 produce
+3, 5 (clamped), 0 (clamped).
+
+
+SCENARIO 137 — Cumulative damage tracker (lifetime stat)
+---------------------------------------------------------
+
+!match new cdt137 CumulDmg 6 6
+!match use cdt137
+!ent add hero Hero 30 3 3 10
+!ent set_var hero damage_taken_lifetime 0
+!passive add hero track_damage on_var_changed target=hp scope=exact "if new_value < old_value:\n    entity[self].damage_taken_lifetime = entity[self].damage_taken_lifetime + (old_value - new_value)"
+!ent hp hero -5
+!ent hp hero -8
+!ent hp hero 3
+!ent hp hero -10
+!ent info hero
+
+Expected: damage_taken_lifetime = 5 + 8 + 0 + 10 = 23. The heal (+3)
+doesn't increase the counter because the conditional checks new < old.
+
+
+SCENARIO 138 — Mirror match: copy stats from another entity
+------------------------------------------------------------
+
+!match new mir138 Mirror 6 6
+!match use mir138
+!ent add hero Hero 30 1 1 10
+!ent set_var hero atk 15
+!ent set_var hero defense 8
+!ent add mirror Mirror 30 5 5 10
+!ent set_var mirror atk "$(entity[hero].atk)"
+!ent set_var mirror defense "$(entity[hero].defense)"
+!ent info mirror
+
+Expected: Mirror's atk=15 and defense=8, copied from hero via $() at
+creation time. Note: this is a one-time copy, not a binding — if
+hero.atk changes later, mirror.atk won't update.
+
+
+SCENARIO 139 — Aggregate damage check across multiple sources
+--------------------------------------------------------------
+
+!match new agg139 Aggregate 6 6
+!match use agg139
+!ent add hero Hero 30 3 3 10
+!ent set_var hero turn_damage 0
+!passive add hero start_turn on_turn_start "entity[self].turn_damage = 0"
+!passive add hero accumulate on_var_changed target=hp scope=exact "if new_value < old_value:\n    entity[self].turn_damage = entity[self].turn_damage + (old_value - new_value)"
+!turn next
+!ent hp hero -3
+!ent hp hero -5
+!ent hp hero -2
+!ent info hero
+!turn next
+!ent info hero
+
+Expected: Across the turn, hero takes 3+5+2=10 damage, turn_damage=10.
+At the next turn_start, turn_damage resets to 0. Useful for "if you
+took more than 15 damage this turn, X happens" mechanics.
+
+
+SCENARIO 140 — Channeled ability: must stay still
+--------------------------------------------------
+
+!match new ch140 Channel 6 6
+!match use ch140
+!ent add hero Hero 30 3 3 10
+!ent set_var hero channeling 1
+!ent set_var hero channel_x 3
+!ent set_var hero channel_y 3
+!passive add hero break_channel on_var_changed target=x scope=exact "if entity[self].channeling == 1 and new_value != entity[self].channel_x:\n    entity[self].channeling = 0"
+!ent info hero
+!ent tp hero 4 3
+!ent info hero
+
+Expected: Hero starts channeling at (3,3). Teleporting to (4,3) changes
+x from 3 to 4. The passive sees x changed and channel_x is still 3, so
+it sets channeling=0. Note: this requires var hooks on x, which depends
+on x being routed through write_var — that's outside this commit's
+scope. The scenario demonstrates the pattern; if x isn't watched, the
+mechanic won't trigger.
+
+
+SCENARIO 141 — Resource regen rate tied to a stat
+--------------------------------------------------
+
+!match new rrr141 RegenRate 6 6
+!match use rrr141
+!ent add hero Hero 30 3 3 10
+!ent set_var hero spirit 12
+!ent set_var hero mana 0
+!ent set_var hero max_mana 100
+!passive add hero spirit_regen on_turn_start "entity[self].mana = min(entity[self].mana + entity[self].spirit // 3, entity[self].max_mana)"
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+
+Expected: Mana regen per turn = spirit / 3 = 4. After three turns:
+4, 8, 12. The rate scales with the entity's spirit stat — buff spirit
+and the regen accelerates.
+
+
+SCENARIO 142 — Dynamic max_hp scaled by level
+----------------------------------------------
+
+!match new dmh142 DynMax 6 6
+!match use dmh142
+!ent add hero Hero 30 3 3 10
+!ent set_var hero level 1
+!ent set_var hero hp_per_level 5
+!passive add hero level_max_hp on_var_changed target=level scope=exact "entity[self].max_hp = 25 + new_value * entity[self].hp_per_level"
+!ent set_var hero level 2
+!ent info hero
+!ent set_var hero level 5
+!ent info hero
+
+Expected: Setting level=2 triggers the passive, max_hp = 25 + 2*5 = 35.
+Setting level=5: max_hp = 25 + 25 = 50. The clamp's reference to
+max_hp picks up the new value next time hp is written.
+
+
+SCENARIO 143 — Tag-based filtering using string vars
+-----------------------------------------------------
+
+!match new tag143 Tags 6 6
+!match use tag143
+!ent add hero Hero 30 3 3 10
+!ent set_var hero type "warrior"
+!ent set_var hero subtype "berserker"
+!eval "entity[hero].type == \"warrior\" and entity[hero].subtype == \"berserker\""
+
+Expected: Returns True. Multiple string vars can implement a tag system.
+Comparison via == in formulas works for strings.
+
+
+SCENARIO 144 — Periodic event: every 3 turns, something happens
+----------------------------------------------------------------
+
+!match new per144 Periodic 6 6
+!match use per144
+!ent add hero Hero 30 3 3 10
+!ent set_var hero turn_counter 0
+!ent set_var hero pulse_count 0
+!passive add hero pulse on_turn_start "entity[self].turn_counter = entity[self].turn_counter + 1\nif entity[self].turn_counter >= 3:\n    entity[self].turn_counter = 0\n    entity[self].pulse_count = entity[self].pulse_count + 1"
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!ent info hero
+
+Expected: Every 3 turns the counter wraps and pulse_count increments.
+After 8 turn_starts (the initial init + 7 more): turn_counter cycles
+1,2,3→0+pulse,1,2,3→0+pulse,1,2... after 8 starts pulse_count = 2.
+
+
+SCENARIO 145 — Variable type-coercion gotcha: number vs string
+---------------------------------------------------------------
+
+!match new tc145 TypeCoerce 6 6
+!match use tc145
+!ent add hero Hero 30 3 3 10
+!ent set_var hero count 5
+!ent set_var hero label "5"
+!eval "entity[hero].count == 5"
+!eval "entity[hero].label == \"5\""
+!eval "entity[hero].count == entity[hero].label"
+
+Expected: True, True, False. !ent set_var auto-coerces "5" to int 5
+when the value is bare; quoted "5" stays a string. The third comparison
+shows int 5 != string "5".
+
+
+===============================================================================
+INTEGRATED GAME-SYSTEM EXAMPLES
+===============================================================================
+
+
+SCENARIO 146 — Build a custom RPG system from scratch
+------------------------------------------------------
+
+!system new dnd5e
+!system set dnd5e hp_var hp
+!system set dnd5e max_hp_var max_hp
+!system set dnd5e turnorder_var initiative
+!gclamp add hp max=max_hp mode=soft
+!system set dnd5e entity_line_format "{name} (L{level}) — HP:{hp}/{max_hp} AC:{ac}"
+!system set dnd5e entity_info_format "**{name}** Level {level} {class}\nHP: {hp}/{max_hp}\nAC: {ac}\nInit: {initiative}{?status_csv?}\nStatus: {status_csv}{/?}"
+!match new dnd1 Adventure 10 10 dnd5e
+!match use dnd1
+!ent add fighter Fighter 30 3 3 12
+!ent set_var fighter level 3
+!ent set_var fighter ac 16
+!ent set_var fighter class "Fighter"
+!list
+!ent info fighter
+
+Expected: A bespoke D&D-style system with custom rendering. The
+template references ac, level, class — vars that the GM sets per
+entity. Entity card shows the full character sheet.
+
+
+SCENARIO 147 — Pokemon-style turn system with status moves
+-----------------------------------------------------------
+
+!system new pkmn
+!system set pkmn hp_var hp
+!system set pkmn max_hp_var max_hp
+!system set pkmn turnorder_var speed
+!system set pkmn entity_line_format "{name} L{level} HP:{hp}/{max_hp}{?status?} [{status}]{/?}"
+!match new pkmn1 Battle 6 6 pkmn
+!match use pkmn1
+!ent add pikachu Pikachu 100 2 2 90
+!ent set_var pikachu level 25
+!ent add geodude Geodude 110 4 4 20
+!ent set_var geodude level 25
+!list
+
+Expected: Pikachu acts first (speed 90 > 20). The system's renamed
+turnorder_var means initiative is stored under "speed" instead of
+"initiative". Custom template shows level and conditional status.
+
+
+SCENARIO 148 — Combined: lifesteal vamp + thorns barrier on a single entity
+----------------------------------------------------------------------------
+
+!match new combo148 Combo 8 8
+!match use combo148
+!ent add vamp Vampire 50 3 3 15
+!ent set_var vamp lifesteal_pct 30
+!ent set_var vamp damage_dealt_this_turn 0
+!ent add target Target 30 5 5 10
+!passive add target thorn_aura on_var_changed target=hp scope=exact "if new_value < old_value:\n    entity[this].hp = entity[this].hp - (old_value - new_value) // 4"
+!ent hp target -20
+!ent info vamp
+!ent info target
+
+Expected: Vampire is current (init=15 > 10). Target takes 20 damage
+(30→10). Target's thorn passive fires: vamp (this) takes 20/4 = 5
+damage. Vampire hp: 50→45. Total: target lost 20, vamp lost 5. (A
+combined lifesteal passive could also be added to the vamp itself.)
+
+
+SCENARIO 149 — End-to-end skill check workflow
+-----------------------------------------------
+
+!match new sk149 Skill 6 6
+!match use sk149
+!ent add hero Hero 30 3 3 10
+!ent set_var hero stat_per 14
+!ent set_var hero skill_athletics 5
+!ent set_var hero last_roll 15
+!eval "entity[hero].last_roll + entity[hero].stat_per // 2 + entity[hero].skill_athletics"
+
+Expected: Skill check total = roll + (stat_per/2) + skill_athletics =
+15 + 7 + 5 = 27. The GM provides last_roll (from external dice), the
+formula computes the total. Compare against a DC.
+
+
+SCENARIO 150 — Demonstration of two scopes interacting
+-------------------------------------------------------
+
+!match new sc150 ScopeMix 6 6
+!match use sc150
+!ent add hero Hero 30 3 3 10
+!ent set_var hero direct_hits 0
+!ent set_var hero deep_hits 0
+!passive add hero direct on_var_changed target=loadout scope=children "entity[self].direct_hits = entity[self].direct_hits + 1"
+!passive add hero deep on_var_changed target=loadout scope=deep "entity[self].deep_hits = entity[self].deep_hits + 1"
+!ent set_var hero loadout.weapon "sword"
+!ent set_var hero loadout.weapon "axe"
+!ent set_var hero loadout.gear.boots "leather"
+!ent set_var hero loadout.gear.boots "iron"
+!ent info hero
+
+Expected: First write: creates loadout, loadout.weapon (children + deep
+both watching at their respective paths fire creation NOT change so
+counters stay 0). Second write changes loadout.weapon (sword→axe):
+direct fires (children of loadout), deep fires. Counters: direct=1,
+deep=1 — wait, deep also matches loadout itself but the changed event
+fires on loadout.weapon. So deep_hits=1. Third write creates
+loadout.gear and loadout.gear.boots (no change event). Fourth changes
+loadout.gear.boots: deep matches (boots is descendant of loadout),
+direct does NOT (boots is two levels deep, not a direct child).
+Final: direct=1 (just the weapon change), deep=2 (weapon and boots
+changes).
+
+Note: this scenario tests the precise scope semantics. Verify by
+inspecting both counters in !ent info.
+
+
+SCENARIO 151 — Demonstration of save/load equivalence
+------------------------------------------------------
+
+!match new eq151 Equiv 6 6
+!match use eq151
+!ent add hero Hero 30 3 3 10
+!ent set_var hero mana 50
+!ent set_var hero inventory.sword.damage 12
+!passive add hero regen on_turn_start "entity[self].mana = entity[self].mana + 5"
+!clamp add hero mana max=100 mode=soft
+!turn next
+!turn next
+!ent info hero
+!store save /tmp/eq151_before.json
+!store load /tmp/eq151_before.json
+!ent info hero
+
+Expected: !ent info before save and after load show identical state.
+This is the strongest validation that serialization is complete and
+lossless — including round count, current entity, turn_started flag,
+passives, clamps, and nested vars.
+
+
+===============================================================================
+COMPOSITION AND COMPOSABILITY
+===============================================================================
+
+
+SCENARIO 152 — Multiple passives on the same hook fire in registration order
+-----------------------------------------------------------------------------
+
+!match new ord152 Order 6 6
+!match use ord152
+!ent add hero Hero 30 3 3 10
+!ent set_var hero log ""
+!passive add hero p1 on_turn_start "entity[self].log = entity[self].log + \"|P1\""
+!passive add hero p2 on_turn_start "entity[self].log = entity[self].log + \"|P2\""
+!passive add hero p3 on_turn_start "entity[self].log = entity[self].log + \"|P3\""
+!turn next
+!ent info hero
+
+Expected: log = "|P1|P2|P3" — passives fire in the order they were
+registered (insertion order in the dict).
+
+
+SCENARIO 153 — Global passive runs BEFORE entity-owned passive
+---------------------------------------------------------------
+
+!match new gvse153 GlobalVsEntity 6 6
+!match use gvse153
+!ent add hero Hero 30 3 3 10
+!ent set_var hero log ""
+!gpassive add g1 on_turn_start "entity[self].log = entity[self].log + \"|G1\""
+!passive add hero e1 on_turn_start "entity[self].log = entity[self].log + \"|E1\""
+!turn next
+!ent info hero
+
+Expected: log = "|G1|E1". Global passives fire first, then entity
+passives — both filtered to the entity whose turn is starting.
+
+
+SCENARIO 154 — Multiple matching var passives all fire on one event
+--------------------------------------------------------------------
+
+!match new mvp154 MultiVarPassives 6 6
+!match use mvp154
+!ent add hero Hero 30 3 3 10
+!ent set_var hero hp_changes 0
+!ent set_var hero written_events 0
+!passive add hero count_changes on_var_changed target=hp scope=exact "entity[self].hp_changes = entity[self].hp_changes + 1"
+!passive add hero count_writes on_var_written target=hp scope=exact "entity[self].written_events = entity[self].written_events + 1"
+!ent hp hero -5
+!ent hp hero 3
+!ent info hero
+
+Expected: hp_changes=2 (both writes produced changes), written_events=2
+(on_var_written catch-all fires for each, since each was a change).
+
+
+SCENARIO 155 — Removing a passive mid-match
+--------------------------------------------
+
+!match new rmid155 RemoveMid 6 6
+!match use rmid155
+!ent add hero Hero 30 3 3 10
+!ent set_var hero ticks 0
+!passive add hero counter on_turn_start "entity[self].ticks = entity[self].ticks + 1"
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+!passive remove hero counter
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+
+Expected: ticks counts up while the passive is active (2 ticks), then
+stays at 2 after the passive is removed.
+
+
+SCENARIO 156 — Buggy passive doesn't crash siblings
+----------------------------------------------------
+
+!match new bug156 BuggyIsolated 6 6
+!match use bug156
+!ent add hero Hero 30 3 3 10
+!ent set_var hero good_tick 0
+!passive add hero buggy on_turn_start "entity[self].crash = 1 / 0"
+!passive add hero good on_turn_start "entity[self].good_tick = entity[self].good_tick + 1"
+!turn next
+!ent info hero
+
+Expected: The buggy passive errors at runtime (division by zero); the
+log shows a "CRASHED" line for it. The good passive still fires
+normally; good_tick=1. Per-passive errors don't abort other passives.
+
+
+SCENARIO 157 — Diagonal directions rejected by default; new arrow glyphs
 ------------------------------------------------------------------------
 
 !match new m29 cardinal_only 8 8
@@ -689,7 +3057,7 @@ False. The cardinal move 'u' still works, leaving Hero at (4,3)
 facing ↑ on the second map.
 
 
-SCENARIO 30 — Enabling diagonal movement and facing
+SCENARIO 158 — Enabling diagonal movement and facing
 ----------------------------------------------------
 
 !match new m30 eight_way 8 8
@@ -715,7 +3083,7 @@ diagonal arrow. Reset the rules afterward with
 if you plan to run other scenarios in the same session.
 
 
-SCENARIO 31 — Rotation via !ent face <cw|ccw> (4-way and 8-way)
+SCENARIO 159 — Rotation via !ent face <cw|ccw> (4-way and 8-way)
 ----------------------------------------------------------------
 
 !match new m31 rotation 8 8
@@ -744,7 +3112,7 @@ alias steps it once more to down), and turn_left rotates one step
 back to down_right.
 
 
-SCENARIO 32 — Rotation snap when current facing is off the rotation ring
+SCENARIO 160 — Rotation snap when current facing is off the rotation ring
 -------------------------------------------------------------------------
 
 !match new m32 rotation_snap 8 8
