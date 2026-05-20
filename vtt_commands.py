@@ -5,7 +5,11 @@ from typing import Callable, Dict, List, Optional, Protocol, Any, Tuple
 from logic import MatchManager, Entity, VTTError, OutOfBounds, Occupied, NotFound, DuplicateId, ReservedId, _coerce_rule_value, _parse_bool
 
 #used for Gamesystem-related commands
-from logic import DEFAULT_SYSTEM_SETTINGS, ALLOWED_DIRECTIONS, RULE_SCHEMA, RULES_REGISTRY
+from logic import (
+    DEFAULT_SYSTEM_SETTINGS, ALLOWED_DIRECTIONS, RULE_SCHEMA, RULES_REGISTRY,
+    CARDINAL_DIRECTIONS, DIAGONAL_DIRECTIONS,
+    normalize_direction, rotate_direction,
+)
 
 # Passive system
 from logic import Passive, HOOK_NAMES
@@ -726,7 +730,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "move":# and len(args) >= 3:
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "move"):
             return
-        eid = _resolve_eid(m, args[1]); 
+        eid = _resolve_eid(m, args[1]);
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
         tokens = " ".join(args[2:]).replace(",", " ").split()
@@ -734,23 +738,28 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             # Defer to help for usage details
             title, body = registry.help_for(["ent","move"])
             return await ctx.send(f"**{title}**\n{body}")
-    
+
+        # The parser accepts any alias normalize_direction handles
+        # (cardinal + diagonal + compass + 1-2 letter forms). The
+        # diagonal rule check lives in Entity.move_dirs — we just need
+        # to recognize tokens here. A token is a direction if it
+        # normalizes; otherwise it's a count to be followed by one.
         moves: list[tuple[str,int]] = []
         i = 0
-        dirs = {"up","down","left","right","u","d","l","r"}
         while i < len(tokens):
-            t = tokens[i].lower()
-            if t in dirs:
+            t = tokens[i]
+            if normalize_direction(t) is not None:
                 moves.append((t, 1)); i += 1
             else:
                 try: n = int(t)
                 except ValueError:
                     return await ctx.send(f"Unexpected token '{t}'.")
                 if i + 1 >= len(tokens): return await ctx.send("Count must be followed by a direction.")
-                d = tokens[i+1].lower()
-                if d not in dirs: return await ctx.send(f"'{d}' is not a direction.")
+                d = tokens[i+1]
+                if normalize_direction(d) is None:
+                    return await ctx.send(f"'{d}' is not a direction.")
                 moves.append((d, n)); i += 2
-    
+
         total_steps = sum(max(1, int(n)) for _, n in moves)
         try:
             m.entities[eid].move_dirs(moves)
@@ -758,21 +767,51 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(f"❌ {e}")
         e = m.entities[eid]
         return await ctx.send(f"Moved `{eid}` {total_steps} step(s) to ({e.x},{e.y}); facing {e.facing}.")
-    
-    # face
-    if sub == "face":# and len(args) >= 3:
+
+    # face — accepts either a direction (any alias) or a rotation token
+    # (cw/ccw/clockwise/counterclockwise). Diagonal direction tokens are
+    # gated by the allow_diagonal_facing rule; rotation tokens always
+    # work, but their step size is 45° (8-way) or 90° (4-way) depending
+    # on that same rule.
+    if sub == "face":
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "face"):
             return
-        eid = _resolve_eid(m, args[1]); 
+        eid = _resolve_eid(m, args[1])
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
-        dir_ = args[2].lower()
-        mapping = {"u":"up","d":"down","l":"left","r":"right"}
-        dir_full = mapping.get(dir_, dir_)
-        if dir_full not in ("up","down","left","right"):
-            return await ctx.send("Use: up/down/left/right")
-        m.entities[eid].facing = dir_full
-        return await ctx.send(f"Facing of `{eid}` set to {dir_full}.")
+        e = m.entities[eid]
+        raw = args[2].strip().lower()
+        eight_way_face = bool(m.rules.get("allow_diagonal_facing", False))
+
+        rotation_aliases_cw = {"cw", "clockwise", "right_turn", "turn_right"}
+        rotation_aliases_ccw = {"ccw", "counterclockwise", "anticlockwise",
+                                "left_turn", "turn_left"}
+        if raw in rotation_aliases_cw or raw in rotation_aliases_ccw:
+            clockwise = raw in rotation_aliases_cw
+            new_facing = rotate_direction(
+                e.facing, clockwise=clockwise, eight_way=eight_way_face,
+            )
+            e.facing = new_facing
+            label = "clockwise" if clockwise else "counterclockwise"
+            return await ctx.send(
+                f"Rotated `{eid}` {label}; now facing {new_facing}."
+            )
+
+        canon = normalize_direction(raw)
+        if canon is None:
+            return await ctx.send(
+                "Use: up/down/left/right (or up_left/up_right/down_left/"
+                "down_right when allow_diagonal_facing is enabled), or "
+                "cw/ccw to rotate."
+            )
+        if canon in DIAGONAL_DIRECTIONS and not eight_way_face:
+            raise VTTError(
+                f"Diagonal facing '{raw}' is not allowed by the active "
+                f"game system. Enable rule 'allow_diagonal_facing' to "
+                f"permit it."
+            )
+        e.facing = canon
+        return await ctx.send(f"Facing of `{eid}` set to {canon}.")
 
     # hp
     if sub == "hp":# and len(args) >= 3:
@@ -971,12 +1010,24 @@ registry.annotate_sub(
 registry.annotate_sub(
     "ent", "move",
     usage="!ent move <id> <dir[,dir...]> | !ent move <id> <n> <dir> [<n> <dir> ...]",
-    desc="Stepwise move; directions: up/down/left/right (u/d/l/r). Final cell must be free."
+    desc=(
+        "Stepwise move; final cell must be free. Directions: up/down/left/"
+        "right (aliases u/d/l/r, n/s/w/e). Diagonals up_left/up_right/"
+        "down_left/down_right (aliases ul/ur/dl/dr, nw/ne/sw/se, or "
+        "hyphen/no-separator variants like 'up-left' / 'upleft') are only "
+        "accepted when the system rule 'allow_diagonal_movement' is True."
+    ),
 )
 registry.annotate_sub(
     "ent", "face",
-    usage="!ent face <id> <dir>",
-    desc="Set facing to up/down/left/right (aliases: u/d/l/r)."
+    usage="!ent face <id> <dir|cw|ccw>",
+    desc=(
+        "Set or rotate facing. <dir> accepts the same direction aliases as "
+        "!ent move (cardinals always; diagonals only when "
+        "'allow_diagonal_facing' is enabled). Use 'cw'/'clockwise' or "
+        "'ccw'/'counterclockwise' to rotate one step — 90° in cardinal-"
+        "only systems, 45° when diagonal facing is enabled."
+    ),
 )
 registry.annotate_sub(
     "ent", "hp",
