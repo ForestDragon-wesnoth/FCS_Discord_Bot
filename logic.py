@@ -68,18 +68,25 @@ DIRECTION_CW_ORDER_8: Tuple[str, ...] = (
     "down", "down_left", "left", "up_left",
 )
 
-# Single-cell-width unicode arrows for ASCII map rendering. All from the
-# U+2190 mathematical-arrows block so the eight glyphs share a visual
-# style (replaces the older ^v<> ASCII set, which had no diagonal forms).
+# Single-cell ASCII glyphs for ASCII map rendering. Diagonals use the
+# slash whose line matches the diagonal axis: '\' for the NW-SE pair
+# (up_left, down_right) and '/' for the NE-SW pair (up_right, down_left).
+# That means the two glyphs in each pair are AMBIGUOUS — you can't tell
+# from the map alone whether a '\' is facing NW or SE. The exact facing
+# is always visible via !ent dump / !ent info. We use ASCII here rather
+# than the prettier unicode arrows (↖↗↘↙) because those four glyphs
+# aren't in CP437 and don't render in the default Windows terminal font.
+# The cardinal pair (^ v < >) is unambiguous and matches the historical
+# pre-diagonal symbol set.
 DIRECTION_ARROWS: Dict[str, str] = {
-    "up":         "↑",
-    "down":       "↓",
-    "left":       "←",
-    "right":      "→",
-    "up_left":    "↖",
-    "up_right":   "↗",
-    "down_left":  "↙",
-    "down_right": "↘",
+    "up":         "^",
+    "down":       "v",
+    "left":       "<",
+    "right":      ">",
+    "up_left":    "\\",
+    "up_right":   "/",
+    "down_left":  "/",
+    "down_right": "\\",
 }
 
 # Maps every accepted alias to the canonical direction name. The parser
@@ -2263,7 +2270,7 @@ class Match:
             if not getattr(e, "is_alive", True):
                 continue
             if self.in_bounds(e.x, e.y):
-                sym = DIRECTION_ARROWS.get(getattr(e, "facing", ""), "•")
+                sym = DIRECTION_ARROWS.get(getattr(e, "facing", ""), "@")
                 grid[e.y][e.x] = sym
 
         # Skip the 0th row entirely to preserve 1-based coordinates

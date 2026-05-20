@@ -3032,8 +3032,8 @@ log shows a "CRASHED" line for it. The good passive still fires
 normally; good_tick=1. Per-passive errors don't abort other passives.
 
 
-SCENARIO 157 — Diagonal directions rejected by default; new arrow glyphs
-------------------------------------------------------------------------
+SCENARIO 157 — Diagonal directions rejected by default
+-------------------------------------------------------
 
 !match new m29 cardinal_only 8 8
 !match use m29
@@ -3047,14 +3047,12 @@ SCENARIO 157 — Diagonal directions rejected by default; new arrow glyphs
 !ent move hero u
 !map
 
-Expected: !ent face hero up and the !map render show the new unicode
-arrow glyphs (↑↓←→↖↗↘↙) instead of the legacy ^v<> ASCII set — Hero
-should appear as ↑ at (4,4) on the first map. Both diagonal move
-attempts (ne, up_right) and both diagonal face attempts (up_left, nw)
-are rejected with "Diagonal ... not allowed" errors, since
-allow_diagonal_movement and allow_diagonal_facing both default to
-False. The cardinal move 'u' still works, leaving Hero at (4,3)
-facing ↑ on the second map.
+Expected: Hero renders as ^ on the first map (single-cell ASCII glyph,
+unambiguous for cardinals). Both diagonal move attempts (ne, up_right)
+and both diagonal face attempts (up_left, nw) are rejected with
+"Diagonal ... not allowed" errors, since allow_diagonal_movement and
+allow_diagonal_facing both default to False. The cardinal move 'u'
+still works, leaving Hero at (4,3) facing ^ on the second map.
 
 
 SCENARIO 158 — Enabling diagonal movement and facing
@@ -3073,11 +3071,13 @@ SCENARIO 158 — Enabling diagonal movement and facing
 !ent dump hero
 
 Expected: After enabling both diagonal rules and refreshing the live
-match, Hero starts at (4,4). 'ne' moves to (5,3) facing up_right (↗);
-'2 down_right' moves to (7,5) facing down_right (↘). The face commands
-accept compact ('ul' → up_left), hyphenated ('south-east' → down_right),
-and any other alias forms. The map renders Hero with the corresponding
-diagonal arrow. Reset the rules afterward with
+match, Hero starts at (4,4). 'ne' moves to (5,3) facing up_right;
+'2 down_right' moves to (7,5) facing down_right. The face commands
+accept compact ('ul' → up_left), hyphenated ('south-east' →
+down_right), and any other alias forms. The map renders Hero as a
+diagonal slash glyph — '/' for up_right/down_left, '\\' for
+up_left/down_right (ambiguous within each pair; check !ent dump for
+exact facing). Reset the rules afterward with
   !system set default allow_diagonal_movement false
   !system set default allow_diagonal_facing false
 if you plan to run other scenarios in the same session.
