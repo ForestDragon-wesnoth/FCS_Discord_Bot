@@ -35,8 +35,123 @@ class ReservedId(VTTError):
 # -------------------------
 # Types & helpers
 # -------------------------
-Direction = Literal["up", "down", "left", "right"]
-ALLOWED_DIRECTIONS: Set[str] = {"up", "down", "left", "right"}
+# Directions cover the full 8-way set. Whether diagonals are actually
+# usable for movement or facing is gated by per-system rules
+# (allow_diagonal_movement, allow_diagonal_facing), checked at the
+# command/move layer. The constant sets below are engine-wide and
+# don't change with system settings.
+Direction = Literal[
+    "up", "down", "left", "right",
+    "up_left", "up_right", "down_left", "down_right",
+]
+CARDINAL_DIRECTIONS: Set[str] = {"up", "down", "left", "right"}
+DIAGONAL_DIRECTIONS: Set[str] = {"up_left", "up_right", "down_left", "down_right"}
+ALLOWED_DIRECTIONS: Set[str] = CARDINAL_DIRECTIONS | DIAGONAL_DIRECTIONS
+
+# Per-step deltas. y grows downward (1-based grid; (1,1) is the top-left).
+DIRECTION_VECTORS: Dict[str, Tuple[int, int]] = {
+    "up":         ( 0, -1),
+    "down":       ( 0,  1),
+    "left":       (-1,  0),
+    "right":      ( 1,  0),
+    "up_left":    (-1, -1),
+    "up_right":   ( 1, -1),
+    "down_left":  (-1,  1),
+    "down_right": ( 1,  1),
+}
+
+# Clockwise rotation orders. The 4-way variant is used when
+# allow_diagonal_facing is off; the 8-way when it's on. Both start at "up".
+DIRECTION_CW_ORDER_4: Tuple[str, ...] = ("up", "right", "down", "left")
+DIRECTION_CW_ORDER_8: Tuple[str, ...] = (
+    "up", "up_right", "right", "down_right",
+    "down", "down_left", "left", "up_left",
+)
+
+# Single-cell-width unicode arrows for ASCII map rendering. All from the
+# U+2190 mathematical-arrows block so the eight glyphs share a visual
+# style (replaces the older ^v<> ASCII set, which had no diagonal forms).
+DIRECTION_ARROWS: Dict[str, str] = {
+    "up":         "↑",
+    "down":       "↓",
+    "left":       "←",
+    "right":      "→",
+    "up_left":    "↖",
+    "up_right":   "↗",
+    "down_left":  "↙",
+    "down_right": "↘",
+}
+
+# Maps every accepted alias to the canonical direction name. The parser
+# also strips hyphens and lowercases before lookup, so "Up-Left" matches
+# "up_left" without needing a separate entry.
+_DIRECTION_ALIASES: Dict[str, str] = {
+    # Cardinals
+    "up": "up", "u": "up", "north": "up", "n": "up",
+    "down": "down", "d": "down", "south": "down", "s": "down",
+    "left": "left", "l": "left", "west": "left", "w": "left",
+    "right": "right", "r": "right", "east": "right", "e": "right",
+    # Diagonals — canonical underscore form, separator-free, two-letter,
+    # and the four compass abbreviations.
+    "up_left": "up_left", "upleft": "up_left", "ul": "up_left",
+    "northwest": "up_left", "north_west": "up_left", "nw": "up_left",
+    "up_right": "up_right", "upright": "up_right", "ur": "up_right",
+    "northeast": "up_right", "north_east": "up_right", "ne": "up_right",
+    "down_left": "down_left", "downleft": "down_left", "dl": "down_left",
+    "southwest": "down_left", "south_west": "down_left", "sw": "down_left",
+    "down_right": "down_right", "downright": "down_right", "dr": "down_right",
+    "southeast": "down_right", "south_east": "down_right", "se": "down_right",
+}
+
+
+def normalize_direction(token: str) -> Optional[str]:
+    """Map any user-provided direction alias to its canonical name.
+
+    Accepts cardinals (up/down/left/right + u/d/l/r + n/s/e/w + compass
+    names), diagonals (up_left/up-left/upleft/ul/nw and so on), and is
+    case-insensitive. Returns None for unrecognized input — callers
+    typically raise VTTError with their own message in that case.
+
+    Does NOT check whether the canonical direction is permitted by the
+    current game system; that's the caller's job (see Entity.move_dirs
+    and the !ent face command for the allow_diagonal_* rule gating).
+    """
+    if not isinstance(token, str):
+        return None
+    t = token.strip().lower().replace("-", "_")
+    return _DIRECTION_ALIASES.get(t)
+
+
+def rotate_direction(facing: str, *, clockwise: bool, eight_way: bool) -> str:
+    """Return the next direction one rotation step from `facing`.
+
+    eight_way=True  rotates through all 8 directions (cardinals + diagonals).
+    eight_way=False rotates only through the 4 cardinals.
+
+    If `facing` is a diagonal but eight_way is False (e.g. the system was
+    flipped after an entity was already facing diagonally), we snap to
+    the nearest cardinal in the rotation direction in a single step,
+    rather than spinning through diagonals the system has just disallowed.
+    Unknown facings degrade to "up".
+    """
+    order = DIRECTION_CW_ORDER_8 if eight_way else DIRECTION_CW_ORDER_4
+    if facing not in order:
+        # Off-axis: snap to the nearest in `order` along the rotation
+        # direction. We walk the full 8-way ring one step at a time and
+        # return the first entry that lives in our reduced order.
+        full = DIRECTION_CW_ORDER_8
+        if facing not in full:
+            return order[0]
+        idx_full = full.index(facing)
+        step = 1 if clockwise else -1
+        for off in range(1, len(full) + 1):
+            cand = full[(idx_full + off * step) % len(full)]
+            if cand in order:
+                return cand
+        return order[0]
+    idx = order.index(facing)
+    step = 1 if clockwise else -1
+    return order[(idx + step) % len(order)]
 
 
 # ---- Rule registry & model ---------------------------------------------------
@@ -70,7 +185,36 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     "spawn_default_facing": {
         "default": "up",
         "schema": {"type": "enum", "choices": ALLOWED_DIRECTIONS},
-        "desc": "Default facing used when spawn_face_toward_center is False.",
+        "desc": (
+            "Default facing used when spawn_face_toward_center is False. "
+            "Diagonal values (up_left/up_right/down_left/down_right) only "
+            "take effect when allow_diagonal_facing is also True; otherwise "
+            "they fall back to 'up' at spawn time."
+        ),
+    },
+    # Diagonal direction support
+    "allow_diagonal_movement": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "If True, !ent move accepts diagonal directions (up_left, "
+            "up_right, down_left, down_right and their aliases like ul/ne). "
+            "Each diagonal step moves one cell on both axes simultaneously. "
+            "Off by default — diagonal-aware systems must opt in."
+        ),
+    },
+    "allow_diagonal_facing": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "If True, entities may face one of the four diagonals; "
+            "!ent face accepts diagonal tokens; !ent face <cw|ccw> rotates "
+            "through 8 directions; and a diagonal move (if allowed) updates "
+            "facing to the matching diagonal. When False, all of those "
+            "collapse to the nearest cardinal. Independent of "
+            "allow_diagonal_movement — you can have diagonal facing without "
+            "diagonal movement, or vice versa."
+        ),
     },
     # OPTIONS THAT ARE NOT YET IMPLEMENTED (examples for future)
     ##UI rules:
@@ -243,19 +387,31 @@ def _coerce_rule_value(key: str, raw_value: str):
     raise VTTError(f"Invalid schema for setting '{key}'.")
 
 
-def _dominant_axis_dir(dx: int, dy: int) -> Direction:
-    # ties prefer vertical
+def _dominant_axis_dir(dx: int, dy: int, *, eight_way: bool = False) -> Direction:
+    """Pick a facing direction from a (dx, dy) vector pointing where the
+    entity should look. Ties prefer vertical for the cardinal case
+    (preserves the historical behavior of the 4-way version).
+
+    In 8-way mode, when both components are non-zero we return a diagonal;
+    a pure-axis vector still resolves to the matching cardinal.
+    """
+    if eight_way and dx != 0 and dy != 0:
+        v = "up" if dy < 0 else "down"
+        h = "left" if dx < 0 else "right"
+        return f"{v}_{h}"
     if abs(dy) >= abs(dx):
         return "down" if dy > 0 else "up"
-    else:
-        return "right" if dx > 0 else "left"
+    return "right" if dx > 0 else "left"
 
-def _default_facing_for(x: int, y: int, width: int, height: int) -> Direction:
+
+def _default_facing_for(
+    x: int, y: int, width: int, height: int, *, eight_way: bool = False,
+) -> Direction:
     cx = (width + 1) / 2
     cy = (height + 1) / 2
     dx = cx - x
     dy = cy - y
-    return _dominant_axis_dir(int(round(dx)), int(round(dy)))
+    return _dominant_axis_dir(int(round(dx)), int(round(dy)), eight_way=eight_way)
 
 
 # ---------- Special/reserved id registry (like how "this" or "current" is the entity whose turn it is right now, "self" is usually the entity directly affected ay a command regardless of turn order") ----------
@@ -1259,20 +1415,33 @@ class Entity:
     # Stepwise move (final cell must be free; rotate per step)
     def move_dirs(self, moves: list[tuple[str, int]]):
         m = self._require_match()
+        allow_diag_move = bool(m.rules.get("allow_diagonal_movement", False))
+        allow_diag_face = bool(m.rules.get("allow_diagonal_facing", False))
+
         x, y = self.x, self.y
         for direction, count in moves:
-            d = direction.lower()
-            dx, dy = 0, 0
-            if d in ("up", "u"): dy = -1
-            elif d in ("down", "d"): dy = 1
-            elif d in ("left", "l"): dx = -1
-            elif d in ("right", "r"): dx = 1
-            else: raise VTTError(f"Unknown direction '{direction}'")
+            canon = normalize_direction(direction)
+            if canon is None:
+                raise VTTError(f"Unknown direction '{direction}'")
+            if canon in DIAGONAL_DIRECTIONS and not allow_diag_move:
+                raise VTTError(
+                    f"Diagonal direction '{direction}' is not allowed by "
+                    f"the active game system. Enable rule "
+                    f"'allow_diagonal_movement' to permit it."
+                )
+            dx, dy = DIRECTION_VECTORS[canon]
+            # Per-step facing: diagonal moves update facing to the matching
+            # diagonal IFF the system allows diagonal facing. Otherwise we
+            # snap to the vertical component (preserves the legacy
+            # "ties-prefer-vertical" feel for cardinal-only systems).
+            step_facing = canon
+            if canon in DIAGONAL_DIRECTIONS and not allow_diag_face:
+                step_facing = "up" if dy < 0 else "down"
             for _ in range(max(1, int(count))):
                 nx, ny = x + dx, y + dy
                 if not m.in_bounds(nx, ny):
                     raise OutOfBounds(f"({nx},{ny}) outside {m.grid_width}x{m.grid_height}")
-                self.facing = {(-1,0):"left",(1,0):"right",(0,-1):"up",(0,1):"down"}[(dx,dy)]
+                self.facing = step_facing
                 x, y = nx, ny
         if m.is_occupied(x, y, ignore_entity_id=self.id):
             raise Occupied(f"Cell ({x},{y}) already occupied")
@@ -2088,26 +2257,34 @@ class Match:
             ["." for _ in range(self.grid_width + 1)]
             for _ in range(self.grid_height + 1)
         ]
-    
-        arrows = {"up": "^", "down": "v", "left": "<", "right": ">"}
-    
+
         for e in self.entities.values():
             # Keep old semantics: skip dead entities
             if not getattr(e, "is_alive", True):
                 continue
             if self.in_bounds(e.x, e.y):
-                sym = arrows.get(getattr(e, "facing", ""), "@")
+                sym = DIRECTION_ARROWS.get(getattr(e, "facing", ""), "•")
                 grid[e.y][e.x] = sym
-    
+
         # Skip the 0th row entirely to preserve 1-based coordinates
         lines = [" ".join(row[1:]) for row in grid[1:]]
         return "\n".join(lines)
 
     def _spawn_facing(self, x: int, y: int) -> Direction:
+        eight_way = bool(self.rules.get("allow_diagonal_facing", False))
         if self.rules.get("spawn_face_toward_center", True):
-            return _default_facing_for(x, y, self.grid_width, self.grid_height)
+            return _default_facing_for(
+                x, y, self.grid_width, self.grid_height, eight_way=eight_way,
+            )
         d = self.rules.get("spawn_default_facing", "up")
-        return d if d in ALLOWED_DIRECTIONS else "up"
+        if d not in ALLOWED_DIRECTIONS:
+            return "up"
+        # If the system disallows diagonal facing but spawn_default_facing
+        # is set to one, fall back rather than silently producing a state
+        # the system says shouldn't exist.
+        if d in DIAGONAL_DIRECTIONS and not eight_way:
+            return "up"
+        return d
 
     def entities_in_turn_order(self) -> List["Entity"]:
         # Returns Entity objects in current turn order; appends any missing at the end
