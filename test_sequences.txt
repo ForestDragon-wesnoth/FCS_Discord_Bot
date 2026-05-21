@@ -3620,3 +3620,125 @@ twice in a row would give two independent rolls, which is rarely
 what a GM wants for a "roll once and react" pattern — using an
 entity var (or any formula-readable storage) is the idiom for
 memoizing the roll.
+
+
+SCENARIO 176 — Team is now an entity var, readable and writable from formulas
+------------------------------------------------------------------------------
+
+!match new mteam1 TeamAsVar 8 8
+!match use mteam1
+!ent add a A 10 1 1 10
+!ent add b B 10 2 1 11
+!ent set_var a team red
+!ent set_var b team blue
+!ent info a
+!ent info b
+!eval entity[a].team
+!eval entity[b].team
+!eval 'entity[a].team == "red"'
+!eval 'entity[b].team == "red"'
+!eval 'entity[a].team = "purple"'
+!ent info a
+!eval entity[a].team
+!system new sci_fi
+!system set sci_fi team_var faction
+!match new mteam2 SciFi 8 8 system=sci_fi
+!match use mteam2
+!ent add s1 Ship1 10 1 1 10
+!ent set_var s1 faction federation
+!ent info s1
+!eval entity[s1].faction
+!eval entity[s1].team
+
+Expected: Team has been demoted from a dedicated dataclass field to
+an ordinary entity var, configured via the new `team_var` rule
+(default key: "team"). That means:
+
+  - !ent set_var <id> team <value> is the canonical way to assign
+    or change an entity's team. No special command is needed; teams
+    are just strings stored under the team_var key.
+  - !ent info still shows `Team: red` because the e.team property
+    reads vars[team_var] under the hood, and the entity_line_format /
+    entity_info_format templates haven't changed.
+  - Formulas can read teams via entity[X].team (when team_var is
+    "team"). String literals inside the formula need quotes that
+    survive shell tokenization — wrap the whole expression in
+    single quotes so the inner double quotes reach the formula
+    engine: !eval 'entity[a].team == "red"' returns True, the
+    mismatched variant returns False. Useful for "if entity[self]
+    .team == entity[this].team" friendly-fire checks inside
+    passives.
+  - Formulas can WRITE teams the same way: entity[a].team = "purple"
+    propagates through write_var (firing on_var_changed hooks, the
+    same as any other var write) and !ent info reflects the new
+    value on the next call.
+  - The second match opts into a custom team_var = "faction" via a
+    custom game system. The same entity now exposes its team as
+    entity[s1].faction — entity[s1].team raises "Variable 'team' is
+    not defined" because that key doesn't exist on the entity. The
+    e.team Python property still works (it dereferences team_var per
+    match), so the !ent info card still shows the team — only the
+    formula path is sensitive to the renamed key, mirroring how
+    hp_var/max_hp_var rename hp / max_hp in formulas without
+    breaking !ent info's display.
+
+
+SCENARIO 177 — Friendly-fire damage aura via a team check inside a global passive
+----------------------------------------------------------------------------------
+
+!match new mteam3 FriendlyFire 8 8
+!match use mteam3
+!ent add knight Knight 30 1 1 10
+!ent add archer Archer 30 2 1 11
+!ent add goblin Goblin 30 3 1 12
+!ent set_var knight team alliance
+!ent set_var archer team alliance
+!ent set_var goblin team horde
+!gpassive add aura on_round_start 'entity[self].hp = entity[self].hp - 5 if entity[self].team != entity[this].team else entity[self].hp'
+!turn next
+!ent info knight
+!ent info archer
+!ent info goblin
+!turn next
+!turn next
+!turn next
+!ent info knight
+!ent info archer
+!ent info goblin
+
+Expected: The `aura` global passive runs on_round_start, which fires
+for EVERY entity in turn-order (unlike on_turn_start which fires
+only for the entity whose turn just began). For each fire the
+formula inspects the team of the entity it's being applied to
+(entity[self].team) versus the team of whoever's turn it is right
+then (entity[this].team). When the teams differ the entity takes 5
+damage; when they match the formula evaluates to the entity's
+current hp (a no-op write).
+
+Turn order is sorted by initiative descending: [Goblin (12), Archer
+(11), Knight (10)]. Match.active_index starts at the last-spawned
+entity, so the first turn-next opens round 1 with this=knight. The
+on_round_start hook fires once per entity:
+  - Goblin (horde) != knight (alliance) → Goblin loses 5
+  - Archer & Knight (alliance) == knight (alliance) → no damage
+After turn-next #1: Goblin 25/30, Archer 30/30, Knight 30/30.
+
+The next three turn-nexts advance through the turn cycle. Turn-next
+#2 wraps the active_index past the end, firing on_round_end /
+on_round_start for round 2 — and on this round this=goblin (the
+new round-opener). The aura fires again per entity:
+  - Knight & Archer (alliance) != goblin (horde) → each loses 5
+  - Goblin (horde) == goblin → no damage
+Turn-nexts #3 and #4 stay inside round 2 (no wrap, no
+on_round_start), so the totals don't move further.
+After turn-next #4: Goblin 25/30, Archer 25/30, Knight 25/30 —
+exactly the symmetric cross-team damage you'd expect over the
+course of two rounds.
+
+This wouldn't have been expressible before — team was a Python-only
+dataclass field, invisible to the formula engine. Putting it in
+vars makes it a first-class part of the formula vocabulary, which
+unlocks the "friendly fire on/off" pattern as a one-line passive.
+The single quotes around the formula are shell quoting (the inner
+double quotes around team names need to survive shlex tokenization
+to reach the formula parser intact).
