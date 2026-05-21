@@ -320,8 +320,14 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   tile_get(5, 5, "flame.burn_damage")   -> 5     or raises if absent
     #   tile_has(5, 5, "flame.burn_damage")   -> bool  (False on absent /
     #                                                  off-grid coords)
-    # Reads only in this PR; mutation comes later with tile hooks.
-    "tile_get", "tile_has",
+    #   tile_set(5, 5, "flame.burn_damage", v) -> v   write at dotted path
+    #   tile_del(5, 5, "flame.burn_damage")   -> bool (True iff present)
+    #   tile_clear(5, 5)                      -> bool (True iff the tile
+    #                                                  had any data to drop)
+    # The mutating trio (set/del/clear) is meant for use INSIDE tile
+    # hooks — a landmine's on_enter can deal damage and call
+    # tile_clear() to self-destruct in one formula.
+    "tile_get", "tile_has", "tile_set", "tile_del", "tile_clear",
 )
 
 _ALLOWED_NODES: Tuple[type, ...] = (
@@ -363,6 +369,18 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
                         # OR if the write used bypass_clamp at the command
                         # layer (bypassing was a deliberate choice, not a
                         # clamp engagement).
+    "tile_x",           # The firing tile's x coordinate. Bound during
+                        # tile-hook evaluation (on_enter / on_exit /
+                        # on_stop); None elsewhere. Redundant with
+                        # entity[self].x in on_enter / on_stop (entity
+                        # is AT the tile) but distinct in on_exit
+                        # (entity is still at the OLD coords during
+                        # the hook — tile_x and entity[self].x happen
+                        # to agree there too with the current "fire
+                        # before move" timing, but the distinction
+                        # matters if the hook moves the entity
+                        # mid-fire via a future entity-tp formula).
+    "tile_y",           # See tile_x.
 )
 
 
@@ -764,6 +782,87 @@ class FormulaEngine:
 
         ns["tile_get"] = _tile_get
         ns["tile_has"] = _tile_has
+
+        # Mutating tile functions. tile_set / tile_del / tile_clear
+        # forward to Match.tile_set_path / tile_del_path / direct dict
+        # mutation respectively. These are meant for use INSIDE tile
+        # hooks (e.g. a landmine's on_enter clearing itself after
+        # dealing damage), but they're also callable from any other
+        # formula context. No recursion guard is needed in this PR
+        # because tile data writes don't trigger var events, and the
+        # formula engine can't move entities (writes to entity[X].x
+        # are blocked); a hook can't reentrantly fire more tile hooks
+        # from within itself.
+        def _tile_set(x: Any, y: Any, path: Any, value: Any) -> Any:
+            if not isinstance(x, int) or isinstance(x, bool):
+                raise FormulaError(
+                    f"tile_set(x, y, path, value): x must be int, got "
+                    f"{type(x).__name__}."
+                )
+            if not isinstance(y, int) or isinstance(y, bool):
+                raise FormulaError(
+                    f"tile_set(x, y, path, value): y must be int, got "
+                    f"{type(y).__name__}."
+                )
+            if not isinstance(path, str):
+                raise FormulaError(
+                    f"tile_set(x, y, path, value): path must be str, got "
+                    f"{type(path).__name__}."
+                )
+            try:
+                match.tile_set_path(x, y, path, value)
+            except VTTError as ex:
+                raise FormulaError(str(ex))
+            return value
+
+        def _tile_del(x: Any, y: Any, path: Any) -> bool:
+            if not isinstance(x, int) or isinstance(x, bool):
+                raise FormulaError(
+                    f"tile_del(x, y, path): x must be int, got "
+                    f"{type(x).__name__}."
+                )
+            if not isinstance(y, int) or isinstance(y, bool):
+                raise FormulaError(
+                    f"tile_del(x, y, path): y must be int, got "
+                    f"{type(y).__name__}."
+                )
+            if not isinstance(path, str):
+                raise FormulaError(
+                    f"tile_del(x, y, path): path must be str, got "
+                    f"{type(path).__name__}."
+                )
+            # Pre-check existence so we can return True/False instead
+            # of raising on a missing path — formulas chaining
+            # tile_del calls would otherwise need a tile_has guard
+            # for each one. Match.tile_del_path raises NotFound on
+            # absent paths; we swallow that and return False.
+            if not match.tile_has_path(x, y, path):
+                return False
+            try:
+                match.tile_del_path(x, y, path)
+            except VTTError as ex:
+                raise FormulaError(str(ex))
+            return True
+
+        def _tile_clear(x: Any, y: Any) -> bool:
+            if not isinstance(x, int) or isinstance(x, bool):
+                raise FormulaError(
+                    f"tile_clear(x, y): x must be int, got "
+                    f"{type(x).__name__}."
+                )
+            if not isinstance(y, int) or isinstance(y, bool):
+                raise FormulaError(
+                    f"tile_clear(x, y): y must be int, got "
+                    f"{type(y).__name__}."
+                )
+            if (x, y) not in match.tiles:
+                return False
+            del match.tiles[(x, y)]
+            return True
+
+        ns["tile_set"] = _tile_set
+        ns["tile_del"] = _tile_del
+        ns["tile_clear"] = _tile_clear
 
         return ns
 
