@@ -28,6 +28,12 @@ class DuplicateId(VTTError):
 class ReservedId(VTTError):
     pass
 
+# Imported AFTER the exception classes so match_history.py can subclass
+# VTTError for HistoryError. logic and match_history have a circular
+# dependency, broken by importing match_history late here and importing
+# VTTError eagerly from match_history's side.
+from match_history import MatchHistory
+
 # -------------------------
 # Data Models
 # -------------------------
@@ -277,6 +283,86 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "'off' = no warnings; 'minimal' = warn only on recursion-limit "
             "hits (default); 'detailed' = also annotate every destructive "
             "write with the count of removed keys."
+        ),
+    },
+    # ---- Match history / autosave / undo --------------------------------
+    # The MatchHistory module (see match_history.py) takes three kinds of
+    # autosave: round-start (after on_round_start hooks), turn-start
+    # (after on_turn_start hooks), and pre-command (before each mutating
+    # command). The three rules below cap how much of each is kept; the
+    # three thresholds below them gate the "are you sure?" prompt for
+    # destructive undos. Manual saves (!history save <name>) are exempt
+    # from all retention pruning.
+    #
+    # For all six values, -1 means "unlimited / disable check" and 0
+    # means "disable that snapshot kind / prompt entirely".
+    "autosave_round_retention": {
+        "default": -1,
+        "schema": {"type": "int"},
+        "desc": (
+            "Cap on retained round-start autosaves. -1 = unlimited (default; "
+            "the original spec is 'every start of round, for the entirety of "
+            "the match'). 0 = disable round autosaves. N>0 = keep the most "
+            "recent N round-start snapshots. Round-start snapshots are taken "
+            "AFTER on_round_start hooks fire, so restoring one puts the "
+            "match at the state players would have seen as the round began."
+        ),
+    },
+    "autosave_turn_retention_rounds": {
+        "default": 3,
+        "schema": {"type": "int"},
+        "desc": (
+            "How many rounds' worth of turn-start autosaves to keep. -1 = "
+            "unlimited (one per entity per round, forever — memory-heavy "
+            "for long matches). 0 = disable turn autosaves entirely. "
+            "Default 3 = three most recent rounds. Turn-start snapshots "
+            "are taken AFTER on_turn_start hooks fire, so restoring one "
+            "puts the match at the state players would have seen as that "
+            "turn began."
+        ),
+    },
+    "autosave_command_retention_turns": {
+        "default": 3,
+        "schema": {"type": "int"},
+        "desc": (
+            "How many turns' worth of pre-command autosaves to keep. -1 = "
+            "unlimited. 0 = disable command autosaves entirely. Default 3 = "
+            "all commands from the last three turns. Pre-command snapshots "
+            "are taken before each MUTATING command runs and skipped when "
+            "the command turns out to be a no-op (e.g. !ent info, !map). "
+            "This gives users fine-grained undo at the cost of more "
+            "snapshots than the round/turn levels."
+        ),
+    },
+    "undo_confirmation_turn_threshold": {
+        "default": 3,
+        "schema": {"type": "int"},
+        "desc": (
+            "Undoing this many or more turns requires the user to repeat the "
+            "command with a trailing `confirm` token. Smaller undos go "
+            "through silently. Default 3. -1 disables the prompt entirely; "
+            "0 means every turn-undo prompts (since 'n >= 0' is always true "
+            "for a valid undo)."
+        ),
+    },
+    "undo_confirmation_round_threshold": {
+        "default": 1,
+        "schema": {"type": "int"},
+        "desc": (
+            "Undoing this many or more rounds requires `confirm`. Default 1 "
+            "(any round-undo prompts, since a round is a lot of state). -1 "
+            "disables. The same `confirm` token applies to `!history undo "
+            "to round X` regardless of distance — that command is "
+            "conceptually a 'big jump' and always prompts."
+        ),
+    },
+    "undo_confirmation_command_threshold": {
+        "default": -1,
+        "schema": {"type": "int"},
+        "desc": (
+            "Undoing this many or more commands requires `confirm`. Default "
+            "-1 = never prompt (commands are small-grain, low-risk). Set a "
+            "positive value to require confirmation past that count."
         ),
     },
     "default_clamps": {
@@ -1833,6 +1919,14 @@ class Match:
     #global passives that apply to every entity in turn order on each hook fire
     global_passives: Dict[str, Passive] = field(default_factory=dict)
 
+    # Per-match save history (round/turn/command autosaves + manual
+    # saves + undo). Lives in memory on the Match instance so it
+    # vanishes when the match is removed from the MatchManager —
+    # explicit cleanup isn't needed. Excluded from to_dict() by
+    # default; pass include_history=True to bundle it into the save
+    # file (used by `!store save <path> include_history=yes`).
+    history: MatchHistory = field(default_factory=MatchHistory)
+
     # Group registry. Keyed by group name → ordered list of entity ids
     # belonging to that group. An entity can belong to any number of
     # groups; a group can be empty. Groups live separately from entity
@@ -1918,8 +2012,14 @@ class Match:
         if not self.round_started:
             self.round_started = True
             log.extend(self.fire_hook("on_round_start"))
+            # Autosave: round start happens after on_round_start hooks
+            # so that restoring the snapshot gives the players the
+            # state they would have seen as the round began (with any
+            # hook side-effects already applied).
+            self.history.record_round(self)
             cur = self.turn_order[self.active_index]
             log.extend(self.fire_hook("on_turn_start", target_ids=[cur]))
+            self.history.record_turn(self)
             return (cur, log)
 
         # Normal transition.
@@ -1933,8 +2033,14 @@ class Match:
         if wrapped:
             self.turn_number += 1
             log.extend(self.fire_hook("on_round_start"))
+            # Autosave round start AFTER turn_number is bumped and
+            # on_round_start hooks have fired, mirroring the first-call
+            # path above. Snapshot.round_at_snapshot will record the
+            # *new* round number, matching the round players are in.
+            self.history.record_round(self)
         new_cur = self.turn_order[self.active_index]
         log.extend(self.fire_hook("on_turn_start", target_ids=[new_cur]))
+        self.history.record_turn(self)
         return (new_cur, log)
 
     def _effective_clamp(self, entity: "Entity", path: str) -> Optional["ClampSpec"]:
@@ -2231,8 +2337,18 @@ class Match:
         del self.global_passives[pid]
 
     # ---- persistence ----
-    def to_dict(self) -> Dict[str, Any]:
-        return {
+    def to_dict(self, include_history: bool = False) -> Dict[str, Any]:
+        """Serialize the match for save files and snapshots.
+
+        `include_history` defaults to False because the autosave history
+        can balloon save files (every round-start state for the entire
+        match). MatchHistory itself calls this with include_history=False
+        when snapshotting — bundling history inside snapshots would
+        produce infinite nesting. Pass include_history=True from `!store
+        save <path> include_history=yes` for a long-term campaign backup
+        that includes every undoable autosave.
+        """
+        d: Dict[str, Any] = {
             "id": self.id,
             "name": self.name,
             "grid_width": self.grid_width,
@@ -2247,6 +2363,9 @@ class Match:
             "global_passives": {pid: p.to_dict() for pid, p in self.global_passives.items()},
             "groups": {name: list(members) for name, members in self.groups.items()},
         }
+        if include_history:
+            d["history"] = self.history.to_dict()
+        return d
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "Match":
@@ -2279,6 +2398,15 @@ class Match:
             name: [eid for eid in members if eid in m.entities]
             for name, members in raw_groups.items()
         }
+        # History is optional in saved dicts. It's only present when the
+        # original save was made with include_history=True. A snapshot's
+        # state.dict deliberately omits history (snapshots-within-
+        # snapshots would explode), so loading a snapshot starts with a
+        # fresh empty history — the in-memory MatchHistory keeps living
+        # on the OLD Match object, which the caller transfers across
+        # via Match.history = ... after construction.
+        if "history" in d:
+            m.history = MatchHistory.from_dict(d["history"])
         return m
 
     # ------------- simple ASCII render for quick debugging -------------
@@ -2603,9 +2731,19 @@ class MatchManager:
         return self.active_by_channel.get(channel_key)
 
     # ---------- persistence ----------
-    def save(self, path: str):
+    def save(self, path: str, include_history: bool = False):
+        """Persist all matches & bindings to JSON.
+
+        `include_history` is forwarded to Match.to_dict — if True, each
+        match's autosave history is bundled into the save file. Off by
+        default to keep save files small; opt in via
+        `!store save <path> include_history=yes` for a complete backup.
+        """
         data = {
-            "matches": {mid: m.to_dict() for mid, m in self.matches.items()},
+            "matches": {
+                mid: m.to_dict(include_history=include_history)
+                for mid, m in self.matches.items()
+            },
             "active_by_channel": self.active_by_channel,
             "systems": {name: s.to_dict() for name, s in self.systems.items()},
             "default_system_name": self.default_system_name,

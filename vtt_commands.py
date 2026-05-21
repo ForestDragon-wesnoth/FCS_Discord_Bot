@@ -2,7 +2,8 @@
 # vtt_commands.py
 from __future__ import annotations
 from typing import Callable, Dict, List, Optional, Protocol, Any, Tuple
-from logic import MatchManager, Entity, VTTError, OutOfBounds, Occupied, NotFound, DuplicateId, ReservedId, _coerce_rule_value, _parse_bool
+from logic import MatchManager, Match, Entity, VTTError, OutOfBounds, Occupied, NotFound, DuplicateId, ReservedId, _coerce_rule_value, _parse_bool
+from match_history import MatchHistory, Snapshot, HistoryError
 
 #used for Gamesystem-related commands
 from logic import (
@@ -36,9 +37,18 @@ class CommandRegistry:
         self._handlers: Dict[str, Handler] = {}
         # help metadata: {root: {"usage": str, "desc": str, "subs": {sub: {"usage": str, "desc": str}}}}
         self._help: Dict[str, Dict[str, Any]] = {}
-    def command(self, name: str, *, usage: Optional[str] = None, desc: Optional[str] = None):
+        # Per-command "should the dispatcher take a pre/post snapshot
+        # of the active match's state and record a command autosave if
+        # the state changed?" Default True for new commands. We turn it
+        # off for commands whose mutations are better tracked through a
+        # different undo lane (`turn next` snapshots round/turn itself)
+        # or that aren't conceptually undoable (`history`, `store`).
+        self._snapshot: Dict[str, bool] = {}
+    def command(self, name: str, *, usage: Optional[str] = None,
+                desc: Optional[str] = None, snapshot: bool = True):
         def deco(fn: Handler):
             self._handlers[name] = fn
+            self._snapshot[name] = snapshot
             meta = self._help.setdefault(name, {"usage": None, "desc": None, "subs": {}})
             if usage:
                 meta["usage"] = usage
@@ -102,13 +112,48 @@ class CommandRegistry:
         if not h:
             await ctx.send(f"❓ Unknown command `{name}`")
             return
+
+        # Pre-dispatch snapshot of the active match's state. We only
+        # bother if (a) the command opted into snapshotting (snapshot=
+        # True, default), (b) there IS an active match on this channel,
+        # and (c) the active match's autosave_command_retention_turns
+        # rule isn't 0 (which means "command autosaves disabled").
+        pre_state = None
+        pre_active_mid = mgr.active_by_channel.get(ctx.channel_key)
+        if (self._snapshot.get(name, True)
+                and pre_active_mid is not None
+                and pre_active_mid in mgr.matches):
+            m_pre = mgr.matches[pre_active_mid]
+            if int(m_pre.rules.get("autosave_command_retention_turns", 3)) != 0:
+                pre_state = m_pre.to_dict(include_history=False)
+
         try:
             result = await h(ctx, args, mgr)
-            return result
         except VTTError as e:
             await ctx.send(f"❌ {e}")
+            # Command failed — don't record a snapshot for a no-op.
+            return
         except Exception as e:
             await ctx.send(f"💥 Unexpected error: {e}")
+            return
+
+        # Post-dispatch: if we captured pre-state and the active match
+        # still exists and its serialized state genuinely changed, the
+        # command was mutating and we record a pre-state snapshot. The
+        # snapshot represents "the state to roll back to if you undo
+        # this command".
+        if pre_state is not None and pre_active_mid in mgr.matches:
+            m_post = mgr.matches[pre_active_mid]
+            post_state = m_post.to_dict(include_history=False)
+            if pre_state != post_state:
+                # Build a short, human-meaningful label. The full args
+                # list can be very long (multi-line passive formulas);
+                # cap it so the !history list output stays readable.
+                label = f"!{name} {' '.join(args)}".strip()
+                if len(label) > 80:
+                    label = label[:77] + "..."
+                m_post.history.record_command(m_post, label, pre_state=pre_state)
+        return result
 
 registry = CommandRegistry()
 
@@ -1357,7 +1402,7 @@ registry.annotate_sub(
     ),
 )
 
-@registry.command("turn", usage="!turn | !turn next | ...", desc="See/advance/set/etc. turns")
+@registry.command("turn", usage="!turn | !turn next | ...", desc="See/advance/set/etc. turns", snapshot=False)
 async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     if not args:
@@ -1446,7 +1491,478 @@ async def state_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     await list_cmd(ctx, args, mgr)
     await map_cmd(ctx, args, mgr)
 
-@registry.command("store", usage="!store save <path> | !store load <path>", desc="Save/load all matches and channel bindings.")
+# ---- !history -----------------------------------------------------------
+# Per-match save history: manual saves, automatic round/turn/command
+# snapshots, undo, and JSON export/import. snapshot=False so this command
+# doesn't try to autosnapshot ITSELF — managing the history shouldn't
+# clutter the history.
+def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot) -> Match:
+    """Replace mgr.matches[mid] with a Match restored from `snapshot`.
+
+    The previous Match's MatchHistory is moved onto the new Match and
+    truncated to drop autosaves with sequence > snapshot.sequence —
+    those describe a timeline the user just abandoned. Manual saves
+    survive (they're explicit bookmarks; the user owns their lifecycle).
+    Returns the new Match instance.
+    """
+    if mid not in mgr.matches:
+        raise NotFound(f"Match '{mid}' no longer exists.")
+    old = mgr.matches[mid]
+    new_match = Match.from_dict(snapshot.state)
+    # Transfer history pointer first so the truncate below targets the
+    # same object we just attached to the new match.
+    new_match.history = old.history
+    new_match.history.truncate_after(snapshot)
+    mgr.matches[mid] = new_match
+    return new_match
+
+
+def _parse_int_or(default: int, token: Optional[str]) -> int:
+    """Parse `token` as a positive int, falling back to `default` for
+    None / non-numeric. Used to make `!history undo turn` and
+    `!history undo turn 3` both work without the `confirm` token
+    confusing the parser."""
+    if token is None:
+        return default
+    try:
+        return int(token)
+    except (TypeError, ValueError):
+        return default
+
+
+def _confirmation_required(threshold: int, n: int) -> bool:
+    """A threshold of -1 disables prompting; anything else compares
+    against `n` and prompts when n >= threshold."""
+    return threshold >= 0 and n >= threshold
+
+
+def _confirm_message(action_label: str, n: int, scope: str,
+                     re_run_args: str, removed_estimate: int) -> str:
+    """Standard 'are you sure?' message body. Pulled out so all the
+    undo subcommands give a consistent prompt."""
+    return (
+        f"⚠️ {action_label} would undo **{n} {scope}**. This will "
+        f"discard the {removed_estimate} autosave(s) taken after that "
+        f"restore point.\n"
+        f"• To proceed:  `!history undo {re_run_args} confirm`\n"
+        f"• To bookmark current state first:  "
+        f"`!history save <name>`  then re-run the undo command."
+    )
+
+
+@registry.command(
+    "history",
+    usage=("!history <list|save|delete|restore|undo|export|import> ..."),
+    desc=(
+        "Per-match save & undo system. Three flavors of autosave are "
+        "taken automatically — round-start (after on_round_start hooks), "
+        "turn-start (after on_turn_start hooks), and pre-command (before "
+        "each mutating command). Plus manual saves (`!history save "
+        "<name>`) which never auto-prune. Retention and "
+        "confirmation thresholds are set on the active game system "
+        "via the `autosave_*` and `undo_confirmation_*` rules."
+    ),
+    snapshot=False,
+)
+async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["history"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    mid = m.id
+    sub = args[0].lower()
+
+    # ---- list --------------------------------------------------------
+    # `!history list` is the summary view. `!history list <kind>` shows
+    # detail for one kind. The summary is intentionally compact (one
+    # line per kind) because in a long match the lists can be huge.
+    if sub == "list":
+        if len(args) >= 2:
+            kind = args[1].lower()
+            if kind in ("rounds", "round"):
+                if not m.history.round_saves:
+                    return await ctx.send("No round autosaves retained.")
+                lines = ["**Round autosaves:**"]
+                for s in m.history.round_saves:
+                    lines.append(f"- seq {s.sequence}: {s.short_summary()}  [{s.timestamp}]")
+                return await ctx.send("\n".join(lines))
+            if kind in ("turns", "turn"):
+                if not m.history.turn_saves:
+                    return await ctx.send("No turn autosaves retained.")
+                lines = ["**Turn autosaves:**"]
+                for s in m.history.turn_saves:
+                    lines.append(f"- seq {s.sequence}: {s.short_summary()}  [{s.timestamp}]")
+                return await ctx.send("\n".join(lines))
+            if kind in ("commands", "command"):
+                if not m.history.command_saves:
+                    return await ctx.send("No command autosaves retained.")
+                lines = ["**Command autosaves:**"]
+                for s in m.history.command_saves:
+                    lines.append(f"- seq {s.sequence}: {s.short_summary()}  [{s.timestamp}]")
+                return await ctx.send("\n".join(lines))
+            if kind in ("manual", "manuals"):
+                if not m.history.manual_saves:
+                    return await ctx.send("No manual saves.")
+                lines = ["**Manual saves:**"]
+                for name, s in m.history.manual_saves.items():
+                    lines.append(f"- `{name}`: {s.short_summary()}  [{s.timestamp}]")
+                return await ctx.send("\n".join(lines))
+            return await ctx.send(
+                f"Unknown list kind '{kind}'. Use one of: rounds, turns, commands, manual."
+            )
+        # Summary
+        lines = [f"**Match `{mid}` history:**"]
+        if m.history.round_saves:
+            rounds = sorted({s.round_at_snapshot for s in m.history.round_saves})
+            rng = f"{rounds[0]}–{rounds[-1]}" if len(rounds) > 1 else str(rounds[0])
+            lines.append(f"- Rounds: {len(m.history.round_saves)} snapshot(s) (round {rng})")
+        else:
+            lines.append("- Rounds: none")
+        if m.history.turn_saves:
+            lines.append(f"- Turns: {len(m.history.turn_saves)} snapshot(s)")
+        else:
+            lines.append("- Turns: none")
+        if m.history.command_saves:
+            lines.append(f"- Commands: {len(m.history.command_saves)} snapshot(s)")
+        else:
+            lines.append("- Commands: none")
+        if m.history.manual_saves:
+            names = ", ".join(f"`{n}`" for n in m.history.manual_saves)
+            lines.append(f"- Manual: {len(m.history.manual_saves)} ({names})")
+        else:
+            lines.append("- Manual: none")
+        lines.append("Use `!history list <rounds|turns|commands|manual>` for detail.")
+        return await ctx.send("\n".join(lines))
+
+    # ---- save / delete / restore (manual) ----------------------------
+    if sub == "save":
+        if await return_help_if_not_enough_args(ctx, args, 2, "history", "save"):
+            return
+        name = args[1]
+        s = m.history.save_manual(m, name)
+        return await ctx.send(
+            f"Saved manual `{name}` (round {s.round_at_snapshot}, "
+            f"seq {s.sequence})."
+        )
+
+    if sub == "delete":
+        if await return_help_if_not_enough_args(ctx, args, 2, "history", "delete"):
+            return
+        name = args[1]
+        m.history.delete_manual(name)
+        return await ctx.send(f"Deleted manual save `{name}`.")
+
+    if sub == "restore":
+        # Manual restore is a "big jump" — always confirms. The
+        # threshold rules apply to undo-by-distance, not manual jumps.
+        if await return_help_if_not_enough_args(ctx, args, 2, "history", "restore"):
+            return
+        name = args[1]
+        confirmed = "confirm" in (a.lower() for a in args[2:])
+        snap = m.history.get_manual(name)
+        if not confirmed:
+            # Estimate "what would be erased": any autosave with seq >
+            # snap.sequence. Manual saves are preserved regardless.
+            erased = (sum(1 for x in m.history.round_saves if x.sequence > snap.sequence)
+                      + sum(1 for x in m.history.turn_saves if x.sequence > snap.sequence)
+                      + sum(1 for x in m.history.command_saves if x.sequence > snap.sequence))
+            return await ctx.send(
+                f"⚠️ Restoring manual `{name}` will jump to round "
+                f"{snap.round_at_snapshot} and discard {erased} autosave(s) "
+                f"taken after that point.\n"
+                f"• To proceed:  `!history restore {name} confirm`"
+            )
+        _restore_snapshot(mgr, mid, snap)
+        return await ctx.send(
+            f"Restored manual `{name}` (now at round {snap.round_at_snapshot})."
+        )
+
+    # ---- undo --------------------------------------------------------
+    # Subcommands: undo turn [N] [confirm], undo round [N] [confirm],
+    # undo command [N] [confirm], undo to round X [confirm].
+    if sub == "undo":
+        if len(args) < 2:
+            title, body = registry.help_for(["history", "undo"])
+            return await ctx.send(f"**{title}**\n{body}")
+        scope = args[1].lower()
+
+        # ---- undo to round X ----
+        if scope == "to":
+            # Form: !history undo to round X [confirm]
+            if len(args) < 4 or args[2].lower() not in ("round", "rounds"):
+                return await ctx.send(
+                    "Usage: `!history undo to round <X> [confirm]`."
+                )
+            try:
+                target_round = int(args[3])
+            except ValueError:
+                return await ctx.send(f"Round number must be an integer, got '{args[3]}'.")
+            confirmed = "confirm" in (a.lower() for a in args[4:])
+            snap = m.history.get_round_with_number(target_round)
+            # `undo to round X` always prompts unless the round threshold
+            # is disabled (-1). Conceptually it's a non-linear jump so
+            # we treat it like a round undo of "however many rounds away."
+            distance = max(1, m.turn_number - target_round)
+            threshold = int(m.rules.get("undo_confirmation_round_threshold", 1))
+            if _confirmation_required(threshold, distance) and not confirmed:
+                erased = sum(1 for x in m.history.round_saves if x.sequence > snap.sequence) + \
+                         sum(1 for x in m.history.turn_saves if x.sequence > snap.sequence) + \
+                         sum(1 for x in m.history.command_saves if x.sequence > snap.sequence)
+                return await ctx.send(_confirm_message(
+                    "Jump to round start", distance, "rounds back",
+                    f"to round {target_round}", erased,
+                ))
+            _restore_snapshot(mgr, mid, snap)
+            return await ctx.send(f"Restored start of round {target_round}.")
+
+        # ---- undo {turn|round|command} [N] [confirm] ----
+        if scope in ("turn", "turns"):
+            n = _parse_int_or(1, args[2] if len(args) >= 3 else None)
+            confirmed = "confirm" in (a.lower() for a in args[2:])
+            snap = m.history.get_turn_nth_back(n)
+            threshold = int(m.rules.get("undo_confirmation_turn_threshold", 3))
+            if _confirmation_required(threshold, n) and not confirmed:
+                erased = sum(1 for x in m.history.round_saves if x.sequence > snap.sequence) + \
+                         sum(1 for x in m.history.turn_saves if x.sequence > snap.sequence) + \
+                         sum(1 for x in m.history.command_saves if x.sequence > snap.sequence)
+                return await ctx.send(_confirm_message(
+                    "Undoing turns", n, "turn(s)",
+                    f"turn {n}", erased,
+                ))
+            _restore_snapshot(mgr, mid, snap)
+            return await ctx.send(
+                f"Undid {n} turn(s). Now at start of "
+                f"{snap.active_entity_id or 'no-active'}'s turn "
+                f"(round {snap.round_at_snapshot})."
+            )
+
+        if scope in ("round", "rounds"):
+            n = _parse_int_or(1, args[2] if len(args) >= 3 else None)
+            confirmed = "confirm" in (a.lower() for a in args[2:])
+            snap = m.history.get_round_nth_back(n)
+            threshold = int(m.rules.get("undo_confirmation_round_threshold", 1))
+            if _confirmation_required(threshold, n) and not confirmed:
+                erased = sum(1 for x in m.history.round_saves if x.sequence > snap.sequence) + \
+                         sum(1 for x in m.history.turn_saves if x.sequence > snap.sequence) + \
+                         sum(1 for x in m.history.command_saves if x.sequence > snap.sequence)
+                return await ctx.send(_confirm_message(
+                    "Undoing rounds", n, "round(s)",
+                    f"round {n}", erased,
+                ))
+            _restore_snapshot(mgr, mid, snap)
+            return await ctx.send(
+                f"Undid {n} round(s). Now at start of round "
+                f"{snap.round_at_snapshot}."
+            )
+
+        if scope in ("command", "commands"):
+            n = _parse_int_or(1, args[2] if len(args) >= 3 else None)
+            confirmed = "confirm" in (a.lower() for a in args[2:])
+            snap = m.history.get_command_nth_back(n)
+            threshold = int(m.rules.get("undo_confirmation_command_threshold", -1))
+            if _confirmation_required(threshold, n) and not confirmed:
+                erased = sum(1 for x in m.history.round_saves if x.sequence > snap.sequence) + \
+                         sum(1 for x in m.history.turn_saves if x.sequence > snap.sequence) + \
+                         sum(1 for x in m.history.command_saves if x.sequence > snap.sequence)
+                return await ctx.send(_confirm_message(
+                    "Undoing commands", n, "command(s)",
+                    f"command {n}", erased,
+                ))
+            _restore_snapshot(mgr, mid, snap)
+            return await ctx.send(
+                f"Undid {n} command(s). Reverted past `{snap.label}`."
+            )
+
+        return await ctx.send(
+            f"Unknown undo scope '{scope}'. Use turn/round/command/to."
+        )
+
+    # ---- export ------------------------------------------------------
+    # `!history export <selector> <path>` writes one snapshot to JSON.
+    # Selectors:
+    #   manual:<name>      named manual save
+    #   round:<N>          round-start snapshot for round N
+    #   turn:<seq>         turn-start snapshot by sequence number
+    #   command:<seq>      command snapshot by sequence number
+    #   latest:round       most recent round save
+    #   latest:turn        most recent turn save
+    #   latest:command     most recent command save
+    if sub == "export":
+        if await return_help_if_not_enough_args(ctx, args, 3, "history", "export"):
+            return
+        selector = args[1]
+        path = args[2]
+        snap = _resolve_snapshot_selector(m, selector)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(snap.to_dict(), f, indent=2)
+        except OSError as ex:
+            raise VTTError(f"Failed to write '{path}': {ex}")
+        return await ctx.send(
+            f"Exported {snap.kind} snapshot (seq {snap.sequence}) to `{path}`."
+        )
+
+    # ---- import ------------------------------------------------------
+    # `!history import <path> [as <name>]` reads a snapshot JSON and
+    # adds it to manual_saves. `as <name>` overrides the imported
+    # label; if omitted we keep the snapshot's existing label, or
+    # fall back to "imported-<seq>" if the label is empty.
+    if sub == "import":
+        if await return_help_if_not_enough_args(ctx, args, 2, "history", "import"):
+            return
+        path = args[1]
+        override_name = None
+        if len(args) >= 4 and args[2].lower() == "as":
+            override_name = args[3]
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                snap = Snapshot.from_dict(json.load(f))
+        except FileNotFoundError:
+            raise VTTError(f"File not found: '{path}'")
+        except (OSError, json.JSONDecodeError, KeyError) as ex:
+            raise VTTError(f"Failed to import from '{path}': {ex}")
+        name = override_name or snap.label or f"imported-{snap.sequence}"
+        # The imported snapshot keeps its OLD sequence number, which
+        # could collide with the current match's sequence space. That's
+        # fine for the manual_saves dict (keyed by name, not seq), but
+        # we re-stamp the kind to "manual" so a later !history list
+        # categorizes it correctly.
+        snap.kind = "manual"
+        snap.label = name
+        m.history.manual_saves[name] = snap
+        return await ctx.send(
+            f"Imported snapshot from `{path}` as manual save `{name}` "
+            f"(round {snap.round_at_snapshot})."
+        )
+
+    # Fallback to help
+    title, body = registry.help_for(["history"])
+    return await ctx.send(f"**{title}**\n{body}")
+
+
+def _resolve_snapshot_selector(m: Match, selector: str) -> Snapshot:
+    """Map a selector string to a specific Snapshot, or raise."""
+    if ":" not in selector:
+        raise VTTError(
+            f"Selector '{selector}' must be like manual:<name>, round:<N>, "
+            f"turn:<seq>, command:<seq>, or latest:<kind>."
+        )
+    kind, _, value = selector.partition(":")
+    kind = kind.lower()
+    if kind == "manual":
+        return m.history.get_manual(value)
+    if kind == "latest":
+        v = value.lower()
+        if v == "round":
+            if not m.history.round_saves:
+                raise HistoryError("No round snapshots to export.")
+            return m.history.round_saves[-1]
+        if v == "turn":
+            if not m.history.turn_saves:
+                raise HistoryError("No turn snapshots to export.")
+            return m.history.turn_saves[-1]
+        if v == "command":
+            if not m.history.command_saves:
+                raise HistoryError("No command snapshots to export.")
+            return m.history.command_saves[-1]
+        raise VTTError(f"latest:<kind> expects round/turn/command, got '{value}'.")
+    # round:<N> looks up by round_at_snapshot
+    if kind == "round":
+        try:
+            n = int(value)
+        except ValueError:
+            raise VTTError(f"round:<N> expects an integer, got '{value}'.")
+        return m.history.get_round_with_number(n)
+    # turn / command lookups use sequence number for unambiguous reference
+    if kind == "turn":
+        try:
+            seq = int(value)
+        except ValueError:
+            raise VTTError(f"turn:<seq> expects an integer, got '{value}'.")
+        for s in m.history.turn_saves:
+            if s.sequence == seq:
+                return s
+        raise HistoryError(f"No turn snapshot with sequence {seq}.")
+    if kind == "command":
+        try:
+            seq = int(value)
+        except ValueError:
+            raise VTTError(f"command:<seq> expects an integer, got '{value}'.")
+        for s in m.history.command_saves:
+            if s.sequence == seq:
+                return s
+        raise HistoryError(f"No command snapshot with sequence {seq}.")
+    raise VTTError(f"Unknown selector prefix '{kind}'.")
+
+
+# Annotate the subcommands for help
+registry.annotate_sub(
+    "history", "list",
+    usage="!history list [rounds|turns|commands|manual]",
+    desc=(
+        "Without an argument: one-line summary of each save category. "
+        "With a category argument: detailed listing of that category."
+    ),
+)
+registry.annotate_sub(
+    "history", "save",
+    usage="!history save <name>",
+    desc=(
+        "Create or overwrite a named manual save bookmarked at the "
+        "current state. Manual saves never auto-prune; delete them "
+        "explicitly with `!history delete <name>`."
+    ),
+)
+registry.annotate_sub(
+    "history", "delete",
+    usage="!history delete <name>",
+    desc="Drop a manual save by name."
+)
+registry.annotate_sub(
+    "history", "restore",
+    usage="!history restore <name> [confirm]",
+    desc=(
+        "Replace the active match state with the named manual save's "
+        "state. Always requires `confirm` because the autosaves taken "
+        "after the manual save's point will be erased."
+    ),
+)
+registry.annotate_sub(
+    "history", "undo",
+    usage=(
+        "!history undo turn [N] [confirm] | !history undo round [N] "
+        "[confirm] | !history undo command [N] [confirm] | "
+        "!history undo to round <X> [confirm]"
+    ),
+    desc=(
+        "Roll the match back to an earlier autosave. N defaults to 1 "
+        "for the turn/round/command forms; `undo to round X` jumps "
+        "directly to that round's start. Confirmation thresholds are "
+        "configurable via the undo_confirmation_* rules."
+    ),
+)
+registry.annotate_sub(
+    "history", "export",
+    usage="!history export <selector> <path>",
+    desc=(
+        "Write one snapshot to a JSON file. Selectors: manual:<name>, "
+        "round:<N>, turn:<seq>, command:<seq>, latest:round, "
+        "latest:turn, latest:command."
+    ),
+)
+registry.annotate_sub(
+    "history", "import",
+    usage="!history import <path> [as <name>]",
+    desc=(
+        "Read a snapshot JSON and add it to manual saves on the active "
+        "match. `as <name>` overrides the imported label; otherwise the "
+        "snapshot's existing label is used. The imported snapshot is "
+        "always categorized as manual regardless of its original kind."
+    ),
+)
+
+
+@registry.command("store", usage="!store save <path> | !store load <path>", desc="Save/load all matches and channel bindings.", snapshot=False)
 async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
         title, body = registry.help_for(["store"])
@@ -1455,7 +1971,16 @@ async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "save":# and len(args) >= 2:
         if await return_help_if_not_enough_args(ctx, args, 2, "store", "save"):
             return
-        mgr.save(args[1]); return await ctx.send(f"Saved to `{args[1]}`")
+        # Optional `include_history=yes` toggle bundles every match's
+        # autosave history into the save file. Off by default to keep
+        # files small; on for full campaign backups.
+        include_history = False
+        for extra in args[2:]:
+            if extra.startswith("include_history="):
+                include_history = _parse_bool(extra[len("include_history="):])
+        mgr.save(args[1], include_history=include_history)
+        suffix = " (with autosave history)" if include_history else ""
+        return await ctx.send(f"Saved to `{args[1]}`{suffix}")
     if sub == "load":# and len(args) >= 2:
         if await return_help_if_not_enough_args(ctx, args, 2, "store", "load"):
             return
@@ -1466,8 +1991,13 @@ async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 #annonate subcommands next to the command itself:
 registry.annotate_sub(
     "store", "save",
-    usage="!store save <path>",
-    desc="Save all matches and channel bindings to a JSON file."
+    usage="!store save <path> [include_history=yes]",
+    desc=(
+        "Save all matches and channel bindings to a JSON file. By default "
+        "excludes per-match autosave history (which can be large); pass "
+        "`include_history=yes` to bundle the round/turn/command/manual "
+        "saves for full campaign backup."
+    ),
 )
 registry.annotate_sub(
     "store", "load",
