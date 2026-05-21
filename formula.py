@@ -237,6 +237,33 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
     "int": int, "float": float, "str": str,
 }
 
+# Match-bound function names. These functions are bound at namespace build
+# time (FormulaEngine._namespace) because they need access to the match;
+# they can't live in _ALLOWED_FUNCS like the pure helpers above. The
+# validator accepts these names alongside _ALLOWED_FUNCS.
+#
+# The group_* functions touch Match.groups. Read-only:
+#   group_has(name, eid)    -> bool   membership test
+#   group_size(name)        -> int    member count (0 if group doesn't exist)
+# Mutating:
+#   group_add(name, eid)    -> bool   add; True iff newly added
+#   group_remove(name, eid) -> bool   remove; True iff was a member
+# Identity helpers (mirror the entity[self]/entity[this] shorthand for
+# contexts where you need the id as a plain string to pass to another
+# function, like group_has):
+#   self_id()    -> str   the bound self id; raises if unbound
+#   current_id() -> str   the current-turn entity id; raises if none
+#
+# Mutating group_add/group_remove still respect the recursion safeguards
+# of any var hooks they might trigger downstream — actually they don't
+# fire any var hooks (groups aren't in entity vars), so they're cheap.
+# But a passive that mutates groups can still cascade indirectly via
+# subsequent commands; that's the GM's problem to design around.
+_MATCH_FUNC_NAMES: Tuple[str, ...] = (
+    "group_has", "group_size", "group_add", "group_remove",
+    "self_id", "current_id",
+)
+
 _ALLOWED_NODES: Tuple[type, ...] = (
     ast.Module, ast.Expression,
     ast.Expr, ast.Assign,
@@ -409,20 +436,23 @@ def _validate_tree(tree: ast.AST) -> None:
             raise FormulaError(f"Disallowed syntax: {type(n).__name__}")
         if isinstance(n, ast.Name):
             # Allowed Names: __read/__write (transformer-injected), the
-            # built-in funcs (min, max, etc.), and the hook context names
-            # (changed_key, old_value, new_value, hook_name). The latter are
-            # bound to None outside var-hook contexts so a formula using them
-            # in the wrong context fails at comparison time rather than
-            # parse time — keeps the validator hook-agnostic.
+            # built-in funcs (min, max, etc.), the hook context names
+            # (changed_key, old_value, new_value, hook_name, ...) bound to
+            # None outside var-hook contexts, and the match-bound
+            # functions (group_has, group_size, group_add, group_remove,
+            # self_id, current_id) bound at namespace-build time.
             if (n.id not in ("__read", "__write")
                     and n.id not in _ALLOWED_FUNCS
+                    and n.id not in _MATCH_FUNC_NAMES
                     and n.id not in HOOK_CONTEXT_NAMES):
                 raise FormulaError(f"Unknown identifier '{n.id}'.")
         if isinstance(n, ast.Call):
             if not isinstance(n.func, ast.Name):
                 raise FormulaError("Only direct function calls are allowed.")
             fname = n.func.id
-            if fname not in ("__read", "__write") and fname not in _ALLOWED_FUNCS:
+            if (fname not in ("__read", "__write")
+                    and fname not in _ALLOWED_FUNCS
+                    and fname not in _MATCH_FUNC_NAMES):
                 raise FormulaError(f"Function '{fname}' is not allowed.")
 
 
@@ -512,6 +542,9 @@ class FormulaEngine:
             -> None. Unconditional binding keeps the validator simple — a
             formula referencing changed_key in a non-var-hook context just
             sees None (or False).
+          - Match-bound functions (group_*, self_id, current_id). These
+            close over self._match and the provided ctx so the formula
+            doesn't need to thread either through explicitly.
         """
         extras = ctx.extras or {}
         ns: Dict[str, Any] = {
@@ -524,6 +557,65 @@ class FormulaEngine:
         _CONTEXT_DEFAULTS = {"was_clamped": False}
         for name in HOOK_CONTEXT_NAMES:
             ns[name] = extras.get(name, _CONTEXT_DEFAULTS.get(name))
+
+        # Match-bound group functions. Each takes string args; entity-id
+        # args go through ctx.resolve_who so the special tokens "self",
+        # "this", and "current" work the same as inside entity[X].path
+        # — meaning a formula can write group_add("swarm", "self") if
+        # the bare-identifier shorthand self_id() feels too verbose.
+        match = self._match
+        def _eid(token: Any) -> str:
+            if not isinstance(token, str):
+                raise FormulaError(
+                    f"Entity id argument must be a string, got {type(token).__name__}."
+                )
+            return ctx.resolve_who(token)
+        def _group_has(name: Any, eid_token: Any) -> bool:
+            if not isinstance(name, str):
+                raise FormulaError("group_has(name, eid): name must be a string.")
+            eid = _eid(eid_token)
+            members = match.groups.get(name, [])
+            return eid in members
+        def _group_size(name: Any) -> int:
+            if not isinstance(name, str):
+                raise FormulaError("group_size(name): name must be a string.")
+            return len(match.groups.get(name, []))
+        def _group_add(name: Any, eid_token: Any) -> bool:
+            if not isinstance(name, str):
+                raise FormulaError("group_add(name, eid): name must be a string.")
+            eid = _eid(eid_token)
+            try:
+                return match.add_to_group(name, eid)
+            except VTTError as ex:
+                raise FormulaError(str(ex))
+        def _group_remove(name: Any, eid_token: Any) -> bool:
+            if not isinstance(name, str):
+                raise FormulaError("group_remove(name, eid): name must be a string.")
+            eid = _eid(eid_token)
+            # If the group doesn't exist, treat as a no-op (False) rather
+            # than raising — symmetric with group_size returning 0 for an
+            # absent group. Mutating a never-defined group from a passive
+            # is most likely a typo; we surface that as a "did nothing"
+            # rather than crashing the passive chain.
+            if name not in match.groups:
+                return False
+            return match.remove_from_group(name, eid)
+        def _self_id() -> str:
+            if not ctx.target:
+                raise FormulaError("self_id(): self is unbound in this context.")
+            return ctx.target
+        def _current_id() -> str:
+            if not ctx.this:
+                raise FormulaError("current_id(): no current entity (turn order empty).")
+            return ctx.this
+
+        ns["group_has"]    = _group_has
+        ns["group_size"]   = _group_size
+        ns["group_add"]    = _group_add
+        ns["group_remove"] = _group_remove
+        ns["self_id"]      = _self_id
+        ns["current_id"]   = _current_id
+
         return ns
 
     @staticmethod

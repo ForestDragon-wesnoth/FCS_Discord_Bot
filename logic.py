@@ -1395,6 +1395,8 @@ class Entity:
     def remove(self):
         """
         Remove this entity from its match and turn order.
+        Also scrubs the entity from every group it was a member of, so
+        no group is left holding a dangling id.
         """
         m = self._require_match()
         if self.id in m.entities:
@@ -1407,6 +1409,7 @@ class Entity:
                 m.active_index = max(0, len(m.turn_order) - 1)
             elif m.active_index > idx:
                 m.active_index = max(0, m.active_index - 1)
+        m._scrub_entity_from_groups(self.id)
         self._match = None
         m._rebuild_turn_order()
 
@@ -1830,6 +1833,18 @@ class Match:
     #global passives that apply to every entity in turn order on each hook fire
     global_passives: Dict[str, Passive] = field(default_factory=dict)
 
+    # Group registry. Keyed by group name → ordered list of entity ids
+    # belonging to that group. An entity can belong to any number of
+    # groups; a group can be empty. Groups live separately from entity
+    # vars (they're an organizational concept, not gameplay state) and
+    # are mutated through Match.add_to_group / remove_from_group /
+    # delete_group rather than directly. Entity.remove() scrubs the
+    # removed entity from every group it belonged to so we never end
+    # up with stale references. Ordering within each group is
+    # insertion order, which is also the iteration order for any
+    # command that targets the group.
+    groups: Dict[str, List[str]] = field(default_factory=dict)
+
     # ---- runtime-only state for var-hook recursion safeguard ----
     # Tracks how deep we are in a chain of var-hook fires. A passive's
     # formula can write vars, which produces more events, which fire more
@@ -2230,6 +2245,7 @@ class Match:
             "turn_number": self.turn_number,
             "round_started": self.round_started,
             "global_passives": {pid: p.to_dict() for pid, p in self.global_passives.items()},
+            "groups": {name: list(members) for name, members in self.groups.items()},
         }
 
     @staticmethod
@@ -2254,6 +2270,14 @@ class Match:
         m.global_passives = {
             pid: Passive.from_dict(pd)
             for pid, pd in (d.get("global_passives", {}) or {}).items()
+        }
+        # Groups are a recent addition; older saves won't have the key.
+        # Filter members to currently-existing entities at load time so
+        # stale references in older saves don't survive.
+        raw_groups = d.get("groups", {}) or {}
+        m.groups = {
+            name: [eid for eid in members if eid in m.entities]
+            for name, members in raw_groups.items()
         }
         return m
 
@@ -2292,6 +2316,165 @@ class Match:
         if d in DIAGONAL_DIRECTIONS and not eight_way:
             return "up"
         return d
+
+    # ---- group management ----
+    # Groups are an organizational layer: an entity can belong to any
+    # number of named groups, and various !ent subcommands accept a
+    # `group:NAME` target to apply the action to every member at once.
+    # Mass movement (move_group_dirs below) treats fellow group members
+    # as transparent to each other so a marching group doesn't trip on
+    # its own footprint. Group names are arbitrary strings — they share
+    # no namespace with entity ids, so a group named "hero" and an
+    # entity id "hero" can coexist without conflict.
+
+    def has_group(self, name: str) -> bool:
+        return name in self.groups
+
+    def group_members(self, name: str) -> List[str]:
+        """Return the member id list (a copy). Raises NotFound if the
+        group doesn't exist. Filters out any ids that are no longer in
+        self.entities, but that should never happen in practice because
+        Entity.remove() scrubs group membership on its way out."""
+        if name not in self.groups:
+            raise NotFound(f"Group '{name}' not found in match '{self.id}'.")
+        return [eid for eid in self.groups[name] if eid in self.entities]
+
+    def groups_for(self, entity_id: str) -> List[str]:
+        """Return the names of all groups containing this entity, in
+        the order they were defined on the match."""
+        return [name for name, members in self.groups.items()
+                if entity_id in members]
+
+    def add_to_group(self, name: str, entity_id: str) -> bool:
+        """Add entity_id to group `name`. Creates the group implicitly
+        if it doesn't yet exist. Returns True if newly added, False if
+        the entity was already a member (idempotent). Raises NotFound
+        if the entity id doesn't refer to an entity in this match."""
+        if entity_id not in self.entities:
+            raise NotFound(f"Entity '{entity_id}' not found in match '{self.id}'.")
+        members = self.groups.setdefault(name, [])
+        if entity_id in members:
+            return False
+        members.append(entity_id)
+        return True
+
+    def remove_from_group(self, name: str, entity_id: str) -> bool:
+        """Remove entity_id from group `name`. Returns True if removed,
+        False if the entity wasn't a member. Raises NotFound if the
+        group doesn't exist. Empty groups are kept (they're explicit
+        and might be populated later) — use delete_group to drop one."""
+        if name not in self.groups:
+            raise NotFound(f"Group '{name}' not found in match '{self.id}'.")
+        if entity_id not in self.groups[name]:
+            return False
+        self.groups[name].remove(entity_id)
+        return True
+
+    def delete_group(self, name: str) -> None:
+        """Drop the group entirely. Members are unaffected (the group
+        is just a label — deleting it doesn't remove or alter the
+        entities). Raises NotFound if the group doesn't exist."""
+        if name not in self.groups:
+            raise NotFound(f"Group '{name}' not found in match '{self.id}'.")
+        del self.groups[name]
+
+    def _scrub_entity_from_groups(self, entity_id: str) -> None:
+        """Remove `entity_id` from every group it's in. Called by
+        Entity.remove() so a deleted entity doesn't leave dangling
+        references in group membership lists."""
+        for members in self.groups.values():
+            while entity_id in members:
+                members.remove(entity_id)
+
+    # ---- atomic group movement ----
+    # Apply the same move sequence to every member of a group at once.
+    # The two key properties:
+    #   1. Fellow group members don't block each other — during path
+    #      validation we treat them as transparent. This makes sense
+    #      because every member is shifting by the same (dx,dy) vector,
+    #      so geometrically no two members can collide internally as
+    #      long as they started at distinct cells.
+    #   2. Either the whole group moves, or nothing moves. We validate
+    #      every member's path first; if any one hits an out-of-bounds
+    #      cell or a non-member obstacle, we raise without mutating
+    #      anything. Callers see the same exception types they'd see
+    #      for a single-entity move (OutOfBounds / Occupied).
+    # Designed to play nicely with a future per-step collision system:
+    # the validation walks each entity step-by-step so per-step hooks
+    # could be added here later without restructuring.
+    def move_group_dirs(
+        self, group_name: str, moves: List[Tuple[str, int]],
+    ) -> Tuple[int, int]:
+        """Move every member of `group_name` through `moves` atomically.
+
+        Returns (member_count, total_steps_per_member). Raises NotFound
+        if the group is unknown or empty. Raises OutOfBounds / Occupied
+        (annotated with the offending member's id) if any member can't
+        complete the move; in that case NO entity is moved and no
+        facing is changed.
+        """
+        members = self.group_members(group_name)
+        if not members:
+            raise NotFound(f"Group '{group_name}' has no members to move.")
+        allow_diag_move = bool(self.rules.get("allow_diagonal_movement", False))
+        allow_diag_face = bool(self.rules.get("allow_diagonal_facing", False))
+        member_set = set(members)
+
+        # Phase 1: per-member simulation. We don't mutate anything until
+        # every member has been validated; if a later member fails, the
+        # earlier ones must not have moved.
+        plans: Dict[str, Tuple[int, int, str]] = {}  # eid -> (x, y, facing)
+        for eid in members:
+            e = self.entities[eid]
+            x, y = e.x, e.y
+            facing = e.facing
+            for direction, count in moves:
+                canon = normalize_direction(direction)
+                if canon is None:
+                    raise VTTError(f"Unknown direction '{direction}'")
+                if canon in DIAGONAL_DIRECTIONS and not allow_diag_move:
+                    raise VTTError(
+                        f"Diagonal direction '{direction}' is not allowed by "
+                        f"the active game system. Enable rule "
+                        f"'allow_diagonal_movement' to permit it."
+                    )
+                dx, dy = DIRECTION_VECTORS[canon]
+                step_facing = canon
+                if canon in DIAGONAL_DIRECTIONS and not allow_diag_face:
+                    step_facing = "up" if dy < 0 else "down"
+                for _ in range(max(1, int(count))):
+                    nx, ny = x + dx, y + dy
+                    if not self.in_bounds(nx, ny):
+                        raise OutOfBounds(
+                            f"Group '{group_name}' move aborted: member "
+                            f"'{eid}' would leave the grid at ({nx},{ny})."
+                        )
+                    x, y = nx, ny
+                    facing = step_facing
+            # Final-cell occupancy: ignore the entity itself AND every
+            # other group member (they're moving too — treat as
+            # transparent). We hand-roll the loop here because
+            # Match.is_occupied only takes a single ignore_entity_id.
+            for other_eid, other_e in self.entities.items():
+                if other_eid in member_set:
+                    continue
+                if other_e.x == x and other_e.y == y and other_e.is_alive:
+                    raise Occupied(
+                        f"Group '{group_name}' move aborted: member "
+                        f"'{eid}' would land on ({x},{y}), occupied by "
+                        f"'{other_eid}'."
+                    )
+            plans[eid] = (x, y, facing)
+
+        # Phase 2: commit. Geometric invariant (same shift vector for
+        # all members) guarantees no intra-group collision, so we can
+        # just write each member's new state without re-checking.
+        for eid, (x, y, facing) in plans.items():
+            e = self.entities[eid]
+            e.x, e.y = x, y
+            e.facing = facing
+        total_steps = sum(max(1, int(n)) for _, n in moves)
+        return len(members), total_steps
 
     def entities_in_turn_order(self) -> List["Entity"]:
         # Returns Entity objects in current turn order; appends any missing at the end

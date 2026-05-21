@@ -3135,4 +3135,225 @@ diagonals just long enough to reset facing back to up_right, then
 disable again and rotate ccw — snaps back the other way to up. Off-ring
 rotation always resolves in one step, never spinning through directions
 the current system has disallowed.
-normally; good_tick=1. Per-passive errors don't abort other passives.
+
+
+SCENARIO 161 — Group registry: create, add, info, remove, delete
+-----------------------------------------------------------------
+
+!match new mgrp1 GroupRegistry 8 8
+!match use mgrp1
+!ent add a A 30 1 1 10
+!ent add b B 30 2 1 11
+!ent add c C 30 3 1 12
+!ent group new swarm
+!ent group list
+!ent group add swarm a b
+!ent group add swarm a
+!ent group add swarm c
+!ent group info swarm
+!ent group list
+!ent group new elite
+!ent group add elite a
+!ent group info elite
+!ent group remove swarm b
+!ent group info swarm
+!ent group delete swarm
+!ent group list
+!ent group info elite
+
+Expected: 'new swarm' creates an empty group; 'list' shows it with
+0 members. The first 'add' enrolls a and b; the duplicate 'add swarm a'
+acknowledges a is already a member (no error). 'add c' brings the
+count to 3. 'group info' lists members in insertion order. After
+creating 'elite' with one member, 'list' shows both groups. Removing b
+from swarm leaves [a, c]. Deleting swarm doesn't affect elite — the
+groups are independent. Final 'group info elite' still shows a.
+
+
+SCENARIO 162 — Iterating !ent subcommands across a group
+---------------------------------------------------------
+
+!match new mgrp2 GroupIterate 8 8
+!match use mgrp2
+!ent add a A 30 1 1 10
+!ent add b B 30 2 1 11
+!ent add c C 30 3 1 12
+!ent group new mooks
+!ent group add mooks a b c
+!ent hp group:mooks -5
+!ent set_var group:mooks status_token marked
+!ent face group:mooks down
+!ent info group:mooks
+!ent group new ghosts
+!ent hp group:ghosts 5
+
+Expected: '!ent hp group:mooks -5' damages each of a, b, c by 5
+(three separate ack lines, one per member). 'set_var group:mooks
+status_token marked' writes the same var to each member. 'face' sets
+all three to face down. 'info group:mooks' prints three entity cards
+back-to-back. The empty group 'ghosts' produces a no-op message
+instead of an error — group iteration over zero members is a valid
+in-game state (e.g. all members died), not a failure.
+
+
+SCENARIO 163 — Atomic group movement with self-passthrough
+-----------------------------------------------------------
+
+!match new mgrp3 GroupMove 10 6
+!match use mgrp3
+!ent add a A 30 2 3 10
+!ent add b B 30 3 3 11
+!ent add c C 30 4 3 12
+!ent add wall Wall 30 7 3 1
+!ent group new line
+!ent group add line a b c
+!map
+!ent move group:line right
+!map
+!ent move group:line right right
+!map
+!ent move group:line right
+!map
+!ent remove wall
+!ent move group:line right right
+!map
+
+Expected: The line {a,b,c} sits at x=2,3,4 on row 3 with a wall at
+x=7. First 'move right' shifts to x=3,4,5 — fellow members are
+transparent so a "moves into" b's old cell with no false collision.
+'move right right' would put c on (7,3) which is the wall: abort,
+the map is unchanged, none of a/b/c moved (atomic). 'move right'
+alone shifts to x=4,5,6 — fine, c stops short of the wall. After
+removing the wall, 'move right right' completes; the group lands at
+x=6,7,8.
+
+
+SCENARIO 164 — group: target rejected for incompatible subcommands
+-------------------------------------------------------------------
+
+!match new mgrp4 GroupReject 8 8
+!match use mgrp4
+!ent add a A 30 1 1 10
+!ent add b B 30 2 1 11
+!ent group new pair
+!ent group add pair a b
+!ent tp group:pair 3 3
+!ent rename group:pair Renamed
+!ent clone group:pair clone 5 5
+!ent add group:newentity New 30 1 4
+
+Expected: All four commands return errors. tp/rename/clone all need
+a single per-call target (a unique destination cell, a single new
+name, a single new id) — they can't sensibly fan out across a group.
+'!ent add group:newentity' fails too: a creation command takes a
+NEW id, not a group target. None of these commands silently iterate
+or partially apply.
+
+
+SCENARIO 165 — Entity removal scrubs group membership
+------------------------------------------------------
+
+!match new mgrp5 GroupScrub 8 8
+!match use mgrp5
+!ent add a A 30 1 1 10
+!ent add b B 30 2 1 11
+!ent add c C 30 3 1 12
+!ent group new squad
+!ent group add squad a b c
+!ent group info squad
+!ent remove b
+!ent group info squad
+!ent group add squad b
+
+Expected: 'remove b' deletes the entity and silently drops it from
+the squad group; 'group info squad' shows [a, c]. Re-adding 'b' to
+the group after removal fails because the entity no longer exists —
+group_add raises NotFound for non-existent entity ids.
+
+
+SCENARIO 166 — Save/load preserves groups
+------------------------------------------
+
+!match new mgrp6 GroupPersist 8 8
+!match use mgrp6
+!ent add a A 30 1 1 10
+!ent add b B 30 2 1 11
+!ent group new alpha
+!ent group new beta
+!ent group add alpha a
+!ent group add alpha b
+!ent group add beta a
+!store save groups_test.json
+!match delete mgrp6
+!store load groups_test.json
+!match use mgrp6
+!ent group list
+!ent group info alpha
+!ent group info beta
+
+Expected: After save → delete → load, both groups round-trip with
+their members intact. 'alpha' has [a, b] in insertion order, 'beta'
+has [a]. An entity belonging to multiple groups (a in both alpha and
+beta) is correctly represented in each.
+
+
+SCENARIO 167 — Formula functions: group_has, group_size, group_add, group_remove
+---------------------------------------------------------------------------------
+
+!match new mgrp7 GroupFormulas 8 8
+!match use mgrp7
+!ent add a A 30 1 1 10
+!ent add b B 30 2 1 11
+!ent group new swarm
+!ent group add swarm a
+!eval "group_has(\"swarm\", \"a\")"
+!eval "group_has(\"swarm\", \"b\")"
+!eval "group_size(\"swarm\")"
+!eval "group_size(\"ghosts\")"
+!eval "group_add(\"swarm\", \"b\")"
+!eval "group_add(\"swarm\", \"b\")"
+!eval "group_size(\"swarm\")"
+!eval "group_remove(\"swarm\", \"a\")"
+!eval "group_remove(\"swarm\", \"a\")"
+!eval "group_remove(\"never_existed\", \"a\")"
+
+Expected: group_has returns True for a (member), False for b. Initial
+size is 1 for swarm, 0 for the non-existent 'ghosts' group (size of
+an undefined group is 0, not an error — symmetric with the no-op
+behavior of group_remove on a missing group). group_add returns
+True the first time (newly added) and False on the duplicate. After
+adding b, size is 2. group_remove returns True the first time and
+False the second (a is no longer a member). Removing from a never-
+existed group also returns False without raising.
+
+
+SCENARIO 168 — self_id/current_id and group-gated passive
+----------------------------------------------------------
+
+!match new mgrp8 GroupPassive 8 8
+!match use mgrp8
+!ent add a A 30 1 1 10
+!ent add b B 30 2 1 11
+!ent group new sworn
+!ent group add sworn b
+!ent set_var b sworn_tick 0
+!passive add b watch on_turn_start "entity[self].sworn_tick = entity[self].sworn_tick + (1 if group_has(\"sworn\", self_id()) else 0)"
+!turn next
+!turn next
+!turn next
+!eval "entity[b].sworn_tick"
+!eval "group_remove(\"sworn\", \"b\")"
+!turn next
+!turn next
+!eval "entity[b].sworn_tick"
+!eval "current_id()"
+
+Expected: B is in the 'sworn' group; the passive ticks on every
+B-turn. Turn order is [b, a] (B's init=11 > A's init=10) but the
+active index sticks to the first-spawned entity, so the cycle here
+runs A → B → A, with B ticking once and A's turns not firing the
+passive at all. sworn_tick is 1 after the three turn-nexts. After
+group_remove, the passive still fires on B's turn but group_has
+returns False, so the ternary contributes 0 — sworn_tick stays at 1.
+current_id() returns whichever entity's turn it is at the time of
+the eval; in the final call it's A.
