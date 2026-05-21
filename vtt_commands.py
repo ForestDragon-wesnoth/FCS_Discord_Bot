@@ -2768,6 +2768,231 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         title, body = registry.help_for(["tile", "hook"])
         return await ctx.send(f"**{title}**\n{body}")
 
+    # ---- def: template management --------------------------------------
+    # Templates are reusable tile-kind definitions (e.g. "flame",
+    # "spike_trap"). Define once, then place at any coordinate. See the
+    # SpecialTileTemplate class in logic.py for the storage shape and
+    # Match.place_tile_template for the placement semantics (data is
+    # deep-copied at place time, hooks are looked up live at fire
+    # time).
+    if sub == "def":
+        from logic import TILE_HOOK_NAMES, TILE_RESERVED_KEYS
+        from formula import validate_formula, FormulaError
+        if len(args) < 2:
+            title, body = registry.help_for(["tile", "def"])
+            return await ctx.send(f"**{title}**\n{body}")
+        dsub = args[1].lower()
+
+        if dsub == "new":
+            # !tile def new <name>
+            if await return_help_if_not_enough_args(ctx, args, 3, "tile", "def"):
+                return
+            name = args[2]
+            try:
+                m.define_tile_template(name)
+            except DuplicateId:
+                return await ctx.send(
+                    f"❌ template `{name}` already exists. "
+                    f"Use `!tile def del {name}` first or pick a new name."
+                )
+            return await ctx.send(f"Defined empty tile template `{name}`.")
+
+        if dsub == "data":
+            # !tile def data <name> <path> <value>
+            if await return_help_if_not_enough_args(ctx, args, 5, "tile", "def"):
+                return
+            name = args[2]
+            path = args[3]
+            if name not in m.tile_templates:
+                return await ctx.send(f"❌ template `{name}` not found.")
+            if path.split(".", 1)[0] in TILE_RESERVED_KEYS:
+                return await ctx.send(
+                    f"❌ template data may not use reserved keys "
+                    f"({', '.join(sorted(TILE_RESERVED_KEYS))})."
+                )
+            value = _parse_scalar(args[4])
+            tpl = m.tile_templates[name]
+            # Reuse Match.tile_set_path's path-walking semantics by
+            # operating directly on the template's data dict — we don't
+            # want to round-trip through self.tiles. The walk is short
+            # enough to inline here without pulling out a helper.
+            parts = path.split(".")
+            d = tpl.data
+            for i, key in enumerate(parts[:-1]):
+                existing = d.get(key)
+                if existing is not None and not isinstance(existing, dict):
+                    where = ".".join(parts[:i + 1])
+                    return await ctx.send(
+                        f"❌ template `{name}` value at '{where}' is "
+                        f"{type(existing).__name__}, not a dict."
+                    )
+                if key not in d:
+                    d[key] = {}
+                d = d[key]
+            d[parts[-1]] = value
+            return await ctx.send(f"template `{name}`.{path} = {value!r}")
+
+        if dsub == "del-data":
+            # !tile def del-data <name> <path>
+            if await return_help_if_not_enough_args(ctx, args, 4, "tile", "def"):
+                return
+            name = args[2]
+            path = args[3]
+            if name not in m.tile_templates:
+                return await ctx.send(f"❌ template `{name}` not found.")
+            tpl = m.tile_templates[name]
+            parts = path.split(".")
+            chain: List[Dict[str, Any]] = [tpl.data]
+            for i, key in enumerate(parts[:-1]):
+                d = chain[-1]
+                if not isinstance(d, dict) or key not in d:
+                    return await ctx.send(
+                        f"❌ template `{name}` has no value at '{path}'."
+                    )
+                chain.append(d[key])
+            leaf_parent = chain[-1]
+            leaf_key = parts[-1]
+            if not isinstance(leaf_parent, dict) or leaf_key not in leaf_parent:
+                return await ctx.send(
+                    f"❌ template `{name}` has no value at '{path}'."
+                )
+            del leaf_parent[leaf_key]
+            # Prune empty intermediate dicts the same way tile_del_path does.
+            for i in range(len(chain) - 1, 0, -1):
+                if chain[i]:
+                    break
+                del chain[i - 1][parts[i - 1]]
+            return await ctx.send(f"Removed template `{name}`.{path}.")
+
+        if dsub == "hook":
+            # !tile def hook <name> <when> <formula>
+            if await return_help_if_not_enough_args(ctx, args, 5, "tile", "def"):
+                return
+            name = args[2]
+            when = args[3]
+            formula_src = args[4]
+            if name not in m.tile_templates:
+                return await ctx.send(f"❌ template `{name}` not found.")
+            if when not in TILE_HOOK_NAMES:
+                allowed = ", ".join(sorted(TILE_HOOK_NAMES))
+                return await ctx.send(
+                    f"❌ Unknown tile hook '{when}'. Allowed: {allowed}."
+                )
+            try:
+                validate_formula(formula_src, mode="exec")
+            except FormulaError as ex:
+                return await ctx.send(f"❌ Invalid hook formula: {ex}")
+            m.tile_templates[name].hooks[when] = formula_src
+            return await ctx.send(f"Set template `{name}` `{when}` hook.")
+
+        if dsub == "del-hook":
+            # !tile def del-hook <name> <when>
+            if await return_help_if_not_enough_args(ctx, args, 4, "tile", "def"):
+                return
+            name = args[2]
+            when = args[3]
+            if name not in m.tile_templates:
+                return await ctx.send(f"❌ template `{name}` not found.")
+            if when not in m.tile_templates[name].hooks:
+                return await ctx.send(
+                    f"template `{name}` has no `{when}` hook."
+                )
+            del m.tile_templates[name].hooks[when]
+            return await ctx.send(f"Removed template `{name}` `{when}` hook.")
+
+        if dsub == "del":
+            # !tile def del <name> [confirm]
+            if await return_help_if_not_enough_args(ctx, args, 3, "tile", "def"):
+                return
+            name = args[2]
+            if name not in m.tile_templates:
+                return await ctx.send(f"❌ template `{name}` not found.")
+            confirmed = "confirm" in (a.lower() for a in args[3:])
+            instance_count = sum(
+                1 for t in m.tiles.values()
+                if isinstance(t, dict) and t.get("_template") == name
+            )
+            if instance_count and not confirmed:
+                return await ctx.send(
+                    f"⚠️ template `{name}` still has {instance_count} "
+                    f"placed instance(s). Deleting it leaves them "
+                    f"orphaned (hooks will warn at fire time). "
+                    f"To proceed: `!tile def del {name} confirm`."
+                )
+            orphaned = m.undefine_tile_template(name)
+            extra = (
+                f" ({orphaned} placed instance(s) now orphaned)"
+                if orphaned else ""
+            )
+            return await ctx.send(f"Deleted template `{name}`{extra}.")
+
+        if dsub == "list":
+            if not m.tile_templates:
+                return await ctx.send("No tile templates defined.")
+            lines = ["**tile templates:**"]
+            for tname in sorted(m.tile_templates.keys()):
+                tpl = m.tile_templates[tname]
+                placed = sum(
+                    1 for t in m.tiles.values()
+                    if isinstance(t, dict) and t.get("_template") == tname
+                )
+                hook_keys = ", ".join(sorted(tpl.hooks.keys())) or "—"
+                lines.append(
+                    f"- `{tname}` ({placed} placed; hooks: {hook_keys})"
+                )
+            return await ctx.send("\n".join(lines))
+
+        if dsub == "info":
+            if await return_help_if_not_enough_args(ctx, args, 3, "tile", "def"):
+                return
+            name = args[2]
+            if name not in m.tile_templates:
+                return await ctx.send(f"❌ template `{name}` not found.")
+            tpl = m.tile_templates[name]
+            placed = sum(
+                1 for t in m.tiles.values()
+                if isinstance(t, dict) and t.get("_template") == name
+            )
+            import json as _json
+            body = _json.dumps(
+                {"data": tpl.data, "hooks": tpl.hooks},
+                indent=2, default=str,
+            )
+            return await ctx.send(
+                f"**template `{name}`** ({placed} placed)\n```{body}\n```"
+            )
+
+        title, body = registry.help_for(["tile", "def"])
+        return await ctx.send(f"**{title}**\n{body}")
+
+    # ---- place <template> <x> <y> [k=v ...] ----------------------------
+    # Instantiate a template at (x, y). Optional override tokens look
+    # like key=value and merge over the template's defaults before the
+    # tile is written. Replaces any existing tile data at (x, y) — the
+    # GM is explicitly placing a new instance.
+    if sub == "place":
+        if await return_help_if_not_enough_args(ctx, args, 4, "tile", "place"):
+            return
+        name = args[1]
+        x, y = _parse_xy(args, offset=2)
+        overrides: Dict[str, Any] = {}
+        for tok in args[4:]:
+            if "=" not in tok:
+                return await ctx.send(
+                    f"❌ override `{tok}` must be `key=value`."
+                )
+            k, v = tok.split("=", 1)
+            overrides[k] = _parse_scalar(v)
+        try:
+            m.place_tile_template(name, x, y, overrides=overrides or None)
+        except (NotFound, OutOfBounds, VTTError) as ex:
+            return await ctx.send(f"❌ {ex}")
+        msg = f"Placed template `{name}` at ({x},{y})."
+        if overrides:
+            override_str = ", ".join(f"{k}={v!r}" for k, v in overrides.items())
+            msg = msg + f" Overrides: {override_str}."
+        return await ctx.send(msg)
+
     title, body = registry.help_for(["tile"])
     return await ctx.send(f"**{title}**\n{body}")
 
@@ -2823,15 +3048,52 @@ registry.annotate_sub(
         "!tile hook list <x> <y>"
     ),
     desc=(
-        "Tile-attached hook formulas that fire when an entity transits "
-        "the tile. `when` is one of: on_enter (fires post-position-change "
-        "when an entity arrives), on_exit (fires PRE-position-change when "
-        "an entity is about to leave — entity[self].x/.y still refer to "
-        "the exit tile inside the formula), on_stop (fires once at the "
-        "final cell of a tp or stepwise move). One hook per (tile, when) "
-        "— re-adding overwrites. Formula context: self = the moving "
-        "entity, this = current_entity_id(), tile_x / tile_y = the "
-        "firing tile's coords, hook_name = the `when` string."
+        "Per-tile ad-hoc hook formulas. The same `when` values as tile "
+        "templates (on_enter / on_exit / on_stop) — see `!tile def` for "
+        "the firing-time semantics. Ad-hoc hooks override the template's "
+        "hook for that one `when` if the tile was placed from a "
+        "template; on instances without a template they ARE the only "
+        "behavior. Reach for templates first when the same behavior "
+        "recurs at multiple coordinates; reach for !tile hook when a "
+        "single tile needs unique behavior."
+    ),
+)
+registry.annotate_sub(
+    "tile", "def",
+    usage=(
+        "!tile def new <name> | "
+        "!tile def data <name> <path> <value> | "
+        "!tile def del-data <name> <path> | "
+        "!tile def hook <name> <when> <formula> | "
+        "!tile def del-hook <name> <when> | "
+        "!tile def del <name> [confirm] | "
+        "!tile def list | "
+        "!tile def info <name>"
+    ),
+    desc=(
+        "Manage reusable tile templates. A template defines a kind of "
+        "tile (e.g. `flame`, `spike`, `treasure_chest`) with default "
+        "data fields and hook formulas. Place instances at coordinates "
+        "with `!tile place`. Template data is deep-copied into each "
+        "instance at placement (per-instance edits don't propagate), "
+        "while template hooks are looked up live at fire time (template "
+        "hook edits propagate to all placed instances). Deleting a "
+        "template that still has placed instances requires the "
+        "trailing `confirm` token — orphaned instances continue to "
+        "exist but their hook firings warn instead of running."
+    ),
+)
+registry.annotate_sub(
+    "tile", "place",
+    usage="!tile place <template> <x> <y> [key=value ...]",
+    desc=(
+        "Instantiate a defined template at (x, y), discarding any tile "
+        "data already there. The instance starts as a deep copy of the "
+        "template's data with `_template` set to the template name. "
+        "Optional `key=value` tokens after the coords override "
+        "individual fields on this instance (e.g. "
+        "`!tile place flame 3 3 burn_damage=20` to make this flame "
+        "hit harder without redefining the template)."
     ),
 )
 
