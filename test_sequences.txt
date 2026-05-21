@@ -3742,3 +3742,46 @@ unlocks the "friendly fire on/off" pattern as a one-line passive.
 The single quotes around the formula are shell quoting (the inner
 double quotes around team names need to survive shlex tokenization
 to reach the formula parser intact).
+
+
+SCENARIO 178 — Reading entity x,y from formulas (writes are rejected)
+----------------------------------------------------------------------
+
+!match new mxy1 XYReadOnly 8 8
+!match use mxy1
+!ent add a A 10 1 1 10
+!ent add b B 10 5 1 11
+!eval entity[a].x
+!eval entity[a].y
+!eval entity[a].x + entity[a].y
+!eval entity[a].x == entity[b].x
+!eval entity[a].y < entity[b].y
+!ent set_var a anchor_x 1
+!ent set_var a anchor_y 1
+!eval entity[a].x - entity[a].anchor_x
+!eval entity[a].x = 3
+!eval entity[a].y = 7
+!ent info a
+
+Expected: Formulas can read entity[X].x and entity[X].y as
+first-class values — they return the entity's actual grid
+position (not a vars key; x and y still live on the Entity
+dataclass, the engine just special-cases the read path so the
+usual vars lookup doesn't raise "Variable 'x' is not defined").
+Arithmetic, comparison, and combining with regular vars all work
+as expected — entity[a].x - entity[a].anchor_x returns 0 here
+because A is still at its spawn position.
+
+Writes to entity[X].x / entity[X].y are explicitly REJECTED with
+FormulaError pointing the user at `!ent tp`. The rationale: a
+formula assignment like "entity[a].x = 5" could only validate one
+axis at a time, which gives wrong answers for legal 2D moves past
+other entities. With A at (1,1) and B at (5,1), a naive per-axis
+"x = 5; y = 5" would try to move A through (5,1) first — that
+cell is occupied by B — and reject what should have been a legal
+move to (5,5). Rather than ship that footgun, formulas stay
+read-only on position and the user is funneled to the !ent tp
+command which validates the full destination in one shot. The
+last !ent info confirms A is still at (1,1) — the rejected
+writes didn't change anything because the engine never started
+the move.
