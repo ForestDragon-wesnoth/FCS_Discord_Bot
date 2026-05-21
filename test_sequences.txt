@@ -3204,7 +3204,7 @@ SCENARIO 163 — Atomic group movement with self-passthrough
 !ent add a A 30 2 3 10
 !ent add b B 30 3 3 11
 !ent add c C 30 4 3 12
-!ent add wall Wall 30 7 3 1
+!ent add obstacle_entity obstacle_entity 30 7 3 1
 !ent group new line
 !ent group add line a b c
 !map
@@ -3214,17 +3214,17 @@ SCENARIO 163 — Atomic group movement with self-passthrough
 !map
 !ent move group:line right
 !map
-!ent remove wall
+!ent remove obstacle_entity
 !ent move group:line right right
 !map
 
-Expected: The line {a,b,c} sits at x=2,3,4 on row 3 with a wall at
+Expected: The line {a,b,c} sits at x=2,3,4 on row 3 with a obstacle_entity at
 x=7. First 'move right' shifts to x=3,4,5 — fellow members are
 transparent so a "moves into" b's old cell with no false collision.
-'move right right' would put c on (7,3) which is the wall: abort,
+'move right right' would put c on (7,3) which is the obstacle_entity: abort,
 the map is unchanged, none of a/b/c moved (atomic). 'move right'
-alone shifts to x=4,5,6 — fine, c stops short of the wall. After
-removing the wall, 'move right right' completes; the group lands at
+alone shifts to x=4,5,6 — fine, c stops short of the obstacle_entity. After
+removing the obstacle_entity, 'move right right' completes; the group lands at
 x=6,7,8.
 
 
