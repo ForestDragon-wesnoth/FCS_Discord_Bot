@@ -3920,3 +3920,123 @@ identical structure. The serialized form uses "x,y" string keys
 (JSON object keys must be strings) but the in-memory store
 reconstructs (x, y) tuples on load. `!tile info` and tile_get on
 the reloaded match both return the original values exactly.
+
+
+SCENARIO 182 — Tile hooks: on_enter, on_exit, on_stop
+------------------------------------------------------
+
+!match new mhook1 TileHooks 8 8
+!match use mhook1
+!ent add hero Hero 30 1 1 10
+!tile hook add 3 3 on_enter 'entity[self].hp = entity[self].hp - 15'
+!tile hook list 3 3
+!ent tp hero 3 3
+!ent info hero
+!tile hook add 3 3 on_exit 'entity[self].hp = entity[self].hp - 2'
+!ent tp hero 1 1
+!ent info hero
+!ent set_var hero stops 0
+!tile hook add 5 5 on_stop 'entity[self].stops = entity[self].stops + 1'
+!ent tp hero 5 5
+!ent info hero
+!tile hook add 6 6 on_enter 'entity[self].hp = entity[self].hp - 1'
+!ent move hero 1 right
+!tile hook list 5 5
+
+Expected: Tile (3,3) gets an on_enter hook that deals 15 damage.
+Teleporting hero onto (3,3) fires the hook (hp 30 → 15) and !ent
+info shows the new HP. After adding an on_exit hook to (3,3) that
+deals 2 more damage, teleporting AWAY fires on_exit BEFORE the
+move — entity[self].x/.y still refer to (3,3) when the formula
+runs, so the damage applies (hp 15 → 13). The hero is now at
+(1,1).
+
+The on_stop hook on (5,5) increments hero.stops by 1 each time
+the entity stops there. After tp to (5,5): on_enter on (5,5) has
+no hook, but on_stop fires — stops = 1. !ent info confirms.
+
+The final !tile hook list shows the registered hook on (5,5)
+(snippet truncated if long). Subsequent moves continue to fire
+hooks as expected — adding an on_enter to (6,6) and moving 1 step
+right from (5,5) lands on (6,6), firing on_exit at (5,5) (no
+hook — no fire), on_enter at (6,6) (-1 hp), and on_stop at (6,6)
+(no hook).
+
+
+SCENARIO 183 — Walking through a fire path accumulates damage per tile
+-----------------------------------------------------------------------
+
+!match new mhook2 FirePath 8 8
+!match use mhook2
+!ent add hero Hero 30 1 1 10
+!tile hook add 2 1 on_enter 'entity[self].hp = entity[self].hp - 5'
+!tile hook add 3 1 on_enter 'entity[self].hp = entity[self].hp - 5'
+!tile hook add 4 1 on_enter 'entity[self].hp = entity[self].hp - 5'
+!tile hook add 5 1 on_stop 'entity[self].hp = entity[self].hp - 10'
+!ent move hero 4 right
+!ent info hero
+
+Expected: The hero walks four cells right from (1,1) — passing
+through (2,1), (3,1), (4,1), and stopping at (5,1). Each
+intermediate cell's on_enter hook fires once as the hero enters
+it (3 × -5 = -15 damage); the on_stop hook at (5,1) fires once
+at the end (-10 damage). Total damage = -25. !ent info shows
+hp = 5. This is exactly the user's "walking through fire takes
+damage per tile of fire walked through" pattern. on_exit is also
+fired at every transit cell (including the starting (1,1) and
+intermediates), but those tiles have no on_exit hooks so the
+fires are no-ops.
+
+
+SCENARIO 184 — Landmine: self-destruct via tile_clear from a hook
+------------------------------------------------------------------
+
+!match new mhook3 Landmine 8 8
+!match use mhook3
+!ent add hero Hero 30 1 1 10
+!tile hook add 4 4 on_enter 'entity[self].hp = entity[self].hp - 25; tile_clear(4, 4)'
+!tile info 4 4
+!ent tp hero 4 4
+!tile info 4 4
+!ent info hero
+!ent tp hero 1 1
+!ent tp hero 4 4
+!ent info hero
+
+Expected: The landmine at (4,4) has an on_enter hook that deals
+25 damage and then calls tile_clear(4, 4) to remove itself.
+After the hero teleports onto (4,4): hp = 5, and the tile is
+gone from m.tiles (!tile info reports "no data"). Teleporting
+the hero away and back lands on (4,4) again, but the tile no
+longer has a hook — no further damage. The on_stop hook would
+fire if registered, but tile_clear already wiped it; the engine
+gracefully no-ops because fire_tile_hook checks the data dict
+each fire rather than caching a hook reference.
+
+
+SCENARIO 185 — Group move fires per-member hooks
+-------------------------------------------------
+
+!match new mhook4 GroupHooks 8 8
+!match use mhook4
+!ent add soldier Soldier 30 2 5 11
+!ent add wizard Wizard 30 3 5 12
+!ent group new party
+!ent group add party soldier
+!ent group add party wizard
+!tile hook add 2 6 on_enter 'entity[self].hp = entity[self].hp - 3'
+!tile hook add 3 6 on_enter 'entity[self].hp = entity[self].hp - 3'
+!ent move group:party 1 down
+!ent info soldier
+!ent info wizard
+
+Expected: The party group moves one cell down atomically. Soldier
+goes from (2,5) → (2,6); Wizard goes from (3,5) → (3,6). Both
+target cells have fire on_enter hooks, so each member's on_enter
+fires independently — soldier takes -3 (hp 27), wizard takes -3
+(hp 27). The group-move firing is per-member, not per-group; the
+log lines show "fired for `soldier`" and "fired for `wizard`"
+separately. If one member's hook formula failed, only that
+member's hook log line would carry the ⚠️ FAILED marker; the
+group move itself wouldn't roll back (the move had already
+committed by the time hooks fired).

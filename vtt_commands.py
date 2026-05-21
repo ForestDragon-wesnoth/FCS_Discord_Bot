@@ -789,13 +789,16 @@ async def _ent_move_group(ctx, args, mgr, m):
                 return await ctx.send(f"'{d}' is not a direction.")
             moves.append((d, n)); i += 2
     try:
-        count, steps = m.move_group_dirs(group_name, moves)
+        count, steps, hook_log = m.move_group_dirs(group_name, moves)
     except VTTError as ex:
         return await ctx.send(f"❌ {ex}")
-    return await ctx.send(
+    msg = (
         f"Moved group `{group_name}` ({count} "
         f"{'members' if count != 1 else 'member'}, {steps} step(s) each)."
     )
+    if hook_log:
+        msg = msg + "\n" + "\n".join(hook_log)
+    return await ctx.send(msg)
 
 
 async def _ent_group_subcmd(ctx, args, mgr, m):
@@ -1014,12 +1017,15 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "tp":#and len(args) >= 4:
         if await return_help_if_not_enough_args(ctx, args, 4, "ent", "tp"):
             return
-        eid = _resolve_eid(m, args[1]); 
+        eid = _resolve_eid(m, args[1]);
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
         x = int(args[2]); y = int(args[3])
-        m.entities[eid].tp(x, y)
-        return await ctx.send(f"Teleported `{eid}` to ({x},{y}).")
+        hook_log = m.entities[eid].tp(x, y)
+        msg = f"Teleported `{eid}` to ({x},{y})."
+        if hook_log:
+            msg = msg + "\n" + "\n".join(hook_log)
+        return await ctx.send(msg)
 
     # move (stepwise)
     if sub == "move":# and len(args) >= 3:
@@ -1057,11 +1063,14 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
         total_steps = sum(max(1, int(n)) for _, n in moves)
         try:
-            m.entities[eid].move_dirs(moves)
+            hook_log = m.entities[eid].move_dirs(moves)
         except VTTError as e:
             return await ctx.send(f"❌ {e}")
         e = m.entities[eid]
-        return await ctx.send(f"Moved `{eid}` {total_steps} step(s) to ({e.x},{e.y}); facing {e.facing}.")
+        msg = f"Moved `{eid}` {total_steps} step(s) to ({e.x},{e.y}); facing {e.facing}."
+        if hook_log:
+            msg = msg + "\n" + "\n".join(hook_log)
+        return await ctx.send(msg)
 
     # face — accepts either a direction (any alias) or a rotation token
     # (cw/ccw/clockwise/counterclockwise). Diagonal direction tokens are
@@ -2680,6 +2689,83 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         m.tiles.clear()
         return await ctx.send(f"Cleared {n} tile(s).")
 
+    # ---- hook add|del|list ----
+    # Tile hooks are formulas stored under tiles[(x,y)]["hooks"][when]
+    # that fire when an entity transits the tile. on_enter / on_exit
+    # / on_stop are the three supported `when` values (TILE_HOOK_NAMES
+    # in logic.py). One hook per (tile, when) — re-adding overwrites.
+    # The formula context inside the hook binds self = the moving
+    # entity, this = current_entity_id(), tile_x/tile_y = the firing
+    # tile's coords, hook_name = the `when`.
+    if sub == "hook":
+        from logic import TILE_HOOK_NAMES
+        from formula import validate_formula, FormulaError
+        if len(args) < 2:
+            title, body = registry.help_for(["tile", "hook"])
+            return await ctx.send(f"**{title}**\n{body}")
+        hsub = args[1].lower()
+
+        if hsub == "add":
+            # !tile hook add <x> <y> <when> <formula>
+            if await return_help_if_not_enough_args(ctx, args, 6, "tile", "hook"):
+                return
+            x, y = _parse_xy(args, offset=2)
+            when = args[4]
+            formula_src = args[5]
+            if when not in TILE_HOOK_NAMES:
+                allowed = ", ".join(sorted(TILE_HOOK_NAMES))
+                return await ctx.send(
+                    f"❌ Unknown tile hook '{when}'. Allowed: {allowed}."
+                )
+            try:
+                validate_formula(formula_src, mode="exec")
+            except FormulaError as ex:
+                return await ctx.send(f"❌ Invalid hook formula: {ex}")
+            m.tile_set_path(x, y, f"hooks.{when}", formula_src)
+            return await ctx.send(
+                f"Set tile ({x},{y}) `{when}` hook."
+            )
+
+        if hsub == "del":
+            # !tile hook del <x> <y> <when>
+            if await return_help_if_not_enough_args(ctx, args, 5, "tile", "hook"):
+                return
+            x, y = _parse_xy(args, offset=2)
+            when = args[4]
+            if when not in TILE_HOOK_NAMES:
+                allowed = ", ".join(sorted(TILE_HOOK_NAMES))
+                return await ctx.send(
+                    f"❌ Unknown tile hook '{when}'. Allowed: {allowed}."
+                )
+            try:
+                m.tile_del_path(x, y, f"hooks.{when}")
+            except NotFound:
+                return await ctx.send(
+                    f"tile ({x},{y}) has no `{when}` hook."
+                )
+            return await ctx.send(f"Removed tile ({x},{y}) `{when}` hook.")
+
+        if hsub == "list":
+            # !tile hook list <x> <y>
+            if await return_help_if_not_enough_args(ctx, args, 4, "tile", "hook"):
+                return
+            x, y = _parse_xy(args, offset=2)
+            data = m.tiles.get((x, y), {})
+            hooks = data.get("hooks") if isinstance(data, dict) else None
+            if not isinstance(hooks, dict) or not hooks:
+                return await ctx.send(f"tile ({x},{y}): no hooks.")
+            lines = [f"**tile ({x},{y}) hooks:**"]
+            for when in sorted(hooks.keys()):
+                src = hooks[when]
+                # Truncate long formulas in the listing — the GM can
+                # use !tile info to see the full source if needed.
+                snippet = src if len(src) <= 80 else src[:77] + "..."
+                lines.append(f"- `{when}`: {snippet}")
+            return await ctx.send("\n".join(lines))
+
+        title, body = registry.help_for(["tile", "hook"])
+        return await ctx.send(f"**{title}**\n{body}")
+
     title, body = registry.help_for(["tile"])
     return await ctx.send(f"**{title}**\n{body}")
 
@@ -2725,6 +2811,25 @@ registry.annotate_sub(
         "Wipe ALL special-tile data from the active match. Requires "
         "the trailing `confirm` token; without it the command reports "
         "how many tiles would be cleared and bails."
+    ),
+)
+registry.annotate_sub(
+    "tile", "hook",
+    usage=(
+        "!tile hook add <x> <y> <when> <formula> | "
+        "!tile hook del <x> <y> <when> | "
+        "!tile hook list <x> <y>"
+    ),
+    desc=(
+        "Tile-attached hook formulas that fire when an entity transits "
+        "the tile. `when` is one of: on_enter (fires post-position-change "
+        "when an entity arrives), on_exit (fires PRE-position-change when "
+        "an entity is about to leave — entity[self].x/.y still refer to "
+        "the exit tile inside the formula), on_stop (fires once at the "
+        "final cell of a tp or stepwise move). One hook per (tile, when) "
+        "— re-adding overwrites. Formula context: self = the moving "
+        "entity, this = current_entity_id(), tile_x / tile_y = the "
+        "firing tile's coords, hook_name = the `when` string."
     ),
 )
 

@@ -631,6 +631,21 @@ HOOK_NAMES: Set[str] = {
     "on_var_write_attempt",
 }
 
+# Tile hooks live in tiles[(x, y)]["hooks"][<name>] as formula strings.
+# They fire when an entity transits a tile via Entity.tp / Entity.move_dirs
+# (and Match.move_group_dirs for group-shift moves) — see Match.fire_tile_hook
+# for the actual firing path. These names are kept separate from
+# HOOK_NAMES because entity / global passives don't subscribe to them
+# (only stored tile-side formulas do).
+TILE_HOOK_NAMES: Set[str] = {
+    "on_enter",   # entity arrived on this tile (fired post-position-change)
+    "on_exit",    # entity is about to leave this tile (fired PRE-position-change
+                  # so entity[self].x / .y still refer to the exit tile)
+    "on_stop",    # entity stopped here: either a tp landed here, or this
+                  # was the last cell of a stepwise move. Fires after on_enter
+                  # at the same coord.
+}
+
 # Var hooks distinguished from lifecycle hooks. Useful for code paths that
 # need to know whether to expect a var-event payload.
 VAR_HOOKS: Set[str] = {
@@ -1559,20 +1574,70 @@ class Entity:
         m._rebuild_turn_order()
 
     # Teleport (absolute move)
-    def tp(self, x: int, y: int):
+    def tp(self, x: int, y: int, *, fire_hooks: bool = True) -> List[str]:
+        """Teleport this entity to (x, y).
+
+        Validates bounds and occupancy, then mutates the position. Tile
+        hooks fire (when `fire_hooks=True`, the default) in this order:
+          1. on_exit at the OLD coords, before the move — entity[self].x/.y
+             still refer to the exit tile while the formula runs
+          2. on_enter at the NEW coords, after the move
+          3. on_stop at the NEW coords, after on_enter
+
+        Returns the accumulated log lines from all three firings. Empty
+        list when the moved-from and moved-to tiles have no hooks. The
+        `fire_hooks=False` escape hatch is for callers that need a raw
+        position change without trigger effects (e.g. history-restore
+        rebuilds positions from a snapshot rather than re-running the
+        moves that produced them).
+        """
         m = self._require_match()
         if not m.in_bounds(x, y):
             raise OutOfBounds(f"({x},{y}) outside {m.grid_width}x{m.grid_height}")
         if m.is_occupied(x, y, ignore_entity_id=self.id):
             raise Occupied(f"Cell ({x},{y}) already occupied")
+        log: List[str] = []
+        old_x, old_y = self.x, self.y
+        if fire_hooks and (old_x, old_y) != (x, y):
+            # Skip on_exit when teleporting to the current cell (no
+            # actual move). Matches the intuition that "tp to where I
+            # am" is a no-op rather than a fire-and-reverse cycle.
+            log.extend(m.fire_tile_hook("on_exit", self.id, old_x, old_y))
         self.move_to(x, y)
+        if fire_hooks:
+            log.extend(m.fire_tile_hook("on_enter", self.id, x, y))
+            log.extend(m.fire_tile_hook("on_stop", self.id, x, y))
+        return log
 
     # Stepwise move (final cell must be free; rotate per step)
-    def move_dirs(self, moves: list[tuple[str, int]]):
+    def move_dirs(self, moves: list[tuple[str, int]], *,
+                  fire_hooks: bool = True) -> List[str]:
+        """Walk through `moves` step by step.
+
+        Tile hooks fire per intermediate cell — on_exit at the cell
+        you're leaving (pre-move), on_enter at the cell you arrive in
+        (post-move). After the final step, on_stop fires once at the
+        final cell. Walking through three fire tiles in a row therefore
+        triggers three on_enter hooks (one per tile), accumulating
+        damage across the path — matching the user's "walking through
+        fire takes damage per tile" requirement.
+
+        Two passes still: phase 1 simulates the path to validate
+        bounds and final-cell occupancy without mutating anything;
+        phase 2 commits cell-by-cell, firing hooks as it goes. If
+        phase 1 raises (out-of-bounds, occupied) no hooks fire and no
+        position change is applied — matching the all-or-nothing
+        semantics of move_group_dirs.
+        """
         m = self._require_match()
         allow_diag_move = bool(m.rules.get("allow_diagonal_movement", False))
         allow_diag_face = bool(m.rules.get("allow_diagonal_facing", False))
 
+        # Phase 1: build the per-step path and validate bounds without
+        # mutating. step_path is a list of (cell, facing) entries: each
+        # cell is the post-step position, paired with the facing the
+        # entity should adopt arriving there.
+        step_path: List[Tuple[int, int, str]] = []
         x, y = self.x, self.y
         for direction, count in moves:
             canon = normalize_direction(direction)
@@ -1596,11 +1661,27 @@ class Entity:
                 nx, ny = x + dx, y + dy
                 if not m.in_bounds(nx, ny):
                     raise OutOfBounds(f"({nx},{ny}) outside {m.grid_width}x{m.grid_height}")
-                self.facing = step_facing
+                step_path.append((nx, ny, step_facing))
                 x, y = nx, ny
         if m.is_occupied(x, y, ignore_entity_id=self.id):
             raise Occupied(f"Cell ({x},{y}) already occupied")
-        self.move_to(x, y)
+
+        # Phase 2: commit each step, firing hooks. No more validation —
+        # phase 1 already proved the whole path is legal.
+        log: List[str] = []
+        for nx, ny, step_facing in step_path:
+            if fire_hooks:
+                log.extend(m.fire_tile_hook("on_exit", self.id, self.x, self.y))
+            self.facing = step_facing
+            self.move_to(nx, ny)
+            if fire_hooks:
+                log.extend(m.fire_tile_hook("on_enter", self.id, nx, ny))
+        if fire_hooks and step_path:
+            # on_stop fires once at the final cell, even if no actual
+            # movement happened (zero-step move_dirs) — empty step_path
+            # means no transit and therefore no stop.
+            log.extend(m.fire_tile_hook("on_stop", self.id, self.x, self.y))
+        return log
 
     # Stats/initiative (entity-owned)
     def damage_entity(self, amount: int):
@@ -2291,6 +2372,76 @@ class Match:
                     continue
         return None
 
+    def fire_tile_hook(self, when: str, entity_id: str, x: int, y: int) -> List[str]:
+        """Fire the tile hook at (x, y) of the given `when`, with the
+        moving entity bound as `self`.
+
+        Returns log lines: one info line per successful fire, one warning
+        line per formula failure. Empty list when no hook is registered
+        for this (tile, when) — the common case, since most tiles carry
+        no hooks at all.
+
+        Context bindings:
+          - self          = the entering/exiting/stopping entity
+          - this          = current_entity_id()    (often `self` but not
+                            always — e.g. a future push effect would move
+                            a non-current entity)
+          - tile_x, tile_y = (x, y) of the firing tile
+          - hook_name      = `when`
+
+        No-ops gracefully for:
+          - out-of-bounds (x, y): GM-typo guard, returns []
+          - tile has no data dict at (x, y)
+          - tile data exists but has no "hooks" subdict
+          - "hooks" subdict has no entry for `when`
+        Each layer is checked independently so a tile can carry pure
+        data with no hooks and never pay the hook-evaluation cost.
+        """
+        if when not in TILE_HOOK_NAMES:
+            return []
+        if not self.in_bounds(x, y):
+            return []
+        data = self.tiles.get((x, y))
+        if not data:
+            return []
+        hooks = data.get("hooks")
+        if not isinstance(hooks, dict):
+            return []
+        formula_src = hooks.get(when)
+        if not isinstance(formula_src, str) or not formula_src:
+            return []
+        # Lazy import to avoid logic <-> formula import cycle (same
+        # pattern as fire_hook below).
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        engine = FormulaEngine(self)
+        extras = {
+            "tile_x": x,
+            "tile_y": y,
+            "hook_name": when,
+        }
+        ctx = EvalCtx(
+            this=self.current_entity_id(),
+            target=entity_id,
+            extras=extras,
+        )
+        try:
+            engine.eval_program(formula_src, ctx)
+        except FormulaError as ex:
+            return [
+                f"⚠️ tile ({x},{y}) hook `{when}` for `{entity_id}` "
+                f"FAILED: {ex}"
+            ]
+        except Exception as ex:
+            # Defensive: any non-FormulaError exception is a bug, but
+            # don't bring down the move on it.
+            return [
+                f"⚠️ tile ({x},{y}) hook `{when}` for `{entity_id}` "
+                f"CRASHED: {type(ex).__name__}: {ex}"
+            ]
+        return [
+            f"⚙️ tile ({x},{y}) hook `{when}` fired for `{entity_id}`"
+        ]
+
     def fire_hook(self, when: str, *, target_ids: Optional[List[str]] = None) -> List[str]:
         """
         Fire every passive matching `when` for each target entity.
@@ -2789,14 +2940,23 @@ class Match:
     # could be added here later without restructuring.
     def move_group_dirs(
         self, group_name: str, moves: List[Tuple[str, int]],
-    ) -> Tuple[int, int]:
+        *, fire_hooks: bool = True,
+    ) -> Tuple[int, int, List[str]]:
         """Move every member of `group_name` through `moves` atomically.
 
-        Returns (member_count, total_steps_per_member). Raises NotFound
-        if the group is unknown or empty. Raises OutOfBounds / Occupied
-        (annotated with the offending member's id) if any member can't
-        complete the move; in that case NO entity is moved and no
-        facing is changed.
+        Returns (member_count, total_steps_per_member, log_lines).
+        Raises NotFound if the group is unknown or empty. Raises
+        OutOfBounds / Occupied (annotated with the offending member's
+        id) if any member can't complete the move; in that case NO
+        entity is moved and no facing is changed and no hooks fire.
+
+        Tile-hook firing semantics: hooks run per MEMBER, not per group.
+        Each member fires on_exit at every cell of its path, on_enter
+        at every cell it arrives in, and on_stop once at its final
+        cell — exactly like calling Entity.move_dirs on the same
+        sequence of moves, but with the group-level all-or-nothing
+        validation guarantee that no member starts moving until every
+        member's path has been proven legal.
         """
         members = self.group_members(group_name)
         if not members:
@@ -2807,12 +2967,13 @@ class Match:
 
         # Phase 1: per-member simulation. We don't mutate anything until
         # every member has been validated; if a later member fails, the
-        # earlier ones must not have moved.
-        plans: Dict[str, Tuple[int, int, str]] = {}  # eid -> (x, y, facing)
+        # earlier ones must not have moved. plans[eid] is the full
+        # per-step path so phase 2 can fire hooks cell by cell.
+        plans: Dict[str, List[Tuple[int, int, str]]] = {}
         for eid in members:
             e = self.entities[eid]
             x, y = e.x, e.y
-            facing = e.facing
+            path: List[Tuple[int, int, str]] = []
             for direction, count in moves:
                 canon = normalize_direction(direction)
                 if canon is None:
@@ -2834,8 +2995,8 @@ class Match:
                             f"Group '{group_name}' move aborted: member "
                             f"'{eid}' would leave the grid at ({nx},{ny})."
                         )
+                    path.append((nx, ny, step_facing))
                     x, y = nx, ny
-                    facing = step_facing
             # Final-cell occupancy: ignore the entity itself AND every
             # other group member (they're moving too — treat as
             # transparent). We hand-roll the loop here because
@@ -2849,17 +3010,27 @@ class Match:
                         f"'{eid}' would land on ({x},{y}), occupied by "
                         f"'{other_eid}'."
                     )
-            plans[eid] = (x, y, facing)
+            plans[eid] = path
 
-        # Phase 2: commit. Geometric invariant (same shift vector for
-        # all members) guarantees no intra-group collision, so we can
-        # just write each member's new state without re-checking.
-        for eid, (x, y, facing) in plans.items():
+        # Phase 2: commit per member, firing tile hooks step by step.
+        # Geometric invariant (same shift vector for all members)
+        # guarantees no intra-group collision; we still walk each
+        # member's path one cell at a time so on_enter / on_exit fire
+        # per intermediate tile (same as single-entity move_dirs).
+        log: List[str] = []
+        for eid, path in plans.items():
             e = self.entities[eid]
-            e.x, e.y = x, y
-            e.facing = facing
+            for nx, ny, facing in path:
+                if fire_hooks:
+                    log.extend(self.fire_tile_hook("on_exit", eid, e.x, e.y))
+                e.facing = facing
+                e.move_to(nx, ny)
+                if fire_hooks:
+                    log.extend(self.fire_tile_hook("on_enter", eid, nx, ny))
+            if fire_hooks and path:
+                log.extend(self.fire_tile_hook("on_stop", eid, e.x, e.y))
         total_steps = sum(max(1, int(n)) for _, n in moves)
-        return len(members), total_steps
+        return len(members), total_steps, log
 
     def entities_in_turn_order(self) -> List["Entity"]:
         # Returns Entity objects in current turn order; appends any missing at the end
