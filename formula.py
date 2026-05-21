@@ -221,6 +221,7 @@ import ast
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+import random
 
 from logic import VTTError
 
@@ -232,9 +233,59 @@ class FormulaError(VTTError):
 
 # --- whitelists --------------------------------------------------------------
 
+# Random helpers, exposed to formulas under user-facing names. Wrapped
+# so the FormulaError message is friendly when args are wrong — the bare
+# random.randint / random.choice exceptions reference "non-integer stop"
+# and "empty sequence" which read as Python internals rather than VTT
+# user errors. Both consume the formula AST's allowed-Call path; no
+# special-casing in the validator is needed beyond their inclusion in
+# _ALLOWED_FUNCS below.
+
+def _random_int(lo: Any, hi: Any) -> int:
+    """random_int(lo, hi): inclusive on both ends, like a die roll.
+    The match never has a seed so successive calls are independent;
+    if a GM wants repeatable rolls they should write the choice out
+    by hand instead."""
+    if not isinstance(lo, int):
+        raise FormulaError(
+            f"random_int(lo, hi): lo must be int, got "
+            f"{type(lo).__name__} ({lo!r})."
+        )
+    if not isinstance(hi, int):
+        raise FormulaError(
+            f"random_int(lo, hi): hi must be int, got "
+            f"{type(hi).__name__} ({hi!r})."
+        )
+    if lo > hi:
+        raise FormulaError(
+            f"random_int(lo, hi): lo ({lo}) must be <= hi ({hi})."
+        )
+    return random.randint(lo, hi)
+
+
+def _random_string(*choices: Any) -> str:
+    """random_string("a", "b", ...): uniform pick from the arguments.
+    Each argument must be a string — passing ints by accident would
+    return a non-string and surprise downstream string comparisons,
+    so we surface that as a FormulaError instead."""
+    if not choices:
+        raise FormulaError(
+            "random_string(...): requires at least one argument."
+        )
+    for i, c in enumerate(choices):
+        if not isinstance(c, str):
+            raise FormulaError(
+                f"random_string(...): all arguments must be strings; "
+                f"argument {i} is {type(c).__name__} ({c!r})."
+            )
+    return random.choice(choices)
+
+
 _ALLOWED_FUNCS: Dict[str, Any] = {
     "min": min, "max": max, "abs": abs, "round": round,
     "int": int, "float": float, "str": str,
+    "random_int": _random_int,
+    "random_string": _random_string,
 }
 
 # Match-bound function names. These functions are bound at namespace build
