@@ -554,11 +554,30 @@ class FormulaEngine:
 
     def __init__(self, match):
         self._match = match
+
+    # ---- positional-var special-casing ------------------------------------
+    # Names of the entity attributes that the formula engine treats as
+    # first-class "vars" even though they live as dataclass fields on
+    # Entity rather than inside entity.vars. Reads route to e.<name>;
+    # writes route through Entity.tp() so bounds and occupancy
+    # validation engages (a formula write that lands the entity on an
+    # occupied or out-of-grid cell raises FormulaError instead of
+    # silently desyncing engine state from displayed state). The set
+    # is hardcoded — these aren't user-configurable like hp_var or
+    # team_var because the collision and bounds checks depend on the
+    # underlying fields being x / y specifically.
+    _POSITIONAL_PATHS = ("x", "y")
+
     def _read(self, who: str, path: str, ctx: EvalCtx) -> Any:
         eid = ctx.resolve_who(who)
         e = self._match.entities.get(eid)
         if e is None:
             raise FormulaError(f"Entity '{eid}' not found.")
+        if path in self._POSITIONAL_PATHS:
+            # Direct attribute read — x and y live on the dataclass,
+            # not in vars, so the normal _get_path(e.vars, path) would
+            # raise "Variable 'x' is not defined" for every entity.
+            return getattr(e, path)
         return _get_path(e.vars, path)
 
     def _write(self, who: str, path: str, value: Any, ctx: EvalCtx) -> Any:
@@ -571,11 +590,51 @@ class FormulaEngine:
         passives still run; only the log lines are discarded. If a passive
         chain needs to surface logs, it should originate from a command
         path that captures them.
+
+        Special case: writes to "x" or "y" route through Entity.tp()
+        so the engine enforces grid bounds and occupancy. tp() raises
+        OutOfBounds / Occupied (both VTTError subclasses) when the move
+        is illegal; we re-raise those as FormulaError so the message
+        threads through the standard formula-error pipeline. On
+        success, entity.x / entity.y change in place — no var hooks
+        fire for positional changes because moves go through a
+        different mutation chokepoint (Entity.tp / move_to) than var
+        writes, and intercepting both would change behavior for every
+        existing move command. The "rollback if tp fails" semantic
+        from the original spec is implicit: tp validates BEFORE
+        mutating, so a failed teleport never touched entity state
+        and there's nothing to undo.
         """
         eid = ctx.resolve_who(who)
         e = self._match.entities.get(eid)
         if e is None:
             raise FormulaError(f"Entity '{eid}' not found.")
+        if path in self._POSITIONAL_PATHS:
+            try:
+                new_int = int(value)
+            except (TypeError, ValueError):
+                raise FormulaError(
+                    f"entity[{who}].{path} expects an integer, got "
+                    f"{type(value).__name__} ({value!r})."
+                )
+            # One axis at a time: keep the other axis at its current
+            # value. The user can still chain writes to update both
+            # axes — each goes through its own tp() validation, which
+            # is the conservative choice (mid-formula state is always
+            # a real, legal position).
+            new_x = new_int if path == "x" else e.x
+            new_y = new_int if path == "y" else e.y
+            try:
+                e.tp(new_x, new_y)
+            except VTTError as ex:
+                # OutOfBounds and Occupied subclass VTTError; rewrap
+                # as FormulaError so the message format matches every
+                # other formula failure surface ("❌ <msg>" via the
+                # command dispatcher).
+                raise FormulaError(
+                    f"Cannot move entity[{who}].{path} to {new_int}: {ex}"
+                )
+            return new_int
         # write_var does the diff + event firing + mutation in one shot.
         # _ = e.write_var(path, value)  # log lines discarded
         e.write_var(path, value)
