@@ -3744,122 +3744,44 @@ double quotes around team names need to survive shlex tokenization
 to reach the formula parser intact).
 
 
-SCENARIO 178 — Reading and writing x,y from formulas; tp-style validation
---------------------------------------------------------------------------
+SCENARIO 178 — Reading entity x,y from formulas (writes are rejected)
+----------------------------------------------------------------------
 
-!match new mxy1 XYBasics 8 8
+!match new mxy1 XYReadOnly 8 8
 !match use mxy1
 !ent add a A 10 1 1 10
-!ent add wall Wall 10 4 1 5
+!ent add b B 10 5 1 11
 !eval entity[a].x
 !eval entity[a].y
 !eval entity[a].x + entity[a].y
+!eval entity[a].x == entity[b].x
+!eval entity[a].y < entity[b].y
+!ent set_var a anchor_x 1
+!ent set_var a anchor_y 1
+!eval entity[a].x - entity[a].anchor_x
 !eval entity[a].x = 3
-!ent info a
 !eval entity[a].y = 7
 !ent info a
-!eval entity[a].x = 100
-!ent info a
-!eval entity[a].x = 4
-!ent info a
-!eval entity[a].y = 0
 
-Expected: Formulas can now read entity[X].x / entity[X].y directly
-(returning the entity's actual grid position, NOT a vars key — x
-and y still live on the Entity dataclass; the formula engine
-special-cases the read path).
+Expected: Formulas can read entity[X].x and entity[X].y as
+first-class values — they return the entity's actual grid
+position (not a vars key; x and y still live on the Entity
+dataclass, the engine just special-cases the read path so the
+usual vars lookup doesn't raise "Variable 'x' is not defined").
+Arithmetic, comparison, and combining with regular vars all work
+as expected — entity[a].x - entity[a].anchor_x returns 0 here
+because A is still at its spawn position.
 
-Writes route through Entity.tp(), so they're subject to the same
-bounds-and-occupancy checks as the `!ent tp` command. Legal moves
-succeed and the info card shows the new position. Out-of-bounds
-writes (x=100 on an 8-wide grid, y=0 with 1-based indexing)
-surface as ❌ FormulaError with the underlying bounds message. The
-"rollback" semantic from the original spec is implicit: tp
-validates BEFORE mutating entity state, so a failed teleport never
-changed anything and there's no half-applied write to undo. A
-formula write that tries to land on the wall at (4,1) raises
-Occupied for the same reason — the info card shows the entity is
-still at the position from the previous successful write.
-
-
-SCENARIO 179 — Chase passive: hunter walks toward target via formula writes
-----------------------------------------------------------------------------
-
-!match new mxy2 ChasePassive 8 8
-!match use mxy2
-!ent add hunter Hunter 10 1 1 12
-!ent set_var hunter target_x 5
-!ent set_var hunter target_y 3
-!passive add hunter chase on_turn_start "entity[self].x = entity[self].x + 1 if entity[self].x < entity[self].target_x else (entity[self].x - 1 if entity[self].x > entity[self].target_x else entity[self].x); entity[self].y = entity[self].y + 1 if entity[self].y < entity[self].target_y else (entity[self].y - 1 if entity[self].y > entity[self].target_y else entity[self].y)"
-!turn next
-!ent info hunter
-!turn next
-!ent info hunter
-!turn next
-!ent info hunter
-!turn next
-!ent info hunter
-!turn next
-!ent info hunter
-
-Expected: Each turn-start, the `chase` passive nudges the hunter
-one cell closer to (target_x, target_y) on each axis independently
-— ternary chains pick +1 / -1 / 0 based on the sign of
-(target - current). With the hunter starting at (1,1) and the
-target at (5,3), the trajectory is:
-  turn 1: (2,2)
-  turn 2: (3,3)        — y reaches target this turn
-  turn 3: (4,3)        — x keeps advancing, y stays
-  turn 4: (5,3)        — both at target
-  turn 5: (5,3)        — no-op (both ternaries pick "else: keep")
-
-Each formula write goes through Entity.tp(), so the passive can't
-accidentally walk the hunter off the grid or into another entity
-— if a wall stood at (3,3), turn 2's "x = x+1" half would succeed
-to (3,2) but the "y = y+1" half would raise FormulaError and the
-passive would surface a ⚠️ FAIL warning. The hunter would still
-be at (3,2) because the X half ran first and committed before the
-Y half failed — this is the per-axis semantics of writing one
-coordinate at a time. To enforce all-or-nothing 2D moves, a GM
-should validate the destination explicitly (e.g. read
-entity[X].target_x / target_y, decide whether the target cell is
-free, then issue a single coordinated write).
-
-
-SCENARIO 180 — Collision rejected at passive level surfaces as ⚠️ FAIL
-------------------------------------------------------------------------
-
-!match new mxy3 BlockedMarch 8 8
-!match use mxy3
-!ent add runner Runner 10 1 1 10
-!ent add wall Wall 10 3 1 11
-!passive add runner march on_turn_start "entity[self].x = entity[self].x + 1"
-!turn next
-!ent info runner
-!turn next
-!turn next
-!ent info runner
-!turn next
-!turn next
-!ent info runner
-
-Expected: The `march` passive blindly advances runner.x by 1 each
-turn-start. With runner at (1,1) and wall at (3,1):
-  - turn 1: runner.x: 1 → 2. Move succeeds.
-  - turn 3 (runner's next turn, after wall's): runner.x: 2 → 3.
-    Collision with wall — the passive surfaces ⚠️ "passive
-    `runner.march` ... FAIL: Cannot move entity[self].x to 3:
-    Cell (3,1) already occupied". Runner stays at (2,1).
-  - turn 5: same collision, same FAIL warning, runner stays.
-
-This is the rollback-on-failure pattern the original spec called
-out: when tp rejects the move, the entity's position is unchanged
-and the formula error propagates as a passive-level warning,
-without halting the rest of the match. A "smart" version of the
-same passive could pre-check the destination with an if-expression:
-"entity[self].x = entity[self].x + 1 if <destination free> else
-entity[self].x" — but expressing "destination free" requires
-iterating over entities, which the formula engine doesn't
-currently expose. The passive-level FAIL log is the simplest way
-for a GM to discover a blocked move without writing destination-
-check logic by hand.
+Writes to entity[X].x / entity[X].y are explicitly REJECTED with
+FormulaError pointing the user at `!ent tp`. The rationale: a
+formula assignment like "entity[a].x = 5" could only validate one
+axis at a time, which gives wrong answers for legal 2D moves past
+other entities. With A at (1,1) and B at (5,1), a naive per-axis
+"x = 5; y = 5" would try to move A through (5,1) first — that
+cell is occupied by B — and reject what should have been a legal
+move to (5,5). Rather than ship that footgun, formulas stay
+read-only on position and the user is funneled to the !ent tp
+command which validates the full destination in one shot. The
+last !ent info confirms A is still at (1,1) — the rejected
+writes didn't change anything because the engine never started
+the move.

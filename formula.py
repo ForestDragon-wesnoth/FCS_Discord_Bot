@@ -559,13 +559,17 @@ class FormulaEngine:
     # Names of the entity attributes that the formula engine treats as
     # first-class "vars" even though they live as dataclass fields on
     # Entity rather than inside entity.vars. Reads route to e.<name>;
-    # writes route through Entity.tp() so bounds and occupancy
-    # validation engages (a formula write that lands the entity on an
-    # occupied or out-of-grid cell raises FormulaError instead of
-    # silently desyncing engine state from displayed state). The set
-    # is hardcoded — these aren't user-configurable like hp_var or
-    # team_var because the collision and bounds checks depend on the
-    # underlying fields being x / y specifically.
+    # writes are REJECTED with a FormulaError pointing the user at the
+    # !ent tp command. The read side is "lazy intercept" — no vars
+    # mirror, just a path-name special case in _read. The write side
+    # was originally a per-axis tp() call, but that produces broken
+    # results for any 2D move past another entity: writing x first
+    # validates the (new_x, old_y) cell, which may be occupied even
+    # when the actual intended destination (new_x, new_y) is free. To
+    # avoid that edge case we punt on formula writes entirely until
+    # the engine can validate full 2D destinations in one shot.
+    # Read-only x/y also keeps the "rollback" question moot: there's
+    # nothing to roll back if the write was never accepted.
     _POSITIONAL_PATHS = ("x", "y")
 
     def _read(self, who: str, path: str, ctx: EvalCtx) -> Any:
@@ -591,50 +595,25 @@ class FormulaEngine:
         chain needs to surface logs, it should originate from a command
         path that captures them.
 
-        Special case: writes to "x" or "y" route through Entity.tp()
-        so the engine enforces grid bounds and occupancy. tp() raises
-        OutOfBounds / Occupied (both VTTError subclasses) when the move
-        is illegal; we re-raise those as FormulaError so the message
-        threads through the standard formula-error pipeline. On
-        success, entity.x / entity.y change in place — no var hooks
-        fire for positional changes because moves go through a
-        different mutation chokepoint (Entity.tp / move_to) than var
-        writes, and intercepting both would change behavior for every
-        existing move command. The "rollback if tp fails" semantic
-        from the original spec is implicit: tp validates BEFORE
-        mutating, so a failed teleport never touched entity state
-        and there's nothing to undo.
+        Writes to "x" or "y" are rejected. See the comment on
+        _POSITIONAL_PATHS — the per-axis tp() validation was unsound for
+        any 2D move past another entity. Until the engine supports
+        "validate destination then move" in a single check, the user
+        should use the `!ent tp` command (or a movement-rule command)
+        which already takes both coordinates at once.
         """
         eid = ctx.resolve_who(who)
         e = self._match.entities.get(eid)
         if e is None:
             raise FormulaError(f"Entity '{eid}' not found.")
         if path in self._POSITIONAL_PATHS:
-            try:
-                new_int = int(value)
-            except (TypeError, ValueError):
-                raise FormulaError(
-                    f"entity[{who}].{path} expects an integer, got "
-                    f"{type(value).__name__} ({value!r})."
-                )
-            # One axis at a time: keep the other axis at its current
-            # value. The user can still chain writes to update both
-            # axes — each goes through its own tp() validation, which
-            # is the conservative choice (mid-formula state is always
-            # a real, legal position).
-            new_x = new_int if path == "x" else e.x
-            new_y = new_int if path == "y" else e.y
-            try:
-                e.tp(new_x, new_y)
-            except VTTError as ex:
-                # OutOfBounds and Occupied subclass VTTError; rewrap
-                # as FormulaError so the message format matches every
-                # other formula failure surface ("❌ <msg>" via the
-                # command dispatcher).
-                raise FormulaError(
-                    f"Cannot move entity[{who}].{path} to {new_int}: {ex}"
-                )
-            return new_int
+            raise FormulaError(
+                f"entity[{who}].{path} is read-only from formulas. "
+                f"Use `!ent tp <id> <x> <y>` to move an entity — that "
+                f"command validates the full destination at once, "
+                f"avoiding the per-axis collision quirk that would "
+                f"break legal 2D moves past another entity."
+            )
         # write_var does the diff + event firing + mutation in one shot.
         # _ = e.write_var(path, value)  # log lines discarded
         e.write_var(path, value)
