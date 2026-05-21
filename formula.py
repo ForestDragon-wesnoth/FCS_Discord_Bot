@@ -313,6 +313,15 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
 _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     "group_has", "group_size", "group_add", "group_remove",
     "self_id", "current_id",
+    # Tile data access. Tiles live on Match.tiles as a sparse dict of
+    # (x, y) tuples to free-form data dicts. The validator restricts
+    # attribute chains to entity[X].path, so tile data uses dotted-
+    # STRING paths instead of dot-attribute syntax:
+    #   tile_get(5, 5, "flame.burn_damage")   -> 5     or raises if absent
+    #   tile_has(5, 5, "flame.burn_damage")   -> bool  (False on absent /
+    #                                                  off-grid coords)
+    # Reads only in this PR; mutation comes later with tile hooks.
+    "tile_get", "tile_has",
 )
 
 _ALLOWED_NODES: Tuple[type, ...] = (
@@ -704,6 +713,57 @@ class FormulaEngine:
         ns["group_remove"] = _group_remove
         ns["self_id"]      = _self_id
         ns["current_id"]   = _current_id
+
+        # Tile data accessors. tile_get raises FormulaError on missing
+        # paths (matching the "Variable 'foo' is not defined" style of
+        # entity-var reads); tile_has returns False instead of raising
+        # so formulas can use it as a guard before tile_get. Both
+        # accept integer coordinates and a dotted string path.
+        def _tile_get(x: Any, y: Any, path: Any) -> Any:
+            if not isinstance(x, int) or isinstance(x, bool):
+                raise FormulaError(
+                    f"tile_get(x, y, path): x must be int, got "
+                    f"{type(x).__name__}."
+                )
+            if not isinstance(y, int) or isinstance(y, bool):
+                raise FormulaError(
+                    f"tile_get(x, y, path): y must be int, got "
+                    f"{type(y).__name__}."
+                )
+            if not isinstance(path, str):
+                raise FormulaError(
+                    f"tile_get(x, y, path): path must be str, got "
+                    f"{type(path).__name__}."
+                )
+            try:
+                return match.tile_get_path(x, y, path)
+            except VTTError as ex:
+                # OutOfBounds / NotFound / empty-path errors from
+                # tile_get_path are all VTTError subclasses; surface
+                # them as FormulaError so the ❌ formula error path
+                # picks them up consistently.
+                raise FormulaError(str(ex))
+
+        def _tile_has(x: Any, y: Any, path: Any) -> bool:
+            if not isinstance(x, int) or isinstance(x, bool):
+                raise FormulaError(
+                    f"tile_has(x, y, path): x must be int, got "
+                    f"{type(x).__name__}."
+                )
+            if not isinstance(y, int) or isinstance(y, bool):
+                raise FormulaError(
+                    f"tile_has(x, y, path): y must be int, got "
+                    f"{type(y).__name__}."
+                )
+            if not isinstance(path, str):
+                raise FormulaError(
+                    f"tile_has(x, y, path): path must be str, got "
+                    f"{type(path).__name__}."
+                )
+            return match.tile_has_path(x, y, path)
+
+        ns["tile_get"] = _tile_get
+        ns["tile_has"] = _tile_has
 
         return ns
 

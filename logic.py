@@ -2011,6 +2011,25 @@ class Match:
     # command that targets the group.
     groups: Dict[str, List[str]] = field(default_factory=dict)
 
+    # Special-tile data store. Sparse dict keyed by (x, y) tuple — only
+    # coordinates the GM has explicitly written to live here. Each value
+    # is a free-form dict of named "features" (e.g. {"flame":
+    # {"burn_damage": 5}, "loot": {"gold": 50}, "glyph": "*"}); a single
+    # tile can hold any number of side-by-side features. Reads from
+    # formulas go through tile_get / tile_has in formula.py — the
+    # validator rejects raw attribute chains on non-entity objects, so
+    # tile data uses dotted-string paths instead of dot-attribute syntax.
+    #
+    # The "glyph" key, if set to a single character, overrides the
+    # blank-cell rendering in !map (entities still take precedence).
+    # Other keys are GM-defined and have no engine-level meaning until
+    # later PRs add hooks and tile-attached passives on top.
+    #
+    # JSON serialization rewrites tuple keys as "x,y" strings (see the
+    # _tile_key / _parse_tile_key helpers further down) because JSON
+    # objects can't have non-string keys.
+    tiles: Dict[Tuple[int, int], Dict[str, Any]] = field(default_factory=dict)
+
     # ---- runtime-only state for var-hook recursion safeguard ----
     # Tracks how deep we are in a chain of var-hook fires. A passive's
     # formula can write vars, which produces more events, which fire more
@@ -2034,6 +2053,133 @@ class Match:
     # ---- global constraints / helpers (unchanged in spirit) ----
     def in_bounds(self, x: int, y: int) -> bool:
         return 1 <= x <= self.grid_width and 1 <= y <= self.grid_height
+
+    # ---- tile data helpers --------------------------------------------
+    # Tiles live in self.tiles keyed by (x, y) tuples. These methods are
+    # the chokepoints for set / get / delete so that JSON serialization,
+    # bounds checking, and intermediate-dict creation happen in one
+    # place — both !tile commands and the formula-side tile_get /
+    # tile_has functions reach for them.
+
+    def tile_data(self, x: int, y: int) -> Dict[str, Any]:
+        """Return the tile's data dict at (x, y), creating an empty
+        entry if the tile has no data yet. Caller mutates in place.
+        Out-of-bounds coordinates raise OutOfBounds — silently auto-
+        creating off-grid tiles would mask GM typos."""
+        if not self.in_bounds(x, y):
+            raise OutOfBounds(
+                f"({x},{y}) outside {self.grid_width}x{self.grid_height}"
+            )
+        return self.tiles.setdefault((x, y), {})
+
+    def tile_get_path(self, x: int, y: int, path: str) -> Any:
+        """Read tile_data[x,y][a][b][c] for a dotted path 'a.b.c'.
+        Raises NotFound on any missing segment so the user gets a
+        precise error like \"tile (5,5) has no feature 'flame'\"
+        rather than a Python KeyError. Empty-path '' is rejected —
+        the bare 'tile data dict' isn't a useful thing to expose."""
+        if not self.in_bounds(x, y):
+            raise OutOfBounds(
+                f"({x},{y}) outside {self.grid_width}x{self.grid_height}"
+            )
+        if not path:
+            raise VTTError("tile path cannot be empty.")
+        d: Any = self.tiles.get((x, y), {})
+        parts = path.split(".")
+        for i, key in enumerate(parts):
+            if not isinstance(d, dict) or key not in d:
+                # Build a useful path-prefix for the error so the GM
+                # knows where the chain broke.
+                where = ".".join(parts[:i + 1])
+                raise NotFound(
+                    f"tile ({x},{y}) has no value at '{where}'."
+                )
+            d = d[key]
+        return d
+
+    def tile_has_path(self, x: int, y: int, path: str) -> bool:
+        """Boolean version of tile_get_path. Out-of-bounds returns
+        False (a missing tile is conceptually 'has no feature' rather
+        than an error) so formulas can defensively guard against
+        passing entity coords that walked off-grid for some reason."""
+        if not self.in_bounds(x, y):
+            return False
+        if not path:
+            return False
+        d: Any = self.tiles.get((x, y), {})
+        for key in path.split("."):
+            if not isinstance(d, dict) or key not in d:
+                return False
+            d = d[key]
+        return True
+
+    def tile_set_path(self, x: int, y: int, path: str, value: Any) -> None:
+        """Set tile_data[x,y][a][b][c] = value, creating intermediate
+        dicts as needed (same write semantics as Entity.write_var,
+        but on tile dicts). Out-of-bounds raises; empty path raises;
+        path that collides with a non-dict value mid-traversal raises
+        (we don't silently clobber a scalar with a dict)."""
+        if not self.in_bounds(x, y):
+            raise OutOfBounds(
+                f"({x},{y}) outside {self.grid_width}x{self.grid_height}"
+            )
+        if not path:
+            raise VTTError("tile path cannot be empty.")
+        d = self.tiles.setdefault((x, y), {})
+        parts = path.split(".")
+        for i, key in enumerate(parts[:-1]):
+            existing = d.get(key)
+            if existing is not None and not isinstance(existing, dict):
+                where = ".".join(parts[:i + 1])
+                raise VTTError(
+                    f"tile ({x},{y}) value at '{where}' is "
+                    f"{type(existing).__name__}, not a dict — cannot "
+                    f"set a nested key under it without clobbering."
+                )
+            if key not in d:
+                d[key] = {}
+            d = d[key]
+        d[parts[-1]] = value
+
+    def tile_del_path(self, x: int, y: int, path: Optional[str]) -> None:
+        """Delete a dotted-path key from a tile's data, OR (when
+        path is None / empty) delete the entire tile entry from
+        self.tiles. After a path-delete, walk back up the chain and
+        drop any parent dict that became empty, finishing with the
+        (x,y) entry itself — every entry in self.tiles always has
+        at least one populated feature so the serialized form
+        stays sparse and !tile list doesn't show no-op coords."""
+        if (x, y) not in self.tiles:
+            return  # nothing to do — symmetric with remove_var_silent
+        if not path:
+            del self.tiles[(x, y)]
+            return
+        # Walk down, tracking each parent dict so we can prune empties
+        # on the way back up.
+        parts = path.split(".")
+        chain: List[Dict[str, Any]] = [self.tiles[(x, y)]]
+        for i, key in enumerate(parts[:-1]):
+            d = chain[-1]
+            if not isinstance(d, dict) or key not in d:
+                where = ".".join(parts[:i + 1])
+                raise NotFound(f"tile ({x},{y}) has no value at '{where}'.")
+            chain.append(d[key])
+        leaf_parent = chain[-1]
+        leaf_key = parts[-1]
+        if not isinstance(leaf_parent, dict) or leaf_key not in leaf_parent:
+            raise NotFound(f"tile ({x},{y}) has no value at '{path}'.")
+        del leaf_parent[leaf_key]
+        # Prune empty parents from the leaf back to the root. Each
+        # iteration drops the just-emptied dict from its grandparent
+        # under the key we descended through.
+        for i in range(len(chain) - 1, 0, -1):
+            if chain[i]:
+                break  # still has siblings — stop pruning
+            parent = chain[i - 1]
+            parent_key = parts[i - 1]
+            del parent[parent_key]
+        if not self.tiles[(x, y)]:
+            del self.tiles[(x, y)]
 
     def is_occupied(self, x: int, y: int, ignore_entity_id: Optional[str] = None) -> bool:
         for eid, e in self.entities.items():
@@ -2434,6 +2580,14 @@ class Match:
             "round_started": self.round_started,
             "global_passives": {pid: p.to_dict() for pid, p in self.global_passives.items()},
             "groups": {name: list(members) for name, members in self.groups.items()},
+            # Tile keys are tuples internally; JSON object keys must be
+            # strings, so encode as "x,y". Order doesn't matter (the
+            # match doesn't iterate tiles by position), but sorting the
+            # serialized output keeps save-file diffs readable when a
+            # GM edits tiles by hand.
+            "tiles": {
+                f"{x},{y}": dat for (x, y), dat in sorted(self.tiles.items())
+            },
         }
         if include_history:
             d["history"] = self.history.to_dict()
@@ -2470,6 +2624,21 @@ class Match:
             name: [eid for eid in members if eid in m.entities]
             for name, members in raw_groups.items()
         }
+        # Tiles are even newer; older saves omit the key. Filter to
+        # in-bounds coords so a grid-resize between save and load
+        # doesn't leave orphaned data — the match's effective bounds
+        # are authoritative, and an out-of-bounds tile would never be
+        # reachable from any command or formula anyway.
+        raw_tiles = d.get("tiles", {}) or {}
+        m.tiles = {}
+        for key, val in raw_tiles.items():
+            try:
+                xs, ys = key.split(",", 1)
+                x, y = int(xs), int(ys)
+            except (ValueError, AttributeError):
+                continue
+            if m.in_bounds(x, y) and isinstance(val, dict) and val:
+                m.tiles[(x, y)] = val
         # History is optional in saved dicts. It's only present when the
         # original save was made with include_history=True. A snapshot's
         # state.dict deliberately omits history (snapshots-within-
@@ -2489,6 +2658,22 @@ class Match:
             for _ in range(self.grid_height + 1)
         ]
 
+        # Lay down tile glyphs first — any tile with a single-character
+        # "glyph" key shows that character instead of the default ".".
+        # Validation is strict (must be exactly one character) so a GM
+        # who accidentally sets glyph="fire" gets nothing on the map
+        # rather than a column-misaligning multi-character cell.
+        for (tx, ty), data in self.tiles.items():
+            if not self.in_bounds(tx, ty):
+                continue
+            glyph = data.get("glyph")
+            if isinstance(glyph, str) and len(glyph) == 1:
+                grid[ty][tx] = glyph
+
+        # Entities take precedence over tile glyphs: the standard
+        # "who is where" question is more useful than tile feature
+        # visualization. A GM who wants tile visibility through an
+        # entity should toggle the entity off or use !tile info.
         for e in self.entities.values():
             # Keep old semantics: skip dead entities
             if not getattr(e, "is_alive", True):
