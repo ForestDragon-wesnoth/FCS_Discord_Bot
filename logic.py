@@ -2059,8 +2059,14 @@ class Match:
     entities: Dict[str, Entity] = field(default_factory=dict)
     turn_order: List[str] = field(default_factory=list)
     active_index: int = 0
-    #global turn counter, starts at 1. global turn here increments by 1 after EVERY entity had its turn and the cycle resets
-    turn_number: int = 1
+    #global round counter, starts at 1. Increments by 1 each time every
+    #entity in the turn order has had their turn and the cycle wraps
+    #back to the first entity. A "turn" is per-entity (active_index
+    #points to whose turn it is); a "round" is the full lap through
+    #turn_order. The two are deliberately distinct: on_turn_* hooks
+    #fire once per entity per round, while on_round_* hooks fire
+    #once per round across the whole table.
+    round_number: int = 1
     # Tracks whether the very first `on_round_start`/`on_turn_start` have fired
     # for this match. False until the first `Match.next_turn()` call. Used to
     # make that first call begin the round (fire start-hooks for active_index)
@@ -2330,7 +2336,7 @@ class Match:
             log.extend(self.fire_hook("on_round_end"))
         self.active_index = new_index
         if wrapped:
-            self.turn_number += 1
+            self.round_number += 1
             log.extend(self.fire_hook("on_round_start"))
             # Autosave round start AFTER turn_number is bumped and
             # on_round_start hooks have fired, mirroring the first-call
@@ -2727,7 +2733,7 @@ class Match:
             "active_index": self.active_index,
             "system_name": self.system_name,
             "rules": self.rules,
-            "turn_number": self.turn_number,
+            "round_number": self.round_number,
             "round_started": self.round_started,
             "global_passives": {pid: p.to_dict() for pid, p in self.global_passives.items()},
             "groups": {name: list(members) for name, members in self.groups.items()},
@@ -2761,7 +2767,7 @@ class Match:
         m.turn_order = d.get("turn_order", [])
         m.active_index = d.get("active_index", 0)
         # m.rules already set above
-        m.turn_number = int(d.get("turn_number", 1))
+        m.round_number = int(d.get("round_number", 1))
         m.round_started = bool(d.get("round_started", False))
         m.global_passives = {
             pid: Passive.from_dict(pd)

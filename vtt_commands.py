@@ -1439,7 +1439,7 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if eid not in m.turn_order:
             raise NotFound(f"Entity '{eid}' not in turn order.")
         m.active_index = m.turn_order.index(eid)
-        return await ctx.send(f"Active turn set to `{eid}` (round {m.turn_number})")
+        return await ctx.send(f"Active turn set to `{eid}` (round {m.round_number})")
     # Fallback: show authoritative help
     title, body = registry.help_for(["turn"])
     return await ctx.send(f"**{title}**\n{body}")
@@ -1447,7 +1447,9 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 registry.annotate_sub(
     "turn", "next",
     usage="!turn next",
-    desc="Advance to the next entity's turn (turn number wraps/increments)."
+    desc=("Advance to the next entity's turn. When the cycle wraps "
+          "(every entity has acted), increments the match's round_number "
+          "and fires on_round_end / on_round_start hooks.")
 )
 registry.annotate_sub(
     "turn", "set",
@@ -1457,13 +1459,13 @@ registry.annotate_sub(
 
 
 #global info about the match that isn't the map or entities
-@registry.command("match_toplevel", usage="!match_toplevel", desc="Show active match summary (name/id/turn number).")
+@registry.command("match_toplevel", usage="!match_toplevel", desc="Show active match summary (name/id/round number).")
 async def match_top_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     parts = [
         f"**{m.name}** `{m.id}`",
         f"Game System: **{m.system_name}**",
-        f"Current Turn Number: **{m.turn_number}**",
+        f"Current Round Number: **{m.round_number}**",
     ]
     if m.global_passives:
         parts.append("")
