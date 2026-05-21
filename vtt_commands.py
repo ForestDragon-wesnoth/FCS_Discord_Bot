@@ -2578,6 +2578,157 @@ registry.annotate_sub(
 )
 
 
+# ---- !tile -------------------------------------------------------------
+# Special-tile data store. Each (x, y) tile has its own free-form dict;
+# this command surface manages reads/writes and serialization. Hooks
+# (on_enter / on_exit / on_stop) and tile-attached passives are coming
+# in follow-up PRs — this one ships the storage primitive plus the
+# formula-side tile_get / tile_has accessors.
+def _parse_xy(args: List[str], offset: int = 1) -> Tuple[int, int]:
+    """Pull integer (x, y) starting at args[offset]. Raises VTTError
+    with the standard '!ent tp'-style message so the error surface is
+    consistent across tile commands."""
+    try:
+        x = int(args[offset])
+        y = int(args[offset + 1])
+    except (IndexError, ValueError):
+        raise VTTError("expected integer x and y coordinates.")
+    return x, y
+
+
+@registry.command(
+    "tile",
+    usage=("!tile <set|del|info|list|clear> ..."),
+    desc=(
+        "Special-tile data store. Each (x, y) tile has a free-form "
+        "data dict — set arbitrary nested keys with `set`, read with "
+        "`info`, drop with `del`. A tile's \"glyph\" key (if set to "
+        "a single character) overrides the default \".\" rendering "
+        "in !map when no entity stands on the cell. Tile data is "
+        "readable from formulas via tile_get(x, y, \"path\") and "
+        "tile_has(x, y, \"path\")."
+    ),
+)
+async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["tile"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    sub = args[0].lower()
+
+    # ---- set <x> <y> <path> <value> ----
+    if sub == "set":
+        if await return_help_if_not_enough_args(ctx, args, 5, "tile", "set"):
+            return
+        x, y = _parse_xy(args)
+        path = args[3]
+        value = _parse_scalar(args[4])
+        m.tile_set_path(x, y, path, value)
+        return await ctx.send(f"tile ({x},{y}).{path} = {value!r}")
+
+    # ---- del <x> <y> [<path>] ----
+    if sub == "del":
+        if await return_help_if_not_enough_args(ctx, args, 3, "tile", "del"):
+            return
+        x, y = _parse_xy(args)
+        path = args[3] if len(args) >= 4 else None
+        if (x, y) not in m.tiles:
+            return await ctx.send(f"tile ({x},{y}) has no data.")
+        m.tile_del_path(x, y, path)
+        if path:
+            return await ctx.send(f"Removed `{path}` from tile ({x},{y}).")
+        return await ctx.send(f"Cleared tile ({x},{y}).")
+
+    # ---- info <x> <y> ----
+    if sub == "info":
+        if await return_help_if_not_enough_args(ctx, args, 3, "tile", "info"):
+            return
+        x, y = _parse_xy(args)
+        if (x, y) not in m.tiles:
+            return await ctx.send(f"tile ({x},{y}): no data.")
+        data = m.tiles[(x, y)]
+        return await ctx.send(
+            f"**tile ({x},{y})**\n```{json.dumps(data, indent=2, sort_keys=True)}\n```"
+        )
+
+    # ---- list ----
+    if sub == "list":
+        if not m.tiles:
+            return await ctx.send("No special tiles in this match.")
+        # Compact one-line summary per tile: list top-level feature
+        # keys so the GM sees at a glance what's where. Use !tile info
+        # for the full nested dump.
+        lines = ["**Special tiles:**"]
+        for (x, y) in sorted(m.tiles.keys()):
+            features = ", ".join(sorted(m.tiles[(x, y)].keys()))
+            lines.append(f"- ({x},{y}): {features}")
+        return await ctx.send("\n".join(lines))
+
+    # ---- clear [confirm] ----
+    # Wipes ALL tile data. Destructive enough to require explicit
+    # confirm, mirroring the !history undo confirmation pattern.
+    if sub == "clear":
+        confirmed = "confirm" in (a.lower() for a in args[1:])
+        n = len(m.tiles)
+        if n == 0:
+            return await ctx.send("No tile data to clear.")
+        if not confirmed:
+            return await ctx.send(
+                f"⚠️ This would clear all {n} special tile(s) in this match. "
+                f"To proceed: `!tile clear confirm`."
+            )
+        m.tiles.clear()
+        return await ctx.send(f"Cleared {n} tile(s).")
+
+    title, body = registry.help_for(["tile"])
+    return await ctx.send(f"**{title}**\n{body}")
+
+
+registry.annotate_sub(
+    "tile", "set",
+    usage="!tile set <x> <y> <path> <value>",
+    desc=(
+        "Set tile (x,y).path = value, creating intermediate dicts. "
+        "Path uses dotted notation: `flame.burn_damage` sets the "
+        "burn_damage key inside the flame feature. Value is parsed "
+        "as int → float → string (use quotes for strings with spaces)."
+    ),
+)
+registry.annotate_sub(
+    "tile", "del",
+    usage="!tile del <x> <y> [<path>]",
+    desc=(
+        "Delete one path from a tile (e.g. `flame.spreads`) or drop "
+        "the entire tile entry if no path is given. Parent dicts that "
+        "go empty as a result are pruned automatically — the sparse-"
+        "dict invariant means !tile list never shows no-op coords."
+    ),
+)
+registry.annotate_sub(
+    "tile", "info",
+    usage="!tile info <x> <y>",
+    desc="Show one tile's data dict as pretty-printed JSON.",
+)
+registry.annotate_sub(
+    "tile", "list",
+    usage="!tile list",
+    desc=(
+        "List every tile that has data, one per line, with its top-"
+        "level feature names. For the full nested data dump, use "
+        "!tile info on a specific coordinate."
+    ),
+)
+registry.annotate_sub(
+    "tile", "clear",
+    usage="!tile clear [confirm]",
+    desc=(
+        "Wipe ALL special-tile data from the active match. Requires "
+        "the trailing `confirm` token; without it the command reports "
+        "how many tiles would be cleared and bails."
+    ),
+)
+
+
 @registry.command(
     "eval",
     usage='!eval "<formula>"',
