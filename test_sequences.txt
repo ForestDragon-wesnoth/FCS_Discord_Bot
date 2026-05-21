@@ -3519,3 +3519,104 @@ by NOT setting include_history). The second save with
 `include_history=yes` round-trips the full autosave history; after
 reload, the round/turn/manual save counts match the pre-save state,
 and the named manual save `important` is present.
+
+
+SCENARIO 174 — random_int via eval and inside a passive
+--------------------------------------------------------
+
+!match new mrand1 RandInt 8 8
+!match use mrand1
+!ent add hero Hero 100 1 1 10
+!eval random_int(1, 6)
+!eval random_int(1, 6)
+!eval random_int(-5, 5)
+!ent set_var hero last_roll 0
+!passive add hero burning on_turn_start "entity[self].last_roll = random_int(2, 8); entity[self].hp = entity[self].hp - entity[self].last_roll"
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+!eval random_int(5, 3)
+!eval random_int("not", "int")
+!eval random_string()
+
+Expected: The first three !eval calls return integers in their
+respective inclusive ranges — 1-6, 1-6, and -5 to 5. The values
+themselves are non-deterministic (no shared seed across sessions)
+but each call is guaranteed to be within the requested range.
+
+The `burning` passive stores the rolled damage on the entity's
+`last_roll` var, then subtracts that amount from HP. (Augmented
+assignment like `hp += -x` isn't allowed by the formula engine —
+write it out as `hp = hp - x`.) After each turn start, hero.hp has
+dropped by whatever last_roll says — `!ent info hero` shows the
+last_roll value alongside the lowered HP, and the two values agree
+(HP decreases by exactly last_roll). Storing the roll on the
+entity rather than re-rolling inside the if/else matters:
+random_int returns a different value on each call, so "roll once,
+branch on the stored value" is the standard idiom for formula-level
+randomness.
+
+The final three !eval calls demonstrate the validation errors:
+random_int with lo > hi, random_int with non-integer args, and
+random_string with no choices all surface as ❌ FormulaError with
+messages that name the offending argument and its type — easier to
+debug than the raw Python ValueError / IndexError underneath.
+
+
+SCENARIO 175 — random_string with if/elif/else branching
+---------------------------------------------------------
+
+!match new mrand2 RandStr 8 8
+!match use mrand2
+!ent add hero Hero 100 1 1 10
+!ent set_var hero status none
+!ent set_var hero buff 0
+!passive add hero mood on_turn_start "entity[self].status = random_string('rage', 'calm', 'fear'); entity[self].hp = max(0, entity[self].hp - 8) if entity[self].status == 'rage' else (min(entity[self].max_hp, entity[self].hp + 4) if entity[self].status == 'calm' else entity[self].hp); entity[self].buff = 0 if entity[self].status == 'rage' else (5 if entity[self].status == 'calm' else -2)"
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+
+Expected: The `mood` passive rolls a status on each turn-start —
+one of 'rage', 'calm', 'fear' — stores it on the entity, then
+branches:
+  - rage   →  HP -8, buff cleared to 0
+  - calm   →  HP +4 (clamped to max_hp), buff = 5
+  - fear   →  buff = -2 (HP unchanged; the entity is too scared
+              to swing but takes no damage either)
+
+The formula above uses chained ternaries to fit on one line — when
+typed into Discord directly the same logic reads more naturally as
+if/elif/else:
+
+    entity[self].status = random_string("rage", "calm", "fear")
+    if entity[self].status == "rage":
+        entity[self].hp = max(0, entity[self].hp - 8)
+        entity[self].buff = 0
+    elif entity[self].status == "calm":
+        entity[self].hp = min(entity[self].max_hp, entity[self].hp + 4)
+        entity[self].buff = 5
+    else:
+        entity[self].buff = -2
+
+Both forms have identical semantics. Across four turns, the hero's
+`status` and `buff` vars track whichever branch fired most recently
+and HP drifts down or up depending on which moods came up. Because
+random_string is non-deterministic the exact sequence varies, but
+every turn the status is one of the three listed values and the
+HP/buff pair is consistent with the branch that name implies — a
+useful pattern for "random table" status effects.
+
+The roll is assigned to entity[self].status FIRST, then the
+ternary chain (or the if/elif) reads it back. Calling random_string
+twice in a row would give two independent rolls, which is rarely
+what a GM wants for a "roll once and react" pattern — using an
+entity var (or any formula-readable storage) is the idiom for
+memoizing the roll.
