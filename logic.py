@@ -189,6 +189,20 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "str"},
         "desc": "Variable name in entity vars used for turn-order priority (e.g. 'initiative', 'ship_agility').",
     },
+    "team_var": {
+        "default": "team",
+        "schema": {"type": "str"},
+        "desc": (
+            "Variable name in entity vars used for team / faction grouping "
+            "(e.g. 'team', 'faction', 'side'). Stored as a string in entity "
+            "vars; absent or empty means 'no team'. Formula access works via "
+            "the configured name — for team_var='faction', use "
+            "entity[X].faction in formulas. Unlike hp_var the team value is "
+            "optional: entities don't have to belong to a team, and removing "
+            "the var (e.g. !ent del_var hero team) puts the entity back to "
+            "'no team' rather than erroring."
+        ),
+    },
     # Spawning / facing
     "spawn_face_toward_center": {
         "default": True,
@@ -1278,7 +1292,12 @@ class Entity:
     x: int
     y: int
     id: str# explicit, user-provided
-    team: Optional[str] = None
+    # `team` was a top-level dataclass field historically. It now lives in
+    # vars under the key configured by the team_var rule (default "team"),
+    # the same way hp/max_hp/initiative migrated. Read/write goes through
+    # the team property pair below so external callers using e.team still
+    # work; legacy saves that carry a top-level "team" field get migrated
+    # into vars during Entity.from_dict.
     status: Set[str] = field(default_factory=set)
 
     # structured variable bag — hp, max_hp, and initiative now live HERE
@@ -1321,8 +1340,22 @@ class Entity:
             )
         return ("hp", "max_hp", "initiative")
 
+    def _team_var_name(self) -> str:
+        """Var name used to store this entity's team. Pulled from
+        the bound match's team_var rule, or the default 'team' if
+        the entity isn't bound yet (e.g. during deserialization)."""
+        if self._match:
+            return self._match.rules.get("team_var", "team")
+        return "team"
+
     def protected_var_names(self) -> Set[str]:
-        """Return the set of top-level var keys that must not be deleted."""
+        """Return the set of top-level var keys that must not be deleted.
+
+        Note: team_var is intentionally NOT included. Team is optional —
+        an entity can legitimately have no team, and deleting the team
+        var is the way to express "remove this entity from its team".
+        Compare hp/max_hp/initiative, which the engine assumes always
+        exist (deleting hp would break combat math)."""
         hp_v, mhp_v, init_v = self._vital_var_names()
         return {hp_v, mhp_v, init_v}
 
@@ -1378,6 +1411,32 @@ class Entity:
                 self.remove_var(init_var)
         else:
             self.write_var(init_var, int(value))
+
+    @property
+    def team(self) -> Optional[str]:
+        """Team / faction name, sourced from vars[team_var]. None when
+        the entity isn't on a team (var absent OR set to None). The
+        getter doesn't coerce to str so that formula readers see the
+        actual stored type — a GM who sets the team var to an int via
+        !ent set_var still gets that int back through e.team, which
+        surfaces the type mismatch instead of silently hiding it."""
+        v = self.vars.get(self._team_var_name())
+        return v if v is not None else None
+
+    @team.setter
+    def team(self, value):
+        # Mirrors max_hp.setter / initiative.setter: None unsets the
+        # var (firing on_var_removed if it existed), otherwise we
+        # write through write_var (which fires created/changed events
+        # as appropriate). Pre-bind entities — i.e. during from_dict
+        # before bind() runs — get a plain dict assign because
+        # write_var no-ops on event firing without a bound match.
+        name = self._team_var_name()
+        if value is None:
+            if name in self.vars:
+                self.remove_var(name)
+        else:
+            self.write_var(name, value)
 
     # ---------- binding ----------
     #bind this entity to a specific match
@@ -1840,9 +1899,10 @@ class Entity:
 
     # ---------- serialization ----------
     def to_dict(self) -> Dict[str, Any]:
-        # hp/max_hp/initiative now live in vars; include top-level copies for save-file readability
+        # hp/max_hp/initiative/team now live in vars; include top-level copies for save-file readability
         # and backwards compatibility with older loaders
         hp_var, max_hp_var, init_var = self._vital_var_names()
+        team_var = self._team_var_name()
         return {
             "name": self.name,
             "hp": self.vars.get(hp_var, 0),         # backwards-compat mirror
@@ -1850,7 +1910,7 @@ class Entity:
             "y": self.y,
             "id": self.id,
             "max_hp": self.vars.get(max_hp_var),     # backwards-compat mirror
-            "team": self.team,
+            "team": self.vars.get(team_var),         # backwards-compat mirror
             "status": list(self.status),
             "initiative": self.vars.get(init_var),   # backwards-compat mirror
             "vars": dict(self.vars),
@@ -1873,12 +1933,24 @@ class Entity:
                 vars_dict["max_hp"] = int(data["max_hp"])
             if "initiative" in data and data.get("initiative") is not None and "initiative" not in vars_dict:
                 vars_dict["initiative"] = int(data["initiative"])
+        # Migrate legacy "team" top-level field into vars. Two cases:
+        #   - Legacy save (no _vital_in_vars flag): team always migrates if
+        #     present, under the default key "team" (legacy saves predate
+        #     team_var so the value of that rule isn't knowable here).
+        #   - New-format save (_vital_in_vars=True): the top-level "team"
+        #     is the backwards-compat mirror written by to_dict, but the
+        #     authoritative copy is already inside data["vars"]. Skip the
+        #     migration to avoid clobbering a renamed team var (e.g. when
+        #     team_var='faction', vars['faction'] holds the real value and
+        #     data['team'] would be None or stale).
+        if (not data.get("_vital_in_vars", False)
+                and data.get("team") is not None and "team" not in vars_dict):
+            vars_dict["team"] = data["team"]
         e = Entity(
             name=data["name"],
             x=int(data["x"]),
             y=int(data["y"]),
             id=str(data["id"]),
-            team=data.get("team"),
             status=set(data.get("status", [])),
             vars=vars_dict,
             facing=data.get("facing", "up"),
