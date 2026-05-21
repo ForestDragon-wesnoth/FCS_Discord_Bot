@@ -3357,3 +3357,165 @@ group_remove, the passive still fires on B's turn but group_has
 returns False, so the ternary contributes 0 — sworn_tick stays at 1.
 current_id() returns whichever entity's turn it is at the time of
 the eval; in the final call it's A.
+
+
+SCENARIO 169 — Autosaves, manual save, and silent command undo
+---------------------------------------------------------------
+
+!match new mhist1 HistBasic 8 8
+!match use mhist1
+!ent add a A 30 1 1 10
+!ent add b B 30 2 1 11
+!turn next
+!turn next
+!turn next
+!history list
+!ent hp a -7
+!history save before_more_damage
+!ent hp a -7
+!ent info a
+!history list commands
+!history undo command
+!ent info a
+
+Expected: Three turn-nexts open round 1 (A's turn) and advance into
+round 2 (B then A) thanks to the spawn-order quirk that puts A at
+active_index=1 initially. By that point the history holds 2 round
+snapshots and 3 turn snapshots. !ent hp -7 creates a command
+snapshot of the pre-damage state, then the manual save bookmarks
+the post-7-damage state. A second -7 brings A to 16 HP. !ent info
+is read-only — no extra command snapshot appears. !history list
+commands shows just the two -7 commands. `undo command` is below
+every confirmation threshold (default command threshold is -1 =
+never prompts), so it executes silently, reverting A back to 23 HP.
+
+
+SCENARIO 170 — Confirmation thresholds for destructive undos
+-------------------------------------------------------------
+
+!match new mhist2 HistConfirm 8 8
+!match use mhist2
+!ent add a A 30 1 1 10
+!ent add b B 30 2 1 11
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!history undo turn
+!history undo turn 2
+!history undo turn 3
+!history undo turn 3 confirm
+!history undo round
+!history undo round 1 confirm
+!history undo to round 1
+!history undo to round 1 confirm
+!history undo command 99
+
+Expected: Six turn-nexts cycle through several rounds. `undo turn`
+and `undo turn 2` are below the default turn confirmation threshold
+(3) and execute silently. `undo turn 3` hits the threshold and
+returns the warning message instead of doing the undo — only when
+the user re-issues with `confirm` does the undo actually run.
+Likewise for `undo round` (default round threshold is 1, so even a
+1-round undo prompts). `undo to round 1` always confirms because
+it's a non-linear jump. The final `undo command 99` fails cleanly
+because not that many command snapshots exist — the error message
+names the actual retention limit so the user knows what to adjust.
+
+
+SCENARIO 171 — Retention pruning of turn autosaves
+---------------------------------------------------
+
+!match new mhist3 HistRetention 8 8
+!match use mhist3
+!ent add a A 30 1 1 10
+!ent add b B 30 2 1 11
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!history list
+!system new tight
+!system set tight autosave_turn_retention_rounds 1
+!match new mhist4 HistTight 8 8 system=tight
+!match use mhist4
+!ent add a A 30 1 1 10
+!ent add b B 30 2 1 11
+!turn next
+!turn next
+!turn next
+!turn next
+!history list
+
+Expected: The first match uses default rules (turn retention = 3
+rounds). After 8 turn-nexts it's deep into round 5; the turn
+snapshot list spans only the most recent 3 rounds (rounds 3-5, so
+roughly 5 entries depending on how many turns each round held).
+Round snapshots are unlimited so all 5 are still there. The second
+match uses a custom system with autosave_turn_retention_rounds=1;
+after 4 turn-nexts only the current round's turn snapshots survive,
+demonstrating that the rule is per-system and per-match.
+
+
+SCENARIO 172 — Snapshot export and import as a manual save
+-----------------------------------------------------------
+
+!match new mhist5 HistExport 8 8
+!match use mhist5
+!ent add a A 30 1 1 10
+!turn next
+!history save checkpoint
+!ent hp a -10
+!history export manual:checkpoint /tmp/_hist_export_test.json
+!history delete checkpoint
+!history list manual
+!history import /tmp/_hist_export_test.json as restored
+!history list manual
+!history restore restored confirm
+!ent info a
+
+Expected: `checkpoint` bookmarks A at 30 HP. After damaging A to 20,
+the snapshot is exported to JSON, then the manual entry is deleted
+(empty manual list afterward). Importing the JSON adds a manual save
+named `restored` — the imported snapshot is always categorized as
+manual regardless of its original kind, so it shows up in the
+manual list. Restoring it (with confirm) puts A back to 30 HP. The
+JSON file is a self-contained snapshot, usable as off-bot persistent
+storage across bot restarts.
+
+
+SCENARIO 173 — !store save with include_history round-trips autosaves
+----------------------------------------------------------------------
+
+!match new mhist6 HistPersist 8 8
+!match use mhist6
+!ent add a A 30 1 1 10
+!ent add b B 30 2 1 11
+!turn next
+!turn next
+!turn next
+!history save important
+!store save /tmp/_hist_store_no.json
+!store save /tmp/_hist_store_yes.json include_history=yes
+!match delete mhist6
+!store load /tmp/_hist_store_no.json
+!match use mhist6
+!history list
+!match delete mhist6
+!store load /tmp/_hist_store_yes.json
+!match use mhist6
+!history list
+
+Expected: !store save without the flag produces a smaller file and,
+on reload, gives a match with empty history (no rounds, turns, or
+manual saves — exactly the autosave-free state the user opted into
+by NOT setting include_history). The second save with
+`include_history=yes` round-trips the full autosave history; after
+reload, the round/turn/manual save counts match the pre-save state,
+and the named manual save `important` is present.
