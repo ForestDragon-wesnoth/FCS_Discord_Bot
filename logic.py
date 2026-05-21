@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Literal, Any, Dict, List, Optional, Tuple, Set
 import uuid
 import json
+import copy
 
 # -------------------------
 # Exceptions
@@ -1240,6 +1241,62 @@ def _run_passive_safely(engine, p: "Passive", ctx, *, target_id: str, is_global:
 
 
 # -------------------------
+# SpecialTileTemplate (reusable tile definition: data defaults + hooks)
+# -------------------------
+# A template defines a KIND of special tile (e.g. "flame", "spike",
+# "treasure_chest") that the GM can instantiate at any number of
+# coordinates. Templates have:
+#   - data:  dict of default field values copied into the tile dict at
+#            placement time. Each placed instance carries its own copy
+#            so edits on one instance don't propagate to others.
+#   - hooks: dict[when, formula_src] of formulas that fire when an
+#            entity transits any instance of this template. Looked up
+#            LIVE every fire — editing template hooks immediately
+#            affects all placed instances. The two halves intentionally
+#            differ: data is instance state (drifts), hooks are shared
+#            behavior (canonical).
+#
+# Unique one-off tiles ("a treasure chest at (5,5) with custom loot")
+# don't need a template — they're written as ad-hoc instances via
+# !tile set + !tile hook add, which keep working unchanged. Templates
+# exist purely as a reuse convenience for tile KINDS that recur.
+TILE_RESERVED_KEYS = frozenset({"_template", "hooks"})
+# Keys in a tile dict that aren't user data:
+#   _template — name of the template this instance was placed from
+#               (absent on ad-hoc instances)
+#   hooks     — per-instance hook overrides (override the template's
+#               hooks per-when; primarily the !tile hook surface)
+# Template definitions must not carry these names in their data dict;
+# !tile def data rejects writes to either key.
+
+
+@dataclass
+class SpecialTileTemplate:
+    name: str
+    data: Dict[str, Any] = field(default_factory=dict)
+    hooks: Dict[str, str] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "data": copy.deepcopy(self.data),
+            "hooks": dict(self.hooks),
+        }
+
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> "SpecialTileTemplate":
+        return SpecialTileTemplate(
+            name=str(d["name"]),
+            data=copy.deepcopy(d.get("data", {}) or {}),
+            hooks={
+                str(k): str(v)
+                for k, v in (d.get("hooks", {}) or {}).items()
+                if isinstance(v, str)
+            },
+        )
+
+
+# -------------------------
 # GameSystem (stores global rules for a game system, so not everything has to be manually set each match)
 # -------------------------
 @dataclass
@@ -1247,7 +1304,16 @@ class GameSystem:
     name: str
     # Per-system overrides now stored as Rule objects keyed by rule key
     settings: Dict[str, Rule] = field(default_factory=dict)
- 
+    # System-level special-tile templates. Copied into Match.tile_templates
+    # on match creation so a game system can ship a default library of
+    # tile kinds (e.g. "fire", "wall", "pit") that matches inherit
+    # automatically. Matches can extend or shadow these with their own
+    # !tile def commands; the system-level definitions are unaffected.
+    # Stored as plain dicts (template name -> SpecialTileTemplate.to_dict
+    # output) rather than live SpecialTileTemplate objects so the
+    # GameSystem stays self-contained and easy to serialize.
+    tile_templates: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
     def get(self, key: str) -> Any:
         if key in self.settings:
             return self.settings[key].value
@@ -1278,8 +1344,12 @@ class GameSystem:
                     "description": r.description,
                 } for k, r in self.settings.items()
             },
+            "tile_templates": {
+                tname: copy.deepcopy(tdef)
+                for tname, tdef in sorted(self.tile_templates.items())
+            },
         }
-    
+
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "GameSystem":
         raw = d.get("settings", {}) or {}
@@ -1295,7 +1365,14 @@ class GameSystem:
                 schema = RULES_REGISTRY.get(k, {}).get("schema", {})
                 desc = RULES_REGISTRY.get(k, {}).get("desc", "")
             settings[k] = Rule(key=k, value=val, schema=schema, description=desc)
-        return GameSystem(name=d["name"], settings=settings)
+        # Older saves predate system-level templates — they just won't
+        # have the key, and the match starts with no inherited templates.
+        raw_templates = d.get("tile_templates", {}) or {}
+        templates: Dict[str, Dict[str, Any]] = {}
+        for tname, tdef in raw_templates.items():
+            if isinstance(tdef, dict) and isinstance(tname, str):
+                templates[tname] = copy.deepcopy(tdef)
+        return GameSystem(name=d["name"], settings=settings, tile_templates=templates)
 
 # -------------------------
 # Entity
@@ -2117,6 +2194,16 @@ class Match:
     # objects can't have non-string keys.
     tiles: Dict[Tuple[int, int], Dict[str, Any]] = field(default_factory=dict)
 
+    # Special-tile TEMPLATE registry. Reusable tile-kind definitions
+    # (e.g. "flame", "spike", "treasure_chest"). Each template carries
+    # default data and hook formulas; a placed tile that references a
+    # template via its reserved `_template` field inherits the hooks
+    # live (template-edit propagates) and a deep copy of the data
+    # (instance-edit doesn't propagate). System-level templates are
+    # copied in at match creation (see MatchManager.new_match); the
+    # match can extend/shadow with !tile def commands.
+    tile_templates: Dict[str, SpecialTileTemplate] = field(default_factory=dict)
+
     # ---- runtime-only state for var-hook recursion safeguard ----
     # Tracks how deep we are in a chain of var-hook fires. A passive's
     # formula can write vars, which produces more events, which fire more
@@ -2268,6 +2355,134 @@ class Match:
         if not self.tiles[(x, y)]:
             del self.tiles[(x, y)]
 
+    # ---- tile-template registry --------------------------------------
+    # Templates are the "kind" / "class" definitions; placed tiles in
+    # self.tiles are the "instances". A placed tile may carry a reserved
+    # `_template` field naming its source template — see place_template
+    # below for the placement semantics (data is deep-copied at place
+    # time, hooks are looked up live at fire time).
+
+    def define_tile_template(
+        self, name: str, *,
+        data: Optional[Dict[str, Any]] = None,
+        hooks: Optional[Dict[str, str]] = None,
+        overwrite: bool = False,
+    ) -> SpecialTileTemplate:
+        """Create or replace a tile template. `overwrite=False` raises
+        DuplicateId if the name is already taken — keeps the GM from
+        clobbering a template by accident. Returns the stored template."""
+        if not isinstance(name, str) or not name:
+            raise VTTError("tile template name must be a non-empty string.")
+        if not overwrite and name in self.tile_templates:
+            raise DuplicateId(f"tile template '{name}' already exists.")
+        # Reject reserved-key collisions in template data: a template
+        # whose data dict carries `_template` or `hooks` would corrupt
+        # the placed tile's structure (the placement merge would
+        # silently overwrite the instance's tracking fields). Catching
+        # at define time is louder than catching at place time.
+        data_dict = dict(data or {})
+        bad = TILE_RESERVED_KEYS & data_dict.keys()
+        if bad:
+            raise VTTError(
+                f"template data may not use reserved keys: "
+                f"{', '.join(sorted(bad))}."
+            )
+        # Hooks must be strings (formula source). Validation of the
+        # formula syntax is the caller's job (vtt_commands runs
+        # validate_formula at !tile def hook time) — this method just
+        # stores; tests and internal callers shouldn't have to round
+        # through the command layer.
+        hooks_dict: Dict[str, str] = {}
+        for w, src in (hooks or {}).items():
+            if not isinstance(src, str):
+                raise VTTError(
+                    f"template '{name}' hook '{w}' source must be a string."
+                )
+            hooks_dict[str(w)] = src
+        tpl = SpecialTileTemplate(
+            name=name,
+            data=copy.deepcopy(data_dict),
+            hooks=hooks_dict,
+        )
+        self.tile_templates[name] = tpl
+        return tpl
+
+    def undefine_tile_template(self, name: str) -> int:
+        """Remove a template. Returns the number of placed instances
+        that referenced it (now orphaned — they still exist as tiles
+        with a `_template` field pointing at a missing definition;
+        fire_tile_hook degrades gracefully by emitting a warning and
+        no-opping on hook firings for those tiles)."""
+        if name not in self.tile_templates:
+            raise NotFound(f"tile template '{name}' not found.")
+        del self.tile_templates[name]
+        orphan_count = 0
+        for tile in self.tiles.values():
+            if isinstance(tile, dict) and tile.get("_template") == name:
+                orphan_count += 1
+        return orphan_count
+
+    def place_tile_template(
+        self, name: str, x: int, y: int,
+        *, overrides: Optional[Dict[str, Any]] = None,
+        replace: bool = True,
+    ) -> Dict[str, Any]:
+        """Instantiate template `name` at (x, y), returning the resulting
+        tile dict. Default `replace=True` discards any existing tile data
+        at (x, y) — the GM is explicitly placing a new instance, not
+        merging onto an existing tile. Set `replace=False` to error
+        instead when the cell already carries tile data.
+
+        The placement copies template.data deeply onto a fresh dict,
+        applies any `overrides` on top (single-level merge — pass a
+        deep override structure pre-merged if you need nested control),
+        and tags the result with `_template`. The template's hooks are
+        NOT copied — they're looked up live at fire time so editing
+        the template's hooks affects all placed instances. The instance
+        can shadow individual hooks via the existing !tile hook add
+        surface (or by direct ['hooks'][when] mutation).
+        """
+        if name not in self.tile_templates:
+            raise NotFound(f"tile template '{name}' not found.")
+        if not self.in_bounds(x, y):
+            raise OutOfBounds(
+                f"({x},{y}) outside {self.grid_width}x{self.grid_height}"
+            )
+        if not replace and (x, y) in self.tiles:
+            raise DuplicateId(
+                f"tile ({x},{y}) already has data; pass replace=True "
+                f"or delete first."
+            )
+        tpl = self.tile_templates[name]
+        tile: Dict[str, Any] = copy.deepcopy(tpl.data)
+        if overrides:
+            bad = TILE_RESERVED_KEYS & overrides.keys()
+            if bad:
+                raise VTTError(
+                    f"placement overrides may not use reserved keys: "
+                    f"{', '.join(sorted(bad))}."
+                )
+            tile.update(copy.deepcopy(overrides))
+        tile["_template"] = name
+        self.tiles[(x, y)] = tile
+        return tile
+
+    def tile_template_for(self, x: int, y: int) -> Optional[SpecialTileTemplate]:
+        """Return the SpecialTileTemplate this tile was placed from, or
+        None if the tile is ad-hoc / off-grid / has a dangling
+        `_template` reference (template was deleted after placement).
+        The dangling case is intentional: fire_tile_hook returns a
+        warning for it rather than silently swallowing the miss."""
+        if not self.in_bounds(x, y):
+            return None
+        tile = self.tiles.get((x, y))
+        if not isinstance(tile, dict):
+            return None
+        tpl_name = tile.get("_template")
+        if not isinstance(tpl_name, str):
+            return None
+        return self.tile_templates.get(tpl_name)
+
     def is_occupied(self, x: int, y: int, ignore_entity_id: Optional[str] = None) -> bool:
         for eid, e in self.entities.items():
             if ignore_entity_id and eid == ignore_entity_id:
@@ -2410,11 +2625,36 @@ class Match:
         data = self.tiles.get((x, y))
         if not data:
             return []
-        hooks = data.get("hooks")
-        if not isinstance(hooks, dict):
-            return []
-        formula_src = hooks.get(when)
-        if not isinstance(formula_src, str) or not formula_src:
+        # Resolution order: ad-hoc instance hook wins, falling back to
+        # the template's hook for the same `when`. This lets the GM
+        # place a template-backed tile and then locally override a
+        # single hook via !tile hook add without redefining the
+        # template, while leaving the other hook timings inherited.
+        formula_src: Optional[str] = None
+        instance_hooks = data.get("hooks")
+        if isinstance(instance_hooks, dict):
+            cand = instance_hooks.get(when)
+            if isinstance(cand, str) and cand:
+                formula_src = cand
+        if formula_src is None:
+            tpl_name = data.get("_template")
+            if isinstance(tpl_name, str):
+                tpl = self.tile_templates.get(tpl_name)
+                # Dangling template references (template deleted after
+                # placement) silently no-op the lookup. The deletion
+                # path already warned the GM at confirm-time about the
+                # orphan count; warning again on every fire would spam
+                # the move-result message — one !ent move step over
+                # three orphaned tiles produces six fire_tile_hook
+                # calls (three on_enter + three on_exit), each of
+                # which would emit a "missing template" line.
+                # !tile info on the tile still shows the dangling
+                # `_template` field so the GM can audit them later.
+                if tpl is not None:
+                    cand = tpl.hooks.get(when)
+                    if isinstance(cand, str) and cand:
+                        formula_src = cand
+        if formula_src is None:
             return []
         # Lazy import to avoid logic <-> formula import cycle (same
         # pattern as fire_hook below).
@@ -2745,6 +2985,10 @@ class Match:
             "tiles": {
                 f"{x},{y}": dat for (x, y), dat in sorted(self.tiles.items())
             },
+            "tile_templates": {
+                name: tpl.to_dict()
+                for name, tpl in sorted(self.tile_templates.items())
+            },
         }
         if include_history:
             d["history"] = self.history.to_dict()
@@ -2796,6 +3040,23 @@ class Match:
                 continue
             if m.in_bounds(x, y) and isinstance(val, dict) and val:
                 m.tiles[(x, y)] = val
+        # Templates are newer than tiles; older saves predate them and
+        # restore with an empty registry (existing tiles with no
+        # `_template` field continue to work — they're ad-hoc and were
+        # never tied to a template).
+        raw_templates = d.get("tile_templates", {}) or {}
+        m.tile_templates = {}
+        for tname, tdef in raw_templates.items():
+            if not isinstance(tname, str) or not isinstance(tdef, dict):
+                continue
+            try:
+                m.tile_templates[tname] = SpecialTileTemplate.from_dict(tdef)
+            except (KeyError, TypeError, VTTError):
+                # Malformed entry in the save — skip rather than fail
+                # the whole load. The instances that referenced this
+                # template will surface the missing-template warning
+                # at their next hook fire.
+                continue
         # History is optional in saved dicts. It's only present when the
         # original save was made with include_history=True. A snapshot's
         # state.dict deliberately omits history (snapshots-within-
@@ -2823,7 +3084,21 @@ class Match:
         for (tx, ty), data in self.tiles.items():
             if not self.in_bounds(tx, ty):
                 continue
+            # Instance glyph wins; if the instance has no glyph but
+            # comes from a template that does, use the template's.
+            # This lets a "fire" template define glyph='F' once and
+            # every placed instance picks it up without per-cell
+            # repetition. Same single-character constraint applies
+            # to both layers.
             glyph = data.get("glyph")
+            if not (isinstance(glyph, str) and len(glyph) == 1):
+                tpl_name = data.get("_template")
+                if isinstance(tpl_name, str):
+                    tpl = self.tile_templates.get(tpl_name)
+                    if tpl is not None:
+                        cand = tpl.data.get("glyph")
+                        if isinstance(cand, str) and len(cand) == 1:
+                            glyph = cand
             if isinstance(glyph, str) and len(glyph) == 1:
                 grid[ty][tx] = glyph
 
@@ -3121,6 +3396,16 @@ class MatchManager:
         rules = self._build_rules_dict(sysobj)
         m = Match(id=match_id, name=name, grid_width=width, grid_height=height,
                   system_name=sysobj.name, rules=rules)
+        # Seed match-level templates from the system's defaults. We copy
+        # so subsequent match-side define / undefine doesn't reach back
+        # into GameSystem.tile_templates — the system's library is the
+        # canonical source for NEW matches but not a live link to
+        # existing ones (mirrors how `rules` is snapshotted, not linked).
+        for tname, tdef in (sysobj.tile_templates or {}).items():
+            try:
+                m.tile_templates[tname] = SpecialTileTemplate.from_dict(tdef)
+            except (KeyError, TypeError, VTTError):
+                continue
         self.matches[m.id] = m
         return m.id
 
