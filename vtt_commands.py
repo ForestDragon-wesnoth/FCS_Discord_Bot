@@ -302,8 +302,16 @@ def _resolve_eid(m, token: str) -> str:
     """
     Accepts an entity id token and returns a concrete entity id.
     Supports the shorthands 'current' / 'this' to mean the entity
-    whose turn it currently is.
+    whose turn it currently is. Rejects `group:NAME` tokens — those
+    must be handled by the calling subcommand via _resolve_targets
+    (or refused with _reject_group_token for commands like tp/clone
+    that don't have sensible group semantics).
     """
+    if isinstance(token, str) and token.startswith("group:"):
+        raise VTTError(
+            f"This subcommand does not accept a group target "
+            f"({token!r}). Provide a single entity id instead."
+        )
     t = str(token).strip().lower()
     if t in {"current", "this"}:
         eid = m.current_entity_id()
@@ -311,6 +319,40 @@ def _resolve_eid(m, token: str) -> str:
             raise NotFound("No current entity (turn order is empty).")
         return eid
     return token
+
+
+def _resolve_targets(m, token: str) -> List[str]:
+    """
+    Resolve a target token to a list of entity ids. Accepts:
+      - a literal entity id              → [id]
+      - "current" / "this"               → [active-turn id]
+      - "group:NAME"                     → all members of that group,
+                                           in insertion order (may be
+                                           empty if the group exists
+                                           but has no members)
+    Raises NotFound if the group doesn't exist. Caller decides what
+    to do with an empty result (typically: send a benign "no-op"
+    message rather than erroring, since deleting all members from a
+    group is a reasonable mid-game state).
+    """
+    if isinstance(token, str) and token.startswith("group:"):
+        name = token[len("group:"):]
+        if not name:
+            raise VTTError("Group target must be 'group:NAME' (name is empty).")
+        return m.group_members(name)
+    return [_resolve_eid(m, token)]
+
+
+def _reject_group_token(token: str, subcommand: str) -> None:
+    """Raise a clear error if a subcommand was handed a group: token
+    but doesn't support groups. Used by tp / rename / clone where
+    the operation is fundamentally per-entity (a unique target cell,
+    a single new name, a single new id)."""
+    if isinstance(token, str) and token.startswith("group:"):
+        raise VTTError(
+            f"!ent {subcommand} doesn't accept a group target — it "
+            f"operates on a single entity. Got {token!r}."
+        )
 
 
 
@@ -621,6 +663,193 @@ registry.annotate_sub("system", "new", usage="!system new <name>", desc="Create 
 registry.annotate_sub("system", "set", usage="!system set <name> <key> <value>", desc="Change a GameSystem setting (booleans/int auto-coerced).")
 registry.annotate_sub("system", "default", usage="!system default <global|server|channel> <name>", desc="Set default GameSystem.")
 
+# ---- group fan-out helpers -------------------------------------------------
+# Subcommands of !ent that sensibly iterate one-at-a-time over group members.
+# !ent move is excluded because group movement is atomic (see Match.move_group_dirs).
+# add/tp/rename/clone are excluded because they take a per-call unique target
+# (a new id, a single destination cell, a single new name).
+_ENT_GROUP_ITERABLE_SUBS = {
+    "info", "dump", "remove", "del", "rm", "face",
+    "hp", "init", "set_var", "delete_var", "delete_var_silent",
+}
+_ENT_GROUP_REJECTING_SUBS = {"add", "tp", "rename", "clone"}
+
+
+async def _ent_group_dispatch(ctx, args, mgr, m, sub: str):
+    """Handle a `group:NAME` target on the !ent command."""
+    if sub in _ENT_GROUP_REJECTING_SUBS:
+        return await ctx.send(
+            f"❌ !ent {sub} doesn't accept a group target — it operates on "
+            f"a single entity. Got {args[1]!r}."
+        )
+    if sub == "move":
+        return await _ent_move_group(ctx, args, mgr, m)
+    if sub in _ENT_GROUP_ITERABLE_SUBS:
+        group_name = args[1][len("group:"):]
+        try:
+            targets = m.group_members(group_name)
+        except NotFound as ex:
+            return await ctx.send(f"❌ {ex}")
+        if not targets:
+            return await ctx.send(f"Group `{group_name}` is empty; no-op.")
+        # Per-member dispatch via recursion. Each iteration resolves its own
+        # formula substitutions (self_id = the iterated member). Per-entity
+        # errors are surfaced but don't abort the rest of the iteration —
+        # one bad apple shouldn't silently drop the others.
+        for eid in targets:
+            sub_args = list(args)
+            sub_args[1] = eid
+            try:
+                await ent_cmd(ctx, sub_args, mgr)
+            except VTTError as ex:
+                await ctx.send(f"⚠️ `{eid}`: {ex}")
+        return
+    return await ctx.send(
+        f"❌ !ent {sub} either doesn't support group targets, or isn't a "
+        f"recognized subcommand."
+    )
+
+
+async def _ent_move_group(ctx, args, mgr, m):
+    """Atomic !ent move group:NAME ..."""
+    if await return_help_if_not_enough_args(ctx, args, 3, "ent", "move"):
+        return
+    group_name = args[1][len("group:"):]
+    try:
+        members = m.group_members(group_name)
+    except NotFound as ex:
+        return await ctx.send(f"❌ {ex}")
+    if not members:
+        return await ctx.send(f"Group `{group_name}` is empty; no-op.")
+    # Reuse the same direction-token parser as the single-entity move.
+    tokens = " ".join(args[2:]).replace(",", " ").split()
+    if not tokens:
+        title, body = registry.help_for(["ent", "move"])
+        return await ctx.send(f"**{title}**\n{body}")
+    moves: list[tuple[str, int]] = []
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if normalize_direction(t) is not None:
+            moves.append((t, 1)); i += 1
+        else:
+            try:
+                n = int(t)
+            except ValueError:
+                return await ctx.send(f"Unexpected token '{t}'.")
+            if i + 1 >= len(tokens):
+                return await ctx.send("Count must be followed by a direction.")
+            d = tokens[i + 1]
+            if normalize_direction(d) is None:
+                return await ctx.send(f"'{d}' is not a direction.")
+            moves.append((d, n)); i += 2
+    try:
+        count, steps = m.move_group_dirs(group_name, moves)
+    except VTTError as ex:
+        return await ctx.send(f"❌ {ex}")
+    return await ctx.send(
+        f"Moved group `{group_name}` ({count} "
+        f"{'members' if count != 1 else 'member'}, {steps} step(s) each)."
+    )
+
+
+async def _ent_group_subcmd(ctx, args, mgr, m):
+    """Handle !ent group <action> ... — group registry management."""
+    # args[0] is "group"; the action lives at args[1].
+    if len(args) < 2:
+        title, body = registry.help_for(["ent", "group"])
+        return await ctx.send(f"**{title}**\n{body}")
+    action = args[1].lower()
+
+    if action == "list":
+        if not m.groups:
+            return await ctx.send("No groups defined in this match.")
+        lines = ["**Groups in this match:**"]
+        for name, members in m.groups.items():
+            lines.append(f"- `{name}`: {len(members)} member(s)")
+        return await ctx.send("\n".join(lines))
+
+    if action == "info":
+        if await return_help_if_not_enough_args(ctx, args, 3, "ent", "group"):
+            return
+        name = args[2]
+        try:
+            members = m.group_members(name)
+        except NotFound as ex:
+            return await ctx.send(f"❌ {ex}")
+        if not members:
+            return await ctx.send(f"Group `{name}` exists but has no members.")
+        lines = [f"**Group `{name}`** ({len(members)} member(s)):"]
+        for eid in members:
+            lines.append(f"- `{eid}` — {m.entities[eid].name}")
+        return await ctx.send("\n".join(lines))
+
+    if action == "new":
+        if await return_help_if_not_enough_args(ctx, args, 3, "ent", "group"):
+            return
+        name = args[2]
+        if m.has_group(name):
+            raise DuplicateId(f"Group '{name}' already exists.")
+        # Create an empty group by ensuring the key exists. We sidestep
+        # add_to_group (which requires an entity id) so empty groups are
+        # explicitly representable.
+        m.groups[name] = []
+        return await ctx.send(f"Created empty group `{name}`.")
+
+    if action == "add":
+        if await return_help_if_not_enough_args(ctx, args, 4, "ent", "group"):
+            return
+        name = args[2]
+        added: List[str] = []
+        already: List[str] = []
+        for raw in args[3:]:
+            eid = _resolve_eid(m, raw)
+            if eid not in m.entities:
+                raise NotFound(f"Entity '{eid}' not found.")
+            if m.add_to_group(name, eid):
+                added.append(eid)
+            else:
+                already.append(eid)
+        parts = [f"Group `{name}`:"]
+        if added:
+            parts.append(f"added {', '.join(f'`{e}`' for e in added)}")
+        if already:
+            parts.append(f"already members: {', '.join(f'`{e}`' for e in already)}")
+        return await ctx.send(" ".join(parts))
+
+    if action in ("remove", "rm", "del"):
+        if await return_help_if_not_enough_args(ctx, args, 4, "ent", "group"):
+            return
+        name = args[2]
+        if not m.has_group(name):
+            raise NotFound(f"Group '{name}' not found.")
+        removed: List[str] = []
+        not_in: List[str] = []
+        for raw in args[3:]:
+            eid = _resolve_eid(m, raw)
+            if m.remove_from_group(name, eid):
+                removed.append(eid)
+            else:
+                not_in.append(eid)
+        parts = [f"Group `{name}`:"]
+        if removed:
+            parts.append(f"removed {', '.join(f'`{e}`' for e in removed)}")
+        if not_in:
+            parts.append(f"not members: {', '.join(f'`{e}`' for e in not_in)}")
+        return await ctx.send(" ".join(parts))
+
+    if action == "delete":
+        if await return_help_if_not_enough_args(ctx, args, 3, "ent", "group"):
+            return
+        name = args[2]
+        m.delete_group(name)
+        return await ctx.send(f"Deleted group `{name}`.")
+
+    # Fallback: show authoritative help for !ent group
+    title, body = registry.help_for(["ent", "group"])
+    return await ctx.send(f"**{title}**\n{body}")
+
+
 @registry.command("ent", usage="!ent <subcommand> ...", desc="Manage entities in the active match, lots of available sub-commands. Note: <id> parameter also accepts 'this' or 'current', to target the entity whose turn it is right now")
 async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # Show authoritative help if no subcommand was given
@@ -632,6 +861,27 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
 
     sub = args[0].lower()#makes the first arg lowercase, so "ADD", "aDD", etc. become "add"
+
+    # ---- group management subcommand ---------------------------------------
+    # `!ent group <action> ...` manages the match's named entity groups.
+    # Handled before formula substitution because the leading sub-action
+    # ("new"/"add"/"remove"/...) isn't an entity id and shouldn't go through
+    # the self-id resolver.
+    if sub == "group":
+        return await _ent_group_subcmd(ctx, args, mgr, m)
+
+    # ---- group:NAME fan-out ------------------------------------------------
+    # If the target slot is `group:NAME`, dispatch through the group path:
+    #   - "move" gets atomic-all-or-nothing semantics via Match.move_group_dirs
+    #   - subcommands that iterate cleanly (info/dump/remove/face/hp/init/
+    #     set_var/delete_var/delete_var_silent) fan out one call per member
+    #   - subcommands that need a unique per-call target (add/tp/rename/clone)
+    #     reject the group token with a clear error
+    # Formula substitution is deferred to the per-member recursive call so
+    # $(entity[self].x) resolves freshly for each member rather than once
+    # against an unbound self.
+    if len(args) >= 2 and isinstance(args[1], str) and args[1].startswith("group:"):
+        return await _ent_group_dispatch(ctx, args, mgr, m, sub)
 
     # ---- formula substitution ----------------------------------------------
     # args[1] (if present) is treated as the self-target for $() resolution in
@@ -976,6 +1226,26 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     return await ctx.send(f"**{title}**\n{body}")
 #annonate subcommands next to the command itself:
 registry.annotate_sub(
+    "ent", "group",
+    usage="!ent group <list|info|new|add|remove|delete> ...",
+    desc=(
+        "Manage named entity groups in the active match. An entity can "
+        "belong to any number of groups; group membership is stored "
+        "separately from entity vars. Once a group exists, most !ent "
+        "subcommands accept `group:NAME` as the target to fan out across "
+        "all members (`!ent hp group:swarm 10` heals everyone). "
+        "!ent move on a group is atomic — if any member can't complete "
+        "the move, nobody moves; fellow group members are treated as "
+        "transparent during path validation. Actions: "
+        "`list` (all groups), "
+        "`info <name>` (members of one group), "
+        "`new <name>` (create an empty group), "
+        "`add <name> <eid> [eid ...]` (add entities), "
+        "`remove <name> <eid> [eid ...]` (remove entities; aliases rm/del), "
+        "`delete <name>` (drop the group entirely; members are unaffected)."
+    ),
+)
+registry.annotate_sub(
     "ent", "info",
     usage="!ent info <id>",
     desc=("Show an entity card per the game system's entity_info_format rule. "
@@ -1009,13 +1279,18 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "ent", "move",
-    usage="!ent move <id> <dir[,dir...]> | !ent move <id> <n> <dir> [<n> <dir> ...]",
+    usage="!ent move <id|group:NAME> <dir[,dir...]> | !ent move <id|group:NAME> <n> <dir> [<n> <dir> ...]",
     desc=(
         "Stepwise move; final cell must be free. Directions: up/down/left/"
         "right (aliases u/d/l/r, n/s/w/e). Diagonals up_left/up_right/"
         "down_left/down_right (aliases ul/ur/dl/dr, nw/ne/sw/se, or "
         "hyphen/no-separator variants like 'up-left' / 'upleft') are only "
-        "accepted when the system rule 'allow_diagonal_movement' is True."
+        "accepted when the system rule 'allow_diagonal_movement' is True. "
+        "With a `group:NAME` target, every member moves through the same "
+        "sequence atomically: fellow members are invisible to the occupancy "
+        "check (so a marching group doesn't trip on its own footprint), "
+        "and if any member would leave the grid or hit a non-member "
+        "obstacle, NO entity moves."
     ),
 )
 registry.annotate_sub(
