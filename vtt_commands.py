@@ -1159,8 +1159,11 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")        
         value = int(args[2])
-        m.entities[eid].set_initiative_entity(value)
-        return await ctx.send(f"Set initiative of `{eid}` to {value}.")
+        hook_log = m.entities[eid].set_initiative_entity(value)
+        msg = f"Set initiative of `{eid}` to {value}."
+        if hook_log:
+            msg = msg + "\n" + "\n".join(hook_log)
+        return await ctx.send(msg)
     # clone
     if sub == "clone":
         if await return_help_if_not_enough_args(ctx, args, 5, "ent", "clone"):
@@ -1713,7 +1716,7 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             # `undo to round X` always prompts unless the round threshold
             # is disabled (-1). Conceptually it's a non-linear jump so
             # we treat it like a round undo of "however many rounds away."
-            distance = max(1, m.turn_number - target_round)
+            distance = max(1, m.round_number - target_round)
             threshold = int(m.rules.get("undo_confirmation_round_threshold", 1))
             if _confirmation_required(threshold, distance) and not confirmed:
                 erased = sum(1 for x in m.history.round_saves if x.sequence > snap.sequence) + \

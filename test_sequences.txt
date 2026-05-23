@@ -4040,3 +4040,338 @@ separately. If one member's hook formula failed, only that
 member's hook log line would carry the ⚠️ FAILED marker; the
 group move itself wouldn't roll back (the move had already
 committed by the time hooks fired).
+
+
+SCENARIO 186 — Turn order: immediate rebuild on initiative change (default)
+----------------------------------------------------------------------------
+
+!match new mto1 TurnImm 8 8
+!match use mto1
+!ent add alice Alice 30 1 1 10
+!ent add bob Bob 30 2 2 20
+!ent add carol Carol 30 3 3 15
+!list
+!ent init alice 99
+!list
+
+Expected: Default turn order with three entities is bob(20),
+carol(15), alice(10) — sorted by initiative descending. The
+default `turnorder_change_policy` is `immediate`, so
+`!ent init alice 99` (which routes through `write_var` on the
+initiative variable) triggers an inline `_rebuild_turn_order()`.
+The post-rebuild order is alice(99), bob(20), carol(15) — the
+new order is reflected by `!list` immediately, no round wait
+required. This is also the path a formula like
+`entity[X].initiative = N` takes: any var write to the
+configured `turnorder_var` triggers the same policy.
+
+
+SCENARIO 187 — Turn order: deferred rebuild waits for round end
+---------------------------------------------------------------
+
+!system set default turnorder_change_policy deferred
+!match new mto2 TurnDef 8 8
+!match use mto2
+!ent add alice Alice 30 1 1 10
+!ent add bob Bob 30 2 2 20
+!list
+!turn next
+!ent init alice 999
+!list
+!turn next
+!list
+!turn next
+!list
+!system set default turnorder_change_policy immediate
+
+Expected: Under `deferred` policy, writing to an entity's
+initiative emits a `⏳ turn order change deferred` warning AND
+leaves `turn_order` untouched for the rest of the round.
+`!list` after the change still shows the OLD order (bob then
+alice). The rebuild happens automatically at the next round
+wrap — after `on_round_end` fires (which runs against the
+just-ended round's order), and before `on_round_start` fires
+(which sees the new order). A `🔄 deferred turn-order rebuild
+applied at round end.` log line confirms the flush. The
+final `!list` shows alice(999), bob(20).
+
+The trailing `!system set ... immediate` restores the global
+default so subsequent scenarios run with the original behavior.
+(Test scenarios share global GameSystem state — leaving
+`deferred` set would change every later scenario's turn-order
+semantics.)
+
+
+SCENARIO 188 — Turn order: lowest_first inverts the sort
+---------------------------------------------------------
+
+!system set default turnorder_direction lowest_first
+!match new mto3 LowFirst 8 8
+!match use mto3
+!ent add alice Alice 30 1 1 10
+!ent add bob Bob 30 2 2 20
+!ent add carol Carol 30 3 3 15
+!list
+!system set default turnorder_direction highest_first
+
+Expected: With `turnorder_direction = lowest_first`, the
+turn order sorts by initiative ASCENDING: alice(10), carol(15),
+bob(20). Fits systems where the variable means "time to act"
+or "agility cost" — lowest goes first. Switching back to
+`highest_first` at the end restores the global default for
+subsequent scenarios.
+
+
+SCENARIO 189 — Turn order: team grouping by highest member initiative
+----------------------------------------------------------------------
+
+!system set default turnorder_team_grouping highest_per_team
+!match new mto4 TeamHigh 8 8
+!match use mto4
+!ent add a A 30 1 1 50
+!ent set_var a team blue
+!ent add b B 30 2 2 45
+!ent set_var b team red
+!ent add c C 30 3 3 10
+!ent set_var c team blue
+!ent add d D 30 4 4 40
+!ent set_var d team red
+!list
+!system set default turnorder_team_grouping none
+
+Expected: Team `blue` has members A(50) and C(10) — team slot
+= max(50, 10) = 50. Team `red` has B(45) and D(40) — team slot
+= 45. Under `highest_per_team` blue acts before red (50 > 45).
+Within each team, members sort by individual initiative
+(highest first): blue → A then C, red → B then D. Final order:
+A, C, B, D. The trailing restore returns the rule to its
+default `none` value so later scenarios sort flatly.
+
+
+SCENARIO 190 — Turn order: team grouping by average member initiative
+----------------------------------------------------------------------
+
+!system set default turnorder_team_grouping average_per_team
+!match new mto5 TeamAvg 8 8
+!match use mto5
+!ent add a A 30 1 1 50
+!ent set_var a team blue
+!ent add b B 30 2 2 45
+!ent set_var b team red
+!ent add c C 30 3 3 10
+!ent set_var c team blue
+!ent add d D 30 4 4 40
+!ent set_var d team red
+!list
+!system set default turnorder_team_grouping none
+
+Expected: Same setup as scenario 189 but the team slot is
+team's mean initiative. Blue avg = (50+10)/2 = 30; red avg =
+(45+40)/2 = 42.5. Red acts first because 42.5 > 30. Within
+each team, members still sort by their own initiative
+(direction-aware): red → B(45) then D(40); blue → A(50) then
+C(10). Final order: B, D, A, C.
+
+
+SCENARIO 191 — Turn order: teamless placement interleaved / first / last
+-------------------------------------------------------------------------
+
+!system set default turnorder_team_grouping highest_per_team
+!system set default turnorder_teamless_position interleaved
+!match new mto6 Teamless 8 8
+!match use mto6
+!ent add a A 30 1 1 50
+!ent set_var a team blue
+!ent add b B 30 2 2 30
+!ent set_var b team blue
+!ent add x X 30 3 3 40
+!ent add y Y 30 4 4 20
+!list
+!system set default turnorder_teamless_position first
+!ent init a 51
+!list
+!system set default turnorder_teamless_position last
+!ent init a 52
+!list
+!system set default turnorder_team_grouping none
+!system set default turnorder_teamless_position interleaved
+
+Expected: Setup is two blue members A and B, plus two teamless
+X and Y. Blue team slot under `highest_per_team` = max(A, B) =
+50 (then 51, then 52 as A's initiative is bumped to force
+rebuilds). Teamless are slotted by their own initiative.
+
+`interleaved` (default): each teamless entity is a "team of
+one". Combined sort by slot: blue(50), X(40), Y(20). Blue
+members A, B come first as the team cluster, then X, then Y.
+Output: A, B, X, Y.
+
+`first`: all teamless go BEFORE all teamed. Output: X, Y, A, B
+(teamless block internally sorted by own initiative
+descending; teamed block sorted by team slot).
+
+`last`: all teamless go AFTER all teamed. Output: A, B, X, Y.
+Happens to match the interleaved layout in this specific
+setup because the blue team's slot dominates both teamless
+slots — but with different initiatives the two would differ.
+(Scenario 192 covers the distinct case.)
+
+
+SCENARIO 192 — Turn order: teamless 'last' vs 'interleaved' diverge
+--------------------------------------------------------------------
+
+!system set default turnorder_team_grouping highest_per_team
+!system set default turnorder_teamless_position interleaved
+!match new mto7 TeamLast 8 8
+!match use mto7
+!ent add a A 30 1 1 30
+!ent set_var a team blue
+!ent add b B 30 2 2 20
+!ent set_var b team blue
+!ent add x X 30 3 3 50
+!ent add y Y 30 4 4 40
+!list
+!system set default turnorder_teamless_position last
+!ent init a 31
+!list
+!system set default turnorder_team_grouping none
+!system set default turnorder_teamless_position interleaved
+
+Expected: Now teamless entities X(50) and Y(40) outrank the
+blue team's slot (max(30, 20) = 30, then 31 after the rebuild
+trigger). Under `interleaved`: X, Y, A, B. Under `last`:
+A, B, X, Y — teamless go after the team cluster regardless of
+their individual slot values. This is exactly when the rule
+matters — for systems where "organized teams always act
+before lone wolves" is the intended fiction.
+
+
+SCENARIO 193 — Turn order: tiebreaker rules resolve equal initiatives
+----------------------------------------------------------------------
+
+!match new mto8 Ties 8 8
+!match use mto8
+!ent add zara Zara 30 1 1 10
+!ent add alice Alice 30 2 2 10
+!ent add bob Bob 30 3 3 10
+!list
+!system set default turnorder_tiebreaker insertion_order
+!ent init bob 11
+!ent init bob 10
+!list
+!system set default turnorder_tiebreaker name
+
+Expected: Three entities at initiative 10 with the default
+`name` tiebreaker sort alphabetically by display name: Alice,
+Bob, Zara. Switching to `insertion_order` and bumping then
+restoring bob's initiative (any change forces a rebuild) gives
+zara, alice, bob — the order they were added via `!ent add`.
+The trailing `name` restore returns the default for later
+scenarios. (`id` tiebreaker would match alphabetical here
+because ids equal names lowercased; `random_stable` uses a
+hash of `(match.id, round_number, entity_id)` that's stable
+within a round and reshuffles between rounds.)
+
+
+SCENARIO 194 — Turn order: configurable turnorder_var name
+-----------------------------------------------------------
+
+!system set default turnorder_var speed
+!match new mto9 SpeedVar 8 8
+!match use mto9
+!ent add ship_a "Ship A" 30 1 1
+!ent set_var ship_a speed 30
+!ent add ship_b "Ship B" 30 2 2
+!ent set_var ship_b speed 50
+!ent add ship_c "Ship C" 30 3 3
+!ent set_var ship_c speed 10
+!list
+!ent set_var ship_a speed 99
+!list
+!system set default turnorder_var initiative
+
+Expected: With `turnorder_var = speed`, the engine sorts on
+`vars.speed` instead of `vars.initiative`. Three ships added
+without initiative at `!ent add` time get inserted into the
+turn order once their `speed` var is set (each `set_var speed`
+triggers `_mark_turn_order_dirty` since the configured
+turn-order variable changed). Order is Ship B(50), Ship A(30),
+Ship C(10).
+
+Setting Ship A's speed to 99 reorders to Ship A(99), Ship B(50),
+Ship C(10) — the same `immediate` policy applies regardless of
+what `turnorder_var` is named. Restoring `turnorder_var =
+initiative` at the end keeps the global default clean for
+subsequent scenarios.
+
+
+SCENARIO 195 — Turn order: removing the team var triggers a rebuild
+--------------------------------------------------------------------
+
+!system set default turnorder_team_grouping highest_per_team
+!match new mto10 TeamDrop 8 8
+!match use mto10
+!ent add a A 30 1 1 30
+!ent set_var a team blue
+!ent add b B 30 2 2 50
+!ent set_var b team red
+!ent add c C 30 3 3 10
+!ent set_var c team blue
+!list
+!ent delete_var c team
+!list
+!system set default turnorder_team_grouping none
+
+Expected: With `highest_per_team` grouping, initial order is
+B (red, slot 50), A (blue, slot 30), C (blue, slot 30 — same
+team as A so they cluster). Deleting C's team var moves her
+out of team blue into the "teamless" bucket. The `remove_var`
+path detects that the deleted key is the configured
+`team_var` and calls `_mark_turn_order_dirty`, which under
+the default `immediate` policy rebuilds right away.
+
+Post-removal, blue's slot drops to 30 (A alone), red is still
+50, and C is teamless with slot 10. With the default
+`turnorder_teamless_position = interleaved`, C slots in by
+her own initiative: B (red 50), A (blue 30), C (10). Notice
+the team-bucket recalculation — C is no longer dragging
+blue's max down because she's not in blue anymore.
+
+(Removing the configured `turnorder_var` itself isn't tested
+here because the engine protects it as a vital variable. The
+underlying `remove_var` codepath still flags the turn-order
+rebuild — it's just not reachable from `!ent delete_var`.)
+
+
+SCENARIO 196 — Turn order: structural changes always rebuild immediately
+-------------------------------------------------------------------------
+
+!system set default turnorder_change_policy deferred
+!match new mto11 Struct 8 8
+!match use mto11
+!ent add alice Alice 30 1 1 10
+!ent add bob Bob 30 2 2 20
+!list
+!ent add carol Carol 30 3 3 15
+!list
+!ent del bob
+!list
+!ent hp alice -999
+!list
+!system set default turnorder_change_policy immediate
+
+Expected: Even with `deferred` policy active, STRUCTURAL
+changes — spawn, removal, death/revive — rebuild
+immediately. They have to: a deferred-rebuild dead entity
+would otherwise still get turns until the next round wrap.
+The deferred policy applies only to VALUE-driven changes
+(writes to the configured turn-order or team variable).
+
+Adding Carol mid-game inserts her at the right initiative
+slot right away: bob, carol, alice. Removing Bob with
+`!ent del bob` drops him from the order immediately: carol,
+alice. Dealing lethal damage to Alice (`!ent hp alice -999`)
+flips her to "dead" status — `damage_entity` detects the
+alive-status change and calls `_rebuild_turn_order()`
+directly, dropping her from the turn list. Final order:
+[carol] alone.
