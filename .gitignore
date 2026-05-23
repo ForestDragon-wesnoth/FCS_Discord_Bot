@@ -185,3 +185,13 @@ cython_debug/
 
 #project-specific excludes:
 1bot_token.txt
+
+# Test-suite artifacts: a handful of scenarios in test_sequences.txt
+# call `!store save <name>` with relative paths (most use /tmp/<...>
+# but a few legacy ones don't). Running the suite from the repo root
+# drops these files in the working dir — they're not source, just
+# left behind by the harness.
+groups_test.json
+savetest.json
+tpl_save
+tpl_save.json
