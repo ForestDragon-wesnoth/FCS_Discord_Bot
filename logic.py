@@ -418,7 +418,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # },
 }
 
-# Backwards-compatibility helpers (engine defaults & bare schema maps)
+# Precomputed views of RULES_REGISTRY for fast lookup at call sites that
+# only need the default value or the schema (not the full registry entry).
 DEFAULT_SYSTEM_SETTINGS: Dict[str, Any] = {
     k: v["default"] for k, v in RULES_REGISTRY.items()
 }
@@ -784,8 +785,9 @@ class Passive:
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "Passive":
-        # `target` and `scope` are recent additions; older save files lack
-        # them. Fall back to the defaults so old saves load cleanly.
+        # `target=""` is the "no filter" sentinel and `scope="deep"` is the
+        # most permissive option — these defaults are the semantic
+        # "unspecified" state, not back-compat for missing fields.
         return Passive(
             id=d["id"],
             when=d["when"],
@@ -1354,19 +1356,13 @@ class GameSystem:
     def from_dict(d: Dict[str, Any]) -> "GameSystem":
         raw = d.get("settings", {}) or {}
         settings: Dict[str, Rule] = {}
-        # Back-compat: allow old saves that stored plain values
         for k, v in raw.items():
-            if isinstance(v, dict) and "value" in v and "schema" in v:
-                val = v["value"]
-                schema = v.get("schema") or RULES_REGISTRY.get(k, {}).get("schema", {})
-                desc = v.get("description") or RULES_REGISTRY.get(k, {}).get("desc", "")
-            else:
-                val = v
-                schema = RULES_REGISTRY.get(k, {}).get("schema", {})
-                desc = RULES_REGISTRY.get(k, {}).get("desc", "")
-            settings[k] = Rule(key=k, value=val, schema=schema, description=desc)
-        # Older saves predate system-level templates — they just won't
-        # have the key, and the match starts with no inherited templates.
+            settings[k] = Rule(
+                key=k,
+                value=v["value"],
+                schema=v.get("schema") or RULES_REGISTRY.get(k, {}).get("schema", {}),
+                description=v.get("description") or RULES_REGISTRY.get(k, {}).get("desc", ""),
+            )
         raw_templates = d.get("tile_templates", {}) or {}
         templates: Dict[str, Dict[str, Any]] = {}
         for tname, tdef in raw_templates.items():
@@ -1384,12 +1380,10 @@ class Entity:
     x: int
     y: int
     id: str# explicit, user-provided
-    # `team` was a top-level dataclass field historically. It now lives in
-    # vars under the key configured by the team_var rule (default "team"),
-    # the same way hp/max_hp/initiative migrated. Read/write goes through
-    # the team property pair below so external callers using e.team still
-    # work; legacy saves that carry a top-level "team" field get migrated
-    # into vars during Entity.from_dict.
+    # Team lives in vars under the key configured by the team_var rule
+    # (default "team"), same as hp/max_hp/initiative. Read/write goes
+    # through the team property pair below so external callers using
+    # e.team still work — direct vars[team_var] access is also fine.
     status: Set[str] = field(default_factory=set)
 
     # structured variable bag — hp, max_hp, and initiative now live HERE
@@ -2057,22 +2051,13 @@ class Entity:
 
     # ---------- serialization ----------
     def to_dict(self) -> Dict[str, Any]:
-        # hp/max_hp/initiative/team now live in vars; include top-level copies for save-file readability
-        # and backwards compatibility with older loaders
-        hp_var, max_hp_var, init_var = self._vital_var_names()
-        team_var = self._team_var_name()
         return {
             "name": self.name,
-            "hp": self.vars.get(hp_var, 0),         # backwards-compat mirror
             "x": self.x,
             "y": self.y,
             "id": self.id,
-            "max_hp": self.vars.get(max_hp_var),     # backwards-compat mirror
-            "team": self.vars.get(team_var),         # backwards-compat mirror
             "status": list(self.status),
-            "initiative": self.vars.get(init_var),   # backwards-compat mirror
             "vars": dict(self.vars),
-            "_vital_in_vars": True,                  # flag: vital data lives in vars
             "passives": {pid: p.to_dict() for pid, p in self.passives.items()},
             "clamps": {path: c.to_dict() for path, c in self.clamps.items()},
             "facing": self.facing,
@@ -2080,42 +2065,17 @@ class Entity:
 
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "Entity":
-        vars_dict = dict(data.get("vars", {}))
-        # Migrate legacy saves ONLY (before vital vars moved into vars).
-        # New-format saves set _vital_in_vars=True; skip migration for those
-        # to avoid creating duplicate keys when custom var names are used.
-        if not data.get("_vital_in_vars", False):
-            if "hp" in data and "hp" not in vars_dict:
-                vars_dict["hp"] = int(data["hp"])
-            if "max_hp" in data and data.get("max_hp") is not None and "max_hp" not in vars_dict:
-                vars_dict["max_hp"] = int(data["max_hp"])
-            if "initiative" in data and data.get("initiative") is not None and "initiative" not in vars_dict:
-                vars_dict["initiative"] = int(data["initiative"])
-        # Migrate legacy "team" top-level field into vars. Two cases:
-        #   - Legacy save (no _vital_in_vars flag): team always migrates if
-        #     present, under the default key "team" (legacy saves predate
-        #     team_var so the value of that rule isn't knowable here).
-        #   - New-format save (_vital_in_vars=True): the top-level "team"
-        #     is the backwards-compat mirror written by to_dict, but the
-        #     authoritative copy is already inside data["vars"]. Skip the
-        #     migration to avoid clobbering a renamed team var (e.g. when
-        #     team_var='faction', vars['faction'] holds the real value and
-        #     data['team'] would be None or stale).
-        if (not data.get("_vital_in_vars", False)
-                and data.get("team") is not None and "team" not in vars_dict):
-            vars_dict["team"] = data["team"]
         e = Entity(
             name=data["name"],
             x=int(data["x"]),
             y=int(data["y"]),
             id=str(data["id"]),
             status=set(data.get("status", [])),
-            vars=vars_dict,
+            vars=dict(data.get("vars", {})),
             facing=data.get("facing", "up"),
         )
         for pid, pd in (data.get("passives", {}) or {}).items():
             e.passives[pid] = Passive.from_dict(pd)
-        # Clamps are a recent addition; old saves won't have the key.
         for path, cd in (data.get("clamps", {}) or {}).items():
             e.clamps[path] = ClampSpec.from_dict(cd)
         return e
@@ -2553,10 +2513,10 @@ class Match:
         if wrapped:
             self.round_number += 1
             log.extend(self.fire_hook("on_round_start"))
-            # Autosave round start AFTER turn_number is bumped and
+            # Autosave round start AFTER round_number is bumped and
             # on_round_start hooks have fired, mirroring the first-call
-            # path above. Snapshot.round_at_snapshot will record the
-            # *new* round number, matching the round players are in.
+            # path above. Snapshot.round_at_snapshot records the *new*
+            # round number, matching the round players are in.
             self.history.record_round(self)
         new_cur = self.turn_order[self.active_index]
         log.extend(self.fire_hook("on_turn_start", target_ids=[new_cur]))
@@ -2569,10 +2529,6 @@ class Match:
         Entity-level clamps WHOLLY override system-level clamps on the same
         path (replace, not field-by-field merge). See ClampSpec docstring.
         Returns None if neither level defines a clamp for this path.
-
-        The rule lookup goes through self.rules.get("default_clamps", []),
-        which produces an empty list for matches whose rules dict predates
-        this commit (graceful backward-compat for old saves).
         """
         # Entity-level override wins
         if path in entity.clamps:
@@ -3017,19 +2973,19 @@ class Match:
             pid: Passive.from_dict(pd)
             for pid, pd in (d.get("global_passives", {}) or {}).items()
         }
-        # Groups are a recent addition; older saves won't have the key.
-        # Filter members to currently-existing entities at load time so
-        # stale references in older saves don't survive.
+        # Filter group membership to currently-existing entities so a
+        # stale reference (entity deleted between save and load) doesn't
+        # survive the load — group_members would otherwise return a
+        # mix of live and dangling ids.
         raw_groups = d.get("groups", {}) or {}
         m.groups = {
             name: [eid for eid in members if eid in m.entities]
             for name, members in raw_groups.items()
         }
-        # Tiles are even newer; older saves omit the key. Filter to
-        # in-bounds coords so a grid-resize between save and load
-        # doesn't leave orphaned data — the match's effective bounds
-        # are authoritative, and an out-of-bounds tile would never be
-        # reachable from any command or formula anyway.
+        # Filter tiles to in-bounds coords so a grid-resize between save
+        # and load doesn't leave orphaned data. Match's bounds are
+        # authoritative — an out-of-bounds tile would never be reachable
+        # from any command or formula anyway.
         raw_tiles = d.get("tiles", {}) or {}
         m.tiles = {}
         for key, val in raw_tiles.items():
@@ -3040,10 +2996,6 @@ class Match:
                 continue
             if m.in_bounds(x, y) and isinstance(val, dict) and val:
                 m.tiles[(x, y)] = val
-        # Templates are newer than tiles; older saves predate them and
-        # restore with an empty registry (existing tiles with no
-        # `_template` field continue to work — they're ad-hoc and were
-        # never tied to a template).
         raw_templates = d.get("tile_templates", {}) or {}
         m.tile_templates = {}
         for tname, tdef in raw_templates.items():
@@ -3487,23 +3439,19 @@ class MatchManager:
         try:
             self.matches = {mid: Match.from_dict(md) for mid, md in data.get("matches", {}).items()}
             self.active_by_channel = data.get("active_by_channel", {})
-            # systems
-            sysdict = data.get("systems", {"default": {"name": "default", "settings": dict(DEFAULT_SYSTEM_SETTINGS)}})
-            self.systems = {name: GameSystem.from_dict(sd) for name, sd in sysdict.items()}
+            self.systems = {
+                name: GameSystem.from_dict(sd)
+                for name, sd in data["systems"].items()
+            }
             self.default_system_name = data.get("default_system_name", "default")
             self.default_system_per_server = data.get("default_system_per_server", {})
             self.default_system_per_channel = data.get("default_system_per_channel", {})
-            # re-bind matches to ensure entity defaults consistent
+            # Re-snapshot each match's rules dict from its bound system so
+            # mid-write rule edits since the save took effect when reloaded.
             for m in self.matches.values():
-                # If system missing, fall back to global default
                 if m.system_name not in self.systems:
                     m.system_name = self.default_system_name
-                # refresh rules = defaults + system settings
-                base = dict(DEFAULT_SYSTEM_SETTINGS)
-                base = dict(DEFAULT_SYSTEM_SETTINGS)
-                for k, r in (self.systems[m.system_name].settings or {}).items():
-                    base[k] = r.value
-                m.rules = base
+                m.rules = self._build_rules_dict(self.systems[m.system_name])
                 for e in m.entities.values():
                     e.bind(m, set_spawn_facing=False)
         except Exception as e:

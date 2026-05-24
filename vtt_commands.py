@@ -1713,7 +1713,7 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             # `undo to round X` always prompts unless the round threshold
             # is disabled (-1). Conceptually it's a non-linear jump so
             # we treat it like a round undo of "however many rounds away."
-            distance = max(1, m.turn_number - target_round)
+            distance = max(1, m.round_number - target_round)
             threshold = int(m.rules.get("undo_confirmation_round_threshold", 1))
             if _confirmation_required(threshold, distance) and not confirmed:
                 erased = sum(1 for x in m.history.round_saves if x.sequence > snap.sequence) + \
@@ -2055,9 +2055,9 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         when = args[3].lower()
 
         # Walk args[4:] looking for target=/scope= named args; the rest is
-        # the formula. We allow named args in any order, but they must all
-        # come before any formula content. This keeps simple cases
-        # (no target/scope) backward-compatible with the original syntax.
+        # the formula. Named args may appear in any order but must all
+        # come before any formula content so simple cases stay terse
+        # (`!pas add ... <formula>` without typing target=/scope=).
         target_val = ""
         scope_val = "deep"
         formula_parts: List[str] = []
