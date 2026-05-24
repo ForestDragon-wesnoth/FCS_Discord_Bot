@@ -1159,8 +1159,11 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")        
         value = int(args[2])
-        m.entities[eid].set_initiative_entity(value)
-        return await ctx.send(f"Set initiative of `{eid}` to {value}.")
+        hook_log = m.entities[eid].set_initiative_entity(value)
+        msg = f"Set initiative of `{eid}` to {value}."
+        if hook_log:
+            msg = msg + "\n" + "\n".join(hook_log)
+        return await ctx.send(msg)
     # clone
     if sub == "clone":
         if await return_help_if_not_enough_args(ctx, args, 5, "ent", "clone"):
