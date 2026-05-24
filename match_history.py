@@ -76,7 +76,7 @@ class Snapshot:
                                  time (used for "keep last N turns of
                                  command snapshots" pruning); 0 before any
                                  turn has begun
-      round_at_snapshot          Match.turn_number at snapshot time
+      round_at_snapshot          Match.round_number at snapshot time
       active_index               Match.active_index at snapshot time
       active_entity_id           convenience copy of the entity whose turn
                                  it was; None if turn order is empty
@@ -190,7 +190,7 @@ class MatchHistory:
             kind=kind,
             sequence=self._next_seq(),
             turn_index_at_snapshot=self._turn_index,
-            round_at_snapshot=match.turn_number,
+            round_at_snapshot=match.round_number,
             active_index=match.active_index,
             active_entity_id=match.current_entity_id(),
             timestamp=_now_iso(),
@@ -352,7 +352,7 @@ class MatchHistory:
         if rounds == 0:
             self.turn_saves.clear()
             return
-        threshold = match.turn_number - rounds + 1
+        threshold = match.round_number - rounds + 1
         self.turn_saves = [s for s in self.turn_saves
                            if s.round_at_snapshot >= threshold]
 

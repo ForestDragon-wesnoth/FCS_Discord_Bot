@@ -204,6 +204,96 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "'no team' rather than erroring."
         ),
     },
+    # --- Turn-order shape ---
+    # The five rules below control how _rebuild_turn_order produces the
+    # turn list from the candidate set (alive entities whose turnorder_var
+    # is not None). Together they cover the common axes of variation:
+    # which direction to sort, whether to cluster by team, where teamless
+    # entities go, how to break exact ties, and when value-driven
+    # rebuilds take effect.
+    "turnorder_direction": {
+        "default": "highest_first",
+        "schema": {"type": "enum", "choices": ["highest_first", "lowest_first"]},
+        "desc": (
+            "Whether higher or lower turnorder_var values act FIRST in the "
+            "round. 'highest_first' (the default) is what most d20-style "
+            "systems use; 'lowest_first' fits e.g. roll-under or "
+            "agility-based systems where the variable is conceptually "
+            "'time to act' rather than initiative."
+        ),
+    },
+    "turnorder_team_grouping": {
+        "default": "none",
+        "schema": {
+            "type": "enum",
+            "choices": ["none", "highest_per_team", "average_per_team"],
+        },
+        "desc": (
+            "How teams are clustered within the turn order. 'none' (default) "
+            "ignores teams entirely — every entity sorts on its own "
+            "turnorder_var. 'highest_per_team' clusters team members "
+            "together and ranks each team's slot by the best individual "
+            "turnorder_var in that team. 'average_per_team' uses the team's "
+            "mean turnorder_var as its slot. Within a clustered team, "
+            "members sort by individual turnorder_var (using "
+            "turnorder_direction and turnorder_tiebreaker the same way "
+            "the top-level sort does). Teamless entities are placed "
+            "according to turnorder_teamless_position."
+        ),
+    },
+    "turnorder_teamless_position": {
+        "default": "interleaved",
+        "schema": {
+            "type": "enum",
+            "choices": ["interleaved", "first", "last"],
+        },
+        "desc": (
+            "Where teamless entities sit when turnorder_team_grouping is "
+            "enabled. 'interleaved' (default): each teamless entity is "
+            "treated as a 'team of one' and slotted by its own "
+            "turnorder_var alongside real teams. 'first': all teamless "
+            "entities form a single block placed before all teamed "
+            "entities. 'last': all teamless go after all teamed. The "
+            "teamless block is always internally sorted by individual "
+            "turnorder_var. Ignored entirely when team_grouping='none'."
+        ),
+    },
+    "turnorder_tiebreaker": {
+        "default": "name",
+        "schema": {
+            "type": "enum",
+            "choices": ["name", "id", "insertion_order", "random_stable"],
+        },
+        "desc": (
+            "How to resolve ties when two entities have the same "
+            "turnorder_var (or two teams have the same group score). "
+            "'name' (default): alphabetical by display name, then id. "
+            "'id': by entity id only. 'insertion_order': order entities "
+            "were added to the match (oldest first). 'random_stable': "
+            "seeded by (match.id, round_number) so the order is stable "
+            "within a round but reshuffles between rounds — useful for "
+            "systems that want randomized initiative ties without "
+            "rerolling each turn."
+        ),
+    },
+    "turnorder_change_policy": {
+        "default": "immediate",
+        "schema": {"type": "enum", "choices": ["immediate", "deferred"]},
+        "desc": (
+            "When a write to an entity's turnorder_var or team_var "
+            "occurs mid-round (typically from a formula or a passive's "
+            "side effect), should turn order rebuild immediately? "
+            "'immediate' (default): rebuild on the spot. The currently "
+            "acting entity keeps acting — active_index follows them to "
+            "their new position. 'deferred': leave this round's order "
+            "untouched; emit a warning and stash the change. The "
+            "rebuild happens at round end (after on_round_end fires, "
+            "before on_round_start fires for the next round). "
+            "Structural changes (spawn, death, removal) always rebuild "
+            "immediately regardless of this rule — only value-driven "
+            "changes are deferrable."
+        ),
+    },
     # Spawning / facing
     "spawn_face_toward_center": {
         "default": True,
@@ -1773,9 +1863,17 @@ class Entity:
         if (not was_alive) and self.is_alive:
             self._require_match()._rebuild_turn_order()
 
-    def set_initiative_entity(self, value: int):
-        self.initiative = value
-        self._require_match()._rebuild_turn_order()
+    def set_initiative_entity(self, value: int) -> List[str]:
+        # Route through write_var directly (rather than the property
+        # setter) so we can capture and return the resulting log
+        # lines — !ent init then surfaces them. write_var dirties
+        # turn order through the active change_policy rule
+        # (immediate rebuild by default; deferred queues it for round
+        # end). No explicit _rebuild_turn_order call here — that
+        # would bypass the policy for !ent init specifically and
+        # split the behavior model from formula-driven writes.
+        _, _, init_var = self._vital_var_names()
+        return self.write_var(init_var, int(value))
 
     # ---------- var mutation chokepoint ----------
     # All writes to entity.vars should go through write_var / remove_var
@@ -1941,6 +2039,30 @@ class Entity:
         # caller sees everything in chronological order.
         event_log = self._fire_var_events(ancestor_events + leaf_events)
         combined = attempt_log + event_log
+        # If this write touched the turn-order or team variable, the
+        # current turn_order is potentially stale. Route through
+        # _mark_turn_order_dirty so the active change_policy decides
+        # whether to rebuild now (immediate) or queue for round end
+        # (deferred). Done AFTER events fire so any var-hook side
+        # effects from this write are also accounted for in the
+        # subsequent rebuild — and so a clamp on the init var
+        # produces an accurate "stored value" in the reason string.
+        if self._match is not None:
+            init_var = self._match.rules.get("turnorder_var", "initiative")
+            team_var = self._match.rules.get("team_var", "team")
+            for ev in (ancestor_events + leaf_events):
+                if ev.key == init_var:
+                    self._match._mark_turn_order_dirty(
+                        f"`{self.id}`.{init_var}: "
+                        f"{ev.old_value!r} → {ev.new_value!r}"
+                    )
+                    break
+                if ev.key == team_var:
+                    self._match._mark_turn_order_dirty(
+                        f"`{self.id}`.{team_var}: "
+                        f"{ev.old_value!r} → {ev.new_value!r}"
+                    )
+                    break
         # Drain accumulated warnings ONLY at top-level. Nested writes
         # (from passive formulas) accumulate warnings on the match but
         # don't surface them — the outermost call collects them all.
@@ -1970,6 +2092,22 @@ class Entity:
         self._del_path(path)
         events = _diff_subtree(path, old, _MISSING)
         log = self._fire_var_events(events)
+        # Removing the init or team var also dirties turn order — same
+        # policy gate as write_var above. Initiative being removed means
+        # the entity drops out of turn_order entirely (since
+        # _rebuild_turn_order filters on initiative is not None), so
+        # this matters even under the deferred policy at round end.
+        if self._match is not None:
+            init_var = self._match.rules.get("turnorder_var", "initiative")
+            team_var = self._match.rules.get("team_var", "team")
+            if path == init_var:
+                self._match._mark_turn_order_dirty(
+                    f"`{self.id}`.{init_var} removed (was {old!r})"
+                )
+            elif path == team_var:
+                self._match._mark_turn_order_dirty(
+                    f"`{self.id}`.{team_var} removed (was {old!r})"
+                )
         if is_top_level_write and self._match is not None and self._match._var_event_warnings:
             log.extend(self._match._var_event_warnings)
             self._match._var_event_warnings = []
@@ -2223,6 +2361,13 @@ class Match:
     # warnings on the Match and the top-level entry point (write_var /
     # remove_var on Entity) flushes them at chain exit.
     _var_event_warnings: List[str] = field(default_factory=list, repr=False)
+
+    # Deferred turn-order rebuild flag. Set true when a write to an
+    # entity's turnorder_var or team_var happens under the 'deferred'
+    # change policy; the actual rebuild runs at round end. Always
+    # false under 'immediate' policy (the rebuild ran inline so
+    # nothing was deferred). Cleared at every successful rebuild.
+    _turn_order_dirty: bool = field(default=False, repr=False)
 
     # ---- global constraints / helpers (unchanged in spirit) ----
     def in_bounds(self, x: int, y: int) -> bool:
@@ -2494,20 +2639,203 @@ class Match:
     # ------------- turns -------------
 
     def _rebuild_turn_order(self):
+        """Sort the alive, initiative-bearing entities into `self.turn_order`
+        according to the active rules. Preserves the currently-acting
+        entity's identity: if they're still eligible, active_index points
+        at their new position. Clears the deferred-rebuild flag.
+
+        Five rules drive this:
+          - turnorder_direction       (highest_first | lowest_first)
+          - turnorder_team_grouping   (none | highest_per_team | average_per_team)
+          - turnorder_teamless_position (interleaved | first | last)
+          - turnorder_tiebreaker      (name | id | insertion_order | random_stable)
+          - turnorder_change_policy   handled OUTSIDE this method by
+                                      _mark_turn_order_dirty; once we
+                                      get here we just rebuild.
+
+        Structural rebuilds (spawn / remove / death / revive) call this
+        directly because membership changes can't usefully be deferred —
+        a dead entity sitting in turn_order would otherwise still take
+        turns. Value-driven rebuilds (init/team writes from formulas or
+        the !ent initiative command) route through _mark_turn_order_dirty
+        so they respect the policy rule.
+        """
         prev_current_id = None
         if 0 <= self.active_index < len(self.turn_order):
             prev_current_id = self.turn_order[self.active_index]
 
-        ordered = sorted(
-            [e for e in self.entities.values() if e.initiative is not None and e.is_alive],
-            key=lambda e: (-e.initiative, e.name.lower(), e.id)
-        )
-        self.turn_order = [e.id for e in ordered]
+        candidates = [
+            e for e in self.entities.values()
+            if e.initiative is not None and e.is_alive
+        ]
+
+        direction = self.rules.get("turnorder_direction", "highest_first")
+        grouping = self.rules.get("turnorder_team_grouping", "none")
+        teamless_pos = self.rules.get("turnorder_teamless_position", "interleaved")
+        tiebreaker = self.rules.get("turnorder_tiebreaker", "name")
+
+        # Direction multiplier — Python's sort is ascending, so we negate
+        # the initiative for highest_first and leave it positive for
+        # lowest_first. Group scores follow the same convention.
+        init_dir = -1 if direction == "highest_first" else 1
+
+        # Snapshot insertion order once per rebuild — list(entities.keys())
+        # is O(n) and we'd otherwise call it inside every tie_key.
+        insertion_index = {eid: i for i, eid in enumerate(self.entities.keys())}
+
+        def tie_key(e: "Entity") -> Tuple:
+            if tiebreaker == "id":
+                return (e.id,)
+            if tiebreaker == "insertion_order":
+                return (insertion_index.get(e.id, 1_000_000),)
+            if tiebreaker == "random_stable":
+                # Seeded by (match.id, round_number) so the same set of
+                # ties resolves identically every call within a round
+                # but reshuffles when the round bumps. Using a hash of
+                # the seed + entity id keeps it deterministic without
+                # needing a stored permutation.
+                import hashlib
+                seed = f"{self.id}:{self.round_number}:{e.id}"
+                return (hashlib.sha256(seed.encode()).hexdigest(),)
+            # default 'name'
+            return (e.name.lower(), e.id)
+
+        def member_key(e: "Entity") -> Tuple:
+            # Members are always sorted by direction-aware individual
+            # initiative first, then the configured tiebreaker.
+            return (init_dir * e.initiative,) + tie_key(e)
+
+        if grouping == "none":
+            ordered = sorted(candidates, key=member_key)
+            self.turn_order = [e.id for e in ordered]
+        else:
+            # Partition into teamed groups and teamless. team_var on
+            # Entity already returns None for "no team" (absent or
+            # empty value), so the partition is just a None check.
+            teamed_groups: Dict[str, List["Entity"]] = {}
+            teamless: List["Entity"] = []
+            for e in candidates:
+                team = e.team
+                if team is None or team == "":
+                    teamless.append(e)
+                else:
+                    teamed_groups.setdefault(team, []).append(e)
+
+            def group_score(members: List["Entity"]) -> float:
+                inits = [e.initiative for e in members]
+                if grouping == "average_per_team":
+                    return sum(inits) / len(inits)
+                # highest_per_team — but "highest" depends on direction.
+                # In lowest_first systems, the team's slot is its LOWEST
+                # initiative (the most-eager member); the rule name's
+                # spirit is "best representative", not "max value".
+                return min(inits) if direction == "lowest_first" else max(inits)
+
+            def team_group_key(team_name: str, members: List["Entity"]) -> Tuple:
+                # Group ties resolve by the tiebreaker applied to the
+                # team's NAME (rather than to a representative member's
+                # name) — teams are first-class buckets here. For
+                # tiebreaker='id' / 'insertion_order' / 'random_stable'
+                # we fall back to team_name as the secondary key since
+                # those tiebreakers are entity-specific.
+                if tiebreaker == "id":
+                    return (team_name,)
+                if tiebreaker == "insertion_order":
+                    earliest = min(
+                        insertion_index.get(m.id, 1_000_000) for m in members
+                    )
+                    return (earliest, team_name)
+                if tiebreaker == "random_stable":
+                    import hashlib
+                    seed = f"{self.id}:{self.round_number}:team:{team_name}"
+                    return (hashlib.sha256(seed.encode()).hexdigest(),)
+                return (team_name.lower(), team_name)
+
+            def sort_group(members):
+                return sorted(members, key=member_key)
+
+            teamed_entries: List[Tuple[float, Tuple, List["Entity"], str]] = []
+            for tname, members in teamed_groups.items():
+                score = group_score(members)
+                teamed_entries.append((
+                    init_dir * score, team_group_key(tname, members),
+                    sort_group(members), tname,
+                ))
+
+            # Sort teams by (score, tiebreak). Stable Python sort plus
+            # an explicit secondary key makes ordering deterministic
+                # even on score ties.
+            teamed_entries.sort(key=lambda t: (t[0], t[1]))
+            teamed_flat: List["Entity"] = [
+                m for _, _, members, _ in teamed_entries for m in members
+            ]
+            teamless_sorted = sort_group(teamless)
+
+            if teamless_pos == "first":
+                ordered = teamless_sorted + teamed_flat
+            elif teamless_pos == "last":
+                ordered = teamed_flat + teamless_sorted
+            else:
+                # 'interleaved' — treat each teamless entity as a
+                # one-person team. Merge them into teamed_entries with
+                # a synthetic team name so the same sort produces the
+                # interleaved layout in one pass.
+                interleaved_entries = list(teamed_entries)
+                for e in teamless:
+                    interleaved_entries.append((
+                        init_dir * e.initiative,
+                        # Synthetic team key — use the entity's own
+                        # tie_key so a teamless entity with init==team
+                        # score sorts where its own tiebreaker would
+                        # place it, not where its arbitrary id would.
+                        tie_key(e),
+                        [e],
+                        f"__teamless_{e.id}",
+                    ))
+                interleaved_entries.sort(key=lambda t: (t[0], t[1]))
+                ordered = [m for _, _, members, _ in interleaved_entries for m in members]
+            self.turn_order = [e.id for e in ordered]
 
         if prev_current_id and prev_current_id in self.turn_order:
             self.active_index = self.turn_order.index(prev_current_id)
         else:
-            self.active_index = 0 if self.turn_order else 0
+            self.active_index = 0
+
+        # Whatever triggered this rebuild, we've now applied it — the
+        # deferred flag is no longer meaningful.
+        self._turn_order_dirty = False
+
+    def _mark_turn_order_dirty(self, reason: str) -> None:
+        """Called when a value change (turnorder_var or team_var) wants
+        a rebuild. Under the 'immediate' policy (the default) this
+        rebuilds inline. Under 'deferred' it just sets the dirty flag
+        and queues a warning on _var_event_warnings so the GM sees
+        WHICH change is being held until round end.
+
+        Membership changes (spawn / remove / death / revive) DO NOT go
+        through this — they call _rebuild_turn_order directly because
+        a dead entity in the turn list would otherwise still get
+        turns under the deferred policy."""
+        policy = self.rules.get("turnorder_change_policy", "immediate")
+        if policy == "deferred":
+            if not self._turn_order_dirty:
+                # First defer this round — explain the policy once so
+                # the GM doesn't think the change was dropped.
+                self._var_event_warnings.append(
+                    f"⏳ turn order change deferred ({reason}). "
+                    f"New order takes effect at round end."
+                )
+            else:
+                # Subsequent changes during the same deferred window —
+                # just note the reason; the policy was already
+                # surfaced by the first warning.
+                self._var_event_warnings.append(
+                    f"⏳ turn order change deferred: {reason}."
+                )
+            self._turn_order_dirty = True
+            return
+        # 'immediate' (default).
+        self._rebuild_turn_order()
 
     def current_entity_id(self) -> Optional[str]:
         if not self.turn_order:
@@ -2549,6 +2877,19 @@ class Match:
         wrapped = (new_index == 0)
         if wrapped:
             log.extend(self.fire_hook("on_round_end"))
+            # Flush any deferred turn-order rebuild between
+            # on_round_end (which ran against the OLD order — those
+            # were the entities that acted this round) and
+            # on_round_start (which should see the NEW order). The
+            # rebuild rewrites turn_order and may put a different
+            # entity at index 0, which is fine because round-wrap
+            # naturally starts at the top of the new order anyway.
+            if self._turn_order_dirty:
+                self._rebuild_turn_order()
+                log.append(
+                    "🔄 deferred turn-order rebuild applied at round end."
+                )
+                new_index = 0
         self.active_index = new_index
         if wrapped:
             self.round_number += 1
