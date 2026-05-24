@@ -3922,127 +3922,287 @@ reconstructs (x, y) tuples on load. `!tile info` and tile_get on
 the reloaded match both return the original values exactly.
 
 
-SCENARIO 182 — Tile hooks: on_enter, on_exit, on_stop
-------------------------------------------------------
+SCENARIO 182 — Define a tile template and place instances
+----------------------------------------------------------
 
-!match new mhook1 TileHooks 8 8
-!match use mhook1
+!match new mtpl1 TplBasics 8 8
+!match use mtpl1
 !ent add hero Hero 30 1 1 10
-!tile hook add 3 3 on_enter 'entity[self].hp = entity[self].hp - 15'
-!tile hook list 3 3
+!tile def list
+!tile def new flame
+!tile def data flame burn_damage 5
+!tile def data flame glyph F
+!tile def hook flame on_enter 'entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, "burn_damage")'
+!tile def list
+!tile def info flame
+!tile place flame 3 1
+!tile place flame 4 1
+!tile place flame 5 1
+!tile info 3 1
+!tile list
+!ent move hero 5 right
+!ent info hero
+
+Expected: The match starts with no templates ("No tile templates
+defined."). Defining `flame` creates an empty template that's then
+filled with two data fields and one on_enter hook formula. The
+formula reads `tile_get(tile_x, tile_y, "burn_damage")` so each
+instance's own burn_damage value drives the damage — making the
+template generic over per-instance tuning.
+
+Placing flame at (3,1), (4,1), (5,1) writes three independent
+tile dicts, each one a deep copy of the template's data plus a
+`_template: "flame"` tag. `!tile info 3 1` shows the instance
+dict (burn_damage=5, glyph=F, _template=flame); `!tile list` shows
+all three placements. Hooks are NOT copied — they're looked up
+live from the template at fire time.
+
+`!ent move hero 5 right` walks (1,1) → (6,1), transiting (2,1)
+(empty, no hook), (3,1), (4,1), (5,1) (three flames), and stops
+at (6,1). The three flame on_enter hooks fire in order; each
+deals 5 damage. !ent info: hp = 15. The hook firing message
+lists each fire so the GM can verify per-tile triggering.
+
+
+SCENARIO 183 — Template hook edits propagate; template data edits do NOT
+-------------------------------------------------------------------------
+
+!match new mtpl2 TplLive 8 8
+!match use mtpl2
+!ent add hero Hero 100 1 1 10
+!tile def new spike
+!tile def data spike damage 5
+!tile def hook spike on_enter 'entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, "damage")'
+!tile place spike 3 3
+!tile place spike 5 5
 !ent tp hero 3 3
 !ent info hero
-!tile hook add 3 3 on_exit 'entity[self].hp = entity[self].hp - 2'
+!tile def data spike damage 999
+!tile info 3 3
 !ent tp hero 1 1
+!ent tp hero 3 3
 !ent info hero
-!ent set_var hero stops 0
-!tile hook add 5 5 on_stop 'entity[self].stops = entity[self].stops + 1'
+!tile def hook spike on_enter 'entity[self].hp = entity[self].hp - 50'
+!ent tp hero 1 1
 !ent tp hero 5 5
 !ent info hero
-!tile hook add 6 6 on_enter 'entity[self].hp = entity[self].hp - 1'
-!ent move hero 1 right
-!tile hook list 5 5
 
-Expected: Tile (3,3) gets an on_enter hook that deals 15 damage.
-Teleporting hero onto (3,3) fires the hook (hp 30 → 15) and !ent
-info shows the new HP. After adding an on_exit hook to (3,3) that
-deals 2 more damage, teleporting AWAY fires on_exit BEFORE the
-move — entity[self].x/.y still refer to (3,3) when the formula
-runs, so the damage applies (hp 15 → 13). The hero is now at
-(1,1).
+Expected: Two spikes are placed from the same template. Stepping
+on the first deals 5 damage (hp 95). Editing the template's
+`damage` to 999 changes the TEMPLATE'S default — but the already-
+placed instance at (3,3) still has `damage: 5` (copied at place
+time). `!tile info 3 3` shows damage=5 unchanged. Stepping on it
+again still deals 5 (hp 90), proving instance data drifted away
+from the template.
 
-The on_stop hook on (5,5) increments hero.stops by 1 each time
-the entity stops there. After tp to (5,5): on_enter on (5,5) has
-no hook, but on_stop fires — stops = 1. !ent info confirms.
-
-The final !tile hook list shows the registered hook on (5,5)
-(snippet truncated if long). Subsequent moves continue to fire
-hooks as expected — adding an on_enter to (6,6) and moving 1 step
-right from (5,5) lands on (6,6), firing on_exit at (5,5) (no
-hook — no fire), on_enter at (6,6) (-1 hp), and on_stop at (6,6)
-(no hook).
+Then we edit the template's HOOK to deal a flat 50 instead of
+reading per-instance data. This change DOES propagate — the next
+step onto (5,5) fires the new hook formula (hp 90 → 40), even
+though that instance was placed before the hook edit. Hooks are
+looked up live; data is snapshotted.
 
 
-SCENARIO 183 — Walking through a fire path accumulates damage per tile
------------------------------------------------------------------------
+SCENARIO 184 — Placement overrides and per-tile hook override
+--------------------------------------------------------------
 
-!match new mhook2 FirePath 8 8
-!match use mhook2
-!ent add hero Hero 30 1 1 10
-!tile hook add 2 1 on_enter 'entity[self].hp = entity[self].hp - 5'
-!tile hook add 3 1 on_enter 'entity[self].hp = entity[self].hp - 5'
-!tile hook add 4 1 on_enter 'entity[self].hp = entity[self].hp - 5'
-!tile hook add 5 1 on_stop 'entity[self].hp = entity[self].hp - 10'
-!ent move hero 4 right
+!match new mtpl3 TplOverride 8 8
+!match use mtpl3
+!ent add hero Hero 100 1 1 10
+!tile def new flame
+!tile def data flame burn_damage 5
+!tile def hook flame on_enter 'entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, "burn_damage")'
+!tile place flame 3 3
+!tile place flame 4 3 burn_damage=20
+!tile info 3 3
+!tile info 4 3
+!ent tp hero 3 3
 !ent info hero
-
-Expected: The hero walks four cells right from (1,1) — passing
-through (2,1), (3,1), (4,1), and stopping at (5,1). Each
-intermediate cell's on_enter hook fires once as the hero enters
-it (3 × -5 = -15 damage); the on_stop hook at (5,1) fires once
-at the end (-10 damage). Total damage = -25. !ent info shows
-hp = 5. This is exactly the user's "walking through fire takes
-damage per tile of fire walked through" pattern. on_exit is also
-fired at every transit cell (including the starting (1,1) and
-intermediates), but those tiles have no on_exit hooks so the
-fires are no-ops.
-
-
-SCENARIO 184 — Landmine: self-destruct via tile_clear from a hook
-------------------------------------------------------------------
-
-!match new mhook3 Landmine 8 8
-!match use mhook3
-!ent add hero Hero 30 1 1 10
-!tile hook add 4 4 on_enter 'entity[self].hp = entity[self].hp - 25; tile_clear(4, 4)'
-!tile info 4 4
-!ent tp hero 4 4
-!tile info 4 4
+!ent tp hero 4 3
 !ent info hero
+!tile hook add 4 3 on_enter 'entity[self].hp = entity[self].hp - 1'
 !ent tp hero 1 1
-!ent tp hero 4 4
+!ent tp hero 4 3
 !ent info hero
 
-Expected: The landmine at (4,4) has an on_enter hook that deals
-25 damage and then calls tile_clear(4, 4) to remove itself.
-After the hero teleports onto (4,4): hp = 5, and the tile is
-gone from m.tiles (!tile info reports "no data"). Teleporting
-the hero away and back lands on (4,4) again, but the tile no
-longer has a hook — no further damage. The on_stop hook would
-fire if registered, but tile_clear already wiped it; the engine
-gracefully no-ops because fire_tile_hook checks the data dict
-each fire rather than caching a hook reference.
+Expected: Two flames are placed. The first uses template defaults
+(burn_damage=5); the second uses a placement override
+(`burn_damage=20`). `!tile info` shows the override on the
+instance dict — overrides merge over template defaults at place
+time, then the instance is independent. Stepping on (3,3) deals 5
+(hp 95); stepping on (4,3) deals 20 (hp 75).
+
+Adding an ad-hoc `!tile hook add 4 3 on_enter ...` puts a per-
+tile hook on (4,3) that takes precedence over the template's hook
+for THAT tile's on_enter. Stepping on (4,3) again now deals just
+1 (hp 74), not 20. Per-tile hooks beat template hooks; per-when
+granularity is preserved (the template's on_exit / on_stop would
+still apply if defined, since only on_enter was overridden).
 
 
-SCENARIO 185 — Group move fires per-member hooks
--------------------------------------------------
+SCENARIO 185 — Landmine: template-based self-destruct
+------------------------------------------------------
 
-!match new mhook4 GroupHooks 8 8
-!match use mhook4
+!match new mtpl4 Landmines 8 8
+!match use mtpl4
+!ent add hero Hero 100 1 1 10
+!tile def new landmine
+!tile def data landmine glyph *
+!tile def hook landmine on_enter 'entity[self].hp = entity[self].hp - 25; tile_clear(tile_x, tile_y)'
+!tile place landmine 3 3
+!tile place landmine 5 5
+!tile def list
+!ent tp hero 3 3
+!ent info hero
+!tile info 3 3
+!ent tp hero 5 5
+!ent info hero
+!tile info 5 5
+!ent tp hero 1 1
+!ent tp hero 3 3
+!ent info hero
+
+Expected: Define a `landmine` template once. Place two instances.
+Stepping on the first detonates it: -25 damage AND `tile_clear`
+wipes the tile entirely (instance data is gone, no `_template`
+reference remains — the cell is empty). The template itself is
+untouched and still has 1 placed instance left.
+
+Stepping on the second mine detonates that one too — independent
+self-destruct (hp 100 → 75 → 50). After both are detonated,
+`!tile def list` would still show the template with 0 placed
+instances. Teleporting back onto (3,3) finds an empty tile (no
+hook to fire) so hp stays at 50.
+
+This is exactly the user's landmine pattern, except now ONE
+template definition covers any number of placements rather than
+needing a separate `!tile hook add` per cell.
+
+
+SCENARIO 186 — Ad-hoc tiles are still supported (unique loot chest)
+--------------------------------------------------------------------
+
+!match new mtpl5 AdHoc 8 8
+!match use mtpl5
+!ent add hero Hero 30 1 1 10
+!ent set_var hero gold 0
+!tile set 4 4 contents.gold 50
+!tile set 4 4 contents.note 'a small treasure chest'
+!tile set 4 4 glyph C
+!tile hook add 4 4 on_enter 'entity[self].gold = entity[self].gold + tile_get(tile_x, tile_y, "contents.gold"); tile_clear(tile_x, tile_y)'
+!tile info 4 4
+!ent tp hero 4 4
+!ent info hero
+!tile info 4 4
+
+Expected: A one-off treasure chest at (4,4) with no template
+behind it — just an ad-hoc instance with custom data and an
+ad-hoc on_enter hook. Templates are for REUSABLE tile kinds; a
+single unique chest doesn't need one. The hook awards the
+entity 50 gold and tile_clears the chest.
+
+Hero teleports onto (4,4): hero.gold goes from 0 to 50, and the
+tile is gone. !tile info confirms. This is the "unique
+instance" path the user called out — unique tiles are still
+instances, not free-floating hooks attached to a coordinate,
+and they go through the same fire_tile_hook code path with
+identical context bindings.
+
+
+SCENARIO 187 — Group move fires per-member template hooks
+----------------------------------------------------------
+
+!match new mtpl6 GroupTpl 8 8
+!match use mtpl6
 !ent add soldier Soldier 30 2 5 11
 !ent add wizard Wizard 30 3 5 12
 !ent group new party
 !ent group add party soldier
 !ent group add party wizard
-!tile hook add 2 6 on_enter 'entity[self].hp = entity[self].hp - 3'
-!tile hook add 3 6 on_enter 'entity[self].hp = entity[self].hp - 3'
+!tile def new flame
+!tile def data flame burn_damage 3
+!tile def hook flame on_enter 'entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, "burn_damage")'
+!tile place flame 2 6
+!tile place flame 3 6
 !ent move group:party 1 down
 !ent info soldier
 !ent info wizard
 
-Expected: The party group moves one cell down atomically. Soldier
-goes from (2,5) → (2,6); Wizard goes from (3,5) → (3,6). Both
-target cells have fire on_enter hooks, so each member's on_enter
-fires independently — soldier takes -3 (hp 27), wizard takes -3
-(hp 27). The group-move firing is per-member, not per-group; the
-log lines show "fired for `soldier`" and "fired for `wizard`"
-separately. If one member's hook formula failed, only that
-member's hook log line would carry the ⚠️ FAILED marker; the
-group move itself wouldn't roll back (the move had already
-committed by the time hooks fired).
+Expected: One `flame` template covers two placed instances at
+(2,6) and (3,6). The party group steps onto them simultaneously
+via group-move. Each member's on_enter fires independently
+through the SAME template formula — soldier resolves
+`tile_get(2, 6, "burn_damage")` (instance data on the soldier's
+target tile) and takes 3 damage; wizard resolves
+`tile_get(3, 6, "burn_damage")` (instance data on the wizard's
+target tile) and takes 3 damage. tile_x / tile_y bind correctly
+per-firing-tile so the formula doesn't need to know which member
+triggered it.
 
 
-SCENARIO 186 — Turn order: immediate rebuild on initiative change (default)
+SCENARIO 188 — Orphaned instances after template deletion no-op silently
+-------------------------------------------------------------------------
+
+!match new mtpl7 Orphans 8 8
+!match use mtpl7
+!ent add hero Hero 50 1 1 10
+!tile def new flame
+!tile def data flame burn_damage 5
+!tile def hook flame on_enter 'entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, "burn_damage")'
+!tile place flame 3 3
+!tile def del flame
+!tile def del flame confirm
+!tile info 3 3
+!ent tp hero 3 3
+!ent info hero
+
+Expected: `!tile def del flame` without `confirm` warns the GM
+that 1 placed instance still exists. With `confirm` it deletes
+the template, leaving the placed instance as an "orphan" — the
+tile dict still has `_template: "flame"` and its data fields,
+but the template definition is gone.
+
+Stepping onto an orphaned tile silently no-ops the hook lookup.
+No warning spam (a 4-step move through 4 orphan tiles would
+otherwise produce 8+ warning lines; the GM was already warned
+once at delete-confirm time so we don't re-warn per-fire). Hero
+hp stays at 50. `!tile info 3 3` still shows the dangling
+`_template` field so the GM can audit and either redefine the
+template or `!tile del 3 3` to clean up.
+
+
+SCENARIO 189 — Tile templates persist through save/load
+--------------------------------------------------------
+
+!match new mtpl8 TplPersist 8 8
+!match use mtpl8
+!ent add hero Hero 50 1 1 10
+!tile def new flame
+!tile def data flame burn_damage 7
+!tile def hook flame on_enter 'entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, "burn_damage")'
+!tile place flame 4 4
+!store save tpl_save
+!match new mfresh Fresh 8 8
+!match use mfresh
+!ent add hero Hero 50 1 1 10
+!ent tp hero 4 4
+!ent info hero
+!store load tpl_save
+!match use mtpl8
+!tile def list
+!tile def info flame
+!ent tp hero 4 4
+!ent info hero
+
+Expected: Template definitions and placed instances both survive
+a !store save / !store load round-trip. After defining `flame`
+and placing it at (4,4), we save. In a fresh match (no template,
+no tile), tp to (4,4) deals no damage (hp stays 50). Loading the
+save brings back the original match WITH templates and placed
+tiles intact — hero on the restored match takes 7 damage from
+the (4,4) flame via the restored template hook.
+
+
+SCENARIO 190 — Turn order: immediate rebuild on initiative change (default)
 ----------------------------------------------------------------------------
 
 !match new mto1 TurnImm 8 8
@@ -4066,7 +4226,7 @@ required. This is also the path a formula like
 configured `turnorder_var` triggers the same policy.
 
 
-SCENARIO 187 — Turn order: deferred rebuild waits for round end
+SCENARIO 191 — Turn order: deferred rebuild waits for round end
 ---------------------------------------------------------------
 
 !system set default turnorder_change_policy deferred
@@ -4102,7 +4262,7 @@ default so subsequent scenarios run with the original behavior.
 semantics.)
 
 
-SCENARIO 188 — Turn order: lowest_first inverts the sort
+SCENARIO 192 — Turn order: lowest_first inverts the sort
 ---------------------------------------------------------
 
 !system set default turnorder_direction lowest_first
@@ -4122,7 +4282,7 @@ or "agility cost" — lowest goes first. Switching back to
 subsequent scenarios.
 
 
-SCENARIO 189 — Turn order: team grouping by highest member initiative
+SCENARIO 193 — Turn order: team grouping by highest member initiative
 ----------------------------------------------------------------------
 
 !system set default turnorder_team_grouping highest_per_team
@@ -4148,7 +4308,7 @@ A, C, B, D. The trailing restore returns the rule to its
 default `none` value so later scenarios sort flatly.
 
 
-SCENARIO 190 — Turn order: team grouping by average member initiative
+SCENARIO 194 — Turn order: team grouping by average member initiative
 ----------------------------------------------------------------------
 
 !system set default turnorder_team_grouping average_per_team
@@ -4173,7 +4333,7 @@ each team, members still sort by their own initiative
 C(10). Final order: B, D, A, C.
 
 
-SCENARIO 191 — Turn order: teamless placement interleaved / first / last
+SCENARIO 195 — Turn order: teamless placement interleaved / first / last
 -------------------------------------------------------------------------
 
 !system set default turnorder_team_grouping highest_per_team
@@ -4217,7 +4377,7 @@ slots — but with different initiatives the two would differ.
 (Scenario 192 covers the distinct case.)
 
 
-SCENARIO 192 — Turn order: teamless 'last' vs 'interleaved' diverge
+SCENARIO 196 — Turn order: teamless 'last' vs 'interleaved' diverge
 --------------------------------------------------------------------
 
 !system set default turnorder_team_grouping highest_per_team
@@ -4246,7 +4406,7 @@ matters — for systems where "organized teams always act
 before lone wolves" is the intended fiction.
 
 
-SCENARIO 193 — Turn order: tiebreaker rules resolve equal initiatives
+SCENARIO 197 — Turn order: tiebreaker rules resolve equal initiatives
 ----------------------------------------------------------------------
 
 !match new mto8 Ties 8 8
@@ -4273,7 +4433,7 @@ hash of `(match.id, round_number, entity_id)` that's stable
 within a round and reshuffles between rounds.)
 
 
-SCENARIO 194 — Turn order: configurable turnorder_var name
+SCENARIO 198 — Turn order: configurable turnorder_var name
 -----------------------------------------------------------
 
 !system set default turnorder_var speed
@@ -4305,7 +4465,7 @@ initiative` at the end keeps the global default clean for
 subsequent scenarios.
 
 
-SCENARIO 195 — Turn order: removing the team var triggers a rebuild
+SCENARIO 199 — Turn order: removing the team var triggers a rebuild
 --------------------------------------------------------------------
 
 !system set default turnorder_team_grouping highest_per_team
@@ -4343,7 +4503,7 @@ underlying `remove_var` codepath still flags the turn-order
 rebuild — it's just not reachable from `!ent delete_var`.)
 
 
-SCENARIO 196 — Turn order: structural changes always rebuild immediately
+SCENARIO 200 — Turn order: structural changes always rebuild immediately
 -------------------------------------------------------------------------
 
 !system set default turnorder_change_policy deferred
