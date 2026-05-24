@@ -186,6 +186,14 @@ cython_debug/
 #project-specific excludes:
 1bot_token.txt
 
+# Test-suite save artifacts. Scenarios run `!store save <name>` against
+# the working directory; the resulting files are scratch and shouldn't
+# be committed. The names below are the ones used by current scenarios —
+# add more here if new scenarios introduce new save names.
+groups_test.json
+savetest.json
+tpl_save
+test_compat
 # Test-suite artifacts: a handful of scenarios in test_sequences.txt
 # call `!store save <name>` with relative paths (most use /tmp/<...>
 # but a few legacy ones don't). Running the suite from the repo root

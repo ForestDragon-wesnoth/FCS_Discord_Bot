@@ -2058,9 +2058,9 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         when = args[3].lower()
 
         # Walk args[4:] looking for target=/scope= named args; the rest is
-        # the formula. We allow named args in any order, but they must all
-        # come before any formula content. This keeps simple cases
-        # (no target/scope) backward-compatible with the original syntax.
+        # the formula. Named args may appear in any order but must all
+        # come before any formula content so simple cases stay terse
+        # (`!pas add ... <formula>` without typing target=/scope=).
         target_val = ""
         scope_val = "deep"
         formula_parts: List[str] = []
