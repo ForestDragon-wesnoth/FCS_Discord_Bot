@@ -218,6 +218,7 @@ passives still fire.)
 """
 from __future__ import annotations
 import ast
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -281,11 +282,199 @@ def _random_string(*choices: Any) -> str:
     return random.choice(choices)
 
 
+# Distance modes accepted by the distance() formula function. The full
+# names match how the user thinks about them; the short aliases save
+# typing in deeply-nested formulas. All four entries below map to the
+# same three behaviors. Adding a mode means appending here AND extending
+# the if-chain inside _distance.
+_DISTANCE_MODES: Tuple[str, ...] = (
+    "square_radius_distance",  # Chebyshev: max(|dx|, |dy|)
+    "manhattan_distance",      # taxicab:   |dx| + |dy|
+    "euclidean_distance",      # pythag:    sqrt(dx^2 + dy^2), float
+    # short aliases
+    "square_radius", "manhattan", "euclidean",
+)
+
+
+def _distance(x1: Any, y1: Any, x2: Any, y2: Any,
+              mode: Any = "square_radius_distance") -> Any:
+    """distance(x1, y1, x2, y2, mode="square_radius_distance"): how far
+    apart two map cells are under the chosen distance metric.
+
+    Modes:
+      square_radius_distance  Chebyshev / "king's move" distance —
+                              max(|dx|, |dy|). Diagonal counts as one
+                              step, matching how !ent move treats
+                              diagonal directions when they're enabled.
+                              Returns int. (Default — most common in
+                              tile-based RPGs for spell range etc.)
+      manhattan_distance      Taxicab — |dx| + |dy|. Diagonals cost 2
+                              steps. Use this for systems that forbid
+                              diagonal movement entirely. Returns int.
+      euclidean_distance      Straight-line — sqrt(dx^2 + dy^2),
+                              assuming each cell is 1x1. Returns float.
+      Short aliases: "square_radius", "manhattan", "euclidean".
+
+    Entity collisions are NOT considered — this is geometric distance
+    between two points, not pathfinding cost. A wall, another entity,
+    or off-map blockers between (x1,y1) and (x2,y2) don't change the
+    result. For "shortest traversable path" you'd want a separate
+    pathfind function (not in this engine yet).
+
+    Coordinates may be ints or floats; the four args must be numeric.
+    For entity-to-entity distance just pass entity[A].x, entity[A].y,
+    entity[B].x, entity[B].y.
+    """
+    def _num(v, name):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise FormulaError(
+                f"distance(...): {name} must be a number, got "
+                f"{type(v).__name__}."
+            )
+        return v
+    x1 = _num(x1, "x1"); y1 = _num(y1, "y1")
+    x2 = _num(x2, "x2"); y2 = _num(y2, "y2")
+    if not isinstance(mode, str):
+        raise FormulaError(
+            f"distance(..., mode): mode must be a string, got "
+            f"{type(mode).__name__}."
+        )
+    if mode not in _DISTANCE_MODES:
+        allowed = ", ".join(sorted(set(_DISTANCE_MODES)))
+        raise FormulaError(
+            f"distance(...): unknown mode '{mode}'. Allowed: {allowed}."
+        )
+    dx = abs(x2 - x1)
+    dy = abs(y2 - y1)
+    if mode in ("square_radius_distance", "square_radius"):
+        return int(max(dx, dy))
+    if mode in ("manhattan_distance", "manhattan"):
+        return int(dx + dy)
+    # euclidean — returns float by design
+    return math.sqrt(dx * dx + dy * dy)
+
+
+# Angle reference axes. Each entry is (dx, dy) — the unit vector
+# pointing along that reference. We use these to rotate the raw angle
+# so that whichever axis the caller picked reads as 0°. The pairs match
+# DIRECTION_VECTORS in logic.py (up = -y because screen coords).
+_ANGLE_REFERENCES: Dict[str, Tuple[int, int]] = {
+    "up":    ( 0, -1),
+    "right": ( 1,  0),
+    "down":  ( 0,  1),
+    "left":  (-1,  0),
+}
+
+
+def _angle(x1: Any, y1: Any, x2: Any, y2: Any,
+           reference: Any = "up", direction: Any = "cw",
+           signed: Any = False, as_int: Any = True) -> Any:
+    """angle(x1, y1, x2, y2, reference="up", direction="cw",
+       signed=False, as_int=True): bearing FROM (x1,y1) TO (x2,y2).
+
+    Default convention is compass bearing: 0° points "up" (the same
+    direction !ent move treats as up, i.e. y decreasing), and angles
+    grow clockwise. So:
+      (0,0) -> (0,-1)  is 0°    (target directly up)
+      (0,0) -> (1, 0)  is 90°   (target directly right)
+      (0,0) -> (0, 1)  is 180°  (target directly down)
+      (0,0) -> (-1,0)  is 270°  (target directly left)
+      (0,0) -> (1,-1)  is 45°   (target up-right diagonal)
+
+    Knobs:
+      reference   "up" (default) | "right" | "down" | "left". Rotates
+                  the zero point. reference="right" with direction="ccw"
+                  gives the standard math convention (0° = +x, CCW
+                  positive).
+      direction   "cw" (default — compass) | "ccw" (math).
+      signed      False (default — range [0, 360)) | True (range
+                  [-180, 180], with positive in the chosen direction).
+      as_int      True (default — rounded to nearest degree, returns
+                  int) | False (returns float with arbitrary precision).
+
+    Same-point case: angle(x, y, x, y) is undefined geometrically
+    (no displacement). Returns 0 (treating "no direction" as "no
+    rotation from the reference") rather than raising — formulas
+    often compute angles before knowing whether the target is
+    distinct, and forcing every caller to guard would be tedious.
+
+    Entity collisions are ignored — this is the angle between two
+    points, not the angle of an actual line of sight.
+    """
+    def _num(v, name):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise FormulaError(
+                f"angle(...): {name} must be a number, got "
+                f"{type(v).__name__}."
+            )
+        return v
+    x1 = _num(x1, "x1"); y1 = _num(y1, "y1")
+    x2 = _num(x2, "x2"); y2 = _num(y2, "y2")
+    if not isinstance(reference, str) or reference not in _ANGLE_REFERENCES:
+        allowed = ", ".join(sorted(_ANGLE_REFERENCES.keys()))
+        raise FormulaError(
+            f"angle(..., reference): must be one of {allowed}, got "
+            f"{reference!r}."
+        )
+    if direction not in ("cw", "ccw"):
+        raise FormulaError(
+            f"angle(..., direction): must be 'cw' or 'ccw', got "
+            f"{direction!r}."
+        )
+    if not isinstance(signed, bool):
+        raise FormulaError(
+            f"angle(..., signed): must be bool, got {type(signed).__name__}."
+        )
+    if not isinstance(as_int, bool):
+        raise FormulaError(
+            f"angle(..., as_int): must be bool, got {type(as_int).__name__}."
+        )
+    dx = x2 - x1
+    dy = y2 - y1
+    if dx == 0 and dy == 0:
+        return 0 if as_int else 0.0
+    # Compute the angle FROM "up" (y=-1) measured CLOCKWISE. Using
+    # math.atan2(dx, -dy) gives exactly that: atan2's first arg is
+    # the "y component" of the rotation it computes — by feeding dx
+    # there and -dy as the "x component", we rotate the standard
+    # math angle into compass orientation in one call.
+    raw = math.degrees(math.atan2(dx, -dy))  # range (-180, 180], 0=up, CW
+    # Rotate by the chosen reference (offset from "up" measured CW).
+    ref_offset_cw = {
+        "up": 0.0, "right": 90.0, "down": 180.0, "left": 270.0,
+    }[reference]
+    a = raw - ref_offset_cw
+    if direction == "ccw":
+        a = -a
+    if signed:
+        # Wrap into (-180, 180] — directly "behind" (the reference axis
+        # reversed) returns 180, NOT -180, since 180 is the cleaner
+        # representation and matches what GMs would write.
+        a = a % 360.0
+        if a > 180.0:
+            a -= 360.0
+    else:
+        a = a % 360.0
+    if as_int:
+        # Round to nearest integer then re-wrap: round(359.6) = 360,
+        # which should be 0 (unsigned) or -180→180 normalized (signed).
+        a = int(round(a))
+        if not signed:
+            a = a % 360
+        elif a > 180:
+            a -= 360
+        elif a <= -180:
+            a += 360
+    return a
+
+
 _ALLOWED_FUNCS: Dict[str, Any] = {
     "min": min, "max": max, "abs": abs, "round": round,
     "int": int, "float": float, "str": str,
     "random_int": _random_int,
     "random_string": _random_string,
+    "distance": _distance,
+    "angle": _angle,
 }
 
 # Match-bound function names. These functions are bound at namespace build
