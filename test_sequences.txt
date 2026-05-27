@@ -4535,3 +4535,168 @@ flips her to "dead" status — `damage_entity` detects the
 alive-status change and calls `_rebuild_turn_order()`
 directly, dropping her from the turn list. Final order:
 [carol] alone.
+
+
+SCENARIO 201 — distance(): the three modes between literal coordinates
+-----------------------------------------------------------------------
+
+!match new mdist1 Distance 8 8
+!match use mdist1
+!eval "distance(1, 1, 4, 4)"
+!eval "distance(1, 1, 4, 4, 'manhattan_distance')"
+!eval "distance(1, 1, 4, 4, 'euclidean_distance')"
+!eval "distance(0, 0, 1, 3, 'square_radius_distance')"
+!eval "distance(0, 0, 1, 3, 'manhattan_distance')"
+!eval "distance(0, 0, 1, 3, 'euclidean_distance')"
+!eval "distance(2, 5, 2, 5)"
+!eval "distance(0, 0, 3, 0, 'square_radius')"
+
+Expected: `distance(x1,y1,x2,y2,mode)` returns the geometric distance
+between two map cells under the chosen metric. From (1,1) to (4,4):
+`square_radius_distance` (the default) gives 3 — diagonal moves
+count as one step, so three diagonal steps cover the distance.
+`manhattan_distance` gives 6 — diagonals cost 2 there, so it's
+3 right + 3 down. `euclidean_distance` returns the float 4.242...
+= sqrt(18).
+
+The (0,0)→(1,3) example from the function docstring: square_radius=3
+(max of |1| and |3|), manhattan=4 (|1|+|3|), euclidean=3.162...
+(sqrt(10)). Same-point distance is 0 in every mode. The short alias
+`"square_radius"` (no `_distance` suffix) is accepted alongside the
+full names for terseness in nested formulas.
+
+The function ignores entity collisions, walls, and the grid edge —
+it's pure geometry between two points. For "shortest path actually
+walkable around obstacles", a pathfinding helper would be needed
+(not in this engine yet).
+
+
+SCENARIO 202 — distance(): between two entities via their coordinates
+----------------------------------------------------------------------
+
+!match new mdist2 EntDist 10 10
+!match use mdist2
+!ent add hero Hero 30 3 3 10
+!ent add goblin Goblin 30 6 5 5
+!eval "distance(entity[hero].x, entity[hero].y, entity[goblin].x, entity[goblin].y)"
+!eval "distance(entity[hero].x, entity[hero].y, entity[goblin].x, entity[goblin].y, 'manhattan_distance')"
+!eval "distance(entity[hero].x, entity[hero].y, entity[goblin].x, entity[goblin].y, 'euclidean_distance')"
+!ent set_var hero target_dist "$(distance(entity[hero].x, entity[hero].y, entity[goblin].x, entity[goblin].y))"
+!ent dump hero
+
+Expected: Hero at (3,3), goblin at (6,5). dx=3, dy=2. Chebyshev
+distance = max(3,2) = 3. Manhattan = 5. Euclidean = sqrt(13) ≈
+3.606. Reading `entity[hero].x`/`.y` inside the formula gives the
+live coordinates — passing them straight into `distance()` is the
+canonical way to compute entity-to-entity range checks in passives
+(e.g. "did this entity move into spell range?").
+
+The trailing `!ent set_var hero target_dist $(...)` shows the
+same call wrapped in `$()` substitution at the command layer.
+After the assignment, `!ent dump hero` shows
+`vars.target_dist = 3` — the Chebyshev result stored as an int.
+
+
+SCENARIO 203 — angle(): eight cardinal/diagonal directions from origin
+-----------------------------------------------------------------------
+
+!match new mang1 Angle 10 10
+!match use mang1
+!eval "angle(5, 5, 5, 4)"
+!eval "angle(5, 5, 6, 4)"
+!eval "angle(5, 5, 6, 5)"
+!eval "angle(5, 5, 6, 6)"
+!eval "angle(5, 5, 5, 6)"
+!eval "angle(5, 5, 4, 6)"
+!eval "angle(5, 5, 4, 5)"
+!eval "angle(5, 5, 4, 4)"
+!eval "angle(5, 5, 5, 5)"
+
+Expected: Compass-bearing convention (the default): 0° points
+"up" (toward decreasing y, matching how `!ent move up` works),
+angles grow clockwise. Eight cardinal/diagonal target cells
+around (5,5) give the eight 45°-multiples in order:
+
+  (5,4) up        → 0°
+  (6,4) up-right  → 45°
+  (6,5) right     → 90°
+  (6,6) down-right→ 135°
+  (5,6) down      → 180°
+  (4,6) down-left → 225°
+  (4,5) left      → 270°
+  (4,4) up-left   → 315°
+
+The degenerate same-point case (5,5)→(5,5) returns 0 — geometrically
+undefined (no displacement) but treated as "no rotation from the
+reference" so formulas that compute angles before checking distance
+don't need to guard against it.
+
+
+SCENARIO 204 — angle(): knobs — signed range, math convention, as_int
+----------------------------------------------------------------------
+
+!match new mang2 AngleKnobs 10 10
+!match use mang2
+!eval "angle(5, 5, 4, 4)"
+!eval "angle(5, 5, 4, 4, signed=True)"
+!eval "angle(5, 5, 5, 6, signed=True)"
+!eval "angle(5, 5, 6, 5, reference='right', direction='ccw')"
+!eval "angle(5, 5, 5, 4, reference='right', direction='ccw')"
+!eval "angle(5, 5, 4, 5, reference='right', direction='ccw')"
+!eval "angle(0, 0, 1, -2, as_int=False)"
+!eval "angle(0, 0, 1, -2)"
+
+Expected: The default convention gives up-left as 315°
+(compass-style, 0–360 unsigned). With `signed=True`, the same
+target reads as -45° — the negative half of [-180, 180]. The
+"directly behind" case (down from origin) returns 180 under
+signed=True (NOT -180); the function deliberately prefers the
+positive 180 representation over the equivalent -180 because
+it's the cleaner number to write conditions against.
+
+Switching to math convention (`reference="right"`, `direction="ccw"`)
+puts 0° at "right" (positive x) with angles growing
+counterclockwise. (5,5)→(6,5) gives 0° (target on the +x axis);
+(5,5)→(5,4) is 90° (target on the +y axis in math terms — note
+that "up" on the map is +y in math because the engine's y-down
+screen coords get flipped by `direction="ccw"`); (5,5)→(4,5) is
+180°.
+
+`as_int=False` returns a float — (0,0)→(1,-2) is exactly
+arctan(1/2) measured from up clockwise ≈ 26.565°. The default
+`as_int=True` rounds that to 27. (The validator allows keyword
+arguments to formula functions; ordering between positional and
+keyword args follows Python rules.)
+
+
+SCENARIO 205 — angle(): between two entities, used inside a passive
+--------------------------------------------------------------------
+
+!match new mang3 EntAngle 10 10
+!match use mang3
+!ent add hero Hero 30 3 3 10
+!ent add goblin Goblin 30 6 5 5
+!eval "angle(entity[hero].x, entity[hero].y, entity[goblin].x, entity[goblin].y)"
+!ent set_var hero bearing "$(angle(entity[hero].x, entity[hero].y, entity[goblin].x, entity[goblin].y))"
+!ent dump hero
+!ent tp goblin 3 1
+!ent set_var hero bearing "$(angle(entity[hero].x, entity[hero].y, entity[goblin].x, entity[goblin].y))"
+!ent dump hero
+!ent tp goblin 1 3
+!ent set_var hero bearing "$(angle(entity[hero].x, entity[hero].y, entity[goblin].x, entity[goblin].y))"
+!ent dump hero
+
+Expected: Hero at (3,3), goblin at (6,5). Vector dx=3, dy=2 —
+target is down-and-right of hero. Compass bearing from up,
+clockwise: atan2(3,-2) in degrees ≈ 123.69° rounded to 124°.
+After teleporting goblin to (3,1) (directly above hero):
+bearing = 0°. Teleporting to (1,3) (directly left): bearing
+= 270°. Each `set_var` stores the new bearing on the hero;
+`!ent dump hero` shows the running value.
+
+The same pattern works inside a passive — e.g. a "shoots arrows
+forward" passive could compare `entity[self].facing_angle` to
+`angle(entity[self].x, entity[self].y, entity[target].x,
+entity[target].y)` to gate a hit. Entity collisions, walls,
+and other obstructions don't affect the result — angle() is
+pure geometry between two points, same as distance().
