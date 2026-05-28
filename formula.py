@@ -468,6 +468,81 @@ def _angle(x1: Any, y1: Any, x2: Any, y2: Any,
     return a
 
 
+def _direction_to(x1: Any, y1: Any, x2: Any, y2: Any,
+                  allow_diagonals: Any = True) -> str:
+    """direction_to(x1, y1, x2, y2, allow_diagonals=True): name of the
+    direction FROM (x1,y1) TO (x2,y2), snapped to the engine's cardinal
+    (or cardinal+diagonal) direction set.
+
+    With allow_diagonals=True (the default), returns one of:
+      "up", "up_right", "right", "down_right",
+      "down", "down_left", "left", "up_left"
+    Each cell adjacent to (x1,y1) maps to one of these eight names, and
+    farther cells snap to the closest of the eight by sign of dx/dy.
+
+    With allow_diagonals=False, returns one of "up", "down", "left",
+    "right". Pure diagonals are "clumsily rounded" to the dominant
+    axis; perfect 45° ties (|dx| == |dy|) snap to the VERTICAL axis,
+    matching the per-step facing rule for cardinal-only systems
+    (see move_dirs in logic.py).
+
+    Same-point case (x1,y1) == (x2,y2) returns "" (empty string).
+    There's no displacement and thus no direction; callers wanting a
+    sentinel can compare `== ""` rather than guarding with distance().
+
+    Coords may be ints or floats; the result is always one of the
+    direction strings above (or "") regardless of input precision.
+    Entity collisions are ignored, like distance() and angle() —
+    this is pure geometry.
+    """
+    def _num(v, name):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise FormulaError(
+                f"direction_to(...): {name} must be a number, got "
+                f"{type(v).__name__}."
+            )
+        return v
+    x1 = _num(x1, "x1"); y1 = _num(y1, "y1")
+    x2 = _num(x2, "x2"); y2 = _num(y2, "y2")
+    if not isinstance(allow_diagonals, bool):
+        raise FormulaError(
+            f"direction_to(..., allow_diagonals): must be bool, got "
+            f"{type(allow_diagonals).__name__}."
+        )
+    dx = x2 - x1
+    dy = y2 - y1
+    if dx == 0 and dy == 0:
+        return ""
+    # Helper for the sign (vector component) of a number — we don't use
+    # math.copysign because that returns +/- 1.0 even for input 0 and
+    # we want true 0 for "no displacement on this axis".
+    def _sign(v):
+        if v > 0: return 1
+        if v < 0: return -1
+        return 0
+    sx, sy = _sign(dx), _sign(dy)
+    if allow_diagonals:
+        # 8-way snap: each component independently contributes its sign.
+        names = {
+            ( 0, -1): "up",
+            ( 1, -1): "up_right",
+            ( 1,  0): "right",
+            ( 1,  1): "down_right",
+            ( 0,  1): "down",
+            (-1,  1): "down_left",
+            (-1,  0): "left",
+            (-1, -1): "up_left",
+        }
+        return names[(sx, sy)]
+    # 4-way snap: pick the dominant axis. On exact ties prefer
+    # vertical (the "ties-prefer-vertical" convention used by
+    # cardinal-only diagonal facing in move_dirs).
+    if abs(dx) > abs(dy):
+        return "right" if sx > 0 else "left"
+    # abs(dy) >= abs(dx) — vertical wins ties
+    return "down" if sy > 0 else "up"
+
+
 _ALLOWED_FUNCS: Dict[str, Any] = {
     "min": min, "max": max, "abs": abs, "round": round,
     "int": int, "float": float, "str": str,
@@ -475,6 +550,7 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
     "random_string": _random_string,
     "distance": _distance,
     "angle": _angle,
+    "direction_to": _direction_to,
 }
 
 # Match-bound function names. These functions are bound at namespace build
@@ -517,6 +593,26 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # hooks — a landmine's on_enter can deal damage and call
     # tile_clear() to self-destruct in one formula.
     "tile_get", "tile_has", "tile_set", "tile_del", "tile_clear",
+    # Team relationship predicates. Each takes entity ids (strings) and
+    # consults the team_var field on each entity's vars. Teamless
+    # entities (var absent / empty string) are treated as singletons:
+    # a teamless entity shares a team with NOBODY, so is_same_team
+    # against a teamless entity is always False and is_hostile is
+    # always True. The four predicates split deliberately:
+    #   is_same_team(a, b)        — both have the same non-empty team
+    #   is_hostile(a, b)          — NOT same team (the "strict" check;
+    #                               unaffected by the friendlyfire rule)
+    #   is_part_of_team(a, team)  — entity a's team equals `team` literal
+    #   is_attackable(a, b)       — the "can A attack B" check. Equals
+    #                               is_hostile when friendlyfire is off
+    #                               (the default); always True for
+    #                               distinct pairs when friendlyfire
+    #                               is on. is_attackable(a, a) is always
+    #                               False — you can't target yourself.
+    # The split matters because changing the friendlyfire rule must
+    # NOT silently flip is_hostile-keyed formulas (which often gate
+    # heal/buff decisions on team identity, not target legality).
+    "is_same_team", "is_hostile", "is_part_of_team", "is_attackable",
 )
 
 _ALLOWED_NODES: Tuple[type, ...] = (
@@ -1052,6 +1148,74 @@ class FormulaEngine:
         ns["tile_set"] = _tile_set
         ns["tile_del"] = _tile_del
         ns["tile_clear"] = _tile_clear
+
+        # Team-relationship predicates. All four resolve entity ids
+        # through _eid (so they accept "self" / "this" / "current"
+        # sentinels) and then read the team via Entity.team, which
+        # honors the team_var rule rename. A "no team" entity has
+        # team == None (or empty string by convention); team
+        # comparisons treat that as a singleton-bucket — see the
+        # docstrings above in _MATCH_FUNC_NAMES for the truth table.
+        def _team_of(eid: str) -> Optional[str]:
+            e = match.entities.get(eid)
+            if e is None:
+                raise FormulaError(
+                    f"unknown entity id '{eid}'."
+                )
+            t = e.team
+            if t is None or t == "":
+                return None
+            return t
+
+        def _is_same_team(a_token: Any, b_token: Any) -> bool:
+            a = _eid(a_token); b = _eid(b_token)
+            ta, tb = _team_of(a), _team_of(b)
+            if ta is None or tb is None:
+                return False
+            return ta == tb
+
+        def _is_hostile(a_token: Any, b_token: Any) -> bool:
+            # Inverse of is_same_team. Teamless entities are "hostile to
+            # everyone" — they have no allies to spare from a friendly-
+            # fire-off attack.
+            return not _is_same_team(a_token, b_token)
+
+        def _is_part_of_team(a_token: Any, team: Any) -> bool:
+            if not isinstance(team, str):
+                raise FormulaError(
+                    f"is_part_of_team(a, team): team must be a string, "
+                    f"got {type(team).__name__}."
+                )
+            a = _eid(a_token)
+            ta = _team_of(a)
+            if ta is None:
+                # Teamless: only matches the empty-string sentinel,
+                # which we already convert to None — so is_part_of_team
+                # against "" or absent never matches. Callers wanting
+                # to test "is teamless" should compare entity[X].team
+                # directly.
+                return False
+            return ta == team
+
+        def _is_attackable(a_token: Any, b_token: Any) -> bool:
+            a = _eid(a_token); b = _eid(b_token)
+            # An entity is never attackable by itself, regardless of
+            # the friendlyfire rule. Self-targeting belongs in
+            # separate "self-buff" / "self-damage" formula paths.
+            if a == b:
+                return False
+            if bool(match.rules.get("friendlyfire", False)):
+                # Friendly fire on: same-team and different-team alike
+                # are valid attack targets. Only self is excluded.
+                return True
+            # Friendly fire off (default): same-team is protected;
+            # otherwise the targeting rule matches is_hostile.
+            return _is_hostile(a_token, b_token)
+
+        ns["is_same_team"]   = _is_same_team
+        ns["is_hostile"]     = _is_hostile
+        ns["is_part_of_team"] = _is_part_of_team
+        ns["is_attackable"]  = _is_attackable
 
         return ns
 

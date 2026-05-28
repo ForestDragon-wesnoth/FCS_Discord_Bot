@@ -1976,6 +1976,32 @@ registry.annotate_sub(
 )
 
 
+@registry.command(
+    "undo",
+    usage=(
+        "!undo turn [N] [confirm] | "
+        "!undo round [N] [confirm] | "
+        "!undo command [N] [confirm] | "
+        "!undo to round <X> [confirm]"
+    ),
+    desc=(
+        "Shortcut for `!history undo ...`. Forwards every arg to the "
+        "history undo subcommand — same scopes (turn/round/command/to "
+        "round), same confirmation thresholds, same outputs. Exists "
+        "because `!history undo` is the most common destructive "
+        "operation and typing it out four times in a row gets old."
+    ),
+    snapshot=False,
+)
+async def undo_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    # Prepend "undo" and dispatch to history_cmd. We don't recurse
+    # through registry.run because that would also re-trigger
+    # autosave bookkeeping and command-name resolution; a direct call
+    # keeps the two paths interchangeable from the user's POV but
+    # avoids double-bookkeeping under the hood.
+    return await history_cmd(ctx, ["undo"] + list(args), mgr)
+
+
 @registry.command("store", usage="!store save <path> | !store load <path>", desc="Save/load all matches and channel bindings.", snapshot=False)
 async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
@@ -2996,6 +3022,99 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             msg = msg + f" Overrides: {override_str}."
         return await ctx.send(msg)
 
+    # ---- place_area <template> <x1> <y1> <x2> <y2> [overrides...] ----
+    # Bulk-fill every cell in the inclusive rectangle (x1,y1)..(x2,y2)
+    # with a placement of <template>. The rectangle is normalized so
+    # the GM can pass the corners in any order. Overrides apply to
+    # EVERY placed instance (same as a single !tile place). Existing
+    # tile data in the rectangle is replaced — matches single-place
+    # semantics (which defaults to replace=True).
+    if sub == "place_area":
+        if await return_help_if_not_enough_args(ctx, args, 6, "tile", "place_area"):
+            return
+        name = args[1]
+        try:
+            x1 = int(args[2]); y1 = int(args[3])
+            x2 = int(args[4]); y2 = int(args[5])
+        except ValueError:
+            return await ctx.send("❌ expected integer corner coordinates.")
+        overrides: Dict[str, Any] = {}
+        for tok in args[6:]:
+            if "=" not in tok:
+                return await ctx.send(
+                    f"❌ override `{tok}` must be `key=value`."
+                )
+            k, v = tok.split("=", 1)
+            overrides[k] = _parse_scalar(v)
+        if name not in m.tile_templates:
+            return await ctx.send(f"❌ template `{name}` not found.")
+        # Normalize so (x1,y1) is the top-left and (x2,y2) the bottom-right.
+        xa, xb = (x1, x2) if x1 <= x2 else (x2, x1)
+        ya, yb = (y1, y2) if y1 <= y2 else (y2, y1)
+        # Validate bounds BEFORE writing anything — if any corner is
+        # off-grid we want an all-or-nothing failure, not a partial
+        # fill that the GM has to clean up. The four corners are
+        # representative because the rectangle is axis-aligned.
+        for cx, cy in ((xa, ya), (xb, yb)):
+            if not m.in_bounds(cx, cy):
+                return await ctx.send(
+                    f"❌ corner ({cx},{cy}) is outside the "
+                    f"{m.grid_width}x{m.grid_height} grid."
+                )
+        placed = 0
+        for px in range(xa, xb + 1):
+            for py in range(ya, yb + 1):
+                try:
+                    m.place_tile_template(
+                        name, px, py,
+                        overrides=overrides or None,
+                    )
+                    placed += 1
+                except (NotFound, OutOfBounds, VTTError) as ex:
+                    # Should be unreachable given the bounds pre-check
+                    # and the template-exists pre-check, but surface
+                    # whatever it is rather than swallow.
+                    return await ctx.send(
+                        f"❌ failed at ({px},{py}): {ex}"
+                    )
+        rect_desc = f"({xa},{ya})..({xb},{yb})"
+        msg = f"Placed template `{name}` at {placed} cells {rect_desc}."
+        if overrides:
+            override_str = ", ".join(f"{k}={v!r}" for k, v in overrides.items())
+            msg = msg + f" Overrides: {override_str}."
+        return await ctx.send(msg)
+
+    # ---- find <template> ----
+    # List every (x,y) where a tile carries the named template via its
+    # `_template` field. Useful when the GM has placed many instances
+    # via place_area and wants to audit "where ARE all the fires?".
+    # Returns an empty-list ack rather than an error when no instances
+    # exist, since "zero" is a valid answer to a "find" query.
+    if sub == "find":
+        if await return_help_if_not_enough_args(ctx, args, 2, "tile", "find"):
+            return
+        name = args[1]
+        if name not in m.tile_templates:
+            # Surface the typo loudly — a silent "0 found" would hide
+            # a real mistake (defining 'fire' and searching 'flame').
+            return await ctx.send(
+                f"❌ template `{name}` not found. (Searching for a "
+                f"template that doesn't exist is almost always a typo. "
+                f"Use `!tile def list` to see available templates.)"
+            )
+        coords = sorted(
+            (x, y) for (x, y), data in m.tiles.items()
+            if isinstance(data, dict) and data.get("_template") == name
+        )
+        if not coords:
+            return await ctx.send(
+                f"No placed instances of template `{name}`."
+            )
+        coords_str = ", ".join(f"({x},{y})" for x, y in coords)
+        return await ctx.send(
+            f"`{name}` placed at {len(coords)} cell(s): {coords_str}"
+        )
+
     title, body = registry.help_for(["tile"])
     return await ctx.send(f"**{title}**\n{body}")
 
@@ -3097,6 +3216,36 @@ registry.annotate_sub(
         "individual fields on this instance (e.g. "
         "`!tile place flame 3 3 burn_damage=20` to make this flame "
         "hit harder without redefining the template)."
+    ),
+)
+registry.annotate_sub(
+    "tile", "place_area",
+    usage="!tile place_area <template> <x1> <y1> <x2> <y2> [key=value ...]",
+    desc=(
+        "Bulk-fill the inclusive rectangle between (x1,y1) and (x2,y2) "
+        "with placements of <template>. Corners may be given in any "
+        "order. Existing tile data inside the rectangle is replaced — "
+        "this is the multi-cell version of `!tile place` and has the "
+        "same single-cell replace semantics. Optional `key=value` "
+        "overrides apply to EVERY placed instance (e.g. "
+        "`!tile place_area flame 1 1 5 5 burn_damage=10` paints a "
+        "5x5 block of stronger-than-default flames). All-or-nothing: "
+        "if any corner is off-grid the command fails without placing "
+        "anything."
+    ),
+)
+registry.annotate_sub(
+    "tile", "find",
+    usage="!tile find <template>",
+    desc=(
+        "List every coordinate where a tile was placed from the named "
+        "template (via `!tile place` or `!tile place_area`). Coordinates "
+        "are sorted in (x, y) order. Useful for auditing 'where are all "
+        "the fires?' after bulk placements, or for confirming a "
+        "template deletion really cleaned up. Returns an empty-list "
+        "ack when zero instances exist; errors loudly if the template "
+        "name isn't defined (treated as a typo since a missing-name "
+        "search trivially has zero results)."
     ),
 )
 

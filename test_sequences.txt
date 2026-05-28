@@ -4700,3 +4700,290 @@ forward" passive could compare `entity[self].facing_angle` to
 entity[target].y)` to gate a hit. Entity collisions, walls,
 and other obstructions don't affect the result — angle() is
 pure geometry between two points, same as distance().
+
+
+SCENARIO 206 — direction_to(): eight named directions around a center
+----------------------------------------------------------------------
+
+!match new mdt1 DirTo 10 10
+!match use mdt1
+!eval "direction_to(5, 5, 5, 4)"
+!eval "direction_to(5, 5, 6, 4)"
+!eval "direction_to(5, 5, 6, 5)"
+!eval "direction_to(5, 5, 6, 6)"
+!eval "direction_to(5, 5, 5, 6)"
+!eval "direction_to(5, 5, 4, 6)"
+!eval "direction_to(5, 5, 4, 5)"
+!eval "direction_to(5, 5, 4, 4)"
+!eval "direction_to(5, 5, 5, 5)"
+!eval "direction_to(2, 2, 8, 5)"
+
+Expected: `direction_to(x1, y1, x2, y2)` returns one of the eight
+direction names — "up", "up_right", "right", "down_right", "down",
+"down_left", "left", "up_left" — matching how each cell adjacent
+to (5,5) lies relative to it. Cells farther than 1 step away snap
+to the same eight names by the sign of dx and dy: (2,2)→(8,5) has
+dx=6, dy=3 (both positive), so the answer is "down_right". The
+degenerate same-point case (5,5)→(5,5) returns the empty string
+"" — there's no displacement and thus no direction.
+
+
+SCENARIO 207 — direction_to(): allow_diagonals=False snaps to cardinals
+-----------------------------------------------------------------------
+
+!match new mdt2 DirTo4 10 10
+!match use mdt2
+!eval "direction_to(5, 5, 6, 4, False)"
+!eval "direction_to(5, 5, 8, 4, False)"
+!eval "direction_to(5, 5, 6, 8, False)"
+!eval "direction_to(5, 5, 4, 6, False)"
+!eval "direction_to(5, 5, 3, 6, False)"
+!eval "direction_to(5, 5, 5, 5, False)"
+
+Expected: With `allow_diagonals=False`, the function clumsily rounds
+to up/down/left/right by picking the dominant axis. (5,5)→(6,4)
+has equal-magnitude dx=1 and dy=-1 — pure diagonal — and ties
+prefer vertical (matching the engine's per-step facing rule for
+cardinal-only systems), so the answer is "up". (5,5)→(8,4) has
+|dx|=3 > |dy|=1, so "right" wins. (5,5)→(6,8) has |dy|=3 > |dx|=1,
+so "down". (5,5)→(4,6) is again a 1:1 tie — vertical wins, "down".
+(5,5)→(3,6) has |dx|=2 > |dy|=1, so "left". Same-point still
+returns "".
+
+
+SCENARIO 208 — direction_to(): between two entities
+----------------------------------------------------
+
+!match new mdt3 DirToEnt 10 10
+!match use mdt3
+!ent add hero Hero 30 3 3 10
+!ent add goblin Goblin 30 7 5 5
+!eval "direction_to(entity[hero].x, entity[hero].y, entity[goblin].x, entity[goblin].y)"
+!ent set_var hero face_target "$(direction_to(entity[hero].x, entity[hero].y, entity[goblin].x, entity[goblin].y))"
+!ent dump hero
+!ent tp goblin 3 1
+!eval "direction_to(entity[hero].x, entity[hero].y, entity[goblin].x, entity[goblin].y)"
+!eval "direction_to(entity[hero].x, entity[hero].y, entity[goblin].x, entity[goblin].y, False)"
+
+Expected: Hero at (3,3), goblin at (7,5) — dx=4, dy=2, both
+positive — direction is "down_right". `$()` substitution stores
+"down_right" into `vars.face_target`. After teleporting goblin
+to (3,1) directly above hero, the 8-way result is "up". With
+`allow_diagonals=False` and the goblin still at (3,1), the result
+is still "up" (dx=0, dy=-2 — purely vertical, no rounding needed).
+The string-valued return integrates cleanly with other formula
+ops — e.g. comparing `direction_to(...) == "up_right"` to gate
+behavior on enemy position.
+
+
+SCENARIO 209 — Friendly fire OFF (default): is_attackable mirrors is_hostile
+-----------------------------------------------------------------------------
+
+!match new mff1 FFOff 8 8
+!match use mff1
+!ent add alice Alice 30 1 1 10
+!ent set_var alice team blue
+!ent add bob Bob 30 2 2 11
+!ent set_var bob team blue
+!ent add goblin Goblin 30 3 3 5
+!ent set_var goblin team red
+!ent add wanderer Wanderer 30 4 4 5
+!eval "is_same_team('alice', 'bob')"
+!eval "is_same_team('alice', 'goblin')"
+!eval "is_same_team('alice', 'wanderer')"
+!eval "is_hostile('alice', 'bob')"
+!eval "is_hostile('alice', 'goblin')"
+!eval "is_hostile('alice', 'wanderer')"
+!eval "is_part_of_team('alice', 'blue')"
+!eval "is_part_of_team('alice', 'red')"
+!eval "is_part_of_team('wanderer', 'blue')"
+!eval "is_attackable('alice', 'alice')"
+!eval "is_attackable('alice', 'bob')"
+!eval "is_attackable('alice', 'goblin')"
+!eval "is_attackable('alice', 'wanderer')"
+
+Expected: Four entities — Alice and Bob on team "blue", Goblin on
+team "red", Wanderer with no team. The default `friendlyfire` rule
+is False, so `is_attackable` and `is_hostile` agree on every pair.
+
+`is_same_team` requires both entities to share a non-empty team:
+alice/bob (both blue) → True; alice/goblin (different teams) →
+False; alice/wanderer (teamless wanderer) → False.
+
+`is_hostile` is the strict NOT-same-team check, unaffected by the
+friendlyfire rule. Teamless entities are hostile to everyone (no
+allies to spare): alice/wanderer → True.
+
+`is_part_of_team` checks an entity against a literal team name.
+A teamless entity matches NO team name — `is_part_of_team(wanderer,
+'blue')` is False.
+
+`is_attackable` adds the self-exclusion: an entity can never attack
+itself regardless of the rule. With friendlyfire OFF, otherwise it
+follows is_hostile.
+
+
+SCENARIO 210 — Friendly fire ON: is_attackable permits same-team targets
+-------------------------------------------------------------------------
+
+!system set default friendlyfire true
+!match new mff2 FFOn 8 8
+!match use mff2
+!ent add alice Alice 30 1 1 10
+!ent set_var alice team blue
+!ent add bob Bob 30 2 2 11
+!ent set_var bob team blue
+!ent add goblin Goblin 30 3 3 5
+!ent set_var goblin team red
+!eval "is_attackable('alice', 'alice')"
+!eval "is_attackable('alice', 'bob')"
+!eval "is_attackable('alice', 'goblin')"
+!eval "is_same_team('alice', 'bob')"
+!eval "is_hostile('alice', 'bob')"
+!system set default friendlyfire false
+
+Expected: With `friendlyfire=true` set on the game system, the
+match created afterward inherits it. `is_attackable('alice','bob')`
+now returns True even though alice and bob are on the same team —
+the rule says friendly targets are legal. `is_attackable` of an
+entity with itself stays False (no self-targeting regardless of
+rule).
+
+Critically, `is_same_team` and `is_hostile` are NOT affected by
+the rule — they return True/False respectively for alice/bob.
+That separation is the whole point: passives that gate on team
+identity (e.g. "heal only allies", "damage aura on hostiles
+only") keep working when the GM toggles friendly fire; only
+attack-legality formulas need to switch from `is_hostile` to
+`is_attackable`.
+
+Trailing `!system set default friendlyfire false` restores the
+default for subsequent scenarios.
+
+
+SCENARIO 211 — !tile place_area: bulk-fill a rectangle with one template
+-------------------------------------------------------------------------
+
+!match new mpa1 PlaceArea 10 10
+!match use mpa1
+!tile def new flame
+!tile def data flame burn_damage 5
+!tile place_area flame 2 2 4 4
+!tile find flame
+!tile info 2 2
+!tile info 3 3
+!tile info 4 4
+!tile place_area flame 7 6 5 8 burn_damage=20
+!tile find flame
+!tile info 5 8
+
+Expected: `!tile place_area` fills the inclusive rectangle between
+its two corner arguments. A 3x3 fill from (2,2) to (4,4) writes
+nine tiles; `!tile find flame` lists all nine in sorted (x,y) order.
+Each placed tile is an independent copy of the template's data —
+`!tile info` on any cell shows `burn_damage: 5` and
+`_template: "flame"`.
+
+Corners can be given in any order — the second call passes (7,6)
+and (5,8), which normalizes to (5,6)..(7,8). The `burn_damage=20`
+override applies to every cell in that rectangle. After the second
+call, `!tile find` shows 9 (from the first fill) + 9 (from the
+second) = 18 placed tiles total, and `!tile info 5 8` confirms the
+override took effect.
+
+
+SCENARIO 212 — !tile place_area: corners off-grid → all-or-nothing failure
+---------------------------------------------------------------------------
+
+!match new mpa2 PlaceAreaOOB 8 8
+!match use mpa2
+!tile def new flame
+!tile place_area flame 5 5 12 12
+!tile find flame
+!tile place_area flame 2 2 4 4
+!tile place_area flame 3 3 9 4
+!tile find flame
+!tile place_area flame missing 1 1 2 2
+
+Expected: An off-grid corner is rejected BEFORE any placement
+happens — the engine validates the rectangle against the grid
+bounds, and only proceeds if both corners fit. So
+`!tile place_area flame 5 5 12 12` (the second corner is off the
+8x8 grid) fails with an error and `!tile find flame` reports zero
+placed instances afterward. Following that with a valid call
+`!tile place_area flame 2 2 4 4` places 9 cells cleanly.
+
+The third call's second corner (9,4) is off the 8-wide grid (max
+x = 8) — it also fails without partial fill, and the grand total
+stays at 9. The final call uses a misspelled template name; the
+command errors with "template `missing` not found" since the
+template lookup happens up front.
+
+
+SCENARIO 213 — !tile find: empty list, missing template, and template del
+--------------------------------------------------------------------------
+
+!match new mtf1 TileFind 8 8
+!match use mtf1
+!tile def new flame
+!tile find flame
+!tile place flame 3 3
+!tile place flame 5 5
+!tile find flame
+!tile def new spike
+!tile find spike
+!tile place spike 7 1
+!tile place spike 7 7
+!tile find spike
+!tile find flame
+!tile find nonexistent_template
+
+Expected: A newly-defined template with no placements gives a
+"No placed instances of template `flame`" message — an empty
+listing rather than an error, since "zero" is a valid count.
+After two placements, `!tile find flame` reports both coords in
+sorted order: (3,3), (5,5).
+
+Two templates can coexist independently: defining `spike` and
+placing it at (7,1) and (7,7) gives a `!tile find spike` of two
+coords, and `!tile find flame` still returns the original two.
+
+Searching for an undefined template name (`!tile find
+nonexistent_template`) errors loudly — a silent empty result
+would mask the common typo case (e.g. searching for "fire" when
+the template is named "flame").
+
+
+SCENARIO 214 — !undo: shortcut for `!history undo`
+---------------------------------------------------
+
+!match new mun1 UndoAlias 6 6
+!match use mun1
+!ent add hero Hero 30 1 1 10
+!turn next
+!ent hp hero -10
+!ent info hero
+!undo command 1 confirm
+!ent info hero
+!ent hp hero -5
+!ent hp hero -5
+!undo command 2 confirm
+!ent info hero
+
+Expected: `!undo <scope> ...` forwards to `!history undo <scope>
+...` with identical behavior — same scopes (command/turn/round/to
+round), same confirmation tokens. Damaging hero by 10 brings hp
+from 30 to 20; `!undo command 1 confirm` reverts the single
+command, restoring hp to 30 and printing "Undid 1 command(s).
+Reverted past `!ent hp hero -10`.". Two more `-5` damages bring
+hp to 20; `!undo command 2 confirm` rolls back both damage
+commands, restoring hp to 30.
+
+The alias exists because `!history undo ...` is the most common
+destructive op and typing the longer form four times in quick
+succession (during playtest sessions where the GM keeps making
+small mistakes) is friction. Note: no `!redo` alias is shipped —
+the engine's history system doesn't currently support redo (an
+undo erases the now-orphaned future from each retention bucket),
+so a redo command would need real implementation work, not just
+a forwarder.
