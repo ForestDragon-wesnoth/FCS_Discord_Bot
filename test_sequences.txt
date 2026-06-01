@@ -5218,3 +5218,39 @@ next call). `!func list` shows only `viafn` remains. Loading the
 saved state restores both functions, and `viafn(10)` = 31 works
 again. (The deletion's downstream breakage is intentional and
 mirrors how tile-template deletion leaves orphaned instances.)
+
+
+SCENARIO 223 — Formula functions: built-in protection and overwrite reporting
+------------------------------------------------------------------------------
+
+!match new mfn7 FuncGuard 8 8
+!match use mfn7
+!func def max x "x + 1"
+!func def clamp x "x"
+!func def distance a "a"
+!func def is_hostile a "a"
+!func def group_add a "a"
+!func def tile_get a "a"
+!func def mitigated raw,armor "max(raw - armor, 0)"
+!func def mitigated raw,armor "max(raw - armor * 2, 0)"
+!func def mitigated raw,armor,pierce "max(raw - armor + pierce, 0)"
+!eval "mitigated(20, 5, 3)"
+
+Expected: Built-in formula functions are protected from
+accidental redefinition. Trying to `!func def` any built-in —
+core math (`max`, `clamp`, `distance`), team predicates
+(`is_hostile`), group helpers (`group_add`), tile accessors
+(`tile_get`), etc. — is rejected with "'X' is a built-in formula
+function and cannot be redefined." This catches the common
+mistake of shadowing a standard function with a custom one.
+
+Redefining a USER-defined function is allowed (iterating on a
+formula is the normal workflow) but is reported loudly so an
+accidental overwrite is visible. The second and third
+`!func def mitigated` both print a "Redefined ... (overwrote an
+existing definition)" message that shows BOTH the previous
+signature+body ("was:") and the replacement ("now:"). The
+parameter list can change across a redefinition (the third call
+adds a `pierce` parameter). The final `mitigated(20, 5, 3)`
+confirms the latest definition is the active one:
+max(20 - 5 + 3, 0) = 18.

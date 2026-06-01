@@ -3310,10 +3310,22 @@ async def func_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             )
         except _FE as ex:
             return await ctx.send(f"❌ invalid function body: {ex}")
+        # Capture the prior definition (if any) so an overwrite can show
+        # the GM what changed — silently replacing a function is exactly
+        # the kind of edit that's easy to do by accident, so we surface
+        # the before/after.
+        prior = m.formula_functions.get(name)
         try:
             fn = m.define_formula_function(name, params, body)
         except (VTTError, DuplicateId) as ex:
             return await ctx.send(f"❌ {ex}")
+        if prior is not None:
+            return await ctx.send(
+                f"Redefined formula function `{name}` (overwrote an "
+                f"existing definition).\n"
+                f"  was: `{prior.signature()}` → {prior.body}\n"
+                f"  now: `{fn.signature()}` → {fn.body}"
+            )
         return await ctx.send(f"Defined formula function `{fn.signature()}`.")
 
     # ---- del <name> ----
