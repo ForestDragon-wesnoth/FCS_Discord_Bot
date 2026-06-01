@@ -2105,7 +2105,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             allowed = ", ".join(sorted(HOOK_NAMES))
             raise VTTError(f"Unknown hook '{when}'. Allowed: {allowed}")
         try:
-            validate_program(formula)
+            validate_program(formula, known_funcs=frozenset(m.formula_functions.keys()))
         except FormulaError as ex:
             raise VTTError(f"Invalid passive formula: {ex}")
         e = m.entities[eid]
@@ -2279,7 +2279,7 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             allowed = ", ".join(sorted(HOOK_NAMES))
             raise VTTError(f"Unknown hook '{when}'. Allowed: {allowed}")
         try:
-            validate_program(formula)
+            validate_program(formula, known_funcs=frozenset(m.formula_functions.keys()))
         except FormulaError as ex:
             raise VTTError(f"Invalid passive formula: {ex}")
         if pid in m.global_passives:
@@ -2749,7 +2749,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     f"❌ Unknown tile hook '{when}'. Allowed: {allowed}."
                 )
             try:
-                validate_formula(formula_src, mode="exec")
+                validate_formula(formula_src, mode="exec", known_funcs=frozenset(m.formula_functions.keys()))
             except FormulaError as ex:
                 return await ctx.send(f"❌ Invalid hook formula: {ex}")
             m.tile_set_path(x, y, f"hooks.{when}", formula_src)
@@ -2908,7 +2908,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     f"❌ Unknown tile hook '{when}'. Allowed: {allowed}."
                 )
             try:
-                validate_formula(formula_src, mode="exec")
+                validate_formula(formula_src, mode="exec", known_funcs=frozenset(m.formula_functions.keys()))
             except FormulaError as ex:
                 return await ctx.send(f"❌ Invalid hook formula: {ex}")
             m.tile_templates[name].hooks[when] = formula_src
@@ -3247,6 +3247,164 @@ registry.annotate_sub(
         "name isn't defined (treated as a typo since a missing-name "
         "search trivially has zero results)."
     ),
+)
+
+
+@registry.command(
+    "func",
+    usage=("!func <def|del|list|info> ..."),
+    desc=(
+        "Define reusable formula functions callable by name from any "
+        "formula on the active match. A function has a name, an ordered "
+        "list of parameters, and a body (a full formula program — "
+        "statements plus an optional trailing expression whose value is "
+        "the return value). Inside the body, parameters are bound as "
+        "plain identifiers and entity[self]/entity[this] resolve against "
+        "the CALLER's context (functions are inline macros, not isolated "
+        "frames). Functions may call other functions and recurse "
+        "(bounded by the formula_function_recursion_limit rule). "
+        "Subcommands: def, del, list, info."
+    ),
+)
+async def func_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["func"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    sub = args[0].lower()
+
+    # ---- def <name> <params> <body> ----
+    # params is one token: comma-separated identifiers, or one of
+    # "", "-", "none" for a zero-parameter function. The body is the
+    # remaining args rejoined (so the GM can pass it unquoted if it has
+    # no shell-significant characters, or quoted to preserve spaces).
+    if sub == "def":
+        if await return_help_if_not_enough_args(ctx, args, 3, "func", "def"):
+            return
+        name = args[1]
+        params_token = args[2]
+        body = " ".join(args[3:]).strip() if len(args) > 3 else ""
+        if not body:
+            return await ctx.send(
+                "❌ function body cannot be empty. Usage: "
+                "`!func def <name> <params> <body>`."
+            )
+        # Parse the params token. "", "-", and "none" all mean no params.
+        if params_token.strip().lower() in ("", "-", "none"):
+            params: List[str] = []
+        else:
+            params = [p.strip() for p in params_token.split(",") if p.strip()]
+        # Validate the body BEFORE storing — known_funcs is the current
+        # registry plus the name being defined (so a recursive function
+        # validates), and known_params is this function's parameters.
+        from formula import validate_program as _vp, FormulaError as _FE
+        known = frozenset(m.formula_functions.keys()) | {name}
+        try:
+            # Build the body validator with params allowed. validate_program
+            # doesn't take known_params, so use the lower-level path.
+            from formula import FormulaEngine as _FEng
+            _FEng._prepare(
+                body, "exec",
+                known_funcs=known,
+                known_params=frozenset(params),
+            )
+        except _FE as ex:
+            return await ctx.send(f"❌ invalid function body: {ex}")
+        # Capture the prior definition (if any) so an overwrite can show
+        # the GM what changed — silently replacing a function is exactly
+        # the kind of edit that's easy to do by accident, so we surface
+        # the before/after.
+        prior = m.formula_functions.get(name)
+        try:
+            fn = m.define_formula_function(name, params, body)
+        except (VTTError, DuplicateId) as ex:
+            return await ctx.send(f"❌ {ex}")
+        if prior is not None:
+            return await ctx.send(
+                f"Redefined formula function `{name}` (overwrote an "
+                f"existing definition).\n"
+                f"  was: `{prior.signature()}` → {prior.body}\n"
+                f"  now: `{fn.signature()}` → {fn.body}"
+            )
+        return await ctx.send(f"Defined formula function `{fn.signature()}`.")
+
+    # ---- del <name> ----
+    if sub == "del":
+        if await return_help_if_not_enough_args(ctx, args, 2, "func", "del"):
+            return
+        name = args[1]
+        try:
+            m.undefine_formula_function(name)
+        except NotFound as ex:
+            return await ctx.send(f"❌ {ex}")
+        return await ctx.send(f"Deleted formula function `{name}`.")
+
+    # ---- list ----
+    if sub == "list":
+        if not m.formula_functions:
+            return await ctx.send("No formula functions defined.")
+        lines = ["**Formula functions:**"]
+        for fname in sorted(m.formula_functions.keys()):
+            fn = m.formula_functions[fname]
+            snippet = fn.body if len(fn.body) <= 60 else fn.body[:57] + "..."
+            lines.append(f"- `{fn.signature()}` → {snippet}")
+        return await ctx.send("\n".join(lines))
+
+    # ---- info <name> ----
+    if sub == "info":
+        if await return_help_if_not_enough_args(ctx, args, 2, "func", "info"):
+            return
+        name = args[1]
+        fn = m.formula_functions.get(name)
+        if fn is None:
+            return await ctx.send(f"❌ formula function `{name}` not found.")
+        return await ctx.send(
+            f"**`{fn.signature()}`**\n```\n{fn.body}\n```"
+        )
+
+    title, body = registry.help_for(["func"])
+    return await ctx.send(f"**{title}**\n{body}")
+
+
+registry.annotate_sub(
+    "func", "def",
+    usage="!func def <name> <params> <body>",
+    desc=(
+        "Define (or overwrite) a formula function. `<params>` is a "
+        "single token: comma-separated parameter names (e.g. "
+        "`raw,armor`), or one of `-` / `none` / empty-string for no "
+        "parameters. `<body>` is the rest of the line — a formula "
+        "program whose trailing expression (if any) is the return "
+        "value. Example: "
+        "`!func def mitigated raw,armor \"max(raw - armor, 0)\"` then "
+        "call it from any formula as `mitigated(entity[self].atk, 3)`. "
+        "The body is validated at definition time; parameters and the "
+        "function's own name (for recursion) are in scope. Redefining "
+        "an existing name overwrites it."
+    ),
+)
+registry.annotate_sub(
+    "func", "del",
+    usage="!func del <name>",
+    desc=(
+        "Delete a formula function. Formulas or other functions that "
+        "still reference it will error at their next evaluation (the "
+        "name simply stops resolving) — no dependency scan is done."
+    ),
+)
+registry.annotate_sub(
+    "func", "list",
+    usage="!func list",
+    desc=(
+        "List all formula functions on the active match with their "
+        "signatures and a body snippet. Use `!func info <name>` for the "
+        "full body."
+    ),
+)
+registry.annotate_sub(
+    "func", "info",
+    usage="!func info <name>",
+    desc="Show a formula function's full signature and body.",
 )
 
 
