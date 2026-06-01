@@ -7,6 +7,7 @@ from typing import Literal, Any, Dict, List, Optional, Tuple, Set
 import uuid
 import json
 import copy
+import re
 
 # -------------------------
 # Exceptions
@@ -388,6 +389,18 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "'off' = no warnings; 'minimal' = warn only on recursion-limit "
             "hits (default); 'detailed' = also annotate every destructive "
             "write with the count of removed keys."
+        ),
+    },
+    "formula_function_recursion_limit": {
+        "default": 64,
+        "schema": {"type": "int"},
+        "desc": (
+            "Maximum call depth for user-defined formula functions (see "
+            "!func). A function may call other functions (or itself); if "
+            "the nested-call depth exceeds this limit the call raises a "
+            "FormulaError instead of blowing Python's stack. Default 64 is "
+            "ample for legitimate composition/recursion; hitting it almost "
+            "always means an unbounded recursive function."
         ),
     },
     # ---- Match history / autosave / undo --------------------------------
@@ -1400,6 +1413,65 @@ class SpecialTileTemplate:
 
 
 # -------------------------
+# FormulaFunction (a reusable, user-defined formula callable)
+# -------------------------
+# A FormulaFunction is a named formula body plus a list of parameter
+# names. Once defined on a match (via !func def), any formula can call
+# it by name — `damage_after_armor(entity[self].atk, entity[target].def)`
+# — and the body runs with the parameters bound as plain identifiers.
+#
+# The body is a full formula program: it may have statements (including
+# entity[X] writes, which take effect as side effects) and an optional
+# trailing expression whose value becomes the function's return value.
+# A body with no trailing expression returns None.
+#
+# Inside the body:
+#   - the parameter names are bound to the call's argument values
+#   - entity[self] / entity[this] resolve against the CALLER's context
+#     (functions are macros that run in the caller's frame, not a fresh
+#     one) — so a function called from a passive sees that passive's
+#     `self`
+#   - other formula functions (and builtins) are callable, enabling
+#     composition and recursion (bounded by the recursion limit rule)
+#
+# Compilation of the body is cached on the instance (the _compiled
+# field, excluded from equality / repr / serialization). Redefining a
+# function replaces the instance, so the cache is naturally fresh.
+_FUNC_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+@dataclass
+class FormulaFunction:
+    name: str
+    params: List[str] = field(default_factory=list)
+    body: str = ""
+    # Lazily-populated compiled artifact, set by the formula engine on
+    # first call. Opaque to logic.py. Excluded from comparison/repr so
+    # two functions with the same source are still equal, and from
+    # to_dict so it never leaks into save files.
+    _compiled: Any = field(default=None, compare=False, repr=False)
+
+    def signature(self) -> str:
+        """Human-readable `name(p1, p2)` for listings and errors."""
+        return f"{self.name}({', '.join(self.params)})"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "params": list(self.params),
+            "body": self.body,
+        }
+
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> "FormulaFunction":
+        return FormulaFunction(
+            name=str(d["name"]),
+            params=[str(p) for p in (d.get("params", []) or [])],
+            body=str(d.get("body", "")),
+        )
+
+
+# -------------------------
 # GameSystem (stores global rules for a game system, so not everything has to be manually set each match)
 # -------------------------
 @dataclass
@@ -1416,6 +1488,13 @@ class GameSystem:
     # output) rather than live SpecialTileTemplate objects so the
     # GameSystem stays self-contained and easy to serialize.
     tile_templates: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # System-level formula-function library, copied into
+    # Match.formula_functions at match creation — same inherit-at-create
+    # pattern as tile_templates. Lets a game system ship a standard set
+    # of reusable formula functions (e.g. armor mitigation, crit math)
+    # that every new match starts with. Stored as plain dicts
+    # (FormulaFunction.to_dict output) for self-contained serialization.
+    formula_functions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def get(self, key: str) -> Any:
         if key in self.settings:
@@ -1451,6 +1530,10 @@ class GameSystem:
                 tname: copy.deepcopy(tdef)
                 for tname, tdef in sorted(self.tile_templates.items())
             },
+            "formula_functions": {
+                fname: copy.deepcopy(fdef)
+                for fname, fdef in sorted(self.formula_functions.items())
+            },
         }
 
     @staticmethod
@@ -1469,7 +1552,15 @@ class GameSystem:
         for tname, tdef in raw_templates.items():
             if isinstance(tdef, dict) and isinstance(tname, str):
                 templates[tname] = copy.deepcopy(tdef)
-        return GameSystem(name=d["name"], settings=settings, tile_templates=templates)
+        raw_funcs = d.get("formula_functions", {}) or {}
+        funcs: Dict[str, Dict[str, Any]] = {}
+        for fname, fdef in raw_funcs.items():
+            if isinstance(fdef, dict) and isinstance(fname, str):
+                funcs[fname] = copy.deepcopy(fdef)
+        return GameSystem(
+            name=d["name"], settings=settings,
+            tile_templates=templates, formula_functions=funcs,
+        )
 
 # -------------------------
 # Entity
@@ -2313,6 +2404,13 @@ class Match:
     # match can extend/shadow with !tile def commands.
     tile_templates: Dict[str, SpecialTileTemplate] = field(default_factory=dict)
 
+    # User-defined formula functions, keyed by name. Defined via !func
+    # def and callable by name from any formula on this match. Seeded
+    # from the bound GameSystem's formula_functions at creation (same
+    # inherit-at-create pattern as tile_templates) and serialized with
+    # the match. See the FormulaFunction dataclass for the call model.
+    formula_functions: Dict[str, "FormulaFunction"] = field(default_factory=dict)
+
     # ---- runtime-only state for var-hook recursion safeguard ----
     # Tracks how deep we are in a chain of var-hook fires. A passive's
     # formula can write vars, which produces more events, which fire more
@@ -2598,6 +2696,84 @@ class Match:
         if not isinstance(tpl_name, str):
             return None
         return self.tile_templates.get(tpl_name)
+
+    # ---- formula-function registry -----------------------------------
+    # User-defined formula functions live in self.formula_functions and
+    # are callable by name from any formula on this match. The command
+    # layer (!func def) validates the name / params / body before
+    # calling define_formula_function; this method enforces the
+    # structural invariants (valid identifiers, unique params) but
+    # does NOT compile the body — that happens lazily in the formula
+    # engine on first call.
+
+    def define_formula_function(
+        self, name: str, params: List[str], body: str,
+        *, overwrite: bool = True,
+    ) -> "FormulaFunction":
+        """Create or replace a formula function. Validates that the name
+        and every parameter is a legal identifier, parameters are
+        unique, and the name doesn't collide with a built-in formula
+        function. Does NOT validate the body here (the command layer
+        does that via validate_formula so it can pass the right
+        known-function / known-param sets); a bad body would simply
+        fail at call time. Returns the stored FormulaFunction.
+
+        overwrite defaults True (redefining is the common iterate-on-a-
+        formula workflow); pass overwrite=False to raise DuplicateId on
+        an existing name instead.
+        """
+        if not isinstance(name, str) or not _FUNC_NAME_RE.match(name):
+            raise VTTError(
+                f"formula function name '{name}' must be a valid "
+                f"identifier (letters, digits, underscore; not starting "
+                f"with a digit)."
+            )
+        # Lazy import to avoid a logic <-> formula import cycle at module
+        # load. We only need the reserved-name set.
+        from formula import _ALLOWED_FUNCS, _MATCH_FUNC_NAMES
+        if name in _ALLOWED_FUNCS or name in _MATCH_FUNC_NAMES:
+            raise VTTError(
+                f"'{name}' is a built-in formula function and cannot be "
+                f"redefined."
+            )
+        if not overwrite and name in self.formula_functions:
+            raise DuplicateId(f"formula function '{name}' already exists.")
+        seen = set()
+        for p in params:
+            if not isinstance(p, str) or not _FUNC_NAME_RE.match(p):
+                raise VTTError(
+                    f"parameter name '{p}' must be a valid identifier."
+                )
+            if p in seen:
+                raise VTTError(f"duplicate parameter name '{p}'.")
+            seen.add(p)
+            if p in _ALLOWED_FUNCS or p in _MATCH_FUNC_NAMES:
+                raise VTTError(
+                    f"parameter name '{p}' collides with a built-in "
+                    f"formula function; pick a different name."
+                )
+            # `entity` is the magic accessor keyword and __-prefixed
+            # names are transformer-injected internals; a parameter
+            # using either would either shadow the accessor or never be
+            # reachable. Reject both up front.
+            if p == "entity" or p.startswith("__"):
+                raise VTTError(
+                    f"parameter name '{p}' is reserved; pick a different "
+                    f"name."
+                )
+        fn = FormulaFunction(name=name, params=list(params), body=body)
+        self.formula_functions[name] = fn
+        return fn
+
+    def undefine_formula_function(self, name: str) -> None:
+        """Remove a formula function. Raises NotFound if absent. Note:
+        other functions or passives that referenced this one will fail
+        at their next call (the name simply won't resolve) — we don't
+        scan for dependents here, matching how tile-template deletion
+        leaves orphaned instances to surface at fire time."""
+        if name not in self.formula_functions:
+            raise NotFound(f"formula function '{name}' not found.")
+        del self.formula_functions[name]
 
     def is_occupied(self, x: int, y: int, ignore_entity_id: Optional[str] = None) -> bool:
         for eid, e in self.entities.items():
@@ -3297,6 +3473,10 @@ class Match:
                 name: tpl.to_dict()
                 for name, tpl in sorted(self.tile_templates.items())
             },
+            "formula_functions": {
+                name: fn.to_dict()
+                for name, fn in sorted(self.formula_functions.items())
+            },
         }
         if include_history:
             d["history"] = self.history.to_dict()
@@ -3360,6 +3540,17 @@ class Match:
                 # the whole load. The instances that referenced this
                 # template will surface the missing-template warning
                 # at their next hook fire.
+                continue
+        raw_funcs = d.get("formula_functions", {}) or {}
+        m.formula_functions = {}
+        for fname, fdef in raw_funcs.items():
+            if not isinstance(fname, str) or not isinstance(fdef, dict):
+                continue
+            try:
+                m.formula_functions[fname] = FormulaFunction.from_dict(fdef)
+            except (KeyError, TypeError, VTTError):
+                # Malformed entry — skip. A formula that called the
+                # missing function will fail at its next evaluation.
                 continue
         # History is optional in saved dicts. It's only present when the
         # original save was made with include_history=True. A snapshot's
@@ -3708,6 +3899,13 @@ class MatchManager:
         for tname, tdef in (sysobj.tile_templates or {}).items():
             try:
                 m.tile_templates[tname] = SpecialTileTemplate.from_dict(tdef)
+            except (KeyError, TypeError, VTTError):
+                continue
+        # Seed match-level formula functions from the system's library,
+        # same snapshot-not-link semantics as tile templates above.
+        for fname, fdef in (sysobj.formula_functions or {}).items():
+            try:
+                m.formula_functions[fname] = FormulaFunction.from_dict(fdef)
             except (KeyError, TypeError, VTTError):
                 continue
         self.matches[m.id] = m

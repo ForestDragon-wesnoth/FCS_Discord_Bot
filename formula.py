@@ -60,7 +60,17 @@ Comparison:        ==  !=  <  <=  >  >=
 Boolean:           and  or  not
 Ternary:           value_if_true if cond else value_if_false
 
-Allowed functions: min, max, abs, round, int, float, str
+Allowed functions:
+  Core:      min, max, abs, round, int, float, str
+  Math:      sqrt, floor, ceil, pow, clamp(v, lo, hi), sign
+  Random:    random_int, random_string
+  Geometry:  distance, angle, direction_to
+  Teams:     is_same_team, is_hostile, is_part_of_team, is_attackable
+  Groups:    group_has, group_size, group_add, group_remove
+  Identity:  self_id, current_id
+  Tiles:     tile_get, tile_has, tile_set, tile_del, tile_clear
+  User-defined: any function defined via `!func def` on the match (see
+                "USER-DEFINED FUNCTIONS" below)
 
 Everything else is rejected: list comprehensions, lambdas, augmented
 assignment (`+=`), subscripting (other than `entity[X]`), attribute access on
@@ -98,6 +108,49 @@ An `if` without an `else` simply does nothing on the false branch.
 There is NO match/case statement; use an elif chain. There are NO local
 variables; if you need an intermediate value, recompute it or use a ternary
 inside a single assignment.
+
+================================================================================
+USER-DEFINED FUNCTIONS
+================================================================================
+Reusable formula functions are defined per-match with `!func def` and then
+callable by name from any formula on that match (passive bodies, $()
+substitution, !eval, tile hooks, and other functions). They are the
+"named macro / formula library" mechanism.
+
+  !func def mitigated raw,armor "max(raw - armor, 0)"
+  !func def regen_amount missing "ceil(missing / 4)"
+
+A function has a name, an ordered parameter list, and a body. The body is
+a full formula program: it may have statements (including entity[X] writes
+that take effect as side effects) and an optional trailing expression whose
+value becomes the return value. A body with no trailing expression returns
+None.
+
+Inside the body:
+  - parameter names are bound to the call's argument values, as plain
+    identifiers (e.g. `raw`, `armor` above)
+  - entity[self] / entity[this] / entity[current] resolve against the
+    CALLER's context — functions are inline macros running in the caller's
+    frame, not isolated. So a function called from a passive sees that
+    passive's `self`.
+  - other functions (built-in or user-defined) are callable, enabling
+    composition and recursion. Recursion is bounded by the
+    formula_function_recursion_limit rule (default 64) — exceeding it
+    raises a FormulaError rather than blowing the stack.
+
+NOTE: the entity[X] accessor takes X as a literal token (self/this/current
+or an entity id), NOT as a variable — you cannot pass an entity id through
+a parameter and write entity[param]. Target a specific entity with the
+special tokens or a hardcoded id.
+
+Functions are stored on the match (serialized with save/load) and can be
+seeded from a GameSystem's function library at match creation. Manage them
+with: !func def, !func del, !func list, !func info.
+
+Example — define damage math once, use it in many passives:
+
+  !func def mitigated raw,armor "max(raw - armor, 0)"
+  !passive add hero retaliate on_turn_start "entity[attacker].hp = entity[attacker].hp - mitigated(entity[self].thorns, entity[attacker].armor)"
 
 ================================================================================
 TIPS AND COMMON PATTERNS
@@ -543,6 +596,90 @@ def _direction_to(x1: Any, y1: Any, x2: Any, y2: Any,
     return "down" if sy > 0 else "up"
 
 
+# --- math helpers ------------------------------------------------------------
+# Pure numeric functions exposed to formulas. min/max/abs/round/int/float
+# already live in _ALLOWED_FUNCS; these fill the common gaps (roots,
+# rounding direction, clamping, sign). Each validates its arguments and
+# raises FormulaError on a type mismatch rather than letting a bare
+# Python TypeError bubble up as a generic "Runtime error".
+
+def _num_arg(v: Any, fname: str, argname: str) -> Any:
+    """Shared numeric-arg guard. bool is rejected even though it's an
+    int subclass — passing True/False to a math function is almost
+    always a mistake, and silently treating True as 1 hides it."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise FormulaError(
+            f"{fname}(...): {argname} must be a number, got "
+            f"{type(v).__name__}."
+        )
+    return v
+
+
+def _sqrt(v: Any) -> float:
+    _num_arg(v, "sqrt", "value")
+    if v < 0:
+        raise FormulaError(f"sqrt(value): value must be >= 0, got {v}.")
+    return math.sqrt(v)
+
+
+def _floor(v: Any) -> int:
+    _num_arg(v, "floor", "value")
+    return math.floor(v)
+
+
+def _ceil(v: Any) -> int:
+    _num_arg(v, "ceil", "value")
+    return math.ceil(v)
+
+
+def _pow(base: Any, exp: Any) -> Any:
+    _num_arg(base, "pow", "base")
+    _num_arg(exp, "pow", "exp")
+    # math via Python's ** so int**int stays int where possible (matches
+    # the existing ** operator's behavior); guard the 0**negative and
+    # negative-base-fractional-exp cases that raise/return complex.
+    try:
+        result = base ** exp
+    except ZeroDivisionError:
+        raise FormulaError("pow(base, exp): 0 raised to a negative power.")
+    if isinstance(result, complex):
+        raise FormulaError(
+            "pow(base, exp): result is complex (negative base with a "
+            "fractional exponent)."
+        )
+    return result
+
+
+def _clamp(v: Any, lo: Any, hi: Any) -> Any:
+    """clamp(value, lo, hi): value pinned into [lo, hi]. Returns lo if
+    value < lo, hi if value > hi, else value unchanged. Requires
+    lo <= hi — an inverted range is almost certainly a bug, so we
+    raise rather than silently swap."""
+    _num_arg(v, "clamp", "value")
+    _num_arg(lo, "clamp", "lo")
+    _num_arg(hi, "clamp", "hi")
+    if lo > hi:
+        raise FormulaError(
+            f"clamp(value, lo, hi): lo ({lo}) must be <= hi ({hi})."
+        )
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+
+def _sign(v: Any) -> int:
+    """sign(value): -1 if negative, 0 if zero, 1 if positive. Returns an
+    int regardless of input type so it composes cleanly with int math."""
+    _num_arg(v, "sign", "value")
+    if v > 0:
+        return 1
+    if v < 0:
+        return -1
+    return 0
+
+
 _ALLOWED_FUNCS: Dict[str, Any] = {
     "min": min, "max": max, "abs": abs, "round": round,
     "int": int, "float": float, "str": str,
@@ -551,6 +688,12 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
     "distance": _distance,
     "angle": _angle,
     "direction_to": _direction_to,
+    "sqrt": _sqrt,
+    "floor": _floor,
+    "ceil": _ceil,
+    "pow": _pow,
+    "clamp": _clamp,
+    "sign": _sign,
 }
 
 # Match-bound function names. These functions are bound at namespace build
@@ -793,7 +936,23 @@ class _EntityAccessTransformer(ast.NodeTransformer):
         raise FormulaError("Subscripting is not allowed (only entity[X].path).")
 
 
-def _validate_tree(tree: ast.AST) -> None:
+def _validate_tree(
+    tree: ast.AST,
+    known_funcs: "frozenset[str]" = frozenset(),
+    known_params: "frozenset[str]" = frozenset(),
+) -> None:
+    """Walk the (already-transformed) AST and reject anything outside the
+    sandbox whitelist.
+
+    known_funcs   names callable as user-defined formula functions. The
+                  engine passes the current match's function registry so
+                  a formula calling a defined function validates; an
+                  undefined name still errors.
+    known_params  identifier names that are legal as plain values in this
+                  scope. Used ONLY when validating a function body, where
+                  the parameter names appear as Load Names. Empty for
+                  ordinary formulas.
+    """
     for n in ast.walk(tree):
         if not isinstance(n, _ALLOWED_NODES):
             raise FormulaError(f"Disallowed syntax: {type(n).__name__}")
@@ -801,13 +960,16 @@ def _validate_tree(tree: ast.AST) -> None:
             # Allowed Names: __read/__write (transformer-injected), the
             # built-in funcs (min, max, etc.), the hook context names
             # (changed_key, old_value, new_value, hook_name, ...) bound to
-            # None outside var-hook contexts, and the match-bound
-            # functions (group_has, group_size, group_add, group_remove,
-            # self_id, current_id) bound at namespace-build time.
+            # None outside var-hook contexts, the match-bound functions
+            # (group_has, group_size, ..., is_attackable), user-defined
+            # formula functions (known_funcs), and — inside a function
+            # body — that function's parameters (known_params).
             if (n.id not in ("__read", "__write")
                     and n.id not in _ALLOWED_FUNCS
                     and n.id not in _MATCH_FUNC_NAMES
-                    and n.id not in HOOK_CONTEXT_NAMES):
+                    and n.id not in HOOK_CONTEXT_NAMES
+                    and n.id not in known_funcs
+                    and n.id not in known_params):
                 raise FormulaError(f"Unknown identifier '{n.id}'.")
         if isinstance(n, ast.Call):
             if not isinstance(n.func, ast.Name):
@@ -815,7 +977,8 @@ def _validate_tree(tree: ast.AST) -> None:
             fname = n.func.id
             if (fname not in ("__read", "__write")
                     and fname not in _ALLOWED_FUNCS
-                    and fname not in _MATCH_FUNC_NAMES):
+                    and fname not in _MATCH_FUNC_NAMES
+                    and fname not in known_funcs):
                 raise FormulaError(f"Function '{fname}' is not allowed.")
 
 
@@ -847,16 +1010,26 @@ def _set_path(d: Dict[str, Any], path: str, value: Any) -> None:
     cur[keys[-1]] = value
 
 
-def validate_formula(src: str, *, mode: str = "exec") -> None:
+def validate_formula(
+    src: str, *, mode: str = "exec",
+    known_funcs: "frozenset[str]" = frozenset(),
+    known_params: "frozenset[str]" = frozenset(),
+) -> None:
     """Parse, transform, and validate a formula source string.
 
     Raises FormulaError on any syntactic or semantic problem. Useful for
-    failing early when a passive is registered, rather than at hook-fire time.
+    failing early when a passive (or formula function) is registered,
+    rather than at fire/call time.
 
     mode: 'exec' for full program bodies (assignments and expressions),
           'eval' for pure expressions.
+    known_funcs / known_params: forwarded to _validate_tree. Pass the
+          match's defined-function names so a formula referencing a
+          user function validates; pass a function's parameter names
+          when validating that function's body.
     """
-    FormulaEngine._prepare(src, mode)
+    FormulaEngine._prepare(src, mode, known_funcs=known_funcs,
+                           known_params=known_params)
 
 
 # --- engine ------------------------------------------------------------------
@@ -866,6 +1039,13 @@ class FormulaEngine:
 
     def __init__(self, match):
         self._match = match
+        # Current nesting depth of user-defined formula-function calls.
+        # Bumped on entry to each call, restored on exit. Guards against
+        # unbounded recursion blowing Python's stack — see the
+        # formula_function_recursion_limit rule. A fresh engine is
+        # created per hook fire / command, so this naturally starts at 0
+        # for each top-level evaluation.
+        self._fn_depth = 0
 
     # ---- positional-var special-casing ------------------------------------
     # Names of the entity attributes that the formula engine treats as
@@ -1217,21 +1397,139 @@ class FormulaEngine:
         ns["is_part_of_team"] = _is_part_of_team
         ns["is_attackable"]  = _is_attackable
 
+        # User-defined formula functions. Each becomes a Python callable
+        # in the namespace. The callable binds its arguments to the
+        # function's parameters, then runs the (lazily compiled) body
+        # with the SAME ctx as the caller — so entity[self] inside a
+        # function body resolves to the caller's self, making functions
+        # behave like inline macros rather than isolated frames.
+        #
+        # `ns` is captured by reference: the closures below see the
+        # fully-populated namespace at call time (including each other),
+        # so functions can call sibling functions and recurse. The
+        # recursion guard (self._fn_depth vs the limit rule) prevents an
+        # unbounded recursive function from blowing the stack.
+        funcs = getattr(match, "formula_functions", None) or {}
+        if funcs:
+            limit = int(match.rules.get(
+                "formula_function_recursion_limit", 64))
+
+            def _make_callable(fdef):
+                def _call(*args):
+                    if len(args) != len(fdef.params):
+                        raise FormulaError(
+                            f"{fdef.signature()} takes "
+                            f"{len(fdef.params)} argument(s), got "
+                            f"{len(args)}."
+                        )
+                    if self._fn_depth >= limit:
+                        raise FormulaError(
+                            f"formula function recursion limit "
+                            f"({limit}) exceeded while calling "
+                            f"'{fdef.name}' — likely an unbounded "
+                            f"recursive function."
+                        )
+                    body_code, expr_code = self._compile_function_body(fdef)
+                    # Fresh per-call namespace so parameter bindings from
+                    # one call don't leak into siblings. Inherits all the
+                    # builtins / match funcs / sibling functions from ns.
+                    call_ns = dict(ns)
+                    for pname, pval in zip(fdef.params, args):
+                        call_ns[pname] = pval
+                    self._fn_depth += 1
+                    try:
+                        if body_code is not None:
+                            exec(body_code, {"__builtins__": {}}, call_ns)
+                        if expr_code is None:
+                            return None
+                        return eval(expr_code, {"__builtins__": {}}, call_ns)
+                    finally:
+                        self._fn_depth -= 1
+                return _call
+
+            for fname, fdef in funcs.items():
+                ns[fname] = _make_callable(fdef)
+
         return ns
 
+    def _compile_function_body(self, fdef):
+        """Compile (and cache on the FormulaFunction) the body of a
+        user-defined function into (body_code, trailing_expr_code).
+
+        Mirrors eval_program's split: leading statements compile to an
+        exec code object (or None if the body is a single expression),
+        and a trailing expression compiles to an eval code object whose
+        value is the function's return value (or None if the body has
+        no trailing expression).
+
+        Validation uses the current match's function names as
+        known_funcs (so a body may call sibling functions / recurse)
+        plus the function's own parameters as known_params (so the
+        parameters are legal identifiers inside the body).
+        """
+        cached = getattr(fdef, "_compiled", None)
+        if cached is not None:
+            return cached
+        known_funcs = self._known_funcs()
+        known_params = frozenset(fdef.params)
+        try:
+            full = ast.parse(fdef.body, mode="exec")
+        except SyntaxError as e:
+            raise FormulaError(
+                f"function '{fdef.name}' body syntax error: {e.msg}"
+            )
+        trailing_expr = None
+        if full.body and isinstance(full.body[-1], ast.Expr):
+            trailing_expr = full.body.pop().value
+        full = _EntityAccessTransformer().visit(full)
+        ast.fix_missing_locations(full)
+        _validate_tree(full, known_funcs=known_funcs,
+                       known_params=known_params)
+        body_code = None
+        if full.body:
+            body_code = compile(full, "<formula-fn>", "exec")
+        expr_code = None
+        if trailing_expr is not None:
+            expr_tree = ast.Expression(body=trailing_expr)
+            expr_tree = _EntityAccessTransformer().visit(expr_tree)
+            ast.fix_missing_locations(expr_tree)
+            _validate_tree(expr_tree, known_funcs=known_funcs,
+                           known_params=known_params)
+            expr_code = compile(expr_tree, "<formula-fn>", "eval")
+        compiled = (body_code, expr_code)
+        try:
+            fdef._compiled = compiled
+        except Exception:
+            # FormulaFunction should always allow the attribute; if a
+            # caller passes a different shape, just skip caching.
+            pass
+        return compiled
+
     @staticmethod
-    def _prepare(src: str, mode: str) -> ast.AST:
+    def _prepare(
+        src: str, mode: str,
+        known_funcs: "frozenset[str]" = frozenset(),
+        known_params: "frozenset[str]" = frozenset(),
+    ) -> ast.AST:
         try:
             tree = ast.parse(src, mode=mode)
         except SyntaxError as e:
             raise FormulaError(f"Syntax error: {e.msg}")
         tree = _EntityAccessTransformer().visit(tree)
         ast.fix_missing_locations(tree)
-        _validate_tree(tree)
+        _validate_tree(tree, known_funcs=known_funcs, known_params=known_params)
         return tree
 
+    def _known_funcs(self) -> "frozenset[str]":
+        """The set of user-defined function names callable on this match.
+        Empty when the match has no formula functions (or isn't set)."""
+        funcs = getattr(self._match, "formula_functions", None)
+        if not funcs:
+            return frozenset()
+        return frozenset(funcs.keys())
+
     def eval_expression(self, src: str, ctx: EvalCtx) -> Any:
-        tree = self._prepare(src, "eval")
+        tree = self._prepare(src, "eval", known_funcs=self._known_funcs())
         code = compile(tree, "<formula>", "eval")
         try:
             return eval(code, {"__builtins__": {}}, self._namespace(ctx))
@@ -1247,13 +1545,14 @@ class FormulaEngine:
         except SyntaxError as e:
             raise FormulaError(f"Syntax error: {e.msg}")
 
+        known = self._known_funcs()
         trailing_expr = None
         if full.body and isinstance(full.body[-1], ast.Expr):
             trailing_expr = full.body.pop().value
 
         full = _EntityAccessTransformer().visit(full)
         ast.fix_missing_locations(full)
-        _validate_tree(full)
+        _validate_tree(full, known_funcs=known)
 
         ns = self._namespace(ctx)
         try:
@@ -1264,7 +1563,7 @@ class FormulaEngine:
             expr_tree = ast.Expression(body=trailing_expr)
             expr_tree = _EntityAccessTransformer().visit(expr_tree)
             ast.fix_missing_locations(expr_tree)
-            _validate_tree(expr_tree)
+            _validate_tree(expr_tree, known_funcs=known)
             return eval(compile(expr_tree, "<formula>", "eval"),
                         {"__builtins__": {}}, ns)
         except FormulaError:
@@ -1308,11 +1607,18 @@ def _stringify(v: Any) -> str:
 
 # --- public validation helper -----------------------------------------------
 
-def validate_program(src: str) -> None:
+def validate_program(
+    src: str,
+    known_funcs: "frozenset[str]" = frozenset(),
+) -> None:
     """
     Parse and validate a formula in program mode (statements + optional
     trailing expression). Raises FormulaError on syntax errors or disallowed
     constructs. Used to eagerly catch broken passive formulas at add time.
     Does not need a match — purely a syntax check.
+
+    Pass known_funcs (the active match's defined formula-function names)
+    so a passive body that calls a user-defined function validates at
+    registration time instead of erroring only when the hook fires.
     """
-    FormulaEngine._prepare(src, "exec")
+    FormulaEngine._prepare(src, "exec", known_funcs=known_funcs)
