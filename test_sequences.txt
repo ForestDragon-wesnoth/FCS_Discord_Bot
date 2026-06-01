@@ -4987,3 +4987,234 @@ the engine's history system doesn't currently support redo (an
 undo erases the now-orphaned future from each retention bucket),
 so a redo command would need real implementation work, not just
 a forwarder.
+
+
+SCENARIO 215 — Math helpers: sqrt, floor, ceil, pow, clamp, sign
+-----------------------------------------------------------------
+
+!match new mmath1 MathFns 8 8
+!match use mmath1
+!eval "sqrt(9)"
+!eval "sqrt(2)"
+!eval "floor(3.7)"
+!eval "ceil(3.2)"
+!eval "pow(2, 10)"
+!eval "pow(2, 0.5)"
+!eval "clamp(5, 0, 10)"
+!eval "clamp(-3, 0, 10)"
+!eval "clamp(99, 0, 10)"
+!eval "sign(-4)"
+!eval "sign(0)"
+!eval "sign(7)"
+
+Expected: Six new pure math functions join the existing
+min/max/abs/round/int/float. `sqrt(9)` = 3.0 (float),
+`sqrt(2)` ≈ 1.414. `floor(3.7)` = 3 and `ceil(3.2)` = 4, both
+returning ints. `pow(2, 10)` = 1024 (int when both args are
+ints), `pow(2, 0.5)` ≈ 1.414 (float). `clamp(value, lo, hi)`
+pins a value into [lo, hi]: 5 stays 5, -3 becomes 0, 99 becomes
+10. `sign(value)` returns -1 / 0 / 1 for negative / zero /
+positive. These compose with everything else — e.g.
+`clamp(entity[self].hp + heal, 0, entity[self].max_hp)` is a
+cleaner spelling of the nested-min/max clamp pattern.
+
+
+SCENARIO 216 — Math helpers: error cases
+------------------------------------------
+
+!match new mmath2 MathErr 8 8
+!match use mmath2
+!eval "sqrt(-1)"
+!eval "clamp(5, 10, 0)"
+!eval "pow(-2, 0.5)"
+!eval "floor('x')"
+
+Expected: Each math helper validates its arguments and raises a
+clear FormulaError rather than letting a bare Python exception
+leak as a generic "Runtime error". `sqrt(-1)` rejects the
+negative input. `clamp(5, 10, 0)` rejects the inverted range
+(lo > hi) instead of silently swapping. `pow(-2, 0.5)` rejects
+the complex result (negative base, fractional exponent).
+`floor('x')` rejects the non-numeric argument. All four surface
+as `❌`-prefixed errors at the command layer.
+
+
+SCENARIO 217 — Formula functions: define, list, info, call
+-----------------------------------------------------------
+
+!match new mfn1 FuncBasics 8 8
+!match use mfn1
+!ent add hero Hero 30 1 1 10
+!ent set_var hero atk 15
+!ent set_var hero armor 4
+!func list
+!func def mitigated raw,armor "max(raw - armor, 0)"
+!func def crit base "base * 2"
+!func def answer none "42"
+!func list
+!func info mitigated
+!eval "mitigated(15, 4)"
+!eval "crit(8)"
+!eval "answer()"
+!eval "mitigated(entity[hero].atk, entity[hero].armor)"
+
+Expected: `!func def <name> <params> <body>` defines a reusable
+formula function. Params is one token — `raw,armor` (comma-
+separated), or `none` for a zero-parameter function. The body is
+a formula whose trailing expression is the return value.
+
+Before any definitions, `!func list` reports "No formula
+functions defined." After three definitions, `!func list` shows
+each signature with a body snippet, sorted by name:
+`answer()`, `crit(base)`, `mitigated(raw, armor)`. `!func info
+mitigated` shows the full body.
+
+Calling them from `!eval`: `mitigated(15, 4)` = 11,
+`crit(8)` = 16, `answer()` = 42. Arguments can be any formula
+expression including entity reads —
+`mitigated(entity[hero].atk, entity[hero].armor)` resolves to
+`mitigated(15, 4)` = 11.
+
+
+SCENARIO 218 — Formula functions: composition and recursion
+-------------------------------------------------------------
+
+!match new mfn2 FuncCompose 8 8
+!match use mfn2
+!func def mitigated raw,armor "max(raw - armor, 0)"
+!func def crit base "base * 2"
+!func def net atk,armor,mult "crit(mitigated(atk, armor)) * mult"
+!eval "net(10, 3, 1)"
+!func def fact n "1 if n <= 1 else n * fact(n - 1)"
+!eval "fact(5)"
+!eval "fact(0)"
+!func def loop n "loop(n + 1)"
+!eval "loop(0)"
+
+Expected: Functions can call other functions, enabling
+composition. `net(atk, armor, mult)` calls both `crit` and
+`mitigated`: `net(10, 3, 1)` = `crit(mitigated(10, 3)) * 1` =
+`crit(7) * 1` = `14 * 1` = 14.
+
+A function can call ITSELF — `fact` is the classic recursive
+factorial using a ternary as the base case. `fact(5)` = 120,
+`fact(0)` = 1 (base case `n <= 1` returns 1). Recursion is
+bounded by the `formula_function_recursion_limit` rule (default
+64); an unbounded recursive function like `loop` hits the limit
+and raises a clear FormulaError rather than blowing Python's
+stack and crashing.
+
+
+SCENARIO 219 — Formula functions: side effects and shared context
+------------------------------------------------------------------
+
+!match new mfn3 FuncSideEffect 8 8
+!match use mfn3
+!ent add hero Hero 30 1 1 10
+!ent set_var hero max_hp 40
+!func def heal_current amount "entity[this].hp = min(entity[this].hp + amount, entity[this].max_hp)"
+!turn next
+!eval "heal_current(5)"
+!ent dump hero
+!eval "heal_current(20)"
+!ent dump hero
+
+Expected: A function body can WRITE entity vars as a side effect,
+and the special tokens (`this`/`current`/`self`) inside the body
+resolve against the CALLER's context — functions are inline
+macros running in the caller's frame, not isolated. After
+`!turn next`, hero is the current-turn entity, so `entity[this]`
+inside `heal_current` resolves to hero.
+
+`heal_current(5)` raises hero from 30 to 35; `heal_current(20)`
+would push to 55 but `min(..., max_hp)` caps it at 40. The body
+is a pure assignment (no trailing expression), so the function
+returns None — `!eval` echoes `= None` — but the side-effect
+write persists, as `!ent dump hero` confirms (hp 35, then 40).
+
+Note: the `entity[X]` accessor takes X as a literal token
+(`self`/`this`/`current` or an entity id), not as a variable —
+so you can't pass an entity id through a parameter and write
+`entity[param]`. Functions that target a specific entity use
+the special tokens (as here) or a hardcoded id; SCENARIO 220
+shows the `entity[self]` form inside a passive.
+
+
+SCENARIO 220 — Formula functions: used inside a passive (real self)
+--------------------------------------------------------------------
+
+!match new mfn4 FuncPassive 8 8
+!match use mfn4
+!ent add hero Hero 30 1 1 10
+!ent set_var hero max_hp 50
+!func def regen_amount missing "ceil(missing / 4)"
+!passive add hero regen on_turn_start "entity[self].hp = min(entity[self].hp + regen_amount(entity[self].max_hp - entity[self].hp), entity[self].max_hp)"
+!ent hp hero -20
+!ent dump hero
+!turn next
+!ent dump hero
+
+Expected: A passive body can call a formula function, and inside
+that function `self` correctly resolves to the passive's owner.
+`regen_amount(missing)` returns `ceil(missing / 4)`. Hero starts
+at 30/50, takes 20 damage to 10/50 (missing = 40). When the
+on_turn_start passive fires, it computes
+`regen_amount(40)` = `ceil(40/4)` = 10 and heals to 20/50.
+
+This is the headline use case: define reusable math once
+(`regen_amount`), reference it from any number of passives, and
+edit the formula in one place. The function sees the calling
+passive's `self`, so it works for any entity the passive is
+attached to.
+
+
+SCENARIO 221 — Formula functions: validation and reserved names
+----------------------------------------------------------------
+
+!match new mfn5 FuncValid 8 8
+!match use mfn5
+!func def bad x "for i in x: pass"
+!func def usesundef x "x + nope(1)"
+!func def max a "a + 1"
+!func def dup "a,a" "a"
+!func def baditem "1bad" "0"
+!eval "undefined_fn(1)"
+
+Expected: Function definitions are validated up front. A body
+using disallowed syntax (`for` loop) is rejected at define time.
+A body referencing an undefined function (`nope`) is rejected —
+the body validator knows the current function registry plus the
+name being defined (for recursion). Defining a function named
+`max` is rejected because it collides with a built-in. A
+duplicate parameter list (`a,a`) is rejected. An invalid
+parameter identifier (`1bad`, starts with a digit) is rejected.
+Finally, calling an undefined function from a formula
+(`undefined_fn`) errors at evaluation. Every case surfaces as a
+clear `❌` error rather than a crash.
+
+
+SCENARIO 222 — Formula functions: persistence and deletion
+-----------------------------------------------------------
+
+!match new mfn6 FuncPersist 8 8
+!match use mfn6
+!func def triple x "x * 3"
+!func def viafn x "triple(x) + 1"
+!eval "viafn(10)"
+!store save /tmp/scenario222
+!func del triple
+!eval "viafn(10)"
+!func list
+!store load /tmp/scenario222
+!func list
+!eval "viafn(10)"
+
+Expected: Formula functions survive a save/load round-trip.
+`triple(x)` = `x * 3` and `viafn(x)` = `triple(x) + 1`;
+`viafn(10)` = 31. After saving, deleting `triple` breaks `viafn`
+— calling it now errors because `triple` no longer resolves (no
+dependency scan is done at delete time; dependents fail at their
+next call). `!func list` shows only `viafn` remains. Loading the
+saved state restores both functions, and `viafn(10)` = 31 works
+again. (The deletion's downstream breakage is intentional and
+mirrors how tile-template deletion leaves orphaned instances.)
