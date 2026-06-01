@@ -5256,3 +5256,170 @@ parameter list can change across a redefinition (the third call
 adds a `pierce` parameter). The final `mitigated(20, 5, 3)`
 confirms the latest definition is the active one:
 max(20 - 5 + 3, 0) = 18.
+
+
+SCENARIO 224 — entities_within: range queries with relation filters
+--------------------------------------------------------------------
+
+!match new mgeo1 EntWithin 12 12
+!match use mgeo1
+!ent add hero Hero 30 5 5 10
+!ent set_var hero team blue
+!ent add ally Ally 30 6 5 9
+!ent set_var ally team blue
+!ent add gob1 Gob1 20 5 7 5
+!ent set_var gob1 team red
+!ent add gob2 Gob2 20 8 8 4
+!ent set_var gob2 team red
+!ent add fargob FarGob 20 12 12 3
+!ent set_var fargob team red
+!eval "entities_within('hero', 3)"
+!eval "entities_within('hero', 3, 'square_radius_distance', 'hostile')"
+!eval "entities_within('hero', 3, 'square_radius_distance', 'ally')"
+!eval "entities_within('hero', 10)"
+!eval "len(entities_within('hero', 3, 'square_radius_distance', 'hostile'))"
+
+Expected: `entities_within(eid, n, mode, relation)` returns the ids
+of ALIVE entities (excluding eid itself) within distance n of eid,
+sorted by (distance, id). Hero is at (5,5). Within Chebyshev
+distance 3: ally (dist 1), gob1 (dist 2), gob2 (dist 3) — fargob
+at (12,12) is too far. The `relation` filter narrows by team
+relationship: `'hostile'` keeps only gob1/gob2; `'ally'` keeps
+only ally (the relation reuses the same team predicates as
+is_hostile/is_same_team, so it honors team_var and friendlyfire).
+Widening to n=10 pulls in fargob too. `len(...)` counts the
+result — the main way to consume the list before formula
+for-loops exist (e.g. "if 2+ enemies adjacent, use the AOE").
+
+
+SCENARIO 225 — nearest_entity: closest matching entity
+-------------------------------------------------------
+
+!match new mgeo2 Nearest 12 12
+!match use mgeo2
+!ent add hero Hero 30 5 5 10
+!ent set_var hero team blue
+!ent add ally Ally 30 6 5 9
+!ent set_var ally team blue
+!ent add gob1 Gob1 20 5 7 5
+!ent set_var gob1 team red
+!ent add gob2 Gob2 20 8 8 4
+!ent set_var gob2 team red
+!eval "nearest_entity('hero')"
+!eval "nearest_entity('hero', 'hostile')"
+!eval "nearest_entity('hero', 'ally')"
+!ent set_var hero last_target "$(nearest_entity('hero', 'hostile'))"
+!ent dump hero
+
+Expected: `nearest_entity(eid, relation, mode)` returns the single
+closest matching entity id (ties broken by id for determinism),
+or "" if nothing matches. Hero at (5,5): the overall nearest is
+ally (dist 1); the nearest hostile is gob1 (dist 2, vs gob2 at
+3); the nearest ally is ally. The result is a plain id string, so
+it composes with any id-taking function and with `$()`
+substitution — `!ent set_var hero last_target $(...)` stores
+"gob1" into the var, confirmed by `!ent dump`. (To then read that
+target's vars as `entity[<id>]` you'd use the dynamic-accessor
+feature; for now the id is usable as an argument to is_hostile,
+group_add, distance-via-coords, etc.)
+
+
+SCENARIO 226 — cells_in_burst: area shapes by distance mode
+------------------------------------------------------------
+
+!match new mgeo3 Burst 12 12
+!match use mgeo3
+!eval "len(cells_in_burst(5, 5, 0))"
+!eval "len(cells_in_burst(5, 5, 1))"
+!eval "len(cells_in_burst(5, 5, 1, 'manhattan_distance'))"
+!eval "len(cells_in_burst(5, 5, 2, 'euclidean_distance'))"
+!eval "cells_in_burst(5, 5, 1, 'manhattan_distance')"
+
+Expected: `cells_in_burst(x, y, r, mode)` returns every cell
+within distance r of (x,y) INCLUDING the center, as a list of
+(x,y) tuples. The shape depends on the metric: with the default
+square_radius (Chebyshev), r=1 is the 3x3 block = 9 cells; r=0 is
+just the center = 1 cell. Manhattan r=1 is a plus/diamond = 5
+cells (center + 4 orthogonal neighbors). Euclidean r=2 is a disc
+= 13 cells. The explicit manhattan r=1 listing shows the diamond:
+(4,5), (5,4), (5,5), (5,6), (6,5). Coordinates aren't clipped to
+the grid — a burst near the edge can include off-grid cells,
+which simply match no tile/entity downstream.
+
+
+SCENARIO 227 — cells_in_line: Bresenham line between two cells
+--------------------------------------------------------------
+
+!match new mgeo4 Line 12 12
+!match use mgeo4
+!eval "cells_in_line(1, 1, 1, 5)"
+!eval "cells_in_line(1, 1, 5, 1)"
+!eval "cells_in_line(1, 1, 4, 4)"
+!eval "cells_in_line(2, 2, 5, 4)"
+!eval "len(cells_in_line(1, 1, 1, 5))"
+
+Expected: `cells_in_line(x1, y1, x2, y2)` returns the cells on the
+straight line between the two endpoints (inclusive), ordered start
+to end, via Bresenham's algorithm. A vertical line (1,1)->(1,5)
+is the five cells (1,1)..(1,5); a horizontal line (1,1)->(5,1)
+likewise. A perfect diagonal (1,1)->(4,4) steps through
+(1,1),(2,2),(3,3),(4,4). A shallow diagonal (2,2)->(5,4)
+approximates the line with whole cells. This is the basis for a
+future line-of-sight or beam-attack check (walk the cells, stop
+at the first blocker).
+
+
+SCENARIO 228 — cells_in_cone: directional cone area
+----------------------------------------------------
+
+!match new mgeo5 Cone 12 12
+!match use mgeo5
+!eval "cells_in_cone(5, 5, 'right', 2)"
+!eval "cells_in_cone(5, 5, 'up', 2)"
+!eval "len(cells_in_cone(5, 5, 'right', 2))"
+!eval "len(cells_in_cone(5, 5, 'right', 2, 90))"
+!eval "cells_in_cone(5, 5, 90, 1)"
+
+Expected: `cells_in_cone(x, y, direction, length, half_angle=45)`
+returns cells inside a cone emanating from (x,y), excluding the
+origin. Direction is a named direction OR a compass angle
+(0=up, clockwise). With the default 45° half-angle (a 90°-wide
+cone), a "right" cone of length 2 covers (6,4), (6,5), (6,6),
+(7,5) — the cells within euclidean distance 2 whose bearing is
+within 45° of due-right. An "up" cone of length 2 is the same
+shape rotated. Widening half_angle to 90 (a 180° cone) includes
+more cells. Passing a numeric direction (90 = right) instead of
+the name gives the same orientation: `cells_in_cone(5, 5, 90, 1)`
+covers the length-1 cells in the right hemisphere. Reuses the
+engine's angle()/distance() conventions internally.
+
+
+SCENARIO 229 — Spatial helpers compose with passives and functions
+-------------------------------------------------------------------
+
+!match new mgeo6 SpatialCompose 12 12
+!match use mgeo6
+!ent add mage Mage 30 5 5 10
+!ent set_var mage team blue
+!ent add foe1 Foe1 20 5 6 8
+!ent set_var foe1 team red
+!ent add foe2 Foe2 20 6 5 7
+!ent set_var foe2 team red
+!ent add bystander Bystander 30 5 4 6
+!ent set_var bystander team blue
+!func def foes_adjacent eid "len(entities_within(eid, 1, 'square_radius_distance', 'hostile'))"
+!eval "foes_adjacent('mage')"
+!passive add mage threat_check on_turn_start "entity[self].threatened = foes_adjacent('mage')"
+!turn next
+!ent dump mage
+
+Expected: The spatial helpers compose with user-defined functions
+and passives. `foes_adjacent(eid)` wraps
+`len(entities_within(eid, 1, ..., 'hostile'))` into a reusable
+function. The mage at (5,5) has two adjacent hostiles (foe1 at
+(5,6), foe2 at (6,5)) and one adjacent ally (bystander), so
+`foes_adjacent('mage')` = 2. A passive can call the function and
+store the result: after `!turn next` fires the on_turn_start
+passive, `mage.threatened` = 2, confirmed by `!ent dump`. This is
+the headline composition win — "count of adjacent enemies" is now
+a one-liner usable anywhere a formula runs.
