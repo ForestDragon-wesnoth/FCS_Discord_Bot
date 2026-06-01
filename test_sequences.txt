@@ -5256,3 +5256,115 @@ parameter list can change across a redefinition (the third call
 adds a `pierce` parameter). The final `mitigated(20, 5, 3)`
 confirms the latest definition is the active one:
 max(20 - 5 + 3, 0) = 18.
+
+
+SCENARIO 232 — Dynamic entity[<expr>]: literal still works, expressions resolve
+--------------------------------------------------------------------------------
+
+!match new mdyn1 DynAccess 12 12
+!match use mdyn1
+!ent add hero Hero 30 5 5 10
+!ent set_var hero focus gob2
+!ent add gob1 Gob1 20 5 6 5
+!ent add gob2 Gob2 25 8 8 4
+!ent set_var gob2 max_hp 25
+!eval "entity[gob1].hp"
+!eval "entity[\"gob2\"].hp"
+!eval "entity[entity[hero].focus].hp"
+!eval "entity[5].hp"
+
+Expected: The `entity[X]` accessor now accepts dynamic indices while
+keeping the old literal forms working. `entity[gob1].hp` (bare
+identifier) still means the entity with id "gob1" = 20 — backward
+compatible, because at top level no identifier is a "known
+parameter". A string literal `entity["gob2"].hp` = 25. The new
+power: `entity[entity[hero].focus].hp` evaluates the inner read
+(hero.focus = "gob2") and uses it as the id, giving gob2's hp = 25.
+A non-string index like `entity[5]` errors clearly ("index must be
+an entity id string, got int") instead of a confusing downstream
+failure.
+
+
+SCENARIO 233 — Dynamic entity[<param>]: the function-parameter fix
+-------------------------------------------------------------------
+
+!match new mdyn2 DynParam 12 12
+!match use mdyn2
+!ent add hero Hero 30 1 1 10
+!ent set_var hero max_hp 100
+!ent add ally Ally 40 2 2 9
+!ent set_var ally max_hp 100
+!func def target_hp eid "entity[eid].hp"
+!func def heal eid,amount "entity[eid].hp = entity[eid].hp + amount"
+!eval "target_hp('hero')"
+!eval "target_hp('ally')"
+!eval "heal('hero', 15)"
+!ent dump hero
+!eval "heal('ally', 20)"
+!ent dump ally
+
+Expected: Inside a function body, a parameter used as an entity index
+(`entity[eid]`) now resolves to the parameter's VALUE — the
+limitation called out in PR16's scenario 219 is fixed. `target_hp`
+reads any passed entity's hp: `target_hp('hero')` = 30,
+`target_hp('ally')` = 40. `heal` writes to the passed entity:
+`heal('hero', 15)` raises hero to 45 (room under max_hp 100),
+`heal('ally', 20)` raises ally to 60. `!ent dump` confirms both.
+This makes functions genuinely reusable across entities passed by
+id, not just `self`/`this`. (The distinction is unambiguous: bare
+identifiers that are NOT parameters stay literal ids, so existing
+`entity[goblin]` references are unaffected.)
+
+
+SCENARIO 234 — Seedable RNG: reproducible roll sequences
+---------------------------------------------------------
+
+!system set default random_seed encounter42
+!match new mseed1 Seeded1 8 8
+!match use mseed1
+!eval "random_int(1, 1000)"
+!eval "random_int(1, 1000)"
+!eval "random_int(1, 1000)"
+!match new mseed2 Seeded2 8 8
+!match use mseed2
+!eval "random_int(1, 1000)"
+!eval "random_int(1, 1000)"
+!eval "random_int(1, 1000)"
+!system set default random_seed
+
+Expected: With the `random_seed` rule set to a non-empty value, the
+match's formula RNG becomes deterministic — each match seeded with
+the same value produces the SAME sequence of rolls. So the three
+rolls in Seeded1 exactly match the three rolls in Seeded2
+(same seed "encounter42", same call order). The RNG advances across
+calls (the three rolls within a match differ from each other — it's
+a reproducible SEQUENCE, not a stuck value). The trailing
+`!system set default random_seed` with no value clears the seed
+back to unseeded (independent rolls) so later scenarios aren't
+affected. (Test note: because the two matches share the same seed
+and the same number of prior rolls, their roll lists are equal —
+that equality is the deterministic assertion; the exact numbers
+depend on the seed.)
+
+
+SCENARIO 235 — Seedable RNG: random_string and reseeding on change
+-------------------------------------------------------------------
+
+!system set default random_seed alpha
+!match new mseed3 Seeded3 8 8
+!match use mseed3
+!eval "random_string('n', 's', 'e', 'w')"
+!eval "random_string('n', 's', 'e', 'w')"
+!match new mseed4 Seeded4 8 8
+!match use mseed4
+!eval "random_string('n', 's', 'e', 'w')"
+!eval "random_string('n', 's', 'e', 'w')"
+!system set default random_seed
+
+Expected: Seeding applies to `random_string` too — Seeded3 and
+Seeded4 (same seed "alpha", same call order) draw the same two
+direction strings in the same order. This is the basis for
+reproducible "random scatter" or "wandering monster" tables a GM
+can replay. The trailing empty `random_seed` restores unseeded
+behavior. (As in 234, the assertion is that the two matches'
+draw sequences are equal; the specific letters depend on the seed.)
