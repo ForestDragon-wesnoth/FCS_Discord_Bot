@@ -4868,6 +4868,7 @@ SCENARIO 211 — !tile place_area: bulk-fill a rectangle with one template
 !match use mpa1
 !tile def new flame
 !tile def data flame burn_damage 5
+!tile def data flame glyph &
 !tile place_area flame 2 2 4 4
 !tile find flame
 !tile info 2 2
@@ -4898,6 +4899,7 @@ SCENARIO 212 — !tile place_area: corners off-grid → all-or-nothing failure
 !match new mpa2 PlaceAreaOOB 8 8
 !match use mpa2
 !tile def new flame
+!tile def data flame glyph &
 !tile place_area flame 5 5 12 12
 !tile find flame
 !tile place_area flame 2 2 4 4
