@@ -501,11 +501,22 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     #     "schema": {"type": "bool"},
     #     "desc": "If True, stepwise movement collides with units.",
     # },
-    # "friendlyfire": {
-    #     "default": False,
-    #     "schema": {"type": "bool"},
-    #     "desc": "If True, attacks can hit allies; if False, allies are auto-excluded.",
-    # },
+    "friendlyfire": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether attacks can hit allies. False (default) means same-team "
+            "entities are not legal targets; True means anyone can be "
+            "targeted, friend or foe. This is consulted by the "
+            "is_attackable(a, b) formula function — passives that gate on "
+            "'can A attack B' should use is_attackable rather than "
+            "is_hostile so they pick up changes to this rule automatically. "
+            "is_hostile(a, b) remains a pure same/different-team check "
+            "regardless of this rule, so formulas that want the strict "
+            "ally-vs-enemy distinction (e.g. healing only hostiles) still "
+            "behave the same."
+        ),
+    },
 }
 
 # Precomputed views of RULES_REGISTRY for fast lookup at call sites that
