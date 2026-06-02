@@ -3820,7 +3820,16 @@ async def eval_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         args = args[2:]
     src = " ".join(args)  # rejoin in case shlex split on internal spaces
     eval_ctx = EvalCtx(this=m.current_entity_id(), target=self_id)
-    val = FormulaEngine(m).eval_program(src, eval_ctx)
+    engine = FormulaEngine(m)
+    val = engine.eval_program(src, eval_ctx)
+    # For side-effect-only formulas (e.g. `for eid in entities_within(...):
+    # entity[eid].hp = entity[eid].hp - 7`) the trailing assignment makes
+    # the return value None, which prints as a confusing "= `None`".
+    # The engine tracked which entities were mutated; surface that
+    # instead so the user sees what actually happened.
+    if val is None and engine.affected_entities:
+        ids = ", ".join(f"`{eid}`" for eid in engine.affected_entities)
+        return await ctx.send(f"Affected {len(engine.affected_entities)} entit{'y' if len(engine.affected_entities) == 1 else 'ies'}: {ids}")
     return await ctx.send(f"= `{val!r}`")
 
 

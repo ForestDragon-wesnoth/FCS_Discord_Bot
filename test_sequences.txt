@@ -6033,3 +6033,256 @@ from (2,2) to (5,2) marks four cells; a manhattan-burst of radius
 The transformer treats cx/cy as dynamic identifiers inside the
 body (PR 20's accessor logic), so they pass straight through as
 runtime values to tile_set.
+
+
+SCENARIO 249 — status_names: iterate a status set without hardcoding
+---------------------------------------------------------------------
+
+!match new mintro1 StatusNames 6 6
+!match use mintro1
+!ent add hero Hero 30 3 3 10
+!ent set_var hero max_hp 100
+!ent status hero add stunned
+!ent status hero set stunned remaining 2
+!ent status hero add poisoned
+!ent status hero set poisoned damage 5
+!ent status hero add blessed
+!eval --as hero "status_names(self)"
+!eval --as hero "len(status_names(self))"
+!eval --as hero "for s in status_names(self): status_set(self, s, 'audited', 1)"
+!ent status hero info stunned
+!ent status hero info poisoned
+!ent status hero info blessed
+
+Expected: `status_names(eid)` returns the active status names in
+insertion order. Hero starts with [stunned, poisoned, blessed].
+`len(status_names(self))` = 3. The for-loop iterates whatever
+statuses exist (no hardcoded names) and stamps each with an
+`audited: 1` field — `info` on every status now shows that field
+alongside its existing data. This is the headline composition win:
+"do X to every status the entity has" is now a one-liner without
+naming any specific status.
+
+
+SCENARIO 250 — var_keys + the runtime-path var_* accessors
+------------------------------------------------------------
+
+!match new mintro2 VarIntrospect 6 6
+!match use mintro2
+!ent add hero Hero 30 3 3 10
+!ent set_var hero max_hp 100
+!ent set_var hero team blue
+!ent set_var hero inventory.sword.damage 8
+!ent set_var hero inventory.bow.damage 5
+!ent set_var hero inventory.potion.heal 12
+!eval --as hero "var_keys(self)"
+!eval --as hero "var_keys(self, 'inventory')"
+!eval --as hero "var_has(self, 'inventory.sword.damage')"
+!eval --as hero "var_has(self, 'inventory.spear.damage')"
+!eval --as hero "var_get(self, 'inventory.sword.damage')"
+!eval --as hero "var_set(self, 'inventory.sword.damage', 99)"
+!eval --as hero "var_get(self, 'inventory.sword.damage')"
+!eval --as hero "var_del(self, 'inventory.bow.damage')"
+!eval --as hero "var_has(self, 'inventory.bow.damage')"
+!eval --as hero "var_del(self, 'inventory.bow.damage')"
+!eval --as hero "for item in var_keys(self, 'inventory'): var_set(self, 'audit.' + item, 1)"
+!ent dump hero
+
+Expected: `var_keys(eid, path)` lists keys at a vars path
+(empty/omitted path = top level). `entity[X].path` requires a
+STATIC path at parse time; the runtime-path companions
+`var_get/var_has/var_set/var_del` accept a string path computed
+at runtime — which is what makes `var_keys` useful (you can
+iterate whatever exists and touch it without naming names).
+
+Top-level keys for hero: hp, max_hp, initiative, team, inventory.
+Inventory keys: sword, bow, potion. `var_has` returns True/False
+without raising; `var_get` raises on a missing path (same as
+entity[X].path reads). `var_set` writes (routing through
+write_var so var hooks still fire); `var_del` returns True iff
+the path existed (False second time — idempotent).
+
+The trailing for-loop demonstrates iteration over `var_keys`: it
+stamps every inventory item's name as an `audit.<item> = 1` flag
+on the entity. After the loop, the dump shows the new audit
+subtree alongside the existing inventory.
+
+
+SCENARIO 251 — tile_keys + entity_groups + rule_get
+----------------------------------------------------
+
+!match new mintro3 MiscIntro 8 8
+!match use mintro3
+!ent add hero Hero 30 2 2 10
+!ent add ally Ally 30 3 3 9
+!ent add mage Mage 30 4 4 8
+!ent group new heroes
+!ent group add heroes hero ally
+!ent group new mages
+!ent group add mages mage hero
+!tile def new flame
+!tile def data flame burn 5
+!tile def data flame glyph F
+!tile place flame 5 5
+!eval "tile_keys(5, 5)"
+!eval "tile_keys(7, 7)"
+!eval --as hero "entity_groups(self)"
+!eval "entity_groups('mage')"
+!eval "entity_groups('ally')"
+!eval "rule_get('turnorder_direction')"
+!eval "rule_get('friendlyfire')"
+!eval "rule_get('nonexistent_rule')"
+
+Expected: `tile_keys(x, y)` lists the top-level keys in a tile's
+data dict. The placed flame instance shows the placement keys
+(burn, glyph, _template). An empty tile (7,7) returns [].
+
+`entity_groups(eid)` is the reverse index of `group_members`: it
+lists every group containing the entity. hero is in both `heroes`
+and `mages`; mage is in only `mages`; ally is in only `heroes`.
+Insertion order over Match.groups so results are stable.
+
+`rule_get(name)` returns the rule's current value or None for
+unknown rules. Defaults are returned when the rule hasn't been
+set — turnorder_direction = 'highest_first', friendlyfire = False.
+
+
+SCENARIO 252 — Match-wide entity queries: all_entities / with_status / with_var / in_area
+------------------------------------------------------------------------------------------
+
+!match new mintro4 AllQueries 12 12
+!match use mintro4
+!ent add a A 30 1 1 10
+!ent set_var a team blue
+!ent set_var a inventory.sword 1
+!ent add b B 30 2 2 9
+!ent set_var b team red
+!ent set_var b inventory.bow 1
+!ent add c C 30 5 5 8
+!ent set_var c team red
+!ent add d D 30 10 10 7
+!ent set_var d team blue
+!ent set_var d inventory.staff 1
+!ent status b add poisoned
+!ent status c add poisoned
+!ent status c add stunned
+!eval "all_entities()"
+!eval "entities_with_status('poisoned')"
+!eval "entities_with_status('stunned')"
+!eval "entities_with_status('absent')"
+!eval "entities_with_var('inventory')"
+!eval "entities_with_var('inventory.sword')"
+!eval "entities_in_area(5, 5, 2)"
+!eval "entities_in_area(5, 5, 2, 'manhattan_distance')"
+!eval "for eid in entities_with_status('poisoned'): var_set(eid, 'hp', var_get(eid, 'hp') - 3)"
+!ent dump b
+!ent dump c
+
+Expected: The match-wide query family doesn't need a reference
+entity — handy when the "originator" of an effect is a tile or a
+GM command, not another entity.
+
+`all_entities()` returns every alive entity id in insertion order:
+[a, b, c, d]. `entities_with_status(name)` filters to those
+carrying the named status: poisoned → [b, c]; stunned → [c];
+absent → []. `entities_with_var(path)` does the same for var
+paths: 'inventory' → [a, b, d]; 'inventory.sword' → [a] only.
+
+`entities_in_area(x, y, n, mode)` is the coord-rooted twin of
+`entities_within`. Centered on (5,5) with r=2 Chebyshev: c
+(distance 0), all others farther — [c]. Switching to manhattan
+keeps the same result here (c at distance 0). Use this when an
+AOE is rooted at a tile/explosion point, not an entity.
+
+The trailing for-loop is the headline composition pattern: damage
+every poisoned entity by 3 in one line, via `var_set` /
+`var_get` (the runtime-path var accessors needed because `eid`
+is a loop variable). After: b.hp = 27, c.hp = 27, others
+unchanged.
+
+
+SCENARIO 253 — eval reports affected entities for side-effect formulas
+-----------------------------------------------------------------------
+
+!match new mintro5 AffectedOut 12 12
+!match use mintro5
+!ent add wizard Wizard 30 5 5 10
+!ent set_var wizard team blue
+!ent set_var wizard max_hp 100
+!ent add gob1 Gob1 20 5 6 5
+!ent set_var gob1 team red
+!ent set_var gob1 max_hp 100
+!ent add gob2 Gob2 25 6 5 4
+!ent set_var gob2 team red
+!ent set_var gob2 max_hp 100
+!ent add gob3 Gob3 30 4 5 3
+!ent set_var gob3 team red
+!ent set_var gob3 max_hp 100
+!eval --as wizard "for eid in entities_within(self, 2, 'square_radius_distance', 'hostile'): entity[eid].hp = entity[eid].hp - 7"
+!eval --as wizard "entity[gob1].hp = entity[gob1].hp - 1"
+!eval --as wizard "status_add(self, 'casting')"
+!eval "entity[wizard].hp"
+!eval "entity[wizard].max_hp + 0"
+
+Expected: A formula that mutates entity vars or status now
+reports "Affected N entit(y|ies): a, b, c" instead of the
+confusing "= None" that a trailing assignment naturally produces.
+
+The first eval (the user's exact reported case) damages three
+hostiles in a loop; the trailing assignment makes the return
+value None, but the engine tracked the three writes and the
+command-layer summary reports "Affected 3 entities: `gob1`,
+`gob2`, `gob3`". A single-target side-effect eval reports
+"Affected 1 entity: `gob1`" (singular form).
+
+When the formula DOES return a value, that value wins — the
+"Affected" report only fires when the result is None AND at
+least one entity was mutated. So `status_add(self, 'casting')`
+prints `= \`True\`` (the bool the call returned), even though
+status_add affected an entity under the hood. `entity[wizard].hp`
+prints `= \`30\`` and `max_hp + 0` prints its arithmetic result
+the same way they always have. Use a trailing expression in a
+formula to get its value; omit one to get the affected-entities
+summary.
+
+
+SCENARIO 254 — Composition: data-driven debuff purge
+-----------------------------------------------------
+
+!match new mintro6 Purge 6 6
+!match use mintro6
+!ent add cleric Cleric 30 1 1 10
+!ent set_var cleric team blue
+!ent add ally1 Ally1 30 2 2 9
+!ent set_var ally1 team blue
+!ent status ally1 add poisoned
+!ent status ally1 add bleeding
+!ent status ally1 add blessed
+!ent set_var ally1 'status_meta.poisoned.bad' 1
+!ent set_var ally1 'status_meta.bleeding.bad' 1
+!ent add ally2 Ally2 30 3 3 8
+!ent set_var ally2 team blue
+!ent status ally2 add poisoned
+!ent set_var ally2 'status_meta.poisoned.bad' 1
+!eval --as cleric "for tgt in entities_within(self, 5, 'square_radius_distance', 'ally'):\n    for s in status_names(tgt):\n        if var_has(tgt, 'status_meta.' + s + '.bad'):\n            status_remove(tgt, s)"
+!ent status ally1 list
+!ent status ally2 list
+
+Expected: A "mass debuff purge" passive becomes ~one nested loop
+when both iteration primitives exist. The cleric iterates every
+ally in range; for each, she iterates that ally's active
+statuses; for each, she checks whether the status is flagged as
+"bad" via a convention var (`status_meta.<name>.bad = 1`) and
+removes it if so.
+
+This is the design philosophy in action: the engine doesn't know
+what "bad" means — the GM defines the convention by setting
+`status_meta.<name>.bad`. ally1 had poisoned + bleeding + blessed;
+the bleeding and poisoned were flagged bad → removed; blessed
+was not flagged → kept. ally2 had only poisoned (flagged bad)
+→ removed. Final ally1: blessed only. ally2: (none).
+
+(The formula uses the multi-line `\n` form because Python doesn't
+allow `for x in a: for y in b: ...` on a single physical line —
+the SCENARIO file's `\n` escape is interpreted by the harness
+the same way Discord/CLI receive real newlines.)

@@ -388,9 +388,13 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "diagonal movement, or vice versa."
         ),
     },
-    # OPTIONS THAT ARE NOT YET IMPLEMENTED (examples for future)
-    ##UI rules:
-    ## Entity line formatting (shown in !state listings, turn order rows)
+    # ---- UI / display templates ----
+    # These rules drive !list and !ent info rendering — see
+    # vtt_commands._entity_line / _entity_card. Template syntax:
+    # {key} substitutes a value (missing -> "<?key?>" sentinel),
+    # {?key?}...{/?} conditionally renders the inner only when the key
+    # is present and truthy. Dotted paths supported. Scenarios 4-6
+    # cover the templating behavior.
     "entity_line_format": {
         "default": "{name} ({id}): HP: {hp}/{max_hp} X,Y: {x},{y} facing {facing}",
         "schema": {"type": "str"},
@@ -724,9 +728,6 @@ def _default_facing_for(
 
 
 RESERVED_IDS: Set[str] = {"current", "this", "self"}
-
-
-#TODO: flesh it out into a proper system later
 
 
 # -------------------------
@@ -1701,8 +1702,9 @@ class Entity:
     # under keys defined by the GameSystem (defaults: "hp", "max_hp", "initiative")
     vars: Dict[str, Any] = field(default_factory=dict)
 
-#PASSIVES NOT YET TRULY IMPLEMENTED 
-#    #entity-scoped passives
+    # Entity-scoped passives: formulas that fire on a given hook for
+    # this entity specifically. See Passive (defined above) for the
+    # event surface and target/scope filtering semantics.
     passives: Dict[str, Passive] = field(default_factory=dict)
 
     # Entity-scoped clamp overrides. Keyed by the var path being clamped.

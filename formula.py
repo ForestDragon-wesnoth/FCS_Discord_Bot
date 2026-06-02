@@ -79,20 +79,39 @@ Allowed functions:
   Areas:     cells_in_burst, cells_in_line, cells_in_cone  (return lists
              of (x,y) tuples; pair with len() OR iterate with a for-loop)
   Spatial:   entities_within(eid, n, mode, relation),
-             nearest_entity(eid, relation, mode)  (scan alive entities
+             nearest_entity(eid, relation, mode)   (scan alive entities
              relative to a reference; relation = ""/"hostile"/"ally"/
-             "same_team"/"attackable")
+             "same_team"/"attackable"),
+             entities_in_area(x, y, n, mode)   (the coord-rooted twin —
+             scans alive entities around a POINT, not an entity)
+  Match-wide queries (no reference entity; all loopable):
+             all_entities(),
+             entities_with_status(name),
+             entities_with_var(path)
   Teams:     is_same_team, is_hostile, is_part_of_team, is_attackable
   Groups:    group_has, group_size, group_add, group_remove,
-             group_members(name)  (insertion-order id list; loopable)
+             group_members(name)   (insertion-order id list; loopable),
+             entity_groups(eid)   (reverse index: groups containing eid)
   Statuses:  status_has, status_has_path, status_get, status_set,
-             status_del, status_add, status_remove  (Entity.status is a
-             dict-of-dicts: status_get raises on missing, status_del /
-             status_add / status_remove return bool)
+             status_del, status_add, status_remove   (dict-of-dicts:
+             status_get raises on missing, *_add / *_remove / *_del
+             return bool),
+             status_names(eid)   (loopable list of active status names)
+  Vars:      var_keys(eid, path="")   (loopable list of keys at a vars
+             path; "" = top-level var names),
+             var_has(eid, "path"),
+             var_get(eid, "path")      (runtime-path equivalents of
+             var_set(eid, "path", v)    entity[X].path — same semantics,
+             var_del(eid, "path")       but the path is computed at
+                                        runtime so iteration over
+                                        var_keys works)
   Identity:  self_id, current_id  (bare identifiers `self`, `this`,
              `current` also work — bind to ctx.target / ctx.this as
              string ids, or to None when unbound)
-  Tiles:     tile_get, tile_has, tile_set, tile_del, tile_clear
+  Tiles:     tile_get, tile_has, tile_set, tile_del, tile_clear,
+             tile_keys(x, y)   (top-level keys in the tile's data dict)
+  Rules:     rule_get(name)   (read a system rule's effective value;
+                                None for unknown names)
   User-defined: any function defined via `!func def` on the match (see
                 "USER-DEFINED FUNCTIONS" below)
 
@@ -1010,6 +1029,44 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   status_remove(eid, name)            -> bool (True iff removed)
     "status_has", "status_has_path", "status_get",
     "status_set", "status_del", "status_add", "status_remove",
+    # Status-name introspection: status_names(eid) -> list of the active
+    # status names on an entity (insertion order). The companion that
+    # lets a formula iterate WHATEVER statuses exist instead of checking
+    # a hardcoded list (e.g. "purge every debuff", "tick all durations").
+    "status_names",
+    # Var-path introspection + runtime-path accessors. entity[X].path
+    # needs a STATIC path; these take a runtime string path, mirroring
+    # tile_*/status_* exactly, so a formula can read/write a var whose
+    # name it computed (the thing that makes var_keys iteration useful):
+    #   var_keys(eid, path="")        -> list of keys at that vars path
+    #                                    ("" = top-level var names)
+    #   var_has(eid, "path")          -> bool
+    #   var_get(eid, "path")          -> value (raises on missing)
+    #   var_set(eid, "path", value)   -> value (routes through write_var
+    #                                    so var hooks fire, same as
+    #                                    entity[eid].path = value)
+    #   var_del(eid, "path")          -> bool (True iff existed; routes
+    #                                    through remove_var)
+    "var_keys", "var_has", "var_get", "var_set", "var_del",
+    # Tile-key introspection: tile_keys(x, y) -> top-level keys in the
+    # tile's data dict (symmetric companion to tile_get/tile_has).
+    "tile_keys",
+    # Reverse group index: entity_groups(eid) -> names of every group
+    # containing the entity (insertion order over Match.groups).
+    "entity_groups",
+    # Read a game-system rule value from inside a formula. rule_get(name)
+    # -> the rule's effective value, or None if unknown.
+    "rule_get",
+    # Match-wide entity queries (no reference entity; all loopable). Each
+    # returns a list of ALIVE entity ids:
+    #   all_entities()                -> every alive entity, insertion order
+    #   entities_with_status(name)    -> those carrying status `name`
+    #   entities_with_var("path")     -> those for which var_has is True
+    #   entities_in_area(x, y, n, mode) -> those within distance n of the
+    #                                    POINT (x, y) — coord-rooted twin
+    #                                    of entities_within
+    "all_entities", "entities_with_status", "entities_with_var",
+    "entities_in_area",
 )
 
 _ALLOWED_NODES: Tuple[type, ...] = (
@@ -1054,6 +1111,16 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "cells_in_burst",
     "cells_in_line",
     "cells_in_cone",
+    # Introspection / query helpers (PR: introspection primitives). All
+    # return lists, so all are loopable.
+    "status_names",
+    "var_keys",
+    "tile_keys",
+    "entity_groups",
+    "all_entities",
+    "entities_with_status",
+    "entities_with_var",
+    "entities_in_area",
 })
 
 
@@ -1474,6 +1541,27 @@ class FormulaEngine:
         # created per hook fire / command, so this naturally starts at 0
         # for each top-level evaluation.
         self._fn_depth = 0
+        # Entity ids whose vars or status were mutated during the current
+        # top-level evaluation, in first-touch order. Reset at the start
+        # of every eval_program / eval_expression. Surfaced via
+        # `affected_entities` so the !eval command can report
+        # "Affected: a, b, c" for a side-effecting formula that returns
+        # no value (instead of a confusing "= None").
+        self._affected_order: List[str] = []
+        self._affected_set: set = set()
+
+    def _note_affected(self, eid: str) -> None:
+        if eid not in self._affected_set:
+            self._affected_set.add(eid)
+            self._affected_order.append(eid)
+
+    @property
+    def affected_entities(self) -> List[str]:
+        return list(self._affected_order)
+
+    def _reset_affected(self) -> None:
+        self._affected_order = []
+        self._affected_set = set()
 
     # ---- positional-var special-casing ------------------------------------
     # Names of the entity attributes that the formula engine treats as
@@ -1535,8 +1623,9 @@ class FormulaEngine:
                 f"break legal 2D moves past another entity."
             )
         # write_var does the diff + event firing + mutation in one shot.
-        # _ = e.write_var(path, value)  # log lines discarded
         e.write_var(path, value)
+        # Track for the "Affected: a, b, c" command-layer summary.
+        self._note_affected(eid)
         return value
 
     def _namespace(self, ctx: EvalCtx) -> Dict[str, Any]:
@@ -2052,6 +2141,7 @@ class FormulaEngine:
                     cur[k] = {}
                 cur = cur[k]
             cur[keys[-1]] = value
+            self._note_affected(eid)
             return value
 
         def _status_del(eid_t: Any, name: Any, path: Any) -> bool:
@@ -2078,6 +2168,7 @@ class FormulaEngine:
                 if chain[i]:
                     break
                 del chain[i - 1][keys[i - 1]]
+            self._note_affected(eid)
             return True
 
         def _status_add(eid_t: Any, name: Any) -> bool:
@@ -2090,6 +2181,7 @@ class FormulaEngine:
             if name in e.status:
                 return False
             e.status[name] = {}
+            self._note_affected(eid)
             return True
 
         def _status_remove(eid_t: Any, name: Any) -> bool:
@@ -2102,6 +2194,7 @@ class FormulaEngine:
             if name not in e.status:
                 return False
             del e.status[name]
+            self._note_affected(eid)
             return True
 
         ns["status_has"]      = _status_has
@@ -2111,6 +2204,239 @@ class FormulaEngine:
         ns["status_del"]      = _status_del
         ns["status_add"]      = _status_add
         ns["status_remove"]   = _status_remove
+
+        # ---- introspection / runtime-path / query primitives ----
+        # The pattern: entity[X].path needs a STATIC path at AST time.
+        # The runtime-path accessors var_get/var_has/var_set/var_del
+        # parallel status_*/tile_*, taking a string path computed at
+        # runtime — which is what makes `for k in var_keys(self, ""):`
+        # / `var_set(self, k, ...)` actually useful (you can iterate
+        # whatever vars exist and touch them without knowing names).
+        # All ALSO route writes through write_var so var hooks fire,
+        # matching entity[X].path = value semantics exactly.
+
+        engine = self  # capture for _note_affected calls below
+
+        def _resolve_entity(token: Any, fname: str):
+            """Resolve a token to (eid, Entity). Shared validator."""
+            eid = _eid(token)
+            e = match.entities.get(eid)
+            if e is None:
+                raise FormulaError(f"{fname}: unknown entity id '{eid}'.")
+            return eid, e
+
+        def _walk_vars(e, path: str, *, must_exist: bool):
+            """Walk a dotted path into e.vars. Returns the value at the
+            leaf when must_exist is True (raises on missing), or
+            (parent_dict, leaf_key) when must_exist is False — useful
+            for the set/del paths that need the parent reference."""
+            if not isinstance(path, str):
+                raise FormulaError("var path must be a string.")
+            keys = path.split(".") if path else []
+            cur: Any = e.vars
+            for i, k in enumerate(keys):
+                if not isinstance(cur, dict):
+                    where = ".".join(keys[:i])
+                    raise FormulaError(
+                        f"`{e.id}`.{where} is "
+                        f"{type(cur).__name__}, not a dict."
+                    )
+                if k not in cur:
+                    if must_exist:
+                        where = ".".join(keys[:i + 1])
+                        raise FormulaError(
+                            f"`{e.id}` has no var at '{where}'."
+                        )
+                    return None  # caller handles "doesn't exist"
+                cur = cur[k]
+            return cur
+
+        def _var_keys(eid_t: Any, path: Any = "") -> list:
+            """var_keys(eid, path=""): keys at a dotted vars path.
+            Empty path = top-level var names. Non-dict at the path
+            errors (you can't list keys of a scalar). Returns insertion
+            order — formulas iterating this get a stable order."""
+            _, e = _resolve_entity(eid_t, "var_keys")
+            if not isinstance(path, str):
+                raise FormulaError("var_keys(eid, path): path must be a string.")
+            if not path:
+                return list(e.vars.keys())
+            v = _walk_vars(e, path, must_exist=True)
+            if not isinstance(v, dict):
+                raise FormulaError(
+                    f"var_keys(`{e.id}`, '{path}'): not a dict "
+                    f"({type(v).__name__})."
+                )
+            return list(v.keys())
+
+        def _var_has(eid_t: Any, path: Any) -> bool:
+            """var_has(eid, path): True iff the dotted vars path resolves
+            on this entity. Off-grid / nested-into-scalar / missing all
+            return False (no raise)."""
+            if not isinstance(path, str) or not path:
+                raise FormulaError("var_has(eid, path): path must be a non-empty string.")
+            _, e = _resolve_entity(eid_t, "var_has")
+            cur: Any = e.vars
+            for k in path.split("."):
+                if not isinstance(cur, dict) or k not in cur:
+                    return False
+                cur = cur[k]
+            return True
+
+        def _var_get(eid_t: Any, path: Any) -> Any:
+            """var_get(eid, path): runtime-path equivalent of
+            entity[eid].path. Raises on missing path (same semantics as
+            entity[X].path reads)."""
+            if not isinstance(path, str) or not path:
+                raise FormulaError("var_get(eid, path): path must be a non-empty string.")
+            _, e = _resolve_entity(eid_t, "var_get")
+            return _walk_vars(e, path, must_exist=True)
+
+        def _var_set(eid_t: Any, path: Any, value: Any) -> Any:
+            """var_set(eid, path, value): runtime-path equivalent of
+            entity[eid].path = value. Routes through Entity.write_var so
+            var hooks fire — semantically identical to the static-path
+            form, just with a computed path. Returns the written value."""
+            if not isinstance(path, str) or not path:
+                raise FormulaError("var_set(eid, path, value): path must be a non-empty string.")
+            eid, e = _resolve_entity(eid_t, "var_set")
+            # Mirror the positional-axis safety check in _write: x/y
+            # are read-only here too. Reusing the same set keeps the
+            # static and dynamic paths consistent.
+            if path in self._POSITIONAL_PATHS:
+                raise FormulaError(
+                    f"var_set({eid!r}, '{path}', ...): `{path}` is "
+                    f"read-only from formulas. Use `!ent tp` (or, once "
+                    f"available, move_entity from formulas)."
+                )
+            e.write_var(path, value)
+            engine._note_affected(eid)
+            return value
+
+        def _var_del(eid_t: Any, path: Any) -> bool:
+            """var_del(eid, path): runtime-path equivalent of removing
+            a var. Routes through Entity.remove_var so on_var_removed
+            fires. Returns True iff the path existed (and was removed);
+            False if absent (no error, no hook). Vital vars are
+            engine-protected at the remove_var layer."""
+            if not isinstance(path, str) or not path:
+                raise FormulaError("var_del(eid, path): path must be a non-empty string.")
+            eid, e = _resolve_entity(eid_t, "var_del")
+            if not _var_has(eid_t, path):
+                return False
+            try:
+                e.remove_var(path)
+            except VTTError as ex:
+                raise FormulaError(str(ex))
+            engine._note_affected(eid)
+            return True
+
+        ns["var_keys"] = _var_keys
+        ns["var_has"]  = _var_has
+        ns["var_get"]  = _var_get
+        ns["var_set"]  = _var_set
+        ns["var_del"]  = _var_del
+
+        def _status_names(eid_t: Any) -> list:
+            """status_names(eid): names of active statuses, in insertion
+            order. Companion to status_has; lets a formula iterate
+            WHATEVER statuses exist (e.g. 'purge every debuff'),
+            instead of checking hardcoded names."""
+            _, e = _resolve_entity(eid_t, "status_names")
+            return list(e.status.keys())
+        ns["status_names"] = _status_names
+
+        def _tile_keys(x: Any, y: Any) -> list:
+            """tile_keys(x, y): top-level keys in the tile's data dict.
+            Empty list when the tile has no data or is off-grid (no
+            raise — symmetric with tile_has)."""
+            if isinstance(x, bool) or not isinstance(x, int):
+                raise FormulaError(f"tile_keys(x, y): x must be int, got {type(x).__name__}.")
+            if isinstance(y, bool) or not isinstance(y, int):
+                raise FormulaError(f"tile_keys(x, y): y must be int, got {type(y).__name__}.")
+            data = match.tiles.get((x, y))
+            if not isinstance(data, dict):
+                return []
+            return list(data.keys())
+        ns["tile_keys"] = _tile_keys
+
+        def _entity_groups(eid_t: Any) -> list:
+            """entity_groups(eid): names of groups containing this
+            entity, in Match.groups insertion order. The reverse-index
+            companion to group_members."""
+            eid, e = _resolve_entity(eid_t, "entity_groups")
+            return [gname for gname, members in match.groups.items()
+                    if eid in members]
+        ns["entity_groups"] = _entity_groups
+
+        def _rule_get(name: Any) -> Any:
+            """rule_get(name): the effective value of a system rule on
+            this match. Returns None for unknown rules (so formulas can
+            test `rule_get('friendlyfire')` without first checking
+            existence)."""
+            if not isinstance(name, str):
+                raise FormulaError("rule_get(name): name must be a string.")
+            return match.rules.get(name)
+        ns["rule_get"] = _rule_get
+
+        def _all_entities() -> list:
+            """all_entities(): every ALIVE entity id, in
+            match.entities insertion order. The match-wide iteration
+            primitive (no reference entity required)."""
+            return [eid for eid, e in match.entities.items() if e.is_alive]
+        ns["all_entities"] = _all_entities
+
+        def _entities_with_status(name: Any) -> list:
+            """entities_with_status(name): alive entities that carry the
+            named status, insertion order."""
+            if not isinstance(name, str):
+                raise FormulaError("entities_with_status(name): name must be a string.")
+            return [eid for eid, e in match.entities.items()
+                    if e.is_alive and name in e.status]
+        ns["entities_with_status"] = _entities_with_status
+
+        def _entities_with_var(path: Any) -> list:
+            """entities_with_var(path): alive entities for which the
+            dotted vars path resolves. Lets a formula find every
+            "blessed" entity without hardcoding which ones can be."""
+            if not isinstance(path, str) or not path:
+                raise FormulaError("entities_with_var(path): path must be a non-empty string.")
+            keys = path.split(".")
+            out = []
+            for eid, e in match.entities.items():
+                if not e.is_alive:
+                    continue
+                cur: Any = e.vars
+                ok = True
+                for k in keys:
+                    if not isinstance(cur, dict) or k not in cur:
+                        ok = False
+                        break
+                    cur = cur[k]
+                if ok:
+                    out.append(eid)
+            return out
+        ns["entities_with_var"] = _entities_with_var
+
+        def _entities_in_area(x: Any, y: Any, n: Any,
+                              mode: Any = "square_radius_distance") -> list:
+            """entities_in_area(x, y, n, mode): coord-rooted version of
+            entities_within. Returns alive entity ids whose position is
+            within distance n of the POINT (x, y), sorted by
+            (distance, id). Use when the area is centered on a tile
+            (e.g. AOE spell impact) instead of on an entity."""
+            # Validate the same way distance() does — pass through and
+            # let it raise if the args are bad.
+            scored = []
+            for eid, e in match.entities.items():
+                if not e.is_alive:
+                    continue
+                d = _distance(x, y, e.x, e.y, mode)
+                if d <= n:
+                    scored.append((d, eid))
+            scored.sort(key=lambda t: (t[0], t[1]))
+            return [eid for _, eid in scored]
+        ns["entities_in_area"] = _entities_in_area
 
         # User-defined formula functions. Each becomes a Python callable
         # in the namespace. The callable binds its arguments to the
@@ -2247,6 +2573,12 @@ class FormulaEngine:
         return frozenset(funcs.keys())
 
     def eval_expression(self, src: str, ctx: EvalCtx) -> Any:
+        # Fresh per-evaluation accounting so the !eval / passive-runner
+        # caller sees only what THIS formula touched. eval_expression /
+        # eval_program are the two entry points, so resetting here (vs.
+        # in __init__) means a single FormulaEngine instance can be
+        # re-used across multiple evals if a future caller wants.
+        self._reset_affected()
         tree = self._prepare(src, "eval", known_funcs=self._known_funcs())
         code = compile(tree, "<formula>", "eval")
         try:
@@ -2258,6 +2590,7 @@ class FormulaEngine:
 
     def eval_program(self, src: str, ctx: EvalCtx) -> Any:
         """Run statements; if the source ends with an expression, return its value."""
+        self._reset_affected()
         try:
             full = ast.parse(src, mode="exec")
         except SyntaxError as e:
