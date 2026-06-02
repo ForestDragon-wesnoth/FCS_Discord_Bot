@@ -23,6 +23,7 @@ from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, val
 
 import re
 import json
+import random
 
 # ---- Context abstraction -----------------------------------------------------
 class ReplyContext(Protocol):
@@ -662,7 +663,13 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         name = args[1]
         mgr.create_system(name)
-        return await ctx.send(f"Created GameSystem `{name}`.")    
+        return await ctx.send(f"Created GameSystem `{name}`.")
+    if sub in ("delete", "del", "remove", "rm"):
+        if await return_help_if_not_enough_args(ctx, args, 2, "system", "delete"):
+            return
+        name = args[1]
+        mgr.delete_system(name)  # raises VTTError/NotFound on guard failure
+        return await ctx.send(f"Deleted GameSystem `{name}`.")
     if sub == "set":
         if await return_help_if_not_enough_args(ctx, args, 4, "system", "set"):
             return
@@ -705,7 +712,19 @@ registry.annotate_sub("system", "list", usage="!system list", desc="List existin
 registry.annotate_sub("system", "info", usage="!system info <name>", desc="Show a GameSystem's settings.")
 registry.annotate_sub("system", "rules", usage="!system rules", desc="List all available rules, their defaults, their types, and descriptions")
 registry.annotate_sub("system", "new", usage="!system new <name>", desc="Create a GameSystem.")
-registry.annotate_sub("system", "set", usage="!system set <name> <key> <value>", desc="Change a GameSystem setting (booleans/int auto-coerced).")
+registry.annotate_sub(
+    "system", "delete",
+    usage="!system delete <name>",
+    desc=(
+        "Delete a GameSystem (aliases: del/remove/rm). Guarded: the "
+        "system must exist, at least one system must remain, it can't be "
+        "the global default (reassign that first), and no live match may "
+        "still be bound to it (rebind/delete those matches first). "
+        "Per-server/channel default pointers at the deleted system are "
+        "scrubbed and fall back to the global default."
+    ),
+)
+registry.annotate_sub("system", "set", usage="!system set <name> <key> <value>", desc="Change a GameSystem setting (booleans/int auto-coerced). Use \"\" to clear a string rule.")
 registry.annotate_sub("system", "default", usage="!system default <global|server|channel> <name>", desc="Set default GameSystem.")
 
 # ---- group fan-out helpers -------------------------------------------------
@@ -1013,6 +1032,38 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         m._rebuild_turn_order()
         return await ctx.send(f"Renamed `{eid}` to **{new_name}**.")
 
+    # status flags: !ent status <id> <add|remove|clear|list> [flag]
+    if sub == "status":
+        if await return_help_if_not_enough_args(ctx, args, 3, "ent", "status"):
+            return
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        e = m.entities[eid]
+        action = args[2].lower()
+        if action == "list":
+            flags = ", ".join(sorted(e.status)) if e.status else "(none)"
+            return await ctx.send(f"`{eid}` status: {flags}")
+        if action == "clear":
+            n = len(e.status)
+            e.status.clear()
+            return await ctx.send(f"Cleared {n} status flag(s) from `{eid}`.")
+        if action in ("add", "remove", "rm", "del"):
+            if len(args) < 4:
+                return await ctx.send(
+                    f"❌ `!ent status {eid} {action}` needs a flag name."
+                )
+            flag = args[3]
+            if action == "add":
+                e.status.add(flag)
+                return await ctx.send(f"Added status `{flag}` to `{eid}`.")
+            e.status.discard(flag)
+            return await ctx.send(f"Removed status `{flag}` from `{eid}`.")
+        return await ctx.send(
+            f"❌ unknown status action `{action}`. Use add / remove / "
+            f"clear / list."
+        )
+
     # tp (absolute)
     if sub == "tp":#and len(args) >= 4:
         if await return_help_if_not_enough_args(ctx, args, 4, "ent", "tp"):
@@ -1166,34 +1217,70 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(msg)
     # clone
     if sub == "clone":
+        # !ent clone <src> <new_id> <x> <y> [<x> <y> ...]
+        # One coordinate pair clones to a single cell with id <new_id>
+        # (the original behavior). Multiple pairs clone once per cell,
+        # auto-numbering the ids <new_id>1, <new_id>2, ... — handy for
+        # dropping a squad of identical mooks without retyping !ent add.
+        # All-or-nothing: every target cell and every generated id is
+        # validated before any clone is created.
         if await return_help_if_not_enough_args(ctx, args, 5, "ent", "clone"):
             return
-
         src_id = _resolve_eid(m, args[1])
-        new_id = args[2]
-        x, y = int(args[3]), int(args[4])
-
+        new_id_base = args[2]
+        coord_tokens = args[3:]
+        if len(coord_tokens) % 2 != 0:
+            return await ctx.send(
+                "❌ coordinates must come in `x y` pairs."
+            )
+        try:
+            nums = [int(t) for t in coord_tokens]
+        except ValueError:
+            return await ctx.send("❌ coordinates must be integers.")
+        pairs = list(zip(nums[0::2], nums[1::2]))  # [(x1,y1),(x2,y2),...]
         if src_id not in m.entities:
             raise NotFound(f"Entity '{src_id}' not found.")
-        if new_id in m.entities:
-            raise DuplicateId(f"Entity id '{new_id}' already exists.")
-        if not m.in_bounds(x, y):
-            raise OutOfBounds(f"({x},{y}) outside {m.grid_width}x{m.grid_height}")
-        if m.is_occupied(x, y):
-            raise Occupied(f"Cell ({x},{y}) already occupied.")
-
+        single = (len(pairs) == 1)
+        # Build the (id, x, y) plan and validate everything up front.
+        plan: List[Tuple[str, int, int]] = []
+        seen_cells = set()
+        seen_ids = set()
+        for i, (x, y) in enumerate(pairs, start=1):
+            cid = new_id_base if single else f"{new_id_base}{i}"
+            if cid in m.entities or cid in seen_ids:
+                return await ctx.send(
+                    f"❌ entity id `{cid}` already exists (or is "
+                    f"duplicated in this batch)."
+                )
+            if not m.in_bounds(x, y):
+                return await ctx.send(
+                    f"❌ ({x},{y}) outside {m.grid_width}x{m.grid_height}."
+                )
+            if (x, y) in seen_cells or m.is_occupied(x, y):
+                return await ctx.send(
+                    f"❌ cell ({x},{y}) is already occupied (or targeted "
+                    f"twice in this batch)."
+                )
+            seen_ids.add(cid)
+            seen_cells.add((x, y))
+            plan.append((cid, x, y))
         src = m.entities[src_id]
-        payload = src.to_dict()
-        payload.update({"id": new_id, "x": x, "y": y})
-
-        clone = Entity.from_dict(payload)
-        # Use spawn to register/validate; preserve original facing after spawn
-        _, spawn_log = clone.spawn(m, x, y, initiative=src.initiative)
-        clone.facing = src.facing
-
-        msg = f"Cloned `{src_id}` → `{new_id}` at ({x},{y})."
-        if spawn_log:
-            msg += "\n" + "\n".join(spawn_log)
+        logs: List[str] = []
+        for cid, x, y in plan:
+            payload = src.to_dict()
+            payload.update({"id": cid, "x": x, "y": y})
+            clone = Entity.from_dict(payload)
+            _, spawn_log = clone.spawn(m, x, y, initiative=src.initiative)
+            clone.facing = src.facing
+            logs.extend(spawn_log)
+        if single:
+            cid, x, y = plan[0]
+            msg = f"Cloned `{src_id}` → `{cid}` at ({x},{y})."
+        else:
+            placed = ", ".join(f"`{cid}`@({x},{y})" for cid, x, y in plan)
+            msg = f"Cloned `{src_id}` → {len(plan)} copies: {placed}."
+        if logs:
+            msg += "\n" + "\n".join(logs)
         return await ctx.send(msg)
     # set_var
     if sub == "set_var":
@@ -1374,8 +1461,26 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "ent", "clone",
-    usage="!ent clone <id> <new_id> <x> <y>",
-    desc="Create a perfect copy of <id> with new id <new_id> at position (x,y)."
+    usage="!ent clone <id> <new_id> <x> <y> [<x> <y> ...]",
+    desc=(
+        "Copy <id> to one or more cells. With a single x y pair, the copy "
+        "gets id <new_id> (the original behavior). With multiple pairs, "
+        "one copy is made per cell with auto-numbered ids "
+        "<new_id>1, <new_id>2, ... — e.g. `!ent clone goblin mob 5 5 6 6 "
+        "7 7` drops three goblins. All-or-nothing: every target cell must "
+        "be free and every generated id unused, or nothing is cloned."
+    ),
+)
+registry.annotate_sub(
+    "ent", "status",
+    usage="!ent status <id> <add|remove|clear|list> [flag]",
+    desc=(
+        "Manage an entity's status-flag set. `add <flag>` / `remove "
+        "<flag>` toggle a flag, `list` shows the current set, `clear` "
+        "wipes all. Status flags are free-form strings (e.g. stunned, "
+        "prone, blessed) — they feed the skip_turn_statuses rule and any "
+        "passive that checks them."
+    ),
 )
 registry.annotate_sub(
     "ent", "set_var",
@@ -3115,6 +3220,122 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"`{name}` placed at {len(coords)} cell(s): {coords_str}"
         )
 
+    # ---- place_random <template> <count> [overrides...] ----
+    # Scatter `count` instances of a template across random EMPTY cells
+    # (cells with no existing tile data). Entity-occupied cells are still
+    # eligible — tiles and entities coexist. All-or-nothing: if fewer
+    # than `count` empty cells exist, nothing is placed.
+    if sub == "place_random":
+        if await return_help_if_not_enough_args(ctx, args, 3, "tile", "place_random"):
+            return
+        name = args[1]
+        try:
+            count = int(args[2])
+        except ValueError:
+            return await ctx.send("❌ count must be an integer.")
+        if count < 1:
+            return await ctx.send("❌ count must be >= 1.")
+        overrides: Dict[str, Any] = {}
+        for tok in args[3:]:
+            if "=" not in tok:
+                return await ctx.send(f"❌ override `{tok}` must be `key=value`.")
+            k, v = tok.split("=", 1)
+            overrides[k] = _parse_scalar(v)
+        if name not in m.tile_templates:
+            return await ctx.send(f"❌ template `{name}` not found.")
+        # Empty = in-bounds cell with no existing tile data.
+        empty = [
+            (x, y)
+            for x in range(1, m.grid_width + 1)
+            for y in range(1, m.grid_height + 1)
+            if (x, y) not in m.tiles
+        ]
+        if len(empty) < count:
+            return await ctx.send(
+                f"❌ only {len(empty)} empty cell(s) available; cannot "
+                f"place {count}. (place_random fills cells with no "
+                f"existing tile data.)"
+            )
+        chosen = random.sample(empty, count)
+        for px, py in chosen:
+            m.place_tile_template(name, px, py, overrides=overrides or None)
+        chosen.sort()
+        coords_str = ", ".join(f"({x},{y})" for x, y in chosen)
+        msg = f"Placed template `{name}` at {count} random cell(s): {coords_str}."
+        if overrides:
+            override_str = ", ".join(f"{k}={v!r}" for k, v in overrides.items())
+            msg = msg + f" Overrides: {override_str}."
+        return await ctx.send(msg)
+
+    # ---- fill_pattern <x> <y> <legend> <row> [<row> ...] ----
+    # Paint a multi-row ASCII stencil. `legend` maps single characters to
+    # template names (e.g. "#=wall,~=water"); each row string places one
+    # template per char at (x + col, y + row_index). Characters NOT in the
+    # legend are skipped (left untouched) — that's how you punch holes,
+    # conventionally with '.'. All-or-nothing on both validation fronts:
+    # every legend template must exist and every non-skip cell must be
+    # in-bounds before anything is placed.
+    if sub == "fill_pattern":
+        if await return_help_if_not_enough_args(ctx, args, 5, "tile", "fill_pattern"):
+            return
+        try:
+            ax = int(args[1]); ay = int(args[2])
+        except ValueError:
+            return await ctx.send("❌ expected integer anchor x and y.")
+        legend_token = args[3]
+        rows = args[4:]
+        # Parse legend: comma-separated char=template pairs.
+        legend: Dict[str, str] = {}
+        for pair in legend_token.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                return await ctx.send(
+                    f"❌ legend entry `{pair}` must be `char=template`."
+                )
+            ch, tname = pair.split("=", 1)
+            if len(ch) != 1:
+                return await ctx.send(
+                    f"❌ legend key `{ch}` must be exactly one character."
+                )
+            if tname not in m.tile_templates:
+                return await ctx.send(f"❌ template `{tname}` not found.")
+            legend[ch] = tname
+        if not legend:
+            return await ctx.send(
+                "❌ legend is empty; provide at least one `char=template`."
+            )
+        # Collect the placements and bounds-check every non-skip cell first.
+        placements: List[Tuple[int, int, str]] = []
+        for row_idx, row in enumerate(rows):
+            for col_idx, ch in enumerate(row):
+                if ch not in legend:
+                    continue  # skip char (hole)
+                px = ax + col_idx
+                py = ay + row_idx
+                if not m.in_bounds(px, py):
+                    return await ctx.send(
+                        f"❌ pattern cell ({px},{py}) is outside the "
+                        f"{m.grid_width}x{m.grid_height} grid."
+                    )
+                placements.append((px, py, legend[ch]))
+        if not placements:
+            return await ctx.send(
+                "❌ pattern placed nothing (all characters were skips or "
+                "the rows were empty)."
+            )
+        for px, py, tname in placements:
+            m.place_tile_template(tname, px, py)
+        # Summarize per-template counts.
+        from collections import Counter
+        counts = Counter(t for _, _, t in placements)
+        summary = ", ".join(f"{c}× `{t}`" for t, c in sorted(counts.items()))
+        return await ctx.send(
+            f"Filled pattern at anchor ({ax},{ay}): {len(placements)} "
+            f"cell(s) — {summary}."
+        )
+
     title, body = registry.help_for(["tile"])
     return await ctx.send(f"**{title}**\n{body}")
 
@@ -3246,6 +3467,36 @@ registry.annotate_sub(
         "ack when zero instances exist; errors loudly if the template "
         "name isn't defined (treated as a typo since a missing-name "
         "search trivially has zero results)."
+    ),
+)
+registry.annotate_sub(
+    "tile", "place_random",
+    usage="!tile place_random <template> <count> [key=value ...]",
+    desc=(
+        "Scatter `count` instances of a template across random EMPTY "
+        "cells (cells with no existing tile data; entity-occupied cells "
+        "are still eligible since tiles and entities coexist). "
+        "All-or-nothing: if fewer than `count` empty cells exist, "
+        "nothing is placed and the command reports how many were "
+        "available. Optional `key=value` overrides apply to every "
+        "placed instance, same as `!tile place`. The chosen cells are "
+        "echoed so you can see where they landed."
+    ),
+)
+registry.annotate_sub(
+    "tile", "fill_pattern",
+    usage='!tile fill_pattern <x> <y> <legend> <row> [<row> ...]',
+    desc=(
+        "Paint a multi-row ASCII stencil with the top-left at (x, y). "
+        "`legend` maps single characters to templates, comma-separated: "
+        '`"#=wall,~=water"`. Each following row string places one '
+        "template per character at (x + column, y + row). Characters "
+        "NOT in the legend are skipped (left untouched) — conventionally "
+        "'.' is used to punch holes. Example: "
+        '`!tile fill_pattern 2 2 "#=wall,~=water" "##~" "#.~" "~~~"` '
+        "paints a 3x3 block. All-or-nothing: every legend template must "
+        "exist and every non-skip cell must be in-bounds before any "
+        "tile is placed."
     ),
 )
 
@@ -3410,19 +3661,33 @@ registry.annotate_sub(
 
 @registry.command(
     "eval",
-    usage='!eval "<formula>"',
+    usage='!eval [--as <eid>] "<formula>"',
     desc=("Evaluate a formula against the active match (for testing). "
-          "`this` = current-turn entity; `self` is unbound here. "
-          "Supports assignments and multi-statement bodies; if the source ends with "
-          "an expression, its value is returned. Quote the whole formula to preserve spaces."),
+          "`this` = current-turn entity. By default `self` is unbound; "
+          "pass `--as <eid>` as the first two args to bind `self` (and "
+          "entity[self]) to that entity, so you can test passive bodies "
+          "interactively. Supports assignments and multi-statement "
+          "bodies; if the source ends with an expression, its value is "
+          "returned. Quote the whole formula to preserve spaces."),
 )
 async def eval_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
         title, body = registry.help_for(["eval"])
         return await ctx.send(f"**{title}**\n{body}")
     m = active_match(mgr, ctx)
+    # Optional `--as <eid>` prefix binds `self` for the evaluation, so a
+    # GM can test a passive body (which references entity[self]) without
+    # actually attaching it to an entity and advancing a turn.
+    self_id = None
+    if args and args[0] == "--as":
+        if len(args) < 3:
+            return await ctx.send("❌ `--as` needs an entity id and a formula.")
+        self_id = _resolve_eid(m, args[1])
+        if self_id not in m.entities:
+            raise NotFound(f"Entity '{self_id}' not found.")
+        args = args[2:]
     src = " ".join(args)  # rejoin in case shlex split on internal spaces
-    eval_ctx = EvalCtx(this=m.current_entity_id(), target=None)
+    eval_ctx = EvalCtx(this=m.current_entity_id(), target=self_id)
     val = FormulaEngine(m).eval_program(src, eval_ctx)
     return await ctx.send(f"= `{val!r}`")
 
