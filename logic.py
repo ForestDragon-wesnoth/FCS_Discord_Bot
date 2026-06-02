@@ -295,20 +295,57 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "changes are deferrable."
         ),
     },
-    "skip_turn_statuses": {
+    # Status auto-tick. Each status the engine knows about is just a
+    # named dict on Entity.status — there is no hardcoded "remaining"
+    # field or auto-decay. Instead the GM configures a tick:
+    #   status_tick_when     selects when (or never) the tick fires
+    #   status_tick_formula  is the GM-defined body that runs once per
+    #                        (entity, status) at that time
+    # The formula has the usual bindings (entity[self] = bearing
+    # entity, this = current_entity_id()) PLUS `status_name` bound to
+    # the status being ticked. Read/write status data via the status_*
+    # formula functions (status_get / status_set / status_has /
+    # status_remove / ...). A typical "tick a remaining counter and
+    # auto-clear at 0" formula:
+    #   if status_has_path(self, status_name, "remaining"):
+    #       status_set(self, status_name, "remaining",
+    #                  status_get(self, status_name, "remaining") - 1)
+    #       if status_get(self, status_name, "remaining") <= 0:
+    #           status_remove(self, status_name)
+    "status_tick_when": {
+        "default": "never",
+        "schema": {
+            "type": "enum",
+            "choices": ["never", "turn_start", "turn_end",
+                        "round_start", "round_end"],
+        },
+        "desc": (
+            "When the status_tick_formula fires. 'never' (default) "
+            "disables ticking entirely. 'turn_start' / 'turn_end' fire "
+            "once per status on the entity whose turn is starting / "
+            "ending; 'round_start' / 'round_end' fire once per status "
+            "across every entity in turn order. Empty / unset status "
+            "dicts on an entity simply contribute no ticks. Tile-hook "
+            "ordering applies: round-end ticks fire AFTER the "
+            "on_round_end hook, round-start ticks BEFORE on_round_start."
+        ),
+    },
+    "status_tick_formula": {
         "default": "",
         "schema": {"type": "str"},
         "desc": (
-            "Comma-separated list of status flags that cause an entity to "
-            "be SKIPPED when its turn would come up (e.g. "
-            "'stunned,unconscious,frozen'). Empty (default) means no "
-            "status skips turns. Matching is against Entity.status (the "
-            "flags set via !ent status). When next_turn lands on an "
-            "entity carrying any listed status, on_turn_start does NOT "
-            "fire for it; the turn advances to the next eligible entity "
-            "(a 'skipped turn' note is logged). A round whose every "
-            "remaining entity is skippable still advances normally (no "
-            "infinite loop) — the round simply passes."
+            "Formula body run once per (entity, status) at the time "
+            "specified by status_tick_when. Empty (default) is a no-op "
+            "even if status_tick_when is set. Context bindings: "
+            "entity[self] = the bearing entity, this = "
+            "current_entity_id(), status_name = the status being "
+            "ticked (as a string). Use the status_* formula functions "
+            "to read/write the status's data. A status_remove call "
+            "during the tick safely removes the current status without "
+            "breaking the iteration (the engine snapshots the per-"
+            "entity status name list before running). Errors in the "
+            "formula are logged with a ⚠️ marker but don't crash the "
+            "tick — sibling statuses keep ticking."
         ),
     },
     # Spawning / facing
@@ -417,6 +454,19 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "FormulaError instead of blowing Python's stack. Default 64 is "
             "ample for legitimate composition/recursion; hitting it almost "
             "always means an unbounded recursive function."
+        ),
+    },
+    "formula_loop_limit": {
+        "default": 10000,
+        "schema": {"type": "int"},
+        "desc": (
+            "Maximum total iterations across all for-loops in a single "
+            "formula evaluation. Loops over entities_within / "
+            "cells_in_burst / etc. are bounded so a runaway "
+            "loop-within-a-loop can't hang the bot. Default 10000 is "
+            "ample for any realistic spell area; hitting it likely means "
+            "an O(n²) pattern on a large board. Each iteration of any "
+            "for-loop counts toward the total."
         ),
     },
     "random_seed": {
@@ -1599,6 +1649,29 @@ class GameSystem:
 # Entity
 # -------------------------
 
+def _coerce_status_dict(raw: Any) -> Dict[str, Dict[str, Any]]:
+    """Normalize a serialized `status` field into the dict-of-dicts shape.
+
+    The status field is `Dict[str, Dict[str, Any]]` — each flag name
+    maps to its own data dict. Serializers emit that shape directly,
+    but we accept a couple of equivalent inputs for robustness:
+      - dict           -> keep as-is, ensuring each value is a dict
+      - list of names  -> {name: {} for name in list}  (each flag
+                          becomes a status with no data)
+      - anything else  -> {}  (silently coerce to empty)
+    """
+    if isinstance(raw, dict):
+        out: Dict[str, Dict[str, Any]] = {}
+        for k, v in raw.items():
+            if not isinstance(k, str):
+                continue
+            out[k] = dict(v) if isinstance(v, dict) else {}
+        return out
+    if isinstance(raw, (list, tuple, set)):
+        return {str(n): {} for n in raw if isinstance(n, str)}
+    return {}
+
+
 @dataclass
 class Entity:
     name: str
@@ -1609,7 +1682,20 @@ class Entity:
     # (default "team"), same as hp/max_hp/initiative. Read/write goes
     # through the team property pair below so external callers using
     # e.team still work — direct vars[team_var] access is also fine.
-    status: Set[str] = field(default_factory=set)
+    # Status flags carry their own data dicts (the "what X does is stored
+    # in X" design rule). A status like "stunned" might hold {"skips_turn":
+    # True, "remaining": 3}; "poisoned" might hold {"damage": 5,
+    # "remaining": 3}. The data shape is GM-defined — the engine only
+    # knows TWO conventions:
+    #   skips_turn (bool)  -> if True, the bearer is skipped when their
+    #                          turn comes up (see Match._skip_to_eligible).
+    #                          Absent / False means a normal turn.
+    # Everything else is GM data, accessed via the status_* formula
+    # functions (status_get / status_set / status_has / status_remove /
+    # ...). Auto-decay of a "remaining" counter (or any field the GM
+    # chooses) is GM-configurable via the status_tick_when /
+    # status_tick_formula rules — there is NO hardcoded auto-decay.
+    status: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     # structured variable bag — hp, max_hp, and initiative now live HERE
     # under keys defined by the GameSystem (defaults: "hp", "max_hp", "initiative")
@@ -2329,7 +2415,7 @@ class Entity:
             "x": self.x,
             "y": self.y,
             "id": self.id,
-            "status": list(self.status),
+            "status": copy.deepcopy(self.status),
             "vars": dict(self.vars),
             "passives": {pid: p.to_dict() for pid, p in self.passives.items()},
             "clamps": {path: c.to_dict() for path, c in self.clamps.items()},
@@ -2343,7 +2429,10 @@ class Entity:
             x=int(data["x"]),
             y=int(data["y"]),
             id=str(data["id"]),
-            status=set(data.get("status", [])),
+            # status is now dict-per-flag; support both shapes so saves
+            # written by clones via Entity.to_dict (the common path) load
+            # cleanly. Anything else is treated as an empty status set.
+            status=_coerce_status_dict(data.get("status")),
             vars=dict(data.get("vars", {})),
             facing=data.get("facing", "up"),
         )
@@ -3048,6 +3137,7 @@ class Match:
         if not self.round_started:
             self.round_started = True
             log.extend(self.fire_hook("on_round_start"))
+            log.extend(self.fire_status_tick("round_start"))
             # Autosave: round start happens after on_round_start hooks
             # so that restoring the snapshot gives the players the
             # state they would have seen as the round began (with any
@@ -3059,6 +3149,7 @@ class Match:
             cur = self.turn_order[self.active_index]
             if eligible:
                 log.extend(self.fire_hook("on_turn_start", target_ids=[cur]))
+                log.extend(self.fire_status_tick("turn_start"))
             else:
                 log.append(
                     "⏭️ every entity is skippable; the round passes "
@@ -3069,6 +3160,7 @@ class Match:
 
         # Normal transition.
         cur = self.turn_order[self.active_index]
+        log.extend(self.fire_status_tick("turn_end"))
         log.extend(self.fire_hook("on_turn_end", target_ids=[cur]))
         self._advance_index(log)
         # Skip over any entity carrying a skip-status flag.
@@ -3076,6 +3168,7 @@ class Match:
         new_cur = self.turn_order[self.active_index]
         if eligible:
             log.extend(self.fire_hook("on_turn_start", target_ids=[new_cur]))
+            log.extend(self.fire_status_tick("turn_start"))
         else:
             log.append(
                 "⏭️ every entity is skippable; the round passes "
@@ -3086,14 +3179,16 @@ class Match:
 
     def _advance_index(self, log: List[str]) -> None:
         """Advance active_index by one, handling round wrap: fire
-        on_round_end, flush any deferred turn-order rebuild, bump the
-        round number, fire on_round_start, and autosave the round.
-        Factored out of next_turn so the skip-status loop can reuse the
-        exact same wrap bookkeeping for each cell it steps over."""
+        on_round_end + status_tick(round_end), flush any deferred
+        turn-order rebuild, bump the round number, fire on_round_start
+        + status_tick(round_start), and autosave the round. Factored
+        out of next_turn so the skip-status loop can reuse the exact
+        same wrap bookkeeping for each cell it steps over."""
         new_index = (self.active_index + 1) % len(self.turn_order)
         wrapped = (new_index == 0)
         if wrapped:
             log.extend(self.fire_hook("on_round_end"))
+            log.extend(self.fire_status_tick("round_end"))
             # Flush any deferred turn-order rebuild between on_round_end
             # (ran against the OLD order) and on_round_start (sees the
             # NEW order). Round-wrap naturally restarts at the top.
@@ -3107,34 +3202,39 @@ class Match:
         if wrapped:
             self.round_number += 1
             log.extend(self.fire_hook("on_round_start"))
+            log.extend(self.fire_status_tick("round_start"))
             self.history.record_round(self)
 
-    def _skip_turn_status_set(self) -> set:
-        """Parse the skip_turn_statuses rule into a set of flag names.
-        Empty set when the rule is unset (the common case)."""
-        raw = self.rules.get("skip_turn_statuses", "")
-        if not raw:
-            return set()
-        return {s.strip() for s in raw.split(",") if s.strip()}
+    def _skipping_statuses(self, e: "Entity") -> List[str]:
+        """Names of `e`'s statuses whose data dict carries
+        `skips_turn: True`. Returns [] when no status causes a skip.
+        Each status defines its own behavior — there is no global
+        skip-list rule. The boolean key is `skips_turn`."""
+        out = []
+        for name, data in e.status.items():
+            if isinstance(data, dict) and bool(data.get("skips_turn", False)):
+                out.append(name)
+        return out
 
     def _skip_to_eligible(self, log: List[str]) -> bool:
         """Starting from the current active_index, advance past any
-        entity that carries a skip-status flag. Returns True if an
-        eligible (non-skippable) entity is now current, or False if a
-        full cycle found every entity skippable (the caller then passes
-        the round without firing on_turn_start). Bounded to one full
-        turn-order cycle so an all-skippable table can't loop forever."""
-        skip_set = self._skip_turn_status_set()
-        if not skip_set:
-            return True
+        entity carrying a status whose data has `skips_turn=True`.
+        Returns True if an eligible (non-skippable) entity is now
+        current, or False if a full cycle found every entity skippable
+        (the caller then passes the round without firing on_turn_start).
+        Bounded to one full turn-order cycle so an all-skippable table
+        can't loop forever."""
         n = len(self.turn_order)
         checked = 0
         while checked < n:
             cur = self.turn_order[self.active_index]
             e = self.entities.get(cur)
-            if e is None or not (e.status & skip_set):
+            if e is None:
                 return True
-            matched = ", ".join(sorted(e.status & skip_set))
+            skipping = self._skipping_statuses(e)
+            if not skipping:
+                return True
+            matched = ", ".join(sorted(skipping))
             log.append(f"⏭️ `{cur}`'s turn skipped ({matched}).")
             self._advance_index(log)
             checked += 1
@@ -3261,6 +3361,85 @@ class Match:
         return [
             f"⚙️ tile ({x},{y}) hook `{when}` fired for `{entity_id}`"
         ]
+
+    def fire_status_tick(self, when: str) -> List[str]:
+        """Run status_tick_formula once for every status on every
+        target entity, when the active status_tick_when rule equals
+        `when`. Returns accumulated log lines (one per fire, one
+        ⚠️ per formula failure). No-op when the rule disabled or the
+        formula is empty.
+
+        `when` should be one of "turn_start", "turn_end", "round_start",
+        "round_end" — match what next_turn calls with.
+
+        Targeting:
+          turn_start / turn_end : the entity whose turn is starting /
+                                  ending (active_index at call time)
+          round_start / round_end: every entity in turn_order
+
+        Per (entity, status) the formula runs with:
+          self        = the bearing entity
+          this        = current_entity_id()
+          status_name = the status (a string)
+
+        The per-entity status name list is SNAPSHOT before iterating, so
+        a status_remove call inside the formula safely removes the
+        current status (or any other) without breaking iteration. A
+        formula error on one status logs a ⚠️ line and the next status
+        still ticks.
+        """
+        configured = self.rules.get("status_tick_when", "never")
+        if configured != when:
+            return []
+        src = self.rules.get("status_tick_formula", "")
+        if not isinstance(src, str) or not src.strip():
+            return []
+        # Pick targets to iterate.
+        if when in ("turn_start", "turn_end"):
+            if not self.turn_order:
+                return []
+            cur = self.turn_order[self.active_index] if (
+                0 <= self.active_index < len(self.turn_order)
+            ) else None
+            if cur is None:
+                return []
+            targets = [cur]
+        else:  # round_start / round_end
+            targets = list(self.turn_order)
+
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        engine = FormulaEngine(self)
+        this_id = self.current_entity_id()
+        log: List[str] = []
+        for eid in targets:
+            e = self.entities.get(eid)
+            if e is None:
+                continue
+            # Snapshot status names so status_remove during the tick
+            # doesn't break iteration.
+            for sname in list(e.status.keys()):
+                # Re-check existence in case a previous tick on this
+                # entity removed `sname`.
+                if sname not in e.status:
+                    continue
+                ctx = EvalCtx(
+                    this=this_id, target=eid,
+                    extras={"status_name": sname},
+                )
+                try:
+                    engine.eval_program(src, ctx)
+                except FormulaError as ex:
+                    log.append(
+                        f"⚠️ status_tick on `{eid}.{sname}` "
+                        f"({when}) FAILED: {ex}"
+                    )
+                except Exception as ex:
+                    log.append(
+                        f"⚠️ status_tick on `{eid}.{sname}` "
+                        f"({when}) CRASHED: "
+                        f"{type(ex).__name__}: {ex}"
+                    )
+        return log
 
     def fire_hook(self, when: str, *, target_ids: Optional[List[str]] = None) -> List[str]:
         """

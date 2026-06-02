@@ -860,9 +860,11 @@ SCENARIO 40 — Entity status flags
 !ent status hero remove poisoned
 !ent info hero
 
-Expected: Status flags are a set of strings on the entity. The info card
-shows them (or the entity_info_format template's status section). After
-removing "poisoned", only "bleeding" remains.
+Expected: Statuses are entity-owned dicts (each status name maps to
+its own data dict — see scenarios 241+ for the data-carrying side).
+At minimum, adding "poisoned" and "bleeding" gives an entity two
+statuses with empty data, which the info card displays as the
+names. After removing "poisoned", only "bleeding" remains.
 
 
 SCENARIO 41 — Entity team assignment
@@ -5449,8 +5451,8 @@ target cell already occupied (5,5 is taken by minion1) is rejected
 before any copy in that batch is made.
 
 
-SCENARIO 237 — !ent status: add / remove / list / clear flags
---------------------------------------------------------------
+SCENARIO 237 — !ent status: add / remove / list / clear
+--------------------------------------------------------
 
 !match new mstat1 StatusCmd 6 6
 !match use mstat1
@@ -5464,14 +5466,14 @@ SCENARIO 237 — !ent status: add / remove / list / clear flags
 !ent status hero clear
 !ent status hero list
 
-Expected: `!ent status <id> <action> [flag]` manages the entity's
-status flag set (previously there was no command to write it). `add`
-inserts a flag, `remove` discards one, `list` shows the current set
-(sorted, "(none)" when empty), and `clear` wipes them all. After
-adding stunned + poisoned, list shows "poisoned, stunned"; after
-removing poisoned, just "stunned"; after clear, "(none)". This is
-the command that backs status-flag scenarios like 40 and feeds the
-skip_turn_statuses rule (237's flags are what 240 keys off).
+Expected: `!ent status <id> <action> [name]` manages the entity's
+statuses. `add` creates a status with no data, `remove` drops it,
+`list` shows them all (sorted, "(none)" when empty), `clear` wipes
+the lot. After adding stunned + poisoned, list shows
+"poisoned (no data), stunned (no data)"; after removing poisoned,
+just stunned; after clear, "(none)". Statuses can also carry data —
+see SCENARIO 241 for the set/del/info subcommands and SCENARIO 242
+for the per-status `skips_turn` field.
 
 
 SCENARIO 238 — !eval --as binds self for testing passive bodies
@@ -5521,33 +5523,33 @@ match msys1 is created ON the homebrew system specifically to
 exercise the in-use guard.)
 
 
-SCENARIO 240 — skip_turn_statuses: stunned entities are skipped
----------------------------------------------------------------
+SCENARIO 240 — Status skips_turn: per-status, not a gamerule list
+-----------------------------------------------------------------
 
-!system set default skip_turn_statuses stunned,unconscious
 !match new mskip1 SkipTurn 8 8
 !match use mskip1
 !ent add alice Alice 30 1 1 30
 !ent add bob Bob 30 2 2 20
 !ent add carol Carol 30 3 3 10
 !ent status bob add stunned
+!ent status bob set stunned skips_turn true
 !turn next
 !turn next
 !turn next
-!system set default skip_turn_statuses ""
 
-Expected: The `skip_turn_statuses` rule lists status flags (comma-
-separated) that cause an entity to be skipped when its turn comes up.
-With "stunned,unconscious" set and bob carrying "stunned", the turn
-order alice(30), bob(20), carol(10) effectively skips bob. The first
-`!turn next` opens the round on alice. The second advances past
-alice — would land on bob, but bob is stunned, so it skips to carol
-(a "⏭️ `bob`'s turn skipped (stunned)" line is logged and bob's
-on_turn_start does NOT fire). The third wraps the round back to
-alice. A round where every remaining entity is skippable still
-advances (the loop is bounded to one full cycle — no infinite loop)
-and logs that the round passes. The trailing empty-value set restores
-the default (no skips) so later scenarios are unaffected.
+Expected: "What X does" is stored inside X — there is no
+skip-list gamerule any more. A status causes its bearer's turn to
+be skipped when the status's data dict carries `skips_turn: True`.
+With Bob carrying stunned ({skips_turn: True}) and the order
+alice(30), bob(20), carol(10), the first `!turn next` opens on
+alice. The second advances past alice — would land on bob, but
+bob's stunned.skips_turn is True, so it skips to carol (a
+"⏭️ `bob`'s turn skipped (stunned)" line is logged and bob's
+on_turn_start does NOT fire). The third wraps to alice. A status
+WITHOUT skips_turn (or with skips_turn explicitly False) doesn't
+skip — adding "poisoned" to bob wouldn't matter unless poisoned
+also had skips_turn:true. SCENARIO 245 covers auto-clear of a
+skips_turn status via the status_tick mechanism.
 SCENARIO 232 — Dynamic entity[<expr>]: literal still works, expressions resolve
 --------------------------------------------------------------------------------
 
@@ -5723,3 +5725,291 @@ stencil at (7,7) that would spill off the 8x8 grid fails with an
 out-of-bounds cell error (placing nothing); a legend referencing
 an undefined template (`nope`) fails up front; a multi-character
 legend key (`##`) is rejected.
+
+
+SCENARIO 241 — Status data: !ent status set / del / info
+---------------------------------------------------------
+
+!match new mst1 StatusData 6 6
+!match use mst1
+!ent add hero Hero 30 3 3 10
+!ent status hero add stunned
+!ent status hero set stunned skips_turn true
+!ent status hero set stunned remaining 3
+!ent status hero set stunned source.spell "thunder_shock"
+!ent status hero info stunned
+!ent status hero list
+!ent status hero del stunned source.spell
+!ent status hero info stunned
+!ent status hero del stunned remaining
+!ent status hero info stunned
+
+Expected: Statuses carry their own data dicts (the "what X does is
+stored in X" rule). `!ent status hero set stunned skips_turn true`
+stores the literal bool True (case-sensitive: "true" / "false" are
+coerced; "yes" / "no" stay strings). Numeric values like
+`remaining 3` parse as int. Dotted paths like `source.spell
+"thunder_shock"` create intermediate dicts. `info` prints the full
+data as JSON. `list` shows each status's fields inline. `del` with
+a dotted path removes one field and prunes the now-empty parent
+dict (so after `del stunned source.spell`, the `source` subdict is
+gone, not left as `{}`). Removing the LAST field leaves the status
+with no data — `info` reports "(no data)" — but the status itself
+persists until `!ent status hero remove stunned`.
+
+
+SCENARIO 242 — Status data: !ent status remove vs. clear
+---------------------------------------------------------
+
+!match new mst2 StatusRC 6 6
+!match use mst2
+!ent add hero Hero 30 3 3 10
+!ent status hero add stunned
+!ent status hero set stunned remaining 2
+!ent status hero add poisoned
+!ent status hero set poisoned damage 5
+!ent status hero list
+!ent status hero remove stunned
+!ent status hero list
+!ent status hero clear
+!ent status hero list
+
+Expected: `remove <name>` drops one status entirely (data and all);
+`clear` wipes every status. After remove-stunned, only poisoned
+remains (with its damage field intact). After clear, the list is
+"(none)". Removing a status that doesn't exist reports a friendly
+"`hero` has no status `<name>`" line rather than erroring — the
+remove is idempotent. (Removing a status field, vs. removing the
+whole status, is the del vs. remove distinction shown in 241/242.)
+
+
+SCENARIO 243 — status_* formula functions: read, write, branch
+---------------------------------------------------------------
+
+!match new mst3 StatusFn 6 6
+!match use mst3
+!ent add hero Hero 30 3 3 10
+!ent status hero add stunned
+!ent status hero set stunned remaining 5
+!eval --as hero "status_has(self, 'stunned')"
+!eval --as hero "status_has(self, 'absent')"
+!eval --as hero "status_has_path(self, 'stunned', 'remaining')"
+!eval --as hero "status_has_path(self, 'stunned', 'nope')"
+!eval --as hero "status_get(self, 'stunned', 'remaining')"
+!eval --as hero "status_set(self, 'stunned', 'remaining', 99)"
+!eval --as hero "status_get(self, 'stunned', 'remaining')"
+!eval --as hero "status_del(self, 'stunned', 'remaining')"
+!eval --as hero "status_has_path(self, 'stunned', 'remaining')"
+!eval --as hero "status_add(self, 'poisoned')"
+!eval --as hero "status_add(self, 'poisoned')"
+!eval --as hero "status_remove(self, 'poisoned')"
+!eval --as hero "status_remove(self, 'poisoned')"
+
+Expected: The status_* formula functions parallel tile_*:
+`status_has(eid, name)` → bool (status present);
+`status_has_path(eid, name, "path")` → bool (status present AND
+path resolves); `status_get` raises on missing path; `status_set`
+writes (creating intermediates); `status_del` returns True iff the
+path existed; `status_add` returns True only on a fresh insert
+(False if already present); `status_remove` returns True only on
+an actual removal (False if absent). Bare `self` (allowed via the
+new entity-token identifier set) evaluates to the !eval --as
+binding. So the calls thread through:
+- has stunned → True; absent → False
+- has_path remaining → True; nope → False
+- get remaining → 5
+- set remaining 99 → returns 99
+- get remaining → 99
+- del remaining → True
+- has_path remaining → False
+- add poisoned → True (newly added); second call → False (already)
+- remove poisoned → True; second call → False (already gone)
+
+
+SCENARIO 244 — Status auto-tick (round_end): "remaining" decay
+---------------------------------------------------------------
+
+!system set default status_tick_when round_end
+!system set default status_tick_formula "if status_has_path(self, status_name, 'remaining'): status_set(self, status_name, 'remaining', status_get(self, status_name, 'remaining') - 1); status_remove(self, status_name) if status_get(self, status_name, 'remaining') <= 0 else 0"
+!match new mst4 StatusTick 6 6
+!match use mst4
+!ent add alice Alice 30 1 1 30
+!ent add bob Bob 30 2 2 20
+!ent status alice add bleeding
+!ent status alice set bleeding remaining 2
+!ent status bob add poisoned
+!ent status bob set poisoned remaining 3
+!turn next
+!turn next
+!turn next
+!ent status alice list
+!ent status bob list
+!turn next
+!turn next
+!ent status alice list
+!ent status bob list
+!turn next
+!turn next
+!ent status alice list
+!ent status bob list
+!system set default status_tick_when never
+!system set default status_tick_formula ""
+
+Expected: With `status_tick_when=round_end` and the canonical
+decay formula, EACH (entity, status) ticks once per round wrap.
+The formula is GM-defined — there is no hardcoded "remaining"
+field; the formula chooses what to decrement and when to remove.
+
+Initial: alice has bleeding(remaining=2), bob has
+poisoned(remaining=3). Each round_end fires the tick once per
+(entity, status). With turn_order [alice, bob], a round wrap
+happens once every 2 `!turn next` calls (after the initial
+opener). So:
+
+  After 1st `!turn next`: opens R1 (no round_end yet).
+  After 2nd: alice→bob, no wrap. State unchanged.
+  After 3rd: bob→alice WRAP — tick #1 fires:
+    bleeding 2→1, poisoned 3→2.
+  After 4th-5th: another wrap — tick #2 fires:
+    bleeding 1→0 → AUTO-REMOVE, poisoned 2→1.
+  After 6th-7th: another wrap — tick #3 fires:
+    poisoned 1→0 → AUTO-REMOVE.
+
+Final state: both statuses gone. The two trailing `!system set`
+calls restore `never`/`""` so later scenarios run without ticks.
+
+
+SCENARIO 245 — Status auto-tick on a skips_turn status
+-------------------------------------------------------
+
+!system set default status_tick_when round_end
+!system set default status_tick_formula "if status_has_path(self, status_name, 'remaining'): status_set(self, status_name, 'remaining', status_get(self, status_name, 'remaining') - 1); status_remove(self, status_name) if status_get(self, status_name, 'remaining') <= 0 else 0"
+!match new mst5 StatusSkipDecay 6 6
+!match use mst5
+!ent add alice Alice 30 1 1 30
+!ent add bob Bob 30 2 2 20
+!ent status bob add stunned
+!ent status bob set stunned skips_turn true
+!ent status bob set stunned remaining 2
+!turn next
+!ent status bob list
+!turn next
+!ent status bob list
+!turn next
+!ent status bob list
+!system set default status_tick_when never
+!system set default status_tick_formula ""
+
+Expected: skips_turn and the tick decay work together. Bob has
+stunned({skips_turn:true, remaining:2}). On each round wrap the
+tick decrements remaining. When remaining hits 0 the status
+auto-removes — and bob stops being skipped.
+
+Trace:
+  R1 opens on alice. Bob is stunned, so when his turn comes he
+  is skipped (no on_turn_start).
+  Wrap to R2: tick fires. bob.stunned.remaining 2→1.
+  R2 bob.status: stunned(r=1, skips_turn=true). Still skipped.
+  Wrap to R3: tick fires. remaining 1→0 → auto-remove.
+  R3 bob.status: (none). Now bob acts normally; his on_turn_start
+  fires.
+
+This is the headline modularity win: "stunned skips turns AND
+lasts N rounds" is fully described by the status's own data,
+not by external rules.
+
+
+SCENARIO 246 — Formula for-loop over entities_within: AOE damage
+------------------------------------------------------------------
+
+!match new mfor1 ForLoop 10 10
+!match use mfor1
+!ent add wizard Wizard 30 5 5 10
+!ent set_var wizard team blue
+!ent add gob1 Gob1 20 5 6 5
+!ent set_var gob1 team red
+!ent set_var gob1 max_hp 100
+!ent add gob2 Gob2 25 6 5 4
+!ent set_var gob2 team red
+!ent set_var gob2 max_hp 100
+!ent add gob3 Gob3 30 4 5 3
+!ent set_var gob3 team red
+!ent set_var gob3 max_hp 100
+!ent add ally Ally 40 5 4 9
+!ent set_var ally team blue
+!ent set_var ally max_hp 100
+!eval --as wizard "for eid in entities_within(self, 2, 'square_radius_distance', 'hostile'): entity[eid].hp = entity[eid].hp - 7"
+!ent dump gob1
+!ent dump gob2
+!ent dump gob3
+!ent dump ally
+
+Expected: The for-loop over `entities_within(...)` makes "damage
+every adjacent enemy" a one-liner. The wizard at (5,5) sees three
+hostiles (gob1@(5,6), gob2@(6,5), gob3@(4,5)) within distance 2
+plus an ally at (5,4). The relation filter "hostile" keeps only
+the three goblins. The loop body applies -7 hp to each. After:
+gob1.hp = 13, gob2.hp = 18, gob3.hp = 23, ally.hp UNCHANGED at
+40. The dynamic-accessor (PR 20) makes `entity[eid]` resolve at
+runtime to each loop iteration's id; combined with the relation
+filter that's the whole "single-target spell becomes AOE" recipe.
+
+
+SCENARIO 247 — for-loop iterable validation + loop bound
+---------------------------------------------------------
+
+!match new mfor2 ForLimits 10 10
+!match use mfor2
+!ent add hero Hero 30 5 5 10
+!eval "for x in range(5): entity[x].hp = 0"
+!eval "for x in my_list: entity[x].hp = 0"
+!eval "for [a, b] in cells_in_burst(5, 5, 1): tile_set(a, b, 'foo', 1)"
+!tile def new mark
+!system set default formula_loop_limit 5
+!eval "for (cx, cy) in cells_in_burst(5, 5, 3): tile_set(cx, cy, 'foo', 1)"
+!system set default formula_loop_limit 10000
+
+Expected: For-loops are validated up front. The iterable MUST be
+a direct call to one of: entities_within, group_members,
+cells_in_burst, cells_in_line, cells_in_cone. So `range(5)`
+errors with "iterable must be a direct call to one of {...}" and
+`my_list` errors as an unknown identifier. A loop target that's
+neither a single name nor a tuple of names ("for [a, b] in ..."
+uses a List, not Tuple) is also rejected.
+
+The formula_loop_limit rule caps TOTAL iterations across all
+loops in one evaluation. With it set to 5, looping a 7x7=49-cell
+square-radius burst would tick 49 times — the runtime raises
+"formula for-loop iteration limit (5) exceeded" once the 6th
+iteration runs. The default 10000 is restored at the end so
+later scenarios run with the normal cap.
+
+
+SCENARIO 248 — group_members and tuple-unpack for-loop
+-------------------------------------------------------
+
+!match new mfor3 GroupAndCoords 10 10
+!match use mfor3
+!ent add a A 30 1 1 10
+!ent add b B 30 2 2 9
+!ent add c C 30 3 3 8
+!ent group new party
+!ent group add party a b c
+!eval "for eid in group_members('party'): entity[eid].hp = entity[eid].hp - 1"
+!ent dump a
+!ent dump b
+!ent dump c
+!tile def new mark
+!tile def data mark glyph X
+!eval "for (cx, cy) in cells_in_line(2, 2, 5, 2): tile_set(cx, cy, 'marked', 1)"
+!eval "for (cx, cy) in cells_in_burst(7, 7, 1, 'manhattan_distance'): tile_set(cx, cy, 'flame', 1)"
+
+Expected: `group_members(name)` returns the member list in
+insertion order and is loopable. The loop applies -1 hp to every
+party member: a/b/c all drop from 30 to 29. The tuple-unpack form
+`for (cx, cy) in cells_in_*` works on coord-list returns: a line
+from (2,2) to (5,2) marks four cells; a manhattan-burst of radius
+1 at (7,7) marks the diamond {(6,7),(7,6),(7,7),(7,8),(8,7)}.
+The transformer treats cx/cy as dynamic identifiers inside the
+body (PR 20's accessor logic), so they pass straight through as
+runtime values to tile_set.

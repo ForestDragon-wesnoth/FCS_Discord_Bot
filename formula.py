@@ -77,22 +77,42 @@ Allowed functions:
   Random:    random_int, random_string
   Geometry:  distance, angle, direction_to
   Areas:     cells_in_burst, cells_in_line, cells_in_cone  (return lists
-             of (x,y) tuples; pair with len() or, later, for-loops)
+             of (x,y) tuples; pair with len() OR iterate with a for-loop)
   Spatial:   entities_within(eid, n, mode, relation),
              nearest_entity(eid, relation, mode)  (scan alive entities
              relative to a reference; relation = ""/"hostile"/"ally"/
              "same_team"/"attackable")
   Teams:     is_same_team, is_hostile, is_part_of_team, is_attackable
-  Groups:    group_has, group_size, group_add, group_remove
-  Identity:  self_id, current_id
+  Groups:    group_has, group_size, group_add, group_remove,
+             group_members(name)  (insertion-order id list; loopable)
+  Statuses:  status_has, status_has_path, status_get, status_set,
+             status_del, status_add, status_remove  (Entity.status is a
+             dict-of-dicts: status_get raises on missing, status_del /
+             status_add / status_remove return bool)
+  Identity:  self_id, current_id  (bare identifiers `self`, `this`,
+             `current` also work — bind to ctx.target / ctx.this as
+             string ids, or to None when unbound)
   Tiles:     tile_get, tile_has, tile_set, tile_del, tile_clear
   User-defined: any function defined via `!func def` on the match (see
                 "USER-DEFINED FUNCTIONS" below)
 
+For-loops (CONSTRAINED form):
+  for eid in entities_within(self, 3, "square_radius_distance", "hostile"):
+      entity[eid].hp = entity[eid].hp - 5
+  for (cx, cy) in cells_in_burst(5, 5, 1):
+      tile_set(cx, cy, "burned", 1)
+The iterable MUST be a direct call to one of: entities_within,
+group_members, cells_in_burst, cells_in_line, cells_in_cone. The
+target may be a single name (entity id / scalar) or a tuple of
+names (for coord unpacking). Total iterations across all loops in
+one evaluation are bounded by the formula_loop_limit rule
+(default 10000). No `else:`, no break/continue. Loop variables are
+in scope for the body (including as `entity[<var>]` indices).
+
 Everything else is rejected: list comprehensions, lambdas, augmented
 assignment (`+=`), subscripting (other than `entity[X]`), attribute access on
 non-entity values, imports, function definitions, decorators, exception
-handling, loops, with-blocks, etc.
+handling, while-loops, with-blocks, etc.
 
 ================================================================================
 CONDITIONAL FLOW
@@ -967,6 +987,29 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   nearest_entity(eid, relation, mode)      -> single closest id, or
     #                                               "" if none match
     "entities_within", "nearest_entity",
+    # Iterable companion to group_has / group_size: the list of member
+    # ids for a named group, in insertion order. Returns [] when the
+    # group doesn't exist (consistent with group_size returning 0). The
+    # main consumer is the new for-loop:
+    #     for m in group_members("party"):
+    #         entity[m].hp = entity[m].hp + 5
+    "group_members",
+    # Status-data accessors. Statuses are entity-owned dicts:
+    # entity.status[name] = {field: value, ...}. The status_* trio
+    # mirrors tile_* — same dotted-path semantics, same raise-on-
+    # missing for status_get, same bool return for status_has /
+    # status_remove.
+    #   status_has(eid, name)               -> bool (status present)
+    #   status_has_path(eid, name, "path")  -> bool (status present AND
+    #                                          path resolves; False on
+    #                                          either layer missing)
+    #   status_get(eid, name, "path")       -> value (raises on missing)
+    #   status_set(eid, name, "path", v)    -> v   (creates intermediates)
+    #   status_del(eid, name, "path")       -> bool (True iff existed)
+    #   status_add(eid, name)               -> bool (True iff newly added)
+    #   status_remove(eid, name)            -> bool (True iff removed)
+    "status_has", "status_has_path", "status_get",
+    "status_set", "status_del", "status_add", "status_remove",
 )
 
 _ALLOWED_NODES: Tuple[type, ...] = (
@@ -976,7 +1019,13 @@ _ALLOWED_NODES: Tuple[type, ...] = (
     #   If         -> if / elif / else statements (elif is encoded as else: If)
     #   Pass       -> empty bodies, e.g. `if cond: pass`
     #   IfExp      -> ternary  (value_a if cond else value_b)
+    #   For        -> constrained for-loop (see _LOOPABLE_FUNCS and
+    #                  _validate_for). The loop target may be a single
+    #                  Name (entity id / scalar) or a Tuple of Names
+    #                  (coord unpacking, e.g. `for (cx, cy) in
+    #                  cells_in_burst(...)`).
     ast.If, ast.Pass,
+    ast.For, ast.Tuple,
     ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.IfExp, ast.Compare,
     ast.Call, ast.keyword,
     ast.Name, ast.Constant, ast.Load, ast.Store,
@@ -985,6 +1034,27 @@ _ALLOWED_NODES: Tuple[type, ...] = (
     ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
     ast.And, ast.Or,
 )
+
+
+# Functions whose call result is a known list/tuple suitable for a
+# formula for-loop. Keeping this explicit (rather than allowing any
+# call) is a sandbox safety measure: a user-defined function could
+# silently return a non-iterable and a `for` over it would crash at
+# runtime; gating to known list-returning builtins keeps the validation
+# pinned to "this loop can be iterated cheaply".
+#
+# All entries here MUST be functions defined elsewhere in this module
+# (either in _ALLOWED_FUNCS or _MATCH_FUNC_NAMES). They return either
+# string ids (entities_within / group_members) or coordinate tuples
+# (cells_in_*). The for-loop target shape must match: a single Name for
+# the id case, a 2-tuple of Names for the coord case.
+_LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
+    "entities_within",
+    "group_members",
+    "cells_in_burst",
+    "cells_in_line",
+    "cells_in_cone",
+})
 
 
 # --- evaluation context ------------------------------------------------------
@@ -1020,7 +1090,19 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
                         # matters if the hook moves the entity
                         # mid-fire via a future entity-tp formula).
     "tile_y",           # See tile_x.
+    "status_name",      # The status being ticked. Bound only during
+                        # status_tick_formula evaluation (see
+                        # status_tick_when / status_tick_formula rules
+                        # and Match.fire_status_tick); None elsewhere.
 )
+
+# Entity-id sentinel identifiers. Inside `entity[X]` these get
+# special-cased by the transformer; as bare identifiers they bind to
+# the actual entity id string at namespace build time (or to None when
+# unbound). Letting them appear bare lets a formula write
+# `status_set(self, status_name, "remaining", 0)` instead of the more
+# verbose `status_set(self_id(), ...)`.
+_ENTITY_TOKEN_NAMES: Tuple[str, ...] = ("self", "this", "current")
 
 
 @dataclass
@@ -1179,6 +1261,94 @@ class _EntityAccessTransformer(ast.NodeTransformer):
             raise FormulaError("entity[X] must be followed by .path.")
         raise FormulaError("Subscripting is not allowed (only entity[X].path).")
 
+    def visit_For(self, node: ast.For) -> ast.AST:
+        # Treat for-loop target variables as dynamic identifiers inside
+        # the body, so `entity[<loop_var>]` resolves at runtime to the
+        # loop iteration's value (an entity id) instead of being
+        # frozen to the literal token name. The validator separately
+        # checks the iterable's shape — here we only need to extend
+        # self.known_params for the body traversal and restore it after.
+        # We also inject a `__loop_tick()` call as the FIRST statement
+        # in the body so the runtime can enforce the formula_loop_limit
+        # rule — the engine raises FormulaError once total iterations
+        # across all loops in this evaluation exceed the limit.
+        node.iter = self.visit(node.iter)
+        loop_vars = set()
+        if isinstance(node.target, ast.Name):
+            loop_vars.add(node.target.id)
+        elif isinstance(node.target, ast.Tuple):
+            for elt in node.target.elts:
+                if isinstance(elt, ast.Name):
+                    loop_vars.add(elt.id)
+        saved = self.known_params
+        self.known_params = saved | frozenset(loop_vars)
+        try:
+            new_body = [self.visit(stmt) for stmt in node.body]
+        finally:
+            self.known_params = saved
+        tick_call = ast.Expr(value=ast.Call(
+            func=ast.Name(id="__loop_tick", ctx=ast.Load()),
+            args=[], keywords=[],
+        ))
+        ast.copy_location(tick_call, node)
+        ast.copy_location(tick_call.value, node)
+        node.body = [tick_call] + new_body
+        return node
+
+
+def _for_target_names(target: ast.AST) -> List[str]:
+    """Extract the loop-variable names from a `for` target. Allowed
+    shapes: a single Name (`for eid in ...`), or a 2-Tuple of Names
+    (`for (cx, cy) in cells_in_burst(...)`). Anything else (nested
+    tuples, starred targets, attribute targets) is rejected — the
+    sandbox keeps loop targets to plain bindings."""
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, ast.Tuple):
+        names = []
+        for elt in target.elts:
+            if not isinstance(elt, ast.Name):
+                raise FormulaError(
+                    "for-loop target tuple must contain only plain names "
+                    "(e.g. `for (cx, cy) in cells_in_burst(...)`)."
+                )
+            names.append(elt.id)
+        if not names:
+            raise FormulaError(
+                "for-loop target tuple cannot be empty."
+            )
+        return names
+    raise FormulaError(
+        "for-loop target must be a name or a tuple of names "
+        "(e.g. `for eid in entities_within(...)` or "
+        "`for (cx, cy) in cells_in_burst(...)`)."
+    )
+
+
+def _validate_for(node: ast.For) -> Tuple[List[str], "frozenset[str]"]:
+    """Verify a For node's iterable is a Call to a _LOOPABLE_FUNCS name,
+    and return the loop variable names. The caller augments
+    known_params with these names before recursing into the body."""
+    if node.orelse:
+        # `for ... else:` is supported by Python but its semantics
+        # ("else runs unless break") are surprising in a sandboxed
+        # context where there's no break. Reject up front.
+        raise FormulaError(
+            "for-loop `else:` clause is not supported."
+        )
+    it = node.iter
+    if not (isinstance(it, ast.Call)
+            and isinstance(it.func, ast.Name)
+            and it.func.id in _LOOPABLE_FUNCS):
+        allowed = ", ".join(sorted(_LOOPABLE_FUNCS))
+        raise FormulaError(
+            f"for-loop iterable must be a direct call to one of "
+            f"{{{allowed}}} — got "
+            f"`{ast.unparse(it) if hasattr(ast, 'unparse') else type(it).__name__}`."
+        )
+    names = _for_target_names(node.target)
+    return names, frozenset(names)
+
 
 def _validate_tree(
     tree: ast.AST,
@@ -1193,37 +1363,51 @@ def _validate_tree(
                   a formula calling a defined function validates; an
                   undefined name still errors.
     known_params  identifier names that are legal as plain values in this
-                  scope. Used ONLY when validating a function body, where
-                  the parameter names appear as Load Names. Empty for
-                  ordinary formulas.
+                  scope. Used for function-body parameters AND for-loop
+                  target variables; both extend the in-scope identifier
+                  set the same way.
     """
-    for n in ast.walk(tree):
+    def _check_node(n: ast.AST, scope_params: "frozenset[str]") -> None:
         if not isinstance(n, _ALLOWED_NODES):
             raise FormulaError(f"Disallowed syntax: {type(n).__name__}")
         if isinstance(n, ast.Name):
-            # Allowed Names: __read/__write (transformer-injected), the
-            # built-in funcs (min, max, etc.), the hook context names
-            # (changed_key, old_value, new_value, hook_name, ...) bound to
-            # None outside var-hook contexts, the match-bound functions
-            # (group_has, group_size, ..., is_attackable), user-defined
-            # formula functions (known_funcs), and — inside a function
-            # body — that function's parameters (known_params).
-            if (n.id not in ("__read", "__write")
+            if (n.id not in ("__read", "__write", "__loop_tick")
                     and n.id not in _ALLOWED_FUNCS
                     and n.id not in _MATCH_FUNC_NAMES
                     and n.id not in HOOK_CONTEXT_NAMES
+                    and n.id not in _ENTITY_TOKEN_NAMES
                     and n.id not in known_funcs
-                    and n.id not in known_params):
+                    and n.id not in scope_params):
                 raise FormulaError(f"Unknown identifier '{n.id}'.")
         if isinstance(n, ast.Call):
             if not isinstance(n.func, ast.Name):
                 raise FormulaError("Only direct function calls are allowed.")
             fname = n.func.id
-            if (fname not in ("__read", "__write")
+            if (fname not in ("__read", "__write", "__loop_tick")
                     and fname not in _ALLOWED_FUNCS
                     and fname not in _MATCH_FUNC_NAMES
                     and fname not in known_funcs):
                 raise FormulaError(f"Function '{fname}' is not allowed.")
+
+    def _walk(node: ast.AST, scope_params: "frozenset[str]") -> None:
+        _check_node(node, scope_params)
+        if isinstance(node, ast.For):
+            # Validate the iterable + target shape; recurse into the
+            # body with the loop variables added to scope. The target
+            # node itself does NOT need to be _check_node'd — its
+            # Tuple/Name children are loop-binding shapes, not Loads.
+            _check_node(node.iter, scope_params)
+            for child in ast.iter_child_nodes(node.iter):
+                _walk(child, scope_params)
+            _, loop_vars = _validate_for(node)
+            body_scope = scope_params | loop_vars
+            for stmt in node.body:
+                _walk(stmt, body_scope)
+            return
+        for child in ast.iter_child_nodes(node):
+            _walk(child, scope_params)
+
+    _walk(tree, known_params)
 
 
 # --- variable-path helpers ---------------------------------------------------
@@ -1372,9 +1556,27 @@ class FormulaEngine:
             doesn't need to thread either through explicitly.
         """
         extras = ctx.extras or {}
+        # Bounded for-loop counter. The transformer injects a
+        # __loop_tick() call as the first statement in every loop body,
+        # so this runs once per iteration across all loops in the
+        # evaluation. Reset to 0 at the start of every top-level
+        # eval_program / eval_expression call.
+        loop_limit = int(self._match.rules.get("formula_loop_limit", 10000)) \
+            if self._match else 10000
+        self._loop_iters = 0
+        def _loop_tick():
+            self._loop_iters += 1
+            if self._loop_iters > loop_limit:
+                raise FormulaError(
+                    f"formula for-loop iteration limit ({loop_limit}) "
+                    f"exceeded — likely an unbounded loop. Tune via the "
+                    f"formula_loop_limit rule if a higher cap is "
+                    f"intentionally needed."
+                )
         ns: Dict[str, Any] = {
             "__read":  lambda who, path:        self._read(who, path, ctx),
             "__write": lambda who, path, value: self._write(who, path, value, ctx),
+            "__loop_tick": _loop_tick,
             **_ALLOWED_FUNCS,
         }
         # Per-name default: was_clamped is boolean-flavored (default False);
@@ -1382,6 +1584,13 @@ class FormulaEngine:
         _CONTEXT_DEFAULTS = {"was_clamped": False}
         for name in HOOK_CONTEXT_NAMES:
             ns[name] = extras.get(name, _CONTEXT_DEFAULTS.get(name))
+        # Bare entity-id tokens. Bound to the actual id string when
+        # available, None otherwise. Calls that consume them (status_*,
+        # group_*, etc.) detect None via _eid and surface a clear
+        # "X is unbound" FormulaError.
+        ns["self"]    = ctx.target
+        ns["this"]    = ctx.this
+        ns["current"] = ctx.this
 
         # Seeded RNG: when the random_seed rule is non-empty, shadow the
         # global-RNG random_int/random_string with versions bound to a
@@ -1410,6 +1619,15 @@ class FormulaEngine:
         # the bare-identifier shorthand self_id() feels too verbose.
         match = self._match
         def _eid(token: Any) -> str:
+            if token is None:
+                # A bare `self` / `this` / `current` token was passed,
+                # but the calling context didn't bind that side
+                # (e.g. `self_id()` outside a passive). Distinguish from
+                # an arbitrary None so the message is actionable.
+                raise FormulaError(
+                    "entity id is None — 'self', 'this', or 'current' "
+                    "was used but is unbound in this context."
+                )
             if not isinstance(token, str):
                 raise FormulaError(
                     f"Entity id argument must be a string, got {type(token).__name__}."
@@ -1736,6 +1954,163 @@ class FormulaEngine:
 
         ns["entities_within"] = _entities_within
         ns["nearest_entity"]  = _nearest_entity
+
+        # ---- group iteration ----
+        def _group_members(name: Any) -> list:
+            if not isinstance(name, str):
+                raise FormulaError(
+                    "group_members(name): name must be a string."
+                )
+            # Returns the live list copy (insertion order). The for-loop
+            # iterates a snapshot, so concurrent group_add / group_remove
+            # during iteration is safe even though they mutate this list.
+            return list(match.groups.get(name, []))
+        ns["group_members"] = _group_members
+
+        # ---- status data accessors ----
+        # Mirror the tile_* shape: dotted-string paths into the per-status
+        # data dict, raise on missing path for get, bool returns for
+        # has / has_path / del / add / remove.
+
+        def _status_data(eid: str, name: str, must_exist: bool):
+            e = match.entities.get(eid)
+            if e is None:
+                raise FormulaError(f"unknown entity id '{eid}'.")
+            data = e.status.get(name)
+            if data is None:
+                if must_exist:
+                    raise FormulaError(
+                        f"entity '{eid}' has no status '{name}'."
+                    )
+                return None, e
+            return data, e
+
+        def _status_has(eid_t: Any, name: Any) -> bool:
+            eid = _eid(eid_t)
+            if not isinstance(name, str):
+                raise FormulaError("status_has(eid, name): name must be a string.")
+            e = match.entities.get(eid)
+            if e is None:
+                raise FormulaError(f"unknown entity id '{eid}'.")
+            return name in e.status
+
+        def _status_has_path(eid_t: Any, name: Any, path: Any) -> bool:
+            eid = _eid(eid_t)
+            if not isinstance(name, str):
+                raise FormulaError("status_has_path(eid, name, path): name must be a string.")
+            if not isinstance(path, str) or not path:
+                raise FormulaError("status_has_path(eid, name, path): path must be a non-empty string.")
+            data, _ = _status_data(eid, name, must_exist=False)
+            if data is None:
+                return False
+            cur = data
+            for k in path.split("."):
+                if not isinstance(cur, dict) or k not in cur:
+                    return False
+                cur = cur[k]
+            return True
+
+        def _status_get(eid_t: Any, name: Any, path: Any) -> Any:
+            eid = _eid(eid_t)
+            if not isinstance(name, str):
+                raise FormulaError("status_get(eid, name, path): name must be a string.")
+            if not isinstance(path, str) or not path:
+                raise FormulaError("status_get(eid, name, path): path must be a non-empty string.")
+            data, _ = _status_data(eid, name, must_exist=True)
+            cur = data
+            keys = path.split(".")
+            for i, k in enumerate(keys):
+                if not isinstance(cur, dict) or k not in cur:
+                    where = ".".join(keys[:i + 1])
+                    raise FormulaError(
+                        f"status '{eid}.{name}' has no value at '{where}'."
+                    )
+                cur = cur[k]
+            return cur
+
+        def _status_set(eid_t: Any, name: Any, path: Any, value: Any) -> Any:
+            eid = _eid(eid_t)
+            if not isinstance(name, str):
+                raise FormulaError("status_set(eid, name, path, value): name must be a string.")
+            if not isinstance(path, str) or not path:
+                raise FormulaError("status_set(eid, name, path, value): path must be a non-empty string.")
+            e = match.entities.get(eid)
+            if e is None:
+                raise FormulaError(f"unknown entity id '{eid}'.")
+            data = e.status.setdefault(name, {})
+            keys = path.split(".")
+            cur = data
+            for i, k in enumerate(keys[:-1]):
+                existing = cur.get(k)
+                if existing is not None and not isinstance(existing, dict):
+                    where = ".".join(keys[:i + 1])
+                    raise FormulaError(
+                        f"status '{eid}.{name}' value at '{where}' is "
+                        f"{type(existing).__name__}, not a dict."
+                    )
+                if k not in cur:
+                    cur[k] = {}
+                cur = cur[k]
+            cur[keys[-1]] = value
+            return value
+
+        def _status_del(eid_t: Any, name: Any, path: Any) -> bool:
+            eid = _eid(eid_t)
+            if not isinstance(name, str):
+                raise FormulaError("status_del(eid, name, path): name must be a string.")
+            if not isinstance(path, str) or not path:
+                raise FormulaError("status_del(eid, name, path): path must be a non-empty string.")
+            data, _ = _status_data(eid, name, must_exist=False)
+            if data is None:
+                return False
+            keys = path.split(".")
+            chain = [data]
+            for i, k in enumerate(keys[:-1]):
+                cur = chain[-1]
+                if not isinstance(cur, dict) or k not in cur:
+                    return False
+                chain.append(cur[k])
+            leaf = chain[-1]
+            if not isinstance(leaf, dict) or keys[-1] not in leaf:
+                return False
+            del leaf[keys[-1]]
+            for i in range(len(chain) - 1, 0, -1):
+                if chain[i]:
+                    break
+                del chain[i - 1][keys[i - 1]]
+            return True
+
+        def _status_add(eid_t: Any, name: Any) -> bool:
+            eid = _eid(eid_t)
+            if not isinstance(name, str):
+                raise FormulaError("status_add(eid, name): name must be a string.")
+            e = match.entities.get(eid)
+            if e is None:
+                raise FormulaError(f"unknown entity id '{eid}'.")
+            if name in e.status:
+                return False
+            e.status[name] = {}
+            return True
+
+        def _status_remove(eid_t: Any, name: Any) -> bool:
+            eid = _eid(eid_t)
+            if not isinstance(name, str):
+                raise FormulaError("status_remove(eid, name): name must be a string.")
+            e = match.entities.get(eid)
+            if e is None:
+                raise FormulaError(f"unknown entity id '{eid}'.")
+            if name not in e.status:
+                return False
+            del e.status[name]
+            return True
+
+        ns["status_has"]      = _status_has
+        ns["status_has_path"] = _status_has_path
+        ns["status_get"]      = _status_get
+        ns["status_set"]      = _status_set
+        ns["status_del"]      = _status_del
+        ns["status_add"]      = _status_add
+        ns["status_remove"]   = _status_remove
 
         # User-defined formula functions. Each becomes a Python callable
         # in the namespace. The callable binds its arguments to the
