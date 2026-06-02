@@ -5368,3 +5368,68 @@ reproducible "random scatter" or "wandering monster" tables a GM
 can replay. The trailing empty `random_seed` restores unseeded
 behavior. (As in 234, the assertion is that the two matches'
 draw sequences are equal; the specific letters depend on the seed.)
+SCENARIO 230 — !tile place_random: scatter instances across empty cells
+------------------------------------------------------------------------
+
+!match new mtr1 PlaceRandom 4 4
+!match use mtr1
+!tile def new flame
+!tile def data flame burn 5
+!tile place_random flame 5
+!tile find flame
+!tile place_random flame 3 burn=20
+!tile find flame
+!tile place_random flame 100
+!tile place_random flame 0
+
+Expected: `!tile place_random <template> <count>` scatters `count`
+instances across random cells that have no existing tile data
+(entity-occupied cells are still eligible — tiles and entities
+coexist). On a 4x4 grid (16 cells), placing 5 flames then listing
+shows exactly 5 placed cells (the exact coordinates are random, so
+this test asserts the COUNT, not positions). A second
+`place_random flame 3 burn=20` adds 3 more (now 8 total); the
+`burn=20` override applies to those 3. Asking for 100 on a grid
+with only 8 empty cells left fails all-or-nothing: "only 8 empty
+cell(s) available; cannot place 100" — nothing is placed. A count
+of 0 (or negative) is rejected. Because placement is random, the
+deterministic assertions are: count after first call = 5, count
+after second = 8, the over-count and zero-count calls both error
+and leave the total unchanged.
+
+
+SCENARIO 231 — !tile fill_pattern: paint an ASCII stencil
+----------------------------------------------------------
+
+!match new mtr2 FillPattern 8 8
+!match use mtr2
+!tile def new wall
+!tile def data wall glyph #
+!tile def new water
+!tile def data water glyph ~
+!tile fill_pattern 2 2 "#=wall,~=water" "##~" "#.~" "~~~"
+!tile find wall
+!tile find water
+!tile info 3 3
+!tile fill_pattern 7 7 "#=wall" "###" "###"
+!tile fill_pattern 1 1 "#=nope" "#"
+!tile fill_pattern 1 1 "##=wall" "#"
+
+Expected: `!tile fill_pattern <x> <y> <legend> <rows...>` paints a
+multi-row stencil with its top-left at (x, y). The legend maps
+single characters to templates; each row places one template per
+character at (x + column, y + row). Characters not in the legend
+are skipped (left untouched) — '.' is the conventional hole.
+
+The 3x3 stencil at (2,2):
+  row "##~" → (2,2) wall, (3,2) wall, (4,2) water
+  row "#.~" → (2,3) wall, (3,3) SKIP,  (4,3) water
+  row "~~~" → (2,4) water,(3,4) water, (4,4) water
+So `!tile find wall` shows 3 cells, `!tile find water` shows 5,
+and `!tile info 3 3` reports "no data" (the '.' left it empty).
+
+The remaining calls demonstrate all-or-nothing validation: a
+stencil at (7,7) that would spill off the 8x8 grid fails with an
+out-of-bounds cell error (placing nothing); a legend referencing
+an undefined template (`nope`) fails up front; a multi-character
+legend key (`##`) is rejected.

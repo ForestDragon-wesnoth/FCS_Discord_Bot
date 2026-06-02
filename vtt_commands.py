@@ -23,6 +23,7 @@ from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, val
 
 import re
 import json
+import random
 
 # ---- Context abstraction -----------------------------------------------------
 class ReplyContext(Protocol):
@@ -3115,6 +3116,122 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"`{name}` placed at {len(coords)} cell(s): {coords_str}"
         )
 
+    # ---- place_random <template> <count> [overrides...] ----
+    # Scatter `count` instances of a template across random EMPTY cells
+    # (cells with no existing tile data). Entity-occupied cells are still
+    # eligible — tiles and entities coexist. All-or-nothing: if fewer
+    # than `count` empty cells exist, nothing is placed.
+    if sub == "place_random":
+        if await return_help_if_not_enough_args(ctx, args, 3, "tile", "place_random"):
+            return
+        name = args[1]
+        try:
+            count = int(args[2])
+        except ValueError:
+            return await ctx.send("❌ count must be an integer.")
+        if count < 1:
+            return await ctx.send("❌ count must be >= 1.")
+        overrides: Dict[str, Any] = {}
+        for tok in args[3:]:
+            if "=" not in tok:
+                return await ctx.send(f"❌ override `{tok}` must be `key=value`.")
+            k, v = tok.split("=", 1)
+            overrides[k] = _parse_scalar(v)
+        if name not in m.tile_templates:
+            return await ctx.send(f"❌ template `{name}` not found.")
+        # Empty = in-bounds cell with no existing tile data.
+        empty = [
+            (x, y)
+            for x in range(1, m.grid_width + 1)
+            for y in range(1, m.grid_height + 1)
+            if (x, y) not in m.tiles
+        ]
+        if len(empty) < count:
+            return await ctx.send(
+                f"❌ only {len(empty)} empty cell(s) available; cannot "
+                f"place {count}. (place_random fills cells with no "
+                f"existing tile data.)"
+            )
+        chosen = random.sample(empty, count)
+        for px, py in chosen:
+            m.place_tile_template(name, px, py, overrides=overrides or None)
+        chosen.sort()
+        coords_str = ", ".join(f"({x},{y})" for x, y in chosen)
+        msg = f"Placed template `{name}` at {count} random cell(s): {coords_str}."
+        if overrides:
+            override_str = ", ".join(f"{k}={v!r}" for k, v in overrides.items())
+            msg = msg + f" Overrides: {override_str}."
+        return await ctx.send(msg)
+
+    # ---- fill_pattern <x> <y> <legend> <row> [<row> ...] ----
+    # Paint a multi-row ASCII stencil. `legend` maps single characters to
+    # template names (e.g. "#=wall,~=water"); each row string places one
+    # template per char at (x + col, y + row_index). Characters NOT in the
+    # legend are skipped (left untouched) — that's how you punch holes,
+    # conventionally with '.'. All-or-nothing on both validation fronts:
+    # every legend template must exist and every non-skip cell must be
+    # in-bounds before anything is placed.
+    if sub == "fill_pattern":
+        if await return_help_if_not_enough_args(ctx, args, 5, "tile", "fill_pattern"):
+            return
+        try:
+            ax = int(args[1]); ay = int(args[2])
+        except ValueError:
+            return await ctx.send("❌ expected integer anchor x and y.")
+        legend_token = args[3]
+        rows = args[4:]
+        # Parse legend: comma-separated char=template pairs.
+        legend: Dict[str, str] = {}
+        for pair in legend_token.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                return await ctx.send(
+                    f"❌ legend entry `{pair}` must be `char=template`."
+                )
+            ch, tname = pair.split("=", 1)
+            if len(ch) != 1:
+                return await ctx.send(
+                    f"❌ legend key `{ch}` must be exactly one character."
+                )
+            if tname not in m.tile_templates:
+                return await ctx.send(f"❌ template `{tname}` not found.")
+            legend[ch] = tname
+        if not legend:
+            return await ctx.send(
+                "❌ legend is empty; provide at least one `char=template`."
+            )
+        # Collect the placements and bounds-check every non-skip cell first.
+        placements: List[Tuple[int, int, str]] = []
+        for row_idx, row in enumerate(rows):
+            for col_idx, ch in enumerate(row):
+                if ch not in legend:
+                    continue  # skip char (hole)
+                px = ax + col_idx
+                py = ay + row_idx
+                if not m.in_bounds(px, py):
+                    return await ctx.send(
+                        f"❌ pattern cell ({px},{py}) is outside the "
+                        f"{m.grid_width}x{m.grid_height} grid."
+                    )
+                placements.append((px, py, legend[ch]))
+        if not placements:
+            return await ctx.send(
+                "❌ pattern placed nothing (all characters were skips or "
+                "the rows were empty)."
+            )
+        for px, py, tname in placements:
+            m.place_tile_template(tname, px, py)
+        # Summarize per-template counts.
+        from collections import Counter
+        counts = Counter(t for _, _, t in placements)
+        summary = ", ".join(f"{c}× `{t}`" for t, c in sorted(counts.items()))
+        return await ctx.send(
+            f"Filled pattern at anchor ({ax},{ay}): {len(placements)} "
+            f"cell(s) — {summary}."
+        )
+
     title, body = registry.help_for(["tile"])
     return await ctx.send(f"**{title}**\n{body}")
 
@@ -3246,6 +3363,36 @@ registry.annotate_sub(
         "ack when zero instances exist; errors loudly if the template "
         "name isn't defined (treated as a typo since a missing-name "
         "search trivially has zero results)."
+    ),
+)
+registry.annotate_sub(
+    "tile", "place_random",
+    usage="!tile place_random <template> <count> [key=value ...]",
+    desc=(
+        "Scatter `count` instances of a template across random EMPTY "
+        "cells (cells with no existing tile data; entity-occupied cells "
+        "are still eligible since tiles and entities coexist). "
+        "All-or-nothing: if fewer than `count` empty cells exist, "
+        "nothing is placed and the command reports how many were "
+        "available. Optional `key=value` overrides apply to every "
+        "placed instance, same as `!tile place`. The chosen cells are "
+        "echoed so you can see where they landed."
+    ),
+)
+registry.annotate_sub(
+    "tile", "fill_pattern",
+    usage='!tile fill_pattern <x> <y> <legend> <row> [<row> ...]',
+    desc=(
+        "Paint a multi-row ASCII stencil with the top-left at (x, y). "
+        "`legend` maps single characters to templates, comma-separated: "
+        '`"#=wall,~=water"`. Each following row string places one '
+        "template per character at (x + column, y + row). Characters "
+        "NOT in the legend are skipped (left untouched) — conventionally "
+        "'.' is used to punch holes. Example: "
+        '`!tile fill_pattern 2 2 "#=wall,~=water" "##~" "#.~" "~~~"` '
+        "paints a 3x3 block. All-or-nothing: every legend template must "
+        "exist and every non-skip cell must be in-bounds before any "
+        "tile is placed."
     ),
 )
 
