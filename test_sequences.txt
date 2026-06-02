@@ -229,6 +229,7 @@ SCENARIO 10 — Conditional flow in formulas (if/elif/else, ternary)
 !match new m10 conds 8 8
 !match use m10
 !ent add hero Hero 30 4 4 10
+!ent set_var hero max_hp 100
 !ent set_var hero resting yes
 !ent set_var hero stamina 5
 !eval "5 if entity[hero].hp > 10 else 99"
@@ -256,9 +257,12 @@ SCENARIO 10 — Conditional flow in formulas (if/elif/else, ternary)
 
 Expected: ternary returns 5; first if/else hits then-branch (stamina 5 ->
 30); second hits else-branch (5 -> 7); elif chain picks middle branch (hp
--> 50); compound boolean fires revive (hp -> 30, revives -> 0); registered
-conditional passive fires on next turn (hp 10 -> 15); ternary inside $()
-adds 15 to hp (10 -> 25).
+-> 50); compound boolean fires revive (hp -> max_hp = 100, revives -> 0);
+registered conditional passive fires on next turn (hp 10 -> 15); ternary
+inside $() adds 15 to hp (10 -> 25). (hero's max_hp is set to 100 up front
+so the hp branches aren't pinned by the default hp <= max_hp clamp — with
+the auto-filled max_hp = starting-hp, every branch above 30 would clamp
+back to 30.)
 
 
 SCENARIO 11 — Rejections still hold
@@ -275,10 +279,16 @@ SCENARIO 11 — Rejections still hold
 !eval "import os"
 !passive add hero bad on_turn_start "if True:\n    for x in [1]: entity[self].hp = x"
 
-Expected: every line should print an error (most with an X-mark). Loops,
-lambdas, list comprehensions, local-variable assignment, imports, and
-disallowed constructs nested inside an otherwise-valid if are all rejected
-clearly. None should crash or silently succeed.
+Expected: every line should print an error (most with an X-mark).
+A `for` over a non-loopable iterable (entity[hero].hp is not a
+loopable builtin call) is rejected ("for-loop iterable must be a
+direct call to one of {...}"); `while` loops, lambdas, list
+comprehensions, local-variable assignment, imports, and disallowed
+constructs nested inside an otherwise-valid if (the last line nests
+a `for x in [1]` — a List iterable, rejected) are all rejected
+clearly. None should crash or silently succeed. (Constrained
+for-loops over the loopable builtins ARE allowed — see SCENARIO
+246+; this scenario only covers the rejection cases.)
 
 
 SCENARIO 12 — Var hooks: creation events fire at every level
@@ -2353,16 +2363,25 @@ Expected: 5, 10, 7, 4, 3, 5.0. Whitelisted: min, max, abs, round, int,
 float, str.
 
 
-SCENARIO 121 — Disallowed: loops
----------------------------------
+SCENARIO 121 — Loops are constrained, not blanket-disallowed
+-------------------------------------------------------------
 
 !match new rej121 Reject 6 6
 !match use rej121
 !ent add hero Hero 30 3 3 10
 !eval "for x in range(3): entity[hero].hp = x"
+!eval "for x in entity[hero].hp: entity[hero].hp = x"
 !eval "while True: entity[hero].hp = 0"
 
-Expected: Both rejected with "Disallowed syntax" errors.
+Expected: `while` loops are still fully disallowed ("Disallowed
+syntax: While"). `for` loops ARE allowed, but only over a direct
+call to one of the loopable builtins (entities_within,
+group_members, cells_in_burst, cells_in_line, cells_in_cone) — so
+`for x in range(3)` is rejected because `range` isn't an allowed
+function, and `for x in entity[hero].hp` is rejected because the
+iterable isn't a loopable call ("for-loop iterable must be a
+direct call to one of {...}"). See SCENARIO 246+ for the legal
+for-loop forms.
 
 
 SCENARIO 122 — Disallowed: lambdas, comprehensions, imports
@@ -3541,7 +3560,7 @@ SCENARIO 174 — random_int via eval and inside a passive
 !turn next
 !ent info hero
 !eval random_int(5, 3)
-!eval random_int("not", "int")
+!eval "random_int('not', 'int')"
 !eval random_string()
 
 Expected: The first three !eval calls return integers in their
@@ -5177,16 +5196,17 @@ SCENARIO 221 — Formula functions: validation and reserved names
 
 !match new mfn5 FuncValid 8 8
 !match use mfn5
-!func def bad x "for i in x: pass"
+!func def bad x "for i in entity[x].hp: entity[x].hp = i"
 !func def usesundef x "x + nope(1)"
 !func def max a "a + 1"
 !func def dup "a,a" "a"
 !func def baditem "1bad" "0"
 !eval "undefined_fn(1)"
 
-Expected: Function definitions are validated up front. A body
-using disallowed syntax (`for` loop) is rejected at define time.
-A body referencing an undefined function (`nope`) is rejected —
+Expected: Function definitions are validated up front. A body with
+an illegal for-loop (iterating `entity[x].hp`, which isn't a
+loopable builtin call) is rejected at define time. A body
+referencing an undefined function (`nope`) is rejected —
 the body validator knows the current function registry plus the
 name being defined (for recursion). Defining a function named
 `max` is rejected because it collides with a built-in. A
@@ -5830,7 +5850,7 @@ SCENARIO 244 — Status auto-tick (round_end): "remaining" decay
 ---------------------------------------------------------------
 
 !system set default status_tick_when round_end
-!system set default status_tick_formula "if status_has_path(self, status_name, 'remaining'): status_set(self, status_name, 'remaining', status_get(self, status_name, 'remaining') - 1); status_remove(self, status_name) if status_get(self, status_name, 'remaining') <= 0 else 0"
+!system set default status_tick_formula "if status_has_path(self, status_name, 'remaining'):\n    status_set(self, status_name, 'remaining', status_get(self, status_name, 'remaining') - 1)\n    if status_get(self, status_name, 'remaining') <= 0:\n        status_remove(self, status_name)"
 !match new mst4 StatusTick 6 6
 !match use mst4
 !ent add alice Alice 30 1 1 30
@@ -5883,7 +5903,7 @@ SCENARIO 245 — Status auto-tick on a skips_turn status
 -------------------------------------------------------
 
 !system set default status_tick_when round_end
-!system set default status_tick_formula "if status_has_path(self, status_name, 'remaining'): status_set(self, status_name, 'remaining', status_get(self, status_name, 'remaining') - 1); status_remove(self, status_name) if status_get(self, status_name, 'remaining') <= 0 else 0"
+!system set default status_tick_formula "if status_has_path(self, status_name, 'remaining'):\n    status_set(self, status_name, 'remaining', status_get(self, status_name, 'remaining') - 1)\n    if status_get(self, status_name, 'remaining') <= 0:\n        status_remove(self, status_name)"
 !match new mst5 StatusSkipDecay 6 6
 !match use mst5
 !ent add alice Alice 30 1 1 30
