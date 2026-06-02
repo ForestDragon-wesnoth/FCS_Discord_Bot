@@ -261,7 +261,7 @@ def _entity_template_context(e: Entity) -> Dict[str, Any]:
         "initiative": e.vars.get(init_var, 0),
         "hp": e.hp,
         "max_hp": e.max_hp if e.max_hp is not None else e.hp,
-        "status_csv": ", ".join(sorted(e.status)) if e.status else "",
+        "status_csv": ", ".join(sorted(e.status.keys())) if e.status else "",
         "passives_csv": ", ".join(sorted(e.passives.keys())) if e.passives else "",
     }
     # Merge vars — vars win for keys NOT already in the well-known set above.
@@ -302,7 +302,19 @@ def _entity_dump(e: Entity) -> str:
     parts.append(f"**{e.name}** (`{e.id}`)")
     parts.append(f"Position: ({e.x}, {e.y}) facing {e.facing}")
     parts.append(f"Team: {e.team if e.team else '(none)'}")
-    parts.append(f"Status: {', '.join(sorted(e.status)) if e.status else '(none)'}")
+    # Status flags carry data; show name(field=value, ...) if data exists.
+    if e.status:
+        status_parts = []
+        for name in sorted(e.status.keys()):
+            data = e.status[name]
+            if isinstance(data, dict) and data:
+                fields = ", ".join(f"{k}={v!r}" for k, v in sorted(data.items()))
+                status_parts.append(f"{name}({fields})")
+            else:
+                status_parts.append(name)
+        parts.append(f"Status: {', '.join(status_parts)}")
+    else:
+        parts.append("Status: (none)")
     hp_var, max_hp_var, init_var = e._vital_var_names()
     parts.append(
         f"Vitals: hp_var=`{hp_var}` max_hp_var=`{max_hp_var}` turnorder_var=`{init_var}`"
@@ -404,7 +416,17 @@ def _reject_group_token(token: str, subcommand: str) -> None:
 
 
 def _parse_scalar(token: str):
-    # int → float → str
+    # bool → int → float → str. Only EXACT "true"/"false" (case-
+    # sensitive) becomes a Python bool — "yes"/"no" are conventionally
+    # used as string values across existing scenarios (see scenario 10's
+    # `entity[hero].resting == "yes"`), and case-insensitive matching
+    # would collide with variable-name tokens like "True" or "False"
+    # used as labels. If you want a string literal "true", quote the
+    # token at the command layer: `!ent set_var x t "true"`.
+    if token == "true":
+        return True
+    if token == "false":
+        return False
     try:
         return int(token, 10)
     except ValueError:
@@ -1032,7 +1054,16 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         m._rebuild_turn_order()
         return await ctx.send(f"Renamed `{eid}` to **{new_name}**.")
 
-    # status flags: !ent status <id> <add|remove|clear|list> [flag]
+    # !ent status <id> <action> [args...]
+    # Statuses now carry their own data dicts. Actions:
+    #   list                       — names + brief data summary
+    #   add <name>                 — add status (empty data) idempotently
+    #   remove <name>              — remove the whole status
+    #   clear                      — wipe all statuses
+    #   info <name>                — pretty-print one status's data
+    #   set <name> <path> <value>  — write a data field (dotted path,
+    #                                 like !ent set_var)
+    #   del <name> <path>          — remove a data field
     if sub == "status":
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "status"):
             return
@@ -1041,27 +1072,118 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             raise NotFound(f"Entity '{eid}' not found.")
         e = m.entities[eid]
         action = args[2].lower()
+
         if action == "list":
-            flags = ", ".join(sorted(e.status)) if e.status else "(none)"
-            return await ctx.send(f"`{eid}` status: {flags}")
+            if not e.status:
+                return await ctx.send(f"`{eid}` status: (none)")
+            lines = [f"**`{eid}` statuses:**"]
+            for name in sorted(e.status.keys()):
+                data = e.status[name]
+                if isinstance(data, dict) and data:
+                    fields = ", ".join(f"{k}={v!r}" for k, v in sorted(data.items()))
+                    lines.append(f"- `{name}` ({fields})")
+                else:
+                    lines.append(f"- `{name}` (no data)")
+            return await ctx.send("\n".join(lines))
+
         if action == "clear":
             n = len(e.status)
             e.status.clear()
-            return await ctx.send(f"Cleared {n} status flag(s) from `{eid}`.")
-        if action in ("add", "remove", "rm", "del"):
+            return await ctx.send(f"Cleared {n} status(es) from `{eid}`.")
+
+        if action in ("add", "remove", "rm", "del-status",
+                      "info", "set", "del"):
             if len(args) < 4:
                 return await ctx.send(
-                    f"❌ `!ent status {eid} {action}` needs a flag name."
+                    f"❌ `!ent status {eid} {action}` needs a status name."
                 )
-            flag = args[3]
+            name = args[3]
             if action == "add":
-                e.status.add(flag)
-                return await ctx.send(f"Added status `{flag}` to `{eid}`.")
-            e.status.discard(flag)
-            return await ctx.send(f"Removed status `{flag}` from `{eid}`.")
+                if name not in e.status:
+                    e.status[name] = {}
+                    return await ctx.send(f"Added status `{name}` to `{eid}`.")
+                return await ctx.send(
+                    f"Status `{name}` already on `{eid}` (no change; use "
+                    f"`set` to edit its data)."
+                )
+            if action in ("remove", "rm", "del-status"):
+                if name in e.status:
+                    del e.status[name]
+                    return await ctx.send(f"Removed status `{name}` from `{eid}`.")
+                return await ctx.send(f"`{eid}` has no status `{name}`.")
+            if action == "info":
+                if name not in e.status:
+                    return await ctx.send(f"`{eid}` has no status `{name}`.")
+                data = e.status[name]
+                if not data:
+                    return await ctx.send(f"**`{eid}.{name}`** (no data)")
+                body = json.dumps(data, indent=2, default=str)
+                return await ctx.send(f"**`{eid}.{name}`**\n```{body}\n```")
+            if action == "set":
+                if len(args) < 6:
+                    return await ctx.send(
+                        f"❌ `!ent status {eid} set {name}` needs <path> "
+                        f"and <value>."
+                    )
+                path = args[4]
+                value = _parse_scalar(args[5])
+                data = e.status.setdefault(name, {})
+                # Walk the dotted path, creating intermediate dicts.
+                parts_path = path.split(".")
+                cur = data
+                for i, key in enumerate(parts_path[:-1]):
+                    existing = cur.get(key)
+                    if existing is not None and not isinstance(existing, dict):
+                        where = ".".join(parts_path[:i + 1])
+                        return await ctx.send(
+                            f"❌ `{eid}.{name}` value at '{where}' is "
+                            f"{type(existing).__name__}, not a dict."
+                        )
+                    if key not in cur:
+                        cur[key] = {}
+                    cur = cur[key]
+                cur[parts_path[-1]] = value
+                return await ctx.send(
+                    f"Set `{eid}.{name}.{path}` = {value!r}."
+                )
+            if action == "del":
+                if len(args) < 5:
+                    return await ctx.send(
+                        f"❌ `!ent status {eid} del {name}` needs a "
+                        f"<path>. (For removing the status itself use "
+                        f"`!ent status {eid} remove {name}`.)"
+                    )
+                if name not in e.status:
+                    return await ctx.send(f"`{eid}` has no status `{name}`.")
+                path = args[4]
+                data = e.status[name]
+                parts_path = path.split(".")
+                chain = [data]
+                for i, key in enumerate(parts_path[:-1]):
+                    cur = chain[-1]
+                    if not isinstance(cur, dict) or key not in cur:
+                        where = ".".join(parts_path[:i + 1])
+                        return await ctx.send(
+                            f"❌ `{eid}.{name}` has no value at '{where}'."
+                        )
+                    chain.append(cur[key])
+                leaf = chain[-1]
+                if not isinstance(leaf, dict) or parts_path[-1] not in leaf:
+                    return await ctx.send(
+                        f"❌ `{eid}.{name}` has no value at '{path}'."
+                    )
+                del leaf[parts_path[-1]]
+                # Prune empty intermediate dicts.
+                for i in range(len(chain) - 1, 0, -1):
+                    if chain[i]:
+                        break
+                    del chain[i - 1][parts_path[i - 1]]
+                return await ctx.send(
+                    f"Removed `{eid}.{name}.{path}`."
+                )
         return await ctx.send(
             f"❌ unknown status action `{action}`. Use add / remove / "
-            f"clear / list."
+            f"set / del / info / list / clear."
         )
 
     # tp (absolute)
@@ -1473,13 +1595,23 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "ent", "status",
-    usage="!ent status <id> <add|remove|clear|list> [flag]",
+    usage=(
+        "!ent status <id> <add|remove|clear|list|info|set|del> [name] "
+        "[path] [value]"
+    ),
     desc=(
-        "Manage an entity's status-flag set. `add <flag>` / `remove "
-        "<flag>` toggle a flag, `list` shows the current set, `clear` "
-        "wipes all. Status flags are free-form strings (e.g. stunned, "
-        "prone, blessed) — they feed the skip_turn_statuses rule and any "
-        "passive that checks them."
+        "Manage an entity's statuses. Each status name maps to its own "
+        "data dict — the 'what X does is stored in X' design rule. "
+        "Actions: `add <name>` (idempotent, empty data), `remove <name>` "
+        "(drop the whole status), `clear` (wipe all), `list` (names + "
+        "field summary), `info <name>` (pretty-print one), `set <name> "
+        "<path> <value>` (write a field — dotted path, value parses "
+        "true/false/int/float/str), `del <name> <path>` (remove a field, "
+        "pruning empty parent dicts). The engine recognizes ONE "
+        "convention: `skips_turn: true` on any active status causes the "
+        "bearer's turn to be skipped (see SCENARIO 240). All other data "
+        "is GM-defined — auto-decay etc. is configured via the "
+        "status_tick_when / status_tick_formula rules."
     ),
 )
 registry.annotate_sub(
