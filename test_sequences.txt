@@ -5258,6 +5258,131 @@ confirms the latest definition is the active one:
 max(20 - 5 + 3, 0) = 18.
 
 
+SCENARIO 236 — !ent clone: multiple coordinate pairs auto-number copies
+------------------------------------------------------------------------
+
+!match new mclone1 CloneMulti 10 10
+!match use mclone1
+!ent add gob Goblin 20 1 1 5
+!ent set_var gob atk 7
+!ent clone gob gobcopy 3 3
+!ent clone gob minion 5 5 6 6 7 7
+!list
+!ent dump minion2
+!ent clone gob bad 2 2 3
+!ent clone gob onself 5 5
+
+Expected: `!ent clone` now accepts multiple `x y` pairs. A single pair
+keeps the original behavior: `!ent clone gob gobcopy 3 3` makes one
+copy with id "gobcopy" at (3,3). Multiple pairs make one copy per
+cell, auto-numbering the ids from the base: `!ent clone gob minion
+5 5 6 6 7 7` creates minion1@(5,5), minion2@(6,6), minion3@(7,7).
+Each copy is a full clone (vars included — `!ent dump minion2` shows
+atk=7 inherited). All-or-nothing validation: an odd number of
+coordinate values ("2 2 3") is rejected as not forming pairs, and a
+target cell already occupied (5,5 is taken by minion1) is rejected
+before any copy in that batch is made.
+
+
+SCENARIO 237 — !ent status: add / remove / list / clear flags
+--------------------------------------------------------------
+
+!match new mstat1 StatusCmd 6 6
+!match use mstat1
+!ent add hero Hero 30 3 3 10
+!ent status hero list
+!ent status hero add stunned
+!ent status hero add poisoned
+!ent status hero list
+!ent status hero remove poisoned
+!ent status hero list
+!ent status hero clear
+!ent status hero list
+
+Expected: `!ent status <id> <action> [flag]` manages the entity's
+status flag set (previously there was no command to write it). `add`
+inserts a flag, `remove` discards one, `list` shows the current set
+(sorted, "(none)" when empty), and `clear` wipes them all. After
+adding stunned + poisoned, list shows "poisoned, stunned"; after
+removing poisoned, just "stunned"; after clear, "(none)". This is
+the command that backs status-flag scenarios like 40 and feeds the
+skip_turn_statuses rule (237's flags are what 240 keys off).
+
+
+SCENARIO 238 — !eval --as binds self for testing passive bodies
+----------------------------------------------------------------
+
+!match new meval1 EvalAs 6 6
+!match use meval1
+!ent add hero Hero 30 3 3 10
+!ent set_var hero atk 12
+!ent set_var hero max_hp 50
+!eval "entity[self].atk"
+!eval --as hero "entity[self].atk"
+!eval --as hero "entity[self].hp = entity[self].hp + 5"
+!ent dump hero
+
+Expected: `!eval` normally leaves `self` unbound, so a formula using
+`entity[self]` errors ("'self' is unbound in this context") — useful
+but inconvenient when prototyping a passive body. The new
+`!eval --as <eid> "<formula>"` prefix binds `self` to that entity for
+the evaluation. `!eval --as hero "entity[self].atk"` returns 12, and
+`!eval --as hero "entity[self].hp = entity[self].hp + 5"` actually
+heals hero from 30 to 35 (confirmed by `!ent dump`) — letting a GM
+test a passive's effect interactively without attaching it and
+advancing a turn.
+
+
+SCENARIO 239 — !system delete with safety guards
+-------------------------------------------------
+
+!system new homebrew
+!system new throwaway
+!system delete throwaway
+!system list
+!system delete default
+!match new msys1 SysMatch 6 6 --system homebrew
+!system delete homebrew
+!system delete nonexistent
+
+Expected: `!system delete <name>` removes a GameSystem, with guards
+against breaking the manager. Deleting the unused "throwaway" system
+succeeds and `!system list` no longer shows it. The guards then
+reject: deleting "default" (it's the global default — must reassign
+first); deleting "homebrew" while a match is bound to it (the match
+must be rebound or deleted first); and deleting a nonexistent system.
+Each guard produces a clear error rather than corrupting state. (The
+match msys1 is created ON the homebrew system specifically to
+exercise the in-use guard.)
+
+
+SCENARIO 240 — skip_turn_statuses: stunned entities are skipped
+---------------------------------------------------------------
+
+!system set default skip_turn_statuses stunned,unconscious
+!match new mskip1 SkipTurn 8 8
+!match use mskip1
+!ent add alice Alice 30 1 1 30
+!ent add bob Bob 30 2 2 20
+!ent add carol Carol 30 3 3 10
+!ent status bob add stunned
+!turn next
+!turn next
+!turn next
+!system set default skip_turn_statuses ""
+
+Expected: The `skip_turn_statuses` rule lists status flags (comma-
+separated) that cause an entity to be skipped when its turn comes up.
+With "stunned,unconscious" set and bob carrying "stunned", the turn
+order alice(30), bob(20), carol(10) effectively skips bob. The first
+`!turn next` opens the round on alice. The second advances past
+alice — would land on bob, but bob is stunned, so it skips to carol
+(a "⏭️ `bob`'s turn skipped (stunned)" line is logged and bob's
+on_turn_start does NOT fire). The third wraps the round back to
+alice. A round where every remaining entity is skippable still
+advances (the loop is bounded to one full cycle — no infinite loop)
+and logs that the round passes. The trailing empty-value set restores
+the default (no skips) so later scenarios are unaffected.
 SCENARIO 232 — Dynamic entity[<expr>]: literal still works, expressions resolve
 --------------------------------------------------------------------------------
 

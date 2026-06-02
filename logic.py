@@ -295,6 +295,22 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "changes are deferrable."
         ),
     },
+    "skip_turn_statuses": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "Comma-separated list of status flags that cause an entity to "
+            "be SKIPPED when its turn would come up (e.g. "
+            "'stunned,unconscious,frozen'). Empty (default) means no "
+            "status skips turns. Matching is against Entity.status (the "
+            "flags set via !ent status). When next_turn lands on an "
+            "entity carrying any listed status, on_turn_start does NOT "
+            "fire for it; the turn advances to the next eligible entity "
+            "(a 'skipped turn' note is logged). A round whose every "
+            "remaining entity is skippable still advances normally (no "
+            "infinite loop) — the round simply passes."
+        ),
+    },
     # Spawning / facing
     "spawn_face_toward_center": {
         "default": True,
@@ -3037,25 +3053,50 @@ class Match:
             # state they would have seen as the round began (with any
             # hook side-effects already applied).
             self.history.record_round(self)
+            # The opening entity may itself be skippable (e.g. starts
+            # stunned) — skip forward to the first eligible one.
+            eligible = self._skip_to_eligible(log)
             cur = self.turn_order[self.active_index]
-            log.extend(self.fire_hook("on_turn_start", target_ids=[cur]))
+            if eligible:
+                log.extend(self.fire_hook("on_turn_start", target_ids=[cur]))
+            else:
+                log.append(
+                    "⏭️ every entity is skippable; the round passes "
+                    "without anyone acting."
+                )
             self.history.record_turn(self)
             return (cur, log)
 
         # Normal transition.
         cur = self.turn_order[self.active_index]
         log.extend(self.fire_hook("on_turn_end", target_ids=[cur]))
+        self._advance_index(log)
+        # Skip over any entity carrying a skip-status flag.
+        eligible = self._skip_to_eligible(log)
+        new_cur = self.turn_order[self.active_index]
+        if eligible:
+            log.extend(self.fire_hook("on_turn_start", target_ids=[new_cur]))
+        else:
+            log.append(
+                "⏭️ every entity is skippable; the round passes "
+                "without anyone acting."
+            )
+        self.history.record_turn(self)
+        return (new_cur, log)
+
+    def _advance_index(self, log: List[str]) -> None:
+        """Advance active_index by one, handling round wrap: fire
+        on_round_end, flush any deferred turn-order rebuild, bump the
+        round number, fire on_round_start, and autosave the round.
+        Factored out of next_turn so the skip-status loop can reuse the
+        exact same wrap bookkeeping for each cell it steps over."""
         new_index = (self.active_index + 1) % len(self.turn_order)
         wrapped = (new_index == 0)
         if wrapped:
             log.extend(self.fire_hook("on_round_end"))
-            # Flush any deferred turn-order rebuild between
-            # on_round_end (which ran against the OLD order — those
-            # were the entities that acted this round) and
-            # on_round_start (which should see the NEW order). The
-            # rebuild rewrites turn_order and may put a different
-            # entity at index 0, which is fine because round-wrap
-            # naturally starts at the top of the new order anyway.
+            # Flush any deferred turn-order rebuild between on_round_end
+            # (ran against the OLD order) and on_round_start (sees the
+            # NEW order). Round-wrap naturally restarts at the top.
             if self._turn_order_dirty:
                 self._rebuild_turn_order()
                 log.append(
@@ -3066,15 +3107,39 @@ class Match:
         if wrapped:
             self.round_number += 1
             log.extend(self.fire_hook("on_round_start"))
-            # Autosave round start AFTER round_number is bumped and
-            # on_round_start hooks have fired, mirroring the first-call
-            # path above. Snapshot.round_at_snapshot records the *new*
-            # round number, matching the round players are in.
             self.history.record_round(self)
-        new_cur = self.turn_order[self.active_index]
-        log.extend(self.fire_hook("on_turn_start", target_ids=[new_cur]))
-        self.history.record_turn(self)
-        return (new_cur, log)
+
+    def _skip_turn_status_set(self) -> set:
+        """Parse the skip_turn_statuses rule into a set of flag names.
+        Empty set when the rule is unset (the common case)."""
+        raw = self.rules.get("skip_turn_statuses", "")
+        if not raw:
+            return set()
+        return {s.strip() for s in raw.split(",") if s.strip()}
+
+    def _skip_to_eligible(self, log: List[str]) -> bool:
+        """Starting from the current active_index, advance past any
+        entity that carries a skip-status flag. Returns True if an
+        eligible (non-skippable) entity is now current, or False if a
+        full cycle found every entity skippable (the caller then passes
+        the round without firing on_turn_start). Bounded to one full
+        turn-order cycle so an all-skippable table can't loop forever."""
+        skip_set = self._skip_turn_status_set()
+        if not skip_set:
+            return True
+        n = len(self.turn_order)
+        checked = 0
+        while checked < n:
+            cur = self.turn_order[self.active_index]
+            e = self.entities.get(cur)
+            if e is None or not (e.status & skip_set):
+                return True
+            matched = ", ".join(sorted(e.status & skip_set))
+            log.append(f"⏭️ `{cur}`'s turn skipped ({matched}).")
+            self._advance_index(log)
+            checked += 1
+        # Full cycle without finding an eligible entity.
+        return False
 
     def _effective_clamp(self, entity: "Entity", path: str) -> Optional["ClampSpec"]:
         """Return the clamp that applies to `path` on this entity, or None.
@@ -3875,6 +3940,50 @@ class MatchManager:
         if name in self.systems:
             raise DuplicateId(f"GameSystem '{name}' already exists")
         self.systems[name] = GameSystem(name, settings or {})
+
+    def delete_system(self, name: str) -> None:
+        """Remove a GameSystem. Guards against leaving the manager in a
+        broken state:
+          - the system must exist
+          - at least one system must remain afterward (there's always a
+            global default to fall back to)
+          - it must not be the global default (reassign that first)
+          - no live match may still be bound to it (rebind or delete
+            those matches first)
+        Per-server / per-channel default pointers AT this system are
+        scrubbed (they fall back to the global default automatically via
+        effective_system_name)."""
+        if name not in self.systems:
+            raise NotFound(f"GameSystem '{name}' not found.")
+        if len(self.systems) <= 1:
+            raise VTTError(
+                "Cannot delete the only remaining GameSystem — at least "
+                "one must exist."
+            )
+        if name == self.default_system_name:
+            raise VTTError(
+                f"'{name}' is the global default GameSystem. Set a "
+                f"different global default first "
+                f"(!system default global <other>)."
+            )
+        bound = [mid for mid, m in self.matches.items() if m.system_name == name]
+        if bound:
+            shown = ", ".join(sorted(bound)[:5])
+            more = "" if len(bound) <= 5 else f" (+{len(bound) - 5} more)"
+            raise VTTError(
+                f"GameSystem '{name}' is still used by {len(bound)} "
+                f"match(es): {shown}{more}. Rebind or delete those "
+                f"matches first."
+            )
+        del self.systems[name]
+        # Scrub server/channel default pointers that referenced it; they
+        # fall back to the global default via effective_system_name.
+        self.default_system_per_server = {
+            k: v for k, v in self.default_system_per_server.items() if v != name
+        }
+        self.default_system_per_channel = {
+            k: v for k, v in self.default_system_per_channel.items() if v != name
+        }
 
     def set_global_default_system(self, name: str):
         self.get_system(name)
