@@ -419,6 +419,23 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "always means an unbounded recursive function."
         ),
     },
+    "random_seed": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "Seed for the match's formula RNG (random_int / random_string). "
+            "Empty (default) means UNSEEDED — every roll is independent. "
+            "Set a non-empty value to make rolls reproducible: the match "
+            "uses a dedicated random.Random seeded with this string, so a "
+            "given sequence of rolls replays identically. The RNG resets "
+            "to the seed when the match (re)loads or when the seed value "
+            "changes — the seed itself is saved with the match, but the "
+            "live RNG cursor position is not, so reproducibility is from "
+            "the seed-set / load point, not across arbitrary mid-session "
+            "save/load. Mainly useful for testing encounters and for "
+            "deterministic replays."
+        ),
+    },
     # ---- Match history / autosave / undo --------------------------------
     # The MatchHistory module (see match_history.py) takes three kinds of
     # autosave: round-start (after on_round_start hooks), turn-start
@@ -2453,6 +2470,14 @@ class Match:
     # false under 'immediate' policy (the rebuild ran inline so
     # nothing was deferred). Cleared at every successful rebuild.
     _turn_order_dirty: bool = field(default=False, repr=False)
+
+    # Runtime-only seeded RNG for formulas, lazily built by the formula
+    # engine when the random_seed rule is non-empty. Not serialized: the
+    # seed (a rule) is saved, but the live cursor position is not — a
+    # reloaded match reseeds from scratch. _rng_seed tracks which seed
+    # _rng was built with so a seed change triggers a rebuild.
+    _rng: Any = field(default=None, repr=False, compare=False)
+    _rng_seed: Any = field(default=None, repr=False, compare=False)
 
     # ---- global constraints / helpers (unchanged in spirit) ----
     def in_bounds(self, x: int, y: int) -> bool:

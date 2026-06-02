@@ -32,14 +32,25 @@ The only way to touch entity state is the magic `entity[X].path` form:
   entity["rogue"].hp               same as entity[rogue].hp (string-literal id)
 
 The X inside the brackets may be:
-  - A bare identifier:      entity[hero]
+  - A bare identifier:      entity[hero]    (the literal entity id "hero")
   - A string literal:       entity["hero"]
-  - One of two specials:
+  - One of the specials:
       entity[this]    or entity[current]   -> the entity whose turn it is now
       entity[self]                          -> the entity bound by the current
                                                frame (the passive's owner, or
                                                the target of a command). In an
                                                !eval call `self` is unbound.
+  - Any other expression (DYNAMIC):  evaluated at runtime, its value used
+    as the entity id. Examples:
+      entity[entity[self].target_id].hp    -> read self's target_id var,
+                                              then that entity's hp
+      entity[nearest_entity(self, "hostile")].hp
+      entity[eid].hp    inside a function whose parameter is `eid`
+                        -> uses the value passed for eid (a bare identifier
+                           is dynamic ONLY when it's a function parameter;
+                           otherwise it stays a literal id, so existing
+                           entity[goblin] references are unaffected)
+    A dynamic index that doesn't evaluate to a string raises FormulaError.
 
 Reading a path that does not exist raises FormulaError. There are no silent
 defaults. If you need a default, write it explicitly: e.g.
@@ -295,11 +306,12 @@ class FormulaError(VTTError):
 # special-casing in the validator is needed beyond their inclusion in
 # _ALLOWED_FUNCS below.
 
-def _random_int(lo: Any, hi: Any) -> int:
-    """random_int(lo, hi): inclusive on both ends, like a die roll.
-    The match never has a seed so successive calls are independent;
-    if a GM wants repeatable rolls they should write the choice out
-    by hand instead."""
+# The random helpers take an `rng` (either the `random` module itself
+# for unseeded global rolls, or a match-bound random.Random instance
+# when the random_seed rule is set — see FormulaEngine._namespace).
+# Both expose .randint / .choice so the same impl works for either.
+
+def _random_int_impl(rng, lo: Any, hi: Any) -> int:
     if not isinstance(lo, int):
         raise FormulaError(
             f"random_int(lo, hi): lo must be int, got "
@@ -314,14 +326,10 @@ def _random_int(lo: Any, hi: Any) -> int:
         raise FormulaError(
             f"random_int(lo, hi): lo ({lo}) must be <= hi ({hi})."
         )
-    return random.randint(lo, hi)
+    return rng.randint(lo, hi)
 
 
-def _random_string(*choices: Any) -> str:
-    """random_string("a", "b", ...): uniform pick from the arguments.
-    Each argument must be a string — passing ints by accident would
-    return a non-string and surprise downstream string comparisons,
-    so we surface that as a FormulaError instead."""
+def _random_string_impl(rng, choices) -> str:
     if not choices:
         raise FormulaError(
             "random_string(...): requires at least one argument."
@@ -332,7 +340,26 @@ def _random_string(*choices: Any) -> str:
                 f"random_string(...): all arguments must be strings; "
                 f"argument {i} is {type(c).__name__} ({c!r})."
             )
-    return random.choice(choices)
+    return rng.choice(choices)
+
+
+def _random_int(lo: Any, hi: Any) -> int:
+    """random_int(lo, hi): inclusive on both ends, like a die roll.
+
+    By default rolls are independent (unseeded global RNG). If the match
+    sets the `random_seed` rule, the engine shadows this with a
+    match-bound seeded RNG so a session's rolls become reproducible —
+    see the random_seed rule docs."""
+    return _random_int_impl(random, lo, hi)
+
+
+def _random_string(*choices: Any) -> str:
+    """random_string("a", "b", ...): uniform pick from the arguments.
+    Each argument must be a string — passing ints by accident would
+    return a non-string and surprise downstream string comparisons,
+    so we surface that as a FormulaError instead. Honors the
+    random_seed rule the same way random_int does."""
+    return _random_string_impl(random, choices)
 
 
 # Distance modes accepted by the distance() formula function. The full
@@ -833,7 +860,7 @@ class EvalCtx:
     target: Optional[str] = None
     extras: Optional[Dict[str, Any]] = None
 
-    def resolve_who(self, token: str) -> str:
+    def resolve_who(self, token: Any) -> str:
         if token in ("this", "current"):
             if not self.this:
                 raise FormulaError(
@@ -844,60 +871,93 @@ class EvalCtx:
             if not self.target:
                 raise FormulaError("'self' is unbound in this context.")
             return self.target
-        return token  # literal entity id
+        # Anything else is treated as a literal entity id. For the dynamic
+        # entity[<expr>] form the expression is evaluated at runtime and
+        # its (already-computed) value lands here — guard against a
+        # non-string so entity[5] / entity[some_dict] fail clearly rather
+        # than as a downstream "entity not found".
+        if not isinstance(token, str):
+            raise FormulaError(
+                f"entity[...] index must be an entity id string, got "
+                f"{type(token).__name__}."
+            )
+        return token
 
 
 # --- AST flattening / rewriting ---------------------------------------------
 
-def _who_from_slice(node: ast.AST) -> str:
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
-    raise FormulaError(
-        'entity[...] index must be a bare identifier (entity[rogue]) '
-        'or a string literal (entity["rogue"]).'
-    )
+class _EntityAccessTransformer(ast.NodeTransformer):
+    """Rewrites entity[X].path reads/writes into __read/__write helper calls.
 
+    The index X in entity[X] may be:
+      - a special token (self / this / current)   -> resolved at runtime
+      - a bare identifier that is a known function parameter -> evaluated
+        at runtime (the parameter's value is the entity id)
+      - any other bare identifier                 -> a LITERAL entity id
+        (backward compatible: entity[rogue] means the entity with id
+        "rogue")
+      - a string literal                          -> a literal entity id
+      - any other expression (a call, an entity read, arithmetic on
+        strings, ...)                             -> evaluated at runtime
 
-def _flatten_entity_chain(node: ast.AST) -> Optional[Tuple[str, List[str]]]:
+    `known_params` is the set of identifiers that should be treated as
+    runtime variables rather than literal ids. It is non-empty only when
+    transforming a user-defined function body (the function's params);
+    for top-level formulas it is empty, so bare identifiers stay literal
+    and existing formulas are unaffected.
     """
-    Recognize chains of the form entity[X].a.b.c... and return
-    (who_token, ['a', 'b', 'c', ...]). Returns None if `node` is not such a chain.
-    """
-    parts: List[str] = []
-    cur = node
-    while isinstance(cur, ast.Attribute):
-        parts.append(cur.attr)
-        cur = cur.value
-    if (isinstance(cur, ast.Subscript)
-            and isinstance(cur.value, ast.Name)
-            and cur.value.id == "entity"):
-        slice_node = cur.slice
+
+    def __init__(self, known_params: "frozenset[str]" = frozenset()):
+        self.known_params = known_params
+
+    def _who_arg(self, slice_node: ast.AST) -> ast.AST:
+        """Return the AST expression to use as the `who` argument of
+        __read / __write for an entity[...] index."""
         if isinstance(slice_node, ast.Index):  # py<=3.8 wrapper, defensive
             slice_node = slice_node.value
-        who = _who_from_slice(slice_node)
-        parts.reverse()
-        return who, parts
-    return None
+        if isinstance(slice_node, ast.Name):
+            if slice_node.id in ("self", "this", "current"):
+                # Special token — pass the token string; resolve_who maps it.
+                return ast.Constant(value=slice_node.id)
+            if slice_node.id in self.known_params:
+                # Dynamic: the parameter's bound value is the entity id.
+                return ast.Name(id=slice_node.id, ctx=ast.Load())
+            # Bare identifier -> literal entity id (backward compatible).
+            return ast.Constant(value=slice_node.id)
+        if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, str):
+            return ast.Constant(value=slice_node.value)
+        # Any other expression -> dynamic. Recursively transform it so it
+        # may itself contain entity[...] reads / function calls, then use
+        # its runtime value as the entity id.
+        return self.visit(slice_node)
 
-
-class _EntityAccessTransformer(ast.NodeTransformer):
-    """Rewrites entity[X].path reads/writes into __read/__write helper calls."""
+    def _flatten(self, node: ast.AST) -> Optional[Tuple[ast.AST, List[str]]]:
+        """Recognize entity[X].a.b.c and return (who_arg_ast, ['a','b','c'])
+        or None if `node` isn't such a chain."""
+        parts: List[str] = []
+        cur = node
+        while isinstance(cur, ast.Attribute):
+            parts.append(cur.attr)
+            cur = cur.value
+        if (isinstance(cur, ast.Subscript)
+                and isinstance(cur.value, ast.Name)
+                and cur.value.id == "entity"):
+            who_arg = self._who_arg(cur.slice)
+            parts.reverse()
+            return who_arg, parts
+        return None
 
     def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
-        # Don't recurse: the whole chain is handled at once by _flatten.
-        match = _flatten_entity_chain(node)
-        if match is None:
+        flat = self._flatten(node)
+        if flat is None:
             raise FormulaError("Attribute access is only allowed on entity[X].path.")
-        who, parts = match
+        who_arg, parts = flat
         if not parts:
             raise FormulaError("entity[X] must be followed by .path.")
         return ast.copy_location(
             ast.Call(
                 func=ast.Name(id="__read", ctx=ast.Load()),
-                args=[ast.Constant(value=who),
-                      ast.Constant(value=".".join(parts))],
+                args=[who_arg, ast.Constant(value=".".join(parts))],
                 keywords=[],
             ),
             node,
@@ -908,15 +968,15 @@ class _EntityAccessTransformer(ast.NodeTransformer):
         node.value = self.visit(node.value)
         if len(node.targets) != 1:
             raise FormulaError("Chained / tuple assignment is not supported.")
-        match = _flatten_entity_chain(node.targets[0])
-        if match is None:
+        flat = self._flatten(node.targets[0])
+        if flat is None:
             raise FormulaError("Assignment target must be entity[X].path.")
-        who, parts = match
+        who_arg, parts = flat
         if not parts:
             raise FormulaError("entity[X] must be followed by .path.")
         call = ast.Call(
             func=ast.Name(id="__write", ctx=ast.Load()),
-            args=[ast.Constant(value=who),
+            args=[who_arg,
                   ast.Constant(value=".".join(parts)),
                   node.value],
             keywords=[],
@@ -1138,6 +1198,26 @@ class FormulaEngine:
         _CONTEXT_DEFAULTS = {"was_clamped": False}
         for name in HOOK_CONTEXT_NAMES:
             ns[name] = extras.get(name, _CONTEXT_DEFAULTS.get(name))
+
+        # Seeded RNG: when the random_seed rule is non-empty, shadow the
+        # global-RNG random_int/random_string with versions bound to a
+        # match-local random.Random so rolls are reproducible. The RNG
+        # lives on the match and advances across calls (so a SEQUENCE of
+        # rolls is deterministic, not every roll identical). It's rebuilt
+        # when the seed changes or the match reloads (runtime-only state).
+        seed = self._match.rules.get("random_seed", "") if self._match else ""
+        if seed:
+            rng = getattr(self._match, "_rng", None)
+            if rng is None or getattr(self._match, "_rng_seed", None) != seed:
+                rng = random.Random(seed)
+                self._match._rng = rng
+                self._match._rng_seed = seed
+            ns["random_int"] = (
+                lambda lo, hi, _r=rng: _random_int_impl(_r, lo, hi)
+            )
+            ns["random_string"] = (
+                lambda *choices, _r=rng: _random_string_impl(_r, choices)
+            )
 
         # Match-bound group functions. Each takes string args; entity-id
         # args go through ctx.resolve_who so the special tokens "self",
@@ -1481,7 +1561,10 @@ class FormulaEngine:
         trailing_expr = None
         if full.body and isinstance(full.body[-1], ast.Expr):
             trailing_expr = full.body.pop().value
-        full = _EntityAccessTransformer().visit(full)
+        # Pass known_params so the transformer treats parameter names used
+        # as entity[<param>] indices as dynamic runtime values, not
+        # literal ids.
+        full = _EntityAccessTransformer(known_params).visit(full)
         ast.fix_missing_locations(full)
         _validate_tree(full, known_funcs=known_funcs,
                        known_params=known_params)
@@ -1491,7 +1574,7 @@ class FormulaEngine:
         expr_code = None
         if trailing_expr is not None:
             expr_tree = ast.Expression(body=trailing_expr)
-            expr_tree = _EntityAccessTransformer().visit(expr_tree)
+            expr_tree = _EntityAccessTransformer(known_params).visit(expr_tree)
             ast.fix_missing_locations(expr_tree)
             _validate_tree(expr_tree, known_funcs=known_funcs,
                            known_params=known_params)
@@ -1515,7 +1598,7 @@ class FormulaEngine:
             tree = ast.parse(src, mode=mode)
         except SyntaxError as e:
             raise FormulaError(f"Syntax error: {e.msg}")
-        tree = _EntityAccessTransformer().visit(tree)
+        tree = _EntityAccessTransformer(known_params).visit(tree)
         ast.fix_missing_locations(tree)
         _validate_tree(tree, known_funcs=known_funcs, known_params=known_params)
         return tree
