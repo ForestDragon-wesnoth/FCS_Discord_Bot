@@ -72,10 +72,16 @@ Boolean:           and  or  not
 Ternary:           value_if_true if cond else value_if_false
 
 Allowed functions:
-  Core:      min, max, abs, round, int, float, str
+  Core:      min, max, abs, round, int, float, str, len
   Math:      sqrt, floor, ceil, pow, clamp(v, lo, hi), sign
   Random:    random_int, random_string
   Geometry:  distance, angle, direction_to
+  Areas:     cells_in_burst, cells_in_line, cells_in_cone  (return lists
+             of (x,y) tuples; pair with len() or, later, for-loops)
+  Spatial:   entities_within(eid, n, mode, relation),
+             nearest_entity(eid, relation, mode)  (scan alive entities
+             relative to a reference; relation = ""/"hostile"/"ally"/
+             "same_team"/"attackable")
   Teams:     is_same_team, is_hostile, is_part_of_team, is_attackable
   Groups:    group_has, group_size, group_add, group_remove
   Identity:  self_id, current_id
@@ -707,9 +713,174 @@ def _sign(v: Any) -> int:
     return 0
 
 
+def _len(v: Any) -> int:
+    """len(value): number of items in a list (or characters in a string).
+
+    Primarily the companion to the list-returning geometry functions —
+    `len(entities_within(self, 3, "square_radius_distance", "hostile"))`
+    counts nearby enemies for a condition like "if 3+ foes adjacent".
+    Until formula for-loops land, this is the main way to consume the
+    list/coordinate-list return values. Raises FormulaError on a value
+    that has no length (e.g. a number)."""
+    if isinstance(v, (list, tuple, str, dict)):
+        return len(v)
+    raise FormulaError(
+        f"len(value): value has no length (got {type(v).__name__}); "
+        f"len works on lists, strings, and the coordinate lists "
+        f"returned by cells_in_* / entities_within."
+    )
+
+
+# --- area / shape helpers ----------------------------------------------------
+# Pure geometric functions that return LISTS of (x, y) coordinate tuples
+# for an area shape. They take no match and do no grid clipping — a burst
+# at the map edge will include off-grid coordinates, which simply match
+# no tile/entity downstream. Combine with entities_within (to find who's
+# in the shape) or, once formula for-loops exist, iterate the cells
+# directly. Coordinates are 1-indexed to match the rest of the engine,
+# but nothing here enforces the grid bounds.
+
+def _coord_int(v: Any, fname: str, argname: str) -> int:
+    """Coerce a coordinate arg to int, rejecting non-numerics. Floats are
+    floored (a fractional coordinate snaps to its containing cell)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise FormulaError(
+            f"{fname}(...): {argname} must be a number, got "
+            f"{type(v).__name__}."
+        )
+    return int(math.floor(v))
+
+
+def _cells_in_burst(x: Any, y: Any, r: Any,
+                    mode: Any = "square_radius_distance") -> list:
+    """cells_in_burst(x, y, r, mode="square_radius_distance"): every cell
+    within distance r of (x, y) under the given distance metric, INCLUDING
+    the center. Shape depends on mode: square_radius -> filled square,
+    manhattan -> diamond, euclidean -> disc. Returns a list of (cx, cy)
+    tuples sorted in (x, y) order."""
+    cx0 = _coord_int(x, "cells_in_burst", "x")
+    cy0 = _coord_int(y, "cells_in_burst", "y")
+    if isinstance(r, bool) or not isinstance(r, (int, float)):
+        raise FormulaError(
+            f"cells_in_burst(...): r must be a number, got "
+            f"{type(r).__name__}."
+        )
+    if r < 0:
+        raise FormulaError(f"cells_in_burst(...): r must be >= 0, got {r}.")
+    ri = int(math.floor(r))
+    out = []
+    for cx in range(cx0 - ri, cx0 + ri + 1):
+        for cy in range(cy0 - ri, cy0 + ri + 1):
+            # Reuse _distance for the metric so burst shape exactly
+            # matches what distance()/entities_within consider "within r".
+            if _distance(cx0, cy0, cx, cy, mode) <= r:
+                out.append((cx, cy))
+    return out
+
+
+def _cells_in_line(x1: Any, y1: Any, x2: Any, y2: Any) -> list:
+    """cells_in_line(x1, y1, x2, y2): the cells on the straight line from
+    (x1,y1) to (x2,y2) inclusive, via Bresenham's algorithm. Returns a
+    list of (x, y) tuples ordered from start to end. Useful as the basis
+    of a line-of-sight or beam-attack check."""
+    ax = _coord_int(x1, "cells_in_line", "x1")
+    ay = _coord_int(y1, "cells_in_line", "y1")
+    bx = _coord_int(x2, "cells_in_line", "x2")
+    by = _coord_int(y2, "cells_in_line", "y2")
+    dx = abs(bx - ax)
+    dy = abs(by - ay)
+    sx = 1 if ax < bx else -1
+    sy = 1 if ay < by else -1
+    err = dx - dy
+    out = []
+    cx, cy = ax, ay
+    while True:
+        out.append((cx, cy))
+        if cx == bx and cy == by:
+            break
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy
+            cx += sx
+        if e2 < dx:
+            err += dx
+            cy += sy
+    return out
+
+
+# Compass angle (0=up, clockwise) of each named direction, for cone
+# orientation. Matches angle()/direction_to conventions.
+_DIRECTION_ANGLES: Dict[str, float] = {
+    "up": 0.0, "up_right": 45.0, "right": 90.0, "down_right": 135.0,
+    "down": 180.0, "down_left": 225.0, "left": 270.0, "up_left": 315.0,
+}
+
+
+def _cells_in_cone(x: Any, y: Any, direction: Any, length: Any,
+                   half_angle: Any = 45) -> list:
+    """cells_in_cone(x, y, direction, length, half_angle=45): the cells
+    inside a cone emanating from (x, y).
+
+    direction   a named direction ("up", "up_right", ...) OR a compass
+                angle in degrees (0=up, clockwise) giving the cone's
+                centerline.
+    length      the cone's reach in cells (euclidean). The origin (x,y)
+                itself is NOT included.
+    half_angle  half the cone's angular width in degrees (default 45, so
+                a 90°-wide cone). A cell is in the cone if its angular
+                offset from the centerline is <= half_angle.
+
+    Returns a list of (cx, cy) tuples sorted in (x, y) order. Reuses
+    angle()/distance() internally so the cone respects the same compass
+    conventions as the rest of the engine."""
+    cx0 = _coord_int(x, "cells_in_cone", "x")
+    cy0 = _coord_int(y, "cells_in_cone", "y")
+    if isinstance(direction, str):
+        if direction not in _DIRECTION_ANGLES:
+            allowed = ", ".join(sorted(_DIRECTION_ANGLES))
+            raise FormulaError(
+                f"cells_in_cone(...): direction '{direction}' must be a "
+                f"named direction ({allowed}) or a number."
+            )
+        center = _DIRECTION_ANGLES[direction]
+    elif isinstance(direction, (int, float)) and not isinstance(direction, bool):
+        center = float(direction) % 360.0
+    else:
+        raise FormulaError(
+            f"cells_in_cone(...): direction must be a named direction or "
+            f"a number, got {type(direction).__name__}."
+        )
+    if isinstance(length, bool) or not isinstance(length, (int, float)):
+        raise FormulaError(
+            f"cells_in_cone(...): length must be a number, got "
+            f"{type(length).__name__}."
+        )
+    if isinstance(half_angle, bool) or not isinstance(half_angle, (int, float)):
+        raise FormulaError(
+            f"cells_in_cone(...): half_angle must be a number, got "
+            f"{type(half_angle).__name__}."
+        )
+    li = int(math.floor(length))
+    out = []
+    for cx in range(cx0 - li, cx0 + li + 1):
+        for cy in range(cy0 - li, cy0 + li + 1):
+            if cx == cx0 and cy == cy0:
+                continue  # exclude the origin
+            if _distance(cx0, cy0, cx, cy, "euclidean_distance") > length:
+                continue
+            a = _angle(cx0, cy0, cx, cy)  # compass degrees, 0=up cw
+            diff = abs(a - center) % 360.0
+            if diff > 180.0:
+                diff = 360.0 - diff
+            if diff <= half_angle:
+                out.append((cx, cy))
+    return out
+
+
 _ALLOWED_FUNCS: Dict[str, Any] = {
     "min": min, "max": max, "abs": abs, "round": round,
     "int": int, "float": float, "str": str,
+    "len": _len,
     "random_int": _random_int,
     "random_string": _random_string,
     "distance": _distance,
@@ -721,6 +892,9 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
     "pow": _pow,
     "clamp": _clamp,
     "sign": _sign,
+    "cells_in_burst": _cells_in_burst,
+    "cells_in_line": _cells_in_line,
+    "cells_in_cone": _cells_in_cone,
 }
 
 # Match-bound function names. These functions are bound at namespace build
@@ -783,6 +957,16 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # NOT silently flip is_hostile-keyed formulas (which often gate
     # heal/buff decisions on team identity, not target legality).
     "is_same_team", "is_hostile", "is_part_of_team", "is_attackable",
+    # Spatial-query helpers. Both scan match.entities relative to a
+    # reference entity, exclude the reference itself, consider only
+    # ALIVE entities (matching occupancy/turn-order conventions), and
+    # accept an optional `relation` filter ("hostile" / "ally" /
+    # "same_team" / "attackable" / "" for no filter):
+    #   entities_within(eid, n, mode, relation)  -> list of ids in range,
+    #                                               sorted by (distance, id)
+    #   nearest_entity(eid, relation, mode)      -> single closest id, or
+    #                                               "" if none match
+    "entities_within", "nearest_entity",
 )
 
 _ALLOWED_NODES: Tuple[type, ...] = (
@@ -1476,6 +1660,82 @@ class FormulaEngine:
         ns["is_hostile"]     = _is_hostile
         ns["is_part_of_team"] = _is_part_of_team
         ns["is_attackable"]  = _is_attackable
+
+        # ---- spatial-query helpers ----
+        # Shared relation filter for entities_within / nearest_entity.
+        # `relation` selects which other entities count, relative to the
+        # reference entity `ref`. "" / "any" = no filter. The named
+        # relations reuse the team-predicate closures above so they honor
+        # team_var renames and the friendlyfire rule (for "attackable").
+        def _relation_ok(relation: str, ref: str, other: str) -> bool:
+            if relation in ("", "any"):
+                return True
+            if relation == "hostile":
+                return _is_hostile(ref, other)
+            if relation in ("ally", "same_team"):
+                return _is_same_team(ref, other)
+            if relation == "attackable":
+                return _is_attackable(ref, other)
+            raise FormulaError(
+                f"unknown relation '{relation}'. Allowed: any, hostile, "
+                f"ally, same_team, attackable."
+            )
+
+        def _candidates(ref_eid: str, relation: str):
+            """Yield (other_eid, entity) for every ALIVE entity other than
+            ref_eid that passes the relation filter."""
+            ref_e = match.entities.get(ref_eid)
+            if ref_e is None:
+                raise FormulaError(f"unknown entity id '{ref_eid}'.")
+            for oid, oe in match.entities.items():
+                if oid == ref_eid:
+                    continue
+                if not oe.is_alive:
+                    continue
+                if not _relation_ok(relation, ref_eid, oid):
+                    continue
+                yield oid, oe, ref_e
+
+        def _entities_within(eid_token: Any, n: Any,
+                             mode: Any = "square_radius_distance",
+                             relation: Any = "") -> list:
+            eid = _eid(eid_token)
+            if isinstance(n, bool) or not isinstance(n, (int, float)):
+                raise FormulaError(
+                    f"entities_within(eid, n, ...): n must be a number, "
+                    f"got {type(n).__name__}."
+                )
+            if not isinstance(relation, str):
+                raise FormulaError(
+                    "entities_within(...): relation must be a string."
+                )
+            scored = []
+            for oid, oe, ref_e in _candidates(eid, relation):
+                d = _distance(ref_e.x, ref_e.y, oe.x, oe.y, mode)
+                if d <= n:
+                    scored.append((d, oid))
+            scored.sort(key=lambda t: (t[0], t[1]))
+            return [oid for _, oid in scored]
+
+        def _nearest_entity(eid_token: Any, relation: Any = "",
+                            mode: Any = "square_radius_distance") -> str:
+            eid = _eid(eid_token)
+            if not isinstance(relation, str):
+                raise FormulaError(
+                    "nearest_entity(...): relation must be a string."
+                )
+            best_id = ""
+            best_d = None
+            for oid, oe, ref_e in _candidates(eid, relation):
+                d = _distance(ref_e.x, ref_e.y, oe.x, oe.y, mode)
+                # Tie-break by id so the result is deterministic.
+                if best_d is None or d < best_d or (d == best_d and oid < best_id):
+                    best_d = d
+                    best_id = oid
+            return best_id
+
+        ns["entities_within"] = _entities_within
+        ns["nearest_entity"]  = _nearest_entity
 
         # User-defined formula functions. Each becomes a Python callable
         # in the namespace. The callable binds its arguments to the
