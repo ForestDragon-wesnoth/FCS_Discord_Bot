@@ -6828,3 +6828,126 @@ This confirms on_entity_step is the per-cell event and
 on_entity_moved is the once-per-command event.
 
 
+SCENARIO 272 — Container primitives: var_has_key, var_count, var_sum
+---------------------------------------------------------------------
+
+!match new mvc1 VarContainer 6 6
+!match use mvc1
+!ent add hero Hero 30 2 2 10
+!ent set_var hero inventory.sword 1
+!ent set_var hero inventory.arrows 12
+!ent set_var hero inventory.potion 3
+!ent set_var hero inventory.broken_flag true
+!eval "var_has_key('hero', 'inventory', 'sword')"
+!eval "var_has_key('hero', 'inventory', 'shield')"
+!eval "var_has_key('hero', 'nosuch', 'anything')"
+!eval "var_count('hero', 'inventory')"
+!eval "var_count('hero', 'nosuch')"
+!eval "var_count('hero', '')"
+!eval "var_sum('hero', 'inventory')"
+!eval "var_sum('hero', 'nosuch')"
+
+Expected:
+- `var_has_key('hero','inventory','sword')` -> True
+- `var_has_key('hero','inventory','shield')` -> False
+- `var_has_key('hero','nosuch','anything')` -> False (tolerant)
+- `var_count('hero','inventory')` -> 4 (sword, arrows, potion,
+  broken_flag)
+- `var_count('hero','nosuch')` -> 0 (tolerant)
+- `var_count('hero','')` -> the entity's top-level var count
+  (inventory + the vital vars set by !ent add: hp, max_hp,
+  initiative — exact number depends on defaults; >= 4)
+- `var_sum('hero','inventory')` -> 16 (1 + 12 + 3; the
+  `broken_flag` True is a bool and is skipped explicitly)
+- `var_sum('hero','nosuch')` -> 0
+
+
+SCENARIO 273 — var_max_key, var_min_key, var_pick_random
+---------------------------------------------------------
+
+!match new mvc2 VarExtrema 6 6
+!match use mvc2
+!ent add hero Hero 30 2 2 10
+!ent set_var hero inv.sword 5
+!ent set_var hero inv.bow 8
+!ent set_var hero inv.dagger 8
+!ent set_var hero inv.arrows 2
+!eval "var_max_key('hero', 'inv')"
+!eval "var_min_key('hero', 'inv')"
+!eval "var_max_key('hero', 'nosuch')"
+!eval "var_min_key('hero', 'nosuch')"
+!system set default random_seed picktest
+!eval "var_pick_random('hero', 'inv')"
+!eval "var_pick_random('hero', 'inv')"
+!eval "var_pick_random('hero', 'inv')"
+!eval "var_pick_random('hero', 'empty_dict_var')"
+
+Expected:
+- `var_max_key` -> 'bow' (8 wins; bow comes before dagger in
+  insertion order, so the tie breaks to bow)
+- `var_min_key` -> 'arrows' (2)
+- `var_max_key`/`var_min_key` on missing -> None
+- After setting random_seed, three var_pick_random calls return
+  reproducible (but not necessarily identical) keys from
+  {sword,bow,dagger,arrows}. Re-running this scenario produces
+  the same three picks.
+- `var_pick_random` on missing -> None (no error).
+
+
+SCENARIO 274 — var_clear drops children and fires on_var_removed
+-----------------------------------------------------------------
+
+!match new mvc3 VarClear 6 6
+!match use mvc3
+!ent add hero Hero 30 2 2 10
+!ent set_var hero inventory.sword 1
+!ent set_var hero inventory.arrows 12
+!ent set_var hero loot.gold 50
+!ent set_var hero notes "draft"
+!ent set_var hero drop_count 0
+!passive add hero loss_counter on_var_removed "entity[self].drop_count = entity[self].drop_count + 1"
+!eval "var_clear('hero', 'inventory')"
+!ent dump hero
+!eval "var_has('hero', 'inventory')"
+!eval "var_count('hero', 'inventory')"
+!eval "var_clear('hero', 'notes')"
+!ent dump hero
+!eval "var_has('hero', 'notes')"
+!eval "var_clear('hero', 'nosuch')"
+
+Expected:
+- `var_clear('hero','inventory')` -> 2 (sword and arrows removed).
+  The container `inventory` is still present as an empty dict, so
+  `var_has('hero','inventory')` stays True and
+  `var_count('hero','inventory')` returns 0. The on_var_removed
+  passive fired for each removed child: drop_count is now 2.
+- `var_clear('hero','notes')` -> 1 (leaf scalar removed entirely).
+  `var_has('hero','notes')` is now False. drop_count is 3.
+- `var_clear('hero','nosuch')` -> 0 (missing is a no-op, no error).
+  drop_count stays at 3.
+
+
+SCENARIO 275 — Container primitives compose for an inventory pattern
+---------------------------------------------------------------------
+
+!match new mvc4 VarComposition 6 6
+!match use mvc4
+!ent add hero Hero 30 2 2 10
+!ent set_var hero pack.rations 5
+!ent set_var hero pack.torch 3
+!ent set_var hero pack.rope 1
+!ent set_var hero weight 0
+!eval --as hero "for item in var_keys('hero', 'pack'):\n    entity[self].weight = entity[self].weight + var_get('hero', 'pack.' + item)"
+!eval "var_sum('hero', 'pack')"
+!ent dump hero
+
+Expected: The explicit for-loop over `var_keys` reads each
+child via `var_get` and accumulates into `entity[hero].weight`,
+which ends up at 9 (5+3+1). The shorthand `var_sum('hero','pack')`
+returns 9 too. The composition demonstrates that var_keys +
+var_get covers the same ground as the dedicated `var_sum`; the
+latter is purely a convenience. This is the canonical "carry-
+weight summing" pattern without a hardcoded inventory: pack
+contents are just numeric vars under a GM-chosen path.
+
+
