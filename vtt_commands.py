@@ -1977,7 +1977,8 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if _find_match_entity(m, e, predicates)]
     if not hits:
         return await ctx.send("No entities match.")
-    lines = [f"**{len(hits)} match(es):**"]
+    word = "match" if len(hits) == 1 else "matches"
+    lines = [f"**{len(hits)} {word}:**"]
     for e in hits:
         lines.append(f"- {_entity_line(e)}")
     return await ctx.send("\n".join(lines))
