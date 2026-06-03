@@ -374,7 +374,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import random
 
-from logic import VTTError
+from logic import VTTError, NotFound
 
 
 class FormulaError(VTTError):
@@ -1115,6 +1115,23 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   var_del(eid, "path")          -> bool (True iff existed; routes
     #                                    through remove_var)
     "var_keys", "var_has", "var_get", "var_set", "var_del",
+    # Container-shape introspection / convenience over the SAME var
+    # path machinery. None of these encode an "inventory" concept —
+    # they're generic operations on dicts living under entity.vars.
+    #   var_has_key(eid, path, key)  -> bool (path is a dict that has
+    #                                   `key`); tolerant of shape
+    #   var_count(eid, path="")      -> int (immediate-child count)
+    #   var_sum(eid, path="")        -> number (sum of numeric children;
+    #                                   non-numeric skipped silently)
+    #   var_max_key(eid, path="")    -> str|None (key of largest child;
+    #                                   ties: insertion order)
+    #   var_min_key(eid, path="")    -> str|None
+    #   var_pick_random(eid, path="") -> str|None (honors random_seed)
+    #   var_clear(eid, path="")      -> int (children removed; fires
+    #                                   on_var_removed per child)
+    "var_has_key", "var_count", "var_sum",
+    "var_max_key", "var_min_key", "var_pick_random",
+    "var_clear",
     # Tile-key introspection: tile_keys(x, y) -> top-level keys in the
     # tile's data dict (symmetric companion to tile_get/tile_has).
     "tile_keys",
@@ -2693,6 +2710,209 @@ class FormulaEngine:
         ns["var_get"]  = _var_get
         ns["var_set"]  = _var_set
         ns["var_del"]  = _var_del
+
+        def _var_has_key(eid_t: Any, path: Any, key: Any) -> bool:
+            """var_has_key(eid, path, key): True iff the value at `path`
+            is a dict that contains `key`. Tolerant — returns False if
+            `path` is missing or resolves to a non-dict, never raises
+            on shape (so a passive can guard `if var_has_key(self,
+            'inventory', 'sword'): ...` without first checking that
+            inventory exists). The companion to `var_has(eid, path)`:
+            that one asks "does this path resolve at all", this one
+            asks "is this path a dict with this specific child key"."""
+            if not isinstance(path, str):
+                raise FormulaError("var_has_key(eid, path, key): path must be a string.")
+            if not isinstance(key, str) or not key:
+                raise FormulaError(
+                    "var_has_key(eid, path, key): key must be a "
+                    "non-empty string."
+                )
+            _, e = _resolve_entity(eid_t, "var_has_key")
+            cur: Any = e.vars
+            if path:
+                for seg in path.split("."):
+                    if not isinstance(cur, dict) or seg not in cur:
+                        return False
+                    cur = cur[seg]
+            return isinstance(cur, dict) and key in cur
+
+        def _var_count(eid_t: Any, path: Any = "") -> int:
+            """var_count(eid, path=""): number of immediate children at
+            the dotted vars path. Empty path = number of top-level vars.
+            Missing path or non-dict at path returns 0 (the read-side
+            functions are tolerant — they answer "how many" not "is the
+            shape valid")."""
+            if not isinstance(path, str):
+                raise FormulaError("var_count(eid, path): path must be a string.")
+            _, e = _resolve_entity(eid_t, "var_count")
+            cur: Any = e.vars
+            if path:
+                for seg in path.split("."):
+                    if not isinstance(cur, dict) or seg not in cur:
+                        return 0
+                    cur = cur[seg]
+            if not isinstance(cur, dict):
+                return 0
+            return len(cur)
+
+        def _var_sum(eid_t: Any, path: Any = "") -> Any:
+            """var_sum(eid, path=""): sum of the immediate-child numeric
+            values at the dotted vars path. Non-numeric children (dicts,
+            strings, bools, None) are skipped silently — the GM hasn't
+            committed to all children being numbers, and skipping is the
+            useful behavior for mixed-shape containers. Missing path or
+            non-dict at path returns 0. Result is int if every contri-
+            buting value was int, otherwise float (Python's natural
+            sum() promotion)."""
+            if not isinstance(path, str):
+                raise FormulaError("var_sum(eid, path): path must be a string.")
+            _, e = _resolve_entity(eid_t, "var_sum")
+            cur: Any = e.vars
+            if path:
+                for seg in path.split("."):
+                    if not isinstance(cur, dict) or seg not in cur:
+                        return 0
+                    cur = cur[seg]
+            if not isinstance(cur, dict):
+                return 0
+            total: Any = 0
+            for v in cur.values():
+                # Bool is a subclass of int in Python; exclude it
+                # explicitly so a True flag doesn't contribute 1 to an
+                # inventory total. Strings and dicts are non-numeric.
+                if isinstance(v, bool):
+                    continue
+                if isinstance(v, (int, float)):
+                    total = total + v
+            return total
+
+        def _var_extremum_key(eid_t: Any, path: str, *,
+                              fname: str, want_max: bool) -> Any:
+            """Shared core for var_max_key / var_min_key. Returns the
+            child key with the highest (or lowest) numeric value. Ties
+            break to insertion order (first-seen wins) so successive
+            calls are deterministic for a fixed dict. None for
+            missing path / non-dict / no numeric children."""
+            if not isinstance(path, str):
+                raise FormulaError(f"{fname}(eid, path): path must be a string.")
+            _, e = _resolve_entity(eid_t, fname)
+            cur: Any = e.vars
+            if path:
+                for seg in path.split("."):
+                    if not isinstance(cur, dict) or seg not in cur:
+                        return None
+                    cur = cur[seg]
+            if not isinstance(cur, dict):
+                return None
+            best_key: Any = None
+            best_val: Any = None
+            for k, v in cur.items():
+                if isinstance(v, bool):
+                    continue
+                if not isinstance(v, (int, float)):
+                    continue
+                if best_val is None or (
+                    v > best_val if want_max else v < best_val
+                ):
+                    best_key = k
+                    best_val = v
+            return best_key
+
+        def _var_max_key(eid_t: Any, path: Any = "") -> Any:
+            """var_max_key(eid, path=""): the immediate-child key whose
+            numeric value is largest. None if path missing, non-dict,
+            or no numeric children. Ties break to insertion order."""
+            return _var_extremum_key(eid_t, path, fname="var_max_key", want_max=True)
+
+        def _var_min_key(eid_t: Any, path: Any = "") -> Any:
+            """var_min_key(eid, path=""): the immediate-child key whose
+            numeric value is smallest. None if path missing, non-dict,
+            or no numeric children. Ties break to insertion order."""
+            return _var_extremum_key(eid_t, path, fname="var_min_key", want_max=False)
+
+        def _var_pick_random(eid_t: Any, path: Any = "") -> Any:
+            """var_pick_random(eid, path=""): a randomly-chosen immediate-
+            child key. None if path missing / non-dict / empty. Honors
+            the random_seed rule the same way random_int does — when a
+            seed is set, picks come from the match-bound seeded RNG so
+            a session is reproducible."""
+            if not isinstance(path, str):
+                raise FormulaError("var_pick_random(eid, path): path must be a string.")
+            _, e = _resolve_entity(eid_t, "var_pick_random")
+            cur: Any = e.vars
+            if path:
+                for seg in path.split("."):
+                    if not isinstance(cur, dict) or seg not in cur:
+                        return None
+                    cur = cur[seg]
+            if not isinstance(cur, dict) or not cur:
+                return None
+            keys = list(cur.keys())
+            rng = getattr(self._match, "_rng", None) if self._match else None
+            if rng is not None:
+                return rng.choice(keys)
+            return random.choice(keys)
+
+        def _var_clear(eid_t: Any, path: Any = "") -> int:
+            """var_clear(eid, path=""): drop the contents at `path`.
+            If `path` resolves to a dict, removes each immediate child
+            (subtree removal — grandchildren fire on_var_removed too,
+            same as remove_var elsewhere). The container itself is
+            left in place as an empty dict, so `var_has(eid, path)`
+            still returns True afterwards — the inventory still
+            exists, it's just empty. If `path` is a leaf scalar, the
+            var itself is removed (return 1). Missing path is a
+            no-op (return 0). Empty path = clear ALL top-level vars,
+            which the engine refuses on vital paths (initiative /
+            team_var / hp_var) at the remove_var layer; those will
+            simply be skipped and not counted as removed."""
+            if not isinstance(path, str):
+                raise FormulaError("var_clear(eid, path): path must be a string.")
+            eid, e = _resolve_entity(eid_t, "var_clear")
+            cur: Any = e.vars
+            if path:
+                for seg in path.split("."):
+                    if not isinstance(cur, dict) or seg not in cur:
+                        return 0
+                    cur = cur[seg]
+            if not isinstance(cur, dict):
+                # Leaf scalar at `path` — drop the var itself.
+                # Path is non-empty here (root is always a dict).
+                try:
+                    e.remove_var(path)
+                except VTTError as ex:
+                    raise FormulaError(str(ex))
+                engine._note_affected(eid)
+                return 1
+            # Dict at `path`. Remove each immediate child individually
+            # so on_var_removed fires per child (matching the natural
+            # "you lost item X" event pattern). Iterate a snapshot of
+            # keys so a passive that mutates vars during fire doesn't
+            # invalidate the iterator.
+            children = list(cur.keys())
+            removed = 0
+            for k in children:
+                child_path = f"{path}.{k}" if path else k
+                try:
+                    e.remove_var(child_path)
+                    removed += 1
+                except (VTTError, NotFound):
+                    # Vital-var protection (initiative / team / hp) or
+                    # races with concurrent passive mutation: skip and
+                    # keep going. The count reflects what we ACTUALLY
+                    # removed, not what we tried to remove.
+                    continue
+            if removed:
+                engine._note_affected(eid)
+            return removed
+
+        ns["var_has_key"]    = _var_has_key
+        ns["var_count"]      = _var_count
+        ns["var_sum"]        = _var_sum
+        ns["var_max_key"]    = _var_max_key
+        ns["var_min_key"]    = _var_min_key
+        ns["var_pick_random"] = _var_pick_random
+        ns["var_clear"]      = _var_clear
 
         def _status_names(eid_t: Any) -> list:
             """status_names(eid): names of active statuses, in insertion
