@@ -796,6 +796,106 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(f"Channel default GameSystem is now `{name}`.")
         else:
             return await ctx.send("Scope must be one of: global | server | channel")
+
+    # ---- system alias <subcommand> -----------------------------------
+    # System-level alias library. These don't affect any currently live
+    # match (parallel to how `!system set` only refreshes rules via
+    # refresh_match_rules); new matches in this system pick them up.
+    if sub == "alias":
+        if await return_help_if_not_enough_args(ctx, args, 3, "system", "alias"):
+            return
+        action = args[1].lower()
+        sys_name = args[2]
+        s = mgr.get_system(sys_name)
+
+        if action == "list":
+            if not s.aliases:
+                return await ctx.send(
+                    f"No aliases defined on system `{sys_name}`."
+                )
+            lines = [f"**Aliases on `{sys_name}`:**"]
+            for aname in sorted(s.aliases.keys()):
+                exp = s.aliases[aname]
+                snippet = exp if len(exp) <= 60 else exp[:57] + "..."
+                lines.append(f"- `!{aname}` → `!{snippet}`")
+            return await ctx.send("\n".join(lines))
+
+        if action == "info":
+            if len(args) < 4:
+                return await ctx.send(
+                    "Usage: `!system alias info <system> <name>`."
+                )
+            aname = args[3]
+            exp = s.aliases.get(aname)
+            if exp is None:
+                return await ctx.send(
+                    f"❌ alias `{aname}` not defined on system `{sys_name}`."
+                )
+            return await ctx.send(f"**`!{aname}`** on `{sys_name}` → `!{exp}`")
+
+        if action == "def":
+            # `!system alias def <system> <name> <expansion>` mirrors
+            # `!alias def` but on the system. We re-use the match-level
+            # validator's contract (first token of expansion must be a
+            # real registered command) — system-level aliases are NOT
+            # allowed to chain into other aliases either.
+            if len(args) < 5:
+                return await ctx.send(
+                    "Usage: `!system alias def <system> <name> <expansion>`."
+                )
+            aname = args[3]
+            expansion = " ".join(args[4:]).strip()
+            if not expansion:
+                return await ctx.send("❌ alias expansion cannot be empty.")
+            if not aname or any(c.isspace() for c in aname):
+                return await ctx.send(
+                    f"❌ invalid alias name `{aname}`: names must be a "
+                    f"single whitespace-free token."
+                )
+            import shlex as _shlex
+            try:
+                tokens = _shlex.split(expansion)
+            except ValueError as ex:
+                return await ctx.send(f"❌ invalid alias expansion: {ex}")
+            if not tokens:
+                return await ctx.send("❌ alias expansion cannot be empty.")
+            target = tokens[0]
+            if target not in registry._handlers:
+                return await ctx.send(
+                    f"❌ alias expansion must start with a real command; "
+                    f"`{target}` is not a registered command."
+                )
+            prior = s.aliases.get(aname)
+            s.aliases[aname] = expansion
+            if prior is not None:
+                return await ctx.send(
+                    f"Redefined alias `{aname}` on `{sys_name}` "
+                    f"(was `!{prior}`, now `!{expansion}`)."
+                )
+            return await ctx.send(
+                f"Defined alias `!{aname}` → `!{expansion}` on `{sys_name}`."
+            )
+
+        if action in ("del", "delete", "remove", "rm"):
+            if len(args) < 4:
+                return await ctx.send(
+                    "Usage: `!system alias del <system> <name>`."
+                )
+            aname = args[3]
+            if aname not in s.aliases:
+                return await ctx.send(
+                    f"❌ alias `{aname}` not defined on system `{sys_name}`."
+                )
+            del s.aliases[aname]
+            return await ctx.send(
+                f"Deleted alias `{aname}` from system `{sys_name}`."
+            )
+
+        return await ctx.send(
+            f"Unknown `!system alias` action `{action}`. "
+            f"Use one of: def, del, list, info."
+        )
+
     title, body = registry.help_for(["system"])
     return await ctx.send(f"**{title}**\n{body}")
 registry.annotate_sub("system", "list", usage="!system list", desc="List existing GameSystems.")
@@ -815,6 +915,21 @@ registry.annotate_sub(
     ),
 )
 registry.annotate_sub("system", "set", usage="!system set <name> <key> <value>", desc="Change a GameSystem setting (booleans/int auto-coerced). Use \"\" to clear a string rule.")
+registry.annotate_sub(
+    "system", "alias",
+    usage=(
+        "!system alias <def|del|list|info> <system> [<name> [<expansion>]]"
+    ),
+    desc=(
+        "Manage a GameSystem's alias library. Aliases are copied into "
+        "every NEW match created under this system (same inherit-at-"
+        "create pattern as tile templates and formula functions); "
+        "match-side `!alias` edits afterwards don't reach back here. "
+        "Forms: `def <sys> <name> <expansion>`, `del <sys> <name>`, "
+        "`list <sys>`, `info <sys> <name>`. The expansion's first "
+        "token must be a real registered command (no alias chains)."
+    ),
+)
 registry.annotate_sub("system", "default", usage="!system default <global|server|channel> <name>", desc="Set default GameSystem.")
 
 # ---- group fan-out helpers -------------------------------------------------

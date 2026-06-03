@@ -6733,3 +6733,98 @@ context names, entity tokens, and user-defined function names —
 e.g. 'move_entity', 'entity_groups'). `!eval "minn(1,2)"` fails
 with "Function 'minn' is not allowed. Did you mean: 'min'?"
 
+
+SCENARIO 269 — !system alias library inherits into new matches
+---------------------------------------------------------------
+
+!system new SysAlias
+!system alias list SysAlias
+!system alias def SysAlias dmg "ent hp this"
+!system alias def SysAlias heal "ent hp this"
+!system alias list SysAlias
+!match new msa1 SysAliasMatch1 6 6 --system SysAlias
+!match use msa1
+!ent add hero Hero 30 2 2 10
+!alias list
+!dmg -7
+!ent dump hero
+!alias def heal "ent set_var this"
+!alias list
+!system alias list SysAlias
+!match new msa2 SysAliasMatch2 6 6 --system SysAlias
+!match use msa2
+!ent add ally Ally 20 1 1 8
+!alias list
+!system alias del SysAlias dmg
+!system alias list SysAlias
+!alias list
+
+Expected: Initially `!system alias list SysAlias` is empty. After
+defining `dmg` and `heal`, the system library shows both. The
+first match (msa1) inherits a copy of both, so `!alias list` on it
+shows the same two and `!dmg -7` works directly. Editing
+`heal` match-side and listing the system afterwards STILL shows
+the ORIGINAL system-side expansions — the inherit is snapshot,
+not link. The second match (msa2) also inherits both aliases at
+creation. Deleting `dmg` system-side does NOT affect already-
+created matches: `!system alias list SysAlias` shows only `heal`
+afterwards, but msa2's `!alias list` still shows both.
+
+
+SCENARIO 270 — push_entity and swap_entities formula primitives
+----------------------------------------------------------------
+
+!match new mpush PushSwap 8 8
+!match use mpush
+!ent add a A 30 1 3 10
+!ent add b B 30 3 3 9
+!ent add c C 30 5 3 8
+!eval "push_entity('a', 'right', 3)"
+!ent dump a
+!eval "push_entity('a', 'right', 5)"
+!ent dump a
+!eval "push_entity('a', 'right', 10)"
+!ent dump a
+!eval "swap_entities('a', 'b')"
+!ent dump a
+!ent dump b
+!eval "swap_entities('a', 'a')"
+!eval "swap_entities('a', 'nosuch')"
+
+Expected:
+- `push_entity('a','right',3)` -> a goes from x=1 to x=2 (one
+  cell, then b blocks at x=3). Returns 1.
+- `push_entity('a','right',5)` -> a is still at x=2, b still at
+  x=3 -> returns 0 (immediately blocked). a unchanged.
+- `push_entity('a','right',10)` after first batch -> 0 again.
+- Then `swap_entities('a','b')` -> a at (3,3), b at (2,3).
+  Returns True.
+- `swap_entities('a','a')` -> no-op, returns False (no error).
+- `swap_entities('a','nosuch')` -> raises "swap_entities:
+  unknown entity id 'nosuch'." surfaced as ❌.
+
+
+SCENARIO 271 — on_entity_step fires per cell of stepwise movement
+------------------------------------------------------------------
+
+!match new mstep StepHook 8 8
+!match use mstep
+!ent add hero Hero 30 1 4 10
+!ent set_var hero step_count 0
+!ent set_var hero move_count 0
+!passive add hero step_counter on_entity_step "entity[self].step_count = entity[self].step_count + 1"
+!passive add hero move_counter on_entity_moved "entity[self].move_count = entity[self].move_count + 1"
+!ent move hero 3 right
+!ent dump hero
+!ent tp hero 1 4
+!ent dump hero
+
+Expected: After the stepwise move (`!ent move hero 3 right`),
+`step_count` increments to 3 (one per cell) while `move_count`
+increments to 1 (one for the whole command). After `!ent tp hero
+1 4` (single-tp), `step_count` is STILL 3 (tp doesn't fire
+per-step) but `move_count` is 2 (tp fires on_entity_moved once).
+This confirms on_entity_step is the per-cell event and
+on_entity_moved is the once-per-command event.
+
+
