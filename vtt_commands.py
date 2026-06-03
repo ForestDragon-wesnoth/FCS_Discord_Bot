@@ -24,6 +24,7 @@ from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, val
 import re
 import json
 import random
+import copy
 
 # ---- Context abstraction -----------------------------------------------------
 class ReplyContext(Protocol):
@@ -1088,8 +1089,17 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
         if action == "clear":
             n = len(e.status)
+            # Snapshot for event firing, then mutate. on_status_removed
+            # fires once per status (in insertion order so reactions
+            # have a stable ordering).
+            removed = [(name, copy.deepcopy(data))
+                       for name, data in e.status.items()]
             e.status.clear()
-            return await ctx.send(f"Cleared {n} status(es) from `{eid}`.")
+            event_log: List[str] = []
+            for name, data in removed:
+                event_log.extend(m._emit_status_diff(eid, name, data, None))
+            tail = "\n" + "\n".join(event_log) if event_log else ""
+            return await ctx.send(f"Cleared {n} status(es) from `{eid}`.{tail}")
 
         if action in ("add", "remove", "rm", "del-status",
                       "info", "set", "del"):
@@ -1100,16 +1110,27 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             name = args[3]
             if action == "add":
                 if name not in e.status:
+                    before = None
                     e.status[name] = {}
-                    return await ctx.send(f"Added status `{name}` to `{eid}`.")
+                    after = copy.deepcopy(e.status[name])
+                    event_log = m._emit_status_diff(eid, name, before, after)
+                    msg = f"Added status `{name}` to `{eid}`."
+                    if event_log:
+                        msg += "\n" + "\n".join(event_log)
+                    return await ctx.send(msg)
                 return await ctx.send(
                     f"Status `{name}` already on `{eid}` (no change; use "
                     f"`set` to edit its data)."
                 )
             if action in ("remove", "rm", "del-status"):
                 if name in e.status:
+                    before = copy.deepcopy(e.status[name])
                     del e.status[name]
-                    return await ctx.send(f"Removed status `{name}` from `{eid}`.")
+                    event_log = m._emit_status_diff(eid, name, before, None)
+                    msg = f"Removed status `{name}` from `{eid}`."
+                    if event_log:
+                        msg += "\n" + "\n".join(event_log)
+                    return await ctx.send(msg)
                 return await ctx.send(f"`{eid}` has no status `{name}`.")
             if action == "info":
                 if name not in e.status:
@@ -1127,6 +1148,10 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     )
                 path = args[4]
                 value = _parse_scalar(args[5])
+                # Snapshot for the diff-based event firing. Use None for
+                # the "status didn't exist" case so set acts as an
+                # implicit add when applied to a fresh status.
+                before = copy.deepcopy(e.status.get(name)) if name in e.status else None
                 data = e.status.setdefault(name, {})
                 # Walk the dotted path, creating intermediate dicts.
                 parts_path = path.split(".")
@@ -1143,9 +1168,12 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                         cur[key] = {}
                     cur = cur[key]
                 cur[parts_path[-1]] = value
-                return await ctx.send(
-                    f"Set `{eid}.{name}.{path}` = {value!r}."
-                )
+                after = copy.deepcopy(e.status[name])
+                event_log = m._emit_status_diff(eid, name, before, after)
+                msg = f"Set `{eid}.{name}.{path}` = {value!r}."
+                if event_log:
+                    msg += "\n" + "\n".join(event_log)
+                return await ctx.send(msg)
             if action == "del":
                 if len(args) < 5:
                     return await ctx.send(
@@ -1156,6 +1184,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 if name not in e.status:
                     return await ctx.send(f"`{eid}` has no status `{name}`.")
                 path = args[4]
+                before = copy.deepcopy(e.status[name])
                 data = e.status[name]
                 parts_path = path.split(".")
                 chain = [data]
@@ -1178,9 +1207,12 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     if chain[i]:
                         break
                     del chain[i - 1][parts_path[i - 1]]
-                return await ctx.send(
-                    f"Removed `{eid}.{name}.{path}`."
-                )
+                after = copy.deepcopy(e.status[name])
+                event_log = m._emit_status_diff(eid, name, before, after)
+                msg = f"Removed `{eid}.{name}.{path}`."
+                if event_log:
+                    msg += "\n" + "\n".join(event_log)
+                return await ctx.send(msg)
         return await ctx.send(
             f"❌ unknown status action `{action}`. Use add / remove / "
             f"set / del / info / list / clear."
@@ -3468,6 +3500,46 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"cell(s) — {summary}."
         )
 
+    # ---- test <x> <y> <hook_name> [--as <eid>] ----
+    # Fire a tile's hook manually without requiring an entity transit.
+    # Pure debugging UX: lets a GM verify a hook formula works (or test
+    # a fire-while-you-edit cycle) without spawning a phantom entity
+    # and teleporting it. --as binds `self` to a specific entity (same
+    # surface as !eval --as).
+    if sub == "test":
+        if await return_help_if_not_enough_args(ctx, args, 4, "tile", "test"):
+            return
+        try:
+            x = int(args[1]); y = int(args[2])
+        except ValueError:
+            return await ctx.send("❌ expected integer x and y.")
+        hook_name = args[3]
+        # Optional --as <eid>
+        eid: Optional[str] = None
+        rest = args[4:]
+        if rest and rest[0] == "--as":
+            if len(rest) < 2:
+                return await ctx.send("❌ `--as` needs an entity id.")
+            eid = _resolve_eid(m, rest[1])
+            if eid not in m.entities:
+                return await ctx.send(f"❌ entity `{eid}` not found.")
+        from logic import TILE_HOOK_NAMES as _THN
+        if hook_name not in _THN:
+            allowed = ", ".join(sorted(_THN))
+            return await ctx.send(
+                f"❌ unknown tile hook `{hook_name}`. Allowed: {allowed}."
+            )
+        if not m.in_bounds(x, y):
+            return await ctx.send(
+                f"❌ ({x},{y}) outside {m.grid_width}x{m.grid_height}."
+            )
+        log = m.fire_tile_hook(hook_name, eid, x, y)
+        if not log:
+            return await ctx.send(
+                f"tile ({x},{y}) has no `{hook_name}` hook to fire."
+            )
+        return await ctx.send("\n".join(log))
+
     title, body = registry.help_for(["tile"])
     return await ctx.send(f"**{title}**\n{body}")
 
@@ -3629,6 +3701,22 @@ registry.annotate_sub(
         "paints a 3x3 block. All-or-nothing: every legend template must "
         "exist and every non-skip cell must be in-bounds before any "
         "tile is placed."
+    ),
+)
+registry.annotate_sub(
+    "tile", "test",
+    usage="!tile test <x> <y> <hook_name> [--as <eid>]",
+    desc=(
+        "Fire a tile's hook manually without requiring an entity transit. "
+        "Pure debugging UX: verify a hook formula works (or test "
+        "fire-while-you-edit) without spawning a phantom entity and "
+        "teleporting it. `hook_name` is one of on_enter / on_exit / "
+        "on_stop / on_round_start / on_round_end / on_turn_start / "
+        "on_turn_end. `--as <eid>` binds `self` to that entity for the "
+        "fire (same surface as !eval --as); omit it for hooks that "
+        "don't reference self. Reports the hook's own log line if one "
+        "fires, or 'no hook to fire' if the tile has no hook of that "
+        "name registered."
     ),
 )
 

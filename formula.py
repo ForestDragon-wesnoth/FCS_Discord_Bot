@@ -109,7 +109,19 @@ Allowed functions:
              `current` also work — bind to ctx.target / ctx.this as
              string ids, or to None when unbound)
   Tiles:     tile_get, tile_has, tile_set, tile_del, tile_clear,
-             tile_keys(x, y)   (top-level keys in the tile's data dict)
+             tile_keys(x, y)   (top-level keys in the tile's data dict),
+             fire_tile_hook(x, y, hook_name, eid=None)
+                                (programmatically fire a tile hook;
+                                returns log-line count — useful for
+                                chained-effect tiles and testing)
+  Movement:  move_entity(eid, x, y)   (formula-side `!ent tp` — same
+                                bounds/occupancy validation; fires
+                                tile on_enter/on_exit/on_stop and
+                                on_entity_moved; returns the new
+                                (x,y) tuple),
+             move_step(eid, direction)   (one-cell directional step;
+                                returns True if it moved, False if
+                                blocked — honors allow_diagonal_movement)
   Rules:     rule_get(name)   (read a system rule's effective value;
                                 None for unknown names)
   User-defined: any function defined via `!func def` on the match (see
@@ -314,6 +326,34 @@ values across passive firings is typically done via string concatenation
 with a separator (see the audit_log example above).
 
 ================================================================================
+OTHER EVENT-HOOK CONTEXTS
+================================================================================
+Beyond the var-event bindings, the engine fires three other event kinds
+that pass extra identifiers via the same mechanism:
+
+  on_entity_moved          fires after a tp / move_dirs / move_step /
+                            move_entity. Bindings:
+                              from_x, from_y   — old position
+                              to_x, to_y       — new position
+                              hook_name        — "on_entity_moved"
+
+  on_status_added /        fires when a status appears / disappears /
+  on_status_removed /      has data fields changed via set/del. Bindings:
+  on_status_changed          status_name        — the affected status
+                              old_value          — pre-change data dict
+                                                   (None for added)
+                              new_value          — post-change data dict
+                                                   (None for removed)
+                              hook_name          — the event kind
+
+Tile time-hooks (on_round_start, on_round_end, on_turn_start, on_turn_end)
+fire on each registered tile at the round/turn lifecycle moment.
+Bindings: tile_x, tile_y (the firing tile's coords); hook_name. `self`
+resolves to the currently-acting entity at the moment of fire (the
+entity whose turn is current); if there isn't one, `self` is unbound and
+a formula referencing it errors with the standard message.
+
+================================================================================
 SECURITY NOTES
 ================================================================================
 Formulas run with __builtins__ disabled and a curated namespace. The AST is
@@ -327,6 +367,7 @@ passives still fire.)
 """
 from __future__ import annotations
 import ast
+import copy
 import math
 import re
 from dataclasses import dataclass
@@ -976,6 +1017,23 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # hooks — a landmine's on_enter can deal damage and call
     # tile_clear() to self-destruct in one formula.
     "tile_get", "tile_has", "tile_set", "tile_del", "tile_clear",
+    # Move an entity from a formula. The geometry checks (bounds,
+    # occupancy) and side-effect firing (tile on_exit/on_enter/on_stop,
+    # on_entity_moved) are exactly the !ent tp command's, so
+    # move_entity and !ent tp are semantically interchangeable.
+    # Returns the new (x, y) as a tuple. Raises FormulaError on any
+    # validation failure (off-grid, occupied) so a formula can guard
+    # with try-equivalent patterns (a status, a flag var, etc.).
+    "move_entity",
+    # Single-step move in a named direction; returns True if the step
+    # succeeded (within bounds, destination free), False if blocked.
+    # Honors allow_diagonal_movement just like !ent move.
+    "move_step",
+    # Programmatically fire a tile hook (for chained effects, tests,
+    # or "trigger this trap from a script" patterns). The bound entity
+    # for `self` defaults to ctx.target (whoever is the caller's
+    # self); pass an explicit eid string to bind a different entity.
+    "fire_tile_hook",
     # Team relationship predicates. Each takes entity ids (strings) and
     # consults the team_var field on each entity's vars. Teamless
     # entities (var absent / empty string) are treated as singletons:
@@ -1161,6 +1219,13 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
                         # status_tick_formula evaluation (see
                         # status_tick_when / status_tick_formula rules
                         # and Match.fire_status_tick); None elsewhere.
+    # Movement-event bindings. Bound only during on_entity_moved
+    # firing (see Match.fire_entity_moved); None elsewhere. from_*
+    # are the position the entity moved FROM, to_* are where it
+    # ended up. For a stepwise move from (3,3) to (7,5), the hook
+    # fires ONCE with from=(3,3), to=(7,5) — per-step observation is
+    # via tile on_enter/on_exit.
+    "from_x", "from_y", "to_x", "to_y",
 )
 
 # Entity-id sentinel identifiers. Inside `entity[X]` these get
@@ -1900,6 +1965,136 @@ class FormulaEngine:
         ns["tile_del"] = _tile_del
         ns["tile_clear"] = _tile_clear
 
+        # ---- movement writes & tile-hook firing ----
+        # move_entity / move_step let a formula change an entity's
+        # position. The geometry / occupancy validation and the tile
+        # hook firing pipeline are exactly what Entity.tp /
+        # Entity.move_dirs do — so formula-driven movement is
+        # observationally identical to a command-driven move (on_enter,
+        # on_exit, on_stop, on_entity_moved all fire). Both return a
+        # value rather than mutating in place from the caller's POV.
+        from logic import (
+            normalize_direction as _normalize_direction,
+            DIRECTION_VECTORS as _DIRECTION_VECTORS,
+            DIAGONAL_DIRECTIONS as _DIAGONAL_DIRECTIONS,
+            OutOfBounds as _OutOfBounds,
+            Occupied as _Occupied,
+        )
+
+        def _move_entity(eid_t: Any, x: Any, y: Any) -> tuple:
+            """move_entity(eid, x, y): teleport the entity to (x, y) with
+            full tp() semantics (bounds + occupancy validated, tile
+            hooks + on_entity_moved fire). Returns (x, y) on success;
+            raises FormulaError on validation failure so a formula can
+            safeguard with prior reads (in_bounds / is_occupied are not
+            yet exposed; check via tile_keys or entity coordinate
+            equality)."""
+            eid = _eid(eid_t)
+            e = match.entities.get(eid)
+            if e is None:
+                raise FormulaError(f"move_entity: unknown entity id '{eid}'.")
+            if not isinstance(x, int) or isinstance(x, bool):
+                raise FormulaError(
+                    f"move_entity(eid, x, y): x must be int, got "
+                    f"{type(x).__name__}."
+                )
+            if not isinstance(y, int) or isinstance(y, bool):
+                raise FormulaError(
+                    f"move_entity(eid, x, y): y must be int, got "
+                    f"{type(y).__name__}."
+                )
+            try:
+                e.tp(x, y)
+            except (_OutOfBounds, _Occupied) as ex:
+                raise FormulaError(str(ex))
+            self._note_affected(eid)
+            return (x, y)
+
+        def _move_step(eid_t: Any, direction: Any) -> bool:
+            """move_step(eid, direction): one-cell move toward a named
+            direction. Returns True if the step happened, False if it
+            was blocked (off-grid or occupied) so a formula can branch
+            without try-equivalent patterns. Honors
+            allow_diagonal_movement the same way !ent move does."""
+            eid = _eid(eid_t)
+            e = match.entities.get(eid)
+            if e is None:
+                raise FormulaError(f"move_step: unknown entity id '{eid}'.")
+            if not isinstance(direction, str):
+                raise FormulaError(
+                    f"move_step(eid, direction): direction must be a "
+                    f"string, got {type(direction).__name__}."
+                )
+            canon = _normalize_direction(direction)
+            if canon is None:
+                raise FormulaError(
+                    f"move_step(eid, direction): unknown direction "
+                    f"'{direction}'."
+                )
+            allow_diag = bool(match.rules.get("allow_diagonal_movement", False))
+            if canon in _DIAGONAL_DIRECTIONS and not allow_diag:
+                raise FormulaError(
+                    f"move_step: diagonal direction '{direction}' "
+                    f"requires allow_diagonal_movement=True."
+                )
+            dx, dy = _DIRECTION_VECTORS[canon]
+            nx, ny = e.x + dx, e.y + dy
+            if not match.in_bounds(nx, ny):
+                return False
+            if match.is_occupied(nx, ny, ignore_entity_id=e.id):
+                return False
+            try:
+                e.tp(nx, ny)
+            except (_OutOfBounds, _Occupied):
+                return False
+            self._note_affected(eid)
+            return True
+
+        def _fire_tile_hook(x: Any, y: Any, hook_name: Any,
+                            eid_t: Any = None) -> int:
+            """fire_tile_hook(x, y, hook_name, eid=None): fire the
+            named hook at (x, y) immediately, binding `self` to eid
+            if given (otherwise to the caller's ctx.target).
+
+            Returns the number of log lines emitted (the engine's
+            convention for "did anything fire?": >0 means a hook ran,
+            == 0 means no hook of that name was registered on the
+            tile). Useful for chained effects ('this tile detonates
+            and ignites its neighbors') and for tests
+            (`!eval --as ... fire_tile_hook(3, 3, 'on_enter')`).
+            """
+            if not isinstance(x, int) or isinstance(x, bool):
+                raise FormulaError(
+                    f"fire_tile_hook(x, y, ...): x must be int, got "
+                    f"{type(x).__name__}."
+                )
+            if not isinstance(y, int) or isinstance(y, bool):
+                raise FormulaError(
+                    f"fire_tile_hook(x, y, ...): y must be int, got "
+                    f"{type(y).__name__}."
+                )
+            if not isinstance(hook_name, str):
+                raise FormulaError(
+                    f"fire_tile_hook(x, y, hook_name): hook_name must "
+                    f"be a string."
+                )
+            from logic import TILE_HOOK_NAMES as _THN
+            if hook_name not in _THN:
+                allowed = ", ".join(sorted(_THN))
+                raise FormulaError(
+                    f"fire_tile_hook: unknown hook_name '{hook_name}'. "
+                    f"Allowed: {allowed}."
+                )
+            target_eid = ctx.target
+            if eid_t is not None:
+                target_eid = _eid(eid_t)
+            log = match.fire_tile_hook(hook_name, target_eid, x, y)
+            return len(log)
+
+        ns["move_entity"] = _move_entity
+        ns["move_step"]   = _move_step
+        ns["fire_tile_hook"] = _fire_tile_hook
+
         # Team-relationship predicates. All four resolve entity ids
         # through _eid (so they accept "self" / "this" / "current"
         # sentinels) and then read the team via Entity.team, which
@@ -2126,6 +2321,7 @@ class FormulaEngine:
             e = match.entities.get(eid)
             if e is None:
                 raise FormulaError(f"unknown entity id '{eid}'.")
+            before = copy.deepcopy(e.status[name]) if name in e.status else None
             data = e.status.setdefault(name, {})
             keys = path.split(".")
             cur = data
@@ -2141,6 +2337,8 @@ class FormulaEngine:
                     cur[k] = {}
                 cur = cur[k]
             cur[keys[-1]] = value
+            after = copy.deepcopy(e.status[name])
+            match._emit_status_diff(eid, name, before, after)
             self._note_affected(eid)
             return value
 
@@ -2153,6 +2351,7 @@ class FormulaEngine:
             data, _ = _status_data(eid, name, must_exist=False)
             if data is None:
                 return False
+            before = copy.deepcopy(data)
             keys = path.split(".")
             chain = [data]
             for i, k in enumerate(keys[:-1]):
@@ -2168,6 +2367,8 @@ class FormulaEngine:
                 if chain[i]:
                     break
                 del chain[i - 1][keys[i - 1]]
+            after = copy.deepcopy(match.entities[eid].status.get(name))
+            match._emit_status_diff(eid, name, before, after)
             self._note_affected(eid)
             return True
 
@@ -2181,6 +2382,7 @@ class FormulaEngine:
             if name in e.status:
                 return False
             e.status[name] = {}
+            match._emit_status_diff(eid, name, None, {})
             self._note_affected(eid)
             return True
 
@@ -2193,7 +2395,9 @@ class FormulaEngine:
                 raise FormulaError(f"unknown entity id '{eid}'.")
             if name not in e.status:
                 return False
+            before = copy.deepcopy(e.status[name])
             del e.status[name]
+            match._emit_status_diff(eid, name, before, None)
             self._note_affected(eid)
             return True
 

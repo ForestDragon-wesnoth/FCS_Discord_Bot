@@ -6286,3 +6286,273 @@ was not flagged → kept. ally2 had only poisoned (flagged bad)
 allow `for x in a: for y in b: ...` on a single physical line —
 the SCENARIO file's `\n` escape is interpreted by the harness
 the same way Discord/CLI receive real newlines.)
+
+
+SCENARIO 255 — on_entity_moved fires once per tp / move
+--------------------------------------------------------
+
+!match new mev1 EntityMoved 10 10
+!match use mev1
+!ent add hero Hero 30 3 3 10
+!ent set_var hero max_hp 100
+!ent set_var hero move_count 0
+!ent set_var hero last_from 0
+!ent set_var hero last_to 0
+!passive add hero mover on_entity_moved "entity[self].move_count = entity[self].move_count + 1\nentity[self].last_from = from_x\nentity[self].last_to = to_x"
+!ent tp hero 5 5
+!ent dump hero
+!ent move hero 2 right
+!ent dump hero
+!ent tp hero 5 5
+
+Expected: `on_entity_moved` fires once per position-changing command,
+with `from_x`/`from_y`/`to_x`/`to_y` bound to the move's endpoints.
+The hook is the entity-side complement to tile on_enter/on_exit —
+a passive can react to "any move" without caring which tiles are
+involved.
+
+After `!ent tp hero 5 5` (from (3,3)): move_count = 1, last_from = 3,
+last_to = 5. After `!ent move hero 2 right` (from (5,5) to (7,5)):
+move_count = 2, last_from = 5, last_to = 7. The final
+`!ent tp hero 5 5` from (7,5) IS a real move, so count = 3.
+
+For a stepwise move the hook fires ONCE at the end with from/to as
+the endpoints (per-step observation is via tile on_enter/on_exit).
+For group moves it fires once per moving member. The TP-to-current-
+cell case is a no-op (no actual move) and does NOT fire.
+
+
+SCENARIO 256 — Status lifecycle events: added / removed / changed
+------------------------------------------------------------------
+
+!match new mev2 StatusEvents 8 8
+!match use mev2
+!ent add hero Hero 30 3 3 10
+!ent set_var hero max_hp 100
+!ent set_var hero status_log ""
+!passive add hero saw_added on_status_added "entity[self].status_log = entity[self].status_log + '+' + status_name"
+!passive add hero saw_removed on_status_removed "entity[self].status_log = entity[self].status_log + '-' + status_name"
+!passive add hero saw_changed on_status_changed "entity[self].status_log = entity[self].status_log + '~' + status_name"
+!ent status hero add poisoned
+!ent status hero set poisoned damage 5
+!ent status hero set poisoned damage 5
+!ent status hero set poisoned damage 7
+!ent status hero remove poisoned
+!ent dump hero
+
+Expected: Three new hook event types complete the status surface:
+on_status_added (fired when a status appears), on_status_removed
+(when it goes away), on_status_changed (when a field inside an
+already-present status changes). All three bind `status_name`,
+plus old_value/new_value with the whole pre/post status data dict.
+
+The trace: add poisoned → "+poisoned"; set damage=5 first time
+(status data goes from {} to {damage:5}) → "~poisoned"; set
+damage=5 AGAIN with the same value → NO FIRE (the diff helper
+compares before vs after and only fires when they differ); set
+damage=7 → "~poisoned"; remove → "-poisoned". Final
+status_log = "+poisoned~poisoned~poisoned-poisoned" (4 markers
+for the 4 actual transitions, not 5).
+
+Same diff-comparison logic applies whether the mutation came from
+the !ent status command or from the status_* formula functions —
+both paths route through Match._emit_status_diff to keep the
+firing semantics consistent.
+
+
+SCENARIO 257 — Tile time hooks fire at round/turn lifecycle
+------------------------------------------------------------
+
+!match new mev3 TileTimeHooks 6 6
+!match use mev3
+!ent add hero Hero 30 1 1 10
+!ent set_var hero max_hp 100
+!ent set_var hero beacon_count 0
+!tile def new beacon
+!tile def data beacon glyph B
+!tile def hook beacon on_round_end "entity[this].beacon_count = entity[this].beacon_count + 1"
+!tile place beacon 5 5
+!ent dump hero
+!turn next
+!ent dump hero
+!turn next
+!ent dump hero
+!turn next
+!ent dump hero
+
+Expected: Tile hooks now include time hooks (on_round_start /
+on_round_end / on_turn_start / on_turn_end) in addition to the
+movement hooks (on_enter / on_exit / on_stop). Time hooks fire on
+the tile itself at the round/turn lifecycle moment, without
+requiring an entity transit. Each registered tile fires once per
+matching tick — useful for "beacon pulses every round end",
+"trap rearms at turn start", terrain-driven effects in general.
+
+The first `!turn next` opens round 1; no round_end yet, so
+beacon_count = 0. With only hero in turn_order, every subsequent
+`!turn next` immediately wraps the round, firing on_round_end on
+every relevant tile (just (5,5) here). After 2nd turn next:
+beacon_count = 1. After 3rd: 2.
+
+`self` inside a time hook resolves to the current-turn entity at
+the moment of fire (hero here); for round_* hooks during a wrap
+when active_index sits at 0, that's whoever is at index 0 of the
+new order.
+
+
+SCENARIO 258 — !tile test fires a tile hook manually
+-----------------------------------------------------
+
+!match new mev4 TileTest 6 6
+!match use mev4
+!ent add hero Hero 30 1 1 10
+!ent set_var hero max_hp 100
+!ent set_var hero touched 0
+!tile def new spike
+!tile def hook spike on_enter "entity[self].touched = entity[self].touched + 1"
+!tile place spike 4 4
+!tile test 4 4 on_enter --as hero
+!tile test 4 4 on_enter --as hero
+!ent dump hero
+!tile test 4 4 on_exit --as hero
+!tile test 9 9 on_enter --as hero
+!tile test 4 4 not_a_hook
+!tile test 4 4 on_enter
+
+Expected: `!tile test <x> <y> <hook_name> [--as <eid>]` fires the
+named tile hook immediately, without requiring an entity to walk
+onto the cell. Pure debugging UX — you can verify a hook formula
+works in isolation, fire it for testing without spawning a phantom
+entity, or use it as the "trigger this trap manually" admin
+command.
+
+Two `!tile test 4 4 on_enter --as hero` fires bump `touched` to 2.
+A test for a hook that's not registered (`on_exit` on a tile with
+only on_enter) reports "no hook to fire" and doesn't error. Off-
+grid coords error before firing. An unknown hook name errors with
+the allowed list. Omitting --as leaves self unbound — fine for
+hooks that don't reference it; a hook that DOES reference self
+would surface the standard "'self' is unbound" error.
+
+
+SCENARIO 259 — fire_tile_hook from formulas (chained tile effects)
+-------------------------------------------------------------------
+
+!match new mev5 ChainedTiles 8 8
+!match use mev5
+!ent add hero Hero 30 1 1 10
+!ent set_var hero max_hp 100
+!ent set_var hero burned 0
+!tile def new flame
+!tile def hook flame on_enter "entity[self].burned = entity[self].burned + 1"
+!tile place flame 3 3
+!tile place flame 4 3
+!tile place flame 5 3
+!eval --as hero "fire_tile_hook(3, 3, 'on_enter')"
+!eval --as hero "for (cx, cy) in cells_in_line(3, 3, 5, 3): fire_tile_hook(cx, cy, 'on_enter')"
+!ent dump hero
+!eval --as hero "fire_tile_hook(9, 9, 'on_enter')"
+!eval --as hero "fire_tile_hook(3, 3, 'not_a_hook')"
+
+Expected: `fire_tile_hook(x, y, hook_name, eid=None)` triggers a
+tile hook from a formula. Returns the number of log lines emitted
+(>0 means the hook ran, 0 means no hook of that name on this
+tile). Defaults `self` to the caller's ctx.target; pass an
+explicit eid as the fourth arg to override.
+
+The first call fires flame on (3,3) once → burned = 1. The
+for-loop over cells_in_line iterates (3,3)→(5,3) and fires
+each of the three flames → burned += 3 → burned = 4. Off-grid
+(9,9) returns 0 (no tile data, no hook to fire). An unknown
+hook name errors with the allowed-list message.
+
+This is the "chained effects" primitive: a tile's own on_enter
+hook could call `fire_tile_hook(cx, cy, 'on_enter')` on
+neighbors to spread fire, propagate damage, etc. — without the
+GM scripting the propagation manually.
+
+
+SCENARIO 260 — move_entity / move_step from formulas
+-----------------------------------------------------
+
+!match new mev6 FormulaMove 8 8
+!match use mev6
+!ent add a A 30 3 3 10
+!ent add b B 30 7 5 9
+!ent add c C 30 2 2 8
+!ent set_var a moves 0
+!passive add a count_moves on_entity_moved "entity[self].moves = entity[self].moves + 1"
+!eval "move_entity('a', 5, 5)"
+!ent dump a
+!eval "move_step('a', 'right')"
+!ent dump a
+!eval "move_step('a', 'right')"
+!ent dump a
+!ent tp a 8 5
+!eval "move_step('a', 'right')"
+!ent dump a
+!ent tp a 6 5
+!eval "move_step('a', 'right')"
+
+Expected: `move_entity(eid, x, y)` teleports the entity with full
+tp() semantics (bounds + occupancy validated, tile hooks +
+on_entity_moved fire). Returns (x, y) on success; raises
+FormulaError on validation failure.
+
+`move_step(eid, direction)` is the single-cell-toward-a-direction
+companion. Returns True if the step succeeded, False if blocked
+(off-grid or destination occupied) — so formulas can branch on
+the result without try-equivalent patterns.
+
+Trace: move_entity to (5,5) succeeds → a at (5,5), moves = 1
+(on_entity_moved fired). move_step right → a at (6,5), moves = 2.
+move_step right → would land on (7,5) but b is there → False,
+a still at (6,5), moves still 2. After tp a 8 5 (the grid edge),
+move_step right → False (off-grid), a unchanged. After tp a 6 5,
+move_step right → True, lands on (7,5) — wait, b is there. So
+False. The point: move_step honors the same bounds/occupancy
+rules !ent move does, and is observationally identical (tile
+hooks fire, on_entity_moved fires) when the step succeeds.
+
+
+SCENARIO 261 — Composition: status event triggers cleanup passive
+------------------------------------------------------------------
+
+!match new mev7 EventComposition 6 6
+!match use mev7
+!ent add hero Hero 30 3 3 10
+!ent set_var hero max_hp 100
+!ent set_var hero blessing_count 0
+!passive add hero bless_log on_status_added "if status_name == 'blessed':\n    entity[self].blessing_count = entity[self].blessing_count + 1"
+!passive add hero curse_purge on_status_added "if status_name == 'cursed':\n    status_remove(self, 'cursed')\n    entity[self].hp = entity[self].hp - 5"
+!ent status hero add blessed
+!ent dump hero
+!ent status hero add cursed
+!ent dump hero
+!ent status hero add blessed
+!ent dump hero
+
+Expected: Status events compose with the formula side-effect
+toolkit. A "blessing counter" passive watches on_status_added
+and bumps a var when a status named "blessed" appears. A
+"curse purge" passive intercepts the same event for "cursed"
+and immediately removes it while applying a cost (-5 hp).
+
+Trace:
+  add blessed   → bless_log fires → blessing_count = 1.
+                  curse_purge fires too but `status_name !=
+                  cursed`, so the if-branch doesn't run; blessed
+                  remains.
+  add cursed    → curse_purge fires → status_remove(self, 'cursed')
+                  → hp drops to 25 → cursed is gone immediately.
+                  This produces an on_status_removed event for
+                  cursed — observable by a separate passive if
+                  registered (none here).
+  add blessed   → bless_log fires → blessing_count = 2.
+
+The hp clamp respects the default `hp <= max_hp` rule (set max_hp
+= 100 up front so the -5 lands cleanly). The "added a status →
+immediately remove it" pattern is the foundation for things like
+"this entity is immune to debuffs", "fire-resistant entity
+removes burning on apply", etc. — all GM-built via this PR's
+event hooks.
