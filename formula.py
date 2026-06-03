@@ -1029,6 +1029,15 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # succeeded (within bounds, destination free), False if blocked.
     # Honors allow_diagonal_movement just like !ent move.
     "move_step",
+    # Forced movement: push an entity up to n cells in a direction,
+    # stopping at the first blocked cell. Returns the number of cells
+    # actually moved (0..n). Honors allow_diagonal_movement.
+    "push_entity",
+    # Atomically exchange two entities' positions. Bypasses the usual
+    # occupancy check (the two cells are occupied — by each other).
+    # Fires on_exit/on_enter/on_stop/on_entity_moved for both. Returns
+    # True on a real swap, False on the same-entity no-op.
+    "swap_entities",
     # Programmatically fire a tile hook (for chained effects, tests,
     # or "trigger this trap from a script" patterns). The bound entity
     # for `self` defaults to ctx.target (whoever is the caller's
@@ -2116,8 +2125,127 @@ class FormulaEngine:
             log = match.fire_tile_hook(hook_name, target_eid, x, y)
             return len(log)
 
+        def _push_entity(eid_t: Any, direction: Any, n: Any = 1) -> int:
+            """push_entity(eid, direction, n=1): step `eid` up to `n`
+            cells in `direction`, stopping at the first blocked cell
+            (off-grid or occupied). Returns the NUMBER of cells actually
+            moved (0..n). Honors allow_diagonal_movement the same way
+            move_step does; raises FormulaError on bad direction or
+            unknown entity. Per-step tile hooks (on_exit/on_enter) and
+            the final on_stop / on_entity_moved fire the same way they
+            would for a stepwise `!ent move`, so a pushed entity walks
+            through fire tiles cell by cell."""
+            eid = _eid(eid_t)
+            e = match.entities.get(eid)
+            if e is None:
+                raise FormulaError(f"push_entity: unknown entity id '{eid}'.")
+            if not isinstance(direction, str):
+                raise FormulaError(
+                    f"push_entity(eid, direction, n): direction must be a "
+                    f"string, got {type(direction).__name__}."
+                )
+            canon = _normalize_direction(direction)
+            if canon is None:
+                raise FormulaError(
+                    f"push_entity(eid, direction, n): unknown direction "
+                    f"'{direction}'."
+                )
+            allow_diag = bool(match.rules.get("allow_diagonal_movement", False))
+            if canon in _DIAGONAL_DIRECTIONS and not allow_diag:
+                raise FormulaError(
+                    f"push_entity: diagonal direction '{direction}' "
+                    f"requires allow_diagonal_movement=True."
+                )
+            if not isinstance(n, int) or isinstance(n, bool):
+                raise FormulaError(
+                    f"push_entity(eid, direction, n): n must be int, got "
+                    f"{type(n).__name__}."
+                )
+            if n <= 0:
+                return 0
+            dx, dy = _DIRECTION_VECTORS[canon]
+            # Walk forward to find the longest legal prefix. The push
+            # stops at the cell BEFORE the first blocker (off-grid or
+            # another entity). Intermediate occupancy matters — pushing
+            # through an entity isn't allowed (matches the natural
+            # "knockback hits the wall behind them" intuition).
+            x, y = e.x, e.y
+            steps = 0
+            for _ in range(n):
+                nx, ny = x + dx, y + dy
+                if not match.in_bounds(nx, ny):
+                    break
+                if match.is_occupied(nx, ny, ignore_entity_id=e.id):
+                    break
+                x, y = nx, ny
+                steps += 1
+            if steps == 0:
+                return 0
+            # Delegate the actual stepwise commit to move_dirs so we get
+            # per-step on_enter/on_exit, on_stop, and on_entity_moved
+            # firing for free. We've already proven the path is legal.
+            try:
+                e.move_dirs([(canon, steps)])
+            except (_OutOfBounds, _Occupied) as ex:
+                # Should be unreachable — we validated above — but if a
+                # passive mutates state between validation and commit,
+                # surface the failure cleanly.
+                raise FormulaError(str(ex))
+            self._note_affected(eid)
+            return steps
+
+        def _swap_entities(a_t: Any, b_t: Any) -> bool:
+            """swap_entities(a, b): atomically exchange the positions of
+            two entities. Both must exist; swapping an entity with
+            itself is a no-op that returns False. Bypasses the usual
+            occupancy check (the two cells ARE occupied — by each
+            other — but the swap is atomic). Fires on_exit on both old
+            cells, on_enter + on_stop on both new cells, and
+            on_entity_moved for both entities. Returns True on a real
+            swap, False on the same-entity no-op."""
+            aid = _eid(a_t)
+            bid = _eid(b_t)
+            ea = match.entities.get(aid)
+            eb = match.entities.get(bid)
+            if ea is None:
+                raise FormulaError(f"swap_entities: unknown entity id '{aid}'.")
+            if eb is None:
+                raise FormulaError(f"swap_entities: unknown entity id '{bid}'.")
+            if aid == bid:
+                return False
+            ax, ay = ea.x, ea.y
+            bx, by = eb.x, eb.y
+            # Same-cell swap is degenerate (both entities are at the
+            # same coords, which shouldn't normally happen but is
+            # defended in case a future feature allows colocation):
+            # nothing changes, no hooks fire.
+            if (ax, ay) == (bx, by):
+                return False
+            # Fire on_exit for both at their CURRENT positions before
+            # any state changes — passives see (ea.x,ea.y) == (ax,ay).
+            match.fire_tile_hook("on_exit", aid, ax, ay)
+            match.fire_tile_hook("on_exit", bid, bx, by)
+            # Atomic position swap via direct move_to (bypasses
+            # is_occupied — required, since A and B occupy each other's
+            # target cells until the swap completes).
+            ea.move_to(bx, by)
+            eb.move_to(ax, ay)
+            # Fire on_enter + on_stop at new positions.
+            match.fire_tile_hook("on_enter", aid, bx, by)
+            match.fire_tile_hook("on_stop", aid, bx, by)
+            match.fire_tile_hook("on_enter", bid, ax, ay)
+            match.fire_tile_hook("on_stop", bid, ax, ay)
+            # Entity-side movement events.
+            match.fire_entity_moved(aid, ax, ay, bx, by)
+            match.fire_entity_moved(bid, bx, by, ax, ay)
+            self._note_affected(aid)
+            self._note_affected(bid)
+            return True
+
         ns["move_entity"] = _move_entity
         ns["move_step"]   = _move_step
+        ns["push_entity"] = _push_entity
+        ns["swap_entities"] = _swap_entities
         ns["fire_tile_hook"] = _fire_tile_hook
 
         # Team-relationship predicates. All four resolve entity ids

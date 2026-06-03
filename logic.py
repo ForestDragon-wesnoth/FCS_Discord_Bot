@@ -845,6 +845,22 @@ HOOK_NAMES: Set[str] = {
     # logic; on_entity_moved is the entity-side complement so a
     # passive can react regardless of which tile is involved.
     "on_entity_moved",
+    # Per-step movement event. Fires ONCE PER CELL traversed during a
+    # stepwise move (Entity.move_dirs), AFTER the position changes for
+    # that step — so `entity[self].x/.y` refer to the just-entered
+    # cell when the passive runs. Context bindings:
+    #   from_x, from_y  — the cell just left (the previous step's
+    #                     position; equals the entity's pre-move origin
+    #                     for the first step)
+    #   to_x, to_y      — the cell just entered (== entity[self].x/.y)
+    # Single-tp moves (Entity.tp, including formula `move_entity`) fire
+    # `on_entity_moved` only, not `on_entity_step` — there are no
+    # intermediate cells to "step into". So on_entity_step is the right
+    # hook for "thorns trigger per cell of traversal", "attacks of
+    # opportunity fire per step adjacent to me", and "distance-cost
+    # accumulators". For "did this entity move at all this command",
+    # use on_entity_moved (fires once, after all steps).
+    "on_entity_step",
     # Status lifecycle. Fire on the entity whose status changed.
     # Context bindings:
     #   status_name  — the affected status
@@ -1632,6 +1648,12 @@ class GameSystem:
     # that every new match starts with. Stored as plain dicts
     # (FormulaFunction.to_dict output) for self-contained serialization.
     formula_functions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # System-level alias library, copied into Match.aliases at match
+    # creation — same inherit-at-create pattern as tile_templates /
+    # formula_functions. Lets a system ship a standard set of GM
+    # shorthands (`dmg`, `heal`, `mv`, ...) that every match in this
+    # system starts with. Stored as plain `name -> expansion` strings.
+    aliases: Dict[str, str] = field(default_factory=dict)
 
     def get(self, key: str) -> Any:
         if key in self.settings:
@@ -1671,6 +1693,10 @@ class GameSystem:
                 fname: copy.deepcopy(fdef)
                 for fname, fdef in sorted(self.formula_functions.items())
             },
+            "aliases": {
+                aname: str(self.aliases[aname])
+                for aname in sorted(self.aliases.keys())
+            },
         }
 
     @staticmethod
@@ -1694,9 +1720,15 @@ class GameSystem:
         for fname, fdef in raw_funcs.items():
             if isinstance(fdef, dict) and isinstance(fname, str):
                 funcs[fname] = copy.deepcopy(fdef)
+        raw_sys_aliases = d.get("aliases", {}) or {}
+        sys_aliases: Dict[str, str] = {
+            str(k): str(v) for k, v in raw_sys_aliases.items()
+            if isinstance(k, str) and isinstance(v, str)
+        }
         return GameSystem(
             name=d["name"], settings=settings,
             tile_templates=templates, formula_functions=funcs,
+            aliases=sys_aliases,
         )
 
 # -------------------------
@@ -2117,12 +2149,22 @@ class Entity:
         log: List[str] = []
         origin_x, origin_y = self.x, self.y
         for nx, ny, step_facing in step_path:
+            step_from_x, step_from_y = self.x, self.y
             if fire_hooks:
                 log.extend(m.fire_tile_hook("on_exit", self.id, self.x, self.y))
             self.facing = step_facing
             self.move_to(nx, ny)
             if fire_hooks:
                 log.extend(m.fire_tile_hook("on_enter", self.id, nx, ny))
+                # Per-step entity hook: fires AFTER on_enter so
+                # passives see whatever the just-entered tile already
+                # applied (e.g. a damage tile's hp delta) on top of
+                # the position change. Same binding shape as
+                # on_entity_moved (from_x/from_y/to_x/to_y) so a
+                # passive body can swap hooks without rewriting refs.
+                log.extend(m.fire_entity_step(
+                    self.id, step_from_x, step_from_y, nx, ny,
+                ))
         if fire_hooks and step_path:
             # on_stop fires once at the final cell, even if no actual
             # movement happened (zero-step move_dirs) — empty step_path
@@ -3658,6 +3700,42 @@ class Match:
                 ))
         return log
 
+    def fire_entity_step(
+        self, entity_id: str,
+        from_x: int, from_y: int, to_x: int, to_y: int,
+    ) -> List[str]:
+        """Fire on_entity_step passives for the entity that just stepped
+        from (from_x, from_y) to (to_x, to_y) by ONE cell. Called per
+        step by Entity.move_dirs, AFTER the tile on_enter for that step
+        — so passives observe the post-step entity position AND see
+        whatever the tile's on_enter already applied. Same binding
+        shape as fire_entity_moved (from_x/from_y/to_x/to_y), making
+        the two hooks drop-in interchangeable in a passive body."""
+        e = self.entities.get(entity_id)
+        if e is None:
+            return []
+        from formula import FormulaEngine, EvalCtx
+        engine = FormulaEngine(self)
+        this_id = self.current_entity_id()
+        extras = {
+            "from_x": from_x, "from_y": from_y,
+            "to_x": to_x, "to_y": to_y,
+            "hook_name": "on_entity_step",
+        }
+        ctx = EvalCtx(this=this_id, target=entity_id, extras=extras)
+        log: List[str] = []
+        for p in self.global_passives.values():
+            if p.when == "on_entity_step":
+                log.append(_run_passive_safely(
+                    engine, p, ctx, target_id=entity_id, is_global=True,
+                ))
+        for p in e.passives.values():
+            if p.when == "on_entity_step":
+                log.append(_run_passive_safely(
+                    engine, p, ctx, target_id=entity_id, is_global=False,
+                ))
+        return log
+
     def fire_tile_time_hooks(self, when: str) -> List[str]:
         """Fire tile time hooks (on_round_start/end, on_turn_start/end)
         on every tile that has a hook of that name. Iterates a snapshot
@@ -4479,6 +4557,12 @@ class MatchManager:
                 m.formula_functions[fname] = FormulaFunction.from_dict(fdef)
             except (KeyError, TypeError, VTTError):
                 continue
+        # Seed match-level aliases from the system's library, same
+        # snapshot-not-link semantics. Plain string copy — match-side
+        # !alias def/del afterwards doesn't reach back into the system.
+        for aname, expansion in (sysobj.aliases or {}).items():
+            if isinstance(aname, str) and isinstance(expansion, str):
+                m.aliases[aname] = expansion
         self.matches[m.id] = m
         return m.id
 
