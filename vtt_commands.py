@@ -109,10 +109,77 @@ class CommandRegistry:
             lines.append(sm["desc"])
         return (f"Help: {root} {sub}", "\n".join(lines))
 
-    async def run(self, name: str, args: List[str], ctx: ReplyContext, mgr: MatchManager):
+    def _unknown_command_message(self, name: str, mgr: MatchManager,
+                                  ctx: ReplyContext) -> str:
+        """Build the 'unknown command' reply, optionally with did-you-mean
+        suggestions. Looks at registered commands AND the active match's
+        alias names so a typo'd alias gets a hint too."""
+        import difflib as _difflib
+        candidates = list(self._handlers.keys())
+        active_mid = mgr.active_by_channel.get(ctx.channel_key)
+        if active_mid is not None and active_mid in mgr.matches:
+            candidates.extend(mgr.matches[active_mid].aliases.keys())
+        # cutoff 0.55 is permissive enough to catch single-letter
+        # typos (e.g. "ene" -> "ent") but tight enough not to suggest
+        # every command for nonsense input.
+        hits = _difflib.get_close_matches(name, candidates, n=3, cutoff=0.55)
+        msg = f"❓ Unknown command `{name}`"
+        if hits:
+            msg += f" — did you mean: {', '.join(f'`{h}`' for h in hits)}?"
+        return msg
+
+    def _resolve_alias(self, name: str, args: List[str],
+                       mgr: MatchManager, ctx: ReplyContext) -> Tuple[str, List[str]]:
+        """One-shot alias expansion. Returns (name, args) — unchanged if
+        no alias applies. Tokenized via shlex so a multi-word expansion
+        like `dmg -> "ent hp this"` produces real argv tokens. We
+        deliberately do NOT re-resolve recursively (that would let
+        aliases loop) — the alias's first token must already be a real
+        registered command, which is enforced at alias-def time."""
+        mid = mgr.active_by_channel.get(ctx.channel_key)
+        if mid is None or mid not in mgr.matches:
+            return name, args
+        expansion = mgr.matches[mid].aliases.get(name)
+        if not expansion:
+            return name, args
+        import shlex as _shlex
+        try:
+            tokens = _shlex.split(expansion)
+        except ValueError:
+            tokens = expansion.split()
+        if not tokens:
+            return name, args
+        return tokens[0], tokens[1:] + list(args)
+
+    async def dispatch_no_snapshot(self, name: str, args: List[str],
+                                    ctx: ReplyContext, mgr: MatchManager):
+        """Alias-resolve, look up, and call a handler WITHOUT recording
+        an autosave. Used by !batch and !run to fold many subcommands
+        into one outer snapshot (the wrapping command's own snapshot).
+        VTTError still surfaces as `❌ ...`; unexpected exceptions still
+        propagate so the caller can decide whether to abort."""
+        name, args = self._resolve_alias(name, args, mgr, ctx)
         h = self._handlers.get(name)
         if not h:
-            await ctx.send(f"❓ Unknown command `{name}`")
+            await ctx.send(self._unknown_command_message(name, mgr, ctx))
+            return
+        try:
+            return await h(ctx, args, mgr)
+        except VTTError as e:
+            await ctx.send(f"❌ {e}")
+            return
+
+    async def run(self, name: str, args: List[str], ctx: ReplyContext, mgr: MatchManager):
+        # Alias resolution happens BEFORE handler lookup so an alias can
+        # shadow a built-in name on this match.
+        name, args = self._resolve_alias(name, args, mgr, ctx)
+        h = self._handlers.get(name)
+        if not h:
+            # Did-you-mean: suggest close matches from registered
+            # commands plus the active match's alias names. Keeps the
+            # "❓ Unknown command" message short — at most three
+            # suggestions, only if any are close.
+            await ctx.send(self._unknown_command_message(name, mgr, ctx))
             return
 
         # Pre-dispatch snapshot of the active match's state. We only
@@ -1767,6 +1834,155 @@ async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         lines.append(f"{marker} {_entity_line(e)}")
     return await ctx.send("\n".join(lines))
 
+# ---- !find ----------------------------------------------------------
+# Token-based entity query. Each arg is one predicate; all predicates
+# AND. Predicate forms:
+#   <var>=<value>      vars[var] == value  (numeric coerced when both sides parse)
+#   <var>!=<value>     vars[var] != value
+#   <var><<value>      vars[var] < value   (numeric; non-numeric vars never match)
+#   <var><=<value>     vars[var] <= value
+#   <var>><value>      vars[var] > value
+#   <var>>=<value>     vars[var] >= value
+#   status:<name>      entity.status has the named status
+#   group:<name>       entity is a member of the named group
+# Dotted var names address nested dicts (e.g. inventory.sword.damage).
+_FIND_OPS = ("!=", "<=", ">=", "=", "<", ">")
+
+
+def _parse_find_predicate(token: str) -> Tuple[str, str, Optional[str]]:
+    """Return (kind, key, value). kind is one of:
+        "status"  — status:NAME            (value is None, key is NAME)
+        "group"   — group:NAME             (value is None, key is NAME)
+        "<op>"    — one of =, !=, <, <=, >, >=  (key is var path, value is RHS)
+    Raises VTTError on malformed input."""
+    if token.startswith("status:"):
+        name = token[len("status:"):]
+        if not name:
+            raise VTTError("`status:` predicate needs a status name.")
+        return "status", name, None
+    if token.startswith("group:"):
+        name = token[len("group:"):]
+        if not name:
+            raise VTTError("`group:` predicate needs a group name.")
+        return "group", name, None
+    # Try operators longest-first so `<=` isn't misread as `<`.
+    for op in _FIND_OPS:
+        idx = token.find(op)
+        if idx > 0:  # key must be non-empty
+            return op, token[:idx], token[idx + len(op):]
+    raise VTTError(
+        f"Unrecognized find predicate `{token}`. Expected `key=value`, "
+        f"`key<value`, `status:NAME`, or `group:NAME`."
+    )
+
+
+def _resolve_dotted_var(vars_dict: Dict[str, Any], path: str) -> Tuple[bool, Any]:
+    """Walk dotted path through a vars dict. Returns (found, value)."""
+    cur: Any = vars_dict
+    for part in path.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return False, None
+    return True, cur
+
+
+def _coerce_for_compare(s: str) -> Any:
+    """Best-effort coercion for find values: ints, floats, bools, then
+    fall back to the raw string. Numeric inputs let `hp<20` work
+    naturally; the bool form covers `team_active=true` style flags."""
+    if s.lower() in ("true", "false"):
+        return s.lower() == "true"
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    return s
+
+
+def _find_match_entity(m: Match, e: Entity, predicates: List[Tuple[str, str, Optional[str]]]) -> bool:
+    """Return True iff every predicate matches `e`. Predicates short-
+    circuit on the first failure."""
+    for kind, key, val in predicates:
+        if kind == "status":
+            if key not in e.status:
+                return False
+            continue
+        if kind == "group":
+            if e.id not in (m.groups.get(key) or []):
+                return False
+            continue
+        # Var-comparison forms. Missing var never matches any operator
+        # (including !=) — that keeps "team=red" from spuriously
+        # matching entities that don't have a team set at all.
+        found, lhs = _resolve_dotted_var(e.vars, key)
+        if not found:
+            return False
+        rhs = _coerce_for_compare(val)
+        # If lhs is numeric-ish and rhs coerced numeric, compare as numbers.
+        # Otherwise the relational ops still attempt the comparison and a
+        # TypeError is treated as "doesn't match".
+        try:
+            if kind == "=":
+                if lhs != rhs:
+                    return False
+            elif kind == "!=":
+                if lhs == rhs:
+                    return False
+            elif kind == "<":
+                if not (lhs < rhs):
+                    return False
+            elif kind == "<=":
+                if not (lhs <= rhs):
+                    return False
+            elif kind == ">":
+                if not (lhs > rhs):
+                    return False
+            elif kind == ">=":
+                if not (lhs >= rhs):
+                    return False
+        except TypeError:
+            return False
+    return True
+
+
+@registry.command(
+    "find",
+    usage="!find <predicate> [<predicate> ...]",
+    desc=(
+        "Query entities by AND-ed predicates. Predicate forms: "
+        "`var=value`, `var!=value`, `var<value`, `var<=value`, "
+        "`var>value`, `var>=value` for vars; `status:NAME` for a status "
+        "flag; `group:NAME` for group membership. Dotted var paths walk "
+        "nested dicts (`inventory.sword.damage>5`). Example: "
+        "`!find team=red hp<20 status:bleeding` lists all red-team "
+        "entities below 20 HP that are bleeding."
+    ),
+    snapshot=False,
+)
+async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["find"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    try:
+        predicates = [_parse_find_predicate(t) for t in args]
+    except VTTError as ex:
+        return await ctx.send(f"❌ {ex}")
+    hits = [e for e in m.entities_in_turn_order()
+            if _find_match_entity(m, e, predicates)]
+    if not hits:
+        return await ctx.send("No entities match.")
+    lines = [f"**{len(hits)} match(es):**"]
+    for e in hits:
+        lines.append(f"- {_entity_line(e)}")
+    return await ctx.send("\n".join(lines))
+
+
 @registry.command("state", usage="!state", desc="Show match summary, entities, and map.")
 async def state_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # New behavior: show list (turn-order) then map
@@ -2118,6 +2334,19 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"(round {snap.round_at_snapshot})."
         )
 
+    # ---- diff --------------------------------------------------------
+    # `!history diff <selector_a> <selector_b>` — entity-focused diff
+    # between two snapshots. Uses the same selector syntax as
+    # export/import (manual:<name>, round:<N>, turn:<seq>, command:<seq>,
+    # latest:<kind>).
+    if sub == "diff":
+        if await return_help_if_not_enough_args(ctx, args, 3, "history", "diff"):
+            return
+        snap_a = _resolve_snapshot_selector(m, args[1])
+        snap_b = _resolve_snapshot_selector(m, args[2])
+        lines = _format_snapshot_diff(snap_a, snap_b, args[1], args[2])
+        return await ctx.send("\n".join(lines))
+
     # Fallback to help
     title, body = registry.help_for(["history"])
     return await ctx.send(f"**{title}**\n{body}")
@@ -2176,6 +2405,139 @@ def _resolve_snapshot_selector(m: Match, selector: str) -> Snapshot:
                 return s
         raise HistoryError(f"No command snapshot with sequence {seq}.")
     raise VTTError(f"Unknown selector prefix '{kind}'.")
+
+
+def _flatten_vars(prefix: str, val: Any, out: Dict[str, Any]) -> None:
+    """Flatten a vars dict into dotted paths. We diff at the leaf level
+    so a deeply nested var change (e.g. `inventory.sword.damage`) shows
+    as a single line rather than burying the diff inside a serialized
+    dict. Lists/tuples are treated as leaves — order matters and a
+    structural list-diff would add noise without much signal here."""
+    if isinstance(val, dict):
+        if not val:
+            out[prefix] = {}
+            return
+        for k, v in val.items():
+            child = f"{prefix}.{k}" if prefix else str(k)
+            _flatten_vars(child, v, out)
+    else:
+        out[prefix] = val
+
+
+def _diff_entity(eid: str, ea: Dict[str, Any], eb: Dict[str, Any]) -> List[str]:
+    """Per-entity diff lines. Reports changes to position, facing, vars
+    (flattened), passives (id-level add/remove/change), and groups. Only
+    returns lines for fields that actually differ — an unchanged entity
+    contributes zero lines."""
+    lines: List[str] = []
+    for field_name in ("position", "facing", "groups"):
+        va = ea.get(field_name)
+        vb = eb.get(field_name)
+        if va != vb:
+            lines.append(f"    {field_name}: {va!r} -> {vb!r}")
+    # Vars: flatten both sides, then diff leaf by leaf.
+    fa: Dict[str, Any] = {}
+    fb: Dict[str, Any] = {}
+    _flatten_vars("", ea.get("vars", {}) or {}, fa)
+    _flatten_vars("", eb.get("vars", {}) or {}, fb)
+    all_keys = sorted(set(fa) | set(fb))
+    for k in all_keys:
+        if k not in fa:
+            lines.append(f"    vars.{k}: + {fb[k]!r}")
+        elif k not in fb:
+            lines.append(f"    vars.{k}: - {fa[k]!r}")
+        elif fa[k] != fb[k]:
+            lines.append(f"    vars.{k}: {fa[k]!r} -> {fb[k]!r}")
+    # Passives: id-level. Changing a passive's formula shows as a
+    # before/after; we don't try to diff formula text itself.
+    pa = ea.get("passives", {}) or {}
+    pb = eb.get("passives", {}) or {}
+    for pid in sorted(set(pa) | set(pb)):
+        if pid not in pa:
+            lines.append(f"    passive.{pid}: added")
+        elif pid not in pb:
+            lines.append(f"    passive.{pid}: removed")
+        elif pa[pid] != pb[pid]:
+            lines.append(f"    passive.{pid}: changed")
+    return lines
+
+
+def _format_snapshot_diff(snap_a: Snapshot, snap_b: Snapshot,
+                          sel_a: str, sel_b: str) -> List[str]:
+    """Build a human-readable diff between two snapshot states. Focuses
+    on what GMs actually want to see — entity-level changes, round/turn
+    deltas, and rule changes — rather than dumping a JSON patch."""
+    sa = snap_a.state
+    sb = snap_b.state
+    lines = [f"**Diff `{sel_a}` -> `{sel_b}`**"]
+    # Match-level scalars worth surfacing.
+    if sa.get("round_number") != sb.get("round_number"):
+        lines.append(
+            f"- round_number: {sa.get('round_number')} -> "
+            f"{sb.get('round_number')}"
+        )
+    if sa.get("active_index") != sb.get("active_index"):
+        lines.append(
+            f"- active_index: {sa.get('active_index')} -> "
+            f"{sb.get('active_index')}"
+        )
+    # Rule changes: report at the key level (one line per changed rule).
+    ra = sa.get("rules", {}) or {}
+    rb = sb.get("rules", {}) or {}
+    rule_keys = sorted(set(ra) | set(rb))
+    rule_changes = []
+    for rk in rule_keys:
+        if rk not in ra:
+            rule_changes.append(f"  + rule `{rk}` = {rb[rk]!r}")
+        elif rk not in rb:
+            rule_changes.append(f"  - rule `{rk}` (was {ra[rk]!r})")
+        elif ra[rk] != rb[rk]:
+            rule_changes.append(f"  ~ rule `{rk}`: {ra[rk]!r} -> {rb[rk]!r}")
+    if rule_changes:
+        lines.append("- Rules:")
+        lines.extend(rule_changes)
+    # Entities — the main event.
+    ea = sa.get("entities", {}) or {}
+    eb = sb.get("entities", {}) or {}
+    # `entities` can be serialized as a dict (id -> entity_dict) or a
+    # list of entity_dicts depending on Match.to_dict's format. Normalize.
+    if isinstance(ea, list):
+        ea = {e.get("id"): e for e in ea if isinstance(e, dict) and "id" in e}
+    if isinstance(eb, list):
+        eb = {e.get("id"): e for e in eb if isinstance(e, dict) and "id" in e}
+    added = sorted(set(eb) - set(ea))
+    removed = sorted(set(ea) - set(eb))
+    both = sorted(set(ea) & set(eb))
+    if added:
+        lines.append(f"- Entities added: {', '.join(f'`{x}`' for x in added)}")
+    if removed:
+        lines.append(f"- Entities removed: {', '.join(f'`{x}`' for x in removed)}")
+    entity_change_lines: List[str] = []
+    for eid in both:
+        ent_diff = _diff_entity(eid, ea[eid], eb[eid])
+        if ent_diff:
+            entity_change_lines.append(f"  `{eid}`:")
+            entity_change_lines.extend(ent_diff)
+    if entity_change_lines:
+        lines.append("- Entities changed:")
+        lines.extend(entity_change_lines)
+    # Global passives.
+    gpa = sa.get("global_passives", {}) or {}
+    gpb = sb.get("global_passives", {}) or {}
+    gp_changes = []
+    for pid in sorted(set(gpa) | set(gpb)):
+        if pid not in gpa:
+            gp_changes.append(f"  + global passive `{pid}`")
+        elif pid not in gpb:
+            gp_changes.append(f"  - global passive `{pid}`")
+        elif gpa[pid] != gpb[pid]:
+            gp_changes.append(f"  ~ global passive `{pid}` changed")
+    if gp_changes:
+        lines.append("- Global passives:")
+        lines.extend(gp_changes)
+    if len(lines) == 1:
+        lines.append("(no differences)")
+    return lines
 
 
 # Annotate the subcommands for help
@@ -2241,6 +2603,17 @@ registry.annotate_sub(
         "match. `as <name>` overrides the imported label; otherwise the "
         "snapshot's existing label is used. The imported snapshot is "
         "always categorized as manual regardless of its original kind."
+    ),
+)
+registry.annotate_sub(
+    "history", "diff",
+    usage="!history diff <selector_a> <selector_b>",
+    desc=(
+        "Compare two snapshots and report entity-level changes. "
+        "Selectors use the same syntax as `!history export`: "
+        "manual:<name>, round:<N>, turn:<seq>, command:<seq>, "
+        "latest:<kind>. The diff is direction-aware (`a -> b`) so "
+        "swapping the arguments inverts adds and removes."
     ),
 )
 
@@ -3880,15 +4253,268 @@ registry.annotate_sub(
 
 
 @registry.command(
+    "alias",
+    usage="!alias <def|del|list|info> ...",
+    desc=(
+        "Per-match command aliases. `!alias def dmg \"ent hp this\"` makes "
+        "`!dmg -5` expand to `!ent hp this -5` on this match. Aliases are "
+        "shorthand only — expansion is one-shot (an alias cannot resolve "
+        "to another alias) and the expansion's first token must be a real "
+        "registered command. Aliases are stored on the match (not the "
+        "system) and persist through save/load. Subcommands: def, del, "
+        "list, info."
+    ),
+    snapshot=False,
+)
+async def alias_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["alias"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    sub = args[0].lower()
+
+    # ---- def <name> <expansion...> ----
+    # The expansion is the rest of the line rejoined. We validate that
+    # the expansion's first token is a real registered command — that's
+    # the contract that makes aliases predictable (no silent typos and
+    # no alias-to-alias chains, since resolution is one-shot in run()).
+    if sub == "def":
+        if await return_help_if_not_enough_args(ctx, args, 3, "alias", "def"):
+            return
+        name = args[1]
+        expansion = " ".join(args[2:]).strip()
+        if not expansion:
+            return await ctx.send(
+                "❌ alias expansion cannot be empty. Usage: "
+                "`!alias def <name> <expansion>`."
+            )
+        # Reject names that would conflict with shell-significant
+        # characters or are otherwise unusable as a command word.
+        if not name or any(c.isspace() for c in name):
+            return await ctx.send(
+                f"❌ invalid alias name `{name}`: names must be a single "
+                f"whitespace-free token."
+            )
+        # Validate that the expansion's first token is a registered
+        # command. We deliberately don't accept other aliases as the
+        # target — resolution is one-shot, so a chained alias would just
+        # fail at dispatch with a confusing "Unknown command" error.
+        import shlex as _shlex
+        try:
+            tokens = _shlex.split(expansion)
+        except ValueError as ex:
+            return await ctx.send(f"❌ invalid alias expansion: {ex}")
+        if not tokens:
+            return await ctx.send("❌ alias expansion cannot be empty.")
+        target = tokens[0]
+        if target not in registry._handlers:
+            return await ctx.send(
+                f"❌ alias expansion must start with a real command; "
+                f"`{target}` is not a registered command."
+            )
+        prior = m.aliases.get(name)
+        m.aliases[name] = expansion
+        if prior is not None:
+            return await ctx.send(
+                f"Redefined alias `{name}` (overwrote an existing "
+                f"definition).\n"
+                f"  was: `!{name}` → `!{prior}`\n"
+                f"  now: `!{name}` → `!{expansion}`"
+            )
+        return await ctx.send(f"Defined alias `!{name}` → `!{expansion}`.")
+
+    # ---- del <name> ----
+    if sub == "del":
+        if await return_help_if_not_enough_args(ctx, args, 2, "alias", "del"):
+            return
+        name = args[1]
+        if name not in m.aliases:
+            return await ctx.send(f"❌ alias `{name}` not found.")
+        del m.aliases[name]
+        return await ctx.send(f"Deleted alias `{name}`.")
+
+    # ---- list ----
+    if sub == "list":
+        if not m.aliases:
+            return await ctx.send("No aliases defined.")
+        lines = ["**Aliases:**"]
+        for aname in sorted(m.aliases.keys()):
+            exp = m.aliases[aname]
+            snippet = exp if len(exp) <= 60 else exp[:57] + "..."
+            lines.append(f"- `!{aname}` → `!{snippet}`")
+        return await ctx.send("\n".join(lines))
+
+    # ---- info <name> ----
+    if sub == "info":
+        if await return_help_if_not_enough_args(ctx, args, 2, "alias", "info"):
+            return
+        name = args[1]
+        exp = m.aliases.get(name)
+        if exp is None:
+            return await ctx.send(f"❌ alias `{name}` not found.")
+        return await ctx.send(f"**`!{name}`** → `!{exp}`")
+
+    title, body = registry.help_for(["alias"])
+    return await ctx.send(f"**{title}**\n{body}")
+
+
+registry.annotate_sub(
+    "alias", "def",
+    usage="!alias def <name> <expansion>",
+    desc=(
+        "Define (or overwrite) an alias on the active match. `<name>` is "
+        "the new command word; `<expansion>` is the command line it "
+        "expands to (its first token MUST be an existing registered "
+        "command — aliases can shadow built-ins but can't chain into "
+        "each other). Any args you pass to the alias are appended to the "
+        "expansion. Example: `!alias def dmg \"ent hp this\"` then "
+        "`!dmg -5` runs `!ent hp this -5`."
+    ),
+)
+registry.annotate_sub(
+    "alias", "del",
+    usage="!alias del <name>",
+    desc="Delete an alias from the active match.",
+)
+registry.annotate_sub(
+    "alias", "list",
+    usage="!alias list",
+    desc=(
+        "List all aliases defined on the active match, with their "
+        "expansions."
+    ),
+)
+registry.annotate_sub(
+    "alias", "info",
+    usage="!alias info <name>",
+    desc="Show an alias's full expansion.",
+)
+
+
+# -- !batch ------------------------------------------------------------------
+# `!batch cmd1 args1 ; cmd2 args2 ; ...` runs several commands as one
+# undo unit: the dispatcher's outer pre/post snapshot for `!batch`
+# captures the WHOLE sequence's state delta, and we use
+# `dispatch_no_snapshot` for each subcommand so they don't each carve
+# their own autosave. `;` is the separator — a literal `;` argument is
+# spelled `";"` (shlex preserves the quotes around it).
+def _split_batch(args: List[str], sep: str = ";") -> List[List[str]]:
+    """Split a token list at every plain `sep` token. Empty subcommands
+    (consecutive `;` or leading/trailing `;`) are dropped."""
+    parts: List[List[str]] = []
+    cur: List[str] = []
+    for tok in args:
+        if tok == sep:
+            if cur:
+                parts.append(cur)
+                cur = []
+        else:
+            cur.append(tok)
+    if cur:
+        parts.append(cur)
+    return parts
+
+
+@registry.command(
+    "batch",
+    usage="!batch <cmd1> <args...> ; <cmd2> <args...> ; ...",
+    desc=(
+        "Run multiple commands as a single undo unit. The whole batch "
+        "produces one history entry, so one `!history undo command` "
+        "rolls back the entire sequence. Subcommands are separated by a "
+        "bare `;` token (a literal semicolon argument would be quoted: "
+        "`\";\"`). If a subcommand fails with an `❌ ...` error the "
+        "batch continues with the next subcommand — the rollback is "
+        "still one-shot because the outer snapshot was taken before "
+        "any of them ran."
+    ),
+)
+async def batch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["batch"])
+        return await ctx.send(f"**{title}**\n{body}")
+    parts = _split_batch(args)
+    if not parts:
+        return await ctx.send(
+            "❌ batch is empty — provide at least one subcommand."
+        )
+    # We rely on the outer dispatcher's snapshot for undo, so subcommands
+    # use dispatch_no_snapshot. We surface a brief header so the GM can
+    # tell the responses apart from a normal single-command reply.
+    await ctx.send(f"Running batch of {len(parts)} command(s)...")
+    for sub in parts:
+        if not sub:
+            continue
+        await registry.dispatch_no_snapshot(sub[0], sub[1:], ctx, mgr)
+
+
+# -- !run --------------------------------------------------------------------
+@registry.command(
+    "run",
+    usage="!run <path>",
+    desc=(
+        "Read a file of commands (one per line, leading `!` optional, "
+        "blank lines and `#`-prefixed comment lines ignored) and run "
+        "them as a single batch — same one-snapshot undo semantics as "
+        "`!batch`. Useful for replaying a saved sequence of setup "
+        "commands at the start of a match."
+    ),
+)
+async def run_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if await return_help_if_not_enough_args(ctx, args, 1, "run"):
+        return
+    path = args[0]
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return await ctx.send(f"❌ no such file: `{path}`")
+    except OSError as ex:
+        return await ctx.send(f"❌ cannot read `{path}`: {ex}")
+    # Build subcommand argv lists. Each non-blank, non-comment line is
+    # one subcommand. Leading `!` is optional — both forms are common in
+    # human-written script files.
+    import shlex as _shlex
+    subcommands: List[List[str]] = []
+    for ln in raw.splitlines():
+        stripped = ln.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("!"):
+            stripped = stripped[1:]
+        try:
+            toks = _shlex.split(stripped)
+        except ValueError as ex:
+            return await ctx.send(
+                f"❌ parse error in `{path}`: {ex} (line: `{ln[:60]}`)"
+            )
+        if toks:
+            subcommands.append(toks)
+    if not subcommands:
+        return await ctx.send(
+            f"No commands in `{path}` (file was empty or only "
+            f"blank/comment lines)."
+        )
+    await ctx.send(
+        f"Running {len(subcommands)} command(s) from `{path}`..."
+    )
+    for sub in subcommands:
+        await registry.dispatch_no_snapshot(sub[0], sub[1:], ctx, mgr)
+
+
+@registry.command(
     "eval",
-    usage='!eval [--as <eid>] "<formula>"',
+    usage='!eval [--as <eid>] "<formula>" | !eval --as-passive <eid> <pid>',
     desc=("Evaluate a formula against the active match (for testing). "
           "`this` = current-turn entity. By default `self` is unbound; "
           "pass `--as <eid>` as the first two args to bind `self` (and "
           "entity[self]) to that entity, so you can test passive bodies "
-          "interactively. Supports assignments and multi-statement "
-          "bodies; if the source ends with an expression, its value is "
-          "returned. Quote the whole formula to preserve spaces."),
+          "interactively. Or pass `--as-passive <eid> <pid>` to look up "
+          "an existing passive's formula and run it with `self` bound to "
+          "`<eid>` — checks the entity's passives first, then global "
+          "passives. Supports assignments and multi-statement bodies; "
+          "if the source ends with an expression, its value is returned. "
+          "Quote the whole formula to preserve spaces."),
 )
 async def eval_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
@@ -3899,14 +4525,37 @@ async def eval_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # GM can test a passive body (which references entity[self]) without
     # actually attaching it to an entity and advancing a turn.
     self_id = None
-    if args and args[0] == "--as":
+    src: str
+    if args and args[0] == "--as-passive":
+        # `--as-passive <eid> <pid>` — look up an existing passive by id
+        # and run its formula. Saves the GM from copy-pasting a passive
+        # body just to test it. We check the entity's own passives first
+        # (the common case), then fall back to global_passives.
+        if len(args) < 3:
+            return await ctx.send(
+                "❌ `--as-passive` needs an entity id and a passive id."
+            )
+        self_id = _resolve_eid(m, args[1])
+        if self_id not in m.entities:
+            raise NotFound(f"Entity '{self_id}' not found.")
+        pid = args[2]
+        e = m.entities[self_id]
+        p = e.passives.get(pid) or m.global_passives.get(pid)
+        if p is None:
+            return await ctx.send(
+                f"❌ passive `{pid}` not found on entity `{self_id}` or "
+                f"in global passives."
+            )
+        src = p.formula
+    elif args and args[0] == "--as":
         if len(args) < 3:
             return await ctx.send("❌ `--as` needs an entity id and a formula.")
         self_id = _resolve_eid(m, args[1])
         if self_id not in m.entities:
             raise NotFound(f"Entity '{self_id}' not found.")
-        args = args[2:]
-    src = " ".join(args)  # rejoin in case shlex split on internal spaces
+        src = " ".join(args[2:])
+    else:
+        src = " ".join(args)  # rejoin in case shlex split on internal spaces
     eval_ctx = EvalCtx(this=m.current_entity_id(), target=self_id)
     engine = FormulaEngine(m)
     val = engine.eval_program(src, eval_ctx)
