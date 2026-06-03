@@ -1510,6 +1510,21 @@ def _validate_tree(
                     and n.id not in _ENTITY_TOKEN_NAMES
                     and n.id not in known_funcs
                     and n.id not in scope_params):
+                # Did-you-mean: the identifier surface is large (hook
+                # context names, entity tokens, allowed funcs, match
+                # funcs, scope params, user-defined functions) so a
+                # typo-recovery hint is most of what tells the GM
+                # whether they misspelled a builtin or a local param.
+                import difflib as _difflib
+                pool = (set(_ALLOWED_FUNCS) | set(_MATCH_FUNC_NAMES)
+                        | set(HOOK_CONTEXT_NAMES) | set(_ENTITY_TOKEN_NAMES)
+                        | set(known_funcs) | set(scope_params))
+                hits = _difflib.get_close_matches(n.id, list(pool), n=3, cutoff=0.6)
+                if hits:
+                    suggestions = ", ".join(f"'{h}'" for h in hits)
+                    raise FormulaError(
+                        f"Unknown identifier '{n.id}'. Did you mean: {suggestions}?"
+                    )
                 raise FormulaError(f"Unknown identifier '{n.id}'.")
         if isinstance(n, ast.Call):
             if not isinstance(n.func, ast.Name):
@@ -1519,6 +1534,16 @@ def _validate_tree(
                     and fname not in _ALLOWED_FUNCS
                     and fname not in _MATCH_FUNC_NAMES
                     and fname not in known_funcs):
+                import difflib as _difflib
+                pool = (set(_ALLOWED_FUNCS) | set(_MATCH_FUNC_NAMES)
+                        | set(known_funcs))
+                hits = _difflib.get_close_matches(fname, list(pool), n=3, cutoff=0.6)
+                if hits:
+                    suggestions = ", ".join(f"'{h}'" for h in hits)
+                    raise FormulaError(
+                        f"Function '{fname}' is not allowed. "
+                        f"Did you mean: {suggestions}?"
+                    )
                 raise FormulaError(f"Function '{fname}' is not allowed.")
 
     def _walk(node: ast.AST, scope_params: "frozenset[str]") -> None:

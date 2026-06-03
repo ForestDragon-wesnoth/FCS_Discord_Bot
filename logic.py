@@ -654,9 +654,22 @@ def _parse_bool(token: str) -> bool:
     )
 
 def _coerce_rule_value(key: str, raw_value: str):
-    # Unknown key? block (prevents typos or unimplemented settings)
+    # Unknown key? block (prevents typos or unimplemented settings).
+    # When the rule schema gets large the bare "Allowed: ..." dump is
+    # noise, so we put close-match suggestions FIRST (the common case
+    # for unknown rules is a typo) and only show the full list if we
+    # have no good guesses.
     if key not in RULE_SCHEMA:
-        allowed = ", ".join(sorted(RULE_SCHEMA.keys()))
+        import difflib as _difflib
+        keys = sorted(RULE_SCHEMA.keys())
+        hits = _difflib.get_close_matches(key, keys, n=3, cutoff=0.55)
+        if hits:
+            suggestions = ", ".join(f"'{h}'" for h in hits)
+            raise VTTError(
+                f"Unknown setting '{key}'. Did you mean: {suggestions}? "
+                f"Use `!system rules` to see all settings."
+            )
+        allowed = ", ".join(keys)
         raise VTTError(f"Unknown setting '{key}'. Allowed: {allowed}")
 
     spec = RULE_SCHEMA[key]
@@ -2592,6 +2605,18 @@ class Match:
     # the match. See the FormulaFunction dataclass for the call model.
     formula_functions: Dict[str, "FormulaFunction"] = field(default_factory=dict)
 
+    # Per-match command aliases. `aliases[name] = expansion` means a
+    # subsequent `!<name> <args>` expands to `!<expansion> <args>`. The
+    # expansion can itself include trailing literal tokens
+    # ("dmg" -> "ent hp this") so `!dmg -5` becomes `!ent hp this -5`.
+    # Aliases live on the match (not the system) because they're a
+    # session-shaping convenience the GM tweaks on the fly; serialized
+    # with the match so they survive save/load. Resolution happens at
+    # the registry dispatch layer (see CommandRegistry.run) BEFORE the
+    # handler lookup, so an alias can shadow a built-in name on this
+    # match without affecting other matches.
+    aliases: Dict[str, str] = field(default_factory=dict)
+
     # ---- runtime-only state for var-hook recursion safeguard ----
     # Tracks how deep we are in a chain of var-hook fires. A passive's
     # formula can write vars, which produces more events, which fire more
@@ -3967,6 +3992,7 @@ class Match:
                 name: fn.to_dict()
                 for name, fn in sorted(self.formula_functions.items())
             },
+            "aliases": dict(self.aliases),
         }
         if include_history:
             d["history"] = self.history.to_dict()
@@ -4042,6 +4068,11 @@ class Match:
                 # Malformed entry — skip. A formula that called the
                 # missing function will fail at its next evaluation.
                 continue
+        raw_aliases = d.get("aliases", {}) or {}
+        m.aliases = {
+            str(k): str(v) for k, v in raw_aliases.items()
+            if isinstance(k, str) and isinstance(v, str)
+        }
         # History is optional in saved dicts. It's only present when the
         # original save was made with include_history=True. A snapshot's
         # state.dict deliberately omits history (snapshots-within-

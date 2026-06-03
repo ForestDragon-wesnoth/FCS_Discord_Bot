@@ -6556,3 +6556,180 @@ immediately remove it" pattern is the foundation for things like
 "this entity is immune to debuffs", "fire-resistant entity
 removes burning on apply", etc. — all GM-built via this PR's
 event hooks.
+
+
+SCENARIO 262 — !alias define / list / info / use / overwrite / delete
+---------------------------------------------------------------------
+
+!match new ma1 AliasBasics 6 6
+!match use ma1
+!ent add hero Hero 30 3 3 10
+!alias list
+!alias def dmg "ent hp this"
+!alias def heal "ent hp this"
+!alias list
+!alias info dmg
+!dmg -5
+!ent dump hero
+!heal 7
+!ent dump hero
+!alias def dmg "ent set_var this"
+!alias info dmg
+!dmg poked yes
+!ent dump hero
+!alias del dmg
+!alias list
+!dmg -1
+
+Expected:
+`!alias list` initially reports "No aliases defined.". After
+`!alias def dmg "ent hp this"` and `!alias def heal "ent hp this"`,
+list shows both with their expansions. `!alias info dmg` shows
+`!dmg` -> `!ent hp this`. `!dmg -5` expands to `!ent hp this -5`,
+damaging hero to 25; `!heal 7` heals back to 32 (capped at 30
+unless max_hp differs — depending on default clamp behaviour the
+final HP may be 30). Redefining `dmg` to `ent set_var this` shows
+the before/after in the response, then `!dmg poked yes` sets the
+hero's `poked` var to "yes". After `!alias del dmg`, list shows
+only `heal`, and `!dmg -1` falls through to the unknown-command
+path with a did-you-mean hint pointing at `heal` (or similar).
+
+
+SCENARIO 263 — !alias rejects unknown target and empty expansion
+----------------------------------------------------------------
+
+!match new ma2 AliasReject 6 6
+!match use ma2
+!ent add a A 30 2 2 10
+!alias def foo nosuchcommand
+!alias def bar ""
+!alias def "spaced name" "ent hp this"
+!alias list
+
+Expected: Each `!alias def` rejects with a specific error.
+`foo` -> "alias expansion must start with a real command;
+`nosuchcommand` is not a registered command." `bar` -> "alias
+expansion cannot be empty." `"spaced name"` -> "invalid alias
+name `spaced name`: names must be a single whitespace-free token."
+List ends empty.
+
+
+SCENARIO 264 — !batch groups commands under a single undo
+---------------------------------------------------------
+
+!match new mb1 BatchUndo 6 6
+!match use mb1
+!ent add a A 30 2 2 10
+!ent add b B 30 4 4 9
+!batch ent hp a -5 ; ent hp b -7 ; ent set_var a marked true
+!ent dump a
+!ent dump b
+!history list commands
+!history undo command 1 confirm
+!ent dump a
+!ent dump b
+
+Expected: After `!batch`, A has hp 25 and `marked=true`; B has
+hp 23. The batch produces ONE command snapshot (label starts with
+`!batch ent hp a ...`) — `!history list commands` shows a single
+entry from this batch. After `!history undo command 1 confirm`,
+both entities revert: A back to hp 30 (no `marked` var), B back
+to hp 30 — proving the snapshot was taken BEFORE any subcommand
+ran.
+
+
+SCENARIO 265 — !history diff between two command snapshots
+-----------------------------------------------------------
+
+!match new mhd1 HistoryDiff 6 6
+!match use mhd1
+!ent add hero Hero 30 2 2 10
+!ent add foe Foe 30 4 4 9
+!history save start
+!ent hp hero -10
+!ent set_var hero blessed true
+!ent add ally Ally 30 1 1 8
+!ent remove foe
+!history save end
+!history diff manual:start manual:end
+
+Expected: The diff names the two selectors and lists:
+entities added (ally), entities removed (foe), and entity changes
+for hero — vars.hp moved 30 -> 20 and vars.blessed was added
+(+ true). Round/active_index unchanged so those lines do not
+appear. Direction is `start -> end`; swapping the args would
+flip adds/removes.
+
+
+SCENARIO 266 — !find predicate AND queries (vars, status, group)
+----------------------------------------------------------------
+
+!match new mf1 FindQueries 6 6
+!match use mf1
+!ent add a A 30 1 1 10
+!ent add b B 15 2 2 9
+!ent add c C 8 3 3 8
+!ent set_var a team red
+!ent set_var b team red
+!ent set_var c team blue
+!ent status b add bleeding
+!ent status c add bleeding
+!ent group new wounded
+!ent group add wounded b
+!ent group add wounded c
+!find team=red
+!find team=red hp<20
+!find status:bleeding group:wounded
+!find hp>=10 team!=blue
+!find nosuchvar=1
+
+Expected:
+- `team=red`        -> a, b
+- `team=red hp<20`  -> b only (a has hp 30)
+- `status:bleeding group:wounded` -> b, c
+- `hp>=10 team!=blue` -> a, b (c is hp 8, excluded; also team=blue
+  would have excluded it)
+- `nosuchvar=1`     -> "No entities match." (missing vars never
+  satisfy any operator, even `!=`)
+
+
+SCENARIO 267 — !eval --as-passive runs a stored passive's formula
+-----------------------------------------------------------------
+
+!match new me1 EvalAsPassive 6 6
+!match use me1
+!ent add hero Hero 30 2 2 10
+!ent set_var hero stamina 5
+!passive add hero regen on_turn_start "entity[self].stamina = entity[self].stamina + 3"
+!eval --as-passive hero regen
+!ent dump hero
+!eval --as-passive hero regen
+!ent dump hero
+!eval --as-passive hero nosuchpid
+
+Expected: `!eval --as-passive hero regen` runs the passive body
+with `self` bound to hero — stamina 5 -> 8 -> 11 across two
+invocations. The third call fails with "passive `nosuchpid` not
+found on entity `hero` or in global passives."
+
+
+SCENARIO 268 — Did-you-mean hints (unknown command, rule, identifier)
+---------------------------------------------------------------------
+
+!match new mdym1 DidYouMean 6 6
+!match use mdym1
+!ent add hero Hero 30 2 2 10
+!enitty
+!system set DidYouMean teem_var team
+!eval "entitty"
+!eval "minn(1,2)"
+
+Expected: `!enitty` triggers the unknown-command suggester with
+a did-you-mean pointing at `ent`. `!system set ... teem_var ...`
+fails with "Unknown setting 'teem_var'. Did you mean: 'team_var'?".
+`!eval "entitty"` fails with "Unknown identifier 'entitty'. Did
+you mean: ..." (close-matches drawn from allowed funcs, hook
+context names, entity tokens, and user-defined function names —
+e.g. 'move_entity', 'entity_groups'). `!eval "minn(1,2)"` fails
+with "Function 'minn' is not allowed. Did you mean: 'min'?"
+
