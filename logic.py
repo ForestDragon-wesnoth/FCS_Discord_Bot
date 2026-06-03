@@ -824,6 +824,30 @@ HOOK_NAMES: Set[str] = {
     "on_round_start",
     "on_round_end",
     "on_entity_spawned",
+    # Movement event (any position change — tp / step / clone-spawn-
+    # via-move; NOT the initial spawn placement, which has its own
+    # on_entity_spawned hook). Context bindings during fire:
+    #   from_x, from_y, to_x, to_y  — the move's endpoints
+    # Tile on_enter / on_exit fire alongside this for tile-attached
+    # logic; on_entity_moved is the entity-side complement so a
+    # passive can react regardless of which tile is involved.
+    "on_entity_moved",
+    # Status lifecycle. Fire on the entity whose status changed.
+    # Context bindings:
+    #   status_name  — the affected status
+    #   old_value    — for changed/removed: the prior data dict (the
+    #                  whole subtree under status[name]); None for
+    #                  added (the status didn't exist before).
+    #   new_value    — for added/changed: the resulting data dict;
+    #                  None for removed (the status no longer exists).
+    # `on_status_changed` fires on data-field writes within an
+    # already-present status (status_set on a path; the field-level
+    # equivalent of on_var_changed). For applied/removed lifecycle,
+    # use on_status_added / on_status_removed — they cover the
+    # whole-status appear/disappear distinction.
+    "on_status_added",
+    "on_status_removed",
+    "on_status_changed",
     "on_var_created",
     "on_var_changed",
     "on_var_removed",
@@ -832,18 +856,34 @@ HOOK_NAMES: Set[str] = {
 }
 
 # Tile hooks live in tiles[(x, y)]["hooks"][<name>] as formula strings.
-# They fire when an entity transits a tile via Entity.tp / Entity.move_dirs
-# (and Match.move_group_dirs for group-shift moves) — see Match.fire_tile_hook
-# for the actual firing path. These names are kept separate from
-# HOOK_NAMES because entity / global passives don't subscribe to them
-# (only stored tile-side formulas do).
+# Movement hooks (on_enter / on_exit / on_stop) fire when an entity
+# transits a tile via Entity.tp / Entity.move_dirs (and
+# Match.move_group_dirs for group-shift moves). Time hooks
+# (on_round_*, on_turn_*) fire on the tile itself at the corresponding
+# round/turn lifecycle moment — they don't need an entity standing on
+# the tile, just the tile existing with the hook registered. These
+# names are kept separate from HOOK_NAMES because entity / global
+# passives don't subscribe to them (only stored tile-side formulas
+# do). See Match.fire_tile_hook / Match.fire_tile_time_hooks.
 TILE_HOOK_NAMES: Set[str] = {
+    # Movement
     "on_enter",   # entity arrived on this tile (fired post-position-change)
     "on_exit",    # entity is about to leave this tile (fired PRE-position-change
                   # so entity[self].x / .y still refer to the exit tile)
     "on_stop",    # entity stopped here: either a tp landed here, or this
                   # was the last cell of a stepwise move. Fires after on_enter
                   # at the same coord.
+    # Time hooks. Fire once per relevant tile (anything in match.tiles
+    # carrying that hook) at the round/turn lifecycle moment. The
+    # firing entity (for `self`) is whatever entity's turn is current
+    # at the time the hook fires — except for round_* hooks where no
+    # specific entity is acting; there `self` resolves to the
+    # current-turn entity if there is one, else `self` is unbound.
+    # Bindings: tile_x, tile_y for both movement and time hooks.
+    "on_round_start",
+    "on_round_end",
+    "on_turn_start",
+    "on_turn_end",
 }
 
 # Var hooks distinguished from lifecycle hooks. Useful for code paths that
@@ -1991,6 +2031,15 @@ class Entity:
         if fire_hooks:
             log.extend(m.fire_tile_hook("on_enter", self.id, x, y))
             log.extend(m.fire_tile_hook("on_stop", self.id, x, y))
+            # Entity-side movement event. Fires once per tp call (not
+            # per step), AFTER the tile hooks so a passive observing
+            # the move sees the final (x, y) and any side-effects the
+            # tile hooks already applied. Skip when the position
+            # didn't actually change.
+            if (old_x, old_y) != (x, y):
+                log.extend(m.fire_entity_moved(
+                    self.id, old_x, old_y, x, y,
+                ))
         return log
 
     # Stepwise move (final cell must be free; rotate per step)
@@ -2053,6 +2102,7 @@ class Entity:
         # Phase 2: commit each step, firing hooks. No more validation —
         # phase 1 already proved the whole path is legal.
         log: List[str] = []
+        origin_x, origin_y = self.x, self.y
         for nx, ny, step_facing in step_path:
             if fire_hooks:
                 log.extend(m.fire_tile_hook("on_exit", self.id, self.x, self.y))
@@ -2065,6 +2115,13 @@ class Entity:
             # movement happened (zero-step move_dirs) — empty step_path
             # means no transit and therefore no stop.
             log.extend(m.fire_tile_hook("on_stop", self.id, self.x, self.y))
+            # on_entity_moved fires ONCE for the whole stepwise move,
+            # with from = origin and to = final position. Step-level
+            # observation is via tile on_enter/on_exit; on_entity_moved
+            # answers "did this entity move at all this command?"
+            log.extend(m.fire_entity_moved(
+                self.id, origin_x, origin_y, self.x, self.y,
+            ))
         return log
 
     # Stats/initiative (entity-owned)
@@ -3140,6 +3197,7 @@ class Match:
             self.round_started = True
             log.extend(self.fire_hook("on_round_start"))
             log.extend(self.fire_status_tick("round_start"))
+            log.extend(self.fire_tile_time_hooks("on_round_start"))
             # Autosave: round start happens after on_round_start hooks
             # so that restoring the snapshot gives the players the
             # state they would have seen as the round began (with any
@@ -3152,6 +3210,7 @@ class Match:
             if eligible:
                 log.extend(self.fire_hook("on_turn_start", target_ids=[cur]))
                 log.extend(self.fire_status_tick("turn_start"))
+                log.extend(self.fire_tile_time_hooks("on_turn_start"))
             else:
                 log.append(
                     "⏭️ every entity is skippable; the round passes "
@@ -3163,6 +3222,7 @@ class Match:
         # Normal transition.
         cur = self.turn_order[self.active_index]
         log.extend(self.fire_status_tick("turn_end"))
+        log.extend(self.fire_tile_time_hooks("on_turn_end"))
         log.extend(self.fire_hook("on_turn_end", target_ids=[cur]))
         self._advance_index(log)
         # Skip over any entity carrying a skip-status flag.
@@ -3171,6 +3231,7 @@ class Match:
         if eligible:
             log.extend(self.fire_hook("on_turn_start", target_ids=[new_cur]))
             log.extend(self.fire_status_tick("turn_start"))
+            log.extend(self.fire_tile_time_hooks("on_turn_start"))
         else:
             log.append(
                 "⏭️ every entity is skippable; the round passes "
@@ -3191,6 +3252,7 @@ class Match:
         if wrapped:
             log.extend(self.fire_hook("on_round_end"))
             log.extend(self.fire_status_tick("round_end"))
+            log.extend(self.fire_tile_time_hooks("on_round_end"))
             # Flush any deferred turn-order rebuild between on_round_end
             # (ran against the OLD order) and on_round_start (sees the
             # NEW order). Round-wrap naturally restarts at the top.
@@ -3205,6 +3267,7 @@ class Match:
             self.round_number += 1
             log.extend(self.fire_hook("on_round_start"))
             log.extend(self.fire_status_tick("round_start"))
+            log.extend(self.fire_tile_time_hooks("on_round_start"))
             self.history.record_round(self)
 
     def _skipping_statuses(self, e: "Entity") -> List[str]:
@@ -3269,9 +3332,8 @@ class Match:
                     continue
         return None
 
-    def fire_tile_hook(self, when: str, entity_id: str, x: int, y: int) -> List[str]:
-        """Fire the tile hook at (x, y) of the given `when`, with the
-        moving entity bound as `self`.
+    def fire_tile_hook(self, when: str, entity_id: Optional[str], x: int, y: int) -> List[str]:
+        """Fire the tile hook at (x, y) of the given `when`.
 
         Returns log lines: one info line per successful fire, one warning
         line per formula failure. Empty list when no hook is registered
@@ -3279,7 +3341,15 @@ class Match:
         no hooks at all.
 
         Context bindings:
-          - self          = the entering/exiting/stopping entity
+          - self          = the bound entity (entity_id arg). For
+                            movement hooks this is the entering /
+                            exiting / stopping entity. For time hooks
+                            (on_round_*, on_turn_*) it's the
+                            currently-acting entity if there is one,
+                            or unbound (entity_id=None) otherwise — in
+                            which case a formula referencing `self`
+                            errors with the standard "self is unbound"
+                            message.
           - this          = current_entity_id()    (often `self` but not
                             always — e.g. a future push effect would move
                             a non-current entity)
@@ -3343,26 +3413,24 @@ class Match:
         }
         ctx = EvalCtx(
             this=self.current_entity_id(),
-            target=entity_id,
+            target=entity_id or None,  # "" -> None for unbound `self`
             extras=extras,
         )
+        # Log-line tag: show "for `eid`" when there's an acting entity,
+        # otherwise "(no acting entity)" for time hooks during a wrap.
+        tag = f"for `{entity_id}`" if entity_id else "(no acting entity)"
         try:
             engine.eval_program(formula_src, ctx)
         except FormulaError as ex:
-            return [
-                f"⚠️ tile ({x},{y}) hook `{when}` for `{entity_id}` "
-                f"FAILED: {ex}"
-            ]
+            return [f"⚠️ tile ({x},{y}) hook `{when}` {tag} FAILED: {ex}"]
         except Exception as ex:
             # Defensive: any non-FormulaError exception is a bug, but
             # don't bring down the move on it.
             return [
-                f"⚠️ tile ({x},{y}) hook `{when}` for `{entity_id}` "
+                f"⚠️ tile ({x},{y}) hook `{when}` {tag} "
                 f"CRASHED: {type(ex).__name__}: {ex}"
             ]
-        return [
-            f"⚙️ tile ({x},{y}) hook `{when}` fired for `{entity_id}`"
-        ]
+        return [f"⚙️ tile ({x},{y}) hook `{when}` fired {tag}"]
 
     def fire_status_tick(self, when: str) -> List[str]:
         """Run status_tick_formula once for every status on every
@@ -3441,6 +3509,157 @@ class Match:
                         f"({when}) CRASHED: "
                         f"{type(ex).__name__}: {ex}"
                     )
+        return log
+
+    def fire_status_event(
+        self, when: str, entity_id: str, status_name: str,
+        *, old_value: Optional[Dict[str, Any]] = None,
+        new_value: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
+        """Fire passives matching `when` for a status lifecycle event.
+
+        `when` is one of "on_status_added" / "on_status_removed" /
+        "on_status_changed". Context bindings: status_name + old_value
+        / new_value as documented in HOOK_NAMES. Routes through the
+        same fire_hook pipeline (global passives first, then the
+        entity's own), so target/scope filtering works the same way
+        var hooks do.
+
+        old_value / new_value semantics:
+          on_status_added   — old None, new = the data dict (usually
+                              {} since add starts with empty data)
+          on_status_removed — old = the prior dict, new None
+          on_status_changed — both = the dict (whole status subtree)
+                              before and after the field change
+        Snapshots are shallow copies so a passive that mutates
+        new_value doesn't bleed into the live status data.
+        """
+        if when not in HOOK_NAMES:
+            return []
+        if when not in ("on_status_added", "on_status_removed",
+                        "on_status_changed"):
+            return []
+        e = self.entities.get(entity_id)
+        if e is None:
+            return []
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        engine = FormulaEngine(self)
+        this_id = self.current_entity_id()
+        extras = {
+            "status_name": status_name,
+            "old_value": dict(old_value) if isinstance(old_value, dict) else old_value,
+            "new_value": dict(new_value) if isinstance(new_value, dict) else new_value,
+            "hook_name": when,
+        }
+        ctx = EvalCtx(this=this_id, target=entity_id, extras=extras)
+        log: List[str] = []
+        for p in self.global_passives.values():
+            if p.when == when:
+                log.append(_run_passive_safely(
+                    engine, p, ctx, target_id=entity_id, is_global=True,
+                ))
+        for p in e.passives.values():
+            if p.when == when:
+                log.append(_run_passive_safely(
+                    engine, p, ctx, target_id=entity_id, is_global=False,
+                ))
+        return log
+
+    def _emit_status_diff(
+        self, entity_id: str, status_name: str,
+        before: Any, after: Any,
+    ) -> List[str]:
+        """Compare a status's data before vs after a mutation and fire
+        the right lifecycle event (or none if data is unchanged).
+
+        before / after are the data dicts at status[name] (None if the
+        status wasn't / isn't present). Used by every mutation site
+        (both the !ent status command and the status_* formula
+        functions) so event-firing is consistent and the call sites
+        don't repeat the dispatch logic.
+
+        before  after  -> event
+          None  {...}      on_status_added
+          {...} None       on_status_removed
+          {...} {...}      on_status_changed iff before != after
+        """
+        if before is None and after is not None:
+            return self.fire_status_event(
+                "on_status_added", entity_id, status_name,
+                old_value=None, new_value=after,
+            )
+        if before is not None and after is None:
+            return self.fire_status_event(
+                "on_status_removed", entity_id, status_name,
+                old_value=before, new_value=None,
+            )
+        if before != after:
+            return self.fire_status_event(
+                "on_status_changed", entity_id, status_name,
+                old_value=before, new_value=after,
+            )
+        return []
+
+    def fire_entity_moved(
+        self, entity_id: str,
+        from_x: int, from_y: int, to_x: int, to_y: int,
+    ) -> List[str]:
+        """Fire on_entity_moved passives for an entity that just changed
+        position. Context bindings: from_x / from_y / to_x / to_y. The
+        entity-side complement of tile on_enter / on_exit hooks — a
+        passive can react to "any movement" without caring which tile."""
+        e = self.entities.get(entity_id)
+        if e is None:
+            return []
+        from formula import FormulaEngine, EvalCtx
+        engine = FormulaEngine(self)
+        this_id = self.current_entity_id()
+        extras = {
+            "from_x": from_x, "from_y": from_y,
+            "to_x": to_x, "to_y": to_y,
+            "hook_name": "on_entity_moved",
+        }
+        ctx = EvalCtx(this=this_id, target=entity_id, extras=extras)
+        log: List[str] = []
+        for p in self.global_passives.values():
+            if p.when == "on_entity_moved":
+                log.append(_run_passive_safely(
+                    engine, p, ctx, target_id=entity_id, is_global=True,
+                ))
+        for p in e.passives.values():
+            if p.when == "on_entity_moved":
+                log.append(_run_passive_safely(
+                    engine, p, ctx, target_id=entity_id, is_global=False,
+                ))
+        return log
+
+    def fire_tile_time_hooks(self, when: str) -> List[str]:
+        """Fire tile time hooks (on_round_start/end, on_turn_start/end)
+        on every tile that has a hook of that name. Iterates a snapshot
+        of tile coords so a hook that calls tile_clear/tile_del during
+        firing doesn't break the loop. Sorted by (x, y) for deterministic
+        order across rounds. Each fire has self bound to whatever entity
+        is currently acting (if any); tile_x/tile_y bind to the tile's
+        coords as usual.
+
+        Tile time hooks are an alternative to entity-attached passives
+        for terrain effects: 'fire spreads at round end', 'trap rearms
+        at round start', a status-like-effect that's tied to the tile
+        rather than to a creature.
+        """
+        if when not in TILE_HOOK_NAMES:
+            return []
+        cur = self.current_entity_id()
+        coords = sorted(self.tiles.keys())
+        log: List[str] = []
+        for (x, y) in coords:
+            # Skip tiles cleared mid-iteration (e.g. by a previous tile's
+            # hook calling tile_clear on this one). Also skip if no hook
+            # of this kind is registered — fire_tile_hook handles all
+            # the per-tile lookup so we just delegate.
+            if (x, y) not in self.tiles:
+                continue
+            log.extend(self.fire_tile_hook(when, cur, x, y))
         return log
 
     def fire_hook(self, when: str, *, target_ids: Optional[List[str]] = None) -> List[str]:
@@ -4067,6 +4286,7 @@ class Match:
         log: List[str] = []
         for eid, path in plans.items():
             e = self.entities[eid]
+            origin_x, origin_y = e.x, e.y
             for nx, ny, facing in path:
                 if fire_hooks:
                     log.extend(self.fire_tile_hook("on_exit", eid, e.x, e.y))
@@ -4076,6 +4296,11 @@ class Match:
                     log.extend(self.fire_tile_hook("on_enter", eid, nx, ny))
             if fire_hooks and path:
                 log.extend(self.fire_tile_hook("on_stop", eid, e.x, e.y))
+                # on_entity_moved per group member, once per member
+                # (mirrors single-entity move_dirs semantics).
+                log.extend(self.fire_entity_moved(
+                    eid, origin_x, origin_y, e.x, e.y,
+                ))
         total_steps = sum(max(1, int(n)) for _, n in moves)
         return len(members), total_steps, log
 
