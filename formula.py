@@ -3438,6 +3438,14 @@ class FormulaEngine:
         except FormulaError:
             raise
         except Exception as e:
+            # Action-system exceptions (ActionFail / ActionEngineFault)
+            # propagate unwrapped — they carry user-visible messages the
+            # runner uses to decide rollback vs surface vs branch, and
+            # wrapping them as "Runtime error: ..." would hide that
+            # signal from the action runner above us.
+            from action import ActionFail, ActionEngineFault
+            if isinstance(e, (ActionFail, ActionEngineFault)):
+                raise
             raise FormulaError(f"Runtime error: {e}")
 
     def eval_program(self, src: str, ctx: EvalCtx,
@@ -3510,6 +3518,14 @@ class FormulaEngine:
         except FormulaError:
             raise
         except Exception as e:
+            # Action-system exceptions (ActionFail / ActionEngineFault)
+            # propagate unwrapped — they carry user-visible messages the
+            # runner uses to decide rollback vs surface vs branch, and
+            # wrapping them as "Runtime error: ..." would hide that
+            # signal from the action runner above us.
+            from action import ActionFail, ActionEngineFault
+            if isinstance(e, (ActionFail, ActionEngineFault)):
+                raise
             raise FormulaError(f"Runtime error: {e}")
 
 

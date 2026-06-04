@@ -4770,50 +4770,56 @@ async def _run_action_dispatch(
     (success ✓ vs ❌ <msg>)."""
     from action import (
         discover_actions, lookup_action, parse_target, parse_args_tokens,
-        run_action, _sync_dispatch_returning,
+        run_action,
     )
     actor = m.entities[actor_id]
     actions = discover_actions(actor, m.rules)
-    matches = lookup_action(actions, requested_name, m.rules)
-    if not matches:
-        avail = sorted(actions.keys())
-        if avail:
-            hint = " Available: " + ", ".join(f"`{n}`" for n in avail) + "."
-        else:
-            hint = ""
-        return await ctx.send(
-            f"❌ no action `{requested_name}` on `{actor_id}`.{hint}"
-        )
-    if len(matches) > 1:
-        # Disambiguation menu: list all locations, the user re-issues
-        # the command with the full path as the name. The full path
-        # (e.g. `inventory.sword.actions.slice`) is unique by
-        # construction so it always resolves cleanly.
-        lines = [
-            f"There are {len(matches)} actions named "
-            f"`{requested_name}` on `{actor_id}`. Pick one by its "
-            f"full path:"
-        ]
-        for i, act in enumerate(matches, start=1):
-            desc = f" — {act.description}" if act.description else ""
-            lines.append(
-                f"  {i}. `{act.full_path}`{desc}"
-            )
-        lines.append(
-            f"Re-issue as: "
-            f"`!action {actor_id} <full_path>`"
-        )
-        return await ctx.send("\n".join(lines))
-    # Single-match path. Also accept "fully-qualified" requests where
-    # the user typed an exact full_path (the disambiguation menu
-    # invites this). Compare against any action whose full_path
-    # matches; if found, use that one directly.
-    action = matches[0]
+    # First: full-path match. The disambiguation menu directs users
+    # to type the full path (e.g. `inventory.sword.actions.slice`),
+    # so we resolve that BEFORE falling through to the bare-name
+    # lookup — otherwise the full path would still hit the multi-
+    # match menu (or miss entirely when the bare name is shared).
+    action = None
     for act_list in actions.values():
         for act in act_list:
             if act.full_path == requested_name:
                 action = act
                 break
+        if action is not None:
+            break
+    if action is None:
+        # Bare-name lookup. Apply the case-sensitivity rule via
+        # lookup_action so a `slice` named action matches the user's
+        # request consistently with discover_actions's casing.
+        matches = lookup_action(actions, requested_name, m.rules)
+        if not matches:
+            avail = sorted(actions.keys())
+            if avail:
+                hint = " Available: " + ", ".join(f"`{n}`" for n in avail) + "."
+            else:
+                hint = ""
+            return await ctx.send(
+                f"❌ no action `{requested_name}` on `{actor_id}`.{hint}"
+            )
+        if len(matches) > 1:
+            # Disambiguation menu: list all locations, the user re-
+            # issues with the full path.
+            lines = [
+                f"There are {len(matches)} actions named "
+                f"`{requested_name}` on `{actor_id}`. Pick one by its "
+                f"full path:"
+            ]
+            for i, act in enumerate(matches, start=1):
+                desc = f" — {act.description}" if act.description else ""
+                lines.append(
+                    f"  {i}. `{act.full_path}`{desc}"
+                )
+            lines.append(
+                f"Re-issue as: "
+                f"`!action {actor_id} <full_path>`"
+            )
+            return await ctx.send("\n".join(lines))
+        action = matches[0]
     # Parse the target tokens off the front, then args off the rest.
     try:
         target_value, remaining = parse_target(
@@ -4831,11 +4837,18 @@ async def _run_action_dispatch(
     prev_mgr = getattr(m, "_runtime_mgr", None)
     m._runtime_ctx = ctx
     m._runtime_mgr = mgr
+    from action import ActionEngineFault
     try:
         ok, fail_msg = await run_action(
             action, actor_id=actor_id, target=target_value,
             args=args_dict, match=m, mgr=mgr, ctx=ctx,
         )
+    except ActionEngineFault as ef:
+        # Engine-level refusal (recursion limit etc.) — runner has
+        # already rolled back and unwound the chain. Surface as a
+        # clean ❌ so the user doesn't see the dispatcher's generic
+        # `💥 Unexpected error` path.
+        return await ctx.send(f"❌ action `{action.name}`: {ef.message}")
     finally:
         m._runtime_ctx = prev_ctx
         m._runtime_mgr = prev_mgr

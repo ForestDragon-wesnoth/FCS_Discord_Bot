@@ -92,6 +92,20 @@ class ActionValidationError(VTTError):
     pass
 
 
+class ActionEngineFault(Exception):
+    """Engine-level refusal to keep running an action chain — the
+    recursion limit was hit, an internal invariant broke, etc.
+    DISTINCT from ActionFail (which is the GM's clean abort signal):
+    engine faults propagate up the action chain regardless of
+    use_action() return-value branching, because the engine is
+    refusing the operation rather than the GM's body choosing to
+    bail. use_action() catches ActionFail and translates to a False
+    return; ActionEngineFault is allowed to bubble past."""
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
 # ----------------------------------------------------------------------
 # Action dataclass
 # ----------------------------------------------------------------------
@@ -613,10 +627,13 @@ async def run_action(
     # Enforce recursion limit BEFORE allocating any state for this
     # call. The check uses the CURRENT depth — _action_depth gets
     # bumped just below, so the limit value is "max nested actions
-    # including this one".
+    # including this one". This is an ENGINE FAULT (raised) rather
+    # than a clean fail (returned), so use_action() can't accidentally
+    # swallow it by ignoring the False return — the exception
+    # propagates up the whole chain so EVERY level rolls back.
     limit = int(match.rules.get("action_recursion_limit", 8))
     if match._action_depth >= limit:
-        return False, (
+        raise ActionEngineFault(
             f"action recursion limit reached ({limit}). The action "
             f"`{action.name}` would be call #{match._action_depth + 1} "
             f"in a chain — break the cycle or raise "
@@ -725,9 +742,21 @@ async def run_action(
                 action_bindings=bindings,
             )
         except ActionFail as af:
+            # Clean GM-initiated abort. Roll back to pre-state and
+            # surface as a False return so the caller (use_action /
+            # the !action handler) can branch on it.
             _rollback_match(match, mgr, pre_state)
             match._action_depth = pre_action_depth
             return False, af.message
+        except ActionEngineFault:
+            # Engine refusal (recursion limit etc.). Roll back AND
+            # re-raise — these don't get translated to a False
+            # return; they propagate up the chain so every level
+            # unwinds. The outermost !action handler surfaces the
+            # message via the dispatcher's `💥 ...` path.
+            _rollback_match(match, mgr, pre_state)
+            match._action_depth = pre_action_depth
+            raise
         except Exception:
             _rollback_match(match, mgr, pre_state)
             match._action_depth = pre_action_depth

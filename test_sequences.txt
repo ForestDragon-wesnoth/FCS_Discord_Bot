@@ -6951,3 +6951,181 @@ weight summing" pattern without a hardcoded inventory: pack
 contents are just numeric vars under a GM-chosen path.
 
 
+SCENARIO 276 — Basic action: source proxy + entity target
+----------------------------------------------------------
+
+!match new mac1 ActionBasic 6 6
+!match use mac1
+!ent add hero Hero 30 2 2 10
+!ent add goblin Goblin 20 4 4 8
+!ent set_var hero inventory.sword.damage 5
+!ent set_var hero inventory.sword.actions.slice.target entity
+!ent set_var hero inventory.sword.actions.slice.description "Slice with the sword"
+!ent set_var hero inventory.sword.actions.slice.body "entity[target].hp = entity[target].hp - source.damage"
+!action hero slice goblin
+!ent dump goblin
+!ent set_var hero inventory.sword.damage 8
+!action hero slice goblin
+!ent dump goblin
+
+Expected: First !action runs the body with source.damage = 5;
+goblin's hp drops from 20 to 15. After bumping inventory.sword
+.damage to 8, a second invocation reads through the source
+proxy and subtracts 8 — goblin hp 15 -> 7. The reply line is
+`hero used action slice.` in both cases. This proves the
+self-reference pattern: copying the same action body to a
+"dagger" with damage=3 would automatically use 3 with no body
+change.
+
+
+SCENARIO 277 — fail() rolls back to pre-action state
+-----------------------------------------------------
+
+!match new mac2 ActionRollback 6 6
+!match use mac2
+!ent add hero Hero 30 2 2 10
+!ent set_var hero mana 6
+!ent set_var hero blast_count 0
+!ent set_var hero spells.fireball.cost 10
+!ent set_var hero spells.fireball.power 12
+!ent set_var hero spells.fireball.actions.cast.target none
+!ent set_var hero spells.fireball.actions.cast.body "entity[self].blast_count = entity[self].blast_count + 1\nif entity[self].mana < source.cost:\n    fail('not enough mana (need ' + str(source.cost) + ', have ' + str(entity[self].mana) + ')')\nentity[self].mana = entity[self].mana - source.cost"
+!action hero cast
+!ent dump hero
+!ent set_var hero mana 15
+!action hero cast
+!ent dump hero
+
+Expected: First !action fails because mana (6) < cost (10).
+The body's first statement BUMPED blast_count to 1, but the
+fail() triggers a rollback — so blast_count stays at 0 and mana
+stays at 6. The reply is `❌ action cast: not enough mana (need
+10, have 6)`. After topping mana to 15, the second invocation
+succeeds: blast_count goes to 1, mana drops to 5. This proves
+transactional rollback: mid-body writes that came before the
+fail() are reverted, not persisted.
+
+
+SCENARIO 278 — cmd() dispatches an allowed entity command
+----------------------------------------------------------
+
+!match new mac3 ActionCmd 6 6
+!match use mac3
+!ent add hero Hero 30 2 2 10
+!ent add foe Foe 25 4 4 8
+!ent set_var hero spells.zap.damage 4
+!ent set_var hero spells.zap.actions.cast.target entity
+!ent set_var hero spells.zap.actions.cast.body "cmd('ent hp ' + target + ' -' + str(source.damage))"
+!action hero cast foe
+!ent dump foe
+!system set default action_cmd_allowlist ""
+!action hero cast foe
+!ent dump foe
+
+Expected: With the default allowlist (`ent` only), the first
+!action runs cmd("ent hp foe -4") and foe's hp drops from 25
+to 21. After clearing the allowlist, the second invocation
+fails — `❌ action cast: cmd(): command `ent` is not on this
+system's action_cmd_allowlist. Allowed: (none).` — and foe's
+hp stays at 21 (rollback). This proves the allowlist
+enforcement and that cmd() is the bridge between the action
+body and the wider command surface.
+
+
+SCENARIO 279 — Disambiguation menu for two same-named actions
+--------------------------------------------------------------
+
+!match new mac4 ActionDisamb 6 6
+!match use mac4
+!ent add hero Hero 30 2 2 10
+!ent add foe Foe 25 4 4 8
+!ent set_var hero inventory.sword.damage 5
+!ent set_var hero inventory.sword.actions.strike.target entity
+!ent set_var hero inventory.sword.actions.strike.body "entity[target].hp = entity[target].hp - source.damage"
+!ent set_var hero inventory.dagger.damage 3
+!ent set_var hero inventory.dagger.actions.strike.target entity
+!ent set_var hero inventory.dagger.actions.strike.body "entity[target].hp = entity[target].hp - source.damage"
+!action hero strike foe
+!action hero inventory.sword.actions.strike foe
+!ent dump foe
+!action hero inventory.dagger.actions.strike foe
+!ent dump foe
+
+Expected: The first !action with just `strike` triggers the
+disambiguation menu listing both `inventory.sword.actions.
+strike` and `inventory.dagger.actions.strike`, instructing the
+user to re-issue with a full path. The next call uses the
+sword path; foe loses 5 hp (25 -> 20). The dagger path then
+loses 3 more (20 -> 17). This proves both that ambiguity is
+detected and that the full-path form is the unambiguous
+selector.
+
+
+SCENARIO 280 — Recursion limit guards an action chain
+------------------------------------------------------
+
+!match new mac5 ActionRecursion 6 6
+!match use mac5
+!ent add hero Hero 30 2 2 10
+!system set default action_recursion_limit 3
+!ent set_var hero actions.bounce.target none
+!ent set_var hero actions.bounce.body "use_action(self, 'bounce')"
+!action hero bounce
+
+Expected: The action recursively calls itself via use_action.
+With action_recursion_limit=3, the third nested call refuses;
+the runner returns False with the message "action recursion
+limit reached (3). ..." which the use_action() formula
+primitive bubbles up as a FormulaError, surfaced by the OUTER
+!action as `❌ action bounce: Runtime error: ...recursion
+limit...`. All mid-chain writes are rolled back. The limit
+acts as the backstop against accidentally cyclic actions.
+
+
+SCENARIO 281 — on_action_used fires after successful actions
+-------------------------------------------------------------
+
+!match new mac6 ActionHook 6 6
+!match use mac6
+!ent add hero Hero 30 2 2 10
+!ent set_var hero used_count 0
+!ent set_var hero last_action ""
+!ent set_var hero inventory.sword.damage 5
+!ent set_var hero inventory.sword.actions.slice.target none
+!ent set_var hero inventory.sword.actions.slice.body "entity[self].used_count = entity[self].used_count"
+!passive add hero log_action on_action_used "entity[self].used_count = entity[self].used_count + 1\nentity[self].last_action = action_name"
+!action hero slice
+!ent dump hero
+!action hero slice
+!ent dump hero
+
+Expected: Each successful !action fires on_action_used once.
+used_count goes from 0 -> 1 -> 2 across the two invocations
+and last_action is set to "slice" by the passive. The action's
+own body is a deliberate no-op (reads but doesn't change a
+var) — the hook fires regardless because the action completed
+without fail().
+
+
+SCENARIO 282 — Action body locals + control flow + args proxy
+--------------------------------------------------------------
+
+!match new mac7 ActionLocals 6 6
+!match use mac7
+!ent add hero Hero 30 2 2 10
+!ent add target1 T1 20 3 3 8
+!ent set_var hero inventory.bow.base 4
+!ent set_var hero inventory.bow.actions.shoot.target entity
+!ent set_var hero inventory.bow.actions.shoot.body "raw = source.base + 3\nif args.crit:\n    raw = raw * 2\nentity[target].hp = entity[target].hp - raw"
+!action hero shoot target1 crit=false
+!ent dump target1
+!action hero shoot target1 crit=true
+!ent dump target1
+
+Expected: First call: raw = 4 + 3 = 7, no crit branch -> hp
+drops 20 -> 13. Second call: raw = 7, crit branch doubles to
+14 -> hp drops 13 -> -1. This proves locals (`raw = ...`)
+work, control flow (`if args.crit: ...`) routes correctly, and
+args.<key> attribute access reads through the ArgsProxy.
+
+
