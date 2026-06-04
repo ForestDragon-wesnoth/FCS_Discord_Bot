@@ -19,7 +19,7 @@ from logic import Passive, HOOK_NAMES
 from logic import ClampSpec
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
-from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program
+from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, normalize_body_source
 
 import re
 import json
@@ -2887,7 +2887,10 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 scope_val = tok[len("scope="):].lower()
             else:
                 formula_parts.append(tok)
-        formula = " ".join(formula_parts).strip()
+        # Translate `\n`/`\t` so a multi-line body typed at the CLI
+        # (where shlex preserves literal backslash-n) compiles. See
+        # formula.normalize_body_source.
+        formula = normalize_body_source(" ".join(formula_parts).strip())
 
         if not formula:
             raise VTTError("Passive formula cannot be empty.")
@@ -3061,7 +3064,8 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 scope_val = tok[len("scope="):].lower()
             else:
                 formula_parts.append(tok)
-        formula = " ".join(formula_parts).strip()
+        # Same `\n`/`\t` normalization as entity-scoped !passive add.
+        formula = normalize_body_source(" ".join(formula_parts).strip())
 
         if not formula:
             raise VTTError("Passive formula cannot be empty.")
@@ -4275,7 +4279,9 @@ async def func_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         name = args[1]
         params_token = args[2]
-        body = " ".join(args[3:]).strip() if len(args) > 3 else ""
+        # Normalize `\n`/`\t` so a multi-line body typed at the CLI
+        # compiles. See formula.normalize_body_source.
+        body = normalize_body_source(" ".join(args[3:]).strip() if len(args) > 3 else "")
         if not body:
             return await ctx.send(
                 "❌ function body cannot be empty. Usage: "
