@@ -3595,6 +3595,35 @@ def _stringify(v: Any) -> str:
 
 # --- public validation helper -----------------------------------------------
 
+def normalize_body_source(src: str) -> str:
+    """Translate the two-character documentation escapes `\\n` and
+    `\\t` (literal backslash + n / backslash + t) into the real
+    characters Python's parser expects.
+
+    Necessary because every realistic input surface — Discord, the
+    CLI's input(), shlex.split — preserves literal `\\n` rather than
+    a real newline when the user types it inside a single-line quoted
+    string. Without this normalization, a multi-line action or
+    passive body typed at the CLI lands in storage with a literal
+    backslash followed by `n`, and ast.parse rejects it with
+    "unexpected character after line continuation character".
+
+    The scenario harness does the same translation in
+    `_interpret_escapes` for the same reason; this helper applies it
+    everywhere user-supplied body text reaches the engine (action
+    discovery, !passive add, !gpassive add, !func def). Idempotent:
+    real newlines pass through unchanged because they don't contain
+    the two-character `\\n` sequence.
+
+    Trade-off: a formula whose source literally contains `"a\\nb"`
+    (a string literal with an embedded backslash-n that the GM wants
+    to KEEP as two characters) can't be expressed this way — that
+    matches the harness's behavior and is an accepted limitation."""
+    if not isinstance(src, str):
+        return src
+    return src.replace("\\n", "\n").replace("\\t", "\t")
+
+
 def validate_program(
     src: str,
     known_funcs: "frozenset[str]" = frozenset(),

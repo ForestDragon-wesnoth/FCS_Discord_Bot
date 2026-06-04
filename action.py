@@ -181,6 +181,12 @@ class Action:
                 f"action '{name}' at `{full_path}`: `body` is "
                 f"required and must be a non-empty string."
             )
+        # Translate the documentation escapes `\n` and `\t` so a body
+        # typed at the CLI / Discord (where shlex preserves literal
+        # backslash-n) loads with real newlines for ast.parse. See
+        # formula.normalize_body_source for the full rationale.
+        from formula import normalize_body_source
+        body = normalize_body_source(body)
         description = raw.get("description", "")
         if not isinstance(description, str):
             raise ActionValidationError(
