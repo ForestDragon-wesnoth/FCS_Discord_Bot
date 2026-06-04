@@ -1138,6 +1138,16 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # Reverse group index: entity_groups(eid) -> names of every group
     # containing the entity (insertion order over Match.groups).
     "entity_groups",
+    # Action introspection / invocation primitives. Discovery walks the
+    # entity's vars tree (subject to action_container_* rules); the
+    # results power both these primitives and the !action command.
+    #   has_action(eid, name)         -> bool
+    #   entity_actions(eid)           -> list of action names (loopable)
+    #   use_action(eid, name, target=None, args=None)
+    #                                 -> True on success, False on a
+    #                                    clean fail(). Counts toward
+    #                                    action_recursion_limit.
+    "has_action", "entity_actions", "use_action",
     # Read a game-system rule value from inside a formula. rule_get(name)
     # -> the rule's effective value, or None if unknown.
     "rule_get",
@@ -1169,10 +1179,32 @@ _ALLOWED_NODES: Tuple[type, ...] = (
     ast.For, ast.Tuple,
     ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.IfExp, ast.Compare,
     ast.Call, ast.keyword,
+    # Attribute: outside action_mode the transformer rewrites every
+    # entity[X].path Attribute into a __read/__write Call, so no
+    # Attribute node survives to be validated. In action_mode the
+    # transformer deliberately LEAVES source.<path>/args.<key>/
+    # target.<x> Attribute chains in place for the SourceProxy/
+    # ArgsProxy/raw-value runtime to handle, so the node type must
+    # be in the allowed list for the validator's _ALLOWED_NODES
+    # check to pass. Misuse outside action_mode is still rejected
+    # at the transformer layer with a specific error.
+    ast.Attribute,
+    # Container literals — Dict and List. Needed for action bodies
+    # that call use_action(..., args={'power': 3}) and for any
+    # formula that wants to build small constant data on the fly.
+    # The _validate_for loop iterable check still restricts loop
+    # iterators to _LOOPABLE_FUNCS calls (or `target` in action
+    # mode), so allowing List literals here doesn't let a GM
+    # iterate `[1, 2, 3]` as a sneak path around the loop limit.
+    ast.Dict, ast.List,
     ast.Name, ast.Constant, ast.Load, ast.Store,
     ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow,
     ast.UAdd, ast.USub, ast.Not,
     ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+    # Membership tests. Useful as guards: `if "crit" in args:` for
+    # action-arg presence, `if status_name in entity_status_names:`
+    # in passives, etc. Read-only (no Python sandbox escape).
+    ast.In, ast.NotIn,
     ast.And, ast.Or,
 )
 
@@ -1205,6 +1237,8 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "entities_with_status",
     "entities_with_var",
     "entities_in_area",
+    # Action introspection — returns a list of action names, loopable.
+    "entity_actions",
 })
 
 
@@ -1252,6 +1286,18 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     # fires ONCE with from=(3,3), to=(7,5) — per-step observation is
     # via tile on_enter/on_exit.
     "from_x", "from_y", "to_x", "to_y",
+    # Action-event bindings. Bound only during on_action_used firing
+    # (see Match.fire_action_used); None elsewhere. action_name is
+    # the bare action name; action_path is the full vars location
+    # the action was loaded from.
+    "action_name", "action_path",
+    # `target` and `args` overlap with the action-mode body bindings,
+    # but inside a passive (where action_mode is NOT enabled) they're
+    # populated from EvalCtx.extras for the on_action_used firing —
+    # so a passive can read `target` and `args` without enabling the
+    # action-body sandbox. For passives observing any other hook
+    # they default to None / empty dict.
+    "target", "args",
 )
 
 # Entity-id sentinel identifiers. Inside `entity[X]` these get
@@ -1310,6 +1356,42 @@ class EvalCtx:
 
 # --- AST flattening / rewriting ---------------------------------------------
 
+# Identifier names the action body language reserves on top of plain
+# formula. The validator and transformer treat these specially when
+# action_mode is True; the runtime binds them in the eval namespace.
+#   source / args / target  — bindings (proxies for source/args,
+#                              raw value for target)
+#   cmd / fail               — callables (added to _ACTION_BUILTINS
+#                              and allowed as Call targets)
+_ACTION_BINDING_NAMES = frozenset({"source", "args", "target"})
+_ACTION_BUILTINS = frozenset({"cmd", "fail"})
+# Names that are loopable in action mode WITHOUT being a Call. Lets
+# `for x in target:` work for *_list target types. The runtime will
+# error cleanly if the loop runs against a non-iterable (e.g. for a
+# target=entity action where the GM iterates `target`).
+_ACTION_LOOPABLE_NAMES = frozenset({"target"})
+
+
+def _collect_action_locals(tree: ast.AST) -> "frozenset[str]":
+    """Pre-pass over an action body AST. Collects every bare Name
+    that appears on the LHS of an Assign — those become the action's
+    locals (Python `exec` binds them in the eval namespace; the
+    validator needs to allow RHS references too). For-loop target
+    names are handled separately by _validate_for.
+
+    NOT a strict use-before-assign checker; treats every assigned
+    name as in-scope throughout the program. Matches Python's "name
+    resolution is function-wide" semantic, which is the natural
+    expectation for a multi-statement body."""
+    locals_set: set = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    locals_set.add(tgt.id)
+    return frozenset(locals_set)
+
+
 class _EntityAccessTransformer(ast.NodeTransformer):
     """Rewrites entity[X].path reads/writes into __read/__write helper calls.
 
@@ -1331,8 +1413,19 @@ class _EntityAccessTransformer(ast.NodeTransformer):
     and existing formulas are unaffected.
     """
 
-    def __init__(self, known_params: "frozenset[str]" = frozenset()):
+    def __init__(self, known_params: "frozenset[str]" = frozenset(),
+                 action_mode: bool = False):
         self.known_params = known_params
+        # When True, three extra patterns are allowed and left
+        # un-rewritten (the runtime namespace handles them):
+        #   - bare Name = expr   (Python binds in the eval ns; the
+        #     pre-pass added all such names to known_params for the
+        #     validator)
+        #   - source.<path>      (SourceProxy.__getattr__ at runtime)
+        #   - source.<path> = v  (SourceProxy.__setattr__ at runtime)
+        #   - args.<key>         (ArgsProxy.__getattr__ at runtime)
+        # All four are rejected outside action_mode for safety.
+        self.action_mode = action_mode
 
     def _who_arg(self, slice_node: ast.AST) -> ast.AST:
         """Return the AST expression to use as the `who` argument of
@@ -1345,6 +1438,13 @@ class _EntityAccessTransformer(ast.NodeTransformer):
                 return ast.Constant(value=slice_node.id)
             if slice_node.id in self.known_params:
                 # Dynamic: the parameter's bound value is the entity id.
+                return ast.Name(id=slice_node.id, ctx=ast.Load())
+            if self.action_mode and slice_node.id in _ACTION_BINDING_NAMES:
+                # In action mode, `entity[target]` resolves at runtime
+                # against whatever the runner bound `target` to (the
+                # eid for target=entity actions; a list for entity_list;
+                # etc.). Treat it like a known_param — emit the bare
+                # Name so Python's namespace lookup runs.
                 return ast.Name(id=slice_node.id, ctx=ast.Load())
             # Bare identifier -> literal entity id (backward compatible).
             return ast.Constant(value=slice_node.id)
@@ -1371,9 +1471,49 @@ class _EntityAccessTransformer(ast.NodeTransformer):
             return who_arg, parts
         return None
 
+    def _action_binding_root(self, node: ast.AST) -> Optional[str]:
+        """If `node` is an Attribute chain whose root is a Name in
+        _ACTION_BINDING_NAMES (source/args/target), return that root
+        name. Else None. Used to recognize source.<path> patterns we
+        leave un-rewritten in action_mode."""
+        cur = node
+        while isinstance(cur, ast.Attribute):
+            cur = cur.value
+        if isinstance(cur, ast.Name) and cur.id in _ACTION_BINDING_NAMES:
+            return cur.id
+        return None
+
+    def _is_action_attr_passthrough(self, node: ast.AST) -> bool:
+        """In action mode, ANY Attribute chain whose root is a bare
+        Name is left un-rewritten so Python's runtime attribute
+        resolution handles it. This covers:
+          - the engine-bound proxies (source/args/target)
+          - for-loop loop variables that bind to Coord proxies
+            (target=location_list) or any user object exposing
+            __getattr__
+          - locals the GM assigned earlier in the body
+        The validator's identifier check still runs on the root Name,
+        so `nonexistent.x` still errors as 'Unknown identifier' at
+        validation time. Runtime errors (missing attribute on a
+        bound value) surface cleanly through the runner's exception
+        handler."""
+        if not self.action_mode:
+            return False
+        cur = node
+        while isinstance(cur, ast.Attribute):
+            cur = cur.value
+        return isinstance(cur, ast.Name)
+
     def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
         flat = self._flatten(node)
         if flat is None:
+            # In action mode, any Attribute chain rooted at a bare
+            # Name is delegated to Python's runtime attribute resolu-
+            # tion: the engine bindings (source/args/target), the
+            # for-loop Coord proxies, and any local the GM bound
+            # earlier all surface through this same path.
+            if self._is_action_attr_passthrough(node):
+                return node
             raise FormulaError("Attribute access is only allowed on entity[X].path.")
         who_arg, parts = flat
         if not parts:
@@ -1392,7 +1532,20 @@ class _EntityAccessTransformer(ast.NodeTransformer):
         node.value = self.visit(node.value)
         if len(node.targets) != 1:
             raise FormulaError("Chained / tuple assignment is not supported.")
-        flat = self._flatten(node.targets[0])
+        target = node.targets[0]
+        # In action_mode three extra Assign target shapes are allowed:
+        #   1. bare Name = expr        -> local binding (Python's eval
+        #      namespace handles it; pre-pass added the name to
+        #      known_params so RHS reads validate too)
+        #   2. <any-bare-name>.attr = expr -> Python setattr on the
+        #      bound value. Covers source/args/target/coord loop vars
+        #      uniformly.
+        if self.action_mode:
+            if isinstance(target, ast.Name):
+                return node
+            if isinstance(target, ast.Attribute) and self._is_action_attr_passthrough(target):
+                return node
+        flat = self._flatten(target)
         if flat is None:
             raise FormulaError("Assignment target must be entity[X].path.")
         who_arg, parts = flat
@@ -1483,10 +1636,19 @@ def _for_target_names(target: ast.AST) -> List[str]:
     )
 
 
-def _validate_for(node: ast.For) -> Tuple[List[str], "frozenset[str]"]:
+def _validate_for(
+    node: ast.For, *, action_mode: bool = False,
+) -> Tuple[List[str], "frozenset[str]"]:
     """Verify a For node's iterable is a Call to a _LOOPABLE_FUNCS name,
     and return the loop variable names. The caller augments
-    known_params with these names before recursing into the body."""
+    known_params with these names before recursing into the body.
+
+    When action_mode is True, the iterable may also be a bare Name in
+    _ACTION_LOOPABLE_NAMES (currently just `target`) — that lets
+    `for eid in target:` work cleanly when the action's target_type
+    is entity_list / location_list. Iterating a non-list target at
+    runtime is a clean Python TypeError that surfaces as a
+    FormulaError."""
     if node.orelse:
         # `for ... else:` is supported by Python but its semantics
         # ("else runs unless break") are surprising in a sandboxed
@@ -1495,13 +1657,26 @@ def _validate_for(node: ast.For) -> Tuple[List[str], "frozenset[str]"]:
             "for-loop `else:` clause is not supported."
         )
     it = node.iter
-    if not (isinstance(it, ast.Call)
-            and isinstance(it.func, ast.Name)
-            and it.func.id in _LOOPABLE_FUNCS):
+    is_loopable_call = (
+        isinstance(it, ast.Call)
+        and isinstance(it.func, ast.Name)
+        and it.func.id in _LOOPABLE_FUNCS
+    )
+    is_action_loopable_name = (
+        action_mode
+        and isinstance(it, ast.Name)
+        and it.id in _ACTION_LOOPABLE_NAMES
+    )
+    if not (is_loopable_call or is_action_loopable_name):
         allowed = ", ".join(sorted(_LOOPABLE_FUNCS))
+        if action_mode:
+            extras = ", ".join(sorted(_ACTION_LOOPABLE_NAMES))
+            extra_msg = f" (or, in action mode, one of {{{extras}}})"
+        else:
+            extra_msg = ""
         raise FormulaError(
             f"for-loop iterable must be a direct call to one of "
-            f"{{{allowed}}} — got "
+            f"{{{allowed}}}{extra_msg} — got "
             f"`{ast.unparse(it) if hasattr(ast, 'unparse') else type(it).__name__}`."
         )
     names = _for_target_names(node.target)
@@ -1512,6 +1687,7 @@ def _validate_tree(
     tree: ast.AST,
     known_funcs: "frozenset[str]" = frozenset(),
     known_params: "frozenset[str]" = frozenset(),
+    action_mode: bool = False,
 ) -> None:
     """Walk the (already-transformed) AST and reject anything outside the
     sandbox whitelist.
@@ -1524,7 +1700,18 @@ def _validate_tree(
                   scope. Used for function-body parameters AND for-loop
                   target variables; both extend the in-scope identifier
                   set the same way.
+    action_mode   when True, three extra identifier sets are allowed:
+                  _ACTION_BINDING_NAMES (source/args/target) as plain
+                  Names, and _ACTION_BUILTINS (cmd/fail) as Call
+                  targets. Also relaxes _validate_for to accept
+                  `for x in target:` for *_list target types.
     """
+    # Action-mode allowances expressed as extra membership tests in
+    # the identifier and call whitelists. Centralized here so each
+    # check site stays readable.
+    extra_names = _ACTION_BINDING_NAMES if action_mode else frozenset()
+    extra_calls = _ACTION_BUILTINS if action_mode else frozenset()
+
     def _check_node(n: ast.AST, scope_params: "frozenset[str]") -> None:
         if not isinstance(n, _ALLOWED_NODES):
             raise FormulaError(f"Disallowed syntax: {type(n).__name__}")
@@ -1535,7 +1722,9 @@ def _validate_tree(
                     and n.id not in HOOK_CONTEXT_NAMES
                     and n.id not in _ENTITY_TOKEN_NAMES
                     and n.id not in known_funcs
-                    and n.id not in scope_params):
+                    and n.id not in scope_params
+                    and n.id not in extra_names
+                    and n.id not in extra_calls):
                 # Did-you-mean: the identifier surface is large (hook
                 # context names, entity tokens, allowed funcs, match
                 # funcs, scope params, user-defined functions) so a
@@ -1544,7 +1733,8 @@ def _validate_tree(
                 import difflib as _difflib
                 pool = (set(_ALLOWED_FUNCS) | set(_MATCH_FUNC_NAMES)
                         | set(HOOK_CONTEXT_NAMES) | set(_ENTITY_TOKEN_NAMES)
-                        | set(known_funcs) | set(scope_params))
+                        | set(known_funcs) | set(scope_params)
+                        | set(extra_names) | set(extra_calls))
                 hits = _difflib.get_close_matches(n.id, list(pool), n=3, cutoff=0.6)
                 if hits:
                     suggestions = ", ".join(f"'{h}'" for h in hits)
@@ -1559,10 +1749,11 @@ def _validate_tree(
             if (fname not in ("__read", "__write", "__loop_tick")
                     and fname not in _ALLOWED_FUNCS
                     and fname not in _MATCH_FUNC_NAMES
-                    and fname not in known_funcs):
+                    and fname not in known_funcs
+                    and fname not in extra_calls):
                 import difflib as _difflib
                 pool = (set(_ALLOWED_FUNCS) | set(_MATCH_FUNC_NAMES)
-                        | set(known_funcs))
+                        | set(known_funcs) | set(extra_calls))
                 hits = _difflib.get_close_matches(fname, list(pool), n=3, cutoff=0.6)
                 if hits:
                     suggestions = ", ".join(f"'{h}'" for h in hits)
@@ -1582,7 +1773,7 @@ def _validate_tree(
             _check_node(node.iter, scope_params)
             for child in ast.iter_child_nodes(node.iter):
                 _walk(child, scope_params)
-            _, loop_vars = _validate_for(node)
+            _, loop_vars = _validate_for(node, action_mode=action_mode)
             body_scope = scope_params | loop_vars
             for stmt in node.body:
                 _walk(stmt, body_scope)
@@ -1785,10 +1976,20 @@ class FormulaEngine:
             **_ALLOWED_FUNCS,
         }
         # Per-name default: was_clamped is boolean-flavored (default False);
-        # everything else defaults to None.
-        _CONTEXT_DEFAULTS = {"was_clamped": False}
+        # args defaults to an empty dict (so attribute access via
+        # ArgsProxy never NPEs); everything else defaults to None.
+        _CONTEXT_DEFAULTS = {"was_clamped": False, "args": {}}
         for name in HOOK_CONTEXT_NAMES:
-            ns[name] = extras.get(name, _CONTEXT_DEFAULTS.get(name))
+            val = extras.get(name, _CONTEXT_DEFAULTS.get(name))
+            # `args` binding is wrapped in an ArgsProxy so passives can
+            # use the same `args.<key>` attribute-access pattern that
+            # action bodies use. Action mode overrides this binding
+            # later via eval_program's action_bindings dict, so the
+            # action body sees its own (mutable) proxy.
+            if name == "args" and isinstance(val, dict):
+                from action import ArgsProxy  # local import to avoid cycle
+                val = ArgsProxy(val)
+            ns[name] = val
         # Bare entity-id tokens. Bound to the actual id string when
         # available, None otherwise. Calls that consume them (status_*,
         # group_*, etc.) detect None via _eid and surface a clear
@@ -2946,6 +3147,98 @@ class FormulaEngine:
                     if eid in members]
         ns["entity_groups"] = _entity_groups
 
+        def _has_action(eid_t: Any, name: Any) -> bool:
+            """has_action(eid, name): True iff `eid` has at least one
+            discoverable action with the given name (anywhere in its
+            vars tree, subject to the action_container_* rules). The
+            action-mode body language and passives can both use this
+            to gate behaviour ("only fire if I can slice")."""
+            if not isinstance(name, str) or not name:
+                raise FormulaError("has_action(eid, name): name must be a non-empty string.")
+            _, e = _resolve_entity(eid_t, "has_action")
+            from action import discover_actions, lookup_action
+            actions = discover_actions(e, match.rules)
+            return len(lookup_action(actions, name, match.rules)) > 0
+
+        def _entity_actions(eid_t: Any) -> list:
+            """entity_actions(eid): the names of every discoverable
+            action on the entity (insertion order over the vars walk;
+            duplicate names appear once). The for-loop companion to
+            has_action — iterate every action the entity could use."""
+            _, e = _resolve_entity(eid_t, "entity_actions")
+            from action import discover_actions
+            actions = discover_actions(e, match.rules)
+            return list(actions.keys())
+
+        def _use_action(eid_t: Any, name: Any,
+                        target_arg: Any = None,
+                        args_arg: Any = None) -> bool:
+            """use_action(eid, name, target=None, args=None): invoke an
+            action on `eid` from inside another formula or action body.
+            Returns True on a clean successful run, False if the action
+            cleanly fail()ed. Unexpected errors propagate as
+            FormulaError. Counts toward the action_recursion_limit."""
+            if not isinstance(name, str) or not name:
+                raise FormulaError("use_action(eid, name): name must be a non-empty string.")
+            eid, e = _resolve_entity(eid_t, "use_action")
+            from action import discover_actions, lookup_action, ActionFail
+            actions = discover_actions(e, match.rules)
+            matches = lookup_action(actions, name, match.rules)
+            if not matches:
+                raise FormulaError(
+                    f"use_action: entity `{eid}` has no action `{name}`."
+                )
+            if len(matches) > 1:
+                paths = ", ".join(f"`{a.full_path}`" for a in matches)
+                raise FormulaError(
+                    f"use_action: entity `{eid}` has multiple `{name}` "
+                    f"actions ({paths}); use_action() doesn't disambiguate. "
+                    f"Use the !action command for the menu, or make the "
+                    f"action names unique."
+                )
+            action = matches[0]
+            args_dict = {}
+            if isinstance(args_arg, dict):
+                args_dict = dict(args_arg)
+            elif args_arg is not None:
+                raise FormulaError(
+                    f"use_action(args=...): args must be a dict, got "
+                    f"{type(args_arg).__name__}."
+                )
+            # Resolve a synchronous-friendly path through the runner.
+            # Because the formula engine is sync but run_action is
+            # async, we drive the coroutine with the same trampoline
+            # the action runner uses for cmd().
+            from action import run_action, _sync_dispatch_returning
+            # We need ctx and mgr; both are wired into FormulaEngine
+            # only loosely. Best path: stash them on the match when
+            # the outer action runner starts (already happens via the
+            # ctx/mgr closure variables in cmd()) — for use_action
+            # called from a passive or a top-level !eval there's no
+            # outer runner, so we look up via the match's manager
+            # attribute set up below.
+            mgr_local = getattr(match, "_runtime_mgr", None)
+            ctx_local = getattr(match, "_runtime_ctx", None)
+            if mgr_local is None or ctx_local is None:
+                raise FormulaError(
+                    "use_action: no command context available — "
+                    "this formula was evaluated outside an active "
+                    "command dispatch (e.g. an internal !eval). "
+                    "Call use_action from inside !action / !ent / a "
+                    "passive that fires during command processing."
+                )
+            coro = run_action(
+                action, actor_id=eid, target=target_arg,
+                args=args_dict, match=match, mgr=mgr_local,
+                ctx=ctx_local,
+            )
+            ok, _msg = _sync_dispatch_returning(coro)
+            return ok
+
+        ns["has_action"]     = _has_action
+        ns["entity_actions"] = _entity_actions
+        ns["use_action"]     = _use_action
+
         def _rule_get(name: Any) -> Any:
             """rule_get(name): the effective value of a system rule on
             this match. Returns None for unknown rules (so formulas can
@@ -3131,14 +3424,27 @@ class FormulaEngine:
         src: str, mode: str,
         known_funcs: "frozenset[str]" = frozenset(),
         known_params: "frozenset[str]" = frozenset(),
+        action_mode: bool = False,
     ) -> ast.AST:
         try:
             tree = ast.parse(src, mode=mode)
         except SyntaxError as e:
             raise FormulaError(f"Syntax error: {e.msg}")
-        tree = _EntityAccessTransformer(known_params).visit(tree)
+        # In action mode every bare-name Assign target becomes an
+        # implicit local; pre-collect them all so the validator allows
+        # forward references (e.g. `x = x + 1` at line 1 — Python
+        # exec will UnboundLocalError if x is never assigned before
+        # that point, but the validator accepts the static program).
+        if action_mode:
+            known_params = known_params | _collect_action_locals(tree)
+        tree = _EntityAccessTransformer(
+            known_params, action_mode=action_mode,
+        ).visit(tree)
         ast.fix_missing_locations(tree)
-        _validate_tree(tree, known_funcs=known_funcs, known_params=known_params)
+        _validate_tree(
+            tree, known_funcs=known_funcs, known_params=known_params,
+            action_mode=action_mode,
+        )
         return tree
 
     def _known_funcs(self) -> "frozenset[str]":
@@ -3163,10 +3469,31 @@ class FormulaEngine:
         except FormulaError:
             raise
         except Exception as e:
+            # Action-system exceptions (ActionFail / ActionEngineFault)
+            # propagate unwrapped — they carry user-visible messages the
+            # runner uses to decide rollback vs surface vs branch, and
+            # wrapping them as "Runtime error: ..." would hide that
+            # signal from the action runner above us.
+            from action import ActionFail, ActionEngineFault
+            if isinstance(e, (ActionFail, ActionEngineFault)):
+                raise
             raise FormulaError(f"Runtime error: {e}")
 
-    def eval_program(self, src: str, ctx: EvalCtx) -> Any:
-        """Run statements; if the source ends with an expression, return its value."""
+    def eval_program(self, src: str, ctx: EvalCtx,
+                     *, action_mode: bool = False,
+                     action_bindings: Optional[Dict[str, Any]] = None) -> Any:
+        """Run statements; if the source ends with an expression, return its value.
+
+        action_mode      enables the action body language (cmd/fail/
+                         source/args/target bindings, bare-name local
+                         assignments, looping over `target`). The
+                         caller MUST supply the matching values via
+                         action_bindings.
+        action_bindings  dict merged into the eval namespace AFTER
+                         _namespace(ctx) — so it can override the
+                         engine's default `cmd`/`fail` stubs with
+                         action-aware ones, and inject
+                         source/args/target proxies."""
         self._reset_affected()
         try:
             full = ast.parse(src, mode="exec")
@@ -3178,25 +3505,58 @@ class FormulaEngine:
         if full.body and isinstance(full.body[-1], ast.Expr):
             trailing_expr = full.body.pop().value
 
-        full = _EntityAccessTransformer().visit(full)
+        if action_mode:
+            full_locals = _collect_action_locals(full)
+            # The trailing-expr branch parses the trailing piece
+            # separately below; collect locals from THAT too so a body
+            # whose trailing expr references an earlier-assigned local
+            # validates.
+            if trailing_expr is not None:
+                full_locals = full_locals | _collect_action_locals(
+                    ast.Expression(body=trailing_expr)
+                )
+        else:
+            full_locals = frozenset()
+
+        full = _EntityAccessTransformer(
+            full_locals, action_mode=action_mode,
+        ).visit(full)
         ast.fix_missing_locations(full)
-        _validate_tree(full, known_funcs=known)
+        _validate_tree(
+            full, known_funcs=known, known_params=full_locals,
+            action_mode=action_mode,
+        )
 
         ns = self._namespace(ctx)
+        if action_bindings:
+            ns.update(action_bindings)
         try:
             if full.body:
                 exec(compile(full, "<formula>", "exec"), {"__builtins__": {}}, ns)
             if trailing_expr is None:
                 return None
             expr_tree = ast.Expression(body=trailing_expr)
-            expr_tree = _EntityAccessTransformer().visit(expr_tree)
+            expr_tree = _EntityAccessTransformer(
+                full_locals, action_mode=action_mode,
+            ).visit(expr_tree)
             ast.fix_missing_locations(expr_tree)
-            _validate_tree(expr_tree, known_funcs=known)
+            _validate_tree(
+                expr_tree, known_funcs=known, known_params=full_locals,
+                action_mode=action_mode,
+            )
             return eval(compile(expr_tree, "<formula>", "eval"),
                         {"__builtins__": {}}, ns)
         except FormulaError:
             raise
         except Exception as e:
+            # Action-system exceptions (ActionFail / ActionEngineFault)
+            # propagate unwrapped — they carry user-visible messages the
+            # runner uses to decide rollback vs surface vs branch, and
+            # wrapping them as "Runtime error: ..." would hide that
+            # signal from the action runner above us.
+            from action import ActionFail, ActionEngineFault
+            if isinstance(e, (ActionFail, ActionEngineFault)):
+                raise
             raise FormulaError(f"Runtime error: {e}")
 
 
@@ -3238,6 +3598,7 @@ def _stringify(v: Any) -> str:
 def validate_program(
     src: str,
     known_funcs: "frozenset[str]" = frozenset(),
+    *, action_mode: bool = False,
 ) -> None:
     """
     Parse and validate a formula in program mode (statements + optional
@@ -3248,5 +3609,13 @@ def validate_program(
     Pass known_funcs (the active match's defined formula-function names)
     so a passive body that calls a user-defined function validates at
     registration time instead of erroring only when the hook fires.
+
+    action_mode  enables the action body language extensions: cmd/fail
+                 calls, source/args/target name bindings, bare-name
+                 local assignments, and `for x in target:` loops. Used
+                 at action-definition time to surface errors before
+                 the action is ever invoked.
     """
-    FormulaEngine._prepare(src, "exec", known_funcs=known_funcs)
+    FormulaEngine._prepare(
+        src, "exec", known_funcs=known_funcs, action_mode=action_mode,
+    )
