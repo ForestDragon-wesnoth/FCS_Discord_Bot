@@ -1189,10 +1189,22 @@ _ALLOWED_NODES: Tuple[type, ...] = (
     # check to pass. Misuse outside action_mode is still rejected
     # at the transformer layer with a specific error.
     ast.Attribute,
+    # Container literals — Dict and List. Needed for action bodies
+    # that call use_action(..., args={'power': 3}) and for any
+    # formula that wants to build small constant data on the fly.
+    # The _validate_for loop iterable check still restricts loop
+    # iterators to _LOOPABLE_FUNCS calls (or `target` in action
+    # mode), so allowing List literals here doesn't let a GM
+    # iterate `[1, 2, 3]` as a sneak path around the loop limit.
+    ast.Dict, ast.List,
     ast.Name, ast.Constant, ast.Load, ast.Store,
     ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow,
     ast.UAdd, ast.USub, ast.Not,
     ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+    # Membership tests. Useful as guards: `if "crit" in args:` for
+    # action-arg presence, `if status_name in entity_status_names:`
+    # in passives, etc. Read-only (no Python sandbox escape).
+    ast.In, ast.NotIn,
     ast.And, ast.Or,
 )
 
@@ -1471,15 +1483,36 @@ class _EntityAccessTransformer(ast.NodeTransformer):
             return cur.id
         return None
 
+    def _is_action_attr_passthrough(self, node: ast.AST) -> bool:
+        """In action mode, ANY Attribute chain whose root is a bare
+        Name is left un-rewritten so Python's runtime attribute
+        resolution handles it. This covers:
+          - the engine-bound proxies (source/args/target)
+          - for-loop loop variables that bind to Coord proxies
+            (target=location_list) or any user object exposing
+            __getattr__
+          - locals the GM assigned earlier in the body
+        The validator's identifier check still runs on the root Name,
+        so `nonexistent.x` still errors as 'Unknown identifier' at
+        validation time. Runtime errors (missing attribute on a
+        bound value) surface cleanly through the runner's exception
+        handler."""
+        if not self.action_mode:
+            return False
+        cur = node
+        while isinstance(cur, ast.Attribute):
+            cur = cur.value
+        return isinstance(cur, ast.Name)
+
     def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
         flat = self._flatten(node)
         if flat is None:
-            # In action_mode, source.<path> / args.<key> / target.<x>
-            # are valid: the runtime namespace binds those names to
-            # proxy/value objects whose __getattr__ does the work.
-            # We leave the Attribute chain unchanged so Python's
-            # normal attribute-resolution machinery runs it.
-            if self.action_mode and self._action_binding_root(node):
+            # In action mode, any Attribute chain rooted at a bare
+            # Name is delegated to Python's runtime attribute resolu-
+            # tion: the engine bindings (source/args/target), the
+            # for-loop Coord proxies, and any local the GM bound
+            # earlier all surface through this same path.
+            if self._is_action_attr_passthrough(node):
                 return node
             raise FormulaError("Attribute access is only allowed on entity[X].path.")
         who_arg, parts = flat
@@ -1504,15 +1537,13 @@ class _EntityAccessTransformer(ast.NodeTransformer):
         #   1. bare Name = expr        -> local binding (Python's eval
         #      namespace handles it; pre-pass added the name to
         #      known_params so RHS reads validate too)
-        #   2. source.<path> = expr    -> SourceProxy.__setattr__
-        #   3. args.<key> = expr       -> ArgsProxy.__setattr__ (local
-        #      to this action call; doesn't persist)
-        # For each of these we leave the Assign node unchanged and
-        # return it as-is. Outside action_mode all three still error.
+        #   2. <any-bare-name>.attr = expr -> Python setattr on the
+        #      bound value. Covers source/args/target/coord loop vars
+        #      uniformly.
         if self.action_mode:
             if isinstance(target, ast.Name):
                 return node
-            if isinstance(target, ast.Attribute) and self._action_binding_root(target):
+            if isinstance(target, ast.Attribute) and self._is_action_attr_passthrough(target):
                 return node
         flat = self._flatten(target)
         if flat is None:

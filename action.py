@@ -408,6 +408,36 @@ class SourceProxy:
         self._entity.write_var(path, value)
 
 
+class Coord:
+    """Tiny `.x` / `.y` value object used for `target` bindings on
+    location-typed actions. The formula sandbox rejects subscript
+    (`target[0]`) so a tuple wouldn't be usable from the body; an
+    object with attributes is the consistent shape with everything
+    else the body sees (entity[X].x, source.x, etc.).
+
+    Mutable by intent — assigning to `.x` / `.y` updates the local
+    copy but does NOT write through to anything in the match (a
+    coordinate is just a value). For *_list targets, the runner
+    wraps each tuple individually so a `for loc in target:` loop
+    binds `loc` to one Coord per iteration."""
+
+    __slots__ = ("x", "y")
+
+    def __init__(self, x: int, y: int):
+        self.x = x
+        self.y = y
+
+    def __repr__(self) -> str:
+        return f"Coord({self.x}, {self.y})"
+
+    def __iter__(self):
+        # Allow `for cx, cy in [coord1, coord2]:` style unpacking
+        # (the action validator's `for (cx, cy) in ...` form expects
+        # 2-tuple-shaped iterables).
+        yield self.x
+        yield self.y
+
+
 class ArgsProxy:
     """Body-language binding over the GM-supplied args dict. Attribute
     access only — `args.amount` reads, `args.amount = ...` writes
@@ -534,7 +564,7 @@ def parse_target(
                 f"location target needs integer coords; got "
                 f"`{tokens[0]} {tokens[1]}`."
             )
-        return (x, y), list(tokens[2:])
+        return Coord(x, y), list(tokens[2:])
     if target_type == "entity_list":
         eids: List[str] = []
         i = 0
@@ -548,14 +578,14 @@ def parse_target(
             raise VTTError("entity_list target needs at least one entity.")
         return eids, list(tokens[i:])
     if target_type == "location_list":
-        coords: List[Tuple[int, int]] = []
+        coords: List[Coord] = []
         i = 0
         while i + 1 < len(tokens) and "=" not in tokens[i] and "=" not in tokens[i + 1]:
             try:
                 x = int(tokens[i]); y = int(tokens[i + 1])
             except ValueError:
                 break
-            coords.append((x, y))
+            coords.append(Coord(x, y))
             i += 2
         if not coords:
             raise VTTError(

@@ -7129,3 +7129,514 @@ work, control flow (`if args.crit: ...`) routes correctly, and
 args.<key> attribute access reads through the ArgsProxy.
 
 
+SCENARIO 283 — target=location uses the Coord proxy
+----------------------------------------------------
+
+!match new mac8 ActionLocTarget 6 6
+!match use mac8
+!ent add hero Hero 30 1 1 10
+!ent set_var hero spells.blink.actions.cast.target location
+!ent set_var hero spells.blink.actions.cast.body "cmd('ent tp ' + self + ' ' + str(target.x) + ' ' + str(target.y))"
+!action hero cast 4 5
+!ent dump hero
+!action hero cast 2 3
+!ent dump hero
+
+Expected: Each !action consumes the next two tokens as x and y
+ints and binds them onto the Coord proxy that becomes
+`target`. The body reads `target.x` and `target.y` and passes
+them to `!ent tp <id> <x> <y>` via cmd(). First call teleports
+hero to (4,5); second to (2,3). This proves the Coord proxy
+makes location targets usable from formula bodies even though
+subscript is banned in the sandbox.
+
+
+SCENARIO 284 — target=entity_list iterates every target
+--------------------------------------------------------
+
+!match new mac9 ActionEntList 6 6
+!match use mac9
+!ent add hero Hero 30 1 1 10
+!ent add g1 G1 15 3 3 8
+!ent add g2 G2 15 4 4 7
+!ent add g3 G3 15 5 5 6
+!ent set_var hero spells.chain.damage 4
+!ent set_var hero spells.chain.actions.cast.target entity_list
+!ent set_var hero spells.chain.actions.cast.body "for eid in target:\n    entity[eid].hp = entity[eid].hp - source.damage"
+!action hero cast g1 g2 g3
+!ent dump g1
+!ent dump g2
+!ent dump g3
+
+Expected: Body uses `for eid in target:` — `_ACTION_LOOPABLE_NAMES`
+lets the loop iterate the entity_list directly (without
+needing a Call to a _LOOPABLE_FUNCS function). All three
+goblins lose 4 hp: g1 11, g2 11, g3 11. The chain.damage proxy
+read is constant across the loop body.
+
+
+SCENARIO 285 — target=location_list iterates Coord proxies
+-----------------------------------------------------------
+
+!match new mac10 ActionLocList 6 6
+!match use mac10
+!ent add hero Hero 30 1 1 10
+!system set default action_cmd_allowlist ent,tile
+!ent set_var hero spells.mark.actions.cast.target location_list
+!ent set_var hero spells.mark.actions.cast.body "for loc in target:\n    cmd('tile set ' + str(loc.x) + ' ' + str(loc.y) + ' marked true')"
+!action hero cast 2 2 3 3 4 4
+
+Expected: The three (x,y) pairs after `cast` parse as a
+location_list of three Coord proxies. The body loops, reading
+`.x` and `.y` from each, dispatching `!tile set` for each
+cell. The 3 tiles (2,2), (3,3), (4,4) end up with the
+`marked=true` data. cmd's allowlist had to be extended to
+include `tile` for the dispatch to validate.
+
+
+SCENARIO 286 — Top-level action: source binds to entity vars root
+------------------------------------------------------------------
+
+!match new mac11 ActionTopLevel 6 6
+!match use mac11
+!ent add hero Hero 30 1 1 10
+!ent set_var hero stamina 5
+!ent set_var hero actions.rest.target none
+!ent set_var hero actions.rest.body "source.stamina = source.stamina + 10\nentity[self].hp = entity[self].hp + 5"
+!action hero rest
+!ent dump hero
+!action hero rest
+!ent dump hero
+
+Expected: `actions.rest` is a top-level action (entity.vars
+.actions.rest, no enclosing container). Per the spec, `source`
+binds to the entity's vars ROOT, so `source.stamina` reads /
+writes `entity.vars.stamina` (equivalent to entity[self].stamina).
+First call: stamina 5 -> 15, hp 30 -> 30 (default clamp keeps
+at max). Second call: stamina 15 -> 25, hp stays.
+
+
+SCENARIO 287 — Deeply nested container is discovered
+-----------------------------------------------------
+
+!match new mac12 ActionDeep 6 6
+!match use mac12
+!ent add hero Hero 30 1 1 10
+!ent set_var hero inventory.bag.bottle.charges 3
+!ent set_var hero inventory.bag.bottle.actions.drink.target none
+!ent set_var hero inventory.bag.bottle.actions.drink.body "source.charges = source.charges - 1\nentity[self].hp = entity[self].hp + 5"
+!eval "has_action('hero', 'drink')"
+!eval "entity_actions('hero')"
+!action hero drink
+!ent dump hero
+!action hero drink
+!ent dump hero
+
+Expected: Discovery walks four levels deep (inventory ->
+bag -> bottle -> actions -> drink) and surfaces `drink` as an
+available action. `has_action('hero','drink')` returns True;
+`entity_actions('hero')` returns `['drink']`. Each !action
+reads source.charges (= the bottle's own charges) and
+decrements it via source.charges = source.charges - 1.
+charges goes 3 -> 2 -> 1; hp clamps at max.
+
+
+SCENARIO 288 — has_action / entity_actions primitives
+------------------------------------------------------
+
+!match new mac13 ActionIntro 6 6
+!match use mac13
+!ent add hero Hero 30 1 1 10
+!ent add wiz Wizard 30 4 4 9
+!ent set_var hero inventory.sword.actions.slice.target entity
+!ent set_var hero inventory.sword.actions.slice.body "entity[target].hp = entity[target].hp - 5"
+!ent set_var hero inventory.bow.actions.shoot.target entity
+!ent set_var hero inventory.bow.actions.shoot.body "entity[target].hp = entity[target].hp - 3"
+!ent set_var wiz spells.fireball.actions.cast.target entity
+!ent set_var wiz spells.fireball.actions.cast.body "entity[target].hp = entity[target].hp - 7"
+!eval "has_action('hero', 'slice')"
+!eval "has_action('hero', 'shoot')"
+!eval "has_action('hero', 'cast')"
+!eval "has_action('wiz', 'cast')"
+!eval "entity_actions('hero')"
+!eval "entity_actions('wiz')"
+
+Expected:
+- has_action('hero','slice') -> True
+- has_action('hero','shoot') -> True
+- has_action('hero','cast') -> False (cast is wiz's)
+- has_action('wiz','cast') -> True
+- entity_actions('hero') -> ['slice', 'shoot'] (insertion order
+  via the vars walk)
+- entity_actions('wiz') -> ['cast']
+
+
+SCENARIO 289 — use_action() composition
+----------------------------------------
+
+!match new mac14 ActionUseAct 6 6
+!match use mac14
+!ent add hero Hero 30 1 1 10
+!ent add goblin Goblin 20 4 4 8
+!ent set_var hero used_inner 0
+!ent set_var hero inventory.sword.damage 4
+!ent set_var hero inventory.sword.actions.slice.target entity
+!ent set_var hero inventory.sword.actions.slice.body "entity[target].hp = entity[target].hp - source.damage\nentity[self].used_inner = entity[self].used_inner + 1"
+!ent set_var hero actions.flurry.target entity
+!ent set_var hero actions.flurry.body "use_action(self, 'slice', target)\nuse_action(self, 'slice', target)\nuse_action(self, 'slice', target)"
+!action hero flurry goblin
+!ent dump goblin
+!ent dump hero
+
+Expected: `flurry` calls `slice` three times, each on the same
+target. Goblin loses 4 hp three times: 20 -> 16 -> 12 -> 8.
+`used_inner` increments three times: 0 -> 3. Each nested
+use_action() succeeds (returns True). The outer flurry then
+fires on_action_used once for itself. Recursion stays well
+below the limit (depth 2 max).
+
+
+SCENARIO 290 — action_container_mode whitelist
+-----------------------------------------------
+
+!match new mac15 ActionWhitelist 6 6
+!match use mac15
+!system set default action_container_mode whitelist
+!system set default action_container_paths equipped,skills
+!ent add hero Hero 30 1 1 10
+!ent set_var hero equipped.sword.actions.slice.target none
+!ent set_var hero equipped.sword.actions.slice.body "entity[self].hp = entity[self].hp"
+!ent set_var hero skills.dodge.actions.evade.target none
+!ent set_var hero skills.dodge.actions.evade.body "entity[self].hp = entity[self].hp"
+!ent set_var hero backpack.potion.actions.drink.target none
+!ent set_var hero backpack.potion.actions.drink.body "entity[self].hp = entity[self].hp"
+!ent set_var hero notes.idea.actions.muse.target none
+!ent set_var hero notes.idea.actions.muse.body "entity[self].hp = entity[self].hp"
+!eval "entity_actions('hero')"
+!action hero slice
+!action hero evade
+!action hero drink
+!action hero muse
+
+Expected: Only `equipped` and `skills` are searched.
+entity_actions returns ['slice', 'evade'] only (drink and
+muse are inside `backpack` and `notes` which the whitelist
+excludes). The two whitelisted actions run; the two
+blacklisted-by-omission produce `❌ no action `drink` on
+`hero`` and similar.
+
+
+SCENARIO 291 — action_container_mode blacklist
+-----------------------------------------------
+
+!match new mac16 ActionBlacklist 6 6
+!match use mac16
+!system set default action_container_mode blacklist
+!system set default action_container_paths notes,__meta
+!ent add hero Hero 30 1 1 10
+!ent set_var hero inventory.sword.actions.slice.target none
+!ent set_var hero inventory.sword.actions.slice.body "entity[self].hp = entity[self].hp"
+!ent set_var hero notes.recipe.actions.cook.target none
+!ent set_var hero notes.recipe.actions.cook.body "entity[self].hp = entity[self].hp"
+!ent set_var hero __meta.debug.actions.dump.target none
+!ent set_var hero __meta.debug.actions.dump.body "entity[self].hp = entity[self].hp"
+!eval "entity_actions('hero')"
+!action hero slice
+!action hero cook
+
+Expected: notes and __meta are excluded. entity_actions
+returns just ['slice']. cook isn't discoverable so the
+!action fails with "no action `cook` on `hero`".
+
+
+SCENARIO 292 — action_names_case_sensitive=false
+-------------------------------------------------
+
+!match new mac17 ActionCase 6 6
+!match use mac17
+!ent add hero Hero 30 1 1 10
+!ent set_var hero actions.Slice.target none
+!ent set_var hero actions.Slice.body "entity[self].hp = entity[self].hp"
+!action hero slice
+!action hero SLICE
+!system set default action_names_case_sensitive false
+!action hero slice
+!action hero SLICE
+!action hero Slice
+
+Expected: With the default (case-sensitive), `!action hero
+slice` and `!action hero SLICE` both produce "no action ... on
+hero" (storage name is `Slice` with a capital S). After
+flipping the rule to false, all three forms (`slice`, `SLICE`,
+`Slice`) resolve to the stored `Slice` action and dispatch
+cleanly with "hero used action `Slice`.".
+
+
+SCENARIO 293 — Malformed action defs are skipped during discovery
+------------------------------------------------------------------
+
+!match new mac18 ActionMalformed 6 6
+!match use mac18
+!ent add hero Hero 30 1 1 10
+!ent set_var hero inventory.bad1.actions.nobody.target none
+!ent set_var hero inventory.bad2.actions.badtarget.target wat
+!ent set_var hero inventory.bad2.actions.badtarget.body "entity[self].hp = entity[self].hp"
+!ent set_var hero inventory.good.actions.fine.target none
+!ent set_var hero inventory.good.actions.fine.body "entity[self].hp = entity[self].hp"
+!eval "entity_actions('hero')"
+!action hero nobody
+!action hero badtarget
+!action hero fine
+
+Expected: Discovery is tolerant — entities with a
+half-formed action dict skip the bad ones silently. nobody
+lacks `body`, badtarget has an invalid target type. Only
+`fine` is surfaced. The two bad ones get "no action ... on
+hero". `fine` runs successfully.
+
+
+SCENARIO 294 — !ent action alias form
+--------------------------------------
+
+!match new mac19 ActionEntAlias 6 6
+!match use mac19
+!ent add hero Hero 30 1 1 10
+!ent add foe Foe 25 4 4 8
+!ent set_var hero inventory.sword.damage 5
+!ent set_var hero inventory.sword.actions.slice.target entity
+!ent set_var hero inventory.sword.actions.slice.body "entity[target].hp = entity[target].hp - source.damage"
+!ent action hero slice foe
+!ent dump foe
+
+Expected: `!ent action hero slice foe` is parsed as an alias
+for `!action hero slice foe` — same handler, same behavior.
+Foe drops from 25 to 20. The alias is purely syntactic
+convenience for users who think in "ent <id> <verb>" patterns.
+
+
+SCENARIO 295 — args.<missing> error and `in args` guard
+---------------------------------------------------------
+
+!match new mac20 ActionArgsGuard 6 6
+!match use mac20
+!ent add hero Hero 30 1 1 10
+!ent add foe Foe 30 4 4 8
+!ent set_var hero spells.zap.actions.cast.target entity
+!ent set_var hero spells.zap.actions.cast.body "amount = 5\nif 'boost' in args:\n    amount = amount + args.boost\nentity[target].hp = entity[target].hp - amount"
+!action hero cast foe
+!ent dump foe
+!action hero cast foe boost=3
+!ent dump foe
+!action hero cast foe boost=10
+
+Expected: First call passes no args; `"boost" in args` is
+False so amount stays 5. Foe hp 30 -> 25. Second call passes
+boost=3; amount becomes 8, foe 25 -> 17. Third call passes
+boost=10; amount becomes 15, foe 17 -> 2. This proves the
+`in args` membership guard works for optional args, and that
+args.<key> reads through ArgsProxy when the key exists.
+
+
+SCENARIO 296 — Action is a single history entry
+-------------------------------------------------
+
+!match new mac21 ActionHistory 6 6
+!match use mac21
+!ent add hero Hero 30 1 1 10
+!ent add foe Foe 25 4 4 8
+!ent set_var hero inventory.sword.damage 5
+!ent set_var hero inventory.sword.actions.slice.target entity
+!ent set_var hero inventory.sword.actions.slice.body "entity[target].hp = entity[target].hp - source.damage\nentity[target].hp = entity[target].hp - source.damage\nentity[target].hp = entity[target].hp - source.damage"
+!action hero slice foe
+!ent dump foe
+!history list commands
+!history undo command 1 confirm
+!ent dump foe
+
+Expected: The body does three hp writes via three statements.
+Per the design (action depth suspends per-command snapshots),
+the WHOLE action shows up as ONE entry in `!history list
+commands` (labeled with the !action line). After
+`!history undo command 1 confirm`, foe goes back to hp=25
+(all three writes reverted in one step). This proves the
+transactional snapshot model.
+
+
+SCENARIO 297 — cmd() with multi-token string interpolation
+-----------------------------------------------------------
+
+!match new mac22 ActionCmdInterp 6 6
+!match use mac22
+!ent add hero Hero 30 1 1 10
+!ent add foe Foe 30 4 4 8
+!ent set_var hero spells.bolt.damage 6
+!ent set_var hero spells.bolt.actions.cast.target entity
+!ent set_var hero spells.bolt.actions.cast.body "msg = 'ent hp ' + target + ' -' + str(source.damage)\ncmd(msg)"
+!action hero cast foe
+!ent dump foe
+
+Expected: The body builds the command string via local string
+concatenation (msg = ...), then dispatches via cmd. Foe loses
+6 hp: 30 -> 24. Demonstrates that cmd's argument can be a
+runtime-computed string (the body assembles `!ent hp foe -6`
+from constants + the target binding + the source proxy
+read).
+
+
+SCENARIO 298 — Passive observes on_action_used with target / args / action_path
+---------------------------------------------------------------------------------
+
+!match new mac23 ActionPassObs 6 6
+!match use mac23
+!ent add hero Hero 30 1 1 10
+!ent add foe Foe 30 4 4 8
+!ent set_var hero log "init"
+!ent set_var hero inventory.sword.damage 4
+!ent set_var hero inventory.sword.actions.slice.target entity
+!ent set_var hero inventory.sword.actions.slice.body "entity[target].hp = entity[target].hp - source.damage"
+!passive add hero observer on_action_used "entity[self].log = action_path"
+!action hero slice foe boost=true
+!ent dump hero
+!ent dump foe
+
+Expected: The passive reads action_path from the hook
+context and writes it to hero.log. After the action, hero.log
+== "inventory.sword.actions.slice". Foe still drops 4 hp via
+the body. Demonstrates that on_action_used hook context
+bindings are visible to passives just like other hook events.
+
+
+SCENARIO 299 — Action body calls a user-defined formula function
+------------------------------------------------------------------
+
+!match new mac24 ActionFunc 6 6
+!match use mac24
+!ent add hero Hero 30 1 1 10
+!ent add foe Foe 25 4 4 8
+!func def crit raw "raw * 2"
+!ent set_var hero spells.zap.damage 4
+!ent set_var hero spells.zap.actions.cast.target entity
+!ent set_var hero spells.zap.actions.cast.body "entity[target].hp = entity[target].hp - crit(source.damage)"
+!action hero cast foe
+!ent dump foe
+
+Expected: The action body calls `crit(source.damage)` — a
+user-defined formula function that doubles its argument.
+crit(4) returns 8; foe loses 8 hp from 25 to 17. Demonstrates
+that formula functions and actions compose: anything callable
+inside a formula is callable inside an action body.
+
+
+SCENARIO 300 — Empty action_cmd_allowlist disables cmd() entirely
+------------------------------------------------------------------
+
+!match new mac25 ActionNoCmd 6 6
+!match use mac25
+!system set default action_cmd_allowlist ""
+!ent add hero Hero 30 1 1 10
+!ent add foe Foe 25 4 4 8
+!ent set_var hero spells.zap.actions.cast.target entity
+!ent set_var hero spells.zap.actions.cast.body "cmd('ent hp ' + target + ' -5')"
+!action hero cast foe
+!ent dump foe
+
+Expected: With the allowlist cleared, every cmd() call refuses.
+The action body's first cmd raises ActionFail with the
+"not on allowlist" message. The runner rolls back and the
+!action surfaces `❌ action `cast`: cmd(): command `ent` is
+not on this system's action_cmd_allowlist. Allowed: (none).`.
+Foe's hp stays at 25.
+
+
+SCENARIO 301 — Action manipulates entity statuses
+--------------------------------------------------
+
+!match new mac26 ActionStatus 6 6
+!match use mac26
+!ent add hero Hero 30 1 1 10
+!ent add foe Foe 25 4 4 8
+!ent set_var hero spells.poison.actions.cast.target entity
+!ent set_var hero spells.poison.actions.cast.body "status_add(target, 'poisoned')\nstatus_set(target, 'poisoned', 'remaining', 3)\nstatus_set(target, 'poisoned', 'damage', 4)"
+!action hero cast foe
+!ent dump foe
+
+Expected: The action body uses the existing status_*
+formula primitives (status_add / status_set) on the target
+binding. After the action, foe has the `poisoned` status
+with `remaining=3` and `damage=4` in its data dict. The
+action carries no special status-system code — it just
+composes with the existing one through the body language.
+
+
+SCENARIO 302 — use_action passes target and args through
+----------------------------------------------------------
+
+!match new mac27 ActionUsePass 6 6
+!match use mac27
+!ent add hero Hero 30 1 1 10
+!ent add foe Foe 30 4 4 8
+!ent set_var hero spells.zap.actions.cast.target entity
+!ent set_var hero spells.zap.actions.cast.body "entity[target].hp = entity[target].hp - args.power"
+!ent set_var hero actions.combo.target entity
+!ent set_var hero actions.combo.body "use_action(self, 'cast', target, {'power': 3})\nuse_action(self, 'cast', target, {'power': 5})"
+!action hero combo foe
+!ent dump foe
+
+Expected: The outer `combo` action calls `cast` twice via
+use_action, threading the target through and providing a
+different `power` arg dict each call. Foe loses 3 then 5:
+30 -> 27 -> 22. Demonstrates use_action's full signature:
+target propagates, args dict propagates, both nested calls
+see the right bindings.
+
+
+SCENARIO 303 — Source proxy writes propagate to vars
+-----------------------------------------------------
+
+!match new mac28 ActionSourceWrite 6 6
+!match use mac28
+!ent add hero Hero 30 1 1 10
+!ent set_var hero inventory.wand.charges 5
+!ent set_var hero inventory.wand.actions.zap.target none
+!ent set_var hero inventory.wand.actions.zap.body "if source.charges <= 0:\n    fail('wand is empty')\nsource.charges = source.charges - 1\nentity[self].hp = entity[self].hp + 1"
+!action hero zap
+!action hero zap
+!action hero zap
+!action hero zap
+!action hero zap
+!action hero zap
+!ent dump hero
+
+Expected: Each zap decrements wand.charges via the source
+proxy. After 5 successful zaps (charges 5 -> 0), the 6th
+call's body sees source.charges == 0, hits the `if <= 0:
+fail(...)` branch, rolls back, and surfaces `❌ action zap:
+wand is empty`. Final state: charges = 0. The proxy writes
+have all persisted (one history entry per successful
+action).
+
+
+SCENARIO 304 — Action iterates a container with var_keys
+---------------------------------------------------------
+
+!match new mac29 ActionIterVars 6 6
+!match use mac29
+!ent add hero Hero 30 1 1 10
+!ent set_var hero pack.gold 10
+!ent set_var hero pack.silver 25
+!ent set_var hero pack.copper 40
+!ent set_var hero actions.dump_pack.target none
+!ent set_var hero actions.dump_pack.body "for item in var_keys(self, 'pack'):\n    cmd('ent delete_var ' + self + ' pack.' + item)"
+!action hero dump_pack
+!ent dump hero
+
+Expected: The action iterates `var_keys(self, 'pack')` and
+dispatches `!ent delete_var hero pack.<item>` for each. All
+three pack entries are removed in a single transactional
+unit. The body uses cmd() because deleting an entity var via
+formula isn't available as a sandbox primitive on this code
+path (var_del is the formula-side equivalent — see scenario
+269 in the var_clear PR; this scenario chose cmd to show that
+delete_var dispatches under an action's umbrella too).
+
+
