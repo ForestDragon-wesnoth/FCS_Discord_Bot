@@ -2807,6 +2807,13 @@ class Match:
     #      by !batch / !run, but flag-driven so nested cmd() calls
     #      inside an action body don't have to re-route themselves.
     _action_depth: int = field(default=0, repr=False)
+    # Shared output buffer for the in-flight top-level action. cmd()
+    # dispatches into this (a _BufferCtx) instead of the real reply
+    # context because the formula engine is synchronous and can't await
+    # a real network send(); the top-level run_action flushes it through
+    # the real context after the body completes. None when no action is
+    # running. Not serialized — purely transient dispatch state.
+    _runtime_buffer: Any = field(default=None, repr=False, compare=False)
 
     # ---- global constraints / helpers (unchanged in spirit) ----
     def in_bounds(self, x: int, y: int) -> bool:
