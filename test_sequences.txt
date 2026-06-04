@@ -7640,3 +7640,97 @@ path (var_del is the formula-side equivalent — see scenario
 delete_var dispatches under an action's umbrella too).
 
 
+
+
+SCENARIO 305 — Action with a range gate (bow, range 4)
+-------------------------------------------------------
+
+!match new mac30 ActionBowRange 8 8
+!match use mac30
+!ent add hero Hero 30 1 1 10
+!ent add foe Foe 25 4 4 8
+!ent add far Far 25 1 8 7
+!ent set_var hero inventory.bow.range 4
+!ent set_var hero inventory.bow.damage 6
+!ent set_var hero inventory.bow.actions.shoot.target entity
+!ent set_var hero inventory.bow.actions.shoot.description "Fire the bow (range 4)"
+!ent set_var hero inventory.bow.actions.shoot.body "dist = distance(entity[self].x, entity[self].y, entity[target].x, entity[target].y)\nif dist > source.range:\n    fail(\"target is outside this action's range!\")\nentity[target].hp = entity[target].hp - source.damage"
+!action hero shoot foe
+!ent dump foe
+!action hero shoot far
+!ent dump far
+
+Expected: The bow body computes the grid (Chebyshev /
+square_radius) distance from the wielder to the target and
+gates on `source.range`. `foe` is at (4,4), distance 3 from
+hero at (1,1) — 3 <= 4, so the shot lands and foe drops from
+25 to 19 (-6). `far` is at (1,8), distance 7 — 7 > 4, so the
+body hits the `fail(...)` branch, the action rolls back, and
+the reply is `❌ action shoot: target is outside this action's
+range!`. far stays at 25. Range is read through the source
+proxy, so the same body works for any weapon container that
+defines `range` and `damage`.
+
+
+SCENARIO 306 — Artillery with a min AND max range band (3..7)
+--------------------------------------------------------------
+
+!match new mac31 ActionArtillery 10 10
+!match use mac31
+!ent add gun Cannon 40 1 1 10
+!ent add tooclose Grunt 20 2 2 9
+!ent add inband Tank 30 1 5 8
+!ent add toofar Scout 20 1 10 7
+!ent set_var gun artillery.min_range 3
+!ent set_var gun artillery.max_range 7
+!ent set_var gun artillery.damage 12
+!ent set_var gun artillery.actions.fire.target entity
+!ent set_var gun artillery.actions.fire.description "Lob a shell (range 3-7)"
+!ent set_var gun artillery.actions.fire.body "dist = distance(entity[self].x, entity[self].y, entity[target].x, entity[target].y)\nif dist < source.min_range:\n    fail(\"target is too close (min range \" + str(source.min_range) + \")\")\nif dist > source.max_range:\n    fail(\"target is out of range (max range \" + str(source.max_range) + \")\")\nentity[target].hp = entity[target].hp - source.damage"
+!action gun fire tooclose
+!ent dump tooclose
+!action gun fire inband
+!ent dump inband
+!action gun fire toofar
+!ent dump toofar
+
+Expected: Artillery enforces BOTH a minimum and a maximum
+range with two `fail()` gates in sequence. Distances from gun
+at (1,1) (Chebyshev): tooclose at (2,2) = 1, inband at (1,5)
+= 4, toofar at (1,10) = 9.
+- fire tooclose: 1 < 3 -> `❌ action fire: target is too close
+  (min range 3)`; tooclose stays at 20.
+- fire inband: 4 is in [3,7] -> hits, Tank drops 30 -> 18 (-12).
+- fire toofar: 9 > 7 -> `❌ action fire: target is out of range
+  (max range 7)`; toofar stays at 20.
+Demonstrates layered requirement checks: an action body can
+chain multiple fail() guards before applying its effect, each
+with a specific message.
+
+
+SCENARIO 307 — Range threshold scales through the source proxy
+---------------------------------------------------------------
+
+!match new mac32 ActionRangeScale 10 10
+!match use mac32
+!ent add hero Hero 30 1 1 10
+!ent add target1 T1 30 1 6 8
+!ent set_var hero inventory.bow.range 4
+!ent set_var hero inventory.bow.damage 5
+!ent set_var hero inventory.bow.actions.shoot.target entity
+!ent set_var hero inventory.bow.actions.shoot.body "dist = distance(entity[self].x, entity[self].y, entity[target].x, entity[target].y)\nif dist > source.range:\n    fail(\"out of range\")\nentity[target].hp = entity[target].hp - source.damage"
+!action hero shoot target1
+!ent dump target1
+!ent set_var hero inventory.bow.range 6
+!action hero shoot target1
+!ent dump target1
+
+Expected: target1 is at (1,6), distance 5 from hero at (1,1).
+With `inventory.bow.range` = 4, the first shot fails (5 > 4):
+`❌ action shoot: out of range`, target1 stays at 30. After
+bumping `inventory.bow.range` to 6, the SAME body now reads
+source.range = 6 and 5 <= 6, so the shot lands: target1 drops
+30 -> 25 (-5). This is the range analogue of scenario 276's
+damage scaling — the gate threshold lives in vars and the
+body reads it live through the source proxy, so upgrading a
+weapon's range needs no body edit.

@@ -55,6 +55,32 @@ if TYPE_CHECKING:
     from logic import Match, Entity
 
 
+class _BufferCtx:
+    """Synchronous reply sink used for the command dispatch an action
+    body performs via cmd() (and for nested sub-actions).
+
+    The crux: the formula engine is SYNCHRONOUS, but command handlers
+    are async and a real reply context (e.g. the Discord bot) awaits a
+    network round-trip inside send(). A synchronous formula can't await
+    that. _BufferCtx.send is a coroutine that completes WITHOUT a real
+    suspension point (it just appends to a list), so the sync engine
+    can drive a dispatched command to completion by pumping the
+    coroutine (see _sync_dispatch) — there's no pending future to wait
+    on. The buffered lines are flushed through the REAL awaitable
+    reply context after the top-level action finishes, back in async
+    land where awaiting is legal.
+
+    channel_key mirrors the real context so active-match lookups inside
+    the dispatched command resolve to the same match."""
+
+    def __init__(self, channel_key: str):
+        self.channel_key = channel_key
+        self.out: List[str] = []
+
+    async def send(self, message: str) -> None:
+        self.out.append(message)
+
+
 # Reserved subkey under any vars container that holds the action
 # dictionary. A container with a key named "actions" whose value is a
 # dict has each child of that dict treated as an Action definition.
@@ -680,10 +706,27 @@ async def run_action(
     # in the dispatcher AFTER the action completes).
     pre_state = match.to_dict(include_history=False)
     pre_action_depth = match._action_depth
+    is_top_level = (pre_action_depth == 0)
+
+    # Buffer for command output produced by cmd() inside the body.
+    # cmd() can't dispatch into the real (awaitable) ctx because the
+    # formula engine is synchronous — so it dispatches into a
+    # _BufferCtx whose send() never truly suspends, and we flush the
+    # buffer through the real ctx after a SUCCESSFUL top-level action.
+    # Nested sub-actions reuse the top-level buffer (stored on the
+    # match) so all command echoes flush together, once, at the top.
+    if is_top_level:
+        buffer_ctx = _BufferCtx(getattr(ctx, "channel_key", "CLI"))
+        match._runtime_buffer = buffer_ctx
+    else:
+        buffer_ctx = getattr(match, "_runtime_buffer", None)
+        if buffer_ctx is None:
+            buffer_ctx = _BufferCtx(getattr(ctx, "channel_key", "CLI"))
+            match._runtime_buffer = buffer_ctx
 
     # Build the action's eval bindings. SourceProxy/ArgsProxy
     # implement the body-side magic; cmd/fail are closure-built so
-    # they can see this runner's match + ctx + allowlist.
+    # they can see this runner's match + buffer + allowlist.
     source = SourceProxy(actor, action.container_path)
     args_proxy = ArgsProxy(args)
     cmd_allowlist = parse_cmd_allowlist(match.rules)
@@ -716,30 +759,18 @@ async def run_action(
                 f"cmd(): command `{name}` is not on this system's "
                 f"action_cmd_allowlist. Allowed: {allowed}."
             )
-        # Coroutine — we're already inside an async context (the
-        # caller of run_action is async). Run inline. The dispatcher's
-        # per-command snapshot is suppressed because match._action_depth
-        # > 0 (set just below) — that gate lives in the dispatcher.
-        import asyncio
+        # Dispatch into the synchronous buffer context. Because
+        # _BufferCtx.send never suspends on a real future, the
+        # dispatched (async) command coroutine runs to completion
+        # under a single _sync_dispatch pump — no event loop needed,
+        # so this works identically whether we're under the CLI's
+        # asyncio.run, the scenario harness, or the live Discord
+        # bot's running loop. The dispatcher's per-command snapshot is
+        # suppressed because match._action_depth > 0 (set below).
         coro = registry.dispatch_no_snapshot(
-            tokens[0], tokens[1:], ctx, mgr,
+            tokens[0], tokens[1:], buffer_ctx, mgr,
         )
-        # We need to wait synchronously here. The eval engine runs
-        # synchronously (it's not async), so this is the only place
-        # an async dispatch is invoked. Use ensure_future + run_until
-        # the current loop has a slot — but we're already in a
-        # coroutine so just use the running loop.
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # We're inside an async caller; can't block. Use a
-            # synchronous trampoline: schedule the coroutine and
-            # await it via a small adapter. But sync code can't
-            # await. So we resolve this by making cmd() complete
-            # inline through a synchronous shim — see _sync_dispatch
-            # below.
-            _sync_dispatch(coro)
-        else:
-            loop.run_until_complete(coro)
+        _sync_dispatch(coro)
 
     def _fail(message: Any) -> None:
         """fail('reason'): abort the action body cleanly. The runner
@@ -774,9 +805,13 @@ async def run_action(
         except ActionFail as af:
             # Clean GM-initiated abort. Roll back to pre-state and
             # surface as a False return so the caller (use_action /
-            # the !action handler) can branch on it.
+            # the !action handler) can branch on it. Buffered command
+            # echoes are DISCARDED — the action rolled back, so its
+            # partial command output would be misleading.
             _rollback_match(match, mgr, pre_state)
             match._action_depth = pre_action_depth
+            if is_top_level:
+                match._runtime_buffer = None
             return False, af.message
         except ActionEngineFault:
             # Engine refusal (recursion limit etc.). Roll back AND
@@ -786,10 +821,14 @@ async def run_action(
             # message via the dispatcher's `💥 ...` path.
             _rollback_match(match, mgr, pre_state)
             match._action_depth = pre_action_depth
+            if is_top_level:
+                match._runtime_buffer = None
             raise
         except Exception:
             _rollback_match(match, mgr, pre_state)
             match._action_depth = pre_action_depth
+            if is_top_level:
+                match._runtime_buffer = None
             raise
     finally:
         # Defensive: ensure depth is back to where we started no
@@ -809,6 +848,18 @@ async def run_action(
         target=target,
         args=dict(args),
     )
+    # Flush buffered command output through the real (awaitable) reply
+    # context. Only the TOP-LEVEL action flushes — nested sub-actions
+    # accumulated into the same shared buffer. This runs in async land
+    # (run_action is a coroutine) so awaiting the real network send()
+    # is legal here, even though the cmd() calls that produced these
+    # lines ran under the synchronous formula engine.
+    if is_top_level:
+        flush = match._runtime_buffer
+        match._runtime_buffer = None
+        if flush is not None:
+            for line in flush.out:
+                await ctx.send(line)
     return True, None
 
 
@@ -835,7 +886,7 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
     preserved_attrs = (
         "_rng", "_rng_seed",
         "_var_event_depth", "_var_event_warned", "_var_event_warnings",
-        "_action_depth",
+        "_action_depth", "_runtime_buffer",
     )
     preserved = {a: getattr(match, a) for a in preserved_attrs}
     # Replace serialized state. We iterate a snapshot of restored's
