@@ -1,0 +1,822 @@
+"""action.py — the action subsystem.
+
+Actions are GM-defined effect bundles stored under entity vars at any
+path ending in `<container>.actions.<name>`. The full vars subtree at
+that name is an Action dict:
+
+    {
+        "body": "<formula program with cmd()/source/fail extensions>",
+        "description": "<human-readable explanation>",   # optional
+        "target":      "entity|location|entity_list|location_list|none",
+                                                          # optional, default "none"
+    }
+
+Discovery walks the entity's whole vars tree (subject to
+action_container_mode / action_container_paths) and surfaces every
+such dict as an available action. The body is run when the player
+issues `!action <eid> <name> [target] [k=v ...]` (or the equivalent
+`!ent <eid> action <name> ...`). The runner is transactional: it
+captures pre-state, suspends the dispatcher's per-command snapshots
+for the duration of the body (so a single action is one undo unit),
+runs the body, and on any failure rolls back to the captured state.
+
+Three runtime concepts the body language adds on top of plain
+formulas:
+
+  cmd(line)         dispatch a `!command` from inside an action,
+                    subject to action_cmd_allowlist
+  fail(message)     abort the body cleanly; the runner rolls back,
+                    surfaces `❌ <action>: <message>`, and does NOT
+                    fire on_action_used (unlike a successful body)
+  source            a proxy bound to the enclosing container; reads
+                    and writes pass through to `entity.vars.<container>`.
+                    For a top-level action (no enclosing container)
+                    `source` aliases the entity's vars root, so
+                    `source.<path>` is equivalent to
+                    `entity[self].<path>`. Reserved name — cannot be
+                    used as a vars key.
+
+  target            the resolved target token(s) — shape depends on
+                    the action's declared target type
+  args              a dict view over the GM-supplied key=value tokens
+
+The implementation lives here (data shape + proxies + runner) rather
+than in logic.py so the domain model stays browsable in one file. The
+formula sandbox (formula.py) gains the new builtins; the command
+surface (vtt_commands.py) gains `!action`.
+"""
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+
+from logic import VTTError, NotFound
+
+if TYPE_CHECKING:
+    from logic import Match, Entity
+
+
+# Reserved subkey under any vars container that holds the action
+# dictionary. A container with a key named "actions" whose value is a
+# dict has each child of that dict treated as an Action definition.
+ACTIONS_KEY = "actions"
+
+# Allowed values for an Action dict's `target` field. Anything else at
+# definition time is a validation error.
+ALLOWED_TARGET_TYPES = frozenset({
+    "entity", "location", "entity_list", "location_list", "none",
+})
+
+# Reserved bindings the action body language injects into the eval
+# namespace. The GM cannot use these as vars keys at the affected paths
+# (the validator + the cmd dispatcher refuse them).
+ACTION_RESERVED_BINDINGS = frozenset({
+    "source", "target", "args", "cmd", "fail",
+})
+
+
+class ActionFail(Exception):
+    """Raised by fail(message) inside an action body to abort the
+    body cleanly. The runner catches this, rolls back to pre-state,
+    and replies `❌ <action>: <message>`. NOT a FormulaError — that
+    would be caught and re-wrapped by the formula engine; ActionFail
+    bubbles past the engine's catch so the runner can see it."""
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
+class ActionValidationError(VTTError):
+    """Raised when an action dict's shape (or body's syntax) is
+    invalid at definition time. Subclass of VTTError so the command
+    dispatcher's standard `❌ <error>` path catches it."""
+    pass
+
+
+# ----------------------------------------------------------------------
+# Action dataclass
+# ----------------------------------------------------------------------
+
+@dataclass
+class Action:
+    """One discovered action ready to be invoked.
+
+    `name`            the bare action name (e.g. "slice")
+    `body`            the formula program source (string)
+    `description`     GM-facing prose; "" if not declared
+    `target_type`     one of ALLOWED_TARGET_TYPES; "none" if not declared
+    `container_path`  the dotted vars path of the ENCLOSING container —
+                      what `source` binds to. Empty string for a
+                      top-level action (lives under `entity.vars.actions
+                      .<name>` directly). Example: an action at
+                      `inventory.sword.actions.slice` has
+                      container_path = "inventory.sword".
+    `full_path`       the dotted vars path of this action's dict —
+                      e.g. "inventory.sword.actions.slice". Used as the
+                      stable identifier for disambiguation menus and
+                      as the `action_path` binding fed to
+                      on_action_used.
+    """
+    name: str
+    body: str
+    description: str
+    target_type: str
+    container_path: str
+    full_path: str
+
+    @staticmethod
+    def from_dict(
+        name: str, raw: Any, *,
+        container_path: str, full_path: str,
+    ) -> "Action":
+        """Build an Action from a vars subtree. Raises
+        ActionValidationError if the shape is wrong."""
+        if not isinstance(raw, dict):
+            raise ActionValidationError(
+                f"action '{name}' at `{full_path}` must be a dict "
+                f"(got {type(raw).__name__})."
+            )
+        body = raw.get("body", "")
+        if not isinstance(body, str) or not body.strip():
+            raise ActionValidationError(
+                f"action '{name}' at `{full_path}`: `body` is "
+                f"required and must be a non-empty string."
+            )
+        description = raw.get("description", "")
+        if not isinstance(description, str):
+            raise ActionValidationError(
+                f"action '{name}' at `{full_path}`: `description` "
+                f"must be a string."
+            )
+        target_type = raw.get("target", "none")
+        if not isinstance(target_type, str) or target_type not in ALLOWED_TARGET_TYPES:
+            allowed = ", ".join(sorted(ALLOWED_TARGET_TYPES))
+            raise ActionValidationError(
+                f"action '{name}' at `{full_path}`: `target` must be "
+                f"one of {{{allowed}}}; got {target_type!r}."
+            )
+        return Action(
+            name=name, body=body, description=description,
+            target_type=target_type,
+            container_path=container_path, full_path=full_path,
+        )
+
+
+# ----------------------------------------------------------------------
+# Container scope rules
+# ----------------------------------------------------------------------
+
+def _split_csv(value: Any) -> List[str]:
+    """Parse the comma-separated string-list shape used by the action
+    container/allowlist rules. Whitespace around items is stripped;
+    empty items are dropped."""
+    if not isinstance(value, str):
+        return []
+    return [tok.strip() for tok in value.split(",") if tok.strip()]
+
+
+def _top_container_allowed(top_key: str, rules: Dict[str, Any]) -> bool:
+    """True iff the top-level vars key `top_key` should be descended
+    into by the action discovery walker. Consults
+    action_container_mode + action_container_paths."""
+    mode = rules.get("action_container_mode", "all")
+    paths = _split_csv(rules.get("action_container_paths", ""))
+    if mode == "all":
+        return True
+    if mode == "whitelist":
+        return top_key in paths
+    if mode == "blacklist":
+        return top_key not in paths
+    # Unknown mode: behave like "all" rather than silently hiding
+    # everything. Rule schema validation should catch the bad value
+    # before it gets here.
+    return True
+
+
+# ----------------------------------------------------------------------
+# Discovery
+# ----------------------------------------------------------------------
+
+def discover_actions(
+    entity: "Entity", rules: Dict[str, Any],
+) -> Dict[str, List[Action]]:
+    """Walk `entity.vars` and return every action keyed by name.
+
+    Result shape: `{action_name: [Action, ...]}` — the list is per-
+    name because two containers can both declare an action of the
+    same name (e.g. two swords both having `slice`), in which case
+    the caller (the !action handler) shows a disambiguation menu.
+
+    Discovery rules:
+      - any vars subtree whose IMMEDIATE child key is `actions` and
+        whose `actions` value is a dict, contributes its children as
+        actions of the enclosing container
+      - depth is unbounded — `inventory.bags.left.sword.actions.slice`
+        is just as valid as `inventory.sword.actions.slice`
+      - the `actions` subkey is itself skipped during descent (we
+        don't recurse into an action's `body` looking for nested
+        action dicts; bodies are strings anyway)
+      - the action_container_mode/paths rules gate WHICH top-level
+        containers to descend into. Mode `all` searches everything;
+        whitelist/blacklist scope to the named first-segments. A
+        top-level `actions` container (entity.vars.actions.<name>) is
+        always considered regardless of the rules (it's the
+        "intrinsic actions" slot, not a container being scoped).
+      - malformed action subtrees (missing `body`, wrong shape) are
+        SKIPPED with no error — discovery is read-only and tolerant.
+        The validation-error path is for the explicit invocation
+        attempt. (We don't want one broken action to make the entity's
+        whole action list unreadable.)
+
+    The result preserves the order Python dict iteration produces
+    (insertion order), so `entity_actions()` and the disambiguation
+    menu give a stable view across calls."""
+    out: Dict[str, List[Action]] = {}
+
+    # Top-level intrinsic actions: entity.vars.actions.<name>. Bypass
+    # the container scoping (it's the catch-all slot for entity-level
+    # actions that don't belong to any item/skill/etc.).
+    intrinsic = entity.vars.get(ACTIONS_KEY)
+    if isinstance(intrinsic, dict):
+        for name, raw in intrinsic.items():
+            try:
+                act = Action.from_dict(
+                    name, raw, container_path="",
+                    full_path=f"{ACTIONS_KEY}.{name}",
+                )
+            except ActionValidationError:
+                continue
+            out.setdefault(name, []).append(act)
+
+    # Container actions. Each top-level key (subject to the container
+    # rules) is the root of a recursive walk that looks for `.actions.`
+    # subdicts at any depth. Note that the walker descends INTO each
+    # container but skips the `actions` key when it finds one (no
+    # actions-within-actions).
+    for top_key, top_val in entity.vars.items():
+        if top_key == ACTIONS_KEY:
+            continue  # already handled above
+        if not _top_container_allowed(top_key, rules):
+            continue
+        if not isinstance(top_val, dict):
+            continue
+        _walk_for_actions(
+            top_val, base_path=top_key, out=out,
+        )
+    return out
+
+
+def _walk_for_actions(
+    container: Dict[str, Any], *,
+    base_path: str, out: Dict[str, List[Action]],
+) -> None:
+    """Recursive helper for discover_actions. Walks `container` and:
+      - if it has an `actions` key with a dict value, every child of
+        that dict is an Action of `base_path`
+      - for every OTHER child that's itself a dict, recurses with the
+        extended path (so nested containers like
+        `inventory.bags.left.sword` are reachable)
+    Non-dict children are leaves and ignored. The `actions` subkey
+    is NEVER recursed into."""
+    actions_subtree = container.get(ACTIONS_KEY)
+    if isinstance(actions_subtree, dict):
+        for name, raw in actions_subtree.items():
+            try:
+                act = Action.from_dict(
+                    name, raw,
+                    container_path=base_path,
+                    full_path=f"{base_path}.{ACTIONS_KEY}.{name}",
+                )
+            except ActionValidationError:
+                continue
+            out.setdefault(name, []).append(act)
+    for k, v in container.items():
+        if k == ACTIONS_KEY:
+            continue
+        if isinstance(v, dict):
+            _walk_for_actions(
+                v,
+                base_path=f"{base_path}.{k}",
+                out=out,
+            )
+
+
+def fold_name(name: str, rules: Dict[str, Any]) -> str:
+    """Apply the action_names_case_sensitive rule to a name token. If
+    case-sensitive (default), returned unchanged. If False, lowercased.
+    Used by the !action handler when matching the user's typed name
+    against the discovered name set."""
+    if rules.get("action_names_case_sensitive", True):
+        return name
+    return name.lower()
+
+
+def lookup_action(
+    actions_by_name: Dict[str, List[Action]],
+    requested: str, rules: Dict[str, Any],
+) -> List[Action]:
+    """Resolve a user-typed action name against the discovery result.
+    Returns the list of matching actions (length 0, 1, or more — the
+    caller decides what to do with each). Respects
+    action_names_case_sensitive."""
+    case_sensitive = rules.get("action_names_case_sensitive", True)
+    if case_sensitive:
+        return list(actions_by_name.get(requested, []))
+    target = requested.lower()
+    matches: List[Action] = []
+    for name, acts in actions_by_name.items():
+        if name.lower() == target:
+            matches.extend(acts)
+    return matches
+
+
+# ----------------------------------------------------------------------
+# Source / args proxies
+# ----------------------------------------------------------------------
+
+class SourceProxy:
+    """Body-language binding that mirrors `entity[self]` reads/writes
+    but rooted at a fixed sub-path of the entity's vars.
+
+    For an action at `inventory.sword.actions.slice`, `source` is a
+    SourceProxy whose base_path is `inventory.sword`. Then:
+
+        source.damage             reads entity.vars.inventory.sword.damage
+        source.damage = source.damage - 1
+                                  writes through Entity.write_var so
+                                  on_var_changed fires the same way it
+                                  would for `entity[self].inventory
+                                  .sword.damage = ...`
+
+    For a top-level action (container_path == "") the proxy's base
+    path is the empty string, so `source.<path>` is functionally
+    identical to `entity[self].<path>`.
+
+    The proxy reserves underscore-prefixed attribute names for its own
+    internal slots (`_entity`, `_base_path`) — those aren't legal vars
+    key shapes anyway (vars keys are user-defined strings, conventionally
+    not starting with `_`)."""
+
+    __slots__ = ("_entity", "_base_path")
+
+    def __init__(self, entity: "Entity", base_path: str):
+        object.__setattr__(self, "_entity", entity)
+        object.__setattr__(self, "_base_path", base_path)
+
+    def _full(self, attr: str) -> str:
+        if self._base_path:
+            return f"{self._base_path}.{attr}"
+        return attr
+
+    def __getattr__(self, attr: str) -> Any:
+        # Underscore-prefixed lookups bypass — they're the slots
+        # we set in __init__ and don't represent vars keys.
+        if attr.startswith("_"):
+            raise AttributeError(attr)
+        path = self._full(attr)
+        cur: Any = self._entity.vars
+        for seg in path.split("."):
+            if not isinstance(cur, dict) or seg not in cur:
+                # Re-raise as AttributeError so the formula engine's
+                # error-message machinery surfaces it as a "no var at
+                # path" rather than a Python attribute miss.
+                raise AttributeError(
+                    f"`{self._entity.id}` has no var at "
+                    f"'{path}' (via source)."
+                )
+            cur = cur[seg]
+        return cur
+
+    def __setattr__(self, attr: str, value: Any) -> None:
+        if attr.startswith("_"):
+            object.__setattr__(self, attr, value)
+            return
+        path = self._full(attr)
+        self._entity.write_var(path, value)
+
+
+class ArgsProxy:
+    """Body-language binding over the GM-supplied args dict. Attribute
+    access only — `args.amount` reads, `args.amount = ...` writes
+    (writes are local to the proxy; they DON'T persist beyond this
+    action call). Missing attributes raise AttributeError (which the
+    formula engine surfaces as "Unknown identifier" or similar)."""
+
+    __slots__ = ("_data",)
+
+    def __init__(self, data: Dict[str, Any]):
+        object.__setattr__(self, "_data", dict(data))
+
+    def __getattr__(self, attr: str) -> Any:
+        if attr.startswith("_"):
+            raise AttributeError(attr)
+        d = object.__getattribute__(self, "_data")
+        if attr not in d:
+            raise AttributeError(
+                f"action args has no `{attr}` (passed args: "
+                f"{sorted(d.keys()) or 'none'})."
+            )
+        return d[attr]
+
+    def __setattr__(self, attr: str, value: Any) -> None:
+        if attr.startswith("_"):
+            object.__setattr__(self, attr, value)
+            return
+        d = object.__getattribute__(self, "_data")
+        d[attr] = value
+
+    def __contains__(self, key: str) -> bool:
+        d = object.__getattribute__(self, "_data")
+        return key in d
+
+
+# ----------------------------------------------------------------------
+# Argument coercion (for `key=value` tokens on the command line)
+# ----------------------------------------------------------------------
+
+def coerce_args_token(value: str) -> Any:
+    """Best-effort scalar coercion of a value typed on the command
+    line. Matches the convention used by !find and similar commands:
+    `true`/`false` → bool, integer → int, float → float, otherwise
+    raw string. Quotation marks aren't preserved — shlex already
+    stripped them at the command-parsing layer."""
+    if value.lower() in ("true", "false"):
+        return value.lower() == "true"
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    return value
+
+
+def parse_args_tokens(tokens: List[str]) -> Dict[str, Any]:
+    """Parse `key=value` tokens into the args dict. Tokens without `=`
+    are rejected so a typo doesn't silently become an empty-named
+    key. Duplicate keys: last write wins (matches shell convention).
+    """
+    out: Dict[str, Any] = {}
+    for tok in tokens:
+        if "=" not in tok:
+            raise VTTError(
+                f"action arg `{tok}` must be in `key=value` form."
+            )
+        k, _, v = tok.partition("=")
+        if not k:
+            raise VTTError(
+                f"action arg `{tok}` has an empty key."
+            )
+        out[k] = coerce_args_token(v)
+    return out
+
+
+# ----------------------------------------------------------------------
+# Target parsing (per declared target_type)
+# ----------------------------------------------------------------------
+
+def parse_target(
+    target_type: str, tokens: List[str], match: "Match",
+) -> Tuple[Any, List[str]]:
+    """Consume the leading tokens that constitute the target and
+    return `(target_value, remaining_tokens)`. The remaining tokens
+    are the args portion (key=value). Raises VTTError on shape
+    violations.
+
+    target_type semantics:
+      none           consumes 0 tokens; target value is None
+      entity         consumes 1 token (an entity id, or `self`/`this`/
+                     `current`); value is the resolved eid string
+      location       consumes 2 tokens (x then y, ints); value is (x,y)
+      entity_list    consumes EVERY non-key=value token (entity ids);
+                     value is List[str]
+      location_list  consumes paired x/y tokens (must be even count);
+                     value is List[Tuple[int,int]]
+
+    For the *_list variants the boundary between target tokens and
+    args is "first token containing `=`". So `!action self lightning
+    3 4 5 6 power=10` parses as target=[(3,4),(5,6)] and args={power:10}.
+    """
+    if target_type == "none":
+        return None, list(tokens)
+    if target_type == "entity":
+        if not tokens:
+            raise VTTError("expected an entity id after the action name.")
+        eid_token = tokens[0]
+        eid = _resolve_eid_for_action(eid_token, match)
+        if eid not in match.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        return eid, list(tokens[1:])
+    if target_type == "location":
+        if len(tokens) < 2:
+            raise VTTError(
+                "expected `<x> <y>` coords after the action name."
+            )
+        try:
+            x = int(tokens[0]); y = int(tokens[1])
+        except ValueError:
+            raise VTTError(
+                f"location target needs integer coords; got "
+                f"`{tokens[0]} {tokens[1]}`."
+            )
+        return (x, y), list(tokens[2:])
+    if target_type == "entity_list":
+        eids: List[str] = []
+        i = 0
+        while i < len(tokens) and "=" not in tokens[i]:
+            eid = _resolve_eid_for_action(tokens[i], match)
+            if eid not in match.entities:
+                raise NotFound(f"Entity '{eid}' not found.")
+            eids.append(eid)
+            i += 1
+        if not eids:
+            raise VTTError("entity_list target needs at least one entity.")
+        return eids, list(tokens[i:])
+    if target_type == "location_list":
+        coords: List[Tuple[int, int]] = []
+        i = 0
+        while i + 1 < len(tokens) and "=" not in tokens[i] and "=" not in tokens[i + 1]:
+            try:
+                x = int(tokens[i]); y = int(tokens[i + 1])
+            except ValueError:
+                break
+            coords.append((x, y))
+            i += 2
+        if not coords:
+            raise VTTError(
+                "location_list target needs at least one paired `<x> <y>`."
+            )
+        return coords, list(tokens[i:])
+    # Should be unreachable given ALLOWED_TARGET_TYPES.
+    raise VTTError(f"unknown target type `{target_type}`.")
+
+
+def _resolve_eid_for_action(token: str, match: "Match") -> str:
+    """Tiny shim that resolves `self`/`this`/`current` to the current
+    entity id, leaving other tokens unchanged. Mirrors the convention
+    used by other commands that accept those shortcuts. Defined here
+    (rather than importing from vtt_commands) to keep the action
+    module loadable without the command layer."""
+    t = token.strip().lower()
+    if t in {"self", "this", "current"}:
+        eid = match.current_entity_id()
+        if not eid:
+            raise NotFound("No current entity (turn order is empty).")
+        return eid
+    return token
+
+
+# ----------------------------------------------------------------------
+# Allowlist parsing (used by the cmd() builtin)
+# ----------------------------------------------------------------------
+
+def parse_cmd_allowlist(rules: Dict[str, Any]) -> "frozenset[str]":
+    """Return the set of command names an action body's cmd() can
+    dispatch. Pulled from the action_cmd_allowlist rule. Empty when
+    the rule is empty (cmd() then refuses every dispatch)."""
+    return frozenset(_split_csv(rules.get("action_cmd_allowlist", "")))
+
+
+# ----------------------------------------------------------------------
+# Runner
+# ----------------------------------------------------------------------
+
+async def run_action(
+    action: Action, *,
+    actor_id: str,
+    target: Any,
+    args: Dict[str, Any],
+    match: "Match",
+    mgr: Any,           # MatchManager (kept loose to avoid import cycle)
+    ctx: Any,           # ReplyContext for cmd()'s dispatch output
+) -> Tuple[bool, Optional[str]]:
+    """Execute an action body transactionally.
+
+    Returns (success, fail_message). On success, fail_message is None.
+    On a clean fail(...) abort, success is False and fail_message is
+    the GM-supplied reason (the runner has already rolled back the
+    pre-state and the !action handler should surface
+    `❌ <action_name>: <message>`).
+
+    On an unexpected runtime error (FormulaError or other Exception),
+    the runner ALSO rolls back, but re-raises so the dispatcher's
+    standard `💥 Unexpected error: ...` path catches it.
+
+    Recursion: an action body's `cmd()` or `use_action()` calls
+    increment match._action_depth; the runner enforces
+    action_recursion_limit at the top of every nested call.
+    """
+    from logic import Match  # for type hint, no runtime impact
+    from formula import FormulaEngine, EvalCtx
+
+    # Enforce recursion limit BEFORE allocating any state for this
+    # call. The check uses the CURRENT depth — _action_depth gets
+    # bumped just below, so the limit value is "max nested actions
+    # including this one".
+    limit = int(match.rules.get("action_recursion_limit", 8))
+    if match._action_depth >= limit:
+        return False, (
+            f"action recursion limit reached ({limit}). The action "
+            f"`{action.name}` would be call #{match._action_depth + 1} "
+            f"in a chain — break the cycle or raise "
+            f"`action_recursion_limit`."
+        )
+
+    actor = match.entities.get(actor_id)
+    if actor is None:
+        raise NotFound(f"Action actor '{actor_id}' not found.")
+
+    # Snapshot pre-state for transactional rollback on failure. The
+    # match-history layer handles serialization; we just stash the
+    # pre-state dict (no history-snapshot append yet — that happens
+    # in the dispatcher AFTER the action completes).
+    pre_state = match.to_dict(include_history=False)
+    pre_action_depth = match._action_depth
+
+    # Build the action's eval bindings. SourceProxy/ArgsProxy
+    # implement the body-side magic; cmd/fail are closure-built so
+    # they can see this runner's match + ctx + allowlist.
+    source = SourceProxy(actor, action.container_path)
+    args_proxy = ArgsProxy(args)
+    cmd_allowlist = parse_cmd_allowlist(match.rules)
+
+    def _cmd(line: Any) -> None:
+        """cmd('<command line>'): dispatch the line as if the GM
+        typed it. shlex-tokenized; first token must be an
+        action_cmd_allowlist member. Raises ActionFail on a
+        disallowed or malformed line — the body can preempt-check
+        instead by reading from vars / using has_action / etc."""
+        if not isinstance(line, str) or not line.strip():
+            raise ActionFail(
+                "cmd(...) needs a non-empty string command line."
+            )
+        # Lazy import: action.py is loaded by vtt_commands at module
+        # init, so importing the registry at module scope would
+        # cycle. Inside this closure we're past both modules' loads.
+        import shlex
+        from vtt_commands import registry  # noqa: PLC0415
+        try:
+            tokens = shlex.split(line)
+        except ValueError as ex:
+            raise ActionFail(f"cmd(): cannot parse `{line}`: {ex}")
+        if not tokens:
+            raise ActionFail("cmd(): line is empty after parsing.")
+        name = tokens[0]
+        if name not in cmd_allowlist:
+            allowed = ", ".join(sorted(cmd_allowlist)) or "(none)"
+            raise ActionFail(
+                f"cmd(): command `{name}` is not on this system's "
+                f"action_cmd_allowlist. Allowed: {allowed}."
+            )
+        # Coroutine — we're already inside an async context (the
+        # caller of run_action is async). Run inline. The dispatcher's
+        # per-command snapshot is suppressed because match._action_depth
+        # > 0 (set just below) — that gate lives in the dispatcher.
+        import asyncio
+        coro = registry.dispatch_no_snapshot(
+            tokens[0], tokens[1:], ctx, mgr,
+        )
+        # We need to wait synchronously here. The eval engine runs
+        # synchronously (it's not async), so this is the only place
+        # an async dispatch is invoked. Use ensure_future + run_until
+        # the current loop has a slot — but we're already in a
+        # coroutine so just use the running loop.
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # We're inside an async caller; can't block. Use a
+            # synchronous trampoline: schedule the coroutine and
+            # await it via a small adapter. But sync code can't
+            # await. So we resolve this by making cmd() complete
+            # inline through a synchronous shim — see _sync_dispatch
+            # below.
+            _sync_dispatch(coro)
+        else:
+            loop.run_until_complete(coro)
+
+    def _fail(message: Any) -> None:
+        """fail('reason'): abort the action body cleanly. The runner
+        catches ActionFail, rolls back to pre-state, and surfaces
+        `❌ <action>: <message>`. Always raises — control does NOT
+        return to the body."""
+        if not isinstance(message, str):
+            message = str(message)
+        raise ActionFail(message)
+
+    bindings = {
+        "source": source,
+        "args": args_proxy,
+        "target": target,
+        "cmd": _cmd,
+        "fail": _fail,
+    }
+
+    match._action_depth += 1
+    try:
+        engine = FormulaEngine(match)
+        eval_ctx = EvalCtx(
+            this=match.current_entity_id(),
+            target=actor_id,
+        )
+        try:
+            engine.eval_program(
+                action.body, eval_ctx,
+                action_mode=True,
+                action_bindings=bindings,
+            )
+        except ActionFail as af:
+            _rollback_match(match, mgr, pre_state)
+            match._action_depth = pre_action_depth
+            return False, af.message
+        except Exception:
+            _rollback_match(match, mgr, pre_state)
+            match._action_depth = pre_action_depth
+            raise
+    finally:
+        # Defensive: ensure depth is back to where we started no
+        # matter how we exit. _rollback_match already restored it
+        # on the error paths, but a successful path needs to drop
+        # the increment here.
+        if match._action_depth > pre_action_depth:
+            match._action_depth = pre_action_depth
+
+    # Successful completion. Fire the on_action_used hook AFTER the
+    # body's writes have settled (so a passive observing this hook
+    # sees post-action state).
+    match.fire_action_used(
+        actor_id=actor_id,
+        action_name=action.name,
+        action_path=action.full_path,
+        target=target,
+        args=dict(args),
+    )
+    return True, None
+
+
+def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None:
+    """Restore a Match in-place to the given pre-state dict. Used by
+    the action runner when the body raises. We swap the live Match
+    object's contents rather than replacing the manager's pointer
+    because the action runner is deeply nested in coroutines that
+    hold references to the original instance; rebinding the
+    manager's entry would leave them pointing at the post-rollback
+    state through stale aliases.
+
+    Implementation: build a fresh Match from pre_state (which
+    captures vars, entities, rules, etc.), then copy its __dict__
+    entries back into the live match. Runtime-only state (_rng,
+    _action_depth, _var_event_depth) is preserved on the live match
+    — those are by-design transient and shouldn't be reset by an
+    action rollback."""
+    from logic import Match  # local import
+    restored = Match.from_dict(pre_state)
+    # Preserve runtime-only fields the snapshot doesn't carry. Names
+    # listed here match the field defaults declared on Match for
+    # runtime-only state.
+    preserved_attrs = (
+        "_rng", "_rng_seed",
+        "_var_event_depth", "_var_event_warned", "_var_event_warnings",
+        "_action_depth",
+    )
+    preserved = {a: getattr(match, a) for a in preserved_attrs}
+    # Replace serialized state. We iterate a snapshot of restored's
+    # __dict__ to avoid mutating-while-iterating shenanigans.
+    for k, v in vars(restored).items():
+        setattr(match, k, v)
+    # Restore runtime-only state.
+    for a, v in preserved.items():
+        setattr(match, a, v)
+    # Re-parent entities so their _match backref points at the live
+    # match instance (Match.from_dict set them to `restored`).
+    for e in match.entities.values():
+        e._match = match
+
+
+def _sync_dispatch(coro) -> None:
+    """Synchronously drive a coroutine to completion. Used by the
+    action runner's cmd() so a sync formula evaluator can dispatch
+    an async command. Works by repeatedly calling .send(None) until
+    the coroutine raises StopIteration. The dispatcher's awaits are
+    all ctx.send() calls (which we control — _Ctx.send in the
+    scenario harness is a coroutine that completes immediately), so
+    this finishes in one trip in practice. For non-trivial async
+    contexts (the real Discord client), this would need a different
+    bridge — but inside an action body run from an already-async
+    handler, we know the only awaits are the trivial ones the
+    command surface generates."""
+    try:
+        while True:
+            coro.send(None)
+    except StopIteration:
+        return
+
+
+def _sync_dispatch_returning(coro) -> Any:
+    """Same as _sync_dispatch but returns the coroutine's return
+    value (carried in StopIteration.value). Used by use_action to
+    propagate the (success, message) tuple back to the formula."""
+    try:
+        while True:
+            coro.send(None)
+    except StopIteration as stop:
+        return stop.value

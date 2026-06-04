@@ -473,6 +473,88 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "for-loop counts toward the total."
         ),
     },
+    # ---- Action system --------------------------------------------------
+    # Actions are GM-defined effect bundles stored under entity.vars at any
+    # path ending in `.actions.<name>`. Each action is a dict with `body`
+    # (required, a formula program with the cmd()/source/fail extensions),
+    # optional `description`, and optional `target` (one of: entity,
+    # location, entity_list, location_list, none). Discovery walks the
+    # whole vars tree, so `inventory.sword.actions.slice`,
+    # `equipped.bow.actions.fire`, and `species.dragon.actions.breathe`
+    # are all surfaced as available actions on the entity. The four
+    # rules below shape that discovery and the body's command-dispatch
+    # surface; see also Match.discover_actions and the !action command.
+    "action_recursion_limit": {
+        "default": 8,
+        "schema": {"type": "int"},
+        "desc": (
+            "Maximum action call depth — an action body that calls "
+            "use_action() into another action counts as a nested call. "
+            "Default 8 is enough for legitimate composition (an attack "
+            "calling a damage_calculation action calling a crit_check "
+            "action ...); hitting it almost always means a cyclic "
+            "definition. The dispatcher raises an ActionFail on "
+            "overflow rather than blowing Python's stack."
+        ),
+    },
+    "action_cmd_allowlist": {
+        # Default deliberately conservative: only `ent` (the entity-state
+        # CRUD surface) is allowed by default. Adding things like
+        # `history`, `batch`, `run`, or `store` to this list explicitly
+        # opts the GM into letting actions fork the timeline / persist
+        # to disk / etc. — those side effects belong on the GM's head,
+        # not the engine's defaults.
+        "default": "ent",
+        "schema": {"type": "str"},
+        "desc": (
+            "Comma-separated list of command names that an action's "
+            "body can dispatch via `cmd('<name> ...')`. The default "
+            "`ent` covers all entity-state commands (hp/move/set_var/"
+            "etc.). Add others (e.g. `tile,passive`) only when you "
+            "want actions to manipulate those surfaces too. Commands "
+            "like `history`, `batch`, `run`, `store` are NOT in the "
+            "default — adding them is the GM's explicit choice. "
+            "Whitespace around names is ignored; an empty list "
+            "disables `cmd()` entirely (formula-only actions)."
+        ),
+    },
+    "action_container_mode": {
+        "default": "all",
+        "schema": {"type": "enum", "choices": ["all", "whitelist", "blacklist"]},
+        "desc": (
+            "How the action-discovery walker chooses which top-level "
+            "var containers to descend into. `all` (default) searches "
+            "every top-level var. `whitelist` searches ONLY the "
+            "containers named in action_container_paths. `blacklist` "
+            "searches everything EXCEPT those containers. Useful when "
+            "an entity has a `notes` or `__meta` container the GM "
+            "wants the engine to ignore."
+        ),
+    },
+    "action_container_paths": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "Comma-separated list of top-level var names. Interpreted "
+            "as a whitelist or blacklist depending on "
+            "action_container_mode. Ignored when mode is `all`. The "
+            "names match the FIRST segment of a vars path only "
+            "(`inventory`, `equipped`, `species`, ...); deeper paths "
+            "inside an allowed container are always searched."
+        ),
+    },
+    "action_names_case_sensitive": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether action-name lookups treat `slice` and `Slice` as "
+            "different actions. True (default) matches every other "
+            "vars-key lookup in the engine. False folds both halves "
+            "of a lookup to lowercase — letting a system tolerate "
+            "casing drift in GM-typed names. Storage is always case-"
+            "preserving; this rule affects matching only."
+        ),
+    },
     "random_seed": {
         "default": "",
         "schema": {"type": "str"},
@@ -845,6 +927,24 @@ HOOK_NAMES: Set[str] = {
     # logic; on_entity_moved is the entity-side complement so a
     # passive can react regardless of which tile is involved.
     "on_entity_moved",
+    # Action usage event. Fires AFTER an action body has run to
+    # completion (and after its outer snapshot has been committed). A
+    # passive watching this hook sees the final state, not an in-flight
+    # one. Fires on the ACTOR entity (`self` = the entity that used the
+    # action; `this` = current-turn entity, as usual). Context bindings:
+    #   action_name   the bare name (e.g. "slice")
+    #   action_path   the full vars path the action was loaded from
+    #                 (e.g. "inventory.sword.actions.slice"). Useful
+    #                 for category filtering (`if action_path.startswith
+    #                 ("inventory.")`).
+    #   target        the resolved target — an entity id (target=entity),
+    #                 a (x, y) tuple (target=location), a list of either,
+    #                 or None (target=none).
+    #   args          the args dict the GM passed (key=value tokens).
+    # Failed actions (fail() / rollback) do NOT fire this hook — only
+    # successful completions do. A separate on_action_failed hook is
+    # deferred to a follow-up PR.
+    "on_action_used",
     # Per-step movement event. Fires ONCE PER CELL traversed during a
     # stepwise move (Entity.move_dirs), AFTER the position changes for
     # that step — so `entity[self].x/.y` refer to the just-entered
@@ -2694,6 +2794,20 @@ class Match:
     _rng: Any = field(default=None, repr=False, compare=False)
     _rng_seed: Any = field(default=None, repr=False, compare=False)
 
+    # ---- action runtime state --------------------------------------------
+    # Tracks how deep we are in a chain of action invocations. Bumped at
+    # the start of an action body and decremented after; gates two
+    # behaviors:
+    #   1. recursion limit — `use_action()` past action_recursion_limit
+    #      raises ActionFail without blowing Python's stack.
+    #   2. snapshot suspension — when > 0, the command dispatcher
+    #      skips its per-command pre/post snapshot; only the action's
+    #      outer snapshot pair counts (the transactional unit the GM
+    #      cares about). Mirrors the `dispatch_no_snapshot` path used
+    #      by !batch / !run, but flag-driven so nested cmd() calls
+    #      inside an action body don't have to re-route themselves.
+    _action_depth: int = field(default=0, repr=False)
+
     # ---- global constraints / helpers (unchanged in spirit) ----
     def in_bounds(self, x: int, y: int) -> bool:
         return 1 <= x <= self.grid_width and 1 <= y <= self.grid_height
@@ -3733,6 +3847,48 @@ class Match:
             if p.when == "on_entity_step":
                 log.append(_run_passive_safely(
                     engine, p, ctx, target_id=entity_id, is_global=False,
+                ))
+        return log
+
+    def fire_action_used(
+        self, *,
+        actor_id: str,
+        action_name: str,
+        action_path: str,
+        target: Any,
+        args: Dict[str, Any],
+    ) -> List[str]:
+        """Fire on_action_used passives after an action's body has
+        completed successfully. Bindings (per the hook contract in
+        HOOK_NAMES): action_name, action_path, target, args. `self`
+        binds to the ACTOR — the entity that used the action.
+
+        Failed/rolled-back actions do NOT call this — the action runner
+        only invokes fire_action_used on the success path."""
+        e = self.entities.get(actor_id)
+        if e is None:
+            return []
+        from formula import FormulaEngine, EvalCtx
+        engine = FormulaEngine(self)
+        this_id = self.current_entity_id()
+        extras = {
+            "action_name": action_name,
+            "action_path": action_path,
+            "target": target,
+            "args": args,
+            "hook_name": "on_action_used",
+        }
+        ctx = EvalCtx(this=this_id, target=actor_id, extras=extras)
+        log: List[str] = []
+        for p in self.global_passives.values():
+            if p.when == "on_action_used":
+                log.append(_run_passive_safely(
+                    engine, p, ctx, target_id=actor_id, is_global=True,
+                ))
+        for p in e.passives.values():
+            if p.when == "on_action_used":
+                log.append(_run_passive_safely(
+                    engine, p, ctx, target_id=actor_id, is_global=False,
                 ))
         return log
 

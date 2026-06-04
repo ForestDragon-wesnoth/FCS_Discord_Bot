@@ -185,15 +185,22 @@ class CommandRegistry:
         # Pre-dispatch snapshot of the active match's state. We only
         # bother if (a) the command opted into snapshotting (snapshot=
         # True, default), (b) there IS an active match on this channel,
-        # and (c) the active match's autosave_command_retention_turns
-        # rule isn't 0 (which means "command autosaves disabled").
+        # (c) the active match's autosave_command_retention_turns
+        # rule isn't 0 (which means "command autosaves disabled"), AND
+        # (d) we're NOT inside an action body — when an action is
+        # executing (match._action_depth > 0) it owns the snapshot
+        # for the whole transaction, so per-command snapshots inside
+        # would clutter the undo history with synthetic mid-action
+        # entries. Same suspension model as !batch/!run, but
+        # flag-driven instead of routed through dispatch_no_snapshot.
         pre_state = None
         pre_active_mid = mgr.active_by_channel.get(ctx.channel_key)
         if (self._snapshot.get(name, True)
                 and pre_active_mid is not None
                 and pre_active_mid in mgr.matches):
             m_pre = mgr.matches[pre_active_mid]
-            if int(m_pre.rules.get("autosave_command_retention_turns", 3)) != 0:
+            if (int(m_pre.rules.get("autosave_command_retention_turns", 3)) != 0
+                    and getattr(m_pre, "_action_depth", 0) == 0):
                 pre_state = m_pre.to_dict(include_history=False)
 
         try:
@@ -1699,7 +1706,23 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             )
         e.remove_var_silent(key_path)
         return await ctx.send(f"Deleted (silent) `{eid}` vars.{key_path}")
-    
+
+    # ---- !ent action <id> <name> [target] [k=v...] ----
+    # Alias form for !action <id> <name> [...]. Routes through the
+    # same _run_action_dispatch helper so behavior is identical —
+    # this is purely a syntactic convenience for users who already
+    # think in "ent <id> <verb>" patterns.
+    if sub == "action":
+        if await return_help_if_not_enough_args(ctx, args, 3, "ent", "action"):
+            return
+        actor_id = _resolve_eid(m, args[1])
+        if actor_id not in m.entities:
+            raise NotFound(f"Entity '{actor_id}' not found.")
+        await _run_action_dispatch(
+            ctx, mgr, m, actor_id=actor_id,
+            requested_name=args[2], tail_tokens=list(args[3:]),
+        )
+        return
 
     # Fallback: show authoritative help for the root command
     title, body = registry.help_for(["ent"])
@@ -1805,6 +1828,15 @@ registry.annotate_sub(
         "<new_id>1, <new_id>2, ... — e.g. `!ent clone goblin mob 5 5 6 6 "
         "7 7` drops three goblins. All-or-nothing: every target cell must "
         "be free and every generated id unused, or nothing is cloned."
+    ),
+)
+registry.annotate_sub(
+    "ent", "action",
+    usage="!ent action <id> <name> [target...] [k=v ...]",
+    desc=(
+        "Alias form for `!action <id> <name> [...]` — invokes a "
+        "discovered action on `<id>`. See `!help action` for the "
+        "full body language and target/args semantics."
     ),
 )
 registry.annotate_sub(
@@ -4684,6 +4716,136 @@ async def eval_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         ids = ", ".join(f"`{eid}`" for eid in engine.affected_entities)
         return await ctx.send(f"Affected {len(engine.affected_entities)} entit{'y' if len(engine.affected_entities) == 1 else 'ies'}: {ids}")
     return await ctx.send(f"= `{val!r}`")
+
+
+# ---- !action ---------------------------------------------------------
+# Top-level invocation surface for the action system. The runner /
+# proxies / discovery live in action.py; this handler is the user-
+# facing parser + dispatcher: it resolves the action by name on the
+# specified actor entity, parses the target tokens according to the
+# action's declared target_type, parses key=value args, then hands
+# off to action.run_action which captures pre-state, runs the body,
+# and rolls back on failure.
+
+@registry.command(
+    "action",
+    usage="!action <eid> <name> [target...] [k=v ...]",
+    desc=(
+        "Invoke an action discovered anywhere in `<eid>`'s vars tree. "
+        "Actions are dicts at any path ending in `actions.<name>` with "
+        "a `body` (a formula program), optional `description`, and "
+        "optional `target` (entity/location/entity_list/location_list/"
+        "none). The leading tokens after the action name are the "
+        "target (shape depends on the action's declared type); any "
+        "`key=value` tokens after that go into the `args` dict the "
+        "body can read. On a clean `fail(\"msg\")` the runner rolls "
+        "back and replies ❌; on a successful run, `on_action_used` "
+        "fires. `<eid>` accepts `self`/`this`/`current`. When two "
+        "actions share a name the handler shows a numbered "
+        "disambiguation menu."
+    ),
+)
+async def action_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if await return_help_if_not_enough_args(ctx, args, 2, "action"):
+        return
+    m = active_match(mgr, ctx)
+    actor_id = _resolve_eid(m, args[0])
+    if actor_id not in m.entities:
+        raise NotFound(f"Entity '{actor_id}' not found.")
+    requested = args[1]
+    tail = list(args[2:])
+    await _run_action_dispatch(
+        ctx, mgr, m, actor_id=actor_id,
+        requested_name=requested, tail_tokens=tail,
+    )
+
+
+async def _run_action_dispatch(
+    ctx: ReplyContext, mgr: MatchManager, m: Match, *,
+    actor_id: str, requested_name: str, tail_tokens: List[str],
+) -> None:
+    """Shared resolution path for both !action and !ent <id> action.
+    Owns: discovery, disambiguation menu, target parsing, args
+    parsing, runner invocation, and the reply for the !command
+    (success ✓ vs ❌ <msg>)."""
+    from action import (
+        discover_actions, lookup_action, parse_target, parse_args_tokens,
+        run_action, _sync_dispatch_returning,
+    )
+    actor = m.entities[actor_id]
+    actions = discover_actions(actor, m.rules)
+    matches = lookup_action(actions, requested_name, m.rules)
+    if not matches:
+        avail = sorted(actions.keys())
+        if avail:
+            hint = " Available: " + ", ".join(f"`{n}`" for n in avail) + "."
+        else:
+            hint = ""
+        return await ctx.send(
+            f"❌ no action `{requested_name}` on `{actor_id}`.{hint}"
+        )
+    if len(matches) > 1:
+        # Disambiguation menu: list all locations, the user re-issues
+        # the command with the full path as the name. The full path
+        # (e.g. `inventory.sword.actions.slice`) is unique by
+        # construction so it always resolves cleanly.
+        lines = [
+            f"There are {len(matches)} actions named "
+            f"`{requested_name}` on `{actor_id}`. Pick one by its "
+            f"full path:"
+        ]
+        for i, act in enumerate(matches, start=1):
+            desc = f" — {act.description}" if act.description else ""
+            lines.append(
+                f"  {i}. `{act.full_path}`{desc}"
+            )
+        lines.append(
+            f"Re-issue as: "
+            f"`!action {actor_id} <full_path>`"
+        )
+        return await ctx.send("\n".join(lines))
+    # Single-match path. Also accept "fully-qualified" requests where
+    # the user typed an exact full_path (the disambiguation menu
+    # invites this). Compare against any action whose full_path
+    # matches; if found, use that one directly.
+    action = matches[0]
+    for act_list in actions.values():
+        for act in act_list:
+            if act.full_path == requested_name:
+                action = act
+                break
+    # Parse the target tokens off the front, then args off the rest.
+    try:
+        target_value, remaining = parse_target(
+            action.target_type, tail_tokens, m,
+        )
+        args_dict = parse_args_tokens(remaining)
+    except VTTError as ex:
+        return await ctx.send(f"❌ action `{action.name}`: {ex}")
+    # The use_action formula primitive needs ctx/mgr to find a
+    # dispatcher; stash them on the match as transient runtime
+    # attributes for the duration of this dispatch chain. They're
+    # cleared after the runner returns to avoid leaking dispatcher
+    # state into unrelated formula evaluations.
+    prev_ctx = getattr(m, "_runtime_ctx", None)
+    prev_mgr = getattr(m, "_runtime_mgr", None)
+    m._runtime_ctx = ctx
+    m._runtime_mgr = mgr
+    try:
+        ok, fail_msg = await run_action(
+            action, actor_id=actor_id, target=target_value,
+            args=args_dict, match=m, mgr=mgr, ctx=ctx,
+        )
+    finally:
+        m._runtime_ctx = prev_ctx
+        m._runtime_mgr = prev_mgr
+    if not ok:
+        return await ctx.send(
+            f"❌ action `{action.name}`: {fail_msg}"
+        )
+    return await ctx.send(
+        f"`{actor_id}` used action `{action.name}`."
+    )
 
 
 # ---- Automated Help command (shows available commands----------------------------------------------------------
