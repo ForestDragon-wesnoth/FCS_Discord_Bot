@@ -8211,3 +8211,177 @@ advances: `a.pulse` == 2, `round_number()` returns 2, and
 These are the cadence primitives for "every N rounds" effects,
 round-measured cooldowns, and "first turn of the round" checks
 — no need to hand-track a counter in vars.
+
+
+SCENARIO 326 — Natural death by hp damage; corpse stored in tile data
+----------------------------------------------------------------------
+
+!match new mdc1 DeathBasic 8 8
+!match use mdc1
+!ent add hero Hero 30 1 1 10
+!ent add foe Foe 8 4 4 8
+!list
+!ent hp foe -12
+!list
+!ent dump hero
+
+Expected: Initial !list shows both entities, no Dead: section.
+After `!ent hp foe -12` drops foe's hp from 8 to -4, the death
+chokepoint in write_var fires the default death condition
+(hp <= 0) — true. The death pipeline runs on_death (no
+passives here), stores foe as a corpse at (4,4), and removes
+foe from the match + turn order. The second !list shows only
+hero in Entities: and a Dead: section with foe at HP -4/8
+X,Y: 4,4 (corpse). Hero is unaffected.
+
+
+SCENARIO 327 — !action with target=corpse: cleric revives warrior
+------------------------------------------------------------------
+
+!match new mdc2 DeathRevive 8 8
+!match use mdc2
+!ent add cleric Cleric 30 1 1 12
+!ent add warrior Warrior 20 3 3 10
+!ent set_var cleric spells.revive.actions.cast.target corpse
+!ent set_var cleric spells.revive.actions.cast.description "Revive a fallen ally"
+!ent set_var cleric spells.revive.actions.cast.body "revive(target)"
+!ent hp warrior -50
+!list
+!action cleric cast warrior
+!ent dump warrior
+!list
+
+Expected: After damage, warrior is a corpse at (3,3) with hp
+-30/20. `!action cleric cast warrior` accepts "warrior" as the
+corpse target (target type = corpse), and the body
+`revive(target)` resurrects the entity: a fresh Warrior at
+(3,3) with hp = max_hp = 20 (revive restores full hp), the
+corpse tile-data entry is deleted, and warrior rejoins turn
+order. Final !list: cleric + warrior in Entities:, no Dead:
+section.
+
+
+SCENARIO 328 — Per-entity __death_result = delete skips the corpse
+-------------------------------------------------------------------
+
+!match new mdc3 DeathDelete 8 8
+!match use mdc3
+!ent add ghost Ghost 5 2 2 7
+!ent set_var ghost __death_result delete
+!ent add hero Hero 30 1 1 10
+!ent hp ghost -10
+!list
+!eval "has_corpse('ghost')"
+
+Expected: ghost dies from -10 damage. Because its per-entity
+`__death_result` is "delete", the death pipeline removes the
+entity outright — NO corpse is written. !list shows only hero
+in Entities: and no Dead: section. `has_corpse('ghost')`
+returns False.
+
+
+SCENARIO 329 — Per-entity __death_condition (additive): non-hp death gate
+--------------------------------------------------------------------------
+
+!match new mdc4 DeathAdditive 8 8
+!match use mdc4
+!ent add hero Hero 30 1 1 10
+!ent add construct Construct 100 4 4 5
+!ent set_var construct __death_condition "status_has(self, 'core_breached')"
+!ent dump construct
+!ent status construct add core_breached
+!list
+!eval "has_corpse('construct')"
+
+Expected: The construct's per-entity __death_condition adds an
+extra death gate (additive mode by default). Even with 100 hp,
+adding the status `core_breached` immediately triggers death
+on the next chokepoint check (the status add writes a var on
+the entity). The construct becomes a corpse; !list shows hero
++ Dead: construct. `has_corpse('construct')` returns True.
+This demonstrates that the death condition is a full formula
+expression — non-hp death is a one-liner.
+
+
+SCENARIO 330 — on_death and on_revive hooks fire
+-------------------------------------------------
+
+!match new mdc5 DeathHooks 8 8
+!match use mdc5
+!ent add hero Hero 30 1 1 10
+!ent add mark Mark 10 3 3 9
+!ent set_var mark deaths 0
+!ent set_var mark revivals 0
+!passive add mark deathlog on_death "entity[self].deaths = entity[self].deaths + 1"
+!passive add mark revivelog on_revive "entity[self].revivals = entity[self].revivals + 1"
+!ent hp mark -20
+!eval "revive('mark')"
+!ent dump mark
+
+Expected: mark's on_death passive fires when the lethal damage
+write triggers the chokepoint — `deaths` is bumped from 0 to 1
+(observed AFTER the snapshot is taken, so the corpse carries
+deaths=1). On revive, the entity is restored from the snapshot
+(so deaths starts at 1) and on_revive fires, bumping revivals
+from 0 to 1. Final dump shows deaths=1, revivals=1.
+
+
+SCENARIO 331 — kill() bypasses the condition; corpse + revive still work
+-------------------------------------------------------------------------
+
+!match new mdc6 DeathKill 8 8
+!match use mdc6
+!ent add hero Hero 30 1 1 10
+!ent add tough Tough 99 4 4 8
+!eval "kill('tough')"
+!list
+!eval "has_corpse('tough')"
+!eval "revive('tough')"
+!list
+
+Expected: tough has 99 hp — well above the default death
+threshold — but `kill('tough')` calls the death pipeline
+directly, bypassing the condition. tough becomes a corpse;
+has_corpse returns True. revive brings it back at full hp.
+
+
+SCENARIO 332 — show_corpses_in_entity_list = false hides the Dead: section
+----------------------------------------------------------------------------
+
+!match new mdc7 DeathHidden 8 8
+!match use mdc7
+!system set default show_corpses_in_entity_list false
+!ent add hero Hero 30 1 1 10
+!ent add foe Foe 5 4 4 8
+!ent hp foe -10
+!list
+!eval "has_corpse('foe')"
+
+Expected: !list shows only hero in Entities: and NO Dead:
+section, because the rule is off. The corpse still exists in
+tile data — `has_corpse('foe')` returns True. The rule only
+affects display, not state.
+
+
+SCENARIO 333 — corpse_list target: mass revive
+-----------------------------------------------
+
+!match new mdc8 DeathMassRevive 10 10
+!match use mdc8
+!ent add cleric Cleric 30 1 1 12
+!ent add a A 5 3 3 9
+!ent add b B 5 4 4 8
+!ent add c C 5 5 5 7
+!ent hp a -10
+!ent hp b -10
+!ent hp c -10
+!ent set_var cleric spells.mass_revive.actions.cast.target corpse_list
+!ent set_var cleric spells.mass_revive.actions.cast.body "for cid in target:\n    revive(cid)"
+!action cleric cast a b c
+!list
+
+Expected: All three fall to corpses. The cleric's mass_revive
+action accepts a corpse_list (multiple corpse ids as positional
+tokens) and the body iterates them, calling revive on each.
+All three return at full hp. Final !list: cleric, a, b, c all
+alive; no Dead: section.

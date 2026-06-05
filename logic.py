@@ -489,6 +489,72 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "if a system genuinely needs bigger waves."
         ),
     },
+    # ---- Death system ---------------------------------------------------
+    # An entity "dies" when a configurable formula condition evaluates
+    # truthy on it. The check fires after every var-event chain (the
+    # condition can reference any var, not just hp), at the chokepoint
+    # inside Entity.write_var. On death the entity is removed from the
+    # match per `death_result` — either deleted entirely or turned into
+    # a corpse stored in the cell's tile data (the default — corpse
+    # carries the full Entity.to_dict so `revive` can resurrect it).
+    # Per-entity vars (`__death_condition` / `__death_result`) override
+    # the system defaults; see Match._evaluate_death_condition.
+    "death_condition": {
+        "default": "entity[self].hp <= 0",
+        "schema": {"type": "str"},
+        "desc": (
+            "Formula expression evaluated on an entity after any var "
+            "change. When it returns truthy the entity dies. Default "
+            "is the classic `hp <= 0` check, but any boolean formula "
+            "works — `entity[self].hp <= 0 or status_has(self, "
+            "'doomed')` for status-based death, or "
+            "`entity[self].sanity <= 0` for a non-hp game. The formula "
+            "runs with `self` bound to the entity being checked. "
+            "Per-entity override: set `__death_condition` in the "
+            "entity's vars; combined with this rule per "
+            "`death_condition_mode`."
+        ),
+    },
+    "death_condition_mode": {
+        "default": "additive",
+        "schema": {"type": "enum", "choices": ["additive", "replace"]},
+        "desc": (
+            "How a per-entity `__death_condition` var combines with "
+            "this system's `death_condition` rule. `additive` "
+            "(default): the entity dies when EITHER condition is true "
+            "— useful for 'undead also die if they take radiant damage' "
+            "without losing the hp check. `replace`: the per-entity "
+            "condition WHOLLY replaces the rule — for entities the "
+            "engine should track by entirely different state (a robot "
+            "that dies on `core_damaged == true` regardless of hp)."
+        ),
+    },
+    "death_result": {
+        "default": "corpse",
+        "schema": {"type": "enum", "choices": ["delete", "corpse"]},
+        "desc": (
+            "What happens when an entity dies. `corpse` (default) "
+            "stores the Entity.to_dict snapshot in the entity's cell "
+            "tile data under a corpses-by-id map "
+            "(`tile[(x,y)].corpses.<eid>`) and removes the entity from "
+            "turn order — actions can later `revive(<eid>)` it. "
+            "`delete` removes the entity outright (no corpse left). "
+            "Per-entity override: set `__death_result` in the "
+            "entity's vars."
+        ),
+    },
+    "show_corpses_in_entity_list": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "When true (default), `!list` and `!state` show a `Dead:` "
+            "section below the live entity roster, displaying every "
+            "corpse's id, name, position, and final hp/max_hp. False "
+            "hides corpses from the entity-list output (they still "
+            "exist in tile data; `!find` / `entity_actions` etc. on "
+            "corpses use the explicit corpse-targeting surface)."
+        ),
+    },
     # ---- Action system --------------------------------------------------
     # Actions are GM-defined effect bundles stored under entity.vars at any
     # path ending in `.actions.<name>`. Each action is a dict with `body`
@@ -935,6 +1001,18 @@ HOOK_NAMES: Set[str] = {
     "on_round_start",
     "on_round_end",
     "on_entity_spawned",
+    # Death event. Fires on the entity once the death-condition formula
+    # evaluates truthy, BEFORE the entity is removed from the match (so
+    # `self` is still bound and entity[self].x/.y still resolve). The
+    # corpse-vs-delete result also runs after this fires. No special
+    # extras — passives observe via the normal `self`/`this` bindings.
+    "on_death",
+    # Revive event. Fires on the freshly-restored entity AFTER revive()
+    # has spawned it back from a corpse (so on_entity_spawned has
+    # already fired). Useful for "remove the doomed status when I come
+    # back" or "regen kicks in only after the first revive". `self` =
+    # the revived entity; `this` = current-turn entity as usual.
+    "on_revive",
     # Movement event (any position change — tp / step / clone-spawn-
     # via-move; NOT the initial spawn placement, which has its own
     # on_entity_spawned hook). Context bindings during fire:
@@ -2325,8 +2403,16 @@ class Entity:
     def damage_entity(self, amount: int):
         was_alive = self.is_alive
         self.take_damage(amount)
-        if was_alive and not self.is_alive:
-            self._require_match()._rebuild_turn_order()
+        # The death-chokepoint inside write_var (which take_damage
+        # routed through) may have already triggered death — which
+        # detaches the entity from the match and rebuilds turn order.
+        # In that case we have nothing more to do; calling
+        # _require_match() here would raise. Otherwise, preserve the
+        # legacy "hp went to 0 without the death pipeline firing"
+        # rebuild, which can still happen when the GM has set
+        # death_condition to something that doesn't gate on hp.
+        if was_alive and not self.is_alive and self._match is not None:
+            self._match._rebuild_turn_order()
 
     def heal_entity(self, amount: int):
         was_alive = self.is_alive
@@ -2540,6 +2626,21 @@ class Entity:
         if is_top_level_write and self._match is not None and self._match._var_event_warnings:
             combined.extend(self._match._var_event_warnings)
             self._match._var_event_warnings = []
+        # Death check. Runs at TOP-LEVEL writes only — a passive whose
+        # body writes more vars accumulates events in the same chain;
+        # we don't want to evaluate the death condition mid-chain
+        # (it might transiently look truthy before a healing passive
+        # has fired). The check is also skipped during in-flight death
+        # processing via Match._death_processing so an on_death passive
+        # writing vars doesn't recursively trigger another death of
+        # the same entity. Self.id may already be gone from the match
+        # if a passive earlier in the chain removed it — check_death
+        # handles that. This is the single chokepoint for "did this
+        # write kill the entity?" — it covers hp damage, status writes,
+        # arbitrary GM conditions, and writes via formulas/actions.
+        if (is_top_level_write and self._match is not None
+                and self.id in self._match.entities):
+            combined.extend(self._match.check_death(self.id))
         return combined
 
     def remove_var(self, path: str) -> List[str]:
@@ -2582,6 +2683,13 @@ class Entity:
         if is_top_level_write and self._match is not None and self._match._var_event_warnings:
             log.extend(self._match._var_event_warnings)
             self._match._var_event_warnings = []
+        # Death check — same chokepoint policy as write_var (removing
+        # a var can change the death condition's verdict: e.g. removing
+        # a 'protected' status that gated death). Top-level only;
+        # skipped during in-flight death processing.
+        if (is_top_level_write and self._match is not None
+                and self.id in self._match.entities):
+            log.extend(self._match.check_death(self.id))
         return log
 
     def remove_var_silent(self, path: str) -> None:
@@ -2862,6 +2970,14 @@ class Match:
     # summons in the same command raise. Not serialized — transient
     # safety state.
     _summon_count: int = field(default=0, repr=False, compare=False)
+    # Re-entry guard for the death-condition chokepoint. The check runs
+    # at the top of every write_var chain; if the condition write
+    # itself causes further var writes (clamp, on_death passive,
+    # corpse-tile mutation), we must NOT re-evaluate the condition
+    # mid-collapse — set to >0 while processing a death to short-
+    # circuit nested checks. Reset to 0 once the death pipeline
+    # finishes. Not serialized.
+    _death_processing: int = field(default=0, repr=False, compare=False)
 
     # ---- global constraints / helpers (unchanged in spirit) ----
     def in_bounds(self, x: int, y: int) -> bool:
@@ -3819,22 +3935,33 @@ class Match:
           {...} None       on_status_removed
           {...} {...}      on_status_changed iff before != after
         """
+        log: List[str] = []
         if before is None and after is not None:
-            return self.fire_status_event(
+            log = self.fire_status_event(
                 "on_status_added", entity_id, status_name,
                 old_value=None, new_value=after,
             )
-        if before is not None and after is None:
-            return self.fire_status_event(
+        elif before is not None and after is None:
+            log = self.fire_status_event(
                 "on_status_removed", entity_id, status_name,
                 old_value=before, new_value=None,
             )
-        if before != after:
-            return self.fire_status_event(
+        elif before != after:
+            log = self.fire_status_event(
                 "on_status_changed", entity_id, status_name,
                 old_value=before, new_value=after,
             )
-        return []
+        # Death-check chokepoint for status mutations. Death conditions
+        # can reference statuses (status_has / status_get) — without
+        # this, adding a 'doomed' status wouldn't trigger the death
+        # condition the way an hp write would. Gated by
+        # _death_processing (set by _process_death) to prevent
+        # re-entry from on_death passives that themselves mutate
+        # status. Covers add / remove / changed via the single
+        # chokepoint here.
+        if entity_id in self.entities:
+            log.extend(self.check_death(entity_id))
+        return log
 
     def fire_entity_moved(
         self, entity_id: str,
@@ -4185,6 +4312,193 @@ class Match:
                 if self.in_bounds(cx, cy) and not self.is_occupied(cx, cy):
                     return (cx, cy)
         return None
+
+    # ---- death / corpse machinery ----------------------------------------
+    # A "corpse" is an entry under `tile[(x,y)].corpses.<eid>` carrying
+    # the dead entity's full Entity.to_dict (so revive can spawn it back
+    # exactly). The corpse's authoritative position is the TILE
+    # coordinate, never the embedded entity dict's `x`/`y` (those are
+    # snapshotted at death and not read by engine code afterward — this
+    # is the desync prevention the user called out). Multi-corpse-per-
+    # cell is supported via the id-keyed map; a second death on the same
+    # cell adds a new key, not an overwrite.
+
+    def _effective_death_condition(self, e: "Entity") -> Tuple[str, str]:
+        """Resolve the (condition_formula, mode) pair to evaluate for
+        entity `e`. Per-entity vars `__death_condition` / `__death_mode`
+        override the system rules; the mode (`additive` / `replace`)
+        decides whether the per-entity condition combines with or
+        wholly replaces the system one."""
+        sys_cond = str(self.rules.get("death_condition", "entity[self].hp <= 0"))
+        sys_mode = str(self.rules.get("death_condition_mode", "additive"))
+        ent_cond_raw = e.vars.get("__death_condition")
+        ent_mode_raw = e.vars.get("__death_mode")
+        ent_cond = str(ent_cond_raw) if isinstance(ent_cond_raw, str) and ent_cond_raw.strip() else None
+        ent_mode = str(ent_mode_raw) if isinstance(ent_mode_raw, str) else None
+        mode = ent_mode if ent_mode in ("additive", "replace") else sys_mode
+        if ent_cond is None:
+            return sys_cond, mode
+        if mode == "replace":
+            return ent_cond, mode
+        # additive: OR the two together with parens so operator
+        # precedence stays predictable regardless of either body.
+        return f"({sys_cond}) or ({ent_cond})", mode
+
+    def _effective_death_result(self, e: "Entity") -> str:
+        """Resolve `corpse` vs `delete` for entity `e`. Per-entity var
+        `__death_result` overrides the system rule; falls back to the
+        rule's default on any malformed value."""
+        ent = e.vars.get("__death_result")
+        if isinstance(ent, str) and ent in ("corpse", "delete"):
+            return ent
+        sys_res = str(self.rules.get("death_result", "corpse"))
+        return sys_res if sys_res in ("corpse", "delete") else "corpse"
+
+    def check_death(self, entity_id: str) -> List[str]:
+        """Evaluate the effective death condition on `entity_id`. If it
+        returns truthy, run the death pipeline (fire on_death, then
+        store-corpse-or-delete, remove from turn order). Returns log
+        lines produced by passives that fired.
+
+        Re-entry guarded via _death_processing — a death-firing passive
+        that itself writes vars must not retrigger the check on the
+        already-dying entity. Returns empty list on guard hit."""
+        if self._death_processing > 0:
+            return []
+        e = self.entities.get(entity_id)
+        if e is None:
+            return []
+        condition, _mode = self._effective_death_condition(e)
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        engine = FormulaEngine(self)
+        ctx = EvalCtx(this=self.current_entity_id(), target=entity_id)
+        try:
+            verdict = engine.eval_expression(condition, ctx)
+        except FormulaError:
+            # A malformed death condition is the GM's bug, not the
+            # entity's; surfacing it as "the entity instantly dies"
+            # would be terrible UX. Silently treat as "not dying" so
+            # gameplay continues; the typo will surface elsewhere.
+            return []
+        if not verdict:
+            return []
+        return self._process_death(entity_id)
+
+    def _process_death(self, entity_id: str) -> List[str]:
+        """Run the death pipeline for `entity_id`: fire on_death (entity
+        still in match), apply the death_result (corpse-store or
+        delete), remove from turn order. Returns log lines."""
+        e = self.entities.get(entity_id)
+        if e is None:
+            return []
+        self._death_processing += 1
+        try:
+            log = self.fire_hook("on_death", target_ids=[entity_id])
+            # Re-check entity still exists — a paranoid on_death passive
+            # could have already removed the entity, in which case the
+            # corpse/delete step has nothing to do.
+            if entity_id not in self.entities:
+                return log
+            result = self._effective_death_result(e)
+            if result == "corpse":
+                self._store_corpse(e)
+            # Remove from match (entity.remove handles turn-order
+            # bookkeeping + group scrubbing) regardless of result.
+            e.remove()
+        finally:
+            self._death_processing = max(0, self._death_processing - 1)
+        return log
+
+    def _store_corpse(self, e: "Entity") -> None:
+        """Snapshot `e` into a corpse entry under tile (e.x, e.y) at
+        `corpses.<eid>`. Stores the full Entity.to_dict (including id,
+        x, y) so revive can spawn it back exactly. Multi-corpse-per-
+        cell: existing corpses on the cell aren't disturbed."""
+        cell = self.tile_data(e.x, e.y)
+        corpses = cell.setdefault("corpses", {})
+        if not isinstance(corpses, dict):
+            # Tile data shape was hand-written into something else;
+            # bulldoze with a fresh dict (corpses is engine-owned).
+            corpses = {}
+            cell["corpses"] = corpses
+        corpses[e.id] = {
+            "entity": e.to_dict(),
+            "died_round": self.round_number,
+        }
+
+    def find_corpse(self, eid: str) -> Optional[Tuple[int, int, Dict[str, Any]]]:
+        """Locate a corpse by its dead-entity id. Returns
+        (x, y, corpse_dict) or None. The tile coords are the
+        AUTHORITATIVE position; the embedded entity dict's x/y are
+        the snapshot at death and may differ if a (rare) GM hack
+        moved corpses around manually — engine code never reads them
+        for placement, this method always returns the tile's coords."""
+        for (x, y), cell in self.tiles.items():
+            corpses = cell.get("corpses") if isinstance(cell, dict) else None
+            if isinstance(corpses, dict) and eid in corpses:
+                return x, y, corpses[eid]
+        return None
+
+    def all_corpses(self) -> List[Tuple[int, int, str, Dict[str, Any]]]:
+        """List every corpse in the match as
+        (x, y, eid, corpse_dict). Sorted by (x, y, eid) for stable
+        iteration; the order matches what `!list`'s Dead: section
+        renders."""
+        out: List[Tuple[int, int, str, Dict[str, Any]]] = []
+        for (x, y) in sorted(self.tiles.keys()):
+            cell = self.tiles[(x, y)]
+            corpses = cell.get("corpses") if isinstance(cell, dict) else None
+            if isinstance(corpses, dict):
+                for eid in sorted(corpses.keys()):
+                    out.append((x, y, eid, corpses[eid]))
+        return out
+
+    def revive_corpse(self, eid: str) -> Tuple[str, List[str]]:
+        """Resurrect the corpse keyed by `eid`: spawn an entity from
+        the stored dict at the corpse's TILE position, remove the
+        corpse, then fire on_revive on the freshly-spawned entity.
+        Returns (entity_id, log_lines). Raises NotFound / Occupied
+        / OutOfBounds on failure (the caller decides whether to wrap
+        as fail() in an action, etc.).
+
+        Hp is restored to max_hp on revive — the corpse's dead hp is
+        preserved IN the snapshot but the live entity starts whole.
+        GMs who want "revive at 1 hp" can write to hp in an
+        on_revive passive."""
+        loc = self.find_corpse(eid)
+        if loc is None:
+            raise NotFound(f"No corpse with id '{eid}'.")
+        x, y, corpse = loc
+        entity_dict = copy.deepcopy(corpse.get("entity") or {})
+        if not entity_dict:
+            raise VTTError(f"Corpse '{eid}' has no entity data to revive.")
+        # Stamp authoritative coords from the tile location, not the
+        # embedded snapshot — desync defense.
+        entity_dict["x"] = x
+        entity_dict["y"] = y
+        # Heal to max_hp using the system's vital-var names.
+        hp_var = self.rules.get("hp_var", "hp")
+        max_hp_var = self.rules.get("max_hp_var", "max_hp")
+        vars_d = entity_dict.get("vars") or {}
+        if isinstance(vars_d, dict) and max_hp_var in vars_d:
+            vars_d[hp_var] = vars_d[max_hp_var]
+            entity_dict["vars"] = vars_d
+        e = Entity.from_dict(entity_dict)
+        # Remove corpse FIRST so spawn doesn't see its own cell as
+        # already-corpse-occupied for any future invariants and so the
+        # tile's `corpses` key is gone if it becomes empty.
+        cell = self.tiles.get((x, y), {})
+        corpses = cell.get("corpses") if isinstance(cell, dict) else None
+        if isinstance(corpses, dict) and eid in corpses:
+            del corpses[eid]
+            if not corpses:
+                cell.pop("corpses", None)
+            # Drop an empty tile dict entirely so tile listings stay clean.
+            if isinstance(cell, dict) and not cell:
+                self.tiles.pop((x, y), None)
+        _, spawn_log = e.spawn(self, x, y)
+        revive_log = self.fire_hook("on_revive", target_ids=[e.id])
+        return e.id, spawn_log + revive_log
 
     def fire_tile_time_hooks(self, when: str) -> List[str]:
         """Fire tile time hooks (on_round_start/end, on_turn_start/end)

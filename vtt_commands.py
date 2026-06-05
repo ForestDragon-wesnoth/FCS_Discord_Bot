@@ -2035,20 +2035,42 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     return await ctx.send(f"```\n{m.render_ascii()}\n```")
 
-@registry.command("list", usage="!list", desc="List entities in a match, sorted by turn order")
+@registry.command("list", usage="!list", desc="List entities in a match, sorted by turn order, plus a Dead: section of corpses when show_corpses_in_entity_list is enabled.")
 async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     es = m.entities_in_turn_order()
-    if not es:
-        return await ctx.send("(no entities)")
-
     active_id = m.turn_order[m.active_index] if m.turn_order else None
-    lines = []
-    lines.append(f"Entities:")
-    #add a right arrow to show which entity's turn it is right now
-    for e in es:
-        marker = "→" if e.id == active_id else "  "
-        lines.append(f"{marker} {_entity_line(e)}")
+    lines: List[str] = []
+    if es:
+        lines.append("Entities:")
+        for e in es:
+            marker = "→" if e.id == active_id else "  "
+            lines.append(f"{marker} {_entity_line(e)}")
+    # Dead: section. Render every corpse with id / name / position /
+    # final hp/max_hp pulled from the embedded snapshot. The tile
+    # coords (NOT the embedded x/y) are authoritative; we display
+    # them as the corpse's location. Gated by the
+    # show_corpses_in_entity_list rule — when false we silently
+    # omit the section (corpses still exist in tile data).
+    if bool(m.rules.get("show_corpses_in_entity_list", True)):
+        corpses = m.all_corpses()
+        if corpses:
+            if lines:
+                lines.append("")  # blank line separates living from dead
+            lines.append("Dead:")
+            hp_var = m.rules.get("hp_var", "hp")
+            max_hp_var = m.rules.get("max_hp_var", "max_hp")
+            for (x, y, eid, corpse) in corpses:
+                ent = corpse.get("entity") or {}
+                name = ent.get("name", eid)
+                ent_vars = ent.get("vars") or {}
+                hp = ent_vars.get(hp_var, "?")
+                mhp = ent_vars.get(max_hp_var, "?")
+                lines.append(
+                    f"   {name} (`{eid}`): HP: {hp}/{mhp} X,Y: {x},{y} (corpse)"
+                )
+    if not lines:
+        return await ctx.send("(no entities)")
     return await ctx.send("\n".join(lines))
 
 # ---- !find ----------------------------------------------------------

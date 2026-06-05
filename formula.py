@@ -1159,6 +1159,17 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   remove_entity(eid)                    -> True (despawn)
     "entity_snapshot", "summon", "summon_near", "summon_from",
     "remove_entity",
+    # Death / corpse family. kill / revive route through the same
+    # death pipeline as the natural-death chokepoint; the introspection
+    # trio (has_corpse, corpse_at, all_corpses) reads tile-data
+    # corpse entries with the tile location as the authoritative
+    # position (never the embedded snapshot's x/y).
+    #   kill(eid)           -> bool (death triggered)
+    #   revive(eid)         -> str (new entity id; raises if no corpse)
+    #   has_corpse(eid)     -> bool
+    #   corpse_at(eid)      -> (x, y); raises if no such corpse
+    #   all_corpses()       -> list of corpse ids (loopable)
+    "kill", "revive", "has_corpse", "corpse_at", "all_corpses",
     # Read a game-system rule value from inside a formula. rule_get(name)
     # -> the rule's effective value, or None if unknown.
     "rule_get",
@@ -1255,6 +1266,8 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "entities_in_area",
     # Action introspection — returns a list of action names, loopable.
     "entity_actions",
+    # Corpse introspection — returns a list of corpse ids, loopable.
+    "all_corpses",
 })
 
 
@@ -3378,6 +3391,71 @@ class FormulaEngine:
         ns["summon_near"]     = _summon_near
         ns["summon_from"]     = _summon_from
         ns["remove_entity"]   = _remove_entity
+
+        # ---- death / corpse family ---------------------------------
+        # All death/corpse mutations route through Match.check_death /
+        # Match.revive_corpse so on_death / on_revive fire consistently
+        # and corpse tile-data stays the authoritative position store.
+        def _kill(eid_t: Any) -> bool:
+            """kill(eid): trigger death on `eid` unconditionally. Used
+            for instant-kill effects, abilities that bypass hp, and
+            'cleanup' patterns. Routes through Match._process_death
+            directly — fires on_death, applies the death_result
+            (corpse vs delete), removes from turn order — without
+            re-evaluating the death condition (so it works regardless
+            of what the GM configured). Returns True if the entity
+            was present and got killed, False if there was no such
+            entity to begin with."""
+            eid = _eid(eid_t)
+            if eid not in match.entities:
+                return False
+            match._process_death(eid)
+            return eid not in match.entities
+
+        def _revive(eid_t: Any) -> str:
+            """revive(eid): bring back the corpse with id `eid`. Spawns
+            a fresh entity from the stored snapshot at the corpse's
+            tile coords, removes the corpse, and fires on_revive on
+            the restored entity. Hp is restored to max_hp; per-revive
+            customization belongs in an on_revive passive. Returns
+            the revived entity id. Raises if no such corpse exists."""
+            eid = str(_eid(eid_t))
+            try:
+                new_id, _log = match.revive_corpse(eid)
+            except (VTTError, NotFound, OutOfBounds, Occupied) as ex:
+                raise FormulaError(str(ex))
+            engine._note_affected(new_id)
+            return new_id
+
+        def _has_corpse(eid_t: Any) -> bool:
+            """has_corpse(eid): True iff a corpse with id `eid` exists
+            in this match. The corpse-side companion to has_action /
+            has_status — useful for conditional revives, "necromancer
+            harvests bones" patterns, etc."""
+            return match.find_corpse(str(_eid(eid_t))) is not None
+
+        def _corpse_at(eid_t: Any) -> tuple:
+            """corpse_at(eid): the (x, y) tile coordinates of the
+            corpse with id `eid`. Authoritative source (tile location,
+            never the embedded snapshot). Raises if no such corpse."""
+            eid = str(_eid(eid_t))
+            loc = match.find_corpse(eid)
+            if loc is None:
+                raise FormulaError(f"corpse_at: no corpse with id '{eid}'.")
+            x, y, _ = loc
+            return (x, y)
+
+        def _all_corpses() -> list:
+            """all_corpses(): list of corpse ids in the match (insertion
+            order by tile, then by id). Loopable — `for cid in
+            all_corpses(): if condition: revive(cid)`."""
+            return [eid for (_x, _y, eid, _c) in match.all_corpses()]
+
+        ns["kill"]         = _kill
+        ns["revive"]       = _revive
+        ns["has_corpse"]   = _has_corpse
+        ns["corpse_at"]    = _corpse_at
+        ns["all_corpses"]  = _all_corpses
 
         def _rule_get(name: Any) -> Any:
             """rule_get(name): the effective value of a system rule on
