@@ -1151,6 +1151,11 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # Read a game-system rule value from inside a formula. rule_get(name)
     # -> the rule's effective value, or None if unknown.
     "rule_get",
+    # Match-clock primitives (no args). round_number() -> current round
+    # (1-based); turn_index() -> 0-based position of the acting entity
+    # in the round's turn order. For cadence checks ('every N rounds',
+    # 'first turn of the round') and round-measured cooldowns.
+    "round_number", "turn_index",
     # Match-wide entity queries (no reference entity; all loopable). Each
     # returns a list of ALIVE entity ids:
     #   all_entities()                -> every alive entity, insertion order
@@ -3273,6 +3278,26 @@ class FormulaEngine:
                 raise FormulaError("rule_get(name): name must be a string.")
             return match.rules.get(name)
         ns["rule_get"] = _rule_get
+
+        def _round_number() -> int:
+            """round_number(): the match's current round number (1-based;
+            starts at 1, increments each time turn order wraps back to
+            the first entity). The time primitive for cadence checks —
+            'every 3 rounds', 'after round 5', cooldowns measured in
+            rounds. During an on_round_start hook it already reflects
+            the round just begun. Example: a tile pulse that fires on
+            multiples of N -> `if round_number() % 3 == 0: ...`."""
+            return int(match.round_number)
+        ns["round_number"] = _round_number
+
+        def _turn_index() -> int:
+            """turn_index(): the 0-based position of the acting entity
+            within the current round's turn order (match.active_index).
+            Companion to round_number for finer-grained timing — e.g.
+            'only on the first turn of the round' is `turn_index() ==
+            0`. Returns 0 when turn order is empty."""
+            return int(match.active_index)
+        ns["turn_index"] = _turn_index
 
         def _all_entities() -> list:
             """all_entities(): every ALIVE entity id, in
