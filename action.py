@@ -101,14 +101,22 @@ ACTION_RESERVED_BINDINGS = frozenset({
 
 
 class ActionFail(Exception):
-    """Raised by fail(message) inside an action body to abort the
-    body cleanly. The runner catches this, rolls back to pre-state,
-    and replies `❌ <action>: <message>`. NOT a FormulaError — that
-    would be caught and re-wrapped by the formula engine; ActionFail
-    bubbles past the engine's catch so the runner can see it."""
-    def __init__(self, message: str):
+    """Raised by fail(...) inside an action body to abort the body
+    cleanly. The runner catches this, rolls back to pre-state, and
+    replies `❌ <action>: [<reason>] <message>` (reason is dropped
+    from the prefix when empty). NOT a FormulaError — that would be
+    caught and re-wrapped by the formula engine; ActionFail bubbles
+    past the engine's catch so the runner can see it.
+
+    `reason` is a free-form GM-chosen tag — "cost", "out_of_range",
+    "invalid_target", etc. — surfaced to on_action_failed passives
+    via the `fail_reason` binding. Empty string means "no reason
+    tag" (the single-arg `fail("msg")` form)."""
+
+    def __init__(self, message: str, *, reason: str = ""):
         super().__init__(message)
         self.message = message
+        self.reason = reason
 
 
 class ActionValidationError(VTTError):
@@ -778,14 +786,31 @@ async def run_action(
         )
         _sync_dispatch(coro)
 
-    def _fail(message: Any) -> None:
-        """fail('reason'): abort the action body cleanly. The runner
-        catches ActionFail, rolls back to pre-state, and surfaces
-        `❌ <action>: <message>`. Always raises — control does NOT
-        return to the body."""
-        if not isinstance(message, str):
-            message = str(message)
-        raise ActionFail(message)
+    def _fail(*fail_args: Any) -> None:
+        """fail(message) | fail(reason, message): abort the action
+        body cleanly. The runner catches ActionFail, rolls back to
+        pre-state, fires on_action_failed (when reachable), and
+        surfaces `❌ <action>: [<reason>] <message>` (the [reason]
+        prefix is dropped when reason is empty). Always raises —
+        control does NOT return to the body.
+
+        Reason is a GM-chosen tag like "cost", "out_of_range",
+        "invalid_target". It's surfaced to on_action_failed passives
+        via the `fail_reason` binding so reactive logic can
+        discriminate between failure modes."""
+        if len(fail_args) == 1:
+            reason = ""
+            message = str(fail_args[0])
+        elif len(fail_args) == 2:
+            reason = str(fail_args[0])
+            message = str(fail_args[1])
+        else:
+            raise ActionFail(
+                "fail() takes 1 or 2 arguments: fail(message) or "
+                "fail(reason, message).",
+                reason="usage",
+            )
+        raise ActionFail(message, reason=reason)
 
     bindings = {
         "source": source,
@@ -810,15 +835,32 @@ async def run_action(
             )
         except ActionFail as af:
             # Clean GM-initiated abort. Roll back to pre-state and
-            # surface as a False return so the caller (use_action /
-            # the !action handler) can branch on it. Buffered command
-            # echoes are DISCARDED — the action rolled back, so its
-            # partial command output would be misleading.
+            # surface as a (False, (reason, message)) return so the
+            # caller (use_action / the !action handler) can branch on
+            # it. Buffered command echoes are DISCARDED — the action
+            # rolled back, so its partial command output would be
+            # misleading.
             _rollback_match(match, mgr, pre_state)
             match._action_depth = pre_action_depth
             if is_top_level:
                 match._runtime_buffer = None
-            return False, af.message
+            # Fire on_action_failed AFTER rollback so passives
+            # observing the failure see pre-action state (matching
+            # the on_action_used contract of "see settled state").
+            # Only the ACTOR-side passives fire — failed actions
+            # don't have a settled target side. Engine faults
+            # (recursion limit) deliberately skip this hook because
+            # they're bugs, not GM-controlled outcomes.
+            match.fire_action_failed(
+                actor_id=actor_id,
+                action_name=action.name,
+                action_path=action.full_path,
+                target=target,
+                args=dict(args),
+                fail_reason=af.reason,
+                fail_message=af.message,
+            )
+            return False, (af.reason, af.message)
         except ActionEngineFault:
             # Engine refusal (recursion limit etc.). Roll back AND
             # re-raise — these don't get translated to a False
@@ -854,6 +896,28 @@ async def run_action(
         target=target,
         args=dict(args),
     )
+    # Target-side hook: fires on each ENTITY target after the
+    # actor-side hook. For target=entity, fires once on that target.
+    # For target=entity_list, once per eid. For location /
+    # location_list / none, doesn't fire — there's no entity target.
+    # The hook gives reactive passives a place to live: "shield
+    # reflects melee", "trap counters attacker", etc. Inside the
+    # hook, `self` binds to the target (the entity being acted on),
+    # `actor` binds to the entity that used the action.
+    target_eids: List[str] = []
+    if action.target_type == "entity" and isinstance(target, str):
+        if target in match.entities:
+            target_eids.append(target)
+    elif action.target_type == "entity_list" and isinstance(target, list):
+        target_eids = [t for t in target if isinstance(t, str) and t in match.entities]
+    for tid in target_eids:
+        match.fire_action_used_on_target(
+            target_id=tid,
+            actor_id=actor_id,
+            action_name=action.name,
+            action_path=action.full_path,
+            args=dict(args),
+        )
     # Flush buffered command output through the real (awaitable) reply
     # context. Only the TOP-LEVEL action flushes — nested sub-actions
     # accumulated into the same shared buffer. This runs in async land

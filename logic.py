@@ -942,9 +942,35 @@ HOOK_NAMES: Set[str] = {
     #                 or None (target=none).
     #   args          the args dict the GM passed (key=value tokens).
     # Failed actions (fail() / rollback) do NOT fire this hook — only
-    # successful completions do. A separate on_action_failed hook is
-    # deferred to a follow-up PR.
+    # successful completions do; the on_action_failed hook below
+    # covers the rollback path.
     "on_action_used",
+    # Target-side companion to on_action_used. Fires on EACH ENTITY
+    # the action targeted, AFTER the actor-side on_action_used has
+    # run. For target=entity, fires once on that target. For
+    # target=entity_list, fires once per eid (insertion order).
+    # For location / location_list / none, does NOT fire — there's
+    # no entity-side target. Inside the hook, `self` binds to the
+    # target (the entity being acted on); `actor` binds to the
+    # entity that USED the action. Other bindings (action_name,
+    # action_path, args) match on_action_used. This is where
+    # reactive defender logic lives — "shield reflects melee",
+    # "trap counters attacker", "this entity has resistance to
+    # actions whose action_path starts with `inventory.poison.`".
+    "on_action_used_on_target",
+    # Failure event. Fires on the ACTOR after a clean fail() abort —
+    # AFTER the runner has rolled back to pre-state, so passives see
+    # the unchanged world (matching on_action_used's "see settled
+    # state" contract). Bindings:
+    #   action_name, action_path, target, args  — same as
+    #   on_action_used
+    #   fail_reason   the GM-supplied tag from fail(reason, msg),
+    #                 or "" for the single-arg fail(msg) form
+    #   fail_message  the human-readable failure message
+    # Engine faults (recursion limit, internal invariants) DON'T
+    # fire this hook — they're bugs, not GM-controlled outcomes,
+    # and observing them with a passive would mask the diagnostic.
+    "on_action_failed",
     # Per-step movement event. Fires ONCE PER CELL traversed during a
     # stepwise move (Entity.move_dirs), AFTER the position changes for
     # that step — so `entity[self].x/.y` refer to the just-entered
@@ -3883,6 +3909,7 @@ class Match:
             "action_path": action_path,
             "target": target,
             "args": args,
+            "actor": actor_id,
             "hook_name": "on_action_used",
         }
         ctx = EvalCtx(this=this_id, target=actor_id, extras=extras)
@@ -3894,6 +3921,101 @@ class Match:
                 ))
         for p in e.passives.values():
             if p.when == "on_action_used":
+                log.append(_run_passive_safely(
+                    engine, p, ctx, target_id=actor_id, is_global=False,
+                ))
+        return log
+
+    def fire_action_used_on_target(
+        self, *,
+        target_id: str,
+        actor_id: str,
+        action_name: str,
+        action_path: str,
+        args: Dict[str, Any],
+    ) -> List[str]:
+        """Fire on_action_used_on_target passives on a SPECIFIC target
+        entity. Called once per entity by the action runner (for
+        target=entity, once total; for target=entity_list, once per
+        eid). `self` binds to the TARGET; `actor` to the entity that
+        used the action; `target` shadows to the same eid as self
+        (it's the resolved-for-this-fire target, not the original
+        list). action_name / action_path / args match on_action_used."""
+        e = self.entities.get(target_id)
+        if e is None:
+            return []
+        from formula import FormulaEngine, EvalCtx
+        engine = FormulaEngine(self)
+        this_id = self.current_entity_id()
+        extras = {
+            "action_name": action_name,
+            "action_path": action_path,
+            # Shadow `target` to the per-fire eid so a passive reading
+            # `entity[target].hp` (or comparing `target == self`) sees
+            # this specific defender, not the whole entity_list.
+            "target": target_id,
+            "args": args,
+            "actor": actor_id,
+            "hook_name": "on_action_used_on_target",
+        }
+        ctx = EvalCtx(this=this_id, target=target_id, extras=extras)
+        log: List[str] = []
+        for p in self.global_passives.values():
+            if p.when == "on_action_used_on_target":
+                log.append(_run_passive_safely(
+                    engine, p, ctx, target_id=target_id, is_global=True,
+                ))
+        for p in e.passives.values():
+            if p.when == "on_action_used_on_target":
+                log.append(_run_passive_safely(
+                    engine, p, ctx, target_id=target_id, is_global=False,
+                ))
+        return log
+
+    def fire_action_failed(
+        self, *,
+        actor_id: str,
+        action_name: str,
+        action_path: str,
+        target: Any,
+        args: Dict[str, Any],
+        fail_reason: str,
+        fail_message: str,
+    ) -> List[str]:
+        """Fire on_action_failed passives on the ACTOR after a clean
+        fail() abort. The runner has already rolled back to
+        pre-state by the time this fires, so passives see the
+        unchanged world (not the partial in-flight state). Engine
+        faults (recursion limit, internal invariants) deliberately
+        skip this hook — those are bugs, not GM-controlled outcomes.
+
+        Bindings: action_name, action_path, target, args, actor,
+        fail_reason (GM-supplied tag or ""), fail_message."""
+        e = self.entities.get(actor_id)
+        if e is None:
+            return []
+        from formula import FormulaEngine, EvalCtx
+        engine = FormulaEngine(self)
+        this_id = self.current_entity_id()
+        extras = {
+            "action_name": action_name,
+            "action_path": action_path,
+            "target": target,
+            "args": args,
+            "actor": actor_id,
+            "fail_reason": fail_reason,
+            "fail_message": fail_message,
+            "hook_name": "on_action_failed",
+        }
+        ctx = EvalCtx(this=this_id, target=actor_id, extras=extras)
+        log: List[str] = []
+        for p in self.global_passives.values():
+            if p.when == "on_action_failed":
+                log.append(_run_passive_safely(
+                    engine, p, ctx, target_id=actor_id, is_global=True,
+                ))
+        for p in e.passives.values():
+            if p.when == "on_action_failed":
                 log.append(_run_passive_safely(
                     engine, p, ctx, target_id=actor_id, is_global=False,
                 ))

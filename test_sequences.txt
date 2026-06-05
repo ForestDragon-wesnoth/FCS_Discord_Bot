@@ -7734,3 +7734,224 @@ source.range = 6 and 5 <= 6, so the shot lands: target1 drops
 damage scaling — the gate threshold lives in vars and the
 body reads it live through the source proxy, so upgrading a
 weapon's range needs no body edit.
+
+
+SCENARIO 308 — !action list / !action info introspect available actions
+------------------------------------------------------------------------
+
+!match new mac33 ActionIntrospect 6 6
+!match use mac33
+!ent add hero Hero 30 1 1 10
+!ent set_var hero inventory.sword.damage 5
+!ent set_var hero inventory.sword.actions.slice.target entity
+!ent set_var hero inventory.sword.actions.slice.description "Slash"
+!ent set_var hero inventory.sword.actions.slice.body "entity[target].hp = entity[target].hp - source.damage"
+!ent set_var hero actions.rest.target none
+!ent set_var hero actions.rest.description "Catch your breath"
+!ent set_var hero actions.rest.body "entity[self].hp = entity[self].hp + 1"
+!action list hero
+!action info hero rest
+!action info hero slice
+!action info hero nosuch
+
+Expected:
+- `!action list hero` lists both actions, sorted by name:
+    - rest (target: none, at (entity root)) — Catch your breath
+    - slice (target: entity, at inventory.sword) — Slash
+- `!action info hero rest` shows path = `actions.rest`,
+  container = `(entity root)`, target = none, description, and
+  the body block.
+- `!action info hero slice` shows path = `inventory.sword.actions
+  .slice`, container = `inventory.sword`, and the body.
+- `!action info hero nosuch` -> "❌ no action `nosuch` on `hero`.
+  Available: `rest`, `slice`."
+
+
+SCENARIO 309 — !action list on an entity with no actions
+---------------------------------------------------------
+
+!match new mac34 ActionListEmpty 6 6
+!match use mac34
+!ent add bare Bare 30 1 1 10
+!action list bare
+
+Expected: "No actions discoverable on `bare`. Add one by setting
+`<container>.actions.<name>.body` ..." — friendly hint rather
+than a bare empty list.
+
+
+SCENARIO 310 — !find action:NAME predicate
+-------------------------------------------
+
+!match new mac35 ActionFindPred 6 6
+!match use mac35
+!ent add a A 30 1 1 10
+!ent add b B 30 2 2 9
+!ent add c C 30 3 3 8
+!ent set_var a inventory.sword.actions.slice.target entity
+!ent set_var a inventory.sword.actions.slice.body "entity[target].hp = entity[target].hp - 5"
+!ent set_var b skills.dodge.actions.evade.target none
+!ent set_var b skills.dodge.actions.evade.body "entity[self].hp = entity[self].hp + 0"
+!ent set_var c inventory.sword.actions.slice.target entity
+!ent set_var c inventory.sword.actions.slice.body "entity[target].hp = entity[target].hp - 3"
+!find action:slice
+!find action:evade
+!find action:nosuch
+!find action:slice hp>=30
+
+Expected:
+- `action:slice` -> A and C (both have a slice action).
+- `action:evade` -> B only.
+- `action:nosuch` -> "No entities match."
+- `action:slice hp>=30` -> A and C still (AND of predicates;
+  both meet the hp threshold and have slice).
+
+
+SCENARIO 311 — fail(reason, message): reason tag in error output + on_action_failed binding
+---------------------------------------------------------------------------------------------
+
+!match new mac36 ActionFailReason 6 6
+!match use mac36
+!ent add hero Hero 30 1 1 10
+!ent add foe Foe 25 4 4 8
+!ent set_var hero last_reason "init"
+!ent set_var hero last_msg "init"
+!ent set_var hero spells.fireball.cost 50
+!ent set_var hero spells.fireball.actions.cast.target entity
+!ent set_var hero spells.fireball.actions.cast.body "if entity[self].hp < source.cost:\n    fail('cost', 'need ' + str(source.cost) + ' hp, have ' + str(entity[self].hp))\nentity[target].hp = entity[target].hp - 20"
+!passive add hero log_fail on_action_failed "entity[self].last_reason = fail_reason\nentity[self].last_msg = fail_message"
+!action hero cast foe
+!ent dump hero
+!ent dump foe
+
+Expected: hero's hp (30) is BELOW the cost (50), so the body
+hits `fail('cost', 'need 50 hp, have 30')`. The reply is
+`❌ action cast: [cost] need 50 hp, have 30`. The
+on_action_failed passive fires (since this is a clean fail(),
+not an engine fault), and hero's vars record
+`last_reason = "cost"` and `last_msg = "need 50 hp, have 30"`.
+Foe stays at hp 25 — the body's damage line never ran;
+rollback restored pre-state. This is the canonical
+"requirement check + reactive logging" pattern enabled by
+the fail-with-reason + on_action_failed pair.
+
+
+SCENARIO 312 — on_action_used_on_target: defender reacts to attacker
+---------------------------------------------------------------------
+
+!match new mac37 ActionTargetHook 6 6
+!match use mac37
+!ent add hero Hero 30 1 1 10
+!ent add foe Foe 30 4 4 8
+!ent set_var foe hits_taken 0
+!ent set_var foe last_attacker ""
+!ent set_var hero inventory.sword.damage 5
+!ent set_var hero inventory.sword.actions.slice.target entity
+!ent set_var hero inventory.sword.actions.slice.body "entity[target].hp = entity[target].hp - source.damage"
+!passive add foe react on_action_used_on_target "entity[self].hits_taken = entity[self].hits_taken + 1\nentity[self].last_attacker = actor"
+!action hero slice foe
+!ent dump foe
+!action hero slice foe
+!ent dump foe
+
+Expected: After each !action, foe's `hits_taken` increments by
+1 and `last_attacker` is set to `"hero"`. The passive runs with
+`self` = foe (the defender) and `actor` = hero. Foe's hp drops
+5 each time (30 -> 25 -> 20) from the action body's write,
+which happens BEFORE on_action_used_on_target fires.
+
+
+SCENARIO 313 — on_action_used_on_target fires once per entity_list target
+---------------------------------------------------------------------------
+
+!match new mac38 ActionTargetList 6 6
+!match use mac38
+!ent add hero Hero 30 1 1 10
+!ent add g1 G1 30 3 3 8
+!ent add g2 G2 30 4 4 7
+!ent add g3 G3 30 5 5 6
+!ent set_var g1 reactions 0
+!ent set_var g2 reactions 0
+!ent set_var g3 reactions 0
+!ent set_var hero spells.chain.actions.zap.target entity_list
+!ent set_var hero spells.chain.actions.zap.body "for eid in target:\n    entity[eid].hp = entity[eid].hp - 3"
+!passive add g1 r1 on_action_used_on_target "entity[self].reactions = entity[self].reactions + 1"
+!passive add g2 r2 on_action_used_on_target "entity[self].reactions = entity[self].reactions + 1"
+!passive add g3 r3 on_action_used_on_target "entity[self].reactions = entity[self].reactions + 1"
+!action hero zap g1 g2 g3
+!ent dump g1
+!ent dump g2
+!ent dump g3
+
+Expected: Each goblin's `reactions` is now 1 (the hook fires
+ONCE per entity in the entity_list). All three lose 3 hp from
+the body's loop. Insertion order matters for the firing order
+(g1, then g2, then g3) — visible if you check log lines.
+
+
+SCENARIO 314 — Retaliation pattern: target-side hook deals damage back to attacker
+------------------------------------------------------------------------------------
+
+!match new mac39 ActionRetaliate 6 6
+!match use mac39
+!ent add hero Hero 30 1 1 10
+!ent add thorn Thorn 30 4 4 8
+!ent set_var thorn thorns 4
+!ent set_var hero inventory.sword.damage 5
+!ent set_var hero inventory.sword.actions.slice.target entity
+!ent set_var hero inventory.sword.actions.slice.body "entity[target].hp = entity[target].hp - source.damage"
+!passive add thorn retaliate on_action_used_on_target "entity[actor].hp = entity[actor].hp - entity[self].thorns"
+!action hero slice thorn
+!ent dump hero
+!ent dump thorn
+
+Expected: Hero slashes thorn for 5 damage (thorn: 30 -> 25).
+The target-side hook then fires on thorn — `self` = thorn,
+`actor` = hero — and writes `entity[actor].hp = entity[actor]
+.hp - 4`. Hero: 30 -> 26. This is the canonical "thorns"
+pattern, built entirely from the new on_action_used_on_target
+hook and the existing entity[X].path write — no hardcoded
+retaliation system. Note: passives can't dispatch `!commands`
+via cmd() (that's an action-mode-only binding); direct vars
+writes are the passive-side mutation surface.
+
+
+SCENARIO 315 — on_action_failed doesn't fire on engine faults (recursion limit)
+---------------------------------------------------------------------------------
+
+!match new mac40 ActionFailedEngineFault 6 6
+!match use mac40
+!system set default action_recursion_limit 3
+!ent add hero Hero 30 1 1 10
+!ent set_var hero engine_fault_count 0
+!ent set_var hero actions.bounce.target none
+!ent set_var hero actions.bounce.body "use_action(self, 'bounce')"
+!passive add hero log on_action_failed "entity[self].engine_fault_count = entity[self].engine_fault_count + 1"
+!action hero bounce
+!ent dump hero
+
+Expected: The recursion-limit engine fault aborts the chain
+and surfaces as `❌ action bounce: action recursion limit
+reached (3). ...`. The on_action_failed passive does NOT fire
+(engine faults are bugs, not GM-controlled outcomes), so
+`engine_fault_count` stays at 0.
+
+
+SCENARIO 316 — Single-arg fail("msg") works alongside two-arg form
+-------------------------------------------------------------------
+
+!match new mac41 ActionFailSingleArg 6 6
+!match use mac41
+!ent add hero Hero 30 1 1 10
+!ent set_var hero last_reason "init"
+!ent set_var hero last_msg "init"
+!ent set_var hero actions.giveup.target none
+!ent set_var hero actions.giveup.body "fail('I give up')"
+!passive add hero log on_action_failed "entity[self].last_reason = fail_reason\nentity[self].last_msg = fail_message"
+!action hero giveup
+!ent dump hero
+
+Expected: Single-arg `fail("I give up")` produces reply
+`❌ action giveup: I give up` (no `[reason]` prefix because
+reason is empty). The passive sees fail_reason = "" and
+fail_message = "I give up".
