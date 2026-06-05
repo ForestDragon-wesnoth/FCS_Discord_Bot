@@ -8178,3 +8178,36 @@ armor=5) and summons `golem2` with armor=5 — proving the
 summoned copy is independent of both the prototype and the
 stored blueprint (deep-copied at summon time). The two summons
 use distinct cells so neither hits the other's occupancy.
+
+
+SCENARIO 325 — round_number() / turn_index() match-clock primitives
+--------------------------------------------------------------------
+
+!match new mrn1 RoundClock 6 6
+!match use mrn1
+!ent add a A 30 1 1 10
+!ent add b B 30 2 2 9
+!eval "round_number()"
+!ent set_var a pulse 0
+!passive add a clock on_round_start "if round_number() % 2 == 0:\n    entity[self].pulse = round_number()"
+!turn next
+!turn next
+!turn next
+!turn next
+!ent dump a
+!eval "round_number()"
+!eval "turn_index()"
+
+Expected: `round_number()` is 1 at match start. The passive on
+`a` watches on_round_start and, only on EVEN rounds, records
+the current round into `pulse`. The first `turn next` BEGINS
+round 1 (fires the round-start hook for round 1 — odd, so pulse
+stays 0). With two entities, the round wraps to 2 on the third
+`turn next` (a comes round again), firing on_round_start with
+round_number() == 2 — even, so `pulse` is set to 2. The fourth
+advance moves to b's turn, still round 2. So after four
+advances: `a.pulse` == 2, `round_number()` returns 2, and
+`turn_index()` returns 1 (b is at position 1 in turn order).
+These are the cadence primitives for "every N rounds" effects,
+round-measured cooldowns, and "first turn of the round" checks
+— no need to hand-track a counter in vars.
