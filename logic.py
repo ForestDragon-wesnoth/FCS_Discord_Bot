@@ -473,6 +473,22 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "for-loop counts toward the total."
         ),
     },
+    "summon_event_limit": {
+        "default": 50,
+        "schema": {"type": "int"},
+        "desc": (
+            "Maximum number of entities that may be summoned during a "
+            "single top-level command (including all hook fires and "
+            "action bodies it triggers). Guards against a runaway "
+            "summon loop — e.g. an on_entity_spawned passive that "
+            "summons another entity whose spawn hook summons again. "
+            "The counter resets at the start of every command; "
+            "exceeding the cap raises a clear error rather than "
+            "hanging. Default 50 is far above any legitimate "
+            "single-command burst (a mass-summon ritual); raise it "
+            "if a system genuinely needs bigger waves."
+        ),
+    },
     # ---- Action system --------------------------------------------------
     # Actions are GM-defined effect bundles stored under entity.vars at any
     # path ending in `.actions.<name>`. Each action is a dict with `body`
@@ -2840,6 +2856,12 @@ class Match:
     # the real context after the body completes. None when no action is
     # running. Not serialized — purely transient dispatch state.
     _runtime_buffer: Any = field(default=None, repr=False, compare=False)
+    # Per-command summon counter, reset to 0 at the start of every
+    # top-level command dispatch (see CommandRegistry.run). Incremented
+    # by summon_entity; once it reaches summon_event_limit, further
+    # summons in the same command raise. Not serialized — transient
+    # safety state.
+    _summon_count: int = field(default=0, repr=False, compare=False)
 
     # ---- global constraints / helpers (unchanged in spirit) ----
     def in_bounds(self, x: int, y: int) -> bool:
@@ -4020,6 +4042,149 @@ class Match:
                     engine, p, ctx, target_id=actor_id, is_global=False,
                 ))
         return log
+
+    # ---- summon / entity-template helpers --------------------------------
+    # A "template" is just an entity-shaped dict (Entity.to_dict output,
+    # optionally with id/x/y omitted). It lives in ordinary storage —
+    # an entity's vars, a tile's data, wherever the GM put it. There is
+    # NO first-class template type; summon_entity turns any such dict
+    # into a live entity. This is the "what X does is stored in X"
+    # philosophy: a summoner stores its minion as data, and the summon
+    # primitive is the only engine-side machinery.
+
+    @staticmethod
+    def entity_template_dict(e: "Entity") -> Dict[str, Any]:
+        """Snapshot a live entity into a summon-ready template dict.
+        Strips id and position — those are assigned at summon time, so
+        a template never carries a stale id (which would collide) or a
+        fixed cell. Everything else (name, vars, status, passives,
+        clamps, facing) carries over."""
+        d = e.to_dict()
+        d.pop("id", None)
+        d.pop("x", None)
+        d.pop("y", None)
+        return d
+
+    def mint_entity_id(self, prefix: str) -> str:
+        """Return an id not currently in use, derived from `prefix`.
+        `prefix` itself if free, else prefix2, prefix3, ... The scan
+        is against live entity ids only — a summoned skeleton becomes
+        `skeleton`, the next `skeleton2`, and so on. Prefix is
+        sanitized to a reasonable id token (whitespace/dots stripped)
+        and lower-cased; falls back to 'summon' if it empties out."""
+        base = "".join(
+            ch for ch in str(prefix).strip().lower().replace(" ", "_")
+            if ch.isalnum() or ch in ("_", "-")
+        ) or "summon"
+        if base not in self.entities:
+            return base
+        n = 2
+        while f"{base}{n}" in self.entities:
+            n += 1
+        return f"{base}{n}"
+
+    def summon_entity(
+        self, template: Any, x: int, y: int, *,
+        id_prefix: Optional[str] = None,
+        near_radius: Optional[int] = None,
+    ) -> Tuple[str, List[str]]:
+        """Instantiate a live entity from a template dict and place it.
+
+        template     an entity-shaped dict (Entity.to_dict output, with
+                     id/x/y optional — they're overridden here).
+        x, y         the desired cell.
+        id_prefix    base for the minted id; defaults to the template's
+                     `name`, then its `id`, then "summon".
+        near_radius  None = STRICT placement (raises OutOfBounds /
+                     Occupied if (x,y) isn't free). A non-negative int
+                     = ring-search outward (Chebyshev) up to that
+                     radius for the first free in-bounds cell, raising
+                     only if none is found.
+
+        Returns (new_entity_id, log_lines) — log_lines carries any
+        on_entity_spawned passive output, same as Entity.spawn. The
+        summoned entity joins turn order by its initiative.
+
+        Guarded by the summon_event_limit rule: the per-command summon
+        counter (_summon_count) is checked and incremented here, so a
+        runaway summon chain raises instead of hanging."""
+        if not isinstance(template, dict):
+            raise VTTError(
+                f"summon: template must be an entity dict, got "
+                f"{type(template).__name__}."
+            )
+        limit = int(self.rules.get("summon_event_limit", 50))
+        if self._summon_count >= limit:
+            raise VTTError(
+                f"summon_event_limit reached ({limit}) — too many "
+                f"entities summoned in one command. Likely a runaway "
+                f"summon loop; raise the rule if this is intentional."
+            )
+
+        # Resolve placement.
+        if not isinstance(x, int) or isinstance(x, bool) \
+                or not isinstance(y, int) or isinstance(y, bool):
+            raise VTTError("summon: x and y must be integers.")
+        place_x, place_y = x, y
+        if near_radius is not None:
+            place = self._find_free_cell_near(x, y, int(near_radius))
+            if place is None:
+                raise Occupied(
+                    f"summon_near: no free in-bounds cell within "
+                    f"radius {near_radius} of ({x},{y})."
+                )
+            place_x, place_y = place
+        else:
+            if not self.in_bounds(place_x, place_y):
+                raise OutOfBounds(
+                    f"summon: ({place_x},{place_y}) is off-grid "
+                    f"({self.grid_width}x{self.grid_height})."
+                )
+            if self.is_occupied(place_x, place_y):
+                raise Occupied(
+                    f"summon: cell ({place_x},{place_y}) is occupied. "
+                    f"Use summon_near to search for a free cell."
+                )
+
+        # Build the concrete entity dict: copy the template, then
+        # override id/x/y. We deep-copy so the summoned entity doesn't
+        # alias the stored template's nested dicts (mutating the minion
+        # later must not edit the stored blueprint).
+        prefix = id_prefix or template.get("name") or template.get("id") or "summon"
+        new_id = self.mint_entity_id(prefix)
+        d = copy.deepcopy(template)
+        d["id"] = new_id
+        d["x"] = place_x
+        d["y"] = place_y
+        e = Entity.from_dict(d)
+        # Entity.spawn validates bounds/occupancy again (cheap) and
+        # fires on_entity_spawned. We pre-validated for a clean error
+        # message; spawn's checks are the authoritative gate.
+        self._summon_count += 1
+        _, log = e.spawn(self, place_x, place_y)
+        return new_id, log
+
+    def _find_free_cell_near(
+        self, x: int, y: int, radius: int,
+    ) -> Optional[Tuple[int, int]]:
+        """Ring-search outward from (x,y) for the first free in-bounds
+        cell, distance 0..radius (Chebyshev). Returns (cx,cy) or None.
+        Deterministic order: rings nearest-first, and within a ring by
+        (dy, dx) so summon_near placement is reproducible."""
+        for r in range(0, max(0, radius) + 1):
+            if r == 0:
+                candidates = [(x, y)]
+            else:
+                candidates = []
+                for dy in range(-r, r + 1):
+                    for dx in range(-r, r + 1):
+                        # Only the ring shell at exactly Chebyshev r.
+                        if max(abs(dx), abs(dy)) == r:
+                            candidates.append((x + dx, y + dy))
+            for cx, cy in candidates:
+                if self.in_bounds(cx, cy) and not self.is_occupied(cx, cy):
+                    return (cx, cy)
+        return None
 
     def fire_tile_time_hooks(self, when: str) -> List[str]:
         """Fire tile time hooks (on_round_start/end, on_turn_start/end)

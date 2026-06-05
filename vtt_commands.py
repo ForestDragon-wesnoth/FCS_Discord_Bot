@@ -203,6 +203,16 @@ class CommandRegistry:
                     and getattr(m_pre, "_action_depth", 0) == 0):
                 pre_state = m_pre.to_dict(include_history=False)
 
+        # Reset the per-command summon budget on the active match.
+        # summon_entity increments _summon_count and caps it at the
+        # summon_event_limit rule; resetting here makes the budget
+        # "per top-level command" (covering every hook fire and action
+        # body the command triggers). Only the top-level run() resets —
+        # cmd() inside an action uses dispatch_no_snapshot, which does
+        # NOT re-enter run(), so a multi-summon action keeps its budget.
+        if pre_active_mid is not None and pre_active_mid in mgr.matches:
+            mgr.matches[pre_active_mid]._summon_count = 0
+
         try:
             result = await h(ctx, args, mgr)
         except VTTError as e:
@@ -1724,6 +1734,31 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         )
         return
 
+    # ---- !ent store_entity_into_var <src_id> <dest_id> <dest_path> ----
+    # Snapshot a (configured) entity into a summon-ready template dict
+    # and store it at dest's vars[dest_path]. This is the ergonomic way
+    # to BUILD a summon template: configure a real "Fire Elemental"
+    # entity once, then capture it into the summoner's vars. Sugar over
+    # the entity_snapshot() + var_set() formula primitives. Snapshot
+    # strips id/position so the stored dict is a clean blueprint.
+    if sub in ("store_entity_into_var", "store_entity"):
+        if await return_help_if_not_enough_args(ctx, args, 4, "ent", "store_entity_into_var"):
+            return
+        src_id = _resolve_eid(m, args[1])
+        if src_id not in m.entities:
+            raise NotFound(f"Source entity '{src_id}' not found.")
+        dest_id = _resolve_eid(m, args[2])
+        if dest_id not in m.entities:
+            raise NotFound(f"Destination entity '{dest_id}' not found.")
+        dest_path = args[3]
+        template = m.entity_template_dict(m.entities[src_id])
+        m.entities[dest_id].write_var(dest_path, template)
+        return await ctx.send(
+            f"Stored a template of `{src_id}` into `{dest_id}` "
+            f"vars.{dest_path} (id/position stripped — ready to "
+            f"`summon_from('{dest_path}', x, y)`)."
+        )
+
     # Fallback: show authoritative help for the root command
     title, body = registry.help_for(["ent"])
     return await ctx.send(f"**{title}**\n{body}")
@@ -1837,6 +1872,21 @@ registry.annotate_sub(
         "Alias form for `!action <id> <name> [...]` — invokes a "
         "discovered action on `<id>`. See `!help action` for the "
         "full body language and target/args semantics."
+    ),
+)
+registry.annotate_sub(
+    "ent", "store_entity_into_var",
+    usage="!ent store_entity_into_var <src_id> <dest_id> <dest_path>",
+    desc=(
+        "Snapshot `<src_id>` into a summon-ready template dict (id and "
+        "position stripped) and store it at `<dest_id>`'s "
+        "vars.<dest_path>. The ergonomic way to build a summon "
+        "blueprint: configure a real entity, then capture it into the "
+        "summoner's vars (or a tile via formulas). Afterwards a "
+        "formula can instantiate copies with "
+        "`summon_from('<dest_path>', x, y)` (template on `self`) or "
+        "`summon(var_get('<dest_id>','<dest_path>'), x, y)`. Alias: "
+        "`store_entity`."
     ),
 )
 registry.annotate_sub(

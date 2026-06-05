@@ -1148,6 +1148,17 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #                                    clean fail(). Counts toward
     #                                    action_recursion_limit.
     "has_action", "entity_actions", "use_action",
+    # Summon / despawn family. A template is an entity-shaped dict in
+    # ordinary storage (vars / tile data); these turn one into a live
+    # entity and back. All route through Match.summon_entity (shared
+    # summon_event_limit guard + turn-order/on_entity_spawned wiring).
+    #   entity_snapshot(eid)                  -> template dict (id/pos stripped)
+    #   summon(template, x, y, id_prefix=None) -> new id (strict placement)
+    #   summon_near(template, x, y, radius, id_prefix=None) -> new id (ring search)
+    #   summon_from(path, x, y, id_prefix=None) -> new id (template from self's vars)
+    #   remove_entity(eid)                    -> True (despawn)
+    "entity_snapshot", "summon", "summon_near", "summon_from",
+    "remove_entity",
     # Read a game-system rule value from inside a formula. rule_get(name)
     # -> the rule's effective value, or None if unknown.
     "rule_get",
@@ -3263,6 +3274,105 @@ class FormulaEngine:
         ns["has_action"]     = _has_action
         ns["entity_actions"] = _entity_actions
         ns["use_action"]     = _use_action
+
+        # ---- summon / despawn family --------------------------------
+        # A template is an entity-shaped dict living in ordinary
+        # storage (vars / tile data). These primitives turn one into a
+        # live entity (or snapshot a live entity back into a template).
+        # All route through Match.summon_entity, so the
+        # summon_event_limit guard and turn-order/on_entity_spawned
+        # wiring are shared.
+        def _entity_snapshot(eid_t: Any) -> dict:
+            """entity_snapshot(eid): capture an entity into a summon-
+            ready template dict (id and position stripped). Pair with
+            var_set / tile_set to store it, then summon / summon_from
+            to instantiate copies."""
+            _, e = _resolve_entity(eid_t, "entity_snapshot")
+            return match.entity_template_dict(e)
+
+        def _summon(template: Any, x: Any, y: Any, id_prefix: Any = None) -> str:
+            """summon(template, x, y, id_prefix=None): instantiate a
+            live entity from a template dict at exactly (x, y). Raises
+            (off-grid / occupied) if the cell isn't free — use
+            summon_near to ring-search. Returns the new entity id.
+            id_prefix overrides the auto-derived id base (template
+            name, else 'summon'); the engine appends a counter to keep
+            ids unique."""
+            prefix = None if id_prefix is None else str(id_prefix)
+            try:
+                new_id, _log = match.summon_entity(
+                    template, x, y, id_prefix=prefix,
+                )
+            except (VTTError, NotFound) as ex:
+                raise FormulaError(str(ex))
+            engine._note_affected(new_id)
+            return new_id
+
+        def _summon_near(template: Any, x: Any, y: Any, radius: Any,
+                         id_prefix: Any = None) -> str:
+            """summon_near(template, x, y, radius, id_prefix=None): like
+            summon, but searches outward (Chebyshev rings, nearest
+            first) up to `radius` for the first free in-bounds cell.
+            Raises only if no free cell is found in range. Ideal for
+            'spawn a minion adjacent to me' (radius 1)."""
+            if not isinstance(radius, int) or isinstance(radius, bool):
+                raise FormulaError("summon_near: radius must be an int.")
+            prefix = None if id_prefix is None else str(id_prefix)
+            try:
+                new_id, _log = match.summon_entity(
+                    template, x, y, id_prefix=prefix, near_radius=radius,
+                )
+            except (VTTError, NotFound) as ex:
+                raise FormulaError(str(ex))
+            engine._note_affected(new_id)
+            return new_id
+
+        def _summon_from(path: Any, x: Any, y: Any, id_prefix: Any = None) -> str:
+            """summon_from(path, x, y, id_prefix=None): read a template
+            from `self`'s vars at the dotted `path`, then summon it
+            (strict placement). Convenience for the common case where
+            the summoner stores its blueprint in its own vars — e.g. a
+            boss with `minion_template` in vars calls
+            `summon_from('minion_template', x, y)`. For templates in a
+            tile or another entity, fetch with tile_get / var_get and
+            use summon(...) directly."""
+            if not isinstance(path, str) or not path:
+                raise FormulaError("summon_from: path must be a non-empty string.")
+            self_id = ctx.target
+            if self_id is None:
+                raise FormulaError(
+                    "summon_from: no `self` entity bound — call it from a "
+                    "passive / action / `!eval --as <eid>` so `self` "
+                    "resolves the vars owner."
+                )
+            e = match.entities.get(self_id)
+            if e is None:
+                raise FormulaError(f"summon_from: entity '{self_id}' not found.")
+            cur: Any = e.vars
+            for seg in path.split("."):
+                if not isinstance(cur, dict) or seg not in cur:
+                    raise FormulaError(
+                        f"summon_from: `{self_id}` has no template at "
+                        f"vars '{path}'."
+                    )
+                cur = cur[seg]
+            return _summon(cur, x, y, id_prefix)
+
+        def _remove_entity(eid_t: Any) -> bool:
+            """remove_entity(eid): despawn an entity — the complement of
+            summon. Removes it from the match, turn order, and any
+            groups. Returns True. Use for 'minion expires after N
+            turns', 'banish', cleanup of summoned waves. Raises if the
+            id isn't a live entity."""
+            eid, e = _resolve_entity(eid_t, "remove_entity")
+            e.remove()
+            return True
+
+        ns["entity_snapshot"] = _entity_snapshot
+        ns["summon"]          = _summon
+        ns["summon_near"]     = _summon_near
+        ns["summon_from"]     = _summon_from
+        ns["remove_entity"]   = _remove_entity
 
         def _rule_get(name: Any) -> Any:
             """rule_get(name): the effective value of a system rule on
