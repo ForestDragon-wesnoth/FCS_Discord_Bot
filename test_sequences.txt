@@ -7955,3 +7955,259 @@ Expected: Single-arg `fail("I give up")` produces reply
 `❌ action giveup: I give up` (no `[reason]` prefix because
 reason is empty). The passive sees fail_reason = "" and
 fail_message = "I give up".
+
+
+SCENARIO 317 — Summon: capture a template, then summon from it
+---------------------------------------------------------------
+
+!match new msm1 SummonBasic 8 8
+!match use msm1
+!ent add mage Mage 30 2 2 12
+!ent add elem_proto FireElemental 18 1 1 7
+!ent set_var elem_proto atk 6
+!ent set_var elem_proto element fire
+!ent store_entity_into_var elem_proto mage conjure.fire_elemental
+!ent remove elem_proto
+!ent set_var mage conjure.actions.summon_fire.target location
+!ent set_var mage conjure.actions.summon_fire.body "summon(source.fire_elemental, target.x, target.y)"
+!ent action mage summon_fire 4 5
+!ent dump fireelemental
+!list
+
+Expected: `!ent store_entity_into_var elem_proto mage
+conjure.fire_elemental` snapshots the configured FireElemental
+into mage's vars at `conjure.fire_elemental` (id/position
+stripped). The action lives at `conjure.actions.summon_fire`,
+so its `source` proxy is bound to the `conjure` container —
+`source.fire_elemental` reaches the stored template. After
+deleting the prototype, invoking the action with a location
+target summons a live entity at (4,5) with id `fireelemental`
+(minted from the template's name), carrying atk=6 and
+element=fire. The takeaway: a captured entity is just data the
+summon primitive instantiates.
+
+
+SCENARIO 318 — Summon mints unique ids and carries vars + passives
+-------------------------------------------------------------------
+
+!match new msm2 SummonUnique 8 8
+!match use msm2
+!ent add boss Boss 60 4 4 14
+!ent add skel_proto Skeleton 8 1 1 5
+!ent set_var skel_proto atk 3
+!passive add skel_proto onspawn on_entity_spawned "entity[self].spawned_flag = 1"
+!ent store_entity_into_var skel_proto boss minion
+!ent remove skel_proto
+!ent set_var boss actions.raise.target none
+!ent set_var boss actions.raise.body "summon_from('minion', 4, 6)"
+!ent action boss raise
+!ent set_var boss actions.raise2.target none
+!ent set_var boss actions.raise2.body "summon_from('minion', 4, 7)"
+!ent action boss raise2
+!ent dump skeleton
+!ent dump skeleton2
+!list
+
+Expected: First summon mints id `skeleton`; second mints
+`skeleton2` (counter avoids collision). Both carry atk=3 from
+the template, and each fired its on_entity_spawned passive on
+summon (spawned_flag=1). Both join turn order by initiative.
+The template lives on boss as data; mutating a summoned
+skeleton later does not change the blueprint (deep-copied).
+
+
+SCENARIO 319 — Boss passive summons a minion adjacent every turn
+-----------------------------------------------------------------
+
+!match new msm3 SummonEachTurn 10 10
+!match use msm3
+!ent add boss Boss 80 5 5 20
+!ent add hero Hero 30 1 1 10
+!ent add imp_proto Imp 6 1 2 4
+!ent store_entity_into_var imp_proto boss imp
+!ent remove imp_proto
+!passive add boss spawner on_turn_start "summon_near(var_get('boss','imp'), entity[self].x, entity[self].y, 2)"
+!turn next
+!turn next
+!turn next
+!list
+
+Expected: Each time the boss's turn starts, the on_turn_start
+passive summons an Imp in a free cell within radius 2 of the
+boss (Chebyshev ring search). After the boss has had a couple
+of turns, several `imp`, `imp2`, ... entities exist adjacent to
+the boss. summon_near picks the nearest free cell each time, so
+the imps cluster around the boss. (Imps have no spawner passive
+themselves, so they don't cascade.)
+
+
+SCENARIO 320 — Graveyard tile summons a skeleton on a countdown
+----------------------------------------------------------------
+
+!match new msm4 SummonTile 8 8
+!match use msm4
+!ent add hero Hero 30 1 1 10
+!ent add skel_proto Skeleton 8 7 7 5
+!ent set_var skel_proto undead true
+!eval "tile_set(4, 4, 'minion', entity_snapshot('skel_proto'))"
+!eval "tile_set(4, 4, 'countdown', 2)"
+!ent remove skel_proto
+!tile hook add 4 4 on_round_start "tile_set(tile_x, tile_y, 'countdown', tile_get(tile_x, tile_y, 'countdown') - 1)\nif tile_get(tile_x, tile_y, 'countdown') <= 0:\n    summon_near(tile_get(tile_x, tile_y, 'minion'), tile_x, tile_y, 3)\n    tile_set(tile_x, tile_y, 'countdown', 2)"
+!turn next
+!turn next
+!turn next
+!turn next
+!list
+
+Expected: The graveyard tile at (4,4) stores a Skeleton
+template plus a countdown in its own data. Each round start
+decrements the countdown; when it hits 0 the tile summons a
+skeleton near (4,4) and resets the countdown to 2. Over four
+turn advances (each a fresh round, since hero is the only
+turn-order member initially) the countdown reaches 0 twice, so
+two skeletons (`skeleton`, `skeleton2`) appear near the
+graveyard. The cadence lives entirely in the tile's data — no
+round-number primitive needed.
+
+
+SCENARIO 321 — Strict summon fails on occupied; summon_near searches
+---------------------------------------------------------------------
+
+!match new msm5 SummonOccupied 8 8
+!match use msm5
+!ent add boss Boss 40 4 4 12
+!ent add blocker Blocker 10 4 6 8
+!ent add proto Proto 5 1 1 5
+!ent store_entity_into_var proto boss minion
+!ent remove proto
+!ent set_var boss actions.strict.target none
+!ent set_var boss actions.strict.body "summon(var_get('boss','minion'), 4, 6)"
+!ent action boss strict
+!ent set_var boss actions.flex.target none
+!ent set_var boss actions.flex.body "summon_near(var_get('boss','minion'), 4, 6, 2)"
+!ent action boss flex
+!list
+
+Expected: `summon(... 4 6)` targets the cell occupied by
+`blocker`, so the strict summon raises — the action fails and
+rolls back: `❌ action strict: summon: cell (4,6) is
+occupied. Use summon_near to search for a free cell.` No entity
+is added. Then `summon_near(... 4 6 2)` ring-searches outward
+from (4,6), finds a free adjacent cell, and summons `proto`
+there successfully. Final roster: boss, blocker, proto.
+
+
+SCENARIO 322 — remove_entity despawns a summoned minion
+--------------------------------------------------------
+
+!match new msm6 SummonDespawn 8 8
+!match use msm6
+!ent add boss Boss 40 4 4 12
+!ent add proto Proto 5 1 1 5
+!ent store_entity_into_var proto boss minion
+!ent remove proto
+!ent set_var boss actions.raise.target none
+!ent set_var boss actions.raise.body "summon(var_get('boss','minion'), 4, 6)"
+!ent action boss raise
+!list
+!ent set_var boss actions.banish.target entity
+!ent set_var boss actions.banish.body "remove_entity(target)"
+!ent action boss banish proto
+!list
+
+Expected: The raise action summons `proto` at (4,6). The banish
+action then `remove_entity(target)` despawns it — removed from
+the match, turn order, and any groups. Final roster after
+banish: just boss. remove_entity is the despawn complement of
+summon; "minion vanishes after N turns" is built by calling it
+from a passive/action.
+
+
+SCENARIO 323 — summon_event_limit caps summons within one command
+------------------------------------------------------------------
+
+!match new msm7 SummonRunaway 12 12
+!match use msm7
+!system set default summon_event_limit 4
+!ent add boss Boss 40 6 6 12
+!ent add proto Proto 5 1 1 5
+!ent store_entity_into_var proto boss minion
+!ent remove proto
+!ent set_var boss actions.mass_summon.target none
+!ent set_var boss actions.mass_summon.body "summon_near(var_get('boss','minion'), 6, 6, 5)\nsummon_near(var_get('boss','minion'), 6, 6, 5)\nsummon_near(var_get('boss','minion'), 6, 6, 5)\nsummon_near(var_get('boss','minion'), 6, 6, 5)\nsummon_near(var_get('boss','minion'), 6, 6, 5)"
+!ent action boss mass_summon
+!list
+
+Expected: The action body tries to summon 5 minions, but
+`summon_event_limit` is 4. The 5th summon raises
+"summon_event_limit reached (4) ..." — a FormulaError that
+propagates out of the action body, which rolls back the WHOLE
+transaction. So NONE of the 4 already-summoned minions persist:
+final roster is boss only. The cap + transactional rollback
+make a misconfigured mass-summon safe inside an action — it
+fails loudly and changes nothing. (Note: when the cap is hit
+inside a PASSIVE cascade instead — e.g. an on_entity_spawned
+that summons — the passive-error swallow means the cascade
+just STOPS at the cap with the partial wave intact, rather
+than rolling back; either way the hang is prevented.)
+
+
+SCENARIO 324 — entity_snapshot + var_set + summon(value form); blueprint independence
+---------------------------------------------------------------------------------------
+
+!match new msm8 SummonSnapshot 8 8
+!match use msm8
+!ent add wizard Wizard 30 2 2 12
+!ent add golem_proto Golem 40 1 1 6
+!ent set_var golem_proto armor 5
+!ent set_var wizard actions.capture_and_summon.target location
+!ent set_var wizard actions.capture_and_summon.body "var_set('wizard', 'blueprint', entity_snapshot('golem_proto'))\nsummon(var_get('wizard','blueprint'), target.x, target.y)"
+!ent action wizard capture_and_summon 4 4
+!ent dump golem
+!ent set_var golem armor 99
+!ent action wizard capture_and_summon 5 5
+!ent dump golem2
+
+Expected: The action snapshots golem_proto into wizard's
+`blueprint` var (via entity_snapshot + var_set), then summons
+from that stored value (`summon(var_get(...), target.x,
+target.y)`) — first at (4,4), minting `golem` with armor=5.
+After bumping the SUMMONED golem's armor to 99, a second
+capture_and_summon at (5,5) re-snapshots the PROTOTYPE (still
+armor=5) and summons `golem2` with armor=5 — proving the
+summoned copy is independent of both the prototype and the
+stored blueprint (deep-copied at summon time). The two summons
+use distinct cells so neither hits the other's occupancy.
+
+
+SCENARIO 325 — round_number() / turn_index() match-clock primitives
+--------------------------------------------------------------------
+
+!match new mrn1 RoundClock 6 6
+!match use mrn1
+!ent add a A 30 1 1 10
+!ent add b B 30 2 2 9
+!eval "round_number()"
+!ent set_var a pulse 0
+!passive add a clock on_round_start "if round_number() % 2 == 0:\n    entity[self].pulse = round_number()"
+!turn next
+!turn next
+!turn next
+!turn next
+!ent dump a
+!eval "round_number()"
+!eval "turn_index()"
+
+Expected: `round_number()` is 1 at match start. The passive on
+`a` watches on_round_start and, only on EVEN rounds, records
+the current round into `pulse`. The first `turn next` BEGINS
+round 1 (fires the round-start hook for round 1 — odd, so pulse
+stays 0). With two entities, the round wraps to 2 on the third
+`turn next` (a comes round again), firing on_round_start with
+round_number() == 2 — even, so `pulse` is set to 2. The fourth
+advance moves to b's turn, still round 2. So after four
+advances: `a.pulse` == 2, `round_number()` returns 2, and
+`turn_index()` returns 1 (b is at position 1 in turn order).
+These are the cadence primitives for "every N rounds" effects,
+round-measured cooldowns, and "first turn of the round" checks
+— no need to hand-track a counter in vars.
