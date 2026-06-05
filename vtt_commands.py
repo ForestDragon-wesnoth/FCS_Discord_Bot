@@ -1840,6 +1840,26 @@ registry.annotate_sub(
     ),
 )
 registry.annotate_sub(
+    "action", "list",
+    usage="!action list <eid>",
+    desc=(
+        "Enumerate every discoverable action on `<eid>` — one line "
+        "per action with its target type, container path, and "
+        "description. Respects the action_container_* rules the "
+        "same way the invocation path does."
+    ),
+)
+registry.annotate_sub(
+    "action", "info",
+    usage="!action info <eid> <name>",
+    desc=(
+        "Full detail for one action on `<eid>` — path, container, "
+        "target type, description, and the body source. Accepts a "
+        "bare name (with disambiguation menu on collision) or a "
+        "full vars path."
+    ),
+)
+registry.annotate_sub(
     "ent", "status",
     usage=(
         "!ent status <id> <add|remove|clear|list|info|set|del> [name] "
@@ -2000,6 +2020,7 @@ def _parse_find_predicate(token: str) -> Tuple[str, str, Optional[str]]:
     """Return (kind, key, value). kind is one of:
         "status"  — status:NAME            (value is None, key is NAME)
         "group"   — group:NAME             (value is None, key is NAME)
+        "action"  — action:NAME            (value is None, key is NAME)
         "<op>"    — one of =, !=, <, <=, >, >=  (key is var path, value is RHS)
     Raises VTTError on malformed input."""
     if token.startswith("status:"):
@@ -2012,6 +2033,11 @@ def _parse_find_predicate(token: str) -> Tuple[str, str, Optional[str]]:
         if not name:
             raise VTTError("`group:` predicate needs a group name.")
         return "group", name, None
+    if token.startswith("action:"):
+        name = token[len("action:"):]
+        if not name:
+            raise VTTError("`action:` predicate needs an action name.")
+        return "action", name, None
     # Try operators longest-first so `<=` isn't misread as `<`.
     for op in _FIND_OPS:
         idx = token.find(op)
@@ -2019,7 +2045,7 @@ def _parse_find_predicate(token: str) -> Tuple[str, str, Optional[str]]:
             return op, token[:idx], token[idx + len(op):]
     raise VTTError(
         f"Unrecognized find predicate `{token}`. Expected `key=value`, "
-        f"`key<value`, `status:NAME`, or `group:NAME`."
+        f"`key<value`, `status:NAME`, `group:NAME`, or `action:NAME`."
     )
 
 
@@ -2063,6 +2089,17 @@ def _find_match_entity(m: Match, e: Entity, predicates: List[Tuple[str, str, Opt
             if e.id not in (m.groups.get(key) or []):
                 return False
             continue
+        if kind == "action":
+            # Action discovery walks the vars tree and respects the
+            # match's container-scope rules — same lookup the
+            # !action handler uses, so a `!find action:slice` query
+            # answer is consistent with "will `!action <eid> slice`
+            # find anything?".
+            from action import discover_actions, lookup_action
+            actions = discover_actions(e, m.rules)
+            if not lookup_action(actions, key, m.rules):
+                return False
+            continue
         # Var-comparison forms. Missing var never matches any operator
         # (including !=) — that keeps "team=red" from spuriously
         # matching entities that don't have a team set at all.
@@ -2104,10 +2141,12 @@ def _find_match_entity(m: Match, e: Entity, predicates: List[Tuple[str, str, Opt
         "Query entities by AND-ed predicates. Predicate forms: "
         "`var=value`, `var!=value`, `var<value`, `var<=value`, "
         "`var>value`, `var>=value` for vars; `status:NAME` for a status "
-        "flag; `group:NAME` for group membership. Dotted var paths walk "
+        "flag; `group:NAME` for group membership; `action:NAME` for "
+        "discoverable-action availability. Dotted var paths walk "
         "nested dicts (`inventory.sword.damage>5`). Example: "
-        "`!find team=red hp<20 status:bleeding` lists all red-team "
-        "entities below 20 HP that are bleeding."
+        "`!find team=red hp<20 status:bleeding action:slice` lists "
+        "every red-team entity below 20 HP that is bleeding AND has "
+        "a `slice` action available."
     ),
     snapshot=False,
 )
@@ -4735,26 +4774,55 @@ async def eval_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 @registry.command(
     "action",
-    usage="!action <eid> <name> [target...] [k=v ...]",
+    usage=(
+        "!action <eid> <name> [target...] [k=v ...] | "
+        "!action list <eid> | !action info <eid> <name>"
+    ),
     desc=(
-        "Invoke an action discovered anywhere in `<eid>`'s vars tree. "
-        "Actions are dicts at any path ending in `actions.<name>` with "
-        "a `body` (a formula program), optional `description`, and "
-        "optional `target` (entity/location/entity_list/location_list/"
-        "none). The leading tokens after the action name are the "
-        "target (shape depends on the action's declared type); any "
-        "`key=value` tokens after that go into the `args` dict the "
-        "body can read. On a clean `fail(\"msg\")` the runner rolls "
-        "back and replies ❌; on a successful run, `on_action_used` "
-        "fires. `<eid>` accepts `self`/`this`/`current`. When two "
+        "Invoke an action discovered anywhere in `<eid>`'s vars tree, "
+        "or introspect with `list` / `info`. Actions are dicts at any "
+        "path ending in `actions.<name>` with a `body` (a formula "
+        "program), optional `description`, and optional `target` "
+        "(entity/location/entity_list/location_list/none). The leading "
+        "tokens after the action name are the target (shape depends "
+        "on the action's declared type); any `key=value` tokens after "
+        "that go into the `args` dict the body can read. On a clean "
+        "`fail(reason, msg)` the runner rolls back and replies "
+        "`❌ action <name>: [<reason>] <msg>`; on a successful run, "
+        "`on_action_used` + per-target `on_action_used_on_target` "
+        "fire. `<eid>` accepts `self`/`this`/`current`. When two "
         "actions share a name the handler shows a numbered "
-        "disambiguation menu."
+        "disambiguation menu — re-issue with the full path."
     ),
 )
 async def action_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if await return_help_if_not_enough_args(ctx, args, 2, "action"):
         return
     m = active_match(mgr, ctx)
+    # `list` / `info` are introspection subcommands. Recognized by
+    # the LEADING token, which makes them mutually exclusive with
+    # the bare-invocation form (`!action <eid> <name> ...`) — no
+    # entity can be named `list` because of entity-id sanity checks
+    # at !ent add time, and even if one were, the user types the
+    # subcommand explicitly. We branch BEFORE the entity-existence
+    # check so `!action list` (no eid) shows a usage error rather
+    # than an "entity 'list' not found".
+    sub = args[0].lower()
+    if sub == "list":
+        if await return_help_if_not_enough_args(ctx, args, 2, "action", "list"):
+            return
+        actor_id = _resolve_eid(m, args[1])
+        if actor_id not in m.entities:
+            raise NotFound(f"Entity '{actor_id}' not found.")
+        return await _action_list(ctx, m, actor_id)
+    if sub == "info":
+        if await return_help_if_not_enough_args(ctx, args, 3, "action", "info"):
+            return
+        actor_id = _resolve_eid(m, args[1])
+        if actor_id not in m.entities:
+            raise NotFound(f"Entity '{actor_id}' not found.")
+        return await _action_info(ctx, m, actor_id, args[2])
+
     actor_id = _resolve_eid(m, args[0])
     if actor_id not in m.entities:
         raise NotFound(f"Entity '{actor_id}' not found.")
@@ -4764,6 +4832,87 @@ async def action_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         ctx, mgr, m, actor_id=actor_id,
         requested_name=requested, tail_tokens=tail,
     )
+
+
+async def _action_list(ctx: ReplyContext, m: Match, actor_id: str) -> None:
+    """!action list <eid>: enumerate every discovered action on the
+    entity. One line per action, showing name, target type, container
+    path (where the action lives in vars — useful when the same name
+    appears in multiple containers), and the GM's description if any.
+    Empty entries hint at the available subcommands so a confused
+    user sees a way forward."""
+    from action import discover_actions
+    actor = m.entities[actor_id]
+    actions = discover_actions(actor, m.rules)
+    if not actions:
+        return await ctx.send(
+            f"No actions discoverable on `{actor_id}`. Add one by "
+            f"setting `<container>.actions.<name>.body` (and "
+            f"optionally `.target`, `.description`) in the entity's "
+            f"vars. See `!help action`."
+        )
+    lines = [f"**Actions on `{actor_id}`** "
+             f"({sum(len(v) for v in actions.values())} total):"]
+    for name in sorted(actions.keys()):
+        for act in actions[name]:
+            container = act.container_path or "(entity root)"
+            desc = f" — {act.description}" if act.description else ""
+            lines.append(
+                f"- `{act.name}` (target: `{act.target_type}`, at "
+                f"`{container}`){desc}"
+            )
+    await ctx.send("\n".join(lines))
+
+
+async def _action_info(
+    ctx: ReplyContext, m: Match, actor_id: str, requested: str,
+) -> None:
+    """!action info <eid> <name>: full detail for one action,
+    including the body source. Accepts either a bare name (with
+    disambiguation menu on collision) or a full vars path."""
+    from action import discover_actions, lookup_action
+    actor = m.entities[actor_id]
+    actions = discover_actions(actor, m.rules)
+    # Full-path first (matches the !action invocation precedence).
+    matches: List[Any] = []
+    for act_list in actions.values():
+        for act in act_list:
+            if act.full_path == requested:
+                matches = [act]
+                break
+        if matches:
+            break
+    if not matches:
+        matches = lookup_action(actions, requested, m.rules)
+    if not matches:
+        avail = sorted(actions.keys())
+        hint = (" Available: " + ", ".join(f"`{n}`" for n in avail)) if avail else ""
+        return await ctx.send(
+            f"❌ no action `{requested}` on `{actor_id}`.{hint}"
+        )
+    if len(matches) > 1:
+        lines = [
+            f"There are {len(matches)} actions named `{requested}` on "
+            f"`{actor_id}`. Use the full path with `!action info`:"
+        ]
+        for i, act in enumerate(matches, start=1):
+            lines.append(f"  {i}. `{act.full_path}`")
+        return await ctx.send("\n".join(lines))
+    act = matches[0]
+    container = act.container_path or "(entity root)"
+    desc = act.description or "(no description)"
+    lines = [
+        f"**`{act.name}`** on `{actor_id}`",
+        f"Path:        `{act.full_path}`",
+        f"Container:   `{container}`",
+        f"Target type: `{act.target_type}`",
+        f"Description: {desc}",
+        "Body:",
+        "```",
+        act.body,
+        "```",
+    ]
+    await ctx.send("\n".join(lines))
 
 
 async def _run_action_dispatch(
@@ -4845,7 +4994,7 @@ async def _run_action_dispatch(
     m._runtime_mgr = mgr
     from action import ActionEngineFault
     try:
-        ok, fail_msg = await run_action(
+        ok, fail_info = await run_action(
             action, actor_id=actor_id, target=target_value,
             args=args_dict, match=m, mgr=mgr, ctx=ctx,
         )
@@ -4859,8 +5008,13 @@ async def _run_action_dispatch(
         m._runtime_ctx = prev_ctx
         m._runtime_mgr = prev_mgr
     if not ok:
+        # fail_info is (reason, message). The reason prefix is
+        # included only when the GM supplied one (the single-arg
+        # fail("msg") form leaves it empty).
+        reason, message = fail_info
+        tag = f"[{reason}] " if reason else ""
         return await ctx.send(
-            f"❌ action `{action.name}`: {fail_msg}"
+            f"❌ action `{action.name}`: {tag}{message}"
         )
     return await ctx.send(
         f"`{actor_id}` used action `{action.name}`."

@@ -1298,6 +1298,21 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     # action-body sandbox. For passives observing any other hook
     # they default to None / empty dict.
     "target", "args",
+    # The entity that USED the action. Bound during on_action_used
+    # (where it equals `self`), on_action_used_on_target (where
+    # `self` is the defender and `actor` is the user), and
+    # on_action_failed (same as on_action_used). None elsewhere.
+    # Lets target-side reactive passives reference the attacker
+    # naturally: `entity[actor].team`, `is_hostile(actor, self)`,
+    # `cmd("ent hp " + actor + " -3")` for retaliation.
+    "actor",
+    # Failure event bindings. Bound only during on_action_failed
+    # firing. fail_reason is the GM-supplied tag from
+    # fail(reason, msg) — "" for the single-arg fail(msg) form.
+    # fail_message is the human-readable explanation. Together they
+    # let reactive logic discriminate: "if fail_reason == 'cost'
+    # and entity[self].mana < 5: status_add(self, 'exhausted')".
+    "fail_reason", "fail_message",
 )
 
 # Entity-id sentinel identifiers. Inside `entity[X]` these get
@@ -1445,6 +1460,16 @@ class _EntityAccessTransformer(ast.NodeTransformer):
                 # eid for target=entity actions; a list for entity_list;
                 # etc.). Treat it like a known_param — emit the bare
                 # Name so Python's namespace lookup runs.
+                return ast.Name(id=slice_node.id, ctx=ast.Load())
+            if slice_node.id in HOOK_CONTEXT_NAMES:
+                # Hook context bindings (actor / target / etc.) are
+                # populated from EvalCtx.extras into the eval namespace.
+                # Inside `entity[X]` they MUST be evaluated dynamically,
+                # not frozen to the literal token name — otherwise
+                # `entity[actor].hp` reads the (nonexistent) entity
+                # whose id is the string "actor" instead of dereferencing
+                # the binding. The validator already accepts these
+                # names; this just makes the subscript path agree.
                 return ast.Name(id=slice_node.id, ctx=ast.Load())
             # Bare identifier -> literal entity id (backward compatible).
             return ast.Constant(value=slice_node.id)
