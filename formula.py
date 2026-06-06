@@ -2347,7 +2347,11 @@ class FormulaEngine:
             nx, ny = e.x + dx, e.y + dy
             if not match.in_bounds(nx, ny):
                 return False
-            if match.is_occupied(nx, ny, ignore_entity_id=e.id):
+            # Stackable movers bypass the precheck — Entity.tp itself
+            # would also bypass, but we precheck here to return False
+            # (the formula's documented "blocked" signal) rather than
+            # raising. For stackable, "blocked" never applies.
+            if not e.is_cell_stackable and match.is_occupied(nx, ny, ignore_entity_id=e.id):
                 return False
             try:
                 e.tp(nx, ny)
@@ -2441,13 +2445,16 @@ class FormulaEngine:
             # another entity). Intermediate occupancy matters — pushing
             # through an entity isn't allowed (matches the natural
             # "knockback hits the wall behind them" intuition).
+            # Stackable pushees ignore occupancy (they can be shoved
+            # onto / past other entities), only bounds stop them.
             x, y = e.x, e.y
             steps = 0
+            stackable = e.is_cell_stackable
             for _ in range(n):
                 nx, ny = x + dx, y + dy
                 if not match.in_bounds(nx, ny):
                     break
-                if match.is_occupied(nx, ny, ignore_entity_id=e.id):
+                if not stackable and match.is_occupied(nx, ny, ignore_entity_id=e.id):
                     break
                 x, y = nx, ny
                 steps += 1

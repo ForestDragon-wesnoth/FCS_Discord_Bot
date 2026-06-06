@@ -8385,3 +8385,156 @@ action accepts a corpse_list (multiple corpse ids as positional
 tokens) and the body iterates them, calling revive on each.
 All three return at full hp. Final !list: cleric, a, b, c all
 alive; no Dead: section.
+
+
+SCENARIO 334 — corpse_id_uniqueness: corpse id blocks reuse by default
+-----------------------------------------------------------------------
+
+!match new mui1 IdUniqDefault 8 8
+!match use mui1
+!ent add goblin Goblin 5 3 3 8
+!ent hp goblin -10
+!ent add goblin Goblin 5 4 4 8
+!list
+
+Expected: After the lethal damage, goblin becomes a corpse at
+(3,3). The second `!ent add goblin ...` is REJECTED under the
+default `corpse_id_uniqueness=true` rule with `❌ Entity id
+'goblin' already exists in this match (as a live entity or a
+corpse — see the corpse_id_uniqueness rule).`. !list shows
+nothing in Entities: (no live goblin) and the corpse goblin in
+the Dead: section. The id stays reserved for the corpse, so a
+later `revive('goblin')` brings back THIS goblin specifically.
+
+
+SCENARIO 335 — corpse_id_uniqueness=false: id reuse is allowed
+---------------------------------------------------------------
+
+!match new mui2 IdUniqOff 8 8
+!match use mui2
+!system set default corpse_id_uniqueness false
+!ent add goblin Goblin 5 3 3 8
+!ent hp goblin -10
+!ent add goblin Goblin 5 4 4 8
+!list
+!eval "has_corpse('goblin')"
+
+Expected: With the rule off, after the kill a NEW live goblin
+is permitted at (4,4) sharing the id with the corpse at (3,3).
+!list shows the new goblin in Entities: and a goblin entry in
+Dead:. has_corpse('goblin') returns True. Note that under this
+setting revive('goblin') would refuse to spawn (id collision
+with the live goblin) — this is exactly the breakage the
+default rule prevents.
+
+
+SCENARIO 336 — mint_entity_id avoids corpse ids when minting from summon
+-------------------------------------------------------------------------
+
+!match new mui3 IdMintSummon 8 8
+!match use mui3
+!ent add boss Boss 30 1 1 12
+!ent add gob_proto Goblin 5 5 5 8
+!ent store_entity_into_var gob_proto boss minion
+!ent remove gob_proto
+!eval "summon(var_get('boss','minion'), 3, 3)"
+!ent hp goblin -10
+!eval "summon(var_get('boss','minion'), 4, 4)"
+!list
+
+Expected: First summon mints id `goblin`. After it dies and
+becomes a corpse, the second summon scans BOTH live entity ids
+AND corpse ids — `goblin` is taken, so it mints `goblin2`.
+Final !list shows boss + goblin2 alive and the goblin corpse
+in Dead:. The summoned `goblin2` is a fresh entity; the corpse
+keeps its identity for revival.
+
+
+SCENARIO 337 — __cell_stackable mover can enter occupied cells
+---------------------------------------------------------------
+
+!match new mst1 StackableMover 6 6
+!match use mst1
+!ent add big Big 20 3 3 10
+!ent add small Small 5 1 1 5
+!ent set_var small __cell_stackable true
+!ent tp small 3 3
+!ent dump small
+
+Expected: `small` has `__cell_stackable=true`. The tp onto big's
+cell (3,3) SUCCEEDS — both entities now occupy (3,3). The dump
+confirms small.x = 3, small.y = 3 (stacked on big). Without the
+flag the tp would have raised "Cell (3,3) already occupied".
+
+
+SCENARIO 338 — __cell_stackable resident doesn't block other movers
+--------------------------------------------------------------------
+
+!match new mst2 StackableResident 6 6
+!match use mst2
+!ent add scout Scout 5 3 3 10
+!ent set_var scout __cell_stackable true
+!ent add knight Knight 25 1 1 8
+!ent tp knight 3 3
+!ent dump knight
+!eval "is_occupied = 'cant call directly, but the tp succeeded so cell wasnt occupying'"
+
+Expected: `scout` is stackable and sits at (3,3). When normal
+knight tps onto (3,3), is_occupied returns FALSE (the only
+resident is stackable) so the move succeeds. Both entities are
+now at (3,3). Knight is non-stackable; further entities tping
+to (3,3) would now be blocked by knight (since knight DOES
+count as occupying).
+
+
+SCENARIO 339 — Stackable + non-stackable interaction (full matrix)
+-------------------------------------------------------------------
+
+!match new mst3 StackableMatrix 6 6
+!match use mst3
+!ent add wall Wall 100 3 3 1
+!ent add ghost Ghost 10 1 1 5
+!ent set_var ghost __cell_stackable true
+!ent add mouse Mouse 1 5 5 12
+!ent set_var mouse __cell_stackable true
+!ent tp ghost 3 3
+!ent tp mouse 3 3
+!ent dump ghost
+!ent dump mouse
+!ent add normal Normal 10 2 2 7
+!ent tp normal 3 3
+
+Expected: Stackable ghost tps onto wall (3,3) — succeeds (ghost
+bypasses occupancy as a mover). Stackable mouse also tps onto
+(3,3) — also succeeds (mouse bypasses occupancy too; even
+though wall is there, mouse doesn't care). Three entities now
+at (3,3): wall + ghost + mouse. When normal tries to tp onto
+(3,3), the cell IS occupied (wall is non-stackable), so the
+move is REJECTED with `❌ Cell (3,3) already occupied`. The
+rule is: occupancy fails ONLY when a non-stackable mover
+enters a cell holding a non-stackable resident.
+
+
+SCENARIO 340 — summon respects __cell_stackable on the template
+----------------------------------------------------------------
+
+!match new mst4 StackableSummon 6 6
+!match use mst4
+!ent add altar Altar 50 3 3 1
+!ent add wisp_proto Wisp 3 1 1 7
+!ent set_var wisp_proto __cell_stackable true
+!ent store_entity_into_var wisp_proto altar wisp
+!ent remove wisp_proto
+!ent set_var altar actions.summon_wisp.target none
+!ent set_var altar actions.summon_wisp.body "summon(source.wisp, 3, 3)"
+!ent action altar summon_wisp
+!ent dump wisp
+!list
+
+Expected: The wisp template has `__cell_stackable=true`. The
+altar's action summons a wisp DIRECTLY onto the altar's own
+cell (3,3) — a non-stackable resident — and SUCCEEDS because
+the summoned template is stackable (summon_entity bypasses
+occupancy for stackable templates). The wisp ends up at (3,3),
+stacked on the altar. List shows altar + wisp at the same
+cell.
