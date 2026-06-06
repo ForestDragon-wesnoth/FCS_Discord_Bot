@@ -555,6 +555,21 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "corpses use the explicit corpse-targeting surface)."
         ),
     },
+    "corpse_id_uniqueness": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "When true (default), entity-id allocation considers CORPSE "
+            "ids as well as live entity ids: `summon` / `mint_entity_id` "
+            "won't reuse a corpse's id, and `!ent add` / `Entity.spawn` "
+            "refuses an explicit id that matches a corpse. Prevents the "
+            "'goblin1 dies → new goblin1 spawned → revive(goblin1) is "
+            "forced to a different id' breakage. Turn off only if a "
+            "system wants id reuse and the GM is OK with revive deciding "
+            "which entity gets the id back (the current naming-collision "
+            "semantics)."
+        ),
+    },
     # ---- Action system --------------------------------------------------
     # Actions are GM-defined effect bundles stored under entity.vars at any
     # path ending in `.actions.<name>`. Each action is a dict with `body`
@@ -2163,6 +2178,19 @@ class Entity:
     def is_alive(self) -> bool:
         return self.hp > 0
 
+    @property
+    def is_cell_stackable(self) -> bool:
+        """True when this entity's `__cell_stackable` var is truthy.
+        A stackable entity (a) doesn't count as occupying its cell for
+        Match.is_occupied — other entities can move onto a tile that
+        only contains stackable residents — and (b) faces no occupancy
+        check when it itself moves, so it can enter cells already
+        holding non-stackable entities. Together that's the "very
+        small entity" / overlapping-units pattern. Per-entity opt-in
+        via vars; absent / false-y means the normal "one entity per
+        cell" enforcement applies."""
+        return bool(self.vars.get("__cell_stackable", False))
+
     def move_to(self, x: int, y: int):
         self.x, self.y = x, y
 
@@ -2198,10 +2226,21 @@ class Entity:
             raise VTTError(f"Entity '{self.id}' is already in a match")
         if not match.in_bounds(x, y):
             raise OutOfBounds(f"({x},{y}) outside {match.grid_width}x{match.grid_height}")
-        if match.is_occupied(x, y):
+        # Stackable spawners skip the occupancy check (same rule as
+        # Entity.tp / move_dirs / summon_entity). Lets `!ent add` drop
+        # a stackable entity onto a cell that already holds another.
+        if not self.is_cell_stackable and match.is_occupied(x, y):
             raise Occupied(f"Cell ({x},{y}) already occupied")
-        if self.id in match.entities:
-            raise DuplicateId(f"Entity id '{self.id}' already exists in this match")
+        # ID collision check honors `corpse_id_uniqueness` — under the
+        # default true setting a corpse's id reserves the name too, so
+        # spawning a fresh `goblin1` while a `goblin1` corpse exists
+        # raises here instead of orphaning the corpse's identity.
+        if self.id in match._taken_entity_ids():
+            raise DuplicateId(
+                f"Entity id '{self.id}' already exists in this match "
+                f"(as a live entity or a corpse — see the "
+                f"`corpse_id_uniqueness` rule)."
+            )
 
         # --- Validate vital vars against game system ---
         hp_var = match.rules.get("hp_var", "hp")
@@ -2283,7 +2322,12 @@ class Entity:
         m = self._require_match()
         if not m.in_bounds(x, y):
             raise OutOfBounds(f"({x},{y}) outside {m.grid_width}x{m.grid_height}")
-        if m.is_occupied(x, y, ignore_entity_id=self.id):
+        # Stackable movers skip the occupancy check entirely — they're
+        # allowed to enter cells already holding non-stackable entities.
+        # Combined with is_occupied skipping stackable RESIDENTS, the
+        # net rule is: occupancy fails only when a non-stackable mover
+        # enters a cell containing a non-stackable resident.
+        if not self.is_cell_stackable and m.is_occupied(x, y, ignore_entity_id=self.id):
             raise Occupied(f"Cell ({x},{y}) already occupied")
         log: List[str] = []
         old_x, old_y = self.x, self.y
@@ -2361,7 +2405,11 @@ class Entity:
                     raise OutOfBounds(f"({nx},{ny}) outside {m.grid_width}x{m.grid_height}")
                 step_path.append((nx, ny, step_facing))
                 x, y = nx, ny
-        if m.is_occupied(x, y, ignore_entity_id=self.id):
+        # Stackable movers skip the final-cell occupancy check (see
+        # Entity.tp for the symmetric rationale). move_dirs only
+        # validates the final cell for occupancy, so this is the one
+        # gate that needs the bypass.
+        if not self.is_cell_stackable and m.is_occupied(x, y, ignore_entity_id=self.id):
             raise Occupied(f"Cell ({x},{y}) already occupied")
 
         # Phase 2: commit each step, firing hooks. No more validation —
@@ -3317,10 +3365,19 @@ class Match:
         del self.formula_functions[name]
 
     def is_occupied(self, x: int, y: int, ignore_entity_id: Optional[str] = None) -> bool:
+        """True when the cell (x, y) holds an entity that BLOCKS other
+        entities from entering — i.e. an alive non-stackable entity.
+        Stackable entities (vars `__cell_stackable` truthy) don't count
+        as occupying their cell; a tile holding only stackable residents
+        still answers False here. Pair this with the mover-side check
+        in Entity.tp / move_dirs / Match.summon_entity: those skip the
+        is_occupied call entirely when the MOVER itself is stackable,
+        so a stackable entity can also enter a cell that has a
+        non-stackable resident."""
         for eid, e in self.entities.items():
             if ignore_entity_id and eid == ignore_entity_id:
                 continue
-            if e.x == x and e.y == y and e.is_alive:
+            if e.x == x and e.y == y and e.is_alive and not e.is_cell_stackable:
                 return True
         return False
 
@@ -4192,21 +4249,36 @@ class Match:
         d.pop("y", None)
         return d
 
+    def _taken_entity_ids(self) -> "set[str]":
+        """Return the set of entity ids that should be considered
+        already-in-use for collision purposes. Always includes live
+        entity ids; ALSO includes corpse ids when the
+        `corpse_id_uniqueness` rule is true (default). This is the
+        single source of truth for "is this id taken?" — used by
+        mint_entity_id and Entity.spawn so the two stay consistent."""
+        taken: set = set(self.entities.keys())
+        if bool(self.rules.get("corpse_id_uniqueness", True)):
+            for (_x, _y, eid, _c) in self.all_corpses():
+                taken.add(eid)
+        return taken
+
     def mint_entity_id(self, prefix: str) -> str:
         """Return an id not currently in use, derived from `prefix`.
-        `prefix` itself if free, else prefix2, prefix3, ... The scan
-        is against live entity ids only — a summoned skeleton becomes
-        `skeleton`, the next `skeleton2`, and so on. Prefix is
-        sanitized to a reasonable id token (whitespace/dots stripped)
-        and lower-cased; falls back to 'summon' if it empties out."""
+        `prefix` itself if free, else prefix2, prefix3, ... Honors the
+        `corpse_id_uniqueness` rule: when true (default) the scan
+        considers corpse ids too, so a summoned skeleton becomes
+        `skeleton2` if a `skeleton` corpse is already lying around.
+        Prefix is sanitized to a reasonable id token (whitespace/dots
+        stripped) and lower-cased; falls back to 'summon' if empty."""
         base = "".join(
             ch for ch in str(prefix).strip().lower().replace(" ", "_")
             if ch.isalnum() or ch in ("_", "-")
         ) or "summon"
-        if base not in self.entities:
+        taken = self._taken_entity_ids()
+        if base not in taken:
             return base
         n = 2
-        while f"{base}{n}" in self.entities:
+        while f"{base}{n}" in taken:
             n += 1
         return f"{base}{n}"
 
@@ -4253,6 +4325,14 @@ class Match:
                 or not isinstance(y, int) or isinstance(y, bool):
             raise VTTError("summon: x and y must be integers.")
         place_x, place_y = x, y
+        # If the template marks the summoned entity as cell-stackable,
+        # placement bypasses occupancy entirely — symmetric with how
+        # Entity.tp / move_dirs handle stackable movers. We probe the
+        # template's vars directly rather than constructing the Entity
+        # twice; the eventual Entity.spawn below will validate again
+        # (and also bypass for stackable, via the same flag).
+        tpl_vars = template.get("vars") if isinstance(template.get("vars"), dict) else {}
+        stackable_template = bool(tpl_vars.get("__cell_stackable", False))
         if near_radius is not None:
             place = self._find_free_cell_near(x, y, int(near_radius))
             if place is None:
@@ -4267,7 +4347,7 @@ class Match:
                     f"summon: ({place_x},{place_y}) is off-grid "
                     f"({self.grid_width}x{self.grid_height})."
                 )
-            if self.is_occupied(place_x, place_y):
+            if not stackable_template and self.is_occupied(place_x, place_y):
                 raise Occupied(
                     f"summon: cell ({place_x},{place_y}) is occupied. "
                     f"Use summon_near to search for a free cell."

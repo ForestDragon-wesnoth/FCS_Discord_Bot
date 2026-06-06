@@ -1594,13 +1594,20 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if src_id not in m.entities:
             raise NotFound(f"Entity '{src_id}' not found.")
         single = (len(pairs) == 1)
+        # Clones inherit the source's vars, so a stackable source
+        # produces stackable clones — they bypass the per-cell
+        # occupancy check the same way Entity.spawn does.
+        src_stackable = m.entities[src_id].is_cell_stackable
+        # Honor the corpse_id_uniqueness rule: a clone's id is taken
+        # if it's a live entity OR (under the default rule) a corpse.
+        taken_ids = m.entities.keys() if not bool(m.rules.get("corpse_id_uniqueness", True)) else m._taken_entity_ids()
         # Build the (id, x, y) plan and validate everything up front.
         plan: List[Tuple[str, int, int]] = []
         seen_cells = set()
         seen_ids = set()
         for i, (x, y) in enumerate(pairs, start=1):
             cid = new_id_base if single else f"{new_id_base}{i}"
-            if cid in m.entities or cid in seen_ids:
+            if cid in taken_ids or cid in seen_ids:
                 return await ctx.send(
                     f"❌ entity id `{cid}` already exists (or is "
                     f"duplicated in this batch)."
@@ -1609,7 +1616,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return await ctx.send(
                     f"❌ ({x},{y}) outside {m.grid_width}x{m.grid_height}."
                 )
-            if (x, y) in seen_cells or m.is_occupied(x, y):
+            if (x, y) in seen_cells or (not src_stackable and m.is_occupied(x, y)):
                 return await ctx.send(
                     f"❌ cell ({x},{y}) is already occupied (or targeted "
                     f"twice in this batch)."
