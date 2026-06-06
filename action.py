@@ -90,6 +90,11 @@ ACTIONS_KEY = "actions"
 # definition time is a validation error.
 ALLOWED_TARGET_TYPES = frozenset({
     "entity", "location", "entity_list", "location_list", "none",
+    # Corpse targets: the input is a corpse id (string). The runner
+    # binds `target` to that id; the body uses it via revive(target)
+    # / has_corpse(target) / corpse_at(target). `corpse_list` accepts
+    # multiple ids (loopable in the body).
+    "corpse", "corpse_list",
 })
 
 # Reserved bindings the action body language injects into the eval
@@ -632,6 +637,24 @@ def parse_target(
                 "location_list target needs at least one paired `<x> <y>`."
             )
         return coords, list(tokens[i:])
+    if target_type == "corpse":
+        if not tokens:
+            raise VTTError("expected a corpse id after the action name.")
+        cid = tokens[0]
+        if match.find_corpse(cid) is None:
+            raise NotFound(f"No corpse with id '{cid}'.")
+        return cid, list(tokens[1:])
+    if target_type == "corpse_list":
+        cids: List[str] = []
+        i = 0
+        while i < len(tokens) and "=" not in tokens[i]:
+            if match.find_corpse(tokens[i]) is None:
+                raise NotFound(f"No corpse with id '{tokens[i]}'.")
+            cids.append(tokens[i])
+            i += 1
+        if not cids:
+            raise VTTError("corpse_list target needs at least one corpse id.")
+        return cids, list(tokens[i:])
     # Should be unreachable given ALLOWED_TARGET_TYPES.
     raise VTTError(f"unknown target type `{target_type}`.")
 

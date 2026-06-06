@@ -1594,13 +1594,20 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if src_id not in m.entities:
             raise NotFound(f"Entity '{src_id}' not found.")
         single = (len(pairs) == 1)
+        # Clones inherit the source's vars, so a stackable source
+        # produces stackable clones — they bypass the per-cell
+        # occupancy check the same way Entity.spawn does.
+        src_stackable = m.entities[src_id].is_cell_stackable
+        # Honor the corpse_id_uniqueness rule: a clone's id is taken
+        # if it's a live entity OR (under the default rule) a corpse.
+        taken_ids = m.entities.keys() if not bool(m.rules.get("corpse_id_uniqueness", True)) else m._taken_entity_ids()
         # Build the (id, x, y) plan and validate everything up front.
         plan: List[Tuple[str, int, int]] = []
         seen_cells = set()
         seen_ids = set()
         for i, (x, y) in enumerate(pairs, start=1):
             cid = new_id_base if single else f"{new_id_base}{i}"
-            if cid in m.entities or cid in seen_ids:
+            if cid in taken_ids or cid in seen_ids:
                 return await ctx.send(
                     f"❌ entity id `{cid}` already exists (or is "
                     f"duplicated in this batch)."
@@ -1609,7 +1616,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return await ctx.send(
                     f"❌ ({x},{y}) outside {m.grid_width}x{m.grid_height}."
                 )
-            if (x, y) in seen_cells or m.is_occupied(x, y):
+            if (x, y) in seen_cells or (not src_stackable and m.is_occupied(x, y)):
                 return await ctx.send(
                     f"❌ cell ({x},{y}) is already occupied (or targeted "
                     f"twice in this batch)."
@@ -2035,20 +2042,42 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     return await ctx.send(f"```\n{m.render_ascii()}\n```")
 
-@registry.command("list", usage="!list", desc="List entities in a match, sorted by turn order")
+@registry.command("list", usage="!list", desc="List entities in a match, sorted by turn order, plus a Dead: section of corpses when show_corpses_in_entity_list is enabled.")
 async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     es = m.entities_in_turn_order()
-    if not es:
-        return await ctx.send("(no entities)")
-
     active_id = m.turn_order[m.active_index] if m.turn_order else None
-    lines = []
-    lines.append(f"Entities:")
-    #add a right arrow to show which entity's turn it is right now
-    for e in es:
-        marker = "→" if e.id == active_id else "  "
-        lines.append(f"{marker} {_entity_line(e)}")
+    lines: List[str] = []
+    if es:
+        lines.append("Entities:")
+        for e in es:
+            marker = "→" if e.id == active_id else "  "
+            lines.append(f"{marker} {_entity_line(e)}")
+    # Dead: section. Render every corpse with id / name / position /
+    # final hp/max_hp pulled from the embedded snapshot. The tile
+    # coords (NOT the embedded x/y) are authoritative; we display
+    # them as the corpse's location. Gated by the
+    # show_corpses_in_entity_list rule — when false we silently
+    # omit the section (corpses still exist in tile data).
+    if bool(m.rules.get("show_corpses_in_entity_list", True)):
+        corpses = m.all_corpses()
+        if corpses:
+            if lines:
+                lines.append("")  # blank line separates living from dead
+            lines.append("Dead:")
+            hp_var = m.rules.get("hp_var", "hp")
+            max_hp_var = m.rules.get("max_hp_var", "max_hp")
+            for (x, y, eid, corpse) in corpses:
+                ent = corpse.get("entity") or {}
+                name = ent.get("name", eid)
+                ent_vars = ent.get("vars") or {}
+                hp = ent_vars.get(hp_var, "?")
+                mhp = ent_vars.get(max_hp_var, "?")
+                lines.append(
+                    f"   {name} (`{eid}`): HP: {hp}/{mhp} X,Y: {x},{y} (corpse)"
+                )
+    if not lines:
+        return await ctx.send("(no entities)")
     return await ctx.send("\n".join(lines))
 
 # ---- !find ----------------------------------------------------------
