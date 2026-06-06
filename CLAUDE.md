@@ -1,9 +1,9 @@
 # FCS_Discord_Bot — Notes for Claude
 
-A Discord/CLI virtual tabletop for tactical RPGs. The current codebase is
-~5000 lines of Python; you'll be extending it. Read this whole file
-before doing anything substantive — it captures hard-won knowledge from
-prior sessions that the code alone won't teach you.
+A Discord/CLI virtual tabletop for tactical RPGs, written in Python;
+you'll be extending it. Read this whole file before doing anything
+substantive — it captures hard-won knowledge from prior sessions that
+the code alone won't teach you.
 
 ---
 
@@ -146,7 +146,7 @@ behavior is what shipped).
 
 ### Files (with role)
 
-- **`logic.py`** (~5000 lines): the domain model. `Entity`, `Match`,
+- **`logic.py`**: the domain model. `Entity`, `Match`,
   `MatchManager`, `Passive`, `ClampSpec`, `SpecialTileTemplate`,
   `FormulaFunction`, `GameSystem`. **`RULES_REGISTRY`** at the top is
   the single source of truth for every gamerule. **`HOOK_NAMES`** is
@@ -155,7 +155,7 @@ behavior is what shipped).
   (`Match._emit_status_diff`) are where almost every cross-cutting
   feature hooks in (death checks, var hooks, clamps).
 
-- **`formula.py`** (~3500 lines): the sandboxed expression/program
+- **`formula.py`**: the sandboxed expression/program
   language. The validator (`_EntityAccessTransformer` +
   `_validate_tree`) rewrites `entity[X].path` reads/writes into safe
   `__read`/`__write` calls and rejects anything outside the
@@ -169,13 +169,13 @@ behavior is what shipped).
   attribute access on `source`/`args`/`target` proxies, and dynamic
   `entity[<binding>]` lookup.
 
-- **`vtt_commands.py`** (~5000 lines): the user-facing command surface
+- **`vtt_commands.py`**: the user-facing command surface
   with `CommandRegistry`. Every `!command` is a `@registry.command`
   decorator. The dispatcher (`CommandRegistry.run`) takes the
   pre/post snapshot for undo history and resolves aliases. There's
   also `dispatch_no_snapshot` for `!batch` / `!run` / action `cmd()`.
 
-- **`action.py`** (~1000 lines): the action subsystem. `Action`
+- **`action.py`**: the action subsystem. `Action`
   dataclass, `discover_actions` (walks vars looking for `.actions.`
   subdicts), `SourceProxy` / `ArgsProxy` / `Coord` (the runtime
   bindings the body sees), `run_action` (transactional runner —
@@ -188,7 +188,7 @@ behavior is what shipped).
   flavors: round, turn, command. `Snapshot.state` is
   `Match.to_dict(include_history=False)`.
 
-- **`test_sequences.txt`** (~8000 lines): scenario integration tests.
+- **`test_sequences.txt`**: scenario integration tests.
   Each `SCENARIO N — title` block has `!command` lines and an
   `Expected:` prose section. **The prose is not machine-checked.**
   Multi-line bodies use literal `\n` (the harness pre-translates them

@@ -8615,3 +8615,95 @@ This proves the corpse line is a fully configurable template,
 parallel to entity_line_format — `died_round` is exposed as a
 placeholder, and the tile coords are authoritative (not the
 embedded snapshot's x/y).
+
+
+SCENARIO 344 — !ent kill / !ent revive: command equivalents of the formula primitives
+--------------------------------------------------------------------------------------
+
+!match new mck1 KillCmd 6 6
+!match use mck1
+!ent add victim Victim 20 2 2 7
+!ent kill victim
+!list
+!ent revive victim
+!ent dump victim
+
+Expected: `!ent kill victim` routes through the same
+Match.kill_entity used by the kill() formula primitive: it runs
+default_kill_function_effects (hp -> 0), fires the death
+pipeline, and replies "Killed `victim`.". `!list` then shows
+victim in the Dead: section (a corpse at 2,2), gone from the
+live roster. `!ent revive victim` wraps Match.revive_corpse and
+replies "Revived corpse `victim` as `victim`."; the default
+revive effects restore hp to max, so `!ent dump victim` shows a
+live entity back at (2,2) with hp 20/20.
+
+
+SCENARIO 345 — !ent push: forced movement stops at walls and occupants
+----------------------------------------------------------------------
+
+!match new mph1 PushCmd 6 6
+!match use mph1
+!ent add boulder Boulder 10 1 1 5
+!ent push boulder right 2
+!ent add wall Wall 10 5 1 4
+!ent push boulder right 10
+!ent dump boulder
+!ent push boulder right 5
+!ent push boulder up_left 1
+
+Expected: `!ent push boulder right 2` shoves it two cells to
+(3,1) — "Pushed `boulder` 2 cell(s) to (3,1)." With a wall
+placed at (5,1), `!ent push boulder right 10` walks east but
+stops in front of the blocker at (4,1): "Pushed `boulder` 1
+cell(s) to (4,1)." `!ent dump boulder` confirms (4,1). A
+further `!ent push boulder right 5` is blocked immediately
+(wall is adjacent) — "Pushed `boulder` 0 cell(s) to (4,1)." The
+diagonal push fails the rule gate: with allow_diagonal_movement
+off, `!ent push boulder up_left 1` replies "❌ push: diagonal
+direction 'up_left' requires allow_diagonal_movement=True."
+This is the !ent command equivalent of the push_entity()
+formula primitive, sharing Match.push_entity.
+
+
+SCENARIO 346 — !ent swap: atomic position exchange
+--------------------------------------------------
+
+!match new msw1 SwapCmd 6 6
+!match use msw1
+!ent add aa Aaa 10 1 1 5
+!ent add bb Bbb 10 6 6 4
+!ent swap aa bb
+!ent dump aa
+!ent dump bb
+!ent swap aa aa
+
+Expected: `!ent swap aa bb` exchanges positions atomically
+(bypassing the occupancy check) and replies "Swapped `aa` ↔
+`bb`; now at (6,6) and (1,1)." `!ent dump aa` shows aa at
+(6,6); `!ent dump bb` shows bb at (1,1). Swapping an entity
+with itself is a no-op: `!ent swap aa aa` replies "No swap:
+`aa` and `aa` are the same entity or already share a cell."
+This is the !ent command equivalent of the swap_entities()
+formula primitive, sharing Match.swap_entities.
+
+
+SCENARIO 347 — command/formula parity: !ent kill and kill() reach the same end-state
+------------------------------------------------------------------------------------
+
+!match new mpar1 Parity 6 6
+!match use mpar1
+!ent add cmdkill CmdKill 30 1 1 8
+!ent add fmlkill FmlKill 30 4 4 7
+!ent kill cmdkill
+!eval "kill('fmlkill')"
+!list
+
+Expected: Both entities end up as corpses with identical
+treatment because the command and the formula primitive share
+Match.kill_entity. `!ent kill cmdkill` and `!eval
+"kill('fmlkill')"` each run default_kill_function_effects (hp
+-> 0) then the death pipeline; `!list` shows BOTH cmdkill (at
+1,1) and fmlkill (at 4,4) in the Dead: section, with no live
+entities remaining. This is the DRY guarantee: one shared
+implementation, two surfaces.
