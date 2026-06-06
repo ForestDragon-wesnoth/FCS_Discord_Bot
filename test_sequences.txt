@@ -8538,3 +8538,80 @@ the summoned template is stackable (summon_entity bypasses
 occupancy for stackable templates). The wisp ends up at (3,3),
 stacked on the altar. List shows altar + wisp at the same
 cell.
+
+
+SCENARIO 341 — default_kill_function_effects: kill leaves a sensible corpse hp
+-------------------------------------------------------------------------------
+
+!match new mdk1 KillEffects 6 6
+!match use mdk1
+!ent add tough Tough 99 4 4 8
+!eval "kill('tough')"
+!state
+!system set default default_kill_function_effects ""
+!ent add unscathed Unscathed 50 2 2 7
+!eval "kill('unscathed')"
+!state
+
+Expected: With the default rule (`entity[self].hp = 0`), the
+`kill('tough')` writes hp to 0 before the death pipeline fires,
+so the corpse renders `Tough (tough): HP: 0/99 X,Y: 4,4
+(corpse)` — no more weird "99/99 corpse". After clearing the
+rule, the next kill skips the pre-death effect; the corpse for
+`unscathed` keeps the entity's original hp (50/50). The rule is
+the configurable knob you reach for to tune what a corpse looks
+like for a given system (negative hp for overkill tracking,
+status_add for "dead but doesn't decompose", etc.).
+
+
+SCENARIO 342 — default_revive_function_effects: configurable revive hp
+-----------------------------------------------------------------------
+
+!match new mdr1 ReviveEffects 6 6
+!match use mdr1
+!ent add cleric Cleric 30 1 1 12
+!ent add fighter Fighter 20 3 3 10
+!eval "kill('fighter')"
+!eval "revive('fighter')"
+!ent dump fighter
+!eval "kill('fighter')"
+!system set default default_revive_function_effects "entity[self].hp = 1"
+!eval "revive('fighter')"
+!ent dump fighter
+!eval "kill('fighter')"
+!system set default default_revive_function_effects ""
+!eval "revive('fighter')"
+!ent dump fighter
+
+Expected: First revive uses the default formula (`entity[self]
+.hp = entity[self].max_hp`) — fighter comes back at 20/20.
+Second revive uses the GM-set rule `entity[self].hp = 1` —
+fighter comes back at 1/20 (the "Revive Lite" cleric pattern).
+Third revive has the rule empty — no effect runs; fighter
+comes back with WHATEVER hp was in the corpse snapshot (0,
+from the kill's effect), which means the death check
+immediately re-fires and fighter dies again. This is the
+"foot-gun if you forget the rule" path; the docstring warns
+about it. The point: no hardcoded revive policy — the GM
+owns it.
+
+
+SCENARIO 343 — corpse_line_format: GM customizes the Dead: section
+-------------------------------------------------------------------
+
+!match new mcf1 CorpseFormat 6 6
+!match use mcf1
+!system set default corpse_line_format "🪦 {name} [{id}] — fell at ({x},{y}) on round {died_round}"
+!ent add hero Hero 30 1 1 10
+!ent add foe Foe 8 4 4 8
+!ent hp foe -10
+!state
+
+Expected: The Dead: section renders foe via the new template:
+`🪦 Foe [foe] — fell at (4,4) on round 1` instead of the
+default "HP: ... X,Y: ..." line. Hero stays in the live
+Entities: section under the unchanged entity_line_format.
+This proves the corpse line is a fully configurable template,
+parallel to entity_line_format — `died_round` is exposed as a
+placeholder, and the tile coords are authoritative (not the
+embedded snapshot's x/y).

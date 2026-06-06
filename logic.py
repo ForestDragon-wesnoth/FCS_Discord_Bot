@@ -570,6 +570,52 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "semantics)."
         ),
     },
+    "default_kill_function_effects": {
+        "default": "entity[self].hp = 0",
+        "schema": {"type": "str"},
+        "desc": (
+            "Formula program run on the entity BEFORE the death pipeline "
+            "fires when the `kill()` primitive is invoked. The default "
+            "zeroes the entity's hp so the resulting corpse reads "
+            "naturally (otherwise a `kill('tough')` on a 99/99 entity "
+            "would leave a 99/99 corpse). Empty string disables the "
+            "effect — kill then just runs the death pipeline with the "
+            "entity's current state. Runs with `self` bound to the "
+            "killed entity; any formula constructs are legal "
+            "(`entity[self].hp = 0`, `status_add(self, 'dead')`, "
+            "`entity[self].hp = -entity[self].max_hp` for overkill "
+            "tracking, etc.)."
+        ),
+    },
+    "default_revive_function_effects": {
+        "default": "entity[self].hp = entity[self].max_hp",
+        "schema": {"type": "str"},
+        "desc": (
+            "Formula program run on the freshly-revived entity AFTER "
+            "spawn (before on_revive fires). The default restores hp "
+            "to max — the classic 'revive at full' rule — but any "
+            "formula works. Empty string disables the effect, leaving "
+            "the entity's stored hp as-is from the corpse snapshot "
+            "(typically the negative value at death, so the entity "
+            "would re-die immediately unless an on_revive passive "
+            "heals it). Runs with `self` bound to the revived entity."
+        ),
+    },
+    "corpse_line_format": {
+        "default": "{name} (`{id}`): HP: {hp}/{max_hp} X,Y: {x},{y} (corpse)",
+        "schema": {"type": "str"},
+        "desc": (
+            "Single-line template for a corpse row (used in the Dead: "
+            "section of !list / !state). Same placeholder syntax as "
+            "entity_line_format: {key}, dotted paths, {?key?}...{/?} "
+            "conditionals, \\n for newlines. Built-in keys: id, name, "
+            "x, y (the AUTHORITATIVE tile coords, NOT the embedded "
+            "snapshot's x/y), facing, hp, max_hp, status_csv, "
+            "passives_csv, died_round. Any vars on the snapshot are "
+            "available by name; useful for system-specific death "
+            "info like `{?death_cause?}slain by {death_cause}{/?}`."
+        ),
+    },
     # ---- Action system --------------------------------------------------
     # Actions are GM-defined effect bundles stored under entity.vars at any
     # path ending in `.actions.<name>`. Each action is a dict with `body`
@@ -4536,15 +4582,22 @@ class Match:
     def revive_corpse(self, eid: str) -> Tuple[str, List[str]]:
         """Resurrect the corpse keyed by `eid`: spawn an entity from
         the stored dict at the corpse's TILE position, remove the
-        corpse, then fire on_revive on the freshly-spawned entity.
-        Returns (entity_id, log_lines). Raises NotFound / Occupied
-        / OutOfBounds on failure (the caller decides whether to wrap
+        corpse, run the `default_revive_function_effects` formula on
+        the freshly-spawned entity (default: hp -> max_hp; entirely
+        configurable via the gamerule), then fire on_revive.
+
+        Returns (entity_id, log_lines). Raises NotFound / Occupied /
+        OutOfBounds on failure (the caller decides whether to wrap
         as fail() in an action, etc.).
 
-        Hp is restored to max_hp on revive — the corpse's dead hp is
-        preserved IN the snapshot but the live entity starts whole.
-        GMs who want "revive at 1 hp" can write to hp in an
-        on_revive passive."""
+        The hp restoration policy lives in the
+        default_revive_function_effects rule, NOT here — empty rule
+        means "revive at whatever the corpse stored" (typically the
+        negative death hp), and a GM can swap in any formula
+        (`entity[self].hp = 1` for the "revive at 1 hp" rule,
+        `status_add(self, 'weakened')` for a tax on resurrection,
+        etc.). Per-revive customization beyond the rule belongs in
+        an on_revive passive."""
         loc = self.find_corpse(eid)
         if loc is None:
             raise NotFound(f"No corpse with id '{eid}'.")
@@ -4556,13 +4609,6 @@ class Match:
         # embedded snapshot — desync defense.
         entity_dict["x"] = x
         entity_dict["y"] = y
-        # Heal to max_hp using the system's vital-var names.
-        hp_var = self.rules.get("hp_var", "hp")
-        max_hp_var = self.rules.get("max_hp_var", "max_hp")
-        vars_d = entity_dict.get("vars") or {}
-        if isinstance(vars_d, dict) and max_hp_var in vars_d:
-            vars_d[hp_var] = vars_d[max_hp_var]
-            entity_dict["vars"] = vars_d
         e = Entity.from_dict(entity_dict)
         # Remove corpse FIRST so spawn doesn't see its own cell as
         # already-corpse-occupied for any future invariants and so the
@@ -4577,6 +4623,20 @@ class Match:
             if isinstance(cell, dict) and not cell:
                 self.tiles.pop((x, y), None)
         _, spawn_log = e.spawn(self, x, y)
+        # Run the revive-effects formula on the freshly-spawned entity
+        # BEFORE on_revive so on_revive observers see the post-effect
+        # state (matching on_death's "see settled state" contract).
+        # Skipped silently when the rule is empty.
+        effects = str(self.rules.get("default_revive_function_effects", "")).strip()
+        if effects:
+            from formula import FormulaEngine, EvalCtx, FormulaError
+            engine = FormulaEngine(self)
+            r_ctx = EvalCtx(this=self.current_entity_id(), target=e.id)
+            try:
+                engine.eval_program(effects, r_ctx)
+            except FormulaError:
+                # GM bug; don't make every revive into a hard error.
+                pass
         revive_log = self.fire_hook("on_revive", target_ids=[e.id])
         return e.id, spawn_log + revive_log
 

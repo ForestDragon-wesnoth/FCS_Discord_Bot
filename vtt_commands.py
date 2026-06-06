@@ -381,6 +381,66 @@ def _entity_card(e: Entity) -> str:
     return _render_template(tmpl, _entity_template_context(e))
 
 
+def _corpse_template_context(
+    m: Match, x: int, y: int, eid: str, corpse: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build the placeholder context for a corpse row. Same shape as
+    _entity_template_context, but rooted in the corpse's stored
+    snapshot rather than a live Entity — so the template engine sees
+    every var/status/passive the snapshot carried.
+
+    The x/y values come from the TILE coordinates (the authoritative
+    position store), NOT the embedded snapshot's x/y. This matters
+    if a (rare) GM operation ever moved a corpse — the template
+    always shows where the corpse actually IS, not where the entity
+    died.
+
+    `died_round` is exposed as a top-level placeholder so a system
+    can render `(fell on round {died_round})` without digging into
+    storage."""
+    ent = corpse.get("entity") or {}
+    hp_var = m.rules.get("hp_var", "hp")
+    max_hp_var = m.rules.get("max_hp_var", "max_hp")
+    init_var = m.rules.get("turnorder_var", "initiative")
+    ent_vars = ent.get("vars") or {}
+    status = ent.get("status") or {}
+    passives = ent.get("passives") or {}
+    ctx: Dict[str, Any] = {
+        "id": eid,
+        "name": ent.get("name", eid),
+        # Authoritative position from the tile, NOT the snapshot.
+        "x": x,
+        "y": y,
+        "facing": ent.get("facing", ""),
+        "team": ent_vars.get(m.rules.get("team_var", "team"), ""),
+        "initiative": ent_vars.get(init_var, 0),
+        "hp": ent_vars.get(hp_var, "?"),
+        "max_hp": ent_vars.get(max_hp_var, "?"),
+        "status_csv": ", ".join(sorted(status.keys())) if status else "",
+        "passives_csv": ", ".join(sorted(passives.keys())) if passives else "",
+        "died_round": corpse.get("died_round", "?"),
+    }
+    for k, v in ent_vars.items():
+        if k not in ctx:
+            ctx[k] = v
+    return ctx
+
+
+def _corpse_line(
+    m: Match, x: int, y: int, eid: str, corpse: Dict[str, Any],
+) -> str:
+    """Single-line corpse summary, rendered from the active match's
+    corpse_line_format rule. Falls back to the engine default if the
+    rule is empty (shouldn't happen for normal systems)."""
+    tmpl = m.rules.get("corpse_line_format")
+    if not tmpl:
+        tmpl = DEFAULT_SYSTEM_SETTINGS.get(
+            "corpse_line_format",
+            "{name} (`{id}`): HP: {hp}/{max_hp} X,Y: {x},{y} (corpse)",
+        )
+    return _render_template(tmpl, _corpse_template_context(m, x, y, eid, corpse))
+
+
 def _entity_dump(e: Entity) -> str:
     """Raw 'show everything' view — template-free, complete state of the entity."""
     parts: List[str] = []
@@ -2053,11 +2113,11 @@ async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         for e in es:
             marker = "→" if e.id == active_id else "  "
             lines.append(f"{marker} {_entity_line(e)}")
-    # Dead: section. Render every corpse with id / name / position /
-    # final hp/max_hp pulled from the embedded snapshot. The tile
-    # coords (NOT the embedded x/y) are authoritative; we display
-    # them as the corpse's location. Gated by the
-    # show_corpses_in_entity_list rule — when false we silently
+    # Dead: section. Each corpse rendered via _corpse_line which honors
+    # the corpse_line_format rule (the corpse equivalent of
+    # entity_line_format — no hardcoded shape). The tile coords (NOT
+    # the embedded snapshot's x/y) are authoritative for position.
+    # Gated by show_corpses_in_entity_list — when false we silently
     # omit the section (corpses still exist in tile data).
     if bool(m.rules.get("show_corpses_in_entity_list", True)):
         corpses = m.all_corpses()
@@ -2065,17 +2125,8 @@ async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if lines:
                 lines.append("")  # blank line separates living from dead
             lines.append("Dead:")
-            hp_var = m.rules.get("hp_var", "hp")
-            max_hp_var = m.rules.get("max_hp_var", "max_hp")
             for (x, y, eid, corpse) in corpses:
-                ent = corpse.get("entity") or {}
-                name = ent.get("name", eid)
-                ent_vars = ent.get("vars") or {}
-                hp = ent_vars.get(hp_var, "?")
-                mhp = ent_vars.get(max_hp_var, "?")
-                lines.append(
-                    f"   {name} (`{eid}`): HP: {hp}/{mhp} X,Y: {x},{y} (corpse)"
-                )
+                lines.append(f"   {_corpse_line(m, x, y, eid, corpse)}")
     if not lines:
         return await ctx.send("(no entities)")
     return await ctx.send("\n".join(lines))
