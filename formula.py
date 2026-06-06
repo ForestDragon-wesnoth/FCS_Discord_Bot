@@ -3406,17 +3406,47 @@ class FormulaEngine:
         def _kill(eid_t: Any) -> bool:
             """kill(eid): trigger death on `eid` unconditionally. Used
             for instant-kill effects, abilities that bypass hp, and
-            'cleanup' patterns. Routes through Match._process_death
-            directly — fires on_death, applies the death_result
-            (corpse vs delete), removes from turn order — without
-            re-evaluating the death condition (so it works regardless
-            of what the GM configured). Returns True if the entity
-            was present and got killed, False if there was no such
-            entity to begin with."""
+            'cleanup' patterns.
+
+            Pipeline:
+              1. Run `default_kill_function_effects` (default
+                 `entity[self].hp = 0`) on the target — so the corpse
+                 reads naturally (no 99/99hp corpses) and any GM-
+                 configured pre-death effects fire. Skipped if the
+                 rule is empty.
+              2. Call Match._process_death unconditionally — fires
+                 on_death, stores corpse (or deletes per
+                 death_result), removes from turn order. Bypasses the
+                 death CONDITION so kill works regardless of what the
+                 GM configured.
+
+            Returns True if the entity was present and got killed,
+            False if there was no such entity to begin with."""
             eid = _eid(eid_t)
             if eid not in match.entities:
                 return False
-            match._process_death(eid)
+            # Apply the kill effects formula first. We evaluate via the
+            # same engine but with `self` bound to the target — these
+            # writes go through the normal chokepoint, so a side-effect
+            # passive (or even the natural death check itself) might
+            # already remove the entity. The unconditional
+            # _process_death below covers the case where the effect
+            # didn't trigger natural death; the entities-check skips
+            # the call if death already happened.
+            effects = str(match.rules.get("default_kill_function_effects", "")).strip()
+            if effects:
+                kill_ctx = EvalCtx(this=match.current_entity_id(), target=eid)
+                try:
+                    engine.eval_program(effects, kill_ctx)
+                except FormulaError:
+                    # A malformed effects formula is the GM's bug; the
+                    # unconditional death below still fires, so kill
+                    # remains useful. Silently swallow — surfacing it
+                    # here would convert every kill() into a hard
+                    # failure across the whole match.
+                    pass
+            if eid in match.entities:
+                match._process_death(eid)
             return eid not in match.entities
 
         def _revive(eid_t: Any) -> str:
