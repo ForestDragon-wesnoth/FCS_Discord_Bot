@@ -87,6 +87,19 @@ git checkout <existing-feature-branch>
 # if you had started a second branch, close its PR and delete the branch
 ```
 
+### Verify the PR is still open after every push
+
+Pushing to an existing feature branch does NOT silently extend an
+already-merged PR. If the user merged the PR while you were doing
+follow-up work, your follow-up commits become orphaned on a dead
+branch — they show up nowhere, and the user only notices when GitHub
+prompts them with a "Compare & pull request" banner. **After every
+`git push` to a feature branch, run `git fetch && git log
+origin/main` (or check the PR's state via the MCP tool) to confirm
+the PR is still open.** If the PR merged, the unmerged commits need
+either a rebase or a fresh branch and a new PR — don't just keep
+pushing.
+
 ### Run the regression after every meaningful change
 
 ```bash
@@ -352,6 +365,22 @@ before presenting to the user.** Past survey agents have hallucinated
 Ask one focused `AskUserQuestion` with the recommended path
 labeled. The user has strong preferences and will tell you which
 way to go. Better than guessing wrong and having to refactor.
+
+### When in doubt, ask — implementation drift is much worse than questions
+
+More questions is always better than the user later seeing the
+implementation drifted from intent. The user has said this
+explicitly. If a feature has ambiguity in shape, signature,
+behavior, edge case handling, naming, or scope — **ask, don't
+guess**. The user is fast to answer and treats good questions as a
+sign of care, not slowness. They will be unhappy if they have to
+ask "why does this do X instead of Y?" after merge.
+
+Prefer `AskUserQuestion` with a recommended-option-first list over
+free-text questions; they're easier to answer. Skip questions
+about things that are obviously settled (don't ask "should I
+keep the existing test passing?"), but otherwise the bar for
+asking is low. A 30-second clarification beats a 300-line refactor.
 
 ---
 
