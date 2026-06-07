@@ -3427,6 +3427,104 @@ class Match:
                 return True
         return False
 
+    def push_entity(self, eid: str, direction: str, n: int = 1) -> Tuple[int, List[str]]:
+        """Forced movement: step `eid` up to `n` cells in `direction`,
+        stopping at the first blocked cell (off-grid, or — for a non-
+        stackable mover — an occupied cell). Returns
+        (cells_actually_moved, hook_log). Honors allow_diagonal_movement.
+        The committed steps go through Entity.move_dirs, so per-step tile
+        on_enter/on_exit and the final on_stop / on_entity_moved fire the
+        same way a stepwise `!ent move` would — a pushed entity walks
+        through fire tiles cell by cell. Raises VTTError on an unknown
+        entity, a non-string / unknown direction, a disallowed diagonal,
+        or a non-int `n`.
+
+        This is the shared implementation behind both the push_entity()
+        formula primitive and the `!ent push` command."""
+        e = self.entities.get(eid)
+        if e is None:
+            raise NotFound(f"Entity '{eid}' not found.")
+        if not isinstance(direction, str):
+            raise VTTError("push: direction must be a string.")
+        canon = normalize_direction(direction)
+        if canon is None:
+            raise VTTError(f"push: unknown direction '{direction}'.")
+        allow_diag = bool(self.rules.get("allow_diagonal_movement", False))
+        if canon in DIAGONAL_DIRECTIONS and not allow_diag:
+            raise VTTError(
+                f"push: diagonal direction '{direction}' requires "
+                f"allow_diagonal_movement=True."
+            )
+        if not isinstance(n, int) or isinstance(n, bool):
+            raise VTTError("push: n must be an integer.")
+        if n <= 0:
+            return 0, []
+        dx, dy = DIRECTION_VECTORS[canon]
+        # Walk forward to find the longest legal prefix. The push stops
+        # at the cell BEFORE the first blocker. Intermediate occupancy
+        # matters — shoving an entity THROUGH another isn't allowed
+        # (matches the "knockback hits the wall behind them" intuition).
+        # A stackable pushee ignores occupancy; only bounds stop it.
+        x, y = e.x, e.y
+        steps = 0
+        stackable = e.is_cell_stackable
+        for _ in range(n):
+            nx, ny = x + dx, y + dy
+            if not self.in_bounds(nx, ny):
+                break
+            if not stackable and self.is_occupied(nx, ny, ignore_entity_id=e.id):
+                break
+            x, y = nx, ny
+            steps += 1
+        if steps == 0:
+            return 0, []
+        # Delegate the actual commit to move_dirs (we've already proven
+        # the path legal) so we inherit per-step hook firing for free.
+        log = e.move_dirs([(canon, steps)])
+        return steps, log
+
+    def swap_entities(self, a: str, b: str) -> Tuple[bool, List[str]]:
+        """Atomically exchange the positions of entities `a` and `b`.
+        Both must exist; swapping an entity with itself (or two entities
+        that already share a cell) is a no-op returning (False, []).
+        Bypasses the usual occupancy check — the two target cells ARE
+        occupied, by each other — but the move is atomic. Fires on_exit
+        on both old cells, on_enter + on_stop on both new cells, and
+        on_entity_moved for both. Returns (swapped, hook_log).
+
+        Shared implementation behind the swap_entities() formula
+        primitive and the `!ent swap` command."""
+        ea = self.entities.get(a)
+        eb = self.entities.get(b)
+        if ea is None:
+            raise NotFound(f"Entity '{a}' not found.")
+        if eb is None:
+            raise NotFound(f"Entity '{b}' not found.")
+        if a == b:
+            return False, []
+        ax, ay = ea.x, ea.y
+        bx, by = eb.x, eb.y
+        # Degenerate co-located case (shouldn't happen for two non-
+        # stackable entities, but defended): nothing moves, no hooks.
+        if (ax, ay) == (bx, by):
+            return False, []
+        log: List[str] = []
+        # Fire on_exit at CURRENT positions before any state changes, so
+        # passives observe each entity still standing on its old cell.
+        log += self.fire_tile_hook("on_exit", a, ax, ay)
+        log += self.fire_tile_hook("on_exit", b, bx, by)
+        # Atomic swap via direct move_to (bypasses is_occupied — required,
+        # since A and B occupy each other's target cells until done).
+        ea.move_to(bx, by)
+        eb.move_to(ax, ay)
+        log += self.fire_tile_hook("on_enter", a, bx, by)
+        log += self.fire_tile_hook("on_stop", a, bx, by)
+        log += self.fire_tile_hook("on_enter", b, ax, ay)
+        log += self.fire_tile_hook("on_stop", b, ax, ay)
+        log += self.fire_entity_moved(a, ax, ay, bx, by)
+        log += self.fire_entity_moved(b, bx, by, ax, ay)
+        return True, log
+
     # ------------- turns -------------
 
     def _rebuild_turn_order(self):
@@ -4534,6 +4632,43 @@ class Match:
         finally:
             self._death_processing = max(0, self._death_processing - 1)
         return log
+
+    def kill_entity(self, eid: str) -> Tuple[bool, List[str]]:
+        """Unconditionally kill `eid`, bypassing the death CONDITION so
+        it works no matter what the GM configured. Two-step pipeline:
+          1. Run the `default_kill_function_effects` formula on the
+             target (default `entity[self].hp = 0`) so the corpse reads
+             naturally and any GM-configured pre-death effects fire.
+             Skipped when the rule is empty.
+          2. Run _process_death (fires on_death, stores the corpse or
+             deletes per death_result, rebuilds turn order).
+        Returns (killed, log). `killed` is True iff the entity is gone
+        afterward; False if there was no such entity to begin with.
+
+        Shared implementation behind the kill() formula primitive and
+        the `!ent kill` command."""
+        if eid not in self.entities:
+            return False, []
+        effects = str(self.rules.get("default_kill_function_effects", "")).strip()
+        if effects:
+            from formula import FormulaEngine, EvalCtx, FormulaError
+            engine = FormulaEngine(self)
+            k_ctx = EvalCtx(this=self.current_entity_id(), target=eid)
+            try:
+                engine.eval_program(effects, k_ctx)
+            except FormulaError:
+                # A malformed effects formula is the GM's bug; the
+                # unconditional death below still fires, so kill stays
+                # useful. Swallow rather than turn every kill into a
+                # hard failure across the whole match.
+                pass
+        # The effects formula (or a side-effect passive) may have already
+        # tripped natural death and removed the entity; only run the
+        # pipeline if it's still present.
+        log: List[str] = []
+        if eid in self.entities:
+            log = self._process_death(eid)
+        return eid not in self.entities, log
 
     def _store_corpse(self, e: "Entity") -> None:
         """Snapshot `e` into a corpse entry under tile (e.x, e.y) at

@@ -2412,65 +2412,16 @@ class FormulaEngine:
             would for a stepwise `!ent move`, so a pushed entity walks
             through fire tiles cell by cell."""
             eid = _eid(eid_t)
-            e = match.entities.get(eid)
-            if e is None:
-                raise FormulaError(f"push_entity: unknown entity id '{eid}'.")
-            if not isinstance(direction, str):
-                raise FormulaError(
-                    f"push_entity(eid, direction, n): direction must be a "
-                    f"string, got {type(direction).__name__}."
-                )
-            canon = _normalize_direction(direction)
-            if canon is None:
-                raise FormulaError(
-                    f"push_entity(eid, direction, n): unknown direction "
-                    f"'{direction}'."
-                )
-            allow_diag = bool(match.rules.get("allow_diagonal_movement", False))
-            if canon in _DIAGONAL_DIRECTIONS and not allow_diag:
-                raise FormulaError(
-                    f"push_entity: diagonal direction '{direction}' "
-                    f"requires allow_diagonal_movement=True."
-                )
-            if not isinstance(n, int) or isinstance(n, bool):
-                raise FormulaError(
-                    f"push_entity(eid, direction, n): n must be int, got "
-                    f"{type(n).__name__}."
-                )
-            if n <= 0:
-                return 0
-            dx, dy = _DIRECTION_VECTORS[canon]
-            # Walk forward to find the longest legal prefix. The push
-            # stops at the cell BEFORE the first blocker (off-grid or
-            # another entity). Intermediate occupancy matters — pushing
-            # through an entity isn't allowed (matches the natural
-            # "knockback hits the wall behind them" intuition).
-            # Stackable pushees ignore occupancy (they can be shoved
-            # onto / past other entities), only bounds stop them.
-            x, y = e.x, e.y
-            steps = 0
-            stackable = e.is_cell_stackable
-            for _ in range(n):
-                nx, ny = x + dx, y + dy
-                if not match.in_bounds(nx, ny):
-                    break
-                if not stackable and match.is_occupied(nx, ny, ignore_entity_id=e.id):
-                    break
-                x, y = nx, ny
-                steps += 1
-            if steps == 0:
-                return 0
-            # Delegate the actual stepwise commit to move_dirs so we get
-            # per-step on_enter/on_exit, on_stop, and on_entity_moved
-            # firing for free. We've already proven the path is legal.
+            # Geometry, hook firing and validation live in
+            # Match.push_entity (shared with the !ent push command);
+            # this primitive just resolves the id, surfaces any engine
+            # error as a FormulaError, and records the affected entity.
             try:
-                e.move_dirs([(canon, steps)])
-            except (_OutOfBounds, _Occupied) as ex:
-                # Should be unreachable — we validated above — but if a
-                # passive mutates state between validation and commit,
-                # surface the failure cleanly.
+                steps, _log = match.push_entity(eid, direction, n)
+            except VTTError as ex:
                 raise FormulaError(str(ex))
-            self._note_affected(eid)
+            if steps:
+                self._note_affected(eid)
             return steps
 
         def _swap_entities(a_t: Any, b_t: Any) -> bool:
@@ -2484,42 +2435,16 @@ class FormulaEngine:
             swap, False on the same-entity no-op."""
             aid = _eid(a_t)
             bid = _eid(b_t)
-            ea = match.entities.get(aid)
-            eb = match.entities.get(bid)
-            if ea is None:
-                raise FormulaError(f"swap_entities: unknown entity id '{aid}'.")
-            if eb is None:
-                raise FormulaError(f"swap_entities: unknown entity id '{bid}'.")
-            if aid == bid:
-                return False
-            ax, ay = ea.x, ea.y
-            bx, by = eb.x, eb.y
-            # Same-cell swap is degenerate (both entities are at the
-            # same coords, which shouldn't normally happen but is
-            # defended in case a future feature allows colocation):
-            # nothing changes, no hooks fire.
-            if (ax, ay) == (bx, by):
-                return False
-            # Fire on_exit for both at their CURRENT positions before
-            # any state changes — passives see (ea.x,ea.y) == (ax,ay).
-            match.fire_tile_hook("on_exit", aid, ax, ay)
-            match.fire_tile_hook("on_exit", bid, bx, by)
-            # Atomic position swap via direct move_to (bypasses
-            # is_occupied — required, since A and B occupy each other's
-            # target cells until the swap completes).
-            ea.move_to(bx, by)
-            eb.move_to(ax, ay)
-            # Fire on_enter + on_stop at new positions.
-            match.fire_tile_hook("on_enter", aid, bx, by)
-            match.fire_tile_hook("on_stop", aid, bx, by)
-            match.fire_tile_hook("on_enter", bid, ax, ay)
-            match.fire_tile_hook("on_stop", bid, ax, ay)
-            # Entity-side movement events.
-            match.fire_entity_moved(aid, ax, ay, bx, by)
-            match.fire_entity_moved(bid, bx, by, ax, ay)
-            self._note_affected(aid)
-            self._note_affected(bid)
-            return True
+            # The atomic swap, occupancy bypass and hook firing live in
+            # Match.swap_entities (shared with the !ent swap command).
+            try:
+                swapped, _log = match.swap_entities(aid, bid)
+            except VTTError as ex:
+                raise FormulaError(str(ex))
+            if swapped:
+                self._note_affected(aid)
+                self._note_affected(bid)
+            return swapped
 
         ns["move_entity"] = _move_entity
         ns["move_step"]   = _move_step
@@ -3422,32 +3347,10 @@ class FormulaEngine:
 
             Returns True if the entity was present and got killed,
             False if there was no such entity to begin with."""
-            eid = _eid(eid_t)
-            if eid not in match.entities:
-                return False
-            # Apply the kill effects formula first. We evaluate via the
-            # same engine but with `self` bound to the target — these
-            # writes go through the normal chokepoint, so a side-effect
-            # passive (or even the natural death check itself) might
-            # already remove the entity. The unconditional
-            # _process_death below covers the case where the effect
-            # didn't trigger natural death; the entities-check skips
-            # the call if death already happened.
-            effects = str(match.rules.get("default_kill_function_effects", "")).strip()
-            if effects:
-                kill_ctx = EvalCtx(this=match.current_entity_id(), target=eid)
-                try:
-                    engine.eval_program(effects, kill_ctx)
-                except FormulaError:
-                    # A malformed effects formula is the GM's bug; the
-                    # unconditional death below still fires, so kill
-                    # remains useful. Silently swallow — surfacing it
-                    # here would convert every kill() into a hard
-                    # failure across the whole match.
-                    pass
-            if eid in match.entities:
-                match._process_death(eid)
-            return eid not in match.entities
+            # Effects-formula run + unconditional death pipeline live in
+            # Match.kill_entity (shared with the !ent kill command).
+            killed, _log = match.kill_entity(_eid(eid_t))
+            return killed
 
         def _revive(eid_t: Any) -> str:
             """revive(eid): bring back the corpse with id `eid`. Spawns

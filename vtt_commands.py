@@ -1536,6 +1536,98 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             msg = msg + "\n" + "\n".join(hook_log)
         return await ctx.send(msg)
 
+    # push (forced movement) — !ent push <id> <dir> [n]. Thin wrapper over
+    # Match.push_entity (shared with the push_entity() formula primitive):
+    # the geometry, occupancy stop, diagonal gating and per-step hook
+    # firing all live there.
+    if sub == "push":
+        if await return_help_if_not_enough_args(ctx, args, 3, "ent", "push"):
+            return
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        n = 1
+        if len(args) >= 4:
+            try:
+                n = int(args[3])
+            except ValueError:
+                return await ctx.send(
+                    f"Push distance must be an integer, got '{args[3]}'."
+                )
+        try:
+            steps, hook_log = m.push_entity(eid, args[2], n)
+        except VTTError as e:
+            return await ctx.send(f"❌ {e}")
+        e = m.entities[eid]
+        msg = f"Pushed `{eid}` {steps} cell(s) to ({e.x},{e.y})."
+        if hook_log:
+            msg = msg + "\n" + "\n".join(hook_log)
+        return await ctx.send(msg)
+
+    # swap — !ent swap <id1> <id2>. Wraps Match.swap_entities (shared with
+    # the swap_entities() formula primitive).
+    if sub == "swap":
+        if await return_help_if_not_enough_args(ctx, args, 3, "ent", "swap"):
+            return
+        aid = _resolve_eid(m, args[1])
+        bid = _resolve_eid(m, args[2])
+        if aid not in m.entities:
+            raise NotFound(f"Entity '{aid}' not found.")
+        if bid not in m.entities:
+            raise NotFound(f"Entity '{bid}' not found.")
+        try:
+            swapped, hook_log = m.swap_entities(aid, bid)
+        except VTTError as e:
+            return await ctx.send(f"❌ {e}")
+        if not swapped:
+            return await ctx.send(
+                f"No swap: `{aid}` and `{bid}` are the same entity "
+                f"or already share a cell."
+            )
+        ea = m.entities[aid]; eb = m.entities[bid]
+        msg = (
+            f"Swapped `{aid}` ↔ `{bid}`; now at "
+            f"({ea.x},{ea.y}) and ({eb.x},{eb.y})."
+        )
+        if hook_log:
+            msg = msg + "\n" + "\n".join(hook_log)
+        return await ctx.send(msg)
+
+    # kill — !ent kill <id>. Unconditional death (bypasses the death
+    # CONDITION). Wraps Match.kill_entity (shared with the kill() formula
+    # primitive): runs default_kill_function_effects then the death
+    # pipeline (on_death, corpse-or-delete, turn-order rebuild).
+    if sub == "kill":
+        if await return_help_if_not_enough_args(ctx, args, 2, "ent", "kill"):
+            return
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        killed, hook_log = m.kill_entity(eid)
+        msg = f"Killed `{eid}`." if killed else f"`{eid}` could not be killed."
+        if hook_log:
+            msg = msg + "\n" + "\n".join(hook_log)
+        return await ctx.send(msg)
+
+    # revive — !ent revive <corpse_id>. Resurrect a stored corpse. Wraps
+    # Match.revive_corpse (shared with the revive() formula primitive):
+    # spawns the entity back at the corpse tile, runs
+    # default_revive_function_effects, fires on_revive. The id here is a
+    # CORPSE id (not a live entity), so it's used verbatim — no
+    # this/current resolution.
+    if sub == "revive":
+        if await return_help_if_not_enough_args(ctx, args, 2, "ent", "revive"):
+            return
+        cid = args[1]
+        try:
+            new_id, hook_log = m.revive_corpse(cid)
+        except VTTError as e:
+            return await ctx.send(f"❌ {e}")
+        msg = f"Revived corpse `{cid}` as `{new_id}`."
+        if hook_log:
+            msg = msg + "\n" + "\n".join(hook_log)
+        return await ctx.send(msg)
+
     # face — accepts either a direction (any alias) or a rotation token
     # (cw/ccw/clockwise/counterclockwise). Diagonal direction tokens are
     # gated by the allow_diagonal_facing rule; rotation tokens always
@@ -1907,6 +1999,48 @@ registry.annotate_sub(
         "'allow_diagonal_facing' is enabled). Use 'cw'/'clockwise' or "
         "'ccw'/'counterclockwise' to rotate one step — 90° in cardinal-"
         "only systems, 45° when diagonal facing is enabled."
+    ),
+)
+registry.annotate_sub(
+    "ent", "push",
+    usage="!ent push <id> <dir> [n]",
+    desc=(
+        "Forced movement: shove <id> up to n cells (default 1) in <dir>, "
+        "stopping at the first wall or occupied cell. Honors "
+        "'allow_diagonal_movement'. Walks cell by cell, firing per-step "
+        "tile hooks — the command equivalent of the push_entity() formula "
+        "primitive."
+    ),
+)
+registry.annotate_sub(
+    "ent", "swap",
+    usage="!ent swap <id1> <id2>",
+    desc=(
+        "Atomically exchange the positions of two entities (bypasses the "
+        "occupancy check, since they occupy each other's cells). Fires "
+        "on_exit/on_enter/on_stop and on_entity_moved for both. Command "
+        "equivalent of the swap_entities() formula primitive."
+    ),
+)
+registry.annotate_sub(
+    "ent", "kill",
+    usage="!ent kill <id>",
+    desc=(
+        "Unconditionally kill <id>, bypassing the death CONDITION. Runs "
+        "the 'default_kill_function_effects' rule then the death pipeline "
+        "(on_death, corpse-or-delete per 'death_result', turn-order "
+        "rebuild). Command equivalent of the kill() formula primitive."
+    ),
+)
+registry.annotate_sub(
+    "ent", "revive",
+    usage="!ent revive <corpse_id>",
+    desc=(
+        "Resurrect a stored corpse by its id: respawns the entity at the "
+        "corpse tile, runs 'default_revive_function_effects', fires "
+        "on_revive. The id is a CORPSE id (see `!list` Dead: section), not "
+        "a live entity. Command equivalent of the revive() formula "
+        "primitive."
     ),
 )
 registry.annotate_sub(
