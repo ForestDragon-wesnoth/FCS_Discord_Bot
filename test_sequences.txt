@@ -9085,10 +9085,13 @@ SCENARIO 360 — channel binding + per-match access overrides (fog-of-war read r
 !ent add spy Spy 20 1 1 9
 !match bind label=host-room
 !match channels
-!host access set "ent dump" host
-!host access list
 !as player watcher
 !ent info spy
+!ent dump spy
+!as host
+!host access set "ent dump" all
+!host access list
+!as player watcher
 !ent dump spy
 !as host
 !host access clear "ent dump"
@@ -9101,16 +9104,18 @@ players channel, or one per team — though the harness only has
 the single CLI channel). `!match use` already bound CLI, so
 `!match bind label=host-room` UPDATES that binding, attaching
 the label reserved for upcoming per-team / fog-of-war views;
-`!match channels` lists it. By default read-only inspect
-commands run for anyone, so as `watcher` (a player) `!ent info`
-and normally `!ent dump` both work. `!host access set "ent dump"
-host` is the owner tightening a read for a fog-of-war match: now
-a player's `!ent dump spy` is held for approval (request `r1`)
-rather than leaking the entity's full vars, while `!ent info`
-stays free. `!host access clear "ent dump"` lifts the
-restriction — `watcher`'s `!ent dump spy` runs again. These
-overrides are per-match host state, so they survive a system
-rule refresh.
+`!match channels` lists it. `!ent info` (a summary read) runs
+for anyone, so `watcher` (a player) sees it. But `!ent dump`
+reveals the entity's FULL var tree, so it is host-gated BY
+DEFAULT — `watcher`'s `!ent dump spy` is held for approval
+(request `r1`) rather than leaking everything. `!host access set
+"ent dump" all` is the owner LOOSENING that read for this match
+(e.g. an open-information game): now `watcher`'s `!ent dump spy`
+runs and shows the vars. `!host access clear "ent dump"` drops
+the override, so dump reverts to its gated default — `watcher`'s
+final `!ent dump spy` is held again (request `r2`). These
+overrides are per-match host state (they also survive a system
+rule refresh, per scenario 361).
 
 
 SCENARIO 361 — system-wide access policy + per-match override precedence + survival across rule refresh
@@ -9148,3 +9153,32 @@ access_overrides field (not in the refreshed rules), so it
 SURVIVES: scout's final `!find` still runs. Precedence:
 per-match `!host access` > system `!system access` rule >
 engine defaults.
+
+
+SCENARIO 362 — default access levels: overview reads open to players, detailed/mutating gated
+---------------------------------------------------------------------------------------------
+
+!match new acc AccessDefaults 6 6
+!match use acc
+!ent add hero Hero 30 2 2 5
+!as player bob
+!state
+!turn
+!history
+!ent info hero
+!ent dump hero
+!ent move hero 1 e
+
+Expected: The match creator (`cli`) is the owner. As player
+`bob` (no host role), the OVERVIEW reads run directly without
+approval: `!state` (summary + entities + map), bare `!turn`
+(turn order), bare `!history` (the history help/overview), and
+`!ent info hero` (the entity summary). These are player-
+available by default — good UX, no host round-trip just to look
+at the board. The SENSITIVE / MUTATING commands are still
+host-gated: `!ent dump hero` (full var tree, including any GM-
+hidden data) is held for approval (request `r1`), and `!ent move
+hero 1 e` (a mutation) is held too (request `r2`). The hero does
+not move. This is the default split — a host can loosen `ent
+dump` per match with `!host access set "ent dump" all`, or
+tighten any open read for fog-of-war (see scenarios 360-361).

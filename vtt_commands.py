@@ -64,7 +64,19 @@ Handler = Callable[[ReplyContext, List[str], MatchManager], Any]
 # downgrade can't open a write hole. The per-match command_access rule
 # can re-tighten any of them for fog-of-war matches.
 READ_ONLY_SUBCOMMANDS: frozenset = frozenset({
-    "list", "info", "dump", "cells", "diff", "channels", "hosts",
+    "list", "info", "cells", "diff", "channels", "hosts",
+})
+# `dump` is intentionally NOT in the set above: `!ent dump` reveals an
+# entity's full var tree (including GM-hidden data), so it stays host-
+# gated by default. A host can open it per match with
+# `!host access set "ent dump" all`.
+
+# Host-gated roots whose NO-ARGUMENT (view) form is read-only and should
+# be player-available, even though their subcommands mutate (`!turn
+# next`, `!history undo`). Only the bare invocation downgrades — `!undo`,
+# whose bare form itself mutates, deliberately stays gated.
+READ_ONLY_BARE_ROOTS: frozenset = frozenset({
+    "turn", "history",
 })
 
 class CommandRegistry:
@@ -223,6 +235,9 @@ class CommandRegistry:
         active Match (or None)."""
         base = self._access.get(name, "host")
         if base == "host" and args and args[0].lower() in READ_ONLY_SUBCOMMANDS:
+            base = "all"
+        elif base == "host" and not args and name in READ_ONLY_BARE_ROOTS:
+            # Bare view form of a root that mutates only via subcommands.
             base = "all"
         if m is not None:
             sub_key = f"{name} {args[0].lower()}" if args else None
@@ -928,11 +943,11 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         m = mgr.matches.get(target_mid)
         if not m:
             raise NotFound(f"Match '{target_mid}' not found.")
-        owner = m.owner or "(none)"
-        cohosts = ", ".join(f"`{c}`" for c in m.cohosts) if m.cohosts else "(none)"
+        owner = _mention(m.owner)
+        cohosts = ", ".join(_mention(c) for c in m.cohosts) if m.cohosts else "(none)"
         return await ctx.send(
             f"**{m.name}** (`{target_mid}`)\n"
-            f"- owner: `{owner}`\n- co-hosts: {cohosts}"
+            f"- owner: {owner}\n- co-hosts: {cohosts}"
         )
     if sub == "delete":# and len(args) >= 2:
         if await return_help_if_not_enough_args(ctx, args, 2, "match", "delete"):
@@ -1083,10 +1098,10 @@ async def host_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         sub = args[0].lower()
 
     if sub == "list":
-        owner = m.owner or "(none)"
-        cohosts = ", ".join(f"`{c}`" for c in m.cohosts) if m.cohosts else "(none)"
+        owner = _mention(m.owner)
+        cohosts = ", ".join(_mention(c) for c in m.cohosts) if m.cohosts else "(none)"
         return await ctx.send(
-            f"**{m.name}** hosts\n- owner: `{owner}`\n- co-hosts: {cohosts}"
+            f"**{m.name}** hosts\n- owner: {owner}\n- co-hosts: {cohosts}"
         )
 
     if sub == "access":
@@ -1134,11 +1149,11 @@ async def host_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         target = _normalize_user_token(args[1])
         if sub == "add":
             if target == m.owner:
-                return await ctx.send(f"`{target}` is already the owner.")
+                return await ctx.send(f"{_mention(target)} is already the owner.")
             added = m.add_cohost(target)
             if not added:
-                return await ctx.send(f"`{target}` is already a co-host.")
-            return await ctx.send(f"Appointed `{target}` as a co-host of **{m.name}**.")
+                return await ctx.send(f"{_mention(target)} is already a co-host.")
+            return await ctx.send(f"Appointed {_mention(target)} as a co-host of **{m.name}**.")
         # remove
         if target == m.owner:
             return await ctx.send(
@@ -1146,8 +1161,8 @@ async def host_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             )
         removed = m.remove_cohost(target)
         if not removed:
-            return await ctx.send(f"`{target}` is not a co-host.")
-        return await ctx.send(f"Removed co-host `{target}` from **{m.name}**.")
+            return await ctx.send(f"{_mention(target)} is not a co-host.")
+        return await ctx.send(f"Removed co-host {_mention(target)} from **{m.name}**.")
 
     title, body = registry.help_for(["host"])
     return await ctx.send(f"**{title}**\n{body}")
@@ -1164,6 +1179,19 @@ def _normalize_user_token(tok: str) -> str:
         if t.startswith("!"):
             t = t[1:]
     return t
+
+
+def _mention(user_id: Optional[str]) -> str:
+    """Render a user id for display. A numeric Discord snowflake becomes a
+    `<@id>` mention — on Discord that shows as a clickable @username (and
+    pings them), the traditional UX. A non-numeric identity (e.g. the CLI
+    `"cli"` stand-in) or an empty/None value is shown verbatim so output
+    still reads sensibly off Discord. Inverse of _normalize_user_token's
+    display side."""
+    if not user_id:
+        return "(none)"
+    s = str(user_id)
+    return f"<@{s}>" if s.isdigit() else f"`{s}`"
 
 
 # ---- as (CLI identity switch for previewing host vs player) -----
@@ -2943,7 +2971,7 @@ registry.annotate_sub(
 
 
 #global info about the match that isn't the map or entities
-@registry.command("match_toplevel", usage="!match_toplevel", desc="Show active match summary (name/id/round number).")
+@registry.command("match_toplevel", access="all", usage="!match_toplevel", desc="Show active match summary (name/id/round number).")
 async def match_top_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     parts = [
@@ -3161,7 +3189,7 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     return await ctx.send("\n".join(lines))
 
 
-@registry.command("state", usage="!state", desc="Show match summary, entities, and map.")
+@registry.command("state", access="all", usage="!state", desc="Show match summary, entities, and map.")
 async def state_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # New behavior: show list (turn-order) then map
     await match_top_cmd(ctx, args, mgr)
