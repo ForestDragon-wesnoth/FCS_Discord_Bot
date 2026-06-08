@@ -2,6 +2,7 @@
 
 # discord_commands.py
 from typing import Any, List
+import discord
 from discord.ext import commands
 from logic import MatchManager
 from vtt_commands import registry
