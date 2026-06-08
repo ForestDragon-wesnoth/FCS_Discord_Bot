@@ -68,6 +68,14 @@ DIRECTION_VECTORS: Dict[str, Tuple[int, int]] = {
     "down_right": ( 1,  1),
 }
 
+# Reverse of DIRECTION_VECTORS: a unit (dx, dy) step maps back to its
+# canonical direction name. Used by point-directed movement (pull_entity)
+# that recomputes a heading each step rather than walking a fixed
+# direction like push_entity does.
+_VECTOR_TO_DIRECTION: Dict[Tuple[int, int], str] = {
+    vec: name for name, vec in DIRECTION_VECTORS.items()
+}
+
 # Clockwise rotation orders. The 4-way variant is used when
 # allow_diagonal_facing is off; the 8-way when it's on. Both start at "up".
 DIRECTION_CW_ORDER_4: Tuple[str, ...] = ("up", "right", "down", "left")
@@ -168,6 +176,40 @@ def rotate_direction(facing: str, *, clockwise: bool, eight_way: bool) -> str:
     step = 1 if clockwise else -1
     return order[(idx + step) % len(order)]
 
+
+# ---- Event log (combat log) --------------------------------------------------
+# The engine appends structured event records to Match.event_log at its
+# chokepoints. Each record is a dict {type, round, turn, ...fields}; the
+# text shown by !log is produced at READ time from a per-type template,
+# so the stored data stays un-opinionated. EVENT_LOG_AUTO_TYPES are the
+# engine-emitted types (custom is reserved for the log() primitive). Each
+# is gated by the event_log_enabled master switch AND membership in the
+# event_log_events rule. The default templates below are overridable per
+# type via the event_log_format rule (a dict, edited with `!log format`).
+EVENT_LOG_AUTO_TYPES: Tuple[str, ...] = (
+    "death", "revive", "spawn", "move",
+    "damage", "heal", "status_added", "status_removed",
+    "action_used", "action_failed",
+)
+
+# Built-in render templates, keyed by event type. Same placeholder syntax
+# as entity_line_format ({key}, {?key?}...{/?}, dotted paths, \n). The
+# fields available per type are whatever Match.log_event stores for it
+# (see each call site). A type with no override and no entry here renders
+# as a compact key=value dump (see the !log command).
+EVENT_LOG_DEFAULT_FORMATS: Dict[str, str] = {
+    "death":          "💀 {name} (`{entity}`) died at ({x},{y}).",
+    "revive":         "✨ {name} (`{entity}`) was revived.",
+    "spawn":          "➕ {name} (`{entity}`) spawned at ({x},{y}).",
+    "move":           "👣 {name} (`{entity}`) moved ({from_x},{from_y})→({to_x},{to_y}).",
+    "damage":         "🩸 {name} (`{entity}`) took {amount} damage ({var} {old}→{new}).",
+    "heal":           "💚 {name} (`{entity}`) healed {amount} ({var} {old}→{new}).",
+    "status_added":   "🔆 {name} (`{entity}`) gained status `{status}`.",
+    "status_removed": "🔅 {name} (`{entity}`) lost status `{status}`.",
+    "action_used":    "⚔️ {actor_name} (`{actor}`) used `{action}`{?target?} → {target}{/?}.",
+    "action_failed":  "✖️ {actor_name} (`{actor}`) failed `{action}`: {message}",
+    "custom":         "{message}",
+}
 
 # ---- Rule registry & model ---------------------------------------------------
 # Each rule now has a default, schema, and description. GameSystems store
@@ -821,6 +863,108 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "system-level clamps on the same path; see !clamp add/remove/list."
         ),
     },
+    # Default passives injected onto every entity at creation. Each entry
+    # is a passive-spec dict (id/when/formula, optional target/scope —
+    # the same shape Passive.to_dict produces). When an entity is created
+    # (via !ent add, summon, OR revive — every path routes through
+    # Entity.spawn), each default passive whose id the entity does not
+    # already carry is copied onto it BEFORE on_entity_spawned fires, so
+    # a default passive may itself observe the spawn. This is an
+    # injection, NOT an enforcement: the GM (or a formula) can remove a
+    # default passive from an individual entity afterward and it stays
+    # gone — until that entity is re-spawned (e.g. revived), at which
+    # point the defaults are re-applied. Edit via !defpassive add/remove/
+    # list (NOT !system set, which can't handle structured values), the
+    # same pattern default_clamps uses with !gclamp. Empty (default) =
+    # no injection.
+    "default_entity_passives": {
+        "default": [],
+        "schema": {"type": "list"},
+        "desc": (
+            "List of passive specs (each {id, when, formula, target?, "
+            "scope?}) copied onto every entity at creation (add / summon "
+            "/ revive — all route through Entity.spawn), applied before "
+            "on_entity_spawned fires. A default whose id the entity "
+            "already has is skipped (so revive is idempotent for kept "
+            "passives). Injection only, never re-enforced — remove one "
+            "from an entity and it stays gone until that entity is "
+            "re-spawned. Edit via !defpassive add/remove/list, not "
+            "!system set."
+        ),
+    },
+    # ---- Event log (combat log) ----------------------------------------
+    "event_log_enabled": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Master switch for the structured event log (the combat log). "
+            "When True (default), the engine records curated combat events "
+            "at its chokepoints and the log() formula primitive appends "
+            "custom entries; view with `!log`. False disables ALL logging "
+            "(auto events and log()) — existing entries are kept but no "
+            "new ones are added. The log is a separate store: it never "
+            "changes command replies, only what `!log` shows."
+        ),
+    },
+    "event_log_events": {
+        "default": ",".join(EVENT_LOG_AUTO_TYPES),
+        "schema": {"type": "str"},
+        "desc": (
+            "Comma-separated list of which AUTO event types the engine "
+            "records (subject to event_log_enabled). Default is all of "
+            "them: " + ", ".join(EVENT_LOG_AUTO_TYPES) + ". Trim it to cut "
+            "noise — e.g. drop `move` and `damage`/`heal` for a "
+            "lifecycle-only log. The `custom` type (from the log() "
+            "primitive) is always allowed when logging is enabled and is "
+            "not gated by this list."
+        ),
+    },
+    "event_log_retention": {
+        "default": 200,
+        "schema": {"type": "int"},
+        "desc": (
+            "Cap on the number of event-log entries kept. When the log "
+            "exceeds this, the oldest entries are dropped. Default 200. "
+            "-1 = unlimited (memory grows with the match); 0 = keep "
+            "nothing (logging effectively off even if enabled)."
+        ),
+    },
+    "event_log_format": {
+        "default": {},
+        "schema": {"type": "dict"},
+        "desc": (
+            "Per-type render-template OVERRIDES for the event log, keyed "
+            "by event type. A type with no override uses the engine's "
+            "built-in default template; a type with neither renders as a "
+            "compact key=value dump. Same placeholder syntax as "
+            "entity_line_format ({key}, {?key?}...{/?}, dotted paths, "
+            "\\n). Each event's available fields are whatever the engine "
+            "stored for it (see `!log` / the type's default template). "
+            "Edit via `!log format <type> <template>` (NOT !system set — "
+            "it's a structured value)."
+        ),
+    },
+    "command_access": {
+        "default": {},
+        "schema": {"type": "dict"},
+        "desc": (
+            "Per-match OVERRIDES for the command access gate, keyed by "
+            "command name or 'name sub' (e.g. \"find\" or \"ent dump\"). "
+            "The value is one of: \"all\" (anyone may run it), \"host\" "
+            "(hosts run directly, a non-host's invocation is held for "
+            "approval), \"host_only\" (hosts only, non-hosts rejected — no "
+            "queue), \"owner\" (owner only). The engine's defaults make "
+            "every state-mutating command \"host\" and read-only inspect "
+            "subcommands (list/info/dump/cells/diff/channels/hosts) "
+            "\"all\"; use this rule to TIGHTEN reads that would leak "
+            "hidden information in a fog-of-war / invisibility match "
+            "(e.g. {\"ent dump\": \"host\", \"find\": \"host\"}) or to "
+            "loosen a normally-gated command. A 'name sub' key beats a "
+            "bare 'name' key. Edit via `!system set` is awkward for a "
+            "dict; set it through the system's settings or a future "
+            "dedicated command."
+        ),
+    },
     # "movement_block_through": {
     #     "default": False,
     #     "schema": {"type": "bool"},
@@ -930,6 +1074,15 @@ def _coerce_rule_value(key: str, raw_value: str):
             f"Setting '{key}' is a structured list and can't be edited via "
             f"!system set. Use the dedicated commands for this rule "
             f"(e.g. !gclamp add/remove/list for default_clamps)."
+        )
+
+    if t == "dict":
+        # Structured dict-valued rules (currently: event_log_format) aren't
+        # editable via the flat key=value !system set command either.
+        raise VTTError(
+            f"Setting '{key}' is a structured dict and can't be edited via "
+            f"!system set. Use the dedicated command for this rule "
+            f"(e.g. !log format <type> <template> for event_log_format)."
         )
 
     raise VTTError(f"Invalid schema for setting '{key}'.")
@@ -1195,6 +1348,44 @@ TILE_HOOK_NAMES: Set[str] = {
     "on_turn_start",
     "on_turn_end",
 }
+
+# Zone hooks live in zones[name]["hooks"][<name>] as formula strings. A
+# zone is a NAMED set of cells (Match.zones) — unlike a tile (one cell),
+# a zone covers many and can be reshaped/moved. Zones carry TWO movement
+# hook families plus the time hooks:
+#   Boundary hooks (on_enter/on_exit/on_stop) fire ONCE when an entity
+#     CROSSES the zone's edge — entering from outside, leaving to outside,
+#     or stopping inside. Moving cell-to-cell WITHIN the zone fires none
+#     of these. This is the "you entered the room" semantics.
+#   Per-cell hooks (on_cell_enter/on_cell_exit/on_cell_stop) mirror tile
+#     movement hooks: they fire for EVERY cell of the zone stepped into /
+#     out of / stopped on, even while moving within the zone. This is the
+#     "the gas damages you each cell you walk through" semantics.
+#   Time hooks (on_round_*, on_turn_*) fire once per zone carrying them
+#     at the lifecycle moment, like tile time hooks.
+# Bindings: zone_name, plus tile_x/tile_y (the crossed/stepped cell) for
+# movement hooks. `self` = the moving/acting entity (or current-turn
+# entity for time hooks; unbound if none). Kept separate from HOOK_NAMES
+# and TILE_HOOK_NAMES — only zone-stored formulas subscribe. See
+# Match.fire_zone_hook / fire_zone_move_hooks / fire_zone_time_hooks.
+ZONE_HOOK_NAMES: Set[str] = {
+    # Boundary (fire once on a zone-edge crossing)
+    "on_enter",
+    "on_exit",
+    "on_stop",
+    # Per-cell (fire per cell of the zone, like tile hooks)
+    "on_cell_enter",
+    "on_cell_exit",
+    "on_cell_stop",
+    # Time
+    "on_round_start",
+    "on_round_end",
+    "on_turn_start",
+    "on_turn_end",
+}
+# Reserved top-level keys inside a zone dict (everything else under
+# zones[name]["data"] is free-form GM data).
+ZONE_RESERVED_KEYS = frozenset({"cells", "data", "hooks", "glyph"})
 
 # Var hooks distinguished from lifecycle hooks. Useful for code paths that
 # need to know whether to expect a var-event payload.
@@ -2323,7 +2514,20 @@ class Entity:
         # initial creation event.
         if needs_max_hp_default:
             self.write_var(max_hp_var, default_max_hp_value)
+        # Inject the system's default passives BEFORE on_entity_spawned
+        # fires, so a default passive can itself react to the spawn. Skip
+        # any whose id the entity already carries — keeps revive (which
+        # re-runs spawn on a corpse snapshot that already has them)
+        # idempotent, and lets a per-entity definition shadow a default.
+        match._apply_default_passives(self)
         log = match.fire_hook("on_entity_spawned", target_ids=[self.id])
+        # Spawn event — but NOT during a revive (the entity sits in the
+        # death-suppressed set only across the revive's spawn window), so
+        # a revive emits just its own "revive" event, not a duplicate
+        # "spawn". A normal !ent add / summon is never in that set.
+        if self.id not in match._death_check_suppressed_ids:
+            match.log_event("spawn", entity=self.id, name=self.name,
+                            x=self.x, y=self.y)
         return (self.id, log)
 
     def remove(self):
@@ -2344,6 +2548,10 @@ class Entity:
             elif m.active_index > idx:
                 m.active_index = max(0, m.active_index - 1)
         m._scrub_entity_from_groups(self.id)
+        # Drop any entity-attached scheduled effects bound to this entity
+        # — a dead/despawned entity's pending turn-delayed effects don't
+        # fire and don't dangle to a future same-id entity.
+        m._prune_entity_scheduled(self.id)
         self._match = None
         m._rebuild_turn_order()
 
@@ -2382,10 +2590,17 @@ class Entity:
             # actual move). Matches the intuition that "tp to where I
             # am" is a no-op rather than a fire-and-reverse cycle.
             log.extend(m.fire_tile_hook("on_exit", self.id, old_x, old_y))
+            log.extend(m.fire_zone_exit_hooks(self.id, old_x, old_y, x, y))
         self.move_to(x, y)
         if fire_hooks:
             log.extend(m.fire_tile_hook("on_enter", self.id, x, y))
             log.extend(m.fire_tile_hook("on_stop", self.id, x, y))
+            # A tp is a single, final step; zone enter + stop fire here.
+            # (For a same-cell tp, fire_zone_enter_hooks still fires
+            # on_stop/on_cell_stop for the standing-on zones — a tp that
+            # "lands" re-affirms its stop, matching on_stop's tile
+            # semantics which fire even on a same-cell tp.)
+            log.extend(m.fire_zone_enter_hooks(self.id, old_x, old_y, x, y, True))
             # Entity-side movement event. Fires once per tp call (not
             # per step), AFTER the tile hooks so a passive observing
             # the move sees the final (x, y) and any side-effects the
@@ -2466,10 +2681,17 @@ class Entity:
             step_from_x, step_from_y = self.x, self.y
             if fire_hooks:
                 log.extend(m.fire_tile_hook("on_exit", self.id, self.x, self.y))
+                log.extend(m.fire_zone_exit_hooks(
+                    self.id, step_from_x, step_from_y, nx, ny))
             self.facing = step_facing
             self.move_to(nx, ny)
             if fire_hooks:
                 log.extend(m.fire_tile_hook("on_enter", self.id, nx, ny))
+                # Per-step zone enter (boundary on_enter + per-cell
+                # on_cell_enter); the stop hooks fire once after the loop
+                # at the final cell, like tile on_stop below.
+                log.extend(m.fire_zone_enter_hooks(
+                    self.id, step_from_x, step_from_y, nx, ny, False))
                 # Per-step entity hook: fires AFTER on_enter so
                 # passives see whatever the just-entered tile already
                 # applied (e.g. a damage tile's hp delta) on top of
@@ -2484,6 +2706,7 @@ class Entity:
             # movement happened (zero-step move_dirs) — empty step_path
             # means no transit and therefore no stop.
             log.extend(m.fire_tile_hook("on_stop", self.id, self.x, self.y))
+            log.extend(m.fire_zone_stop_hooks(self.id, self.x, self.y))
             # on_entity_moved fires ONCE for the whole stepwise move,
             # with from = origin and to = final position. Step-level
             # observation is via tile on_enter/on_exit; on_entity_moved
@@ -2720,6 +2943,34 @@ class Entity:
         if is_top_level_write and self._match is not None and self._match._var_event_warnings:
             combined.extend(self._match._var_event_warnings)
             self._match._var_event_warnings = []
+        # Damage / heal event logging. A top-level NUMERIC change to the
+        # hp var becomes a damage (decrease) or heal (increase) event —
+        # logged before the death check so a fatal blow reads
+        # "damage ... then death" in the log. Only 'changed' events count
+        # (an initial 'created' hp write at spawn isn't damage). Skipped
+        # while this entity is in the revive window (its hp-restore is the
+        # revive mechanic, not combat healing — the revive emits a single
+        # 'revive' event, same reason spawn is suppressed there). No-op
+        # unless those event types are enabled.
+        if (is_top_level_write and self._match is not None
+                and self.id in self._match.entities
+                and self.id not in self._match._death_check_suppressed_ids
+                and self._match.rules.get("event_log_enabled", True)):
+            hp_var = self._match.rules.get("hp_var", "hp")
+            for ev in leaf_events:
+                if ev.key != hp_var or ev.kind != "changed":
+                    continue
+                old_v, new_v = ev.old_value, ev.new_value
+                if (isinstance(old_v, (int, float)) and not isinstance(old_v, bool)
+                        and isinstance(new_v, (int, float)) and not isinstance(new_v, bool)
+                        and new_v != old_v):
+                    self._match.log_event(
+                        "damage" if new_v < old_v else "heal",
+                        entity=self.id, name=self._match._entity_name(self.id),
+                        var=hp_var, old=old_v, new=new_v,
+                        amount=abs(new_v - old_v),
+                    )
+                break
         # Death check. Runs at TOP-LEVEL writes only — a passive whose
         # body writes more vars accumulates events in the same chain;
         # we don't want to evaluate the death condition mid-chain
@@ -2974,6 +3225,22 @@ class Match:
     # objects can't have non-string keys.
     tiles: Dict[Tuple[int, int], Dict[str, Any]] = field(default_factory=dict)
 
+    # Zone registry. A zone is a NAMED region — a set of cells plus a
+    # free-form data dict, optional hook formulas, and an optional map
+    # glyph. Keyed by zone name. Each value is a dict:
+    #   {"cells": Set[(x,y)], "data": {...}, "hooks": {when: src},
+    #    "glyph": "g"}
+    # Unlike tiles (one cell, keyed by coord), a zone spans many cells,
+    # can overlap other zones and tiles, and can be reshaped or shifted
+    # after creation (the "3x3 gas cloud that drifts" case). `cells` is a
+    # set of (x,y) tuples in memory for O(1) membership; to_dict encodes
+    # it as a sorted list of [x,y]. Data is read/written via the zone_*
+    # formula functions and the !zone command (dotted paths under
+    # "data"); hooks fire on zone-boundary crossings (on_enter/exit/stop),
+    # per cell within the zone (on_cell_enter/exit/stop), and at
+    # round/turn lifecycle moments. See the zone_* methods below.
+    zones: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
     # Special-tile TEMPLATE registry. Reusable tile-kind definitions
     # (e.g. "flame", "spike", "treasure_chest"). Each template carries
     # default data and hook formulas; a placed tile that references a
@@ -3002,6 +3269,85 @@ class Match:
     # handler lookup, so an alias can shadow a built-in name on this
     # match without affecting other matches.
     aliases: Dict[str, str] = field(default_factory=dict)
+
+    # Match-level scratchpad vars. A free-form dict of GM-defined global
+    # state that belongs to the MATCH rather than any single entity —
+    # "alarm_level", "objective_progress", "weather", a doom counter,
+    # etc. Mirrors the dict-shaped, dotted-path conventions used by
+    # entity vars and tile data: formulas read/write via the reserved
+    # `match` root (`match.alarm_level = match.alarm_level + 1`) or the
+    # match_var_* functions for runtime paths; the command surface is
+    # `!match var set/get/del/list`. Deliberately UN-opinionated — the
+    # engine attaches no meaning to any key. Unlike entity vars, writes
+    # here do NOT fire var hooks (there's no per-entity passive owner to
+    # observe them); a global passive that needs to react should watch
+    # the entity-side effect it triggers. Serialized with the match.
+    vars: Dict[str, Any] = field(default_factory=dict)
+
+    # Scheduled / delayed effects queue. Each entry is a dict:
+    #   {name, kind, body, eid?, fire_round? / turns_left?}
+    # kind "round" entries are MATCH-level (eid=None) and fire at
+    # on_round_start once round_number reaches fire_round; kind "turn"
+    # entries are ENTITY-attached (eid set) and fire at that entity's
+    # on_turn_start once turns_left counts down to 0. Created via the
+    # schedule() / schedule_on() formula primitives, cancellable by name
+    # via cancel_schedule(). Entity-attached entries are pruned when their
+    # entity is removed (death or despawn) — that's the "dropped if the
+    # entity dies" contract. Serialized with the match. See
+    # Match.add_scheduled / fire_scheduled_round / fire_scheduled_turn.
+    scheduled: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Structured event log (the combat log). Each entry is a dict with at
+    # least {type, round, turn, ...type-specific fields}. The engine
+    # appends curated combat events at its chokepoints (death, action,
+    # status, move, hp change, spawn/revive) when the matching
+    # event_log_<type> rule is on; the log() formula primitive appends
+    # custom entries. Rendering to text happens at read time (!log) via
+    # the event_log_format rule's per-type templates. Capped by
+    # event_log_retention. Serialized with the match. See
+    # Match.log_event.
+    event_log: List[Dict[str, Any]] = field(default_factory=list)
+
+    # ---- host / access control ----
+    # `owner` is the user id (Discord author id, or "cli" at the CLI) of
+    # whoever created the match. The owner has full command privileges
+    # and is the ONLY identity that can manage the host list. `cohosts`
+    # are user ids the owner has appointed; they share the owner's
+    # command privileges but cannot themselves appoint/remove hosts.
+    # Together {owner} | cohosts are "the hosts" — see is_host(). A
+    # command sent by a non-host against this match is held for host
+    # approval (see pending_requests) rather than executed. Both persist
+    # with the match; the owner is set at creation by MatchManager.
+    owner: Optional[str] = None
+    cohosts: List[str] = field(default_factory=list)
+
+    # Per-match host overrides for the command access gate, keyed by
+    # command name or "name sub" -> level ("all"/"host"/"host_only"/
+    # "owner"). Set by the owner via `!host access`. Takes precedence over
+    # the system-level command_access rule AND survives a system rule
+    # refresh (it's match state, not a snapshotted rule), so a host can
+    # lock down reads for a fog-of-war match without the next !system set
+    # wiping it. Persisted with the match.
+    access_overrides: Dict[str, str] = field(default_factory=dict)
+
+    # Channels bound to this match. channel_key -> metadata dict (an
+    # optional free-form {"label": ...} reserved for the upcoming
+    # fog-of-war / per-team-view work; the engine attaches no meaning to
+    # it yet). MULTIPLE channels can bind one match, uncapped — e.g. a
+    # host channel plus a players channel, or one channel per team. The
+    # manager's active_by_channel pointer is kept in sync (binding a
+    # channel makes the match active there). Persisted with the match.
+    bound_channels: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    # ---- runtime-only: pending approval queue ----
+    # Requests from non-host users awaiting host approval, keyed by a
+    # short per-match id ("r1", "r2", ...). Each value is a dict
+    # {id, user, user_name, name, args, channel_key}. NOT serialized —
+    # ephemeral, lives only as long as the in-memory match. Mutated via
+    # add_pending_request / pop_pending_request.
+    pending_requests: Dict[str, Dict[str, Any]] = field(
+        default_factory=dict, repr=False)
+    _request_seq: int = field(default=0, repr=False)
 
     # ---- runtime-only state for var-hook recursion safeguard ----
     # Tracks how deep we are in a chain of var-hook fires. A passive's
@@ -3072,6 +3418,17 @@ class Match:
     # circuit nested checks. Reset to 0 once the death pipeline
     # finishes. Not serialized.
     _death_processing: int = field(default=0, repr=False, compare=False)
+    # Per-entity death-check suppression. Holds the ids whose automatic
+    # death-condition re-check is currently deferred — used by
+    # revive_corpse to shield ONLY the entity being respawned from its
+    # transient corpse death-state (hp<=0) while spawn / revive-effects /
+    # on_revive run, WITHOUT masking deaths the same writes might cause on
+    # other entities (which the match-global _death_processing counter
+    # would). Explicit kill() bypasses check_death and so is unaffected —
+    # only the automatic condition check is deferred. Not serialized.
+    _death_check_suppressed_ids: Set[str] = field(
+        default_factory=set, repr=False, compare=False
+    )
 
     # ---- global constraints / helpers (unchanged in spirit) ----
     def in_bounds(self, x: int, y: int) -> bool:
@@ -3203,6 +3560,343 @@ class Match:
             del parent[parent_key]
         if not self.tiles[(x, y)]:
             del self.tiles[(x, y)]
+
+    # ---- zones (named multi-cell regions) ----------------------------
+    # A zone is a named SET of cells plus a free-form data dict, optional
+    # hook formulas, and an optional map glyph (see the `zones` field and
+    # ZONE_HOOK_NAMES). These methods are the chokepoints the !zone
+    # command and the zone_* formula functions share. `cells` is held as
+    # a set of (x,y) tuples in memory; serialization encodes it as a
+    # sorted list of [x,y].
+    @staticmethod
+    def _zone_to_dict(z: Dict[str, Any]) -> Dict[str, Any]:
+        cells = z.get("cells") or set()
+        out: Dict[str, Any] = {
+            "cells": [[x, y] for (x, y) in sorted(cells)],
+            "data": z.get("data") or {},
+            "hooks": z.get("hooks") or {},
+        }
+        g = z.get("glyph")
+        if isinstance(g, str) and len(g) == 1:
+            out["glyph"] = g
+        return out
+
+    def _zone_from_dict(self, zdef: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(zdef, dict):
+            return None
+        cells: Set[Tuple[int, int]] = set()
+        raw_cells = zdef.get("cells")
+        if isinstance(raw_cells, list):
+            for pair in raw_cells:
+                if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                    try:
+                        x, y = int(pair[0]), int(pair[1])
+                    except (TypeError, ValueError):
+                        continue
+                    if self.in_bounds(x, y):
+                        cells.add((x, y))
+        data = zdef.get("data")
+        hooks = zdef.get("hooks")
+        z: Dict[str, Any] = {
+            "cells": cells,
+            "data": copy.deepcopy(data) if isinstance(data, dict) else {},
+            "hooks": {
+                k: v for k, v in hooks.items()
+                if isinstance(k, str) and isinstance(v, str)
+            } if isinstance(hooks, dict) else {},
+        }
+        g = zdef.get("glyph")
+        if isinstance(g, str) and len(g) == 1:
+            z["glyph"] = g
+        return z
+
+    def has_zone(self, name: str) -> bool:
+        return name in self.zones
+
+    def _require_zone(self, name: str) -> Dict[str, Any]:
+        z = self.zones.get(name)
+        if z is None:
+            raise NotFound(f"Zone '{name}' not found.")
+        return z
+
+    def create_zone(self, name: str, *, overwrite: bool = False) -> Dict[str, Any]:
+        """Create an empty zone. Raises DuplicateId if it exists unless
+        overwrite=True."""
+        if not isinstance(name, str) or not name.strip():
+            raise VTTError("Zone name must be a non-empty string.")
+        if name in self.zones and not overwrite:
+            raise DuplicateId(f"Zone '{name}' already exists.")
+        self.zones[name] = {"cells": set(), "data": {}, "hooks": {}}
+        return self.zones[name]
+
+    def delete_zone(self, name: str) -> None:
+        if name not in self.zones:
+            raise NotFound(f"Zone '{name}' not found.")
+        del self.zones[name]
+
+    def zone_add_cell(self, name: str, x: int, y: int,
+                      *, create: bool = True) -> bool:
+        """Add cell (x,y) to a zone (creating the zone if missing and
+        create=True). Returns True iff newly added. Off-grid cells are
+        rejected."""
+        if not self.in_bounds(x, y):
+            raise OutOfBounds(
+                f"({x},{y}) outside {self.grid_width}x{self.grid_height}"
+            )
+        z = self.zones.get(name)
+        if z is None:
+            if not create:
+                raise NotFound(f"Zone '{name}' not found.")
+            z = self.create_zone(name)
+        if (x, y) in z["cells"]:
+            return False
+        z["cells"].add((x, y))
+        return True
+
+    def zone_remove_cell(self, name: str, x: int, y: int) -> bool:
+        """Remove cell (x,y) from a zone. Returns True iff it was present.
+        An emptied zone still exists (data/hooks preserved)."""
+        z = self._require_zone(name)
+        if (x, y) in z["cells"]:
+            z["cells"].discard((x, y))
+            return True
+        return False
+
+    def zone_fill_rect(self, name: str, x1: int, y1: int, x2: int, y2: int,
+                       *, create: bool = True) -> int:
+        """Add every in-bounds cell of the rectangle (x1,y1)-(x2,y2) to a
+        zone (corners in any order). Returns the count of NEWLY added
+        cells."""
+        z = self.zones.get(name)
+        if z is None:
+            if not create:
+                raise NotFound(f"Zone '{name}' not found.")
+            z = self.create_zone(name)
+        xa, xb = sorted((int(x1), int(x2)))
+        ya, yb = sorted((int(y1), int(y2)))
+        added = 0
+        for xx in range(xa, xb + 1):
+            for yy in range(ya, yb + 1):
+                if self.in_bounds(xx, yy) and (xx, yy) not in z["cells"]:
+                    z["cells"].add((xx, yy))
+                    added += 1
+        return added
+
+    def zone_shift(self, name: str, dx: int, dy: int) -> int:
+        """Translate every cell of the zone by (dx,dy). Cells that would
+        leave the grid are DROPPED (a zone may drift off the edge and,
+        with an opposite shift, partially return — only on-grid cells
+        survive each shift). Returns the number of cells retained."""
+        z = self._require_zone(name)
+        dx, dy = int(dx), int(dy)
+        new: Set[Tuple[int, int]] = set()
+        for (x, y) in z["cells"]:
+            nx, ny = x + dx, y + dy
+            if self.in_bounds(nx, ny):
+                new.add((nx, ny))
+        z["cells"] = new
+        return len(new)
+
+    def zone_cell_list(self, name: str) -> List[List[int]]:
+        z = self._require_zone(name)
+        return [[x, y] for (x, y) in sorted(z["cells"])]
+
+    def zone_size(self, name: str) -> int:
+        """Cell count of a zone (0 if the zone doesn't exist)."""
+        z = self.zones.get(name)
+        return len(z["cells"]) if z is not None else 0
+
+    def zones_at(self, x: int, y: int) -> Set[str]:
+        """Names of every zone whose footprint includes (x,y)."""
+        return {name for name, z in self.zones.items() if (x, y) in z["cells"]}
+
+    def cell_in_zone(self, x: int, y: int, name: str) -> bool:
+        z = self.zones.get(name)
+        return z is not None and (x, y) in z["cells"]
+
+    def entity_zones(self, eid: str) -> Set[str]:
+        """Names of every zone the entity currently stands in."""
+        e = self.entities.get(eid)
+        if e is None:
+            return set()
+        return self.zones_at(e.x, e.y)
+
+    def entities_in_zone(self, name: str) -> List[str]:
+        """Ids of every alive entity standing on a cell of the zone, in
+        insertion order. [] for a missing zone."""
+        z = self.zones.get(name)
+        if z is None:
+            return []
+        cells = z["cells"]
+        return [
+            eid for eid, e in self.entities.items()
+            if getattr(e, "is_alive", True) and (e.x, e.y) in cells
+        ]
+
+    # ---- zone data accessors (dotted paths under zone["data"]) -------
+    def zone_get_path(self, name: str, path: str) -> Any:
+        z = self._require_zone(name)
+        if not path:
+            raise VTTError("zone path cannot be empty.")
+        cur: Any = z["data"]
+        for key in path.split("."):
+            if not isinstance(cur, dict) or key not in cur:
+                raise NotFound(f"zone '{name}' has no value at '{path}'.")
+            cur = cur[key]
+        return cur
+
+    def zone_has_path(self, name: str, path: str) -> bool:
+        z = self.zones.get(name)
+        if z is None or not path:
+            return False
+        cur: Any = z["data"]
+        for key in path.split("."):
+            if not isinstance(cur, dict) or key not in cur:
+                return False
+            cur = cur[key]
+        return True
+
+    def zone_set_path(self, name: str, path: str, value: Any,
+                      *, create: bool = True) -> None:
+        z = self.zones.get(name)
+        if z is None:
+            if not create:
+                raise NotFound(f"Zone '{name}' not found.")
+            z = self.create_zone(name)
+        if not path:
+            raise VTTError("zone path cannot be empty.")
+        d = z["data"]
+        parts = path.split(".")
+        for i, key in enumerate(parts[:-1]):
+            existing = d.get(key)
+            if existing is not None and not isinstance(existing, dict):
+                where = ".".join(parts[:i + 1])
+                raise VTTError(
+                    f"zone '{name}' value at '{where}' is "
+                    f"{type(existing).__name__}, not a dict — cannot set a "
+                    f"nested key under it without clobbering."
+                )
+            if key not in d:
+                d[key] = {}
+            d = d[key]
+        d[parts[-1]] = value
+
+    def zone_del_path(self, name: str, path: str) -> None:
+        """Delete a dotted key from a zone's data, pruning emptied
+        parents. Raises NotFound if the path is absent."""
+        z = self._require_zone(name)
+        if not path:
+            raise VTTError("zone path cannot be empty.")
+        parts = path.split(".")
+        chain: List[Dict[str, Any]] = [z["data"]]
+        cur: Any = z["data"]
+        for key in parts[:-1]:
+            if not isinstance(cur, dict) or key not in cur:
+                raise NotFound(f"zone '{name}' has no value at '{path}'.")
+            cur = cur[key]
+            chain.append(cur)
+        leaf_parent = chain[-1]
+        if not isinstance(leaf_parent, dict) or parts[-1] not in leaf_parent:
+            raise NotFound(f"zone '{name}' has no value at '{path}'.")
+        del leaf_parent[parts[-1]]
+        for i in range(len(chain) - 1, 0, -1):
+            if chain[i]:
+                break
+            del chain[i - 1][parts[i - 1]]
+
+    def zone_clear_data(self, name: str) -> int:
+        """Drop ALL data from a zone (keeps cells + hooks). Returns the
+        number of top-level keys removed."""
+        z = self._require_zone(name)
+        n = len(z["data"])
+        z["data"] = {}
+        return n
+
+    # ---- host / access control ---------------------------------------
+    def is_owner(self, user: Optional[str]) -> bool:
+        """True iff `user` is the match owner. An unset owner (legacy /
+        CLI-less load) treats nobody as owner."""
+        return user is not None and self.owner == user
+
+    def is_host(self, user: Optional[str]) -> bool:
+        """True iff `user` is the owner or an appointed co-host — i.e. has
+        full command privileges on this match."""
+        if user is None:
+            return False
+        return user == self.owner or user in self.cohosts
+
+    def host_ids(self) -> List[str]:
+        """Owner first, then co-hosts in appointment order. Empty if no
+        owner is set."""
+        out: List[str] = []
+        if self.owner is not None:
+            out.append(self.owner)
+        out.extend(c for c in self.cohosts if c != self.owner)
+        return out
+
+    def add_cohost(self, user: str) -> bool:
+        """Appoint a co-host. No-op (returns False) if they're already the
+        owner or a co-host; raises on an empty id."""
+        if not isinstance(user, str) or not user.strip():
+            raise VTTError("co-host user id must be a non-empty string.")
+        if user == self.owner or user in self.cohosts:
+            return False
+        self.cohosts.append(user)
+        return True
+
+    def remove_cohost(self, user: str) -> bool:
+        """Remove a co-host. Returns False if they weren't one. The owner
+        is never in cohosts and can't be removed here."""
+        if user in self.cohosts:
+            self.cohosts.remove(user)
+            return True
+        return False
+
+    # ---- channel binding ---------------------------------------------
+    def bind_channel(self, channel_key: str,
+                     label: Optional[str] = None) -> bool:
+        """Bind a channel to this match. Returns True if newly bound,
+        False if it was already bound (label still updated). The caller
+        (command layer) is responsible for keeping MatchManager's
+        active_by_channel pointer in sync."""
+        if not isinstance(channel_key, str) or not channel_key:
+            raise VTTError("channel key must be a non-empty string.")
+        newly = channel_key not in self.bound_channels
+        meta = self.bound_channels.get(channel_key, {})
+        if label is not None:
+            meta["label"] = label
+        self.bound_channels[channel_key] = meta
+        return newly
+
+    def unbind_channel(self, channel_key: str) -> bool:
+        """Unbind a channel. Returns False if it wasn't bound."""
+        if channel_key in self.bound_channels:
+            del self.bound_channels[channel_key]
+            return True
+        return False
+
+    # ---- pending approval queue --------------------------------------
+    def add_pending_request(self, *, user: Optional[str], user_name: str,
+                            name: str, args: List[str],
+                            channel_key: str) -> Dict[str, Any]:
+        """Queue a non-host command for host approval. Returns the stored
+        request dict (its `id` is a short per-match token)."""
+        self._request_seq += 1
+        rid = f"r{self._request_seq}"
+        req = {
+            "id": rid,
+            "user": user,
+            "user_name": user_name,
+            "name": name,
+            "args": list(args),
+            "channel_key": channel_key,
+        }
+        self.pending_requests[rid] = req
+        return req
+
+    def pop_pending_request(self, rid: str) -> Optional[Dict[str, Any]]:
+        """Remove and return a pending request by id, or None if absent."""
+        return self.pending_requests.pop(rid, None)
 
     # ---- tile-template registry --------------------------------------
     # Templates are the "kind" / "class" definitions; placed tiles in
@@ -3483,6 +4177,71 @@ class Match:
         log = e.move_dirs([(canon, steps)])
         return steps, log
 
+    def pull_entity(self, eid: str, tx: int, ty: int, n: int = 1) -> Tuple[int, List[str]]:
+        """Forced movement TOWARD a point: step `eid` up to `n` cells
+        toward (tx, ty), stopping at the first blocked cell (off-grid,
+        or — for a non-stackable mover — an occupied cell) or once the
+        entity reaches the target cell. Returns (cells_actually_moved,
+        hook_log).
+
+        The point-directed twin of push_entity: where push walks a FIXED
+        direction away, pull recomputes a heading toward the target each
+        step, so the path curves toward (tx, ty). Each step reduces the
+        Chebyshev gap by moving one cell on whichever axes still differ.
+        When allow_diagonal_movement is off, a step that would be diagonal
+        collapses to the dominant axis (the larger remaining delta; ties
+        favor the horizontal axis), matching the cardinal-only feel of
+        !ent move. The committed path goes through Entity.move_dirs, so
+        per-step tile on_enter/on_exit and the final on_stop /
+        on_entity_moved fire exactly as a stepwise move would — a pulled
+        entity is dragged through fire tiles cell by cell.
+
+        Raises VTTError on an unknown entity, non-int target coords, or a
+        non-int `n`. (tx, ty) need NOT be in bounds — pulling toward an
+        off-grid point just drags the entity to the board edge.
+
+        Shared implementation behind the pull_entity() formula primitive
+        and the `!ent pull` command."""
+        e = self.entities.get(eid)
+        if e is None:
+            raise NotFound(f"Entity '{eid}' not found.")
+        for label, val in (("tx", tx), ("ty", ty), ("n", n)):
+            if not isinstance(val, int) or isinstance(val, bool):
+                raise VTTError(f"pull: {label} must be an integer.")
+        if n <= 0:
+            return 0, []
+        allow_diag = bool(self.rules.get("allow_diagonal_movement", False))
+        stackable = e.is_cell_stackable
+        # Walk forward to find the longest legal prefix, recomputing the
+        # heading toward (tx, ty) at each cell. Intermediate occupancy
+        # stops the drag (you can't be pulled THROUGH a body), mirroring
+        # push_entity's "stops at the first blocker" rule.
+        x, y = e.x, e.y
+        moves: List[Tuple[str, int]] = []
+        for _ in range(n):
+            if (x, y) == (tx, ty):
+                break
+            sx = (tx > x) - (tx < x)   # sign of remaining x delta
+            sy = (ty > y) - (ty < y)
+            if sx != 0 and sy != 0 and not allow_diag:
+                # Collapse the diagonal to the dominant axis; ties favor
+                # horizontal so the behavior is deterministic.
+                if abs(tx - x) >= abs(ty - y):
+                    sy = 0
+                else:
+                    sx = 0
+            nx, ny = x + sx, y + sy
+            if not self.in_bounds(nx, ny):
+                break
+            if not stackable and self.is_occupied(nx, ny, ignore_entity_id=e.id):
+                break
+            moves.append((_VECTOR_TO_DIRECTION[(sx, sy)], 1))
+            x, y = nx, ny
+        if not moves:
+            return 0, []
+        log = e.move_dirs(moves)
+        return len(moves), log
+
     def swap_entities(self, a: str, b: str) -> Tuple[bool, List[str]]:
         """Atomically exchange the positions of entities `a` and `b`.
         Both must exist; swapping an entity with itself (or two entities
@@ -3512,15 +4271,20 @@ class Match:
         # Fire on_exit at CURRENT positions before any state changes, so
         # passives observe each entity still standing on its old cell.
         log += self.fire_tile_hook("on_exit", a, ax, ay)
+        log += self.fire_zone_exit_hooks(a, ax, ay, bx, by)
         log += self.fire_tile_hook("on_exit", b, bx, by)
+        log += self.fire_zone_exit_hooks(b, bx, by, ax, ay)
         # Atomic swap via direct move_to (bypasses is_occupied — required,
         # since A and B occupy each other's target cells until done).
         ea.move_to(bx, by)
         eb.move_to(ax, ay)
         log += self.fire_tile_hook("on_enter", a, bx, by)
         log += self.fire_tile_hook("on_stop", a, bx, by)
+        # Each swap partner's move is a single, final step — enter + stop.
+        log += self.fire_zone_enter_hooks(a, ax, ay, bx, by, True)
         log += self.fire_tile_hook("on_enter", b, ax, ay)
         log += self.fire_tile_hook("on_stop", b, ax, ay)
+        log += self.fire_zone_enter_hooks(b, bx, by, ax, ay, True)
         log += self.fire_entity_moved(a, ax, ay, bx, by)
         log += self.fire_entity_moved(b, bx, by, ax, ay)
         return True, log
@@ -3751,6 +4515,8 @@ class Match:
             log.extend(self.fire_hook("on_round_start"))
             log.extend(self.fire_status_tick("round_start"))
             log.extend(self.fire_tile_time_hooks("on_round_start"))
+            log.extend(self.fire_zone_time_hooks("on_round_start"))
+            log.extend(self.fire_scheduled_round())
             # Autosave: round start happens after on_round_start hooks
             # so that restoring the snapshot gives the players the
             # state they would have seen as the round began (with any
@@ -3764,6 +4530,8 @@ class Match:
                 log.extend(self.fire_hook("on_turn_start", target_ids=[cur]))
                 log.extend(self.fire_status_tick("turn_start"))
                 log.extend(self.fire_tile_time_hooks("on_turn_start"))
+                log.extend(self.fire_zone_time_hooks("on_turn_start"))
+                log.extend(self.fire_scheduled_turn(cur))
             else:
                 log.append(
                     "⏭️ every entity is skippable; the round passes "
@@ -3776,6 +4544,7 @@ class Match:
         cur = self.turn_order[self.active_index]
         log.extend(self.fire_status_tick("turn_end"))
         log.extend(self.fire_tile_time_hooks("on_turn_end"))
+        log.extend(self.fire_zone_time_hooks("on_turn_end"))
         log.extend(self.fire_hook("on_turn_end", target_ids=[cur]))
         self._advance_index(log)
         # Skip over any entity carrying a skip-status flag.
@@ -3785,6 +4554,8 @@ class Match:
             log.extend(self.fire_hook("on_turn_start", target_ids=[new_cur]))
             log.extend(self.fire_status_tick("turn_start"))
             log.extend(self.fire_tile_time_hooks("on_turn_start"))
+            log.extend(self.fire_zone_time_hooks("on_turn_start"))
+            log.extend(self.fire_scheduled_turn(new_cur))
         else:
             log.append(
                 "⏭️ every entity is skippable; the round passes "
@@ -3806,6 +4577,7 @@ class Match:
             log.extend(self.fire_hook("on_round_end"))
             log.extend(self.fire_status_tick("round_end"))
             log.extend(self.fire_tile_time_hooks("on_round_end"))
+            log.extend(self.fire_zone_time_hooks("on_round_end"))
             # Flush any deferred turn-order rebuild between on_round_end
             # (ran against the OLD order) and on_round_start (sees the
             # NEW order). Round-wrap naturally restarts at the top.
@@ -3821,6 +4593,8 @@ class Match:
             log.extend(self.fire_hook("on_round_start"))
             log.extend(self.fire_status_tick("round_start"))
             log.extend(self.fire_tile_time_hooks("on_round_start"))
+            log.extend(self.fire_zone_time_hooks("on_round_start"))
+            log.extend(self.fire_scheduled_round())
             self.history.record_round(self)
 
     def _skipping_statuses(self, e: "Entity") -> List[str]:
@@ -3985,6 +4759,166 @@ class Match:
             ]
         return [f"⚙️ tile ({x},{y}) hook `{when}` fired {tag}"]
 
+    # ---- zone hooks --------------------------------------------------
+    # Zones carry two movement-hook families plus the time hooks (see
+    # ZONE_HOOK_NAMES). fire_zone_hook fires ONE named zone's hook of a
+    # given `when`; fire_zone_exit_hooks / fire_zone_enter_hooks do the
+    # boundary-vs-per-cell dispatch around a single step (called pre- and
+    # post-move respectively at every movement site, paralleling the tile
+    # on_exit / on_enter+on_stop calls); fire_zone_time_hooks fires the
+    # round/turn hooks across all zones.
+    def fire_zone_hook(self, when: str, name: str,
+                       entity_id: Optional[str], x: int, y: int) -> List[str]:
+        """Fire zone `name`'s hook of `when`. Bindings: self = the bound
+        entity (or None -> unbound), this = current entity, zone_name =
+        `name`, tile_x/tile_y = (x,y) (the crossed/stepped cell), and
+        hook_name = `when`. No-ops (returns []) for an unknown `when`, a
+        missing zone, or a zone with no hook of that name."""
+        if when not in ZONE_HOOK_NAMES:
+            return []
+        z = self.zones.get(name)
+        if not z:
+            return []
+        hooks = z.get("hooks")
+        if not isinstance(hooks, dict):
+            return []
+        formula_src = hooks.get(when)
+        if not (isinstance(formula_src, str) and formula_src):
+            return []
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        engine = FormulaEngine(self)
+        extras = {
+            "zone_name": name,
+            "tile_x": x,
+            "tile_y": y,
+            "hook_name": when,
+        }
+        ctx = EvalCtx(
+            this=self.current_entity_id(),
+            target=entity_id or None,
+            extras=extras,
+        )
+        tag = f"for `{entity_id}`" if entity_id else "(no acting entity)"
+        try:
+            engine.eval_program(formula_src, ctx)
+        except FormulaError as ex:
+            return [f"⚠️ zone `{name}` hook `{when}` {tag} FAILED: {ex}"]
+        except Exception as ex:
+            return [
+                f"⚠️ zone `{name}` hook `{when}` {tag} "
+                f"CRASHED: {type(ex).__name__}: {ex}"
+            ]
+        return [f"⚙️ zone `{name}` hook `{when}` fired {tag}"]
+
+    def fire_zone_exit_hooks(self, entity_id: Optional[str],
+                             fx: int, fy: int, tx: int, ty: int) -> List[str]:
+        """PRE-move zone firing for a step (fx,fy) -> (tx,ty). Fires the
+        per-cell on_cell_exit for every zone containing the FROM cell, and
+        the boundary on_exit for every zone the entity is LEAVING (FROM
+        cell in the zone, TO cell not). Moving within a zone fires only
+        on_cell_exit, not on_exit. Zone-name sets are snapshotted before
+        firing so a hook that reshapes zones can't disturb the iteration."""
+        from_zones = self.zones_at(fx, fy)
+        if not from_zones:
+            return []
+        to_zones = self.zones_at(tx, ty)
+        log: List[str] = []
+        for name in sorted(from_zones):
+            # Boundary exit first (you cross the edge), then per-cell.
+            if name not in to_zones:
+                log.extend(self.fire_zone_hook("on_exit", name, entity_id, fx, fy))
+            log.extend(self.fire_zone_hook("on_cell_exit", name, entity_id, fx, fy))
+        return log
+
+    def fire_zone_enter_hooks(self, entity_id: Optional[str],
+                              fx: int, fy: int, tx: int, ty: int,
+                              is_final: bool) -> List[str]:
+        """POST-move zone firing for a step (fx,fy) -> (tx,ty). Fires the
+        boundary on_enter for every zone the entity is ENTERING (TO cell
+        in the zone, FROM cell not) and the per-cell on_cell_enter for
+        every zone containing the TO cell. When is_final (the step that
+        ends the whole move), also fires the boundary on_stop and per-cell
+        on_cell_stop for every zone containing the final cell."""
+        to_zones = self.zones_at(tx, ty)
+        if not to_zones:
+            return []
+        from_zones = self.zones_at(fx, fy)
+        log: List[str] = []
+        for name in sorted(to_zones):
+            if name not in from_zones:
+                log.extend(self.fire_zone_hook("on_enter", name, entity_id, tx, ty))
+            log.extend(self.fire_zone_hook("on_cell_enter", name, entity_id, tx, ty))
+        if is_final:
+            log.extend(self.fire_zone_stop_hooks(entity_id, tx, ty))
+        return log
+
+    def fire_zone_stop_hooks(self, entity_id: Optional[str],
+                             x: int, y: int) -> List[str]:
+        """Fire boundary on_stop + per-cell on_cell_stop for every zone
+        containing (x,y). Split out from fire_zone_enter_hooks so a
+        stepwise mover can fire the stop ONCE at its final cell (after the
+        per-step enter loop), mirroring how tile on_stop fires once after
+        the move_dirs loop."""
+        log: List[str] = []
+        for name in sorted(self.zones_at(x, y)):
+            log.extend(self.fire_zone_hook("on_stop", name, entity_id, x, y))
+            log.extend(self.fire_zone_hook("on_cell_stop", name, entity_id, x, y))
+        return log
+
+    def fire_zone_time_hooks(self, when: str) -> List[str]:
+        """Fire zone time hooks (on_round_start/end, on_turn_start/end) on
+        every zone carrying a hook of that name. Iterates a snapshot of
+        zone names sorted for determinism, skipping zones deleted
+        mid-iteration. self binds to the currently-acting entity (if any);
+        zone_name to the zone; tile_x/tile_y are unbound (None) for time
+        hooks — there's no single cell, so a time hook that needs cells
+        should loop zone_cells(zone_name)."""
+        if when not in ZONE_HOOK_NAMES:
+            return []
+        cur = self.current_entity_id()
+        log: List[str] = []
+        for name in sorted(self.zones.keys()):
+            if name not in self.zones:
+                continue
+            # tile_x/tile_y default to None for time hooks (no single
+            # firing cell); fire_zone_hook still binds zone_name.
+            z = self.zones.get(name)
+            hooks = z.get("hooks") if z else None
+            if not (isinstance(hooks, dict) and hooks.get(when)):
+                continue
+            log.extend(self._fire_zone_time_hook(when, name, cur))
+        return log
+
+    def _fire_zone_time_hook(self, when: str, name: str,
+                             entity_id: Optional[str]) -> List[str]:
+        """fire_zone_hook variant for time hooks: binds tile_x/tile_y to
+        None (no single firing cell) rather than a real coordinate."""
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        z = self.zones.get(name)
+        if not z:
+            return []
+        formula_src = (z.get("hooks") or {}).get(when)
+        if not (isinstance(formula_src, str) and formula_src):
+            return []
+        engine = FormulaEngine(self)
+        ctx = EvalCtx(
+            this=self.current_entity_id(),
+            target=entity_id or None,
+            extras={"zone_name": name, "tile_x": None, "tile_y": None,
+                    "hook_name": when},
+        )
+        tag = f"for `{entity_id}`" if entity_id else "(no acting entity)"
+        try:
+            engine.eval_program(formula_src, ctx)
+        except FormulaError as ex:
+            return [f"⚠️ zone `{name}` hook `{when}` {tag} FAILED: {ex}"]
+        except Exception as ex:
+            return [
+                f"⚠️ zone `{name}` hook `{when}` {tag} "
+                f"CRASHED: {type(ex).__name__}: {ex}"
+            ]
+        return [f"⚙️ zone `{name}` hook `{when}` fired {tag}"]
+
     def fire_status_tick(self, when: str) -> List[str]:
         """Run status_tick_formula once for every status on every
         target entity, when the active status_tick_when rule equals
@@ -4138,11 +5072,17 @@ class Match:
         """
         log: List[str] = []
         if before is None and after is not None:
+            self.log_event("status_added", entity=entity_id,
+                           name=self._entity_name(entity_id),
+                           status=status_name)
             log = self.fire_status_event(
                 "on_status_added", entity_id, status_name,
                 old_value=None, new_value=after,
             )
         elif before is not None and after is None:
+            self.log_event("status_removed", entity=entity_id,
+                           name=self._entity_name(entity_id),
+                           status=status_name)
             log = self.fire_status_event(
                 "on_status_removed", entity_id, status_name,
                 old_value=before, new_value=None,
@@ -4184,6 +5124,8 @@ class Match:
             "hook_name": "on_entity_moved",
         }
         ctx = EvalCtx(this=this_id, target=entity_id, extras=extras)
+        self.log_event("move", entity=entity_id, name=e.name,
+                       from_x=from_x, from_y=from_y, to_x=to_x, to_y=to_y)
         log: List[str] = []
         for p in self.global_passives.values():
             if p.when == "on_entity_moved":
@@ -4586,8 +5528,13 @@ class Match:
 
         Re-entry guarded via _death_processing — a death-firing passive
         that itself writes vars must not retrigger the check on the
-        already-dying entity. Returns empty list on guard hit."""
+        already-dying entity. Returns empty list on guard hit. A specific
+        entity can also be shielded via _death_check_suppressed_ids (used
+        by revive to defer the revived entity's check until its post-
+        revive state settles)."""
         if self._death_processing > 0:
+            return []
+        if entity_id in self._death_check_suppressed_ids:
             return []
         e = self.entities.get(entity_id)
         if e is None:
@@ -4616,12 +5563,17 @@ class Match:
         if e is None:
             return []
         self._death_processing += 1
+        # Capture identity/position now — after e.remove() the entity is
+        # detached, so the log event must read these up front.
+        dead_name, dead_x, dead_y = e.name, e.x, e.y
         try:
             log = self.fire_hook("on_death", target_ids=[entity_id])
             # Re-check entity still exists — a paranoid on_death passive
             # could have already removed the entity, in which case the
             # corpse/delete step has nothing to do.
             if entity_id not in self.entities:
+                self.log_event("death", entity=entity_id, name=dead_name,
+                               x=dead_x, y=dead_y)
                 return log
             result = self._effective_death_result(e)
             if result == "corpse":
@@ -4629,6 +5581,8 @@ class Match:
             # Remove from match (entity.remove handles turn-order
             # bookkeeping + group scrubbing) regardless of result.
             e.remove()
+            self.log_event("death", entity=entity_id, name=dead_name,
+                           x=dead_x, y=dead_y)
         finally:
             self._death_processing = max(0, self._death_processing - 1)
         return log
@@ -4757,23 +5711,59 @@ class Match:
             # Drop an empty tile dict entirely so tile listings stay clean.
             if isinstance(cell, dict) and not cell:
                 self.tiles.pop((x, y), None)
-        _, spawn_log = e.spawn(self, x, y)
-        # Run the revive-effects formula on the freshly-spawned entity
-        # BEFORE on_revive so on_revive observers see the post-effect
-        # state (matching on_death's "see settled state" contract).
-        # Skipped silently when the rule is empty.
-        effects = str(self.rules.get("default_revive_function_effects", "")).strip()
-        if effects:
-            from formula import FormulaEngine, EvalCtx, FormulaError
-            engine = FormulaEngine(self)
-            r_ctx = EvalCtx(this=self.current_entity_id(), target=e.id)
-            try:
-                engine.eval_program(effects, r_ctx)
-            except FormulaError:
-                # GM bug; don't make every revive into a hard error.
-                pass
+        # Suppress death checks FOR THIS ENTITY across the spawn +
+        # revive-effects window. The corpse snapshot carries the entity's
+        # DEATH-state vars (typically hp<=0), so the entity momentarily
+        # satisfies its own death condition while being respawned.
+        # Without this guard any var write during spawn — an
+        # on_entity_spawned passive, an injected default passive, the
+        # max_hp auto-fill — would trip the death check and re-kill the
+        # entity before the revive policy (default_revive_function_effects,
+        # e.g. hp -> max_hp) runs. We scope the shield to e.id (NOT the
+        # match-global _death_processing counter) so writes in this window
+        # that legitimately kill OTHER entities still register. The
+        # condition is re-evaluated against e's settled state right after
+        # the window (below).
+        self._death_check_suppressed_ids.add(e.id)
+        try:
+            _, spawn_log = e.spawn(self, x, y)
+            # Run the revive-effects formula on the freshly-spawned entity
+            # BEFORE on_revive so on_revive observers see the post-effect
+            # state (matching on_death's "see settled state" contract).
+            # Skipped silently when the rule is empty.
+            effects = str(self.rules.get("default_revive_function_effects", "")).strip()
+            if effects:
+                from formula import FormulaEngine, EvalCtx, FormulaError
+                engine = FormulaEngine(self)
+                r_ctx = EvalCtx(this=self.current_entity_id(), target=e.id)
+                try:
+                    engine.eval_program(effects, r_ctx)
+                except FormulaError:
+                    # GM bug; don't make every revive into a hard error.
+                    pass
+        finally:
+            self._death_check_suppressed_ids.discard(e.id)
+        # on_revive fires with death checks active again — by now the
+        # revive policy has applied, so a healthy entity won't re-die.
         revive_log = self.fire_hook("on_revive", target_ids=[e.id])
-        return e.id, spawn_log + revive_log
+        # Evaluate the death condition ONCE against the fully-settled
+        # post-revive state. The suppression above only deferred the
+        # check past spawn + revive-effects + on_revive so a transient
+        # death-state (corpse hp, an on_entity_spawned write) couldn't
+        # re-kill the entity before the revive policy and on_revive had
+        # their say. The invariant still holds afterward: if the entity
+        # STILL meets its death condition here — e.g.
+        # default_revive_function_effects is empty so the corpse's hp<=0
+        # carried over, and no on_revive passive healed it — it dies
+        # again, exactly as it did pre-suppression (and as the
+        # default_revive_function_effects docs describe). A revived,
+        # healed entity passes this check as a no-op.
+        if e.id in self.entities:
+            self.log_event("revive", entity=e.id, name=e.name)
+        death_log: List[str] = []
+        if e.id in self.entities:
+            death_log = self.check_death(e.id)
+        return e.id, spawn_log + revive_log + death_log
 
     def fire_tile_time_hooks(self, when: str) -> List[str]:
         """Fire tile time hooks (on_round_start/end, on_turn_start/end)
@@ -5067,6 +6057,231 @@ class Match:
             raise NotFound(f"Global passive '{pid}' not found in match '{self.id}'.")
         del self.global_passives[pid]
 
+    def _apply_default_passives(self, entity: "Entity") -> None:
+        """Copy the system's `default_entity_passives` onto `entity`,
+        skipping any id it already carries. Called from Entity.spawn for
+        every entity-creation path. Each entity gets its OWN Passive
+        instance (built from the spec dict) so later per-entity edits
+        don't mutate the shared rule. A malformed spec is skipped
+        silently (same convention as the from_dict loaders) — one bad
+        default shouldn't make every entity un-spawnable; the `!defpassive
+        add` command validates specs before they reach the rule, so a bad
+        entry here means hand-edited config."""
+        specs = self.rules.get("default_entity_passives") or []
+        if not isinstance(specs, list):
+            return
+        for spec in specs:
+            if not isinstance(spec, dict):
+                continue
+            pid = spec.get("id")
+            if not isinstance(pid, str) or pid in entity.passives:
+                continue
+            try:
+                entity.add_passive(Passive.from_dict(spec))
+            except (VTTError, KeyError, TypeError):
+                continue
+
+    # ---- scheduled / delayed effects ----
+    # A scheduled effect is a formula body queued to run at a future
+    # round (match-level) or after a future number of one entity's turns
+    # (entity-attached). Both live in self.scheduled; the firing points
+    # are wired into next_turn / _advance_index alongside the status-tick
+    # boundaries. See the `scheduled` field comment for the entry shape.
+    def _validate_schedule_body(self, body: Any) -> str:
+        """Normalize + validate a scheduled-effect body. Raises VTTError
+        on a non-string or a body that fails formula validation, so the
+        error surfaces at schedule time, not silently at fire time."""
+        from formula import normalize_body_source, validate_program, FormulaError
+        if not isinstance(body, str):
+            raise VTTError("schedule: body must be a formula string.")
+        src = normalize_body_source(body).strip()
+        if not src:
+            raise VTTError("schedule: body cannot be empty.")
+        try:
+            validate_program(
+                src, known_funcs=frozenset(self.formula_functions.keys())
+            )
+        except FormulaError as ex:
+            raise VTTError(f"schedule: invalid body: {ex}")
+        return src
+
+    @staticmethod
+    def _mint_schedule_name() -> str:
+        return f"sched_{uuid.uuid4().hex[:8]}"
+
+    def add_scheduled(self, delay: Any, body: Any,
+                      name: Optional[str] = None) -> str:
+        """Queue a MATCH-level effect to fire at on_round_start once
+        round_number has advanced by `delay` rounds (delay>=1; delay=1
+        fires at the start of the next round). The body runs with no
+        `self` bound (use explicit ids or `this`). Returns the schedule
+        name (a generated one if `name` is falsy). Raises VTTError on a
+        bad delay or body."""
+        if not isinstance(delay, int) or isinstance(delay, bool) or delay < 1:
+            raise VTTError("schedule: delay must be a positive integer (rounds).")
+        src = self._validate_schedule_body(body)
+        nm = name if (isinstance(name, str) and name) else self._mint_schedule_name()
+        self.scheduled.append({
+            "name": nm, "kind": "round", "body": src,
+            "eid": None, "fire_round": self.round_number + delay,
+        })
+        return nm
+
+    def add_scheduled_on(self, eid: str, delay: Any, body: Any,
+                         name: Optional[str] = None) -> str:
+        """Queue an ENTITY-attached effect to fire at `eid`'s
+        on_turn_start once `delay` of its turns have started (delay>=1;
+        delay=1 fires at its next turn). The body runs with `self`=eid.
+        Auto-dropped if the entity is removed (death/despawn) before it
+        fires. Returns the schedule name. Raises VTTError/NotFound on a
+        bad delay, body, or unknown entity."""
+        if eid not in self.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        if not isinstance(delay, int) or isinstance(delay, bool) or delay < 1:
+            raise VTTError("schedule_on: delay must be a positive integer (turns).")
+        src = self._validate_schedule_body(body)
+        nm = name if (isinstance(name, str) and name) else self._mint_schedule_name()
+        self.scheduled.append({
+            "name": nm, "kind": "turn", "body": src,
+            "eid": eid, "turns_left": delay,
+        })
+        return nm
+
+    def cancel_scheduled(self, name: str) -> int:
+        """Remove every pending schedule whose name == `name`. Returns
+        the number removed (0 if none matched)."""
+        before = len(self.scheduled)
+        self.scheduled = [s for s in self.scheduled if s.get("name") != name]
+        return before - len(self.scheduled)
+
+    def _prune_entity_scheduled(self, eid: str) -> None:
+        """Drop every entity-attached schedule bound to `eid`. Called
+        from Entity.remove so a dead/despawned entity's pending effects
+        don't fire (the 'dropped if the entity dies' contract) and don't
+        dangle to a future same-id entity."""
+        self.scheduled = [
+            s for s in self.scheduled if s.get("eid") != eid
+        ]
+
+    def _run_scheduled_body(self, entry: Dict[str, Any],
+                            eid: Optional[str]) -> List[str]:
+        """Run one scheduled effect's body. `self` binds to `eid` (None
+        for match-level). Errors are logged with a ⚠️ marker rather than
+        crashing the turn transition — a sibling schedule keeps firing."""
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        engine = FormulaEngine(self)
+        ctx = EvalCtx(this=self.current_entity_id(), target=eid)
+        name = entry.get("name", "?")
+        try:
+            engine.eval_program(entry.get("body", ""), ctx)
+        except FormulaError as ex:
+            return [f"⚠️ scheduled effect `{name}` failed: {ex}"]
+        return [f"⏰ scheduled effect `{name}` fired."]
+
+    def fire_scheduled_round(self) -> List[str]:
+        """Fire (and remove) every due MATCH-level round schedule —
+        those with fire_round <= the current round_number. Due entries
+        are removed BEFORE their bodies run so a body that re-schedules
+        itself for a later round doesn't re-fire this boundary."""
+        due = [
+            s for s in self.scheduled
+            if s.get("kind") == "round"
+            and int(s.get("fire_round", 1)) <= self.round_number
+        ]
+        if not due:
+            return []
+        due_ids = {id(s) for s in due}
+        self.scheduled = [s for s in self.scheduled if id(s) not in due_ids]
+        log: List[str] = []
+        for s in due:
+            log.extend(self._run_scheduled_body(s, eid=None))
+        return log
+
+    def fire_scheduled_turn(self, eid: str) -> List[str]:
+        """Decrement every ENTITY-attached schedule bound to `eid` and
+        fire (and remove) those that reach 0. Called at eid's
+        on_turn_start."""
+        fire: List[Dict[str, Any]] = []
+        for s in self.scheduled:
+            if s.get("kind") == "turn" and s.get("eid") == eid:
+                s["turns_left"] = int(s.get("turns_left", 1)) - 1
+                if s["turns_left"] <= 0:
+                    fire.append(s)
+        if not fire:
+            return []
+        fire_ids = {id(s) for s in fire}
+        self.scheduled = [s for s in self.scheduled if id(s) not in fire_ids]
+        log: List[str] = []
+        for s in fire:
+            log.extend(self._run_scheduled_body(s, eid=eid))
+        return log
+
+    # ---- event log (combat log) ----
+    # The engine appends structured event records here at its chokepoints
+    # (see the call sites in write_var / _process_death / revive_corpse /
+    # Entity.spawn / fire_entity_moved / fire_status_event and action.py's
+    # run_action). Records are rendered to text only at read time by the
+    # !log command, keeping the stored data un-opinionated.
+    def _event_type_enabled(self, event_type: str) -> bool:
+        """Whether an event of this type should be recorded right now.
+        Gated by the event_log_enabled master switch; AUTO types are
+        additionally gated by membership in the event_log_events list.
+        The `custom` type (log() primitive) bypasses the list."""
+        if not self.rules.get("event_log_enabled", True):
+            return False
+        if event_type == "custom":
+            return True
+        raw = self.rules.get("event_log_events", "")
+        enabled = {t.strip() for t in str(raw).split(",") if t.strip()}
+        return event_type in enabled
+
+    def log_event(self, event_type: str, **fields: Any) -> bool:
+        """Append a structured event to event_log if its type is enabled.
+        Stamps round + turn (active_index) automatically and trims to
+        event_log_retention. Returns True iff an entry was actually kept
+        (False when logging is off, the type is disabled, or retention is
+        0 — 'keep nothing'). A cheap no-op in the False cases, so
+        chokepoints can call it unconditionally."""
+        if not self._event_type_enabled(event_type):
+            return False
+        try:
+            cap = int(self.rules.get("event_log_retention", 200))
+        except (TypeError, ValueError):
+            cap = 200
+        if cap == 0:
+            return False  # 'keep nothing' — don't even append
+        entry: Dict[str, Any] = {
+            "type": event_type,
+            "round": self.round_number,
+            "turn": self.active_index,
+        }
+        entry.update(fields)
+        self.event_log.append(entry)
+        self._trim_event_log()
+        return True
+
+    def _trim_event_log(self) -> None:
+        """Enforce the event_log_retention cap (drop oldest). -1 =
+        unlimited; 0 = keep nothing."""
+        try:
+            cap = int(self.rules.get("event_log_retention", 200))
+        except (TypeError, ValueError):
+            cap = 200
+        if cap < 0:
+            return
+        if cap == 0:
+            self.event_log.clear()
+            return
+        excess = len(self.event_log) - cap
+        if excess > 0:
+            del self.event_log[:excess]
+
+    def _entity_name(self, eid: str) -> str:
+        """Display name for an event field; falls back to the id when the
+        entity is already gone (e.g. logging a death after removal)."""
+        e = self.entities.get(eid)
+        return e.name if e is not None else eid
+
     # ---- persistence ----
     def to_dict(self, include_history: bool = False) -> Dict[str, Any]:
         """Serialize the match for save files and snapshots.
@@ -5101,6 +6316,10 @@ class Match:
             "tiles": {
                 f"{x},{y}": dat for (x, y), dat in sorted(self.tiles.items())
             },
+            "zones": {
+                name: self._zone_to_dict(z)
+                for name, z in sorted(self.zones.items())
+            },
             "tile_templates": {
                 name: tpl.to_dict()
                 for name, tpl in sorted(self.tile_templates.items())
@@ -5110,6 +6329,13 @@ class Match:
                 for name, fn in sorted(self.formula_functions.items())
             },
             "aliases": dict(self.aliases),
+            "vars": copy.deepcopy(self.vars),
+            "scheduled": copy.deepcopy(self.scheduled),
+            "event_log": copy.deepcopy(self.event_log),
+            "owner": self.owner,
+            "cohosts": list(self.cohosts),
+            "access_overrides": dict(self.access_overrides),
+            "bound_channels": copy.deepcopy(self.bound_channels),
         }
         if include_history:
             d["history"] = self.history.to_dict()
@@ -5161,6 +6387,18 @@ class Match:
                 continue
             if m.in_bounds(x, y) and isinstance(val, dict) and val:
                 m.tiles[(x, y)] = val
+        raw_zones = d.get("zones", {}) or {}
+        m.zones = {}
+        for zname, zdef in raw_zones.items():
+            if not isinstance(zname, str) or not isinstance(zdef, dict):
+                continue
+            z = m._zone_from_dict(zdef)
+            # Keep only in-bounds cells (a grid resize between save and
+            # load shouldn't leave dangling cells). An emptied zone still
+            # exists — its data/hooks are preserved so a shift could bring
+            # it back on-grid; consistent with keeping empty groups.
+            if z is not None:
+                m.zones[zname] = z
         raw_templates = d.get("tile_templates", {}) or {}
         m.tile_templates = {}
         for tname, tdef in raw_templates.items():
@@ -5190,6 +6428,36 @@ class Match:
             str(k): str(v) for k, v in raw_aliases.items()
             if isinstance(k, str) and isinstance(v, str)
         }
+        raw_vars = d.get("vars", {})
+        m.vars = copy.deepcopy(raw_vars) if isinstance(raw_vars, dict) else {}
+        raw_sched = d.get("scheduled", [])
+        m.scheduled = (
+            [e for e in copy.deepcopy(raw_sched) if isinstance(e, dict)]
+            if isinstance(raw_sched, list) else []
+        )
+        raw_evlog = d.get("event_log", [])
+        m.event_log = (
+            [e for e in copy.deepcopy(raw_evlog) if isinstance(e, dict)]
+            if isinstance(raw_evlog, list) else []
+        )
+        # Host / access control + channel bindings.
+        owner = d.get("owner")
+        m.owner = owner if isinstance(owner, str) else None
+        raw_cohosts = d.get("cohosts", [])
+        m.cohosts = (
+            [c for c in raw_cohosts if isinstance(c, str)]
+            if isinstance(raw_cohosts, list) else []
+        )
+        raw_acc = d.get("access_overrides", {})
+        m.access_overrides = {
+            k: str(v) for k, v in raw_acc.items()
+            if isinstance(k, str) and isinstance(v, str)
+        } if isinstance(raw_acc, dict) else {}
+        raw_bound = d.get("bound_channels", {})
+        m.bound_channels = {
+            k: (dict(v) if isinstance(v, dict) else {})
+            for k, v in raw_bound.items() if isinstance(k, str)
+        } if isinstance(raw_bound, dict) else {}
         # History is optional in saved dicts. It's only present when the
         # original save was made with include_history=True. A snapshot's
         # state.dict deliberately omits history (snapshots-within-
@@ -5209,7 +6477,20 @@ class Match:
             for _ in range(self.grid_height + 1)
         ]
 
-        # Lay down tile glyphs first — any tile with a single-character
+        # Zone glyphs are the lowest layer — a zone with a single-char
+        # "glyph" paints all its cells (overlapping zones: later-iterated
+        # wins). Tiles, then entities, render on top, so a zone glyph
+        # shows only where no tile glyph or entity sits. Lets a gas-cloud
+        # zone be visible on the map without per-cell tile setup.
+        for z in self.zones.values():
+            g = z.get("glyph")
+            if not (isinstance(g, str) and len(g) == 1):
+                continue
+            for (zx, zy) in z.get("cells", ()):
+                if self.in_bounds(zx, zy):
+                    grid[zy][zx] = g
+
+        # Lay down tile glyphs next — any tile with a single-character
         # "glyph" key shows that character instead of the default ".".
         # Validation is strict (must be exactly one character) so a GM
         # who accidentally sets glyph="fire" gets nothing on the map
@@ -5436,14 +6717,18 @@ class Match:
             e = self.entities[eid]
             origin_x, origin_y = e.x, e.y
             for nx, ny, facing in path:
+                sx, sy = e.x, e.y
                 if fire_hooks:
-                    log.extend(self.fire_tile_hook("on_exit", eid, e.x, e.y))
+                    log.extend(self.fire_tile_hook("on_exit", eid, sx, sy))
+                    log.extend(self.fire_zone_exit_hooks(eid, sx, sy, nx, ny))
                 e.facing = facing
                 e.move_to(nx, ny)
                 if fire_hooks:
                     log.extend(self.fire_tile_hook("on_enter", eid, nx, ny))
+                    log.extend(self.fire_zone_enter_hooks(eid, sx, sy, nx, ny, False))
             if fire_hooks and path:
                 log.extend(self.fire_tile_hook("on_stop", eid, e.x, e.y))
+                log.extend(self.fire_zone_stop_hooks(eid, e.x, e.y))
                 # on_entity_moved per group member, once per member
                 # (mirrors single-entity move_dirs semantics).
                 log.extend(self.fire_entity_moved(
@@ -5570,7 +6855,7 @@ class MatchManager:
             rules[k] = r.value
         return rules
 
-    def create_match(self, match_id: str, name: str, width: int, height: int, channel_key: Optional[str] = None, system_name: Optional[str] = None) -> str:
+    def create_match(self, match_id: str, name: str, width: int, height: int, channel_key: Optional[str] = None, system_name: Optional[str] = None, owner: Optional[str] = None) -> str:
         if match_id in self.matches:
             raise DuplicateId(f"Match id '{match_id}' already exists")
         sysobj = self.get_system(system_name) if system_name else (
@@ -5579,6 +6864,11 @@ class MatchManager:
         rules = self._build_rules_dict(sysobj)
         m = Match(id=match_id, name=name, grid_width=width, grid_height=height,
                   system_name=sysobj.name, rules=rules)
+        # The creator becomes the match owner (full privileges + sole host
+        # manager). The creating channel isn't bound here — binding tracks
+        # channels that ACTIVATE the match, which happens on `match use` /
+        # `match bind` (the creator's `match new` is followed by a `use`).
+        m.owner = owner
         # Seed match-level templates from the system's defaults. We copy
         # so subsequent match-side define / undefine doesn't reach back
         # into GameSystem.tile_templates — the system's library is the

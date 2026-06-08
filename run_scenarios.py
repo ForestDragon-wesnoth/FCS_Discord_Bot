@@ -55,11 +55,16 @@ _FAILURE_MARKERS = ("💥", "Syntax error")
 
 
 class _Ctx:
-    """Minimal ReplyContext stand-in: collects sent messages."""
+    """Minimal ReplyContext stand-in: collects sent messages. Carries a
+    switchable identity (default owner "cli") so scenarios can exercise
+    the host/player gating with `!as host` / `!as player <name>`."""
     channel_key = "CLI"
+    cli_mutable = True
 
     def __init__(self) -> None:
         self.out: List[str] = []
+        self.user_id = "cli"
+        self.user_name = "cli"
 
     async def send(self, message: str) -> None:
         self.out.append(message)

@@ -8707,3 +8707,444 @@ Match.kill_entity. `!ent kill cmdkill` and `!eval
 1,1) and fmlkill (at 4,4) in the Dead: section, with no live
 entities remaining. This is the DRY guarantee: one shared
 implementation, two surfaces.
+
+
+SCENARIO 348 — !ent pull: forced movement toward a point, stops at walls/occupants
+----------------------------------------------------------------------------------
+
+!match new mpull1 PullCmd 8 6
+!match use mpull1
+!ent add anchor Anchor 10 4 3 5
+!ent add draggee Draggee 10 8 3 4
+!ent pull draggee 1 3 3
+!ent dump draggee
+!ent pull draggee 1 3 5
+
+Expected: `!ent pull` is the point-directed twin of `!ent
+push` — it drags an entity TOWARD a point instead of along a
+fixed direction. draggee starts at (8,3); `!ent pull draggee 1
+3 3` recomputes a heading toward (1,3) each step and walks 3
+cells, replying "Pulled `draggee` 3 cell(s) toward (1,3) to
+(5,3)." `!ent dump draggee` confirms it at (5, 3). The second
+pull `!ent pull draggee 1 3 5` is blocked immediately: the
+next cell toward (1,3) is (4,3), occupied by anchor, so it
+stops with "Pulled `draggee` 0 cell(s) toward (1,3) to (5,3)"
+— forced movement can't drag a body THROUGH another, matching
+push's "stops at the first blocker" rule. This is the command
+equivalent of the pull_entity() formula primitive, sharing
+Match.pull_entity.
+
+
+SCENARIO 349 — match-level vars: !match var command surface + match.* formula root
+----------------------------------------------------------------------------------
+
+!match new mmv1 MatchVars 6 6
+!match use mmv1
+!match var set alarm 3
+!eval "match.alarm = match.alarm + 10"
+!match var get alarm
+!eval 'match.weather.kind = "storm"'
+!match var list
+!eval "match_var_has('weather.kind')"
+!match var del weather
+!eval "match_var_has('weather.kind')"
+
+Expected: Match-level vars are a free-form scratchpad that
+belongs to the MATCH, not any entity — global GM state like an
+alarm counter or the weather. `!match var set alarm 3` stores
+it; the reserved `match` formula root reads and writes it, so
+`!eval "match.alarm = match.alarm + 10"` bumps it and `!match
+var get alarm` shows 13. Dotted paths nest: `!eval
+'match.weather.kind = "storm"'` creates {'kind': 'storm'},
+visible in `!match var list`. The match_var_* functions are
+the runtime-path twins of the static `match.<path>` root, so
+`match_var_has('weather.kind')` returns True. `!match var del
+weather` removes the subtree and the final check returns
+False. Match vars persist with the match (to_dict/from_dict)
+and do NOT fire var hooks (no per-entity owner).
+
+
+SCENARIO 350 — roll(): standard dice notation through the seeded RNG
+--------------------------------------------------------------------
+
+!match new mroll1 Roll 6 6
+!match use mroll1
+!system set default random_seed dicetest
+!eval "roll('4d1+2')"
+!eval "roll('2d6')"
+!eval "roll('2d6')"
+!eval "roll('d20+5')"
+!eval "roll('oops')"
+
+Expected: roll() evaluates standard dice notation and returns
+the integer total, routed through the same RNG random_int uses
+(so the random_seed rule makes it reproducible). `roll('4d1+2')`
+is deterministic — four 1-sided dice plus 2 — and always
+returns 6. Under random_seed=dicetest the seeded rolls are
+reproducible across replays: `roll('2d6')` yields a value in
+[2,12] (4, then 7 on the next call as the RNG advances),
+`roll('d20+5')` a value in [6,25] (the leading count defaults
+to 1). A malformed spec is a clean user error, not a crash:
+`roll('oops')` replies "❌ roll(spec): malformed term 'oops'
+... expected NdM or a flat integer." Grammar: terms joined by
++/-, each either NdM (N optional) or a flat integer.
+
+
+SCENARIO 351 — default_entity_passives: injected at every entity creation (add + summon)
+----------------------------------------------------------------------------------------
+
+!match new mdp1 DefPass 8 8
+!match use mdp1
+!defpassive add regen on_turn_start "entity[self].hp = entity[self].hp + 1"
+!defpassive add mark on_entity_spawned "entity[self].marked = 1"
+!defpassive list
+!ent add hero Hero 10 2 2 5
+!ent dump hero
+!eval 'summon({"name": "imp", "vars": {"hp": 5, "max_hp": 5}}, 4, 4)'
+!passive list imp
+
+Expected: The `default_entity_passives` rule (edited via
+!defpassive, the passive analog of !gclamp for default_clamps)
+copies passives onto every entity at creation. After adding
+two defaults, `!ent add hero ...` injects BOTH onto hero —
+`!ent dump hero` shows `regen` and `mark` in its passives, and
+because the injection happens BEFORE on_entity_spawned fires,
+the `mark` passive's spawn formula already ran (vars include
+marked=1). Summoning routes through the same Entity.spawn
+chokepoint, so the summoned `imp` also carries both defaults:
+`!passive list imp` shows `regen` and `mark`. This is injection,
+not enforcement — the copies are independent Passive instances
+the GM can remove per-entity afterward.
+
+
+SCENARIO 352 — default passive survives revive (death-suppression during respawn)
+---------------------------------------------------------------------------------
+
+!match new mdr1 DefRevive 6 6
+!match use mdr1
+!defpassive add mark on_entity_spawned "entity[self].marked = 1"
+!ent add ghost Ghost 10 2 2 5
+!ent kill ghost
+!ent revive ghost
+!list
+!ent dump ghost
+
+Expected: A revived entity respawns from its corpse snapshot,
+which carries the DEATH-state hp (0 from the kill). Death
+checks are suppressed across the revive's spawn + revive-effects
+window, so the `mark` default passive's on_entity_spawned
+write (marked=1) can't re-trigger the death condition before
+default_revive_function_effects restores hp -> max_hp. After
+`!ent revive ghost`, `!list` shows ghost ALIVE at HP 10/10 (not
+in a Dead: section), and `!ent dump ghost` shows hp=10,
+marked=1, and a single `mark` passive (the spawn-time injection
+is skipped when the entity already carries that id, keeping
+revive idempotent for kept passives).
+
+
+SCENARIO 353 — scheduled effects: match-level (round) and entity-attached (turn) fire at their boundaries
+---------------------------------------------------------------------------------------------------------
+
+!match new msch1 Schedule 6 6
+!match use msch1
+!ent add hero Hero 30 2 2 9
+!ent add foe Foe 30 5 5 5
+!schedule round 1 "match.alarm = 1"
+!schedule turn hero 1 "entity[self].hp = entity[self].hp - 5"
+!schedule list
+!turn next
+!ent dump hero
+!turn next
+!turn next
+!match var get alarm
+
+Expected: Scheduled effects queue a formula body to run later.
+`!schedule round 1 ...` is MATCH-level: at round 1 it reports
+"for round 2" (delay 1 = next round) and fires at that round's
+on_round_start. `!schedule turn hero 1 ...` is ENTITY-attached:
+it fires at hero's turn-start after 1 of hero's turns, with
+`self`=hero. `!schedule list` shows both pending. The first
+`!turn next` begins round 1 on hero's turn — the turn schedule
+fires immediately ("⏰ scheduled effect ... fired") and `!ent
+dump hero` shows hp 25 (30 - 5). It is then removed (one-shot).
+Two more `!turn next` calls advance through foe and wrap into
+round 2, whose on_round_start fires the match schedule, so
+`!match var get alarm` shows 1. Round schedules fire alongside
+the on_round_start status-tick boundary; turn schedules
+alongside on_turn_start.
+
+
+SCENARIO 354 — scheduled effects: entity-attached dropped on death; cancel by name
+----------------------------------------------------------------------------------
+
+!match new msch2 SchedDrop 6 6
+!match use msch2
+!ent add doomed Doomed 10 2 2 9
+!schedule turn doomed 3 "match.never = 1"
+!eval 'schedule(5, "match.late = 1", "bomb")'
+!schedule list
+!ent kill doomed
+!schedule list
+!schedule cancel bomb
+!schedule list
+
+Expected: An entity-attached schedule is bound to its entity's
+life. `!schedule turn doomed 3 ...` queues a body on `doomed`;
+the formula `schedule(5, ..., "bomb")` queues a named match-level
+one. `!schedule list` shows both. `!ent kill doomed` removes the
+entity, and the next `!schedule list` shows ONLY `bomb` — the
+doomed-bound schedule was pruned (the "dropped if the entity
+dies/despawns" contract; it never fires). `!schedule cancel
+bomb` removes the named match schedule (replying "Cancelled 1
+scheduled effect(s) named `bomb`"), leaving "No scheduled
+effects pending." cancel_schedule / `!schedule cancel` match by
+name and remove every entry carrying it.
+
+
+SCENARIO 355 — event log: the engine records a combat sequence and renders it via per-type templates
+-----------------------------------------------------------------------------------------------------
+
+!match new mlog1 CombatLog 8 8
+!match use mlog1
+!ent add hero Hero 30 2 2 9
+!ent add foe Foe 20 5 5 5
+!ent set_var hero kit.actions.zap.target entity
+!ent set_var hero kit.actions.zap.body "entity[target].hp = entity[target].hp - 8"
+!log clear
+!action hero zap foe
+!ent status foe add poison
+!ent kill foe
+!log
+
+Expected: The structured event log records curated combat
+events at the engine's chokepoints, rendered at read time by
+each type's template. `!log clear` empties it (here it drops
+the two spawn entries from the !ent adds). `!action hero zap
+foe` runs an action that subtracts 8 hp: the log captures both
+the hp change as a `damage` event ("🩸 Foe (`foe`) took 8
+damage (hp 20→12)") and the `action_used` event ("⚔️ Hero
+(`hero`) used `zap` → foe") — damage first (it happens inside
+the body) then action_used (fired after the body settles).
+`!ent status foe add poison` logs a `status_added` event.
+`!ent kill foe` runs default_kill_function_effects (hp→0,
+logged as a second `damage` of 12) then the death pipeline (a
+`death` event "💀 Foe (`foe`) died at (5,5)"). `!log` shows all
+five in order. The log is a separate store — it never changes
+the command replies themselves.
+
+
+SCENARIO 356 — event log: custom log(), per-type filtering, format override, and retention cap
+-----------------------------------------------------------------------------------------------
+
+!match new mlog2 LogCfg 8 8
+!match use mlog2
+!ent add a A 10 1 1 5
+!system set default event_log_events "spawn,custom"
+!log clear
+!ent tp a 3 3
+!eval 'log("the bell tolls")'
+!log format custom ">> {message}"
+!log
+!system set default event_log_retention 2
+!log clear
+!eval 'log("x1")'
+!eval 'log("x2")'
+!eval 'log("x3")'
+!log
+
+Expected: `event_log_events` controls which AUTO event types
+are recorded. Setting it to "spawn,custom" means `!ent tp a 3
+3` (a `move`) is NOT logged, but the `log("the bell tolls")`
+formula primitive IS — the `custom` type is always allowed
+when logging is enabled, bypassing the events filter. `!log
+format custom ">> {message}"` overrides the custom template,
+so `!log` renders ">> the bell tolls". `event_log_retention 2`
+caps the log: after clearing and appending x1/x2/x3, only the
+two most recent (x2, x3) remain — the oldest is dropped. The
+log() primitive returns True when an entry was recorded. Both
+the events filter and the format override persist on the game
+system.
+
+
+SCENARIO 357 — zones: footprint (fill/add/remove/shift), data, glyph rendering, and membership queries
+-----------------------------------------------------------------------------------------------------
+
+!match new mzone1 Zones 8 8
+!match use mzone1
+!ent add hero Hero 30 2 2 5
+!zone fill gas 2 2 4 4
+!zone remove gas 2 2
+!zone add gas 5 5
+!zone set gas dmg 4
+!zone glyph gas ~
+!eval 'zone_size("gas")'
+!eval 'in_zone("hero", "gas")'
+!eval 'zone_get("gas", "dmg")'
+!eval 'zones_at(3, 3)'
+!eval 'entities_in_zone("gas")'
+!zone shift gas 1 0
+!eval 'in_zone("hero", "gas")'
+!eval 'cell_in_zone(2, 3, "gas")'
+!zone list
+!map
+
+Expected: A zone is a named set of cells. `!zone fill gas 2 2
+4 4` paints the 3x3 block (9 cells); `remove` drops (2,2) and
+`add` adds (5,5), leaving 9 cells. `!zone set gas dmg 4` stores
+free-form data read back by `zone_get("gas", "dmg")` → 4.
+`zone_size` is 9; the hero at (2,2) is NOT in the zone (we
+removed that cell) so `in_zone("hero","gas")` is False;
+(3,3) is covered so `zones_at(3,3)` → ['gas']. With the hero
+off the zone, `entities_in_zone("gas")` is []. `!zone shift gas
+1 0` translates every cell east by one — now (3,3) moved to
+(4,3), and the hero at (2,2) is still outside, while
+`cell_in_zone(2,3,"gas")` is False (that column shifted away).
+`!zone list` shows gas with its cell count, data key, and
+glyph. `!map` renders the zone's `~` glyph on every gas cell
+that has no entity on top (the hero's own glyph wins on (2,2)).
+
+
+SCENARIO 358 — zones: boundary hooks fire once on edge crossing, per-cell hooks fire every cell, time hook drifts the cloud
+--------------------------------------------------------------------------------------------------------------------------
+
+!match new mzone2 ZoneHooks 8 8
+!match use mzone2
+!ent add hero Hero 30 1 1 5
+!zone fill gas 3 1 5 1
+!zone set gas dmg 4
+!zone hook add gas on_cell_enter "entity[self].hp = entity[self].hp - zone_get(zone_name, 'dmg')"
+!zone hook add gas on_enter "log(self + ' entered ' + zone_name)"
+!zone hook add gas on_exit "log(self + ' left ' + zone_name)"
+!zone hook add gas on_round_start "zone_shift(zone_name, 0, 1)"
+!log clear
+!ent move hero 5 e
+!eval 'entity[hero].hp'
+!log
+!zone cells gas
+!turn next
+!zone cells gas
+
+Expected: The gas zone covers (3,1),(4,1),(5,1). Moving the
+hero east 5 steps from (1,1) walks it through all three gas
+cells and out the far side. The BOUNDARY on_enter fires exactly
+ONCE (crossing into the zone at (3,1)) and on_exit ONCE
+(leaving at (6,1)) — the log shows "hero entered gas" and "hero
+left gas". The PER-CELL on_cell_enter fires for every gas cell
+stepped onto — three times — so the hero loses 4 hp x3 and ends
+at hp 18. `!zone cells gas` lists the three cells. `!turn next`
+is the first turn advance, which begins round 1 and fires the
+zone's on_round_start time hook: `zone_shift(zone_name, 0, 1)`
+drifts the whole cloud one cell south, so `!zone cells gas` now
+shows (3,2),(4,2),(5,2).
+
+
+SCENARIO 359 — host system: owner runs freely, co-hosts run freely, players are held for approval; approve/deny
+---------------------------------------------------------------------------------------------------------------
+
+!match new arena Arena 6 6
+!match use arena
+!ent add hero Hero 30 2 2 5
+!host add alice
+!match hosts
+!as player alice
+!ent move hero 1 e
+!as player pleb
+!ent move hero 1 e
+!ent move hero 1 s
+!as host
+!pending
+!approve r1
+!deny r2
+!pending
+!as player alice
+!host add carol
+
+Expected: The creator of a match becomes its OWNER (here the
+harness identity `cli`, set because `!match new` records the
+sender). `!host add alice` appoints a co-host; `!match hosts`
+shows owner `cli` and co-host `alice`. `!as <role>` is the
+CLI/harness identity switch used to preview each role. As
+co-host `alice`, `!ent move` runs DIRECTLY — co-hosts share full
+command privileges. As `pleb` (no host role) the same two moves
+are NOT executed: each is held as a pending request (`r1`, `r2`)
+with a "needs host approval" reply; the hero does not move.
+`!pending` as a player is refused ("Only a host can do that").
+Back as the owner, `!pending` lists r1 and r2; `!approve r1`
+runs the held command with host authority (the hero finally
+moves east to (4,2)); `!deny r2` drops the other without
+running it; `!pending` is then empty. Finally, co-host `alice`
+trying `!host add carol` is refused — host MANAGEMENT is
+owner-only, even though co-hosts can run every other command.
+
+
+SCENARIO 360 — channel binding + per-match access overrides (fog-of-war read restriction)
+-----------------------------------------------------------------------------------------
+
+!match new fog Fog 6 6
+!match use fog
+!ent add spy Spy 20 1 1 9
+!match bind label=host-room
+!match channels
+!host access set "ent dump" host
+!host access list
+!as player watcher
+!ent info spy
+!ent dump spy
+!as host
+!host access clear "ent dump"
+!as player watcher
+!ent dump spy
+
+Expected: Channels bind to a match as a first-class set
+(multiple channels can bind one match — a host channel plus a
+players channel, or one per team — though the harness only has
+the single CLI channel). `!match use` already bound CLI, so
+`!match bind label=host-room` UPDATES that binding, attaching
+the label reserved for upcoming per-team / fog-of-war views;
+`!match channels` lists it. By default read-only inspect
+commands run for anyone, so as `watcher` (a player) `!ent info`
+and normally `!ent dump` both work. `!host access set "ent dump"
+host` is the owner tightening a read for a fog-of-war match: now
+a player's `!ent dump spy` is held for approval (request `r1`)
+rather than leaking the entity's full vars, while `!ent info`
+stays free. `!host access clear "ent dump"` lifts the
+restriction — `watcher`'s `!ent dump spy` runs again. These
+overrides are per-match host state, so they survive a system
+rule refresh.
+
+
+SCENARIO 361 — system-wide access policy + per-match override precedence + survival across rule refresh
+------------------------------------------------------------------------------------------------------
+
+!system new fogsys
+!system access fogsys set find host
+!system access fogsys list
+!match new m1 M1 6 6 --system fogsys
+!match use m1
+!ent add h H 9 1 1 1
+!as player scout
+!find hp>0
+!as host
+!host access set find all
+!as player scout
+!find hp>0
+!as host
+!system set fogsys friendlyfire true
+!as player scout
+!find hp>0
+
+Expected: There are TWO access-override layers and this shows
+how they stack. `!system access fogsys set find host` sets a
+SYSTEM-WIDE default — every match created on `fogsys` inherits
+`find` as host-gated (command_access is a dict rule, so it has
+its own editor rather than `!system set`). Match `m1` is created
+under fogsys, so as player `scout` the normally-free `!find` is
+held for approval (request r1). `!host access set find all` is
+the per-match owner override; it WINS over the system default,
+so scout's next `!find` runs and lists the entity. Then
+`!system set fogsys friendlyfire true` triggers a rule refresh
+on the live match — the per-match override lives in its own
+access_overrides field (not in the refreshed rules), so it
+SURVIVES: scout's final `!find` still runs. Precedence:
+per-match `!host access` > system `!system access` rule >
+engine defaults.

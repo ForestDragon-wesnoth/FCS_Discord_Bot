@@ -233,6 +233,21 @@ def _split_csv(value: Any) -> List[str]:
     return [tok.strip() for tok in value.split(",") if tok.strip()]
 
 
+def _log_target_str(target: Any) -> str:
+    """Compact string form of an action's resolved target for the event
+    log: entity id as-is, a (x, y) location as '(x,y)', a list joined by
+    ', ', and None (target=none) as ''."""
+    if target is None:
+        return ""
+    if isinstance(target, str):
+        return target
+    if isinstance(target, (tuple, list)):
+        if (len(target) == 2 and all(isinstance(c, int) for c in target)):
+            return f"({target[0]},{target[1]})"
+        return ", ".join(_log_target_str(t) for t in target)
+    return str(target)
+
+
 def _top_container_allowed(top_key: str, rules: Dict[str, Any]) -> bool:
     """True iff the top-level vars key `top_key` should be descended
     into by the action discovery walker. Consults
@@ -883,6 +898,13 @@ async def run_action(
                 fail_reason=af.reason,
                 fail_message=af.message,
             )
+            match.log_event(
+                "action_failed", actor=actor_id,
+                actor_name=match._entity_name(actor_id),
+                action=action.name, action_path=action.full_path,
+                target=_log_target_str(target),
+                reason=af.reason, message=af.message,
+            )
             return False, (af.reason, af.message)
         except ActionEngineFault:
             # Engine refusal (recursion limit etc.). Roll back AND
@@ -918,6 +940,12 @@ async def run_action(
         action_path=action.full_path,
         target=target,
         args=dict(args),
+    )
+    match.log_event(
+        "action_used", actor=actor_id,
+        actor_name=match._entity_name(actor_id),
+        action=action.name, action_path=action.full_path,
+        target=_log_target_str(target),
     )
     # Target-side hook: fires on each ENTITY target after the
     # actor-side hook. For target=entity, fires once on that target.

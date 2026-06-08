@@ -420,11 +420,77 @@ Recently shipped or in-flight:
   - __cell_stackable per-entity flag
   - default_kill_function_effects / default_revive_function_effects
     / corpse_line_format gamerules
+- Zones (named multi-cell regions): `Match.zones`, !zone command,
+  zone_* formula functions, boundary + per-cell + time hooks, drifting
+  via zone_shift. (See the zones commits.)
+- **Host / access-control system + multi-channel binding** — the big
+  structural one; read this before touching dispatch or the Discord
+  adapter:
+  - **Identity.** The command context now carries a user identity
+    (`ctx.user_id` / `user_name`), which the engine previously lacked.
+    Discord fills it from the message author; CLI + the scenario harness
+    use a switchable `"cli"` stand-in flipped by `!as host|player`
+    (gated behind `ctx.cli_mutable`). Read via `ctx_user(ctx)` /
+    `ctx_user_name(ctx)` in vtt_commands.py — both return None-safe
+    fallbacks so an identity-less surface DISABLES gating rather than
+    locking out.
+  - **Ownership.** `Match.owner` (the creator, set by
+    `create_match(owner=...)`) + `Match.cohosts`. is_owner / is_host /
+    add_cohost / remove_cohost. Owner = sole host-MANAGER; co-hosts share
+    full command privileges but can't appoint. `!host add/remove/list`
+    (owner-only). All persisted.
+  - **Multi-channel binding.** `Match.bound_channels`
+    (channel_key -> {"label"?}), uncapped. `!match bind/unbind/channels`;
+    `match use`/`bind` keep `MatchManager.active_by_channel` in sync. The
+    `label` is reserved for the NOT-YET-BUILT per-team / fog-of-war
+    views — binding routing exists, per-channel rendering does not.
+  - **The gate** lives in `CommandRegistry.run` →
+    `_gate_decision` / `_effective_access` (vtt_commands.py). Per-command
+    access level via `registry.command(access=...)`: `"all"` /
+    `"host"` (DEFAULT, mutating — non-host's invocation is held for
+    approval) / `"host_only"` (approve/deny themselves) / `"owner"`
+    (host mgmt). A host-gated root auto-downgrades to "all" when its
+    first arg is in `READ_ONLY_SUBCOMMANDS` (list/info/dump/cells/...),
+    so players can inspect but not mutate. Gate is a NO-OP when there's
+    no active match, no identity, or `owner is None` (legacy/open
+    matches). Alias resolution runs BEFORE the gate; `dispatch_no_snapshot`
+    (batch/run/action `cmd()`) is intentionally ungated since it's only
+    reached from an already-approved/host context — gate stays at the
+    top level only.
+  - **Approval queue.** Non-host commands → `Match.add_pending_request`
+    (runtime-only, not serialized). Surfaced as Discord Approve/Deny
+    buttons (`_ApprovalView` in discord_commands.py, host-only,
+    re-dispatches with the clicker's authority) OR text
+    `!approve`/`!deny`/`!pending` (work everywhere, harness-testable).
+  - **TWO access-override layers — don't conflate them** (this bit
+    confused even me; comments at `!system access` in vtt_commands.py
+    spell it out):
+    1. The `command_access` RULE = system-wide default. It's a DICT rule,
+       so `!system set` refuses it (dict/list rules each get a dedicated
+       editor — `!log format`, `!gclamp`, and now `!system access`).
+       Edited via `!system access <sys> set/clear/list`; flows into a
+       match's `rules` snapshot at create + every `refresh_match_rules`.
+    2. `Match.access_overrides` = per-match host tweak, edited via
+       `!host access set/clear/list`. It lives in its OWN field, NOT in
+       `rules`, SPECIFICALLY so a rule refresh (any `!system set` /
+       `!system access`) does NOT wipe it. The gate checks
+       access_overrides FIRST, then the rule, then defaults — so a
+       per-match host decision always beats the system default. Do NOT
+       "simplify" by folding access_overrides into rules; that would let
+       `!system access` clobber every host's per-match lockdowns.
+    The point of both: fog-of-war / invisibility matches can host-gate
+    reads (`ent dump`, `find`, `map`) so players can't enumerate hidden
+    entities — per match (`!host access`) or as a system default
+    (`!system access`).
 
 What the user has flagged as next-on-their-mind:
 - The user repeatedly chooses the "more gamerules, fewer hardcodes"
   direction. Almost every behavior the engine performs should be
   configurable.
+- Multi-channel binding was built as the foundation for **fog of war /
+  per-team views** (a channel per team, each rendering only what that
+  team sees). The `bound_channels` label field is the hook for it; the
+  per-channel rendering is the actual unbuilt feature.
 
 Look at recent PR descriptions on the repo (PRs #30 through #35)
 for context on the latest design conversations and rationale.

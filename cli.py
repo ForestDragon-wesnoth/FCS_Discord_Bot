@@ -8,6 +8,15 @@ from vtt_commands import registry
 
 class CLICtx:
     channel_key = "CLI"
+    # The CLI is single-user and local, so identity is a switchable
+    # stand-in (the `!as` command flips it) used to PREVIEW what a host
+    # vs a player sees. Default identity "cli" owns any match it creates.
+    cli_mutable = True
+
+    def __init__(self):
+        self.user_id = "cli"
+        self.user_name = "cli"
+
     async def send(self, message: str):
         print(message)
 

@@ -10,6 +10,7 @@ from logic import (
     DEFAULT_SYSTEM_SETTINGS, ALLOWED_DIRECTIONS, RULE_SCHEMA, RULES_REGISTRY,
     CARDINAL_DIRECTIONS, DIAGONAL_DIRECTIONS,
     normalize_direction, rotate_direction,
+    EVENT_LOG_DEFAULT_FORMATS,
 )
 
 # Passive system
@@ -19,7 +20,7 @@ from logic import Passive, HOOK_NAMES
 from logic import ClampSpec
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
-from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, normalize_body_source
+from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, normalize_body_source, _get_path, _set_path
 
 import re
 import json
@@ -29,10 +30,42 @@ import copy
 # ---- Context abstraction -----------------------------------------------------
 class ReplyContext(Protocol):
     channel_key: str  # unique per chat location (e.g., guild:channel). For CLI, just "CLI".
+    # Identity of whoever sent the command. Discord sets these from the
+    # message author; the CLI/harness use a switchable stand-in. Optional
+    # for backward compat — a context without them disables host gating
+    # (everyone is treated as privileged). See ctx_user / ctx_user_name.
+    user_id: str
+    user_name: str
     async def send(self, message: str) -> None: ...
+
+
+def ctx_user(ctx: "ReplyContext") -> Optional[str]:
+    """The sender's user id, or None when the surface doesn't carry one
+    (which disables host gating for that surface)."""
+    uid = getattr(ctx, "user_id", None)
+    return uid if isinstance(uid, str) and uid else None
+
+
+def ctx_user_name(ctx: "ReplyContext") -> str:
+    """A human-friendly sender name for messages (falls back to the id,
+    then to 'someone')."""
+    name = getattr(ctx, "user_name", None)
+    if isinstance(name, str) and name:
+        return name
+    return ctx_user(ctx) or "someone"
 
 # ---- Command registry --------------------------------------------------------
 Handler = Callable[[ReplyContext, List[str], MatchManager], Any]
+
+# Subcommand names that are read-only across every command root, so a
+# host-gated root invoked with one of these as its first argument is
+# downgraded to "all" (anyone may run it). Conservative on purpose: these
+# names never mutate state anywhere in the command surface, so the
+# downgrade can't open a write hole. The per-match command_access rule
+# can re-tighten any of them for fog-of-war matches.
+READ_ONLY_SUBCOMMANDS: frozenset = frozenset({
+    "list", "info", "dump", "cells", "diff", "channels", "hosts",
+})
 
 class CommandRegistry:
     def __init__(self):
@@ -46,11 +79,24 @@ class CommandRegistry:
         # different undo lane (`turn next` snapshots round/turn itself)
         # or that aren't conceptually undoable (`history`, `store`).
         self._snapshot: Dict[str, bool] = {}
+        # Per-command access level for the host/approval gate (see run()):
+        #   "all"       anyone may run it (read-only / harmless)
+        #   "host"      hosts run directly; a non-host's invocation is
+        #               held for host approval (DEFAULT — mutating cmds)
+        #   "host_only" hosts run directly; a non-host is rejected outright
+        #               (no queue) — for the approval commands themselves
+        #   "owner"     only the match owner may run it; others rejected
+        # A host-gated root is downgraded to "all" when its first arg is a
+        # known read-only subcommand (READ_ONLY_SUBCOMMANDS), and the
+        # active match's command_access rule can override any of this.
+        self._access: Dict[str, str] = {}
     def command(self, name: str, *, usage: Optional[str] = None,
-                desc: Optional[str] = None, snapshot: bool = True):
+                desc: Optional[str] = None, snapshot: bool = True,
+                access: str = "host"):
         def deco(fn: Handler):
             self._handlers[name] = fn
             self._snapshot[name] = snapshot
+            self._access[name] = access
             meta = self._help.setdefault(name, {"usage": None, "desc": None, "subs": {}})
             if usage:
                 meta["usage"] = usage
@@ -169,6 +215,85 @@ class CommandRegistry:
             await ctx.send(f"❌ {e}")
             return
 
+    def _effective_access(self, name: str, args: List[str],
+                          m: "Any") -> str:
+        """Resolve the access level for this invocation: the command's
+        base level, downgraded to 'all' for a read-only subcommand, then
+        overridden by the active match's command_access rule. `m` is the
+        active Match (or None)."""
+        base = self._access.get(name, "host")
+        if base == "host" and args and args[0].lower() in READ_ONLY_SUBCOMMANDS:
+            base = "all"
+        if m is not None:
+            sub_key = f"{name} {args[0].lower()}" if args else None
+            # Per-match host overrides win over the system-level rule,
+            # which wins over the default. Within each layer, a precise
+            # "name sub" key beats a bare "name" key.
+            for table in (getattr(m, "access_overrides", None),
+                          m.rules.get("command_access")):
+                if not isinstance(table, dict) or not table:
+                    continue
+                if sub_key is not None and sub_key in table:
+                    return str(table[sub_key])
+                if name in table:
+                    return str(table[name])
+        return base
+
+    def _gate_decision(self, name: str, args: List[str],
+                       ctx: ReplyContext, mgr: MatchManager) -> str:
+        """Return one of: 'allow', 'queue', 'reject_owner', 'reject_host'.
+        The gate only engages when there's an active match AND the surface
+        carries a user identity."""
+        mid = mgr.active_by_channel.get(ctx.channel_key)
+        m = mgr.matches.get(mid) if mid is not None else None
+        if m is None:
+            return "allow"
+        if m.owner is None:
+            # No host system established on this match (legacy save /
+            # API-created without an owner) — leave it fully open rather
+            # than locking everyone out with no host able to approve.
+            return "allow"
+        user = ctx_user(ctx)
+        if user is None:
+            # Identity-less surface (shouldn't happen for our contexts) —
+            # don't gate, preserving pre-host-system behavior.
+            return "allow"
+        access = self._effective_access(name, args, m)
+        if access == "all":
+            return "allow"
+        is_owner = m.is_owner(user)
+        is_host = m.is_host(user)
+        if access == "owner":
+            return "allow" if is_owner else "reject_owner"
+        if access == "host_only":
+            return "allow" if is_host else "reject_host"
+        # access == "host": hosts run directly, everyone else is queued.
+        return "allow" if is_host else "queue"
+
+    async def _queue_request(self, name: str, args: List[str],
+                             ctx: ReplyContext, mgr: MatchManager):
+        """Hold a non-host's command for host approval. Stores the request
+        on the active match and notifies — with clickable buttons if the
+        surface supports them (Discord), else a text prompt."""
+        mid = mgr.active_by_channel.get(ctx.channel_key)
+        m = mgr.matches.get(mid)
+        if m is None:  # defensive — gate already checked, but be safe
+            await ctx.send("❌ No active match.")
+            return
+        req = m.add_pending_request(
+            user=ctx_user(ctx), user_name=ctx_user_name(ctx),
+            name=name, args=list(args), channel_key=ctx.channel_key,
+        )
+        sender = getattr(ctx, "send_approval", None)
+        if callable(sender):
+            return await sender(req)
+        cmd = "!" + name + (" " + " ".join(args) if args else "")
+        await ctx.send(
+            f"🕓 `{cmd}` needs host approval (request `{req['id']}`, by "
+            f"{req['user_name']}). A host can `!approve {req['id']}` or "
+            f"`!deny {req['id']}`."
+        )
+
     async def run(self, name: str, args: List[str], ctx: ReplyContext, mgr: MatchManager):
         # Alias resolution happens BEFORE handler lookup so an alias can
         # shadow a built-in name on this match.
@@ -181,6 +306,24 @@ class CommandRegistry:
             # suggestions, only if any are close.
             await ctx.send(self._unknown_command_message(name, mgr, ctx))
             return
+
+        # Host / approval gate. Resolved against the channel's ACTIVE
+        # match (the thing the command would act on). If there's no active
+        # match, or the surface carries no identity, the gate is a no-op —
+        # so match creation, help, and identity-less contexts all run
+        # freely. Otherwise: owner/host commands run directly for the
+        # right role, a non-host's mutating command is held for approval,
+        # and owner_only / host_only violations are rejected outright.
+        gate = self._gate_decision(name, args, ctx, mgr)
+        if gate == "reject_owner":
+            await ctx.send("❌ Only the match owner can do that.")
+            return
+        if gate == "reject_host":
+            await ctx.send("❌ Only a host can do that.")
+            return
+        if gate == "queue":
+            return await self._queue_request(name, args, ctx, mgr)
+        # gate == "allow" -> fall through and run normally.
 
         # Pre-dispatch snapshot of the active match's state. We only
         # bother if (a) the command opted into snapshotting (snapshot=
@@ -698,15 +841,99 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 i += 1
             else:
                 i += 1
-        mid = mgr.create_match(match_id, name, w, h, channel_key=ctx.channel_key, system_name=system_name)
+        mid = mgr.create_match(match_id, name, w, h, channel_key=ctx.channel_key, system_name=system_name, owner=ctx_user(ctx))
         return await ctx.send(f"Created match `{name}` with id `{mid}` using system `{mgr.get(mid).system_name}`.")
     if sub == "use":# and len(args) >= 2:
         if await return_help_if_not_enough_args(ctx, args, 2, "match", "use"):
             return
         mid = args[1]
         mgr.set_active_for_channel(ctx.channel_key, mid)
+        # `use` makes this channel act on the match; treat that as binding
+        # the channel too so the match's channel set stays accurate.
         m = mgr.matches.get(mid)
+        if m is not None:
+            m.bind_channel(ctx.channel_key)
         return await ctx.send(f"Active match is now **{m.name}** (`{mid}`, system `{m.system_name}`).")
+    if sub == "bind":
+        # !match bind [<match_id>] [label=<text>]
+        # Bind THIS channel to a match (defaults to the channel's active
+        # match) and make the match active here. Multiple channels can
+        # bind one match (uncapped) — host channel + players channel, or
+        # one channel per team. An optional label is stored for the
+        # upcoming per-team / fog-of-war views.
+        label = None
+        positional = []
+        for a in args[1:]:
+            if a.startswith("label="):
+                label = a[len("label="):]
+            else:
+                positional.append(a)
+        target_mid = positional[0] if positional else mgr.get_active_for_channel(ctx.channel_key)
+        if not target_mid:
+            return await ctx.send(
+                "❌ No match to bind. Use `!match bind <match_id>` or set "
+                "an active match first."
+            )
+        m = mgr.matches.get(target_mid)
+        if not m:
+            raise NotFound(f"Match '{target_mid}' not found.")
+        newly = m.bind_channel(ctx.channel_key, label=label)
+        mgr.set_active_for_channel(ctx.channel_key, target_mid)
+        tail = f" (label '{label}')" if label else ""
+        verb = "Bound this channel to" if newly else "Updated binding of this channel to"
+        return await ctx.send(
+            f"{verb} **{m.name}** (`{target_mid}`){tail}. "
+            f"{len(m.bound_channels)} channel(s) bound."
+        )
+    if sub == "unbind":
+        # !match unbind [<match_id>] — unbind THIS channel.
+        target_mid = args[1] if len(args) >= 2 else mgr.get_active_for_channel(ctx.channel_key)
+        if not target_mid:
+            return await ctx.send("❌ No match to unbind from this channel.")
+        m = mgr.matches.get(target_mid)
+        if not m:
+            raise NotFound(f"Match '{target_mid}' not found.")
+        removed = m.unbind_channel(ctx.channel_key)
+        if mgr.get_active_for_channel(ctx.channel_key) == target_mid:
+            mgr.active_by_channel.pop(ctx.channel_key, None)
+        if not removed:
+            return await ctx.send(f"This channel was not bound to `{target_mid}`.")
+        return await ctx.send(
+            f"Unbound this channel from **{m.name}** (`{target_mid}`). "
+            f"{len(m.bound_channels)} channel(s) remain."
+        )
+    if sub == "channels":
+        # !match channels [<match_id>] — list bound channels.
+        target_mid = args[1] if len(args) >= 2 else mgr.get_active_for_channel(ctx.channel_key)
+        if not target_mid:
+            return await ctx.send("❌ No active match. `!match channels <id>`.")
+        m = mgr.matches.get(target_mid)
+        if not m:
+            raise NotFound(f"Match '{target_mid}' not found.")
+        if not m.bound_channels:
+            return await ctx.send(f"**{m.name}** (`{target_mid}`): no bound channels.")
+        lines = [f"**{m.name}** (`{target_mid}`) bound channels:"]
+        for ch in sorted(m.bound_channels.keys()):
+            meta = m.bound_channels[ch]
+            label = meta.get("label")
+            here = " ← here" if ch == ctx.channel_key else ""
+            lab = f" — '{label}'" if label else ""
+            lines.append(f"- `{ch}`{lab}{here}")
+        return await ctx.send("\n".join(lines))
+    if sub == "hosts":
+        # !match hosts [<match_id>] — show owner + co-hosts.
+        target_mid = args[1] if len(args) >= 2 else mgr.get_active_for_channel(ctx.channel_key)
+        if not target_mid:
+            return await ctx.send("❌ No active match. `!match hosts <id>`.")
+        m = mgr.matches.get(target_mid)
+        if not m:
+            raise NotFound(f"Match '{target_mid}' not found.")
+        owner = m.owner or "(none)"
+        cohosts = ", ".join(f"`{c}`" for c in m.cohosts) if m.cohosts else "(none)"
+        return await ctx.send(
+            f"**{m.name}** (`{target_mid}`)\n"
+            f"- owner: `{owner}`\n- co-hosts: {cohosts}"
+        )
     if sub == "delete":# and len(args) >= 2:
         if await return_help_if_not_enough_args(ctx, args, 2, "match", "delete"):
             return
@@ -721,6 +948,54 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             raise NotFound(f"Match '{mid}' not found.")
         m.name = " ".join(args[2:])
         return await ctx.send(f"Renamed match `{mid}`.")
+    # var: match-level scratchpad vars on the ACTIVE match. The command
+    # twin of the `match.<path>` formula root / match_var_* functions —
+    # global GM state (alarm_level, objective_progress, weather, ...) that
+    # belongs to the match rather than any entity. Dotted paths supported.
+    if sub == "var":
+        if await return_help_if_not_enough_args(ctx, args, 2, "match", "var"):
+            return
+        m = active_match(mgr, ctx)
+        vsub = args[1].lower()
+        if vsub == "set":
+            if await return_help_if_not_enough_args(ctx, args, 4, "match", "var"):
+                return
+            path = args[2]
+            value = _parse_scalar(args[3])
+            _set_path(m.vars, path, value)
+            return await ctx.send(f"match var `{path}` = {value!r}")
+        if vsub == "get":
+            if await return_help_if_not_enough_args(ctx, args, 3, "match", "var"):
+                return
+            path = args[2]
+            try:
+                value = _get_path(m.vars, path)
+            except FormulaError:
+                raise NotFound(f"Match var '{path}' is not set.")
+            return await ctx.send(f"match var `{path}` = {value!r}")
+        if vsub in ("del", "delete", "rm", "remove"):
+            if await return_help_if_not_enough_args(ctx, args, 3, "match", "var"):
+                return
+            path = args[2]
+            keys = path.split(".")
+            cur: Any = m.vars
+            for k in keys[:-1]:
+                if not isinstance(cur, dict) or k not in cur:
+                    raise NotFound(f"Match var '{path}' is not set.")
+                cur = cur[k]
+            if not isinstance(cur, dict) or keys[-1] not in cur:
+                raise NotFound(f"Match var '{path}' is not set.")
+            del cur[keys[-1]]
+            return await ctx.send(f"Removed match var `{path}`.")
+        if vsub == "list":
+            if not m.vars:
+                return await ctx.send("No match vars set.")
+            lines = [f"- `{k}` = {v!r}" for k, v in m.vars.items()]
+            return await ctx.send("**Match vars:**\n" + "\n".join(lines))
+        raise VTTError(
+            f"Unknown !match var subcommand '{vsub}'. "
+            f"Use set / get / del / list."
+        )
     # Fallback: show help menu for the command if it's not properly typed
     title, body = registry.help_for(["match"])
     return await ctx.send(f"**{title}**\n{body}")
@@ -736,6 +1011,32 @@ registry.annotate_sub(
     desc="Set the current channel's active match."
 )
 registry.annotate_sub(
+    "match", "bind",
+    usage="!match bind [<id>] [label=<text>]",
+    desc=(
+        "Bind THIS channel to a match (defaults to the active one) and "
+        "make it active here. Multiple channels can bind one match, "
+        "uncapped — e.g. a host channel plus a players channel, or one "
+        "channel per team. The optional label is stored for upcoming "
+        "per-team / fog-of-war views."
+    ),
+)
+registry.annotate_sub(
+    "match", "unbind",
+    usage="!match unbind [<id>]",
+    desc="Unbind THIS channel from a match (defaults to the active one).",
+)
+registry.annotate_sub(
+    "match", "channels",
+    usage="!match channels [<id>]",
+    desc="List every channel bound to a match, with labels.",
+)
+registry.annotate_sub(
+    "match", "hosts",
+    usage="!match hosts [<id>]",
+    desc="Show a match's owner and co-hosts.",
+)
+registry.annotate_sub(
     "match", "delete",
     usage="!match delete <id>",
     desc="Delete a match by id."
@@ -745,6 +1046,282 @@ registry.annotate_sub(
     usage="!match rename <id> <new_name>",
     desc="Rename a selected match."
 )
+registry.annotate_sub(
+    "match", "var",
+    usage="!match var <set <path> <value> | get <path> | del <path> | list>",
+    desc=(
+        "Match-level scratchpad vars on the active match — global GM state "
+        "(alarm_level, objective_progress, weather, ...) that belongs to "
+        "the match, not any entity. Dotted paths supported. The command "
+        "twin of the reserved `match.<path>` formula root and the "
+        "match_var_* formula functions. Values parse as int → float → str; "
+        "quote multi-word string values (`!match var set note \"red alert\"`). "
+        "Match vars do NOT fire var hooks."
+    )
+)
+
+# ---- host (per-match host management) -----
+@registry.command(
+    "host", access="owner",
+    usage="!host <add|remove|list|access> ...",
+    desc=(
+        "Manage the active match's host list. The match's CREATOR is its "
+        "owner — full command privileges and the sole manager of this "
+        "list. `add <user>` appoints a co-host (same command privileges, "
+        "but they can't manage hosts); `remove <user>` revokes one; "
+        "`list` shows everyone. On Discord, `<user>` is a mention or "
+        "user id; at the CLI it's any string identity (see `!as`). "
+        "Non-host commands against the match are held for host approval "
+        "(see `!approve` / `!deny`)."
+    ),
+)
+async def host_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    m = active_match(mgr, ctx)
+    if not args:
+        sub = "list"
+    else:
+        sub = args[0].lower()
+
+    if sub == "list":
+        owner = m.owner or "(none)"
+        cohosts = ", ".join(f"`{c}`" for c in m.cohosts) if m.cohosts else "(none)"
+        return await ctx.send(
+            f"**{m.name}** hosts\n- owner: `{owner}`\n- co-hosts: {cohosts}"
+        )
+
+    if sub == "access":
+        # !host access <set <cmd> <level> | clear <cmd> | list>
+        # Per-match overrides of the command access gate. Lets the host
+        # tighten a normally-free read (fog of war: `ent dump`, `find`,
+        # `map`) or loosen a gated one. Keys are "command" or
+        # "command sub"; levels are all / host / host_only / owner.
+        VALID = {"all", "host", "host_only", "owner"}
+        asub = args[1].lower() if len(args) >= 2 else "list"
+        if asub == "list":
+            if not m.access_overrides:
+                return await ctx.send(
+                    f"**{m.name}**: no command-access overrides (engine "
+                    f"defaults apply)."
+                )
+            lines = [f"**{m.name}** command-access overrides:"]
+            for k in sorted(m.access_overrides.keys()):
+                lines.append(f"- `{k}` → {m.access_overrides[k]}")
+            return await ctx.send("\n".join(lines))
+        if asub == "set":
+            if await return_help_if_not_enough_args(ctx, args, 4, "host", "access"):
+                return
+            key = args[2]
+            level = args[3].lower()
+            if level not in VALID:
+                return await ctx.send(
+                    f"❌ level must be one of: {', '.join(sorted(VALID))}."
+                )
+            m.access_overrides[key] = level
+            return await ctx.send(f"Access override set: `{key}` → {level}.")
+        if asub == "clear":
+            if await return_help_if_not_enough_args(ctx, args, 3, "host", "access"):
+                return
+            key = args[2]
+            if m.access_overrides.pop(key, None) is None:
+                return await ctx.send(f"No override for `{key}`.")
+            return await ctx.send(f"Cleared access override for `{key}`.")
+        title, body = registry.help_for(["host", "access"])
+        return await ctx.send(f"**{title}**\n{body}")
+
+    if sub in ("add", "remove"):
+        if await return_help_if_not_enough_args(ctx, args, 2, "host", sub):
+            return
+        target = _normalize_user_token(args[1])
+        if sub == "add":
+            if target == m.owner:
+                return await ctx.send(f"`{target}` is already the owner.")
+            added = m.add_cohost(target)
+            if not added:
+                return await ctx.send(f"`{target}` is already a co-host.")
+            return await ctx.send(f"Appointed `{target}` as a co-host of **{m.name}**.")
+        # remove
+        if target == m.owner:
+            return await ctx.send(
+                "❌ The owner can't be removed. Owner stays for the match's life."
+            )
+        removed = m.remove_cohost(target)
+        if not removed:
+            return await ctx.send(f"`{target}` is not a co-host.")
+        return await ctx.send(f"Removed co-host `{target}` from **{m.name}**.")
+
+    title, body = registry.help_for(["host"])
+    return await ctx.send(f"**{title}**\n{body}")
+
+
+def _normalize_user_token(tok: str) -> str:
+    """Normalize a user reference. A Discord mention (<@123>, <@!123>)
+    reduces to the bare id so it matches the user_id the dispatcher
+    sees; anything else passes through unchanged (CLI string identities,
+    raw ids)."""
+    t = tok.strip()
+    if t.startswith("<@") and t.endswith(">"):
+        t = t[2:-1]
+        if t.startswith("!"):
+            t = t[1:]
+    return t
+
+
+# ---- as (CLI identity switch for previewing host vs player) -----
+@registry.command(
+    "as", access="all",
+    usage="!as <host|player|owner> [<name>]",
+    desc=(
+        "Switch your previewing identity. CLI-only: lets you see what a "
+        "host vs a player experiences (a player's mutating commands are "
+        "held for approval; later, fog-of-war views will differ too). "
+        "`!as owner` / `!as host` restores the owner identity 'cli'; "
+        "`!as player [name]` becomes a player ('player' or the given "
+        "name). On Discord, identity comes from your account and can't "
+        "be reassigned, so this command is inert there."
+    ),
+)
+async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not getattr(ctx, "cli_mutable", False):
+        return await ctx.send(
+            "❌ `!as` only works at the CLI. On Discord your identity is "
+            "your account."
+        )
+    if not args:
+        return await ctx.send(
+            f"You are `{ctx_user(ctx)}`. Use `!as host` or `!as player [name]`."
+        )
+    role = args[0].lower()
+    if role in ("host", "owner"):
+        ctx.user_id = "cli"
+        ctx.user_name = "cli"
+        return await ctx.send("You are now the owner identity `cli`.")
+    if role == "player":
+        name = args[1] if len(args) >= 2 else "player"
+        ctx.user_id = name
+        ctx.user_name = name
+        return await ctx.send(f"You are now player `{name}` (non-host).")
+    # Treat any other token as a literal identity to assume.
+    ctx.user_id = role
+    ctx.user_name = role
+    return await ctx.send(f"You are now `{role}`.")
+
+
+# ---- approval queue (host approves / denies player commands) -----
+@registry.command(
+    "pending", access="host_only", snapshot=False,
+    usage="!pending",
+    desc=(
+        "List the active match's pending approval requests — player "
+        "commands awaiting a host's go-ahead. Each shows an id, the "
+        "requester, and the command. Approve with `!approve <id>` or "
+        "reject with `!deny <id>`. Host-only."
+    ),
+)
+async def pending_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    m = active_match(mgr, ctx)
+    if not m.pending_requests:
+        return await ctx.send("No pending requests.")
+    lines = [f"**{m.name}** pending requests:"]
+    for rid in sorted(m.pending_requests.keys(), key=lambda r: int(r[1:])):
+        req = m.pending_requests[rid]
+        cmd = "!" + req["name"] + (" " + " ".join(req["args"]) if req["args"] else "")
+        lines.append(f"- `{rid}` by {req['user_name']}: `{cmd}`")
+    return await ctx.send("\n".join(lines))
+
+
+@registry.command(
+    "approve", access="host_only", snapshot=False,
+    usage="!approve <id|all>",
+    desc=(
+        "Approve a pending player command and run it now (with host "
+        "authority). `!approve all` runs every queued request in order. "
+        "The command executes exactly as the player typed it, against "
+        "this match. Host-only."
+    ),
+)
+async def approve_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    m = active_match(mgr, ctx)
+    if await return_help_if_not_enough_args(ctx, args, 1, "approve"):
+        return
+    target = args[0]
+    if target.lower() == "all":
+        if not m.pending_requests:
+            return await ctx.send("No pending requests.")
+        rids = sorted(m.pending_requests.keys(), key=lambda r: int(r[1:]))
+        for rid in rids:
+            await _run_approved(m.pop_pending_request(rid), ctx, mgr)
+        return
+    req = m.pop_pending_request(target)
+    if req is None:
+        return await ctx.send(f"❌ No pending request `{target}`.")
+    await _run_approved(req, ctx, mgr)
+
+
+async def _run_approved(req: dict, ctx: ReplyContext, mgr: MatchManager):
+    """Re-dispatch an approved request through the normal path. The
+    approver is a host, so the gate lets it run directly; it snapshots
+    and behaves like any host command. We announce the approval first so
+    the command's own output follows it."""
+    cmd = "!" + req["name"] + (" " + " ".join(req["args"]) if req["args"] else "")
+    await ctx.send(f"✅ Approved `{req['id']}` ({cmd}, by {req['user_name']}).")
+    await registry.run(req["name"], req["args"], ctx, mgr)
+
+
+@registry.command(
+    "deny", access="host_only", snapshot=False,
+    usage="!deny <id|all>",
+    desc=(
+        "Reject a pending player command without running it. `!deny all` "
+        "clears the whole queue. Host-only."
+    ),
+)
+async def deny_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    m = active_match(mgr, ctx)
+    if await return_help_if_not_enough_args(ctx, args, 1, "deny"):
+        return
+    target = args[0]
+    if target.lower() == "all":
+        n = len(m.pending_requests)
+        if n == 0:
+            return await ctx.send("No pending requests.")
+        m.pending_requests.clear()
+        return await ctx.send(f"Denied all {n} pending request(s).")
+    req = m.pop_pending_request(target)
+    if req is None:
+        return await ctx.send(f"❌ No pending request `{target}`.")
+    cmd = "!" + req["name"] + (" " + " ".join(req["args"]) if req["args"] else "")
+    return await ctx.send(f"🚫 Denied `{req['id']}` ({cmd}, by {req['user_name']}).")
+
+
+registry.annotate_sub(
+    "host", "add",
+    usage="!host add <user>",
+    desc="Appoint a co-host (owner only). On Discord pass a mention or id.",
+)
+registry.annotate_sub(
+    "host", "remove",
+    usage="!host remove <user>",
+    desc="Revoke a co-host (owner only). The owner can't be removed.",
+)
+registry.annotate_sub(
+    "host", "list",
+    usage="!host list",
+    desc="Show the match owner and co-hosts.",
+)
+registry.annotate_sub(
+    "host", "access",
+    usage="!host access <set <cmd> <level> | clear <cmd> | list>",
+    desc=(
+        "Per-match overrides of the command-access gate (owner only). "
+        "`set <cmd> <level>` keys on a command (\"find\") or "
+        "command+sub (\"ent dump\"); levels: all / host / host_only / "
+        "owner. Tighten a normally-free read so it needs host approval in "
+        "a fog-of-war / invisibility match, or loosen a gated one. These "
+        "override the system command_access rule and survive rule "
+        "refreshes. `clear <cmd>` removes one; `list` shows them all."
+    ),
+)
+
 
 # ---- system (gamesystem commands)-----
 
@@ -856,6 +1433,93 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         refreshed = mgr.refresh_match_rules(name)
         suffix = f" (refreshed {refreshed} live match{'es' if refreshed != 1 else ''})" if refreshed else ""
         return await ctx.send(f"`{name}`.{key} = {value!r}{suffix}")
+
+    # ---- system access <system> <set|clear|list> ---------------------
+    # Dedicated editor for the command_access RULE on a GameSystem. This
+    # exists because command_access is a dict-valued rule, and `!system
+    # set` deliberately refuses dict/list rules (you can't express a
+    # nested value in one flat key=value token, and a partial edit would
+    # clobber the structure) — see _coerce_rule_value's "structured dict"
+    # branch in logic.py. So dict rules each get a dedicated command:
+    # `!log format` edits event_log_format, and THIS edits command_access.
+    #
+    # WHY TWO ACCESS-OVERRIDE LAYERS (important for future readers):
+    #   1. The command_access RULE (edited here) is the SYSTEM-WIDE
+    #      default. It flows into a match's `rules` snapshot at creation
+    #      and on every refresh_match_rules — so editing it here updates
+    #      the baseline policy for every current and future match on the
+    #      system (e.g. "on my Fog-of-War system, `find` and `ent dump`
+    #      are host-gated out of the box").
+    #   2. Match.access_overrides (edited via `!host access`) is a
+    #      PER-MATCH host tweak. It lives in its OWN field, NOT in
+    #      `rules`, precisely so a refresh_match_rules (triggered by ANY
+    #      `!system set` / `!system access` on the system) does NOT wipe
+    #      it. The gate (CommandRegistry._effective_access) checks
+    #      access_overrides FIRST, then the command_access rule, then the
+    #      built-in defaults — so a per-match host decision always beats
+    #      the system default.
+    # That separation is the whole reason the per-match overrides survive
+    # rule refreshes; don't "simplify" by moving access_overrides into
+    # rules, or `!system access` here would clobber every host's tweaks.
+    if sub == "access":
+        if await return_help_if_not_enough_args(ctx, args, 3, "system", "access"):
+            return
+        name = args[1]
+        action = args[2].lower()
+        s = mgr.get_system(name)
+        VALID = {"all", "host", "host_only", "owner"}
+        # The system's current command_access dict (copy so we don't
+        # mutate the stored value in place before set()).
+        current = s.get("command_access")
+        current = dict(current) if isinstance(current, dict) else {}
+
+        if action == "list":
+            if not current:
+                return await ctx.send(
+                    f"System `{name}` has no command_access overrides "
+                    f"(engine defaults apply: mutating commands are host, "
+                    f"read-only inspects are open)."
+                )
+            lines = [f"**{name}** command_access (system-wide default):"]
+            for k in sorted(current.keys()):
+                lines.append(f"- `{k}` → {current[k]}")
+            return await ctx.send("\n".join(lines))
+
+        if action == "set":
+            if await return_help_if_not_enough_args(ctx, args, 5, "system", "access"):
+                return
+            key = args[3]
+            level = args[4].lower()
+            if level not in VALID:
+                return await ctx.send(
+                    f"❌ level must be one of: {', '.join(sorted(VALID))}."
+                )
+            current[key] = level
+            s.set("command_access", current)
+            refreshed = mgr.refresh_match_rules(name)
+            suffix = f" ({refreshed} live match{'es' if refreshed != 1 else ''} refreshed)" if refreshed else ""
+            return await ctx.send(
+                f"System `{name}` command_access: `{key}` → {level}{suffix}. "
+                f"Note: per-match `!host access` overrides still win."
+            )
+
+        if action == "clear":
+            if await return_help_if_not_enough_args(ctx, args, 4, "system", "access"):
+                return
+            key = args[3]
+            if key not in current:
+                return await ctx.send(f"System `{name}` has no override for `{key}`.")
+            del current[key]
+            s.set("command_access", current)
+            refreshed = mgr.refresh_match_rules(name)
+            suffix = f" ({refreshed} live match{'es' if refreshed != 1 else ''} refreshed)" if refreshed else ""
+            return await ctx.send(
+                f"Cleared `{key}` from system `{name}` command_access{suffix}."
+            )
+
+        title, body = registry.help_for(["system", "access"])
+        return await ctx.send(f"**{title}**\n{body}")
+
     if sub == "default":
         if await return_help_if_not_enough_args(ctx, args, 3, "system", "default"):
             return
@@ -992,6 +1656,21 @@ registry.annotate_sub(
     ),
 )
 registry.annotate_sub("system", "set", usage="!system set <name> <key> <value>", desc="Change a GameSystem setting (booleans/int auto-coerced). Use \"\" to clear a string rule.")
+registry.annotate_sub(
+    "system", "access",
+    usage="!system access <system> <set <key> <level> | clear <key> | list>",
+    desc=(
+        "Edit a GameSystem's command_access rule — the SYSTEM-WIDE "
+        "default access policy inherited by every match on the system "
+        "(command_access is a dict rule, so `!system set` can't touch "
+        "it). `set <key> <level>` keys on a command (\"find\") or "
+        "command+sub (\"ent dump\"); levels: all / host / host_only / "
+        "owner. Refreshes live matches. This is the BASELINE — per-match "
+        "`!host access` overrides take precedence and survive this "
+        "refresh. Use it for a system whose matches should default to "
+        "fog-of-war read restrictions; use `!host access` for one match."
+    ),
+)
 registry.annotate_sub(
     "system", "alias",
     usage=(
@@ -1564,6 +2243,41 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             msg = msg + "\n" + "\n".join(hook_log)
         return await ctx.send(msg)
 
+    # pull — !ent pull <id> <x> <y> [n]. Forced movement TOWARD a point.
+    # Wraps Match.pull_entity (shared with the pull_entity() formula
+    # primitive): drags the entity up to n cells toward (x,y), stopping
+    # at the first blocked cell or on reaching the target.
+    if sub == "pull":
+        if await return_help_if_not_enough_args(ctx, args, 4, "ent", "pull"):
+            return
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        try:
+            tx = int(args[2]); ty = int(args[3])
+        except ValueError:
+            return await ctx.send(
+                f"Pull target must be integer x and y, got "
+                f"'{args[2]}' '{args[3]}'."
+            )
+        n = 1
+        if len(args) >= 5:
+            try:
+                n = int(args[4])
+            except ValueError:
+                return await ctx.send(
+                    f"Pull distance must be an integer, got '{args[4]}'."
+                )
+        try:
+            steps, hook_log = m.pull_entity(eid, tx, ty, n)
+        except VTTError as e:
+            return await ctx.send(f"❌ {e}")
+        e = m.entities[eid]
+        msg = f"Pulled `{eid}` {steps} cell(s) toward ({tx},{ty}) to ({e.x},{e.y})."
+        if hook_log:
+            msg = msg + "\n" + "\n".join(hook_log)
+        return await ctx.send(msg)
+
     # swap — !ent swap <id1> <id2>. Wraps Match.swap_entities (shared with
     # the swap_entities() formula primitive).
     if sub == "swap":
@@ -2013,6 +2727,19 @@ registry.annotate_sub(
     ),
 )
 registry.annotate_sub(
+    "ent", "pull",
+    usage="!ent pull <id> <x> <y> [n]",
+    desc=(
+        "Forced movement TOWARD a point: drag <id> up to n cells (default "
+        "1) toward (x,y), stopping at the first wall/occupied cell or on "
+        "reaching the target. The point-directed twin of !ent push — the "
+        "heading recomputes each step, so the path curves toward (x,y). "
+        "Honors 'allow_diagonal_movement'. Walks cell by cell, firing "
+        "per-step tile hooks. Command equivalent of the pull_entity() "
+        "formula primitive."
+    ),
+)
+registry.annotate_sub(
     "ent", "swap",
     usage="!ent swap <id1> <id2>",
     desc=(
@@ -2231,12 +2958,12 @@ async def match_top_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             parts.append(f"- `{pid}` ({p.when}): `{p.formula}`")
     return await ctx.send("\n".join(parts))
 
-@registry.command("map", usage="!map", desc="Render the ASCII map for the active match.")
+@registry.command("map", access="all", usage="!map", desc="Render the ASCII map for the active match.")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     return await ctx.send(f"```\n{m.render_ascii()}\n```")
 
-@registry.command("list", usage="!list", desc="List entities in a match, sorted by turn order, plus a Dead: section of corpses when show_corpses_in_entity_list is enabled.")
+@registry.command("list", access="all", usage="!list", desc="List entities in a match, sorted by turn order, plus a Dead: section of corpses when show_corpses_in_entity_list is enabled.")
 async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     es = m.entities_in_turn_order()
@@ -2399,7 +3126,7 @@ def _find_match_entity(m: Match, e: Entity, predicates: List[Tuple[str, str, Opt
 
 
 @registry.command(
-    "find",
+    "find", access="all",
     usage="!find <predicate> [<predicate> ...]",
     desc=(
         "Query entities by AND-ed predicates. Predicate forms: "
@@ -3715,6 +4442,421 @@ registry.annotate_sub(
 )
 
 
+@registry.command(
+    "defpassive",
+    usage="!defpassive <add|remove|list> ...",
+    desc=(
+        "Manage the active match's game-system `default_entity_passives` "
+        "rule — passive specs copied onto EVERY entity at creation (via "
+        "!ent add, summon, or revive). Injection only: removable from an "
+        "individual entity afterward and not re-enforced (until that "
+        "entity is re-spawned). The passive analog of !gclamp for "
+        "default_clamps; edits persist on the GameSystem and apply to "
+        "every match using it."
+    ),
+)
+async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["defpassive"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    sub = args[0].lower()
+
+    # Edits live on the GameSystem (persist across saves, apply to every
+    # match on this system); we refresh live matches so the change takes
+    # effect immediately. Same pattern as !gclamp.
+    sys_name = m.system_name
+    sysobj = mgr.get_system(sys_name)
+
+    def _read_specs() -> List[Dict[str, Any]]:
+        cur = sysobj.settings.get("default_entity_passives")
+        if cur is None:
+            return list(DEFAULT_SYSTEM_SETTINGS.get("default_entity_passives", []))
+        return list(cur.value or [])
+
+    def _write_specs(new_list: List[Dict[str, Any]]) -> int:
+        sysobj.set("default_entity_passives", new_list)
+        return mgr.refresh_match_rules(sys_name)
+
+    if sub == "hooks":
+        return await ctx.send(
+            "**Passive hooks:** " + ", ".join(f"`{h}`" for h in sorted(HOOK_NAMES))
+        )
+
+    if sub == "add":
+        # !defpassive add <id> <when> [target=PATH] [scope=...] "<formula>"
+        # Body parsing mirrors !gpassive add exactly.
+        if await return_help_if_not_enough_args(ctx, args, 4, "defpassive", "add"):
+            return
+        pid = args[1]
+        when = args[2].lower()
+        target_val = ""
+        scope_val = "deep"
+        formula_parts: List[str] = []
+        for tok in args[3:]:
+            if not formula_parts and tok.startswith("target="):
+                target_val = tok[len("target="):]
+            elif not formula_parts and tok.startswith("scope="):
+                scope_val = tok[len("scope="):].lower()
+            else:
+                formula_parts.append(tok)
+        formula = normalize_body_source(" ".join(formula_parts).strip())
+        if not formula:
+            raise VTTError("Passive formula cannot be empty.")
+        try:
+            validate_program(formula, known_funcs=frozenset(m.formula_functions.keys()))
+        except FormulaError as ex:
+            raise VTTError(f"Invalid passive formula: {ex}")
+        # Construct the Passive to validate id / when / scope up front
+        # (Passive.__post_init__ raises VTTError on a bad hook or scope),
+        # then store its serialized form on the rule.
+        spec = Passive(
+            id=pid, when=when, formula=formula,
+            target=target_val, scope=scope_val,
+        )
+        existing = _read_specs()
+        if any(isinstance(s, dict) and s.get("id") == pid for s in existing):
+            raise DuplicateId(
+                f"System '{sys_name}' already has a default passive "
+                f"'{pid}'. Remove it first with !defpassive remove."
+            )
+        existing.append(spec.to_dict())
+        refreshed = _write_specs(existing)
+        from logic import VAR_HOOKS
+        scope_note = ""
+        if when in VAR_HOOKS:
+            scope_note = f" watching `{target_val or '(root)'}` scope=`{scope_val}`"
+        return await ctx.send(
+            f"Added default passive `{pid}` ({when}){scope_note} to system "
+            f"`{sys_name}` [refreshed {refreshed} live "
+            f"match{'es' if refreshed != 1 else ''}]. Applies to entities "
+            f"created from now on."
+        )
+
+    if sub in ("remove", "del", "rm"):
+        if await return_help_if_not_enough_args(ctx, args, 2, "defpassive", "remove"):
+            return
+        pid = args[1]
+        existing = _read_specs()
+        new_list = [
+            s for s in existing
+            if not (isinstance(s, dict) and s.get("id") == pid)
+        ]
+        if len(new_list) == len(existing):
+            raise NotFound(
+                f"No default passive '{pid}' in system '{sys_name}'."
+            )
+        refreshed = _write_specs(new_list)
+        return await ctx.send(
+            f"Removed default passive `{pid}` from system `{sys_name}` "
+            f"[refreshed {refreshed} live "
+            f"match{'es' if refreshed != 1 else ''}]. Already-spawned "
+            f"entities keep their copy."
+        )
+
+    if sub == "list":
+        existing = _read_specs()
+        if not existing:
+            return await ctx.send(
+                f"System `{sys_name}` has no default entity passives."
+            )
+        lines = [f"**System `{sys_name}` default entity passives:**"]
+        for sd in existing:
+            try:
+                p = Passive.from_dict(sd)
+                lines.append(_format_passive_line(p.id, p))
+            except (VTTError, KeyError, TypeError) as ex:
+                lines.append(f"- ⚠️ malformed: {sd!r} ({ex})")
+        return await ctx.send("\n".join(lines))
+
+    raise VTTError(f"Unknown !defpassive subcommand: {sub}")
+
+
+registry.annotate_sub(
+    "defpassive", "add",
+    usage='!defpassive add <id> <when> [target=PATH] [scope=exact|children|deep] "<formula>"',
+    desc=(
+        "Add a default passive to the game system: it is copied onto every "
+        "entity at creation (add / summon / revive), applied before "
+        "on_entity_spawned fires. Same id/when/target/scope/formula syntax "
+        "as !passive add but without the <entity_id> (it's not bound to one "
+        "entity). <when> must be a hook name (see !defpassive hooks). "
+        "Removable per-entity afterward; not re-enforced."
+    ),
+)
+registry.annotate_sub(
+    "defpassive", "remove",
+    usage="!defpassive remove <id>",
+    desc=(
+        "Remove a default passive from the game system (stops injecting it "
+        "into NEW entities; already-spawned entities keep their copy). "
+        "Aliases: del, rm."
+    ),
+)
+registry.annotate_sub(
+    "defpassive", "list",
+    usage="!defpassive list",
+    desc="List the default entity passives for the active match's game system.",
+)
+registry.annotate_sub(
+    "defpassive", "hooks",
+    usage="!defpassive hooks",
+    desc="List the available passive hook names.",
+)
+
+
+# ---- !schedule ---------------------------------------------------------
+# Scheduled / delayed effects: a formula body queued to run at a future
+# round (match-level) or after a future number of one entity's turns
+# (entity-attached). Mostly driven from formulas via schedule() /
+# schedule_on() / cancel_schedule(); this command is the GM-facing twin
+# for creating, inspecting, and cancelling them by hand.
+def _schedule_line(s: Dict[str, Any]) -> str:
+    name = s.get("name", "?")
+    body = s.get("body", "")
+    if s.get("kind") == "round":
+        return f"- `{name}` (match) @ round {s.get('fire_round')}: `{body}`"
+    return (
+        f"- `{name}` on `{s.get('eid')}` @ in {s.get('turns_left')} "
+        f"turn(s): `{body}`"
+    )
+
+
+@registry.command(
+    "schedule",
+    usage="!schedule <list | cancel <name> | round <delay> <body> | turn <eid> <delay> <body>>",
+    desc=(
+        "Manage scheduled / delayed effects on the active match. `round "
+        "<delay> <body>` queues a MATCH-level body to run at round-start "
+        "<delay> rounds from now (no `self` bound). `turn <eid> <delay> "
+        "<body>` queues an ENTITY-attached body to run at <eid>'s "
+        "turn-start after <delay> of its turns (`self`=<eid>, dropped if "
+        "it dies). `list` shows pending; `cancel <name>` removes by name. "
+        "Command twin of the schedule() / schedule_on() / cancel_schedule() "
+        "formula primitives. Use \\n in a body for multiple statements."
+    ),
+)
+async def schedule_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["schedule"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    sub = args[0].lower()
+
+    if sub == "list":
+        if not m.scheduled:
+            return await ctx.send("No scheduled effects pending.")
+        lines = ["**Scheduled effects:**"]
+        lines.extend(_schedule_line(s) for s in m.scheduled)
+        return await ctx.send("\n".join(lines))
+
+    if sub in ("cancel", "del", "rm", "remove"):
+        if await return_help_if_not_enough_args(ctx, args, 2, "schedule", "cancel"):
+            return
+        n = m.cancel_scheduled(args[1])
+        if n == 0:
+            raise NotFound(f"No scheduled effect named '{args[1]}'.")
+        return await ctx.send(
+            f"Cancelled {n} scheduled effect(s) named `{args[1]}`."
+        )
+
+    if sub == "round":
+        if await return_help_if_not_enough_args(ctx, args, 3, "schedule", "round"):
+            return
+        try:
+            delay = int(args[1])
+        except ValueError:
+            return await ctx.send(f"Delay must be an integer, got '{args[1]}'.")
+        body = " ".join(args[2:])
+        try:
+            name = m.add_scheduled(delay, body)
+        except VTTError as e:
+            return await ctx.send(f"❌ {e}")
+        return await ctx.send(
+            f"Scheduled match effect `{name}` for round "
+            f"{m.round_number + delay}."
+        )
+
+    if sub == "turn":
+        if await return_help_if_not_enough_args(ctx, args, 4, "schedule", "turn"):
+            return
+        eid = _resolve_eid(m, args[1])
+        try:
+            delay = int(args[2])
+        except ValueError:
+            return await ctx.send(f"Delay must be an integer, got '{args[2]}'.")
+        body = " ".join(args[3:])
+        try:
+            name = m.add_scheduled_on(eid, delay, body)
+        except VTTError as e:
+            return await ctx.send(f"❌ {e}")
+        return await ctx.send(
+            f"Scheduled effect `{name}` on `{eid}` for {delay} turn(s) "
+            f"from now."
+        )
+
+    raise VTTError(
+        f"Unknown !schedule subcommand '{sub}'. "
+        f"Use list / cancel / round / turn."
+    )
+
+
+registry.annotate_sub(
+    "schedule", "list",
+    usage="!schedule list",
+    desc="List pending scheduled effects (name, target, when, body).",
+)
+registry.annotate_sub(
+    "schedule", "cancel",
+    usage="!schedule cancel <name>",
+    desc="Cancel every pending scheduled effect with this name. Aliases: del, rm.",
+)
+registry.annotate_sub(
+    "schedule", "round",
+    usage="!schedule round <delay> <body>",
+    desc=(
+        "Queue a MATCH-level effect: <body> runs at round-start <delay> "
+        "rounds from now (delay>=1). No `self` bound — use explicit ids or "
+        "`this`. Twin of the schedule() formula primitive."
+    ),
+)
+registry.annotate_sub(
+    "schedule", "turn",
+    usage="!schedule turn <eid> <delay> <body>",
+    desc=(
+        "Queue an ENTITY-attached effect: <body> runs at <eid>'s "
+        "turn-start after <delay> of its turns (delay>=1), with `self`= "
+        "<eid>. Dropped if the entity dies/despawns first. Twin of the "
+        "schedule_on() formula primitive."
+    ),
+)
+
+
+# ---- !log --------------------------------------------------------------
+# The structured event log (combat log). The engine appends curated
+# events at its chokepoints and the log() formula primitive appends
+# custom ones; this command renders them (per-type templates) and manages
+# the format overrides + clearing.
+def _render_event(m: Match, entry: Dict[str, Any]) -> str:
+    """Render one event-log entry to text. Override template (from the
+    event_log_format rule) wins over the built-in default; an unknown
+    type with neither renders as a compact key=value dump."""
+    etype = entry.get("type", "?")
+    overrides = m.rules.get("event_log_format", {})
+    tmpl = overrides.get(etype) if isinstance(overrides, dict) else None
+    if not tmpl:
+        tmpl = EVENT_LOG_DEFAULT_FORMATS.get(etype)
+    if not tmpl:
+        kv = " ".join(f"{k}={v}" for k, v in entry.items() if k != "type")
+        return f"[{etype}] {kv}"
+    return _render_template(tmpl, entry)
+
+
+async def _log_format_sub(ctx, fmt_args, mgr, m):
+    """Handle `!log format ...` — read/edit the event_log_format dict
+    rule on the active match's game system (gclamp-style: persist on the
+    system, refresh live matches)."""
+    sys_name = m.system_name
+    sysobj = mgr.get_system(sys_name)
+
+    def _read() -> Dict[str, str]:
+        cur = sysobj.settings.get("event_log_format")
+        if cur is None:
+            return dict(DEFAULT_SYSTEM_SETTINGS.get("event_log_format", {}) or {})
+        return dict(cur.value or {})
+
+    def _write(d: Dict[str, str]) -> int:
+        sysobj.set("event_log_format", d)
+        return mgr.refresh_match_rules(sys_name)
+
+    overrides = _read()
+    if not fmt_args:
+        lines = ["**Event log templates** (★ = override):"]
+        for t in EVENT_LOG_DEFAULT_FORMATS:
+            ov = overrides.get(t)
+            star = "★ " if ov else "  "
+            lines.append(f"{star}`{t}`: {ov if ov else EVENT_LOG_DEFAULT_FORMATS[t]}")
+        return await ctx.send("\n".join(lines))
+    etype = fmt_args[0]
+    if len(fmt_args) == 1:
+        # Reset this type to its built-in default.
+        if etype in overrides:
+            del overrides[etype]
+            refreshed = _write(overrides)
+            return await ctx.send(
+                f"Reset `{etype}` to its built-in template "
+                f"[refreshed {refreshed} live match"
+                f"{'es' if refreshed != 1 else ''}]."
+            )
+        return await ctx.send(f"`{etype}` has no override (already default).")
+    template = " ".join(fmt_args[1:])
+    overrides[etype] = template
+    refreshed = _write(overrides)
+    return await ctx.send(
+        f"Set the `{etype}` event template [refreshed {refreshed} live "
+        f"match{'es' if refreshed != 1 else ''}]."
+    )
+
+
+@registry.command(
+    "log", access="all",
+    usage="!log [n] | !log clear | !log format [<type> [<template>]]",
+    desc=(
+        "Show the active match's event log (the combat log). `!log` or "
+        "`!log <n>` shows the most recent n entries (default 20), rendered "
+        "via each event type's template. `!log clear` empties it. `!log "
+        "format` lists the per-type templates; `!log format <type> "
+        "<template>` overrides one (placeholder syntax like "
+        "entity_line_format); `!log format <type>` resets it to the "
+        "built-in default. What gets recorded is governed by the "
+        "event_log_enabled / event_log_events / event_log_retention rules."
+    ),
+)
+async def log_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    m = active_match(mgr, ctx)
+    if args and args[0].lower() == "clear":
+        n = len(m.event_log)
+        m.event_log.clear()
+        return await ctx.send(
+            f"Cleared {n} event log entr{'y' if n == 1 else 'ies'}."
+        )
+    if args and args[0].lower() == "format":
+        return await _log_format_sub(ctx, args[1:], mgr, m)
+    n = 20
+    if args:
+        try:
+            n = int(args[0])
+        except ValueError:
+            return await ctx.send(
+                f"Expected a number, 'clear', or 'format'; got '{args[0]}'."
+            )
+    if not m.event_log:
+        return await ctx.send("Event log is empty.")
+    entries = m.event_log[-n:] if n > 0 else list(m.event_log)
+    header = f"**Event log** (showing {len(entries)} of {len(m.event_log)}):"
+    lines = [header]
+    for e in entries:
+        lines.append(f"`R{e.get('round')}` " + _render_event(m, e))
+    return await ctx.send("\n".join(lines))
+
+
+registry.annotate_sub(
+    "log", "clear",
+    usage="!log clear",
+    desc="Empty the active match's event log.",
+)
+registry.annotate_sub(
+    "log", "format",
+    usage="!log format [<type> [<template>]]",
+    desc=(
+        "List the per-type render templates, or override/reset one. "
+        "`!log format` lists; `!log format <type> <template>` sets an "
+        "override (persists on the game system); `!log format <type>` "
+        "resets it to the built-in default."
+    ),
+)
+
+
 # ---- !tile -------------------------------------------------------------
 # Special-tile data store. Each (x, y) tile has its own free-form dict;
 # this command surface manages reads/writes and serialization. Hooks
@@ -4550,6 +5692,314 @@ registry.annotate_sub(
 
 
 @registry.command(
+    "zone",
+    usage=("!zone <new|drop|add|remove|fill|shift|set|del|clear|glyph|info|list|cells> ..."),
+    desc=(
+        "Named multi-cell regions. A zone is a SET of cells plus a "
+        "free-form data dict, optional hooks, and an optional map glyph "
+        "— think 'the gas cloud', 'the throne room', 'the lava field'. "
+        "Unlike a tile (one cell), a zone spans many cells and can be "
+        "reshaped (`add`/`remove`/`fill`) or moved wholesale (`shift`, "
+        "for a drifting cloud). Data is set/read with dotted paths "
+        "(`set`/`del`/`clear`/`info`) exactly like tile data, and is "
+        "readable from formulas via zone_get/zone_has plus membership "
+        "queries (zones_at, in_zone, entities_in_zone, ...). Subcommands: "
+        "new, drop, add, remove, fill, shift, set, del, clear, glyph, "
+        "info, list, cells, hook."
+    ),
+)
+async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["zone"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    sub = args[0].lower()
+
+    # ---- new <name> ----
+    if sub == "new":
+        if await return_help_if_not_enough_args(ctx, args, 2, "zone", "new"):
+            return
+        name = args[1]
+        try:
+            m.create_zone(name)
+        except (VTTError, DuplicateId) as ex:
+            return await ctx.send(f"❌ {ex}")
+        return await ctx.send(f"Created empty zone `{name}`.")
+
+    # ---- drop <name> ----  (delete the whole zone)
+    if sub == "drop":
+        if await return_help_if_not_enough_args(ctx, args, 2, "zone", "drop"):
+            return
+        name = args[1]
+        z = m.zones.get(name)
+        if z is None:
+            return await ctx.send(f"❌ Zone '{name}' not found.")
+        n = len(z.get("cells") or ())
+        m.delete_zone(name)
+        return await ctx.send(f"Dropped zone `{name}` ({n} cell(s)).")
+
+    # ---- add <name> <x> <y> ----  (add one cell; creates the zone)
+    if sub == "add":
+        if await return_help_if_not_enough_args(ctx, args, 4, "zone", "add"):
+            return
+        name = args[1]
+        x, y = _parse_xy(args, offset=2)
+        try:
+            added = m.zone_add_cell(name, x, y)
+        except (VTTError, OutOfBounds) as ex:
+            return await ctx.send(f"❌ {ex}")
+        verb = "Added" if added else "Already in zone:"
+        prep = "to" if added else "for"
+        return await ctx.send(
+            f"{verb} ({x},{y}) {prep} `{name}` ({m.zone_size(name)} cell(s))."
+        )
+
+    # ---- remove <name> <x> <y> ----  (drop one cell)
+    if sub == "remove":
+        if await return_help_if_not_enough_args(ctx, args, 4, "zone", "remove"):
+            return
+        name = args[1]
+        x, y = _parse_xy(args, offset=2)
+        try:
+            removed = m.zone_remove_cell(name, x, y)
+        except NotFound as ex:
+            return await ctx.send(f"❌ {ex}")
+        if not removed:
+            return await ctx.send(f"({x},{y}) was not in zone `{name}`.")
+        return await ctx.send(
+            f"Removed ({x},{y}) from `{name}` ({m.zone_size(name)} cell(s))."
+        )
+
+    # ---- fill <name> <x1> <y1> <x2> <y2> ----  (rect, creates the zone)
+    if sub == "fill":
+        if await return_help_if_not_enough_args(ctx, args, 6, "zone", "fill"):
+            return
+        name = args[1]
+        x1, y1 = _parse_xy(args, offset=2)
+        x2, y2 = _parse_xy(args, offset=4)
+        try:
+            added = m.zone_fill_rect(name, x1, y1, x2, y2)
+        except VTTError as ex:
+            return await ctx.send(f"❌ {ex}")
+        return await ctx.send(
+            f"Filled `{name}` over ({x1},{y1})-({x2},{y2}): +{added} cell(s), "
+            f"{m.zone_size(name)} total."
+        )
+
+    # ---- shift <name> <dx> <dy> ----  (translate the footprint)
+    if sub == "shift":
+        if await return_help_if_not_enough_args(ctx, args, 4, "zone", "shift"):
+            return
+        name = args[1]
+        try:
+            dx = int(args[2]); dy = int(args[3])
+        except (ValueError, IndexError):
+            return await ctx.send("❌ expected integer dx and dy.")
+        z = m.zones.get(name)
+        if z is None:
+            return await ctx.send(f"❌ Zone '{name}' not found.")
+        before = len(z.get("cells") or ())
+        kept = m.zone_shift(name, dx, dy)
+        dropped = before - kept
+        tail = f" ({dropped} pushed off-grid)" if dropped else ""
+        return await ctx.send(
+            f"Shifted `{name}` by ({dx},{dy}): {kept} cell(s){tail}."
+        )
+
+    # ---- set <name> <path> <value> ----  (data set, dotted path)
+    if sub == "set":
+        if await return_help_if_not_enough_args(ctx, args, 4, "zone", "set"):
+            return
+        name = args[1]
+        path = args[2]
+        value = _parse_scalar(args[3])
+        try:
+            m.zone_set_path(name, path, value)
+        except VTTError as ex:
+            return await ctx.send(f"❌ {ex}")
+        return await ctx.send(f"zone `{name}`.{path} = {value!r}")
+
+    # ---- del <name> <path> ----  (data delete, dotted path)
+    if sub == "del":
+        if await return_help_if_not_enough_args(ctx, args, 3, "zone", "del"):
+            return
+        name = args[1]
+        path = args[2]
+        try:
+            m.zone_del_path(name, path)
+        except (NotFound, VTTError) as ex:
+            return await ctx.send(f"❌ {ex}")
+        return await ctx.send(f"Removed `{path}` from zone `{name}`.")
+
+    # ---- clear <name> ----  (wipe all data; keeps cells + hooks)
+    if sub == "clear":
+        if await return_help_if_not_enough_args(ctx, args, 2, "zone", "clear"):
+            return
+        name = args[1]
+        try:
+            n = m.zone_clear_data(name)
+        except NotFound as ex:
+            return await ctx.send(f"❌ {ex}")
+        return await ctx.send(f"Cleared {n} data key(s) from zone `{name}`.")
+
+    # ---- glyph <name> <char|-> ----  (map rendering)
+    if sub == "glyph":
+        if await return_help_if_not_enough_args(ctx, args, 3, "zone", "glyph"):
+            return
+        name = args[1]
+        z = m.zones.get(name)
+        if z is None:
+            return await ctx.send(f"❌ Zone '{name}' not found.")
+        g = args[2]
+        if g in ("-", "none", "clear"):
+            z.pop("glyph", None)
+            return await ctx.send(f"Cleared map glyph for zone `{name}`.")
+        if len(g) != 1:
+            return await ctx.send(
+                "❌ glyph must be exactly one character (or `-` to clear)."
+            )
+        z["glyph"] = g
+        return await ctx.send(f"Zone `{name}` map glyph set to `{g}`.")
+
+    # ---- cells <name> ----  (list the footprint)
+    if sub == "cells":
+        if await return_help_if_not_enough_args(ctx, args, 2, "zone", "cells"):
+            return
+        name = args[1]
+        try:
+            cells = m.zone_cell_list(name)
+        except NotFound as ex:
+            return await ctx.send(f"❌ {ex}")
+        if not cells:
+            return await ctx.send(f"zone `{name}`: no cells.")
+        rendered = ", ".join(f"({x},{y})" for x, y in cells)
+        return await ctx.send(
+            f"**zone `{name}`** ({len(cells)} cell(s)): {rendered}"
+        )
+
+    # ---- info <name> ----
+    if sub == "info":
+        if await return_help_if_not_enough_args(ctx, args, 2, "zone", "info"):
+            return
+        name = args[1]
+        z = m.zones.get(name)
+        if z is None:
+            return await ctx.send(f"zone `{name}`: not found.")
+        cells = m.zone_cell_list(name)
+        view = {
+            "cells": cells,
+            "data": z.get("data") or {},
+            "hooks": sorted((z.get("hooks") or {}).keys()),
+        }
+        if isinstance(z.get("glyph"), str):
+            view["glyph"] = z["glyph"]
+        return await ctx.send(
+            f"**zone `{name}`** ({len(cells)} cell(s))\n"
+            f"```{json.dumps(view, indent=2, sort_keys=True)}\n```"
+        )
+
+    # ---- list ----
+    if sub == "list":
+        if not m.zones:
+            return await ctx.send("No zones in this match.")
+        lines = ["**Zones:**"]
+        for name in sorted(m.zones.keys()):
+            z = m.zones[name]
+            n = len(z.get("cells") or ())
+            hooks = sorted((z.get("hooks") or {}).keys())
+            extras = []
+            if z.get("data"):
+                extras.append(f"data: {', '.join(sorted(z['data'].keys()))}")
+            if hooks:
+                extras.append(f"hooks: {', '.join(hooks)}")
+            if isinstance(z.get("glyph"), str):
+                extras.append(f"glyph '{z['glyph']}'")
+            tail = (" — " + "; ".join(extras)) if extras else ""
+            lines.append(f"- `{name}`: {n} cell(s){tail}")
+        return await ctx.send("\n".join(lines))
+
+    # ---- hook add|del|list ----
+    # Zone hooks are formulas under zones[name]["hooks"][when]. The two
+    # movement families (boundary on_enter/exit/stop, per-cell
+    # on_cell_enter/exit/stop) fire as entities move; the time hooks
+    # (on_round/turn_*) fire at the lifecycle moments. Inside the hook
+    # self = the moving/acting entity, zone_name = the zone, tile_x/tile_y
+    # = the crossed/stepped cell (None for time hooks).
+    if sub == "hook":
+        from logic import ZONE_HOOK_NAMES
+        from formula import validate_formula, FormulaError
+        if len(args) < 2:
+            title, body = registry.help_for(["zone", "hook"])
+            return await ctx.send(f"**{title}**\n{body}")
+        hsub = args[1].lower()
+
+        if hsub == "add":
+            # !zone hook add <name> <when> <formula>
+            if await return_help_if_not_enough_args(ctx, args, 5, "zone", "hook"):
+                return
+            name = args[2]
+            when = args[3]
+            formula_src = normalize_body_source(" ".join(args[4:]).strip())
+            if when not in ZONE_HOOK_NAMES:
+                allowed = ", ".join(sorted(ZONE_HOOK_NAMES))
+                return await ctx.send(
+                    f"❌ Unknown zone hook '{when}'. Allowed: {allowed}."
+                )
+            if not formula_src:
+                return await ctx.send("❌ hook formula cannot be empty.")
+            try:
+                validate_formula(
+                    formula_src, mode="exec",
+                    known_funcs=frozenset(m.formula_functions.keys()),
+                )
+            except FormulaError as ex:
+                return await ctx.send(f"❌ Invalid hook formula: {ex}")
+            z = m.zones.get(name)
+            if z is None:
+                z = m.create_zone(name)
+            z["hooks"][when] = formula_src
+            return await ctx.send(f"Set zone `{name}` `{when}` hook.")
+
+        if hsub == "del":
+            # !zone hook del <name> <when>
+            if await return_help_if_not_enough_args(ctx, args, 4, "zone", "hook"):
+                return
+            name = args[2]
+            when = args[3]
+            z = m.zones.get(name)
+            if z is None:
+                return await ctx.send(f"❌ Zone '{name}' not found.")
+            if when not in (z.get("hooks") or {}):
+                return await ctx.send(f"zone `{name}` has no `{when}` hook.")
+            del z["hooks"][when]
+            return await ctx.send(f"Removed zone `{name}` `{when}` hook.")
+
+        if hsub == "list":
+            # !zone hook list <name>
+            if await return_help_if_not_enough_args(ctx, args, 3, "zone", "hook"):
+                return
+            name = args[2]
+            z = m.zones.get(name)
+            if z is None:
+                return await ctx.send(f"❌ Zone '{name}' not found.")
+            hooks = z.get("hooks") or {}
+            if not hooks:
+                return await ctx.send(f"zone `{name}`: no hooks.")
+            lines = [f"**zone `{name}` hooks:**"]
+            for when in sorted(hooks.keys()):
+                src = hooks[when]
+                snippet = src if len(src) <= 80 else src[:77] + "..."
+                lines.append(f"- `{when}`: {snippet}")
+            return await ctx.send("\n".join(lines))
+
+        title, body = registry.help_for(["zone", "hook"])
+        return await ctx.send(f"**{title}**\n{body}")
+
+    title, body = registry.help_for(["zone"])
+    return await ctx.send(f"**{title}**\n{body}")
+
+
+@registry.command(
     "func",
     usage=("!func <def|del|list|info> ..."),
     desc=(
@@ -4667,6 +6117,135 @@ async def func_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     return await ctx.send(f"**{title}**\n{body}")
 
 
+registry.annotate_sub(
+    "zone", "new",
+    usage="!zone new <name>",
+    desc="Create an empty zone (no cells). Errors if the name is taken.",
+)
+registry.annotate_sub(
+    "zone", "drop",
+    usage="!zone drop <name>",
+    desc="Delete a zone entirely (cells, data, hooks, glyph).",
+)
+registry.annotate_sub(
+    "zone", "add",
+    usage="!zone add <name> <x> <y>",
+    desc=(
+        "Add a single cell to a zone, creating the zone if it doesn't "
+        "exist yet. Off-grid coordinates are rejected. No-op (reported) "
+        "if the cell is already in the zone."
+    ),
+)
+registry.annotate_sub(
+    "zone", "remove",
+    usage="!zone remove <name> <x> <y>",
+    desc=(
+        "Remove a single cell from a zone. The zone keeps existing even "
+        "if this empties it (its data/hooks survive, so a later `shift` "
+        "or `add` can repopulate it)."
+    ),
+)
+registry.annotate_sub(
+    "zone", "fill",
+    usage="!zone fill <name> <x1> <y1> <x2> <y2>",
+    desc=(
+        "Add every in-bounds cell of the rectangle spanned by the two "
+        "corners (in any order) to a zone, creating it if needed. The "
+        "fast way to paint a rectangular region; combine with `remove` "
+        "to carve out holes."
+    ),
+)
+registry.annotate_sub(
+    "zone", "shift",
+    usage="!zone shift <name> <dx> <dy>",
+    desc=(
+        "Translate the entire zone footprint by (dx, dy). Cells pushed "
+        "off the grid are dropped (the zone can drift off an edge). The "
+        "drifting-gas-cloud primitive — pair with a turn/round hook to "
+        "move a hazard each round."
+    ),
+)
+registry.annotate_sub(
+    "zone", "set",
+    usage="!zone set <name> <path> <value>",
+    desc=(
+        "Set a dotted-path key in the zone's free-form data dict "
+        "(creating the zone + intermediate dicts as needed). Same "
+        "semantics as `!tile set`. Read it from formulas with "
+        "zone_get(name, path)."
+    ),
+)
+registry.annotate_sub(
+    "zone", "del",
+    usage="!zone del <name> <path>",
+    desc=(
+        "Delete a dotted-path key from the zone's data, pruning any "
+        "parent dicts left empty. Errors if the path is absent."
+    ),
+)
+registry.annotate_sub(
+    "zone", "clear",
+    usage="!zone clear <name>",
+    desc=(
+        "Wipe ALL data from a zone (keeps its cells, hooks, and glyph). "
+        "Reports how many top-level data keys were removed."
+    ),
+)
+registry.annotate_sub(
+    "zone", "glyph",
+    usage="!zone glyph <name> <char|->",
+    desc=(
+        "Set the zone's single-character map glyph (shown in !map on "
+        "every zone cell that has no tile glyph or entity on top), or "
+        "pass `-` / `none` to clear it. Zone glyphs are the lowest "
+        "render layer."
+    ),
+)
+registry.annotate_sub(
+    "zone", "cells",
+    usage="!zone cells <name>",
+    desc="List every cell in the zone as (x,y) pairs.",
+)
+registry.annotate_sub(
+    "zone", "info",
+    usage="!zone info <name>",
+    desc=(
+        "Show a zone's full state: its cells, data dict, registered hook "
+        "names, and glyph (if any)."
+    ),
+)
+registry.annotate_sub(
+    "zone", "list",
+    usage="!zone list",
+    desc=(
+        "List every zone on the active match with cell counts and a "
+        "summary of its data keys, hooks, and glyph."
+    ),
+)
+registry.annotate_sub(
+    "zone", "hook",
+    usage="!zone hook <add|del|list> <name> [<when>] [<formula>]",
+    desc=(
+        "Manage a zone's hook formulas. `add <name> <when> <formula>` "
+        "stores (or overwrites) a hook, creating the zone if needed; "
+        "`del <name> <when>` removes one; `list <name>` shows them. "
+        "Movement hooks come in two families: BOUNDARY "
+        "(on_enter / on_exit / on_stop) fire ONCE when an entity crosses "
+        "the zone's edge — entering from outside, leaving to outside, or "
+        "stopping inside; moving cell-to-cell within the zone fires none "
+        "of them. PER-CELL (on_cell_enter / on_cell_exit / on_cell_stop) "
+        "fire for EVERY zone cell stepped into / out of / stopped on, "
+        "even while moving within the zone — the 'gas damages you each "
+        "cell you cross' case. TIME hooks (on_round_start / on_round_end "
+        "/ on_turn_start / on_turn_end) fire once per zone at the "
+        "lifecycle moment. Inside the body: self = the moving/acting "
+        "entity (or current-turn entity for time hooks), zone_name = the "
+        "firing zone, tile_x/tile_y = the crossed/stepped cell (None for "
+        "time hooks). Example: "
+        "`!zone hook add gas on_cell_enter \"entity[self].hp = "
+        "entity[self].hp - zone_get(zone_name, 'dmg')\"`."
+    ),
+)
 registry.annotate_sub(
     "func", "def",
     usage="!func def <name> <params> <body>",
@@ -5286,7 +6865,7 @@ async def _run_action_dispatch(
 
 
 # ---- Automated Help command (shows available commands----------------------------------------------------------
-@registry.command("help", usage="!help [command [sub]]", desc="Show command usage. Try `!help ent` or `!help ent move`.")
+@registry.command("help", access="all", usage="!help [command [sub]]", desc="Show command usage. Try `!help ent` or `!help ent move`.")
 async def help_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     title, body = registry.help_for(args)
     await ctx.send(f"**{title}**\n{body}")

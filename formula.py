@@ -74,7 +74,7 @@ Ternary:           value_if_true if cond else value_if_false
 Allowed functions:
   Core:      min, max, abs, round, int, float, str, len
   Math:      sqrt, floor, ceil, pow, clamp(v, lo, hi), sign
-  Random:    random_int, random_string
+  Random:    random_int, random_string, roll("2d6+3")
   Geometry:  distance, angle, direction_to
   Areas:     cells_in_burst, cells_in_line, cells_in_cone  (return lists
              of (x,y) tuples; pair with len() OR iterate with a for-loop)
@@ -446,6 +446,77 @@ def _random_string(*choices: Any) -> str:
     so we surface that as a FormulaError instead. Honors the
     random_seed rule the same way random_int does."""
     return _random_string_impl(random, choices)
+
+
+# Caps on a single roll() so a typo can't hang the bot. A spell that
+# rolls "1000d6" is already absurd; nobody legitimately rolls more.
+_ROLL_MAX_DICE = 1000
+_ROLL_MAX_SIDES = 1_000_000
+_ROLL_TERM_RE = re.compile(r"^([+-]?)(\d*)d(\d+)$|^([+-]?)(\d+)$")
+
+
+def _roll_impl(rng, spec: Any) -> int:
+    """roll("2d6+3"): evaluate standard dice notation and return the
+    integer total. Implementation shared by the seeded and unseeded
+    bindings — the RNG is injected so the match's random_seed rule makes
+    rolls reproducible the same way random_int does.
+
+    Grammar: one or more terms joined by + / -, each term either a die
+    group `NdM` (N optional, defaults to 1) or a flat integer modifier.
+    Examples: "d20", "2d6+3", "1d8-1", "3d6+2d4+1". Whitespace and case
+    are ignored. Each die contributes an independent randint(1, M)."""
+    if not isinstance(spec, str):
+        raise FormulaError(
+            f"roll(spec): spec must be a dice string like '2d6+3', got "
+            f"{type(spec).__name__} ({spec!r})."
+        )
+    s = spec.replace(" ", "").lower()
+    if not s:
+        raise FormulaError("roll(spec): empty dice expression.")
+    # Split into signed terms while keeping each leading +/-; a bare
+    # leading term has an implicit '+'.
+    terms = re.findall(r"[+-]?[^+-]+", s)
+    if not terms or "".join(terms) != s:
+        raise FormulaError(f"roll(spec): malformed dice expression '{spec}'.")
+    total = 0
+    for term in terms:
+        m = _ROLL_TERM_RE.match(term)
+        if m is None:
+            raise FormulaError(
+                f"roll(spec): malformed term '{term}' in '{spec}' — "
+                f"expected NdM or a flat integer."
+            )
+        if m.group(3) is not None:
+            # Die group: sign, optional count, sides.
+            sgn = -1 if m.group(1) == "-" else 1
+            count = int(m.group(2)) if m.group(2) else 1
+            sides = int(m.group(3))
+            if count < 1 or count > _ROLL_MAX_DICE:
+                raise FormulaError(
+                    f"roll(spec): die count {count} out of range "
+                    f"(1..{_ROLL_MAX_DICE}) in '{spec}'."
+                )
+            if sides < 1 or sides > _ROLL_MAX_SIDES:
+                raise FormulaError(
+                    f"roll(spec): die sides {sides} out of range "
+                    f"(1..{_ROLL_MAX_SIDES}) in '{spec}'."
+                )
+            for _ in range(count):
+                total += sgn * rng.randint(1, sides)
+        else:
+            # Flat integer modifier.
+            sgn = -1 if m.group(4) == "-" else 1
+            total += sgn * int(m.group(5))
+    return total
+
+
+def _roll(spec: Any) -> int:
+    """roll("2d6+3"): roll standard dice notation, returning the integer
+    total. By default rolls are independent (unseeded global RNG); when
+    the match sets the random_seed rule the engine shadows this with a
+    match-bound seeded RNG so a session's rolls become reproducible —
+    see the random_seed rule docs (same mechanism as random_int)."""
+    return _roll_impl(random, spec)
 
 
 # Distance modes accepted by the distance() formula function. The full
@@ -963,6 +1034,7 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
     "len": _len,
     "random_int": _random_int,
     "random_string": _random_string,
+    "roll": _roll,
     "distance": _distance,
     "angle": _angle,
     "direction_to": _direction_to,
@@ -1033,6 +1105,10 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # stopping at the first blocked cell. Returns the number of cells
     # actually moved (0..n). Honors allow_diagonal_movement.
     "push_entity",
+    # Forced movement TOWARD a point: drag an entity up to n cells toward
+    # (x, y), stopping at the first blocked cell or on reaching the
+    # target. The point-directed twin of push_entity; returns cells moved.
+    "pull_entity",
     # Atomically exchange two entities' positions. Bypasses the usual
     # occupancy check (the two cells are occupied — by each other).
     # Fires on_exit/on_enter/on_stop/on_entity_moved for both. Returns
@@ -1115,6 +1191,19 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   var_del(eid, "path")          -> bool (True iff existed; routes
     #                                    through remove_var)
     "var_keys", "var_has", "var_get", "var_set", "var_del",
+    # Match-level var accessors: runtime-path twins of the reserved
+    # `match.<path>` formula root (which itself mirrors entity[X].path).
+    # All read/write the single match-wide vars dict — global GM state
+    # like alarm_level / objective_progress / weather — with no entity id
+    # and no var hooks. match_var_get raises on a missing path; the
+    # others mirror their var_* counterparts.
+    #   match_var_keys(path="")     -> list of keys at that match-vars path
+    #   match_var_has(path)         -> bool
+    #   match_var_get(path)         -> value (raises on missing)
+    #   match_var_set(path, value)  -> value
+    #   match_var_del(path)         -> bool (True iff existed)
+    "match_var_keys", "match_var_has", "match_var_get",
+    "match_var_set", "match_var_del",
     # Container-shape introspection / convenience over the SAME var
     # path machinery. None of these encode an "inventory" concept —
     # they're generic operations on dicts living under entity.vars.
@@ -1170,6 +1259,37 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   corpse_at(eid)      -> (x, y); raises if no such corpse
     #   all_corpses()       -> list of corpse ids (loopable)
     "kill", "revive", "has_corpse", "corpse_at", "all_corpses",
+    # Scheduled / delayed effects. schedule() queues a MATCH-level body
+    # to run at on_round_start `delay` rounds out (no self bound);
+    # schedule_on() queues an ENTITY-attached body to run at that
+    # entity's on_turn_start after `delay` of its turns (self=eid,
+    # dropped if it dies first); both return a name. cancel_schedule()
+    # removes pending schedules by name.
+    #   schedule(delay, body, name=None)            -> name (rounds)
+    #   schedule_on(eid, delay, body, name=None)    -> name (turns)
+    #   cancel_schedule(name)                       -> count removed
+    "schedule", "schedule_on", "cancel_schedule",
+    # Append a custom entry to the match's structured event log (the
+    # combat log). log(message) stringifies its arg; recorded when
+    # event_log_enabled (the `custom` type bypasses the event_log_events
+    # filter). Returns True if recorded. View with !log.
+    "log",
+    # Zone primitives. A zone is a named region (a set of cells) with
+    # free-form data and hooks; these mirror the tile_* accessors plus
+    # membership queries and footprint mutation.
+    #   Queries: zone_exists(name), zones_at(x,y), cell_in_zone(x,y,name),
+    #     in_zone(eid,name), entity_zones(eid), entities_in_zone(name),
+    #     zone_cells(name), zone_names(), zone_size(name)
+    #   Data:    zone_get/has/keys/set/del (dotted paths under the zone's
+    #            data dict — same semantics as tile_*)
+    #   Shape:   create_zone(name), delete_zone(name),
+    #            zone_add_cell(name,x,y), zone_remove_cell(name,x,y),
+    #            zone_fill(name,x1,y1,x2,y2), zone_shift(name,dx,dy)
+    "zone_exists", "zones_at", "cell_in_zone", "in_zone", "entity_zones",
+    "entities_in_zone", "zone_cells", "zone_names", "zone_size",
+    "zone_get", "zone_has", "zone_keys", "zone_set", "zone_del",
+    "create_zone", "delete_zone", "zone_add_cell", "zone_remove_cell",
+    "zone_fill", "zone_shift",
     # Read a game-system rule value from inside a formula. rule_get(name)
     # -> the rule's effective value, or None if unknown.
     "rule_get",
@@ -1268,6 +1388,15 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "entity_actions",
     # Corpse introspection — returns a list of corpse ids, loopable.
     "all_corpses",
+    # Zone queries — all return lists. zones_at / entity_zones /
+    # zone_names yield zone-name strings; entities_in_zone yields entity
+    # ids; zone_cells yields [x,y] pairs (loop with `for (cx,cy) in ...`).
+    "zones_at",
+    "entity_zones",
+    "zone_names",
+    "entities_in_zone",
+    "zone_cells",
+    "zone_keys",
 })
 
 
@@ -1342,6 +1471,15 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     # let reactive logic discriminate: "if fail_reason == 'cost'
     # and entity[self].mana < 5: status_add(self, 'exhausted')".
     "fail_reason", "fail_message",
+    # Zone-hook binding. Bound during zone-hook evaluation (boundary
+    # on_enter/on_exit/on_stop, per-cell on_cell_enter/on_cell_exit/
+    # on_cell_stop, and the time hooks) to the firing zone's name; None
+    # elsewhere. tile_x/tile_y carry the crossed/stepped cell for the
+    # movement hooks (the entity's own .x/.y may differ for on_exit /
+    # on_cell_exit, which fire pre-move). Lets a single shared hook
+    # formula reference its zone generically: `zone_get(zone_name,
+    # "gas.dmg")`, `zone_shift(zone_name, 1, 0)`.
+    "zone_name",
 )
 
 # Entity-id sentinel identifiers. Inside `entity[X]` these get
@@ -1525,6 +1663,24 @@ class _EntityAccessTransformer(ast.NodeTransformer):
             return who_arg, parts
         return None
 
+    def _match_root_path(self, node: ast.AST) -> Optional[str]:
+        """If `node` is an Attribute chain rooted at the reserved Name
+        `match` (the match-level var root), return the dotted path below
+        it (e.g. `match.weather.kind` -> "weather.kind"). Returns None
+        for a bare `match` Name or any chain not rooted at `match`.
+        Works in every formula mode — match vars are global state, not an
+        action-only binding — so this is checked before the entity[...]
+        and action-passthrough branches."""
+        parts: List[str] = []
+        cur = node
+        while isinstance(cur, ast.Attribute):
+            parts.append(cur.attr)
+            cur = cur.value
+        if isinstance(cur, ast.Name) and cur.id == "match" and parts:
+            parts.reverse()
+            return ".".join(parts)
+        return None
+
     def _action_binding_root(self, node: ast.AST) -> Optional[str]:
         """If `node` is an Attribute chain whose root is a Name in
         _ACTION_BINDING_NAMES (source/args/target), return that root
@@ -1559,6 +1715,19 @@ class _EntityAccessTransformer(ast.NodeTransformer):
         return isinstance(cur, ast.Name)
 
     def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
+        # match.<path> read — rewrite to __read_match("path"). Checked
+        # before entity[...] and the action-mode attribute passthrough so
+        # the reserved `match` root resolves uniformly in every mode.
+        mpath = self._match_root_path(node)
+        if mpath is not None:
+            return ast.copy_location(
+                ast.Call(
+                    func=ast.Name(id="__read_match", ctx=ast.Load()),
+                    args=[ast.Constant(value=mpath)],
+                    keywords=[],
+                ),
+                node,
+            )
         flat = self._flatten(node)
         if flat is None:
             # In action mode, any Attribute chain rooted at a bare
@@ -1587,6 +1756,22 @@ class _EntityAccessTransformer(ast.NodeTransformer):
         if len(node.targets) != 1:
             raise FormulaError("Chained / tuple assignment is not supported.")
         target = node.targets[0]
+        # match.<path> = value — rewrite to __write_match("path", value).
+        # Checked first so the reserved root works in every mode and isn't
+        # captured by the action-mode bare-Name local rule below.
+        mpath = self._match_root_path(target)
+        if mpath is not None:
+            call = ast.Call(
+                func=ast.Name(id="__write_match", ctx=ast.Load()),
+                args=[ast.Constant(value=mpath), node.value],
+                keywords=[],
+            )
+            return ast.copy_location(ast.Expr(value=call), node)
+        if isinstance(target, ast.Name) and target.id == "match":
+            raise FormulaError(
+                "'match' is a reserved formula root; assign to "
+                "match.<path> (e.g. match.alarm = 3), not bare 'match'."
+            )
         # In action_mode three extra Assign target shapes are allowed:
         #   1. bare Name = expr        -> local binding (Python's eval
         #      namespace handles it; pre-pass added the name to
@@ -1770,7 +1955,8 @@ def _validate_tree(
         if not isinstance(n, _ALLOWED_NODES):
             raise FormulaError(f"Disallowed syntax: {type(n).__name__}")
         if isinstance(n, ast.Name):
-            if (n.id not in ("__read", "__write", "__loop_tick")
+            if (n.id not in ("__read", "__write", "__read_match",
+                             "__write_match", "__loop_tick")
                     and n.id not in _ALLOWED_FUNCS
                     and n.id not in _MATCH_FUNC_NAMES
                     and n.id not in HOOK_CONTEXT_NAMES
@@ -1800,7 +1986,8 @@ def _validate_tree(
             if not isinstance(n.func, ast.Name):
                 raise FormulaError("Only direct function calls are allowed.")
             fname = n.func.id
-            if (fname not in ("__read", "__write", "__loop_tick")
+            if (fname not in ("__read", "__write", "__read_match",
+                              "__write_match", "__loop_tick")
                     and fname not in _ALLOWED_FUNCS
                     and fname not in _MATCH_FUNC_NAMES
                     and fname not in known_funcs
@@ -1989,6 +2176,25 @@ class FormulaEngine:
         self._note_affected(eid)
         return value
 
+    def _read_match(self, path: str) -> Any:
+        """Read match-level var at dotted `path` (the `match.<path>`
+        formula root). Raises FormulaError on a missing path — same
+        contract as entity var reads, so `match.x = match.x + 1` requires
+        x to already exist (initialize it first via `!match var set` or
+        check with match_var_has)."""
+        if self._match is None:
+            raise FormulaError("match vars are unavailable in this context.")
+        return _get_path(self._match.vars, path)
+
+    def _write_match(self, path: str, value: Any) -> Any:
+        """Write match-level var at dotted `path`. Plain storage — match
+        vars don't fire var hooks (no per-entity owner). Returns the
+        written value so it composes inside larger expressions."""
+        if self._match is None:
+            raise FormulaError("match vars are unavailable in this context.")
+        _set_path(self._match.vars, path, value)
+        return value
+
     def _namespace(self, ctx: EvalCtx) -> Dict[str, Any]:
         """Build the safe namespace for evaluating a formula.
 
@@ -2026,6 +2232,8 @@ class FormulaEngine:
         ns: Dict[str, Any] = {
             "__read":  lambda who, path:        self._read(who, path, ctx),
             "__write": lambda who, path, value: self._write(who, path, value, ctx),
+            "__read_match":  lambda path:        self._read_match(path),
+            "__write_match": lambda path, value: self._write_match(path, value),
             "__loop_tick": _loop_tick,
             **_ALLOWED_FUNCS,
         }
@@ -2070,6 +2278,9 @@ class FormulaEngine:
             )
             ns["random_string"] = (
                 lambda *choices, _r=rng: _random_string_impl(_r, choices)
+            )
+            ns["roll"] = (
+                lambda spec, _r=rng: _roll_impl(_r, spec)
             )
 
         # Match-bound group functions. Each takes string args; entity-id
@@ -2424,6 +2635,28 @@ class FormulaEngine:
                 self._note_affected(eid)
             return steps
 
+        def _pull_entity(eid_t: Any, x: Any, y: Any, n: Any = 1) -> int:
+            """pull_entity(eid, x, y, n=1): drag `eid` up to `n` cells
+            TOWARD the point (x, y), stopping at the first blocked cell
+            (off-grid or occupied) or once it reaches the target cell.
+            Returns the NUMBER of cells actually moved (0..n). The point-
+            directed twin of push_entity — the heading recomputes each
+            step so the path curves toward (x, y); honors
+            allow_diagonal_movement the same way. Per-step tile hooks and
+            the final on_stop / on_entity_moved fire as for a stepwise
+            move. Raises FormulaError on a non-int coord/n or unknown
+            entity."""
+            eid = _eid(eid_t)
+            # Geometry, hook firing and validation live in
+            # Match.pull_entity (shared with the !ent pull command).
+            try:
+                steps, _log = match.pull_entity(eid, x, y, n)
+            except VTTError as ex:
+                raise FormulaError(str(ex))
+            if steps:
+                self._note_affected(eid)
+            return steps
+
         def _swap_entities(a_t: Any, b_t: Any) -> bool:
             """swap_entities(a, b): atomically exchange the positions of
             two entities. Both must exist; swapping an entity with
@@ -2449,6 +2682,7 @@ class FormulaEngine:
         ns["move_entity"] = _move_entity
         ns["move_step"]   = _move_step
         ns["push_entity"] = _push_entity
+        ns["pull_entity"] = _pull_entity
         ns["swap_entities"] = _swap_entities
         ns["fire_tile_hook"] = _fire_tile_hook
 
@@ -2897,6 +3131,74 @@ class FormulaEngine:
         ns["var_get"]  = _var_get
         ns["var_set"]  = _var_set
         ns["var_del"]  = _var_del
+
+        # Match-level var accessors: the runtime-path twins of the
+        # `match.<path>` static root (mirroring how var_* twins the
+        # entity[X].path root). All operate on the single match-wide
+        # vars dict; no entity id, no var hooks.
+        def _match_var_keys(path: Any = "") -> list:
+            """match_var_keys(path=""): keys at a dotted match-vars path.
+            Empty path = top-level names. Non-dict at the path errors."""
+            if not isinstance(path, str):
+                raise FormulaError("match_var_keys(path): path must be a string.")
+            if match is None:
+                raise FormulaError("match vars are unavailable in this context.")
+            if not path:
+                return list(match.vars.keys())
+            v = _get_path(match.vars, path)
+            if not isinstance(v, dict):
+                raise FormulaError(
+                    f"match_var_keys('{path}'): not a dict ({type(v).__name__})."
+                )
+            return list(v.keys())
+
+        def _match_var_has(path: Any) -> bool:
+            """match_var_has(path): True iff the dotted match-vars path
+            resolves. Missing / nested-into-scalar return False (no raise)."""
+            if not isinstance(path, str) or not path:
+                raise FormulaError("match_var_has(path): path must be a non-empty string.")
+            if match is None:
+                return False
+            cur: Any = match.vars
+            for k in path.split("."):
+                if not isinstance(cur, dict) or k not in cur:
+                    return False
+                cur = cur[k]
+            return True
+
+        def _match_var_get(path: Any) -> Any:
+            """match_var_get(path): runtime-path equivalent of match.path.
+            Raises on a missing path (same as the static root)."""
+            if not isinstance(path, str) or not path:
+                raise FormulaError("match_var_get(path): path must be a non-empty string.")
+            return self._read_match(path)
+
+        def _match_var_set(path: Any, value: Any) -> Any:
+            """match_var_set(path, value): runtime-path equivalent of
+            match.path = value. Returns the written value."""
+            if not isinstance(path, str) or not path:
+                raise FormulaError("match_var_set(path, value): path must be a non-empty string.")
+            return self._write_match(path, value)
+
+        def _match_var_del(path: Any) -> bool:
+            """match_var_del(path): remove a match var at a dotted path.
+            Returns True iff it existed (and was removed); False if absent."""
+            if not isinstance(path, str) or not path:
+                raise FormulaError("match_var_del(path): path must be a non-empty string.")
+            if match is None or not _match_var_has(path):
+                return False
+            keys = path.split(".")
+            cur: Any = match.vars
+            for k in keys[:-1]:
+                cur = cur[k]
+            del cur[keys[-1]]
+            return True
+
+        ns["match_var_keys"] = _match_var_keys
+        ns["match_var_has"]  = _match_var_has
+        ns["match_var_get"]  = _match_var_get
+        ns["match_var_set"]  = _match_var_set
+        ns["match_var_del"]  = _match_var_del
 
         def _var_has_key(eid_t: Any, path: Any, key: Any) -> bool:
             """var_has_key(eid, path, key): True iff the value at `path`
@@ -3396,6 +3698,261 @@ class FormulaEngine:
         ns["has_corpse"]   = _has_corpse
         ns["corpse_at"]    = _corpse_at
         ns["all_corpses"]  = _all_corpses
+
+        def _schedule(delay: Any, body: Any, name: Any = None) -> str:
+            """schedule(delay, body, name=None): queue a MATCH-level
+            effect to run at on_round_start `delay` rounds from now
+            (delay>=1; delay=1 fires next round). The body string runs
+            with NO `self` bound — use explicit ids or `this`. Returns
+            the schedule name (generated if name is falsy); cancel via
+            cancel_schedule(name)."""
+            nm = name if isinstance(name, str) and name else None
+            try:
+                return match.add_scheduled(delay, body, nm)
+            except VTTError as ex:
+                raise FormulaError(str(ex))
+
+        def _schedule_on(eid_t: Any, delay: Any, body: Any,
+                         name: Any = None) -> str:
+            """schedule_on(eid, delay, body, name=None): queue an
+            entity-attached effect to run at eid's on_turn_start after
+            `delay` of its turns (delay>=1; delay=1 fires its next turn).
+            The body runs with `self`=eid. Auto-dropped if the entity
+            dies/despawns before firing. Returns the schedule name."""
+            eid = _eid(eid_t)
+            nm = name if isinstance(name, str) and name else None
+            try:
+                return match.add_scheduled_on(eid, delay, body, nm)
+            except VTTError as ex:
+                raise FormulaError(str(ex))
+
+        def _cancel_schedule(name: Any) -> int:
+            """cancel_schedule(name): remove every pending schedule with
+            this name. Returns the number removed (0 if none matched)."""
+            if not isinstance(name, str):
+                raise FormulaError("cancel_schedule(name): name must be a string.")
+            return match.cancel_scheduled(name)
+
+        ns["schedule"]        = _schedule
+        ns["schedule_on"]     = _schedule_on
+        ns["cancel_schedule"] = _cancel_schedule
+
+        def _log(message: Any) -> bool:
+            """log(message): append a custom entry to the match's event
+            log (the combat log). The message is stringified. Always
+            recorded when event_log_enabled (the `custom` type is not
+            gated by the event_log_events list). Returns True if it was
+            recorded, False if logging is disabled. View with !log; the
+            rendered text uses the event_log_format `custom` template
+            (default '{message}')."""
+            return match.log_event("custom", message=_stringify(message))
+
+        ns["log"] = _log
+
+        # ---- zone primitives ----
+        # A zone is a named region (a set of cells) with free-form data
+        # and hooks. These mirror the tile_* accessors plus membership
+        # queries and footprint mutation. Coords are validated by the
+        # Match methods; errors surface as FormulaError.
+        def _zone_name(v: Any, fname: str) -> str:
+            if not isinstance(v, str) or not v:
+                raise FormulaError(f"{fname}: zone name must be a non-empty string.")
+            return v
+
+        def _zone_xy(x: Any, y: Any, fname: str) -> Tuple[int, int]:
+            if (not isinstance(x, int) or isinstance(x, bool)
+                    or not isinstance(y, int) or isinstance(y, bool)):
+                raise FormulaError(f"{fname}: x and y must be integers.")
+            return x, y
+
+        def _zone_exists(name: Any) -> bool:
+            """zone_exists(name): True iff a zone with this name exists."""
+            return match.has_zone(_zone_name(name, "zone_exists"))
+
+        def _zones_at(x: Any, y: Any) -> list:
+            """zones_at(x, y): list of zone names covering cell (x,y)
+            (sorted; loopable)."""
+            xi, yi = _zone_xy(x, y, "zones_at")
+            return sorted(match.zones_at(xi, yi))
+
+        def _cell_in_zone(x: Any, y: Any, name: Any) -> bool:
+            """cell_in_zone(x, y, name): True iff (x,y) is in the zone."""
+            xi, yi = _zone_xy(x, y, "cell_in_zone")
+            return match.cell_in_zone(xi, yi, _zone_name(name, "cell_in_zone"))
+
+        def _in_zone(eid_t: Any, name: Any) -> bool:
+            """in_zone(eid, name): True iff the entity's current cell is
+            in the zone."""
+            eid = _eid(eid_t)
+            return name in match.entity_zones(eid) if isinstance(name, str) else False
+
+        def _entity_zones(eid_t: Any) -> list:
+            """entity_zones(eid): zone names the entity currently stands
+            in (sorted; loopable)."""
+            return sorted(match.entity_zones(_eid(eid_t)))
+
+        def _entities_in_zone(name: Any) -> list:
+            """entities_in_zone(name): alive entity ids standing in the
+            zone (insertion order; loopable)."""
+            return match.entities_in_zone(_zone_name(name, "entities_in_zone"))
+
+        def _zone_cells(name: Any) -> list:
+            """zone_cells(name): the zone's cells as [x,y] pairs (sorted;
+            loop with `for (cx,cy) in zone_cells(name)`)."""
+            return match.zone_cell_list(_zone_name(name, "zone_cells"))
+
+        def _zone_names() -> list:
+            """zone_names(): every zone name (sorted; loopable)."""
+            return sorted(match.zones.keys())
+
+        def _zone_size(name: Any) -> int:
+            """zone_size(name): number of cells in the zone (0 if it
+            doesn't exist)."""
+            z = match.zones.get(_zone_name(name, "zone_size"))
+            return len(z["cells"]) if z is not None else 0
+
+        def _zone_get(name: Any, path: Any) -> Any:
+            """zone_get(name, path): read the zone's data at a dotted
+            path. Raises on a missing zone or path."""
+            if not isinstance(path, str) or not path:
+                raise FormulaError("zone_get(name, path): path must be a non-empty string.")
+            try:
+                return match.zone_get_path(_zone_name(name, "zone_get"), path)
+            except VTTError as ex:
+                raise FormulaError(str(ex))
+
+        def _zone_has(name: Any, path: Any) -> bool:
+            """zone_has(name, path): True iff the dotted data path
+            resolves on the zone (False on a missing zone)."""
+            if not isinstance(path, str) or not path:
+                raise FormulaError("zone_has(name, path): path must be a non-empty string.")
+            return match.zone_has_path(_zone_name(name, "zone_has"), path)
+
+        def _zone_keys(name: Any, path: Any = "") -> list:
+            """zone_keys(name, path=""): keys at a dotted data path (""
+            = top-level). Non-dict at the path errors."""
+            zn = _zone_name(name, "zone_keys")
+            if not isinstance(path, str):
+                raise FormulaError("zone_keys(name, path): path must be a string.")
+            z = match.zones.get(zn)
+            if z is None:
+                raise FormulaError(f"zone_keys: zone '{zn}' not found.")
+            cur: Any = z["data"]
+            if path:
+                try:
+                    cur = match.zone_get_path(zn, path)
+                except VTTError as ex:
+                    raise FormulaError(str(ex))
+            if not isinstance(cur, dict):
+                raise FormulaError(
+                    f"zone_keys('{zn}', '{path}'): not a dict "
+                    f"({type(cur).__name__})."
+                )
+            return list(cur.keys())
+
+        def _zone_set(name: Any, path: Any, value: Any) -> Any:
+            """zone_set(name, path, value): write the zone's data at a
+            dotted path (creates the zone + intermediates). Returns the
+            written value."""
+            if not isinstance(path, str) or not path:
+                raise FormulaError("zone_set(name, path, value): path must be a non-empty string.")
+            try:
+                match.zone_set_path(_zone_name(name, "zone_set"), path, value)
+            except VTTError as ex:
+                raise FormulaError(str(ex))
+            return value
+
+        def _zone_del(name: Any, path: Any) -> bool:
+            """zone_del(name, path): remove a dotted data key. Returns
+            True iff it existed, False if absent (no error)."""
+            if not isinstance(path, str) or not path:
+                raise FormulaError("zone_del(name, path): path must be a non-empty string.")
+            zn = _zone_name(name, "zone_del")
+            if not match.zone_has_path(zn, path):
+                return False
+            try:
+                match.zone_del_path(zn, path)
+            except VTTError as ex:
+                raise FormulaError(str(ex))
+            return True
+
+        def _create_zone(name: Any) -> bool:
+            """create_zone(name): make an empty zone. Returns True if
+            created, False if it already existed."""
+            zn = _zone_name(name, "create_zone")
+            if match.has_zone(zn):
+                return False
+            match.create_zone(zn)
+            return True
+
+        def _delete_zone(name: Any) -> bool:
+            """delete_zone(name): remove a zone entirely. Returns True iff
+            it existed."""
+            zn = _zone_name(name, "delete_zone")
+            if not match.has_zone(zn):
+                return False
+            match.delete_zone(zn)
+            return True
+
+        def _zone_add_cell(name: Any, x: Any, y: Any) -> bool:
+            """zone_add_cell(name, x, y): add a cell (creating the zone if
+            needed). Returns True iff newly added. Off-grid raises."""
+            xi, yi = _zone_xy(x, y, "zone_add_cell")
+            try:
+                return match.zone_add_cell(_zone_name(name, "zone_add_cell"), xi, yi)
+            except VTTError as ex:
+                raise FormulaError(str(ex))
+
+        def _zone_remove_cell(name: Any, x: Any, y: Any) -> bool:
+            """zone_remove_cell(name, x, y): drop a cell. Returns True iff
+            it was present."""
+            xi, yi = _zone_xy(x, y, "zone_remove_cell")
+            try:
+                return match.zone_remove_cell(_zone_name(name, "zone_remove_cell"), xi, yi)
+            except VTTError as ex:
+                raise FormulaError(str(ex))
+
+        def _zone_fill(name: Any, x1: Any, y1: Any, x2: Any, y2: Any) -> int:
+            """zone_fill(name, x1, y1, x2, y2): add every in-bounds cell of
+            the rectangle (creating the zone if needed). Returns the count
+            newly added."""
+            ax, ay = _zone_xy(x1, y1, "zone_fill")
+            bx, by = _zone_xy(x2, y2, "zone_fill")
+            try:
+                return match.zone_fill_rect(_zone_name(name, "zone_fill"), ax, ay, bx, by)
+            except VTTError as ex:
+                raise FormulaError(str(ex))
+
+        def _zone_shift(name: Any, dx: Any, dy: Any) -> int:
+            """zone_shift(name, dx, dy): translate the whole zone by
+            (dx,dy); cells pushed off-grid are dropped. Returns the cell
+            count retained. The 'gas cloud drifts' primitive."""
+            ddx, ddy = _zone_xy(dx, dy, "zone_shift")
+            try:
+                return match.zone_shift(_zone_name(name, "zone_shift"), ddx, ddy)
+            except VTTError as ex:
+                raise FormulaError(str(ex))
+
+        ns["zone_exists"]       = _zone_exists
+        ns["zones_at"]          = _zones_at
+        ns["cell_in_zone"]      = _cell_in_zone
+        ns["in_zone"]           = _in_zone
+        ns["entity_zones"]      = _entity_zones
+        ns["entities_in_zone"]  = _entities_in_zone
+        ns["zone_cells"]        = _zone_cells
+        ns["zone_names"]        = _zone_names
+        ns["zone_size"]         = _zone_size
+        ns["zone_get"]          = _zone_get
+        ns["zone_has"]          = _zone_has
+        ns["zone_keys"]         = _zone_keys
+        ns["zone_set"]          = _zone_set
+        ns["zone_del"]          = _zone_del
+        ns["create_zone"]       = _create_zone
+        ns["delete_zone"]       = _delete_zone
+        ns["zone_add_cell"]     = _zone_add_cell
+        ns["zone_remove_cell"]  = _zone_remove_cell
+        ns["zone_fill"]         = _zone_fill
+        ns["zone_shift"]        = _zone_shift
 
         def _rule_get(name: Any) -> Any:
             """rule_get(name): the effective value of a system rule on
