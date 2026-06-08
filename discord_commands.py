@@ -32,6 +32,47 @@ async def _dbg_chat(ctx, text: str):
 # Max commands to run from a single paste to avoid accidental spam
 BATCH_MAX_LINES = 200
 
+# Discord rejects a message whose `content` exceeds a hard server-side
+# length cap (API error 50035). 2000 is the universally-safe bot limit
+# (works regardless of Nitro/boost/channel context). Long command output
+# (e.g. !help, !system rules, big maps) is split into multiple messages
+# at this boundary — see _split_for_discord.
+DISCORD_MAX_CONTENT = 2000
+
+def _split_for_discord(message: str, limit: int = DISCORD_MAX_CONTENT) -> List[str]:
+    """Split `message` into a list of chunks, each at most `limit`
+    characters, breaking ONLY at newline boundaries so a single logical
+    line is never cut across two messages. Consecutive lines are packed
+    into one chunk until the next line wouldn't fit.
+
+    A single line longer than `limit` (no newline to break on) is the one
+    case we can't honor cleanly — it's hard-split into limit-sized pieces
+    as a last resort. Returns at least one chunk (the message unchanged
+    when it already fits, including the empty string)."""
+    if len(message) <= limit:
+        return [message]
+    chunks: List[str] = []
+    cur = ""
+    for line in message.split("\n"):
+        # Flush the current chunk if appending this line (plus the
+        # rejoining newline, when cur is non-empty) would overflow.
+        if cur and len(cur) + 1 + len(line) > limit:
+            chunks.append(cur)
+            cur = ""
+        if len(line) > limit:
+            # Oversized single line: flush whatever's buffered, then
+            # hard-split the line itself.
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            for i in range(0, len(line), limit):
+                chunks.append(line[i:i + limit])
+            continue
+        cur = line if not cur else cur + "\n" + line
+    if cur:
+        chunks.append(cur)
+    return chunks
+
 def _is_comment_or_blank(line: str) -> bool:
     s = (line or "").strip()
     return not s or s.startswith("#")
@@ -97,7 +138,10 @@ class DiscordCtxWrapper:
         # mid-session the way the CLI's stand-in can.
         self.cli_mutable = False
     async def send(self, message: str):
-        await self._ctx.send(message)
+        # Split over-long output at line boundaries so we never trip
+        # Discord's content-length cap (see _split_for_discord).
+        for chunk in _split_for_discord(message):
+            await self._ctx.send(chunk)
 
     async def send_approval(self, req: dict):
         """Post an approval request with clickable Approve/Deny buttons.
@@ -139,7 +183,8 @@ class _InteractionCtx:
         self._channel = interaction.channel
 
     async def send(self, message: str):
-        await self._channel.send(message)
+        for chunk in _split_for_discord(message):
+            await self._channel.send(chunk)
 
 
 class _ApprovalView(discord.ui.View):
