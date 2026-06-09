@@ -816,6 +816,38 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Only the first character is used."
         ),
     },
+    # Fog MEMORY (explored terrain). When on, cells a team has ever seen
+    # stay revealed even after they leave current vision (the team
+    # "remembers" the lay of the land), instead of the map snapping back
+    # to only what's currently in range. The explored set accumulates as
+    # units move and reveal new cells, and is per-team + persisted.
+    "fog_memory_enabled_by_default": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether NEW matches start with fog MEMORY on. Only SEEDS a "
+            "match's per-match memory toggle at creation; flip it live per "
+            "match with `!match fog memory on|off` (match state, survives "
+            "a rule refresh). Default False — explored fog resets to "
+            "current vision each time (no memory). Memory has no effect "
+            "unless fog itself is on (fog_enabled_by_default / !match "
+            "fog)."
+        ),
+    },
+    "fog_memory_mode": {
+        "default": "full",
+        "schema": {"type": "enum", "choices": ["full", "terrain"]},
+        "desc": (
+            "What a REMEMBERED cell (explored but not currently in vision) "
+            "shows, when fog memory is on. 'full' (default): everything "
+            "currently there, including live entities — memory = 'once "
+            "seen, stays visible'. 'terrain': only static features "
+            "(tiles, zones, corpses) are remembered; LIVE entities still "
+            "require current vision, so you can't track moving units "
+            "through explored-but-unwatched areas (classic fog of war). "
+            "Currently-visible cells always show everything regardless."
+        ),
+    },
     # ---- Action system --------------------------------------------------
     # Actions are GM-defined effect bundles stored under entity.vars at any
     # path ending in `.actions.<name>`. Each action is a dict with `body`
@@ -2709,6 +2741,8 @@ class Entity:
         if self.id not in match._death_check_suppressed_ids:
             match.log_event("spawn", entity=self.id, name=self.name,
                             x=self.x, y=self.y)
+        # Fog memory: a freshly-spawned unit reveals cells for its team.
+        match._record_vision(getattr(self, "team", None))
         return (self.id, log)
 
     def remove(self):
@@ -3530,6 +3564,19 @@ class Match:
     # radii) and paints the fog_glyph over unseen cells. Persisted.
     fog_enabled: bool = False
 
+    # Per-match fog MEMORY toggle (only meaningful when fog_enabled).
+    # Seeded at creation from fog_memory_enabled_by_default, then match
+    # state (toggled via `!match fog memory on|off`, survives refresh).
+    # When True, `explored` accumulates every cell each team has seen and
+    # those cells stay revealed (per fog_memory_mode) even out of current
+    # vision. When False, only current vision shows. Persisted.
+    fog_memory: bool = False
+    # Per-team set of explored cells: team-name -> set of (x, y) ever seen
+    # by that team. Grows as units move/spawn (Match._record_vision) while
+    # fog_memory is on; cleared when memory is toggled off. Serialized as
+    # lists of [x, y]. Runtime type is set for fast membership tests.
+    explored: Dict[str, "set"] = field(default_factory=dict)
+
     # ---- runtime-only: pending approval queue ----
     # Requests from non-host users awaiting host approval, keyed by a
     # short per-match id ("r1", "r2", ...). Each value is a dict
@@ -4139,12 +4186,48 @@ class Match:
             return False
         return self._within_vision(e.x, e.y, x, y, self._vision_radius_of(e))
 
-    def _fog_sees(self, pov_team: Optional[str], x: int, y: int) -> bool:
-        """Fog gate for a single cell: True (visible) when fog is off, the
-        viewer is omniscient, or the team currently sees the cell."""
+    def _cell_remembered(self, pov_team: Optional[str], x: int, y: int) -> bool:
+        """True iff fog memory is on and `pov_team` has explored (x, y)."""
+        if not self.fog_memory or not pov_team:
+            return False
+        return (x, y) in self.explored.get(pov_team, ())
+
+    def _fog_terrain_visible(self, pov_team: Optional[str], x: int, y: int) -> bool:
+        """Fog gate for STATIC features (tiles, zones, corpses) and the
+        map's fog overlay: visible when fog is off, the viewer is
+        omniscient, the team currently sees the cell, OR (memory on) the
+        team has explored it. Remembered terrain stays revealed in both
+        memory modes."""
         if not self.fog_enabled or pov_team is None:
             return True
-        return self.team_sees_cell(pov_team, x, y)
+        return (self.team_sees_cell(pov_team, x, y)
+                or self._cell_remembered(pov_team, x, y))
+
+    def _fog_entity_visible(self, pov_team: Optional[str], x: int, y: int) -> bool:
+        """Fog gate for LIVE entities: visible on current vision always;
+        on a remembered (explored, not currently-seen) cell only when
+        fog_memory_mode is 'full'. Under 'terrain' mode a moving unit in
+        an explored-but-unwatched area stays hidden."""
+        if not self.fog_enabled or pov_team is None:
+            return True
+        if self.team_sees_cell(pov_team, x, y):
+            return True
+        if self._cell_remembered(pov_team, x, y):
+            return str(self.rules.get("fog_memory_mode", "full")) == "full"
+        return False
+
+    def _record_vision(self, team: Optional[str]) -> None:
+        """Fold `team`'s CURRENT vision into its explored set. No-op unless
+        fog AND fog memory are on and `team` is a real team. Called wherever
+        a team's sight may have just expanded (entity move / spawn, memory
+        toggle-on) so explored grows 'as cells are revealed'."""
+        if not self.fog_enabled or not self.fog_memory or not team:
+            return
+        seen = self.explored.setdefault(team, set())
+        for y in range(1, self.grid_height + 1):
+            for x in range(1, self.grid_width + 1):
+                if (x, y) not in seen and self.team_sees_cell(team, x, y):
+                    seen.add((x, y))
 
     def _visibility_visible(self, rule_key: str, pov_team: Optional[str], *,
                             target: Optional[str] = None,
@@ -4182,7 +4265,7 @@ class Match:
         if eid not in self.entities:
             return False
         e = self.entities[eid]
-        if not self._fog_sees(pov_team, e.x, e.y):
+        if not self._fog_entity_visible(pov_team, e.x, e.y):
             return False
         return self._visibility_visible(
             "entity_visibility_condition", pov_team, target=eid)
@@ -4192,7 +4275,7 @@ class Match:
         list/info/cells rows — is visible to `pov_team`. Binds tile_x /
         tile_y (inspect data via tile_get/tile_has). See
         tile_visibility_condition."""
-        if pov_team is not None and not self._fog_sees(pov_team, x, y):
+        if pov_team is not None and not self._fog_terrain_visible(pov_team, x, y):
             return False
         return self._visibility_visible(
             "tile_visibility_condition", pov_team,
@@ -4208,7 +4291,7 @@ class Match:
             z = self.zones.get(name)
             cells = z.get("cells", ()) if isinstance(z, dict) else ()
             if cells and not any(
-                self.team_sees_cell(pov_team, cx, cy) for (cx, cy) in cells
+                self._fog_terrain_visible(pov_team, cx, cy) for (cx, cy) in cells
             ):
                 return False
         return self._visibility_visible(
@@ -4224,7 +4307,7 @@ class Match:
         corpse_visibility_condition."""
         if pov_team is None:
             return True
-        if not self._fog_sees(pov_team, x, y):
+        if not self._fog_terrain_visible(pov_team, x, y):
             return False
         team_var = str(self.rules.get("team_var", "team"))
         corpse_team = ""
@@ -5506,6 +5589,10 @@ class Match:
                 log.append(_run_passive_safely(
                     engine, p, ctx, target_id=entity_id, is_global=False,
                 ))
+        # Fog memory: a move can reveal new cells for the mover's team —
+        # fold current vision into its explored set (no-op unless memory
+        # on). Other entities a passive moved record via their own fires.
+        self._record_vision(getattr(e, "team", None))
         return log
 
     def fire_entity_step(
@@ -5542,6 +5629,10 @@ class Match:
                 log.append(_run_passive_safely(
                     engine, p, ctx, target_id=entity_id, is_global=False,
                 ))
+        # Fog memory: capture cells revealed mid-path, per step (the
+        # once-per-move record in fire_entity_moved would miss a stepwise
+        # move's intermediate vision).
+        self._record_vision(getattr(e, "team", None))
         return log
 
     def fire_action_used(
@@ -6749,6 +6840,12 @@ class Match:
             "access_overrides": dict(self.access_overrides),
             "bound_channels": copy.deepcopy(self.bound_channels),
             "fog_enabled": bool(self.fog_enabled),
+            "fog_memory": bool(self.fog_memory),
+            # sets/tuples aren't JSON-able; store as {team: [[x, y], ...]}
+            "explored": {
+                team: sorted([x, y] for (x, y) in cells)
+                for team, cells in self.explored.items()
+            },
         }
         if include_history:
             d["history"] = self.history.to_dict()
@@ -6872,6 +6969,14 @@ class Match:
             for k, v in raw_bound.items() if isinstance(k, str)
         } if isinstance(raw_bound, dict) else {}
         m.fog_enabled = bool(d.get("fog_enabled", False))
+        m.fog_memory = bool(d.get("fog_memory", False))
+        raw_expl = d.get("explored", {})
+        m.explored = {
+            team: {(int(c[0]), int(c[1])) for c in cells
+                   if isinstance(c, (list, tuple)) and len(c) == 2}
+            for team, cells in raw_expl.items()
+            if isinstance(team, str) and isinstance(cells, list)
+        } if isinstance(raw_expl, dict) else {}
         # History is optional in saved dicts. It's only present when the
         # original save was made with include_history=True. A snapshot's
         # state.dict deliberately omits history (snapshots-within-
@@ -6955,17 +7060,19 @@ class Match:
                 grid[e.y][e.x] = sym
 
         # Fog overlay — the LAST layer. When fog is on and we're rendering
-        # from a team POV, every cell that team can't currently see is
-        # painted with fog_glyph (over whatever's underneath). The
-        # *_visible_to filters above already kept hidden entities/tiles/
-        # zones off unseen cells, so this just stamps the fog marker.
-        # Empty fog_glyph = leave unseen cells blank ('.').
+        # from a team POV, every cell whose TERRAIN isn't revealed (not
+        # currently seen and — with memory — not explored) is painted with
+        # fog_glyph. Remembered cells are NOT fogged: they keep their
+        # terrain glyph (and, under fog_memory_mode='full', their entity
+        # glyph, which the entity loop above already drew). The
+        # *_visible_to filters kept hidden features off unrevealed cells,
+        # so this just stamps the fog marker. Empty fog_glyph = blank.
         if self.fog_enabled and pov_team is not None:
             fog_glyph = str(self.rules.get("fog_glyph", "?"))
             fg = fog_glyph[0] if fog_glyph else "."
             for yy in range(1, self.grid_height + 1):
                 for xx in range(1, self.grid_width + 1):
-                    if not self.team_sees_cell(pov_team, xx, yy):
+                    if not self._fog_terrain_visible(pov_team, xx, yy):
                         grid[yy][xx] = fg
 
         # Skip the 0th row entirely to preserve 1-based coordinates
@@ -7313,6 +7420,7 @@ class MatchManager:
         # it's match state (toggled via `!match fog`), independent of the
         # rule — a refresh won't flip it.
         m.fog_enabled = bool(rules.get("fog_enabled_by_default", False))
+        m.fog_memory = bool(rules.get("fog_memory_enabled_by_default", False))
         # Seed match-level templates from the system's defaults. We copy
         # so subsequent match-side define / undefine doesn't reach back
         # into GameSystem.tile_templates — the system's library is the

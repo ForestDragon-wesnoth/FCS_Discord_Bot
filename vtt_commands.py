@@ -976,26 +976,60 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"- owner: {owner}\n- co-hosts: {cohosts}"
         )
     if sub == "fog":
-        # !match fog [on|off] — per-match fog-of-war toggle. A !match
-        # mutation, so host-gated; bare form reports the current state.
+        # !match fog [on|off]            — fog-of-war toggle
+        # !match fog memory [on|off]     — explored-memory toggle
+        # A !match mutation, so host-gated; bare forms report state.
         target_mid = mgr.get_active_for_channel(ctx.channel_key)
         if not target_mid:
             return await ctx.send("❌ No active match on this channel.")
         m = mgr.matches.get(target_mid)
         if not m:
             raise NotFound(f"Match '{target_mid}' not found.")
+
+        def _truthy(v):  # returns True/False/None (None = unrecognized)
+            if v in ("on", "true", "yes", "enable", "enabled"):
+                return True
+            if v in ("off", "false", "no", "disable", "disabled"):
+                return False
+            return None
+
+        # ---- memory sub-toggle ----
+        if len(args) >= 2 and args[1].lower() == "memory":
+            if len(args) < 3:
+                return await ctx.send(
+                    f"Fog memory is **{'on' if m.fog_memory else 'off'}** "
+                    f"for **{m.name}** (fog itself is "
+                    f"{'on' if m.fog_enabled else 'off'})."
+                )
+            want = _truthy(args[2].lower())
+            if want is None:
+                return await ctx.send("Usage: `!match fog memory on|off`.")
+            m.fog_memory = want
+            if want:
+                # Seed explored from every present team's current vision so
+                # memory starts from what's visible right now, then grows.
+                for team in {e.team for e in m.entities.values() if e.team}:
+                    m._record_vision(team)
+            else:
+                # Off = reset: drop remembered cells (render falls back to
+                # current vision only).
+                m.explored.clear()
+            return await ctx.send(
+                f"Fog memory **{'on' if m.fog_memory else 'off'}** for "
+                f"**{m.name}**."
+            )
+
+        # ---- fog on/off ----
         if len(args) < 2:
             return await ctx.send(
                 f"Fog of war is **{'on' if m.fog_enabled else 'off'}** "
-                f"for **{m.name}**."
+                f"for **{m.name}** (memory "
+                f"{'on' if m.fog_memory else 'off'})."
             )
-        val = args[1].lower()
-        if val in ("on", "true", "yes", "enable", "enabled"):
-            m.fog_enabled = True
-        elif val in ("off", "false", "no", "disable", "disabled"):
-            m.fog_enabled = False
-        else:
-            return await ctx.send("Usage: `!match fog on|off`.")
+        want = _truthy(args[1].lower())
+        if want is None:
+            return await ctx.send("Usage: `!match fog on|off` or `!match fog memory on|off`.")
+        m.fog_enabled = want
         return await ctx.send(
             f"Fog of war **{'on' if m.fog_enabled else 'off'}** for "
             f"**{m.name}**."
@@ -1108,17 +1142,19 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "match", "fog",
-    usage="!match fog [on|off]",
+    usage="!match fog [on|off] | !match fog memory [on|off]",
     desc=(
-        "Toggle fog of war for the active match (bare form shows current "
-        "state). Per-match — seeded at creation from the "
-        "fog_enabled_by_default rule, then independent of the game system "
-        "(survives rule refreshes). When on, a channel rendering from a "
-        "team POV (set via `!match bind pov=<team>`) only sees what its "
-        "team can: cells within vision range (fog_vision_radius_var, "
-        "fog_range_mode) of any alive member; unseen cells show fog_glyph "
-        "and anything in them is hidden. Host channels (omniscient POV) "
-        "and `!… full` bypass."
+        "Toggle fog of war for the active match (bare form shows state). "
+        "Per-match — seeded at creation from fog_enabled_by_default, then "
+        "independent of the game system (survives rule refreshes). When "
+        "on, a channel rendering from a team POV (`!match bind pov=`) "
+        "only sees what its team can: cells within vision range "
+        "(fog_vision_radius_var, fog_range_mode) of any alive member; "
+        "unseen cells show fog_glyph and anything in them is hidden. "
+        "`!match fog memory on` keeps explored cells revealed after the "
+        "team leaves vision (fog_memory_mode controls whether remembered "
+        "cells show everything or terrain-only); off (default) resets to "
+        "current vision. Host channels (omniscient) and `!… full` bypass."
     ),
 )
 registry.annotate_sub(

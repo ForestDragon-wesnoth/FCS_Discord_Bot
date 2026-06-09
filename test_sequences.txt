@@ -9416,3 +9416,66 @@ forcing the omniscient view (host-gated via the `full` flag);
 as the owner it runs and reveals everything including Spy at
 (5,5) with no fog glyph. `!match fog off` disables fog for the
 match, so red's next `!list` shows Spy again.
+
+
+SCENARIO 370 — fog memory: explored terrain stays revealed (mode 'full'), toggle resets
+----------------------------------------------------------------------------------------
+
+!match new mem Mem 9 9
+!match use mem
+!defvar add fog_vision_radius 2
+!tile set 5 6 glyph T
+!ent add scout Scout 30 2 2 9
+!ent set_var scout team red
+!match fog on
+!match fog memory on
+!as view red
+!ent tp scout 5 4
+!map
+!ent tp scout 8 8
+!map
+!match fog memory off
+!map
+
+Expected: With fog AND fog memory on, the explored set grows as
+Scout moves. From (2,2) Scout can't see the tile at (5,6); after
+`!ent tp scout 5 4` it does (distance 2), so (5,6) is now
+explored and the first `!map` shows `T`. After `!ent tp scout 8
+8` Scout no longer has (5,6) in CURRENT vision, but under the
+default fog_memory_mode 'full' the remembered cell stays
+revealed — the second `!map` still shows `T` there (only the
+area around (8,8) is freshly lit; everything Scout ever saw
+stays clear). `!match fog memory off` resets to current-vision-
+only and clears the explored set, so the final `!map` re-fogs
+(5,6) (it's `?` again, far from Scout at (8,8)).
+
+
+SCENARIO 371 — fog memory mode 'terrain': remembered terrain shown, live units need current vision
+--------------------------------------------------------------------------------------------------
+
+!match new mem2 Mem2 9 9
+!match use mem2
+!defvar add fog_vision_radius 2
+!system set default fog_memory_mode terrain
+!tile set 5 6 glyph T
+!ent add scout Scout 30 2 2 9
+!ent set_var scout team red
+!ent add enemy Enemy 15 5 5 5
+!ent set_var enemy team blue
+!match fog on
+!match fog memory on
+!as view red
+!ent tp scout 5 4
+!list
+!ent tp scout 8 8
+!list
+
+Expected: fog_memory_mode is set to 'terrain'. Scout (red)
+moves to (5,4) and sees the blue Enemy at (5,5) and the tile at
+(5,6) — `!list` shows Enemy (currently visible). Scout then
+moves to (8,8): the tile at (5,6) stays remembered (terrain is
+kept), but the LIVE Enemy is no longer in current vision, so
+under 'terrain' mode it drops out of `!list` (you remember the
+ground, not where the enemy went). Under 'full' mode (scenario
+370's default) the enemy would have stayed; 'terrain' is the
+classic fog-of-war behavior.
