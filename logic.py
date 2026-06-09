@@ -758,6 +758,64 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "visible. Example: \"corpse_team == pov_team\"."
         ),
     },
+    # ---- Fog of war (range-only spatial visibility) ---------------------
+    # A spatial visibility layer ON TOP of the formula-driven conditions
+    # above. When a match has fog ON (per-match Match.fog_enabled, seeded
+    # from fog_enabled_by_default) and a channel renders from a TEAM POV,
+    # the engine hides anything in a cell that team can't currently see
+    # and paints fog_glyph over unseen cells. "See" = within vision range
+    # (fog_range_mode) of at least one ALIVE team member — vision is the
+    # UNION across the team (a scout reveals for everyone). Each unit
+    # always sees its own cell, so you always see your own team. RANGE
+    # ONLY: no line-of-sight / opacity (a future piece). Omniscient POV
+    # (host channels), `!… full`, and fog-off all bypass.
+    "fog_enabled_by_default": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether NEW matches start with fog of war on. This only "
+            "SEEDS a match's per-match fog toggle at creation; flip fog "
+            "live per match with `!match fog on|off` (it's match state, "
+            "not a rule, so a system refresh won't change it). Default "
+            "False — fog is opt-in."
+        ),
+    },
+    "fog_vision_radius_var": {
+        "default": "fog_vision_radius",
+        "schema": {"type": "str"},
+        "desc": (
+            "Entity var name holding each unit's vision radius for fog. A "
+            "team sees every cell within this many cells (per "
+            "fog_range_mode) of any alive member. Missing / non-integer "
+            "var = radius 0 (sees only its own cell) — set a sensible "
+            "default with `!defvar add fog_vision_radius <n>`."
+        ),
+    },
+    "fog_range_mode": {
+        "default": "square_radius",
+        "schema": {
+            "type": "enum",
+            "choices": ["square_radius", "manhattan", "euclidean"],
+        },
+        "desc": (
+            "Distance metric for fog vision. 'square_radius' (default, "
+            "Chebyshev — a radius-N square, max(|dx|,|dy|)<=N); "
+            "'manhattan' (|dx|+|dy|<=N, a diamond); 'euclidean' "
+            "(dx^2+dy^2<=N^2, a disc). Same family as the distance() "
+            "formula modes."
+        ),
+    },
+    "fog_glyph": {
+        "default": "?",
+        "schema": {"type": "str"},
+        "desc": (
+            "Single character painted over every cell the POV team can't "
+            "see when fog is on — drawn on TOP of terrain/zone glyphs so "
+            "unseen cells read as fog, not as their real contents. Empty "
+            "string = no overlay (unseen cells just render blank '.'). "
+            "Only the first character is used."
+        ),
+    },
     # ---- Action system --------------------------------------------------
     # Actions are GM-defined effect bundles stored under entity.vars at any
     # path ending in `.actions.<name>`. Each action is a dict with `body`
@@ -3462,6 +3520,16 @@ class Match:
     # channel makes the match active there). Persisted with the match.
     bound_channels: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
+    # Per-match fog-of-war toggle. Seeded at match creation from the
+    # `fog_enabled_by_default` rule, then independent of the game system
+    # (toggled live via `!match fog on|off`) — it lives in its OWN field,
+    # NOT in `rules`, so a system rule refresh can't flip it, the same
+    # reasoning as access_overrides. When True (and a channel renders from
+    # a team POV, i.e. pov_team is not None), the engine hides anything in
+    # a cell that team can't currently see (union of its units' vision
+    # radii) and paints the fog_glyph over unseen cells. Persisted.
+    fog_enabled: bool = False
+
     # ---- runtime-only: pending approval queue ----
     # Requests from non-host users awaiting host approval, keyed by a
     # short per-match id ("r1", "r2", ...). Each value is a dict
@@ -4016,6 +4084,68 @@ class Match:
             return None
         return str(pov)
 
+    # ---- fog of war: range-only spatial vision -----------------------
+    def _vision_radius_of(self, e: "Entity") -> int:
+        """The entity's fog vision radius (the fog_vision_radius_var var),
+        clamped to >= 0. Missing / non-integer -> 0 (sees only its own
+        cell). Set a default with `!defvar add fog_vision_radius <n>`."""
+        var = str(self.rules.get("fog_vision_radius_var", "fog_vision_radius"))
+        try:
+            return max(0, int(e.vars.get(var)))
+        except (TypeError, ValueError):
+            return 0
+
+    def _within_vision(self, ux: int, uy: int, x: int, y: int,
+                       radius: int) -> bool:
+        """Is (x, y) within `radius` of (ux, uy) under fog_range_mode?"""
+        dx, dy = abs(ux - x), abs(uy - y)
+        mode = str(self.rules.get("fog_range_mode", "square_radius"))
+        if mode == "manhattan":
+            return dx + dy <= radius
+        if mode == "euclidean":
+            return dx * dx + dy * dy <= radius * radius
+        # square_radius (Chebyshev) — the default
+        return max(dx, dy) <= radius
+
+    def team_sees_cell(self, pov_team: Optional[str], x: int, y: int) -> bool:
+        """Does team `pov_team` currently see cell (x, y)? True if ANY
+        alive member is within its vision radius of the cell (union team
+        vision — a scout reveals for everyone). An omniscient / empty
+        pov_team sees everything. This is the spatial-vision primitive;
+        it does NOT consult fog_enabled (callers decide whether fog is in
+        play) — so a GM can query sight regardless."""
+        if not pov_team:
+            return True
+        for e in self.entities.values():
+            if not e.is_alive or e.team != pov_team:
+                continue
+            if self._within_vision(e.x, e.y, x, y, self._vision_radius_of(e)):
+                return True
+        return False
+
+    def team_sees_entity(self, pov_team: Optional[str], eid: str) -> bool:
+        """Does team `pov_team` see entity `eid` (i.e. its cell)? False
+        for an unknown/removed entity."""
+        e = self.entities.get(eid)
+        if e is None:
+            return False
+        return self.team_sees_cell(pov_team, e.x, e.y)
+
+    def entity_can_see(self, viewer_eid: str, x: int, y: int) -> bool:
+        """Does the single unit `viewer_eid` see cell (x, y) — within its
+        own vision radius, regardless of team? False for unknown viewer."""
+        e = self.entities.get(viewer_eid)
+        if e is None:
+            return False
+        return self._within_vision(e.x, e.y, x, y, self._vision_radius_of(e))
+
+    def _fog_sees(self, pov_team: Optional[str], x: int, y: int) -> bool:
+        """Fog gate for a single cell: True (visible) when fog is off, the
+        viewer is omniscient, or the team currently sees the cell."""
+        if not self.fog_enabled or pov_team is None:
+            return True
+        return self.team_sees_cell(pov_team, x, y)
+
     def _visibility_visible(self, rule_key: str, pov_team: Optional[str], *,
                             target: Optional[str] = None,
                             extras: Optional[Dict[str, Any]] = None) -> bool:
@@ -4051,6 +4181,9 @@ class Match:
             return True
         if eid not in self.entities:
             return False
+        e = self.entities[eid]
+        if not self._fog_sees(pov_team, e.x, e.y):
+            return False
         return self._visibility_visible(
             "entity_visibility_condition", pov_team, target=eid)
 
@@ -4059,6 +4192,8 @@ class Match:
         list/info/cells rows — is visible to `pov_team`. Binds tile_x /
         tile_y (inspect data via tile_get/tile_has). See
         tile_visibility_condition."""
+        if pov_team is not None and not self._fog_sees(pov_team, x, y):
+            return False
         return self._visibility_visible(
             "tile_visibility_condition", pov_team,
             extras={"tile_x": x, "tile_y": y})
@@ -4066,7 +4201,16 @@ class Match:
     def zone_visible_to(self, name: str, pov_team: Optional[str]) -> bool:
         """Whether zone `name` — its map glyph and its !zone listing row
         — is visible to `pov_team`. Binds zone_name (inspect via
-        zone_get/zone_has). See zone_visibility_condition."""
+        zone_get/zone_has). See zone_visibility_condition. Under fog a
+        zone is revealed if the team sees ANY of its cells (the seen part
+        shows; the fog overlay still covers its unseen cells on the map)."""
+        if pov_team is not None and self.fog_enabled:
+            z = self.zones.get(name)
+            cells = z.get("cells", ()) if isinstance(z, dict) else ()
+            if cells and not any(
+                self.team_sees_cell(pov_team, cx, cy) for (cx, cy) in cells
+            ):
+                return False
         return self._visibility_visible(
             "zone_visibility_condition", pov_team,
             extras={"zone_name": name})
@@ -4080,6 +4224,8 @@ class Match:
         corpse_visibility_condition."""
         if pov_team is None:
             return True
+        if not self._fog_sees(pov_team, x, y):
+            return False
         team_var = str(self.rules.get("team_var", "team"))
         corpse_team = ""
         ent = corpse.get("entity") if isinstance(corpse, dict) else None
@@ -6602,6 +6748,7 @@ class Match:
             "cohosts": list(self.cohosts),
             "access_overrides": dict(self.access_overrides),
             "bound_channels": copy.deepcopy(self.bound_channels),
+            "fog_enabled": bool(self.fog_enabled),
         }
         if include_history:
             d["history"] = self.history.to_dict()
@@ -6724,6 +6871,7 @@ class Match:
             k: (dict(v) if isinstance(v, dict) else {})
             for k, v in raw_bound.items() if isinstance(k, str)
         } if isinstance(raw_bound, dict) else {}
+        m.fog_enabled = bool(d.get("fog_enabled", False))
         # History is optional in saved dicts. It's only present when the
         # original save was made with include_history=True. A snapshot's
         # state.dict deliberately omits history (snapshots-within-
@@ -6805,6 +6953,20 @@ class Match:
             if self.in_bounds(e.x, e.y):
                 sym = DIRECTION_ARROWS.get(getattr(e, "facing", ""), "@")
                 grid[e.y][e.x] = sym
+
+        # Fog overlay — the LAST layer. When fog is on and we're rendering
+        # from a team POV, every cell that team can't currently see is
+        # painted with fog_glyph (over whatever's underneath). The
+        # *_visible_to filters above already kept hidden entities/tiles/
+        # zones off unseen cells, so this just stamps the fog marker.
+        # Empty fog_glyph = leave unseen cells blank ('.').
+        if self.fog_enabled and pov_team is not None:
+            fog_glyph = str(self.rules.get("fog_glyph", "?"))
+            fg = fog_glyph[0] if fog_glyph else "."
+            for yy in range(1, self.grid_height + 1):
+                for xx in range(1, self.grid_width + 1):
+                    if not self.team_sees_cell(pov_team, xx, yy):
+                        grid[yy][xx] = fg
 
         # Skip the 0th row entirely to preserve 1-based coordinates
         lines = [" ".join(row[1:]) for row in grid[1:]]
@@ -7147,6 +7309,10 @@ class MatchManager:
         # channels that ACTIVATE the match, which happens on `match use` /
         # `match bind` (the creator's `match new` is followed by a `use`).
         m.owner = owner
+        # Seed the per-match fog toggle from the system default. After this
+        # it's match state (toggled via `!match fog`), independent of the
+        # rule — a refresh won't flip it.
+        m.fog_enabled = bool(rules.get("fog_enabled_by_default", False))
         # Seed match-level templates from the system's defaults. We copy
         # so subsequent match-side define / undefine doesn't reach back
         # into GameSystem.tile_templates — the system's library is the

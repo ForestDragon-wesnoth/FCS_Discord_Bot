@@ -1308,6 +1308,16 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #                                    of entities_within
     "all_entities", "entities_with_status", "entities_with_var",
     "entities_in_area",
+    # Fog-of-war vision primitives (range-only; see fog_* rules). All
+    # return bool and ignore the fog_enabled toggle — they answer the raw
+    # "is it in sight?" question, so a GM can compose custom visibility
+    # regardless of whether the auto-fog is on:
+    #   team_sees_cell(team, x, y)    -> any alive `team` member within
+    #                                    vision range of (x, y) (union)
+    #   team_sees_entity(team, eid)   -> team sees eid's cell
+    #   can_see(eid, x, y)            -> the single unit eid sees (x, y)
+    # A falsy/empty team is treated as omniscient (sees all).
+    "team_sees_cell", "team_sees_entity", "can_see",
 )
 
 _ALLOWED_NODES: Tuple[type, ...] = (
@@ -4058,6 +4068,22 @@ class FormulaEngine:
             scored.sort(key=lambda t: (t[0], t[1]))
             return [eid for _, eid in scored]
         ns["entities_in_area"] = _entities_in_area
+
+        # ---- fog-of-war vision primitives -------------------------------
+        def _team_sees_cell(team: Any, x: Any, y: Any) -> bool:
+            return match.team_sees_cell(
+                None if team is None else str(team), int(x), int(y))
+
+        def _team_sees_entity(team: Any, eid_t: Any) -> bool:
+            return match.team_sees_entity(
+                None if team is None else str(team), _eid(eid_t))
+
+        def _can_see(eid_t: Any, x: Any, y: Any) -> bool:
+            return match.entity_can_see(_eid(eid_t), int(x), int(y))
+
+        ns["team_sees_cell"] = _team_sees_cell
+        ns["team_sees_entity"] = _team_sees_entity
+        ns["can_see"] = _can_see
 
         # User-defined formula functions. Each becomes a Python callable
         # in the namespace. The callable binds its arguments to the
