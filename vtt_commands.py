@@ -78,6 +78,16 @@ READ_ONLY_SUBCOMMANDS: frozenset = frozenset({
 READ_ONLY_BARE_ROOTS: frozenset = frozenset({
     "turn", "history",
 })
+# The inverse of READ_ONLY_SUBCOMMANDS: an otherwise player-available
+# ("all") command whose FIRST ARG here ELEVATES it to host-gated. Used by
+# the visibility full-reveal: `!state` / `!map` / `!list` render from the
+# channel's POV for anyone, but `... full` forces the omniscient view and
+# so must be host-only (else a player could peek past fog of war).
+ELEVATED_ARGS: Dict[str, frozenset] = {
+    "state": frozenset({"full"}),
+    "map": frozenset({"full"}),
+    "list": frozenset({"full"}),
+}
 
 class CommandRegistry:
     def __init__(self):
@@ -239,6 +249,9 @@ class CommandRegistry:
         elif base == "host" and not args and name in READ_ONLY_BARE_ROOTS:
             # Bare view form of a root that mutates only via subcommands.
             base = "all"
+        elif base == "all" and args and args[0].lower() in ELEVATED_ARGS.get(name, ()):
+            # Full-reveal flag on a normally-open read -> host-gated.
+            base = "host"
         if m is not None:
             sub_key = f"{name} {args[0].lower()}" if args else None
             # Per-match host overrides win over the system-level rule,
@@ -877,10 +890,15 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # one channel per team. An optional label is stored for the
         # upcoming per-team / fog-of-war views.
         label = None
+        pov = None
         positional = []
         for a in args[1:]:
             if a.startswith("label="):
                 label = a[len("label="):]
+            elif a.startswith("pov="):
+                # pov=<team> restricts this channel to a team's view;
+                # pov=omniscient (or pov=) clears it back to seeing all.
+                pov = a[len("pov="):]
             else:
                 positional.append(a)
         target_mid = positional[0] if positional else mgr.get_active_for_channel(ctx.channel_key)
@@ -892,9 +910,15 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         m = mgr.matches.get(target_mid)
         if not m:
             raise NotFound(f"Match '{target_mid}' not found.")
-        newly = m.bind_channel(ctx.channel_key, label=label)
+        newly = m.bind_channel(ctx.channel_key, label=label, pov=pov)
         mgr.set_active_for_channel(ctx.channel_key, target_mid)
-        tail = f" (label '{label}')" if label else ""
+        bits = []
+        if label is not None:
+            bits.append(f"label '{label}'")
+        if pov is not None:
+            eff = m.channel_pov(ctx.channel_key)
+            bits.append(f"POV {eff}" if eff else "POV omniscient")
+        tail = f" ({', '.join(bits)})" if bits else ""
         verb = "Bound this channel to" if newly else "Updated binding of this channel to"
         return await ctx.send(
             f"{verb} **{m.name}** (`{target_mid}`){tail}. "
@@ -931,9 +955,11 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         for ch in sorted(m.bound_channels.keys()):
             meta = m.bound_channels[ch]
             label = meta.get("label")
+            pov = meta.get("pov")
             here = " ← here" if ch == ctx.channel_key else ""
             lab = f" — '{label}'" if label else ""
-            lines.append(f"- `{ch}`{lab}{here}")
+            povtag = f" [POV: {pov}]" if (pov and pov != "omniscient") else " [POV: omniscient]"
+            lines.append(f"- `{ch}`{lab}{povtag}{here}")
         return await ctx.send("\n".join(lines))
     if sub == "hosts":
         # !match hosts [<match_id>] — show owner + co-hosts.
@@ -1027,13 +1053,17 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "match", "bind",
-    usage="!match bind [<id>] [label=<text>]",
+    usage="!match bind [<id>] [label=<text>] [pov=<team|omniscient>]",
     desc=(
         "Bind THIS channel to a match (defaults to the active one) and "
         "make it active here. Multiple channels can bind one match, "
         "uncapped — e.g. a host channel plus a players channel, or one "
-        "channel per team. The optional label is stored for upcoming "
-        "per-team / fog-of-war views."
+        "channel per team. The optional label is free-form text. "
+        "`pov=<team>` sets the channel's point-of-view team: !state / "
+        "!map / !list then render only what that team can see (per the "
+        "entity_visibility_condition rule). `pov=omniscient` (the "
+        "default) clears it — the channel sees everything, which is "
+        "what a host channel wants."
     ),
 )
 registry.annotate_sub(
@@ -1197,28 +1227,52 @@ def _mention(user_id: Optional[str]) -> str:
 # ---- as (CLI identity switch for previewing host vs player) -----
 @registry.command(
     "as", access="all",
-    usage="!as <host|player|owner> [<name>]",
+    usage="!as <host|player|owner> [<name>] | !as view <team|omniscient|clear>",
     desc=(
-        "Switch your previewing identity. CLI-only: lets you see what a "
-        "host vs a player experiences (a player's mutating commands are "
-        "held for approval; later, fog-of-war views will differ too). "
-        "`!as owner` / `!as host` restores the owner identity 'cli'; "
-        "`!as player [name]` becomes a player ('player' or the given "
-        "name). On Discord, identity comes from your account and can't "
-        "be reassigned, so this command is inert there."
+        "Switch your previewing identity OR point-of-view. CLI-only "
+        "(on Discord both come from your account / the channel, so this "
+        "is inert). IDENTITY: `!as owner`/`!as host` restores the owner "
+        "identity 'cli'; `!as player [name]` becomes a player (whose "
+        "mutating commands are held for approval). POV (visibility "
+        "preview, a SEPARATE axis from identity): `!as view <team>` "
+        "renders !state/!map/!list as that team sees them; `!as view "
+        "omniscient` forces the full view; `!as view clear` drops the "
+        "override and falls back to the channel's bound POV. Bare `!as` "
+        "reports both your identity and your effective POV."
     ),
 )
 async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not getattr(ctx, "cli_mutable", False):
         return await ctx.send(
-            "❌ `!as` only works at the CLI. On Discord your identity is "
-            "your account."
+            "❌ `!as` only works at the CLI. On Discord your identity and "
+            "view come from your account and the channel."
         )
     if not args:
+        ov = getattr(ctx, "pov_override", _NO_POV)
+        if ov is _NO_POV:
+            pov_desc = "channel default"
+        elif ov is None or ov == "omniscient":
+            pov_desc = "omniscient (override)"
+        else:
+            pov_desc = f"team `{ov}` (override)"
         return await ctx.send(
-            f"You are `{ctx_user(ctx)}`. Use `!as host` or `!as player [name]`."
+            f"You are `{ctx_user(ctx)}`; POV: {pov_desc}. "
+            f"Use `!as host`/`!as player [name]` or `!as view <team>`."
         )
     role = args[0].lower()
+    if role == "view":
+        target = args[1].lower() if len(args) >= 2 else "omniscient"
+        if target == "clear":
+            if hasattr(ctx, "pov_override"):
+                delattr(ctx, "pov_override")
+            return await ctx.send("POV override cleared; using the channel's bound POV.")
+        if target in ("omniscient", "all", "full"):
+            ctx.pov_override = "omniscient"
+            return await ctx.send("POV is now omniscient (you see everything).")
+        # Preserve original casing of the team name (args[1], not lowered).
+        team = args[1]
+        ctx.pov_override = team
+        return await ctx.send(f"POV is now team `{team}`.")
     if role in ("host", "owner"):
         ctx.user_id = "cli"
         ctx.user_name = "cli"
@@ -2986,20 +3040,48 @@ async def match_top_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             parts.append(f"- `{pid}` ({p.when}): `{p.formula}`")
     return await ctx.send("\n".join(parts))
 
-@registry.command("map", access="all", usage="!map", desc="Render the ASCII map for the active match.")
+# Sentinel distinguishing "no transient POV override on this ctx" from
+# "override is set to omniscient" (both render everything, but absence
+# means fall back to the channel binding).
+_NO_POV = object()
+
+
+def _view_pov(ctx: ReplyContext, m: "Match", args: List[str]) -> Optional[str]:
+    """Resolve the POV team for a render/list command. Returns a team
+    string, or None for an omniscient view (no filtering). Precedence:
+      1. a `full` first-arg forces omniscient (host-gated by the access
+         layer via ELEVATED_ARGS);
+      2. a transient ctx POV override (CLI `!as view <team>`), which lets
+         a tester preview a team's fog without mutating the binding;
+      3. the channel's bound POV (Match.channel_pov)."""
+    if args and args[0].lower() == "full":
+        return None
+    ov = getattr(ctx, "pov_override", _NO_POV)
+    if ov is not _NO_POV:
+        return None if (ov is None or ov == "omniscient") else str(ov)
+    return m.channel_pov(ctx.channel_key)
+
+
+@registry.command("map", access="all", usage="!map [full]", desc="Render the ASCII map for the active match, from this channel's POV. `!map full` (host-gated) forces the omniscient view.")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
-    return await ctx.send(f"```\n{m.render_ascii()}\n```")
+    pov = _view_pov(ctx, m, args)
+    return await ctx.send(f"```\n{m.render_ascii(pov)}\n```")
 
-@registry.command("list", access="all", usage="!list", desc="List entities in a match, sorted by turn order, plus a Dead: section of corpses when show_corpses_in_entity_list is enabled.")
+@registry.command("list", access="all", usage="!list [full]", desc="List entities (turn order) from this channel's POV, plus a Dead: section of corpses when show_corpses_in_entity_list is enabled. `!list full` (host-gated) ignores visibility.")
 async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
+    pov = _view_pov(ctx, m, args)
     es = m.entities_in_turn_order()
     active_id = m.turn_order[m.active_index] if m.turn_order else None
     lines: List[str] = []
-    if es:
+    # Filter out entities hidden from this POV (omniscient pov=None keeps
+    # all). Corpses (the Dead: section below) are NOT yet POV-filtered —
+    # a later visibility piece covers tile-stored data.
+    visible = [e for e in es if m.entity_visible_to(e.id, pov)]
+    if visible:
         lines.append("Entities:")
-        for e in es:
+        for e in visible:
             marker = "→" if e.id == active_id else "  "
             lines.append(f"{marker} {_entity_line(e)}")
     # Dead: section. Each corpse rendered via _corpse_line which honors
@@ -3189,9 +3271,11 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     return await ctx.send("\n".join(lines))
 
 
-@registry.command("state", access="all", usage="!state", desc="Show match summary, entities, and map.")
+@registry.command("state", access="all", usage="!state [full]", desc="Show match summary, entities, and map from this channel's POV. `!state full` (host-gated) forces the omniscient view.")
 async def state_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
-    # New behavior: show list (turn-order) then map
+    # New behavior: show list (turn-order) then map. The `full` arg (when
+    # present) flows through to list_cmd / map_cmd, which resolve it to
+    # the omniscient POV; match_top_cmd ignores it.
     await match_top_cmd(ctx, args, mgr)
     await list_cmd(ctx, args, mgr)
     await map_cmd(ctx, args, mgr)
