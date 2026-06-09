@@ -544,20 +544,29 @@ What the user has flagged as next-on-their-mind:
   add/remove/list` (the var analog of `!defpassive`/`!gclamp`; values
   coerce via `_parse_scalar` like `!ent set_var`, dotted paths nest). The
   intended home for `fog_vision_radius`.
-- **Visibility rework — REMAINING pieces** (Pieces 1 & 2 shipped):
-  - Piece 3 — fog of war, RANGE-ONLY (next up; design locked with the
-    user). Per-entity vision-radius var (`fog_vision_radius`, defaulted
-    via `default_entity_vars`); a team sees the UNION of cells within
-    each alive member's radius (metric = `fog_range_mode`, default
-    `square_radius`). Per-match `Match.fog_enabled` (seeded from a
-    `fog_enabled_by_default` rule, toggled by `!match fog on|off`,
-    survives refresh like access_overrides). HYBRID: engine auto-applies
-    fog (paints `fog_glyph` over unseen cells + ANDs "cell seen?" into
-    every `*_visible_to` so entities/tiles/zones/corpses in fog hide
-    across map + listings) AND exposes `team_sees_cell` / `team_sees_entity`
-    / `can_see` primitives for custom formulas. Omniscient POV / `… full`
-    / fog-off bypass. LOS (opaque tiles blocking sight) and explored
-    memory are SEPARATE future pieces, explicitly out of scope.
+- **Visibility rework — PIECE 3 SHIPPED (fog of war, RANGE-ONLY).**
+  Per-entity vision-radius var (`fog_vision_radius`, defaulted via
+  `default_entity_vars`); a team sees the UNION of cells within each
+  alive member's radius (metric = `fog_range_mode` rule, default
+  `square_radius`/Chebyshev; missing var = radius 0). Per-match
+  `Match.fog_enabled` (its OWN field, seeded at creation from the
+  `fog_enabled_by_default` rule, toggled by `!match fog on|off`, survives
+  rule refresh like access_overrides, serialized). HYBRID: the engine
+  auto-applies fog (`render_ascii` paints `fog_glyph` over unseen cells;
+  each `*_visible_to` ANDs a `_fog_sees` cell check so
+  entities/tiles/zones/corpses in fog hide across map + every listing)
+  AND exposes `team_sees_cell` / `team_sees_entity` / `can_see` formula
+  primitives (they ignore `fog_enabled` — raw sight queries). Omniscient
+  POV (None) / `!… full` / fog-off all bypass. Vision math:
+  `Match._within_vision` + `_vision_radius_of`; zone fog = "any cell
+  seen". LOS (opaque tiles blocking sight) and explored memory remain
+  SEPARATE future pieces, explicitly out of scope.
+- **Visibility rework — REMAINING pieces** (Pieces 1, 2 & 3 shipped):
+  - LOS / line-of-sight: opaque tiles blocking vision (a `los_*` rule +
+    a line/beam walk — there's already a line geometry helper). Its own
+    can of worms; deferred by the user.
+  - Explored memory: terrain you've seen stays revealed (needs
+    persistent per-team explored state + update timing).
   - Possible later: per-channel auto-routing; richer corpse-snapshot
     introspection (status/vars not exposed today).
 

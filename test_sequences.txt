@@ -9350,3 +9350,69 @@ required var). After `!defvar remove fog_vision_radius`, Rogue
 future injection) but still gets inventory.gold=100. Defaults
 are injection-at-creation, not enforcement: already-spawned
 entities are untouched by a later add/remove.
+
+
+SCENARIO 368 — fog of war (range): a team only sees within its units' vision
+-----------------------------------------------------------------------------
+
+!match new fog Fog 9 9
+!match use fog
+!defvar add fog_vision_radius 2
+!ent add scout Scout 20 2 2 9
+!ent set_var scout team red
+!ent add near Near 15 4 2 7
+!ent set_var near team blue
+!ent add far Far 15 8 8 6
+!ent set_var far team blue
+!match fog on
+!as view red
+!list
+!map
+!as view omniscient
+!list
+
+Expected: `!match fog on` turns on the per-match fog toggle.
+Scout (red) has fog_vision_radius 2 (from !defvar), so under the
+default square_radius metric it sees up to 2 cells in every
+direction (a 5x5 area, clamped at the map edge). The blue Near
+at (4,2) is exactly 2 cells away -> its cell is visible to the
+red POV; the blue Far at (8,8) is out of range -> hidden. (Only
+RED units spot for the red POV — Near doesn't extend red's
+vision; it just stands on a cell Scout already sees.)
+As red, `!list` shows Scout and Near but NOT Far, and `!map`
+paints the fog_glyph `?` over every cell red can't see (the far
+corner incl (8,8)) while drawing Scout and Near normally. Switch
+to `!as view omniscient` (a host/omniscient channel) and `!list`
+shows all three — omniscient bypasses fog entirely. (A team's
+own units are always visible, since each unit sees its own cell.)
+
+
+SCENARIO 369 — fog: shared (union) team vision, full-reveal, and toggle off
+---------------------------------------------------------------------------
+
+!match new fog2 Fog2 9 9
+!match use fog2
+!defvar add fog_vision_radius 1
+!ent add a A 20 1 1 9
+!ent set_var a team red
+!ent add b B 20 9 9 8
+!ent set_var b team red
+!ent add spy Spy 10 5 5 7
+!ent set_var spy team blue
+!match fog on
+!as view red
+!list
+!map full
+!match fog off
+!list
+
+Expected: red fields two units, a at (1,1) and b at (9,9), each
+with vision radius 1. Team vision is the UNION of what every
+member sees (a scout reveals for the whole team), so red sees
+the two opposite corners but nothing in the middle. The blue Spy
+at (5,5) sits outside both units' radius, so under fog red's
+`!list` shows a and b but NOT Spy. `!map full` is the host
+forcing the omniscient view (host-gated via the `full` flag);
+as the owner it runs and reveals everything including Spy at
+(5,5) with no fog glyph. `!match fog off` disables fog for the
+match, so red's next `!list` shows Spy again.

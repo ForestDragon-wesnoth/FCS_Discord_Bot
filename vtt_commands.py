@@ -975,6 +975,31 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"**{m.name}** (`{target_mid}`)\n"
             f"- owner: {owner}\n- co-hosts: {cohosts}"
         )
+    if sub == "fog":
+        # !match fog [on|off] — per-match fog-of-war toggle. A !match
+        # mutation, so host-gated; bare form reports the current state.
+        target_mid = mgr.get_active_for_channel(ctx.channel_key)
+        if not target_mid:
+            return await ctx.send("❌ No active match on this channel.")
+        m = mgr.matches.get(target_mid)
+        if not m:
+            raise NotFound(f"Match '{target_mid}' not found.")
+        if len(args) < 2:
+            return await ctx.send(
+                f"Fog of war is **{'on' if m.fog_enabled else 'off'}** "
+                f"for **{m.name}**."
+            )
+        val = args[1].lower()
+        if val in ("on", "true", "yes", "enable", "enabled"):
+            m.fog_enabled = True
+        elif val in ("off", "false", "no", "disable", "disabled"):
+            m.fog_enabled = False
+        else:
+            return await ctx.send("Usage: `!match fog on|off`.")
+        return await ctx.send(
+            f"Fog of war **{'on' if m.fog_enabled else 'off'}** for "
+            f"**{m.name}**."
+        )
     if sub == "delete":# and len(args) >= 2:
         if await return_help_if_not_enough_args(ctx, args, 2, "match", "delete"):
             return
@@ -1080,6 +1105,21 @@ registry.annotate_sub(
     "match", "hosts",
     usage="!match hosts [<id>]",
     desc="Show a match's owner and co-hosts.",
+)
+registry.annotate_sub(
+    "match", "fog",
+    usage="!match fog [on|off]",
+    desc=(
+        "Toggle fog of war for the active match (bare form shows current "
+        "state). Per-match — seeded at creation from the "
+        "fog_enabled_by_default rule, then independent of the game system "
+        "(survives rule refreshes). When on, a channel rendering from a "
+        "team POV (set via `!match bind pov=<team>`) only sees what its "
+        "team can: cells within vision range (fog_vision_radius_var, "
+        "fog_range_mode) of any alive member; unseen cells show fog_glyph "
+        "and anything in them is hidden. Host channels (omniscient POV) "
+        "and `!… full` bypass."
+    ),
 )
 registry.annotate_sub(
     "match", "delete",
