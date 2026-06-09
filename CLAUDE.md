@@ -561,12 +561,25 @@ What the user has flagged as next-on-their-mind:
   `Match._within_vision` + `_vision_radius_of`; zone fog = "any cell
   seen". LOS (opaque tiles blocking sight) and explored memory remain
   SEPARATE future pieces, explicitly out of scope.
-- **Visibility rework — REMAINING pieces** (Pieces 1, 2 & 3 shipped):
+- **Fog MEMORY (explored terrain) — SHIPPED.** Per-match `Match.fog_memory`
+  (own field; seeded at creation from `fog_memory_enabled_by_default`
+  rule, default off = "resets to current vision each time"; toggled by
+  `!match fog memory on|off`; survives refresh; serialized). `Match.explored`
+  = per-team set of seen (x,y), accumulated by `Match._record_vision` on
+  every entity move (`fire_entity_moved` + per-step `fire_entity_step`)
+  and spawn, and seeded for present teams when memory is toggled on;
+  cleared when toggled off; serialized as `{team: [[x,y],...]}`. Remembered
+  cells stay un-fogged. The `fog_memory_mode` rule (enum, default `full`)
+  controls remembered-cell CONTENT: `full` = everything incl. live
+  entities ("once seen, stays visible"); `terrain` = only static features
+  (tiles/zones/corpses) remembered, LIVE entities still need current
+  vision. Two gates: `_fog_terrain_visible` (current OR remembered — used
+  by tiles/zones/corpses + the map fog overlay) vs `_fog_entity_visible`
+  (current always; remembered only when mode==full).
+- **Visibility rework — REMAINING pieces** (Pieces 1-3 + memory shipped):
   - LOS / line-of-sight: opaque tiles blocking vision (a `los_*` rule +
     a line/beam walk — there's already a line geometry helper). Its own
     can of worms; deferred by the user.
-  - Explored memory: terrain you've seen stays revealed (needs
-    persistent per-team explored state + update timing).
   - Possible later: per-channel auto-routing; richer corpse-snapshot
     introspection (status/vars not exposed today).
 
