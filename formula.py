@@ -1480,6 +1480,16 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     # formula reference its zone generically: `zone_get(zone_name,
     # "gas.dmg")`, `zone_shift(zone_name, 1, 0)`.
     "zone_name",
+    # Visibility binding. Bound during entity_visibility_condition
+    # evaluation (Match.entity_visible_to) to the requesting channel's
+    # POV team — the string team name a player channel renders from.
+    # None when the view is omniscient (a host channel), though the
+    # omniscient case short-circuits before the formula runs, so a
+    # visibility formula in practice always sees a concrete team string.
+    # `self` is the entity whose visibility is being tested. Lets a GM
+    # write "hidden unless an ally sees it": `not status_has(self,
+    # "invisible") or is_part_of_team(self, pov_team)`.
+    "pov_team",
 )
 
 # Entity-id sentinel identifiers. Inside `entity[X]` these get

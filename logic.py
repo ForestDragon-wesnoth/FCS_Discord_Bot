@@ -658,6 +658,41 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "info like `{?death_cause?}slain by {death_cause}{/?}`."
         ),
     },
+    # ---- Visibility / per-channel POV -----------------------------------
+    # A formula EXPRESSION evaluated once per entity when a render is asked
+    # for from a non-omniscient (team) point of view. Returns truthy ->
+    # the entity is VISIBLE to that POV; falsy -> hidden (dropped from the
+    # map glyph layer and the !state/!list entity rosters for that
+    # channel). Default "" means "no visibility rule" — every entity is
+    # always visible, so behavior is unchanged until a GM opts in.
+    #
+    # Bindings: `self` = the entity under test; `pov_team` = the viewing
+    # channel's team (a string). Omniscient views (host channels, and
+    # `!state full` / `!map full`) SKIP this formula entirely and show
+    # everything, so the formula only ever runs with a concrete team.
+    #
+    # The engine hardcodes no notion of "invisible" or "stealth" — those
+    # live in entity data + this formula. Typical patterns:
+    #   "is_part_of_team(self, pov_team) or not status_has(self, 'hidden')"
+    #     — your own team is always visible; others hide while 'hidden'.
+    #   "not status_has(self, 'invisible')"
+    #     — a flat stealth flag, same for every team.
+    # A malformed formula is treated as VISIBLE, so a GM typo reveals
+    # rather than blanking the whole board.
+    "entity_visibility_condition": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "Formula expression deciding whether an entity is visible to "
+            "a team POV (a player channel). Truthy = visible, falsy = "
+            "hidden. Bindings: self = the entity, pov_team = the viewing "
+            "team. Empty (default) = everything visible. Omniscient views "
+            "(host channels / !state full / !map full) bypass it. "
+            "Malformed formula = treated as visible. Example: "
+            "\"is_part_of_team(self, pov_team) or not status_has(self, "
+            "'hidden')\"."
+        ),
+    },
     # ---- Action system --------------------------------------------------
     # Actions are GM-defined effect bundles stored under entity.vars at any
     # path ending in `.actions.<name>`. Each action is a dict with `body`
@@ -3854,19 +3889,71 @@ class Match:
 
     # ---- channel binding ---------------------------------------------
     def bind_channel(self, channel_key: str,
-                     label: Optional[str] = None) -> bool:
+                     label: Optional[str] = None,
+                     pov: Optional[str] = None) -> bool:
         """Bind a channel to this match. Returns True if newly bound,
-        False if it was already bound (label still updated). The caller
-        (command layer) is responsible for keeping MatchManager's
-        active_by_channel pointer in sync."""
+        False if it was already bound (label/pov still updated). The
+        caller (command layer) keeps MatchManager's active_by_channel
+        pointer in sync.
+
+        `pov` sets the channel's point-of-view team for visibility
+        filtering: a team string restricts the channel to that team's
+        view; the literal "omniscient" (or "") CLEARS the POV back to
+        the omniscient default (sees everything). None leaves any
+        existing POV untouched (so a plain re-bind doesn't reset it)."""
         if not isinstance(channel_key, str) or not channel_key:
             raise VTTError("channel key must be a non-empty string.")
         newly = channel_key not in self.bound_channels
         meta = self.bound_channels.get(channel_key, {})
         if label is not None:
             meta["label"] = label
+        if pov is not None:
+            if pov == "" or pov == "omniscient":
+                meta.pop("pov", None)
+            else:
+                meta["pov"] = pov
         self.bound_channels[channel_key] = meta
         return newly
+
+    def channel_pov(self, channel_key: str) -> Optional[str]:
+        """The point-of-view team for a channel, or None for an
+        omniscient view (channel unbound, no POV set, or POV explicitly
+        'omniscient'). None is the signal to render/list everything
+        without consulting the visibility formula."""
+        meta = self.bound_channels.get(channel_key)
+        if not isinstance(meta, dict):
+            return None
+        pov = meta.get("pov")
+        if not pov or pov == "omniscient":
+            return None
+        return str(pov)
+
+    def entity_visible_to(self, eid: str, pov_team: Optional[str]) -> bool:
+        """Whether entity `eid` is visible to a viewer whose POV is
+        `pov_team`. An omniscient viewer (pov_team is None) sees
+        everything. Otherwise the entity_visibility_condition formula is
+        evaluated with `self`=the entity and `pov_team` bound; truthy =
+        visible. An empty rule (the default) means every entity is
+        visible. A malformed formula is treated as visible so a GM typo
+        reveals rather than blanking the board."""
+        if pov_team is None:
+            return True
+        if eid not in self.entities:
+            return False
+        cond = str(self.rules.get("entity_visibility_condition", "")).strip()
+        if not cond:
+            return True
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        engine = FormulaEngine(self)
+        ctx = EvalCtx(this=self.current_entity_id(), target=eid,
+                      extras={"pov_team": pov_team})
+        try:
+            return bool(engine.eval_expression(cond, ctx))
+        except FormulaError:
+            # GM bug in the condition; reveal rather than blank the whole
+            # board (same "malformed -> benign default" stance as the
+            # death-condition evaluator).
+            return True
 
     def unbind_channel(self, channel_key: str) -> bool:
         """Unbind a channel. Returns False if it wasn't bound."""
@@ -6470,7 +6557,13 @@ class Match:
         return m
 
     # ------------- simple ASCII render for quick debugging -------------
-    def render_ascii(self) -> str:
+    def render_ascii(self, pov_team: Optional[str] = None) -> str:
+        # `pov_team` filters the ENTITY layer through the visibility rule:
+        # an entity hidden from that team isn't painted (its cell falls
+        # back to whatever tile/zone glyph is underneath, so the map
+        # doesn't betray its position). pov_team=None = omniscient (no
+        # filtering). Tile and zone layers are NOT yet POV-filtered —
+        # that's a later visibility piece.
         # Build grid with an unused 0th row/col so coordinates can be 1-based
         grid = [
             ["." for _ in range(self.grid_width + 1)]
@@ -6523,6 +6616,9 @@ class Match:
         for e in self.entities.values():
             # Keep old semantics: skip dead entities
             if not getattr(e, "is_alive", True):
+                continue
+            # POV filter: an entity hidden from this team isn't drawn.
+            if not self.entity_visible_to(e.id, pov_team):
                 continue
             if self.in_bounds(e.x, e.y):
                 sym = DIRECTION_ARROWS.get(getattr(e, "facing", ""), "@")

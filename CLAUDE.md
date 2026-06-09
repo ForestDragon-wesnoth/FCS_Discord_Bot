@@ -482,15 +482,48 @@ Recently shipped or in-flight:
     reads (`ent dump`, `find`, `map`) so players can't enumerate hidden
     entities — per match (`!host access`) or as a system default
     (`!system access`).
+- **Visibility rework — PIECE 1 (entity visibility + per-channel POV).**
+  Being built gradually; this is the first slice. Full LOS/range fog is
+  explicitly later.
+  - **Per-channel POV.** `bound_channels[ch]["pov"]` = a team string, or
+    absent/`"omniscient"` = sees all. `Match.channel_pov(ch)` returns the
+    team or None (None = omniscient = no filtering). Set via `!match bind
+    pov=<team>` / `pov=omniscient`; shown in `!match channels`. POV is
+    per-CHANNEL, not per-user (a player in red-channel sees red's view
+    regardless of who they are).
+  - **CLI preview.** `!as view <team> | omniscient | clear` sets a
+    TRANSIENT `ctx.pov_override` (CLI-only, not persisted) — the POV
+    analog of `!as host|player`. Orthogonal axis from identity (changing
+    identity doesn't touch POV). `_view_pov(ctx,m,args)` resolves:
+    `full` arg → omniscient; else ctx override; else channel binding.
+  - **The visibility primitive.** Gamerule `entity_visibility_condition`
+    (formula EXPRESSION, default "" = all visible). Evaluated per entity
+    by `Match.entity_visible_to(eid, pov_team)` with `self`=entity +
+    `pov_team` binding (added to HOOK_CONTEXT_NAMES). Truthy = visible.
+    Omniscient (None pov) or empty rule short-circuits to visible;
+    malformed formula → visible (don't blank the board on a GM typo).
+    Engine hardcodes no "invisible"/"stealth" concept — it's all in the
+    formula + entity data.
+  - **Where it filters.** `render_ascii(pov_team)` filters the ENTITY
+    glyph layer; `!list`/`!state`/`!map` filter the live-entity roster +
+    map. Tiles, zones, and CORPSES are NOT yet POV-filtered (Piece 3).
+  - **Full reveal.** `!state full` / `!map full` / `!list full` force the
+    omniscient view and are HOST-GATED via `ELEVATED_ARGS` (the inverse
+    of `READ_ONLY_SUBCOMMANDS` in `_effective_access`: a `full` first-arg
+    bumps an otherwise-`all` read up to `host`).
 
 What the user has flagged as next-on-their-mind:
 - The user repeatedly chooses the "more gamerules, fewer hardcodes"
   direction. Almost every behavior the engine performs should be
   configurable.
-- Multi-channel binding was built as the foundation for **fog of war /
-  per-team views** (a channel per team, each rendering only what that
-  team sees). The `bound_channels` label field is the hook for it; the
-  per-channel rendering is the actual unbuilt feature.
+- **Visibility rework — REMAINING pieces** (Piece 1 above shipped):
+  - Piece 2/3: tile / special-tile (trap) / zone visibility + corpse
+    visibility — parallel `*_visibility_condition` formulas filtering the
+    tile & zone glyph layers and the `!tile`/`!zone`/Dead: listings.
+  - Piece 4 (the "real" fog): line-of-sight, vision range, explored
+    memory. Hardest; explicitly deferred.
+  - Possible later: per-channel auto-routing (pushing each bound
+    channel its own POV render automatically).
 
 Look at recent PR descriptions on the repo (PRs #30 through #35)
 for context on the latest design conversations and rationale.

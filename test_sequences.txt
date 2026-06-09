@@ -9182,3 +9182,70 @@ hero 1 e` (a mutation) is held too (request `r2`). The hero does
 not move. This is the default split — a host can loosen `ent
 dump` per match with `!host access set "ent dump" all`, or
 tighten any open read for fog-of-war (see scenarios 360-361).
+
+
+SCENARIO 363 — entity visibility: invisible enemy hidden from a team POV, full-reveal host-gated
+------------------------------------------------------------------------------------------------
+
+!match new vis Vis 6 6
+!match use vis
+!system set default entity_visibility_condition "is_part_of_team(self, pov_team) or not status_has(self, 'invisible')"
+!ent add hero Hero 30 1 1 5
+!ent set_var hero team red
+!ent add brute Brute 25 3 3 6
+!ent set_var brute team blue
+!ent add sneak Sneak 20 5 5 4
+!ent set_var sneak team blue
+!ent status sneak add invisible
+!as view red
+!list
+!as view omniscient
+!list
+!as view red
+!state full
+!as player watcher
+!state full
+!list
+
+Expected: The visibility rule hides an entity that has the
+`invisible` status UNLESS the viewer is on its team. From the
+red POV (`!as view red`), `!list` shows hero (red) and brute
+(blue but not invisible) and OMITS sneak (blue + invisible).
+`!as view omniscient` lifts the filter — `!list` now shows all
+three including Sneak. Back at red POV, `!state full` is the
+host forcing the omniscient view: as the owner identity (cli)
+it runs and shows everything (Sneak included on the map and
+roster). As a player (`!as player watcher`), `!state full` is
+host-gated (the `full` flag elevates an otherwise-open read) so
+it's held for approval (request r1) rather than leaking the
+hidden enemy. watcher's plain `!list` still respects the POV
+(pov_override is a separate axis from identity, so it's still
+red) — Sneak stays hidden.
+
+
+SCENARIO 364 — per-channel POV via !match bind, shown in !match channels
+------------------------------------------------------------------------
+
+!match new vis2 Vis2 6 6
+!match use vis2
+!system set default entity_visibility_condition "not status_has(self, 'cloaked')"
+!ent add scout Scout 18 2 2 7
+!ent add ghost Ghost 14 4 4 6
+!ent status ghost add cloaked
+!match channels
+!match bind pov=red
+!match channels
+!list
+!match bind pov=omniscient
+!list
+
+Expected: A channel's POV is stored on its binding. `!match
+channels` first shows `[POV: omniscient]` (the default — a host
+channel sees all). `!match bind pov=red` sets this channel to
+the red team's view; `!match channels` now shows `[POV: red]`.
+Under that POV, `!list` hides Ghost (it has the `cloaked`
+status that the visibility rule keys on) while Scout shows.
+`!match bind pov=omniscient` clears the POV back to seeing
+everything, so `!list` shows both Scout and Ghost again. (The
+binding-based POV is the Discord path — one channel per team;
+`!as view` is the CLI preview equivalent.)
