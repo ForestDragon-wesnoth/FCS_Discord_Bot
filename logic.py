@@ -992,6 +992,24 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "!system set."
         ),
     },
+    "default_entity_vars": {
+        "default": {},
+        "schema": {"type": "dict"},
+        "desc": (
+            "Map of var-path -> default value applied to every entity at "
+            "creation (add / summon / revive — all route through "
+            "Entity.spawn), filling ONLY vars the entity doesn't already "
+            "have. Applied at the START of spawn, before vital-var "
+            "validation, so a default can even satisfy a required var "
+            "(e.g. hp). Values are typed (coerced like !ent set_var: "
+            "true/false -> bool, ints, floats, else string); dotted paths "
+            "create nested dicts. Fill-only — an entity that already has "
+            "the var keeps its value, so it's injection not enforcement. "
+            "Edit via !defvar add/remove/list, not !system set. The "
+            "intended home for things like a fog vision radius "
+            "(`!defvar add fog_vision_radius 4`)."
+        ),
+    },
     # ---- Event log (combat log) ----------------------------------------
     "event_log_enabled": {
         "default": True,
@@ -2578,6 +2596,11 @@ class Entity:
                 f"(as a live entity or a corpse — see the "
                 f"`corpse_id_uniqueness` rule)."
             )
+
+        # Fill missing vars from the system's default_entity_vars BEFORE
+        # validating vital vars — a default may legitimately supply the
+        # required hp var. Fill-only, so an explicitly-provided value wins.
+        match._apply_default_vars(self)
 
         # --- Validate vital vars against game system ---
         hp_var = match.rules.get("hp_var", "hp")
@@ -6256,6 +6279,49 @@ class Match:
         if pid not in self.global_passives:
             raise NotFound(f"Global passive '{pid}' not found in match '{self.id}'.")
         del self.global_passives[pid]
+
+    def _apply_default_vars(self, entity: "Entity") -> None:
+        """Fill `entity`'s MISSING vars from the system's
+        `default_entity_vars` rule (dotted-path -> default value). Called
+        from Entity.spawn for every creation path, at the very start —
+        before vital-var validation — so a default can satisfy a required
+        var (e.g. hp). Only sets a path the entity doesn't already have:
+        an `!ent add` value, a summon-template value, or a revive
+        snapshot's value all win over the default (injection, not
+        enforcement). The value is deep-copied so a mutable default
+        (dict/list) isn't shared across entities. Malformed paths /
+        non-dict rule are skipped silently (same convention as the other
+        spawn-time defaulters)."""
+        defaults = self.rules.get("default_entity_vars") or {}
+        if not isinstance(defaults, dict):
+            return
+        for path, value in defaults.items():
+            if not isinstance(path, str) or not path:
+                continue
+            segs = path.split(".")
+            # Walk to the parent dict, treating any non-dict encountered
+            # along the way as "absent" (don't clobber a scalar that a
+            # shorter path already placed).
+            cur = entity.vars
+            present = True
+            for seg in segs[:-1]:
+                nxt = cur.get(seg) if isinstance(cur, dict) else None
+                if not isinstance(nxt, dict):
+                    present = False
+                    break
+                cur = nxt
+            leaf = segs[-1]
+            if present and isinstance(cur, dict) and leaf in cur:
+                continue  # entity already has this var — keep it
+            # Materialize intermediate dicts, then set the leaf.
+            cur = entity.vars
+            for seg in segs[:-1]:
+                nxt = cur.get(seg)
+                if not isinstance(nxt, dict):
+                    nxt = {}
+                    cur[seg] = nxt
+                cur = nxt
+            cur[leaf] = copy.deepcopy(value)
 
     def _apply_default_passives(self, entity: "Entity") -> None:
         """Copy the system's `default_entity_passives` onto `entity`,

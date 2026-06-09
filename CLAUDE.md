@@ -536,13 +536,30 @@ What the user has flagged as next-on-their-mind:
 - The user repeatedly chooses the "more gamerules, fewer hardcodes"
   direction. Almost every behavior the engine performs should be
   configurable.
+- **`default_entity_vars` gamerule (SHIPPED — fog precursor).** Dict rule
+  (var-path -> default value) applied in `Entity.spawn` at the very start,
+  before vital-var validation, filling only MISSING vars (so an `!ent add`
+  / summon-template / revive-snapshot value always wins). A default can
+  even satisfy a required var (e.g. hp). Edited via `!defvar
+  add/remove/list` (the var analog of `!defpassive`/`!gclamp`; values
+  coerce via `_parse_scalar` like `!ent set_var`, dotted paths nest). The
+  intended home for `fog_vision_radius`.
 - **Visibility rework — REMAINING pieces** (Pieces 1 & 2 shipped):
-  - Piece 3 (the "real" fog): line-of-sight, vision range, explored
-    memory. Hardest; explicitly deferred.
-  - Possible later: per-channel auto-routing (pushing each bound
-    channel its own POV render automatically); richer corpse-snapshot
-    introspection if a GM needs corpse visibility keyed on more than
-    team/coords (the snapshot's status/vars aren't exposed today).
+  - Piece 3 — fog of war, RANGE-ONLY (next up; design locked with the
+    user). Per-entity vision-radius var (`fog_vision_radius`, defaulted
+    via `default_entity_vars`); a team sees the UNION of cells within
+    each alive member's radius (metric = `fog_range_mode`, default
+    `square_radius`). Per-match `Match.fog_enabled` (seeded from a
+    `fog_enabled_by_default` rule, toggled by `!match fog on|off`,
+    survives refresh like access_overrides). HYBRID: engine auto-applies
+    fog (paints `fog_glyph` over unseen cells + ANDs "cell seen?" into
+    every `*_visible_to` so entities/tiles/zones/corpses in fog hide
+    across map + listings) AND exposes `team_sees_cell` / `team_sees_entity`
+    / `can_see` primitives for custom formulas. Omniscient POV / `… full`
+    / fog-off bypass. LOS (opaque tiles blocking sight) and explored
+    memory are SEPARATE future pieces, explicitly out of scope.
+  - Possible later: per-channel auto-routing; richer corpse-snapshot
+    introspection (status/vars not exposed today).
 
 Look at recent PR descriptions on the repo (PRs #30 through #35)
 for context on the latest design conversations and rationale.

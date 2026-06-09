@@ -9321,3 +9321,32 @@ shows Ally (team red) but NOT Foe (team blue). As blue it's the
 reverse — Foe shows, Ally doesn't. `!as view omniscient` shows
 both corpses. (`!list full` — host-gated — would also reveal
 both from a team channel.)
+
+
+SCENARIO 367 — default_entity_vars: vars injected at creation, fill-only, removable
+-----------------------------------------------------------------------------------
+
+!match new dv DefVar 6 6
+!match use dv
+!defvar add fog_vision_radius 4
+!defvar add inventory.gold 100
+!defvar list
+!ent add hero Hero 30 2 2 5
+!ent dump hero
+!defvar remove fog_vision_radius
+!ent add rogue Rogue 25 3 3 6
+!ent dump rogue
+
+Expected: `!defvar add` records a per-game-system default var
+(value coerced like !ent set_var — `4` becomes the int 4); a
+dotted path nests (`inventory.gold` -> {gold: 100}). `!defvar
+list` shows both. Hero, created WHILE the defaults are active,
+spawns carrying fog_vision_radius=4 and inventory.gold=100 in
+addition to its explicit hp/max_hp — the defaults fill vars the
+entity didn't already have (the engine applies them at spawn,
+before vital-var validation, so a default could even supply a
+required var). After `!defvar remove fog_vision_radius`, Rogue
+(created next) does NOT get fog_vision_radius (removal stops
+future injection) but still gets inventory.gold=100. Defaults
+are injection-at-creation, not enforcement: already-spawned
+entities are untouched by a later add/remove.

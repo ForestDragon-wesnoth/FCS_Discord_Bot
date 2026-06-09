@@ -4718,6 +4718,121 @@ registry.annotate_sub(
 )
 
 
+# ---- !defvar -----------------------------------------------------------
+# Manage the game system's default_entity_vars rule: var defaults applied
+# to every entity at creation, filling only missing vars. The var analog
+# of !defpassive (default_entity_passives) / !gclamp (default_clamps);
+# same GameSystem-persist + refresh-live-matches pattern.
+@registry.command(
+    "defvar",
+    usage="!defvar <add|remove|list> ...",
+    desc=(
+        "Manage the active match's game-system `default_entity_vars` rule "
+        "— var defaults applied to EVERY entity at creation (!ent add, "
+        "summon, revive), filling only vars the entity doesn't already "
+        "have. Applied before vital-var validation, so a default can even "
+        "supply a required var like hp. The var analog of !defpassive / "
+        "!gclamp; edits persist on the GameSystem and refresh live "
+        "matches. Values coerce like !ent set_var (true/false -> bool, "
+        "then int, float, else string); dotted paths nest."
+    ),
+)
+async def defvar_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["defvar"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    sub = args[0].lower()
+
+    # Edits live on the GameSystem (persist across saves, apply to every
+    # match on this system); refresh live matches so it takes effect now.
+    sys_name = m.system_name
+    sysobj = mgr.get_system(sys_name)
+
+    def _read_vars() -> Dict[str, Any]:
+        cur = sysobj.settings.get("default_entity_vars")
+        if cur is None:
+            return dict(DEFAULT_SYSTEM_SETTINGS.get("default_entity_vars", {}))
+        return dict(cur.value or {})
+
+    def _write_vars(new_map: Dict[str, Any]) -> int:
+        sysobj.set("default_entity_vars", new_map)
+        return mgr.refresh_match_rules(sys_name)
+
+    if sub == "add":
+        # !defvar add <path> <value>  (quote a value with spaces)
+        if await return_help_if_not_enough_args(ctx, args, 3, "defvar", "add"):
+            return
+        path = args[1]
+        value = _parse_scalar(args[2])  # same coercion as !ent set_var
+        existing = _read_vars()
+        existing[path] = value
+        refreshed = _write_vars(existing)
+        return await ctx.send(
+            f"Default var `{path}` = {value!r} on system `{sys_name}` "
+            f"[refreshed {refreshed} live "
+            f"match{'es' if refreshed != 1 else ''}]. Applies to entities "
+            f"created from now on (fills only when the var is missing)."
+        )
+
+    if sub in ("remove", "del", "rm"):
+        if await return_help_if_not_enough_args(ctx, args, 2, "defvar", "remove"):
+            return
+        path = args[1]
+        existing = _read_vars()
+        if path not in existing:
+            raise NotFound(f"No default var '{path}' in system '{sys_name}'.")
+        del existing[path]
+        refreshed = _write_vars(existing)
+        return await ctx.send(
+            f"Removed default var `{path}` from system `{sys_name}` "
+            f"[refreshed {refreshed} live "
+            f"match{'es' if refreshed != 1 else ''}]. Already-spawned "
+            f"entities keep their value."
+        )
+
+    if sub == "list":
+        existing = _read_vars()
+        if not existing:
+            return await ctx.send(
+                f"System `{sys_name}` has no default entity vars."
+            )
+        lines = [f"**System `{sys_name}` default entity vars:**"]
+        for k in sorted(existing.keys()):
+            lines.append(f"- `{k}` = {existing[k]!r}")
+        return await ctx.send("\n".join(lines))
+
+    raise VTTError(f"Unknown !defvar subcommand: {sub}")
+
+
+registry.annotate_sub(
+    "defvar", "add",
+    usage="!defvar add <path> <value>",
+    desc=(
+        "Set a default var on the game system: copied onto every entity "
+        "at creation (add / summon / revive) that lacks it, before "
+        "vital-var validation. Value coerces like !ent set_var "
+        "(true/false -> bool, int, float, else string; quote for spaces). "
+        "Dotted <path> nests (e.g. inventory.gold). Re-adding overwrites "
+        "the default."
+    ),
+)
+registry.annotate_sub(
+    "defvar", "remove",
+    usage="!defvar remove <path>",
+    desc=(
+        "Remove a default var from the game system (stops filling it into "
+        "NEW entities; already-spawned entities keep their value). "
+        "Aliases: del, rm."
+    ),
+)
+registry.annotate_sub(
+    "defvar", "list",
+    usage="!defvar list",
+    desc="List the default entity vars for the active match's game system.",
+)
+
+
 # ---- !schedule ---------------------------------------------------------
 # Scheduled / delayed effects: a formula body queued to run at a future
 # round (match-level) or after a future number of one entity's turns
