@@ -9249,3 +9249,75 @@ status that the visibility rule keys on) while Scout shows.
 everything, so `!list` shows both Scout and Ghost again. (The
 binding-based POV is the Discord path — one channel per team;
 `!as view` is the CLI preview equivalent.)
+
+
+SCENARIO 365 — tile & zone visibility: hidden trap / secret region filtered from a team POV
+-------------------------------------------------------------------------------------------
+
+!match new tvis TVis 8 8
+!match use tvis
+!system set default tile_visibility_condition "not tile_has(tile_x, tile_y, 'hidden')"
+!system set default zone_visibility_condition "not zone_has(zone_name, 'secret')"
+!tile set 3 3 glyph T
+!tile set 3 3 hidden true
+!tile set 5 5 glyph V
+!zone new secret
+!zone add secret 2 2
+!zone glyph secret S
+!zone set secret secret true
+!zone new open
+!zone add open 6 6
+!zone glyph open O
+!as view red
+!tile list
+!tile info 3 3
+!zone list
+!zone info secret
+!map
+!as view omniscient
+!tile list
+!zone list
+!map
+
+Expected: With the tile rule, a tile carrying a `hidden` flag is
+invisible to a team POV; with the zone rule, a zone whose data
+has `secret` is too. As red (a player POV), `!tile list` shows
+only (5,5) — the hidden trap at (3,3) is omitted; `!tile info 3
+3` reports "no data" (it won't even confirm the trap exists);
+`!zone list` shows only `open`; `!zone info secret` reports "not
+found". On `!map`, neither the trap glyph T at (3,3) nor the
+secret zone glyph S at (2,2) is painted, but the visible tile V
+(5,5) and open zone O (6,6) are. `!as view omniscient` lifts
+the filter: `!tile list` now includes (3,3), `!zone list`
+includes `secret`, and the map paints both T and S. (Tiles and
+zones store their map glyph differently — `!tile set ... glyph`
+vs the dedicated `!zone glyph` — but both filter identically.)
+
+
+SCENARIO 366 — corpse visibility: enemy corpses hidden from a team POV
+----------------------------------------------------------------------
+
+!match new cvis CVis 6 6
+!match use cvis
+!system set default corpse_visibility_condition "corpse_team == pov_team"
+!ent add ally Ally 20 1 1 7
+!ent set_var ally team red
+!ent add foe Foe 15 4 4 5
+!ent set_var foe team blue
+!ent kill ally
+!ent kill foe
+!as view red
+!list
+!as view blue
+!list
+!as view omniscient
+!list
+
+Expected: A corpse is a stored snapshot, not a live entity, so
+the corpse rule keys on `corpse_team` (the dead entity's team at
+death) rather than `self`. Here only your own team's corpses are
+visible. After killing both, as red `!list`'s Dead: section
+shows Ally (team red) but NOT Foe (team blue). As blue it's the
+reverse — Foe shows, Ally doesn't. `!as view omniscient` shows
+both corpses. (`!list full` — host-gated — would also reveal
+both from a team channel.)
