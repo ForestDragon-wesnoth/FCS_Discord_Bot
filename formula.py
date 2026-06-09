@@ -1490,6 +1490,12 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     # write "hidden unless an ally sees it": `not status_has(self,
     # "invisible") or is_part_of_team(self, pov_team)`.
     "pov_team",
+    # Bound during corpse_visibility_condition evaluation to the dead
+    # entity's team value at death (the team_var on its snapshot; "" if
+    # none). A corpse is a stored snapshot, not a live entity, so it has
+    # no `self`/entity[X] — corpse_team + tile_x/tile_y are how a
+    # visibility formula keys on it. None outside corpse-visibility.
+    "corpse_team",
 )
 
 # Entity-id sentinel identifiers. Inside `entity[X]` these get

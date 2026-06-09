@@ -511,19 +511,38 @@ Recently shipped or in-flight:
     omniscient view and are HOST-GATED via `ELEVATED_ARGS` (the inverse
     of `READ_ONLY_SUBCOMMANDS` in `_effective_access`: a `full` first-arg
     bumps an otherwise-`all` read up to `host`).
+- **Visibility rework — PIECE 2 (tile / zone / corpse visibility).**
+  Same pattern as Piece 1, three more rules, all default "" = visible:
+  - `tile_visibility_condition` — bindings `pov_team` + `tile_x`/`tile_y`
+    (inspect via `tile_get`/`tile_has`). Filters the tile glyph layer +
+    `!tile list`/`!tile info` (a hidden tile reads as "no data", so a
+    player can't probe for a trap).
+  - `zone_visibility_condition` — bindings `pov_team` + `zone_name`.
+    Filters the zone glyph layer + `!zone list`/`info`/`cells` (hidden =
+    "not found").
+  - `corpse_visibility_condition` — a corpse is a stored SNAPSHOT, not a
+    live entity, so NO `self`/`entity[X]`. Bindings: `pov_team`,
+    `corpse_team` (the dead entity's team_var at death; new
+    HOOK_CONTEXT_NAME), `tile_x`/`tile_y`. Filters the Dead: section of
+    `!list`/`!state`.
+  - All four (incl. Piece 1's entity rule) now share
+    `Match._visibility_visible(rule_key, pov_team, target=, extras=)`.
+    Reminder asymmetry: a TILE stores its map glyph at the top level of
+    its data dict (`!tile set <x> <y> glyph <c>`), but a ZONE stores it
+    in a dedicated field set by `!zone glyph <name> <c>` (NOT `!zone
+    set ... glyph`, which writes zone DATA).
 
 What the user has flagged as next-on-their-mind:
 - The user repeatedly chooses the "more gamerules, fewer hardcodes"
   direction. Almost every behavior the engine performs should be
   configurable.
-- **Visibility rework — REMAINING pieces** (Piece 1 above shipped):
-  - Piece 2/3: tile / special-tile (trap) / zone visibility + corpse
-    visibility — parallel `*_visibility_condition` formulas filtering the
-    tile & zone glyph layers and the `!tile`/`!zone`/Dead: listings.
-  - Piece 4 (the "real" fog): line-of-sight, vision range, explored
+- **Visibility rework — REMAINING pieces** (Pieces 1 & 2 shipped):
+  - Piece 3 (the "real" fog): line-of-sight, vision range, explored
     memory. Hardest; explicitly deferred.
   - Possible later: per-channel auto-routing (pushing each bound
-    channel its own POV render automatically).
+    channel its own POV render automatically); richer corpse-snapshot
+    introspection if a GM needs corpse visibility keyed on more than
+    team/coords (the snapshot's status/vars aren't exposed today).
 
 Look at recent PR descriptions on the repo (PRs #30 through #35)
 for context on the latest design conversations and rationale.

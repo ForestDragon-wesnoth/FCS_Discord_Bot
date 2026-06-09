@@ -3076,8 +3076,8 @@ async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     active_id = m.turn_order[m.active_index] if m.turn_order else None
     lines: List[str] = []
     # Filter out entities hidden from this POV (omniscient pov=None keeps
-    # all). Corpses (the Dead: section below) are NOT yet POV-filtered —
-    # a later visibility piece covers tile-stored data.
+    # all). Corpses (the Dead: section below) are filtered too, via
+    # corpse_visible_to.
     visible = [e for e in es if m.entity_visible_to(e.id, pov)]
     if visible:
         lines.append("Entities:")
@@ -3091,7 +3091,8 @@ async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # Gated by show_corpses_in_entity_list — when false we silently
     # omit the section (corpses still exist in tile data).
     if bool(m.rules.get("show_corpses_in_entity_list", True)):
-        corpses = m.all_corpses()
+        corpses = [(x, y, eid, c) for (x, y, eid, c) in m.all_corpses()
+                   if m.corpse_visible_to(eid, c, x, y, pov)]
         if corpses:
             if lines:
                 lines.append("")  # blank line separates living from dead
@@ -5035,7 +5036,12 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "tile", "info"):
             return
         x, y = _parse_xy(args)
-        if (x, y) not in m.tiles:
+        # A tile hidden from this channel's POV reads as "no data" — we
+        # don't even confirm it exists, so a player can't probe for a
+        # hidden trap. `!tile info` carries no `full` flag; a host views
+        # from an omniscient channel (or `!as view omniscient`).
+        pov = _view_pov(ctx, m, args)
+        if (x, y) not in m.tiles or not m.tile_visible_to(x, y, pov):
             return await ctx.send(f"tile ({x},{y}): no data.")
         data = m.tiles[(x, y)]
         return await ctx.send(
@@ -5044,13 +5050,18 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
     # ---- list ----
     if sub == "list":
-        if not m.tiles:
+        # POV-filtered: hidden tiles are omitted entirely (no enumeration
+        # of hidden traps from a player channel).
+        pov = _view_pov(ctx, m, args)
+        coords = [(x, y) for (x, y) in sorted(m.tiles.keys())
+                  if m.tile_visible_to(x, y, pov)]
+        if not coords:
             return await ctx.send("No special tiles in this match.")
         # Compact one-line summary per tile: list top-level feature
         # keys so the GM sees at a glance what's where. Use !tile info
         # for the full nested dump.
         lines = ["**Special tiles:**"]
-        for (x, y) in sorted(m.tiles.keys()):
+        for (x, y) in coords:
             features = ", ".join(sorted(m.tiles[(x, y)].keys()))
             lines.append(f"- ({x},{y}): {features}")
         return await ctx.send("\n".join(lines))
@@ -5978,6 +5989,10 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 2, "zone", "cells"):
             return
         name = args[1]
+        # A zone hidden from this POV reads as absent (don't reveal a
+        # secret region exists to a player channel).
+        if not m.zone_visible_to(name, _view_pov(ctx, m, args)):
+            return await ctx.send(f"zone `{name}`: not found.")
         try:
             cells = m.zone_cell_list(name)
         except NotFound as ex:
@@ -5995,7 +6010,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         name = args[1]
         z = m.zones.get(name)
-        if z is None:
+        if z is None or not m.zone_visible_to(name, _view_pov(ctx, m, args)):
             return await ctx.send(f"zone `{name}`: not found.")
         cells = m.zone_cell_list(name)
         view = {
@@ -6012,10 +6027,12 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
     # ---- list ----
     if sub == "list":
-        if not m.zones:
+        pov = _view_pov(ctx, m, args)
+        names = [n for n in sorted(m.zones.keys()) if m.zone_visible_to(n, pov)]
+        if not names:
             return await ctx.send("No zones in this match.")
         lines = ["**Zones:**"]
-        for name in sorted(m.zones.keys()):
+        for name in names:
             z = m.zones[name]
             n = len(z.get("cells") or ())
             hooks = sorted((z.get("hooks") or {}).keys())

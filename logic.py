@@ -693,6 +693,71 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "'hidden')\"."
         ),
     },
+    # Per-tile visibility (hidden traps, secret doors, etc.). Same shape
+    # as entity_visibility_condition but for the TILE glyph layer + the
+    # !tile list/info/cells listings. Bindings: pov_team = the viewing
+    # team, tile_x / tile_y = the tile's coordinates (use tile_get /
+    # tile_has(tile_x, tile_y, "path") to inspect its data). No `self`
+    # (a tile isn't an entity). Empty (default) = every tile visible.
+    # Example — a trap stays hidden until the team has detected it (the
+    # GM stores a per-team flag on the tile):
+    #   "not tile_has(tile_x, tile_y, 'trap') or
+    #    tile_has(tile_x, tile_y, 'detected.' + pov_team)"
+    "tile_visibility_condition": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "Formula expression deciding whether a TILE (its glyph on the "
+            "map and its !tile list/info/cells rows) is visible to a team "
+            "POV. Truthy = visible. Bindings: pov_team = viewing team, "
+            "tile_x / tile_y = the tile coords (inspect data via "
+            "tile_get/tile_has(tile_x, tile_y, ...)). Empty (default) = "
+            "all tiles visible. Omniscient views / full reveals bypass "
+            "it. Malformed = treated as visible. Example: \"not "
+            "tile_has(tile_x, tile_y, 'trap') or tile_has(tile_x, "
+            "tile_y, 'detected.' + pov_team)\"."
+        ),
+    },
+    # Per-zone visibility (hidden regions: an unseen gas cloud, a secret
+    # room). Filters the ZONE glyph layer + the !zone listings. Bindings:
+    # pov_team = viewing team, zone_name = the zone (inspect via
+    # zone_get/zone_has(zone_name, "path")). No `self`. Empty (default) =
+    # every zone visible.
+    "zone_visibility_condition": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "Formula expression deciding whether a ZONE (its glyph on the "
+            "map and its !zone listing rows) is visible to a team POV. "
+            "Truthy = visible. Bindings: pov_team = viewing team, "
+            "zone_name = the zone (inspect via zone_get/zone_has("
+            "zone_name, ...)). Empty (default) = all zones visible. "
+            "Omniscient / full reveals bypass it. Malformed = visible."
+        ),
+    },
+    # Per-corpse visibility (the Dead: section of !list / !state). A
+    # corpse is a STORED SNAPSHOT, not a live entity, so the formula
+    # can't bind `self` or read entity[X] vars; instead it gets the dead
+    # entity's team plus the corpse coords. Bindings: pov_team = viewing
+    # team, corpse_team = the dead entity's team value (the team_var on
+    # its death snapshot; "" if none), tile_x / tile_y = the corpse's
+    # tile. Empty (default) = all corpses visible. Example — only your
+    # own team's corpses show: "corpse_team == pov_team".
+    "corpse_visibility_condition": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "Formula expression deciding whether a CORPSE row (Dead: "
+            "section of !list/!state) is visible to a team POV. Truthy = "
+            "visible. Bindings: pov_team = viewing team, corpse_team = "
+            "the dead entity's team at death (\"\" if none), tile_x / "
+            "tile_y = the corpse tile. (A corpse is a snapshot, not a "
+            "live entity — entity[X]/self are NOT available; key off "
+            "corpse_team / coords.) Empty (default) = all corpses "
+            "visible. Omniscient / full reveals bypass it. Malformed = "
+            "visible. Example: \"corpse_team == pov_team\"."
+        ),
+    },
     # ---- Action system --------------------------------------------------
     # Actions are GM-defined effect bundles stored under entity.vars at any
     # path ending in `.actions.<name>`. Each action is a dict with `body`
@@ -3928,32 +3993,80 @@ class Match:
             return None
         return str(pov)
 
+    def _visibility_visible(self, rule_key: str, pov_team: Optional[str], *,
+                            target: Optional[str] = None,
+                            extras: Optional[Dict[str, Any]] = None) -> bool:
+        """Shared evaluator behind the *_visibility_condition rules
+        (entity / tile / zone / corpse). An omniscient viewer (pov_team
+        is None) sees everything; an empty rule means visible; a
+        malformed formula is treated as visible (reveal rather than blank
+        the board on a GM typo — same stance as the death-condition
+        evaluator). `extras` supplies the per-kind bindings; pov_team is
+        added automatically. `target` binds `self` (only entities have
+        one; tiles/zones/corpses pass None)."""
+        if pov_team is None:
+            return True
+        cond = str(self.rules.get(rule_key, "")).strip()
+        if not cond:
+            return True
+        ex = dict(extras or {})
+        ex["pov_team"] = pov_team
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        engine = FormulaEngine(self)
+        ctx = EvalCtx(this=self.current_entity_id(), target=target, extras=ex)
+        try:
+            return bool(engine.eval_expression(cond, ctx))
+        except FormulaError:
+            return True
+
     def entity_visible_to(self, eid: str, pov_team: Optional[str]) -> bool:
         """Whether entity `eid` is visible to a viewer whose POV is
-        `pov_team`. An omniscient viewer (pov_team is None) sees
-        everything. Otherwise the entity_visibility_condition formula is
-        evaluated with `self`=the entity and `pov_team` bound; truthy =
-        visible. An empty rule (the default) means every entity is
-        visible. A malformed formula is treated as visible so a GM typo
-        reveals rather than blanking the board."""
+        `pov_team` (None = omniscient = always visible). Evaluates
+        entity_visibility_condition with `self`=the entity and `pov_team`
+        bound; empty rule / malformed = visible."""
         if pov_team is None:
             return True
         if eid not in self.entities:
             return False
-        cond = str(self.rules.get("entity_visibility_condition", "")).strip()
-        if not cond:
+        return self._visibility_visible(
+            "entity_visibility_condition", pov_team, target=eid)
+
+    def tile_visible_to(self, x: int, y: int, pov_team: Optional[str]) -> bool:
+        """Whether the tile at (x, y) — its map glyph and its !tile
+        list/info/cells rows — is visible to `pov_team`. Binds tile_x /
+        tile_y (inspect data via tile_get/tile_has). See
+        tile_visibility_condition."""
+        return self._visibility_visible(
+            "tile_visibility_condition", pov_team,
+            extras={"tile_x": x, "tile_y": y})
+
+    def zone_visible_to(self, name: str, pov_team: Optional[str]) -> bool:
+        """Whether zone `name` — its map glyph and its !zone listing row
+        — is visible to `pov_team`. Binds zone_name (inspect via
+        zone_get/zone_has). See zone_visibility_condition."""
+        return self._visibility_visible(
+            "zone_visibility_condition", pov_team,
+            extras={"zone_name": name})
+
+    def corpse_visible_to(self, eid: str, corpse: Dict[str, Any],
+                          x: int, y: int, pov_team: Optional[str]) -> bool:
+        """Whether a corpse (Dead: row) is visible to `pov_team`. A
+        corpse is a stored snapshot, not a live entity, so the formula
+        gets corpse_team (the dead entity's team_var value at death) +
+        tile_x / tile_y rather than `self`. See
+        corpse_visibility_condition."""
+        if pov_team is None:
             return True
-        from formula import FormulaEngine, EvalCtx, FormulaError
-        engine = FormulaEngine(self)
-        ctx = EvalCtx(this=self.current_entity_id(), target=eid,
-                      extras={"pov_team": pov_team})
-        try:
-            return bool(engine.eval_expression(cond, ctx))
-        except FormulaError:
-            # GM bug in the condition; reveal rather than blank the whole
-            # board (same "malformed -> benign default" stance as the
-            # death-condition evaluator).
-            return True
+        team_var = str(self.rules.get("team_var", "team"))
+        corpse_team = ""
+        ent = corpse.get("entity") if isinstance(corpse, dict) else None
+        if isinstance(ent, dict):
+            cv = ent.get("vars", {})
+            if isinstance(cv, dict):
+                corpse_team = str(cv.get(team_var, "") or "")
+        return self._visibility_visible(
+            "corpse_visibility_condition", pov_team,
+            extras={"corpse_team": corpse_team, "tile_x": x, "tile_y": y})
 
     def unbind_channel(self, channel_key: str) -> bool:
         """Unbind a channel. Returns False if it wasn't bound."""
@@ -6558,12 +6671,11 @@ class Match:
 
     # ------------- simple ASCII render for quick debugging -------------
     def render_ascii(self, pov_team: Optional[str] = None) -> str:
-        # `pov_team` filters the ENTITY layer through the visibility rule:
-        # an entity hidden from that team isn't painted (its cell falls
-        # back to whatever tile/zone glyph is underneath, so the map
-        # doesn't betray its position). pov_team=None = omniscient (no
-        # filtering). Tile and zone layers are NOT yet POV-filtered —
-        # that's a later visibility piece.
+        # `pov_team` filters EVERY layer through its visibility rule: a
+        # zone / tile / entity hidden from that team isn't painted (its
+        # cell falls back to whatever layer is visible underneath, so the
+        # map doesn't betray a hidden feature's position). pov_team=None
+        # = omniscient (no filtering).
         # Build grid with an unused 0th row/col so coordinates can be 1-based
         grid = [
             ["." for _ in range(self.grid_width + 1)]
@@ -6575,9 +6687,11 @@ class Match:
         # wins). Tiles, then entities, render on top, so a zone glyph
         # shows only where no tile glyph or entity sits. Lets a gas-cloud
         # zone be visible on the map without per-cell tile setup.
-        for z in self.zones.values():
+        for zname, z in self.zones.items():
             g = z.get("glyph")
             if not (isinstance(g, str) and len(g) == 1):
+                continue
+            if not self.zone_visible_to(zname, pov_team):
                 continue
             for (zx, zy) in z.get("cells", ()):
                 if self.in_bounds(zx, zy):
@@ -6590,6 +6704,8 @@ class Match:
         # rather than a column-misaligning multi-character cell.
         for (tx, ty), data in self.tiles.items():
             if not self.in_bounds(tx, ty):
+                continue
+            if not self.tile_visible_to(tx, ty, pov_team):
                 continue
             # Instance glyph wins; if the instance has no glyph but
             # comes from a template that does, use the template's.
