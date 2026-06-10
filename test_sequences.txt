@@ -9479,3 +9479,70 @@ under 'terrain' mode it drops out of `!list` (you remember the
 ground, not where the enemy went). Under 'full' mode (scenario
 370's default) the enemy would have stayed; 'terrain' is the
 classic fog-of-war behavior.
+
+
+SCENARIO 372 — impassable tiles: system rule, conditional bypass, per-tile override, mode toggle
+------------------------------------------------------------------------------------------------
+
+!match new wb WB 8 8
+!match use wb
+!defvar add flying false
+!defvar add ghost false
+!ent add hero Hero 30 3 3 9
+!tile set 4 3 wall solid
+!tile set 3 4 wall short
+!system set default tile_block_condition "tile_get(tile_x,tile_y,'wall') == 'solid' or (tile_get(tile_x,tile_y,'wall') == 'short' and not entity[self].flying)"
+!ent move hero right
+!ent move hero down
+!ent set_var hero flying true
+!ent move hero down
+!ent tp hero 5 3
+!tile set 6 3 block "not entity[self].ghost"
+!ent move hero right
+!system set default block_walk false
+!ent move hero right
+
+Expected: tile_block_condition makes a 'solid' wall impassable to
+everyone and a 'short' wall impassable unless entity[self].flying.
+Hero at (3,3): moving right onto the solid wall at (4,3) is
+refused ("Cell (4,3) blocks `hero`") — Hero stays put. Moving
+down onto the short wall at (3,4) is refused too (Hero isn't
+flying). After `!ent set_var hero flying true`, moving down onto
+(3,4) succeeds (flying bypasses short walls). Hero tps to (5,3);
+tile (6,3) gets its OWN `block` formula "not entity[self].ghost"
+which OVERRIDES the system rule for that cell — moving right is
+refused (Hero isn't a ghost). Setting block_walk False disables
+walk blocking entirely, so the final move right phases onto
+(6,3). (Both flying/ghost are given defaults via !defvar so the
+formula's var reads always resolve; a missing var would fail the
+formula open = not blocking.)
+
+
+SCENARIO 373 — zone blocking (all-or-nothing walk), push knockback-stop, tp mode toggle
+---------------------------------------------------------------------------------------
+
+!match new zb ZB 8 8
+!match use zb
+!defvar add ghost false
+!ent add hero Hero 30 2 2 9
+!zone add barrier 2 4
+!zone set barrier block "not entity[self].ghost"
+!ent move hero 2 down
+!tile set 5 5 wall solid
+!system set default tile_block_condition "tile_get(tile_x,tile_y,'wall') == 'solid'"
+!ent tp hero 5 2
+!ent push hero down 5
+!ent tp hero 5 5
+!system set default block_tp false
+!ent tp hero 5 5
+
+Expected: Zone `barrier` covers (2,4) and blocks non-ghosts via
+its `block` data field (zone_block_condition's per-zone
+override). Hero at (2,2) walking down 2 would cross (2,4); the
+blocked cell aborts the WHOLE walk (all-or-nothing), so Hero
+stays at (2,2). A solid wall is set at (5,5). Hero tps to (5,2)
+and is pushed down 5: the push stops at (5,4), the cell before
+the wall (knockback into a wall) — Hero ends at (5,4), 2 cells
+moved. Teleporting onto the wall at (5,5) is refused while
+block_tp is on. After `!system set default block_tp false`, the
+same tp phases Hero onto (5,5) (teleports ignore blocking).

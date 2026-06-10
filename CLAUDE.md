@@ -398,6 +398,24 @@ Recently shipped or in-flight:
 - `!history diff` between snapshots
 - `!find` with predicate prefixes (status:, group:, action:)
 - Push/swap/step movement primitives + `on_entity_step` hook
+- **Movement blocking (impassable tiles / zones) — SHIPPED.** A cell blocks
+  a mover when its tile OR any covering zone evaluates a block condition
+  truthy for that entity. Conditions are formula EXPRESSIONS (NOT action
+  mode — read mover vars via `entity[self].flying`, not `self.flying`) so
+  blocking is conditional ("short wall blocks unless flying"). Resolution
+  mirrors glyph layering: a tile's own `block` data field > its template's
+  `block` > the `tile_block_condition` rule; zones use the zone's `block`
+  data > `zone_block_condition`. A block value is a formula string OR a bare
+  bool/number (`block=true` = always impassable). Fail-OPEN: a malformed
+  formula — or one reading a var the mover lacks — does NOT block (give
+  gating vars a default via `!defvar` so reads resolve). Hooked into every
+  movement verb (`Entity.tp`, `Entity.move_dirs` via a new `block_mode`
+  param, `push_entity`/`pull_entity` prefix-walk, `swap_entities`); the raw
+  `move_to` primitive and spawn/summon are never gated. Per-kind toggles:
+  `block_walk`/`block_tp`/`block_push`/`block_swap` rules (all default True;
+  walk/tp/swap RAISE `Blocked`, push/pull stop at the cell before the wall).
+  Core helpers: `Match.cell_blocks(mover, x, y)` (raw geometry) +
+  `_check_block(mover, x, y, mode)` (consults the block_<mode> rule).
 - Action system (full body language with cmd/fail/source/target/args,
   transactional rollback, target types entity/location/entity_list/
   location_list/none/corpse/corpse_list, recursion limit, allowlist,

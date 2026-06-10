@@ -21,6 +21,9 @@ class OutOfBounds(VTTError):
 class Occupied(VTTError):
     pass
 
+class Blocked(VTTError):
+    pass
+
 class NotFound(VTTError):
     pass
 
@@ -428,6 +431,92 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "collapse to the nearest cardinal. Independent of "
             "allow_diagonal_movement — you can have diagonal facing without "
             "diagonal movement, or vice versa."
+        ),
+    },
+    # ---- Movement blocking (impassable tiles / zones) ----
+    # An entity attempting to enter a cell is BLOCKED when the tile or any
+    # zone covering that cell evaluates its block condition truthy for that
+    # mover. Conditions are formula EXPRESSIONS with `entity[self]` = the
+    # moving entity, so blocking can be conditional ("a short wall blocks
+    # unless entity[self].flying; an indoor wall blocks unless
+    # entity[self].ghost"). Resolution per cell: the tile's own `block`
+    # data field wins, else its template's `block`, else the
+    # tile_block_condition rule (the same instance > template > system
+    # layering as a tile glyph). Zones: the zone's `block` data field,
+    # else zone_block_condition. A block value may be a formula STRING
+    # (evaluated) or a bare bool/number (true = always impassable). A
+    # malformed formula — OR one reading a var the mover lacks — fails
+    # OPEN (does NOT block) so a GM typo can't soft-lock the board; give
+    # the gating vars a default via default_entity_vars (!defvar) so the
+    # read always resolves. Empty = nothing blocks (default).
+    "tile_block_condition": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "Default formula deciding whether a TILE blocks an entity from "
+            "entering its cell. Bindings: tile_x / tile_y (read the tile's "
+            "data via tile_get/tile_has) and entity[self] = the moving "
+            "entity (read its vars, e.g. entity[self].flying — define the "
+            "var via !defvar so the read resolves). Truthy = blocked. This "
+            "is the fallback; a tile's own `block` data field (or its "
+            "template's) overrides it per cell — set with `!tile set <x> "
+            "<y> block \"<formula>\"`. Empty = tiles never block. Malformed "
+            "formula = treated as not blocking. Which MOVEMENT kinds honor "
+            "blocking is set by the block_walk / block_tp / block_push / "
+            "block_swap rules (all default True)."
+        ),
+    },
+    "zone_block_condition": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "Default formula deciding whether a ZONE blocks an entity from "
+            "entering any of its cells. Bindings: zone_name and entity[self] "
+            "= the moving entity. Truthy = blocked. A zone's own `block` "
+            "data field overrides it (`!zone set <name> block \"<formula>\"`). "
+            "Empty = zones never block. Malformed = not blocking. A cell is "
+            "blocked if its tile OR any covering zone blocks the mover."
+        ),
+    },
+    # Which movement kinds honor tile/zone blocking. Each defaults True
+    # (block everything); set a kind False to let it phase through walls
+    # (e.g. block_tp=False lets teleports ignore blocking). The low-level
+    # move_to primitive (raw force placement from actions) and
+    # spawn/summon are never gated by these.
+    "block_walk": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether stepwise walking (!ent move) honors tile/zone "
+            "blocking. A walk whose path crosses a blocked cell is "
+            "refused entirely (all-or-nothing, like hitting an occupied "
+            "cell). Set False to let walking ignore blocking."
+        ),
+    },
+    "block_tp": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether teleport (!ent tp) honors tile/zone blocking. Set "
+            "False to let teleports phase through / onto walls."
+        ),
+    },
+    "block_push": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether forced movement (push / pull) honors tile/zone "
+            "blocking — a pushed entity stops at the cell before a blocked "
+            "one (knockback into a wall). Set False to shove through."
+        ),
+    },
+    "block_swap": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether !ent swap honors tile/zone blocking — a swap is "
+            "refused if either entity would land on a cell that blocks it. "
+            "Set False to allow swapping into otherwise-blocked cells."
         ),
     },
     # ---- UI / display templates ----
@@ -2798,6 +2887,8 @@ class Entity:
         # enters a cell containing a non-stackable resident.
         if not self.is_cell_stackable and m.is_occupied(x, y, ignore_entity_id=self.id):
             raise Occupied(f"Cell ({x},{y}) already occupied")
+        if m._check_block(self.id, x, y, "tp"):
+            raise Blocked(f"Cell ({x},{y}) blocks `{self.id}`")
         log: List[str] = []
         old_x, old_y = self.x, self.y
         if fire_hooks and (old_x, old_y) != (x, y):
@@ -2829,7 +2920,8 @@ class Entity:
 
     # Stepwise move (final cell must be free; rotate per step)
     def move_dirs(self, moves: list[tuple[str, int]], *,
-                  fire_hooks: bool = True) -> List[str]:
+                  fire_hooks: bool = True,
+                  block_mode: Optional[str] = "walk") -> List[str]:
         """Walk through `moves` step by step.
 
         Tile hooks fire per intermediate cell — on_exit at the cell
@@ -2879,6 +2971,12 @@ class Entity:
                 nx, ny = x + dx, y + dy
                 if not m.in_bounds(nx, ny):
                     raise OutOfBounds(f"({nx},{ny}) outside {m.grid_width}x{m.grid_height}")
+                # A blocked cell ANYWHERE on the path fails the whole walk
+                # (all-or-nothing, like an occupied final cell). block_mode
+                # None skips this — callers that pre-validated the path
+                # (push/pull) pass None to avoid re-checking.
+                if block_mode is not None and m._check_block(self.id, nx, ny, block_mode):
+                    raise Blocked(f"Cell ({nx},{ny}) blocks `{self.id}`")
                 step_path.append((nx, ny, step_facing))
                 x, y = nx, ny
         # Stackable movers skip the final-cell occupancy check (see
@@ -4573,6 +4671,84 @@ class Match:
                 return True
         return False
 
+    # ---- movement blocking (impassable tiles / zones) ----------------
+    # A cell blocks a mover when its tile OR any covering zone evaluates a
+    # block condition truthy for that entity. Tile spec resolution mirrors
+    # the glyph layering: instance `block` data > template `block` data >
+    # the tile_block_condition rule. Zone: the zone's `block` data > the
+    # zone_block_condition rule. A spec is a formula STRING (evaluated with
+    # `self`=mover + tile_x/tile_y or zone_name) or a bare bool/number.
+
+    def _tile_block_spec(self, x: int, y: int) -> Any:
+        """The block spec governing the tile at (x, y): the instance's
+        `block` data, else its template's `block`, else the
+        tile_block_condition rule. Returns "" when nothing applies."""
+        cell = self.tiles.get((x, y))
+        if cell is not None:
+            inst = cell.get("block")
+            if inst not in (None, ""):
+                return inst
+            tpl_name = cell.get("_template")
+            if isinstance(tpl_name, str):
+                tpl = self.tile_templates.get(tpl_name)
+                if tpl is not None:
+                    t_block = tpl.data.get("block")
+                    if t_block not in (None, ""):
+                        return t_block
+        return self.rules.get("tile_block_condition", "")
+
+    def _eval_block_spec(self, spec: Any, mover_id: str,
+                         extras: Dict[str, Any]) -> bool:
+        """Evaluate a block spec for `mover_id`. bool/number specs are used
+        directly; a string is run as a formula with `self`=the mover plus
+        `extras` bindings. Empty/None = not blocking. A malformed formula
+        FAILS OPEN (returns False) so a GM typo can't trap units in place —
+        same fail-toward-permissive stance as the visibility rules."""
+        if spec is None:
+            return False
+        if isinstance(spec, bool):
+            return spec
+        if isinstance(spec, (int, float)):
+            return bool(spec)
+        cond = str(spec).strip()
+        if not cond:
+            return False
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        engine = FormulaEngine(self)
+        ctx = EvalCtx(this=self.current_entity_id(), target=mover_id,
+                      extras=dict(extras))
+        try:
+            return bool(engine.eval_expression(cond, ctx))
+        except FormulaError:
+            return False
+
+    def cell_blocks(self, mover_id: str, x: int, y: int) -> bool:
+        """True iff the tile or any zone covering (x, y) blocks `mover_id`
+        from entering. The raw geometry query — does NOT consult the
+        block_* movement-mode rules (use _check_block for that)."""
+        if self._eval_block_spec(
+                self._tile_block_spec(x, y), mover_id,
+                {"tile_x": x, "tile_y": y}):
+            return True
+        for name, z in self.zones.items():
+            cells = z.get("cells", ())
+            if (x, y) not in cells:
+                continue
+            zspec = (z.get("data") or {}).get("block")
+            if zspec in (None, ""):
+                zspec = self.rules.get("zone_block_condition", "")
+            if self._eval_block_spec(zspec, mover_id, {"zone_name": name}):
+                return True
+        return False
+
+    def _check_block(self, mover_id: str, x: int, y: int, mode: str) -> bool:
+        """Whether a movement of kind `mode` ('walk'/'tp'/'push'/'swap')
+        onto (x, y) is blocked for `mover_id` — i.e. the matching block_<mode>
+        rule is on AND the cell blocks the mover."""
+        if not self.rules.get(f"block_{mode}", True):
+            return False
+        return self.cell_blocks(mover_id, x, y)
+
     def push_entity(self, eid: str, direction: str, n: int = 1) -> Tuple[int, List[str]]:
         """Forced movement: step `eid` up to `n` cells in `direction`,
         stopping at the first blocked cell (off-grid, or — for a non-
@@ -4620,13 +4796,19 @@ class Match:
                 break
             if not stackable and self.is_occupied(nx, ny, ignore_entity_id=e.id):
                 break
+            # A blocked cell stops the push at the cell before it (knockback
+            # into a wall) — same "stops at the first blocker" rule as
+            # occupancy above.
+            if self._check_block(e.id, nx, ny, "push"):
+                break
             x, y = nx, ny
             steps += 1
         if steps == 0:
             return 0, []
         # Delegate the actual commit to move_dirs (we've already proven
         # the path legal) so we inherit per-step hook firing for free.
-        log = e.move_dirs([(canon, steps)])
+        # block_mode=None: we already applied the push-mode block check.
+        log = e.move_dirs([(canon, steps)], block_mode=None)
         return steps, log
 
     def pull_entity(self, eid: str, tx: int, ty: int, n: int = 1) -> Tuple[int, List[str]]:
@@ -4687,11 +4869,16 @@ class Match:
                 break
             if not stackable and self.is_occupied(nx, ny, ignore_entity_id=e.id):
                 break
+            # Blocking stops the drag at the cell before a blocked one,
+            # mirroring push_entity's "stops at the first blocker" rule.
+            if self._check_block(e.id, nx, ny, "push"):
+                break
             moves.append((_VECTOR_TO_DIRECTION[(sx, sy)], 1))
             x, y = nx, ny
         if not moves:
             return 0, []
-        log = e.move_dirs(moves)
+        # block_mode=None — push-mode block already applied per step above.
+        log = e.move_dirs(moves, block_mode=None)
         return len(moves), log
 
     def swap_entities(self, a: str, b: str) -> Tuple[bool, List[str]]:
@@ -4719,6 +4906,13 @@ class Match:
         # stackable entities, but defended): nothing moves, no hooks.
         if (ax, ay) == (bx, by):
             return False, []
+        # Each partner lands on the OTHER's cell; refuse the swap if that
+        # cell blocks it (e.g. swapping a non-flyer into a wall the other
+        # was occupying). Checked before any hook fires — all-or-nothing.
+        if self._check_block(a, bx, by, "swap"):
+            raise Blocked(f"Cell ({bx},{by}) blocks `{a}`")
+        if self._check_block(b, ax, ay, "swap"):
+            raise Blocked(f"Cell ({ax},{ay}) blocks `{b}`")
         log: List[str] = []
         # Fire on_exit at CURRENT positions before any state changes, so
         # passives observe each entity still standing on its old cell.
