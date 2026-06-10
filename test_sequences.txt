@@ -9546,3 +9546,33 @@ the wall (knockback into a wall) — Hero ends at (5,4), 2 cells
 moved. Teleporting onto the wall at (5,5) is refused while
 block_tp is on. After `!system set default block_tp false`, the
 same tp phases Hero onto (5,5) (teleports ignore blocking).
+
+
+SCENARIO 374 — !map resize: anchors, content shift, block vs kill on shrink
+---------------------------------------------------------------------------
+
+!match new rs RS 4 4
+!match use rs
+!ent add hero Hero 30 1 1 9
+!tile set 2 2 glyph T
+!map resize 6 6 bottom-right
+!ent add far Far 10 6 1 9
+!map resize 3 3
+!system set default map_resize_shrink_mode kill
+!map resize 3 3
+!list
+
+Expected: The grid starts 4x4 with Hero at (1,1) and a 'T' tile
+at (2,2). `!map resize 6 6 bottom-right` grows to 6x6 anchored at
+the bottom-right, so all content shifts by the full delta (+2,+2):
+Hero is now at (3,3) and the tile at (4,4). A second entity Far is
+added at (6,1). `!map resize 3 3` (default top-left anchor, no
+shift) would cut everything past column/row 3: Far at (6,1) falls
+off-grid. With the default map_resize_shrink_mode=block the resize
+is REFUSED — it reports Far as in the way and nothing changes
+(still 6x6). After `!system set default map_resize_shrink_mode
+kill`, the same resize runs the kill function on Far and completes:
+the grid becomes 3x3, Hero (in-bounds at (3,3)) is kept, the tile
+at (4,4) is dropped (off the new grid), and Far is gone. Far's
+corpse, which sat at the now-off-grid (6,1), is dropped too, so
+the final `!list` shows only Hero.

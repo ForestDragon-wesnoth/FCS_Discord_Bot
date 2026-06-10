@@ -108,6 +108,32 @@ DIRECTION_ARROWS: Dict[str, str] = {
     "down_right": "\\",
 }
 
+# !map resize anchors: name (+ aliases) -> (horizontal, vertical) kind.
+# horizontal in {left, center, right}; vertical in {top, middle, bottom}.
+# The anchor names the corner/edge where existing content stays put; the
+# shift offset is derived from it (left/top = 0, right/bottom = full delta,
+# center/middle = half). See Match.resize_grid.
+_RESIZE_ANCHORS: Dict[str, Tuple[str, str]] = {
+    "top-left": ("left", "top"), "tl": ("left", "top"),
+    "topleft": ("left", "top"),
+    "top": ("center", "top"), "top-center": ("center", "top"),
+    "tc": ("center", "top"), "t": ("center", "top"),
+    "top-right": ("right", "top"), "tr": ("right", "top"),
+    "topright": ("right", "top"),
+    "left": ("left", "middle"), "l": ("left", "middle"),
+    "center-left": ("left", "middle"), "cl": ("left", "middle"),
+    "center": ("center", "middle"), "c": ("center", "middle"),
+    "middle": ("center", "middle"), "m": ("center", "middle"),
+    "right": ("right", "middle"), "r": ("right", "middle"),
+    "center-right": ("right", "middle"), "cr": ("right", "middle"),
+    "bottom-left": ("left", "bottom"), "bl": ("left", "bottom"),
+    "bottomleft": ("left", "bottom"),
+    "bottom": ("center", "bottom"), "bottom-center": ("center", "bottom"),
+    "bc": ("center", "bottom"), "b": ("center", "bottom"),
+    "bottom-right": ("right", "bottom"), "br": ("right", "bottom"),
+    "bottomright": ("right", "bottom"),
+}
+
 # Maps every accepted alias to the canonical direction name. The parser
 # also strips hyphens and lowercases before lookup, so "Up-Left" matches
 # "up_left" without needing a separate entry.
@@ -517,6 +543,21 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Whether !ent swap honors tile/zone blocking — a swap is "
             "refused if either entity would land on a cell that blocks it. "
             "Set False to allow swapping into otherwise-blocked cells."
+        ),
+    },
+    # ---- Map resize ----
+    "map_resize_shrink_mode": {
+        "default": "block",
+        "schema": {"type": "enum", "choices": ["block", "kill"]},
+        "desc": (
+            "What `!map resize` does when shrinking would push a live "
+            "entity outside the new grid (after the anchor shift). 'block' "
+            "(default) refuses the whole resize and lists the entities in "
+            "the way — nothing changes. 'kill' runs the configured kill "
+            "function (default_kill_function_effects + the corpse/delete "
+            "death pipeline) on each out-of-bounds entity, then completes "
+            "the resize. Out-of-bounds TILES and CORPSES are dropped and "
+            "zone cells clipped either way (only entities trigger block)."
         ),
     },
     # ---- UI / display templates ----
@@ -3769,6 +3810,98 @@ class Match:
     # ---- global constraints / helpers (unchanged in spirit) ----
     def in_bounds(self, x: int, y: int) -> bool:
         return 1 <= x <= self.grid_width and 1 <= y <= self.grid_height
+
+    def resize_grid(self, new_w: int, new_h: int,
+                    anchor: str = "top-left") -> Tuple[Dict[str, Any], List[str]]:
+        """Resize the grid to new_w x new_h, repositioning ALL content
+        (entities, tiles, corpses, zones, fog-explored memory) by an offset
+        derived from `anchor` — the 9-point compass point where existing
+        content stays put. top-left (default) leaves coordinates unchanged
+        and grows/cuts at the bottom-right; bottom-right shifts everything
+        so it stays anchored to the far corner; center recenters; etc.
+
+        Shrinking that would push a live entity off the new grid is governed
+        by the map_resize_shrink_mode rule: 'block' (default) raises with the
+        offending ids and changes nothing; 'kill' runs the configured kill
+        function on them and proceeds. Out-of-bounds tiles/corpses are
+        dropped and zone cells clipped regardless. Returns (summary, log)."""
+        if not isinstance(new_w, int) or isinstance(new_w, bool) or \
+           not isinstance(new_h, int) or isinstance(new_h, bool):
+            raise VTTError("resize: width and height must be integers.")
+        if new_w < 1 or new_h < 1:
+            raise VTTError("resize: width and height must be at least 1.")
+        key = str(anchor).strip().lower()
+        if key not in _RESIZE_ANCHORS:
+            raise VTTError(
+                f"resize: unknown anchor '{anchor}'. Use one of: top-left, "
+                f"top, top-right, left, center, right, bottom-left, bottom, "
+                f"bottom-right."
+            )
+        h_kind, v_kind = _RESIZE_ANCHORS[key]
+        dw, dh = new_w - self.grid_width, new_h - self.grid_height
+        ox = 0 if h_kind == "left" else (dw if h_kind == "right" else dw // 2)
+        oy = 0 if v_kind == "top" else (dh if v_kind == "bottom" else dh // 2)
+
+        def in_new(x: int, y: int) -> bool:
+            return 1 <= x <= new_w and 1 <= y <= new_h
+
+        # Entities whose post-shift cell falls off the new grid.
+        cut = sorted(e.id for e in self.entities.values()
+                     if not in_new(e.x + ox, e.y + oy))
+        log: List[str] = []
+        if cut:
+            mode = str(self.rules.get("map_resize_shrink_mode", "block"))
+            if mode != "kill":
+                ids = ", ".join(f"`{i}`" for i in cut)
+                raise VTTError(
+                    f"Resize to {new_w}x{new_h} ({key}) would cut off "
+                    f"{len(cut)} entit{'y' if len(cut) == 1 else 'ies'} "
+                    f"({ids}). Move them into the kept region first, or set "
+                    f"map_resize_shrink_mode=kill to kill them instead."
+                )
+            # kill mode: kill the cut entities before shifting. Their corpses
+            # land at the current cell and are dropped below if that cell
+            # shifts off-grid (which, being in the cut region, it does).
+            for eid in cut:
+                _, klog = self.kill_entity(eid)
+                log.extend(klog)
+
+        # Shift survivors — each is in-bounds by construction (the off-grid
+        # ones were just killed or we'd have raised).
+        for e in self.entities.values():
+            e.x += ox
+            e.y += oy
+
+        # Re-key tiles (corpses ride along inside tile data); drop off-grid.
+        old_tiles = len(self.tiles)
+        self.tiles = {(x + ox, y + oy): cell
+                      for (x, y), cell in self.tiles.items()
+                      if in_new(x + ox, y + oy)}
+        dropped_tiles = old_tiles - len(self.tiles)
+
+        # Shift + clip zone cells.
+        clipped_cells = 0
+        for z in self.zones.values():
+            cells = z.get("cells")
+            if isinstance(cells, set):
+                before = len(cells)
+                z["cells"] = {(x + ox, y + oy) for (x, y) in cells
+                              if in_new(x + ox, y + oy)}
+                clipped_cells += before - len(z["cells"])
+
+        # Shift + clip fog-explored memory.
+        if self.explored:
+            self.explored = {
+                team: {(x + ox, y + oy) for (x, y) in cells
+                       if in_new(x + ox, y + oy)}
+                for team, cells in self.explored.items()
+            }
+
+        self.grid_width, self.grid_height = new_w, new_h
+        return ({"offset": (ox, oy), "anchor": key, "killed": cut,
+                 "dropped_tiles": dropped_tiles,
+                 "clipped_zone_cells": clipped_cells}, log)
+
 
     # ---- tile data helpers --------------------------------------------
     # Tiles live in self.tiles keyed by (x, y) tuples. These methods are

@@ -416,6 +416,19 @@ Recently shipped or in-flight:
   walk/tp/swap RAISE `Blocked`, push/pull stop at the cell before the wall).
   Core helpers: `Match.cell_blocks(mover, x, y)` (raw geometry) +
   `_check_block(mover, x, y, mode)` (consults the block_<mode> rule).
+- **`!map resize <w> <h> [anchor]` — SHIPPED.** `Match.resize_grid(new_w,
+  new_h, anchor)` repositions ALL coordinate-bearing content (entities,
+  tiles, corpses-in-tile-data, zone cells, fog `explored`) by an offset
+  derived from a 9-point anchor (`_RESIZE_ANCHORS`): the compass point
+  where existing content stays put. top-left (default) = offset (0,0)
+  (coords unchanged, grow/cut at bottom-right); right/bottom = full delta;
+  center/middle = half. Shrinking that pushes a live entity off-grid obeys
+  the `map_resize_shrink_mode` rule (enum block|kill, default block): block
+  RAISES listing the offenders (no change); kill runs `kill_entity` (the
+  configured kill function) on them then proceeds. Off-grid tiles/corpses
+  are dropped + zone cells clipped regardless (only entities trigger
+  block). Host-gated via `ELEVATED_ARGS["map"]` (resize bumps the
+  otherwise-`all` `!map` to host). Undoable (command snapshot).
 - Action system (full body language with cmd/fail/source/target/args,
   transactional rollback, target types entity/location/entity_list/
   location_list/none/corpse/corpse_list, recursion limit, allowlist,
