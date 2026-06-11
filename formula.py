@@ -76,14 +76,17 @@ Allowed functions:
   Math:      sqrt, floor, ceil, pow, clamp(v, lo, hi), sign
   Random:    random_int, random_string, roll("2d6+3")
   Geometry:  distance, angle, direction_to
-  Areas:     cells_in_burst, cells_in_line, cells_in_cone  (return lists
-             of (x,y) tuples; pair with len() OR iterate with a for-loop)
+  Areas:     cells_in_burst, cells_in_line, cells_in_cone, cells_in_rect
+             (return lists of (x,y) tuples; pair with len() OR iterate
+             with a for-loop). clip_cells(cells) drops off-grid cells.
   Spatial:   entities_within(eid, n, mode, relation),
              nearest_entity(eid, relation, mode)   (scan alive entities
              relative to a reference; relation = ""/"hostile"/"ally"/
              "same_team"/"attackable"),
              entities_in_area(x, y, n, mode)   (the coord-rooted twin —
-             scans alive entities around a POINT, not an entity)
+             scans alive entities around a POINT, not an entity),
+             entities_in_line / entities_in_cone / entities_in_rect
+             (entity-returning twins of the cells_in_* shapes)
   Match-wide queries (no reference entity; all loopable):
              all_entities(),
              entities_with_status(name),
@@ -132,10 +135,11 @@ For-loops (CONSTRAINED form):
       entity[eid].hp = entity[eid].hp - 5
   for (cx, cy) in cells_in_burst(5, 5, 1):
       tile_set(cx, cy, "burned", 1)
-The iterable MUST be a direct call to one of: entities_within,
-group_members, cells_in_burst, cells_in_line, cells_in_cone. The
-target may be a single name (entity id / scalar) or a tuple of
-names (for coord unpacking). Total iterations across all loops in
+The iterable MUST be a direct call to a loopable function (e.g.
+entities_within, group_members, cells_in_burst/line/cone/rect,
+entities_in_area/line/cone/rect, clip_cells, and the introspection
+helpers — see _LOOPABLE_FUNCS). The target may be a single name
+(entity id / scalar) or a tuple of names (for coord unpacking). Total iterations across all loops in
 one evaluation are bounded by the formula_loop_limit rule
 (default 10000). No `else:`, no break/continue. Loop variables are
 in scope for the body (including as `entity[<var>]` indices).
@@ -1028,6 +1032,26 @@ def _cells_in_cone(x: Any, y: Any, direction: Any, length: Any,
     return out
 
 
+def _cells_in_rect(x1: Any, y1: Any, x2: Any, y2: Any) -> list:
+    """cells_in_rect(x1, y1, x2, y2): every cell in the axis-aligned
+    rectangle whose opposite corners are (x1,y1) and (x2,y2), inclusive.
+    Corner order doesn't matter (the bounds are normalized), so
+    cells_in_rect(4,4,2,2) == cells_in_rect(2,2,4,4). Returns a list of
+    (cx, cy) tuples sorted in (x, y) order — the rectangular twin of
+    cells_in_burst's filled-area shape."""
+    ax = _coord_int(x1, "cells_in_rect", "x1")
+    ay = _coord_int(y1, "cells_in_rect", "y1")
+    bx = _coord_int(x2, "cells_in_rect", "x2")
+    by = _coord_int(y2, "cells_in_rect", "y2")
+    lo_x, hi_x = (ax, bx) if ax <= bx else (bx, ax)
+    lo_y, hi_y = (ay, by) if ay <= by else (by, ay)
+    out = []
+    for cx in range(lo_x, hi_x + 1):
+        for cy in range(lo_y, hi_y + 1):
+            out.append((cx, cy))
+    return out
+
+
 _ALLOWED_FUNCS: Dict[str, Any] = {
     "min": min, "max": max, "abs": abs, "round": round,
     "int": int, "float": float, "str": str,
@@ -1047,6 +1071,7 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
     "cells_in_burst": _cells_in_burst,
     "cells_in_line": _cells_in_line,
     "cells_in_cone": _cells_in_cone,
+    "cells_in_rect": _cells_in_rect,
 }
 
 # Match-bound function names. These functions are bound at namespace build
@@ -1308,6 +1333,19 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #                                    of entities_within
     "all_entities", "entities_with_status", "entities_with_var",
     "entities_in_area",
+    # Shape-rooted entity queries — the entity-returning twins of the
+    # cells_in_* area helpers (entities_in_area already covers burst/
+    # radius). Each returns ALIVE entity ids standing on the shape's cells:
+    #   entities_in_line(x1,y1,x2,y2)  -> along a beam, start->end order
+    #   entities_in_cone(x,y,dir,len[,half_angle]) -> within a cone
+    #   entities_in_rect(x1,y1,x2,y2)  -> within an axis-aligned rectangle
+    # All loopable. Filter by team/relation inside the loop.
+    "entities_in_line", "entities_in_cone", "entities_in_rect",
+    # clip_cells(cells) -> the subset of an (x,y) cell list that is on the
+    # grid. The cells_in_* helpers can return off-grid cells (they're pure
+    # geometry); wrap one to keep only valid cells, e.g.
+    # `clip_cells(cells_in_burst(x, y, 3))`. Loopable (yields (x,y)).
+    "clip_cells",
     # Fog-of-war vision primitives (range-only; see fog_* rules). All
     # return bool and ignore the fog_enabled toggle — they answer the raw
     # "is it in sight?" question, so a GM can compose custom visibility
@@ -1384,6 +1422,11 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "cells_in_burst",
     "cells_in_line",
     "cells_in_cone",
+    "cells_in_rect",
+    "entities_in_line",
+    "entities_in_cone",
+    "entities_in_rect",
+    "clip_cells",
     # Introspection / query helpers (PR: introspection primitives). All
     # return lists, so all are loopable.
     "status_names",
@@ -4068,6 +4111,74 @@ class FormulaEngine:
             scored.sort(key=lambda t: (t[0], t[1]))
             return [eid for _, eid in scored]
         ns["entities_in_area"] = _entities_in_area
+
+        # Shape-rooted entity queries: the entity-returning twins of the
+        # cells_in_* helpers. Each builds the shape's cells then collects
+        # the alive entities standing on them.
+        def _alive_at(cellset):
+            return [(e.x, e.y, eid) for eid, e in match.entities.items()
+                    if e.is_alive and (e.x, e.y) in cellset]
+
+        def _entities_in_line(x1: Any, y1: Any, x2: Any, y2: Any) -> list:
+            """entities_in_line(x1, y1, x2, y2): alive entity ids on the
+            Bresenham line from (x1,y1) to (x2,y2), ordered start->end (a
+            beam hits the nearest first). Multiple entities on one cell
+            keep id order."""
+            order = _cells_in_line(x1, y1, x2, y2)
+            here = {}
+            for eid, e in match.entities.items():
+                if e.is_alive:
+                    here.setdefault((e.x, e.y), []).append(eid)
+            out = []
+            for cell in order:
+                for eid in sorted(here.get(cell, ())):
+                    out.append(eid)
+            return out
+
+        def _entities_in_cone(x: Any, y: Any, direction: Any, length: Any,
+                              half_angle: Any = 45) -> list:
+            """entities_in_cone(x, y, direction, length, half_angle=45):
+            alive entity ids inside the cone (see cells_in_cone), sorted
+            by (distance from origin, id)."""
+            cells = set(_cells_in_cone(x, y, direction, length, half_angle))
+            cx0 = _coord_int(x, "entities_in_cone", "x")
+            cy0 = _coord_int(y, "entities_in_cone", "y")
+            scored = [
+                (_distance(cx0, cy0, ex, ey, "euclidean_distance"), eid)
+                for (ex, ey, eid) in _alive_at(cells)
+            ]
+            scored.sort(key=lambda t: (t[0], t[1]))
+            return [eid for _, eid in scored]
+
+        def _entities_in_rect(x1: Any, y1: Any, x2: Any, y2: Any) -> list:
+            """entities_in_rect(x1, y1, x2, y2): alive entity ids inside the
+            axis-aligned rectangle (see cells_in_rect), sorted by
+            (x, y, id)."""
+            cells = set(_cells_in_rect(x1, y1, x2, y2))
+            return [eid for (_x, _y, eid) in sorted(_alive_at(cells))]
+
+        ns["entities_in_line"] = _entities_in_line
+        ns["entities_in_cone"] = _entities_in_cone
+        ns["entities_in_rect"] = _entities_in_rect
+
+        def _clip_cells(cells: Any) -> list:
+            """clip_cells(cells): the subset of an (x,y) cell list that is
+            on the grid. Wrap a cells_in_* call to drop off-grid cells, e.g.
+            clip_cells(cells_in_burst(x, y, 3))."""
+            if not isinstance(cells, (list, tuple)):
+                raise FormulaError(
+                    "clip_cells(...): expects a list of (x, y) cells.")
+            out = []
+            for c in cells:
+                if not isinstance(c, (list, tuple)) or len(c) != 2:
+                    raise FormulaError(
+                        "clip_cells(...): each cell must be an (x, y) pair.")
+                cxv = _coord_int(c[0], "clip_cells", "x")
+                cyv = _coord_int(c[1], "clip_cells", "y")
+                if match.in_bounds(cxv, cyv):
+                    out.append((cxv, cyv))
+            return out
+        ns["clip_cells"] = _clip_cells
 
         # ---- fog-of-war vision primitives -------------------------------
         def _team_sees_cell(team: Any, x: Any, y: Any) -> bool:

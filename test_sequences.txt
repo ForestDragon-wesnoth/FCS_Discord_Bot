@@ -5416,6 +5416,59 @@ covers the length-1 cells in the right hemisphere. Reuses the
 engine's angle()/distance() conventions internally.
 
 
+SCENARIO 375 — cells_in_rect: axis-aligned rectangle area + clip_cells
+----------------------------------------------------------------------
+
+!match new mrect Rect 6 6
+!match use mrect
+!eval "cells_in_rect(2, 2, 4, 3)"
+!eval "len(cells_in_rect(2, 2, 4, 4))"
+!eval "cells_in_rect(4, 3, 2, 2)"
+!eval "len(cells_in_burst(1, 1, 2))"
+!eval "len(clip_cells(cells_in_burst(1, 1, 2)))"
+!eval "clip_cells(cells_in_rect(4, 4, 9, 9))"
+
+Expected: `cells_in_rect(x1, y1, x2, y2)` returns every cell in
+the axis-aligned rectangle between the two corners, inclusive,
+sorted in (x,y) order — the rectangular twin of cells_in_burst.
+(2,2)-(4,3) is a 3x2 block = 6 cells; (2,2)-(4,4) is 3x3 = 9.
+Corner order doesn't matter, so (4,3,2,2) gives the same cells as
+(2,2,4,3). Like the other cells_in_* helpers it isn't clipped to
+the grid: cells_in_burst(1,1,2) yields 25 cells (a 5x5 block
+centered on the corner), many off-grid. `clip_cells(cells)` drops
+the off-grid ones — here 25 -> 9 (the on-grid quarter). The final
+rect (4,4)-(9,9) on a 6x6 grid clips to the (4..6, 4..6) corner =
+9 cells.
+
+
+SCENARIO 376 — entities_in_line / _cone / _rect: entity-returning area twins
+----------------------------------------------------------------------------
+
+!match new ment EntArea 6 6
+!match use ment
+!ent add a A 10 2 2 9
+!ent add b B 10 3 3 9
+!ent add c C 10 4 4 9
+!ent add d D 10 6 6 9
+!ent add off O 10 3 1 9
+!eval "entities_in_rect(2, 2, 4, 4)"
+!eval "entities_in_line(2, 2, 4, 4)"
+!eval "entities_in_cone(1, 1, 'down_right', 10, 30)"
+
+Expected: the entity-returning twins of the cells_in_* shapes —
+each returns the ALIVE entity ids standing on the shape's cells
+(entities_in_area already covers the burst/radius case). With a,b,c
+on the (2,2)->(4,4) diagonal, d at (6,6), and off at (3,1):
+entities_in_rect(2,2,4,4) = [a, b, c] (d and off are outside the
+rectangle). entities_in_line(2,2,4,4) walks the beam start->end and
+returns [a, b, c] in that order (nearest first). entities_in_cone
+from (1,1) down the down-right diagonal with a narrow 30° half-angle
+catches the whole diagonal — [a, b, c, d] sorted by distance — while
+off (90° off the centerline) is excluded. Filter by team/relation
+inside a `for` loop; all three are loopable, e.g. an AoE action does
+`for eid in entities_in_rect(...): entity[eid].hp = entity[eid].hp - dmg`.
+
+
 SCENARIO 229 — Spatial helpers compose with passives and functions
 -------------------------------------------------------------------
 
