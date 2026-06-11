@@ -9629,3 +9629,33 @@ the grid becomes 3x3, Hero (in-bounds at (3,3)) is kept, the tile
 at (4,4) is dropped (off the new grid), and Far is gone. Far's
 corpse, which sat at the now-off-grid (6,1), is dropped too, so
 the final `!list` shows only Hero.
+
+
+SCENARIO 377 — directional armor / weakspot (side_hit + directional_get in an action)
+-------------------------------------------------------------------------------------
+
+!match new dir DIR 9 9
+!match use dir
+!ent add ogre Ogre 30 5 5 5
+!ent face ogre up
+!ent set_var ogre armor.front 8
+!ent set_var ogre armor.back 1
+!ent add rogue Rogue 20 5 8 9
+!ent set_var rogue weapon.power 6
+!ent set_var rogue weapon.actions.stab.target entity
+!ent set_var rogue weapon.actions.stab.body "armor = directional_get(target, 'armor', entity[self].x, entity[self].y, 0)\nentity[target].hp = entity[target].hp - max(1, source.power - armor)"
+!action rogue stab ogre
+!ent tp rogue 5 2
+!action rogue stab ogre
+!ent dump ogre
+
+Expected: Ogre faces up (north) with directional armor front=8,
+back=1. Rogue (power 6) starts at (5,8), directly SOUTH of the
+Ogre — i.e. behind it. The stab action computes the struck side
+from the Rogue's position via directional_get(ogre, "armor",
+self.x, self.y): the hit lands on the Ogre's BACK, so armor=1 and
+damage = max(1, 6-1) = 5 → Ogre 30→25. The Rogue then tps to
+(5,2), directly north = in FRONT of the Ogre; the second stab
+hits the front (armor 8), so damage = max(1, 6-8) = 1 (floored) →
+Ogre 25→24. Same attacker, same power, very different result:
+the back is the weakspot. `!ent dump ogre` shows hp 24.

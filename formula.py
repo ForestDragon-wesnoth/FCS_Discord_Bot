@@ -1052,6 +1052,100 @@ def _cells_in_rect(x1: Any, y1: Any, x2: Any, y2: Any) -> list:
     return out
 
 
+# ---- directional / facing-relative geometry -------------------------------
+# Sides are named in the ENTITY's own frame (0deg = the way it faces =
+# front; 90 = its right; 180 = back; 270 = its left). NOTE the lateral
+# names are left_side / right_side, NOT left / right — bare left/right mean
+# absolute map directions everywhere else in the engine, and these are
+# facing-RELATIVE, so the distinct names avoid that collision.
+_SIDE_CARDINALS: Tuple[Tuple[float, str], ...] = (
+    (0.0, "front"), (90.0, "right_side"), (180.0, "back"), (270.0, "left_side"),
+)
+_SIDE_CORNERS: Tuple[Tuple[float, str], ...] = (
+    (45.0, "front_right_side"), (135.0, "back_right_side"),
+    (225.0, "back_left_side"), (315.0, "front_left_side"),
+)
+
+
+def _facing_degrees(facing: Any, fname: str) -> float:
+    """Resolve a facing argument — a named direction ('up'/'down'/... or a
+    diagonal) or a compass-degree number — to degrees (0=up, clockwise)."""
+    if isinstance(facing, str):
+        key = facing.strip().lower()
+        if key not in _DIRECTION_ANGLES:
+            allowed = ", ".join(sorted(_DIRECTION_ANGLES))
+            raise FormulaError(
+                f"{fname}(...): facing '{facing}' must be a named direction "
+                f"({allowed}) or a number.")
+        return _DIRECTION_ANGLES[key]
+    if isinstance(facing, (int, float)) and not isinstance(facing, bool):
+        return float(facing) % 360.0
+    raise FormulaError(
+        f"{fname}(...): facing must be a named direction or a number, got "
+        f"{type(facing).__name__}.")
+
+
+def _relative_angle(facing: Any, abs_angle: Any, signed: Any = False) -> float:
+    """relative_angle(facing, abs_angle, signed=False): the absolute compass
+    bearing abs_angle re-expressed in the frame of an entity facing
+    `facing` — i.e. (abs_angle - facing) normalized. 0 = straight ahead
+    (front), 90 = the entity's right, 180 = behind, 270 = its left.
+    signed=False -> [0,360); True -> (-180,180]. `facing` is a named
+    direction or compass degrees; `abs_angle` is compass degrees (get one
+    from angle(...))."""
+    fdeg = _facing_degrees(facing, "relative_angle")
+    if isinstance(abs_angle, bool) or not isinstance(abs_angle, (int, float)):
+        raise FormulaError(
+            f"relative_angle(...): abs_angle must be a number, got "
+            f"{type(abs_angle).__name__}.")
+    if not isinstance(signed, bool):
+        raise FormulaError(
+            f"relative_angle(..., signed): must be bool, got "
+            f"{type(signed).__name__}.")
+    rel = (float(abs_angle) - fdeg) % 360.0
+    if signed and rel > 180.0:
+        rel -= 360.0
+    return rel
+
+
+def _ang_diff(a: float, b: float) -> float:
+    """Smallest absolute angular gap between two compass bearings (deg)."""
+    d = abs((a - b) % 360.0)
+    return min(d, 360.0 - d)
+
+
+def _coerce_corner_arc(arc: Any) -> float:
+    """Validate + clamp a corner_arc (degrees) to [0, 90]. Clamps rather
+    than raising on out-of-range so a stray rule value can't crash a
+    combat formula; a non-number is still a hard error."""
+    if isinstance(arc, bool) or not isinstance(arc, (int, float)):
+        raise FormulaError(
+            f"corner_arc must be a number, got {type(arc).__name__}.")
+    return max(0.0, min(float(arc), 90.0))
+
+
+def _relative_side_name(rel: float, sides: int, corner_arc: float) -> str:
+    """Bucket a facing-relative bearing `rel` (deg, 0=front) into a side
+    name. sides=4: four 90deg faces. sides=8: cardinal faces span
+    (90 - corner_arc) and each diagonal corner spans corner_arc, centered
+    on the 45deg lines — so corner_arc=0 collapses to 4-way and
+    corner_arc=45 gives equal octants."""
+    rel %= 360.0
+    if sides == 4:
+        # Each cardinal face owns a full 90deg quadrant; ties at the 45deg
+        # boundary fall to the cardinal checked first (front, then cw).
+        for c, name in _SIDE_CARDINALS:
+            if _ang_diff(rel, c) <= 45.0 + 1e-9:
+                return name
+        return "front"  # unreachable; quadrants tile the circle
+    face_half = (90.0 - corner_arc) / 2.0
+    for c, name in _SIDE_CARDINALS:
+        if _ang_diff(rel, c) <= face_half + 1e-9:
+            return name
+    # Not within any cardinal face -> it's a corner; pick the nearest.
+    return min(_SIDE_CORNERS, key=lambda kc: _ang_diff(rel, kc[0]))[1]
+
+
 _ALLOWED_FUNCS: Dict[str, Any] = {
     "min": min, "max": max, "abs": abs, "round": round,
     "int": int, "float": float, "str": str,
@@ -1072,6 +1166,7 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
     "cells_in_line": _cells_in_line,
     "cells_in_cone": _cells_in_cone,
     "cells_in_rect": _cells_in_rect,
+    "relative_angle": _relative_angle,
 }
 
 # Match-bound function names. These functions are bound at namespace build
@@ -1356,6 +1451,22 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   can_see(eid, x, y)            -> the single unit eid sees (x, y)
     # A falsy/empty team is treated as omniscient (sees all).
     "team_sees_cell", "team_sees_entity", "can_see",
+    # Directional / facing-relative primitives. facing_of bridges the
+    # entity facing attribute (otherwise unreadable from formulas) into a
+    # formula value; relative_side buckets an absolute bearing into a side
+    # of an entity facing some direction; side_hit is the headline combat
+    # primitive (which side of a target a hit from a point lands on);
+    # directional_get reads a per-side value table in one call. The PURE
+    # relative_angle (no match needed) lives in _ALLOWED_FUNCS.
+    #   facing_of(eid)                                   -> direction name
+    #   relative_side(facing, abs_angle, sides=4, corner_arc=None) -> side
+    #   side_hit(target, from_x, from_y, sides=4, corner_arc=None) -> side
+    #   directional_get(eid, base_path, from_x, from_y,
+    #                   default=None, sides=4, corner_arc=None)    -> value
+    # Sides: front / back / left_side / right_side (+ the four *_side
+    # corners when sides=8). corner_arc defaults to the
+    # directional_corner_arc rule.
+    "facing_of", "relative_side", "side_hit", "directional_get",
 )
 
 _ALLOWED_NODES: Tuple[type, ...] = (
@@ -4179,6 +4290,78 @@ class FormulaEngine:
                     out.append((cxv, cyv))
             return out
         ns["clip_cells"] = _clip_cells
+
+        # ---- directional / facing-relative primitives -------------------
+        def _facing_of(eid_t: Any) -> str:
+            """facing_of(eid): the entity's current facing as a direction
+            name. Bridges the facing attribute (not a var) into formulas."""
+            _, e = _resolve_entity(eid_t, "facing_of")
+            return getattr(e, "facing", "up")
+
+        def _arc_default(corner_arc: Any) -> float:
+            """Resolve the corner_arc argument, falling back to the
+            directional_corner_arc rule when not given."""
+            if corner_arc is None:
+                corner_arc = match.rules.get("directional_corner_arc", 30)
+            return _coerce_corner_arc(corner_arc)
+
+        def _check_sides(sides: Any, fname: str) -> int:
+            if sides not in (4, 8):
+                raise FormulaError(f"{fname}(...): sides must be 4 or 8.")
+            return sides
+
+        def _relative_side(facing: Any, abs_angle: Any,
+                           sides: Any = 4, corner_arc: Any = None) -> str:
+            """relative_side(facing, abs_angle, sides=4, corner_arc=None):
+            bucket an ABSOLUTE compass bearing into a side of an entity
+            facing `facing`. sides=4 -> front/back/left_side/right_side
+            (each a 90deg face); sides=8 adds the diagonal corners
+            front_right_side / back_right_side / back_left_side /
+            front_left_side, each spanning corner_arc degrees (default the
+            directional_corner_arc rule) while the cardinal faces span
+            90 - corner_arc."""
+            _check_sides(sides, "relative_side")
+            rel = _relative_angle(facing, abs_angle)
+            return _relative_side_name(rel, sides, _arc_default(corner_arc))
+
+        def _side_hit(target_t: Any, from_x: Any, from_y: Any,
+                      sides: Any = 4, corner_arc: Any = None) -> str:
+            """side_hit(target, from_x, from_y, sides=4, corner_arc=None):
+            which facing-relative side of `target` something coming FROM
+            (from_x, from_y) strikes. Reads target's facing + position,
+            takes the bearing from the target toward the source, and buckets
+            it (see relative_side). Source where the target faces -> 'front';
+            opposite -> 'back'. The basis for directional armor / weakspots."""
+            _check_sides(sides, "side_hit")
+            _, e = _resolve_entity(target_t, "side_hit")
+            # Bearing from the target toward the source of the hit; full
+            # precision (as_int=False) so corner boundaries are exact.
+            ab = _angle(e.x, e.y, from_x, from_y, "up", "cw", False, False)
+            rel = _relative_angle(getattr(e, "facing", "up"), ab)
+            return _relative_side_name(rel, sides, _arc_default(corner_arc))
+
+        def _directional_get(eid_t: Any, base_path: Any, from_x: Any,
+                             from_y: Any, default: Any = None,
+                             sides: Any = 4, corner_arc: Any = None) -> Any:
+            """directional_get(eid, base_path, from_x, from_y, default=None,
+            sides=4, corner_arc=None): compute the side of `eid` struck from
+            (from_x, from_y) via side_hit, then read eid's var at
+            base_path.<side>. Returns `default` when that path is missing,
+            so a partial table (only some sides defined) is fine. The
+            one-call form of var_get(eid, base_path + '.' + side_hit(...))."""
+            if not isinstance(base_path, str) or not base_path:
+                raise FormulaError(
+                    "directional_get(...): base_path must be a non-empty string.")
+            side = _side_hit(eid_t, from_x, from_y, sides, corner_arc)
+            full = base_path + "." + side
+            if not _var_has(eid_t, full):
+                return default
+            return _var_get(eid_t, full)
+
+        ns["facing_of"] = _facing_of
+        ns["relative_side"] = _relative_side
+        ns["side_hit"] = _side_hit
+        ns["directional_get"] = _directional_get
 
         # ---- fog-of-war vision primitives -------------------------------
         def _team_sees_cell(team: Any, x: Any, y: Any) -> bool:

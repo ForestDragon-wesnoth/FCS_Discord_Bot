@@ -560,6 +560,24 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "zone cells clipped either way (only entities trigger block)."
         ),
     },
+    # ---- Directional / facing-relative geometry ----
+    "directional_corner_arc": {
+        "default": 30,
+        "schema": {"type": "int"},
+        "desc": (
+            "Default angular width (degrees) of each diagonal CORNER side "
+            "when the directional primitives (side_hit / relative_side / "
+            "directional_get) run in 8-way mode (sides=8). Each of the four "
+            "corners (front_right_side, back_right_side, back_left_side, "
+            "front_left_side) spans this many degrees centered on its 45° "
+            "diagonal; the four cardinal faces (front/back/left_side/"
+            "right_side) each span the remaining 90 − arc. 0 collapses to "
+            "4-way (corners vanish); 45 gives eight equal octants. Default "
+            "30 makes a square's corners narrower targets than its flat "
+            "faces. Per-call override: pass corner_arc= to any directional "
+            "primitive. 4-way mode ignores this (faces are always 90°)."
+        ),
+    },
     # ---- UI / display templates ----
     # These rules drive !list and !ent info rendering — see
     # vtt_commands._entity_line / _entity_card. Template syntax:

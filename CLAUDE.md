@@ -429,6 +429,32 @@ Recently shipped or in-flight:
   are dropped + zone cells clipped regardless (only entities trigger
   block). Host-gated via `ELEVATED_ARGS["map"]` (resize bumps the
   otherwise-`all` `!map` to host). Undoable (command snapshot).
+- **Directional values / facing-relative sides — SHIPPED (first slice).** The
+  facing-relative layer on top of the existing absolute geometry
+  (`angle`/`direction_to` already give objective up/down/left/right). Formula
+  primitives (all in `formula.py`): `relative_angle(facing, abs_angle [,signed])`
+  (pure; abs bearing → entity frame, 0=front), `relative_side(facing,
+  abs_angle [,sides,corner_arc])`, `side_hit(target, from_x, from_y
+  [,sides,corner_arc])` (the headline combat primitive: which side of the
+  target a hit FROM (x,y) lands on — reads target facing + pos, bearing
+  target→source), `facing_of(eid)` (bridges the facing attribute, which is
+  NOT a var and was previously unreadable from formulas), and
+  `directional_get(eid, base, from_x, from_y [,default,sides,corner_arc])`
+  (computes the side, reads `base.<side>`, default if missing — the
+  one-call directional-armor read; equivalent to `var_get(eid, base + "." +
+  side_hit(...))`). Sides: `front`/`back`/`left_side`/`right_side` (NOT
+  bare left/right — those mean absolute map directions everywhere else),
+  plus `front_right_side`/`back_right_side`/`back_left_side`/`front_left_side`
+  when `sides=8`. 4-way = four 90° faces (exact for a square). 8-way: each
+  diagonal CORNER spans `corner_arc`° (rule `directional_corner_arc`,
+  default 30, per-call override), cardinal faces span `90 − arc` — so a
+  square's corners are narrower targets than its faces; arc=0 collapses to
+  4-way, arc=45 = equal octants. Helpers `_relative_side_name`,
+  `_relative_angle`, `_facing_degrees`, `_SIDE_CARDINALS`/`_SIDE_CORNERS`.
+  Malformed/missing-var fails by raising (FormulaError) like other funcs.
+  Verified: directional armor/weakspot (back hit > front hit) via an action.
+  FUTURE slices the user may want: LOS-aware raycast (stops at opaque
+  cells), configurable side NAMES (gamerule), entity-shape > point hitboxes.
 - Action system (full body language with cmd/fail/source/target/args,
   transactional rollback, target types entity/location/entity_list/
   location_list/none/corpse/corpse_list, recursion limit, allowlist,
