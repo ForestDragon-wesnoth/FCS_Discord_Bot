@@ -5416,6 +5416,59 @@ covers the length-1 cells in the right hemisphere. Reuses the
 engine's angle()/distance() conventions internally.
 
 
+SCENARIO 375 — cells_in_rect: axis-aligned rectangle area + clip_cells
+----------------------------------------------------------------------
+
+!match new mrect Rect 6 6
+!match use mrect
+!eval "cells_in_rect(2, 2, 4, 3)"
+!eval "len(cells_in_rect(2, 2, 4, 4))"
+!eval "cells_in_rect(4, 3, 2, 2)"
+!eval "len(cells_in_burst(1, 1, 2))"
+!eval "len(clip_cells(cells_in_burst(1, 1, 2)))"
+!eval "clip_cells(cells_in_rect(4, 4, 9, 9))"
+
+Expected: `cells_in_rect(x1, y1, x2, y2)` returns every cell in
+the axis-aligned rectangle between the two corners, inclusive,
+sorted in (x,y) order — the rectangular twin of cells_in_burst.
+(2,2)-(4,3) is a 3x2 block = 6 cells; (2,2)-(4,4) is 3x3 = 9.
+Corner order doesn't matter, so (4,3,2,2) gives the same cells as
+(2,2,4,3). Like the other cells_in_* helpers it isn't clipped to
+the grid: cells_in_burst(1,1,2) yields 25 cells (a 5x5 block
+centered on the corner), many off-grid. `clip_cells(cells)` drops
+the off-grid ones — here 25 -> 9 (the on-grid quarter). The final
+rect (4,4)-(9,9) on a 6x6 grid clips to the (4..6, 4..6) corner =
+9 cells.
+
+
+SCENARIO 376 — entities_in_line / _cone / _rect: entity-returning area twins
+----------------------------------------------------------------------------
+
+!match new ment EntArea 6 6
+!match use ment
+!ent add a A 10 2 2 9
+!ent add b B 10 3 3 9
+!ent add c C 10 4 4 9
+!ent add d D 10 6 6 9
+!ent add off O 10 3 1 9
+!eval "entities_in_rect(2, 2, 4, 4)"
+!eval "entities_in_line(2, 2, 4, 4)"
+!eval "entities_in_cone(1, 1, 'down_right', 10, 30)"
+
+Expected: the entity-returning twins of the cells_in_* shapes —
+each returns the ALIVE entity ids standing on the shape's cells
+(entities_in_area already covers the burst/radius case). With a,b,c
+on the (2,2)->(4,4) diagonal, d at (6,6), and off at (3,1):
+entities_in_rect(2,2,4,4) = [a, b, c] (d and off are outside the
+rectangle). entities_in_line(2,2,4,4) walks the beam start->end and
+returns [a, b, c] in that order (nearest first). entities_in_cone
+from (1,1) down the down-right diagonal with a narrow 30° half-angle
+catches the whole diagonal — [a, b, c, d] sorted by distance — while
+off (90° off the centerline) is excluded. Filter by team/relation
+inside a `for` loop; all three are loopable, e.g. an AoE action does
+`for eid in entities_in_rect(...): entity[eid].hp = entity[eid].hp - dmg`.
+
+
 SCENARIO 229 — Spatial helpers compose with passives and functions
 -------------------------------------------------------------------
 
@@ -9479,3 +9532,100 @@ under 'terrain' mode it drops out of `!list` (you remember the
 ground, not where the enemy went). Under 'full' mode (scenario
 370's default) the enemy would have stayed; 'terrain' is the
 classic fog-of-war behavior.
+
+
+SCENARIO 372 — impassable tiles: system rule, conditional bypass, per-tile override, mode toggle
+------------------------------------------------------------------------------------------------
+
+!match new wb WB 8 8
+!match use wb
+!defvar add flying false
+!defvar add ghost false
+!ent add hero Hero 30 3 3 9
+!tile set 4 3 wall solid
+!tile set 3 4 wall short
+!system set default tile_block_condition "tile_get(tile_x,tile_y,'wall') == 'solid' or (tile_get(tile_x,tile_y,'wall') == 'short' and not entity[self].flying)"
+!ent move hero right
+!ent move hero down
+!ent set_var hero flying true
+!ent move hero down
+!ent tp hero 5 3
+!tile set 6 3 block "not entity[self].ghost"
+!ent move hero right
+!system set default block_walk false
+!ent move hero right
+
+Expected: tile_block_condition makes a 'solid' wall impassable to
+everyone and a 'short' wall impassable unless entity[self].flying.
+Hero at (3,3): moving right onto the solid wall at (4,3) is
+refused ("Cell (4,3) blocks `hero`") — Hero stays put. Moving
+down onto the short wall at (3,4) is refused too (Hero isn't
+flying). After `!ent set_var hero flying true`, moving down onto
+(3,4) succeeds (flying bypasses short walls). Hero tps to (5,3);
+tile (6,3) gets its OWN `block` formula "not entity[self].ghost"
+which OVERRIDES the system rule for that cell — moving right is
+refused (Hero isn't a ghost). Setting block_walk False disables
+walk blocking entirely, so the final move right phases onto
+(6,3). (Both flying/ghost are given defaults via !defvar so the
+formula's var reads always resolve; a missing var would fail the
+formula open = not blocking.)
+
+
+SCENARIO 373 — zone blocking (all-or-nothing walk), push knockback-stop, tp mode toggle
+---------------------------------------------------------------------------------------
+
+!match new zb ZB 8 8
+!match use zb
+!defvar add ghost false
+!ent add hero Hero 30 2 2 9
+!zone add barrier 2 4
+!zone set barrier block "not entity[self].ghost"
+!ent move hero 2 down
+!tile set 5 5 wall solid
+!system set default tile_block_condition "tile_get(tile_x,tile_y,'wall') == 'solid'"
+!ent tp hero 5 2
+!ent push hero down 5
+!ent tp hero 5 5
+!system set default block_tp false
+!ent tp hero 5 5
+
+Expected: Zone `barrier` covers (2,4) and blocks non-ghosts via
+its `block` data field (zone_block_condition's per-zone
+override). Hero at (2,2) walking down 2 would cross (2,4); the
+blocked cell aborts the WHOLE walk (all-or-nothing), so Hero
+stays at (2,2). A solid wall is set at (5,5). Hero tps to (5,2)
+and is pushed down 5: the push stops at (5,4), the cell before
+the wall (knockback into a wall) — Hero ends at (5,4), 2 cells
+moved. Teleporting onto the wall at (5,5) is refused while
+block_tp is on. After `!system set default block_tp false`, the
+same tp phases Hero onto (5,5) (teleports ignore blocking).
+
+
+SCENARIO 374 — !map resize: anchors, content shift, block vs kill on shrink
+---------------------------------------------------------------------------
+
+!match new rs RS 4 4
+!match use rs
+!ent add hero Hero 30 1 1 9
+!tile set 2 2 glyph T
+!map resize 6 6 bottom-right
+!ent add far Far 10 6 1 9
+!map resize 3 3
+!system set default map_resize_shrink_mode kill
+!map resize 3 3
+!list
+
+Expected: The grid starts 4x4 with Hero at (1,1) and a 'T' tile
+at (2,2). `!map resize 6 6 bottom-right` grows to 6x6 anchored at
+the bottom-right, so all content shifts by the full delta (+2,+2):
+Hero is now at (3,3) and the tile at (4,4). A second entity Far is
+added at (6,1). `!map resize 3 3` (default top-left anchor, no
+shift) would cut everything past column/row 3: Far at (6,1) falls
+off-grid. With the default map_resize_shrink_mode=block the resize
+is REFUSED — it reports Far as in the way and nothing changes
+(still 6x6). After `!system set default map_resize_shrink_mode
+kill`, the same resize runs the kill function on Far and completes:
+the grid becomes 3x3, Hero (in-bounds at (3,3)) is kept, the tile
+at (4,4) is dropped (off the new grid), and Far is gone. Far's
+corpse, which sat at the now-off-grid (6,1), is dropped too, so
+the final `!list` shows only Hero.

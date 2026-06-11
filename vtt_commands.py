@@ -85,7 +85,9 @@ READ_ONLY_BARE_ROOTS: frozenset = frozenset({
 # so must be host-only (else a player could peek past fog of war).
 ELEVATED_ARGS: Dict[str, frozenset] = {
     "state": frozenset({"full"}),
-    "map": frozenset({"full"}),
+    # `map` renders for anyone from the channel POV, but `full` (omniscient)
+    # and `resize` (a grid mutation) both elevate to host-gated.
+    "map": frozenset({"full", "resize"}),
     "list": frozenset({"full"}),
 }
 
@@ -3138,9 +3140,38 @@ def _view_pov(ctx: ReplyContext, m: "Match", args: List[str]) -> Optional[str]:
     return m.channel_pov(ctx.channel_key)
 
 
-@registry.command("map", access="all", usage="!map [full]", desc="Render the ASCII map for the active match, from this channel's POV. `!map full` (host-gated) forces the omniscient view.")
+@registry.command("map", access="all", usage="!map [full] | !map resize <w> <h> [anchor]", desc="Render the ASCII map for the active match, from this channel's POV. `!map full` (host-gated) forces the omniscient view. `!map resize <w> <h> [anchor]` (host-gated) changes the grid size — anchor (default top-left) is the 9-point compass point where existing content stays put.")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
+    if args and args[0].lower() == "resize":
+        if len(args) < 3:
+            return await ctx.send(
+                "Usage: `!map resize <width> <height> [anchor]` (anchor "
+                "default top-left; e.g. center, bottom-right)."
+            )
+        try:
+            new_w, new_h = int(args[1]), int(args[2])
+        except ValueError:
+            return await ctx.send("Width and height must be integers.")
+        anchor = args[3] if len(args) >= 4 else "top-left"
+        try:
+            summary, log = m.resize_grid(new_w, new_h, anchor)
+        except VTTError as e:
+            return await ctx.send(f"❌ {e}")
+        msg = (f"Resized **{m.name}** to {new_w}x{new_h} "
+               f"(anchor {summary['anchor']}).")
+        notes: List[str] = []
+        if summary["killed"]:
+            notes.append("killed " + ", ".join(f"`{i}`" for i in summary["killed"]))
+        if summary["dropped_tiles"]:
+            notes.append(f"dropped {summary['dropped_tiles']} tile cell(s)")
+        if summary["clipped_zone_cells"]:
+            notes.append(f"clipped {summary['clipped_zone_cells']} zone cell(s)")
+        if notes:
+            msg = msg + " " + "; ".join(notes) + "."
+        if log:
+            msg = msg + "\n" + "\n".join(log)
+        return await ctx.send(msg + f"\n```\n{m.render_ascii(_view_pov(ctx, m, []))}\n```")
     pov = _view_pov(ctx, m, args)
     return await ctx.send(f"```\n{m.render_ascii(pov)}\n```")
 
