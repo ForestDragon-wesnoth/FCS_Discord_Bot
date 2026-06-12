@@ -1441,16 +1441,24 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # geometry); wrap one to keep only valid cells, e.g.
     # `clip_cells(cells_in_burst(x, y, 3))`. Loopable (yields (x,y)).
     "clip_cells",
-    # Fog-of-war vision primitives (range-only; see fog_* rules). All
-    # return bool and ignore the fog_enabled toggle — they answer the raw
-    # "is it in sight?" question, so a GM can compose custom visibility
-    # regardless of whether the auto-fog is on:
-    #   team_sees_cell(team, x, y)    -> any alive `team` member within
-    #                                    vision range of (x, y) (union)
-    #   team_sees_entity(team, eid)   -> team sees eid's cell
-    #   can_see(eid, x, y)            -> the single unit eid sees (x, y)
-    # A falsy/empty team is treated as omniscient (sees all).
-    "team_sees_cell", "team_sees_entity", "can_see",
+    # Vision primitives. All return bool and ignore the fog_enabled /
+    # fog_los toggles — raw "is it in sight?" queries a GM composes with.
+    # The bare names mean range AND line-of-sight; _rangeonly / _losonly
+    # isolate each concept. A falsy/empty team is omniscient (sees all).
+    #   team_sees_cell(team, x, y)        -> any alive member in range AND
+    #                                        with a clear line to (x, y)
+    #   team_sees_cell_rangeonly(...)     -> range only (any member in radius)
+    #   team_sees_cell_losonly(...)       -> clear line only (ignores range)
+    #   team_sees_entity(team, eid)[ _rangeonly | _losonly ] -> same of eid's cell
+    #   can_see(eid, x, y)[ _rangeonly | _losonly ] -> single unit eid
+    #   has_los(x1, y1, x2, y2, viewer=None) -> clear line between two cells
+    #       (pass a viewer for viewer-conditional opacity; without one such
+    #       conditions read transparent). LOS is blocked by OPAQUE cells
+    #       (tile_opaque_condition / zone_opaque_condition + per-cell
+    #       `opaque` overrides), judged with the los_corner_mode rule.
+    "team_sees_cell", "team_sees_cell_rangeonly", "team_sees_cell_losonly",
+    "team_sees_entity", "team_sees_entity_rangeonly", "team_sees_entity_losonly",
+    "can_see", "can_see_rangeonly", "can_see_losonly", "has_los",
     # Directional / facing-relative primitives. facing_of bridges the
     # entity facing attribute (otherwise unreadable from formulas) into a
     # formula value; relative_side buckets an absolute bearing into a side
@@ -4363,21 +4371,63 @@ class FormulaEngine:
         ns["side_hit"] = _side_hit
         ns["directional_get"] = _directional_get
 
-        # ---- fog-of-war vision primitives -------------------------------
+        # ---- vision primitives (range / LOS) ----------------------------
+        # The bare names (can_see / team_sees_cell / team_sees_entity) mean
+        # range AND line-of-sight; the _rangeonly / _losonly variants isolate
+        # each concept. All ignore the fog_los rule (raw geometry queries);
+        # fog applies LOS via fog_los internally.
+        def _tm(team: Any) -> Optional[str]:
+            return None if team is None else str(team)
+
         def _team_sees_cell(team: Any, x: Any, y: Any) -> bool:
-            return match.team_sees_cell(
-                None if team is None else str(team), int(x), int(y))
+            return match._team_sees(_tm(team), int(x), int(y), los=True)
+
+        def _team_sees_cell_rangeonly(team: Any, x: Any, y: Any) -> bool:
+            return match._team_sees(_tm(team), int(x), int(y), los=False)
+
+        def _team_sees_cell_losonly(team: Any, x: Any, y: Any) -> bool:
+            return match._team_has_los(_tm(team), int(x), int(y))
 
         def _team_sees_entity(team: Any, eid_t: Any) -> bool:
-            return match.team_sees_entity(
-                None if team is None else str(team), _eid(eid_t))
+            e = match.entities.get(_eid(eid_t))
+            return False if e is None else \
+                match._team_sees(_tm(team), e.x, e.y, los=True)
+
+        def _team_sees_entity_rangeonly(team: Any, eid_t: Any) -> bool:
+            return match.team_sees_entity(_tm(team), _eid(eid_t))
+
+        def _team_sees_entity_losonly(team: Any, eid_t: Any) -> bool:
+            e = match.entities.get(_eid(eid_t))
+            return False if e is None else \
+                match._team_has_los(_tm(team), e.x, e.y)
 
         def _can_see(eid_t: Any, x: Any, y: Any) -> bool:
+            return match._entity_sees(_eid(eid_t), int(x), int(y), los=True)
+
+        def _can_see_rangeonly(eid_t: Any, x: Any, y: Any) -> bool:
             return match.entity_can_see(_eid(eid_t), int(x), int(y))
 
+        def _can_see_losonly(eid_t: Any, x: Any, y: Any) -> bool:
+            return match._entity_has_los(_eid(eid_t), int(x), int(y))
+
+        def _has_los(x1: Any, y1: Any, x2: Any, y2: Any,
+                     viewer: Any = None) -> bool:
+            """has_los(x1,y1,x2,y2,viewer=None): clear line of sight between
+            two cells? Pass a viewer entity for viewer-conditional opacity
+            (without one, such conditions read transparent)."""
+            vid = None if viewer is None else _eid(viewer)
+            return match.has_los(vid, int(x1), int(y1), int(x2), int(y2))
+
         ns["team_sees_cell"] = _team_sees_cell
+        ns["team_sees_cell_rangeonly"] = _team_sees_cell_rangeonly
+        ns["team_sees_cell_losonly"] = _team_sees_cell_losonly
         ns["team_sees_entity"] = _team_sees_entity
+        ns["team_sees_entity_rangeonly"] = _team_sees_entity_rangeonly
+        ns["team_sees_entity_losonly"] = _team_sees_entity_losonly
         ns["can_see"] = _can_see
+        ns["can_see_rangeonly"] = _can_see_rangeonly
+        ns["can_see_losonly"] = _can_see_losonly
+        ns["has_los"] = _has_los
 
         # User-defined formula functions. Each becomes a Python callable
         # in the namespace. The callable binds its arguments to the

@@ -996,6 +996,77 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Currently-visible cells always show everything regardless."
         ),
     },
+    # ---- Line of sight / opacity ----
+    # Sight is blocked by OPAQUE cells. Opacity is a per-cell formula
+    # EXPRESSION (NOT action mode — read viewer vars via entity[self].x),
+    # the sight analogue of the movement `block` system and resolved the
+    # same way: a tile's own `opaque` data field > its template's `opaque`
+    # > tile_opaque_condition; a zone's `opaque` data > zone_opaque_condition.
+    # `self` is the VIEWER, so opacity can be conditional ("a wall blocks
+    # sight unless entity[self].true_sight"; "low wall unless tall"). A
+    # value may be a formula string OR a bare bool/number (opaque=true =
+    # always blocks). Fail-TRANSPARENT (a typo/missing var does NOT blind).
+    # These conditions + the has_los / can_see / team_sees_* formula
+    # primitives are ALWAYS live; the fog_los rule only governs whether the
+    # auto-fog feature factors LOS in.
+    "tile_opaque_condition": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "Default formula deciding whether a TILE blocks line of sight "
+            "through its cell. Bindings: tile_x / tile_y (read the tile's "
+            "data via tile_get/tile_has) and entity[self] = the VIEWER. "
+            "Truthy = opaque. Overridden per cell by a tile's own `opaque` "
+            "data field (or its template's) — `!tile set <x> <y> opaque "
+            "\"<formula>\"`. Empty = tiles never block sight. Malformed / "
+            "missing-var = transparent. SEPARATE from tile_block_condition "
+            "(movement) — set each independently (a window: opaque empty + "
+            "block true; smoke: opaque true + block empty)."
+        ),
+    },
+    "zone_opaque_condition": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "Default formula deciding whether a ZONE blocks line of sight "
+            "through any of its cells. Bindings: zone_name, tile_x / tile_y, "
+            "entity[self] = the viewer. Overridden by a zone's own `opaque` "
+            "data field (`!zone set <name> opaque \"<formula>\"`). A cell "
+            "blocks sight if its tile OR any covering zone is opaque."
+        ),
+    },
+    "los_corner_mode": {
+        "default": "permissive",
+        "schema": {"type": "enum",
+                   "choices": ["permissive", "strict", "open"]},
+        "desc": (
+            "How a line of sight that runs exactly through a grid CORNER "
+            "(diagonally between four cells) is judged. 'permissive' "
+            "(default): blocked only when BOTH cells flanking the corner "
+            "are opaque (an 'X' of two walls) — a lone diagonal pillar does "
+            "NOT cast a shadow. 'strict': any single opaque cell touched at "
+            "the corner blocks (isolated pillars shadow their diagonal). "
+            "'open': corner touches never block (a sightline may slip "
+            "between two diagonal walls). Only affects exact-diagonal "
+            "corners; cells the line passes through normally always block."
+        ),
+    },
+    "fog_los": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether the auto-fog feature factors LINE OF SIGHT in (in "
+            "addition to range). False (default): fog is range-only — a "
+            "cell is seen if any alive team member is within vision radius. "
+            "True: a member must ALSO have an unobstructed line (no opaque "
+            "cell between) — walls hide what's behind them, the map shows "
+            "fog_glyph there, and explored memory only records cells "
+            "actually seen. System-wide because a system either models "
+            "sightlines or it doesn't; whether a given match is foggy is "
+            "the per-match !match fog toggle. The raw has_los / can_see / "
+            "team_sees_* primitives work regardless of this rule."
+        ),
+    },
     # ---- Action system --------------------------------------------------
     # Actions are GM-defined effect bundles stored under entity.vars at any
     # path ending in `.actions.<name>`. Each action is a dict with `body`
@@ -4404,36 +4475,195 @@ class Match:
         return max(dx, dy) <= radius
 
     def team_sees_cell(self, pov_team: Optional[str], x: int, y: int) -> bool:
-        """Does team `pov_team` currently see cell (x, y)? True if ANY
-        alive member is within its vision radius of the cell (union team
-        vision — a scout reveals for everyone). An omniscient / empty
-        pov_team sees everything. This is the spatial-vision primitive;
-        it does NOT consult fog_enabled (callers decide whether fog is in
-        play) — so a GM can query sight regardless."""
-        if not pov_team:
-            return True
-        for e in self.entities.values():
-            if not e.is_alive or e.team != pov_team:
-                continue
-            if self._within_vision(e.x, e.y, x, y, self._vision_radius_of(e)):
-                return True
-        return False
+        """Does team `pov_team` see cell (x, y) by RANGE (any alive member
+        within its vision radius — union team vision)? Omniscient / empty
+        pov_team sees all. Does NOT consult fog_enabled or LOS; it's the raw
+        range query. LOS-aware team vision is _team_sees(..., los=True)."""
+        return self._team_sees(pov_team, x, y, los=False)
 
     def team_sees_entity(self, pov_team: Optional[str], eid: str) -> bool:
-        """Does team `pov_team` see entity `eid` (i.e. its cell)? False
-        for an unknown/removed entity."""
+        """RANGE team vision of entity `eid`'s cell. False for unknown."""
         e = self.entities.get(eid)
         if e is None:
             return False
-        return self.team_sees_cell(pov_team, e.x, e.y)
+        return self._team_sees(pov_team, e.x, e.y, los=False)
 
     def entity_can_see(self, viewer_eid: str, x: int, y: int) -> bool:
-        """Does the single unit `viewer_eid` see cell (x, y) — within its
-        own vision radius, regardless of team? False for unknown viewer."""
-        e = self.entities.get(viewer_eid)
+        """Does the single unit `viewer_eid` see (x, y) by RANGE (within its
+        own vision radius, any team)? False for unknown viewer."""
+        return self._entity_sees(viewer_eid, x, y, los=False)
+
+    # ---- opacity (line-of-sight blocking) ---------------------------
+    # Opacity mirrors the movement-block system: a per-cell condition,
+    # resolved instance `opaque` data > template `opaque` > the
+    # tile_opaque_condition rule (zones: zone `opaque` data >
+    # zone_opaque_condition). Evaluated as a formula with `self` = the
+    # VIEWER (+ tile_x/tile_y), so it can be viewer-conditional ("opaque
+    # unless entity[self].true_sight"). A bare bool/number is taken
+    # directly. Fail-TRANSPARENT: a malformed / missing-var formula reads
+    # as NOT opaque (a typo must not blind the table). SEPARATE from
+    # `block` — a window is transparent+impassable, smoke opaque+passable.
+
+    def _tile_opaque_spec(self, x: int, y: int) -> Any:
+        """Opacity spec for the tile at (x, y): instance `opaque` data, else
+        its template's, else the tile_opaque_condition rule."""
+        cell = self.tiles.get((x, y))
+        if cell is not None:
+            inst = cell.get("opaque")
+            if inst not in (None, ""):
+                return inst
+            tpl_name = cell.get("_template")
+            if isinstance(tpl_name, str):
+                tpl = self.tile_templates.get(tpl_name)
+                if tpl is not None:
+                    t_op = tpl.data.get("opaque")
+                    if t_op not in (None, ""):
+                        return t_op
+        return self.rules.get("tile_opaque_condition", "")
+
+    def _eval_opaque_spec(self, spec: Any, viewer_id: Optional[str],
+                          extras: Dict[str, Any]) -> bool:
+        """Evaluate an opacity spec with `self`=the viewer. bool/number used
+        directly; a string runs as a formula. Empty/None or a malformed
+        formula -> NOT opaque (transparent; fail toward visible)."""
+        if spec is None:
+            return False
+        if isinstance(spec, bool):
+            return spec
+        if isinstance(spec, (int, float)):
+            return bool(spec)
+        cond = str(spec).strip()
+        if not cond:
+            return False
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        engine = FormulaEngine(self)
+        ctx = EvalCtx(this=self.current_entity_id(), target=viewer_id,
+                      extras=dict(extras))
+        try:
+            return bool(engine.eval_expression(cond, ctx))
+        except FormulaError:
+            return False
+
+    def cell_opaque(self, viewer_id: Optional[str], x: int, y: int) -> bool:
+        """True iff the tile or any zone covering (x, y) blocks the sight of
+        `viewer_id`. The raw opacity query (ignores fog toggles)."""
+        if self._eval_opaque_spec(self._tile_opaque_spec(x, y), viewer_id,
+                                  {"tile_x": x, "tile_y": y}):
+            return True
+        for name, z in self.zones.items():
+            cells = z.get("cells", ())
+            if (x, y) not in cells:
+                continue
+            zspec = (z.get("data") or {}).get("opaque")
+            if zspec in (None, ""):
+                zspec = self.rules.get("zone_opaque_condition", "")
+            if self._eval_opaque_spec(
+                    zspec, viewer_id,
+                    {"zone_name": name, "tile_x": x, "tile_y": y}):
+                return True
+        return False
+
+    def has_los(self, viewer_id: Optional[str], x1: int, y1: int,
+                x2: int, y2: int) -> bool:
+        """Clear line of sight between the centers of (x1,y1) and (x2,y2)
+        for `viewer_id`? Walks the supercover of the segment (tiles = unit
+        squares); blocked by an opaque cell strictly between the endpoints.
+        Geometric (not Bresenham) so it is SYMMETRIC. Diagonal corner
+        crossings obey los_corner_mode (permissive: only an X of BOTH
+        flanking cells blocks; strict: any corner-touch blocks; open:
+        corners never block). The viewer's own cell and the target's own
+        opacity never block. viewer_id None -> viewer-conditional opacity
+        reads transparent."""
+        if (x1, y1) == (x2, y2):
+            return True
+        mode = str(self.rules.get("los_corner_mode", "permissive"))
+        dx, dy = x2 - x1, y2 - y1
+        sx = 1 if dx > 0 else (-1 if dx < 0 else 0)
+        sy = 1 if dy > 0 else (-1 if dy < 0 else 0)
+        adx, ady = abs(dx), abs(dy)
+        cx, cy = x1, y1
+        nx = ny = 0  # boundary crossings consumed per axis
+        guard = adx + ady + 2
+        while guard > 0:
+            guard -= 1
+            if adx == 0:
+                cy += sy
+            elif ady == 0:
+                cx += sx
+            else:
+                # tMaxX=(2nx+1)/(2adx) vs tMaxY=(2ny+1)/(2ady), cross-
+                # multiplied to integers (no float drift at corners).
+                a = (2 * nx + 1) * ady
+                b = (2 * ny + 1) * adx
+                if a == b:
+                    # Corner: the segment crosses the point shared by four
+                    # cells, passing diagonally. It only TOUCHES the two
+                    # off-axis flankers (cx+sx,cy) and (cx,cy+sy).
+                    f1 = (cx + sx, cy)
+                    f2 = (cx, cy + sy)
+                    if mode == "strict":
+                        if self.cell_opaque(viewer_id, *f1) or \
+                           self.cell_opaque(viewer_id, *f2):
+                            return False
+                    elif mode != "open":  # permissive (default)
+                        if self.cell_opaque(viewer_id, *f1) and \
+                           self.cell_opaque(viewer_id, *f2):
+                            return False
+                    cx += sx; cy += sy; nx += 1; ny += 1
+                elif a < b:
+                    cx += sx; nx += 1
+                else:
+                    cy += sy; ny += 1
+            if (cx, cy) == (x2, y2):
+                return True
+            if self.cell_opaque(viewer_id, cx, cy):
+                return False
+        return True
+
+    # ---- combined vision (range and/or LOS) -------------------------
+    def _member_sees(self, e: "Entity", x: int, y: int, *, los: bool) -> bool:
+        if not self._within_vision(e.x, e.y, x, y, self._vision_radius_of(e)):
+            return False
+        return (not los) or self.has_los(e.id, e.x, e.y, x, y)
+
+    def _team_sees(self, pov_team: Optional[str], x: int, y: int,
+                   *, los: bool) -> bool:
+        if not pov_team:
+            return True
+        for e in self.entities.values():
+            if e.is_alive and e.team == pov_team and \
+               self._member_sees(e, x, y, los=los):
+                return True
+        return False
+
+    def _team_has_los(self, pov_team: Optional[str], x: int, y: int) -> bool:
+        """Any alive member of `pov_team` has a clear line to (x,y),
+        IGNORING range (the losonly team query)."""
+        if not pov_team:
+            return True
+        for e in self.entities.values():
+            if e.is_alive and e.team == pov_team and \
+               self.has_los(e.id, e.x, e.y, x, y):
+                return True
+        return False
+
+    def _entity_sees(self, eid: str, x: int, y: int, *, los: bool) -> bool:
+        e = self.entities.get(eid)
         if e is None:
             return False
-        return self._within_vision(e.x, e.y, x, y, self._vision_radius_of(e))
+        return self._member_sees(e, x, y, los=los)
+
+    def _entity_has_los(self, eid: str, x: int, y: int) -> bool:
+        e = self.entities.get(eid)
+        if e is None:
+            return False
+        return self.has_los(eid, e.x, e.y, x, y)
+
+    def _fog_team_sees(self, pov_team: Optional[str], x: int, y: int) -> bool:
+        """Team vision for the FOG feature: range, plus LOS when the fog_los
+        rule is on. The single switch behind fog hiding + explored memory."""
+        return self._team_sees(
+            pov_team, x, y, los=bool(self.rules.get("fog_los", False)))
 
     def _cell_remembered(self, pov_team: Optional[str], x: int, y: int) -> bool:
         """True iff fog memory is on and `pov_team` has explored (x, y)."""
@@ -4442,24 +4672,21 @@ class Match:
         return (x, y) in self.explored.get(pov_team, ())
 
     def _fog_terrain_visible(self, pov_team: Optional[str], x: int, y: int) -> bool:
-        """Fog gate for STATIC features (tiles, zones, corpses) and the
-        map's fog overlay: visible when fog is off, the viewer is
-        omniscient, the team currently sees the cell, OR (memory on) the
-        team has explored it. Remembered terrain stays revealed in both
-        memory modes."""
+        """Fog gate for STATIC features (tiles, zones, corpses) and the map
+        overlay: visible when fog is off, omniscient, currently seen (range
+        + LOS per fog_los), OR (memory on) explored."""
         if not self.fog_enabled or pov_team is None:
             return True
-        return (self.team_sees_cell(pov_team, x, y)
+        return (self._fog_team_sees(pov_team, x, y)
                 or self._cell_remembered(pov_team, x, y))
 
     def _fog_entity_visible(self, pov_team: Optional[str], x: int, y: int) -> bool:
-        """Fog gate for LIVE entities: visible on current vision always;
-        on a remembered (explored, not currently-seen) cell only when
-        fog_memory_mode is 'full'. Under 'terrain' mode a moving unit in
-        an explored-but-unwatched area stays hidden."""
+        """Fog gate for LIVE entities: visible on current vision (range +
+        LOS per fog_los); on a remembered cell only when fog_memory_mode is
+        'full'."""
         if not self.fog_enabled or pov_team is None:
             return True
-        if self.team_sees_cell(pov_team, x, y):
+        if self._fog_team_sees(pov_team, x, y):
             return True
         if self._cell_remembered(pov_team, x, y):
             return str(self.rules.get("fog_memory_mode", "full")) == "full"
@@ -4467,16 +4694,26 @@ class Match:
 
     def _record_vision(self, team: Optional[str]) -> None:
         """Fold `team`'s CURRENT vision into its explored set. No-op unless
-        fog AND fog memory are on and `team` is a real team. Called wherever
-        a team's sight may have just expanded (entity move / spawn, memory
-        toggle-on) so explored grows 'as cells are revealed'."""
+        fog AND fog memory are on. Iterates each alive member's vision-radius
+        NEIGHBOURHOOD (not the whole grid) and, when fog_los is on, requires
+        a clear line — so explored grows 'as cells are revealed'."""
         if not self.fog_enabled or not self.fog_memory or not team:
             return
         seen = self.explored.setdefault(team, set())
-        for y in range(1, self.grid_height + 1):
-            for x in range(1, self.grid_width + 1):
-                if (x, y) not in seen and self.team_sees_cell(team, x, y):
-                    seen.add((x, y))
+        use_los = bool(self.rules.get("fog_los", False))
+        for e in self.entities.values():
+            if not e.is_alive or e.team != team:
+                continue
+            r = self._vision_radius_of(e)
+            for yy in range(max(1, e.y - r), min(self.grid_height, e.y + r) + 1):
+                for xx in range(max(1, e.x - r), min(self.grid_width, e.x + r) + 1):
+                    if (xx, yy) in seen:
+                        continue
+                    if not self._within_vision(e.x, e.y, xx, yy, r):
+                        continue
+                    if use_los and not self.has_los(e.id, e.x, e.y, xx, yy):
+                        continue
+                    seen.add((xx, yy))
 
     def _visibility_visible(self, rule_key: str, pov_team: Optional[str], *,
                             target: Optional[str] = None,

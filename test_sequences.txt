@@ -9659,3 +9659,61 @@ damage = max(1, 6-1) = 5 → Ogre 30→25. The Rogue then tps to
 hits the front (armor 8), so damage = max(1, 6-8) = 1 (floored) →
 Ogre 25→24. Same attacker, same power, very different result:
 the back is the weakspot. `!ent dump ogre` shows hp 24.
+
+
+SCENARIO 378 — line-of-sight fog: a wall hides what's behind it
+---------------------------------------------------------------
+
+!match new losf LOSF 7 7
+!match use losf
+!defvar add fog_vision_radius 10
+!tile set 4 4 opaque true
+!tile set 4 4 glyph #
+!ent add scout Scout 30 1 4 9
+!ent set_var scout team red
+!ent add ogre Ogre 20 7 4 9
+!ent set_var ogre team blue
+!match fog on
+!as view red
+!list
+!system set default fog_los true
+!list
+!map
+
+Expected: Scout (red, vision radius 10) and a blue Ogre sit on
+opposite sides of an opaque wall '#' at (4,4), same row. With fog
+on but fog_los OFF (default), fog is RANGE-only: the Scout's
+radius covers the whole board, so the first `!list` shows the
+Ogre. After `!system set default fog_los true`, fog factors line
+of sight: the wall at (4,4) blocks the Scout's line to (7,4), so
+the second `!list` DROPS the Ogre (hidden behind the wall). `!map`
+shows the wall '#' and the cells in front of it as visible ('.'),
+while every cell behind the wall on that row — including the
+Ogre's — is fog ('?'). The wall itself is still seen (a target's
+own opacity never hides it); only what's beyond it is blocked.
+
+
+SCENARIO 379 — has_los gates a ranged attack (cover)
+----------------------------------------------------
+
+!match new sht SHT 7 7
+!match use sht
+!tile set 4 3 opaque true
+!ent add archer Archer 20 2 3 9
+!ent set_var archer bow.actions.shoot.target entity
+!ent set_var archer bow.actions.shoot.body "if not has_los(entity[self].x, entity[self].y, entity[target].x, entity[target].y, self):\n    fail('no line of sight')\nentity[target].hp = entity[target].hp - 5"
+!ent add goblin Goblin 12 6 3 9
+!action archer shoot goblin
+!ent tp goblin 6 5
+!action archer shoot goblin
+!ent dump goblin
+
+Expected: An opaque wall sits at (4,3) between the Archer (2,3)
+and the Goblin (6,3) on the same row. The shoot action checks
+has_los from the archer to the target and fail()s without one.
+First shot: the wall is on the line, so has_los is false — the
+action fails ("no line of sight"), rolled back, Goblin stays at
+12 hp. The Goblin then moves to (6,5); the line from (2,3) to
+(6,5) no longer passes through (4,3) (at x=4 it's already on row
+4), so has_los is clear and the second shot connects for 5 →
+Goblin at 7. `!ent dump goblin` shows hp 7.

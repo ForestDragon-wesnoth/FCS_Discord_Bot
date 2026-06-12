@@ -633,12 +633,38 @@ What the user has flagged as next-on-their-mind:
   vision. Two gates: `_fog_terrain_visible` (current OR remembered — used
   by tiles/zones/corpses + the map fog overlay) vs `_fog_entity_visible`
   (current always; remembered only when mode==full).
-- **Visibility rework — REMAINING pieces** (Pieces 1-3 + memory shipped):
-  - LOS / line-of-sight: opaque tiles blocking vision (a `los_*` rule +
-    a line/beam walk — there's already a line geometry helper). Its own
-    can of worms; deferred by the user.
+- **Line of sight / opacity — SHIPPED (first slice).** Sight is blocked by
+  OPAQUE cells, modeled exactly like the movement `block` system but for
+  vision. Rules `tile_opaque_condition` / `zone_opaque_condition` (formula
+  EXPRESSIONS, `self`=the VIEWER + `tile_x`/`tile_y`), overridden per-cell by
+  an `opaque` data field: instance > template > rule (zones: zone `opaque`
+  data > rule). Bare bool/number allowed; fail-TRANSPARENT (a typo must not
+  blind). Separate from `block` (window vs smoke). `Match.cell_opaque(viewer,
+  x, y)` = the raw opacity query; `Match.has_los(viewer, x1,y1,x2,y2)` =
+  the LOS walk: SUPERCOVER of the segment between tile centers (tiles = unit
+  squares), GEOMETRIC integer DDA (cross-multiplied `(2n+1)` boundary
+  compare, no floats) so it's SYMMETRIC; viewer's own cell + target's own
+  opacity never block. The diagonal-corner case obeys the `los_corner_mode`
+  rule (`permissive` default = only an X of BOTH flanking cells blocks;
+  `strict` = any corner-touch; `open` = corners never block). Fog wiring:
+  the `fog_los` rule (system-level, default False — NOT a per-match field,
+  unlike `fog_enabled`/`fog_memory`) switches whether the auto-fog factors
+  LOS; `Match._fog_team_sees` (= `_team_sees(..., los=fog_los)`) is the
+  single funnel behind `_fog_terrain_visible`/`_fog_entity_visible` +
+  `_record_vision`, so fog hiding/map-overlay/explored-memory all become
+  LOS-aware at once. `_record_vision` now iterates each member's vision-
+  radius NEIGHBOURHOOD (not the whole grid) — the radius-bounded perf fix.
+  Formula prims: bare `can_see`/`team_sees_cell`/`team_sees_entity` now mean
+  range AND los; `_rangeonly`/`_losonly` variants isolate each; `has_los(x1,
+  y1,x2,y2[,viewer])` is the raw line query (all ignore the toggles). NOTE
+  viewer-conditional opacity needs the gating var to exist (`!defvar`) or it
+  fails transparent. DEFERRED: `first_opaque` (single-coord return needs a
+  sandbox convention — subscript/attr-on-call are banned); symmetric is
+  already guaranteed; elevation as a first-class rule; vision-result caching.
+  Vision math in `logic.py` ~`team_sees_cell`..`_record_vision`.
   - Possible later: per-channel auto-routing; richer corpse-snapshot
-    introspection (status/vars not exposed today).
+    introspection (status/vars not exposed today); `first_opaque` once we
+    pick a coord-return convention.
 
 Look at recent PR descriptions on the repo (PRs #30 through #35)
 for context on the latest design conversations and rationale.
