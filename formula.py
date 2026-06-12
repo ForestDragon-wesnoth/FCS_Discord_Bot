@@ -85,8 +85,10 @@ Allowed functions:
              "same_team"/"attackable"),
              entities_in_area(x, y, n, mode)   (the coord-rooted twin —
              scans alive entities around a POINT, not an entity),
-             entities_in_line / entities_in_cone / entities_in_rect
-             (entity-returning twins of the cells_in_* shapes)
+             entities_in_cone / entities_in_rect / entities_in_line_ignorelos
+             (entity-returning twins of the cells_in_* shapes),
+             entities_on_los (line, sight-aware, between-only),
+             first_opaque (first terrain blocker as an (x,y) coord)
   Match-wide queries (no reference entity; all loopable):
              all_entities(),
              entities_with_status(name),
@@ -1146,6 +1148,38 @@ def _relative_side_name(rel: float, sides: int, corner_arc: float) -> str:
     return min(_SIDE_CORNERS, key=lambda kc: _ang_diff(rel, kc[0]))[1]
 
 
+# ---- coordinate extractors ------------------------------------------------
+# A coordinate is the 2-element (x, y) pair that cells_in_* / first_opaque /
+# etc. produce (or an action-mode Coord with .x/.y). The sandbox bans
+# subscript and attribute-on-call-result, so these are the read convention
+# for a returned coord: coord_x(first_opaque(...)), coord_y(c).
+def _coord_x(c: Any) -> Any:
+    """coord_x(c): the x component of a coordinate (an (x, y) pair or a
+    Coord). Raises on None / a non-coordinate (check `c == None` first when
+    a function may return 'no coordinate')."""
+    if isinstance(c, (list, tuple)):
+        if len(c) == 2:
+            return c[0]
+    elif hasattr(c, "x"):
+        return c.x
+    raise FormulaError(
+        f"coord_x(...): expected an (x, y) coordinate, got "
+        f"{'None' if c is None else type(c).__name__}.")
+
+
+def _coord_y(c: Any) -> Any:
+    """coord_y(c): the y component of a coordinate (an (x, y) pair or a
+    Coord). Raises on None / a non-coordinate."""
+    if isinstance(c, (list, tuple)):
+        if len(c) == 2:
+            return c[1]
+    elif hasattr(c, "y"):
+        return c.y
+    raise FormulaError(
+        f"coord_y(...): expected an (x, y) coordinate, got "
+        f"{'None' if c is None else type(c).__name__}.")
+
+
 _ALLOWED_FUNCS: Dict[str, Any] = {
     "min": min, "max": max, "abs": abs, "round": round,
     "int": int, "float": float, "str": str,
@@ -1167,6 +1201,8 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
     "cells_in_cone": _cells_in_cone,
     "cells_in_rect": _cells_in_rect,
     "relative_angle": _relative_angle,
+    "coord_x": _coord_x,
+    "coord_y": _coord_y,
 }
 
 # Match-bound function names. These functions are bound at namespace build
@@ -1431,11 +1467,21 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # Shape-rooted entity queries — the entity-returning twins of the
     # cells_in_* area helpers (entities_in_area already covers burst/
     # radius). Each returns ALIVE entity ids standing on the shape's cells:
-    #   entities_in_line(x1,y1,x2,y2)  -> along a beam, start->end order
     #   entities_in_cone(x,y,dir,len[,half_angle]) -> within a cone
     #   entities_in_rect(x1,y1,x2,y2)  -> within an axis-aligned rectangle
     # All loopable. Filter by team/relation inside the loop.
-    "entities_in_line", "entities_in_cone", "entities_in_rect",
+    "entities_in_cone", "entities_in_rect",
+    # Line / beam entity queries (the LOS pair). Both ordered near->far:
+    #   entities_in_line_ignorelos(x1,y1,x2,y2) -> every entity on the
+    #       geometric line INCLUDING the endpoints, walls ignored.
+    #   entities_on_los(x1,y1,x2,y2,viewer=None) -> entities STRICTLY
+    #       BETWEEN the points that the viewer has line of sight to (cut at
+    #       the first opaque cell; shooter + target excluded) — the bodies a
+    #       projectile would meet. Compose the block rule in the loop.
+    #   first_opaque(x1,y1,x2,y2,viewer=None) -> the first opaque cell
+    #       strictly between as an (x,y) pair (read with coord_x/coord_y), or
+    #       None if clear. NOT loopable (single coord).
+    "entities_in_line_ignorelos", "entities_on_los", "first_opaque",
     # clip_cells(cells) -> the subset of an (x,y) cell list that is on the
     # grid. The cells_in_* helpers can return off-grid cells (they're pure
     # geometry); wrap one to keep only valid cells, e.g.
@@ -1542,7 +1588,8 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "cells_in_line",
     "cells_in_cone",
     "cells_in_rect",
-    "entities_in_line",
+    "entities_in_line_ignorelos",
+    "entities_on_los",
     "entities_in_cone",
     "entities_in_rect",
     "clip_cells",
@@ -4238,21 +4285,69 @@ class FormulaEngine:
             return [(e.x, e.y, eid) for eid, e in match.entities.items()
                     if e.is_alive and (e.x, e.y) in cellset]
 
-        def _entities_in_line(x1: Any, y1: Any, x2: Any, y2: Any) -> list:
-            """entities_in_line(x1, y1, x2, y2): alive entity ids on the
-            Bresenham line from (x1,y1) to (x2,y2), ordered start->end (a
-            beam hits the nearest first). Multiple entities on one cell
-            keep id order."""
-            order = _cells_in_line(x1, y1, x2, y2)
-            here = {}
+        def _occupants() -> dict:
+            here: dict = {}
             for eid, e in match.entities.items():
                 if e.is_alive:
                     here.setdefault((e.x, e.y), []).append(eid)
+            return here
+
+        def _entities_in_line_ignorelos(x1: Any, y1: Any,
+                                        x2: Any, y2: Any) -> list:
+            """entities_in_line_ignorelos(x1, y1, x2, y2): alive entity ids
+            on the geometric line from (x1,y1) to (x2,y2), INCLUDING the
+            endpoints, ordered near->far (same line walk as has_los, but
+            opacity is ignored — walls don't stop the count). For the
+            sight-aware version that stops at terrain and skips the shooter
+            and target, use entities_on_los."""
+            cx1 = _coord_int(x1, "entities_in_line_ignorelos", "x1")
+            cy1 = _coord_int(y1, "entities_in_line_ignorelos", "y1")
+            cx2 = _coord_int(x2, "entities_in_line_ignorelos", "x2")
+            cy2 = _coord_int(y2, "entities_in_line_ignorelos", "y2")
+            here = _occupants()
             out = []
-            for cell in order:
-                for eid in sorted(here.get(cell, ())):
-                    out.append(eid)
+            for cell in match._line_cells(cx1, cy1, cx2, cy2):
+                out.extend(sorted(here.get(cell, ())))
             return out
+
+        def _entities_on_los(x1: Any, y1: Any, x2: Any, y2: Any,
+                             viewer: Any = None) -> list:
+            """entities_on_los(x1, y1, x2, y2, viewer=None): alive entity ids
+            STRICTLY BETWEEN (x1,y1) and (x2,y2) that the viewer has line of
+            sight to (terrain past an opaque cell is cut off), ordered
+            near->far. The endpoints (a shooter at the start, the target at
+            the end) are excluded — these are the bodies IN THE WAY. Compose
+            the block rule yourself, e.g.
+            `for e in entities_on_los(sx,sy,tx,ty): if not entity[e].tiny:
+            fail('blocked')`. viewer is for viewer-conditional opacity."""
+            cx1 = _coord_int(x1, "entities_on_los", "x1")
+            cy1 = _coord_int(y1, "entities_on_los", "y1")
+            cx2 = _coord_int(x2, "entities_on_los", "x2")
+            cy2 = _coord_int(y2, "entities_on_los", "y2")
+            vid = None if viewer is None else _eid(viewer)
+            here = _occupants()
+            out = []
+            for cell in match._line_cells(cx1, cy1, cx2, cy2)[1:-1]:
+                ids = here.get(cell)
+                if not ids:
+                    continue
+                if not match.has_los(vid, cx1, cy1, cell[0], cell[1]):
+                    continue
+                out.extend(sorted(ids))
+            return out
+
+        def _first_opaque(x1: Any, y1: Any, x2: Any, y2: Any,
+                          viewer: Any = None) -> Any:
+            """first_opaque(x1, y1, x2, y2, viewer=None): the first opaque
+            cell strictly between the two points (near->far) as an (x, y)
+            pair, or None if the line is clear of terrain. Read the result
+            with coord_x / coord_y. The terrain a beam would strike."""
+            cx1 = _coord_int(x1, "first_opaque", "x1")
+            cy1 = _coord_int(y1, "first_opaque", "y1")
+            cx2 = _coord_int(x2, "first_opaque", "x2")
+            cy2 = _coord_int(y2, "first_opaque", "y2")
+            vid = None if viewer is None else _eid(viewer)
+            return match.first_opaque(vid, cx1, cy1, cx2, cy2)
 
         def _entities_in_cone(x: Any, y: Any, direction: Any, length: Any,
                               half_angle: Any = 45) -> list:
@@ -4276,7 +4371,9 @@ class FormulaEngine:
             cells = set(_cells_in_rect(x1, y1, x2, y2))
             return [eid for (_x, _y, eid) in sorted(_alive_at(cells))]
 
-        ns["entities_in_line"] = _entities_in_line
+        ns["entities_in_line_ignorelos"] = _entities_in_line_ignorelos
+        ns["entities_on_los"] = _entities_on_los
+        ns["first_opaque"] = _first_opaque
         ns["entities_in_cone"] = _entities_in_cone
         ns["entities_in_rect"] = _entities_in_rect
 

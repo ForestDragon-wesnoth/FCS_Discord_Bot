@@ -5452,7 +5452,7 @@ SCENARIO 376 — entities_in_line / _cone / _rect: entity-returning area twins
 !ent add d D 10 6 6 9
 !ent add off O 10 3 1 9
 !eval "entities_in_rect(2, 2, 4, 4)"
-!eval "entities_in_line(2, 2, 4, 4)"
+!eval "entities_in_line_ignorelos(2, 2, 4, 4)"
 !eval "entities_in_cone(1, 1, 'down_right', 10, 30)"
 
 Expected: the entity-returning twins of the cells_in_* shapes —
@@ -5460,8 +5460,9 @@ each returns the ALIVE entity ids standing on the shape's cells
 (entities_in_area already covers the burst/radius case). With a,b,c
 on the (2,2)->(4,4) diagonal, d at (6,6), and off at (3,1):
 entities_in_rect(2,2,4,4) = [a, b, c] (d and off are outside the
-rectangle). entities_in_line(2,2,4,4) walks the beam start->end and
-returns [a, b, c] in that order (nearest first). entities_in_cone
+rectangle). entities_in_line_ignorelos(2,2,4,4) walks the beam
+start->end and returns [a, b, c] in that order (nearest first;
+endpoints included, walls ignored). entities_in_cone
 from (1,1) down the down-right diagonal with a narrow 30° half-angle
 catches the whole diagonal — [a, b, c, d] sorted by distance — while
 off (90° off the centerline) is excluded. Filter by team/relation
@@ -9717,3 +9718,59 @@ action fails ("no line of sight"), rolled back, Goblin stays at
 (6,5) no longer passes through (4,3) (at x=4 it's already on row
 4), so has_los is clear and the second shot connects for 5 →
 Goblin at 7. `!ent dump goblin` shows hp 7.
+
+
+SCENARIO 380 — entities_on_los gates a projectile (a body blocks the shot)
+--------------------------------------------------------------------------
+
+!match new proj PROJ 7 7
+!match use proj
+!ent add gunner Gunner 20 1 4 9
+!ent set_var gunner gun.actions.fire.target entity
+!ent set_var gunner gun.actions.fire.body "for e in entities_on_los(entity[self].x, entity[self].y, entity[target].x, entity[target].y):\n    if not entity[e].tiny:\n        fail('a body blocks the shot')\nentity[target].hp = entity[target].hp - 6"
+!ent add guard Guard 25 4 4 9
+!ent set_var guard tiny false
+!ent add dummy Dummy 20 7 4 9
+!action gunner fire dummy
+!ent set_var guard tiny true
+!action gunner fire dummy
+!ent dump dummy
+
+Expected: Gunner (1,4) fires at the Dummy (7,4); a Guard stands
+between them at (4,4). The fire action loops entities_on_los from
+the gunner to the target — the bodies STRICTLY BETWEEN, in
+near->far order — and fails if any of them is not `tiny`. First
+shot: the Guard is not tiny, so the shot is blocked ("a body
+blocks the shot"), rolled back, Dummy stays at 20. After the
+Guard is marked tiny (a crouching/small body the shot clears),
+the second shot connects for 6 → Dummy at 14. The shooter and
+target themselves are never in the list (endpoints excluded), and
+the GM writes the block rule inline — a different weapon could
+ignore bodies entirely (skip the loop) or block only on size.
+`!ent dump dummy` shows hp 14.
+
+
+SCENARIO 381 — first_opaque + coord_x/coord_y; entities_in_line_ignorelos
+-------------------------------------------------------------------------
+
+!match new beam BEAM 7 7
+!match use beam
+!tile set 4 3 opaque true
+!eval "first_opaque(1, 3, 7, 3)"
+!eval "coord_x(first_opaque(1, 3, 7, 3))"
+!eval "coord_y(first_opaque(1, 3, 7, 3))"
+!eval "first_opaque(1, 5, 7, 5)"
+!ent add a A 10 2 6 9
+!ent add b B 10 5 6 9
+!eval "entities_in_line_ignorelos(1, 6, 7, 6)"
+
+Expected: An opaque wall sits at (4,3). first_opaque(1,3,7,3)
+returns the first terrain blocker strictly between the points as
+an (x,y) coordinate — (4, 3). Because the sandbox bans subscript
+and attribute-on-call, the coordinate is read with the new
+extractors: coord_x(...) = 4 and coord_y(...) = 3. A clear line
+(row 5 has no wall) makes first_opaque return None — a GM checks
+`first_opaque(...) == None` before reading it. Finally, with
+entities a at (2,6) and b at (5,6), entities_in_line_ignorelos(1,
+6,7,6) lists every entity on the geometric line (endpoints
+included, walls ignored), near->far: [a, b].

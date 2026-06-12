@@ -4620,6 +4620,52 @@ class Match:
                 return False
         return True
 
+    def _line_cells(self, x1: int, y1: int, x2: int, y2: int) -> List[Tuple[int, int]]:
+        """The ordered cells the segment (x1,y1)->(x2,y2) passes through,
+        near->far, INCLUSIVE of both endpoints — the same thin line the LOS
+        walk uses (a diagonal step at an exact corner). Geometry only, no
+        opacity. The shared path behind first_opaque / entities_on_los /
+        entities_in_line_ignorelos."""
+        cells = [(x1, y1)]
+        if (x1, y1) == (x2, y2):
+            return cells
+        dx, dy = x2 - x1, y2 - y1
+        sx = 1 if dx > 0 else (-1 if dx < 0 else 0)
+        sy = 1 if dy > 0 else (-1 if dy < 0 else 0)
+        adx, ady = abs(dx), abs(dy)
+        cx, cy = x1, y1
+        nx = ny = 0
+        guard = adx + ady + 2
+        while (cx, cy) != (x2, y2) and guard > 0:
+            guard -= 1
+            if adx == 0:
+                cy += sy
+            elif ady == 0:
+                cx += sx
+            else:
+                a = (2 * nx + 1) * ady
+                b = (2 * ny + 1) * adx
+                if a == b:
+                    cx += sx; cy += sy; nx += 1; ny += 1
+                elif a < b:
+                    cx += sx; nx += 1
+                else:
+                    cy += sy; ny += 1
+            cells.append((cx, cy))
+        return cells
+
+    def first_opaque(self, viewer_id: Optional[str], x1: int, y1: int,
+                     x2: int, y2: int) -> Optional[Tuple[int, int]]:
+        """The first opaque cell strictly between (x1,y1) and (x2,y2) for
+        `viewer_id`, near->far, or None if the line is clear of terrain.
+        The cell a projectile/beam would strike. (The exact-diagonal corner
+        nuance belongs to has_los; this returns the first cell the line
+        actually passes through that is opaque.)"""
+        for (cx, cy) in self._line_cells(x1, y1, x2, y2)[1:-1]:
+            if self.cell_opaque(viewer_id, cx, cy):
+                return (cx, cy)
+        return None
+
     # ---- combined vision (range and/or LOS) -------------------------
     def _member_sees(self, e: "Entity", x: int, y: int, *, los: bool) -> bool:
         if not self._within_vision(e.x, e.y, x, y, self._vision_radius_of(e)):
