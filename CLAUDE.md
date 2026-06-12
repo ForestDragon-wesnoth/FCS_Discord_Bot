@@ -658,13 +658,31 @@ What the user has flagged as next-on-their-mind:
   range AND los; `_rangeonly`/`_losonly` variants isolate each; `has_los(x1,
   y1,x2,y2[,viewer])` is the raw line query (all ignore the toggles). NOTE
   viewer-conditional opacity needs the gating var to exist (`!defvar`) or it
-  fails transparent. DEFERRED: `first_opaque` (single-coord return needs a
-  sandbox convention — subscript/attr-on-call are banned); symmetric is
-  already guaranteed; elevation as a first-class rule; vision-result caching.
-  Vision math in `logic.py` ~`team_sees_cell`..`_record_vision`.
+  fails transparent. Vision math in `logic.py` ~`team_sees_cell`..
+  `_record_vision`.
+- **Coord-return convention + entity-LOS — SHIPPED (LOS slice 2).** Two
+  follow-ons to the LOS slice. (1) **Coords as return values.** The sandbox
+  bans subscript/attr-on-call, so a returned `(x,y)` was unreadable; the
+  convention is now pure extractors `coord_x(c)`/`coord_y(c)` (accept an
+  (x,y) tuple/list or an action `Coord`; raise on None — check `c == None`
+  first). `first_opaque(x1,y1,x2,y2[,viewer])` returns the first opaque cell
+  strictly between as an (x,y) pair (read via coord_x/coord_y) or `None` if
+  clear — `Match.first_opaque` over the shared `Match._line_cells` (the thin
+  DDA path used by has_los, factored out). (2) **Entity-factoring LOS** as
+  pure primitives (fog NEVER factors entities — unchanged). The old
+  Bresenham `entities_in_line` is REPLACED by `entities_in_line_ignorelos(x1,
+  y1,x2,y2)` (supercover thin-line, endpoints INCLUDED, walls ignored,
+  near→far) + `entities_on_los(x1,y1,x2,y2[,viewer])` (STRICTLY BETWEEN —
+  shooter+target excluded — sight-aware: cut at the first opaque cell via
+  per-cell has_los; near→far). No `block_entities` flag (rejected — "a tiny
+  body shouldn't block a shot over it"); the GM composes the block rule in
+  the action loop (`for e in entities_on_los(...): if not entity[e].tiny:
+  fail(...)`). NOTE `!ent set_var x v false` coerces only LOWERCASE
+  true/false to bool (capitalized stays a string → truthy); formula BODIES
+  use `True`/`False`.
   - Possible later: per-channel auto-routing; richer corpse-snapshot
-    introspection (status/vars not exposed today); `first_opaque` once we
-    pick a coord-return convention.
+    introspection (status/vars not exposed today); elevation as a
+    first-class rule; vision-result caching beyond the radius bound.
 
 Look at recent PR descriptions on the repo (PRs #30 through #35)
 for context on the latest design conversations and rationale.
