@@ -278,6 +278,14 @@ class CommandRegistry:
         m = mgr.matches.get(mid) if mid is not None else None
         if m is None:
             return "allow"
+        # Single-operator surfaces (the local CLI) carry no host-approval
+        # infrastructure — there's no second person to approve a queued
+        # request, so holding one is a dead end. Such a surface sets
+        # `auto_approve`, and the gate becomes a full no-op: the operator
+        # is effectively always authorized. (The scenario harness does NOT
+        # set this, so the approval queue stays under test there.)
+        if getattr(ctx, "auto_approve", False):
+            return "allow"
         if m.owner is None:
             # No host system established on this match (legacy save /
             # API-created without an owner) — leave it fully open rather
@@ -1310,8 +1318,10 @@ def _mention(user_id: Optional[str]) -> str:
         "Switch your previewing identity OR point-of-view. CLI-only "
         "(on Discord both come from your account / the channel, so this "
         "is inert). IDENTITY: `!as owner`/`!as host` restores the owner "
-        "identity 'cli'; `!as player [name]` becomes a player (whose "
-        "mutating commands are held for approval). POV (visibility "
+        "identity 'cli'; `!as player [name]` becomes a player for "
+        "previewing (the CLI has no host-approval infrastructure, so the "
+        "command still runs — identity here is for seeing the game AS that "
+        "player, not for gating). POV (visibility "
         "preview, a SEPARATE axis from identity): `!as view <team>` "
         "renders !state/!map/!list as that team sees them; `!as view "
         "omniscient` forces the full view; `!as view clear` drops the "
@@ -1359,7 +1369,9 @@ async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         name = args[1] if len(args) >= 2 else "player"
         ctx.user_id = name
         ctx.user_name = name
-        return await ctx.send(f"You are now player `{name}` (non-host).")
+        tail = ("" if getattr(ctx, "auto_approve", False)
+                else " — mutating commands are held for host approval")
+        return await ctx.send(f"You are now player `{name}` (non-host){tail}.")
     # Treat any other token as a literal identity to assume.
     ctx.user_id = role
     ctx.user_name = role

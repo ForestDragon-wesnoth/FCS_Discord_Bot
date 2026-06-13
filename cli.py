@@ -12,6 +12,12 @@ class CLICtx:
     # stand-in (the `!as` command flips it) used to PREVIEW what a host
     # vs a player sees. Default identity "cli" owns any match it creates.
     cli_mutable = True
+    # No host-approval infrastructure exists at the CLI (there's no second
+    # person to approve a queued command), so the access gate is a no-op
+    # here: every command runs directly regardless of the current `!as`
+    # identity. `!as player` still changes the identity for previewing,
+    # it just no longer bounces mutating commands to an approval dead-end.
+    auto_approve = True
 
     def __init__(self):
         self.user_id = "cli"
