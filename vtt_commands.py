@@ -5338,7 +5338,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return
             x, y = _parse_xy(args, offset=2)
             when = args[4]
-            formula_src = args[5]
+            formula_src = normalize_body_source(" ".join(args[5:]).strip())
             if when not in TILE_HOOK_NAMES:
                 allowed = ", ".join(sorted(TILE_HOOK_NAMES))
                 return await ctx.send(
@@ -5495,7 +5495,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return
             name = args[2]
             when = args[3]
-            formula_src = args[4]
+            formula_src = normalize_body_source(" ".join(args[4:]).strip())
             if name not in m.tile_templates:
                 return await ctx.send(f"❌ template `{name}` not found.")
             if when not in TILE_HOOK_NAMES:
