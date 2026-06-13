@@ -1590,7 +1590,13 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 4, "system", "set"):
             return
         name, key, raw_value = args[1], args[2], args[3]
-    
+
+        # Normalize `\n`/`\t` so a formula-body rule (status_tick_formula,
+        # default_kill/revive_function_effects, ...) or a multi-line format
+        # rule set at the CLI parses/renders with real newlines. The
+        # harness pre-translates these; the raw CLI does not. No-op on
+        # plain scalars (numbers/bools/strings without the escape).
+        raw_value = normalize_body_source(raw_value)
         # hard block unknown keys (also guards against keys that exist in DEFAULT_SYSTEM_SETTINGS
         # but we haven't made safe yet)
         value = _coerce_rule_value(key, raw_value)
@@ -7188,6 +7194,12 @@ async def eval_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         src = " ".join(args[2:])
     else:
         src = " ".join(args)  # rejoin in case shlex split on internal spaces
+    # Normalize `\n`/`\t` so a multi-statement program typed at the CLI
+    # (where the line is one physical string) parses — the harness
+    # pre-translates these, the raw CLI does not. Idempotent on text that
+    # has no literal escape sequence (incl. an already-stored passive
+    # formula from the --as-passive branch). See normalize_body_source.
+    src = normalize_body_source(src)
     eval_ctx = EvalCtx(this=m.current_entity_id(), target=self_id)
     engine = FormulaEngine(m)
     val = engine.eval_program(src, eval_ctx)
