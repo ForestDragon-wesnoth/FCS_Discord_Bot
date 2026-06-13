@@ -1452,6 +1452,13 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     "zone_get", "zone_has", "zone_keys", "zone_set", "zone_del",
     "create_zone", "delete_zone", "zone_add_cell", "zone_remove_cell",
     "zone_fill", "zone_shift",
+    # Entity-anchored auras: bind a zone to an entity so its cells track
+    # the entity's footprint (re-stamped on move). radius 0 = the
+    # footprint itself.
+    #   zone_anchor(name, eid, radius=0, metric="square_radius") -> cells
+    #   zone_unanchor(name)   -> bool (was it anchored)
+    #   zone_anchor_of(name)  -> the anchor eid, or '' if not an aura
+    "zone_anchor", "zone_unanchor", "zone_anchor_of",
     # Read a game-system rule value from inside a formula. rule_get(name)
     # -> the rule's effective value, or None if unknown.
     "rule_get",
@@ -4325,6 +4332,42 @@ class FormulaEngine:
             except VTTError as ex:
                 raise FormulaError(str(ex))
 
+        def _zone_anchor(name: Any, eid: Any, radius: Any = 0,
+                         metric: Any = "square_radius") -> int:
+            """zone_anchor(name, eid, radius=0, metric="square_radius"):
+            bind a zone to an entity as an AURA and stamp its cells now (a
+            footprint-aware disc of `radius` around `eid`). The cells
+            re-stamp whenever the anchor moves. radius 0 = exactly the
+            anchor's footprint. Returns the cell count. The 'burning aura'
+            / 'commander's banner' primitive."""
+            if isinstance(radius, bool) or not isinstance(radius, (int, float)):
+                raise FormulaError("zone_anchor(...): radius must be a number.")
+            try:
+                return match.anchor_zone(
+                    _zone_name(name, "zone_anchor"), _eid(eid),
+                    int(radius), str(metric))
+            except (VTTError, NotFound) as ex:
+                raise FormulaError(str(ex))
+
+        def _zone_unanchor(name: Any) -> bool:
+            """zone_unanchor(name): detach an aura's anchor, leaving its
+            current cells as a static zone. Returns True iff it was
+            anchored."""
+            try:
+                return match.unanchor_zone(_zone_name(name, "zone_unanchor"))
+            except (VTTError, NotFound) as ex:
+                raise FormulaError(str(ex))
+
+        def _zone_anchor_of(name: Any) -> str:
+            """zone_anchor_of(name): the entity id a zone is anchored to,
+            or '' if it isn't an aura (or doesn't exist)."""
+            z = match.zones.get(_zone_name(name, "zone_anchor_of"))
+            anc = z.get("anchor") if isinstance(z, dict) else None
+            return str(anc) if anc else ""
+
+        ns["zone_anchor"]       = _zone_anchor
+        ns["zone_unanchor"]     = _zone_unanchor
+        ns["zone_anchor_of"]    = _zone_anchor_of
         ns["zone_exists"]       = _zone_exists
         ns["zones_at"]          = _zones_at
         ns["cell_in_zone"]      = _cell_in_zone

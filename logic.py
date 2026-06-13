@@ -541,6 +541,19 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "blocked if its tile OR any covering zone blocks the mover."
         ),
     },
+    "anchored_zone_on_anchor_loss": {
+        "default": "delete",
+        "schema": {"type": "enum", "choices": ["delete", "freeze"]},
+        "desc": (
+            "What happens to an entity-anchored aura zone (one bound via "
+            "`!zone anchor <name> <eid> <radius>`) when its anchor entity "
+            "dies or leaves the match. 'delete' (default) removes the zone "
+            "entirely — the aura vanishes with its source. 'freeze' clears "
+            "the anchor binding but leaves the cells where they last were, "
+            "turning the aura into an ordinary static zone (a lingering "
+            "cloud the caster left behind)."
+        ),
+    },
     # Which movement kinds honor tile/zone blocking. Each defaults True
     # (block everything); set a kind False to let it phase through walls
     # (e.g. block_tp=False lets teleports ignore blocking). The low-level
@@ -1848,8 +1861,15 @@ ZONE_HOOK_NAMES: Set[str] = {
     "on_turn_end",
 }
 # Reserved top-level keys inside a zone dict (everything else under
-# zones[name]["data"] is free-form GM data).
-ZONE_RESERVED_KEYS = frozenset({"cells", "data", "hooks", "glyph"})
+# zones[name]["data"] is free-form GM data). `anchor`/`anchor_radius`/
+# `anchor_metric` make a zone an entity-anchored AURA: its cells are
+# re-stamped (a radius around the anchor entity's footprint) whenever
+# the anchor moves. They're reserved so `!zone set` / zone_set can't
+# clobber the binding.
+ZONE_RESERVED_KEYS = frozenset({
+    "cells", "data", "hooks", "glyph",
+    "anchor", "anchor_radius", "anchor_metric",
+})
 
 # Var hooks distinguished from lifecycle hooks. Useful for code paths that
 # need to know whether to expect a var-event payload.
@@ -3025,6 +3045,10 @@ class Entity:
         # — a dead/despawned entity's pending turn-delayed effects don't
         # fire and don't dangle to a future same-id entity.
         m._prune_entity_scheduled(self.id)
+        # Resolve any aura zones anchored to this entity (death OR despawn
+        # both route through here): delete or freeze per the
+        # anchored_zone_on_anchor_loss rule.
+        m._release_anchored_zones(self.id)
         self._match = None
         m._rebuild_turn_order()
 
@@ -4194,6 +4218,11 @@ class Match:
         g = z.get("glyph")
         if isinstance(g, str) and len(g) == 1:
             out["glyph"] = g
+        # Aura binding (entity-anchored zone), if present.
+        if z.get("anchor"):
+            out["anchor"] = z["anchor"]
+            out["anchor_radius"] = int(z.get("anchor_radius", 0) or 0)
+            out["anchor_metric"] = str(z.get("anchor_metric", "square_radius"))
         return out
 
     def _zone_from_dict(self, zdef: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -4223,6 +4252,18 @@ class Match:
         g = zdef.get("glyph")
         if isinstance(g, str) and len(g) == 1:
             z["glyph"] = g
+        # Restore an aura binding. The cells were serialized at their
+        # last-stamped positions (and re-stamp on the next anchor move),
+        # so no recompute is needed at load time.
+        anchor = zdef.get("anchor")
+        if isinstance(anchor, str) and anchor:
+            z["anchor"] = anchor
+            try:
+                z["anchor_radius"] = max(0, int(zdef.get("anchor_radius", 0)))
+            except (TypeError, ValueError):
+                z["anchor_radius"] = 0
+            metric = str(zdef.get("anchor_metric", "square_radius"))
+            z["anchor_metric"] = metric if metric in self._AURA_METRICS else "square_radius"
         return z
 
     def has_zone(self, name: str) -> bool:
@@ -4311,6 +4352,106 @@ class Match:
                 new.add((nx, ny))
         z["cells"] = new
         return len(new)
+
+    # ---- entity-anchored auras --------------------------------------
+    # An aura is a zone bound to an entity: its `anchor` field holds the
+    # eid, `anchor_radius` a radius, `anchor_metric` the distance metric.
+    # The zone's `cells` are RE-STAMPED (a footprint-aware disc around the
+    # anchor) whenever the anchor moves — so `cells` stays a concrete set
+    # and every existing zone query / hook / render works unchanged. The
+    # aura is footprint-aware: the disc is the union of cells within
+    # `anchor_radius` of ANY of the anchor's footprint cells (radius 0 =
+    # exactly the footprint), matching how large-entity vision/AoE behave.
+
+    _AURA_METRICS = ("square_radius", "manhattan", "euclidean")
+
+    def _within_radius(self, ux: int, uy: int, x: int, y: int,
+                       radius: int, metric: str) -> bool:
+        dx, dy = abs(ux - x), abs(uy - y)
+        if metric == "manhattan":
+            return dx + dy <= radius
+        if metric == "euclidean":
+            return dx * dx + dy * dy <= radius * radius
+        return max(dx, dy) <= radius   # square_radius (Chebyshev)
+
+    def _stamp_anchored_zone(self, name: str) -> None:
+        """Recompute an anchored zone's cells from its anchor entity's
+        current footprint + radius. No-op for a non-anchored zone or one
+        whose anchor entity is gone (the anchor-loss path handles that)."""
+        z = self.zones.get(name)
+        if not isinstance(z, dict):
+            return
+        eid = z.get("anchor")
+        if not eid:
+            return
+        e = self.entities.get(eid)
+        if e is None or not e.is_alive:
+            return
+        r = max(0, int(z.get("anchor_radius", 0) or 0))
+        metric = str(z.get("anchor_metric", "square_radius"))
+        new: Set[Tuple[int, int]] = set()
+        for (fx, fy) in self.entity_cells(e):
+            for yy in range(max(1, fy - r), min(self.grid_height, fy + r) + 1):
+                for xx in range(max(1, fx - r), min(self.grid_width, fx + r) + 1):
+                    if (xx, yy) in new:
+                        continue
+                    if self._within_radius(fx, fy, xx, yy, r, metric):
+                        new.add((xx, yy))
+        z["cells"] = new
+
+    def _restamp_anchors_for(self, eid: str) -> None:
+        """Re-stamp every aura anchored to `eid` (called when it moves)."""
+        for name, z in self.zones.items():
+            if isinstance(z, dict) and z.get("anchor") == eid:
+                self._stamp_anchored_zone(name)
+
+    def _release_anchored_zones(self, eid: str) -> None:
+        """Handle auras anchored to `eid` when it dies / leaves the match,
+        per the anchored_zone_on_anchor_loss rule: 'delete' drops the zone,
+        'freeze' clears the binding and leaves the cells as a static zone."""
+        mode = str(self.rules.get("anchored_zone_on_anchor_loss", "delete"))
+        for name in [n for n, z in self.zones.items()
+                     if isinstance(z, dict) and z.get("anchor") == eid]:
+            if mode == "freeze":
+                z = self.zones[name]
+                z.pop("anchor", None)
+                z.pop("anchor_radius", None)
+                z.pop("anchor_metric", None)
+            else:
+                del self.zones[name]
+
+    def anchor_zone(self, name: str, eid: str, radius: int = 0,
+                    metric: str = "square_radius") -> int:
+        """Bind zone `name` to entity `eid` as an aura of `radius`, then
+        stamp its cells immediately. Returns the resulting cell count.
+        Raises NotFound for an unknown zone or entity, VTTError on a bad
+        radius/metric. Re-anchoring an already-anchored zone just rebinds."""
+        z = self._require_zone(name)
+        if eid not in self.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        if not isinstance(radius, int) or isinstance(radius, bool) or radius < 0:
+            raise VTTError("anchor: radius must be a non-negative integer.")
+        metric = str(metric)
+        if metric not in self._AURA_METRICS:
+            raise VTTError(
+                f"anchor: unknown metric '{metric}'. Use one of: "
+                f"{', '.join(self._AURA_METRICS)}.")
+        z["anchor"] = eid
+        z["anchor_radius"] = radius
+        z["anchor_metric"] = metric
+        self._stamp_anchored_zone(name)
+        return len(z["cells"])
+
+    def unanchor_zone(self, name: str) -> bool:
+        """Detach an aura's anchor, leaving its current cells as a static
+        zone. Returns True iff the zone was anchored. Raises for an
+        unknown zone."""
+        z = self._require_zone(name)
+        was = bool(z.get("anchor"))
+        z.pop("anchor", None)
+        z.pop("anchor_radius", None)
+        z.pop("anchor_metric", None)
+        return was
 
     def zone_cell_list(self, name: str) -> List[List[int]]:
         z = self._require_zone(name)
@@ -6530,6 +6671,12 @@ class Match:
         e = self.entities.get(entity_id)
         if e is None:
             return []
+        # Re-stamp any aura anchored to this entity so it rides along with
+        # the move (before on_entity_moved passives fire, so they observe
+        # the repositioned aura). Like zone_shift, the restamp just moves
+        # cells — it does NOT fire the aura's own enter/exit hooks for
+        # entities it sweeps over.
+        self._restamp_anchors_for(entity_id)
         from formula import FormulaEngine, EvalCtx
         engine = FormulaEngine(self)
         this_id = self.current_entity_id()

@@ -9914,3 +9914,91 @@ footprint intact (footprint_width('ogre')=2). Swapping the 2×2 ogre with
 the 1×1 knight exchanges anchors (the swap is legal because each
 relocated footprint fits in free space): ogre's anchor becomes (3,6),
 knight's becomes (3,3).
+
+
+SCENARIO 387 — Corpse var introspection (corpse_var / corpse_has)
+-----------------------------------------------------------------
+
+!match new loot LOOT 8 8
+!match use loot
+!ent add gob Goblin 1 3 3 5
+!ent set_var gob loot.gold 50
+!ent set_var gob inventory.key true
+!ent hp gob -1
+!list
+!eval "has_corpse('gob')"
+!eval "corpse_var('gob', 'loot.gold')"
+!eval "corpse_has('gob', 'inventory.key')"
+!eval "corpse_has('gob', 'inventory.sword')"
+!eval "corpse_var('gob', 'loot.silver', 0)"
+!eval "corpse_var('missing', 'x', -1)"
+
+Expected: The goblin (hp 1) is reduced to 0 and dies, leaving a corpse
+that stores its full var snapshot. corpse_var('gob','loot.gold')=50 and
+corpse_has('gob','inventory.key')=True read the dead entity's frozen
+vars by dotted path — the loot / "was it carrying the key" patterns.
+corpse_has for a path the corpse lacks ('inventory.sword') is False.
+corpse_var with a DEFAULT returns the default when the path is missing
+(loot.silver -> 0) or when there's no such corpse at all ('missing' ->
+-1) instead of raising. Without a default, a missing path/corpse raises
+(not shown here to keep the scenario clean).
+
+
+SCENARIO 388 — Entity-anchored aura: a zone that follows its caster
+-------------------------------------------------------------------
+
+!match new aura AURA 12 12
+!match use aura
+!ent add mage Mage 30 5 5 10
+!zone new flame
+!zone glyph flame f
+!zone anchor flame mage 1
+!eval "zone_size('flame')"
+!eval "in_zone('mage', 'flame')"
+!eval "zone_anchor_of('flame')"
+!ent move mage right
+!eval "cell_in_zone(7, 6, 'flame')"
+!eval "cell_in_zone(4, 4, 'flame')"
+!zone unanchor flame
+!eval "zone_anchor_of('flame')"
+!ent move mage right
+!eval "cell_in_zone(8, 6, 'flame')"
+
+Expected: `flame` is bound to the mage as an aura of radius 1 — its cells
+are stamped as the 3×3 disc around the mage at (5,5), so zone_size=9,
+in_zone('mage','flame')=True, zone_anchor_of('flame')='mage'. Moving the
+mage east to (6,5) RE-STAMPS the aura: it now covers (7,6) (True) and no
+longer covers the old corner (4,4) (False) — the cloud rides along with
+its caster. `zone unanchor` detaches it (zone_anchor_of -> ''); a further
+mage move leaves the now-static cells where they were, so the cell the
+aura WOULD have covered had it still followed (8,6) is False.
+
+
+SCENARIO 389 — Aura anchor-loss: delete (default) vs freeze
+-----------------------------------------------------------
+
+!match new auraloss LOSS 10 10
+!match use auraloss
+!ent add a A 1 3 3 5
+!zone new aura_a
+!zone anchor aura_a a 1
+!eval "zone_exists('aura_a')"
+!ent hp a -1
+!eval "zone_exists('aura_a')"
+!system set default anchored_zone_on_anchor_loss freeze
+!ent add b B 1 6 6 5
+!zone new aura_b
+!zone anchor aura_b b 1
+!eval "zone_size('aura_b')"
+!ent hp b -1
+!eval "zone_exists('aura_b')"
+!eval "zone_anchor_of('aura_b')"
+!eval "zone_size('aura_b')"
+
+Expected: With the default `anchored_zone_on_anchor_loss=delete`, killing
+the anchor `a` deletes its aura entirely (zone_exists('aura_a') goes
+True -> False — the aura vanishes with its source). After switching the
+rule to `freeze`, killing `b` instead KEEPS the zone: zone_exists('aura_b')
+stays True, zone_anchor_of('aura_b') becomes '' (binding cleared), and its
+cells are left frozen in place (zone_size unchanged at 9) — a lingering
+cloud the caster left behind.
