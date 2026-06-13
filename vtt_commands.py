@@ -6038,7 +6038,7 @@ registry.annotate_sub(
 
 @registry.command(
     "zone",
-    usage=("!zone <new|drop|add|remove|fill|shift|set|del|clear|glyph|info|list|cells> ..."),
+    usage=("!zone <new|drop|add|remove|fill|shift|anchor|unanchor|set|del|clear|glyph|info|list|cells> ..."),
     desc=(
         "Named multi-cell regions. A zone is a SET of cells plus a "
         "free-form data dict, optional hooks, and an optional map glyph "
@@ -6151,6 +6151,46 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"Shifted `{name}` by ({dx},{dy}): {kept} cell(s){tail}."
         )
 
+    # ---- anchor <name> <eid> [radius] [metric] ----  (entity-anchored aura)
+    if sub == "anchor":
+        if await return_help_if_not_enough_args(ctx, args, 3, "zone", "anchor"):
+            return
+        name = args[1]
+        eid = args[2]
+        radius = 0
+        metric = "square_radius"
+        if len(args) >= 4:
+            try:
+                radius = int(args[3])
+            except ValueError:
+                return await ctx.send("❌ radius must be a non-negative integer.")
+        if len(args) >= 5:
+            metric = args[4]
+        try:
+            n = m.anchor_zone(name, eid, radius, metric)
+        except (NotFound, VTTError) as ex:
+            return await ctx.send(f"❌ {ex}")
+        return await ctx.send(
+            f"Anchored `{name}` to `{eid}` (radius {radius}, {metric}): "
+            f"{n} cell(s). It now follows `{eid}`."
+        )
+
+    # ---- unanchor <name> ----  (detach aura; leave cells static)
+    if sub == "unanchor":
+        if await return_help_if_not_enough_args(ctx, args, 2, "zone", "unanchor"):
+            return
+        name = args[1]
+        try:
+            was = m.unanchor_zone(name)
+        except NotFound as ex:
+            return await ctx.send(f"❌ {ex}")
+        if not was:
+            return await ctx.send(f"Zone `{name}` was not anchored.")
+        return await ctx.send(
+            f"Detached `{name}`'s anchor; its {m.zone_size(name)} cell(s) "
+            f"are now static."
+        )
+
     # ---- set <name> <path> <value> ----  (data set, dotted path)
     if sub == "set":
         if await return_help_if_not_enough_args(ctx, args, 4, "zone", "set"):
@@ -6242,6 +6282,12 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         }
         if isinstance(z.get("glyph"), str):
             view["glyph"] = z["glyph"]
+        if z.get("anchor"):
+            view["anchor"] = {
+                "entity": z["anchor"],
+                "radius": z.get("anchor_radius", 0),
+                "metric": z.get("anchor_metric", "square_radius"),
+            }
         return await ctx.send(
             f"**zone `{name}`** ({len(cells)} cell(s))\n"
             f"```{json.dumps(view, indent=2, sort_keys=True)}\n```"
@@ -6265,6 +6311,9 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 extras.append(f"hooks: {', '.join(hooks)}")
             if isinstance(z.get("glyph"), str):
                 extras.append(f"glyph '{z['glyph']}'")
+            if z.get("anchor"):
+                extras.append(
+                    f"aura→`{z['anchor']}` r{z.get('anchor_radius', 0)}")
             tail = (" — " + "; ".join(extras)) if extras else ""
             lines.append(f"- `{name}`: {n} cell(s){tail}")
         return await ctx.send("\n".join(lines))

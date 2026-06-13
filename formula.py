@@ -1414,7 +1414,13 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   has_corpse(eid)     -> bool
     #   corpse_at(eid)      -> (x, y); raises if no such corpse
     #   all_corpses()       -> list of corpse ids (loopable)
+    #   corpse_has(eid, path)        -> bool (dotted vars path resolves
+    #                                   on the dead entity's snapshot)
+    #   corpse_var(eid, path[, def]) -> the dead entity's stored var at a
+    #                                   dotted path (raises if missing
+    #                                   unless a default is supplied)
     "kill", "revive", "has_corpse", "corpse_at", "all_corpses",
+    "corpse_has", "corpse_var",
     # Scheduled / delayed effects. schedule() queues a MATCH-level body
     # to run at on_round_start `delay` rounds out (no self bound);
     # schedule_on() queues an ENTITY-attached body to run at that
@@ -1446,6 +1452,13 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     "zone_get", "zone_has", "zone_keys", "zone_set", "zone_del",
     "create_zone", "delete_zone", "zone_add_cell", "zone_remove_cell",
     "zone_fill", "zone_shift",
+    # Entity-anchored auras: bind a zone to an entity so its cells track
+    # the entity's footprint (re-stamped on move). radius 0 = the
+    # footprint itself.
+    #   zone_anchor(name, eid, radius=0, metric="square_radius") -> cells
+    #   zone_unanchor(name)   -> bool (was it anchored)
+    #   zone_anchor_of(name)  -> the anchor eid, or '' if not an aura
+    "zone_anchor", "zone_unanchor", "zone_anchor_of",
     # Read a game-system rule value from inside a formula. rule_get(name)
     # -> the rule's effective value, or None if unknown.
     "rule_get",
@@ -4016,11 +4029,74 @@ class FormulaEngine:
             all_corpses(): if condition: revive(cid)`."""
             return [eid for (_x, _y, eid, _c) in match.all_corpses()]
 
+        # ---- corpse var introspection ----
+        # A corpse is a stored snapshot (corpse["entity"] = Entity.to_dict
+        # at death). These read the DEAD entity's frozen vars by dotted
+        # path — the loot / "raise with the same statline" / "was it
+        # carrying the key?" patterns. Read-only: a corpse's snapshot is
+        # immutable until revive. Mirror var_get / var_has semantics
+        # (raise on missing for the getter unless a default is supplied;
+        # bool for the has-check). Status is intentionally NOT exposed yet.
+        _corpse_no_default = object()
+
+        def _corpse_vars(eid: str):
+            """The dead entity's stored vars dict, or None if no such
+            corpse (an empty dict if the corpse has no vars)."""
+            loc = match.find_corpse(eid)
+            if loc is None:
+                return None
+            _x, _y, corpse = loc
+            ent = corpse.get("entity") if isinstance(corpse, dict) else None
+            cv = ent.get("vars") if isinstance(ent, dict) else None
+            return cv if isinstance(cv, dict) else {}
+
+        def _corpse_has(eid_t: Any, path: Any) -> bool:
+            """corpse_has(eid, path): True iff the dotted vars path
+            resolves on the corpse's stored snapshot. False on a missing
+            corpse / missing path / nesting into a scalar (no raise)."""
+            if not isinstance(path, str) or not path:
+                raise FormulaError("corpse_has(eid, path): path must be a non-empty string.")
+            cv = _corpse_vars(str(_eid(eid_t)))
+            if cv is None:
+                return False
+            cur: Any = cv
+            for k in path.split("."):
+                if not isinstance(cur, dict) or k not in cur:
+                    return False
+                cur = cur[k]
+            return True
+
+        def _corpse_var(eid_t: Any, path: Any,
+                        default: Any = _corpse_no_default) -> Any:
+            """corpse_var(eid, path[, default]): read the dead entity's
+            stored var at a dotted path (the corpse-snapshot equivalent of
+            var_get). Raises if the corpse or the path is missing, UNLESS a
+            `default` is supplied, in which case the default is returned."""
+            if not isinstance(path, str) or not path:
+                raise FormulaError("corpse_var(eid, path[, default]): path must be a non-empty string.")
+            eid = str(_eid(eid_t))
+            cv = _corpse_vars(eid)
+            if cv is None:
+                if default is _corpse_no_default:
+                    raise FormulaError(f"corpse_var: no corpse with id '{eid}'.")
+                return default
+            cur: Any = cv
+            for k in path.split("."):
+                if not isinstance(cur, dict) or k not in cur:
+                    if default is _corpse_no_default:
+                        raise FormulaError(
+                            f"corpse_var: corpse '{eid}' has no value at '{path}'.")
+                    return default
+                cur = cur[k]
+            return cur
+
         ns["kill"]         = _kill
         ns["revive"]       = _revive
         ns["has_corpse"]   = _has_corpse
         ns["corpse_at"]    = _corpse_at
         ns["all_corpses"]  = _all_corpses
+        ns["corpse_has"]   = _corpse_has
+        ns["corpse_var"]   = _corpse_var
 
         def _schedule(delay: Any, body: Any, name: Any = None) -> str:
             """schedule(delay, body, name=None): queue a MATCH-level
@@ -4256,6 +4332,42 @@ class FormulaEngine:
             except VTTError as ex:
                 raise FormulaError(str(ex))
 
+        def _zone_anchor(name: Any, eid: Any, radius: Any = 0,
+                         metric: Any = "square_radius") -> int:
+            """zone_anchor(name, eid, radius=0, metric="square_radius"):
+            bind a zone to an entity as an AURA and stamp its cells now (a
+            footprint-aware disc of `radius` around `eid`). The cells
+            re-stamp whenever the anchor moves. radius 0 = exactly the
+            anchor's footprint. Returns the cell count. The 'burning aura'
+            / 'commander's banner' primitive."""
+            if isinstance(radius, bool) or not isinstance(radius, (int, float)):
+                raise FormulaError("zone_anchor(...): radius must be a number.")
+            try:
+                return match.anchor_zone(
+                    _zone_name(name, "zone_anchor"), _eid(eid),
+                    int(radius), str(metric))
+            except (VTTError, NotFound) as ex:
+                raise FormulaError(str(ex))
+
+        def _zone_unanchor(name: Any) -> bool:
+            """zone_unanchor(name): detach an aura's anchor, leaving its
+            current cells as a static zone. Returns True iff it was
+            anchored."""
+            try:
+                return match.unanchor_zone(_zone_name(name, "zone_unanchor"))
+            except (VTTError, NotFound) as ex:
+                raise FormulaError(str(ex))
+
+        def _zone_anchor_of(name: Any) -> str:
+            """zone_anchor_of(name): the entity id a zone is anchored to,
+            or '' if it isn't an aura (or doesn't exist)."""
+            z = match.zones.get(_zone_name(name, "zone_anchor_of"))
+            anc = z.get("anchor") if isinstance(z, dict) else None
+            return str(anc) if anc else ""
+
+        ns["zone_anchor"]       = _zone_anchor
+        ns["zone_unanchor"]     = _zone_unanchor
+        ns["zone_anchor_of"]    = _zone_anchor_of
         ns["zone_exists"]       = _zone_exists
         ns["zones_at"]          = _zones_at
         ns["cell_in_zone"]      = _cell_in_zone
