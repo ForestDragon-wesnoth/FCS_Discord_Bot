@@ -760,6 +760,33 @@ What the user has flagged as next-on-their-mind:
   (save + undo via `_zone_to_dict`/`_zone_from_dict`). Core: `_stamp_anchored_zone`
   / `_restamp_anchors_for` / `_release_anchored_zones` / `anchor_zone` /
   `unanchor_zone` in logic.py. Scenarios 388-389.
+- **Rich statuses (self-describing status definitions) — SHIPPED.** A status's
+  behavior no longer needs to live in the one global branch-on-name
+  `status_tick_formula`. `Match.status_definitions` (name -> {`tick`,
+  `tick_when`, `stack`, `max_level`, `data`}) defines a status ONCE; a status
+  INSTANCE on an entity (`entity.status[name]`) resolves its behavior from the
+  definition of the SAME name — the name IS the key, so NO `_template` tag
+  (unlike tiles). `fire_status_tick(when)` now: per status, run its
+  definition's `tick` at the definition's `tick_when` (default `turn_end`);
+  a status with NO definition falls back to the global `status_tick_formula`
+  at the global `status_tick_when` (full backward compat). DESIGN CALL:
+  duration decrement + self-removal stay INSIDE the tick formula (no forced
+  auto-decay) — the GM writes "hp -= 5*level; duration -= 1; remove at <=0"
+  once in the def. Application/stacking is configurable: `apply_status` (+
+  `status_apply` formula prim + `!status apply <eid> <name> [level]
+  [duration]`) honors the def's `stack` mode, else the `status_default_stack`
+  rule; modes `refresh`/`add_level`(capped by `max_level`)/`extend`/`replace`/
+  `none` (first application just sets level [default 1] + duration). New
+  top-level `!status` command (def/drop/tick/when/stack/maxlevel/data/list/
+  info/apply) for match-level DEFINITIONS — raw per-entity instance editing
+  stays on `!ent status`. Definitions serialize (save + undo). Core:
+  `define_status`/`remove_status_def`/`apply_status` + the rewritten
+  `fire_status_tick` in logic.py. Scenarios 390-391. DEFERRED (composable via
+  `on_status_added`): cross-status interactions (burn↔freeze cancellation),
+  resistance/immunity reducing applied levels, damage-buff scaling of applied
+  level/duration. This was framed as the modest precursor to the bigger combat
+  layers (damage pipeline, action economy, reactions) surfaced by analyzing
+  the three FCS combat-system docs.
 - Idea parked (Discord-only, not built): **opt-in auto-updating views** —
   `!map autoupdate` / `!state autoupdate` create a self-refreshing
   (edit-in-place) board message per channel that the bot updates on
