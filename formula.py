@@ -4551,9 +4551,15 @@ class FormulaEngine:
             opposite -> 'back'. The basis for directional armor / weakspots."""
             _check_sides(sides, "side_hit")
             _, e = _resolve_entity(target_t, "side_hit")
-            # Bearing from the target toward the source of the hit; full
-            # precision (as_int=False) so corner boundaries are exact.
-            ab = _angle(e.x, e.y, from_x, from_y, "up", "cw", False, False)
+            # Bearing from the target toward the source of the hit, measured
+            # from the target's footprint CENTER (true, possibly-fractional
+            # center for even sizes) so a hit's side is judged against the
+            # body's middle, not its top-left anchor. 1×1 -> the anchor.
+            # Full precision (as_int=False) so corner boundaries are exact.
+            w, h = match.entity_footprint(e)
+            cxf = e.x + (w - 1) / 2.0
+            cyf = e.y + (h - 1) / 2.0
+            ab = _angle(cxf, cyf, from_x, from_y, "up", "cw", False, False)
             rel = _relative_angle(getattr(e, "facing", "up"), ab)
             return _relative_side_name(rel, sides, _arc_default(corner_arc))
 
