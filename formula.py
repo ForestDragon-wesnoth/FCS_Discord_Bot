@@ -1521,6 +1521,22 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # corners when sides=8). corner_arc defaults to the
     # directional_corner_arc rule.
     "facing_of", "relative_side", "side_hit", "directional_get",
+    # Footprint / large-entity primitives. A large entity occupies a W×H
+    # rectangle anchored at its top-left cell (entity[X].x / .y); these
+    # expose that footprint to formulas.
+    #   footprint_width(eid) / footprint_height(eid) -> the W / H (>=1)
+    #   footprint_cells(eid)        -> loopable list of (x,y) cells it
+    #                                  covers (read each via coord_x/coord_y)
+    #   occupies(eid, x, y)         -> bool: does eid's footprint cover (x,y)
+    #   cell_entity(x, y)           -> id of the blocking entity covering
+    #                                  (x,y), or "" if none
+    #   entity_center(eid)          -> the footprint's center cell (x,y),
+    #                                  rounding down for even sizes
+    #   aoe_origin(eid)             -> the cell an area effect cast BY eid
+    #                                  originates from: its center or anchor
+    #                                  per the aoe_origin_mode rule
+    "footprint_width", "footprint_height", "footprint_cells",
+    "occupies", "cell_entity", "entity_center", "aoe_origin",
 )
 
 _ALLOWED_NODES: Tuple[type, ...] = (
@@ -1616,6 +1632,9 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "entities_in_zone",
     "zone_cells",
     "zone_keys",
+    # Footprint cells — a list of (x,y) pairs (loop with `for (cx,cy) in
+    # footprint_cells(eid)`).
+    "footprint_cells",
 })
 
 
@@ -3024,6 +3043,20 @@ class FormulaEngine:
                     continue
                 yield oid, oe, ref_e
 
+        def _ent_dist(ref_e, oe, mode):
+            # Footprint-aware entity-to-entity distance = the gap between
+            # the two axis-aligned footprint rectangles (nearest-cell
+            # distance), combined per `mode`. Computed in closed form: the
+            # per-axis gap is 0 when the rectangles overlap on that axis,
+            # else the separation; distance(0,0,gx,gy,mode) then applies
+            # the same metric as point distance. For two 1×1 entities this
+            # reduces to the old anchor-to-anchor distance.
+            rw, rh = match.entity_footprint(ref_e)
+            ow, oh = match.entity_footprint(oe)
+            gx = max(0, ref_e.x - (oe.x + ow - 1), oe.x - (ref_e.x + rw - 1))
+            gy = max(0, ref_e.y - (oe.y + oh - 1), oe.y - (ref_e.y + rh - 1))
+            return _distance(0, 0, gx, gy, mode)
+
         def _entities_within(eid_token: Any, n: Any,
                              mode: Any = "square_radius_distance",
                              relation: Any = "") -> list:
@@ -3039,7 +3072,7 @@ class FormulaEngine:
                 )
             scored = []
             for oid, oe, ref_e in _candidates(eid, relation):
-                d = _distance(ref_e.x, ref_e.y, oe.x, oe.y, mode)
+                d = _ent_dist(ref_e, oe, mode)
                 if d <= n:
                     scored.append((d, oid))
             scored.sort(key=lambda t: (t[0], t[1]))
@@ -3055,7 +3088,7 @@ class FormulaEngine:
             best_id = ""
             best_d = None
             for oid, oe, ref_e in _candidates(eid, relation):
-                d = _distance(ref_e.x, ref_e.y, oe.x, oe.y, mode)
+                d = _ent_dist(ref_e, oe, mode)
                 # Tie-break by id so the result is deterministic.
                 if best_d is None or d < best_d or (d == best_d and oid < best_id):
                     best_d = d
@@ -3064,6 +3097,61 @@ class FormulaEngine:
 
         ns["entities_within"] = _entities_within
         ns["nearest_entity"]  = _nearest_entity
+
+        # ---- footprint / large-entity accessors ----
+        def _require_e(eid_t: Any, fn: str):
+            eid = _eid(eid_t)
+            e = match.entities.get(eid)
+            if e is None:
+                raise FormulaError(f"{fn}(...): unknown entity id '{eid}'.")
+            return e
+
+        def _footprint_width(eid_t: Any) -> int:
+            return match.entity_footprint(_require_e(eid_t, "footprint_width"))[0]
+
+        def _footprint_height(eid_t: Any) -> int:
+            return match.entity_footprint(_require_e(eid_t, "footprint_height"))[1]
+
+        def _footprint_cells(eid_t: Any) -> list:
+            # List of (x,y) the entity covers; loopable + coord-readable.
+            return [(cx, cy) for cx, cy in
+                    match.entity_cells(_require_e(eid_t, "footprint_cells"))]
+
+        def _occupies(eid_t: Any, x: Any, y: Any) -> bool:
+            e = _require_e(eid_t, "occupies")
+            return match.entity_occupies(
+                e, _coord_int(x, "occupies", "x"), _coord_int(y, "occupies", "y"))
+
+        def _cell_entity(x: Any, y: Any) -> str:
+            # The blocking entity covering (x,y), or "" if the cell is free.
+            occ = match.cell_occupant(
+                _coord_int(x, "cell_entity", "x"),
+                _coord_int(y, "cell_entity", "y"))
+            return occ or ""
+
+        def _entity_center(eid_t: Any) -> tuple:
+            # The footprint's center CELL (rounding down for even sizes so
+            # the result is always a covered integer cell).
+            e = _require_e(eid_t, "entity_center")
+            w, h = match.entity_footprint(e)
+            return (e.x + (w - 1) // 2, e.y + (h - 1) // 2)
+
+        def _aoe_origin(eid_t: Any) -> tuple:
+            # Where an area effect cast BY this entity originates: its
+            # center cell or its anchor, per the aoe_origin_mode rule.
+            e = _require_e(eid_t, "aoe_origin")
+            if str(match.rules.get("aoe_origin_mode", "center")) == "anchor":
+                return (e.x, e.y)
+            w, h = match.entity_footprint(e)
+            return (e.x + (w - 1) // 2, e.y + (h - 1) // 2)
+
+        ns["footprint_width"] = _footprint_width
+        ns["footprint_height"] = _footprint_height
+        ns["footprint_cells"] = _footprint_cells
+        ns["occupies"] = _occupies
+        ns["cell_entity"] = _cell_entity
+        ns["entity_center"] = _entity_center
+        ns["aoe_origin"] = _aoe_origin
 
         # ---- group iteration ----
         def _group_members(name: Any) -> list:
@@ -4282,8 +4370,11 @@ class FormulaEngine:
         # cells_in_* helpers. Each builds the shape's cells then collects
         # the alive entities standing on them.
         def _alive_at(cellset):
+            # Footprint-aware membership: a large entity is "in" the shape
+            # if ANY cell it covers is in cellset (listed once, by anchor).
             return [(e.x, e.y, eid) for eid, e in match.entities.items()
-                    if e.is_alive and (e.x, e.y) in cellset]
+                    if e.is_alive
+                    and any(c in cellset for c in match.entity_cells(e))]
 
         def _occupants() -> dict:
             # Footprint-aware: a large entity registers under EVERY cell it
@@ -4374,9 +4465,13 @@ class FormulaEngine:
             cells = set(_cells_in_cone(x, y, direction, length, half_angle))
             cx0 = _coord_int(x, "entities_in_cone", "x")
             cy0 = _coord_int(y, "entities_in_cone", "y")
+            # Order by NEAREST covered cell to the origin (so a large entity
+            # is ranked by its closest part, matching the nearest-cell
+            # distance convention).
             scored = [
-                (_distance(cx0, cy0, ex, ey, "euclidean_distance"), eid)
-                for (ex, ey, eid) in _alive_at(cells)
+                (min(_distance(cx0, cy0, fx, fy, "euclidean_distance")
+                     for fx, fy in match.entity_cells(match.entities[eid])), eid)
+                for (_ex, _ey, eid) in _alive_at(cells)
             ]
             scored.sort(key=lambda t: (t[0], t[1]))
             return [eid for _, eid in scored]

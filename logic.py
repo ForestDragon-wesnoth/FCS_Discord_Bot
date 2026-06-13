@@ -302,6 +302,17 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "(default var 'footprint_h'). Absent / <1 means height 1."
         ),
     },
+    "aoe_origin_mode": {
+        "default": "center",
+        "schema": {"type": "enum", "choices": ["center", "anchor"]},
+        "desc": (
+            "Where the aoe_origin(eid) primitive places the origin of an "
+            "area effect cast by a (possibly large) entity: 'center' = the "
+            "footprint's center cell (rounded down for even sizes), 'anchor' "
+            "= the top-left cell (entity.x/.y). Only affects aoe_origin(); "
+            "GMs passing explicit coords are unaffected."
+        ),
+    },
     # --- Turn-order shape ---
     # The five rules below control how _rebuild_turn_order produces the
     # turn list from the candidate set (alive entities whose turnorder_var
