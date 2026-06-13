@@ -386,10 +386,11 @@ asking is low. A 30-second clarification beats a 300-line refactor.
 
 ## 7. Current state of the project (as of this handoff)
 
-Recently shipped or in-flight:
+Shipped capabilities (roughly chronological; all merged):
 - Match history / undo system
 - Passives + var hooks + tile hooks
-- Status system (entity.status dicts; tick formula configurable)
+- Status system (entity.status dicts; self-describing status
+  definitions — see the rich-statuses entry below)
 - Clamp system (entity + system-level)
 - Tile templates + tile time-hooks
 - Formula functions (`!func`)
@@ -464,7 +465,7 @@ Recently shipped or in-flight:
 - Summon system (entity templates in vars/tiles; summon/summon_near/
   summon_from/entity_snapshot/remove_entity)
 - round_number / turn_index match-clock primitives
-- Death and corpses (this PR — #34, currently open):
+- Death and corpses — SHIPPED:
   - Configurable death condition (default `hp <= 0`)
   - Per-entity override modes (additive/replace)
   - Corpse OR delete result; tile-data storage
@@ -497,14 +498,13 @@ Recently shipped or in-flight:
     full command privileges but can't appoint. `!host add/remove/list`
     (owner-only). All persisted.
   - **Multi-channel binding.** `Match.bound_channels`
-    (channel_key -> {"label"?}), uncapped. `!match bind/unbind/channels`;
-    `match use`/`bind` keep `MatchManager.active_by_channel` in sync. The
-    `label` is a free-form tag; per-CHANNEL POV rendering DOES exist (see
-    the Visibility PIECE 1 entry — `bound_channels[ch]["pov"]` +
-    `_view_pov`, so `!map`/`!list`/`!state` in a bound channel already
-    render that team's fogged view ON DEMAND). What's NOT built is PUSH
-    auto-routing — the bot proactively re-posting each channel's view when
-    state changes (see the auto-update idea in the "next-on-mind" list).
+    (channel_key -> {"label"?, "pov"?}), uncapped. `!match
+    bind/unbind/channels`; `match use`/`bind` keep
+    `MatchManager.active_by_channel` in sync. The `label` is a free-form
+    tag; the per-channel `pov` (on-demand fogged views) is detailed in
+    Visibility Piece 1 below. PUSH auto-routing (the bot re-posting each
+    channel's view on state change) is the parked auto-update idea, not
+    built.
   - **The gate** lives in `CommandRegistry.run` →
     `_gate_decision` / `_effective_access` (vtt_commands.py). Per-command
     access level via `registry.command(access=...)`: `"all"` /
@@ -544,8 +544,8 @@ Recently shipped or in-flight:
     entities — per match (`!host access`) or as a system default
     (`!system access`).
 - **Visibility rework — PIECE 1 (entity visibility + per-channel POV).**
-  Being built gradually; this is the first slice. Full LOS/range fog is
-  explicitly later.
+  The first slice of a since-completed arc — range fog, LOS, fog memory,
+  and tile/zone/corpse visibility (Pieces 2–3 + LOS) all shipped below.
   - **Per-channel POV.** `bound_channels[ch]["pov"]` = a team string, or
     absent/`"omniscient"` = sees all. `Match.channel_pov(ch)` returns the
     team or None (None = omniscient = no filtering). Set via `!match bind
@@ -567,7 +567,7 @@ Recently shipped or in-flight:
     formula + entity data.
   - **Where it filters.** `render_ascii(pov_team)` filters the ENTITY
     glyph layer; `!list`/`!state`/`!map` filter the live-entity roster +
-    map. Tiles, zones, and CORPSES are NOT yet POV-filtered (Piece 3).
+    map. (Tile / zone / corpse POV filtering followed in Piece 2.)
   - **Full reveal.** `!state full` / `!map full` / `!list full` force the
     omniscient view and are HOST-GATED via `ELEVATED_ARGS` (the inverse
     of `READ_ONLY_SUBCOMMANDS` in `_effective_access`: a `full` first-arg
@@ -593,10 +593,10 @@ Recently shipped or in-flight:
     in a dedicated field set by `!zone glyph <name> <c>` (NOT `!zone
     set ... glyph`, which writes zone DATA).
 
-What the user has flagged as next-on-their-mind:
-- The user repeatedly chooses the "more gamerules, fewer hardcodes"
-  direction. Almost every behavior the engine performs should be
-  configurable.
+Standing direction the user keeps reaffirming: **"more gamerules, fewer
+hardcodes"** — almost every engine behavior should be configurable.
+
+More shipped work (continuing the list above):
 - **`default_entity_vars` gamerule (SHIPPED — fog precursor).** Dict rule
   (var-path -> default value) applied in `Entity.spawn` at the very start,
   before vital-var validation, filling only MISSING vars (so an `!ent add`
@@ -794,15 +794,16 @@ What the user has flagged as next-on-their-mind:
   stay throwaway on-demand renders. Lives in the Discord adapter; the headless
   harness can't exercise it. The "push" half of per-channel POV.
 
-Look at recent PR descriptions on the repo (PRs #30 through #35)
-for context on the latest design conversations and rationale.
+For context on the latest design conversations and rationale, read the
+descriptions of the most recently merged PRs on the repo (they're dense
+and explain the "why").
 
 ---
 
 ## 8. Final advice
 
 **Read this whole file before doing your first edit.** The user has
-shipped 35+ PRs of work with prior Claude instances. The codebase has
+shipped 50+ PRs of work with prior Claude instances. The codebase has
 patterns. Match them. Don't reinvent.
 
 The user is genuinely a great collaborator — clear about goals,
