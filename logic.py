@@ -3054,22 +3054,26 @@ class Entity:
         m._validate_placement(self, x, y, "tp")
         log: List[str] = []
         old_x, old_y = self.x, self.y
+        # Footprint cell sets at the old and new anchors (the dims don't
+        # change during a tp, so new_cells is just old_cells shifted).
+        old_cells = m.entity_cells(self, old_x, old_y)
+        new_cells = m.entity_cells(self, x, y)
         if fire_hooks and (old_x, old_y) != (x, y):
-            # Skip on_exit when teleporting to the current cell (no
+            # Skip on_exit when teleporting to the current footprint (no
             # actual move). Matches the intuition that "tp to where I
             # am" is a no-op rather than a fire-and-reverse cycle.
-            log.extend(m.fire_tile_hook("on_exit", self.id, old_x, old_y))
-            log.extend(m.fire_zone_exit_hooks(self.id, old_x, old_y, x, y))
+            log.extend(m.fire_footprint_tile_exit(self.id, old_cells, new_cells))
+            log.extend(m.fire_footprint_zone_exit(self.id, old_cells, new_cells))
         self.move_to(x, y)
         if fire_hooks:
-            log.extend(m.fire_tile_hook("on_enter", self.id, x, y))
-            log.extend(m.fire_tile_hook("on_stop", self.id, x, y))
+            log.extend(m.fire_footprint_tile_enter(self.id, old_cells, new_cells))
+            log.extend(m.fire_footprint_tile_stop(self.id, new_cells))
             # A tp is a single, final step; zone enter + stop fire here.
-            # (For a same-cell tp, fire_zone_enter_hooks still fires
+            # (For a same-cell tp, fire_footprint_zone_enter still fires
             # on_stop/on_cell_stop for the standing-on zones — a tp that
             # "lands" re-affirms its stop, matching on_stop's tile
             # semantics which fire even on a same-cell tp.)
-            log.extend(m.fire_zone_enter_hooks(self.id, old_x, old_y, x, y, True))
+            log.extend(m.fire_footprint_zone_enter(self.id, old_cells, new_cells, True))
             # Entity-side movement event. Fires once per tp call (not
             # per step), AFTER the tile hooks so a passive observing
             # the move sees the final (x, y) and any side-effects the
@@ -3168,19 +3172,22 @@ class Entity:
         origin_x, origin_y = self.x, self.y
         for nx, ny, step_facing in step_path:
             step_from_x, step_from_y = self.x, self.y
+            old_cells = m.entity_cells(self, step_from_x, step_from_y)
+            new_cells = m.entity_cells(self, nx, ny)
             if fire_hooks:
-                log.extend(m.fire_tile_hook("on_exit", self.id, self.x, self.y))
-                log.extend(m.fire_zone_exit_hooks(
-                    self.id, step_from_x, step_from_y, nx, ny))
+                # Per-step, fire on_exit/on_cell_exit for the cells the
+                # footprint vacates this step and the boundary on_exit for
+                # zones it fully leaves.
+                log.extend(m.fire_footprint_tile_exit(self.id, old_cells, new_cells))
+                log.extend(m.fire_footprint_zone_exit(self.id, old_cells, new_cells))
             self.facing = step_facing
             self.move_to(nx, ny)
             if fire_hooks:
-                log.extend(m.fire_tile_hook("on_enter", self.id, nx, ny))
-                # Per-step zone enter (boundary on_enter + per-cell
-                # on_cell_enter); the stop hooks fire once after the loop
-                # at the final cell, like tile on_stop below.
-                log.extend(m.fire_zone_enter_hooks(
-                    self.id, step_from_x, step_from_y, nx, ny, False))
+                # on_enter/on_cell_enter for the newly-covered cells; the
+                # stop hooks fire once after the loop at the final cells.
+                log.extend(m.fire_footprint_tile_enter(self.id, old_cells, new_cells))
+                log.extend(m.fire_footprint_zone_enter(
+                    self.id, old_cells, new_cells, False))
                 # Per-step entity hook: fires AFTER on_enter so
                 # passives see whatever the just-entered tile already
                 # applied (e.g. a damage tile's hp delta) on top of
@@ -3191,11 +3198,12 @@ class Entity:
                     self.id, step_from_x, step_from_y, nx, ny,
                 ))
         if fire_hooks and step_path:
-            # on_stop fires once at the final cell, even if no actual
+            # on_stop fires once per final footprint cell, even if no actual
             # movement happened (zero-step move_dirs) — empty step_path
             # means no transit and therefore no stop.
-            log.extend(m.fire_tile_hook("on_stop", self.id, self.x, self.y))
-            log.extend(m.fire_zone_stop_hooks(self.id, self.x, self.y))
+            final_cells = m.entity_cells(self, self.x, self.y)
+            log.extend(m.fire_footprint_tile_stop(self.id, final_cells))
+            log.extend(m.fire_footprint_zone_stop(self.id, final_cells))
             # on_entity_moved fires ONCE for the whole stepwise move,
             # with from = origin and to = final position. Step-level
             # observation is via tile on_enter/on_exit; on_entity_moved
@@ -4319,22 +4327,25 @@ class Match:
         return z is not None and (x, y) in z["cells"]
 
     def entity_zones(self, eid: str) -> Set[str]:
-        """Names of every zone the entity currently stands in."""
+        """Names of every zone the entity currently stands in — any zone
+        overlapping ANY of its footprint cells (a large entity is 'in' a
+        zone if any part of its body is)."""
         e = self.entities.get(eid)
         if e is None:
             return set()
-        return self.zones_at(e.x, e.y)
+        return self._zones_over(self.entity_cells(e))
 
     def entities_in_zone(self, name: str) -> List[str]:
-        """Ids of every alive entity standing on a cell of the zone, in
-        insertion order. [] for a missing zone."""
+        """Ids of every alive entity with ANY footprint cell in the zone,
+        in insertion order. [] for a missing zone."""
         z = self.zones.get(name)
         if z is None:
             return []
         cells = z["cells"]
         return [
             eid for eid, e in self.entities.items()
-            if getattr(e, "is_alive", True) and (e.x, e.y) in cells
+            if getattr(e, "is_alive", True)
+            and any(c in cells for c in self.entity_cells(e))
         ]
 
     # ---- zone data accessors (dotted paths under zone["data"]) -------
@@ -5545,23 +5556,28 @@ class Match:
                 if self._check_block(mover.id, cx, cy, "swap"):
                     raise Blocked(f"Cell ({cx},{cy}) blocks `{mover.id}`")
         log: List[str] = []
-        # Fire on_exit at CURRENT positions before any state changes, so
-        # passives observe each entity still standing on its old cell.
-        log += self.fire_tile_hook("on_exit", a, ax, ay)
-        log += self.fire_zone_exit_hooks(a, ax, ay, bx, by)
-        log += self.fire_tile_hook("on_exit", b, bx, by)
-        log += self.fire_zone_exit_hooks(b, bx, by, ax, ay)
+        # Footprint cell sets for each partner at its old and new anchor.
+        a_old = self.entity_cells(ea, ax, ay)
+        a_new = self.entity_cells(ea, bx, by)
+        b_old = self.entity_cells(eb, bx, by)
+        b_new = self.entity_cells(eb, ax, ay)
+        # Fire exit-side hooks at CURRENT positions before any state change,
+        # so passives observe each entity still standing on its old cells.
+        log += self.fire_footprint_tile_exit(a, a_old, a_new)
+        log += self.fire_footprint_zone_exit(a, a_old, a_new)
+        log += self.fire_footprint_tile_exit(b, b_old, b_new)
+        log += self.fire_footprint_zone_exit(b, b_old, b_new)
         # Atomic swap via direct move_to (bypasses is_occupied — required,
         # since A and B occupy each other's target cells until done).
         ea.move_to(bx, by)
         eb.move_to(ax, ay)
-        log += self.fire_tile_hook("on_enter", a, bx, by)
-        log += self.fire_tile_hook("on_stop", a, bx, by)
         # Each swap partner's move is a single, final step — enter + stop.
-        log += self.fire_zone_enter_hooks(a, ax, ay, bx, by, True)
-        log += self.fire_tile_hook("on_enter", b, ax, ay)
-        log += self.fire_tile_hook("on_stop", b, ax, ay)
-        log += self.fire_zone_enter_hooks(b, bx, by, ax, ay, True)
+        log += self.fire_footprint_tile_enter(a, a_old, a_new)
+        log += self.fire_footprint_tile_stop(a, a_new)
+        log += self.fire_footprint_zone_enter(a, a_old, a_new, True)
+        log += self.fire_footprint_tile_enter(b, b_old, b_new)
+        log += self.fire_footprint_tile_stop(b, b_new)
+        log += self.fire_footprint_zone_enter(b, b_old, b_new, True)
         log += self.fire_entity_moved(a, ax, ay, bx, by)
         log += self.fire_entity_moved(b, bx, by, ax, ay)
         return True, log
@@ -6140,6 +6156,98 @@ class Match:
         for name in sorted(self.zones_at(x, y)):
             log.extend(self.fire_zone_hook("on_stop", name, entity_id, x, y))
             log.extend(self.fire_zone_hook("on_cell_stop", name, entity_id, x, y))
+        return log
+
+    # ---- footprint-aware movement hook firing ------------------------
+    # A large entity fires tile/zone movement hooks per CELL it covers:
+    # on_exit / on_cell_exit for every cell the footprint vacates,
+    # on_enter / on_cell_enter for every cell it newly covers, and
+    # on_stop / on_cell_stop for every final cell — so a 2×2 crossing a
+    # band of fire tiles burns once per fire cell entered. Boundary zone
+    # hooks (on_enter/on_exit/on_stop) fire ONCE per zone (at the first
+    # relevant cell); per-cell zone hooks fire per covered cell. For a
+    # 1×1 entity these reduce exactly to the single-cell firings.
+
+    def _zones_over(self, cells) -> set:
+        names: set = set()
+        for (cx, cy) in cells:
+            names |= set(self.zones_at(cx, cy))
+        return names
+
+    def fire_footprint_tile_exit(self, eid: Optional[str],
+                                 old_cells, new_cells) -> List[str]:
+        nc = set(new_cells)
+        log: List[str] = []
+        for (cx, cy) in old_cells:
+            if (cx, cy) not in nc:
+                log.extend(self.fire_tile_hook("on_exit", eid, cx, cy))
+        return log
+
+    def fire_footprint_tile_enter(self, eid: Optional[str],
+                                  old_cells, new_cells) -> List[str]:
+        oc = set(old_cells)
+        log: List[str] = []
+        for (cx, cy) in new_cells:
+            if (cx, cy) not in oc:
+                log.extend(self.fire_tile_hook("on_enter", eid, cx, cy))
+        return log
+
+    def fire_footprint_tile_stop(self, eid: Optional[str], cells) -> List[str]:
+        log: List[str] = []
+        for (cx, cy) in cells:
+            log.extend(self.fire_tile_hook("on_stop", eid, cx, cy))
+        return log
+
+    def fire_footprint_zone_exit(self, eid: Optional[str],
+                                 old_cells, new_cells) -> List[str]:
+        """PRE-move: per-cell on_cell_exit for every vacated cell in a
+        zone, plus boundary on_exit ONCE for each zone the whole footprint
+        is leaving (was overlapped, now disjoint)."""
+        nc = set(new_cells)
+        leaving = self._zones_over(old_cells) - self._zones_over(new_cells)
+        log: List[str] = []
+        for (cx, cy) in old_cells:
+            if (cx, cy) in nc:
+                continue
+            for name in sorted(set(self.zones_at(cx, cy))):
+                if name in leaving:
+                    log.extend(self.fire_zone_hook("on_exit", name, eid, cx, cy))
+                    leaving.discard(name)
+                log.extend(self.fire_zone_hook("on_cell_exit", name, eid, cx, cy))
+        return log
+
+    def fire_footprint_zone_enter(self, eid: Optional[str],
+                                  old_cells, new_cells,
+                                  is_final: bool) -> List[str]:
+        """POST-move: boundary on_enter ONCE for each newly-overlapped
+        zone + per-cell on_cell_enter for every newly-covered cell in a
+        zone. When is_final, also fire the footprint stop hooks."""
+        oc = set(old_cells)
+        entering = self._zones_over(new_cells) - self._zones_over(old_cells)
+        log: List[str] = []
+        for (cx, cy) in new_cells:
+            if (cx, cy) in oc:
+                continue
+            for name in sorted(set(self.zones_at(cx, cy))):
+                if name in entering:
+                    log.extend(self.fire_zone_hook("on_enter", name, eid, cx, cy))
+                    entering.discard(name)
+                log.extend(self.fire_zone_hook("on_cell_enter", name, eid, cx, cy))
+        if is_final:
+            log.extend(self.fire_footprint_zone_stop(eid, new_cells))
+        return log
+
+    def fire_footprint_zone_stop(self, eid: Optional[str], cells) -> List[str]:
+        """Boundary on_stop ONCE per zone the footprint ends in, plus
+        per-cell on_cell_stop for every final cell in a zone."""
+        log: List[str] = []
+        stopped: set = set()
+        for (cx, cy) in cells:
+            for name in sorted(set(self.zones_at(cx, cy))):
+                if name not in stopped:
+                    log.extend(self.fire_zone_hook("on_stop", name, eid, cx, cy))
+                    stopped.add(name)
+                log.extend(self.fire_zone_hook("on_cell_stop", name, eid, cx, cy))
         return log
 
     def fire_zone_time_hooks(self, when: str) -> List[str]:
