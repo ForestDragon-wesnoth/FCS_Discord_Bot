@@ -3988,9 +3988,12 @@ class Match:
         def in_new(x: int, y: int) -> bool:
             return 1 <= x <= new_w and 1 <= y <= new_h
 
-        # Entities whose post-shift cell falls off the new grid.
+        # Entities whose post-shift footprint would fall (even partly) off
+        # the new grid — a large entity is "cut" if ANY covered cell lands
+        # off-grid.
         cut = sorted(e.id for e in self.entities.values()
-                     if not in_new(e.x + ox, e.y + oy))
+                     if not all(in_new(cx + ox, cy + oy)
+                                for cx, cy in self.entity_cells(e)))
         log: List[str] = []
         if cut:
             mode = str(self.rules.get("map_resize_shrink_mode", "block"))
@@ -4920,16 +4923,43 @@ class Match:
             "zone_visibility_condition", pov_team,
             extras={"zone_name": name})
 
+    def _corpse_footprint(self, corpse: Dict[str, Any]) -> Tuple[int, int]:
+        """(w, h) of a corpse's footprint, read from the dead entity's
+        stored footprint vars (1×1 when absent) — so a large entity
+        leaves a large corpse. One stored corpse identity, footprint
+        derived, exactly like the live-entity convention."""
+        w = h = 1
+        ent = corpse.get("entity") if isinstance(corpse, dict) else None
+        cv = ent.get("vars", {}) if isinstance(ent, dict) else {}
+        if isinstance(cv, dict):
+            try:
+                w = max(1, int(cv.get(str(self.rules.get("footprint_width_var", "footprint_w")))))
+            except (TypeError, ValueError):
+                w = 1
+            try:
+                h = max(1, int(cv.get(str(self.rules.get("footprint_height_var", "footprint_h")))))
+            except (TypeError, ValueError):
+                h = 1
+        return w, h
+
+    def corpse_cells(self, x: int, y: int,
+                     corpse: Dict[str, Any]) -> List[Tuple[int, int]]:
+        """The cells a corpse covers, anchored at its tile (x, y)."""
+        w, h = self._corpse_footprint(corpse)
+        return [(x + dx, y + dy) for dy in range(h) for dx in range(w)]
+
     def corpse_visible_to(self, eid: str, corpse: Dict[str, Any],
                           x: int, y: int, pov_team: Optional[str]) -> bool:
         """Whether a corpse (Dead: row) is visible to `pov_team`. A
         corpse is a stored snapshot, not a live entity, so the formula
         gets corpse_team (the dead entity's team_var value at death) +
-        tile_x / tile_y rather than `self`. See
+        tile_x / tile_y rather than `self`. A large corpse is visible if
+        ANY cell of its footprint is fog-visible. See
         corpse_visibility_condition."""
         if pov_team is None:
             return True
-        if not self._fog_terrain_visible(pov_team, x, y):
+        if not any(self._fog_terrain_visible(pov_team, cx, cy)
+                   for cx, cy in self.corpse_cells(x, y, corpse)):
             return False
         team_var = str(self.rules.get("team_var", "team"))
         corpse_team = ""
