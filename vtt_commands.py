@@ -6400,6 +6400,190 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 
 @registry.command(
+    "status",
+    usage=("!status <def|drop|tick|when|stack|maxlevel|data|list|info|apply> ..."),
+    desc=(
+        "Status DEFINITIONS — self-describing statuses. Define a status "
+        "once (its per-tick effect, when it ticks, how it stacks, its max "
+        "level, default data); applying it to entities instantiates from "
+        "the definition. A status instance on an entity resolves its "
+        "behavior from the definition of the SAME name. `tick` is a formula "
+        "run at the definition's `when` (default turn_end) with self=the "
+        "bearer and status_name bound — it's where the DoT/regen effect AND "
+        "any duration decrement / self-removal live (auto-decay is "
+        "deliberately not built in). Apply with `!status apply <eid> <name> "
+        "[level] [duration]` (or the status_apply formula primitive), which "
+        "honors the definition's stack mode (else the status_default_stack "
+        "rule). Raw per-entity instance editing stays on `!ent status`. "
+        "Subcommands: def, drop, tick, when, stack, maxlevel, data, list, "
+        "info, apply."
+    ),
+)
+async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["status"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    sub = args[0].lower()
+    _TICK_WHENS = ("turn_end", "turn_start", "round_start", "round_end", "never")
+    _STACK_MODES = ("refresh", "add_level", "extend", "replace", "none")
+
+    if sub == "def":
+        if await return_help_if_not_enough_args(ctx, args, 2, "status", "def"):
+            return
+        name = args[1]
+        try:
+            m.define_status(name)
+        except (VTTError, DuplicateId) as ex:
+            return await ctx.send(f"❌ {ex}")
+        return await ctx.send(
+            f"Defined status `{name}` (tick_when=turn_end, no tick yet). "
+            f"Set its effect with `!status tick {name} \"<formula>\"`."
+        )
+
+    if sub == "drop":
+        if await return_help_if_not_enough_args(ctx, args, 2, "status", "drop"):
+            return
+        try:
+            m.remove_status_def(args[1])
+        except NotFound as ex:
+            return await ctx.send(f"❌ {ex}")
+        return await ctx.send(
+            f"Removed status definition `{args[1]}`. Existing instances "
+            f"keep their data but lose tick behavior."
+        )
+
+    if sub == "tick":
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "tick"):
+            return
+        name = args[1]
+        if name not in m.status_definitions:
+            return await ctx.send(f"❌ No status definition `{name}`. Use `!status def {name}` first.")
+        body = normalize_body_source(" ".join(args[2:]).strip())
+        if body:
+            from formula import validate_formula
+            try:
+                validate_formula(
+                    body, mode="exec",
+                    known_funcs=frozenset(m.formula_functions.keys()),
+                )
+            except FormulaError as ex:
+                return await ctx.send(f"❌ Invalid tick formula: {ex}")
+        m.status_definitions[name]["tick"] = body
+        return await ctx.send(f"Set `{name}` tick formula.")
+
+    if sub == "when":
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "when"):
+            return
+        name = args[1]
+        when = args[2].lower()
+        if name not in m.status_definitions:
+            return await ctx.send(f"❌ No status definition `{name}`.")
+        if when not in _TICK_WHENS:
+            return await ctx.send(f"❌ when must be one of: {', '.join(_TICK_WHENS)}.")
+        m.status_definitions[name]["tick_when"] = when
+        return await ctx.send(f"`{name}` ticks at {when}.")
+
+    if sub == "stack":
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "stack"):
+            return
+        name = args[1]
+        mode = args[2].lower()
+        if name not in m.status_definitions:
+            return await ctx.send(f"❌ No status definition `{name}`.")
+        if mode not in _STACK_MODES:
+            return await ctx.send(f"❌ stack mode must be one of: {', '.join(_STACK_MODES)}.")
+        m.status_definitions[name]["stack"] = mode
+        return await ctx.send(f"`{name}` stack mode = {mode}.")
+
+    if sub == "maxlevel":
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "maxlevel"):
+            return
+        name = args[1]
+        if name not in m.status_definitions:
+            return await ctx.send(f"❌ No status definition `{name}`.")
+        try:
+            n = int(args[2])
+        except ValueError:
+            return await ctx.send("❌ maxlevel must be an integer (0 = uncapped).")
+        m.status_definitions[name]["max_level"] = max(0, n)
+        return await ctx.send(f"`{name}` max_level = {max(0, n)}.")
+
+    if sub == "data":
+        if await return_help_if_not_enough_args(ctx, args, 4, "status", "data"):
+            return
+        name = args[1]
+        if name not in m.status_definitions:
+            return await ctx.send(f"❌ No status definition `{name}`.")
+        path = args[2]
+        value = _parse_scalar(args[3])
+        d = m.status_definitions[name].setdefault("data", {})
+        try:
+            _set_path(d, path, value)
+        except (VTTError, KeyError, TypeError) as ex:
+            return await ctx.send(f"❌ {ex}")
+        return await ctx.send(f"`{name}` default data.{path} = {value!r}")
+
+    if sub == "list":
+        if not m.status_definitions:
+            return await ctx.send("No status definitions in this match.")
+        lines = ["**Status definitions:**"]
+        for name in sorted(m.status_definitions.keys()):
+            d = m.status_definitions[name]
+            bits = [f"when={d.get('tick_when', 'turn_end')}"]
+            if d.get("stack"):
+                bits.append(f"stack={d['stack']}")
+            if d.get("max_level"):
+                bits.append(f"max_lvl={d['max_level']}")
+            if not (isinstance(d.get("tick"), str) and d["tick"].strip()):
+                bits.append("no tick")
+            lines.append(f"- `{name}` ({', '.join(bits)})")
+        return await ctx.send("\n".join(lines))
+
+    if sub == "info":
+        if await return_help_if_not_enough_args(ctx, args, 2, "status", "info"):
+            return
+        name = args[1]
+        d = m.status_definitions.get(name)
+        if d is None:
+            return await ctx.send(f"No status definition `{name}`.")
+        return await ctx.send(
+            f"**status def `{name}`**\n```{json.dumps(d, indent=2, sort_keys=True)}\n```"
+        )
+
+    if sub == "apply":
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "apply"):
+            return
+        eid = _resolve_eid(m, args[1])
+        name = args[2]
+        level = duration = None
+        if len(args) >= 4:
+            try:
+                level = int(args[3])
+            except ValueError:
+                return await ctx.send("❌ level must be an integer.")
+        if len(args) >= 5:
+            try:
+                duration = int(args[4])
+            except ValueError:
+                return await ctx.send("❌ duration must be an integer.")
+        try:
+            event_log = m.apply_status(eid, name, level, duration)
+        except (VTTError, NotFound) as ex:
+            return await ctx.send(f"❌ {ex}")
+        inst = m.entities[eid].status.get(name, {})
+        tail = ("\n" + "\n".join(event_log)) if event_log else ""
+        return await ctx.send(
+            f"Applied `{name}` to `{eid}` "
+            f"(level={inst.get('level', '?')}, "
+            f"duration={inst.get('duration', '∞')}).{tail}"
+        )
+
+    title, body = registry.help_for(["status"])
+    return await ctx.send(f"**{title}**\n{body}")
+
+
+@registry.command(
     "func",
     usage=("!func <def|del|list|info> ..."),
     desc=(
