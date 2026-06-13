@@ -4286,10 +4286,14 @@ class FormulaEngine:
                     if e.is_alive and (e.x, e.y) in cellset]
 
         def _occupants() -> dict:
+            # Footprint-aware: a large entity registers under EVERY cell it
+            # covers, so it's "on the line" / "in the way" if any part of
+            # its body is. Consumers dedupe across cells.
             here: dict = {}
             for eid, e in match.entities.items():
                 if e.is_alive:
-                    here.setdefault((e.x, e.y), []).append(eid)
+                    for c in match.entity_cells(e):
+                        here.setdefault(c, []).append(eid)
             return here
 
         def _entities_in_line_ignorelos(x1: Any, y1: Any,
@@ -4297,17 +4301,22 @@ class FormulaEngine:
             """entities_in_line_ignorelos(x1, y1, x2, y2): alive entity ids
             on the geometric line from (x1,y1) to (x2,y2), INCLUDING the
             endpoints, ordered near->far (same line walk as has_los, but
-            opacity is ignored — walls don't stop the count). For the
-            sight-aware version that stops at terrain and skips the shooter
-            and target, use entities_on_los."""
+            opacity is ignored — walls don't stop the count). A large entity
+            counts if any footprint cell is on the line (listed once, at its
+            nearest cell). For the sight-aware version that stops at terrain
+            and skips the shooter and target, use entities_on_los."""
             cx1 = _coord_int(x1, "entities_in_line_ignorelos", "x1")
             cy1 = _coord_int(y1, "entities_in_line_ignorelos", "y1")
             cx2 = _coord_int(x2, "entities_in_line_ignorelos", "x2")
             cy2 = _coord_int(y2, "entities_in_line_ignorelos", "y2")
             here = _occupants()
-            out = []
+            out: list = []
+            seen: set = set()
             for cell in match._line_cells(cx1, cy1, cx2, cy2):
-                out.extend(sorted(here.get(cell, ())))
+                for eid in sorted(here.get(cell, ())):
+                    if eid not in seen:
+                        seen.add(eid)
+                        out.append(eid)
             return out
 
         def _entities_on_los(x1: Any, y1: Any, x2: Any, y2: Any,
@@ -4326,14 +4335,22 @@ class FormulaEngine:
             cy2 = _coord_int(y2, "entities_on_los", "y2")
             vid = None if viewer is None else _eid(viewer)
             here = _occupants()
-            out = []
+            # Exclude the shooter and target BY ID, not just their anchor
+            # cells: a large shooter/target's body can extend onto the
+            # in-between cells, and those aren't "in the way" of its own shot.
+            endpoint_ids = set(here.get((cx1, cy1), ())) | set(here.get((cx2, cy2), ()))
+            out: list = []
+            seen: set = set(endpoint_ids)
             for cell in match._line_cells(cx1, cy1, cx2, cy2)[1:-1]:
                 ids = here.get(cell)
                 if not ids:
                     continue
                 if not match.has_los(vid, cx1, cy1, cell[0], cell[1]):
                     continue
-                out.extend(sorted(ids))
+                for eid in sorted(ids):
+                    if eid not in seen:
+                        seen.add(eid)
+                        out.append(eid)
             return out
 
         def _first_opaque(x1: Any, y1: Any, x2: Any, y2: Any,
@@ -4486,17 +4503,14 @@ class FormulaEngine:
             return match._team_has_los(_tm(team), int(x), int(y))
 
         def _team_sees_entity(team: Any, eid_t: Any) -> bool:
-            e = match.entities.get(_eid(eid_t))
-            return False if e is None else \
-                match._team_sees(_tm(team), e.x, e.y, los=True)
+            # Footprint-aware: a large target is seen if ANY of its cells is.
+            return match._team_sees_entity(_tm(team), _eid(eid_t), los=True)
 
         def _team_sees_entity_rangeonly(team: Any, eid_t: Any) -> bool:
             return match.team_sees_entity(_tm(team), _eid(eid_t))
 
         def _team_sees_entity_losonly(team: Any, eid_t: Any) -> bool:
-            e = match.entities.get(_eid(eid_t))
-            return False if e is None else \
-                match._team_has_los(_tm(team), e.x, e.y)
+            return match._team_has_los_entity(_tm(team), _eid(eid_t))
 
         def _can_see(eid_t: Any, x: Any, y: Any) -> bool:
             return match._entity_sees(_eid(eid_t), int(x), int(y), los=True)

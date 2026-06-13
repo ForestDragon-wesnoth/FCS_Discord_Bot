@@ -4516,12 +4516,30 @@ class Match:
         range query. LOS-aware team vision is _team_sees(..., los=True)."""
         return self._team_sees(pov_team, x, y, los=False)
 
-    def team_sees_entity(self, pov_team: Optional[str], eid: str) -> bool:
-        """RANGE team vision of entity `eid`'s cell. False for unknown."""
+    def _team_sees_entity(self, pov_team: Optional[str], eid: str,
+                          *, los: bool) -> bool:
+        """Whether team `pov_team` sees entity `eid` — true when ANY cell
+        of its footprint is seen (range, plus LOS when `los`). A large
+        body is spotted if any part of it is in view."""
         e = self.entities.get(eid)
         if e is None:
             return False
-        return self._team_sees(pov_team, e.x, e.y, los=False)
+        return any(self._team_sees(pov_team, cx, cy, los=los)
+                   for cx, cy in self.entity_cells(e))
+
+    def _team_has_los_entity(self, pov_team: Optional[str], eid: str) -> bool:
+        """Any alive member of `pov_team` has a clear line to ANY of
+        `eid`'s footprint cells (LOS only, ignores range)."""
+        e = self.entities.get(eid)
+        if e is None:
+            return False
+        return any(self._team_has_los(pov_team, cx, cy)
+                   for cx, cy in self.entity_cells(e))
+
+    def team_sees_entity(self, pov_team: Optional[str], eid: str) -> bool:
+        """RANGE team vision of entity `eid` (any footprint cell). False
+        for unknown."""
+        return self._team_sees_entity(pov_team, eid, los=False)
 
     def entity_can_see(self, viewer_eid: str, x: int, y: int) -> bool:
         """Does the single unit `viewer_eid` see (x, y) by RANGE (within its
@@ -4703,9 +4721,16 @@ class Match:
 
     # ---- combined vision (range and/or LOS) -------------------------
     def _member_sees(self, e: "Entity", x: int, y: int, *, los: bool) -> bool:
-        if not self._within_vision(e.x, e.y, x, y, self._vision_radius_of(e)):
-            return False
-        return (not los) or self.has_los(e.id, e.x, e.y, x, y)
+        # A large viewer sees from its WHOLE body: (x,y) is seen if any
+        # footprint cell is within vision radius (and — under LOS — has a
+        # clear line from that cell). The radius is measured per cell, so
+        # a 3×3 scout projects its sight disc from every cell it covers.
+        r = self._vision_radius_of(e)
+        for (ex, ey) in self.entity_cells(e):
+            if self._within_vision(ex, ey, x, y, r) and (
+                    (not los) or self.has_los(e.id, ex, ey, x, y)):
+                return True
+        return False
 
     def _team_sees(self, pov_team: Optional[str], x: int, y: int,
                    *, los: bool) -> bool:
@@ -4786,15 +4811,18 @@ class Match:
             if not e.is_alive or e.team != team:
                 continue
             r = self._vision_radius_of(e)
-            for yy in range(max(1, e.y - r), min(self.grid_height, e.y + r) + 1):
-                for xx in range(max(1, e.x - r), min(self.grid_width, e.x + r) + 1):
-                    if (xx, yy) in seen:
-                        continue
-                    if not self._within_vision(e.x, e.y, xx, yy, r):
-                        continue
-                    if use_los and not self.has_los(e.id, e.x, e.y, xx, yy):
-                        continue
-                    seen.add((xx, yy))
+            # A large viewer reveals the UNION of every footprint cell's
+            # vision-radius neighbourhood (LOS measured from that cell).
+            for (ex, ey) in self.entity_cells(e):
+                for yy in range(max(1, ey - r), min(self.grid_height, ey + r) + 1):
+                    for xx in range(max(1, ex - r), min(self.grid_width, ex + r) + 1):
+                        if (xx, yy) in seen:
+                            continue
+                        if not self._within_vision(ex, ey, xx, yy, r):
+                            continue
+                        if use_los and not self.has_los(e.id, ex, ey, xx, yy):
+                            continue
+                        seen.add((xx, yy))
 
     def _visibility_visible(self, rule_key: str, pov_team: Optional[str], *,
                             target: Optional[str] = None,
@@ -4832,7 +4860,12 @@ class Match:
         if eid not in self.entities:
             return False
         e = self.entities[eid]
-        if not self._fog_entity_visible(pov_team, e.x, e.y):
+        # A large entity is fog-visible if ANY footprint cell passes the
+        # entity fog gate (current vision, or remembered when memory mode
+        # is 'full') — so a giant is hidden only when its whole body is
+        # in fog.
+        if not any(self._fog_entity_visible(pov_team, cx, cy)
+                   for cx, cy in self.entity_cells(e)):
             return False
         return self._visibility_visible(
             "entity_visibility_condition", pov_team, target=eid)
