@@ -499,8 +499,12 @@ Recently shipped or in-flight:
   - **Multi-channel binding.** `Match.bound_channels`
     (channel_key -> {"label"?}), uncapped. `!match bind/unbind/channels`;
     `match use`/`bind` keep `MatchManager.active_by_channel` in sync. The
-    `label` is reserved for the NOT-YET-BUILT per-team / fog-of-war
-    views — binding routing exists, per-channel rendering does not.
+    `label` is a free-form tag; per-CHANNEL POV rendering DOES exist (see
+    the Visibility PIECE 1 entry — `bound_channels[ch]["pov"]` +
+    `_view_pov`, so `!map`/`!list`/`!state` in a bound channel already
+    render that team's fogged view ON DEMAND). What's NOT built is PUSH
+    auto-routing — the bot proactively re-posting each channel's view when
+    state changes (see the auto-update idea in the "next-on-mind" list).
   - **The gate** lives in `CommandRegistry.run` →
     `_gate_decision` / `_effective_access` (vtt_commands.py). Per-command
     access level via `registry.command(access=...)`: `"all"` /
@@ -680,9 +684,10 @@ What the user has flagged as next-on-their-mind:
   fail(...)`). NOTE `!ent set_var x v false` coerces only LOWERCASE
   true/false to bool (capitalized stays a string → truthy); formula BODIES
   use `True`/`False`.
-  - Possible later: per-channel auto-routing; richer corpse-snapshot
-    introspection (status/vars not exposed today); elevation as a
-    first-class rule; vision-result caching beyond the radius bound.
+  - Possible later: per-channel PUSH auto-routing (the auto-update idea
+    below); corpse STATUS introspection (vars now exposed via corpse_var,
+    status still not); elevation as a first-class rule; vision-result
+    caching beyond the radius bound.
 - **Large / multi-tile entities — SHIPPED.** An entity can occupy a W×H
   RECTANGLE of cells anchored at its TOP-LEFT cell (`entity[X].x/.y` stays
   the sole addressing convention; the footprint extends right/down). W and
@@ -731,6 +736,36 @@ What the user has flagged as next-on-their-mind:
   Scenarios 382–386. FUTURE the user may want: arbitrary/L-shaped
   footprints, footprint rotation on facing change, edge-aware side_hit,
   corpse occupancy as a gamerule.
+- **Corpse var introspection — SHIPPED.** `corpse_var(eid, path[, default])`
+  + `corpse_has(eid, path)` read a DEAD entity's frozen vars by dotted path
+  (the loot / "was it carrying the key" / "raise with the same statline"
+  patterns). Mirror var_get/var_has: corpse_var raises on a missing
+  corpse/path unless a default is supplied; corpse_has returns bool, never
+  raises. Read-only (snapshot immutable until revive). `corpse_team`
+  remains a HOOK_CONTEXT binding only. Status introspection deferred.
+  Scenario 387.
+- **Entity-anchored auras — SHIPPED.** A zone can be bound to an entity as
+  an AURA via reserved zone fields `anchor`/`anchor_radius`/`anchor_metric`.
+  Its `cells` are RE-STAMPED (footprint-aware disc of `anchor_radius` around
+  every footprint cell of the anchor; radius 0 = the footprint) whenever the
+  anchor moves — hooked into `fire_entity_moved` (so tp/move_dirs/push/pull/
+  swap all carry it), clipped to grid. Cells stay a concrete set, so all zone
+  queries/hooks/glyph render work unchanged; the restamp does NOT fire the
+  aura's own enter/exit hooks (same stance as zone_shift). On anchor death/
+  despawn (both route through `Entity.remove`) the `anchored_zone_on_anchor_loss`
+  rule decides: `delete` (default) drops the aura, `freeze` clears the binding
+  and leaves a static zone. Surface: `!zone anchor <name> <eid> [radius]
+  [metric]` / `!zone unanchor` (shown in `!zone info`/`list`); formula prims
+  `zone_anchor`/`zone_unanchor`/`zone_anchor_of`. Anchor fields serialize
+  (save + undo via `_zone_to_dict`/`_zone_from_dict`). Core: `_stamp_anchored_zone`
+  / `_restamp_anchors_for` / `_release_anchored_zones` / `anchor_zone` /
+  `unanchor_zone` in logic.py. Scenarios 388-389.
+- Idea parked (Discord-only, not built): **opt-in auto-updating views** —
+  `!map autoupdate` / `!state autoupdate` create a self-refreshing
+  (edit-in-place) board message per channel that the bot updates on
+  state-changing commands, HOST-ONLY by default, while plain `!map`/`!state`
+  stay throwaway on-demand renders. Lives in the Discord adapter; the headless
+  harness can't exercise it. The "push" half of per-channel POV.
 
 Look at recent PR descriptions on the repo (PRs #30 through #35)
 for context on the latest design conversations and rationale.
