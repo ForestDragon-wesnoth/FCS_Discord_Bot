@@ -1414,7 +1414,13 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   has_corpse(eid)     -> bool
     #   corpse_at(eid)      -> (x, y); raises if no such corpse
     #   all_corpses()       -> list of corpse ids (loopable)
+    #   corpse_has(eid, path)        -> bool (dotted vars path resolves
+    #                                   on the dead entity's snapshot)
+    #   corpse_var(eid, path[, def]) -> the dead entity's stored var at a
+    #                                   dotted path (raises if missing
+    #                                   unless a default is supplied)
     "kill", "revive", "has_corpse", "corpse_at", "all_corpses",
+    "corpse_has", "corpse_var",
     # Scheduled / delayed effects. schedule() queues a MATCH-level body
     # to run at on_round_start `delay` rounds out (no self bound);
     # schedule_on() queues an ENTITY-attached body to run at that
@@ -4016,11 +4022,74 @@ class FormulaEngine:
             all_corpses(): if condition: revive(cid)`."""
             return [eid for (_x, _y, eid, _c) in match.all_corpses()]
 
+        # ---- corpse var introspection ----
+        # A corpse is a stored snapshot (corpse["entity"] = Entity.to_dict
+        # at death). These read the DEAD entity's frozen vars by dotted
+        # path — the loot / "raise with the same statline" / "was it
+        # carrying the key?" patterns. Read-only: a corpse's snapshot is
+        # immutable until revive. Mirror var_get / var_has semantics
+        # (raise on missing for the getter unless a default is supplied;
+        # bool for the has-check). Status is intentionally NOT exposed yet.
+        _corpse_no_default = object()
+
+        def _corpse_vars(eid: str):
+            """The dead entity's stored vars dict, or None if no such
+            corpse (an empty dict if the corpse has no vars)."""
+            loc = match.find_corpse(eid)
+            if loc is None:
+                return None
+            _x, _y, corpse = loc
+            ent = corpse.get("entity") if isinstance(corpse, dict) else None
+            cv = ent.get("vars") if isinstance(ent, dict) else None
+            return cv if isinstance(cv, dict) else {}
+
+        def _corpse_has(eid_t: Any, path: Any) -> bool:
+            """corpse_has(eid, path): True iff the dotted vars path
+            resolves on the corpse's stored snapshot. False on a missing
+            corpse / missing path / nesting into a scalar (no raise)."""
+            if not isinstance(path, str) or not path:
+                raise FormulaError("corpse_has(eid, path): path must be a non-empty string.")
+            cv = _corpse_vars(str(_eid(eid_t)))
+            if cv is None:
+                return False
+            cur: Any = cv
+            for k in path.split("."):
+                if not isinstance(cur, dict) or k not in cur:
+                    return False
+                cur = cur[k]
+            return True
+
+        def _corpse_var(eid_t: Any, path: Any,
+                        default: Any = _corpse_no_default) -> Any:
+            """corpse_var(eid, path[, default]): read the dead entity's
+            stored var at a dotted path (the corpse-snapshot equivalent of
+            var_get). Raises if the corpse or the path is missing, UNLESS a
+            `default` is supplied, in which case the default is returned."""
+            if not isinstance(path, str) or not path:
+                raise FormulaError("corpse_var(eid, path[, default]): path must be a non-empty string.")
+            eid = str(_eid(eid_t))
+            cv = _corpse_vars(eid)
+            if cv is None:
+                if default is _corpse_no_default:
+                    raise FormulaError(f"corpse_var: no corpse with id '{eid}'.")
+                return default
+            cur: Any = cv
+            for k in path.split("."):
+                if not isinstance(cur, dict) or k not in cur:
+                    if default is _corpse_no_default:
+                        raise FormulaError(
+                            f"corpse_var: corpse '{eid}' has no value at '{path}'.")
+                    return default
+                cur = cur[k]
+            return cur
+
         ns["kill"]         = _kill
         ns["revive"]       = _revive
         ns["has_corpse"]   = _has_corpse
         ns["corpse_at"]    = _corpse_at
         ns["all_corpses"]  = _all_corpses
+        ns["corpse_has"]   = _corpse_has
+        ns["corpse_var"]   = _corpse_var
 
         def _schedule(delay: Any, body: Any, name: Any = None) -> str:
             """schedule(delay, body, name=None): queue a MATCH-level
