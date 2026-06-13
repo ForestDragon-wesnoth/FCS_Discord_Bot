@@ -456,6 +456,25 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "tick — sibling statuses keep ticking."
         ),
     },
+    "status_default_stack": {
+        "default": "refresh",
+        "schema": {
+            "type": "enum",
+            "choices": ["refresh", "add_level", "extend", "replace", "none"],
+        },
+        "desc": (
+            "Default re-application behavior for apply_status / `!status "
+            "apply` when a status is applied to an entity that already has "
+            "it, used when the status DEFINITION doesn't set its own "
+            "`stack`. Modes: 'refresh' (reset duration, keep level), "
+            "'add_level' (level += applied, capped at the definition's "
+            "max_level, and refresh duration), 'extend' (add to remaining "
+            "duration, keep level), 'replace' (overwrite level + duration), "
+            "'none' (re-application is a no-op while the status is present). "
+            "A first application (status not yet present) always just sets "
+            "the given level/duration regardless of mode."
+        ),
+    },
     # Spawning / facing
     "spawn_face_toward_center": {
         "default": True,
@@ -3772,6 +3791,19 @@ class Match:
     # match can extend/shadow with !tile def commands.
     tile_templates: Dict[str, SpecialTileTemplate] = field(default_factory=dict)
 
+    # Status DEFINITIONS — self-describing statuses (the "rich status"
+    # feature). name -> {tick, tick_when, stack, max_level, data}. A
+    # status instance on an entity (entity.status[name]) resolves its
+    # behavior from the definition of the SAME name: at tick time the
+    # engine runs the definition's `tick` formula when its `tick_when`
+    # matches (default turn_end). Statuses with no matching definition
+    # fall back to the global status_tick_formula rule (backwards compat).
+    # Application/stacking goes through apply_status, honoring the
+    # definition's `stack` mode (else the status_default_stack rule).
+    # Edits propagate live (the instance only stores dynamic state like
+    # level/duration). Serialized with the match.
+    status_definitions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
     # User-defined formula functions, keyed by name. Defined via !func
     # def and callable by name from any formula on this match. Seeded
     # from the bound GameSystem's formula_functions at creation (same
@@ -6475,12 +6507,99 @@ class Match:
             ]
         return [f"⚙️ zone `{name}` hook `{when}` fired {tag}"]
 
+    # ---- status definitions (self-describing statuses) --------------
+    # A status DEFINITION holds the behaviour a status of that name has:
+    #   tick       formula body run at tick time (the DoT/regen effect;
+    #              also where the GM decrements `duration` and removes the
+    #              status, since auto-decay is deliberately not built in)
+    #   tick_when  when the tick fires (turn_end default / turn_start /
+    #              round_start / round_end / never)
+    #   stack      re-application mode (see apply_status / the
+    #              status_default_stack rule); "" = use the rule default
+    #   max_level  cap for the add_level stack mode (0 = uncapped)
+    #   data       default data merged into a freshly-applied instance
+    # The instance on an entity (entity.status[name]) carries only the
+    # dynamic state (level / duration / whatever the def's data seeds).
+
+    def define_status(self, name: str, *, overwrite: bool = False) -> Dict[str, Any]:
+        """Create an empty status definition. Raises DuplicateId if it
+        already exists unless overwrite=True."""
+        if not isinstance(name, str) or not name.strip():
+            raise VTTError("status definition name must be a non-empty string.")
+        if not overwrite and name in self.status_definitions:
+            raise DuplicateId(f"Status definition '{name}' already exists.")
+        self.status_definitions[name] = {
+            "tick": "", "tick_when": "turn_end",
+            "stack": "", "max_level": 0, "data": {},
+        }
+        return self.status_definitions[name]
+
+    def remove_status_def(self, name: str) -> None:
+        """Delete a status definition. Existing instances of that name on
+        entities are left in place (they just lose their tick behaviour
+        and fall back to the global formula, like an orphaned tile)."""
+        if name not in self.status_definitions:
+            raise NotFound(f"Status definition '{name}' not found.")
+        del self.status_definitions[name]
+
+    def apply_status(self, eid: str, name: str,
+                     level: Optional[int] = None,
+                     duration: Optional[int] = None) -> List[str]:
+        """Apply status `name` to entity `eid`, honoring the definition's
+        `stack` mode (else the status_default_stack rule) when the status
+        is already present. A FIRST application seeds the definition's
+        default `data`, then sets level (default 1) and duration. Fires
+        the on_status_added / on_status_changed hooks via the status
+        chokepoint. Returns the hook log. Raises NotFound for an unknown
+        entity."""
+        e = self.entities.get(eid)
+        if e is None:
+            raise NotFound(f"Entity '{eid}' not found.")
+        sdef = self.status_definitions.get(name) or {}
+        new_level = None if level is None else int(level)
+        new_duration = None if duration is None else int(duration)
+        before = copy.deepcopy(e.status.get(name))
+        if name not in e.status:
+            inst = copy.deepcopy(sdef.get("data")) if isinstance(sdef.get("data"), dict) else {}
+            inst["level"] = new_level if new_level is not None else int(inst.get("level", 1))
+            if new_duration is not None:
+                inst["duration"] = new_duration
+            e.status[name] = inst
+        else:
+            mode = sdef.get("stack") or str(self.rules.get("status_default_stack", "refresh"))
+            inst = e.status[name]
+            if mode == "none":
+                pass
+            elif mode == "replace":
+                if new_level is not None:
+                    inst["level"] = new_level
+                if new_duration is not None:
+                    inst["duration"] = new_duration
+            elif mode == "extend":
+                if new_duration is not None:
+                    inst["duration"] = int(inst.get("duration", 0)) + new_duration
+            elif mode == "add_level":
+                add = new_level if new_level is not None else 1
+                nl = int(inst.get("level", 0)) + add
+                maxl = int(sdef.get("max_level", 0) or 0)
+                inst["level"] = min(nl, maxl) if maxl > 0 else nl
+                if new_duration is not None:
+                    inst["duration"] = new_duration
+            else:  # refresh (default)
+                if new_duration is not None:
+                    inst["duration"] = new_duration
+        after = copy.deepcopy(e.status.get(name))
+        if before == after:
+            return []
+        return self._emit_status_diff(eid, name, before, after)
+
     def fire_status_tick(self, when: str) -> List[str]:
-        """Run status_tick_formula once for every status on every
-        target entity, when the active status_tick_when rule equals
-        `when`. Returns accumulated log lines (one per fire, one
-        ⚠️ per formula failure). No-op when the rule disabled or the
-        formula is empty.
+        """Run each status's tick at the given `when`. A status WITH a
+        matching definition runs that definition's `tick` formula when the
+        definition's `tick_when` equals `when`; a status with NO definition
+        falls back to the global status_tick_formula rule at the global
+        status_tick_when (backwards compatible). Returns accumulated log
+        lines (one ⚠️ per formula failure).
 
         `when` should be one of "turn_start", "turn_end", "round_start",
         "round_end" — match what next_turn calls with.
@@ -6501,13 +6620,8 @@ class Match:
         formula error on one status logs a ⚠️ line and the next status
         still ticks.
         """
-        configured = self.rules.get("status_tick_when", "never")
-        if configured != when:
-            return []
-        src = self.rules.get("status_tick_formula", "")
-        if not isinstance(src, str) or not src.strip():
-            return []
-        # Pick targets to iterate.
+        # Targeting depends only on `when`: a turn tick hits the entity
+        # whose turn it is; a round tick hits everyone in turn order.
         if when in ("turn_start", "turn_end"):
             if not self.turn_order:
                 return []
@@ -6520,6 +6634,11 @@ class Match:
         else:  # round_start / round_end
             targets = list(self.turn_order)
 
+        global_when = self.rules.get("status_tick_when", "never")
+        global_src = self.rules.get("status_tick_formula", "")
+        global_active = (global_when == when and isinstance(global_src, str)
+                         and bool(global_src.strip()))
+
         from formula import FormulaEngine, EvalCtx, FormulaError
         engine = FormulaEngine(self)
         this_id = self.current_entity_id()
@@ -6531,10 +6650,24 @@ class Match:
             # Snapshot status names so status_remove during the tick
             # doesn't break iteration.
             for sname in list(e.status.keys()):
-                # Re-check existence in case a previous tick on this
-                # entity removed `sname`.
                 if sname not in e.status:
                     continue
+                # A status WITH a definition runs its own tick at its own
+                # tick_when (default turn_end); a def-less status falls back
+                # to the global status_tick_formula at the global when.
+                sdef = self.status_definitions.get(sname)
+                if sdef is not None:
+                    body = sdef.get("tick")
+                    if not (isinstance(body, str) and body.strip()):
+                        continue
+                    def_when = sdef.get("tick_when") or "turn_end"
+                    if def_when != when:
+                        continue
+                    src = body
+                else:
+                    if not global_active:
+                        continue
+                    src = global_src
                 ctx = EvalCtx(
                     this=this_id, target=eid,
                     extras={"status_name": sname},
@@ -7956,6 +8089,10 @@ class Match:
                 name: tpl.to_dict()
                 for name, tpl in sorted(self.tile_templates.items())
             },
+            "status_definitions": {
+                name: copy.deepcopy(d)
+                for name, d in sorted(self.status_definitions.items())
+            },
             "formula_functions": {
                 name: fn.to_dict()
                 for name, fn in sorted(self.formula_functions.items())
@@ -8051,6 +8188,11 @@ class Match:
                 # template will surface the missing-template warning
                 # at their next hook fire.
                 continue
+        raw_status_defs = d.get("status_definitions", {}) or {}
+        m.status_definitions = {}
+        for sname, sdef in raw_status_defs.items():
+            if isinstance(sname, str) and isinstance(sdef, dict):
+                m.status_definitions[sname] = copy.deepcopy(sdef)
         raw_funcs = d.get("formula_functions", {}) or {}
         m.formula_functions = {}
         for fname, fdef in raw_funcs.items():

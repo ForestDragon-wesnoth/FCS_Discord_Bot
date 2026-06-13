@@ -10002,3 +10002,64 @@ rule to `freeze`, killing `b` instead KEEPS the zone: zone_exists('aura_b')
 stays True, zone_anchor_of('aura_b') becomes '' (binding cleared), and its
 cells are left frozen in place (zone_size unchanged at 9) — a lingering
 cloud the caster left behind.
+
+
+SCENARIO 390 — Status definitions: define, stack (add_level capped), apply
+---------------------------------------------------------------------------
+
+!match new sdef SDEF 6 6
+!match use sdef
+!ent add hero Hero 100 1 1 50
+!status def burn
+!status when burn turn_end
+!status stack burn add_level
+!status maxlevel burn 3
+!status tick burn "entity[self].hp = entity[self].hp - 5 * status_get(self, status_name, 'level')\nstatus_set(self, status_name, 'duration', status_get(self, status_name, 'duration') - 1)\nif status_get(self, status_name, 'duration') <= 0:\n    status_remove(self, status_name)"
+!status list
+!status info burn
+!status apply hero burn 1 3
+!ent status hero list
+!status apply hero burn 2 3
+!ent status hero list
+!status apply hero burn 5 3
+!ent status hero list
+
+Expected: `!status def burn` plus when/stack/maxlevel/tick build a
+self-describing status (the tick formula is accepted — it parses as a
+multi-statement program, NOT a "Syntax error"). `!status list` shows
+`burn (when=turn_end, stack=add_level, max_lvl=3)` and `!status info`
+dumps the definition. Applying burn lvl1 for 3 turns gives the hero
+{level:1, duration:3}. Re-applying with add_level stacks: +2 → level 3
+(duration refreshed to 3). A third apply of +5 is capped at max_level 3,
+so level stays 3 — `add_level` never exceeds the definition's cap.
+
+
+SCENARIO 391 — Status DoT ticks at the bearer's turn end and self-expires
+-------------------------------------------------------------------------
+
+!match new dot DOT 6 6
+!match use dot
+!ent add hero Hero 100 1 1 50
+!ent add foe Foe 100 5 5 40
+!status def burn
+!status stack burn add_level
+!status maxlevel burn 3
+!status tick burn "entity[self].hp = entity[self].hp - 5 * status_get(self, status_name, 'level')\nstatus_set(self, status_name, 'duration', status_get(self, status_name, 'duration') - 1)\nif status_get(self, status_name, 'duration') <= 0:\n    status_remove(self, status_name)"
+!status apply hero burn 3 2
+!turn next
+!ent info hero
+!turn next
+!ent info hero
+!turn next
+!turn next
+!ent info hero
+!ent status hero list
+
+Expected: burn ticks at turn_end (the default) only for the entity whose
+turn is ending. The FIRST `!turn next` starts round 1 (hero's turn
+begins — no turn_end tick), so the hero is still at 100. The second
+`!turn next` ENDS the hero's turn: burn fires for 5×level (level 3 = 15
+damage), hp → 85, duration 2 → 1; the foe is untouched (its turn hasn't
+ended). Two more `!turn next` (foe ends, then hero ends again) deal
+another 15 — hp → 70 — and the duration hits 0, so the tick formula
+self-removes burn: `!ent status hero list` shows (none).

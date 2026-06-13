@@ -1328,6 +1328,9 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   status_remove(eid, name)            -> bool (True iff removed)
     "status_has", "status_has_path", "status_get",
     "status_set", "status_del", "status_add", "status_remove",
+    # status_apply(eid, name[, level, duration]) -> apply a status via its
+    # definition + stack mode (the host-friendly "inflict burn" call).
+    "status_apply",
     # Status-name introspection: status_names(eid) -> list of the active
     # status names on an entity (insertion order). The companion that
     # lets a formula iterate WHATEVER statuses exist instead of checking
@@ -3328,6 +3331,29 @@ class FormulaEngine:
             self._note_affected(eid)
             return True
 
+        def _status_apply(eid_t: Any, name: Any,
+                          level: Any = None, duration: Any = None) -> bool:
+            """status_apply(eid, name, level=None, duration=None): apply a
+            status, honoring its definition's stack mode (else the
+            status_default_stack rule) when already present. Seeds the
+            definition's default data on a first application. Returns True
+            (always applied/updated; a 'none' stack mode on a present
+            status is a silent no-op)."""
+            eid = _eid(eid_t)
+            if not isinstance(name, str):
+                raise FormulaError("status_apply(eid, name, ...): name must be a string.")
+            for label, v in (("level", level), ("duration", duration)):
+                if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
+                    raise FormulaError(f"status_apply(...): {label} must be a number.")
+            lv = None if level is None else int(level)
+            du = None if duration is None else int(duration)
+            try:
+                match.apply_status(eid, name, lv, du)
+            except (VTTError, NotFound) as ex:
+                raise FormulaError(str(ex))
+            self._note_affected(eid)
+            return True
+
         ns["status_has"]      = _status_has
         ns["status_has_path"] = _status_has_path
         ns["status_get"]      = _status_get
@@ -3335,6 +3361,7 @@ class FormulaEngine:
         ns["status_del"]      = _status_del
         ns["status_add"]      = _status_add
         ns["status_remove"]   = _status_remove
+        ns["status_apply"]    = _status_apply
 
         # ---- introspection / runtime-path / query primitives ----
         # The pattern: entity[X].path needs a STATIC path at AST time.
