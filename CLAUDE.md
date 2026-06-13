@@ -683,6 +683,54 @@ What the user has flagged as next-on-their-mind:
   - Possible later: per-channel auto-routing; richer corpse-snapshot
     introspection (status/vars not exposed today); elevation as a
     first-class rule; vision-result caching beyond the radius bound.
+- **Large / multi-tile entities — SHIPPED.** An entity can occupy a W×H
+  RECTANGLE of cells anchored at its TOP-LEFT cell (`entity[X].x/.y` stays
+  the sole addressing convention; the footprint extends right/down). W and
+  H live in entity vars named by the `footprint_width_var` /
+  `footprint_height_var` rules (default vars `footprint_w`/`footprint_h`;
+  absent or <1 = 1, so a plain entity is byte-for-byte unchanged). Set per
+  entity (`!ent set_var dragon footprint_w 3`), via a summon template, or
+  globally with `!defvar` (defaults are applied in `spawn`/`summon` BEFORE
+  the footprint-aware bounds/occupancy check). There is NO `!ent add` size
+  arg — footprint is "just a var." Core geometry on `Match`:
+  `entity_footprint(e)`→(w,h), `entity_cells(e[,ax,ay])` (row-major, [0]=
+  anchor), `entity_occupies(e,x,y)`, `cell_occupant(x,y,ignore=())` (the
+  footprint-aware occupancy core behind `is_occupied`), and the single
+  placement gate `_validate_placement(e,ax,ay,mode)` (bounds+occupancy+
+  block, ignoring the mover's own cells). Policies the user chose (all
+  hardcoded defaults, NOT gamerules — "only-anchor-matters" is too
+  unintuitive to warrant a knob): distance = NEAREST footprint cell;
+  boolean membership (fog/AoE/zone/LOS-line) = ANY footprint cell; outward
+  VISION = UNION of every footprint cell's sight disc. Threaded through:
+  movement (`tp`, `move_dirs` validates the WHOLE swept footprint each step
+  so a body can't squeeze through a gap narrower than itself; final
+  footprint must be unoccupied), push/pull (whole shifted body), swap
+  (different-size legal iff each relocated footprint fits — anchors
+  exchanged), spawn/summon (`summon_near` searches for an anchor where the
+  whole footprint fits), `render_ascii` (glyph painted on every covered
+  cell), resize (cut if ANY cell off-grid). Vision: `_member_sees` casts
+  from each footprint cell; `_record_vision` unions per-cell neighbourhoods;
+  target-side `_team_sees_entity`/`_team_has_los_entity` + `entity_visible_to`
+  use ANY cell; entity-LOS `_occupants` (formula.py) registers each body
+  cell (deduped, shooter/target excluded by id). Distance/AoE: nearest-cell
+  gap distance in `entities_within`/`nearest_entity`; `_alive_at` membership
+  by any covered cell. `side_hit`/`directional_get` measure the bearing from
+  the target's true (possibly fractional) footprint CENTER (facing stays a
+  single attribute; no footprint rotation, no edge-aware hit yet). Movement
+  hooks fire PER CELL: `fire_footprint_tile_{exit,enter,stop}` /
+  `fire_footprint_zone_{exit,enter,stop}` (boundary zone hook once per zone,
+  per-cell hooks per covered cell) — a 2×2 crossing a fire band burns once
+  per fire cell. Large corpses: ONE corpse identity (id-keyed, fully
+  compatible with existing corpse targeting), footprint DERIVED from the
+  stored entity vars (`corpse_cells`/`_corpse_footprint`); `corpse_visible_to`
+  reveals if ANY cell is fog-visible; revive restores the footprint for free;
+  corpses stay passable. New formula prims: `footprint_width`/`_height`,
+  `footprint_cells` (loopable, coord-readable), `occupies(eid,x,y)`,
+  `cell_entity(x,y)` (''=free), `entity_center(eid)` (center cell, floor for
+  even), `aoe_origin(eid)` (center|anchor per the `aoe_origin_mode` rule).
+  Scenarios 382–386. FUTURE the user may want: arbitrary/L-shaped
+  footprints, footprint rotation on facing change, edge-aware side_hit,
+  corpse occupancy as a gamerule.
 
 Look at recent PR descriptions on the repo (PRs #30 through #35)
 for context on the latest design conversations and rationale.

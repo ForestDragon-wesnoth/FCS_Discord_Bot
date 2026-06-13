@@ -9774,3 +9774,143 @@ extractors: coord_x(...) = 4 and coord_y(...) = 3. A clear line
 entities a at (2,6) and b at (5,6), entities_in_line_ignorelos(1,
 6,7,6) lists every entity on the geometric line (endpoints
 included, walls ignored), near->far: [a, b].
+
+
+SCENARIO 382 — Large entity (2×2): footprint occupancy, movement, accessors
+---------------------------------------------------------------------------
+
+!match new big BIG 12 12
+!match use big
+!ent add dragon Dragon 50 2 2 10
+!ent set_var dragon footprint_w 2
+!ent set_var dragon footprint_h 2
+!eval "footprint_width('dragon')"
+!eval "len(footprint_cells('dragon'))"
+!eval "occupies('dragon', 3, 3)"
+!eval "cell_entity(3, 2)"
+!ent add gob Goblin 10 3 3 5
+!ent move dragon right
+!eval "occupies('dragon', 4, 2)"
+!eval "occupies('dragon', 2, 2)"
+
+Expected: dragon is a 2×2 anchored at its top-left cell (2,2), covering
+(2,2),(3,2),(2,3),(3,3). footprint_width=2, footprint_cells has 4 cells,
+occupies('dragon',3,3)=True, and cell_entity(3,2)='dragon' (the body
+blocks every covered cell, not just the anchor). Adding a goblin onto
+(3,3) — a cell under the dragon — fails with an occupancy ❌ (the goblin
+is not added). After `!ent move dragon right` the anchor is (3,2), so the
+footprint is (3,2),(4,2),(3,3),(4,3): occupies(4,2)=True and the
+old anchor occupies(2,2)=False.
+
+
+SCENARIO 383 — Large entity can't squeeze through a gap narrower than itself
+----------------------------------------------------------------------------
+
+!match new gap GAP 10 6
+!match use gap
+!defvar add flying 0
+!ent add dragon Dragon 50 2 2 10
+!ent set_var dragon footprint_w 2
+!ent set_var dragon footprint_h 2
+!tile set 5 2 block true
+!ent move dragon 4 right
+!eval "entity['dragon'].x"
+!tile set 5 2 block false
+!ent move dragon 4 right
+!eval "entity['dragon'].x"
+
+Expected: A 2×2 dragon at anchor (2,2) tries to walk east. A wall sits at
+(5,2). Because the WHOLE swept footprint is bounds/block-checked each
+step, the step whose footprint would cover (5,2) is Blocked and the
+all-or-nothing walk fails with a ❌ — the dragon stays at x=2 (its body
+can't pass a wall that only blocks part of its width). After the wall is
+cleared, the same move succeeds and the anchor advances to x=6.
+
+
+SCENARIO 384 — Large entity vision union, nearest-cell distance, AoE membership
+-------------------------------------------------------------------------------
+
+!match new see SEE 20 20
+!match use see
+!ent add scout Scout 30 2 2 10
+!ent set_var scout footprint_w 2
+!ent set_var scout footprint_h 2
+!ent set_var scout team red
+!ent set_var scout fog_vision_radius 2
+!eval "team_sees_cell_rangeonly('red', 5, 3)"
+!eval "team_sees_cell_rangeonly('red', 6, 3)"
+!ent add hero Hero 30 9 6 8
+!eval "entities_within('hero', 2, 'square_radius_distance', '')"
+!eval "nearest_entity('hero', '', 'square_radius_distance')"
+!eval "entities_in_rect(7, 7, 8, 8)"
+
+Expected: The 2×2 scout (radius 2) projects its sight from EVERY footprint
+cell. Cell (5,3) is within radius 2 of its (3,3) corner, so
+team_sees_cell_rangeonly('red',5,3)=True even though (5,3) is distance 3
+from the anchor (2,2); (6,3) is out of every cell's range -> False.
+Entity-to-entity distance is nearest-cell: hero is at (9,6); the scout's
+nearest cell (3,3) is well beyond 2, so entities_within('hero',2,...) is
+[] — yet nearest_entity('hero') still resolves to 'scout' (the only other
+entity). entities_in_rect(7,7,8,8) is [] (no entity covers those cells).
+This scenario exercises the union-vision and nearest-cell distance paths.
+
+
+SCENARIO 385 — 2×2 crossing a fire band: per-cell tile hooks; zone membership
+-----------------------------------------------------------------------------
+
+!match new burn BURN 12 6
+!match use burn
+!ent add dragon Dragon 100 1 1 10
+!ent set_var dragon footprint_w 2
+!ent set_var dragon footprint_h 2
+!tile def new flame
+!tile def data flame burn_damage 5
+!tile def hook flame on_enter "entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, 'burn_damage')"
+!tile place flame 4 1
+!tile place flame 4 2
+!tile place flame 5 1
+!tile place flame 5 2
+!ent move dragon 4 right
+!ent info dragon
+!zone new gas
+!zone add gas 8 1
+!ent tp dragon 7 1
+!eval "in_zone('dragon', 'gas')"
+!eval "entities_in_zone('gas')"
+
+Expected: A 2×2 fire band fills columns x=4 and x=5 (rows 1-2). The 2×2
+dragon walks east from anchor (1,1); its body ENTERS four flame cells —
+(4,1),(4,2) on one step and (5,1),(5,2) on the next — firing the flame
+on_enter hook once per cell, for 4×5 = 20 damage. !ent info: hp=80.
+Then a one-cell zone `gas` at (8,1): teleporting the dragon to anchor
+(7,1) makes its footprint cover (7,1),(8,1),(7,2),(8,2), overlapping the
+zone by one corner, so in_zone('dragon','gas')=True and
+entities_in_zone('gas') lists ['dragon'] — a large entity is "in" a zone
+if ANY part of its body is.
+
+
+SCENARIO 386 — Large corpse keeps its footprint; revive restores it; swap sizes
+--------------------------------------------------------------------------------
+
+!match new dead DEAD 12 12
+!match use dead
+!ent add ogre Ogre 1 3 3 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent add knight Knight 20 3 6 7
+!ent hp ogre -1
+!list
+!ent revive ogre
+!eval "footprint_width('ogre')"
+!ent swap ogre knight
+!eval "entity['ogre'].x"
+!eval "entity['knight'].x"
+
+Expected: The 2×2 ogre is reduced to 0 hp and dies, leaving ONE corpse
+(single identity, keyed `ogre`) whose footprint is derived from its
+stored vars — it's a large corpse, listed once in the Dead: section.
+Reviving it spawns the ogre back at the corpse's anchor with the
+footprint intact (footprint_width('ogre')=2). Swapping the 2×2 ogre with
+the 1×1 knight exchanges anchors (the swap is legal because each
+relocated footprint fits in free space): ogre's anchor becomes (3,6),
+knight's becomes (3,3).

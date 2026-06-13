@@ -276,6 +276,43 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "'no team' rather than erroring."
         ),
     },
+    # --- Entity footprint (multi-tile / large entities) ---
+    # The W×H rectangle a "large" entity occupies lives in two entity
+    # vars named by these rules; absent / non-positive = 1 (an ordinary
+    # single-cell entity). The footprint is anchored at the entity's
+    # TOP-LEFT cell (entity.x / entity.y) and extends right (+x) / down
+    # (+y). Occupancy, movement, placement, rendering and (in later
+    # layers) vision / distance / AoE all reason about the full
+    # footprint. Set per-entity (`!ent set_var dragon footprint_w 3`),
+    # via a summon template, or globally with `!defvar`.
+    "footprint_width_var": {
+        "default": "footprint_w",
+        "schema": {"type": "str"},
+        "desc": (
+            "Entity-var name holding an entity's footprint WIDTH in cells "
+            "(default var 'footprint_w'). Absent / <1 means width 1. Read "
+            "in formulas as entity[X].footprint_w (or whatever you name it)."
+        ),
+    },
+    "footprint_height_var": {
+        "default": "footprint_h",
+        "schema": {"type": "str"},
+        "desc": (
+            "Entity-var name holding an entity's footprint HEIGHT in cells "
+            "(default var 'footprint_h'). Absent / <1 means height 1."
+        ),
+    },
+    "aoe_origin_mode": {
+        "default": "center",
+        "schema": {"type": "enum", "choices": ["center", "anchor"]},
+        "desc": (
+            "Where the aoe_origin(eid) primitive places the origin of an "
+            "area effect cast by a (possibly large) entity: 'center' = the "
+            "footprint's center cell (rounded down for even sizes), 'anchor' "
+            "= the top-left cell (entity.x/.y). Only affects aoe_origin(); "
+            "GMs passing explicit coords are unaffected."
+        ),
+    },
     # --- Turn-order shape ---
     # The five rules below control how _rebuild_turn_order produces the
     # turn list from the candidate set (alive entities whose turnorder_var
@@ -2888,13 +2925,6 @@ class Entity:
         """
         if self._match is not None:
             raise VTTError(f"Entity '{self.id}' is already in a match")
-        if not match.in_bounds(x, y):
-            raise OutOfBounds(f"({x},{y}) outside {match.grid_width}x{match.grid_height}")
-        # Stackable spawners skip the occupancy check (same rule as
-        # Entity.tp / move_dirs / summon_entity). Lets `!ent add` drop
-        # a stackable entity onto a cell that already holds another.
-        if not self.is_cell_stackable and match.is_occupied(x, y):
-            raise Occupied(f"Cell ({x},{y}) already occupied")
         # ID collision check honors `corpse_id_uniqueness` — under the
         # default true setting a corpse's id reserves the name too, so
         # spawning a fresh `goblin1` while a `goblin1` corpse exists
@@ -2907,9 +2937,18 @@ class Entity:
             )
 
         # Fill missing vars from the system's default_entity_vars BEFORE
-        # validating vital vars — a default may legitimately supply the
-        # required hp var. Fill-only, so an explicitly-provided value wins.
+        # validating placement and vital vars — a default may legitimately
+        # supply the required hp var OR the footprint size, so the
+        # footprint-aware bounds/occupancy check below must see the
+        # defaults. Fill-only, so an explicitly-provided value wins.
         match._apply_default_vars(self)
+
+        # Validate the WHOLE footprint anchored at (x, y): every covered
+        # cell in bounds and unoccupied (stackable spawners skip
+        # occupancy — same rule as tp / move_dirs / summon). Spawn is
+        # never gated by movement-block (mode=None), matching the
+        # "spawn/summon are never block-gated" convention.
+        match._validate_placement(self, x, y, None)
 
         # --- Validate vital vars against game system ---
         hp_var = match.rules.get("hp_var", "hp")
@@ -3008,35 +3047,33 @@ class Entity:
         moves that produced them).
         """
         m = self._require_match()
-        if not m.in_bounds(x, y):
-            raise OutOfBounds(f"({x},{y}) outside {m.grid_width}x{m.grid_height}")
-        # Stackable movers skip the occupancy check entirely — they're
-        # allowed to enter cells already holding non-stackable entities.
-        # Combined with is_occupied skipping stackable RESIDENTS, the
-        # net rule is: occupancy fails only when a non-stackable mover
-        # enters a cell containing a non-stackable resident.
-        if not self.is_cell_stackable and m.is_occupied(x, y, ignore_entity_id=self.id):
-            raise Occupied(f"Cell ({x},{y}) already occupied")
-        if m._check_block(self.id, x, y, "tp"):
-            raise Blocked(f"Cell ({x},{y}) blocks `{self.id}`")
+        # Validate the WHOLE destination footprint in one shot: every
+        # covered cell in bounds, unoccupied (stackable movers skip
+        # occupancy — they may enter cells holding non-stackable
+        # entities), and not tp-blocked. (x, y) is the top-left anchor.
+        m._validate_placement(self, x, y, "tp")
         log: List[str] = []
         old_x, old_y = self.x, self.y
+        # Footprint cell sets at the old and new anchors (the dims don't
+        # change during a tp, so new_cells is just old_cells shifted).
+        old_cells = m.entity_cells(self, old_x, old_y)
+        new_cells = m.entity_cells(self, x, y)
         if fire_hooks and (old_x, old_y) != (x, y):
-            # Skip on_exit when teleporting to the current cell (no
+            # Skip on_exit when teleporting to the current footprint (no
             # actual move). Matches the intuition that "tp to where I
             # am" is a no-op rather than a fire-and-reverse cycle.
-            log.extend(m.fire_tile_hook("on_exit", self.id, old_x, old_y))
-            log.extend(m.fire_zone_exit_hooks(self.id, old_x, old_y, x, y))
+            log.extend(m.fire_footprint_tile_exit(self.id, old_cells, new_cells))
+            log.extend(m.fire_footprint_zone_exit(self.id, old_cells, new_cells))
         self.move_to(x, y)
         if fire_hooks:
-            log.extend(m.fire_tile_hook("on_enter", self.id, x, y))
-            log.extend(m.fire_tile_hook("on_stop", self.id, x, y))
+            log.extend(m.fire_footprint_tile_enter(self.id, old_cells, new_cells))
+            log.extend(m.fire_footprint_tile_stop(self.id, new_cells))
             # A tp is a single, final step; zone enter + stop fire here.
-            # (For a same-cell tp, fire_zone_enter_hooks still fires
+            # (For a same-cell tp, fire_footprint_zone_enter still fires
             # on_stop/on_cell_stop for the standing-on zones — a tp that
             # "lands" re-affirms its stop, matching on_stop's tile
             # semantics which fire even on a same-cell tp.)
-            log.extend(m.fire_zone_enter_hooks(self.id, old_x, old_y, x, y, True))
+            log.extend(m.fire_footprint_zone_enter(self.id, old_cells, new_cells, True))
             # Entity-side movement event. Fires once per tp call (not
             # per step), AFTER the tile hooks so a passive observing
             # the move sees the final (x, y) and any side-effects the
@@ -3099,22 +3136,35 @@ class Entity:
                 step_facing = "up" if dy < 0 else "down"
             for _ in range(max(1, int(count))):
                 nx, ny = x + dx, y + dy
-                if not m.in_bounds(nx, ny):
-                    raise OutOfBounds(f"({nx},{ny}) outside {m.grid_width}x{m.grid_height}")
-                # A blocked cell ANYWHERE on the path fails the whole walk
+                # Validate the WHOLE swept footprint each step: every
+                # covered cell must be in bounds, and (unless block_mode
+                # is None) none may block this mode. Checking the full
+                # footprint — not just the anchor — is what stops a large
+                # entity squeezing through a gap narrower than its body.
+                # A failure ANYWHERE on the path fails the whole walk
                 # (all-or-nothing, like an occupied final cell). block_mode
-                # None skips this — callers that pre-validated the path
-                # (push/pull) pass None to avoid re-checking.
-                if block_mode is not None and m._check_block(self.id, nx, ny, block_mode):
-                    raise Blocked(f"Cell ({nx},{ny}) blocks `{self.id}`")
+                # None skips the block check — callers that pre-validated
+                # the path (push/pull) pass None to avoid re-checking.
+                for cx, cy in m.entity_cells(self, nx, ny):
+                    if not m.in_bounds(cx, cy):
+                        raise OutOfBounds(
+                            f"({cx},{cy}) outside {m.grid_width}x{m.grid_height}")
+                if block_mode is not None:
+                    for cx, cy in m.entity_cells(self, nx, ny):
+                        if m._check_block(self.id, cx, cy, block_mode):
+                            raise Blocked(f"Cell ({cx},{cy}) blocks `{self.id}`")
                 step_path.append((nx, ny, step_facing))
                 x, y = nx, ny
         # Stackable movers skip the final-cell occupancy check (see
         # Entity.tp for the symmetric rationale). move_dirs only
-        # validates the final cell for occupancy, so this is the one
-        # gate that needs the bypass.
-        if not self.is_cell_stackable and m.is_occupied(x, y, ignore_entity_id=self.id):
-            raise Occupied(f"Cell ({x},{y}) already occupied")
+        # validates the FINAL footprint for occupancy (intermediate
+        # cells may be passed through, matching the 1×1 semantics), so
+        # this is the one occupancy gate; a large entity's whole
+        # destination footprint must be clear.
+        if not self.is_cell_stackable:
+            for cx, cy in m.entity_cells(self, x, y):
+                if m.cell_occupant(cx, cy, (self.id,)) is not None:
+                    raise Occupied(f"Cell ({cx},{cy}) already occupied")
 
         # Phase 2: commit each step, firing hooks. No more validation —
         # phase 1 already proved the whole path is legal.
@@ -3122,19 +3172,22 @@ class Entity:
         origin_x, origin_y = self.x, self.y
         for nx, ny, step_facing in step_path:
             step_from_x, step_from_y = self.x, self.y
+            old_cells = m.entity_cells(self, step_from_x, step_from_y)
+            new_cells = m.entity_cells(self, nx, ny)
             if fire_hooks:
-                log.extend(m.fire_tile_hook("on_exit", self.id, self.x, self.y))
-                log.extend(m.fire_zone_exit_hooks(
-                    self.id, step_from_x, step_from_y, nx, ny))
+                # Per-step, fire on_exit/on_cell_exit for the cells the
+                # footprint vacates this step and the boundary on_exit for
+                # zones it fully leaves.
+                log.extend(m.fire_footprint_tile_exit(self.id, old_cells, new_cells))
+                log.extend(m.fire_footprint_zone_exit(self.id, old_cells, new_cells))
             self.facing = step_facing
             self.move_to(nx, ny)
             if fire_hooks:
-                log.extend(m.fire_tile_hook("on_enter", self.id, nx, ny))
-                # Per-step zone enter (boundary on_enter + per-cell
-                # on_cell_enter); the stop hooks fire once after the loop
-                # at the final cell, like tile on_stop below.
-                log.extend(m.fire_zone_enter_hooks(
-                    self.id, step_from_x, step_from_y, nx, ny, False))
+                # on_enter/on_cell_enter for the newly-covered cells; the
+                # stop hooks fire once after the loop at the final cells.
+                log.extend(m.fire_footprint_tile_enter(self.id, old_cells, new_cells))
+                log.extend(m.fire_footprint_zone_enter(
+                    self.id, old_cells, new_cells, False))
                 # Per-step entity hook: fires AFTER on_enter so
                 # passives see whatever the just-entered tile already
                 # applied (e.g. a damage tile's hp delta) on top of
@@ -3145,11 +3198,12 @@ class Entity:
                     self.id, step_from_x, step_from_y, nx, ny,
                 ))
         if fire_hooks and step_path:
-            # on_stop fires once at the final cell, even if no actual
+            # on_stop fires once per final footprint cell, even if no actual
             # movement happened (zero-step move_dirs) — empty step_path
             # means no transit and therefore no stop.
-            log.extend(m.fire_tile_hook("on_stop", self.id, self.x, self.y))
-            log.extend(m.fire_zone_stop_hooks(self.id, self.x, self.y))
+            final_cells = m.entity_cells(self, self.x, self.y)
+            log.extend(m.fire_footprint_tile_stop(self.id, final_cells))
+            log.extend(m.fire_footprint_zone_stop(self.id, final_cells))
             # on_entity_moved fires ONCE for the whole stepwise move,
             # with from = origin and to = final position. Step-level
             # observation is via tile on_enter/on_exit; on_entity_moved
@@ -3934,9 +3988,12 @@ class Match:
         def in_new(x: int, y: int) -> bool:
             return 1 <= x <= new_w and 1 <= y <= new_h
 
-        # Entities whose post-shift cell falls off the new grid.
+        # Entities whose post-shift footprint would fall (even partly) off
+        # the new grid — a large entity is "cut" if ANY covered cell lands
+        # off-grid.
         cut = sorted(e.id for e in self.entities.values()
-                     if not in_new(e.x + ox, e.y + oy))
+                     if not all(in_new(cx + ox, cy + oy)
+                                for cx, cy in self.entity_cells(e)))
         log: List[str] = []
         if cut:
             mode = str(self.rules.get("map_resize_shrink_mode", "block"))
@@ -4273,22 +4330,25 @@ class Match:
         return z is not None and (x, y) in z["cells"]
 
     def entity_zones(self, eid: str) -> Set[str]:
-        """Names of every zone the entity currently stands in."""
+        """Names of every zone the entity currently stands in — any zone
+        overlapping ANY of its footprint cells (a large entity is 'in' a
+        zone if any part of its body is)."""
         e = self.entities.get(eid)
         if e is None:
             return set()
-        return self.zones_at(e.x, e.y)
+        return self._zones_over(self.entity_cells(e))
 
     def entities_in_zone(self, name: str) -> List[str]:
-        """Ids of every alive entity standing on a cell of the zone, in
-        insertion order. [] for a missing zone."""
+        """Ids of every alive entity with ANY footprint cell in the zone,
+        in insertion order. [] for a missing zone."""
         z = self.zones.get(name)
         if z is None:
             return []
         cells = z["cells"]
         return [
             eid for eid, e in self.entities.items()
-            if getattr(e, "is_alive", True) and (e.x, e.y) in cells
+            if getattr(e, "is_alive", True)
+            and any(c in cells for c in self.entity_cells(e))
         ]
 
     # ---- zone data accessors (dotted paths under zone["data"]) -------
@@ -4481,12 +4541,30 @@ class Match:
         range query. LOS-aware team vision is _team_sees(..., los=True)."""
         return self._team_sees(pov_team, x, y, los=False)
 
-    def team_sees_entity(self, pov_team: Optional[str], eid: str) -> bool:
-        """RANGE team vision of entity `eid`'s cell. False for unknown."""
+    def _team_sees_entity(self, pov_team: Optional[str], eid: str,
+                          *, los: bool) -> bool:
+        """Whether team `pov_team` sees entity `eid` — true when ANY cell
+        of its footprint is seen (range, plus LOS when `los`). A large
+        body is spotted if any part of it is in view."""
         e = self.entities.get(eid)
         if e is None:
             return False
-        return self._team_sees(pov_team, e.x, e.y, los=False)
+        return any(self._team_sees(pov_team, cx, cy, los=los)
+                   for cx, cy in self.entity_cells(e))
+
+    def _team_has_los_entity(self, pov_team: Optional[str], eid: str) -> bool:
+        """Any alive member of `pov_team` has a clear line to ANY of
+        `eid`'s footprint cells (LOS only, ignores range)."""
+        e = self.entities.get(eid)
+        if e is None:
+            return False
+        return any(self._team_has_los(pov_team, cx, cy)
+                   for cx, cy in self.entity_cells(e))
+
+    def team_sees_entity(self, pov_team: Optional[str], eid: str) -> bool:
+        """RANGE team vision of entity `eid` (any footprint cell). False
+        for unknown."""
+        return self._team_sees_entity(pov_team, eid, los=False)
 
     def entity_can_see(self, viewer_eid: str, x: int, y: int) -> bool:
         """Does the single unit `viewer_eid` see (x, y) by RANGE (within its
@@ -4668,9 +4746,16 @@ class Match:
 
     # ---- combined vision (range and/or LOS) -------------------------
     def _member_sees(self, e: "Entity", x: int, y: int, *, los: bool) -> bool:
-        if not self._within_vision(e.x, e.y, x, y, self._vision_radius_of(e)):
-            return False
-        return (not los) or self.has_los(e.id, e.x, e.y, x, y)
+        # A large viewer sees from its WHOLE body: (x,y) is seen if any
+        # footprint cell is within vision radius (and — under LOS — has a
+        # clear line from that cell). The radius is measured per cell, so
+        # a 3×3 scout projects its sight disc from every cell it covers.
+        r = self._vision_radius_of(e)
+        for (ex, ey) in self.entity_cells(e):
+            if self._within_vision(ex, ey, x, y, r) and (
+                    (not los) or self.has_los(e.id, ex, ey, x, y)):
+                return True
+        return False
 
     def _team_sees(self, pov_team: Optional[str], x: int, y: int,
                    *, los: bool) -> bool:
@@ -4751,15 +4836,18 @@ class Match:
             if not e.is_alive or e.team != team:
                 continue
             r = self._vision_radius_of(e)
-            for yy in range(max(1, e.y - r), min(self.grid_height, e.y + r) + 1):
-                for xx in range(max(1, e.x - r), min(self.grid_width, e.x + r) + 1):
-                    if (xx, yy) in seen:
-                        continue
-                    if not self._within_vision(e.x, e.y, xx, yy, r):
-                        continue
-                    if use_los and not self.has_los(e.id, e.x, e.y, xx, yy):
-                        continue
-                    seen.add((xx, yy))
+            # A large viewer reveals the UNION of every footprint cell's
+            # vision-radius neighbourhood (LOS measured from that cell).
+            for (ex, ey) in self.entity_cells(e):
+                for yy in range(max(1, ey - r), min(self.grid_height, ey + r) + 1):
+                    for xx in range(max(1, ex - r), min(self.grid_width, ex + r) + 1):
+                        if (xx, yy) in seen:
+                            continue
+                        if not self._within_vision(ex, ey, xx, yy, r):
+                            continue
+                        if use_los and not self.has_los(e.id, ex, ey, xx, yy):
+                            continue
+                        seen.add((xx, yy))
 
     def _visibility_visible(self, rule_key: str, pov_team: Optional[str], *,
                             target: Optional[str] = None,
@@ -4797,7 +4885,12 @@ class Match:
         if eid not in self.entities:
             return False
         e = self.entities[eid]
-        if not self._fog_entity_visible(pov_team, e.x, e.y):
+        # A large entity is fog-visible if ANY footprint cell passes the
+        # entity fog gate (current vision, or remembered when memory mode
+        # is 'full') — so a giant is hidden only when its whole body is
+        # in fog.
+        if not any(self._fog_entity_visible(pov_team, cx, cy)
+                   for cx, cy in self.entity_cells(e)):
             return False
         return self._visibility_visible(
             "entity_visibility_condition", pov_team, target=eid)
@@ -4830,16 +4923,43 @@ class Match:
             "zone_visibility_condition", pov_team,
             extras={"zone_name": name})
 
+    def _corpse_footprint(self, corpse: Dict[str, Any]) -> Tuple[int, int]:
+        """(w, h) of a corpse's footprint, read from the dead entity's
+        stored footprint vars (1×1 when absent) — so a large entity
+        leaves a large corpse. One stored corpse identity, footprint
+        derived, exactly like the live-entity convention."""
+        w = h = 1
+        ent = corpse.get("entity") if isinstance(corpse, dict) else None
+        cv = ent.get("vars", {}) if isinstance(ent, dict) else {}
+        if isinstance(cv, dict):
+            try:
+                w = max(1, int(cv.get(str(self.rules.get("footprint_width_var", "footprint_w")))))
+            except (TypeError, ValueError):
+                w = 1
+            try:
+                h = max(1, int(cv.get(str(self.rules.get("footprint_height_var", "footprint_h")))))
+            except (TypeError, ValueError):
+                h = 1
+        return w, h
+
+    def corpse_cells(self, x: int, y: int,
+                     corpse: Dict[str, Any]) -> List[Tuple[int, int]]:
+        """The cells a corpse covers, anchored at its tile (x, y)."""
+        w, h = self._corpse_footprint(corpse)
+        return [(x + dx, y + dy) for dy in range(h) for dx in range(w)]
+
     def corpse_visible_to(self, eid: str, corpse: Dict[str, Any],
                           x: int, y: int, pov_team: Optional[str]) -> bool:
         """Whether a corpse (Dead: row) is visible to `pov_team`. A
         corpse is a stored snapshot, not a live entity, so the formula
         gets corpse_team (the dead entity's team_var value at death) +
-        tile_x / tile_y rather than `self`. See
+        tile_x / tile_y rather than `self`. A large corpse is visible if
+        ANY cell of its footprint is fog-visible. See
         corpse_visibility_condition."""
         if pov_team is None:
             return True
-        if not self._fog_terrain_visible(pov_team, x, y):
+        if not any(self._fog_terrain_visible(pov_team, cx, cy)
+                   for cx, cy in self.corpse_cells(x, y, corpse)):
             return False
         team_var = str(self.rules.get("team_var", "team"))
         corpse_team = ""
@@ -5088,22 +5208,112 @@ class Match:
             raise NotFound(f"formula function '{name}' not found.")
         del self.formula_functions[name]
 
-    def is_occupied(self, x: int, y: int, ignore_entity_id: Optional[str] = None) -> bool:
-        """True when the cell (x, y) holds an entity that BLOCKS other
-        entities from entering — i.e. an alive non-stackable entity.
-        Stackable entities (vars `__cell_stackable` truthy) don't count
-        as occupying their cell; a tile holding only stackable residents
-        still answers False here. Pair this with the mover-side check
-        in Entity.tp / move_dirs / Match.summon_entity: those skip the
-        is_occupied call entirely when the MOVER itself is stackable,
-        so a stackable entity can also enter a cell that has a
-        non-stackable resident."""
+    # ---- entity footprint (multi-tile / large entities) --------------
+    # A large entity occupies a W×H rectangle of cells anchored at its
+    # TOP-LEFT cell (entity.x / entity.y). W and H live in entity vars
+    # named by the footprint_width_var / footprint_height_var rules,
+    # defaulting to 1×1 when the var is absent or non-positive — so a
+    # plain entity behaves exactly as before. Every spatial RELATION
+    # (occupancy, movement validation, spawn/summon placement,
+    # rendering, and — in later layers — vision / distance / AoE) works
+    # in terms of the full footprint; the anchor is only the addressing
+    # convention: what entity[X].x means and where a bare coord points.
+    # The footprint extends RIGHT (+x) and DOWN (+y) from the anchor.
+
+    def _footprint_dim(self, e: "Entity", rule_key: str, default_name: str) -> int:
+        var = str(self.rules.get(rule_key, default_name))
+        try:
+            v = int(e.vars.get(var))
+        except (TypeError, ValueError):
+            return 1
+        return v if v >= 1 else 1
+
+    def entity_footprint(self, e: "Entity") -> Tuple[int, int]:
+        """(width, height) of `e`'s footprint, each >= 1. 1×1 when the
+        footprint vars are unset / non-positive (the ordinary case)."""
+        return (self._footprint_dim(e, "footprint_width_var", "footprint_w"),
+                self._footprint_dim(e, "footprint_height_var", "footprint_h"))
+
+    def entity_cells(self, e: "Entity",
+                     ax: Optional[int] = None,
+                     ay: Optional[int] = None) -> List[Tuple[int, int]]:
+        """The list of (x, y) cells `e`'s footprint covers, anchored at
+        (ax, ay) — defaulting to the entity's current position. Top-left
+        anchored, row-major order (so [0] is always the anchor cell)."""
+        if ax is None:
+            ax = e.x
+        if ay is None:
+            ay = e.y
+        w, h = self.entity_footprint(e)
+        return [(ax + dx, ay + dy) for dy in range(h) for dx in range(w)]
+
+    def entity_occupies(self, e: "Entity", x: int, y: int) -> bool:
+        """True iff (x, y) lies within `e`'s footprint at its current
+        anchor — the membership test behind cell_occupant."""
+        w, h = self.entity_footprint(e)
+        return e.x <= x < e.x + w and e.y <= y < e.y + h
+
+    def cell_occupant(self, x: int, y: int,
+                      ignore: Tuple[str, ...] = ()) -> Optional[str]:
+        """The id of the first alive, non-stackable entity whose
+        FOOTPRINT covers (x, y), skipping any id in `ignore`; None when
+        the cell is free of blockers. The footprint-aware core behind
+        is_occupied — a large entity blocks every cell it spans."""
         for eid, e in self.entities.items():
-            if ignore_entity_id and eid == ignore_entity_id:
+            if eid in ignore:
                 continue
-            if e.x == x and e.y == y and e.is_alive and not e.is_cell_stackable:
-                return True
-        return False
+            if e.is_alive and not e.is_cell_stackable and self.entity_occupies(e, x, y):
+                return eid
+        return None
+
+    def is_occupied(self, x: int, y: int, ignore_entity_id: Optional[str] = None) -> bool:
+        """True when the cell (x, y) is covered by the footprint of an
+        entity that BLOCKS others from entering — i.e. an alive
+        non-stackable entity (a W×H entity blocks all W*H of its cells).
+        Stackable entities (vars `__cell_stackable` truthy) don't count
+        as occupying their cells; a tile holding only stackable
+        residents still answers False here. Pair this with the
+        mover-side check in Entity.tp / move_dirs / Match.summon_entity:
+        those skip the occupancy call entirely when the MOVER itself is
+        stackable, so a stackable entity can also enter a cell that has
+        a non-stackable resident."""
+        ignore = (ignore_entity_id,) if ignore_entity_id else ()
+        return self.cell_occupant(x, y, ignore) is not None
+
+    # ---- footprint-aware placement validation ------------------------
+    # The single gate every validated placement (tp / move_dirs final /
+    # spawn / summon / resize) funnels through, so footprint semantics
+    # live in one place. The raw move_to primitive and direct position
+    # writes stay single-cell and ungated, as before.
+
+    def footprint_in_bounds(self, e: "Entity", ax: int, ay: int) -> bool:
+        """True iff every cell of `e`'s footprint anchored at (ax, ay)
+        is on the grid."""
+        return all(self.in_bounds(cx, cy) for cx, cy in self.entity_cells(e, ax, ay))
+
+    def _validate_placement(self, e: "Entity", ax: int, ay: int,
+                            mode: Optional[str]) -> None:
+        """Validate that `e` can occupy the footprint anchored at
+        (ax, ay): every cell in bounds, none occupied by another entity
+        (skipped when `e` is stackable), and — when `mode` is not None —
+        none blocking movement of kind `mode` ('walk'/'tp'/'swap').
+        Raises OutOfBounds / Occupied / Blocked naming the offending
+        cell. `e`'s own footprint is always ignored for occupancy, so a
+        large entity stepping forward doesn't collide with the cells it
+        is vacating. Shared by tp / move_dirs / spawn / summon."""
+        cells = self.entity_cells(e, ax, ay)
+        for cx, cy in cells:
+            if not self.in_bounds(cx, cy):
+                raise OutOfBounds(
+                    f"({cx},{cy}) outside {self.grid_width}x{self.grid_height}")
+        if not e.is_cell_stackable:
+            for cx, cy in cells:
+                if self.cell_occupant(cx, cy, (e.id,)) is not None:
+                    raise Occupied(f"Cell ({cx},{cy}) already occupied")
+        if mode is not None:
+            for cx, cy in cells:
+                if self._check_block(e.id, cx, cy, mode):
+                    raise Blocked(f"Cell ({cx},{cy}) blocks `{e.id}`")
 
     # ---- movement blocking (impassable tiles / zones) ----------------
     # A cell blocks a mover when its tile OR any covering zone evaluates a
@@ -5226,14 +5436,21 @@ class Match:
         stackable = e.is_cell_stackable
         for _ in range(n):
             nx, ny = x + dx, y + dy
-            if not self.in_bounds(nx, ny):
+            # Footprint-aware: the whole shifted footprint must be in
+            # bounds, unoccupied (by others), and unblocked — the push
+            # stops at the cell before the first cell that fails for any
+            # part of the body.
+            if not self.footprint_in_bounds(e, nx, ny):
                 break
-            if not stackable and self.is_occupied(nx, ny, ignore_entity_id=e.id):
+            if not stackable and any(
+                    self.cell_occupant(cx, cy, (e.id,)) is not None
+                    for cx, cy in self.entity_cells(e, nx, ny)):
                 break
             # A blocked cell stops the push at the cell before it (knockback
             # into a wall) — same "stops at the first blocker" rule as
             # occupancy above.
-            if self._check_block(e.id, nx, ny, "push"):
+            if any(self._check_block(e.id, cx, cy, "push")
+                   for cx, cy in self.entity_cells(e, nx, ny)):
                 break
             x, y = nx, ny
             steps += 1
@@ -5299,13 +5516,18 @@ class Match:
                 else:
                     sx = 0
             nx, ny = x + sx, y + sy
-            if not self.in_bounds(nx, ny):
+            # Footprint-aware (see push_entity): the whole shifted body
+            # must be in bounds, clear of others, and unblocked.
+            if not self.footprint_in_bounds(e, nx, ny):
                 break
-            if not stackable and self.is_occupied(nx, ny, ignore_entity_id=e.id):
+            if not stackable and any(
+                    self.cell_occupant(cx, cy, (e.id,)) is not None
+                    for cx, cy in self.entity_cells(e, nx, ny)):
                 break
             # Blocking stops the drag at the cell before a blocked one,
             # mirroring push_entity's "stops at the first blocker" rule.
-            if self._check_block(e.id, nx, ny, "push"):
+            if any(self._check_block(e.id, cx, cy, "push")
+                   for cx, cy in self.entity_cells(e, nx, ny)):
                 break
             moves.append((_VECTOR_TO_DIRECTION[(sx, sy)], 1))
             x, y = nx, ny
@@ -5340,31 +5562,52 @@ class Match:
         # stackable entities, but defended): nothing moves, no hooks.
         if (ax, ay) == (bx, by):
             return False, []
-        # Each partner lands on the OTHER's cell; refuse the swap if that
-        # cell blocks it (e.g. swapping a non-flyer into a wall the other
-        # was occupying). Checked before any hook fires — all-or-nothing.
-        if self._check_block(a, bx, by, "swap"):
-            raise Blocked(f"Cell ({bx},{by}) blocks `{a}`")
-        if self._check_block(b, ax, ay, "swap"):
-            raise Blocked(f"Cell ({ax},{ay}) blocks `{b}`")
+        # Each partner's ANCHOR lands on the other's anchor; its whole
+        # footprint re-anchors there. For equal-size entities this is a
+        # clean exchange; for DIFFERENT sizes it's only legal when each
+        # relocated footprint fits — in bounds, and clear of every entity
+        # except the two being swapped (they vacate each other). Checked
+        # before any hook fires — all-or-nothing. Block (swap mode) is
+        # checked per covered cell.
+        pair = (a, b)
+        for mover, mx, my in ((ea, bx, by), (eb, ax, ay)):
+            for cx, cy in self.entity_cells(mover, mx, my):
+                if not self.in_bounds(cx, cy):
+                    raise OutOfBounds(
+                        f"swap: ({cx},{cy}) outside "
+                        f"{self.grid_width}x{self.grid_height} for `{mover.id}`")
+            if not mover.is_cell_stackable:
+                for cx, cy in self.entity_cells(mover, mx, my):
+                    if self.cell_occupant(cx, cy, pair) is not None:
+                        raise Occupied(
+                            f"swap: cell ({cx},{cy}) occupied — `{mover.id}` "
+                            f"doesn't fit at the swap target")
+            for cx, cy in self.entity_cells(mover, mx, my):
+                if self._check_block(mover.id, cx, cy, "swap"):
+                    raise Blocked(f"Cell ({cx},{cy}) blocks `{mover.id}`")
         log: List[str] = []
-        # Fire on_exit at CURRENT positions before any state changes, so
-        # passives observe each entity still standing on its old cell.
-        log += self.fire_tile_hook("on_exit", a, ax, ay)
-        log += self.fire_zone_exit_hooks(a, ax, ay, bx, by)
-        log += self.fire_tile_hook("on_exit", b, bx, by)
-        log += self.fire_zone_exit_hooks(b, bx, by, ax, ay)
+        # Footprint cell sets for each partner at its old and new anchor.
+        a_old = self.entity_cells(ea, ax, ay)
+        a_new = self.entity_cells(ea, bx, by)
+        b_old = self.entity_cells(eb, bx, by)
+        b_new = self.entity_cells(eb, ax, ay)
+        # Fire exit-side hooks at CURRENT positions before any state change,
+        # so passives observe each entity still standing on its old cells.
+        log += self.fire_footprint_tile_exit(a, a_old, a_new)
+        log += self.fire_footprint_zone_exit(a, a_old, a_new)
+        log += self.fire_footprint_tile_exit(b, b_old, b_new)
+        log += self.fire_footprint_zone_exit(b, b_old, b_new)
         # Atomic swap via direct move_to (bypasses is_occupied — required,
         # since A and B occupy each other's target cells until done).
         ea.move_to(bx, by)
         eb.move_to(ax, ay)
-        log += self.fire_tile_hook("on_enter", a, bx, by)
-        log += self.fire_tile_hook("on_stop", a, bx, by)
         # Each swap partner's move is a single, final step — enter + stop.
-        log += self.fire_zone_enter_hooks(a, ax, ay, bx, by, True)
-        log += self.fire_tile_hook("on_enter", b, ax, ay)
-        log += self.fire_tile_hook("on_stop", b, ax, ay)
-        log += self.fire_zone_enter_hooks(b, bx, by, ax, ay, True)
+        log += self.fire_footprint_tile_enter(a, a_old, a_new)
+        log += self.fire_footprint_tile_stop(a, a_new)
+        log += self.fire_footprint_zone_enter(a, a_old, a_new, True)
+        log += self.fire_footprint_tile_enter(b, b_old, b_new)
+        log += self.fire_footprint_tile_stop(b, b_new)
+        log += self.fire_footprint_zone_enter(b, b_old, b_new, True)
         log += self.fire_entity_moved(a, ax, ay, bx, by)
         log += self.fire_entity_moved(b, bx, by, ax, ay)
         return True, log
@@ -5945,6 +6188,98 @@ class Match:
             log.extend(self.fire_zone_hook("on_cell_stop", name, entity_id, x, y))
         return log
 
+    # ---- footprint-aware movement hook firing ------------------------
+    # A large entity fires tile/zone movement hooks per CELL it covers:
+    # on_exit / on_cell_exit for every cell the footprint vacates,
+    # on_enter / on_cell_enter for every cell it newly covers, and
+    # on_stop / on_cell_stop for every final cell — so a 2×2 crossing a
+    # band of fire tiles burns once per fire cell entered. Boundary zone
+    # hooks (on_enter/on_exit/on_stop) fire ONCE per zone (at the first
+    # relevant cell); per-cell zone hooks fire per covered cell. For a
+    # 1×1 entity these reduce exactly to the single-cell firings.
+
+    def _zones_over(self, cells) -> set:
+        names: set = set()
+        for (cx, cy) in cells:
+            names |= set(self.zones_at(cx, cy))
+        return names
+
+    def fire_footprint_tile_exit(self, eid: Optional[str],
+                                 old_cells, new_cells) -> List[str]:
+        nc = set(new_cells)
+        log: List[str] = []
+        for (cx, cy) in old_cells:
+            if (cx, cy) not in nc:
+                log.extend(self.fire_tile_hook("on_exit", eid, cx, cy))
+        return log
+
+    def fire_footprint_tile_enter(self, eid: Optional[str],
+                                  old_cells, new_cells) -> List[str]:
+        oc = set(old_cells)
+        log: List[str] = []
+        for (cx, cy) in new_cells:
+            if (cx, cy) not in oc:
+                log.extend(self.fire_tile_hook("on_enter", eid, cx, cy))
+        return log
+
+    def fire_footprint_tile_stop(self, eid: Optional[str], cells) -> List[str]:
+        log: List[str] = []
+        for (cx, cy) in cells:
+            log.extend(self.fire_tile_hook("on_stop", eid, cx, cy))
+        return log
+
+    def fire_footprint_zone_exit(self, eid: Optional[str],
+                                 old_cells, new_cells) -> List[str]:
+        """PRE-move: per-cell on_cell_exit for every vacated cell in a
+        zone, plus boundary on_exit ONCE for each zone the whole footprint
+        is leaving (was overlapped, now disjoint)."""
+        nc = set(new_cells)
+        leaving = self._zones_over(old_cells) - self._zones_over(new_cells)
+        log: List[str] = []
+        for (cx, cy) in old_cells:
+            if (cx, cy) in nc:
+                continue
+            for name in sorted(set(self.zones_at(cx, cy))):
+                if name in leaving:
+                    log.extend(self.fire_zone_hook("on_exit", name, eid, cx, cy))
+                    leaving.discard(name)
+                log.extend(self.fire_zone_hook("on_cell_exit", name, eid, cx, cy))
+        return log
+
+    def fire_footprint_zone_enter(self, eid: Optional[str],
+                                  old_cells, new_cells,
+                                  is_final: bool) -> List[str]:
+        """POST-move: boundary on_enter ONCE for each newly-overlapped
+        zone + per-cell on_cell_enter for every newly-covered cell in a
+        zone. When is_final, also fire the footprint stop hooks."""
+        oc = set(old_cells)
+        entering = self._zones_over(new_cells) - self._zones_over(old_cells)
+        log: List[str] = []
+        for (cx, cy) in new_cells:
+            if (cx, cy) in oc:
+                continue
+            for name in sorted(set(self.zones_at(cx, cy))):
+                if name in entering:
+                    log.extend(self.fire_zone_hook("on_enter", name, eid, cx, cy))
+                    entering.discard(name)
+                log.extend(self.fire_zone_hook("on_cell_enter", name, eid, cx, cy))
+        if is_final:
+            log.extend(self.fire_footprint_zone_stop(eid, new_cells))
+        return log
+
+    def fire_footprint_zone_stop(self, eid: Optional[str], cells) -> List[str]:
+        """Boundary on_stop ONCE per zone the footprint ends in, plus
+        per-cell on_cell_stop for every final cell in a zone."""
+        log: List[str] = []
+        stopped: set = set()
+        for (cx, cy) in cells:
+            for name in sorted(set(self.zones_at(cx, cy))):
+                if name not in stopped:
+                    log.extend(self.fire_zone_hook("on_stop", name, eid, cx, cy))
+                    stopped.add(name)
+                log.extend(self.fire_zone_hook("on_cell_stop", name, eid, cx, cy))
+        return log
+
     def fire_zone_time_hooks(self, when: str) -> List[str]:
         """Fire zone time hooks (on_round_start/end, on_turn_start/end) on
         every zone carrying a hook of that name. Iterates a snapshot of
@@ -6498,46 +6833,51 @@ class Match:
         if not isinstance(x, int) or isinstance(x, bool) \
                 or not isinstance(y, int) or isinstance(y, bool):
             raise VTTError("summon: x and y must be integers.")
-        place_x, place_y = x, y
-        # If the template marks the summoned entity as cell-stackable,
-        # placement bypasses occupancy entirely — symmetric with how
-        # Entity.tp / move_dirs handle stackable movers. We probe the
-        # template's vars directly rather than constructing the Entity
-        # twice; the eventual Entity.spawn below will validate again
-        # (and also bypass for stackable, via the same flag).
-        tpl_vars = template.get("vars") if isinstance(template.get("vars"), dict) else {}
-        stackable_template = bool(tpl_vars.get("__cell_stackable", False))
-        if near_radius is not None:
-            place = self._find_free_cell_near(x, y, int(near_radius))
-            if place is None:
-                raise Occupied(
-                    f"summon_near: no free in-bounds cell within "
-                    f"radius {near_radius} of ({x},{y})."
-                )
-            place_x, place_y = place
-        else:
-            if not self.in_bounds(place_x, place_y):
-                raise OutOfBounds(
-                    f"summon: ({place_x},{place_y}) is off-grid "
-                    f"({self.grid_width}x{self.grid_height})."
-                )
-            if not stackable_template and self.is_occupied(place_x, place_y):
-                raise Occupied(
-                    f"summon: cell ({place_x},{place_y}) is occupied. "
-                    f"Use summon_near to search for a free cell."
-                )
 
-        # Build the concrete entity dict: copy the template, then
-        # override id/x/y. We deep-copy so the summoned entity doesn't
-        # alias the stored template's nested dicts (mutating the minion
-        # later must not edit the stored blueprint).
+        # Build the concrete entity FIRST (so its footprint — including any
+        # size supplied by default_entity_vars — is known before we search
+        # for / validate a placement). Deep-copy so the summoned entity
+        # doesn't alias the stored template's nested dicts (mutating the
+        # minion later must not edit the stored blueprint).
         prefix = id_prefix or template.get("name") or template.get("id") or "summon"
         new_id = self.mint_entity_id(prefix)
         d = copy.deepcopy(template)
         d["id"] = new_id
+        e = Entity.from_dict(d)
+        # Apply default vars to the probe so the footprint size reflects
+        # them; spawn re-applies (fill-only, idempotent).
+        self._apply_default_vars(e)
+        stackable_template = e.is_cell_stackable
+
+        place_x, place_y = x, y
+        if near_radius is not None:
+            place = self._find_free_cell_near(x, y, int(near_radius), e=e)
+            if place is None:
+                fw, fh = self.entity_footprint(e)
+                raise Occupied(
+                    f"summon_near: no cell within radius {near_radius} of "
+                    f"({x},{y}) fits `{new_id}`'s {fw}x{fh} footprint."
+                )
+            place_x, place_y = place
+        else:
+            # Footprint-aware pre-check for a friendly message; spawn's
+            # _validate_placement is the authoritative gate.
+            if not self.footprint_in_bounds(e, place_x, place_y):
+                raise OutOfBounds(
+                    f"summon: footprint anchored at ({place_x},{place_y}) is "
+                    f"off-grid ({self.grid_width}x{self.grid_height})."
+                )
+            if not stackable_template and any(
+                    self.cell_occupant(cx, cy) is not None
+                    for cx, cy in self.entity_cells(e, place_x, place_y)):
+                raise Occupied(
+                    f"summon: footprint at ({place_x},{place_y}) is occupied. "
+                    f"Use summon_near to search for a free cell."
+                )
+
         d["x"] = place_x
         d["y"] = place_y
-        e = Entity.from_dict(d)
+        e.x, e.y = place_x, place_y
         # Entity.spawn validates bounds/occupancy again (cheap) and
         # fires on_entity_spawned. We pre-validated for a clean error
         # message; spawn's checks are the authoritative gate.
@@ -6547,11 +6887,25 @@ class Match:
 
     def _find_free_cell_near(
         self, x: int, y: int, radius: int,
+        e: Optional["Entity"] = None,
     ) -> Optional[Tuple[int, int]]:
-        """Ring-search outward from (x,y) for the first free in-bounds
-        cell, distance 0..radius (Chebyshev). Returns (cx,cy) or None.
-        Deterministic order: rings nearest-first, and within a ring by
-        (dy, dx) so summon_near placement is reproducible."""
+        """Ring-search outward from (x,y) for the first in-bounds cell
+        where an entity can be placed, distance 0..radius (Chebyshev).
+        Returns the ANCHOR (cx,cy) or None. When `e` is given the search
+        is footprint-aware: the whole W×H footprint anchored at the
+        candidate must fit in bounds and (unless `e` is stackable) be
+        clear; otherwise it's the plain single-cell test. Deterministic
+        order: rings nearest-first, within a ring by (dy, dx) so
+        placement is reproducible."""
+        def fits(cx: int, cy: int) -> bool:
+            if e is None:
+                return self.in_bounds(cx, cy) and not self.is_occupied(cx, cy)
+            if not self.footprint_in_bounds(e, cx, cy):
+                return False
+            if e.is_cell_stackable:
+                return True
+            return all(self.cell_occupant(fx, fy) is None
+                       for fx, fy in self.entity_cells(e, cx, cy))
         for r in range(0, max(0, radius) + 1):
             if r == 0:
                 candidates = [(x, y)]
@@ -6563,7 +6917,7 @@ class Match:
                         if max(abs(dx), abs(dy)) == r:
                             candidates.append((x + dx, y + dy))
             for cx, cy in candidates:
-                if self.in_bounds(cx, cy) and not self.is_occupied(cx, cy):
+                if fits(cx, cy):
                     return (cx, cy)
         return None
 
@@ -7683,9 +8037,14 @@ class Match:
             # POV filter: an entity hidden from this team isn't drawn.
             if not self.entity_visible_to(e.id, pov_team):
                 continue
-            if self.in_bounds(e.x, e.y):
-                sym = DIRECTION_ARROWS.get(getattr(e, "facing", ""), "@")
-                grid[e.y][e.x] = sym
+            # A large entity paints its glyph across EVERY footprint cell
+            # (a 2×2 reads as a 2×2 block of the same arrow). Living
+            # entities are drawn last, so among overlaps the later-iterated
+            # entity wins and all entities sit above tiles/zones/corpses.
+            sym = DIRECTION_ARROWS.get(getattr(e, "facing", ""), "@")
+            for (cx, cy) in self.entity_cells(e):
+                if self.in_bounds(cx, cy):
+                    grid[cy][cx] = sym
 
         # Fog overlay — the LAST layer. When fog is on and we're rendering
         # from a team POV, every cell whose TERRAIN isn't revealed (not
