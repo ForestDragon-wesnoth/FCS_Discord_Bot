@@ -112,13 +112,20 @@ DIRECTION_ARROWS: Dict[str, str] = {
 # renderer (Discord ```ansi blocks + ANSI terminals). The names are the
 # only valid values for an entity `color` var / a team color; an unknown
 # name renders uncolored. Foreground only for now.
+#
+# Codes are chosen to work on BOTH a real ANSI terminal AND Discord's
+# ```ansi blocks. Discord supports only the 30-37 foreground set plus
+# style 1 (bold) — it does NOT understand the 90-97 "bright" range — so the
+# bright variants are expressed as bold + base color (`1;3X`), which renders
+# bright on Discord and (bold/bright) on a terminal. Plain `gray` is bold
+# black, the brightest Discord gets toward grey.
 TEXT_COLORS: Dict[str, str] = {
     "black": "30", "red": "31", "green": "32", "yellow": "33",
     "blue": "34", "magenta": "35", "cyan": "36", "white": "37",
-    "gray": "90", "grey": "90",
-    "bright_red": "91", "bright_green": "92", "bright_yellow": "93",
-    "bright_blue": "94", "bright_magenta": "95", "bright_cyan": "96",
-    "bright_white": "97",
+    "gray": "1;30", "grey": "1;30",
+    "bright_red": "1;31", "bright_green": "1;32", "bright_yellow": "1;33",
+    "bright_blue": "1;34", "bright_magenta": "1;35", "bright_cyan": "1;36",
+    "bright_white": "1;37",
 }
 
 # !map resize anchors: name (+ aliases) -> (horizontal, vertical) kind.

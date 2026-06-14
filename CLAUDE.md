@@ -956,16 +956,23 @@ More shipped work (continuing the list above):
     (else ignored → falls through), same rule as tile/zone glyphs, so columns
     stay aligned. Works on every surface incl. the harness.
   - **Color** (surface-gated, ANSI): `TEXT_COLORS` maps names (red/green/.../
-    bright_*) → ANSI SGR fg codes. `Match.entity_color(e)` = the entity's
+    bright_*) → ANSI SGR fg codes. Codes work on BOTH a terminal and Discord
+    `ansi` blocks: Discord only supports 30-37 + style 1 (bold) and NOT the
+    90-97 bright range, so the bright_* variants are `1;3X` (bold+base) and
+    `gray` is `1;30`. `Match.entity_color(e)` = the entity's
     `color` var > its team's color (the per-match `team_colors` map, DEFAULTING
     to the team's own name when that name is itself a palette color — a team
     named "red" auto-renders red) > None. `render_ascii(pov, colorize=)` wraps
     each entity glyph in `\x1b[<code>m…\x1b[0m` when colorize. FG only for now.
   - **Surface plumbing:** the command layer colorizes only when
     `ctx.supports_color` AND the match's `color_enabled` (default True); it
-    fences the map ` ```ansi ` so Discord renders the codes. CLI + Discord set
-    `supports_color=True`; the scenario harness does NOT → its `!map` is always
-    plain (scenarios stay clean). Per-match toggle `!map color on|off`; team
+    fences the map ` ```ansi ` so Discord renders the codes. Discord sets
+    `supports_color=True`; the CLI sets it per-run via `_enable_terminal_color()`
+    (turns on Windows VT processing via SetConsoleMode; respects NO_COLOR /
+    non-tty; on failure → plain + a one-time "use Discord / glyphs" warning,
+    so a legacy console never spews raw escapes); the scenario harness does
+    NOT set it → its `!map` is always plain (scenarios stay clean). Per-match
+    toggle `!map color on|off`; team
     map via `!map teamcolor <team> <color>|clear|list` (host-gated via
     ELEVATED_ARGS["map"]). Both fields serialized on Match.
   - Scenarios 401 (glyphs) / 402 (color settings). NEXT PR (the user wants it):
