@@ -10296,3 +10296,51 @@ scanned root). `!mod show fighter dmg 10`: base 10 +30 (blade) +100
 `!mod show fighter dmg 10 holy`: the holyban modifier is excluded by its
 negative tag, so 10 +30 = 40, ×1.5 = 60. Demonstrates source scoping,
 the more% multiplicative layer, negative tags, and the read-only readout.
+
+
+SCENARIO 401 — Renderer: custom entity glyphs (single + per-facing)
+-------------------------------------------------------------------
+
+!match new rend REND 6 3
+!match use rend
+!ent add knight Knight 30 2 2 9
+!ent set_var knight glyph K
+!ent add scout Scout 30 4 2 9
+!ent set_var scout glyphs.right R
+!ent set_var scout glyphs.up U
+!ent face scout right
+!map
+!ent face scout up
+!map
+
+Expected: knight renders as `K` — a single `glyph` var, direction-agnostic
+(stays `K` whatever its facing). scout uses a per-facing `glyphs` table:
+facing right it shows `R`, and after turning to face up it shows `U`. An
+entity with neither var keeps the default DIRECTION_ARROWS arrow. Custom
+glyphs must be exactly one character (anything else is ignored and falls
+through to the arrow), so columns stay aligned.
+
+
+SCENARIO 402 — Renderer: color settings (surface-gated)
+-------------------------------------------------------
+
+!match new col COL 6 3
+!match use col
+!ent add red1 Red 30 2 2 9
+!ent set_var red1 team red
+!map teamcolor orcs green
+!map teamcolor list
+!ent set_var red1 color bright_red
+!map color off
+!map color on
+!map teamcolor orcs notacolor
+!map
+
+Expected: team text colors are a match-level setting — `!map teamcolor orcs
+green` assigns one and `list` shows it. A team literally named `red`
+auto-colors red without any mapping; an entity's own `color` var (here
+bright_red) overrides its team color. `!map color off|on` toggles colorized
+rendering for the match. Color is only emitted on a color-capable surface
+(Discord ansi blocks / a terminal); the headless harness declares no color
+support, so its `!map` stays plain ASCII regardless. An unknown color name
+(`notacolor`) is rejected with ❌.

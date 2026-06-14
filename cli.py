@@ -8,6 +8,9 @@ from vtt_commands import registry
 
 class CLICtx:
     channel_key = "CLI"
+    # The terminal interprets ANSI escapes, so the colorized renderer is
+    # enabled here (the ```ansi fence is harmless noise on a terminal).
+    supports_color = True
     # The CLI is single-user and local, so identity is a switchable
     # stand-in (the `!as` command flips it) used to PREVIEW what a host
     # vs a player sees. Default identity "cli" owns any match it creates.
