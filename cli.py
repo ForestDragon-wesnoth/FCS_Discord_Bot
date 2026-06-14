@@ -1,15 +1,49 @@
 
 ## cli.py (desktop runner using the same commands)
 # cli.py
-import asyncio, shlex
+import asyncio, shlex, os, sys
 from typing import List
 from logic import MatchManager
 from vtt_commands import registry
 
+
+def _enable_terminal_color() -> bool:
+    """Best-effort: make this terminal able to render the colorized map.
+
+    Returns True when ANSI escapes will be interpreted, False otherwise
+    (the caller then disables color + warns instead of spewing raw codes).
+    On Windows the legacy console doesn't process ANSI until
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING is turned on; we flip it via
+    SetConsoleMode. NO_COLOR (the de-facto standard) and a non-tty stdout
+    (piped/redirected) both force plain."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    try:
+        if not sys.stdout.isatty():
+            return False
+    except Exception:
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            k = ctypes.windll.kernel32
+            h = k.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+            mode = ctypes.c_uint32()
+            if not k.GetConsoleMode(h, ctypes.byref(mode)):
+                return False
+            ENABLE_VT = 0x0004
+            if not k.SetConsoleMode(h, mode.value | ENABLE_VT):
+                return False
+        except Exception:
+            return False
+    return True
+
+
 class CLICtx:
     channel_key = "CLI"
-    # The terminal interprets ANSI escapes, so the colorized renderer is
-    # enabled here (the ```ansi fence is harmless noise on a terminal).
+    # Whether the colorized renderer is used. Set per-run in main() from
+    # _enable_terminal_color(); a terminal that can't process ANSI gets
+    # plain output (and a one-time warning) rather than raw escape codes.
     supports_color = True
     # The CLI is single-user and local, so identity is a switchable
     # stand-in (the `!as` command flips it) used to PREVIEW what a host
@@ -62,11 +96,19 @@ def parse(line: str):
 async def main():
     mgr = MatchManager()
     ctx = CLICtx()
+    color_ok = _enable_terminal_color()
+    CLICtx.supports_color = color_ok
     print(
         "VTT CLI. Type !help to see available commands\n"
         "Type !help [command] to see available subcommands for a specific command\n"
         "Type 'exit' or 'quit' to leave."
     )
+    if not color_ok:
+        print(
+            "(note: this terminal can't render ANSI color — the map will "
+            "show plain. Use Discord for colored units, or tell units apart "
+            "with custom glyphs: `!ent set_var <id> glyph <char>`.)"
+        )
     while True:
         try:
             line = input("> ").strip()
