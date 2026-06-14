@@ -6907,8 +6907,9 @@ async def mod_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         for md in mods:
             tg = (" tags=" + ",".join(md["tags"])) if md["tags"] else ""
             ntg = (" not=" + ",".join(md["not_tags"])) if md["not_tags"] else ""
+            src = f" [{md['source']}]" if md.get("source") else ""
             lines.append(
-                f"  {md['op']} {md['value']:g} (pri {md['priority']:g}){tg}{ntg}")
+                f"  {md['op']} {md['value']:g} (pri {md['priority']:g}){tg}{ntg}{src}")
         if base is not None:
             result = m.apply_modifiers(eid, stat, base, tags, {})
             lines.append(f"  → base {base:g} becomes {result:g}")
