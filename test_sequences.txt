@@ -10231,3 +10231,68 @@ Expected: snipe rolls a hit location, but the large aim_bonus (1000)
 forces the aimed `head`; damage_part then routes 50 × 150% = 75 to the
 target's main HP (100→25). Demonstrates hit_location's aim feeding
 damage_part — the headline "aim for the head" combat flow.
+
+
+SCENARIO 399 — Stat modifiers: layered fold + tags + condition via apply_mods
+-----------------------------------------------------------------------------
+
+!match new mod MOD 10 5
+!match use mod
+!ent add hero Hero 100 2 2 9
+!ent add gob Goblin 200 4 2 5
+!ent set_var gob undead true
+!ent set_var hero modifiers.fb.stat damage_dealt
+!ent set_var hero modifiers.fb.op add
+!ent set_var hero modifiers.fb.value 10
+!ent set_var hero modifiers.fb.tags fire
+!ent set_var hero modifiers.fm.stat damage_dealt
+!ent set_var hero modifiers.fm.op inc%
+!ent set_var hero modifiers.fm.value 50
+!ent set_var hero modifiers.fm.tags fire,melee
+!ent set_var hero modifiers.vu.stat damage_dealt
+!ent set_var hero modifiers.vu.op add
+!ent set_var hero modifiers.vu.value 25
+!ent set_var hero modifiers.vu.condition "entity[target].undead"
+!ent set_var hero actions.strike.target entity
+!ent set_var hero actions.strike.body "entity[target].hp = entity[target].hp - round(apply_mods(self, 'damage_dealt', args.raw, ['fire', 'melee'], target=target))"
+!action hero strike gob raw=40
+!list
+
+Expected: a modifier is a data record (here a dict bundle authored with
+`!ent set_var hero modifiers.<name>.<field>`; tags accept CSV). apply_mods
+folds hero's `damage_dealt` modifiers for tags [fire, melee] vs the undead
+goblin: adds (fire +10, vs-undead +25, the latter firing because its
+condition reads `entity[target].undead`) → 40+35 = 75; then inc% (fire+melee
++50%) → ×1.5 = 112.5 → round 112. Goblin 200 → 88. Against a living target
+the +25 wouldn't apply.
+
+
+SCENARIO 400 — Stat modifiers: equipped source, more%, negative tags, !mod show
+-------------------------------------------------------------------------------
+
+!match new mod2 MOD2 10 5
+!match use mod2
+!ent add fighter Fighter 100 2 2 9
+!ent set_var fighter equipped.blade.modifiers.swing.stat dmg
+!ent set_var fighter equipped.blade.modifiers.swing.op add
+!ent set_var fighter equipped.blade.modifiers.swing.value 30
+!ent set_var fighter inventory.spare.modifiers.swing.stat dmg
+!ent set_var fighter inventory.spare.modifiers.swing.op add
+!ent set_var fighter inventory.spare.modifiers.swing.value 999
+!ent set_var fighter modifiers.berserk.stat dmg
+!ent set_var fighter modifiers.berserk.op more%
+!ent set_var fighter modifiers.berserk.value 50
+!ent set_var fighter modifiers.holyban.stat dmg
+!ent set_var fighter modifiers.holyban.op add
+!ent set_var fighter modifiers.holyban.value 100
+!ent set_var fighter modifiers.holyban.not_tags holy
+!mod show fighter dmg 10
+!mod show fighter dmg 10 holy
+
+Expected: only the EQUIPPED blade contributes its +30 (the identical
+modifier on the `inventory` spare is NOT scanned — equip = move it under a
+scanned root). `!mod show fighter dmg 10`: base 10 +30 (blade) +100
+(holyban, no `holy` tag present) = 140, then more% +50% → ×1.5 = 210.
+`!mod show fighter dmg 10 holy`: the holyban modifier is excluded by its
+negative tag, so 10 +30 = 40, ×1.5 = 60. Demonstrates source scoping,
+the more% multiplicative layer, negative tags, and the read-only readout.

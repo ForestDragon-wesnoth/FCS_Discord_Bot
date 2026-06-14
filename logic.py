@@ -4724,13 +4724,33 @@ class Match:
             roots = roots + [str(r) for r in add]
         return roots
 
+    @staticmethod
+    def _modifier_dicts(bundle: Any) -> List[dict]:
+        """The modifier records in a `modifiers` bundle, which may be a LIST
+        of records or a DICT of named records (the dict form is what
+        `!ent set_var hero modifiers.fireboost.op add` builds)."""
+        if isinstance(bundle, list):
+            return [m for m in bundle if isinstance(m, dict)]
+        if isinstance(bundle, dict):
+            return [m for m in bundle.values() if isinstance(m, dict)]
+        return []
+
+    @staticmethod
+    def _modifier_tagset(raw: Any) -> "set[str]":
+        """A modifier's tag set, accepting a list OR a comma-separated
+        string (so `set_var ... .tags fire,melee` works)."""
+        if isinstance(raw, str):
+            return {t.strip() for t in raw.split(",") if t.strip()}
+        if isinstance(raw, (list, tuple)):
+            return {str(t) for t in raw}
+        return set()
+
     def _walk_modifier_bundles(self, node: Any, out: List[dict]) -> None:
-        """Collect every `modifiers` list found anywhere under `node`
-        (dicts recursed; the modifiers list itself is not descended)."""
+        """Collect every `modifiers` bundle (list or dict of records) found
+        anywhere under `node` (dicts recursed; bundles not descended)."""
         if isinstance(node, dict):
-            mods = node.get("modifiers")
-            if isinstance(mods, list):
-                out.extend(m for m in mods if isinstance(m, dict))
+            if "modifiers" in node:
+                out.extend(self._modifier_dicts(node["modifiers"]))
             for k, v in node.items():
                 if k == "modifiers":
                     continue
@@ -4742,14 +4762,14 @@ class Match:
     def _raw_modifier_records(self, e: "Entity") -> List[dict]:
         """Every modifier record contributing to `e`, aggregated live from
         its sources: each status instance's `modifiers`, the direct
-        `entity.modifiers` slot, and each scan-root subtree."""
+        `entity.modifiers` slot, and each scan-root subtree. A bundle may
+        be a list of records or a dict of named records."""
         out: List[dict] = []
         for sdata in e.status.values():
-            if isinstance(sdata, dict) and isinstance(sdata.get("modifiers"), list):
-                out.extend(m for m in sdata["modifiers"] if isinstance(m, dict))
-        direct = e.vars.get("modifiers")
-        if isinstance(direct, list):
-            out.extend(m for m in direct if isinstance(m, dict))
+            if isinstance(sdata, dict) and "modifiers" in sdata:
+                out.extend(self._modifier_dicts(sdata["modifiers"]))
+        if "modifiers" in e.vars:
+            out.extend(self._modifier_dicts(e.vars["modifiers"]))
         for root in self._effective_modifier_sources(e):
             node: Any = e.vars
             ok = True
@@ -4789,10 +4809,10 @@ class Match:
         for m in self._raw_modifier_records(e):
             if str(m.get("stat", "")) != str(stat):
                 continue
-            req = {str(t) for t in (m.get("tags") or [])}
+            req = self._modifier_tagset(m.get("tags"))
             if not req <= tagset:
                 continue
-            notg = {str(t) for t in (m.get("not_tags") or [])}
+            notg = self._modifier_tagset(m.get("not_tags"))
             if notg & tagset:
                 continue
             cond = m.get("condition", "")
