@@ -10161,3 +10161,73 @@ With NO answer supplied and no interactive surface (the harness can't
 prompt), `!action mage zap` fails cleanly with a "needs a choice" ❌
 rather than hanging or crashing — choices must be pre-supplied to drive
 an action headlessly.
+
+
+SCENARIO 396 — Body parts: damage_part HD2 routing + 0/0 passthrough zone
+-------------------------------------------------------------------------
+
+!match new loc LOC 10 5
+!match use loc
+!ent add knight Knight 50 2 3 9
+!ent add ogre Ogre 200 5 3 5
+!part add ogre oarm arm 40 40 to_main_percent=50 to_main_cap=max_hp
+!part add ogre ohead head 0 0 to_main_percent=150
+!ent set_var knight inventory.weapon.actions.hit.target entity
+!ent set_var knight inventory.weapon.actions.hit.body "damage_part(part(target, args.where), args.dmg)"
+!action knight hit ogre where=arm dmg=20
+!ent dump ogre
+!action knight hit ogre where=head dmg=100
+!part list ogre
+
+Expected: `hit` routes damage to a named body part via
+damage_part(part(target, where), dmg). First strike (arm, 20): the arm
+(cap=max_hp) loses 20 (40→20) and 50% of 20 = 10 taps to the ogre's main
+HP (200→190). Second strike (head, 100): the head is a 0/0 passthrough
+zone (auto cap=none + indestructible), so the full 100 × 150% = 150 taps
+to main (190→40) while the head stays at 0/0. `!part list ogre` shows
+`oarm` 20/40 (50%→main) and `ohead` 0/0 (150%→main, indestructible).
+
+
+SCENARIO 397 — Body parts: vital cascade + lingering destruction
+----------------------------------------------------------------
+
+!match new loc2 LOC2 10 5
+!match use loc2
+!ent add mech Mech 300 5 3 5
+!part add mech marm arm 40 40 to_main_percent=30
+!part add mech mcore core 50 50 vital=true to_main_percent=0
+!ent add gun Gunner 30 2 3 9
+!ent set_var gun actions.blast.target entity
+!ent set_var gun actions.blast.body "damage_part(part(target, args.where), args.dmg)"
+!action gun blast mech where=arm dmg=100
+!part list mech
+!action gun blast mech where=core dmg=100
+!list
+
+Expected: blasting the arm for 100 destroys it (40→0); the arm LINGERS
+attached as a dead limb (marked DESTROYED in `!part list`), and 30% of the
+capped damage (cap=max_hp 40 → 30%×40 = 12) taps to the mech (300→288).
+The mech survives. Blasting the vital core for 100 destroys it AND kills
+the mech (vital cascade), then the parent-death cascade removes the mech's
+parts — `!list`'s live roster shows only the Gunner (the Mech is a corpse
+in the Dead section) and no body parts remain.
+
+
+SCENARIO 398 — Body parts: hit_location aim feeds damage_part
+-------------------------------------------------------------
+
+!match new loc3 LOC3 10 5
+!match use loc3
+!system set default random_seed bodyseed
+!ent add t Target 100 5 3 5
+!part add t th head 0 0 to_main_percent=150 hit_weights.front=20 hit_weights.back=20
+!ent add a Attacker 30 5 1 9
+!ent set_var a actions.snipe.target entity
+!ent set_var a actions.snipe.body "damage_part(hit_location(target, entity[self].x, entity[self].y, args.aim, 1, 1000), args.dmg)"
+!action a snipe t aim=head dmg=50
+!ent dump t
+
+Expected: snipe rolls a hit location, but the large aim_bonus (1000)
+forces the aimed `head`; damage_part then routes 50 × 150% = 75 to the
+target's main HP (100→25). Demonstrates hit_location's aim feeding
+damage_part — the headline "aim for the head" combat flow.

@@ -834,6 +834,82 @@ More shipped work (continuing the list above):
   state-changing commands, HOST-ONLY by default, while plain `!map`/`!state`
   stay throwaway on-demand renders. Lives in the Discord adapter; the headless
   harness can't exercise it. The "push" half of per-channel POV.
+- **Locational / body-part damage — SHIPPED (first slice).**
+  The big locational-damage arc (scope ~ multi-tile entities). Reference the
+  FCS3 combat-rules docx (head=150% / chest=100% / stomach=70% / limbs=30%
+  "damage to main", directional hit-chance tables, armor coverage) and
+  Helldivers 2's "% to main" model. WHAT SHIPPED:
+  - **Parts are real `Entity`s** in `match.entities`, flagged attached via a
+    protected `part_of=<parent_id>` entity FIELD (serialized; not a var). Parent's
+    parts are DERIVED by scanning for `part_of==self` (no second structure); an
+    `Entity.is_part` property (true only while the parent exists). A part's `x,y`
+    MIRROR the parent's anchor, re-stamped on `fire_entity_moved` via
+    `_restamp_parts_for` (same hook+pattern as entity-anchored auras).
+  - **Skip surface:** attached parts are excluded from occupancy/`cell_occupant`,
+    render glyph, group-move, zone membership, team vision (sees + is-seen +
+    `_record_vision`), and the spatial/roster formula enums (`entities_within`/
+    `nearest_entity` via `_candidates`, `entities_in_area`, `all_entities`).
+    PROPERTY searches (`entities_with_status`/`_var`) still include parts. Turn
+    order is free — a part has no initiative unless made independent (give it one
+    → it acts on its own turn, the turret/eldritch case). `_validate_placement`
+    skips occupancy for parts (keyed off the raw `part_of` field, since spawn
+    validates before binding).
+  - **HP-less zones = `0/0` indestructible entities** (compatible with every
+    hp-assuming mechanic). `Match.is_indestructible(e)` = the `indestructible`
+    var OR (is_part AND max_hp<=0).
+  - **`parent` reference token** (child→parent), resolves like
+    `self`/`this`/`current` via `EvalCtx` (now carries a `match` backref for it);
+    wired into `_ENTITY_TOKEN_NAMES`, `_who_arg`, `RESERVED_IDS`. Parent→child is
+    primitive-based: `parts(eid)` (loopable), `part(parent, name_or_id)`,
+    `has_part`, `part_of(eid)`.
+  - **Damage model = HD2 "% to main", default but heavily configurable.**
+    `damage_part(part, amount)` → to-main dealt. Computes the to-main transfer
+    EXPLICITLY from pre-hit values (incoming + part hp read BEFORE mutation),
+    applies it to the parent via the NORMAL hp path FIRST (so parent clamp/hooks/
+    death fire — kills HD2's uncapped Trooper), THEN floors the part's hp at 0
+    (a 0/0 zone stays 0). Does NOT depend on clamp residue. Per-part vars +
+    gamerule defaults (`part_to_main_percent_default` etc.): `to_main_percent`
+    (doc 30/100/150), `to_main_cap` (`none`=uncapped/overflow · `max_hp`=HD2
+    default · `remaining_hp` · `absolute:<n>`; `none` auto for 0/0), `vital`
+    (part death kills parent), `indestructible` (auto for max_hp==0). Routing
+    happens ONLY via `damage_part` — a raw `entity[part].hp -=` does not spill.
+  - **Part destruction** (hp→0 by damage, non-indestructible): the part LINGERS
+    attached & dead, fires `on_death` ONCE (latched by the `__part_destroyed`
+    var; a heal above 0 clears it), and if `vital` runs the parent through the
+    kill function. `check_death` skips parts entirely (they end only via
+    damage_part / cascade). **Destroy effects** = the part's own `on_death`/
+    passives.
+  - **`hit_location(target, from_x, from_y[, aim, aim_weight, aim_bonus, mode,
+    sides, corner_arc])`** → part id; modes uniform / weighted (per-part
+    `hit_weights.<side>`, side from the shipped `side_hit`, default the
+    `hit_location_mode` rule) / aimed (×`aim_weight` [rule default 3] +
+    `aim_bonus`; bias without guarantee — a 0-weight side stays 0 unless
+    aim_bonus lifts it). No parts / nothing exposed → returns the target itself.
+    RNG via the match RNG (`_active_rng`, replay-safe with the choice system).
+  - **Creation:** template-driven — `summon_entity` consumes a reserved `parts`
+    key (dict `{role: part-template}` or a list), auto-spawning+linking each at
+    the parent's cell. AND mid-match `!part add/attach/detach/remove/list/info`
+    (`Match.create_part`/`attach_part`/`detach_part`). Config rides on plain
+    `!ent set_var <part> ...` (dotted paths like `hit_weights.front=15` nest);
+    only `part_of` is engine-special.
+  - **Detach** → the part becomes a free entity at the parent's cell, keeping
+    its state (a blown-off arm = a dead `0`-hp free entity; no corpse).
+  - **Parent death** → parts are snapshotted into the corpse and removed (no
+    orphaned visible limbs); `revive_corpse` re-spawns them (delivers "revive
+    parent ⇒ revive parts"). `!ent dump` shows a "body parts:" section + "Body
+    part of:"; `!part list` shows hp + knobs. Scenarios 396-398.
+  DEFERRED TODOs (the user explicitly wants these tracked):
+  - **AoE damage SPREAD between main and limbs** based on per-system factors
+    (many combat systems want this; only "damage to main" for now).
+  - **Independently-LOCATED parts** (own cell, not glued to parent).
+  - **Part independently targetable by cell** (per game system) — needs more
+    discussion.
+  - Per-damage-TYPE `to_main_percent`; the **armor layer** (coverage % +
+    directional, damage-type AR-vs-ARP mitigation); the **to-hit roll**
+    (accuracy/evasion/suppression/spread, SEPARATE from hit-location); **AP/FP/
+    ARC action economy + reactionary actions** (block/dodge → the reaction
+    framework the choice-replay system seeded); fancier revive (regrow from
+    template).
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

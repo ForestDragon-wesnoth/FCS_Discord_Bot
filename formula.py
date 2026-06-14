@@ -1480,6 +1480,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #                                    of entities_within
     "all_entities", "entities_with_status", "entities_with_var",
     "entities_in_area",
+    # Body parts (locational damage)
+    "parts", "part", "has_part", "part_of", "damage_part",
     # Shape-rooted entity queries — the entity-returning twins of the
     # cells_in_* area helpers (entities_in_area already covers burst/
     # radius). Each returns ALIVE entity ids standing on the shape's cells:
@@ -1538,6 +1540,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # corners when sides=8). corner_arc defaults to the
     # directional_corner_arc rule.
     "facing_of", "relative_side", "side_hit", "directional_get",
+    "hit_location",
     # Footprint / large-entity primitives. A large entity occupies a W×H
     # rectangle anchored at its top-left cell (entity[X].x / .y); these
     # expose that footprint to formulas.
@@ -1634,6 +1637,7 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "tile_keys",
     "entity_groups",
     "all_entities",
+    "parts",
     "entities_with_status",
     "entities_with_var",
     "entities_in_area",
@@ -1760,7 +1764,7 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
 # unbound). Letting them appear bare lets a formula write
 # `status_set(self, status_name, "remaining", 0)` instead of the more
 # verbose `status_set(self_id(), ...)`.
-_ENTITY_TOKEN_NAMES: Tuple[str, ...] = ("self", "this", "current")
+_ENTITY_TOKEN_NAMES: Tuple[str, ...] = ("self", "this", "current", "parent")
 
 
 @dataclass
@@ -1783,6 +1787,11 @@ class EvalCtx:
     this: Optional[str] = None
     target: Optional[str] = None
     extras: Optional[Dict[str, Any]] = None
+    # Back-reference to the Match, set by the engine at the top of each
+    # eval so resolve_who can dereference the `parent` token (which needs
+    # to read the contextual entity's `part_of`). None for callers that
+    # never use `parent`.
+    match: Optional[Any] = None
 
     def resolve_who(self, token: Any) -> str:
         if token in ("this", "current"):
@@ -1795,6 +1804,21 @@ class EvalCtx:
             if not self.target:
                 raise FormulaError("'self' is unbound in this context.")
             return self.target
+        if token == "parent":
+            # The parent of the contextual entity (self, falling back to
+            # the current-turn entity). Used by a body part's passives /
+            # actions to reach the whole creature: entity[parent].hp.
+            base = self.target or self.this
+            if not base:
+                raise FormulaError("'parent' is unbound in this context.")
+            if self.match is None:
+                raise FormulaError("'parent' cannot be resolved here.")
+            e = self.match.entities.get(base)
+            if e is None or not e.part_of:
+                raise FormulaError(
+                    f"'{base}' has no parent (it is not a body part)."
+                )
+            return e.part_of
         # Anything else is treated as a literal entity id. For the dynamic
         # entity[<expr>] form the expression is evaluated at runtime and
         # its (already-computed) value lands here — guard against a
@@ -1890,8 +1914,9 @@ class _EntityAccessTransformer(ast.NodeTransformer):
         if isinstance(slice_node, ast.Index):  # py<=3.8 wrapper, defensive
             slice_node = slice_node.value
         if isinstance(slice_node, ast.Name):
-            if slice_node.id in ("self", "this", "current"):
-                # Special token — pass the token string; resolve_who maps it.
+            if slice_node.id in _ENTITY_TOKEN_NAMES:
+                # Special token (self/this/current/parent) — pass the token
+                # string; resolve_who maps it to a concrete entity id.
                 return ast.Constant(value=slice_node.id)
             if slice_node.id in self.known_params:
                 # Dynamic: the parameter's bound value is the entity id.
@@ -2564,6 +2589,12 @@ class FormulaEngine:
         # — meaning a formula can write group_add("swarm", "self") if
         # the bare-identifier shorthand self_id() feels too verbose.
         match = self._match
+        def _active_rng():
+            """The RNG hit_location (and any other replay-safe roll) should
+            use: the match-seeded random.Random when random_seed is set,
+            else the global `random` module. Both honor getstate/setstate,
+            so the action choice-replay snapshot covers either."""
+            return getattr(match, "_rng", None) or random
         def _eid(token: Any) -> str:
             if token is None:
                 # A bare `self` / `this` / `current` token was passed,
@@ -3059,6 +3090,10 @@ class FormulaEngine:
                 if oid == ref_eid:
                     continue
                 if not oe.is_alive:
+                    continue
+                # Attached body parts aren't independent map targets — a
+                # distance/AoE query resolves to the parent, not its parts.
+                if oe.is_part:
                     continue
                 if not _relation_ok(relation, ref_eid, oid):
                     continue
@@ -4452,11 +4487,73 @@ class FormulaEngine:
         ns["turn_index"] = _turn_index
 
         def _all_entities() -> list:
-            """all_entities(): every ALIVE entity id, in
+            """all_entities(): every ALIVE, independent entity id, in
             match.entities insertion order. The match-wide iteration
-            primitive (no reference entity required)."""
-            return [eid for eid, e in match.entities.items() if e.is_alive]
+            primitive (no reference entity required). Attached body parts
+            are excluded (they're not field units — reach them with
+            parts(parent) / part(parent, name))."""
+            return [eid for eid, e in match.entities.items()
+                    if e.is_alive and not e.is_part]
         ns["all_entities"] = _all_entities
+
+        def _parts(eid_token: Any) -> list:
+            """parts(eid): the ids of every body part attached to `eid`,
+            in order (loopable). Empty if it has none. Includes 0/0
+            indestructible zones (which are 'not alive')."""
+            eid, _e = _resolve_entity(eid_token, "parts")
+            return [p.id for p in match.entity_parts(eid)]
+        ns["parts"] = _parts
+
+        def _part(parent_token: Any, handle: Any) -> str:
+            """part(parent, name_or_id): the id of `parent`'s body part
+            matching `name_or_id` — its part_name var OR its entity id (id
+            wins on a clash). Raises if there's no such part."""
+            pid, _pe = _resolve_entity(parent_token, "part")
+            if not isinstance(handle, str) or not handle:
+                raise FormulaError("part(parent, name): name must be a non-empty string.")
+            p = match.find_part(pid, handle)
+            if p is None:
+                raise FormulaError(
+                    f"part: `{pid}` has no body part `{handle}`.")
+            return p.id
+        ns["part"] = _part
+
+        def _has_part(parent_token: Any, handle: Any) -> bool:
+            """has_part(parent, name_or_id): True iff `parent` has a body
+            part matching name_or_id. Never raises."""
+            try:
+                pid, _pe = _resolve_entity(parent_token, "has_part")
+            except FormulaError:
+                return False
+            if not isinstance(handle, str) or not handle:
+                return False
+            return match.find_part(pid, handle) is not None
+        ns["has_part"] = _has_part
+
+        def _damage_part(part_token: Any, amount: Any) -> int:
+            """damage_part(part, amount): deal `amount` to a body part,
+            routing the configured share to the parent's main HP (the
+            HD2 'damage to main' model — see the part_to_main_* rules and
+            per-part to_main_percent / to_main_cap / vital vars). Returns
+            the amount dealt to the parent's main HP. Destroying a part
+            fires its on_death (destroy effects) and, if `vital`, kills
+            the parent. Routing happens ONLY through this verb — a raw
+            entity[part].hp write does not spill to main."""
+            pid, _pe = _resolve_entity(part_token, "damage_part")
+            if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+                raise FormulaError("damage_part(part, amount): amount must be a number.")
+            to_main, _log = match.damage_part(pid, int(amount))
+            return to_main
+        ns["damage_part"] = _damage_part
+
+        def _part_of(eid_token: Any) -> str:
+            """part_of(eid): the parent entity id if `eid` is a body part,
+            else '' (empty string). The query analog of the `parent`
+            token — usable on any entity, no raise."""
+            eid, e = _resolve_entity(eid_token, "part_of")
+            po = e.part_of
+            return po if (po and po in match.entities) else ""
+        ns["part_of"] = _part_of
 
         def _entities_with_status(name: Any) -> list:
             """entities_with_status(name): alive entities that carry the
@@ -4501,7 +4598,7 @@ class FormulaEngine:
             # let it raise if the args are bad.
             scored = []
             for eid, e in match.entities.items():
-                if not e.is_alive:
+                if not e.is_alive or e.is_part:
                     continue
                 d = _distance(x, y, e.x, e.y, mode)
                 if d <= n:
@@ -4771,6 +4868,72 @@ class FormulaEngine:
         ns["side_hit"] = _side_hit
         ns["directional_get"] = _directional_get
 
+        def _hit_location(target_t: Any, from_x: Any, from_y: Any,
+                          aim: Any = None, aim_weight: Any = None,
+                          aim_bonus: Any = None, mode: Any = None,
+                          sides: Any = 4, corner_arc: Any = None) -> str:
+            """hit_location(target, from_x, from_y, aim=None, aim_weight=None,
+            aim_bonus=None, mode=None, sides=4, corner_arc=None): roll WHICH
+            body part of `target` a hit coming FROM (from_x, from_y) lands
+            on, returning the part id. Modes (default hit_location_mode rule):
+            `weighted` uses each part's hit_weights.<side> (side from
+            side_hit — front/back/left_side/right_side); `uniform` gives
+            equal odds. `aim` (a part name or id) biases toward that part:
+            its weight is multiplied by aim_weight (default the
+            hit_location_aim_weight rule) and aim_bonus (default 0) is added
+            — so aiming raises but doesn't guarantee, and a 0-weight side
+            stays 0 unless aim_bonus lifts it. With no parts (or no part
+            eligible for this side) returns the target itself (the hit lands
+            on the main body). RNG is the match RNG (replay-safe)."""
+            tid, _te = _resolve_entity(target_t, "hit_location")
+            body = match.entity_parts(tid)
+            if not body:
+                return tid
+            mode_s = str(mode) if mode is not None else \
+                str(match.rules.get("hit_location_mode", "weighted"))
+            if mode_s not in ("weighted", "uniform"):
+                raise FormulaError(
+                    "hit_location(...): mode must be 'weighted' or 'uniform'.")
+            side = _side_hit(target_t, from_x, from_y, sides, corner_arc)
+            aim_id = None
+            if aim is not None and aim != "":
+                ap = match.find_part(tid, str(aim))
+                if ap is None:
+                    raise FormulaError(
+                        f"hit_location: aim '{aim}' is not a part of '{tid}'.")
+                aim_id = ap.id
+            aw = (float(aim_weight) if aim_weight is not None
+                  else float(match.rules.get("hit_location_aim_weight", 3)))
+            ab = float(aim_bonus) if aim_bonus is not None else 0.0
+            weighted: list = []
+            total = 0.0
+            for p in body:
+                if mode_s == "uniform":
+                    w = 1.0
+                else:
+                    table = p.vars.get("hit_weights", {})
+                    try:
+                        w = float(table.get(side, 0)) if isinstance(table, dict) else 0.0
+                    except (TypeError, ValueError):
+                        w = 0.0
+                if aim_id is not None and p.id == aim_id:
+                    w = w * aw + ab
+                if w > 0:
+                    weighted.append((p.id, w))
+                    total += w
+            if total <= 0:
+                # Nothing exposed for this side (and no aim_bonus lifted a
+                # part above 0): the hit lands on the main body.
+                return tid
+            r = _active_rng().random() * total
+            acc = 0.0
+            for pid, w in weighted:
+                acc += w
+                if r <= acc:
+                    return pid
+            return weighted[-1][0]
+        ns["hit_location"] = _hit_location
+
         # ---- vision primitives (range / LOS) ----------------------------
         # The bare names (can_see / team_sees_cell / team_sees_entity) mean
         # range AND line-of-sight; the _rangeonly / _losonly variants isolate
@@ -4979,6 +5142,8 @@ class FormulaEngine:
         # eval_program are the two entry points, so resetting here (vs.
         # in __init__) means a single FormulaEngine instance can be
         # re-used across multiple evals if a future caller wants.
+        if ctx.match is None:
+            ctx.match = self._match  # enable `parent`-token resolution
         self._reset_affected()
         tree = self._prepare(src, "eval", known_funcs=self._known_funcs())
         code = compile(tree, "<formula>", "eval")
@@ -5012,6 +5177,8 @@ class FormulaEngine:
                          engine's default `cmd`/`fail` stubs with
                          action-aware ones, and inject
                          source/args/target proxies."""
+        if ctx.match is None:
+            ctx.match = self._match  # enable `parent`-token resolution
         self._reset_affected()
         try:
             full = ast.parse(src, mode="exec")
