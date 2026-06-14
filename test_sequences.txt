@@ -10063,3 +10063,52 @@ damage), hp → 85, duration 2 → 1; the foe is untouched (its turn hasn't
 ended). Two more `!turn next` (foe ends, then hero ends again) deal
 another 15 — hp → 70 — and the duration hits 0, so the tick formula
 self-removes burn: `!ent status hero list` shows (none).
+
+
+SCENARIO 392 — Pierce up to N targets (entities_in_line_until)
+--------------------------------------------------------------
+
+!match new pierce PIERCE 10 3
+!match use pierce
+!ent add archer Archer 50 1 1 9
+!ent add a A 30 3 1 5
+!ent add b B 30 4 1 5
+!ent add c C 30 6 1 5
+!ent set_var archer actions.volley.target none
+!ent set_var archer actions.volley.body "for e in entities_in_line_until(2, 1, 10, 1, 2):\n    entity[e].hp = entity[e].hp - 10"
+!action archer volley
+!list
+
+Expected: `volley` pierces up to 2 targets along the row. The body loops
+entities_in_line_until(2,1, 10,1, 2) — the first 2 entities near→far on
+the segment (started at (2,1), one cell ahead of the archer, so the
+shooter at (1,1) isn't counted). Enemies sit at (3,1),(4,1),(6,1): a and
+b each take 10 (→20/30), and c is beyond the cap of 2, so it's untouched
+(30/30). The helper gives a clean "pierce N" without needing a loop break.
+
+
+SCENARIO 393 — Armor-limited penetration (composed, no new primitive)
+---------------------------------------------------------------------
+
+!match new pen PEN 10 3
+!match use pen
+!ent add gunner Gunner 50 1 1 9
+!ent add x X 40 3 1 5
+!ent add y Y 40 4 1 5
+!ent add z Z 40 5 1 5
+!ent set_var x armor 1
+!ent set_var y armor 2
+!ent set_var z armor 3
+!ent set_var gunner actions.snipe.target none
+!ent set_var gunner actions.snipe.body "pen = 3\nfor e in entities_on_los(1, 1, 9, 1):\n    if pen > 0:\n        entity[e].hp = entity[e].hp - 20\n        pen = pen - entity[e].armor"
+!action gunner snipe
+!list
+
+Expected: `snipe` fires from the gunner at (1,1) toward (9,1).
+entities_on_los returns the bodies strictly between (shooter and the
+empty endpoint excluded), near→far: x, y, z. The body carries a
+penetration budget pen=3: x (3>0 → −20 → 20, pen 3−1=2), y (2>0 → −20 →
+20, pen 2−2=0), z (0>0 is false → untouched → 40). So penetration is
+limited by each target's armor — the composable alternative to a fixed
+cap, and any other variable (damage falloff, etc.) drops into the same
+loop. No engine primitive needed beyond the existing line queries.

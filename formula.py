@@ -1497,7 +1497,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   first_opaque(x1,y1,x2,y2,viewer=None) -> the first opaque cell
     #       strictly between as an (x,y) pair (read with coord_x/coord_y), or
     #       None if clear. NOT loopable (single coord).
-    "entities_in_line_ignorelos", "entities_on_los", "first_opaque",
+    "entities_in_line_ignorelos", "entities_on_los",
+    "entities_in_line_until", "first_opaque",
     # clip_cells(cells) -> the subset of an (x,y) cell list that is on the
     # grid. The cells_in_* helpers can return off-grid cells (they're pure
     # geometry); wrap one to keep only valid cells, e.g.
@@ -1622,6 +1623,7 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "cells_in_rect",
     "entities_in_line_ignorelos",
     "entities_on_los",
+    "entities_in_line_until",
     "entities_in_cone",
     "entities_in_rect",
     "clip_cells",
@@ -4622,8 +4624,49 @@ class FormulaEngine:
             cells = set(_cells_in_rect(x1, y1, x2, y2))
             return [eid for (_x, _y, eid) in sorted(_alive_at(cells))]
 
+        def _entities_in_line_until(x1: Any, y1: Any, x2: Any, y2: Any,
+                                    max_targets: Any, viewer: Any = None) -> list:
+            """entities_in_line_until(x1, y1, x2, y2, max_targets,
+            viewer=None): the first `max_targets` alive entity ids the
+            segment passes through, near->far, endpoints INCLUDED — the
+            capped sibling of entities_in_line_ignorelos, for 'a shot that
+            pierces up to N targets'. With a `viewer`, sight is cut at the
+            first opaque cell (LOS-aware); without one, walls are ignored.
+            A large body counts once, at its nearest cell. max_targets <= 0
+            returns []. For armor-limited penetration (depth varies by what
+            it hits) loop entities_in_line_ignorelos / entities_on_los with
+            your own accumulator instead."""
+            cx1 = _coord_int(x1, "entities_in_line_until", "x1")
+            cy1 = _coord_int(y1, "entities_in_line_until", "y1")
+            cx2 = _coord_int(x2, "entities_in_line_until", "x2")
+            cy2 = _coord_int(y2, "entities_in_line_until", "y2")
+            if isinstance(max_targets, bool) or not isinstance(max_targets, (int, float)):
+                raise FormulaError(
+                    "entities_in_line_until(...): max_targets must be a number.")
+            cap = int(max_targets)
+            if cap <= 0:
+                return []
+            vid = None if viewer is None else _eid(viewer)
+            here = _occupants()
+            out: list = []
+            seen: set = set()
+            for cell in match._line_cells(cx1, cy1, cx2, cy2):
+                # With a viewer, stop the line at the first opaque cell
+                # (a wall halts the shot); the start cell never blocks.
+                if vid is not None and cell != (cx1, cy1) and \
+                        not match.has_los(vid, cx1, cy1, cell[0], cell[1]):
+                    break
+                for eid in sorted(here.get(cell, ())):
+                    if eid not in seen:
+                        seen.add(eid)
+                        out.append(eid)
+                        if len(out) >= cap:
+                            return out
+            return out
+
         ns["entities_in_line_ignorelos"] = _entities_in_line_ignorelos
         ns["entities_on_los"] = _entities_on_los
+        ns["entities_in_line_until"] = _entities_in_line_until
         ns["first_opaque"] = _first_opaque
         ns["entities_in_cone"] = _entities_in_cone
         ns["entities_in_rect"] = _entities_in_rect
