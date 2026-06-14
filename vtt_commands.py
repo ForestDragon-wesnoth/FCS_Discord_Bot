@@ -6743,19 +6743,22 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 @registry.command(
     "part",
-    usage="!part <add|attach|detach|remove|list|info> ...",
+    usage="!part <add|attach|detach|locate|glue|remove|list|info> ...",
     desc=(
         "Body parts for locational damage. A part is a REAL entity attached "
-        "to a parent (it gets hp/vars/statuses/passives/death for free) but "
-        "rides on the parent's cell and is hidden from the map roster. "
+        "to a parent (it gets hp/vars/statuses/passives/death for free) and "
+        "by default rides on the parent's cell, hidden from the map roster. "
         "Damage routes via the damage_part formula primitive (HD2 'damage to "
         "main' model — see the part_to_main_* rules + per-part to_main_percent "
         "/ to_main_cap / vital vars); WHERE a hit lands via hit_location. "
         "Config lives in the part's vars (set with `!ent set_var <part> ...`); "
         "destroy effects are passives on the part (`!ent passive add <part> "
         "on_death ...`). A 0/0 part is an indestructible passthrough zone "
-        "(head/chest). Subcommands: add <parent> <part_id> <name> <hp> <maxhp> "
-        "[k=v ...]; attach <parent> <part_id>; detach <part_id>; remove "
+        "(head/chest). `locate` gives a part its OWN cell (a turret you can "
+        "flank separately) — it then renders/occupies/is-targetable; `glue` "
+        "snaps it back to the parent. Subcommands: add <parent> <part_id> "
+        "<name> <hp> <maxhp> [k=v ...]; attach <parent> <part_id>; detach "
+        "<part_id>; locate <part_id> <x> <y>; glue <part_id>; remove "
         "<part_id>; list <parent>; info <part_id>."
     ),
 )
@@ -6818,6 +6821,35 @@ async def part_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(
             f"Detached `{part_id}` — it's now a free entity at "
             f"({p.x},{p.y})."
+        )
+
+    if sub == "locate":
+        if await return_help_if_not_enough_args(ctx, args, 4, "part", "locate"):
+            return
+        part_id = _resolve_eid(m, args[1])
+        try:
+            x, y = int(args[2]), int(args[3])
+        except ValueError:
+            return await ctx.send("❌ x and y must be integers.")
+        try:
+            m.locate_part(part_id, x, y)
+        except (NotFound, VTTError) as ex:
+            return await ctx.send(f"❌ {ex}")
+        return await ctx.send(
+            f"`{part_id}` is now independently located at ({x},{y}) — it "
+            f"keeps its own cell (no longer glued to the parent)."
+        )
+
+    if sub == "glue":
+        if await return_help_if_not_enough_args(ctx, args, 2, "part", "glue"):
+            return
+        part_id = _resolve_eid(m, args[1])
+        try:
+            p = m.glue_part(part_id)
+        except (NotFound, VTTError) as ex:
+            return await ctx.send(f"❌ {ex}")
+        return await ctx.send(
+            f"Re-glued `{part_id}` to its parent at ({p.x},{p.y})."
         )
 
     if sub in ("remove", "del", "rm"):

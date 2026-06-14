@@ -3101,7 +3101,7 @@ class FormulaEngine:
                     continue
                 # Attached body parts aren't independent map targets — a
                 # distance/AoE query resolves to the parent, not its parts.
-                if oe.is_part:
+                if oe.is_glued_part:
                     continue
                 if not _relation_ok(relation, ref_eid, oid):
                     continue
@@ -4501,7 +4501,7 @@ class FormulaEngine:
             are excluded (they're not field units — reach them with
             parts(parent) / part(parent, name))."""
             return [eid for eid, e in match.entities.items()
-                    if e.is_alive and not e.is_part]
+                    if e.is_alive and not e.is_glued_part]
         ns["all_entities"] = _all_entities
 
         def _parts(eid_token: Any) -> list:
@@ -4669,7 +4669,7 @@ class FormulaEngine:
             # let it raise if the args are bad.
             scored = []
             for eid, e in match.entities.items():
-                if not e.is_alive or e.is_part:
+                if not e.is_alive or e.is_glued_part:
                     continue
                 d = _distance(x, y, e.x, e.y, mode)
                 if d <= n:
