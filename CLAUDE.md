@@ -787,6 +787,47 @@ More shipped work (continuing the list above):
   level/duration. This was framed as the modest precursor to the bigger combat
   layers (damage pipeline, action economy, reactions) surfaced by analyzing
   the three FCS combat-system docs.
+- **Pierce helper + composable penetration — SHIPPED.**
+  `entities_in_line_until(x1,y1,x2,y2, max_targets[, viewer])` (formula.py)
+  returns the first N alive entity ids the segment passes through, near→far,
+  endpoints INCLUDED — the capped sibling of `entities_in_line_ignorelos`
+  (the sandbox has no loop `break`, so a cap helper is the clean "pierce up
+  to N" tool). With a `viewer` it cuts at the first opaque cell (LOS-aware);
+  without one it ignores walls. Loopable. ARMOR-limited penetration (depth
+  varies by what it hits) needs NO new primitive — loop `entities_on_los` /
+  `entities_in_line_ignorelos` with your own `pen` accumulator gated on
+  `pen > 0` (no break needed). Scenarios 392 (cap helper) / 393 (armor
+  accumulator).
+- **Mid-body action choices — SHIPPED (the interactive-action layer).**
+  `choose(prompt, options)` → picked element; `choose_number(prompt, lo, hi)`
+  → int in range. Action-mode builtins (in `_ACTION_BUILTINS`), supplied as
+  `action_bindings` by the runner. EXECUTION = REPLAY (chosen over a
+  generator/interpreter rewrite): the TOP-LEVEL `run_action` seeds an answer
+  queue, runs the body, and when `choose()` has no answer yet it raises
+  `ChoiceNeeded`; the runner rolls the attempt back, obtains one more answer,
+  and re-runs the body from the top with answers replayed IN ORDER until it
+  completes, then commits. Reuses the existing transactional rollback. Per
+  attempt: RNG state is snapshot/restored (a roll BEFORE a choice stays
+  stable) and the cmd output buffer is reset (rolled-back attempts don't leak
+  echoes) — so side effects before a choice apply EXACTLY once (verified:
+  var writes + cmd()). Sequential/dependent choices "just work" (the replay
+  walks whichever branch prior answers chose). ANSWERING: `answer=<value>`
+  invocation tokens feed choices in order (repeatable, bypass the last-wins
+  args dict); if exhausted, the surface's `prompt_choice(prompt, options,
+  lo, hi)` coroutine is used (cli.py implements it via `input()`; the harness
+  has none → headless callers MUST pre-supply, yielding a clean "needs a
+  choice" fail, NOT a hang). Reserved answer `cancel` (or empty/None
+  interactive reply) aborts with full rollback; a bad interactive pick
+  re-prompts, a bad pre-supplied one fails. `ChoiceNeeded` joins
+  ActionFail/ActionEngineFault in `eval_program`'s unwrapped set so it
+  reaches the runner; nested actions let it propagate to the top-level loop;
+  Match runtime fields `_choice_answers`/`_choice_cursor` (preserved across
+  rollback); `action_choice_limit` rule bounds the replay. Core in action.py
+  (`ChoiceNeeded`, `_obtain_answer`, `_snapshot_rng`, the run_action replay
+  loop). Scenarios 394-395. FUTURE: this same pause/resume shape is the
+  groundwork for the bigger REACTION framework (block/dodge/counter during
+  another unit's turn) — interactive Discord menus for choices are also not
+  built yet (Discord currently relies on pre-supplied answer= tokens).
 - Idea parked (Discord-only, not built): **opt-in auto-updating views** —
   `!map autoupdate` / `!state autoupdate` create a self-refreshing
   (edit-in-place) board message per channel that the bot updates on
