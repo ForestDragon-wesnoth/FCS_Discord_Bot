@@ -975,7 +975,14 @@ More shipped work (continuing the list above):
     toggle `!map color on|off`; team
     map via `!map teamcolor <team> <color>|clear|list` (host-gated via
     ELEVATED_ARGS["map"]). Both fields serialized on Match.
-  - Scenarios 401 (glyphs) / 402 (color settings). NEXT PR (the user wants it):
+  - **Guide + invalid-color warnings:** `!map colors` (read-only, player-
+    available) lists the palette via `_color_guide()`; `!map teamcolor` with a
+    bad color and `!ent set_var <id> color <bad>` both cite it — the latter is
+    a non-blocking ⚠ advisory (still writes the var, since it may feed the
+    GM's own formulas). The whole palette is Discord-safe, so there's no
+    terminal-only color to warn about separately.
+  - Scenarios 401 (glyphs) / 402 (color settings) / 403 (guide + warning).
+    NEXT PR (the user wants it):
     colored special TILES and zones — the color mechanism is reusable; this
     slice is entities only. Long-term someday: an actual image-rendered map.
 

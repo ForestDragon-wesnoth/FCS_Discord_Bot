@@ -10344,3 +10344,23 @@ rendering for the match. Color is only emitted on a color-capable surface
 (Discord ansi blocks / a terminal); the headless harness declares no color
 support, so its `!map` stays plain ASCII regardless. An unknown color name
 (`notacolor`) is rejected with ❌.
+
+
+SCENARIO 403 — Renderer: color guide + invalid-color warning
+------------------------------------------------------------
+
+!match new cg CG 5 3
+!match use cg
+!ent add e E 10 2 2 9
+!map colors
+!ent set_var e color purple
+!ent set_var e color red
+!map teamcolor orcs notacolor
+
+Expected: `!map colors` lists the supported color names (all of them render
+on Discord ansi blocks and ANSI terminals — there's no terminal-only set).
+Setting an entity `color` var to an UNrecognized name (`purple`) still
+writes the var but appends a ⚠ advisory that it renders uncolored, plus the
+guide; a recognized name (`red`) writes cleanly with no warning. `!map
+teamcolor orcs notacolor` rejects the unknown color outright, also citing
+the guide.
