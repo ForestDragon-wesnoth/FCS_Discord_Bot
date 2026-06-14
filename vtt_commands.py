@@ -2751,6 +2751,14 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         ack = f"`{eid}` vars.{key_path} = {value!r}"
         if bypass_clamp:
             ack += " (clamp bypassed)"
+        # Advisory (non-blocking): the render `color` var is the top-level
+        # `color`; an unrecognized name renders uncolored, so flag a likely
+        # typo while still honoring the write (the value may be intended for
+        # the GM's own formulas, not rendering).
+        if key_path == "color" and isinstance(value, str) and value:
+            from logic import TEXT_COLORS
+            if value not in TEXT_COLORS:
+                ack += f"\n⚠ `{value}` isn't a recognized render color (renders uncolored). " + _color_guide()
         if hook_log:
             ack += "\n" + "\n".join(hook_log)
         return await ctx.send(ack)
@@ -3202,9 +3210,26 @@ def _map_block(ctx: ReplyContext, m, pov) -> str:
     return f"```{fence}\n{body}\n```"
 
 
-@registry.command("map", access="all", usage="!map [full] | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list", desc="Render the ASCII map for the active match, from this channel's POV. `!map full` (host-gated) forces the omniscient view. `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` toggles colorized rendering for this match; `!map teamcolor <team> <color>` sets a team's text color (also: clear / list). Colors apply on color-capable surfaces (Discord/terminal); an entity's own `color` var overrides its team color.")
+def _color_guide() -> str:
+    """Human-readable list of the supported render color names. The palette
+    is deliberately the Discord-safe set (30-37 + bold), so every listed
+    name renders on Discord's ansi blocks AND ANSI terminals — there's no
+    'terminal-only' color to warn separately about."""
+    from logic import TEXT_COLORS
+    names = ", ".join(sorted(TEXT_COLORS))
+    return (
+        f"Supported colors: {names}. They all render in Discord ansi code "
+        f"blocks and ANSI terminals (the `bright_*` names are bold variants, "
+        f"since Discord's ansi has no separate bright range). An "
+        f"unrecognized name renders uncolored."
+    )
+
+
+@registry.command("map", access="all", usage="!map [full] | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. `!map full` (host-gated) forces the omniscient view. `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` toggles colorized rendering for this match; `!map teamcolor <team> <color>` sets a team's text color (also: clear / list); `!map colors` lists the supported color names. Colors apply on color-capable surfaces (Discord/terminal); an entity's own `color` var overrides its team color.")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
+    if args and args[0].lower() == "colors":
+        return await ctx.send(_color_guide())
     if args and args[0].lower() == "color":
         if len(args) < 2 or args[1].lower() not in ("on", "off"):
             return await ctx.send("Usage: `!map color on|off`.")
@@ -3235,9 +3260,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send("Usage: `!map teamcolor <team> <color>`.")
         team, color = args[1], args[2].lower()
         if color not in TEXT_COLORS:
-            return await ctx.send(
-                f"❌ unknown color `{color}`. Choose from: "
-                f"{', '.join(sorted(TEXT_COLORS))}.")
+            return await ctx.send(f"❌ unknown color `{color}`. {_color_guide()}")
         m.team_colors[team] = color
         return await ctx.send(f"Team `{team}` renders in {color}.")
     if args and args[0].lower() == "resize":
