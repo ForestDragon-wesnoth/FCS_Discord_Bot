@@ -108,6 +108,19 @@ DIRECTION_ARROWS: Dict[str, str] = {
     "down_right": "\\",
 }
 
+# Named text colors -> ANSI SGR foreground codes, for the colorized text
+# renderer (Discord ```ansi blocks + ANSI terminals). The names are the
+# only valid values for an entity `color` var / a team color; an unknown
+# name renders uncolored. Foreground only for now.
+TEXT_COLORS: Dict[str, str] = {
+    "black": "30", "red": "31", "green": "32", "yellow": "33",
+    "blue": "34", "magenta": "35", "cyan": "36", "white": "37",
+    "gray": "90", "grey": "90",
+    "bright_red": "91", "bright_green": "92", "bright_yellow": "93",
+    "bright_blue": "94", "bright_magenta": "95", "bright_cyan": "96",
+    "bright_white": "97",
+}
+
 # !map resize anchors: name (+ aliases) -> (horizontal, vertical) kind.
 # horizontal in {left, center, right}; vertical in {top, middle, bottom}.
 # The anchor names the corner/edge where existing content stays put; the
@@ -4077,6 +4090,19 @@ class Match:
     # fog_memory is on; cleared when memory is toggled off. Serialized as
     # lists of [x, y]. Runtime type is set for fast membership tests.
     explored: Dict[str, "set"] = field(default_factory=dict)
+
+    # ---- text-renderer customization ----
+    # Per-team text color for the colorized renderer: team-name -> a
+    # TEXT_COLORS name. An entity's own `color` var overrides this; absent
+    # here, a team whose NAME is itself a palette color (e.g. "red") still
+    # auto-colors. Edited via `!map teamcolor`. Serialized.
+    team_colors: Dict[str, str] = field(default_factory=dict)
+    # Per-match color toggle. When False, the renderer never emits color
+    # even on a color-capable surface. Default on; flipped by `!map color
+    # on|off`. Serialized. (Color also requires the surface to declare
+    # supports_color — the scenario harness doesn't, so scenarios stay
+    # plain regardless.)
+    color_enabled: bool = True
 
     # ---- runtime-only: pending approval queue ----
     # Requests from non-host users awaiting host approval, keyed by a
@@ -8786,6 +8812,8 @@ class Match:
                 team: sorted([x, y] for (x, y) in cells)
                 for team, cells in self.explored.items()
             },
+            "team_colors": dict(self.team_colors),
+            "color_enabled": bool(self.color_enabled),
         }
         if include_history:
             d["history"] = self.history.to_dict()
@@ -8922,6 +8950,12 @@ class Match:
             for team, cells in raw_expl.items()
             if isinstance(team, str) and isinstance(cells, list)
         } if isinstance(raw_expl, dict) else {}
+        raw_tc = d.get("team_colors", {})
+        m.team_colors = {
+            str(k): str(v) for k, v in raw_tc.items()
+            if isinstance(k, str) and isinstance(v, str)
+        } if isinstance(raw_tc, dict) else {}
+        m.color_enabled = bool(d.get("color_enabled", True))
         # History is optional in saved dicts. It's only present when the
         # original save was made with include_history=True. A snapshot's
         # state.dict deliberately omits history (snapshots-within-
@@ -8934,7 +8968,46 @@ class Match:
         return m
 
     # ------------- simple ASCII render for quick debugging -------------
-    def render_ascii(self, pov_team: Optional[str] = None) -> str:
+    def entity_glyph(self, e: "Entity") -> str:
+        """The map symbol for `e`: a per-facing `glyphs.<facing>` var wins,
+        else a direction-agnostic single `glyph` var, else the default
+        DIRECTION_ARROWS arrow for its facing (`@` if unknown). Custom
+        glyphs must be exactly one character (alignment); anything else is
+        ignored and falls through — same rule as tile/zone glyphs."""
+        facing = getattr(e, "facing", "")
+        glyphs = e.vars.get("glyphs")
+        if isinstance(glyphs, dict):
+            g = glyphs.get(facing)
+            if isinstance(g, str) and len(g) == 1:
+                return g
+        g = e.vars.get("glyph")
+        if isinstance(g, str) and len(g) == 1:
+            return g
+        return DIRECTION_ARROWS.get(facing, "@")
+
+    def entity_color(self, e: "Entity") -> Optional[str]:
+        """The resolved color NAME for `e` (or None): its `color` var wins,
+        else its team's color — the match team_colors map, defaulting to
+        the team's own name when that name is itself a palette color (so a
+        team literally named 'red' renders red). Unknown names -> None."""
+        c = e.vars.get("color")
+        if isinstance(c, str) and c in TEXT_COLORS:
+            return c
+        team = e.team
+        if team:
+            tc = self.team_colors.get(team)
+            if isinstance(tc, str) and tc in TEXT_COLORS:
+                return tc
+            if team in TEXT_COLORS:
+                return team
+        return None
+
+    def _entity_color_code(self, e: "Entity") -> Optional[str]:
+        name = self.entity_color(e)
+        return TEXT_COLORS.get(name) if name else None
+
+    def render_ascii(self, pov_team: Optional[str] = None,
+                     colorize: bool = False) -> str:
         # `pov_team` filters EVERY layer through its visibility rule: a
         # zone / tile / entity hidden from that team isn't painted (its
         # cell falls back to whatever layer is visible underneath, so the
@@ -9008,7 +9081,11 @@ class Match:
             # (a 2×2 reads as a 2×2 block of the same arrow). Living
             # entities are drawn last, so among overlaps the later-iterated
             # entity wins and all entities sit above tiles/zones/corpses.
-            sym = DIRECTION_ARROWS.get(getattr(e, "facing", ""), "@")
+            sym = self.entity_glyph(e)
+            if colorize:
+                code = self._entity_color_code(e)
+                if code:
+                    sym = f"\x1b[{code}m{sym}\x1b[0m"
             for (cx, cy) in self.entity_cells(e):
                 if self.in_bounds(cx, cy):
                     grid[cy][cx] = sym

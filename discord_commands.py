@@ -120,6 +120,10 @@ async def _parse_and_run_single_line(ctx, line: str, mgr, known_roots) -> bool:
 
 
 class DiscordCtxWrapper:
+    # Discord renders ANSI colors inside ```ansi code blocks, so the
+    # colorized map renderer is enabled for this surface.
+    supports_color = True
+
     def __init__(self, ctx, mgr=None):
         self._ctx = ctx
         self._mgr = mgr
@@ -168,6 +172,7 @@ class _InteractionCtx:
     command runs with the CLICKER's identity (a host) against the
     interaction's channel."""
     cli_mutable = False
+    supports_color = True
 
     def __init__(self, interaction):
         guild = getattr(interaction, "guild", None)

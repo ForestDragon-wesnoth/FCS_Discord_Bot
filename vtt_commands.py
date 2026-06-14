@@ -85,9 +85,10 @@ READ_ONLY_BARE_ROOTS: frozenset = frozenset({
 # so must be host-only (else a player could peek past fog of war).
 ELEVATED_ARGS: Dict[str, frozenset] = {
     "state": frozenset({"full"}),
-    # `map` renders for anyone from the channel POV, but `full` (omniscient)
-    # and `resize` (a grid mutation) both elevate to host-gated.
-    "map": frozenset({"full", "resize"}),
+    # `map` renders for anyone from the channel POV, but `full` (omniscient),
+    # `resize` (a grid mutation), and the `color`/`teamcolor` settings all
+    # elevate to host-gated.
+    "map": frozenset({"full", "resize", "color", "teamcolor"}),
     "list": frozenset({"full"}),
 }
 
@@ -3190,9 +3191,55 @@ def _view_pov(ctx: ReplyContext, m: "Match", args: List[str]) -> Optional[str]:
     return m.channel_pov(ctx.channel_key)
 
 
-@registry.command("map", access="all", usage="!map [full] | !map resize <w> <h> [anchor]", desc="Render the ASCII map for the active match, from this channel's POV. `!map full` (host-gated) forces the omniscient view. `!map resize <w> <h> [anchor]` (host-gated) changes the grid size — anchor (default top-left) is the 9-point compass point where existing content stays put.")
+def _map_block(ctx: ReplyContext, m, pov) -> str:
+    """The fenced ASCII map. Colorizes only when the surface declares
+    `supports_color` AND the match has color enabled; uses an ```ansi
+    fence so Discord renders the ANSI codes (a no-op label on a terminal /
+    the harness, which get plain glyphs anyway)."""
+    colorize = bool(getattr(ctx, "supports_color", False)) and getattr(m, "color_enabled", True)
+    body = m.render_ascii(pov, colorize=colorize)
+    fence = "ansi" if colorize else ""
+    return f"```{fence}\n{body}\n```"
+
+
+@registry.command("map", access="all", usage="!map [full] | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list", desc="Render the ASCII map for the active match, from this channel's POV. `!map full` (host-gated) forces the omniscient view. `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` toggles colorized rendering for this match; `!map teamcolor <team> <color>` sets a team's text color (also: clear / list). Colors apply on color-capable surfaces (Discord/terminal); an entity's own `color` var overrides its team color.")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
+    if args and args[0].lower() == "color":
+        if len(args) < 2 or args[1].lower() not in ("on", "off"):
+            return await ctx.send("Usage: `!map color on|off`.")
+        m.color_enabled = (args[1].lower() == "on")
+        return await ctx.send(
+            f"Colorized rendering {'ON' if m.color_enabled else 'OFF'} for "
+            f"**{m.name}** (applies on color-capable surfaces)."
+        )
+    if args and args[0].lower() == "teamcolor":
+        from logic import TEXT_COLORS
+        if len(args) < 2:
+            return await ctx.send(
+                "Usage: `!map teamcolor <team> <color>` | `clear <team>` | `list`.")
+        op = args[1].lower()
+        if op == "list":
+            if not m.team_colors:
+                return await ctx.send("No team colors set.")
+            lines = ["Team colors:"] + [
+                f"  `{t}` → {c}" for t, c in sorted(m.team_colors.items())]
+            return await ctx.send("\n".join(lines))
+        if op == "clear":
+            if len(args) < 3:
+                return await ctx.send("Usage: `!map teamcolor clear <team>`.")
+            m.team_colors.pop(args[2], None)
+            return await ctx.send(f"Cleared team color for `{args[2]}`.")
+        # set: !map teamcolor <team> <color>
+        if len(args) < 3:
+            return await ctx.send("Usage: `!map teamcolor <team> <color>`.")
+        team, color = args[1], args[2].lower()
+        if color not in TEXT_COLORS:
+            return await ctx.send(
+                f"❌ unknown color `{color}`. Choose from: "
+                f"{', '.join(sorted(TEXT_COLORS))}.")
+        m.team_colors[team] = color
+        return await ctx.send(f"Team `{team}` renders in {color}.")
     if args and args[0].lower() == "resize":
         if len(args) < 3:
             return await ctx.send(
@@ -3221,9 +3268,9 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             msg = msg + " " + "; ".join(notes) + "."
         if log:
             msg = msg + "\n" + "\n".join(log)
-        return await ctx.send(msg + f"\n```\n{m.render_ascii(_view_pov(ctx, m, []))}\n```")
+        return await ctx.send(msg + "\n" + _map_block(ctx, m, _view_pov(ctx, m, [])))
     pov = _view_pov(ctx, m, args)
-    return await ctx.send(f"```\n{m.render_ascii(pov)}\n```")
+    return await ctx.send(_map_block(ctx, m, pov))
 
 @registry.command("list", access="all", usage="!list [full]", desc="List entities (turn order) from this channel's POV, plus a Dead: section of corpses when show_corpses_in_entity_list is enabled. `!list full` (host-gated) ignores visibility.")
 async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):

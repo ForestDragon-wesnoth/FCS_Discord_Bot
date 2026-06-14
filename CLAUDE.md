@@ -948,6 +948,29 @@ More shipped work (continuing the list above):
     `source` tracking in the breakdown; per-stat caps; modifiers that
     themselves grant tags. This is groundwork the combat refactor (damage
     types, armor AR-vs-ARP, to-hit) will lean on.
+- **Text-renderer customization (glyphs + color) — SHIPPED (entities, v1).**
+  Two ways to tell units apart in the ASCII renderer, both config-as-vars.
+  - **Custom glyphs** (universal, no ANSI): `Match.entity_glyph(e)` resolves a
+    per-facing `glyphs.<facing>` var > a direction-agnostic single `glyph` var
+    > the default DIRECTION_ARROWS arrow (`@` fallback). Exactly ONE character
+    (else ignored → falls through), same rule as tile/zone glyphs, so columns
+    stay aligned. Works on every surface incl. the harness.
+  - **Color** (surface-gated, ANSI): `TEXT_COLORS` maps names (red/green/.../
+    bright_*) → ANSI SGR fg codes. `Match.entity_color(e)` = the entity's
+    `color` var > its team's color (the per-match `team_colors` map, DEFAULTING
+    to the team's own name when that name is itself a palette color — a team
+    named "red" auto-renders red) > None. `render_ascii(pov, colorize=)` wraps
+    each entity glyph in `\x1b[<code>m…\x1b[0m` when colorize. FG only for now.
+  - **Surface plumbing:** the command layer colorizes only when
+    `ctx.supports_color` AND the match's `color_enabled` (default True); it
+    fences the map ` ```ansi ` so Discord renders the codes. CLI + Discord set
+    `supports_color=True`; the scenario harness does NOT → its `!map` is always
+    plain (scenarios stay clean). Per-match toggle `!map color on|off`; team
+    map via `!map teamcolor <team> <color>|clear|list` (host-gated via
+    ELEVATED_ARGS["map"]). Both fields serialized on Match.
+  - Scenarios 401 (glyphs) / 402 (color settings). NEXT PR (the user wants it):
+    colored special TILES and zones — the color mechanism is reusable; this
+    slice is entities only. Long-term someday: an actual image-rendered map.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
