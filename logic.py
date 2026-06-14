@@ -288,6 +288,57 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "'head'). Absent = the part is only addressable by its id."
         ),
     },
+    # --- Locational damage: damage_part routing knobs (per-part vars of
+    #     the same name override these system defaults) ---
+    "part_to_main_percent_default": {
+        "default": 0,
+        "schema": {"type": "number"},
+        "desc": (
+            "Default % of a hit on a body part that is ALSO dealt to the "
+            "parent's main HP (the Helldivers-2 'damage to main' tap). "
+            "Per-part override: the `to_main_percent` var (doc values: head "
+            "150, chest 100, stomach 70, limb 30). 0 = a hit on the part "
+            "stays on the part. Applied by damage_part, never by a raw HP "
+            "write."
+        ),
+    },
+    "part_to_main_cap_default": {
+        "default": "max_hp",
+        "schema": {"type": "str", "choices": ["none", "max_hp", "remaining_hp"]},
+        "desc": (
+            "Default for what damage feeds the to-main %. `max_hp` (HD2 "
+            "default): a single hit is capped at the part's max HP before "
+            "the % is taken. `remaining_hp`: capped at the part's CURRENT "
+            "HP (only damage the part can absorb taps through). `none`: "
+            "uncapped — the full hit taps through, so a big hit can kill the "
+            "parent via overflow (HD2's uncapped parts). A 0/0 part is "
+            "auto-treated as `none` (it can't absorb, so it's pure "
+            "passthrough). Per-part override: the `to_main_cap` var (also "
+            "accepts `absolute:<n>`)."
+        ),
+    },
+    "part_vital_default": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Default for whether destroying a body part also kills its "
+            "parent (a 'vital' weakspot — a head with its own HP, a mech "
+            "reactor core). Per-part override: the `vital` var. When a "
+            "vital part is destroyed by damage_part, the parent is run "
+            "through the configured kill function."
+        ),
+    },
+    "part_indestructible_default": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Default for whether a body part is incapable of dying on its "
+            "own (it only goes away when the parent dies). Per-part "
+            "override: the `indestructible` var. A part with max_hp <= 0 (a "
+            "0/0 passthrough zone like a head/chest) is ALWAYS treated as "
+            "indestructible regardless of this rule."
+        ),
+    },
     # --- Entity footprint (multi-tile / large entities) ---
     # The W×H rectangle a "large" entity occupies lives in two entity
     # vars named by these rules; absent / non-positive = 1 (an ordinary
@@ -5578,7 +5629,10 @@ class Match:
             if not self.in_bounds(cx, cy):
                 raise OutOfBounds(
                     f"({cx},{cy}) outside {self.grid_width}x{self.grid_height}")
-        if not e.is_cell_stackable:
+        # Attached body parts ride on the parent's cell and never collide
+        # (they're non-occupying), so they skip the occupancy gate just
+        # like a stackable entity.
+        if not e.is_cell_stackable and not e.is_part:
             for cx, cy in cells:
                 if self.cell_occupant(cx, cy, (e.id,)) is not None:
                     raise Occupied(f"Cell ({cx},{cy}) already occupied")
@@ -7363,6 +7417,12 @@ class Match:
         e = self.entities.get(entity_id)
         if e is None:
             return []
+        # Body parts never die via the automatic chokepoint — their end
+        # is owned by damage_part (broken-limb / vital) and the
+        # parent-death cascade, so a raw hp write (or a 0/0 zone sitting
+        # at hp 0) doesn't trip a spurious death.
+        if e.is_part:
+            return []
         condition, _mode = self._effective_death_condition(e)
         from formula import FormulaEngine, EvalCtx, FormulaError
         engine = FormulaEngine(self)
@@ -7401,10 +7461,17 @@ class Match:
                 return log
             result = self._effective_death_result(e)
             if result == "corpse":
-                self._store_corpse(e)
+                self._store_corpse(e)   # also snapshots the parts
             # Remove from match (entity.remove handles turn-order
             # bookkeeping + group scrubbing) regardless of result.
             e.remove()
+            # Cascade: the creature is gone, so its body parts go with it
+            # (no orphaned, suddenly-visible limbs). Their snapshots already
+            # rode into the corpse above for revive. Silent — destroy
+            # effects are for targeted limb destruction, not whole-creature
+            # death.
+            for part in self.entity_parts(entity_id):
+                part.remove()
             self.log_event("death", entity=entity_id, name=dead_name,
                            x=dead_x, y=dead_y)
         finally:
@@ -7448,6 +7515,119 @@ class Match:
             log = self._process_death(eid)
         return eid not in self.entities, log
 
+    # ---------- locational damage: routing + part death ----------
+    def is_indestructible(self, e: "Entity") -> bool:
+        """True when `e` cannot die on its own: its `indestructible` var
+        (default from part_indestructible_default), OR it's a body part
+        with max_hp <= 0 (a 0/0 passthrough zone — always indestructible).
+        Such entities are skipped by the automatic death check; only
+        damage_part / kill_entity / the parent-death cascade end them."""
+        if bool(e.vars.get("indestructible",
+                           self.rules.get("part_indestructible_default", False))):
+            return True
+        if e.is_part:
+            _, mhp_var, _ = e._vital_var_names()
+            try:
+                if int(e.vars.get(mhp_var, 0) or 0) <= 0:
+                    return True
+            except (TypeError, ValueError):
+                return True
+        return False
+
+    def _part_transfer_base(self, amount: int, cur_hp: int, max_hp: int,
+                            cap: str) -> int:
+        """Damage that feeds the to-main % under cap mode `cap`. See the
+        part_to_main_cap_default rule. A 0/0 part is forced to `none`."""
+        if max_hp <= 0:
+            return amount          # 0/0 passthrough — full hit taps through
+        if cap == "max_hp":
+            return min(amount, max_hp)
+        if cap == "remaining_hp":
+            return min(amount, max(0, cur_hp))
+        if cap.startswith("absolute:"):
+            try:
+                return min(amount, int(cap.split(":", 1)[1]))
+            except (TypeError, ValueError):
+                return amount
+        return amount              # "none" / unknown -> uncapped
+
+    def damage_part(self, part_id: str, amount: int) -> Tuple[int, List[str]]:
+        """Deal `amount` damage to body part `part_id`, routing the
+        configured share to the parent's main HP (the HD2 'damage to main'
+        model). Returns (to_main_dealt, log_lines).
+
+        Order (so the transfer never depends on clamp timing — see CLAUDE.md):
+          1. read the part's pre-hit hp + knobs;
+          2. compute to_main = to_main_percent% of the cap-moded damage and
+             apply it to the PARENT via the normal hp path (parent
+             clamp/hooks/death all fire — this is what lets a big uncapped
+             hit kill the parent);
+          3. write the part's own hp, floored at 0 (a 0/0 zone stays 0);
+          4. if the part hit 0 and isn't indestructible, run its death
+             (fire on_death once; if `vital`, kill the parent).
+
+        Routing happens ONLY here — a raw `entity[part].hp -= n` does not
+        spill to main (intentional, mirrors damage_entity vs write_var)."""
+        p = self.entities.get(part_id)
+        if p is None:
+            raise NotFound(f"Entity '{part_id}' not found.")
+        try:
+            amount = int(amount)
+        except (TypeError, ValueError):
+            raise VTTError("damage_part: amount must be an integer.")
+        hp_var, mhp_var, _ = p._vital_var_names()
+        cur_hp = int(p.vars.get(hp_var, 0) or 0)
+        max_hp = int(p.vars.get(mhp_var, 0) or 0)
+        pct = float(p.vars.get("to_main_percent",
+                              self.rules.get("part_to_main_percent_default", 0)) or 0)
+        cap = str(p.vars.get("to_main_cap",
+                            self.rules.get("part_to_main_cap_default", "max_hp")))
+        log: List[str] = []
+        # (2) transfer to parent main HP first, from pre-hit values.
+        to_main = 0
+        parent = self.entities.get(p.part_of) if p.part_of else None
+        if parent is not None and pct != 0:
+            base = self._part_transfer_base(amount, cur_hp, max_hp, cap)
+            to_main = int(round(base * pct / 100.0))
+            if to_main != 0:
+                p_hp_var, _, _ = parent._vital_var_names()
+                parent.write_var(p_hp_var,
+                                 int(parent.vars.get(p_hp_var, 0) or 0) - to_main)
+        # (3) write the part's own hp, floored at 0.
+        new_hp = max(0, cur_hp - amount)
+        if new_hp != cur_hp:
+            p.write_var(hp_var, new_hp)
+        # A heal that lifts a previously-destroyed part back above 0 clears
+        # the destroyed latch so it can break (and re-fire on_death) again.
+        if new_hp > 0 and p.vars.get("__part_destroyed"):
+            p.vars.pop("__part_destroyed", None)
+        # (4) destruction.
+        if new_hp <= 0 and (cur_hp - amount) <= 0 and not self.is_indestructible(p):
+            log += self._process_part_death(p)
+        return to_main, log
+
+    def _process_part_death(self, p: "Entity", *, cascade: bool = False) -> List[str]:
+        """A body part reaching 0 hp by damage. Fires the part's on_death
+        ONCE (destroy effects live there as passives), latched by the
+        `__part_destroyed` var so further hits don't re-fire. The part
+        STAYS attached as a dead (0-hp) limb — the doc's broken-limb model;
+        a part-targeted revive (or a heal) restores it. If the part is
+        `vital`, the parent is run through the kill function. `cascade`
+        (parent already dying) skips the vital re-kill."""
+        if p.vars.get("__part_destroyed"):
+            return []
+        p.vars["__part_destroyed"] = True   # raw set: no write_var recursion
+        self.log_event("part_destroyed", entity=p.id, name=p.name,
+                       part_of=p.part_of or "")
+        log = self.fire_hook("on_death", target_ids=[p.id])
+        if not cascade:
+            vital = bool(p.vars.get("vital",
+                                    self.rules.get("part_vital_default", False)))
+            if vital and p.part_of in self.entities:
+                _, klog = self.kill_entity(p.part_of)
+                log += klog
+        return log
+
     def _store_corpse(self, e: "Entity") -> None:
         """Snapshot `e` into a corpse entry under tile (e.x, e.y) at
         `corpses.<eid>`. Stores the full Entity.to_dict (including id,
@@ -7464,6 +7644,13 @@ class Match:
             "entity": e.to_dict(),
             "died_round": self.round_number,
         }
+        # Snapshot any attached body parts alongside the parent so a later
+        # revive_corpse restores the whole creature (the parts themselves
+        # are removed from the match by _process_death). Kept minimal — the
+        # "regrow from a fresh template" variant is a deferred TODO.
+        part_dicts = [pp.to_dict() for pp in self.entity_parts(e.id)]
+        if part_dicts:
+            corpses[e.id]["parts"] = part_dicts
 
     def find_corpse(self, eid: str) -> Optional[Tuple[int, int, Dict[str, Any]]]:
         """Locate a corpse by its dead-entity id. Returns
@@ -7518,6 +7705,9 @@ class Match:
         entity_dict = copy.deepcopy(corpse.get("entity") or {})
         if not entity_dict:
             raise VTTError(f"Corpse '{eid}' has no entity data to revive.")
+        # Body parts snapshotted at death (see _store_corpse). Re-spawned
+        # after the parent so reviving a creature restores its limbs.
+        stored_parts = copy.deepcopy(corpse.get("parts") or [])
         # Stamp authoritative coords from the tile location, not the
         # embedded snapshot — desync defense.
         entity_dict["x"] = x
@@ -7551,6 +7741,24 @@ class Match:
         self._death_check_suppressed_ids.add(e.id)
         try:
             _, spawn_log = e.spawn(self, x, y)
+            # Restore the creature's body parts at the parent's cell. Each
+            # snapshot carries its part_of (-> e.id) so it re-attaches; a
+            # part already taking that id (somehow still alive) is skipped.
+            for pd in stored_parts:
+                pdc = copy.deepcopy(pd)
+                pdc["x"] = x
+                pdc["y"] = y
+                pid = str(pdc.get("id", ""))
+                if not pid or pid in self._taken_entity_ids():
+                    continue
+                part_e = Entity.from_dict(pdc)
+                try:
+                    _, plog = part_e.spawn(self, x, y)
+                    spawn_log += plog
+                except VTTError:
+                    # A part that can't be placed (e.g. id clash) is skipped
+                    # rather than aborting the whole revive.
+                    pass
             # Run the revive-effects formula on the freshly-spawned entity
             # BEFORE on_revive so on_revive observers see the post-effect
             # state (matching on_death's "see settled state" contract).

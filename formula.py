@@ -1481,7 +1481,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     "all_entities", "entities_with_status", "entities_with_var",
     "entities_in_area",
     # Body parts (locational damage)
-    "parts", "part", "has_part", "part_of",
+    "parts", "part", "has_part", "part_of", "damage_part",
     # Shape-rooted entity queries — the entity-returning twins of the
     # cells_in_* area helpers (entities_in_area already covers burst/
     # radius). Each returns ALIVE entity ids standing on the shape's cells:
@@ -4522,6 +4522,22 @@ class FormulaEngine:
                 return False
             return match.find_part(pid, handle) is not None
         ns["has_part"] = _has_part
+
+        def _damage_part(part_token: Any, amount: Any) -> int:
+            """damage_part(part, amount): deal `amount` to a body part,
+            routing the configured share to the parent's main HP (the
+            HD2 'damage to main' model — see the part_to_main_* rules and
+            per-part to_main_percent / to_main_cap / vital vars). Returns
+            the amount dealt to the parent's main HP. Destroying a part
+            fires its on_death (destroy effects) and, if `vital`, kills
+            the parent. Routing happens ONLY through this verb — a raw
+            entity[part].hp write does not spill to main."""
+            pid, _pe = _resolve_entity(part_token, "damage_part")
+            if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+                raise FormulaError("damage_part(part, amount): amount must be a number.")
+            to_main, _log = match.damage_part(pid, int(amount))
+            return to_main
+        ns["damage_part"] = _damage_part
 
         def _part_of(eid_token: Any) -> str:
             """part_of(eid): the parent entity id if `eid` is a body part,
