@@ -9456,6 +9456,7 @@ SCENARIO 369 — fog: shared (union) team vision, full-reveal, and toggle off
 !match fog on
 !as view red
 !list
+!map
 !map full
 !match fog off
 !list
@@ -9953,6 +9954,7 @@ SCENARIO 388 — Entity-anchored aura: a zone that follows its caster
 !zone new flame
 !zone glyph flame f
 !zone anchor flame mage 1
+!ent move mage right
 !eval "zone_size('flame')"
 !eval "in_zone('mage', 'flame')"
 !eval "zone_anchor_of('flame')"
@@ -9963,6 +9965,8 @@ SCENARIO 388 — Entity-anchored aura: a zone that follows its caster
 !eval "zone_anchor_of('flame')"
 !ent move mage right
 !eval "cell_in_zone(8, 6, 'flame')"
+!zone anchor flame mage 1
+!ent move mage right
 
 Expected: `flame` is bound to the mage as an aura of radius 1 — its cells
 are stamped as the 3×3 disc around the mage at (5,5), so zone_size=9,
