@@ -1540,6 +1540,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # corners when sides=8). corner_arc defaults to the
     # directional_corner_arc rule.
     "facing_of", "relative_side", "side_hit", "directional_get",
+    "hit_location",
     # Footprint / large-entity primitives. A large entity occupies a W×H
     # rectangle anchored at its top-left cell (entity[X].x / .y); these
     # expose that footprint to formulas.
@@ -2588,6 +2589,12 @@ class FormulaEngine:
         # — meaning a formula can write group_add("swarm", "self") if
         # the bare-identifier shorthand self_id() feels too verbose.
         match = self._match
+        def _active_rng():
+            """The RNG hit_location (and any other replay-safe roll) should
+            use: the match-seeded random.Random when random_seed is set,
+            else the global `random` module. Both honor getstate/setstate,
+            so the action choice-replay snapshot covers either."""
+            return getattr(match, "_rng", None) or random
         def _eid(token: Any) -> str:
             if token is None:
                 # A bare `self` / `this` / `current` token was passed,
@@ -4860,6 +4867,72 @@ class FormulaEngine:
         ns["relative_side"] = _relative_side
         ns["side_hit"] = _side_hit
         ns["directional_get"] = _directional_get
+
+        def _hit_location(target_t: Any, from_x: Any, from_y: Any,
+                          aim: Any = None, aim_weight: Any = None,
+                          aim_bonus: Any = None, mode: Any = None,
+                          sides: Any = 4, corner_arc: Any = None) -> str:
+            """hit_location(target, from_x, from_y, aim=None, aim_weight=None,
+            aim_bonus=None, mode=None, sides=4, corner_arc=None): roll WHICH
+            body part of `target` a hit coming FROM (from_x, from_y) lands
+            on, returning the part id. Modes (default hit_location_mode rule):
+            `weighted` uses each part's hit_weights.<side> (side from
+            side_hit — front/back/left_side/right_side); `uniform` gives
+            equal odds. `aim` (a part name or id) biases toward that part:
+            its weight is multiplied by aim_weight (default the
+            hit_location_aim_weight rule) and aim_bonus (default 0) is added
+            — so aiming raises but doesn't guarantee, and a 0-weight side
+            stays 0 unless aim_bonus lifts it. With no parts (or no part
+            eligible for this side) returns the target itself (the hit lands
+            on the main body). RNG is the match RNG (replay-safe)."""
+            tid, _te = _resolve_entity(target_t, "hit_location")
+            body = match.entity_parts(tid)
+            if not body:
+                return tid
+            mode_s = str(mode) if mode is not None else \
+                str(match.rules.get("hit_location_mode", "weighted"))
+            if mode_s not in ("weighted", "uniform"):
+                raise FormulaError(
+                    "hit_location(...): mode must be 'weighted' or 'uniform'.")
+            side = _side_hit(target_t, from_x, from_y, sides, corner_arc)
+            aim_id = None
+            if aim is not None and aim != "":
+                ap = match.find_part(tid, str(aim))
+                if ap is None:
+                    raise FormulaError(
+                        f"hit_location: aim '{aim}' is not a part of '{tid}'.")
+                aim_id = ap.id
+            aw = (float(aim_weight) if aim_weight is not None
+                  else float(match.rules.get("hit_location_aim_weight", 3)))
+            ab = float(aim_bonus) if aim_bonus is not None else 0.0
+            weighted: list = []
+            total = 0.0
+            for p in body:
+                if mode_s == "uniform":
+                    w = 1.0
+                else:
+                    table = p.vars.get("hit_weights", {})
+                    try:
+                        w = float(table.get(side, 0)) if isinstance(table, dict) else 0.0
+                    except (TypeError, ValueError):
+                        w = 0.0
+                if aim_id is not None and p.id == aim_id:
+                    w = w * aw + ab
+                if w > 0:
+                    weighted.append((p.id, w))
+                    total += w
+            if total <= 0:
+                # Nothing exposed for this side (and no aim_bonus lifted a
+                # part above 0): the hit lands on the main body.
+                return tid
+            r = _active_rng().random() * total
+            acc = 0.0
+            for pid, w in weighted:
+                acc += w
+                if r <= acc:
+                    return pid
+            return weighted[-1][0]
+        ns["hit_location"] = _hit_location
 
         # ---- vision primitives (range / LOS) ----------------------------
         # The bare names (can_see / team_sees_cell / team_sees_entity) mean

@@ -339,6 +339,29 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "indestructible regardless of this rule."
         ),
     },
+    "hit_location_mode": {
+        "default": "weighted",
+        "schema": {"type": "str", "choices": ["weighted", "uniform"]},
+        "desc": (
+            "Default mode for hit_location(): `weighted` rolls a body part "
+            "using each part's per-side hit_weights table (the doc's "
+            "front/right/left/rear chance columns, keyed by side_hit's "
+            "names front/back/left_side/right_side); `uniform` gives every "
+            "part equal odds. Per-call override via the mode argument."
+        ),
+    },
+    "hit_location_aim_weight": {
+        "default": 3,
+        "schema": {"type": "number"},
+        "desc": (
+            "Default multiplier applied to the aimed part's weight in "
+            "hit_location() when an aim is given (biases toward it without "
+            "guaranteeing — a 0-weight side stays 0, so you can't hit what "
+            "isn't exposed). Per-call override via aim_weight; aim_bonus "
+            "adds a flat amount instead/as well (for attacks that reach a "
+            "normally-unexposed side, e.g. a boomerang)."
+        ),
+    },
     # --- Entity footprint (multi-tile / large entities) ---
     # The W×H rectangle a "large" entity occupies lives in two entity
     # vars named by these rules; absent / non-positive = 1 (an ordinary
