@@ -10364,3 +10364,28 @@ writes the var but appends a ⚠ advisory that it renders uncolored, plus the
 guide; a recognized name (`red`) writes cleanly with no warning. `!map
 teamcolor orcs notacolor` rejects the unknown color outright, also citing
 the guide.
+
+
+SCENARIO 404 — Renderer: colored tiles & zones (glyph, fill, formula, warnings)
+-------------------------------------------------------------------------------
+
+!match new tz TZ 5 3
+!match use tz
+!tile set 2 1 glyph T
+!tile set 2 1 color red
+!tile set 4 1 color purple
+!zone fill gas 1 2 3 2
+!zone glyph gas ~
+!zone color gas blue
+!zone color gas "zone_get(zone_name, 'tint')"
+!zone set gas tint green
+!map
+
+Expected: tile (2,1) shows glyph `T` (rendered red on a color-capable
+surface; the harness is plain, so glyphs show without color). tile (4,1)
+has a color but NO glyph, so it tints its `.` cell — and `purple` triggers
+a ⚠ advisory since it's not a palette name. The `gas` zone fills
+(1,2)-(3,2) with glyph `~`, colored by a FORMULA (`zone_get(zone_name,
+'tint')` → green, resolved per render). Layering is unchanged: a tile or
+entity sitting on a zone cell owns that cell's glyph and color. The plain
+harness map shows `T` on row 1 and `~ ~ ~` on row 2.
