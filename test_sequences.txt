@@ -10112,3 +10112,48 @@ penetration budget pen=3: x (3>0 → −20 → 20, pen 3−1=2), y (2>0 → −2
 limited by each target's armor — the composable alternative to a fixed
 cap, and any other variable (damage falloff, etc.) drops into the same
 loop. No engine primitive needed beyond the existing line queries.
+
+
+SCENARIO 394 — Mid-body choices: choose / choose_number (pre-supplied answers)
+-----------------------------------------------------------------------------
+
+!match new ch CH 6 3
+!match use ch
+!ent add mage Mage 50 1 1 9
+!ent set_var mage actions.cast.target none
+!ent set_var mage actions.cast.body "element = choose('element', ['fire', 'ice'])\nif element == 'fire':\n    entity[self].burned = 1\nelse:\n    entity[self].chilled = 1\nentity[self].power = choose_number('power', 1, 5)"
+!action mage cast answer=ice answer=3
+!ent dump mage
+!action mage cast answer=fire answer=5
+!ent dump mage
+
+Expected: `cast` makes two mid-body choices. choose(prompt, list) returns
+the picked element and choose_number(prompt, lo, hi) a number in range;
+both consume `answer=` tokens in order (the harness can't prompt
+interactively, so answers are pre-supplied). First cast (answer=ice
+answer=3): the 'ice' branch runs (chilled=1) and power=3. Second cast
+(answer=fire answer=5): the 'fire' branch runs (burned=1) and power=5
+(chilled lingers from the first cast — vars aren't auto-cleared between
+actions). Sequential choices work because the body re-runs (replay) with
+answers replayed in order, walking whichever branch the prior pick chose.
+
+
+SCENARIO 395 — Mid-body choices: cancel rolls back; missing answer fails clean
+-----------------------------------------------------------------------------
+
+!match new ch2 CH2 6 3
+!match use ch2
+!ent add mage Mage 50 1 1 9
+!ent set_var mage actions.zap.target none
+!ent set_var mage actions.zap.body "entity[self].zapped = 1\nx = choose('confirm', ['yes', 'no'])\nentity[self].confirmed = 1"
+!action mage zap answer=cancel
+!ent dump mage
+!action mage zap
+
+Expected: the reserved `answer=cancel` aborts at the choice — the whole
+action rolls back transactionally, so `zapped` (written BEFORE the
+choice) is NOT persisted and the dump shows neither zapped nor confirmed.
+With NO answer supplied and no interactive surface (the harness can't
+prompt), `!action mage zap` fails cleanly with a "needs a choice" ❌
+rather than hanging or crashing — choices must be pre-supplied to drive
+an action headlessly.

@@ -7426,10 +7426,22 @@ async def _run_action_dispatch(
             )
             return await ctx.send("\n".join(lines))
         action = matches[0]
+    # Pull out any pre-supplied mid-body choice answers FIRST. `answer=`
+    # tokens feed choose()/choose_number() in order (a repeatable token,
+    # so they bypass the last-write-wins args dict); the rest go through
+    # normal target + args parsing. The reserved 'cancel' value aborts at
+    # that prompt.
+    answers: List[Any] = []
+    pruned: List[str] = []
+    for tok in tail_tokens:
+        if tok.startswith("answer="):
+            answers.append(tok.split("=", 1)[1])
+        else:
+            pruned.append(tok)
     # Parse the target tokens off the front, then args off the rest.
     try:
         target_value, remaining = parse_target(
-            action.target_type, tail_tokens, m,
+            action.target_type, pruned, m,
         )
         args_dict = parse_args_tokens(remaining)
     except VTTError as ex:
@@ -7448,6 +7460,7 @@ async def _run_action_dispatch(
         ok, fail_info = await run_action(
             action, actor_id=actor_id, target=target_value,
             args=args_dict, match=m, mgr=mgr, ctx=ctx,
+            answers=answers,
         )
     except ActionEngineFault as ef:
         # Engine-level refusal (recursion limit etc.) — runner has

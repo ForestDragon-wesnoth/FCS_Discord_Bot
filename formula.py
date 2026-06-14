@@ -1818,7 +1818,10 @@ class EvalCtx:
 #   cmd / fail               — callables (added to _ACTION_BUILTINS
 #                              and allowed as Call targets)
 _ACTION_BINDING_NAMES = frozenset({"source", "args", "target"})
-_ACTION_BUILTINS = frozenset({"cmd", "fail"})
+# cmd/fail plus the mid-body choice prompts. choose(prompt, list) returns
+# the chosen element; choose_number(prompt, lo, hi) returns the chosen int.
+# Both are supplied as action_bindings by the runner (action-mode only).
+_ACTION_BUILTINS = frozenset({"cmd", "fail", "choose", "choose_number"})
 # Names that are loopable in action mode WITHOUT being a Call. Lets
 # `for x in target:` work for *_list target types. The runtime will
 # error cleanly if the loop runs against a non-iterable (e.g. for a
@@ -4989,8 +4992,8 @@ class FormulaEngine:
             # runner uses to decide rollback vs surface vs branch, and
             # wrapping them as "Runtime error: ..." would hide that
             # signal from the action runner above us.
-            from action import ActionFail, ActionEngineFault
-            if isinstance(e, (ActionFail, ActionEngineFault)):
+            from action import ActionFail, ActionEngineFault, ChoiceNeeded
+            if isinstance(e, (ActionFail, ActionEngineFault, ChoiceNeeded)):
                 raise
             raise FormulaError(f"Runtime error: {e}")
 
@@ -5069,8 +5072,8 @@ class FormulaEngine:
             # runner uses to decide rollback vs surface vs branch, and
             # wrapping them as "Runtime error: ..." would hide that
             # signal from the action runner above us.
-            from action import ActionFail, ActionEngineFault
-            if isinstance(e, (ActionFail, ActionEngineFault)):
+            from action import ActionFail, ActionEngineFault, ChoiceNeeded
+            if isinstance(e, (ActionFail, ActionEngineFault, ChoiceNeeded)):
                 raise
             raise FormulaError(f"Runtime error: {e}")
 

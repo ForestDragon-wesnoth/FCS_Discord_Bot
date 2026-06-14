@@ -1160,6 +1160,18 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "overflow rather than blowing Python's stack."
         ),
     },
+    "action_choice_limit": {
+        "default": 20,
+        "schema": {"type": "int"},
+        "desc": (
+            "Maximum number of mid-body choices (choose / choose_number "
+            "prompts) a single action invocation may make. The runner "
+            "re-runs the body once per choice (replay model), so this "
+            "bounds that work and catches a body that loops choose() "
+            "unboundedly. Hitting it raises an engine fault. Raise it if "
+            "you legitimately need more interactive picks in one action."
+        ),
+    },
     "action_cmd_allowlist": {
         # Default deliberately conservative: only `ent` (the entity-state
         # CRUD surface) is allowed by default. Adding things like
@@ -3980,6 +3992,14 @@ class Match:
     # the real context after the body completes. None when no action is
     # running. Not serialized — purely transient dispatch state.
     _runtime_buffer: Any = field(default=None, repr=False, compare=False)
+    # Mid-body action choices (choose / choose_number). The top-level
+    # action runner seeds `_choice_answers` (from `answer=` invocation
+    # tokens, then grows it one entry per interactive prompt) and resets
+    # `_choice_cursor` to 0 before each replay attempt; the choose()
+    # bindings consume answers in order. Runtime-only, preserved across
+    # an action's rollback retries (see action._rollback_match).
+    _choice_answers: List[Any] = field(default_factory=list, repr=False, compare=False)
+    _choice_cursor: int = field(default=0, repr=False, compare=False)
     # Per-command summon counter, reset to 0 at the start of every
     # top-level command dispatch (see CommandRegistry.run). Incremented
     # by summon_entity; once it reaches summon_event_limit, further
