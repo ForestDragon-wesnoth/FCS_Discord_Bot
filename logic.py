@@ -4606,6 +4606,61 @@ class Match:
                 e.x = parent.x
                 e.y = parent.y
 
+    def create_part(self, parent_id: str, part_id: str, name: str,
+                    hp: int, max_hp: int,
+                    extra_vars: Optional[Dict[str, Any]] = None
+                    ) -> Tuple["Entity", List[str]]:
+        """Spawn a fresh entity at `parent_id`'s cell and attach it as a
+        body part. The part's role name goes in the part_name var; hp /
+        max_hp use the match's vital-var names. Returns (part, spawn_log).
+        Raises NotFound (no parent) / DuplicateId (id taken)."""
+        parent = self.entities.get(parent_id)
+        if parent is None:
+            raise NotFound(f"Entity '{parent_id}' not found.")
+        if part_id in self._taken_entity_ids():
+            raise DuplicateId(
+                f"Entity id '{part_id}' already exists in this match.")
+        hp_var, mhp_var, _ = parent._vital_var_names()
+        pvars: Dict[str, Any] = {hp_var: int(hp), mhp_var: int(max_hp),
+                                 self.part_name_var(): name}
+        if extra_vars:
+            pvars.update(extra_vars)
+        e = Entity(id=part_id, name=name, x=parent.x, y=parent.y,
+                   vars=pvars, part_of=parent_id)
+        _, log = e.spawn(self, parent.x, parent.y)
+        return e, log
+
+    def attach_part(self, parent_id: str, part_id: str) -> "Entity":
+        """Link an EXISTING entity as a body part of `parent_id`, moving it
+        onto the parent's cell. Raises NotFound / VTTError (self-attach or
+        already a part of someone else is allowed — it just re-points)."""
+        parent = self.entities.get(parent_id)
+        if parent is None:
+            raise NotFound(f"Entity '{parent_id}' not found.")
+        p = self.entities.get(part_id)
+        if p is None:
+            raise NotFound(f"Entity '{part_id}' not found.")
+        if part_id == parent_id:
+            raise VTTError("An entity can't be a body part of itself.")
+        p.part_of = parent_id
+        p.x, p.y = parent.x, parent.y
+        self._rebuild_turn_order()
+        return p
+
+    def detach_part(self, part_id: str) -> "Entity":
+        """Unlink a body part — it becomes an ordinary free entity at its
+        current (the parent's) cell, keeping all its state. A severed limb
+        is just a (usually dead, 0-hp) entity on the ground; no corpse.
+        Raises NotFound / VTTError (not a part)."""
+        p = self.entities.get(part_id)
+        if p is None:
+            raise NotFound(f"Entity '{part_id}' not found.")
+        if not p.part_of:
+            raise VTTError(f"`{part_id}` is not a body part.")
+        p.part_of = None
+        self._rebuild_turn_order()
+        return p
+
     def _release_anchored_zones(self, eid: str) -> None:
         """Handle auras anchored to `eid` when it dies / leaves the match,
         per the anchored_zone_on_anchor_loss rule: 'delete' drops the zone,
@@ -5654,8 +5709,10 @@ class Match:
                     f"({cx},{cy}) outside {self.grid_width}x{self.grid_height}")
         # Attached body parts ride on the parent's cell and never collide
         # (they're non-occupying), so they skip the occupancy gate just
-        # like a stackable entity.
-        if not e.is_cell_stackable and not e.is_part:
+        # like a stackable entity. Keyed off the raw part_of field (not
+        # is_part) because spawn validates placement BEFORE binding the
+        # entity to the match, when is_part can't see the parent yet.
+        if not e.is_cell_stackable and not e.part_of:
             for cx, cy in cells:
                 if self.cell_occupant(cx, cy, (e.id,)) is not None:
                     raise Occupied(f"Cell ({cx},{cy}) already occupied")
@@ -7342,6 +7399,46 @@ class Match:
         # message; spawn's checks are the authoritative gate.
         self._summon_count += 1
         _, log = e.spawn(self, place_x, place_y)
+        # Consume a `parts` body spec (locational damage): a dict
+        # {role: part-template} or a list of part-template dicts. Each is
+        # auto-spawned at the parent's cell and linked via part_of. A dict
+        # key supplies the part's role name (part_name var) when the
+        # template doesn't carry one. Reserved top-level template key, so
+        # Entity.from_dict ignores it for the parent itself.
+        parts_spec = template.get("parts")
+        if isinstance(parts_spec, dict):
+            part_items = list(parts_spec.items())
+        elif isinstance(parts_spec, (list, tuple)):
+            part_items = [(None, pt) for pt in parts_spec]
+        else:
+            part_items = []
+        name_var = self.part_name_var()
+        for role, pt in part_items:
+            if not isinstance(pt, dict):
+                continue
+            ptc = copy.deepcopy(pt)
+            ptc.pop("x", None)
+            ptc.pop("y", None)
+            pvars = ptc.setdefault("vars", {})
+            if role is not None and name_var not in pvars:
+                pvars[name_var] = role
+            pprefix = (ptc.get("id") or pvars.get(name_var)
+                       or ptc.get("name") or f"{new_id}_part")
+            pid = self.mint_entity_id(str(pprefix))
+            ptc["id"] = pid
+            ptc["x"] = place_x
+            ptc["y"] = place_y
+            ptc["part_of"] = new_id
+            if "name" not in ptc:
+                ptc["name"] = str(pvars.get(name_var, pid))
+            try:
+                pe = Entity.from_dict(ptc)
+                _, plog = pe.spawn(self, place_x, place_y)
+                log += plog
+            except VTTError:
+                # A malformed part entry (missing hp var, id clash) is
+                # skipped rather than aborting the whole summon.
+                pass
         return new_id, log
 
     def _find_free_cell_near(

@@ -622,12 +622,35 @@ def _corpse_line(
     return _render_template(tmpl, _corpse_template_context(m, x, y, eid, corpse))
 
 
+def _part_status_str(m, p: Entity) -> str:
+    """Compact one-line summary of a body part's hp + routing knobs, for
+    `!part list`."""
+    hp_var, mhp_var, _ = p._vital_var_names()
+    hp = p.vars.get(hp_var, 0)
+    mhp = p.vars.get(mhp_var, 0)
+    flags: List[str] = []
+    pct = p.vars.get("to_main_percent",
+                     m.rules.get("part_to_main_percent_default", 0))
+    flags.append(f"{pct}%→main")
+    cap = p.vars.get("to_main_cap", m.rules.get("part_to_main_cap_default", "max_hp"))
+    flags.append(f"cap={cap}")
+    if m.is_indestructible(p):
+        flags.append("indestructible")
+    if bool(p.vars.get("vital", m.rules.get("part_vital_default", False))):
+        flags.append("vital")
+    if p.vars.get("__part_destroyed"):
+        flags.append("DESTROYED")
+    return f"{hp}/{mhp} hp, " + ", ".join(flags)
+
+
 def _entity_dump(e: Entity) -> str:
     """Raw 'show everything' view — template-free, complete state of the entity."""
     parts: List[str] = []
     parts.append(f"**{e.name}** (`{e.id}`)")
     parts.append(f"Position: ({e.x}, {e.y}) facing {e.facing}")
     parts.append(f"Team: {e.team if e.team else '(none)'}")
+    if e.part_of:
+        parts.append(f"Body part of: `{e.part_of}`")
     # Status flags carry data; show name(field=value, ...) if data exists.
     if e.status:
         status_parts = []
@@ -654,6 +677,15 @@ def _entity_dump(e: Entity) -> str:
             parts.append(f"- `{pid}` ({p.when}): `{p.formula}`")
     else:
         parts.append("**passives:** (none)")
+    # Body parts attached to this entity (locational damage).
+    m = getattr(e, "_match", None)
+    body = m.entity_parts(e.id) if m is not None else []
+    if body:
+        parts.append("**body parts:**")
+        name_var = m.part_name_var()
+        for bp in body:
+            role = bp.vars.get(name_var, "?")
+            parts.append(f"- `{bp.id}` ({role}): {_part_status_str(m, bp)}")
     return "\n".join(parts)
 
 
@@ -6598,6 +6630,125 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         )
 
     title, body = registry.help_for(["status"])
+    return await ctx.send(f"**{title}**\n{body}")
+
+
+@registry.command(
+    "part",
+    usage="!part <add|attach|detach|remove|list|info> ...",
+    desc=(
+        "Body parts for locational damage. A part is a REAL entity attached "
+        "to a parent (it gets hp/vars/statuses/passives/death for free) but "
+        "rides on the parent's cell and is hidden from the map roster. "
+        "Damage routes via the damage_part formula primitive (HD2 'damage to "
+        "main' model — see the part_to_main_* rules + per-part to_main_percent "
+        "/ to_main_cap / vital vars); WHERE a hit lands via hit_location. "
+        "Config lives in the part's vars (set with `!ent set_var <part> ...`); "
+        "destroy effects are passives on the part (`!ent passive add <part> "
+        "on_death ...`). A 0/0 part is an indestructible passthrough zone "
+        "(head/chest). Subcommands: add <parent> <part_id> <name> <hp> <maxhp> "
+        "[k=v ...]; attach <parent> <part_id>; detach <part_id>; remove "
+        "<part_id>; list <parent>; info <part_id>."
+    ),
+)
+async def part_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["part"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    sub = args[0].lower()
+
+    if sub == "add":
+        if await return_help_if_not_enough_args(ctx, args, 6, "part", "add"):
+            return
+        parent = _resolve_eid(m, args[1])
+        part_id, name = args[2], args[3]
+        try:
+            hp, maxhp = int(args[4]), int(args[5])
+        except ValueError:
+            return await ctx.send("❌ hp and maxhp must be integers.")
+        try:
+            e, log = m.create_part(parent, part_id, name, hp, maxhp)
+        except (NotFound, DuplicateId, VTTError) as ex:
+            return await ctx.send(f"❌ {ex}")
+        applied: List[str] = []
+        for tok in args[6:]:
+            if "=" not in tok:
+                return await ctx.send(
+                    f"❌ extra var `{tok}` must be in key=value form.")
+            k, _, v = tok.partition("=")
+            if not k:
+                return await ctx.send(f"❌ extra var `{tok}` has an empty key.")
+            e.write_var(k, _parse_scalar(v))
+            applied.append(k)
+        extra = f" Set: {', '.join(applied)}." if applied else ""
+        tail = ("\n" + "\n".join(log)) if log else ""
+        return await ctx.send(
+            f"Attached body part `{part_id}` ({name}) to `{parent}` "
+            f"({hp}/{maxhp} hp).{extra}{tail}"
+        )
+
+    if sub == "attach":
+        if await return_help_if_not_enough_args(ctx, args, 3, "part", "attach"):
+            return
+        parent = _resolve_eid(m, args[1])
+        part_id = _resolve_eid(m, args[2])
+        try:
+            m.attach_part(parent, part_id)
+        except (NotFound, VTTError) as ex:
+            return await ctx.send(f"❌ {ex}")
+        return await ctx.send(f"`{part_id}` is now a body part of `{parent}`.")
+
+    if sub == "detach":
+        if await return_help_if_not_enough_args(ctx, args, 2, "part", "detach"):
+            return
+        part_id = _resolve_eid(m, args[1])
+        try:
+            p = m.detach_part(part_id)
+        except (NotFound, VTTError) as ex:
+            return await ctx.send(f"❌ {ex}")
+        return await ctx.send(
+            f"Detached `{part_id}` — it's now a free entity at "
+            f"({p.x},{p.y})."
+        )
+
+    if sub in ("remove", "del", "rm"):
+        if await return_help_if_not_enough_args(ctx, args, 2, "part", "remove"):
+            return
+        part_id = _resolve_eid(m, args[1])
+        if part_id not in m.entities:
+            return await ctx.send(f"❌ Entity `{part_id}` not found.")
+        m.entities[part_id].remove()
+        return await ctx.send(f"Removed body part `{part_id}`.")
+
+    if sub == "list":
+        if await return_help_if_not_enough_args(ctx, args, 2, "part", "list"):
+            return
+        parent = _resolve_eid(m, args[1])
+        if parent not in m.entities:
+            return await ctx.send(f"❌ Entity `{parent}` not found.")
+        parts = m.entity_parts(parent)
+        if not parts:
+            return await ctx.send(f"`{parent}` has no body parts.")
+        name_var = m.part_name_var()
+        lines = [f"Body parts of `{parent}`:"]
+        for p in parts:
+            role = p.vars.get(name_var, "?")
+            lines.append(f"  `{p.id}` ({role}): {_part_status_str(m, p)}")
+        return await ctx.send("\n".join(lines))
+
+    if sub == "info":
+        if await return_help_if_not_enough_args(ctx, args, 2, "part", "info"):
+            return
+        part_id = _resolve_eid(m, args[1])
+        if part_id not in m.entities:
+            return await ctx.send(f"❌ Entity `{part_id}` not found.")
+        p = m.entities[part_id]
+        if not p.part_of:
+            return await ctx.send(f"`{part_id}` is not a body part.")
+        return await ctx.send(_entity_dump(p))
+
+    title, body = registry.help_for(["part"])
     return await ctx.send(f"**{title}**\n{body}")
 
 
