@@ -910,6 +910,44 @@ More shipped work (continuing the list above):
     ARC action economy + reactionary actions** (block/dodge → the reaction
     framework the choice-replay system seeded); fancier revive (regrow from
     template).
+- **Stat / modifier system (derived effective stats) — SHIPPED (first slice).**
+  A generic derived-stat layer: base stats stay plain vars (NEVER mutated);
+  a modifier is a DATA record aggregated live from its source and combined on
+  demand. PURE COMPOSABLE QUERY — the engine never auto-applies modifiers
+  (the GM threads `apply_mods` through their own combat), same stance as
+  "no hardcoded combat".
+  - **Record:** `{stat, op, value, tags, not_tags, priority, condition}`.
+    `value` + `condition` may be FORMULAS, eval'd with `self`=the modifier's
+    owner plus the call's context entities (`target`/`attacker`/`defender`/
+    `other`, each optional — added to HOOK_CONTEXT_NAMES; `target`/`actor`
+    were already there). So "+25 vs undead" = `condition:"entity[target].undead"`,
+    and a value can scale (`"(entity[self].max_hp - entity[self].hp)"`).
+  - **Sources aggregated live** (`Match._raw_modifier_records`): every status
+    instance's `modifiers`, a direct `entity.modifiers` slot, and each scan-
+    root subtree (the `modifier_sources` rule, default `equipped`, walked for
+    nested `modifiers`). Per-entity `__modifier_sources` (replace the default
+    list) and `__modifier_sources_add` (extend it). Equip = move the item
+    under a scanned root; an `inventory` copy doesn't apply. A bundle is a
+    LIST of records OR a DICT of named records (the dict form is what
+    `!ent set_var hero modifiers.fireboost.op add` builds); `tags`/`not_tags`
+    accept a list or a CSV string — so the whole thing is command-authorable.
+  - **Tag match:** required ⊆ query tags AND excluded(not_tags) ∩ query empty.
+  - **Fold (`apply_modifiers`):** `eff_priority = priority + per-op offset`
+    (`modifier_op_priority` rule, a CSV `op:offset` string); group by priority,
+    combine same-op within a tier (add→sum, inc%→sum, more%→product, set→last,
+    min→floor, max→cap), apply tiers ascending; `modifier_op_order` (CSV)
+    breaks ties between different ops in a tier. Defaults reproduce
+    `((base+Σadd)×(1+Σinc%))×∏(1+more%)` then set/clamp; bumping one record's
+    `priority` pulls it into its own tier.
+  - **Surface:** formula prims `apply_mods(entity, stat, base, tags, target=,
+    attacker=, defender=, other=)` → number and `list_mods(...)` → the active
+    records (introspection / `len()` checks). Read-only `!mod show <eid> <stat>
+    [base] [tag ...]` renders the active modifiers + folded result (context-
+    dependent ones show only when their condition resolves context-free).
+    Scenarios 399-400. FUTURE the user may want: more context roles; modifier
+    `source` tracking in the breakdown; per-stat caps; modifiers that
+    themselves grant tags. This is groundwork the combat refactor (damage
+    types, armor AR-vs-ARP, to-hit) will lean on.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

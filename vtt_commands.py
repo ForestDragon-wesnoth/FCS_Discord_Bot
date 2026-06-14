@@ -6753,6 +6753,64 @@ async def part_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 
 @registry.command(
+    "mod",
+    access="all",
+    usage="!mod show <eid> <stat> [base] [tag ...]",
+    desc=(
+        "Inspect a derived/effective stat — the active modifiers and, given "
+        "a numeric base, the folded result. Modifiers are NOT edited here: "
+        "they live in their sources (a status's `modifiers`, an equipped "
+        "item's `modifiers`, the entity's direct `modifiers` slot) and are "
+        "set with `!ent set_var` / status data. The engine combines them via "
+        "the apply_mods / list_mods formula primitives; this is the readout. "
+        "Context-dependent modifiers (condition reads target/attacker/etc.) "
+        "only show when their condition resolves without that context."
+    ),
+)
+async def mod_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["mod"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    sub = args[0].lower()
+    if sub == "show":
+        if await return_help_if_not_enough_args(ctx, args, 3, "mod", "show"):
+            return
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            return await ctx.send(f"❌ Entity `{eid}` not found.")
+        stat = args[2]
+        rest = args[3:]
+        base = None
+        tags: List[str] = []
+        for tok in rest:
+            if base is None:
+                try:
+                    base = float(tok)
+                    continue
+                except ValueError:
+                    pass
+            tags.append(tok)
+        mods = m.gather_modifiers(eid, stat, tags, {})
+        tagstr = f" [{', '.join(tags)}]" if tags else ""
+        lines = [f"Modifiers on `{eid}` for `{stat}`{tagstr}:"]
+        if not mods:
+            lines.append("  (none active)")
+        for md in mods:
+            tg = (" tags=" + ",".join(md["tags"])) if md["tags"] else ""
+            ntg = (" not=" + ",".join(md["not_tags"])) if md["not_tags"] else ""
+            lines.append(
+                f"  {md['op']} {md['value']:g} (pri {md['priority']:g}){tg}{ntg}")
+        if base is not None:
+            result = m.apply_modifiers(eid, stat, base, tags, {})
+            lines.append(f"  → base {base:g} becomes {result:g}")
+        return await ctx.send("\n".join(lines))
+
+    title, body = registry.help_for(["mod"])
+    return await ctx.send(f"**{title}**\n{body}")
+
+
+@registry.command(
     "func",
     usage=("!func <def|del|list|info> ..."),
     desc=(
