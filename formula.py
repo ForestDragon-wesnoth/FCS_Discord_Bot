@@ -1480,6 +1480,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #                                    of entities_within
     "all_entities", "entities_with_status", "entities_with_var",
     "entities_in_area",
+    # Body parts (locational damage)
+    "parts", "part", "has_part", "part_of",
     # Shape-rooted entity queries — the entity-returning twins of the
     # cells_in_* area helpers (entities_in_area already covers burst/
     # radius). Each returns ALIVE entity ids standing on the shape's cells:
@@ -1634,6 +1636,7 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "tile_keys",
     "entity_groups",
     "all_entities",
+    "parts",
     "entities_with_status",
     "entities_with_var",
     "entities_in_area",
@@ -1760,7 +1763,7 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
 # unbound). Letting them appear bare lets a formula write
 # `status_set(self, status_name, "remaining", 0)` instead of the more
 # verbose `status_set(self_id(), ...)`.
-_ENTITY_TOKEN_NAMES: Tuple[str, ...] = ("self", "this", "current")
+_ENTITY_TOKEN_NAMES: Tuple[str, ...] = ("self", "this", "current", "parent")
 
 
 @dataclass
@@ -1783,6 +1786,11 @@ class EvalCtx:
     this: Optional[str] = None
     target: Optional[str] = None
     extras: Optional[Dict[str, Any]] = None
+    # Back-reference to the Match, set by the engine at the top of each
+    # eval so resolve_who can dereference the `parent` token (which needs
+    # to read the contextual entity's `part_of`). None for callers that
+    # never use `parent`.
+    match: Optional[Any] = None
 
     def resolve_who(self, token: Any) -> str:
         if token in ("this", "current"):
@@ -1795,6 +1803,21 @@ class EvalCtx:
             if not self.target:
                 raise FormulaError("'self' is unbound in this context.")
             return self.target
+        if token == "parent":
+            # The parent of the contextual entity (self, falling back to
+            # the current-turn entity). Used by a body part's passives /
+            # actions to reach the whole creature: entity[parent].hp.
+            base = self.target or self.this
+            if not base:
+                raise FormulaError("'parent' is unbound in this context.")
+            if self.match is None:
+                raise FormulaError("'parent' cannot be resolved here.")
+            e = self.match.entities.get(base)
+            if e is None or not e.part_of:
+                raise FormulaError(
+                    f"'{base}' has no parent (it is not a body part)."
+                )
+            return e.part_of
         # Anything else is treated as a literal entity id. For the dynamic
         # entity[<expr>] form the expression is evaluated at runtime and
         # its (already-computed) value lands here — guard against a
@@ -1890,8 +1913,9 @@ class _EntityAccessTransformer(ast.NodeTransformer):
         if isinstance(slice_node, ast.Index):  # py<=3.8 wrapper, defensive
             slice_node = slice_node.value
         if isinstance(slice_node, ast.Name):
-            if slice_node.id in ("self", "this", "current"):
-                # Special token — pass the token string; resolve_who maps it.
+            if slice_node.id in _ENTITY_TOKEN_NAMES:
+                # Special token (self/this/current/parent) — pass the token
+                # string; resolve_who maps it to a concrete entity id.
                 return ast.Constant(value=slice_node.id)
             if slice_node.id in self.known_params:
                 # Dynamic: the parameter's bound value is the entity id.
@@ -3059,6 +3083,10 @@ class FormulaEngine:
                 if oid == ref_eid:
                     continue
                 if not oe.is_alive:
+                    continue
+                # Attached body parts aren't independent map targets — a
+                # distance/AoE query resolves to the parent, not its parts.
+                if oe.is_part:
                     continue
                 if not _relation_ok(relation, ref_eid, oid):
                     continue
@@ -4452,11 +4480,57 @@ class FormulaEngine:
         ns["turn_index"] = _turn_index
 
         def _all_entities() -> list:
-            """all_entities(): every ALIVE entity id, in
+            """all_entities(): every ALIVE, independent entity id, in
             match.entities insertion order. The match-wide iteration
-            primitive (no reference entity required)."""
-            return [eid for eid, e in match.entities.items() if e.is_alive]
+            primitive (no reference entity required). Attached body parts
+            are excluded (they're not field units — reach them with
+            parts(parent) / part(parent, name))."""
+            return [eid for eid, e in match.entities.items()
+                    if e.is_alive and not e.is_part]
         ns["all_entities"] = _all_entities
+
+        def _parts(eid_token: Any) -> list:
+            """parts(eid): the ids of every body part attached to `eid`,
+            in order (loopable). Empty if it has none. Includes 0/0
+            indestructible zones (which are 'not alive')."""
+            eid, _e = _resolve_entity(eid_token, "parts")
+            return [p.id for p in match.entity_parts(eid)]
+        ns["parts"] = _parts
+
+        def _part(parent_token: Any, handle: Any) -> str:
+            """part(parent, name_or_id): the id of `parent`'s body part
+            matching `name_or_id` — its part_name var OR its entity id (id
+            wins on a clash). Raises if there's no such part."""
+            pid, _pe = _resolve_entity(parent_token, "part")
+            if not isinstance(handle, str) or not handle:
+                raise FormulaError("part(parent, name): name must be a non-empty string.")
+            p = match.find_part(pid, handle)
+            if p is None:
+                raise FormulaError(
+                    f"part: `{pid}` has no body part `{handle}`.")
+            return p.id
+        ns["part"] = _part
+
+        def _has_part(parent_token: Any, handle: Any) -> bool:
+            """has_part(parent, name_or_id): True iff `parent` has a body
+            part matching name_or_id. Never raises."""
+            try:
+                pid, _pe = _resolve_entity(parent_token, "has_part")
+            except FormulaError:
+                return False
+            if not isinstance(handle, str) or not handle:
+                return False
+            return match.find_part(pid, handle) is not None
+        ns["has_part"] = _has_part
+
+        def _part_of(eid_token: Any) -> str:
+            """part_of(eid): the parent entity id if `eid` is a body part,
+            else '' (empty string). The query analog of the `parent`
+            token — usable on any entity, no raise."""
+            eid, e = _resolve_entity(eid_token, "part_of")
+            po = e.part_of
+            return po if (po and po in match.entities) else ""
+        ns["part_of"] = _part_of
 
         def _entities_with_status(name: Any) -> list:
             """entities_with_status(name): alive entities that carry the
@@ -4501,7 +4575,7 @@ class FormulaEngine:
             # let it raise if the args are bad.
             scored = []
             for eid, e in match.entities.items():
-                if not e.is_alive:
+                if not e.is_alive or e.is_part:
                     continue
                 d = _distance(x, y, e.x, e.y, mode)
                 if d <= n:
@@ -4979,6 +5053,8 @@ class FormulaEngine:
         # eval_program are the two entry points, so resetting here (vs.
         # in __init__) means a single FormulaEngine instance can be
         # re-used across multiple evals if a future caller wants.
+        if ctx.match is None:
+            ctx.match = self._match  # enable `parent`-token resolution
         self._reset_affected()
         tree = self._prepare(src, "eval", known_funcs=self._known_funcs())
         code = compile(tree, "<formula>", "eval")
@@ -5012,6 +5088,8 @@ class FormulaEngine:
                          engine's default `cmd`/`fail` stubs with
                          action-aware ones, and inject
                          source/args/target proxies."""
+        if ctx.match is None:
+            ctx.match = self._match  # enable `parent`-token resolution
         self._reset_affected()
         try:
             full = ast.parse(src, mode="exec")

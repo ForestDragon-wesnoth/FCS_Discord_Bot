@@ -276,6 +276,18 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "'no team' rather than erroring."
         ),
     },
+    "part_name_var": {
+        "default": "part_name",
+        "schema": {"type": "str"},
+        "desc": (
+            "Var key holding a body part's ROLE name ('head', 'left_arm', "
+            "'reactor') — the handle that `part(parent, name)`, the aim "
+            "argument of hit_location, and destroy logic resolve against. "
+            "The entity id stays unique per part; part_name is the shared "
+            "role tag (every humanoid's head part can share part_name "
+            "'head'). Absent = the part is only addressable by its id."
+        ),
+    },
     # --- Entity footprint (multi-tile / large entities) ---
     # The W×H rectangle a "large" entity occupies lives in two entity
     # vars named by these rules; absent / non-positive = 1 (an ordinary
@@ -1626,7 +1638,7 @@ def _default_facing_for(
 # ---------- Special/reserved id registry (like how "this" or "current" is the entity whose turn it is right now, "self" is usually the entity directly affected ay a command regardless of turn order") ----------
 
 
-RESERVED_IDS: Set[str] = {"current", "this", "self"}
+RESERVED_IDS: Set[str] = {"current", "this", "self", "parent"}
 
 
 # -------------------------
@@ -2788,6 +2800,16 @@ class Entity:
 
     facing: Direction = "up"# will be set to a default by Match when adding
 
+    # Locational damage: when this entity is a BODY PART of another entity,
+    # `part_of` holds the parent entity's id. A part is a real Entity (it
+    # gets hp/vars/statuses/passives/death for free) but is "attached" — it
+    # mirrors the parent's position and is skipped by the map-facing surface
+    # (render, occupancy, distance/AoE/zone/vision enumeration, the !list
+    # roster). None = an ordinary, independent entity. Set via `!part
+    # attach`/`detach` (a protected field, NOT a var) so it survives a rules
+    # refresh and can't be casually set_var'd. See section 7 of CLAUDE.md.
+    part_of: "str | None" = field(default=None)
+
     #connect Entity to the Match (so functions like moving an entity can still access map size data, etc.)
     _match: "Match | None" = field(default=None, repr=False, compare=False)
 
@@ -2929,6 +2951,17 @@ class Entity:
     @property
     def is_alive(self) -> bool:
         return self.hp > 0
+
+    @property
+    def is_part(self) -> bool:
+        """True when this entity is an attached body part of another entity
+        (its `part_of` points at a live parent). Attached parts mirror the
+        parent's position and are skipped by the map-facing surface
+        (render, occupancy, distance/AoE/zone/vision enumeration, the
+        !list roster). The link is ignored if the parent no longer exists
+        (a dangling part reads as an ordinary entity)."""
+        po = self.part_of
+        return bool(po) and self._match is not None and po in self._match.entities
 
     @property
     def is_cell_stackable(self) -> bool:
@@ -3681,6 +3714,7 @@ class Entity:
             "passives": {pid: p.to_dict() for pid, p in self.passives.items()},
             "clamps": {path: c.to_dict() for path, c in self.clamps.items()},
             "facing": self.facing,
+            "part_of": self.part_of,
         }
 
     @staticmethod
@@ -3696,6 +3730,7 @@ class Entity:
             status=_coerce_status_dict(data.get("status")),
             vars=dict(data.get("vars", {})),
             facing=data.get("facing", "up"),
+            part_of=data.get("part_of", None),
         )
         for pid, pd in (data.get("passives", {}) or {}).items():
             e.passives[pid] = Passive.from_dict(pd)
@@ -4457,6 +4492,46 @@ class Match:
             if isinstance(z, dict) and z.get("anchor") == eid:
                 self._stamp_anchored_zone(name)
 
+    # ---------- body parts (locational damage) ----------
+    def entity_parts(self, parent_id: str) -> List["Entity"]:
+        """Every attached part Entity whose `part_of` points at `parent_id`,
+        in insertion order. Derived (no second structure to keep in sync)."""
+        return [e for e in self.entities.values() if e.part_of == parent_id]
+
+    def part_name_var(self) -> str:
+        """Var key holding a part's role name ('head', 'left_arm') — the
+        handle `part(parent, name)` / aiming resolve against. Per the
+        part_name_var rule (default 'part_name')."""
+        return str(self.rules.get("part_name_var", "part_name"))
+
+    def find_part(self, parent_id: str, handle: str) -> Optional["Entity"]:
+        """Resolve a part of `parent_id` by either its entity id OR its
+        `part_name` var (id wins on a clash). None if no match."""
+        handle = str(handle)
+        name_var = self.part_name_var()
+        named: Optional["Entity"] = None
+        for e in self.entities.values():
+            if e.part_of != parent_id:
+                continue
+            if e.id == handle:
+                return e
+            if named is None and str(e.vars.get(name_var, "")) == handle:
+                named = e
+        return named
+
+    def _restamp_parts_for(self, parent_id: str) -> None:
+        """Glue every attached part to the parent's current anchor cell.
+        Called whenever the parent moves (alongside aura restamping) so a
+        part's mirrored position rides along. Parts are non-occupying, so
+        co-locating them on the parent's cell is always legal."""
+        parent = self.entities.get(parent_id)
+        if parent is None:
+            return
+        for e in self.entities.values():
+            if e.part_of == parent_id and (e.x != parent.x or e.y != parent.y):
+                e.x = parent.x
+                e.y = parent.y
+
     def _release_anchored_zones(self, eid: str) -> None:
         """Handle auras anchored to `eid` when it dies / leaves the match,
         per the anchored_zone_on_anchor_loss rule: 'delete' drops the zone,
@@ -4540,7 +4615,7 @@ class Match:
         cells = z["cells"]
         return [
             eid for eid, e in self.entities.items()
-            if getattr(e, "is_alive", True)
+            if getattr(e, "is_alive", True) and not e.is_part
             and any(c in cells for c in self.entity_cells(e))
         ]
 
@@ -4955,7 +5030,7 @@ class Match:
         if not pov_team:
             return True
         for e in self.entities.values():
-            if e.is_alive and e.team == pov_team and \
+            if e.is_alive and not e.is_part and e.team == pov_team and \
                self._member_sees(e, x, y, los=los):
                 return True
         return False
@@ -4966,7 +5041,7 @@ class Match:
         if not pov_team:
             return True
         for e in self.entities.values():
-            if e.is_alive and e.team == pov_team and \
+            if e.is_alive and not e.is_part and e.team == pov_team and \
                self.has_los(e.id, e.x, e.y, x, y):
                 return True
         return False
@@ -5026,7 +5101,7 @@ class Match:
         seen = self.explored.setdefault(team, set())
         use_los = bool(self.rules.get("fog_los", False))
         for e in self.entities.values():
-            if not e.is_alive or e.team != team:
+            if not e.is_alive or e.is_part or e.team != team:
                 continue
             r = self._vision_radius_of(e)
             # A large viewer reveals the UNION of every footprint cell's
@@ -5454,6 +5529,10 @@ class Match:
         is_occupied — a large entity blocks every cell it spans."""
         for eid, e in self.entities.items():
             if eid in ignore:
+                continue
+            # Attached body parts ride on the parent's cell and never
+            # block — the parent is the occupant.
+            if e.is_part:
                 continue
             if e.is_alive and not e.is_cell_stackable and self.entity_occupies(e, x, y):
                 return eid
@@ -6830,6 +6909,9 @@ class Match:
         # cells — it does NOT fire the aura's own enter/exit hooks for
         # entities it sweeps over.
         self._restamp_anchors_for(entity_id)
+        # Glue attached body parts to the parent's new cell (before
+        # on_entity_moved passives fire, so they observe the moved parts).
+        self._restamp_parts_for(entity_id)
         from formula import FormulaEngine, EvalCtx
         engine = FormulaEngine(self)
         this_id = self.current_entity_id()
@@ -8343,6 +8425,10 @@ class Match:
             # Keep old semantics: skip dead entities
             if not getattr(e, "is_alive", True):
                 continue
+            # Attached body parts ride on the parent's cell — the parent
+            # draws the glyph; parts never paint their own.
+            if e.is_part:
+                continue
             # POV filter: an entity hidden from this team isn't drawn.
             if not self.entity_visible_to(e.id, pov_team):
                 continue
@@ -8540,7 +8626,7 @@ class Match:
             # transparent). We hand-roll the loop here because
             # Match.is_occupied only takes a single ignore_entity_id.
             for other_eid, other_e in self.entities.items():
-                if other_eid in member_set:
+                if other_eid in member_set or other_e.is_part:
                     continue
                 if other_e.x == x and other_e.y == y and other_e.is_alive:
                     raise Occupied(
