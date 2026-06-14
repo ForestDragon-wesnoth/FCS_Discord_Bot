@@ -1482,6 +1482,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     "entities_in_area",
     # Body parts (locational damage)
     "parts", "part", "has_part", "part_of", "damage_part",
+    # Stat modifiers (derived / effective stats)
+    "apply_mods", "list_mods",
     # Shape-rooted entity queries — the entity-returning twins of the
     # cells_in_* area helpers (entities_in_area already covers burst/
     # radius). Each returns ALIVE entity ids standing on the shape's cells:
@@ -1756,6 +1758,12 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     # no `self`/entity[X] — corpse_team + tile_x/tile_y are how a
     # visibility formula keys on it. None outside corpse-visibility.
     "corpse_team",
+    # Stat-modifier context. Bound when apply_mods / list_mods evaluate a
+    # modifier's condition / value / tag formulas, to the related entities
+    # the caller passed (each optional — unbound if not supplied). `self`
+    # is always the modifier's owner. Lets a modifier read the other party:
+    # "+25 vs undead" -> condition `entity[target].undead`.
+    "attacker", "defender", "other",
 )
 
 # Entity-id sentinel identifiers. Inside `entity[X]` these get
@@ -4554,6 +4562,69 @@ class FormulaEngine:
             po = e.part_of
             return po if (po and po in match.entities) else ""
         ns["part_of"] = _part_of
+
+        # ---- stat modifiers (derived / effective stats) ------------------
+        def _norm_mod_tags(tags: Any, fname: str) -> list:
+            if tags is None:
+                return []
+            if isinstance(tags, str):
+                return [tags]
+            if isinstance(tags, (list, tuple)):
+                return [str(t) for t in tags]
+            raise FormulaError(
+                f"{fname}(...): tags must be a string or a list of strings.")
+
+        def _mod_context(target: Any, attacker: Any, defender: Any,
+                         other: Any) -> dict:
+            ctx: dict = {}
+            if target is not None:
+                ctx["target"] = target
+            if attacker is not None:
+                ctx["attacker"] = attacker
+            if defender is not None:
+                ctx["defender"] = defender
+            if other is not None:
+                ctx["other"] = other
+            return ctx
+
+        def _apply_mods(entity_token: Any, stat: Any, base: Any,
+                        tags: Any = None, target: Any = None,
+                        attacker: Any = None, defender: Any = None,
+                        other: Any = None) -> float:
+            """apply_mods(entity, stat, base, tags=None, target=, attacker=,
+            defender=, other=): the effective value of `base` after the
+            entity's modifiers for `stat` + `tags` (the HD-style derived
+            stat). Modifiers come live from statuses / a direct
+            `entity.modifiers` slot / scanned containers (e.g. equipped);
+            each may carry a condition / value formula that reads `self`
+            (the owner) plus the context entities passed here (e.g.
+            condition `entity[target].undead` for '+X vs undead'). Folds
+            per the modifier_op_priority / _order rules."""
+            eid, _e = _resolve_entity(entity_token, "apply_mods")
+            if not isinstance(stat, str) or not stat:
+                raise FormulaError("apply_mods(...): stat must be a non-empty string.")
+            if isinstance(base, bool) or not isinstance(base, (int, float)):
+                raise FormulaError("apply_mods(...): base must be a number.")
+            return match.apply_modifiers(
+                eid, stat, base, _norm_mod_tags(tags, "apply_mods"),
+                _mod_context(target, attacker, defender, other))
+        ns["apply_mods"] = _apply_mods
+
+        def _list_mods(entity_token: Any, stat: Any, tags: Any = None,
+                       target: Any = None, attacker: Any = None,
+                       defender: Any = None, other: Any = None) -> list:
+            """list_mods(entity, stat, tags=None, target=, attacker=,
+            defender=, other=): the active modifier records for stat+tags
+            (same filtering as apply_mods), for introspection / breakdowns.
+            Mostly useful at the command layer or via len() ('is any X
+            modifier active?')."""
+            eid, _e = _resolve_entity(entity_token, "list_mods")
+            if not isinstance(stat, str) or not stat:
+                raise FormulaError("list_mods(...): stat must be a non-empty string.")
+            return match.gather_modifiers(
+                eid, stat, _norm_mod_tags(tags, "list_mods"),
+                _mod_context(target, attacker, defender, other))
+        ns["list_mods"] = _list_mods
 
         def _entities_with_status(name: Any) -> list:
             """entities_with_status(name): alive entities that carry the

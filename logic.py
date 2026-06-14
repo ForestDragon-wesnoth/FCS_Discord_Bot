@@ -362,6 +362,48 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "normally-unexposed side, e.g. a boomerang)."
         ),
     },
+    # --- Stat modifiers (derived/effective stats) ---
+    # Base stats stay plain vars and are never mutated; modifiers are data
+    # records aggregated live from their SOURCES and combined on demand by
+    # the apply_mods / list_mods formula primitives. A modifier record is
+    # {stat, op, value, tags, not_tags, priority, condition}; value/condition
+    # may be formulas (eval'd with self=owner + the call's context names).
+    "modifier_sources": {
+        "default": "equipped",
+        "schema": {"type": "str"},
+        "desc": (
+            "Comma-separated vars roots walked for `modifiers` bundles when "
+            "computing effective stats — so an item under one of these "
+            "containers contributes its modifiers, while the same item in "
+            "`inventory` does not (equip = move it under a scanned root). "
+            "Status instances and a direct `entity.modifiers` slot are "
+            "ALWAYS scanned on top of these. Per-entity override: the "
+            "`__modifier_sources` var (replaces this list) and/or "
+            "`__modifier_sources_add` var (extends it)."
+        ),
+    },
+    "modifier_op_priority": {
+        "default": "add:0,inc%:100,more%:200,set:300,min:400,max:500",
+        "schema": {"type": "str"},
+        "desc": (
+            "Per-op priority OFFSETS, added to each modifier's own "
+            "`priority` to get its effective priority. Modifiers fold in "
+            "ascending effective priority; same-op modifiers in a tier "
+            "combine naturally (add→sum, inc%→sum, more%→product, set→last, "
+            "min→floor, max→cap). The defaults reproduce the classic "
+            "((base+Σadd)×(1+Σinc%))×∏(1+more%) then set/clamp. Format "
+            "`op:offset,op:offset` (an unlisted op offsets 0)."
+        ),
+    },
+    "modifier_op_order": {
+        "default": "add,inc%,more%,set,min,max",
+        "schema": {"type": "str"},
+        "desc": (
+            "Tiebreak order for DIFFERENT ops that land on the same "
+            "effective priority — the comma-separated op sequence applied "
+            "within a tier. Ops not listed sort last (then by source order)."
+        ),
+    },
     # --- Entity footprint (multi-tile / large entities) ---
     # The W×H rectangle a "large" entity occupies lives in two entity
     # vars named by these rules; absent / non-positive = 1 (an ordinary
@@ -4660,6 +4702,188 @@ class Match:
         p.part_of = None
         self._rebuild_turn_order()
         return p
+
+    # ---------- stat modifiers (derived / effective stats) ----------
+    # Base stats stay plain vars (never mutated); a modifier is a data
+    # record aggregated live from its source and combined on demand. See
+    # the modifier_sources / modifier_op_priority / modifier_op_order rules
+    # and the apply_mods / list_mods formula primitives.
+    def _effective_modifier_sources(self, e: "Entity") -> List[str]:
+        """The vars roots to scan for `modifiers` bundles on `e`: the
+        per-entity `__modifier_sources` var (replaces the default) or the
+        modifier_sources rule, plus `__modifier_sources_add` (extends)."""
+        override = e.vars.get("__modifier_sources")
+        if isinstance(override, list):
+            roots = [str(r) for r in override]
+        else:
+            roots = [r.strip() for r in
+                     str(self.rules.get("modifier_sources", "equipped")).split(",")
+                     if r.strip()]
+        add = e.vars.get("__modifier_sources_add")
+        if isinstance(add, list):
+            roots = roots + [str(r) for r in add]
+        return roots
+
+    def _walk_modifier_bundles(self, node: Any, out: List[dict]) -> None:
+        """Collect every `modifiers` list found anywhere under `node`
+        (dicts recursed; the modifiers list itself is not descended)."""
+        if isinstance(node, dict):
+            mods = node.get("modifiers")
+            if isinstance(mods, list):
+                out.extend(m for m in mods if isinstance(m, dict))
+            for k, v in node.items():
+                if k == "modifiers":
+                    continue
+                self._walk_modifier_bundles(v, out)
+        elif isinstance(node, list):
+            for it in node:
+                self._walk_modifier_bundles(it, out)
+
+    def _raw_modifier_records(self, e: "Entity") -> List[dict]:
+        """Every modifier record contributing to `e`, aggregated live from
+        its sources: each status instance's `modifiers`, the direct
+        `entity.modifiers` slot, and each scan-root subtree."""
+        out: List[dict] = []
+        for sdata in e.status.values():
+            if isinstance(sdata, dict) and isinstance(sdata.get("modifiers"), list):
+                out.extend(m for m in sdata["modifiers"] if isinstance(m, dict))
+        direct = e.vars.get("modifiers")
+        if isinstance(direct, list):
+            out.extend(m for m in direct if isinstance(m, dict))
+        for root in self._effective_modifier_sources(e):
+            node: Any = e.vars
+            ok = True
+            for seg in root.split("."):
+                if isinstance(node, dict) and seg in node:
+                    node = node[seg]
+                else:
+                    ok = False
+                    break
+            if ok:
+                self._walk_modifier_bundles(node, out)
+        return out
+
+    def gather_modifiers(self, eid: str, stat: str, tags: Any,
+                         context: Optional[Dict[str, Any]] = None) -> List[dict]:
+        """The active modifier records on `eid` for `stat` + `tags`:
+        filtered by stat name, tag subset (required ⊆ query) and negative
+        tags (excluded ∩ query empty) and condition, with value formulas
+        resolved to numbers. The introspection half of the system (list_mods)
+        and the input to apply_modifiers' fold."""
+        e = self.entities.get(eid)
+        if e is None:
+            raise NotFound(f"Entity '{eid}' not found.")
+        context = dict(context or {})
+        tagset = {str(t) for t in (tags or [])}
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        engine = FormulaEngine(self)
+        this_id = self.current_entity_id()
+
+        def _ev(expr: Any) -> Any:
+            return engine.eval_expression(
+                str(expr),
+                EvalCtx(this=this_id, target=eid, extras=dict(context)),
+            )
+
+        out: List[dict] = []
+        for m in self._raw_modifier_records(e):
+            if str(m.get("stat", "")) != str(stat):
+                continue
+            req = {str(t) for t in (m.get("tags") or [])}
+            if not req <= tagset:
+                continue
+            notg = {str(t) for t in (m.get("not_tags") or [])}
+            if notg & tagset:
+                continue
+            cond = m.get("condition", "")
+            if cond:
+                try:
+                    if not _ev(cond):
+                        continue
+                except FormulaError:
+                    continue          # malformed condition -> inactive (fail safe)
+            raw_val = m.get("value", 0)
+            if isinstance(raw_val, str):
+                try:
+                    raw_val = _ev(raw_val)
+                except FormulaError:
+                    continue          # malformed value -> skip this modifier
+            try:
+                val = float(raw_val)
+            except (TypeError, ValueError):
+                continue
+            try:
+                pri = float(m.get("priority", 0) or 0)
+            except (TypeError, ValueError):
+                pri = 0.0
+            out.append({
+                "op": str(m.get("op", "add")),
+                "value": val,
+                "priority": pri,
+                "tags": sorted(req),
+                "not_tags": sorted(notg),
+            })
+        return out
+
+    def _modifier_op_offsets(self) -> Dict[str, float]:
+        offsets: Dict[str, float] = {}
+        for tok in str(self.rules.get("modifier_op_priority", "")).split(","):
+            tok = tok.strip()
+            if ":" in tok:
+                k, _, v = tok.partition(":")
+                try:
+                    offsets[k.strip()] = float(v)
+                except ValueError:
+                    pass
+        return offsets
+
+    def _apply_modifier_op(self, running: float, op: str,
+                           vals: List[float]) -> float:
+        """Combine same-op modifier values onto the running value."""
+        if op == "add":
+            return running + sum(vals)
+        if op == "inc%":
+            return running * (1 + sum(vals) / 100.0)
+        if op == "more%":
+            for v in vals:
+                running *= (1 + v / 100.0)
+            return running
+        if op == "set":
+            return vals[-1]
+        if op == "min":          # floor: result at least the highest min
+            return max(running, max(vals))
+        if op == "max":          # cap: result at most the lowest max
+            return min(running, min(vals))
+        return running + sum(vals)   # unknown op -> lenient add
+
+    def apply_modifiers(self, eid: str, stat: str, base: Any, tags: Any,
+                        context: Optional[Dict[str, Any]] = None) -> float:
+        """Effective value of `base` after `eid`'s modifiers for `stat` +
+        `tags`. Folds in effective-priority tiers (priority + the per-op
+        offset rule); within a tier same-op records combine, and different
+        ops apply in the modifier_op_order tiebreak order."""
+        try:
+            running = float(base)
+        except (TypeError, ValueError):
+            running = 0.0
+        mods = self.gather_modifiers(eid, stat, tags, context)
+        if not mods:
+            return running
+        offsets = self._modifier_op_offsets()
+        order = [t.strip() for t in
+                 str(self.rules.get("modifier_op_order", "")).split(",") if t.strip()]
+
+        def order_key(op: str) -> int:
+            return order.index(op) if op in order else len(order)
+
+        for m in mods:
+            m["_eff"] = m["priority"] + offsets.get(m["op"], 0.0)
+        for tier in sorted({m["_eff"] for m in mods}):
+            tier_mods = [m for m in mods if m["_eff"] == tier]
+            for op in sorted({m["op"] for m in tier_mods}, key=order_key):
+                vals = [m["value"] for m in tier_mods if m["op"] == op]
+                running = self._apply_modifier_op(running, op, vals)
+        return running
 
     def _release_anchored_zones(self, eid: str) -> None:
         """Handle auras anchored to `eid` when it dies / leaves the match,
