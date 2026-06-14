@@ -834,6 +834,65 @@ More shipped work (continuing the list above):
   state-changing commands, HOST-ONLY by default, while plain `!map`/`!state`
   stay throwaway on-demand renders. Lives in the Discord adapter; the headless
   harness can't exercise it. The "push" half of per-channel POV.
+- **Locational / body-part damage — DESIGNED, NOT YET BUILT (in progress).**
+  The big locational-damage arc (scope ~ multi-tile entities). Design locked
+  with the user over a long discussion; reference the FCS3 combat-rules docx
+  (head=150% / chest=100% / stomach=70% / limbs=30% "damage to main",
+  directional hit-chance tables, armor coverage) and Helldivers 2's "% to
+  main" model. LOCKED DECISIONS:
+  - **Parts are real `Entity`s** in `match.entities`, flagged attached via a
+    protected `part_of=<parent_id>` entity FIELD (like `facing`/`owner`, not a
+    var). Parent's parts are DERIVED by scanning for `part_of==self` (no second
+    structure). A part's `x,y` MIRROR the parent's anchor, re-stamped on
+    `fire_entity_moved` (same hook+pattern as entity-anchored auras).
+  - **HP-less zones = `0/0` indestructible entities** (compatible with every
+    hp-assuming mechanic; an undefined-hp entity would be far worse to code).
+  - **`parent` reference token** (child→parent), resolves like
+    `self`/`this`/`current`; wire into `_ENTITY_TOKEN_NAMES`, the `_who_arg`
+    dynamic branch (literal-fallthrough trap), and hook-context resolution.
+    Parent→child stays primitive-based (`hit_location`, `damage_part`, a
+    parts-list helper).
+  - **Damage model = HD2 "% to main", default but heavily configurable.**
+    `damage_part(part, amount)` computes the to-main transfer EXPLICITLY from
+    pre-hit values (incoming + part hp read BEFORE mutation), applies it to the
+    parent via the NORMAL damage path (so parent clamp/hooks/death fire — this
+    is what kills HD2's uncapped Trooper), THEN writes the part's hp and lets
+    the normal `[0,max]` clamp do the `[0,0]` reset. Do NOT source the transfer
+    from clamp residue (fragile ordering — the user flagged this; assert-test
+    that the parent got the right amount AND the 0/0 part reads 0 after). Per-
+    part + gamerule knobs: `to_main_percent` (doc 30/100/150),
+    `to_main_cap` (`none`=uncapped/overflow · `max_hp`=HD2 default ·
+    `remaining_hp` · `absolute:<n>`; `none` auto for 0/0), `vital` (part death
+    kills parent), `independent` (part hp decoupled — dies only with parent),
+    `indestructible` (auto for max_hp==0).
+  - **Destroy effects** = the part's own `on_death`/passives (death-machinery
+    reuse); `vital` is a flag the death pipeline checks to cascade upward.
+  - **`hit_location(target, from_x, from_y[, aim, aim_weight])`** → part id;
+    three modes — uniform / directional-weighted (weights per part per side,
+    side from the shipped `side_hit`) / aimed (bias the aimed part, no
+    guarantee). Weights live in part data; RNG via the match RNG (replay-safe).
+  - **Creation:** template-driven via the existing summon machinery (a body
+    template auto-spawns+links parts) AND mid-match `!part attach/detach/edit`.
+  - **Detach** → the part becomes a free entity at the parent's cell, keeping
+    its state (a blown-off arm = a dead `0`-hp free entity; no corpse — an arm
+    corpse is pointless).
+  - **Parent death → cascade-kill all parts** via the configured kill function
+    (on_death/corpse rules fire per part). **Revive parent ⇒ revive all parts**
+    by default; a revive TARGETED at a part revives just that part.
+  - **AoE enumeration (THIS slice):** a query on the parent's cell returns just
+    the PARENT; part routing is via the part system.
+  DEFERRED TODOs (the user explicitly wants these tracked):
+  - **AoE damage SPREAD between main and limbs** based on per-system factors
+    (many combat systems want this; only "damage to main" for now).
+  - **Independently-LOCATED parts** (own cell, not glued to parent).
+  - **Part independently targetable by cell** (per game system) — needs more
+    discussion.
+  - Per-damage-TYPE `to_main_percent`; the **armor layer** (coverage % +
+    directional, damage-type AR-vs-ARP mitigation); the **to-hit roll**
+    (accuracy/evasion/suppression/spread, SEPARATE from hit-location); **AP/FP/
+    ARC action economy + reactionary actions** (block/dodge → the reaction
+    framework the choice-replay system seeded); fancier revive (regrow from
+    template).
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
