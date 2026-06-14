@@ -26,6 +26,29 @@ class CLICtx:
     async def send(self, message: str):
         print(message)
 
+    async def prompt_choice(self, prompt, options, lo, hi):
+        """Interactive mid-action choice prompt (choose / choose_number).
+        Returns the typed answer as a string, or None to cancel. Blocking
+        input() is fine here: the CLI's main loop is already awaiting this
+        command, and the engine is single-threaded."""
+        if options is not None:
+            shown = ", ".join(f"{i + 1}) {o}" for i, o in enumerate(options))
+            print(f"? {prompt}\n  {shown}\n  (type a value, or 'cancel')")
+        else:
+            print(f"? {prompt} (enter a number {lo}-{hi}, or 'cancel')")
+        try:
+            line = input("  > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not line:
+            return None
+        # Allow picking an option by its 1-based number, too.
+        if options is not None and line.isdigit():
+            idx = int(line) - 1
+            if 0 <= idx < len(options):
+                return options[idx]
+        return line
+
 def parse(line: str):
     try:
         return shlex.split(line)

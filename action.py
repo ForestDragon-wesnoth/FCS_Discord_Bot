@@ -131,6 +131,99 @@ class ActionValidationError(VTTError):
     pass
 
 
+class ChoiceNeeded(Exception):
+    """Raised by the choose() / choose_number() bindings when an action
+    body needs an interactive pick that hasn't been pre-supplied. The
+    TOP-LEVEL run_action catches it, rolls back the attempt, obtains an
+    answer (interactively, or fails cleanly if the surface can't prompt),
+    appends it to the answer queue, and re-runs the body from the top —
+    the replay model. Not an ActionFail (the action isn't aborting) and
+    not a FormulaError (the formula engine must let it pass through to the
+    runner — it's in eval_program's unwrapped-exception set).
+
+    `options` is the candidate list for choose(); None for choose_number(),
+    which carries an integer range in `lo`/`hi` instead."""
+    def __init__(self, prompt: str, options: Optional[List[Any]] = None, *,
+                 lo: Optional[int] = None, hi: Optional[int] = None):
+        super().__init__(prompt)
+        self.prompt = prompt
+        self.options = options
+        self.lo = lo
+        self.hi = hi
+
+
+# Answer tokens (any case) that mean "abort this action" at a prompt.
+CHOICE_CANCEL_TOKENS = frozenset({"cancel", "__cancel__"})
+
+# Sentinel for "the supplied answer matched no option".
+_CHOICE_MISS = object()
+
+
+def _match_option(raw: Any, options: List[Any]) -> Any:
+    """Match a supplied answer against an option list — exact value first,
+    then string-equality (so the CLI/Discord token "3" matches the int 3,
+    "fire" matches "fire"). Returns the matched OPTION (preserving its
+    original type) or _CHOICE_MISS."""
+    for opt in options:
+        if raw == opt or str(raw) == str(opt):
+            return opt
+    return _CHOICE_MISS
+
+
+def _snapshot_rng(match: "Match") -> Dict[str, Any]:
+    """Capture RNG state so the body replays the same random draws across
+    choice prompts (a roll BEFORE a choice stays stable). Covers both the
+    global RNG (unseeded) and the match-seeded RNG."""
+    import random
+    state: Dict[str, Any] = {"global": random.getstate()}
+    rng = getattr(match, "_rng", None)
+    if rng is not None:
+        state["match"] = rng.getstate()
+    return state
+
+
+def _restore_rng(match: "Match", state: Dict[str, Any]) -> None:
+    import random
+    random.setstate(state["global"])
+    rng = getattr(match, "_rng", None)
+    if rng is not None and "match" in state:
+        rng.setstate(state["match"])
+
+
+async def _obtain_answer(ctx: Any, nc: "ChoiceNeeded") -> Any:
+    """Get one interactive answer for a ChoiceNeeded. Uses the surface's
+    `prompt_choice(prompt, options, lo, hi)` coroutine if it has one (the
+    CLI); otherwise there's no way to ask, so raise ActionFail telling the
+    GM to pre-supply `answer=` tokens (the harness / a menu-less surface
+    path). Re-prompts on an invalid pick; a None / "cancel" reply aborts
+    the action (ActionFail). Returns a value choose()/choose_number() will
+    accept on replay."""
+    prompter = getattr(ctx, "prompt_choice", None)
+    if not callable(prompter):
+        raise ActionFail(
+            f"this action needs a choice ('{nc.prompt}') but no answer was "
+            f"supplied — pass it as an `answer=<value>` token, or run on a "
+            f"surface that can prompt.",
+            reason="needs_choice",
+        )
+    while True:
+        raw = await prompter(nc.prompt, nc.options, nc.lo, nc.hi)
+        if raw is None or (isinstance(raw, str)
+                           and raw.strip().lower() in CHOICE_CANCEL_TOKENS):
+            raise ActionFail("choice cancelled.", reason="cancelled")
+        if nc.options is not None:
+            if _match_option(raw, nc.options) is not _CHOICE_MISS:
+                return raw
+        else:
+            try:
+                n = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if nc.lo <= n <= nc.hi:
+                return n
+        # invalid -> loop and ask again
+
+
 class ActionEngineFault(Exception):
     """Engine-level refusal to keep running an action chain — the
     recursion limit was hit, an internal invariant broke, etc.
@@ -712,6 +805,7 @@ async def run_action(
     match: "Match",
     mgr: Any,           # MatchManager (kept loose to avoid import cycle)
     ctx: Any,           # ReplyContext for cmd()'s dispatch output
+    answers: Optional[List[Any]] = None,  # pre-supplied choose() answers
 ) -> Tuple[bool, Optional[str]]:
     """Execute an action body transactionally.
 
@@ -819,8 +913,10 @@ async def run_action(
         # asyncio.run, the scenario harness, or the live Discord
         # bot's running loop. The dispatcher's per-command snapshot is
         # suppressed because match._action_depth > 0 (set below).
+        # Use the CURRENT buffer (the replay loop swaps in a fresh one
+        # per attempt, so reference it dynamically rather than capturing).
         coro = registry.dispatch_no_snapshot(
-            tokens[0], tokens[1:], buffer_ctx, mgr,
+            tokens[0], tokens[1:], match._runtime_buffer or buffer_ctx, mgr,
         )
         _sync_dispatch(coro)
 
@@ -850,13 +946,105 @@ async def run_action(
             )
         raise ActionFail(message, reason=reason)
 
+    def _choose(prompt: Any, options: Any) -> Any:
+        """choose(prompt, options): present `options` (a list) and return
+        the chosen element. Consumes the next pre-supplied answer if any,
+        else raises ChoiceNeeded so the top-level runner prompts and
+        replays. A pre-supplied answer that matches no option (or the
+        reserved 'cancel' token) aborts the action."""
+        if not isinstance(options, (list, tuple)):
+            raise ActionFail(
+                "choose(prompt, options): options must be a list.",
+                reason="usage")
+        opts = list(options)
+        if not opts:
+            raise ActionFail(
+                f"choose('{prompt}', ...): the options list is empty.",
+                reason="usage")
+        cur = match._choice_cursor
+        ans = match._choice_answers
+        if cur < len(ans):
+            raw = ans[cur]
+            match._choice_cursor = cur + 1
+            if isinstance(raw, str) and raw.strip().lower() in CHOICE_CANCEL_TOKENS:
+                raise ActionFail("choice cancelled.", reason="cancelled")
+            picked = _match_option(raw, opts)
+            if picked is _CHOICE_MISS:
+                raise ActionFail(
+                    f"invalid choice {raw!r} for '{prompt}' "
+                    f"(options: {opts}).", reason="invalid_choice")
+            return picked
+        raise ChoiceNeeded(str(prompt), options=opts)
+
+    def _choose_number(prompt: Any, lo: Any, hi: Any) -> int:
+        """choose_number(prompt, lo, hi): return a chosen integer in
+        [lo, hi]. Same answer/replay model as choose()."""
+        try:
+            lo_i = int(lo); hi_i = int(hi)
+        except (TypeError, ValueError):
+            raise ActionFail(
+                "choose_number(prompt, lo, hi): lo and hi must be integers.",
+                reason="usage")
+        if lo_i > hi_i:
+            raise ActionFail(
+                f"choose_number('{prompt}', {lo_i}, {hi_i}): lo > hi.",
+                reason="usage")
+        cur = match._choice_cursor
+        ans = match._choice_answers
+        if cur < len(ans):
+            raw = ans[cur]
+            match._choice_cursor = cur + 1
+            if isinstance(raw, str) and raw.strip().lower() in CHOICE_CANCEL_TOKENS:
+                raise ActionFail("choice cancelled.", reason="cancelled")
+            try:
+                n = int(raw)
+            except (TypeError, ValueError):
+                raise ActionFail(
+                    f"invalid number {raw!r} for '{prompt}'.",
+                    reason="invalid_choice")
+            if not (lo_i <= n <= hi_i):
+                raise ActionFail(
+                    f"{n} out of range [{lo_i},{hi_i}] for '{prompt}'.",
+                    reason="invalid_choice")
+            return n
+        raise ChoiceNeeded(str(prompt), options=None, lo=lo_i, hi=hi_i)
+
     bindings = {
         "source": source,
         "args": args_proxy,
         "target": target,
         "cmd": _cmd,
         "fail": _fail,
+        "choose": _choose,
+        "choose_number": _choose_number,
     }
+
+    def _finish_action_fail(af: "ActionFail") -> Tuple[bool, Optional[str]]:
+        """Shared tail for a clean abort (body fail() OR a cancelled /
+        unanswerable choice). The caller has ALREADY rolled back to
+        pre-state; this resets depth, drops the buffer, fires
+        on_action_failed (passives see pre-action state), logs, and
+        returns the (False, (reason, message)) tuple."""
+        match._action_depth = pre_action_depth
+        if is_top_level:
+            match._runtime_buffer = None
+        match.fire_action_failed(
+            actor_id=actor_id,
+            action_name=action.name,
+            action_path=action.full_path,
+            target=target,
+            args=dict(args),
+            fail_reason=af.reason,
+            fail_message=af.message,
+        )
+        match.log_event(
+            "action_failed", actor=actor_id,
+            actor_name=match._entity_name(actor_id),
+            action=action.name, action_path=action.full_path,
+            target=_log_target_str(target),
+            reason=af.reason, message=af.message,
+        )
+        return False, (af.reason, af.message)
 
     match._action_depth += 1
     try:
@@ -865,71 +1053,79 @@ async def run_action(
             this=match.current_entity_id(),
             target=actor_id,
         )
-        try:
-            engine.eval_program(
-                action.body, eval_ctx,
-                action_mode=True,
-                action_bindings=bindings,
-            )
-        except ActionFail as af:
-            # Clean GM-initiated abort. Roll back to pre-state and
-            # surface as a (False, (reason, message)) return so the
-            # caller (use_action / the !action handler) can branch on
-            # it. Buffered command echoes are DISCARDED — the action
-            # rolled back, so its partial command output would be
-            # misleading.
-            _rollback_match(match, mgr, pre_state)
-            match._action_depth = pre_action_depth
+        # Mid-body choices use a REPLAY model: only the top-level
+        # invocation owns the loop + answer queue. It seeds the queue
+        # from pre-supplied `answer=` tokens, then re-runs the body once
+        # per interactive prompt (rolling back each attempt, replaying
+        # the same RNG draws) until the body completes without needing a
+        # new choice. A nested action just lets ChoiceNeeded propagate up
+        # to this loop.
+        if is_top_level:
+            match._choice_answers = list(answers or [])
+            rng_state = _snapshot_rng(match)
+            choice_limit = int(match.rules.get("action_choice_limit", 20))
+        while True:
             if is_top_level:
-                match._runtime_buffer = None
-            # Fire on_action_failed AFTER rollback so passives
-            # observing the failure see pre-action state (matching
-            # the on_action_used contract of "see settled state").
-            # Only the ACTOR-side passives fire — failed actions
-            # don't have a settled target side. Engine faults
-            # (recursion limit) deliberately skip this hook because
-            # they're bugs, not GM-controlled outcomes.
-            match.fire_action_failed(
-                actor_id=actor_id,
-                action_name=action.name,
-                action_path=action.full_path,
-                target=target,
-                args=dict(args),
-                fail_reason=af.reason,
-                fail_message=af.message,
-            )
-            match.log_event(
-                "action_failed", actor=actor_id,
-                actor_name=match._entity_name(actor_id),
-                action=action.name, action_path=action.full_path,
-                target=_log_target_str(target),
-                reason=af.reason, message=af.message,
-            )
-            return False, (af.reason, af.message)
-        except ActionEngineFault:
-            # Engine refusal (recursion limit etc.). Roll back AND
-            # re-raise — these don't get translated to a False
-            # return; they propagate up the chain so every level
-            # unwinds. The outermost !action handler surfaces the
-            # message via the dispatcher's `💥 ...` path.
-            _rollback_match(match, mgr, pre_state)
-            match._action_depth = pre_action_depth
-            if is_top_level:
-                match._runtime_buffer = None
-            raise
-        except Exception:
-            _rollback_match(match, mgr, pre_state)
-            match._action_depth = pre_action_depth
-            if is_top_level:
-                match._runtime_buffer = None
-            raise
+                match._choice_cursor = 0
+                _restore_rng(match, rng_state)
+                # Fresh output buffer per attempt — rolled-back attempts'
+                # command echoes must not leak into the committed run.
+                match._runtime_buffer = _BufferCtx(getattr(ctx, "channel_key", "CLI"))
+            try:
+                engine.eval_program(
+                    action.body, eval_ctx,
+                    action_mode=True,
+                    action_bindings=bindings,
+                )
+            except ChoiceNeeded as nc:
+                if not is_top_level:
+                    raise  # the top-level loop owns replay
+                _rollback_match(match, mgr, pre_state)
+                if len(match._choice_answers) >= choice_limit:
+                    match._action_depth = pre_action_depth
+                    match._runtime_buffer = None
+                    raise ActionEngineFault(
+                        f"action_choice_limit reached ({choice_limit}) in "
+                        f"`{action.name}` — the body asked for more choices "
+                        f"than the limit (likely an unbounded choose loop)."
+                    )
+                try:
+                    ans = await _obtain_answer(ctx, nc)
+                except ActionFail as af:
+                    return _finish_action_fail(af)
+                match._choice_answers.append(ans)
+                continue
+            except ActionFail as af:
+                # Clean GM-initiated abort. Roll back, then finish.
+                # Buffered command echoes are DISCARDED — the action
+                # rolled back, so its partial output would mislead.
+                _rollback_match(match, mgr, pre_state)
+                return _finish_action_fail(af)
+            except ActionEngineFault:
+                # Engine refusal (recursion / choice limit). Roll back
+                # AND re-raise so every level unwinds.
+                _rollback_match(match, mgr, pre_state)
+                match._action_depth = pre_action_depth
+                if is_top_level:
+                    match._runtime_buffer = None
+                raise
+            except Exception:
+                _rollback_match(match, mgr, pre_state)
+                match._action_depth = pre_action_depth
+                if is_top_level:
+                    match._runtime_buffer = None
+                raise
+            else:
+                break  # body completed without needing another choice
     finally:
-        # Defensive: ensure depth is back to where we started no
-        # matter how we exit. _rollback_match already restored it
-        # on the error paths, but a successful path needs to drop
-        # the increment here.
+        # Defensive: depth back to baseline no matter how we exit.
         if match._action_depth > pre_action_depth:
             match._action_depth = pre_action_depth
+        # The choice queue is per-invocation; clear it once the
+        # top-level call is done (success, fail, or error).
+        if is_top_level:
+            match._choice_answers = []
+            match._choice_cursor = 0
 
     # Successful completion. Fire the on_action_used hook AFTER the
     # body's writes have settled (so a passive observing this hook
@@ -1008,6 +1204,9 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
         "_rng", "_rng_seed",
         "_var_event_depth", "_var_event_warned", "_var_event_warnings",
         "_action_depth", "_runtime_buffer",
+        # The mid-body choice queue + cursor must survive an action's
+        # rollback-and-retry (the whole point of replay).
+        "_choice_answers", "_choice_cursor",
     )
     preserved = {a: getattr(match, a) for a in preserved_attrs}
     # Replace serialized state. We iterate a snapshot of restored's
