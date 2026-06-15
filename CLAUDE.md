@@ -901,9 +901,16 @@ More shipped work (continuing the list above):
   DEFERRED TODOs (the user explicitly wants these tracked):
   - **AoE damage SPREAD between main and limbs** based on per-system factors
     (many combat systems want this; only "damage to main" for now).
-  - **Independently-LOCATED parts** (own cell, not glued to parent).
-  - **Part independently targetable by cell** (per game system) — needs more
-    discussion.
+  - **Independently-LOCATED parts — SHIPPED (scenario 406).** A part with the
+    `__part_located` var keeps its OWN cell: `Entity.is_located_part` /
+    `is_glued_part` (the new skip-surface predicate — glued parts only).
+    A located part is NOT re-stamped to the parent and NOT hidden — it
+    renders, occupies (occupancy enforced on placement), is targetable, and
+    sees/is-seen; it still routes damage / resolves `parent` / dies + revives
+    with the parent (revive restores it at its own stored cell). `!part
+    locate <part> <x> <y>` / `!part glue <part>` (+ Match.locate_part /
+    glue_part). Parent move does NOT drag it. Per-cell independent TARGETING
+    (selecting the part by clicking its cell) still TBD per game system.
   - Per-damage-TYPE `to_main_percent`; the **armor layer** (coverage % +
     directional, damage-type AR-vs-ARP mitigation); the **to-hit roll**
     (accuracy/evasion/suppression/spread, SEPARATE from hit-location); **AP/FP/
@@ -941,13 +948,19 @@ More shipped work (continuing the list above):
     `priority` pulls it into its own tier.
   - **Surface:** formula prims `apply_mods(entity, stat, base, tags, target=,
     attacker=, defender=, other=)` → number and `list_mods(...)` → the active
-    records (introspection / `len()` checks). Read-only `!mod show <eid> <stat>
-    [base] [tag ...]` renders the active modifiers + folded result (context-
-    dependent ones show only when their condition resolves context-free).
-    Scenarios 399-400. FUTURE the user may want: more context roles; modifier
-    `source` tracking in the breakdown; per-stat caps; modifiers that
-    themselves grant tags. This is groundwork the combat refactor (damage
-    types, armor AR-vs-ARP, to-hit) will lean on.
+    records (each carries a `source` label). Read-only `!mod show <eid> <stat>
+    [base] [tag ...]` renders the active modifiers (with [source]) + folded
+    result (context-dependent ones show only when their condition resolves
+    context-free). Scenarios 399-400.
+  - **C1 follow-ups SHIPPED (scenario 405):** (a) `source` tracking —
+    `_raw_modifier_records` returns (record, source) labels like
+    `status:burning.fireboost` / `equipped.sword.0`; (b) per-stat caps — the
+    `modifier_stat_caps` rule (CSV `stat:lo:hi`, lo/hi optional) clamps the
+    FINAL value even with no modifiers (per-entity caps stay the min/max ops);
+    (c) tag-granting — a record's `grants_tags` expands the query tag set in a
+    single pre-pass (no chain-granting). FUTURE: more context roles. This is
+    groundwork the combat refactor (damage types, armor AR-vs-ARP, to-hit)
+    will lean on.
 - **Text-renderer customization (glyphs + color) — SHIPPED (entities, v1).**
   Two ways to tell units apart in the ASCII renderer, both config-as-vars.
   - **Custom glyphs** (universal, no ANSI): `Match.entity_glyph(e)` resolves a

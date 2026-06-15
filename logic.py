@@ -424,6 +424,18 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "within a tier. Ops not listed sort last (then by source order)."
         ),
     },
+    "modifier_stat_caps": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "Global per-stat clamps on apply_mods' FINAL value, a safety net "
+            "applied even when no modifiers are present (per-ENTITY caps come "
+            "from the min/max modifier ops instead). Format `stat:lo:hi` "
+            "entries, comma-separated; lo and hi are each optional (blank = "
+            "unbounded), e.g. `damage_dealt::500,evasion:0:95`. Empty = no "
+            "caps."
+        ),
+    },
     # --- Entity footprint (multi-tile / large entities) ---
     # The W×H rectangle a "large" entity occupies lives in two entity
     # vars named by these rules; absent / non-positive = 1 (an ordinary
@@ -3100,6 +3112,23 @@ class Entity:
         return bool(po) and self._match is not None and po in self._match.entities
 
     @property
+    def is_located_part(self) -> bool:
+        """True for a body part that lives on its OWN cell rather than being
+        glued to the parent's (the `__part_located` var). It still routes
+        damage / resolves `parent` / dies with the parent, but it is NOT
+        re-stamped to the parent's position and NOT hidden from the map —
+        it renders, occupies, is targetable, and sees/is-seen normally (a
+        turret you can flank separately)."""
+        return self.is_part and bool(self.vars.get("__part_located"))
+
+    @property
+    def is_glued_part(self) -> bool:
+        """A body part glued to the parent's cell (the default) — mirrors
+        the parent's position and is skipped by the map-facing surface. The
+        skip-surface predicate (a LOCATED part is on the map normally)."""
+        return self.is_part and not bool(self.vars.get("__part_located"))
+
+    @property
     def is_cell_stackable(self) -> bool:
         """True when this entity's `__cell_stackable` var is truthy.
         A stackable entity (a) doesn't count as occupying its cell for
@@ -4683,7 +4712,9 @@ class Match:
         if parent is None:
             return
         for e in self.entities.values():
-            if e.part_of == parent_id and (e.x != parent.x or e.y != parent.y):
+            # Located parts keep their own cell — only glued parts ride along.
+            if e.part_of == parent_id and not e.vars.get("__part_located") \
+                    and (e.x != parent.x or e.y != parent.y):
                 e.x = parent.x
                 e.y = parent.y
 
@@ -4742,6 +4773,41 @@ class Match:
         self._rebuild_turn_order()
         return p
 
+    def locate_part(self, part_id: str, x: int, y: int) -> "Entity":
+        """Make a body part INDEPENDENTLY LOCATED at (x, y): it stays
+        part_of-linked (damage routing, the parent token, death/revive) but
+        keeps its own cell — no longer re-stamped to the parent, and visible
+        on the map (renders, occupies, targetable). Enforces bounds +
+        occupancy at the destination. Raises NotFound / VTTError."""
+        p = self.entities.get(part_id)
+        if p is None:
+            raise NotFound(f"Entity '{part_id}' not found.")
+        if not p.part_of:
+            raise VTTError(f"`{part_id}` is not a body part.")
+        had = p.vars.get("__part_located")
+        p.vars["__part_located"] = True   # set first so the occupancy gate engages
+        try:
+            self._validate_placement(p, x, y, None)
+        except VTTError:
+            if had is None:
+                p.vars.pop("__part_located", None)
+            raise
+        p.move_to(x, y)
+        return p
+
+    def glue_part(self, part_id: str) -> "Entity":
+        """Re-glue a located part to its parent — it snaps back to the
+        parent's cell and resumes being hidden/mirrored. Raises NotFound /
+        VTTError (not a part)."""
+        p = self.entities.get(part_id)
+        if p is None:
+            raise NotFound(f"Entity '{part_id}' not found.")
+        if not p.part_of:
+            raise VTTError(f"`{part_id}` is not a body part.")
+        p.vars.pop("__part_located", None)
+        self._restamp_parts_for(p.part_of)
+        return p
+
     # ---------- stat modifiers (derived / effective stats) ----------
     # Base stats stay plain vars (never mutated); a modifier is a data
     # record aggregated live from its source and combined on demand. See
@@ -4764,15 +4830,20 @@ class Match:
         return roots
 
     @staticmethod
-    def _modifier_dicts(bundle: Any) -> List[dict]:
-        """The modifier records in a `modifiers` bundle, which may be a LIST
-        of records or a DICT of named records (the dict form is what
-        `!ent set_var hero modifiers.fireboost.op add` builds)."""
+    def _bundle_items(bundle: Any) -> List[Tuple[str, dict]]:
+        """(key, record) for each modifier record in a `modifiers` bundle —
+        a LIST (key = index) or a DICT of named records (key = name; the
+        form `!ent set_var hero modifiers.fireboost.op add` builds). The
+        key feeds the source label for breakdowns."""
         if isinstance(bundle, list):
-            return [m for m in bundle if isinstance(m, dict)]
+            return [(str(i), m) for i, m in enumerate(bundle) if isinstance(m, dict)]
         if isinstance(bundle, dict):
-            return [m for m in bundle.values() if isinstance(m, dict)]
+            return [(str(k), m) for k, m in bundle.items() if isinstance(m, dict)]
         return []
+
+    @staticmethod
+    def _mod_source(base: str, key: str) -> str:
+        return f"{base}.{key}" if base else str(key)
 
     @staticmethod
     def _modifier_tagset(raw: Any) -> "set[str]":
@@ -4784,31 +4855,39 @@ class Match:
             return {str(t) for t in raw}
         return set()
 
-    def _walk_modifier_bundles(self, node: Any, out: List[dict]) -> None:
-        """Collect every `modifiers` bundle (list or dict of records) found
-        anywhere under `node` (dicts recursed; bundles not descended)."""
+    def _walk_modifier_bundles(self, node: Any, base: str,
+                               out: List[Tuple[dict, str]]) -> None:
+        """Collect every `modifiers` bundle found anywhere under `node`
+        (dicts recursed; bundles not descended), tagging each record with
+        its source path (`base` is the path of `node`)."""
         if isinstance(node, dict):
             if "modifiers" in node:
-                out.extend(self._modifier_dicts(node["modifiers"]))
+                for key, rec in self._bundle_items(node["modifiers"]):
+                    out.append((rec, self._mod_source(base, key)))
             for k, v in node.items():
                 if k == "modifiers":
                     continue
-                self._walk_modifier_bundles(v, out)
+                child = f"{base}.{k}" if base else str(k)
+                self._walk_modifier_bundles(v, child, out)
         elif isinstance(node, list):
-            for it in node:
-                self._walk_modifier_bundles(it, out)
+            for i, it in enumerate(node):
+                child = f"{base}[{i}]" if base else f"[{i}]"
+                self._walk_modifier_bundles(it, child, out)
 
-    def _raw_modifier_records(self, e: "Entity") -> List[dict]:
-        """Every modifier record contributing to `e`, aggregated live from
+    def _raw_modifier_records(self, e: "Entity") -> List[Tuple[dict, str]]:
+        """Every (record, source) contributing to `e`, aggregated live from
         its sources: each status instance's `modifiers`, the direct
-        `entity.modifiers` slot, and each scan-root subtree. A bundle may
-        be a list of records or a dict of named records."""
-        out: List[dict] = []
-        for sdata in e.status.values():
+        `entity.modifiers` slot, and each scan-root subtree. Source is a
+        readable label (e.g. `status:burning.fireboost`, `equipped.sword.0`)
+        for the list_mods breakdown."""
+        out: List[Tuple[dict, str]] = []
+        for sname, sdata in e.status.items():
             if isinstance(sdata, dict) and "modifiers" in sdata:
-                out.extend(self._modifier_dicts(sdata["modifiers"]))
+                for key, rec in self._bundle_items(sdata["modifiers"]):
+                    out.append((rec, self._mod_source(f"status:{sname}", key)))
         if "modifiers" in e.vars:
-            out.extend(self._modifier_dicts(e.vars["modifiers"]))
+            for key, rec in self._bundle_items(e.vars["modifiers"]):
+                out.append((rec, self._mod_source("modifiers", key)))
         for root in self._effective_modifier_sources(e):
             node: Any = e.vars
             ok = True
@@ -4819,7 +4898,7 @@ class Match:
                     ok = False
                     break
             if ok:
-                self._walk_modifier_bundles(node, out)
+                self._walk_modifier_bundles(node, root, out)
         return out
 
     def gather_modifiers(self, eid: str, stat: str, tags: Any,
@@ -4827,8 +4906,15 @@ class Match:
         """The active modifier records on `eid` for `stat` + `tags`:
         filtered by stat name, tag subset (required ⊆ query) and negative
         tags (excluded ∩ query empty) and condition, with value formulas
-        resolved to numbers. The introspection half of the system (list_mods)
-        and the input to apply_modifiers' fold."""
+        resolved to numbers and each record tagged with its `source`. The
+        introspection half of the system (list_mods) and the input to
+        apply_modifiers' fold.
+
+        Tag-granting: a record's `grants_tags` adds tags to the query in a
+        single pre-pass (the granting record must itself pass stat +
+        required tags vs the ORIGINAL query + not_tags + condition); the
+        main filter then runs against the expanded tag set. Single-pass —
+        a granted tag can activate other modifiers but not chain-grant."""
         e = self.entities.get(eid)
         if e is None:
             raise NotFound(f"Entity '{eid}' not found.")
@@ -4844,23 +4930,46 @@ class Match:
                 EvalCtx(this=this_id, target=eid, extras=dict(context)),
             )
 
-        out: List[dict] = []
-        for m in self._raw_modifier_records(e):
+        def _cond_ok(m: dict) -> bool:
+            cond = m.get("condition", "")
+            if not cond:
+                return True
+            try:
+                return bool(_ev(cond))
+            except FormulaError:
+                return False          # malformed condition -> inactive (fail safe)
+
+        records = self._raw_modifier_records(e)
+
+        # Pass 1: expand the query tag set from grants_tags (vs original tags).
+        granted: "set[str]" = set()
+        for m, _src in records:
+            if not m.get("grants_tags"):
+                continue
             if str(m.get("stat", "")) != str(stat):
                 continue
             req = self._modifier_tagset(m.get("tags"))
-            if not req <= tagset:
+            notg = self._modifier_tagset(m.get("not_tags"))
+            if not (req <= tagset) or (notg & tagset):
+                continue
+            if not _cond_ok(m):
+                continue
+            granted |= self._modifier_tagset(m.get("grants_tags"))
+        eff_tags = tagset | granted
+
+        # Pass 2: filter + resolve against the expanded tag set.
+        out: List[dict] = []
+        for m, src in records:
+            if str(m.get("stat", "")) != str(stat):
+                continue
+            req = self._modifier_tagset(m.get("tags"))
+            if not req <= eff_tags:
                 continue
             notg = self._modifier_tagset(m.get("not_tags"))
-            if notg & tagset:
+            if notg & eff_tags:
                 continue
-            cond = m.get("condition", "")
-            if cond:
-                try:
-                    if not _ev(cond):
-                        continue
-                except FormulaError:
-                    continue          # malformed condition -> inactive (fail safe)
+            if not _cond_ok(m):
+                continue
             raw_val = m.get("value", 0)
             if isinstance(raw_val, str):
                 try:
@@ -4881,6 +4990,7 @@ class Match:
                 "priority": pri,
                 "tags": sorted(req),
                 "not_tags": sorted(notg),
+                "source": src,
             })
         return out
 
@@ -4927,7 +5037,7 @@ class Match:
             running = 0.0
         mods = self.gather_modifiers(eid, stat, tags, context)
         if not mods:
-            return running
+            return self._apply_stat_cap(stat, running)
         offsets = self._modifier_op_offsets()
         order = [t.strip() for t in
                  str(self.rules.get("modifier_op_order", "")).split(",") if t.strip()]
@@ -4942,7 +5052,35 @@ class Match:
             for op in sorted({m["op"] for m in tier_mods}, key=order_key):
                 vals = [m["value"] for m in tier_mods if m["op"] == op]
                 running = self._apply_modifier_op(running, op, vals)
-        return running
+        return self._apply_stat_cap(stat, running)
+
+    def _apply_stat_cap(self, stat: str, value: float) -> float:
+        """Clamp the folded value to the per-stat [lo, hi] from the
+        modifier_stat_caps rule (a global safety net, applied even with no
+        modifiers; per-entity caps use the min/max modifier ops). Rule
+        format: `stat:lo:hi` entries, comma-separated, lo/hi each optional
+        (blank = unbounded)."""
+        raw = str(self.rules.get("modifier_stat_caps", ""))
+        if not raw:
+            return value
+        for tok in raw.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            parts = tok.split(":")
+            if len(parts) < 2 or parts[0].strip() != str(stat):
+                continue
+            try:
+                lo = float(parts[1]) if parts[1].strip() else None
+                hi = float(parts[2]) if len(parts) > 2 and parts[2].strip() else None
+            except ValueError:
+                continue
+            if lo is not None and value < lo:
+                value = lo
+            if hi is not None and value > hi:
+                value = hi
+            return value
+        return value
 
     def _release_anchored_zones(self, eid: str) -> None:
         """Handle auras anchored to `eid` when it dies / leaves the match,
@@ -5027,7 +5165,7 @@ class Match:
         cells = z["cells"]
         return [
             eid for eid, e in self.entities.items()
-            if getattr(e, "is_alive", True) and not e.is_part
+            if getattr(e, "is_alive", True) and not e.is_glued_part
             and any(c in cells for c in self.entity_cells(e))
         ]
 
@@ -5442,7 +5580,7 @@ class Match:
         if not pov_team:
             return True
         for e in self.entities.values():
-            if e.is_alive and not e.is_part and e.team == pov_team and \
+            if e.is_alive and not e.is_glued_part and e.team == pov_team and \
                self._member_sees(e, x, y, los=los):
                 return True
         return False
@@ -5453,7 +5591,7 @@ class Match:
         if not pov_team:
             return True
         for e in self.entities.values():
-            if e.is_alive and not e.is_part and e.team == pov_team and \
+            if e.is_alive and not e.is_glued_part and e.team == pov_team and \
                self.has_los(e.id, e.x, e.y, x, y):
                 return True
         return False
@@ -5513,7 +5651,7 @@ class Match:
         seen = self.explored.setdefault(team, set())
         use_los = bool(self.rules.get("fog_los", False))
         for e in self.entities.values():
-            if not e.is_alive or e.is_part or e.team != team:
+            if not e.is_alive or e.is_glued_part or e.team != team:
                 continue
             r = self._vision_radius_of(e)
             # A large viewer reveals the UNION of every footprint cell's
@@ -5942,9 +6080,10 @@ class Match:
         for eid, e in self.entities.items():
             if eid in ignore:
                 continue
-            # Attached body parts ride on the parent's cell and never
-            # block — the parent is the occupant.
-            if e.is_part:
+            # Glued body parts ride on the parent's cell and never block —
+            # the parent is the occupant. A LOCATED part has its own cell
+            # and occupies it normally.
+            if e.is_glued_part:
                 continue
             if e.is_alive and not e.is_cell_stackable and self.entity_occupies(e, x, y):
                 return eid
@@ -5990,12 +6129,14 @@ class Match:
             if not self.in_bounds(cx, cy):
                 raise OutOfBounds(
                     f"({cx},{cy}) outside {self.grid_width}x{self.grid_height}")
-        # Attached body parts ride on the parent's cell and never collide
-        # (they're non-occupying), so they skip the occupancy gate just
-        # like a stackable entity. Keyed off the raw part_of field (not
-        # is_part) because spawn validates placement BEFORE binding the
-        # entity to the match, when is_part can't see the parent yet.
-        if not e.is_cell_stackable and not e.part_of:
+        # GLUED body parts ride on the parent's cell and never collide
+        # (non-occupying), so they skip the occupancy gate like a stackable
+        # entity. A LOCATED part (own cell) DOES get the occupancy check.
+        # Keyed off the raw part_of / __part_located vars (not the is_*
+        # properties) because spawn validates placement BEFORE binding the
+        # entity to the match, when those can't see the parent yet.
+        glued = bool(e.part_of) and not e.vars.get("__part_located")
+        if not e.is_cell_stackable and not glued:
             for cx, cy in cells:
                 if self.cell_occupant(cx, cy, (e.id,)) is not None:
                     raise Occupied(f"Cell ({cx},{cy}) already occupied")
@@ -8149,18 +8290,24 @@ class Match:
             # part already taking that id (somehow still alive) is skipped.
             for pd in stored_parts:
                 pdc = copy.deepcopy(pd)
-                pdc["x"] = x
-                pdc["y"] = y
+                # A glued part respawns at the parent's cell; a LOCATED part
+                # keeps its own snapshotted position.
+                located = bool((pdc.get("vars") or {}).get("__part_located"))
+                px = int(pdc.get("x", x)) if located else x
+                py = int(pdc.get("y", y)) if located else y
+                pdc["x"] = px
+                pdc["y"] = py
                 pid = str(pdc.get("id", ""))
                 if not pid or pid in self._taken_entity_ids():
                     continue
                 part_e = Entity.from_dict(pdc)
                 try:
-                    _, plog = part_e.spawn(self, x, y)
+                    _, plog = part_e.spawn(self, px, py)
                     spawn_log += plog
                 except VTTError:
-                    # A part that can't be placed (e.g. id clash) is skipped
-                    # rather than aborting the whole revive.
+                    # A part that can't be placed (e.g. id clash or its cell
+                    # is now occupied) is skipped rather than aborting the
+                    # whole revive.
                     pass
             # Run the revive-effects formula on the freshly-spawned entity
             # BEFORE on_revive so on_revive observers see the post-effect
@@ -9137,9 +9284,10 @@ class Match:
         for e in self.entities.values():
             if not getattr(e, "is_alive", True):
                 continue
-            # Attached body parts ride on the parent's cell — the parent
-            # draws the glyph; parts never paint their own.
-            if e.is_part:
+            # Glued body parts ride on the parent's cell — the parent draws
+            # the glyph; they never paint their own. A LOCATED part draws
+            # at its own cell.
+            if e.is_glued_part:
                 continue
             if not self.entity_visible_to(e.id, pov_team):
                 continue
@@ -9341,7 +9489,7 @@ class Match:
             # transparent). We hand-roll the loop here because
             # Match.is_occupied only takes a single ignore_entity_id.
             for other_eid, other_e in self.entities.items():
-                if other_eid in member_set or other_e.is_part:
+                if other_eid in member_set or other_e.is_glued_part:
                     continue
                 if other_e.x == x and other_e.y == y and other_e.is_alive:
                     raise Occupied(

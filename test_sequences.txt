@@ -10389,3 +10389,55 @@ a ⚠ advisory since it's not a palette name. The `gas` zone fills
 'tint')` → green, resolved per render). Layering is unchanged: a tile or
 entity sitting on a zone cell owns that cell's glyph and color. The plain
 harness map shows `T` on row 1 and `~ ~ ~` on row 2.
+
+
+SCENARIO 405 — Stat modifiers: source breakdown, tag-granting, per-stat cap
+---------------------------------------------------------------------------
+
+!match new mod3 MOD3 5 3
+!match use mod3
+!system set default modifier_stat_caps "dmg::20"
+!ent add hero Hero 100 2 2 9
+!ent set_var hero modifiers.wet.stat dmg
+!ent set_var hero modifiers.wet.op add
+!ent set_var hero modifiers.wet.value 0
+!ent set_var hero modifiers.wet.grants_tags wet
+!ent set_var hero modifiers.vswet.stat dmg
+!ent set_var hero modifiers.vswet.op inc%
+!ent set_var hero modifiers.vswet.value 100
+!ent set_var hero modifiers.vswet.tags wet
+!ent set_var hero modifiers.flat.stat dmg
+!ent set_var hero modifiers.flat.op add
+!ent set_var hero modifiers.flat.value 10
+!mod show hero dmg 10
+
+Expected: the `wet` modifier grants the `wet` tag in a single pre-pass,
+which activates `vswet` (+100% vs wet). Fold: base 10 + flat 10 = 20, ×2
+(vswet) = 40, then the modifier_stat_caps rule (`dmg::20`) clamps the FINAL
+value to 20. `!mod show` lists each active modifier WITH its [source] label
+(modifiers.flat / modifiers.vswet / modifiers.wet) and ends with the capped
+"→ base 10 becomes 20".
+
+
+SCENARIO 406 — Independently-located body parts
+-----------------------------------------------
+
+!match new lp LP 8 4
+!match use lp
+!ent add mech Mech 200 2 2 9
+!part add mech turret turret 30 30 to_main_percent=50
+!map
+!part locate turret 5 3
+!map
+!ent tp mech 6 1
+!map
+!part glue turret
+!map
+
+Expected: a part is glued to the parent by default — hidden from the map
+(the first `!map` shows only the mech arrow at (2,2)). `!part locate turret
+5 3` gives it its OWN cell: it now renders (an arrow at (5,3)) and occupies
+it, alongside the mech. Moving the mech to (6,1) does NOT drag the located
+turret — it stays at (5,3). It's still a part (damage_part still taps the
+mech, `parent` still resolves). `!part glue turret` snaps it back onto the
+parent's cell and hides it again (the last `!map` shows only the mech).
