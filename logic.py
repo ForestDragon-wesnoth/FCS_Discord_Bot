@@ -108,6 +108,16 @@ DIRECTION_ARROWS: Dict[str, str] = {
     "down_right": "\\",
 }
 
+# Facing name -> forward (dx, dy) in grid coords (x right, y down). Used to
+# project footprint cells into a part's facing-relative region (front/back/
+# left/right + corners). Diagonals are unnormalized (sign-only is what the
+# projection needs). Keys match DIRECTION_ARROWS / ALLOWED_DIRECTIONS.
+FACING_VECTORS: Dict[str, Tuple[int, int]] = {
+    "up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0),
+    "up_left": (-1, -1), "up_right": (1, -1),
+    "down_left": (-1, 1), "down_right": (1, 1),
+}
+
 # Named text colors -> ANSI SGR foreground codes, for the colorized text
 # renderer (Discord ```ansi blocks + ANSI terminals). The names are the
 # only valid values for an entity `color` var / a team color; an unknown
@@ -438,6 +448,19 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "that doesn't track it per-limb). Per-part override: the "
             "`__status_redirect` var (replaces this list when set). Checked "
             "after immunity; raw `!ent status` editing bypasses it."
+        ),
+    },
+    "part_custom_glyph_priority": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "When True (default), a body part overlapping its parent on the "
+            "map renders ABOVE the parent only if it has a CUSTOM glyph "
+            "(glyph / glyphs var) — a part on the default arrow yields to the "
+            "parent, so default-glyph region parts don't clobber the parent's "
+            "own glyph customization. False = the parent always wins on its "
+            "cells (overlapping parts never draw). Located parts on their own "
+            "cells are unaffected (no overlap)."
         ),
     },
     # --- Stat modifiers (derived/effective stats) ---
@@ -3180,11 +3203,24 @@ class Entity:
         return self.is_part and bool(self.vars.get("__part_located"))
 
     @property
+    def is_region_part(self) -> bool:
+        """True for a body part auto-positioned over a REGION of the parent's
+        footprint (the `__part_region` var: front/back/left/right/center/all
+        + corners, facing-aware). Its anchor follows the parent but its cells
+        are the region (derived by Match.part_region_cells), so a blast on the
+        parent's front hits the front part. On the map (not hidden) but
+        attached. Mutually exclusive with __part_located (located wins)."""
+        return (self.is_part and not self.vars.get("__part_located")
+                and bool(self.vars.get("__part_region")))
+
+    @property
     def is_glued_part(self) -> bool:
-        """A body part glued to the parent's cell (the default) — mirrors
-        the parent's position and is skipped by the map-facing surface. The
-        skip-surface predicate (a LOCATED part is on the map normally)."""
-        return self.is_part and not bool(self.vars.get("__part_located"))
+        """A body part glued to the parent's ANCHOR cell (the default) —
+        mirrors the parent's position and is skipped by the map-facing
+        surface. The skip-surface predicate; LOCATED and REGION parts are on
+        the map normally."""
+        return (self.is_part and not self.vars.get("__part_located")
+                and not self.vars.get("__part_region"))
 
     @property
     def is_cell_stackable(self) -> bool:
@@ -4850,21 +4886,95 @@ class Match:
             if had is None:
                 p.vars.pop("__part_located", None)
             raise
+        p.vars.pop("__part_region", None)   # locate and region are exclusive
         p.move_to(x, y)
         return p
 
     def glue_part(self, part_id: str) -> "Entity":
-        """Re-glue a located part to its parent — it snaps back to the
-        parent's cell and resumes being hidden/mirrored. Raises NotFound /
-        VTTError (not a part)."""
+        """Re-glue a part to its parent's anchor cell — clears both the
+        located and region modes; it resumes being hidden/mirrored. Raises
+        NotFound / VTTError (not a part)."""
         p = self.entities.get(part_id)
         if p is None:
             raise NotFound(f"Entity '{part_id}' not found.")
         if not p.part_of:
             raise VTTError(f"`{part_id}` is not a body part.")
         p.vars.pop("__part_located", None)
+        p.vars.pop("__part_region", None)
         self._restamp_parts_for(p.part_of)
         return p
+
+    _PART_REGIONS = frozenset({
+        "all", "front", "back", "left", "right", "center",
+        "front_left", "front_right", "back_left", "back_right",
+    })
+
+    def region_part(self, part_id: str, region: str) -> "Entity":
+        """Auto-position a part over a REGION of the parent's footprint
+        (facing-aware). Clears any manual location (exclusive). Raises
+        NotFound / VTTError (not a part / bad region)."""
+        p = self.entities.get(part_id)
+        if p is None:
+            raise NotFound(f"Entity '{part_id}' not found.")
+        if not p.part_of:
+            raise VTTError(f"`{part_id}` is not a body part.")
+        region = str(region).strip().lower()
+        if region not in self._PART_REGIONS:
+            raise VTTError(
+                f"unknown region '{region}'. Use one of: "
+                f"{', '.join(sorted(self._PART_REGIONS))}.")
+        p.vars.pop("__part_located", None)        # region and locate are exclusive
+        p.vars["__part_region"] = region
+        self._restamp_parts_for(p.part_of)        # snap anchor to the parent
+        return p
+
+    @staticmethod
+    def _region_match(region: str, fwd: float, rgt: float, eps: float) -> bool:
+        front, back = fwd > eps, fwd < -eps
+        right, left = rgt > eps, rgt < -eps
+        if region == "front": return front
+        if region == "back": return back
+        if region == "left": return left
+        if region == "right": return right
+        if region == "front_left": return front and left
+        if region == "front_right": return front and right
+        if region == "back_left": return back and left
+        if region == "back_right": return back and right
+        return False
+
+    def part_region_cells(self, p: "Entity") -> List[Tuple[int, int]]:
+        """The parent-footprint cells a region part occupies, facing-aware.
+        Each footprint cell is projected onto the parent's forward / right
+        axes (from the footprint center); the region selects by sign (full
+        8-way, so a diagonal facing yields a non-rectangular set). `all` =
+        every cell; `center` = the cell(s) at the center, falling back to
+        ALL when the footprint has no true center (even dimension). Falls
+        back to the part's own cell if the parent is gone."""
+        parent = self.entities.get(p.part_of) if p.part_of else None
+        if parent is None:
+            return [(p.x, p.y)]
+        region = str(p.vars.get("__part_region", "")).strip().lower()
+        cells = self.entity_cells(parent)
+        if not region or region == "all":
+            return list(cells)
+        w, h = self.entity_footprint(parent)
+        ccx = parent.x + (w - 1) / 2.0
+        ccy = parent.y + (h - 1) / 2.0
+        fdx, fdy = FACING_VECTORS.get(getattr(parent, "facing", "up"), (0, -1))
+        eps = 1e-9
+        if region == "center":
+            center = [(gx, gy) for (gx, gy) in cells
+                      if abs((gx - ccx) * fdx + (gy - ccy) * fdy) <= eps
+                      and abs((gx - ccx) * (-fdy) + (gy - ccy) * fdx) <= eps]
+            return center if center else list(cells)
+        sel = []
+        for (gx, gy) in cells:
+            dx, dy = gx - ccx, gy - ccy
+            fwd = dx * fdx + dy * fdy
+            rgt = dx * (-fdy) + dy * fdx
+            if self._region_match(region, fwd, rgt, eps):
+                sel.append((gx, gy))
+        return sel if sel else [(parent.x, parent.y)]
 
     # ---------- stat modifiers (derived / effective stats) ----------
     # Base stats stay plain vars (never mutated); a modifier is a data
@@ -6116,6 +6226,12 @@ class Match:
         """The list of (x, y) cells `e`'s footprint covers, anchored at
         (ax, ay) — defaulting to the entity's current position. Top-left
         anchored, row-major order (so [0] is always the anchor cell)."""
+        # A region part's cells are an explicit facing-derived set over the
+        # parent's footprint, not a rectangle (only for a current-position
+        # query — an ax/ay override means a movement sweep, which region
+        # parts don't do).
+        if ax is None and ay is None and e.is_region_part:
+            return self.part_region_cells(e)
         if ax is None:
             ax = e.x
         if ay is None:
@@ -8283,7 +8399,9 @@ class Match:
 
     def damage_spread(self, target_id: str, total: int,
                       mode: Optional[str] = None,
-                      fragments: Optional[int] = None) -> Tuple[int, List[str]]:
+                      fragments: Optional[int] = None,
+                      origin: Optional[Tuple[int, int]] = None,
+                      radius: Optional[int] = None) -> Tuple[int, List[str]]:
         """Distribute `total` area damage across `target_id`'s body parts,
         returning (to_main_dealt, log). Each part's share is routed via
         damage_part (so it taps the main per the part's to_main config). The
@@ -8293,7 +8411,12 @@ class Match:
         part's aoe_weight), `uniform` (equal), `fragment` (N discrete
         weighted-random hits — N = fragments or aoe_fragment_count), and
         `main_only` (ignore parts, hit the main HP directly). A target with
-        no parts (or weights all zero) takes the full `total` to main."""
+        no parts (or weights all zero) takes the full `total` to main.
+
+        Spatial: when `origin` (x, y) + `radius` are given, only parts with a
+        cell within `radius` (Chebyshev) of the origin are eligible — a blast
+        that doesn't reach the whole body (matters for located + footprint-
+        region parts). If the filter leaves no parts, the total goes to main."""
         target = self.entities.get(target_id)
         if target is None:
             raise NotFound(f"Entity '{target_id}' not found.")
@@ -8305,6 +8428,12 @@ class Match:
             str(self.rules.get("aoe_default_mode", "weighted"))
 
         parts = self.entity_parts(target_id)
+        if origin is not None and radius is not None:
+            ox, oy = int(origin[0]), int(origin[1])
+            r = int(radius)
+            parts = [p for p in parts
+                     if any(max(abs(cx - ox), abs(cy - oy)) <= r
+                            for (cx, cy) in self.entity_cells(p))]
 
         def _hit_main(amount: int) -> Tuple[int, List[str]]:
             """Fallback: deal `amount` straight to the target's main HP."""
@@ -9350,6 +9479,18 @@ class Match:
             return g
         return DIRECTION_ARROWS.get(facing, "@")
 
+    def entity_has_custom_glyph(self, e: "Entity") -> bool:
+        """True when `e` has a valid custom glyph (per-facing `glyphs` or the
+        single `glyph` var) rather than the default facing arrow — drives
+        the part-over-parent render priority."""
+        gd = e.vars.get("glyphs")
+        if isinstance(gd, dict):
+            gg = gd.get(getattr(e, "facing", ""))
+            if isinstance(gg, str) and len(gg) == 1:
+                return True
+        g = e.vars.get("glyph")
+        return isinstance(g, str) and len(g) == 1
+
     def entity_color(self, e: "Entity") -> Optional[str]:
         """The resolved color NAME for `e` (or None): its `color` var wins,
         else its team's color — the match team_colors map, defaulting to
@@ -9490,9 +9631,10 @@ class Match:
             if not getattr(e, "is_alive", True):
                 continue
             # Glued body parts ride on the parent's cell — the parent draws
-            # the glyph; they never paint their own. A LOCATED part draws
-            # at its own cell.
-            if e.is_glued_part:
+            # the glyph; they never paint their own. A LOCATED part draws at
+            # its own cell. REGION parts overlap the parent and are deferred
+            # to a priority pass below.
+            if e.is_glued_part or e.is_region_part:
                 continue
             if not self.entity_visible_to(e.id, pov_team):
                 continue
@@ -9502,6 +9644,24 @@ class Match:
                 if self.in_bounds(cx, cy):
                     grid[cy][cx] = sym
                     colors[cy][cx] = ecol
+
+        # Region-part priority pass: a region part overlaps its parent, so by
+        # default it only draws over the parent when it has a CUSTOM glyph (a
+        # default-glyph region part yields, so it doesn't clobber the parent's
+        # own customization). part_custom_glyph_priority=False = parent always
+        # wins. Drawn regardless of hp so structural 0/0 zones still show.
+        if bool(self.rules.get("part_custom_glyph_priority", True)):
+            for e in self.entities.values():
+                if not e.is_region_part or not self.entity_has_custom_glyph(e):
+                    continue
+                if not self.entity_visible_to(e.id, pov_team):
+                    continue
+                sym = self.entity_glyph(e)
+                ecol = self.entity_color(e)
+                for (cx, cy) in self.entity_cells(e):
+                    if self.in_bounds(cx, cy):
+                        grid[cy][cx] = sym
+                        colors[cy][cx] = ecol
 
         # Fog overlay (last): an unrevealed cell shows fog_glyph and no
         # color (fog hides whatever tint was there).

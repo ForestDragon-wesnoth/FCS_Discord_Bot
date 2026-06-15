@@ -6754,7 +6754,7 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 @registry.command(
     "part",
-    usage="!part <add|attach|detach|locate|glue|remove|list|info> ...",
+    usage="!part <add|attach|detach|locate|region|glue|remove|list|info> ...",
     desc=(
         "Body parts for locational damage. A part is a REAL entity attached "
         "to a parent (it gets hp/vars/statuses/passives/death for free) and "
@@ -6849,6 +6849,20 @@ async def part_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(
             f"`{part_id}` is now independently located at ({x},{y}) — it "
             f"keeps its own cell (no longer glued to the parent)."
+        )
+
+    if sub == "region":
+        if await return_help_if_not_enough_args(ctx, args, 3, "part", "region"):
+            return
+        part_id = _resolve_eid(m, args[1])
+        try:
+            p = m.region_part(part_id, args[2])
+        except (NotFound, VTTError) as ex:
+            return await ctx.send(f"❌ {ex}")
+        n = len(m.part_region_cells(p))
+        return await ctx.send(
+            f"`{part_id}` now covers the `{args[2].lower()}` region of its "
+            f"parent's footprint ({n} cell(s), facing-aware)."
         )
 
     if sub == "glue":
