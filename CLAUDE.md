@@ -1054,6 +1054,41 @@ More shipped work (continuing the list above):
     value (still stored — could be a formula). Entity color stays literal-var
     only (not formula) — unchanged. Scenario 404. Long-term someday: an
     actual image-rendered map.
+- **Range-band primitive — SHIPPED (scenario 411).** `band(value, spec,
+  default=None)` (a pure `_ALLOWED_FUNCS` func) looks `value` up in a banded
+  table `spec` ('1-2:120,3-5:100,6-9:80,10+:0'), FIRST match wins. Ranges:
+  `lo-hi` (inclusive), `n` (exact), `lo+`/`lo-` (lo and up), `-hi` (up to hi).
+  Result coerced to a number when numeric. No match → `default`, else raises.
+  Models the doc's munition falloff without a conditional chain.
+- **Reusable named macros — SHIPPED (scenario 412).** `Match.macros` (name ->
+  newline-separated command body). `!macro set/run/list/show/remove`. `run`
+  substitutes $1/$2/.../$@ (positional; missing → ""; leaves $(...) formula
+  tokens alone, via `_macro_subst`) then dispatches each line via
+  `dispatch_no_snapshot` — so the whole macro is ONE undo entry (the !macro
+  command itself is snapshotted). Per-match, serialized.
+- **Condition-watchers — SHIPPED (scenario 413).** `Match.watchers` (name ->
+  {condition, effect, once, last}). EDGE-triggered: `Match.fire_watchers`
+  evaluates each condition (a formula expr), records all edges, then runs the
+  effect (a formula program) for any that went false→true; `once` removes
+  after firing; malformed condition reads as not-met (fail-safe). Polled by
+  `CommandRegistry.run` AFTER each top-level command settles (single pass —
+  an effect's change is caught next poll, no loops; turn/round are covered
+  since they're commands). `!watch add <name> "<cond>" "<effect>" [once]` /
+  remove / list / show / check. `last` serialized so a reload doesn't
+  re-fire. Distinct from event passives: fires on the condition's transition
+  regardless of what changed it.
+- **Team-level state (resources + modifiers + passives) — SHIPPED (scenario
+  414).** `Match.team_data` (team -> free-form dict) + `team_passives` (team
+  -> {pid: Passive}). (1) Resources: `team_get/team_has/team_set/team_add`
+  (Match methods + formula prims; dotted paths) and `!team set/get/add/list/
+  clear`. (2) Team-scoped MODIFIERS: a `modifiers` bundle in a team's data
+  (e.g. `!team set red modifiers.rally.op add`) is aggregated by
+  `_raw_modifier_records` for every member (source `team:<team>`), so it
+  flows through apply_mods. (3) Team-scoped PASSIVES: `!team passive add
+  <team> <pid> <when> <formula>` — fire for any member (self = the member) via
+  the new `Match._firing_passives(target)` helper, which yields global + the
+  target's team passives and replaced the raw `global_passives` iteration at
+  every fire site. All serialized.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

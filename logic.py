@@ -4234,6 +4234,28 @@ class Match:
     # plain regardless.)
     color_enabled: bool = True
 
+    # ---- reusable named macros ----
+    # name -> a body of command lines (newline-separated). Run via `!macro
+    # run <name> [args...]`, which substitutes $1/$2/.../$@ and dispatches
+    # each line under one undo entry. Per-match; serialized.
+    macros: Dict[str, str] = field(default_factory=dict)
+
+    # ---- condition-watchers (edge-triggered triggers) ----
+    # name -> {"condition": <formula expr>, "effect": <formula program>,
+    # "once": bool, "last": bool}. Re-checked after each command + at turn/
+    # round boundaries; the effect fires when condition goes false->true.
+    # `last` is runtime edge-state (serialized so a reload doesn't re-fire).
+    watchers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    # ---- team-level state (resources + team-scoped modifiers) ----
+    # team -> free-form data dict (command points, morale, a `modifiers`
+    # bundle that applies to every member, etc.). Read/written via team_get
+    # / team_set / team_add. Serialized.
+    team_data: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # team -> {pid: Passive}: passives that fire for events on any member of
+    # the team (self = the member), alongside global + entity passives.
+    team_passives: Dict[str, Dict[str, "Passive"]] = field(default_factory=dict)
+
     # ---- runtime-only: pending approval queue ----
     # Requests from non-host users awaiting host approval, keyed by a
     # short per-match id ("r1", "r2", ...). Each value is a dict
@@ -5053,6 +5075,14 @@ class Match:
             if isinstance(sdata, dict) and "modifiers" in sdata:
                 for key, rec in self._bundle_items(sdata["modifiers"]):
                     out.append((rec, self._mod_source(f"status:{sname}", key)))
+        # Team-scoped modifiers: a `modifiers` bundle in the entity's team
+        # data applies to every member.
+        team = e.team
+        if team is not None:
+            tdata = self.team_data.get(team)
+            if isinstance(tdata, dict) and "modifiers" in tdata:
+                for key, rec in self._bundle_items(tdata["modifiers"]):
+                    out.append((rec, self._mod_source(f"team:{team}", key)))
         if "modifiers" in e.vars:
             for key, rec in self._bundle_items(e.vars["modifiers"]):
                 out.append((rec, self._mod_source("modifiers", key)))
@@ -5249,6 +5279,91 @@ class Match:
                 value = hi
             return value
         return value
+
+    # ---------- team-level state (resources + team modifiers) ----------
+    def team_get(self, team: str, path: str, default: Any = None) -> Any:
+        """Read a dotted path in a team's data dict (command points, morale,
+        a `modifiers` bundle, ...). `default` if absent."""
+        cur: Any = self.team_data.get(str(team))
+        if not isinstance(cur, dict):
+            return default
+        for seg in str(path).split("."):
+            if isinstance(cur, dict) and seg in cur:
+                cur = cur[seg]
+            else:
+                return default
+        return cur
+
+    def team_has(self, team: str, path: str) -> bool:
+        _sentinel = object()
+        return self.team_get(team, path, _sentinel) is not _sentinel
+
+    def team_set(self, team: str, path: str, value: Any) -> None:
+        """Set a dotted path in a team's data dict (creating it + nested
+        dicts as needed)."""
+        cur = self.team_data.setdefault(str(team), {})
+        segs = str(path).split(".")
+        for seg in segs[:-1]:
+            nxt = cur.get(seg)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                cur[seg] = nxt
+            cur = nxt
+        cur[segs[-1]] = value
+
+    def team_add(self, team: str, path: str, delta: float) -> Any:
+        """Add `delta` to a numeric team value (0 if absent). Returns the new
+        value."""
+        cur = self.team_get(team, path, 0) or 0
+        try:
+            new = cur + delta
+        except TypeError:
+            raise VTTError(f"team_add: `{team}`.{path} is not numeric.")
+        self.team_set(team, path, new)
+        return new
+
+    # ---------- condition-watchers (edge-triggered) ----------
+    def fire_watchers(self) -> List[str]:
+        """Re-check every watcher; fire its effect on a false->true edge
+        (the condition newly becoming true). Single pass per call — all edges
+        are recorded BEFORE any effect runs, so one effect can't perturb
+        another watcher's reading this pass (a change it makes is caught on
+        the next call). A `once` watcher is removed after firing. A malformed
+        condition reads as not-met (fail-safe). Returns effect-error notes."""
+        if not self.watchers:
+            return []
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        this_id = self.current_entity_id()
+        engine = FormulaEngine(self)
+        fired: List[str] = []
+        for name, w in list(self.watchers.items()):
+            cond = str(w.get("condition", "") or "")
+            now = False
+            if cond:
+                try:
+                    now = bool(engine.eval_expression(cond, EvalCtx(this=this_id)))
+                except FormulaError:
+                    now = False
+            was = bool(w.get("last", False))
+            w["last"] = now
+            if now and not was:
+                fired.append(name)
+        log: List[str] = []
+        for name in fired:
+            w = self.watchers.get(name)
+            if w is None:
+                continue
+            eff = str(w.get("effect", "") or "")
+            if eff:
+                try:
+                    FormulaEngine(self).eval_program(
+                        eff, EvalCtx(this=self.current_entity_id()))
+                except FormulaError as ex:
+                    log.append(f"⚠ watcher `{name}` effect error: {ex}")
+            self.log_event("watcher_fired", name=name)
+            if w.get("once"):
+                self.watchers.pop(name, None)
+        return log
 
     def _release_anchored_zones(self, eid: str) -> None:
         """Handle auras anchored to `eid` when it dies / leaves the match,
@@ -7572,7 +7687,7 @@ class Match:
         }
         ctx = EvalCtx(this=this_id, target=entity_id, extras=extras)
         log: List[str] = []
-        for p in self.global_passives.values():
+        for p in self._firing_passives(entity_id):
             if p.when == when:
                 log.append(_run_passive_safely(
                     engine, p, ctx, target_id=entity_id, is_global=True,
@@ -7668,7 +7783,7 @@ class Match:
         self.log_event("move", entity=entity_id, name=e.name,
                        from_x=from_x, from_y=from_y, to_x=to_x, to_y=to_y)
         log: List[str] = []
-        for p in self.global_passives.values():
+        for p in self._firing_passives(entity_id):
             if p.when == "on_entity_moved":
                 log.append(_run_passive_safely(
                     engine, p, ctx, target_id=entity_id, is_global=True,
@@ -7708,7 +7823,7 @@ class Match:
         }
         ctx = EvalCtx(this=this_id, target=entity_id, extras=extras)
         log: List[str] = []
-        for p in self.global_passives.values():
+        for p in self._firing_passives(entity_id):
             if p.when == "on_entity_step":
                 log.append(_run_passive_safely(
                     engine, p, ctx, target_id=entity_id, is_global=True,
@@ -7755,7 +7870,7 @@ class Match:
         }
         ctx = EvalCtx(this=this_id, target=actor_id, extras=extras)
         log: List[str] = []
-        for p in self.global_passives.values():
+        for p in self._firing_passives(actor_id):
             if p.when == "on_action_used":
                 log.append(_run_passive_safely(
                     engine, p, ctx, target_id=actor_id, is_global=True,
@@ -7801,7 +7916,7 @@ class Match:
         }
         ctx = EvalCtx(this=this_id, target=target_id, extras=extras)
         log: List[str] = []
-        for p in self.global_passives.values():
+        for p in self._firing_passives(target_id):
             if p.when == "on_action_used_on_target":
                 log.append(_run_passive_safely(
                     engine, p, ctx, target_id=target_id, is_global=True,
@@ -7850,7 +7965,7 @@ class Match:
         }
         ctx = EvalCtx(this=this_id, target=actor_id, extras=extras)
         log: List[str] = []
-        for p in self.global_passives.values():
+        for p in self._firing_passives(actor_id):
             if p.when == "on_action_failed":
                 log.append(_run_passive_safely(
                     engine, p, ctx, target_id=actor_id, is_global=True,
@@ -8710,6 +8825,17 @@ class Match:
             log.extend(self.fire_tile_hook(when, cur, x, y))
         return log
 
+    def _firing_passives(self, target_eid):
+        """Passives that fire for an event on `target_eid` (self = target):
+        the match's global passives PLUS the target entity's team passives.
+        Entity-owned passives are iterated separately at each fire site."""
+        yield from self.global_passives.values()
+        e = self.entities.get(target_eid) if target_eid else None
+        if e is not None and e.team is not None:
+            tp = self.team_passives.get(e.team)
+            if tp:
+                yield from tp.values()
+
     def fire_hook(self, when: str, *, target_ids: Optional[List[str]] = None) -> List[str]:
         """
         Fire every passive matching `when` for each target entity.
@@ -8741,7 +8867,7 @@ class Match:
                 continue
             ctx = EvalCtx(this=this_id, target=tid)
             # Globals first (in insertion order).
-            for pid, p in list(self.global_passives.items()):
+            for p in self._firing_passives(tid):
                 if p.when != when:
                     continue
                 log.append(_run_passive_safely(engine, p, ctx, target_id=tid, is_global=True))
@@ -8834,7 +8960,7 @@ class Match:
             ))
 
         # Wave 1: passives subscribed to the exact event kind
-        for p in self.global_passives.values():
+        for p in self._firing_passives(entity_id):
             if p.when == kind_hook:
                 _maybe_fire(p, is_global=True)
         for p in e.passives.values():
@@ -8842,7 +8968,7 @@ class Match:
                 _maybe_fire(p, is_global=False)
 
         # Wave 2: on_var_written catch-all passives
-        for p in self.global_passives.values():
+        for p in self._firing_passives(entity_id):
             if p.when == "on_var_written":
                 _maybe_fire(p, is_global=True)
         for p in e.passives.values():
@@ -8948,7 +9074,7 @@ class Match:
 
         # ONLY fire passives subscribed to on_var_write_attempt. We do NOT
         # fire on_var_written here — see comment on _fire_var_attempt.
-        for p in self.global_passives.values():
+        for p in self._firing_passives(entity_id):
             if p.when == "on_var_write_attempt":
                 _maybe_fire(p, is_global=True)
         for p in e.passives.values():
@@ -9292,6 +9418,13 @@ class Match:
                 for name, fn in sorted(self.formula_functions.items())
             },
             "aliases": dict(self.aliases),
+            "macros": dict(self.macros),
+            "watchers": copy.deepcopy(self.watchers),
+            "team_data": copy.deepcopy(self.team_data),
+            "team_passives": {
+                team: {pid: p.to_dict() for pid, p in d.items()}
+                for team, d in self.team_passives.items()
+            },
             "vars": copy.deepcopy(self.vars),
             "scheduled": copy.deepcopy(self.scheduled),
             "event_log": copy.deepcopy(self.event_log),
@@ -9405,6 +9538,31 @@ class Match:
             str(k): str(v) for k, v in raw_aliases.items()
             if isinstance(k, str) and isinstance(v, str)
         }
+        raw_macros = d.get("macros", {}) or {}
+        m.macros = {
+            str(k): str(v) for k, v in raw_macros.items()
+            if isinstance(k, str) and isinstance(v, str)
+        }
+        raw_watch = d.get("watchers", {}) or {}
+        m.watchers = {
+            str(k): dict(v) for k, v in raw_watch.items()
+            if isinstance(k, str) and isinstance(v, dict)
+        } if isinstance(raw_watch, dict) else {}
+        raw_td = d.get("team_data", {}) or {}
+        m.team_data = {
+            str(k): copy.deepcopy(v) for k, v in raw_td.items()
+            if isinstance(k, str) and isinstance(v, dict)
+        } if isinstance(raw_td, dict) else {}
+        raw_tp = d.get("team_passives", {}) or {}
+        m.team_passives = {}
+        if isinstance(raw_tp, dict):
+            for team, pd in raw_tp.items():
+                if not isinstance(team, str) or not isinstance(pd, dict):
+                    continue
+                m.team_passives[team] = {
+                    str(pid): Passive.from_dict(spec)
+                    for pid, spec in pd.items() if isinstance(spec, dict)
+                }
         raw_vars = d.get("vars", {})
         m.vars = copy.deepcopy(raw_vars) if isinstance(raw_vars, dict) else {}
         raw_sched = d.get("scheduled", [])

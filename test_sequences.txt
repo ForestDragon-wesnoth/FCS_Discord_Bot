@@ -10543,3 +10543,88 @@ with a cell reaching that point — the head (front row, which includes (4,2))
 but NOT the tail (back row). So the whole 80 lands on the head (150%→main =
 120); dragon main 400 → 280, gunner.dealt = 120, the tail untouched. That's
 how a blast that doesn't reach the whole big body is modeled.
+
+
+SCENARIO 411 — Range-band falloff (band primitive)
+--------------------------------------------------
+
+!match new rb RB 12 3
+!match use rb
+!ent add archer Archer 50 1 2 9
+!ent add t1 T1 200 3 2 5
+!ent add t2 T2 200 6 2 5
+!ent add t3 T3 200 11 2 5
+!ent set_var archer actions.shoot.target entity
+!ent set_var archer actions.shoot.body "entity[target].hp = entity[target].hp - band(distance(entity[self].x, entity[self].y, entity[target].x, entity[target].y), '1-2:120,3-5:100,6-9:80,10+:0')"
+!action archer shoot t1
+!action archer shoot t2
+!action archer shoot t3
+!list
+
+Expected: `shoot` deals damage by range band. archer at (1,2): t1 (3,2) is
+distance 2 → band 1-2 → 120 (200→80); t2 (6,2) is distance 5 → band 3-5 →
+100 (200→100); t3 (11,2) is distance 10 → band 10+ → 0 (untouched, 200).
+band(value, spec) returns the first matching band's result — the doc's
+munition falloff without a chain of conditionals.
+
+
+SCENARIO 412 — Reusable macro with positional args
+--------------------------------------------------
+
+!match new mc MC 8 4
+!match use mc
+!ent add hero Hero 100 2 2 9
+!macro set buff "ent set_var $1 blessed 1\nent set_var $1 power $2"
+!macro run buff hero 7
+!ent dump hero
+!macro list
+
+Expected: `macro set` stores a two-line sequence using $1/$2. `macro run
+buff hero 7` substitutes $1=hero, $2=7 and runs both lines as ONE undo
+entry, so hero gets blessed=1 and power=7. `macro list` shows `buff`.
+
+
+SCENARIO 413 — Condition-watcher (edge-triggered)
+-------------------------------------------------
+
+!match new wt WT 8 4
+!match use wt
+!ent add hero Hero 100 2 2 9
+!watch add lowhp "entity[hero].hp < 50" "entity[hero].alarms = var_get('hero', 'alarms', 0) + 1"
+!ent hp hero -60
+!ent dump hero
+!ent hp hero -10
+!ent dump hero
+
+Expected: the watcher fires when hero's hp crosses below 50. `ent hp hero
+-60` (hp 40) trips the false→true edge on the post-command check, so the
+effect runs once → alarms=1. A further `-10` (hp 30) keeps the condition
+true (no NEW edge), so alarms STAYS 1 — watchers fire on the transition,
+not every poll. (Re-arms only after the condition goes false again.)
+
+
+SCENARIO 414 — Team resources + team-scoped modifiers
+-----------------------------------------------------
+
+!match new tm TM 8 4
+!match use tm
+!ent add red1 Red1 100 2 2 9
+!ent set_var red1 team red
+!ent add blue1 Blue1 100 5 2 5
+!ent set_var blue1 team blue
+!team set red command_points 3
+!team add red command_points 2
+!team set red modifiers.rally.stat atk
+!team set red modifiers.rally.op add
+!team set red modifiers.rally.value 10
+!team passive add red onrnd on_round_start "entity[self].rallied = 1"
+!mod show red1 atk 5
+!mod show blue1 atk 5
+!team get red command_points
+
+Expected: team `red` has a shared pool — command_points 3, then +2 = 5
+(team_get/team_set/team_add). Its `modifiers.rally` (+10 atk) auto-applies
+to every red member: `!mod show red1 atk 5` folds to 15 (5 base + 10, source
+`team:red`), while blue1 (other team) stays 5. The team passive `onrnd`
+fires for red members on round start (self = the member). `!team get` reads
+the pool back.

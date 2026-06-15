@@ -859,6 +859,52 @@ def _clamp(v: Any, lo: Any, hi: Any) -> Any:
     return v
 
 
+def _band(value: Any, spec: Any, default: Any = None) -> Any:
+    """band(value, spec, default=None): look `value` up in a banded table and
+    return the matching band's result (FIRST match wins). `spec` is a comma-
+    separated list of `range:result` entries; a range is `lo-hi` (inclusive),
+    `n` (exact), `lo+` / `lo-` (lo and up), or `-hi` (up to hi). Models the
+    doc's munition falloff, e.g. band(dist, "1-2:120,3-5:100,6-9:80,10+:0").
+    Result is coerced to a number when numeric, else left a string. No band
+    matches -> `default` if given, else a FormulaError."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise FormulaError("band(value, ...): value must be a number.")
+    if not isinstance(spec, str):
+        raise FormulaError("band(value, spec, ...): spec must be a string.")
+    for entry in spec.split(","):
+        entry = entry.strip()
+        if not entry or ":" not in entry:
+            continue
+        rng, _, res = entry.partition(":")
+        rng = rng.strip()
+        try:
+            if rng.endswith("+") or rng.endswith("-"):
+                lo, hi = float(rng[:-1]), None
+            elif rng.startswith("-"):
+                lo, hi = None, float(rng[1:])
+            elif "-" in rng:
+                a, b = rng.split("-", 1)
+                lo, hi = float(a), float(b)
+            else:
+                lo = hi = float(rng)
+        except ValueError:
+            continue          # malformed entry -> skip it
+        if (lo is None or value >= lo) and (hi is None or value <= hi):
+            res = res.strip()
+            try:
+                return int(res)
+            except ValueError:
+                pass
+            try:
+                return float(res)
+            except ValueError:
+                return res
+    if default is not None:
+        return default
+    raise FormulaError(
+        f"band({value}, ...): no band matched and no default was given.")
+
+
 def _sign(v: Any) -> int:
     """sign(value): -1 if negative, 0 if zero, 1 if positive. Returns an
     int regardless of input type so it composes cleanly with int math."""
@@ -1195,6 +1241,7 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
     "ceil": _ceil,
     "pow": _pow,
     "clamp": _clamp,
+    "band": _band,
     "sign": _sign,
     "cells_in_burst": _cells_in_burst,
     "cells_in_line": _cells_in_line,
@@ -1484,6 +1531,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     "parts", "part", "has_part", "part_of", "damage_part", "damage_spread",
     # Stat modifiers (derived / effective stats)
     "apply_mods", "list_mods",
+    # Team-level resources
+    "team_get", "team_has", "team_set", "team_add",
     # Shape-rooted entity queries — the entity-returning twins of the
     # cells_in_* area helpers (entities_in_area already covers burst/
     # radius). Each returns ALIVE entity ids standing on the shape's cells:
@@ -4660,6 +4709,39 @@ class FormulaEngine:
                 eid, stat, _norm_mod_tags(tags, "list_mods"),
                 _mod_context(target, attacker, defender, other))
         ns["list_mods"] = _list_mods
+
+        # ---- team-level resources ----
+        def _team_get(team: Any, path: Any, default: Any = None) -> Any:
+            """team_get(team, path, default=None): read a dotted path in a
+            team's shared data (command points, morale, ...)."""
+            if not isinstance(team, str) or not isinstance(path, str):
+                raise FormulaError("team_get(team, path): team and path must be strings.")
+            return match.team_get(team, path, default)
+        ns["team_get"] = _team_get
+
+        def _team_has(team: Any, path: Any) -> bool:
+            if not isinstance(team, str) or not isinstance(path, str):
+                raise FormulaError("team_has(team, path): team and path must be strings.")
+            return match.team_has(team, path)
+        ns["team_has"] = _team_has
+
+        def _team_set(team: Any, path: Any, value: Any) -> Any:
+            """team_set(team, path, value): set a team's shared value."""
+            if not isinstance(team, str) or not isinstance(path, str):
+                raise FormulaError("team_set(team, path, value): team and path must be strings.")
+            match.team_set(team, path, value)
+            return value
+        ns["team_set"] = _team_set
+
+        def _team_add(team: Any, path: Any, delta: Any) -> Any:
+            """team_add(team, path, delta): add to a numeric team value
+            (0 if absent); returns the new value."""
+            if not isinstance(team, str) or not isinstance(path, str):
+                raise FormulaError("team_add(team, path, delta): team and path must be strings.")
+            if isinstance(delta, bool) or not isinstance(delta, (int, float)):
+                raise FormulaError("team_add(...): delta must be a number.")
+            return match.team_add(team, path, delta)
+        ns["team_add"] = _team_add
 
         def _entities_with_status(name: Any) -> list:
             """entities_with_status(name): alive entities that carry the
