@@ -4454,6 +4454,9 @@ class Match:
         g = z.get("glyph")
         if isinstance(g, str) and len(g) == 1:
             out["glyph"] = g
+        c = z.get("color")
+        if isinstance(c, str) and c:
+            out["color"] = c
         # Aura binding (entity-anchored zone), if present.
         if z.get("anchor"):
             out["anchor"] = z["anchor"]
@@ -4488,6 +4491,9 @@ class Match:
         g = zdef.get("glyph")
         if isinstance(g, str) and len(g) == 1:
             z["glyph"] = g
+        c = zdef.get("color")
+        if isinstance(c, str) and c:
+            z["color"] = c
         # Restore an aura binding. The cells were serialized at their
         # last-stamped positions (and re-stamp on the next anchor move),
         # so no recompute is needed at load time.
@@ -9009,9 +9015,52 @@ class Match:
                 return team
         return None
 
-    def _entity_color_code(self, e: "Entity") -> Optional[str]:
-        name = self.entity_color(e)
-        return TEXT_COLORS.get(name) if name else None
+    def _resolve_color_value(self, val: Any,
+                             extras: Dict[str, Any]) -> Optional[str]:
+        """Resolve a tile/zone `color` data value to a palette NAME or None.
+        A bare TEXT_COLORS name is a literal; anything else is treated as a
+        formula EXPRESSION (evaluated with `extras` bound — tile_x/tile_y
+        for tiles, zone_name for zones) whose string result must itself be
+        a palette name. Malformed / non-palette results -> None (no color),
+        the same fail-safe stance as the visibility/block conditions."""
+        if val in (None, ""):
+            return None
+        if not isinstance(val, str):
+            val = str(val)
+        if val in TEXT_COLORS:
+            return val
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        try:
+            res = FormulaEngine(self).eval_expression(
+                val, EvalCtx(this=self.current_entity_id(), extras=dict(extras)))
+        except FormulaError:
+            return None
+        res = str(res) if res is not None else ""
+        return res if res in TEXT_COLORS else None
+
+    def tile_color(self, x: int, y: int) -> Optional[str]:
+        """The resolved color name for the tile at (x, y): its instance
+        `color` data wins, else its template's `color`. Literal-or-formula
+        (see _resolve_color_value). None when unset/unresolved."""
+        cell = self.tiles.get((x, y))
+        if not isinstance(cell, dict):
+            return None
+        val = cell.get("color")
+        if val in (None, ""):
+            tpl_name = cell.get("_template")
+            if isinstance(tpl_name, str):
+                tpl = self.tile_templates.get(tpl_name)
+                if tpl is not None:
+                    val = tpl.data.get("color")
+        return self._resolve_color_value(val, {"tile_x": x, "tile_y": y})
+
+    def zone_color(self, name: str) -> Optional[str]:
+        """The resolved color name for zone `name` (its `color` field,
+        literal-or-formula), or None."""
+        z = self.zones.get(name)
+        if not isinstance(z, dict):
+            return None
+        return self._resolve_color_value(z.get("color"), {"zone_name": name})
 
     def render_ascii(self, pov_team: Optional[str] = None,
                      colorize: bool = False) -> str:
@@ -9020,43 +9069,50 @@ class Match:
         # cell falls back to whatever layer is visible underneath, so the
         # map doesn't betray a hidden feature's position). pov_team=None
         # = omniscient (no filtering).
-        # Build grid with an unused 0th row/col so coordinates can be 1-based
+        # Build grid with an unused 0th row/col so coordinates can be 1-based.
+        # `colors` is a parallel grid of palette NAMES (or None) — each
+        # layer that owns a cell sets BOTH its glyph and its color (color
+        # None = uncolored), so the topmost feature owns the cell's tint
+        # (keeping the existing entity > tile > zone layering). A zone/tile
+        # with a color but no glyph still tints its cell (the '.'), the
+        # "fill empty cells" behavior.
         grid = [
             ["." for _ in range(self.grid_width + 1)]
             for _ in range(self.grid_height + 1)
         ]
+        colors: List[List[Optional[str]]] = [
+            [None for _ in range(self.grid_width + 1)]
+            for _ in range(self.grid_height + 1)
+        ]
 
-        # Zone glyphs are the lowest layer — a zone with a single-char
-        # "glyph" paints all its cells (overlapping zones: later-iterated
-        # wins). Tiles, then entities, render on top, so a zone glyph
-        # shows only where no tile glyph or entity sits. Lets a gas-cloud
-        # zone be visible on the map without per-cell tile setup.
+        # Zone layer (lowest): a single-char `glyph` paints all the zone's
+        # cells; a `color` tints them (the glyph if present, else the '.').
+        # Overlapping zones: later-iterated wins for both.
         for zname, z in self.zones.items():
-            g = z.get("glyph")
-            if not (isinstance(g, str) and len(g) == 1):
-                continue
             if not self.zone_visible_to(zname, pov_team):
                 continue
+            g = z.get("glyph")
+            has_glyph = isinstance(g, str) and len(g) == 1
+            zc = self.zone_color(zname)
+            if not has_glyph and zc is None:
+                continue
             for (zx, zy) in z.get("cells", ()):
-                if self.in_bounds(zx, zy):
+                if not self.in_bounds(zx, zy):
+                    continue
+                if has_glyph:
                     grid[zy][zx] = g
+                    colors[zy][zx] = zc
+                elif zc is not None:
+                    colors[zy][zx] = zc
 
-        # Lay down tile glyphs next — any tile with a single-character
-        # "glyph" key shows that character instead of the default ".".
-        # Validation is strict (must be exactly one character) so a GM
-        # who accidentally sets glyph="fire" gets nothing on the map
-        # rather than a column-misaligning multi-character cell.
+        # Tile layer: instance `glyph` wins, else the template's. A tile
+        # `color` (instance > template) tints the cell — overriding any zone
+        # tint underneath, since the tile is the higher layer.
         for (tx, ty), data in self.tiles.items():
             if not self.in_bounds(tx, ty):
                 continue
             if not self.tile_visible_to(tx, ty, pov_team):
                 continue
-            # Instance glyph wins; if the instance has no glyph but
-            # comes from a template that does, use the template's.
-            # This lets a "fire" template define glyph='F' once and
-            # every placed instance picks it up without per-cell
-            # repetition. Same single-character constraint applies
-            # to both layers.
             glyph = data.get("glyph")
             if not (isinstance(glyph, str) and len(glyph) == 1):
                 tpl_name = data.get("_template")
@@ -9066,45 +9122,36 @@ class Match:
                         cand = tpl.data.get("glyph")
                         if isinstance(cand, str) and len(cand) == 1:
                             glyph = cand
-            if isinstance(glyph, str) and len(glyph) == 1:
+            has_glyph = isinstance(glyph, str) and len(glyph) == 1
+            tc = self.tile_color(tx, ty)
+            if has_glyph:
                 grid[ty][tx] = glyph
+                colors[ty][tx] = tc            # tile owns the cell (tc may be None)
+            elif tc is not None:
+                colors[ty][tx] = tc
 
-        # Entities take precedence over tile glyphs: the standard
-        # "who is where" question is more useful than tile feature
-        # visualization. A GM who wants tile visibility through an
-        # entity should toggle the entity off or use !tile info.
+        # Entity layer (top, above tiles): the "who is where" question wins
+        # over tile features. An entity always paints a glyph, so it owns
+        # the cell's color too (its resolved color, or None = uncolored,
+        # overriding any tile/zone tint).
         for e in self.entities.values():
-            # Keep old semantics: skip dead entities
             if not getattr(e, "is_alive", True):
                 continue
             # Attached body parts ride on the parent's cell — the parent
             # draws the glyph; parts never paint their own.
             if e.is_part:
                 continue
-            # POV filter: an entity hidden from this team isn't drawn.
             if not self.entity_visible_to(e.id, pov_team):
                 continue
-            # A large entity paints its glyph across EVERY footprint cell
-            # (a 2×2 reads as a 2×2 block of the same arrow). Living
-            # entities are drawn last, so among overlaps the later-iterated
-            # entity wins and all entities sit above tiles/zones/corpses.
             sym = self.entity_glyph(e)
-            if colorize:
-                code = self._entity_color_code(e)
-                if code:
-                    sym = f"\x1b[{code}m{sym}\x1b[0m"
+            ecol = self.entity_color(e)
             for (cx, cy) in self.entity_cells(e):
                 if self.in_bounds(cx, cy):
                     grid[cy][cx] = sym
+                    colors[cy][cx] = ecol
 
-        # Fog overlay — the LAST layer. When fog is on and we're rendering
-        # from a team POV, every cell whose TERRAIN isn't revealed (not
-        # currently seen and — with memory — not explored) is painted with
-        # fog_glyph. Remembered cells are NOT fogged: they keep their
-        # terrain glyph (and, under fog_memory_mode='full', their entity
-        # glyph, which the entity loop above already drew). The
-        # *_visible_to filters kept hidden features off unrevealed cells,
-        # so this just stamps the fog marker. Empty fog_glyph = blank.
+        # Fog overlay (last): an unrevealed cell shows fog_glyph and no
+        # color (fog hides whatever tint was there).
         if self.fog_enabled and pov_team is not None:
             fog_glyph = str(self.rules.get("fog_glyph", "?"))
             fg = fog_glyph[0] if fog_glyph else "."
@@ -9112,9 +9159,21 @@ class Match:
                 for xx in range(1, self.grid_width + 1):
                     if not self._fog_terrain_visible(pov_team, xx, yy):
                         grid[yy][xx] = fg
+                        colors[yy][xx] = None
 
-        # Skip the 0th row entirely to preserve 1-based coordinates
-        lines = [" ".join(row[1:]) for row in grid[1:]]
+        # Compose, wrapping each cell in its ANSI color when colorizing.
+        lines = []
+        for yy in range(1, self.grid_height + 1):
+            cells = []
+            for xx in range(1, self.grid_width + 1):
+                ch = grid[yy][xx]
+                if colorize:
+                    name = colors[yy][xx]
+                    code = TEXT_COLORS.get(name) if name else None
+                    if code:
+                        ch = f"\x1b[{code}m{ch}\x1b[0m"
+                cells.append(ch)
+            lines.append(" ".join(cells))
         return "\n".join(lines)
 
     def _spawn_facing(self, x: int, y: int) -> Direction:

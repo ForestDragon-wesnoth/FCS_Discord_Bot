@@ -5358,7 +5358,18 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         path = args[3]
         value = _parse_scalar(args[4])
         m.tile_set_path(x, y, path, value)
-        return await ctx.send(f"tile ({x},{y}).{path} = {value!r}")
+        ack = f"tile ({x},{y}).{path} = {value!r}"
+        # Advisory for a likely-bad render color (same spirit as entity
+        # set_var): the renderer reads the top-level `color` field, which may
+        # be a palette name OR a color formula — so only nudge on a value
+        # that's neither a known name nor formula-shaped.
+        if path == "color" and isinstance(value, str) and value:
+            from logic import TEXT_COLORS
+            if value not in TEXT_COLORS and not any(c in value for c in "()[]. +-*/"):
+                ack += (f"\n⚠ `{value}` isn't a recognized color (renders "
+                        f"uncolored unless it's a valid color formula). "
+                        + _color_guide())
+        return await ctx.send(ack)
 
     # ---- del <x> <y> [<path>] ----
     if sub == "del":
@@ -6158,7 +6169,7 @@ registry.annotate_sub(
 
 @registry.command(
     "zone",
-    usage=("!zone <new|drop|add|remove|fill|shift|anchor|unanchor|set|del|clear|glyph|info|list|cells> ..."),
+    usage=("!zone <new|drop|add|remove|fill|shift|anchor|unanchor|set|del|clear|glyph|color|info|list|cells> ..."),
     desc=(
         "Named multi-cell regions. A zone is a SET of cells plus a "
         "free-form data dict, optional hooks, and an optional map glyph "
@@ -6365,6 +6376,33 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             )
         z["glyph"] = g
         return await ctx.send(f"Zone `{name}` map glyph set to `{g}`.")
+
+    if sub == "color":
+        if await return_help_if_not_enough_args(ctx, args, 3, "zone", "color"):
+            return
+        name = args[1]
+        z = m.zones.get(name)
+        if z is None:
+            return await ctx.send(f"❌ Zone '{name}' not found.")
+        val = args[2]
+        if val in ("-", "none", "clear"):
+            z.pop("color", None)
+            return await ctx.send(f"Cleared color for zone `{name}`.")
+        from logic import TEXT_COLORS
+        # A bare palette name is a literal; anything else is a color formula
+        # (resolved per render). Warn on a non-palette, non-formula-looking
+        # value the same way entity colors do, but still store it (it may be
+        # a formula). A clearly-bad literal (no formula chars) gets a nudge.
+        if val not in TEXT_COLORS and not any(c in val for c in "()[]. +-*/"):
+            z["color"] = val
+            return await ctx.send(
+                f"Zone `{name}` color set to `{val}`.\n⚠ `{val}` isn't a "
+                f"recognized color name (renders uncolored unless it's a "
+                f"valid color formula). {_color_guide()}"
+            )
+        z["color"] = val
+        kind = "color" if val in TEXT_COLORS else "color formula"
+        return await ctx.send(f"Zone `{name}` {kind} set to `{val}`.")
 
     # ---- cells <name> ----  (list the footprint)
     if sub == "cells":
@@ -7080,6 +7118,17 @@ registry.annotate_sub(
         "every zone cell that has no tile glyph or entity on top), or "
         "pass `-` / `none` to clear it. Zone glyphs are the lowest "
         "render layer."
+    ),
+)
+registry.annotate_sub(
+    "zone", "color",
+    usage="!zone color <name> <color|formula|->",
+    desc=(
+        "Set the zone's render color — a palette name (see `!map colors`) "
+        "OR a color formula resolved per render (bindings: zone_name; e.g. "
+        "`zone_get(zone_name, 'tint')`). Colors the zone glyph, and tints "
+        "empty (glyph-less) zone cells. `-` / `none` clears it. Applies on "
+        "color-capable surfaces; a tile or entity on top owns its cell."
     ),
 )
 registry.annotate_sub(

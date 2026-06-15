@@ -982,9 +982,25 @@ More shipped work (continuing the list above):
     GM's own formulas). The whole palette is Discord-safe, so there's no
     terminal-only color to warn about separately.
   - Scenarios 401 (glyphs) / 402 (color settings) / 403 (guide + warning).
-    NEXT PR (the user wants it):
-    colored special TILES and zones — the color mechanism is reusable; this
-    slice is entities only. Long-term someday: an actual image-rendered map.
+  - **Colored TILES + ZONES — SHIPPED (follow-up slice).** render_ascii now
+    carries a parallel `colors` grid (palette NAMES) painted alongside the
+    glyph grid, layer by layer (zone < tile < entity < fog); each layer that
+    owns a cell sets BOTH its glyph and its color (color None = uncolored),
+    so the topmost feature owns the tint (keeps the positional layering), and
+    a zone/tile with a color but NO glyph still tints its `.` ("fill empty
+    cells"). `Match.tile_color(x,y)` (instance `color` data > template) and
+    `Match.zone_color(name)` (zone `color` field) via the shared
+    `_resolve_color_value`: a bare palette name is literal, anything else is a
+    FORMULA EXPRESSION (bindings tile_x/tile_y or zone_name) whose string
+    result must be a palette name — fail/non-palette → None (same fail-safe
+    as visibility/block conditions). Surface: tiles use the existing `!tile
+    set <x> <y> color <name|formula>`; zones get `!zone color <name>
+    <name|formula|->` (a dedicated field like the zone glyph, serialized in
+    _zone_to_dict/_from_dict). Both `!tile set color` and `!zone color` give
+    the same ⚠ advisory as entity color on a non-palette, non-formula-shaped
+    value (still stored — could be a formula). Entity color stays literal-var
+    only (not formula) — unchanged. Scenario 404. Long-term someday: an
+    actual image-rendered map.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
