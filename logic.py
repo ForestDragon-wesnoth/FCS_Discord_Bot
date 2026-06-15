@@ -382,6 +382,64 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "normally-unexposed side, e.g. a boomerang)."
         ),
     },
+    # --- AoE damage spread across body parts ---
+    "part_aoe_weight_default": {
+        "default": 1,
+        "schema": {"type": "number"},
+        "desc": (
+            "Default share weight a body part gets from an area attack split "
+            "by damage_spread, when the part has no `aoe_weight` var AND no "
+            "`hit_weights` to sum. Per-part override: the `aoe_weight` var "
+            "(else damage_spread falls back to the part's summed hit_weights, "
+            "else this). Higher = catches more of an aimless blast; set a "
+            "head low so explosions aren't free headshots."
+        ),
+    },
+    "aoe_default_mode": {
+        "default": "weighted",
+        "schema": {"type": "str",
+                   "choices": ["weighted", "uniform", "fragment", "main_only"]},
+        "desc": (
+            "Default mode for damage_spread(target, total): `weighted` splits "
+            "total across parts proportional to aoe_weight; `uniform` splits "
+            "equally; `fragment` deals aoe_fragment_count discrete weighted-"
+            "random hits (shrapnel); `main_only` ignores parts and hits the "
+            "main HP directly. Per-call override via the mode argument."
+        ),
+    },
+    "aoe_fragment_count": {
+        "default": 4,
+        "schema": {"type": "int"},
+        "desc": (
+            "Default number of discrete random hits in damage_spread's "
+            "`fragment` mode (each lands on a weighted-random part, dealing "
+            "total/N). Per-call override via the fragments argument. A big "
+            "swinging weapon is fragment with N=1-2; shrapnel is higher."
+        ),
+    },
+    # --- Status effects on body parts ---
+    "part_status_immune": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "Comma-separated status names a BODY PART can't receive — "
+            "apply_status on a part silently no-ops them ('fear' on an arm "
+            "does nothing). Per-part override: the `__status_immune` var "
+            "(replaces this list when set). Raw `!ent status` editing is a "
+            "GM force-write and bypasses this."
+        ),
+    },
+    "part_status_redirect": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "Comma-separated status names that, applied to a BODY PART, are "
+            "instead applied to its PARENT (for per-entity DoT in a system "
+            "that doesn't track it per-limb). Per-part override: the "
+            "`__status_redirect` var (replaces this list when set). Checked "
+            "after immunity; raw `!ent status` editing bypasses it."
+        ),
+    },
     # --- Stat modifiers (derived/effective stats) ---
     # Base stats stay plain vars and are never mutated; modifiers are data
     # records aggregated live from their SOURCES and combined on demand by
@@ -7212,6 +7270,18 @@ class Match:
         e = self.entities.get(eid)
         if e is None:
             raise NotFound(f"Entity '{eid}' not found.")
+        # Body-part status rules: a part can be immune to some statuses
+        # (no-op) or redirect them to its parent (per-entity DoT). Raw
+        # `!ent status` editing bypasses this — only the apply path honors it.
+        if e.is_part:
+            if name in self._part_status_names(
+                    e, "__status_immune", "part_status_immune"):
+                return []
+            if name in self._part_status_names(
+                    e, "__status_redirect", "part_status_redirect"):
+                if e.part_of in self.entities:
+                    return self.apply_status(e.part_of, name, level, duration)
+                return []
         sdef = self.status_definitions.get(name) or {}
         new_level = None if level is None else int(level)
         new_duration = None if duration is None else int(duration)
@@ -8171,6 +8241,141 @@ class Match:
                 _, klog = self.kill_entity(p.part_of)
                 log += klog
         return log
+
+    # ---------- status-on-part rules + AoE damage spread ----------
+    def _part_status_names(self, e: "Entity", var_key: str,
+                           rule_key: str) -> "set[str]":
+        """The set of status names for a part-status rule: the per-part var
+        (replaces the default when set) else the gamerule. Accepts a list
+        or a comma-separated string."""
+        raw = e.vars.get(var_key)
+        if raw is None:
+            raw = self.rules.get(rule_key, "")
+        if isinstance(raw, str):
+            return {t.strip() for t in raw.split(",") if t.strip()}
+        if isinstance(raw, (list, tuple)):
+            return {str(t) for t in raw}
+        return set()
+
+    def _part_aoe_weight(self, p: "Entity") -> float:
+        """A part's area-attack share weight: its `aoe_weight` var, else the
+        sum of its directional `hit_weights`, else part_aoe_weight_default."""
+        w = p.vars.get("aoe_weight")
+        if w is not None:
+            try:
+                return max(0.0, float(w))
+            except (TypeError, ValueError):
+                return 0.0
+        hw = p.vars.get("hit_weights")
+        if isinstance(hw, dict):
+            total = 0.0
+            for v in hw.values():
+                try:
+                    total += float(v)
+                except (TypeError, ValueError):
+                    pass
+            if total > 0:
+                return total
+        try:
+            return max(0.0, float(self.rules.get("part_aoe_weight_default", 1)))
+        except (TypeError, ValueError):
+            return 1.0
+
+    def damage_spread(self, target_id: str, total: int,
+                      mode: Optional[str] = None,
+                      fragments: Optional[int] = None) -> Tuple[int, List[str]]:
+        """Distribute `total` area damage across `target_id`'s body parts,
+        returning (to_main_dealt, log). Each part's share is routed via
+        damage_part (so it taps the main per the part's to_main config). The
+        total is DIVIDED among parts, never dealt in full to each.
+
+        Modes (default aoe_default_mode): `weighted` (proportional to each
+        part's aoe_weight), `uniform` (equal), `fragment` (N discrete
+        weighted-random hits — N = fragments or aoe_fragment_count), and
+        `main_only` (ignore parts, hit the main HP directly). A target with
+        no parts (or weights all zero) takes the full `total` to main."""
+        target = self.entities.get(target_id)
+        if target is None:
+            raise NotFound(f"Entity '{target_id}' not found.")
+        try:
+            total = int(total)
+        except (TypeError, ValueError):
+            raise VTTError("damage_spread: total must be an integer.")
+        mode = str(mode) if mode is not None else \
+            str(self.rules.get("aoe_default_mode", "weighted"))
+
+        parts = self.entity_parts(target_id)
+
+        def _hit_main(amount: int) -> Tuple[int, List[str]]:
+            """Fallback: deal `amount` straight to the target's main HP."""
+            if amount == 0:
+                return 0, []
+            hp_var, _, _ = target._vital_var_names()
+            log = target.write_var(
+                hp_var, int(target.vars.get(hp_var, 0) or 0) - amount)
+            return amount, (log or [])
+
+        if mode == "main_only" or not parts:
+            return _hit_main(total)
+
+        # Per-part share amounts.
+        shares: Dict[str, int] = {}
+        if mode == "fragment":
+            n = int(fragments) if fragments is not None else \
+                int(self.rules.get("aoe_fragment_count", 4))
+            n = max(1, n)
+            weighted = [(p, self._part_aoe_weight(p)) for p in parts]
+            wsum = sum(w for _p, w in weighted)
+            rng = getattr(self, "_rng", None) or random
+            per = total // n
+            rem = total - per * n      # give the remainder to the first frags
+            for i in range(n):
+                amt = per + (1 if i < rem else 0)
+                if amt == 0:
+                    continue
+                if wsum > 0:
+                    r = rng.random() * wsum
+                    acc = 0.0
+                    pick = weighted[-1][0]
+                    for p, w in weighted:
+                        acc += w
+                        if r <= acc:
+                            pick = p
+                            break
+                else:
+                    pick = parts[rng.randrange(len(parts))]
+                shares[pick.id] = shares.get(pick.id, 0) + amt
+        else:
+            if mode == "uniform":
+                weights = [(p, 1.0) for p in parts]
+            else:  # weighted (default / unknown)
+                weights = [(p, self._part_aoe_weight(p)) for p in parts]
+            wsum = sum(w for _p, w in weights)
+            if wsum <= 0:
+                return _hit_main(total)
+            # Largest-remainder apportionment so the shares sum to `total`.
+            raw = [(p, total * w / wsum) for p, w in weights]
+            floored = [(p, int(v)) for p, v in raw]
+            assigned = sum(v for _p, v in floored)
+            leftover = total - assigned
+            order = sorted(range(len(raw)),
+                           key=lambda i: raw[i][1] - floored[i][1], reverse=True)
+            for p, v in floored:
+                if v:
+                    shares[p.id] = shares.get(p.id, 0) + v
+            for i in order[:max(0, leftover)]:
+                pid = raw[i][0].id
+                shares[pid] = shares.get(pid, 0) + 1
+
+        to_main = 0
+        log: List[str] = []
+        for pid, amt in shares.items():
+            if amt == 0:
+                continue
+            tm, plog = self.damage_part(pid, amt)
+            to_main += tm
+            log += plog
+        return to_main, log
 
     def _store_corpse(self, e: "Entity") -> None:
         """Snapshot `e` into a corpse entry under tile (e.x, e.y) at

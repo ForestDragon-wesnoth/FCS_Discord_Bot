@@ -1481,7 +1481,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     "all_entities", "entities_with_status", "entities_with_var",
     "entities_in_area",
     # Body parts (locational damage)
-    "parts", "part", "has_part", "part_of", "damage_part",
+    "parts", "part", "has_part", "part_of", "damage_part", "damage_spread",
     # Stat modifiers (derived / effective stats)
     "apply_mods", "list_mods",
     # Shape-rooted entity queries — the entity-returning twins of the
@@ -4553,6 +4553,30 @@ class FormulaEngine:
             to_main, _log = match.damage_part(pid, int(amount))
             return to_main
         ns["damage_part"] = _damage_part
+
+        def _damage_spread(target_token: Any, total: Any, mode: Any = None,
+                           fragments: Any = None) -> int:
+            """damage_spread(target, total, mode=None, fragments=None):
+            distribute `total` area damage across the target's body parts,
+            returning the amount that reached the parent's main HP. The total
+            is DIVIDED among parts (each routed via damage_part), never dealt
+            in full to each. Modes (default aoe_default_mode): weighted /
+            uniform / fragment / main_only — see the aoe_* rules and per-part
+            aoe_weight var. A target with no parts takes the full total to
+            main. Loop entities_in_area(...) and call this per entity for a
+            blast; compute per-entity falloff yourself."""
+            tid, _te = _resolve_entity(target_token, "damage_spread")
+            if isinstance(total, bool) or not isinstance(total, (int, float)):
+                raise FormulaError("damage_spread(...): total must be a number.")
+            m = None if mode is None else str(mode)
+            f = None
+            if fragments is not None:
+                if isinstance(fragments, bool) or not isinstance(fragments, (int, float)):
+                    raise FormulaError("damage_spread(...): fragments must be a number.")
+                f = int(fragments)
+            to_main, _log = match.damage_spread(tid, int(total), m, f)
+            return to_main
+        ns["damage_spread"] = _damage_spread
 
         def _part_of(eid_token: Any) -> str:
             """part_of(eid): the parent entity id if `eid` is a body part,
