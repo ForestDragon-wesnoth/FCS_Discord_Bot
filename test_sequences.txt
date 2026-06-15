@@ -10490,3 +10490,56 @@ arm is redirected to the PARENT (part_status_redirect) — hero gains burning,
 the arm does not (good for per-entity DoT a system doesn't track per-limb).
 Per-part `__status_immune` / `__status_redirect` vars override the rules.
 Only the apply path honors these; raw `!ent status` editing force-writes.
+
+
+SCENARIO 409 — Footprint-region part positioning + render priority
+------------------------------------------------------------------
+
+!match new mt MT 10 6
+!match use mt
+!ent add dragon Dragon 400 3 2 9
+!ent set_var dragon footprint_w 2
+!ent set_var dragon footprint_h 2
+!ent face dragon up
+!part add dragon head head 0 0 to_main_percent=150
+!part add dragon tail tail 30 30 to_main_percent=30
+!part region head front
+!part region tail back
+!ent set_var head glyph H
+!map
+!ent face dragon right
+!map
+
+Expected: the dragon is a 2×2. `part region head front` makes the head cover
+the parent's front row, `tail back` the back row — facing-aware. The head has
+a custom glyph `H`, so it renders ABOVE the parent on its front cells; the
+tail uses the default glyph, so it yields to the parent (part_custom_glyph_
+priority). Facing up: top row shows `H H`, bottom row the dragon's `^ ^`
+arrows. Turning to face right rotates the `front` region to the right column,
+so the `H`s move to the right side and the arrows to the left.
+
+
+SCENARIO 410 — Spatial AoE on a multi-tile entity (origin + radius)
+------------------------------------------------------------------
+
+!match new sa SA 10 6
+!match use sa
+!ent add gunner Gunner 30 1 1 9
+!ent add dragon Dragon 400 4 2 5
+!ent set_var dragon footprint_w 2
+!ent set_var dragon footprint_h 2
+!ent face dragon up
+!part add dragon head head 0 0 to_main_percent=150
+!part add dragon tail tail 40 40 to_main_percent=50
+!part region head front
+!part region tail back
+!ent set_var gunner actions.frontblast.target entity
+!ent set_var gunner actions.frontblast.body "entity[self].dealt = damage_spread(target, 80, 'weighted', 0, 4, 2, 0)"
+!action gunner frontblast dragon
+!ent dump dragon
+
+Expected: damage_spread with origin (4,2) + radius 0 only includes parts
+with a cell reaching that point — the head (front row, which includes (4,2))
+but NOT the tail (back row). So the whole 80 lands on the head (150%→main =
+120); dragon main 400 → 280, gunner.dealt = 120, the tail untouched. That's
+how a blast that doesn't reach the whole big body is modeled.

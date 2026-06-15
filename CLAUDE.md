@@ -928,19 +928,29 @@ More shipped work (continuing the list above):
     locate <part> <x> <y>` / `!part glue <part>` (+ Match.locate_part /
     glue_part). Parent move does NOT drag it. Per-cell independent TARGETING
     (selecting the part by clicking its cell) still TBD per game system.
-  - **NEXT PR — multi-tile-entity AoE + footprint-region part positioning**
-    (the user designed this; split out of the AoE PR). (1) Spatial AoE: a
-    `damage_spread(target, total, mode, origin_x, origin_y, radius)` that only
-    includes parts whose cell is within the blast (matters for located parts
-    + big footprints). (2) `part_region` positioning: a part auto-occupies a
-    REGION of the parent's footprint — `front`/`back`/`left`/`right`/`center`/
-    `all` (and corners), facing-aware (reuse the side machinery), re-derived on
-    parent move AND facing change; multi-cell (front of a 2×2 = 2 cells); a 1×1
-    part rounds to a fitting corner. region vs `!part locate` are mutually
-    exclusive (setting one clears the other). (3) Render-priority gamerule: a
-    part's CUSTOM glyph renders ABOVE the parent, but a part on the DEFAULT
-    glyph yields to the parent (so default-glyph parts don't clobber the
-    parent's customization).
+  - **Multi-tile AoE + footprint-region part positioning — SHIPPED (scenarios
+    409-410).** (1) Spatial AoE: `damage_spread(target, total, mode, fragments,
+    origin_x, origin_y, radius)` filters to parts with a cell within `radius`
+    (Chebyshev) of the origin — a blast that doesn't reach the whole body
+    (no eligible parts → full total to main). (2) `part_region` (the
+    `__part_region` var, set by `!part region <part> <region>`): a part's cells
+    become a facing-aware REGION of the parent's footprint —
+    `front`/`back`/`left`/`right`/`center`/`all` + corners. Derivation
+    (`Match.part_region_cells` + `_region_match`) PROJECTS each footprint cell
+    onto the parent's forward/right axes (`FACING_VECTORS`) and selects by
+    SIGN, so it's full 8-way (a diagonal facing → a non-rectangular set);
+    `center` falls back to ALL on an even (no-true-center) footprint. The cells
+    are an explicit set returned via `entity_cells` (the single chokepoint, so
+    render/occupancy/AoE/vision all pick it up); the anchor follows the parent
+    (`_restamp_parts_for` restamps glued + region parts), cells re-derive each
+    call from the parent's live facing. `Entity.is_region_part`; `is_glued_part`
+    (the skip-surface predicate) now excludes BOTH located and region parts.
+    region and `!part locate` are mutually exclusive (each clears the other;
+    `!part glue` clears both). (3) Render priority: the `part_custom_glyph_priority`
+    rule (default True) — a region part draws over the parent only if it has a
+    CUSTOM glyph (a default-glyph region part yields, so it doesn't clobber the
+    parent's customization); done in a second render pass. Located parts (own
+    cell, no overlap) are unaffected.
   - Per-damage-TYPE `to_main_percent`; the **armor layer** (coverage % +
     directional, damage-type AR-vs-ARP mitigation); the **to-hit roll**
     (accuracy/evasion/suppression/spread, SEPARATE from hit-location); **AP/FP/

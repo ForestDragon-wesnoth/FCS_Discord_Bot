@@ -4555,16 +4555,19 @@ class FormulaEngine:
         ns["damage_part"] = _damage_part
 
         def _damage_spread(target_token: Any, total: Any, mode: Any = None,
-                           fragments: Any = None) -> int:
-            """damage_spread(target, total, mode=None, fragments=None):
-            distribute `total` area damage across the target's body parts,
-            returning the amount that reached the parent's main HP. The total
-            is DIVIDED among parts (each routed via damage_part), never dealt
-            in full to each. Modes (default aoe_default_mode): weighted /
-            uniform / fragment / main_only — see the aoe_* rules and per-part
-            aoe_weight var. A target with no parts takes the full total to
-            main. Loop entities_in_area(...) and call this per entity for a
-            blast; compute per-entity falloff yourself."""
+                           fragments: Any = None, origin_x: Any = None,
+                           origin_y: Any = None, radius: Any = None) -> int:
+            """damage_spread(target, total, mode=None, fragments=None,
+            origin_x=None, origin_y=None, radius=None): distribute `total`
+            area damage across the target's body parts, returning the amount
+            that reached the parent's main HP. The total is DIVIDED among
+            parts (each routed via damage_part), never full to each. Modes
+            (default aoe_default_mode): weighted / uniform / fragment /
+            main_only — see the aoe_* rules and per-part aoe_weight var. With
+            origin_x/origin_y + radius, only parts with a cell within radius
+            (Chebyshev) of the origin are hit — a blast that doesn't reach the
+            whole body (located + footprint-region parts). No (eligible) parts
+            -> full total to main. Loop entities_in_area(...) per entity."""
             tid, _te = _resolve_entity(target_token, "damage_spread")
             if isinstance(total, bool) or not isinstance(total, (int, float)):
                 raise FormulaError("damage_spread(...): total must be a number.")
@@ -4574,7 +4577,15 @@ class FormulaEngine:
                 if isinstance(fragments, bool) or not isinstance(fragments, (int, float)):
                     raise FormulaError("damage_spread(...): fragments must be a number.")
                 f = int(fragments)
-            to_main, _log = match.damage_spread(tid, int(total), m, f)
+            origin = None
+            radius_i = None
+            if origin_x is not None and origin_y is not None and radius is not None:
+                origin = (_coord_int(origin_x, "damage_spread", "origin_x"),
+                          _coord_int(origin_y, "damage_spread", "origin_y"))
+                if isinstance(radius, bool) or not isinstance(radius, (int, float)):
+                    raise FormulaError("damage_spread(...): radius must be a number.")
+                radius_i = int(radius)
+            to_main, _log = match.damage_spread(tid, int(total), m, f, origin, radius_i)
             return to_main
         ns["damage_spread"] = _damage_spread
 
