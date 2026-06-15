@@ -899,8 +899,25 @@ More shipped work (continuing the list above):
     parent ⇒ revive parts"). `!ent dump` shows a "body parts:" section + "Body
     part of:"; `!part list` shows hp + knobs. Scenarios 396-398.
   DEFERRED TODOs (the user explicitly wants these tracked):
-  - **AoE damage SPREAD between main and limbs** based on per-system factors
-    (many combat systems want this; only "damage to main" for now).
+  - **AoE damage SPREAD between main and limbs — SHIPPED (scenario 407).**
+    `damage_spread(target, total[, mode, fragments])` → to-main; splits total
+    across the target's parts (DIVIDED, never full-to-each — no free AoE
+    headshots), each routed via damage_part. Modes (rule `aoe_default_mode`):
+    `weighted` (per-part `aoe_weight` var, defaulting to summed `hit_weights`,
+    else `part_aoe_weight_default`), `uniform`, `fragment` (N=`aoe_fragment_count`
+    discrete weighted-random hits, match-RNG), `main_only` (hit main hp
+    directly). No parts / zero weights → full total to main. Largest-remainder
+    apportionment so shares sum to total. GM loops `entities_in_area` + calls
+    it per entity (falloff stays GM-side). SPATIAL origin/radius filtering is
+    the NEXT PR (with footprint-region part positioning).
+  - **Status effects on body parts — SHIPPED (scenario 408).** Two list rules,
+    each overridable per part (the `__status_immune` / `__status_redirect`
+    vars replace the rule when set): `part_status_immune` (apply_status no-ops
+    these on a part) and `part_status_redirect` (applied to a part → applied to
+    the PARENT instead, for per-entity DoT). Hooked into `apply_status` only
+    (raw `!ent status` editing force-writes). Parts are real entities, so
+    statuses otherwise tick on them normally — a part's tick can `damage_part(
+    self, n)` to route to main.
   - **Independently-LOCATED parts — SHIPPED (scenario 406).** A part with the
     `__part_located` var keeps its OWN cell: `Entity.is_located_part` /
     `is_glued_part` (the new skip-surface predicate — glued parts only).
@@ -911,6 +928,19 @@ More shipped work (continuing the list above):
     locate <part> <x> <y>` / `!part glue <part>` (+ Match.locate_part /
     glue_part). Parent move does NOT drag it. Per-cell independent TARGETING
     (selecting the part by clicking its cell) still TBD per game system.
+  - **NEXT PR — multi-tile-entity AoE + footprint-region part positioning**
+    (the user designed this; split out of the AoE PR). (1) Spatial AoE: a
+    `damage_spread(target, total, mode, origin_x, origin_y, radius)` that only
+    includes parts whose cell is within the blast (matters for located parts
+    + big footprints). (2) `part_region` positioning: a part auto-occupies a
+    REGION of the parent's footprint — `front`/`back`/`left`/`right`/`center`/
+    `all` (and corners), facing-aware (reuse the side machinery), re-derived on
+    parent move AND facing change; multi-cell (front of a 2×2 = 2 cells); a 1×1
+    part rounds to a fitting corner. region vs `!part locate` are mutually
+    exclusive (setting one clears the other). (3) Render-priority gamerule: a
+    part's CUSTOM glyph renders ABOVE the parent, but a part on the DEFAULT
+    glyph yields to the parent (so default-glyph parts don't clobber the
+    parent's customization).
   - Per-damage-TYPE `to_main_percent`; the **armor layer** (coverage % +
     directional, damage-type AR-vs-ARP mitigation); the **to-hit roll**
     (accuracy/evasion/suppression/spread, SEPARATE from hit-location); **AP/FP/

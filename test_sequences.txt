@@ -10441,3 +10441,52 @@ it, alongside the mech. Moving the mech to (6,1) does NOT drag the located
 turret — it stays at (5,3). It's still a part (damage_part still taps the
 mech, `parent` still resolves). `!part glue turret` snaps it back onto the
 parent's cell and hides it again (the last `!map` shows only the mech).
+
+
+SCENARIO 407 — AoE damage spread across body parts (damage_spread)
+------------------------------------------------------------------
+
+!match new aoe AOE 8 4
+!match use aoe
+!ent add bomber Bomber 50 1 1 9
+!ent add ogre Ogre 300 4 2 5
+!part add ogre chest chest 0 0 to_main_percent=100 aoe_weight=60
+!part add ogre head head 0 0 to_main_percent=150 aoe_weight=10
+!part add ogre arm arm 40 40 to_main_percent=50 aoe_weight=30
+!ent set_var bomber actions.blast.target entity
+!ent set_var bomber actions.blast.body "entity[self].lasthit = damage_spread(target, args.dmg)"
+!action bomber blast ogre dmg=100
+!ent dump ogre
+!part list ogre
+
+Expected: damage_spread splits the 100 across the ogre's parts by aoe_weight
+(chest 60 / head 10 / arm 30 of 100 total weight) — DIVIDED among parts, not
+dealt in full to each (no free AoE headshots). chest (0/0, 100%→main) routes
+60; head (0/0, 150%) routes 15; arm (40hp, 50%, cap max_hp) takes 30 to its
+own hp (40→10) and taps 15 to main. Ogre main 300 → 210 (took 90), and
+bomber.lasthit records 90. Modes weighted (default) / uniform / fragment /
+main_only are picked via a mode arg or the aoe_default_mode rule.
+
+
+SCENARIO 408 — Status effects on body parts: immune + redirect
+--------------------------------------------------------------
+
+!match new ps PS 6 3
+!match use ps
+!ent add hero Hero 100 2 2 9
+!part add hero arm arm 30 30
+!status def burning
+!status def fear
+!system set default part_status_immune fear
+!system set default part_status_redirect burning
+!status apply arm fear
+!status apply arm burning
+!ent dump arm
+!ent dump hero
+
+Expected: applying `fear` to the arm is a no-op — the part is immune per the
+part_status_immune rule, so the arm gains no fear. Applying `burning` to the
+arm is redirected to the PARENT (part_status_redirect) — hero gains burning,
+the arm does not (good for per-entity DoT a system doesn't track per-limb).
+Per-part `__status_immune` / `__status_redirect` vars override the rules.
+Only the apply path honors these; raw `!ent status` editing force-writes.

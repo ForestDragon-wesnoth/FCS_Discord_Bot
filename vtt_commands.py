@@ -6729,8 +6729,19 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             event_log = m.apply_status(eid, name, level, duration)
         except (VTTError, NotFound) as ex:
             return await ctx.send(f"❌ {ex}")
-        inst = m.entities[eid].status.get(name, {})
+        e = m.entities[eid]
         tail = ("\n" + "\n".join(event_log)) if event_log else ""
+        # Body-part status rules can no-op (immune) or redirect to the
+        # parent — reflect that instead of a misleading "Applied to <part>".
+        if e.is_part and name not in e.status:
+            if name in m._part_status_names(e, "__status_immune", "part_status_immune"):
+                return await ctx.send(
+                    f"`{eid}` is immune to `{name}` (part rule) — no effect.")
+            if name in m._part_status_names(e, "__status_redirect", "part_status_redirect"):
+                return await ctx.send(
+                    f"`{name}` on body part `{eid}` redirected to its parent "
+                    f"`{e.part_of}`.{tail}")
+        inst = e.status.get(name, {})
         return await ctx.send(
             f"Applied `{name}` to `{eid}` "
             f"(level={inst.get('level', '?')}, "
