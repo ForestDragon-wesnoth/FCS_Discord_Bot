@@ -916,7 +916,7 @@ More shipped work (continuing the list above):
   - **Parent death** → parts are snapshotted into the corpse and removed (no
     orphaned visible limbs); `revive_corpse` re-spawns them (delivers "revive
     parent ⇒ revive parts"). `!ent dump` shows a "body parts:" section + "Body
-    part of:"; `!part list` shows hp + knobs. Scenarios 396-398; further coverage 414 (composite 2×2 with region head + torso), 415 (detach → free entity), 416 (parent death snapshots parts + revive restores).
+    part of:"; `!part list` shows hp + knobs. Scenarios 396-398; further coverage 414 (composite 2×2 with region head + torso), 415 (detach → free entity), 416 (parent death snapshots parts + revive restores), 417 (killing a part = limb destruction, never a corpse — `_process_death` routes a part to `_process_part_death`; only non-parts corpse).
   DEFERRED TODOs (the user explicitly wants these tracked):
   - **AoE damage SPREAD between main and limbs — SHIPPED (scenario 410).**
     `damage_spread(target, total[, mode, fragments])` → to-main; splits total
@@ -1073,19 +1073,19 @@ More shipped work (continuing the list above):
     value (still stored — could be a formula). Entity color stays literal-var
     only (not formula) — unchanged. Scenario 404. Long-term someday: an
     actual image-rendered map.
-- **Range-band primitive — SHIPPED (scenarios 417-418).** `band(value, spec,
+- **Range-band primitive — SHIPPED (scenarios 418-419).** `band(value, spec,
   default=None)` (a pure `_ALLOWED_FUNCS` func) looks `value` up in a banded
   table `spec` ('1-2:120,3-5:100,6-9:80,10+:0'), FIRST match wins. Ranges:
   `lo-hi` (inclusive), `n` (exact), `lo+`/`lo-` (lo and up), `-hi` (up to hi).
   Result coerced to a number when numeric. No match → `default`, else raises.
   Models the doc's munition falloff without a conditional chain.
-- **Reusable named macros — SHIPPED (scenarios 419-420).** `Match.macros` (name ->
+- **Reusable named macros — SHIPPED (scenarios 420-421).** `Match.macros` (name ->
   newline-separated command body). `!macro set/run/list/show/remove`. `run`
   substitutes $1/$2/.../$@ (positional; missing → ""; leaves $(...) formula
   tokens alone, via `_macro_subst`) then dispatches each line via
   `dispatch_no_snapshot` — so the whole macro is ONE undo entry (the !macro
   command itself is snapshotted). Per-match, serialized.
-- **Condition-watchers — SHIPPED (scenarios 421-422).** `Match.watchers` (name ->
+- **Condition-watchers — SHIPPED (scenarios 422-423).** `Match.watchers` (name ->
   {condition, effect, once, last}). EDGE-triggered: `Match.fire_watchers`
   evaluates each condition (a formula expr), records all edges, then runs the
   effect (a formula program) for any that went false→true; `once` removes
@@ -1097,7 +1097,7 @@ More shipped work (continuing the list above):
   re-fire. Distinct from event passives: fires on the condition's transition
   regardless of what changed it.
 - **Team-level state (resources + modifiers + passives) — SHIPPED (scenarios
-  423-425).** `Match.team_data` (team -> free-form dict) + `team_passives` (team
+  424-426).** `Match.team_data` (team -> free-form dict) + `team_passives` (team
   -> {pid: Passive}). (1) Resources: `team_get/team_has/team_set/team_add`
   (Match methods + formula prims; dotted paths) and `!team set/get/add/list/
   clear`. (2) Team-scoped MODIFIERS: a `modifiers` bundle in a team's data
