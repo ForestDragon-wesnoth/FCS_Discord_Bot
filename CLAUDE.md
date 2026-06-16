@@ -117,6 +117,25 @@ opposite of what it should. Always also do at least one of:
   prior commits' verification work) that parses `!ent dump` / `!list`
   output and asserts exact end-state values
 
+### How many scenarios per PR (coverage rule of thumb)
+
+The user enforces this — a prior session shipped many PRs with only ONE
+scenario each, which under-tested complex features (e.g. modifiers without a
+formula that actually CONSUMES them; multi-tile body parts without a real
+composite shape). Match coverage to PR size:
+
+- **Simple PR** (one small primitive, one rule): **1-2** scenarios.
+- **Complex PR** (a subsystem, multiple sub-features, or anything with
+  several interacting knobs): **3+** scenarios, ideally more — one per
+  distinct behavior, plus a failure/edge case.
+
+Each scenario should exercise a DIFFERENT facet, and at least one should
+prove the feature in REAL USE (a formula/action that consumes the new
+primitive end-to-end), not just that the setter command runs. When you add
+follow-up tests for an older feature, insert them right after that feature's
+existing scenarios and renumber the rest (the tail-rewrite pattern); update
+the `Scenario N` citations in this file to match.
+
 ### Commit messages: dense, factual, no fluff
 
 Look at existing commit messages on `main`. They explain WHY a change
@@ -897,9 +916,9 @@ More shipped work (continuing the list above):
   - **Parent death** → parts are snapshotted into the corpse and removed (no
     orphaned visible limbs); `revive_corpse` re-spawns them (delivers "revive
     parent ⇒ revive parts"). `!ent dump` shows a "body parts:" section + "Body
-    part of:"; `!part list` shows hp + knobs. Scenarios 396-398.
+    part of:"; `!part list` shows hp + knobs. Scenarios 396-398; further coverage 414 (composite 2×2 with region head + torso), 415 (detach → free entity), 416 (parent death snapshots parts + revive restores).
   DEFERRED TODOs (the user explicitly wants these tracked):
-  - **AoE damage SPREAD between main and limbs — SHIPPED (scenario 407).**
+  - **AoE damage SPREAD between main and limbs — SHIPPED (scenario 410).**
     `damage_spread(target, total[, mode, fragments])` → to-main; splits total
     across the target's parts (DIVIDED, never full-to-each — no free AoE
     headshots), each routed via damage_part. Modes (rule `aoe_default_mode`):
@@ -910,7 +929,7 @@ More shipped work (continuing the list above):
     apportionment so shares sum to total. GM loops `entities_in_area` + calls
     it per entity (falloff stays GM-side). SPATIAL origin/radius filtering is
     the NEXT PR (with footprint-region part positioning).
-  - **Status effects on body parts — SHIPPED (scenario 408).** Two list rules,
+  - **Status effects on body parts — SHIPPED (scenario 411).** Two list rules,
     each overridable per part (the `__status_immune` / `__status_redirect`
     vars replace the rule when set): `part_status_immune` (apply_status no-ops
     these on a part) and `part_status_redirect` (applied to a part → applied to
@@ -918,7 +937,7 @@ More shipped work (continuing the list above):
     (raw `!ent status` editing force-writes). Parts are real entities, so
     statuses otherwise tick on them normally — a part's tick can `damage_part(
     self, n)` to route to main.
-  - **Independently-LOCATED parts — SHIPPED (scenario 406).** A part with the
+  - **Independently-LOCATED parts — SHIPPED (scenario 409).** A part with the
     `__part_located` var keeps its OWN cell: `Entity.is_located_part` /
     `is_glued_part` (the new skip-surface predicate — glued parts only).
     A located part is NOT re-stamped to the parent and NOT hidden — it
@@ -929,7 +948,7 @@ More shipped work (continuing the list above):
     glue_part). Parent move does NOT drag it. Per-cell independent TARGETING
     (selecting the part by clicking its cell) still TBD per game system.
   - **Multi-tile AoE + footprint-region part positioning — SHIPPED (scenarios
-    409-410).** (1) Spatial AoE: `damage_spread(target, total, mode, fragments,
+    412-413).** (1) Spatial AoE: `damage_spread(target, total, mode, fragments,
     origin_x, origin_y, radius)` filters to parts with a cell within `radius`
     (Chebyshev) of the origin — a blast that doesn't reach the whole body
     (no eligible parts → full total to main). (2) `part_region` (the
@@ -991,8 +1010,8 @@ More shipped work (continuing the list above):
     records (each carries a `source` label). Read-only `!mod show <eid> <stat>
     [base] [tag ...]` renders the active modifiers (with [source]) + folded
     result (context-dependent ones show only when their condition resolves
-    context-free). Scenarios 399-400.
-  - **C1 follow-ups SHIPPED (scenario 405):** (a) `source` tracking —
+    context-free). Scenarios 399-400; further coverage 407 (set/min/max ops + priority tiers), 408 (defender context role + scaling value formula).
+  - **C1 follow-ups SHIPPED (scenario 406):** (a) `source` tracking —
     `_raw_modifier_records` returns (record, source) labels like
     `status:burning.fireboost` / `equipped.sword.0`; (b) per-stat caps — the
     `modifier_stat_caps` rule (CSV `stat:lo:hi`, lo/hi optional) clamps the
@@ -1054,19 +1073,19 @@ More shipped work (continuing the list above):
     value (still stored — could be a formula). Entity color stays literal-var
     only (not formula) — unchanged. Scenario 404. Long-term someday: an
     actual image-rendered map.
-- **Range-band primitive — SHIPPED (scenario 411).** `band(value, spec,
+- **Range-band primitive — SHIPPED (scenarios 417-418).** `band(value, spec,
   default=None)` (a pure `_ALLOWED_FUNCS` func) looks `value` up in a banded
   table `spec` ('1-2:120,3-5:100,6-9:80,10+:0'), FIRST match wins. Ranges:
   `lo-hi` (inclusive), `n` (exact), `lo+`/`lo-` (lo and up), `-hi` (up to hi).
   Result coerced to a number when numeric. No match → `default`, else raises.
   Models the doc's munition falloff without a conditional chain.
-- **Reusable named macros — SHIPPED (scenario 412).** `Match.macros` (name ->
+- **Reusable named macros — SHIPPED (scenarios 419-420).** `Match.macros` (name ->
   newline-separated command body). `!macro set/run/list/show/remove`. `run`
   substitutes $1/$2/.../$@ (positional; missing → ""; leaves $(...) formula
   tokens alone, via `_macro_subst`) then dispatches each line via
   `dispatch_no_snapshot` — so the whole macro is ONE undo entry (the !macro
   command itself is snapshotted). Per-match, serialized.
-- **Condition-watchers — SHIPPED (scenario 413).** `Match.watchers` (name ->
+- **Condition-watchers — SHIPPED (scenarios 421-422).** `Match.watchers` (name ->
   {condition, effect, once, last}). EDGE-triggered: `Match.fire_watchers`
   evaluates each condition (a formula expr), records all edges, then runs the
   effect (a formula program) for any that went false→true; `once` removes
@@ -1077,8 +1096,8 @@ More shipped work (continuing the list above):
   remove / list / show / check. `last` serialized so a reload doesn't
   re-fire. Distinct from event passives: fires on the condition's transition
   regardless of what changed it.
-- **Team-level state (resources + modifiers + passives) — SHIPPED (scenario
-  414).** `Match.team_data` (team -> free-form dict) + `team_passives` (team
+- **Team-level state (resources + modifiers + passives) — SHIPPED (scenarios
+  423-425).** `Match.team_data` (team -> free-form dict) + `team_passives` (team
   -> {pid: Passive}). (1) Resources: `team_get/team_has/team_set/team_add`
   (Match methods + formula prims; dotted paths) and `!team set/get/add/list/
   clear`. (2) Team-scoped MODIFIERS: a `modifiers` bundle in a team's data

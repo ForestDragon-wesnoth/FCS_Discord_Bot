@@ -10391,7 +10391,30 @@ entity sitting on a zone cell owns that cell's glyph and color. The plain
 harness map shows `T` on row 1 and `~ ~ ~` on row 2.
 
 
-SCENARIO 405 — Stat modifiers: source breakdown, tag-granting, per-stat cap
+SCENARIO 405 — Renderer: region-part custom glyph draws over parent
+-------------------------------------------------------------------
+
+!match new rgp RGP 8 6
+!match use rgp
+!ent add boss Boss 200 3 3 9
+!ent set_var boss footprint_w 2
+!ent set_var boss footprint_h 2
+!ent set_var boss glyph B
+!ent face boss right
+!part add boss head head 0 0
+!part region head front
+!map
+!ent set_var head glyph H
+!map
+
+Expected: the boss is a 2×2 painted with its custom glyph `B`. The `head`
+region part covers the front face but has only the DEFAULT glyph, so under
+the `part_custom_glyph_priority` rule (default true) it YIELDS — the first
+map shows `B` on all four boss cells. After giving the head a CUSTOM glyph
+`H`, the second map draws `H` over the boss's two front cells (a second
+render pass) while the rear cells stay `B`.
+
+SCENARIO 406 — Stat modifiers: source breakdown, tag-granting, per-stat cap
 ---------------------------------------------------------------------------
 
 !match new mod3 MOD3 5 3
@@ -10419,7 +10442,67 @@ value to 20. `!mod show` lists each active modifier WITH its [source] label
 "→ base 10 becomes 20".
 
 
-SCENARIO 406 — Independently-located body parts
+SCENARIO 407 — Stat modifiers: set / min / max ops + priority tiers
+-------------------------------------------------------------------
+
+!match new mod3 MOD3 8 4
+!match use mod3
+!ent add h Hero 100 2 2 9
+!ent set_var h modifiers.boost.stat speed
+!ent set_var h modifiers.boost.op add
+!ent set_var h modifiers.boost.value 10
+!ent set_var h modifiers.cap.stat speed
+!ent set_var h modifiers.cap.op max
+!ent set_var h modifiers.cap.value 12
+!ent set_var h modifiers.floor.stat speed
+!ent set_var h modifiers.floor.op min
+!ent set_var h modifiers.floor.value 8
+!mod show h speed 5
+!ent set_var h modifiers.haste.stat speed
+!ent set_var h modifiers.haste.op set
+!ent set_var h modifiers.haste.value 3
+!ent set_var h modifiers.haste.priority 100
+!mod show h speed 5
+
+Expected: in the default priority tier base 5 + add 10 = 15, then the max
+op CAPS it to 12 and the min op (floor 8) leaves it (12 ≥ 8) → first show 12.
+Adding a `set` modifier at priority 100 (its own higher tier) overrides the
+value to 3 — but the min/max clamp ops carry a high op-priority offset and
+so apply LAST, after the set: the floor (8) pulls 3 back up → second show 8.
+Demonstrates set/min(floor)/max(cap) and that bumping a record's priority
+pulls it into its own tier while clamp ops still land last.
+
+
+SCENARIO 408 — Stat modifiers: defender context role + scaling value formula
+----------------------------------------------------------------------------
+
+!match new mod4 MOD4 8 4
+!match use mod4
+!ent add hero Hero 100 2 2 9
+!ent add foe Foe 200 4 2 5
+!ent set_var foe undead true
+!ent set_var hero modifiers.bane.stat atk
+!ent set_var hero modifiers.bane.op add
+!ent set_var hero modifiers.bane.value 25
+!ent set_var hero modifiers.bane.condition "entity[defender].undead"
+!ent set_var hero modifiers.rage.stat atk
+!ent set_var hero modifiers.rage.op add
+!ent set_var hero modifiers.rage.value "(entity[self].max_hp - entity[self].hp)"
+!ent hp hero -30
+!ent set_var hero actions.smite.target entity
+!ent set_var hero actions.smite.body "entity[target].hp = entity[target].hp - apply_mods(self, 'atk', 10, [], defender=target)"
+!action hero smite foe
+!list
+
+Expected: smite folds hero's `atk` modifiers with the target bound as the
+`defender` context role. bane (+25) fires because its condition reads
+`entity[defender].undead` (foe is undead); rage adds a FORMULA value
+(`max_hp - hp` = 30 after the -30) → base 10 + 25 + 30 = 65. Foe 200 → 135.
+Demonstrates a non-target context role and a modifier whose value scales via
+a formula evaluated against its owner.
+
+
+SCENARIO 409 — Independently-located body parts
 -----------------------------------------------
 
 !match new lp LP 8 4
@@ -10443,7 +10526,7 @@ mech, `parent` still resolves). `!part glue turret` snaps it back onto the
 parent's cell and hides it again (the last `!map` shows only the mech).
 
 
-SCENARIO 407 — AoE damage spread across body parts (damage_spread)
+SCENARIO 410 — AoE damage spread across body parts (damage_spread)
 ------------------------------------------------------------------
 
 !match new aoe AOE 8 4
@@ -10468,7 +10551,7 @@ bomber.lasthit records 90. Modes weighted (default) / uniform / fragment /
 main_only are picked via a mode arg or the aoe_default_mode rule.
 
 
-SCENARIO 408 — Status effects on body parts: immune + redirect
+SCENARIO 411 — Status effects on body parts: immune + redirect
 --------------------------------------------------------------
 
 !match new ps PS 6 3
@@ -10492,7 +10575,7 @@ Per-part `__status_immune` / `__status_redirect` vars override the rules.
 Only the apply path honors these; raw `!ent status` editing force-writes.
 
 
-SCENARIO 409 — Footprint-region part positioning + render priority
+SCENARIO 412 — Footprint-region part positioning + render priority
 ------------------------------------------------------------------
 
 !match new mt MT 10 6
@@ -10519,7 +10602,7 @@ arrows. Turning to face right rotates the `front` region to the right column,
 so the `H`s move to the right side and the arrows to the left.
 
 
-SCENARIO 410 — Spatial AoE on a multi-tile entity (origin + radius)
+SCENARIO 413 — Spatial AoE on a multi-tile entity (origin + radius)
 ------------------------------------------------------------------
 
 !match new sa SA 10 6
@@ -10545,7 +10628,88 @@ but NOT the tail (back row). So the whole 80 lands on the head (150%→main =
 how a blast that doesn't reach the whole big body is modeled.
 
 
-SCENARIO 411 — Range-band falloff (band primitive)
+SCENARIO 414 — Composite multi-tile entity: region head + torso parts
+---------------------------------------------------------------------
+
+!match new comp COMP 12 6
+!match use comp
+!ent add boss Boss 300 3 3 9
+!ent set_var boss footprint_w 2
+!ent set_var boss footprint_h 2
+!ent face boss right
+!part add boss head head 0 0 to_main_percent=150
+!part region head front
+!part add boss torso torso 0 0 to_main_percent=100
+!part region torso all
+!eval "len(footprint_cells('boss'))"
+!eval "len(footprint_cells('head'))"
+!eval "len(footprint_cells('torso'))"
+!ent add atk Atk 30 9 3 7
+!ent set_var atk actions.hit.target entity
+!ent set_var atk actions.hit.body "damage_part(part(target, args.p), args.d)"
+!action atk hit boss p=head d=40
+!action atk hit boss p=torso d=40
+!list
+!part list boss
+
+Expected: boss is a 2×2 entity (footprint_w/h = 2) facing right, so its
+footprint is 4 cells. The `head` region part = the `front` face → the 2
+forward (x=4) cells; the `torso` region part = `all` → 4 cells (region cells
+re-derive from the parent's live facing). Both are 0/0 indestructible
+passthrough zones, so damage routes fully to main by their percent: head 40
+× 150% = 60 (300→240), torso 40 × 100% = 40 (240→200). `len(footprint_cells())`
+returns 4 / 2 / 4 for boss / head / torso. The user's 2×2-with-front-head
+composite shape, end to end.
+
+
+SCENARIO 415 — Body part detach becomes a free standalone entity
+----------------------------------------------------------------
+
+!match new dp DP 10 5
+!match use dp
+!ent add ogre Ogre 100 5 3 5
+!part add ogre arm arm 30 30 to_main_percent=50
+!eval "has_part('ogre', 'arm')"
+!eval "part_of('arm')"
+!part detach arm
+!eval "has_part('ogre', 'arm')"
+!eval "part_of('arm')"
+!list
+
+Expected: while attached, `has_part('ogre','arm')` is true and
+`part_of('arm')` is `ogre`. `!part detach arm` turns the part into a FREE
+standalone entity at the parent's cell, keeping its hp (30/30): afterwards
+`has_part('ogre','arm')` is false and `part_of('arm')` is `''` (empty), and
+`!list` shows both Ogre and Arm as independent live entities.
+
+
+SCENARIO 416 — Parent death snapshots parts; revive restores them
+-----------------------------------------------------------------
+
+!match new pr PR 10 5
+!match use pr
+!ent add golem Golem 40 5 3 5
+!part add golem core core 25 25 to_main_percent=30
+!part add golem fist fist 20 20 to_main_percent=50
+!ent add cleric Cleric 30 1 3 12
+!ent set_var cleric actions.raise.target corpse
+!ent set_var cleric actions.raise.body "revive(target)"
+!ent hp golem -50
+!list
+!eval "has_corpse('golem')"
+!action cleric raise golem
+!list
+!part list golem
+
+Expected: golem (40 hp) dies to -50 damage. Its parts (core, fist) are
+snapshotted into the corpse and removed from the live roster, so `!list`
+shows only Cleric live + golem in the Dead: section (no orphaned limbs);
+`has_corpse('golem')` is true. `cleric raise golem` revives the corpse, and
+the parent's footprint/parts are restored for free — `!part list golem`
+again shows core and fist attached.
+
+
+SCENARIO 417 — Range-band falloff (band primitive)
 --------------------------------------------------
 
 !match new rb RB 12 3
@@ -10568,7 +10732,24 @@ band(value, spec) returns the first matching band's result — the doc's
 munition falloff without a chain of conditionals.
 
 
-SCENARIO 412 — Reusable macro with positional args
+SCENARIO 418 — Range-band: inclusive / open-ended / exact / default forms
+-------------------------------------------------------------------------
+
+!match new bnd BND 6 3
+!match use bnd
+!ent add d Dummy 100 2 2 9
+!ent set_var d actions.t.target none
+!ent set_var d actions.t.body "entity[self].a = band(1, '1-3:10,4+:20')\nentity[self].b = band(5, '1-3:10,4+:20')\nentity[self].c = band(2, '-1:1,3+:3', 99)\nentity[self].e = band(100, '1-2:5', -1)"
+!action d t
+!ent dump d
+
+Expected: `a` = 10 (1 falls in the inclusive 1-3 band); `b` = 20 (5 matches
+the open `4+` band); `c` = 99 (2 matches neither `-1` [≤1] nor `3+` [≥3], so
+the default 99 is returned); `e` = -1 (no band matches 100, default -1).
+Exercises lo-hi, lo+, -hi and the default fall-through.
+
+
+SCENARIO 419 — Reusable macro with positional args
 --------------------------------------------------
 
 !match new mc MC 8 4
@@ -10584,7 +10765,30 @@ buff hero 7` substitutes $1=hero, $2=7 and runs both lines as ONE undo
 entry, so hero gets blessed=1 and power=7. `macro list` shows `buff`.
 
 
-SCENARIO 413 — Condition-watcher (edge-triggered)
+SCENARIO 420 — Macro: $@ all-args, $() formula token preserved, one-undo-entry
+-----------------------------------------------------------------------------
+
+!match new mcr MCR 8 4
+!match use mcr
+!ent add hero Hero 100 2 2 9
+!macro set buff "ent set_var $1 atk $(10+5)\nent set_var $1 turns $2"
+!macro run buff hero 3
+!ent dump hero
+!macro set hurt "ent hp $@"
+!macro run hurt hero -40
+!list
+!undo command
+!list
+
+Expected: `macro run buff hero 3` substitutes $1=hero, $2=3, and leaves the
+$(10+5) formula token untouched for the dispatcher to evaluate → atk=15,
+turns=3. The `hurt` macro forwards $@ (ALL args, space-joined) as the
+command's arguments, so `macro run hurt hero -40` runs `ent hp hero -40` →
+hero 100→60. The whole macro is ONE undo entry, so `!undo command` reverts
+the macro — hero is back to 100.
+
+
+SCENARIO 421 — Condition-watcher (edge-triggered)
 -------------------------------------------------
 
 !match new wt WT 8 4
@@ -10603,7 +10807,31 @@ true (no NEW edge), so alarms STAYS 1 — watchers fire on the transition,
 not every poll. (Re-arms only after the condition goes false again.)
 
 
-SCENARIO 414 — Team resources + team-scoped modifiers
+SCENARIO 422 — Watchers: single-pass, next-poll chaining, once-removal
+----------------------------------------------------------------------
+
+!match new wt2 WT2 8 4
+!match use wt2
+!ent add hero Hero 100 2 2 9
+!ent set_var hero stage 0
+!watch add w1 "entity[hero].hp < 70" "entity[hero].stage = 1"
+!watch add w2 "entity[hero].stage == 1" "entity[hero].stage = 2" once
+!ent hp hero -40
+!ent dump hero
+!ent face hero left
+!ent dump hero
+!watch list
+
+Expected: `ent hp hero -40` (hp 60) trips w1's edge; because all edges are
+recorded BEFORE any effect runs, w2 still reads stage 0 this pass and does
+NOT fire — first dump shows stage 1. The next command (`ent face`) polls
+again: w1's condition is still true (no new edge), but w2 now sees stage==1,
+fires (false→true), sets stage 2, and `once` removes it — second dump shows
+stage 2. `watch list` shows only w1 remaining. Single-pass + next-poll
+chaining + once.
+
+
+SCENARIO 423 — Team resources + team-scoped modifiers
 -----------------------------------------------------
 
 !match new tm TM 8 4
@@ -10628,3 +10856,56 @@ to every red member: `!mod show red1 atk 5` folds to 15 (5 base + 10, source
 `team:red`), while blue1 (other team) stays 5. The team passive `onrnd`
 fires for red members on round start (self = the member). `!team get` reads
 the pool back.
+
+
+SCENARIO 424 — Team passives fire for members on turn start (not other teams)
+----------------------------------------------------------------------------
+
+!match new tmp TMP 8 4
+!match use tmp
+!ent add r1 R1 100 2 2 9
+!ent set_var r1 team red
+!ent add r2 R2 100 3 2 8
+!ent set_var r2 team red
+!ent add b1 B1 100 5 2 5
+!ent set_var b1 team blue
+!team set red morale 0
+!team passive add red rally on_turn_start "team_add('red', 'morale', 1)"
+!turn next
+!turn next
+!turn next
+!team get red morale
+
+Expected: the team passive `rally` fires on each red member's turn-start
+(self = that member) and bumps the shared `red.morale` via team_add. Turn
+order by initiative is r1(9), r2(8), b1(5): the first `turn next` starts
+r1's turn (red → morale 1), the second starts r2's (red → morale 2), the
+third starts b1's (blue → rally does NOT fire). `team get red morale` → 2.
+Demonstrates team-scoped passives firing for members only and team_add from
+a formula.
+
+
+SCENARIO 425 — Team modifier folds into a member's apply_mods; team_get gate
+---------------------------------------------------------------------------
+
+!match new tmm TMM 8 4
+!match use tmm
+!ent add r1 R1 100 2 2 9
+!ent set_var r1 team red
+!ent add foe Foe 200 4 2 5
+!ent set_var foe team blue
+!team set red modifiers.warcry.stat atk
+!team set red modifiers.warcry.op add
+!team set red modifiers.warcry.value 15
+!team set red power 1
+!ent set_var r1 actions.strike.target entity
+!ent set_var r1 actions.strike.body "entity[target].hp = entity[target].hp - apply_mods(self, 'atk', 20, []) * team_get('red', 'power', 0)"
+!action r1 strike foe
+!list
+
+Expected: red's `modifiers.warcry` (+15 atk) auto-applies to member r1, so
+apply_mods(r1,'atk',20,[]) folds to 35; multiplied by the team resource
+team_get('red','power') = 1 → 35 damage. Foe 200 → 165. A team modifier
+flowing into a member's combat formula AND a team resource read in the same
+body.
+
