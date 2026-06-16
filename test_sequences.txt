@@ -10746,6 +10746,9 @@ SCENARIO 418 — Destroyer: body segments trail the head; damage routes to main
 !ent move d right
 !ent move d right
 !list
+!map
+!ent add wall Wall 10 13 2
+!ent tp wall 8 2
 !ent add gun Gunner 30 2 4 7
 !ent set_var gun actions.shoot.target entity
 !ent set_var gun actions.shoot.body "damage_part(part(target, args.p), args.d)"
@@ -10756,9 +10759,13 @@ Expected: a head with three 0/0 indestructible body segments trailing behind
 it (laid to the left of the head at (8,2), so b0 (7,2), b1 (6,2), b2 (5,2)).
 Each `ent move d right` shifts the whole chain one cell into the head's
 vacated path — after two moves the head is at (10,2) and the body at (9,2)/
-(8,2)/(7,2). Shooting body segment b1 routes the full 25 × 100% to the
-head's main HP (120 → 95) while the 0/0 segment is unharmed: hit any part of
-the worm, damage the whole worm.
+(8,2)/(7,2). The whole worm RENDERS on the map (head + three body cells in a
+row) even though the segments are at 0/0 hp — an indestructible 0/0 entity
+reads as alive, so it isn't dropped from the map/occupancy. The body is solid
+to other movers: teleporting Wall onto a body cell (8,2) is blocked. Shooting
+body segment b1 routes the full 25 × 100% to the head's main HP (120 → 95)
+while the 0/0 segment is unharmed: hit any part of the worm, damage the whole
+worm.
 
 
 SCENARIO 419 — Snake sever (cascade): a cut destroys everything behind it

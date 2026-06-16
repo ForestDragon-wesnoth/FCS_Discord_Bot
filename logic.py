@@ -3246,7 +3246,15 @@ class Entity:
     # ---------- minimal primitives ----------
     @property
     def is_alive(self) -> bool:
-        return self.hp > 0
+        if self.hp > 0:
+            return True
+        # An INDESTRUCTIBLE entity sits on the board at 0 hp and never dies on
+        # its own (a 0/0 passthrough body part / zone — e.g. a Destroyer
+        # segment routing all damage to main). It is very much present, so it
+        # must read as alive — otherwise render, occupancy, and the spatial
+        # enumerators all silently drop it. Only reached when hp <= 0, so the
+        # extra check stays off the hot path.
+        return self._match is not None and self._match.is_indestructible(self)
 
     @property
     def is_part(self) -> bool:
