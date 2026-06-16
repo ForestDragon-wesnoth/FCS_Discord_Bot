@@ -975,6 +975,20 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     ## Entity card formatting (shown in !ent info)
+    "body_part_entity_line_suffix": {
+        "default": " [part of {parent}]",
+        "schema": {"type": "str"},
+        "desc": (
+            "Appended to the entity_line_format row (in !list / !state) for a "
+            "SUB-ENTITY — an entity attached as a body part / segment of "
+            "another (its `part_of` points at a live parent). Lets a roster "
+            "show at a glance which body a part belongs to. Placeholders: "
+            "{parent} (parent id), {parent_name} (parent's name), plus every "
+            "key entity_line_format exposes (resolved against the PART). Empty "
+            "= no suffix. Only parts that appear on the roster (located / "
+            "segment / region parts; glued parts are hidden) ever show it."
+        ),
+    },
     "entity_info_format": {
         "default": (
             "**{name}** (`{id}`)\\n"
@@ -1094,6 +1108,26 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "condition WHOLLY replaces the rule — for entities the "
             "engine should track by entirely different state (a robot "
             "that dies on `core_damaged == true` regardless of hp)."
+        ),
+    },
+    "alive_condition": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "Formula expression deciding whether an entity reads as ALIVE — "
+            "the gate behind Entity.is_alive, which governs render, occupancy, "
+            "and the spatial / roster enumerators (distinct from "
+            "death_condition, which triggers the death PIPELINE). Runs with "
+            "`self` bound to the entity. EMPTY (default) uses the built-in "
+            "rule: present when `hp > 0` OR the entity is indestructible (a "
+            "0/0 passthrough body part / zone that never dies on its own) — so "
+            "such a part still renders and occupies. Set a formula to "
+            "customize (it REPLACES the built-in, so include the carve-out "
+            "yourself if wanted, e.g. `entity[self].hp > 0 or "
+            "is_indestructible(self) or entity[self].undying`). Malformed / "
+            "erroring formula falls back to the built-in rule (never blanks "
+            "the board). Evaluated only when set, so the default stays on the "
+            "fast path."
         ),
     },
     "death_result": {
@@ -3246,15 +3280,32 @@ class Entity:
     # ---------- minimal primitives ----------
     @property
     def is_alive(self) -> bool:
+        m = self._match
+        # Configurable override: the alive_condition rule (a formula
+        # expression with `self` = this entity). Empty (default) uses the
+        # built-in rule below. Evaluated only when set, so the default stays
+        # on the fast path; guarded against recursion (a condition that calls
+        # an is_alive-using enumerator) via _alive_eval_depth; malformed /
+        # erroring formula falls back to the built-in (never blanks the board).
+        if m is not None and m._alive_eval_depth == 0:
+            cond = str(m.rules.get("alive_condition", "")).strip()
+            if cond:
+                from formula import FormulaEngine, EvalCtx, FormulaError
+                m._alive_eval_depth += 1
+                try:
+                    return bool(FormulaEngine(m).eval_expression(
+                        cond, EvalCtx(this=self.id, target=self.id)))
+                except FormulaError:
+                    pass
+                finally:
+                    m._alive_eval_depth -= 1
+        # Built-in rule: present when hp > 0, OR the entity is INDESTRUCTIBLE —
+        # a 0/0 passthrough body part / zone (e.g. a Destroyer segment routing
+        # all damage to main) sits on the board at 0 hp and never dies on its
+        # own, so it must still render / occupy / enumerate.
         if self.hp > 0:
             return True
-        # An INDESTRUCTIBLE entity sits on the board at 0 hp and never dies on
-        # its own (a 0/0 passthrough body part / zone — e.g. a Destroyer
-        # segment routing all damage to main). It is very much present, so it
-        # must read as alive — otherwise render, occupancy, and the spatial
-        # enumerators all silently drop it. Only reached when hp <= 0, so the
-        # extra check stays off the hot path.
-        return self._match is not None and self._match.is_indestructible(self)
+        return m is not None and m.is_indestructible(self)
 
     @property
     def is_part(self) -> bool:
@@ -4429,6 +4480,12 @@ class Match:
     # circuit nested checks. Reset to 0 once the death pipeline
     # finishes. Not serialized.
     _death_processing: int = field(default=0, repr=False, compare=False)
+    # Re-entry guard for the alive_condition formula. is_alive is called
+    # by render / occupancy / the spatial enumerators; a custom
+    # alive_condition that itself calls one of those (entities_within, ...)
+    # would recurse. While >0, is_alive falls back to the built-in rule.
+    # Not serialized — transient.
+    _alive_eval_depth: int = field(default=0, repr=False, compare=False)
     # Per-entity death-check suppression. Holds the ids whose automatic
     # death-condition re-check is currently deferred — used by
     # revive_corpse to shield ONLY the entity being respawned from its

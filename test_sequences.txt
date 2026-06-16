@@ -11073,3 +11073,49 @@ body.
 
 
 
+
+
+SCENARIO 432 — alive_condition rule: custom aliveness + is_indestructible
+-------------------------------------------------------------------------
+
+!match new ac AC 12 5
+!match use ac
+!ent add boss Boss 60 5 2
+!part segment boss seg Seg 0 0 to_main_percent=100
+!map
+!system set default alive_condition "entity[self].hp > 0"
+!map
+!system set default alive_condition "entity[self].hp > 0 or is_indestructible(self)"
+!map
+
+Expected: with the default (empty) alive_condition, the 0/0 indestructible
+body segment counts as alive and renders on the map alongside the boss
+(built-in carve-out). Setting alive_condition to `entity[self].hp > 0`
+REPLACES the built-in rule, so the 0/0 segment now reads as not-alive and
+drops off the map (only the boss glyph remains). Re-adding the carve-out with
+the is_indestructible(self) primitive brings the segment back — the GM owns
+the rule, and the primitive lets a custom condition reproduce the default
+behavior.
+
+
+SCENARIO 433 — body_part_entity_line_suffix: sub-entities show their parent
+---------------------------------------------------------------------------
+
+!match new sf SF 12 5
+!match use sf
+!ent add dragon Dragon 80 6 2
+!part add dragon head Head 20 20
+!part locate head 7 2
+!part segment dragon tail Tail 10 10
+!list
+!system set default body_part_entity_line_suffix " «{parent_name}#{parent}»"
+!list
+!system set default body_part_entity_line_suffix ""
+!list
+
+Expected: by default every sub-entity row in !list carries the
+` [part of {parent}]` suffix — the located Head and the Tail segment both
+show `[part of dragon]`, while Dragon's own line has none. A custom template
+` «{parent_name}#{parent}»` renders ` «Dragon#dragon»` on those rows instead.
+Setting the suffix empty removes the annotation entirely (the rows render as
+plain entity lines).
