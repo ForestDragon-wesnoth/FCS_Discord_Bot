@@ -49,6 +49,22 @@ them. Adding `summon`? Make it route through `Entity.spawn` so
 on_entity_spawned still fires. Adding `revive`? Make it run a
 configurable effects formula, not a hardcoded heal.
 
+### NO automated entity behavior / AI (intentional, lasting)
+
+The engine has **no AI / behavior layer**, and the user has confirmed
+this is **100% intentional and staying that way**. Every action is
+GM/player-invoked or driven by GM-authored data (passives, watchers,
+actions). Do NOT propose or build autonomous entity behavior —
+target-selection, pathfinding-to-enemy, "the monster takes its turn by
+itself." For a system this flexible, baking in AI would be
+unsustainable and exponentially hard (coding game AI is a different
+discipline, viable only for fully-hardcoded games). There are **no
+major plans to automate entities** beyond, *at most*, the absolute most
+primitive cases — a stationary turret, a very basic horde mover — and
+even those should fall out of existing primitives (a passive/watcher
+the GM writes), not a new AI subsystem. When a feature idea reduces to
+"the engine decides what an entity does," stop and reconsider.
+
 ### Backwards compat is irrelevant this early
 
 The user has said this repeatedly. **Rewrite > dual-implementation
@@ -1009,8 +1025,16 @@ More shipped work (continuing the list above):
     destruction, never a corpse). Authoring: `!part segment <head> <id> <name>
     <hp> <maxhp> [k=v ...]` appends to the tail; the summon-template `segments`
     list/dict chains a body at spawn. Serializes free (linkage is vars +
-    `part_of`). FUTURE the user may want: per-segment independent AI on splits,
-    spacing>1 in trail mode, branching (non-linear) bodies.
+    `part_of`). FUTURE (all low-priority / deferred): spacing>1 in `trail` mode
+    (currently always adjacent; `segment_spacing` only applies in `path` mode)
+    — the user is fine with the current spacing. Branching (non-linear, TREE)
+    bodies — a hydra / multi-tail where several segments share one `__follows`
+    predecessor; structurally invasive (chain walker + sever become subtree
+    ops), the user is NOT interested yet. NOTE explicitly OFF the table:
+    autonomous AI for split-off heads (or any entity) — see "NO automated
+    entity behavior" in §1; a promoted head is a complete independent UNIT
+    (own initiative + the stamped template's actions/passives), but it never
+    acts by itself.
 - **Stat / modifier system (derived effective stats) — SHIPPED (first slice).**
   A generic derived-stat layer: base stats stay plain vars (NEVER mutated);
   a modifier is a DATA record aggregated live from its source and combined on
