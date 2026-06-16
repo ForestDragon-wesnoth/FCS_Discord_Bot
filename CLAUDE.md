@@ -976,6 +976,41 @@ More shipped work (continuing the list above):
     ARC action economy + reactionary actions** (block/dodge → the reaction
     framework the choice-replay system seeded); fancier revive (regrow from
     template).
+  - **Snake / segmented bodies — SHIPPED (scenarios 418-422).** A SEGMENT is a
+    LOCATED part (own cell — renders/occupies/targetable) that also FOLLOWS the
+    head along a chain. Linkage: segments are parts of the head, each carrying
+    `__segment` + `__follows` (= the segment/head directly ahead);
+    `Match.snake_segments(head)` walks the chain head→tail, `is_snake_head`
+    detects a head. **Follow** (rule `segment_follow_mode`, head-var override
+    `__segment_follow`): `trail` (default) — each segment moves into the cell
+    the one ahead just vacated (always adjacent), driven per-cell from
+    `fire_entity_step`; `path` — the head's cell path is recorded
+    (`__seg_path`) and segments sit `segment_spacing` cells back (gaps). A
+    discontinuous head move (tp/swap/push — no per-cell steps) is detected in
+    `fire_entity_moved` via a stale `__seg_last` and re-lays the body straight
+    behind the head (`_resettle_snake`). **Self-collision** (rule
+    `segment_self_collision`, default False = pass-through, the Destroyer): the
+    head ignores its OWN segments for occupancy via `Match._occupancy_ignore`
+    (threaded through move_dirs / tp `_validate_placement` / push / pull /
+    swap); True = blocked by its body (classic Snake). Other movers are always
+    blocked by segments. **Death/sever** (rule `segment_death_mode`, segment-
+    or head-var override `__segment_death_mode`), applied in
+    `_process_part_death` → `_sever_segment` when an own-hp segment is
+    destroyed: `solid` (Destroyer — segments are 0/0 indestructible routing to
+    main, never individually die, whole snake dies with the head); `cascade`
+    (destroying a segment removes it + every segment BEHIND it, no corpses);
+    `split` (Eater of Worlds — the segment behind the cut is PROMOTED to a new
+    independent head via `_promote_segment_to_head`: clears the part/segment
+    linkage, stamps `segment_split_head_template` [head-var override
+    `__segment_split_head_template`, dotted-fill of MISSING vars via
+    `_fill_missing_vars`], inherits the old head's initiative; trailing
+    segments re-parent to it; the cut segment is removed → one worm becomes
+    two). Built on the part-corpse invariant (killing a segment is limb
+    destruction, never a corpse). Authoring: `!part segment <head> <id> <name>
+    <hp> <maxhp> [k=v ...]` appends to the tail; the summon-template `segments`
+    list/dict chains a body at spawn. Serializes free (linkage is vars +
+    `part_of`). FUTURE the user may want: per-segment independent AI on splits,
+    spacing>1 in trail mode, branching (non-linear) bodies.
 - **Stat / modifier system (derived effective stats) — SHIPPED (first slice).**
   A generic derived-stat layer: base stats stay plain vars (NEVER mutated);
   a modifier is a DATA record aggregated live from its source and combined on
@@ -1073,19 +1108,19 @@ More shipped work (continuing the list above):
     value (still stored — could be a formula). Entity color stays literal-var
     only (not formula) — unchanged. Scenario 404. Long-term someday: an
     actual image-rendered map.
-- **Range-band primitive — SHIPPED (scenarios 418-419).** `band(value, spec,
+- **Range-band primitive — SHIPPED (scenarios 423-424).** `band(value, spec,
   default=None)` (a pure `_ALLOWED_FUNCS` func) looks `value` up in a banded
   table `spec` ('1-2:120,3-5:100,6-9:80,10+:0'), FIRST match wins. Ranges:
   `lo-hi` (inclusive), `n` (exact), `lo+`/`lo-` (lo and up), `-hi` (up to hi).
   Result coerced to a number when numeric. No match → `default`, else raises.
   Models the doc's munition falloff without a conditional chain.
-- **Reusable named macros — SHIPPED (scenarios 420-421).** `Match.macros` (name ->
+- **Reusable named macros — SHIPPED (scenarios 425-426).** `Match.macros` (name ->
   newline-separated command body). `!macro set/run/list/show/remove`. `run`
   substitutes $1/$2/.../$@ (positional; missing → ""; leaves $(...) formula
   tokens alone, via `_macro_subst`) then dispatches each line via
   `dispatch_no_snapshot` — so the whole macro is ONE undo entry (the !macro
   command itself is snapshotted). Per-match, serialized.
-- **Condition-watchers — SHIPPED (scenarios 422-423).** `Match.watchers` (name ->
+- **Condition-watchers — SHIPPED (scenarios 427-428).** `Match.watchers` (name ->
   {condition, effect, once, last}). EDGE-triggered: `Match.fire_watchers`
   evaluates each condition (a formula expr), records all edges, then runs the
   effect (a formula program) for any that went false→true; `once` removes
@@ -1097,7 +1132,7 @@ More shipped work (continuing the list above):
   re-fire. Distinct from event passives: fires on the condition's transition
   regardless of what changed it.
 - **Team-level state (resources + modifiers + passives) — SHIPPED (scenarios
-  424-426).** `Match.team_data` (team -> free-form dict) + `team_passives` (team
+  429-431).** `Match.team_data` (team -> free-form dict) + `team_passives` (team
   -> {pid: Passive}). (1) Resources: `team_get/team_has/team_set/team_add`
   (Match methods + formula prims; dotted paths) and `!team set/get/add/list/
   clear`. (2) Team-scoped MODIFIERS: a `modifiers` bundle in a team's data

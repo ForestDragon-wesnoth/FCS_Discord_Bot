@@ -369,6 +369,73 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "indestructible regardless of this rule."
         ),
     },
+    "segment_follow_mode": {
+        "default": "trail",
+        "schema": {"type": "str", "choices": ["trail", "path"]},
+        "desc": (
+            "How a snake's body segments follow the head. `trail` "
+            "(default): each segment moves into the cell the one ahead just "
+            "vacated — an always-adjacent body. `path`: the head's recent "
+            "cell path is recorded and segments sit at `segment_spacing`-cell "
+            "offsets back along it (allows gaps and is faithful for fast / "
+            "teleporting heads). Per-snake override: the head's "
+            "`__segment_follow` var."
+        ),
+    },
+    "segment_spacing": {
+        "default": 1,
+        "schema": {"type": "int"},
+        "desc": (
+            "For `path` follow mode, how many cells of head travel separate "
+            "consecutive segments (1 = adjacent). Ignored by `trail` mode "
+            "(always adjacent). Per-snake override: the head's "
+            "`__segment_spacing` var."
+        ),
+    },
+    "segment_self_collision": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether a snake's head is BLOCKED by its own body segments. "
+            "False (default): the head passes through its own body (the "
+            "Terraria-Destroyer behavior) — its segments are ignored by the "
+            "head's occupancy check. True: moving the head into one of its "
+            "own segment cells is blocked, like classic Snake. Other "
+            "entities are always blocked by segments either way. Per-snake "
+            "override: the head's `__segment_self_collision` var."
+        ),
+    },
+    "segment_death_mode": {
+        "default": "none",
+        "schema": {"type": "str",
+                   "choices": ["none", "solid", "cascade", "split"]},
+        "desc": (
+            "What happens when a body SEGMENT (own-HP) is destroyed. `none`: "
+            "it just becomes a dead limb (default part behavior). `solid` "
+            "(Destroyer): segments are treated as a single HP pool — they "
+            "should be 0/0 indestructible parts routing to main, so they "
+            "never individually die; the whole snake dies with the head. "
+            "`cascade`: destroying a segment also destroys every segment "
+            "BEHIND it (the back of the worm is severed and removed). "
+            "`split` (Eater of Worlds): the segment behind the destroyed one "
+            "is PROMOTED to a new independent head, the trailing segments "
+            "re-parent to it, and the new head is stamped with "
+            "`segment_split_head_template` — one snake becomes two. Per-snake "
+            "override: the head's (or a segment's) `__segment_death_mode` var."
+        ),
+    },
+    "segment_split_head_template": {
+        "default": {},
+        "schema": {"type": "dict"},
+        "desc": (
+            "Vars merged onto a segment when it is PROMOTED to a head by a "
+            "`split` sever (dotted paths -> values, like default_entity_vars; "
+            "applied only to keys missing on the promoted segment). The home "
+            "for the head's actions / passives / AI vars so each severed worm "
+            "comes up fully functional. Per-snake override: the original "
+            "head's `__segment_split_head_template` var (an inline dict)."
+        ),
+    },
     "hit_location_mode": {
         "default": "weighted",
         "schema": {"type": "str", "choices": ["weighted", "uniform"]},
@@ -3203,6 +3270,16 @@ class Entity:
         return self.is_part and bool(self.vars.get("__part_located"))
 
     @property
+    def is_segment(self) -> bool:
+        """True for a snake/worm body SEGMENT (the `__segment` var). A segment
+        is a LOCATED part (own cell — renders, occupies, is targetable) that
+        ALSO follows the head along the body chain (`__follows` points at the
+        segment/head directly ahead). The follow movement, the
+        segment_death_mode sever behaviors, and the self-collision toggle are
+        what distinguish it from a plain located part."""
+        return self.is_part and bool(self.vars.get("__segment"))
+
+    @property
     def is_region_part(self) -> bool:
         """True for a body part auto-positioned over a REGION of the parent's
         footprint (the `__part_region` var: front/back/left/right/center/all
@@ -3509,8 +3586,9 @@ class Entity:
         # this is the one occupancy gate; a large entity's whole
         # destination footprint must be clear.
         if not self.is_cell_stackable:
+            ig = m._occupancy_ignore(self)
             for cx, cy in m.entity_cells(self, x, y):
-                if m.cell_occupant(cx, cy, (self.id,)) is not None:
+                if m.cell_occupant(cx, cy, ig) is not None:
                     raise Occupied(f"Cell ({cx},{cy}) already occupied")
 
         # Phase 2: commit each step, firing hooks. No more validation —
@@ -4833,6 +4911,168 @@ class Match:
                     and (e.x != parent.x or e.y != parent.y):
                 e.x = parent.x
                 e.y = parent.y
+
+    # ---------- snake / segmented bodies ----------
+    def snake_segments(self, head_id: str) -> List["Entity"]:
+        """The ordered body chain of a snake (head -> tail). Built by walking
+        each segment's `__follows` back-pointer from the head; assumes a
+        linear chain (one successor per node). Empty if `head_id` has no
+        segments."""
+        segs = [e for e in self.entities.values()
+                if e.part_of == head_id and e.vars.get("__segment")]
+        by_pred: Dict[str, "Entity"] = {}
+        for s in segs:
+            by_pred[str(s.vars.get("__follows", ""))] = s
+        chain: List["Entity"] = []
+        seen: set = set()
+        cur = head_id
+        while True:
+            nxt = by_pred.get(cur)
+            if nxt is None or nxt.id in seen:
+                break
+            chain.append(nxt)
+            seen.add(nxt.id)
+            cur = nxt.id
+        return chain
+
+    def is_snake_head(self, eid: str) -> bool:
+        """True iff `eid` has at least one body segment attached."""
+        return any(e.part_of == eid and e.vars.get("__segment")
+                   for e in self.entities.values())
+
+    def _segment_cfg(self, head: "Entity", var: str, rule: str) -> Any:
+        """Resolve a per-snake setting: the head's override var if present,
+        else the gamerule."""
+        v = head.vars.get(var)
+        return self.rules.get(rule) if v is None else v
+
+    def _advance_snake(self, head_id: str, prev_x: int, prev_y: int) -> None:
+        """Advance a snake's body one cell after the head stepped from
+        (prev_x, prev_y) to its current cell. Pure position writes (no
+        movement hooks), so it never recurses through fire_entity_*."""
+        head = self.entities.get(head_id)
+        if head is None:
+            return
+        chain = self.snake_segments(head_id)
+        if not chain:
+            return
+        mode = str(self._segment_cfg(head, "__segment_follow", "segment_follow_mode"))
+        if mode == "path":
+            self._advance_snake_path(head, chain)
+        else:
+            old = [(s.x, s.y) for s in chain]
+            chain[0].x, chain[0].y = prev_x, prev_y
+            for i in range(1, len(chain)):
+                chain[i].x, chain[i].y = old[i - 1]
+        head.vars["__seg_last"] = [head.x, head.y]
+
+    def _advance_snake_path(self, head: "Entity", chain: List["Entity"]) -> None:
+        """`path` follow mode: prepend the head's current cell to the recorded
+        path and place each segment `spacing` cells further back along it."""
+        try:
+            spacing = max(1, int(self._segment_cfg(
+                head, "__segment_spacing", "segment_spacing")))
+        except (TypeError, ValueError):
+            spacing = 1
+        path = head.vars.get("__seg_path")
+        if not isinstance(path, list):
+            path = []
+        path.insert(0, [head.x, head.y])
+        need = (len(chain) + 1) * spacing + 1
+        del path[need:]
+        head.vars["__seg_path"] = path
+        for i, s in enumerate(chain):
+            idx = min((i + 1) * spacing, len(path) - 1)
+            s.x, s.y = path[idx][0], path[idx][1]
+
+    def _resettle_snake(self, head_id: str) -> None:
+        """Re-lay a snake's body in a straight line behind the head, used
+        after a discontinuous head move (teleport / swap / push) where there
+        were no per-cell steps to trail through."""
+        head = self.entities.get(head_id)
+        if head is None:
+            return
+        chain = self.snake_segments(head_id)
+        if not chain:
+            return
+        try:
+            spacing = max(1, int(self._segment_cfg(
+                head, "__segment_spacing", "segment_spacing")))
+        except (TypeError, ValueError):
+            spacing = 1
+        bdx, bdy = FACING_VECTORS.get(getattr(head, "facing", "up"), (0, -1))
+        bdx, bdy = -bdx, -bdy            # behind = opposite of facing
+        path = [[head.x, head.y]]
+        for i, s in enumerate(chain):
+            cx = head.x + bdx * (i + 1) * spacing
+            cy = head.y + bdy * (i + 1) * spacing
+            if not self.in_bounds(cx, cy):
+                cx, cy = s.x, s.y        # off-grid: leave the segment put
+            s.x, s.y = cx, cy
+            path.append([cx, cy])
+        head.vars["__seg_last"] = [head.x, head.y]
+        if str(self._segment_cfg(head, "__segment_follow",
+                                 "segment_follow_mode")) == "path":
+            head.vars["__seg_path"] = path
+
+    def _find_segment_cell(self, px: int, py: int,
+                           bdx: int, bdy: int) -> Optional[Tuple[int, int]]:
+        """A free, in-bounds cell to place a new segment near (px, py),
+        preferring the cell directly 'behind' (px+bdx, py+bdy) then a ring
+        around the predecessor and the behind cell."""
+        cands = [(px + bdx, py + bdy)]
+        for ox in (-1, 0, 1):
+            for oy in (-1, 0, 1):
+                if ox or oy:
+                    cands.append((px + bdx + ox, py + bdy + oy))
+                    cands.append((px + ox, py + oy))
+        seen = set()
+        for cx, cy in cands:
+            if (cx, cy) in seen:
+                continue
+            seen.add((cx, cy))
+            if self.in_bounds(cx, cy) and self.cell_occupant(cx, cy) is None:
+                return (cx, cy)
+        return None
+
+    def add_segment(self, head_id: str, seg_id: str, name: str,
+                    hp: int, max_hp: int,
+                    extra_vars: Optional[Dict[str, Any]] = None
+                    ) -> Tuple["Entity", List[str]]:
+        """Append a body SEGMENT to a snake's tail: a located part of
+        `head_id` that follows the chain, placed in a free cell behind the
+        current tail (or the head if first). Sets __segment / __part_located /
+        __follows (= the predecessor). Raises NotFound / DuplicateId /
+        VTTError (no free cell)."""
+        head = self.entities.get(head_id)
+        if head is None:
+            raise NotFound(f"Entity '{head_id}' not found.")
+        if seg_id in self._taken_entity_ids():
+            raise DuplicateId(
+                f"Entity id '{seg_id}' already exists in this match.")
+        chain = self.snake_segments(head_id)
+        pred = chain[-1] if chain else head
+        bdx, bdy = FACING_VECTORS.get(getattr(head, "facing", "up"), (0, -1))
+        cell = self._find_segment_cell(pred.x, pred.y, -bdx, -bdy)
+        if cell is None:
+            raise VTTError(
+                f"No free cell behind `{pred.id}` to place the segment.")
+        hp_var, mhp_var, _ = head._vital_var_names()
+        svars: Dict[str, Any] = {
+            hp_var: int(hp), mhp_var: int(max_hp),
+            self.part_name_var(): name,
+            "__part_located": True, "__segment": True, "__follows": pred.id,
+        }
+        if extra_vars:
+            svars.update(extra_vars)
+        e = Entity(id=seg_id, name=name, x=cell[0], y=cell[1],
+                   vars=svars, part_of=head_id)
+        _, log = e.spawn(self, cell[0], cell[1])
+        head.vars.setdefault("__seg_last", [head.x, head.y])
+        # Seed the path (for `path` follow mode) with the head's current cell
+        # so segments reach full spacing without a warm-up lag.
+        head.vars.setdefault("__seg_path", [[head.x, head.y]])
+        return e, log
 
     def create_part(self, parent_id: str, part_id: str, name: str,
                     hp: int, max_hp: int,
@@ -6378,6 +6618,18 @@ class Match:
                 return eid
         return None
 
+    def _occupancy_ignore(self, e: "Entity",
+                          extra: Tuple[str, ...] = ()) -> Tuple[str, ...]:
+        """Ids a moving entity ignores for occupancy: always itself, PLUS its
+        own snake-body segments when `e` is a snake head with self-collision
+        OFF (the Destroyer passes through its own body; a classic-Snake head
+        is blocked by it). Other movers see segments as occupying normally."""
+        ids: Tuple[str, ...] = (e.id,) + tuple(extra)
+        if self.is_snake_head(e.id) and not bool(self._segment_cfg(
+                e, "__segment_self_collision", "segment_self_collision")):
+            ids += tuple(s.id for s in self.snake_segments(e.id))
+        return ids
+
     def is_occupied(self, x: int, y: int, ignore_entity_id: Optional[str] = None) -> bool:
         """True when the cell (x, y) is covered by the footprint of an
         entity that BLOCKS others from entering — i.e. an alive
@@ -6426,8 +6678,9 @@ class Match:
         # entity to the match, when those can't see the parent yet.
         glued = bool(e.part_of) and not e.vars.get("__part_located")
         if not e.is_cell_stackable and not glued:
+            ignore_ids = self._occupancy_ignore(e)
             for cx, cy in cells:
-                if self.cell_occupant(cx, cy, (e.id,)) is not None:
+                if self.cell_occupant(cx, cy, ignore_ids) is not None:
                     raise Occupied(f"Cell ({cx},{cy}) already occupied")
         if mode is not None:
             for cx, cy in cells:
@@ -6562,7 +6815,7 @@ class Match:
             if not self.footprint_in_bounds(e, nx, ny):
                 break
             if not stackable and any(
-                    self.cell_occupant(cx, cy, (e.id,)) is not None
+                    self.cell_occupant(cx, cy, self._occupancy_ignore(e)) is not None
                     for cx, cy in self.entity_cells(e, nx, ny)):
                 break
             # A blocked cell stops the push at the cell before it (knockback
@@ -6640,7 +6893,7 @@ class Match:
             if not self.footprint_in_bounds(e, nx, ny):
                 break
             if not stackable and any(
-                    self.cell_occupant(cx, cy, (e.id,)) is not None
+                    self.cell_occupant(cx, cy, self._occupancy_ignore(e)) is not None
                     for cx, cy in self.entity_cells(e, nx, ny)):
                 break
             # Blocking stops the drag at the cell before a blocked one,
@@ -6696,8 +6949,9 @@ class Match:
                         f"swap: ({cx},{cy}) outside "
                         f"{self.grid_width}x{self.grid_height} for `{mover.id}`")
             if not mover.is_cell_stackable:
+                ig = self._occupancy_ignore(mover, extra=pair)
                 for cx, cy in self.entity_cells(mover, mx, my):
-                    if self.cell_occupant(cx, cy, pair) is not None:
+                    if self.cell_occupant(cx, cy, ig) is not None:
                         raise Occupied(
                             f"swap: cell ({cx},{cy}) occupied — `{mover.id}` "
                             f"doesn't fit at the swap target")
@@ -7771,6 +8025,15 @@ class Match:
         # Glue attached body parts to the parent's new cell (before
         # on_entity_moved passives fire, so they observe the moved parts).
         self._restamp_parts_for(entity_id)
+        # Snake body: a stepwise move already trailed the chain per
+        # fire_entity_step (which left __seg_last == the head's cell). A
+        # discontinuous move (teleport / swap / push with no per-cell steps)
+        # leaves __seg_last stale, so re-lay the body straight behind the head.
+        if self.is_snake_head(entity_id):
+            last = e.vars.get("__seg_last")
+            if not (isinstance(last, list) and len(last) == 2
+                    and last[0] == e.x and last[1] == e.y):
+                self._resettle_snake(entity_id)
         from formula import FormulaEngine, EvalCtx
         engine = FormulaEngine(self)
         this_id = self.current_entity_id()
@@ -7813,6 +8076,10 @@ class Match:
         e = self.entities.get(entity_id)
         if e is None:
             return []
+        # Snake body: trail the chain one cell into the head's vacated
+        # position (from_x, from_y), before passives observe the move.
+        if self.is_snake_head(entity_id):
+            self._advance_snake(entity_id, from_x, from_y)
         from formula import FormulaEngine, EvalCtx
         engine = FormulaEngine(self)
         this_id = self.current_entity_id()
@@ -8164,6 +8431,35 @@ class Match:
                 # A malformed part entry (missing hp var, id clash) is
                 # skipped rather than aborting the whole summon.
                 pass
+        # Snake body: a `segments` list/dict spawns SEGMENTS chained behind
+        # the head (this entity), in order. Each entry: {name?, id?, hp,
+        # maxhp, vars?}. add_segment finds a free trailing cell and sets the
+        # __segment / __follows linkage. Reserved template key like `parts`.
+        seg_spec = template.get("segments")
+        if isinstance(seg_spec, dict):
+            seg_items = list(seg_spec.items())
+        elif isinstance(seg_spec, (list, tuple)):
+            seg_items = [(None, st) for st in seg_spec]
+        else:
+            seg_items = []
+        for role, st in seg_items:
+            if not isinstance(st, dict):
+                continue
+            svars = copy.deepcopy(st.get("vars", {}) or {})
+            if role is not None and name_var not in svars:
+                svars[name_var] = role
+            sname = str(st.get("name") or svars.get(name_var) or f"{new_id}_seg")
+            sid = self.mint_entity_id(str(st.get("id") or sname))
+            try:
+                shp = int(st.get("hp", 0))
+                smhp = int(st.get("maxhp", shp))
+            except (TypeError, ValueError):
+                continue
+            try:
+                _, slog = self.add_segment(new_id, sid, sname, shp, smhp, svars)
+                log += slog
+            except VTTError:
+                pass
         return new_id, log
 
     def _find_free_cell_near(
@@ -8485,7 +8781,78 @@ class Match:
             if vital and p.part_of in self.entities:
                 _, klog = self.kill_entity(p.part_of)
                 log += klog
+            # Snake segment: apply the sever behavior (cascade / split). Done
+            # after the vital check — if `vital` already killed the head, the
+            # whole-creature death cascade removed the parts and is_segment is
+            # now false, so this is a no-op.
+            if p.is_segment:
+                log += self._sever_segment(p)
         return log
+
+    def _sever_segment(self, p: "Entity") -> List[str]:
+        """Apply a destroyed segment's `segment_death_mode`:
+          cascade — destroy `p` and every segment BEHIND it (the back of the
+                    worm is severed and removed; no corpses).
+          split   — remove `p` (the cut), promote the segment behind it to a
+                    new independent head, re-parent the rest of the tail to
+                    it, and stamp segment_split_head_template.
+        `none` / `solid` do nothing extra (the segment just lingers as a dead
+        limb). Resolution: the segment's `__segment_death_mode` var > the
+        head's > the rule."""
+        head_id = p.part_of
+        head = self.entities.get(head_id)
+        if head is None:
+            return []
+        mode = str(p.vars.get("__segment_death_mode")
+                   or head.vars.get("__segment_death_mode")
+                   or self.rules.get("segment_death_mode", "none"))
+        if mode in ("none", "solid"):
+            return []
+        chain = self.snake_segments(head_id)
+        if p not in chain:
+            return []
+        k = chain.index(p)
+        behind = chain[k + 1:]
+        log: List[str] = []
+        if mode == "cascade":
+            for s in [p] + behind:
+                self.log_event("segment_severed", entity=s.id,
+                               mode="cascade", part_of=head_id)
+                s.remove()
+            log.append(
+                f"`{head_id}` severed at `{p.id}`: "
+                f"{len(behind) + 1} segment(s) destroyed.")
+        elif mode == "split":
+            if behind:
+                newhead = behind[0]
+                self._promote_segment_to_head(newhead, head)
+                for s in behind[1:]:
+                    s.part_of = newhead.id
+                log.append(
+                    f"`{head_id}` split at `{p.id}`: `{newhead.id}` is now an "
+                    f"independent head trailing {len(behind) - 1} segment(s).")
+            self.log_event("segment_severed", entity=p.id,
+                           mode="split", part_of=head_id)
+            p.remove()
+            self._rebuild_turn_order()
+        return log
+
+    def _promote_segment_to_head(self, seg: "Entity", old_head: "Entity") -> None:
+        """Turn a body segment into a free, living, independent head: clear
+        its segment/part linkage, stamp the split-head template (missing keys
+        only — actions/passives/AI vars), and give it the old head's
+        initiative if it has none so it acts on its own."""
+        for k in ("__segment", "__follows", "__part_located",
+                  "__part_destroyed", "__seg_path", "__seg_last"):
+            seg.vars.pop(k, None)
+        seg.part_of = None
+        tmpl = old_head.vars.get("__segment_split_head_template")
+        if not isinstance(tmpl, dict):
+            tmpl = self.rules.get("segment_split_head_template")
+        self._fill_missing_vars(seg, tmpl)
+        if seg.initiative is None and old_head.initiative is not None:
+            seg.initiative = old_head.initiative
+        seg.vars["__seg_last"] = [seg.x, seg.y]
 
     # ---------- status-on-part rules + AoE damage spread ----------
     def _part_status_names(self, e: "Entity", var_key: str,
@@ -9125,7 +9492,13 @@ class Match:
         (dict/list) isn't shared across entities. Malformed paths /
         non-dict rule are skipped silently (same convention as the other
         spawn-time defaulters)."""
-        defaults = self.rules.get("default_entity_vars") or {}
+        self._fill_missing_vars(entity, self.rules.get("default_entity_vars"))
+
+    def _fill_missing_vars(self, entity: "Entity", defaults: Any) -> None:
+        """Fill `entity`'s MISSING vars from a {dotted-path -> value} dict
+        (injection, not enforcement: a path the entity already has is kept).
+        Values are deep-copied; malformed paths / non-dict input skipped.
+        Shared by default_entity_vars and the split-head template stamp."""
         if not isinstance(defaults, dict):
             return
         for path, value in defaults.items():

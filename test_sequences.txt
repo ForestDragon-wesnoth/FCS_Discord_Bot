@@ -10732,7 +10732,139 @@ core cascades to the parent: the ogre dies and leaves ONE corpse
 (`has_corpse('ogre')` True) with its parts snapshotted inside, while
 `has_corpse('core')` is False. Corpses are a parent-only concept.
 
-SCENARIO 418 — Range-band falloff (band primitive)
+SCENARIO 418 — Destroyer: body segments trail the head; damage routes to main
+------------------------------------------------------------------------------
+
+!match new dz DZ 16 5
+!match use dz
+!ent add d Destroyer 120 8 2 9
+!ent face d right
+!part segment d b0 Body0 0 0 to_main_percent=100
+!part segment d b1 Body1 0 0 to_main_percent=100
+!part segment d b2 Body2 0 0 to_main_percent=100
+!list
+!ent move d right
+!ent move d right
+!list
+!ent add gun Gunner 30 2 4 7
+!ent set_var gun actions.shoot.target entity
+!ent set_var gun actions.shoot.body "damage_part(part(target, args.p), args.d)"
+!action gun shoot d p=b1 d=25
+!list
+
+Expected: a head with three 0/0 indestructible body segments trailing behind
+it (laid to the left of the head at (8,2), so b0 (7,2), b1 (6,2), b2 (5,2)).
+Each `ent move d right` shifts the whole chain one cell into the head's
+vacated path — after two moves the head is at (10,2) and the body at (9,2)/
+(8,2)/(7,2). Shooting body segment b1 routes the full 25 × 100% to the
+head's main HP (120 → 95) while the 0/0 segment is unharmed: hit any part of
+the worm, damage the whole worm.
+
+
+SCENARIO 419 — Snake sever (cascade): a cut destroys everything behind it
+-------------------------------------------------------------------------
+
+!match new cs CS 18 4
+!match use cs
+!system set default segment_death_mode cascade
+!ent add w Worm 50 9 2 9
+!ent face w right
+!part segment w s0 Seg0 12 12
+!part segment w s1 Seg1 12 12
+!part segment w s2 Seg2 12 12
+!part segment w s3 Seg3 12 12
+!ent add g Gun 30 2 3 7
+!ent set_var g actions.cut.target entity
+!ent set_var g actions.cut.body "damage_part(part(target, args.p), 99)"
+!action g cut w p=s1
+!part list w
+!list
+
+Expected: each segment has its own 12 hp and segment_death_mode is cascade.
+Cutting s1 (99 damage) destroys it AND every segment behind it (s2, s3) —
+the back of the worm is severed and removed (no corpses). The head w and the
+front segment s0 survive; `!part list w` shows only s0 still attached.
+
+
+SCENARIO 420 — Snake split (Eater of Worlds): a cut spawns a second head
+------------------------------------------------------------------------
+
+!match new ew EW 22 4
+!match use ew
+!system set default segment_death_mode split
+!ent add e Eater 60 11 2 9
+!ent face e right
+!ent set_var e __segment_split_head_template.color red
+!part segment e s0 Seg0 15 15
+!part segment e s1 Seg1 15 15
+!part segment e s2 Seg2 15 15
+!part segment e s3 Seg3 15 15
+!ent add g Gun 30 2 3 7
+!ent set_var g actions.cut.target entity
+!ent set_var g actions.cut.body "damage_part(part(target, args.p), 99)"
+!action g cut e p=s1
+!part list e
+!part list s2
+!ent dump s2
+!list
+
+Expected: with segment_death_mode split, cutting s1 removes the cut segment
+and PROMOTES the segment behind it (s2) into a new independent head; the
+remaining tail (s3) re-parents to follow s2, and s2 is stamped with the
+configured split-head template (color=red) plus the original Eater's
+initiative so it acts on its own. The original Eater keeps its front
+(`!part list e` shows s0); `!part list s2` shows s3. One worm became two.
+
+
+SCENARIO 421 — Snake self-collision: pass-through vs blocked
+------------------------------------------------------------
+
+!match new sc SC 14 8
+!match use sc
+!ent add a SnakeA 30 5 2 9
+!ent face a right
+!part segment a a0 A0 5 5
+!part segment a a1 A1 5 5
+!ent move a left
+!list
+!system set default segment_self_collision true
+!ent add b SnakeB 30 5 5 9
+!ent face b right
+!part segment b b0 B0 5 5
+!part segment b b1 B1 5 5
+!ent move b left
+!list
+
+Expected: SnakeA uses the default (self-collision OFF), so moving its head
+LEFT — into the cell its own segment a0 occupies — is allowed (the Destroyer
+passes through itself); A's head ends at (4,2). After turning self-collision
+ON, SnakeB's head moving LEFT into its own body cell (b0) is BLOCKED, so B's
+head stays at (5,5). Other entities are blocked by segments either way.
+
+
+SCENARIO 422 — Path follow mode: spaced segments along the head's trail
+-----------------------------------------------------------------------
+
+!match new pm PM 22 4
+!match use pm
+!system set default segment_follow_mode path
+!system set default segment_spacing 2
+!ent add h Centipede 40 14 2 9
+!ent face h right
+!part segment h s0 S0 6 6
+!part segment h s1 S1 6 6
+!ent move h right
+!ent move h right
+!ent move h right
+!ent move h right
+!list
+
+Expected: in `path` follow mode with segment_spacing 2, segments ride the
+head's recorded path two cells apart instead of adjacent. After the head
+walks right to (18,2), s0 sits 2 cells back along the path (16,2) and s1 4
+cells back (14,2) — gaps between body cells, the centipede/path look.
+
+SCENARIO 423 — Range-band falloff (band primitive)
 --------------------------------------------------
 
 !match new rb RB 12 3
@@ -10755,7 +10887,7 @@ band(value, spec) returns the first matching band's result — the doc's
 munition falloff without a chain of conditionals.
 
 
-SCENARIO 419 — Range-band: inclusive / open-ended / exact / default forms
+SCENARIO 424 — Range-band: inclusive / open-ended / exact / default forms
 -------------------------------------------------------------------------
 
 !match new bnd BND 6 3
@@ -10772,7 +10904,7 @@ the default 99 is returned); `e` = -1 (no band matches 100, default -1).
 Exercises lo-hi, lo+, -hi and the default fall-through.
 
 
-SCENARIO 420 — Reusable macro with positional args
+SCENARIO 425 — Reusable macro with positional args
 --------------------------------------------------
 
 !match new mc MC 8 4
@@ -10788,7 +10920,7 @@ buff hero 7` substitutes $1=hero, $2=7 and runs both lines as ONE undo
 entry, so hero gets blessed=1 and power=7. `macro list` shows `buff`.
 
 
-SCENARIO 421 — Macro: $@ all-args, $() formula token preserved, one-undo-entry
+SCENARIO 426 — Macro: $@ all-args, $() formula token preserved, one-undo-entry
 -----------------------------------------------------------------------------
 
 !match new mcr MCR 8 4
@@ -10811,7 +10943,7 @@ hero 100→60. The whole macro is ONE undo entry, so `!undo command` reverts
 the macro — hero is back to 100.
 
 
-SCENARIO 422 — Condition-watcher (edge-triggered)
+SCENARIO 427 — Condition-watcher (edge-triggered)
 -------------------------------------------------
 
 !match new wt WT 8 4
@@ -10830,7 +10962,7 @@ true (no NEW edge), so alarms STAYS 1 — watchers fire on the transition,
 not every poll. (Re-arms only after the condition goes false again.)
 
 
-SCENARIO 423 — Watchers: single-pass, next-poll chaining, once-removal
+SCENARIO 428 — Watchers: single-pass, next-poll chaining, once-removal
 ----------------------------------------------------------------------
 
 !match new wt2 WT2 8 4
@@ -10854,7 +10986,7 @@ stage 2. `watch list` shows only w1 remaining. Single-pass + next-poll
 chaining + once.
 
 
-SCENARIO 424 — Team resources + team-scoped modifiers
+SCENARIO 429 — Team resources + team-scoped modifiers
 -----------------------------------------------------
 
 !match new tm TM 8 4
@@ -10881,7 +11013,7 @@ fires for red members on round start (self = the member). `!team get` reads
 the pool back.
 
 
-SCENARIO 425 — Team passives fire for members on turn start (not other teams)
+SCENARIO 430 — Team passives fire for members on turn start (not other teams)
 ----------------------------------------------------------------------------
 
 !match new tmp TMP 8 4
@@ -10908,7 +11040,7 @@ Demonstrates team-scoped passives firing for members only and team_add from
 a formula.
 
 
-SCENARIO 426 — Team modifier folds into a member's apply_mods; team_get gate
+SCENARIO 431 — Team modifier folds into a member's apply_mods; team_get gate
 ---------------------------------------------------------------------------
 
 !match new tmm TMM 8 4
@@ -10931,5 +11063,6 @@ apply_mods(r1,'atk',20,[]) folds to 35; multiplied by the team resource
 team_get('red','power') = 1 → 35 damage. Foe 200 → 165. A team modifier
 flowing into a member's combat formula AND a team resource read in the same
 body.
+
 
 
