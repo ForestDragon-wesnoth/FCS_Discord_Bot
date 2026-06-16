@@ -1143,6 +1143,26 @@ More shipped work (continuing the list above):
   the new `Match._firing_passives(target)` helper, which yields global + the
   target's team passives and replaced the raw `global_passives` iteration at
   every fire site. All serialized.
+- **Aliveness as a rule + indestructible-0/0 render fix — SHIPPED (scenarios
+  418, 432).** `Entity.is_alive` was a hardcoded `hp > 0`, so an
+  INDESTRUCTIBLE 0/0 entity (a passthrough body part / zone — e.g. a Destroyer
+  segment routing all damage to main) read as DEAD and was silently dropped
+  from render AND occupancy (you could walk through the worm's body). Fixed +
+  generalized into the `alive_condition` rule (formula expr, `self`=the
+  entity, distinct from `death_condition` which drives the death PIPELINE):
+  EMPTY (default) = the built-in `hp > 0 OR is_indestructible` (the fix); set a
+  formula to REPLACE it (include the carve-out yourself via the new
+  `is_indestructible(eid)` formula primitive). Evaluated only when set (default
+  stays on the fast path), recursion-guarded via `Match._alive_eval_depth` (a
+  condition that calls an is_alive-using enumerator falls back to built-in),
+  malformed → built-in (never blanks the board).
+- **`body_part_entity_line_suffix` rule — SHIPPED (scenario 433).** A
+  SUB-ENTITY's `!list`/`!state` row now appends a suffix naming its parent;
+  default `" [part of {parent}]"`. Rendered in `_entity_line` only when
+  `e.is_part` (parent alive); placeholders `{parent}` / `{parent_name}` plus
+  every entity_line_format key (resolved against the part). Empty = off. Only
+  parts on the roster (located / segment / region) show it — glued parts are
+  hidden anyway.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

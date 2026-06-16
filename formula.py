@@ -1528,7 +1528,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     "all_entities", "entities_with_status", "entities_with_var",
     "entities_in_area",
     # Body parts (locational damage)
-    "parts", "part", "has_part", "part_of", "damage_part", "damage_spread",
+    "parts", "part", "has_part", "part_of", "is_indestructible",
+    "damage_part", "damage_spread",
     # Stat modifiers (derived / effective stats)
     "apply_mods", "list_mods",
     # Team-level resources
@@ -4646,6 +4647,15 @@ class FormulaEngine:
             po = e.part_of
             return po if (po and po in match.entities) else ""
         ns["part_of"] = _part_of
+
+        def _is_indestructible(eid_token: Any) -> bool:
+            """is_indestructible(eid): True when `eid` cannot die on its own —
+            its `indestructible` var, or a body part with max_hp <= 0 (a 0/0
+            passthrough zone). The carve-out the built-in alive rule applies;
+            handy inside a custom alive_condition."""
+            eid, e = _resolve_entity(eid_token, "is_indestructible")
+            return bool(match.is_indestructible(e))
+        ns["is_indestructible"] = _is_indestructible
 
         # ---- stat modifiers (derived / effective stats) ------------------
         def _norm_mod_tags(tags: Any, fname: str) -> list:

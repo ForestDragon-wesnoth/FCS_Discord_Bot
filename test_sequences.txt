@@ -10746,6 +10746,9 @@ SCENARIO 418 — Destroyer: body segments trail the head; damage routes to main
 !ent move d right
 !ent move d right
 !list
+!map
+!ent add wall Wall 10 13 2
+!ent tp wall 8 2
 !ent add gun Gunner 30 2 4 7
 !ent set_var gun actions.shoot.target entity
 !ent set_var gun actions.shoot.body "damage_part(part(target, args.p), args.d)"
@@ -10756,9 +10759,13 @@ Expected: a head with three 0/0 indestructible body segments trailing behind
 it (laid to the left of the head at (8,2), so b0 (7,2), b1 (6,2), b2 (5,2)).
 Each `ent move d right` shifts the whole chain one cell into the head's
 vacated path — after two moves the head is at (10,2) and the body at (9,2)/
-(8,2)/(7,2). Shooting body segment b1 routes the full 25 × 100% to the
-head's main HP (120 → 95) while the 0/0 segment is unharmed: hit any part of
-the worm, damage the whole worm.
+(8,2)/(7,2). The whole worm RENDERS on the map (head + three body cells in a
+row) even though the segments are at 0/0 hp — an indestructible 0/0 entity
+reads as alive, so it isn't dropped from the map/occupancy. The body is solid
+to other movers: teleporting Wall onto a body cell (8,2) is blocked. Shooting
+body segment b1 routes the full 25 × 100% to the head's main HP (120 → 95)
+while the 0/0 segment is unharmed: hit any part of the worm, damage the whole
+worm.
 
 
 SCENARIO 419 — Snake sever (cascade): a cut destroys everything behind it
@@ -11066,3 +11073,49 @@ body.
 
 
 
+
+
+SCENARIO 432 — alive_condition rule: custom aliveness + is_indestructible
+-------------------------------------------------------------------------
+
+!match new ac AC 12 5
+!match use ac
+!ent add boss Boss 60 5 2
+!part segment boss seg Seg 0 0 to_main_percent=100
+!map
+!system set default alive_condition "entity[self].hp > 0"
+!map
+!system set default alive_condition "entity[self].hp > 0 or is_indestructible(self)"
+!map
+
+Expected: with the default (empty) alive_condition, the 0/0 indestructible
+body segment counts as alive and renders on the map alongside the boss
+(built-in carve-out). Setting alive_condition to `entity[self].hp > 0`
+REPLACES the built-in rule, so the 0/0 segment now reads as not-alive and
+drops off the map (only the boss glyph remains). Re-adding the carve-out with
+the is_indestructible(self) primitive brings the segment back — the GM owns
+the rule, and the primitive lets a custom condition reproduce the default
+behavior.
+
+
+SCENARIO 433 — body_part_entity_line_suffix: sub-entities show their parent
+---------------------------------------------------------------------------
+
+!match new sf SF 12 5
+!match use sf
+!ent add dragon Dragon 80 6 2
+!part add dragon head Head 20 20
+!part locate head 7 2
+!part segment dragon tail Tail 10 10
+!list
+!system set default body_part_entity_line_suffix " «{parent_name}#{parent}»"
+!list
+!system set default body_part_entity_line_suffix ""
+!list
+
+Expected: by default every sub-entity row in !list carries the
+` [part of {parent}]` suffix — the located Head and the Tail segment both
+show `[part of dragon]`, while Dragon's own line has none. A custom template
+` «{parent_name}#{parent}»` renders ` «Dragon#dragon»` on those rows instead.
+Setting the suffix empty removes the annotation entirely (the rows render as
+plain entity lines).

@@ -559,7 +559,23 @@ def _entity_line(e: Entity) -> str:
             "entity_line_format",
             "{name} ({id}): HP: {hp}/{max_hp} X,Y: {x},{y} facing {facing}",
         )
-    return _render_template(tmpl, _entity_template_context(e))
+    line = _render_template(tmpl, _entity_template_context(e))
+    # Sub-entity (body part / segment) suffix: append body_part_entity_line_suffix
+    # with {parent} / {parent_name} bound, so a roster shows which body a part
+    # belongs to. Only fires for an entity whose part_of points at a live parent.
+    if e.is_part:
+        suffix = None
+        if e._match is not None:
+            suffix = e._match.rules.get("body_part_entity_line_suffix")
+        if suffix is None:
+            suffix = DEFAULT_SYSTEM_SETTINGS.get("body_part_entity_line_suffix", "")
+        if suffix:
+            sctx = _entity_template_context(e)
+            sctx["parent"] = e.part_of or ""
+            parent = e._match.entities.get(e.part_of) if e._match else None
+            sctx["parent_name"] = parent.name if parent is not None else (e.part_of or "")
+            line += _render_template(suffix, sctx)
+    return line
 
 
 def _entity_card(e: Entity) -> str:
