@@ -10709,7 +10709,30 @@ the parent's footprint/parts are restored for free — `!part list golem`
 again shows core and fist attached.
 
 
-SCENARIO 417 — Range-band falloff (band primitive)
+SCENARIO 417 — Killing a body part destroys it (no corpse); only parents corpse
+-------------------------------------------------------------------------------
+
+!match new pc PC 10 5
+!match use pc
+!ent add ogre Ogre 60 5 3 5
+!part add ogre arm arm 30 30 to_main_percent=50
+!part add ogre core core 20 20 vital=true
+!eval "kill('arm')"
+!eval "has_corpse('arm')"
+!list
+!eval "kill('core')"
+!eval "has_corpse('ogre')"
+!eval "has_corpse('core')"
+!list
+
+Expected: `kill('arm')` (a non-vital part) destroys the arm IN PLACE — it
+lingers as a dead 0-hp limb attached to the ogre, and `has_corpse('arm')` is
+False (a part never leaves its own revivable corpse). Killing the `vital`
+core cascades to the parent: the ogre dies and leaves ONE corpse
+(`has_corpse('ogre')` True) with its parts snapshotted inside, while
+`has_corpse('core')` is False. Corpses are a parent-only concept.
+
+SCENARIO 418 — Range-band falloff (band primitive)
 --------------------------------------------------
 
 !match new rb RB 12 3
@@ -10732,7 +10755,7 @@ band(value, spec) returns the first matching band's result — the doc's
 munition falloff without a chain of conditionals.
 
 
-SCENARIO 418 — Range-band: inclusive / open-ended / exact / default forms
+SCENARIO 419 — Range-band: inclusive / open-ended / exact / default forms
 -------------------------------------------------------------------------
 
 !match new bnd BND 6 3
@@ -10749,7 +10772,7 @@ the default 99 is returned); `e` = -1 (no band matches 100, default -1).
 Exercises lo-hi, lo+, -hi and the default fall-through.
 
 
-SCENARIO 419 — Reusable macro with positional args
+SCENARIO 420 — Reusable macro with positional args
 --------------------------------------------------
 
 !match new mc MC 8 4
@@ -10765,7 +10788,7 @@ buff hero 7` substitutes $1=hero, $2=7 and runs both lines as ONE undo
 entry, so hero gets blessed=1 and power=7. `macro list` shows `buff`.
 
 
-SCENARIO 420 — Macro: $@ all-args, $() formula token preserved, one-undo-entry
+SCENARIO 421 — Macro: $@ all-args, $() formula token preserved, one-undo-entry
 -----------------------------------------------------------------------------
 
 !match new mcr MCR 8 4
@@ -10788,7 +10811,7 @@ hero 100→60. The whole macro is ONE undo entry, so `!undo command` reverts
 the macro — hero is back to 100.
 
 
-SCENARIO 421 — Condition-watcher (edge-triggered)
+SCENARIO 422 — Condition-watcher (edge-triggered)
 -------------------------------------------------
 
 !match new wt WT 8 4
@@ -10807,7 +10830,7 @@ true (no NEW edge), so alarms STAYS 1 — watchers fire on the transition,
 not every poll. (Re-arms only after the condition goes false again.)
 
 
-SCENARIO 422 — Watchers: single-pass, next-poll chaining, once-removal
+SCENARIO 423 — Watchers: single-pass, next-poll chaining, once-removal
 ----------------------------------------------------------------------
 
 !match new wt2 WT2 8 4
@@ -10831,7 +10854,7 @@ stage 2. `watch list` shows only w1 remaining. Single-pass + next-poll
 chaining + once.
 
 
-SCENARIO 423 — Team resources + team-scoped modifiers
+SCENARIO 424 — Team resources + team-scoped modifiers
 -----------------------------------------------------
 
 !match new tm TM 8 4
@@ -10858,7 +10881,7 @@ fires for red members on round start (self = the member). `!team get` reads
 the pool back.
 
 
-SCENARIO 424 — Team passives fire for members on turn start (not other teams)
+SCENARIO 425 — Team passives fire for members on turn start (not other teams)
 ----------------------------------------------------------------------------
 
 !match new tmp TMP 8 4
@@ -10885,7 +10908,7 @@ Demonstrates team-scoped passives firing for members only and team_add from
 a formula.
 
 
-SCENARIO 425 — Team modifier folds into a member's apply_mods; team_get gate
+SCENARIO 426 — Team modifier folds into a member's apply_mods; team_get gate
 ---------------------------------------------------------------------------
 
 !match new tmm TMM 8 4
@@ -10908,4 +10931,5 @@ apply_mods(r1,'atk',20,[]) folds to 35; multiplied by the team resource
 team_get('red','power') = 1 → 35 damage. Foe 200 → 165. A team modifier
 flowing into a member's combat formula AND a team resource read in the same
 body.
+
 

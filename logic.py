@@ -8291,6 +8291,14 @@ class Match:
         e = self.entities.get(entity_id)
         if e is None:
             return []
+        # A body part never leaves a corpse. check_death already skips parts,
+        # but the UNCONDITIONAL kill path (kill() / !ent kill, which bypasses
+        # the death condition) reaches here directly — route it to limb
+        # destruction instead of storing a revivable part-corpse. Only the
+        # parent-death cascade puts a part's state anywhere, and that goes
+        # into the PARENT's corpse, not the part's own.
+        if e.is_part:
+            return self._process_part_death(e)
         self._death_processing += 1
         # Capture identity/position now — after e.remove() the entity is
         # detached, so the log event must read these up front.
@@ -8355,10 +8363,16 @@ class Match:
         # The effects formula (or a side-effect passive) may have already
         # tripped natural death and removed the entity; only run the
         # pipeline if it's still present.
+        was_part = eid in self.entities and self.entities[eid].is_part
         log: List[str] = []
         if eid in self.entities:
             log = self._process_death(eid)
-        return eid not in self.entities, log
+        # A killed body part is destroyed IN PLACE (lingers as a dead limb),
+        # so "still in the match" does not mean "not killed" — count it as
+        # killed once it carries the __part_destroyed latch.
+        post = self.entities.get(eid)
+        killed = post is None or (was_part and bool(post.vars.get("__part_destroyed")))
+        return killed, log
 
     # ---------- locational damage: routing + part death ----------
     def is_indestructible(self, e: "Entity") -> bool:
