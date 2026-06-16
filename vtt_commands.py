@@ -421,6 +421,15 @@ class CommandRegistry:
                 if len(label) > 80:
                     label = label[:77] + "..."
                 m_post.history.record_command(m_post, label, pre_state=pre_state)
+
+        # Condition-watchers: re-check on the active match now the top-level
+        # command has settled (edge-triggered effects fire here). Only the
+        # top-level run() polls — not dispatch_no_snapshot (batch / action
+        # cmd / macro lines), so a multi-step command polls once at the end.
+        mid_now = mgr.active_by_channel.get(ctx.channel_key)
+        if mid_now is not None and mid_now in mgr.matches:
+            for line in mgr.matches[mid_now].fire_watchers():
+                await ctx.send(line)
         return result
 
 registry = CommandRegistry()
@@ -7524,6 +7533,292 @@ async def run_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     )
     for sub in subcommands:
         await registry.dispatch_no_snapshot(sub[0], sub[1:], ctx, mgr)
+
+
+def _macro_subst(line: str, mac_args: List[str]) -> str:
+    """Substitute $@ (all args, space-joined) and $1..$9 (positional;
+    missing -> empty) in a macro line. Leaves $(...) formula tokens alone."""
+    out = line.replace("$@", " ".join(mac_args))
+    for i in range(9, 0, -1):
+        val = mac_args[i - 1] if i <= len(mac_args) else ""
+        out = out.replace(f"${i}", val)
+    return out
+
+
+@registry.command(
+    "macro",
+    usage="!macro <set|run|list|show|remove> ...",
+    desc=(
+        "Reusable named command sequences (a step up from !batch/!run). "
+        "`set <name> <commands>` stores a macro — commands separated by `\\n`; "
+        "lines may use $1/$2/... and $@ for run-time args. `run <name> "
+        "[args...]` substitutes the args and runs every line as ONE undo "
+        "entry (leading `!` optional; blank / `#` lines skipped). Also: list "
+        "/ show <name> / remove <name>. Per-match, serialized."
+    ),
+)
+async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["macro"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    sub = args[0].lower()
+
+    if sub == "set":
+        if await return_help_if_not_enough_args(ctx, args, 3, "macro", "set"):
+            return
+        name = args[1]
+        body = normalize_body_source(" ".join(args[2:]).strip())
+        if not body:
+            return await ctx.send("❌ macro body is empty.")
+        m.macros[name] = body
+        n = len([l for l in body.split("\n") if l.strip()])
+        return await ctx.send(f"Saved macro `{name}` ({n} line(s)).")
+
+    if sub == "run":
+        if await return_help_if_not_enough_args(ctx, args, 2, "macro", "run"):
+            return
+        name = args[1]
+        if name not in m.macros:
+            return await ctx.send(f"❌ no macro `{name}`.")
+        mac_args = args[2:]
+        import shlex as _shlex
+        for raw in m.macros[name].split("\n"):
+            line = _macro_subst(raw, mac_args).strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("!"):
+                line = line[1:]
+            try:
+                toks = _shlex.split(line)
+            except ValueError as ex:
+                await ctx.send(f"❌ macro `{name}`: parse error in `{line[:50]}`: {ex}")
+                continue
+            if toks:
+                await registry.dispatch_no_snapshot(toks[0], toks[1:], ctx, mgr)
+        return
+
+    if sub == "list":
+        if not m.macros:
+            return await ctx.send("No macros defined.")
+        return await ctx.send("Macros: " + ", ".join(f"`{n}`" for n in sorted(m.macros)))
+
+    if sub == "show":
+        if await return_help_if_not_enough_args(ctx, args, 2, "macro", "show"):
+            return
+        name = args[1]
+        if name not in m.macros:
+            return await ctx.send(f"❌ no macro `{name}`.")
+        return await ctx.send(f"**macro `{name}`**\n```\n{m.macros[name]}\n```")
+
+    if sub in ("remove", "del", "rm"):
+        if await return_help_if_not_enough_args(ctx, args, 2, "macro", "remove"):
+            return
+        name = args[1]
+        if m.macros.pop(name, None) is None:
+            return await ctx.send(f"❌ no macro `{name}`.")
+        return await ctx.send(f"Removed macro `{name}`.")
+
+    title, body = registry.help_for(["macro"])
+    return await ctx.send(f"**{title}**\n{body}")
+
+
+@registry.command(
+    "watch",
+    usage='!watch <add|remove|list|show|check> ...',
+    desc=(
+        "Condition-watchers: edge-triggered triggers re-checked after every "
+        "command (and turn/round). `add <name> \"<condition>\" \"<effect>\" "
+        "[once]` — when the condition FORMULA goes false->true, the effect "
+        "FORMULA runs (this = current entity; use literal ids / this in the "
+        "formulas). `once` removes it after firing. Unlike event passives, a "
+        "watcher fires on the condition's transition regardless of what "
+        "changed it. Also: remove <name> / list / show <name> / check (poll "
+        "now). Per-match, serialized."
+    ),
+)
+async def watch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["watch"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    sub = args[0].lower()
+
+    if sub == "add":
+        if await return_help_if_not_enough_args(ctx, args, 4, "watch", "add"):
+            return
+        name = args[1]
+        cond = normalize_body_source(args[2])
+        effect = normalize_body_source(args[3])
+        once = len(args) >= 5 and args[4].lower() in ("once", "true", "yes")
+        try:
+            validate_program(cond, known_funcs=frozenset(m.formula_functions.keys()))
+            validate_program(effect, known_funcs=frozenset(m.formula_functions.keys()))
+        except FormulaError as ex:
+            return await ctx.send(f"❌ invalid watcher formula: {ex}")
+        m.watchers[name] = {"condition": cond, "effect": effect,
+                            "once": once, "last": False}
+        return await ctx.send(
+            f"Added watcher `{name}`{' (once)' if once else ''}. Fires when "
+            f"the condition becomes true.")
+
+    if sub == "list":
+        if not m.watchers:
+            return await ctx.send("No watchers defined.")
+        return await ctx.send("Watchers: " + ", ".join(
+            f"`{n}`" + ("(once)" if w.get("once") else "")
+            for n, w in sorted(m.watchers.items())))
+
+    if sub == "show":
+        if await return_help_if_not_enough_args(ctx, args, 2, "watch", "show"):
+            return
+        w = m.watchers.get(args[1])
+        if w is None:
+            return await ctx.send(f"❌ no watcher `{args[1]}`.")
+        return await ctx.send(
+            f"**watcher `{args[1]}`** (once={bool(w.get('once'))}, "
+            f"armed={not w.get('last')})\n"
+            f"when: `{w.get('condition','')}`\n"
+            f"do: ```\n{w.get('effect','')}\n```")
+
+    if sub in ("remove", "del", "rm"):
+        if await return_help_if_not_enough_args(ctx, args, 2, "watch", "remove"):
+            return
+        if m.watchers.pop(args[1], None) is None:
+            return await ctx.send(f"❌ no watcher `{args[1]}`.")
+        return await ctx.send(f"Removed watcher `{args[1]}`.")
+
+    if sub == "check":
+        log = m.fire_watchers()
+        tail = ("\n" + "\n".join(log)) if log else ""
+        return await ctx.send(f"Watchers checked.{tail}")
+
+    title, body = registry.help_for(["watch"])
+    return await ctx.send(f"**{title}**\n{body}")
+
+
+@registry.command(
+    "team",
+    usage="!team <set|get|add|list|clear|passive> ...",
+    desc=(
+        "Team-level shared state. `set <team> <path> <value>` / `get <team> "
+        "<path>` / `add <team> <path> <delta>` manage a team's resource pool "
+        "(command points, morale, ...) — read in formulas via team_get / "
+        "team_set / team_add. A `modifiers` bundle in a team's data "
+        "auto-applies to every member (set with `!team set <team> "
+        "modifiers.<name>.<field> ...`). `passive add <team> <pid> <when> "
+        "<formula>` adds a team-scoped passive that fires for any member "
+        "(self = the member). Also: list [team] / clear <team> [path] / "
+        "passive list|remove. Serialized."
+    ),
+)
+async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["team"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    sub = args[0].lower()
+
+    if sub == "set":
+        if await return_help_if_not_enough_args(ctx, args, 4, "team", "set"):
+            return
+        team, path, value = args[1], args[2], _parse_scalar(args[3])
+        m.team_set(team, path, value)
+        return await ctx.send(f"team `{team}`.{path} = {value!r}")
+
+    if sub == "add":
+        if await return_help_if_not_enough_args(ctx, args, 4, "team", "add"):
+            return
+        team, path = args[1], args[2]
+        try:
+            delta = _parse_scalar(args[3])
+            if not isinstance(delta, (int, float)) or isinstance(delta, bool):
+                raise ValueError
+        except ValueError:
+            return await ctx.send("❌ delta must be a number.")
+        try:
+            new = m.team_add(team, path, delta)
+        except VTTError as ex:
+            return await ctx.send(f"❌ {ex}")
+        return await ctx.send(f"team `{team}`.{path} = {new!r}")
+
+    if sub == "get":
+        if await return_help_if_not_enough_args(ctx, args, 3, "team", "get"):
+            return
+        _sent = object()
+        v = m.team_get(args[1], args[2], _sent)
+        if v is _sent:
+            return await ctx.send(f"team `{args[1]}`.{args[2]} is unset.")
+        return await ctx.send(f"team `{args[1]}`.{args[2]} = {v!r}")
+
+    if sub == "list":
+        if len(args) >= 2:
+            d = m.team_data.get(args[1])
+            if not d:
+                return await ctx.send(f"team `{args[1]}` has no data.")
+            return await ctx.send(
+                f"**team `{args[1]}`**\n```{json.dumps(d, indent=2, sort_keys=True)}\n```")
+        if not m.team_data:
+            return await ctx.send("No team data.")
+        return await ctx.send("Teams with data: " + ", ".join(
+            f"`{t}`" for t in sorted(m.team_data)))
+
+    if sub in ("clear", "del"):
+        if await return_help_if_not_enough_args(ctx, args, 2, "team", "clear"):
+            return
+        team = args[1]
+        if len(args) >= 3:
+            d = m.team_data.get(team, {})
+            if d.pop(args[2], None) is None:
+                return await ctx.send(f"team `{team}` has no `{args[2]}`.")
+            return await ctx.send(f"Cleared team `{team}`.{args[2]}.")
+        m.team_data.pop(team, None)
+        m.team_passives.pop(team, None)
+        return await ctx.send(f"Cleared all data + passives for team `{team}`.")
+
+    if sub == "passive":
+        psub = args[1].lower() if len(args) >= 2 else ""
+        if psub == "add":
+            if await return_help_if_not_enough_args(ctx, args, 6, "team", "passive"):
+                return
+            team, pid, when = args[2], args[3], args[4]
+            formula = normalize_body_source(" ".join(args[5:]).strip())
+            if when not in HOOK_NAMES:
+                return await ctx.send(
+                    f"❌ unknown hook `{when}`. Allowed: {', '.join(sorted(HOOK_NAMES))}.")
+            if not formula:
+                return await ctx.send("❌ passive formula cannot be empty.")
+            try:
+                validate_program(formula, known_funcs=frozenset(m.formula_functions.keys()))
+            except FormulaError as ex:
+                return await ctx.send(f"❌ invalid passive formula: {ex}")
+            bucket = m.team_passives.setdefault(team, {})
+            if pid in bucket:
+                return await ctx.send(f"❌ team `{team}` already has passive `{pid}`.")
+            bucket[pid] = Passive(id=pid, when=when, formula=formula)
+            return await ctx.send(f"Added team passive `{pid}` ({when}) to `{team}`.")
+        if psub in ("remove", "del", "rm"):
+            if await return_help_if_not_enough_args(ctx, args, 4, "team", "passive"):
+                return
+            team, pid = args[2], args[3]
+            bucket = m.team_passives.get(team, {})
+            if bucket.pop(pid, None) is None:
+                return await ctx.send(f"❌ team `{team}` has no passive `{pid}`.")
+            return await ctx.send(f"Removed team passive `{pid}` from `{team}`.")
+        if psub == "list":
+            if await return_help_if_not_enough_args(ctx, args, 3, "team", "passive"):
+                return
+            bucket = m.team_passives.get(args[2], {})
+            if not bucket:
+                return await ctx.send(f"team `{args[2]}` has no passives.")
+            lines = [f"Team passives for `{args[2]}`:"]
+            for pid, p in bucket.items():
+                lines.append(f"  `{pid}` ({p.when}): `{p.formula}`")
+            return await ctx.send("\n".join(lines))
+        return await ctx.send("Usage: `!team passive <add|remove|list> ...`")
+
+    title, body = registry.help_for(["team"])
+    return await ctx.send(f"**{title}**\n{body}")
 
 
 @registry.command(
