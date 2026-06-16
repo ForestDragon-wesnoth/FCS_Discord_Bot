@@ -6763,7 +6763,7 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 @registry.command(
     "part",
-    usage="!part <add|attach|detach|locate|region|glue|remove|list|info> ...",
+    usage="!part <add|segment|attach|detach|locate|region|glue|remove|list|info> ...",
     desc=(
         "Body parts for locational damage. A part is a REAL entity attached "
         "to a parent (it gets hp/vars/statuses/passives/death for free) and "
@@ -6776,8 +6776,12 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         "on_death ...`). A 0/0 part is an indestructible passthrough zone "
         "(head/chest). `locate` gives a part its OWN cell (a turret you can "
         "flank separately) — it then renders/occupies/is-targetable; `glue` "
-        "snaps it back to the parent. Subcommands: add <parent> <part_id> "
-        "<name> <hp> <maxhp> [k=v ...]; attach <parent> <part_id>; detach "
+        "snaps it back to the parent. `segment` appends a SNAKE body segment "
+        "that follows the head along the chain (see the segment_* rules: "
+        "follow mode, self-collision, and the death/sever mode — solid / "
+        "cascade / split). Subcommands: add <parent> <part_id> "
+        "<name> <hp> <maxhp> [k=v ...]; segment <head> <seg_id> <name> <hp> "
+        "<maxhp> [k=v ...]; attach <parent> <part_id>; detach "
         "<part_id>; locate <part_id> <x> <y>; glue <part_id>; remove "
         "<part_id>; list <parent>; info <part_id>."
     ),
@@ -6817,6 +6821,37 @@ async def part_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(
             f"Attached body part `{part_id}` ({name}) to `{parent}` "
             f"({hp}/{maxhp} hp).{extra}{tail}"
+        )
+
+    if sub == "segment":
+        if await return_help_if_not_enough_args(ctx, args, 6, "part", "segment"):
+            return
+        head = _resolve_eid(m, args[1])
+        seg_id, name = args[2], args[3]
+        try:
+            hp, maxhp = int(args[4]), int(args[5])
+        except ValueError:
+            return await ctx.send("❌ hp and maxhp must be integers.")
+        try:
+            e, log = m.add_segment(head, seg_id, name, hp, maxhp)
+        except (NotFound, DuplicateId, VTTError) as ex:
+            return await ctx.send(f"❌ {ex}")
+        applied: List[str] = []
+        for tok in args[6:]:
+            if "=" not in tok:
+                return await ctx.send(
+                    f"❌ extra var `{tok}` must be in key=value form.")
+            k, _, v = tok.partition("=")
+            if not k:
+                return await ctx.send(f"❌ extra var `{tok}` has an empty key.")
+            e.write_var(k, _parse_scalar(v))
+            applied.append(k)
+        extra = f" Set: {', '.join(applied)}." if applied else ""
+        n = len(m.snake_segments(head))
+        tail = ("\n" + "\n".join(log)) if log else ""
+        return await ctx.send(
+            f"Appended segment `{seg_id}` ({name}) to snake `{head}` "
+            f"at ({e.x},{e.y}); chain length {n}.{extra}{tail}"
         )
 
     if sub == "attach":
