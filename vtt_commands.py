@@ -14,7 +14,7 @@ from logic import (
 )
 
 # Passive system
-from logic import Passive, HOOK_NAMES
+from logic import Passive, HOOK_NAMES, is_event_hook
 
 # Clamp system
 from logic import ClampSpec
@@ -4289,9 +4289,10 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
         if not formula:
             raise VTTError("Passive formula cannot be empty.")
-        if when not in HOOK_NAMES:
+        if when not in HOOK_NAMES and not is_event_hook(when):
             allowed = ", ".join(sorted(HOOK_NAMES))
-            raise VTTError(f"Unknown hook '{when}'. Allowed: {allowed}")
+            raise VTTError(f"Unknown hook '{when}'. Allowed: {allowed}; "
+                           f"or a custom event subscription 'event:<name>'.")
         try:
             validate_program(formula, known_funcs=frozenset(m.formula_functions.keys()))
         except FormulaError as ex:
@@ -4464,9 +4465,10 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
         if not formula:
             raise VTTError("Passive formula cannot be empty.")
-        if when not in HOOK_NAMES:
+        if when not in HOOK_NAMES and not is_event_hook(when):
             allowed = ", ".join(sorted(HOOK_NAMES))
-            raise VTTError(f"Unknown hook '{when}'. Allowed: {allowed}")
+            raise VTTError(f"Unknown hook '{when}'. Allowed: {allowed}; "
+                           f"or a custom event subscription 'event:<name>'.")
         try:
             validate_program(formula, known_funcs=frozenset(m.formula_functions.keys()))
         except FormulaError as ex:
@@ -7749,6 +7751,49 @@ async def watch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 
 @registry.command(
+    "emit",
+    usage="!emit <name> [to=<eid>] [key=value ...]",
+    desc=(
+        "Fire a custom EVENT on the event bus. Every passive subscribed via "
+        "`when` = `event:<name>` runs: global passives fire once; passing "
+        "`to=<eid>` ALSO fires that entity's team + own handlers (self = the "
+        "target) — a directed event. Any other `key=value` pairs form the "
+        "event PAYLOAD, readable inside a handler with event_get(key[, "
+        "default]) / event_has(key); the handler also sees `event_name`. "
+        "Subscribe a handler with `!ent passive add <eid> event:<name> "
+        "\"<formula>\"` (or !gpassive / !team passive). The same event fires "
+        "from formulas via emit(name, payload, target). Decouples cause from "
+        "effect — the GM's extensible hook surface."
+    ),
+)
+async def emit_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["emit"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    name = args[0]
+    target = None
+    payload: Dict[str, Any] = {}
+    for tok in args[1:]:
+        if "=" not in tok:
+            return await ctx.send(
+                f"❌ `{tok}` must be in key=value form (payload, or to=<eid>).")
+        k, _, v = tok.partition("=")
+        if not k:
+            return await ctx.send(f"❌ `{tok}` has an empty key.")
+        if k == "to":
+            target = _resolve_eid(m, v)
+        else:
+            payload[k] = _parse_scalar(v)
+    log = m.emit_event(name, payload or None, target)
+    fired = len([x for x in log if x])
+    at = f" at `{target}`" if target else ""
+    tail = ("\n" + "\n".join(x for x in log if x)) if any(log) else ""
+    return await ctx.send(
+        f"Emitted `{name}`{at}; {fired} handler(s) fired.{tail}")
+
+
+@registry.command(
     "team",
     usage="!team <set|get|add|list|clear|passive> ...",
     desc=(
@@ -7834,9 +7879,10 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return
             team, pid, when = args[2], args[3], args[4]
             formula = normalize_body_source(" ".join(args[5:]).strip())
-            if when not in HOOK_NAMES:
+            if when not in HOOK_NAMES and not is_event_hook(when):
                 return await ctx.send(
-                    f"❌ unknown hook `{when}`. Allowed: {', '.join(sorted(HOOK_NAMES))}.")
+                    f"❌ unknown hook `{when}`. Allowed: "
+                    f"{', '.join(sorted(HOOK_NAMES))}; or 'event:<name>'.")
             if not formula:
                 return await ctx.send("❌ passive formula cannot be empty.")
             try:

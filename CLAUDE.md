@@ -1215,6 +1215,27 @@ More shipped work (continuing the list above):
   only for one synchronous read pass — so it can't go stale; renders are
   byte-identical with it on/off. Cross-command caching intentionally out of
   scope (avoids invalidation hazards).
+- **Custom event bus — SHIPPED (scenarios 437-439).** A GM-extensible hook
+  surface on top of the fixed HOOK_NAMES, decoupling cause from effect.
+  Handlers are ordinary PASSIVES whose `when` is `event:<name>` (`is_event_hook`
+  relaxes the when-validation in Passive.__post_init__ + the !passive /
+  !gpassive / !team passive command checks). Emission: the `emit(name,
+  payload=None, target=None)` formula prim and the `!emit <name> [to=<eid>]
+  [k=v ...]` command. `Match.emit_event` fires GLOBAL handlers ONCE (self =
+  target if given, else the current-turn entity, else None); when a `target`
+  is given it ALSO fires that target's TEAM + OWN handlers (self = target) — a
+  DIRECTED event. Broadcast-to-many is the GM looping emit per target (cause
+  stays explicit; no implicit fan-out). The `payload` dict is read inside a
+  handler via `event_get(key[,default])` / `event_has(key)` (from a transient
+  `Match._event_stack`, NOT a binding — sidesteps the sandbox's no-dynamic-
+  attribute rule); `event_name` is a HOOK_CONTEXT binding. Re-entrancy (a
+  handler that emits) is capped by the `event_recursion_limit` rule (default
+  64) with a var-hook-style warning latch (`_event_warnings`) drained by the
+  outermost emit. emit works from any formula context (action body, watcher
+  effect, another handler). All transient (`_event_depth`/`_event_stack`/
+  warnings not serialized); the subscribing passives serialize as normal
+  passives. The foundational primitive several other approved features
+  compose on.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

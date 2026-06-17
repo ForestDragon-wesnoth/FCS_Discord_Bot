@@ -955,6 +955,17 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "primitive. 4-way mode ignores this (faces are always 90°)."
         ),
     },
+    "event_recursion_limit": {
+        "default": 64,
+        "schema": {"type": "int"},
+        "desc": (
+            "Max nesting depth for the custom event bus (emit). A handler "
+            "fired by an event may itself emit; this caps the chain so a "
+            "handler that re-emits its own event can't loop forever. Beyond "
+            "the limit, further emit() calls in the chain are suppressed (a "
+            "single warning is logged). Mirrors var_hook_recursion_limit."
+        ),
+    },
     "side_hit_hitbox_mode": {
         "default": "box",
         "schema": {"type": "enum", "choices": ["box", "center"]},
@@ -2185,6 +2196,19 @@ HOOK_NAMES: Set[str] = {
     "on_var_write_attempt",
 }
 
+# Custom event-bus subscription. A passive whose `when` is "event:<name>"
+# (any non-empty name) fires when the GM emits that named event via the
+# emit() formula primitive or the !emit command — a user-extensible hook
+# surface decoupling cause from effect, on top of the fixed HOOK_NAMES.
+_EVENT_WHEN_PREFIX = "event:"
+
+
+def is_event_hook(when: Any) -> bool:
+    """True iff `when` is a custom event-bus subscription ('event:<name>')."""
+    return (isinstance(when, str)
+            and when.startswith(_EVENT_WHEN_PREFIX)
+            and len(when) > len(_EVENT_WHEN_PREFIX))
+
 # Tile hooks live in tiles[(x, y)]["hooks"][<name>] as formula strings.
 # Movement hooks (on_enter / on_exit / on_stop) fire when an entity
 # transits a tile via Entity.tp / Entity.move_dirs (and
@@ -2344,10 +2368,11 @@ class Passive:
     def __post_init__(self):
         if not isinstance(self.id, str) or not self.id.strip():
             raise VTTError("Passive id must be a non-empty string.")
-        if self.when not in HOOK_NAMES:
+        if self.when not in HOOK_NAMES and not is_event_hook(self.when):
             allowed = ", ".join(sorted(HOOK_NAMES))
             raise VTTError(
-                f"Unknown passive hook '{self.when}'. Allowed: {allowed}"
+                f"Unknown passive hook '{self.when}'. Allowed: {allowed}; "
+                f"or a custom event subscription 'event:<name>'."
             )
         if not isinstance(self.formula, str):
             raise VTTError("Passive formula must be a string.")
@@ -4508,6 +4533,17 @@ class Match:
     # Never held across a mutation, so it cannot go stale. None = inactive.
     _vision_memo: Optional[Dict[Any, bool]] = field(
         default=None, repr=False, compare=False)
+    # Custom event bus: re-entry guard + the current-event payload stack
+    # (read by event_get / event_has during handler firing). Transient — an
+    # event is a transient broadcast, nothing about it is serialized.
+    _event_depth: int = field(default=0, repr=False, compare=False)
+    _event_stack: List[Dict[str, Any]] = field(
+        default_factory=list, repr=False, compare=False)
+    # Recursion-warning buffer (drained by the top-level emit), mirroring the
+    # var-hook warning latch so a limit hit deep in a chain still surfaces.
+    _event_warned: bool = field(default=False, repr=False, compare=False)
+    _event_warnings: List[str] = field(
+        default_factory=list, repr=False, compare=False)
     # Per-entity death-check suppression. Holds the ids whose automatic
     # death-condition re-check is currently deferred — used by
     # revive_corpse to shield ONLY the entity being respawned from its
@@ -9378,6 +9414,76 @@ class Match:
                 if p.when != when:
                     continue
                 log.append(_run_passive_safely(engine, p, ctx, target_id=tid, is_global=False))
+        return log
+
+    def emit_event(self, name: str, payload: Optional[Dict[str, Any]] = None,
+                   target: Optional[str] = None) -> List[str]:
+        """Fire the custom event `name` — the GM-extensible event bus. Runs
+        every passive whose `when` is 'event:<name>':
+          - GLOBAL passives fire ONCE (self = `target` if given, else the
+            current-turn entity, else None): match-level decoupled handlers.
+          - When `target` is given, the target's TEAM passives + its OWN
+            passives also fire (self = target): a DIRECTED event.
+        For a broadcast to many entities the GM loops emit per target (cause
+        and effect stay explicit). `payload` (a dict) is readable inside a
+        handler via event_get / event_has; `event_name` is bound. Re-entrancy
+        (a handler that emits) is capped by the event_recursion_limit rule.
+        Returns one log line per fired handler."""
+        when = _EVENT_WHEN_PREFIX + str(name)
+        limit = int(self.rules.get("event_recursion_limit", 64))
+        top = self._event_depth == 0
+        if self._event_depth >= limit:
+            # Suppress (don't fire) and latch a single warning for the chain;
+            # the top-level emit drains it so it reaches the caller.
+            if not self._event_warned:
+                self._event_warned = True
+                self._event_warnings.append(
+                    f"⚠️ event recursion limit ({limit}) reached emitting "
+                    f"`{name}`; suppressing further emits in this chain.")
+            return []
+        from formula import FormulaEngine, EvalCtx
+        engine = FormulaEngine(self)
+        this_id = self.current_entity_id()
+        self._event_depth += 1
+        self._event_stack.append(dict(payload or {}))
+        log: List[str] = []
+        try:
+            gself = target if target else this_id
+            extras: Dict[str, Any] = {"event_name": str(name), "hook_name": when}
+            if target is not None:
+                extras["target"] = target
+            gctx = EvalCtx(this=this_id, target=gself, extras=extras)
+            # Global handlers fire once.
+            for p in self.global_passives.values():
+                if p.when == when:
+                    log.append(_run_passive_safely(
+                        engine, p, gctx, target_id=gself, is_global=True))
+            # Directed: the target's team + own handlers (self = target).
+            if target is not None:
+                e = self.entities.get(target)
+                if e is not None:
+                    tctx = EvalCtx(this=this_id, target=target, extras=extras)
+                    if e.team is not None:
+                        for p in (self.team_passives.get(e.team) or {}).values():
+                            if p.when == when:
+                                log.append(_run_passive_safely(
+                                    engine, p, tctx, target_id=target,
+                                    is_global=True))
+                    for p in list(e.passives.values()):
+                        if p.when == when:
+                            log.append(_run_passive_safely(
+                                engine, p, tctx, target_id=target,
+                                is_global=False))
+        finally:
+            self._event_stack.pop()
+            self._event_depth -= 1
+        if top:
+            # Back at the outermost emit: surface any buffered recursion
+            # warning and reset the latch for the next chain.
+            if self._event_warnings:
+                log = log + self._event_warnings
+                self._event_warnings = []
+            self._event_warned = False
         return log
 
     # ---- var-event firing ----

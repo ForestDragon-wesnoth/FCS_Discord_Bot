@@ -1410,6 +1410,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   match_var_del(path)         -> bool (True iff existed)
     "match_var_keys", "match_var_has", "match_var_get",
     "match_var_set", "match_var_del",
+    # Custom event bus: emit an event, read the current event's payload.
+    "emit", "event_get", "event_has",
     # Container-shape introspection / convenience over the SAME var
     # path machinery. None of these encode an "inventory" concept —
     # they're generic operations on dicts living under entity.vars.
@@ -1814,6 +1816,11 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     # is always the modifier's owner. Lets a modifier read the other party:
     # "+25 vs undead" -> condition `entity[target].undead`.
     "attacker", "defender", "other",
+    # Custom event bus. Bound during a custom-event handler's firing (a
+    # passive whose `when` is 'event:<name>', fired by emit / !emit) to the
+    # emitted event's name; None elsewhere. The event's payload is read with
+    # the event_get / event_has functions (not a binding).
+    "event_name",
 )
 
 # Entity-id sentinel identifiers. Inside `entity[X]` these get
@@ -3660,6 +3667,39 @@ class FormulaEngine:
         ns["match_var_get"]  = _match_var_get
         ns["match_var_set"]  = _match_var_set
         ns["match_var_del"]  = _match_var_del
+
+        # ---- custom event bus -------------------------------------------
+        def _emit(name: Any, payload: Any = None, target: Any = None) -> int:
+            """emit(name, payload=None, target=None): fire the custom event
+            `name`, running every passive subscribed via when='event:<name>'.
+            Global handlers fire once; passing a `target` entity ALSO fires
+            that target's team + own handlers (self = target). `payload` is a
+            dict readable in handlers via event_get / event_has. Returns the
+            number of handlers fired. Decouples cause from effect — the GM's
+            extensible hook surface."""
+            if not isinstance(name, str) or not name:
+                raise FormulaError("emit(name, ...): name must be a non-empty string.")
+            if payload is not None and not isinstance(payload, dict):
+                raise FormulaError("emit(...): payload must be a dict.")
+            tid = None if target is None else _eid(target)
+            return len(match.emit_event(name, payload, tid))
+
+        def _event_get(key: Any, default: Any = None) -> Any:
+            """event_get(key, default=None): a value from the payload of the
+            event currently being handled (the innermost emit). `default` (or
+            None) outside any event / for a missing key."""
+            if not match._event_stack:
+                return default
+            return match._event_stack[-1].get(str(key), default)
+
+        def _event_has(key: Any) -> bool:
+            """event_has(key): True iff the current event's payload has `key`.
+            False outside any event."""
+            return bool(match._event_stack) and str(key) in match._event_stack[-1]
+
+        ns["emit"]       = _emit
+        ns["event_get"]  = _event_get
+        ns["event_has"]  = _event_has
 
         def _var_has_key(eid_t: Any, path: Any, key: Any) -> bool:
             """var_has_key(eid, path, key): True iff the value at `path`
