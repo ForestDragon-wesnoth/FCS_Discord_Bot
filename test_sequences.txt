@@ -11251,3 +11251,104 @@ global `ring` handler in turn calls `emit('echo')`, and the `echo` handler
 records its own `event_name` ('echo') into the match var `echoed`. So emit
 works from a formula, events chain handler→handler, and the `event_name`
 binding identifies the firing event. `!eval` shows 'echo'.
+
+
+SCENARIO 440 — Shields: multiple coexisting absorb pools, typed ward, priority
+-------------------------------------------------------------------------------
+
+!match new sh SH 12 6
+!match use sh
+!ent add hero Hero 40 2 2 9
+!ent set_var hero shields.plate 15
+!ent set_var hero shields.ward.amount 10
+!ent set_var hero shields.ward.tags fire
+!ent set_var hero shields.ward.priority 5
+!eval "shield_total('hero')"
+!eval "shield_total('hero', 'fire')"
+!ent set_var hero actions.bite.target none
+!ent set_var hero actions.bite.body "entity[self].hp = entity[self].hp - absorb_damage(self, 12)"
+!action hero bite
+!ent dump hero
+!ent set_var hero actions.flame.target none
+!ent set_var hero actions.flame.body "entity[self].hp = entity[self].hp - absorb_damage(self, 20, 'fire')"
+!action hero flame
+!ent dump hero
+
+Expected: Hero has two independent absorb pools — a generic `plate` (15,
+priority 0) and a fire `ward` (10, priority 5, tags=fire). shield_total with
+no tags = 15 (the fire ward doesn't apply to an untagged hit); for a fire hit
+= 25 (both apply). The `bite` (untagged 12) drains only the plate (15→3) and
+0 penetrates, so Hero stays at 40 hp. The `flame` (fire 20) drains the
+higher-priority ward first (10→gone), then the plate (3→gone), leaving 7 to
+penetrate → Hero 40→33. Emptied pools are removed.
+
+
+SCENARIO 441 — Chain / bounce attack: chain lightning with falloff
+------------------------------------------------------------------
+
+!match new cl CL 16 6
+!match use cl
+!ent add coil Coil 20 2 3 9
+!ent add e1 E1 30 5 3 5
+!ent add e2 E2 30 7 3 5
+!ent add e3 E3 30 9 3 5
+!ent set_var coil actions.zap.target entity
+!ent set_var coil actions.zap.body "entity[target].hp = entity[target].hp - 12\ndmg = 8\nfor t in chain_targets(target, 2):\n entity[t].hp = entity[t].hp - dmg\n dmg = dmg - 4"
+!action coil zap e1
+!list
+
+Expected: the zap hits the primary target e1 for 12 (30→18), then
+chain_targets walks the two nearest-unvisited entities out of e1 — e2 then e3
+— and the action applies a decaying bolt (8, then 4): e2 30→22, e3 30→26. The
+caster Coil is never chained (count stops at 2). The GM owns the falloff;
+chain_targets is just the nearest-neighbour walk.
+
+
+SCENARIO 442 — Channeled ability (composed): breaks on move or damage
+---------------------------------------------------------------------
+
+!match new ch CH 12 6
+!match use ch
+!defvar add channeling 0
+!ent add mage Mage 30 2 2 9
+!passive add mage brkmove on_entity_moved "entity[self].channeling = 0"
+!passive add mage brkdmg on_var_changed target=hp "if new_value < old_value:\n entity[self].channeling = 0"
+!ent set_var mage channeling 1
+!ent move mage right
+!eval "entity[mage].channeling"
+!ent set_var mage channeling 1
+!ent set_var mage hp 25
+!eval "entity[mage].channeling"
+
+Expected: a channeled ability needs NO new engine primitive — it's a
+`channeling` flag plus two passives. Starting the channel sets channeling=1.
+Moving fires on_entity_moved, which clears it → 0. Re-starting then taking
+damage fires on_var_changed (hp 30→25, new < old), which clears it → 0. Both
+!eval read 0: the channel broke. (Completion is a turn-hook that resolves the
+effect when channeling survives N turns — see the charge-up scenario.)
+
+
+SCENARIO 443 — Charge-up attack (composed): wind up over turns, release at threshold
+------------------------------------------------------------------------------------
+
+!match new cu CU 10 6
+!match use cu
+!defvar add charge 0
+!defvar add charging 0
+!ent add hero Hero 30 2 2 9
+!ent add dummy Dummy 50 4 2 5
+!passive add hero windup on_turn_start "if entity[self].charging > 0:\n entity[self].charge = entity[self].charge + 1\n if entity[self].charge >= 3:\n  entity[dummy].hp = entity[dummy].hp - 25\n  entity[self].charging = 0\n  entity[self].charge = 0"
+!ent set_var hero charging 1
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!ent dump dummy
+
+Expected: a charge-up attack also needs no new primitive — a `charging` flag
++ `charge` counter advanced by an on_turn_start passive. While charging, each
+of Hero's turn-starts adds 1; on the third the wound-up attack releases (25 to
+Dummy) and the charge resets. After cycling through enough turns Dummy has
+taken the hit: 50→25. Clearing `charging` mid-wind-up would cancel it.

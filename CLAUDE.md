@@ -1236,6 +1236,40 @@ More shipped work (continuing the list above):
   warnings not serialized); the subscribing passives serialize as normal
   passives. The foundational primitive several other approved features
   compose on.
+- **Combat helpers: shields + chain/bounce — SHIPPED (scenarios 440-443).**
+  Two new primitives where assembling them from existing pieces was painful
+  (the sandbox has no damage-interception or loop+visited-set); channeled /
+  charge-up were judged COMPOSABLE and shipped as demonstration scenarios
+  only (no new engine code), per "do we really need a whole feature for X?".
+  - **Shields / temp-HP** (the `shield_sources` rule, CSV of vars roots,
+    default `shields`; per-entity `__shield_sources`): named absorb POOLS
+    (`shields.plate`, `shields.ward`, ...) so multiple independent layers
+    coexist. A pool is `{amount, priority?, tags?, not_tags?}` or a bare
+    number. `absorb_damage(eid, amount, tags=None)` drains matching pools
+    HIGHEST priority first (ties by name), removes any emptied to 0, mutates
+    the pool vars (firing their var hooks), and RETURNS the leftover that
+    PENETRATES to HP — the GM applies it (`entity[t].hp = entity[t].hp -
+    absorb_damage(t, dmg)`). Tag match mirrors modifiers: an untagged pool
+    absorbs anything, a `tags` pool only hits carrying those tags (a typed
+    ward), `not_tags` excludes. `shield_total(eid, tags=None)` sums available
+    absorb (no mutation). Pools are plain vars — set/refresh via `!ent
+    set_var`; DECAY is GM-composed (a status tick / round hook), not an engine
+    feature. Core in formula.py (`_gather_pools` / `_absorb_damage` /
+    `_shield_total`).
+  - **Chain / bounce** — `chain_targets(from_eid, count, max_jump=0,
+    relation="")` (loopable): up to `count` entity ids, each the nearest alive
+    eligible entity to the PREVIOUS link, never revisiting, within max_jump
+    Chebyshev cells (0/None = unlimited); `relation` reuses the
+    any/hostile/ally/same_team/attackable filter (`_candidates`/`_relation_ok`).
+    The GM loops it and owns the per-hop falloff (engine never auto-applies
+    damage). Near→far.
+  - **Channeled (#60) / charge-up (#61) — DEMONSTRATED, not built.** Scenario
+    442: a `channeling` flag + an `on_entity_moved` passive (break on move) +
+    an `on_var_changed target=hp` passive (break on damage). Scenario 443: a
+    `charging` flag + `charge` counter advanced by an `on_turn_start` passive
+    that releases the wound-up attack at a threshold and resets. Both prove
+    the engine already supports the pattern via status/var + hooks + use_action
+    + the event bus — no new primitive warranted.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
