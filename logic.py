@@ -955,6 +955,23 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "primitive. 4-way mode ignores this (faces are always 90°)."
         ),
     },
+    "side_hit_hitbox_mode": {
+        "default": "box",
+        "schema": {"type": "enum", "choices": ["box", "center"]},
+        "desc": (
+            "How side_hit / directional_get / hit_location resolve which side "
+            "of a MULTI-TILE target a hit lands on. `box` (default): the "
+            "footprint is treated as a real rectangle — the bearing from the "
+            "body's center to the attacker is aspect-corrected by the "
+            "footprint's half-extents, so a hit along a LONG flank reads as a "
+            "side (not front) even near a corner. `center`: the legacy bearing "
+            "from the footprint center as a point (a long body's corners read "
+            "front-ish). 1×1 entities are identical under both — the aspect "
+            "correction is uniform when width == height. Per-call override: "
+            "pass hitbox='box'|'center' to side_hit / directional_get / "
+            "hit_location."
+        ),
+    },
     # ---- UI / display templates ----
     # These rules drive !list and !ent info rendering — see
     # vtt_commands._entity_line / _entity_card. Template syntax:
@@ -4486,6 +4503,11 @@ class Match:
     # would recurse. While >0, is_alive falls back to the built-in rule.
     # Not serialized — transient.
     _alive_eval_depth: int = field(default=0, repr=False, compare=False)
+    # Transient memo for _fog_team_sees, active (a dict) only for the duration
+    # of one read-only cell-scanning pass (set/torn-down around render_ascii).
+    # Never held across a mutation, so it cannot go stale. None = inactive.
+    _vision_memo: Optional[Dict[Any, bool]] = field(
+        default=None, repr=False, compare=False)
     # Per-entity death-check suppression. Holds the ids whose automatic
     # death-condition re-check is currently deferred — used by
     # revive_corpse to shield ONLY the entity being respawned from its
@@ -6150,6 +6172,24 @@ class Match:
                 return (cx, cy)
         return None
 
+    def raycast(self, viewer_id: Optional[str], x1: int, y1: int,
+                x2: int, y2: int) -> Tuple[int, int]:
+        """The IMPACT point of a beam cast from (x1,y1) toward (x2,y2) for
+        `viewer_id`: the farthest cell with clear sight before terrain stops
+        it — i.e. the last clear cell before the first opaque cell strictly
+        between, or (x2,y2) if the whole line is clear. The companion to
+        first_opaque (which returns the blocker itself); raycast returns where
+        the beam LANDS. The viewer's own cell never blocks; the target's own
+        opacity never blocks (mirrors has_los). If the cell adjacent to the
+        origin is opaque the impact is the origin itself."""
+        cells = self._line_cells(x1, y1, x2, y2)
+        last = cells[0]
+        for (cx, cy) in cells[1:-1]:
+            if self.cell_opaque(viewer_id, cx, cy):
+                return last
+            last = (cx, cy)
+        return (x2, y2)
+
     # ---- combined vision (range and/or LOS) -------------------------
     def _member_sees(self, e: "Entity", x: int, y: int, *, los: bool) -> bool:
         # A large viewer sees from its WHOLE body: (x,y) is seen if any
@@ -6198,9 +6238,25 @@ class Match:
 
     def _fog_team_sees(self, pov_team: Optional[str], x: int, y: int) -> bool:
         """Team vision for the FOG feature: range, plus LOS when the fog_los
-        rule is on. The single switch behind fog hiding + explored memory."""
-        return self._team_sees(
-            pov_team, x, y, los=bool(self.rules.get("fog_los", False)))
+        rule is on. The single switch behind fog hiding + explored memory.
+
+        Memoized when `_vision_memo` is active (set around a read-only
+        operation that scans many cells — see render_ascii). The memo is NEVER
+        held across a mutation: it lives only for the duration of one
+        synchronous read pass, so it can't go stale. A full-map render
+        otherwise recomputes the same (team, cell) sight — looping every team
+        member with a per-member LOS walk — once per layer per cell."""
+        memo = self._vision_memo
+        if memo is None:
+            return self._team_sees(
+                pov_team, x, y, los=bool(self.rules.get("fog_los", False)))
+        key = (pov_team, x, y)
+        cached = memo.get(key)
+        if cached is None:
+            cached = self._team_sees(
+                pov_team, x, y, los=bool(self.rules.get("fog_los", False)))
+            memo[key] = cached
+        return cached
 
     def _cell_remembered(self, pov_team: Optional[str], x: int, y: int) -> bool:
         """True iff fog memory is on and `pov_team` has explored (x, y)."""
@@ -10167,6 +10223,22 @@ class Match:
 
     def render_ascii(self, pov_team: Optional[str] = None,
                      colorize: bool = False) -> str:
+        """Render the ASCII map. Thin wrapper that activates the read-only
+        _fog_team_sees memo for the duration of the render, so the per-cell,
+        per-layer fog scan doesn't recompute the same team-sight (each
+        recompute loops every team member with a per-member LOS walk). The
+        memo is torn down in `finally` and is never held across a mutation, so
+        it can't go stale. See _render_ascii_impl for the actual rendering."""
+        prev = self._vision_memo
+        if prev is None:
+            self._vision_memo = {}
+        try:
+            return self._render_ascii_impl(pov_team, colorize)
+        finally:
+            self._vision_memo = prev
+
+    def _render_ascii_impl(self, pov_team: Optional[str] = None,
+                           colorize: bool = False) -> str:
         # `pov_team` filters EVERY layer through its visibility rule: a
         # zone / tile / entity hidden from that team isn't painted (its
         # cell falls back to whatever layer is visible underneath, so the

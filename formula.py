@@ -1552,7 +1552,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #       strictly between as an (x,y) pair (read with coord_x/coord_y), or
     #       None if clear. NOT loopable (single coord).
     "entities_in_line_ignorelos", "entities_on_los",
-    "entities_in_line_until", "first_opaque",
+    "entities_in_line_until", "first_opaque", "raycast",
     # clip_cells(cells) -> the subset of an (x,y) cell list that is on the
     # grid. The cells_in_* helpers can return off-grid cells (they're pure
     # geometry); wrap one to keep only valid cells, e.g.
@@ -4896,6 +4896,22 @@ class FormulaEngine:
             vid = None if viewer is None else _eid(viewer)
             return match.first_opaque(vid, cx1, cy1, cx2, cy2)
 
+        def _raycast(x1: Any, y1: Any, x2: Any, y2: Any,
+                     viewer: Any = None) -> Any:
+            """raycast(x1, y1, x2, y2, viewer=None): the IMPACT point of a
+            beam cast from (x1,y1) toward (x2,y2) — the farthest cell with
+            clear sight before terrain stops it, as an (x, y) pair (read with
+            coord_x / coord_y). (x2,y2) if the line is clear; the last clear
+            cell before the first opaque one otherwise. The companion to
+            first_opaque (which returns the blocker); raycast returns where
+            the beam LANDS — for placing an effect at the point of impact."""
+            cx1 = _coord_int(x1, "raycast", "x1")
+            cy1 = _coord_int(y1, "raycast", "y1")
+            cx2 = _coord_int(x2, "raycast", "x2")
+            cy2 = _coord_int(y2, "raycast", "y2")
+            vid = None if viewer is None else _eid(viewer)
+            return match.raycast(vid, cx1, cy1, cx2, cy2)
+
         def _entities_in_cone(x: Any, y: Any, direction: Any, length: Any,
                               half_angle: Any = 45) -> list:
             """entities_in_cone(x, y, direction, length, half_angle=45):
@@ -4966,6 +4982,7 @@ class FormulaEngine:
         ns["entities_on_los"] = _entities_on_los
         ns["entities_in_line_until"] = _entities_in_line_until
         ns["first_opaque"] = _first_opaque
+        ns["raycast"] = _raycast
         ns["entities_in_cone"] = _entities_in_cone
         ns["entities_in_rect"] = _entities_in_rect
 
@@ -5021,41 +5038,77 @@ class FormulaEngine:
             rel = _relative_angle(facing, abs_angle)
             return _relative_side_name(rel, sides, _arc_default(corner_arc))
 
+        def _hitbox_mode(hitbox: Any) -> str:
+            """Resolve the hitbox mode: the per-call arg if given, else the
+            side_hit_hitbox_mode rule. Validates box|center."""
+            if hitbox is None:
+                hitbox = match.rules.get("side_hit_hitbox_mode", "box")
+            hb = str(hitbox)
+            if hb not in ("box", "center"):
+                raise FormulaError(
+                    "hitbox must be 'box' or 'center'.")
+            return hb
+
         def _side_hit(target_t: Any, from_x: Any, from_y: Any,
-                      sides: Any = 4, corner_arc: Any = None) -> str:
-            """side_hit(target, from_x, from_y, sides=4, corner_arc=None):
-            which facing-relative side of `target` something coming FROM
-            (from_x, from_y) strikes. Reads target's facing + position,
-            takes the bearing from the target toward the source, and buckets
-            it (see relative_side). Source where the target faces -> 'front';
-            opposite -> 'back'. The basis for directional armor / weakspots."""
+                      sides: Any = 4, corner_arc: Any = None,
+                      hitbox: Any = None) -> str:
+            """side_hit(target, from_x, from_y, sides=4, corner_arc=None,
+            hitbox=None): which facing-relative side of `target` something
+            coming FROM (from_x, from_y) strikes. Reads target's facing +
+            position, takes the bearing from the target toward the source, and
+            buckets it (see relative_side). Source where the target faces ->
+            'front'; opposite -> 'back'. The basis for directional armor /
+            weakspots. For a MULTI-TILE target the bearing is aspect-corrected
+            by the footprint's half-extents (hitbox='box', the default per the
+            side_hit_hitbox_mode rule) so a hit along a long flank reads as a
+            side; hitbox='center' uses the legacy point-bearing from the
+            center. 1×1 targets are identical under both."""
             _check_sides(sides, "side_hit")
             _, e = _resolve_entity(target_t, "side_hit")
-            # Bearing from the target toward the source of the hit, measured
-            # from the target's footprint CENTER (true, possibly-fractional
-            # center for even sizes) so a hit's side is judged against the
-            # body's middle, not its top-left anchor. 1×1 -> the anchor.
-            # Full precision (as_int=False) so corner boundaries are exact.
+            # Footprint center (true, possibly-fractional center for even
+            # sizes; 1×1 -> the anchor) so a hit's side is judged against the
+            # body's middle, not its top-left anchor.
             w, h = match.entity_footprint(e)
             cxf = e.x + (w - 1) / 2.0
             cyf = e.y + (h - 1) / 2.0
-            ab = _angle(cxf, cyf, from_x, from_y, "up", "cw", False, False)
+            if _hitbox_mode(hitbox) == "box" and (w != 1 or h != 1):
+                # Box-face: aspect-correct the center->source vector by the
+                # footprint half-extents, then take the bearing of the
+                # NORMALIZED vector. Dividing each axis by its half-extent
+                # turns the rectangle into a unit square, so the face the
+                # attacker is "beyond" (front/back vs side) reflects the body's
+                # width-vs-depth, not just the raw angle. Feeding the corrected
+                # bearing through the same relative_angle + relative_side_name
+                # pipeline keeps 4/8-way + corner_arc + any facing working.
+                dx = float(from_x) - cxf
+                dy = float(from_y) - cyf
+                hx = w / 2.0
+                hy = h / 2.0
+                if dx == 0 and dy == 0:
+                    ab = 0.0  # source atop the center -> treat as front
+                else:
+                    ab = _angle(0.0, 0.0, dx / hx, dy / hy,
+                                "up", "cw", False, False)
+            else:
+                # Full precision (as_int=False) so corner boundaries are exact.
+                ab = _angle(cxf, cyf, from_x, from_y, "up", "cw", False, False)
             rel = _relative_angle(getattr(e, "facing", "up"), ab)
             return _relative_side_name(rel, sides, _arc_default(corner_arc))
 
         def _directional_get(eid_t: Any, base_path: Any, from_x: Any,
                              from_y: Any, default: Any = None,
-                             sides: Any = 4, corner_arc: Any = None) -> Any:
+                             sides: Any = 4, corner_arc: Any = None,
+                             hitbox: Any = None) -> Any:
             """directional_get(eid, base_path, from_x, from_y, default=None,
-            sides=4, corner_arc=None): compute the side of `eid` struck from
-            (from_x, from_y) via side_hit, then read eid's var at
+            sides=4, corner_arc=None, hitbox=None): compute the side of `eid`
+            struck from (from_x, from_y) via side_hit, then read eid's var at
             base_path.<side>. Returns `default` when that path is missing,
             so a partial table (only some sides defined) is fine. The
             one-call form of var_get(eid, base_path + '.' + side_hit(...))."""
             if not isinstance(base_path, str) or not base_path:
                 raise FormulaError(
                     "directional_get(...): base_path must be a non-empty string.")
-            side = _side_hit(eid_t, from_x, from_y, sides, corner_arc)
+            side = _side_hit(eid_t, from_x, from_y, sides, corner_arc, hitbox)
             full = base_path + "." + side
             if not _var_has(eid_t, full):
                 return default
@@ -5069,7 +5122,8 @@ class FormulaEngine:
         def _hit_location(target_t: Any, from_x: Any, from_y: Any,
                           aim: Any = None, aim_weight: Any = None,
                           aim_bonus: Any = None, mode: Any = None,
-                          sides: Any = 4, corner_arc: Any = None) -> str:
+                          sides: Any = 4, corner_arc: Any = None,
+                          hitbox: Any = None) -> str:
             """hit_location(target, from_x, from_y, aim=None, aim_weight=None,
             aim_bonus=None, mode=None, sides=4, corner_arc=None): roll WHICH
             body part of `target` a hit coming FROM (from_x, from_y) lands
@@ -5092,7 +5146,7 @@ class FormulaEngine:
             if mode_s not in ("weighted", "uniform"):
                 raise FormulaError(
                     "hit_location(...): mode must be 'weighted' or 'uniform'.")
-            side = _side_hit(target_t, from_x, from_y, sides, corner_arc)
+            side = _side_hit(target_t, from_x, from_y, sides, corner_arc, hitbox)
             aim_id = None
             if aim is not None and aim != "":
                 ap = match.find_part(tid, str(aim))

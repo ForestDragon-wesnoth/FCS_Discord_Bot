@@ -11119,3 +11119,77 @@ show `[part of dragon]`, while Dragon's own line has none. A custom template
 ` «{parent_name}#{parent}»` renders ` «Dragon#dragon»` on those rows instead.
 Setting the suffix empty removes the annotation entirely (the rows render as
 plain entity lines).
+
+
+SCENARIO 434 — Box-face side_hit: a multi-tile flank reads "side", not "front"
+------------------------------------------------------------------------------
+
+!match new bf BF 14 12
+!match use bf
+!ent add tower Tower 60 5 4 9
+!ent face tower up
+!ent set_var tower footprint_w 1
+!ent set_var tower footprint_h 4
+!eval "side_hit('tower', 6, 4)"
+!eval "side_hit('tower', 6, 4, 4, 30, 'center')"
+!ent add small Small 10 10 4 9
+!ent face small up
+!eval "side_hit('small', 11, 4)"
+!eval "side_hit('small', 11, 4, 4, 30, 'center')"
+
+Expected: Tower is a 1×4 body (a tall, thin column) facing up, occupying
+(5,4)-(5,7). An attacker at (6,4) is directly EAST of the tower's front cell —
+right beside the thin body. The default `box` hitbox aspect-corrects by the
+footprint (it's only 1 wide), so side_hit reads `right_side`. The legacy
+`center` mode measures the bare bearing to the body's distant center (5,5.5),
+a shallow angle, and reads `front`. The 1×1 Small entity is identical under
+both modes — `box` and `center` both read `right_side` for a hit from (11,4) —
+because the aspect correction is uniform when width == height.
+
+
+SCENARIO 435 — Box-face directional armor on a large body (flank beats front)
+-----------------------------------------------------------------------------
+
+!match new ba BA 14 12
+!match use ba
+!ent add tower Tower 60 5 4 9
+!ent face tower up
+!ent set_var tower footprint_w 1
+!ent set_var tower footprint_h 4
+!ent set_var tower armor.front 8
+!ent set_var tower armor.right_side 2
+!ent add gun Gunner 20 6 4 7
+!ent set_var gun weapon.power 10
+!ent set_var gun weapon.actions.shoot.target entity
+!ent set_var gun weapon.actions.shoot.body "armor = directional_get(target, 'armor', entity[self].x, entity[self].y, 0)\nentity[target].hp = entity[target].hp - max(1, source.power - armor)"
+!eval "directional_get('tower', 'armor', 6, 4, 0)"
+!eval "directional_get('tower', 'armor', 6, 4, 0, 4, 30, 'center')"
+!action gun shoot tower
+!ent dump tower
+
+Expected: the 1×4 Tower (facing up) has front armor 8 and right_side armor 2.
+The Gunner at (6,4) is beside the tower's front. With the default box hitbox
+the struck side is `right_side`, so directional_get reads armor 2 → the stab
+deals max(1, 10-2) = 8 → Tower 60→52. The contrast `!eval` with `center`
+shows the legacy geometry would have read the FRONT (armor 8), which would
+have floored the hit at max(1, 10-8) = 2. Aspect-aware hit geometry makes a
+long body's flank a real weak point. `!ent dump tower` shows hp 52.
+
+
+SCENARIO 436 — raycast: a beam lands on the cell before cover
+-------------------------------------------------------------
+
+!match new rc RC 10 8
+!match use rc
+!tile set 5 4 opaque true
+!eval "coord_x(raycast(5, 1, 5, 7))"
+!eval "coord_y(raycast(5, 1, 5, 7))"
+!eval "coord_y(first_opaque(5, 1, 5, 7))"
+!eval "coord_y(raycast(7, 1, 7, 7))"
+
+Expected: an opaque tile sits at (5,4). A beam cast from (5,1) toward (5,7)
+is stopped by it: raycast returns the IMPACT point (5,3) — the last clear cell
+before the wall — while first_opaque returns the wall itself (5,4). A beam
+down the clear column x=7 reaches its target: raycast(7,1,7,7) returns (7,7).
+raycast answers "where does the beam land", first_opaque answers "what did it
+hit".
