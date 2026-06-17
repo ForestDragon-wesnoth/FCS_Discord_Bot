@@ -11193,3 +11193,61 @@ before the wall — while first_opaque returns the wall itself (5,4). A beam
 down the clear column x=7 reaches its target: raycast(7,1,7,7) returns (7,7).
 raycast answers "where does the beam land", first_opaque answers "what did it
 hit".
+
+
+SCENARIO 437 — Event bus: a global handler decouples cause from effect
+----------------------------------------------------------------------
+
+!match new ev EV 8 6
+!match use ev
+!gpassive add onwave event:wave_cleared "match_var_set('waves', match_var_get('waves') + 1)"
+!match var set waves 0
+!emit wave_cleared
+!emit wave_cleared
+!eval "match_var_get('waves')"
+
+Expected: a global passive subscribes to the custom event `wave_cleared`
+(when = `event:wave_cleared`). Each `!emit wave_cleared` fires it once,
+bumping the match var `waves` 0→1→2. The emitter knows nothing about the
+handler — the event bus decouples cause from effect. `!eval` shows 2.
+
+
+SCENARIO 438 — Event bus: directed emit carries a payload; untargeted skips entity handlers
+-------------------------------------------------------------------------------------------
+
+!match new evh EVH 8 6
+!match use evh
+!ent add ogre Ogre 40 4 3 9
+!passive add ogre takehit event:damage "entity[self].hp = entity[self].hp - event_get('amount', 0) * event_get('mult', 1)"
+!emit damage to=ogre amount=5 mult=2
+!ent dump ogre
+!emit damage amount=5 mult=2
+!ent dump ogre
+
+Expected: the Ogre has an entity passive on `event:damage` that reads the
+event PAYLOAD via event_get. `!emit damage to=ogre amount=5 mult=2` is a
+DIRECTED emit — it fires the Ogre's own handler with self=ogre, applying
+5 × 2 = 10 → hp 40→30. The second emit OMITS `to=`, so it's untargeted: only
+global handlers (there are none) fire and the Ogre's entity handler is
+skipped — hp stays 30. (For a broadcast the GM loops emit per target.)
+
+
+SCENARIO 439 — Event bus: emit from a formula, event chaining + event_name
+--------------------------------------------------------------------------
+
+!match new evc EVC 8 6
+!match use evc
+!ent add bell Bell 10 2 2 9
+!gpassive add chain event:ring "emit('echo')"
+!gpassive add onecho event:echo "match_var_set('echoed', event_name)"
+!match var set echoed none
+!ent set_var bell actions.toll.target none
+!ent set_var bell actions.toll.body "emit('ring')"
+!action bell toll
+!eval "match_var_get('echoed')"
+
+Expected: tolling the Bell runs an action body that calls `emit('ring')`. The
+global `ring` handler in turn calls `emit('echo')`, and the `echo` handler
+records its own `event_name` ('echo') into the match var `echoed`. So emit
+works from a formula, events chain handler→handler, and the `event_name`
+binding identifies the firing event. `!eval` shows 'echo'.
