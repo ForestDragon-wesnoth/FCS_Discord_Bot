@@ -4758,9 +4758,9 @@ class FormulaEngine:
             raise FormulaError("shield tags must be a string or a list.")
 
         def _shield_roots(e) -> list:
-            ov = e.vars.get("__shield_sources")
+            ov = e.vars.get("__temp_hp_sources")
             raw = ov if (isinstance(ov, str) and ov.strip()) \
-                else match.rules.get("shield_sources", "shields")
+                else match.rules.get("temp_hp_sources", "shields")
             return [r.strip() for r in str(raw).split(",") if r.strip()]
 
         def _vars_at(d: Any, path: str) -> Any:
@@ -4825,7 +4825,7 @@ class FormulaEngine:
 
         def _absorb_damage(eid_token: Any, amount: Any, tags: Any = None):
             """absorb_damage(eid, amount, tags=None): drain `eid`'s shield /
-            temp-HP POOLS (the shield_sources roots) by `amount`, HIGHEST
+            temp-HP POOLS (the temp_hp_sources roots) by `amount`, HIGHEST
             priority first, and return the leftover that PENETRATES to be
             applied to HP (the GM applies it: `entity[t].hp = entity[t].hp -
             absorb_damage(t, dmg)`). Pools matching the hit's `tags` absorb it

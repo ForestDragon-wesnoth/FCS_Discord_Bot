@@ -1241,8 +1241,8 @@ More shipped work (continuing the list above):
   (the sandbox has no damage-interception or loop+visited-set); channeled /
   charge-up were judged COMPOSABLE and shipped as demonstration scenarios
   only (no new engine code), per "do we really need a whole feature for X?".
-  - **Shields / temp-HP** (the `shield_sources` rule, CSV of vars roots,
-    default `shields`; per-entity `__shield_sources`): named absorb POOLS
+  - **Shields / temp-HP** (the `temp_hp_sources` rule, CSV of vars roots,
+    default `shields`; per-entity `__temp_hp_sources`): named absorb POOLS
     (`shields.plate`, `shields.ward`, ...) so multiple independent layers
     coexist. A pool is `{amount, priority?, tags?, not_tags?}` or a bare
     number. `absorb_damage(eid, amount, tags=None)` drains matching pools

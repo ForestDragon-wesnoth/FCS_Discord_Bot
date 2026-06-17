@@ -550,7 +550,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "`__modifier_sources_add` var (extends it)."
         ),
     },
-    "shield_sources": {
+    "temp_hp_sources": {
         "default": "shields",
         "schema": {"type": "str"},
         "desc": (
@@ -565,7 +565,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "pool emptied to 0 is removed. Pools are plain vars — set/refresh "
             "them with `!ent set_var` (decay is GM-composed via a status tick "
             "or round hook), per 'what X does is stored in X'. Per-entity "
-            "override: the `__shield_sources` var (replaces this list)."
+            "override: the `__temp_hp_sources` var (replaces this list)."
         ),
     },
     "modifier_op_priority": {
