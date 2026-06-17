@@ -1351,7 +1351,9 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #                                               sorted by (distance, id)
     #   nearest_entity(eid, relation, mode)      -> single closest id, or
     #                                               "" if none match
-    "entities_within", "nearest_entity",
+    "entities_within", "nearest_entity", "chain_targets",
+    # Shields / temporary-HP absorb layer.
+    "absorb_damage", "shield_total",
     # Iterable companion to group_has / group_size: the list of member
     # ids for a named group, in insertion order. Returns [] when the
     # group doesn't exist (consistent with group_size returning 0). The
@@ -1673,6 +1675,7 @@ _ALLOWED_NODES: Tuple[type, ...] = (
 # the id case, a 2-tuple of Names for the coord case.
 _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "entities_within",
+    "chain_targets",
     "group_members",
     "cells_in_burst",
     "cells_in_line",
@@ -3219,6 +3222,51 @@ class FormulaEngine:
         ns["entities_within"] = _entities_within
         ns["nearest_entity"]  = _nearest_entity
 
+        def _chain_targets(from_token: Any, count: Any, max_jump: Any = 0,
+                           relation: Any = "") -> list:
+            """chain_targets(from_eid, count, max_jump=0, relation=""): up to
+            `count` entity ids forming a CHAIN out of `from_eid` — each link
+            the nearest alive eligible entity to the PREVIOUS link, never
+            revisiting, within max_jump cells (0 / None = unlimited). The
+            chain-lightning / bounce primitive: loop it and apply your own
+            per-hop falloff (the GM owns the damage). `relation` filters
+            eligibility (any / hostile / ally / same_team / attackable);
+            distance is the square-radius (Chebyshev) gap. Near->far."""
+            start = _eid(from_token)
+            if match.entities.get(start) is None:
+                raise FormulaError(f"chain_targets: unknown entity id '{start}'.")
+            if isinstance(count, bool) or not isinstance(count, (int, float)):
+                raise FormulaError("chain_targets(...): count must be a number.")
+            n = int(count)
+            cap = None
+            if max_jump not in (None, 0):
+                if isinstance(max_jump, bool) or not isinstance(max_jump, (int, float)):
+                    raise FormulaError("chain_targets(...): max_jump must be a number.")
+                cap = float(max_jump)
+            visited = {start}
+            cur = start
+            out: list = []
+            while len(out) < n:
+                best_id = ""
+                best_d = None
+                for oid, oe, ref_e in _candidates(cur, relation):
+                    if oid in visited:
+                        continue
+                    d = _ent_dist(ref_e, oe, "square_radius_distance")
+                    if cap is not None and d > cap:
+                        continue
+                    if best_d is None or d < best_d or (d == best_d and oid < best_id):
+                        best_d = d
+                        best_id = oid
+                if not best_id:
+                    break
+                out.append(best_id)
+                visited.add(best_id)
+                cur = best_id
+            return out
+
+        ns["chain_targets"] = _chain_targets
+
         # ---- footprint / large-entity accessors ----
         def _require_e(eid_t: Any, fn: str):
             eid = _eid(eid_t)
@@ -4696,6 +4744,127 @@ class FormulaEngine:
             eid, e = _resolve_entity(eid_token, "is_indestructible")
             return bool(match.is_indestructible(e))
         ns["is_indestructible"] = _is_indestructible
+
+        # ---- shields / temporary-HP absorb layer -------------------------
+        def _shield_tags(tags: Any) -> list:
+            """Normalize a tags argument: None -> [], a CSV string -> split,
+            a list -> as-is."""
+            if tags is None:
+                return []
+            if isinstance(tags, str):
+                return [t.strip() for t in tags.split(",") if t.strip()]
+            if isinstance(tags, (list, tuple)):
+                return [str(t) for t in tags]
+            raise FormulaError("shield tags must be a string or a list.")
+
+        def _shield_roots(e) -> list:
+            ov = e.vars.get("__temp_hp_sources")
+            raw = ov if (isinstance(ov, str) and ov.strip()) \
+                else match.rules.get("temp_hp_sources", "shields")
+            return [r.strip() for r in str(raw).split(",") if r.strip()]
+
+        def _vars_at(d: Any, path: str) -> Any:
+            cur = d
+            for seg in path.split("."):
+                if not isinstance(cur, dict):
+                    return None
+                cur = cur.get(seg)
+            return cur
+
+        def _pool_amount(pool: Any) -> float:
+            if isinstance(pool, dict):
+                v = pool.get("amount", 0)
+            elif isinstance(pool, bool) or not isinstance(pool, (int, float)):
+                return 0.0
+            else:
+                v = pool
+            try:
+                return float(v or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _pool_priority(pool: Any) -> float:
+            if isinstance(pool, dict):
+                try:
+                    return float(pool.get("priority", 0) or 0)
+                except (TypeError, ValueError):
+                    return 0.0
+            return 0.0
+
+        def _pool_matches(pool: Any, hit_tags: set) -> bool:
+            # A bare-number / untagged pool absorbs any hit. A pool with
+            # `tags` only absorbs hits carrying all of them; `not_tags`
+            # excludes. Mirrors the modifier tag-match.
+            if not isinstance(pool, dict):
+                return True
+            req = _shield_tags(pool.get("tags"))
+            exc = _shield_tags(pool.get("not_tags"))
+            if any(t not in hit_tags for t in req):
+                return False
+            if any(t in hit_tags for t in exc):
+                return False
+            return True
+
+        def _gather_pools(e, hit_tags: set) -> list:
+            out = []
+            for root in _shield_roots(e):
+                d = _vars_at(e.vars, root)
+                if not isinstance(d, dict):
+                    continue
+                for name, pool in d.items():
+                    amt = _pool_amount(pool)
+                    if amt <= 0 or not _pool_matches(pool, hit_tags):
+                        continue
+                    out.append((root, name, pool, _pool_priority(pool), amt))
+            # Highest priority absorbs first; ties by name (deterministic).
+            out.sort(key=lambda t: (-t[3], t[1]))
+            return out
+
+        def _clean_num(x: float):
+            return int(x) if float(x).is_integer() else float(x)
+
+        def _absorb_damage(eid_token: Any, amount: Any, tags: Any = None):
+            """absorb_damage(eid, amount, tags=None): drain `eid`'s shield /
+            temp-HP POOLS (the temp_hp_sources roots) by `amount`, HIGHEST
+            priority first, and return the leftover that PENETRATES to be
+            applied to HP (the GM applies it: `entity[t].hp = entity[t].hp -
+            absorb_damage(t, dmg)`). Pools matching the hit's `tags` absorb it
+            (an untagged pool absorbs anything; a typed ward only its type); a
+            pool drained to 0 is removed. Multiple named pools coexist and
+            drain in order. Mutates the pool vars (firing their var hooks)."""
+            eid, e = _resolve_entity(eid_token, "absorb_damage")
+            try:
+                remaining = float(amount)
+            except (TypeError, ValueError):
+                raise FormulaError("absorb_damage(...): amount must be a number.")
+            if remaining <= 0:
+                return _clean_num(remaining)
+            hit_tags = set(_shield_tags(tags))
+            for (root, name, pool, _prio, amt) in _gather_pools(e, hit_tags):
+                if remaining <= 0:
+                    break
+                absorbed = min(remaining, amt)
+                remaining -= absorbed
+                new_amt = amt - absorbed
+                path = root + "." + name
+                if new_amt <= 0:
+                    e.remove_var(path)
+                elif isinstance(pool, dict):
+                    e.write_var(path + ".amount", _clean_num(new_amt))
+                else:
+                    e.write_var(path, _clean_num(new_amt))
+            return _clean_num(remaining)
+
+        def _shield_total(eid_token: Any, tags: Any = None):
+            """shield_total(eid, tags=None): the total absorb available to a
+            hit of `tags` (sum of matching pool amounts; no mutation). For
+            display / conditions."""
+            eid, e = _resolve_entity(eid_token, "shield_total")
+            hit_tags = set(_shield_tags(tags))
+            return _clean_num(sum(t[4] for t in _gather_pools(e, hit_tags)))
+
+        ns["absorb_damage"] = _absorb_damage
+        ns["shield_total"]  = _shield_total
 
         # ---- stat modifiers (derived / effective stats) ------------------
         def _norm_mod_tags(tags: Any, fname: str) -> list:

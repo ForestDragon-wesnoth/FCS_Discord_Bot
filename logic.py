@@ -550,6 +550,24 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "`__modifier_sources_add` var (extends it)."
         ),
     },
+    "temp_hp_sources": {
+        "default": "shields",
+        "schema": {"type": "str"},
+        "desc": (
+            "Comma-separated vars roots scanned for temporary-HP / shield "
+            "POOLS by absorb_damage / shield_total. Each root is a dict of "
+            "NAMED pools (`shields.barrier`, `shields.ward`, ...) so multiple "
+            "independent absorb layers coexist. A pool is a dict {amount, "
+            "priority?, tags?, not_tags?} or a bare number (= amount). "
+            "absorb_damage drains matching pools HIGHEST priority first (ties "
+            "by name); a pool with `tags`/`not_tags` only absorbs hits whose "
+            "tags match (a typed ward), an untagged pool absorbs anything; a "
+            "pool emptied to 0 is removed. Pools are plain vars — set/refresh "
+            "them with `!ent set_var` (decay is GM-composed via a status tick "
+            "or round hook), per 'what X does is stored in X'. Per-entity "
+            "override: the `__temp_hp_sources` var (replaces this list)."
+        ),
+    },
     "modifier_op_priority": {
         "default": "add:0,inc%:100,more%:200,set:300,min:400,max:500",
         "schema": {"type": "str"},
