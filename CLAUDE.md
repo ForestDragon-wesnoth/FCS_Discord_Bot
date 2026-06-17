@@ -489,8 +489,9 @@ Shipped capabilities (roughly chronological; all merged):
   `_relative_angle`, `_facing_degrees`, `_SIDE_CARDINALS`/`_SIDE_CORNERS`.
   Malformed/missing-var fails by raising (FormulaError) like other funcs.
   Verified: directional armor/weakspot (back hit > front hit) via an action.
-  FUTURE slices the user may want: LOS-aware raycast (stops at opaque
-  cells), configurable side NAMES (gamerule), entity-shape > point hitboxes.
+  FUTURE slices the user may want: configurable side NAMES (gamerule).
+  (entity-shape hitboxes + LOS-aware raycast SHIPPED — see the
+  "Directional/vision geometry" entry below.)
 - Action system (full body language with cmd/fail/source/target/args,
   transactional rollback, target types entity/location/entity_list/
   location_list/none/corpse/corpse_list, recursion limit, allowlist,
@@ -1187,6 +1188,33 @@ More shipped work (continuing the list above):
   every entity_line_format key (resolved against the part). Empty = off. Only
   parts on the roster (located / segment / region) show it — glued parts are
   hidden anyway.
+- **Directional/vision geometry — SHIPPED (scenarios 434-436).** Three
+  primitives extending the directional + LOS + footprint layers.
+  (1) **Box-face (footprint-aware) side_hit** — `side_hit` / `directional_get`
+  / `hit_location` now judge a MULTI-TILE target's struck side against its
+  real rectangle, not a center POINT. The `side_hit_hitbox_mode` rule
+  (`box` default | `center` legacy; per-call `hitbox=` override) selects it:
+  `box` aspect-corrects the center→attacker vector by the footprint
+  half-extents (`dx/hx, dy/hy`) and takes the bearing of that NORMALIZED
+  vector, then runs it through the existing `_relative_angle` +
+  `_relative_side_name` pipeline — so a hit along a long flank reads `side`
+  (not `front`) even near a corner, and 4/8-way + corner_arc + any facing all
+  keep working with no special diagonal case. 1×1 is byte-identical to
+  `center` (uniform correction when w==h), so the default-on change only
+  affects multi-tile bodies. (2) **`raycast(x1,y1,x2,y2[,viewer])`** —
+  `Match.raycast`, the IMPACT point of a beam: the farthest clear cell before
+  terrain stops it (or the target if clear), as an (x,y) read via
+  coord_x/coord_y. The companion to `first_opaque` (which returns the
+  BLOCKER); raycast returns where the beam LANDS. Walks the shared
+  `_line_cells`; the cell adjacent to an opaque origin-neighbour yields the
+  origin. (3) **Render vision memo (perf)** — `_fog_team_sees` is memoized via
+  a transient `Match._vision_memo` dict, activated only around `render_ascii`
+  (now a thin wrapper over `_render_ascii_impl`) and torn down in `finally`,
+  so the per-cell-per-layer fog scan (which loops every team member with a
+  per-member LOS walk) isn't recomputed. NEVER held across a mutation — lives
+  only for one synchronous read pass — so it can't go stale; renders are
+  byte-identical with it on/off. Cross-command caching intentionally out of
+  scope (avoids invalidation hazards).
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
