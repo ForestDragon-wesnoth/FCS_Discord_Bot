@@ -1270,6 +1270,19 @@ More shipped work (continuing the list above):
     that releases the wound-up attack at a threshold and resets. Both prove
     the engine already supports the pattern via status/var + hooks + use_action
     + the event bus — no new primitive warranted.
+- **Dice DSL extensions + weighted tables — SHIPPED (scenarios 444-446).** The
+  pre-existing `roll("NdM±k")` primitive (a shared `_roll_impl` used by both the
+  unseeded and the random_seed-bound bindings) gained per-die-group suffixes:
+  `!` (EXPLODE — a die on its max face rolls again and adds, capped at
+  `_ROLL_EXPLODE_CAP`, skipped for sides==1), and `kh<n>`/`kl<n>` (KEEP highest
+  / lowest n of the rolled dice — `2d20kh1` = advantage, `2d20kl1` =
+  disadvantage). Grammar via `_ROLL_DIE_RE` / `_ROLL_FLAT_RE`; dice are rolled
+  into a list (post-explosion per die) then keep-filtered. New
+  `roll_table(spec)` (match-bound, replay-safe via `_active_rng`): a weighted
+  random PICK returning a key — input is a `"key:weight,..."` CSV (weight
+  optional, default 1) or a `{key: weight}` dict; 0-weight entries never chosen;
+  the discrete-choice companion to `band` (which buckets a NUMBER into a range).
+  Both honor `random_seed` for reproducible sessions.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
