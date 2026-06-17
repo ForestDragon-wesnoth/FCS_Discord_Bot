@@ -11352,3 +11352,66 @@ Expected: a charge-up attack also needs no new primitive — a `charging` flag
 of Hero's turn-starts adds 1; on the third the wound-up attack releases (25 to
 Dummy) and the charge resets. After cycling through enough turns Dummy has
 taken the hit: 50→25. Clearing `charging` mid-wind-up would cancel it.
+
+
+SCENARIO 444 — Dice DSL: keep-highest/lowest (advantage), exploding
+-------------------------------------------------------------------
+
+!match new dc DC 6 6
+!match use dc
+!system set default random_seed showcase
+!eval "roll('3d6+2')"
+!eval "roll('4d6kh3')"
+!eval "roll('2d20kh1')"
+!eval "roll('2d20kl1')"
+!eval "roll('1d6!')"
+
+Expected: roll() now understands keep-highest/lowest and exploding dice on
+top of the existing NdM±k notation. With random_seed=showcase the rolls are
+reproducible: `3d6+2`=12, `4d6kh3`=14 (roll 4d6, keep the best 3),
+`2d20kh1`=17 (ADVANTAGE — best of two d20), `2d20kl1`=6 (DISADVANTAGE — worst
+of two), `1d6!`=3 (exploding: a die showing its max face rolls again and
+adds; here it didn't hit 6 so it's a flat 3). Each die is an independent
+randint, and the match RNG makes a seeded session replay identically.
+
+
+SCENARIO 445 — Dice in an action: advantage to-hit + exploding damage
+---------------------------------------------------------------------
+
+!match new at AT 8 6
+!match use at
+!system set default random_seed atk
+!ent add knight Knight 30 2 2 9
+!ent add troll Troll 40 6 2 5
+!ent set_var knight actions.smite.target entity
+!ent set_var knight actions.smite.body "tohit = roll('2d20kh1')\nif tohit >= 12:\n dmg = roll('2d6!') + 3\n entity[target].hp = entity[target].hp - dmg"
+!action knight smite troll
+!ent dump troll
+
+Expected: the smite rolls 2d20kh1 (an advantage to-hit) and, on a 12+, deals
+roll('2d6!')+3 exploding damage. With random_seed=atk the to-hit clears the
+threshold and the damage roll totals 9 → Troll 40→31. The whole attack is
+assembled from the dice primitive in an ordinary action body; the GM owns the
+threshold and the damage application.
+
+
+SCENARIO 446 — Weighted random table: loot drop + crit table
+------------------------------------------------------------
+
+!match new lt LT 8 6
+!match use lt
+!system set default random_seed loot
+!ent add chest Chest 1 4 2 1
+!ent set_var chest actions.open.target none
+!ent set_var chest actions.open.body "entity[self].contents = roll_table('sword:1,potion:3,gold:6,nothing:2')"
+!action chest open
+!ent dump chest
+!eval "roll_table('crit:1,hit:3,miss:2')"
+
+Expected: roll_table picks a key with probability proportional to its weight
+(the discrete-choice companion to band, which buckets a number). Opening the
+chest rolls the loot table `sword:1,potion:3,gold:6,nothing:2`; with
+random_seed=loot the drop is `gold` (stored in the chest's `contents` var).
+`roll_table('crit:1,hit:3,miss:2')` similarly resolves an attack outcome —
+here `hit`. Weights need not sum to anything in particular; a 0-weight entry
+is never chosen, and the match RNG makes seeded rolls reproducible.

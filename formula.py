@@ -458,19 +458,30 @@ def _random_string(*choices: Any) -> str:
 # rolls "1000d6" is already absurd; nobody legitimately rolls more.
 _ROLL_MAX_DICE = 1000
 _ROLL_MAX_SIDES = 1_000_000
-_ROLL_TERM_RE = re.compile(r"^([+-]?)(\d*)d(\d+)$|^([+-]?)(\d+)$")
+_ROLL_EXPLODE_CAP = 1000   # max extra rolls a single exploding die can chain
+# A die group: optional sign, optional count, `d`, sides, optional `!`
+# (explode), optional keep-highest/lowest `kh<n>` / `kl<n>`. Or a flat int.
+_ROLL_DIE_RE = re.compile(r"^([+-]?)(\d*)d(\d+)(!?)(?:(kh|kl)(\d+))?$")
+_ROLL_FLAT_RE = re.compile(r"^([+-]?)(\d+)$")
 
 
 def _roll_impl(rng, spec: Any) -> int:
-    """roll("2d6+3"): evaluate standard dice notation and return the
-    integer total. Implementation shared by the seeded and unseeded
-    bindings — the RNG is injected so the match's random_seed rule makes
-    rolls reproducible the same way random_int does.
+    """roll("2d6+3"): evaluate dice notation and return the integer total.
+    Implementation shared by the seeded and unseeded bindings — the RNG is
+    injected so the match's random_seed rule makes rolls reproducible the
+    same way random_int does.
 
-    Grammar: one or more terms joined by + / -, each term either a die
-    group `NdM` (N optional, defaults to 1) or a flat integer modifier.
-    Examples: "d20", "2d6+3", "1d8-1", "3d6+2d4+1". Whitespace and case
-    are ignored. Each die contributes an independent randint(1, M)."""
+    Grammar: one or more terms joined by + / -, each term either a flat
+    integer modifier or a die group `NdM` (N optional, defaults to 1) with
+    optional suffixes:
+      `!`        explode — a die showing its max face rolls again and adds,
+                 repeating (so a d6 reading 6 keeps going); capped per die.
+      `kh<n>`    keep the highest n of the rolled dice (drop the rest).
+      `kl<n>`    keep the lowest n. `2d20kh1` = advantage, `2d20kl1` =
+                 disadvantage.
+    Examples: "d20", "2d6+3", "1d8-1", "3d6+2d4+1", "4d6kh3", "2d20kl1",
+    "10d6!". Whitespace and case are ignored. Each die is an independent
+    randint(1, M)."""
     if not isinstance(spec, str):
         raise FormulaError(
             f"roll(spec): spec must be a dice string like '2d6+3', got "
@@ -479,24 +490,19 @@ def _roll_impl(rng, spec: Any) -> int:
     s = spec.replace(" ", "").lower()
     if not s:
         raise FormulaError("roll(spec): empty dice expression.")
-    # Split into signed terms while keeping each leading +/-; a bare
-    # leading term has an implicit '+'.
     terms = re.findall(r"[+-]?[^+-]+", s)
     if not terms or "".join(terms) != s:
         raise FormulaError(f"roll(spec): malformed dice expression '{spec}'.")
     total = 0
     for term in terms:
-        m = _ROLL_TERM_RE.match(term)
-        if m is None:
-            raise FormulaError(
-                f"roll(spec): malformed term '{term}' in '{spec}' — "
-                f"expected NdM or a flat integer."
-            )
-        if m.group(3) is not None:
-            # Die group: sign, optional count, sides.
-            sgn = -1 if m.group(1) == "-" else 1
-            count = int(m.group(2)) if m.group(2) else 1
-            sides = int(m.group(3))
+        dm = _ROLL_DIE_RE.match(term)
+        if dm is not None:
+            sgn = -1 if dm.group(1) == "-" else 1
+            count = int(dm.group(2)) if dm.group(2) else 1
+            sides = int(dm.group(3))
+            explode = dm.group(4) == "!"
+            keep_mode = dm.group(5)            # 'kh' / 'kl' / None
+            keep_n = int(dm.group(6)) if dm.group(6) else None
             if count < 1 or count > _ROLL_MAX_DICE:
                 raise FormulaError(
                     f"roll(spec): die count {count} out of range "
@@ -507,12 +513,35 @@ def _roll_impl(rng, spec: Any) -> int:
                     f"roll(spec): die sides {sides} out of range "
                     f"(1..{_ROLL_MAX_SIDES}) in '{spec}'."
                 )
+            dice = []
             for _ in range(count):
-                total += sgn * rng.randint(1, sides)
-        else:
-            # Flat integer modifier.
-            sgn = -1 if m.group(4) == "-" else 1
-            total += sgn * int(m.group(5))
+                v = rng.randint(1, sides)
+                die_total = v
+                # Explode only when there's a non-trivial max face (a d1
+                # would explode forever); cap the chain regardless.
+                if explode and sides > 1:
+                    chain = 0
+                    while v == sides and chain < _ROLL_EXPLODE_CAP:
+                        v = rng.randint(1, sides)
+                        die_total += v
+                        chain += 1
+                dice.append(die_total)
+            if keep_mode is not None:
+                k = max(0, min(keep_n, len(dice)))
+                dice.sort()
+                kept = dice[-k:] if keep_mode == "kh" else dice[:k]
+            else:
+                kept = dice
+            total += sgn * sum(kept)
+            continue
+        fm = _ROLL_FLAT_RE.match(term)
+        if fm is not None:
+            total += (-1 if fm.group(1) == "-" else 1) * int(fm.group(2))
+            continue
+        raise FormulaError(
+            f"roll(spec): malformed term '{term}' in '{spec}' — expected "
+            f"NdM (with optional !, kh<n>, kl<n>) or a flat integer."
+        )
     return total
 
 
@@ -1521,6 +1550,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # in the round's turn order. For cadence checks ('every N rounds',
     # 'first turn of the round') and round-measured cooldowns.
     "round_number", "turn_index",
+    # Weighted random pick (replay-safe via the match RNG).
+    "roll_table",
     # Match-wide entity queries (no reference entity; all loopable). Each
     # returns a list of ALIVE entity ids:
     #   all_entities()                -> every alive entity, insertion order
@@ -2663,6 +2694,59 @@ class FormulaEngine:
             else the global `random` module. Both honor getstate/setstate,
             so the action choice-replay snapshot covers either."""
             return getattr(match, "_rng", None) or random
+
+        def _roll_table(spec: Any) -> str:
+            """roll_table("a:3,b:2,c") / roll_table({...}): weighted random
+            pick — returns a key with probability proportional to its weight.
+            Input is a CSV of `key:weight` (weight optional, default 1) or a
+            dict {key: weight}. A 0-weight entry is never chosen. Replay-safe
+            via the match RNG (honors random_seed). The discrete-choice
+            companion to band (which buckets a number into a range)."""
+            def _w(x: Any, key: str) -> float:
+                if isinstance(x, bool) or not isinstance(x, (int, float)):
+                    try:
+                        x = float(str(x).strip())
+                    except (TypeError, ValueError):
+                        raise FormulaError(
+                            f"roll_table(...): weight for '{key}' must be a number.")
+                w = float(x)
+                if w < 0:
+                    raise FormulaError(
+                        f"roll_table(...): weight for '{key}' must be >= 0.")
+                return w
+            pairs = []
+            if isinstance(spec, dict):
+                for k, w in spec.items():
+                    pairs.append((str(k), _w(w, str(k))))
+            elif isinstance(spec, str):
+                for part in spec.split(","):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    if ":" in part:
+                        k, _, ws = part.partition(":")
+                        pairs.append((k.strip(), _w(ws.strip(), k.strip())))
+                    else:
+                        pairs.append((part, 1.0))
+            else:
+                raise FormulaError(
+                    "roll_table(spec): spec must be a 'key:weight,...' "
+                    "string or a dict {key: weight}.")
+            pairs = [(k, w) for k, w in pairs if w > 0]
+            total = sum(w for _, w in pairs)
+            if not pairs or total <= 0:
+                raise FormulaError(
+                    "roll_table(spec): needs at least one entry with "
+                    "positive weight.")
+            r = _active_rng().random() * total
+            upto = 0.0
+            for k, w in pairs:
+                upto += w
+                if r < upto:
+                    return k
+            return pairs[-1][0]
+        ns["roll_table"] = _roll_table
+
         def _eid(token: Any) -> str:
             if token is None:
                 # A bare `self` / `this` / `current` token was passed,
