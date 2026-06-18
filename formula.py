@@ -1413,6 +1413,9 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     "status_tags", "status_has_tag", "statuses_with_tag",
     "status_resist_of", "is_status_immune",
     "status_counter_add", "status_counter_set",
+    # Match outcome / victory (no built-in objective evaluator; compose
+    # win conditions from watchers/actions calling declare_winner).
+    "declare_winner", "match_winner", "match_over",
     # Status-name introspection: status_names(eid) -> list of the active
     # status names on an entity (insertion order). The companion that
     # lets a formula iterate WHATEVER statuses exist instead of checking
@@ -3721,6 +3724,29 @@ class FormulaEngine:
         ns["is_status_immune"]    = _is_status_immune
         ns["status_counter_add"]  = _status_counter_add
         ns["status_counter_set"]  = _status_counter_set
+
+        # ---- match outcome / victory (no built-in objective evaluator) ----
+        def _declare_winner(winner: Any, reason: Any = "") -> str:
+            """declare_winner(winner[, reason]): record the match outcome
+            (the composable 'win' call — invoke it from a watcher effect, an
+            action, or an on_death passive). Returns the winner string."""
+            if not isinstance(winner, str) or not winner:
+                raise FormulaError("declare_winner(winner[, reason]): winner must be a non-empty string.")
+            match.declare_winner(winner, str(reason) if reason else "")
+            return str(winner)
+
+        def _match_winner() -> str:
+            """match_winner(): the declared winner string, or '' if the match
+            has no outcome yet."""
+            return str(match.outcome.get("winner", "")) if match.outcome else ""
+
+        def _match_over() -> bool:
+            """match_over(): True iff an outcome has been declared."""
+            return match.outcome is not None
+
+        ns["declare_winner"] = _declare_winner
+        ns["match_winner"]   = _match_winner
+        ns["match_over"]     = _match_over
 
         # ---- introspection / runtime-path / query primitives ----
         # The pattern: entity[X].path needs a STATIC path at AST time.

@@ -11591,3 +11591,136 @@ duration: poison starts at duration 4, `counter add -1` → 3, and `counter set 
 removes it. Charges differ from durations only in that nothing auto-decrements
 them from the turn clock — the GM calls status_counter_add from whatever the
 trigger is (here, manual). One universal add/subtract/set, auto-clearing at ≤ 0.
+
+
+SCENARIO 453 — Tile line/fill builder: draw walls and rooms in one command
+--------------------------------------------------------------------------
+
+!match new tb TB 10 6
+!match use tb
+!tile line 2 2 6 2 glyph #
+!tile line 2 2 6 2 block true
+!tile fill 8 3 9 5 glyph ~
+!tile info 4 2
+!tile line 8 1 12 1 glyph *
+!map
+
+Expected: `!tile line 2 2 6 2 glyph #` stamps the glyph `#` on the five cells
+(2,2)..(6,2) in one shot; the second line adds `block true` to the same row
+(a wall you draw with two commands instead of ten). `!tile fill 8 3 9 5 glyph ~`
+fills the whole 2×3 bounding rectangle (6 cells) with `~`. `!tile info 4 2`
+shows glyph `#` and block true. The last line runs from x=8 to x=12 on a
+width-10 grid, so cells x=11 and x=12 are off-grid and reported skipped (3
+set, 2 skipped). Both builders are pure sugar over `!tile set` (same path=value
+shape) — line uses the engine's segment geometry, fill the bounding box.
+
+
+SCENARIO 454 — Toggleable map layers: persistent toggle + one-off hide
+----------------------------------------------------------------------
+
+!match new ml ML 8 6
+!match use ml
+!tile set 3 3 glyph #
+!ent add hero Hero 20 4 4 5
+!map
+!map layer tiles off
+!map
+!map layer list
+!map layer tiles on
+!map hide=entities
+!map
+!map layer list
+!map layer bogus off
+
+Expected: the base `!map` shows both the tile glyph `#` and the hero. `!map
+layer tiles off` hides the tile layer persistently — the next `!map` has no `#`,
+and `!map layer list` reports tiles hidden. `!map layer tiles on` restores it.
+`!map hide=entities` is a ONE-OFF: that single render drops the hero glyph, but
+the following `!map layer list` shows nothing hidden (the one-off arg didn't
+mutate state). `!map layer bogus off` is rejected (unknown layer). Layers are
+zones / tiles / entities / fog; `!map layer` is host-gated, the one-off `hide=`
+arg is player-available.
+
+
+SCENARIO 455 — Cross-match entity transfer: copy keeps source, transfer moves
+-----------------------------------------------------------------------------
+
+!match new src Source 8 6
+!match new bench Bench 10 8
+!match use src
+!ent add knight Knight 25 4 4 5
+!ent set_var knight strength 7
+!status def blessed
+!status apply knight blessed 2 3
+!part add knight arm Arm 8 8
+!ent copy knight bench 5 5
+!ent add rogue Rogue 12 2 2 5
+!ent transfer rogue bench
+!ent copy knight bench
+!match use bench
+!list
+!eval "var_get('knight', 'strength')"
+!eval "status_has('knight', 'blessed')"
+!eval "has_part('knight', 'arm')"
+!match use src
+!list
+
+Expected: `!ent copy knight bench 5 5` duplicates the knight — with its
+`strength` var, its `blessed` status, and its `arm` body part — into the Bench
+match at (5,5), leaving the original in Source. `!ent transfer rogue bench`
+MOVES the rogue (it leaves Source). The second `!ent copy knight bench`
+collides with the already-copied knight id, so it's auto-suffixed to
+`knight_2`. Switching to Bench, `!list` shows knight, rogue, knight_2; the
+evals confirm the copied knight kept strength=7, the blessed status, and its
+arm part. Switching back to Source, `!list` still has knight (copied, not
+moved) but no rogue (transferred away).
+
+
+SCENARIO 456 — Match outcome: manual victory + prims + a goal-tile win condition
+--------------------------------------------------------------------------------
+
+!match new win Win 8 6
+!match use win
+!eval "match_over()"
+!match win red Total domination
+!eval "match_winner()"
+!eval "match_over()"
+!match outcome
+!match win clear
+!eval "match_over()"
+!ent add runner Runner 10 1 1 5
+!tile set 4 1 hooks.on_enter "declare_winner('blue', 'reached the goal')"
+!ent tp runner 4 1
+!match outcome
+
+Expected: no outcome at first (match_over False). `!match win red ...` declares
+a manual victory; match_winner() = 'red', match_over() True, `!match outcome`
+shows red. `!match win clear` resets it (match_over False again, play resumes).
+Then a GOAL TILE: the cell (4,1) carries an on_enter hook that calls
+declare_winner. Teleporting the runner onto it fires the hook, so `!match
+outcome` now shows blue won. There is NO built-in objective evaluator — the win
+condition is just a tile hook calling the declare_winner primitive.
+
+
+SCENARIO 457 — Win conditions from an action and an on_death passive
+--------------------------------------------------------------------
+
+!match new fin Fin 8 6
+!match use fin
+!ent add hero Hero 20 2 2 5
+!ent set_var hero actions.exodia.target none
+!ent set_var hero actions.exodia.body "declare_winner('heroes', 'EXODIA assembled')"
+!action hero exodia
+!match outcome
+!match win clear
+!ent add boss Boss 10 6 6 9
+!passive add boss deathwin on_death "declare_winner('heroes', 'boss slain')"
+!ent set_var boss hp 0
+!match outcome
+
+Expected: declare_winner works from any formula context. An ACTION whose body
+calls declare_winner (the "Exodia auto-win" pattern) declares heroes the winner
+when used. After clearing, a per-entity on_death PASSIVE on the boss declares
+victory the moment the boss dies (setting its hp to 0 runs the death pipeline,
+which fires on_death → declare_winner). Same primitive, two more trigger
+sources (action body, death hook) — alongside the watcher and tile-hook paths.

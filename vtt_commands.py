@@ -64,7 +64,7 @@ Handler = Callable[[ReplyContext, List[str], MatchManager], Any]
 # downgrade can't open a write hole. The per-match command_access rule
 # can re-tighten any of them for fog-of-war matches.
 READ_ONLY_SUBCOMMANDS: frozenset = frozenset({
-    "list", "info", "cells", "diff", "channels", "hosts",
+    "list", "info", "cells", "diff", "channels", "hosts", "outcome",
 })
 # `dump` is intentionally NOT in the set above: `!ent dump` reveals an
 # entity's full var tree (including GM-hidden data), so it stays host-
@@ -88,7 +88,7 @@ ELEVATED_ARGS: Dict[str, frozenset] = {
     # `map` renders for anyone from the channel POV, but `full` (omniscient),
     # `resize` (a grid mutation), and the `color`/`teamcolor` settings all
     # elevate to host-gated.
-    "map": frozenset({"full", "resize", "color", "teamcolor"}),
+    "map": frozenset({"full", "resize", "color", "teamcolor", "layer"}),
     "list": frozenset({"full"}),
 }
 
@@ -1116,6 +1116,37 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             raise NotFound(f"Match '{mid}' not found.")
         m.name = " ".join(args[2:])
         return await ctx.send(f"Renamed match `{mid}`.")
+    # win / outcome: declare or inspect the match VICTORY (100). There is no
+    # built-in objective evaluator — win conditions are composed from
+    # watchers / actions / hooks calling the declare_winner primitive, which
+    # works from any formula context. `!match win <winner> [reason]` is the
+    # manual declaration; `!match win clear` resumes play; `!match outcome`
+    # (read-only) shows the current result.
+    if sub == "win":
+        m = active_match(mgr, ctx)
+        if len(args) >= 2 and args[1].lower() == "clear":
+            had = m.clear_outcome()
+            return await ctx.send(
+                "Cleared the match outcome — play resumes." if had
+                else "No outcome was set.")
+        if await return_help_if_not_enough_args(ctx, args, 2, "match", "win"):
+            return
+        winner = args[1]
+        reason = " ".join(args[2:]) if len(args) >= 3 else ""
+        oc = m.declare_winner(winner, reason)
+        extra = f" — {oc['reason']}" if oc["reason"] else ""
+        return await ctx.send(
+            f"🏆 Winner declared: **{oc['winner']}** "
+            f"(round {oc['round']}){extra}.")
+    if sub == "outcome":
+        m = active_match(mgr, ctx)
+        if m.outcome is None:
+            return await ctx.send("No outcome declared — the match is ongoing.")
+        oc = m.outcome
+        extra = f" — {oc.get('reason')}" if oc.get("reason") else ""
+        return await ctx.send(
+            f"🏆 Winner: **{oc.get('winner')}** "
+            f"(declared round {oc.get('round')}){extra}.")
     # var: match-level scratchpad vars on the ACTIVE match. The command
     # twin of the `match.<path>` formula root / match_var_* functions —
     # global GM state (alarm_level, objective_progress, weather, ...) that
@@ -2876,6 +2907,41 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"`summon_from('{dest_path}', x, y)`)."
         )
 
+    # ---- copy / transfer <id> <dest_match> [x] [y] ----
+    # Cross-match entity transfer (107): copy duplicates into another live
+    # match (keeps the source); transfer MOVES it (removes the source). Vars,
+    # statuses, passives, clamps, facing, and the whole body-part subtree ride
+    # along; colliding ids are auto-suffixed in the destination.
+    if sub in ("copy", "transfer"):
+        if await return_help_if_not_enough_args(ctx, args, 3, "ent", sub):
+            return
+        src_id = _resolve_eid(m, args[1])
+        if src_id not in m.entities:
+            raise NotFound(f"Entity '{src_id}' not found.")
+        dest_mid = args[2]
+        if dest_mid not in mgr.matches:
+            return await ctx.send(
+                f"❌ No match with id `{dest_mid}` (see `!match list`).")
+        x = y = None
+        if len(args) >= 5:
+            try:
+                x, y = int(args[3]), int(args[4])
+            except ValueError:
+                return await ctx.send("❌ x and y must be integers.")
+        try:
+            new_id, log = mgr.copy_entity(
+                m.id, dest_mid, src_id, x, y, move=(sub == "transfer"))
+        except (VTTError, NotFound) as ex:
+            return await ctx.send(f"❌ {ex}")
+        verb = "Moved" if sub == "transfer" else "Copied"
+        dest = mgr.matches[dest_mid]
+        rid = f" as `{new_id}`" if new_id != src_id else ""
+        tail = ("\n" + "\n".join(log)) if log else ""
+        return await ctx.send(
+            f"{verb} `{src_id}` to **{dest.name}** "
+            f"({dest_mid}){rid} at ({dest.entities[new_id].x},"
+            f"{dest.entities[new_id].y}).{tail}")
+
     # Fallback: show authoritative help for the root command
     title, body = registry.help_for(["ent"])
     return await ctx.send(f"**{title}**\n{body}")
@@ -3195,6 +3261,10 @@ async def match_top_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         f"Game System: **{m.system_name}**",
         f"Current Round Number: **{m.round_number}**",
     ]
+    if m.outcome is not None:
+        oc = m.outcome
+        extra = f" — {oc.get('reason')}" if oc.get("reason") else ""
+        parts.append(f"🏆 Winner: **{oc.get('winner')}**{extra}")
     if m.global_passives:
         parts.append("")
         parts.append("**Global passives:**")
@@ -3224,13 +3294,17 @@ def _view_pov(ctx: ReplyContext, m: "Match", args: List[str]) -> Optional[str]:
     return m.channel_pov(ctx.channel_key)
 
 
-def _map_block(ctx: ReplyContext, m, pov) -> str:
+_MAP_LAYERS = ("zones", "tiles", "entities", "fog")
+
+
+def _map_block(ctx: ReplyContext, m, pov, hidden=None) -> str:
     """The fenced ASCII map. Colorizes only when the surface declares
     `supports_color` AND the match has color enabled; uses an ```ansi
     fence so Discord renders the ANSI codes (a no-op label on a terminal /
-    the harness, which get plain glyphs anyway)."""
+    the harness, which get plain glyphs anyway). `hidden` (None = use the
+    match's persistent hidden_layers) suppresses render layers."""
     colorize = bool(getattr(ctx, "supports_color", False)) and getattr(m, "color_enabled", True)
-    body = m.render_ascii(pov, colorize=colorize)
+    body = m.render_ascii(pov, colorize=colorize, hidden_layers=hidden)
     fence = "ansi" if colorize else ""
     return f"```{fence}\n{body}\n```"
 
@@ -3317,8 +3391,41 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if log:
             msg = msg + "\n" + "\n".join(log)
         return await ctx.send(msg + "\n" + _map_block(ctx, m, _view_pov(ctx, m, [])))
+    # ---- !map layer <name> on|off | !map layer list ----
+    if args and args[0].lower() == "layer":
+        if len(args) < 2:
+            return await ctx.send("Usage: `!map layer <zones|tiles|entities|fog> on|off` or `!map layer list`.")
+        if args[1].lower() == "list":
+            shown = [L for L in _MAP_LAYERS if L not in m.hidden_layers]
+            hid = sorted(m.hidden_layers)
+            return await ctx.send(
+                f"Map layers — shown: {', '.join(shown) or '(none)'}"
+                + (f"; hidden: {', '.join(hid)}" if hid else ""))
+        name = args[1].lower()
+        if name not in _MAP_LAYERS:
+            return await ctx.send(
+                f"❌ unknown layer `{name}`. Layers: {', '.join(_MAP_LAYERS)}.")
+        if len(args) < 3 or args[2].lower() not in ("on", "off"):
+            return await ctx.send(f"Usage: `!map layer {name} on|off`.")
+        if args[2].lower() == "off":
+            m.hidden_layers.add(name)
+        else:
+            m.hidden_layers.discard(name)
+        return await ctx.send(
+            f"Layer `{name}` {'hidden' if name in m.hidden_layers else 'shown'} "
+            f"on **{m.name}**'s map.")
+    # One-off `hide=zones,fog` arg: suppress extra layers for this render
+    # only (union with the persistent hidden set), without mutating state.
+    # `full` is honored only as args[0] (the host-gated position) via
+    # _view_pov, so a player can't sneak omniscient via `!map hide=.. full`.
+    extra_hidden = set()
+    for a in args:
+        low = a.lower()
+        if low.startswith("hide="):
+            extra_hidden |= {p.strip() for p in low[5:].split(",") if p.strip()}
     pov = _view_pov(ctx, m, args)
-    return await ctx.send(_map_block(ctx, m, pov))
+    hidden = m.hidden_layers | extra_hidden if extra_hidden else None
+    return await ctx.send(_map_block(ctx, m, pov, hidden))
 
 @registry.command("list", access="all", usage="!list [full]", desc="List entities (turn order) from this channel's POV, plus a Dead: section of corpses when show_corpses_in_entity_list is enabled. `!list full` (host-gated) ignores visibility.")
 async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -5359,7 +5466,7 @@ def _parse_xy(args: List[str], offset: int = 1) -> Tuple[int, int]:
 
 @registry.command(
     "tile",
-    usage=("!tile <set|del|info|list|clear> ..."),
+    usage=("!tile <set|line|fill|del|info|list|clear> ..."),
     desc=(
         "Special-tile data store. Each (x, y) tile has a free-form "
         "data dict — set arbitrary nested keys with `set`, read with "
@@ -6012,6 +6119,39 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"tile ({x},{y}) has no `{hook_name}` hook to fire."
             )
         return await ctx.send("\n".join(log))
+
+    # ---- line / fill <x1> <y1> <x2> <y2> <path> <value> ----
+    # Builder sugar over `set`: stamp one path=value across many cells in a
+    # single command (drawing a wall line, filling a room). `line` walks the
+    # segment between the two points (the same geometry LOS uses); `fill`
+    # covers the whole bounding rectangle. Off-grid cells are skipped.
+    if sub in ("line", "fill"):
+        if await return_help_if_not_enough_args(ctx, args, 7, "tile", sub):
+            return
+        try:
+            x1, y1, x2, y2 = (int(args[1]), int(args[2]),
+                              int(args[3]), int(args[4]))
+        except ValueError:
+            return await ctx.send("❌ coordinates must be integers.")
+        path = args[5]
+        value = _parse_scalar(args[6])
+        if sub == "line":
+            cells = m._line_cells(x1, y1, x2, y2)
+        else:
+            cells = [(cx, cy)
+                     for cy in range(min(y1, y2), max(y1, y2) + 1)
+                     for cx in range(min(x1, x2), max(x1, x2) + 1)]
+        n = 0
+        for (cx, cy) in cells:
+            if not m.in_bounds(cx, cy):
+                continue
+            m.tile_set_path(cx, cy, path, value)
+            n += 1
+        skipped = len(cells) - n
+        tail = f" ({skipped} off-grid cell(s) skipped)" if skipped else ""
+        return await ctx.send(
+            f"Set `{path}` = {value!r} on {n} tile(s) "
+            f"({sub} {x1},{y1} → {x2},{y2}).{tail}")
 
     title, body = registry.help_for(["tile"])
     return await ctx.send(f"**{title}**\n{body}")
