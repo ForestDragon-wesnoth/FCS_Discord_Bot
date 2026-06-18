@@ -6586,7 +6586,8 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 @registry.command(
     "status",
-    usage=("!status <def|drop|tick|when|stack|maxlevel|data|list|info|apply> ..."),
+    usage=("!status <def|drop|tick|when|stack|maxlevel|data|tags|removes|"
+           "blockedby|resist|counter|list|info|apply> ..."),
     desc=(
         "Status DEFINITIONS — self-describing statuses. Define a status "
         "once (its per-tick effect, when it ticks, how it stacks, its max "
@@ -6709,6 +6710,65 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(f"❌ {ex}")
         return await ctx.send(f"`{name}` default data.{path} = {value!r}")
 
+    if sub in ("tags", "removes", "blockedby"):
+        if await return_help_if_not_enough_args(ctx, args, 2, "status", sub):
+            return
+        name = args[1]
+        if name not in m.status_definitions:
+            return await ctx.send(f"❌ No status definition `{name}`.")
+        field = "blocked_by" if sub == "blockedby" else sub
+        raw = " ".join(args[2:]).strip()
+        if raw in ("", "-"):
+            m.status_definitions[name][field] = [] if sub == "tags" else ""
+            return await ctx.send(f"Cleared `{name}` {field}.")
+        toks = [t.strip() for t in raw.replace(",", " ").split() if t.strip()]
+        if sub == "tags":
+            m.status_definitions[name]["tags"] = toks
+        else:
+            m.status_definitions[name][field] = ",".join(toks)
+        return await ctx.send(f"`{name}` {field} = {', '.join(toks)}")
+
+    if sub == "resist":
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "resist"):
+            return
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            return await ctx.send(f"❌ No entity `{args[1]}`.")
+        sname = args[2]
+        immune, reduction = m.status_resistance(eid, sname)
+        if immune:
+            return await ctx.send(f"`{eid}` is IMMUNE to `{sname}`.")
+        if reduction:
+            return await ctx.send(
+                f"`{eid}` resists `{sname}`: applied level reduced by {reduction}.")
+        return await ctx.send(f"`{eid}` has no resistance to `{sname}`.")
+
+    if sub == "counter":
+        # !status counter <eid> <name> <add|set> <value> [field]
+        if await return_help_if_not_enough_args(ctx, args, 5, "status", "counter"):
+            return
+        eid = _resolve_eid(m, args[1])
+        sname, op = args[2], args[3].lower()
+        try:
+            value = int(args[4])
+        except ValueError:
+            return await ctx.send("❌ value must be an integer.")
+        field = args[5] if len(args) >= 6 else "duration"
+        if op not in ("add", "set"):
+            return await ctx.send("❌ op must be `add` or `set`.")
+        prim = "status_counter_add" if op == "add" else "status_counter_set"
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        try:
+            new = FormulaEngine(m).eval_expression(
+                f"{prim}('{eid}', '{sname}', {value}, '{field}')",
+                EvalCtx(this=m.current_entity_id(), target=eid))
+        except FormulaError as ex:
+            return await ctx.send(f"❌ {ex}")
+        e = m.entities.get(eid)
+        gone = e is None or sname not in e.status
+        tail = " (status removed at <=0)" if gone else ""
+        return await ctx.send(f"`{eid}.{sname}.{field}` = {new}{tail}")
+
     if sub == "list":
         if not m.status_definitions:
             return await ctx.send("No status definitions in this match.")
@@ -6768,6 +6828,12 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return await ctx.send(
                     f"`{name}` on body part `{eid}` redirected to its parent "
                     f"`{e.part_of}`.{tail}")
+        # Immunity / blocked_by / full resistance — report instead of a
+        # misleading "Applied".
+        if name not in e.status:
+            reason = m.status_apply_block_reason(eid, name, level)
+            if reason:
+                return await ctx.send(f"`{eid}`: {reason} — no effect.{tail}")
         inst = e.status.get(name, {})
         return await ctx.send(
             f"Applied `{name}` to `{eid}` "

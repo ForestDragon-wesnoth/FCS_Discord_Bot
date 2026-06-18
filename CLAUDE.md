@@ -840,12 +840,59 @@ More shipped work (continuing the list above):
   info/apply) for match-level DEFINITIONS — raw per-entity instance editing
   stays on `!ent status`. Definitions serialize (save + undo). Core:
   `define_status`/`remove_status_def`/`apply_status` + the rewritten
-  `fire_status_tick` in logic.py. Scenarios 390-391. DEFERRED (composable via
-  `on_status_added`): cross-status interactions (burn↔freeze cancellation),
-  resistance/immunity reducing applied levels, damage-buff scaling of applied
-  level/duration. This was framed as the modest precursor to the bigger combat
-  layers (damage pipeline, action economy, reactions) surfaced by analyzing
-  the three FCS combat-system docs.
+  `fire_status_tick` in logic.py. Scenarios 390-391. DEFERRED then SHIPPED in
+  the status cluster below (cross-status interactions + resistance/immunity);
+  damage-buff scaling of applied level/duration is still composable via
+  `on_status_added`. This was framed as the modest precursor to the bigger
+  combat layers (damage pipeline, action economy, reactions) surfaced by
+  analyzing the three FCS combat-system docs.
+- **Status cluster: tags + cross-status + resistance + counters — SHIPPED.**
+  Four interlocking deepenings of the rich-status system (scenarios 449-452).
+  - **Tags / categories (84):** a status DEFINITION carries a `tags` list
+    (`!status tags <name> <csv|->`). The category other features key on. Prims:
+    `status_tags(name)` (loopable, declared order), `status_has_tag(eid, name,
+    tag)`, `statuses_with_tag(eid, tag)` (loopable, sorted — loop it to purge
+    every 'debuff'). Tags are DEFINITION-level (a def-less status has none).
+    `Match.status_def_tags(name)` is the accessor.
+  - **TOKEN convention (shared):** a "token" is a bare status NAME or
+    `tag:<x>` (matches any status whose def carries that tag). `Match.
+    _status_token_matches(token, name)` is the single matcher behind removes /
+    blocked_by / immune / resist.
+  - **Cross-status interactions (17):** declarative def fields `removes` and
+    `blocked_by` (CSV of tokens; `!status removes`/`!status blockedby`). On
+    apply (in `apply_status`, BEFORE the stacking math): if the target has any
+    `blocked_by` status → no-op; after an accepted application, statuses
+    matching `removes` are cleared (fires even on a no-change refresh; never
+    self-removes). "What freeze does is stored in freeze." on_status_added is
+    still the escape hatch for richer logic.
+  - **Resistance / immunity (18):** SOURCE-GATED like modifiers. Rule
+    `status_resist_sources` (CSV roots, default `equipped`; per-entity
+    `__status_resist_sources` replace / `__status_resist_sources_add` extend)
+    + the direct innate `status_immune`/`status_resist` entity vars. A nested
+    `status_immune` (list/CSV of tokens) or `status_resist` (map token->int
+    level reduction) found under a scanned root contributes — so an EQUIPPED
+    ring resists, an inventoried one does NOT. Immunity (any matching immune
+    token) blocks outright; resistance reduces the applied LEVEL (duration
+    untouched for now), and if it drops to <=0 the application is fully
+    resisted (no-op). Multiple reductions combine per the `status_resist_stack`
+    rule (sum default / max / first). Core: `Match.status_resistance(eid,
+    name)` -> (immune, reduction); `_gather_resist_records` +
+    `_effective_status_resist_sources`. Prims `status_resist_of` /
+    `is_status_immune`; read-only `!status resist <eid> <name>`. The existing
+    PARTS immune/redirect (`part_status_immune`) is a SEPARATE part-only
+    mechanism that still runs first in `apply_status`.
+  - **Universal counters (87):** `status_counter_add(eid, name, delta[,
+    field="duration"])` and `status_counter_set(eid, name, value[, field])`
+    adjust ANY numeric field on a live status instance and auto-remove the
+    status at <=0 — the same tool for time-based DURATIONS and per-trigger
+    CHARGES (charges differ only in that nothing auto-decrements them from the
+    turn clock; the GM calls status_counter_add(-1) from whatever the trigger
+    is). Also `!status counter <eid> <name> <add|set> <value> [field]`. Auto-
+    removal goes through the status diff chokepoint (`_status_remove`).
+  - apply_status now also surfaces a block reason to the command layer via
+    `Match.status_apply_block_reason(eid, name, level)` (immune / blocked by X
+    / fully resisted). All def fields serialize (deepcopy); resistances are
+    plain entity vars; counters are instance data.
 - **Pierce helper + composable penetration — SHIPPED.**
   `entities_in_line_until(x1,y1,x2,y2, max_targets[, viewer])` (formula.py)
   returns the first N alive entity ids the segment passes through, near→far,

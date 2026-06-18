@@ -801,6 +801,36 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "the given level/duration regardless of mode."
         ),
     },
+    "status_resist_sources": {
+        "default": "equipped",
+        "schema": {"type": "str"},
+        "desc": (
+            "Comma-separated vars subtree roots scanned for status "
+            "resistance/immunity records (like modifier_sources). A nested "
+            "`status_resist` (map of status-name-or-`tag:<x>` -> integer "
+            "level reduction) and/or `status_immune` (list / CSV of names + "
+            "`tag:<x>`) found under a scanned root contributes to the bearer "
+            "— so an EQUIPPED resistance ring works while one sitting in the "
+            "inventory does nothing. A DIRECT `status_immune` / `status_resist` "
+            "var on the entity (innate) always counts. Per-entity overrides: "
+            "`__status_resist_sources` var (replaces this list) and/or "
+            "`__status_resist_sources_add` var (extends it)."
+        ),
+    },
+    "status_resist_stack": {
+        "default": "sum",
+        "schema": {
+            "type": "enum",
+            "choices": ["sum", "max", "first"],
+        },
+        "desc": (
+            "How multiple matching status_resist reductions combine for one "
+            "incoming status: 'sum' (add them — two +1 rings = +2), 'max' "
+            "(take the single strongest), 'first' (the first record found "
+            "wins). Immunity is independent — any matching status_immune "
+            "entry blocks the application outright regardless of this."
+        ),
+    },
     # Spawning / facing
     "spawn_face_toward_center": {
         "default": True,
@@ -7943,6 +7973,7 @@ class Match:
         self.status_definitions[name] = {
             "tick": "", "tick_when": "turn_end",
             "stack": "", "max_level": 0, "data": {},
+            "tags": [], "removes": "", "blocked_by": "",
         }
         return self.status_definitions[name]
 
@@ -7953,6 +7984,160 @@ class Match:
         if name not in self.status_definitions:
             raise NotFound(f"Status definition '{name}' not found.")
         del self.status_definitions[name]
+
+    # ---- status tags / cross-status / resistance helpers --------------
+    # A "token" is either a bare status NAME (matches that status) or
+    # `tag:<x>` (matches any status whose DEFINITION carries tag <x>).
+    # Shared by removes / blocked_by (cross-status) and immune / resist.
+
+    def status_def_tags(self, name: str) -> List[str]:
+        """The tag list declared on a status DEFINITION (empty if the def
+        is absent or untagged). Tags are a definition-level category."""
+        d = self.status_definitions.get(name)
+        tags = d.get("tags") if isinstance(d, dict) else None
+        if isinstance(tags, str):
+            return [t.strip() for t in tags.split(",") if t.strip()]
+        if isinstance(tags, (list, tuple)):
+            return [str(t) for t in tags]
+        return []
+
+    def _status_token_matches(self, token: str, status_name: str) -> bool:
+        """Whether `token` (a name or `tag:<x>`) matches the status named
+        `status_name` (a tag token checks that status's definition tags)."""
+        token = token.strip()
+        if not token:
+            return False
+        if token.startswith("tag:"):
+            return token[4:].strip() in self.status_def_tags(status_name)
+        return token == status_name
+
+    @staticmethod
+    def _token_list(raw: Any) -> List[str]:
+        """Normalize a removes/blocked_by/immune field (list or CSV)."""
+        if isinstance(raw, str):
+            return [t.strip() for t in raw.split(",") if t.strip()]
+        if isinstance(raw, (list, tuple)):
+            return [str(t).strip() for t in raw if str(t).strip()]
+        return []
+
+    def _statuses_matching_tokens(self, e: "Entity",
+                                  tokens: List[str]) -> List[str]:
+        """Names of statuses currently on `e` that match ANY of `tokens`."""
+        out = []
+        for sname in e.status:
+            if any(self._status_token_matches(tok, sname) for tok in tokens):
+                out.append(sname)
+        return out
+
+    def _effective_status_resist_sources(self, e: "Entity") -> List[str]:
+        """The vars roots scanned for status_resist / status_immune records:
+        the per-entity `__status_resist_sources` var (replaces the default)
+        or the status_resist_sources rule, plus `__status_resist_sources_add`
+        (extends). Mirrors _effective_modifier_sources."""
+        override = e.vars.get("__status_resist_sources")
+        if isinstance(override, list):
+            roots = [str(r) for r in override]
+        else:
+            roots = [r.strip() for r in
+                     str(self.rules.get("status_resist_sources", "equipped")).split(",")
+                     if r.strip()]
+        add = e.vars.get("__status_resist_sources_add")
+        if isinstance(add, list):
+            roots = roots + [str(r) for r in add]
+        return roots
+
+    def _gather_resist_records(self, e: "Entity") -> Tuple[List[Any], List[dict]]:
+        """Collect (immune-token-lists, resist-maps) contributing to `e`:
+        the direct innate `status_immune`/`status_resist` vars, plus every
+        nested `status_immune`/`status_resist` found anywhere under a scanned
+        source root (so an equipped item grants, an inventoried one doesn't)."""
+        immune: List[Any] = []
+        resist: List[dict] = []
+        di = e.vars.get("status_immune")
+        if di is not None:
+            immune.append(di)
+        dr = e.vars.get("status_resist")
+        if isinstance(dr, dict):
+            resist.append(dr)
+
+        def _walk(node: Any) -> None:
+            if not isinstance(node, dict):
+                return
+            for key, val in node.items():
+                if key == "status_immune" and val is not None:
+                    immune.append(val)
+                elif key == "status_resist" and isinstance(val, dict):
+                    resist.append(val)
+                elif isinstance(val, dict):
+                    _walk(val)
+
+        for root in self._effective_status_resist_sources(e):
+            node: Any = e.vars
+            ok = True
+            for seg in root.split("."):
+                if isinstance(node, dict) and seg in node:
+                    node = node[seg]
+                else:
+                    ok = False
+                    break
+            if ok:
+                _walk(node)
+        return immune, resist
+
+    def status_resistance(self, eid: str, name: str) -> Tuple[bool, int]:
+        """(is_immune, level_reduction) for status `name` applied to `eid`,
+        aggregated from the entity's innate + source-gated resistance
+        records per the status_resist_stack rule. Immunity if any matching
+        immune token; reduction combines matching resist values."""
+        e = self.entities.get(eid)
+        if e is None:
+            return (False, 0)
+        immune_lists, resist_maps = self._gather_resist_records(e)
+        for lst in immune_lists:
+            for tok in self._token_list(lst):
+                if self._status_token_matches(tok, name):
+                    return (True, 0)
+        stack = str(self.rules.get("status_resist_stack", "sum"))
+        amounts: List[int] = []
+        for rmap in resist_maps:
+            for key, val in rmap.items():
+                if not self._status_token_matches(str(key), name):
+                    continue
+                try:
+                    amounts.append(int(val))
+                except (TypeError, ValueError):
+                    continue
+        if not amounts:
+            return (False, 0)
+        if stack == "max":
+            reduction = max(amounts)
+        elif stack == "first":
+            reduction = amounts[0]
+        else:  # sum
+            reduction = sum(amounts)
+        return (False, max(0, reduction))
+
+    def status_apply_block_reason(self, eid: str, name: str,
+                                  level: Optional[int] = None) -> Optional[str]:
+        """A human reason the status would NOT apply to `eid` (immunity,
+        a blocking status, or full resistance), or None if it would. Used
+        for command feedback; recomputes the same checks apply_status runs."""
+        e = self.entities.get(eid)
+        if e is None:
+            return None
+        immune, reduction = self.status_resistance(eid, name)
+        if immune:
+            return f"immune to `{name}`"
+        sdef = self.status_definitions.get(name) or {}
+        blockers = self._statuses_matching_tokens(
+            e, self._token_list(sdef.get("blocked_by")))
+        if blockers:
+            return f"`{name}` blocked by `{blockers[0]}`"
+        if reduction and (name not in e.status or level is not None):
+            base = int(level) if level is not None else 1
+            if base - reduction <= 0:
+                return f"`{name}` fully resisted (reduction {reduction})"
+        return None
 
     def apply_status(self, eid: str, name: str,
                      level: Optional[int] = None,
@@ -7980,8 +8165,26 @@ class Match:
                     return self.apply_status(e.part_of, name, level, duration)
                 return []
         sdef = self.status_definitions.get(name) or {}
+        # Cross-status blocking + resistance/immunity, evaluated BEFORE the
+        # stacking math (a blocked/immune/fully-resisted application is a
+        # no-op). blocked_by: a status the target already has prevents this
+        # one. immunity: an aggregated immune token. resistance: reduces the
+        # applied LEVEL; if it drops to <=0 the application is fully resisted.
+        blockers = self._statuses_matching_tokens(
+            e, self._token_list(sdef.get("blocked_by")))
+        if blockers:
+            return []
+        immune, reduction = self.status_resistance(eid, name)
+        if immune:
+            return []
         new_level = None if level is None else int(level)
         new_duration = None if duration is None else int(duration)
+        if reduction and (name not in e.status or new_level is not None):
+            base = new_level if new_level is not None else 1
+            eff = base - reduction
+            if eff <= 0:
+                return []
+            new_level = eff
         before = copy.deepcopy(e.status.get(name))
         if name not in e.status:
             inst = copy.deepcopy(sdef.get("data")) if isinstance(sdef.get("data"), dict) else {}
@@ -8013,9 +8216,20 @@ class Match:
                 if new_duration is not None:
                     inst["duration"] = new_duration
         after = copy.deepcopy(e.status.get(name))
-        if before == after:
-            return []
-        return self._emit_status_diff(eid, name, before, after)
+        log = ([] if before == after
+               else self._emit_status_diff(eid, name, before, after))
+        # removes: an accepted application clears the statuses this one
+        # cancels (burn removes freeze). Fires even on a no-change refresh
+        # so re-applying still purges the opposite. Tokens are names or
+        # `tag:<x>`; the status itself is never self-removed.
+        for other in self._statuses_matching_tokens(
+                e, self._token_list(sdef.get("removes"))):
+            if other == name or other not in e.status:
+                continue
+            ob = copy.deepcopy(e.status[other])
+            del e.status[other]
+            log = log + self._emit_status_diff(eid, other, ob, None)
+        return log
 
     def fire_status_tick(self, when: str) -> List[str]:
         """Run each status's tick at the given `when`. A status WITH a
