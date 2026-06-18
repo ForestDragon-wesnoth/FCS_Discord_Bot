@@ -1392,6 +1392,68 @@ More shipped work (continuing the list above):
   optional, default 1) or a `{key: weight}` dict; 0-weight entries never chosen;
   the discrete-choice companion to `band` (which buckets a NUMBER into a range).
   Both honor `random_seed` for reproducible sessions.
+- **Mounts / vehicles (slots + riders) — SHIPPED (scenarios 458-461).** A
+  VEHICLE is just an entity carrying a `slots` var (no hardcoded type); a SLOT
+  def lives at `vehicle.vars.slots.<name>` (author with `!ent set_var`). Slot
+  fields: `capacity` (numeric budget, default 1), `cost` (per-rider formula
+  consuming it, default "1"; `self`=rider + `vehicle` binding), `condition`
+  (valid-rider formula gate; fail-OPEN), `region` (a facing-relative footprint
+  region — reuses the part-region machinery via the factored
+  `Match.region_cells_of` — at which the rider RENDERS and is targeted; absent =
+  hidden inside), `controls_movement` (any number of slots may set it — an
+  occupant drives), and `actions` (a slot-scoped action bundle). The rider
+  back-link is the protected Entity fields `mounted_on` / `mount_slot` (serialized,
+  like `part_of`); occupancy is DERIVED by scanning (`vehicle_riders` /
+  `slot_occupants`), no second structure. Core on Match: `vehicle_slots` /
+  `slot_def` / `is_vehicle` / `slot_capacity` / `slot_cost_of` /
+  `slot_used_capacity` / `slot_condition_ok` / `can_mount`→(ok,reason) /
+  `mount_entity` / `dismount_entity` / `switch_slot` / `rider_cell` /
+  `_restamp_riders_for` / `_release_riders`.
+  - **Movement.** NO hardcoded "drive" action (the GM writes movement actions).
+    A rider's own move (`Entity.move_dirs` / `tp`, via `_mount_move_redirect`)
+    is REDIRECTED to the vehicle when its slot has `controls_movement` (the
+    whole rig moves; riders are carried), or REFUSED with a clear message when
+    it's a plain passenger ("dismount first"). Moving the vehicle directly
+    carries everyone: `_restamp_riders_for` is hooked into `fire_entity_moved`
+    alongside the part/anchor restamps (raw move_to — no rider hooks fire, like
+    parts). push/pull/swap operate on the vehicle (riders are excluded from
+    occupancy so they're never the push target).
+  - **Skip surfaces.** A HIDDEN rider (no region) is excluded from ground
+    occupancy (`cell_occupant`), render, POV visibility (`entity_visible_to`),
+    and the spatial enumerators (`_candidates`/`all_entities`/`entities_in_area`)
+    — the part-glued skip surface. A VISIBLE (region-slot) rider draws OVER the
+    vehicle at its region cell (a dedicated render priority pass) and stays
+    targetable; ALL mounted riders are off the ground (they share the vehicle's
+    cells). Riders keep their own turn/initiative + hp + actions; they show in
+    `!list` with a `mount_entity_line_suffix` suffix. Multiple visible occupants
+    spread across the region's cells by index.
+  - **Slot/vehicle actions.** A rider's available actions are augmented by
+    `discover_mount_actions`: (1) actions defined in its slot
+    (`slots.<slot>.actions.*`, container_path == `slots.<slot>`), and (2)
+    vehicle-wide actions carrying an `allowed_slots` field (list/CSV; `*`/`all`
+    = any) whose list includes the rider's slot. Other slots' actions and
+    vehicle-private (no allowed_slots) actions are NOT offered. Merged in
+    `_run_action_dispatch` + shown in `!action list`. Run-as is configurable:
+    the `mount_action_actor` rule (`rider` default | `vehicle`) with a
+    per-vehicle `mount_action_actor` var override decides which is the action's
+    `source`/actor; BOTH `vehicle` and `rider` ids are ALWAYS bound in the body
+    (new HOOK_CONTEXT names `vehicle`/`rider`/`slot`). In rider mode the action's
+    container is dropped (source = the rider's plain vars; read vehicle/slot
+    config via `entity[vehicle]`). Threaded via a new `extra_ctx` param on
+    `run_action`.
+  - **Lifecycle.** New hooks `on_mounted` / `on_dismounted` (fire on the rider,
+    bind `vehicle`+`slot`; switch fires dismount-then-mount). Host death/despawn
+    runs `_release_riders` from `Entity.remove` per the `mount_on_host_death`
+    rule (`eject` default — dismount to nearby free cells via
+    `_find_dismount_cell` | `kill` | `keep`). Formula prims: `mount` /
+    `dismount` / `switch_slot` (mutating), `is_mounted` / `mount_of` / `slot_of`
+    / `is_vehicle` / `riders` (loopable) / `slot_riders` (loopable) /
+    `slot_capacity` / `slot_free` / `can_mount`. Command `!mount <rider>
+    <vehicle> <slot>` / `dismount` / `switch` / `list` / `info` (list/info
+    player-available via READ_ONLY_SUBCOMMANDS). All serialized.
+    FUTURE the user may want: per-rider footprint inside a vehicle, edge-aware
+    boarding range (mount only from an adjacent cell), nested vehicles' shared
+    fuel/initiative, and an armor layer for riders-inside (positional cover).
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

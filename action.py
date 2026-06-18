@@ -268,6 +268,12 @@ class Action:
     target_type: str
     container_path: str
     full_path: str
+    # Mounts: when this action is offered to a vehicle's RIDERS, the slot
+    # names allowed to use it (parsed from the def's `allowed_slots` —
+    # list or CSV; "*"/"all" = any slot). None = not a rider-shared
+    # action (the vehicle's own). Only consulted for vehicle-owned actions
+    # during mount-action discovery; ignored for ordinary entity actions.
+    allowed_slots: Optional[List[str]] = None
 
     @staticmethod
     def from_dict(
@@ -306,10 +312,17 @@ class Action:
                 f"action '{name}' at `{full_path}`: `target` must be "
                 f"one of {{{allowed}}}; got {target_type!r}."
             )
+        raw_slots = raw.get("allowed_slots")
+        allowed_slots: Optional[List[str]] = None
+        if isinstance(raw_slots, str):
+            allowed_slots = _split_csv(raw_slots)
+        elif isinstance(raw_slots, (list, tuple)):
+            allowed_slots = [str(s).strip() for s in raw_slots if str(s).strip()]
         return Action(
             name=name, body=body, description=description,
             target_type=target_type,
             container_path=container_path, full_path=full_path,
+            allowed_slots=allowed_slots,
         )
 
 
@@ -465,6 +478,44 @@ def _walk_for_actions(
                 base_path=f"{base_path}.{k}",
                 out=out,
             )
+
+
+def discover_mount_actions(
+    rider: "Entity", match: "Match", rules: Dict[str, Any],
+) -> Dict[str, List[Action]]:
+    """Actions a MOUNTED rider can invoke through its vehicle, same
+    `{name: [Action, ...]}` shape as discover_actions. Two sources:
+      - SLOT actions: defined at `vehicle.vars.slots.<slot>.actions.<name>`
+        — available only to riders in that slot (container_path ==
+        `slots.<slot>`).
+      - VEHICLE actions with `allowed_slots`: any action on the vehicle
+        (outside the slots subtree) whose `allowed_slots` list includes the
+        rider's slot (or "*" / "all").
+    A vehicle action with NO allowed_slots, and any OTHER slot's actions,
+    are excluded. Empty when the rider isn't mounted / the host is gone."""
+    if not rider.is_mounted:
+        return {}
+    veh = match.entities.get(rider.mounted_on)
+    if veh is None:
+        return {}
+    slot = rider.mount_slot
+    slot_container = f"slots.{slot}"
+    out: Dict[str, List[Action]] = {}
+    for name, acts in discover_actions(veh, rules).items():
+        for act in acts:
+            cp = act.container_path
+            if cp == slot_container:
+                avail = True                       # this slot's own action
+            elif cp.startswith("slots."):
+                avail = False                      # another slot's action
+            elif act.allowed_slots is not None:
+                al = act.allowed_slots
+                avail = (slot in al) or ("*" in al) or ("all" in al)
+            else:
+                avail = False                      # vehicle-private action
+            if avail:
+                out.setdefault(name, []).append(act)
+    return out
 
 
 def fold_name(name: str, rules: Dict[str, Any]) -> str:
@@ -806,6 +857,7 @@ async def run_action(
     mgr: Any,           # MatchManager (kept loose to avoid import cycle)
     ctx: Any,           # ReplyContext for cmd()'s dispatch output
     answers: Optional[List[Any]] = None,  # pre-supplied choose() answers
+    extra_ctx: Optional[Dict[str, Any]] = None,  # extra hook-ctx bindings
 ) -> Tuple[bool, Optional[str]]:
     """Execute an action body transactionally.
 
@@ -1052,6 +1104,7 @@ async def run_action(
         eval_ctx = EvalCtx(
             this=match.current_entity_id(),
             target=actor_id,
+            extras=dict(extra_ctx) if extra_ctx else None,
         )
         # Mid-body choices use a REPLAY model: only the top-level
         # invocation owns the loop + answer queue. It seeds the queue

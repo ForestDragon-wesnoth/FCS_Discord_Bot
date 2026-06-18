@@ -946,6 +946,49 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "cloud the caster left behind)."
         ),
     },
+    # ---- mounts / vehicles ----
+    # Who is the action's `source` when a RIDER triggers a vehicle action
+    # (a slot-granted action, or a vehicle action whose allowed_slots
+    # includes the rider's slot). 'rider' (default) runs it as the rider
+    # (source = the rider) with a `vehicle` binding pointing at the host;
+    # 'vehicle' runs it as the vehicle (source = the host) with a `rider`
+    # binding pointing at the triggering occupant. Either way BOTH bindings
+    # are available in the body. Per-vehicle override: the vehicle's
+    # `mount_action_actor` var.
+    "mount_action_actor": {
+        "default": "rider",
+        "schema": {"type": "enum", "choices": ["rider", "vehicle"]},
+        "desc": (
+            "Who acts when a rider triggers a vehicle/slot action: 'rider' "
+            "(source = the occupant, with a `vehicle` binding) or 'vehicle' "
+            "(source = the host, with a `rider` binding). Both bindings are "
+            "always available; this only sets which is `source`. Override per "
+            "vehicle with its `mount_action_actor` var."
+        ),
+    },
+    # What happens to a vehicle's riders when the vehicle dies / leaves the
+    # match. 'eject' (default) dismounts everyone to free cells near the
+    # vehicle's last position (offboard but alive); 'kill' runs the kill
+    # function on each rider; 'keep' leaves them mounted for manual cleanup.
+    "mount_on_host_death": {
+        "default": "eject",
+        "schema": {"type": "enum", "choices": ["eject", "kill", "keep"]},
+        "desc": (
+            "Fate of riders when their vehicle dies or despawns: 'eject' "
+            "(dismount to nearby free cells), 'kill' (run the kill function "
+            "on each), or 'keep' (leave them mounted for manual cleanup)."
+        ),
+    },
+    # Roster suffix appended to a mounted rider's !list / !state row.
+    # Placeholders: {vehicle}, {vehicle_name}, {slot}. Empty = off.
+    "mount_entity_line_suffix": {
+        "default": " [riding {vehicle} :: {slot}]",
+        "schema": {"type": "str"},
+        "desc": (
+            "Suffix appended to a mounted rider's roster row. Placeholders: "
+            "{vehicle}, {vehicle_name}, {slot}. Empty = off."
+        ),
+    },
     # Which movement kinds honor tile/zone blocking. Each defaults True
     # (block everything); set a kind False to let it phase through walls
     # (e.g. block_tp=False lets teleports ignore blocking). The low-level
@@ -2259,6 +2302,16 @@ HOOK_NAMES: Set[str] = {
     "on_var_removed",
     "on_var_written",
     "on_var_write_attempt",
+    # Mount lifecycle (mounts/vehicles). Fire on the RIDER entity (`self`
+    # = the rider; `this` = current-turn entity). Context bindings:
+    #   vehicle   — the host vehicle's id (new HOOK_CONTEXT name)
+    #   slot      — the slot name the rider entered / left
+    # on_mounted fires after a rider boards (or switches slots — the
+    # switch fires on_dismounted from the old slot then on_mounted in the
+    # new); on_dismounted fires after a rider leaves (also on host-death
+    # eject). Lets the GM grant a "buckled in" status, deduct fuel, etc.
+    "on_mounted",
+    "on_dismounted",
 }
 
 # Custom event-bus subscription. A passive whose `when` is "event:<name>"
@@ -3247,6 +3300,18 @@ class Entity:
     # refresh and can't be casually set_var'd. See section 7 of CLAUDE.md.
     part_of: "str | None" = field(default=None)
 
+    # Mounts / vehicles: when this entity is RIDING another (a vehicle),
+    # `mounted_on` holds the host vehicle's id and `mount_slot` the slot
+    # name it occupies. A rider is a normal independent entity (keeps its
+    # own hp/turn/actions) that is carried by the vehicle's movement and
+    # hidden from / excluded from the ground (occupancy + spatial targeting)
+    # while aboard. The slot DEFINITIONS live on the vehicle (its `slots`
+    # var); this back-link is the per-rider occupancy fact, derived-scanned
+    # the same way `part_of` is. Protected fields (NOT vars) so they survive
+    # a rules refresh and can't be casually set_var'd. None = not riding.
+    mounted_on: "str | None" = field(default=None)
+    mount_slot: "str | None" = field(default=None)
+
     #connect Entity to the Match (so functions like moving an entity can still access map size data, etc.)
     _match: "Match | None" = field(default=None, repr=False, compare=False)
 
@@ -3466,6 +3531,39 @@ class Entity:
                 and not self.vars.get("__part_region"))
 
     @property
+    def is_mounted(self) -> bool:
+        """True when this entity is RIDING a vehicle (its `mounted_on`
+        points at a live host). A rider keeps its own hp/turn/actions but is
+        carried by the vehicle's movement and is off the ground while
+        aboard. The link is ignored if the host no longer exists (a dangling
+        rider reads as an ordinary entity)."""
+        mo = self.mounted_on
+        return bool(mo) and self._match is not None and mo in self._match.entities
+
+    @property
+    def is_hidden_rider(self) -> bool:
+        """A rider in a slot with NO `region` — tucked inside the vehicle:
+        hidden from the map, off the ground (no occupancy), and excluded
+        from spatial targeting (the part-glued skip surface). A rider in a
+        slot WITH a region (is_visible_rider) renders/targets at that
+        footprint cell instead."""
+        if not self.is_mounted:
+            return False
+        sd = self._match.slot_def(self.mounted_on, self.mount_slot)
+        return not (isinstance(sd, dict) and str(sd.get("region", "")).strip())
+
+    @property
+    def is_visible_rider(self) -> bool:
+        """A rider whose slot declares a `region` — shown and targetable at
+        that facing-relative footprint cell of the vehicle (a gunner on top,
+        a rider in the saddle), but still carried by the vehicle and not
+        blocking the ground."""
+        if not self.is_mounted:
+            return False
+        sd = self._match.slot_def(self.mounted_on, self.mount_slot)
+        return bool(isinstance(sd, dict) and str(sd.get("region", "")).strip())
+
+    @property
     def is_cell_stackable(self) -> bool:
         """True when this entity's `__cell_stackable` var is truthy.
         A stackable entity (a) doesn't count as occupying its cell for
@@ -3480,6 +3578,25 @@ class Entity:
 
     def move_to(self, x: int, y: int):
         self.x, self.y = x, y
+
+    def _mount_move_redirect(self) -> "Entity":
+        """Resolve who actually moves when THIS entity is told to move
+        (tp / move_dirs). When not riding, returns self. When riding a slot
+        flagged `controls_movement`, returns the VEHICLE (the driver steers
+        the whole rig; riders are carried via _restamp_riders_for). When
+        riding a non-control slot, raises — a passenger can't move on its
+        own and must dismount first."""
+        if not self.is_mounted:
+            return self
+        m = self._match
+        sd = m.slot_def(self.mounted_on, self.mount_slot) or {}
+        if sd.get("controls_movement"):
+            return m.entities[self.mounted_on]
+        raise VTTError(
+            f"'{self.id}' is riding '{self.mounted_on}' in slot "
+            f"'{self.mount_slot}' and can't move on its own — dismount "
+            f"first, or ride a slot that controls movement."
+        )
 
     def take_damage(self, amount: int):
         # Pass the raw post-damage intent through the chokepoint. If a min
@@ -3596,6 +3713,10 @@ class Entity:
         no group is left holding a dangling id.
         """
         m = self._require_match()
+        # Resolve any riders this entity was carrying (death OR despawn both
+        # route here) per the mount_on_host_death rule — done while `self` is
+        # still in the match so the eject search can use its footprint.
+        m._release_riders(self.id)
         if self.id in m.entities:
             del m.entities[self.id]
         # scrub from turn order & clamp active index
@@ -3637,6 +3758,12 @@ class Entity:
         moves that produced them).
         """
         m = self._require_match()
+        # Mounts: a rider's own move is redirected to the VEHICLE when its
+        # slot controls movement (driving), or refused when it's a plain
+        # passenger. The vehicle carries everyone via _restamp_riders_for.
+        mover = self._mount_move_redirect()
+        if mover is not self:
+            return mover.tp(x, y, fire_hooks=fire_hooks)
         # Validate the WHOLE destination footprint in one shot: every
         # covered cell in bounds, unoccupied (stackable movers skip
         # occupancy — they may enter cells holding non-stackable
@@ -3697,6 +3824,13 @@ class Entity:
         semantics of move_group_dirs.
         """
         m = self._require_match()
+        # Mounts: redirect a driver's walk to the vehicle, or refuse a
+        # passenger's (see tp). Done before path-building so the whole walk
+        # applies to the vehicle's footprint.
+        mover = self._mount_move_redirect()
+        if mover is not self:
+            return mover.move_dirs(moves, fire_hooks=fire_hooks,
+                                   block_mode=block_mode)
         allow_diag_move = bool(m.rules.get("allow_diagonal_movement", False))
         allow_diag_face = bool(m.rules.get("allow_diagonal_facing", False))
 
@@ -4218,6 +4352,8 @@ class Entity:
             "clamps": {path: c.to_dict() for path, c in self.clamps.items()},
             "facing": self.facing,
             "part_of": self.part_of,
+            "mounted_on": self.mounted_on,
+            "mount_slot": self.mount_slot,
         }
 
     @staticmethod
@@ -4234,6 +4370,8 @@ class Entity:
             vars=dict(data.get("vars", {})),
             facing=data.get("facing", "up"),
             part_of=data.get("part_of", None),
+            mounted_on=data.get("mounted_on", None),
+            mount_slot=data.get("mount_slot", None),
         )
         for pid, pd in (data.get("passives", {}) or {}).items():
             e.passives[pid] = Passive.from_dict(pd)
@@ -5407,25 +5545,23 @@ class Match:
         if region == "back_right": return back and right
         return False
 
-    def part_region_cells(self, p: "Entity") -> List[Tuple[int, int]]:
-        """The parent-footprint cells a region part occupies, facing-aware.
-        Each footprint cell is projected onto the parent's forward / right
-        axes (from the footprint center); the region selects by sign (full
-        8-way, so a diagonal facing yields a non-rectangular set). `all` =
-        every cell; `center` = the cell(s) at the center, falling back to
-        ALL when the footprint has no true center (even dimension). Falls
-        back to the part's own cell if the parent is gone."""
-        parent = self.entities.get(p.part_of) if p.part_of else None
-        if parent is None:
-            return [(p.x, p.y)]
-        region = str(p.vars.get("__part_region", "")).strip().lower()
-        cells = self.entity_cells(parent)
+    def region_cells_of(self, owner: "Entity",
+                        region: str) -> List[Tuple[int, int]]:
+        """The cells of `owner`'s footprint matching a facing-relative
+        `region` (front/back/left/right/center/all + corners). Each footprint
+        cell is projected onto the owner's forward / right axes from the
+        footprint center; the region selects by sign (full 8-way). `all` /
+        empty = every cell; `center` = the center cell(s), falling back to ALL
+        on an even (no-true-center) footprint. Always returns at least the
+        owner's anchor. Shared by region body parts and vehicle slots."""
+        region = str(region or "").strip().lower()
+        cells = self.entity_cells(owner)
         if not region or region == "all":
             return list(cells)
-        w, h = self.entity_footprint(parent)
-        ccx = parent.x + (w - 1) / 2.0
-        ccy = parent.y + (h - 1) / 2.0
-        fdx, fdy = FACING_VECTORS.get(getattr(parent, "facing", "up"), (0, -1))
+        w, h = self.entity_footprint(owner)
+        ccx = owner.x + (w - 1) / 2.0
+        ccy = owner.y + (h - 1) / 2.0
+        fdx, fdy = FACING_VECTORS.get(getattr(owner, "facing", "up"), (0, -1))
         eps = 1e-9
         if region == "center":
             center = [(gx, gy) for (gx, gy) in cells
@@ -5439,7 +5575,325 @@ class Match:
             rgt = dx * (-fdy) + dy * fdx
             if self._region_match(region, fwd, rgt, eps):
                 sel.append((gx, gy))
-        return sel if sel else [(parent.x, parent.y)]
+        return sel if sel else [(owner.x, owner.y)]
+
+    def part_region_cells(self, p: "Entity") -> List[Tuple[int, int]]:
+        """The parent-footprint cells a region part occupies, facing-aware
+        (see region_cells_of). Falls back to the part's own cell if the
+        parent is gone."""
+        parent = self.entities.get(p.part_of) if p.part_of else None
+        if parent is None:
+            return [(p.x, p.y)]
+        return self.region_cells_of(
+            parent, str(p.vars.get("__part_region", "")))
+
+    # ---------- mounts / vehicles -------------------------------------
+    # A vehicle is just an entity carrying a `slots` var (no hardcoded
+    # type). Each slot def lives under vehicle.vars.slots.<name>:
+    #   {capacity, cost, condition, region, controls_movement, actions,
+    #    ...} — capacity is a numeric budget (default 1); cost is a per-rider
+    #   formula consuming it (default 1); condition is a valid-rider formula
+    #   gate; region positions/shows the rider (else hidden inside);
+    #   controls_movement lets the occupant drive; actions is an optional
+    #   slot-scoped action bundle. The rider back-link is the protected
+    #   Entity.mounted_on / mount_slot fields; occupancy is derived by
+    #   scanning (no second structure), mirroring body parts.
+
+    def vehicle_slots(self, vid: str) -> Dict[str, Any]:
+        """The slot-definition dict of vehicle `vid` (its `slots` var), or
+        {} if it has none / isn't a vehicle."""
+        v = self.entities.get(vid)
+        if v is None:
+            return {}
+        slots = v.vars.get("slots")
+        return slots if isinstance(slots, dict) else {}
+
+    def slot_def(self, vid: str, slot: Optional[str]) -> Optional[Dict[str, Any]]:
+        """The definition dict for one slot, or None if absent/malformed."""
+        if not slot:
+            return None
+        sd = self.vehicle_slots(vid).get(slot)
+        return sd if isinstance(sd, dict) else None
+
+    def is_vehicle(self, vid: str) -> bool:
+        """True iff `vid` defines at least one slot."""
+        return bool(self.vehicle_slots(vid))
+
+    def vehicle_riders(self, vid: str) -> List["Entity"]:
+        """Every entity currently riding vehicle `vid` (any slot)."""
+        return [e for e in self.entities.values() if e.mounted_on == vid]
+
+    def slot_occupants(self, vid: str, slot: str) -> List["Entity"]:
+        """Every entity riding `vid` in the named `slot`."""
+        return [e for e in self.entities.values()
+                if e.mounted_on == vid and e.mount_slot == slot]
+
+    def _eval_slot_expr(self, vid: str, rider_id: str,
+                        expr: Any, fallback: Any) -> Any:
+        """Evaluate a slot cost/condition formula with `self` = the rider and
+        a `vehicle` binding = the host. Empty or malformed -> fallback
+        (fail-OPEN: a GM typo doesn't trap or bar a rider — give gating vars
+        a default via !defvar so reads resolve)."""
+        expr = str(expr or "").strip()
+        if not expr:
+            return fallback
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        ctx = EvalCtx(this=self.current_entity_id(), target=rider_id,
+                      extras={"vehicle": vid, "rider": rider_id,
+                              "slot": self.entities[rider_id].mount_slot
+                              if rider_id in self.entities else None})
+        try:
+            return FormulaEngine(self).eval_expression(expr, ctx)
+        except FormulaError:
+            return fallback
+
+    def slot_capacity(self, vid: str, slot: str) -> float:
+        """The slot's numeric capacity budget (default 1)."""
+        sd = self.slot_def(vid, slot) or {}
+        try:
+            return float(sd.get("capacity", 1))
+        except (TypeError, ValueError):
+            return 1.0
+
+    def slot_cost_of(self, vid: str, slot: str, rider_id: str) -> float:
+        """What `rider_id` would consume from the slot's budget — the slot's
+        `cost` formula evaluated for that rider (default 1)."""
+        sd = self.slot_def(vid, slot) or {}
+        val = self._eval_slot_expr(vid, rider_id, sd.get("cost", ""), 1)
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return 1.0
+
+    def slot_used_capacity(self, vid: str, slot: str,
+                           ignore: Optional[str] = None) -> float:
+        """Total budget currently consumed by the slot's occupants
+        (optionally excluding `ignore`, used when re-checking a rider already
+        seated there)."""
+        return sum(self.slot_cost_of(vid, slot, e.id)
+                   for e in self.slot_occupants(vid, slot)
+                   if e.id != ignore)
+
+    def slot_condition_ok(self, vid: str, slot: str, rider_id: str) -> bool:
+        """Whether `rider_id` satisfies the slot's `condition` formula
+        (empty/malformed = yes)."""
+        sd = self.slot_def(vid, slot) or {}
+        return bool(self._eval_slot_expr(vid, rider_id, sd.get("condition", ""), True))
+
+    def can_mount(self, rider_id: str, vid: str,
+                  slot: str) -> Tuple[bool, str]:
+        """(ok, reason) for mounting `rider_id` into `vid`'s `slot`: the
+        vehicle/slot exist, no self-mount or mount cycle, the rider isn't a
+        body part, the condition passes, and the cost fits the remaining
+        budget. The rider's OWN current occupancy of this slot is excluded
+        from the used-budget total (so a re-seat / no-op doesn't self-block)."""
+        rider = self.entities.get(rider_id)
+        veh = self.entities.get(vid)
+        if rider is None:
+            return False, f"no entity '{rider_id}'."
+        if veh is None:
+            return False, f"no vehicle '{vid}'."
+        if rider_id == vid:
+            return False, "an entity can't mount itself."
+        if rider.is_part:
+            return False, f"'{rider_id}' is a body part — mount its owner."
+        sd = self.slot_def(vid, slot)
+        if sd is None:
+            names = ", ".join(sorted(self.vehicle_slots(vid))) or "(none)"
+            return False, f"vehicle '{vid}' has no slot '{slot}'. Slots: {names}."
+        # Cycle guard: walk vid's own mount chain; it must not lead back to
+        # the rider (you can't put the cart inside the horse that's on it).
+        cur, seen = veh, set()
+        while cur is not None and cur.mounted_on and cur.id not in seen:
+            seen.add(cur.id)
+            if cur.mounted_on == rider_id:
+                return False, "that would create a mount cycle."
+            cur = self.entities.get(cur.mounted_on)
+        if not self.slot_condition_ok(vid, slot, rider_id):
+            return False, (f"'{rider_id}' doesn't meet slot '{slot}'s "
+                           f"rider condition.")
+        cap = self.slot_capacity(vid, slot)
+        used = self.slot_used_capacity(vid, slot, ignore=rider_id)
+        cost = self.slot_cost_of(vid, slot, rider_id)
+        if used + cost > cap + 1e-9:
+            return False, (f"slot '{slot}' is full: {used:g} + {cost:g} "
+                           f"would exceed capacity {cap:g}.")
+        return True, ""
+
+    def rider_cell(self, vid: str, rider: "Entity") -> Tuple[int, int]:
+        """Where a rider sits: a representative cell of its slot's region (for
+        a visible slot — multiple visible occupants spread across the region's
+        cells by index), else the vehicle's anchor (hidden inside)."""
+        veh = self.entities.get(vid)
+        if veh is None:
+            return (rider.x, rider.y)
+        sd = self.slot_def(vid, rider.mount_slot) or {}
+        region = str(sd.get("region", "")).strip()
+        if region:
+            cells = self.region_cells_of(veh, region)
+            if cells:
+                occ = self.slot_occupants(vid, rider.mount_slot)
+                try:
+                    idx = [e.id for e in occ].index(rider.id)
+                except ValueError:
+                    idx = 0
+                return cells[idx % len(cells)]
+        return (veh.x, veh.y)
+
+    def _restamp_riders_for(self, vid: str) -> None:
+        """Reposition every rider of `vid` onto its slot cell (raw move_to —
+        no occupancy/hooks). Called when the vehicle moves and after a
+        mount/dismount/slot-change."""
+        for rider in self.vehicle_riders(vid):
+            cx, cy = self.rider_cell(vid, rider)
+            if (rider.x, rider.y) != (cx, cy):
+                rider.move_to(cx, cy)
+
+    def _detach_rider(self, rider: "Entity") -> List[str]:
+        """Clear a rider's mount link and fire on_dismounted. Does NOT move
+        the rider (callers place it). Returns hook log."""
+        vid, slot = rider.mounted_on, rider.mount_slot
+        rider.mounted_on = None
+        rider.mount_slot = None
+        log = self.fire_hook("on_dismounted", target_ids=[rider.id],
+                             extras={"vehicle": vid, "slot": slot})
+        return log
+
+    def mount_entity(self, rider_id: str, vid: str, slot: str) -> List[str]:
+        """Board `rider_id` into `vid`'s `slot`. Validates via can_mount
+        (raises VTTError on failure). If the rider was already mounted
+        elsewhere it dismounts first. Fires on_mounted. Returns hook log."""
+        ok, reason = self.can_mount(rider_id, vid, slot)
+        if not ok:
+            raise VTTError(reason)
+        rider = self.entities[rider_id]
+        log: List[str] = []
+        if rider.mounted_on and not (rider.mounted_on == vid
+                                     and rider.mount_slot == slot):
+            log.extend(self._detach_rider(rider))
+        rider.mounted_on = vid
+        rider.mount_slot = slot
+        cx, cy = self.rider_cell(vid, rider)
+        rider.move_to(cx, cy)
+        # Occupancy changed (rider left the ground); rebuild turn order so a
+        # large rider no longer blocks, etc. (the rider keeps its initiative).
+        self._rebuild_turn_order()
+        log.extend(self.fire_hook("on_mounted", target_ids=[rider_id],
+                                  extras={"vehicle": vid, "slot": slot}))
+        return log
+
+    def switch_slot(self, rider_id: str, new_slot: str) -> List[str]:
+        """Move an already-mounted rider to a different slot of the SAME
+        vehicle (passenger -> gunner, etc.). Validated like a fresh mount.
+        Fires on_dismounted (old slot) then on_mounted (new)."""
+        rider = self.entities.get(rider_id)
+        if rider is None or not rider.is_mounted:
+            raise VTTError(f"'{rider_id}' isn't riding anything.")
+        vid = rider.mounted_on
+        if new_slot == rider.mount_slot:
+            raise VTTError(f"'{rider_id}' is already in slot '{new_slot}'.")
+        ok, reason = self.can_mount(rider_id, vid, new_slot)
+        if not ok:
+            raise VTTError(reason)
+        log = self._detach_rider(rider)   # fires on_dismounted (old slot)
+        rider.mounted_on = vid
+        rider.mount_slot = new_slot
+        cx, cy = self.rider_cell(vid, rider)
+        rider.move_to(cx, cy)
+        log.extend(self.fire_hook("on_mounted", target_ids=[rider_id],
+                                  extras={"vehicle": vid, "slot": new_slot}))
+        return log
+
+    def dismount_entity(self, rider_id: str,
+                        x: Optional[int] = None,
+                        y: Optional[int] = None) -> List[str]:
+        """Disembark a rider to a free cell. Uses (x, y) if given (must be a
+        valid placement); otherwise searches outward from the vehicle for the
+        nearest cell that fits the rider's footprint. Fires on_dismounted."""
+        rider = self.entities.get(rider_id)
+        if rider is None or not rider.is_mounted:
+            raise VTTError(f"'{rider_id}' isn't riding anything.")
+        veh = self.entities.get(rider.mounted_on)
+        # Resolve the drop cell FIRST (rider still mounted, so it's excluded
+        # from occupancy and can't block itself) — only commit if it fits.
+        if x is not None and y is not None:
+            self._validate_placement(rider, int(x), int(y), None)
+            dest = (int(x), int(y))
+        else:
+            dest = self._find_dismount_cell(rider, veh)
+            if dest is None:
+                raise VTTError(
+                    f"no free cell to dismount '{rider_id}' near the vehicle.")
+        ox, oy = rider.x, rider.y
+        log = self._detach_rider(rider)
+        rider.move_to(*dest)
+        self._rebuild_turn_order()
+        log.extend(self.fire_entity_moved(rider_id, ox, oy, dest[0], dest[1]))
+        return log
+
+    def _find_dismount_cell(self, rider: "Entity",
+                            veh: Optional["Entity"]) -> Optional[Tuple[int, int]]:
+        """Nearest cell whose footprint fits `rider`, searched in rings
+        outward from the vehicle's footprint (or the rider's current cell if
+        the vehicle is gone). None if nothing fits within the grid."""
+        if veh is not None:
+            origins = self.entity_cells(veh)
+            ox = sum(c[0] for c in origins) / len(origins)
+            oy = sum(c[1] for c in origins) / len(origins)
+        else:
+            ox, oy = rider.x, rider.y
+        candidates = []
+        for gy in range(1, self.grid_height + 1):
+            for gx in range(1, self.grid_width + 1):
+                if self.footprint_in_bounds(rider, gx, gy) and \
+                        not self._footprint_blocked_by_others(rider, gx, gy):
+                    candidates.append((gx, gy))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda c: (c[0] - ox) ** 2 + (c[1] - oy) ** 2)
+        return candidates[0]
+
+    def _footprint_blocked_by_others(self, e: "Entity",
+                                     ax: int, ay: int) -> bool:
+        """True if some OTHER non-stackable entity covers any cell of `e`'s
+        footprint anchored at (ax, ay). (Placement helper for dismount.)"""
+        for cx, cy in self.entity_cells(e, ax, ay):
+            occ = self.cell_occupant(cx, cy, ignore=(e.id,))
+            if occ is not None:
+                return True
+        return False
+
+    def _release_riders(self, vid: str) -> List[str]:
+        """Resolve a vehicle's riders when it dies / despawns, per the
+        mount_on_host_death rule: 'eject' (dismount to nearby cells),
+        'kill' (run the kill function on each), 'keep' (leave them linked).
+        Called from Entity.remove. Returns log."""
+        riders = self.vehicle_riders(vid)
+        if not riders:
+            return []
+        mode = str(self.rules.get("mount_on_host_death", "eject"))
+        veh = self.entities.get(vid)
+        log: List[str] = []
+        for rider in riders:
+            if mode == "keep":
+                continue
+            if mode == "kill":
+                # Detach first so the rider is a normal entity for the kill
+                # pipeline, then run the configured kill function.
+                log.extend(self._detach_rider(rider))
+                try:
+                    self.kill_entity(rider.id)
+                except VTTError:
+                    pass
+                continue
+            # eject (default): place at a free cell near the vehicle.
+            log.extend(self._detach_rider(rider))
+            dest = self._find_dismount_cell(rider, veh)
+            if dest is not None:
+                rider.move_to(*dest)
+        if mode != "keep":
+            self._rebuild_turn_order()
+        return log
 
     # ---------- stat modifiers (derived / effective stats) ----------
     # Base stats stay plain vars (never mutated); a modifier is a data
@@ -6491,6 +6945,11 @@ class Match:
         if eid not in self.entities:
             return False
         e = self.entities[eid]
+        # A rider tucked inside a vehicle (hidden slot) isn't independently
+        # visible under a POV — you see the vehicle, not who's inside. A
+        # visible (region-slot) rider stays subject to the normal checks.
+        if e.is_hidden_rider:
+            return False
         # A large entity is fog-visible if ANY footprint cell passes the
         # entity fog gate (current vision, or remembered when memory mode
         # is 'full') — so a giant is hidden only when its whole body is
@@ -6878,6 +7337,11 @@ class Match:
             # the parent is the occupant. A LOCATED part has its own cell
             # and occupies it normally.
             if e.is_glued_part:
+                continue
+            # Mounted riders are aboard the vehicle, not on the ground — they
+            # never block (the vehicle's own footprint is the occupant). This
+            # holds for visible riders too (a gunner shares the tank's cell).
+            if e.is_mounted:
                 continue
             if e.is_alive and not e.is_cell_stackable and self.entity_occupies(e, x, y):
                 return eid
@@ -8494,6 +8958,11 @@ class Match:
         # Glue attached body parts to the parent's new cell (before
         # on_entity_moved passives fire, so they observe the moved parts).
         self._restamp_parts_for(entity_id)
+        # Carry mounted riders along with the vehicle (each to its slot's
+        # cell — region cell for a visible slot, the anchor otherwise). Like
+        # the part/anchor restamp, this just moves cells; it does NOT fire
+        # the riders' own movement hooks (they're carried, not walking).
+        self._restamp_riders_for(entity_id)
         # Snake body: a stepwise move already trailed the chain per
         # fire_entity_step (which left __seg_last == the head's cell). A
         # discontinuous move (teleport / swap / push with no per-cell steps)
@@ -9686,7 +10155,8 @@ class Match:
             if tp:
                 yield from tp.values()
 
-    def fire_hook(self, when: str, *, target_ids: Optional[List[str]] = None) -> List[str]:
+    def fire_hook(self, when: str, *, target_ids: Optional[List[str]] = None,
+                  extras: Optional[Dict[str, Any]] = None) -> List[str]:
         """
         Fire every passive matching `when` for each target entity.
 
@@ -9715,7 +10185,7 @@ class Match:
             e = self.entities.get(tid)
             if e is None:
                 continue
-            ctx = EvalCtx(this=this_id, target=tid)
+            ctx = EvalCtx(this=this_id, target=tid, extras=extras)
             # Globals first (in insertion order).
             for p in self._firing_passives(tid):
                 if p.when != when:
@@ -10746,8 +11216,24 @@ class Match:
             # Glued body parts ride on the parent's cell — the parent draws
             # the glyph; they never paint their own. A LOCATED part draws at
             # its own cell. REGION parts overlap the parent and are deferred
-            # to a priority pass below.
-            if e.is_glued_part or e.is_region_part:
+            # to a priority pass below. Mounted riders are aboard: hidden
+            # ones don't draw (the vehicle does); visible (region-slot) ones
+            # draw over the vehicle in the priority pass below.
+            if e.is_glued_part or e.is_region_part or e.is_mounted:
+                continue
+            if not self.entity_visible_to(e.id, pov_team):
+                continue
+            sym = self.entity_glyph(e)
+            ecol = self.entity_color(e)
+            for (cx, cy) in self.entity_cells(e):
+                if self.in_bounds(cx, cy):
+                    grid[cy][cx] = sym
+                    colors[cy][cx] = ecol
+
+        # Visible-rider priority pass: a rider in a region slot sits ON the
+        # vehicle, so it draws over the vehicle glyph at its slot cell.
+        for e in (self.entities.values() if "entities" not in hidden else ()):
+            if not e.is_visible_rider or not getattr(e, "is_alive", True):
                 continue
             if not self.entity_visible_to(e.id, pov_team):
                 continue
