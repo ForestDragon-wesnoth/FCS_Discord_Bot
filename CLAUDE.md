@@ -893,6 +893,45 @@ More shipped work (continuing the list above):
     `Match.status_apply_block_reason(eid, name, level)` (immune / blocked by X
     / fully resisted). All def fields serialize (deepcopy); resistances are
     plain entity vars; counters are instance data.
+- **Builder/objectives/transfer/layers bundle — SHIPPED (scenarios 453-457).**
+  Four small composable features.
+  - **Line/fill tile builder (49):** `!tile line <x1> <y1> <x2> <y2> <path>
+    <value>` and `!tile fill ...` stamp ONE path=value across many cells in a
+    single command (`line` = the engine's `_line_cells` segment geometry,
+    `fill` = the bounding rectangle). Pure sugar over `!tile set` (same
+    path=value shape — run twice for glyph+block on a wall). Off-grid cells
+    skipped + reported.
+  - **Toggleable map layers (114):** `Match.hidden_layers` (serialized set;
+    layers `zones`/`tiles`/`entities`/`fog`). `!map layer <name> on|off` (host-
+    gated via ELEVATED_ARGS) persists; `!map layer list` shows state; a one-off
+    `!map hide=zones,fog` arg (player-available) suppresses layers for a SINGLE
+    render without mutating state. Threaded as `render_ascii(..., hidden_layers=)`
+    → `_render_ascii_impl(hidden=)` (each layer loop gated; fog overlay too). NOT
+    a Discord-only feature — works in the CLI/harness. `full` stays honored only
+    as args[0] so `hide=` can't sneak a player past the fog gate. (No coords/axis
+    layer — infeasible with 1-char cells.)
+  - **Cross-match entity transfer (107):** `MatchManager.copy_entity(src_mid,
+    dest_mid, eid, x, y, move=)`. `!ent copy <id> <dest_match> [x y]` duplicates
+    into another LIVE match (keeps source); `!ent transfer ...` MOVES it (note:
+    `!ent move` is the movement verb, so transfer is the rename). Full fidelity:
+    vars/statuses/passives/clamps/facing + the whole body-part SUBTREE (BFS,
+    parents before children; `part_of` remapped; glued/region parts re-stamped,
+    located parts keep their offset). Colliding ids auto-suffixed (`goblin` →
+    `goblin_2`). Routes through `Entity.spawn` (fires on_entity_spawned in the
+    dest, validates placement). A part can't be transferred alone (move its
+    parent). Template-save-for-later is a SEPARATE future PR (cross-match
+    permanent storage); this is the direct match→match move.
+  - **Match outcome / victory (100):** NO built-in objective evaluator (the user
+    chose primitives over a `Match.objectives` table). `Match.outcome` (None =
+    ongoing, else `{winner, reason, round}`; serialized) + `Match.declare_winner
+    (winner, reason)` / `clear_outcome`. Formula prims `declare_winner(winner[,
+    reason])` / `match_winner()` / `match_over()` are MATCH funcs, so they fire
+    from ANY formula context — watcher effects, actions (Exodia auto-win),
+    on_death passives (boss slain), tile `on_enter` hooks (goal tile), zones,
+    status ticks, etc. Commands `!match win <winner> [reason]` (manual) / `!match
+    win clear` (resume) / `!match outcome` (read-only, player-available). Winner
+    shown in the `!state` header. "Victory is declared manually" is the default;
+    win conditions are COMPOSED, not configured.
 - **Pierce helper + composable penetration — SHIPPED.**
   `entities_in_line_until(x1,y1,x2,y2, max_targets[, viewer])` (formula.py)
   returns the first N alive entity ids the segment passes through, near→far,

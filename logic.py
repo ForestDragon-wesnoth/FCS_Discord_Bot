@@ -4491,6 +4491,21 @@ class Match:
     # `last` is runtime edge-state (serialized so a reload doesn't re-fire).
     watchers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
+    # ---- toggleable map layers (114) ----
+    # Names of render layers HIDDEN for this match (persistent, serialized).
+    # Empty = everything drawn. Layers: zones / tiles / entities / fog.
+    # Toggled with `!map layer <name> on|off`; a one-off `!map hide=...`
+    # arg hides extra layers for a single render without storing them.
+    hidden_layers: "set[str]" = field(default_factory=set)
+
+    # ---- match outcome / victory (100) ----
+    # None until a winner is declared (manually via `!match win` or from a
+    # GM-composed watcher/action calling declare_winner). Then a dict
+    # {"winner": str, "reason": str, "round": int}. There is NO built-in
+    # objective evaluator — win conditions are composed from watchers +
+    # declare_winner, keeping "victory is declared manually" the default.
+    outcome: Optional[Dict[str, Any]] = None
+
     # ---- team-level state (resources + team-scoped modifiers) ----
     # team -> free-form data dict (command points, morale, a `modifiers`
     # bundle that applies to every member, etc.). Read/written via team_get
@@ -5792,6 +5807,34 @@ class Match:
             if w.get("once"):
                 self.watchers.pop(name, None)
         return log
+
+    # ---- match outcome / victory (100) -------------------------------
+    # No built-in objective evaluator: a win CONDITION is composed by the
+    # GM from existing systems (a watcher whose effect calls declare_winner,
+    # an action, an on_death passive, ...). The engine only stores the
+    # declared outcome and exposes it — "victory is declared manually" by
+    # default. declare_winner is also a formula primitive.
+
+    def declare_winner(self, winner: str, reason: str = "") -> Dict[str, Any]:
+        """Record a match outcome. `winner` is a free-form string (a team,
+        an entity id, 'draw', whatever the GM means); `reason` is optional
+        flavor. Overwrites any prior outcome. Returns the outcome dict."""
+        self.outcome = {
+            "winner": str(winner),
+            "reason": str(reason or ""),
+            "round": int(self.round_number),
+        }
+        self.log_event("winner_declared",
+                       winner=self.outcome["winner"],
+                       reason=self.outcome["reason"])
+        return self.outcome
+
+    def clear_outcome(self) -> bool:
+        """Drop any declared outcome (resume play). Returns True if one was
+        set."""
+        had = self.outcome is not None
+        self.outcome = None
+        return had
 
     def _release_anchored_zones(self, eid: str) -> None:
         """Handle auras anchored to `eid` when it dies / leaves the match,
@@ -10303,6 +10346,8 @@ class Match:
             "aliases": dict(self.aliases),
             "macros": dict(self.macros),
             "watchers": copy.deepcopy(self.watchers),
+            "hidden_layers": sorted(self.hidden_layers),
+            "outcome": copy.deepcopy(self.outcome),
             "team_data": copy.deepcopy(self.team_data),
             "team_passives": {
                 team: {pid: p.to_dict() for pid, p in d.items()}
@@ -10431,6 +10476,11 @@ class Match:
             str(k): dict(v) for k, v in raw_watch.items()
             if isinstance(k, str) and isinstance(v, dict)
         } if isinstance(raw_watch, dict) else {}
+        raw_layers = d.get("hidden_layers", []) or []
+        m.hidden_layers = {str(x) for x in raw_layers
+                           if isinstance(x, str)} if isinstance(raw_layers, (list, tuple, set)) else set()
+        raw_outcome = d.get("outcome")
+        m.outcome = copy.deepcopy(raw_outcome) if isinstance(raw_outcome, dict) else None
         raw_td = d.get("team_data", {}) or {}
         m.team_data = {
             str(k): copy.deepcopy(v) for k, v in raw_td.items()
@@ -10597,23 +10647,29 @@ class Match:
         return self._resolve_color_value(z.get("color"), {"zone_name": name})
 
     def render_ascii(self, pov_team: Optional[str] = None,
-                     colorize: bool = False) -> str:
+                     colorize: bool = False,
+                     hidden_layers: Optional["set[str]"] = None) -> str:
         """Render the ASCII map. Thin wrapper that activates the read-only
         _fog_team_sees memo for the duration of the render, so the per-cell,
         per-layer fog scan doesn't recompute the same team-sight (each
         recompute loops every team member with a per-member LOS walk). The
         memo is torn down in `finally` and is never held across a mutation, so
-        it can't go stale. See _render_ascii_impl for the actual rendering."""
+        it can't go stale. See _render_ascii_impl for the actual rendering.
+
+        `hidden_layers` (None = use this match's persistent self.hidden_layers)
+        suppresses render layers by name: zones / tiles / entities / fog."""
+        hidden = self.hidden_layers if hidden_layers is None else hidden_layers
         prev = self._vision_memo
         if prev is None:
             self._vision_memo = {}
         try:
-            return self._render_ascii_impl(pov_team, colorize)
+            return self._render_ascii_impl(pov_team, colorize, hidden)
         finally:
             self._vision_memo = prev
 
     def _render_ascii_impl(self, pov_team: Optional[str] = None,
-                           colorize: bool = False) -> str:
+                           colorize: bool = False,
+                           hidden: "set[str]" = frozenset()) -> str:
         # `pov_team` filters EVERY layer through its visibility rule: a
         # zone / tile / entity hidden from that team isn't painted (its
         # cell falls back to whatever layer is visible underneath, so the
@@ -10638,7 +10694,7 @@ class Match:
         # Zone layer (lowest): a single-char `glyph` paints all the zone's
         # cells; a `color` tints them (the glyph if present, else the '.').
         # Overlapping zones: later-iterated wins for both.
-        for zname, z in self.zones.items():
+        for zname, z in (self.zones.items() if "zones" not in hidden else ()):
             if not self.zone_visible_to(zname, pov_team):
                 continue
             g = z.get("glyph")
@@ -10658,7 +10714,7 @@ class Match:
         # Tile layer: instance `glyph` wins, else the template's. A tile
         # `color` (instance > template) tints the cell — overriding any zone
         # tint underneath, since the tile is the higher layer.
-        for (tx, ty), data in self.tiles.items():
+        for (tx, ty), data in (self.tiles.items() if "tiles" not in hidden else ()):
             if not self.in_bounds(tx, ty):
                 continue
             if not self.tile_visible_to(tx, ty, pov_team):
@@ -10684,7 +10740,7 @@ class Match:
         # over tile features. An entity always paints a glyph, so it owns
         # the cell's color too (its resolved color, or None = uncolored,
         # overriding any tile/zone tint).
-        for e in self.entities.values():
+        for e in (self.entities.values() if "entities" not in hidden else ()):
             if not getattr(e, "is_alive", True):
                 continue
             # Glued body parts ride on the parent's cell — the parent draws
@@ -10707,7 +10763,7 @@ class Match:
         # default-glyph region part yields, so it doesn't clobber the parent's
         # own customization). part_custom_glyph_priority=False = parent always
         # wins. Drawn regardless of hp so structural 0/0 zones still show.
-        if bool(self.rules.get("part_custom_glyph_priority", True)):
+        if bool(self.rules.get("part_custom_glyph_priority", True)) and "entities" not in hidden:
             for e in self.entities.values():
                 if not e.is_region_part or not self.entity_has_custom_glyph(e):
                     continue
@@ -10722,7 +10778,7 @@ class Match:
 
         # Fog overlay (last): an unrevealed cell shows fog_glyph and no
         # color (fog hides whatever tint was there).
-        if self.fog_enabled and pov_team is not None:
+        if self.fog_enabled and pov_team is not None and "fog" not in hidden:
             fog_glyph = str(self.rules.get("fog_glyph", "?"))
             fg = fog_glyph[0] if fog_glyph else "."
             for yy in range(1, self.grid_height + 1):
@@ -11113,6 +11169,76 @@ class MatchManager:
                 m.aliases[aname] = expansion
         self.matches[m.id] = m
         return m.id
+
+    def copy_entity(self, src_mid: str, dest_mid: str, eid: str,
+                    x: Optional[int] = None, y: Optional[int] = None,
+                    *, move: bool = False) -> Tuple[str, List[str]]:
+        """Copy (move=False) or MOVE (move=True) an entity — with its vars,
+        statuses, passives, clamps, facing, and its whole body-part subtree —
+        from one live match to another. Returns (new_id, spawn_log).
+
+        Placement defaults to the entity's current cell; pass x/y to override.
+        Parts ride along: glued/region parts are re-stamped onto the new
+        anchor, a located part keeps its offset from the anchor. Ids that
+        collide in the destination are auto-suffixed (`goblin` -> `goblin_2`),
+        with `part_of` links remapped to match. Each spawn fires
+        on_entity_spawned in the destination (the transfer routes through
+        Entity.spawn, not a raw insert). The template-save-for-later flow is
+        a separate feature; this is the direct match->match transfer."""
+        if src_mid not in self.matches:
+            raise NotFound(f"Source match '{src_mid}' not found.")
+        if dest_mid not in self.matches:
+            raise NotFound(f"Destination match '{dest_mid}' not found.")
+        src, dest = self.matches[src_mid], self.matches[dest_mid]
+        if src is dest:
+            raise VTTError("Source and destination matches must differ.")
+        e = src.entities.get(eid)
+        if e is None:
+            raise NotFound(f"Entity '{eid}' not found in match '{src_mid}'.")
+        if e.is_part:
+            raise VTTError(
+                f"'{eid}' is a body part — transfer its parent instead.")
+        # BFS the part subtree so parents are spawned before their children.
+        order = [eid]
+        i = 0
+        while i < len(order):
+            pid = order[i]; i += 1
+            for child in src.entities.values():
+                if child.part_of == pid and child.id not in order:
+                    order.append(child.id)
+        # Remap ids to avoid destination collisions (live ids + corpses).
+        taken = set(dest._taken_entity_ids())
+        idmap: Dict[str, str] = {}
+        for oid in order:
+            nid = oid
+            if nid in taken:
+                k = 2
+                while f"{oid}_{k}" in taken:
+                    k += 1
+                nid = f"{oid}_{k}"
+            idmap[oid] = nid
+            taken.add(nid)
+        tx = e.x if x is None else int(x)
+        ty = e.y if y is None else int(y)
+        log: List[str] = []
+        for oid in order:
+            oe = src.entities[oid]
+            ne = Entity.from_dict(oe.to_dict())
+            ne.id = idmap[oid]
+            if ne.part_of:
+                ne.part_of = idmap.get(ne.part_of, ne.part_of)
+            if oid == eid or not oe.is_located_part:
+                px, py = tx, ty
+            else:  # a located part keeps its offset from the anchor
+                px, py = tx + (oe.x - e.x), ty + (oe.y - e.y)
+            _, slog = ne.spawn(dest, px, py)
+            log.extend(slog)
+        dest._restamp_parts_for(idmap[eid])
+        if move:
+            for oid in reversed(order):  # children first
+                if oid in src.entities:
+                    src.entities[oid].remove()
+        return idmap[eid], log
 
     def refresh_match_rules(self, system_name: str) -> int:
         """Re-snapshot rules onto every match bound to `system_name`. Returns count refreshed.
