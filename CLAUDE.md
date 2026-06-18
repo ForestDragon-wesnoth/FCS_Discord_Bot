@@ -780,6 +780,29 @@ More shipped work (continuing the list above):
   raises. Read-only (snapshot immutable until revive). `corpse_team`
   remains a HOOK_CONTEXT binding only. Status introspection deferred.
   Scenario 387.
+- **Corpse STATUS introspection + corpse OCCUPANCY — SHIPPED.** Two corpse
+  follow-ons (the deferrals tracked since the corpse-var / corpse arc).
+  (1) **Status introspection:** `corpse_status_has(eid, name)` (bool, never
+  raises on a missing corpse), `corpse_status_get(eid, name, path[, default])`
+  (dotted field of a frozen status; raises on missing corpse/status/path
+  UNLESS a default, mirroring corpse_var + status_get), and
+  `corpse_status_names(eid)` (loopable, sorted, []=missing) read a DEAD
+  entity's frozen statuses from the corpse snapshot's `status` dict (the
+  "did it die cursed?" / "raise with the same affliction" patterns). The
+  status analog of corpse_var; read-only. Core in formula.py
+  (`_corpse_status_dict` + the three prims).
+  (2) **Occupancy as a gamerule:** the `corpse_block_condition` rule (formula
+  EXPRESSION, default "" = corpses passable, the old behavior). Plugged into
+  `Match.cell_blocks` (so it flows through `_check_block` → every movement
+  verb + the same block_walk/tp/push/swap toggles as tile/zone blocking).
+  Bindings: `self`=mover, `tile_x`/`tile_y`=the corpse cell, `corpse_id` (NEW
+  HOOK_CONTEXT name — read frozen vars via `corpse_var(corpse_id, ...)`),
+  `corpse_team`. A cell blocks if ANY corpse covering it (large corpses block
+  their whole footprint via `corpse_cells`) evaluates truthy. Fail-OPEN
+  (malformed / missing-var → not blocking) like the rest of the block system,
+  so gating vars need a real value on the MOVER (`!defvar` only defaults new
+  spawns). Gated on the rule being set = zero cost when off. Scenarios
+  447-448.
 - **Entity-anchored auras — SHIPPED.** A zone can be bound to an entity as
   an AURA via reserved zone fields `anchor`/`anchor_radius`/`anchor_metric`.
   Its `cells` are RE-STAMPED (footprint-aware disc of `anchor_radius` around

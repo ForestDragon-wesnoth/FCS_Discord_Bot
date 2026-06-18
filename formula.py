@@ -1504,6 +1504,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #                                   unless a default is supplied)
     "kill", "revive", "has_corpse", "corpse_at", "all_corpses",
     "corpse_has", "corpse_var",
+    "corpse_status_has", "corpse_status_get", "corpse_status_names",
     # Scheduled / delayed effects. schedule() queues a MATCH-level body
     # to run at on_round_start `delay` rounds out (no self bound);
     # schedule_on() queues an ENTITY-attached body to run at that
@@ -1733,6 +1734,7 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "entity_actions",
     # Corpse introspection — returns a list of corpse ids, loopable.
     "all_corpses",
+    "corpse_status_names",
     # Zone queries — all return lists. zones_at / entity_zones /
     # zone_names yield zone-name strings; entities_in_zone yields entity
     # ids; zone_cells yields [x,y] pairs (loop with `for (cx,cy) in ...`).
@@ -1844,6 +1846,10 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     # no `self`/entity[X] — corpse_team + tile_x/tile_y are how a
     # visibility formula keys on it. None outside corpse-visibility.
     "corpse_team",
+    # Bound during corpse_block_condition evaluation to the id of the
+    # corpse occupying the cell (so the formula can read its frozen vars
+    # via corpse_var(corpse_id, ...)); None elsewhere.
+    "corpse_id",
     # Stat-modifier context. Bound when apply_mods / list_mods evaluate a
     # modifier's condition / value / tag formulas, to the related entities
     # the caller passed (each optional — unbound if not supplied). `self`
@@ -4394,6 +4400,64 @@ class FormulaEngine:
         ns["all_corpses"]  = _all_corpses
         ns["corpse_has"]   = _corpse_has
         ns["corpse_var"]   = _corpse_var
+
+        def _corpse_status_dict(eid: str):
+            """The dead entity's stored status dict, or None if no such
+            corpse (an empty dict if the corpse carried no statuses)."""
+            loc = match.find_corpse(eid)
+            if loc is None:
+                return None
+            _x, _y, corpse = loc
+            ent = corpse.get("entity") if isinstance(corpse, dict) else None
+            sd = ent.get("status") if isinstance(ent, dict) else None
+            return sd if isinstance(sd, dict) else {}
+
+        def _corpse_status_has(eid_t: Any, name: Any) -> bool:
+            """corpse_status_has(eid, name): True iff the corpse's frozen
+            snapshot carried status `name`. False on a missing corpse (no
+            raise) — the corpse analog of status_has."""
+            if not isinstance(name, str):
+                raise FormulaError("corpse_status_has(eid, name): name must be a string.")
+            sd = _corpse_status_dict(str(_eid(eid_t)))
+            return sd is not None and name in sd
+
+        def _corpse_status_get(eid_t: Any, name: Any, path: Any,
+                               default: Any = _corpse_no_default) -> Any:
+            """corpse_status_get(eid, name, path[, default]): read a dotted
+            field of a status the dead entity carried (the corpse analog of
+            status_get). Raises on a missing corpse / status / path UNLESS a
+            `default` is supplied (mirrors corpse_var)."""
+            if not isinstance(name, str):
+                raise FormulaError("corpse_status_get(eid, name, path): name must be a string.")
+            if not isinstance(path, str) or not path:
+                raise FormulaError("corpse_status_get(eid, name, path): path must be a non-empty string.")
+            eid = str(_eid(eid_t))
+            sd = _corpse_status_dict(eid)
+            data = sd.get(name) if isinstance(sd, dict) else None
+            if not isinstance(data, dict):
+                if default is _corpse_no_default:
+                    raise FormulaError(
+                        f"corpse_status_get: corpse '{eid}' has no status '{name}'.")
+                return default
+            cur: Any = data
+            for k in path.split("."):
+                if not isinstance(cur, dict) or k not in cur:
+                    if default is _corpse_no_default:
+                        raise FormulaError(
+                            f"corpse_status_get: '{eid}.{name}' has no value at '{path}'.")
+                    return default
+                cur = cur[k]
+            return cur
+
+        def _corpse_status_names(eid_t: Any) -> list:
+            """corpse_status_names(eid): the status names the dead entity
+            carried (loopable). Empty list on a missing corpse."""
+            sd = _corpse_status_dict(str(_eid(eid_t)))
+            return sorted(sd.keys()) if sd else []
+
+        ns["corpse_status_has"]   = _corpse_status_has
+        ns["corpse_status_get"]   = _corpse_status_get
+        ns["corpse_status_names"] = _corpse_status_names
 
         def _schedule(delay: Any, body: Any, name: Any = None) -> str:
             """schedule(delay, body, name=None): queue a MATCH-level

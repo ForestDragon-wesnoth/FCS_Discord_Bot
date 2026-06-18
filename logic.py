@@ -886,6 +886,23 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "blocked if its tile OR any covering zone blocks the mover."
         ),
     },
+    "corpse_block_condition": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "Default formula deciding whether a CORPSE blocks an entity from "
+            "entering its cell (corpses are passable by default — empty rule). "
+            "Bindings: tile_x / tile_y (the corpse cell), corpse_id (read the "
+            "dead entity's frozen vars via corpse_var(corpse_id, ...)), "
+            "corpse_team, and entity[self] = the moving entity. Truthy = "
+            "blocked — e.g. `corpse_var(corpse_id, 'footprint_w', 1) >= 2` so "
+            "only big corpses block, or `not entity[self].flying`. A cell is "
+            "blocked if ANY corpse covering it blocks the mover; a large "
+            "corpse blocks its whole footprint. Malformed = not blocking. "
+            "Honored by the same block_walk / block_tp / block_push / "
+            "block_swap movement-kind toggles as tile/zone blocking."
+        ),
+    },
     "anchored_zone_on_anchor_loss": {
         "default": "delete",
         "schema": {"type": "enum", "choices": ["delete", "freeze"]},
@@ -6930,6 +6947,26 @@ class Match:
                 zspec = self.rules.get("zone_block_condition", "")
             if self._eval_block_spec(zspec, mover_id, {"zone_name": name}):
                 return True
+        # Corpses can block, per corpse_block_condition (off by default).
+        # Gated on the rule being set so there's zero cost when corpses are
+        # passable (the default). A large corpse blocks its whole footprint.
+        cspec = self.rules.get("corpse_block_condition", "")
+        if cspec not in (None, ""):
+            team_var = str(self.rules.get("team_var", "team"))
+            for cx, cy, cid, corpse in self.all_corpses():
+                if (x, y) not in self.corpse_cells(cx, cy, corpse):
+                    continue
+                ct = ""
+                ent = corpse.get("entity") if isinstance(corpse, dict) else None
+                if isinstance(ent, dict):
+                    cv = ent.get("vars", {})
+                    if isinstance(cv, dict):
+                        ct = str(cv.get(team_var, "") or "")
+                if self._eval_block_spec(
+                        cspec, mover_id,
+                        {"tile_x": x, "tile_y": y,
+                         "corpse_id": cid, "corpse_team": ct}):
+                    return True
         return False
 
     def _check_block(self, mover_id: str, x: int, y: int, mode: str) -> bool:
