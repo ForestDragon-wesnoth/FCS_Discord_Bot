@@ -1409,6 +1409,10 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # status_apply(eid, name[, level, duration]) -> apply a status via its
     # definition + stack mode (the host-friendly "inflict burn" call).
     "status_apply",
+    # Status tags / resistance introspection + universal counters.
+    "status_tags", "status_has_tag", "statuses_with_tag",
+    "status_resist_of", "is_status_immune",
+    "status_counter_add", "status_counter_set",
     # Status-name introspection: status_names(eid) -> list of the active
     # status names on an entity (insertion order). The companion that
     # lets a formula iterate WHATEVER statuses exist instead of checking
@@ -1722,6 +1726,8 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     # Introspection / query helpers (PR: introspection primitives). All
     # return lists, so all are loopable.
     "status_names",
+    "status_tags",
+    "statuses_with_tag",
     "var_keys",
     "tile_keys",
     "entity_groups",
@@ -3605,6 +3611,116 @@ class FormulaEngine:
         ns["status_add"]      = _status_add
         ns["status_remove"]   = _status_remove
         ns["status_apply"]    = _status_apply
+
+        # ---- status tags / resistance introspection ----
+        def _status_tags(name: Any) -> list:
+            """status_tags(name): the tag list of a status DEFINITION
+            (loopable; [] if undefined or untagged)."""
+            if not isinstance(name, str):
+                raise FormulaError("status_tags(name): name must be a string.")
+            return list(match.status_def_tags(name))
+
+        def _status_has_tag(eid_t: Any, name: Any, tag: Any) -> bool:
+            """status_has_tag(eid, name, tag): True iff `eid` has status
+            `name` and its definition carries `tag`."""
+            eid = _eid(eid_t)
+            if not isinstance(name, str) or not isinstance(tag, str):
+                raise FormulaError("status_has_tag(eid, name, tag): name and tag must be strings.")
+            e = match.entities.get(eid)
+            if e is None:
+                raise FormulaError(f"unknown entity id '{eid}'.")
+            return name in e.status and tag in match.status_def_tags(name)
+
+        def _statuses_with_tag(eid_t: Any, tag: Any) -> list:
+            """statuses_with_tag(eid, tag): names of statuses on `eid` whose
+            definition carries `tag` (loopable, sorted) — e.g. loop it to
+            clear every 'debuff'-tagged status."""
+            eid = _eid(eid_t)
+            if not isinstance(tag, str):
+                raise FormulaError("statuses_with_tag(eid, tag): tag must be a string.")
+            e = match.entities.get(eid)
+            if e is None:
+                raise FormulaError(f"unknown entity id '{eid}'.")
+            return sorted(s for s in e.status if tag in match.status_def_tags(s))
+
+        def _status_resist_of(eid_t: Any, name: Any) -> int:
+            """status_resist_of(eid, name): the aggregated level-reduction
+            `eid` has against status `name` (0 if none / immune)."""
+            eid = _eid(eid_t)
+            if not isinstance(name, str):
+                raise FormulaError("status_resist_of(eid, name): name must be a string.")
+            if eid not in match.entities:
+                raise FormulaError(f"unknown entity id '{eid}'.")
+            return match.status_resistance(eid, name)[1]
+
+        def _is_status_immune(eid_t: Any, name: Any) -> bool:
+            """is_status_immune(eid, name): True iff `eid` is immune to
+            status `name` (an aggregated immune token matches)."""
+            eid = _eid(eid_t)
+            if not isinstance(name, str):
+                raise FormulaError("is_status_immune(eid, name): name must be a string.")
+            if eid not in match.entities:
+                raise FormulaError(f"unknown entity id '{eid}'.")
+            return match.status_resistance(eid, name)[0]
+
+        # ---- universal status counters (durations / charges) ----
+        # Add/subtract/set any numeric field on a live status instance,
+        # auto-removing the status when the counter reaches <=0. The same
+        # tool for time-based durations AND per-trigger charges (charges
+        # just aren't auto-decremented by the tick clock — the GM calls
+        # status_counter_add(-1) from whatever the trigger is).
+        def _status_counter(eid_t: Any, name: Any, field: str,
+                            amount: float, absolute: bool) -> Any:
+            eid = _eid(eid_t)
+            if not isinstance(name, str):
+                raise FormulaError("status counter: name must be a string.")
+            if not isinstance(field, str) or not field:
+                raise FormulaError("status counter: field must be a non-empty string.")
+            e = match.entities.get(eid)
+            if e is None:
+                raise FormulaError(f"unknown entity id '{eid}'.")
+            if name not in e.status:
+                raise FormulaError(f"entity '{eid}' has no status '{name}'.")
+            cur = e.status[name].get(field, 0)
+            try:
+                cur = float(cur)
+            except (TypeError, ValueError):
+                cur = 0.0
+            new = float(amount) if absolute else cur + float(amount)
+            if new == int(new):
+                new = int(new)
+            if new <= 0:
+                _status_remove(eid_t, name)
+                return new
+            _status_set(eid_t, name, field, new)
+            return new
+
+        def _status_counter_add(eid_t: Any, name: Any, delta: Any,
+                                field: Any = "duration") -> Any:
+            """status_counter_add(eid, name, delta[, field="duration"]):
+            add `delta` (negative to subtract) to a status's counter field;
+            removes the status if the result is <=0. Returns the new value.
+            The universal duration/charge adjuster."""
+            if isinstance(delta, bool) or not isinstance(delta, (int, float)):
+                raise FormulaError("status_counter_add(...): delta must be a number.")
+            return _status_counter(eid_t, name, field, delta, False)
+
+        def _status_counter_set(eid_t: Any, name: Any, value: Any,
+                                field: Any = "duration") -> Any:
+            """status_counter_set(eid, name, value[, field="duration"]):
+            set a status's counter field; removes the status if <=0.
+            Returns the new value."""
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise FormulaError("status_counter_set(...): value must be a number.")
+            return _status_counter(eid_t, name, field, value, True)
+
+        ns["status_tags"]         = _status_tags
+        ns["status_has_tag"]      = _status_has_tag
+        ns["statuses_with_tag"]   = _statuses_with_tag
+        ns["status_resist_of"]    = _status_resist_of
+        ns["is_status_immune"]    = _is_status_immune
+        ns["status_counter_add"]  = _status_counter_add
+        ns["status_counter_set"]  = _status_counter_set
 
         # ---- introspection / runtime-path / query primitives ----
         # The pattern: entity[X].path needs a STATIC path at AST time.
