@@ -11415,3 +11415,57 @@ random_seed=loot the drop is `gold` (stored in the chest's `contents` var).
 `roll_table('crit:1,hit:3,miss:2')` similarly resolves an attack outcome —
 here `hit`. Weights need not sum to anything in particular; a 0-weight entry
 is never chosen, and the match RNG makes seeded rolls reproducible.
+
+
+SCENARIO 447 — Corpse status introspection: read a dead entity's frozen statuses
+---------------------------------------------------------------------------------
+
+!match new cs CS 8 6
+!match use cs
+!ent add ghoul Ghoul 12 3 3 5
+!status apply ghoul poisoned 3 2
+!status apply ghoul cursed 1 5
+!ent kill ghoul
+!eval "corpse_status_has('ghoul', 'poisoned')"
+!eval "corpse_status_has('ghoul', 'burning')"
+!eval "corpse_status_get('ghoul', 'poisoned', 'level')"
+!eval "corpse_status_get('ghoul', 'poisoned', 'duration', -1)"
+!eval "corpse_status_names('ghoul')"
+
+Expected: killing the Ghoul (poisoned level 3 / cursed level 1) freezes its
+statuses into the corpse snapshot. corpse_status_has reads them back —
+poisoned True, burning False; corpse_status_get pulls a dotted field
+(poisoned.level = 3, poisoned.duration = 2 via the default arg), raising on a
+missing corpse/status/path unless a default is supplied (mirrors corpse_var);
+corpse_status_names lists ['cursed', 'poisoned']. The "did it die cursed?" /
+"raise it with the same affliction" pattern — the status analog of corpse_var.
+
+
+SCENARIO 448 — Corpse occupancy: a corpse blocks movement (conditional + footprint)
+-----------------------------------------------------------------------------------
+
+!match new co CO 10 6
+!match use co
+!defvar add flying 0
+!ent add ogre Ogre 30 5 3 5
+!ent set_var ogre footprint_w 2
+!ent kill ogre
+!ent add scout Scout 8 3 3 9
+!ent set_var scout flying 0
+!ent tp scout 5 3
+!list
+!system set default corpse_block_condition "not entity[self].flying"
+!ent tp scout 5 3
+!list
+!ent set_var scout flying 1
+!ent tp scout 6 3
+!list
+
+Expected: the Ogre (footprint_w 2) leaves a 2×1 corpse covering (5,3) and
+(6,3). With the default (empty) corpse_block_condition corpses are passable —
+the non-flying Scout teleports onto (5,3) fine. After setting
+corpse_block_condition to `not entity[self].flying`, a non-flyer is blocked
+from the corpse cell (Scout, moved back, stays put — the tp is rejected), but
+once flying it teleports onto a footprint cell (6,3) freely. A large corpse
+blocks its whole footprint, and blocking honors the same block_walk / block_tp
+movement toggles as tile/zone blocking.
