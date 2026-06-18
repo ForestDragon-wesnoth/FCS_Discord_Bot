@@ -11878,3 +11878,36 @@ cap, deck with sailor. Setting the boat's hp to 0 KILLS it (default death
 condition hp<=0); the default `mount_on_host_death` is `eject`, so both riders
 are dismounted to free cells near the boat's last position and survive. `!list`
 no longer shows the boat but shows sailor + cap as ordinary ground entities.
+
+
+SCENARIO 462 — Mounts: group move skips (or aborts on) carried riders
+---------------------------------------------------------------------
+
+!match new mnt5 MountGroup 14 10
+!match use mnt5
+!ent add car Car 30 3 3 0
+!ent set_var car footprint_w 2
+!ent set_var car slots.seat.capacity 2
+!ent add foot Foot 10 3 6 5
+!ent add pax Pax 10 5 1 5
+!mount pax car seat
+!ent group add squad foot pax
+!ent move group:squad 2 right
+!ent info foot
+!ent info pax
+!ent group add convoy car pax
+!ent move group:convoy 2 right
+!ent info car
+!ent info pax
+!system set default mount_group_move_mode abort
+!ent move group:squad 2 right
+!ent info foot
+
+Expected: `pax` rides the car (seat slot). With the default
+`mount_group_move_mode` = skip, `!ent move group:squad 2 right` moves only the
+free member foot (3,6)->(5,6); pax is SKIPPED — it stays aboard at the car's
+cell, not force-displaced. When the VEHICLE is itself in the group (`convoy` =
+car + pax), moving the group moves the car two east and pax is carried along (it
+ends on the car's cell), so the rider isn't double-moved. Switching the rule to
+`abort`, a group move that includes the riding pax is REFUSED with a ❌ naming
+pax, and foot does NOT move (all-or-nothing).

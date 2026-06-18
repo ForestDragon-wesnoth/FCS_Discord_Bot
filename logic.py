@@ -989,6 +989,20 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "{vehicle}, {vehicle_name}, {slot}. Empty = off."
         ),
     },
+    # What a GROUP move (!ent move group:NAME ...) does with a member that is
+    # RIDING a vehicle — its position is controlled by the vehicle, not the
+    # group. 'skip' (default) silently excludes such riders from the group
+    # move (they stay aboard; if their vehicle is itself in the group it
+    # carries them); 'abort' refuses the whole move, naming the riders.
+    "mount_group_move_mode": {
+        "default": "skip",
+        "schema": {"type": "enum", "choices": ["skip", "abort"]},
+        "desc": (
+            "Group-move handling of a mounted member: 'skip' (exclude the "
+            "rider from the move — it's carried by its vehicle) or 'abort' "
+            "(refuse the whole group move, naming the riders)."
+        ),
+    },
     # Which movement kinds honor tile/zone blocking. Each defaults True
     # (block everything); set a kind False to let it phase through walls
     # (e.g. block_tp=False lets teleports ignore blocking). The low-level
@@ -11412,6 +11426,27 @@ class Match:
         members = self.group_members(group_name)
         if not members:
             raise NotFound(f"Group '{group_name}' has no members to move.")
+        # Mounts: a member riding a vehicle has its position controlled by the
+        # vehicle, not the group, so it must not be force-moved here (the
+        # group path hand-rolls move_to and would otherwise desync the rider
+        # off its mount). Per mount_group_move_mode: 'abort' refuses the whole
+        # move; 'skip' (default) drops the riders (they stay aboard — and if
+        # their vehicle is itself a group member it carries them normally).
+        mounted = [eid for eid in members if self.entities[eid].is_mounted]
+        if mounted:
+            mode = str(self.rules.get("mount_group_move_mode", "skip"))
+            if mode == "abort":
+                raise VTTError(
+                    f"Group '{group_name}' move aborted: member(s) "
+                    f"{', '.join(repr(e) for e in mounted)} are riding a "
+                    f"vehicle (dismount first, or set "
+                    f"mount_group_move_mode=skip)."
+                )
+            skip = set(mounted)
+            members = [eid for eid in members if eid not in skip]
+            if not members:
+                total = sum(max(1, int(n)) for _, n in moves)
+                return 0, total, []
         allow_diag_move = bool(self.rules.get("allow_diagonal_movement", False))
         allow_diag_face = bool(self.rules.get("allow_diagonal_facing", False))
         member_set = set(members)
@@ -11453,7 +11488,8 @@ class Match:
             # transparent). We hand-roll the loop here because
             # Match.is_occupied only takes a single ignore_entity_id.
             for other_eid, other_e in self.entities.items():
-                if other_eid in member_set or other_e.is_glued_part:
+                if (other_eid in member_set or other_e.is_glued_part
+                        or other_e.is_mounted):
                     continue
                 if other_e.x == x and other_e.y == y and other_e.is_alive:
                     raise Occupied(
