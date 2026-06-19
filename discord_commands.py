@@ -1,7 +1,7 @@
 ## discord_commands.py (thin Discord adapter)
 
 # discord_commands.py
-from typing import Any, List
+from typing import Any, List, Dict, Optional, Tuple
 import discord
 from discord.ext import commands
 from logic import MatchManager
@@ -123,6 +123,9 @@ class DiscordCtxWrapper:
     # Discord renders ANSI colors inside ```ansi code blocks, so the
     # colorized map renderer is enabled for this surface.
     supports_color = True
+    # Discord messages are narrow, so the map viewport engages in 'auto'
+    # mode on large maps (pan with `!map pan` / the arrow buttons).
+    viewport_capable = True
 
     def __init__(self, ctx, mgr=None):
         self._ctx = ctx
@@ -146,6 +149,26 @@ class DiscordCtxWrapper:
         # Discord's content-length cap (see _split_for_discord).
         for chunk in _split_for_discord(message):
             await self._ctx.send(chunk)
+
+    async def set_autoupdate(self, m, on: bool) -> str:
+        """Turn this channel's self-refreshing map board on/off. Posts the
+        board message (with pan buttons when the viewport is engaged) and
+        registers it for post-command refresh; returns a status line. Called
+        by the `!map autoupdate` handler via getattr (Discord-only — other
+        surfaces lack this method and report the feature as unavailable)."""
+        if not on:
+            _boards.pop(self.channel_key, None)
+            return "🗺️ Auto-update board OFF for this channel."
+        text, engaged = _board_render(m, self.channel_key)
+        view = _PanView(self.channel_key, self._mgr) if engaged else None
+        try:
+            msg = await self._ctx.send(text, view=view) if view \
+                else await self._ctx.send(text)
+        except Exception:
+            msg = await self._ctx.send(text)
+        _boards[self.channel_key] = {"message": msg, "match_id": m.id}
+        return ("🗺️ Auto-update board ON — this message refreshes on every "
+                "change" + (" (use the arrows to pan)." if engaged else "."))
 
     async def send_approval(self, req: dict):
         """Post an approval request with clickable Approve/Deny buttons.
@@ -173,6 +196,7 @@ class _InteractionCtx:
     interaction's channel."""
     cli_mutable = False
     supports_color = True
+    viewport_capable = True
 
     def __init__(self, interaction):
         guild = getattr(interaction, "guild", None)
@@ -239,6 +263,10 @@ class _ApprovalView(discord.ui.View):
             f"✅ {ictx.user_name} approved `{cmd}` (by {req['user_name']})."
         )
         await registry.run(req["name"], req["args"], ictx, self._mgr)
+        if _boards:
+            mid = self._mgr.get_active_for_channel(ictx.channel_key)
+            if mid:
+                await _refresh_boards_for_match(self._mgr, mid)
         await self._disable(interaction)
 
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger)
@@ -272,6 +300,113 @@ class _ApprovalView(discord.ui.View):
         self.stop()
 
 #now supports-multiple commands in one message - one command per line
+# ----------------------------------------------------------------------
+# Auto-update boards (#24) + pan buttons (#110, Discord surface)
+# ----------------------------------------------------------------------
+# A "board" is a self-refreshing map message: one per channel, edited in
+# place after every state-changing command (and on a pan-button click)
+# instead of spamming a fresh map. Runtime only — the Discord Message
+# handles can't be serialized, so boards don't survive a restart (re-issue
+# `!map autoupdate on`). The render itself (POV + viewport + legend) is the
+# same surface-agnostic render_ascii the `!map` command uses; only the
+# message lifecycle lives here, which is why it can't be harness-tested.
+
+# channel_key -> {"message": discord.Message, "match_id": str}
+_boards: Dict[str, Dict[str, Any]] = {}
+
+
+def _board_render(m, channel_key: str) -> Tuple[str, bool]:
+    """(message text, viewport_engaged) for a channel's board: the same
+    POV + viewport + legend render as `!map`, with a windowed header."""
+    pov = m.channel_pov(channel_key)
+    mode = str(m.rules.get("viewport_mode", "auto"))
+    enabled = mode != "off"   # Discord is viewport_capable; auto => on
+    viewport = m.resolve_viewport(channel_key, enabled=enabled)
+    legend = bool(getattr(m, "map_legend_enabled", False))
+    colorize = bool(getattr(m, "color_enabled", True))
+    body = m.render_ascii(pov, colorize=colorize, viewport=viewport,
+                          legend=legend)
+    fence = "ansi" if colorize else ""
+    header = ""
+    if viewport:
+        vx, vy, vw, vh = viewport
+        header = (f"🗺️ viewport ({vx},{vy})–({vx + vw - 1},{vy + vh - 1}) "
+                  f"of {m.grid_width}×{m.grid_height}\n")
+    return f"{header}```{fence}\n{body}\n```", bool(viewport)
+
+
+def _pan_step(m, axis_dim: int) -> int:
+    """Tiles per arrow-button click: the viewport_button_step rule, or half
+    the window (0 = half-screen scroll) for that axis."""
+    step = int(m.rules.get("viewport_button_step", 0))
+    return step if step > 0 else max(1, axis_dim // 2)
+
+
+class _PanView(discord.ui.View):
+    """The 4 arrow buttons under an auto-update board. Each click pans that
+    channel's viewport by the button step and edits the board in place."""
+
+    def __init__(self, channel_key: str, mgr: MatchManager):
+        super().__init__(timeout=None)
+        self.channel_key = channel_key
+        self._mgr = mgr
+
+    async def _pan(self, interaction, dx: int, dy: int):
+        mid = self._mgr.get_active_for_channel(self.channel_key)
+        m = self._mgr.get(mid) if mid else None
+        if m is None or not m.viewport_engaged():
+            try:
+                await interaction.response.defer()
+            except Exception:
+                pass
+            return
+        vw, vh = m._viewport_dims()
+        m.pan_view(self.channel_key,
+                   dx * _pan_step(m, vw), dy * _pan_step(m, vh))
+        text, _ = _board_render(m, self.channel_key)
+        entry = _boards.get(self.channel_key)
+        if entry is not None:
+            entry["message"] = interaction.message
+        try:
+            await interaction.response.edit_message(content=text, view=self)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="⬆", style=discord.ButtonStyle.secondary)
+    async def up(self, interaction, button):
+        await self._pan(interaction, 0, -1)
+
+    @discord.ui.button(label="⬇", style=discord.ButtonStyle.secondary)
+    async def down(self, interaction, button):
+        await self._pan(interaction, 0, 1)
+
+    @discord.ui.button(label="⬅", style=discord.ButtonStyle.secondary)
+    async def left(self, interaction, button):
+        await self._pan(interaction, -1, 0)
+
+    @discord.ui.button(label="➡", style=discord.ButtonStyle.secondary)
+    async def right(self, interaction, button):
+        await self._pan(interaction, 1, 0)
+
+
+async def _refresh_boards_for_match(mgr: MatchManager, match_id: str) -> None:
+    """Edit every board bound to `match_id` in place (after a state change).
+    Best-effort: a failed edit (deleted message, perms) drops that board."""
+    for ck, entry in list(_boards.items()):
+        if entry.get("match_id") != match_id:
+            continue
+        m = mgr.get(match_id)
+        if m is None:
+            _boards.pop(ck, None)
+            continue
+        text, engaged = _board_render(m, ck)
+        view = _PanView(ck, mgr) if engaged else None
+        try:
+            await entry["message"].edit(content=text, view=view)
+        except Exception:
+            _boards.pop(ck, None)
+
+
 def wire_commands(bot: commands.Bot, mgr: MatchManager):
     async def _dispatch(ctx, bound_root: str):
         content = ctx.message.content or ""
@@ -295,6 +430,12 @@ def wire_commands(bot: commands.Bot, mgr: MatchManager):
             _dbg(ctx, batch_done=True, executed=executed, total=len(lines))
             # Optional: summarize; individual commands will have already sent their outputs
             await _dbg_chat(ctx, f"batch executed {executed}/{len(lines)} lines")
+            if _boards:
+                gid = getattr(ctx.guild, "id", "DM")
+                ck = f"{gid}:{ctx.channel.id}"
+                mid = mgr.get_active_for_channel(ck)
+                if mid:
+                    await _refresh_boards_for_match(mgr, mid)
             return
         # --- END BATCH MODE ---
     
@@ -330,7 +471,15 @@ def wire_commands(bot: commands.Bot, mgr: MatchManager):
     
         _dbg(ctx, final_args=args)
         await _dbg_chat(ctx, f"root={bound_root} args={args}")
-        await registry.run(bound_root, args, DiscordCtxWrapper(ctx, mgr), mgr)
+        wrapper = DiscordCtxWrapper(ctx, mgr)
+        await registry.run(bound_root, args, wrapper, mgr)
+        # Auto-update boards (#24): after any command settles, re-render the
+        # boards bound to this channel's active match (so a move/spawn/death
+        # in one channel updates every channel watching the same match).
+        if _boards:
+            mid = mgr.get_active_for_channel(wrapper.channel_key)
+            if mid:
+                await _refresh_boards_for_match(mgr, mid)
 
     # Make sure discord.py’s default help is gone (your registry defines its own help)
     if bot.get_command("help"):

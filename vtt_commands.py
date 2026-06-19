@@ -8,7 +8,7 @@ from match_history import MatchHistory, Snapshot, HistoryError
 #used for Gamesystem-related commands
 from logic import (
     DEFAULT_SYSTEM_SETTINGS, ALLOWED_DIRECTIONS, RULE_SCHEMA, RULES_REGISTRY,
-    CARDINAL_DIRECTIONS, DIAGONAL_DIRECTIONS,
+    CARDINAL_DIRECTIONS, DIAGONAL_DIRECTIONS, DIRECTION_VECTORS,
     normalize_direction, rotate_direction,
     EVENT_LOG_DEFAULT_FORMATS,
 )
@@ -36,6 +36,11 @@ class ReplyContext(Protocol):
     # (everyone is treated as privileged). See ctx_user / ctx_user_name.
     user_id: str
     user_name: str
+    # Surface capability: whether this surface wants the map VIEWPORT in
+    # 'auto' mode (narrow surfaces like Discord set True; the CLI / harness,
+    # which fit wide output, leave it False). Optional — absent reads as
+    # False (no viewport unless the viewport_mode rule forces it on).
+    viewport_capable: bool
     async def send(self, message: str) -> None: ...
 
 
@@ -86,9 +91,11 @@ READ_ONLY_BARE_ROOTS: frozenset = frozenset({
 ELEVATED_ARGS: Dict[str, frozenset] = {
     "state": frozenset({"full"}),
     # `map` renders for anyone from the channel POV, but `full` (omniscient),
-    # `resize` (a grid mutation), and the `color`/`teamcolor` settings all
-    # elevate to host-gated.
-    "map": frozenset({"full", "resize", "color", "teamcolor", "layer"}),
+    # `resize` (a grid mutation), and the `color`/`teamcolor`/`legend`
+    # settings all elevate to host-gated. (pan/center/view are per-CHANNEL
+    # camera state — harmless, so they stay player-available.)
+    "map": frozenset({"full", "resize", "color", "teamcolor", "layer",
+                      "legend", "autoupdate"}),
     "list": frozenset({"full"}),
 }
 
@@ -3312,16 +3319,62 @@ def _view_pov(ctx: ReplyContext, m: "Match", args: List[str]) -> Optional[str]:
 _MAP_LAYERS = ("zones", "tiles", "entities", "fog")
 
 
-def _map_block(ctx: ReplyContext, m, pov, hidden=None) -> str:
+def _map_block(ctx: ReplyContext, m, pov, hidden=None, *,
+               viewport=None, legend=False) -> str:
     """The fenced ASCII map. Colorizes only when the surface declares
     `supports_color` AND the match has color enabled; uses an ```ansi
     fence so Discord renders the ANSI codes (a no-op label on a terminal /
     the harness, which get plain glyphs anyway). `hidden` (None = use the
-    match's persistent hidden_layers) suppresses render layers."""
+    match's persistent hidden_layers) suppresses render layers. `viewport`
+    (vx,vy,vw,vh) clips to a window; `legend` appends a glyph key."""
     colorize = bool(getattr(ctx, "supports_color", False)) and getattr(m, "color_enabled", True)
-    body = m.render_ascii(pov, colorize=colorize, hidden_layers=hidden)
+    body = m.render_ascii(pov, colorize=colorize, hidden_layers=hidden,
+                          viewport=viewport, legend=legend)
     fence = "ansi" if colorize else ""
     return f"```{fence}\n{body}\n```"
+
+
+def _viewport_enabled(ctx: ReplyContext, m) -> bool:
+    """Whether the map viewport applies on this surface: the viewport_mode
+    rule ('on'/'off' force it; 'auto' defers to the surface's
+    `viewport_capable` flag — Discord True, CLI/harness False)."""
+    mode = str(m.rules.get("viewport_mode", "auto"))
+    if mode == "on":
+        return True
+    if mode == "off":
+        return False
+    return bool(getattr(ctx, "viewport_capable", False))
+
+
+def _legend_flag(m, args: List[str]) -> bool:
+    """Resolve whether to render the auto-legend: a one-off `legend=on|off`
+    arg wins, else the per-match toggle (Match.map_legend_enabled)."""
+    for a in args:
+        low = a.lower()
+        if low == "legend=on":
+            return True
+        if low == "legend=off":
+            return False
+    return bool(getattr(m, "map_legend_enabled", False))
+
+
+def _map_render_reply(ctx: ReplyContext, m, args: List[str],
+                      extra_hidden=None) -> str:
+    """Build the standard map reply: POV + viewport + legend resolution, a
+    windowed header + pan hint when the viewport is engaged."""
+    pov = _view_pov(ctx, m, args)
+    hidden = (m.hidden_layers | extra_hidden) if extra_hidden else None
+    viewport = m.resolve_viewport(
+        ctx.channel_key, enabled=_viewport_enabled(ctx, m))
+    legend = _legend_flag(m, args)
+    block = _map_block(ctx, m, pov, hidden, viewport=viewport, legend=legend)
+    if viewport:
+        vx, vy, vw, vh = viewport
+        header = (f"🗺️ viewport ({vx},{vy})–({vx + vw - 1},{vy + vh - 1}) "
+                  f"of {m.grid_width}×{m.grid_height} · "
+                  f"`!map pan <dir> [n]` / `!map center <eid>`\n")
+        block = header + block
+    return block
 
 
 def _color_guide() -> str:
@@ -3339,7 +3392,7 @@ def _color_guide() -> str:
     )
 
 
-@registry.command("map", access="all", usage="!map [full] | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. `!map full` (host-gated) forces the omniscient view. `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` toggles colorized rendering for this match; `!map teamcolor <team> <color>` sets a team's text color (also: clear / list); `!map colors` lists the supported color names. Colors apply on color-capable surfaces (Discord/terminal); an entity's own `color` var overrides its team color.")
+@registry.command("map", access="all", usage="!map [full] | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 30), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map full` (host-gated) forces the omniscient view. `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors.")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     if args and args[0].lower() == "colors":
@@ -3429,6 +3482,77 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(
             f"Layer `{name}` {'hidden' if name in m.hidden_layers else 'shown'} "
             f"on **{m.name}**'s map.")
+    # ---- viewport / camera (panning) ----
+    if args and args[0].lower() == "autoupdate":
+        # Self-refreshing board: Discord-only (the surface owns the
+        # message lifecycle). Other surfaces lack set_autoupdate.
+        on = not (len(args) >= 2 and args[1].lower() == "off")
+        hook = getattr(ctx, "set_autoupdate", None)
+        if hook is None:
+            return await ctx.send(
+                "Auto-update boards are a Discord-only feature — on the CLI "
+                "the whole map already prints each time.")
+        return await ctx.send(await hook(m, on))
+    if args and args[0].lower() == "legend":
+        if len(args) < 2 or args[1].lower() not in ("on", "off"):
+            state = "ON" if m.map_legend_enabled else "OFF"
+            return await ctx.send(
+                f"Auto-legend is {state} for **{m.name}**. "
+                f"Usage: `!map legend on|off` (or one-off `!map legend=on`).")
+        m.map_legend_enabled = (args[1].lower() == "on")
+        return await ctx.send(
+            f"Auto-legend {'ON' if m.map_legend_enabled else 'OFF'} for "
+            f"**{m.name}**.")
+    if args and args[0].lower() == "pan":
+        if not m.viewport_engaged():
+            return await ctx.send(
+                f"Map ({m.grid_width}×{m.grid_height}) fits the viewport "
+                f"({m.rules.get('viewport_width')}×"
+                f"{m.rules.get('viewport_height')}); nothing to pan.")
+        if len(args) < 2:
+            return await ctx.send("Usage: `!map pan <up|down|left|right> [n]`.")
+        canon = normalize_direction(args[1])
+        if canon is None or canon not in DIRECTION_VECTORS:
+            return await ctx.send(f"❌ `{args[1]}` is not a direction.")
+        try:
+            n = int(args[2]) if len(args) >= 3 else 1
+        except ValueError:
+            return await ctx.send("❌ step count must be an integer.")
+        dx, dy = DIRECTION_VECTORS[canon]
+        m.pan_view(ctx.channel_key, dx * n, dy * n)
+        return await ctx.send(_map_render_reply(ctx, m, []))
+    if args and args[0].lower() == "center":
+        if not m.viewport_engaged():
+            return await ctx.send(
+                f"Map ({m.grid_width}×{m.grid_height}) fits the viewport; "
+                f"nothing to center.")
+        if len(args) == 2:
+            eid = _resolve_eid(m, args[1])
+            if eid not in m.entities:
+                return await ctx.send(f"❌ no entity `{args[1]}`.")
+            e = m.entities[eid]
+            m.center_view(ctx.channel_key, e.x, e.y)
+        elif len(args) >= 3:
+            try:
+                cx, cy = int(args[1]), int(args[2])
+            except ValueError:
+                return await ctx.send("Usage: `!map center <eid>` or `!map center <x> <y>`.")
+            m.center_view(ctx.channel_key, cx, cy)
+        else:
+            return await ctx.send("Usage: `!map center <eid>` or `!map center <x> <y>`.")
+        return await ctx.send(_map_render_reply(ctx, m, []))
+    if args and args[0].lower() == "view":
+        if len(args) >= 2 and args[1].lower() in ("reset", "clear"):
+            m.clear_view(ctx.channel_key)
+            return await ctx.send(_map_render_reply(ctx, m, []))
+        if len(args) >= 3:
+            try:
+                vx, vy = int(args[1]), int(args[2])
+            except ValueError:
+                return await ctx.send("Usage: `!map view <x> <y>` | `!map view reset`.")
+            m.set_view(ctx.channel_key, vx, vy)
+            return await ctx.send(_map_render_reply(ctx, m, []))
+        return await ctx.send("Usage: `!map view <x> <y>` (top-left) | `!map view reset`.")
     # One-off `hide=zones,fog` arg: suppress extra layers for this render
     # only (union with the persistent hidden set), without mutating state.
     # `full` is honored only as args[0] (the host-gated position) via
@@ -3438,9 +3562,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         low = a.lower()
         if low.startswith("hide="):
             extra_hidden |= {p.strip() for p in low[5:].split(",") if p.strip()}
-    pov = _view_pov(ctx, m, args)
-    hidden = m.hidden_layers | extra_hidden if extra_hidden else None
-    return await ctx.send(_map_block(ctx, m, pov, hidden))
+    return await ctx.send(_map_render_reply(ctx, m, args, extra_hidden))
 
 @registry.command("list", access="all", usage="!list [full]", desc="List entities (turn order) from this channel's POV, plus a Dead: section of corpses when show_corpses_in_entity_list is enabled. `!list full` (host-gated) ignores visibility.")
 async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):

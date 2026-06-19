@@ -11911,3 +11911,61 @@ car + pax), moving the group moves the car two east and pax is carried along (it
 ends on the car's cell), so the rider isn't double-moved. Switching the rule to
 `abort`, a group move that includes the riding pax is REFUSED with a ❌ naming
 pax, and foot does NOT move (all-or-nothing).
+
+
+SCENARIO 463 — Map viewport: windowing, panning, and centering a large map
+--------------------------------------------------------------------------
+
+!match new vp Viewport 50 8
+!match use vp
+!system set default viewport_mode on
+!system set default viewport_width 20
+!system set default viewport_height 20
+!ent add scout Scout 10 2 2 5
+!ent set_var scout glyph s
+!ent add boss Boss 30 45 4 9
+!ent set_var boss glyph B
+!map
+!map center boss
+!map pan left 5
+!map view reset
+!map view 30 1
+
+Expected: the match is 50 wide × 8 tall; with viewport_mode forced on and the
+cap set to 20×20, a viewport engages on width (50 > 20) but not height (8 ≤ 20),
+so each render is a 20-wide × 8-tall window. The bare `!map` shows the top-left
+window (cols 1-20): the scout `s` at (2,2) appears, the boss `B` at (45,4) does
+not. `!map center boss` recenters the window around x=45 (clamped to the right
+edge, cols 31-50) so `B` shows and `s` doesn't. `!map pan left 5` shifts the
+window 5 columns west. `!map view reset` snaps back to the top-left (scout
+visible again); `!map view 30 1` jumps the top-left anchor to column 30. Each
+reply carries a "viewport (...)" header naming the visible window.
+
+
+SCENARIO 464 — Map auto-legend: glyph→meaning key honors the current window
+---------------------------------------------------------------------------
+
+!match new lg Legend 40 6
+!match use lg
+!system set default viewport_mode on
+!system set default viewport_width 12
+!ent add gob Goblin 10 3 3 5
+!ent set_var gob glyph g
+!ent add orc Orc 12 5 2 5
+!ent set_var orc glyph g
+!ent add drag Dragon 80 38 4 9
+!ent set_var drag glyph D
+!zone create water 1 4 2 4
+!zone glyph water ~
+!map legend on
+!map
+!map center drag
+
+Expected: legend lists only what's actually on screen, grouped by glyph. The
+default window (cols 1-12) shows the two `g` entities (Goblin at (3,3), Orc at
+(5,2)) and the `~` water zone, so the legend reads `g — Orc, Goblin` (row-major
+scan order: Orc on row 2 precedes Goblin on row 3) and `~ — zone: water`; the
+Dragon `D` (at x=38, off-window) is NOT listed. After
+`!map center drag` the window moves to the right edge — now `D — Dragon` appears
+in the legend and the goblins/zone drop out (they're no longer visible). The
+auto-legend reflects the current viewport, not the whole map.
