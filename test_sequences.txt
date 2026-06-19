@@ -11724,3 +11724,190 @@ when used. After clearing, a per-entity on_death PASSIVE on the boss declares
 victory the moment the boss dies (setting its hp to 0 runs the death pipeline,
 which fires on_death → declare_winner). Same primitive, two more trigger
 sources (action body, death hook) — alongside the watcher and tile-hook paths.
+
+SCENARIO 458 — Mounts: slots, capacity budget + cost + condition, carry & driving
+---------------------------------------------------------------------------------
+
+!match new mnt Mounts 12 8
+!match use mnt
+!ent add car Car 30 3 3 0
+!ent set_var car footprint_w 2
+!ent set_var car slots.driver.capacity 1
+!ent set_var car slots.driver.controls_movement true
+!ent set_var car slots.driver.region front
+!ent set_var car slots.seats.capacity 3
+!ent set_var car slots.seats.cost "entity[self].size"
+!ent set_var car slots.seats.condition "entity[self].size <= 2"
+!ent add drv Driver 10 1 1 5
+!ent set_var drv size 1
+!ent add p1 Pass1 10 2 1 5
+!ent set_var p1 size 2
+!ent add p2 Pass2 10 5 1 5
+!ent set_var p2 size 2
+!ent add ogre Ogre 10 6 1 5
+!ent set_var ogre size 5
+!mount drv car driver
+!mount p1 car seats
+!mount p2 car seats
+!mount ogre car seats
+!mount list car
+!ent move drv 2 right
+!ent info car
+!ent info drv
+!ent info p1
+!ent move p1 1 right
+!mount dismount p1 1 5
+!ent info p1
+
+Expected: `car` is a 2-wide vehicle with a `driver` slot (capacity 1, drives,
+shown at the front) and a `seats` slot (capacity 3, each rider costs its `size`,
+riders must be size<=2). drv mounts driver; p1 (size 2) mounts seats (used 2/3);
+p2 (size 2) is REFUSED — 2+2 > 3 capacity. ogre (size 5) is REFUSED by the
+condition (size<=2). `!mount list car` shows driver 1/1 with drv, seats 2/3 with
+p1. `!ent move drv 2 right` REDIRECTS to the car (drv is in a control slot): the car
+moves from (3,3) to (5,3), and drv + p1 are carried (drv at the car's front cell,
+p1 hidden at the anchor). `!ent move p1 1 right` is REFUSED with a ❌ — p1 is a plain
+passenger and can't move on its own. Dismounting p1 to (1,5) puts it back on the
+ground there.
+
+
+SCENARIO 459 — Mounts: slot actions, allowed_slots, and rider-vs-vehicle actor
+------------------------------------------------------------------------------
+
+!match new mnt2 MountActions 12 8
+!match use mnt2
+!ent add tank Tank 40 3 3 0
+!ent set_var tank footprint_w 2
+!ent set_var tank ammo 3
+!ent set_var tank honks 0
+!ent set_var tank slots.gunner.capacity 1
+!ent set_var tank slots.gunner.region back
+!ent set_var tank slots.gunner.actions.shoot.target entity
+!ent set_var tank slots.gunner.actions.shoot.body "entity[vehicle].ammo = entity[vehicle].ammo - 1\nentity[target].hp = entity[target].hp - 7"
+!ent set_var tank actions.horn.target none
+!ent set_var tank actions.horn.allowed_slots gunner,driver
+!ent set_var tank actions.horn.body "entity[vehicle].honks = entity[vehicle].honks + 1"
+!ent add gun Gunner 10 6 1 5
+!ent add foe Foe 25 5 3 5
+!mount gun tank gunner
+!action list gun
+!action gun shoot foe
+!ent info foe
+!ent info tank
+!action gun horn
+!ent dump tank
+!ent set_var tank mount_action_actor vehicle
+!action gun horn
+!ent dump tank
+
+Expected: the gunner slot carries a `shoot` action and the tank carries a
+vehicle-wide `horn` action shared with the gunner/driver slots via
+`allowed_slots`. After gun mounts the gunner slot, `!action list gun` shows
+shoot + horn under a "Via vehicle `tank`" section. `!action gun shoot foe`
+runs the slot action: foe drops to 18 and the tank's ammo goes 3->2 (the body
+reads the `vehicle` binding). `!action gun horn` fires the shared vehicle
+action; honks becomes 1. The default actor is the RIDER. Setting the tank's
+`mount_action_actor` var to `vehicle` makes the next `horn` run as the vehicle
+(honks -> 2 either way; both bindings are always available, this only changes
+which one is `source`).
+
+
+SCENARIO 460 — Mounts: visible vs hidden riders, render and ground occupancy
+----------------------------------------------------------------------------
+
+!match new mnt3 MountRender 8 6
+!match use mnt3
+!ent add bus Bus 30 2 2 0
+!ent set_var bus footprint_w 2
+!ent set_var bus glyph B
+!ent set_var bus slots.roof.capacity 2
+!ent set_var bus slots.roof.region front
+!ent set_var bus slots.hold.capacity 4
+!ent add rg Rooftop 10 5 1 5
+!ent set_var rg glyph R
+!ent add cg Cargo 10 6 1 5
+!mount rg bus roof
+!mount cg bus hold
+!list
+!map
+!mount dismount cg 6 5
+!ent add box Box 10 6 5 5
+!mount cg bus hold
+!ent add box2 Box2 10 6 5 5
+!ent info box2
+
+Expected: `bus` is a 2-wide vehicle. rg mounts the visible `roof` slot (it shows
+on the map at the bus's front cell, glyph R drawn over the bus's B); cg mounts
+the hidden `hold` slot (tucked inside — no map glyph). `!list` shows all three
+entities, the two riders with a "riding bus" suffix. `!map` shows B (and R over
+the front cell), but NOT cg (it's inside the hold). Dismounting cg to (6,5) puts
+it on the ground there, so adding `Box` at (6,5) is REFUSED (cell occupied).
+Re-mounting cg takes it OFF the ground — so a second add at (6,5) now SUCCEEDS.
+Occupancy toggles exactly with mount state: a rider blocks the ground only while
+dismounted.
+ground, so the cells the bus covers are blocked only by the bus itself, and the
+riders never add extra blocking. (walker stops adjacent to the bus's footprint.)
+
+
+SCENARIO 461 — Mounts: switching slots and host-death ejection
+--------------------------------------------------------------
+
+!match new mnt4 MountDeath 10 8
+!match use mnt4
+!ent add boat Boat 20 3 3 0
+!ent set_var boat footprint_w 2
+!ent set_var boat slots.helm.capacity 1
+!ent set_var boat slots.helm.controls_movement true
+!ent set_var boat slots.deck.capacity 3
+!ent add sailor Sailor 10 1 1 5
+!ent add cap Captain 10 8 1 5
+!mount sailor boat deck
+!mount cap boat helm
+!mount switch sailor helm
+!mount switch sailor deck
+!mount list boat
+!ent set_var boat hp 0
+!list
+!ent info sailor
+!ent info cap
+
+Expected: sailor boards the deck, cap takes the helm. `!mount switch sailor helm`
+is REFUSED (helm is capacity 1, cap is in it) — sailor stays on deck. Switching
+sailor to deck (already there) is a no-op ❌. `!mount list boat` shows helm with
+cap, deck with sailor. Setting the boat's hp to 0 KILLS it (default death
+condition hp<=0); the default `mount_on_host_death` is `eject`, so both riders
+are dismounted to free cells near the boat's last position and survive. `!list`
+no longer shows the boat but shows sailor + cap as ordinary ground entities.
+
+
+SCENARIO 462 — Mounts: group move skips (or aborts on) carried riders
+---------------------------------------------------------------------
+
+!match new mnt5 MountGroup 14 10
+!match use mnt5
+!ent add car Car 30 3 3 0
+!ent set_var car footprint_w 2
+!ent set_var car slots.seat.capacity 2
+!ent add foot Foot 10 3 6 5
+!ent add pax Pax 10 5 1 5
+!mount pax car seat
+!ent group add squad foot pax
+!ent move group:squad 2 right
+!ent info foot
+!ent info pax
+!ent group add convoy car pax
+!ent move group:convoy 2 right
+!ent info car
+!ent info pax
+!system set default mount_group_move_mode abort
+!ent move group:squad 2 right
+!ent info foot
+
+Expected: `pax` rides the car (seat slot). With the default
+`mount_group_move_mode` = skip, `!ent move group:squad 2 right` moves only the
+free member foot (3,6)->(5,6); pax is SKIPPED — it stays aboard at the car's
+cell, not force-displaced. When the VEHICLE is itself in the group (`convoy` =
+car + pax), moving the group moves the car two east and pax is carried along (it
+ends on the car's cell), so the rider isn't double-moved. Switching the rule to
+`abort`, a group move that includes the riding pax is REFUSED with a ❌ naming
+pax, and foot does NOT move (all-or-nothing).

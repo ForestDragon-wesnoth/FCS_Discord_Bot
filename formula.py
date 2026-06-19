@@ -1550,6 +1550,15 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   zone_unanchor(name)   -> bool (was it anchored)
     #   zone_anchor_of(name)  -> the anchor eid, or '' if not an aura
     "zone_anchor", "zone_unanchor", "zone_anchor_of",
+    # Mounts / vehicles. Mutating: mount(rider, vehicle, slot),
+    # dismount(rider [,x,y]), switch_slot(rider, slot). Read:
+    # is_mounted(eid), mount_of(eid)->'' , slot_of(eid)->'',
+    # is_vehicle(eid), riders(vehicle) (loopable), slot_riders(vehicle,
+    # slot) (loopable), slot_capacity(vehicle, slot), slot_free(vehicle,
+    # slot) (remaining budget), can_mount(rider, vehicle, slot)->bool.
+    "mount", "dismount", "switch_slot",
+    "is_mounted", "mount_of", "slot_of", "is_vehicle",
+    "riders", "slot_riders", "slot_capacity", "slot_free", "can_mount",
     # Read a game-system rule value from inside a formula. rule_get(name)
     # -> the rule's effective value, or None if unknown.
     "rule_get",
@@ -1736,6 +1745,8 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "entity_groups",
     "all_entities",
     "parts",
+    "riders",
+    "slot_riders",
     "entities_with_status",
     "entities_with_var",
     "entities_in_area",
@@ -1870,6 +1881,15 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     # emitted event's name; None elsewhere. The event's payload is read with
     # the event_get / event_has functions (not a binding).
     "event_name",
+    # Mounts / vehicles. `vehicle` and `rider` are entity ids (usable in
+    # entity[vehicle] / entity[rider]); `slot` is the slot name string.
+    # Bound during slot cost/condition evaluation (Match.can_mount etc.) —
+    # `self` is the rider, `vehicle` the host — and during a rider-triggered
+    # vehicle/slot action body (both ids bound so the action can affect
+    # either party regardless of the mount_action_actor setting). The
+    # on_mounted / on_dismounted hooks bind `vehicle` + `slot`. None
+    # elsewhere.
+    "vehicle", "rider", "slot",
 )
 
 # Entity-id sentinel identifiers. Inside `entity[X]` these get
@@ -3260,7 +3280,10 @@ class FormulaEngine:
                     continue
                 # Attached body parts aren't independent map targets — a
                 # distance/AoE query resolves to the parent, not its parts.
-                if oe.is_glued_part:
+                # A HIDDEN rider (inside a vehicle) is likewise off the board
+                # for spatial queries; a visible rider (in a region slot) is
+                # on its cell and stays targetable.
+                if oe.is_glued_part or oe.is_hidden_rider:
                     continue
                 if not _relation_ok(relation, ref_eid, oid):
                     continue
@@ -4871,6 +4894,95 @@ class FormulaEngine:
         ns["zone_anchor"]       = _zone_anchor
         ns["zone_unanchor"]     = _zone_unanchor
         ns["zone_anchor_of"]    = _zone_anchor_of
+
+        # ---- mounts / vehicles ----
+        def _mount(rider: Any, vehicle: Any, slot: Any) -> bool:
+            """mount(rider, vehicle, slot): board `rider` into the vehicle's
+            slot (validated — capacity, condition, no cycle). Raises on
+            failure. Returns True."""
+            try:
+                match.mount_entity(_eid(rider), _eid(vehicle), str(slot))
+            except (VTTError, NotFound) as ex:
+                raise FormulaError(str(ex))
+            return True
+
+        def _dismount(rider: Any, x: Any = None, y: Any = None) -> bool:
+            """dismount(rider [,x,y]): disembark a rider to (x,y) or the
+            nearest free cell. Raises if not mounted / no room. True."""
+            try:
+                xi = int(x) if x is not None else None
+                yi = int(y) if y is not None else None
+                match.dismount_entity(_eid(rider), xi, yi)
+            except (VTTError, NotFound) as ex:
+                raise FormulaError(str(ex))
+            return True
+
+        def _switch_slot(rider: Any, slot: Any) -> bool:
+            """switch_slot(rider, slot): move a mounted rider to another slot
+            of the same vehicle (validated). Raises on failure. True."""
+            try:
+                match.switch_slot(_eid(rider), str(slot))
+            except (VTTError, NotFound) as ex:
+                raise FormulaError(str(ex))
+            return True
+
+        def _is_mounted(eid: Any) -> bool:
+            """is_mounted(eid): True iff the entity is riding a vehicle."""
+            e = match.entities.get(_eid(eid))
+            return bool(e is not None and e.is_mounted)
+
+        def _mount_of(eid: Any) -> str:
+            """mount_of(eid): the vehicle id the entity is riding, or ''."""
+            e = match.entities.get(_eid(eid))
+            return e.mounted_on if (e is not None and e.is_mounted) else ""
+
+        def _slot_of(eid: Any) -> str:
+            """slot_of(eid): the slot name the entity occupies, or ''."""
+            e = match.entities.get(_eid(eid))
+            return (e.mount_slot or "") if (e is not None and e.is_mounted) else ""
+
+        def _is_vehicle(eid: Any) -> bool:
+            """is_vehicle(eid): True iff the entity defines any slots."""
+            return match.is_vehicle(_eid(eid))
+
+        def _riders(vehicle: Any) -> list:
+            """riders(vehicle): ids of every entity riding the vehicle
+            (any slot), in entity order. Loopable."""
+            return [e.id for e in match.vehicle_riders(_eid(vehicle))]
+
+        def _slot_riders(vehicle: Any, slot: Any) -> list:
+            """slot_riders(vehicle, slot): ids of the riders in one slot.
+            Loopable."""
+            return [e.id for e in match.slot_occupants(_eid(vehicle), str(slot))]
+
+        def _slot_capacity(vehicle: Any, slot: Any) -> float:
+            """slot_capacity(vehicle, slot): the slot's numeric budget."""
+            return match.slot_capacity(_eid(vehicle), str(slot))
+
+        def _slot_free(vehicle: Any, slot: Any) -> float:
+            """slot_free(vehicle, slot): remaining budget (capacity minus
+            what current occupants consume)."""
+            vid, s = _eid(vehicle), str(slot)
+            return match.slot_capacity(vid, s) - match.slot_used_capacity(vid, s)
+
+        def _can_mount(rider: Any, vehicle: Any, slot: Any) -> bool:
+            """can_mount(rider, vehicle, slot): whether the mount would
+            succeed (capacity + condition + no cycle), without doing it."""
+            ok, _ = match.can_mount(_eid(rider), _eid(vehicle), str(slot))
+            return bool(ok)
+
+        ns["mount"]          = _mount
+        ns["dismount"]       = _dismount
+        ns["switch_slot"]    = _switch_slot
+        ns["is_mounted"]     = _is_mounted
+        ns["mount_of"]       = _mount_of
+        ns["slot_of"]        = _slot_of
+        ns["is_vehicle"]     = _is_vehicle
+        ns["riders"]         = _riders
+        ns["slot_riders"]    = _slot_riders
+        ns["slot_capacity"]  = _slot_capacity
+        ns["slot_free"]      = _slot_free
+        ns["can_mount"]      = _can_mount
         ns["zone_exists"]       = _zone_exists
         ns["zones_at"]          = _zones_at
         ns["cell_in_zone"]      = _cell_in_zone
@@ -4929,7 +5041,8 @@ class FormulaEngine:
             are excluded (they're not field units — reach them with
             parts(parent) / part(parent, name))."""
             return [eid for eid, e in match.entities.items()
-                    if e.is_alive and not e.is_glued_part]
+                    if e.is_alive and not e.is_glued_part
+                    and not e.is_hidden_rider]
         ns["all_entities"] = _all_entities
 
         def _parts(eid_token: Any) -> list:
@@ -5295,7 +5408,7 @@ class FormulaEngine:
             # let it raise if the args are bad.
             scored = []
             for eid, e in match.entities.items():
-                if not e.is_alive or e.is_glued_part:
+                if not e.is_alive or e.is_glued_part or e.is_hidden_rider:
                     continue
                 d = _distance(x, y, e.x, e.y, mode)
                 if d <= n:

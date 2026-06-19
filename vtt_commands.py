@@ -575,6 +575,21 @@ def _entity_line(e: Entity) -> str:
             parent = e._match.entities.get(e.part_of) if e._match else None
             sctx["parent_name"] = parent.name if parent is not None else (e.part_of or "")
             line += _render_template(suffix, sctx)
+    # Rider suffix: a mounted entity's row shows which vehicle/slot it's in,
+    # via mount_entity_line_suffix ({vehicle}/{vehicle_name}/{slot}).
+    elif e.is_mounted:
+        suffix = None
+        if e._match is not None:
+            suffix = e._match.rules.get("mount_entity_line_suffix")
+        if suffix is None:
+            suffix = DEFAULT_SYSTEM_SETTINGS.get("mount_entity_line_suffix", "")
+        if suffix:
+            sctx = _entity_template_context(e)
+            sctx["vehicle"] = e.mounted_on or ""
+            sctx["slot"] = e.mount_slot or ""
+            veh = e._match.entities.get(e.mounted_on) if e._match else None
+            sctx["vehicle_name"] = veh.name if veh is not None else (e.mounted_on or "")
+            line += _render_template(suffix, sctx)
     return line
 
 
@@ -8207,6 +8222,152 @@ async def eval_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 # off to action.run_action which captures pre-state, runs the body,
 # and rolls back on failure.
 
+
+@registry.command(
+    "mount",
+    usage=(
+        "!mount <rider> <vehicle> <slot> | !mount dismount <rider> [x y] | "
+        "!mount switch <rider> <slot> | !mount list <vehicle> | "
+        "!mount info <vehicle> [slot]"
+    ),
+    desc=(
+        "Mounts / vehicles. A VEHICLE is any entity with a `slots` var; a "
+        "slot is a dict at `slots.<name>` with optional `capacity` (numeric "
+        "budget, default 1), `cost` (per-rider formula consuming it, default "
+        "1; self = rider, `vehicle` bound), `condition` (valid-rider formula "
+        "gate), `region` (a facing-relative footprint region — front/back/"
+        "left_side/right_side/center/all — the rider shows & is targeted at; "
+        "absent = hidden inside), `controls_movement` (true = an occupant "
+        "drives the whole rig), and `actions` (a slot-scoped action bundle). "
+        "Define slots with `!ent set_var <vehicle> slots.<name>.<field> "
+        "<value>`. `<rider> <vehicle> <slot>` boards (validated: capacity + "
+        "condition + no cycle). A driver's own move steers the vehicle; a "
+        "plain passenger can't self-move (it's carried — dismount first). "
+        "`dismount <rider> [x y]` disembarks; `switch <rider> <slot>` changes "
+        "slot. `list`/`info` inspect (player-available). Riders are carried "
+        "on every vehicle move and don't block the ground."
+    ),
+)
+async def mount_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["mount"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    sub = args[0].lower()
+
+    if sub == "list":
+        if await return_help_if_not_enough_args(ctx, args, 2, "mount", "list"):
+            return
+        vid = _resolve_eid(m, args[1])
+        if vid not in m.entities:
+            raise NotFound(f"Entity '{vid}' not found.")
+        slots = m.vehicle_slots(vid)
+        if not slots:
+            return await ctx.send(f"`{vid}` defines no slots (not a vehicle).")
+        lines = [f"**Slots on `{vid}`**:"]
+        for name in slots:
+            occ = m.slot_occupants(vid, name)
+            cap = m.slot_capacity(vid, name)
+            used = m.slot_used_capacity(vid, name)
+            sd = m.slot_def(vid, name) or {}
+            flags = []
+            if sd.get("controls_movement"):
+                flags.append("drives")
+            region = str(sd.get("region", "")).strip()
+            flags.append(f"region={region}" if region else "hidden")
+            occ_str = ", ".join(f"`{e.id}`" for e in occ) or "(empty)"
+            lines.append(
+                f"- `{name}` [{', '.join(flags)}] {used:g}/{cap:g}: {occ_str}")
+        return await ctx.send("\n".join(lines))
+
+    if sub == "info":
+        if await return_help_if_not_enough_args(ctx, args, 2, "mount", "info"):
+            return
+        vid = _resolve_eid(m, args[1])
+        if vid not in m.entities:
+            raise NotFound(f"Entity '{vid}' not found.")
+        slots = m.vehicle_slots(vid)
+        if len(args) >= 3:
+            name = args[2]
+            sd = m.slot_def(vid, name)
+            if sd is None:
+                return await ctx.send(
+                    f"`{vid}` has no slot `{name}`. Slots: "
+                    + (", ".join(f"`{s}`" for s in slots) or "(none)"))
+            occ = m.slot_occupants(vid, name)
+            return await ctx.send(
+                f"**slot `{name}` on `{vid}`**\n"
+                f"```{json.dumps(sd, indent=2, sort_keys=True)}\n```\n"
+                f"capacity {m.slot_used_capacity(vid, name):g}/"
+                f"{m.slot_capacity(vid, name):g}; occupants: "
+                + (", ".join(f"`{e.id}`" for e in occ) or "(none)"))
+        riders = m.vehicle_riders(vid)
+        return await ctx.send(
+            f"`{vid}` slots: " + (", ".join(f"`{s}`" for s in slots) or "(none)")
+            + "; riders: " + (", ".join(f"`{e.id}`({e.mount_slot})"
+                                        for e in riders) or "(none)"))
+
+    if sub in ("dismount", "off"):
+        if await return_help_if_not_enough_args(ctx, args, 2, "mount", "dismount"):
+            return
+        rid = _resolve_eid(m, args[1])
+        x = y = None
+        if len(args) >= 4:
+            try:
+                x, y = int(args[2]), int(args[3])
+            except ValueError:
+                return await ctx.send("❌ x and y must be integers.")
+        try:
+            log = m.dismount_entity(rid, x, y)
+        except (VTTError, NotFound) as ex:
+            return await ctx.send(f"❌ {ex}")
+        msg = f"`{rid}` dismounted to ({m.entities[rid].x},{m.entities[rid].y})."
+        if log:
+            msg += "\n" + "\n".join(l for l in log if l)
+        return await ctx.send(msg)
+
+    if sub == "switch":
+        if await return_help_if_not_enough_args(ctx, args, 3, "mount", "switch"):
+            return
+        rid = _resolve_eid(m, args[1])
+        try:
+            log = m.switch_slot(rid, args[2])
+        except (VTTError, NotFound) as ex:
+            return await ctx.send(f"❌ {ex}")
+        msg = f"`{rid}` switched to slot `{args[2]}`."
+        if log:
+            msg += "\n" + "\n".join(l for l in log if l)
+        return await ctx.send(msg)
+
+    # Bare form: !mount <rider> <vehicle> <slot>
+    if await return_help_if_not_enough_args(ctx, args, 3, "mount"):
+        return
+    rid = _resolve_eid(m, args[0])
+    vid = _resolve_eid(m, args[1])
+    slot = args[2]
+    try:
+        log = m.mount_entity(rid, vid, slot)
+    except (VTTError, NotFound) as ex:
+        return await ctx.send(f"❌ {ex}")
+    msg = f"`{rid}` mounted `{vid}` in slot `{slot}`."
+    if log:
+        msg += "\n" + "\n".join(l for l in log if l)
+    return await ctx.send(msg)
+
+
+registry.annotate_sub("mount", "dismount",
+                      usage="!mount dismount <rider> [x y]",
+                      desc="Disembark a rider to (x,y) or the nearest free cell.")
+registry.annotate_sub("mount", "switch",
+                      usage="!mount switch <rider> <slot>",
+                      desc="Move a mounted rider to another slot of the same vehicle.")
+registry.annotate_sub("mount", "list",
+                      usage="!mount list <vehicle>",
+                      desc="Show a vehicle's slots, capacity, and occupants.")
+registry.annotate_sub("mount", "info",
+                      usage="!mount info <vehicle> [slot]",
+                      desc="Detail one slot (or all) of a vehicle.")
+
 @registry.command(
     "action",
     usage=(
@@ -8276,18 +8437,21 @@ async def _action_list(ctx: ReplyContext, m: Match, actor_id: str) -> None:
     appears in multiple containers), and the GM's description if any.
     Empty entries hint at the available subcommands so a confused
     user sees a way forward."""
-    from action import discover_actions
+    from action import discover_actions, discover_mount_actions
     actor = m.entities[actor_id]
     actions = discover_actions(actor, m.rules)
-    if not actions:
+    mount_actions = discover_mount_actions(actor, m, m.rules) \
+        if actor.is_mounted else {}
+    if not actions and not mount_actions:
         return await ctx.send(
             f"No actions discoverable on `{actor_id}`. Add one by "
             f"setting `<container>.actions.<name>.body` (and "
             f"optionally `.target`, `.description`) in the entity's "
             f"vars. See `!help action`."
         )
-    lines = [f"**Actions on `{actor_id}`** "
-             f"({sum(len(v) for v in actions.values())} total):"]
+    total = sum(len(v) for v in actions.values()) + \
+        sum(len(v) for v in mount_actions.values())
+    lines = [f"**Actions on `{actor_id}`** ({total} total):"]
     for name in sorted(actions.keys()):
         for act in actions[name]:
             container = act.container_path or "(entity root)"
@@ -8296,6 +8460,16 @@ async def _action_list(ctx: ReplyContext, m: Match, actor_id: str) -> None:
                 f"- `{act.name}` (target: `{act.target_type}`, at "
                 f"`{container}`){desc}"
             )
+    if mount_actions:
+        lines.append(f"Via vehicle `{actor.mounted_on}` "
+                     f"(slot `{actor.mount_slot}`):")
+        for name in sorted(mount_actions.keys()):
+            for act in mount_actions[name]:
+                desc = f" — {act.description}" if act.description else ""
+                lines.append(
+                    f"- `{act.name}` (target: `{act.target_type}`, at "
+                    f"`{act.full_path}`){desc}"
+                )
     await ctx.send("\n".join(lines))
 
 
@@ -8359,11 +8533,20 @@ async def _run_action_dispatch(
     parsing, runner invocation, and the reply for the !command
     (success ✓ vs ❌ <msg>)."""
     from action import (
-        discover_actions, lookup_action, parse_target, parse_args_tokens,
-        run_action,
+        discover_actions, discover_mount_actions, lookup_action,
+        parse_target, parse_args_tokens, run_action,
     )
     actor = m.entities[actor_id]
     actions = discover_actions(actor, m.rules)
+    # Mounts: a rider can also invoke its slot's actions and the vehicle's
+    # `allowed_slots` actions. Merge them in and remember which arrived via
+    # the mount (full_path -> vehicle id) so we route the actor correctly.
+    mount_paths: Dict[str, str] = {}
+    if actor.is_mounted:
+        for name, acts in discover_mount_actions(actor, m, m.rules).items():
+            for act in acts:
+                actions.setdefault(name, []).append(act)
+                mount_paths[act.full_path] = actor.mounted_on
     # First: full-path match. The disambiguation menu directs users
     # to type the full path (e.g. `inventory.sword.actions.slice`),
     # so we resolve that BEFORE falling through to the bare-name
@@ -8435,6 +8618,25 @@ async def _run_action_dispatch(
     # attributes for the duration of this dispatch chain. They're
     # cleared after the runner returns to avoid leaking dispatcher
     # state into unrelated formula evaluations.
+    # Mount routing: a rider-triggered vehicle/slot action runs as the
+    # rider (default) or the vehicle, per the mount_action_actor rule with a
+    # per-vehicle `mount_action_actor` var override. Either way BOTH the
+    # `vehicle` and `rider` ids are bound in the body. In rider mode the
+    # action's own container is dropped (source = the rider's plain vars);
+    # the body reads vehicle/slot config via entity[vehicle] / var_get.
+    eff_actor_id = actor_id
+    extra_ctx: Optional[Dict[str, Any]] = None
+    if action.full_path in mount_paths:
+        vid = mount_paths[action.full_path]
+        veh = m.entities.get(vid)
+        mode = (veh.vars.get("mount_action_actor") if veh is not None else None) \
+            or m.rules.get("mount_action_actor", "rider")
+        extra_ctx = {"vehicle": vid, "rider": actor_id}
+        if str(mode) == "vehicle":
+            eff_actor_id = vid
+        else:
+            import dataclasses
+            action = dataclasses.replace(action, container_path="")
     prev_ctx = getattr(m, "_runtime_ctx", None)
     prev_mgr = getattr(m, "_runtime_mgr", None)
     m._runtime_ctx = ctx
@@ -8442,9 +8644,9 @@ async def _run_action_dispatch(
     from action import ActionEngineFault
     try:
         ok, fail_info = await run_action(
-            action, actor_id=actor_id, target=target_value,
+            action, actor_id=eff_actor_id, target=target_value,
             args=args_dict, match=m, mgr=mgr, ctx=ctx,
-            answers=answers,
+            answers=answers, extra_ctx=extra_ctx,
         )
     except ActionEngineFault as ef:
         # Engine-level refusal (recursion limit etc.) — runner has
