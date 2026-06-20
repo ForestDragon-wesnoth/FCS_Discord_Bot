@@ -1581,6 +1581,12 @@ More shipped work (continuing the list above):
   transient in-flight state — the emit stack, summon budget, etc. — must
   survive). The list must stay in sync with Match's underscore fields; a
   `hasattr` guard makes a future-missing name a no-op rather than a crash.
+  COMPANION fix in `run_action`: because `_summon_count` is now PRESERVED across
+  a rollback, the choice-REPLAY loop (which rolls back + re-runs the body per
+  interactive `choose`) resets it to the action-start value each attempt —
+  otherwise a summon-before-`choose` would accumulate the per-command summon
+  budget across replays and falsely hit `summon_event_limit`. Snapshotted
+  alongside the existing per-attempt RNG/cursor/buffer resets.
 - **Audit-pass-3 fix: a turn_end tick that empties the turn order no longer
   crashes next_turn (scenario 479).** PRE-EXISTING (parts-independent): if a
   `turn_end`/round hook or status tick removed the LAST entity in `turn_order`

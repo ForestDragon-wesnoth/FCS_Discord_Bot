@@ -1116,10 +1116,19 @@ async def run_action(
         if is_top_level:
             match._choice_answers = list(answers or [])
             rng_state = _snapshot_rng(match)
+            # The per-command summon budget at action start. Each replay
+            # attempt re-runs the body from the top (its summons are rolled
+            # back between attempts), so the counter must reset to this — NOT
+            # accumulate across attempts (which would falsely exhaust the
+            # budget for a summon-before-choose action). _rollback_match now
+            # PRESERVES _summon_count for the fail()/exception case, so we
+            # restore the start value here explicitly for the replay case.
+            summon_at_start = match._summon_count
             choice_limit = int(match.rules.get("action_choice_limit", 20))
         while True:
             if is_top_level:
                 match._choice_cursor = 0
+                match._summon_count = summon_at_start
                 _restore_rng(match, rng_state)
                 # Fresh output buffer per attempt — rolled-back attempts'
                 # command echoes must not leak into the committed run.
