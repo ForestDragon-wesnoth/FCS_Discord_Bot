@@ -12189,3 +12189,60 @@ content (and now the camera) by +5,+5, so the camera follows to (25,25) — the
 stayed at (20,20) while the content moved, framing the wrong region. `!map view
 1 1` then resets it. (The harness surface isn't viewport-capable, so viewport_mode
 must be forced on for the window to engage.)
+
+
+SCENARIO 474 — A status DoT on a body part ticks (shares the parent's clock)
+---------------------------------------------------------------------------
+
+!match new spt StatusPartTick 10 6
+!match use spt
+!ent add ogre Ogre 30 3 3 40
+!part add ogre oarm arm 20 20
+!part add oarm ofinger finger 8 8
+!status def burn
+!status when burn turn_end
+!status tick burn "entity[self].hp = entity[self].hp - 3"
+!status apply oarm burn 1 5
+!status apply ofinger burn 1 5
+!ent dump oarm
+!ent dump ofinger
+!turn next
+!turn next
+!ent dump oarm
+!ent dump ofinger
+
+Expected: the ogre has an arm (a part) and the arm has a finger (a part of a
+part). A `burn` DoT (tick_when=turn_end, −3 hp) is applied to BOTH parts. Parts
+have no initiative of their own, so before the fix their statuses never ticked.
+Now they share the parent ogre's status clock: ending the ogre's turn ticks the
+ogre AND every attached part lacking its own initiative. (The first `!turn next`
+just begins round 1; the second ends the ogre's turn and fires the turn_end
+tick.) So `oarm` drops 20→17 and the sub-part `ofinger` drops 8→5. (Each part's own tick_when still gates it;
+a part with a different tick_when wouldn't fire here.)
+
+
+SCENARIO 475 — A part's tick routes damage to the parent via damage_part
+-----------------------------------------------------------------------
+
+!match new spr StatusPartRoute 10 6
+!match use spr
+!ent add troll Troll 30 4 3 50
+!part add troll tleg leg 25 25 to_main_percent=100 to_main_cap=max_hp
+!status def acid
+!status when acid turn_end
+!status tick acid "damage_part(self, 4)"
+!status apply tleg acid 1 5
+!ent dump troll
+!ent dump tleg
+!turn next
+!turn next
+!ent dump troll
+!ent dump tleg
+
+Expected: the troll's leg has an `acid` DoT whose tick calls `damage_part(self,
+4)` — the headline pattern the doc describes for limb DoTs. (The first `!turn next`
+begins round 1; the second ends the troll's turn.) Ending the troll's
+turn ticks the leg (it shares the parent's clock); the leg's tick routes 4
+damage through the part-damage pipeline: with to_main_percent=100 the parent
+troll takes 4 (50→46) and the leg itself drops 25→21. This proves a status on a
+limb can both live on the limb and bleed into the main body.

@@ -1537,6 +1537,23 @@ More shipped work (continuing the list above):
     center/edge-anchored resize left the camera framing the wrong region. Now
     offset like everything else (resolve_viewport re-clamps on read).
     Scenario 473.
+- **Audit-pass-3 fix: status DoTs tick on body parts (scenarios 474-475).**
+  `fire_status_tick` only targeted `turn_order` members (round ticks) or the
+  active entity (turn ticks), and attached parts have NO initiative (excluded
+  from turn_order) — so a status on a glued/region/located part NEVER ticked,
+  silently contradicting the doc ("parts tick normally; a part's tick can
+  `damage_part(self,n)` to route to main"). Now a part shares its parent's
+  status clock: for each base target, `fire_status_tick` BFS-walks the part
+  subtree and adds parts that LACK independent initiative, STOPPING descent at
+  an independent part (it's its own target and ticks on its own turn, carrying
+  its own sub-parts) — deduped via a `seen` set so a deep part isn't
+  double-ticked, and no double-tick of an independent part reached via both its
+  own slot and its parent. Each part's own definition `tick_when` still gates
+  whether it fires this `when`. So a DoT on a limb both lives on the limb and
+  (via `damage_part(self,n)` in its tick) can bleed into the main body. (The
+  serialization round-trip and push/pull/swap footprint-awareness for
+  multi-tile bodies were re-audited and found correct; `pending_requests` is
+  intentionally runtime-only.)
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

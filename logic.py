@@ -8950,6 +8950,33 @@ class Match:
         else:  # round_start / round_end
             targets = list(self.turn_order)
 
+        # Attached parts share their parent's status clock: a part has no
+        # initiative of its own (unless made independent, i.e. placed in
+        # turn_order), so a status on a glued/region/located part would
+        # never tick. For each base target, BFS its part subtree and add
+        # the parts that LACK independent initiative — descending stops at
+        # an independent part (it is its own target and ticks on its own
+        # turn, carrying its own sub-parts). Dedup via `seen` so a deep
+        # part isn't added twice. Each part's own definition tick_when
+        # still gates whether it actually fires this `when`.
+        if self.entities:
+            turn_set = set(self.turn_order)
+            seen = set(targets)
+            extra: List[str] = []
+            for t in list(targets):
+                frontier = [c.id for c in self.entity_parts(t)]
+                while frontier:
+                    pid = frontier.pop(0)
+                    if pid in seen:
+                        continue
+                    seen.add(pid)
+                    if pid in turn_set:
+                        # Independent part: its own target; don't descend.
+                        continue
+                    extra.append(pid)
+                    frontier.extend(c.id for c in self.entity_parts(pid))
+            targets = targets + extra
+
         global_when = self.rules.get("status_tick_when", "never")
         global_src = self.rules.get("status_tick_formula", "")
         global_active = (global_when == when and isinstance(global_src, str)
