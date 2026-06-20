@@ -12246,3 +12246,51 @@ turn ticks the leg (it shares the parent's clock); the leg's tick routes 4
 damage through the part-damage pipeline: with to_main_percent=100 the parent
 troll takes 4 (50→46) and the leg itself drops 25→21. This proves a status on a
 limb can both live on the limb and bleed into the main body.
+
+
+SCENARIO 476 — A body part's turn/round passive fires on the parent's clock
+---------------------------------------------------------------------------
+
+!match new ptp PartTurnPassive 10 6
+!match use ptp
+!ent add ogre Ogre 30 3 3 40
+!part add ogre arm arm 20 20
+!part add arm finger finger 8 8
+!passive add arm bleed on_turn_end "entity[self].hp = entity[self].hp - 2"
+!passive add finger bleed on_turn_end "entity[self].hp = entity[self].hp - 1"
+!ent dump arm
+!ent dump finger
+!turn next
+!turn next
+!ent dump arm
+!ent dump finger
+
+Expected: parts carry no initiative (excluded from turn_order), so before the
+fix an on_turn_end passive on a part never fired. Now a part shares its parent's
+turn/round clock: ending the ogre's turn fires the ogre's hooks AND every
+attached part's OWN passives (globals/team passives still fire only once per
+acting unit, NOT per part). So `arm` drops 20→18 and the sub-part `finger` drops
+8→7. (The first `!turn next` begins round 1; the second ends the ogre's turn and
+fires on_turn_end.)
+
+
+SCENARIO 477 — A turn-scheduled effect on a body part fires on the parent's turn
+-------------------------------------------------------------------------------
+
+!match new psp PartSchedule 10 6
+!match use psp
+!ent add troll Troll 30 4 3 50
+!part add troll leg leg 25 25
+!schedule turn leg 1 "entity[self].hp = entity[self].hp - 5"
+!schedule list
+!ent dump leg
+!turn next
+!turn next
+!ent dump leg
+!schedule list
+
+Expected: an entity-attached turn schedule bound to the leg (a part) would never
+fire before the fix, because fire_scheduled_turn was only invoked for the active
+turn_order entity. Now a part's turn schedule fires on the parent's turn start:
+the leg's −5 effect (delay 1) fires once, dropping it 25→20, and the schedule is
+consumed (the second `!schedule list` is empty).
