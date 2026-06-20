@@ -11955,7 +11955,7 @@ SCENARIO 464 — Map auto-legend: glyph→meaning key honors the current window
 !ent set_var orc glyph g
 !ent add drag Dragon 80 38 4 9
 !ent set_var drag glyph D
-!zone create water 1 4 2 4
+!zone fill water 1 4 2 4
 !zone glyph water ~
 !map legend on
 !map
@@ -12046,3 +12046,146 @@ zombie with a dangling parent). Reviving the dragon restores the whole tree: the
 wing re-attaches to the dragon and the feather re-attaches to the wing (`!ent
 dump feather` shows it's a body part of `wing`), because the corpse now snapshots
 the full subtree in parent-before-child order.
+
+
+SCENARIO 468 — Group move validates the WHOLE footprint (bounds + occupancy)
+---------------------------------------------------------------------------
+
+!match new gfv GroupFootprint 10 6
+!match use gfv
+!ent add big Big 30 7 2 5
+!ent set_var big footprint_w 2
+!ent set_var big footprint_h 2
+!ent group new gg
+!ent group add gg big
+!ent move group:gg right right right
+!ent dump big
+!ent add wall Wall 30 4 4 9
+!ent set_var wall footprint_w 2
+!ent set_var wall footprint_h 2
+!ent add runner Runner 20 1 4 6
+!ent group new gr
+!ent group add gr runner
+!ent move group:gr right right right
+!ent dump runner
+
+Expected: the 2×2 `big` is anchored at (7,2), covering (7,2)-(8,3). A group move
+of three steps right would push its right edge to column 11, off the 10-wide
+grid — the move is REJECTED (❌ out of bounds) atomically, so `big` stays at
+(7,2) (the `!ent dump big` still shows 7,2). Then a 2×2 `wall` at (4,4) covers
+(4,4)-(5,5); the 1×1 `runner` at (1,4) moving three right would land on (4,4) —
+the wall's cell — and is REJECTED (❌ occupied), so runner stays at (1,4).
+Before the fix the group path only checked the anchor cell, so a multi-tile
+member could march its footprint off-grid or onto another body's non-anchor
+cells.
+
+
+SCENARIO 469 — Group move respects movement blocking (impassable zone)
+---------------------------------------------------------------------
+
+!match new gbl GroupBlock 12 5
+!match use gbl
+!ent add hero Hero 30 1 1 5
+!ent group new band
+!ent group add band hero
+!zone fill wall 5 1 5 3
+!zone set wall block true
+!ent move group:band right right right right right
+!ent dump hero
+
+Expected: an impassable zone `wall` covers column 5 (rows 1-3). A group move of
+five steps right from (1,1) would cross x=5 — it is REJECTED (❌ blocked) and
+the whole group move is aborted atomically, so `hero` stays at (1,1). Before the
+fix `move_group_dirs` had no block check at all and the group walked straight
+through the wall.
+
+
+SCENARIO 470 — A large viewer casts line-of-sight from its WHOLE body
+--------------------------------------------------------------------
+
+!match new lbv LargeViewerLOS 12 8
+!match use lbv
+!ent add scout Scout 30 2 2 5
+!ent set_var scout footprint_w 3
+!ent set_var scout footprint_h 1
+!ent set_var scout team blue
+!zone fill smoke 2 3 2 7
+!zone set smoke opaque true
+!eval "can_see_losonly('scout', 4, 7)"
+!eval "has_los(2, 2, 4, 7, 'scout')"
+
+Expected: the 3-wide `scout` covers (2,2)-(4,2). An opaque smoke zone fills
+column 2 (rows 3-7), blocking the anchor cell (2,2)'s downward sight. The pure
+line-of-sight query `can_see_losonly('scout', 4, 7)` returns True because the
+scout's right body cell (4,2) has a clear column down to (4,7) — a large viewer
+sees from any footprint cell. The raw `has_los` from the ANCHOR (2,2) to (4,7)
+returns False (its line clips the smoke), showing why the anchor-only check was
+wrong before the fix.
+
+
+SCENARIO 471 — A body part's aura and its sub-parts follow the parent's move
+---------------------------------------------------------------------------
+
+!match new paf PartAuraFollow 20 20
+!match use paf
+!ent add dragon Dragon 40 5 5 5
+!part add dragon wing wing 20 20
+!part add wing feather feather 10 10
+!zone new aura
+!zone anchor aura wing 1
+!ent dump feather
+!ent move dragon 4 right
+!ent dump feather
+!zone cells aura
+
+Expected: the dragon has a wing (a part) and the wing has a feather (a part of a
+part); an aura zone is anchored to the wing with radius 1. Moving the dragon 4
+right to (9,5) carries the WHOLE part tree — the feather (a part of the wing)
+rides along to (9,5), shown by the two `!ent dump feather` calls (x 5 → 9) — and
+the wing's anchored aura re-stamps around the wing's new cell (`!zone cells aura`
+now centers on column 9). Before the fix the parts-restamp moved only the
+direct part's position and never re-stamped a part's aura or its sub-parts.
+
+
+SCENARIO 472 — hidden_rider_grants_vision gamerule (passenger sight)
+-------------------------------------------------------------------
+
+!match new hrv HiddenRiderVision 14 5
+!match use hrv
+!ent add veh Veh 30 2 2 5
+!ent set_var veh team red
+!ent set_var veh slots.hold.capacity 1
+!ent add pax Pax 20 3 3 5
+!ent set_var pax team red
+!ent set_var pax fog_vision_radius 9
+!mount pax veh hold
+!eval "team_sees_cell_rangeonly('red', 11, 2)"
+!system set default hidden_rider_grants_vision true
+!eval "team_sees_cell_rangeonly('red', 11, 2)"
+
+Expected: `pax` (a vision radius of 9) is mounted into a hidden slot (no region)
+inside `veh`, so it's tucked inside. With the default `hidden_rider_grants_vision`
+= false, the hidden passenger does NOT contribute to the team's vision, so
+`team_sees_cell_rangeonly('red', 11, 2)` is False (the vehicle's own radius
+doesn't reach 9 cells away). After enabling the rule, the passenger's eyes count
+and the same query returns True. (Note: the rule flows into the match's rules on
+the next refresh; this eval reads the live rule.)
+
+
+SCENARIO 473 — resize_grid shifts the per-channel viewport camera
+----------------------------------------------------------------
+
+!match new rvc ResizeCam 50 50
+!match use rvc
+!system set default viewport_mode on
+!map view 20 20
+!map resize 60 60 center
+!map view 1 1
+
+Expected: with the viewport forced on, `!map view 20 20` parks the camera's
+top-left at (20,20). Resizing to 60×60 with the `center` anchor shifts all
+content (and now the camera) by +5,+5, so the camera follows to (25,25) — the
+`!map resize` reply's viewport header reads "(25,25)…". Before the fix the camera
+stayed at (20,20) while the content moved, framing the wrong region. `!map view
+1 1` then resets it. (The harness surface isn't viewport-capable, so viewport_mode
+must be forced on for the window to engage.)
