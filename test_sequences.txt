@@ -12321,3 +12321,28 @@ field), so `outer` succeeds: `log`=42 AND `log2`=42 (the payload is still
 readable after the rolled-back sub-action), `a.hp` stays 30 (the sub-action's −1
 was rolled back), and `after`=false (the emit popped its frame normally on
 completion).
+
+
+SCENARIO 479 — A turn_end tick that empties the turn order doesn't crash next_turn
+---------------------------------------------------------------------------------
+
+!match new doom Doomtick 8 6
+!match use doom
+!ent add solo solo 3 3 3 5
+!status def doom
+!status when doom turn_end
+!status tick doom "entity[self].hp = entity[self].hp - 10"
+!status apply solo doom 1 5
+!turn next
+!turn next
+!list
+
+Expected: `solo` is the only combatant and carries a `doom` DoT that fires at
+turn_end for −10. The first `!turn next` begins round 1 (turn_start only); the
+second ends solo's turn, the doom tick drops it to −7 and it dies — emptying the
+turn order. Previously `next_turn` then computed `(active_index + 1) %
+len(turn_order)` against an empty order and crashed with ZeroDivisionError
+(surfacing as 💥). Now the turn clock detects the emptied order at each point a
+hook/tick could clear it (turn_end, the round-wrap ticks, and the opening
+round_start) and ends the turn cleanly. `!list` shows no living entities (solo
+is dead/gone) and no error.

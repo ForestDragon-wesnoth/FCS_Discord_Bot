@@ -1581,6 +1581,18 @@ More shipped work (continuing the list above):
   transient in-flight state — the emit stack, summon budget, etc. — must
   survive). The list must stay in sync with Match's underscore fields; a
   `hasattr` guard makes a future-missing name a no-op rather than a crash.
+- **Audit-pass-3 fix: a turn_end tick that empties the turn order no longer
+  crashes next_turn (scenario 479).** PRE-EXISTING (parts-independent): if a
+  `turn_end`/round hook or status tick removed the LAST entity in `turn_order`
+  (e.g. a lethal DoT on the only combatant — now also reachable via a part tick
+  routing `damage_part` to its vital parent), `next_turn` then computed
+  `(active_index + 1) % len(turn_order)` against an empty order →
+  ZeroDivisionError (surfacing as a 💥). Guarded every point a hook/tick can
+  empty the order: `_advance_index` bails if `turn_order` is empty; `next_turn`
+  returns `(None, log)` after the opening round_start, after `turn_end` hooks,
+  and after `_advance_index`'s round-wrap ticks; `_skip_to_eligible` stops on an
+  emptied order and clamps a stale `active_index`. A two-combatant table where
+  one self-kills still advances cleanly to the survivor.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

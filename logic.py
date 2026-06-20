@@ -8169,6 +8169,11 @@ class Match:
             # state they would have seen as the round began (with any
             # hook side-effects already applied).
             self.history.record_round(self)
+            # An opening round_start hook/tick may have removed every
+            # entity — nothing to start.
+            if not self.turn_order:
+                self.history.record_turn(self)
+                return (None, log)
             # The opening entity may itself be skippable (e.g. starts
             # stunned) — skip forward to the first eligible one.
             eligible = self._skip_to_eligible(log)
@@ -8199,7 +8204,19 @@ class Match:
         log.extend(self.fire_hook(
             "on_turn_end", target_ids=[cur],
             own_only_targets=self._attached_tick_parts([cur])))
+        # A turn_end hook/tick may have removed the last entity (e.g. a
+        # lethal DoT — directly, or routed to a parent via a part tick).
+        # With no one left, end here rather than advancing into an empty
+        # turn order.
+        if not self.turn_order:
+            self.history.record_turn(self)
+            return (None, log)
         self._advance_index(log)
+        # _advance_index's round-wrap hooks (on_round_end/start ticks) can
+        # likewise empty the order; re-check before reading the next entity.
+        if not self.turn_order:
+            self.history.record_turn(self)
+            return (None, log)
         # Skip over any entity carrying a skip-status flag.
         eligible = self._skip_to_eligible(log)
         new_cur = self.turn_order[self.active_index]
@@ -8228,6 +8245,11 @@ class Match:
         + status_tick(round_start), and autosave the round. Factored
         out of next_turn so the skip-status loop can reuse the exact
         same wrap bookkeeping for each cell it steps over."""
+        # A preceding hook/tick may have emptied the turn order (e.g. a
+        # lethal DoT removed the last combatant). Nothing to advance to —
+        # bail before the modulo divides by zero.
+        if not self.turn_order:
+            return
         new_index = (self.active_index + 1) % len(self.turn_order)
         wrapped = (new_index == 0)
         if wrapped:
@@ -8280,6 +8302,12 @@ class Match:
         n = len(self.turn_order)
         checked = 0
         while checked < n:
+            # A skip's round-wrap (or a skip-status side effect) can empty
+            # the order; stop rather than indexing into nothing.
+            if not self.turn_order:
+                return False
+            if self.active_index >= len(self.turn_order):
+                self.active_index = 0
             cur = self.turn_order[self.active_index]
             e = self.entities.get(cur)
             if e is None:
