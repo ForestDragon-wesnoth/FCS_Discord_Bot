@@ -11969,3 +11969,80 @@ Dragon `D` (at x=38, off-window) is NOT listed. After
 `!map center drag` the window moves to the right edge — now `D — Dragon` appears
 in the legend and the goblins/zone drop out (they're no longer visible). The
 auto-legend reflects the current viewport, not the whole map.
+
+
+SCENARIO 465 — Mounts: a vehicle-on-a-vehicle carries its own rider (nested)
+---------------------------------------------------------------------------
+
+!match new nv NestedVeh 20 20
+!match use nv
+!ent add gunship Gunship 30 5 5 0
+!ent set_var gunship slots.cargo.capacity 1
+!ent set_var gunship slots.cargo.controls_movement true
+!ent add cart Cart 20 1 1 0
+!ent set_var cart slots.driver.capacity 1
+!ent set_var cart slots.driver.controls_movement true
+!ent add rider Rider 10 2 2 5
+!mount cart gunship cargo
+!mount rider cart driver
+!ent dump rider
+!ent move gunship 5 right
+!ent dump rider
+!ent dump cart
+
+Expected: cart mounts into the gunship's cargo slot (cart snaps to the gunship
+cell 5,5); rider mounts the cart's driver slot (rider snaps to 5,5 too). After
+`!ent move gunship 5 right` the gunship moves to (10,5) and carries the WHOLE
+nested stack: cart → (10,5) AND rider → (10,5). Before the nested-restamp fix
+the rider was stranded at (5,5) because the cart (itself a rider) was
+repositioned by a raw move that didn't re-run its own carry. The two `!ent dump
+rider` calls show x going from 5 to 10.
+
+
+SCENARIO 466 — Mounts: a rider that dies revives UNMOUNTED (no phantom links)
+----------------------------------------------------------------------------
+
+!match new mr MountRevive 20 20
+!match use mr
+!ent add horse Horse 30 3 3 0
+!ent set_var horse slots.saddle.capacity 1
+!ent add knight Knight 10 4 4 5
+!mount knight horse saddle
+!ent kill knight
+!ent move horse 3 right
+!ent revive knight
+!ent dump knight
+!mount list horse
+
+Expected: the knight mounts the horse (snaps to the horse cell 3,3) and is then
+killed — its corpse is stored at (3,3). The horse moves away (to 6,3), freeing
+the cell, and the knight is revived there at full hp. The revived knight is a
+NORMAL ground entity: its corpse snapshot dropped the `mounted_on` / `mount_slot`
+links at death, so revive does NOT re-seat it onto the horse for free (which had
+previously produced an invisible "rider" standing on the ground). `!mount list
+horse` shows no riders.
+
+
+SCENARIO 467 — Body parts: a multi-level part subtree dies and revives whole
+---------------------------------------------------------------------------
+
+!match new hp HierParts 20 20
+!match use hp
+!ent add dragon Dragon 40 5 5 5
+!part add dragon wing wing 20 20
+!part add wing feather feather 10 10
+!part list dragon
+!ent kill dragon
+!list
+!ent revive dragon
+!part list dragon
+!ent dump feather
+
+Expected: the dragon has a wing (a part), and the wing has a feather (a part of
+a part). `!part list dragon` shows the wing. Killing the dragon removes the
+ENTIRE part subtree — wing AND feather — so `!list` shows no orphaned, suddenly-
+free feather entity (before the fix the deeper feather survived as a visible
+zombie with a dangling parent). Reviving the dragon restores the whole tree: the
+wing re-attaches to the dragon and the feather re-attaches to the wing (`!ent
+dump feather` shows it's a body part of `wing`), because the corpse now snapshots
+the full subtree in parent-before-child order.

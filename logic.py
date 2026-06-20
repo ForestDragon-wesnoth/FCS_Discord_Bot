@@ -5308,6 +5308,28 @@ class Match:
         in insertion order. Derived (no second structure to keep in sync)."""
         return [e for e in self.entities.values() if e.part_of == parent_id]
 
+    def entity_part_subtree(self, root_id: str) -> List["Entity"]:
+        """Every DESCENDANT part of `root_id` (parts, their parts, ...), in
+        BFS order (a parent always precedes its children), excluding the root.
+        Used by death-cascade removal and corpse snapshotting so a multi-level
+        part tree (dragon -> wing -> feather) is handled whole — the direct-
+        parts-only `entity_parts` would leave deeper parts orphaned. Cycle-
+        guarded against a malformed part_of chain."""
+        out: List["Entity"] = []
+        seen = {root_id}
+        frontier = [root_id]
+        while frontier:
+            nxt: List[str] = []
+            for pid in frontier:
+                for child in self.entity_parts(pid):
+                    if child.id in seen:
+                        continue
+                    seen.add(child.id)
+                    out.append(child)
+                    nxt.append(child.id)
+            frontier = nxt
+        return out
+
     def part_name_var(self) -> str:
         """Var key holding a part's role name ('head', 'left_arm') — the
         handle `part(parent, name)` / aiming resolve against. Per the
@@ -5834,11 +5856,19 @@ class Match:
     def _restamp_riders_for(self, vid: str) -> None:
         """Reposition every rider of `vid` onto its slot cell (raw move_to —
         no occupancy/hooks). Called when the vehicle moves and after a
-        mount/dismount/slot-change."""
+        mount/dismount/slot-change. When a rider MOVES it carries its OWN
+        cargo too — its parts, anchored auras, and (for a vehicle-on-vehicle)
+        its own riders — so the carry propagates down a nested stack. The
+        raw move_to doesn't fire fire_entity_moved, so we replay that hook's
+        carry-restamps by hand. Mount cycles are prevented by can_mount, so
+        the recursion terminates."""
         for rider in self.vehicle_riders(vid):
             cx, cy = self.rider_cell(vid, rider)
             if (rider.x, rider.y) != (cx, cy):
                 rider.move_to(cx, cy)
+                self._restamp_anchors_for(rider.id)
+                self._restamp_parts_for(rider.id)
+                self._restamp_riders_for(rider.id)
 
     def _detach_rider(self, rider: "Entity") -> List[str]:
         """Clear a rider's mount link and fire on_dismounted. Does NOT move
@@ -9644,12 +9674,15 @@ class Match:
             # bookkeeping + group scrubbing) regardless of result.
             e.remove()
             # Cascade: the creature is gone, so its body parts go with it
-            # (no orphaned, suddenly-visible limbs). Their snapshots already
-            # rode into the corpse above for revive. Silent — destroy
-            # effects are for targeted limb destruction, not whole-creature
-            # death.
-            for part in self.entity_parts(entity_id):
-                part.remove()
+            # (no orphaned, suddenly-visible limbs). The WHOLE subtree —
+            # parts, their parts, ... — is removed, not just direct parts,
+            # or a deeper limb (wing -> feather) would survive as a free-
+            # floating zombie. Their snapshots already rode into the corpse
+            # above for revive. Silent — destroy effects are for targeted
+            # limb destruction, not whole-creature death.
+            for part in self.entity_part_subtree(entity_id):
+                if part.id in self.entities:
+                    part.remove()
             self.log_event("death", entity=entity_id, name=dead_name,
                            x=dead_x, y=dead_y)
         finally:
@@ -10043,15 +10076,26 @@ class Match:
             # bulldoze with a fresh dict (corpses is engine-owned).
             corpses = {}
             cell["corpses"] = corpses
+        snap = e.to_dict()
+        # A rider that dies falls OFF its vehicle — don't carry the mount
+        # links into the corpse, or revive_corpse would restore a phantom-
+        # mounted entity (excluded from render/occupancy as a "rider", or
+        # silently re-seated onto a still-living vehicle for free). It can
+        # always mount again after revival.
+        snap.pop("mounted_on", None)
+        snap.pop("mount_slot", None)
         corpses[e.id] = {
-            "entity": e.to_dict(),
+            "entity": snap,
             "died_round": self.round_number,
         }
-        # Snapshot any attached body parts alongside the parent so a later
-        # revive_corpse restores the whole creature (the parts themselves
-        # are removed from the match by _process_death). Kept minimal — the
-        # "regrow from a fresh template" variant is a deferred TODO.
-        part_dicts = [pp.to_dict() for pp in self.entity_parts(e.id)]
+        # Snapshot the whole attached part SUBTREE (parts, their parts, ...)
+        # alongside the parent so a later revive_corpse restores the whole
+        # creature — multi-level limbs included (BFS order = parents before
+        # children, so revive can spawn each after its parent). The parts
+        # themselves are removed from the match by _process_death. Kept
+        # minimal — the "regrow from a fresh template" variant is a deferred
+        # TODO.
+        part_dicts = [pp.to_dict() for pp in self.entity_part_subtree(e.id)]
         if part_dicts:
             corpses[e.id]["parts"] = part_dicts
 

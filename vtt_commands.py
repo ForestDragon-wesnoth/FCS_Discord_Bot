@@ -3458,7 +3458,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             msg = msg + " " + "; ".join(notes) + "."
         if log:
             msg = msg + "\n" + "\n".join(log)
-        return await ctx.send(msg + "\n" + _map_block(ctx, m, _view_pov(ctx, m, [])))
+        return await ctx.send(msg + "\n" + _map_render_reply(ctx, m, []))
     # ---- !map layer <name> on|off | !map layer list ----
     if args and args[0].lower() == "layer":
         if len(args) < 2:
