@@ -12346,3 +12346,28 @@ len(turn_order)` against an empty order and crashed with ZeroDivisionError
 hook/tick could clear it (turn_end, the round-wrap ticks, and the opening
 round_start) and ends the turn cleanly. `!list` shows no living entities (solo
 is dead/gone) and no error.
+
+
+SCENARIO 480 — !mod show flags an unrecognized modifier op (typo guard)
+----------------------------------------------------------------------
+
+!match new mop ModOpWarn 8 6
+!match use mop
+!ent add h h 30 2 2 5
+!ent set_var h modifiers.fm.stat atk
+!ent set_var h modifiers.fm.op inc%
+!ent set_var h modifiers.fm.value 50
+!mod show h atk 10
+!ent set_var h modifiers.bad.stat atk
+!ent set_var h modifiers.bad.op inc
+!ent set_var h modifiers.bad.value 5
+!mod show h atk 10
+
+Expected: the first `!mod show` lists the well-formed `inc%` modifier and folds
+base 10 → 15 with no warning. After adding a second modifier with the op `inc`
+(a typo for `inc%`), the second `!mod show` marks that line with ⚠️ and appends
+an advisory: "unrecognized op(s) `inc` — folded as a lenient add. Valid ops:
+add, inc%, more%, set, min, max." The unknown op still folds (as a lenient add,
+so base 10 → 22.5), but the warning surfaces the likely typo rather than letting
+a silent flat bonus pass unnoticed. The recognized ops (add/inc%/more%/set/min/
+max) never warn.

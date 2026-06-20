@@ -7366,15 +7366,23 @@ async def mod_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         lines = [f"Modifiers on `{eid}` for `{stat}`{tagstr}:"]
         if not mods:
             lines.append("  (none active)")
+        from logic import MODIFIER_OPS
         for md in mods:
             tg = (" tags=" + ",".join(md["tags"])) if md["tags"] else ""
             ntg = (" not=" + ",".join(md["not_tags"])) if md["not_tags"] else ""
             src = f" [{md['source']}]" if md.get("source") else ""
+            bad = " ⚠️" if md["op"] not in MODIFIER_OPS else ""
             lines.append(
-                f"  {md['op']} {md['value']:g} (pri {md['priority']:g}){tg}{ntg}{src}")
+                f"  {md['op']} {md['value']:g} (pri {md['priority']:g}){tg}{ntg}{src}{bad}")
         if base is not None:
             result = m.apply_modifiers(eid, stat, base, tags, {})
             lines.append(f"  → base {base:g} becomes {result:g}")
+        unknown = m.unknown_modifier_ops(mods)
+        if unknown:
+            lines.append(
+                "⚠️ unrecognized op(s) " + ", ".join(f"`{o}`" for o in unknown)
+                + " — folded as a lenient add. Valid ops: "
+                + ", ".join(MODIFIER_OPS) + ".")
         return await ctx.send("\n".join(lines))
 
     title, body = registry.help_for(["mod"])

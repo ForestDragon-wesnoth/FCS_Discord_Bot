@@ -2202,6 +2202,11 @@ def _default_facing_for(
 
 RESERVED_IDS: Set[str] = {"current", "this", "self", "parent"}
 
+# Recognized modifier fold ops (see Match._apply_modifier_op). An op outside
+# this set still folds as a lenient add, but `!mod show` flags it as a likely
+# typo via Match.unknown_modifier_ops.
+MODIFIER_OPS: Tuple[str, ...] = ("add", "inc%", "more%", "set", "min", "max")
+
 
 # -------------------------
 # Passive hooks & Passive dataclass
@@ -6272,7 +6277,21 @@ class Match:
             return max(running, max(vals))
         if op == "max":          # cap: result at most the lowest max
             return min(running, min(vals))
-        return running + sum(vals)   # unknown op -> lenient add
+        return running + sum(vals)   # unknown op -> lenient add (see
+        #   MODIFIER_OPS / unknown_modifier_ops: surfaced as a ⚠️ advisory
+        #   in `!mod show` so a typo like `inc` for `inc%` is caught.
+
+    def unknown_modifier_ops(self, mods: List[Dict[str, Any]]) -> List[str]:
+        """The sorted, de-duplicated ops in `mods` (records from
+        gather_modifiers) that aren't one of the recognized fold ops. An
+        unrecognized op still folds (lenient add), but it's almost always a
+        typo — `!mod show` flags these so the GM notices."""
+        seen = []
+        for m in mods:
+            op = m.get("op")
+            if op not in MODIFIER_OPS and op not in seen:
+                seen.append(op)
+        return sorted(str(o) for o in seen)
 
     def apply_modifiers(self, eid: str, stat: str, base: Any, tags: Any,
                         context: Optional[Dict[str, Any]] = None) -> float:

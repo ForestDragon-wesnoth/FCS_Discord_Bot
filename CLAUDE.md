@@ -1599,6 +1599,15 @@ More shipped work (continuing the list above):
   and after `_advance_index`'s round-wrap ticks; `_skip_to_eligible` stops on an
   emptied order and clamps a stale `active_index`. A two-combatant table where
   one self-kills still advances cleanly to the survivor.
+- **Audit-pass-3 enhancement: `!mod show` flags unrecognized modifier ops
+  (scenario 480).** The fold (`_apply_modifier_op`) treats an op outside the
+  recognized set (`add`/`inc%`/`more%`/`set`/`min`/`max`, now the module
+  constant `MODIFIER_OPS`) as a lenient ADD — convenient, but it silently
+  swallows a typo like `inc` for `inc%` (a flat +N instead of a %). Behavior is
+  UNCHANGED (still lenient-add, so no existing match breaks); `!mod show` now
+  marks any such line with ⚠️ and appends an advisory naming the bad op(s) +
+  the valid set, via `Match.unknown_modifier_ops(mods)`. Read-only diagnostic
+  surface only — the fold itself doesn't warn (no clean channel mid-formula).
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
