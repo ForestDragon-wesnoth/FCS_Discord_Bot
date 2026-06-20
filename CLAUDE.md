@@ -1504,6 +1504,39 @@ More shipped work (continuing the list above):
     tiles (0 = half-screen). NOTE: boards are runtime-only (Discord Message
     handles don't serialize) — re-issue after a restart. Minimap (#110's other
     half) was explicitly skipped.
+- **Audit-pass-2 bug fixes (scenarios 468-473).** A second interaction-bug
+  sweep (zones / fog-LOS / movement subsystems). Fixed:
+  - **`move_group_dirs` now validates the whole footprint + blocking** (was
+    anchor-only). Phase 1 checks every swept-footprint cell for bounds + the
+    `block_walk` condition each step, and the FINAL footprint for occupancy
+    (footprint-aware `cell_occupant`, fellow group members treated as
+    transparent via `_occupancy_ignore(extra=...)`) — so a multi-tile member
+    can't march off-grid / onto another body's non-anchor cells, and a group
+    can't walk through an impassable tile/zone/corpse. Mirrors the
+    single-entity `Entity.move_dirs` contract. Scenarios 468-469.
+  - **LOS-only vision casts from the whole body** (`_entity_has_los` /
+    `_team_has_los`). They used the anchor cell only, disagreeing with
+    `_member_sees` (which checks every footprint cell) — so a large viewer's
+    `can_see_losonly` / `team_sees_cell_losonly` was wrong. Now ANY footprint
+    cell with a clear line counts. Scenario 470.
+  - **`_restamp_parts_for` carries a part's auras + sub-parts.** It snapped a
+    part's position but never re-stamped that part's anchored aura or its own
+    sub-parts (a part-of-a-part) — same class as the nested-mount bug fixed in
+    #80. Now walks the whole part subtree (BFS via `entity_part_subtree`,
+    parents first) and re-stamps each moved part's auras. Scenario 471.
+  - **`hidden_rider_grants_vision` rule (default False).** A hidden rider
+    (passenger in a region-less slot) was excluded from being SEEN but still
+    contributed to its team's vision/fog — an asymmetry. Now gated by the rule
+    via the shared `_vision_member_ok` (used by `_team_sees` / `_team_has_los`
+    / `_record_vision`); default off = symmetric (a passenger grants no
+    sight). An explicit per-entity `can_see(<rider>,...)` is unaffected.
+    Scenario 472.
+  - **`resize_grid` shifts `channel_views`.** Resize repositions all
+    coordinate-bearing content by the anchor offset but had missed the
+    per-channel viewport CAMERA (added after resize was written), so a
+    center/edge-anchored resize left the camera framing the wrong region. Now
+    offset like everything else (resolve_viewport re-clamps on read).
+    Scenario 473.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

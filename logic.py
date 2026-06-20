@@ -979,6 +979,24 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "on each), or 'keep' (leave them mounted for manual cleanup)."
         ),
     },
+    # Whether a HIDDEN rider (a passenger in a slot with no `region`, tucked
+    # inside the vehicle) contributes to its team's vision / fog reveal.
+    # Default False — symmetric with a hidden rider being excluded from
+    # being SEEN and from the map (the vehicle's own vision still applies);
+    # a passenger inside a transport grants no sight. Set True for "every
+    # crew member's eyes count" systems. Only affects TEAM vision (fog,
+    # team_sees_*); an explicit can_see(<rider>, ...) query still works.
+    "hidden_rider_grants_vision": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether a hidden rider (passenger in a region-less slot, tucked "
+            "inside the vehicle) adds to its team's vision and fog reveal. "
+            "Default False (symmetric with being hidden from the map); the "
+            "vehicle's own vision still applies. An explicit per-entity "
+            "can_see query on the rider is unaffected."
+        ),
+    },
     # Roster suffix appended to a mounted rider's !list / !state row.
     # Placeholders: {vehicle}, {vehicle_name}, {slot}. Empty = off.
     "mount_entity_line_suffix": {
@@ -4957,6 +4975,14 @@ class Match:
                        if in_new(x + ox, y + oy)}
                 for team, cells in self.explored.items()
             }
+        # Shift each channel's viewport CAMERA by the same offset so it keeps
+        # framing the same content after a center/edge-anchored resize (the
+        # camera is coordinate-bearing too). resolve_viewport re-clamps on
+        # read, so an offset that lands off the (resized) grid self-corrects.
+        if self.channel_views:
+            for ck, off in self.channel_views.items():
+                if isinstance(off, (list, tuple)) and len(off) == 2:
+                    self.channel_views[ck] = [off[0] + ox, off[1] + oy]
 
         self.grid_width, self.grid_height = new_w, new_h
         return ({"offset": (ox, oy), "anchor": key, "killed": cut,
@@ -5352,19 +5378,26 @@ class Match:
         return named
 
     def _restamp_parts_for(self, parent_id: str) -> None:
-        """Glue every attached part to the parent's current anchor cell.
+        """Glue every attached part to its parent's current anchor cell.
         Called whenever the parent moves (alongside aura restamping) so a
-        part's mirrored position rides along. Parts are non-occupying, so
-        co-locating them on the parent's cell is always legal."""
-        parent = self.entities.get(parent_id)
-        if parent is None:
+        part's mirrored position rides along. Walks the WHOLE part subtree
+        (BFS, parents before children) so a part-of-a-part rides along too,
+        and re-stamps each moved part's OWN anchored auras so a part's aura
+        follows the parent (same carry shape as _restamp_riders_for). Parts
+        are non-occupying, so co-locating them is always legal."""
+        if parent_id not in self.entities:
             return
-        for e in self.entities.values():
+        for e in self.entity_part_subtree(parent_id):
             # Located parts keep their own cell — only glued parts ride along.
-            if e.part_of == parent_id and not e.vars.get("__part_located") \
-                    and (e.x != parent.x or e.y != parent.y):
-                e.x = parent.x
-                e.y = parent.y
+            if e.vars.get("__part_located"):
+                continue
+            par = self.entities.get(e.part_of)
+            if par is None:
+                continue
+            if e.x != par.x or e.y != par.y:
+                e.x = par.x
+                e.y = par.y
+                self._restamp_anchors_for(e.id)
 
     # ---------- snake / segmented bodies ----------
     def snake_segments(self, head_id: str) -> List["Entity"]:
@@ -6922,12 +6955,25 @@ class Match:
                 return True
         return False
 
+    def _vision_member_ok(self, e: "Entity", pov_team: str) -> bool:
+        """Whether `e` counts toward `pov_team`'s aggregate vision: an alive
+        team member that isn't a glued part and (unless
+        hidden_rider_grants_vision) isn't a hidden rider tucked inside a
+        vehicle. Shared by _team_sees / _team_has_los / _record_vision so the
+        'who provides sight' rule is defined once."""
+        if not (e.is_alive and not e.is_glued_part and e.team == pov_team):
+            return False
+        if e.is_hidden_rider and not bool(
+                self.rules.get("hidden_rider_grants_vision", False)):
+            return False
+        return True
+
     def _team_sees(self, pov_team: Optional[str], x: int, y: int,
                    *, los: bool) -> bool:
         if not pov_team:
             return True
         for e in self.entities.values():
-            if e.is_alive and not e.is_glued_part and e.team == pov_team and \
+            if self._vision_member_ok(e, pov_team) and \
                self._member_sees(e, x, y, los=los):
                 return True
         return False
@@ -6938,8 +6984,8 @@ class Match:
         if not pov_team:
             return True
         for e in self.entities.values():
-            if e.is_alive and not e.is_glued_part and e.team == pov_team and \
-               self.has_los(e.id, e.x, e.y, x, y):
+            if self._vision_member_ok(e, pov_team) and \
+               self._entity_has_los(e.id, x, y):
                 return True
         return False
 
@@ -6950,10 +6996,14 @@ class Match:
         return self._member_sees(e, x, y, los=los)
 
     def _entity_has_los(self, eid: str, x: int, y: int) -> bool:
+        # A large viewer casts LOS from its WHOLE body — clear from ANY
+        # footprint cell counts (mirrors _member_sees, which checks every
+        # cell for the range+LOS query).
         e = self.entities.get(eid)
         if e is None:
             return False
-        return self.has_los(eid, e.x, e.y, x, y)
+        return any(self.has_los(eid, ex, ey, x, y)
+                   for (ex, ey) in self.entity_cells(e))
 
     def _fog_team_sees(self, pov_team: Optional[str], x: int, y: int) -> bool:
         """Team vision for the FOG feature: range, plus LOS when the fog_los
@@ -7014,7 +7064,7 @@ class Match:
         seen = self.explored.setdefault(team, set())
         use_los = bool(self.rules.get("fog_los", False))
         for e in self.entities.values():
-            if not e.is_alive or e.is_glued_part or e.team != team:
+            if not self._vision_member_ok(e, team):
                 continue
             r = self._vision_radius_of(e)
             # A large viewer reveals the UNION of every footprint cell's
@@ -11744,27 +11794,42 @@ class Match:
                     step_facing = "up" if dy < 0 else "down"
                 for _ in range(max(1, int(count))):
                     nx, ny = x + dx, y + dy
-                    if not self.in_bounds(nx, ny):
-                        raise OutOfBounds(
-                            f"Group '{group_name}' move aborted: member "
-                            f"'{eid}' would leave the grid at ({nx},{ny})."
-                        )
+                    # Per-step: the WHOLE swept footprint must be in bounds and
+                    # unblocked (a body can't squeeze through a gap narrower
+                    # than itself, and can't cross impassable terrain) — same
+                    # contract as Entity.move_dirs. Intermediate occupancy is
+                    # passed through; only the FINAL footprint is occupancy-
+                    # checked (below).
+                    for cx, cy in self.entity_cells(e, nx, ny):
+                        if not self.in_bounds(cx, cy):
+                            raise OutOfBounds(
+                                f"Group '{group_name}' move aborted: member "
+                                f"'{eid}' would leave the grid at ({cx},{cy})."
+                            )
+                        if self._check_block(eid, cx, cy, "walk"):
+                            raise Blocked(
+                                f"Group '{group_name}' move aborted: member "
+                                f"'{eid}' is blocked at ({cx},{cy})."
+                            )
                     path.append((nx, ny, step_facing))
                     x, y = nx, ny
-            # Final-cell occupancy: ignore the entity itself AND every
-            # other group member (they're moving too — treat as
-            # transparent). We hand-roll the loop here because
-            # Match.is_occupied only takes a single ignore_entity_id.
-            for other_eid, other_e in self.entities.items():
-                if (other_eid in member_set or other_e.is_glued_part
-                        or other_e.is_mounted):
-                    continue
-                if other_e.x == x and other_e.y == y and other_e.is_alive:
-                    raise Occupied(
-                        f"Group '{group_name}' move aborted: member "
-                        f"'{eid}' would land on ({x},{y}), occupied by "
-                        f"'{other_eid}'."
-                    )
+            # Final-footprint occupancy: ignore the entity itself AND every
+            # other group member (they're moving too — treat as transparent),
+            # plus the mover's own snake segments. cell_occupant is footprint-
+            # aware and already skips glued parts / mounted riders, so a large
+            # member can't land overlapping a stationary body's non-anchor
+            # cells. Stackable / glued movers skip the gate (as elsewhere).
+            glued = bool(e.part_of) and not e.vars.get("__part_located")
+            if not e.is_cell_stackable and not glued:
+                ignore = self._occupancy_ignore(e, extra=tuple(member_set))
+                for cx, cy in self.entity_cells(e, x, y):
+                    occ = self.cell_occupant(cx, cy, ignore)
+                    if occ is not None:
+                        raise Occupied(
+                            f"Group '{group_name}' move aborted: member "
+                            f"'{eid}' would land on ({cx},{cy}), occupied by "
+                            f"'{occ}'."
+                        )
             plans[eid] = path
 
         # Phase 2: commit per member, firing tile hooks step by step.
