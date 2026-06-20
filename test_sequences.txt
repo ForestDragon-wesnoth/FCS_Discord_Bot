@@ -12294,3 +12294,30 @@ fire before the fix, because fire_scheduled_turn was only invoked for the active
 turn_order entity. Now a part's turn schedule fires on the parent's turn start:
 the leg's −5 effect (delay 1) fires once, dropping it 25→20, and the schedule is
 consumed (the second `!schedule list` is empty).
+
+
+SCENARIO 478 — Action rollback preserves the live event-bus stack (no "pop from empty list")
+-------------------------------------------------------------------------------------------
+
+!match new evr EventRollback 8 6
+!match use evr
+!ent add a a 30 2 2 10
+!ent set_var a actions.outer.target none
+!ent set_var a actions.outer.body "emit('zap', {'mark': 42}, self)\nentity[self].after = event_has('mark')"
+!ent set_var a actions.bad.target none
+!ent set_var a actions.bad.body "entity[self].hp = entity[self].hp - 1\nfail('nope')"
+!passive add a h event:zap "entity[self].log = event_get('mark')\nuse_action(self, 'bad')\nentity[self].log2 = event_get('mark')"
+!action a outer
+!ent dump a
+
+Expected: action `outer` emits `zap` (pushing a frame on the event-bus stack),
+whose handler reads the payload (`log`=42), then runs the sub-action `bad` which
+deducts hp and `fail()`s — rolling back. Before the fix the rollback rebuilt the
+match from a snapshot and clobbered the LIVE event-bus runtime fields, wiping the
+in-flight emit frame; the handler's next `event_get` and the emit's own cleanup
+then hit "pop from empty list", crashing the whole `outer` action. Now
+`_rollback_match` preserves the event stack (and every other runtime-only
+field), so `outer` succeeds: `log`=42 AND `log2`=42 (the payload is still
+readable after the rolled-back sub-action), `a.hp` stays 30 (the sub-action's −1
+was rolled back), and `after`=false (the emit popped its frame normally on
+completion).

@@ -1564,6 +1564,23 @@ More shipped work (continuing the list above):
   found correct: `Match.to_dict`/`from_dict` round-trips every persistent field
   — `pending_requests` is intentionally runtime-only — and push/pull/swap are
   footprint-aware for multi-tile bodies.)
+- **Audit-pass-3 fix: action rollback preserves ALL runtime-only state
+  (scenario 478).** `action._rollback_match` restores a failed action's
+  transaction by rebuilding the Match from the pre-state snapshot and copying
+  its fields back, then re-applying a curated list of runtime-only (underscore)
+  fields the snapshot doesn't carry. That list had gone STALE — it missed the
+  event-bus fields (`_event_stack`/`_event_depth`/`_event_warned`/
+  `_event_warnings`) and others (`_summon_count`, `_death_processing`,
+  `_death_check_suppressed_ids`, `_alive_eval_depth`, `_vision_memo`,
+  `_turn_order_dirty`, `_request_seq`, `pending_requests`). The headline crash:
+  an action that `emit()`s an event whose handler runs a FAILING sub-action —
+  the sub-action's rollback wiped the LIVE `_event_stack` (holding the outer
+  emit's frame), so the handler's next `event_get` and the emit's own cleanup
+  hit "pop from empty list", crashing the whole outer action. Fix: preserve the
+  COMPLETE set of runtime fields (rollback only restores SERIALIZED state;
+  transient in-flight state — the emit stack, summon budget, etc. — must
+  survive). The list must stay in sync with Match's underscore fields; a
+  `hasattr` guard makes a future-missing name a no-op rather than a crash.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
