@@ -1042,7 +1042,7 @@ More shipped work (continuing the list above):
   - **Parent death** → parts are snapshotted into the corpse and removed (no
     orphaned visible limbs); `revive_corpse` re-spawns them (delivers "revive
     parent ⇒ revive parts"). `!ent dump` shows a "body parts:" section + "Body
-    part of:"; `!part list` shows hp + knobs. Scenarios 396-398; further coverage 414 (composite 2×2 with region head + torso), 415 (detach → free entity), 416 (parent death snapshots parts + revive restores), 417 (killing a part = limb destruction, never a corpse — `_process_death` routes a part to `_process_part_death`; only non-parts corpse).
+    part of:"; `!part list` shows hp + knobs. Scenarios 396-398; further coverage 414 (composite 2×2 with region head + torso), 415 (detach → free entity), 416 (parent death snapshots parts + revive restores), 417 (killing a part = limb destruction, never a corpse — `_process_death` routes a part to `_process_part_death`; only non-parts corpse). Multi-level part SUBTREES (a part of a part, e.g. dragon→wing→feather — the shape `copy_entity`/transfer already walks via BFS) are now handled on death/revive too: `entity_part_subtree(root)` (BFS, parents before children) drives both the death cascade (the WHOLE subtree is removed, no deeper-limb zombie) and the corpse snapshot (whole subtree stored in parent-before-child order, so revive re-spawns each after its parent and re-attaches the tree). Scenario 467.
   DEFERRED TODOs (the user explicitly wants these tracked):
   - **AoE damage SPREAD between main and limbs — SHIPPED (scenario 410).**
     `damage_spread(target, total[, mode, fragments])` → to-main; splits total
@@ -1454,6 +1454,15 @@ More shipped work (continuing the list above):
     FUTURE the user may want: per-rider footprint inside a vehicle, edge-aware
     boarding range (mount only from an adjacent cell), nested vehicles' shared
     fuel/initiative, and an armor layer for riders-inside (positional cover).
+  - **Mount bug fixes (scenarios 465-466).** (1) NESTED carry: a vehicle that
+    is itself a rider now carries its OWN cargo when the rig moves —
+    `_restamp_riders_for` replays fire_entity_moved's carry-restamp trio
+    (anchors/parts/riders) for each moved rider, recursing down the stack
+    (cycles are can_mount-guarded), so a rider-on-a-cart-in-a-gunship follows
+    the gunship. (2) A rider that DIES revives UNMOUNTED: `_store_corpse` strips
+    `mounted_on`/`mount_slot` from the snapshot, so revive_corpse no longer
+    restores a phantom-mounted entity (an invisible "rider" on the ground / a
+    free re-seat). It can mount again afterward.
 - **Map viewport (panning) + auto-legend + auto-update boards — SHIPPED
   (scenarios 463-464; #110 + #111 + #24).** The Discord-surface map block.
   - **Viewport / panning (#110, headless-testable core).** Caps how much grid
