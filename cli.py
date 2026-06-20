@@ -45,6 +45,9 @@ class CLICtx:
     # _enable_terminal_color(); a terminal that can't process ANSI gets
     # plain output (and a one-time warning) rather than raw escape codes.
     supports_color = True
+    # The CLI fits wide output, so the map viewport stays OFF in 'auto'
+    # mode (set the viewport_mode rule to 'on' to force it). See ReplyContext.
+    viewport_capable = False
     # The CLI is single-user and local, so identity is a switchable
     # stand-in (the `!as` command flips it) used to PREVIEW what a host
     # vs a player sees. Default identity "cli" owns any match it creates.

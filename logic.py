@@ -1525,6 +1525,70 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Only the first character is used."
         ),
     },
+    # ---- map viewport (panning) + legend ----
+    # The viewport caps how much map is shown at once (for surfaces with
+    # limited width, like Discord): when EITHER grid dimension exceeds its
+    # cap, only a window of that size renders and the channel pans it around.
+    # A grid that fits both caps renders whole (no viewport).
+    "viewport_width": {
+        "default": 30,
+        "schema": {"type": "int"},
+        "desc": (
+            "Max map columns shown at once before a horizontal viewport "
+            "engages. A grid wider than this renders a window and the "
+            "channel pans it (`!map pan left|right`)."
+        ),
+    },
+    "viewport_height": {
+        "default": 30,
+        "schema": {"type": "int"},
+        "desc": (
+            "Max map rows shown at once before a vertical viewport engages "
+            "(see viewport_width)."
+        ),
+    },
+    # Whether the viewport applies on a given surface. 'auto' (default)
+    # defers to the surface: Discord (narrow) opts IN, the CLI / harness
+    # (which fit wide output) opt OUT. 'on' forces the viewport on every
+    # surface (e.g. to pan a huge map in the CLI); 'off' disables it
+    # everywhere (always render the whole grid).
+    "viewport_mode": {
+        "default": "auto",
+        "schema": {"type": "enum", "choices": ["auto", "on", "off"]},
+        "desc": (
+            "When the map viewport engages: 'auto' (Discord on, CLI/harness "
+            "off), 'on' (all surfaces), or 'off' (never — always render the "
+            "whole grid). Caps are viewport_width / viewport_height."
+        ),
+    },
+    # How many tiles a single Discord arrow-button click pans the viewport
+    # (the buttons move in bigger steps than the command, which pans an
+    # exact count). 0 = half the viewport in that axis (a "half-screen"
+    # scroll that scales with the window). The `!map pan <dir> [n]` command
+    # always pans exactly n (default 1) regardless of this.
+    "viewport_button_step": {
+        "default": 0,
+        "schema": {"type": "int"},
+        "desc": (
+            "Tiles per Discord pan-button click (0 = half the viewport — a "
+            "half-screen scroll). The `!map pan <dir> [n]` command pans an "
+            "exact n instead."
+        ),
+    },
+    # Auto-legend: a glyph->meaning key appended under the map. Seeds a new
+    # match's per-match toggle (flip live with `!map legend on|off`); a
+    # one-off `!map legend` / `!map nolegend` arg overrides per render.
+    "map_legend_by_default": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether NEW matches start with the auto-legend on (a "
+            "glyph->meaning key under the map covering the entities / tiles "
+            "/ zones / fog actually visible in the current view). Toggle "
+            "live with `!map legend on|off`; force per render with the "
+            "`!map legend` / `!map nolegend` argument."
+        ),
+    },
     # Fog MEMORY (explored terrain). When on, cells a team has ever seen
     # stay revealed even after they leave current vision (the team
     # "remembers" the lay of the land), instead of the map snapping back
@@ -4629,6 +4693,19 @@ class Match:
     # supports_color — the scenario harness doesn't, so scenarios stay
     # plain regardless.)
     color_enabled: bool = True
+
+    # ---- map viewport (panning) + auto-legend ----
+    # Per-CHANNEL viewport offset: channel_key -> [x, y], the top-left
+    # anchor of that channel's render window. Auto-created on the first pan
+    # / view command, clamped so the window stays on the grid; only used
+    # when the viewport engages (a grid dimension exceeds its cap and the
+    # surface opts in). Per-channel so different channels pan independently
+    # (the panning analog of per-channel POV). Serialized.
+    channel_views: Dict[str, List[int]] = field(default_factory=dict)
+    # Per-match auto-legend toggle (seeded from the map_legend_by_default
+    # rule at creation; flip with `!map legend on|off`). When on, a
+    # glyph->meaning key is appended under the rendered map. Serialized.
+    map_legend_enabled: bool = False
 
     # ---- reusable named macros ----
     # name -> a body of command lines (newline-separated). Run via `!macro
@@ -10853,6 +10930,10 @@ class Match:
             },
             "team_colors": dict(self.team_colors),
             "color_enabled": bool(self.color_enabled),
+            "channel_views": {k: [int(v[0]), int(v[1])]
+                              for k, v in self.channel_views.items()
+                              if isinstance(v, (list, tuple)) and len(v) == 2},
+            "map_legend_enabled": bool(self.map_legend_enabled),
         }
         if include_history:
             d["history"] = self.history.to_dict()
@@ -11025,6 +11106,12 @@ class Match:
             if isinstance(k, str) and isinstance(v, str)
         } if isinstance(raw_tc, dict) else {}
         m.color_enabled = bool(d.get("color_enabled", True))
+        raw_views = d.get("channel_views", {})
+        m.channel_views = {
+            str(k): [int(v[0]), int(v[1])] for k, v in raw_views.items()
+            if isinstance(k, str) and isinstance(v, (list, tuple)) and len(v) == 2
+        } if isinstance(raw_views, dict) else {}
+        m.map_legend_enabled = bool(d.get("map_legend_enabled", False))
         # History is optional in saved dicts. It's only present when the
         # original save was made with include_history=True. A snapshot's
         # state.dict deliberately omits history (snapshots-within-
@@ -11130,9 +11217,84 @@ class Match:
             return None
         return self._resolve_color_value(z.get("color"), {"zone_name": name})
 
+    # ---- map viewport (panning) -------------------------------------
+    # The viewport caps how much grid renders at once. It engages when
+    # EITHER dimension exceeds its cap (so a 70x5 grid still windows
+    # horizontally). The window size is min(cap, grid) per axis; the
+    # per-channel offset (channel_views[ch]) is the top-left anchor,
+    # clamped so the window never runs off the grid.
+
+    def _viewport_dims(self) -> Tuple[int, int]:
+        """The window size (w, h) = min(cap, grid) per axis."""
+        cw = max(1, int(self.rules.get("viewport_width", 30)))
+        ch = max(1, int(self.rules.get("viewport_height", 30)))
+        return min(cw, self.grid_width), min(ch, self.grid_height)
+
+    def viewport_engaged(self) -> bool:
+        """True iff the grid exceeds a cap on either axis (so a window is
+        needed). Independent of the surface toggle (viewport_mode) — the
+        command layer ANDs this with whether the surface opts in."""
+        cw = max(1, int(self.rules.get("viewport_width", 30)))
+        ch = max(1, int(self.rules.get("viewport_height", 30)))
+        return self.grid_width > cw or self.grid_height > ch
+
+    def _clamp_view(self, x: int, y: int,
+                    vw: int, vh: int) -> Tuple[int, int]:
+        """Clamp a top-left anchor so the vw x vh window stays on the grid."""
+        x = max(1, min(int(x), self.grid_width - vw + 1))
+        y = max(1, min(int(y), self.grid_height - vh + 1))
+        return x, y
+
+    def resolve_viewport(self, channel_key: str, *,
+                         enabled: bool) -> Optional[Tuple[int, int, int, int]]:
+        """The (vx, vy, vw, vh) window to render for `channel_key`, or None
+        for the whole grid. None when the viewport is disabled for this
+        surface (enabled=False) or the grid fits both caps. The offset comes
+        from channel_views (default top-left), clamped to the grid."""
+        if not enabled or not self.viewport_engaged():
+            return None
+        vw, vh = self._viewport_dims()
+        off = self.channel_views.get(channel_key)
+        ox, oy = (off[0], off[1]) if isinstance(off, (list, tuple)) and \
+            len(off) == 2 else (1, 1)
+        vx, vy = self._clamp_view(ox, oy, vw, vh)
+        return (vx, vy, vw, vh)
+
+    def set_view(self, channel_key: str, x: int, y: int) -> Tuple[int, int]:
+        """Set a channel's viewport top-left to (x, y) (clamped). Returns the
+        stored (clamped) anchor."""
+        vw, vh = self._viewport_dims()
+        vx, vy = self._clamp_view(x, y, vw, vh)
+        self.channel_views[channel_key] = [vx, vy]
+        return vx, vy
+
+    def center_view(self, channel_key: str,
+                    cx: int, cy: int) -> Tuple[int, int]:
+        """Center a channel's viewport on (cx, cy) as nearly as the grid
+        allows (the "move the camera to the protagonist" helper). Returns the
+        stored (clamped) top-left anchor."""
+        vw, vh = self._viewport_dims()
+        return self.set_view(channel_key, cx - vw // 2, cy - vh // 2)
+
+    def pan_view(self, channel_key: str, dx: int, dy: int) -> Tuple[int, int]:
+        """Shift a channel's viewport by (dx, dy) tiles from its current
+        (clamped) anchor. Returns the new (clamped) anchor."""
+        vw, vh = self._viewport_dims()
+        off = self.channel_views.get(channel_key)
+        ox, oy = (off[0], off[1]) if isinstance(off, (list, tuple)) and \
+            len(off) == 2 else (1, 1)
+        ox, oy = self._clamp_view(ox, oy, vw, vh)
+        return self.set_view(channel_key, ox + int(dx), oy + int(dy))
+
+    def clear_view(self, channel_key: str) -> None:
+        """Forget a channel's viewport offset (snaps back to top-left)."""
+        self.channel_views.pop(channel_key, None)
+
     def render_ascii(self, pov_team: Optional[str] = None,
                      colorize: bool = False,
-                     hidden_layers: Optional["set[str]"] = None) -> str:
+                     hidden_layers: Optional["set[str]"] = None,
+                     viewport: Optional[Tuple[int, int, int, int]] = None,
+                     legend: bool = False) -> str:
         """Render the ASCII map. Thin wrapper that activates the read-only
         _fog_team_sees memo for the duration of the render, so the per-cell,
         per-layer fog scan doesn't recompute the same team-sight (each
@@ -11147,13 +11309,16 @@ class Match:
         if prev is None:
             self._vision_memo = {}
         try:
-            return self._render_ascii_impl(pov_team, colorize, hidden)
+            return self._render_ascii_impl(pov_team, colorize, hidden,
+                                           viewport=viewport, legend=legend)
         finally:
             self._vision_memo = prev
 
     def _render_ascii_impl(self, pov_team: Optional[str] = None,
                            colorize: bool = False,
-                           hidden: "set[str]" = frozenset()) -> str:
+                           hidden: "set[str]" = frozenset(),
+                           viewport: Optional[Tuple[int, int, int, int]] = None,
+                           legend: bool = False) -> str:
         # `pov_team` filters EVERY layer through its visibility rule: a
         # zone / tile / entity hidden from that team isn't painted (its
         # cell falls back to whatever layer is visible underneath, so the
@@ -11174,6 +11339,17 @@ class Match:
             [None for _ in range(self.grid_width + 1)]
             for _ in range(self.grid_height + 1)
         ]
+        # `meanings` (only allocated for the auto-legend) is a parallel grid
+        # of "what is this glyph" strings, set alongside each painted glyph
+        # so the legend reflects the FINAL top-layer glyph actually shown
+        # (and only the cells in the rendered window). None = nothing to
+        # explain (the background '.').
+        meanings: Optional[List[List[Optional[str]]]] = None
+        if legend:
+            meanings = [
+                [None for _ in range(self.grid_width + 1)]
+                for _ in range(self.grid_height + 1)
+            ]
 
         # Zone layer (lowest): a single-char `glyph` paints all the zone's
         # cells; a `color` tints them (the glyph if present, else the '.').
@@ -11192,6 +11368,8 @@ class Match:
                 if has_glyph:
                     grid[zy][zx] = g
                     colors[zy][zx] = zc
+                    if meanings is not None:
+                        meanings[zy][zx] = f"zone: {zname}"
                 elif zc is not None:
                     colors[zy][zx] = zc
 
@@ -11217,6 +11395,11 @@ class Match:
             if has_glyph:
                 grid[ty][tx] = glyph
                 colors[ty][tx] = tc            # tile owns the cell (tc may be None)
+                if meanings is not None:
+                    tname = data.get("_template")
+                    meanings[ty][tx] = (f"tile: {tname}"
+                                        if isinstance(tname, str) and tname
+                                        else "tile")
             elif tc is not None:
                 colors[ty][tx] = tc
 
@@ -11243,6 +11426,8 @@ class Match:
                 if self.in_bounds(cx, cy):
                     grid[cy][cx] = sym
                     colors[cy][cx] = ecol
+                    if meanings is not None:
+                        meanings[cy][cx] = e.name or e.id
 
         # Visible-rider priority pass: a rider in a region slot sits ON the
         # vehicle, so it draws over the vehicle glyph at its slot cell.
@@ -11257,6 +11442,8 @@ class Match:
                 if self.in_bounds(cx, cy):
                     grid[cy][cx] = sym
                     colors[cy][cx] = ecol
+                    if meanings is not None:
+                        meanings[cy][cx] = e.name or e.id
 
         # Region-part priority pass: a region part overlaps its parent, so by
         # default it only draws over the parent when it has a CUSTOM glyph (a
@@ -11275,6 +11462,8 @@ class Match:
                     if self.in_bounds(cx, cy):
                         grid[cy][cx] = sym
                         colors[cy][cx] = ecol
+                        if meanings is not None:
+                            meanings[cy][cx] = e.name or e.id
 
         # Fog overlay (last): an unrevealed cell shows fog_glyph and no
         # color (fog hides whatever tint was there).
@@ -11286,12 +11475,26 @@ class Match:
                     if not self._fog_terrain_visible(pov_team, xx, yy):
                         grid[yy][xx] = fg
                         colors[yy][xx] = None
+                        if meanings is not None:
+                            meanings[yy][xx] = ("fog (unseen)"
+                                                if fg != "." else None)
+
+        # Window bounds: the viewport (vx, vy, vw, vh) clips the rendered
+        # cells to a sub-rectangle of the grid (clamped); None = whole grid.
+        if viewport is not None:
+            vx, vy, vw, vh = viewport
+            x0 = max(1, vx)
+            y0 = max(1, vy)
+            x1 = min(self.grid_width, vx + vw - 1)
+            y1 = min(self.grid_height, vy + vh - 1)
+        else:
+            x0, y0, x1, y1 = 1, 1, self.grid_width, self.grid_height
 
         # Compose, wrapping each cell in its ANSI color when colorizing.
         lines = []
-        for yy in range(1, self.grid_height + 1):
+        for yy in range(y0, y1 + 1):
             cells = []
-            for xx in range(1, self.grid_width + 1):
+            for xx in range(x0, x1 + 1):
                 ch = grid[yy][xx]
                 if colorize:
                     name = colors[yy][xx]
@@ -11300,7 +11503,28 @@ class Match:
                         ch = f"\x1b[{code}m{ch}\x1b[0m"
                 cells.append(ch)
             lines.append(" ".join(cells))
-        return "\n".join(lines)
+        out = "\n".join(lines)
+
+        # Auto-legend: glyph -> meanings, collected from the cells actually
+        # rendered (within the window) so it explains only what's on screen.
+        if meanings is not None:
+            legend_map: Dict[str, List[str]] = {}
+            for yy in range(y0, y1 + 1):
+                for xx in range(x0, x1 + 1):
+                    mean = meanings[yy][xx]
+                    if not mean:
+                        continue
+                    glyph = grid[yy][xx]
+                    bucket = legend_map.setdefault(glyph, [])
+                    if mean not in bucket:
+                        bucket.append(mean)
+            if legend_map:
+                leg_lines = ["Legend:"]
+                for glyph in sorted(legend_map):
+                    leg_lines.append(
+                        f"  {glyph} — " + ", ".join(legend_map[glyph]))
+                out = out + "\n" + "\n".join(leg_lines)
+        return out
 
     def _spawn_facing(self, x: int, y: int) -> Direction:
         eight_way = bool(self.rules.get("allow_diagonal_facing", False))
@@ -11666,6 +11890,9 @@ class MatchManager:
         # rule — a refresh won't flip it.
         m.fog_enabled = bool(rules.get("fog_enabled_by_default", False))
         m.fog_memory = bool(rules.get("fog_memory_enabled_by_default", False))
+        # Seed the per-match auto-legend toggle from the system default
+        # (then match state, flipped via `!map legend on|off`).
+        m.map_legend_enabled = bool(rules.get("map_legend_by_default", False))
         # Seed match-level templates from the system's defaults. We copy
         # so subsequent match-side define / undefine doesn't reach back
         # into GameSystem.tile_templates — the system's library is the

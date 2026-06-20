@@ -1454,6 +1454,47 @@ More shipped work (continuing the list above):
     FUTURE the user may want: per-rider footprint inside a vehicle, edge-aware
     boarding range (mount only from an adjacent cell), nested vehicles' shared
     fuel/initiative, and an armor layer for riders-inside (positional cover).
+- **Map viewport (panning) + auto-legend + auto-update boards — SHIPPED
+  (scenarios 463-464; #110 + #111 + #24).** The Discord-surface map block.
+  - **Viewport / panning (#110, headless-testable core).** Caps how much grid
+    renders at once: engages when EITHER dimension exceeds its cap (a 70×5 grid
+    still windows horizontally), window size = min(cap, grid) per axis. Caps are
+    the `viewport_width` / `viewport_height` rules (default 30). Per-CHANNEL
+    offset in `Match.channel_views` (channel_key -> [x,y], serialized), the
+    panning analog of per-channel POV. Surface gating: the `viewport_mode` rule
+    (`auto` default | `on` | `off`) — `auto` defers to the surface's
+    `ctx.viewport_capable` flag (Discord True, CLI/harness False), so the CLI
+    shows the whole map unless forced `on`. Core on Match: `viewport_engaged`,
+    `_viewport_dims`, `resolve_viewport(channel_key, enabled=)`→(vx,vy,vw,vh)|
+    None, `set_view` / `center_view` / `pan_view` / `clear_view` (all clamp the
+    window to the grid). `render_ascii(..., viewport=(x,y,w,h))` clips the
+    composition loop to the window. Commands: `!map pan <dir> [n]` (exact n
+    tiles, default 1), `!map center <eid>` / `!map center <x> <y>` (camera to an
+    entity/coord — clamped), `!map view <x> <y>` / `!map view reset`. pan/center/
+    view are per-CHANNEL camera state so they stay player-available; the bare
+    `!map` shows a "viewport (...)" header + pan hint when windowed.
+  - **Auto-legend (#111, headless-testable).** A glyph→meaning key appended
+    under the map, built from a parallel `meanings` grid populated only when
+    `legend=True` (so it reflects the FINAL top-layer glyph at each cell and
+    ONLY cells in the rendered window — POV/fog/viewport-correct). Entities →
+    name, tiles → template name or "tile", zones → "zone: <name>", fog →
+    "fog (unseen)"; grouped by glyph, row-major scan order. Per-match toggle
+    `Match.map_legend_enabled` (seeded from `map_legend_by_default`, default
+    off; serialized), command `!map legend on|off` (host-gated) + one-off
+    `legend=on|off` arg.
+  - **Auto-update boards (#24, Discord-ONLY — can't be harness-tested).** A
+    self-refreshing map message per channel, edited in place after every
+    command instead of re-posting. Lives in discord_commands.py (`_boards`
+    registry, `_board_render`, `_refresh_boards_for_match`, `_PanView` arrow
+    buttons, `DiscordCtxWrapper.set_autoupdate`); the post-dispatch refresh is
+    hooked in `_dispatch` (single + batch) and the approval re-dispatch. A
+    change in one channel refreshes every board on the same match. `!map
+    autoupdate on|off` (host-gated) — surface-agnostic handler calls the
+    optional `ctx.set_autoupdate` hook, so the CLI/harness report it as
+    Discord-only rather than erroring. Arrow buttons pan by `viewport_button_step`
+    tiles (0 = half-screen). NOTE: boards are runtime-only (Discord Message
+    handles don't serialize) — re-issue after a restart. Minimap (#110's other
+    half) was explicitly skipped.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
