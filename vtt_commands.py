@@ -530,8 +530,11 @@ def _render_template(tmpl: str, ctx: Dict[str, Any]) -> str:
     return _TMPL_PLACE_RE.sub(_place_sub, s)
 
 
-def _entity_template_context(e: Entity) -> Dict[str, Any]:
-    """Build the placeholder context for an Entity."""
+def _entity_template_context(e: Entity,
+                             pov_team: Optional[str] = None) -> Dict[str, Any]:
+    """Build the placeholder context for an Entity. When `pov_team` is a
+    non-allied viewer and the entity is disguised (116), the disguise's name
+    and `vars` overlay the real values so the roster shows the fake statblock."""
     hp_var, max_hp_var, init_var = e._vital_var_names()
     # Start with entity attributes (these win over var keys on collision).
     ctx: Dict[str, Any] = {
@@ -552,11 +555,26 @@ def _entity_template_context(e: Entity) -> Dict[str, Any]:
     for k, v in e.vars.items():
         if k not in ctx:
             ctx[k] = v
+    # Disguise overlay (116): a non-allied viewer sees the fake name + vars.
+    # The disguise's vars win over EVERYTHING (incl. the computed hp/max_hp/
+    # team) — that's the point of a fake statblock.
+    if pov_team is not None and e._match is not None:
+        dis = e._match._effective_disguise(e, pov_team)
+        if dis is not None:
+            n = dis.get("name")
+            if isinstance(n, str) and n:
+                ctx["name"] = n
+            dvars = dis.get("vars")
+            if isinstance(dvars, dict):
+                for k, v in dvars.items():
+                    ctx[k] = v
     return ctx
 
 
-def _entity_line(e: Entity) -> str:
-    """Single-line entity summary, rendered from the active match's entity_line_format rule."""
+def _entity_line(e: Entity, pov_team: Optional[str] = None) -> str:
+    """Single-line entity summary, rendered from the active match's
+    entity_line_format rule. `pov_team` (a non-allied viewer) applies the
+    entity's disguise (116) to the rendered name + stats."""
     tmpl = None
     if e._match is not None:
         tmpl = e._match.rules.get("entity_line_format")
@@ -566,7 +584,7 @@ def _entity_line(e: Entity) -> str:
             "entity_line_format",
             "{name} ({id}): HP: {hp}/{max_hp} X,Y: {x},{y} facing {facing}",
         )
-    line = _render_template(tmpl, _entity_template_context(e))
+    line = _render_template(tmpl, _entity_template_context(e, pov_team))
     # Sub-entity (body part / segment) suffix: append body_part_entity_line_suffix
     # with {parent} / {parent_name} bound, so a roster shows which body a part
     # belongs to. Only fires for an entity whose part_of points at a live parent.
@@ -2929,6 +2947,64 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"`summon_from('{dest_path}', x, y)`)."
         )
 
+    # ---- transform <id> <template_ref> [stash_path] ----
+    # Polymorph/transform (115): swap an entity's statblock for a template
+    # while keeping its identity (id/position/facing/team/turn-order slot).
+    # template_ref resolves as a dotted VAR PATH on the entity (the
+    # summon_from convention: store a template, then transform into it), and
+    # falls back to a live entity id (snapshot it). With a stash_path the
+    # pre-transform statblock is saved there so `!ent revert` can restore it.
+    if sub == "transform":
+        if await return_help_if_not_enough_args(ctx, args, 3, "ent", "transform"):
+            return
+        tid = _resolve_eid(m, args[1])
+        if tid not in m.entities:
+            raise NotFound(f"Entity '{tid}' not found.")
+        ref = args[2]
+        stash_path = args[3] if len(args) >= 4 else None
+        # Resolve the template: a dotted var path on the entity, else a live
+        # entity to snapshot.
+        node = m.entities[tid].vars
+        for key in ref.split("."):
+            if isinstance(node, dict) and key in node:
+                node = node[key]
+            else:
+                node = None
+                break
+        if isinstance(node, dict):
+            template = node
+        else:
+            other = _resolve_eid(m, ref)
+            if other in m.entities:
+                template = m.entity_template_dict(m.entities[other])
+            else:
+                return await ctx.send(
+                    f"❌ No template found: `{ref}` is neither a dict var on "
+                    f"`{tid}` nor a live entity id.")
+        try:
+            m.transform_entity(tid, template, stash_path)
+        except (VTTError, NotFound, Occupied) as ex:
+            return await ctx.send(f"❌ {ex}")
+        stash_note = (f" (original stashed at vars.{stash_path} — "
+                      f"`!ent revert {tid} {stash_path}` to restore)"
+                      if stash_path else "")
+        return await ctx.send(
+            f"`{tid}` transformed into **{m.entities[tid].name}**{stash_note}.")
+
+    # ---- revert <id> <stash_path> ----
+    if sub == "revert":
+        if await return_help_if_not_enough_args(ctx, args, 3, "ent", "revert"):
+            return
+        tid = _resolve_eid(m, args[1])
+        if tid not in m.entities:
+            raise NotFound(f"Entity '{tid}' not found.")
+        try:
+            m.revert_entity(tid, args[2])
+        except (VTTError, NotFound, Occupied) as ex:
+            return await ctx.send(f"❌ {ex}")
+        return await ctx.send(
+            f"`{tid}` reverted to **{m.entities[tid].name}**.")
+
     # ---- copy / transfer <id> <dest_match> [x] [y] ----
     # Cross-match entity transfer (107): copy duplicates into another live
     # match (keeps the source); transfer MOVES it (removes the source). Vars,
@@ -3147,6 +3223,31 @@ registry.annotate_sub(
         "`summon_from('<dest_path>', x, y)` (template on `self`) or "
         "`summon(var_get('<dest_id>','<dest_path>'), x, y)`. Alias: "
         "`store_entity`."
+    ),
+)
+registry.annotate_sub(
+    "ent", "transform",
+    usage="!ent transform <id> <template_ref> [stash_path]",
+    desc=(
+        "Polymorph `<id>` into a statblock template — swaps name, vars "
+        "(incl. actions + footprint), passives, clamps, status, and body "
+        "parts, while KEEPING the entity's id, position, facing, team, and "
+        "turn-order slot. `<template_ref>` is a dotted var path on the "
+        "entity (store one with `store_entity_into_var`, then transform into "
+        "it) or a live entity id to snapshot. HP carries per the "
+        "`transform_hp_mode` rule (default: preserve %). Pass `[stash_path]` "
+        "to save the pre-transform statblock at vars.<stash_path> so "
+        "`!ent revert` can restore it — stash paths are ordinary vars, so "
+        "transforms stack."
+    ),
+)
+registry.annotate_sub(
+    "ent", "revert",
+    usage="!ent revert <id> <stash_path>",
+    desc=(
+        "Restore `<id>`'s statblock from a snapshot previously stashed at "
+        "vars.<stash_path> by `!ent transform`. HP carries per the "
+        "`transform_hp_mode` rule. The stash var is consumed."
     ),
 )
 registry.annotate_sub(
@@ -3579,7 +3680,7 @@ async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         lines.append("Entities:")
         for e in visible:
             marker = "→" if e.id == active_id else "  "
-            lines.append(f"{marker} {_entity_line(e)}")
+            lines.append(f"{marker} {_entity_line(e, pov)}")
     # Dead: section. Each corpse rendered via _corpse_line which honors
     # the corpse_line_format rule (the corpse equivalent of
     # entity_line_format — no hardcoded shape). The tile coords (NOT

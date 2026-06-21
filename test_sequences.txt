@@ -12371,3 +12371,125 @@ add, inc%, more%, set, min, max." The unknown op still folds (as a lenient add,
 so base 10 → 22.5), but the warning surfaces the likely typo rather than letting
 a silent flat bonus pass unnoticed. The recognized ops (add/inc%/more%/set/min/
 max) never warn.
+
+
+SCENARIO 481 — Polymorph: transform swaps the statblock, keeps identity; revert restores
+----------------------------------------------------------------------------------------
+
+!match new poly Polymorph 12 8
+!match use poly
+!ent add hero Hero 30 3 3 7
+!ent set_var hero team blue
+!ent set_var hero str 5
+!ent add wolf_npc Wolf 60 8 3 5
+!ent set_var wolf_npc str 12
+!ent store_entity_into_var wolf_npc hero forms.wolf
+!ent set_var hero hp 15
+!ent transform hero forms.wolf original
+!ent dump hero
+!ent revert hero original
+!ent dump hero
+
+Expected: Hero is at 15/30 HP (50%). Transforming into the stored Wolf template
+swaps name→Wolf, max_hp→60, str→12, but KEEPS the id `hero`, position (3,3),
+team `blue`, and initiative 7 (identity). HP carries by % (transform_hp_mode
+default `percent`): 50% of 60 = 30, so the first dump shows **Wolf** `hero` at
+30/60, team blue, with the original statblock stashed at vars.original. Revert
+reads vars.original and restores Hero: max_hp 30, str 5, name Hero; HP carries
+back by % (30/60 = 50% → 15/30). The stash var is consumed.
+
+
+SCENARIO 482 — Polymorph onto a MULTI-TILE form (footprint swap)
+---------------------------------------------------------------
+
+!match new polybig PolyBig 12 8
+!match use polybig
+!ent add mage Mage 24 2 2 6
+!ent add ogre_npc Ogre 80 8 2 4
+!ent set_var ogre_npc footprint_w 2
+!ent set_var ogre_npc footprint_h 2
+!ent store_entity_into_var ogre_npc mage forms.ogre
+!ent transform mage forms.ogre human
+!map
+!ent revert mage human
+!map
+
+Expected: the mage (1×1) transforms into the Ogre template, which carries
+`footprint_w`/`footprint_h` = 2 — so `entity_cells`/render now treat `mage` as a
+2×2 body anchored at (2,2) covering (2,2)-(3,3); the first `!map` paints the Ogre
+glyph across all four cells. Identity is preserved (still id `mage` at anchor
+(2,2)). Reverting restores the 1×1 mage, and the second `!map` shows a single
+cell again. (Footprint lives entirely in vars, so a transform that swaps vars
+swaps the footprint for free — the multi-tile path is exercised end-to-end.)
+
+
+SCENARIO 483 — Polymorph: stacked transforms revert in any order
+---------------------------------------------------------------
+
+!match new polystk PolyStack 12 8
+!match use polystk
+!ent add e Base 20 2 2 5
+!ent add formA A 40 6 2 5
+!ent add formB B 70 9 2 5
+!ent transform e formA wasBase
+!ent transform e formB wasA
+!ent revert e wasA
+!ent revert e wasBase
+
+Expected: entity `e` starts as **Base**. `transform e formA wasBase` snapshots
+Base into vars.wasBase and becomes **A** (the live formA entity, snapshotted).
+`transform e formB wasA` snapshots the A-form (whose vars still contain wasBase)
+into vars.wasA and becomes **B**. Because each stash is an ordinary var the
+caller names, the transforms STACK: `revert e wasA` restores the A-form (name
+A), and `revert e wasBase` then restores Base. No protected/auto-managed state —
+the GM controls the stash paths, so reverts can even skip levels.
+
+
+SCENARIO 484 — Fake-statblock: a disguise is POV-gated (enemy sees the decoy)
+---------------------------------------------------------------------------
+
+!match new disg Disguise 8 5
+!match use disg
+!ent add spy Assassin 40 2 2 5
+!ent set_var spy team red
+!ent set_var spy glyph A
+!ent set_var spy disguise.name Villager
+!ent set_var spy disguise.glyph v
+!ent set_var spy disguise.vars.hp 5
+!ent set_var spy disguise.vars.max_hp 5
+!as view blue
+!list
+!map
+!as view red
+!list
+!as view omniscient
+!list
+
+Expected: the assassin (team red, real glyph `A`, 40/40 HP) carries a `disguise`
+var {name: Villager, glyph: v, vars:{hp:5,max_hp:5}}. From the BLUE viewpoint
+(an enemy, non-omniscient) `!list` shows it as **Villager** at 5/5 HP and `!map`
+paints `v`. From the RED viewpoint (its own team) `!list` shows the real
+**Assassin** at 40/40. The omniscient view also shows the real Assassin. The
+disguise is display-only and gated on the viewer's team.
+
+
+SCENARIO 485 — Fake-statblock: mechanics always use the REAL statblock
+--------------------------------------------------------------------
+
+!match new disg2 DisguiseReal 8 5
+!match use disg2
+!ent add spy Assassin 40 2 2 5
+!ent set_var spy team red
+!ent set_var spy disguise.name Villager
+!ent set_var spy disguise.vars.hp 5
+!ent set_var spy disguise.vars.max_hp 5
+!eval "var_get('spy', 'hp')"
+!eval "var_get('spy', 'max_hp')"
+!as view blue
+!list
+
+Expected: although enemies see the assassin as a 5/5 "Villager", the engine's
+real statblock is untouched: `var_get('spy','hp')` = 40 and
+`var_get('spy','max_hp')` = 40 (formulas, targeting, and damage all read the
+real vars — the disguise only changes what is rendered). The blue `!list` still
+presents the fake 5/5 Villager, confirming display and mechanics are decoupled.

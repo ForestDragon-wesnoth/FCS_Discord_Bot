@@ -287,6 +287,20 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "str"},
         "desc": "Variable name in entity vars used as maximum hit points (e.g. 'max_hp', 'max_hull').",
     },
+    # How HP carries across a polymorph/transform (!ent transform / revert,
+    # transform()/revert()). 'percent' keeps the same fraction of max_hp into
+    # the new form (50% of old max -> 50% of new max); 'keep' carries current
+    # hp clamped to the new max; 'full' uses the target statblock's own hp.
+    "transform_hp_mode": {
+        "default": "percent",
+        "schema": {"type": "enum", "choices": ["percent", "keep", "full"]},
+        "desc": (
+            "How HP carries when an entity transforms (or reverts): 'percent' "
+            "(preserve the fraction of max_hp), 'keep' (carry current hp, "
+            "clamped to the new max), or 'full' (use the target statblock's "
+            "own hp value)."
+        ),
+    },
     "turnorder_var": {
         "default": "initiative",
         "schema": {"type": "str"},
@@ -1418,6 +1432,24 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Malformed formula = treated as visible. Example: "
             "\"is_part_of_team(self, pov_team) or not status_has(self, "
             "'hidden')\"."
+        ),
+    },
+    # Fake-statblock / disguise (116): the entity var holding a display-only,
+    # POV-gated disguise dict {name?, glyph?, glyphs?, color?, vars?}. A viewer
+    # NOT on the entity's own team (and not omniscient) sees the disguise's
+    # name/glyph/color and its `vars` overlaid on the roster; allies and the
+    # GM/omniscient view see the truth. Engine mechanics (targeting, formulas,
+    # damage) ALWAYS use the real statblock — a disguise only changes what's
+    # rendered. A decoy/illusion is a GM composition on top of this.
+    "disguise_var": {
+        "default": "disguise",
+        "schema": {"type": "str"},
+        "desc": (
+            "Entity var holding a display-only, POV-gated disguise dict "
+            "{name?, glyph?, glyphs?, color?, vars?}. Non-allied, "
+            "non-omniscient viewers see the disguise (name/glyph/color + the "
+            "`vars` overlay on the roster); the entity's own team and the GM "
+            "see the real statblock. Mechanics always use the real vars."
         ),
     },
     # Per-tile visibility (hidden traps, secret doors, etc.). Same shape
@@ -10398,6 +10430,230 @@ class Match:
             death_log = self.check_death(e.id)
         return e.id, spawn_log + revive_log + death_log
 
+    # ---------- polymorph / transform (identity-preserving statblock swap) -----
+    # A transform REPLACES an entity's presented statblock — name, vars (incl.
+    # actions + footprint), passives, clamps, status, and its attached part
+    # subtree — while PRESERVING its identity: id, position, facing, team, and
+    # turn-order slot all stay, so references / initiative / allegiance survive.
+    # The pre-transform statblock is captured and (optionally) stashed at a
+    # caller-chosen var path; reverting reads that path back. Because the stash
+    # is an ordinary var the GM names, transforms STACK (stash each to a
+    # different path, revert in any order) and the snapshot is inspectable /
+    # editable like any other var.
+
+    def capture_statblock(self, e: "Entity") -> Dict[str, Any]:
+        """Snapshot `e`'s restorable statblock: name, vars, status, passives,
+        clamps, facing, plus the whole attached part SUBTREE as full entity
+        dicts (BFS, parents before children). Identity — id, position,
+        part/mount links — is NOT captured (it stays on the live entity across
+        a transform). The returned dict doubles as a transform template."""
+        d = e.to_dict()
+        for k in ("id", "x", "y", "part_of", "mounted_on", "mount_slot"):
+            d.pop(k, None)
+        subtree = self.entity_part_subtree(e.id)
+        if subtree:
+            d["parts"] = [p.to_dict() for p in subtree]
+        return d
+
+    def _apply_statblock_parts(self, parent: "Entity",
+                               parts_spec: Any) -> List[str]:
+        """Spawn `parts_spec` as `parent`'s body parts. Accepts the two shapes
+        the rest of the engine uses: a dict {role: part-template} (single level,
+        like a summon template) OR a list of full part entity dicts carrying
+        `id`/`part_of` (a captured subtree — multi-level, BFS). Ids are
+        re-minted to avoid collisions and `part_of` links are remapped so a
+        part-of-a-part re-attaches correctly. Returns spawn log lines."""
+        if not parts_spec:
+            return []
+        name_var = self.part_name_var()
+        # Normalize to a list of part dicts. Dict form carries no ids/part_of
+        # (each is a direct child of `parent`); record the role as part_name.
+        if isinstance(parts_spec, dict):
+            part_list = []
+            for role, pt in parts_spec.items():
+                if not isinstance(pt, dict):
+                    continue
+                d = copy.deepcopy(pt)
+                nv = d.setdefault("vars", {})
+                if role is not None and name_var not in nv:
+                    nv[name_var] = role
+                d.pop("id", None)
+                d.pop("part_of", None)
+                part_list.append(d)
+        elif isinstance(parts_spec, (list, tuple)):
+            part_list = [copy.deepcopy(p) for p in parts_spec
+                         if isinstance(p, dict)]
+        else:
+            return []
+        if not part_list:
+            return []
+        # Re-mint ids; remember the mapping so intra-subtree part_of links
+        # resolve to the new ids (a child whose parent is also in the list).
+        own_ids = {d["id"] for d in part_list if d.get("id")}
+        idmap: Dict[str, str] = {}
+        for d in part_list:
+            base = (d.get("id") or (d.get("vars") or {}).get(name_var)
+                    or d.get("name") or f"{parent.id}_part")
+            nid = self.mint_entity_id(str(base))
+            if d.get("id"):
+                idmap[d["id"]] = nid
+            d["__nid"] = nid
+        log: List[str] = []
+        # Spawn parents before children: a part whose part_of points at another
+        # part in this list waits until that part has spawned.
+        pending = list(part_list)
+        guard = 0
+        while pending and guard <= len(part_list):
+            guard += 1
+            progressed = False
+            for d in list(pending):
+                po = d.get("part_of")
+                if po in own_ids and idmap.get(po) not in self.entities:
+                    continue  # its parent part isn't spawned yet
+                new_po = idmap[po] if po in own_ids else parent.id
+                located = bool((d.get("vars") or {}).get("__part_located"))
+                px = int(d.get("x", parent.x)) if located else parent.x
+                py = int(d.get("y", parent.y)) if located else parent.y
+                spec = {k: v for k, v in d.items() if k not in ("__nid", "parts")}
+                spec["id"] = d["__nid"]
+                spec["part_of"] = new_po
+                spec["x"], spec["y"] = px, py
+                if "name" not in spec:
+                    spec["name"] = str((spec.get("vars") or {}).get(
+                        name_var, spec["id"]))
+                try:
+                    pe = Entity.from_dict(spec)
+                    _, slog = pe.spawn(self, px, py)
+                    log += slog
+                except VTTError:
+                    pass  # malformed part entry — skip, don't abort the swap
+                pending.remove(d)
+                progressed = True
+            if not progressed:
+                break
+        self._restamp_parts_for(parent.id)
+        return log
+
+    def apply_statblock(self, e: "Entity", statblock: Dict[str, Any], *,
+                        hp_mode: Optional[str] = None) -> List[str]:
+        """Replace `e`'s statblock in place from `statblock` (a
+        capture_statblock dict or a summon-style template), PRESERVING e's id,
+        position, facing, team, and turn-order slot. HP carries per `hp_mode`
+        (default the transform_hp_mode rule: percent | keep | full). The
+        entity's current attached parts are despawned (no corpse) and the
+        statblock's `parts`/`segments` spawned. Returns log lines."""
+        if not isinstance(statblock, dict):
+            raise VTTError("transform: statblock must be a dict.")
+        sb = copy.deepcopy(statblock)
+        hp_var, max_hp_var, turnorder_var = e._vital_var_names()
+        team_var = str(self.rules.get("team_var", "team"))
+        if hp_mode is None:
+            hp_mode = str(self.rules.get("transform_hp_mode", "percent"))
+        old_hp = e.vars.get(hp_var)
+        old_max = e.vars.get(max_hp_var)
+        old_team = e.vars.get(team_var)
+        old_init = e.vars.get(turnorder_var)
+        # Despawn current attached parts (children first). This is a despawn,
+        # not a death — no corpse, no on_death.
+        for p in reversed(self.entity_part_subtree(e.id)):
+            if p.id in self.entities:
+                p.remove()
+        # Swap the presented fields. Death checks are suppressed across the
+        # swap window: an intermediate var state (e.g. new max_hp before hp is
+        # set) could momentarily satisfy the death condition.
+        new_vars = copy.deepcopy(sb.get("vars") or {})
+        new_max = new_vars.get(max_hp_var)
+        target_hp = new_vars.get(hp_var)
+        try:
+            if (hp_mode == "percent" and isinstance(new_max, (int, float))
+                    and old_max not in (None, 0)):
+                frac = float(old_hp) / float(old_max)
+                scaled = new_max * frac
+                target_hp = int(round(scaled)) if isinstance(new_max, int) else scaled
+            elif (hp_mode == "keep" and isinstance(new_max, (int, float))
+                  and old_hp is not None):
+                target_hp = min(float(old_hp), float(new_max))
+                if isinstance(new_max, int):
+                    target_hp = int(target_hp)
+            # 'full' (and any fallthrough) leaves target_hp = statblock's value
+        except (TypeError, ValueError):
+            pass
+        if target_hp is not None:
+            new_vars[hp_var] = target_hp
+        # Preserve team membership + turn-order slot (identity), overriding
+        # whatever the statblock carried. The new form keeps its allegiance
+        # and initiative; a GM who wants a slow form sets it explicitly after.
+        if old_team is not None:
+            new_vars[team_var] = old_team
+        if old_init is not None:
+            new_vars[turnorder_var] = old_init
+        self._death_check_suppressed_ids.add(e.id)
+        log: List[str] = []
+        try:
+            e.vars = new_vars
+            e.name = sb.get("name", e.name)
+            e.passives = {pid: Passive.from_dict(pd)
+                          for pid, pd in (sb.get("passives") or {}).items()}
+            e.clamps = {path: ClampSpec.from_dict(cd)
+                        for path, cd in (sb.get("clamps") or {}).items()}
+            e.status = copy.deepcopy(sb.get("status") or {})
+            # facing is identity — preserved (not taken from the statblock).
+            self._turn_order_dirty = True
+            self._rebuild_turn_order()
+            self._restamp_anchors_for(e.id)
+            log += self._apply_statblock_parts(e, sb.get("parts"))
+            seg = sb.get("segments")
+            if seg:
+                log += self._apply_statblock_parts(e, seg)
+        finally:
+            self._death_check_suppressed_ids.discard(e.id)
+        if e.id in self.entities:
+            log += self.check_death(e.id)
+        return log
+
+    def transform_entity(self, eid: str, template: Any,
+                         stash_path: Optional[str] = None,
+                         *, hp_mode: Optional[str] = None) -> List[str]:
+        """Transform `eid` into `template` (a statblock dict). If `stash_path`
+        is given, the PRE-transform statblock is stored at
+        entity[eid].vars.<stash_path> (in the NEW form's vars, so it survives),
+        and `revert(eid, stash_path)` restores it. Stash paths are ordinary
+        vars chosen by the caller, so transforms stack."""
+        e = self.entities.get(eid)
+        if e is None:
+            raise NotFound(f"Entity '{eid}' not found.")
+        if e.is_part:
+            raise VTTError(
+                f"'{eid}' is a body part — transform its parent instead.")
+        snap = self.capture_statblock(e) if stash_path else None
+        log = self.apply_statblock(e, template, hp_mode=hp_mode)
+        if stash_path and e.id in self.entities:
+            e.write_var(str(stash_path), snap)
+        return log
+
+    def revert_entity(self, eid: str, stash_path: str,
+                      *, hp_mode: Optional[str] = None) -> List[str]:
+        """Restore `eid`'s statblock from the snapshot previously stashed at
+        entity[eid].vars.<stash_path> by transform_entity. The stash var
+        naturally disappears (vars are replaced by the older snapshot, which
+        predates the stash)."""
+        e = self.entities.get(eid)
+        if e is None:
+            raise NotFound(f"Entity '{eid}' not found.")
+        # Walk the dotted stash path through e's vars.
+        node: Any = e.vars
+        for key in str(stash_path).split("."):
+            if isinstance(node, dict) and key in node:
+                node = node[key]
+            else:
+                node = None
+                break
+        snap = node
+        if not isinstance(snap, dict):
+            raise VTTError(
+                f"revert: no stashed statblock at `{stash_path}` on `{eid}`.")
+        return self.apply_statblock(e, snap, hp_mode=hp_mode)
+
     def fire_tile_time_hooks(self, when: str) -> List[str]:
         """Fire tile time hooks (on_round_start/end, on_turn_start/end)
         on every tile that has a hook of that name. Iterates a snapshot
@@ -11333,13 +11589,49 @@ class Match:
         return m
 
     # ------------- simple ASCII render for quick debugging -------------
-    def entity_glyph(self, e: "Entity") -> str:
+    def _effective_disguise(self, e: "Entity",
+                            pov_team: Optional[str]) -> Optional[Dict[str, Any]]:
+        """The fake statblock `e` PRESENTS to a viewer on team `pov_team`, or
+        None to show the truth. Display-only and POV-gated: a disguise applies
+        only to a non-omniscient viewer (pov_team is not None) who is NOT on
+        the entity's own team — allies and the omniscient/GM view always see
+        the real entity. The disguise lives in the var named by the
+        `disguise_var` rule (default `disguise`): a dict {name?, glyph?,
+        glyphs?, color?, vars?: {...}}. Engine MECHANICS (targeting, formulas,
+        damage) always use the real statblock; only the rendered name / glyph /
+        color / roster stats are swapped. (116 fake-statblock; decoy/illusion
+        is a GM composition on top of it.)"""
+        if pov_team is None:
+            return None
+        var = str(self.rules.get("disguise_var", "disguise"))
+        d = e.vars.get(var)
+        if not isinstance(d, dict) or not d:
+            return None
+        if e.team is not None and str(e.team) == str(pov_team):
+            return None
+        return d
+
+    def entity_glyph(self, e: "Entity",
+                     pov_team: Optional[str] = None) -> str:
         """The map symbol for `e`: a per-facing `glyphs.<facing>` var wins,
         else a direction-agnostic single `glyph` var, else the default
         DIRECTION_ARROWS arrow for its facing (`@` if unknown). Custom
         glyphs must be exactly one character (alignment); anything else is
-        ignored and falls through — same rule as tile/zone glyphs."""
+        ignored and falls through — same rule as tile/zone glyphs. When `e`
+        is disguised to `pov_team` (116), the disguise's glyph/glyphs are
+        resolved first; a disguise without a glyph falls through to the real
+        resolution."""
         facing = getattr(e, "facing", "")
+        dis = self._effective_disguise(e, pov_team)
+        if dis is not None:
+            dglyphs = dis.get("glyphs")
+            if isinstance(dglyphs, dict):
+                dg = dglyphs.get(facing)
+                if isinstance(dg, str) and len(dg) == 1:
+                    return dg
+            dg = dis.get("glyph")
+            if isinstance(dg, str) and len(dg) == 1:
+                return dg
         glyphs = e.vars.get("glyphs")
         if isinstance(glyphs, dict):
             g = glyphs.get(facing)
@@ -11362,11 +11654,18 @@ class Match:
         g = e.vars.get("glyph")
         return isinstance(g, str) and len(g) == 1
 
-    def entity_color(self, e: "Entity") -> Optional[str]:
+    def entity_color(self, e: "Entity",
+                     pov_team: Optional[str] = None) -> Optional[str]:
         """The resolved color NAME for `e` (or None): its `color` var wins,
         else its team's color — the match team_colors map, defaulting to
         the team's own name when that name is itself a palette color (so a
-        team literally named 'red' renders red). Unknown names -> None."""
+        team literally named 'red' renders red). Unknown names -> None. When
+        `e` is disguised to `pov_team` (116), the disguise's `color` wins."""
+        dis = self._effective_disguise(e, pov_team)
+        if dis is not None:
+            dc = dis.get("color")
+            if isinstance(dc, str) and dc in TEXT_COLORS:
+                return dc
         c = e.vars.get("color")
         if isinstance(c, str) and c in TEXT_COLORS:
             return c
@@ -11378,6 +11677,17 @@ class Match:
             if team in TEXT_COLORS:
                 return team
         return None
+
+    def entity_display_name(self, e: "Entity",
+                            pov_team: Optional[str] = None) -> str:
+        """`e`'s presented name: the disguise's `name` when disguised to
+        `pov_team` (116), else the real name (falling back to id)."""
+        dis = self._effective_disguise(e, pov_team)
+        if dis is not None:
+            n = dis.get("name")
+            if isinstance(n, str) and n:
+                return n
+        return e.name or e.id
 
     def _resolve_color_value(self, val: Any,
                              extras: Dict[str, Any]) -> Optional[str]:
@@ -11629,14 +11939,14 @@ class Match:
                 continue
             if not self.entity_visible_to(e.id, pov_team):
                 continue
-            sym = self.entity_glyph(e)
-            ecol = self.entity_color(e)
+            sym = self.entity_glyph(e, pov_team)
+            ecol = self.entity_color(e, pov_team)
             for (cx, cy) in self.entity_cells(e):
                 if self.in_bounds(cx, cy):
                     grid[cy][cx] = sym
                     colors[cy][cx] = ecol
                     if meanings is not None:
-                        meanings[cy][cx] = e.name or e.id
+                        meanings[cy][cx] = self.entity_display_name(e, pov_team)
 
         # Visible-rider priority pass: a rider in a region slot sits ON the
         # vehicle, so it draws over the vehicle glyph at its slot cell.
@@ -11645,14 +11955,14 @@ class Match:
                 continue
             if not self.entity_visible_to(e.id, pov_team):
                 continue
-            sym = self.entity_glyph(e)
-            ecol = self.entity_color(e)
+            sym = self.entity_glyph(e, pov_team)
+            ecol = self.entity_color(e, pov_team)
             for (cx, cy) in self.entity_cells(e):
                 if self.in_bounds(cx, cy):
                     grid[cy][cx] = sym
                     colors[cy][cx] = ecol
                     if meanings is not None:
-                        meanings[cy][cx] = e.name or e.id
+                        meanings[cy][cx] = self.entity_display_name(e, pov_team)
 
         # Region-part priority pass: a region part overlaps its parent, so by
         # default it only draws over the parent when it has a CUSTOM glyph (a
@@ -11665,14 +11975,14 @@ class Match:
                     continue
                 if not self.entity_visible_to(e.id, pov_team):
                     continue
-                sym = self.entity_glyph(e)
-                ecol = self.entity_color(e)
+                sym = self.entity_glyph(e, pov_team)
+                ecol = self.entity_color(e, pov_team)
                 for (cx, cy) in self.entity_cells(e):
                     if self.in_bounds(cx, cy):
                         grid[cy][cx] = sym
                         colors[cy][cx] = ecol
                         if meanings is not None:
-                            meanings[cy][cx] = e.name or e.id
+                            meanings[cy][cx] = self.entity_display_name(e, pov_team)
 
         # Fog overlay (last): an unrevealed cell shows fog_glyph and no
         # color (fog hides whatever tint was there).
