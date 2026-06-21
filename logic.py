@@ -4480,7 +4480,13 @@ class Entity:
             "y": self.y,
             "id": self.id,
             "status": copy.deepcopy(self.status),
-            "vars": dict(self.vars),
+            # deepcopy, NOT dict(): vars hold nested dicts (inventory,
+            # modifiers, …) that _set_path mutates IN PLACE. A shallow copy
+            # would share those nested objects with the live entity, so a
+            # later nested write would corrupt this snapshot — breaking undo
+            # and action rollback for any dotted-path var. (status above is
+            # deepcopied for the same reason.)
+            "vars": copy.deepcopy(self.vars),
             "passives": {pid: p.to_dict() for pid, p in self.passives.items()},
             "clamps": {path: c.to_dict() for path, c in self.clamps.items()},
             "facing": self.facing,
@@ -5435,6 +5441,10 @@ class Match:
                 e.x = par.x
                 e.y = par.y
                 self._restamp_anchors_for(e.id)
+                # A moved part carries its OWN riders too (a body part that is
+                # itself a vehicle) — same carry cascade _restamp_riders_for
+                # does, so a rider on a limb follows when the parent moves.
+                self._restamp_riders_for(e.id)
 
     # ---------- snake / segmented bodies ----------
     def snake_segments(self, head_id: str) -> List["Entity"]:

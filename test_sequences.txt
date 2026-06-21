@@ -12680,3 +12680,52 @@ per member (parity with single-entity move_dirs, which group move previously
 lacked) — so `var_get('runner','steps')` = 3 and `var_get('big','steps')` = 3.
 The 2×2 member fires once per step (the hook is per-step, not per covered cell),
 confirming the fire is footprint-independent.
+
+
+
+
+
+
+SCENARIO 494 — Audit: undo of a nested-var write restores the prior value
+--------------------------------------------------------------------
+
+!match new nvu NestedVarUndo 6 6
+!match use nvu
+!ent add e E 30 1 1 1
+!ent set_var e inventory.gold 100
+!ent set_var e inventory.potions 3
+!ent set_var e inventory.gold 50
+!history undo command
+!eval "var_get('e','inventory.gold')"
+!eval "var_get('e','inventory.potions')"
+
+Expected: undoing the `inventory.gold 50` command restores `inventory.gold` to
+100 (and leaves the sibling `inventory.potions` = 3 untouched). Before the fix,
+`Entity.to_dict` shallow-copied `vars`, so a command snapshot SHARED the live
+nested `inventory` dict; the in-place write at `_set_path` then corrupted the
+snapshot, and undo restored the wrong (mutated) value — the same root cause also
+broke transactional action rollback of any dotted-path var. Now `vars` is
+deepcopied (like `status` beside it), so each snapshot is independent.
+
+
+SCENARIO 495 — Audit: a rider on a body-part vehicle follows the parent's move
+--------------------------------------------------------------------
+
+!match new pvr PartVehicleRider 12 8
+!match use pvr
+!ent add dragon Dragon 50 5 5 1
+!part add dragon wing Wing 0 0
+!ent set_var wing slots.seat.capacity 1
+!ent add rider Rider 10 7 7 2
+!mount rider wing seat
+!ent move dragon 2 right
+!eval "coord_x(entity_center('dragon'))"
+!eval "coord_x(entity_center('wing'))"
+!eval "coord_x(entity_center('rider'))"
+
+Expected: `wing` is a body PART of the dragon that is ALSO a vehicle; `rider`
+is mounted in its `seat` slot. Moving the dragon 2 right carries the whole
+stack: dragon, wing (a glued part), AND the rider all end at x=7. Before the
+fix, `_restamp_parts_for` synced a moved part's anchor + auras but not its
+RIDERS, so the rider was left behind at x=5 (it only restamped riders of the
+top-level mover, not of a part-that-is-a-vehicle).

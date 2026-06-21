@@ -173,6 +173,19 @@ does an attached part get included where it should (and excluded where it
 shouldn't)? If the feature is spatial, vision-related, movement-related, or
 fires per-entity, this is non-negotiable.
 
+### ANY bug is worth fixing — multi-tile is where they CLUSTER, not a filter
+
+The multi-tile emphasis above is about where bugs concentrate, NOT a
+restriction on what to fix. When auditing or stumbling on a defect,
+multi-tile or not, investigate and fix it (e.g. the shallow-copy undo
+corruption and the resistance/stacking questions found in audit-pass-5 are
+footprint-independent). Do not dismiss a bug because it isn't about
+footprints. Two corollaries the user stated explicitly:
+- **If a fix's intended behavior is ambiguous, ASK the user — don't guess.**
+  A wrong "fix" that drifts from intent is worse than a question.
+- **If CLAUDE.md's wording was ambiguous about the behavior in question, it
+  MUST be amended** as part of the fix, so the ambiguity doesn't recur.
+
 ### Commit messages: dense, factual, no fluff
 
 Look at existing commit messages on `main`. They explain WHY a change
@@ -1748,6 +1761,43 @@ More shipped work (continuing the list above):
     validated, defaults applied first), corpses (`corpse_cells`/`revive`),
     mounts (`_find_dismount_cell`/`_restamp_riders_for`), `resize_grid` (cut if
     ANY cell off-grid), and single-entity `tp`/`move_dirs`/push/pull/swap.
+
+- **Audit-pass-5 fixes: general correctness sweep (scenarios 494-495).** A
+  broader bug hunt (NOT multi-tile-scoped — four read-only survey agents across
+  serialization/undo, status/modifier/event, death/corpse/transform/mount, and
+  action/formula/dispatch; every candidate verified in code before fixing). Two
+  real bugs fixed:
+  - **`Entity.to_dict` shallow-copied `vars` → corrupted undo + action
+    rollback for nested vars.** `to_dict` did `"vars": dict(self.vars)` (shallow)
+    while the sibling `status` was `deepcopy`'d. Entity vars hold nested dicts
+    (`inventory`, `modifiers`, …) that `_set_path` mutates IN PLACE, so a command
+    snapshot SHARED the live nested objects; a later dotted-path write then
+    corrupted the snapshot, and `!history undo` / transactional action rollback
+    restored the wrong (mutated) value (a nested var could even vanish entirely).
+    Fixed to `copy.deepcopy(self.vars)`. This is the snapshot path behind BOTH
+    undo and `action._rollback_match` (both go through `Match.to_dict` →
+    `Entity.to_dict`), so it fixes both at once. Footprint-INDEPENDENT — a
+    long-standing latent bug any nested-var undo would hit.
+  - **`_restamp_parts_for` didn't carry a moved part's RIDERS.** When a parent
+    moved, the part-restamp synced each glued part's anchor + its anchored auras
+    (`_restamp_anchors_for`) but never `_restamp_riders_for(part)`, so a body
+    part that is ALSO a vehicle left its riders behind (same class as the
+    nested-mount bug #80, but for a part-vehicle). Added the symmetric
+    `_restamp_riders_for(e.id)` call (recursion stays bounded — part subtree is
+    acyclic, mount cycles are can_mount-guarded).
+  - **Re-verified correct (no change):** Match/zone serialization round-trips all
+    persistent fields; `action._rollback_match`'s runtime-field list is complete
+    (audit-pass-3); modifier fold min/max ops; event-stack preservation across
+    nested-action rollback; status counter auto-removal; formula sandbox
+    `_who_arg` HOOK_CONTEXT handling + `normalize_body_source` at every body
+    boundary; dispatch gate (no batch/foreach/macro/action bypass).
+  - **OPEN QUESTION raised with the user (status resistance + `add_level`):**
+    `status_resist` reduces the applied LEVEL by a flat amount, gated on
+    `(name not in e.status or new_level is not None)`. So an implicit +1
+    (`!status apply x poison` with no level) to an ALREADY-PRESENT `add_level`
+    status bypasses resistance, while an explicit level is resisted — an
+    asymmetry. Intended behavior was ambiguous → asked the user rather than
+    guessing. (Resolution + a scenario to follow once decided.)
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
