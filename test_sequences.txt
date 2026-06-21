@@ -12493,3 +12493,118 @@ real statblock is untouched: `var_get('spy','hp')` = 40 and
 `var_get('spy','max_hp')` = 40 (formulas, targeting, and damage all read the
 real vars — the disguise only changes what is rendered). The blue `!list` still
 presents the fake 5/5 Villager, confirming display and mechanics are decoupled.
+
+
+SCENARIO 486 — find: near:/within: spatial predicates (footprint-aware)
+--------------------------------------------------------------------
+
+!match new findspat FindSpatial 12 12
+!match use findspat
+!ent add boss Boss 50 5 5 1
+!ent set_var boss footprint_w 2
+!ent set_var boss footprint_h 2
+!ent add a1 A1 10 7 5 2
+!ent add a2 A2 10 9 5 2
+!ent add a3 A3 10 5 9 2
+!ent add far Far 10 11 11 2
+!find near:boss:1
+!find near:boss:3
+!find within:7:5:0
+!find within:6:6:1
+
+Expected: boss occupies the 2×2 block (5,5)-(6,6); distances are the
+footprint-aware nearest-cell gap (Chebyshev). `near:boss:1` matches boss
+itself (gap 0) and a1 at (7,5) (gap 1) — 2 matches. `near:boss:3` adds a2
+(gap 3) and a3 (gap 3) but NOT far (gap 5) — 4 matches. `within:7:5:0`
+matches only a1 (it occupies (7,5); boss's nearest cell is 1 away) — 1 match.
+`within:6:6:1` matches boss (covers (6,6), gap 0) and a1 (gap 1) — 2 matches.
+
+
+SCENARIO 487 — find: spatial predicate AND-ed with var/status; error cases
+--------------------------------------------------------------------
+
+!match new findspat2 FindSpatial2 12 12
+!match use findspat2
+!ent add boss Boss 50 5 5 1
+!ent add red1 Red1 10 6 5 2
+!ent set_var red1 team red
+!ent add red2 Red2 10 10 5 2
+!ent set_var red2 team red
+!ent add blue1 Blue1 10 6 6 2
+!ent set_var blue1 team blue
+!find team=red near:boss:2
+!find near:ghost:2
+!find near:boss:x
+!find within:5:5:2
+
+Expected: `team=red near:boss:2` ANDs both — red1 (team red, gap 1) matches but
+red2 (team red, gap 5) and blue1 (gap 1 but wrong team) do not — 1 match.
+`near:ghost:2` errors with ❌ (reference entity `ghost` not found).
+`near:boss:x` errors with ❌ (radius must be a number). `within:5:5:2` matches
+boss (gap 0), red1 (gap 1) and blue1 (gap 1) — 3 matches (no team filter).
+
+
+SCENARIO 488 — foreach: bulk-apply over a selector, one undo entry
+--------------------------------------------------------------------
+
+!match new feach Foreach 8 8
+!match use feach
+!ent add r1 R1 30 1 1 1
+!ent set_var r1 team red
+!ent add r2 R2 30 2 2 2
+!ent set_var r2 team red
+!ent add r3 R3 30 3 3 2
+!ent set_var r3 team red
+!ent add b1 B1 30 4 4 2
+!ent set_var b1 team blue
+!foreach team=red ; ent set_var $id hp 7
+!find hp=7
+!history undo command
+!find hp=7
+
+Expected: the foreach resolves the 3 red entities first, then runs `ent set_var
+<id> hp 7` for each — `!find hp=7` lists r1, r2, r3 (3 matches), b1 untouched.
+The whole sweep is ONE history entry, so a single `!history undo command`
+reverts all three back to hp 30; the final `!find hp=7` reports no matches.
+
+
+SCENARIO 489 — foreach: spatial selector + $x/$y/$name substitution
+--------------------------------------------------------------------
+
+!match new feach2 Foreach2 10 10
+!match use feach2
+!ent add boss Boss 50 5 5 1
+!ent add m1 M1 10 4 5 2
+!ent add m2 M2 10 6 6 2
+!ent add far Far 10 9 9 2
+!foreach near:boss:1 ; ent set_var $id px $x
+!eval "var_get('boss', 'px')"
+!eval "var_get('m1', 'px')"
+!eval "var_get('m2', 'px')"
+!find px=9
+
+Expected: `near:boss:1` matches boss (gap 0), m1 at (4,5) (gap 1) and m2 at
+(6,6) (gap 1), but not far (gap 4). Each gets its OWN x stored via `$x`:
+`var_get('boss','px')` = 5, `var_get('m1','px')` = 4, `var_get('m2','px')` = 6.
+far is untouched, so `!find px=9` reports no matches (proving the substitution
+is per-entity and the selector excluded far).
+
+
+SCENARIO 490 — foreach: error + empty-result handling
+--------------------------------------------------------------------
+
+!match new feach3 Foreach3 8 8
+!match use feach3
+!ent add r1 R1 30 1 1 1
+!ent set_var r1 team red
+!foreach team=red
+!foreach ; ent set_var $id hp 1
+!foreach team=blue ; ent set_var $id hp 1
+!foreach team=red ; ent set_var $id hp 1
+!find hp=1
+
+Expected: `!foreach team=red` (no `;`) errors ❌ asking for a `;` separator.
+`!foreach ; ...` (empty selector) errors ❌ (selector empty). `!foreach
+team=blue ; ...` matches nothing → "No entities match; nothing to do." (no
+error). `!foreach team=red ; ent set_var $id hp 1` applies to r1, so the final
+`!find hp=1` lists r1 (1 match).

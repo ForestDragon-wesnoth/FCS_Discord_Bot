@@ -1676,6 +1676,36 @@ More shipped work (continuing the list above):
   illusion that fools enemy TARGETING is a GM composition on top (mechanics use
   real, so a true targeting-fooling illusion would need the deep-illusion
   variant, deferred).
+- **`!find` spatial predicates + `!foreach` bulk-apply — SHIPPED (scenarios
+  486-490).** Two composing query/QoL features.
+  - **Spatial `!find` predicates.** `!find` already had var comparisons
+    (`hp<20`, `team=red`, `var!=v`, dotted paths), `status:`/`group:`/`action:`;
+    the only gap was SPATIAL, now `near:<eid>:<radius>` (within radius of an
+    entity — the reference itself matches at gap 0) and `within:<x>:<y>:<radius>`
+    (within radius of a coordinate). Both use the FOOTPRINT-AWARE nearest-cell
+    gap, Chebyshev (square_radius). The gap math is now the single
+    `Match.entity_gap_distance(e_ref, e_other, mode)` + `cell_entity_distance(x,
+    y, e, mode)` over a shared `_rect_gap` (rectangle nearest-cell distance);
+    `formula.py`'s inline `_ent_dist` (behind `entities_within`/`nearest_entity`)
+    was refactored to route through `entity_gap_distance` so the enumerators and
+    the `near:` predicate agree exactly. A malformed radius / missing reference
+    RAISES `VTTError` from `_find_match_entity` — so `find_cmd` (and `foreach`)
+    now run the match loop INSIDE the predicate-parse try.
+  - **`!foreach <predicates> ; <command>`.** Runs ONE command per entity matching
+    a `!find` selector (the selector reuses the exact find grammar). The bare `;`
+    token splits selector from command (first `;` only; like `!batch`); the
+    command runs once per match with `$id`/`$name`/`$x`/`$y` substituted
+    per-token (`$name` LAST so an injected name isn't re-substituted). Matches
+    are resolved to a fixed (id, name, x, y) snapshot BEFORE any command runs, so
+    mutating the board mid-loop (move/kill/spawn) can't change the target set.
+    ONE undo entry (foreach is snapshotted; inner commands go through
+    `dispatch_no_snapshot`); a per-entity `❌` is reported and the loop continues
+    (batch semantics). Host-gated by default (mutating) — a player can't wrap a
+    mutating command to bypass the gate, since the inner ungated
+    `dispatch_no_snapshot` is only reached after foreach passes the top-level
+    gate. Helpers `_foreach_subst` + the `foreach_cmd` handler in vtt_commands.py.
+    FUTURE the user might want: multiple commands per entity (extra `;`), a
+    read-only `!foreach` variant, more substitution tokens.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

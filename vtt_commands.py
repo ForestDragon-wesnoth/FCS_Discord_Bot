@@ -3737,6 +3737,23 @@ def _parse_find_predicate(token: str) -> Tuple[str, str, Optional[str]]:
         if not name:
             raise VTTError("`action:` predicate needs an action name.")
         return "action", name, None
+    if token.startswith("near:"):
+        # near:<eid>:<radius> — within `radius` (footprint-aware nearest-cell,
+        # Chebyshev) of the reference entity. key=eid, value=radius.
+        rest = token[len("near:"):]
+        parts = rest.split(":")
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            raise VTTError("`near:` predicate needs `near:<eid>:<radius>`.")
+        return "near", parts[0], parts[1]
+    if token.startswith("within:"):
+        # within:<x>:<y>:<radius> — within `radius` (footprint-aware
+        # nearest-cell, Chebyshev) of the coordinate (x, y). key="x:y",
+        # value=radius.
+        rest = token[len("within:"):]
+        parts = rest.split(":")
+        if len(parts) != 3 or not all(parts):
+            raise VTTError("`within:` predicate needs `within:<x>:<y>:<radius>`.")
+        return "within", f"{parts[0]}:{parts[1]}", parts[2]
     # Try operators longest-first so `<=` isn't misread as `<`.
     for op in _FIND_OPS:
         idx = token.find(op)
@@ -3744,7 +3761,8 @@ def _parse_find_predicate(token: str) -> Tuple[str, str, Optional[str]]:
             return op, token[:idx], token[idx + len(op):]
     raise VTTError(
         f"Unrecognized find predicate `{token}`. Expected `key=value`, "
-        f"`key<value`, `status:NAME`, `group:NAME`, or `action:NAME`."
+        f"`key<value`, `status:NAME`, `group:NAME`, `action:NAME`, "
+        f"`near:<eid>:<radius>`, or `within:<x>:<y>:<radius>`."
     )
 
 
@@ -3799,6 +3817,34 @@ def _find_match_entity(m: Match, e: Entity, predicates: List[Tuple[str, str, Opt
             if not lookup_action(actions, key, m.rules):
                 return False
             continue
+        if kind == "near":
+            # within `val` cells (footprint-aware nearest-cell, Chebyshev)
+            # of the reference entity `key`. The reference itself matches
+            # (gap 0). Raises on a bad radius / missing reference — find_cmd
+            # and foreach run the match loop inside a VTTError-catching try.
+            radius = _coerce_for_compare(val)
+            if isinstance(radius, bool) or not isinstance(radius, (int, float)):
+                raise VTTError(f"`near:` radius must be a number, got `{val}`.")
+            ref = m.entities.get(_resolve_eid(m, key))
+            if ref is None:
+                raise VTTError(f"`near:` reference entity `{key}` not found.")
+            if m.entity_gap_distance(ref, e) > radius:
+                return False
+            continue
+        if kind == "within":
+            # within `val` cells (footprint-aware nearest-cell, Chebyshev)
+            # of the coordinate stored in `key` as "x:y".
+            radius = _coerce_for_compare(val)
+            if isinstance(radius, bool) or not isinstance(radius, (int, float)):
+                raise VTTError(f"`within:` radius must be a number, got `{val}`.")
+            sx, sy = key.split(":")
+            try:
+                cx, cy = int(sx), int(sy)
+            except ValueError:
+                raise VTTError("`within:` coordinates must be integers.")
+            if m.cell_entity_distance(cx, cy, e) > radius:
+                return False
+            continue
         # Var-comparison forms. Missing var never matches any operator
         # (including !=) — that keeps "team=red" from spuriously
         # matching entities that don't have a team set at all.
@@ -3841,11 +3887,13 @@ def _find_match_entity(m: Match, e: Entity, predicates: List[Tuple[str, str, Opt
         "`var=value`, `var!=value`, `var<value`, `var<=value`, "
         "`var>value`, `var>=value` for vars; `status:NAME` for a status "
         "flag; `group:NAME` for group membership; `action:NAME` for "
-        "discoverable-action availability. Dotted var paths walk "
+        "discoverable-action availability; `near:<eid>:<radius>` and "
+        "`within:<x>:<y>:<radius>` for spatial range (footprint-aware "
+        "nearest-cell, Chebyshev). Dotted var paths walk "
         "nested dicts (`inventory.sword.damage>5`). Example: "
-        "`!find team=red hp<20 status:bleeding action:slice` lists "
-        "every red-team entity below 20 HP that is bleeding AND has "
-        "a `slice` action available."
+        "`!find team=red hp<20 status:bleeding near:boss:3` lists "
+        "every red-team entity below 20 HP that is bleeding AND within "
+        "3 cells of `boss`."
     ),
     snapshot=False,
 )
@@ -3856,10 +3904,10 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     try:
         predicates = [_parse_find_predicate(t) for t in args]
+        hits = [e for e in m.entities_in_turn_order()
+                if _find_match_entity(m, e, predicates)]
     except VTTError as ex:
         return await ctx.send(f"❌ {ex}")
-    hits = [e for e in m.entities_in_turn_order()
-            if _find_match_entity(m, e, predicates)]
     if not hits:
         return await ctx.send("No entities match.")
     word = "match" if len(hits) == 1 else "matches"
@@ -3867,6 +3915,71 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     for e in hits:
         lines.append(f"- {_entity_line(e)}")
     return await ctx.send("\n".join(lines))
+
+
+# ---- !foreach -----------------------------------------------------------
+# Bulk-apply: run one command for every entity matching a !find selector.
+# The selector reuses the exact find-predicate grammar; the command after
+# the bare `;` runs once per match with per-entity tokens substituted.
+def _foreach_subst(tok: str, eid: str, name: str, x: int, y: int) -> str:
+    """Substitute the per-entity tokens in one command token. `$name` is
+    replaced LAST so a name that happens to contain another token (e.g.
+    `$id`) isn't recursively re-substituted."""
+    return (tok.replace("$id", eid)
+               .replace("$x", str(x))
+               .replace("$y", str(y))
+               .replace("$name", name))
+
+
+@registry.command(
+    "foreach",
+    usage="!foreach <predicate> [<predicate> ...] ; <command> [args...]",
+    desc=(
+        "Run one command for every entity matching a `!find` selector. "
+        "The selector (same predicates as `!find`: `var=value`, "
+        "`status:NAME`, `group:NAME`, `action:NAME`, `near:<eid>:<radius>`, "
+        "`within:<x>:<y>:<radius>`) comes before a bare `;`; the command "
+        "after it runs once per matching entity with `$id`/`$name`/`$x`/"
+        "`$y` substituted. Matches are resolved BEFORE any command runs, "
+        "so mutating the board mid-loop won't change the target set. The "
+        "whole sweep is ONE undo entry; a per-entity `❌` is reported and "
+        "the loop continues. Example: "
+        "`!foreach team=red near:boss:2 ; ent damage $id 5`."
+    ),
+)
+async def foreach_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["foreach"])
+        return await ctx.send(f"**{title}**\n{body}")
+    if ";" not in args:
+        return await ctx.send(
+            "❌ foreach needs a `;` separating the selector from the "
+            "command. Usage: `!foreach <predicates> ; <command>`."
+        )
+    sep = args.index(";")
+    sel_tokens = args[:sep]
+    cmd_tokens = args[sep + 1:]
+    if not sel_tokens:
+        return await ctx.send("❌ foreach selector is empty (nothing before `;`).")
+    if not cmd_tokens:
+        return await ctx.send("❌ foreach command is empty (nothing after `;`).")
+    m = active_match(mgr, ctx)
+    try:
+        predicates = [_parse_find_predicate(t) for t in sel_tokens]
+        hits = [e for e in m.entities_in_turn_order()
+                if _find_match_entity(m, e, predicates)]
+    except VTTError as ex:
+        return await ctx.send(f"❌ {ex}")
+    if not hits:
+        return await ctx.send("No entities match; nothing to do.")
+    # Snapshot the substitution values up front so the target set is fixed
+    # even if the per-entity commands move / kill / spawn entities.
+    targets = [(e.id, e.name, e.x, e.y) for e in hits]
+    noun = "entity" if len(targets) == 1 else "entities"
+    await ctx.send(f"foreach: applying to {len(targets)} {noun}...")
+    for eid, name, x, y in targets:
+        sub = [_foreach_subst(t, eid, name, x, y) for t in cmd_tokens]
+        await registry.dispatch_no_snapshot(sub[0], sub[1:], ctx, mgr)
 
 
 @registry.command("state", access="all", usage="!state [full]", desc="Show match summary, entities, and map from this channel's POV. `!state full` (host-gated) forces the omniscient view.")

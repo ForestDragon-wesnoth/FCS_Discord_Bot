@@ -3294,16 +3294,11 @@ class FormulaEngine:
         def _ent_dist(ref_e, oe, mode):
             # Footprint-aware entity-to-entity distance = the gap between
             # the two axis-aligned footprint rectangles (nearest-cell
-            # distance), combined per `mode`. Computed in closed form: the
-            # per-axis gap is 0 when the rectangles overlap on that axis,
-            # else the separation; distance(0,0,gx,gy,mode) then applies
-            # the same metric as point distance. For two 1×1 entities this
+            # distance), combined per `mode`. Routed through the shared
+            # Match.entity_gap_distance so the spatial enumerators and the
+            # `near:` find predicate agree. For two 1×1 entities this
             # reduces to the old anchor-to-anchor distance.
-            rw, rh = match.entity_footprint(ref_e)
-            ow, oh = match.entity_footprint(oe)
-            gx = max(0, ref_e.x - (oe.x + ow - 1), oe.x - (ref_e.x + rw - 1))
-            gy = max(0, ref_e.y - (oe.y + oh - 1), oe.y - (ref_e.y + rh - 1))
-            return _distance(0, 0, gx, gy, mode)
+            return match.entity_gap_distance(ref_e, oe, mode)
 
         def _entities_within(eid_token: Any, n: Any,
                              mode: Any = "square_radius_distance",

@@ -7546,6 +7546,42 @@ class Match:
         w, h = self.entity_footprint(e)
         return e.x <= x < e.x + w and e.y <= y < e.y + h
 
+    def _rect_gap(self, ax: int, ay: int, aw: int, ah: int,
+                  bx: int, by: int, bw: int, bh: int,
+                  mode: str = "square_radius") -> float:
+        """Nearest-cell distance between two axis-aligned rectangles (each
+        x,y = top-left, w,h = size), combined per `mode`. The per-axis gap
+        is 0 when the rectangles overlap on that axis, else the separation;
+        the chosen metric is then applied. Mirrors the point-distance
+        metrics exactly (square_radius/Chebyshev int, manhattan int,
+        euclidean float), so two 1×1 rects reduce to anchor distance."""
+        gx = max(0, ax - (bx + bw - 1), bx - (ax + aw - 1))
+        gy = max(0, ay - (by + bh - 1), by - (ay + ah - 1))
+        if mode in ("manhattan", "manhattan_distance"):
+            return int(gx + gy)
+        if mode in ("euclidean", "euclidean_distance"):
+            return math.sqrt(gx * gx + gy * gy)
+        return int(max(gx, gy))   # square_radius (Chebyshev), the default
+
+    def entity_gap_distance(self, e_ref: "Entity", e_other: "Entity",
+                            mode: str = "square_radius") -> float:
+        """Footprint-aware nearest-cell distance between two entities —
+        the gap between their footprint rectangles. The single source of
+        truth for entity-to-entity distance (entities_within/nearest_entity
+        and the `near:` find predicate both route through here)."""
+        rw, rh = self.entity_footprint(e_ref)
+        ow, oh = self.entity_footprint(e_other)
+        return self._rect_gap(e_ref.x, e_ref.y, rw, rh,
+                              e_other.x, e_other.y, ow, oh, mode)
+
+    def cell_entity_distance(self, x: int, y: int, e: "Entity",
+                             mode: str = "square_radius") -> float:
+        """Footprint-aware nearest-cell distance from a single cell (x, y)
+        to entity `e` — the point-vs-footprint gap behind the `within:`
+        find predicate."""
+        ow, oh = self.entity_footprint(e)
+        return self._rect_gap(x, y, 1, 1, e.x, e.y, ow, oh, mode)
+
     def cell_occupant(self, x: int, y: int,
                       ignore: Tuple[str, ...] = ()) -> Optional[str]:
         """The id of the first alive, non-stackable entity whose
