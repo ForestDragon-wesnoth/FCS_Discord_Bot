@@ -152,6 +152,27 @@ follow-up tests for an older feature, insert them right after that feature's
 existing scenarios and renumber the rest (the tail-rewrite pattern); update
 the `Scenario N` citations in this file to match.
 
+### ALWAYS smoke-test new features on a multi-tile entity
+
+Multi-tile / footprint entities (and their cousins: body parts, mounts,
+anchored auras, segments) are the SINGLE biggest source of interaction bugs
+in this codebase — almost every audit-pass fix traced back to code that
+silently assumed a 1×1, anchor-only entity (anchor-only bounds/occupancy,
+LOS/vision cast from the anchor cell, a hook or clock that skipped attached
+parts, a carry/restamp that moved the anchor but not the footprint). So:
+
+**Any new feature MUST be exercised at least once against a multi-tile
+entity (give something a `footprint_w`/`footprint_h` > 1, or a body part /
+rider / segment) before you call it done — even if that check never becomes
+a committed scenario.** A throwaway Python repro or a `-v` transcript is
+fine; the point is to actually run the new code path with a footprint and
+confirm it uses the WHOLE footprint, not just `(x, y)`. Ask the standard
+questions: does it measure/membership-test by ANY covered cell? does it
+validate the WHOLE swept footprint? does it carry the whole body on move?
+does an attached part get included where it should (and excluded where it
+shouldn't)? If the feature is spatial, vision-related, movement-related, or
+fires per-entity, this is non-negotiable.
+
 ### Commit messages: dense, factual, no fluff
 
 Look at existing commit messages on `main`. They explain WHY a change
