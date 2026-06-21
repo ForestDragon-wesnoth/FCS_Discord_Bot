@@ -5428,17 +5428,20 @@ class FormulaEngine:
         def _entities_in_area(x: Any, y: Any, n: Any,
                               mode: Any = "square_radius_distance") -> list:
             """entities_in_area(x, y, n, mode): coord-rooted version of
-            entities_within. Returns alive entity ids whose position is
-            within distance n of the POINT (x, y), sorted by
-            (distance, id). Use when the area is centered on a tile
-            (e.g. AOE spell impact) instead of on an entity."""
-            # Validate the same way distance() does — pass through and
-            # let it raise if the args are bad.
+            entities_within. Returns alive entity ids whose FOOTPRINT
+            comes within distance n of the POINT (x, y) (nearest covered
+            cell, like entities_within measures the nearest-cell gap),
+            sorted by (distance, id). Use when the area is centered on a
+            tile (e.g. AOE spell impact) instead of on an entity."""
+            # Validate x, y, mode the same way distance() does (raises on
+            # bad input); then measure the footprint-aware nearest-cell gap
+            # per entity so a large body partly inside the radius counts.
+            _distance(x, y, x, y, mode)
             scored = []
             for eid, e in match.entities.items():
                 if not e.is_alive or e.is_glued_part or e.is_hidden_rider:
                     continue
-                d = _distance(x, y, e.x, e.y, mode)
+                d = match.cell_entity_distance(x, y, e, mode)
                 if d <= n:
                     scored.append((d, eid))
             scored.sort(key=lambda t: (t[0], t[1]))

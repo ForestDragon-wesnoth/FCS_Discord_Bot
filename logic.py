@@ -12303,18 +12303,25 @@ class Match:
             e = self.entities[eid]
             origin_x, origin_y = e.x, e.y
             for nx, ny, facing in path:
-                sx, sy = e.x, e.y
+                # Footprint-aware per-step hooks (a multi-tile member must
+                # fire tile/zone hooks for EVERY covered cell it vacates /
+                # enters, not just its anchor) — identical to the anchor
+                # form for a 1×1 member, matching Entity.move_dirs.
+                old_cells = self.entity_cells(e, e.x, e.y)
+                new_cells = self.entity_cells(e, nx, ny)
                 if fire_hooks:
-                    log.extend(self.fire_tile_hook("on_exit", eid, sx, sy))
-                    log.extend(self.fire_zone_exit_hooks(eid, sx, sy, nx, ny))
+                    log.extend(self.fire_footprint_tile_exit(eid, old_cells, new_cells))
+                    log.extend(self.fire_footprint_zone_exit(eid, old_cells, new_cells))
                 e.facing = facing
                 e.move_to(nx, ny)
                 if fire_hooks:
-                    log.extend(self.fire_tile_hook("on_enter", eid, nx, ny))
-                    log.extend(self.fire_zone_enter_hooks(eid, sx, sy, nx, ny, False))
+                    log.extend(self.fire_footprint_tile_enter(eid, old_cells, new_cells))
+                    log.extend(self.fire_footprint_zone_enter(
+                        eid, old_cells, new_cells, False))
             if fire_hooks and path:
-                log.extend(self.fire_tile_hook("on_stop", eid, e.x, e.y))
-                log.extend(self.fire_zone_stop_hooks(eid, e.x, e.y))
+                final_cells = self.entity_cells(e, e.x, e.y)
+                log.extend(self.fire_footprint_tile_stop(eid, final_cells))
+                log.extend(self.fire_footprint_zone_stop(eid, final_cells))
                 # on_entity_moved per group member, once per member
                 # (mirrors single-entity move_dirs semantics).
                 log.extend(self.fire_entity_moved(

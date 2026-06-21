@@ -1706,6 +1706,46 @@ More shipped work (continuing the list above):
     gate. Helpers `_foreach_subst` + the `foreach_cmd` handler in vtt_commands.py.
     FUTURE the user might want: multiple commands per entity (extra `;`), a
     read-only `!foreach` variant, more substitution tokens.
+- **Audit-pass-4 fixes: multi-tile interaction sweep (scenarios 491-492).** A
+  fourth interaction-bug sweep, this time hunting anchor-only assumptions in
+  OLDER features against multi-tile entities (three read-only survey agents
+  across zones/auras/tiles, vision/LOS/targeting, and AoE/spawn/corpse/mount;
+  every flagged candidate verified in code before fixing). Two real bugs found
+  + fixed; the rest of the surface re-confirmed footprint-correct.
+  - **`move_group_dirs` fired tile/zone movement hooks at the ANCHOR cell
+    only.** Group movement (`!ent move group:<name> ...`) validated the whole
+    swept footprint (audit-pass-2) but then fired `on_enter`/`on_exit`/`on_stop`
+    via the anchor-only `fire_tile_hook`/`fire_zone_*_hooks` instead of the
+    footprint-aware `fire_footprint_tile_*`/`fire_footprint_zone_*` that
+    `Entity.move_dirs` uses — contradicting its own docstring ("per intermediate
+    tile … same as single-entity move_dirs"). So a multi-tile group member
+    crossing a hazard band / zone edge under-fired hooks (a 2×2 walking over a
+    damage strip burned once, not per covered cell). Now mirrors `move_dirs`
+    exactly (per-step `old_cells`/`new_cells` via `entity_cells`); byte-identical
+    for a 1×1 member, correct for a footprint. (NOTE: group move still does not
+    fire the per-step `on_entity_step` hook that single-entity `move_dirs` does —
+    a pre-existing, footprint-independent difference left as-is.)
+  - **`entities_in_area(x, y, n)` measured distance to the ANCHOR cell.** The
+    coord-rooted twin of `entities_within` used `_distance(x, y, e.x, e.y, mode)`
+    while `entities_within` had been refactored to the footprint-aware
+    nearest-cell gap — so a large body partly inside an AoE radius was wrongly
+    excluded (a 4×4 at (10,10) missed a blast at (14,14) r2 because the anchor
+    was 4 away though a corner cell was 1 away). Now routes through
+    `Match.cell_entity_distance(x, y, e, mode)` (the point-vs-footprint gap added
+    with the `within:` find predicate), so the entity- and coord-rooted area
+    queries agree.
+  - **Re-verified footprint-correct (no change needed), so future sweeps can
+    skip them:** all vision/fog/LOS casts (`_member_sees`, `_entity_has_los`,
+    `_team_sees_entity`, `_record_vision`, `entity_visible_to` — union/any-cell),
+    targeting geometry (`side_hit`/`hit_location`/`directional_get` box-face
+    hitbox, `entity_center`/`aoe_origin`), the spatial/LOS enumerators
+    (`entities_within`/`nearest_entity` via `entity_gap_distance`,
+    `entities_in_cone`/`_rect`/`_line_ignorelos`/`_on_los`/`_line_until` via
+    `_alive_at`/`_occupants` any-cell), `damage_spread` spatial filtering,
+    `chain_targets`, `summon_near`/`_find_free_cell_near` (whole footprint
+    validated, defaults applied first), corpses (`corpse_cells`/`revive`),
+    mounts (`_find_dismount_cell`/`_restamp_riders_for`), `resize_grid` (cut if
+    ANY cell off-grid), and single-entity `tp`/`move_dirs`/push/pull/swap.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

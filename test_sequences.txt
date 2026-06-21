@@ -12608,3 +12608,49 @@ Expected: `!foreach team=red` (no `;`) errors ❌ asking for a `;` separator.
 team=blue ; ...` matches nothing → "No entities match; nothing to do." (no
 error). `!foreach team=red ; ent set_var $id hp 1` applies to r1, so the final
 `!find hp=1` lists r1 (1 match).
+
+
+SCENARIO 491 — Audit: group-move fires tile hooks for the WHOLE footprint
+--------------------------------------------------------------------
+
+!match new agm AuditGroupMove 12 6
+!match use agm
+!ent add dragon Dragon 50 3 3 1
+!ent set_var dragon footprint_w 2
+!ent set_var dragon footprint_h 2
+!ent group new g
+!ent group add g dragon
+!tile hook add 5 3 on_enter 'entity[self].hp = entity[self].hp - 1'
+!tile hook add 6 3 on_enter 'entity[self].hp = entity[self].hp - 1'
+!tile hook add 5 4 on_enter 'entity[self].hp = entity[self].hp - 1'
+!tile hook add 6 4 on_enter 'entity[self].hp = entity[self].hp - 1'
+!ent move group:g right right
+!eval "var_get('dragon','hp')"
+
+Expected: the 2×2 dragon (anchor (3,3), covering (3,3)-(4,4)) is group-moved
+right two steps to anchor (5,3). Each step fires on_enter for the cells the
+footprint NEWLY covers: step 1 enters (5,3)+(5,4), step 2 enters (6,3)+(6,4) —
+all four are -1 HP tiles. So `var_get('dragon','hp')` = 46. (Before the fix the
+group mover fired tile hooks at the ANCHOR cell only, so the dragon would have
+taken at most 1 hit — the right column's damage was silently skipped.)
+
+
+SCENARIO 492 — Audit: entities_in_area is footprint-aware (nearest cell)
+--------------------------------------------------------------------
+
+!match new aia AuditArea 16 16
+!match use aia
+!ent add dragon Dragon 50 10 10 1
+!ent set_var dragon footprint_w 4
+!ent set_var dragon footprint_h 4
+!ent add far Far 10 1 1 2
+!eval "entities_in_area(12, 12, 0)"
+!eval "entities_in_area(14, 14, 1)"
+!eval "entities_in_area(14, 14, 0)"
+
+Expected: the 4×4 dragon covers (10,10)-(13,13); far is at (1,1).
+`entities_in_area(12,12,0)` = [dragon] (the point is INSIDE the footprint, gap
+0). `entities_in_area(14,14,1)` = [dragon] (nearest cell (13,13) is Chebyshev 1
+from (14,14)). `entities_in_area(14,14,0)` = [] (gap 1 > 0). far never matches.
+(Before the fix the distance used the anchor (10,10) — gap 4 — so all three
+queries would have wrongly EXCLUDED the dragon.)
