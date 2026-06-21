@@ -1501,6 +1501,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # position (never the embedded snapshot's x/y).
     #   kill(eid)           -> bool (death triggered)
     #   revive(eid)         -> str (new entity id; raises if no corpse)
+    #   transform(eid, template, stash_path=None) -> eid (statblock swap)
+    #   revert(eid, stash_path)                    -> eid (restore stash)
     #   has_corpse(eid)     -> bool
     #   corpse_at(eid)      -> (x, y); raises if no such corpse
     #   all_corpses()       -> list of corpse ids (loopable)
@@ -1509,7 +1511,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   corpse_var(eid, path[, def]) -> the dead entity's stored var at a
     #                                   dotted path (raises if missing
     #                                   unless a default is supplied)
-    "kill", "revive", "has_corpse", "corpse_at", "all_corpses",
+    "kill", "revive", "transform", "revert", "has_corpse", "corpse_at", "all_corpses",
     "corpse_has", "corpse_var",
     "corpse_status_has", "corpse_status_get", "corpse_status_names",
     # Scheduled / delayed effects. schedule() queues a MATCH-level body
@@ -4473,6 +4475,35 @@ class FormulaEngine:
             engine._note_affected(new_id)
             return new_id
 
+        def _transform(eid_t: Any, template: Any, stash_path: Any = None) -> str:
+            """transform(eid, template, stash_path=None): swap eid's statblock
+            (name/vars/passives/clamps/status/parts) for `template`, KEEPING
+            its id/position/facing/team/turn-order slot. HP carries per the
+            transform_hp_mode rule. If `stash_path` is given, the pre-transform
+            statblock is stored at entity[eid].<stash_path> so revert(eid,
+            stash_path) can restore it (stash paths are ordinary vars, so
+            transforms stack). Returns eid."""
+            eid = str(_eid(eid_t))
+            sp = None if stash_path is None else str(stash_path)
+            try:
+                match.transform_entity(eid, template, sp)
+            except (VTTError, NotFound, OutOfBounds, Occupied) as ex:
+                raise FormulaError(str(ex))
+            engine._note_affected(eid)
+            return eid
+
+        def _revert(eid_t: Any, stash_path: Any) -> str:
+            """revert(eid, stash_path): restore eid's statblock from the
+            snapshot stashed at entity[eid].<stash_path> by transform().
+            Returns eid. Raises if no stashed statblock is found there."""
+            eid = str(_eid(eid_t))
+            try:
+                match.revert_entity(eid, str(stash_path))
+            except (VTTError, NotFound, OutOfBounds, Occupied) as ex:
+                raise FormulaError(str(ex))
+            engine._note_affected(eid)
+            return eid
+
         def _has_corpse(eid_t: Any) -> bool:
             """has_corpse(eid): True iff a corpse with id `eid` exists
             in this match. The corpse-side companion to has_action /
@@ -4560,6 +4591,8 @@ class FormulaEngine:
 
         ns["kill"]         = _kill
         ns["revive"]       = _revive
+        ns["transform"]    = _transform
+        ns["revert"]       = _revert
         ns["has_corpse"]   = _has_corpse
         ns["corpse_at"]    = _corpse_at
         ns["all_corpses"]  = _all_corpses

@@ -2929,6 +2929,64 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"`summon_from('{dest_path}', x, y)`)."
         )
 
+    # ---- transform <id> <template_ref> [stash_path] ----
+    # Polymorph/transform (115): swap an entity's statblock for a template
+    # while keeping its identity (id/position/facing/team/turn-order slot).
+    # template_ref resolves as a dotted VAR PATH on the entity (the
+    # summon_from convention: store a template, then transform into it), and
+    # falls back to a live entity id (snapshot it). With a stash_path the
+    # pre-transform statblock is saved there so `!ent revert` can restore it.
+    if sub == "transform":
+        if await return_help_if_not_enough_args(ctx, args, 3, "ent", "transform"):
+            return
+        tid = _resolve_eid(m, args[1])
+        if tid not in m.entities:
+            raise NotFound(f"Entity '{tid}' not found.")
+        ref = args[2]
+        stash_path = args[3] if len(args) >= 4 else None
+        # Resolve the template: a dotted var path on the entity, else a live
+        # entity to snapshot.
+        node = m.entities[tid].vars
+        for key in ref.split("."):
+            if isinstance(node, dict) and key in node:
+                node = node[key]
+            else:
+                node = None
+                break
+        if isinstance(node, dict):
+            template = node
+        else:
+            other = _resolve_eid(m, ref)
+            if other in m.entities:
+                template = m.entity_template_dict(m.entities[other])
+            else:
+                return await ctx.send(
+                    f"❌ No template found: `{ref}` is neither a dict var on "
+                    f"`{tid}` nor a live entity id.")
+        try:
+            m.transform_entity(tid, template, stash_path)
+        except (VTTError, NotFound, Occupied) as ex:
+            return await ctx.send(f"❌ {ex}")
+        stash_note = (f" (original stashed at vars.{stash_path} — "
+                      f"`!ent revert {tid} {stash_path}` to restore)"
+                      if stash_path else "")
+        return await ctx.send(
+            f"`{tid}` transformed into **{m.entities[tid].name}**{stash_note}.")
+
+    # ---- revert <id> <stash_path> ----
+    if sub == "revert":
+        if await return_help_if_not_enough_args(ctx, args, 3, "ent", "revert"):
+            return
+        tid = _resolve_eid(m, args[1])
+        if tid not in m.entities:
+            raise NotFound(f"Entity '{tid}' not found.")
+        try:
+            m.revert_entity(tid, args[2])
+        except (VTTError, NotFound, Occupied) as ex:
+            return await ctx.send(f"❌ {ex}")
+        return await ctx.send(
+            f"`{tid}` reverted to **{m.entities[tid].name}**.")
+
     # ---- copy / transfer <id> <dest_match> [x] [y] ----
     # Cross-match entity transfer (107): copy duplicates into another live
     # match (keeps the source); transfer MOVES it (removes the source). Vars,
@@ -3147,6 +3205,31 @@ registry.annotate_sub(
         "`summon_from('<dest_path>', x, y)` (template on `self`) or "
         "`summon(var_get('<dest_id>','<dest_path>'), x, y)`. Alias: "
         "`store_entity`."
+    ),
+)
+registry.annotate_sub(
+    "ent", "transform",
+    usage="!ent transform <id> <template_ref> [stash_path]",
+    desc=(
+        "Polymorph `<id>` into a statblock template — swaps name, vars "
+        "(incl. actions + footprint), passives, clamps, status, and body "
+        "parts, while KEEPING the entity's id, position, facing, team, and "
+        "turn-order slot. `<template_ref>` is a dotted var path on the "
+        "entity (store one with `store_entity_into_var`, then transform into "
+        "it) or a live entity id to snapshot. HP carries per the "
+        "`transform_hp_mode` rule (default: preserve %). Pass `[stash_path]` "
+        "to save the pre-transform statblock at vars.<stash_path> so "
+        "`!ent revert` can restore it — stash paths are ordinary vars, so "
+        "transforms stack."
+    ),
+)
+registry.annotate_sub(
+    "ent", "revert",
+    usage="!ent revert <id> <stash_path>",
+    desc=(
+        "Restore `<id>`'s statblock from a snapshot previously stashed at "
+        "vars.<stash_path> by `!ent transform`. HP carries per the "
+        "`transform_hp_mode` rule. The stash var is consumed."
     ),
 )
 registry.annotate_sub(
