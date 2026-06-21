@@ -1434,6 +1434,24 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "'hidden')\"."
         ),
     },
+    # Fake-statblock / disguise (116): the entity var holding a display-only,
+    # POV-gated disguise dict {name?, glyph?, glyphs?, color?, vars?}. A viewer
+    # NOT on the entity's own team (and not omniscient) sees the disguise's
+    # name/glyph/color and its `vars` overlaid on the roster; allies and the
+    # GM/omniscient view see the truth. Engine mechanics (targeting, formulas,
+    # damage) ALWAYS use the real statblock — a disguise only changes what's
+    # rendered. A decoy/illusion is a GM composition on top of this.
+    "disguise_var": {
+        "default": "disguise",
+        "schema": {"type": "str"},
+        "desc": (
+            "Entity var holding a display-only, POV-gated disguise dict "
+            "{name?, glyph?, glyphs?, color?, vars?}. Non-allied, "
+            "non-omniscient viewers see the disguise (name/glyph/color + the "
+            "`vars` overlay on the roster); the entity's own team and the GM "
+            "see the real statblock. Mechanics always use the real vars."
+        ),
+    },
     # Per-tile visibility (hidden traps, secret doors, etc.). Same shape
     # as entity_visibility_condition but for the TILE glyph layer + the
     # !tile list/info/cells listings. Bindings: pov_team = the viewing
@@ -11571,13 +11589,49 @@ class Match:
         return m
 
     # ------------- simple ASCII render for quick debugging -------------
-    def entity_glyph(self, e: "Entity") -> str:
+    def _effective_disguise(self, e: "Entity",
+                            pov_team: Optional[str]) -> Optional[Dict[str, Any]]:
+        """The fake statblock `e` PRESENTS to a viewer on team `pov_team`, or
+        None to show the truth. Display-only and POV-gated: a disguise applies
+        only to a non-omniscient viewer (pov_team is not None) who is NOT on
+        the entity's own team — allies and the omniscient/GM view always see
+        the real entity. The disguise lives in the var named by the
+        `disguise_var` rule (default `disguise`): a dict {name?, glyph?,
+        glyphs?, color?, vars?: {...}}. Engine MECHANICS (targeting, formulas,
+        damage) always use the real statblock; only the rendered name / glyph /
+        color / roster stats are swapped. (116 fake-statblock; decoy/illusion
+        is a GM composition on top of it.)"""
+        if pov_team is None:
+            return None
+        var = str(self.rules.get("disguise_var", "disguise"))
+        d = e.vars.get(var)
+        if not isinstance(d, dict) or not d:
+            return None
+        if e.team is not None and str(e.team) == str(pov_team):
+            return None
+        return d
+
+    def entity_glyph(self, e: "Entity",
+                     pov_team: Optional[str] = None) -> str:
         """The map symbol for `e`: a per-facing `glyphs.<facing>` var wins,
         else a direction-agnostic single `glyph` var, else the default
         DIRECTION_ARROWS arrow for its facing (`@` if unknown). Custom
         glyphs must be exactly one character (alignment); anything else is
-        ignored and falls through — same rule as tile/zone glyphs."""
+        ignored and falls through — same rule as tile/zone glyphs. When `e`
+        is disguised to `pov_team` (116), the disguise's glyph/glyphs are
+        resolved first; a disguise without a glyph falls through to the real
+        resolution."""
         facing = getattr(e, "facing", "")
+        dis = self._effective_disguise(e, pov_team)
+        if dis is not None:
+            dglyphs = dis.get("glyphs")
+            if isinstance(dglyphs, dict):
+                dg = dglyphs.get(facing)
+                if isinstance(dg, str) and len(dg) == 1:
+                    return dg
+            dg = dis.get("glyph")
+            if isinstance(dg, str) and len(dg) == 1:
+                return dg
         glyphs = e.vars.get("glyphs")
         if isinstance(glyphs, dict):
             g = glyphs.get(facing)
@@ -11600,11 +11654,18 @@ class Match:
         g = e.vars.get("glyph")
         return isinstance(g, str) and len(g) == 1
 
-    def entity_color(self, e: "Entity") -> Optional[str]:
+    def entity_color(self, e: "Entity",
+                     pov_team: Optional[str] = None) -> Optional[str]:
         """The resolved color NAME for `e` (or None): its `color` var wins,
         else its team's color — the match team_colors map, defaulting to
         the team's own name when that name is itself a palette color (so a
-        team literally named 'red' renders red). Unknown names -> None."""
+        team literally named 'red' renders red). Unknown names -> None. When
+        `e` is disguised to `pov_team` (116), the disguise's `color` wins."""
+        dis = self._effective_disguise(e, pov_team)
+        if dis is not None:
+            dc = dis.get("color")
+            if isinstance(dc, str) and dc in TEXT_COLORS:
+                return dc
         c = e.vars.get("color")
         if isinstance(c, str) and c in TEXT_COLORS:
             return c
@@ -11616,6 +11677,17 @@ class Match:
             if team in TEXT_COLORS:
                 return team
         return None
+
+    def entity_display_name(self, e: "Entity",
+                            pov_team: Optional[str] = None) -> str:
+        """`e`'s presented name: the disguise's `name` when disguised to
+        `pov_team` (116), else the real name (falling back to id)."""
+        dis = self._effective_disguise(e, pov_team)
+        if dis is not None:
+            n = dis.get("name")
+            if isinstance(n, str) and n:
+                return n
+        return e.name or e.id
 
     def _resolve_color_value(self, val: Any,
                              extras: Dict[str, Any]) -> Optional[str]:
@@ -11867,14 +11939,14 @@ class Match:
                 continue
             if not self.entity_visible_to(e.id, pov_team):
                 continue
-            sym = self.entity_glyph(e)
-            ecol = self.entity_color(e)
+            sym = self.entity_glyph(e, pov_team)
+            ecol = self.entity_color(e, pov_team)
             for (cx, cy) in self.entity_cells(e):
                 if self.in_bounds(cx, cy):
                     grid[cy][cx] = sym
                     colors[cy][cx] = ecol
                     if meanings is not None:
-                        meanings[cy][cx] = e.name or e.id
+                        meanings[cy][cx] = self.entity_display_name(e, pov_team)
 
         # Visible-rider priority pass: a rider in a region slot sits ON the
         # vehicle, so it draws over the vehicle glyph at its slot cell.
@@ -11883,14 +11955,14 @@ class Match:
                 continue
             if not self.entity_visible_to(e.id, pov_team):
                 continue
-            sym = self.entity_glyph(e)
-            ecol = self.entity_color(e)
+            sym = self.entity_glyph(e, pov_team)
+            ecol = self.entity_color(e, pov_team)
             for (cx, cy) in self.entity_cells(e):
                 if self.in_bounds(cx, cy):
                     grid[cy][cx] = sym
                     colors[cy][cx] = ecol
                     if meanings is not None:
-                        meanings[cy][cx] = e.name or e.id
+                        meanings[cy][cx] = self.entity_display_name(e, pov_team)
 
         # Region-part priority pass: a region part overlaps its parent, so by
         # default it only draws over the parent when it has a CUSTOM glyph (a
@@ -11903,14 +11975,14 @@ class Match:
                     continue
                 if not self.entity_visible_to(e.id, pov_team):
                     continue
-                sym = self.entity_glyph(e)
-                ecol = self.entity_color(e)
+                sym = self.entity_glyph(e, pov_team)
+                ecol = self.entity_color(e, pov_team)
                 for (cx, cy) in self.entity_cells(e):
                     if self.in_bounds(cx, cy):
                         grid[cy][cx] = sym
                         colors[cy][cx] = ecol
                         if meanings is not None:
-                            meanings[cy][cx] = e.name or e.id
+                            meanings[cy][cx] = self.entity_display_name(e, pov_team)
 
         # Fog overlay (last): an unrevealed cell shows fog_glyph and no
         # color (fog hides whatever tint was there).

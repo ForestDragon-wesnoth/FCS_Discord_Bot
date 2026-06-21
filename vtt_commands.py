@@ -530,8 +530,11 @@ def _render_template(tmpl: str, ctx: Dict[str, Any]) -> str:
     return _TMPL_PLACE_RE.sub(_place_sub, s)
 
 
-def _entity_template_context(e: Entity) -> Dict[str, Any]:
-    """Build the placeholder context for an Entity."""
+def _entity_template_context(e: Entity,
+                             pov_team: Optional[str] = None) -> Dict[str, Any]:
+    """Build the placeholder context for an Entity. When `pov_team` is a
+    non-allied viewer and the entity is disguised (116), the disguise's name
+    and `vars` overlay the real values so the roster shows the fake statblock."""
     hp_var, max_hp_var, init_var = e._vital_var_names()
     # Start with entity attributes (these win over var keys on collision).
     ctx: Dict[str, Any] = {
@@ -552,11 +555,26 @@ def _entity_template_context(e: Entity) -> Dict[str, Any]:
     for k, v in e.vars.items():
         if k not in ctx:
             ctx[k] = v
+    # Disguise overlay (116): a non-allied viewer sees the fake name + vars.
+    # The disguise's vars win over EVERYTHING (incl. the computed hp/max_hp/
+    # team) — that's the point of a fake statblock.
+    if pov_team is not None and e._match is not None:
+        dis = e._match._effective_disguise(e, pov_team)
+        if dis is not None:
+            n = dis.get("name")
+            if isinstance(n, str) and n:
+                ctx["name"] = n
+            dvars = dis.get("vars")
+            if isinstance(dvars, dict):
+                for k, v in dvars.items():
+                    ctx[k] = v
     return ctx
 
 
-def _entity_line(e: Entity) -> str:
-    """Single-line entity summary, rendered from the active match's entity_line_format rule."""
+def _entity_line(e: Entity, pov_team: Optional[str] = None) -> str:
+    """Single-line entity summary, rendered from the active match's
+    entity_line_format rule. `pov_team` (a non-allied viewer) applies the
+    entity's disguise (116) to the rendered name + stats."""
     tmpl = None
     if e._match is not None:
         tmpl = e._match.rules.get("entity_line_format")
@@ -566,7 +584,7 @@ def _entity_line(e: Entity) -> str:
             "entity_line_format",
             "{name} ({id}): HP: {hp}/{max_hp} X,Y: {x},{y} facing {facing}",
         )
-    line = _render_template(tmpl, _entity_template_context(e))
+    line = _render_template(tmpl, _entity_template_context(e, pov_team))
     # Sub-entity (body part / segment) suffix: append body_part_entity_line_suffix
     # with {parent} / {parent_name} bound, so a roster shows which body a part
     # belongs to. Only fires for an entity whose part_of points at a live parent.
@@ -3662,7 +3680,7 @@ async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         lines.append("Entities:")
         for e in visible:
             marker = "→" if e.id == active_id else "  "
-            lines.append(f"{marker} {_entity_line(e)}")
+            lines.append(f"{marker} {_entity_line(e, pov)}")
     # Dead: section. Each corpse rendered via _corpse_line which honors
     # the corpse_line_format rule (the corpse equivalent of
     # entity_line_format — no hardcoded shape). The tile coords (NOT

@@ -1629,6 +1629,53 @@ More shipped work (continuing the list above):
   marks any such line with ⚠️ and appends an advisory naming the bad op(s) +
   the valid set, via `Match.unknown_modifier_ops(mods)`. Read-only diagnostic
   surface only — the fold itself doesn't warn (no clean channel mid-formula).
+- **Polymorph / transform (115) — SHIPPED (scenarios 481-483).** An
+  identity-preserving statblock swap. `transform(eid, template, stash_path=None)`
+  / `revert(eid, stash_path)` formula prims (match funcs) + `!ent transform <id>
+  <template_ref> [stash_path]` / `!ent revert <id> <stash_path>`. REPLACES name,
+  vars (incl. actions + footprint), passives, clamps, status, and the attached
+  part subtree; PRESERVES identity — id, position, facing, team var, and
+  turn-order slot (the turnorder_var value) all carry over, so references,
+  initiative, and allegiance survive. Core: `Match.capture_statblock` /
+  `apply_statblock` / `transform_entity` / `revert_entity`. apply_statblock
+  despawns the old parts (despawn, NOT death — no corpse), swaps the fields in
+  place, re-mints + re-links the new statblock's `parts`/`segments` (handles
+  both the summon-style {role: template} dict AND a captured full-subtree list,
+  remapping part_of for multi-level limbs via `_apply_statblock_parts`), rebuilds
+  turn order, and suppresses death checks across the swap window. HP carries per
+  the `transform_hp_mode` rule: `percent` (default — preserve the fraction of
+  max_hp), `keep` (current hp clamped to new max), or `full` (the target's own
+  hp). REVERT DESIGN (user's call): the pre-transform statblock is stashed to a
+  CALLER-CHOSEN var path (not a protected var), and revert reads that path — so
+  the stash is an ordinary inspectable/editable var, transforms STACK (stash
+  each to a different path, revert in any order, even skipping levels), and
+  there's no hidden state. `template_ref` for the command resolves as a dotted
+  var path on the entity (the summon_from convention — store a template, then
+  transform into it) OR a live entity id to snapshot. Multi-tile is first-class:
+  swapping footprint_w/h vars swaps the footprint for free (482), and part
+  templates spawn/despawn their limbs across transform/revert. Both prims/
+  commands are mutating → host-gated.
+- **Fake-statblock / disguise (116) — SHIPPED (scenarios 484-485).** A
+  DISPLAY-ONLY, POV-gated presented statblock (the decoy/illusion primitive).
+  The `disguise_var` rule (default `disguise`) names an entity var holding
+  `{name?, glyph?, glyphs?, color?, vars?: {...}}`. A viewer NOT on the entity's
+  own team (and not omniscient) sees the disguise's name/glyph/color and its
+  `vars` overlaid on the roster; the entity's own team and the omniscient/GM
+  view see the truth. Engine MECHANICS (targeting, formulas, damage, `var_get`)
+  ALWAYS read the real statblock — a disguise only changes what's RENDERED.
+  Core: `Match._effective_disguise(e, pov_team)` (None = show real: gated on
+  pov_team being a non-None, non-own-team viewer + a disguise var present) +
+  `entity_glyph`/`entity_color`/`entity_display_name` now take an optional
+  `pov_team` and consult it; `render_ascii` threads pov_team through the three
+  glyph/color paint passes + the legend meanings; `_entity_template_context` /
+  `_entity_line` take pov_team and overlay the disguise name + vars (disguise
+  vars win over the computed hp/max_hp/team for display). Surfaces: `!map` /
+  `!list` / `!state` (the board); use `!as view <team>` to preview a POV in the
+  CLI/harness. `!find` deliberately stays on REAL names — it already ignores
+  visibility/fog entirely (a search/GM tool). A moving/animated decoy or an
+  illusion that fools enemy TARGETING is a GM composition on top (mechanics use
+  real, so a true targeting-fooling illusion would need the deep-illusion
+  variant, deferred).
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

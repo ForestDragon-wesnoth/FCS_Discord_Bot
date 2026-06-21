@@ -12443,3 +12443,53 @@ into vars.wasA and becomes **B**. Because each stash is an ordinary var the
 caller names, the transforms STACK: `revert e wasA` restores the A-form (name
 A), and `revert e wasBase` then restores Base. No protected/auto-managed state —
 the GM controls the stash paths, so reverts can even skip levels.
+
+
+SCENARIO 484 — Fake-statblock: a disguise is POV-gated (enemy sees the decoy)
+---------------------------------------------------------------------------
+
+!match new disg Disguise 8 5
+!match use disg
+!ent add spy Assassin 40 2 2 5
+!ent set_var spy team red
+!ent set_var spy glyph A
+!ent set_var spy disguise.name Villager
+!ent set_var spy disguise.glyph v
+!ent set_var spy disguise.vars.hp 5
+!ent set_var spy disguise.vars.max_hp 5
+!as view blue
+!list
+!map
+!as view red
+!list
+!as view omniscient
+!list
+
+Expected: the assassin (team red, real glyph `A`, 40/40 HP) carries a `disguise`
+var {name: Villager, glyph: v, vars:{hp:5,max_hp:5}}. From the BLUE viewpoint
+(an enemy, non-omniscient) `!list` shows it as **Villager** at 5/5 HP and `!map`
+paints `v`. From the RED viewpoint (its own team) `!list` shows the real
+**Assassin** at 40/40. The omniscient view also shows the real Assassin. The
+disguise is display-only and gated on the viewer's team.
+
+
+SCENARIO 485 — Fake-statblock: mechanics always use the REAL statblock
+--------------------------------------------------------------------
+
+!match new disg2 DisguiseReal 8 5
+!match use disg2
+!ent add spy Assassin 40 2 2 5
+!ent set_var spy team red
+!ent set_var spy disguise.name Villager
+!ent set_var spy disguise.vars.hp 5
+!ent set_var spy disguise.vars.max_hp 5
+!eval "var_get('spy', 'hp')"
+!eval "var_get('spy', 'max_hp')"
+!as view blue
+!list
+
+Expected: although enemies see the assassin as a 5/5 "Villager", the engine's
+real statblock is untouched: `var_get('spy','hp')` = 40 and
+`var_get('spy','max_hp')` = 40 (formulas, targeting, and damage all read the
+real vars — the disguise only changes what is rendered). The blue `!list` still
+presents the fake 5/5 Villager, confirming display and mechanics are decoupled.
