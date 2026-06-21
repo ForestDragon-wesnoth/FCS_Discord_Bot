@@ -12307,6 +12307,7 @@ class Match:
                 # fire tile/zone hooks for EVERY covered cell it vacates /
                 # enters, not just its anchor) — identical to the anchor
                 # form for a 1×1 member, matching Entity.move_dirs.
+                step_from_x, step_from_y = e.x, e.y
                 old_cells = self.entity_cells(e, e.x, e.y)
                 new_cells = self.entity_cells(e, nx, ny)
                 if fire_hooks:
@@ -12318,6 +12319,13 @@ class Match:
                     log.extend(self.fire_footprint_tile_enter(eid, old_cells, new_cells))
                     log.extend(self.fire_footprint_zone_enter(
                         eid, old_cells, new_cells, False))
+                    # Per-step entity hook, AFTER on_enter (so a passive sees
+                    # the just-entered tile's effect) — full parity with
+                    # single-entity move_dirs, which group move previously
+                    # lacked. Drives per-cell reactions and snake-trail follow.
+                    log.extend(self.fire_entity_step(
+                        eid, step_from_x, step_from_y, nx, ny,
+                    ))
             if fire_hooks and path:
                 final_cells = self.entity_cells(e, e.x, e.y)
                 log.extend(self.fire_footprint_tile_stop(eid, final_cells))

@@ -1722,9 +1722,11 @@ More shipped work (continuing the list above):
     crossing a hazard band / zone edge under-fired hooks (a 2×2 walking over a
     damage strip burned once, not per covered cell). Now mirrors `move_dirs`
     exactly (per-step `old_cells`/`new_cells` via `entity_cells`); byte-identical
-    for a 1×1 member, correct for a footprint. (NOTE: group move still does not
-    fire the per-step `on_entity_step` hook that single-entity `move_dirs` does —
-    a pre-existing, footprint-independent difference left as-is.)
+    for a 1×1 member, correct for a footprint. Group move ALSO now fires the
+    per-step `on_entity_step` hook (after each cell's `on_enter`) that
+    single-entity `move_dirs` fires — a pre-existing, footprint-independent
+    parity gap (per-cell reactions + snake-trail follow now work under group
+    move). Scenario 493.
   - **`entities_in_area(x, y, n)` measured distance to the ANCHOR cell.** The
     coord-rooted twin of `entities_within` used `_distance(x, y, e.x, e.y, mode)`
     while `entities_within` had been refactored to the footprint-aware

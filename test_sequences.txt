@@ -12654,3 +12654,29 @@ Expected: the 4×4 dragon covers (10,10)-(13,13); far is at (1,1).
 from (14,14)). `entities_in_area(14,14,0)` = [] (gap 1 > 0). far never matches.
 (Before the fix the distance used the anchor (10,10) — gap 4 — so all three
 queries would have wrongly EXCLUDED the dragon.)
+
+
+SCENARIO 493 — Audit: group move fires on_entity_step per step (parity)
+--------------------------------------------------------------------
+
+!match new ags AuditGroupStep 14 6
+!match use ags
+!ent add runner Runner 30 2 2 1
+!ent set_var runner steps 0
+!passive add runner stepcount on_entity_step "entity[self].steps = entity[self].steps + 1"
+!ent add big Big 30 6 2 2
+!ent set_var big footprint_w 2
+!ent set_var big footprint_h 2
+!ent set_var big steps 0
+!passive add big stepcount on_entity_step "entity[self].steps = entity[self].steps + 1"
+!ent group new g
+!ent group add g runner big
+!ent move group:g right right right
+!eval "var_get('runner','steps')"
+!eval "var_get('big','steps')"
+
+Expected: the group moves 3 steps right. on_entity_step now fires once per STEP
+per member (parity with single-entity move_dirs, which group move previously
+lacked) — so `var_get('runner','steps')` = 3 and `var_get('big','steps')` = 3.
+The 2×2 member fires once per step (the hook is per-step, not per covered cell),
+confirming the fire is footprint-independent.
