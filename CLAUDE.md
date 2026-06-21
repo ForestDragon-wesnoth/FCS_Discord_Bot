@@ -1537,6 +1537,77 @@ More shipped work (continuing the list above):
     center/edge-anchored resize left the camera framing the wrong region. Now
     offset like everything else (resolve_viewport re-clamps on read).
     Scenario 473.
+- **Audit-pass-3 fix: attached parts share the parent's TURN CLOCK (scenarios
+  474-477).** Three per-unit "clocks" iterated only `turn_order` members (round)
+  or the active entity (turn). Attached parts carry no initiative (excluded from
+  turn_order), so a glued/region/located part's statuses, turn/round passives,
+  and turn-scheduled effects NEVER fired — silently contradicting the doc
+  ("parts tick normally; a part's tick can `damage_part(self,n)` to route to
+  main"). Fix shape (user-approved): a part rides its parent's clock. The shared
+  `Match._attached_tick_parts(base_targets)` BFS-walks each base target's part
+  subtree and returns the parts that LACK independent initiative, STOPPING
+  descent at an independent part (it's its own target and ticks on its own turn,
+  carrying its own sub-parts) — deduped so a deep part isn't double-counted and
+  an independent part reached via both its own turn-order slot and its parent
+  isn't double-ticked. Wired into all three clocks:
+  - **Statuses:** `fire_status_tick` appends the helper's parts to its targets.
+    Each part's own definition `tick_when` still gates whether it fires.
+  - **Turn/round passives:** `fire_hook` gained an `own_only_targets` param —
+    those ids fire ONLY their entity-owned passives, NOT match-wide globals or
+    team passives (which already fired once per acting unit, so they must not
+    re-run per part). The six `on_turn_*`/`on_round_*` calls in `next_turn` /
+    `_advance_index` pass `own_only_targets=self._attached_tick_parts(...)`.
+  - **Turn-scheduled effects:** the two `fire_scheduled_turn(cur/new_cur)` sites
+    also call it for each attached part.
+  So a DoT/regen/bleed on a limb both lives on the limb and (via
+  `damage_part(self,n)`) can bleed into the main body. (Also re-audited and
+  found correct: `Match.to_dict`/`from_dict` round-trips every persistent field
+  — `pending_requests` is intentionally runtime-only — and push/pull/swap are
+  footprint-aware for multi-tile bodies.)
+- **Audit-pass-3 fix: action rollback preserves ALL runtime-only state
+  (scenario 478).** `action._rollback_match` restores a failed action's
+  transaction by rebuilding the Match from the pre-state snapshot and copying
+  its fields back, then re-applying a curated list of runtime-only (underscore)
+  fields the snapshot doesn't carry. That list had gone STALE — it missed the
+  event-bus fields (`_event_stack`/`_event_depth`/`_event_warned`/
+  `_event_warnings`) and others (`_summon_count`, `_death_processing`,
+  `_death_check_suppressed_ids`, `_alive_eval_depth`, `_vision_memo`,
+  `_turn_order_dirty`, `_request_seq`, `pending_requests`). The headline crash:
+  an action that `emit()`s an event whose handler runs a FAILING sub-action —
+  the sub-action's rollback wiped the LIVE `_event_stack` (holding the outer
+  emit's frame), so the handler's next `event_get` and the emit's own cleanup
+  hit "pop from empty list", crashing the whole outer action. Fix: preserve the
+  COMPLETE set of runtime fields (rollback only restores SERIALIZED state;
+  transient in-flight state — the emit stack, summon budget, etc. — must
+  survive). The list must stay in sync with Match's underscore fields; a
+  `hasattr` guard makes a future-missing name a no-op rather than a crash.
+  COMPANION fix in `run_action`: because `_summon_count` is now PRESERVED across
+  a rollback, the choice-REPLAY loop (which rolls back + re-runs the body per
+  interactive `choose`) resets it to the action-start value each attempt —
+  otherwise a summon-before-`choose` would accumulate the per-command summon
+  budget across replays and falsely hit `summon_event_limit`. Snapshotted
+  alongside the existing per-attempt RNG/cursor/buffer resets.
+- **Audit-pass-3 fix: a turn_end tick that empties the turn order no longer
+  crashes next_turn (scenario 479).** PRE-EXISTING (parts-independent): if a
+  `turn_end`/round hook or status tick removed the LAST entity in `turn_order`
+  (e.g. a lethal DoT on the only combatant — now also reachable via a part tick
+  routing `damage_part` to its vital parent), `next_turn` then computed
+  `(active_index + 1) % len(turn_order)` against an empty order →
+  ZeroDivisionError (surfacing as a 💥). Guarded every point a hook/tick can
+  empty the order: `_advance_index` bails if `turn_order` is empty; `next_turn`
+  returns `(None, log)` after the opening round_start, after `turn_end` hooks,
+  and after `_advance_index`'s round-wrap ticks; `_skip_to_eligible` stops on an
+  emptied order and clamps a stale `active_index`. A two-combatant table where
+  one self-kills still advances cleanly to the survivor.
+- **Audit-pass-3 enhancement: `!mod show` flags unrecognized modifier ops
+  (scenario 480).** The fold (`_apply_modifier_op`) treats an op outside the
+  recognized set (`add`/`inc%`/`more%`/`set`/`min`/`max`, now the module
+  constant `MODIFIER_OPS`) as a lenient ADD — convenient, but it silently
+  swallows a typo like `inc` for `inc%` (a flat +N instead of a %). Behavior is
+  UNCHANGED (still lenient-add, so no existing match breaks); `!mod show` now
+  marks any such line with ⚠️ and appends an advisory naming the bad op(s) +
+  the valid set, via `Match.unknown_modifier_ops(mods)`. Read-only diagnostic
+  surface only — the fold itself doesn't warn (no clean channel mid-formula).
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

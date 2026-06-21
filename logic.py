@@ -2202,6 +2202,11 @@ def _default_facing_for(
 
 RESERVED_IDS: Set[str] = {"current", "this", "self", "parent"}
 
+# Recognized modifier fold ops (see Match._apply_modifier_op). An op outside
+# this set still folds as a lenient add, but `!mod show` flags it as a likely
+# typo via Match.unknown_modifier_ops.
+MODIFIER_OPS: Tuple[str, ...] = ("add", "inc%", "more%", "set", "min", "max")
+
 
 # -------------------------
 # Passive hooks & Passive dataclass
@@ -6272,7 +6277,21 @@ class Match:
             return max(running, max(vals))
         if op == "max":          # cap: result at most the lowest max
             return min(running, min(vals))
-        return running + sum(vals)   # unknown op -> lenient add
+        return running + sum(vals)   # unknown op -> lenient add (see
+        #   MODIFIER_OPS / unknown_modifier_ops: surfaced as a ⚠️ advisory
+        #   in `!mod show` so a typo like `inc` for `inc%` is caught.
+
+    def unknown_modifier_ops(self, mods: List[Dict[str, Any]]) -> List[str]:
+        """The sorted, de-duplicated ops in `mods` (records from
+        gather_modifiers) that aren't one of the recognized fold ops. An
+        unrecognized op still folds (lenient add), but it's almost always a
+        typo — `!mod show` flags these so the GM notices."""
+        seen = []
+        for m in mods:
+            op = m.get("op")
+            if op not in MODIFIER_OPS and op not in seen:
+                seen.append(op)
+        return sorted(str(o) for o in seen)
 
     def apply_modifiers(self, eid: str, stat: str, base: Any, tags: Any,
                         context: Optional[Dict[str, Any]] = None) -> float:
@@ -8111,6 +8130,35 @@ class Match:
             return None
         return self.turn_order[self.active_index]
 
+    def _attached_tick_parts(self, base_targets: List[str]) -> List[str]:
+        """The attached parts that should share the status/turn-passive
+        CLOCK of `base_targets`. A part carries no initiative of its own
+        (unless made independent, i.e. placed in turn_order), so without
+        this its statuses and its on_turn_*/on_round_* passives would never
+        fire. BFS each base target's part subtree and collect the parts
+        that LACK independent initiative, STOPPING descent at an independent
+        part (it is its own target and ticks on its own turn, carrying its
+        own sub-parts). Deduped against the base targets and each other, so
+        a deep part isn't added twice and an independent part reached via
+        both its own turn-order slot and its parent isn't double-counted.
+        Returns the EXTRA part ids only (base targets excluded)."""
+        turn_set = set(self.turn_order)
+        seen = set(base_targets)
+        extra: List[str] = []
+        for t in list(base_targets):
+            frontier = [c.id for c in self.entity_parts(t)]
+            while frontier:
+                pid = frontier.pop(0)
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                if pid in turn_set:
+                    # Independent part: its own target; don't descend.
+                    continue
+                extra.append(pid)
+                frontier.extend(c.id for c in self.entity_parts(pid))
+        return extra
+
     def next_turn(self) -> Tuple[Optional[str], List[str]]:
         """
         Advance the turn. Returns (new_active_entity_id, log_lines) where
@@ -8128,7 +8176,9 @@ class Match:
         # First-ever next_turn call: begin round 1 without advancing.
         if not self.round_started:
             self.round_started = True
-            log.extend(self.fire_hook("on_round_start"))
+            log.extend(self.fire_hook(
+                "on_round_start",
+                own_only_targets=self._attached_tick_parts(list(self.turn_order))))
             log.extend(self.fire_status_tick("round_start"))
             log.extend(self.fire_tile_time_hooks("on_round_start"))
             log.extend(self.fire_zone_time_hooks("on_round_start"))
@@ -8138,16 +8188,25 @@ class Match:
             # state they would have seen as the round began (with any
             # hook side-effects already applied).
             self.history.record_round(self)
+            # An opening round_start hook/tick may have removed every
+            # entity — nothing to start.
+            if not self.turn_order:
+                self.history.record_turn(self)
+                return (None, log)
             # The opening entity may itself be skippable (e.g. starts
             # stunned) — skip forward to the first eligible one.
             eligible = self._skip_to_eligible(log)
             cur = self.turn_order[self.active_index]
             if eligible:
-                log.extend(self.fire_hook("on_turn_start", target_ids=[cur]))
+                log.extend(self.fire_hook(
+                    "on_turn_start", target_ids=[cur],
+                    own_only_targets=self._attached_tick_parts([cur])))
                 log.extend(self.fire_status_tick("turn_start"))
                 log.extend(self.fire_tile_time_hooks("on_turn_start"))
                 log.extend(self.fire_zone_time_hooks("on_turn_start"))
                 log.extend(self.fire_scheduled_turn(cur))
+                for pid in self._attached_tick_parts([cur]):
+                    log.extend(self.fire_scheduled_turn(pid))
             else:
                 log.append(
                     "⏭️ every entity is skippable; the round passes "
@@ -8161,17 +8220,35 @@ class Match:
         log.extend(self.fire_status_tick("turn_end"))
         log.extend(self.fire_tile_time_hooks("on_turn_end"))
         log.extend(self.fire_zone_time_hooks("on_turn_end"))
-        log.extend(self.fire_hook("on_turn_end", target_ids=[cur]))
+        log.extend(self.fire_hook(
+            "on_turn_end", target_ids=[cur],
+            own_only_targets=self._attached_tick_parts([cur])))
+        # A turn_end hook/tick may have removed the last entity (e.g. a
+        # lethal DoT — directly, or routed to a parent via a part tick).
+        # With no one left, end here rather than advancing into an empty
+        # turn order.
+        if not self.turn_order:
+            self.history.record_turn(self)
+            return (None, log)
         self._advance_index(log)
+        # _advance_index's round-wrap hooks (on_round_end/start ticks) can
+        # likewise empty the order; re-check before reading the next entity.
+        if not self.turn_order:
+            self.history.record_turn(self)
+            return (None, log)
         # Skip over any entity carrying a skip-status flag.
         eligible = self._skip_to_eligible(log)
         new_cur = self.turn_order[self.active_index]
         if eligible:
-            log.extend(self.fire_hook("on_turn_start", target_ids=[new_cur]))
+            log.extend(self.fire_hook(
+                "on_turn_start", target_ids=[new_cur],
+                own_only_targets=self._attached_tick_parts([new_cur])))
             log.extend(self.fire_status_tick("turn_start"))
             log.extend(self.fire_tile_time_hooks("on_turn_start"))
             log.extend(self.fire_zone_time_hooks("on_turn_start"))
             log.extend(self.fire_scheduled_turn(new_cur))
+            for pid in self._attached_tick_parts([new_cur]):
+                log.extend(self.fire_scheduled_turn(pid))
         else:
             log.append(
                 "⏭️ every entity is skippable; the round passes "
@@ -8187,10 +8264,17 @@ class Match:
         + status_tick(round_start), and autosave the round. Factored
         out of next_turn so the skip-status loop can reuse the exact
         same wrap bookkeeping for each cell it steps over."""
+        # A preceding hook/tick may have emptied the turn order (e.g. a
+        # lethal DoT removed the last combatant). Nothing to advance to —
+        # bail before the modulo divides by zero.
+        if not self.turn_order:
+            return
         new_index = (self.active_index + 1) % len(self.turn_order)
         wrapped = (new_index == 0)
         if wrapped:
-            log.extend(self.fire_hook("on_round_end"))
+            log.extend(self.fire_hook(
+                "on_round_end",
+                own_only_targets=self._attached_tick_parts(list(self.turn_order))))
             log.extend(self.fire_status_tick("round_end"))
             log.extend(self.fire_tile_time_hooks("on_round_end"))
             log.extend(self.fire_zone_time_hooks("on_round_end"))
@@ -8206,7 +8290,9 @@ class Match:
         self.active_index = new_index
         if wrapped:
             self.round_number += 1
-            log.extend(self.fire_hook("on_round_start"))
+            log.extend(self.fire_hook(
+                "on_round_start",
+                own_only_targets=self._attached_tick_parts(list(self.turn_order))))
             log.extend(self.fire_status_tick("round_start"))
             log.extend(self.fire_tile_time_hooks("on_round_start"))
             log.extend(self.fire_zone_time_hooks("on_round_start"))
@@ -8235,6 +8321,12 @@ class Match:
         n = len(self.turn_order)
         checked = 0
         while checked < n:
+            # A skip's round-wrap (or a skip-status side effect) can empty
+            # the order; stop rather than indexing into nothing.
+            if not self.turn_order:
+                return False
+            if self.active_index >= len(self.turn_order):
+                self.active_index = 0
             cur = self.turn_order[self.active_index]
             e = self.entities.get(cur)
             if e is None:
@@ -8949,6 +9041,12 @@ class Match:
             targets = [cur]
         else:  # round_start / round_end
             targets = list(self.turn_order)
+
+        # Attached parts share their parent's status clock (a glued/region/
+        # located part has no initiative, so its statuses would otherwise
+        # never tick). Each part's own definition tick_when still gates
+        # whether it fires for this `when`.
+        targets = targets + self._attached_tick_parts(targets)
 
         global_when = self.rules.get("status_tick_when", "never")
         global_src = self.rules.get("status_tick_formula", "")
@@ -10341,6 +10439,7 @@ class Match:
                 yield from tp.values()
 
     def fire_hook(self, when: str, *, target_ids: Optional[List[str]] = None,
+                  own_only_targets: Optional[List[str]] = None,
                   extras: Optional[Dict[str, Any]] = None) -> List[str]:
         """
         Fire every passive matching `when` for each target entity.
@@ -10349,6 +10448,12 @@ class Match:
         with initiative). For each target, fires global passives first (in
         insertion order), then the target's own entity passives (in insertion
         order). Only passives whose own `when` matches are run.
+
+        own_only_targets (if given) fire ONLY their entity-owned passives —
+        no global/team passives. This is how an attached part rides its
+        parent's turn/round clock: the part runs its own on_turn_*/
+        on_round_* passives, but match-wide globals (which already fired
+        once per acting unit) are NOT re-run per part.
 
         For each fire: `self` = the target entity; `this` = current_entity_id().
 
@@ -10377,6 +10482,16 @@ class Match:
                     continue
                 log.append(_run_passive_safely(engine, p, ctx, target_id=tid, is_global=True))
             # Then entity-owned passives.
+            for pid, p in list(e.passives.items()):
+                if p.when != when:
+                    continue
+                log.append(_run_passive_safely(engine, p, ctx, target_id=tid, is_global=False))
+        # Attached parts riding the parent's clock: own passives only.
+        for tid in (own_only_targets or ()):
+            e = self.entities.get(tid)
+            if e is None:
+                continue
+            ctx = EvalCtx(this=this_id, target=tid, extras=extras)
             for pid, p in list(e.passives.items()):
                 if p.when != when:
                     continue

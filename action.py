@@ -1116,10 +1116,19 @@ async def run_action(
         if is_top_level:
             match._choice_answers = list(answers or [])
             rng_state = _snapshot_rng(match)
+            # The per-command summon budget at action start. Each replay
+            # attempt re-runs the body from the top (its summons are rolled
+            # back between attempts), so the counter must reset to this — NOT
+            # accumulate across attempts (which would falsely exhaust the
+            # budget for a summon-before-choose action). _rollback_match now
+            # PRESERVES _summon_count for the fail()/exception case, so we
+            # restore the start value here explicitly for the replay case.
+            summon_at_start = match._summon_count
             choice_limit = int(match.rules.get("action_choice_limit", 20))
         while True:
             if is_top_level:
                 match._choice_cursor = 0
+                match._summon_count = summon_at_start
                 _restore_rng(match, rng_state)
                 # Fresh output buffer per attempt — rolled-back attempts'
                 # command echoes must not leak into the committed run.
@@ -1250,9 +1259,16 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
     action rollback."""
     from logic import Match  # local import
     restored = Match.from_dict(pre_state)
-    # Preserve runtime-only fields the snapshot doesn't carry. Names
-    # listed here match the field defaults declared on Match for
-    # runtime-only state.
+    # Preserve ALL runtime-only fields the snapshot doesn't carry: they are
+    # by-design transient and must NOT be reset by an action rollback, which
+    # only restores SERIALIZED state. Critically, several of these track an
+    # operation that is STILL IN FLIGHT around the rollback — e.g. the event
+    # bus stack/depth when an action runs inside an emitted handler (resetting
+    # it crashes the outer emit's cleanup with "pop from empty list"), or the
+    # per-command summon budget (resetting it would refill it mid-command).
+    # This list must stay in sync with the runtime (underscore) fields declared
+    # on Match; from_dict gives them defaults, so anything omitted here would be
+    # clobbered. Only SERIALIZED state should come from `restored`.
     preserved_attrs = (
         "_rng", "_rng_seed",
         "_var_event_depth", "_var_event_warned", "_var_event_warnings",
@@ -1260,8 +1276,16 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
         # The mid-body choice queue + cursor must survive an action's
         # rollback-and-retry (the whole point of replay).
         "_choice_answers", "_choice_cursor",
+        # In-flight operation guards/state that span a nested rollback.
+        "_summon_count", "_death_processing", "_death_check_suppressed_ids",
+        "_alive_eval_depth", "_vision_memo", "_turn_order_dirty",
+        "_request_seq", "pending_requests",
+        # Event bus: the live emit stack/depth + warning latch. Resetting
+        # these mid-emit corrupts the outer emit (the verified crash).
+        "_event_depth", "_event_stack", "_event_warned", "_event_warnings",
     )
-    preserved = {a: getattr(match, a) for a in preserved_attrs}
+    preserved = {a: getattr(match, a) for a in preserved_attrs
+                 if hasattr(match, a)}
     # Replace serialized state. We iterate a snapshot of restored's
     # __dict__ to avoid mutating-while-iterating shenanigans.
     for k, v in vars(restored).items():
