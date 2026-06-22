@@ -12787,3 +12787,225 @@ level 3 (resisted). `force poison 5` IGNORES resistance, so the +5 increment
 lands in full: level 3+5 = 8. `apply fear` is a no-op (immune) so
 `status_has('ogre','fear')` = False; `force fear` bypasses immunity and applies
 it, so `status_has('ogre','fear')` = True.
+
+
+SCENARIO 498 — Dice: kh0 / kl0 keep ZERO dice (no negative-zero-slice leak)
+--------------------------------------------------------------------------
+
+!match new dz DiceZero 4 4
+!match use dz
+!eval "roll('4d6kh0')"
+!eval "roll('2d6kl0')"
+!eval "roll('5d8kh0') + roll('3d10kl0')"
+
+Expected: keeping the HIGHEST or LOWEST zero dice yields 0 every time, for any
+roll. `roll('4d6kh0')` = 0 and `roll('2d6kl0')` = 0, and their analogues sum to
+0. Before the fix `dice[-0:]` (the kh branch with k==0) was Python's negative-
+zero slice = the WHOLE list, so `4d6kh0` wrongly returned the sum of all four
+dice; only the kl branch (`dice[:0]`) was naturally correct.
+
+
+SCENARIO 499 — Undo restores an in-place TILE edit (snapshot deepcopy)
+---------------------------------------------------------------------
+
+!match new tu TileUndo 5 5
+!match use tu
+!tile set 1 1 glyph A
+!tile set 1 1 glyph B
+!eval "tile_get(1, 1, 'glyph')"
+!history undo command
+!eval "tile_get(1, 1, 'glyph')"
+
+Expected: the tile glyph is `B` after the second set; `!history undo command`
+reverts the last command, restoring glyph `A`. Before the fix, Match.to_dict
+stored each tile's data dict BY REFERENCE, so the in-place second edit also
+mutated the prior command snapshot — defeating change-detection (pre==post, no
+snapshot) and corrupting rollback, so undo could not bring back `A`.
+
+
+SCENARIO 500 — Undo restores an in-place ZONE edit (snapshot deepcopy)
+---------------------------------------------------------------------
+
+!match new zu ZoneUndo 5 5
+!match use zu
+!zone new gas
+!zone add gas 2 2
+!zone set gas dmg 4
+!zone set gas dmg 9
+!eval "zone_get('gas', 'dmg')"
+!history undo command
+!eval "zone_get('gas', 'dmg')"
+
+Expected: `dmg` is 9 after the second set; `!history undo command` reverts the
+last command, restoring `dmg` 4. Before the fix, _zone_to_dict stored the zone
+`data`/`hooks` dicts BY REFERENCE (only `cells` was rebuilt), so the in-place
+second edit corrupted the prior snapshot and undo could not restore 4.
+
+
+SCENARIO 501 — Macro arg substitution: $10+ and single-pass (no re-expansion)
+----------------------------------------------------------------------------
+
+!match new mc MacroSubst 5 5
+!match use mc
+!ent add hero Hero 10 1 1 1
+!macro set tenth !ent set_var hero n $10
+!macro run tenth a b c d e f g h i J
+!eval "var_get('hero', 'n')"
+!macro set echoall !ent set_var hero m $@
+!macro run echoall $1x
+!eval "var_get('hero', 'm')"
+
+Expected: `$10` expands to the TENTH macro arg ("J"), not `$1` followed by a
+literal `0` ("a0"); so `var_get('hero','n')` = "J". `$@` and the positional
+tokens are substituted in a SINGLE pass, so an arg value that itself contains a
+token is NOT re-expanded: running with `$1x`, `$@` yields the literal "$1x", so
+`var_get('hero','m')` = "$1x" (pre-fix it became "$1xx" — the `$1` inside the
+value got re-substituted).
+
+
+SCENARIO 502 — chain_targets: relation is judged vs the ORIGIN, not the prior link
+---------------------------------------------------------------------------------
+
+!match new ct ChainRel 8 4
+!match use ct
+!ent add cst Caster 30 1 1 5
+!ent set_var cst team red
+!ent add en1 Enemy1 30 2 1 5
+!ent set_var en1 team blue
+!ent add al1 Ally1 30 3 1 5
+!ent set_var al1 team red
+!ent add en2 Enemy2 30 4 1 5
+!ent set_var en2 team blue
+!eval "'al1' in chain_targets('cst', 3, 0, 'hostile')"
+!eval "'en2' in chain_targets('cst', 3, 0, 'hostile')"
+
+Expected: a `hostile` chain out of the red caster bounces ONLY among the
+caster's enemies (blue), every hop measured from the previous link. The line is
+cst(red) en1(blue) al1(red) en2(blue): the chain is [en1, en2] — it skips the
+red ally al1 even though al1 is the nearest entity to en1. So `'al1' in ...` =
+False and `'en2' in ...` = True. Before the fix, `relation` was judged vs the
+PREVIOUS link, so hop 2 looked for an enemy-of-en1 (an ally of the caster) and
+al1 would have been chained.
+
+
+SCENARIO 503 — !ent swap honors the mount redirect (driver swaps the vehicle)
+----------------------------------------------------------------------------
+
+!match new sm SwapMount 12 8
+!match use sm
+!ent add car Car 30 3 3 0
+!ent set_var car slots.driver.capacity 1
+!ent set_var car slots.driver.controls_movement true
+!ent set_var car slots.seats.capacity 2
+!ent add drv Driver 10 1 1 5
+!mount drv car driver
+!ent add rock Rock 10 8 3 0
+!ent swap drv rock
+!eval "entity[car].x"
+!eval "entity[rock].x"
+!eval "is_mounted('drv')"
+!ent add p1 Pass 10 5 5 5
+!mount p1 car seats
+!ent swap p1 rock
+!eval "is_mounted('p1')"
+!eval "entity[rock].x"
+
+Expected: drv rides a `controls_movement` slot, so `!ent swap drv rock`
+REDIRECTS to the car — the whole rig swaps with rock. car moves (3,3)->(8,3)
+and rock (8,3)->(3,3); drv is carried and stays mounted (is_mounted True). A
+plain passenger can't be swapped on its own: `!ent swap p1 rock` is REFUSED with
+a ❌ ("dismount first"), so p1 stays mounted (is_mounted True) and rock is
+unchanged at x=3. Before the fix swap had no mount guard and would have yanked a
+rider physically off its vehicle into an incoherent still-mounted state.
+
+
+SCENARIO 504 — Transform of a vehicle with riders (keep / block / eject)
+-----------------------------------------------------------------------
+
+!match new tvr TransformRiders 10 6
+!match use tvr
+!ent add bus Bus 40 3 3 0
+!ent set_var bus slots.seats.capacity 3
+!ent add rider1 R1 10 1 1 5
+!mount rider1 bus seats
+!ent set_var bus forms.tank.vars.slots.seats.capacity 2
+!ent set_var bus forms.tank.vars.hp 60
+!ent set_var bus forms.tank.vars.max_hp 60
+!ent transform bus forms.tank keep1
+!eval "is_mounted('rider1')"
+!ent set_var bus forms.walker.vars.slots.legs.capacity 1
+!ent set_var bus forms.walker.vars.hp 50
+!ent set_var bus forms.walker.vars.max_hp 50
+!ent transform bus forms.walker keep2
+!eval "is_mounted('rider1')"
+!system set default transform_rider_mismatch_mode eject
+!ent transform bus forms.walker keep2
+!eval "is_mounted('rider1')"
+!system set default transform_rider_mismatch_mode block
+
+Expected: bus carries rider1 in `seats`. Transforming into `tank` (which also
+has a `seats` slot) KEEPS rider1 mounted (is_mounted True). Transforming into
+`walker` (slots = `legs` only, no `seats`) is BLOCKED by default — a ❌, no
+change, rider1 still mounted. After setting `transform_rider_mismatch_mode` to
+`eject`, the same transform succeeds and dismounts rider1 to a nearby cell, so
+is_mounted is now False. The rule is reset to `block` afterward. Before the fix
+the transform silently orphaned the rider (still flagged mounted to a slot-less
+form).
+
+
+SCENARIO 505 — Segment chain (__follows) is remapped on copy under id collision
+------------------------------------------------------------------------------
+
+!match new snk SnakeSrc 14 8
+!match use snk
+!ent add worm Worm 30 5 5 5
+!part segment worm s0 Seg0 5 5
+!part segment worm s1 Seg1 5 5
+!match new snkB SnakeDst 14 8
+!match use snkB
+!ent add worm Other 9 1 1 1
+!ent add s0 OtherA 9 2 1 1
+!ent add s1 OtherB 9 3 1 1
+!match use snk
+!ent copy worm snkB 5 5
+!match use snkB
+!eval "var_get('s0_2', '__follows')"
+!eval "var_get('s1_2', '__follows')"
+
+Expected: copying the snake `worm` (head + segments s0->s1) into a match that
+ALREADY has entities named worm/s0/s1 forces re-minting to worm_2/s0_2/s1_2. The
+segment chain back-pointer `__follows` is remapped alongside `part_of`, so
+`var_get('s0_2','__follows')` = "worm_2" (the new head) and
+`var_get('s1_2','__follows')` = "s0_2" (the new first segment). Before the fix
+only `part_of` was remapped, so s1_2 still pointed at the stale `s0`, breaking
+snake_segments after the first link (this is the same gap the transform/revert
+re-mint path shared).
+
+
+SCENARIO 506 — Mount slot cost/condition formula sees the TARGET slot binding
+----------------------------------------------------------------------------
+
+!match new msb MountSlotBind 10 6
+!match use msb
+!ent add car Car 30 3 3 0
+!ent set_var car slots.vip.capacity 1
+!ent set_var car slots.vip.condition "slot == 'vip'"
+!ent set_var car slots.econ.capacity 1
+!ent set_var car slots.econ.condition "slot == 'econ'"
+!ent add a A 10 1 1 5
+!ent add b B 10 2 1 5
+!mount a car vip
+!mount b car econ
+!eval "is_mounted('a')"
+!eval "is_mounted('b')"
+!eval "slot_of('a')"
+!eval "slot_of('b')"
+
+Expected: each slot's `condition` references the `slot` binding, which must
+resolve to the slot BEING EVALUATED during can_mount (the rider isn't seated
+yet, so it can't come from the rider's own mount_slot). Mounting `a` into `vip`
+satisfies `slot == 'vip'` and `b` into `econ` satisfies `slot == 'econ'`, so
+both succeed: is_mounted True for both, slot_of('a')='vip', slot_of('b')='econ'.
+Before the fix `_eval_slot_expr` hard-wired `slot` to the rider's CURRENT
+mount_slot (None on a fresh mount), so the conditions evaluated against None and
+both mounts were refused.

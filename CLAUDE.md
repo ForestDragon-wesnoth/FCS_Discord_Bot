@@ -1818,6 +1818,62 @@ More shipped work (continuing the list above):
       `!status force <eid> <name> [level] [duration]` command (host-gated like
       apply; reply reads "Force-applied").
 
+- **Audit-pass-6 fixes: cross-subsystem correctness sweep (scenarios 498-506).**
+  A sixth bug hunt (four read-only survey agents across transform/disguise,
+  dispatch/foreach/macro/watcher/undo, dice/modifier/shield numerics, and
+  mounts/vehicles; every candidate verified in code before fixing). Nine real
+  bugs fixed, three of which needed a user design call:
+  - **Snapshot shallow-copy, tiles + zones (HIGH).** `Match.to_dict` stored each
+    tile's data dict BY REFERENCE and `_zone_to_dict` stored a zone's
+    `data`/`hooks` by reference (only `cells` was rebuilt). Since `tile_set_path`/
+    `zone_set_path` (and the `tile_set`/`zone_set` primitives) mutate IN PLACE,
+    an in-place `!tile set`/`!zone set` corrupted the prior command snapshot —
+    defeating undo change-detection (pre==post → no snapshot) AND action
+    rollback. Same class as the audit-pass-5 `Entity.to_dict` vars fix, missed
+    for tiles/zones. Fixed with `copy.deepcopy` in both serializers (498-500).
+  - **Segment `__follows` not remapped on id re-mint (MED-HIGH).** Both
+    `_apply_statblock_parts` (transform/revert of a captured subtree) and
+    `copy_entity` (cross-match copy/transfer) remapped `part_of` but NOT the
+    snake-segment back-pointer `__follows`, so a 2+ segment snake lost its chain
+    past the first link when re-minted under an id collision. Fixed by remapping
+    `__follows` via the same idmap in both paths (505; verified under a forced
+    collision — worm→worm_2, s1's `__follows` s0→s0_2).
+  - **Dice `kh0` negative-zero slice (HIGH).** `dice[-0:]` is the WHOLE list in
+    Python, so `roll("NdMkh0")` returned the full sum instead of 0 (the `kl`
+    branch `dice[:0]` was fine). Guarded `k==0` explicitly (498).
+  - **Macro / foreach substitution (MED/LOW).** `_macro_subst` re-expanded a
+    token appearing INSIDE an arg value ($@ pass then positional pass) and
+    mis-parsed `$10`+ (the `$1` prefix). `_foreach_subst` only guarded
+    `$name`-contains-token, not an id/x/y value containing a later token. Both
+    rewritten as a SINGLE-pass `re.sub` (501; macro now also supports $10+).
+  - **Mount `slot` binding (MED, two sites).** The mount-action dispatch
+    `extra_ctx` never set the documented `slot` binding (read as None), and
+    `_eval_slot_expr` hard-wired `slot` to the rider's CURRENT mount_slot (None
+    on a fresh mount, stale on a switch) instead of the slot being EVALUATED.
+    Fixed: bind `slot` in the action ctx; thread the evaluated slot param through
+    `_eval_slot_expr` from `slot_cost_of`/`slot_condition_ok` (506).
+  - **chain_targets relation anchor (user call → ORIGIN).** `relation`
+    (hostile/ally/…) was judged vs the PREVIOUS link each hop, so a `hostile`
+    chain flipped allegiance (enemy→ally→enemy). Now judged vs the ORIGIN
+    `from_eid` (distance still measured from the previous link), so chain
+    lightning bounces among the caster's enemies (502).
+  - **swap + mounts (user call → REDIRECT).** `swap_entities` had no mount guard.
+    Now applies `_mount_move_redirect` to both participants: a driver (a
+    controls_movement slot) redirects the swap to its VEHICLE (riders carried), a
+    passenger raises "dismount first" — mirroring tp/move_dirs (503).
+  - **transform of a vehicle with riders (user call → gamerule, default block).**
+    Replacing a vehicle's `slots` var wholesale orphaned its riders. New rule
+    `transform_rider_mismatch_mode` (enum block|eject, default `block`): if EVERY
+    rider's slot still exists in the new form they stay mounted; otherwise block
+    (refuse, raise before any change) or eject (dismount all, then transform).
+    `_release_riders` gained an explicit `mode` override for the eject path (504).
+  - Re-verified CORRECT (no change): disguise POV gating + fog/footprint
+    interaction, HP carry modes, modifier fold + caps + tag/grants, shields/
+    absorb priority + drain, band()/roll_table boundary + weight handling,
+    damage_spread apportionment, watcher edge-trigger + serialization, the access
+    gate (no batch/foreach/macro bypass), nested-mount carry + cycle guards,
+    rider-death corpse strip, `_find_dismount_cell`.
+
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
 and explain the "why").

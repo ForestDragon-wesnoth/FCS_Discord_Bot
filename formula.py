@@ -529,7 +529,13 @@ def _roll_impl(rng, spec: Any) -> int:
             if keep_mode is not None:
                 k = max(0, min(keep_n, len(dice)))
                 dice.sort()
-                kept = dice[-k:] if keep_mode == "kh" else dice[:k]
+                # k==0 must keep NOTHING; dice[-0:] is the WHOLE list (Python
+                # negative-zero slice quirk), so guard it explicitly — only the
+                # kl branch (dice[:0]) is naturally correct at k==0.
+                if k == 0:
+                    kept = []
+                else:
+                    kept = dice[-k:] if keep_mode == "kh" else dice[:k]
             else:
                 kept = dice
             total += sgn * sum(kept)
@@ -3351,7 +3357,9 @@ class FormulaEngine:
             revisiting, within max_jump cells (0 / None = unlimited). The
             chain-lightning / bounce primitive: loop it and apply your own
             per-hop falloff (the GM owns the damage). `relation` filters
-            eligibility (any / hostile / ally / same_team / attackable);
+            eligibility (any / hostile / ally / same_team / attackable)
+            relative to the ORIGIN `from_eid` (so a `hostile` chain bounces
+            among the origin's enemies every hop, not the prior link's);
             distance is the square-radius (Chebyshev) gap. Near->far."""
             start = _eid(from_token)
             if match.entities.get(start) is None:
@@ -3368,12 +3376,15 @@ class FormulaEngine:
             cur = start
             out: list = []
             while len(out) < n:
+                # Eligibility (relation) is judged against the ORIGIN; the jump
+                # distance is measured from the PREVIOUS link (`cur`).
+                cur_e = match.entities.get(cur)
                 best_id = ""
                 best_d = None
-                for oid, oe, ref_e in _candidates(cur, relation):
+                for oid, oe, _ref in _candidates(start, relation):
                     if oid in visited:
                         continue
-                    d = _ent_dist(ref_e, oe, "square_radius_distance")
+                    d = _ent_dist(cur_e, oe, "square_radius_distance")
                     if cap is not None and d > cap:
                         continue
                     if best_d is None or d < best_d or (d == best_d and oid < best_id):

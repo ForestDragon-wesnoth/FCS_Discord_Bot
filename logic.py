@@ -993,6 +993,23 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "on each), or 'keep' (leave them mounted for manual cleanup)."
         ),
     },
+    # What happens to a vehicle's riders when the vehicle TRANSFORMS into a
+    # form whose slots don't accommodate every current rider (a rider's slot
+    # is missing in the new form). If EVERY rider's slot still exists in the
+    # new form, they stay mounted regardless of this rule. 'block' (default)
+    # refuses the transform (raises, no change); 'eject' dismounts every rider
+    # to free cells near the vehicle, then transforms.
+    "transform_rider_mismatch_mode": {
+        "default": "block",
+        "schema": {"type": "enum", "choices": ["block", "eject"]},
+        "desc": (
+            "When transforming/polymorphing a VEHICLE whose new form lacks a "
+            "slot for some current rider: 'block' (refuse the transform, no "
+            "change) or 'eject' (dismount all riders to nearby cells, then "
+            "transform). If the new form has matching slots for ALL riders, "
+            "they stay mounted regardless of this rule."
+        ),
+    },
     # Whether a HIDDEN rider (a passenger in a slot with no `region`, tucked
     # inside the vehicle) contributes to its team's vision / fog reveal.
     # Default False — symmetric with a hidden rider being excluded from
@@ -5172,8 +5189,11 @@ class Match:
         cells = z.get("cells") or set()
         out: Dict[str, Any] = {
             "cells": [[x, y] for (x, y) in sorted(cells)],
-            "data": z.get("data") or {},
-            "hooks": z.get("hooks") or {},
+            # deepcopy data/hooks: zone_set_path / the zone_set primitive mutate
+            # the zone data dict IN PLACE, so a by-reference snapshot would be
+            # corrupted by a later edit (defeats undo + action rollback).
+            "data": copy.deepcopy(z.get("data") or {}),
+            "hooks": copy.deepcopy(z.get("hooks") or {}),
         }
         g = z.get("glyph")
         if isinstance(g, str) and len(g) == 1:
@@ -5822,9 +5842,12 @@ class Match:
                 if e.mounted_on == vid and e.mount_slot == slot]
 
     def _eval_slot_expr(self, vid: str, rider_id: str,
-                        expr: Any, fallback: Any) -> Any:
+                        expr: Any, fallback: Any,
+                        slot: Optional[str] = None) -> Any:
         """Evaluate a slot cost/condition formula with `self` = the rider and
-        a `vehicle` binding = the host. Empty or malformed -> fallback
+        `vehicle`/`slot` bindings. `slot` is the slot being EVALUATED (passed by
+        the caller — NOT the rider's current mount_slot, which is None on a
+        fresh mount and stale during a switch). Empty or malformed -> fallback
         (fail-OPEN: a GM typo doesn't trap or bar a rider — give gating vars
         a default via !defvar so reads resolve)."""
         expr = str(expr or "").strip()
@@ -5832,9 +5855,7 @@ class Match:
             return fallback
         from formula import FormulaEngine, EvalCtx, FormulaError
         ctx = EvalCtx(this=self.current_entity_id(), target=rider_id,
-                      extras={"vehicle": vid, "rider": rider_id,
-                              "slot": self.entities[rider_id].mount_slot
-                              if rider_id in self.entities else None})
+                      extras={"vehicle": vid, "rider": rider_id, "slot": slot})
         try:
             return FormulaEngine(self).eval_expression(expr, ctx)
         except FormulaError:
@@ -5852,7 +5873,7 @@ class Match:
         """What `rider_id` would consume from the slot's budget — the slot's
         `cost` formula evaluated for that rider (default 1)."""
         sd = self.slot_def(vid, slot) or {}
-        val = self._eval_slot_expr(vid, rider_id, sd.get("cost", ""), 1)
+        val = self._eval_slot_expr(vid, rider_id, sd.get("cost", ""), 1, slot=slot)
         try:
             return float(val)
         except (TypeError, ValueError):
@@ -5871,7 +5892,8 @@ class Match:
         """Whether `rider_id` satisfies the slot's `condition` formula
         (empty/malformed = yes)."""
         sd = self.slot_def(vid, slot) or {}
-        return bool(self._eval_slot_expr(vid, rider_id, sd.get("condition", ""), True))
+        return bool(self._eval_slot_expr(vid, rider_id, sd.get("condition", ""),
+                                         True, slot=slot))
 
     def can_mount(self, rider_id: str, vid: str,
                   slot: str) -> Tuple[bool, str]:
@@ -6064,15 +6086,17 @@ class Match:
                 return True
         return False
 
-    def _release_riders(self, vid: str) -> List[str]:
+    def _release_riders(self, vid: str, mode: Optional[str] = None) -> List[str]:
         """Resolve a vehicle's riders when it dies / despawns, per the
         mount_on_host_death rule: 'eject' (dismount to nearby cells),
         'kill' (run the kill function on each), 'keep' (leave them linked).
-        Called from Entity.remove. Returns log."""
+        Called from Entity.remove. An explicit `mode` overrides the rule (the
+        transform eject path passes 'eject'). Returns log."""
         riders = self.vehicle_riders(vid)
         if not riders:
             return []
-        mode = str(self.rules.get("mount_on_host_death", "eject"))
+        if mode is None:
+            mode = str(self.rules.get("mount_on_host_death", "eject"))
         veh = self.entities.get(vid)
         log: List[str] = []
         for rider in riders:
@@ -7943,6 +7967,14 @@ class Match:
             raise NotFound(f"Entity '{a}' not found.")
         if eb is None:
             raise NotFound(f"Entity '{b}' not found.")
+        # Mount redirect (mirrors move/tp): a mounted entity can't be swapped
+        # on its own. A driver (a slot with controls_movement) redirects the
+        # swap to its VEHICLE — the whole rig swaps and riders are carried via
+        # fire_entity_moved; a passenger raises ("dismount first"). Resolved
+        # before reading positions so the swap operates on the real movers.
+        ea = ea._mount_move_redirect()
+        eb = eb._mount_move_redirect()
+        a, b = ea.id, eb.id
         if a == b:
             return False, []
         ax, ay = ea.x, ea.y
@@ -10575,6 +10607,14 @@ class Match:
             if d.get("id"):
                 idmap[d["id"]] = nid
             d["__nid"] = nid
+        # Segment chains reference the segment ahead via the `__follows` var
+        # (an entity id); remap it like part_of so a transplanted snake body
+        # keeps its chain. A `__follows` pointing at the head resolves to the
+        # parent's preserved id (not in idmap) and is left unchanged.
+        for d in part_list:
+            dv = d.get("vars")
+            if isinstance(dv, dict) and dv.get("__follows") in idmap:
+                dv["__follows"] = idmap[dv["__follows"]]
         log: List[str] = []
         # Spawn parents before children: a part whose part_of points at another
         # part in this list waits until that part has spawned.
@@ -10622,6 +10662,28 @@ class Match:
         if not isinstance(statblock, dict):
             raise VTTError("transform: statblock must be a dict.")
         sb = copy.deepcopy(statblock)
+        # Vehicle riders: if the entity currently carries riders, the new form
+        # must still have a slot for each, or the riders would be orphaned
+        # (flagged mounted to a slot-less form). If every rider's slot exists
+        # in the new form they stay mounted; otherwise the
+        # transform_rider_mismatch_mode rule decides: 'block' (refuse, raise
+        # before any change) or 'eject' (dismount all riders, then transform).
+        riders = self.vehicle_riders(e.id)
+        if riders:
+            new_slots = (sb.get("vars") or {}).get("slots")
+            new_slots = new_slots if isinstance(new_slots, dict) else {}
+            missing = sorted({r.mount_slot for r in riders
+                              if r.mount_slot not in new_slots})
+            if missing:
+                mode = str(self.rules.get("transform_rider_mismatch_mode", "block"))
+                if mode == "eject":
+                    self._release_riders(e.id, mode="eject")
+                else:
+                    raise VTTError(
+                        f"transform: new form lacks slot(s) "
+                        f"{', '.join(repr(s) for s in missing)} for current "
+                        f"rider(s) — dismount them first (or set "
+                        f"transform_rider_mismatch_mode=eject).")
         hp_var, max_hp_var, turnorder_var = e._vital_var_names()
         team_var = str(self.rules.get("team_var", "team"))
         if hp_mode is None:
@@ -11427,8 +11489,13 @@ class Match:
             # match doesn't iterate tiles by position), but sorting the
             # serialized output keeps save-file diffs readable when a
             # GM edits tiles by hand.
+            # deepcopy each tile's data: tile_set_path / the tile_set primitive
+            # mutate tile dicts IN PLACE, so a by-reference snapshot would be
+            # corrupted by a later edit (defeating undo change-detection and
+            # action rollback — the same defect fixed for entity vars).
             "tiles": {
-                f"{x},{y}": dat for (x, y), dat in sorted(self.tiles.items())
+                f"{x},{y}": copy.deepcopy(dat)
+                for (x, y), dat in sorted(self.tiles.items())
             },
             "zones": {
                 name: self._zone_to_dict(z)
@@ -12602,6 +12669,11 @@ class MatchManager:
             ne.id = idmap[oid]
             if ne.part_of:
                 ne.part_of = idmap.get(ne.part_of, ne.part_of)
+            # Segment chains: remap the `__follows` back-pointer (an entity id)
+            # like part_of, so a copied/transferred snake keeps its chain.
+            fol = ne.vars.get("__follows")
+            if fol in idmap:
+                ne.vars["__follows"] = idmap[fol]
             if oid == eid or not oe.is_located_part:
                 px, py = tx, ty
             else:  # a located part keeps its offset from the anchor

@@ -3922,13 +3922,13 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 # The selector reuses the exact find-predicate grammar; the command after
 # the bare `;` runs once per match with per-entity tokens substituted.
 def _foreach_subst(tok: str, eid: str, name: str, x: int, y: int) -> str:
-    """Substitute the per-entity tokens in one command token. `$name` is
-    replaced LAST so a name that happens to contain another token (e.g.
-    `$id`) isn't recursively re-substituted."""
-    return (tok.replace("$id", eid)
-               .replace("$x", str(x))
-               .replace("$y", str(y))
-               .replace("$name", name))
+    """Substitute the per-entity tokens ($id/$name/$x/$y) in one command token
+    in a SINGLE pass, so a substituted value that itself contains another token
+    (e.g. an id containing `$x`, or a name containing `$id`) is NOT
+    re-substituted. (Sequential str.replace only guarded `$name`-contains-token,
+    not the reverse.)"""
+    repl = {"$id": eid, "$name": name, "$x": str(x), "$y": str(y)}
+    return re.sub(r"\$name|\$id|\$x|\$y", lambda m: repl[m.group(0)], tok)
 
 
 @registry.command(
@@ -8169,13 +8169,18 @@ async def run_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 
 def _macro_subst(line: str, mac_args: List[str]) -> str:
-    """Substitute $@ (all args, space-joined) and $1..$9 (positional;
-    missing -> empty) in a macro line. Leaves $(...) formula tokens alone."""
-    out = line.replace("$@", " ".join(mac_args))
-    for i in range(9, 0, -1):
-        val = mac_args[i - 1] if i <= len(mac_args) else ""
-        out = out.replace(f"${i}", val)
-    return out
+    """Substitute $@ (all args, space-joined) and $1, $2, ... (positional;
+    missing -> empty) in a macro line, in a SINGLE left-to-right pass. The
+    single pass matters: an arg VALUE that itself contains a `$N`/`$@` token is
+    NOT re-substituted, and a multi-digit `$10`+ is parsed as the whole index
+    (not `$1` followed by a literal `0`). Leaves $(...) formula tokens alone
+    (a `$` not followed by `@` or a digit)."""
+    def repl(m: "re.Match") -> str:
+        if m.group(0) == "$@":
+            return " ".join(mac_args)
+        idx = int(m.group(1))
+        return mac_args[idx - 1] if 1 <= idx <= len(mac_args) else ""
+    return re.sub(r"\$@|\$(\d+)", repl, line)
 
 
 @registry.command(
@@ -8979,10 +8984,11 @@ async def _run_action_dispatch(
     # state into unrelated formula evaluations.
     # Mount routing: a rider-triggered vehicle/slot action runs as the
     # rider (default) or the vehicle, per the mount_action_actor rule with a
-    # per-vehicle `mount_action_actor` var override. Either way BOTH the
-    # `vehicle` and `rider` ids are bound in the body. In rider mode the
-    # action's own container is dropped (source = the rider's plain vars);
-    # the body reads vehicle/slot config via entity[vehicle] / var_get.
+    # per-vehicle `mount_action_actor` var override. Either way the
+    # `vehicle`, `rider` AND `slot` ids are bound in the body (CLAUDE.md). In
+    # rider mode the action's own container is dropped (source = the rider's
+    # plain vars); the body reads vehicle/slot config via entity[vehicle] /
+    # var_get.
     eff_actor_id = actor_id
     extra_ctx: Optional[Dict[str, Any]] = None
     if action.full_path in mount_paths:
@@ -8990,7 +8996,9 @@ async def _run_action_dispatch(
         veh = m.entities.get(vid)
         mode = (veh.vars.get("mount_action_actor") if veh is not None else None) \
             or m.rules.get("mount_action_actor", "rider")
-        extra_ctx = {"vehicle": vid, "rider": actor_id}
+        rider_ent = m.entities.get(actor_id)
+        extra_ctx = {"vehicle": vid, "rider": actor_id,
+                     "slot": rider_ent.mount_slot if rider_ent is not None else None}
         if str(mode) == "vehicle":
             eff_actor_id = vid
         else:
