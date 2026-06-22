@@ -13117,3 +13117,25 @@ Expected: the directed event `boom` fires vic's TEAM (red) handler first, which
 removes vic. vic's OWN event:boom handler (which would set wit.marked=1) must NOT
 fire afterward — wit.marked stays 0. Same ghost-handler guard as 510, in the
 emit_event directed path (team handlers before own handlers).
+
+
+SCENARIO 512 — Removed entity's own var-hook doesn't fire (ghost guard, var path)
+--------------------------------------------------------------------------------
+
+!match new gv GhostVar 6 6
+!match use gv
+!ent add vic Victim 30 1 1 5
+!ent set_var vic flag 0
+!ent add wit Witness 30 2 1 5
+!ent set_var wit marked 0
+!gpassive add reap on_var_changed target=flag scope=exact "remove_entity('vic')"
+!passive add vic mk on_var_changed target=flag scope=exact "entity[wit].marked = 1"
+!ent set_var vic flag 1
+!eval "var_get('wit', 'marked')"
+
+Expected: changing vic's `flag` fires the GLOBAL on_var_changed passive first,
+which removes vic. vic's OWN on_var_changed passive (which would set
+wit.marked=1) must NOT fire afterward — wit.marked stays 0. Completes the
+ghost-handler sweep from audit-pass-7 (which guarded the status / hook / event
+firing sites) by also guarding the var-event and var-write-attempt firing paths
+in _fire_var_event_inner / _fire_var_attempt_inner.

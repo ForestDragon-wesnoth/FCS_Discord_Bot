@@ -11069,17 +11069,21 @@ class Match:
         for p in self._firing_passives(entity_id):
             if p.when == kind_hook:
                 _maybe_fire(p, is_global=True)
-        for p in e.passives.values():
-            if p.when == kind_hook:
-                _maybe_fire(p, is_global=False)
+        # A global/team handler may have removed the entity; don't fire its
+        # own passives from beyond the grave (mirrors fire_status_event).
+        if entity_id in self.entities:
+            for p in e.passives.values():
+                if p.when == kind_hook:
+                    _maybe_fire(p, is_global=False)
 
         # Wave 2: on_var_written catch-all passives
         for p in self._firing_passives(entity_id):
             if p.when == "on_var_written":
                 _maybe_fire(p, is_global=True)
-        for p in e.passives.values():
-            if p.when == "on_var_written":
-                _maybe_fire(p, is_global=False)
+        if entity_id in self.entities:
+            for p in e.passives.values():
+                if p.when == "on_var_written":
+                    _maybe_fire(p, is_global=False)
 
         return log
 
@@ -11183,9 +11187,12 @@ class Match:
         for p in self._firing_passives(entity_id):
             if p.when == "on_var_write_attempt":
                 _maybe_fire(p, is_global=True)
-        for p in e.passives.values():
-            if p.when == "on_var_write_attempt":
-                _maybe_fire(p, is_global=False)
+        # A global/team handler may have removed the entity mid-fire; don't
+        # fire its own passives from beyond the grave.
+        if entity_id in self.entities:
+            for p in e.passives.values():
+                if p.when == "on_var_write_attempt":
+                    _maybe_fire(p, is_global=False)
 
         return log
 

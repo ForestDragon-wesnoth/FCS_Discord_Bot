@@ -1925,6 +1925,29 @@ More shipped work (continuing the list above):
     sharing, and (re-confirmed footprint-correct) all vision/LOS casts, distance
     gaps, and movement validation.
 
+- **Audit-pass-8 fix: ghost passives in the VAR-hook firing paths (scenario
+  512).** An eighth sweep (three read-only survey agents across zones/clamps/
+  tiles/aliases, death/corpse/parts/segments, and action/choice/formula/
+  dispatch). Agents 1-2 found their subsystems correct (zones' anchored auras +
+  footprint interaction, clamp ordering, tile precedence, alias resolution; the
+  whole death/corpse/parts/segment/mount cluster incl. the part-destroy latch +
+  revive subtree + mount-strip — all re-confirmed sound). Agent 3 found the ONE
+  real bug: pass-7 guarded the ghost-passive case (a global/team handler removes
+  the entity, then its OWN handlers must not fire from beyond the grave) in
+  `fire_status_event` / `fire_hook` / `emit_event`, but MISSED the var-hook
+  firing paths. `_fire_var_event_inner` (wave 1 = exact `on_var_{kind}`, wave 2
+  = `on_var_written` catch-all) and `_fire_var_attempt_inner`
+  (`on_var_write_attempt`) each fire global/team handlers then the entity's own
+  passives WITHOUT re-checking the entity still exists. So a global var-hook that
+  removes the affected entity left the own-passive loops iterating a stale `e`.
+  Fixed with the same `if entity_id in self.entities:` guard before each own loop
+  (three sites). NOTE for repro authors: in a VAR hook `self`/`this` =
+  current_entity_id() (the active-turn entity), NOT the affected entity, and
+  `target` is NOT bound (var-event extras expose changed_key/old_value/
+  new_value/hook_name/intended_value/was_clamped only) — reference the affected
+  entity by literal id or via `self` only when it IS the active entity. (This
+  differs from STATUS hooks, where the affected entity is bound as `self`.)
+
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
 and explain the "why").
