@@ -13009,3 +13009,111 @@ both succeed: is_mounted True for both, slot_of('a')='vip', slot_of('b')='econ'.
 Before the fix `_eval_slot_expr` hard-wired `slot` to the rider's CURRENT
 mount_slot (None on a fresh mount), so the conditions evaluated against None and
 both mounts were refused.
+
+
+SCENARIO 507 — Restore doesn't corrupt nested entity vars (load-side deepcopy)
+----------------------------------------------------------------------------
+
+!match new lv LoadVars 5 5
+!match use lv
+!ent add h Hero 30 1 1 5
+!ent set_var h inventory.dmg 10
+!history save bm
+!ent set_var h inventory.dmg 20
+!history restore bm confirm
+!ent set_var h inventory.dmg 30
+!history restore bm confirm
+!eval "var_get('h', 'inventory.dmg')"
+
+Expected: the manual save `bm` captures inventory.dmg=10. After restoring to it,
+editing inventory.dmg to 30 (an in-place nested write) must NOT corrupt the saved
+snapshot, so restoring `bm` a second time yields 10. Before the fix,
+Entity.from_dict shallow-copied `vars` (`dict(...)`), so the restored entity
+shared its nested `inventory` dict with the retained snapshot and the later edit
+corrupted it — the second restore wrongly returned 30 (the load-side twin of the
+to_dict deepcopy fixes from earlier audit passes).
+
+
+SCENARIO 508 — Restore doesn't corrupt nested tile data (load-side deepcopy)
+--------------------------------------------------------------------------
+
+!match new lt LoadTile 5 5
+!match use lt
+!tile set 2 2 trap.dmg 10
+!history save tb
+!tile set 2 2 trap.dmg 20
+!history restore tb confirm
+!tile set 2 2 trap.dmg 30
+!history restore tb confirm
+!eval "tile_get(2, 2, 'trap.dmg')"
+
+Expected: same shape as 507 but for a tile's nested data. The save `tb` has
+trap.dmg=10; after restore, an in-place `!tile set` to 30 must not corrupt the
+snapshot, so the second restore yields 10. Before the fix, Match.from_dict reused
+the snapshot's tile dict by reference (`m.tiles[(x,y)] = val`), so the edit
+corrupted the retained save and the second restore returned 30.
+
+
+SCENARIO 509 — max_level is a hard ceiling (first application + replace + add_level)
+----------------------------------------------------------------------------------
+
+!match new ml MaxLevel 5 5
+!match use ml
+!ent add h Hero 30 1 1 5
+!status def burn
+!status maxlevel burn 3
+!status apply h burn 10
+!eval "status_get('h', 'burn', 'level')"
+!status stack burn replace
+!status apply h burn 9
+!eval "status_get('h', 'burn', 'level')"
+!status stack burn add_level
+!status apply h burn 5
+!eval "status_get('h', 'burn', 'level')"
+
+Expected: burn has max_level 3. A FIRST application with explicit level 10 is
+capped to 3; a `replace` to 9 is capped to 3; an `add_level` of +5 is capped to
+3. max_level is now a hard ceiling on the level field everywhere, not just for
+add_level stacking (previously the first application and replace bypassed the
+cap, yielding 10 then 9).
+
+
+SCENARIO 510 — Removed entity's own status passive doesn't fire (ghost guard)
+----------------------------------------------------------------------------
+
+!match new gp GhostPassive 6 6
+!match use gp
+!ent add vic Victim 30 1 1 5
+!ent add wit Witness 30 2 1 5
+!ent set_var wit marked 0
+!gpassive add reaper on_status_added "remove_entity(self)"
+!passive add vic mark on_status_added "entity[wit].marked = 1"
+!status apply vic burn
+!eval "var_get('wit', 'marked')"
+
+Expected: applying `burn` to vic fires the GLOBAL on_status_added passive first,
+which removes vic (`remove_entity(self)`; in a status hook the affected entity is
+`self`). vic's OWN on_status_added passive (which would set wit.marked=1) must NOT
+fire now that vic is gone — so wit.marked stays 0. Before the fix, the own-passive
+loop ran on the just-removed entity, firing side effects from beyond the grave.
+
+
+SCENARIO 511 — Removed target's own event handler doesn't fire (ghost guard)
+---------------------------------------------------------------------------
+
+!match new ge GhostEvent 6 6
+!match use ge
+!ent add vic Victim 30 1 1 5
+!ent set_var vic team red
+!ent add wit Witness 30 2 1 5
+!ent set_var wit team blue
+!ent set_var wit marked 0
+!team passive add red reap event:boom "remove_entity(self)"
+!passive add vic mk event:boom "entity[wit].marked = 1"
+!emit boom to=vic
+!eval "var_get('wit', 'marked')"
+
+Expected: the directed event `boom` fires vic's TEAM (red) handler first, which
+removes vic. vic's OWN event:boom handler (which would set wit.marked=1) must NOT
+fire afterward — wit.marked stays 0. Same ghost-handler guard as 510, in the
+emit_event directed path (team handlers before own handlers).

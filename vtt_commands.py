@@ -7313,9 +7313,17 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             event_log = m.apply_status(eid, name, level, duration, force=force)
         except (VTTError, NotFound) as ex:
             return await ctx.send(f"❌ {ex}")
-        e = m.entities[eid]
         tail = ("\n" + "\n".join(event_log)) if event_log else ""
         verb = "Force-applied" if force else "Applied"
+        # A lifecycle hook fired by the application may have removed the entity
+        # (e.g. an on_status_added passive that kills/removes it). Nothing left
+        # to inspect — report the application + any hook log and stop, rather
+        # than KeyError'ing on m.entities[eid].
+        if eid not in m.entities:
+            return await ctx.send(
+                f"{verb} `{name}` to `{eid}`, which was then removed by a "
+                f"triggered effect.{tail}")
+        e = m.entities[eid]
         # Body-part status rules can no-op (immune) or redirect to the
         # parent — reflect that instead of a misleading "Applied to <part>".
         # These hold even for force (force is the resistance axis, not parts).

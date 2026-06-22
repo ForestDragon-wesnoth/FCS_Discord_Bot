@@ -3390,7 +3390,7 @@ def _coerce_status_dict(raw: Any) -> Dict[str, Dict[str, Any]]:
         for k, v in raw.items():
             if not isinstance(k, str):
                 continue
-            out[k] = dict(v) if isinstance(v, dict) else {}
+            out[k] = copy.deepcopy(v) if isinstance(v, dict) else {}
         return out
     if isinstance(raw, (list, tuple, set)):
         return {str(n): {} for n in raw if isinstance(n, str)}
@@ -4523,7 +4523,7 @@ class Entity:
             # written by clones via Entity.to_dict (the common path) load
             # cleanly. Anything else is treated as an empty status set.
             status=_coerce_status_dict(data.get("status")),
-            vars=dict(data.get("vars", {})),
+            vars=copy.deepcopy(data.get("vars", {})),
             facing=data.get("facing", "up"),
             part_of=data.get("part_of", None),
             mounted_on=data.get("mounted_on", None),
@@ -8997,6 +8997,17 @@ class Match:
             reduction = sum(amounts)
         return (False, max(0, reduction))
 
+    @staticmethod
+    def _cap_status_level(sdef: Dict[str, Any], lvl: int) -> int:
+        """Clamp a status level to the definition's max_level (a hard ceiling
+        on the level field — applied to first application, replace, and
+        add_level alike). max_level absent / <=0 = uncapped."""
+        try:
+            maxl = int(sdef.get("max_level", 0) or 0)
+        except (TypeError, ValueError):
+            maxl = 0
+        return min(lvl, maxl) if maxl > 0 else lvl
+
     def _resistance_applies(self, e: "Entity", name: str,
                             sdef: Dict[str, Any], level_given: bool) -> bool:
         """Whether a flat level-reduction resistance applies to THIS status
@@ -9099,7 +9110,8 @@ class Match:
         before = copy.deepcopy(e.status.get(name))
         if name not in e.status:
             inst = copy.deepcopy(sdef.get("data")) if isinstance(sdef.get("data"), dict) else {}
-            inst["level"] = new_level if new_level is not None else int(inst.get("level", 1))
+            seed_lv = new_level if new_level is not None else int(inst.get("level", 1))
+            inst["level"] = self._cap_status_level(sdef, seed_lv)
             if new_duration is not None:
                 inst["duration"] = new_duration
             e.status[name] = inst
@@ -9110,7 +9122,7 @@ class Match:
                 pass
             elif mode == "replace":
                 if new_level is not None:
-                    inst["level"] = new_level
+                    inst["level"] = self._cap_status_level(sdef, new_level)
                 if new_duration is not None:
                     inst["duration"] = new_duration
             elif mode == "extend":
@@ -9119,8 +9131,7 @@ class Match:
             elif mode == "add_level":
                 add = new_level if new_level is not None else 1
                 nl = int(inst.get("level", 0)) + add
-                maxl = int(sdef.get("max_level", 0) or 0)
-                inst["level"] = min(nl, maxl) if maxl > 0 else nl
+                inst["level"] = self._cap_status_level(sdef, nl)
                 if new_duration is not None:
                     inst["duration"] = new_duration
             else:  # refresh (default)
@@ -9289,11 +9300,14 @@ class Match:
                 log.append(_run_passive_safely(
                     engine, p, ctx, target_id=entity_id, is_global=True,
                 ))
-        for p in e.passives.values():
-            if p.when == when:
-                log.append(_run_passive_safely(
-                    engine, p, ctx, target_id=entity_id, is_global=False,
-                ))
+        # A global/team handler may have removed the entity (kill/remove);
+        # don't fire its own passives from beyond the grave.
+        if entity_id in self.entities:
+            for p in e.passives.values():
+                if p.when == when:
+                    log.append(_run_passive_safely(
+                        engine, p, ctx, target_id=entity_id, is_global=False,
+                    ))
         return log
 
     def _emit_status_diff(
@@ -10876,6 +10890,10 @@ class Match:
                 if p.when != when:
                     continue
                 log.append(_run_passive_safely(engine, p, ctx, target_id=tid, is_global=True))
+            # A global/team passive may have removed this entity; don't fire
+            # its own passives afterward.
+            if tid not in self.entities:
+                continue
             # Then entity-owned passives.
             for pid, p in list(e.passives.items()):
                 if p.when != when:
@@ -10946,11 +10964,14 @@ class Match:
                                 log.append(_run_passive_safely(
                                     engine, p, tctx, target_id=target,
                                     is_global=True))
-                    for p in list(e.passives.values()):
-                        if p.when == when:
-                            log.append(_run_passive_safely(
-                                engine, p, tctx, target_id=target,
-                                is_global=False))
+                    # A team handler may have removed the target; don't fire
+                    # its own handlers afterward.
+                    if target in self.entities:
+                        for p in list(e.passives.values()):
+                            if p.when == when:
+                                log.append(_run_passive_safely(
+                                    engine, p, tctx, target_id=target,
+                                    is_global=False))
         finally:
             self._event_stack.pop()
             self._event_depth -= 1
@@ -11593,7 +11614,11 @@ class Match:
             except (ValueError, AttributeError):
                 continue
             if m.in_bounds(x, y) and isinstance(val, dict) and val:
-                m.tiles[(x, y)] = val
+                # deepcopy: a snapshot's tile dict is loaded here; reusing it
+                # by reference would re-share it with the retained snapshot, so
+                # a later in-place !tile set would corrupt undo/rollback (the
+                # load-side twin of the to_dict deepcopy above).
+                m.tiles[(x, y)] = copy.deepcopy(val)
         raw_zones = d.get("zones", {}) or {}
         m.zones = {}
         for zname, zdef in raw_zones.items():

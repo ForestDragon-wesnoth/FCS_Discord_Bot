@@ -1874,6 +1874,57 @@ More shipped work (continuing the list above):
     gate (no batch/foreach/macro bypass), nested-mount carry + cycle guards,
     rider-death corpse strip, `_find_dismount_cell`.
 
+- **Audit-pass-7 fixes: load-side snapshots + ghost passives + status cap
+  (scenarios 507-511).** A seventh sweep (three read-only survey agents across
+  status/passive/event, movement/geometry/LOS, action/choice/dispatch/clamp;
+  every candidate verified in code — and most behaviorally repro'd — before
+  fixing). Five real bugs + two user design calls:
+  - **Load-side shallow-copy (HIGH).** The SAVE side was deepcopied in passes
+    5/6 (`Entity.to_dict` vars, `Match.to_dict` tiles, `_zone_to_dict`), but the
+    LOAD side still re-shared nested data with the RETAINED snapshot:
+    `Entity.from_dict` did `vars=dict(...)`, `_coerce_status_dict` did `dict(v)`
+    per status, and `Match.from_dict` reused each tile dict by reference
+    (`m.tiles[(x,y)] = val`). Since `from_dict` runs on `!history restore` /
+    undo / action rollback (the snapshot stays in history), a later in-place
+    `!ent set_var inv.x` / `!tile set` corrupted the saved snapshot, so a second
+    restore returned the mutated value. Fixed all three with `copy.deepcopy`
+    (zones' `_zone_from_dict` already deepcopied `data` + rebuilt `hooks`, so it
+    was already safe). Scenarios 507-508.
+  - **Ghost passives (MED).** In `fire_status_event`, `fire_hook`, and
+    `emit_event`, global/team handlers fire BEFORE the entity's own handlers. If
+    a global/team handler removed the entity (kill/remove — in a status hook the
+    affected entity is bound as `self`, NOT `target`), the own-handler loop still
+    ran on the just-removed entity, firing side effects from beyond the grave.
+    Added an existence re-check (`id in self.entities`) before each own-handler
+    loop, mirroring the loops' existing top-of-iteration guard. Scenarios
+    510-511.
+  - **`!status apply` crash when a hook removes the target (MED, pre-existing).**
+    The command handler did `e = m.entities[eid]` right after `apply_status`,
+    KeyError'ing if a lifecycle hook (e.g. an on_status_added passive that kills
+    the entity) removed it mid-apply. Now reports "Applied ... which was then
+    removed by a triggered effect" instead of crashing. Surfaced by scenario 510.
+  - **max_level hard ceiling (user call → cap everywhere).** `max_level` capped
+    only the `add_level` stacking mode; a FIRST application or a `replace` with
+    an explicit level above max was uncapped (`!status apply h burn 10` on a
+    fresh max_level=3 → level 10). User's call: make max_level a hard ceiling on
+    the level field EVERYWHERE. New `Match._cap_status_level(sdef, lvl)` helper
+    applied at all three apply sites (first / replace / add_level). Scenario 509.
+  - **LOS-on-opaque (user call → KEEP current, no code change).** For the
+    sight-aware line queries (`entities_on_los`, `entities_in_line_until`), an
+    entity standing ON the FIRST opaque cell (e.g. an enemy at the near edge of
+    smoke) is RETURNED as visible/hittable; only entities BEYOND the opaque cell
+    are cut. CONFIRMED INTENDED (consistent with `has_los`'s "the target's own
+    opacity never blocks" convention — you can see/shoot something at the wall
+    surface, not past it). Documented here so the ambiguity doesn't recur; do
+    NOT "fix" it to exclude the on-opaque entity.
+  - Re-verified correct (no change): choice-replay RNG snapshot/restore +
+    summon-budget reset + buffer reset, the `action._rollback_match` runtime-
+    field list (incl. event-stack), clamp/death-check ordering in `write_var`,
+    the dispatch gate, status counter auto-removal + cross-status removes/
+    blocked_by, resistance mode-awareness + the force path, attached-part tick
+    sharing, and (re-confirmed footprint-correct) all vision/LOS casts, distance
+    gaps, and movement validation.
+
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
 and explain the "why").
