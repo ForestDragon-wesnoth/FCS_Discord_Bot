@@ -8965,6 +8965,24 @@ class Match:
             reduction = sum(amounts)
         return (False, max(0, reduction))
 
+    def _resistance_applies(self, e: "Entity", name: str,
+                            sdef: Dict[str, Any], level_given: bool) -> bool:
+        """Whether a flat level-reduction resistance applies to THIS status
+        application — only when a level is actually added/set: a first
+        application, an add_level increment (implicit +1 OR explicit), or a
+        replace with an explicit level. refresh / extend / none set no level,
+        so resistance has nothing to reduce (and must not block a
+        duration-only refresh)."""
+        if name not in e.status:
+            return True  # first application seeds a level
+        mode = sdef.get("stack") or str(
+            self.rules.get("status_default_stack", "refresh"))
+        if mode == "add_level":
+            return True
+        if mode == "replace":
+            return level_given
+        return False  # refresh / extend / none — no level applied
+
     def status_apply_block_reason(self, eid: str, name: str,
                                   level: Optional[int] = None) -> Optional[str]:
         """A human reason the status would NOT apply to `eid` (immunity,
@@ -8981,7 +8999,7 @@ class Match:
             e, self._token_list(sdef.get("blocked_by")))
         if blockers:
             return f"`{name}` blocked by `{blockers[0]}`"
-        if reduction and (name not in e.status or level is not None):
+        if reduction and self._resistance_applies(e, name, sdef, level is not None):
             base = int(level) if level is not None else 1
             if base - reduction <= 0:
                 return f"`{name}` fully resisted (reduction {reduction})"
@@ -8989,14 +9007,21 @@ class Match:
 
     def apply_status(self, eid: str, name: str,
                      level: Optional[int] = None,
-                     duration: Optional[int] = None) -> List[str]:
+                     duration: Optional[int] = None,
+                     *, force: bool = False) -> List[str]:
         """Apply status `name` to entity `eid`, honoring the definition's
         `stack` mode (else the status_default_stack rule) when the status
         is already present. A FIRST application seeds the definition's
         default `data`, then sets level (default 1) and duration. Fires
         the on_status_added / on_status_changed hooks via the status
         chokepoint. Returns the hook log. Raises NotFound for an unknown
-        entity."""
+        entity.
+
+        `force=True` (the force_status / `!status force` path) skips the
+        immunity + resistance gating entirely — the level/increment is
+        applied regardless of resistance. blocked_by (cross-status) and the
+        part immune/redirect rules are still honored; force is specifically
+        the 'ignore resistance' axis."""
         e = self.entities.get(eid)
         if e is None:
             raise NotFound(f"Entity '{eid}' not found.")
@@ -9010,29 +9035,35 @@ class Match:
             if name in self._part_status_names(
                     e, "__status_redirect", "part_status_redirect"):
                 if e.part_of in self.entities:
-                    return self.apply_status(e.part_of, name, level, duration)
+                    return self.apply_status(e.part_of, name, level, duration,
+                                             force=force)
                 return []
         sdef = self.status_definitions.get(name) or {}
-        # Cross-status blocking + resistance/immunity, evaluated BEFORE the
-        # stacking math (a blocked/immune/fully-resisted application is a
-        # no-op). blocked_by: a status the target already has prevents this
-        # one. immunity: an aggregated immune token. resistance: reduces the
-        # applied LEVEL; if it drops to <=0 the application is fully resisted.
+        new_level = None if level is None else int(level)
+        new_duration = None if duration is None else int(duration)
+        # Cross-status blocking is ALWAYS honored (a different status the
+        # target already has prevents this one — independent of resistance).
         blockers = self._statuses_matching_tokens(
             e, self._token_list(sdef.get("blocked_by")))
         if blockers:
             return []
-        immune, reduction = self.status_resistance(eid, name)
-        if immune:
-            return []
-        new_level = None if level is None else int(level)
-        new_duration = None if duration is None else int(duration)
-        if reduction and (name not in e.status or new_level is not None):
-            base = new_level if new_level is not None else 1
-            eff = base - reduction
-            if eff <= 0:
+        # Resistance / immunity gating — skipped entirely when force=True.
+        # Resistance reduces a LEVEL being added/set, mode-aware (via
+        # _resistance_applies) so an implicit add_level +1 is resisted just
+        # like an explicit level while a duration-only refresh/extend is
+        # never blocked; if the reduced level drops to <=0 the application is
+        # fully resisted (no-op).
+        if not force:
+            immune, reduction = self.status_resistance(eid, name)
+            if immune:
                 return []
-            new_level = eff
+            if reduction and self._resistance_applies(
+                    e, name, sdef, new_level is not None):
+                base = new_level if new_level is not None else 1
+                eff = base - reduction
+                if eff <= 0:
+                    return []
+                new_level = eff
         before = copy.deepcopy(e.status.get(name))
         if name not in e.status:
             inst = copy.deepcopy(sdef.get("data")) if isinstance(sdef.get("data"), dict) else {}

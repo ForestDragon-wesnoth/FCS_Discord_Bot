@@ -1407,8 +1407,10 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     "status_has", "status_has_path", "status_get",
     "status_set", "status_del", "status_add", "status_remove",
     # status_apply(eid, name[, level, duration]) -> apply a status via its
-    # definition + stack mode (the host-friendly "inflict burn" call).
-    "status_apply",
+    # definition + stack mode (the host-friendly "inflict burn" call),
+    # honoring resistance/immunity. status_force is the same but ignores
+    # resistance (the level/increment lands regardless).
+    "status_apply", "status_force",
     # Status tags / resistance introspection + universal counters.
     "status_tags", "status_has_tag", "statuses_with_tag",
     "status_resist_of", "is_status_immune",
@@ -3603,28 +3605,41 @@ class FormulaEngine:
             self._note_affected(eid)
             return True
 
-        def _status_apply(eid_t: Any, name: Any,
-                          level: Any = None, duration: Any = None) -> bool:
-            """status_apply(eid, name, level=None, duration=None): apply a
-            status, honoring its definition's stack mode (else the
-            status_default_stack rule) when already present. Seeds the
-            definition's default data on a first application. Returns True
-            (always applied/updated; a 'none' stack mode on a present
-            status is a silent no-op)."""
+        def _do_status_apply(fname: str, eid_t: Any, name: Any,
+                             level: Any, duration: Any, force: bool) -> bool:
             eid = _eid(eid_t)
             if not isinstance(name, str):
-                raise FormulaError("status_apply(eid, name, ...): name must be a string.")
+                raise FormulaError(f"{fname}(eid, name, ...): name must be a string.")
             for label, v in (("level", level), ("duration", duration)):
                 if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
-                    raise FormulaError(f"status_apply(...): {label} must be a number.")
+                    raise FormulaError(f"{fname}(...): {label} must be a number.")
             lv = None if level is None else int(level)
             du = None if duration is None else int(duration)
             try:
-                match.apply_status(eid, name, lv, du)
+                match.apply_status(eid, name, lv, du, force=force)
             except (VTTError, NotFound) as ex:
                 raise FormulaError(str(ex))
             self._note_affected(eid)
             return True
+
+        def _status_apply(eid_t: Any, name: Any,
+                          level: Any = None, duration: Any = None) -> bool:
+            """status_apply(eid, name, level=None, duration=None): apply a
+            status, honoring its definition's stack mode (else the
+            status_default_stack rule) when already present AND the target's
+            resistance/immunity (an immune or fully-resisted application is a
+            silent no-op; resistance reduces the applied level). Seeds the
+            definition's default data on a first application. Returns True."""
+            return _do_status_apply("status_apply", eid_t, name, level, duration, False)
+
+        def _status_force(eid_t: Any, name: Any,
+                          level: Any = None, duration: Any = None) -> bool:
+            """status_force(eid, name, level=None, duration=None): like
+            status_apply but IGNORES the target's resistance/immunity — the
+            level/increment lands at full strength regardless (cross-status
+            blocked_by and the part immune/redirect rules are still honored).
+            The 'forced affliction' counterpart to status_apply. Returns True."""
+            return _do_status_apply("status_force", eid_t, name, level, duration, True)
 
         ns["status_has"]      = _status_has
         ns["status_has_path"] = _status_has_path
@@ -3634,6 +3649,7 @@ class FormulaEngine:
         ns["status_add"]      = _status_add
         ns["status_remove"]   = _status_remove
         ns["status_apply"]    = _status_apply
+        ns["status_force"]    = _status_force
 
         # ---- status tags / resistance introspection ----
         def _status_tags(name: Any) -> list:

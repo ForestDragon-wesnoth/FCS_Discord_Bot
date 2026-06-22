@@ -1791,13 +1791,32 @@ More shipped work (continuing the list above):
     nested-action rollback; status counter auto-removal; formula sandbox
     `_who_arg` HOOK_CONTEXT handling + `normalize_body_source` at every body
     boundary; dispatch gate (no batch/foreach/macro/action bypass).
-  - **OPEN QUESTION raised with the user (status resistance + `add_level`):**
-    `status_resist` reduces the applied LEVEL by a flat amount, gated on
-    `(name not in e.status or new_level is not None)`. So an implicit +1
-    (`!status apply x poison` with no level) to an ALREADY-PRESENT `add_level`
-    status bypasses resistance, while an explicit level is resisted — an
-    asymmetry. Intended behavior was ambiguous → asked the user rather than
-    guessing. (Resolution + a scenario to follow once decided.)
+  - **OPEN QUESTION raised with the user → RESOLVED (status resistance +
+    `add_level`).** The old gate `(name not in e.status or new_level is not
+    None)` let an implicit +1 (`!status apply x poison` with no level) on an
+    already-present `add_level` status BYPASS resistance, while an explicit
+    level was resisted — an asymmetry. The user's call: keep `apply_status`
+    consistently resistance-aware AND add a SEPARATE force primitive that
+    ignores resistance (resistance stays LEVEL-only — no duration channel).
+    Shipped (scenarios 496-497):
+    - **Resistance is now mode-aware** via `Match._resistance_applies(e, name,
+      sdef, level_given)`: a flat level-reduction resistance applies only when
+      a level is actually added/set — a FIRST application, an `add_level`
+      increment (implicit +1 OR explicit), or a `replace` with an explicit
+      level. `refresh`/`extend`/`none` set no level, so resistance no longer
+      touches them (fixes BOTH the implicit-+1 bypass AND a previously-possible
+      bug where an explicit level on a `refresh` ran the resistance gate and
+      could no-op the duration refresh). So an implicit `add_level` +1 with
+      resist≥1 is now fully resisted (consistent); `status_apply_block_reason`
+      shares the same helper so command feedback matches.
+    - **`force` path** — `apply_status(..., force=True)` skips the immunity +
+      resistance gating entirely (the level/increment lands regardless);
+      cross-status `blocked_by` and the part immune/redirect rules are STILL
+      honored (force is specifically the "ignore resistance" axis, not a
+      bypass-everything hammer). Surfaced as the `status_force(eid, name[,
+      level, duration])` formula primitive (twin of `status_apply`) and the
+      `!status force <eid> <name> [level] [duration]` command (host-gated like
+      apply; reply reads "Force-applied").
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

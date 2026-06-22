@@ -7078,7 +7078,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 @registry.command(
     "status",
     usage=("!status <def|drop|tick|when|stack|maxlevel|data|tags|removes|"
-           "blockedby|resist|counter|list|info|apply> ..."),
+           "blockedby|resist|counter|list|info|apply|force> ..."),
     desc=(
         "Status DEFINITIONS — self-describing statuses. Define a status "
         "once (its per-tick effect, when it ticks, how it stacks, its max "
@@ -7091,9 +7091,11 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         "deliberately not built in). Apply with `!status apply <eid> <name> "
         "[level] [duration]` (or the status_apply formula primitive), which "
         "honors the definition's stack mode (else the status_default_stack "
-        "rule). Raw per-entity instance editing stays on `!ent status`. "
-        "Subcommands: def, drop, tick, when, stack, maxlevel, data, list, "
-        "info, apply."
+        "rule) AND the target's resistance/immunity. `force` is the same but "
+        "IGNORES resistance/immunity (the level/increment lands regardless; "
+        "cross-status blocks still apply). Raw per-entity instance editing "
+        "stays on `!ent status`. Subcommands: def, drop, tick, when, stack, "
+        "maxlevel, data, list, info, apply, force."
     ),
 )
 async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -7287,8 +7289,12 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"**status def `{name}`**\n```{json.dumps(d, indent=2, sort_keys=True)}\n```"
         )
 
-    if sub == "apply":
-        if await return_help_if_not_enough_args(ctx, args, 3, "status", "apply"):
+    if sub in ("apply", "force"):
+        # `force` is the resistance-ignoring twin of `apply`: it bypasses
+        # immunity + resistance so the level/increment lands regardless
+        # (cross-status blocked_by and part immune/redirect still apply).
+        force = (sub == "force")
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", sub):
             return
         eid = _resolve_eid(m, args[1])
         name = args[2]
@@ -7304,13 +7310,15 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             except ValueError:
                 return await ctx.send("❌ duration must be an integer.")
         try:
-            event_log = m.apply_status(eid, name, level, duration)
+            event_log = m.apply_status(eid, name, level, duration, force=force)
         except (VTTError, NotFound) as ex:
             return await ctx.send(f"❌ {ex}")
         e = m.entities[eid]
         tail = ("\n" + "\n".join(event_log)) if event_log else ""
+        verb = "Force-applied" if force else "Applied"
         # Body-part status rules can no-op (immune) or redirect to the
         # parent — reflect that instead of a misleading "Applied to <part>".
+        # These hold even for force (force is the resistance axis, not parts).
         if e.is_part and name not in e.status:
             if name in m._part_status_names(e, "__status_immune", "part_status_immune"):
                 return await ctx.send(
@@ -7319,15 +7327,22 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return await ctx.send(
                     f"`{name}` on body part `{eid}` redirected to its parent "
                     f"`{e.part_of}`.{tail}")
-        # Immunity / blocked_by / full resistance — report instead of a
-        # misleading "Applied".
+        # Report why nothing applied. For `apply` that's immunity / blocked_by
+        # / full resistance; for `force` only a cross-status blocked_by can
+        # still stop it (immunity + resistance are bypassed).
         if name not in e.status:
-            reason = m.status_apply_block_reason(eid, name, level)
+            if force:
+                sdef = m.status_definitions.get(name) or {}
+                blockers = m._statuses_matching_tokens(
+                    e, m._token_list(sdef.get("blocked_by")))
+                reason = f"`{name}` blocked by `{blockers[0]}`" if blockers else None
+            else:
+                reason = m.status_apply_block_reason(eid, name, level)
             if reason:
                 return await ctx.send(f"`{eid}`: {reason} — no effect.{tail}")
         inst = e.status.get(name, {})
         return await ctx.send(
-            f"Applied `{name}` to `{eid}` "
+            f"{verb} `{name}` to `{eid}` "
             f"(level={inst.get('level', '?')}, "
             f"duration={inst.get('duration', '∞')}).{tail}"
         )

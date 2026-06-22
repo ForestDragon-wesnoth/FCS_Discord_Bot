@@ -12729,3 +12729,61 @@ stack: dragon, wing (a glued part), AND the rider all end at x=7. Before the
 fix, `_restamp_parts_for` synced a moved part's anchor + auras but not its
 RIDERS, so the rider was left behind at x=5 (it only restamped riders of the
 top-level mover, not of a part-that-is-a-vehicle).
+
+
+SCENARIO 496 — Status resistance is mode-consistent (add_level +1 resisted; refresh not blocked)
+--------------------------------------------------------------------
+
+!match new sr StatusResist 8 4
+!match use sr
+!ent add knight Knight 40 2 2 5
+!ent set_var knight status_resist.poison 2
+!status def poison
+!status stack poison add_level
+!status apply knight poison 5
+!eval "status_get('knight','poison','level')"
+!status apply knight poison
+!eval "status_get('knight','poison','level')"
+!ent add mage Mage 30 3 3 5
+!status def chill
+!status stack chill refresh
+!status apply mage chill 1 3
+!ent set_var mage status_resist.chill 5
+!status apply mage chill 1 8
+!eval "status_get('mage','chill','duration')"
+
+Expected: knight resists poison by 2. `apply poison 5` lands at level 3 (5-2).
+`apply poison` (implicit +1) on the already-present poison is NOW also resisted:
+1-2 <= 0 so it is fully resisted and the level stays 3 (before the fix the
+implicit +1 bypassed resistance and it would have become 4). Separately, mage's
+chill (refresh mode) is applied at duration 3; after granting chill resist 5,
+`apply chill 1 8` still REFRESHES to duration 8 — a duration-only refresh is
+never blocked by a level-reduction resistance (before the fix an explicit level
+on a refresh wrongly ran the resistance gate and could no-op the refresh).
+
+
+SCENARIO 497 — status force ignores resistance and immunity
+--------------------------------------------------------------------
+
+!match new sf StatusForce 8 4
+!match use sf
+!ent add ogre Ogre 50 2 2 5
+!ent set_var ogre status_resist.poison 2
+!ent set_var ogre status_immune fear
+!status def poison
+!status stack poison add_level
+!status def fear
+!status apply ogre poison 5
+!eval "status_get('ogre','poison','level')"
+!status force ogre poison 5
+!eval "status_get('ogre','poison','level')"
+!status apply ogre fear
+!eval "status_has('ogre','fear')"
+!status force ogre fear
+!eval "status_has('ogre','fear')"
+
+Expected: ogre resists poison by 2 and is immune to fear. `apply poison 5` →
+level 3 (resisted). `force poison 5` IGNORES resistance, so the +5 increment
+lands in full: level 3+5 = 8. `apply fear` is a no-op (immune) so
+`status_has('ogre','fear')` = False; `force fear` bypasses immunity and applies
+it, so `status_has('ogre','fear')` = True.
