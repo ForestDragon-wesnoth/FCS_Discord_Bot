@@ -529,7 +529,13 @@ def _roll_impl(rng, spec: Any) -> int:
             if keep_mode is not None:
                 k = max(0, min(keep_n, len(dice)))
                 dice.sort()
-                kept = dice[-k:] if keep_mode == "kh" else dice[:k]
+                # k==0 must keep NOTHING; dice[-0:] is the WHOLE list (Python
+                # negative-zero slice quirk), so guard it explicitly — only the
+                # kl branch (dice[:0]) is naturally correct at k==0.
+                if k == 0:
+                    kept = []
+                else:
+                    kept = dice[-k:] if keep_mode == "kh" else dice[:k]
             else:
                 kept = dice
             total += sgn * sum(kept)
@@ -1407,8 +1413,10 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     "status_has", "status_has_path", "status_get",
     "status_set", "status_del", "status_add", "status_remove",
     # status_apply(eid, name[, level, duration]) -> apply a status via its
-    # definition + stack mode (the host-friendly "inflict burn" call).
-    "status_apply",
+    # definition + stack mode (the host-friendly "inflict burn" call),
+    # honoring resistance/immunity. status_force is the same but ignores
+    # resistance (the level/increment lands regardless).
+    "status_apply", "status_force",
     # Status tags / resistance introspection + universal counters.
     "status_tags", "status_has_tag", "statuses_with_tag",
     "status_resist_of", "is_status_immune",
@@ -3294,16 +3302,11 @@ class FormulaEngine:
         def _ent_dist(ref_e, oe, mode):
             # Footprint-aware entity-to-entity distance = the gap between
             # the two axis-aligned footprint rectangles (nearest-cell
-            # distance), combined per `mode`. Computed in closed form: the
-            # per-axis gap is 0 when the rectangles overlap on that axis,
-            # else the separation; distance(0,0,gx,gy,mode) then applies
-            # the same metric as point distance. For two 1×1 entities this
+            # distance), combined per `mode`. Routed through the shared
+            # Match.entity_gap_distance so the spatial enumerators and the
+            # `near:` find predicate agree. For two 1×1 entities this
             # reduces to the old anchor-to-anchor distance.
-            rw, rh = match.entity_footprint(ref_e)
-            ow, oh = match.entity_footprint(oe)
-            gx = max(0, ref_e.x - (oe.x + ow - 1), oe.x - (ref_e.x + rw - 1))
-            gy = max(0, ref_e.y - (oe.y + oh - 1), oe.y - (ref_e.y + rh - 1))
-            return _distance(0, 0, gx, gy, mode)
+            return match.entity_gap_distance(ref_e, oe, mode)
 
         def _entities_within(eid_token: Any, n: Any,
                              mode: Any = "square_radius_distance",
@@ -3354,7 +3357,9 @@ class FormulaEngine:
             revisiting, within max_jump cells (0 / None = unlimited). The
             chain-lightning / bounce primitive: loop it and apply your own
             per-hop falloff (the GM owns the damage). `relation` filters
-            eligibility (any / hostile / ally / same_team / attackable);
+            eligibility (any / hostile / ally / same_team / attackable)
+            relative to the ORIGIN `from_eid` (so a `hostile` chain bounces
+            among the origin's enemies every hop, not the prior link's);
             distance is the square-radius (Chebyshev) gap. Near->far."""
             start = _eid(from_token)
             if match.entities.get(start) is None:
@@ -3371,12 +3376,15 @@ class FormulaEngine:
             cur = start
             out: list = []
             while len(out) < n:
+                # Eligibility (relation) is judged against the ORIGIN; the jump
+                # distance is measured from the PREVIOUS link (`cur`).
+                cur_e = match.entities.get(cur)
                 best_id = ""
                 best_d = None
-                for oid, oe, ref_e in _candidates(cur, relation):
+                for oid, oe, _ref in _candidates(start, relation):
                     if oid in visited:
                         continue
-                    d = _ent_dist(ref_e, oe, "square_radius_distance")
+                    d = _ent_dist(cur_e, oe, "square_radius_distance")
                     if cap is not None and d > cap:
                         continue
                     if best_d is None or d < best_d or (d == best_d and oid < best_id):
@@ -3608,28 +3616,41 @@ class FormulaEngine:
             self._note_affected(eid)
             return True
 
-        def _status_apply(eid_t: Any, name: Any,
-                          level: Any = None, duration: Any = None) -> bool:
-            """status_apply(eid, name, level=None, duration=None): apply a
-            status, honoring its definition's stack mode (else the
-            status_default_stack rule) when already present. Seeds the
-            definition's default data on a first application. Returns True
-            (always applied/updated; a 'none' stack mode on a present
-            status is a silent no-op)."""
+        def _do_status_apply(fname: str, eid_t: Any, name: Any,
+                             level: Any, duration: Any, force: bool) -> bool:
             eid = _eid(eid_t)
             if not isinstance(name, str):
-                raise FormulaError("status_apply(eid, name, ...): name must be a string.")
+                raise FormulaError(f"{fname}(eid, name, ...): name must be a string.")
             for label, v in (("level", level), ("duration", duration)):
                 if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
-                    raise FormulaError(f"status_apply(...): {label} must be a number.")
+                    raise FormulaError(f"{fname}(...): {label} must be a number.")
             lv = None if level is None else int(level)
             du = None if duration is None else int(duration)
             try:
-                match.apply_status(eid, name, lv, du)
+                match.apply_status(eid, name, lv, du, force=force)
             except (VTTError, NotFound) as ex:
                 raise FormulaError(str(ex))
             self._note_affected(eid)
             return True
+
+        def _status_apply(eid_t: Any, name: Any,
+                          level: Any = None, duration: Any = None) -> bool:
+            """status_apply(eid, name, level=None, duration=None): apply a
+            status, honoring its definition's stack mode (else the
+            status_default_stack rule) when already present AND the target's
+            resistance/immunity (an immune or fully-resisted application is a
+            silent no-op; resistance reduces the applied level). Seeds the
+            definition's default data on a first application. Returns True."""
+            return _do_status_apply("status_apply", eid_t, name, level, duration, False)
+
+        def _status_force(eid_t: Any, name: Any,
+                          level: Any = None, duration: Any = None) -> bool:
+            """status_force(eid, name, level=None, duration=None): like
+            status_apply but IGNORES the target's resistance/immunity — the
+            level/increment lands at full strength regardless (cross-status
+            blocked_by and the part immune/redirect rules are still honored).
+            The 'forced affliction' counterpart to status_apply. Returns True."""
+            return _do_status_apply("status_force", eid_t, name, level, duration, True)
 
         ns["status_has"]      = _status_has
         ns["status_has_path"] = _status_has_path
@@ -3639,6 +3660,7 @@ class FormulaEngine:
         ns["status_add"]      = _status_add
         ns["status_remove"]   = _status_remove
         ns["status_apply"]    = _status_apply
+        ns["status_force"]    = _status_force
 
         # ---- status tags / resistance introspection ----
         def _status_tags(name: Any) -> list:
@@ -5433,17 +5455,20 @@ class FormulaEngine:
         def _entities_in_area(x: Any, y: Any, n: Any,
                               mode: Any = "square_radius_distance") -> list:
             """entities_in_area(x, y, n, mode): coord-rooted version of
-            entities_within. Returns alive entity ids whose position is
-            within distance n of the POINT (x, y), sorted by
-            (distance, id). Use when the area is centered on a tile
-            (e.g. AOE spell impact) instead of on an entity."""
-            # Validate the same way distance() does — pass through and
-            # let it raise if the args are bad.
+            entities_within. Returns alive entity ids whose FOOTPRINT
+            comes within distance n of the POINT (x, y) (nearest covered
+            cell, like entities_within measures the nearest-cell gap),
+            sorted by (distance, id). Use when the area is centered on a
+            tile (e.g. AOE spell impact) instead of on an entity."""
+            # Validate x, y, mode the same way distance() does (raises on
+            # bad input); then measure the footprint-aware nearest-cell gap
+            # per entity so a large body partly inside the radius counts.
+            _distance(x, y, x, y, mode)
             scored = []
             for eid, e in match.entities.items():
                 if not e.is_alive or e.is_glued_part or e.is_hidden_rider:
                     continue
-                d = _distance(x, y, e.x, e.y, mode)
+                d = match.cell_entity_distance(x, y, e, mode)
                 if d <= n:
                     scored.append((d, eid))
             scored.sort(key=lambda t: (t[0], t[1]))

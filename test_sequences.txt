@@ -12493,3 +12493,519 @@ real statblock is untouched: `var_get('spy','hp')` = 40 and
 `var_get('spy','max_hp')` = 40 (formulas, targeting, and damage all read the
 real vars — the disguise only changes what is rendered). The blue `!list` still
 presents the fake 5/5 Villager, confirming display and mechanics are decoupled.
+
+
+SCENARIO 486 — find: near:/within: spatial predicates (footprint-aware)
+--------------------------------------------------------------------
+
+!match new findspat FindSpatial 12 12
+!match use findspat
+!ent add boss Boss 50 5 5 1
+!ent set_var boss footprint_w 2
+!ent set_var boss footprint_h 2
+!ent add a1 A1 10 7 5 2
+!ent add a2 A2 10 9 5 2
+!ent add a3 A3 10 5 9 2
+!ent add far Far 10 11 11 2
+!find near:boss:1
+!find near:boss:3
+!find within:7:5:0
+!find within:6:6:1
+
+Expected: boss occupies the 2×2 block (5,5)-(6,6); distances are the
+footprint-aware nearest-cell gap (Chebyshev). `near:boss:1` matches boss
+itself (gap 0) and a1 at (7,5) (gap 1) — 2 matches. `near:boss:3` adds a2
+(gap 3) and a3 (gap 3) but NOT far (gap 5) — 4 matches. `within:7:5:0`
+matches only a1 (it occupies (7,5); boss's nearest cell is 1 away) — 1 match.
+`within:6:6:1` matches boss (covers (6,6), gap 0) and a1 (gap 1) — 2 matches.
+
+
+SCENARIO 487 — find: spatial predicate AND-ed with var/status; error cases
+--------------------------------------------------------------------
+
+!match new findspat2 FindSpatial2 12 12
+!match use findspat2
+!ent add boss Boss 50 5 5 1
+!ent add red1 Red1 10 6 5 2
+!ent set_var red1 team red
+!ent add red2 Red2 10 10 5 2
+!ent set_var red2 team red
+!ent add blue1 Blue1 10 6 6 2
+!ent set_var blue1 team blue
+!find team=red near:boss:2
+!find near:ghost:2
+!find near:boss:x
+!find within:5:5:2
+
+Expected: `team=red near:boss:2` ANDs both — red1 (team red, gap 1) matches but
+red2 (team red, gap 5) and blue1 (gap 1 but wrong team) do not — 1 match.
+`near:ghost:2` errors with ❌ (reference entity `ghost` not found).
+`near:boss:x` errors with ❌ (radius must be a number). `within:5:5:2` matches
+boss (gap 0), red1 (gap 1) and blue1 (gap 1) — 3 matches (no team filter).
+
+
+SCENARIO 488 — foreach: bulk-apply over a selector, one undo entry
+--------------------------------------------------------------------
+
+!match new feach Foreach 8 8
+!match use feach
+!ent add r1 R1 30 1 1 1
+!ent set_var r1 team red
+!ent add r2 R2 30 2 2 2
+!ent set_var r2 team red
+!ent add r3 R3 30 3 3 2
+!ent set_var r3 team red
+!ent add b1 B1 30 4 4 2
+!ent set_var b1 team blue
+!foreach team=red ; ent set_var $id hp 7
+!find hp=7
+!history undo command
+!find hp=7
+
+Expected: the foreach resolves the 3 red entities first, then runs `ent set_var
+<id> hp 7` for each — `!find hp=7` lists r1, r2, r3 (3 matches), b1 untouched.
+The whole sweep is ONE history entry, so a single `!history undo command`
+reverts all three back to hp 30; the final `!find hp=7` reports no matches.
+
+
+SCENARIO 489 — foreach: spatial selector + $x/$y/$name substitution
+--------------------------------------------------------------------
+
+!match new feach2 Foreach2 10 10
+!match use feach2
+!ent add boss Boss 50 5 5 1
+!ent add m1 M1 10 4 5 2
+!ent add m2 M2 10 6 6 2
+!ent add far Far 10 9 9 2
+!foreach near:boss:1 ; ent set_var $id px $x
+!eval "var_get('boss', 'px')"
+!eval "var_get('m1', 'px')"
+!eval "var_get('m2', 'px')"
+!find px=9
+
+Expected: `near:boss:1` matches boss (gap 0), m1 at (4,5) (gap 1) and m2 at
+(6,6) (gap 1), but not far (gap 4). Each gets its OWN x stored via `$x`:
+`var_get('boss','px')` = 5, `var_get('m1','px')` = 4, `var_get('m2','px')` = 6.
+far is untouched, so `!find px=9` reports no matches (proving the substitution
+is per-entity and the selector excluded far).
+
+
+SCENARIO 490 — foreach: error + empty-result handling
+--------------------------------------------------------------------
+
+!match new feach3 Foreach3 8 8
+!match use feach3
+!ent add r1 R1 30 1 1 1
+!ent set_var r1 team red
+!foreach team=red
+!foreach ; ent set_var $id hp 1
+!foreach team=blue ; ent set_var $id hp 1
+!foreach team=red ; ent set_var $id hp 1
+!find hp=1
+
+Expected: `!foreach team=red` (no `;`) errors ❌ asking for a `;` separator.
+`!foreach ; ...` (empty selector) errors ❌ (selector empty). `!foreach
+team=blue ; ...` matches nothing → "No entities match; nothing to do." (no
+error). `!foreach team=red ; ent set_var $id hp 1` applies to r1, so the final
+`!find hp=1` lists r1 (1 match).
+
+
+SCENARIO 491 — Audit: group-move fires tile hooks for the WHOLE footprint
+--------------------------------------------------------------------
+
+!match new agm AuditGroupMove 12 6
+!match use agm
+!ent add dragon Dragon 50 3 3 1
+!ent set_var dragon footprint_w 2
+!ent set_var dragon footprint_h 2
+!ent group new g
+!ent group add g dragon
+!tile hook add 5 3 on_enter 'entity[self].hp = entity[self].hp - 1'
+!tile hook add 6 3 on_enter 'entity[self].hp = entity[self].hp - 1'
+!tile hook add 5 4 on_enter 'entity[self].hp = entity[self].hp - 1'
+!tile hook add 6 4 on_enter 'entity[self].hp = entity[self].hp - 1'
+!ent move group:g right right
+!eval "var_get('dragon','hp')"
+
+Expected: the 2×2 dragon (anchor (3,3), covering (3,3)-(4,4)) is group-moved
+right two steps to anchor (5,3). Each step fires on_enter for the cells the
+footprint NEWLY covers: step 1 enters (5,3)+(5,4), step 2 enters (6,3)+(6,4) —
+all four are -1 HP tiles. So `var_get('dragon','hp')` = 46. (Before the fix the
+group mover fired tile hooks at the ANCHOR cell only, so the dragon would have
+taken at most 1 hit — the right column's damage was silently skipped.)
+
+
+SCENARIO 492 — Audit: entities_in_area is footprint-aware (nearest cell)
+--------------------------------------------------------------------
+
+!match new aia AuditArea 16 16
+!match use aia
+!ent add dragon Dragon 50 10 10 1
+!ent set_var dragon footprint_w 4
+!ent set_var dragon footprint_h 4
+!ent add far Far 10 1 1 2
+!eval "entities_in_area(12, 12, 0)"
+!eval "entities_in_area(14, 14, 1)"
+!eval "entities_in_area(14, 14, 0)"
+
+Expected: the 4×4 dragon covers (10,10)-(13,13); far is at (1,1).
+`entities_in_area(12,12,0)` = [dragon] (the point is INSIDE the footprint, gap
+0). `entities_in_area(14,14,1)` = [dragon] (nearest cell (13,13) is Chebyshev 1
+from (14,14)). `entities_in_area(14,14,0)` = [] (gap 1 > 0). far never matches.
+(Before the fix the distance used the anchor (10,10) — gap 4 — so all three
+queries would have wrongly EXCLUDED the dragon.)
+
+
+SCENARIO 493 — Audit: group move fires on_entity_step per step (parity)
+--------------------------------------------------------------------
+
+!match new ags AuditGroupStep 14 6
+!match use ags
+!ent add runner Runner 30 2 2 1
+!ent set_var runner steps 0
+!passive add runner stepcount on_entity_step "entity[self].steps = entity[self].steps + 1"
+!ent add big Big 30 6 2 2
+!ent set_var big footprint_w 2
+!ent set_var big footprint_h 2
+!ent set_var big steps 0
+!passive add big stepcount on_entity_step "entity[self].steps = entity[self].steps + 1"
+!ent group new g
+!ent group add g runner big
+!ent move group:g right right right
+!eval "var_get('runner','steps')"
+!eval "var_get('big','steps')"
+
+Expected: the group moves 3 steps right. on_entity_step now fires once per STEP
+per member (parity with single-entity move_dirs, which group move previously
+lacked) — so `var_get('runner','steps')` = 3 and `var_get('big','steps')` = 3.
+The 2×2 member fires once per step (the hook is per-step, not per covered cell),
+confirming the fire is footprint-independent.
+
+
+
+
+
+
+SCENARIO 494 — Audit: undo of a nested-var write restores the prior value
+--------------------------------------------------------------------
+
+!match new nvu NestedVarUndo 6 6
+!match use nvu
+!ent add e E 30 1 1 1
+!ent set_var e inventory.gold 100
+!ent set_var e inventory.potions 3
+!ent set_var e inventory.gold 50
+!history undo command
+!eval "var_get('e','inventory.gold')"
+!eval "var_get('e','inventory.potions')"
+
+Expected: undoing the `inventory.gold 50` command restores `inventory.gold` to
+100 (and leaves the sibling `inventory.potions` = 3 untouched). Before the fix,
+`Entity.to_dict` shallow-copied `vars`, so a command snapshot SHARED the live
+nested `inventory` dict; the in-place write at `_set_path` then corrupted the
+snapshot, and undo restored the wrong (mutated) value — the same root cause also
+broke transactional action rollback of any dotted-path var. Now `vars` is
+deepcopied (like `status` beside it), so each snapshot is independent.
+
+
+SCENARIO 495 — Audit: a rider on a body-part vehicle follows the parent's move
+--------------------------------------------------------------------
+
+!match new pvr PartVehicleRider 12 8
+!match use pvr
+!ent add dragon Dragon 50 5 5 1
+!part add dragon wing Wing 0 0
+!ent set_var wing slots.seat.capacity 1
+!ent add rider Rider 10 7 7 2
+!mount rider wing seat
+!ent move dragon 2 right
+!eval "coord_x(entity_center('dragon'))"
+!eval "coord_x(entity_center('wing'))"
+!eval "coord_x(entity_center('rider'))"
+
+Expected: `wing` is a body PART of the dragon that is ALSO a vehicle; `rider`
+is mounted in its `seat` slot. Moving the dragon 2 right carries the whole
+stack: dragon, wing (a glued part), AND the rider all end at x=7. Before the
+fix, `_restamp_parts_for` synced a moved part's anchor + auras but not its
+RIDERS, so the rider was left behind at x=5 (it only restamped riders of the
+top-level mover, not of a part-that-is-a-vehicle).
+
+
+SCENARIO 496 — Status resistance is mode-consistent (add_level +1 resisted; refresh not blocked)
+--------------------------------------------------------------------
+
+!match new sr StatusResist 8 4
+!match use sr
+!ent add knight Knight 40 2 2 5
+!ent set_var knight status_resist.poison 2
+!status def poison
+!status stack poison add_level
+!status apply knight poison 5
+!eval "status_get('knight','poison','level')"
+!status apply knight poison
+!eval "status_get('knight','poison','level')"
+!ent add mage Mage 30 3 3 5
+!status def chill
+!status stack chill refresh
+!status apply mage chill 1 3
+!ent set_var mage status_resist.chill 5
+!status apply mage chill 1 8
+!eval "status_get('mage','chill','duration')"
+
+Expected: knight resists poison by 2. `apply poison 5` lands at level 3 (5-2).
+`apply poison` (implicit +1) on the already-present poison is NOW also resisted:
+1-2 <= 0 so it is fully resisted and the level stays 3 (before the fix the
+implicit +1 bypassed resistance and it would have become 4). Separately, mage's
+chill (refresh mode) is applied at duration 3; after granting chill resist 5,
+`apply chill 1 8` still REFRESHES to duration 8 — a duration-only refresh is
+never blocked by a level-reduction resistance (before the fix an explicit level
+on a refresh wrongly ran the resistance gate and could no-op the refresh).
+
+
+SCENARIO 497 — status force ignores resistance and immunity
+--------------------------------------------------------------------
+
+!match new sf StatusForce 8 4
+!match use sf
+!ent add ogre Ogre 50 2 2 5
+!ent set_var ogre status_resist.poison 2
+!ent set_var ogre status_immune fear
+!status def poison
+!status stack poison add_level
+!status def fear
+!status apply ogre poison 5
+!eval "status_get('ogre','poison','level')"
+!status force ogre poison 5
+!eval "status_get('ogre','poison','level')"
+!status apply ogre fear
+!eval "status_has('ogre','fear')"
+!status force ogre fear
+!eval "status_has('ogre','fear')"
+
+Expected: ogre resists poison by 2 and is immune to fear. `apply poison 5` →
+level 3 (resisted). `force poison 5` IGNORES resistance, so the +5 increment
+lands in full: level 3+5 = 8. `apply fear` is a no-op (immune) so
+`status_has('ogre','fear')` = False; `force fear` bypasses immunity and applies
+it, so `status_has('ogre','fear')` = True.
+
+
+SCENARIO 498 — Dice: kh0 / kl0 keep ZERO dice (no negative-zero-slice leak)
+--------------------------------------------------------------------------
+
+!match new dz DiceZero 4 4
+!match use dz
+!eval "roll('4d6kh0')"
+!eval "roll('2d6kl0')"
+!eval "roll('5d8kh0') + roll('3d10kl0')"
+
+Expected: keeping the HIGHEST or LOWEST zero dice yields 0 every time, for any
+roll. `roll('4d6kh0')` = 0 and `roll('2d6kl0')` = 0, and their analogues sum to
+0. Before the fix `dice[-0:]` (the kh branch with k==0) was Python's negative-
+zero slice = the WHOLE list, so `4d6kh0` wrongly returned the sum of all four
+dice; only the kl branch (`dice[:0]`) was naturally correct.
+
+
+SCENARIO 499 — Undo restores an in-place TILE edit (snapshot deepcopy)
+---------------------------------------------------------------------
+
+!match new tu TileUndo 5 5
+!match use tu
+!tile set 1 1 glyph A
+!tile set 1 1 glyph B
+!eval "tile_get(1, 1, 'glyph')"
+!history undo command
+!eval "tile_get(1, 1, 'glyph')"
+
+Expected: the tile glyph is `B` after the second set; `!history undo command`
+reverts the last command, restoring glyph `A`. Before the fix, Match.to_dict
+stored each tile's data dict BY REFERENCE, so the in-place second edit also
+mutated the prior command snapshot — defeating change-detection (pre==post, no
+snapshot) and corrupting rollback, so undo could not bring back `A`.
+
+
+SCENARIO 500 — Undo restores an in-place ZONE edit (snapshot deepcopy)
+---------------------------------------------------------------------
+
+!match new zu ZoneUndo 5 5
+!match use zu
+!zone new gas
+!zone add gas 2 2
+!zone set gas dmg 4
+!zone set gas dmg 9
+!eval "zone_get('gas', 'dmg')"
+!history undo command
+!eval "zone_get('gas', 'dmg')"
+
+Expected: `dmg` is 9 after the second set; `!history undo command` reverts the
+last command, restoring `dmg` 4. Before the fix, _zone_to_dict stored the zone
+`data`/`hooks` dicts BY REFERENCE (only `cells` was rebuilt), so the in-place
+second edit corrupted the prior snapshot and undo could not restore 4.
+
+
+SCENARIO 501 — Macro arg substitution: $10+ and single-pass (no re-expansion)
+----------------------------------------------------------------------------
+
+!match new mc MacroSubst 5 5
+!match use mc
+!ent add hero Hero 10 1 1 1
+!macro set tenth !ent set_var hero n $10
+!macro run tenth a b c d e f g h i J
+!eval "var_get('hero', 'n')"
+!macro set echoall !ent set_var hero m $@
+!macro run echoall $1x
+!eval "var_get('hero', 'm')"
+
+Expected: `$10` expands to the TENTH macro arg ("J"), not `$1` followed by a
+literal `0` ("a0"); so `var_get('hero','n')` = "J". `$@` and the positional
+tokens are substituted in a SINGLE pass, so an arg value that itself contains a
+token is NOT re-expanded: running with `$1x`, `$@` yields the literal "$1x", so
+`var_get('hero','m')` = "$1x" (pre-fix it became "$1xx" — the `$1` inside the
+value got re-substituted).
+
+
+SCENARIO 502 — chain_targets: relation is judged vs the ORIGIN, not the prior link
+---------------------------------------------------------------------------------
+
+!match new ct ChainRel 8 4
+!match use ct
+!ent add cst Caster 30 1 1 5
+!ent set_var cst team red
+!ent add en1 Enemy1 30 2 1 5
+!ent set_var en1 team blue
+!ent add al1 Ally1 30 3 1 5
+!ent set_var al1 team red
+!ent add en2 Enemy2 30 4 1 5
+!ent set_var en2 team blue
+!eval "'al1' in chain_targets('cst', 3, 0, 'hostile')"
+!eval "'en2' in chain_targets('cst', 3, 0, 'hostile')"
+
+Expected: a `hostile` chain out of the red caster bounces ONLY among the
+caster's enemies (blue), every hop measured from the previous link. The line is
+cst(red) en1(blue) al1(red) en2(blue): the chain is [en1, en2] — it skips the
+red ally al1 even though al1 is the nearest entity to en1. So `'al1' in ...` =
+False and `'en2' in ...` = True. Before the fix, `relation` was judged vs the
+PREVIOUS link, so hop 2 looked for an enemy-of-en1 (an ally of the caster) and
+al1 would have been chained.
+
+
+SCENARIO 503 — !ent swap honors the mount redirect (driver swaps the vehicle)
+----------------------------------------------------------------------------
+
+!match new sm SwapMount 12 8
+!match use sm
+!ent add car Car 30 3 3 0
+!ent set_var car slots.driver.capacity 1
+!ent set_var car slots.driver.controls_movement true
+!ent set_var car slots.seats.capacity 2
+!ent add drv Driver 10 1 1 5
+!mount drv car driver
+!ent add rock Rock 10 8 3 0
+!ent swap drv rock
+!eval "entity[car].x"
+!eval "entity[rock].x"
+!eval "is_mounted('drv')"
+!ent add p1 Pass 10 5 5 5
+!mount p1 car seats
+!ent swap p1 rock
+!eval "is_mounted('p1')"
+!eval "entity[rock].x"
+
+Expected: drv rides a `controls_movement` slot, so `!ent swap drv rock`
+REDIRECTS to the car — the whole rig swaps with rock. car moves (3,3)->(8,3)
+and rock (8,3)->(3,3); drv is carried and stays mounted (is_mounted True). A
+plain passenger can't be swapped on its own: `!ent swap p1 rock` is REFUSED with
+a ❌ ("dismount first"), so p1 stays mounted (is_mounted True) and rock is
+unchanged at x=3. Before the fix swap had no mount guard and would have yanked a
+rider physically off its vehicle into an incoherent still-mounted state.
+
+
+SCENARIO 504 — Transform of a vehicle with riders (keep / block / eject)
+-----------------------------------------------------------------------
+
+!match new tvr TransformRiders 10 6
+!match use tvr
+!ent add bus Bus 40 3 3 0
+!ent set_var bus slots.seats.capacity 3
+!ent add rider1 R1 10 1 1 5
+!mount rider1 bus seats
+!ent set_var bus forms.tank.vars.slots.seats.capacity 2
+!ent set_var bus forms.tank.vars.hp 60
+!ent set_var bus forms.tank.vars.max_hp 60
+!ent transform bus forms.tank keep1
+!eval "is_mounted('rider1')"
+!ent set_var bus forms.walker.vars.slots.legs.capacity 1
+!ent set_var bus forms.walker.vars.hp 50
+!ent set_var bus forms.walker.vars.max_hp 50
+!ent transform bus forms.walker keep2
+!eval "is_mounted('rider1')"
+!system set default transform_rider_mismatch_mode eject
+!ent transform bus forms.walker keep2
+!eval "is_mounted('rider1')"
+!system set default transform_rider_mismatch_mode block
+
+Expected: bus carries rider1 in `seats`. Transforming into `tank` (which also
+has a `seats` slot) KEEPS rider1 mounted (is_mounted True). Transforming into
+`walker` (slots = `legs` only, no `seats`) is BLOCKED by default — a ❌, no
+change, rider1 still mounted. After setting `transform_rider_mismatch_mode` to
+`eject`, the same transform succeeds and dismounts rider1 to a nearby cell, so
+is_mounted is now False. The rule is reset to `block` afterward. Before the fix
+the transform silently orphaned the rider (still flagged mounted to a slot-less
+form).
+
+
+SCENARIO 505 — Segment chain (__follows) is remapped on copy under id collision
+------------------------------------------------------------------------------
+
+!match new snk SnakeSrc 14 8
+!match use snk
+!ent add worm Worm 30 5 5 5
+!part segment worm s0 Seg0 5 5
+!part segment worm s1 Seg1 5 5
+!match new snkB SnakeDst 14 8
+!match use snkB
+!ent add worm Other 9 1 1 1
+!ent add s0 OtherA 9 2 1 1
+!ent add s1 OtherB 9 3 1 1
+!match use snk
+!ent copy worm snkB 5 5
+!match use snkB
+!eval "var_get('s0_2', '__follows')"
+!eval "var_get('s1_2', '__follows')"
+
+Expected: copying the snake `worm` (head + segments s0->s1) into a match that
+ALREADY has entities named worm/s0/s1 forces re-minting to worm_2/s0_2/s1_2. The
+segment chain back-pointer `__follows` is remapped alongside `part_of`, so
+`var_get('s0_2','__follows')` = "worm_2" (the new head) and
+`var_get('s1_2','__follows')` = "s0_2" (the new first segment). Before the fix
+only `part_of` was remapped, so s1_2 still pointed at the stale `s0`, breaking
+snake_segments after the first link (this is the same gap the transform/revert
+re-mint path shared).
+
+
+SCENARIO 506 — Mount slot cost/condition formula sees the TARGET slot binding
+----------------------------------------------------------------------------
+
+!match new msb MountSlotBind 10 6
+!match use msb
+!ent add car Car 30 3 3 0
+!ent set_var car slots.vip.capacity 1
+!ent set_var car slots.vip.condition "slot == 'vip'"
+!ent set_var car slots.econ.capacity 1
+!ent set_var car slots.econ.condition "slot == 'econ'"
+!ent add a A 10 1 1 5
+!ent add b B 10 2 1 5
+!mount a car vip
+!mount b car econ
+!eval "is_mounted('a')"
+!eval "is_mounted('b')"
+!eval "slot_of('a')"
+!eval "slot_of('b')"
+
+Expected: each slot's `condition` references the `slot` binding, which must
+resolve to the slot BEING EVALUATED during can_mount (the rider isn't seated
+yet, so it can't come from the rider's own mount_slot). Mounting `a` into `vip`
+satisfies `slot == 'vip'` and `b` into `econ` satisfies `slot == 'econ'`, so
+both succeed: is_mounted True for both, slot_of('a')='vip', slot_of('b')='econ'.
+Before the fix `_eval_slot_expr` hard-wired `slot` to the rider's CURRENT
+mount_slot (None on a fresh mount), so the conditions evaluated against None and
+both mounts were refused.

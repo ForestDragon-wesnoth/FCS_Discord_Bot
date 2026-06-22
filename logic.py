@@ -993,6 +993,23 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "on each), or 'keep' (leave them mounted for manual cleanup)."
         ),
     },
+    # What happens to a vehicle's riders when the vehicle TRANSFORMS into a
+    # form whose slots don't accommodate every current rider (a rider's slot
+    # is missing in the new form). If EVERY rider's slot still exists in the
+    # new form, they stay mounted regardless of this rule. 'block' (default)
+    # refuses the transform (raises, no change); 'eject' dismounts every rider
+    # to free cells near the vehicle, then transforms.
+    "transform_rider_mismatch_mode": {
+        "default": "block",
+        "schema": {"type": "enum", "choices": ["block", "eject"]},
+        "desc": (
+            "When transforming/polymorphing a VEHICLE whose new form lacks a "
+            "slot for some current rider: 'block' (refuse the transform, no "
+            "change) or 'eject' (dismount all riders to nearby cells, then "
+            "transform). If the new form has matching slots for ALL riders, "
+            "they stay mounted regardless of this rule."
+        ),
+    },
     # Whether a HIDDEN rider (a passenger in a slot with no `region`, tucked
     # inside the vehicle) contributes to its team's vision / fog reveal.
     # Default False — symmetric with a hidden rider being excluded from
@@ -4480,7 +4497,13 @@ class Entity:
             "y": self.y,
             "id": self.id,
             "status": copy.deepcopy(self.status),
-            "vars": dict(self.vars),
+            # deepcopy, NOT dict(): vars hold nested dicts (inventory,
+            # modifiers, …) that _set_path mutates IN PLACE. A shallow copy
+            # would share those nested objects with the live entity, so a
+            # later nested write would corrupt this snapshot — breaking undo
+            # and action rollback for any dotted-path var. (status above is
+            # deepcopied for the same reason.)
+            "vars": copy.deepcopy(self.vars),
             "passives": {pid: p.to_dict() for pid, p in self.passives.items()},
             "clamps": {path: c.to_dict() for path, c in self.clamps.items()},
             "facing": self.facing,
@@ -5166,8 +5189,11 @@ class Match:
         cells = z.get("cells") or set()
         out: Dict[str, Any] = {
             "cells": [[x, y] for (x, y) in sorted(cells)],
-            "data": z.get("data") or {},
-            "hooks": z.get("hooks") or {},
+            # deepcopy data/hooks: zone_set_path / the zone_set primitive mutate
+            # the zone data dict IN PLACE, so a by-reference snapshot would be
+            # corrupted by a later edit (defeats undo + action rollback).
+            "data": copy.deepcopy(z.get("data") or {}),
+            "hooks": copy.deepcopy(z.get("hooks") or {}),
         }
         g = z.get("glyph")
         if isinstance(g, str) and len(g) == 1:
@@ -5435,6 +5461,10 @@ class Match:
                 e.x = par.x
                 e.y = par.y
                 self._restamp_anchors_for(e.id)
+                # A moved part carries its OWN riders too (a body part that is
+                # itself a vehicle) — same carry cascade _restamp_riders_for
+                # does, so a rider on a limb follows when the parent moves.
+                self._restamp_riders_for(e.id)
 
     # ---------- snake / segmented bodies ----------
     def snake_segments(self, head_id: str) -> List["Entity"]:
@@ -5812,9 +5842,12 @@ class Match:
                 if e.mounted_on == vid and e.mount_slot == slot]
 
     def _eval_slot_expr(self, vid: str, rider_id: str,
-                        expr: Any, fallback: Any) -> Any:
+                        expr: Any, fallback: Any,
+                        slot: Optional[str] = None) -> Any:
         """Evaluate a slot cost/condition formula with `self` = the rider and
-        a `vehicle` binding = the host. Empty or malformed -> fallback
+        `vehicle`/`slot` bindings. `slot` is the slot being EVALUATED (passed by
+        the caller — NOT the rider's current mount_slot, which is None on a
+        fresh mount and stale during a switch). Empty or malformed -> fallback
         (fail-OPEN: a GM typo doesn't trap or bar a rider — give gating vars
         a default via !defvar so reads resolve)."""
         expr = str(expr or "").strip()
@@ -5822,9 +5855,7 @@ class Match:
             return fallback
         from formula import FormulaEngine, EvalCtx, FormulaError
         ctx = EvalCtx(this=self.current_entity_id(), target=rider_id,
-                      extras={"vehicle": vid, "rider": rider_id,
-                              "slot": self.entities[rider_id].mount_slot
-                              if rider_id in self.entities else None})
+                      extras={"vehicle": vid, "rider": rider_id, "slot": slot})
         try:
             return FormulaEngine(self).eval_expression(expr, ctx)
         except FormulaError:
@@ -5842,7 +5873,7 @@ class Match:
         """What `rider_id` would consume from the slot's budget — the slot's
         `cost` formula evaluated for that rider (default 1)."""
         sd = self.slot_def(vid, slot) or {}
-        val = self._eval_slot_expr(vid, rider_id, sd.get("cost", ""), 1)
+        val = self._eval_slot_expr(vid, rider_id, sd.get("cost", ""), 1, slot=slot)
         try:
             return float(val)
         except (TypeError, ValueError):
@@ -5861,7 +5892,8 @@ class Match:
         """Whether `rider_id` satisfies the slot's `condition` formula
         (empty/malformed = yes)."""
         sd = self.slot_def(vid, slot) or {}
-        return bool(self._eval_slot_expr(vid, rider_id, sd.get("condition", ""), True))
+        return bool(self._eval_slot_expr(vid, rider_id, sd.get("condition", ""),
+                                         True, slot=slot))
 
     def can_mount(self, rider_id: str, vid: str,
                   slot: str) -> Tuple[bool, str]:
@@ -6054,15 +6086,17 @@ class Match:
                 return True
         return False
 
-    def _release_riders(self, vid: str) -> List[str]:
+    def _release_riders(self, vid: str, mode: Optional[str] = None) -> List[str]:
         """Resolve a vehicle's riders when it dies / despawns, per the
         mount_on_host_death rule: 'eject' (dismount to nearby cells),
         'kill' (run the kill function on each), 'keep' (leave them linked).
-        Called from Entity.remove. Returns log."""
+        Called from Entity.remove. An explicit `mode` overrides the rule (the
+        transform eject path passes 'eject'). Returns log."""
         riders = self.vehicle_riders(vid)
         if not riders:
             return []
-        mode = str(self.rules.get("mount_on_host_death", "eject"))
+        if mode is None:
+            mode = str(self.rules.get("mount_on_host_death", "eject"))
         veh = self.entities.get(vid)
         log: List[str] = []
         for rider in riders:
@@ -7546,6 +7580,42 @@ class Match:
         w, h = self.entity_footprint(e)
         return e.x <= x < e.x + w and e.y <= y < e.y + h
 
+    def _rect_gap(self, ax: int, ay: int, aw: int, ah: int,
+                  bx: int, by: int, bw: int, bh: int,
+                  mode: str = "square_radius") -> float:
+        """Nearest-cell distance between two axis-aligned rectangles (each
+        x,y = top-left, w,h = size), combined per `mode`. The per-axis gap
+        is 0 when the rectangles overlap on that axis, else the separation;
+        the chosen metric is then applied. Mirrors the point-distance
+        metrics exactly (square_radius/Chebyshev int, manhattan int,
+        euclidean float), so two 1×1 rects reduce to anchor distance."""
+        gx = max(0, ax - (bx + bw - 1), bx - (ax + aw - 1))
+        gy = max(0, ay - (by + bh - 1), by - (ay + ah - 1))
+        if mode in ("manhattan", "manhattan_distance"):
+            return int(gx + gy)
+        if mode in ("euclidean", "euclidean_distance"):
+            return math.sqrt(gx * gx + gy * gy)
+        return int(max(gx, gy))   # square_radius (Chebyshev), the default
+
+    def entity_gap_distance(self, e_ref: "Entity", e_other: "Entity",
+                            mode: str = "square_radius") -> float:
+        """Footprint-aware nearest-cell distance between two entities —
+        the gap between their footprint rectangles. The single source of
+        truth for entity-to-entity distance (entities_within/nearest_entity
+        and the `near:` find predicate both route through here)."""
+        rw, rh = self.entity_footprint(e_ref)
+        ow, oh = self.entity_footprint(e_other)
+        return self._rect_gap(e_ref.x, e_ref.y, rw, rh,
+                              e_other.x, e_other.y, ow, oh, mode)
+
+    def cell_entity_distance(self, x: int, y: int, e: "Entity",
+                             mode: str = "square_radius") -> float:
+        """Footprint-aware nearest-cell distance from a single cell (x, y)
+        to entity `e` — the point-vs-footprint gap behind the `within:`
+        find predicate."""
+        ow, oh = self.entity_footprint(e)
+        return self._rect_gap(x, y, 1, 1, e.x, e.y, ow, oh, mode)
+
     def cell_occupant(self, x: int, y: int,
                       ignore: Tuple[str, ...] = ()) -> Optional[str]:
         """The id of the first alive, non-stackable entity whose
@@ -7897,6 +7967,14 @@ class Match:
             raise NotFound(f"Entity '{a}' not found.")
         if eb is None:
             raise NotFound(f"Entity '{b}' not found.")
+        # Mount redirect (mirrors move/tp): a mounted entity can't be swapped
+        # on its own. A driver (a slot with controls_movement) redirects the
+        # swap to its VEHICLE — the whole rig swaps and riders are carried via
+        # fire_entity_moved; a passenger raises ("dismount first"). Resolved
+        # before reading positions so the swap operates on the real movers.
+        ea = ea._mount_move_redirect()
+        eb = eb._mount_move_redirect()
+        a, b = ea.id, eb.id
         if a == b:
             return False, []
         ax, ay = ea.x, ea.y
@@ -8919,6 +8997,24 @@ class Match:
             reduction = sum(amounts)
         return (False, max(0, reduction))
 
+    def _resistance_applies(self, e: "Entity", name: str,
+                            sdef: Dict[str, Any], level_given: bool) -> bool:
+        """Whether a flat level-reduction resistance applies to THIS status
+        application — only when a level is actually added/set: a first
+        application, an add_level increment (implicit +1 OR explicit), or a
+        replace with an explicit level. refresh / extend / none set no level,
+        so resistance has nothing to reduce (and must not block a
+        duration-only refresh)."""
+        if name not in e.status:
+            return True  # first application seeds a level
+        mode = sdef.get("stack") or str(
+            self.rules.get("status_default_stack", "refresh"))
+        if mode == "add_level":
+            return True
+        if mode == "replace":
+            return level_given
+        return False  # refresh / extend / none — no level applied
+
     def status_apply_block_reason(self, eid: str, name: str,
                                   level: Optional[int] = None) -> Optional[str]:
         """A human reason the status would NOT apply to `eid` (immunity,
@@ -8935,7 +9031,7 @@ class Match:
             e, self._token_list(sdef.get("blocked_by")))
         if blockers:
             return f"`{name}` blocked by `{blockers[0]}`"
-        if reduction and (name not in e.status or level is not None):
+        if reduction and self._resistance_applies(e, name, sdef, level is not None):
             base = int(level) if level is not None else 1
             if base - reduction <= 0:
                 return f"`{name}` fully resisted (reduction {reduction})"
@@ -8943,14 +9039,21 @@ class Match:
 
     def apply_status(self, eid: str, name: str,
                      level: Optional[int] = None,
-                     duration: Optional[int] = None) -> List[str]:
+                     duration: Optional[int] = None,
+                     *, force: bool = False) -> List[str]:
         """Apply status `name` to entity `eid`, honoring the definition's
         `stack` mode (else the status_default_stack rule) when the status
         is already present. A FIRST application seeds the definition's
         default `data`, then sets level (default 1) and duration. Fires
         the on_status_added / on_status_changed hooks via the status
         chokepoint. Returns the hook log. Raises NotFound for an unknown
-        entity."""
+        entity.
+
+        `force=True` (the force_status / `!status force` path) skips the
+        immunity + resistance gating entirely — the level/increment is
+        applied regardless of resistance. blocked_by (cross-status) and the
+        part immune/redirect rules are still honored; force is specifically
+        the 'ignore resistance' axis."""
         e = self.entities.get(eid)
         if e is None:
             raise NotFound(f"Entity '{eid}' not found.")
@@ -8964,29 +9067,35 @@ class Match:
             if name in self._part_status_names(
                     e, "__status_redirect", "part_status_redirect"):
                 if e.part_of in self.entities:
-                    return self.apply_status(e.part_of, name, level, duration)
+                    return self.apply_status(e.part_of, name, level, duration,
+                                             force=force)
                 return []
         sdef = self.status_definitions.get(name) or {}
-        # Cross-status blocking + resistance/immunity, evaluated BEFORE the
-        # stacking math (a blocked/immune/fully-resisted application is a
-        # no-op). blocked_by: a status the target already has prevents this
-        # one. immunity: an aggregated immune token. resistance: reduces the
-        # applied LEVEL; if it drops to <=0 the application is fully resisted.
+        new_level = None if level is None else int(level)
+        new_duration = None if duration is None else int(duration)
+        # Cross-status blocking is ALWAYS honored (a different status the
+        # target already has prevents this one — independent of resistance).
         blockers = self._statuses_matching_tokens(
             e, self._token_list(sdef.get("blocked_by")))
         if blockers:
             return []
-        immune, reduction = self.status_resistance(eid, name)
-        if immune:
-            return []
-        new_level = None if level is None else int(level)
-        new_duration = None if duration is None else int(duration)
-        if reduction and (name not in e.status or new_level is not None):
-            base = new_level if new_level is not None else 1
-            eff = base - reduction
-            if eff <= 0:
+        # Resistance / immunity gating — skipped entirely when force=True.
+        # Resistance reduces a LEVEL being added/set, mode-aware (via
+        # _resistance_applies) so an implicit add_level +1 is resisted just
+        # like an explicit level while a duration-only refresh/extend is
+        # never blocked; if the reduced level drops to <=0 the application is
+        # fully resisted (no-op).
+        if not force:
+            immune, reduction = self.status_resistance(eid, name)
+            if immune:
                 return []
-            new_level = eff
+            if reduction and self._resistance_applies(
+                    e, name, sdef, new_level is not None):
+                base = new_level if new_level is not None else 1
+                eff = base - reduction
+                if eff <= 0:
+                    return []
+                new_level = eff
         before = copy.deepcopy(e.status.get(name))
         if name not in e.status:
             inst = copy.deepcopy(sdef.get("data")) if isinstance(sdef.get("data"), dict) else {}
@@ -10498,6 +10607,14 @@ class Match:
             if d.get("id"):
                 idmap[d["id"]] = nid
             d["__nid"] = nid
+        # Segment chains reference the segment ahead via the `__follows` var
+        # (an entity id); remap it like part_of so a transplanted snake body
+        # keeps its chain. A `__follows` pointing at the head resolves to the
+        # parent's preserved id (not in idmap) and is left unchanged.
+        for d in part_list:
+            dv = d.get("vars")
+            if isinstance(dv, dict) and dv.get("__follows") in idmap:
+                dv["__follows"] = idmap[dv["__follows"]]
         log: List[str] = []
         # Spawn parents before children: a part whose part_of points at another
         # part in this list waits until that part has spawned.
@@ -10545,6 +10662,28 @@ class Match:
         if not isinstance(statblock, dict):
             raise VTTError("transform: statblock must be a dict.")
         sb = copy.deepcopy(statblock)
+        # Vehicle riders: if the entity currently carries riders, the new form
+        # must still have a slot for each, or the riders would be orphaned
+        # (flagged mounted to a slot-less form). If every rider's slot exists
+        # in the new form they stay mounted; otherwise the
+        # transform_rider_mismatch_mode rule decides: 'block' (refuse, raise
+        # before any change) or 'eject' (dismount all riders, then transform).
+        riders = self.vehicle_riders(e.id)
+        if riders:
+            new_slots = (sb.get("vars") or {}).get("slots")
+            new_slots = new_slots if isinstance(new_slots, dict) else {}
+            missing = sorted({r.mount_slot for r in riders
+                              if r.mount_slot not in new_slots})
+            if missing:
+                mode = str(self.rules.get("transform_rider_mismatch_mode", "block"))
+                if mode == "eject":
+                    self._release_riders(e.id, mode="eject")
+                else:
+                    raise VTTError(
+                        f"transform: new form lacks slot(s) "
+                        f"{', '.join(repr(s) for s in missing)} for current "
+                        f"rider(s) — dismount them first (or set "
+                        f"transform_rider_mismatch_mode=eject).")
         hp_var, max_hp_var, turnorder_var = e._vital_var_names()
         team_var = str(self.rules.get("team_var", "team"))
         if hp_mode is None:
@@ -11350,8 +11489,13 @@ class Match:
             # match doesn't iterate tiles by position), but sorting the
             # serialized output keeps save-file diffs readable when a
             # GM edits tiles by hand.
+            # deepcopy each tile's data: tile_set_path / the tile_set primitive
+            # mutate tile dicts IN PLACE, so a by-reference snapshot would be
+            # corrupted by a later edit (defeating undo change-detection and
+            # action rollback — the same defect fixed for entity vars).
             "tiles": {
-                f"{x},{y}": dat for (x, y), dat in sorted(self.tiles.items())
+                f"{x},{y}": copy.deepcopy(dat)
+                for (x, y), dat in sorted(self.tiles.items())
             },
             "zones": {
                 name: self._zone_to_dict(z)
@@ -12267,18 +12411,33 @@ class Match:
             e = self.entities[eid]
             origin_x, origin_y = e.x, e.y
             for nx, ny, facing in path:
-                sx, sy = e.x, e.y
+                # Footprint-aware per-step hooks (a multi-tile member must
+                # fire tile/zone hooks for EVERY covered cell it vacates /
+                # enters, not just its anchor) — identical to the anchor
+                # form for a 1×1 member, matching Entity.move_dirs.
+                step_from_x, step_from_y = e.x, e.y
+                old_cells = self.entity_cells(e, e.x, e.y)
+                new_cells = self.entity_cells(e, nx, ny)
                 if fire_hooks:
-                    log.extend(self.fire_tile_hook("on_exit", eid, sx, sy))
-                    log.extend(self.fire_zone_exit_hooks(eid, sx, sy, nx, ny))
+                    log.extend(self.fire_footprint_tile_exit(eid, old_cells, new_cells))
+                    log.extend(self.fire_footprint_zone_exit(eid, old_cells, new_cells))
                 e.facing = facing
                 e.move_to(nx, ny)
                 if fire_hooks:
-                    log.extend(self.fire_tile_hook("on_enter", eid, nx, ny))
-                    log.extend(self.fire_zone_enter_hooks(eid, sx, sy, nx, ny, False))
+                    log.extend(self.fire_footprint_tile_enter(eid, old_cells, new_cells))
+                    log.extend(self.fire_footprint_zone_enter(
+                        eid, old_cells, new_cells, False))
+                    # Per-step entity hook, AFTER on_enter (so a passive sees
+                    # the just-entered tile's effect) — full parity with
+                    # single-entity move_dirs, which group move previously
+                    # lacked. Drives per-cell reactions and snake-trail follow.
+                    log.extend(self.fire_entity_step(
+                        eid, step_from_x, step_from_y, nx, ny,
+                    ))
             if fire_hooks and path:
-                log.extend(self.fire_tile_hook("on_stop", eid, e.x, e.y))
-                log.extend(self.fire_zone_stop_hooks(eid, e.x, e.y))
+                final_cells = self.entity_cells(e, e.x, e.y)
+                log.extend(self.fire_footprint_tile_stop(eid, final_cells))
+                log.extend(self.fire_footprint_zone_stop(eid, final_cells))
                 # on_entity_moved per group member, once per member
                 # (mirrors single-entity move_dirs semantics).
                 log.extend(self.fire_entity_moved(
@@ -12510,6 +12669,11 @@ class MatchManager:
             ne.id = idmap[oid]
             if ne.part_of:
                 ne.part_of = idmap.get(ne.part_of, ne.part_of)
+            # Segment chains: remap the `__follows` back-pointer (an entity id)
+            # like part_of, so a copied/transferred snake keeps its chain.
+            fol = ne.vars.get("__follows")
+            if fol in idmap:
+                ne.vars["__follows"] = idmap[fol]
             if oid == eid or not oe.is_located_part:
                 px, py = tx, ty
             else:  # a located part keeps its offset from the anchor

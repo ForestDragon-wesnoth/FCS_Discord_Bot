@@ -173,6 +173,19 @@ does an attached part get included where it should (and excluded where it
 shouldn't)? If the feature is spatial, vision-related, movement-related, or
 fires per-entity, this is non-negotiable.
 
+### ANY bug is worth fixing — multi-tile is where they CLUSTER, not a filter
+
+The multi-tile emphasis above is about where bugs concentrate, NOT a
+restriction on what to fix. When auditing or stumbling on a defect,
+multi-tile or not, investigate and fix it (e.g. the shallow-copy undo
+corruption and the resistance/stacking questions found in audit-pass-5 are
+footprint-independent). Do not dismiss a bug because it isn't about
+footprints. Two corollaries the user stated explicitly:
+- **If a fix's intended behavior is ambiguous, ASK the user — don't guess.**
+  A wrong "fix" that drifts from intent is worse than a question.
+- **If CLAUDE.md's wording was ambiguous about the behavior in question, it
+  MUST be amended** as part of the fix, so the ambiguity doesn't recur.
+
 ### Commit messages: dense, factual, no fluff
 
 Look at existing commit messages on `main`. They explain WHY a change
@@ -1676,6 +1689,190 @@ More shipped work (continuing the list above):
   illusion that fools enemy TARGETING is a GM composition on top (mechanics use
   real, so a true targeting-fooling illusion would need the deep-illusion
   variant, deferred).
+- **`!find` spatial predicates + `!foreach` bulk-apply — SHIPPED (scenarios
+  486-490).** Two composing query/QoL features.
+  - **Spatial `!find` predicates.** `!find` already had var comparisons
+    (`hp<20`, `team=red`, `var!=v`, dotted paths), `status:`/`group:`/`action:`;
+    the only gap was SPATIAL, now `near:<eid>:<radius>` (within radius of an
+    entity — the reference itself matches at gap 0) and `within:<x>:<y>:<radius>`
+    (within radius of a coordinate). Both use the FOOTPRINT-AWARE nearest-cell
+    gap, Chebyshev (square_radius). The gap math is now the single
+    `Match.entity_gap_distance(e_ref, e_other, mode)` + `cell_entity_distance(x,
+    y, e, mode)` over a shared `_rect_gap` (rectangle nearest-cell distance);
+    `formula.py`'s inline `_ent_dist` (behind `entities_within`/`nearest_entity`)
+    was refactored to route through `entity_gap_distance` so the enumerators and
+    the `near:` predicate agree exactly. A malformed radius / missing reference
+    RAISES `VTTError` from `_find_match_entity` — so `find_cmd` (and `foreach`)
+    now run the match loop INSIDE the predicate-parse try.
+  - **`!foreach <predicates> ; <command>`.** Runs ONE command per entity matching
+    a `!find` selector (the selector reuses the exact find grammar). The bare `;`
+    token splits selector from command (first `;` only; like `!batch`); the
+    command runs once per match with `$id`/`$name`/`$x`/`$y` substituted
+    per-token (`$name` LAST so an injected name isn't re-substituted). Matches
+    are resolved to a fixed (id, name, x, y) snapshot BEFORE any command runs, so
+    mutating the board mid-loop (move/kill/spawn) can't change the target set.
+    ONE undo entry (foreach is snapshotted; inner commands go through
+    `dispatch_no_snapshot`); a per-entity `❌` is reported and the loop continues
+    (batch semantics). Host-gated by default (mutating) — a player can't wrap a
+    mutating command to bypass the gate, since the inner ungated
+    `dispatch_no_snapshot` is only reached after foreach passes the top-level
+    gate. Helpers `_foreach_subst` + the `foreach_cmd` handler in vtt_commands.py.
+    FUTURE the user might want: multiple commands per entity (extra `;`), a
+    read-only `!foreach` variant, more substitution tokens.
+- **Audit-pass-4 fixes: multi-tile interaction sweep (scenarios 491-492).** A
+  fourth interaction-bug sweep, this time hunting anchor-only assumptions in
+  OLDER features against multi-tile entities (three read-only survey agents
+  across zones/auras/tiles, vision/LOS/targeting, and AoE/spawn/corpse/mount;
+  every flagged candidate verified in code before fixing). Two real bugs found
+  + fixed; the rest of the surface re-confirmed footprint-correct.
+  - **`move_group_dirs` fired tile/zone movement hooks at the ANCHOR cell
+    only.** Group movement (`!ent move group:<name> ...`) validated the whole
+    swept footprint (audit-pass-2) but then fired `on_enter`/`on_exit`/`on_stop`
+    via the anchor-only `fire_tile_hook`/`fire_zone_*_hooks` instead of the
+    footprint-aware `fire_footprint_tile_*`/`fire_footprint_zone_*` that
+    `Entity.move_dirs` uses — contradicting its own docstring ("per intermediate
+    tile … same as single-entity move_dirs"). So a multi-tile group member
+    crossing a hazard band / zone edge under-fired hooks (a 2×2 walking over a
+    damage strip burned once, not per covered cell). Now mirrors `move_dirs`
+    exactly (per-step `old_cells`/`new_cells` via `entity_cells`); byte-identical
+    for a 1×1 member, correct for a footprint. Group move ALSO now fires the
+    per-step `on_entity_step` hook (after each cell's `on_enter`) that
+    single-entity `move_dirs` fires — a pre-existing, footprint-independent
+    parity gap (per-cell reactions + snake-trail follow now work under group
+    move). Scenario 493.
+  - **`entities_in_area(x, y, n)` measured distance to the ANCHOR cell.** The
+    coord-rooted twin of `entities_within` used `_distance(x, y, e.x, e.y, mode)`
+    while `entities_within` had been refactored to the footprint-aware
+    nearest-cell gap — so a large body partly inside an AoE radius was wrongly
+    excluded (a 4×4 at (10,10) missed a blast at (14,14) r2 because the anchor
+    was 4 away though a corner cell was 1 away). Now routes through
+    `Match.cell_entity_distance(x, y, e, mode)` (the point-vs-footprint gap added
+    with the `within:` find predicate), so the entity- and coord-rooted area
+    queries agree.
+  - **Re-verified footprint-correct (no change needed), so future sweeps can
+    skip them:** all vision/fog/LOS casts (`_member_sees`, `_entity_has_los`,
+    `_team_sees_entity`, `_record_vision`, `entity_visible_to` — union/any-cell),
+    targeting geometry (`side_hit`/`hit_location`/`directional_get` box-face
+    hitbox, `entity_center`/`aoe_origin`), the spatial/LOS enumerators
+    (`entities_within`/`nearest_entity` via `entity_gap_distance`,
+    `entities_in_cone`/`_rect`/`_line_ignorelos`/`_on_los`/`_line_until` via
+    `_alive_at`/`_occupants` any-cell), `damage_spread` spatial filtering,
+    `chain_targets`, `summon_near`/`_find_free_cell_near` (whole footprint
+    validated, defaults applied first), corpses (`corpse_cells`/`revive`),
+    mounts (`_find_dismount_cell`/`_restamp_riders_for`), `resize_grid` (cut if
+    ANY cell off-grid), and single-entity `tp`/`move_dirs`/push/pull/swap.
+
+- **Audit-pass-5 fixes: general correctness sweep (scenarios 494-495).** A
+  broader bug hunt (NOT multi-tile-scoped — four read-only survey agents across
+  serialization/undo, status/modifier/event, death/corpse/transform/mount, and
+  action/formula/dispatch; every candidate verified in code before fixing). Two
+  real bugs fixed:
+  - **`Entity.to_dict` shallow-copied `vars` → corrupted undo + action
+    rollback for nested vars.** `to_dict` did `"vars": dict(self.vars)` (shallow)
+    while the sibling `status` was `deepcopy`'d. Entity vars hold nested dicts
+    (`inventory`, `modifiers`, …) that `_set_path` mutates IN PLACE, so a command
+    snapshot SHARED the live nested objects; a later dotted-path write then
+    corrupted the snapshot, and `!history undo` / transactional action rollback
+    restored the wrong (mutated) value (a nested var could even vanish entirely).
+    Fixed to `copy.deepcopy(self.vars)`. This is the snapshot path behind BOTH
+    undo and `action._rollback_match` (both go through `Match.to_dict` →
+    `Entity.to_dict`), so it fixes both at once. Footprint-INDEPENDENT — a
+    long-standing latent bug any nested-var undo would hit.
+  - **`_restamp_parts_for` didn't carry a moved part's RIDERS.** When a parent
+    moved, the part-restamp synced each glued part's anchor + its anchored auras
+    (`_restamp_anchors_for`) but never `_restamp_riders_for(part)`, so a body
+    part that is ALSO a vehicle left its riders behind (same class as the
+    nested-mount bug #80, but for a part-vehicle). Added the symmetric
+    `_restamp_riders_for(e.id)` call (recursion stays bounded — part subtree is
+    acyclic, mount cycles are can_mount-guarded).
+  - **Re-verified correct (no change):** Match/zone serialization round-trips all
+    persistent fields; `action._rollback_match`'s runtime-field list is complete
+    (audit-pass-3); modifier fold min/max ops; event-stack preservation across
+    nested-action rollback; status counter auto-removal; formula sandbox
+    `_who_arg` HOOK_CONTEXT handling + `normalize_body_source` at every body
+    boundary; dispatch gate (no batch/foreach/macro/action bypass).
+  - **OPEN QUESTION raised with the user → RESOLVED (status resistance +
+    `add_level`).** The old gate `(name not in e.status or new_level is not
+    None)` let an implicit +1 (`!status apply x poison` with no level) on an
+    already-present `add_level` status BYPASS resistance, while an explicit
+    level was resisted — an asymmetry. The user's call: keep `apply_status`
+    consistently resistance-aware AND add a SEPARATE force primitive that
+    ignores resistance (resistance stays LEVEL-only — no duration channel).
+    Shipped (scenarios 496-497):
+    - **Resistance is now mode-aware** via `Match._resistance_applies(e, name,
+      sdef, level_given)`: a flat level-reduction resistance applies only when
+      a level is actually added/set — a FIRST application, an `add_level`
+      increment (implicit +1 OR explicit), or a `replace` with an explicit
+      level. `refresh`/`extend`/`none` set no level, so resistance no longer
+      touches them (fixes BOTH the implicit-+1 bypass AND a previously-possible
+      bug where an explicit level on a `refresh` ran the resistance gate and
+      could no-op the duration refresh). So an implicit `add_level` +1 with
+      resist≥1 is now fully resisted (consistent); `status_apply_block_reason`
+      shares the same helper so command feedback matches.
+    - **`force` path** — `apply_status(..., force=True)` skips the immunity +
+      resistance gating entirely (the level/increment lands regardless);
+      cross-status `blocked_by` and the part immune/redirect rules are STILL
+      honored (force is specifically the "ignore resistance" axis, not a
+      bypass-everything hammer). Surfaced as the `status_force(eid, name[,
+      level, duration])` formula primitive (twin of `status_apply`) and the
+      `!status force <eid> <name> [level] [duration]` command (host-gated like
+      apply; reply reads "Force-applied").
+
+- **Audit-pass-6 fixes: cross-subsystem correctness sweep (scenarios 498-506).**
+  A sixth bug hunt (four read-only survey agents across transform/disguise,
+  dispatch/foreach/macro/watcher/undo, dice/modifier/shield numerics, and
+  mounts/vehicles; every candidate verified in code before fixing). Nine real
+  bugs fixed, three of which needed a user design call:
+  - **Snapshot shallow-copy, tiles + zones (HIGH).** `Match.to_dict` stored each
+    tile's data dict BY REFERENCE and `_zone_to_dict` stored a zone's
+    `data`/`hooks` by reference (only `cells` was rebuilt). Since `tile_set_path`/
+    `zone_set_path` (and the `tile_set`/`zone_set` primitives) mutate IN PLACE,
+    an in-place `!tile set`/`!zone set` corrupted the prior command snapshot —
+    defeating undo change-detection (pre==post → no snapshot) AND action
+    rollback. Same class as the audit-pass-5 `Entity.to_dict` vars fix, missed
+    for tiles/zones. Fixed with `copy.deepcopy` in both serializers (498-500).
+  - **Segment `__follows` not remapped on id re-mint (MED-HIGH).** Both
+    `_apply_statblock_parts` (transform/revert of a captured subtree) and
+    `copy_entity` (cross-match copy/transfer) remapped `part_of` but NOT the
+    snake-segment back-pointer `__follows`, so a 2+ segment snake lost its chain
+    past the first link when re-minted under an id collision. Fixed by remapping
+    `__follows` via the same idmap in both paths (505; verified under a forced
+    collision — worm→worm_2, s1's `__follows` s0→s0_2).
+  - **Dice `kh0` negative-zero slice (HIGH).** `dice[-0:]` is the WHOLE list in
+    Python, so `roll("NdMkh0")` returned the full sum instead of 0 (the `kl`
+    branch `dice[:0]` was fine). Guarded `k==0` explicitly (498).
+  - **Macro / foreach substitution (MED/LOW).** `_macro_subst` re-expanded a
+    token appearing INSIDE an arg value ($@ pass then positional pass) and
+    mis-parsed `$10`+ (the `$1` prefix). `_foreach_subst` only guarded
+    `$name`-contains-token, not an id/x/y value containing a later token. Both
+    rewritten as a SINGLE-pass `re.sub` (501; macro now also supports $10+).
+  - **Mount `slot` binding (MED, two sites).** The mount-action dispatch
+    `extra_ctx` never set the documented `slot` binding (read as None), and
+    `_eval_slot_expr` hard-wired `slot` to the rider's CURRENT mount_slot (None
+    on a fresh mount, stale on a switch) instead of the slot being EVALUATED.
+    Fixed: bind `slot` in the action ctx; thread the evaluated slot param through
+    `_eval_slot_expr` from `slot_cost_of`/`slot_condition_ok` (506).
+  - **chain_targets relation anchor (user call → ORIGIN).** `relation`
+    (hostile/ally/…) was judged vs the PREVIOUS link each hop, so a `hostile`
+    chain flipped allegiance (enemy→ally→enemy). Now judged vs the ORIGIN
+    `from_eid` (distance still measured from the previous link), so chain
+    lightning bounces among the caster's enemies (502).
+  - **swap + mounts (user call → REDIRECT).** `swap_entities` had no mount guard.
+    Now applies `_mount_move_redirect` to both participants: a driver (a
+    controls_movement slot) redirects the swap to its VEHICLE (riders carried), a
+    passenger raises "dismount first" — mirroring tp/move_dirs (503).
+  - **transform of a vehicle with riders (user call → gamerule, default block).**
+    Replacing a vehicle's `slots` var wholesale orphaned its riders. New rule
+    `transform_rider_mismatch_mode` (enum block|eject, default `block`): if EVERY
+    rider's slot still exists in the new form they stay mounted; otherwise block
+    (refuse, raise before any change) or eject (dismount all, then transform).
+    `_release_riders` gained an explicit `mode` override for the eject path (504).
+  - Re-verified CORRECT (no change): disguise POV gating + fog/footprint
+    interaction, HP carry modes, modifier fold + caps + tag/grants, shields/
+    absorb priority + drain, band()/roll_table boundary + weight handling,
+    damage_spread apportionment, watcher edge-trigger + serialization, the access
+    gate (no batch/foreach/macro bypass), nested-mount carry + cycle guards,
+    rider-death corpse strip, `_find_dismount_cell`.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

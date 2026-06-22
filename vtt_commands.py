@@ -3737,6 +3737,23 @@ def _parse_find_predicate(token: str) -> Tuple[str, str, Optional[str]]:
         if not name:
             raise VTTError("`action:` predicate needs an action name.")
         return "action", name, None
+    if token.startswith("near:"):
+        # near:<eid>:<radius> — within `radius` (footprint-aware nearest-cell,
+        # Chebyshev) of the reference entity. key=eid, value=radius.
+        rest = token[len("near:"):]
+        parts = rest.split(":")
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            raise VTTError("`near:` predicate needs `near:<eid>:<radius>`.")
+        return "near", parts[0], parts[1]
+    if token.startswith("within:"):
+        # within:<x>:<y>:<radius> — within `radius` (footprint-aware
+        # nearest-cell, Chebyshev) of the coordinate (x, y). key="x:y",
+        # value=radius.
+        rest = token[len("within:"):]
+        parts = rest.split(":")
+        if len(parts) != 3 or not all(parts):
+            raise VTTError("`within:` predicate needs `within:<x>:<y>:<radius>`.")
+        return "within", f"{parts[0]}:{parts[1]}", parts[2]
     # Try operators longest-first so `<=` isn't misread as `<`.
     for op in _FIND_OPS:
         idx = token.find(op)
@@ -3744,7 +3761,8 @@ def _parse_find_predicate(token: str) -> Tuple[str, str, Optional[str]]:
             return op, token[:idx], token[idx + len(op):]
     raise VTTError(
         f"Unrecognized find predicate `{token}`. Expected `key=value`, "
-        f"`key<value`, `status:NAME`, `group:NAME`, or `action:NAME`."
+        f"`key<value`, `status:NAME`, `group:NAME`, `action:NAME`, "
+        f"`near:<eid>:<radius>`, or `within:<x>:<y>:<radius>`."
     )
 
 
@@ -3799,6 +3817,34 @@ def _find_match_entity(m: Match, e: Entity, predicates: List[Tuple[str, str, Opt
             if not lookup_action(actions, key, m.rules):
                 return False
             continue
+        if kind == "near":
+            # within `val` cells (footprint-aware nearest-cell, Chebyshev)
+            # of the reference entity `key`. The reference itself matches
+            # (gap 0). Raises on a bad radius / missing reference — find_cmd
+            # and foreach run the match loop inside a VTTError-catching try.
+            radius = _coerce_for_compare(val)
+            if isinstance(radius, bool) or not isinstance(radius, (int, float)):
+                raise VTTError(f"`near:` radius must be a number, got `{val}`.")
+            ref = m.entities.get(_resolve_eid(m, key))
+            if ref is None:
+                raise VTTError(f"`near:` reference entity `{key}` not found.")
+            if m.entity_gap_distance(ref, e) > radius:
+                return False
+            continue
+        if kind == "within":
+            # within `val` cells (footprint-aware nearest-cell, Chebyshev)
+            # of the coordinate stored in `key` as "x:y".
+            radius = _coerce_for_compare(val)
+            if isinstance(radius, bool) or not isinstance(radius, (int, float)):
+                raise VTTError(f"`within:` radius must be a number, got `{val}`.")
+            sx, sy = key.split(":")
+            try:
+                cx, cy = int(sx), int(sy)
+            except ValueError:
+                raise VTTError("`within:` coordinates must be integers.")
+            if m.cell_entity_distance(cx, cy, e) > radius:
+                return False
+            continue
         # Var-comparison forms. Missing var never matches any operator
         # (including !=) — that keeps "team=red" from spuriously
         # matching entities that don't have a team set at all.
@@ -3841,11 +3887,13 @@ def _find_match_entity(m: Match, e: Entity, predicates: List[Tuple[str, str, Opt
         "`var=value`, `var!=value`, `var<value`, `var<=value`, "
         "`var>value`, `var>=value` for vars; `status:NAME` for a status "
         "flag; `group:NAME` for group membership; `action:NAME` for "
-        "discoverable-action availability. Dotted var paths walk "
+        "discoverable-action availability; `near:<eid>:<radius>` and "
+        "`within:<x>:<y>:<radius>` for spatial range (footprint-aware "
+        "nearest-cell, Chebyshev). Dotted var paths walk "
         "nested dicts (`inventory.sword.damage>5`). Example: "
-        "`!find team=red hp<20 status:bleeding action:slice` lists "
-        "every red-team entity below 20 HP that is bleeding AND has "
-        "a `slice` action available."
+        "`!find team=red hp<20 status:bleeding near:boss:3` lists "
+        "every red-team entity below 20 HP that is bleeding AND within "
+        "3 cells of `boss`."
     ),
     snapshot=False,
 )
@@ -3856,10 +3904,10 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     try:
         predicates = [_parse_find_predicate(t) for t in args]
+        hits = [e for e in m.entities_in_turn_order()
+                if _find_match_entity(m, e, predicates)]
     except VTTError as ex:
         return await ctx.send(f"❌ {ex}")
-    hits = [e for e in m.entities_in_turn_order()
-            if _find_match_entity(m, e, predicates)]
     if not hits:
         return await ctx.send("No entities match.")
     word = "match" if len(hits) == 1 else "matches"
@@ -3867,6 +3915,71 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     for e in hits:
         lines.append(f"- {_entity_line(e)}")
     return await ctx.send("\n".join(lines))
+
+
+# ---- !foreach -----------------------------------------------------------
+# Bulk-apply: run one command for every entity matching a !find selector.
+# The selector reuses the exact find-predicate grammar; the command after
+# the bare `;` runs once per match with per-entity tokens substituted.
+def _foreach_subst(tok: str, eid: str, name: str, x: int, y: int) -> str:
+    """Substitute the per-entity tokens ($id/$name/$x/$y) in one command token
+    in a SINGLE pass, so a substituted value that itself contains another token
+    (e.g. an id containing `$x`, or a name containing `$id`) is NOT
+    re-substituted. (Sequential str.replace only guarded `$name`-contains-token,
+    not the reverse.)"""
+    repl = {"$id": eid, "$name": name, "$x": str(x), "$y": str(y)}
+    return re.sub(r"\$name|\$id|\$x|\$y", lambda m: repl[m.group(0)], tok)
+
+
+@registry.command(
+    "foreach",
+    usage="!foreach <predicate> [<predicate> ...] ; <command> [args...]",
+    desc=(
+        "Run one command for every entity matching a `!find` selector. "
+        "The selector (same predicates as `!find`: `var=value`, "
+        "`status:NAME`, `group:NAME`, `action:NAME`, `near:<eid>:<radius>`, "
+        "`within:<x>:<y>:<radius>`) comes before a bare `;`; the command "
+        "after it runs once per matching entity with `$id`/`$name`/`$x`/"
+        "`$y` substituted. Matches are resolved BEFORE any command runs, "
+        "so mutating the board mid-loop won't change the target set. The "
+        "whole sweep is ONE undo entry; a per-entity `❌` is reported and "
+        "the loop continues. Example: "
+        "`!foreach team=red near:boss:2 ; ent damage $id 5`."
+    ),
+)
+async def foreach_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["foreach"])
+        return await ctx.send(f"**{title}**\n{body}")
+    if ";" not in args:
+        return await ctx.send(
+            "❌ foreach needs a `;` separating the selector from the "
+            "command. Usage: `!foreach <predicates> ; <command>`."
+        )
+    sep = args.index(";")
+    sel_tokens = args[:sep]
+    cmd_tokens = args[sep + 1:]
+    if not sel_tokens:
+        return await ctx.send("❌ foreach selector is empty (nothing before `;`).")
+    if not cmd_tokens:
+        return await ctx.send("❌ foreach command is empty (nothing after `;`).")
+    m = active_match(mgr, ctx)
+    try:
+        predicates = [_parse_find_predicate(t) for t in sel_tokens]
+        hits = [e for e in m.entities_in_turn_order()
+                if _find_match_entity(m, e, predicates)]
+    except VTTError as ex:
+        return await ctx.send(f"❌ {ex}")
+    if not hits:
+        return await ctx.send("No entities match; nothing to do.")
+    # Snapshot the substitution values up front so the target set is fixed
+    # even if the per-entity commands move / kill / spawn entities.
+    targets = [(e.id, e.name, e.x, e.y) for e in hits]
+    noun = "entity" if len(targets) == 1 else "entities"
+    await ctx.send(f"foreach: applying to {len(targets)} {noun}...")
+    for eid, name, x, y in targets:
+        sub = [_foreach_subst(t, eid, name, x, y) for t in cmd_tokens]
+        await registry.dispatch_no_snapshot(sub[0], sub[1:], ctx, mgr)
 
 
 @registry.command("state", access="all", usage="!state [full]", desc="Show match summary, entities, and map from this channel's POV. `!state full` (host-gated) forces the omniscient view.")
@@ -6965,7 +7078,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 @registry.command(
     "status",
     usage=("!status <def|drop|tick|when|stack|maxlevel|data|tags|removes|"
-           "blockedby|resist|counter|list|info|apply> ..."),
+           "blockedby|resist|counter|list|info|apply|force> ..."),
     desc=(
         "Status DEFINITIONS — self-describing statuses. Define a status "
         "once (its per-tick effect, when it ticks, how it stacks, its max "
@@ -6978,9 +7091,11 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         "deliberately not built in). Apply with `!status apply <eid> <name> "
         "[level] [duration]` (or the status_apply formula primitive), which "
         "honors the definition's stack mode (else the status_default_stack "
-        "rule). Raw per-entity instance editing stays on `!ent status`. "
-        "Subcommands: def, drop, tick, when, stack, maxlevel, data, list, "
-        "info, apply."
+        "rule) AND the target's resistance/immunity. `force` is the same but "
+        "IGNORES resistance/immunity (the level/increment lands regardless; "
+        "cross-status blocks still apply). Raw per-entity instance editing "
+        "stays on `!ent status`. Subcommands: def, drop, tick, when, stack, "
+        "maxlevel, data, list, info, apply, force."
     ),
 )
 async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -7174,8 +7289,12 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"**status def `{name}`**\n```{json.dumps(d, indent=2, sort_keys=True)}\n```"
         )
 
-    if sub == "apply":
-        if await return_help_if_not_enough_args(ctx, args, 3, "status", "apply"):
+    if sub in ("apply", "force"):
+        # `force` is the resistance-ignoring twin of `apply`: it bypasses
+        # immunity + resistance so the level/increment lands regardless
+        # (cross-status blocked_by and part immune/redirect still apply).
+        force = (sub == "force")
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", sub):
             return
         eid = _resolve_eid(m, args[1])
         name = args[2]
@@ -7191,13 +7310,15 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             except ValueError:
                 return await ctx.send("❌ duration must be an integer.")
         try:
-            event_log = m.apply_status(eid, name, level, duration)
+            event_log = m.apply_status(eid, name, level, duration, force=force)
         except (VTTError, NotFound) as ex:
             return await ctx.send(f"❌ {ex}")
         e = m.entities[eid]
         tail = ("\n" + "\n".join(event_log)) if event_log else ""
+        verb = "Force-applied" if force else "Applied"
         # Body-part status rules can no-op (immune) or redirect to the
         # parent — reflect that instead of a misleading "Applied to <part>".
+        # These hold even for force (force is the resistance axis, not parts).
         if e.is_part and name not in e.status:
             if name in m._part_status_names(e, "__status_immune", "part_status_immune"):
                 return await ctx.send(
@@ -7206,15 +7327,22 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return await ctx.send(
                     f"`{name}` on body part `{eid}` redirected to its parent "
                     f"`{e.part_of}`.{tail}")
-        # Immunity / blocked_by / full resistance — report instead of a
-        # misleading "Applied".
+        # Report why nothing applied. For `apply` that's immunity / blocked_by
+        # / full resistance; for `force` only a cross-status blocked_by can
+        # still stop it (immunity + resistance are bypassed).
         if name not in e.status:
-            reason = m.status_apply_block_reason(eid, name, level)
+            if force:
+                sdef = m.status_definitions.get(name) or {}
+                blockers = m._statuses_matching_tokens(
+                    e, m._token_list(sdef.get("blocked_by")))
+                reason = f"`{name}` blocked by `{blockers[0]}`" if blockers else None
+            else:
+                reason = m.status_apply_block_reason(eid, name, level)
             if reason:
                 return await ctx.send(f"`{eid}`: {reason} — no effect.{tail}")
         inst = e.status.get(name, {})
         return await ctx.send(
-            f"Applied `{name}` to `{eid}` "
+            f"{verb} `{name}` to `{eid}` "
             f"(level={inst.get('level', '?')}, "
             f"duration={inst.get('duration', '∞')}).{tail}"
         )
@@ -8041,13 +8169,18 @@ async def run_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 
 def _macro_subst(line: str, mac_args: List[str]) -> str:
-    """Substitute $@ (all args, space-joined) and $1..$9 (positional;
-    missing -> empty) in a macro line. Leaves $(...) formula tokens alone."""
-    out = line.replace("$@", " ".join(mac_args))
-    for i in range(9, 0, -1):
-        val = mac_args[i - 1] if i <= len(mac_args) else ""
-        out = out.replace(f"${i}", val)
-    return out
+    """Substitute $@ (all args, space-joined) and $1, $2, ... (positional;
+    missing -> empty) in a macro line, in a SINGLE left-to-right pass. The
+    single pass matters: an arg VALUE that itself contains a `$N`/`$@` token is
+    NOT re-substituted, and a multi-digit `$10`+ is parsed as the whole index
+    (not `$1` followed by a literal `0`). Leaves $(...) formula tokens alone
+    (a `$` not followed by `@` or a digit)."""
+    def repl(m: "re.Match") -> str:
+        if m.group(0) == "$@":
+            return " ".join(mac_args)
+        idx = int(m.group(1))
+        return mac_args[idx - 1] if 1 <= idx <= len(mac_args) else ""
+    return re.sub(r"\$@|\$(\d+)", repl, line)
 
 
 @registry.command(
@@ -8851,10 +8984,11 @@ async def _run_action_dispatch(
     # state into unrelated formula evaluations.
     # Mount routing: a rider-triggered vehicle/slot action runs as the
     # rider (default) or the vehicle, per the mount_action_actor rule with a
-    # per-vehicle `mount_action_actor` var override. Either way BOTH the
-    # `vehicle` and `rider` ids are bound in the body. In rider mode the
-    # action's own container is dropped (source = the rider's plain vars);
-    # the body reads vehicle/slot config via entity[vehicle] / var_get.
+    # per-vehicle `mount_action_actor` var override. Either way the
+    # `vehicle`, `rider` AND `slot` ids are bound in the body (CLAUDE.md). In
+    # rider mode the action's own container is dropped (source = the rider's
+    # plain vars); the body reads vehicle/slot config via entity[vehicle] /
+    # var_get.
     eff_actor_id = actor_id
     extra_ctx: Optional[Dict[str, Any]] = None
     if action.full_path in mount_paths:
@@ -8862,7 +8996,9 @@ async def _run_action_dispatch(
         veh = m.entities.get(vid)
         mode = (veh.vars.get("mount_action_actor") if veh is not None else None) \
             or m.rules.get("mount_action_actor", "rider")
-        extra_ctx = {"vehicle": vid, "rider": actor_id}
+        rider_ent = m.entities.get(actor_id)
+        extra_ctx = {"vehicle": vid, "rider": actor_id,
+                     "slot": rider_ent.mount_slot if rider_ent is not None else None}
         if str(mode) == "vehicle":
             eff_actor_id = vid
         else:
