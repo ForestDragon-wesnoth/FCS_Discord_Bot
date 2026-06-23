@@ -13364,3 +13364,30 @@ the binding stays (zone_anchor_of='arm'); the destroyed limb lingers attached.
 Healing the arm back above 0 (damage_part -40) clears the destroyed latch and
 RESUMES the aura to size 9. (A destroyed limb never routes through Entity.remove,
 so this is handled directly in _process_part_death / the damage_part heal path.)
+
+
+SCENARIO 521 — Invalid status-tick formula reports cleanly (no FormulaError crash)
+---------------------------------------------------------------------------------
+
+!match new ferr FErr 6 6
+!match use ferr
+!ent add h Hero 30 1 1 5
+!status def burn
+!status tick burn "entity[self].hp - bogus_ident"
+!status tick burn "entity[self].hp = entity[self].hp - status_get(self, status_name, 'level')"
+!status maxlevel burn 3
+!status apply h burn 2
+!turn next
+!turn next
+!eval "var_get('h', 'hp')"
+
+Expected: setting a tick formula with an unknown identifier reports
+"❌ Invalid tick formula: Unknown identifier 'bogus_ident'." — NOT a crash.
+Before the fix, status_cmd had a redundant function-local `from formula import
+... FormulaError` further down the handler, which made FormulaError a
+function-local everywhere; the `except FormulaError` in the tick-validation path
+(reached first) then raised UnboundLocalError → "💥 cannot access local variable
+'FormulaError'". A valid tick (reading the level via status_get, since `level`
+is NOT a bare binding in tick context) is accepted and fires: burn at level 2
+deals 2 on the one turn_end that elapses across two `!turn next` calls (single
+combatant), so Hero hp 30 → 28.

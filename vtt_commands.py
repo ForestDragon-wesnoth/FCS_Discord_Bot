@@ -20,7 +20,7 @@ from logic import Passive, HOOK_NAMES, is_event_hook
 from logic import ClampSpec
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
-from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, normalize_body_source, _get_path, _set_path
+from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path
 
 import re
 import json
@@ -5930,7 +5930,6 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # tile's coords, hook_name = the `when`.
     if sub == "hook":
         from logic import TILE_HOOK_NAMES
-        from formula import validate_formula, FormulaError
         if len(args) < 2:
             title, body = registry.help_for(["tile", "hook"])
             return await ctx.send(f"**{title}**\n{body}")
@@ -6006,7 +6005,6 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # time).
     if sub == "def":
         from logic import TILE_HOOK_NAMES, TILE_RESERVED_KEYS
-        from formula import validate_formula, FormulaError
         if len(args) < 2:
             title, body = registry.help_for(["tile", "def"])
             return await ctx.send(f"**{title}**\n{body}")
@@ -7003,7 +7001,6 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # = the crossed/stepped cell (None for time hooks).
     if sub == "hook":
         from logic import ZONE_HOOK_NAMES
-        from formula import validate_formula, FormulaError
         if len(args) < 2:
             title, body = registry.help_for(["zone", "hook"])
             return await ctx.send(f"**{title}**\n{body}")
@@ -7140,7 +7137,6 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(f"❌ No status definition `{name}`. Use `!status def {name}` first.")
         body = normalize_body_source(" ".join(args[2:]).strip())
         if body:
-            from formula import validate_formula
             try:
                 validate_formula(
                     body, mode="exec",
@@ -7250,7 +7246,6 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if op not in ("add", "set"):
             return await ctx.send("❌ op must be `add` or `set`.")
         prim = "status_counter_add" if op == "add" else "status_counter_set"
-        from formula import FormulaEngine, EvalCtx, FormulaError
         try:
             new = FormulaEngine(m).eval_expression(
                 f"{prim}('{eid}', '{sname}', {value}, '{field}')",

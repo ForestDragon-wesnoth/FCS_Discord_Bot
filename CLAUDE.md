@@ -2139,6 +2139,48 @@ More shipped work (continuing the list above):
   zone that can't resume (nothing to revive) — re-anchor or delete it manually.
   Default stays `delete` (backward compat); `delete`/`freeze` unchanged.
 
+- **Audit-pass-12 (stability sweep, HANDS-ON): FormulaError-shadowing crash
+  fixed (scenario 521).** First pass done entirely by hand per the standing
+  directive (no survey-agent swarm) — reading subsystems + writing numeric/
+  property assertion harnesses. Verified CORRECT with harnesses (no change):
+  `side_hit`/`hit_location` geometry (4-way all facings × cardinals, 8-way
+  corner detection, the 1×1 box==center invariant over 192 source/facing
+  combos), `has_los` SYMMETRY (property test, ~7k cell-pairs × permissive/
+  strict/open, 0 asymmetric), `raycast` straight-line, the serialization
+  round-trip (idempotent `to_dict==to_dict(from_dict(to_dict))` on a complex
+  match — multi-tile + parts + path-snake + mount + suspended aura + statuses
+  + team + watchers + macros + fog + disguise — AND load-side deepcopy holds),
+  `band()` boundaries (ranges / `n` / `lo+` / `-hi`), and dice (`kh`/`kl`/
+  explode in range). One real bug fixed:
+  - **`FormulaError` UnboundLocalError in `status_cmd` (HIGH, user-facing).**
+    `vtt_commands.py` imports `FormulaError` at module level (line 23), but
+    `status_cmd` had a REDUNDANT function-local `from formula import
+    FormulaEngine, EvalCtx, FormulaError` deep in the handler (the counter
+    path). That makes `FormulaError` a function-LOCAL for the WHOLE function,
+    so the EARLIER `except FormulaError` in the `!status tick` validation path
+    raised `UnboundLocalError: cannot access local variable 'FormulaError'`
+    instead of the intended `❌ Invalid tick formula: ...`. So setting ANY
+    invalid status-tick formula (typo / unknown identifier / bad syntax)
+    crashed with a `💥`. Fixed by deleting the redundant local import; also
+    hoisted `validate_formula` into the module-level import and removed the
+    same redundant-local pattern from the tile-hook / zone-hook / status-tick
+    handlers (they were latent versions of the same shadowing class). The
+    remaining `from formula import ... as _FE/_vp/_FEng` aliased locals are
+    SAFE (an alias doesn't shadow the module name). NOTE confirmed while here:
+    a status-tick formula reads the instance level via `status_get(self,
+    status_name, 'level')` — `level` is NOT a bare binding (only `status_name`
+    is in the tick EvalCtx extras), so the validator correctly rejects a bare
+    `level` (CLAUDE.md's earlier `5*level` shorthand was illustrative).
+  - OPEN QUESTION raised with the user (LOS corner-mode consistency): `has_los`
+    applies the `los_corner_mode` flanker check at diagonal crossings, but
+    `first_opaque` / `raycast` walk the same thin `_line_cells` path WITHOUT it
+    — so they only agree in `open` mode. With an opaque corner-X (both flankers
+    opaque), `has_los`=False (blocked) while `first_opaque`=None and `raycast`
+    reports the beam reaching the target. `entities_on_los` is unaffected (it
+    cuts via per-cell `has_los`, corner-aware). Pending the user's call on
+    whether first_opaque/raycast should be made corner-aware (agree with
+    has_los) and, if so, the exact return value at a corner block.
+
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
 and explain the "why").
