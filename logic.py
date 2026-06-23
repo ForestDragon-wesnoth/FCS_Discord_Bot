@@ -8,6 +8,7 @@ import uuid
 import json
 import copy
 import re
+import random
 
 # -------------------------
 # Exceptions
@@ -11732,7 +11733,7 @@ class Match:
         }
         raw_watch = d.get("watchers", {}) or {}
         m.watchers = {
-            str(k): dict(v) for k, v in raw_watch.items()
+            str(k): copy.deepcopy(v) for k, v in raw_watch.items()
             if isinstance(k, str) and isinstance(v, dict)
         } if isinstance(raw_watch, dict) else {}
         raw_layers = d.get("hidden_layers", []) or []
@@ -11782,7 +11783,7 @@ class Match:
         } if isinstance(raw_acc, dict) else {}
         raw_bound = d.get("bound_channels", {})
         m.bound_channels = {
-            k: (dict(v) if isinstance(v, dict) else {})
+            k: (copy.deepcopy(v) if isinstance(v, dict) else {})
             for k, v in raw_bound.items() if isinstance(k, str)
         } if isinstance(raw_bound, dict) else {}
         m.fog_enabled = bool(d.get("fog_enabled", False))

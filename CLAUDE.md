@@ -2032,6 +2032,56 @@ More shipped work (continuing the list above):
     move_dirs. Lesson: a bare `s.find(old)` restore is unsafe when `old` isn't
     unique; prefer the Edit tool with surrounding context.)
 
+- **Audit-pass-11 fix: damage_spread fragment-mode crash + serialization
+  consistency (scenario 518).** An eleventh sweep — three read-only interaction
+  agents (serialization round-trip completeness; corpse/aura/time-hooks;
+  status-tick/watchers/event-bus) PLUS hand-written numeric assertion harnesses
+  for the primitives that still lacked one (`damage_spread`, the clamp
+  chokepoint). The agents found NO confirmed correctness bugs (their flagged
+  serialization items were FALSE POSITIVES — see below), but my numeric harness
+  caught the real one:
+  - **`damage_spread` fragment mode crashed without a `random_seed` (HIGH).**
+    The `fragment` branch did `rng = getattr(self, "_rng", None) or random`, but
+    `logic.py` never imported `random` (only `formula.py` did, for its
+    `_active_rng`). `Match._rng` is None by default and only built when a
+    `random_seed` is configured AND a formula roll initializes it — so under the
+    DEFAULT (no-seed) config every `damage_spread(target, total, "fragment")`
+    hit the `or random` fallback → `NameError: name 'random' is not defined` (a
+    `❌ Runtime error` through the action/formula path). The weighted / uniform /
+    main_only modes use no RNG, which is why scenarios 410-413 never caught it.
+    Fix: `import random` at the top of logic.py (the fallback now mirrors
+    formula's `_active_rng` exactly: seeded `_rng` when present, global `random`
+    otherwise). Scenario 518.
+  - **Serialization deepcopy consistency (NOT a live bug — defensive).**
+    `Match.from_dict` restored `watchers` and `bound_channels` with a shallow
+    `dict(v)` while `to_dict` deepcopied them. Two survey agents flagged this as
+    the pass-5/6/7 load-side corruption class, but VERIFICATION showed it's a
+    FALSE POSITIVE for correctness: both hold FLAT scalar dicts (`watchers`:
+    condition/effect strings + bool `last` + bool `once`; `bound_channels`
+    meta: `label`/`pov` strings), and the only mutations (`w["last"] = now`,
+    `meta["pov"] = ...`) are TOP-LEVEL key reassignments on the already-
+    independent `dict(v)` copy — they never reach the retained snapshot (which
+    needs a NESTED in-place mutation to corrupt, as `vars`/tiles/zones had).
+    Still, switched both to `copy.deepcopy(v)` for symmetry with the save side +
+    every other dict field, so the inconsistency stops magnetizing audit
+    re-investigation and a future nested field can't silently reintroduce the
+    bug. (Documented as verified-safe so pass N+1 doesn't re-flag it.)
+  - Numeric harnesses re-verified EXACT (no bugs): `damage_part` (every cap mode
+    × percent × rounding × 0/0 passthrough × vital), the `apply_modifiers` fold
+    (add/inc%/more%/set/min/max tiers, priority bumps, op-order, stat caps),
+    `damage_spread` apportionment (largest-remainder shares sum to total across
+    weighted/uniform/fragment/main_only/spatial-miss/all-zero-weights), and the
+    CLAMP chokepoint (hard always clamps; soft engages only crossing from the
+    legal side and stays DORMANT past the bound; max-before-min ordering).
+  - OPEN QUESTION raised with the user (ambiguous → not fixed): a non-vital body
+    PART destroyed by damage (hp→0 via `damage_part`) LINGERS attached-but-dead
+    and does NOT route through `Entity.remove`, so its anchored AURA is never
+    released by `_release_anchored_zones` — the aura stays bound, frozen, until
+    the part is healed (re-stamps on next move) or the parent dies (cascade
+    `remove` releases it). May be intended (a dead limb's aura reactivates on
+    heal) vs. the `anchored_zone_on_anchor_loss` rule that fires on true
+    death/despawn. Awaiting the user's call before touching `_process_part_death`.
+
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
 and explain the "why").

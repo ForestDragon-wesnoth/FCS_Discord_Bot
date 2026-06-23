@@ -13276,3 +13276,36 @@ at (6,3), so the push stops after one cell — tank anchor at (4,3), center colu
 tank's own cells, reading as blocked), so the push silently did nothing (0 cells)
 — or, with a clear lane, committed via the vehicle's move_dirs and could fail
 mid-commit. Pushing a non-driver passenger still raises "dismount first".
+
+
+SCENARIO 518 — damage_spread fragment mode works without a random_seed
+----------------------------------------------------------------------
+
+!match new fr Frag 8 8
+!match use fr
+!ent add ogre Ogre 100 1 1 5
+!part add ogre a A 0 0
+!part add ogre b B 0 0
+!part add ogre c C 0 0
+!ent set_var a to_main_percent 100
+!ent set_var b to_main_percent 100
+!ent set_var c to_main_percent 100
+!ent set_var a aoe_weight 1
+!ent set_var b aoe_weight 1
+!ent set_var c aoe_weight 1
+!ent add bomber Bomber 20 4 4 5
+!ent set_var bomber actions.frag.target entity
+!ent set_var bomber actions.frag.body "entity[self].dealt = damage_spread(target, 30, 'fragment')"
+!action bomber frag ogre
+!eval "var_get('ogre', 'hp')"
+!eval "var_get('bomber', 'dealt')"
+
+Expected: the ogre has three 0/0 passthrough parts (to_main_percent=100). The
+bomber's `fragment`-mode damage_spread of 30 splits 30 across the parts as
+discrete weighted-random hits and routes each share to the ogre's main HP at
+100% — so the total to main is exactly 30 regardless of which fragments land
+where: ogre hp 100 → 70, bomber.dealt = 30. Before the fix, fragment mode
+referenced a `random` module that logic.py never imported, so with the default
+(no random_seed) config — where the match RNG is None — it crashed with
+"name 'random' is not defined". Weighted/uniform/main_only modes were
+unaffected (no RNG), which is why scenarios 410-413 never caught it.
