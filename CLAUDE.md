@@ -379,14 +379,45 @@ scenario that should output "Damaged foe by 5" but actually outputs
 "❌ Cell occupied" will PASS the harness. Write end-state assertions
 that parse `!ent dump` / `!list` output.
 
+### Do audit/interaction passes YOURSELF — don't delegate to weak survey agents
+
+**User directive (standing, as of the audit-pass era):** for correctness /
+interaction audits on this system, do the work DIRECTLY — read the code, trace
+the cross-cutting paths, and write numeric/behavioral assertion harnesses
+yourself. Do NOT fan the audit out to a swarm of survey subagents running
+weaker models (e.g. Haiku). They are no longer sufficient for this task: a
+giant interconnected engine is the opposite of "obvious," and that's exactly
+where they fall down. They're fine for catching shallow, LOCAL issues (a
+missing import, a typo, "does X exist") — not for the interaction bugs that
+are the entire point of these passes.
+
+The evidence from the passes themselves: the swarm largely reported "clean,"
+while the bugs that actually mattered came from doing it by hand —
+`damage_spread`'s fragment-mode `NameError` (caught by a numeric harness, not
+an agent), the turn-order skip-loop crash + round inflation, the mount
+push/pull footprint bug, and the load-side deepcopy class. The agents'
+serialization "findings" were false positives that cost verification time.
+
+Yes, doing it yourself is more token-expensive. The user has explicitly said
+that's the right trade: **more results per pass beats cheaper passes.** So:
+- Read the relevant subsystems end-to-end and reason about how they compose.
+- Write throwaway numeric/end-state assertion scripts for every gnarly
+  primitive (damage_part, the modifier fold, damage_spread, clamps, geometry
+  — see the prior passes for the pattern). The harness only catches `💥`;
+  YOUR assertions catch wrong answers.
+- Reserve subagents for genuinely parallel, mechanical, LOCAL lookups, not for
+  holding the whole model in their head.
+
 ### Don't blindly trust agent recommendations
 
-You may launch an Explore or general-purpose agent to survey the
-codebase. The agents are useful but get things wrong — they'll claim
-features don't exist when they do, miss key context, or recommend
-features that already shipped. **Verify every agent claim with grep
-before presenting to the user.** Past survey agents have hallucinated
-~30% of their recommendations.
+If you DO use an Explore or general-purpose agent for a narrow lookup, treat
+its output as a lead, not a conclusion. The agents get things wrong — they'll
+claim features don't exist when they do, miss key context, recommend features
+that already shipped, or flag false-positive "bugs" (e.g. the pass-11
+watchers/bound_channels shallow-copy claims, which were verified safe).
+**Verify every agent claim against the code yourself before acting or
+presenting it to the user.** Past survey agents have hallucinated ~30% of
+their recommendations.
 
 ---
 
