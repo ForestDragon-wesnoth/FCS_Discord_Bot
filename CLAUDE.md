@@ -1948,6 +1948,39 @@ More shipped work (continuing the list above):
   entity by literal id or via `self` only when it IS the active entity. (This
   differs from STATUS hooks, where the affected entity is bound as `self`.)
 
+- **Audit-pass-9 fix: snake-trail coords shift with resize + cross-match copy
+  (scenarios 513-514).** A ninth sweep — this one INTERACTION-focused (single
+  subsystems are heavily swept now). Three read-only survey agents: (1)
+  visibility/render/disguise × transform/mount/viewport/legend/fog, (2)
+  modifier/status/team × transform/death/parts, (3) resize/transfer/choice-
+  replay/undo. Agents 1-2 re-confirmed their interaction surfaces correct
+  (disguise POV gating vs fog vs mechanics separation; viewport/legend window
+  clipping; team-membership-change reads `e.team` fresh for modifiers+passives;
+  status-removal drops modifiers live; transform wholesale-replaces status;
+  part-on-different-team gets its own team passives; choice-replay preserves the
+  event stack + resets summon budget; watchers fire only at the top-level
+  command boundary, never mid-action). Agent 3 found the one real bug:
+  - **`__seg_path` / `__seg_last` (the engine-managed snake-trail coordinate
+    vars) were not shifted by `resize_grid` nor offset by `copy_entity`.** These
+    are the ONLY coordinate-bearing ENTITY VARS the engine owns (head vars: a
+    list of `[x,y]` cells the head has occupied + the head's last cell, used by
+    `path`-follow-mode segments). resize_grid shifted entities/tiles/zones/
+    explored/channel_views but missed them, and copy_entity remapped part_of +
+    `__follows` but didn't offset them — so a path-mode snake re-laid its body at
+    STALE cells after a center/edge-anchored resize, and a transferred snake
+    re-laid at the SOURCE's coordinates in the destination match. Fixed with a
+    shared `Match._shift_snake_path_vars(vars, ox, oy)` static helper called from
+    the resize entity-shift loop and per-spawned-entity in copy_entity (delta =
+    the same offset the anchor moves by). NOTE: copy_entity is a `MatchManager`
+    method, so it calls the helper as `Match._shift_snake_path_vars(...)`, not
+    `self.` (a transfer scenario now also guards that cross-match path against
+    a crash). KNOWN pre-existing quirk surfaced (NOT fixed — separate from the
+    coord bug): path-mode segments legitimately OVERLAP early (the trail is
+    shorter than `(segments+1)*spacing`), and copy_entity re-validates occupancy
+    on spawn, so transferring a snake whose trail hasn't spread yet fails with
+    "cell occupied" — left as-is since overlapping located parts are themselves
+    a questionable state.
+
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
 and explain the "why").

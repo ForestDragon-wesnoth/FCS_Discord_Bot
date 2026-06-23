@@ -13139,3 +13139,69 @@ wit.marked=1) must NOT fire afterward — wit.marked stays 0. Completes the
 ghost-handler sweep from audit-pass-7 (which guarded the status / hook / event
 firing sites) by also guarding the var-event and var-write-attempt firing paths
 in _fire_var_event_inner / _fire_var_attempt_inner.
+
+
+SCENARIO 513 — Path-mode snake trail shifts with map resize
+-----------------------------------------------------------
+
+!match new sr SnakeResize 22 6
+!match use sr
+!ent add h Centipede 40 8 3 9
+!ent face h right
+!ent set_var h __segment_follow path
+!ent set_var h __segment_spacing 2
+!part segment h s0 S0 6 6
+!part segment h s1 S1 6 6
+!ent move h right
+!ent move h right
+!ent move h right
+!ent move h right
+!ent move h right
+!ent move h right
+!map resize 30 12 center
+!eval "coord_x(entity_center('h'))"
+!eval "coord_x(entity_center('s1'))"
+!ent move h right
+!eval "coord_y(entity_center('s1'))"
+
+Expected: a path-mode centipede (head + 2 segments, spacing 2) lays a trail
+moving right; the head ends at x=14,y=3 pre-resize. Resizing 22x6 → 30x12 with
+the `center` anchor offsets all content by (+4,+3), so the head moves to
+(18,6) and — crucially — its recorded trail (`__seg_path`/`__seg_last`) shifts
+by the same offset. After one more move the segments still trail the head on
+row y=6 (the shifted row), not the stale pre-resize row. Before the fix
+resize_grid shifted entities/tiles/zones/explored/viewport but NOT the
+engine-managed snake-trail vars, so segments re-laid at the old coordinates.
+
+
+SCENARIO 514 — Path-mode snake transfer carries its trail to the destination
+----------------------------------------------------------------------------
+
+!match new st1 SnakeSrc 22 6
+!match use st1
+!ent add h Centipede 40 8 3 9
+!ent face h right
+!ent set_var h __segment_follow path
+!ent set_var h __segment_spacing 2
+!part segment h s0 S0 6 6
+!part segment h s1 S1 6 6
+!ent move h right
+!ent move h right
+!ent move h right
+!ent move h right
+!ent move h right
+!ent move h right
+!match new st2 SnakeDst 30 12
+!ent transfer h st2 8 6
+!match use st2
+!ent move h right
+!eval "coord_y(entity_center('s0'))"
+!eval "coord_y(entity_center('s1'))"
+
+Expected: the centipede (with a populated trail) transfers from st1 to st2 at
+(8,6). copy_entity offsets the head's snake-trail coords by the same delta the
+anchor moves by, so the trail re-bases at the destination. After one move in
+st2 the segments trail the head on row y=6 (the destination row). Before the
+fix the trail kept source coordinates, so segments would re-lay at the source
+location offsets in the new match. (This scenario also exercises the
+cross-match transfer path end-to-end — a missing helper would crash here.)

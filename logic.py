@@ -4947,6 +4947,27 @@ class Match:
     def in_bounds(self, x: int, y: int) -> bool:
         return 1 <= x <= self.grid_width and 1 <= y <= self.grid_height
 
+    @staticmethod
+    def _shift_snake_path_vars(vars_dict: Dict[str, Any], ox: int, oy: int) -> None:
+        """Shift the engine-managed snake-trail coordinate vars by (ox, oy):
+        __seg_path (a list of [x,y] cells the head has occupied) and __seg_last
+        ([x,y], the head's last-seen cell). No-op if absent/malformed. These are
+        the only coordinate-bearing ENTITY VARS the engine owns, so resize_grid
+        and cross-match copy must shift them like every other spatial structure
+        — otherwise a path-mode snake re-lays its body at stale cells after the
+        shift."""
+        if ox == 0 and oy == 0:
+            return
+        path = vars_dict.get("__seg_path")
+        if isinstance(path, list):
+            for p in path:
+                if isinstance(p, list) and len(p) == 2:
+                    p[0] += ox
+                    p[1] += oy
+        last = vars_dict.get("__seg_last")
+        if isinstance(last, (list, tuple)) and len(last) == 2:
+            vars_dict["__seg_last"] = [last[0] + ox, last[1] + oy]
+
     def resize_grid(self, new_w: int, new_h: int,
                     anchor: str = "top-left") -> Tuple[Dict[str, Any], List[str]]:
         """Resize the grid to new_w x new_h, repositioning ALL content
@@ -5010,6 +5031,7 @@ class Match:
         for e in self.entities.values():
             e.x += ox
             e.y += oy
+            self._shift_snake_path_vars(e.vars, ox, oy)
 
         # Re-key tiles (corpses ride along inside tile data); drop off-grid.
         old_tiles = len(self.tiles)
@@ -12706,6 +12728,10 @@ class MatchManager:
             fol = ne.vars.get("__follows")
             if fol in idmap:
                 ne.vars["__follows"] = idmap[fol]
+            # Offset the head's snake-trail coords to the destination cell so a
+            # transferred path-mode snake re-lays at its new location, not the
+            # source's (same delta the anchor moves by).
+            Match._shift_snake_path_vars(ne.vars, tx - e.x, ty - e.y)
             if oid == eid or not oe.is_located_part:
                 px, py = tx, ty
             else:  # a located part keeps its offset from the anchor
