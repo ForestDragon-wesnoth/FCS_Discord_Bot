@@ -2073,14 +2073,40 @@ More shipped work (continuing the list above):
     weighted/uniform/fragment/main_only/spatial-miss/all-zero-weights), and the
     CLAMP chokepoint (hard always clamps; soft engages only crossing from the
     legal side and stays DORMANT past the bound; max-before-min ordering).
-  - OPEN QUESTION raised with the user (ambiguous → not fixed): a non-vital body
-    PART destroyed by damage (hp→0 via `damage_part`) LINGERS attached-but-dead
-    and does NOT route through `Entity.remove`, so its anchored AURA is never
-    released by `_release_anchored_zones` — the aura stays bound, frozen, until
-    the part is healed (re-stamps on next move) or the parent dies (cascade
-    `remove` releases it). May be intended (a dead limb's aura reactivates on
-    heal) vs. the `anchored_zone_on_anchor_loss` rule that fires on true
-    death/despawn. Awaiting the user's call before touching `_process_part_death`.
+  - OPEN QUESTION (RAISED → RESOLVED, shipped as the `suspend` mode below): a
+    non-vital body PART destroyed by damage (hp→0 via `damage_part`) LINGERS
+    attached-but-dead and does NOT route through `Entity.remove`, so its anchored
+    AURA was never released. While investigating, established the current
+    death-aura behavior: entity death/kill/despawn (and the part-death cascade)
+    all route through `Entity.remove` → `_release_anchored_zones` → the
+    `anchored_zone_on_anchor_loss` rule (delete/freeze); the ONE gap was the
+    lingering-destroyed-limb case. The user's call: add a third mode that
+    SUSPENDS the aura while the anchor is dead and RESUMES it on revive/heal,
+    for BOTH entity death/revive and part destroy/heal. Shipped — see next entry.
+
+- **Anchored-aura `suspend` mode (suspend-while-dead, resume-on-revive) —
+  SHIPPED (scenarios 519-520).** A third value for the
+  `anchored_zone_on_anchor_loss` rule, alongside `delete` (default) and
+  `freeze`: `suspend` clears the aura's CELLS (it goes inert — no render, no
+  hooks, no membership) but KEEPS the anchor binding, so the aura automatically
+  RE-STAMPS around the anchor if that entity is revived from its corpse or that
+  part is healed above 0. Implementation: `_release_anchored_zones` gained the
+  `suspend` branch (`z["cells"] = set()`, binding retained); the symmetric
+  `_resume_anchored_zones(eid)` = `_restamp_anchors_for` (a no-op unless the
+  anchor is alive again, since `_stamp_anchored_zone` only re-fills for a live
+  anchor). Wiring: (1) `_process_part_death` now calls `_release_anchored_zones`
+  on the destroyed limb (this ALSO closes the original gap for delete/freeze —
+  a destroyed limb's aura now follows the rule like any other anchor loss,
+  whereas before it was left stale); (2) `damage_part`'s heal path (latch clear
+  on hp>0) calls `_resume_anchored_zones`; (3) `revive_corpse` resumes the
+  entity + its whole part subtree AFTER the revive effects + check_death settle
+  (resuming only if the entity is actually `is_alive` — a revive policy that
+  leaves it dead keeps the aura suspended). Multi-tile anchors work (the
+  footprint disc re-stamps on resume). Suspended auras serialize for free (a
+  zone with empty cells + an anchor binding). CAVEAT (documented in the rule
+  desc): a true despawn (`!ent remove`) under `suspend` leaves an inert bound
+  zone that can't resume (nothing to revive) — re-anchor or delete it manually.
+  Default stays `delete` (backward compat); `delete`/`freeze` unchanged.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

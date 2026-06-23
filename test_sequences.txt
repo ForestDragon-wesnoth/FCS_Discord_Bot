@@ -13309,3 +13309,58 @@ referenced a `random` module that logic.py never imported, so with the default
 (no random_seed) config — where the match RNG is None — it crashed with
 "name 'random' is not defined". Weighted/uniform/main_only modes were
 unaffected (no RNG), which is why scenarios 410-413 never caught it.
+
+
+SCENARIO 519 — Anchored aura 'suspend' mode: entity death suspends, revive resumes
+----------------------------------------------------------------------------------
+
+!match new asus AuraSuspend 12 12
+!match use asus
+!system set default anchored_zone_on_anchor_loss suspend
+!ent add mage Mage 30 5 5 10
+!zone new flame
+!zone glyph flame f
+!zone anchor flame mage 1
+!eval "zone_size('flame')"
+!ent kill mage
+!eval "zone_size('flame')"
+!eval "zone_anchor_of('flame')"
+!ent revive mage
+!eval "zone_size('flame')"
+
+Expected: with anchored_zone_on_anchor_loss=suspend, the mage's radius-1 aura
+is the 3×3 disc (size 9) while alive. Killing the mage SUSPENDS the aura — its
+cells go empty (size 0, so it renders nothing / fires no hooks / has no
+membership) but the anchor BINDING is kept (zone_anchor_of stays 'mage', unlike
+delete which drops the zone or freeze which unbinds). Reviving the mage (default
+revive heals to max_hp, so it's alive) RESUMES the aura: it re-stamps to size 9.
+
+
+SCENARIO 520 — Anchored aura 'suspend' mode: part destruction suspends, heal resumes
+------------------------------------------------------------------------------------
+
+!match new psus PartSuspend 12 12
+!match use psus
+!system set default anchored_zone_on_anchor_loss suspend
+!ent add ogre Ogre 100 5 5 10
+!part add ogre arm Arm 20 20
+!zone new poison
+!zone anchor poison arm 1
+!eval "zone_size('poison')"
+!ent add hitter Hitter 20 8 8 5
+!ent set_var hitter actions.smash.target entity
+!ent set_var hitter actions.smash.body "damage_part(part(target, 'arm'), 50)"
+!action hitter smash ogre
+!eval "zone_size('poison')"
+!eval "zone_anchor_of('poison')"
+!ent set_var hitter actions.mend.target entity
+!ent set_var hitter actions.mend.body "damage_part(part(target, 'arm'), -40)"
+!action hitter mend ogre
+!eval "zone_size('poison')"
+
+Expected: the ogre's arm carries a radius-1 aura (size 9). With suspend mode,
+destroying the arm (damage_part 50 → arm hp 0) SUSPENDS its aura — size 0, but
+the binding stays (zone_anchor_of='arm'); the destroyed limb lingers attached.
+Healing the arm back above 0 (damage_part -40) clears the destroyed latch and
+RESUMES the aura to size 9. (A destroyed limb never routes through Entity.remove,
+so this is handled directly in _process_part_death / the damage_part heal path.)

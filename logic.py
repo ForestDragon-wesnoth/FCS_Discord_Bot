@@ -950,15 +950,22 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "anchored_zone_on_anchor_loss": {
         "default": "delete",
-        "schema": {"type": "enum", "choices": ["delete", "freeze"]},
+        "schema": {"type": "enum", "choices": ["delete", "freeze", "suspend"]},
         "desc": (
             "What happens to an entity-anchored aura zone (one bound via "
             "`!zone anchor <name> <eid> <radius>`) when its anchor entity "
-            "dies or leaves the match. 'delete' (default) removes the zone "
-            "entirely — the aura vanishes with its source. 'freeze' clears "
-            "the anchor binding but leaves the cells where they last were, "
-            "turning the aura into an ordinary static zone (a lingering "
-            "cloud the caster left behind)."
+            "dies, is destroyed (a body part hit to 0 hp), or leaves the "
+            "match. 'delete' (default) removes the zone entirely — the aura "
+            "vanishes with its source. 'freeze' clears the anchor binding but "
+            "leaves the cells where they last were, turning the aura into an "
+            "ordinary static zone (a lingering cloud the caster left behind). "
+            "'suspend' clears the aura's cells (it goes inert — no render, no "
+            "hooks, no membership) but KEEPS the anchor binding, so the aura "
+            "automatically RESUMES (re-stamps around the anchor) if that "
+            "entity is revived from its corpse or that part is healed above 0. "
+            "Note: a true despawn (`!ent remove`) under 'suspend' leaves an "
+            "inert bound zone that won't resume (nothing to revive) — re-anchor "
+            "or delete it manually."
         ),
     },
     # ---- mounts / vehicles ----
@@ -6553,19 +6560,35 @@ class Match:
         return had
 
     def _release_anchored_zones(self, eid: str) -> None:
-        """Handle auras anchored to `eid` when it dies / leaves the match,
-        per the anchored_zone_on_anchor_loss rule: 'delete' drops the zone,
-        'freeze' clears the binding and leaves the cells as a static zone."""
+        """Handle auras anchored to `eid` when it dies / is destroyed / leaves
+        the match, per the anchored_zone_on_anchor_loss rule: 'delete' drops
+        the zone, 'freeze' clears the binding and leaves the cells as a static
+        zone, 'suspend' clears the cells (inert) but KEEPS the binding so the
+        aura resumes (re-stamps) if the anchor is revived/healed — see
+        _resume_anchored_zones."""
         mode = str(self.rules.get("anchored_zone_on_anchor_loss", "delete"))
         for name in [n for n, z in self.zones.items()
                      if isinstance(z, dict) and z.get("anchor") == eid]:
+            z = self.zones[name]
             if mode == "freeze":
-                z = self.zones[name]
                 z.pop("anchor", None)
                 z.pop("anchor_radius", None)
                 z.pop("anchor_metric", None)
+            elif mode == "suspend":
+                # Inert but still bound: empty cells (no render/hooks/
+                # membership) while the anchor is dead; _restamp re-fills it
+                # once the anchor is alive again (revive / part heal).
+                z["cells"] = set()
             else:
                 del self.zones[name]
+
+    def _resume_anchored_zones(self, eid: str) -> None:
+        """Re-stamp any auras still bound to `eid` after it comes back alive
+        (corpse revive / part heal). A no-op unless the aura was suspended
+        (mode 'suspend' kept the binding); _stamp_anchored_zone only re-fills
+        when the anchor is actually alive, so calling this on a healthy
+        anchor is harmless."""
+        self._restamp_anchors_for(eid)
 
     def anchor_zone(self, name: str, eid: str, radius: int = 0,
                     metric: str = "square_radius") -> int:
@@ -10172,9 +10195,12 @@ class Match:
         if new_hp != cur_hp:
             p.write_var(hp_var, new_hp)
         # A heal that lifts a previously-destroyed part back above 0 clears
-        # the destroyed latch so it can break (and re-fire on_death) again.
+        # the destroyed latch so it can break (and re-fire on_death) again,
+        # and RESUMES any aura suspended when it was destroyed (no-op unless
+        # anchored_zone_on_anchor_loss is 'suspend').
         if new_hp > 0 and p.vars.get("__part_destroyed"):
             p.vars.pop("__part_destroyed", None)
+            self._resume_anchored_zones(p.id)
         # (4) destruction.
         if new_hp <= 0 and (cur_hp - amount) <= 0 and not self.is_indestructible(p):
             log += self._process_part_death(p)
@@ -10194,6 +10220,11 @@ class Match:
         self.log_event("part_destroyed", entity=p.id, name=p.name,
                        part_of=p.part_of or "")
         log = self.fire_hook("on_death", target_ids=[p.id])
+        # A destroyed limb LINGERS attached (it doesn't route through
+        # Entity.remove), so resolve its anchored auras here too — same
+        # delete/freeze/suspend rule as any anchor loss. Idempotent if a
+        # later cascade removes the part.
+        self._release_anchored_zones(p.id)
         if not cascade:
             vital = bool(p.vars.get("vital",
                                     self.rules.get("part_vital_default", False)))
@@ -10605,6 +10636,14 @@ class Match:
         death_log: List[str] = []
         if e.id in self.entities:
             death_log = self.check_death(e.id)
+        # Resume any auras suspended while this entity (or its parts) were dead
+        # — done last, once hp is settled and the entity SURVIVED the revive
+        # (if the revive policy left it dead, check_death above re-killed it and
+        # the auras stay suspended). No-op unless mode='suspend' kept a binding.
+        if e.id in self.entities and e.is_alive:
+            self._resume_anchored_zones(e.id)
+            for part in self.entity_part_subtree(e.id):
+                self._resume_anchored_zones(part.id)
         return e.id, spawn_log + revive_log + death_log
 
     # ---------- polymorph / transform (identity-preserving statblock swap) -----
