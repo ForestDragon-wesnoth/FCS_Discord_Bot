@@ -7860,6 +7860,13 @@ class Match:
             raise VTTError("push: n must be an integer.")
         if n <= 0:
             return 0, []
+        # Mounts: redirect a driver's push to its VEHICLE (the whole rig is
+        # shoved, riders carried); a passenger raises ("dismount first").
+        # Resolve BEFORE the footprint prefix-walk so the vehicle's footprint
+        # is the one validated AND committed — otherwise the walk OK's the
+        # rider's 1x1 path and the redirected vehicle move_dirs then fails
+        # mid-commit. Mirrors tp/move_dirs/swap.
+        e = e._mount_move_redirect()
         dx, dy = DIRECTION_VECTORS[canon]
         # Walk forward to find the longest legal prefix. The push stops
         # at the cell BEFORE the first blocker. Intermediate occupancy
@@ -7930,6 +7937,11 @@ class Match:
                 raise VTTError(f"pull: {label} must be an integer.")
         if n <= 0:
             return 0, []
+        # Mounts: a driver's pull drags its VEHICLE (riders carried); a
+        # passenger raises ("dismount first"). Resolve before the footprint
+        # prefix-walk so the vehicle's body is validated AND committed (see
+        # push_entity). Mirrors tp/move_dirs/swap.
+        e = e._mount_move_redirect()
         allow_diag = bool(self.rules.get("allow_diagonal_movement", False))
         stackable = e.is_cell_stackable
         # Walk forward to find the longest legal prefix, recomputing the
@@ -8328,6 +8340,12 @@ class Match:
             # The opening entity may itself be skippable (e.g. starts
             # stunned) — skip forward to the first eligible one.
             eligible = self._skip_to_eligible(log)
+            # A skip's round-wrap (its internal _advance_index firing
+            # on_round_end/start hooks) can itself empty the order — re-check
+            # before indexing, same guard as after the turn_end/advance steps.
+            if not self.turn_order:
+                self.history.record_turn(self)
+                return (None, log)
             cur = self.turn_order[self.active_index]
             if eligible:
                 log.extend(self.fire_hook(
@@ -8370,6 +8388,11 @@ class Match:
             return (None, log)
         # Skip over any entity carrying a skip-status flag.
         eligible = self._skip_to_eligible(log)
+        # _skip_to_eligible's internal round-wrap hooks can empty the order;
+        # re-check before reading the next entity (mirrors the guard above).
+        if not self.turn_order:
+            self.history.record_turn(self)
+            return (None, log)
         new_cur = self.turn_order[self.active_index]
         if eligible:
             log.extend(self.fire_hook(
@@ -8450,7 +8473,7 @@ class Match:
         (the caller then passes the round without firing on_turn_start).
         Bounded to one full turn-order cycle so an all-skippable table
         can't loop forever."""
-        n = len(self.turn_order)
+        n = len(self.turn_order)   # hard cap vs. a skip-hook that GROWS the order
         checked = 0
         while checked < n:
             # A skip's round-wrap (or a skip-status side effect) can empty
@@ -8470,6 +8493,14 @@ class Match:
             log.append(f"⏭️ `{cur}`'s turn skipped ({matched}).")
             self._advance_index(log)
             checked += 1
+            # Bound by the CURRENT order size, not the stale `n`. If a
+            # round-wrap hook SHRANK the order mid-skip, `n` over-counts and
+            # the loop would keep cycling the survivors — firing extra round
+            # wraps (inflating round_number) before exhausting `n`. Once we've
+            # taken a full cycle's worth of steps for the live order and found
+            # nobody eligible, stop.
+            if checked >= len(self.turn_order):
+                return False
         # Full cycle without finding an eligible entity.
         return False
 

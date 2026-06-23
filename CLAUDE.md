@@ -1981,6 +1981,57 @@ More shipped work (continuing the list above):
     "cell occupied" — left as-is since overlapping located parts are themselves
     a questionable state.
 
+- **Audit-pass-10 fixes: turn-order skip-loop + mount push/pull footprint
+  (scenarios 515-517).** The widest sweep yet — FIVE read-only interaction
+  agents (mounts/vehicles deep; movement/block/opacity; turn-order & clocks;
+  formula-sandbox safety; access-gate/dispatch) PLUS hand-written numeric
+  assertion harnesses for the gnarliest primitives. Agents confirmed correct
+  (no change): the whole movement/block/opacity surface (footprint-aware
+  push/pull/swap/group, fail-open conditions, LOS symmetry/corner modes,
+  raycast/first_opaque endpoints), the formula SANDBOX (no escapes — empty
+  `__builtins__`, entity[X] mandatory-`.path`, every HOOK_CONTEXT name in
+  `_who_arg`'s dynamic branch, `normalize_body_source` at every body boundary,
+  kh0/explode/band/roll_table edges), and the ACCESS GATE (no batch/run/macro/
+  foreach/alias/cmd bypass; overrides-before-rule precedence; approval re-gates
+  with the approver's authority). My own numeric harnesses re-verified
+  `damage_part` (every cap mode × percent × rounding × 0/0 passthrough × vital)
+  and the `apply_modifiers` fold (add/inc%/more%/set/min/max tiers, priority
+  bumps, op-order, stat caps) — all exact. Three real bugs fixed:
+  - **Turn-order crash when a skip-status round-wrap empties the order
+    (HIGH).** pass-3 guarded next_turn against an emptied order after the
+    turn_end hooks and after `_advance_index`'s round-wrap, but NOT after
+    `_skip_to_eligible` — whose OWN internal `_advance_index` (stepping over a
+    `skips_turn` entity) can wrap and fire on_round_end/start hooks that remove
+    the last entity. next_turn then did `turn_order[active_index]` on an empty
+    list → IndexError (💥). Fixed: re-check `if not self.turn_order: return
+    (None, log)` after BOTH `_skip_to_eligible` calls (opening-round + normal
+    paths). Scenario 515.
+  - **Skip-loop stale bound inflates round_number (MED).**
+    `_skip_to_eligible` sampled `n = len(turn_order)` ONCE; if a round-wrap hook
+    SHRANK the order mid-skip, the stale `n` let the loop keep cycling the
+    survivors, firing on_round_end repeatedly and inflating round_number (a
+    command-only repro: 3 entities, two removed on round_end, advanced round by
+    3 instead of 1). Fixed: bound by the CURRENT order size each step
+    (`if checked >= len(self.turn_order): return False`), keeping the initial
+    `n` only as a hard cap against a skip-hook that GROWS the order. Identical
+    behavior in the common no-shrink case. Scenario 516.
+  - **push/pull validated the RIDER's footprint, not the vehicle's (HIGH).**
+    `push_entity`/`pull_entity` walked the legal-prefix using the target
+    entity's footprint, then committed via `e.move_dirs`, which redirects a
+    mounted DRIVER to its vehicle (`_mount_move_redirect`). So pushing a 1×1
+    pilot of a 2×2 tank validated the pilot's 1×1 path (which sat inside the
+    tank's own cells → read as blocked → silent no-op) or, on a clear lane,
+    committed the vehicle move that the prefix never validated (stop-early /
+    mid-commit mismatch). Fixed: resolve `_mount_move_redirect()` at the START
+    of push/pull (after the `n<=0` guard), so the VEHICLE's footprint is what's
+    validated AND committed — and a non-driver PASSENGER raises "dismount
+    first." Mirrors the tp/move_dirs/swap redirect (single-level, like swap).
+    Scenario 517. (Process note: while reverting this for a pre-fix check I
+    re-inserted the block at the wrong `dx,dy = DIRECTION_VECTORS[canon]`
+    occurrence — that string also appears in `move_dirs` — briefly corrupting
+    move_dirs. Lesson: a bare `s.find(old)` restore is unsafe when `old` isn't
+    unique; prefer the Edit tool with surrounding context.)
+
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
 and explain the "why").

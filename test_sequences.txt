@@ -13205,3 +13205,74 @@ st2 the segments trail the head on row y=6 (the destination row). Before the
 fix the trail kept source coordinates, so segments would re-lay at the source
 location offsets in the new match. (This scenario also exercises the
 cross-match transfer path end-to-end — a missing helper would crash here.)
+
+
+SCENARIO 515 — Skip-status round-wrap that empties the order doesn't crash
+-------------------------------------------------------------------------
+
+!match new tc TurnCrash 6 6
+!match use tc
+!ent add a Alice 30 1 1 5
+!ent status a set stun skips_turn true
+!gpassive add reaper on_round_end "remove_entity('a')"
+!turn next
+!list
+
+Expected: Alice carries a `skips_turn` status. The first `!turn next` begins the
+round, then skips Alice; her skip advances the (single-entity) order, which WRAPS
+— firing on_round_end, whose handler removes Alice, emptying the turn order. The
+engine must NOT crash re-reading the active entity afterward: next_turn detects
+the now-empty order after `_skip_to_eligible` and returns "no turn" gracefully.
+Before the fix, `turn_order[active_index]` indexed an empty list → 💥 IndexError.
+
+
+SCENARIO 516 — Skip loop bound tracks the live order (no round inflation)
+------------------------------------------------------------------------
+
+!match new ti TurnInflate 10 4
+!match use ti
+!ent add a A 30 1 1 5
+!ent add b B 30 2 1 5
+!ent add c C 30 3 1 5
+!ent status c set stun skips_turn true
+!gpassive add reaper on_round_end "remove_entity('a'); remove_entity('b')"
+!turn next
+!turn next
+!turn next
+!eval "round_number()"
+
+Expected: a and b act on turns 1 and 2 (round 1). The third `!turn next` ends b,
+advances to c, whose `skips_turn` skip wraps the order — firing on_round_end,
+which removes a and b, leaving only c (also skippable). The round must advance by
+exactly ONE (to round 2), then pass with nobody able to act. Before the fix
+`_skip_to_eligible` bounded its skip loop by the order size sampled ONCE; with the
+order shrinking mid-skip that stale bound let the loop keep cycling the lone
+survivor, firing on_round_end repeatedly and inflating round_number (to 4 here).
+Now the loop re-checks the live order size each step, so round_number = 2.
+
+
+SCENARIO 517 — Pushing a vehicle's driver validates the VEHICLE's footprint
+--------------------------------------------------------------------------
+
+!match new mp MountPush 12 8
+!match use mp
+!ent add veh Tank 80 3 3 5
+!ent set_var veh footprint_w 2
+!ent set_var veh footprint_h 2
+!ent set_var veh slots.pilot.capacity 1
+!ent set_var veh slots.pilot.controls_movement true
+!ent add rider Pilot 20 1 1 5
+!mount rider veh pilot
+!ent add wall Wall 10 6 3 5
+!ent push rider right 5
+!eval "coord_x(entity_center('veh'))"
+
+Expected: a 1×1 pilot drives a 2×2 tank (anchored at (3,3), covering columns
+3-4). Pushing the pilot RIGHT redirects to the whole tank (driver controls
+movement). The push must validate the TANK's 2×2 swept footprint: moving right
+one cell puts it on columns 4-5; a second step would put column 6 onto the wall
+at (6,3), so the push stops after one cell — tank anchor at (4,3), center column
+4. Before the fix, push validated the pilot's 1×1 path (which sat inside the
+tank's own cells, reading as blocked), so the push silently did nothing (0 cells)
+— or, with a clear lane, committed via the vehicle's move_dirs and could fail
+mid-commit. Pushing a non-driver passenger still raises "dismount first".
