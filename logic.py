@@ -744,6 +744,76 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "changes are deferrable."
         ),
     },
+    # ---- Active Time Battle (ATB) ----
+    # An optional, SYSTEM-WIDE turn model (a system is designed with it in
+    # mind from the start, so it's a plain rule, not a per-match toggle).
+    # When atb_enabled is on, ROUNDS ARE DISABLED: next_turn no longer cycles
+    # turn_order or fires on_round_*; instead each entity accrues CHARGE into
+    # a bar var (atb_charge_var) at a per-entity RATE (atb_charge_formula),
+    # and the next turn goes to whoever's bar fills first. Round-coupled
+    # formulas (round_number / turn_index / schedule) raise a visible error,
+    # and a one-time warning fires if dormant on_round_* hooks / round status
+    # ticks / round schedules exist while ATB is active. Turn hooks/ticks
+    # (on_turn_start/end, turn status ticks, schedule_on) fire for the actor
+    # exactly as before — only the ROUND layer is removed.
+    "atb_enabled": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Master switch for the Active Time Battle turn model. When True, "
+            "rounds are disabled (round_number()/turn_index()/schedule() raise; "
+            "on_round_* hooks, round status ticks, and round schedules never "
+            "fire) and next_turn picks the entity whose ATB bar fills soonest "
+            "instead of cycling turn order. Design a system around this from "
+            "the start — it changes the fundamental turn flow."
+        ),
+    },
+    "atb_charge_formula": {
+        "default": "entity[self].initiative",
+        "schema": {"type": "str"},
+        "desc": (
+            "Formula EXPRESSION giving an entity's per-tick ATB charge RATE "
+            "(`self` = the entity). The bar fills by this rate; the entity "
+            "with the least time-to-fill ((atb_threshold - bar) / rate) acts "
+            "next. Default reuses the initiative var (every turn-order member "
+            "has one), so initiative doubles as speed out of the box. Compose "
+            "richer rates with vars the entity actually has (a missing var "
+            "RAISES — guard with var_has or give it a default via !defvar): "
+            "e.g. `entity[self].speed + entity[self].haste * 2`. A rate <= 0 "
+            "means the entity can't charge (never acts). Only when atb_enabled."
+        ),
+    },
+    "atb_threshold": {
+        "default": 100,
+        "schema": {"type": "int"},
+        "desc": (
+            "The ATB bar value an entity must reach to take a turn. Higher = "
+            "slower cadence overall. Per-entity pace is expressed via the "
+            "charge rate, not here. Only consulted when atb_enabled."
+        ),
+    },
+    "atb_reset_formula": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "What happens to the actor's ATB bar after it takes a turn. EMPTY "
+            "(default) = the built-in: subtract atb_threshold (keeping any "
+            "overflow toward the next turn). Set a formula PROGRAM (`self` = "
+            "the actor) to override — e.g. `entity[self].atb_charge = 0` to "
+            "drop overflow, or subtract more for a recovery penalty. Read the "
+            "threshold via atb_threshold(). Runs for a skipped turn too."
+        ),
+    },
+    "atb_charge_var": {
+        "default": "atb_charge",
+        "schema": {"type": "str"},
+        "desc": (
+            "Name of the entity var holding the ATB charge bar. It's an "
+            "ordinary var, so a GM formula can read it (var_get) or nudge it "
+            "(a 'haste' effect that adds charge, an 'ambush' that pre-fills "
+            "it). Absent = 0. Only used when atb_enabled."
+        ),
+    },
     # Status auto-tick. Each status the engine knows about is just a
     # named dict on Entity.status — there is no hardcoded "remaining"
     # field or auto-decay. Instead the GM configures a tick:
@@ -4874,6 +4944,12 @@ class Match:
     # _rng was built with so a seed change triggers a rebuild.
     _rng: Any = field(default=None, repr=False, compare=False)
     _rng_seed: Any = field(default=None, repr=False, compare=False)
+    # One-time latch: warn once per match session that on_round_* logic is
+    # dormant while ATB is active. Reset when ATB is found off in next_turn.
+    _atb_round_warned: bool = field(default=False, repr=False, compare=False)
+    # Whether the most-recently-selected ATB actor was skipped (skips_turn) —
+    # so its turn_END fires only status ticks (decay), not its action hooks.
+    _atb_last_skipped: bool = field(default=False, repr=False, compare=False)
 
     # ---- action runtime state --------------------------------------------
     # Tracks how deep we are in a chain of action invocations. Bumped at
@@ -8359,6 +8435,13 @@ class Match:
         """
         if not self.turn_order:
             return (None, [])
+        # Active Time Battle: rounds are disabled — selection is by charge
+        # bar, not turn-order cycling. Whole separate path.
+        if self.rules.get("atb_enabled"):
+            return self._atb_next_turn()
+        # Round-based play: clear the ATB warn latch so re-enabling ATB warns
+        # about dormant round logic again.
+        self._atb_round_warned = False
         log: List[str] = []
         # First-ever next_turn call: begin round 1 without advancing.
         if not self.round_started:
@@ -8452,6 +8535,199 @@ class Match:
                 "⏭️ every entity is skippable; the round passes "
                 "without anyone acting."
             )
+        self.history.record_turn(self)
+        return (new_cur, log)
+
+    # ---- Active Time Battle ------------------------------------------------
+    @staticmethod
+    def _atb_clean_num(x: float):
+        """Int when integral, else float — keeps charge bars tidy."""
+        return int(x) if float(x).is_integer() else float(x)
+
+    def _atb_threshold_value(self) -> float:
+        try:
+            return float(self.rules.get("atb_threshold", 100))
+        except (TypeError, ValueError):
+            return 100.0
+
+    def _atb_charge_rate(self, e: "Entity") -> float:
+        """Evaluate atb_charge_formula for `e` (self=e) → per-tick rate.
+        Malformed / non-numeric → 0.0 (the entity can't charge)."""
+        src = str(self.rules.get("atb_charge_formula", "")).strip()
+        if not src:
+            return 0.0
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        try:
+            val = FormulaEngine(self).eval_expression(
+                src, EvalCtx(this=e.id, target=e.id))
+        except (FormulaError, Exception):
+            return 0.0
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            return 0.0
+        return float(val)
+
+    def _atb_reset_actor(self, e: "Entity") -> List[str]:
+        """Reset the actor's charge bar after a (taken or skipped) turn.
+        Empty atb_reset_formula = built-in subtract-threshold (keep overflow);
+        a set formula runs with self=e. Falls back to the built-in on a
+        formula error so a GM typo can't lock an entity at a full bar."""
+        cvar = str(self.rules.get("atb_charge_var", "atb_charge"))
+        thr = self._atb_threshold_value()
+        src = str(self.rules.get("atb_reset_formula", "")).strip()
+
+        def _builtin():
+            cur = float(e.vars.get(cvar, 0) or 0)
+            e.write_var(cvar, self._atb_clean_num(cur - thr))
+
+        if not src:
+            _builtin()
+            return []
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        try:
+            FormulaEngine(self).eval_program(
+                src, EvalCtx(this=e.id, target=e.id))
+        except FormulaError as ex:
+            _builtin()
+            return [f"⚠️ atb_reset_formula failed for `{e.id}` ({ex}); "
+                    f"subtracted threshold instead."]
+        return []
+
+    def _atb_select(self, log: List[str]) -> Optional[str]:
+        """Advance every chargeable entity's bar to the soonest fill, pick
+        that entity as the actor, reset its bar, and set active_index to its
+        slot. Returns the actor id, or None if nobody can charge (every alive
+        member has a rate <= 0). A skippable actor is NOT re-selected here —
+        each next_turn is ONE entity's turn (a fast but stunned unit burns
+        frequent wasted turns while a slow unit charges, which is the point of
+        ATB); skip handling lives in _atb_next_turn."""
+        cvar = str(self.rules.get("atb_charge_var", "atb_charge"))
+        thr = self._atb_threshold_value()
+        entries = []  # (time_to_fill, eid, rate)
+        for eid in list(self.turn_order):
+            e = self.entities.get(eid)
+            if e is None or not e.is_alive:
+                continue
+            rate = self._atb_charge_rate(e)
+            if rate <= 0:
+                continue
+            cur = float(e.vars.get(cvar, 0) or 0)
+            entries.append((max(0.0, (thr - cur) / rate), eid, rate))
+        if not entries:
+            log.append("⚠️ ATB: no entity has a positive charge rate — "
+                       "no one can act.")
+            return None
+        # Soonest fills; ties broken by higher rate, then id (stable).
+        entries.sort(key=lambda t: (t[0], -t[2], t[1]))
+        min_time = entries[0][0]
+        if min_time > 0:
+            for (_t, eid, rate) in entries:
+                e = self.entities[eid]
+                e.write_var(cvar, self._atb_clean_num(
+                    float(e.vars.get(cvar, 0) or 0) + rate * min_time))
+        actor = entries[0][1]
+        try:
+            self.active_index = self.turn_order.index(actor)
+        except ValueError:
+            self.active_index = 0
+        # Taking (or skipping) a turn spends the bar.
+        log.extend(self._atb_reset_actor(self.entities[actor]))
+        return actor
+
+    def _atb_turn_phase(self, eid: str, when: str, act: bool) -> List[str]:
+        """Fire one turn-phase surface for the ATB actor (active_index must
+        already point at it). Status ticks fire ALWAYS — even on a skipped
+        turn — so DoTs/stuns can decay (there are no round ticks under ATB).
+        The action surface (tile/zone time-hooks, on_turn_* passives,
+        schedule_on) fires only when `act` (the entity isn't skipped)."""
+        log = list(self.fire_status_tick(when))
+        if act:
+            hook = "on_" + when
+            log.extend(self.fire_tile_time_hooks(hook))
+            log.extend(self.fire_zone_time_hooks(hook))
+            log.extend(self.fire_hook(
+                hook, target_ids=[eid],
+                own_only_targets=self._attached_tick_parts([eid])))
+            if when == "turn_start":
+                log.extend(self.fire_scheduled_turn(eid))
+                for pid in self._attached_tick_parts([eid]):
+                    log.extend(self.fire_scheduled_turn(pid))
+        return log
+
+    def _has_round_logic(self) -> bool:
+        """Whether any round-coupled behavior exists (used to warn once that
+        it's dormant under ATB): on_round_* passives (global/team/entity),
+        round status ticks (global rule or a status def), round schedules, or
+        tile/zone on_round_* time-hooks."""
+        rnames = ("on_round_start", "on_round_end")
+        for p in self.global_passives.values():
+            if p.when in rnames:
+                return True
+        for ps in self.team_passives.values():
+            for p in ps.values():
+                if p.when in rnames:
+                    return True
+        for e in self.entities.values():
+            for p in e.passives.values():
+                if p.when in rnames:
+                    return True
+        if str(self.rules.get("status_tick_when", "never")) in rnames and \
+                str(self.rules.get("status_tick_formula", "")).strip():
+            return True
+        for sdef in self.status_definitions.values():
+            if str(sdef.get("tick_when", "turn_end")) in rnames and \
+                    str(sdef.get("tick", "")).strip():
+                return True
+        if any(s.get("kind") == "round" for s in self.scheduled):
+            return True
+        for tpl in self.tile_templates.values():
+            if any(k in (tpl.hooks or {}) for k in rnames):
+                return True
+        for cell in self.tiles.values():
+            h = cell.get("hooks") if isinstance(cell, dict) else None
+            if isinstance(h, dict) and any(k in h for k in rnames):
+                return True
+        for z in self.zones.values():
+            h = z.get("hooks") if isinstance(z, dict) else None
+            if isinstance(h, dict) and any(k in h for k in rnames):
+                return True
+        return False
+
+    def _atb_next_turn(self) -> Tuple[Optional[str], List[str]]:
+        """ATB turn step: fire the outgoing actor's turn_end surface, select
+        the next actor by charge bar, fire its turn_start surface. NO round
+        hooks/ticks/schedules ever fire (rounds are disabled under ATB)."""
+        log: List[str] = []
+        if not self._atb_round_warned and self._has_round_logic():
+            self._atb_round_warned = True
+            log.append("⚠️ ATB is active: rounds are disabled — on_round_* "
+                       "hooks, round status ticks, and round schedules will "
+                       "NOT fire.")
+        # turn_end for the outgoing actor (active_index still points at it).
+        # If its turn was skipped, only its status ticks fire (decay), not
+        # its action surface (act=not _atb_last_skipped).
+        if self.round_started and 0 <= self.active_index < len(self.turn_order):
+            cur = self.turn_order[self.active_index]
+            if cur in self.entities:
+                log.extend(self._atb_turn_phase(
+                    cur, "turn_end", act=not self._atb_last_skipped))
+        self.round_started = True
+        if not self.turn_order:
+            self.history.record_turn(self)
+            return (None, log)
+        new_cur = self._atb_select(log)
+        if new_cur is None:
+            self.history.record_turn(self)
+            return (None, log)
+        # A skipped actor's turn still ELAPSES (bar already reset, status ticks
+        # fire) but it performs no action.
+        skipping = self._skipping_statuses(self.entities[new_cur])
+        self._atb_last_skipped = bool(skipping)
+        if skipping:
+            log.append(f"⏭️ `{new_cur}`'s turn skipped "
+                       f"({', '.join(sorted(skipping))}).")
+        # turn_start for the new actor (active_index now points at it).
+        log.extend(self._atb_turn_phase(
+            new_cur, "turn_start", act=not skipping))
         self.history.record_turn(self)
         return (new_cur, log)
 

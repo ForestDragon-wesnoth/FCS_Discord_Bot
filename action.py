@@ -1283,6 +1283,8 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
         # Event bus: the live emit stack/depth + warning latch. Resetting
         # these mid-emit corrupts the outer emit (the verified crash).
         "_event_depth", "_event_stack", "_event_warned", "_event_warnings",
+        # ATB latches (one-time dormant-round warning + last-actor-skipped).
+        "_atb_round_warned", "_atb_last_skipped",
     )
     preserved = {a: getattr(match, a) for a in preserved_attrs
                  if hasattr(match, a)}
