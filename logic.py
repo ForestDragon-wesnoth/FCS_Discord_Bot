@@ -9312,6 +9312,12 @@ class Match:
             # Snapshot status names so status_remove during the tick
             # doesn't break iteration.
             for sname in list(e.status.keys()):
+                # A PRIOR status's tick may have killed/removed this entity
+                # (e.g. a lethal DoT). Its remaining statuses must not tick
+                # from beyond the grave — same invariant the ghost-passive
+                # guards enforce for the hook/event/var-hook firing sites.
+                if eid not in self.entities:
+                    break
                 if sname not in e.status:
                     continue
                 # A status WITH a definition runs its own tick at its own

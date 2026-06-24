@@ -2192,6 +2192,38 @@ More shipped work (continuing the list above):
     has_los refactor left the symmetry property + full regression intact.
     Scenario 522.
 
+- **Audit-pass-13 (hands-on): ghost STATUS-TICK guard (scenario 523).** Another
+  by-hand pass — numeric/behavioral harnesses, no agent swarm. Verified CORRECT
+  with harnesses (no change), broadening the "primitives are exact" coverage:
+  the AoE/area enumerators (`entities_in_cone`/`_rect`/`_area`/`_within`,
+  `nearest_entity`, `chain_targets` — incl. footprint nearest-cell distance and
+  the chain starting from the nearest to the origin, NOT including the origin),
+  `transform` hp modes (percent/keep/full) + revert fidelity, shield/absorb
+  (`absorb_damage`/`shield_total` — priority order, tag matching, penetration),
+  the whole fog/vision stack (range, multi-tile sight UNION, fog_los blocking,
+  fog_memory `full` vs `terrain` at remembered cells), status resistance
+  (source-gating equipped-vs-inventory, sum/max/first stack, immunity, applied-
+  level reduction, full-resist no-op, `force` bypass), and an edge/crash probe
+  across dice / `roll_table` / `band` / coord extractors (every invalid input
+  is a clean FormulaError, never a 💥), plus event-bus nested-payload integrity
+  and the choice-replay exactly-once invariant (a side effect before two
+  `choose()`s applies once net despite the rollback+replay per choice). One real
+  bug fixed:
+  - **Ghost status tick after a lethal tick (MED, the missed ghost-firing
+    site).** `fire_status_tick` snapshots an entity's status NAMES so
+    status-removal mid-tick doesn't break iteration, but it never re-checked the
+    ENTITY still existed. So if status A's tick kills/removes the entity (a
+    lethal DoT — or a part tick routing `damage_part` to a vital parent), its
+    remaining statuses B, C, … still ticked "from beyond the grave": a tick
+    writing to ANOTHER entity ghost-applied (e.g. a dead unit's aura still
+    damaging others), and one reading `entity[self]` logged a spurious
+    `⚠️ status_tick FAILED: Entity '<id>' not found` (caught, no crash). This is
+    the same invariant the passes-7/8 ghost-passive guards enforce for the hook
+    / event / var-hook firing sites; the status-TICK site was the one missed.
+    Fix: `if eid not in self.entities: break` at the top of the per-status loop
+    (after the name snapshot). A non-lethal multi-status tick still fires every
+    status; only an actually-removed entity stops. Scenario 523.
+
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
 and explain the "why").

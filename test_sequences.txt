@@ -13419,3 +13419,36 @@ corners never block: has_los=True, first_opaque == None is True (clear), and
 raycast reaches the target (coord_x=3). Before the fix first_opaque/raycast
 ignored the corner rule and always reported the line clear here (beam passing
 through a walled diagonal that sight said was blocked).
+
+
+SCENARIO 523 — A lethal status tick stops the entity's remaining statuses from ticking
+-------------------------------------------------------------------------------------
+
+!match new gt GhostTick 6 6
+!match use gt
+!system set default death_result delete
+!ent add v Victim 10 1 1 5
+!ent add w Wit 30 3 3 5
+!ent set_var w marks 0
+!status def lethal
+!status when lethal turn_end
+!status tick lethal "entity[self].hp = entity[self].hp - 999"
+!status def marker
+!status when marker turn_end
+!status tick marker "entity[w].marks = entity[w].marks + 1"
+!status apply v lethal
+!status apply v marker
+!ent add other O 30 5 5 5
+!turn next
+!turn next
+!eval "var_get('w', 'marks')"
+
+Expected: Victim carries two turn_end statuses — `lethal` (applied first, so it
+ticks first) deals 999 and kills/removes Victim, and `marker` (would mark the
+witness). When Victim's turn_end fires, `lethal` removes it; `marker` must NOT
+tick from beyond the grave, so the witness stays at marks=0. Before the fix
+fire_status_tick snapshotted only the status NAMES and never re-checked the
+entity still existed, so `marker` ghost-ticked on the removed entity (marks=1,
+or a spurious "⚠️ status_tick FAILED: Entity 'v' not found" when the ghost tick
+read entity[self]). Completes the ghost-firing-guard sweep (passes 7-8 covered
+the hook / event / var-hook firing sites) for the status-TICK site.
