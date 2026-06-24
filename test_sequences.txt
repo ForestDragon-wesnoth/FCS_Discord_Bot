@@ -13560,3 +13560,34 @@ Expected: the charge formula adds 10 per point of `haste`, so a (haste 0) rates
 the actor's bar, so after b's turn b.atb_charge = 0 (overflow discarded). Turn-
 based `schedule_on(...)` works under ATB (returns a schedule name). Round-based
 `schedule(...)` raises a visible error (❌) — rounds are disabled.
+
+
+SCENARIO 527 — ATB composes with the entity lifecycle (death, summon)
+--------------------------------------------------------------------
+
+!system set default atb_enabled true
+!system set default atb_charge_formula "entity[self].speed"
+!system set default death_result delete
+!match new atb4 ATB4 8 8
+!match use atb4
+!ent add a A 100 1 1 5
+!ent set_var a speed 30
+!ent add b B 100 2 1 5
+!ent set_var b speed 20
+!turn next
+!turn next
+!ent kill a
+!turn next
+!turn next
+!ent add c C 100 3 1 5
+!ent set_var c speed 50
+!turn next
+!turn next
+!eval "all_entities()"
+
+Expected: under ATB, killing `a` mid-sequence removes it from the rotation
+cleanly (no crash, turn order rebuilt); remaining `b` keeps taking turns. A
+newly added `c` (speed 50, fastest) joins the charge race and starts taking the
+most turns. End state: `a` gone, `b` and `c` alive — all_entities() lists b and
+c. Demonstrates ATB selection survives mid-match spawn/death just like the
+round-based engine.

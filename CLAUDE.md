@@ -1945,6 +1945,18 @@ More shipped work (continuing the list above):
     id. Rate <= 0 = the entity can't charge (excluded; all-zero → "no one can
     act"). FUTURE the user may want: per-entity threshold, a turn-elapsed
     counter to replace turn_index() under ATB, an ATB-aware `!state` readout.
+    INTERACTION PASS (hands-on, all clean — scenario 527): verified ATB composes
+    with death/self-kill mid-turn, mid-match summon (newcomer joins the charge
+    race), attached-part status ticks on the parent's ATB turn, multi-tile
+    actors, all-zero-rate (→ None + warning), mounts (rider + vehicle both
+    rotate), undo (the `turn` flavor restores charge bars + the active actor),
+    kill→corpse (round-internal `round_number` reads stay constant, no crash),
+    random_stable tiebreak, and the ATB→round toggle (round play + round_number
+    resume when atb_enabled is cleared). ONE v1 behavior to note:
+    `transform`/`revert` REPLACES vars, so it resets the actor's `atb_charge`
+    bar to the new form's value (absent → 0) — a fresh-form charge, NOT
+    preserved like hp via transform_hp_mode. Defensible (new statblock) but
+    flag if the user wants the bar to persist across a transform.
 
 - **Audit-pass-7 fixes: load-side snapshots + ghost passives + status cap
   (scenarios 507-511).** A seventh sweep (three read-only survey agents across
