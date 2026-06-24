@@ -13452,3 +13452,111 @@ entity still existed, so `marker` ghost-ticked on the removed entity (marks=1,
 or a spurious "⚠️ status_tick FAILED: Entity 'v' not found" when the ghost tick
 read entity[self]). Completes the ghost-firing-guard sweep (passes 7-8 covered
 the hook / event / var-hook firing sites) for the status-TICK site.
+
+
+SCENARIO 524 — ATB: faster entity acts more often; rounds are disabled
+---------------------------------------------------------------------
+
+!system set default atb_enabled true
+!system set default atb_charge_formula "entity[self].speed"
+!match new atb1 ATB1 8 8
+!match use atb1
+!ent add fast Fast 100 1 1 5
+!ent set_var fast speed 30
+!ent set_var fast acts 0
+!ent add slow Slow 100 2 1 5
+!ent set_var slow speed 10
+!ent set_var slow acts 0
+!gpassive add counter on_turn_start "entity[self].acts = entity[self].acts + 1"
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!eval "var_get('fast', 'acts')"
+!eval "var_get('slow', 'acts')"
+!eval "round_number()"
+
+Expected: under Active Time Battle, next_turn picks whoever's charge bar fills
+first — `fast` (speed 30) charges 3× as fast as `slow` (speed 10), so over 8
+turns `fast` acts ~6 times and `slow` ~2. The on_turn_start passive fires for
+the acting entity each turn (self = the actor), so fast.acts ≈ 6, slow.acts ≈ 2.
+`round_number()` raises a visible error (❌) — rounds are disabled under ATB.
+
+
+SCENARIO 525 — ATB: a stunned fast unit burns wasted turns; stun decays; no starvation
+-------------------------------------------------------------------------------------
+
+!system set default atb_enabled true
+!system set default atb_charge_formula "entity[self].speed"
+!match new atb2 ATB2 8 8
+!match use atb2
+!status def stun
+!status when stun turn_start
+!status tick stun "status_counter_add(self, 'stun', -1)"
+!ent add zip Zip 100 1 1 5
+!ent set_var zip speed 100
+!ent set_var zip acted 0
+!ent status zip set stun skips_turn true
+!ent status zip set stun duration 2
+!ent add ox Ox 100 2 1 5
+!ent set_var ox speed 10
+!ent set_var ox acted 0
+!gpassive add c on_turn_start "entity[self].acted = entity[self].acted + 1"
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!eval "status_has('zip', 'stun')"
+!eval "var_get('zip', 'acted')"
+!eval "var_get('ox', 'acted')"
+
+Expected: `zip` (speed 100) charges far faster than `ox` (speed 10) but starts
+stunned (skips_turn) for duration 2. Each of zip's early turns is SKIPPED — it
+performs no action (its on_turn_start counter does NOT increment) but the stun's
+own turn_start tick STILL fires (the ATB accommodation, since there are no round
+ticks), decrementing duration 2→1→0 so the stun is removed. After that zip acts
+normally. Crucially `ox` is NOT starved: each next_turn is one entity's turn, so
+ox's bar still fills and it takes its turns. End state: zip has no stun, zip.acted
+≥ 1 (acted after the stun cleared), ox.acted ≥ 1.
+
+
+SCENARIO 526 — ATB: custom charge (haste) + custom reset; turn scheduling vs round
+---------------------------------------------------------------------------------
+
+!system set default atb_enabled true
+!system set default atb_charge_formula "entity[self].speed + var_get(self, 'haste') * 10"
+!system set default atb_reset_formula "entity[self].atb_charge = 0"
+!match new atb3 ATB3 8 8
+!match use atb3
+!ent add a A 100 1 1 5
+!ent set_var a speed 20
+!ent set_var a haste 0
+!ent add b B 100 2 1 5
+!ent set_var b speed 20
+!ent set_var b haste 2
+!eval "atb_rate('a')"
+!eval "atb_rate('b')"
+!turn next
+!eval "var_get('b', 'atb_charge')"
+!eval "schedule_on('a', 1, 'entity[a].pinged = 1')"
+!eval "schedule(1, 'noop')"
+
+Expected: the charge formula adds 10 per point of `haste`, so a (haste 0) rates
+20 while b (haste 2) rates 20 + 20 = 40 — b acts first. The custom reset zeroes
+the actor's bar, so after b's turn b.atb_charge = 0 (overflow discarded). Turn-
+based `schedule_on(...)` works under ATB (returns a schedule name). Round-based
+`schedule(...)` raises a visible error (❌) — rounds are disabled.

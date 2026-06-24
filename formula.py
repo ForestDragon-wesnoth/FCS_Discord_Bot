@@ -1577,6 +1577,9 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # in the round's turn order. For cadence checks ('every N rounds',
     # 'first turn of the round') and round-measured cooldowns.
     "round_number", "turn_index",
+    # ATB read prims (Active Time Battle): the charge target + an entity's
+    # current charge rate. See the atb_* rules.
+    "atb_threshold", "atb_rate",
     # Weighted random pick (replay-safe via the match RNG).
     "roll_table",
     # Match-wide entity queries (no reference entity; all loopable). Each
@@ -4686,6 +4689,11 @@ class FormulaEngine:
             with NO `self` bound — use explicit ids or `this`. Returns
             the schedule name (generated if name is falsy); cancel via
             cancel_schedule(name)."""
+            if match.rules.get("atb_enabled"):
+                raise FormulaError(
+                    "schedule() is unavailable under ATB — rounds are "
+                    "disabled. Use schedule_on(eid, delay, ...) for "
+                    "turn-based scheduling.")
             nm = name if isinstance(name, str) and name else None
             try:
                 return match.add_scheduled(delay, body, nm)
@@ -5077,6 +5085,10 @@ class FormulaEngine:
             rounds. During an on_round_start hook it already reflects
             the round just begun. Example: a tile pulse that fires on
             multiples of N -> `if round_number() % 3 == 0: ...`."""
+            if match.rules.get("atb_enabled"):
+                raise FormulaError(
+                    "round_number() is unavailable under ATB — rounds are "
+                    "disabled. Drive cadence off turns / charge instead.")
             return int(match.round_number)
         ns["round_number"] = _round_number
 
@@ -5086,8 +5098,28 @@ class FormulaEngine:
             Companion to round_number for finer-grained timing — e.g.
             'only on the first turn of the round' is `turn_index() ==
             0`. Returns 0 when turn order is empty."""
+            if match.rules.get("atb_enabled"):
+                raise FormulaError(
+                    "turn_index() is unavailable under ATB — there is no "
+                    "round to be positioned within.")
             return int(match.active_index)
         ns["turn_index"] = _turn_index
+
+        def _atb_threshold() -> Any:
+            """atb_threshold(): the ATB charge target (the atb_threshold
+            rule). Handy in an atb_reset_formula, e.g.
+            `entity[self].atb_charge = entity[self].atb_charge -
+            atb_threshold()`."""
+            return match._atb_clean_num(match._atb_threshold_value())
+        ns["atb_threshold"] = _atb_threshold
+
+        def _atb_rate(eid_t: Any) -> Any:
+            """atb_rate(eid): the entity's current per-tick ATB charge rate
+            (atb_charge_formula evaluated for it). 0 if it can't charge.
+            For building ATB readouts / debugging cadence."""
+            _eid2, e = _resolve_entity(eid_t, "atb_rate")
+            return match._atb_clean_num(match._atb_charge_rate(e))
+        ns["atb_rate"] = _atb_rate
 
         def _all_entities() -> list:
             """all_entities(): every ALIVE, independent entity id, in

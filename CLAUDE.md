@@ -1905,6 +1905,47 @@ More shipped work (continuing the list above):
     gate (no batch/foreach/macro bypass), nested-mount carry + cycle guards,
     rider-death corpse strip, `_find_dismount_cell`.
 
+- **Active Time Battle (ATB) turn model — SHIPPED (scenarios 524-526).** An
+  optional, SYSTEM-WIDE alternative turn engine (a plain rule, not a per-match
+  toggle — a system is designed around it from the start). When `atb_enabled`
+  is on, ROUNDS ARE DISABLED and `next_turn` no longer cycles `turn_order`:
+  instead each alive turn-order member accrues CHARGE into a bar var
+  (`atb_charge_var`, default `atb_charge`) at a per-entity RATE
+  (`atb_charge_formula`, an EXPRESSION with `self`=the entity, default
+  `entity[self].initiative` so initiative doubles as speed), and the next turn
+  goes to whoever's bar fills soonest. Core: `next_turn` branches to
+  `_atb_next_turn` → `_atb_select` (compute each rate, advance ALL bars by the
+  minimum time-to-fill `(atb_threshold - bar)/rate`, the soonest entity is the
+  actor, reset its bar) → `_atb_turn_phase` fires the actor's turn surface.
+  DESIGN POINTS:
+  - **Reset** via `atb_reset_formula` (program, `self`=actor; EMPTY default =
+    built-in subtract `atb_threshold` keeping overflow). Read the target in a
+    custom reset via the `atb_threshold()` prim.
+  - **Each next_turn is ONE entity's turn.** A skippable (`skips_turn`) actor's
+    turn ELAPSES — bar resets, status ticks STILL fire (so DoTs/stuns decay,
+    since there are no round ticks under ATB) — but its action surface
+    (tile/zone time-hooks, on_turn_* passives, schedule_on) does NOT fire. NO
+    skip-loop: a fast-but-stunned unit burns frequent wasted turns while a slow
+    unit charges (correct ATB), instead of starving the selection. `act` =
+    not-skipped gates the action surface in `_atb_turn_phase`; status ticks are
+    unconditional.
+  - **Round-coupled formulas RAISE a visible FormulaError** under ATB:
+    `round_number()`, `turn_index()` (it's a position-within-round), and the
+    round-based `schedule(delay, ...)`. Turn-based `schedule_on(eid, ...)`,
+    `turn_index`-free cadence, and all turn hooks/ticks keep working. A
+    ONE-TIME ⚠ warning fires from `_atb_next_turn` (latched `_atb_round_warned`,
+    reset when ATB is found off) if dormant round logic exists
+    (`_has_round_logic`: on_round_* passives global/team/entity, round status
+    ticks, round schedules, tile/zone on_round_* hooks).
+  - The charge bar is an ordinary var (read via `var_get`, nudge via a haste
+    formula / pre-fill for an ambush). New read prims `atb_threshold()` /
+    `atb_rate(eid)`. No new serialized Match field (bar = a var, enable = a
+    rule); `_atb_round_warned`/`_atb_last_skipped` are runtime-only (preserved
+    across action rollback). Tiebreak on simultaneous fills: higher rate, then
+    id. Rate <= 0 = the entity can't charge (excluded; all-zero → "no one can
+    act"). FUTURE the user may want: per-entity threshold, a turn-elapsed
+    counter to replace turn_index() under ATB, an ATB-aware `!state` readout.
+
 - **Audit-pass-7 fixes: load-side snapshots + ghost passives + status cap
   (scenarios 507-511).** A seventh sweep (three read-only survey agents across
   status/passive/event, movement/geometry/LOS, action/choice/dispatch/clamp;
