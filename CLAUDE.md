@@ -2224,6 +2224,48 @@ More shipped work (continuing the list above):
     (after the name snapshot). A non-lethal multi-status tick still fires every
     status; only an actually-removed entity stops. Scenario 523.
 
+- **Audit-pass-14 (hands-on): FIRST CLEAN PASS — no bug found.** Continued the
+  by-hand discipline (numeric/behavioral harnesses, no agent swarm). Hand-
+  verified TEN subsystems/interaction-combos against assertion harnesses, ALL
+  exact — no code change. This is the first pass that surfaced zero defects, a
+  signal the harness-testable engine core is solid in these zones. Verified
+  (so future passes can skip re-grinding these):
+  1. **Multi-tile push/pull/swap geometry** — a 2×2 push stops exactly at the
+     cell before a wall; push-to-edge clamps the anchor; swap of a 2×2 with a
+     1×1 exchanges anchors; pull stops adjacent to a 2-wide body.
+  2. **Segment sever modes** — `cascade` removes the cut + everything behind;
+     `split` promotes the segment behind to a new independent head (cleared
+     part/segment linkage, re-parented tail, stamped split-head template, added
+     to turn order).
+  3. **Macro/foreach substitution** — `$10`/`$11` parse as the 10th/11th arg
+     (not `$1`+"0"), `$@` expands to all args, missing `$5`→"", no
+     re-expansion of a `$2` appearing inside an arg value, foreach `$id`/`$name`.
+  4. **Mount slot math** — capacity budget, per-rider `cost` formula, `condition`
+     gate, re-seat doesn't self-block, mount-cycle guard.
+  5. **Region parts** — facing-aware footprint-region projection (front/back/
+     left/right/corners/center) rotates correctly with the parent's facing on a
+     3×3.
+  6. **resize_grid coordinate shift** — corpses-in-tile-data, anchored auras
+     (re-stamped around the shifted anchor), mounts (vehicle + carried rider),
+     and a subsequent revive all land at the shifted cells; no crash.
+  7. **Recursion/limit guards** — event-bus re-emit bounded at
+     `event_recursion_limit` (64), var-hook self-write bounded by the
+     `_var_event_depth` guard, self-referential action bounded at the recursion
+     limit (8) with a clean error — no hangs/crashes.
+  8. **Multi-feature combos** — transforming into a larger footprint re-stamps
+     the anchored aura's disc bigger (and revert shrinks it back); pushing a
+     multi-tile vehicle carries its rider AND re-stamps its aura together.
+  9. **Watchers** — edge-trigger (false→true fires once, no re-fire while true,
+     re-fires after the condition resets), `once` removal, `last` serialization.
+  10. **Corpse introspection** — `corpse_var`/`corpse_has` (nested paths +
+      default), `corpse_status_has`/`get`/`names`, large-corpse `corpse_cells`
+      footprint, and revive restoring the footprint.
+  Note: numeric primitives (damage_part, modifier fold, damage_spread, clamps,
+  side_hit, LOS/raycast, dice/band/roll_table, shields, status resistance, fog/
+  vision) were already harness-verified exact in passes 11-13. With this pass,
+  the harness-testable core is broadly covered; the likeliest remaining defect
+  surface is the Discord adapter (not harness-testable) and genuinely new code.
+
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
 and explain the "why").
