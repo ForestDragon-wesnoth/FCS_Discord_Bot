@@ -2266,6 +2266,27 @@ More shipped work (continuing the list above):
   the harness-testable core is broadly covered; the likeliest remaining defect
   surface is the Discord adapter (not harness-testable) and genuinely new code.
 
+- **Audit-pass-15 (hands-on): SECOND CLEAN PASS — no bug found.** Swept the
+  remaining untouched-by-hand areas; all exact, no code change. Verified:
+  status interaction cluster (tags, cross-status `removes`/`blocked_by` by
+  bare-name + `tag:` tokens, counters auto-removing at <=0 on `duration` AND
+  custom fields); team-level state (resources `team_get`/`set`/`add` dotted,
+  team `modifiers` aggregated per member with a non-member excluded, team
+  passives firing on the acting member, membership-change picks up the new
+  team's modifiers); tile precedence (instance `glyph`/`block`/`opaque` >
+  template > rule) + tile time-hooks firing per placed instance; alias
+  resolution (expands before the gate); batch undo grouping (a `!batch` reverts
+  as ONE history entry) + single-command + tp undo; `!find` predicates
+  (var compare, `team=`, `hp<`, `near:<id>:<r>`, `within:<x>:<y>:<r>` — all
+  footprint/Chebyshev-correct). PROCESS NOTE for future harness authors: two
+  "failures" this pass were BOTH test-harness errors, not engine bugs — (1)
+  there is NO `ent damage` subcommand (damage is `ent hp <id> <-n>`), and (2)
+  `restore_snapshot` (undo/history restore) REPLACES the Match object in
+  `mgr.matches[mid]`, so a captured `m = mgr.matches[id]` reference goes STALE
+  after an undo — always RE-FETCH `mgr.matches[id]` after a restore/undo or
+  you'll read the pre-undo object and think undo is broken. Two clean passes
+  (14-15) in a row → the harness-testable engine core is solid.
+
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
 and explain the "why").
