@@ -13391,3 +13391,31 @@ function-local everywhere; the `except FormulaError` in the tick-validation path
 is NOT a bare binding in tick context) is accepted and fires: burn at level 2
 deals 2 on the one turn_end that elapses across two `!turn next` calls (single
 combatant), so Hero hp 30 → 28.
+
+
+SCENARIO 522 — first_opaque/raycast are corner-aware (agree with has_los)
+------------------------------------------------------------------------
+
+!match new losc LOSCorner 6 6
+!match use losc
+!system set default los_corner_mode permissive
+!tile set 2 1 opaque true
+!tile set 1 2 opaque true
+!eval "has_los(1, 1, 3, 3)"
+!eval "first_opaque(1, 1, 3, 3) == None"
+!eval "coord_x(raycast(1, 1, 3, 3))"
+!eval "coord_y(raycast(1, 1, 3, 3))"
+!system set default los_corner_mode open
+!eval "has_los(1, 1, 3, 3)"
+!eval "first_opaque(1, 1, 3, 3) == None"
+!eval "coord_x(raycast(1, 1, 3, 3))"
+
+Expected: a diagonal from (1,1) to (3,3) crosses the corner shared by the two
+opaque flankers (2,1) and (1,2). In permissive mode that X blocks sight, so
+has_los=False — and first_opaque/raycast now agree (they share the one
+_los_stop walk): first_opaque returns the pre-corner cell (1,1) (so `== None`
+is False), and raycast stops at (1,1) (coord_x=1, coord_y=1). In `open` mode
+corners never block: has_los=True, first_opaque == None is True (clear), and
+raycast reaches the target (coord_x=3). Before the fix first_opaque/raycast
+ignored the corner rule and always reported the line clear here (beam passing
+through a walled diagonal that sight said was blocked).

@@ -2171,15 +2171,26 @@ More shipped work (continuing the list above):
     status_name, 'level')` — `level` is NOT a bare binding (only `status_name`
     is in the tick EvalCtx extras), so the validator correctly rejects a bare
     `level` (CLAUDE.md's earlier `5*level` shorthand was illustrative).
-  - OPEN QUESTION raised with the user (LOS corner-mode consistency): `has_los`
-    applies the `los_corner_mode` flanker check at diagonal crossings, but
-    `first_opaque` / `raycast` walk the same thin `_line_cells` path WITHOUT it
-    — so they only agree in `open` mode. With an opaque corner-X (both flankers
-    opaque), `has_los`=False (blocked) while `first_opaque`=None and `raycast`
-    reports the beam reaching the target. `entities_on_los` is unaffected (it
-    cuts via per-cell `has_los`, corner-aware). Pending the user's call on
-    whether first_opaque/raycast should be made corner-aware (agree with
-    has_los) and, if so, the exact return value at a corner block.
+  - OPEN QUESTION raised with the user (LOS corner-mode consistency) → RESOLVED
+    (corner-aware, shipped): `has_los` applied the `los_corner_mode` flanker
+    check at diagonal crossings, but `first_opaque` / `raycast` walked the same
+    thin `_line_cells` path WITHOUT it — so they only agreed in `open` mode.
+    With an opaque corner-X (both flankers opaque), `has_los`=False (blocked)
+    while `first_opaque`=None and `raycast` reported the beam reaching the
+    target. The user's call: make first_opaque/raycast corner-aware so sight
+    and beams agree. Fix: factored the corner-aware walk into the single shared
+    `Match._los_stop(viewer, x1,y1,x2,y2)` → `(last_clear, blocked, blocker)`,
+    and reimplemented all three over it — `has_los` = `not _los_stop(...)[1]`,
+    `raycast` = `last_clear` (stops at the pre-corner cell on a corner-X block),
+    `first_opaque` = the on-path `blocker` if any, else `last_clear` on a corner
+    block, else None. One walk = one source of truth, so the three can never
+    drift on the corner rule again. `_line_cells` stays for the geometry-only
+    consumers (`entities_in_line_ignorelos` = walls-ignored by design;
+    `entities_on_los` was already corner-aware via per-cell `has_los`).
+    Verified: property sweep across permissive/strict/open — `first_opaque`
+    None ⇔ `has_los` clear and `raycast`==target ⇔ clear, 0 mismatches; the
+    has_los refactor left the symmetry property + full regression intact.
+    Scenario 522.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

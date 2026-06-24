@@ -6952,25 +6952,32 @@ class Match:
                 return True
         return False
 
-    def has_los(self, viewer_id: Optional[str], x1: int, y1: int,
-                x2: int, y2: int) -> bool:
-        """Clear line of sight between the centers of (x1,y1) and (x2,y2)
-        for `viewer_id`? Walks the supercover of the segment (tiles = unit
-        squares); blocked by an opaque cell strictly between the endpoints.
-        Geometric (not Bresenham) so it is SYMMETRIC. Diagonal corner
-        crossings obey los_corner_mode (permissive: only an X of BOTH
-        flanking cells blocks; strict: any corner-touch blocks; open:
-        corners never block). The viewer's own cell and the target's own
-        opacity never block. viewer_id None -> viewer-conditional opacity
-        reads transparent."""
+    def _los_stop(self, viewer_id: Optional[str], x1: int, y1: int,
+                  x2: int, y2: int) -> Tuple[Tuple[int, int], bool, Optional[Tuple[int, int]]]:
+        """Walk the thin LOS line (x1,y1)->(x2,y2) near->far with the SAME
+        corner-mode flanker logic as sight, tracking where the line stops.
+        Returns (last_clear, blocked, blocker):
+          last_clear -- the farthest on-path cell reached with clear sight (the
+                        beam's impact point; == (x2,y2) when the line is clear);
+          blocked    -- True iff terrain stops the line before the target;
+          blocker    -- the ON-PATH opaque cell that stopped it, or None when
+                        the stop was an off-path corner-X (then last_clear is
+                        the pre-corner cell).
+        The single source of truth behind has_los / first_opaque / raycast so
+        all three agree on los_corner_mode (permissive: only an X of BOTH
+        flanking cells blocks; strict: any corner-touch; open: corners never
+        block). Geometric integer DDA (cross-multiplied (2n+1) compare) so it
+        is symmetric; the viewer's own cell and the target's own opacity never
+        block."""
         if (x1, y1) == (x2, y2):
-            return True
+            return ((x2, y2), False, None)
         mode = str(self.rules.get("los_corner_mode", "permissive"))
         dx, dy = x2 - x1, y2 - y1
         sx = 1 if dx > 0 else (-1 if dx < 0 else 0)
         sy = 1 if dy > 0 else (-1 if dy < 0 else 0)
         adx, ady = abs(dx), abs(dy)
         cx, cy = x1, y1
+        last = (x1, y1)
         nx = ny = 0  # boundary crossings consumed per axis
         guard = adx + ady + 2
         while guard > 0:
@@ -6993,21 +7000,35 @@ class Match:
                     if mode == "strict":
                         if self.cell_opaque(viewer_id, *f1) or \
                            self.cell_opaque(viewer_id, *f2):
-                            return False
+                            return (last, True, None)
                     elif mode != "open":  # permissive (default)
                         if self.cell_opaque(viewer_id, *f1) and \
                            self.cell_opaque(viewer_id, *f2):
-                            return False
+                            return (last, True, None)
                     cx += sx; cy += sy; nx += 1; ny += 1
                 elif a < b:
                     cx += sx; nx += 1
                 else:
                     cy += sy; ny += 1
             if (cx, cy) == (x2, y2):
-                return True
+                return ((x2, y2), False, None)
             if self.cell_opaque(viewer_id, cx, cy):
-                return False
-        return True
+                return (last, True, (cx, cy))
+            last = (cx, cy)
+        return ((x2, y2), False, None)
+
+    def has_los(self, viewer_id: Optional[str], x1: int, y1: int,
+                x2: int, y2: int) -> bool:
+        """Clear line of sight between the centers of (x1,y1) and (x2,y2)
+        for `viewer_id`? Blocked by an opaque cell strictly between the
+        endpoints; diagonal corner crossings obey los_corner_mode
+        (permissive: only an X of BOTH flanking cells blocks; strict: any
+        corner-touch blocks; open: corners never block). Symmetric. The
+        viewer's own cell and the target's own opacity never block. viewer_id
+        None -> viewer-conditional opacity reads transparent. Thin wrapper over
+        the shared _los_stop walk so sight / first_opaque / raycast never
+        drift on the corner rule."""
+        return not self._los_stop(viewer_id, x1, y1, x2, y2)[1]
 
     def _line_cells(self, x1: int, y1: int, x2: int, y2: int) -> List[Tuple[int, int]]:
         """The ordered cells the segment (x1,y1)->(x2,y2) passes through,
@@ -7045,33 +7066,31 @@ class Match:
 
     def first_opaque(self, viewer_id: Optional[str], x1: int, y1: int,
                      x2: int, y2: int) -> Optional[Tuple[int, int]]:
-        """The first opaque cell strictly between (x1,y1) and (x2,y2) for
-        `viewer_id`, near->far, or None if the line is clear of terrain.
-        The cell a projectile/beam would strike. (The exact-diagonal corner
-        nuance belongs to has_los; this returns the first cell the line
-        actually passes through that is opaque.)"""
-        for (cx, cy) in self._line_cells(x1, y1, x2, y2)[1:-1]:
-            if self.cell_opaque(viewer_id, cx, cy):
-                return (cx, cy)
-        return None
+        """The cell where sight stops between (x1,y1) and (x2,y2) for
+        `viewer_id`, near->far, or None if the line is clear of terrain. For an
+        ON-PATH opaque cell that's the opaque cell itself (the cell a beam
+        strikes); for an off-path corner-X block (per los_corner_mode) it's the
+        pre-corner cell where the line stops (the blocker is the diagonal
+        flankers, not on the path). Corner-aware via the shared _los_stop walk,
+        so it AGREES with has_los: clear iff has_los is clear."""
+        last, blocked, blocker = self._los_stop(viewer_id, x1, y1, x2, y2)
+        if not blocked:
+            return None
+        return blocker if blocker is not None else last
 
     def raycast(self, viewer_id: Optional[str], x1: int, y1: int,
                 x2: int, y2: int) -> Tuple[int, int]:
         """The IMPACT point of a beam cast from (x1,y1) toward (x2,y2) for
         `viewer_id`: the farthest cell with clear sight before terrain stops
-        it — i.e. the last clear cell before the first opaque cell strictly
-        between, or (x2,y2) if the whole line is clear. The companion to
-        first_opaque (which returns the blocker itself); raycast returns where
-        the beam LANDS. The viewer's own cell never blocks; the target's own
-        opacity never blocks (mirrors has_los). If the cell adjacent to the
-        origin is opaque the impact is the origin itself."""
-        cells = self._line_cells(x1, y1, x2, y2)
-        last = cells[0]
-        for (cx, cy) in cells[1:-1]:
-            if self.cell_opaque(viewer_id, cx, cy):
-                return last
-            last = (cx, cy)
-        return (x2, y2)
+        it, or (x2,y2) if the whole line is clear. The companion to
+        first_opaque (which returns the blocker); raycast returns where the
+        beam LANDS. Corner-aware via the shared _los_stop walk (stops at the
+        pre-corner cell on an off-path corner-X block), so it agrees with
+        has_los. The viewer's own cell never blocks; the target's own opacity
+        never blocks. If the cell adjacent to the origin is opaque the impact
+        is the origin itself."""
+        last, _blocked, _blocker = self._los_stop(viewer_id, x1, y1, x2, y2)
+        return last
 
     # ---- combined vision (range and/or LOS) -------------------------
     def _member_sees(self, e: "Entity", x: int, y: int, *, los: bool) -> bool:
