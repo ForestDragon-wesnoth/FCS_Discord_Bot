@@ -379,14 +379,45 @@ scenario that should output "Damaged foe by 5" but actually outputs
 "❌ Cell occupied" will PASS the harness. Write end-state assertions
 that parse `!ent dump` / `!list` output.
 
+### Do audit/interaction passes YOURSELF — don't delegate to weak survey agents
+
+**User directive (standing, as of the audit-pass era):** for correctness /
+interaction audits on this system, do the work DIRECTLY — read the code, trace
+the cross-cutting paths, and write numeric/behavioral assertion harnesses
+yourself. Do NOT fan the audit out to a swarm of survey subagents running
+weaker models (e.g. Haiku). They are no longer sufficient for this task: a
+giant interconnected engine is the opposite of "obvious," and that's exactly
+where they fall down. They're fine for catching shallow, LOCAL issues (a
+missing import, a typo, "does X exist") — not for the interaction bugs that
+are the entire point of these passes.
+
+The evidence from the passes themselves: the swarm largely reported "clean,"
+while the bugs that actually mattered came from doing it by hand —
+`damage_spread`'s fragment-mode `NameError` (caught by a numeric harness, not
+an agent), the turn-order skip-loop crash + round inflation, the mount
+push/pull footprint bug, and the load-side deepcopy class. The agents'
+serialization "findings" were false positives that cost verification time.
+
+Yes, doing it yourself is more token-expensive. The user has explicitly said
+that's the right trade: **more results per pass beats cheaper passes.** So:
+- Read the relevant subsystems end-to-end and reason about how they compose.
+- Write throwaway numeric/end-state assertion scripts for every gnarly
+  primitive (damage_part, the modifier fold, damage_spread, clamps, geometry
+  — see the prior passes for the pattern). The harness only catches `💥`;
+  YOUR assertions catch wrong answers.
+- Reserve subagents for genuinely parallel, mechanical, LOCAL lookups, not for
+  holding the whole model in their head.
+
 ### Don't blindly trust agent recommendations
 
-You may launch an Explore or general-purpose agent to survey the
-codebase. The agents are useful but get things wrong — they'll claim
-features don't exist when they do, miss key context, or recommend
-features that already shipped. **Verify every agent claim with grep
-before presenting to the user.** Past survey agents have hallucinated
-~30% of their recommendations.
+If you DO use an Explore or general-purpose agent for a narrow lookup, treat
+its output as a lead, not a conclusion. The agents get things wrong — they'll
+claim features don't exist when they do, miss key context, recommend features
+that already shipped, or flag false-positive "bugs" (e.g. the pass-11
+watchers/bound_channels shallow-copy claims, which were verified safe).
+**Verify every agent claim against the code yourself before acting or
+presenting it to the user.** Past survey agents have hallucinated ~30% of
+their recommendations.
 
 ---
 
@@ -1873,6 +1904,388 @@ More shipped work (continuing the list above):
     damage_spread apportionment, watcher edge-trigger + serialization, the access
     gate (no batch/foreach/macro bypass), nested-mount carry + cycle guards,
     rider-death corpse strip, `_find_dismount_cell`.
+
+- **Audit-pass-7 fixes: load-side snapshots + ghost passives + status cap
+  (scenarios 507-511).** A seventh sweep (three read-only survey agents across
+  status/passive/event, movement/geometry/LOS, action/choice/dispatch/clamp;
+  every candidate verified in code — and most behaviorally repro'd — before
+  fixing). Five real bugs + two user design calls:
+  - **Load-side shallow-copy (HIGH).** The SAVE side was deepcopied in passes
+    5/6 (`Entity.to_dict` vars, `Match.to_dict` tiles, `_zone_to_dict`), but the
+    LOAD side still re-shared nested data with the RETAINED snapshot:
+    `Entity.from_dict` did `vars=dict(...)`, `_coerce_status_dict` did `dict(v)`
+    per status, and `Match.from_dict` reused each tile dict by reference
+    (`m.tiles[(x,y)] = val`). Since `from_dict` runs on `!history restore` /
+    undo / action rollback (the snapshot stays in history), a later in-place
+    `!ent set_var inv.x` / `!tile set` corrupted the saved snapshot, so a second
+    restore returned the mutated value. Fixed all three with `copy.deepcopy`
+    (zones' `_zone_from_dict` already deepcopied `data` + rebuilt `hooks`, so it
+    was already safe). Scenarios 507-508.
+  - **Ghost passives (MED).** In `fire_status_event`, `fire_hook`, and
+    `emit_event`, global/team handlers fire BEFORE the entity's own handlers. If
+    a global/team handler removed the entity (kill/remove — in a status hook the
+    affected entity is bound as `self`, NOT `target`), the own-handler loop still
+    ran on the just-removed entity, firing side effects from beyond the grave.
+    Added an existence re-check (`id in self.entities`) before each own-handler
+    loop, mirroring the loops' existing top-of-iteration guard. Scenarios
+    510-511.
+  - **`!status apply` crash when a hook removes the target (MED, pre-existing).**
+    The command handler did `e = m.entities[eid]` right after `apply_status`,
+    KeyError'ing if a lifecycle hook (e.g. an on_status_added passive that kills
+    the entity) removed it mid-apply. Now reports "Applied ... which was then
+    removed by a triggered effect" instead of crashing. Surfaced by scenario 510.
+  - **max_level hard ceiling (user call → cap everywhere).** `max_level` capped
+    only the `add_level` stacking mode; a FIRST application or a `replace` with
+    an explicit level above max was uncapped (`!status apply h burn 10` on a
+    fresh max_level=3 → level 10). User's call: make max_level a hard ceiling on
+    the level field EVERYWHERE. New `Match._cap_status_level(sdef, lvl)` helper
+    applied at all three apply sites (first / replace / add_level). Scenario 509.
+  - **LOS-on-opaque (user call → KEEP current, no code change).** For the
+    sight-aware line queries (`entities_on_los`, `entities_in_line_until`), an
+    entity standing ON the FIRST opaque cell (e.g. an enemy at the near edge of
+    smoke) is RETURNED as visible/hittable; only entities BEYOND the opaque cell
+    are cut. CONFIRMED INTENDED (consistent with `has_los`'s "the target's own
+    opacity never blocks" convention — you can see/shoot something at the wall
+    surface, not past it). Documented here so the ambiguity doesn't recur; do
+    NOT "fix" it to exclude the on-opaque entity.
+  - Re-verified correct (no change): choice-replay RNG snapshot/restore +
+    summon-budget reset + buffer reset, the `action._rollback_match` runtime-
+    field list (incl. event-stack), clamp/death-check ordering in `write_var`,
+    the dispatch gate, status counter auto-removal + cross-status removes/
+    blocked_by, resistance mode-awareness + the force path, attached-part tick
+    sharing, and (re-confirmed footprint-correct) all vision/LOS casts, distance
+    gaps, and movement validation.
+
+- **Audit-pass-8 fix: ghost passives in the VAR-hook firing paths (scenario
+  512).** An eighth sweep (three read-only survey agents across zones/clamps/
+  tiles/aliases, death/corpse/parts/segments, and action/choice/formula/
+  dispatch). Agents 1-2 found their subsystems correct (zones' anchored auras +
+  footprint interaction, clamp ordering, tile precedence, alias resolution; the
+  whole death/corpse/parts/segment/mount cluster incl. the part-destroy latch +
+  revive subtree + mount-strip — all re-confirmed sound). Agent 3 found the ONE
+  real bug: pass-7 guarded the ghost-passive case (a global/team handler removes
+  the entity, then its OWN handlers must not fire from beyond the grave) in
+  `fire_status_event` / `fire_hook` / `emit_event`, but MISSED the var-hook
+  firing paths. `_fire_var_event_inner` (wave 1 = exact `on_var_{kind}`, wave 2
+  = `on_var_written` catch-all) and `_fire_var_attempt_inner`
+  (`on_var_write_attempt`) each fire global/team handlers then the entity's own
+  passives WITHOUT re-checking the entity still exists. So a global var-hook that
+  removes the affected entity left the own-passive loops iterating a stale `e`.
+  Fixed with the same `if entity_id in self.entities:` guard before each own loop
+  (three sites). NOTE for repro authors: in a VAR hook `self`/`this` =
+  current_entity_id() (the active-turn entity), NOT the affected entity, and
+  `target` is NOT bound (var-event extras expose changed_key/old_value/
+  new_value/hook_name/intended_value/was_clamped only) — reference the affected
+  entity by literal id or via `self` only when it IS the active entity. (This
+  differs from STATUS hooks, where the affected entity is bound as `self`.)
+
+- **Audit-pass-9 fix: snake-trail coords shift with resize + cross-match copy
+  (scenarios 513-514).** A ninth sweep — this one INTERACTION-focused (single
+  subsystems are heavily swept now). Three read-only survey agents: (1)
+  visibility/render/disguise × transform/mount/viewport/legend/fog, (2)
+  modifier/status/team × transform/death/parts, (3) resize/transfer/choice-
+  replay/undo. Agents 1-2 re-confirmed their interaction surfaces correct
+  (disguise POV gating vs fog vs mechanics separation; viewport/legend window
+  clipping; team-membership-change reads `e.team` fresh for modifiers+passives;
+  status-removal drops modifiers live; transform wholesale-replaces status;
+  part-on-different-team gets its own team passives; choice-replay preserves the
+  event stack + resets summon budget; watchers fire only at the top-level
+  command boundary, never mid-action). Agent 3 found the one real bug:
+  - **`__seg_path` / `__seg_last` (the engine-managed snake-trail coordinate
+    vars) were not shifted by `resize_grid` nor offset by `copy_entity`.** These
+    are the ONLY coordinate-bearing ENTITY VARS the engine owns (head vars: a
+    list of `[x,y]` cells the head has occupied + the head's last cell, used by
+    `path`-follow-mode segments). resize_grid shifted entities/tiles/zones/
+    explored/channel_views but missed them, and copy_entity remapped part_of +
+    `__follows` but didn't offset them — so a path-mode snake re-laid its body at
+    STALE cells after a center/edge-anchored resize, and a transferred snake
+    re-laid at the SOURCE's coordinates in the destination match. Fixed with a
+    shared `Match._shift_snake_path_vars(vars, ox, oy)` static helper called from
+    the resize entity-shift loop and per-spawned-entity in copy_entity (delta =
+    the same offset the anchor moves by). NOTE: copy_entity is a `MatchManager`
+    method, so it calls the helper as `Match._shift_snake_path_vars(...)`, not
+    `self.` (a transfer scenario now also guards that cross-match path against
+    a crash). KNOWN pre-existing quirk surfaced (NOT fixed — separate from the
+    coord bug): path-mode segments legitimately OVERLAP early (the trail is
+    shorter than `(segments+1)*spacing`), and copy_entity re-validates occupancy
+    on spawn, so transferring a snake whose trail hasn't spread yet fails with
+    "cell occupied" — left as-is since overlapping located parts are themselves
+    a questionable state.
+
+- **Audit-pass-10 fixes: turn-order skip-loop + mount push/pull footprint
+  (scenarios 515-517).** The widest sweep yet — FIVE read-only interaction
+  agents (mounts/vehicles deep; movement/block/opacity; turn-order & clocks;
+  formula-sandbox safety; access-gate/dispatch) PLUS hand-written numeric
+  assertion harnesses for the gnarliest primitives. Agents confirmed correct
+  (no change): the whole movement/block/opacity surface (footprint-aware
+  push/pull/swap/group, fail-open conditions, LOS symmetry/corner modes,
+  raycast/first_opaque endpoints), the formula SANDBOX (no escapes — empty
+  `__builtins__`, entity[X] mandatory-`.path`, every HOOK_CONTEXT name in
+  `_who_arg`'s dynamic branch, `normalize_body_source` at every body boundary,
+  kh0/explode/band/roll_table edges), and the ACCESS GATE (no batch/run/macro/
+  foreach/alias/cmd bypass; overrides-before-rule precedence; approval re-gates
+  with the approver's authority). My own numeric harnesses re-verified
+  `damage_part` (every cap mode × percent × rounding × 0/0 passthrough × vital)
+  and the `apply_modifiers` fold (add/inc%/more%/set/min/max tiers, priority
+  bumps, op-order, stat caps) — all exact. Three real bugs fixed:
+  - **Turn-order crash when a skip-status round-wrap empties the order
+    (HIGH).** pass-3 guarded next_turn against an emptied order after the
+    turn_end hooks and after `_advance_index`'s round-wrap, but NOT after
+    `_skip_to_eligible` — whose OWN internal `_advance_index` (stepping over a
+    `skips_turn` entity) can wrap and fire on_round_end/start hooks that remove
+    the last entity. next_turn then did `turn_order[active_index]` on an empty
+    list → IndexError (💥). Fixed: re-check `if not self.turn_order: return
+    (None, log)` after BOTH `_skip_to_eligible` calls (opening-round + normal
+    paths). Scenario 515.
+  - **Skip-loop stale bound inflates round_number (MED).**
+    `_skip_to_eligible` sampled `n = len(turn_order)` ONCE; if a round-wrap hook
+    SHRANK the order mid-skip, the stale `n` let the loop keep cycling the
+    survivors, firing on_round_end repeatedly and inflating round_number (a
+    command-only repro: 3 entities, two removed on round_end, advanced round by
+    3 instead of 1). Fixed: bound by the CURRENT order size each step
+    (`if checked >= len(self.turn_order): return False`), keeping the initial
+    `n` only as a hard cap against a skip-hook that GROWS the order. Identical
+    behavior in the common no-shrink case. Scenario 516.
+  - **push/pull validated the RIDER's footprint, not the vehicle's (HIGH).**
+    `push_entity`/`pull_entity` walked the legal-prefix using the target
+    entity's footprint, then committed via `e.move_dirs`, which redirects a
+    mounted DRIVER to its vehicle (`_mount_move_redirect`). So pushing a 1×1
+    pilot of a 2×2 tank validated the pilot's 1×1 path (which sat inside the
+    tank's own cells → read as blocked → silent no-op) or, on a clear lane,
+    committed the vehicle move that the prefix never validated (stop-early /
+    mid-commit mismatch). Fixed: resolve `_mount_move_redirect()` at the START
+    of push/pull (after the `n<=0` guard), so the VEHICLE's footprint is what's
+    validated AND committed — and a non-driver PASSENGER raises "dismount
+    first." Mirrors the tp/move_dirs/swap redirect (single-level, like swap).
+    Scenario 517. (Process note: while reverting this for a pre-fix check I
+    re-inserted the block at the wrong `dx,dy = DIRECTION_VECTORS[canon]`
+    occurrence — that string also appears in `move_dirs` — briefly corrupting
+    move_dirs. Lesson: a bare `s.find(old)` restore is unsafe when `old` isn't
+    unique; prefer the Edit tool with surrounding context.)
+
+- **Audit-pass-11 fix: damage_spread fragment-mode crash + serialization
+  consistency (scenario 518).** An eleventh sweep — three read-only interaction
+  agents (serialization round-trip completeness; corpse/aura/time-hooks;
+  status-tick/watchers/event-bus) PLUS hand-written numeric assertion harnesses
+  for the primitives that still lacked one (`damage_spread`, the clamp
+  chokepoint). The agents found NO confirmed correctness bugs (their flagged
+  serialization items were FALSE POSITIVES — see below), but my numeric harness
+  caught the real one:
+  - **`damage_spread` fragment mode crashed without a `random_seed` (HIGH).**
+    The `fragment` branch did `rng = getattr(self, "_rng", None) or random`, but
+    `logic.py` never imported `random` (only `formula.py` did, for its
+    `_active_rng`). `Match._rng` is None by default and only built when a
+    `random_seed` is configured AND a formula roll initializes it — so under the
+    DEFAULT (no-seed) config every `damage_spread(target, total, "fragment")`
+    hit the `or random` fallback → `NameError: name 'random' is not defined` (a
+    `❌ Runtime error` through the action/formula path). The weighted / uniform /
+    main_only modes use no RNG, which is why scenarios 410-413 never caught it.
+    Fix: `import random` at the top of logic.py (the fallback now mirrors
+    formula's `_active_rng` exactly: seeded `_rng` when present, global `random`
+    otherwise). Scenario 518.
+  - **Serialization deepcopy consistency (NOT a live bug — defensive).**
+    `Match.from_dict` restored `watchers` and `bound_channels` with a shallow
+    `dict(v)` while `to_dict` deepcopied them. Two survey agents flagged this as
+    the pass-5/6/7 load-side corruption class, but VERIFICATION showed it's a
+    FALSE POSITIVE for correctness: both hold FLAT scalar dicts (`watchers`:
+    condition/effect strings + bool `last` + bool `once`; `bound_channels`
+    meta: `label`/`pov` strings), and the only mutations (`w["last"] = now`,
+    `meta["pov"] = ...`) are TOP-LEVEL key reassignments on the already-
+    independent `dict(v)` copy — they never reach the retained snapshot (which
+    needs a NESTED in-place mutation to corrupt, as `vars`/tiles/zones had).
+    Still, switched both to `copy.deepcopy(v)` for symmetry with the save side +
+    every other dict field, so the inconsistency stops magnetizing audit
+    re-investigation and a future nested field can't silently reintroduce the
+    bug. (Documented as verified-safe so pass N+1 doesn't re-flag it.)
+  - Numeric harnesses re-verified EXACT (no bugs): `damage_part` (every cap mode
+    × percent × rounding × 0/0 passthrough × vital), the `apply_modifiers` fold
+    (add/inc%/more%/set/min/max tiers, priority bumps, op-order, stat caps),
+    `damage_spread` apportionment (largest-remainder shares sum to total across
+    weighted/uniform/fragment/main_only/spatial-miss/all-zero-weights), and the
+    CLAMP chokepoint (hard always clamps; soft engages only crossing from the
+    legal side and stays DORMANT past the bound; max-before-min ordering).
+  - OPEN QUESTION (RAISED → RESOLVED, shipped as the `suspend` mode below): a
+    non-vital body PART destroyed by damage (hp→0 via `damage_part`) LINGERS
+    attached-but-dead and does NOT route through `Entity.remove`, so its anchored
+    AURA was never released. While investigating, established the current
+    death-aura behavior: entity death/kill/despawn (and the part-death cascade)
+    all route through `Entity.remove` → `_release_anchored_zones` → the
+    `anchored_zone_on_anchor_loss` rule (delete/freeze); the ONE gap was the
+    lingering-destroyed-limb case. The user's call: add a third mode that
+    SUSPENDS the aura while the anchor is dead and RESUMES it on revive/heal,
+    for BOTH entity death/revive and part destroy/heal. Shipped — see next entry.
+
+- **Anchored-aura `suspend` mode (suspend-while-dead, resume-on-revive) —
+  SHIPPED (scenarios 519-520).** A third value for the
+  `anchored_zone_on_anchor_loss` rule, alongside `delete` (default) and
+  `freeze`: `suspend` clears the aura's CELLS (it goes inert — no render, no
+  hooks, no membership) but KEEPS the anchor binding, so the aura automatically
+  RE-STAMPS around the anchor if that entity is revived from its corpse or that
+  part is healed above 0. Implementation: `_release_anchored_zones` gained the
+  `suspend` branch (`z["cells"] = set()`, binding retained); the symmetric
+  `_resume_anchored_zones(eid)` = `_restamp_anchors_for` (a no-op unless the
+  anchor is alive again, since `_stamp_anchored_zone` only re-fills for a live
+  anchor). Wiring: (1) `_process_part_death` now calls `_release_anchored_zones`
+  on the destroyed limb (this ALSO closes the original gap for delete/freeze —
+  a destroyed limb's aura now follows the rule like any other anchor loss,
+  whereas before it was left stale); (2) `damage_part`'s heal path (latch clear
+  on hp>0) calls `_resume_anchored_zones`; (3) `revive_corpse` resumes the
+  entity + its whole part subtree AFTER the revive effects + check_death settle
+  (resuming only if the entity is actually `is_alive` — a revive policy that
+  leaves it dead keeps the aura suspended). Multi-tile anchors work (the
+  footprint disc re-stamps on resume). Suspended auras serialize for free (a
+  zone with empty cells + an anchor binding). CAVEAT (documented in the rule
+  desc): a true despawn (`!ent remove`) under `suspend` leaves an inert bound
+  zone that can't resume (nothing to revive) — re-anchor or delete it manually.
+  Default stays `delete` (backward compat); `delete`/`freeze` unchanged.
+
+- **Audit-pass-12 (stability sweep, HANDS-ON): FormulaError-shadowing crash
+  fixed (scenario 521).** First pass done entirely by hand per the standing
+  directive (no survey-agent swarm) — reading subsystems + writing numeric/
+  property assertion harnesses. Verified CORRECT with harnesses (no change):
+  `side_hit`/`hit_location` geometry (4-way all facings × cardinals, 8-way
+  corner detection, the 1×1 box==center invariant over 192 source/facing
+  combos), `has_los` SYMMETRY (property test, ~7k cell-pairs × permissive/
+  strict/open, 0 asymmetric), `raycast` straight-line, the serialization
+  round-trip (idempotent `to_dict==to_dict(from_dict(to_dict))` on a complex
+  match — multi-tile + parts + path-snake + mount + suspended aura + statuses
+  + team + watchers + macros + fog + disguise — AND load-side deepcopy holds),
+  `band()` boundaries (ranges / `n` / `lo+` / `-hi`), and dice (`kh`/`kl`/
+  explode in range). One real bug fixed:
+  - **`FormulaError` UnboundLocalError in `status_cmd` (HIGH, user-facing).**
+    `vtt_commands.py` imports `FormulaError` at module level (line 23), but
+    `status_cmd` had a REDUNDANT function-local `from formula import
+    FormulaEngine, EvalCtx, FormulaError` deep in the handler (the counter
+    path). That makes `FormulaError` a function-LOCAL for the WHOLE function,
+    so the EARLIER `except FormulaError` in the `!status tick` validation path
+    raised `UnboundLocalError: cannot access local variable 'FormulaError'`
+    instead of the intended `❌ Invalid tick formula: ...`. So setting ANY
+    invalid status-tick formula (typo / unknown identifier / bad syntax)
+    crashed with a `💥`. Fixed by deleting the redundant local import; also
+    hoisted `validate_formula` into the module-level import and removed the
+    same redundant-local pattern from the tile-hook / zone-hook / status-tick
+    handlers (they were latent versions of the same shadowing class). The
+    remaining `from formula import ... as _FE/_vp/_FEng` aliased locals are
+    SAFE (an alias doesn't shadow the module name). NOTE confirmed while here:
+    a status-tick formula reads the instance level via `status_get(self,
+    status_name, 'level')` — `level` is NOT a bare binding (only `status_name`
+    is in the tick EvalCtx extras), so the validator correctly rejects a bare
+    `level` (CLAUDE.md's earlier `5*level` shorthand was illustrative).
+  - OPEN QUESTION raised with the user (LOS corner-mode consistency) → RESOLVED
+    (corner-aware, shipped): `has_los` applied the `los_corner_mode` flanker
+    check at diagonal crossings, but `first_opaque` / `raycast` walked the same
+    thin `_line_cells` path WITHOUT it — so they only agreed in `open` mode.
+    With an opaque corner-X (both flankers opaque), `has_los`=False (blocked)
+    while `first_opaque`=None and `raycast` reported the beam reaching the
+    target. The user's call: make first_opaque/raycast corner-aware so sight
+    and beams agree. Fix: factored the corner-aware walk into the single shared
+    `Match._los_stop(viewer, x1,y1,x2,y2)` → `(last_clear, blocked, blocker)`,
+    and reimplemented all three over it — `has_los` = `not _los_stop(...)[1]`,
+    `raycast` = `last_clear` (stops at the pre-corner cell on a corner-X block),
+    `first_opaque` = the on-path `blocker` if any, else `last_clear` on a corner
+    block, else None. One walk = one source of truth, so the three can never
+    drift on the corner rule again. `_line_cells` stays for the geometry-only
+    consumers (`entities_in_line_ignorelos` = walls-ignored by design;
+    `entities_on_los` was already corner-aware via per-cell `has_los`).
+    Verified: property sweep across permissive/strict/open — `first_opaque`
+    None ⇔ `has_los` clear and `raycast`==target ⇔ clear, 0 mismatches; the
+    has_los refactor left the symmetry property + full regression intact.
+    Scenario 522.
+
+- **Audit-pass-13 (hands-on): ghost STATUS-TICK guard (scenario 523).** Another
+  by-hand pass — numeric/behavioral harnesses, no agent swarm. Verified CORRECT
+  with harnesses (no change), broadening the "primitives are exact" coverage:
+  the AoE/area enumerators (`entities_in_cone`/`_rect`/`_area`/`_within`,
+  `nearest_entity`, `chain_targets` — incl. footprint nearest-cell distance and
+  the chain starting from the nearest to the origin, NOT including the origin),
+  `transform` hp modes (percent/keep/full) + revert fidelity, shield/absorb
+  (`absorb_damage`/`shield_total` — priority order, tag matching, penetration),
+  the whole fog/vision stack (range, multi-tile sight UNION, fog_los blocking,
+  fog_memory `full` vs `terrain` at remembered cells), status resistance
+  (source-gating equipped-vs-inventory, sum/max/first stack, immunity, applied-
+  level reduction, full-resist no-op, `force` bypass), and an edge/crash probe
+  across dice / `roll_table` / `band` / coord extractors (every invalid input
+  is a clean FormulaError, never a 💥), plus event-bus nested-payload integrity
+  and the choice-replay exactly-once invariant (a side effect before two
+  `choose()`s applies once net despite the rollback+replay per choice). One real
+  bug fixed:
+  - **Ghost status tick after a lethal tick (MED, the missed ghost-firing
+    site).** `fire_status_tick` snapshots an entity's status NAMES so
+    status-removal mid-tick doesn't break iteration, but it never re-checked the
+    ENTITY still existed. So if status A's tick kills/removes the entity (a
+    lethal DoT — or a part tick routing `damage_part` to a vital parent), its
+    remaining statuses B, C, … still ticked "from beyond the grave": a tick
+    writing to ANOTHER entity ghost-applied (e.g. a dead unit's aura still
+    damaging others), and one reading `entity[self]` logged a spurious
+    `⚠️ status_tick FAILED: Entity '<id>' not found` (caught, no crash). This is
+    the same invariant the passes-7/8 ghost-passive guards enforce for the hook
+    / event / var-hook firing sites; the status-TICK site was the one missed.
+    Fix: `if eid not in self.entities: break` at the top of the per-status loop
+    (after the name snapshot). A non-lethal multi-status tick still fires every
+    status; only an actually-removed entity stops. Scenario 523.
+
+- **Audit-pass-14 (hands-on): FIRST CLEAN PASS — no bug found.** Continued the
+  by-hand discipline (numeric/behavioral harnesses, no agent swarm). Hand-
+  verified TEN subsystems/interaction-combos against assertion harnesses, ALL
+  exact — no code change. This is the first pass that surfaced zero defects, a
+  signal the harness-testable engine core is solid in these zones. Verified
+  (so future passes can skip re-grinding these):
+  1. **Multi-tile push/pull/swap geometry** — a 2×2 push stops exactly at the
+     cell before a wall; push-to-edge clamps the anchor; swap of a 2×2 with a
+     1×1 exchanges anchors; pull stops adjacent to a 2-wide body.
+  2. **Segment sever modes** — `cascade` removes the cut + everything behind;
+     `split` promotes the segment behind to a new independent head (cleared
+     part/segment linkage, re-parented tail, stamped split-head template, added
+     to turn order).
+  3. **Macro/foreach substitution** — `$10`/`$11` parse as the 10th/11th arg
+     (not `$1`+"0"), `$@` expands to all args, missing `$5`→"", no
+     re-expansion of a `$2` appearing inside an arg value, foreach `$id`/`$name`.
+  4. **Mount slot math** — capacity budget, per-rider `cost` formula, `condition`
+     gate, re-seat doesn't self-block, mount-cycle guard.
+  5. **Region parts** — facing-aware footprint-region projection (front/back/
+     left/right/corners/center) rotates correctly with the parent's facing on a
+     3×3.
+  6. **resize_grid coordinate shift** — corpses-in-tile-data, anchored auras
+     (re-stamped around the shifted anchor), mounts (vehicle + carried rider),
+     and a subsequent revive all land at the shifted cells; no crash.
+  7. **Recursion/limit guards** — event-bus re-emit bounded at
+     `event_recursion_limit` (64), var-hook self-write bounded by the
+     `_var_event_depth` guard, self-referential action bounded at the recursion
+     limit (8) with a clean error — no hangs/crashes.
+  8. **Multi-feature combos** — transforming into a larger footprint re-stamps
+     the anchored aura's disc bigger (and revert shrinks it back); pushing a
+     multi-tile vehicle carries its rider AND re-stamps its aura together.
+  9. **Watchers** — edge-trigger (false→true fires once, no re-fire while true,
+     re-fires after the condition resets), `once` removal, `last` serialization.
+  10. **Corpse introspection** — `corpse_var`/`corpse_has` (nested paths +
+      default), `corpse_status_has`/`get`/`names`, large-corpse `corpse_cells`
+      footprint, and revive restoring the footprint.
+  Note: numeric primitives (damage_part, modifier fold, damage_spread, clamps,
+  side_hit, LOS/raycast, dice/band/roll_table, shields, status resistance, fog/
+  vision) were already harness-verified exact in passes 11-13. With this pass,
+  the harness-testable core is broadly covered; the likeliest remaining defect
+  surface is the Discord adapter (not harness-testable) and genuinely new code.
+
+- **Audit-pass-15 (hands-on): SECOND CLEAN PASS — no bug found.** Swept the
+  remaining untouched-by-hand areas; all exact, no code change. Verified:
+  status interaction cluster (tags, cross-status `removes`/`blocked_by` by
+  bare-name + `tag:` tokens, counters auto-removing at <=0 on `duration` AND
+  custom fields); team-level state (resources `team_get`/`set`/`add` dotted,
+  team `modifiers` aggregated per member with a non-member excluded, team
+  passives firing on the acting member, membership-change picks up the new
+  team's modifiers); tile precedence (instance `glyph`/`block`/`opaque` >
+  template > rule) + tile time-hooks firing per placed instance; alias
+  resolution (expands before the gate); batch undo grouping (a `!batch` reverts
+  as ONE history entry) + single-command + tp undo; `!find` predicates
+  (var compare, `team=`, `hp<`, `near:<id>:<r>`, `within:<x>:<y>:<r>` — all
+  footprint/Chebyshev-correct). PROCESS NOTE for future harness authors: two
+  "failures" this pass were BOTH test-harness errors, not engine bugs — (1)
+  there is NO `ent damage` subcommand (damage is `ent hp <id> <-n>`), and (2)
+  `restore_snapshot` (undo/history restore) REPLACES the Match object in
+  `mgr.matches[mid]`, so a captured `m = mgr.matches[id]` reference goes STALE
+  after an undo — always RE-FETCH `mgr.matches[id]` after a restore/undo or
+  you'll read the pre-undo object and think undo is broken. Two clean passes
+  (14-15) in a row → the harness-testable engine core is solid.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

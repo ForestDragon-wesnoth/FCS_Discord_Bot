@@ -13009,3 +13009,446 @@ both succeed: is_mounted True for both, slot_of('a')='vip', slot_of('b')='econ'.
 Before the fix `_eval_slot_expr` hard-wired `slot` to the rider's CURRENT
 mount_slot (None on a fresh mount), so the conditions evaluated against None and
 both mounts were refused.
+
+
+SCENARIO 507 — Restore doesn't corrupt nested entity vars (load-side deepcopy)
+----------------------------------------------------------------------------
+
+!match new lv LoadVars 5 5
+!match use lv
+!ent add h Hero 30 1 1 5
+!ent set_var h inventory.dmg 10
+!history save bm
+!ent set_var h inventory.dmg 20
+!history restore bm confirm
+!ent set_var h inventory.dmg 30
+!history restore bm confirm
+!eval "var_get('h', 'inventory.dmg')"
+
+Expected: the manual save `bm` captures inventory.dmg=10. After restoring to it,
+editing inventory.dmg to 30 (an in-place nested write) must NOT corrupt the saved
+snapshot, so restoring `bm` a second time yields 10. Before the fix,
+Entity.from_dict shallow-copied `vars` (`dict(...)`), so the restored entity
+shared its nested `inventory` dict with the retained snapshot and the later edit
+corrupted it — the second restore wrongly returned 30 (the load-side twin of the
+to_dict deepcopy fixes from earlier audit passes).
+
+
+SCENARIO 508 — Restore doesn't corrupt nested tile data (load-side deepcopy)
+--------------------------------------------------------------------------
+
+!match new lt LoadTile 5 5
+!match use lt
+!tile set 2 2 trap.dmg 10
+!history save tb
+!tile set 2 2 trap.dmg 20
+!history restore tb confirm
+!tile set 2 2 trap.dmg 30
+!history restore tb confirm
+!eval "tile_get(2, 2, 'trap.dmg')"
+
+Expected: same shape as 507 but for a tile's nested data. The save `tb` has
+trap.dmg=10; after restore, an in-place `!tile set` to 30 must not corrupt the
+snapshot, so the second restore yields 10. Before the fix, Match.from_dict reused
+the snapshot's tile dict by reference (`m.tiles[(x,y)] = val`), so the edit
+corrupted the retained save and the second restore returned 30.
+
+
+SCENARIO 509 — max_level is a hard ceiling (first application + replace + add_level)
+----------------------------------------------------------------------------------
+
+!match new ml MaxLevel 5 5
+!match use ml
+!ent add h Hero 30 1 1 5
+!status def burn
+!status maxlevel burn 3
+!status apply h burn 10
+!eval "status_get('h', 'burn', 'level')"
+!status stack burn replace
+!status apply h burn 9
+!eval "status_get('h', 'burn', 'level')"
+!status stack burn add_level
+!status apply h burn 5
+!eval "status_get('h', 'burn', 'level')"
+
+Expected: burn has max_level 3. A FIRST application with explicit level 10 is
+capped to 3; a `replace` to 9 is capped to 3; an `add_level` of +5 is capped to
+3. max_level is now a hard ceiling on the level field everywhere, not just for
+add_level stacking (previously the first application and replace bypassed the
+cap, yielding 10 then 9).
+
+
+SCENARIO 510 — Removed entity's own status passive doesn't fire (ghost guard)
+----------------------------------------------------------------------------
+
+!match new gp GhostPassive 6 6
+!match use gp
+!ent add vic Victim 30 1 1 5
+!ent add wit Witness 30 2 1 5
+!ent set_var wit marked 0
+!gpassive add reaper on_status_added "remove_entity(self)"
+!passive add vic mark on_status_added "entity[wit].marked = 1"
+!status apply vic burn
+!eval "var_get('wit', 'marked')"
+
+Expected: applying `burn` to vic fires the GLOBAL on_status_added passive first,
+which removes vic (`remove_entity(self)`; in a status hook the affected entity is
+`self`). vic's OWN on_status_added passive (which would set wit.marked=1) must NOT
+fire now that vic is gone — so wit.marked stays 0. Before the fix, the own-passive
+loop ran on the just-removed entity, firing side effects from beyond the grave.
+
+
+SCENARIO 511 — Removed target's own event handler doesn't fire (ghost guard)
+---------------------------------------------------------------------------
+
+!match new ge GhostEvent 6 6
+!match use ge
+!ent add vic Victim 30 1 1 5
+!ent set_var vic team red
+!ent add wit Witness 30 2 1 5
+!ent set_var wit team blue
+!ent set_var wit marked 0
+!team passive add red reap event:boom "remove_entity(self)"
+!passive add vic mk event:boom "entity[wit].marked = 1"
+!emit boom to=vic
+!eval "var_get('wit', 'marked')"
+
+Expected: the directed event `boom` fires vic's TEAM (red) handler first, which
+removes vic. vic's OWN event:boom handler (which would set wit.marked=1) must NOT
+fire afterward — wit.marked stays 0. Same ghost-handler guard as 510, in the
+emit_event directed path (team handlers before own handlers).
+
+
+SCENARIO 512 — Removed entity's own var-hook doesn't fire (ghost guard, var path)
+--------------------------------------------------------------------------------
+
+!match new gv GhostVar 6 6
+!match use gv
+!ent add vic Victim 30 1 1 5
+!ent set_var vic flag 0
+!ent add wit Witness 30 2 1 5
+!ent set_var wit marked 0
+!gpassive add reap on_var_changed target=flag scope=exact "remove_entity('vic')"
+!passive add vic mk on_var_changed target=flag scope=exact "entity[wit].marked = 1"
+!ent set_var vic flag 1
+!eval "var_get('wit', 'marked')"
+
+Expected: changing vic's `flag` fires the GLOBAL on_var_changed passive first,
+which removes vic. vic's OWN on_var_changed passive (which would set
+wit.marked=1) must NOT fire afterward — wit.marked stays 0. Completes the
+ghost-handler sweep from audit-pass-7 (which guarded the status / hook / event
+firing sites) by also guarding the var-event and var-write-attempt firing paths
+in _fire_var_event_inner / _fire_var_attempt_inner.
+
+
+SCENARIO 513 — Path-mode snake trail shifts with map resize
+-----------------------------------------------------------
+
+!match new sr SnakeResize 22 6
+!match use sr
+!ent add h Centipede 40 8 3 9
+!ent face h right
+!ent set_var h __segment_follow path
+!ent set_var h __segment_spacing 2
+!part segment h s0 S0 6 6
+!part segment h s1 S1 6 6
+!ent move h right
+!ent move h right
+!ent move h right
+!ent move h right
+!ent move h right
+!ent move h right
+!map resize 30 12 center
+!eval "coord_x(entity_center('h'))"
+!eval "coord_x(entity_center('s1'))"
+!ent move h right
+!eval "coord_y(entity_center('s1'))"
+
+Expected: a path-mode centipede (head + 2 segments, spacing 2) lays a trail
+moving right; the head ends at x=14,y=3 pre-resize. Resizing 22x6 → 30x12 with
+the `center` anchor offsets all content by (+4,+3), so the head moves to
+(18,6) and — crucially — its recorded trail (`__seg_path`/`__seg_last`) shifts
+by the same offset. After one more move the segments still trail the head on
+row y=6 (the shifted row), not the stale pre-resize row. Before the fix
+resize_grid shifted entities/tiles/zones/explored/viewport but NOT the
+engine-managed snake-trail vars, so segments re-laid at the old coordinates.
+
+
+SCENARIO 514 — Path-mode snake transfer carries its trail to the destination
+----------------------------------------------------------------------------
+
+!match new st1 SnakeSrc 22 6
+!match use st1
+!ent add h Centipede 40 8 3 9
+!ent face h right
+!ent set_var h __segment_follow path
+!ent set_var h __segment_spacing 2
+!part segment h s0 S0 6 6
+!part segment h s1 S1 6 6
+!ent move h right
+!ent move h right
+!ent move h right
+!ent move h right
+!ent move h right
+!ent move h right
+!match new st2 SnakeDst 30 12
+!ent transfer h st2 8 6
+!match use st2
+!ent move h right
+!eval "coord_y(entity_center('s0'))"
+!eval "coord_y(entity_center('s1'))"
+
+Expected: the centipede (with a populated trail) transfers from st1 to st2 at
+(8,6). copy_entity offsets the head's snake-trail coords by the same delta the
+anchor moves by, so the trail re-bases at the destination. After one move in
+st2 the segments trail the head on row y=6 (the destination row). Before the
+fix the trail kept source coordinates, so segments would re-lay at the source
+location offsets in the new match. (This scenario also exercises the
+cross-match transfer path end-to-end — a missing helper would crash here.)
+
+
+SCENARIO 515 — Skip-status round-wrap that empties the order doesn't crash
+-------------------------------------------------------------------------
+
+!match new tc TurnCrash 6 6
+!match use tc
+!ent add a Alice 30 1 1 5
+!ent status a set stun skips_turn true
+!gpassive add reaper on_round_end "remove_entity('a')"
+!turn next
+!list
+
+Expected: Alice carries a `skips_turn` status. The first `!turn next` begins the
+round, then skips Alice; her skip advances the (single-entity) order, which WRAPS
+— firing on_round_end, whose handler removes Alice, emptying the turn order. The
+engine must NOT crash re-reading the active entity afterward: next_turn detects
+the now-empty order after `_skip_to_eligible` and returns "no turn" gracefully.
+Before the fix, `turn_order[active_index]` indexed an empty list → 💥 IndexError.
+
+
+SCENARIO 516 — Skip loop bound tracks the live order (no round inflation)
+------------------------------------------------------------------------
+
+!match new ti TurnInflate 10 4
+!match use ti
+!ent add a A 30 1 1 5
+!ent add b B 30 2 1 5
+!ent add c C 30 3 1 5
+!ent status c set stun skips_turn true
+!gpassive add reaper on_round_end "remove_entity('a'); remove_entity('b')"
+!turn next
+!turn next
+!turn next
+!eval "round_number()"
+
+Expected: a and b act on turns 1 and 2 (round 1). The third `!turn next` ends b,
+advances to c, whose `skips_turn` skip wraps the order — firing on_round_end,
+which removes a and b, leaving only c (also skippable). The round must advance by
+exactly ONE (to round 2), then pass with nobody able to act. Before the fix
+`_skip_to_eligible` bounded its skip loop by the order size sampled ONCE; with the
+order shrinking mid-skip that stale bound let the loop keep cycling the lone
+survivor, firing on_round_end repeatedly and inflating round_number (to 4 here).
+Now the loop re-checks the live order size each step, so round_number = 2.
+
+
+SCENARIO 517 — Pushing a vehicle's driver validates the VEHICLE's footprint
+--------------------------------------------------------------------------
+
+!match new mp MountPush 12 8
+!match use mp
+!ent add veh Tank 80 3 3 5
+!ent set_var veh footprint_w 2
+!ent set_var veh footprint_h 2
+!ent set_var veh slots.pilot.capacity 1
+!ent set_var veh slots.pilot.controls_movement true
+!ent add rider Pilot 20 1 1 5
+!mount rider veh pilot
+!ent add wall Wall 10 6 3 5
+!ent push rider right 5
+!eval "coord_x(entity_center('veh'))"
+
+Expected: a 1×1 pilot drives a 2×2 tank (anchored at (3,3), covering columns
+3-4). Pushing the pilot RIGHT redirects to the whole tank (driver controls
+movement). The push must validate the TANK's 2×2 swept footprint: moving right
+one cell puts it on columns 4-5; a second step would put column 6 onto the wall
+at (6,3), so the push stops after one cell — tank anchor at (4,3), center column
+4. Before the fix, push validated the pilot's 1×1 path (which sat inside the
+tank's own cells, reading as blocked), so the push silently did nothing (0 cells)
+— or, with a clear lane, committed via the vehicle's move_dirs and could fail
+mid-commit. Pushing a non-driver passenger still raises "dismount first".
+
+
+SCENARIO 518 — damage_spread fragment mode works without a random_seed
+----------------------------------------------------------------------
+
+!match new fr Frag 8 8
+!match use fr
+!ent add ogre Ogre 100 1 1 5
+!part add ogre a A 0 0
+!part add ogre b B 0 0
+!part add ogre c C 0 0
+!ent set_var a to_main_percent 100
+!ent set_var b to_main_percent 100
+!ent set_var c to_main_percent 100
+!ent set_var a aoe_weight 1
+!ent set_var b aoe_weight 1
+!ent set_var c aoe_weight 1
+!ent add bomber Bomber 20 4 4 5
+!ent set_var bomber actions.frag.target entity
+!ent set_var bomber actions.frag.body "entity[self].dealt = damage_spread(target, 30, 'fragment')"
+!action bomber frag ogre
+!eval "var_get('ogre', 'hp')"
+!eval "var_get('bomber', 'dealt')"
+
+Expected: the ogre has three 0/0 passthrough parts (to_main_percent=100). The
+bomber's `fragment`-mode damage_spread of 30 splits 30 across the parts as
+discrete weighted-random hits and routes each share to the ogre's main HP at
+100% — so the total to main is exactly 30 regardless of which fragments land
+where: ogre hp 100 → 70, bomber.dealt = 30. Before the fix, fragment mode
+referenced a `random` module that logic.py never imported, so with the default
+(no random_seed) config — where the match RNG is None — it crashed with
+"name 'random' is not defined". Weighted/uniform/main_only modes were
+unaffected (no RNG), which is why scenarios 410-413 never caught it.
+
+
+SCENARIO 519 — Anchored aura 'suspend' mode: entity death suspends, revive resumes
+----------------------------------------------------------------------------------
+
+!match new asus AuraSuspend 12 12
+!match use asus
+!system set default anchored_zone_on_anchor_loss suspend
+!ent add mage Mage 30 5 5 10
+!zone new flame
+!zone glyph flame f
+!zone anchor flame mage 1
+!eval "zone_size('flame')"
+!ent kill mage
+!eval "zone_size('flame')"
+!eval "zone_anchor_of('flame')"
+!ent revive mage
+!eval "zone_size('flame')"
+
+Expected: with anchored_zone_on_anchor_loss=suspend, the mage's radius-1 aura
+is the 3×3 disc (size 9) while alive. Killing the mage SUSPENDS the aura — its
+cells go empty (size 0, so it renders nothing / fires no hooks / has no
+membership) but the anchor BINDING is kept (zone_anchor_of stays 'mage', unlike
+delete which drops the zone or freeze which unbinds). Reviving the mage (default
+revive heals to max_hp, so it's alive) RESUMES the aura: it re-stamps to size 9.
+
+
+SCENARIO 520 — Anchored aura 'suspend' mode: part destruction suspends, heal resumes
+------------------------------------------------------------------------------------
+
+!match new psus PartSuspend 12 12
+!match use psus
+!system set default anchored_zone_on_anchor_loss suspend
+!ent add ogre Ogre 100 5 5 10
+!part add ogre arm Arm 20 20
+!zone new poison
+!zone anchor poison arm 1
+!eval "zone_size('poison')"
+!ent add hitter Hitter 20 8 8 5
+!ent set_var hitter actions.smash.target entity
+!ent set_var hitter actions.smash.body "damage_part(part(target, 'arm'), 50)"
+!action hitter smash ogre
+!eval "zone_size('poison')"
+!eval "zone_anchor_of('poison')"
+!ent set_var hitter actions.mend.target entity
+!ent set_var hitter actions.mend.body "damage_part(part(target, 'arm'), -40)"
+!action hitter mend ogre
+!eval "zone_size('poison')"
+
+Expected: the ogre's arm carries a radius-1 aura (size 9). With suspend mode,
+destroying the arm (damage_part 50 → arm hp 0) SUSPENDS its aura — size 0, but
+the binding stays (zone_anchor_of='arm'); the destroyed limb lingers attached.
+Healing the arm back above 0 (damage_part -40) clears the destroyed latch and
+RESUMES the aura to size 9. (A destroyed limb never routes through Entity.remove,
+so this is handled directly in _process_part_death / the damage_part heal path.)
+
+
+SCENARIO 521 — Invalid status-tick formula reports cleanly (no FormulaError crash)
+---------------------------------------------------------------------------------
+
+!match new ferr FErr 6 6
+!match use ferr
+!ent add h Hero 30 1 1 5
+!status def burn
+!status tick burn "entity[self].hp - bogus_ident"
+!status tick burn "entity[self].hp = entity[self].hp - status_get(self, status_name, 'level')"
+!status maxlevel burn 3
+!status apply h burn 2
+!turn next
+!turn next
+!eval "var_get('h', 'hp')"
+
+Expected: setting a tick formula with an unknown identifier reports
+"❌ Invalid tick formula: Unknown identifier 'bogus_ident'." — NOT a crash.
+Before the fix, status_cmd had a redundant function-local `from formula import
+... FormulaError` further down the handler, which made FormulaError a
+function-local everywhere; the `except FormulaError` in the tick-validation path
+(reached first) then raised UnboundLocalError → "💥 cannot access local variable
+'FormulaError'". A valid tick (reading the level via status_get, since `level`
+is NOT a bare binding in tick context) is accepted and fires: burn at level 2
+deals 2 on the one turn_end that elapses across two `!turn next` calls (single
+combatant), so Hero hp 30 → 28.
+
+
+SCENARIO 522 — first_opaque/raycast are corner-aware (agree with has_los)
+------------------------------------------------------------------------
+
+!match new losc LOSCorner 6 6
+!match use losc
+!system set default los_corner_mode permissive
+!tile set 2 1 opaque true
+!tile set 1 2 opaque true
+!eval "has_los(1, 1, 3, 3)"
+!eval "first_opaque(1, 1, 3, 3) == None"
+!eval "coord_x(raycast(1, 1, 3, 3))"
+!eval "coord_y(raycast(1, 1, 3, 3))"
+!system set default los_corner_mode open
+!eval "has_los(1, 1, 3, 3)"
+!eval "first_opaque(1, 1, 3, 3) == None"
+!eval "coord_x(raycast(1, 1, 3, 3))"
+
+Expected: a diagonal from (1,1) to (3,3) crosses the corner shared by the two
+opaque flankers (2,1) and (1,2). In permissive mode that X blocks sight, so
+has_los=False — and first_opaque/raycast now agree (they share the one
+_los_stop walk): first_opaque returns the pre-corner cell (1,1) (so `== None`
+is False), and raycast stops at (1,1) (coord_x=1, coord_y=1). In `open` mode
+corners never block: has_los=True, first_opaque == None is True (clear), and
+raycast reaches the target (coord_x=3). Before the fix first_opaque/raycast
+ignored the corner rule and always reported the line clear here (beam passing
+through a walled diagonal that sight said was blocked).
+
+
+SCENARIO 523 — A lethal status tick stops the entity's remaining statuses from ticking
+-------------------------------------------------------------------------------------
+
+!match new gt GhostTick 6 6
+!match use gt
+!system set default death_result delete
+!ent add v Victim 10 1 1 5
+!ent add w Wit 30 3 3 5
+!ent set_var w marks 0
+!status def lethal
+!status when lethal turn_end
+!status tick lethal "entity[self].hp = entity[self].hp - 999"
+!status def marker
+!status when marker turn_end
+!status tick marker "entity[w].marks = entity[w].marks + 1"
+!status apply v lethal
+!status apply v marker
+!ent add other O 30 5 5 5
+!turn next
+!turn next
+!eval "var_get('w', 'marks')"
+
+Expected: Victim carries two turn_end statuses — `lethal` (applied first, so it
+ticks first) deals 999 and kills/removes Victim, and `marker` (would mark the
+witness). When Victim's turn_end fires, `lethal` removes it; `marker` must NOT
+tick from beyond the grave, so the witness stays at marks=0. Before the fix
+fire_status_tick snapshotted only the status NAMES and never re-checked the
+entity still existed, so `marker` ghost-ticked on the removed entity (marks=1,
+or a spurious "⚠️ status_tick FAILED: Entity 'v' not found" when the ghost tick
+read entity[self]). Completes the ghost-firing-guard sweep (passes 7-8 covered
+the hook / event / var-hook firing sites) for the status-TICK site.

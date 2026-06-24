@@ -8,6 +8,7 @@ import uuid
 import json
 import copy
 import re
+import random
 
 # -------------------------
 # Exceptions
@@ -949,15 +950,22 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "anchored_zone_on_anchor_loss": {
         "default": "delete",
-        "schema": {"type": "enum", "choices": ["delete", "freeze"]},
+        "schema": {"type": "enum", "choices": ["delete", "freeze", "suspend"]},
         "desc": (
             "What happens to an entity-anchored aura zone (one bound via "
             "`!zone anchor <name> <eid> <radius>`) when its anchor entity "
-            "dies or leaves the match. 'delete' (default) removes the zone "
-            "entirely — the aura vanishes with its source. 'freeze' clears "
-            "the anchor binding but leaves the cells where they last were, "
-            "turning the aura into an ordinary static zone (a lingering "
-            "cloud the caster left behind)."
+            "dies, is destroyed (a body part hit to 0 hp), or leaves the "
+            "match. 'delete' (default) removes the zone entirely — the aura "
+            "vanishes with its source. 'freeze' clears the anchor binding but "
+            "leaves the cells where they last were, turning the aura into an "
+            "ordinary static zone (a lingering cloud the caster left behind). "
+            "'suspend' clears the aura's cells (it goes inert — no render, no "
+            "hooks, no membership) but KEEPS the anchor binding, so the aura "
+            "automatically RESUMES (re-stamps around the anchor) if that "
+            "entity is revived from its corpse or that part is healed above 0. "
+            "Note: a true despawn (`!ent remove`) under 'suspend' leaves an "
+            "inert bound zone that won't resume (nothing to revive) — re-anchor "
+            "or delete it manually."
         ),
     },
     # ---- mounts / vehicles ----
@@ -3390,7 +3398,7 @@ def _coerce_status_dict(raw: Any) -> Dict[str, Dict[str, Any]]:
         for k, v in raw.items():
             if not isinstance(k, str):
                 continue
-            out[k] = dict(v) if isinstance(v, dict) else {}
+            out[k] = copy.deepcopy(v) if isinstance(v, dict) else {}
         return out
     if isinstance(raw, (list, tuple, set)):
         return {str(n): {} for n in raw if isinstance(n, str)}
@@ -4523,7 +4531,7 @@ class Entity:
             # written by clones via Entity.to_dict (the common path) load
             # cleanly. Anything else is treated as an empty status set.
             status=_coerce_status_dict(data.get("status")),
-            vars=dict(data.get("vars", {})),
+            vars=copy.deepcopy(data.get("vars", {})),
             facing=data.get("facing", "up"),
             part_of=data.get("part_of", None),
             mounted_on=data.get("mounted_on", None),
@@ -4947,6 +4955,27 @@ class Match:
     def in_bounds(self, x: int, y: int) -> bool:
         return 1 <= x <= self.grid_width and 1 <= y <= self.grid_height
 
+    @staticmethod
+    def _shift_snake_path_vars(vars_dict: Dict[str, Any], ox: int, oy: int) -> None:
+        """Shift the engine-managed snake-trail coordinate vars by (ox, oy):
+        __seg_path (a list of [x,y] cells the head has occupied) and __seg_last
+        ([x,y], the head's last-seen cell). No-op if absent/malformed. These are
+        the only coordinate-bearing ENTITY VARS the engine owns, so resize_grid
+        and cross-match copy must shift them like every other spatial structure
+        — otherwise a path-mode snake re-lays its body at stale cells after the
+        shift."""
+        if ox == 0 and oy == 0:
+            return
+        path = vars_dict.get("__seg_path")
+        if isinstance(path, list):
+            for p in path:
+                if isinstance(p, list) and len(p) == 2:
+                    p[0] += ox
+                    p[1] += oy
+        last = vars_dict.get("__seg_last")
+        if isinstance(last, (list, tuple)) and len(last) == 2:
+            vars_dict["__seg_last"] = [last[0] + ox, last[1] + oy]
+
     def resize_grid(self, new_w: int, new_h: int,
                     anchor: str = "top-left") -> Tuple[Dict[str, Any], List[str]]:
         """Resize the grid to new_w x new_h, repositioning ALL content
@@ -5010,6 +5039,7 @@ class Match:
         for e in self.entities.values():
             e.x += ox
             e.y += oy
+            self._shift_snake_path_vars(e.vars, ox, oy)
 
         # Re-key tiles (corpses ride along inside tile data); drop off-grid.
         old_tiles = len(self.tiles)
@@ -6530,19 +6560,35 @@ class Match:
         return had
 
     def _release_anchored_zones(self, eid: str) -> None:
-        """Handle auras anchored to `eid` when it dies / leaves the match,
-        per the anchored_zone_on_anchor_loss rule: 'delete' drops the zone,
-        'freeze' clears the binding and leaves the cells as a static zone."""
+        """Handle auras anchored to `eid` when it dies / is destroyed / leaves
+        the match, per the anchored_zone_on_anchor_loss rule: 'delete' drops
+        the zone, 'freeze' clears the binding and leaves the cells as a static
+        zone, 'suspend' clears the cells (inert) but KEEPS the binding so the
+        aura resumes (re-stamps) if the anchor is revived/healed — see
+        _resume_anchored_zones."""
         mode = str(self.rules.get("anchored_zone_on_anchor_loss", "delete"))
         for name in [n for n, z in self.zones.items()
                      if isinstance(z, dict) and z.get("anchor") == eid]:
+            z = self.zones[name]
             if mode == "freeze":
-                z = self.zones[name]
                 z.pop("anchor", None)
                 z.pop("anchor_radius", None)
                 z.pop("anchor_metric", None)
+            elif mode == "suspend":
+                # Inert but still bound: empty cells (no render/hooks/
+                # membership) while the anchor is dead; _restamp re-fills it
+                # once the anchor is alive again (revive / part heal).
+                z["cells"] = set()
             else:
                 del self.zones[name]
+
+    def _resume_anchored_zones(self, eid: str) -> None:
+        """Re-stamp any auras still bound to `eid` after it comes back alive
+        (corpse revive / part heal). A no-op unless the aura was suspended
+        (mode 'suspend' kept the binding); _stamp_anchored_zone only re-fills
+        when the anchor is actually alive, so calling this on a healthy
+        anchor is harmless."""
+        self._restamp_anchors_for(eid)
 
     def anchor_zone(self, name: str, eid: str, radius: int = 0,
                     metric: str = "square_radius") -> int:
@@ -6906,25 +6952,32 @@ class Match:
                 return True
         return False
 
-    def has_los(self, viewer_id: Optional[str], x1: int, y1: int,
-                x2: int, y2: int) -> bool:
-        """Clear line of sight between the centers of (x1,y1) and (x2,y2)
-        for `viewer_id`? Walks the supercover of the segment (tiles = unit
-        squares); blocked by an opaque cell strictly between the endpoints.
-        Geometric (not Bresenham) so it is SYMMETRIC. Diagonal corner
-        crossings obey los_corner_mode (permissive: only an X of BOTH
-        flanking cells blocks; strict: any corner-touch blocks; open:
-        corners never block). The viewer's own cell and the target's own
-        opacity never block. viewer_id None -> viewer-conditional opacity
-        reads transparent."""
+    def _los_stop(self, viewer_id: Optional[str], x1: int, y1: int,
+                  x2: int, y2: int) -> Tuple[Tuple[int, int], bool, Optional[Tuple[int, int]]]:
+        """Walk the thin LOS line (x1,y1)->(x2,y2) near->far with the SAME
+        corner-mode flanker logic as sight, tracking where the line stops.
+        Returns (last_clear, blocked, blocker):
+          last_clear -- the farthest on-path cell reached with clear sight (the
+                        beam's impact point; == (x2,y2) when the line is clear);
+          blocked    -- True iff terrain stops the line before the target;
+          blocker    -- the ON-PATH opaque cell that stopped it, or None when
+                        the stop was an off-path corner-X (then last_clear is
+                        the pre-corner cell).
+        The single source of truth behind has_los / first_opaque / raycast so
+        all three agree on los_corner_mode (permissive: only an X of BOTH
+        flanking cells blocks; strict: any corner-touch; open: corners never
+        block). Geometric integer DDA (cross-multiplied (2n+1) compare) so it
+        is symmetric; the viewer's own cell and the target's own opacity never
+        block."""
         if (x1, y1) == (x2, y2):
-            return True
+            return ((x2, y2), False, None)
         mode = str(self.rules.get("los_corner_mode", "permissive"))
         dx, dy = x2 - x1, y2 - y1
         sx = 1 if dx > 0 else (-1 if dx < 0 else 0)
         sy = 1 if dy > 0 else (-1 if dy < 0 else 0)
         adx, ady = abs(dx), abs(dy)
         cx, cy = x1, y1
+        last = (x1, y1)
         nx = ny = 0  # boundary crossings consumed per axis
         guard = adx + ady + 2
         while guard > 0:
@@ -6947,21 +7000,35 @@ class Match:
                     if mode == "strict":
                         if self.cell_opaque(viewer_id, *f1) or \
                            self.cell_opaque(viewer_id, *f2):
-                            return False
+                            return (last, True, None)
                     elif mode != "open":  # permissive (default)
                         if self.cell_opaque(viewer_id, *f1) and \
                            self.cell_opaque(viewer_id, *f2):
-                            return False
+                            return (last, True, None)
                     cx += sx; cy += sy; nx += 1; ny += 1
                 elif a < b:
                     cx += sx; nx += 1
                 else:
                     cy += sy; ny += 1
             if (cx, cy) == (x2, y2):
-                return True
+                return ((x2, y2), False, None)
             if self.cell_opaque(viewer_id, cx, cy):
-                return False
-        return True
+                return (last, True, (cx, cy))
+            last = (cx, cy)
+        return ((x2, y2), False, None)
+
+    def has_los(self, viewer_id: Optional[str], x1: int, y1: int,
+                x2: int, y2: int) -> bool:
+        """Clear line of sight between the centers of (x1,y1) and (x2,y2)
+        for `viewer_id`? Blocked by an opaque cell strictly between the
+        endpoints; diagonal corner crossings obey los_corner_mode
+        (permissive: only an X of BOTH flanking cells blocks; strict: any
+        corner-touch blocks; open: corners never block). Symmetric. The
+        viewer's own cell and the target's own opacity never block. viewer_id
+        None -> viewer-conditional opacity reads transparent. Thin wrapper over
+        the shared _los_stop walk so sight / first_opaque / raycast never
+        drift on the corner rule."""
+        return not self._los_stop(viewer_id, x1, y1, x2, y2)[1]
 
     def _line_cells(self, x1: int, y1: int, x2: int, y2: int) -> List[Tuple[int, int]]:
         """The ordered cells the segment (x1,y1)->(x2,y2) passes through,
@@ -6999,33 +7066,31 @@ class Match:
 
     def first_opaque(self, viewer_id: Optional[str], x1: int, y1: int,
                      x2: int, y2: int) -> Optional[Tuple[int, int]]:
-        """The first opaque cell strictly between (x1,y1) and (x2,y2) for
-        `viewer_id`, near->far, or None if the line is clear of terrain.
-        The cell a projectile/beam would strike. (The exact-diagonal corner
-        nuance belongs to has_los; this returns the first cell the line
-        actually passes through that is opaque.)"""
-        for (cx, cy) in self._line_cells(x1, y1, x2, y2)[1:-1]:
-            if self.cell_opaque(viewer_id, cx, cy):
-                return (cx, cy)
-        return None
+        """The cell where sight stops between (x1,y1) and (x2,y2) for
+        `viewer_id`, near->far, or None if the line is clear of terrain. For an
+        ON-PATH opaque cell that's the opaque cell itself (the cell a beam
+        strikes); for an off-path corner-X block (per los_corner_mode) it's the
+        pre-corner cell where the line stops (the blocker is the diagonal
+        flankers, not on the path). Corner-aware via the shared _los_stop walk,
+        so it AGREES with has_los: clear iff has_los is clear."""
+        last, blocked, blocker = self._los_stop(viewer_id, x1, y1, x2, y2)
+        if not blocked:
+            return None
+        return blocker if blocker is not None else last
 
     def raycast(self, viewer_id: Optional[str], x1: int, y1: int,
                 x2: int, y2: int) -> Tuple[int, int]:
         """The IMPACT point of a beam cast from (x1,y1) toward (x2,y2) for
         `viewer_id`: the farthest cell with clear sight before terrain stops
-        it — i.e. the last clear cell before the first opaque cell strictly
-        between, or (x2,y2) if the whole line is clear. The companion to
-        first_opaque (which returns the blocker itself); raycast returns where
-        the beam LANDS. The viewer's own cell never blocks; the target's own
-        opacity never blocks (mirrors has_los). If the cell adjacent to the
-        origin is opaque the impact is the origin itself."""
-        cells = self._line_cells(x1, y1, x2, y2)
-        last = cells[0]
-        for (cx, cy) in cells[1:-1]:
-            if self.cell_opaque(viewer_id, cx, cy):
-                return last
-            last = (cx, cy)
-        return (x2, y2)
+        it, or (x2,y2) if the whole line is clear. The companion to
+        first_opaque (which returns the blocker); raycast returns where the
+        beam LANDS. Corner-aware via the shared _los_stop walk (stops at the
+        pre-corner cell on an off-path corner-X block), so it agrees with
+        has_los. The viewer's own cell never blocks; the target's own opacity
+        never blocks. If the cell adjacent to the origin is opaque the impact
+        is the origin itself."""
+        last, _blocked, _blocker = self._los_stop(viewer_id, x1, y1, x2, y2)
+        return last
 
     # ---- combined vision (range and/or LOS) -------------------------
     def _member_sees(self, e: "Entity", x: int, y: int, *, los: bool) -> bool:
@@ -7838,6 +7903,13 @@ class Match:
             raise VTTError("push: n must be an integer.")
         if n <= 0:
             return 0, []
+        # Mounts: redirect a driver's push to its VEHICLE (the whole rig is
+        # shoved, riders carried); a passenger raises ("dismount first").
+        # Resolve BEFORE the footprint prefix-walk so the vehicle's footprint
+        # is the one validated AND committed — otherwise the walk OK's the
+        # rider's 1x1 path and the redirected vehicle move_dirs then fails
+        # mid-commit. Mirrors tp/move_dirs/swap.
+        e = e._mount_move_redirect()
         dx, dy = DIRECTION_VECTORS[canon]
         # Walk forward to find the longest legal prefix. The push stops
         # at the cell BEFORE the first blocker. Intermediate occupancy
@@ -7908,6 +7980,11 @@ class Match:
                 raise VTTError(f"pull: {label} must be an integer.")
         if n <= 0:
             return 0, []
+        # Mounts: a driver's pull drags its VEHICLE (riders carried); a
+        # passenger raises ("dismount first"). Resolve before the footprint
+        # prefix-walk so the vehicle's body is validated AND committed (see
+        # push_entity). Mirrors tp/move_dirs/swap.
+        e = e._mount_move_redirect()
         allow_diag = bool(self.rules.get("allow_diagonal_movement", False))
         stackable = e.is_cell_stackable
         # Walk forward to find the longest legal prefix, recomputing the
@@ -8306,6 +8383,12 @@ class Match:
             # The opening entity may itself be skippable (e.g. starts
             # stunned) — skip forward to the first eligible one.
             eligible = self._skip_to_eligible(log)
+            # A skip's round-wrap (its internal _advance_index firing
+            # on_round_end/start hooks) can itself empty the order — re-check
+            # before indexing, same guard as after the turn_end/advance steps.
+            if not self.turn_order:
+                self.history.record_turn(self)
+                return (None, log)
             cur = self.turn_order[self.active_index]
             if eligible:
                 log.extend(self.fire_hook(
@@ -8348,6 +8431,11 @@ class Match:
             return (None, log)
         # Skip over any entity carrying a skip-status flag.
         eligible = self._skip_to_eligible(log)
+        # _skip_to_eligible's internal round-wrap hooks can empty the order;
+        # re-check before reading the next entity (mirrors the guard above).
+        if not self.turn_order:
+            self.history.record_turn(self)
+            return (None, log)
         new_cur = self.turn_order[self.active_index]
         if eligible:
             log.extend(self.fire_hook(
@@ -8428,7 +8516,7 @@ class Match:
         (the caller then passes the round without firing on_turn_start).
         Bounded to one full turn-order cycle so an all-skippable table
         can't loop forever."""
-        n = len(self.turn_order)
+        n = len(self.turn_order)   # hard cap vs. a skip-hook that GROWS the order
         checked = 0
         while checked < n:
             # A skip's round-wrap (or a skip-status side effect) can empty
@@ -8448,6 +8536,14 @@ class Match:
             log.append(f"⏭️ `{cur}`'s turn skipped ({matched}).")
             self._advance_index(log)
             checked += 1
+            # Bound by the CURRENT order size, not the stale `n`. If a
+            # round-wrap hook SHRANK the order mid-skip, `n` over-counts and
+            # the loop would keep cycling the survivors — firing extra round
+            # wraps (inflating round_number) before exhausting `n`. Once we've
+            # taken a full cycle's worth of steps for the live order and found
+            # nobody eligible, stop.
+            if checked >= len(self.turn_order):
+                return False
         # Full cycle without finding an eligible entity.
         return False
 
@@ -8997,6 +9093,17 @@ class Match:
             reduction = sum(amounts)
         return (False, max(0, reduction))
 
+    @staticmethod
+    def _cap_status_level(sdef: Dict[str, Any], lvl: int) -> int:
+        """Clamp a status level to the definition's max_level (a hard ceiling
+        on the level field — applied to first application, replace, and
+        add_level alike). max_level absent / <=0 = uncapped."""
+        try:
+            maxl = int(sdef.get("max_level", 0) or 0)
+        except (TypeError, ValueError):
+            maxl = 0
+        return min(lvl, maxl) if maxl > 0 else lvl
+
     def _resistance_applies(self, e: "Entity", name: str,
                             sdef: Dict[str, Any], level_given: bool) -> bool:
         """Whether a flat level-reduction resistance applies to THIS status
@@ -9099,7 +9206,8 @@ class Match:
         before = copy.deepcopy(e.status.get(name))
         if name not in e.status:
             inst = copy.deepcopy(sdef.get("data")) if isinstance(sdef.get("data"), dict) else {}
-            inst["level"] = new_level if new_level is not None else int(inst.get("level", 1))
+            seed_lv = new_level if new_level is not None else int(inst.get("level", 1))
+            inst["level"] = self._cap_status_level(sdef, seed_lv)
             if new_duration is not None:
                 inst["duration"] = new_duration
             e.status[name] = inst
@@ -9110,7 +9218,7 @@ class Match:
                 pass
             elif mode == "replace":
                 if new_level is not None:
-                    inst["level"] = new_level
+                    inst["level"] = self._cap_status_level(sdef, new_level)
                 if new_duration is not None:
                     inst["duration"] = new_duration
             elif mode == "extend":
@@ -9119,8 +9227,7 @@ class Match:
             elif mode == "add_level":
                 add = new_level if new_level is not None else 1
                 nl = int(inst.get("level", 0)) + add
-                maxl = int(sdef.get("max_level", 0) or 0)
-                inst["level"] = min(nl, maxl) if maxl > 0 else nl
+                inst["level"] = self._cap_status_level(sdef, nl)
                 if new_duration is not None:
                     inst["duration"] = new_duration
             else:  # refresh (default)
@@ -9205,6 +9312,12 @@ class Match:
             # Snapshot status names so status_remove during the tick
             # doesn't break iteration.
             for sname in list(e.status.keys()):
+                # A PRIOR status's tick may have killed/removed this entity
+                # (e.g. a lethal DoT). Its remaining statuses must not tick
+                # from beyond the grave — same invariant the ghost-passive
+                # guards enforce for the hook/event/var-hook firing sites.
+                if eid not in self.entities:
+                    break
                 if sname not in e.status:
                     continue
                 # A status WITH a definition runs its own tick at its own
@@ -9289,11 +9402,14 @@ class Match:
                 log.append(_run_passive_safely(
                     engine, p, ctx, target_id=entity_id, is_global=True,
                 ))
-        for p in e.passives.values():
-            if p.when == when:
-                log.append(_run_passive_safely(
-                    engine, p, ctx, target_id=entity_id, is_global=False,
-                ))
+        # A global/team handler may have removed the entity (kill/remove);
+        # don't fire its own passives from beyond the grave.
+        if entity_id in self.entities:
+            for p in e.passives.values():
+                if p.when == when:
+                    log.append(_run_passive_safely(
+                        engine, p, ctx, target_id=entity_id, is_global=False,
+                    ))
         return log
 
     def _emit_status_diff(
@@ -10104,9 +10220,12 @@ class Match:
         if new_hp != cur_hp:
             p.write_var(hp_var, new_hp)
         # A heal that lifts a previously-destroyed part back above 0 clears
-        # the destroyed latch so it can break (and re-fire on_death) again.
+        # the destroyed latch so it can break (and re-fire on_death) again,
+        # and RESUMES any aura suspended when it was destroyed (no-op unless
+        # anchored_zone_on_anchor_loss is 'suspend').
         if new_hp > 0 and p.vars.get("__part_destroyed"):
             p.vars.pop("__part_destroyed", None)
+            self._resume_anchored_zones(p.id)
         # (4) destruction.
         if new_hp <= 0 and (cur_hp - amount) <= 0 and not self.is_indestructible(p):
             log += self._process_part_death(p)
@@ -10126,6 +10245,11 @@ class Match:
         self.log_event("part_destroyed", entity=p.id, name=p.name,
                        part_of=p.part_of or "")
         log = self.fire_hook("on_death", target_ids=[p.id])
+        # A destroyed limb LINGERS attached (it doesn't route through
+        # Entity.remove), so resolve its anchored auras here too — same
+        # delete/freeze/suspend rule as any anchor loss. Idempotent if a
+        # later cascade removes the part.
+        self._release_anchored_zones(p.id)
         if not cascade:
             vital = bool(p.vars.get("vital",
                                     self.rules.get("part_vital_default", False)))
@@ -10537,6 +10661,14 @@ class Match:
         death_log: List[str] = []
         if e.id in self.entities:
             death_log = self.check_death(e.id)
+        # Resume any auras suspended while this entity (or its parts) were dead
+        # — done last, once hp is settled and the entity SURVIVED the revive
+        # (if the revive policy left it dead, check_death above re-killed it and
+        # the auras stay suspended). No-op unless mode='suspend' kept a binding.
+        if e.id in self.entities and e.is_alive:
+            self._resume_anchored_zones(e.id)
+            for part in self.entity_part_subtree(e.id):
+                self._resume_anchored_zones(part.id)
         return e.id, spawn_log + revive_log + death_log
 
     # ---------- polymorph / transform (identity-preserving statblock swap) -----
@@ -10876,6 +11008,10 @@ class Match:
                 if p.when != when:
                     continue
                 log.append(_run_passive_safely(engine, p, ctx, target_id=tid, is_global=True))
+            # A global/team passive may have removed this entity; don't fire
+            # its own passives afterward.
+            if tid not in self.entities:
+                continue
             # Then entity-owned passives.
             for pid, p in list(e.passives.items()):
                 if p.when != when:
@@ -10946,11 +11082,14 @@ class Match:
                                 log.append(_run_passive_safely(
                                     engine, p, tctx, target_id=target,
                                     is_global=True))
-                    for p in list(e.passives.values()):
-                        if p.when == when:
-                            log.append(_run_passive_safely(
-                                engine, p, tctx, target_id=target,
-                                is_global=False))
+                    # A team handler may have removed the target; don't fire
+                    # its own handlers afterward.
+                    if target in self.entities:
+                        for p in list(e.passives.values()):
+                            if p.when == when:
+                                log.append(_run_passive_safely(
+                                    engine, p, tctx, target_id=target,
+                                    is_global=False))
         finally:
             self._event_stack.pop()
             self._event_depth -= 1
@@ -11048,17 +11187,21 @@ class Match:
         for p in self._firing_passives(entity_id):
             if p.when == kind_hook:
                 _maybe_fire(p, is_global=True)
-        for p in e.passives.values():
-            if p.when == kind_hook:
-                _maybe_fire(p, is_global=False)
+        # A global/team handler may have removed the entity; don't fire its
+        # own passives from beyond the grave (mirrors fire_status_event).
+        if entity_id in self.entities:
+            for p in e.passives.values():
+                if p.when == kind_hook:
+                    _maybe_fire(p, is_global=False)
 
         # Wave 2: on_var_written catch-all passives
         for p in self._firing_passives(entity_id):
             if p.when == "on_var_written":
                 _maybe_fire(p, is_global=True)
-        for p in e.passives.values():
-            if p.when == "on_var_written":
-                _maybe_fire(p, is_global=False)
+        if entity_id in self.entities:
+            for p in e.passives.values():
+                if p.when == "on_var_written":
+                    _maybe_fire(p, is_global=False)
 
         return log
 
@@ -11162,9 +11305,12 @@ class Match:
         for p in self._firing_passives(entity_id):
             if p.when == "on_var_write_attempt":
                 _maybe_fire(p, is_global=True)
-        for p in e.passives.values():
-            if p.when == "on_var_write_attempt":
-                _maybe_fire(p, is_global=False)
+        # A global/team handler may have removed the entity mid-fire; don't
+        # fire its own passives from beyond the grave.
+        if entity_id in self.entities:
+            for p in e.passives.values():
+                if p.when == "on_var_write_attempt":
+                    _maybe_fire(p, is_global=False)
 
         return log
 
@@ -11593,7 +11739,11 @@ class Match:
             except (ValueError, AttributeError):
                 continue
             if m.in_bounds(x, y) and isinstance(val, dict) and val:
-                m.tiles[(x, y)] = val
+                # deepcopy: a snapshot's tile dict is loaded here; reusing it
+                # by reference would re-share it with the retained snapshot, so
+                # a later in-place !tile set would corrupt undo/rollback (the
+                # load-side twin of the to_dict deepcopy above).
+                m.tiles[(x, y)] = copy.deepcopy(val)
         raw_zones = d.get("zones", {}) or {}
         m.zones = {}
         for zname, zdef in raw_zones.items():
@@ -11647,7 +11797,7 @@ class Match:
         }
         raw_watch = d.get("watchers", {}) or {}
         m.watchers = {
-            str(k): dict(v) for k, v in raw_watch.items()
+            str(k): copy.deepcopy(v) for k, v in raw_watch.items()
             if isinstance(k, str) and isinstance(v, dict)
         } if isinstance(raw_watch, dict) else {}
         raw_layers = d.get("hidden_layers", []) or []
@@ -11697,7 +11847,7 @@ class Match:
         } if isinstance(raw_acc, dict) else {}
         raw_bound = d.get("bound_channels", {})
         m.bound_channels = {
-            k: (dict(v) if isinstance(v, dict) else {})
+            k: (copy.deepcopy(v) if isinstance(v, dict) else {})
             for k, v in raw_bound.items() if isinstance(k, str)
         } if isinstance(raw_bound, dict) else {}
         m.fog_enabled = bool(d.get("fog_enabled", False))
@@ -12674,6 +12824,10 @@ class MatchManager:
             fol = ne.vars.get("__follows")
             if fol in idmap:
                 ne.vars["__follows"] = idmap[fol]
+            # Offset the head's snake-trail coords to the destination cell so a
+            # transferred path-mode snake re-lays at its new location, not the
+            # source's (same delta the anchor moves by).
+            Match._shift_snake_path_vars(ne.vars, tx - e.x, ty - e.y)
             if oid == eid or not oe.is_located_part:
                 px, py = tx, ty
             else:  # a located part keeps its offset from the anchor
