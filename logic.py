@@ -12659,6 +12659,22 @@ class Match:
         s = e.vars.get("sprite")
         return isinstance(s, str) and bool(s)
 
+    def corpse_sprite(self, corpse: Dict[str, Any]) -> Optional[str]:
+        """The sprite key for a corpse, read from its frozen snapshot vars:
+        `sprites.<facing>` > `sprite`. No mirror/fallback (a corpse is static
+        and undisguised). None when the dead entity had no sprite."""
+        ent = corpse.get("entity") if isinstance(corpse, dict) else None
+        if not isinstance(ent, dict):
+            return None
+        vars_ = ent.get("vars") or {}
+        sd = vars_.get("sprites")
+        if isinstance(sd, dict):
+            k = sd.get(ent.get("facing", ""))
+            if isinstance(k, str) and k:
+                return k
+        k = vars_.get("sprite")
+        return k if isinstance(k, str) and k else None
+
     # ---- map viewport (panning) -------------------------------------
     # The viewport caps how much grid renders at once. It engages when
     # EITHER dimension exceeds its cap (so a 70x5 grid still windows
@@ -13069,6 +13085,32 @@ class Match:
                 "w": 1, "h": 1, "mode": "single", "sprite": spr,
                 "glyph": g, "tint": tint, "opacity": 100,
                 "flip_h": False, "flip_v": False, "layer": 20})
+
+        # Corpse layer (25): the dead entity's stored sprite, tinted +
+        # semi-transparent (corpse_sprite_tint / corpse_sprite_opacity).
+        # Fog-gated like everything else; only drawn when it has a sprite (or
+        # a stored glyph for the text fallback). Rides the entity-layer toggle.
+        if "entities" not in hidden:
+            c_tint = str(self.rules.get("corpse_sprite_tint", "gray")).strip() or None
+            try:
+                c_op = int(self.rules.get("corpse_sprite_opacity", 50))
+            except (TypeError, ValueError):
+                c_op = 50
+            c_op = max(0, min(100, c_op))
+            for (cx, cy, cid, corpse) in self.all_corpses():
+                if not self.corpse_visible_to(cid, corpse, cx, cy, pov_team):
+                    continue
+                spr = self.corpse_sprite(corpse)
+                gl = ((corpse.get("entity") or {}).get("vars") or {}).get("glyph")
+                gl = gl if isinstance(gl, str) and len(gl) == 1 else None
+                if spr is None and gl is None:
+                    continue
+                cw, ch = self._corpse_footprint(corpse)
+                placements.append({
+                    "kind": "corpse", "ref": cid, "x": cx, "y": cy,
+                    "w": cw, "h": ch, "mode": "single", "sprite": spr,
+                    "glyph": gl, "tint": c_tint, "opacity": c_op,
+                    "flip_h": False, "flip_v": False, "layer": 25})
 
         if "entities" not in hidden:
             # Entity main pass (30): not glued/region/mounted.

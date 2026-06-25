@@ -95,7 +95,7 @@ ELEVATED_ARGS: Dict[str, frozenset] = {
     # settings all elevate to host-gated. (pan/center/view are per-CHANNEL
     # camera state — harmless, so they stay player-available.)
     "map": frozenset({"full", "resize", "color", "teamcolor", "layer",
-                      "legend", "autoupdate"}),
+                      "legend", "autoupdate", "background"}),
     "list": frozenset({"full"}),
 }
 
@@ -3493,11 +3493,45 @@ def _color_guide() -> str:
     )
 
 
-@registry.command("map", access="all", usage="!map [full] | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 30), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map full` (host-gated) forces the omniscient view. `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors.")
+@registry.command("map", access="all", usage="!map [full] | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 30), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map full` (host-gated) forces the omniscient view. `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets a per-match background sprite; `!map scene` prints a textual summary of the graphics render model (sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected).")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     if args and args[0].lower() == "colors":
         return await ctx.send(_color_guide())
+    if args and args[0].lower() == "background":
+        # !map background <key> [stretch|tile|center] | clear  (host-gated)
+        if len(args) < 2:
+            bg = m.background_layer()
+            return await ctx.send(
+                f"Background: `{bg['sprite']}` ({bg['mode']})." if bg
+                else "No background set.")
+        if args[1].lower() in ("clear", "none", "off", "-"):
+            m.background = None
+            return await ctx.send("Background cleared.")
+        key = args[1]
+        mode = args[2].lower() if len(args) >= 3 else "stretch"
+        if mode not in ("stretch", "tile", "center"):
+            return await ctx.send(
+                "Usage: `!map background <key> [stretch|tile|center]` | `clear`.")
+        m.background = {"sprite": key, "mode": mode}
+        return await ctx.send(f"Background sprite `{key}` ({mode}).")
+    if args and args[0].lower() == "scene":
+        # !map scene [full] — debug summary of the graphics render model
+        # (respects the channel/POV unless `full`). The model itself is for
+        # the graphics surface; this is a textual at-a-glance.
+        pov = _view_pov(ctx, m, args)
+        scene = m.render_scene(pov_team=pov)
+        bg = scene["background"]
+        kinds: Dict[str, int] = {}
+        for p in scene["placements"]:
+            kinds[p["kind"]] = kinds.get(p["kind"], 0) + 1
+        breakdown = ", ".join(f"{k}:{v}" for k, v in sorted(kinds.items())) or "none"
+        return await ctx.send(
+            f"Scene ({m.grid_width}x{m.grid_height}): "
+            f"{len(scene['placements'])} placement(s) [{breakdown}], "
+            f"{len(scene['fog'])} fogged cell(s), "
+            f"background={bg['sprite'] if bg else 'none'}, "
+            f"borders={'on' if scene['borders']['show'] else 'off'}.")
     if args and args[0].lower() == "color":
         if len(args) < 2 or args[1].lower() not in ("on", "off"):
             return await ctx.send("Usage: `!map color on|off`.")
@@ -6685,7 +6719,7 @@ registry.annotate_sub(
 
 @registry.command(
     "zone",
-    usage=("!zone <new|drop|add|remove|fill|shift|anchor|unanchor|set|del|clear|glyph|color|info|list|cells> ..."),
+    usage=("!zone <new|drop|add|remove|fill|shift|anchor|unanchor|set|del|clear|glyph|sprite|color|info|list|cells> ..."),
     desc=(
         "Named multi-cell regions. A zone is a SET of cells plus a "
         "free-form data dict, optional hooks, and an optional map glyph "
@@ -6697,7 +6731,7 @@ registry.annotate_sub(
         "readable from formulas via zone_get/zone_has plus membership "
         "queries (zones_at, in_zone, entities_in_zone, ...). Subcommands: "
         "new, drop, add, remove, fill, shift, set, del, clear, glyph, "
-        "info, list, cells, hook."
+        "sprite (a graphics sprite key, like glyph), info, list, cells, hook."
     ),
 )
 async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -6892,6 +6926,22 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             )
         z["glyph"] = g
         return await ctx.send(f"Zone `{name}` map glyph set to `{g}`.")
+
+    if sub == "sprite":
+        # !zone sprite <name> <key|->  — a dedicated field (like glyph), drawn
+        # by the graphics surface; cleared with `-`.
+        if await return_help_if_not_enough_args(ctx, args, 3, "zone", "sprite"):
+            return
+        name = args[1]
+        z = m.zones.get(name)
+        if z is None:
+            return await ctx.send(f"❌ Zone '{name}' not found.")
+        key = args[2]
+        if key in ("-", "none", "clear"):
+            z.pop("sprite", None)
+            return await ctx.send(f"Cleared sprite for zone `{name}`.")
+        z["sprite"] = key
+        return await ctx.send(f"Zone `{name}` sprite set to `{key}`.")
 
     if sub == "color":
         if await return_help_if_not_enough_args(ctx, args, 3, "zone", "color"):
