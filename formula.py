@@ -1417,6 +1417,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # honoring resistance/immunity. status_force is the same but ignores
     # resistance (the level/increment lands regardless).
     "status_apply", "status_force",
+    "status_dispel", "status_transfer",
     # Status tags / resistance introspection + universal counters.
     "status_tags", "status_has_tag", "statuses_with_tag",
     "status_resist_of", "is_status_immune",
@@ -3646,6 +3647,47 @@ class FormulaEngine:
             definition's default data on a first application. Returns True."""
             return _do_status_apply("status_apply", eid_t, name, level, duration, False)
 
+        def _status_dispel(eid_t: Any, token: Any, max: Any = 0) -> int:
+            """status_dispel(eid, token, max=0): remove every status on `eid`
+            matching `token` — a status name, a `tag:<x>` token, or a CSV of
+            either (same convention as removes/blocked_by). `max` > 0 caps how
+            many are removed (by name order); 0 = all. Fires on_status_removed
+            per removal. Returns the number removed. (Token-only — no
+            'undispellable' guard.)"""
+            eid = _eid(eid_t)
+            if not isinstance(token, str):
+                raise FormulaError("status_dispel(eid, token, ...): token must be a string.")
+            if isinstance(max, bool) or not isinstance(max, (int, float)):
+                raise FormulaError("status_dispel(...): max must be a number.")
+            try:
+                n, _log = match.dispel_statuses(eid, token, int(max))
+            except (VTTError, NotFound) as ex:
+                raise FormulaError(str(ex))
+            self._note_affected(eid)
+            return n
+
+        def _status_transfer(from_t: Any, to_t: Any, name: Any) -> bool:
+            """status_transfer(from_eid, to_eid, name): MOVE a status from one
+            entity to another. It leaves the source (on_status_removed fires)
+            and re-applies on the destination honoring the dest's stacking +
+            resistance/immunity — a RESISTIBLE move: if the dest resists or is
+            immune the status is consumed (gone from source, doesn't stick).
+            Carries level + duration; custom instance data re-seeds from the
+            definition (like the body-part redirect). Returns True iff it
+            LANDED on the destination; False if the source lacked it / from==to
+            / the dest rejected it."""
+            fid = _eid(from_t)
+            tid = _eid(to_t)
+            if not isinstance(name, str):
+                raise FormulaError("status_transfer(from, to, name): name must be a string.")
+            try:
+                landed, _log = match.transfer_status(fid, tid, name)
+            except (VTTError, NotFound) as ex:
+                raise FormulaError(str(ex))
+            self._note_affected(fid)
+            self._note_affected(tid)
+            return landed
+
         def _status_force(eid_t: Any, name: Any,
                           level: Any = None, duration: Any = None) -> bool:
             """status_force(eid, name, level=None, duration=None): like
@@ -3662,6 +3704,8 @@ class FormulaEngine:
         ns["status_del"]      = _status_del
         ns["status_add"]      = _status_add
         ns["status_remove"]   = _status_remove
+        ns["status_dispel"]   = _status_dispel
+        ns["status_transfer"] = _status_transfer
         ns["status_apply"]    = _status_apply
         ns["status_force"]    = _status_force
 

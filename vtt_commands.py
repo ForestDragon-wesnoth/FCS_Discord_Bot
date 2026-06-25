@@ -7091,8 +7091,12 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         "rule) AND the target's resistance/immunity. `force` is the same but "
         "IGNORES resistance/immunity (the level/increment lands regardless; "
         "cross-status blocks still apply). Raw per-entity instance editing "
-        "stays on `!ent status`. Subcommands: def, drop, tick, when, stack, "
-        "maxlevel, data, list, info, apply, force."
+        "stays on `!ent status`. `dispel <eid> <token> [max]` removes statuses "
+        "matching a name / `tag:<x>` / CSV (no undispellable guard); "
+        "`transfer <from> <to> <name>` moves a status to another entity, "
+        "re-applying through the destination's resistance/stacking (a "
+        "resistible move). Subcommands: def, drop, tick, when, stack, "
+        "maxlevel, data, list, info, apply, force, dispel, transfer."
     ),
 )
 async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -7256,6 +7260,46 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         gone = e is None or sname not in e.status
         tail = " (status removed at <=0)" if gone else ""
         return await ctx.send(f"`{eid}.{sname}.{field}` = {new}{tail}")
+
+    if sub == "dispel":
+        # !status dispel <eid> <token> [max]  — remove statuses matching a
+        # name / tag:<x> / CSV token (no undispellable guard).
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "dispel"):
+            return
+        eid = _resolve_eid(m, args[1])
+        token = args[2]
+        max_count = 0
+        if len(args) >= 4:
+            try:
+                max_count = int(args[3])
+            except ValueError:
+                return await ctx.send("❌ max must be an integer.")
+        try:
+            n, event_log = m.dispel_statuses(eid, token, max_count)
+        except (VTTError, NotFound) as ex:
+            return await ctx.send(f"❌ {ex}")
+        tail = ("\n" + "\n".join(event_log)) if event_log else ""
+        return await ctx.send(
+            f"Dispelled {n} status(es) matching `{token}` from `{eid}`.{tail}")
+
+    if sub == "transfer":
+        # !status transfer <from_eid> <to_eid> <name>  — resistible move.
+        if await return_help_if_not_enough_args(ctx, args, 4, "status", "transfer"):
+            return
+        fid = _resolve_eid(m, args[1])
+        tid = _resolve_eid(m, args[2])
+        name = args[3]
+        try:
+            landed, event_log = m.transfer_status(fid, tid, name)
+        except (VTTError, NotFound) as ex:
+            return await ctx.send(f"❌ {ex}")
+        tail = ("\n" + "\n".join(event_log)) if event_log else ""
+        if landed:
+            msg = f"Transferred `{name}` from `{fid}` to `{tid}`."
+        else:
+            msg = (f"`{name}` left `{fid}` but did not stick on `{tid}` "
+                   f"(absent / resisted / immune).")
+        return await ctx.send(f"{msg}{tail}")
 
     if sub == "list":
         if not m.status_definitions:
