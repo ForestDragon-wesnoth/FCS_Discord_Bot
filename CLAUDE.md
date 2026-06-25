@@ -477,7 +477,13 @@ sign of care, not slowness. They will be unhappy if they have to
 ask "why does this do X instead of Y?" after merge.
 
 Prefer `AskUserQuestion` with a recommended-option-first list over
-free-text questions; they're easier to answer. Skip questions
+free-text questions; they're easier to answer. EXCEPTION (user
+directive, restated more than once): for OPEN-ENDED "what feature
+should I build / which idea next" questions, ask in PLAIN TEXT prose,
+NOT the questionnaire — the menu of ideas needs room to explain each,
+and the user wants to answer in their own words. Use the questionnaire
+for bounded design choices (enum-shaped: which stat, which mode, which
+enable-mechanism), not for picking a direction. Skip questions
 about things that are obviously settled (don't ask "should I
 keep the existing test passing?"), but otherwise the bar for
 asking is low. A 30-second clarification beats a 300-line refactor.
