@@ -1958,6 +1958,30 @@ More shipped work (continuing the list above):
     preserved like hp via transform_hp_mode. Defensible (new statblock) but
     flag if the user wants the bar to persist across a transform.
 
+- **Status dispel + transfer — SHIPPED (scenarios 528-529).** Two status
+  primitives built on the existing token machinery (`_status_token_matches` /
+  `_token_list` / `_statuses_matching_tokens`) and the removal chokepoint
+  (`_emit_status_diff(..., None)` fires on_status_removed).
+  - **`status_dispel(eid, token, max=0)`** (Match.`dispel_statuses`) removes
+    every status matching `token` — a name, a `tag:<x>` token, or a CSV of
+    either — up to `max` (0 = all; capped removals go in sorted-name order).
+    Returns the count removed; fires on_status_removed per removal. Design
+    call (user): TOKEN-ONLY, NO 'undispellable' guard — keep un-strippable
+    effects outside the token's range. Command `!status dispel <eid> <token>
+    [max]`.
+  - **`status_transfer(from, to, name)`** (Match.`transfer_status`) MOVES a
+    status: it leaves the source unconditionally (on_status_removed) and
+    RE-APPLIES on the destination via `apply_status` — so the dest's stacking
+    mode + resistance/immunity/blocked_by all apply. Design call (user):
+    RESISTIBLE move, consume-on-reject — if the dest resists/is immune the
+    status is gone from the source AND doesn't stick (returns False). Carries
+    level + duration; custom instance data RE-SEEDS from the definition (same
+    behavior as the existing part_status_redirect, which also re-applies rather
+    than byte-copying). Command `!status transfer <from> <to> <name>`. Both are
+    mutating `!status` subcommands (host-gated); prims registered in
+    `_MATCH_FUNC_NAMES`. (A future variant could preserve full instance data
+    or be force/reflect-flavored.)
+
 - **Audit-pass-7 fixes: load-side snapshots + ghost passives + status cap
   (scenarios 507-511).** A seventh sweep (three read-only survey agents across
   status/passive/event, movement/geometry/LOS, action/choice/dispatch/clamp;

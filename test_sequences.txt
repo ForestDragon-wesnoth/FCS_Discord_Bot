@@ -13591,3 +13591,58 @@ newly added `c` (speed 50, fastest) joins the charge race and starts taking the
 most turns. End state: `a` gone, `b` and `c` alive — all_entities() lists b and
 c. Demonstrates ATB selection survives mid-match spawn/death just like the
 round-based engine.
+
+
+SCENARIO 528 — status_dispel: remove statuses by name / tag / CSV token
+----------------------------------------------------------------------
+
+!match new disp Dispel 6 6
+!match use disp
+!status def poison
+!status tags poison debuff,toxic
+!status def slow
+!status tags slow debuff
+!status def bless
+!status tags bless buff
+!ent add h Hero 100 1 1 5
+!status apply h poison
+!status apply h slow
+!status apply h bless
+!status dispel h tag:debuff
+!eval "status_has('h', 'poison')"
+!eval "status_has('h', 'slow')"
+!eval "status_has('h', 'bless')"
+
+Expected: Hero carries poison + slow (both tagged `debuff`) and bless (tagged
+`buff`). `!status dispel h tag:debuff` removes every status matching the tag
+token — poison and slow go (2 removed, each firing on_status_removed), bless
+stays. status_has → poison False, slow False, bless True. dispel also accepts a
+bare name, a CSV of tokens (`poison,bless`), and a `max` cap; it's token-only
+(no undispellable guard).
+
+
+SCENARIO 529 — status_transfer: a resistible move between entities
+------------------------------------------------------------------
+
+!match new xfer Transfer 6 6
+!match use xfer
+!status def burn
+!ent add a A 100 1 1 5
+!ent add b B 100 2 1 5
+!ent add c C 100 3 1 5
+!ent set_var c status_immune burn
+!status apply a burn 3 5
+!status transfer a b burn
+!eval "status_has('a', 'burn')"
+!eval "status_get('b', 'burn', 'level')"
+!eval "status_get('b', 'burn', 'duration')"
+!status transfer b c burn
+!eval "status_has('b', 'burn')"
+!eval "status_has('c', 'burn')"
+
+Expected: `burn` (level 3, duration 5) starts on a. Transferring a→b moves it:
+a loses it (on_status_removed), b gains it re-applied through b's normal gating,
+carrying level 3 / duration 5. Then transferring b→c, where c is IMMUNE to burn:
+the status LEAVES b (it's moving regardless) but is CONSUMED on the resistible
+landing — c doesn't get it. So status_has a=False, b level 3 / duration 5; after
+the second transfer b=False and c=False (burn is gone entirely).

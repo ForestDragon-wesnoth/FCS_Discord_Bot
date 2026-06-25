@@ -9525,6 +9525,71 @@ class Match:
             log = log + self._emit_status_diff(eid, other, ob, None)
         return log
 
+    def dispel_statuses(self, eid: str, token: Any,
+                        max_count: int = 0) -> Tuple[int, List[str]]:
+        """Remove every status on `eid` matching `token` — a status name, a
+        `tag:<x>` token, or a CSV of either (the same token convention as
+        removes / blocked_by). `max_count` > 0 caps how many are removed
+        (sorted by name for determinism); 0 = all. Each removal goes through
+        the status diff chokepoint, so on_status_removed fires. Returns
+        (count_removed, log). Token-only — there is no 'undispellable' guard;
+        keep un-strippable effects outside the token's range. Raises NotFound
+        for an unknown entity."""
+        e = self.entities.get(eid)
+        if e is None:
+            raise NotFound(f"Entity '{eid}' not found.")
+        matches = sorted(self._statuses_matching_tokens(
+            e, self._token_list(token)))
+        if isinstance(max_count, int) and not isinstance(max_count, bool) \
+                and max_count > 0:
+            matches = matches[:max_count]
+        log: List[str] = []
+        removed = 0
+        for sname in matches:
+            if sname not in e.status:
+                continue
+            before = copy.deepcopy(e.status[sname])
+            del e.status[sname]
+            log += self._emit_status_diff(eid, sname, before, None)
+            removed += 1
+        return removed, log
+
+    def transfer_status(self, from_eid: str, to_eid: str,
+                        name: str) -> Tuple[bool, List[str]]:
+        """Move status `name` from `from_eid` to `to_eid`. It LEAVES the
+        source unconditionally (on_status_removed fires) and RE-APPLIES on the
+        destination via apply_status — so the destination's stacking mode +
+        resistance/immunity/blocked_by all apply (a RESISTIBLE move: if the
+        dest resists or is immune, the status is consumed — gone from the
+        source, doesn't stick). Carries level + duration; custom instance data
+        re-seeds from the definition, exactly like the part_status_redirect
+        path. Returns (landed_on_dest, log). No-op (False) if the source lacks
+        the status or from==to. Raises NotFound for an unknown entity."""
+        src = self.entities.get(from_eid)
+        if src is None:
+            raise NotFound(f"Entity '{from_eid}' not found.")
+        if to_eid not in self.entities:
+            raise NotFound(f"Entity '{to_eid}' not found.")
+        if not isinstance(name, str) or not name:
+            raise VTTError("transfer_status: name must be a non-empty string.")
+        if from_eid == to_eid or name not in src.status:
+            return False, []
+        inst = copy.deepcopy(src.status[name])
+        lv = inst.get("level")
+        du = inst.get("duration")
+        lv = int(lv) if isinstance(lv, (int, float)) and not isinstance(lv, bool) else None
+        du = int(du) if isinstance(du, (int, float)) and not isinstance(du, bool) else None
+        # Leave the source first (it's moving regardless of whether it sticks).
+        del src.status[name]
+        log = self._emit_status_diff(from_eid, name, inst, None)
+        # The source's on_status_removed hook could have removed the dest.
+        if to_eid not in self.entities:
+            return False, log
+        log += self.apply_status(to_eid, name, lv, du)
+        landed = (to_eid in self.entities
+                  and name in self.entities[to_eid].status)
+        return landed, log
+
     def fire_status_tick(self, when: str) -> List[str]:
         """Run each status's tick at the given `when`. A status WITH a
         matching definition runs that definition's `tick` formula when the
