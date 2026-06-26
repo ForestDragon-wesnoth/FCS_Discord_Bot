@@ -2021,13 +2021,29 @@ More shipped work (continuing the list above):
     glued/region/mounted/rider skip surface) — only the loop skeleton is
     duplicated; a keep-in-sync comment flags it. `!map scene` prints a textual
     summary of the model.
-  - PHASE 2 (NOT YET BUILT): `gui.py` — a tkinter+Pillow window (command-entry
-    + a render pane) that loads sprites from a `sprites/` folder (image-only,
-    no path traversal) and DRAWS the scene model; static only (no animation);
-    Discord eventually renders the same model to an image ATTACHMENT. v1 is
-    command-input only (no mouse). Animation, mouse-select/drag, and zoom/pan
-    are deferred. NOTE one v1 behavior: `transform`/`revert` replaces vars, so a
-    transformed entity's sprite naturally follows its new statblock.
+  - PHASE 2 SHIPPED: `gui.py` — a tkinter+Pillow desktop surface that runs the
+    SAME commands as cli.py but DRAWS the `render_scene()` model. Split for
+    headless-testability (tkinter is the ONLY non-testable part; it's thin glue,
+    imported lazily): `SpriteLoader` (PNG-only, path-traversal-safe, cached —
+    `sprites/` folder; extension + magic checked; `..`/absolute keys rejected;
+    missing → None → glyph-as-text fallback), `SceneRenderer` (pure Pillow:
+    background stretch/tile/center, placements in layer order, flip_h/flip_v,
+    tint [`gray`=desaturate for corpses, a colour=multiply for teams], opacity
+    [alpha-scale], multi-tile single/stretch/tile, glyph fallback, fog
+    sprite/dark-overlay at fog_opacity, grid borders + per-tile overrides; cell
+    size = the new `sprite_cell_size` rule, default 100), and `GuiCtx`/`GuiApp`
+    (command Entry + log + Canvas; redraws after each command, reloading sprites
+    so dropped-in art appears). **Pillow is an OPTIONAL dep, needed ONLY for
+    gui.py** (engine/CLI/harness unaffected); there is no requirements.txt in
+    this repo, so gui.py prints a `pip install Pillow` hint if it's missing.
+    Run: `python gui.py [sprites_dir]` (needs tkinter + a display). The renderer
+    is verified by PIXEL assertions in a headless test (loader security, sizing,
+    sprite/tile/background pixels, stretch/tile, flip, tint, opacity, glyph
+    fallback, borders+fog). NOTE one v1 behavior: `transform`/`revert` replaces
+    vars, so a transformed entity's sprite naturally follows its new statblock.
+  - PHASE 3 (deferred): animation, mouse select/drag, in-GUI pan/zoom, and the
+    Discord image-attachment surface (render the same model to a PNG and post
+    it) — all build on the existing render_scene model + SceneRenderer.
 
 - **Audit-pass-7 fixes: load-side snapshots + ghost passives + status cap
   (scenarios 507-511).** A seventh sweep (three read-only survey agents across
