@@ -3493,7 +3493,7 @@ def _color_guide() -> str:
     )
 
 
-@registry.command("map", access="all", usage="!map [full] | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 30), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map full` (host-gated) forces the omniscient view. `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets a per-match background sprite; `!map scene` prints a textual summary of the graphics render model (sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected).")
+@registry.command("map", access="all", usage="!map [full] | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 30), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map full` (host-gated) forces the omniscient view. `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets a per-match background sprite; `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     if args and args[0].lower() == "colors":
@@ -3532,6 +3532,27 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"{len(scene['fog'])} fogged cell(s), "
             f"background={bg['sprite'] if bg else 'none'}, "
             f"borders={'on' if scene['borders']['show'] else 'off'}.")
+    if args and args[0].lower() == "image":
+        # !map image [full] — render the graphics scene to a PNG and post it as
+        # an attachment. Surface-gated: only a surface that implements the
+        # optional `post_scene_image` hook (Discord) can draw it; others (CLI /
+        # harness) report it as graphics-only. Respects channel POV; `full`
+        # (omniscient) is host-gated like the rest of the map's elevated args.
+        sub = args[1:]
+        want_full = bool(sub) and sub[0].lower() == "full"
+        if want_full and not m.is_host(ctx_user(ctx)):
+            return await ctx.send("❌ `!map image full` (omniscient) is host-only.")
+        pov = _view_pov(ctx, m, sub)
+        hook = getattr(ctx, "post_scene_image", None)
+        if hook is None:
+            return await ctx.send(
+                "Graphics image rendering is available on the Discord surface "
+                "(and the `gui.py` desktop window). On the CLI/harness, use "
+                "`!map` for the ASCII view or `!map scene` for the model summary.")
+        reply = await hook(m, pov)
+        if reply:  # the image attachment is the payload; only speak on error/status
+            return await ctx.send(reply)
+        return None
     if args and args[0].lower() == "color":
         if len(args) < 2 or args[1].lower() not in ("on", "off"):
             return await ctx.send("Usage: `!map color on|off`.")

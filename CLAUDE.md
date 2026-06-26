@@ -2041,9 +2041,41 @@ More shipped work (continuing the list above):
     sprite/tile/background pixels, stretch/tile, flip, tint, opacity, glyph
     fallback, borders+fog). NOTE one v1 behavior: `transform`/`revert` replaces
     vars, so a transformed entity's sprite naturally follows its new statblock.
-  - PHASE 3 (deferred): animation, mouse select/drag, in-GUI pan/zoom, and the
-    Discord image-attachment surface (render the same model to a PNG and post
-    it) — all build on the existing render_scene model + SceneRenderer.
+  - PHASE 3 SHIPPED (the two parts the user wanted — #3 mouse select/drag and
+    #4 animation stay deferred "for the foreseeable future"; scenario 531):
+    - **(#1) Discord image attachments.** `sprite_render.py` was factored out of
+      gui.py so the rendering (SpriteLoader + SceneRenderer, VERBATIM) lives in
+      ONE surface-agnostic module with NO tkinter/discord dependency (loads +
+      unit-tests headlessly). gui.py now IMPORTS `_PIL_OK`/`SpriteLoader`/
+      `SceneRenderer`/`SPRITES_DIR_DEFAULT` from it (duplicate class defs
+      removed — no drift). New `sprite_render.render_match_png(match, loader,
+      pov_team=None, viewport=None, cell_size=None, max_dim=1600) -> bytes`:
+      render_scene → SceneRenderer → downscale to `max_dim` longest side (0 =
+      no cap) → PNG bytes; cell_size defaults to the `sprite_cell_size` rule.
+      New command `!map image [full]` (vtt_commands.py) calls the OPTIONAL ctx
+      hook `post_scene_image(m, pov)` via getattr — the set_autoupdate pattern:
+      Discord implements it, the CLI/harness don't and report "graphics
+      available on the Discord surface / gui.py" (so the harness exercises the
+      gating path cleanly). `full` (omniscient) is host-gated in-handler
+      (`m.is_host(ctx_user(ctx))`) since the dispatch gate only checks args[0]
+      and here it's args[1]; otherwise channel POV. `post_scene_image`
+      (discord_commands.py `DiscordCtxWrapper`) renders via a module-level
+      cached `SpriteLoader` + `render_match_png` (in `asyncio.to_thread` — PIL
+      is blocking), respects the channel's resolved viewport, posts a
+      `discord.File(<id>.png)`, and returns "" so the image IS the reply (the
+      handler suppresses an empty status). sprite_render imports are deferred so
+      a Pillow-less host still loads the adapter (the hook reports graphics
+      unavailable instead of crashing). Auto-update IMAGE boards (the graphics
+      twin of the text `!map autoupdate`) deferred — `!map image` is one-shot.
+    - **(#2) In-GUI pan/zoom.** gui.py's canvas got a toolbar (–/+/Reset zoom
+      buttons + a % readout), scrollbars, and bindings: left-drag pans
+      (scan_mark/scan_dragto), mouse wheel zooms (cross-platform: <MouseWheel>
+      delta on Win/Mac, Button-4/5 on Linux), Ctrl +/- zoom, arrow keys scroll.
+      Zoom is a GUI-LOCAL `_zoom` factor (0.25–4.0) that multiplies
+      `sprite_cell_size` at render time (re-renders crisp, not a bitmap
+      upscale); it does NOT touch the engine's per-channel viewport. tkinter
+      glue stays untestable headlessly; the render path (render_match_png) is
+      pixel-verified.
 
 - **Audit-pass-7 fixes: load-side snapshots + ghost passives + status cap
   (scenarios 507-511).** A seventh sweep (three read-only survey agents across

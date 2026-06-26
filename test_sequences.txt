@@ -13691,3 +13691,23 @@ everything. The first `!map scene` reports the placement breakdown
 reports fogged cells. ASCII rendering is unaffected throughout (sprites are a
 parallel layer). Layer order: background < zones < tiles < corpses < entities <
 fog.
+
+SCENARIO 531 — !map image surface gating (Discord-only graphics hook)
+--------------------------------------------------------------------------------
+
+!match new spri Image 6 5
+!match use spri
+!ent add hero Hero 30 3 3 5
+!map image
+!map image full
+
+Expected: `!map image` renders the graphics scene to a PNG attachment, but only
+on a surface that implements the optional `post_scene_image` hook (the Discord
+adapter; the gui.py window draws the same model directly). The harness/CLI lack
+the hook, so `!map image` reports that graphics image rendering is available on
+the Discord surface and points to `!map` / `!map scene`. `!map image full`
+(omniscient) is host-gated; with no owner set (a legacy/open match) the gate is
+a no-op and ctx_user resolves host, so it too falls through to the same
+graphics-unavailable message rather than the host-only refusal. No crash; the
+PNG bytes path itself (render_match_png → SceneRenderer → PNG) is covered by a
+headless Pillow test, not the scenario harness.
