@@ -1988,6 +1988,47 @@ More shipped work (continuing the list above):
     `_MATCH_FUNC_NAMES`. (A future variant could preserve full instance data
     or be force/reflect-flavored.)
 
+- **Graphics / sprite rendering — PHASE 1 SHIPPED (the engine render model;
+  scenario 530).** The long-planned image-rendered map. CORE PRINCIPLE: the
+  engine stays PIXEL-AGNOSTIC — a sprite is a KEY STRING stored in data
+  (mirroring glyphs), and `render_scene()` emits a DECLARATIVE model that a
+  graphics surface draws; the engine never loads an image. ASCII rendering is
+  untouched (a parallel path), so all text surfaces/scenarios are unaffected.
+  - **Sprite addressing** mirrors glyphs exactly: entity `sprite` /
+    `sprites.<facing>` (resolved via `entity_sprite` → (key, flip_h, flip_v),
+    disguise-aware like entity_glyph); tile `sprite` data > template (`tile_sprite`);
+    zone `sprite` field (`zone_sprite`, set by `!zone sprite`); corpse sprite from
+    the frozen snapshot (`corpse_sprite`); a per-match `background` ({sprite, mode},
+    `!map background`, serialized) > the `background_sprite` rule (`background_layer`).
+  - **Facing mirror**: a missing `sprites.<facing>` is filled by MIRRORING an
+    existing facing (the `sprite_mirror` rule / per-entity var: none/horizontal
+    [default = left↔right]/vertical/both); the model emits the chosen key + flip
+    flags. Then the base `sprite`, then the `fallback_sprite` rule, then None
+    (→ the surface renders the glyph as text).
+  - **`render_scene(pov, hidden, viewport)`** → `{grid_w/h, viewport,
+    background, placements[], fog[], borders}`. Each placement: `{kind
+    (zone/tile/corpse/entity), ref, x, y, w, h, mode, sprite, glyph (text
+    fallback), tint, opacity, flip_h, flip_v, layer}`. LAYERS: background(0) <
+    zones(10) < tiles(20) < corpses(25) < entities(30) < riders/region-parts(40)
+    < fog(50). Multi-tile entities carry w/h + `sprite_mode` (single/stretch/tile,
+    rule + var). Corpses are greyed + semi-transparent (`corpse_sprite_tint` /
+    `corpse_sprite_opacity`). Fog cells carry `fog_sprite` + `fog_opacity`;
+    borders carry show/color/opacity + per-tile overrides (`border_color` /
+    `border_opacity` data). Opacities are 0-100 (the schema has no float type).
+    `render_scene` is PARALLEL to `_render_ascii_impl` (deliberately, to avoid
+    risking the heavily-used ASCII path) but REUSES every predicate/resolver
+    (visibility, POV, fog via `_fog_terrain_visible`, entity_cells, the
+    glued/region/mounted/rider skip surface) — only the loop skeleton is
+    duplicated; a keep-in-sync comment flags it. `!map scene` prints a textual
+    summary of the model.
+  - PHASE 2 (NOT YET BUILT): `gui.py` — a tkinter+Pillow window (command-entry
+    + a render pane) that loads sprites from a `sprites/` folder (image-only,
+    no path traversal) and DRAWS the scene model; static only (no animation);
+    Discord eventually renders the same model to an image ATTACHMENT. v1 is
+    command-input only (no mouse). Animation, mouse-select/drag, and zoom/pan
+    are deferred. NOTE one v1 behavior: `transform`/`revert` replaces vars, so a
+    transformed entity's sprite naturally follows its new statblock.
+
 - **Audit-pass-7 fixes: load-side snapshots + ghost passives + status cap
   (scenarios 507-511).** A seventh sweep (three read-only survey agents across
   status/passive/event, movement/geometry/LOS, action/choice/dispatch/clamp;

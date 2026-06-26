@@ -13646,3 +13646,48 @@ carrying level 3 / duration 5. Then transferring b→c, where c is IMMUNE to bur
 the status LEAVES b (it's moving regardless) but is CONSUMED on the resistible
 landing — c doesn't get it. So status_has a=False, b level 3 / duration 5; after
 the second transfer b=False and c=False (burn is gone entirely).
+
+
+SCENARIO 530 — Sprite render model: sprites, background, zone sprite, corpse, fog
+--------------------------------------------------------------------------------
+
+!match new spr Sprites 10 10
+!match use spr
+!map background grass tile
+!ent add dragon Dragon 100 4 4 9
+!ent set_var dragon footprint_w 2
+!ent set_var dragon footprint_h 2
+!ent face dragon left
+!ent set_var dragon sprites.right dragon_right
+!ent set_var dragon sprite_mode stretch
+!ent set_var dragon team red
+!ent set_var dragon fog_vision_radius 2
+!ent add goblin Goblin 10 9 9 5
+!ent set_var goblin sprite goblin_sprite
+!ent set_var goblin team blue
+!tile set 2 2 sprite floor_stone
+!zone add poison 6 6
+!zone sprite poison poison_cloud
+!system set default death_result corpse
+!ent add slain Slain 1 3 3 5
+!ent set_var slain sprite slain_sprite
+!ent kill slain
+!map scene
+!match fog on
+!as view red
+!map scene
+
+Expected: this exercises the whole graphics render model through the command
+surface (the model itself is consumed by gui.py / the Discord image attachment;
+`!map scene` is a textual at-a-glance). The 2×2 dragon faces left with only a
+`sprites.right` set, so render_scene emits that key flipped horizontally,
+mode=stretch over its footprint. The goblin and a stone tile carry sprites; the
+poison zone has a `poison_cloud` sprite (drawn per covered cell); the slain
+entity becomes a corpse rendered with its own sprite, greyed + semi-transparent
+(corpse_sprite_tint=gray, corpse_sprite_opacity=50), on the corpse layer (25,
+between tiles and living entities). A `grass` background tiles beneath
+everything. The first `!map scene` reports the placement breakdown
+(entity/tile/zone/corpse) + background; after `!match fog on`, the second
+reports fogged cells. ASCII rendering is unaffected throughout (sprites are a
+parallel layer). Layer order: background < zones < tiles < corpses < entities <
+fog.

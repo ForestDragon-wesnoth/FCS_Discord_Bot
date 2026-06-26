@@ -1670,6 +1670,133 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Only the first character is used."
         ),
     },
+    # ---- graphics / sprite rendering ----
+    # The engine stays pixel-agnostic: a sprite is referenced by a KEY string
+    # stored in entity/tile/zone data (mirroring glyphs), resolved by the same
+    # instance>template>rule + disguise/POV precedence. render_scene() emits a
+    # declarative model (sprite placements + tint/opacity/flip/mode + fog +
+    # borders + background) that a graphics surface (gui.py) draws; the engine
+    # never loads an image. All sprite rules default to the no-sprite / text
+    # behavior, so ASCII rendering is unaffected. Opacities are 0-100 percent
+    # (the schema has no float type); the surface divides by 100.
+    "sprite_mode": {
+        "default": "single",
+        "schema": {"type": "enum",
+                   "choices": ["single", "stretch", "tile"]},
+        "desc": (
+            "How a MULTI-TILE entity's sprite fills its footprint: 'single' "
+            "(one sprite at the anchor cell), 'stretch' (one sprite scaled "
+            "across the whole footprint), or 'tile' (the sprite repeated once "
+            "per covered cell). Per-entity override: the `sprite_mode` var. "
+            "Irrelevant for 1x1 entities. Only used by render_scene."
+        ),
+    },
+    "sprite_mirror": {
+        "default": "horizontal",
+        "schema": {"type": "enum",
+                   "choices": ["none", "horizontal", "vertical", "both"]},
+        "desc": (
+            "When an entity has no `sprites.<facing>` for its current facing, "
+            "which axes the renderer may MIRROR an existing facing's sprite to "
+            "fill it: 'horizontal' (default — left<->right), 'vertical' "
+            "(up<->down), 'both', or 'none' (never mirror; fall straight back "
+            "to the base `sprite`). The model emits the chosen key plus "
+            "flip_h/flip_v flags for the surface to apply. Per-entity "
+            "override: the `sprite_mirror` var."
+        ),
+    },
+    "fallback_sprite": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "Sprite KEY used when an entity/tile/zone resolves no sprite of "
+            "its own (and no facing-mirror). Empty = no fallback (the surface "
+            "renders the glyph as text instead). A system-wide 'unknown "
+            "object' placeholder sprite."
+        ),
+    },
+    "background_sprite": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "System-default background sprite KEY, drawn as the BOTTOM layer "
+            "(beneath zones) across the whole grid. A per-match background "
+            "(`!map background <key> [mode]`) overrides this. Empty = none."
+        ),
+    },
+    "background_mode": {
+        "default": "stretch",
+        "schema": {"type": "enum",
+                   "choices": ["stretch", "tile", "center"]},
+        "desc": (
+            "How the background sprite fills the grid: 'stretch' (scale to the "
+            "whole map), 'tile' (repeat), or 'center' (one copy centered). "
+            "Default for the background_sprite rule; a per-match background "
+            "carries its own mode."
+        ),
+    },
+    "fog_sprite": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "Sprite KEY drawn over every cell the POV team can't see (the "
+            "graphics analog of fog_glyph), at fog_opacity. Empty = the "
+            "surface just dims/hides unseen cells with no sprite."
+        ),
+    },
+    "fog_opacity": {
+        "default": 60,
+        "schema": {"type": "int"},
+        "desc": (
+            "Opacity (0-100 percent) of the graphics fog overlay over unseen "
+            "cells. 100 = fully hides what's underneath; lower = translucent "
+            "haze. Only used by render_scene (fog_glyph drives text fog)."
+        ),
+    },
+    "show_borders": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Draw grid lines between tiles in the graphics surface. Color + "
+            "opacity come from border_color / border_opacity; a tile may "
+            "override its own edge via `border_color` / `border_opacity` data."
+        ),
+    },
+    "border_color": {
+        "default": "white",
+        "schema": {"type": "str"},
+        "desc": (
+            "Color of the grid border lines (a name or hex the surface "
+            "understands, e.g. 'white' / '#FFFFFF'). Per-tile override: the "
+            "tile's `border_color` data."
+        ),
+    },
+    "border_opacity": {
+        "default": 100,
+        "schema": {"type": "int"},
+        "desc": (
+            "Opacity (0-100 percent) of the grid border lines. Per-tile "
+            "override: the tile's `border_opacity` data."
+        ),
+    },
+    "corpse_sprite_tint": {
+        "default": "gray",
+        "schema": {"type": "str"},
+        "desc": (
+            "Tint the surface applies to a corpse's sprite so a body reads as "
+            "dead — default 'gray' (desaturate). Empty = no tint. A corpse "
+            "renders the dead entity's own stored sprite at this tint + "
+            "corpse_sprite_opacity."
+        ),
+    },
+    "corpse_sprite_opacity": {
+        "default": 50,
+        "schema": {"type": "int"},
+        "desc": (
+            "Opacity (0-100 percent) of a corpse's sprite. Default 50 (a "
+            "semi-transparent body). Combined with corpse_sprite_tint."
+        ),
+    },
     # ---- map viewport (panning) + legend ----
     # The viewport caps how much map is shown at once (for surfaces with
     # limited width, like Discord): when EITHER grid dimension exceeds its
@@ -4882,6 +5009,12 @@ class Match:
     # Toggled with `!map layer <name> on|off`; a one-off `!map hide=...`
     # arg hides extra layers for a single render without storing them.
     hidden_layers: "set[str]" = field(default_factory=set)
+
+    # ---- graphics: per-match background image ----
+    # None = use the background_sprite rule (if any). Else a dict
+    # {"sprite": <key>, "mode": stretch|tile|center} drawn as the bottom
+    # render-scene layer. Set via `!map background <key> [mode]`. Serialized.
+    background: Optional[Dict[str, Any]] = None
 
     # ---- match outcome / victory (100) ----
     # None until a winner is declared (manually via `!match win` or from a
@@ -12030,6 +12163,7 @@ class Match:
                               for k, v in self.channel_views.items()
                               if isinstance(v, (list, tuple)) and len(v) == 2},
             "map_legend_enabled": bool(self.map_legend_enabled),
+            "background": copy.deepcopy(self.background),
         }
         if include_history:
             d["history"] = self.history.to_dict()
@@ -12212,6 +12346,8 @@ class Match:
             if isinstance(k, str) and isinstance(v, (list, tuple)) and len(v) == 2
         } if isinstance(raw_views, dict) else {}
         m.map_legend_enabled = bool(d.get("map_legend_enabled", False))
+        raw_bg = d.get("background")
+        m.background = copy.deepcopy(raw_bg) if isinstance(raw_bg, dict) else None
         # History is optional in saved dicts. It's only present when the
         # original save was made with include_history=True. A snapshot's
         # state.dict deliberately omits history (snapshots-within-
@@ -12370,6 +12506,174 @@ class Match:
         if not isinstance(z, dict):
             return None
         return self._resolve_color_value(z.get("color"), {"zone_name": name})
+
+    # ---- sprite resolution (graphics render model) ------------------
+    # Sprites are KEY strings stored in data, mirroring glyphs: a per-facing
+    # `sprites.<facing>` var > a direction-agnostic `sprite` var > (entity)
+    # facing-mirror of an existing facing > the fallback_sprite rule. The
+    # engine returns keys + flip flags; the surface maps keys to images.
+    _MIRROR_H = {"left": "right", "right": "left",
+                 "up_left": "up_right", "up_right": "up_left",
+                 "down_left": "down_right", "down_right": "down_left"}
+    _MIRROR_V = {"up": "down", "down": "up",
+                 "up_left": "down_left", "down_left": "up_left",
+                 "up_right": "down_right", "down_right": "up_right"}
+
+    def _sprite_mirror_axes(self, e: "Entity") -> frozenset:
+        """Which mirror axes ('h'/'v') are allowed when filling a missing
+        facing sprite for `e`: the `sprite_mirror` var > the rule."""
+        val = e.vars.get("sprite_mirror")
+        if not (isinstance(val, str) and val.strip()):
+            val = str(self.rules.get("sprite_mirror", "horizontal"))
+        val = val.strip().lower()
+        return {"none": frozenset(), "horizontal": frozenset({"h"}),
+                "vertical": frozenset({"v"}),
+                "both": frozenset({"h", "v"})}.get(val, frozenset({"h"}))
+
+    def _mirror_sprite(self, e: "Entity", sprites: Dict[str, Any],
+                       facing: str) -> Optional[Tuple[str, bool, bool]]:
+        """Find a mirror of an existing facing in `sprites` to stand in for
+        the missing `facing`, per the entity's allowed mirror axes. Returns
+        (key, flip_h, flip_v) or None."""
+        axes = self._sprite_mirror_axes(e)
+        if "h" in axes:
+            p = self._MIRROR_H.get(facing)
+            k = sprites.get(p) if p else None
+            if isinstance(k, str) and k:
+                return (k, True, False)
+        if "v" in axes:
+            p = self._MIRROR_V.get(facing)
+            k = sprites.get(p) if p else None
+            if isinstance(k, str) and k:
+                return (k, False, True)
+        return None
+
+    def entity_sprite(self, e: "Entity", pov_team: Optional[str] = None
+                      ) -> Optional[Tuple[str, bool, bool]]:
+        """The sprite for `e` as (key, flip_h, flip_v), or None when nothing
+        resolves (the surface then renders the glyph as text). Resolution
+        mirrors entity_glyph: disguise sprites (when disguised to pov_team)
+        are tried first, then the entity's own — within each source: exact
+        `sprites.<facing>`, then a facing-mirror, then the base `sprite`."""
+        facing = getattr(e, "facing", "")
+        sources: List[Dict[str, Any]] = []
+        dis = self._effective_disguise(e, pov_team)
+        if isinstance(dis, dict):
+            sources.append(dis)
+        sources.append(e.vars)
+        for src in sources:
+            sprites = src.get("sprites")
+            if isinstance(sprites, dict):
+                k = sprites.get(facing)
+                if isinstance(k, str) and k:
+                    return (k, False, False)
+                m = self._mirror_sprite(e, sprites, facing)
+                if m is not None:
+                    return m
+            k = src.get("sprite")
+            if isinstance(k, str) and k:
+                return (k, False, False)
+        fb = str(self.rules.get("fallback_sprite", "")).strip()
+        return (fb, False, False) if fb else None
+
+    def entity_sprite_mode(self, e: "Entity") -> str:
+        """How a multi-tile entity's sprite fills its footprint: the
+        `sprite_mode` var > the rule (single | stretch | tile)."""
+        val = e.vars.get("sprite_mode")
+        if not (isinstance(val, str) and val in ("single", "stretch", "tile")):
+            val = str(self.rules.get("sprite_mode", "single"))
+        return val if val in ("single", "stretch", "tile") else "single"
+
+    def tile_sprite(self, x: int, y: int) -> Optional[str]:
+        """The sprite key for the tile at (x, y): instance `sprite` data >
+        the template's `sprite`. None when unset."""
+        cell = self.tiles.get((x, y))
+        if not isinstance(cell, dict):
+            return None
+        k = cell.get("sprite")
+        if isinstance(k, str) and k:
+            return k
+        tpl_name = cell.get("_template")
+        if isinstance(tpl_name, str):
+            tpl = self.tile_templates.get(tpl_name)
+            if tpl is not None:
+                tk = tpl.data.get("sprite")
+                if isinstance(tk, str) and tk:
+                    return tk
+        return None
+
+    def zone_sprite(self, name: str) -> Optional[str]:
+        """The sprite key for zone `name` (its `sprite` field), or None."""
+        z = self.zones.get(name)
+        if not isinstance(z, dict):
+            return None
+        k = z.get("sprite")
+        return k if isinstance(k, str) and k else None
+
+    def background_layer(self) -> Optional[Dict[str, Any]]:
+        """The resolved background as {sprite, mode}, or None: the per-match
+        `background` field > the background_sprite rule (+ background_mode)."""
+        bg = self.background
+        if isinstance(bg, dict):
+            key = bg.get("sprite")
+            if isinstance(key, str) and key:
+                mode = bg.get("mode")
+                return {"sprite": key,
+                        "mode": mode if mode in ("stretch", "tile", "center")
+                        else "stretch"}
+        key = str(self.rules.get("background_sprite", "")).strip()
+        if key:
+            mode = str(self.rules.get("background_mode", "stretch"))
+            return {"sprite": key,
+                    "mode": mode if mode in ("stretch", "tile", "center")
+                    else "stretch"}
+        return None
+
+    def tile_glyph(self, x: int, y: int) -> Optional[str]:
+        """The glyph for the tile at (x, y): instance > template (mirrors the
+        inline resolution in _render_ascii_impl). None when unset."""
+        cell = self.tiles.get((x, y))
+        if not isinstance(cell, dict):
+            return None
+        g = cell.get("glyph")
+        if isinstance(g, str) and len(g) == 1:
+            return g
+        tpl_name = cell.get("_template")
+        if isinstance(tpl_name, str):
+            tpl = self.tile_templates.get(tpl_name)
+            if tpl is not None:
+                tg = tpl.data.get("glyph")
+                if isinstance(tg, str) and len(tg) == 1:
+                    return tg
+        return None
+
+    def entity_has_custom_sprite(self, e: "Entity") -> bool:
+        """True when `e` has a custom sprite (per-facing `sprites` or the base
+        `sprite` var) — the sprite analog of entity_has_custom_glyph, for the
+        region-part-over-parent render priority."""
+        sd = e.vars.get("sprites")
+        if isinstance(sd, dict):
+            s = sd.get(getattr(e, "facing", ""))
+            if isinstance(s, str) and s:
+                return True
+        s = e.vars.get("sprite")
+        return isinstance(s, str) and bool(s)
+
+    def corpse_sprite(self, corpse: Dict[str, Any]) -> Optional[str]:
+        """The sprite key for a corpse, read from its frozen snapshot vars:
+        `sprites.<facing>` > `sprite`. No mirror/fallback (a corpse is static
+        and undisguised). None when the dead entity had no sprite."""
+        ent = corpse.get("entity") if isinstance(corpse, dict) else None
+        if not isinstance(ent, dict):
+            return None
+        vars_ = ent.get("vars") or {}
+        sd = vars_.get("sprites")
+        if isinstance(sd, dict):
+            k = sd.get(ent.get("facing", ""))
+            if isinstance(k, str) and k:
+                return k
+        k = vars_.get("sprite")
+        return k if isinstance(k, str) and k else None
 
     # ---- map viewport (panning) -------------------------------------
     # The viewport caps how much grid renders at once. It engages when
@@ -12679,6 +12983,189 @@ class Match:
                         f"  {glyph} — " + ", ".join(legend_map[glyph]))
                 out = out + "\n" + "\n".join(leg_lines)
         return out
+
+    # ---- graphics render model (render_scene) -----------------------
+    # The sprite analog of render_ascii: a DECLARATIVE scene the graphics
+    # surface (gui.py) draws. The engine never touches pixels — it emits
+    # sprite KEYS + tint/opacity/flip/mode + fog + borders + background.
+    # KEEP THE LAYER ORDER / VISIBILITY / POV / FOG LOGIC IN SYNC WITH
+    # _render_ascii_impl (a parallel method, by design, to avoid risking the
+    # heavily-used ASCII path; both reuse the same predicate + resolver
+    # helpers, so only the loop skeleton is duplicated).
+    def render_scene(self, pov_team: Optional[str] = None,
+                     hidden_layers: Optional["set[str]"] = None,
+                     viewport: Optional[Tuple[int, int, int, int]] = None
+                     ) -> Dict[str, Any]:
+        """Build the graphics render model (see _render_scene_impl). Activates
+        the read-only fog-sight memo for the duration, exactly like
+        render_ascii."""
+        hidden = self.hidden_layers if hidden_layers is None else hidden_layers
+        prev = self._vision_memo
+        if prev is None:
+            self._vision_memo = {}
+        try:
+            return self._render_scene_impl(pov_team, hidden, viewport)
+        finally:
+            self._vision_memo = prev
+
+    def _emit_entity_placement(self, out: List[Dict[str, Any]], e: "Entity",
+                               pov_team: Optional[str], layer: int) -> None:
+        w, h = self.entity_footprint(e)
+        spr = self.entity_sprite(e, pov_team)
+        key, fh, fv = spr if spr is not None else (None, False, False)
+        mode = self.entity_sprite_mode(e) if (w > 1 or h > 1) else "single"
+        out.append({
+            "kind": "entity", "ref": e.id,
+            "x": e.x, "y": e.y, "w": w, "h": h, "mode": mode,
+            "sprite": key, "glyph": self.entity_glyph(e, pov_team),
+            "tint": self.entity_color(e, pov_team), "opacity": 100,
+            "flip_h": fh, "flip_v": fv, "layer": layer,
+        })
+
+    def _scene_borders(self) -> Dict[str, Any]:
+        """Border (grid-line) config for the scene: the show_borders /
+        border_color / border_opacity rules, plus per-tile `border_color` /
+        `border_opacity` overrides (keyed 'x,y')."""
+        try:
+            op = int(self.rules.get("border_opacity", 100))
+        except (TypeError, ValueError):
+            op = 100
+        overrides: Dict[str, Any] = {}
+        for (tx, ty), data in self.tiles.items():
+            if not isinstance(data, dict):
+                continue
+            bc, bo = data.get("border_color"), data.get("border_opacity")
+            ov: Dict[str, Any] = {}
+            if isinstance(bc, str) and bc:
+                ov["color"] = bc
+            if isinstance(bo, (int, float)) and not isinstance(bo, bool):
+                ov["opacity"] = max(0, min(100, int(bo)))
+            if ov:
+                overrides[f"{tx},{ty}"] = ov
+        return {"show": bool(self.rules.get("show_borders", False)),
+                "color": str(self.rules.get("border_color", "white")),
+                "opacity": max(0, min(100, op)), "overrides": overrides}
+
+    def _render_scene_impl(self, pov_team: Optional[str],
+                           hidden: "set[str]",
+                           viewport: Optional[Tuple[int, int, int, int]]
+                           ) -> Dict[str, Any]:
+        placements: List[Dict[str, Any]] = []
+
+        # Zone layer (10): a sprite / glyph / color per covered cell.
+        for zname, z in (self.zones.items() if "zones" not in hidden else ()):
+            if not self.zone_visible_to(zname, pov_team):
+                continue
+            spr = self.zone_sprite(zname)
+            g = z.get("glyph")
+            g = g if isinstance(g, str) and len(g) == 1 else None
+            tint = self.zone_color(zname)
+            if spr is None and g is None and tint is None:
+                continue
+            for (zx, zy) in z.get("cells", ()):
+                if not self.in_bounds(zx, zy):
+                    continue
+                placements.append({
+                    "kind": "zone", "ref": zname, "x": zx, "y": zy,
+                    "w": 1, "h": 1, "mode": "single", "sprite": spr,
+                    "glyph": g, "tint": tint, "opacity": 100,
+                    "flip_h": False, "flip_v": False, "layer": 10})
+
+        # Tile layer (20).
+        for (tx, ty), data in (self.tiles.items() if "tiles" not in hidden else ()):
+            if not self.in_bounds(tx, ty) or not self.tile_visible_to(tx, ty, pov_team):
+                continue
+            spr = self.tile_sprite(tx, ty)
+            g = self.tile_glyph(tx, ty)
+            tint = self.tile_color(tx, ty)
+            if spr is None and g is None and tint is None:
+                continue
+            placements.append({
+                "kind": "tile", "ref": f"{tx},{ty}", "x": tx, "y": ty,
+                "w": 1, "h": 1, "mode": "single", "sprite": spr,
+                "glyph": g, "tint": tint, "opacity": 100,
+                "flip_h": False, "flip_v": False, "layer": 20})
+
+        # Corpse layer (25): the dead entity's stored sprite, tinted +
+        # semi-transparent (corpse_sprite_tint / corpse_sprite_opacity).
+        # Fog-gated like everything else; only drawn when it has a sprite (or
+        # a stored glyph for the text fallback). Rides the entity-layer toggle.
+        if "entities" not in hidden:
+            c_tint = str(self.rules.get("corpse_sprite_tint", "gray")).strip() or None
+            try:
+                c_op = int(self.rules.get("corpse_sprite_opacity", 50))
+            except (TypeError, ValueError):
+                c_op = 50
+            c_op = max(0, min(100, c_op))
+            for (cx, cy, cid, corpse) in self.all_corpses():
+                if not self.corpse_visible_to(cid, corpse, cx, cy, pov_team):
+                    continue
+                spr = self.corpse_sprite(corpse)
+                gl = ((corpse.get("entity") or {}).get("vars") or {}).get("glyph")
+                gl = gl if isinstance(gl, str) and len(gl) == 1 else None
+                if spr is None and gl is None:
+                    continue
+                cw, ch = self._corpse_footprint(corpse)
+                placements.append({
+                    "kind": "corpse", "ref": cid, "x": cx, "y": cy,
+                    "w": cw, "h": ch, "mode": "single", "sprite": spr,
+                    "glyph": gl, "tint": c_tint, "opacity": c_op,
+                    "flip_h": False, "flip_v": False, "layer": 25})
+
+        if "entities" not in hidden:
+            # Entity main pass (30): not glued/region/mounted.
+            for e in self.entities.values():
+                if not getattr(e, "is_alive", True):
+                    continue
+                if e.is_glued_part or e.is_region_part or e.is_mounted:
+                    continue
+                if not self.entity_visible_to(e.id, pov_team):
+                    continue
+                self._emit_entity_placement(placements, e, pov_team, 30)
+            # Visible riders (40).
+            for e in self.entities.values():
+                if not e.is_visible_rider or not getattr(e, "is_alive", True):
+                    continue
+                if not self.entity_visible_to(e.id, pov_team):
+                    continue
+                self._emit_entity_placement(placements, e, pov_team, 40)
+            # Region parts with a custom sprite/glyph (40), over their parent.
+            if bool(self.rules.get("part_custom_glyph_priority", True)):
+                for e in self.entities.values():
+                    if not e.is_region_part:
+                        continue
+                    if not (self.entity_has_custom_sprite(e)
+                            or self.entity_has_custom_glyph(e)):
+                        continue
+                    if not self.entity_visible_to(e.id, pov_team):
+                        continue
+                    self._emit_entity_placement(placements, e, pov_team, 40)
+
+        # Fog (50): cells the POV team can't see.
+        fog: List[Dict[str, Any]] = []
+        if self.fog_enabled and pov_team is not None and "fog" not in hidden:
+            fog_sprite = str(self.rules.get("fog_sprite", "")).strip() or None
+            try:
+                fog_op = int(self.rules.get("fog_opacity", 60))
+            except (TypeError, ValueError):
+                fog_op = 60
+            fog_op = max(0, min(100, fog_op))
+            for yy in range(1, self.grid_height + 1):
+                for xx in range(1, self.grid_width + 1):
+                    if not self._fog_terrain_visible(pov_team, xx, yy):
+                        fog.append({"x": xx, "y": yy,
+                                    "sprite": fog_sprite, "opacity": fog_op})
+
+        vp = None
+        if viewport is not None:
+            vx, vy, vw, vh = viewport
+            vp = {"x": vx, "y": vy, "w": vw, "h": vh}
+        return {
+            "grid_width": self.grid_width, "grid_height": self.grid_height,
+            "viewport": vp, "background": self.background_layer(),
+            "placements": placements, "fog": fog,
+            "borders": self._scene_borders(),
+        }
 
     def _spawn_facing(self, x: int, y: int) -> Direction:
         eight_way = bool(self.rules.get("allow_diagonal_facing", False))
