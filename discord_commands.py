@@ -170,6 +170,37 @@ class DiscordCtxWrapper:
         return ("🗺️ Auto-update board ON — this message refreshes on every "
                 "change" + (" (use the arrows to pan)." if engaged else "."))
 
+    async def post_scene_image(self, m, pov) -> str:
+        """Render the match's graphics scene to a PNG and post it as an
+        attachment. Called by `!map image` via getattr (Discord-only — other
+        surfaces lack this method). Respects the resolved POV + the channel's
+        viewport window; returns a short status line (the image is the
+        payload). Reports a clean message if Pillow isn't installed."""
+        try:
+            from sprite_render import render_match_png
+        except Exception:
+            return ("❌ Graphics rendering needs Pillow on the bot host "
+                    "(`pip install Pillow`).")
+        mode = str(m.rules.get("viewport_mode", "auto"))
+        enabled = mode != "off"
+        viewport = m.resolve_viewport(self.channel_key, enabled=enabled)
+        try:
+            import asyncio
+            data = await asyncio.to_thread(
+                render_match_png, m, _get_sprite_loader(),
+                pov_team=pov, viewport=viewport)
+        except RuntimeError as e:
+            return f"❌ {e}"
+        except Exception as e:
+            return f"❌ Could not render the scene image: {e}"
+        import io
+        try:
+            await self._ctx.send(
+                file=discord.File(io.BytesIO(data), filename=f"{m.id}.png"))
+        except Exception as e:
+            return f"❌ Could not post the image: {e}"
+        return ""  # the attachment is the reply
+
     async def send_approval(self, req: dict):
         """Post an approval request with clickable Approve/Deny buttons.
         Falls back to a plain text prompt if the discord UI components
@@ -313,6 +344,22 @@ class _ApprovalView(discord.ui.View):
 
 # channel_key -> {"message": discord.Message, "match_id": str}
 _boards: Dict[str, Dict[str, Any]] = {}
+
+
+# --- Graphics image rendering (the `!map image` surface hook) ---------------
+# render_scene -> PNG bytes via sprite_render (Pillow). The loader caches PNGs
+# from the sprites/ folder; we lazily build it once and reuse it. Importing
+# sprite_render is deferred so a Discord deployment without Pillow still loads
+# (the hook reports graphics as unavailable instead of crashing the adapter).
+_sprite_loader = None
+
+
+def _get_sprite_loader():
+    global _sprite_loader
+    if _sprite_loader is None:
+        from sprite_render import SpriteLoader
+        _sprite_loader = SpriteLoader()
+    return _sprite_loader
 
 
 def _board_render(m, channel_key: str) -> Tuple[str, bool]:
