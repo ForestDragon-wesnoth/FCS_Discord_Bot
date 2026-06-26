@@ -1797,6 +1797,16 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "semi-transparent body). Combined with corpse_sprite_tint."
         ),
     },
+    "sprite_cell_size": {
+        "default": 100,
+        "schema": {"type": "int"},
+        "desc": (
+            "Pixel size of one grid cell in the graphics surface (gui.py). "
+            "Default 100 -> a 100x100 px cell. A sprite is scaled to its "
+            "footprint x this size. Engine-agnostic (text rendering ignores "
+            "it); the surface reads it."
+        ),
+    },
     # ---- map viewport (panning) + legend ----
     # The viewport caps how much map is shown at once (for surfaces with
     # limited width, like Discord): when EITHER grid dimension exceeds its
