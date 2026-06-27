@@ -112,10 +112,11 @@ class GuiApp:
         tk.Label(bar, text="(drag to pan · wheel/Ctrl+wheel to zoom)",
                  bg="#0e0e12", fg="#707070").pack(side="left")
 
-        # Canvas + scrollbars (pan).
+        # ---- Widget creation ----
+        # Canvas + scrollbars (the map). Packed LAST (see below) so it's the
+        # widget that gives up / absorbs space on resize.
         frame = tk.Frame(self.root)
-        frame.pack(side="top", fill="both", expand=True)
-        self.canvas = tk.Canvas(frame, width=800, height=600,
+        self.canvas = tk.Canvas(frame, width=800, height=420,
                                 bg="#141418", highlightthickness=0)
         vbar = tk.Scrollbar(frame, orient="vertical", command=self.canvas.yview)
         hbar = tk.Scrollbar(frame, orient="horizontal", command=self.canvas.xview)
@@ -123,6 +124,37 @@ class GuiApp:
         vbar.pack(side="right", fill="y")
         hbar.pack(side="bottom", fill="x")
         self.canvas.pack(side="left", fill="both", expand=True)
+
+        # Output log: READ-ONLY (disabled except while we insert) so it can't
+        # be mistaken for / typed into as the input box.
+        self.log_widget = tk.Text(self.root, height=6, bg="#0e0e12",
+                                  fg="#d0d0d0", insertbackground="#d0d0d0",
+                                  state="disabled")
+
+        # Command input: a MULTI-LINE box so a pasted block of commands runs
+        # line-by-line (like the CLI / a Discord !batch). Enter runs every
+        # non-empty line in order; Shift+Enter inserts a literal newline.
+        inbar = tk.Frame(self.root)
+        tk.Button(inbar, text="Run", command=self._run_input).pack(side="right")
+        self.entry = tk.Text(inbar, height=6, bg="#1a1a20", fg="#e0e0e0",
+                             insertbackground="#e0e0e0", wrap="word")
+        self.entry.pack(side="left", fill="x", expand=True)
+        self.entry.bind("<Return>", self._on_enter)
+        self.entry.bind("<Shift-Return>", lambda e: None)  # literal newline
+        self.entry.bind("<Control-Return>", self._on_enter)
+        self.entry.focus_set()
+
+        # ---- Layout / resize priority ----
+        # Pack order = clipping priority (earliest packed keeps its space). We
+        # want, when the window is too short: the INPUT first-class (always
+        # visible), the LOG second-class, and the MAP to shrink to fit. So pack
+        # input then log at the bottom (reserved first), then the canvas frame
+        # last with expand so it absorbs/yields the remaining space.
+        inbar.pack(side="bottom", fill="x")   # very bottom, reserved first
+        self.log_widget.pack(side="bottom", fill="x")  # above input, second
+        frame.pack(side="top", fill="both", expand=True)  # map fills the rest
+        # Don't let the window grow taller than these reservations need.
+        self.root.minsize(480, 300)
 
         # Pan: left-drag (scan), arrow keys.
         self.canvas.bind("<ButtonPress-1>",
@@ -141,27 +173,6 @@ class GuiApp:
         self.canvas.bind("<Down>", lambda e: self.canvas.yview_scroll(1, "units"))
         self.canvas.bind("<Left>", lambda e: self.canvas.xview_scroll(-1, "units"))
         self.canvas.bind("<Right>", lambda e: self.canvas.xview_scroll(1, "units"))
-
-        # Output log: READ-ONLY (disabled except while we insert) so it can't
-        # be mistaken for / typed into as the input box.
-        self.log_widget = tk.Text(self.root, height=8, bg="#0e0e12",
-                                  fg="#d0d0d0", insertbackground="#d0d0d0",
-                                  state="disabled")
-        self.log_widget.pack(side="top", fill="x")
-
-        # Command input: a MULTI-LINE box so a pasted block of commands runs
-        # line-by-line (like the CLI / a Discord !batch). Enter runs every
-        # non-empty line in order; Shift+Enter inserts a literal newline.
-        inbar = tk.Frame(self.root)
-        inbar.pack(side="bottom", fill="x")
-        tk.Button(inbar, text="Run", command=self._run_input).pack(side="right")
-        self.entry = tk.Text(inbar, height=7, bg="#1a1a20", fg="#e0e0e0",
-                             insertbackground="#e0e0e0", wrap="word")
-        self.entry.pack(side="left", fill="x", expand=True)
-        self.entry.bind("<Return>", self._on_enter)
-        self.entry.bind("<Shift-Return>", lambda e: None)  # literal newline
-        self.entry.bind("<Control-Return>", self._on_enter)
-        self.entry.focus_set()
         self.log("FCS VTT graphics surface. Type !help (one command per line; "
                  "Enter runs all lines, Shift+Enter for a newline). Sprites "
                  f"from: {self.loader.folder}")
