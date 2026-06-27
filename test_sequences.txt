@@ -13767,3 +13767,26 @@ override falls back to the kind's rule default. The layers themselves are
 verified by a headless assertion (the `!map scene` summary only counts
 placements); ASCII rendering is unaffected (z-layers are a graphics-only
 concept).
+
+SCENARIO 534 — Render mode toggle: text vs image (graphics surface gating)
+--------------------------------------------------------------------------------
+
+!match new rm RenderMode 5 5
+!match use rm
+!ent add hero Hero 30 3 3 5
+!map mode
+!map mode image
+!map
+!map mode text
+!map mode bogus
+
+Expected: `!map mode` shows the current per-match render mode (default `text`).
+`!map mode image` sets it (host-gated, serialized via Match.render_mode). On a
+graphics-capable surface (Discord with Pillow) a plain `!map` then posts a
+rendered PNG instead of the ASCII block, and `!map autoupdate` makes a self-
+refreshing IMAGE board; on a text-only surface (the harness/CLI) a plain `!map`
+in image mode FALLS BACK to the ASCII render (the third command here still
+prints the ascii map). `!map mode text` restores ASCII; `!map mode bogus` is
+rejected with a usage hint. The Discord image-board lifecycle (post + edit
+attachments in place, pan buttons re-rendering the image) is verified with
+stubbed Discord objects, not the scenario harness.

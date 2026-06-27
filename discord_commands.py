@@ -159,16 +159,32 @@ class DiscordCtxWrapper:
         if not on:
             _boards.pop(self.channel_key, None)
             return "🗺️ Auto-update board OFF for this channel."
-        text, engaged = _board_render(m, self.channel_key)
-        view = _PanView(self.channel_key, self._mgr) if engaged else None
-        try:
-            msg = await self._ctx.send(text, view=view) if view \
-                else await self._ctx.send(text)
-        except Exception:
-            msg = await self._ctx.send(text)
+        import io
+        msg = None
+        engaged = False
+        # Image board when the match's render mode is `image` (and Pillow is
+        # available); otherwise the ASCII board. Falls back to text on failure.
+        if getattr(m, "render_mode", "text") == "image":
+            try:
+                header, data, engaged = await _board_image(m, self.channel_key)
+                view = _PanView(self.channel_key, self._mgr) if engaged else None
+                file = discord.File(io.BytesIO(data), filename=f"{m.id}.png")
+                msg = await self._ctx.send(header or "🗺️", file=file, view=view) \
+                    if view else await self._ctx.send(header or "🗺️", file=file)
+            except Exception:
+                msg = None
+        if msg is None:
+            text, engaged = _board_render(m, self.channel_key)
+            view = _PanView(self.channel_key, self._mgr) if engaged else None
+            try:
+                msg = await self._ctx.send(text, view=view) if view \
+                    else await self._ctx.send(text)
+            except Exception:
+                msg = await self._ctx.send(text)
         _boards[self.channel_key] = {"message": msg, "match_id": m.id}
-        return ("🗺️ Auto-update board ON — this message refreshes on every "
-                "change" + (" (use the arrows to pan)." if engaged else "."))
+        kind = "image" if getattr(m, "render_mode", "text") == "image" else "map"
+        return (f"🗺️ Auto-update {kind} board ON — this message refreshes on "
+                "every change" + (" (use the arrows to pan)." if engaged else "."))
 
     async def post_scene_image(self, m, pov) -> str:
         """Render the match's graphics scene to a PNG and post it as an
@@ -382,6 +398,51 @@ def _board_render(m, channel_key: str) -> Tuple[str, bool]:
     return f"{header}```{fence}\n{body}\n```", bool(viewport)
 
 
+async def _board_image(m, channel_key: str):
+    """(header text, PNG bytes, viewport_engaged) for an IMAGE board: the same
+    POV + viewport as the text board, rendered to a PNG via sprite_render.
+    Raises if Pillow is unavailable (caller falls back to a text board)."""
+    import asyncio
+    from sprite_render import render_match_png
+    pov = m.channel_pov(channel_key)
+    vmode = str(m.rules.get("viewport_mode", "auto"))
+    enabled = vmode != "off"
+    viewport = m.resolve_viewport(channel_key, enabled=enabled)
+    data = await asyncio.to_thread(
+        render_match_png, m, _get_sprite_loader(),
+        pov_team=pov, viewport=viewport)
+    header = ""
+    if viewport:
+        vx, vy, vw, vh = viewport
+        header = (f"🗺️ viewport ({vx},{vy})–({vx + vw - 1},{vy + vh - 1}) "
+                  f"of {m.grid_width}×{m.grid_height}")
+    return header, data, bool(viewport)
+
+
+async def _apply_board(message, m, channel_key: str, mgr: MatchManager) -> bool:
+    """Edit an existing board `message` to the current view, honoring the
+    match's render_mode (`image` → a PNG attachment, else the ASCII block).
+    Returns whether the viewport is engaged. Image mode falls back to text if
+    rendering fails (e.g. Pillow missing). Raises only on the edit itself."""
+    import io
+    if getattr(m, "render_mode", "text") == "image":
+        try:
+            header, data, engaged = await _board_image(m, channel_key)
+            view = _PanView(channel_key, mgr) if engaged else None
+            await message.edit(
+                content=(header or None),
+                attachments=[discord.File(io.BytesIO(data),
+                                          filename=f"{m.id}.png")],
+                view=view)
+            return engaged
+        except Exception:
+            pass  # fall through to a text board
+    text, engaged = _board_render(m, channel_key)
+    view = _PanView(channel_key, mgr) if engaged else None
+    await message.edit(content=text, attachments=[], view=view)
+    return engaged
+
+
 def _pan_step(m, axis_dim: int) -> int:
     """Tiles per arrow-button click: the viewport_button_step rule, or half
     the window (0 = half-screen scroll) for that axis."""
@@ -410,12 +471,18 @@ class _PanView(discord.ui.View):
         vw, vh = m._viewport_dims()
         m.pan_view(self.channel_key,
                    dx * _pan_step(m, vw), dy * _pan_step(m, vh))
-        text, _ = _board_render(m, self.channel_key)
         entry = _boards.get(self.channel_key)
         if entry is not None:
             entry["message"] = interaction.message
+        # Ack the click, then re-render the board in place (text OR image, via
+        # the unified _apply_board so panning works for both modes).
         try:
-            await interaction.response.edit_message(content=text, view=self)
+            await interaction.response.defer()
+        except Exception:
+            pass
+        try:
+            await _apply_board(interaction.message, m, self.channel_key,
+                               self._mgr)
         except Exception:
             pass
 
@@ -446,10 +513,8 @@ async def _refresh_boards_for_match(mgr: MatchManager, match_id: str) -> None:
         if m is None:
             _boards.pop(ck, None)
             continue
-        text, engaged = _board_render(m, ck)
-        view = _PanView(ck, mgr) if engaged else None
         try:
-            await entry["message"].edit(content=text, view=view)
+            await _apply_board(entry["message"], m, ck, mgr)
         except Exception:
             _boards.pop(ck, None)
 
