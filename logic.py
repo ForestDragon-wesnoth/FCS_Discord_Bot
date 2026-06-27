@@ -1716,23 +1716,27 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "background_sprite": {
-        "default": "",
+        "default": "ground_default",
         "schema": {"type": "str"},
         "desc": (
             "System-default background sprite KEY, drawn as the BOTTOM layer "
             "(beneath zones) across the whole grid. A per-match background "
-            "(`!map background <key> [mode]`) overrides this. Empty = none."
+            "(`!map background <key> [mode]`) overrides this. Empty = none. "
+            "Defaults to `ground_default` (a tiled ground texture from the "
+            "sprites folder); if that PNG is missing the renderer paints a "
+            "flat ground colour so cells stay visible."
         ),
     },
     "background_mode": {
-        "default": "stretch",
+        "default": "tile",
         "schema": {"type": "enum",
                    "choices": ["stretch", "tile", "center"]},
         "desc": (
             "How the background sprite fills the grid: 'stretch' (scale to the "
             "whole map), 'tile' (repeat), or 'center' (one copy centered). "
-            "Default for the background_sprite rule; a per-match background "
-            "carries its own mode."
+            "Default for the background_sprite rule (tile, so a small ground "
+            "texture repeats per cell); a per-match background carries its "
+            "own mode."
         ),
     },
     "fog_sprite": {

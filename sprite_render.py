@@ -19,6 +19,10 @@ except ImportError:  # Pillow is required for any graphics surface.
 SPRITES_DIR_DEFAULT = "sprites"
 ALLOWED_EXT = (".png",)
 _BG_FILL = (20, 20, 24, 255)  # canvas backdrop behind everything
+# Fallback ground colour: a flat fill painted when no background sprite is set
+# OR the configured one (default `ground_default`) can't be loaded, so cells
+# stay visible as terrain rather than a black void. A real background wins.
+_GROUND_FALLBACK = "#5b4632"  # muted brown earth
 
 
 # ----------------------------------------------------------------------------
@@ -151,8 +155,14 @@ class SceneRenderer:
             return ox <= gx <= ox + cols - 1 and oy <= gy <= oy + rows - 1
 
         bg = scene.get("background")
+        drew_bg = False
         if isinstance(bg, dict):
-            self._draw_background(canvas, bg, W, H)
+            drew_bg = self._draw_background(canvas, bg, W, H)
+        if not drew_bg:
+            # No (loadable) background sprite: paint a primitive default ground
+            # so empty cells read as terrain instead of a black void. A real
+            # `!map background <sprite>` always wins.
+            self._draw_default_ground(canvas, ox, oy, cols, rows)
 
         for p in sorted(scene.get("placements", []),
                         key=lambda d: d.get("layer", 0)):
@@ -169,10 +179,10 @@ class SceneRenderer:
         return canvas
 
     # -- layers ----------------------------------------------------------
-    def _draw_background(self, canvas, bg, W, H):
+    def _draw_background(self, canvas, bg, W, H) -> bool:
         img = self.loader.get(bg.get("sprite"))
         if img is None:
-            return
+            return False
         mode = bg.get("mode", "stretch")
         if mode == "stretch":
             canvas.alpha_composite(img.resize((W, H)))
@@ -185,6 +195,14 @@ class SceneRenderer:
             for yy in range(0, H, ih):
                 for xx in range(0, W, iw):
                     canvas.alpha_composite(img, (xx, yy))
+        return True
+
+    def _draw_default_ground(self, canvas, ox, oy, cols, rows):
+        """A flat ground fill, painted when no background sprite is set or the
+        configured one couldn't be loaded, so the map reads as terrain rather
+        than a black void. A real background sprite always wins."""
+        rgb = ImageColor.getrgb(_GROUND_FALLBACK) + (255,)
+        canvas.alpha_composite(Image.new("RGBA", canvas.size, rgb))
 
     def _draw_placement(self, canvas, p, ox, oy, cols, rows):
         cell = self.cell
