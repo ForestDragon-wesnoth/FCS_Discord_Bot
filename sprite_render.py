@@ -19,10 +19,10 @@ except ImportError:  # Pillow is required for any graphics surface.
 SPRITES_DIR_DEFAULT = "sprites"
 ALLOWED_EXT = (".png",)
 _BG_FILL = (20, 20, 24, 255)  # canvas backdrop behind everything
-# Default procedural ground (a muted checkerboard) drawn when no background
-# sprite is set, so empty cells read as terrain rather than a black void.
-_GROUND_LIGHT = "#2c3230"
-_GROUND_DARK = "#242927"
+# Fallback ground colour: a flat fill painted when no background sprite is set
+# OR the configured one (default `ground_default`) can't be loaded, so cells
+# stay visible as terrain rather than a black void. A real background wins.
+_GROUND_FALLBACK = "#5b4632"  # muted brown earth
 
 
 # ----------------------------------------------------------------------------
@@ -198,19 +198,11 @@ class SceneRenderer:
         return True
 
     def _draw_default_ground(self, canvas, ox, oy, cols, rows):
-        """A simple two-tone checkerboard so the grid of cells is visible when
-        the GM hasn't set a background sprite. Drawn in GRID coordinates so the
-        pattern stays stable as the viewport pans."""
-        cell = self.cell
-        light = ImageColor.getrgb(_GROUND_LIGHT) + (255,)
-        dark = ImageColor.getrgb(_GROUND_DARK) + (255,)
-        light_tile = Image.new("RGBA", (cell, cell), light)
-        dark_tile = Image.new("RGBA", (cell, cell), dark)
-        for r in range(rows):
-            for c in range(cols):
-                gx, gy = ox + c, oy + r
-                tile = light_tile if (gx + gy) % 2 == 0 else dark_tile
-                canvas.alpha_composite(tile, (c * cell, r * cell))
+        """A flat ground fill, painted when no background sprite is set or the
+        configured one couldn't be loaded, so the map reads as terrain rather
+        than a black void. A real background sprite always wins."""
+        rgb = ImageColor.getrgb(_GROUND_FALLBACK) + (255,)
+        canvas.alpha_composite(Image.new("RGBA", canvas.size, rgb))
 
     def _draw_placement(self, canvas, p, ox, oy, cols, rows):
         cell = self.cell

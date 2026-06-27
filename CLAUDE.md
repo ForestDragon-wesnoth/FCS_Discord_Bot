@@ -2076,6 +2076,18 @@ More shipped work (continuing the list above):
       upscale); it does NOT touch the engine's per-channel viewport. tkinter
       glue stays untestable headlessly; the render path (render_match_png) is
       pixel-verified.
+    - **GUI polish + default ground (follow-ups).** gui.py: the output log is
+      READ-ONLY (state="disabled" except while inserting) so it can't be mistaken
+      for the input; the command box is a MULTI-LINE Text (height 7) so a pasted
+      block runs line-by-line (Enter runs all non-empty lines like a Discord
+      !batch; Shift+Enter = literal newline; a Run button too). Default GROUND:
+      the `background_sprite` rule now DEFAULTS to `ground_default` (mode `tile`
+      via `background_mode`'s new default) — a tiled ground PNG from the sprites
+      folder — so the map reads as terrain by default; if that PNG is missing,
+      `SceneRenderer._draw_default_ground` paints a flat brown fill
+      (`_GROUND_FALLBACK`) so cells never show as a black void. A per-match `!map
+      background` or any loadable background sprite still wins (`_draw_background`
+      returns whether it drew, so `render()` knows to fall back).
 
 - **Audit-pass-7 fixes: load-side snapshots + ghost passives + status cap
   (scenarios 507-511).** A seventh sweep (three read-only survey agents across
