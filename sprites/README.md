@@ -21,3 +21,20 @@ PNG image assets for the graphics surface (`gui.py`).
 
 Run the surface with: `python gui.py [sprites_dir]` (needs `tkinter` + `Pillow`
 and a display; use `cli.py` on a headless box).
+
+## Sprites are SERVER-SIDE only (intended, for now)
+
+Sprite assets are managed on the **bot host's filesystem** — the operator drops
+PNGs into this folder. The bot does **not** accept sprite uploads over Discord
+(or any chat surface): there is no inbound attachment handling at all. Discord
+attachments are **outbound only** (the rendered map PNG from `!map image` /
+image auto-update boards); the `SpriteLoader` is read-only and the engine never
+writes user-supplied files to disk.
+
+This is a deliberate design choice while the bot is meant to be self-hosted
+(e.g. on a laptop): validating the safety and legitimacy of arbitrary
+user-uploaded image files on a publicly reachable bot is out of scope for now.
+Keeping art server-side means each instance curates its own `sprites/` folder,
+and there is no untrusted-file ingestion surface. An in-chat upload flow (with
+proper validation/quotas) could be added later, but it is intentionally not
+built today — do not add one without revisiting this decision.

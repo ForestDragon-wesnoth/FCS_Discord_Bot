@@ -2131,6 +2131,21 @@ More shipped work (continuing the list above):
       works for both modes). Boards follow the match's CURRENT render_mode on
       each refresh. All Discord-only (verified with stubbed discord objects, not
       the harness).
+    - **Sprites are SERVER-SIDE only — INTENDED (for now).** The bot does NOT
+      accept sprite uploads over Discord (or any chat surface): there is NO
+      inbound attachment handling anywhere (`bot.py` / `discord_commands.py`
+      never read `message.attachments`, never download, never write user files
+      to disk). Discord attachments are OUTBOUND only (the rendered map PNG from
+      `!map image` / image auto-update boards). `SpriteLoader` is READ-ONLY
+      (`Image.open` from the host's `sprites/` folder, path-traversal/PNG-only
+      guarded); the only on-disk `.save()` in the codebase is `!save` (match
+      JSON state), and render output goes to an in-memory `BytesIO`. This is a
+      deliberate choice while the bot is self-hosted (e.g. on a laptop):
+      validating the safety/legitimacy of arbitrary user-uploaded files on a
+      publicly reachable bot is OUT OF SCOPE for now — each instance curates its
+      own `sprites/` folder, so there is no untrusted-file ingestion surface. Do
+      NOT add an in-chat sprite-upload flow without revisiting this decision
+      (it would need validation/quotas/sandboxing). See `sprites/README.md`.
 
 - **Audit-pass-7 fixes: load-side snapshots + ghost passives + status cap
   (scenarios 507-511).** A seventh sweep (three read-only survey agents across
