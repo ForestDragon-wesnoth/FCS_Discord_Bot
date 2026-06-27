@@ -1758,12 +1758,15 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "show_borders": {
-        "default": False,
+        "default": True,
         "schema": {"type": "bool"},
         "desc": (
-            "Draw grid lines between tiles in the graphics surface. Color + "
-            "opacity come from border_color / border_opacity; a tile may "
-            "override its own edge via `border_color` / `border_opacity` data."
+            "Draw grid lines between tiles in the graphics surface (rendered "
+            "above the ground/background but below tiles, zones, and entities "
+            "for visual clarity). Color + opacity come from border_color / "
+            "border_opacity; a tile may override its own edge via "
+            "`border_color` / `border_opacity` data. Per-match override: "
+            "`!map border on|off`."
         ),
     },
     "border_color": {
@@ -1772,7 +1775,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "desc": (
             "Color of the grid border lines (a name or hex the surface "
             "understands, e.g. 'white' / '#FFFFFF'). Per-tile override: the "
-            "tile's `border_color` data."
+            "tile's `border_color` data. Per-match override: `!map border "
+            "color <name>`."
         ),
     },
     "border_opacity": {
@@ -1780,7 +1784,57 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "int"},
         "desc": (
             "Opacity (0-100 percent) of the grid border lines. Per-tile "
-            "override: the tile's `border_opacity` data."
+            "override: the tile's `border_opacity` data. Per-match override: "
+            "`!map border opacity <n>`."
+        ),
+    },
+    # ---- graphics: sprite Z-LAYER (draw order) per kind ----
+    # The render-scene compositor draws placements low-to-high. Background is
+    # always the floor (drawn first); these set each kind's draw layer. A
+    # higher number draws ON TOP. Per-ITEM override: an entity's `sprite_layer`
+    # var or a tile's `sprite_layer` data field (a number) wins over the rule.
+    "sprite_layer_zone": {
+        "default": 25,
+        "schema": {"type": "int"},
+        "desc": (
+            "Z-layer (draw order) for zone sprites/tints in the graphics "
+            "surface. Higher = on top. Background is the floor (always below). "
+            "Defaults: zone 25 < tile 50 < corpse 75 < entity 100 < rider 110."
+        ),
+    },
+    "sprite_layer_tile": {
+        "default": 50,
+        "schema": {"type": "int"},
+        "desc": (
+            "Z-layer (draw order) for special-tile sprites in the graphics "
+            "surface. Higher = on top. Per-tile override: the tile's "
+            "`sprite_layer` data field."
+        ),
+    },
+    "sprite_layer_corpse": {
+        "default": 75,
+        "schema": {"type": "int"},
+        "desc": (
+            "Z-layer (draw order) for corpse sprites in the graphics surface "
+            "(default below living entities so a body reads as on the ground)."
+        ),
+    },
+    "sprite_layer_entity": {
+        "default": 100,
+        "schema": {"type": "int"},
+        "desc": (
+            "Z-layer (draw order) for entity sprites in the graphics surface. "
+            "Higher = on top. Per-entity override: the entity's `sprite_layer` "
+            "var (e.g. a flier drawn over everyone)."
+        ),
+    },
+    "sprite_layer_rider": {
+        "default": 110,
+        "schema": {"type": "int"},
+        "desc": (
+            "Z-layer (draw order) for visible riders and region body-parts, "
+            "drawn over their host/parent entity. Higher = on top. Per-entity "
+            "override: the part/rider's `sprite_layer` var."
         ),
     },
     "corpse_sprite_tint": {
@@ -5029,6 +5083,14 @@ class Match:
     # {"sprite": <key>, "mode": stretch|tile|center} drawn as the bottom
     # render-scene layer. Set via `!map background <key> [mode]`. Serialized.
     background: Optional[Dict[str, Any]] = None
+
+    # ---- graphics: per-match grid-border override ----
+    # Each None = fall through to the show_borders / border_color /
+    # border_opacity rules; a non-None value overrides that rule for THIS
+    # match. Set via `!map border ...`. Serialized.
+    border_show: Optional[bool] = None
+    border_color: Optional[str] = None
+    border_opacity: Optional[int] = None
 
     # ---- match outcome / victory (100) ----
     # None until a winner is declared (manually via `!match win` or from a
@@ -12178,6 +12240,9 @@ class Match:
                               if isinstance(v, (list, tuple)) and len(v) == 2},
             "map_legend_enabled": bool(self.map_legend_enabled),
             "background": copy.deepcopy(self.background),
+            "border_show": self.border_show,
+            "border_color": self.border_color,
+            "border_opacity": self.border_opacity,
         }
         if include_history:
             d["history"] = self.history.to_dict()
@@ -12362,6 +12427,13 @@ class Match:
         m.map_legend_enabled = bool(d.get("map_legend_enabled", False))
         raw_bg = d.get("background")
         m.background = copy.deepcopy(raw_bg) if isinstance(raw_bg, dict) else None
+        bs = d.get("border_show")
+        m.border_show = bool(bs) if isinstance(bs, bool) else None
+        bcol = d.get("border_color")
+        m.border_color = bcol if isinstance(bcol, str) and bcol else None
+        bop = d.get("border_opacity")
+        m.border_opacity = int(bop) if isinstance(bop, (int, float)) \
+            and not isinstance(bop, bool) else None
         # History is optional in saved dicts. It's only present when the
         # original save was made with include_history=True. A snapshot's
         # state.dict deliberately omits history (snapshots-within-
@@ -13022,26 +13094,59 @@ class Match:
         finally:
             self._vision_memo = prev
 
+    @staticmethod
+    def _coerce_layer(raw: Any, default: int) -> int:
+        """A sprite Z-layer value: a number wins, anything else falls back to
+        `default` (so a junk override never breaks the draw order)."""
+        if isinstance(raw, bool) or raw is None:
+            return default
+        if isinstance(raw, (int, float)):
+            return int(raw)
+        if isinstance(raw, str):
+            try:
+                return int(float(raw.strip()))
+            except (ValueError, AttributeError):
+                return default
+        return default
+
+    def _layer_rule(self, key: str, default: int) -> int:
+        return self._coerce_layer(self.rules.get(key, default), default)
+
     def _emit_entity_placement(self, out: List[Dict[str, Any]], e: "Entity",
                                pov_team: Optional[str], layer: int) -> None:
         w, h = self.entity_footprint(e)
         spr = self.entity_sprite(e, pov_team)
         key, fh, fv = spr if spr is not None else (None, False, False)
         mode = self.entity_sprite_mode(e) if (w > 1 or h > 1) else "single"
+        # Per-entity override: a `sprite_layer` var wins over the pass default.
+        eff_layer = self._coerce_layer(e.vars.get("sprite_layer"), layer)
         out.append({
             "kind": "entity", "ref": e.id,
             "x": e.x, "y": e.y, "w": w, "h": h, "mode": mode,
             "sprite": key, "glyph": self.entity_glyph(e, pov_team),
             "tint": self.entity_color(e, pov_team), "opacity": 100,
-            "flip_h": fh, "flip_v": fv, "layer": layer,
+            "flip_h": fh, "flip_v": fv, "layer": eff_layer,
         })
 
     def _scene_borders(self) -> Dict[str, Any]:
         """Border (grid-line) config for the scene: the show_borders /
-        border_color / border_opacity rules, plus per-tile `border_color` /
-        `border_opacity` overrides (keyed 'x,y')."""
+        border_color / border_opacity rules, with per-MATCH overrides
+        (border_show / border_color / border_opacity fields) winning over the
+        rule, plus per-TILE `border_color` / `border_opacity` data overrides
+        (keyed 'x,y')."""
+        # Per-match override (field) > rule.
+        if self.border_show is not None:
+            show = bool(self.border_show)
+        else:
+            show = bool(self.rules.get("show_borders", True))
+        if isinstance(self.border_color, str) and self.border_color:
+            color = self.border_color
+        else:
+            color = str(self.rules.get("border_color", "white"))
+        raw_op = self.border_opacity if self.border_opacity is not None \
+            else self.rules.get("border_opacity", 100)
         try:
-            op = int(self.rules.get("border_opacity", 100))
+            op = int(raw_op)
         except (TypeError, ValueError):
             op = 100
         overrides: Dict[str, Any] = {}
@@ -13056,8 +13161,7 @@ class Match:
                 ov["opacity"] = max(0, min(100, int(bo)))
             if ov:
                 overrides[f"{tx},{ty}"] = ov
-        return {"show": bool(self.rules.get("show_borders", False)),
-                "color": str(self.rules.get("border_color", "white")),
+        return {"show": show, "color": color,
                 "opacity": max(0, min(100, op)), "overrides": overrides}
 
     def _render_scene_impl(self, pov_team: Optional[str],
@@ -13065,8 +13169,15 @@ class Match:
                            viewport: Optional[Tuple[int, int, int, int]]
                            ) -> Dict[str, Any]:
         placements: List[Dict[str, Any]] = []
+        # Z-layer defaults per kind (configurable via the sprite_layer_* rules;
+        # per-item overrides handled at each emission). Background is the floor.
+        zone_layer = self._layer_rule("sprite_layer_zone", 25)
+        tile_layer = self._layer_rule("sprite_layer_tile", 50)
+        corpse_layer = self._layer_rule("sprite_layer_corpse", 75)
+        entity_layer = self._layer_rule("sprite_layer_entity", 100)
+        rider_layer = self._layer_rule("sprite_layer_rider", 110)
 
-        # Zone layer (10): a sprite / glyph / color per covered cell.
+        # Zone layer: a sprite / glyph / color per covered cell.
         for zname, z in (self.zones.items() if "zones" not in hidden else ()):
             if not self.zone_visible_to(zname, pov_team):
                 continue
@@ -13083,7 +13194,7 @@ class Match:
                     "kind": "zone", "ref": zname, "x": zx, "y": zy,
                     "w": 1, "h": 1, "mode": "single", "sprite": spr,
                     "glyph": g, "tint": tint, "opacity": 100,
-                    "flip_h": False, "flip_v": False, "layer": 10})
+                    "flip_h": False, "flip_v": False, "layer": zone_layer})
 
         # Tile layer (20).
         for (tx, ty), data in (self.tiles.items() if "tiles" not in hidden else ()):
@@ -13094,11 +13205,15 @@ class Match:
             tint = self.tile_color(tx, ty)
             if spr is None and g is None and tint is None:
                 continue
+            # Per-tile override: a `sprite_layer` data field wins over the rule.
+            t_layer = self._coerce_layer(
+                data.get("sprite_layer") if isinstance(data, dict) else None,
+                tile_layer)
             placements.append({
                 "kind": "tile", "ref": f"{tx},{ty}", "x": tx, "y": ty,
                 "w": 1, "h": 1, "mode": "single", "sprite": spr,
                 "glyph": g, "tint": tint, "opacity": 100,
-                "flip_h": False, "flip_v": False, "layer": 20})
+                "flip_h": False, "flip_v": False, "layer": t_layer})
 
         # Corpse layer (25): the dead entity's stored sprite, tinted +
         # semi-transparent (corpse_sprite_tint / corpse_sprite_opacity).
@@ -13124,7 +13239,7 @@ class Match:
                     "kind": "corpse", "ref": cid, "x": cx, "y": cy,
                     "w": cw, "h": ch, "mode": "single", "sprite": spr,
                     "glyph": gl, "tint": c_tint, "opacity": c_op,
-                    "flip_h": False, "flip_v": False, "layer": 25})
+                    "flip_h": False, "flip_v": False, "layer": corpse_layer})
 
         if "entities" not in hidden:
             # Entity main pass (30): not glued/region/mounted.
@@ -13135,15 +13250,15 @@ class Match:
                     continue
                 if not self.entity_visible_to(e.id, pov_team):
                     continue
-                self._emit_entity_placement(placements, e, pov_team, 30)
-            # Visible riders (40).
+                self._emit_entity_placement(placements, e, pov_team, entity_layer)
+            # Visible riders, over their host.
             for e in self.entities.values():
                 if not e.is_visible_rider or not getattr(e, "is_alive", True):
                     continue
                 if not self.entity_visible_to(e.id, pov_team):
                     continue
-                self._emit_entity_placement(placements, e, pov_team, 40)
-            # Region parts with a custom sprite/glyph (40), over their parent.
+                self._emit_entity_placement(placements, e, pov_team, rider_layer)
+            # Region parts with a custom sprite/glyph, over their parent.
             if bool(self.rules.get("part_custom_glyph_priority", True)):
                 for e in self.entities.values():
                     if not e.is_region_part:
@@ -13153,9 +13268,9 @@ class Match:
                         continue
                     if not self.entity_visible_to(e.id, pov_team):
                         continue
-                    self._emit_entity_placement(placements, e, pov_team, 40)
+                    self._emit_entity_placement(placements, e, pov_team, rider_layer)
 
-        # Fog (50): cells the POV team can't see.
+        # Fog: cells the POV team can't see (always drawn last / on top).
         fog: List[Dict[str, Any]] = []
         if self.fog_enabled and pov_team is not None and "fog" not in hidden:
             fog_sprite = str(self.rules.get("fog_sprite", "")).strip() or None

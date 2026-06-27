@@ -164,6 +164,12 @@ class SceneRenderer:
             # `!map background <sprite>` always wins.
             self._draw_default_ground(canvas, ox, oy, cols, rows)
 
+        # Grid border lines: drawn ABOVE the ground/background but BELOW tiles,
+        # zones, and entities (so they aid alignment without occluding content).
+        borders = scene.get("borders") or {}
+        if borders.get("show"):
+            self._draw_borders(canvas, borders, ox, oy, cols, rows)
+
         for p in sorted(scene.get("placements", []),
                         key=lambda d: d.get("layer", 0)):
             self._draw_placement(canvas, p, ox, oy, cols, rows)
@@ -171,10 +177,6 @@ class SceneRenderer:
         for f in scene.get("fog", []):
             if in_window(f.get("x"), f.get("y")):
                 self._draw_fog(canvas, f, *px(f["x"], f["y"]))
-
-        borders = scene.get("borders") or {}
-        if borders.get("show"):
-            self._draw_borders(canvas, borders, ox, oy, cols, rows)
 
         return canvas
 

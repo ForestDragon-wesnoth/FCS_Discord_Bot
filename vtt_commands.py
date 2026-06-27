@@ -95,7 +95,7 @@ ELEVATED_ARGS: Dict[str, frozenset] = {
     # settings all elevate to host-gated. (pan/center/view are per-CHANNEL
     # camera state — harmless, so they stay player-available.)
     "map": frozenset({"full", "resize", "color", "teamcolor", "layer",
-                      "legend", "autoupdate", "background"}),
+                      "legend", "autoupdate", "background", "border"}),
     "list": frozenset({"full"}),
 }
 
@@ -3493,7 +3493,7 @@ def _color_guide() -> str:
     )
 
 
-@registry.command("map", access="all", usage="!map [full] | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 30), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map full` (host-gated) forces the omniscient view. `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets a per-match background sprite; `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
+@registry.command("map", access="all", usage="!map [full] | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 30), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map full` (host-gated) forces the omniscient view. `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets a per-match background sprite; `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). `!map border on|off` / `color <name>` / `opacity <0-100>` / `clear` (host-gated) overrides the grid-line border rules per match (borders draw above the ground, below tiles/entities). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     if args and args[0].lower() == "colors":
@@ -3515,6 +3515,50 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 "Usage: `!map background <key> [stretch|tile|center]` | `clear`.")
         m.background = {"sprite": key, "mode": mode}
         return await ctx.send(f"Background sprite `{key}` ({mode}).")
+    if args and args[0].lower() == "border":
+        # !map border [on|off] | color <name> | opacity <0-100> | clear
+        # Per-match override of the show_borders/border_color/border_opacity
+        # rules (grid lines drawn above the ground, below tiles/entities).
+        from logic import TEXT_COLORS
+        if len(args) < 2:
+            sb = m._scene_borders()
+            return await ctx.send(
+                f"Grid borders: {'on' if sb['show'] else 'off'}, "
+                f"color {sb['color']}, opacity {sb['opacity']}% "
+                f"(match override of the border_* rules). "
+                f"Set: `!map border on|off`, `color <name>`, "
+                f"`opacity <0-100>`, `clear`.")
+        op = args[1].lower()
+        if op in ("on", "off"):
+            m.border_show = (op == "on")
+            return await ctx.send(f"Grid borders {op.upper()} for **{m.name}**.")
+        if op == "clear":
+            m.border_show = None
+            m.border_color = None
+            m.border_opacity = None
+            return await ctx.send(
+                "Grid border overrides cleared (back to the border_* rules).")
+        if op == "color":
+            if len(args) < 3:
+                return await ctx.send("Usage: `!map border color <name|hex>`.")
+            col = args[2]
+            m.border_color = col
+            note = "" if col.lower() in TEXT_COLORS or col.startswith("#") \
+                else " ⚠️ not a known palette name; stored as-is (a hex like " \
+                     "`#FFFFFF` also works)."
+            return await ctx.send(f"Grid border color set to `{col}`.{note}")
+        if op == "opacity":
+            if len(args) < 3:
+                return await ctx.send("Usage: `!map border opacity <0-100>`.")
+            try:
+                val = max(0, min(100, int(args[2])))
+            except ValueError:
+                return await ctx.send("Opacity must be an integer 0-100.")
+            m.border_opacity = val
+            return await ctx.send(f"Grid border opacity set to {val}%.")
+        return await ctx.send(
+            "Usage: `!map border on|off` | `color <name>` | "
+            "`opacity <0-100>` | `clear`.")
     if args and args[0].lower() == "scene":
         # !map scene [full] — debug summary of the graphics render model
         # (respects the channel/POV unless `full`). The model itself is for
