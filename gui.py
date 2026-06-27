@@ -142,19 +142,35 @@ class GuiApp:
         self.canvas.bind("<Left>", lambda e: self.canvas.xview_scroll(-1, "units"))
         self.canvas.bind("<Right>", lambda e: self.canvas.xview_scroll(1, "units"))
 
+        # Output log: READ-ONLY (disabled except while we insert) so it can't
+        # be mistaken for / typed into as the input box.
         self.log_widget = tk.Text(self.root, height=8, bg="#0e0e12",
-                                  fg="#d0d0d0", insertbackground="#d0d0d0")
+                                  fg="#d0d0d0", insertbackground="#d0d0d0",
+                                  state="disabled")
         self.log_widget.pack(side="top", fill="x")
-        self.entry = tk.Entry(self.root)
-        self.entry.pack(side="bottom", fill="x")
+
+        # Command input: a MULTI-LINE box so a pasted block of commands runs
+        # line-by-line (like the CLI / a Discord !batch). Enter runs every
+        # non-empty line in order; Shift+Enter inserts a literal newline.
+        inbar = tk.Frame(self.root)
+        inbar.pack(side="bottom", fill="x")
+        tk.Button(inbar, text="Run", command=self._run_input).pack(side="right")
+        self.entry = tk.Text(inbar, height=3, bg="#1a1a20", fg="#e0e0e0",
+                             insertbackground="#e0e0e0", wrap="word")
+        self.entry.pack(side="left", fill="x", expand=True)
         self.entry.bind("<Return>", self._on_enter)
+        self.entry.bind("<Shift-Return>", lambda e: None)  # literal newline
+        self.entry.bind("<Control-Return>", self._on_enter)
         self.entry.focus_set()
-        self.log("FCS VTT graphics surface. Type !help. Sprites from: "
-                 f"{self.loader.folder}")
+        self.log("FCS VTT graphics surface. Type !help (one command per line; "
+                 "Enter runs all lines, Shift+Enter for a newline). Sprites "
+                 f"from: {self.loader.folder}")
 
     def log(self, message: str):
+        self.log_widget.config(state="normal")
         self.log_widget.insert("end", str(message) + "\n")
         self.log_widget.see("end")
+        self.log_widget.config(state="disabled")
 
     def _active_match(self):
         mid = self.mgr.active_by_channel.get(self.ctx.channel_key)
@@ -201,10 +217,33 @@ class GuiApp:
         self.canvas.create_image(0, 0, anchor="nw", image=self._photo)
 
     def _on_enter(self, _event=None):
-        line = self.entry.get().strip()
-        self.entry.delete(0, "end")
-        if not line:
+        # Bound to <Return>: run all lines, and suppress the default newline
+        # insertion in the Text widget (return "break"). Shift+Enter keeps the
+        # default (a literal newline) because it's bound separately.
+        self._run_input()
+        return "break"
+
+    def _run_input(self):
+        block = self.entry.get("1.0", "end")
+        self.entry.delete("1.0", "end")
+        lines = [ln.strip() for ln in block.splitlines()]
+        ran = False
+        for line in lines:
+            if not line:
+                continue
+            ran = True
+            self._run_line(line)
+        if not ran:
             return
+        # Reload sprites the GM may have dropped in, then redraw once.
+        self.loader.clear()
+        try:
+            self.redraw()
+        except Exception as e:
+            self.log(f"⚠️ render error: {e}")
+
+    def _run_line(self, line: str):
+        self.log(f"> {line}")
         if not line.startswith("!"):
             self.log("Commands must start with '!'")
             return
@@ -221,12 +260,6 @@ class GuiApp:
                 registry.run(root, args, self.ctx, self.mgr))
         except Exception as e:
             self.log(f"❌ {e}")
-        # Reload sprites the GM may have dropped in, then redraw.
-        self.loader.clear()
-        try:
-            self.redraw()
-        except Exception as e:
-            self.log(f"⚠️ render error: {e}")
 
     def run(self):
         self.root.mainloop()
