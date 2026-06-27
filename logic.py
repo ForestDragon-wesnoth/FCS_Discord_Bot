@@ -1780,12 +1780,12 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "border_opacity": {
-        "default": 100,
+        "default": 50,
         "schema": {"type": "int"},
         "desc": (
-            "Opacity (0-100 percent) of the grid border lines. Per-tile "
-            "override: the tile's `border_opacity` data. Per-match override: "
-            "`!map border opacity <n>`."
+            "Opacity (0-100 percent) of the grid border lines. Default 50 (a "
+            "subtle grid). Per-tile override: the tile's `border_opacity` "
+            "data. Per-match override: `!map border opacity <n>`."
         ),
     },
     # ---- graphics: sprite Z-LAYER (draw order) per kind ----
@@ -5091,6 +5091,13 @@ class Match:
     border_show: Optional[bool] = None
     border_color: Optional[str] = None
     border_opacity: Optional[int] = None
+
+    # ---- graphics: per-match render mode ----
+    # "text" (ASCII, the default) or "image" (graphical PNG). On a graphics-
+    # capable surface (Discord with Pillow), `image` makes a plain `!map` and
+    # the auto-update board render graphically; text-only surfaces (CLI /
+    # harness) always fall back to ASCII. Set via `!map mode`. Serialized.
+    render_mode: str = "text"
 
     # ---- match outcome / victory (100) ----
     # None until a winner is declared (manually via `!match win` or from a
@@ -12243,6 +12250,7 @@ class Match:
             "border_show": self.border_show,
             "border_color": self.border_color,
             "border_opacity": self.border_opacity,
+            "render_mode": self.render_mode,
         }
         if include_history:
             d["history"] = self.history.to_dict()
@@ -12434,6 +12442,8 @@ class Match:
         bop = d.get("border_opacity")
         m.border_opacity = int(bop) if isinstance(bop, (int, float)) \
             and not isinstance(bop, bool) else None
+        rm = d.get("render_mode")
+        m.render_mode = rm if rm in ("text", "image") else "text"
         # History is optional in saved dicts. It's only present when the
         # original save was made with include_history=True. A snapshot's
         # state.dict deliberately omits history (snapshots-within-

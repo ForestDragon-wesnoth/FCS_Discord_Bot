@@ -2114,7 +2114,23 @@ More shipped work (continuing the list above):
       the kind default) + `_layer_rule`; applied in `_emit_entity_placement`
       (entity var) and the tile loop (tile data) in `_render_scene_impl`. The
       rider/region-part pass uses `sprite_layer_rider`. ASCII rendering is
-      unaffected (z-layers are graphics-only).
+      unaffected (z-layers are graphics-only). Default `border_opacity` was
+      later lowered 100 → 50 (a subtle grid).
+    - **Render-mode toggle + graphical auto-update board (scenario 534).**
+      `Match.render_mode` (`text` default | `image`; serialized) set by `!map
+      mode text|image` (host-gated). In `image` mode, a plain `!map` posts a
+      rendered PNG instead of the ASCII block (via the same `post_scene_image`
+      ctx hook as `!map image`), and `!map autoupdate` creates a self-refreshing
+      IMAGE board; TEXT-only surfaces (CLI/harness, no hook) always fall back to
+      ASCII. Discord board internals (discord_commands.py) are now mode-aware:
+      `_board_image` (render_scene → PNG in `asyncio.to_thread`) + the unified
+      `_apply_board` (edits content for text, or `attachments=[discord.File]`
+      for image, falling back to text if Pillow is missing) drive
+      `set_autoupdate`, `_refresh_boards_for_match`, and `_PanView._pan` (pan
+      buttons now defer the interaction then re-render in place, so panning
+      works for both modes). Boards follow the match's CURRENT render_mode on
+      each refresh. All Discord-only (verified with stubbed discord objects, not
+      the harness).
 
 - **Audit-pass-7 fixes: load-side snapshots + ghost passives + status cap
   (scenarios 507-511).** A seventh sweep (three read-only survey agents across

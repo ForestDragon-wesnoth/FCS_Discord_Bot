@@ -95,7 +95,7 @@ ELEVATED_ARGS: Dict[str, frozenset] = {
     # settings all elevate to host-gated. (pan/center/view are per-CHANNEL
     # camera state — harmless, so they stay player-available.)
     "map": frozenset({"full", "resize", "color", "teamcolor", "layer",
-                      "legend", "autoupdate", "background", "border"}),
+                      "legend", "autoupdate", "background", "border", "mode"}),
     "list": frozenset({"full"}),
 }
 
@@ -3493,7 +3493,7 @@ def _color_guide() -> str:
     )
 
 
-@registry.command("map", access="all", usage="!map [full] | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 30), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map full` (host-gated) forces the omniscient view. `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets a per-match background sprite; `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). `!map border on|off` / `color <name>` / `opacity <0-100>` / `clear` (host-gated) overrides the grid-line border rules per match (borders draw above the ground, below tiles/entities). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
+@registry.command("map", access="all", usage="!map [full] | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 30), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map full` (host-gated) forces the omniscient view. `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets a per-match background sprite; `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). `!map border on|off` / `color <name>` / `opacity <0-100>` / `clear` (host-gated) overrides the grid-line border rules per match (borders draw above the ground, below tiles/entities). `!map mode text|image` (host-gated) sets the per-match default render mode — `image` makes a plain `!map` and the auto-update board render graphically on Discord (text surfaces fall back to ASCII). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     if args and args[0].lower() == "colors":
@@ -3559,6 +3559,24 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(
             "Usage: `!map border on|off` | `color <name>` | "
             "`opacity <0-100>` | `clear`.")
+    if args and args[0].lower() == "mode":
+        # !map mode [text|image] — per-match default render mode. `image` makes
+        # a plain `!map` (and the auto-update board) render graphically on a
+        # graphics-capable surface (Discord + Pillow); text-only surfaces fall
+        # back to ASCII.
+        if len(args) < 2:
+            return await ctx.send(
+                f"Render mode for **{m.name}**: `{m.render_mode}`. "
+                f"Set: `!map mode text|image` (image needs the Discord "
+                f"graphics surface; text surfaces fall back to ASCII).")
+        mode = args[1].lower()
+        if mode not in ("text", "image"):
+            return await ctx.send("Usage: `!map mode text|image`.")
+        m.render_mode = mode
+        extra = ("" if mode == "text" else
+                 " — a plain `!map` and the auto-update board now post a "
+                 "rendered image on Discord (other surfaces stay ASCII).")
+        return await ctx.send(f"Render mode set to `{mode}`{extra}")
     if args and args[0].lower() == "scene":
         # !map scene [full] — debug summary of the graphics render model
         # (respects the channel/POV unless `full`). The model itself is for
@@ -3762,6 +3780,19 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         low = a.lower()
         if low.startswith("hide="):
             extra_hidden |= {p.strip() for p in low[5:].split(",") if p.strip()}
+    # Image render mode: if this match defaults to graphics AND the surface can
+    # draw (Discord's post_scene_image hook), post the rendered scene instead
+    # of the ASCII block. Text-only surfaces (CLI / harness) fall through to
+    # ASCII. (`!map image` forces graphics regardless of mode; this is the
+    # implicit path for a plain `!map` when mode=image.)
+    if getattr(m, "render_mode", "text") == "image":
+        hook = getattr(ctx, "post_scene_image", None)
+        if hook is not None:
+            pov = _view_pov(ctx, m, args)
+            reply = await hook(m, pov)
+            if reply:
+                return await ctx.send(reply)
+            return None
     return await ctx.send(_map_render_reply(ctx, m, args, extra_hidden))
 
 @registry.command("list", access="all", usage="!list [full]", desc="List entities (turn order) from this channel's POV, plus a Dead: section of corpses when show_corpses_in_entity_list is enabled. `!list full` (host-gated) ignores visibility.")
