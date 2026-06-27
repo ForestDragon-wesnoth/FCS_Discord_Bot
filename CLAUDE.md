@@ -2104,6 +2104,17 @@ More shipped work (continuing the list above):
       <0-100> | clear` (host-gated). `_scene_borders` resolves match field >
       rule, plus the existing per-TILE `border_color`/`border_opacity` data
       overrides (keyed 'x,y').
+    - **Configurable sprite Z-layers (scenario 533).** The render-scene draw
+      order per kind is now driven by the `sprite_layer_*` rules (defaults:
+      background=floor < zone 25 < tile 50 < corpse 75 < entity 100 < rider 110;
+      fog is always drawn last/on-top). Higher = on top; ties keep insertion
+      order (stable sort), so default visuals are unchanged. Per-ITEM override:
+      an entity's `sprite_layer` VAR or a tile's `sprite_layer` DATA field (a
+      number) wins over the rule — `Match._coerce_layer` (junk → fall back to
+      the kind default) + `_layer_rule`; applied in `_emit_entity_placement`
+      (entity var) and the tile loop (tile data) in `_render_scene_impl`. The
+      rider/region-part pass uses `sprite_layer_rider`. ASCII rendering is
+      unaffected (z-layers are graphics-only).
 
 - **Audit-pass-7 fixes: load-side snapshots + ghost passives + status cap
   (scenarios 507-511).** A seventh sweep (three read-only survey agents across

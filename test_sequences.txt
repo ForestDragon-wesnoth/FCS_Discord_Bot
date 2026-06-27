@@ -13739,3 +13739,30 @@ them back on; `!map border clear` drops all three overrides back to the rules
 (borders=on, white, 100). All `!map border` subcommands are host-gated. The
 actual white-line rendering is pixel-verified headlessly (borders draw over the
 brown default ground but are covered by an entity/tile sprite on its cell).
+
+SCENARIO 533 — Sprite Z-layers: per-kind rule defaults + per-entity/tile override
+--------------------------------------------------------------------------------
+
+!match new zl ZLayers 5 5
+!match use zl
+!ent add hero Hero 30 2 2 5
+!ent set_var hero sprite hero_sprite
+!ent set_var hero sprite_layer 200
+!ent add flier Flier 20 3 3 5
+!ent set_var flier sprite bird_sprite
+!tile set 4 4 sprite floor_stone
+!tile set 4 4 sprite_layer 60
+!zone add z 1 1
+!zone sprite z mist
+!map scene
+
+Expected: the render_scene model assigns each kind a Z-layer (draw order, higher
+= on top) from the sprite_layer_* rules — defaults zone 25 < tile 50 < corpse 75
+< entity 100 < rider 110, with the background always the floor. A per-ENTITY
+`sprite_layer` var overrides the rule (hero → 200, drawn above other entities —
+the flier without an override stays at the entity default 100); a per-TILE
+`sprite_layer` data field overrides too (the stone tile at (4,4) → 60). A junk
+override falls back to the kind's rule default. The layers themselves are
+verified by a headless assertion (the `!map scene` summary only counts
+placements); ASCII rendering is unaffected (z-layers are a graphics-only
+concept).
