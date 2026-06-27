@@ -19,6 +19,10 @@ except ImportError:  # Pillow is required for any graphics surface.
 SPRITES_DIR_DEFAULT = "sprites"
 ALLOWED_EXT = (".png",)
 _BG_FILL = (20, 20, 24, 255)  # canvas backdrop behind everything
+# Default procedural ground (a muted checkerboard) drawn when no background
+# sprite is set, so empty cells read as terrain rather than a black void.
+_GROUND_LIGHT = "#2c3230"
+_GROUND_DARK = "#242927"
 
 
 # ----------------------------------------------------------------------------
@@ -151,8 +155,14 @@ class SceneRenderer:
             return ox <= gx <= ox + cols - 1 and oy <= gy <= oy + rows - 1
 
         bg = scene.get("background")
+        drew_bg = False
         if isinstance(bg, dict):
-            self._draw_background(canvas, bg, W, H)
+            drew_bg = self._draw_background(canvas, bg, W, H)
+        if not drew_bg:
+            # No (loadable) background sprite: paint a primitive default ground
+            # so empty cells read as terrain instead of a black void. A real
+            # `!map background <sprite>` always wins.
+            self._draw_default_ground(canvas, ox, oy, cols, rows)
 
         for p in sorted(scene.get("placements", []),
                         key=lambda d: d.get("layer", 0)):
@@ -169,10 +179,10 @@ class SceneRenderer:
         return canvas
 
     # -- layers ----------------------------------------------------------
-    def _draw_background(self, canvas, bg, W, H):
+    def _draw_background(self, canvas, bg, W, H) -> bool:
         img = self.loader.get(bg.get("sprite"))
         if img is None:
-            return
+            return False
         mode = bg.get("mode", "stretch")
         if mode == "stretch":
             canvas.alpha_composite(img.resize((W, H)))
@@ -185,6 +195,22 @@ class SceneRenderer:
             for yy in range(0, H, ih):
                 for xx in range(0, W, iw):
                     canvas.alpha_composite(img, (xx, yy))
+        return True
+
+    def _draw_default_ground(self, canvas, ox, oy, cols, rows):
+        """A simple two-tone checkerboard so the grid of cells is visible when
+        the GM hasn't set a background sprite. Drawn in GRID coordinates so the
+        pattern stays stable as the viewport pans."""
+        cell = self.cell
+        light = ImageColor.getrgb(_GROUND_LIGHT) + (255,)
+        dark = ImageColor.getrgb(_GROUND_DARK) + (255,)
+        light_tile = Image.new("RGBA", (cell, cell), light)
+        dark_tile = Image.new("RGBA", (cell, cell), dark)
+        for r in range(rows):
+            for c in range(cols):
+                gx, gy = ox + c, oy + r
+                tile = light_tile if (gx + gy) % 2 == 0 else dark_tile
+                canvas.alpha_composite(tile, (c * cell, r * cell))
 
     def _draw_placement(self, canvas, p, ox, oy, cols, rows):
         cell = self.cell

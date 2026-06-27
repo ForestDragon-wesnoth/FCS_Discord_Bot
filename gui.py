@@ -155,7 +155,7 @@ class GuiApp:
         inbar = tk.Frame(self.root)
         inbar.pack(side="bottom", fill="x")
         tk.Button(inbar, text="Run", command=self._run_input).pack(side="right")
-        self.entry = tk.Text(inbar, height=3, bg="#1a1a20", fg="#e0e0e0",
+        self.entry = tk.Text(inbar, height=7, bg="#1a1a20", fg="#e0e0e0",
                              insertbackground="#e0e0e0", wrap="word")
         self.entry.pack(side="left", fill="x", expand=True)
         self.entry.bind("<Return>", self._on_enter)
