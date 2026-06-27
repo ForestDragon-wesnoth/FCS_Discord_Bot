@@ -1780,12 +1780,12 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "border_opacity": {
-        "default": 100,
+        "default": 50,
         "schema": {"type": "int"},
         "desc": (
-            "Opacity (0-100 percent) of the grid border lines. Per-tile "
-            "override: the tile's `border_opacity` data. Per-match override: "
-            "`!map border opacity <n>`."
+            "Opacity (0-100 percent) of the grid border lines. Default 50 (a "
+            "subtle grid). Per-tile override: the tile's `border_opacity` "
+            "data. Per-match override: `!map border opacity <n>`."
         ),
     },
     # ---- graphics: sprite Z-LAYER (draw order) per kind ----

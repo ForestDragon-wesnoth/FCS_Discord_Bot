@@ -13736,7 +13736,8 @@ border_opacity rules (stored in Match.border_color / border_opacity, serialized,
 surviving a rule refresh); `!map border off` sets the per-match border_show
 override so the next `!map scene` reports borders=off. `!map border on` turns
 them back on; `!map border clear` drops all three overrides back to the rules
-(borders=on, white, 100). All `!map border` subcommands are host-gated. The
+(borders=on, white, opacity 50 by default). All `!map border` subcommands are
+host-gated. The
 actual white-line rendering is pixel-verified headlessly (borders draw over the
 brown default ground but are covered by an entity/tile sprite on its cell).
 
