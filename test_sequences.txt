@@ -13711,3 +13711,31 @@ a no-op and ctx_user resolves host, so it too falls through to the same
 graphics-unavailable message rather than the host-only refusal. No crash; the
 PNG bytes path itself (render_match_png → SceneRenderer → PNG) is covered by a
 headless Pillow test, not the scenario harness.
+
+SCENARIO 532 — Grid borders: default on + per-match override + scene layering
+--------------------------------------------------------------------------------
+
+!match new brd Borders 5 5
+!match use brd
+!ent add hero Hero 30 3 3 5
+!map scene
+!map border color red
+!map border opacity 50
+!map border off
+!map scene
+!map border on
+!map border clear
+!map scene
+
+Expected: grid border lines now default ON (the show_borders rule defaults to
+True), drawn ABOVE the ground/background but BELOW tiles, zones, and entities
+(in render_scene's layering the borders sit between the background and the
+placement layers). The first `!map scene` reports borders=on. `!map border
+color red` / `opacity 50` set per-match overrides of the border_color /
+border_opacity rules (stored in Match.border_color / border_opacity, serialized,
+surviving a rule refresh); `!map border off` sets the per-match border_show
+override so the next `!map scene` reports borders=off. `!map border on` turns
+them back on; `!map border clear` drops all three overrides back to the rules
+(borders=on, white, 100). All `!map border` subcommands are host-gated. The
+actual white-line rendering is pixel-verified headlessly (borders draw over the
+brown default ground but are covered by an entity/tile sprite on its cell).

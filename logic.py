@@ -1758,12 +1758,15 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "show_borders": {
-        "default": False,
+        "default": True,
         "schema": {"type": "bool"},
         "desc": (
-            "Draw grid lines between tiles in the graphics surface. Color + "
-            "opacity come from border_color / border_opacity; a tile may "
-            "override its own edge via `border_color` / `border_opacity` data."
+            "Draw grid lines between tiles in the graphics surface (rendered "
+            "above the ground/background but below tiles, zones, and entities "
+            "for visual clarity). Color + opacity come from border_color / "
+            "border_opacity; a tile may override its own edge via "
+            "`border_color` / `border_opacity` data. Per-match override: "
+            "`!map border on|off`."
         ),
     },
     "border_color": {
@@ -1772,7 +1775,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "desc": (
             "Color of the grid border lines (a name or hex the surface "
             "understands, e.g. 'white' / '#FFFFFF'). Per-tile override: the "
-            "tile's `border_color` data."
+            "tile's `border_color` data. Per-match override: `!map border "
+            "color <name>`."
         ),
     },
     "border_opacity": {
@@ -1780,7 +1784,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "int"},
         "desc": (
             "Opacity (0-100 percent) of the grid border lines. Per-tile "
-            "override: the tile's `border_opacity` data."
+            "override: the tile's `border_opacity` data. Per-match override: "
+            "`!map border opacity <n>`."
         ),
     },
     "corpse_sprite_tint": {
@@ -5029,6 +5034,14 @@ class Match:
     # {"sprite": <key>, "mode": stretch|tile|center} drawn as the bottom
     # render-scene layer. Set via `!map background <key> [mode]`. Serialized.
     background: Optional[Dict[str, Any]] = None
+
+    # ---- graphics: per-match grid-border override ----
+    # Each None = fall through to the show_borders / border_color /
+    # border_opacity rules; a non-None value overrides that rule for THIS
+    # match. Set via `!map border ...`. Serialized.
+    border_show: Optional[bool] = None
+    border_color: Optional[str] = None
+    border_opacity: Optional[int] = None
 
     # ---- match outcome / victory (100) ----
     # None until a winner is declared (manually via `!match win` or from a
@@ -12178,6 +12191,9 @@ class Match:
                               if isinstance(v, (list, tuple)) and len(v) == 2},
             "map_legend_enabled": bool(self.map_legend_enabled),
             "background": copy.deepcopy(self.background),
+            "border_show": self.border_show,
+            "border_color": self.border_color,
+            "border_opacity": self.border_opacity,
         }
         if include_history:
             d["history"] = self.history.to_dict()
@@ -12362,6 +12378,13 @@ class Match:
         m.map_legend_enabled = bool(d.get("map_legend_enabled", False))
         raw_bg = d.get("background")
         m.background = copy.deepcopy(raw_bg) if isinstance(raw_bg, dict) else None
+        bs = d.get("border_show")
+        m.border_show = bool(bs) if isinstance(bs, bool) else None
+        bcol = d.get("border_color")
+        m.border_color = bcol if isinstance(bcol, str) and bcol else None
+        bop = d.get("border_opacity")
+        m.border_opacity = int(bop) if isinstance(bop, (int, float)) \
+            and not isinstance(bop, bool) else None
         # History is optional in saved dicts. It's only present when the
         # original save was made with include_history=True. A snapshot's
         # state.dict deliberately omits history (snapshots-within-
@@ -13038,10 +13061,23 @@ class Match:
 
     def _scene_borders(self) -> Dict[str, Any]:
         """Border (grid-line) config for the scene: the show_borders /
-        border_color / border_opacity rules, plus per-tile `border_color` /
-        `border_opacity` overrides (keyed 'x,y')."""
+        border_color / border_opacity rules, with per-MATCH overrides
+        (border_show / border_color / border_opacity fields) winning over the
+        rule, plus per-TILE `border_color` / `border_opacity` data overrides
+        (keyed 'x,y')."""
+        # Per-match override (field) > rule.
+        if self.border_show is not None:
+            show = bool(self.border_show)
+        else:
+            show = bool(self.rules.get("show_borders", True))
+        if isinstance(self.border_color, str) and self.border_color:
+            color = self.border_color
+        else:
+            color = str(self.rules.get("border_color", "white"))
+        raw_op = self.border_opacity if self.border_opacity is not None \
+            else self.rules.get("border_opacity", 100)
         try:
-            op = int(self.rules.get("border_opacity", 100))
+            op = int(raw_op)
         except (TypeError, ValueError):
             op = 100
         overrides: Dict[str, Any] = {}
@@ -13056,8 +13092,7 @@ class Match:
                 ov["opacity"] = max(0, min(100, int(bo)))
             if ov:
                 overrides[f"{tx},{ty}"] = ov
-        return {"show": bool(self.rules.get("show_borders", False)),
-                "color": str(self.rules.get("border_color", "white")),
+        return {"show": show, "color": color,
                 "opacity": max(0, min(100, op)), "overrides": overrides}
 
     def _render_scene_impl(self, pov_team: Optional[str],

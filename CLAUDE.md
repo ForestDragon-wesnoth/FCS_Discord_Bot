@@ -2087,7 +2087,23 @@ More shipped work (continuing the list above):
       `SceneRenderer._draw_default_ground` paints a flat brown fill
       (`_GROUND_FALLBACK`) so cells never show as a black void. A per-match `!map
       background` or any loadable background sprite still wins (`_draw_background`
-      returns whether it drew, so `render()` knows to fall back).
+      returns whether it drew, so `render()` knows to fall back). gui.py layout:
+      pack order = clipping priority, so input + log are packed at the bottom
+      FIRST (reserved, never clipped — input first-class, log second) and the
+      canvas frame packed LAST with expand, so on resize the MAP shrinks while
+      the fields stay visible (default canvas 420px, `minsize(480,300)`).
+    - **Default grid borders + per-match override (scenario 532).** The
+      `show_borders` rule now DEFAULTS to True: white grid lines drawn ABOVE the
+      ground/background but BELOW tiles/zones/entities (in `render()` the border
+      pass moved to right after the ground draw, before placements — so a
+      tile/entity sprite on a cell covers its border; the grid shows on open
+      ground for alignment). Color/opacity from `border_color`/`border_opacity`
+      rules, overridable PER-MATCH via new `Match.border_show`/`border_color`/
+      `border_opacity` fields (each None = fall through to the rule; serialized;
+      survive rule refresh) set by `!map border on|off | color <name> | opacity
+      <0-100> | clear` (host-gated). `_scene_borders` resolves match field >
+      rule, plus the existing per-TILE `border_color`/`border_opacity` data
+      overrides (keyed 'x,y').
 
 - **Audit-pass-7 fixes: load-side snapshots + ghost passives + status cap
   (scenarios 507-511).** A seventh sweep (three read-only survey agents across
