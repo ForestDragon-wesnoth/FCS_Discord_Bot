@@ -2131,6 +2131,25 @@ More shipped work (continuing the list above):
       works for both modes). Boards follow the match's CURRENT render_mode on
       each refresh. All Discord-only (verified with stubbed discord objects, not
       the harness).
+    - **Overlay sprites: status FX + entity overlay var (scenario 535).** A
+      status (or a passive/action) can render a sprite OVERLAY drawn OVER an
+      afflicted entity — the burning-overlay case. Two sources, both collected
+      by `Match.entity_overlays(e, pov)` → `{sprite, opacity, tint, layer}`
+      records, emitted as `kind:"overlay"` placements in `_emit_entity_placement`
+      (so main entities, riders, and region parts all get them) over the
+      entity's footprint + sprite mode: (1) the entity's active STATUSES — a
+      status DEFINITION's `sprite`/`sprite_opacity`/`sprite_tint`/`sprite_layer`,
+      OVERRIDDEN by the same field on the entity's status INSTANCE (set via
+      `!status sprite <name> <key|clear> [opacity=] [tint=] [layer=]`); (2) the
+      entity's `overlay_var` (rule, default `overlays`) — a dict of records
+      (bare key string OR `{sprite, opacity, tint, layer}`), the path a PASSIVE
+      composes by writing `entity[self].overlays.<name>.sprite = ...` (passives
+      compose via vars, so no sprite field was bolted onto the Passive class).
+      Default layer = `sprite_layer_overlay` rule (150, above entities at 100);
+      per-overlay `layer`/`sprite_layer` overrides. DISGUISED entities (shown a
+      decoy to the viewing pov) emit NO overlays so real status FX don't leak.
+      Graphics-only — ASCII unaffected; no glyph fallback for overlays. Status
+      def overlay fields serialize (deepcopy); the overlay var is a normal var.
     - **Sprites are SERVER-SIDE only — INTENDED (for now).** The bot does NOT
       accept sprite uploads over Discord (or any chat surface): there is NO
       inbound attachment handling anywhere (`bot.py` / `discord_commands.py`
