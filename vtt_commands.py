@@ -7221,7 +7221,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 @registry.command(
     "status",
     usage=("!status <def|drop|tick|when|stack|maxlevel|data|tags|removes|"
-           "blockedby|resist|counter|list|info|apply|force> ..."),
+           "blockedby|resist|counter|sprite|list|info|apply|force> ..."),
     desc=(
         "Status DEFINITIONS — self-describing statuses. Define a status "
         "once (its per-tick effect, when it ticks, how it stacks, its max "
@@ -7241,8 +7241,11 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         "matching a name / `tag:<x>` / CSV (no undispellable guard); "
         "`transfer <from> <to> <name>` moves a status to another entity, "
         "re-applying through the destination's resistance/stacking (a "
-        "resistible move). Subcommands: def, drop, tick, when, stack, "
-        "maxlevel, data, list, info, apply, force, dispel, transfer."
+        "resistible move). `sprite <name> <key|clear> [opacity=<n>] [tint=<name>] "
+        "[layer=<n>]` sets a graphics OVERLAY drawn over afflicted entities "
+        "(e.g. a burning overlay; default layer 150, above entities). "
+        "Subcommands: def, drop, tick, when, stack, maxlevel, data, list, "
+        "info, apply, force, dispel, transfer, sprite."
     ),
 )
 async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -7308,6 +7311,51 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(f"❌ when must be one of: {', '.join(_TICK_WHENS)}.")
         m.status_definitions[name]["tick_when"] = when
         return await ctx.send(f"`{name}` ticks at {when}.")
+
+    if sub == "sprite":
+        # !status sprite <name> <key|clear> [opacity=<n>] [tint=<name>] [layer=<n>]
+        # The graphics overlay drawn over any entity carrying this status
+        # (e.g. a burning overlay). Definition-level; an entity's status
+        # INSTANCE can override the same fields. Graphics-only (no ASCII).
+        from logic import TEXT_COLORS
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "sprite"):
+            return
+        name = args[1]
+        if name not in m.status_definitions:
+            return await ctx.send(f"❌ No status definition `{name}`.")
+        sdef = m.status_definitions[name]
+        val = args[2]
+        if val.lower() in ("clear", "none", "-"):
+            sdef["sprite"] = ""
+            sdef["sprite_opacity"] = None
+            sdef["sprite_tint"] = ""
+            sdef["sprite_layer"] = None
+            return await ctx.send(f"Cleared overlay sprite for `{name}`.")
+        sdef["sprite"] = val
+        notes: List[str] = []
+        for a in args[3:]:
+            if "=" not in a:
+                continue
+            k, v = a.split("=", 1)
+            k = k.strip().lower()
+            if k == "opacity":
+                try:
+                    sdef["sprite_opacity"] = max(0, min(100, int(v)))
+                except ValueError:
+                    notes.append("opacity must be 0-100")
+            elif k == "tint":
+                sdef["sprite_tint"] = v
+                if v.lower() not in TEXT_COLORS and v.lower() not in ("gray", "grey"):
+                    notes.append(f"tint `{v}` is not a known palette name")
+            elif k == "layer":
+                try:
+                    sdef["sprite_layer"] = int(v)
+                except ValueError:
+                    notes.append("layer must be an integer")
+        extra = (" ⚠️ " + "; ".join(notes)) if notes else ""
+        return await ctx.send(
+            f"Set overlay sprite `{val}` for status `{name}` (drawn over "
+            f"afflicted entities on the graphics surface).{extra}")
 
     if sub == "stack":
         if await return_help_if_not_enough_args(ctx, args, 3, "status", "stack"):

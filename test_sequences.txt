@@ -13790,3 +13790,33 @@ prints the ascii map). `!map mode text` restores ASCII; `!map mode bogus` is
 rejected with a usage hint. The Discord image-board lifecycle (post + edit
 attachments in place, pan buttons re-rendering the image) is verified with
 stubbed Discord objects, not the scenario harness.
+
+SCENARIO 535 — Overlay sprites: status FX + entity overlay var (z-layer 150)
+--------------------------------------------------------------------------------
+
+!match new ov Overlays 6 6
+!match use ov
+!ent add hero Hero 30 3 3 5
+!ent set_var hero sprite hero
+!status def burning
+!status sprite burning flame opacity=70 tint=red layer=160
+!status apply hero burning
+!ent set_var hero overlays.mark.sprite target
+!ent set_var hero overlays.mark.opacity 50
+!status info burning
+!status sprite burning clear
+
+Expected: a status (or a passive/action via the entity overlay var) can render a
+sprite OVERLAY drawn on top of an afflicted entity on the graphics surface (e.g.
+a burning overlay). `!status sprite burning flame ...` stores the overlay on the
+status DEFINITION (sprite + optional opacity/tint/layer; an entity's status
+INSTANCE can override the same fields); applying `burning` to the hero then emits
+an overlay placement {sprite:flame, opacity:70, tint:red, layer:160} over the
+hero. The entity `overlays` var (overlay_var rule) adds ad-hoc overlays
+({sprite:target, opacity:50} at the default layer 150) — the path a passive uses
+(`entity[self].overlays.<name>.sprite = ...`). Overlays default to z-layer 150
+(above entities at 100, configurable via sprite_layer_overlay + per-overlay
+layer); they cover the entity's whole footprint and are suppressed on a disguised
+view (real status FX don't leak through the decoy). Graphics-only — ASCII is
+unaffected (the overlay emission is verified headlessly, not via `!map`).
+`!status sprite burning clear` removes the definition overlay.

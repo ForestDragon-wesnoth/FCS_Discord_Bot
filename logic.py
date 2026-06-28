@@ -1837,6 +1837,27 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "override: the part/rider's `sprite_layer` var."
         ),
     },
+    "sprite_layer_overlay": {
+        "default": 150,
+        "schema": {"type": "int"},
+        "desc": (
+            "Default Z-layer for OVERLAY sprites drawn over an entity (status "
+            "FX like a burning overlay, plus the entity's overlay var). 150 = "
+            "above entities (100). Per-overlay override: a status definition's "
+            "`sprite_layer` (or an overlay record's `layer`)."
+        ),
+    },
+    "overlay_var": {
+        "default": "overlays",
+        "schema": {"type": "str"},
+        "desc": (
+            "Entity var holding ad-hoc overlay sprites drawn over the entity "
+            "(in addition to status overlays). A dict of records keyed by name "
+            "— each a sprite KEY string or `{sprite, opacity, tint, layer}`. A "
+            "passive/action composes an overlay by writing this var (e.g. "
+            "`entity[self].overlays.flame.sprite = \"flame\"`)."
+        ),
+    },
     "corpse_sprite_tint": {
         "default": "gray",
         "schema": {"type": "str"},
@@ -9442,6 +9463,9 @@ class Match:
             "tick": "", "tick_when": "turn_end",
             "stack": "", "max_level": 0, "data": {},
             "tags": [], "removes": "", "blocked_by": "",
+            # Graphics overlay (drawn over an afflicted entity). Empty = none.
+            "sprite": "", "sprite_opacity": None,
+            "sprite_tint": "", "sprite_layer": None,
         }
         return self.status_definitions[name]
 
@@ -12680,6 +12704,83 @@ class Match:
             val = str(self.rules.get("sprite_mode", "single"))
         return val if val in ("single", "stretch", "tile") else "single"
 
+    # ---- overlay sprites (status FX + entity overlay var) ----
+    @staticmethod
+    def _overlay_num(v: Any) -> Optional[int]:
+        if isinstance(v, bool) or v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return int(v)
+        if isinstance(v, str):
+            try:
+                return int(float(v.strip()))
+            except (ValueError, AttributeError):
+                return None
+        return None
+
+    def _overlay_fields(self, sprite: Any, opacity: Any, tint: Any,
+                        layer: Any, default_layer: int) -> Optional[Dict[str, Any]]:
+        """Build a normalized overlay placement record from raw values, or
+        None when there's no usable sprite key."""
+        if not (isinstance(sprite, str) and sprite.strip()):
+            return None
+        op = self._overlay_num(opacity)
+        op = 100 if op is None else max(0, min(100, op))
+        t = tint if isinstance(tint, str) and tint.strip() else None
+        return {"sprite": sprite.strip(), "opacity": op, "tint": t,
+                "layer": self._coerce_layer(layer, default_layer)}
+
+    def _overlay_from_record(self, val: Any,
+                             default_layer: int) -> Optional[Dict[str, Any]]:
+        """An overlay record from the entity overlay var: a bare sprite-key
+        string, or a dict with `sprite` (+ optional opacity/tint/layer; both
+        the bare and `sprite_`-prefixed key names are accepted)."""
+        if isinstance(val, str):
+            return self._overlay_fields(val, None, None, None, default_layer)
+        if isinstance(val, dict):
+            return self._overlay_fields(
+                val.get("sprite"),
+                val.get("opacity", val.get("sprite_opacity")),
+                val.get("tint", val.get("sprite_tint")),
+                val.get("layer", val.get("sprite_layer")),
+                default_layer)
+        return None
+
+    def entity_overlays(self, e: "Entity",
+                        pov_team: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Overlay sprite records {sprite, opacity, tint, layer} drawn OVER an
+        entity: its active STATUSES (a status definition's `sprite`, overridden
+        by the same field on the entity's status instance) plus the entity's
+        overlay var (overlay_var rule). Empty if none resolve. A DISGUISED
+        entity (shown a disguise to pov_team) shows no overlays so its real
+        status FX don't leak through the decoy. Graphics-only (no ASCII)."""
+        if self._effective_disguise(e, pov_team) is not None:
+            return []
+        out: List[Dict[str, Any]] = []
+        default_layer = self._layer_rule("sprite_layer_overlay", 150)
+        statuses = e.status if isinstance(e.status, dict) else {}
+        for sname in sorted(statuses):
+            inst = statuses.get(sname)
+            inst = inst if isinstance(inst, dict) else {}
+            sdef = self.status_definitions.get(sname) or {}
+
+            def pick(key: str):
+                v = inst.get(key)
+                return v if v is not None and v != "" else sdef.get(key)
+            rec = self._overlay_fields(
+                pick("sprite"), pick("sprite_opacity"),
+                pick("sprite_tint"), pick("sprite_layer"), default_layer)
+            if rec:
+                out.append(rec)
+        ovar = str(self.rules.get("overlay_var", "overlays")) or "overlays"
+        bag = e.vars.get(ovar)
+        if isinstance(bag, dict):
+            for k in sorted(bag):
+                rec = self._overlay_from_record(bag.get(k), default_layer)
+                if rec:
+                    out.append(rec)
+        return out
+
     def tile_sprite(self, x: int, y: int) -> Optional[str]:
         """The sprite key for the tile at (x, y): instance `sprite` data >
         the template's `sprite`. None when unset."""
@@ -13137,6 +13238,17 @@ class Match:
             "tint": self.entity_color(e, pov_team), "opacity": 100,
             "flip_h": fh, "flip_v": fv, "layer": eff_layer,
         })
+        # Overlay sprites (status FX + overlay var), drawn over the entity at
+        # their own layer (default 150). Footprint + mode follow the entity so
+        # a multi-tile body's overlay covers the whole body. Graphics-only.
+        for ov in self.entity_overlays(e, pov_team):
+            out.append({
+                "kind": "overlay", "ref": e.id,
+                "x": e.x, "y": e.y, "w": w, "h": h, "mode": mode,
+                "sprite": ov["sprite"], "glyph": None,
+                "tint": ov["tint"], "opacity": ov["opacity"],
+                "flip_h": False, "flip_v": False, "layer": ov["layer"],
+            })
 
     def _scene_borders(self) -> Dict[str, Any]:
         """Border (grid-line) config for the scene: the show_borders /
