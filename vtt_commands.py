@@ -20,7 +20,7 @@ from logic import Passive, HOOK_NAMES, is_event_hook
 from logic import ClampSpec
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
-from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path
+from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail
 
 import re
 import json
@@ -4020,10 +4020,13 @@ def _find_match_entity(m: Match, e: Entity, predicates: List[Tuple[str, str, Opt
         "discoverable-action availability; `near:<eid>:<radius>` and "
         "`within:<x>:<y>:<radius>` for spatial range (footprint-aware "
         "nearest-cell, Chebyshev). Dotted var paths walk "
-        "nested dicts (`inventory.sword.damage>5`). Example: "
-        "`!find team=red hp<20 status:bleeding near:boss:3` lists "
-        "every red-team entity below 20 HP that is bleeding AND within "
-        "3 cells of `boss`."
+        "nested dicts (`inventory.sword.damage>5`). DISPLAY: `show:<csv>` "
+        "appends chosen var values to each row (`show:hp,mp`); `sort:<var>` "
+        "orders the results by a var (append `:desc` for descending, e.g. "
+        "`sort:hp:desc`) — both read dotted paths. Example: "
+        "`!find team=red hp<20 status:bleeding near:boss:3 show:hp sort:hp` "
+        "lists every red-team entity below 20 HP that is bleeding AND within "
+        "3 cells of `boss`, showing each one's hp, lowest first."
     ),
     snapshot=False,
 )
@@ -4032,19 +4035,182 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         title, body = registry.help_for(["find"])
         return await ctx.send(f"**{title}**\n{body}")
     m = active_match(mgr, ctx)
+    # Split off the DISPLAY directives (show: / sort:) so they aren't parsed
+    # as predicates. Everything else is a filter predicate.
+    show_cols: List[str] = []
+    sort_var: Optional[str] = None
+    sort_desc = False
+    pred_tokens: List[str] = []
+    for t in args:
+        low = t.lower()
+        if low.startswith("show:"):
+            show_cols.extend(c.strip() for c in t[5:].split(",") if c.strip())
+        elif low.startswith("sort:"):
+            spec = t[5:]
+            if spec.lower().endswith(":desc"):
+                sort_var, sort_desc = spec[:-5], True
+            elif spec.lower().endswith(":asc"):
+                sort_var, sort_desc = spec[:-4], False
+            else:
+                sort_var = spec
+        else:
+            pred_tokens.append(t)
     try:
-        predicates = [_parse_find_predicate(t) for t in args]
+        predicates = [_parse_find_predicate(t) for t in pred_tokens]
         hits = [e for e in m.entities_in_turn_order()
                 if _find_match_entity(m, e, predicates)]
     except VTTError as ex:
         return await ctx.send(f"❌ {ex}")
     if not hits:
         return await ctx.send("No entities match.")
+    if sort_var:
+        def _sort_key(e):
+            found, v = _resolve_dotted_var(e.vars, sort_var)
+            # Missing vars sort last: a (rank, number, string) tuple groups
+            # present values together and compares numbers vs strings cleanly
+            # within their own kind (a numeric string sorts as a number).
+            if not found:
+                return (1, 0.0, "")
+            if isinstance(v, bool):
+                return (0, float(int(v)), "")
+            if isinstance(v, (int, float)):
+                return (0, float(v), "")
+            try:
+                return (0, float(v), "")
+            except (TypeError, ValueError):
+                return (0, 0.0, str(v))
+        hits.sort(key=_sort_key, reverse=sort_desc)
     word = "match" if len(hits) == 1 else "matches"
     lines = [f"**{len(hits)} {word}:**"]
     for e in hits:
-        lines.append(f"- {_entity_line(e)}")
+        row = f"- {_entity_line(e)}"
+        if show_cols:
+            cells = []
+            for col in show_cols:
+                found, v = _resolve_dotted_var(e.vars, col)
+                cells.append(f"{col}={v if found else '—'}")
+            row += "  [" + ", ".join(cells) + "]"
+        lines.append(row)
     return await ctx.send("\n".join(lines))
+
+
+# ---- !roll --------------------------------------------------------------
+@registry.command(
+    "roll", access="all", usage="!roll <dice> [<dice> ...]", snapshot=False,
+    desc=(
+        "Roll dice and show the total plus the individual dice. Uses the same "
+        "notation as the roll() formula primitive: `NdM` (N optional), with "
+        "optional `+`/`-` modifiers, `!` to explode (a max-face die rerolls "
+        "and adds), and `kh<n>`/`kl<n>` to keep the highest/lowest n "
+        "(`2d20kh1` = advantage, `2d20kl1` = disadvantage). Examples: "
+        "`!roll 2d6+3`, `!roll d20`, `!roll 4d6kh3`, `!roll 10d6!`. Replay-"
+        "safe via the match's random_seed rule (a seeded match rolls "
+        "reproducibly). Read-only — rolling never mutates the match."
+    ),
+)
+async def roll_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["roll"])
+        return await ctx.send(f"**{title}**\n{body}")
+    # Join so `!roll 2d6 + 3` and `!roll 2d6+3` both work (roll strips spaces).
+    spec = "".join(args)
+    # Use the match RNG when a match is active (honors random_seed); otherwise
+    # the global RNG, so `!roll` works even with no active match.
+    rng = random
+    try:
+        m = active_match(mgr, ctx)
+        rng = getattr(m, "_rng", None) or random
+    except VTTError:
+        pass
+    try:
+        total, parts = roll_detail(rng, spec)
+    except FormulaError as ex:
+        return await ctx.send(f"❌ {ex}")
+    breakdown = ", ".join(parts)
+    # Hide the breakdown when it's just the same single number (e.g. a flat).
+    tail = f"   ({breakdown})" if breakdown and breakdown != str(total) else ""
+    return await ctx.send(f"🎲 `{spec}` → **{total}**{tail}")
+
+
+# ---- !dist --------------------------------------------------------------
+_DIST_METRICS = {"square_radius": "square_radius", "chebyshev": "square_radius",
+                 "manhattan": "manhattan", "euclidean": "euclidean"}
+
+
+@registry.command(
+    "dist", access="all",
+    usage="!dist <a> <b> [metric] [los] | !dist <eid> <x> <y> ... | !dist <x1> <y1> <x2> <y2> ...",
+    snapshot=False,
+    desc=(
+        "Measure distance between two entities, an entity and a cell, or two "
+        "cells (footprint-aware nearest-cell gap). Forms: `!dist <a> <b>` "
+        "(two entity ids), `!dist <eid> <x> <y>` (entity to a cell), `!dist "
+        "<x1> <y1> <x2> <y2>` (two cells). Optional trailing `metric` "
+        "(square_radius/chebyshev [default], manhattan, euclidean) and `los` "
+        "(also report whether line of sight is clear between them, anchor to "
+        "anchor). Read-only."
+    ),
+)
+async def dist_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["dist"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    # Peel optional trailing keywords (metric + los) in any order.
+    mode = "square_radius"
+    want_los = False
+    toks = list(args)
+    while toks:
+        low = toks[-1].lower()
+        if low == "los":
+            want_los = True
+            toks.pop()
+        elif low in _DIST_METRICS:
+            mode = _DIST_METRICS[low]
+            toks.pop()
+        else:
+            break
+    # Resolve the two endpoints from the leading tokens.
+    def _ent(tok):
+        eid = _resolve_eid(m, tok)
+        e = m.entities.get(eid)
+        if e is None:
+            raise NotFound(f"Entity '{tok}' not found.")
+        return e
+
+    try:
+        if len(toks) == 2:           # entity, entity
+            a, b = _ent(toks[0]), _ent(toks[1])
+            d = m.entity_gap_distance(a, b, mode)
+            ax, ay, bx, by = a.x, a.y, b.x, b.y
+            label = f"`{a.id}` → `{b.id}`"
+        elif len(toks) == 3:         # entity, x, y
+            a = _ent(toks[0])
+            cx, cy = int(toks[1]), int(toks[2])
+            d = m.cell_entity_distance(cx, cy, a, mode)
+            ax, ay, bx, by = a.x, a.y, cx, cy
+            label = f"`{a.id}` → ({cx},{cy})"
+        elif len(toks) == 4:         # x1, y1, x2, y2
+            x1, y1, x2, y2 = (int(t) for t in toks)
+            d = m._rect_gap(x1, y1, 1, 1, x2, y2, 1, 1, mode)
+            ax, ay, bx, by = x1, y1, x2, y2
+            label = f"({x1},{y1}) → ({x2},{y2})"
+        else:
+            return await ctx.send(
+                "Usage: `!dist <a> <b>` | `!dist <eid> <x> <y>` | "
+                "`!dist <x1> <y1> <x2> <y2>` [metric] [los].")
+    except NotFound as ex:
+        return await ctx.send(f"❌ {ex}")
+    except ValueError:
+        return await ctx.send("❌ coordinates must be integers.")
+    dstr = f"{d:g}"
+    out = f"📏 {label}: **{dstr}** ({mode})"
+    if want_los:
+        viewer = toks[0] if len(toks) in (2, 3) else None
+        viewer_id = _resolve_eid(m, viewer) if viewer else None
+        clear = m.has_los(viewer_id, ax, ay, bx, by)
+        out += f" — LOS {'clear ✅' if clear else 'blocked ⛔'}"
+    return await ctx.send(out)
 
 
 # ---- !foreach -----------------------------------------------------------
