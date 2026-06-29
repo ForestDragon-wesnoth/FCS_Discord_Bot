@@ -2423,6 +2423,21 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "dedicated command."
         ),
     },
+    "inline_args_access": {
+        "default": "all",
+        "schema": {"type": "enum", "choices": ["all", "host"]},
+        "desc": (
+            "Who may use inline `$(...)` formula arguments in commands. `all` "
+            "(default) = anyone, as designed. `host` = only hosts; a non-host's "
+            "command containing a `$()` token is REFUSED. Inline `$()` evaluates "
+            "read-only formulas with NO POV/fog filtering (it reads raw entity "
+            "vars, e.g. `$(entity[boss].hp)`), so in a FOG-OF-WAR / hidden-"
+            "information match set this to `host` to stop players probing hidden "
+            "data through `$()` — the same reason you'd tighten `ent dump` / "
+            "`find` via command_access. No-op on an open match (no owner), a "
+            "single-operator / auto-approve surface, or for hosts."
+        ),
+    },
     # "movement_block_through": {
     #     "default": False,
     #     "schema": {"type": "bool"},

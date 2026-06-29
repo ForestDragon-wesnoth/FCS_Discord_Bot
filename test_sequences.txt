@@ -14173,3 +14173,26 @@ closing `!ent dump h` shows hp 20, max_hp 20, initiative 5 intact. (The
 vital-var property setters that legitimately unset max_hp/initiative pass
 allow_protected=True, and `!ent delete_var hp` already blocked at the command
 layer — the chokepoint now makes the protection uniform.)
+
+SCENARIO 550 — inline_args_access: host-only $() lockdown for fog-of-war
+--------------------------------------------------------------------------------
+
+!match new ila InlineAccess 8 8
+!match use ila
+!ent add boss Boss 137 7 7 5
+!system set default inline_args_access host
+!as player pleb
+!dist $(entity[boss].hp) 1 1 1
+!dist boss 1 1
+!as host
+!dist $(entity[boss].hp) 1 1 1
+
+Expected: inline `$()` args evaluate read-only formulas with NO POV/fog
+filtering (they read raw entity vars), so a non-host could otherwise probe
+hidden data (`$(entity[boss].hp)`). The `inline_args_access` rule (default
+`all`) set to `host` closes that: as `!as player pleb` (a non-host), a command
+containing a `$()` token is REFUSED ("inline `$()` arguments are host-only on
+this match"), while a plain `!dist boss 1 1` (no $()) still works. Back as a
+host (`!as host`), `$()` works normally. No-op on an open match (no owner) or a
+single-operator/auto-approve surface. The match owner is the creating "cli"
+identity; `!system set default ...` refreshes the live match.
