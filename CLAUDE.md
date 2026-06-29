@@ -2226,13 +2226,15 @@ More shipped work (continuing the list above):
       `formula.validate_arg_safe` rejects any call to a STATE-CHANGING function.
       The classification is EXPLICIT: `ARG_MUTATING_MATCH_FUNCS` (the banned set
       — kill/summon/var_set/status_apply/damage_part/emit/move_*/tile_set/
-      zone_*/mount/team_set/log/…) vs `ARG_SAFE_MATCH_FUNCS` (the rest of
-      `_MATCH_FUNC_NAMES`); `ARG_SAFE_FUNC_NAMES` = pure `_ALLOWED_FUNCS` + the
-      safe match funcs. User-defined `!func`s are NOT allowed in args
-      (unverifiable). A module-load **drift guard** asserts every
-      `_MATCH_FUNC_NAMES` name is classified, so adding a new match function
-      without deciding read-only-vs-mutating BREAKS THE BUILD — never a silent
-      default-allow. `FormulaError` (a `VTTError` subclass) surfaces as ❌, not 💥.
+      zone_*/mount/team_set/log/…) vs `ARG_SAFE_MATCH_FUNCS` (an EXPLICIT
+      read-only allowlist — NOT derived as all-minus-mutating, so default-DENY);
+      `ARG_SAFE_FUNC_NAMES` = pure `_ALLOWED_FUNCS` + the safe match funcs.
+      User-defined `!func`s are NOT allowed in args (unverifiable). A module-load
+      **drift guard** asserts the two sets are DISJOINT and together cover EVERY
+      `_MATCH_FUNC_NAMES` name, so adding a new match function without placing it
+      in one set BREAKS THE BUILD — never a silent default-allow (when unsure,
+      classify MUTATING). `FormulaError` (a `VTTError` subclass) surfaces as ❌,
+      not 💥.
   - **`!reveal_fog <team> ...`** — reveal fogged cells to a team independent of
     unit vision (scout/clairvoyance/GM reveal); a revealed cell shows terrain
     AND live entities. Forms `all` / `at <x> <y> <r>` (Chebyshev disc) / `rect`
@@ -2246,6 +2248,41 @@ More shipped work (continuing the list above):
     primitive. The picker (`formula.roll_table_pick`) was factored out of inline
     `roll_table` so both share it. `!table roll` is player-available (read-only
     RNG); def/remove host-gated. Replay-safe via the match RNG.
+
+- **Container / inventory convenience primitives (scenarios 547-548).** The
+  engine still has NO inventory concept; these are GENERIC var/container ops
+  that make composing one (and counters, resources, loot) pleasant. Found by a
+  hands-on "how hard is an inventory" pass — the friction was real (stacking-add
+  needed a var_has conditional, transfer was read+write+del by hand, totalling a
+  nested field needed a loop). New formula prims (formula.py namespace):
+  - `var_add(eid, path, delta)` — create-or-increment a numeric var (the entity
+    twin of team_add; the clean 'stack +N' / counter). MUTATING.
+  - `var_move(src_eid, src_path, dest_eid, dest_path)` — MOVE a var/subtree
+    between entities (deep-copied), returns True iff the source existed. The
+    loot/give/drop primitive. MUTATING.
+  - `var_sum_field(eid, path, field)` — sum a nested FIELD across a container's
+    children (total weight/value), the companion to var_sum (direct children
+    only). READ-ONLY (allowed in `$()` args).
+  - `item_add(eid, path, amount=1, field=None)` / `item_consume(eid, path,
+    amount=1, field=None)` — the AMOUNT-aware pair: add to / subtract from the
+    container's amount FIELD (default the new `amount_field` rule = "amount",
+    overridable per call). item_consume DELETES THE WHOLE CONTAINER at `path`
+    when the amount hits <= 0 (the consumable 'use one, drop the empty stack'
+    boilerplate). Both MUTATING.
+  - New rule `amount_field` ("amount") — the default stack-amount key name.
+  - Per the process rule below, all four mutating prims are in
+    `ARG_MUTATING_MATCH_FUNCS` (banned in `$()` args) and `var_sum_field` is in
+    `ARG_SAFE_MATCH_FUNCS`; the same pass converted `ARG_SAFE_MATCH_FUNCS` to an
+    EXPLICIT allowlist so the drift guard truly forces classification.
+  - Inventory authoring NOTES surfaced by the pass (worth remembering): an
+    item's action has `source` rooted at the ITEM's container (`source.heal` =
+    the item's heal), while `entity[self]` is the HOLDER — reach the holder via
+    `entity[self].hp`, NOT `source.hp` / `entity[source]` / `entity[target]`.
+    `var_get(source, ...)` fails (source is a proxy; use `self_id()`). DICT keys
+    are unique, so two identical items can't share a top-level key — stack via
+    an amount field, or use distinct keys (sword_1/sword_2); `!ent set_var hero
+    inventory.potion 99` silently REPLACES the whole item dict (a footgun). A
+    consumable's action vanishes with the item when item_consume removes it.
 
 - **PROCESS RULE — args / formula functions (the user's standing directive).**
   Inline `$()` args evaluate formula functions, so the read-vs-write

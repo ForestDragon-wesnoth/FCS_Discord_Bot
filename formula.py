@@ -1511,6 +1511,12 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   var_del(eid, "path")          -> bool (True iff existed; routes
     #                                    through remove_var)
     "var_keys", "var_has", "var_get", "var_set", "var_del",
+    # Generic container convenience: var_add (create-or-increment a numeric
+    # var), var_move (move a var/subtree between entities — loot/give),
+    # var_sum_field (sum a nested field across a container's children). Plus
+    # the amount-aware pair item_add / item_consume (stack +N / consume-and-
+    # drop-at-0), with the amount field defaulting to the amount_field rule.
+    "var_add", "var_move", "var_sum_field", "item_add", "item_consume",
     # Match-level var accessors: runtime-path twins of the reserved
     # `match.<path>` formula root (which itself mirrors entity[X].path).
     # All read/write the single match-wide vars dict — global GM state
@@ -1770,6 +1776,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "status_counter_add", "status_counter_set",
     "declare_winner",
     "var_set", "var_del", "var_clear",
+    "var_add", "var_move", "item_add", "item_consume",
     "match_var_set", "match_var_del",
     "emit",
     "use_action",
@@ -1784,11 +1791,59 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "damage_part", "damage_spread",
     "team_set", "team_add",
 })
-ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset(
-    set(_MATCH_FUNC_NAMES) - ARG_MUTATING_MATCH_FUNCS)
-# Drift guard: a mutating name must actually be a real match function, and
-# every match function must be classified (the subtraction above can't catch a
-# mutating name that was typo'd or removed from _MATCH_FUNC_NAMES).
+# The read-only match functions, EXPLICITLY listed (NOT derived as
+# all-minus-mutating) so that a NEW match function defaults to UNCLASSIFIED and
+# the drift guard below fails the build until it is deliberately placed in this
+# set or in ARG_MUTATING_MATCH_FUNCS. Default-DENY: forgetting to classify can
+# never silently expose a function in $() args. When unsure, classify a
+# function as MUTATING (leave it out of this set).
+ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
+    'all_corpses', 'all_entities', 'aoe_origin', 'apply_mods',
+    'atb_rate', 'atb_threshold', 'can_mount', 'can_see',
+    'can_see_losonly', 'can_see_rangeonly', 'cell_entity',
+    'cell_in_zone', 'chain_targets', 'clip_cells', 'corpse_at',
+    'corpse_has', 'corpse_status_get', 'corpse_status_has',
+    'corpse_status_names', 'corpse_var', 'current_id',
+    'directional_get', 'entities_in_area', 'entities_in_cone',
+    'entities_in_line_ignorelos', 'entities_in_line_until',
+    'entities_in_rect', 'entities_in_zone', 'entities_on_los',
+    'entities_with_status', 'entities_with_var', 'entities_within',
+    'entity_actions', 'entity_center', 'entity_groups',
+    'entity_snapshot', 'entity_zones', 'event_get', 'event_has',
+    'facing_of', 'first_opaque', 'footprint_cells', 'footprint_height',
+    'footprint_width', 'group_has', 'group_members', 'group_size',
+    'has_action', 'has_corpse', 'has_los', 'has_part', 'hit_location',
+    'in_zone', 'is_attackable', 'is_hostile', 'is_indestructible',
+    'is_mounted', 'is_part_of_team', 'is_same_team', 'is_status_immune',
+    'is_vehicle', 'list_mods', 'match_over', 'match_var_get',
+    'match_var_has', 'match_var_keys', 'match_winner', 'mount_of',
+    'nearest_entity', 'occupies', 'part', 'part_of', 'parts', 'raycast',
+    'relative_side', 'riders', 'roll_table', 'round_number', 'rule_get',
+    'self_id', 'shield_total', 'side_hit', 'slot_capacity', 'slot_free',
+    'slot_of', 'slot_riders', 'status_get', 'status_has',
+    'status_has_path', 'status_has_tag', 'status_names',
+    'status_resist_of', 'status_tags', 'statuses_with_tag',
+    'table_roll', 'team_get', 'team_has', 'team_sees_cell',
+    'team_sees_cell_losonly', 'team_sees_cell_rangeonly',
+    'team_sees_entity', 'team_sees_entity_losonly',
+    'team_sees_entity_rangeonly', 'tile_get', 'tile_has', 'tile_keys',
+    'turn_index', 'var_count', 'var_get', 'var_has', 'var_has_key',
+    'var_keys', 'var_max_key', 'var_min_key', 'var_pick_random',
+    'var_sum', 'var_sum_field', 'zone_anchor_of', 'zone_cells',
+    'zone_exists', 'zone_get', 'zone_has', 'zone_keys', 'zone_names',
+    'zone_size', 'zones_at',
+})
+# Drift guard (forced classification): the safe and mutating sets must be
+# DISJOINT and together cover EVERY _MATCH_FUNC_NAMES name. Adding a new match
+# function without classifying it as read-only (ARG_SAFE) or state-changing
+# (ARG_MUTATING) breaks the build here — never a silent default-allow.
+assert ARG_SAFE_MATCH_FUNCS.isdisjoint(ARG_MUTATING_MATCH_FUNCS), (
+    "a function is in BOTH ARG_SAFE and ARG_MUTATING: "
+    f"{sorted(ARG_SAFE_MATCH_FUNCS & ARG_MUTATING_MATCH_FUNCS)}")
+_arg_unclassified = set(_MATCH_FUNC_NAMES) - ARG_SAFE_MATCH_FUNCS - ARG_MUTATING_MATCH_FUNCS
+assert not _arg_unclassified, (
+    "match function(s) not classified read-only-vs-mutating for $() args — add "
+    f"each to ARG_SAFE_MATCH_FUNCS or ARG_MUTATING_MATCH_FUNCS: {sorted(_arg_unclassified)}")
 _arg_unknown_mutating = ARG_MUTATING_MATCH_FUNCS - set(_MATCH_FUNC_NAMES)
 assert not _arg_unknown_mutating, (
     "ARG_MUTATING_MATCH_FUNCS names not in _MATCH_FUNC_NAMES: "
@@ -4092,11 +4147,146 @@ class FormulaEngine:
             engine._note_affected(eid)
             return True
 
+        def _var_add(eid_t: Any, path: Any, delta: Any) -> Any:
+            """var_add(eid, path, delta): create-or-increment a NUMERIC var at
+            a dotted path — sets it to `delta` if absent, else adds `delta` to
+            the current value. Routes through write_var (var hooks fire).
+            Returns the new value. The entity twin of team_add; the clean
+            'stack +N' / counter primitive (no var_has boilerplate)."""
+            if not isinstance(path, str) or not path:
+                raise FormulaError("var_add(eid, path, delta): path must be a non-empty string.")
+            if isinstance(delta, bool) or not isinstance(delta, (int, float)):
+                raise FormulaError("var_add(eid, path, delta): delta must be a number.")
+            eid, e = _resolve_entity(eid_t, "var_add")
+            if path in self._POSITIONAL_PATHS:
+                raise FormulaError(
+                    f"var_add({eid!r}, '{path}', ...): `{path}` is read-only from formulas.")
+            cur: Any = 0
+            if _var_has(eid_t, path):
+                cur = _walk_vars(e, path, must_exist=True)
+                if isinstance(cur, bool) or not isinstance(cur, (int, float)):
+                    raise FormulaError(
+                        f"var_add: existing value at '{path}' is not a number.")
+            new = cur + delta
+            e.write_var(path, new)
+            engine._note_affected(eid)
+            return new
+
+        def _var_move(src_t: Any, src_path: Any,
+                      dest_t: Any, dest_path: Any) -> bool:
+            """var_move(src_eid, src_path, dest_eid, dest_path): MOVE a var (or
+            a whole var subtree) from one entity/path to another — reads
+            src_path, writes a DEEP COPY to dest_path on the destination, then
+            deletes src_path. Returns True iff the source existed (and was
+            moved); False if absent (no-op). The loot / give / drop primitive."""
+            if not (isinstance(src_path, str) and src_path):
+                raise FormulaError("var_move: src_path must be a non-empty string.")
+            if not (isinstance(dest_path, str) and dest_path):
+                raise FormulaError("var_move: dest_path must be a non-empty string.")
+            if src_path in self._POSITIONAL_PATHS or dest_path in self._POSITIONAL_PATHS:
+                raise FormulaError("var_move: x/y are read-only.")
+            seid, se = _resolve_entity(src_t, "var_move")
+            deid, de = _resolve_entity(dest_t, "var_move")
+            if not _var_has(src_t, src_path):
+                return False
+            val = copy.deepcopy(_walk_vars(se, src_path, must_exist=True))
+            de.write_var(dest_path, val)
+            try:
+                se.remove_var(src_path)
+            except VTTError as ex:
+                raise FormulaError(str(ex))
+            engine._note_affected(seid)
+            engine._note_affected(deid)
+            return True
+
+        def _var_sum_field(eid_t: Any, path: Any, field: Any) -> Any:
+            """var_sum_field(eid, path, field): sum a named sub-FIELD across the
+            immediate children of a container var — e.g.
+            var_sum_field(hero, "inventory", "weight") totals each item's
+            .weight. Non-dict children, or children lacking a numeric `field`,
+            are skipped. Read-only (the companion to var_sum, which only sums a
+            path's direct numeric children — not a nested field)."""
+            if not isinstance(path, str):
+                raise FormulaError("var_sum_field(eid, path, field): path must be a string.")
+            if not (isinstance(field, str) and field):
+                raise FormulaError("var_sum_field(eid, path, field): field must be a non-empty string.")
+            _, e = _resolve_entity(eid_t, "var_sum_field")
+            cur: Any = e.vars
+            if path:
+                for seg in path.split("."):
+                    if not isinstance(cur, dict) or seg not in cur:
+                        return 0
+                    cur = cur[seg]
+            if not isinstance(cur, dict):
+                return 0
+            total: Any = 0
+            for child in cur.values():
+                if not isinstance(child, dict):
+                    continue
+                v = child.get(field)
+                if isinstance(v, bool):
+                    continue
+                if isinstance(v, (int, float)):
+                    total = total + v
+            return total
+
+        def _amount_field() -> str:
+            f = match.rules.get("amount_field", "amount")
+            return f if isinstance(f, str) and f else "amount"
+
+        def _item_add(eid_t: Any, path: Any, amount: Any = 1,
+                      field: Any = None) -> Any:
+            """item_add(eid, path, amount=1, field=None): add `amount` to the
+            container's amount FIELD (`field`, default the amount_field rule =
+            'amount'), creating it if absent. The stacking 'pick up N' helper
+            over var_add. Returns the new amount."""
+            if not isinstance(path, str) or not path:
+                raise FormulaError("item_add(eid, path, amount, field): path must be a non-empty string.")
+            fld = field if (isinstance(field, str) and field) else _amount_field()
+            return _var_add(eid_t, path + "." + fld, amount)
+
+        def _item_consume(eid_t: Any, path: Any, amount: Any = 1,
+                          field: Any = None) -> Any:
+            """item_consume(eid, path, amount=1, field=None): subtract `amount`
+            from the container's amount FIELD (`field`, default the amount_field
+            rule = 'amount'); if the result is <= 0, DELETE THE WHOLE CONTAINER
+            at `path` (the item). Returns the remaining amount (0 when removed).
+            The consumable 'use one, drop the stack when empty' boilerplate."""
+            if not isinstance(path, str) or not path:
+                raise FormulaError("item_consume(eid, path, amount, field): path must be a non-empty string.")
+            if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+                raise FormulaError("item_consume: amount must be a number.")
+            fld = field if (isinstance(field, str) and field) else _amount_field()
+            eid, e = _resolve_entity(eid_t, "item_consume")
+            full = path + "." + fld
+            cur: Any = 0
+            if _var_has(eid_t, full):
+                cur = _walk_vars(e, full, must_exist=True)
+                if isinstance(cur, bool) or not isinstance(cur, (int, float)):
+                    raise FormulaError(f"item_consume: '{full}' is not a number.")
+            remaining = cur - amount
+            if remaining <= 0:
+                if _var_has(eid_t, path):
+                    try:
+                        e.remove_var(path)
+                    except VTTError as ex:
+                        raise FormulaError(str(ex))
+                engine._note_affected(eid)
+                return 0
+            e.write_var(full, remaining)
+            engine._note_affected(eid)
+            return remaining
+
         ns["var_keys"] = _var_keys
         ns["var_has"]  = _var_has
         ns["var_get"]  = _var_get
         ns["var_set"]  = _var_set
         ns["var_del"]  = _var_del
+        ns["var_add"]  = _var_add
+        ns["var_move"] = _var_move
+        ns["var_sum_field"] = _var_sum_field
+        ns["item_add"] = _item_add
+        ns["item_consume"] = _item_consume
 
         # Match-level var accessors: the runtime-path twins of the
         # `match.<path>` static root (mirroring how var_* twins the

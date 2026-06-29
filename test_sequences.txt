@@ -14085,3 +14085,64 @@ it as false; goblin stays alive). `repeat 99999` is clamped to macro_repeat_limi
 structurally broken macro (`broken`: `if` without `end`) is rejected at `set`
 time with ❌, never stored. macro_step_limit is the hard backstop on total
 dispatched lines.
+
+SCENARIO 547 — Container/inventory primitives: var_add, item_add/consume, var_move, var_sum_field
+--------------------------------------------------------------------------------
+
+!match new inv Inventory 6 6
+!match use inv
+!ent add hero Hero 20 2 2 5
+!ent add mob Mob 20 4 4 5
+!eval "var_add('hero','inventory.potion.amount',3)"
+!eval "var_add('hero','inventory.potion.amount',2)"
+!eval "item_add('hero','inventory.bomb',2)"
+!eval "item_consume('hero','inventory.potion')"
+!eval "item_consume('hero','inventory.potion',5)"
+!ent set_var hero inventory.arrow.count 2
+!eval "item_consume('hero','inventory.arrow',2,'count')"
+!ent set_var hero inventory.key.kind brass
+!eval "var_move('hero','inventory.key','mob','inventory.key')"
+!ent set_var hero inventory.sword.weight 8
+!ent set_var hero inventory.bomb.weight 2
+!eval "var_sum_field('hero','inventory','weight')"
+!ent dump hero
+
+Expected: the generic container primitives make an inventory pleasant to
+compose. `var_add(eid, path, delta)` create-or-increments a numeric var
+(potion.amount 0→3→5). `item_add(eid, path, amount=1, field=None)` adds to the
+amount field (default the amount_field rule = "amount") — bomb.amount → 2.
+`item_consume(eid, path, amount=1, field=None)` subtracts and DELETES THE WHOLE
+CONTAINER at `path` when the amount reaches <= 0: consuming 1 potion → amount 4,
+then consuming 5 drops it past 0 so `inventory.potion` is removed entirely. A
+custom `field` works (arrow uses `count`; consuming 2 of 2 removes the arrow).
+`var_move(src,src_path,dest,dest_path)` moves a var subtree between entities
+(the key moves hero→mob — loot/give). `var_sum_field(eid, path, field)` totals a
+nested field across a container's children (sword.weight 8 + bomb.weight 2 = 10).
+The engine still has NO inventory concept — these are generic var ops. (Formulas
+are double-quoted with single-quoted string args so shlex preserves them.)
+
+SCENARIO 548 — $() arg safety for the new container primitives
+--------------------------------------------------------------------------------
+
+!match new ias InvArgSec 6 6
+!match use ias
+!ent add hero Hero 20 2 2 5
+!ent set_var hero inventory.sword.weight 8
+!ent set_var hero inventory.bomb.weight 2
+!dist "$(var_sum_field('hero','inventory','weight'))" 1 5 5
+!dist $(var_add(hero,hp,100)) 1 2 3
+!dist $(var_move(hero,inventory.sword,hero,loot)) 1 2 3
+!dist $(item_add(hero,inventory.bomb)) 1 2 3
+!dist $(item_consume(hero,inventory.bomb)) 1 2 3
+!ent dump hero
+
+Expected: per the standing arg/formula process rule, the new READ-ONLY primitive
+`var_sum_field` is allowed inside a `$()` argument — `$(var_sum_field('hero',
+'inventory','weight'))` → 10, so `!dist 10 1 5 5` runs (the token is double-
+quoted with single-quoted args so shlex keeps it intact). The new MUTATING
+primitives `var_add` / `var_move` / `item_add` / `item_consume` are STRICTLY
+rejected ("function 'X' changes game state and is banned in a $() inline
+argument") and do NOT run — the closing `!ent dump hero` shows hp still 20 and
+the inventory (sword/bomb) unchanged. The module-load drift guard forces every
+new match function to be classified read-only-vs-mutating, so none can slip into
+args by default.
