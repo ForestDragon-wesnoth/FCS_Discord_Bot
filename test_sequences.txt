@@ -13979,14 +13979,20 @@ SCENARIO 542 — Inline $() args SECURITY: state-changing functions are banned
 !dist $(emit(boom)) 1 2 3
 !dist $(damage_part(goblin,5)) 1 2 3
 !dist $(badfunc(3)) 1 2 3
+!dist $(min(5,kill(goblin))) 1 2 3
+!dist $(abs(var_set(goblin,hp,1))) 1 2 3
+!dist $(entity[goblin].hp+emit(boom)) 1 2 3
 !ent set_var ally note $(entity[goblin].hp=0)
 !ent info goblin
 
 Expected: the STRICT read-only gate (formula.validate_arg_safe) rejects every
 state-CHANGING function inside a `$()` argument — kill, summon, var_set, emit,
 damage_part, etc. each return a clean ❌ ("function 'X' changes game state and is
-banned in a $() inline argument") and the command does NOT run. An unknown /
-user-defined function (`badfunc`) is likewise rejected. An ASSIGNMENT inside
+banned in a $() inline argument") and the command does NOT run. The gate walks
+the WHOLE expression tree, so a mutating call nested ANYWHERE is caught too —
+`min(5,kill(goblin))`, `abs(var_set(goblin,hp,1))`, and
+`entity[goblin].hp+emit(boom)` are all rejected, not just top-level calls. An
+unknown / user-defined function (`badfunc`) is likewise rejected. An ASSIGNMENT inside
 `$()` (`entity[goblin].hp = 0`) is rejected as "must be a read-only expression
 (no assignments / statements)" — $() is parsed in EXPRESSION mode so writes are
 impossible. CRUCIALLY no mutation occurs: goblin stays at 30/30 HP and present
