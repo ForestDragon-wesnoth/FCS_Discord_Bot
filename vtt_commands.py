@@ -20,7 +20,7 @@ from logic import Passive, HOOK_NAMES, is_event_hook
 from logic import ClampSpec
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
-from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail
+from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick
 
 import re
 import json
@@ -70,6 +70,10 @@ Handler = Callable[[ReplyContext, List[str], MatchManager], Any]
 # can re-tighten any of them for fog-of-war matches.
 READ_ONLY_SUBCOMMANDS: frozenset = frozenset({
     "list", "info", "cells", "diff", "channels", "hosts", "outcome",
+    # `!table roll <name>` only rolls a stored table (advances the RNG, no
+    # board mutation), so players may roll a GM-defined table. def/remove stay
+    # host-gated.
+    "roll",
 })
 # `dump` is intentionally NOT in the set above: `!ent dump` reveals an
 # entity's full var tree (including GM-hidden data), so it stays host-
@@ -122,13 +126,20 @@ class CommandRegistry:
         # known read-only subcommand (READ_ONLY_SUBCOMMANDS), and the
         # active match's command_access rule can override any of this.
         self._access: Dict[str, str] = {}
+        self._raw_args: Dict[str, bool] = {}
     def command(self, name: str, *, usage: Optional[str] = None,
                 desc: Optional[str] = None, snapshot: bool = True,
-                access: str = "host"):
+                access: str = "host", raw_args: bool = False):
+        # raw_args=True opts a command OUT of dispatcher-level `$(...)` inline-
+        # formula substitution. Used for commands that take raw formula/body
+        # text or sub-command lines whose $() must be evaluated later / per
+        # iteration / in their own context (eval, batch, run, foreach, macro)
+        # or that do their own self-aware substitution (ent).
         def deco(fn: Handler):
             self._handlers[name] = fn
             self._snapshot[name] = snapshot
             self._access[name] = access
+            self._raw_args[name] = raw_args
             meta = self._help.setdefault(name, {"usage": None, "desc": None, "subs": {}})
             if usage:
                 meta["usage"] = usage
@@ -241,6 +252,18 @@ class CommandRegistry:
         if not h:
             await ctx.send(self._unknown_command_message(name, mgr, ctx))
             return
+        # Inline-formula `$(...)` substitution for sub-command lines (a macro /
+        # batch / foreach inner command), so $() resolves per line in the
+        # caller's current context. Same raw_args gate as run().
+        if not self._raw_args.get(name, False):
+            mid = mgr.active_by_channel.get(ctx.channel_key)
+            if mid is not None and mid in mgr.matches:
+                m_arg = mgr.matches[mid]
+                try:
+                    args = [resolve_arg_token(a, m_arg, self_id=None) for a in args]
+                except FormulaError as e:
+                    await ctx.send(f"❌ inline $() argument: {e}")
+                    return
         try:
             return await h(ctx, args, mgr)
         except VTTError as e:
@@ -401,6 +424,20 @@ class CommandRegistry:
         # NOT re-enter run(), so a multi-summon action keeps its budget.
         if pre_active_mid is not None and pre_active_mid in mgr.matches:
             mgr.matches[pre_active_mid]._summon_count = 0
+
+        # Inline-formula argument substitution: evaluate any `$(...)` token in
+        # the args as a READ-ONLY expression (strict gate — state-changing
+        # functions banned; see formula.validate_arg_safe) and substitute the
+        # result. Skipped for raw_args commands (eval / batch / run / foreach /
+        # macro handle $() per-line, and ent does its own self-aware pass).
+        # Done AFTER the access gate so a $() can't alter the gated subcommand.
+        if not self._raw_args.get(name, False) and pre_active_mid in mgr.matches:
+            m_arg = mgr.matches[pre_active_mid]
+            try:
+                args = [resolve_arg_token(a, m_arg, self_id=None) for a in args]
+            except FormulaError as e:
+                await ctx.send(f"❌ inline $() argument: {e}")
+                return
 
         try:
             result = await h(ctx, args, mgr)
@@ -2185,7 +2222,7 @@ async def _ent_group_subcmd(ctx, args, mgr, m):
     return await ctx.send(f"**{title}**\n{body}")
 
 
-@registry.command("ent", usage="!ent <subcommand> ...", desc="Manage entities in the active match, lots of available sub-commands. Note: <id> parameter also accepts 'this' or 'current', to target the entity whose turn it is right now")
+@registry.command("ent", raw_args=True, usage="!ent <subcommand> ...", desc="Manage entities in the active match, lots of available sub-commands. Note: <id> parameter also accepts 'this' or 'current', to target the entity whose turn it is right now")
 async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # Show authoritative help if no subcommand was given
     if not args:
@@ -4213,6 +4250,101 @@ async def dist_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     return await ctx.send(out)
 
 
+# ---- !reveal_fog --------------------------------------------------------
+@registry.command(
+    "reveal_fog",
+    usage=("!reveal_fog <team> all|at <x> <y> <r>|rect <x1> <y1> <x2> <y2>|"
+           "around <eid> <r>|clear [turns=N] | !reveal_fog list"),
+    desc=(
+        "Reveal fogged cells to a TEAM independent of unit vision (a scout "
+        "ping / clairvoyance / GM reveal). A revealed cell shows terrain AND "
+        "live entities. Forms: `all` (whole map), `at <x> <y> <r>` (Chebyshev "
+        "disc), `rect <x1> <y1> <x2> <y2>`, `around <eid> <r>` (disc around an "
+        "entity's footprint), `clear` (drop the team's reveals). Optional "
+        "`turns=N` makes it TEMPORARY (expires after N rounds); omit for a "
+        "permanent reveal. `!reveal_fog list` shows active reveals. Host-"
+        "gated. Only meaningful with fog on; bypassed by omniscient views."
+    ),
+)
+async def reveal_fog_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["reveal_fog"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    if args[0].lower() == "list":
+        if not m.fog_reveals:
+            return await ctx.send("No active fog reveals.")
+        lines = ["**Fog reveals:**"]
+        for team in sorted(m.fog_reveals):
+            recs = m._active_reveals(team)
+            if not recs:
+                continue
+            cnt = sum(len(r.get("cells", ())) for r in recs)
+            spans = ", ".join(
+                ("permanent" if r.get("until") is None
+                 else f"through round {r['until']}") for r in recs)
+            lines.append(f"- `{team}`: {cnt} cell(s) [{spans}]")
+        return await ctx.send("\n".join(lines) if len(lines) > 1
+                              else "No active fog reveals.")
+    if len(args) < 2:
+        return await ctx.send(
+            "Usage: `!reveal_fog <team> all|at|rect|around|clear ...`.")
+    team = args[0]
+    form = args[1].lower()
+    # Pull an optional turns=N from anywhere in the rest; the remaining tokens
+    # are the form's positional args.
+    duration: Optional[int] = None
+    rest: List[str] = []
+    for t in args[2:]:
+        if t.lower().startswith("turns="):
+            try:
+                duration = int(t[6:])
+            except ValueError:
+                return await ctx.send("❌ `turns=` must be an integer.")
+        else:
+            rest.append(t)
+    if form == "clear":
+        n = m.clear_reveals(team)
+        return await ctx.send(f"Cleared {n} reveal record(s) for `{team}`.")
+    cells = set()
+    try:
+        if form == "all":
+            cells = {(x, y) for x in range(1, m.grid_width + 1)
+                     for y in range(1, m.grid_height + 1)}
+        elif form == "at":
+            cx, cy, r = int(rest[0]), int(rest[1]), int(rest[2])
+            cells = {(x, y) for x in range(cx - r, cx + r + 1)
+                     for y in range(cy - r, cy + r + 1)}
+        elif form == "rect":
+            x1, y1, x2, y2 = (int(rest[i]) for i in range(4))
+            cells = {(x, y) for x in range(min(x1, x2), max(x1, x2) + 1)
+                     for y in range(min(y1, y2), max(y1, y2) + 1)}
+        elif form == "around":
+            eid = _resolve_eid(m, rest[0])
+            e = m.entities.get(eid)
+            if e is None:
+                raise NotFound(f"Entity '{rest[0]}' not found.")
+            r = int(rest[1])
+            for (ex, ey) in m.entity_cells(e):
+                for x in range(ex - r, ex + r + 1):
+                    for y in range(ey - r, ey + r + 1):
+                        cells.add((x, y))
+        else:
+            return await ctx.send(
+                "Usage: `!reveal_fog <team> all|at|rect|around|clear ...`.")
+    except (IndexError, ValueError):
+        return await ctx.send(
+            "❌ bad arguments for that form (coords/radius must be integers).")
+    except NotFound as ex:
+        return await ctx.send(f"❌ {ex}")
+    n = m.reveal_cells(team, cells, duration)
+    span = "permanently" if duration is None else f"for {duration} round(s)"
+    return await ctx.send(
+        f"Revealed {n} cell(s) to team `{team}` {span}."
+        + ("" if m.fog_enabled else " ⚠️ fog is OFF on this match, so the "
+           "reveal has no visible effect until `!match fog on`."))
+
+
 # ---- !foreach -----------------------------------------------------------
 # Bulk-apply: run one command for every entity matching a !find selector.
 # The selector reuses the exact find-predicate grammar; the command after
@@ -4229,6 +4361,7 @@ def _foreach_subst(tok: str, eid: str, name: str, x: int, y: int) -> str:
 
 @registry.command(
     "foreach",
+    raw_args=True,
     usage="!foreach <predicate> [<predicate> ...] ; <command> [args...]",
     desc=(
         "Run one command for every entity matching a `!find` selector. "
@@ -8490,6 +8623,7 @@ def _split_batch(args: List[str], sep: str = ";") -> List[List[str]]:
 
 @registry.command(
     "batch",
+    raw_args=True,
     usage="!batch <cmd1> <args...> ; <cmd2> <args...> ; ...",
     desc=(
         "Run multiple commands as a single undo unit. The whole batch "
@@ -8524,6 +8658,7 @@ async def batch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 # -- !run --------------------------------------------------------------------
 @registry.command(
     "run",
+    raw_args=True,
     usage="!run <path>",
     desc=(
         "Read a file of commands (one per line, leading `!` optional, "
@@ -8592,6 +8727,7 @@ def _macro_subst(line: str, mac_args: List[str]) -> str:
 
 @registry.command(
     "macro",
+    raw_args=True,
     usage="!macro <set|run|list|show|remove> ...",
     desc=(
         "Reusable named command sequences (a step up from !batch/!run). "
@@ -8665,6 +8801,81 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(f"Removed macro `{name}`.")
 
     title, body = registry.help_for(["macro"])
+    return await ctx.send(f"**{title}**\n{body}")
+
+
+@registry.command(
+    "table",
+    usage="!table <def|roll|list|show|remove> ...",
+    snapshot=False,
+    desc=(
+        "Named random tables (Match.tables) — store a weighted table once and "
+        "roll it by name. `def <name> <key:weight,...>` defines a table (the "
+        "spec is the same `key:weight` CSV as roll_table; weight optional, "
+        "default 1). `roll <name>` rolls it (replay-safe via the match RNG) "
+        "and returns the picked key. `list` / `show <name>` / `remove <name>`. "
+        "Also usable from formulas via `table_roll(name)`. The named companion "
+        "to inline `roll_table(...)`; per-match, serialized."
+    ),
+)
+async def table_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["table"])
+        return await ctx.send(f"**{title}**\n{body}")
+    m = active_match(mgr, ctx)
+    sub = args[0].lower()
+
+    if sub == "def":
+        if await return_help_if_not_enough_args(ctx, args, 3, "table", "def"):
+            return
+        name = args[1]
+        spec = " ".join(args[2:]).strip()
+        # Validate the spec by attempting a pick (catches bad weights / empty).
+        try:
+            roll_table_pick(random, spec)
+        except FormulaError as ex:
+            return await ctx.send(f"❌ invalid table spec: {ex}")
+        m.tables[name] = spec
+        return await ctx.send(f"Defined table `{name}` = `{spec}`.")
+
+    if sub == "roll":
+        if await return_help_if_not_enough_args(ctx, args, 2, "table", "roll"):
+            return
+        name = args[1]
+        if name not in m.tables:
+            return await ctx.send(f"❌ no table `{name}`.")
+        rng = getattr(m, "_rng", None) or random
+        try:
+            pick = roll_table_pick(rng, m.tables[name])
+        except FormulaError as ex:
+            return await ctx.send(f"❌ {ex}")
+        return await ctx.send(f"🎲 table `{name}` → **{pick}**")
+
+    if sub == "list":
+        if not m.tables:
+            return await ctx.send("No tables defined.")
+        lines = ["**Tables:**"]
+        for n in sorted(m.tables):
+            lines.append(f"- `{n}`: {m.tables[n]}")
+        return await ctx.send("\n".join(lines))
+
+    if sub == "show":
+        if await return_help_if_not_enough_args(ctx, args, 2, "table", "show"):
+            return
+        name = args[1]
+        if name not in m.tables:
+            return await ctx.send(f"❌ no table `{name}`.")
+        return await ctx.send(f"**table `{name}`** = `{m.tables[name]}`")
+
+    if sub in ("remove", "del", "rm"):
+        if await return_help_if_not_enough_args(ctx, args, 2, "table", "remove"):
+            return
+        name = args[1]
+        if m.tables.pop(name, None) is None:
+            return await ctx.send(f"❌ no table `{name}`.")
+        return await ctx.send(f"Removed table `{name}`.")
+
+    title, body = registry.help_for(["table"])
     return await ctx.send(f"**{title}**\n{body}")
 
 
@@ -8912,6 +9123,7 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 @registry.command(
     "eval",
+    raw_args=True,
     usage='!eval [--as <eid>] "<formula>" | !eval --as-passive <eid> <pid>',
     desc=("Evaluate a formula against the active match (for testing). "
           "`this` = current-turn entity. By default `self` is unbound; "

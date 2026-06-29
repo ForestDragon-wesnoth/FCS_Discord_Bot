@@ -565,6 +565,56 @@ def roll_detail(rng, spec: Any) -> "Tuple[int, list]":
             f"NdM (with optional !, kh<n>, kl<n>) or a flat integer."
         )
     return total, parts
+
+
+def roll_table_pick(rng, spec: Any) -> str:
+    """Weighted random pick from a table spec: a `key:weight,...` CSV (weight
+    optional, default 1) or a dict {key: weight}. Returns a key with
+    probability proportional to its weight; 0-weight entries never chosen.
+    Shared by the roll_table() formula primitive, the named-table table_roll()
+    primitive, and the `!table roll` command."""
+    def _w(x: Any, key: str) -> float:
+        if isinstance(x, bool) or not isinstance(x, (int, float)):
+            try:
+                x = float(str(x).strip())
+            except (TypeError, ValueError):
+                raise FormulaError(
+                    f"roll_table(...): weight for '{key}' must be a number.")
+        w = float(x)
+        if w < 0:
+            raise FormulaError(
+                f"roll_table(...): weight for '{key}' must be >= 0.")
+        return w
+    pairs = []
+    if isinstance(spec, dict):
+        for k, w in spec.items():
+            pairs.append((str(k), _w(w, str(k))))
+    elif isinstance(spec, str):
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if ":" in part:
+                k, _, ws = part.partition(":")
+                pairs.append((k.strip(), _w(ws.strip(), k.strip())))
+            else:
+                pairs.append((part, 1.0))
+    else:
+        raise FormulaError(
+            "roll_table(spec): spec must be a 'key:weight,...' string or a "
+            "dict {key: weight}.")
+    pairs = [(k, w) for k, w in pairs if w > 0]
+    total = sum(w for _, w in pairs)
+    if not pairs or total <= 0:
+        raise FormulaError(
+            "roll_table(spec): needs at least one entry with positive weight.")
+    r = rng.random() * total
+    upto = 0.0
+    for k, w in pairs:
+        upto += w
+        if r < upto:
+            return k
+    return pairs[-1][0]
     return total
 
 
@@ -1598,8 +1648,9 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # ATB read prims (Active Time Battle): the charge target + an entity's
     # current charge rate. See the atb_* rules.
     "atb_threshold", "atb_rate",
-    # Weighted random pick (replay-safe via the match RNG).
-    "roll_table",
+    # Weighted random pick (replay-safe via the match RNG). roll_table takes
+    # an inline spec; table_roll rolls a NAMED table stored on the match.
+    "roll_table", "table_roll",
     # Match-wide entity queries (no reference entity; all loopable). Each
     # returns a list of ALIVE entity ids:
     #   all_entities()                -> every alive entity, insertion order
@@ -1693,6 +1744,93 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     "footprint_width", "footprint_height", "footprint_cells",
     "occupies", "cell_entity", "entity_center", "aoe_origin",
 )
+
+# ----------------------------------------------------------------------------
+# Read-only classification for INLINE-ARG ($()) evaluation.
+#
+# When a `$(...)` formula is evaluated to substitute a command argument, ONLY
+# read-only functions may be called — a $() that mutates game state would be a
+# disaster (a player could `!ent set_var x y $(kill('boss'))`). Assignments
+# (entity writes) are already impossible because $() is parsed in EXPRESSION
+# mode; this classification additionally bans every state-CHANGING function.
+#
+# Every name in _MATCH_FUNC_NAMES MUST appear in exactly one of the two sets
+# below — a module-load assertion enforces it, so adding a new match function
+# without classifying it as read-only or mutating breaks the build (a loud
+# reminder, never a silent default-allow). The _ALLOWED_FUNCS pure helpers
+# (min/max/roll/distance/band/...) are all read-only and always permitted.
+ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
+    "group_add", "group_remove",
+    "tile_set", "tile_del", "tile_clear",
+    "move_entity", "move_step", "push_entity", "pull_entity", "swap_entities",
+    "fire_tile_hook",
+    "absorb_damage",
+    "status_set", "status_del", "status_add", "status_remove",
+    "status_apply", "status_force", "status_dispel", "status_transfer",
+    "status_counter_add", "status_counter_set",
+    "declare_winner",
+    "var_set", "var_del", "var_clear",
+    "match_var_set", "match_var_del",
+    "emit",
+    "use_action",
+    "summon", "summon_near", "summon_from", "remove_entity",
+    "kill", "revive", "transform", "revert",
+    "schedule", "schedule_on", "cancel_schedule",
+    "log",
+    "create_zone", "delete_zone", "zone_add_cell", "zone_remove_cell",
+    "zone_fill", "zone_shift", "zone_set", "zone_del",
+    "zone_anchor", "zone_unanchor",
+    "mount", "dismount", "switch_slot",
+    "damage_part", "damage_spread",
+    "team_set", "team_add",
+})
+ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset(
+    set(_MATCH_FUNC_NAMES) - ARG_MUTATING_MATCH_FUNCS)
+# Drift guard: a mutating name must actually be a real match function, and
+# every match function must be classified (the subtraction above can't catch a
+# mutating name that was typo'd or removed from _MATCH_FUNC_NAMES).
+_arg_unknown_mutating = ARG_MUTATING_MATCH_FUNCS - set(_MATCH_FUNC_NAMES)
+assert not _arg_unknown_mutating, (
+    "ARG_MUTATING_MATCH_FUNCS names not in _MATCH_FUNC_NAMES: "
+    f"{sorted(_arg_unknown_mutating)}")
+# The set of all function names callable inside a $() inline argument: the
+# pure helpers plus the read-only match functions. (Coords/relative_angle etc.
+# live in _ALLOWED_FUNCS.) User-defined !func functions are NOT included — they
+# can't be verified read-only, so they're banned from args.
+ARG_SAFE_FUNC_NAMES: "frozenset[str]" = frozenset(_ALLOWED_FUNCS) | ARG_SAFE_MATCH_FUNCS
+
+
+def validate_arg_safe(src: str) -> None:
+    """Validate a `$(...)` inline-argument expression: it must be a pure
+    EXPRESSION (no assignments — guaranteed by eval-mode parsing) that calls
+    ONLY read-only functions (ARG_SAFE_FUNC_NAMES). Raises FormulaError on a
+    syntax error, a statement/assignment, or a call to a state-changing /
+    unknown function. This is the strict gate that makes inline args safe."""
+    try:
+        tree = ast.parse(src, mode="eval")
+    except SyntaxError as ex:
+        # An assignment / statement in a $() arg lands here (eval mode rejects
+        # them) — surface it as the "no mutation" rule, not a raw SyntaxError.
+        raise FormulaError(
+            f"inline $() argument must be a read-only expression "
+            f"(no assignments / statements): {ex.msg}")
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            fname = node.func.id
+            if fname not in ARG_SAFE_FUNC_NAMES:
+                if fname in ARG_MUTATING_MATCH_FUNCS:
+                    raise FormulaError(
+                        f"function '{fname}' changes game state and is banned "
+                        f"in a $() inline argument (only read-only functions "
+                        f"are allowed).")
+                raise FormulaError(
+                    f"function '{fname}' is not allowed in a $() inline "
+                    f"argument (only read-only functions are; user-defined "
+                    f"functions are excluded).")
+        # A call whose target is anything other than a bare Name (e.g. an
+        # attribute call) is already rejected by the main expression validator;
+        # nothing in expression mode produces one, so no extra check is needed.
+
 
 _ALLOWED_NODES: Tuple[type, ...] = (
     ast.Module, ast.Expression,
@@ -2764,54 +2902,23 @@ class FormulaEngine:
         def _roll_table(spec: Any) -> str:
             """roll_table("a:3,b:2,c") / roll_table({...}): weighted random
             pick — returns a key with probability proportional to its weight.
-            Input is a CSV of `key:weight` (weight optional, default 1) or a
-            dict {key: weight}. A 0-weight entry is never chosen. Replay-safe
-            via the match RNG (honors random_seed). The discrete-choice
-            companion to band (which buckets a number into a range)."""
-            def _w(x: Any, key: str) -> float:
-                if isinstance(x, bool) or not isinstance(x, (int, float)):
-                    try:
-                        x = float(str(x).strip())
-                    except (TypeError, ValueError):
-                        raise FormulaError(
-                            f"roll_table(...): weight for '{key}' must be a number.")
-                w = float(x)
-                if w < 0:
-                    raise FormulaError(
-                        f"roll_table(...): weight for '{key}' must be >= 0.")
-                return w
-            pairs = []
-            if isinstance(spec, dict):
-                for k, w in spec.items():
-                    pairs.append((str(k), _w(w, str(k))))
-            elif isinstance(spec, str):
-                for part in spec.split(","):
-                    part = part.strip()
-                    if not part:
-                        continue
-                    if ":" in part:
-                        k, _, ws = part.partition(":")
-                        pairs.append((k.strip(), _w(ws.strip(), k.strip())))
-                    else:
-                        pairs.append((part, 1.0))
-            else:
-                raise FormulaError(
-                    "roll_table(spec): spec must be a 'key:weight,...' "
-                    "string or a dict {key: weight}.")
-            pairs = [(k, w) for k, w in pairs if w > 0]
-            total = sum(w for _, w in pairs)
-            if not pairs or total <= 0:
-                raise FormulaError(
-                    "roll_table(spec): needs at least one entry with "
-                    "positive weight.")
-            r = _active_rng().random() * total
-            upto = 0.0
-            for k, w in pairs:
-                upto += w
-                if r < upto:
-                    return k
-            return pairs[-1][0]
+            Replay-safe via the match RNG (honors random_seed). The discrete-
+            choice companion to band (which buckets a number into a range)."""
+            return roll_table_pick(_active_rng(), spec)
         ns["roll_table"] = _roll_table
+
+        def _table_roll(name: Any) -> str:
+            """table_roll("loot"): roll a NAMED table stored on the match
+            (Match.tables, authored via `!table def`). Returns the picked key.
+            Replay-safe via the match RNG."""
+            if not isinstance(name, str) or not name.strip():
+                raise FormulaError("table_roll(name): name must be a string.")
+            tables = getattr(match, "tables", {}) or {}
+            spec = tables.get(name.strip())
+            if spec is None:
+                raise FormulaError(f"table_roll: no table named '{name}'.")
+            return roll_table_pick(_active_rng(), spec)
+        ns["table_roll"] = _table_roll
 
         def _eid(token: Any) -> str:
             if token is None:
@@ -6277,9 +6384,14 @@ def resolve_arg_token(token: str, match, self_id: Optional[str] = None) -> str:
     m = _QUOTED_RE.match(token) or _BARE_RE.match(token)
     if m is None:
         raise FormulaError(f"Malformed formula token: {token!r}")
+    body = m.group("body")
+    # STRICT read-only gate: a $() argument may only read/compute — any
+    # state-changing function is banned (otherwise an arg like
+    # `$(kill('boss'))` would mutate the match). See validate_arg_safe.
+    validate_arg_safe(body)
     this_id = match.current_entity_id() if hasattr(match, "current_entity_id") else None
     ctx = EvalCtx(this=this_id, target=self_id)
-    val = FormulaEngine(match).eval_expression(m.group("body"), ctx)
+    val = FormulaEngine(match).eval_expression(body, ctx)
     return _stringify(val)
 
 
