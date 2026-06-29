@@ -14020,3 +14020,68 @@ dist $(1+1) 1 5 5` shows the dispatcher substituting a non-ent inner command's
 $() per run. `!batch ... ; ...` likewise substitutes each sub-command's $().
 ent stays raw_args (its own substitution), non-ent inner commands use the
 dispatcher's — both gated read-only.
+
+SCENARIO 544 — Macro control flow: repeat + $# loop index + nesting
+--------------------------------------------------------------------------------
+
+!match new mr MacroRepeat 12 12
+!match use mr
+!ent add g Goblin 100 2 2 5
+!macro set tri "repeat 3\nent hp g $(0-2)\nend"
+!macro run tri
+!macro set idx "repeat 4\nent set_var g last $#\nend"
+!macro run idx
+!macro set nest "repeat 2\nif entity[g].hp > 0\nent hp g $(0-1)\nend\nend"
+!macro run nest
+!ent dump g
+
+Expected: a macro can `repeat <count>\n...\nend` to loop a block; the count is a
+read-only formula. `tri` repeats `ent hp g $(0-2)` three times (100 → 94). `$#`
+is the current 1-based iteration, so `idx` leaves `last=4` after four passes.
+Blocks nest: `nest` repeats an `if`-guarded damage twice (94 → 92). The whole
+macro run is ONE undo entry. A macro with no directives still runs linearly
+(unchanged). repeat counts are clamped by macro_repeat_limit; a runaway total is
+stopped by macro_step_limit.
+
+SCENARIO 545 — Macro control flow: if / elif / else branching
+--------------------------------------------------------------------------------
+
+!match new mb MacroBranch 10 10
+!match use mb
+!ent add g Goblin 30 2 2 5
+!macro set heal "if entity[g].hp < 10\nent hp g 20\nelse\nent hp g 1\nend"
+!macro run heal
+!ent hp g -25
+!macro run heal
+!macro set tier "if entity[g].hp > 100\nent set_var g tier high\nelif entity[g].hp > 10\nent set_var g tier mid\nelse\nent set_var g tier low\nend"
+!macro run tier
+!ent dump g
+
+Expected: `if <formula>` / `elif <formula>` / `else` / `end` branch on a
+READ-ONLY formula (truthy = run that block; first matching branch wins). `heal`
+adds 1 when hp ≥ 10 (30 → 31) and adds 20 when hp < 10 (after `ent hp g -25` →
+6, then +20 → 26). `tier` is an elif chain: hp 26 → `tier=mid`. Conditions only
+read state; a condition that mutates is rejected (see scenario 546).
+
+SCENARIO 546 — Macro control flow: read-only conditions + structure + clamp
+--------------------------------------------------------------------------------
+
+!match new ms MacroSafe 8 8
+!match use ms
+!ent add g Goblin 100 2 2 5
+!system set default macro_repeat_limit 5
+!macro set evil "if kill(g)\nent hp g 1\nend"
+!macro run evil
+!macro set big "repeat 99999\nent hp g $(0-1)\nend"
+!macro run big
+!macro set broken "if entity[g].hp > 0\nent hp g 1"
+!ent dump g
+
+Expected: macro control-flow formulas are evaluated with the SAME strict read-
+only gate as inline $() args — a state-CHANGING function in an `if`/`repeat`
+expression is rejected (`if kill(g)` reports the condition is banned and treats
+it as false; goblin stays alive). `repeat 99999` is clamped to macro_repeat_limit
+(5 here), so `big` deals only 5 damage (100 → 95) with a ⚠ clamp notice. A
+structurally broken macro (`broken`: `if` without `end`) is rejected at `set`
+time with ❌, never stored. macro_step_limit is the hard backstop on total
+dispatched lines.

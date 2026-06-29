@@ -8710,19 +8710,186 @@ async def run_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         await registry.dispatch_no_snapshot(sub[0], sub[1:], ctx, mgr)
 
 
-def _macro_subst(line: str, mac_args: List[str]) -> str:
-    """Substitute $@ (all args, space-joined) and $1, $2, ... (positional;
-    missing -> empty) in a macro line, in a SINGLE left-to-right pass. The
-    single pass matters: an arg VALUE that itself contains a `$N`/`$@` token is
-    NOT re-substituted, and a multi-digit `$10`+ is parsed as the whole index
+def _macro_subst(line: str, mac_args: List[str],
+                 loop_idx: Optional[int] = None) -> str:
+    """Substitute $@ (all args, space-joined), $# (current `repeat` iteration,
+    1-based — empty outside a loop), and $1, $2, ... (positional; missing ->
+    empty) in a macro line, in a SINGLE left-to-right pass. The single pass
+    matters: an arg VALUE that itself contains a `$N`/`$@`/`$#` token is NOT
+    re-substituted, and a multi-digit `$10`+ is parsed as the whole index
     (not `$1` followed by a literal `0`). Leaves $(...) formula tokens alone
-    (a `$` not followed by `@` or a digit)."""
+    (a `$` not followed by `@`, `#`, or a digit)."""
     def repl(m: "re.Match") -> str:
-        if m.group(0) == "$@":
+        tok = m.group(0)
+        if tok == "$@":
             return " ".join(mac_args)
+        if tok == "$#":
+            return "" if loop_idx is None else str(loop_idx)
         idx = int(m.group(1))
         return mac_args[idx - 1] if 1 <= idx <= len(mac_args) else ""
-    return re.sub(r"\$@|\$(\d+)", repl, line)
+    return re.sub(r"\$@|\$#|\$(\d+)", repl, line)
+
+
+# ---- macro control flow (if / elif / else / repeat) ---------------------
+# A macro body is parsed into a small block tree so it can branch and loop,
+# then executed. A macro with no directives is just a flat list of command
+# nodes (identical to the old linear behavior).
+class _MacroError(Exception):
+    """A structural macro error (unbalanced block, bad directive)."""
+
+
+_MACRO_DIRECTIVES = ("if", "elif", "else", "repeat", "end")
+
+
+def _macro_head(line: str) -> str:
+    """The lowercased leading word of a (stripped) macro line, or ''."""
+    s = line.strip()
+    return s.split(None, 1)[0].lower() if s else ""
+
+
+def _parse_macro_block(lines: List[str], i: int, stoppers: frozenset):
+    """Parse a block of macro nodes starting at line index `i`, stopping
+    (without consuming) at a directive whose head is in `stoppers` or at EOF.
+    Returns (nodes, next_index). Node shapes:
+      ("cmd",   line)
+      ("if",    [(cond, block), ...], else_block_or_None)
+      ("repeat", count_expr, block)
+    """
+    nodes: List[Any] = []
+    while i < len(lines):
+        raw = lines[i]
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            i += 1  # blank / comment lines are no-ops, ignored structurally
+            continue
+        head = _macro_head(stripped)
+        if head in stoppers:
+            return nodes, i
+        if head == "if":
+            cond = stripped[2:].strip()
+            i += 1
+            branches: List[Any] = []
+            block, i = _parse_macro_block(lines, i, frozenset({"elif", "else", "end"}))
+            branches.append((cond, block))
+            while i < len(lines) and _macro_head(lines[i]) == "elif":
+                ec = lines[i].strip()[4:].strip()
+                i += 1
+                b, i = _parse_macro_block(lines, i, frozenset({"elif", "else", "end"}))
+                branches.append((ec, b))
+            else_block = None
+            if i < len(lines) and _macro_head(lines[i]) == "else":
+                i += 1
+                else_block, i = _parse_macro_block(lines, i, frozenset({"end"}))
+            if i >= len(lines) or _macro_head(lines[i]) != "end":
+                raise _MacroError("`if` without a matching `end`")
+            i += 1  # consume `end`
+            nodes.append(("if", branches, else_block))
+        elif head == "repeat":
+            count_expr = stripped[6:].strip()
+            if not count_expr:
+                raise _MacroError("`repeat` needs a count (e.g. `repeat 3`)")
+            i += 1
+            block, i = _parse_macro_block(lines, i, frozenset({"end"}))
+            if i >= len(lines) or _macro_head(lines[i]) != "end":
+                raise _MacroError("`repeat` without a matching `end`")
+            i += 1
+            nodes.append(("repeat", count_expr, block))
+        elif head in ("end", "elif", "else"):
+            raise _MacroError(f"unexpected `{head}` (no open block)")
+        else:
+            nodes.append(("cmd", stripped))
+            i += 1
+    return nodes, i
+
+
+def _parse_macro(body: str):
+    """Parse a whole macro body into a node tree. Raises _MacroError on a
+    structural problem (unbalanced if/repeat)."""
+    lines = body.split("\n")
+    nodes, i = _parse_macro_block(lines, 0, frozenset())
+    if i != len(lines):
+        raise _MacroError("dangling block terminator")
+    return nodes
+
+
+def _macro_eval_readonly(expr: str, m, label: str):
+    """Evaluate a macro `if`/`repeat` expression as a READ-ONLY formula (the
+    same strict gate as inline $() args — no mutation in control flow).
+    Raises FormulaError on a bad / state-changing expression."""
+    from formula import validate_arg_safe
+    validate_arg_safe(expr)
+    this_id = m.current_entity_id() if hasattr(m, "current_entity_id") else None
+    return FormulaEngine(m).eval_expression(expr, EvalCtx(this=this_id, target=None))
+
+
+def _macro_active_match(ctx, mgr):
+    """The channel's active Match, re-fetched fresh (so a macro line that
+    switches/restores a match doesn't leave a stale reference). None if none."""
+    mid = mgr.active_by_channel.get(ctx.channel_key)
+    return mgr.matches.get(mid) if mid is not None else None
+
+
+async def _exec_macro(nodes, ctx, mgr, mac_args, loop_idx, name, budget):
+    """Execute a parsed macro block. `budget` is a 1-element list (remaining
+    command-dispatch allowance); `loop_idx` is the innermost repeat counter
+    (1-based) or None."""
+    import shlex as _shlex
+    for node in nodes:
+        kind = node[0]
+        if kind == "cmd":
+            if budget[0] <= 0:
+                raise _MacroError("macro step limit exceeded (macro_step_limit)")
+            budget[0] -= 1
+            line = _macro_subst(node[1], mac_args, loop_idx).strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("!"):
+                line = line[1:]
+            try:
+                toks = _shlex.split(line)
+            except ValueError as ex:
+                await ctx.send(f"❌ macro `{name}`: parse error in `{line[:50]}`: {ex}")
+                continue
+            if toks:
+                await registry.dispatch_no_snapshot(toks[0], toks[1:], ctx, mgr)
+        elif kind == "if":
+            branches, else_block = node[1], node[2]
+            m = _macro_active_match(ctx, mgr)
+            ran = False
+            for cond, block in branches:
+                csrc = _macro_subst(cond, mac_args, loop_idx)
+                if m is None:
+                    break
+                try:
+                    truthy = bool(_macro_eval_readonly(csrc, m, name))
+                except FormulaError as ex:
+                    await ctx.send(f"❌ macro `{name}`: bad `if` condition "
+                                   f"`{csrc[:50]}`: {ex}")
+                    truthy = False
+                if truthy:
+                    await _exec_macro(block, ctx, mgr, mac_args, loop_idx, name, budget)
+                    ran = True
+                    break
+            if not ran and else_block is not None:
+                await _exec_macro(else_block, ctx, mgr, mac_args, loop_idx, name, budget)
+        elif kind == "repeat":
+            m = _macro_active_match(ctx, mgr)
+            csrc = _macro_subst(node[1], mac_args, loop_idx)
+            if m is None:
+                continue
+            try:
+                count = int(_macro_eval_readonly(csrc, m, name))
+            except (FormulaError, ValueError, TypeError) as ex:
+                await ctx.send(f"❌ macro `{name}`: bad `repeat` count "
+                               f"`{csrc[:50]}`: {ex}")
+                continue
+            cap = int(m.rules.get("macro_repeat_limit", 1000))
+            if count > cap:
+                await ctx.send(f"⚠️ macro `{name}`: repeat {count} clamped to "
+                               f"{cap} (macro_repeat_limit).")
+                count = cap
+            for k in range(1, max(0, count) + 1):
+                await _exec_macro(node[2], ctx, mgr, mac_args, k, name, budget)
 
 
 @registry.command(
@@ -8732,10 +8899,15 @@ def _macro_subst(line: str, mac_args: List[str]) -> str:
     desc=(
         "Reusable named command sequences (a step up from !batch/!run). "
         "`set <name> <commands>` stores a macro — commands separated by `\\n`; "
-        "lines may use $1/$2/... and $@ for run-time args. `run <name> "
-        "[args...]` substitutes the args and runs every line as ONE undo "
-        "entry (leading `!` optional; blank / `#` lines skipped). Also: list "
-        "/ show <name> / remove <name>. Per-match, serialized."
+        "lines may use $1/$2/... and $@ for run-time args. CONTROL FLOW: a "
+        "line `if <formula>` / `elif <formula>` / `else` / `end` branches on a "
+        "READ-ONLY formula (truthy = run the block); `repeat <count>` / `end` "
+        "loops a block `count` times (count is a read-only formula too), with "
+        "`$#` = the current 1-based iteration. Blocks nest. `run <name> "
+        "[args...]` substitutes the args and runs the macro as ONE undo entry "
+        "(leading `!` optional; blank / `#` lines skipped). Loops are capped by "
+        "macro_repeat_limit / macro_step_limit. Also: list / show <name> / "
+        "remove <name>. Per-match, serialized."
     ),
 )
 async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -8752,6 +8924,12 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         body = normalize_body_source(" ".join(args[2:]).strip())
         if not body:
             return await ctx.send("❌ macro body is empty.")
+        # Validate the control-flow structure up front (unbalanced if/repeat)
+        # so a broken macro is caught at definition, not mid-run.
+        try:
+            _parse_macro(body)
+        except _MacroError as ex:
+            return await ctx.send(f"❌ macro structure error: {ex}")
         m.macros[name] = body
         n = len([l for l in body.split("\n") if l.strip()])
         return await ctx.send(f"Saved macro `{name}` ({n} line(s)).")
@@ -8763,20 +8941,15 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if name not in m.macros:
             return await ctx.send(f"❌ no macro `{name}`.")
         mac_args = args[2:]
-        import shlex as _shlex
-        for raw in m.macros[name].split("\n"):
-            line = _macro_subst(raw, mac_args).strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("!"):
-                line = line[1:]
-            try:
-                toks = _shlex.split(line)
-            except ValueError as ex:
-                await ctx.send(f"❌ macro `{name}`: parse error in `{line[:50]}`: {ex}")
-                continue
-            if toks:
-                await registry.dispatch_no_snapshot(toks[0], toks[1:], ctx, mgr)
+        try:
+            nodes = _parse_macro(m.macros[name])
+        except _MacroError as ex:
+            return await ctx.send(f"❌ macro `{name}` structure error: {ex}")
+        budget = [int(m.rules.get("macro_step_limit", 10000))]
+        try:
+            await _exec_macro(nodes, ctx, mgr, mac_args, None, name, budget)
+        except _MacroError as ex:
+            await ctx.send(f"❌ macro `{name}`: {ex}")
         return
 
     if sub == "list":
