@@ -322,6 +322,20 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "'no team' rather than erroring."
         ),
     },
+    "amount_field": {
+        "default": "amount",
+        "schema": {"type": "str"},
+        "desc": (
+            "Conventional field name for a stackable 'amount' / quantity on a "
+            "container var (an inventory item). The default field used by the "
+            "item_add / item_consume formula primitives when none is given — "
+            "so `item_consume(hero, 'inventory.potion')` decrements "
+            "`inventory.potion.amount` and drops the item at <=0. Each primitive "
+            "also takes an explicit `field` arg to override per call. The engine "
+            "has NO inventory concept; this is just the default key name for the "
+            "amount-aware helpers."
+        ),
+    },
     "part_name_var": {
         "default": "part_name",
         "schema": {"type": "str"},
