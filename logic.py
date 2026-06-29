@@ -5054,6 +5054,15 @@ class Match:
     # lists of [x, y]. Runtime type is set for fast membership tests.
     explored: Dict[str, "set"] = field(default_factory=dict)
 
+    # ---- fog reveals (scout / clairvoyance) ----
+    # Per-team list of reveal records {cells: set[(x,y)], until: Optional[int]}
+    # that force cells visible to a team independent of unit vision (a scout
+    # ping, clairvoyance, GM reveal). `until` is the round number the reveal
+    # is active THROUGH (a reveal expires once round_number > until); None =
+    # permanent. A revealed cell shows terrain AND live entities (current-
+    # vision-equivalent). Set via `!reveal_fog`. Serialized.
+    fog_reveals: Dict[str, "list"] = field(default_factory=dict)
+
     # ---- text-renderer customization ----
     # Per-team text color for the colorized renderer: team-name -> a
     # TEXT_COLORS name. An entity's own `color` var overrides this; absent
@@ -5085,6 +5094,12 @@ class Match:
     # run <name> [args...]`, which substitutes $1/$2/.../$@ and dispatches
     # each line under one undo entry. Per-match; serialized.
     macros: Dict[str, str] = field(default_factory=dict)
+
+    # ---- named random tables ----
+    # name -> a roll_table spec ("key:weight,..." CSV). Rolled by name via the
+    # `table_roll(name)` formula primitive or `!table roll <name>`. Per-match;
+    # serialized. The named-resource companion to inline roll_table().
+    tables: Dict[str, str] = field(default_factory=dict)
 
     # ---- condition-watchers (edge-triggered triggers) ----
     # name -> {"condition": <formula expr>, "effect": <formula program>,
@@ -7497,6 +7512,48 @@ class Match:
             return False
         return (x, y) in self.explored.get(pov_team, ())
 
+    # ---- fog reveals (scout / clairvoyance) ----
+    def _active_reveals(self, team: str) -> "list":
+        """The team's non-expired reveal records, pruning expired ones in
+        place (lazy cleanup keyed off round_number)."""
+        recs = self.fog_reveals.get(team)
+        if not recs:
+            return []
+        live = [r for r in recs
+                if r.get("until") is None or int(r["until"]) >= self.round_number]
+        if len(live) != len(recs):
+            if live:
+                self.fog_reveals[team] = live
+            else:
+                self.fog_reveals.pop(team, None)
+        return live
+
+    def _cell_revealed(self, pov_team: Optional[str], x: int, y: int) -> bool:
+        """True iff `pov_team` has an active reveal covering (x, y)."""
+        if not pov_team:
+            return False
+        for r in self._active_reveals(pov_team):
+            if (x, y) in r.get("cells", ()):
+                return True
+        return False
+
+    def reveal_cells(self, team: str, cells, duration: Optional[int] = None) -> int:
+        """Reveal a set of cells to `team` for `duration` rounds (None =
+        permanent), independent of unit vision. Returns the cell count.
+        Clipped to the grid."""
+        clipped = {(int(x), int(y)) for (x, y) in cells
+                   if self.in_bounds(int(x), int(y))}
+        if not clipped:
+            return 0
+        until = None if duration is None else self.round_number + int(duration)
+        self.fog_reveals.setdefault(team, []).append(
+            {"cells": clipped, "until": until})
+        return len(clipped)
+
+    def clear_reveals(self, team: str) -> int:
+        """Drop all reveals for `team`. Returns the number of records removed."""
+        return len(self.fog_reveals.pop(team, []) or [])
+
     def _fog_terrain_visible(self, pov_team: Optional[str], x: int, y: int) -> bool:
         """Fog gate for STATIC features (tiles, zones, corpses) and the map
         overlay: visible when fog is off, omniscient, currently seen (range
@@ -7504,7 +7561,8 @@ class Match:
         if not self.fog_enabled or pov_team is None:
             return True
         return (self._fog_team_sees(pov_team, x, y)
-                or self._cell_remembered(pov_team, x, y))
+                or self._cell_remembered(pov_team, x, y)
+                or self._cell_revealed(pov_team, x, y))
 
     def _fog_entity_visible(self, pov_team: Optional[str], x: int, y: int) -> bool:
         """Fog gate for LIVE entities: visible on current vision (range +
@@ -7514,6 +7572,8 @@ class Match:
             return True
         if self._fog_team_sees(pov_team, x, y):
             return True
+        if self._cell_revealed(pov_team, x, y):
+            return True  # a reveal shows live entities too (clairvoyance)
         if self._cell_remembered(pov_team, x, y):
             return str(self.rules.get("fog_memory_mode", "full")) == "full"
         return False
@@ -12243,6 +12303,7 @@ class Match:
             },
             "aliases": dict(self.aliases),
             "macros": dict(self.macros),
+            "tables": dict(self.tables),
             "watchers": copy.deepcopy(self.watchers),
             "hidden_layers": sorted(self.hidden_layers),
             "outcome": copy.deepcopy(self.outcome),
@@ -12264,6 +12325,12 @@ class Match:
             "explored": {
                 team: sorted([x, y] for (x, y) in cells)
                 for team, cells in self.explored.items()
+            },
+            "fog_reveals": {
+                team: [{"cells": sorted([x, y] for (x, y) in r.get("cells", ())),
+                        "until": r.get("until")}
+                       for r in recs]
+                for team, recs in self.fog_reveals.items()
             },
             "team_colors": dict(self.team_colors),
             "color_enabled": bool(self.color_enabled),
@@ -12382,6 +12449,11 @@ class Match:
             str(k): str(v) for k, v in raw_macros.items()
             if isinstance(k, str) and isinstance(v, str)
         }
+        raw_tables = d.get("tables", {}) or {}
+        m.tables = {
+            str(k): str(v) for k, v in raw_tables.items()
+            if isinstance(k, str) and isinstance(v, str)
+        }
         raw_watch = d.get("watchers", {}) or {}
         m.watchers = {
             str(k): copy.deepcopy(v) for k, v in raw_watch.items()
@@ -12446,6 +12518,17 @@ class Match:
             for team, cells in raw_expl.items()
             if isinstance(team, str) and isinstance(cells, list)
         } if isinstance(raw_expl, dict) else {}
+        raw_rev = d.get("fog_reveals", {})
+        m.fog_reveals = {
+            team: [
+                {"cells": {(int(c[0]), int(c[1])) for c in r.get("cells", [])
+                           if isinstance(c, (list, tuple)) and len(c) == 2},
+                 "until": (int(r["until"]) if r.get("until") is not None else None)}
+                for r in recs if isinstance(r, dict)
+            ]
+            for team, recs in raw_rev.items()
+            if isinstance(team, str) and isinstance(recs, list)
+        } if isinstance(raw_rev, dict) else {}
         raw_tc = d.get("team_colors", {})
         m.team_colors = {
             str(k): str(v) for k, v in raw_tc.items()

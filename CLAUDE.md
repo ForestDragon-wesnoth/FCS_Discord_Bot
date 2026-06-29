@@ -2190,7 +2190,61 @@ More shipped work (continuing the list above):
     `!dist ... euclidean` with the euclidean metric) raised `NameError` — a
     latent crash never exercised before. Added `import math`.
 
-- **Audit-pass-7 fixes: load-side snapshots + ghost passives + status cap
+- **Inline `$()` formula args + `!reveal_fog` + named tables (scenarios
+  539-543).** Three approved features bundled.
+  - **Inline `$()` command args (the careful one).** A `$(...)` token in ANY
+    command arg is evaluated as a READ-ONLY formula and substituted with the
+    result (`!dist $(2+3) $(1+1) 10 10`, `$(entity[boss].hp/2)`).
+    `resolve_arg_token` already did this for `!ent`; now the DISPATCHER
+    (`CommandRegistry.run` + `dispatch_no_snapshot`) applies it to every
+    command, gated by a `raw_args=True` registry flag that opts OUT the meta /
+    self-handling commands (eval, batch, run, foreach, macro resolve `$()`
+    per-line / in their own context; ent does its own self-aware pass).
+    Substitution runs AFTER the access gate (a `$()` can't alter the gated
+    subcommand) and only fires on `$(`-prefixed tokens (a stored formula body
+    never starts with `$(`, so it's untouched). NOTE: shlex splits on spaces, so
+    a `$()` containing inner quotes/spaces must be double-quoted; scenarios use
+    quote-free forms (bare ids, `entity[id].path`).
+    - **STRICT read-only safety** (the headline requirement): `$()` is parsed in
+      EXPRESSION mode (assignments impossible → no entity writes) AND
+      `formula.validate_arg_safe` rejects any call to a STATE-CHANGING function.
+      The classification is EXPLICIT: `ARG_MUTATING_MATCH_FUNCS` (the banned set
+      — kill/summon/var_set/status_apply/damage_part/emit/move_*/tile_set/
+      zone_*/mount/team_set/log/…) vs `ARG_SAFE_MATCH_FUNCS` (the rest of
+      `_MATCH_FUNC_NAMES`); `ARG_SAFE_FUNC_NAMES` = pure `_ALLOWED_FUNCS` + the
+      safe match funcs. User-defined `!func`s are NOT allowed in args
+      (unverifiable). A module-load **drift guard** asserts every
+      `_MATCH_FUNC_NAMES` name is classified, so adding a new match function
+      without deciding read-only-vs-mutating BREAKS THE BUILD — never a silent
+      default-allow. `FormulaError` (a `VTTError` subclass) surfaces as ❌, not 💥.
+  - **`!reveal_fog <team> ...`** — reveal fogged cells to a team independent of
+    unit vision (scout/clairvoyance/GM reveal); a revealed cell shows terrain
+    AND live entities. Forms `all` / `at <x> <y> <r>` (Chebyshev disc) / `rect`
+    / `around <eid> <r>` (footprint disc) / `clear`, optional `turns=N` for a
+    TEMPORARY reveal (expires when `round_number` passes `until`; omit =
+    permanent). `Match.fog_reveals` (team → list of `{cells, until}`; serialized,
+    pruned lazily) ORs into `_fog_terrain_visible` + `_fog_entity_visible` via
+    `_cell_revealed`. Host-gated; `list` player-available.
+  - **Named random tables** — `Match.tables` (name → roll_table spec; serialized)
+    via `!table def/roll/list/show/remove` + the `table_roll(name)` formula
+    primitive. The picker (`formula.roll_table_pick`) was factored out of inline
+    `roll_table` so both share it. `!table roll` is player-available (read-only
+    RNG); def/remove host-gated. Replay-safe via the match RNG.
+
+- **PROCESS RULE — args / formula functions (the user's standing directive).**
+  Inline `$()` args evaluate formula functions, so the read-vs-write
+  classification is a SAFETY boundary, not a nicety. WHENEVER you touch formula
+  functions or any feature that evaluates user formulas in args:
+  1. Every new `_MATCH_FUNC_NAMES` entry MUST be classified as
+     `ARG_SAFE_MATCH_FUNCS` (pure read/calc — anything that gets / calculates /
+     evaluates) or `ARG_MUTATING_MATCH_FUNCS` (anything that changes game state
+     — STRICTLY banned from args). The module-load drift guard in `formula.py`
+     fails the build if you forget, but DECIDE deliberately — a mis-classified
+     mutating function in args is a disaster (a player could `$(kill(boss))`).
+     When unsure, classify as MUTATING (default-deny).
+  2. Add `$()` arg scenarios — at minimum a read-only happy path AND a
+     security case proving the new/changed mutating functions are rejected and
+     do NOT mutate (see scenarios 541-543 for the pattern).
   (scenarios 507-511).** A seventh sweep (three read-only survey agents across
   status/passive/event, movement/geometry/LOS, action/choice/dispatch/clamp;
   every candidate verified in code — and most behaviorally repro'd — before

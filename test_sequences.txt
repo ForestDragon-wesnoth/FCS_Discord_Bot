@@ -13890,3 +13890,133 @@ entity's chosen var values as `[hp=...]`. `sort:hp` orders the results by a var
 ascending (a→5, c→20, b→30); `sort:hp:desc` reverses it (b→30, c→20, a→5). Both
 read dotted var paths; a missing var shows `—` and sorts last. The filtering
 predicates are unaffected.
+
+SCENARIO 539 — Named random tables: !table def/roll/list/show + table_roll()
+--------------------------------------------------------------------------------
+
+!match new tb Tables 5 5
+!match use tb
+!system set tb random_seed 4
+!table def loot sword:1,shield:1,gold:5
+!table roll loot
+!table list
+!table show loot
+!eval table_roll("loot")
+!table def bad x:-1
+!table remove loot
+!table roll loot
+
+Expected: `!table def <name> <spec>` stores a weighted table (same `key:weight`
+CSV as roll_table) on Match.tables (serialized). `!table roll <name>` rolls it
+via the match RNG (replay-safe under random_seed) and returns a key; `list` /
+`show` inspect; `table_roll("loot")` is the formula primitive twin. A bad spec
+(`x:-1`, negative weight) is rejected at def time with ❌. After `remove`, rolling
+the missing table errors with ❌. `!table roll` is player-available (read-only);
+def/remove are host-gated.
+
+SCENARIO 540 — Fog reveal: !reveal_fog (clairvoyance + temporary + clear)
+--------------------------------------------------------------------------------
+
+!match new rv Reveal 10 10
+!match use rv
+!match fog on
+!ent add r1 R1 30 1 1 5
+!ent set_var r1 team red
+!ent set_var r1 fog_vision_radius 1
+!ent add b1 B1 30 8 8 5
+!ent set_var b1 team blue
+!reveal_fog red at 8 8 1
+!reveal_fog list
+!reveal_fog red around b1 2 turns=2
+!reveal_fog red rect 3 3 4 4
+!reveal_fog red clear
+!reveal_fog red all turns=1
+
+Expected: `!reveal_fog <team> ...` forces cells visible to a team independent of
+unit vision (a scout/clairvoyance reveal) — a revealed cell shows terrain AND
+live entities. Forms: `at <x> <y> <r>` (Chebyshev disc), `around <eid> <r>`
+(disc around an entity's footprint), `rect`, `all`, `clear`. `turns=N` makes a
+reveal TEMPORARY (expires after N rounds via round_number); omitting it is
+permanent. With fog ON, after `reveal_fog red at 8 8 1` the red team can see
+cell (8,8) and the blue entity there though no red unit is near. `list` shows
+active reveals; `clear` drops them. Reveals are per-team, serialized, host-gated.
+
+SCENARIO 541 — Inline $() args: read-only math/dice/reads across commands
+--------------------------------------------------------------------------------
+
+!match new ia InlineArgs 12 12
+!match use ia
+!system set ia random_seed 5
+!ent add boss Boss 100 5 5 5
+!ent add goblin Goblin 30 6 6 5
+!dist $(2+3) $(1+1) 10 10
+!dist boss $(5+1) $(5+1)
+!ent hp goblin $(0-5)
+!ent hp boss $(0-1*entity[goblin].hp)
+!map center $(3+3) $(2+2)
+!status def burn
+!status apply goblin burn $(1+1) $(2*3)
+
+Expected: a `$(...)` token in a command argument is evaluated as a READ-ONLY
+formula and substituted with the result, for any command except the raw_args
+ones (eval/batch/run/foreach/macro do it per-line; ent does its own self-aware
+pass). `!dist $(2+3) $(1+1) 10 10` measures (5,2)→(10,10). `$()` can read entity
+vars via `entity[goblin].hp` (quote-free literal id) and roll dice (`$(2d6)`).
+`!ent hp goblin $(0-5)` damages by 5 (ent self-handles $()). `!status apply
+goblin burn $(1+1) $(2*3)` applies burn at level 2, duration 6. All reads/maths;
+no state mutated by the substitution itself.
+
+SCENARIO 542 — Inline $() args SECURITY: state-changing functions are banned
+--------------------------------------------------------------------------------
+
+!match new sec ArgSec 8 8
+!match use sec
+!ent add goblin Goblin 30 4 4 5
+!ent add ally Ally 30 2 2 5
+!dist $(kill(goblin)) 1 2 3
+!dist $(summon(goblin,1,1)) 1 2 3
+!dist $(var_set(goblin,hp,1)) 1 2 3
+!dist $(emit(boom)) 1 2 3
+!dist $(damage_part(goblin,5)) 1 2 3
+!dist $(badfunc(3)) 1 2 3
+!dist $(min(5,kill(goblin))) 1 2 3
+!dist $(abs(var_set(goblin,hp,1))) 1 2 3
+!dist $(entity[goblin].hp+emit(boom)) 1 2 3
+!ent set_var ally note $(entity[goblin].hp=0)
+!ent info goblin
+
+Expected: the STRICT read-only gate (formula.validate_arg_safe) rejects every
+state-CHANGING function inside a `$()` argument — kill, summon, var_set, emit,
+damage_part, etc. each return a clean ❌ ("function 'X' changes game state and is
+banned in a $() inline argument") and the command does NOT run. The gate walks
+the WHOLE expression tree, so a mutating call nested ANYWHERE is caught too —
+`min(5,kill(goblin))`, `abs(var_set(goblin,hp,1))`, and
+`entity[goblin].hp+emit(boom)` are all rejected, not just top-level calls. An
+unknown / user-defined function (`badfunc`) is likewise rejected. An ASSIGNMENT inside
+`$()` (`entity[goblin].hp = 0`) is rejected as "must be a read-only expression
+(no assignments / statements)" — $() is parsed in EXPRESSION mode so writes are
+impossible. CRUCIALLY no mutation occurs: goblin stays at 30/30 HP and present
+(the closing `!ent info goblin` shows it unchanged). This is the safety contract
+that makes inline args usable.
+
+SCENARIO 543 — Inline $() args: per-line in macro + ent self-handling
+--------------------------------------------------------------------------------
+
+!match new ml MacroArgs 10 10
+!match use ml
+!system set ml random_seed 9
+!ent add goblin Goblin 30 4 4 5
+!macro def zap ent hp $1 $(0-4)
+!macro run zap goblin
+!macro def measure dist $(1+1) 1 5 5
+!macro run measure
+!batch dist $(2+2) 1 6 6 ; ent hp goblin $(0-1)
+
+Expected: `$(...)` resolves PER LINE inside a macro / batch (dispatch_no_snapshot
+applies the same read-only gate per sub-command). `!macro def zap ent hp $1
+$(0-4)` then `!macro run zap goblin` substitutes $1→goblin and the inner `ent hp
+goblin $(0-4)` runs (ent self-handles the $(): -4 damage). `!macro def measure
+dist $(1+1) 1 5 5` shows the dispatcher substituting a non-ent inner command's
+$() per run. `!batch ... ; ...` likewise substitutes each sub-command's $().
+ent stays raw_args (its own substitution), non-ent inner commands use the
+dispatcher's — both gated read-only.
