@@ -1216,6 +1216,24 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "single warning is logged). Mirrors var_hook_recursion_limit."
         ),
     },
+    "macro_repeat_limit": {
+        "default": 1000,
+        "schema": {"type": "int"},
+        "desc": (
+            "Max iterations a single `repeat N` block in a macro will run "
+            "(N is clamped to this). Guards against a typo'd huge count."
+        ),
+    },
+    "macro_step_limit": {
+        "default": 10000,
+        "schema": {"type": "int"},
+        "desc": (
+            "Hard backstop on the TOTAL number of command lines a single "
+            "`!macro run` may dispatch (across all loops/branches). Stops a "
+            "pathologically nested macro from hanging; the run aborts with an "
+            "error when exceeded."
+        ),
+    },
     "side_hit_hitbox_mode": {
         "default": "box",
         "schema": {"type": "enum", "choices": ["box", "center"]},

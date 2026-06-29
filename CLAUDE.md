@@ -1325,6 +1325,22 @@ More shipped work (continuing the list above):
   tokens alone, via `_macro_subst`) then dispatches each line via
   `dispatch_no_snapshot` — so the whole macro is ONE undo entry (the !macro
   command itself is snapshotted). Per-match, serialized.
+  - **Macro CONTROL FLOW — SHIPPED (scenarios 544-546).** A macro body is parsed
+    (`_parse_macro` → a node tree, validated at `set` time) and executed by a
+    small interpreter (`_exec_macro`), so a macro can branch and loop; a macro
+    with no directives stays a flat command list (unchanged). Directives (own
+    lines): `if <formula>` / `elif <formula>` / `else` / `end` (truthy formula
+    runs the block, first match wins) and `repeat <count>` / `end` (loop the
+    block `count` times). Blocks NEST. `$#` substitutes the current 1-based
+    `repeat` iteration (empty outside a loop; added to `_macro_subst` alongside
+    $N/$@). Conditions + repeat counts are evaluated with the SAME strict
+    read-only gate as inline $() args (`formula.validate_arg_safe` + a read-only
+    `eval_expression`) — a state-changing function in control flow is rejected.
+    Safety caps: `macro_repeat_limit` rule (default 1000, clamps each repeat) +
+    `macro_step_limit` rule (default 10000, hard total-dispatch backstop that
+    aborts a runaway). The active match is re-fetched per condition/repeat eval
+    (no stale reference if a macro line switches/restores a match). Still ONE
+    undo entry.
 - **Condition-watchers — SHIPPED (scenarios 427-428).** `Match.watchers` (name ->
   {condition, effect, once, last}). EDGE-triggered: `Match.fire_watchers`
   evaluates each condition (a formula expr), records all edges, then runs the
