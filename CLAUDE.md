@@ -2316,6 +2316,41 @@ More shipped work (continuing the list above):
     less surface, or for hosts. The same "tighten reads for a fog match" lever as
     `command_access`. Default stays permissive; a fog GM opts into the lockdown.
 
+- **Audit-pass-17 (hands-on): CLEAN PASS — no bug found.** A by-hand
+  interaction sweep over the recent-feature cross-products (graphics + fog/POV +
+  mounts + status + transform + containers + macros), all exact, no code change.
+  Verified (so future passes can skip re-grinding these):
+  1. **Serialization idempotency** — `to_dict == to_dict(from_dict(to_dict))` on
+     a match exercising EVERY recent serialized field at once (named tables,
+     fog_reveals, border_show/color/opacity, render_mode, background, status-def
+     overlay sprites, the overlays var, mounts, parts, container vars, control-
+     flow macros, watchers, anchored zones, team data, sprite_layer var). No
+     missing/dropped field.
+  2. **`render_scene` POV/fog/disguise consistency** — for every POV the emitted
+     entity + tile placements match the SAME `entity_visible_to` /
+     `tile_visible_to` + `_fog_terrain_visible` predicates the ASCII path uses
+     (no graphics-side info leak); a disguised entity shows the decoy name to
+     enemies, the real name omniscient.
+  3. **Status cluster** — dispel by `tag:` removes all matching + keeps others;
+     transfer to an IMMUNE dest is consume-on-reject (gone from source, doesn't
+     stick); counter to 0 on a CUSTOM field auto-removes.
+  4. **Overlays render on a visible mounted rider** (the `_emit_entity_placement`
+     overlay pass covers riders/region parts); item_consume inside a macro
+     `repeat` decrements per iteration.
+  5. **transform/revert** — id/pos/team preserved, statblock wholesale-swapped
+     (old inventory dropped), revert restores it; needs a CAPTURED statblock
+     (`store_entity_into_var` / a live id), NOT a flat hand-built dict.
+  6. **Render resolution precedence** — per-tile `border_color` data >
+     per-match border field > rule; per-tile `sprite_layer` data overrides the
+     z-layer rule; inline `$()` negative result works in `!foreach`.
+  7. **Macro control flow** — nested `if`/`repeat` + `$#` index, `macro_repeat_limit`
+     clamp, `macro_step_limit` runaway abort, unbalanced-block rejected at `set`.
+  Process note for future harness authors: two "failures" this pass were BOTH
+  test errors — spawning a second entity ON a vehicle's occupied cell (the add
+  silently fails, so the later mount has no rider), and using a FLAT transform
+  template instead of a captured statblock (apply_statblock finds no `vars` →
+  max_hp None). Neither is an engine defect.
+
 - **PROCESS RULE — args / formula functions (the user's standing directive).**
   Inline `$()` args evaluate formula functions, so the read-vs-write
   classification is a SAFETY boundary, not a nicety. WHENEVER you touch formula
