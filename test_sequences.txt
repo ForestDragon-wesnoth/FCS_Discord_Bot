@@ -14146,3 +14146,53 @@ argument") and do NOT run — the closing `!ent dump hero` shows hp still 20 and
 the inventory (sword/bomb) unchanged. The module-load drift guard forces every
 new match function to be classified read-only-vs-mutating, so none can slip into
 args by default.
+
+SCENARIO 549 — Vital-var deletion protection (var_del / var_clear / item_consume)
+--------------------------------------------------------------------------------
+
+!match new vv VitalProtect 6 6
+!match use vv
+!ent add h Hero 20 2 2 5
+!ent set_var h junk 9
+!ent set_var h inventory.potion.amount 1
+!eval "var_del('h','hp')"
+!eval "item_consume('h','hp',999)"
+!eval "var_clear('h','')"
+!eval "item_consume('h','inventory.potion')"
+!ent dump h
+
+Expected: the vital vars (hp / max_hp / initiative — protected_var_names) are now
+ENGINE-PROTECTED at the remove_var chokepoint, so every formula deletion path
+refuses to remove them: `var_del('h','hp')` and `item_consume('h','hp',999)`
+both return ❌ "Cannot remove vital var 'hp' ... engine-protected" and hp stays
+20. `var_clear('h','')` clears the non-vital top-level vars (junk, inventory)
+but SKIPS the vitals (its per-child remove now actually raises on them and is
+skipped) — hp/max_hp/initiative survive. A NON-vital nested deletion still works:
+`item_consume('h','inventory.potion')` drops the potion to 0 and removes it. The
+closing `!ent dump h` shows hp 20, max_hp 20, initiative 5 intact. (The
+vital-var property setters that legitimately unset max_hp/initiative pass
+allow_protected=True, and `!ent delete_var hp` already blocked at the command
+layer — the chokepoint now makes the protection uniform.)
+
+SCENARIO 550 — inline_args_access: host-only $() lockdown for fog-of-war
+--------------------------------------------------------------------------------
+
+!match new ila InlineAccess 8 8
+!match use ila
+!ent add boss Boss 137 7 7 5
+!system set default inline_args_access host
+!as player pleb
+!dist $(entity[boss].hp) 1 1 1
+!dist boss 1 1
+!as host
+!dist $(entity[boss].hp) 1 1 1
+
+Expected: inline `$()` args evaluate read-only formulas with NO POV/fog
+filtering (they read raw entity vars), so a non-host could otherwise probe
+hidden data (`$(entity[boss].hp)`). The `inline_args_access` rule (default
+`all`) set to `host` closes that: as `!as player pleb` (a non-host), a command
+containing a `$()` token is REFUSED ("inline `$()` arguments are host-only on
+this match"), while a plain `!dist boss 1 1` (no $()) still works. Back as a
+host (`!as host`), `$()` works normally. No-op on an open match (no owner) or a
+single-operator/auto-approve surface. The match owner is the creating "cli"
+identity; `!system set default ...` refreshes the live match.

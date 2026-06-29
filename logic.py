@@ -2423,6 +2423,21 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "dedicated command."
         ),
     },
+    "inline_args_access": {
+        "default": "all",
+        "schema": {"type": "enum", "choices": ["all", "host"]},
+        "desc": (
+            "Who may use inline `$(...)` formula arguments in commands. `all` "
+            "(default) = anyone, as designed. `host` = only hosts; a non-host's "
+            "command containing a `$()` token is REFUSED. Inline `$()` evaluates "
+            "read-only formulas with NO POV/fog filtering (it reads raw entity "
+            "vars, e.g. `$(entity[boss].hp)`), so in a FOG-OF-WAR / hidden-"
+            "information match set this to `host` to stop players probing hidden "
+            "data through `$()` — the same reason you'd tighten `ent dump` / "
+            "`find` via command_access. No-op on an open match (no owner), a "
+            "single-operator / auto-approve surface, or for hosts."
+        ),
+    },
     # "movement_block_through": {
     #     "default": False,
     #     "schema": {"type": "bool"},
@@ -3863,7 +3878,7 @@ class Entity:
             # if the var doesn't exist, which would surprise callers of the
             # setter who don't know the underlying state.
             if max_hp_var in self.vars:
-                self.remove_var(max_hp_var)
+                self.remove_var(max_hp_var, allow_protected=True)
         else:
             self.write_var(max_hp_var, int(value))
 
@@ -3880,7 +3895,7 @@ class Entity:
         _, _, init_var = self._vital_var_names()
         if value is None:
             if init_var in self.vars:
-                self.remove_var(init_var)
+                self.remove_var(init_var, allow_protected=True)
         else:
             self.write_var(init_var, int(value))
 
@@ -4687,18 +4702,31 @@ class Entity:
             combined.extend(self._match.check_death(self.id))
         return combined
 
-    def remove_var(self, path: str) -> List[str]:
+    def remove_var(self, path: str, *, allow_protected: bool = False) -> List[str]:
         """Remove the var at `path`, firing on_var_removed (plus on_var_written).
 
         Returns log lines from any passives that fired. Raises NotFound if
         the path doesn't exist. For removal that bypasses events entirely,
         use remove_var_silent.
 
+        VITAL vars (the hp / max_hp / initiative var names) are PROTECTED here:
+        removing one raises VTTError, since the engine assumes they always
+        exist (a missing hp breaks combat math). This is the chokepoint behind
+        the `var_del` / `var_clear` / `item_consume` formula primitives (whose
+        delete paths all route here) and the `!ent delete_var` command, so the
+        protection is uniform. The vital-var property setters (max_hp /
+        initiative = None) pass allow_protected=True for an intentional unset.
+
         If the removed value was a subtree, every level inside it fires its
         own removal event (bottom-up: leaves first, then containers).
         """
         if not path:
             raise VTTError("Variable path cannot be empty.")
+        if (not allow_protected and self._match is not None
+                and path in self.protected_var_names()):
+            raise VTTError(
+                f"Cannot remove vital var '{path}' from `{self.id}` — "
+                f"hp / max_hp / initiative are engine-protected.")
         is_top_level_write = (
             self._match is not None and self._match._var_event_depth == 0
         )

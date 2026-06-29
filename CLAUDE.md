@@ -2284,6 +2284,38 @@ More shipped work (continuing the list above):
     inventory.potion 99` silently REPLACES the whole item dict (a footgun). A
     consumable's action vanishes with the item when item_consume removes it.
 
+- **Audit-pass-16 (hands-on, recent-features sweep): two fixes (scenarios
+  549-550).** A by-hand interaction pass over the recent work (containers,
+  inline `$()`, reveal_fog, macros, overlays) with numeric/behavioral harnesses.
+  Verified CORRECT (no change): item_consume transactional rollback on action
+  fail(), var_move deepcopy isolation + dest-overwrite, reveal_fog memory/expiry/
+  serialization, macro `if`/`repeat` read-only gate (enforced at RUN time —
+  mutating conditions rejected, entity survives), container edge cases (clamp on
+  var_add, non-numeric/missing paths, var_sum_field skipping non-dict children).
+  Two issues:
+  - **Vital-var deletion (HIGH, FIXED).** item_consume / var_del / var_clear
+    could DELETE a vital var (hp/max_hp/initiative) → corruption (a missing hp
+    reads as 0 → entity counts dead). The `!ent delete_var` command already
+    blocked it and var_del/var_clear docstrings CLAIMED remove_var protected
+    vitals — but it DIDN'T. Fixed at the chokepoint: `Entity.remove_var(path,
+    allow_protected=False)` raises VTTError on a protected var, so every formula
+    deletion path + the command are uniform; the two vital-var property setters
+    (max_hp/initiative = None) pass `allow_protected=True`. var_clear's existing
+    `except VTTError: continue` now actually skips vitals as intended.
+  - **Inline `$()` POV info-leak → mitigated by a gamerule (user-approved
+    default: a toggle).** Inline `$()` evaluates read-only formulas with NO
+    POV/fog filtering, so a non-host PLAYER could read hidden entity vars via a
+    player-available command (`!dist $(entity[boss].hp) 1 1 1` returned the
+    fogged boss's exact hp). NOT a bug in the engine's formula model (formulas
+    always saw all), but it undercuts fog-of-war info-hiding. New rule
+    `inline_args_access` (enum all|host, default `all` = unchanged): set to
+    `host` and a non-host's command containing a `$()` token is REFUSED
+    (`CommandRegistry._inline_args_blocked` + `_has_inline_token`, checked in
+    both `run` and `dispatch_no_snapshot` so the batch/macro inner-line vector is
+    covered too). No-op on an open match (no owner), an auto-approve/identity-
+    less surface, or for hosts. The same "tighten reads for a fog match" lever as
+    `command_access`. Default stays permissive; a fog GM opts into the lockdown.
+
 - **PROCESS RULE — args / formula functions (the user's standing directive).**
   Inline `$()` args evaluate formula functions, so the read-vs-write
   classification is a SAFETY boundary, not a nicety. WHENEVER you touch formula

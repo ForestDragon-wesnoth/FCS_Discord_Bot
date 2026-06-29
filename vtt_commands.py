@@ -259,6 +259,11 @@ class CommandRegistry:
             mid = mgr.active_by_channel.get(ctx.channel_key)
             if mid is not None and mid in mgr.matches:
                 m_arg = mgr.matches[mid]
+                if self._has_inline_token(args) and self._inline_args_blocked(ctx, m_arg):
+                    await ctx.send(
+                        "❌ inline `$()` arguments are host-only on this match "
+                        "(inline_args_access).")
+                    return
                 try:
                     args = [resolve_arg_token(a, m_arg, self_id=None) for a in args]
                 except FormulaError as e:
@@ -299,6 +304,29 @@ class CommandRegistry:
                 if name in table:
                     return str(table[name])
         return base
+
+    def _inline_args_blocked(self, ctx: ReplyContext, m: "Any") -> bool:
+        """True iff inline `$(...)` args are restricted to hosts on `m` and
+        this caller isn't one — so a non-host's `$()` token must be refused
+        (it would read raw, POV-unfiltered entity data). No-op (False) when the
+        rule allows all, on an open match (no owner), on an auto-approve /
+        identity-less surface, or for a host. Mirrors the gate's no-op shape."""
+        if m is None:
+            return False
+        if str(m.rules.get("inline_args_access", "all")) != "host":
+            return False
+        if getattr(ctx, "auto_approve", False):
+            return False
+        if getattr(m, "owner", None) is None:
+            return False
+        user = ctx_user(ctx)
+        if user is None:
+            return False
+        return not m.is_host(user)
+
+    @staticmethod
+    def _has_inline_token(args: List[str]) -> bool:
+        return any(isinstance(a, str) and a.startswith("$(") for a in args)
 
     def _gate_decision(self, name: str, args: List[str],
                        ctx: ReplyContext, mgr: MatchManager) -> str:
@@ -433,6 +461,11 @@ class CommandRegistry:
         # Done AFTER the access gate so a $() can't alter the gated subcommand.
         if not self._raw_args.get(name, False) and pre_active_mid in mgr.matches:
             m_arg = mgr.matches[pre_active_mid]
+            if self._has_inline_token(args) and self._inline_args_blocked(ctx, m_arg):
+                await ctx.send(
+                    "❌ inline `$()` arguments are host-only on this match "
+                    "(inline_args_access).")
+                return
             try:
                 args = [resolve_arg_token(a, m_arg, self_id=None) for a in args]
             except FormulaError as e:
