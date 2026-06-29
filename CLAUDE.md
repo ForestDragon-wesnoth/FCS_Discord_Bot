@@ -2166,6 +2166,30 @@ More shipped work (continuing the list above):
       NOT add an in-chat sprite-upload flow without revisiting this decision
       (it would need validation/quotas/sandboxing). See `sprites/README.md`.
 
+- **QoL commands: `!roll`, `!dist`, `!find` columns (scenarios 536-538).** Three
+  small conveniences over existing primitives.
+  - **`!roll <dice>`** — chat dice roller. `roll_detail(rng, spec)` was factored
+    out of `formula._roll_impl` (which is now a thin wrapper) so it returns
+    `(total, parts)` — `parts` being per-term breakdown strings — and the
+    command shows the total PLUS the individual dice (`🎲 2d6+3 → 11 (2d6 [2,6],
+    +3)`). Same grammar as the roll() primitive (NdM, +/-, explode `!`, kh/kl).
+    Uses the match RNG (`m._rng or random`, replay-safe via random_seed) when a
+    match is active, else global; works with no active match too. Read-only.
+  - **`!dist <a> <b> [metric] [los]`** — distance: two entities, an entity + a
+    cell (`!dist <eid> <x> <y>`), or two cells (`!dist <x1> <y1> <x2> <y2>`).
+    Footprint-aware nearest-cell gap via `entity_gap_distance` /
+    `cell_entity_distance` / `_rect_gap`; trailing `metric` (square_radius/
+    chebyshev default, manhattan, euclidean) + `los` (anchor-to-anchor
+    `has_los`). Read-only.
+  - **`!find ... show:<csv> sort:<var>[:desc]`** — DISPLAY directives split off
+    before predicate parsing: `show:hp,mp` appends chosen var values per row,
+    `sort:hp` orders by a (dotted) var (`:desc`/`:asc`), missing var → `—` /
+    sorts last. Filtering unchanged.
+  - **Bonus bug fix:** `logic.py` never imported `math`, so the euclidean branch
+    of `_rect_gap` (footprint nearest-cell distance, e.g. `entities_within` /
+    `!dist ... euclidean` with the euclidean metric) raised `NameError` — a
+    latent crash never exercised before. Added `import math`.
+
 - **Audit-pass-7 fixes: load-side snapshots + ghost passives + status cap
   (scenarios 507-511).** A seventh sweep (three read-only survey agents across
   status/passive/event, movement/geometry/LOS, action/choice/dispatch/clamp;

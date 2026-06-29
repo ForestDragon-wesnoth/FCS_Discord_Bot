@@ -13820,3 +13820,73 @@ layer); they cover the entity's whole footprint and are suppressed on a disguise
 view (real status FX don't leak through the decoy). Graphics-only — ASCII is
 unaffected (the overlay emission is verified headlessly, not via `!map`).
 `!status sprite burning clear` removes the definition overlay.
+
+SCENARIO 536 — !roll: chat dice roller (total + individual dice)
+--------------------------------------------------------------------------------
+
+!match new rl Roll 6 6
+!match use rl
+!system set rl random_seed 7
+!roll 2d6+3
+!roll d20
+!roll 4d6kh3
+!roll 2d20kl1
+!roll 10d6!
+!roll 5
+!roll 2x6
+
+Expected: `!roll <dice>` rolls the same notation as the roll() formula primitive
+and prints the total plus the individual dice (e.g. `🎲 2d6+3 → 11  (2d6 [2,6],
++3)`). Supports flat modifiers, explode `!`, and keep-highest/lowest
+(`4d6kh3`/`2d20kl1` showing rolled→kept). With random_seed set the rolls are
+reproducible (replay-safe via the match RNG). `!roll 5` is a flat value. A
+malformed spec (`2x6`) returns a clean ❌ error, not a crash. Read-only — no
+match mutation, so nothing is snapshotted.
+
+SCENARIO 537 — !dist: distance + optional LOS (entity/cell forms, metrics)
+--------------------------------------------------------------------------------
+
+!match new ds Dist 12 12
+!match use ds
+!ent add a Aaa 30 2 2 5
+!ent add b Bbb 20 8 6 5
+!dist a b
+!dist a b manhattan
+!dist a b euclidean
+!dist a 10 10
+!dist 0 0 3 4 euclidean
+!dist a b los
+!tile set 5 4 opaque true
+!dist a b los
+
+Expected: `!dist` measures the footprint-aware nearest-cell gap. `!dist a b`
+(two entities) defaults to square_radius/Chebyshev (6 here); `manhattan` = 10;
+`euclidean` ≈ 7.21. `!dist a 10 10` measures an entity to a cell (8). `!dist 0
+0 3 4 euclidean` measures two cells (5, a 3-4-5 triangle — exercises the now-
+imported math.sqrt path). The trailing `los` flag also reports whether line of
+sight is clear anchor-to-anchor; after setting an opaque tile on the line, LOS
+reads blocked. Read-only.
+
+SCENARIO 538 — !find show/sort columns
+--------------------------------------------------------------------------------
+
+!match new fc FindCols 8 8
+!ent add a Aaa 30 2 2 5
+!ent add b Bbb 30 4 4 5
+!ent add c Ccc 30 6 6 5
+!match use fc
+!ent set_var a team red
+!ent set_var b team red
+!ent set_var c team red
+!ent hp a -25
+!ent hp c -10
+!find team=red show:hp
+!find team=red show:hp sort:hp
+!find team=red show:hp sort:hp:desc
+
+Expected: `!find` gains DISPLAY directives that aren't parsed as filter
+predicates. `show:hp` (CSV for multiple, e.g. `show:hp,mp`) appends each matched
+entity's chosen var values as `[hp=...]`. `sort:hp` orders the results by a var
+ascending (a→5, c→20, b→30); `sort:hp:desc` reverses it (b→30, c→20, a→5). Both
+read dotted var paths; a missing var shows `—` and sorts last. The filtering
+predicates are unaffected.

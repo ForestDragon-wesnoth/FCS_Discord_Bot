@@ -467,9 +467,17 @@ _ROLL_FLAT_RE = re.compile(r"^([+-]?)(\d+)$")
 
 def _roll_impl(rng, spec: Any) -> int:
     """roll("2d6+3"): evaluate dice notation and return the integer total.
-    Implementation shared by the seeded and unseeded bindings — the RNG is
-    injected so the match's random_seed rule makes rolls reproducible the
-    same way random_int does.
+    Thin wrapper over roll_detail (which also returns the per-term breakdown);
+    the formula binding only needs the total."""
+    return roll_detail(rng, spec)[0]
+
+
+def roll_detail(rng, spec: Any) -> "Tuple[int, list]":
+    """Evaluate dice notation; return (total, parts) where parts is a list of
+    human-readable per-term strings (e.g. "2d6 [4, 5]", "4d6kh3 [6,5,4,2]→keep
+    [6,5,4]", "+3"). Shared by the formula roll() binding and the `!roll`
+    command, so the command can show the individual dice. The RNG is injected
+    so the match's random_seed rule makes rolls reproducible.
 
     Grammar: one or more terms joined by + / -, each term either a flat
     integer modifier or a die group `NdM` (N optional, defaults to 1) with
@@ -494,6 +502,7 @@ def _roll_impl(rng, spec: Any) -> int:
     if not terms or "".join(terms) != s:
         raise FormulaError(f"roll(spec): malformed dice expression '{spec}'.")
     total = 0
+    parts: list = []
     for term in terms:
         dm = _ROLL_DIE_RE.match(term)
         if dm is not None:
@@ -526,6 +535,7 @@ def _roll_impl(rng, spec: Any) -> int:
                         die_total += v
                         chain += 1
                 dice.append(die_total)
+            rolled = list(dice)  # preserve the as-rolled order for display
             if keep_mode is not None:
                 k = max(0, min(keep_n, len(dice)))
                 dice.sort()
@@ -536,18 +546,25 @@ def _roll_impl(rng, spec: Any) -> int:
                     kept = []
                 else:
                     kept = dice[-k:] if keep_mode == "kh" else dice[:k]
+                detail = (f"{term.lstrip('+')} {rolled}→keep "
+                          f"{sorted(kept, reverse=(keep_mode == 'kh'))}")
             else:
                 kept = dice
+                detail = f"{term.lstrip('+')} {rolled}"
             total += sgn * sum(kept)
+            parts.append(detail)
             continue
         fm = _ROLL_FLAT_RE.match(term)
         if fm is not None:
-            total += (-1 if fm.group(1) == "-" else 1) * int(fm.group(2))
+            sgn = -1 if fm.group(1) == "-" else 1
+            total += sgn * int(fm.group(2))
+            parts.append(f"{'+' if sgn > 0 else '-'}{int(fm.group(2))}")
             continue
         raise FormulaError(
             f"roll(spec): malformed term '{term}' in '{spec}' — expected "
             f"NdM (with optional !, kh<n>, kl<n>) or a flat integer."
         )
+    return total, parts
     return total
 
 
