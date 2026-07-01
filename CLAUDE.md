@@ -2316,6 +2316,34 @@ More shipped work (continuing the list above):
     less surface, or for hosts. The same "tighten reads for a fog match" lever as
     `command_access`. Default stays permissive; a fog GM opts into the lockdown.
 
+- **Audit-pass-19 (external-report triage): summon regression + var_get default
+  + harness hardening (scenario 554).** A second Opus instance found two bugs
+  plus a harness blindspot; all verified and fixed:
+  - **The summon system was COMPLETELY BROKEN (HIGH, FIXED).** Every
+    `summon` / `summon_near` / `summon_from` raised `❌ Runtime error: 'x'` and
+    created NOTHING. `Match.summon_entity` called `Entity.from_dict(d)` BEFORE
+    seeding `d["x"]/d["y"]` (they're set later from the resolved placement), but
+    a template has its position STRIPPED and `from_dict` does `int(data["x"])`
+    (subscript, no default) → `KeyError('x')`. Fixed: `d.setdefault("x", x)` /
+    `setdefault("y", y)` before the from_dict probe-build (they're overwritten
+    with place_x/place_y anyway). This had rotted undetected across ELEVEN of
+    its own scenarios (317/318/321-324/336/340/351 + the summon-in-passive 319
+    and summon-tile 320) because the harness only flagged 💥, not a top-level ❌.
+  - **`var_get` rejected a default arg (LOW-MED, FIXED).** `var_get(eid, path)`
+    was 2-arg, but the obvious create-or-read idiom `var_get('h','alarms',0)+1`
+    (used by scenario 427's watcher effect, and mirroring `corpse_var`'s
+    `default`) errored "takes 2 positional arguments but 3 were given". Added an
+    optional `default`: returned on a missing path, still raises without one.
+  - **Harness blindspot hardened (the meta-fix).** `run_scenarios.py` only
+    flagged 💥 / "Syntax error", so a top-level `❌ Runtime error:` /
+    `❌ Unexpected error:` (a core feature silently failing) slid through — the
+    exact trap that hid the summon regression. Added `_ERROR_MARKERS` flagged
+    UNLESS a scenario opts out with a `HARNESS-ALLOWS-ERRORS` tag in its
+    Expected prose (for the few scenarios — 222 func-deletion, 551 vital-write
+    rejection, 554 var_get-no-default — that DELIBERATELY surface a top-level
+    error). 💥 / Syntax always flag regardless. So the whole suite now passing
+    (551/551) is a real signal that no core feature is silently ❌-ing.
+
 - **Audit-pass-18 (external-report triage): four fixes (scenarios 551-553).**
   A second Opus instance was asked to find flaws; all four it reported were
   verified against the code (repro'd where harness-reachable) and fixed:

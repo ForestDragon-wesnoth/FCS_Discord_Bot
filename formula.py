@@ -4099,13 +4099,19 @@ class FormulaEngine:
                 cur = cur[k]
             return True
 
-        def _var_get(eid_t: Any, path: Any) -> Any:
-            """var_get(eid, path): runtime-path equivalent of
-            entity[eid].path. Raises on missing path (same semantics as
-            entity[X].path reads)."""
+        _VAR_GET_MISSING = object()
+
+        def _var_get(eid_t: Any, path: Any, default: Any = _VAR_GET_MISSING) -> Any:
+            """var_get(eid, path[, default]): runtime-path equivalent of
+            entity[eid].path. Raises on a missing path UNLESS a `default` is
+            supplied, in which case it's returned instead (mirrors corpse_var,
+            so `var_get('hero','alarms',0)+1` works — the obvious create-or-read
+            idiom without a var_has guard)."""
             if not isinstance(path, str) or not path:
                 raise FormulaError("var_get(eid, path): path must be a non-empty string.")
             _, e = _resolve_entity(eid_t, "var_get")
+            if default is not _VAR_GET_MISSING and not _var_has(eid_t, path):
+                return default
             return _walk_vars(e, path, must_exist=True)
 
         def _var_set(eid_t: Any, path: Any, value: Any) -> Any:

@@ -48,10 +48,19 @@ SCENARIO_RE = re.compile(
     re.DOTALL,
 )
 
-# Output substrings that mark a flagged failure. 💥 is the dispatcher's
+# Output substrings that ALWAYS mark a flagged failure. 💥 is the dispatcher's
 # unexpected-exception prefix; "Syntax error" is a formula parse failure
 # (see module docstring for why that's always a malformed scenario).
 _FAILURE_MARKERS = ("💥", "Syntax error")
+
+# Substrings that mark a top-level command error (a caught VTTError/FormulaError
+# surfaced as a ❌ reply). In a WELL-FORMED scenario these are bugs — a core
+# feature silently returning ❌ is exactly how the summon regression rotted
+# undetected across eleven of its own tests. They're flagged UNLESS a scenario
+# deliberately exercises error handling (a func-deletion test, a rejection
+# test) and opts out with the `HARNESS-ALLOWS-ERRORS` tag in its Expected prose.
+_ERROR_MARKERS = ("❌ Runtime error:", "❌ Unexpected error:")
+_ALLOW_ERRORS_TAG = "harness-allows-errors"
 
 
 class _Ctx:
@@ -78,15 +87,18 @@ def _interpret_escapes(raw: str) -> str:
     return raw.replace("\\n", "\n").replace("\\t", "\t")
 
 
-def parse_scenarios(path: str) -> List[Tuple[int, str, List[str]]]:
-    """Return [(number, title, [command_line, ...]), ...] in file order."""
+def parse_scenarios(path: str) -> List[Tuple[int, str, List[str], bool]]:
+    """Return [(number, title, [command_line, ...], allow_errors), ...] in file
+    order. allow_errors is True when the scenario's prose carries the
+    HARNESS-ALLOWS-ERRORS opt-out tag (a deliberate error-handling test)."""
     with open(path, encoding="utf-8") as f:
         text = f.read()
-    out: List[Tuple[int, str, List[str]]] = []
+    out: List[Tuple[int, str, List[str], bool]] = []
     for m in SCENARIO_RE.finditer(text):
         num = int(m.group(1))
         title = m.group(2).strip()
         body = m.group(3)
+        allow_errors = _ALLOW_ERRORS_TAG in body.lower()
         # Commands live ABOVE the "Expected:" prose. Stop collecting at
         # the Expected marker so prose lines that happen to start with
         # `!` (e.g. "!ent info shows ...", "!map renders ...") aren't
@@ -97,7 +109,7 @@ def parse_scenarios(path: str) -> List[Tuple[int, str, List[str]]]:
                 break
             if ln.startswith("!"):
                 cmds.append(ln)
-        out.append((num, title, cmds))
+        out.append((num, title, cmds, allow_errors))
     return out
 
 
@@ -125,12 +137,16 @@ async def run_one(cmds: List[str]) -> List[Tuple[str, List[str]]]:
     return transcript
 
 
-def _flagged(transcript: List[Tuple[str, List[str]]]) -> List[Tuple[str, str]]:
-    """Return [(command, output_line), ...] for every flagged failure."""
+def _flagged(transcript: List[Tuple[str, List[str]]],
+             allow_errors: bool = False) -> List[Tuple[str, str]]:
+    """Return [(command, output_line), ...] for every flagged failure. 💥 /
+    Syntax error always flag; a top-level ❌ Runtime/Unexpected error flags too
+    unless the scenario opted out (allow_errors)."""
+    markers = _FAILURE_MARKERS if allow_errors else _FAILURE_MARKERS + _ERROR_MARKERS
     hits = []
     for cmd, outs in transcript:
         for o in outs:
-            if any(marker in o for marker in _FAILURE_MARKERS):
+            if any(marker in o for marker in markers):
                 hits.append((cmd, o))
     return hits
 
@@ -140,7 +156,7 @@ async def main_async(args: argparse.Namespace) -> int:
     scenarios = parse_scenarios(os.path.join(here, "test_sequences.txt"))
 
     if args.list:
-        for num, title, _ in scenarios:
+        for num, title, _, _ in scenarios:
             print(f"{num:>4}  {title}")
         return 0
 
@@ -152,9 +168,9 @@ async def main_async(args: argparse.Namespace) -> int:
             print(f"⚠️ no such scenario(s): {sorted(missing)}")
 
     total_fail = 0
-    for num, title, cmds in scenarios:
+    for num, title, cmds, allow_errors in scenarios:
         transcript = await run_one(cmds)
-        hits = _flagged(transcript)
+        hits = _flagged(transcript, allow_errors)
         if args.verbose:
             print(f"\n=== SCENARIO {num} — {title} ===")
             for cmd, outs in transcript:
