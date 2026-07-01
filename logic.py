@@ -10561,6 +10561,13 @@ class Match:
         new_id = self.mint_entity_id(prefix)
         d = copy.deepcopy(template)
         d["id"] = new_id
+        # A template has its position STRIPPED (that's the point of a template),
+        # but Entity.from_dict requires x/y (int(data["x"])) to build the probe.
+        # Seed them with the requested cell; they're overwritten with the final
+        # placement (place_x/place_y) below either way. Without this, EVERY
+        # summon/summon_near/summon_from raised KeyError('x') and created nothing.
+        d.setdefault("x", x)
+        d.setdefault("y", y)
         e = Entity.from_dict(d)
         # Apply default vars to the probe so the footprint size reflects
         # them; spawn re-applies (fill-only, idempotent).

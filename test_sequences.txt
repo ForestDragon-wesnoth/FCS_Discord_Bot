@@ -5242,6 +5242,9 @@ next call). `!func list` shows only `viafn` remains. Loading the
 saved state restores both functions, and `viafn(10)` = 31 works
 again. (The deletion's downstream breakage is intentional and
 mirrors how tile-template deletion leaves orphaned instances.)
+HARNESS-ALLOWS-ERRORS: the two `!eval "viafn(10)"` after the delete
+deliberately surface a top-level ❌ Runtime error (the deleted-func
+reference), so this scenario opts out of the runtime-error failure marker.
 
 
 SCENARIO 223 — Formula functions: built-in protection and overwrite reporting
@@ -14222,6 +14225,9 @@ True`) → ❌ "Vital var 'hp' must be a number"; nesting under a vital
 (`hp.x`, `var_add hp.inner`) → ❌ "Cannot nest under vital var". Valid writes
 still work and coerce: `hp 15`, `var_set hp '12'` → 12, `var_add hp 3` → 15.
 `!list` and `!ent dump` never 💥. bool is rejected (a True flag isn't hp=1).
+HARNESS-ALLOWS-ERRORS: the `!eval "var_set/var_add(...)"` rejection lines
+deliberately surface a top-level ❌ Runtime error (the vital-var guard firing
+through the formula path), so this scenario opts out of the runtime-error marker.
 
 SCENARIO 552 — !ent clone: parts subtree + mount safety (no phantom limb/rider)
 --------------------------------------------------------------------------------
@@ -14269,3 +14275,33 @@ Expected: the four `!ent` subcommands that were missing int() guards
 a b` → "x and y must be integers", `ent add z Z 10 x 2` → "hp, x, y ... must be
 integers"). The crash was pre-mutation so no state was corrupted — it was a 💥
 where a ❌ belongs. A valid `ent hp h -5` still works (damages by 5).
+
+SCENARIO 554 — summon creates entities + var_get default arg
+--------------------------------------------------------------------------------
+
+!match new sm Summon 8 8
+!match use sm
+!ent add anchor Anchor 20 2 2 5
+!eval "summon({'name':'imp','vars':{'hp':5,'max_hp':5,'initiative':3}},3,3)"
+!eval "summon_near({'name':'imp2','vars':{'hp':5,'max_hp':5,'initiative':2}},3,3,2)"
+!ent set_var anchor blueprint.name skel
+!ent set_var anchor blueprint.vars.hp 4
+!ent set_var anchor blueprint.vars.max_hp 4
+!ent set_var anchor blueprint.vars.initiative 1
+!eval --as anchor "summon_from('blueprint',5,5)"
+!list
+!eval "var_get('anchor','ctr',0) + 1"
+!eval "var_get('anchor','ctr')"
+
+Expected: summon / summon_near / summon_from each CREATE a live entity (the imp,
+imp2, and skel show up in `!list`) — a template has its position stripped, and
+summon_entity now seeds x/y before Entity.from_dict so it no longer raises
+KeyError('x') and silently creates nothing (the regression that hid across
+eleven of its own scenarios because the harness ignored a top-level ❌). This
+scenario would FAIL the hardened harness if any summon returned a ❌ Runtime
+error. var_get gains an optional default: `var_get('anchor','ctr',0)` returns 0
+on a missing path (so `... + 1` = 1, the create-or-read idiom, mirroring
+corpse_var); without a default it still raises.
+HARNESS-ALLOWS-ERRORS: the final `!eval "var_get('anchor','ctr')"` (no default)
+deliberately surfaces a top-level ❌ Runtime error to prove the raise-on-missing
+default-less behavior is preserved.
