@@ -2479,6 +2479,25 @@ class Rule:
 
 
 #functions to use alongside RULE_SCHEMA
+def _coerce_vital_value(v: Any) -> Optional[int]:
+    """Coerce a value destined for a vital var (hp/max_hp/initiative) to an
+    int, or None if it isn't a valid number. bool is rejected (a True flag is
+    almost certainly a mistake, not hp=1); numeric strings and floats are
+    accepted (a float truncates, matching the int() the getters use)."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        return int(v)
+    if isinstance(v, str):
+        try:
+            return int(float(v.strip()))
+        except (ValueError, AttributeError):
+            return None
+    return None
+
+
 def _parse_bool(token: str) -> bool:
     """Parse a boolean from a command-line token.
 
@@ -4533,6 +4552,26 @@ class Entity:
         """
         if not path:
             raise VTTError("Variable path cannot be empty.")
+
+        # VITAL-var write protection (symmetric with remove_var's delete
+        # guard): hp / max_hp / initiative must stay numeric SCALARS — the
+        # engine reads them via int(). Reject a non-numeric write (which would
+        # 💥 the hp getter, !list, damage, is_alive) and reject nesting UNDER a
+        # vital var (`hp.x` would clobber the scalar into a dict). Numeric
+        # strings / floats are coerced to int. Skipped pre-bind (no match).
+        if self._match is not None:
+            seg0 = path.split(".", 1)[0]
+            if seg0 in self.protected_var_names():
+                if "." in path:
+                    raise VTTError(
+                        f"Cannot nest under vital var '{seg0}' (writing "
+                        f"'{path}') — it must stay a numeric scalar on `{self.id}`.")
+                coerced = _coerce_vital_value(value)
+                if coerced is None:
+                    raise VTTError(
+                        f"Vital var '{seg0}' must be a number, got {value!r} "
+                        f"on `{self.id}`.")
+                value = coerced
 
         # Snapshot whether this is the top-level entry into a write/event
         # chain. We only drain the warning buffer at top-level exit so
@@ -7814,6 +7853,11 @@ class Match:
             "name": name,
             "args": list(args),
             "channel_key": channel_key,
+            # The match the request was queued ON. Request ids are per-match
+            # sequential (r1, r2, ...), so a resolver (the Discord approval
+            # buttons) must pop against THIS match, not whatever match is
+            # active on the channel when the button is clicked.
+            "match_id": self.id,
         }
         self.pending_requests[rid] = req
         return req

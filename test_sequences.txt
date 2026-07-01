@@ -14196,3 +14196,76 @@ this match"), while a plain `!dist boss 1 1` (no $()) still works. Back as a
 host (`!as host`), `$()` works normally. No-op on an open match (no owner) or a
 single-operator/auto-approve surface. The match owner is the creating "cli"
 identity; `!system set default ...` refreshes the live match.
+
+SCENARIO 551 — Vital-var WRITE protection (non-numeric / dotted-nest rejected)
+--------------------------------------------------------------------------------
+
+!match new vw VitalWrite 6 6
+!match use vw
+!ent add h Hero 20 2 2 5
+!ent set_var h hp abc
+!eval "var_set('h','hp','boom')"
+!ent set_var h hp.x 5
+!eval "var_add('h','hp.inner',5)"
+!eval "var_set('h','hp',True)"
+!ent set_var h hp 15
+!eval "var_set('h','hp','12')"
+!eval "var_add('h','hp',3)"
+!list
+!ent dump h
+
+Expected: vital vars (hp/max_hp/initiative) must stay numeric SCALARS — the
+engine reads them via int(), so a non-numeric or nested write would 💥 the hp
+getter / !list / damage. Symmetric with the remove_var delete guard, write_var
+now REFUSES: a non-numeric write (`hp abc`, `var_set hp 'boom'`, `var_set hp
+True`) → ❌ "Vital var 'hp' must be a number"; nesting under a vital
+(`hp.x`, `var_add hp.inner`) → ❌ "Cannot nest under vital var". Valid writes
+still work and coerce: `hp 15`, `var_set hp '12'` → 12, `var_add hp 3` → 15.
+`!list` and `!ent dump` never 💥. bool is rejected (a True flag isn't hp=1).
+
+SCENARIO 552 — !ent clone: parts subtree + mount safety (no phantom limb/rider)
+--------------------------------------------------------------------------------
+
+!match new cl Clone 12 12
+!match use cl
+!ent add dragon Dragon 100 5 5 9
+!part add dragon head Head 20 20
+!part add dragon tail Tail 15 15
+!ent clone dragon drag2 8 8
+!part list drag2
+!ent add veh Veh 50 10 10 5
+!ent set_var veh slots.seat.capacity 1
+!ent add rider Rider 20 6 6 5
+!mount rider veh seat
+!ent clone rider rider2 7 7
+!mount list veh
+!ent clone head hc 2 2
+
+Expected: `!ent clone` now walks the source's part SUBTREE (parents before
+children), so cloning a multi-part creature keeps its limbs — `drag2` gets its
+own Head + Tail (`!part list drag2` shows two), the original keeps its two.
+Relational fields are stripped/remapped: cloning a MOUNTED unit no longer copies
+`mounted_on`/`mount_slot`, so `rider2` spawns UNMOUNTED (no phantom rider
+bypassing the capacity-1 seat — `!mount list veh` still shows only the original
+rider). Cloning a body part is REFUSED ("`head` is a body part — clone its
+parent instead") rather than making a phantom limb on the original's parent.
+Mirrors MatchManager.copy_entity's correctness, same-match.
+
+SCENARIO 553 — Non-numeric numeric args give ❌, not 💥 (ent hp/init/add/tp)
+--------------------------------------------------------------------------------
+
+!match new ng NumGuard 6 6
+!match use ng
+!ent add h Hero 20 2 2 5
+!ent hp h abc
+!ent init h abc
+!ent tp h a b
+!ent add z Z 10 x 2
+!ent hp h -5
+
+Expected: the four `!ent` subcommands that were missing int() guards
+(hp/init/add/tp) now return a clean ❌ on a non-numeric numeric arg instead of a
+💥 (`ent hp h abc` → "hp delta must be an integer", `ent init h abc`, `ent tp h
+a b` → "x and y must be integers", `ent add z Z 10 x 2` → "hp, x, y ... must be
+integers"). The crash was pre-mutation so no state was corrupted — it was a 💥
+where a ❌ belongs. A valid `ent hp h -5` still works (damages by 5).

@@ -2316,6 +2316,42 @@ More shipped work (continuing the list above):
     less surface, or for hosts. The same "tighten reads for a fog match" lever as
     `command_access`. Default stays permissive; a fog GM opts into the lockdown.
 
+- **Audit-pass-18 (external-report triage): four fixes (scenarios 551-553).**
+  A second Opus instance was asked to find flaws; all four it reported were
+  verified against the code (repro'd where harness-reachable) and fixed:
+  - **Vital-var WRITE corruption (MED, FIXED).** Any write path could set
+    hp/max_hp/initiative to a non-number or nest under it (`!ent set_var h hp
+    abc`, `var_set('h','hp','boom')`, `hp.x`, `var_add('h','hp.inner',5)`),
+    after which the `int()`-based hp getter 💥'd `!list`/damage/is_alive — and it
+    round-tripped through save/load. The DELETE path was already guarded
+    (remove_var, pass-16); the symmetric WRITE path wasn't. Fixed at the
+    `Entity.write_var` chokepoint: a write whose top-level key is a protected
+    vital var is coerced to int (numeric strings/floats OK) or REJECTED
+    (non-numeric / bool), and NESTING under a vital (`hp.x`) is refused
+    (`_coerce_vital_value` helper). Skipped pre-bind (no match).
+  - **`!ent clone` ignored parts/mounts (MED, FIXED).** Clone did `src.to_dict()
+    → from_dict → spawn`, so it DROPPED a multi-part creature's limbs and copied
+    protected relational fields raw — a mounted clone inherited `mounted_on`/
+    `mount_slot` (a phantom rider bypassing slot capacity / on_mounted), a part
+    clone inherited `part_of` (a phantom limb on the original's parent). Fixed to
+    mirror `MatchManager.copy_entity`, same-match: clone the whole part SUBTREE
+    (parents first, ids/`part_of`/`__follows` remapped, located-part offsets
+    kept, `_restamp_parts_for`), STRIP `mounted_on`/`mount_slot`, and REFUSE
+    cloning a body part ("clone its parent instead"). Gotcha fixed mid-work: the
+    root must take the planned id, so `taken` excludes the plan's cid.
+  - **Unguarded `int()` in `!ent hp/init/add/tp` (LOW, FIXED).** A non-numeric
+    numeric arg (`!ent hp foe abc`) 💥'd pre-mutation where a clean ❌ belongs
+    (sibling verbs already wrapped int()). Wrapped the four sites in try/except
+    ValueError → ❌.
+  - **Discord approval resolved against the wrong match (LOW, Discord-only,
+    FIXED by inspection).** `_ApprovalView._match` popped/ran the request via the
+    channel's ACTIVE match, but request ids are per-match sequential (r1, r2…),
+    so a host switching matches mid-approval could pop a DIFFERENT match's
+    same-id request. Fixed: `add_pending_request` now stores `match_id` on the
+    request (runtime-only, harness-verified present); `_match` resolves against
+    it, and the approve re-dispatch points the channel at the request's match
+    before running (falls back to active for legacy requests).
+
 - **Audit-pass-17 (hands-on): CLEAN PASS — no bug found.** A by-hand
   interaction sweep over the recent-feature cross-products (graphics + fog/POV +
   mounts + status + transform + containers + macros), all exact, no code change.

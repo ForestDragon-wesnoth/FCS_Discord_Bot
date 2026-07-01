@@ -279,7 +279,15 @@ class _ApprovalView(discord.ui.View):
     def _match(self):
         if self._mgr is None:
             return None
-        mid = self._mgr.active_by_channel.get(self._channel_key)
+        # Resolve against the match the request was QUEUED on (stored on the
+        # request), NOT the channel's currently-active match — a host may have
+        # switched the active match between queueing and clicking Approve, and
+        # request ids are per-match sequential, so the active match could hold a
+        # DIFFERENT request with the same id. Fall back to the channel's active
+        # match for legacy requests lacking match_id.
+        mid = self._req.get("match_id")
+        if mid is None:
+            mid = self._mgr.active_by_channel.get(self._channel_key)
         return self._mgr.matches.get(mid) if mid is not None else None
 
     async def _require_host(self, interaction) -> bool:
@@ -309,6 +317,14 @@ class _ApprovalView(discord.ui.View):
         await ictx.send(
             f"✅ {ictx.user_name} approved `{cmd}` (by {req['user_name']})."
         )
+        # Re-dispatch against the request's OWN match, not whatever is active on
+        # the channel now — registry.run resolves the target via
+        # active_by_channel, so point the channel at the request's match for the
+        # approved run (the host is now acting on that match). Legacy requests
+        # without match_id keep the channel's current active match.
+        req_mid = req.get("match_id")
+        if req_mid is not None and req_mid in self._mgr.matches:
+            self._mgr.active_by_channel[ictx.channel_key] = req_mid
         await registry.run(req["name"], req["args"], ictx, self._mgr)
         if _boards:
             mid = self._mgr.get_active_for_channel(ictx.channel_key)
