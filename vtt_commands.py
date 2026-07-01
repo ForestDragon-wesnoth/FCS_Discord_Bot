@@ -2313,8 +2313,12 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "add":# and len(args) >= 6:
         if await return_help_if_not_enough_args(ctx, args, 6, "ent", "add"):
             return
-        eid, name, hp, x, y = args[1], args[2], int(args[3]), int(args[4]), int(args[5])
-        init = int(args[6]) if len(args) >= 7 else None
+        eid, name = args[1], args[2]
+        try:
+            hp, x, y = int(args[3]), int(args[4]), int(args[5])
+            init = int(args[6]) if len(args) >= 7 else None
+        except ValueError:
+            return await ctx.send("❌ hp, x, y (and init) must be integers.")
         # Populate vars using the match's game-system variable names
         hp_var = m.rules.get("hp_var", "hp")
         max_hp_var = m.rules.get("max_hp_var", "max_hp")
@@ -2540,7 +2544,10 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         eid = _resolve_eid(m, args[1]);
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
-        x = int(args[2]); y = int(args[3])
+        try:
+            x = int(args[2]); y = int(args[3])
+        except ValueError:
+            return await ctx.send("❌ x and y must be integers.")
         hook_log = m.entities[eid].tp(x, y)
         msg = f"Teleported `{eid}` to ({x},{y})."
         if hook_log:
@@ -2768,10 +2775,13 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "hp":# and len(args) >= 3:
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "hp"):
             return
-        eid = _resolve_eid(m, args[1]); 
+        eid = _resolve_eid(m, args[1]);
         if eid not in m.entities:
-            raise NotFound(f"Entity '{eid}' not found.")        
-        delta = int(args[2])
+            raise NotFound(f"Entity '{eid}' not found.")
+        try:
+            delta = int(args[2])
+        except ValueError:
+            return await ctx.send("❌ hp delta must be an integer.")
         # Optional bypass_clamp arg for overheal effects
         bypass_clamp = False
         for extra in args[3:]:
@@ -2802,10 +2812,13 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "init":# and len(args) >= 3:
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "init"):
             return
-        eid = _resolve_eid(m, args[1]); 
+        eid = _resolve_eid(m, args[1]);
         if eid not in m.entities:
-            raise NotFound(f"Entity '{eid}' not found.")        
-        value = int(args[2])
+            raise NotFound(f"Entity '{eid}' not found.")
+        try:
+            value = int(args[2])
+        except ValueError:
+            return await ctx.send("❌ initiative must be an integer.")
         hook_log = m.entities[eid].set_initiative_entity(value)
         msg = f"Set initiative of `{eid}` to {value}."
         if hook_log:
@@ -2868,14 +2881,63 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             seen_cells.add((x, y))
             plan.append((cid, x, y))
         src = m.entities[src_id]
+        # A part can't be cloned standalone (it would make a phantom limb on
+        # the original's parent) — clone its parent instead, like copy_entity.
+        if src.is_part:
+            return await ctx.send(
+                f"❌ `{src_id}` is a body part — clone its parent instead.")
         logs: List[str] = []
         for cid, x, y in plan:
-            payload = src.to_dict()
-            payload.update({"id": cid, "x": x, "y": y})
-            clone = Entity.from_dict(payload)
-            _, spawn_log = clone.spawn(m, x, y, initiative=src.initiative)
-            clone.facing = src.facing
-            logs.extend(spawn_log)
+            # Clone the WHOLE part subtree (parents before children) so a
+            # multi-part creature keeps its limbs, remapping part_of / __follows
+            # onto the new ids and STRIPPING the mount link (a clone is never
+            # auto-mounted — it would bypass slot capacity / on_mounted). Mirror
+            # of MatchManager.copy_entity, but same-match with clone's id-naming.
+            order = [src_id]
+            k = 0
+            while k < len(order):
+                pid = order[k]; k += 1
+                for child in m.entities.values():
+                    if child.part_of == pid and child.id not in order:
+                        order.append(child.id)
+            # `taken` = ids already live (+ corpses); NOT the planned cid, which
+            # the planning phase validated unique and the root must take. Each
+            # created clone joins m.entities, so a later plan entry sees it.
+            taken = set(m._taken_entity_ids())
+            idmap: Dict[str, str] = {}
+            for oid in order:
+                nid = cid if oid == src_id else f"{cid}_{oid}"
+                if nid in taken:
+                    j = 2
+                    while f"{nid}_{j}" in taken:
+                        j += 1
+                    nid = f"{nid}_{j}"
+                idmap[oid] = nid
+                taken.add(nid)
+            for oid in order:
+                oe = m.entities[oid]
+                payload = oe.to_dict()
+                payload["id"] = idmap[oid]
+                # Strip / remap relational fields.
+                payload.pop("mounted_on", None)
+                payload.pop("mount_slot", None)
+                if oid == src_id:
+                    payload.pop("part_of", None)  # root clone is standalone
+                elif payload.get("part_of") in idmap:
+                    payload["part_of"] = idmap[payload["part_of"]]
+                fol = (payload.get("vars") or {}).get("__follows")
+                if fol in idmap:
+                    payload["vars"]["__follows"] = idmap[fol]
+                if oid == src_id or not oe.is_located_part:
+                    px, py = x, y
+                else:  # a located part keeps its offset from the anchor
+                    px, py = x + (oe.x - src.x), y + (oe.y - src.y)
+                clone = Entity.from_dict(payload)
+                _, spawn_log = clone.spawn(
+                    m, px, py, initiative=(src.initiative if oid == src_id else None))
+                clone.facing = oe.facing
+                logs.extend(spawn_log)
+            m._restamp_parts_for(idmap[src_id])
         if single:
             cid, x, y = plan[0]
             msg = f"Cloned `{src_id}` → `{cid}` at ({x},{y})."
