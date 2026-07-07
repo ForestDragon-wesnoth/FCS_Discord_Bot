@@ -14305,3 +14305,57 @@ corpse_var); without a default it still raises.
 HARNESS-ALLOWS-ERRORS: the final `!eval "var_get('anchor','ctr')"` (no default)
 deliberately surfaces a top-level ❌ Runtime error to prove the raise-on-missing
 default-less behavior is preserved.
+
+
+SCENARIO 555 — Macro runaway backstops: loop-iteration budget + recursion depth
+--------------------------------------------------------------------------------
+
+!system set default macro_step_limit 100
+!match new mrun MacroRunaway 8 8
+!match use mrun
+!ent add g Goblin 30 2 2 5
+!macro set spin "repeat 1000\nrepeat 1000\nend\nend"
+!macro run spin
+!macro set loop "macro run loop"
+!macro run loop
+!macro set pingA "macro run pingB"
+!macro set pingB "macro run pingA"
+!macro run pingA
+!ent dump g
+
+Expected: two macro runaway classes are now stopped. (1) A nested `repeat` over
+an EMPTY (directive-only) body emits no `cmd` node, so the old per-command
+budget never fired — `repeat 1000 / repeat 1000` (let alone a third level) ran
+to completion / hung the bot. macro_step_limit now charges each `repeat`
+ITERATION too, so `spin` aborts at the limit (set to 100 here) with "macro step
+limit exceeded (macro_step_limit)". (2) A macro line can `!macro run <other>`,
+and each `!macro run` allocates its OWN fresh step budget — so the step limit
+can't stop a self-recursive macro (`loop`) or a mutually-recursive pair
+(`pingA`/`pingB`); before the fix they recursed until the Python stack overflowed
+(a 💥 Unexpected error). The new macro_recursion_limit rule (default 20) bounds
+nested-run depth and aborts cleanly with "recursion limit (20) exceeded
+(macro_recursion_limit)". `g` stays at hp 30 — every runaway aborted before any
+mutation ran.
+
+SCENARIO 556 — Macro backstops don't break legitimate loops / nesting
+--------------------------------------------------------------------------------
+
+!match new mok MacroOK 8 8
+!match use mok
+!ent add g Goblin 100 2 2 5
+!macro set tri "repeat 3\nent hp g $(0-2)\nend"
+!macro run tri
+!macro set leaf "ent set_var g touched 1"
+!macro set mid "macro run leaf"
+!macro set top "macro run mid"
+!macro run top
+!ent set_var g touched 0
+!macro run top
+!ent dump g
+
+Expected: the runaway backstops leave normal macros untouched. Charging loop
+ITERATIONS against macro_step_limit doesn't break a bounded loop — `tri` still
+repeats `ent hp g $(0-2)` three times (100 → 94). Legitimate macro NESTING under
+the recursion limit still works: `top` → `mid` → `leaf` is 3 deep (well under the
+default 20) and sets `touched=1`; the depth counter resets between top-level
+runs, so running `top` a second time (after zeroing) sets `touched=1` again.

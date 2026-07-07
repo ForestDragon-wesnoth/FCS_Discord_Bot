@@ -8984,6 +8984,17 @@ async def _exec_macro(nodes, ctx, mgr, mac_args, loop_idx, name, budget):
                                f"{cap} (macro_repeat_limit).")
                 count = cap
             for k in range(1, max(0, count) + 1):
+                # Charge the step budget PER ITERATION, not just per dispatched
+                # command. Otherwise a loop whose body emits no `cmd` node —
+                # e.g. nested `repeat`s over an empty/directive-only block —
+                # never touches the budget, so `repeat 1000 / repeat 1000 /
+                # repeat 1000` runs 1e9 iterations and hangs the bot, defeating
+                # macro_step_limit's role as the runaway backstop. Charging each
+                # iteration bounds TOTAL loop work (across all nesting) by the
+                # limit regardless of body contents.
+                if budget[0] <= 0:
+                    raise _MacroError("macro step limit exceeded (macro_step_limit)")
+                budget[0] -= 1
                 await _exec_macro(node[2], ctx, mgr, mac_args, k, name, budget)
 
 
@@ -9041,10 +9052,25 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         except _MacroError as ex:
             return await ctx.send(f"❌ macro `{name}` structure error: {ex}")
         budget = [int(m.rules.get("macro_step_limit", 10000))]
+        # Recursion-depth guard: a macro line can `!macro run <other>`, and each
+        # `!macro run` allocates its OWN fresh step budget — so the step limit
+        # alone can't stop a self/mutually-recursive macro from recursing until
+        # the Python stack overflows (a 💥). Bound the nested-run depth here.
+        # Tracked on the manager (the dispatch stack), so it accumulates even if
+        # a macro line switches the active match mid-recursion.
+        depth = getattr(mgr, "_macro_depth", 0)
+        rec_limit = int(m.rules.get("macro_recursion_limit", 20))
+        if depth >= rec_limit:
+            return await ctx.send(
+                f"❌ macro `{name}`: recursion limit ({rec_limit}) exceeded "
+                f"(macro_recursion_limit).")
+        mgr._macro_depth = depth + 1
         try:
             await _exec_macro(nodes, ctx, mgr, mac_args, None, name, budget)
         except _MacroError as ex:
             await ctx.send(f"❌ macro `{name}`: {ex}")
+        finally:
+            mgr._macro_depth = depth
         return
 
     if sub == "list":
