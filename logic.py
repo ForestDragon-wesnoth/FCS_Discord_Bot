@@ -1242,10 +1242,22 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "default": 10000,
         "schema": {"type": "int"},
         "desc": (
-            "Hard backstop on the TOTAL number of command lines a single "
-            "`!macro run` may dispatch (across all loops/branches). Stops a "
-            "pathologically nested macro from hanging; the run aborts with an "
-            "error when exceeded."
+            "Hard backstop on the TOTAL work a single `!macro run` may do — "
+            "command lines dispatched PLUS `repeat` loop iterations (across all "
+            "loops/branches). Charging loop iterations too stops a nested "
+            "`repeat` over an empty/directive-only body from hanging the bot; "
+            "the run aborts with an error when exceeded."
+        ),
+    },
+    "macro_recursion_limit": {
+        "default": 20,
+        "schema": {"type": "int"},
+        "desc": (
+            "Max depth of nested `!macro run` calls (a macro line that runs "
+            "another macro). Guards against self/mutually-recursive macros "
+            "exhausting the Python stack — the step limit can't, since each "
+            "`!macro run` starts with a fresh step budget. The run aborts with "
+            "an error when exceeded."
         ),
     },
     "side_hit_hitbox_mode": {

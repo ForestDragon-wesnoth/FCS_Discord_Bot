@@ -2316,6 +2316,49 @@ More shipped work (continuing the list above):
     less surface, or for hosts. The same "tighten reads for a fog match" lever as
     `command_access`. Default stays permissive; a fog GM opts into the lockdown.
 
+- **Audit-pass-20 (hands-on): macro runaway backstops — two DoS/crash fixes
+  (scenarios 555-556).** A by-hand sweep of the least-audited RECENT features
+  (container prims, inline `$()`, macro control flow, reveal_fog, named tables,
+  overlays, the Discord adapter) with behavioral harnesses. Verified CORRECT (no
+  change): the container/inventory prims (item_consume drop-at-0 / over-consume /
+  partial / custom field, var_add create-or-increment + non-numeric reject,
+  var_move deepcopy isolation between entities), status dispel/transfer (tag
+  dispel, max cap, consume-on-reject to an immune dest), transform/foreach/table/
+  reveal_fog smoke on a multi-tile board, reveal_fog serialization + footprint
+  `around`, the dice `kh0` guard (survived the roll_detail refactor), the inline
+  `$()` classification (drift guard + validate_arg_safe reject path) and the
+  raw_args opt-out set (ent/foreach/batch/run/macro/eval — exactly the meta
+  commands), the ATB selection math + death-mid-turn robustness, and the Discord
+  board/approval logic (pass-18's approval-match fix holds). Two real bugs in the
+  MACRO control-flow interpreter (both let a macro hang/crash the bot, defeating
+  the stated runaway backstop):
+  - **Nested `repeat` over an empty body bypassed macro_step_limit (HIGH).**
+    `_exec_macro` charged the step budget ONLY on `cmd` nodes, so a `repeat`
+    whose body emits no command (an empty or directive-only block) never touched
+    the budget. `repeat 1000 / repeat 1000 / end / end` ran 1e6 iterations (0.4s)
+    and a third nesting level (1e9) would hang the bot for minutes — exactly the
+    runaway macro_step_limit exists to stop. Fixed by charging one budget unit
+    PER `repeat` ITERATION (in the `for k in range(...)` loop), so total loop
+    work across all nesting is bounded by the limit regardless of body contents.
+    macro_step_limit's meaning is now "dispatches PLUS loop iterations"; its desc
+    updated. Tight legitimate loops are unaffected (default budget 10000).
+  - **Recursive macros overflowed the Python stack (HIGH → 💥).** A macro line
+    can `!macro run <other>`, and each `!macro run` allocated its OWN fresh step
+    budget — so a self-recursive macro (`loop` = `macro run loop`) or a mutually-
+    recursive pair recursed until `maximum recursion depth exceeded` (a caught
+    but ugly 💥, and a lot of wasted work). Actions guard this with a recursion
+    limit; macros had none. Fixed with a new `macro_recursion_limit` rule
+    (default 20) + a `MatchManager._macro_depth` counter (on the manager = the
+    dispatch stack, so it accumulates even if a macro line switches the active
+    match), incremented around each `!macro run`'s `_exec_macro` and restored in
+    `finally`. Beyond the limit the run aborts with a clean ❌, not a 💥. Legit
+    nesting (`top`→`mid`→`leaf`, 3 deep) and 30 SEQUENTIAL inner runs both still
+    work (depth returns to base between sequential cmds; resets between top-level
+    runs). NOTE for future sweeps: `!batch` CANNOT recurse this way (its
+    subcommands are literal text, no named indirection), but `!run <file>` on a
+    self-referencing file has the same unbounded-recursion shape — left as-is
+    (host-only disk I/O, far more exotic than a stored player-triggerable macro).
+
 - **Audit-pass-19 (external-report triage): summon regression + var_get default
   + harness hardening (scenario 554).** A second Opus instance found two bugs
   plus a harness blindspot; all verified and fixed:
