@@ -2316,6 +2316,61 @@ More shipped work (continuing the list above):
     less surface, or for hosts. The same "tighten reads for a fog match" lever as
     `command_access`. Default stays permissive; a fog GM opts into the lockdown.
 
+- **Audit-pass-21 (hands-on): CLEAN PASS — no bug found.** A by-hand sweep
+  targeting the recent-feature surface NOT already drilled in pass-20 (behavioral
+  harnesses, no agent swarm); every check exact, no code change. Recording the
+  verified combos so future passes can skip re-grinding them:
+  1. **Container-prim vs clamp/vital interaction** — `var_add` on a clamped var
+     RETURNS the pre-clamp computed value while STORING the clamped value; this
+     is the SAME convention as `var_set` (both return the requested value, not
+     the stored one) — NOT a bug (re-read via `var_get` for the stored value).
+     `var_add`/`item_consume` route through `write_var`, so pass-18's vital-write
+     coercion + the clamp system apply correctly (a write above max_hp clamps).
+  2. **`ARG_SAFE_MATCH_FUNCS` classification is genuinely side-effect-free** —
+     spot-audited the suspicious "safe" entries (`entity_snapshot` = pure
+     template builder, `var_pick_random`/`roll_table`/`table_roll` = read-only
+     except advancing the seeded RNG, which is intended/documented). No
+     mis-classified mutator is reachable from inline `$()`.
+  3. **`render_scene` vs `_render_ascii_impl` have NOT drifted** — both entity
+     passes gate on `is_alive` + the SAME `entity_visible_to` / `tile_visible_to`
+     / `zone_visible_to` / `corpse_visible_to` / `_fog_terrain_visible`
+     predicates, skip the same glued/region/mounted parts, and are disguise-
+     gated identically (the one deliberate difference: the scene region-part pass
+     also honors a custom SPRITE, ASCII only a custom glyph). Overlay placements
+     (`_emit_entity_placement`) are disguise-gated (no real-status-FX leak to an
+     enemy POV) and follow the entity footprint/mode.
+  4. **transform → save/load → revert round-trip** — a captured statblock stashed
+     to a caller-chosen var survives `to_dict`/`from_dict` (form, part subtree,
+     stash var all intact); revert on the RELOADED match restores the original
+     name/hp/footprint and its inventory, and drops the transformed form's parts.
+  5. **QoL commands** — `!find sort:<var>[:desc] show:<csv>` (missing var → `—`,
+     sorts last; dotted paths), `!dist` (entity/cell/mixed, all metrics,
+     footprint nearest-cell gap, `los`), `!roll` (NdM/kh/kl/explode, bad input →
+     clean ❌). No crashes.
+  6. **`roll_table_pick`** — weights validated (>=0, non-numeric → ❌), 0-weight
+     filtered, cumulative selection sound (harmless dead `return total` after the
+     final return; not worth a fix).
+  7. **SpriteLoader path-traversal guard** — every `..`/absolute/mixed-separator
+     key and non-PNG extension resolves to None (blocked); legit keys stay inside
+     the sprites folder. (Defense-in-depth; sprites are server-side-only, no
+     inbound upload path exists.)
+  8. **reveal_fog** — a `turns=N` temporary reveal shows terrain AND live
+     entities, then EXPIRES on the right round and is pruned from `fog_reveals`; a
+     permanent reveal persists across rounds. Serializes + is footprint-aware
+     (`around <eid>`).
+  9. **Choice-replay through batch/foreach** — an action using `choose()`
+     (transactional replay+rollback per choice) invoked inside `!batch` and
+     `!foreach` with pre-supplied `answer=` tokens: a var write BEFORE the choice
+     applies EXACTLY ONCE per invocation despite the replay, and the batch/foreach
+     dispatch isn't corrupted by the rollback.
+  Also re-confirmed clean by inspection: the Discord adapter board/approval/image
+  logic (pass-18's per-match approval fix holds) and status dispel/transfer
+  (tag dispel, max cap, consume-on-reject to an immune dest). NOTE for future
+  harness authors: hp is clamped to `[0, max_hp]` and max_hp defaults to the
+  spawn hp — so a bare `!ent add x X 30 ...` caps hp at 30; raise max_hp first or
+  your "hp write is broken" repro is really the clamp working (this cost me a
+  false lead this pass).
+
 - **Audit-pass-20 (hands-on): macro runaway backstops — two DoS/crash fixes
   (scenarios 555-556).** A by-hand sweep of the least-audited RECENT features
   (container prims, inline `$()`, macro control flow, reveal_fog, named tables,
