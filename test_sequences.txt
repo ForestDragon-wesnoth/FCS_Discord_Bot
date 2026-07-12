@@ -14359,3 +14359,52 @@ repeats `ent hp g $(0-2)` three times (100 → 94). Legitimate macro NESTING und
 the recursion limit still works: `top` → `mid` → `leaf` is 3 deep (well under the
 default 20) and sets `touched=1`; the depth counter resets between top-level
 runs, so running `top` a second time (after zeroing) sets `touched=1` again.
+
+
+SCENARIO 557 — foreach: multiple commands per entity + $i/$n tokens + one undo
+--------------------------------------------------------------------------------
+
+!match new mfe ForeachMulti 12 12
+!match use mfe
+!ent add a A 30 1 1 5
+!ent set_var a team red
+!ent add b B 30 3 3 8
+!ent set_var b team red
+!ent add c C 30 5 5 3
+!ent set_var c team blue
+!foreach team=red ; ent set_var $id marked 1 ; ent set_var $id idx $i ; ent set_var $id total $n
+!ent dump a
+!ent dump b
+!ent dump c
+!history undo command
+!ent dump a
+
+Expected: `!foreach <selector> ; <cmd1> ; <cmd2> ; ...` runs MULTIPLE commands
+per matched entity — all commands for one entity before the next (per-entity
+grouping). Here both red-team entities (a, b) get `marked=1`, `idx=$i` (their
+1-based position in the matched set — turn order by initiative, so b=init8 is
+idx 1 and a=init5 is idx 2), and `total=$n=2`. The blue entity c is NOT matched
+(no marked/idx). The whole multi-command sweep is ONE undo entry, so a single
+`!history undo command` reverts every write across every entity (a loses marked,
+idx, total). A single-command foreach (the old form) is unchanged.
+
+SCENARIO 558 — foreach: $team token, $id/$i disambiguation, empty-group skip
+--------------------------------------------------------------------------------
+
+!match new mft ForeachTokens 10 10
+!match use mft
+!ent add a A 30 1 1 5
+!ent set_var a team red
+!ent add c C 30 5 5 3
+!ent set_var c team blue
+!foreach hp>0 ; ent set_var $id myteam $team
+!foreach team=blue ; ent set_var $id combo $id ; ; 
+!ent dump a
+!ent dump c
+
+Expected: the `$team` token substitutes each entity's team var (a → `red`, c →
+`blue`; empty string when an entity has no team). The single-pass substitution
+disambiguates overlapping tokens: `$id` is NOT eaten by the `$i` prefix, so
+`ent set_var $id combo $id` writes `combo=c` for c (not `combo=` + leftover).
+Empty command groups from a doubled/trailing bare `;` are skipped (matching
+`!batch`), so the trailing `; ;` is a no-op rather than an error.

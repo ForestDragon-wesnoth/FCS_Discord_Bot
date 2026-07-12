@@ -1772,6 +1772,27 @@ More shipped work (continuing the list above):
     gate. Helpers `_foreach_subst` + the `foreach_cmd` handler in vtt_commands.py.
     FUTURE the user might want: multiple commands per entity (extra `;`), a
     read-only `!foreach` variant, more substitution tokens.
+  - **`!foreach` upgrades — SHIPPED (scenarios 557-558).** Two of the three
+    flagged follow-ups above. (1) **Multiple commands per entity:** after the
+    first bare `;` (selector separator), further bare `;` tokens split the tail
+    into MULTIPLE commands; all commands for one entity run before the next
+    (PER-ENTITY grouping, so a multi-step recipe reads top-to-bottom). Still ONE
+    undo entry (the whole sweep is snapshotted; inner commands via
+    `dispatch_no_snapshot`). Empty groups from a doubled/leading/trailing `;`
+    are dropped (like `!batch`). New helper `_split_foreach_commands`. (2) **More
+    substitution tokens:** `$team` (the entity's team var, "" if none), `$i`
+    (1-based index in the matched set, TURN-ORDER order), `$n` (total match
+    count), alongside the existing `$id`/`$name`/`$x`/`$y`. `_foreach_subst`
+    stays a SINGLE-pass `re.sub` with the alternation ordered longest-first
+    (`$name`/`$team`/`$id` before the `$i`/`$n` prefixes) so a substituted value
+    containing a token isn't re-expanded and `$id` isn't eaten by `$i`. `$x`/`$y`
+    remain the ANCHOR cell for a multi-tile entity (the addressing convention);
+    the near:/within: selector stays footprint-aware. Host-gated as before (the
+    inner ungated dispatch is only reached after foreach passes the top gate —
+    no player bypass). The DEFERRED third piece — a player-usable READ-ONLY
+    `!foreach` — was intentionally left out (it overlaps `!find show:/sort:`,
+    which already gives players per-entity readouts, and it adds an
+    access-gating surface worth a design decision first).
 - **Audit-pass-4 fixes: multi-tile interaction sweep (scenarios 491-492).** A
   fourth interaction-bug sweep, this time hunting anchor-only assumptions in
   OLDER features against multi-tile entities (three read-only survey agents
