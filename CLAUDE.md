@@ -1772,6 +1772,27 @@ More shipped work (continuing the list above):
     gate. Helpers `_foreach_subst` + the `foreach_cmd` handler in vtt_commands.py.
     FUTURE the user might want: multiple commands per entity (extra `;`), a
     read-only `!foreach` variant, more substitution tokens.
+  - **`!foreach` upgrades — SHIPPED (scenarios 557-558).** Two of the three
+    flagged follow-ups above. (1) **Multiple commands per entity:** after the
+    first bare `;` (selector separator), further bare `;` tokens split the tail
+    into MULTIPLE commands; all commands for one entity run before the next
+    (PER-ENTITY grouping, so a multi-step recipe reads top-to-bottom). Still ONE
+    undo entry (the whole sweep is snapshotted; inner commands via
+    `dispatch_no_snapshot`). Empty groups from a doubled/leading/trailing `;`
+    are dropped (like `!batch`). New helper `_split_foreach_commands`. (2) **More
+    substitution tokens:** `$team` (the entity's team var, "" if none), `$i`
+    (1-based index in the matched set, TURN-ORDER order), `$n` (total match
+    count), alongside the existing `$id`/`$name`/`$x`/`$y`. `_foreach_subst`
+    stays a SINGLE-pass `re.sub` with the alternation ordered longest-first
+    (`$name`/`$team`/`$id` before the `$i`/`$n` prefixes) so a substituted value
+    containing a token isn't re-expanded and `$id` isn't eaten by `$i`. `$x`/`$y`
+    remain the ANCHOR cell for a multi-tile entity (the addressing convention);
+    the near:/within: selector stays footprint-aware. Host-gated as before (the
+    inner ungated dispatch is only reached after foreach passes the top gate —
+    no player bypass). The DEFERRED third piece — a player-usable READ-ONLY
+    `!foreach` — was intentionally left out (it overlaps `!find show:/sort:`,
+    which already gives players per-entity readouts, and it adds an
+    access-gating surface worth a design decision first).
 - **Audit-pass-4 fixes: multi-tile interaction sweep (scenarios 491-492).** A
   fourth interaction-bug sweep, this time hunting anchor-only assumptions in
   OLDER features against multi-tile entities (three read-only survey agents
@@ -2315,6 +2336,83 @@ More shipped work (continuing the list above):
     covered too). No-op on an open match (no owner), an auto-approve/identity-
     less surface, or for hosts. The same "tighten reads for a fog match" lever as
     `command_access`. Default stays permissive; a fog GM opts into the lockdown.
+
+- **Audit-pass-23 (hands-on): CLEAN PASS — no bug found.** A by-hand sweep with
+  exhaustive serialization checks, an event-bus review, broad input fuzzing, and
+  numeric primitive re-verification; no code change. Verified combos (so future
+  passes can skip re-grinding):
+  1. **Serialization is airtight.** Built a match populating ~all 46 serialized
+     fields (nested-var entities, multi-tile + parts + segments, status defs with
+     overlay sprites + tags + modifiers, anchored zone, tiles, groups, aliases,
+     macros, tables, watchers, team data + team passives, fog + memory + reveals,
+     colors, layers, legend, border, render_mode, background, viewport). `to_dict
+     == to_dict(from_dict(to_dict))` idempotent; and a LOAD-SIDE ISOLATION test
+     (rebuild from a retained snapshot dict, mutate every nested structure on the
+     loaded match IN PLACE, confirm the snapshot dict is untouched) passed — so
+     `from_dict` deep-copies nested data, the passes-5/6/7/11 corruption class is
+     fully closed.
+  2. **Event bus (`emit_event`) is careful** — global handlers fire once; a
+     directed event also fires the target's team + own handlers with existence
+     re-checks (the passes-7/8 ghost-passive guards); `_event_stack` push/pop in
+     try/finally; recursion capped by `event_recursion_limit` with a
+     warning-latch drained at the outermost emit.
+  3. **Input fuzzing (58 inputs) all handled cleanly (❌, never 💥).** 28
+     numeric-arg commands fed non-numeric/huge/negative values (`!map resize/pan/
+     center/view/border`, `!zone shift/fill`, `!tile line/fill`, `!part segment`,
+     `!status apply/force/counter`, `!team add`, `!reveal_fog at/around`, `!ent
+     hp/init/tp/add`, `!dist`, `!roll`, …) — the pass-18 int()-guarding holds
+     broadly. 30 formula/structural edges (malformed passive/gpassive/func/clamp/
+     status-tick/watch/action bodies, empty/vital-nesting var paths, vital
+     deletion, ops on missing entities, self-referential alias/macro, a
+     200-deep paren expr) — all clean.
+  4. **Dice parser edge cases correct** — `1d1!`/`100d1!` don't infinite-loop
+     (explosion skipped for sides==1), `0d6` is a clean FormulaError, `d6`
+     implicit-1-die, combined suffixes (`2d6!kh1`, `3d6!kl1`), `kh` cap > dice
+     count, negative groups — all exact.
+  5. **Modifier fold is exact for the combat foundation** — status-instance +
+     team + equipped sources aggregate together with correct `[source]` labels;
+     `((10+5)+2)×(1+0.5)) = 25.5` to the decimal; a `modifier_stat_caps
+     strength:0:20` rule (set before match creation so it's in the rules
+     snapshot) clamps 110→20. NOTE: a status-instance modifier must be set via
+     `!ent status <id> set <name> modifiers.<k>.<field> ...` (the status
+     instance), NOT `!ent set_var <id> status.<name>...` (which writes a var
+     named `status`, a different location — a false lead this pass).
+  This is the third clean pass in the 20s (with 21); the harness-testable core +
+  serialization + command-input robustness are solid. Likeliest remaining defect
+  surface stays genuinely new code (as pass-22 showed — the bug was in the
+  freshest change) and the Discord adapter.
+
+- **Audit-pass-22 (hands-on): two "non-string → string-join" crash fixes
+  (scenarios 558-559).** A by-hand sweep that (correctly) started with the
+  freshest code — the just-added `!foreach` upgrades — and found a bug there,
+  then a second of the SAME class elsewhere. Both are `💥`-level crashes where a
+  non-string value reached a `", ".join(...)` / `re.sub` replacement that
+  assumed strings:
+  - **`_foreach_subst` `$team` (introduced by the foreach-upgrade change).** The
+    `$team` token substituted the entity's team var without str-coercion (unlike
+    `$i`/`$n`/`$x`/`$y`, which were `str()`d). A NUMERIC team var (`!ent set_var
+    x team 5`) made the `re.sub` replacement lambda return an int →
+    "sequence item 0: expected str instance, int found" (💥). Fixed by
+    str()-coercing the replacement in the lambda (defensive for every token, not
+    just `$team`). Regression added to scenario 558 (a numeric-team entity).
+  - **`_tmpl_fmt_value` non-string DICT KEYS (pre-existing).** The `{placeholder}`
+    template value formatter (used by `entity_line_format` / status-line / part-
+    suffix templates) joined a dict var's keys with `", ".join(keys)` — but the
+    sibling list branch already `str()`d its items, and the dict branch didn't.
+    A formula can write a dict with non-string keys (`entity[a].loot = {1: 5}`);
+    referencing that var in a template placeholder (e.g. `entity_line_format`
+    `{loot}`) then crashed `!list`/`!state` with the same "expected str instance"
+    💥. Fixed to `", ".join(str(k) for k in keys)` in both the truncated (>6) and
+    full branches, mirroring the list branch. Scenario 559.
+  Same-class sites deliberately LEFT (verified non-crashing or pathological-only):
+  `!find sort:<var>` is type-safe by construction (a `(rank, number, string)`
+  sort-key tuple, so mixed-type var values across entities never raise); the
+  rule-name / slot-name joins (`logic.py` ~2545/6387) only take non-strings if a
+  GM pathologically builds `slots = {1: ...}` with integer keys, which is far
+  outside normal authoring. NOTE for future harness authors: the fastest bug this
+  pass came from auditing the code I'd JUST written — fresh code is the highest-
+  yield target, and a numeric team/var is a realistic GM input that scenarios
+  rarely exercise.
 
 - **Audit-pass-21 (hands-on): CLEAN PASS — no bug found.** A by-hand sweep
   targeting the recent-feature surface NOT already drilled in pass-20 (behavioral
