@@ -2337,6 +2337,38 @@ More shipped work (continuing the list above):
     less surface, or for hosts. The same "tighten reads for a fog match" lever as
     `command_access`. Default stays permissive; a fog GM opts into the lockdown.
 
+- **Audit-pass-22 (hands-on): two "non-string → string-join" crash fixes
+  (scenarios 558-559).** A by-hand sweep that (correctly) started with the
+  freshest code — the just-added `!foreach` upgrades — and found a bug there,
+  then a second of the SAME class elsewhere. Both are `💥`-level crashes where a
+  non-string value reached a `", ".join(...)` / `re.sub` replacement that
+  assumed strings:
+  - **`_foreach_subst` `$team` (introduced by the foreach-upgrade change).** The
+    `$team` token substituted the entity's team var without str-coercion (unlike
+    `$i`/`$n`/`$x`/`$y`, which were `str()`d). A NUMERIC team var (`!ent set_var
+    x team 5`) made the `re.sub` replacement lambda return an int →
+    "sequence item 0: expected str instance, int found" (💥). Fixed by
+    str()-coercing the replacement in the lambda (defensive for every token, not
+    just `$team`). Regression added to scenario 558 (a numeric-team entity).
+  - **`_tmpl_fmt_value` non-string DICT KEYS (pre-existing).** The `{placeholder}`
+    template value formatter (used by `entity_line_format` / status-line / part-
+    suffix templates) joined a dict var's keys with `", ".join(keys)` — but the
+    sibling list branch already `str()`d its items, and the dict branch didn't.
+    A formula can write a dict with non-string keys (`entity[a].loot = {1: 5}`);
+    referencing that var in a template placeholder (e.g. `entity_line_format`
+    `{loot}`) then crashed `!list`/`!state` with the same "expected str instance"
+    💥. Fixed to `", ".join(str(k) for k in keys)` in both the truncated (>6) and
+    full branches, mirroring the list branch. Scenario 559.
+  Same-class sites deliberately LEFT (verified non-crashing or pathological-only):
+  `!find sort:<var>` is type-safe by construction (a `(rank, number, string)`
+  sort-key tuple, so mixed-type var values across entities never raise); the
+  rule-name / slot-name joins (`logic.py` ~2545/6387) only take non-strings if a
+  GM pathologically builds `slots = {1: ...}` with integer keys, which is far
+  outside normal authoring. NOTE for future harness authors: the fastest bug this
+  pass came from auditing the code I'd JUST written — fresh code is the highest-
+  yield target, and a numeric team/var is a realistic GM input that scenarios
+  rarely exercise.
+
 - **Audit-pass-21 (hands-on): CLEAN PASS — no bug found.** A by-hand sweep
   targeting the recent-feature surface NOT already drilled in pass-20 (behavioral
   harnesses, no agent swarm); every check exact, no code change. Recording the

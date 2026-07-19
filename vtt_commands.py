@@ -537,9 +537,13 @@ def _tmpl_fmt_value(v: Any) -> str:
         if not v:
             return ""
         keys = list(v.keys())
+        # str()-coerce keys: a formula can write a dict with non-string keys
+        # (e.g. `entity[x].loot = {1: 'a'}`), and joining an int key raised
+        # "expected str instance" (a 💥) when such a var fed a template
+        # placeholder. Mirrors the list branch below, which already str()s.
         if len(keys) > 6:
-            return "{" + ", ".join(keys[:6]) + f", ... ({len(keys)} total)" + "}"
-        return "{" + ", ".join(keys) + "}"
+            return "{" + ", ".join(str(k) for k in keys[:6]) + f", ... ({len(keys)} total)" + "}"
+        return "{" + ", ".join(str(k) for k in keys) + "}"
     if isinstance(v, (list, tuple, set)):
         items = list(v)
         if not items:
@@ -4453,11 +4457,13 @@ def _foreach_subst(tok: str, eid: str, name: str, x: int, y: int,
     reverse.) Tokens: $id, $name, $x, $y, $team (the entity's team, empty if
     none), $i (1-based index within the matched set), $n (total match count).
     The alternation lists longer tokens first so `$id`/`$name` win over the
-    `$i`/`$n` prefixes."""
-    repl = {"$id": eid, "$name": name, "$x": str(x), "$y": str(y),
-            "$team": team or "", "$i": str(i), "$n": str(n)}
+    `$i`/`$n` prefixes. Every replacement is str()-coerced: a team var (and in
+    principle an id/name) need not be a string — a numeric `team` would
+    otherwise make re.sub raise "expected str instance"."""
+    repl = {"$id": eid, "$name": name, "$x": x, "$y": y,
+            "$team": ("" if team is None else team), "$i": i, "$n": n}
     return re.sub(r"\$name|\$team|\$id|\$x|\$y|\$i|\$n",
-                  lambda m: repl[m.group(0)], tok)
+                  lambda m: str(repl[m.group(0)]), tok)
 
 
 def _split_foreach_commands(cmd_tokens: List[str]) -> List[List[str]]:
