@@ -1049,8 +1049,12 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "automatically RESUMES (re-stamps around the anchor) if that "
             "entity is revived from its corpse or that part is healed above 0. "
             "Note: a true despawn (`!ent remove`) under 'suspend' leaves an "
-            "inert bound zone that won't resume (nothing to revive) — re-anchor "
-            "or delete it manually."
+            "inert bound zone with nothing to revive — re-anchor or delete it "
+            "manually. It is bound by entity ID, so if a LATER entity is "
+            "created with that same id, the suspended aura resumes around THAT "
+            "entity the first time it moves (ids are the only entity identity "
+            "the engine has). Avoid reusing the id of a despawned anchor, or "
+            "use 'delete'/'freeze' instead."
         ),
     },
     # ---- mounts / vehicles ----
@@ -14119,6 +14123,18 @@ class MatchManager:
             oe = src.entities[oid]
             ne = Entity.from_dict(oe.to_dict())
             ne.id = idmap[oid]
+            # Mount linkage does NOT survive a cross-match copy/transfer: the
+            # vehicle lives in the SOURCE match (transferring a vehicle ejects
+            # its riders, so the pair can't travel together). Carrying a stale
+            # `mounted_on` into the destination leaves a dangling reference that
+            # silently latches onto any entity that later takes that id there —
+            # the rider would read as mounted on a vehicle with no such slot,
+            # bypassing slot existence/capacity, the condition gate and
+            # on_mounted, and vanish from the map via the hidden-rider skip
+            # surface. Same strip the corpse snapshot and `!ent clone` already
+            # do; the copy arrives dismounted and can mount for real.
+            ne.mounted_on = None
+            ne.mount_slot = None
             if ne.part_of:
                 ne.part_of = idmap.get(ne.part_of, ne.part_of)
             # Segment chains: remap the `__follows` back-pointer (an entity id)
