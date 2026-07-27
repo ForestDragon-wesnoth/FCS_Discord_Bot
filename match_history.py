@@ -346,6 +346,21 @@ class MatchHistory:
             del self.round_saves[:excess]
 
     def _prune_turns(self, match: "Match") -> None:
+        # ATB: rounds are disabled, so match.round_number never advances and a
+        # round-keyed window would retain EVERY turn snapshot for the whole
+        # session (each one a full match state). Prune by the turn counter
+        # instead — the only clock that advances under ATB.
+        if match.rules.get("atb_enabled"):
+            turns = int(match.rules.get("autosave_turn_retention_turns", 20))
+            if turns < 0:
+                return
+            if turns == 0:
+                self.turn_saves.clear()
+                return
+            threshold = self._turn_index - turns + 1
+            self.turn_saves = [s for s in self.turn_saves
+                               if s.turn_index_at_snapshot >= threshold]
+            return
         rounds = int(match.rules.get("autosave_turn_retention_rounds", 3))
         if rounds < 0:
             return

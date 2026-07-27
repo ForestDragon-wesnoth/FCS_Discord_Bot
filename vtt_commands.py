@@ -537,9 +537,13 @@ def _tmpl_fmt_value(v: Any) -> str:
         if not v:
             return ""
         keys = list(v.keys())
+        # str()-coerce keys: a formula can write a dict with non-string keys
+        # (e.g. `entity[x].loot = {1: 'a'}`), and joining an int key raised
+        # "expected str instance" (a 💥) when such a var fed a template
+        # placeholder. Mirrors the list branch below, which already str()s.
         if len(keys) > 6:
-            return "{" + ", ".join(keys[:6]) + f", ... ({len(keys)} total)" + "}"
-        return "{" + ", ".join(keys) + "}"
+            return "{" + ", ".join(str(k) for k in keys[:6]) + f", ... ({len(keys)} total)" + "}"
+        return "{" + ", ".join(str(k) for k in keys) + "}"
     if isinstance(v, (list, tuple, set)):
         items = list(v)
         if not items:
@@ -4444,31 +4448,62 @@ async def reveal_fog_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 # Bulk-apply: run one command for every entity matching a !find selector.
 # The selector reuses the exact find-predicate grammar; the command after
 # the bare `;` runs once per match with per-entity tokens substituted.
-def _foreach_subst(tok: str, eid: str, name: str, x: int, y: int) -> str:
-    """Substitute the per-entity tokens ($id/$name/$x/$y) in one command token
-    in a SINGLE pass, so a substituted value that itself contains another token
-    (e.g. an id containing `$x`, or a name containing `$id`) is NOT
-    re-substituted. (Sequential str.replace only guarded `$name`-contains-token,
-    not the reverse.)"""
-    repl = {"$id": eid, "$name": name, "$x": str(x), "$y": str(y)}
-    return re.sub(r"\$name|\$id|\$x|\$y", lambda m: repl[m.group(0)], tok)
+def _foreach_subst(tok: str, eid: str, name: str, x: int, y: int,
+                   team: str = "", i: int = 0, n: int = 0) -> str:
+    """Substitute the per-entity tokens in one command token in a SINGLE pass,
+    so a substituted value that itself contains another token (e.g. an id
+    containing `$x`, or a name containing `$id`) is NOT re-substituted.
+    (Sequential str.replace only guarded `$name`-contains-token, not the
+    reverse.) Tokens: $id, $name, $x, $y, $team (the entity's team, empty if
+    none), $i (1-based index within the matched set), $n (total match count).
+    The alternation lists longer tokens first so `$id`/`$name` win over the
+    `$i`/`$n` prefixes. Every replacement is str()-coerced: a team var (and in
+    principle an id/name) need not be a string — a numeric `team` would
+    otherwise make re.sub raise "expected str instance"."""
+    repl = {"$id": eid, "$name": name, "$x": x, "$y": y,
+            "$team": ("" if team is None else team), "$i": i, "$n": n}
+    return re.sub(r"\$name|\$team|\$id|\$x|\$y|\$i|\$n",
+                  lambda m: str(repl[m.group(0)]), tok)
+
+
+def _split_foreach_commands(cmd_tokens: List[str]) -> List[List[str]]:
+    """Split the post-selector token list into one or more command groups on a
+    bare `;` token (a literal semicolon argument would be quoted `";"`, which
+    shlex strips the quotes from — so a real `;` token here is always a
+    separator). Empty groups (from a doubled/leading/trailing `;`) are dropped,
+    matching `!batch` semantics."""
+    groups: List[List[str]] = []
+    cur: List[str] = []
+    for t in cmd_tokens:
+        if t == ";":
+            if cur:
+                groups.append(cur)
+            cur = []
+        else:
+            cur.append(t)
+    if cur:
+        groups.append(cur)
+    return groups
 
 
 @registry.command(
     "foreach",
     raw_args=True,
-    usage="!foreach <predicate> [<predicate> ...] ; <command> [args...]",
+    usage="!foreach <predicate> [<predicate> ...] ; <command> [; <command> ...]",
     desc=(
-        "Run one command for every entity matching a `!find` selector. "
+        "Run one or more commands for every entity matching a `!find` selector. "
         "The selector (same predicates as `!find`: `var=value`, "
         "`status:NAME`, `group:NAME`, `action:NAME`, `near:<eid>:<radius>`, "
-        "`within:<x>:<y>:<radius>`) comes before a bare `;`; the command "
-        "after it runs once per matching entity with `$id`/`$name`/`$x`/"
-        "`$y` substituted. Matches are resolved BEFORE any command runs, "
-        "so mutating the board mid-loop won't change the target set. The "
-        "whole sweep is ONE undo entry; a per-entity `❌` is reported and "
-        "the loop continues. Example: "
-        "`!foreach team=red near:boss:2 ; ent damage $id 5`."
+        "`within:<x>:<y>:<radius>`) comes before the first bare `;`. After it, "
+        "one OR MORE commands (separated by further bare `;`) run once per "
+        "matching entity, all commands for one entity before moving to the "
+        "next. Per-entity tokens substituted in each command: `$id`, `$name`, "
+        "`$x`, `$y`, `$team` (the entity's team), `$i` (1-based index in the "
+        "matched set), `$n` (total match count). Matches are resolved BEFORE "
+        "any command runs, so mutating the board mid-loop won't change the "
+        "target set. The whole sweep is ONE undo entry; a per-entity `❌` is "
+        "reported and the loop continues. Example: "
+        "`!foreach team=red near:boss:2 ; ent damage $id 5 ; ent set_var $id hit $i`."
     ),
 )
 async def foreach_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -4485,7 +4520,8 @@ async def foreach_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     cmd_tokens = args[sep + 1:]
     if not sel_tokens:
         return await ctx.send("❌ foreach selector is empty (nothing before `;`).")
-    if not cmd_tokens:
+    commands = _split_foreach_commands(cmd_tokens)
+    if not commands:
         return await ctx.send("❌ foreach command is empty (nothing after `;`).")
     m = active_match(mgr, ctx)
     try:
@@ -4498,12 +4534,18 @@ async def foreach_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send("No entities match; nothing to do.")
     # Snapshot the substitution values up front so the target set is fixed
     # even if the per-entity commands move / kill / spawn entities.
-    targets = [(e.id, e.name, e.x, e.y) for e in hits]
-    noun = "entity" if len(targets) == 1 else "entities"
-    await ctx.send(f"foreach: applying to {len(targets)} {noun}...")
-    for eid, name, x, y in targets:
-        sub = [_foreach_subst(t, eid, name, x, y) for t in cmd_tokens]
-        await registry.dispatch_no_snapshot(sub[0], sub[1:], ctx, mgr)
+    targets = [(e.id, e.name, e.x, e.y, (e.team or "")) for e in hits]
+    total = len(targets)
+    noun = "entity" if total == 1 else "entities"
+    ncmd = f"{len(commands)} command(s) each" if len(commands) > 1 else "1 command"
+    await ctx.send(f"foreach: applying {ncmd} to {total} {noun}...")
+    for i, (eid, name, x, y, team) in enumerate(targets, 1):
+        # All commands for one entity run before the next entity (per-entity
+        # grouping), so a multi-step per-entity recipe reads top-to-bottom.
+        for cmd in commands:
+            sub = [_foreach_subst(t, eid, name, x, y, team, i, total)
+                   for t in cmd]
+            await registry.dispatch_no_snapshot(sub[0], sub[1:], ctx, mgr)
 
 
 @registry.command("state", access="all", usage="!state [full]", desc="Show match summary, entities, and map from this channel's POV. `!state full` (host-gated) forces the omniscient view.")
