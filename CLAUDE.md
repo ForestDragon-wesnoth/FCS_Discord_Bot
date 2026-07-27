@@ -2337,6 +2337,59 @@ More shipped work (continuing the list above):
     less surface, or for hosts. The same "tighten reads for a fog match" lever as
     `command_access`. Default stays permissive; a fog GM opts into the lockdown.
 
+- **Audit-pass-25 (hands-on): the "dangling relational id" bug CLASS — transfer
+  phantom mount fixed (scenario 561).** Entities reference each other by BARE ID
+  (`mounted_on`, `part_of`, `__follows`, a zone's `anchor`). Any path that moves
+  or copies an entity across a boundary must REMAP or STRIP those ids, or they
+  dangle — and because an id is the engine's ONLY notion of entity identity, a
+  dangling id silently LATCHES onto whatever later takes that id. Two prior
+  fixes were instances of this (pass-6 corpse snapshot strips mounted_on;
+  pass-18 `!ent clone` strips it); this pass found the remaining hole and a
+  documentation error.
+  - **`copy_entity` (`!ent transfer` / `!ent copy`) carried mount linkage across
+    matches (REAL, FIXED).** It remapped `part_of` and `__follows` but left
+    `mounted_on`/`mount_slot` pointing at the SOURCE match's vehicle. The
+    transferred rider looked harmless at first (`is_mounted` defensively returns
+    False when the host is absent), but the stale id persisted and SERIALIZED —
+    so the moment the destination gained any entity with that id (a summon, a
+    later transfer, a plain `!ent add`), the rider read as mounted on it. Verified
+    harm: a rider "riding" an entity with NO `slots` var at all — bypassing slot
+    existence, capacity, the slot `condition` gate and the on_mounted hook — and
+    disappearing from the map/occupancy via the hidden-rider skip surface. Fixed
+    by stripping both fields in `copy_entity`, matching the corpse/clone paths.
+    Transferring a VEHICLE already ejects its riders (`_release_riders` via
+    `Entity.remove`), so a rider and its vehicle can never travel together —
+    arriving dismounted is the consistent outcome. Applies to `move=True`
+    (transfer) and `move=False` (copy) alike.
+  - **Suspended aura + id reuse: the DOCUMENTATION was wrong (amended, behavior
+    left).** The `anchored_zone_on_anchor_loss` rule desc and this file both
+    claimed a true despawn under `suspend` "leaves an inert bound zone that won't
+    resume (nothing to revive)". Not true: the binding is by ID, so if a later
+    entity is created with the despawned anchor's id, the suspended aura RESUMES
+    around that unrelated entity the first time it moves (`_restamp_anchors_for`
+    on `fire_entity_moved`). Verified. Left the BEHAVIOR as-is (there is no
+    entity identity beyond the id, so distinguishing "same id, different entity"
+    would need a new identity concept — a design call, not a bug fix) and
+    corrected both docs per the standing "ambiguous wording MUST be amended"
+    rule. Flag to the user if they'd rather change the semantics.
+  - Verified CORRECT in the same sweep (no change): **scheduled effects** —
+    `schedule_on` fires at the right turn in BOTH round mode and ATB (it's
+    turn-based, so ATB is fine), entity removal drops its pending schedules,
+    `cancel_schedule` works, schedules serialize, and round `schedule()` raises
+    a clean pointer-to-`schedule_on` error under ATB. **The access gate /
+    approval queue** (hand-verified for the first time, previously only
+    agent-checked): a non-host's mutating command is QUEUED not executed, and
+    there is NO bypass via `!batch`, `!foreach`, `!eval`, or `!macro` (each is
+    gated at the top level before its inner ungated dispatch); approve
+    re-dispatches with host authority, deny drops it, read-only subcommands pass
+    for players, and `!map full` is correctly elevated by ELEVATED_ARGS.
+    **Action transactional rollback** — an action that writes vars, damages hp,
+    applies a status, calls `damage_part`, summons an entity and emits an event
+    then `fail()`s reverts ALL of it (entity count included); a failing NESTED
+    action rolls back its own effects while the outer continues (the GM checks
+    `use_action`'s result if they want abort-on-failure); the recursion limit (8)
+    errors cleanly rather than crashing; a succeeding action commits.
+
 - **Audit-pass-24 (hands-on): the "round-keyed logic breaks under ATB" bug CLASS
   (scenario 560).** Drilled the history/undo subsystem (`match_history.py`, never
   hand-audited before) and found a defect class worth remembering: **ATB disables

@@ -14467,3 +14467,36 @@ Round-based play is unchanged (still uses the _rounds rule). The retained
 snapshots still work: `!history undo turn` reverts to the start of the previous
 turn, dropping the `marker` var that was set after it. -1 = unlimited, 0 =
 disable turn autosaves, matching the round rule's semantics.
+
+
+SCENARIO 561 — cross-match transfer/copy strips mount linkage (no phantom re-seat)
+--------------------------------------------------------------------------------
+
+!match new tsrc TSrc 10 10
+!match use tsrc
+!ent add car Car 60 2 2 5
+!ent set_var car slots.seat.capacity 1
+!ent add rider Rider 20 4 4 6
+!mount rider car seat
+!match new tdst TDst 10 10
+!match use tsrc
+!ent transfer rider tdst 5 5
+!match use tdst
+!ent add car SomeOtherCar 99 8 8 4
+!ent dump rider
+!mount list car
+!list
+
+Expected: a MOUNTED rider carried its `mounted_on`/`mount_slot` into the
+destination match, where the vehicle doesn't exist — a dangling reference. The
+harm: the stale id silently latched onto any entity that LATER took that id
+there (here an unrelated `SomeOtherCar` with no `slots` var at all), so the
+rider read as mounted on it — bypassing slot existence, capacity, the slot
+`condition` gate and the on_mounted hook — and vanished from the map via the
+hidden-rider skip surface. `copy_entity` (behind `!ent transfer` and `!ent
+copy`) now strips both fields, the same way the corpse snapshot and `!ent clone`
+already do. The transferred rider arrives DISMOUNTED: `!ent dump rider` shows no
+mount, `!mount list` shows no riders on the new `car`, and the rider renders and
+occupies its cell normally. Transferring a VEHICLE instead ejects its riders in
+the source (mount_on_host_death / _release_riders), so a rider and its vehicle
+never travel together — dismounting on arrival is the consistent outcome.
