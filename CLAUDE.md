@@ -2337,6 +2337,57 @@ More shipped work (continuing the list above):
     less surface, or for hosts. The same "tighten reads for a fog match" lever as
     `command_access`. Default stays permissive; a fog GM opts into the lockdown.
 
+- **Audit-pass-24 (hands-on): the "round-keyed logic breaks under ATB" bug CLASS
+  (scenario 560).** Drilled the history/undo subsystem (`match_history.py`, never
+  hand-audited before) and found a defect class worth remembering: **ATB disables
+  rounds, so `round_number` is frozen at 1 forever — every mechanism whose window
+  / expiry / seed is keyed on `round_number` silently misbehaves under ATB.**
+  Prior ATB work covered the LOUD cases (`round_number()`/`turn_index()`/round
+  `schedule()` RAISE, and `_has_round_logic` warns about dormant round logic);
+  these are the SILENT ones. Audit the whole class when touching ATB.
+  - **Turn-autosave retention never pruned under ATB (REAL, FIXED).**
+    `MatchHistory._prune_turns` kept `autosave_turn_retention_rounds` rounds'
+    worth of turn snapshots by comparing `s.round_at_snapshot >= round_number -
+    rounds + 1`. Under ATB that threshold never advances, so NOTHING was ever
+    pruned and turn snapshots accumulated for the entire session — each one a
+    FULL match state (measured: 40 ATB turns → 40 retained snapshots / 265 KiB,
+    vs 5 in round mode; 150 turns → 150). An unbounded memory leak in the
+    intended-for-long-sessions turn model. Fixed: under ATB, `_prune_turns`
+    prunes by the `_turn_index` counter (the only clock that advances there)
+    against a NEW `autosave_turn_retention_turns` rule (default 20 ≈ the
+    round-mode default for a mid-sized party; -1 unlimited / 0 disable, mirroring
+    the rounds rule). Round-based play is byte-for-byte unchanged (the ATB branch
+    is gated on the `atb_enabled` rule). Verified: 150 turns → capped at 20,
+    `!history undo turn` still restores correctly under ATB, turns keep advancing
+    after an undo, and the 0 / -1 knobs behave.
+  - **OPEN (raised with the user, NOT fixed — needs a design call): a
+    `!reveal_fog ... turns=N` TEMPORARY reveal never expires under ATB.**
+    `reveal_cells` stores `until = round_number + duration` and `_active_reveals`
+    prunes when `until >= round_number`; with rounds frozen the reveal is
+    permanent (verified: 30 ATB turns, cell still revealed, record still
+    `until: 3`). Fixing it properly needs a monotonic TURN counter on Match —
+    which does not exist (`history._turn_index` is unsuitable: it lives on the
+    history object, which `to_dict` excludes by default, so it resets on
+    save/load). That counter is exactly the "turn-elapsed counter to replace
+    turn_index() under ATB" already flagged as a FUTURE item in the ATB entry, so
+    its shape (field name, whether it's exposed as a formula prim, whether
+    `turn_index()` returns it under ATB instead of raising, whether it counts in
+    round mode too) is the user's design call — I asked rather than guess. Until
+    then: under ATB, `turns=N` reveals behave as permanent; use `!reveal_fog
+    <team> clear` to end them.
+  - Verified CORRECT in the same sweep (no change): the rest of the history
+    subsystem — manual save → mutate → restore, restoring the SAME snapshot
+    TWICE (no snapshot corruption, i.e. the pass-7 load-side deepcopy holds),
+    `!history undo command N`, restore after an entity was removed (it comes
+    back), `!history list`, `!history diff manual:a manual:b` (correct per-var
+    old→new + additions), the confirmation-prompt gate, and linear-history
+    truncation of the orphaned future. Also re-checked and judged BENIGN under
+    ATB: the `random_stable` turn-order tiebreaker's `(match.id, round_number)`
+    seed is frozen, but ATB picks the actor by charge bar (ties broken by
+    time/rate/id), so turn_order ORDER doesn't drive selection — cosmetic only;
+    and round `schedule()`s created before ATB was switched on never fire, which
+    `_has_round_logic` already warns about by design.
+
 - **Audit-pass-23 (hands-on): CLEAN PASS — no bug found.** A by-hand sweep with
   exhaustive serialization checks, an event-bus review, broad input fuzzing, and
   numeric primitive re-verification; no code change. Verified combos (so future

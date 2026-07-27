@@ -2242,7 +2242,23 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Default 3 = three most recent rounds. Turn-start snapshots "
             "are taken AFTER on_turn_start hooks fire, so restoring one "
             "puts the match at the state players would have seen as that "
-            "turn began."
+            "turn began. IGNORED under ATB (rounds are disabled there, so "
+            "the round-based window never advances) — see "
+            "autosave_turn_retention_turns."
+        ),
+    },
+    "autosave_turn_retention_turns": {
+        "default": 20,
+        "schema": {"type": "int"},
+        "desc": (
+            "The ATB counterpart of autosave_turn_retention_rounds: how many "
+            "of the most recent turn-start autosaves to keep when atb_enabled "
+            "is on. Under ATB there are no rounds, so a round-keyed window "
+            "would never advance and turn snapshots would accumulate for the "
+            "whole session (one full match state each). -1 = unlimited, 0 = "
+            "disable turn autosaves, N>0 = keep the last N. Default 20 is "
+            "roughly the round-mode default (3 rounds) for a mid-sized party. "
+            "Only consulted under ATB; round-based play uses the _rounds rule."
         ),
     },
     "autosave_command_retention_turns": {

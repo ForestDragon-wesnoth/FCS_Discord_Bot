@@ -14433,3 +14433,37 @@ str-coerces the keys before joining — it used to raise "sequence item 0:
 expected str instance, int found" (a 💥) because the dict branch joined raw keys
 while the sibling list branch already str()'d its items. `!list` renders
 `→ A: {1, 2}` (the dict's keys) instead of crashing.
+
+
+SCENARIO 560 — ATB: turn autosaves prune by TURN count, not rounds
+--------------------------------------------------------------------------------
+
+!system set default atb_enabled true
+!system set default atb_charge_formula "entity[self].initiative"
+!system set default autosave_turn_retention_turns 3
+!match new atbh ATBHist 8 8
+!match use atbh
+!ent add fast Fast 100 1 1 30
+!ent add slow Slow 100 2 1 10
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!ent set_var fast marker 1
+!history undo turn
+!ent dump fast
+
+Expected: under ATB, rounds are disabled and `round_number` never advances — so
+the round-keyed `autosave_turn_retention_rounds` window never moved and turn
+autosaves accumulated for the WHOLE session (one full match state per turn, an
+unbounded memory leak: 150 ATB turns retained 150 snapshots). Turn autosaves now
+prune by the TURN counter under ATB via the new `autosave_turn_retention_turns`
+rule (default 20; set to 3 here), so only the last N turn snapshots are kept.
+Round-based play is unchanged (still uses the _rounds rule). The retained
+snapshots still work: `!history undo turn` reverts to the start of the previous
+turn, dropping the `marker` var that was set after it. -1 = unlimited, 0 =
+disable turn autosaves, matching the round rule's semantics.
