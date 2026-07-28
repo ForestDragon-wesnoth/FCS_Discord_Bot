@@ -2200,6 +2200,16 @@ class EvalCtx:
 #   cmd / fail               — callables (added to _ACTION_BUILTINS
 #                              and allowed as Call targets)
 _ACTION_BINDING_NAMES = frozenset({"source", "args", "target"})
+
+
+def _is_python_dunder(name: str) -> bool:
+    """True for a Python-internal `__x__` attribute name (dunder on BOTH
+    sides). Engine-reserved entity vars are LEADING-dunder only
+    (`__follows`, `__segment`, `__part_located`, `__cell_stackable`, ...),
+    so this predicate targets Python internals exclusively and never blocks
+    a legitimate var read."""
+    return (isinstance(name, str) and len(name) > 4
+            and name.startswith("__") and name.endswith("__"))
 # cmd/fail plus the mid-body choice prompts. choose(prompt, list) returns
 # the chosen element; choose_number(prompt, lo, hi) returns the chosen int.
 # Both are supplied as action_bindings by the runner (action-mode only).
@@ -2339,6 +2349,10 @@ class _EntityAccessTransformer(ast.NodeTransformer):
             return ".".join(parts)
         return None
 
+    @staticmethod
+    def _dunder(name: str) -> bool:
+        return _is_python_dunder(name)
+
     def _action_binding_root(self, node: ast.AST) -> Optional[str]:
         """If `node` is an Attribute chain whose root is a Name in
         _ACTION_BINDING_NAMES (source/args/target), return that root
@@ -2369,6 +2383,22 @@ class _EntityAccessTransformer(ast.NodeTransformer):
             return False
         cur = node
         while isinstance(cur, ast.Attribute):
+            # Python DUNDER attributes are never a legitimate GM read and are
+            # the standard introspection escape hatch: `self.__class__` (self
+            # binds to a plain str id) yields a live type object, and
+            # `.__bases__` / `.__subclasses__` / `.__globals__` walk from there
+            # into Python internals. Calling them is already blocked (a Call's
+            # func must be a bare Name), so this is not RCE — but the OBJECTS
+            # can be assigned into entity vars, which breaks JSON
+            # serialization and makes the match unsaveable. Reject the whole
+            # chain at validation time. The pattern is deliberately `__x__`
+            # (dunder on BOTH sides): engine-reserved vars are leading-dunder
+            # only (__follows, __segment, __part_located, ...), so a legitimate
+            # `source.__follows` still resolves.
+            if _is_python_dunder(cur.attr):
+                raise FormulaError(
+                    f"Attribute '{cur.attr}' is not allowed — Python "
+                    f"dunder attributes are blocked in action bodies.")
             cur = cur.value
         return isinstance(cur, ast.Name)
 

@@ -2337,6 +2337,63 @@ More shipped work (continuing the list above):
     less surface, or for hosts. The same "tighten reads for a fog match" lever as
     `command_access`. Default stays permissive; a fog GM opts into the lockdown.
 
+- **Audit-pass-26 (hands-on): formula-sandbox dunder hole closed (scenario 562).**
+  Hand-attacked the sandbox for the first time this era (31 escape attempts in
+  expression mode + 20 in action mode). Expression mode rejected EVERYTHING
+  (`__import__`/`eval`/`exec`/`open`/`globals`/`type`/comprehensions/lambda/
+  subscript/`__builtins__` — all clean ❌, no 💥). Action mode leaked:
+  - **THE BUG.** `_is_action_attr_passthrough` deliberately leaves ANY attribute
+    chain rooted at a bare Name un-rewritten for Python's runtime attribute
+    resolution — that's how `source.<path>`, `args.<key>` and Coord `target.x`
+    work. But it also permitted PYTHON DUNDERS. Since `self` in an action body
+    binds to a plain STRING (the entity id), `self.__class__` resolved to a live
+    `type` object and `.__bases__` / `.__subclasses__` / `.__init__` walked
+    further into Python internals. **Not RCE** — a Call's func must be a bare
+    Name, so `...__subclasses__()` is rejected with "Only direct function calls
+    are allowed" (verified). The REAL harm: those objects can be ASSIGNED INTO
+    ENTITY VARS, and a var holding a `type` / bound method breaks
+    `json.dumps` — verified `TypeError: Object of type type is not JSON
+    serializable`, i.e. `!store save` fails and the match becomes unsaveable
+    (the failure is caught and surfaced as a clean ❌ by `MatchManager.save`, so
+    it's data-corruption/DoS, not a crash). Realistically hit by ACCIDENT (a
+    typo'd `self.something`) as much as by intent.
+  - **FIX:** reject Python dunder attribute names at VALIDATION time inside the
+    action-mode passthrough walk (new module helper `_is_python_dunder`). The
+    pattern is deliberately `__x__` — dunder on BOTH sides — because engine-
+    reserved entity vars are LEADING-dunder only (`__follows`, `__segment`,
+    `__part_located`, `__cell_stackable`, ...), so a legitimate `source.__follows`
+    still validates and reaches runtime. Verified after the fix: all 51 escape
+    attempts rejected; `source.<path>` (item container read), `args.<key>`, and
+    location-target Coord `target.x`/`.y` all still work; vars stay clean and the
+    match stays serializable. NOTE for future sweeps: authoring an action body
+    goes through host-gated `!ent set_var`, so this was never player-reachable —
+    but sandbox integrity is the whole point of the `_ALLOWED_NODES` whitelist +
+    empty `__builtins__`, so the hole was worth closing regardless.
+  - Verified CORRECT in the same sweep (no change): **no path mutates an entity
+    id** except `copy_entity`'s remap (`!ent rename` changes the display NAME
+    only), so the pass-25 dangling-id class is closed. **`!store save`/`load`
+    round-trip** through MatchManager — two matches, a custom GameSystem with
+    tweaked rules, active channel bindings, zones/anchored auras, macros, team
+    data, nested inventory and a part subtree all survive into a FRESH manager,
+    and the loaded match is fully functional (list/map/turn/move/macro/part all
+    clean). Path handling is host-gated disk I/O by design (same self-hosted
+    stance as sprites). **Event-log retention** is a plain count cap (not
+    round-keyed, so unlike pass-24 it's ATB-safe): cap enforced, 0 = keep
+    nothing, -1 = unlimited. **Dict-rule editors** — `!system set` correctly
+    refuses dict rules and points at the dedicated editor; `!log format` (incl.
+    clearing with `-` and custom `log()` types), `!gclamp`, `!system access` all
+    validate and error cleanly; and per-match `access_overrides` SURVIVE a rule
+    refresh and serialization (the explicitly-documented "don't fold into rules"
+    invariant holds). **transform cross-products** — transforming a snake head
+    drops its segments and revert restores them; transforming an aura anchor
+    keeps the binding and re-stamps to the NEW footprint (25→36 cells);
+    transforming a mounted rider preserves the mount; `!history undo` after a
+    transform fully reverts name/footprint/inventory. OBSERVATION (not fixed, no
+    design call made): transform does NOT re-validate the slot `condition` for a
+    MOUNTED rider whose new form might no longer qualify — an asymmetry with the
+    vehicle side, which got `transform_rider_mismatch_mode` in pass-6. Flag if
+    the user wants symmetry.
+
 - **Audit-pass-25 (hands-on): the "dangling relational id" bug CLASS — transfer
   phantom mount fixed (scenario 561).** Entities reference each other by BARE ID
   (`mounted_on`, `part_of`, `__follows`, a zone's `anchor`). Any path that moves

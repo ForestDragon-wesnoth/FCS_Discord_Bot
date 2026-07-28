@@ -14500,3 +14500,40 @@ mount, `!mount list` shows no riders on the new `car`, and the rider renders and
 occupies its cell normally. Transferring a VEHICLE instead ejects its riders in
 the source (mount_on_host_death / _release_riders), so a rider and its vehicle
 never travel together — dismounting on arrival is the consistent outcome.
+
+
+SCENARIO 562 — sandbox: Python dunder attributes blocked in action bodies
+--------------------------------------------------------------------------------
+
+!match new sbx Sandbox 10 10
+!match use sbx
+!ent add a A 30 1 1 5
+!ent set_var a actions.bad.target none
+!ent set_var a actions.bad.body "entity[self].leaked = self.__class__"
+!action a bad
+!ent set_var a actions.bad2.body "entity[self].leaked = self.__class__.__bases__"
+!action a bad2
+!ent set_var a items.potion.heal 12
+!ent set_var a items.potion.actions.quaff.target none
+!ent set_var a items.potion.actions.quaff.body "entity[self].healed = source.heal"
+!action a quaff
+!ent set_var a actions.blast.target location
+!ent set_var a actions.blast.body "entity[self].tx = target.x"
+!action a blast 6 7
+!ent dump a
+
+Expected: HARNESS-ALLOWS-ERRORS — the two `bad` actions deliberately surface a
+top-level ❌. In action mode the validator leaves ANY attribute chain rooted at a
+bare Name for Python's runtime resolution (that's how `source.<path>`,
+`args.<key>` and Coord `target.x` work). `self` binds to a plain STRING (the
+entity id), so `self.__class__` used to resolve to a live Python type object and
+`.__bases__` walked further into Python internals; those objects could be
+ASSIGNED INTO ENTITY VARS, which breaks JSON serialization and makes the match
+unsaveable. (Not RCE — calling them was already blocked, since a Call's func
+must be a bare Name.) Dunder attributes (`__x__`, dunder on BOTH sides) are now
+rejected at validation with "Python dunder attributes are blocked", so `leaked`
+is never written. The legitimate passthrough is untouched: `source.heal` reads
+the item container (healed=12) and `target.x` reads the location Coord (tx=6).
+The pattern is deliberately dunder-on-both-sides so engine-reserved vars, which
+are LEADING-dunder only (`__follows`, `__segment`, `__part_located`), still
+resolve.
