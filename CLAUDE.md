@@ -2337,6 +2337,56 @@ More shipped work (continuing the list above):
     less surface, or for hosts. The same "tighten reads for a fog match" lever as
     `command_access`. Default stays permissive; a fog GM opts into the lockdown.
 
+- **Audit-pass-27 (hands-on): CLEAN PASS — no bug found.** An adversarial /
+  resource-exhaustion sweep (the class that produced the pass-20 macro runaway
+  and the pass-24 ATB history leak), plus a re-entrancy audit. No code change.
+  Verified:
+  1. **No `$()` ARGUMENT INJECTION.** A `$()` result containing SPACES stays
+     exactly ONE argument (`var_get` returning `'hello world'` lands as a single
+     var value) — substitution is per-token and happens AFTER shlex, so nothing
+     re-splits and a player can't smuggle extra args/subcommands through a
+     computed value. A space-containing value fed to a numeric arg gives a clean
+     `❌ hp delta must be an integer`, not a split.
+  2. **The `$()` read-only gate is airtight under attack** — every mutating
+     function tried (`kill` / `var_set` / `summon` / `status_apply` /
+     `damage_part`) is REJECTED with ZERO state change (entity still alive, hp
+     untouched), user-defined `!func`s are banned as documented, and the
+     rejection still holds when the `$()` is inside a MACRO line or a `!foreach`
+     inner command (the two indirect dispatch paths).
+  3. **No DEPTH-GUARD LEAKS** (the "one error wedges the feature forever"
+     failure mode; audited because a leaked counter is silent). All six counters
+     — `_action_depth`, `_var_event_depth` (both fire sites), `_event_depth` +
+     `_event_stack`, `_death_processing`, `_alive_eval_depth`, and the new
+     `MatchManager._macro_depth` — are restored in `try/finally`, and
+     EMPIRICALLY: after 30 consecutive failures each (failing actions, an
+     erroring var-hook passive, erroring event handlers, bad macro runs, and a
+     malformed `alive_condition` across 5 kills) every counter read 0 and every
+     subsystem still worked (a later good action/passive/event/macro fired, and
+     death still processed).
+  4. **Degenerate grids are safe** — a match created 0×0, 1×0 or with NEGATIVE
+     dimensions handles `!map` / `!list` / `!state` / `!ent add` / `!map resize`
+     / `!zone add` / `!tile set` without a 💥 (bounds checks reject placement
+     cleanly and the renderer produces an empty map).
+  - OBSERVATION (not fixed — flagged for the user): **grid dimensions are
+    unvalidated and unbounded.** `!match new x X 20000 20000` and `!map resize`
+    accept anything; creation is LAZY (instant, no allocation) so the cost lands
+    at RENDER time, which is quadratic — measured 200²=0.01s/78 KiB,
+    600²=0.05s/703 KiB, 1500²=0.45s/4.4 MiB, so 20000² would be minutes and
+    ~780 MiB of output text. Discord is protected in practice (the viewport
+    engages there and clips to viewport_width/height), but the CLI/gui render
+    the whole grid. Deliberately NOT fixed: both commands are host-gated, the
+    failure is immediate/obvious/recoverable (restart), and a `max_grid_dimension`
+    default generous enough to be safe could still reject a legitimate large
+    campaign map — that default is a design call. The codebase's own precedent
+    (`macro_repeat_limit`'s "guards against a typo'd huge count") argues FOR
+    adding one; say so and it's a small rule.
+  - PROCESS NOTE for future harness authors: THREE apparent "failures" this pass
+    were my own harness bugs, not engine defects — `!passive add` takes
+    `target=`/`scope=` BEFORE the quoted formula (formula LAST; wrong order makes
+    the formula parse as `target=hp` → "Syntax error"), and running probes via
+    `bash -c "python -c ..."` mangles nested quotes inside `$()`/formulas. Write
+    probes to a FILE and use the documented arg order.
+
 - **Audit-pass-26 (hands-on): formula-sandbox dunder hole closed (scenario 562).**
   Hand-attacked the sandbox for the first time this era (31 escape attempts in
   expression mode + 20 in action mode). Expression mode rejected EVERYTHING
