@@ -3565,8 +3565,14 @@ async def match_top_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     parts = [
         f"**{m.name}** `{m.id}`",
         f"Game System: **{m.system_name}**",
-        f"Current Round Number: **{m.round_number}**",
     ]
+    # Under ATB rounds are disabled and round_number is frozen at 1, so
+    # reporting it would be actively misleading — show the turn clock, which
+    # is the one that actually advances there.
+    if m.rules.get("atb_enabled"):
+        parts.append(f"Turns Elapsed: **{m.turns_elapsed}** (ATB — no rounds)")
+    else:
+        parts.append(f"Current Round Number: **{m.round_number}**")
     if m.outcome is not None:
         oc = m.outcome
         extra = f" — {oc.get('reason')}" if oc.get("reason") else ""
@@ -4426,9 +4432,12 @@ async def reveal_fog_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if not recs:
                 continue
             cnt = sum(len(r.get("cells", ())) for r in recs)
+            # Name the clock each record was created under — under ATB the
+            # deadline counts turns, so calling it a round would mislead.
             spans = ", ".join(
                 ("permanent" if r.get("until") is None
-                 else f"through round {r['until']}") for r in recs)
+                 else f"through {'turn' if r.get('clock') == 'turn' else 'round'}"
+                      f" {r['until']}") for r in recs)
             lines.append(f"- `{team}`: {cnt} cell(s) [{spans}]")
         return await ctx.send("\n".join(lines) if len(lines) > 1
                               else "No active fog reveals.")
@@ -4484,7 +4493,8 @@ async def reveal_fog_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     except NotFound as ex:
         return await ctx.send(f"❌ {ex}")
     n = m.reveal_cells(team, cells, duration)
-    span = "permanently" if duration is None else f"for {duration} round(s)"
+    unit = "turn" if m.rules.get("atb_enabled") else "round"
+    span = "permanently" if duration is None else f"for {duration} {unit}(s)"
     return await ctx.send(
         f"Revealed {n} cell(s) to team `{team}` {span}."
         + ("" if m.fog_enabled else " ⚠️ fog is OFF on this match, so the "

@@ -2377,6 +2377,43 @@ More shipped work (continuing the list above):
     less surface, or for hosts. The same "tighten reads for a fog match" lever as
     `command_access`. Default stays permissive; a fog GM opts into the lockdown.
 
+- **ATB turn clock (`Match.turns_elapsed`) — SHIPPED (scenarios 566-567).** The
+  monotonic count of TURN boundaries in a match, and the fix for the pass-24
+  open item. Under ATB rounds are disabled and `round_number` is frozen at 1
+  forever, so anything keyed on rounds silently misbehaves there; this is the
+  only clock that advances.
+  - **Where it bumps:** the new `Match._begin_turn()` — `turns_elapsed += 1`
+    then `history.record_turn(self)`. Every exit of `next_turn` /
+    `_atb_next_turn` already called `record_turn` (10 sites, INCLUDING the ones
+    that return no actor — an emptied turn order or an all-skippable table), so
+    routing them all through one helper keeps the counter exactly in lockstep
+    with `MatchHistory._turn_index` and stops the two drifting. It counts in
+    BOTH turn models: it is the SERIALIZED counterpart of `_turn_index`, which
+    `to_dict` excludes and so resets on save/load — that was precisely why
+    `_turn_index` couldn't back durations.
+  - **DESIGN CALLS (user-approved shape):** counts in round mode too (harmless
+    and more useful than an ATB-only field); `turn_index()` is UNCHANGED and
+    still RAISES under ATB, because it means "position within the round" — a
+    global elapsed count is a different quantity, so conflating them would
+    mislead. Rolled back by a history restore along with the rest of the state.
+  - **Fog reveals expire under ATB (the payoff).** `reveal_cells` keys the
+    deadline to whichever clock advances: under ATB `turns_elapsed + duration`
+    tagged `clock: "turn"`, else `round_number + duration` tagged
+    `clock: "round"`. `_active_reveals` compares each record against the clock
+    it was CREATED under, so a match that switches turn models mid-session
+    still expires existing reveals correctly, and a record with no `clock`
+    predates the field and reads as round-keyed. Both fields round-trip through
+    save/load. Round-based play is byte-for-byte unchanged.
+  - **Surface:** formula prim `turns_elapsed()` (read-only → classified
+    ARG_SAFE, so it works inside inline `$()` args; the module-load drift guard
+    caught the missing classification, as designed). `!match_toplevel` /
+    `!state` show "Turns Elapsed" instead of the frozen round number while ATB
+    is on — the flagged ATB-aware readout. `!reveal_fog` messages now name the
+    right unit ("for 2 turn(s)" / "through turn 2" under ATB, "round" otherwise)
+    rather than always saying rounds.
+  - NOTE `!undo` was already shipped (a thin forwarder to `!history undo` that
+    passes every arg through); it was listed as a feature idea in error.
+
 - **Audit-pass-28 (hands-on, LONG): snapshot `turn_order` aliasing + a DEAD
   gamerule (scenario 563).** Two new techniques carried this pass, both worth
   reusing: **systematic REGISTRY-vs-CODE invariant checks** and a **randomized
@@ -2652,9 +2689,9 @@ More shipped work (continuing the list above):
     turn_index() under ATB" already flagged as a FUTURE item in the ATB entry, so
     its shape (field name, whether it's exposed as a formula prim, whether
     `turn_index()` returns it under ATB instead of raising, whether it counts in
-    round mode too) is the user's design call — I asked rather than guess. Until
-    then: under ATB, `turns=N` reveals behave as permanent; use `!reveal_fog
-    <team> clear` to end them.
+    round mode too) is the user's design call — I asked rather than guess.
+    RESOLVED — the counter shipped as `Match.turns_elapsed`; see the ATB
+    turn-clock entry below.
   - Verified CORRECT in the same sweep (no change): the rest of the history
     subsystem — manual save → mutate → restore, restoring the SAME snapshot
     TWICE (no snapshot corruption, i.e. the pass-7 load-side deepcopy holds),

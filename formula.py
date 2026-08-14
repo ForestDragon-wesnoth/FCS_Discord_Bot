@@ -1650,7 +1650,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # (1-based); turn_index() -> 0-based position of the acting entity
     # in the round's turn order. For cadence checks ('every N rounds',
     # 'first turn of the round') and round-measured cooldowns.
-    "round_number", "turn_index",
+    "round_number", "turn_index", "turns_elapsed",
     # ATB read prims (Active Time Battle): the charge target + an entity's
     # current charge rate. See the atb_* rules.
     "atb_threshold", "atb_rate",
@@ -1827,7 +1827,8 @@ ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'team_sees_cell_losonly', 'team_sees_cell_rangeonly',
     'team_sees_entity', 'team_sees_entity_losonly',
     'team_sees_entity_rangeonly', 'tile_get', 'tile_has', 'tile_keys',
-    'turn_index', 'var_count', 'var_get', 'var_has', 'var_has_key',
+    'turn_index', 'turns_elapsed', 'var_count', 'var_get', 'var_has',
+    'var_has_key',
     'var_keys', 'var_max_key', 'var_min_key', 'var_pick_random',
     'var_sum', 'var_sum_field', 'zone_anchor_of', 'zone_cells',
     'zone_exists', 'zone_get', 'zone_has', 'zone_keys', 'zone_names',
@@ -5485,6 +5486,19 @@ class FormulaEngine:
                     "disabled. Drive cadence off turns / charge instead.")
             return int(match.round_number)
         ns["round_number"] = _round_number
+
+        def _turns_elapsed() -> int:
+            """turns_elapsed(): how many TURN boundaries have occurred in
+            this match, counting from 0. Unlike round_number() this works in
+            BOTH turn models and is the only clock that advances under ATB
+            (where rounds are disabled and round_number is frozen), so it's
+            what turn-based durations and cadence should key on there.
+            Monotonic within a timeline; a history restore rolls it back
+            with the rest of the state. Example: a cooldown that is ready
+            again after 3 turns -> `turns_elapsed() - entity[self].used_at
+            >= 3`."""
+            return int(match.turns_elapsed)
+        ns["turns_elapsed"] = _turns_elapsed
 
         def _turn_index() -> int:
             """turn_index(): the 0-based position of the acting entity
