@@ -1096,12 +1096,21 @@ More shipped work (continuing the list above):
     damage_part / cascade). **Destroy effects** = the part's own `on_death`/
     passives.
   - **`hit_location(target, from_x, from_y[, aim, aim_weight, aim_bonus, mode,
-    sides, corner_arc])`** → part id; modes uniform / weighted (per-part
-    `hit_weights.<side>`, side from the shipped `side_hit`, default the
-    `hit_location_mode` rule) / aimed (×`aim_weight` [rule default 3] +
-    `aim_bonus`; bias without guarantee — a 0-weight side stays 0 unless
-    aim_bonus lifts it). No parts / nothing exposed → returns the target itself.
-    RNG via the match RNG (`_active_rng`, replay-safe with the choice system).
+    sides, corner_arc])`** → part id. There are exactly TWO modes — `weighted`
+    (per-part `hit_weights.<side>`, side from the shipped `side_hit`) and
+    `uniform` — defaulting to the `hit_location_mode` rule; anything else
+    RAISES ("mode must be 'weighted' or 'uniform'"). **AIMING IS NOT A MODE**
+    (an earlier version of this file wrongly listed `aimed` as a third one, so
+    `mode='aimed'` reads plausible but is rejected): it's the separate `aim`
+    ARG, which biases toward the named part on top of whichever mode is
+    active — that part's weight becomes `w * aim_weight + aim_bonus`
+    (`aim_weight` defaults to the `hit_location_aim_weight` rule, 3;
+    `aim_bonus` to 0). Bias without guarantee, and a 0-weight side stays 0
+    unless aim_bonus lifts it. Verified statistically: weights 10/30/60 give
+    a 10/30/60 split; aiming at the 10 with weight 3 gives 30/(30+30+60) =
+    25%; a 0-weight side with aim_bonus=50 becomes 50/140 ≈ 36%. No parts /
+    nothing exposed → returns the target itself. RNG via the match RNG
+    (`_active_rng`, replay-safe with the choice system).
   - **Creation:** template-driven — `summon_entity` consumes a reserved `parts`
     key (dict `{role: part-template}` or a list), auto-spawning+linking each at
     the parent's cell. AND mid-match `!part add/attach/detach/remove/list/info`
@@ -2336,6 +2345,86 @@ More shipped work (continuing the list above):
     covered too). No-op on an open match (no owner), an auto-approve/identity-
     less surface, or for hosts. The same "tighten reads for a fog match" lever as
     `command_access`. Default stays permissive; a fog GM opts into the lockdown.
+
+- **Audit-pass-28 (hands-on, LONG): snapshot `turn_order` aliasing + a DEAD
+  gamerule (scenario 563).** Two new techniques carried this pass, both worth
+  reusing: **systematic REGISTRY-vs-CODE invariant checks** and a **randomized
+  stateful CHAOS test with structural invariant assertions**. Three findings.
+  - **Snapshot aliasing of `turn_order` (HIGH, FIXED — the headline).**
+    `Match.to_dict` stored `"turn_order": self.turn_order` BY REFERENCE, and
+    `Entity.remove` mutates that list IN PLACE (`m.turn_order.remove(self.id)`,
+    logic.py ~4270). So every entity removal retroactively SHRANK every
+    already-taken snapshot, while each snapshot's `active_index` int stayed put
+    — leaving snapshots internally INCONSISTENT (observed: `turn_order=['hero']`
+    with `active_index=1`), and `!history undo` then restored a match whose turn
+    cursor pointed past the end of its own turn order. This is the SAME
+    corruption class as the pass-5/6/7/11 vars/tiles/zones/watchers fixes;
+    `turn_order` was the one mutable field never copied. Fixed on BOTH sides
+    (`to_dict` stores `list(...)`; `from_dict` copies on load so a restored
+    match can't mutate the retained snapshot) plus a load-side CLAMP so a
+    snapshot written by an older build still restores to a usable cursor.
+    `rules` was also shared and is now deep-copied for symmetry (it is only ever
+    rebound today, never mutated in place — copied so a future in-place edit
+    can't silently reintroduce this). NOTE the diagnosis path: instrumenting
+    every `active_index` writer found NOTHING, because no live method ever
+    produced an out-of-range state — the snapshot was corrupted AFTER being
+    taken. When live state looks fine but a restored one doesn't, suspect
+    aliasing, not the writer.
+  - **`var_hook_warning_verbosity` was a DEAD RULE (MED-LOW, FIXED).** Defined
+    in RULES_REGISTRY, documented, listed by `!system rules`, settable — and
+    read NOWHERE in the codebase. A GM could set it to `off` and warnings kept
+    appearing (silent no-op config). Now honored at all three levels: `off`
+    suppresses the var-hook recursion-limit warnings (both fire sites),
+    `minimal` (default) keeps today's behavior, and `detailed` additionally
+    annotates a DESTRUCTIVE write with the count of dropped keys. Gotcha worth
+    remembering for anyone extending this: `_diff_subtree` collapses a
+    structural shift (dict -> scalar) into ONE `changed` event carrying the old
+    subtree as `old_value` — it does NOT emit per-leaf `removed` events — so the
+    count walks `old_value` via `_walk_subtree_keys` and excludes the root
+    (which survives, just holding a different value). Schema upgraded `str` ->
+    `enum` so a typo'd level is rejected instead of silently meaning 'minimal'.
+    New helper `Match.var_warn_verbosity()` (unrecognized value -> 'minimal',
+    so a bad value can't silence real warnings).
+  - **DOC FIX: `hit_location` has TWO modes, not three.** This file listed
+    "modes uniform / weighted / aimed", but the engine accepts only `weighted`
+    and `uniform` and RAISES on anything else — **aiming is a separate `aim`
+    ARG**, not a mode, so a GM following the old wording would write
+    `mode='aimed'` and get a rejection. Corrected in place, with the verified
+    statistics recorded (see below).
+  - **VERIFIED CLEAN — systematic invariant checks (new, reusable).** Every
+    literal `rules.get("X")` name across ALL modules exists in RULES_REGISTRY
+    (139 reads, no typos — a typo'd name silently returns the wrong default
+    forever, so this check is cheap insurance); the only registry rules with no
+    literal reference are the four `block_*`, built dynamically as
+    `f"block_{mode}"`. All **189** `_MATCH_FUNC_NAMES` + **28** `_ALLOWED_FUNCS`
+    are actually registered and callable (the empirical version of the
+    documented "add it to `_MATCH_FUNC_NAMES` AND the namespace builder" trap —
+    calling each with no args cleanly separates "unregistered" from "wrong
+    arity"). `ARG_SAFE_MATCH_FUNCS` / `ARG_MUTATING_MATCH_FUNCS` exactly
+    partition the match funcs. `_who_arg` handles HOOK_CONTEXT_NAMES by SET
+    membership (`if slice_node.id in HOOK_CONTEXT_NAMES`), so that documented
+    trap is structurally solved — new bindings are covered automatically.
+  - **VERIFIED CLEAN — chaos + smoke + statistics.** A randomized STATEFUL
+    chaos test (12 seeds x 200 steps over ~70 valid commands on a rich board:
+    multi-tile, parts, segments, mounts, auras, statuses, fog, two matches)
+    asserting structural invariants after EVERY step — no dangling
+    `part_of`/`mounted_on`/`__follows`/zone-anchor/schedule id, turn_order a
+    subset of entities, `active_index` in range, and state still
+    JSON-serializable. It found the turn_order bug (4/12 seeds) and is clean
+    after the fix. Also: 47 commands x 4 crash shapes (no args / bogus
+    subcommand / no active match / both) = 188 invocations, zero 💥. Statistical
+    verification of the RNG primitives (single-shot tests can't catch a bad
+    weight normalization): `hit_location` weighted with weights 10/30/60 gives
+    a 10/30/60 split; aiming at the 10 with the default `aim_weight` 3 gives
+    30/(30+30+60) = 25% (measured 24.8%); a 0-weight side stays 0 and
+    `aim_bonus=50` lifts it to ~36%; `roll_table 'a:1,b:3,c:6'` is exact and a
+    0-weight entry is NEVER chosen. A NESTED aliasing audit (walking live vs
+    snapshot in parallel to depth 4) now reports the snapshot fully independent
+    at every level, and it stays byte-identical after mutating every live
+    container — the whole corruption class is closed. Discord adapter by
+    inspection: the three `" ".join(req["args"])` sites are safe (queued args
+    are pre-substitution shlex strings — the gate runs before `$()`
+    substitution) and `int(viewport_button_step)` is schema-guarded.
 
 - **Audit-pass-27 (hands-on): CLEAN PASS — no bug found.** An adversarial /
   resource-exhaustion sweep (the class that produced the pass-20 macro runaway
