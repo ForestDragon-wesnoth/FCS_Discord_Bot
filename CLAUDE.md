@@ -1801,7 +1801,38 @@ More shipped work (continuing the list above):
     no player bypass). The DEFERRED third piece — a player-usable READ-ONLY
     `!foreach` — was intentionally left out (it overlaps `!find show:/sort:`,
     which already gives players per-entity readouts, and it adds an
-    access-gating surface worth a design decision first).
+    access-gating surface worth a design decision first). SHIPPED — see below.
+  - **Read-only `!foreach` — SHIPPED (scenarios 564-565).** The third follow-up.
+    Enable mechanism (user's call): NO new command and no opt-in token —
+    `!foreach`'s access is DERIVED FROM CONTENT, the same shape as the existing
+    READ_ONLY_SUBCOMMANDS downgrade. `CommandRegistry._foreach_read_only(args,
+    m)` splits the sweep's inner command groups and downgrades the base access
+    from `host` to `all` iff EVERY group resolves to `all` via a recursive
+    `_effective_access` call. Rationale: a sweep of read-only commands carries
+    no more authority than running those commands one at a time. A MUTATING
+    sweep is unchanged — still host-gated, and a player's invocation still
+    QUEUES for approval (not refused), so the existing approval flow just works.
+    The downgrade is applied BEFORE the per-match override tables, so a host's
+    explicit `!host access set foreach host` still beats it; and because the
+    check calls `_effective_access` per inner command, it tracks per-match
+    overrides in BOTH directions — `!host access set "ent dump" all` immediately
+    makes a `; ent dump $id` sweep player-available.
+    STRICTLY DEFAULT-DENY (the safety rests here, since inner commands run
+    through the deliberately ungated `dispatch_no_snapshot`). Verified blocked:
+    a mutating inner command anywhere in the sweep (incl. mixed with read-only
+    ones); ALIASES (expanded only at inner-dispatch time, so the gate sees an
+    unknown name — players must spell the real command out); a `$`-token in the
+    command OR subcommand position (`; ent $id`, `; $id dump`, `; ent $(...)`)
+    since a token is never a known read-only subcommand; the SELF-DISPATCHING
+    metas (`foreach`/`batch`/`run`/`macro`/`eval`, new frozenset
+    `_SELF_DISPATCHING_COMMANDS`) whose real content isn't in args[0] and where
+    a nested foreach would recurse; and ELEVATED_ARGS (`; map full`). GOTCHA
+    worth remembering: `ent dump` is NOT in READ_ONLY_SUBCOMMANDS by deliberate
+    policy (it reveals GM-hidden vars), so `; ent dump $id` gates a sweep —
+    use `ent info` for the player-available readout. Also note the selector
+    itself still uses the `!find` grammar, which by design IGNORES fog/
+    visibility; that's pre-existing (a player could already run `!find`), not a
+    new leak, and `!host access` remains the lever for a fog match.
 - **Audit-pass-4 fixes: multi-tile interaction sweep (scenarios 491-492).** A
   fourth interaction-bug sweep, this time hunting anchor-only assumptions in
   OLDER features against multi-tile entities (three read-only survey agents
