@@ -1347,12 +1347,14 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "var_hook_warning_verbosity": {
         "default": "minimal",
-        "schema": {"type": "str"},
+        "schema": {"type": "enum", "choices": ["off", "minimal", "detailed"]},
         "desc": (
             "Verbosity of soft warnings for destructive var writes. Levels: "
             "'off' = no warnings; 'minimal' = warn only on recursion-limit "
             "hits (default); 'detailed' = also annotate every destructive "
-            "write with the count of removed keys."
+            "write (one that replaced an existing subtree) with the count of "
+            "removed keys — e.g. writing `inventory = 5` over a populated "
+            "inventory dict."
         ),
     },
     "formula_function_recursion_limit": {
@@ -4698,6 +4700,32 @@ class Entity:
         # caller sees everything in chronological order.
         event_log = self._fire_var_events(ancestor_events + leaf_events)
         combined = attempt_log + event_log
+        # verbosity 'detailed': annotate a DESTRUCTIVE write — one that
+        # replaced an existing subtree, so `inventory = 5` over a populated
+        # dict silently drops its keys. NOTE _diff_subtree collapses a
+        # structural shift (dict -> scalar) into ONE 'changed' event carrying
+        # the whole old subtree as old_value, rather than per-leaf 'removed'
+        # events — so count the descendants that no longer exist (the root
+        # key itself survives, it just holds a different value).
+        if (self._match is not None
+                and self._match.var_warn_verbosity() == "detailed"):
+            lost = 0
+            for ev in (ancestor_events + leaf_events):
+                if ev.kind == "removed":
+                    lost += 1
+                elif ev.kind == "changed" and isinstance(ev.old_value, dict):
+                    old_keys = {k for k, _ in
+                                _walk_subtree_keys(ev.key, ev.old_value)
+                                if k != ev.key}
+                    new_keys = {k for k, _ in
+                                _walk_subtree_keys(ev.key, ev.new_value)
+                                } if isinstance(ev.new_value, dict) else set()
+                    lost += len(old_keys - new_keys)
+            if lost:
+                combined = combined + [
+                    f"⚠️ destructive write to `{self.id}.{path}` dropped "
+                    f"{lost} existing key(s)."
+                ]
         # If this write touched the turn-order or team variable, the
         # current turn_order is potentially stale. Route through
         # _mark_turn_order_dirty so the active change_policy decides
@@ -11904,6 +11932,13 @@ class Match:
     # "var_hook_recursion_limit" rule, further var-event firing is suppressed
     # and a single warning log line is emitted. The actual writes still
     # happen — only the EVENT firing is suppressed — so data isn't lost.
+    def var_warn_verbosity(self) -> str:
+        """Resolved `var_hook_warning_verbosity` level: 'off' | 'minimal' |
+        'detailed'. Anything unrecognized falls back to 'minimal' (the
+        default) so a typo'd rule value can't silence real warnings."""
+        v = str(self.rules.get("var_hook_warning_verbosity", "minimal")).lower()
+        return v if v in ("off", "minimal", "detailed") else "minimal"
+
     def _fire_var_event(self, entity_id: str, ev: VarEvent) -> List[str]:
         """Fire all matching passives for one VarEvent. Returns log lines."""
         # Recursion-depth guard (configured via gamerule, default 128)
@@ -11912,8 +11947,8 @@ class Match:
             # Stash the warning ONCE per chain. The buffer is drained by the
             # top-level entry point (Entity.write_var / remove_var) so the
             # warning surfaces to the caller even though it's generated deep
-            # in the recursion stack.
-            if not self._var_event_warned:
+            # in the recursion stack. Suppressed entirely at verbosity 'off'.
+            if not self._var_event_warned and self.var_warn_verbosity() != "off":
                 self._var_event_warned = True
                 self._var_event_warnings.append(
                     f"⚠️ var-hook recursion limit ({limit}) reached on event "
@@ -12030,7 +12065,7 @@ class Match:
         # Recursion-depth guard (same limit as event firing)
         limit = int(self.rules.get("var_hook_recursion_limit", 128))
         if self._var_event_depth >= limit:
-            if not self._var_event_warned:
+            if not self._var_event_warned and self.var_warn_verbosity() != "off":
                 self._var_event_warned = True
                 self._var_event_warnings.append(
                     f"⚠️ var-hook recursion limit ({limit}) reached on "
@@ -12407,10 +12442,19 @@ class Match:
             "grid_width": self.grid_width,
             "grid_height": self.grid_height,
             "entities": {eid: e.to_dict() for eid, e in self.entities.items()},
-            "turn_order": self.turn_order,
+            # COPY, don't alias: Entity.remove mutates turn_order IN PLACE
+            # (m.turn_order.remove(id)), so storing the live list by reference
+            # let a later removal retroactively shrink an already-taken
+            # snapshot while its active_index int stayed put — leaving the
+            # snapshot internally inconsistent (active_index out of range) and
+            # restoring it produced a broken match. Same corruption class as
+            # the vars/tiles/zones fixes. `rules` is only ever rebound, never
+            # mutated in place, but is copied for symmetry so a future
+            # in-place edit can't silently reintroduce this.
+            "turn_order": list(self.turn_order),
             "active_index": self.active_index,
             "system_name": self.system_name,
-            "rules": self.rules,
+            "rules": copy.deepcopy(self.rules),
             "round_number": self.round_number,
             "round_started": self.round_started,
             "global_passives": {pid: p.to_dict() for pid, p in self.global_passives.items()},
@@ -12505,8 +12549,19 @@ class Match:
             e = Entity.from_dict(ed)
             e.bind(m, set_spawn_facing=False)
             m.entities[eid] = e
-        m.turn_order = d.get("turn_order", [])
+        # COPY on load too (the load-side twin): otherwise the restored match
+        # shares the snapshot's list, and the next Entity.remove would mutate
+        # the retained snapshot in place — corrupting it for a second restore.
+        m.turn_order = list(d.get("turn_order", []))
         m.active_index = d.get("active_index", 0)
+        # A snapshot written before this fix (or hand-edited state) can carry
+        # an active_index past the end of its turn_order; clamp on load so a
+        # restore can never produce an out-of-range cursor.
+        if m.turn_order:
+            if not (0 <= m.active_index < len(m.turn_order)):
+                m.active_index = 0
+        else:
+            m.active_index = 0
         # m.rules already set above
         m.round_number = int(d.get("round_number", 1))
         m.round_started = bool(d.get("round_started", False))

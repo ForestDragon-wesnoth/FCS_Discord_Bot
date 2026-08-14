@@ -14537,3 +14537,37 @@ the item container (healed=12) and `target.x` reads the location Coord (tx=6).
 The pattern is deliberately dunder-on-both-sides so engine-reserved vars, which
 are LEADING-dunder only (`__follows`, `__segment`, `__part_located`), still
 resolve.
+
+
+SCENARIO 563 — snapshots copy turn_order (no retroactive corruption)
+--------------------------------------------------------------------------------
+
+!match new snap SnapAlias 10 10
+!match use snap
+!ent add a A 40 1 1 12
+!ent add b B 40 3 3 9
+!ent add c C 40 5 5 6
+!turn start
+!turn next
+!turn next
+!ent remove a
+!ent remove b
+!history undo command
+!turn next
+!state
+
+Expected: `Match.to_dict` stored `turn_order` BY REFERENCE, and `Entity.remove`
+mutates that list IN PLACE (`m.turn_order.remove(id)`) — so removing an entity
+retroactively shrank every already-taken snapshot, while each snapshot's
+`active_index` int stayed put. A snapshot could therefore end up internally
+INCONSISTENT (e.g. `turn_order=['hero']` with `active_index=1`), and restoring
+it via `!history undo` produced a match whose turn cursor pointed past the end
+of its own turn order. Found by a randomized chaos test that checks structural
+invariants after every command (4 of 12 seeds hit it); the same corruption class
+as the earlier vars / tiles / zones fixes, with `turn_order` the one field never
+copied. `to_dict` now stores a COPY (and `rules` is deep-copied for symmetry —
+it is only ever rebound today, but the aliasing was the same hazard), `from_dict`
+copies on load so a restored match can't mutate the retained snapshot, and load
+CLAMPS an out-of-range `active_index` so a snapshot written by an older build
+still restores to a usable cursor. Here the undo restores cleanly and the turn
+cursor stays valid — `!turn next` and `!state` both work.
