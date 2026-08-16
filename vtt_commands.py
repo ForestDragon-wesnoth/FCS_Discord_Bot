@@ -87,6 +87,13 @@ READ_ONLY_SUBCOMMANDS: frozenset = frozenset({
 READ_ONLY_BARE_ROOTS: frozenset = frozenset({
     "turn", "history",
 })
+# Commands that dispatch arbitrary inner content of their own, so their real
+# authority is NOT visible in args[0]. `!foreach`'s read-only downgrade refuses
+# to look inside these (and a nested foreach would recurse), treating them as
+# mutating. Their own base access is host anyway — this is defense in depth.
+_SELF_DISPATCHING_COMMANDS: frozenset = frozenset({
+    "foreach", "batch", "run", "macro", "eval",
+})
 # The inverse of READ_ONLY_SUBCOMMANDS: an otherwise player-available
 # ("all") command whose FIRST ARG here ELEVATES it to host-gated. Used by
 # the visibility full-reveal: `!state` / `!map` / `!list` render from the
@@ -290,6 +297,13 @@ class CommandRegistry:
         elif base == "all" and args and args[0].lower() in ELEVATED_ARGS.get(name, ()):
             # Full-reveal flag on a normally-open read -> host-gated.
             base = "host"
+        if base == "host" and name == "foreach" and self._foreach_read_only(args, m):
+            # A sweep whose every inner command is itself read-only carries no
+            # more authority than running those commands one at a time, so it
+            # opens to players. Same shape as the READ_ONLY_SUBCOMMANDS
+            # downgrade above — access derived from CONTENT. A mutating sweep
+            # keeps the host gate and still queues for approval.
+            base = "all"
         if m is not None:
             sub_key = f"{name} {args[0].lower()}" if args else None
             # Per-match host overrides win over the system-level rule,
@@ -304,6 +318,39 @@ class CommandRegistry:
                 if name in table:
                     return str(table[name])
         return base
+
+    def _foreach_read_only(self, args: List[str], m: "Any") -> bool:
+        """True iff EVERY inner command group of a `!foreach` resolves to
+        access 'all'. This is what lets a player run a read-only sweep
+        (`!foreach team=red ; ent info $id`) while a mutating one stays
+        host-gated and queues for approval. NOTE `ent dump` is NOT read-only
+        by policy (it reveals GM-hidden vars), so it gates a sweep until a
+        host opens it with `!host access set "ent dump" all`.
+
+        Strictly default-DENY — the gate's safety rests on this, since the
+        inner commands run through the deliberately ungated
+        `dispatch_no_snapshot`. Anything we cannot positively prove read-only
+        blocks the downgrade:
+          - an UNKNOWN command name (`self._access.get(name, "host")`), which
+            also covers ALIASES: they're only expanded at inner-dispatch time,
+            so a player must use the underlying command spelled out;
+          - a SUBSTITUTION token in the command or subcommand position
+            (`; ent $id` / `; $id dump` / `; ent $(...)`) — the token isn't a
+            known read-only subcommand, so it resolves to host;
+          - a SELF-DISPATCHING meta command, whose real content isn't visible
+            in args[0] at all (and where a nested foreach would recurse).
+        """
+        if ";" not in args:
+            return False
+        groups = _split_foreach_commands(args[args.index(";") + 1:])
+        if not groups:
+            return False
+        for g in groups:
+            if g[0].lower() in _SELF_DISPATCHING_COMMANDS:
+                return False
+            if self._effective_access(g[0].lower(), g[1:], m) != "all":
+                return False
+        return True
 
     def _inline_args_blocked(self, ctx: ReplyContext, m: "Any") -> bool:
         """True iff inline `$(...)` args are restricted to hosts on `m` and
@@ -3518,8 +3565,14 @@ async def match_top_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     parts = [
         f"**{m.name}** `{m.id}`",
         f"Game System: **{m.system_name}**",
-        f"Current Round Number: **{m.round_number}**",
     ]
+    # Under ATB rounds are disabled and round_number is frozen at 1, so
+    # reporting it would be actively misleading — show the turn clock, which
+    # is the one that actually advances there.
+    if m.rules.get("atb_enabled"):
+        parts.append(f"Turns Elapsed: **{m.turns_elapsed}** (ATB — no rounds)")
+    else:
+        parts.append(f"Current Round Number: **{m.round_number}**")
     if m.outcome is not None:
         oc = m.outcome
         extra = f" — {oc.get('reason')}" if oc.get("reason") else ""
@@ -4379,9 +4432,12 @@ async def reveal_fog_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if not recs:
                 continue
             cnt = sum(len(r.get("cells", ())) for r in recs)
+            # Name the clock each record was created under — under ATB the
+            # deadline counts turns, so calling it a round would mislead.
             spans = ", ".join(
                 ("permanent" if r.get("until") is None
-                 else f"through round {r['until']}") for r in recs)
+                 else f"through {'turn' if r.get('clock') == 'turn' else 'round'}"
+                      f" {r['until']}") for r in recs)
             lines.append(f"- `{team}`: {cnt} cell(s) [{spans}]")
         return await ctx.send("\n".join(lines) if len(lines) > 1
                               else "No active fog reveals.")
@@ -4437,7 +4493,8 @@ async def reveal_fog_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     except NotFound as ex:
         return await ctx.send(f"❌ {ex}")
     n = m.reveal_cells(team, cells, duration)
-    span = "permanently" if duration is None else f"for {duration} round(s)"
+    unit = "turn" if m.rules.get("atb_enabled") else "round"
+    span = "permanently" if duration is None else f"for {duration} {unit}(s)"
     return await ctx.send(
         f"Revealed {n} cell(s) to team `{team}` {span}."
         + ("" if m.fog_enabled else " ⚠️ fog is OFF on this match, so the "
@@ -4503,7 +4560,15 @@ def _split_foreach_commands(cmd_tokens: List[str]) -> List[List[str]]:
         "any command runs, so mutating the board mid-loop won't change the "
         "target set. The whole sweep is ONE undo entry; a per-entity `❌` is "
         "reported and the loop continues. Example: "
-        "`!foreach team=red near:boss:2 ; ent damage $id 5 ; ent set_var $id hit $i`."
+        "`!foreach team=red near:boss:2 ; ent damage $id 5 ; ent set_var $id hit $i`. "
+        "ACCESS is derived from CONTENT: a sweep whose every inner command is "
+        "read-only (`!foreach team=red ; ent info $id`) is player-available, "
+        "since it carries no more authority than running those commands one at "
+        "a time; if ANY inner command mutates, the whole sweep is host-gated and "
+        "a player's invocation queues for approval as usual. The check is "
+        "default-deny — an alias, a `$`-token in the command/subcommand "
+        "position, or a nested `batch`/`run`/`macro`/`eval`/`foreach` all count "
+        "as mutating, so spell read-only commands out."
     ),
 )
 async def foreach_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):

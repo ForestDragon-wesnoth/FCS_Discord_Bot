@@ -14571,3 +14571,128 @@ copies on load so a restored match can't mutate the retained snapshot, and load
 CLAMPS an out-of-range `active_index` so a snapshot written by an older build
 still restores to a usable cursor. Here the undo restores cleanly and the turn
 cursor stays valid — `!turn next` and `!state` both work.
+
+
+SCENARIO 564 — read-only !foreach is player-available (access derived from content)
+--------------------------------------------------------------------------------
+
+!match new rof ReadOnlyForeach 12 12
+!match use rof
+!ent add hero Hero 50 1 1 12
+!ent set_var hero team red
+!ent add mob Mob 50 3 3 8
+!ent set_var mob team red
+!as player bob
+!foreach team=red ; ent info $id
+!foreach team=red ; ent info $id ; dist $id mob
+!as host
+
+Expected: `!foreach` is host-gated because it wraps arbitrary commands, but its
+access is now derived from CONTENT, exactly like the READ_ONLY_SUBCOMMANDS
+downgrade: a sweep whose EVERY inner command resolves to access `all` carries no
+more authority than running those commands one at a time, so a PLAYER may run
+it. Here `bob` (a non-host) runs `ent info` and `dist` sweeps and they EXECUTE
+immediately — no approval request. Multiple read-only commands per entity work
+the same way. A host is unaffected and keeps full power.
+
+SCENARIO 565 — mutating !foreach still gated; read-only downgrade is default-deny
+--------------------------------------------------------------------------------
+
+!match new rog ReadOnlyGate 12 12
+!match use rog
+!ent add hero Hero 50 1 1 12
+!ent set_var hero team red
+!alias def smite "ent hp"
+!macro set evil "ent hp hero -5"
+!as player bob
+!foreach team=red ; ent hp $id -5
+!foreach team=red ; ent info $id ; ent hp $id -5
+!foreach team=red ; smite $id -5
+!foreach team=red ; ent dump $id
+!foreach team=red ; ent $id
+!foreach team=red ; batch ent hp $id -5
+!foreach team=red ; macro run evil
+!foreach team=red ; map full
+!as host
+!ent dump hero
+
+Expected: every sweep above is held for host approval and NOTHING mutates —
+`hero` still has 50 hp at the end. The downgrade is strictly DEFAULT-DENY, since
+the inner commands run through the deliberately ungated `dispatch_no_snapshot`:
+a MUTATING inner command (`ent hp`) gates the whole sweep, and one mutating
+command among read-only ones gates it too. An ALIAS (`smite`) is only expanded
+at inner-dispatch time, so the gate sees an unknown name and refuses — players
+must spell the underlying command out. `ent dump` is host-gated BY POLICY (it
+reveals GM-hidden vars), so it gates the sweep as well; a host can open it per
+match with `!host access set "ent dump" all`, and the sweep then becomes
+player-available, since the downgrade honors per-match overrides in both
+directions. A `$`-token in the command or subcommand position (`ent $id`) isn't
+a known read-only subcommand, so it resolves to host. Nested self-dispatching
+commands (`batch`/`run`/`macro`/`eval`/`foreach`) hide their real content from
+args[0] and are never treated as read-only. `map full` elevates via
+ELEVATED_ARGS. A host's explicit `!host access set foreach host` still beats the
+content downgrade entirely.
+
+
+SCENARIO 566 — ATB turn counter: turns_elapsed advances where rounds can't
+--------------------------------------------------------------------------------
+
+!system set default atb_enabled true
+!system set default atb_charge_formula "entity[self].initiative"
+!match new atbc ATBClock 12 12
+!match use atbc
+!ent add fast Fast 60 1 1 30
+!ent add slow Slow 60 3 3 10
+!turn next
+!turn next
+!turn next
+!turn next
+!eval "turns_elapsed()"
+!dist $(turns_elapsed()) 1 1 1
+!match_toplevel
+
+Expected: under ATB rounds are DISABLED, so `round_number` is frozen at 1
+forever and `round_number()` raises. `Match.turns_elapsed` is the monotonic
+count of turn boundaries and the only clock that advances there — after four
+`!turn next` it reads 4, exposed to formulas as `turns_elapsed()`. It counts in
+BOTH turn models (round-based play bumps it too), and it is the SERIALIZED
+counterpart of `MatchHistory._turn_index`, which `to_dict` excludes and so
+resets on save/load. `turns_elapsed()` is read-only, so it is classified
+ARG_SAFE and usable inside an inline `$()` argument. `!match_toplevel` reports
+"Turns Elapsed" instead of the frozen, misleading round number while ATB is on.
+
+SCENARIO 567 — ATB: a `turns=N` fog reveal now expires (was permanent)
+--------------------------------------------------------------------------------
+
+!system set default atb_enabled true
+!system set default atb_charge_formula "entity[self].initiative"
+!match new atbr ATBReveal 12 12
+!match use atbr
+!ent add scout Scout 40 2 2 20
+!ent set_var scout team red
+!ent set_var scout fog_vision_radius 1
+!ent add ally Ally 40 4 4 10
+!ent set_var ally team red
+!ent set_var ally fog_vision_radius 1
+!match fog on
+!reveal_fog red at 9 9 1 turns=2
+!reveal_fog list
+!turn next
+!turn next
+!turn next
+!turn next
+!turn next
+!reveal_fog list
+
+Expected: `!reveal_fog ... turns=N` stored its deadline as `round_number + N`,
+but ATB freezes `round_number`, so the deadline never came due and a TEMPORARY
+reveal was permanent (found in audit-pass-24, left open pending this counter).
+`reveal_cells` now keys the deadline to whichever clock actually ADVANCES: under
+ATB it counts `turns_elapsed` and tags the record `clock: "turn"`; in round mode
+it stays round-keyed (`clock: "round"`), so round-based play is unchanged. The
+record carries the clock it was created under, so a match that switches turn
+models mid-session still expires existing reveals correctly, and a record
+written before this field predates it and reads as round-keyed. Both fields
+survive save/load. Here the reveal is listed while live, then expires and is
+pruned once five turns have elapsed. A reveal with no `turns=` is permanent and
+is unaffected.

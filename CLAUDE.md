@@ -1801,7 +1801,38 @@ More shipped work (continuing the list above):
     no player bypass). The DEFERRED third piece — a player-usable READ-ONLY
     `!foreach` — was intentionally left out (it overlaps `!find show:/sort:`,
     which already gives players per-entity readouts, and it adds an
-    access-gating surface worth a design decision first).
+    access-gating surface worth a design decision first). SHIPPED — see below.
+  - **Read-only `!foreach` — SHIPPED (scenarios 564-565).** The third follow-up.
+    Enable mechanism (user's call): NO new command and no opt-in token —
+    `!foreach`'s access is DERIVED FROM CONTENT, the same shape as the existing
+    READ_ONLY_SUBCOMMANDS downgrade. `CommandRegistry._foreach_read_only(args,
+    m)` splits the sweep's inner command groups and downgrades the base access
+    from `host` to `all` iff EVERY group resolves to `all` via a recursive
+    `_effective_access` call. Rationale: a sweep of read-only commands carries
+    no more authority than running those commands one at a time. A MUTATING
+    sweep is unchanged — still host-gated, and a player's invocation still
+    QUEUES for approval (not refused), so the existing approval flow just works.
+    The downgrade is applied BEFORE the per-match override tables, so a host's
+    explicit `!host access set foreach host` still beats it; and because the
+    check calls `_effective_access` per inner command, it tracks per-match
+    overrides in BOTH directions — `!host access set "ent dump" all` immediately
+    makes a `; ent dump $id` sweep player-available.
+    STRICTLY DEFAULT-DENY (the safety rests here, since inner commands run
+    through the deliberately ungated `dispatch_no_snapshot`). Verified blocked:
+    a mutating inner command anywhere in the sweep (incl. mixed with read-only
+    ones); ALIASES (expanded only at inner-dispatch time, so the gate sees an
+    unknown name — players must spell the real command out); a `$`-token in the
+    command OR subcommand position (`; ent $id`, `; $id dump`, `; ent $(...)`)
+    since a token is never a known read-only subcommand; the SELF-DISPATCHING
+    metas (`foreach`/`batch`/`run`/`macro`/`eval`, new frozenset
+    `_SELF_DISPATCHING_COMMANDS`) whose real content isn't in args[0] and where
+    a nested foreach would recurse; and ELEVATED_ARGS (`; map full`). GOTCHA
+    worth remembering: `ent dump` is NOT in READ_ONLY_SUBCOMMANDS by deliberate
+    policy (it reveals GM-hidden vars), so `; ent dump $id` gates a sweep —
+    use `ent info` for the player-available readout. Also note the selector
+    itself still uses the `!find` grammar, which by design IGNORES fog/
+    visibility; that's pre-existing (a player could already run `!find`), not a
+    new leak, and `!host access` remains the lever for a fog match.
 - **Audit-pass-4 fixes: multi-tile interaction sweep (scenarios 491-492).** A
   fourth interaction-bug sweep, this time hunting anchor-only assumptions in
   OLDER features against multi-tile entities (three read-only survey agents
@@ -2346,6 +2377,43 @@ More shipped work (continuing the list above):
     less surface, or for hosts. The same "tighten reads for a fog match" lever as
     `command_access`. Default stays permissive; a fog GM opts into the lockdown.
 
+- **ATB turn clock (`Match.turns_elapsed`) — SHIPPED (scenarios 566-567).** The
+  monotonic count of TURN boundaries in a match, and the fix for the pass-24
+  open item. Under ATB rounds are disabled and `round_number` is frozen at 1
+  forever, so anything keyed on rounds silently misbehaves there; this is the
+  only clock that advances.
+  - **Where it bumps:** the new `Match._begin_turn()` — `turns_elapsed += 1`
+    then `history.record_turn(self)`. Every exit of `next_turn` /
+    `_atb_next_turn` already called `record_turn` (10 sites, INCLUDING the ones
+    that return no actor — an emptied turn order or an all-skippable table), so
+    routing them all through one helper keeps the counter exactly in lockstep
+    with `MatchHistory._turn_index` and stops the two drifting. It counts in
+    BOTH turn models: it is the SERIALIZED counterpart of `_turn_index`, which
+    `to_dict` excludes and so resets on save/load — that was precisely why
+    `_turn_index` couldn't back durations.
+  - **DESIGN CALLS (user-approved shape):** counts in round mode too (harmless
+    and more useful than an ATB-only field); `turn_index()` is UNCHANGED and
+    still RAISES under ATB, because it means "position within the round" — a
+    global elapsed count is a different quantity, so conflating them would
+    mislead. Rolled back by a history restore along with the rest of the state.
+  - **Fog reveals expire under ATB (the payoff).** `reveal_cells` keys the
+    deadline to whichever clock advances: under ATB `turns_elapsed + duration`
+    tagged `clock: "turn"`, else `round_number + duration` tagged
+    `clock: "round"`. `_active_reveals` compares each record against the clock
+    it was CREATED under, so a match that switches turn models mid-session
+    still expires existing reveals correctly, and a record with no `clock`
+    predates the field and reads as round-keyed. Both fields round-trip through
+    save/load. Round-based play is byte-for-byte unchanged.
+  - **Surface:** formula prim `turns_elapsed()` (read-only → classified
+    ARG_SAFE, so it works inside inline `$()` args; the module-load drift guard
+    caught the missing classification, as designed). `!match_toplevel` /
+    `!state` show "Turns Elapsed" instead of the frozen round number while ATB
+    is on — the flagged ATB-aware readout. `!reveal_fog` messages now name the
+    right unit ("for 2 turn(s)" / "through turn 2" under ATB, "round" otherwise)
+    rather than always saying rounds.
+  - NOTE `!undo` was already shipped (a thin forwarder to `!history undo` that
+    passes every arg through); it was listed as a feature idea in error.
+
 - **Audit-pass-28 (hands-on, LONG): snapshot `turn_order` aliasing + a DEAD
   gamerule (scenario 563).** Two new techniques carried this pass, both worth
   reusing: **systematic REGISTRY-vs-CODE invariant checks** and a **randomized
@@ -2621,9 +2689,9 @@ More shipped work (continuing the list above):
     turn_index() under ATB" already flagged as a FUTURE item in the ATB entry, so
     its shape (field name, whether it's exposed as a formula prim, whether
     `turn_index()` returns it under ATB instead of raising, whether it counts in
-    round mode too) is the user's design call — I asked rather than guess. Until
-    then: under ATB, `turns=N` reveals behave as permanent; use `!reveal_fog
-    <team> clear` to end them.
+    round mode too) is the user's design call — I asked rather than guess.
+    RESOLVED — the counter shipped as `Match.turns_elapsed`; see the ATB
+    turn-clock entry below.
   - Verified CORRECT in the same sweep (no change): the rest of the history
     subsystem — manual save → mutate → restore, restoring the SAME snapshot
     TWICE (no snapshot corruption, i.e. the pass-7 load-side deepcopy holds),

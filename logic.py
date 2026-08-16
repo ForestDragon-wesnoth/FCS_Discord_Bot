@@ -5013,6 +5013,14 @@ class Match:
     #fire once per entity per round, while on_round_* hooks fire
     #once per round across the whole table.
     round_number: int = 1
+    # Monotonic count of TURN boundaries that have occurred, across the whole
+    # match. The serialized counterpart of MatchHistory._turn_index (which
+    # to_dict excludes, so it resets on save/load) — bumped by _begin_turn in
+    # BOTH turn models. Under ATB rounds are disabled and round_number is
+    # frozen at 1 forever, so this is the ONLY clock that advances there; it's
+    # what turn-based durations key on. Never decremented (a history restore
+    # rolls it back with the rest of the state).
+    turns_elapsed: int = 0
     # Tracks whether the very first `on_round_start`/`on_turn_start` have fired
     # for this match. False until the first `Match.next_turn()` call. Used to
     # make that first call begin the round (fire start-hooks for active_index)
@@ -7674,12 +7682,22 @@ class Match:
     # ---- fog reveals (scout / clairvoyance) ----
     def _active_reveals(self, team: str) -> "list":
         """The team's non-expired reveal records, pruning expired ones in
-        place (lazy cleanup keyed off round_number)."""
+        place. Each record is compared against the clock it was CREATED
+        under — `clock: "turn"` (ATB, where round_number never moves) against
+        turns_elapsed, anything else against round_number. A record with no
+        `clock` predates the field and is treated as round-keyed."""
         recs = self.fog_reveals.get(team)
         if not recs:
             return []
-        live = [r for r in recs
-                if r.get("until") is None or int(r["until"]) >= self.round_number]
+
+        def _live(r) -> bool:
+            if r.get("until") is None:
+                return True
+            now = (self.turns_elapsed if r.get("clock") == "turn"
+                   else self.round_number)
+            return int(r["until"]) >= now
+
+        live = [r for r in recs if _live(r)]
         if len(live) != len(recs):
             if live:
                 self.fog_reveals[team] = live
@@ -7704,9 +7722,21 @@ class Match:
                    if self.in_bounds(int(x), int(y))}
         if not clipped:
             return 0
-        until = None if duration is None else self.round_number + int(duration)
-        self.fog_reveals.setdefault(team, []).append(
-            {"cells": clipped, "until": until})
+        # Key the deadline to whichever clock actually ADVANCES. Under ATB
+        # rounds are disabled and round_number is frozen, so a round-keyed
+        # `until` would never come due and a temporary reveal would be
+        # permanent; there we count turns instead. The record carries the
+        # clock it was created under so a match that switches turn models
+        # mid-session still expires its existing reveals correctly.
+        if duration is None:
+            rec = {"cells": clipped, "until": None}
+        elif self.rules.get("atb_enabled"):
+            rec = {"cells": clipped, "clock": "turn",
+                   "until": self.turns_elapsed + int(duration)}
+        else:
+            rec = {"cells": clipped, "clock": "round",
+                   "until": self.round_number + int(duration)}
+        self.fog_reveals.setdefault(team, []).append(rec)
         return len(clipped)
 
     def clear_reveals(self, team: str) -> int:
@@ -8923,7 +8953,7 @@ class Match:
             # An opening round_start hook/tick may have removed every
             # entity — nothing to start.
             if not self.turn_order:
-                self.history.record_turn(self)
+                self._begin_turn()
                 return (None, log)
             # The opening entity may itself be skippable (e.g. starts
             # stunned) — skip forward to the first eligible one.
@@ -8932,7 +8962,7 @@ class Match:
             # on_round_end/start hooks) can itself empty the order — re-check
             # before indexing, same guard as after the turn_end/advance steps.
             if not self.turn_order:
-                self.history.record_turn(self)
+                self._begin_turn()
                 return (None, log)
             cur = self.turn_order[self.active_index]
             if eligible:
@@ -8950,7 +8980,7 @@ class Match:
                     "⏭️ every entity is skippable; the round passes "
                     "without anyone acting."
                 )
-            self.history.record_turn(self)
+            self._begin_turn()
             return (cur, log)
 
         # Normal transition.
@@ -8966,20 +8996,20 @@ class Match:
         # With no one left, end here rather than advancing into an empty
         # turn order.
         if not self.turn_order:
-            self.history.record_turn(self)
+            self._begin_turn()
             return (None, log)
         self._advance_index(log)
         # _advance_index's round-wrap hooks (on_round_end/start ticks) can
         # likewise empty the order; re-check before reading the next entity.
         if not self.turn_order:
-            self.history.record_turn(self)
+            self._begin_turn()
             return (None, log)
         # Skip over any entity carrying a skip-status flag.
         eligible = self._skip_to_eligible(log)
         # _skip_to_eligible's internal round-wrap hooks can empty the order;
         # re-check before reading the next entity (mirrors the guard above).
         if not self.turn_order:
-            self.history.record_turn(self)
+            self._begin_turn()
             return (None, log)
         new_cur = self.turn_order[self.active_index]
         if eligible:
@@ -8997,8 +9027,18 @@ class Match:
                 "⏭️ every entity is skippable; the round passes "
                 "without anyone acting."
             )
-        self.history.record_turn(self)
+        self._begin_turn()
         return (new_cur, log)
+
+    def _begin_turn(self) -> None:
+        """Mark a turn boundary: advance the persistent turn clock, then take
+        the turn autosave. Called at EVERY exit of next_turn / _atb_next_turn
+        (including the ones that return no actor — an emptied turn order or an
+        all-skippable table), so `turns_elapsed` stays exactly in lockstep with
+        MatchHistory._turn_index. Kept as one helper rather than bumping the
+        counter at each site so the two can't drift apart."""
+        self.turns_elapsed += 1
+        self.history.record_turn(self)
 
     # ---- Active Time Battle ------------------------------------------------
     @staticmethod
@@ -9174,11 +9214,11 @@ class Match:
                     cur, "turn_end", act=not self._atb_last_skipped))
         self.round_started = True
         if not self.turn_order:
-            self.history.record_turn(self)
+            self._begin_turn()
             return (None, log)
         new_cur = self._atb_select(log)
         if new_cur is None:
-            self.history.record_turn(self)
+            self._begin_turn()
             return (None, log)
         # A skipped actor's turn still ELAPSES (bar already reset, status ticks
         # fire) but it performs no action.
@@ -9190,7 +9230,7 @@ class Match:
         # turn_start for the new actor (active_index now points at it).
         log.extend(self._atb_turn_phase(
             new_cur, "turn_start", act=not skipping))
-        self.history.record_turn(self)
+        self._begin_turn()
         return (new_cur, log)
 
     def _advance_index(self, log: List[str]) -> None:
@@ -12456,6 +12496,7 @@ class Match:
             "system_name": self.system_name,
             "rules": copy.deepcopy(self.rules),
             "round_number": self.round_number,
+            "turns_elapsed": self.turns_elapsed,
             "round_started": self.round_started,
             "global_passives": {pid: p.to_dict() for pid, p in self.global_passives.items()},
             "groups": {name: list(members) for name, members in self.groups.items()},
@@ -12515,7 +12556,8 @@ class Match:
             },
             "fog_reveals": {
                 team: [{"cells": sorted([x, y] for (x, y) in r.get("cells", ())),
-                        "until": r.get("until")}
+                        "until": r.get("until"),
+                        "clock": r.get("clock", "round")}
                        for r in recs]
                 for team, recs in self.fog_reveals.items()
             },
@@ -12564,6 +12606,7 @@ class Match:
             m.active_index = 0
         # m.rules already set above
         m.round_number = int(d.get("round_number", 1))
+        m.turns_elapsed = int(d.get("turns_elapsed", 0))
         m.round_started = bool(d.get("round_started", False))
         m.global_passives = {
             pid: Passive.from_dict(pd)
@@ -12721,7 +12764,8 @@ class Match:
             team: [
                 {"cells": {(int(c[0]), int(c[1])) for c in r.get("cells", [])
                            if isinstance(c, (list, tuple)) and len(c) == 2},
-                 "until": (int(r["until"]) if r.get("until") is not None else None)}
+                 "until": (int(r["until"]) if r.get("until") is not None else None),
+                 "clock": ("turn" if r.get("clock") == "turn" else "round")}
                 for r in recs if isinstance(r, dict)
             ]
             for team, recs in raw_rev.items()
