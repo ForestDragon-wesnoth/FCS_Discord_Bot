@@ -62,19 +62,49 @@ def ctx_user_name(ctx: "ReplyContext") -> str:
 # ---- Command registry --------------------------------------------------------
 Handler = Callable[[ReplyContext, List[str], MatchManager], Any]
 
-# Subcommand names that are read-only across every command root, so a
-# host-gated root invoked with one of these as its first argument is
-# downgraded to "all" (anyone may run it). Conservative on purpose: these
-# names never mutate state anywhere in the command surface, so the
-# downgrade can't open a write hole. The per-match command_access rule
-# can re-tighten any of them for fog-of-war matches.
-READ_ONLY_SUBCOMMANDS: frozenset = frozenset({
-    "list", "info", "cells", "diff", "channels", "hosts", "outcome",
+# Read-only subcommands PER ROOT: a host-gated root invoked with one of ITS
+# listed subcommands as the first argument is downgraded to "all" (anyone may
+# run it). The per-match command_access rule can re-tighten any of them for
+# fog-of-war matches.
+#
+# Keyed by root on purpose (default-DENY). This used to be one global word set
+# applied to EVERY host root, which opened a gate bypass: for a root whose
+# args[0] is free CONTENT rather than a subcommand, a read-only word there was
+# never a subcommand at all. A player's `!batch list ; ent hp boss -40` ran
+# unapproved (args[0] = "list" downgraded the whole batch), and `!emit roll`
+# fired an event. Now a word only downgrades a root whose handler actually
+# dispatches it as a read-only subcommand; a new command gets no downgrade
+# until it's listed here. The module-end check asserts every key is a
+# registered command.
+READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
+    "action":     frozenset({"list", "info"}),
+    "alias":      frozenset({"list", "info"}),
+    "clamp":      frozenset({"list"}),
+    "defpassive": frozenset({"list"}),
+    "defvar":     frozenset({"list"}),
+    "ent":        frozenset({"info"}),
+    "func":       frozenset({"list", "info"}),
+    "gclamp":     frozenset({"list"}),
+    "gpassive":   frozenset({"list", "info"}),
+    "history":    frozenset({"list", "diff"}),
+    "macro":      frozenset({"list"}),
+    "match":      frozenset({"channels", "hosts", "outcome"}),
+    "mount":      frozenset({"list", "info"}),
+    "part":       frozenset({"list", "info"}),
+    "passive":    frozenset({"list", "info"}),
+    "reveal_fog": frozenset({"list"}),
+    "schedule":   frozenset({"list"}),
+    "status":     frozenset({"list", "info"}),
+    "system":     frozenset({"list", "info"}),
     # `!table roll <name>` only rolls a stored table (advances the RNG, no
     # board mutation), so players may roll a GM-defined table. def/remove stay
     # host-gated.
-    "roll",
-})
+    "table":      frozenset({"list", "roll"}),
+    "team":       frozenset({"list"}),
+    "tile":       frozenset({"list", "info"}),
+    "watch":      frozenset({"list"}),
+    "zone":       frozenset({"list", "info", "cells"}),
+}
 # `dump` is intentionally NOT in the set above: `!ent dump` reveals an
 # entity's full var tree (including GM-hidden data), so it stays host-
 # gated by default. A host can open it per match with
@@ -130,7 +160,7 @@ class CommandRegistry:
         #               (no queue) — for the approval commands themselves
         #   "owner"     only the match owner may run it; others rejected
         # A host-gated root is downgraded to "all" when its first arg is a
-        # known read-only subcommand (READ_ONLY_SUBCOMMANDS), and the
+        # read-only subcommand OF THAT ROOT (READ_ONLY_SUBCOMMANDS), and the
         # active match's command_access rule can override any of this.
         self._access: Dict[str, str] = {}
         self._raw_args: Dict[str, bool] = {}
@@ -289,7 +319,7 @@ class CommandRegistry:
         overridden by the active match's command_access rule. `m` is the
         active Match (or None)."""
         base = self._access.get(name, "host")
-        if base == "host" and args and args[0].lower() in READ_ONLY_SUBCOMMANDS:
+        if base == "host" and args and args[0].lower() in READ_ONLY_SUBCOMMANDS.get(name, ()):
             base = "all"
         elif base == "host" and not args and name in READ_ONLY_BARE_ROOTS:
             # Bare view form of a root that mutates only via subcommands.
@@ -10106,3 +10136,10 @@ async def _run_action_dispatch(
 async def help_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     title, body = registry.help_for(args)
     await ctx.send(f"**{title}**\n{body}")
+
+
+# Every root with a read-only-subcommand downgrade must be a registered
+# command: a typo'd key would silently leave that root's reads host-gated.
+_unregistered_ro = set(READ_ONLY_SUBCOMMANDS) - set(registry._handlers)
+assert not _unregistered_ro, (
+    f"READ_ONLY_SUBCOMMANDS names unregistered commands: {sorted(_unregistered_ro)}")

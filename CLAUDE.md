@@ -624,8 +624,13 @@ Shipped capabilities (roughly chronological; all merged):
     `"host"` (DEFAULT, mutating — non-host's invocation is held for
     approval) / `"host_only"` (approve/deny themselves) / `"owner"`
     (host mgmt). A host-gated root auto-downgrades to "all" when its
-    first arg is in `READ_ONLY_SUBCOMMANDS` (list/info/dump/cells/...),
-    so players can inspect but not mutate. Gate is a NO-OP when there's
+    first arg is one of THAT ROOT's read-only subcommands
+    (`READ_ONLY_SUBCOMMANDS`, a per-root dict — `list`/`info`/`cells`/...;
+    `dump` deliberately excluded), so players can inspect but not mutate.
+    It is PER ROOT because a global word set let a player's `!batch list ;
+    ent hp boss -40` run unapproved (args[0] of batch/emit/eval/run is
+    content, not a subcommand — scenario 570); a new command gets no
+    downgrade until its read-only subs are listed there. Gate is a NO-OP when there's
     no active match, no identity, or `owner is None` (legacy/open
     matches). Alias resolution runs BEFORE the gate; `dispatch_no_snapshot`
     (batch/run/action `cmd()`) is intentionally ungated since it's only

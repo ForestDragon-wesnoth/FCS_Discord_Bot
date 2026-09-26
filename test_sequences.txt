@@ -14773,3 +14773,39 @@ ties break on the lower id so results are deterministic, and `''` comes back
 when nothing qualifies — so `b` (12 hp) and `c` (44 hp) here, and `''` for a var
 nobody has. Both are read-only and classified ARG_SAFE, so they work inside
 inline `$()` arguments.
+
+
+SCENARIO 570 — read-only downgrade is per-command: no `!batch list` bypass
+--------------------------------------------------------------------------------
+
+!match new rsg ReadOnlyScope 12 12
+!match use rsg
+!ent add boss Boss 50 1 1 12
+!table def loot gold:1
+!gpassive add alarm event:list "entity[boss].hp = entity[boss].hp - 7"
+!as player bob
+!batch list ; ent hp boss -40
+!emit list
+!foreach list ; ent hp boss -5
+!list
+!table roll loot
+!table list
+!match outcome
+!status list
+!zone list
+!ent info boss
+!as host
+!pending
+!ent info boss
+
+Expected: the player's `!batch list ; ent hp boss -40`, `!emit list`, and
+`!foreach list ; ...` are all HELD for host approval (`!pending` lists r1-r3),
+and `boss` still has 50 hp at the end. Before the fix, a read-only word as the
+FIRST argument (`list`, `info`, `roll`, `cells`, ...) downgraded ANY host-gated
+command to player-available, including roots whose first argument is free
+content rather than a subcommand — so the batch ran unapproved (40 damage) and
+the emit fired the `event:list` handler (7 more). The downgrade is now keyed per
+command (READ_ONLY_SUBCOMMANDS maps each root to the read-only subcommands its
+handler actually dispatches), so real reads stay player-available: `!list`,
+`!table roll loot`, `!table list`, `!match outcome`, `!status list`,
+`!zone list`, and `!ent info boss` all run directly for the player.
