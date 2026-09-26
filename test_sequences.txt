@@ -14984,3 +14984,30 @@ state after the undo), so every later `!undo command 1` re-restored it — a sil
 no-op still reporting "Undid 1 command(s)" — and boss stayed at 43. The fourth
 undo reports that no command snapshot is left. The last line restores the
 default so later scenarios aren't affected.
+
+
+SCENARIO 576 — !log: players read, host clears, admin edits templates
+--------------------------------------------------------------------------------
+
+!match new lgm LogGate 6 6
+!match use lgm
+!ent add a A 10 1 1 5
+!ent hp a -3
+!as player mallory
+!log
+!log format
+!log format hp_changed PWNED
+!log clear
+!as host
+!log
+!pending
+
+Expected: `!log` is open to everyone for READING — the player sees both entries
+(spawn + 3 damage) and can list the templates with bare `!log format`. Writing
+is not: `!log format hp_changed PWNED` is refused ("Only a server
+administrator") because templates live on the shared GAME SYSTEM and refresh
+into every match on it, and `!log clear` wipes the match's log, so it's
+host-gated like any mutation — held for approval (request `r1` in `!pending`).
+Back as the host, the log still has both entries. Before the fix `!log` was
+access `all` with no elevation, so the player's two commands overwrote the
+system-wide `hp_changed` template and emptied the log.

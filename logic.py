@@ -1257,8 +1257,9 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "default": 20,
         "schema": {"type": "int"},
         "desc": (
-            "Max depth of nested `!macro run` calls (a macro line that runs "
-            "another macro). Guards against self/mutually-recursive macros "
+            "Max depth of nested `!macro run` / `!run` calls (a macro line or "
+            "script line that runs another macro or script, counted as one "
+            "stack). Guards against self/mutually-recursive macros and scripts "
             "exhausting the Python stack — the step limit can't, since each "
             "`!macro run` starts with a fresh step budget. The run aborts with "
             "an error when exceeded."

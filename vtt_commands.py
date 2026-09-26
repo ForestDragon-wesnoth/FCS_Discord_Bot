@@ -177,6 +177,8 @@ ELEVATED_ARGS: Dict[str, frozenset] = {
     "map": frozenset({"full", "resize", "color", "teamcolor", "layer",
                       "legend", "autoupdate", "background", "border", "mode"}),
     "list": frozenset({"full"}),
+    # `!log` reads for anyone, but `clear` wipes the match's event log.
+    "log": frozenset({"clear"}),
 }
 
 # Commands that act on BOT-WIDE state — shared GameSystems (every match on
@@ -215,6 +217,10 @@ def _admin_required(name: str, args: List[str]) -> bool:
         return True
     if name == "history":
         return sub in ("export", "import")  # host disk I/O
+    if name == "log":
+        # `!log format <type> ...` sets/resets a template ON THE GAME SYSTEM
+        # (every match on it refreshes); bare `!log format` only lists.
+        return sub == "format" and len(args) >= 2
     return False
 
 
@@ -9142,11 +9148,29 @@ async def run_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"No commands in `{path}` (file was empty or only "
             f"blank/comment lines)."
         )
+    # Nesting guard, shared with `!macro run` (same counter, same rule): a
+    # script line can `run` another script (or itself), and before this a
+    # self-referencing file posted ~490 "Running..." lines and then 💥'd on
+    # Python's recursion limit. Tracked on the manager, so a macro -> run ->
+    # macro chain is bounded as one stack.
+    mid = mgr.active_by_channel.get(ctx.channel_key)
+    m_rules = mgr.matches[mid].rules if mid in mgr.matches else {}
+    rec_limit = int(m_rules.get(
+        "macro_recursion_limit", RULES_REGISTRY["macro_recursion_limit"]["default"]))
+    depth = getattr(mgr, "_macro_depth", 0)
+    if depth >= rec_limit:
+        return await ctx.send(
+            f"❌ `{path}`: nesting limit ({rec_limit}) exceeded — a script or "
+            f"macro keeps running itself (macro_recursion_limit).")
     await ctx.send(
         f"Running {len(subcommands)} command(s) from `{path}`..."
     )
-    for sub in subcommands:
-        await registry.dispatch_no_snapshot(sub[0], sub[1:], ctx, mgr)
+    mgr._macro_depth = depth + 1
+    try:
+        for sub in subcommands:
+            await registry.dispatch_no_snapshot(sub[0], sub[1:], ctx, mgr)
+    finally:
+        mgr._macro_depth = depth
 
 
 def _macro_subst(line: str, mac_args: List[str],
