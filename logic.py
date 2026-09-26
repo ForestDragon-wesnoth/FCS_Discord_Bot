@@ -13490,19 +13490,35 @@ class Match:
         else:
             x0, y0, x1, y1 = 1, 1, self.grid_width, self.grid_height
 
-        # Compose, wrapping each cell in its ANSI color when colorizing.
+        # Compose. When colorizing, a color code is emitted once per RUN of
+        # same-colored cells (reset at each change and at row end) rather than
+        # wrapped around every cell: each code pair costs ~9 characters, and
+        # Discord caps a message at 2000, so a colored zone/terrain block
+        # would otherwise multiply the map's size. (The separator space
+        # inside a run takes the run's color — invisible on a space.)
         lines = []
         for yy in range(y0, y1 + 1):
-            cells = []
+            if not colorize:
+                lines.append(" ".join(grid[yy][xx]
+                                      for xx in range(x0, x1 + 1)))
+                continue
+            parts: List[str] = []
+            active = None
             for xx in range(x0, x1 + 1):
-                ch = grid[yy][xx]
-                if colorize:
-                    name = colors[yy][xx]
-                    code = TEXT_COLORS.get(name) if name else None
+                if xx > x0:
+                    parts.append(" ")     # stays in the previous run's span
+                name = colors[yy][xx]
+                code = TEXT_COLORS.get(name) if name else None
+                if code != active:
+                    if active:
+                        parts.append("\x1b[0m")
                     if code:
-                        ch = f"\x1b[{code}m{ch}\x1b[0m"
-                cells.append(ch)
-            lines.append(" ".join(cells))
+                        parts.append(f"\x1b[{code}m")
+                    active = code
+                parts.append(grid[yy][xx])
+            if active:
+                parts.append("\x1b[0m")
+            lines.append("".join(parts))
         out = "\n".join(lines)
 
         # Auto-legend: glyph -> meanings, collected from the cells actually

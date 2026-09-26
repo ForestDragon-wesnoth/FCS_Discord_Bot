@@ -45,31 +45,75 @@ def _split_for_discord(message: str, limit: int = DISCORD_MAX_CONTENT) -> List[s
     line is never cut across two messages. Consecutive lines are packed
     into one chunk until the next line wouldn't fit.
 
-    A single line longer than `limit` (no newline to break on) is the one
-    case we can't honor cleanly — it's hard-split into limit-sized pieces
-    as a last resort. Returns at least one chunk (the message unchanged
-    when it already fits, including the empty string)."""
+    Code-fence aware: a map arrives as one ```ansi block, and a plain line
+    split would leave the first chunk's fence unclosed and the next chunk's
+    rows unfenced (both render as garbage on Discord). When a chunk ends
+    INSIDE a fence it is closed, and the next chunk reopens it with the same
+    opener line (so `ansi` coloring carries over). Room for the closing
+    fence is reserved while packing a fenced chunk, and a chunk never ends
+    on a bare opener (that would post an empty block).
+
+    A single line longer than the space available (no newline to break on)
+    is the one case we can't honor cleanly — it's hard-split into
+    limit-sized pieces as a last resort. Returns at least one chunk (the
+    message unchanged when it already fits, including the empty string)."""
     if len(message) <= limit:
         return [message]
+    close = "\n```"
     chunks: List[str] = []
-    cur = ""
+    # None = no chunk in progress. Distinct from "" so an EMPTY line at the
+    # start of a chunk is kept rather than silently swallowed.
+    cur: Optional[str] = None
+    opener: Optional[str] = None      # the ``` line of the fence we're inside
+
+    def _has_content(c: Optional[str]) -> bool:
+        # A chunk holding only the re-opened fence carries nothing to flush.
+        return c is not None and c != opener
+
+    def _flush(c: str) -> None:
+        if opener is not None and c.endswith("\n" + opener):
+            # Don't strand an empty block: the opener moves to the next
+            # chunk along with the content it introduces.
+            chunks.append(c[:-(len(opener) + 1)])
+        else:
+            chunks.append(c + (close if opener is not None else ""))
+
     for line in message.split("\n"):
-        # Flush the current chunk if appending this line (plus the
-        # rejoining newline, when cur is non-empty) would overflow.
-        if cur and len(cur) + 1 + len(line) > limit:
-            chunks.append(cur)
-            cur = ""
-        if len(line) > limit:
-            # Oversized single line: flush whatever's buffered, then
-            # hard-split the line itself.
-            if cur:
-                chunks.append(cur)
-                cur = ""
+        is_fence = line.lstrip().startswith("```")
+        if is_fence and opener is not None and cur == opener:
+            # Closing a block whose content all went out already (after a
+            # hard split): the re-opened fence would post an empty block.
+            cur, opener = None, None
+            continue
+        # Inside a fence, every content line must leave room for the close;
+        # the closing fence line itself IS the close, so it needs none.
+        reserve = len(close) if (opener is not None and not is_fence) else 0
+        # What a fresh chunk would start with before this line.
+        base = len(opener) + 1 if opener is not None else 0
+        if base + len(line) + reserve > limit:
+            # Oversized single line: flush whatever's buffered (closing an
+            # open fence), then hard-split the line itself.
+            if _has_content(cur):
+                _flush(cur)
             for i in range(0, len(line), limit):
                 chunks.append(line[i:i + limit])
+            if is_fence:
+                opener = None if opener is not None else line.lstrip()
+            # Still inside a fence: the next chunk re-opens it.
+            cur = opener
             continue
-        cur = line if not cur else cur + "\n" + line
-    if cur:
+        if _has_content(cur) and len(cur) + 1 + len(line) + reserve > limit:
+            _flush(cur)
+            if is_fence and opener is not None:
+                # This line WAS the close, and the flush already closed the
+                # block — don't re-open it just to post an empty one.
+                cur, opener = None, None
+                continue
+            cur = opener
+        cur = line if cur is None else cur + "\n" + line
+        if is_fence:
+            opener = None if opener is not None else line.lstrip()
+    if cur is not None:
         chunks.append(cur)
     return chunks
 
@@ -146,9 +190,12 @@ class DiscordCtxWrapper:
         self.cli_mutable = False
     async def send(self, message: str):
         # Split over-long output at line boundaries so we never trip
-        # Discord's content-length cap (see _split_for_discord).
+        # Discord's content-length cap (see _split_for_discord). Discord also
+        # rejects an EMPTY / whitespace-only message (API error 50006), so a
+        # handler whose output happened to be empty must not crash the send.
         for chunk in _split_for_discord(message):
-            await self._ctx.send(chunk)
+            if chunk.strip():
+                await self._ctx.send(chunk)
 
     async def set_autoupdate(self, m, on: bool) -> str:
         """Turn this channel's self-refreshing map board on/off. Posts the
@@ -260,7 +307,8 @@ class _InteractionCtx:
 
     async def send(self, message: str):
         for chunk in _split_for_discord(message):
-            await self._channel.send(chunk)
+            if chunk.strip():   # Discord rejects empty messages (see above)
+                await self._channel.send(chunk)
 
 
 class _ApprovalView(discord.ui.View):
@@ -396,22 +444,46 @@ def _get_sprite_loader():
 
 def _board_render(m, channel_key: str) -> Tuple[str, bool]:
     """(message text, viewport_engaged) for a channel's board: the same
-    POV + viewport + legend render as `!map`, with a windowed header."""
+    POV + viewport + legend render as `!map`, with a windowed header.
+
+    A board is ONE message edited in place, so unlike a `!map` reply it
+    can't be split across messages — and an edit over Discord's content cap
+    fails, which used to silently drop the board. ANSI color costs ~9 chars
+    per colored cell, so a default 30x30 window with a dozen or so team-
+    colored units already crosses 2000. Degrade instead: drop color, then
+    the legend; if even the bare map is too big, say so (the viewport rules
+    set the window size)."""
     pov = m.channel_pov(channel_key)
     mode = str(m.rules.get("viewport_mode", "auto"))
     enabled = mode != "off"   # Discord is viewport_capable; auto => on
     viewport = m.resolve_viewport(channel_key, enabled=enabled)
     legend = bool(getattr(m, "map_legend_enabled", False))
     colorize = bool(getattr(m, "color_enabled", True))
-    body = m.render_ascii(pov, colorize=colorize, viewport=viewport,
-                          legend=legend)
-    fence = "ansi" if colorize else ""
     header = ""
     if viewport:
         vx, vy, vw, vh = viewport
         header = (f"🗺️ viewport ({vx},{vy})–({vx + vw - 1},{vy + vh - 1}) "
                   f"of {m.grid_width}×{m.grid_height}\n")
-    return f"{header}```{fence}\n{body}\n```", bool(viewport)
+    # Richest first; each fallback drops one optional layer.
+    attempts = [(colorize, legend), (False, legend), (False, False)]
+    text = ""
+    for col, leg in dict.fromkeys(attempts):
+        body = m.render_ascii(pov, colorize=col, viewport=viewport, legend=leg)
+        text = f"{header}```{'ansi' if col else ''}\n{body}\n```"
+        if len(text) <= DISCORD_MAX_CONTENT:
+            if (col, leg) != attempts[0]:
+                dropped = [n for n, was, now in (("color", colorize, col),
+                                                 ("legend", legend, leg))
+                           if was and not now]
+                text = (f"(board too large for one Discord message — "
+                        f"showing without {' and '.join(dropped)})\n" + text)
+                if len(text) > DISCORD_MAX_CONTENT:
+                    continue
+            return text, bool(viewport)
+    return (f"⚠️ This map board is {len(text)} characters, over Discord's "
+            f"{DISCORD_MAX_CONTENT}-character message limit even without "
+            f"color or legend. Lower the `viewport_width` / `viewport_height` "
+            f"rules to shrink the window."), bool(viewport)
 
 
 async def _board_image(m, channel_key: str):
