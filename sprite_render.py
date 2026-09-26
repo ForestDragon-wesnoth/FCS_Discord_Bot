@@ -290,6 +290,32 @@ class SceneRenderer:
         canvas.alpha_composite(overlay)
 
 
+def scene_dims(scene: Dict[str, Any]) -> Tuple[int, int]:
+    """(cols, rows) of cells a scene renders — the viewport window when one is
+    set, else the whole grid. Mirrors SceneRenderer.render's own sizing."""
+    vp = scene.get("viewport")
+    if isinstance(vp, dict):
+        cols, rows = vp.get("w", 1), vp.get("h", 1)
+    else:
+        cols, rows = scene.get("grid_width", 1), scene.get("grid_height", 1)
+    try:
+        return max(1, int(cols)), max(1, int(rows))
+    except (TypeError, ValueError):
+        return 1, 1
+
+
+def fit_cell_size(scene: Dict[str, Any], cell: int, max_dim: int) -> int:
+    """The largest cell size <= `cell` whose rendered image fits `max_dim`
+    pixels on its longest side (0 = no cap). Picked BEFORE rendering: the
+    canvas is cols*cell x rows*cell RGBA, so an 80x80 grid at the default
+    100 px would otherwise allocate an 8000x8000 (~256 MB) image just to be
+    downscaled — or, in the GUI at 4x zoom, far more."""
+    cell = max(1, int(cell))
+    if not max_dim:
+        return cell
+    return max(1, min(cell, int(max_dim) // max(scene_dims(scene))))
+
+
 # ----------------------------------------------------------------------------
 # Convenience: render a match straight to PNG bytes (for the Discord surface).
 # ----------------------------------------------------------------------------
@@ -310,7 +336,9 @@ def render_match_png(match, loader: "SpriteLoader",
         except (TypeError, ValueError):
             cell_size = 100
     scene = match.render_scene(pov_team=pov_team, viewport=viewport)
+    cell_size = fit_cell_size(scene, cell_size, max_dim)
     img = SceneRenderer(loader, cell_size).render(scene)
+    # Safety net only: fit_cell_size already sized the canvas to the cap.
     if max_dim and max(img.size) > max_dim:
         scale = max_dim / float(max(img.size))
         img = img.resize((max(1, int(img.width * scale)),

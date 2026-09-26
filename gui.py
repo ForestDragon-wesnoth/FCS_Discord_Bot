@@ -12,9 +12,9 @@
 #                    tkinter imported lazily so the testable pieces load on a
 #                    headless box.
 #
-# v1 scope (agreed): static sprites only (no animation), command input only
-# (no mouse select/drag), whole-map render (no in-GUI pan/zoom). Discord will
-# later render the same model to an image attachment.
+# Scope: static sprites only (no animation), command input only (no mouse
+# select/drag). The canvas pans and zooms locally (see GuiApp); Discord renders
+# the same model to an image attachment via sprite_render.render_match_png.
 from __future__ import annotations
 import os
 import asyncio
@@ -25,7 +25,7 @@ from typing import Optional, Dict, Any, Tuple, List
 # Discord image surface can reuse them without depending on tkinter. gui.py is
 # the tkinter glue around them.
 from sprite_render import (
-    _PIL_OK, SpriteLoader, SceneRenderer, SPRITES_DIR_DEFAULT,
+    _PIL_OK, SpriteLoader, SceneRenderer, SPRITES_DIR_DEFAULT, fit_cell_size,
 )
 
 from logic import MatchManager
@@ -82,6 +82,11 @@ class GuiApp:
     _ZOOM_MIN = 0.25
     _ZOOM_MAX = 4.0
     _ZOOM_STEP = 1.25
+    # Longest side of the rendered canvas, in pixels. The image is
+    # cols*cell x rows*cell RGBA, so without a cap a 40x40 map at the default
+    # 100 px cells and 4x zoom is 16000x16000 (~1 GB) and hangs the window.
+    # Zooming past the cap does nothing; the readout shows the real zoom.
+    _MAX_CANVAS_PX = 8000
 
     def __init__(self, sprites_dir: str = SPRITES_DIR_DEFAULT):
         if not _PIL_OK:
@@ -187,12 +192,16 @@ class GuiApp:
         mid = self.mgr.active_by_channel.get(self.ctx.channel_key)
         return self.mgr.matches.get(mid) if mid else None
 
-    def _cell_size(self, m) -> int:
+    @staticmethod
+    def _base_cell(m) -> int:
         try:
-            base = int(m.rules.get("sprite_cell_size", 100))
+            return max(1, int(m.rules.get("sprite_cell_size", 100)))
         except (TypeError, ValueError):
-            base = 100
-        return max(1, int(base * self._zoom))
+            return 100
+
+    def _cell_size(self, m, scene) -> int:
+        return fit_cell_size(scene, int(self._base_cell(m) * self._zoom),
+                             self._MAX_CANVAS_PX)
 
     # -- zoom controls ---------------------------------------------------
     def _zoom_by(self, factor: float):
@@ -219,7 +228,14 @@ class GuiApp:
             self.canvas.delete("all")
             return
         scene = m.render_scene()
-        renderer = SceneRenderer(self.loader, self._cell_size(m))
+        cell = self._cell_size(m, scene)
+        base = self._base_cell(m)
+        if cell < int(base * self._zoom):
+            # The pixel cap bit: pin the zoom to what was actually rendered,
+            # so further zoom-in stops instead of silently piling up a factor.
+            self._zoom = cell / base
+        self.zoom_label.config(text=f"{int(round(self._zoom * 100))}%")
+        renderer = SceneRenderer(self.loader, cell)
         img = renderer.render(scene)
         from PIL import ImageTk
         self._photo = ImageTk.PhotoImage(img)
