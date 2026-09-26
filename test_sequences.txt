@@ -14809,3 +14809,32 @@ command (READ_ONLY_SUBCOMMANDS maps each root to the read-only subcommands its
 handler actually dispatches), so real reads stay player-available: `!list`,
 `!table roll loot`, `!table list`, `!match outcome`, `!status list`,
 `!zone list`, and `!ent info boss` all run directly for the player.
+
+
+SCENARIO 571 — the approval queue survives an undo (no silent drop, no id reuse)
+--------------------------------------------------------------------------------
+
+!match new uq UndoQueue 10 10
+!match use uq
+!ent add boss Boss 50 1 1 5
+!ent hp boss -5
+!as player bob
+!ent hp boss -1
+!as host
+!history undo command 1 confirm
+!pending
+!as player bob
+!ent hp boss -30
+!as host
+!pending
+!approve r1
+!ent info boss
+
+Expected: the undo reverts the host's `-5` (boss back to 50) but bob's queued
+request `r1` (`!ent hp boss -1`) is still pending afterwards. Bob's next request
+is numbered `r2`, NOT a second `r1`. Approving `r1` runs the ORIGINAL `-1`
+command, leaving boss at 49 with `r2` still queued. Before the fix the undo
+built a fresh Match whose runtime-only queue was empty and whose id counter
+restarted: the first `!pending` read "No pending requests", the next request
+reused `r1`, and `!approve r1` would have applied `-30`. On Discord that meant an
+Approve button still on screen for the OLD `r1` resolved the NEW request.

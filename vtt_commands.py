@@ -4717,6 +4717,14 @@ def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot) -> Match:
     # same object we just attached to the new match.
     new_match.history = old.history
     new_match.history.truncate_after(snapshot)
+    # The approval queue is runtime-only (never in a snapshot), so a fresh
+    # Match would silently DROP every queued player request on an undo. It
+    # would also restart request ids at r1, and a Discord Approve button
+    # still showing for an old r1 would then resolve whatever NEW request
+    # took that id. Queued requests are proposals about the live match, not
+    # part of the undone state: carry the queue and the id counter over.
+    new_match.pending_requests = old.pending_requests
+    new_match._request_seq = old._request_seq
     mgr.matches[mid] = new_match
     return new_match
 

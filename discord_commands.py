@@ -338,6 +338,17 @@ class _ApprovalView(discord.ui.View):
             mid = self._mgr.active_by_channel.get(self._channel_key)
         return self._mgr.matches.get(mid) if mid is not None else None
 
+    def _pop_own(self, m):
+        """Pop THIS view's request, or None if it's already gone. Checked by
+        identity, not just id: ids are short per-match counters, so a button
+        that outlived its request (resolved via text `!approve`, or a match
+        reloaded from disk) must not resolve a DIFFERENT request that now
+        holds the same id."""
+        rid = self._req.get("id")
+        if m is None or m.pending_requests.get(rid) is not self._req:
+            return None
+        return m.pop_pending_request(rid)
+
     async def _require_host(self, interaction) -> bool:
         m = self._match()
         ictx = _InteractionCtx(interaction)
@@ -353,7 +364,7 @@ class _ApprovalView(discord.ui.View):
         if not await self._require_host(interaction):
             return
         m = self._match()
-        req = m.pop_pending_request(self._req["id"]) if m else None
+        req = self._pop_own(m)
         if req is None:
             await interaction.response.send_message(
                 "Already resolved.", ephemeral=True
@@ -385,7 +396,7 @@ class _ApprovalView(discord.ui.View):
         if not await self._require_host(interaction):
             return
         m = self._match()
-        req = m.pop_pending_request(self._req["id"]) if m else None
+        req = self._pop_own(m)
         if req is None:
             await interaction.response.send_message(
                 "Already resolved.", ephemeral=True
