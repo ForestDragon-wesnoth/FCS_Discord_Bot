@@ -14838,3 +14838,35 @@ built a fresh Match whose runtime-only queue was empty and whose id counter
 restarted: the first `!pending` read "No pending requests", the next request
 reused `r1`, and `!approve r1` would have applied `-30`. On Discord that meant an
 Approve button still on screen for the OLD `r1` resolved the NEW request.
+
+SCENARIO 572 — command undo: count cap + repeated single-step undo
+--------------------------------------------------------------------------------
+
+!system set default autosave_command_retention_max 3
+!match new ucm UndoCap 6 6
+!match use ucm
+!ent add boss Boss 50 1 1 5
+!ent hp boss -1
+!ent hp boss -2
+!ent hp boss -4
+!ent hp boss -8
+!history list commands
+!undo command 1 confirm
+!ent info boss
+!undo command 1 confirm
+!ent info boss
+!undo command 1 confirm
+!ent info boss
+!undo command 1 confirm
+!system set default autosave_command_retention_max 100
+
+Expected: `autosave_command_retention_max` caps command autosaves by COUNT on
+top of the turn window (default 100; here 3), so after five mutating commands
+only the last 3 pre-command snapshots are listed — without the cap a setup phase
+before the first `!turn next` kept one full match snapshot per command. Repeated
+single-step undos walk back ONE command each: boss 35 -> 43 -> 47 -> 49. Before
+the fix the restored command snapshot stayed in the list (it IS the current
+state after the undo), so every later `!undo command 1` re-restored it — a silent
+no-op still reporting "Undid 1 command(s)" — and boss stayed at 43. The fourth
+undo reports that no command snapshot is left. The last line restores the
+default so later scenarios aren't affected.

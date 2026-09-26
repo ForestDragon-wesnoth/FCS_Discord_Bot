@@ -20,10 +20,12 @@ Key invariants:
   pruning by sequence (drop everything with seq > restore_point) gives
   linear-history semantics: undo erases the now-orphaned future.
 
-- Retention is rule-driven. Three independent dials live on Match.rules:
+- Retention is rule-driven. The dials live on Match.rules:
     autosave_round_retention          (default -1 / unlimited)
-    autosave_turn_retention_rounds    (default 3)
+    autosave_turn_retention_rounds    (default 3; round mode)
+    autosave_turn_retention_turns     (default 20; ATB, where rounds freeze)
     autosave_command_retention_turns  (default 3)
+    autosave_command_retention_max    (default 100; count cap on commands)
   -1 means unlimited, 0 disables that kind entirely, N>0 caps to last N.
 
 - Manual saves never auto-prune. They live until explicitly deleted or
@@ -284,7 +286,8 @@ class MatchHistory:
             raise HistoryError(
                 f"Cannot undo {n} command(s) — only "
                 f"{len(self.command_saves)} command snapshot(s) retained. "
-                f"Adjust autosave_command_retention_turns to keep more."
+                f"Adjust autosave_command_retention_turns / "
+                f"autosave_command_retention_max to keep more."
             )
         return self.command_saves[-n]
 
@@ -323,7 +326,19 @@ class MatchHistory:
                   + len(self.command_saves))
         self.round_saves = [s for s in self.round_saves if s.sequence <= cut]
         self.turn_saves = [s for s in self.turn_saves if s.sequence <= cut]
-        self.command_saves = [s for s in self.command_saves if s.sequence <= cut]
+        # A command snapshot is the state BEFORE its command ran, so once it
+        # is restored it IS the current state — keep it and the next
+        # `undo command 1` would "restore" it again (a silent no-op that
+        # still reports "Undid 1 command"), so repeated single undos never
+        # stepped further back. Drop the restored command snapshot itself.
+        # (Round/turn snapshots mark the START of a round/turn — `undo turn
+        # 1` = back to the start of the current turn — so they stay.)
+        if snapshot.kind == "command":
+            self.command_saves = [s for s in self.command_saves
+                                  if s.sequence < cut]
+        else:
+            self.command_saves = [s for s in self.command_saves
+                                  if s.sequence <= cut]
         # Restore the turn-counter to what it was at snapshot time so
         # subsequent commands prune correctly against the new "current"
         # turn position.
@@ -373,14 +388,19 @@ class MatchHistory:
 
     def _prune_commands(self, match: "Match") -> None:
         turns = int(match.rules.get("autosave_command_retention_turns", 3))
-        if turns < 0:
-            return
         if turns == 0:
             self.command_saves.clear()
             return
-        threshold = self._turn_index - turns + 1
-        self.command_saves = [s for s in self.command_saves
-                              if s.turn_index_at_snapshot >= threshold]
+        if turns > 0:
+            threshold = self._turn_index - turns + 1
+            self.command_saves = [s for s in self.command_saves
+                                  if s.turn_index_at_snapshot >= threshold]
+        # Count cap on top of the turn window: the window only prunes when a
+        # turn advances, so without this a long setup phase (no `!turn next`
+        # yet) kept one full match snapshot per command, unbounded.
+        cap = int(match.rules.get("autosave_command_retention_max", 100))
+        if cap >= 0 and len(self.command_saves) > cap:
+            del self.command_saves[:len(self.command_saves) - cap]
 
     # ---- serialization ----
 

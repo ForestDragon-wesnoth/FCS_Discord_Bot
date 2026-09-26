@@ -2277,7 +2277,23 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "are taken before each MUTATING command runs and skipped when "
             "the command turns out to be a no-op (e.g. !ent info, !map). "
             "This gives users fine-grained undo at the cost of more "
-            "snapshots than the round/turn levels."
+            "snapshots than the round/turn levels. See also "
+            "autosave_command_retention_max, which caps the COUNT."
+        ),
+    },
+    "autosave_command_retention_max": {
+        "default": 100,
+        "schema": {"type": "int"},
+        "desc": (
+            "Hard cap on how many pre-command autosaves are kept, on top of "
+            "the autosave_command_retention_turns window (the oldest beyond "
+            "the cap are dropped). -1 = no cap. The turn window alone only "
+            "prunes when a turn ADVANCES, so a long setup session before "
+            "the first `!turn next` (map building, spawning) otherwise kept a "
+            "full match snapshot for EVERY command: 600 tile edits held 640 "
+            "snapshots / 16 MB and grew with the board. Each snapshot is a "
+            "complete copy of the match, so this is the memory ceiling for "
+            "command undo."
         ),
     },
     "undo_confirmation_turn_threshold": {
