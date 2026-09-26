@@ -5501,7 +5501,13 @@ def saves_path(name: str, *, write: bool = False) -> Tuple[str, str]:
             f"and `..` are refused.")
     base = os.path.realpath(SAVES_DIR)
     full = os.path.realpath(os.path.join(base, *parts))
-    if os.path.commonpath([full, base]) != base:
+    try:
+        inside = os.path.commonpath([full, base]) == base
+    except ValueError:
+        # Windows: different drives (e.g. a junction inside saves/ pointing
+        # at another drive) have no common path — that's outside too.
+        inside = False
+    if not inside:
         raise VTTError(f"`{raw}` resolves outside the `saves/` folder.")
     if write:
         os.makedirs(os.path.dirname(full), exist_ok=True)

@@ -3548,6 +3548,17 @@ def _run_passive_safely(engine, p: "Passive", ctx, *, target_id: str, is_global:
     # Lazy import to avoid logic <-> formula import cycle.
     from formula import FormulaError
     label = f"global passive `{p.id}`" if is_global else f"passive `{target_id}.{p.id}`"
+    if is_global:
+        # The fire sites pass is_global for everything _firing_passives
+        # yields, which includes TEAM passives — so a team passive used to be
+        # logged as "global passive `regen`", sending a GM to `!gpassive
+        # list` where it isn't. Name the table it actually lives in.
+        m = getattr(engine, "_match", None)
+        if m is not None and m.global_passives.get(p.id) is not p:
+            for team, tps in (getattr(m, "team_passives", None) or {}).items():
+                if tps.get(p.id) is p:
+                    label = f"team passive `{team}.{p.id}`"
+                    break
     try:
         result = engine.eval_program(p.formula, ctx)
         if result is None:
