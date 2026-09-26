@@ -5502,6 +5502,7 @@ store the result: after `!turn next` fires the on_turn_start
 passive, `mage.threatened` = 2, confirmed by `!ent dump`. This is
 the headline composition win — "count of adjacent enemies" is now
 a one-liner usable anywhere a formula runs.
+
 SCENARIO 236 — !ent clone: multiple coordinate pairs auto-number copies
 ------------------------------------------------------------------------
 
@@ -5627,6 +5628,7 @@ WITHOUT skips_turn (or with skips_turn explicitly False) doesn't
 skip — adding "poisoned" to bob wouldn't matter unless poisoned
 also had skips_turn:true. SCENARIO 245 covers auto-clear of a
 skips_turn status via the status_tick mechanism.
+
 SCENARIO 232 — Dynamic entity[<expr>]: literal still works, expressions resolve
 --------------------------------------------------------------------------------
 
@@ -5737,6 +5739,7 @@ reproducible "random scatter" or "wandering monster" tables a GM
 can replay. The trailing empty `random_seed` restores unseeded
 behavior. (As in 234, the assertion is that the two matches'
 draw sequences are equal; the specific letters depend on the seed.)
+
 SCENARIO 230 — !tile place_random: scatter instances across empty cells
 ------------------------------------------------------------------------
 

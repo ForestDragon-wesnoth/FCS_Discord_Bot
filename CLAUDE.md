@@ -123,7 +123,13 @@ python run_scenarios.py
 ```
 
 The harness is fast. Run it after every commit-worthy change. If it
-breaks, fix it before adding more code. **But the harness only
+breaks, fix it before adding more code. Every `SCENARIO N — title`
+header needs a BLANK LINE before it and a dashes line after it; a header
+missing the blank line is silently swallowed into the previous
+scenario's Expected: prose and never runs (scenarios 230/232/236 sat
+unexecuted this way for a long time). The harness now cross-checks every
+header line against what it parsed and refuses to run on a mismatch or a
+duplicate number. **But the harness only
 catches Python exceptions and "Syntax error" — it does NOT verify
 behavior.** A scenario can "pass" with a `❌` reply that means the
 opposite of what it should. Always also do at least one of:

@@ -151,9 +151,42 @@ def _flagged(transcript: List[Tuple[str, List[str]]],
     return hits
 
 
+_HEADER_RE = re.compile(r"^SCENARIO (\d+)\b", re.MULTILINE)
+
+
+def header_problems(path: str,
+                    scenarios: List[Tuple[int, str, List[str], bool]]) -> List[str]:
+    """Cross-check every `SCENARIO N` header line against what SCENARIO_RE
+    actually parsed. A header the regex misses (e.g. no blank line before it,
+    or no dashes underline) is silently folded into the PREVIOUS scenario's
+    Expected: prose — where command collection has already stopped — so its
+    commands never run. That hid scenarios 230/232/236 for a long stretch.
+    Also reports duplicate numbers. Returns human-readable problem lines."""
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    headers = [int(n) for n in _HEADER_RE.findall(text)]
+    parsed = [s[0] for s in scenarios]
+    problems = []
+    unparsed = sorted(set(headers) - set(parsed))
+    if unparsed:
+        problems.append(
+            f"header(s) not parsed (need a blank line before + a dashes "
+            f"line after): {unparsed}")
+    dupes = sorted({n for n in headers if headers.count(n) > 1})
+    if dupes:
+        problems.append(f"duplicate scenario number(s): {dupes}")
+    return problems
+
+
 async def main_async(args: argparse.Namespace) -> int:
     here = os.path.dirname(os.path.abspath(__file__))
-    scenarios = parse_scenarios(os.path.join(here, "test_sequences.txt"))
+    seq_path = os.path.join(here, "test_sequences.txt")
+    scenarios = parse_scenarios(seq_path)
+    problems = header_problems(seq_path, scenarios)
+    if problems:
+        for p in problems:
+            print(f"❌ test_sequences.txt: {p}")
+        return 1
 
     if args.list:
         for num, title, _, _ in scenarios:
