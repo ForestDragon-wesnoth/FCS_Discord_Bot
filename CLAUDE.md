@@ -2377,6 +2377,60 @@ More shipped work (continuing the list above):
     less surface, or for hosts. The same "tighten reads for a fog match" lever as
     `command_access`. Default stays permissive; a fog GM opts into the lockdown.
 
+- **Small-features bundle: match_outcome event + show:status + targeting
+  helpers — SHIPPED (scenarios 568-569).** Three independent gaps found by
+  enumerating the ACTUAL surface (47 commands / 190 match funcs / 22 hooks)
+  rather than working from notes — worth repeating, since two earlier proposals
+  (`!undo`, auto-update boards) turned out already shipped.
+  - **Built-in `match_outcome` event.** `declare_winner` recorded the outcome
+    and logged an event but fired NO hook, so victory was a dead end — nowhere
+    to announce, award, roll loot, or clear lingering auras. It now EMITS
+    `match_outcome`; handlers are ordinary passives (`!gpassive add x
+    event:match_outcome "..."`) reading `event_get('winner'/'reason'/'round')`.
+    DESIGN CALL — the EVENT BUS, not a new HOOK_NAME: `fire_hook` runs global
+    passives once per TARGET ENTITY (so a 5-entity board would announce five
+    times), while `emit_event` fires globals exactly ONCE; the bus also already
+    carries a payload and caps re-entrancy via `event_recursion_limit`, so a
+    handler that itself calls `declare_winner` can't loop (verified). Emission
+    sits INSIDE `declare_winner` (the single chokepoint) so the formula
+    primitive — watchers, actions, on_death passives — fires it too. Handler log
+    lines reach the `!match win` reply through a new optional `log_out` list
+    param, which keeps the existing return type intact; callers that don't care
+    (the prim) just omit it. No handlers = byte-identical output.
+  - **`!find show:status`.** Statuses live in `e.status`, not vars, so
+    `show:status` rendered `—` for everyone. `status` / `statuses` are now
+    pseudo-columns (`_SHOW_STATUS_COLUMNS` + `_fmt_status_names`) listing status
+    names, annotated `name(level)` above level 1. Joined with `/` NOT `, `
+    because `show:` already separates its columns with `, ` — otherwise
+    `[status=burn, slow, hp=40]` reads as three columns. Takes precedence over a
+    same-named var (a var literally called `status` is a known GM mistake, see
+    the pass-23 note; statuses are edited via `!ent status`).
+  - **`lowest_var(list, path)` / `highest_var(list, path)`.** Return the id of
+    the entity in a list with the smallest / largest numeric value at a dotted
+    var path — the "weakest target" / "biggest threat" pick, fed straight from
+    `entities_within` / `entities_on_los` / `chain_targets`. They earn their
+    place because the sandbox has no comprehensions and no loop `break`, so this
+    otherwise needs a hand-rolled running-minimum accumulator in EVERY targeting
+    formula. Entities missing the var or holding a non-numeric value are
+    SKIPPED; ties break on the lower id (deterministic, mirroring
+    `nearest_entity`); `''` when nothing qualifies — so test `== ''` before use.
+    Both read-only → ARG_SAFE, usable in inline `$()`.
+  - **BONUS FIX found while testing: `match_var_get` gained an optional
+    `default`.** `var_get` (pass-19), `corpse_var` and `team_get` all take one,
+    but `match_var_get` did NOT — so the read-or-initialize idiom
+    `match_var_get('wins', 0) + 1` (exactly what an outcome tally handler wants)
+    died with a raw Python TypeError leaking through as
+    "❌ Runtime error: ... takes 1 positional argument but 2 were given". Now
+    mirrors its siblings: raises on a missing path unless a default is given.
+  - PROCESS NOTES: the module-load drift guard caught the unclassified
+    `lowest_var`/`highest_var` immediately, as designed. It does NOT catch a
+    bad identifier inside a prim body, though — I first wrote `_dig(...)`, a
+    helper that doesn't exist (the real one is `_get_path`, which RAISES rather
+    than returning a found-flag); that would have been a NameError only when
+    called. Import-time checks prove registration, not correctness — exercise
+    every new prim. And shell-quoting mangled a probe again; write probes to a
+    FILE (pass-27's note).
+
 - **ATB turn clock (`Match.turns_elapsed`) — SHIPPED (scenarios 566-567).** The
   monotonic count of TURN boundaries in a match, and the fix for the pass-24
   open item. Under ATB rounds are disabled and `round_number` is frozen at 1

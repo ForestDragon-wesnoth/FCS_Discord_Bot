@@ -7034,10 +7034,26 @@ class Match:
     # declared outcome and exposes it — "victory is declared manually" by
     # default. declare_winner is also a formula primitive.
 
-    def declare_winner(self, winner: str, reason: str = "") -> Dict[str, Any]:
+    def declare_winner(self, winner: str, reason: str = "",
+                       log_out: Optional[List[str]] = None) -> Dict[str, Any]:
         """Record a match outcome. `winner` is a free-form string (a team,
         an entity id, 'draw', whatever the GM means); `reason` is optional
-        flavor. Overwrites any prior outcome. Returns the outcome dict."""
+        flavor. Overwrites any prior outcome. Returns the outcome dict.
+
+        Also EMITS the built-in `match_outcome` event, so victory has a
+        reaction point (announce, award, clean up lingering effects). Handlers
+        are ordinary passives — `!gpassive add x event:match_outcome "..."` —
+        and read the payload with `event_get('winner')` / `'reason'` / `'round'`.
+        The event bus is used rather than a new HOOK_NAME because a match-level
+        result should fire its global handlers exactly ONCE (fire_hook runs
+        them per target entity), and because the bus already carries a payload
+        and caps re-entrancy via event_recursion_limit — so a handler that
+        itself declares a winner can't loop forever.
+
+        Emission is inside this chokepoint so no caller can forget it. Handler
+        log lines are appended to `log_out` when a caller passes a list;
+        callers that don't care (the formula primitive) simply drop them.
+        """
         self.outcome = {
             "winner": str(winner),
             "reason": str(reason or ""),
@@ -7046,6 +7062,9 @@ class Match:
         self.log_event("winner_declared",
                        winner=self.outcome["winner"],
                        reason=self.outcome["reason"])
+        fired = self.emit_event("match_outcome", dict(self.outcome))
+        if log_out is not None and fired:
+            log_out.extend(fired)
         return self.outcome
 
     def clear_outcome(self) -> bool:

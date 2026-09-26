@@ -1294,11 +1294,16 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         winner = args[1]
         reason = " ".join(args[2:]) if len(args) >= 3 else ""
-        oc = m.declare_winner(winner, reason)
+        # Collect anything the built-in `match_outcome` event's handlers log,
+        # so a victory reaction is visible in the same reply.
+        fired: List[str] = []
+        oc = m.declare_winner(winner, reason, log_out=fired)
         extra = f" — {oc['reason']}" if oc["reason"] else ""
-        return await ctx.send(
-            f"🏆 Winner declared: **{oc['winner']}** "
-            f"(round {oc['round']}){extra}.")
+        msg = (f"🏆 Winner declared: **{oc['winner']}** "
+               f"(round {oc['round']}){extra}.")
+        if fired:
+            msg += "\n" + "\n".join(fired)
+        return await ctx.send(msg)
     if sub == "outcome":
         m = active_match(mgr, ctx)
         if m.outcome is None:
@@ -4085,6 +4090,36 @@ def _parse_find_predicate(token: str) -> Tuple[str, str, Optional[str]]:
     )
 
 
+# `show:` column names that render an entity's STATUSES rather than a var.
+# Statuses are stored in e.status (a separate structure from vars), so a
+# plain var lookup would always render '—'. These names take precedence over
+# a same-named var — writing a var literally called `status` is a known GM
+# mistake (statuses are edited with `!ent status`), so showing the real
+# statuses is the useful reading.
+_SHOW_STATUS_COLUMNS: frozenset = frozenset({"status", "statuses"})
+
+
+def _fmt_status_names(e) -> str:
+    """An entity's statuses as a compact display string: sorted names, each
+    annotated `name(level)` when its level is set and greater than 1.
+    Empty string when the entity has none.
+
+    Joined with '/' rather than ', ' because `show:` already separates its
+    COLUMNS with ', ' — a comma here would make `[status=burn, slow, hp=40]`
+    read as three columns instead of two.
+    """
+    out = []
+    for name in sorted(e.status or {}):
+        data = e.status.get(name)
+        lvl = data.get("level") if isinstance(data, dict) else None
+        try:
+            show_lvl = lvl is not None and float(lvl) > 1
+        except (TypeError, ValueError):
+            show_lvl = False
+        out.append(f"{name}({lvl})" if show_lvl else str(name))
+    return "/".join(out)
+
+
 def _resolve_dotted_var(vars_dict: Dict[str, Any], path: str) -> Tuple[bool, Any]:
     """Walk dotted path through a vars dict. Returns (found, value)."""
     cur: Any = vars_dict
@@ -4210,7 +4245,9 @@ def _find_match_entity(m: Match, e: Entity, predicates: List[Tuple[str, str, Opt
         "`within:<x>:<y>:<radius>` for spatial range (footprint-aware "
         "nearest-cell, Chebyshev). Dotted var paths walk "
         "nested dicts (`inventory.sword.damage>5`). DISPLAY: `show:<csv>` "
-        "appends chosen var values to each row (`show:hp,mp`); `sort:<var>` "
+        "appends chosen var values to each row (`show:hp,mp`) — the special "
+        "column `status` (or `statuses`) lists the entity's STATUSES instead "
+        "of a var, annotated `name(level)` above level 1; `sort:<var>` "
         "orders the results by a var (append `:desc` for descending, e.g. "
         "`sort:hp:desc`) — both read dotted paths. Example: "
         "`!find team=red hp<20 status:bleeding near:boss:3 show:hp sort:hp` "
@@ -4276,6 +4313,12 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if show_cols:
             cells = []
             for col in show_cols:
+                if col.lower() in _SHOW_STATUS_COLUMNS:
+                    # Statuses live in e.status, NOT in vars, so a plain var
+                    # lookup renders '—'. This pseudo-column reads the real
+                    # status dict; a level > 1 is shown as name(level).
+                    cells.append(f"{col}={_fmt_status_names(e) or '—'}")
+                    continue
                 found, v = _resolve_dotted_var(e.vars, col)
                 cells.append(f"{col}={v if found else '—'}")
             row += "  [" + ", ".join(cells) + "]"

@@ -1454,6 +1454,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   nearest_entity(eid, relation, mode)      -> single closest id, or
     #                                               "" if none match
     "entities_within", "nearest_entity", "chain_targets",
+    "lowest_var", "highest_var",
     # Shields / temporary-HP absorb layer.
     "absorb_damage", "shield_total",
     # Iterable companion to group_has / group_size: the list of member
@@ -1818,6 +1819,7 @@ ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'is_vehicle', 'list_mods', 'match_over', 'match_var_get',
     'match_var_has', 'match_var_keys', 'match_winner', 'mount_of',
     'nearest_entity', 'occupies', 'part', 'part_of', 'parts', 'raycast',
+    'highest_var', 'lowest_var',
     'relative_side', 'riders', 'roll_table', 'round_number', 'rule_get',
     'self_id', 'shield_total', 'side_hit', 'slot_capacity', 'slot_free',
     'slot_of', 'slot_riders', 'status_get', 'status_has',
@@ -3563,6 +3565,60 @@ class FormulaEngine:
         ns["entities_within"] = _entities_within
         ns["nearest_entity"]  = _nearest_entity
 
+        def _extreme_var(which: str, ids: Any, path: Any) -> str:
+            """Shared body for lowest_var / highest_var."""
+            if not isinstance(path, str) or not path:
+                raise FormulaError(
+                    f"{which}_var(list, path): path must be a non-empty string.")
+            if isinstance(ids, str):
+                ids = [ids]
+            try:
+                seq = list(ids)
+            except TypeError:
+                raise FormulaError(
+                    f"{which}_var(list, path): first argument must be a list "
+                    f"of entity ids.")
+            best_id, best_v = "", None
+            for raw in seq:
+                oid = _eid(raw)
+                oe = match.entities.get(oid)
+                if oe is None:
+                    continue
+                try:
+                    val = _get_path(oe.vars, path)
+                except FormulaError:
+                    continue          # entities lacking the var are skipped
+                try:
+                    num = float(val)
+                except (TypeError, ValueError):
+                    continue          # non-numeric values aren't comparable
+                if best_v is None:
+                    best_id, best_v = oid, num
+                elif (num < best_v) if which == "lowest" else (num > best_v):
+                    best_id, best_v = oid, num
+                elif num == best_v and oid < best_id:
+                    best_id = oid     # deterministic tie-break, like nearest_entity
+            return best_id
+
+        def _lowest_var(ids: Any, path: Any) -> str:
+            """lowest_var(list, path): the id of the entity in `list` with the
+            SMALLEST numeric value at dotted var `path` — the 'weakest target'
+            pick. Feed it an enumerator: `lowest_var(entities_within(self, 5,
+            'hostile'), 'hp')`. Entities that are missing the var or hold a
+            non-numeric value are skipped; ties break on the lower id so the
+            result is deterministic; '' when nothing qualifies (test with
+            `== ''` before using it). Read-only."""
+            return _extreme_var("lowest", ids, path)
+
+        def _highest_var(ids: Any, path: Any) -> str:
+            """highest_var(list, path): the id of the entity in `list` with the
+            LARGEST numeric value at dotted var `path` — the 'biggest threat'
+            pick. Same skip/tie-break/'' rules as lowest_var. Read-only."""
+            return _extreme_var("highest", ids, path)
+
+        ns["lowest_var"] = _lowest_var
+        ns["highest_var"] = _highest_var
+
         def _chain_targets(from_token: Any, count: Any, max_jump: Any = 0,
                            relation: Any = "") -> list:
             """chain_targets(from_eid, count, max_jump=0, relation=""): up to
@@ -4359,12 +4415,23 @@ class FormulaEngine:
                 cur = cur[k]
             return True
 
-        def _match_var_get(path: Any) -> Any:
-            """match_var_get(path): runtime-path equivalent of match.path.
-            Raises on a missing path (same as the static root)."""
+        _MVG_MISSING = object()
+
+        def _match_var_get(path: Any, default: Any = _MVG_MISSING) -> Any:
+            """match_var_get(path[, default]): runtime-path equivalent of
+            match.path. Raises on a missing path (same as the static root)
+            UNLESS a default is supplied, in which case it is returned —
+            the read-or-initialize idiom, e.g. a counter that starts at 0:
+            `match.wins = match_var_get('wins', 0) + 1`. Mirrors var_get /
+            corpse_var / team_get, which all take an optional default."""
             if not isinstance(path, str) or not path:
                 raise FormulaError("match_var_get(path): path must be a non-empty string.")
-            return self._read_match(path)
+            try:
+                return self._read_match(path)
+            except FormulaError:
+                if default is _MVG_MISSING:
+                    raise
+                return default
 
         def _match_var_set(path: Any, value: Any) -> Any:
             """match_var_set(path, value): runtime-path equivalent of

@@ -14696,3 +14696,77 @@ written before this field predates it and reads as round-keyed. Both fields
 survive save/load. Here the reveal is listed while live, then expires and is
 pruned once five turns have elapsed. A reveal with no `turns=` is permanent and
 is unaffected.
+
+
+SCENARIO 568 — built-in `match_outcome` event: victory has a reaction point
+--------------------------------------------------------------------------------
+
+!match new mo Outcome 10 10
+!match use mo
+!ent add hero Hero 50 1 1 10
+!ent add mob Mob 50 3 3 5
+!ent add extra Extra 20 5 5 3
+!gpassive add announce event:match_outcome "match.last_winner = event_get('winner')"
+!gpassive add tally event:match_outcome "match.wins = match_var_get('wins', 0) + 1"
+!match win red flawless victory
+!match var get last_winner
+!match var get wins
+!match outcome
+
+Expected: `declare_winner` recorded the outcome and logged an event, but fired
+NO hook — victory was a dead end with nowhere to announce, award, or clean up.
+It now EMITS the built-in `match_outcome` event, so handlers are ordinary
+passives (`event:match_outcome`) that read the payload via `event_get('winner')`
+/ `'reason'` / `'round'`. The event BUS is used rather than a new HOOK_NAME
+because a match-level result must fire its global handlers exactly ONCE —
+`fire_hook` runs globals once per TARGET ENTITY, which would announce three
+times on this board — and because the bus already carries a payload and caps
+re-entrancy via `event_recursion_limit`, so a handler that itself declares a
+winner cannot loop forever. Emission lives inside `declare_winner`, the single
+chokepoint, so the `declare_winner()` formula primitive (watchers, actions,
+on_death passives) fires it too. Handler log lines are surfaced in the `!match
+win` reply via an optional `log_out` list; with no handlers registered the reply
+is unchanged. Here `last_winner` reads `red` and `wins` reads 1 (fired once, not
+once per entity).
+
+SCENARIO 569 — `!find show:status` + lowest_var / highest_var targeting helpers
+--------------------------------------------------------------------------------
+
+!match new sh Show 12 12
+!match use sh
+!ent add hero Hero 50 5 5 10
+!ent set_var hero team red
+!ent add a A 30 6 5 5
+!ent set_var a team blue
+!ent add b B 12 7 5 5
+!ent set_var b team blue
+!ent add c C 44 4 5 5
+!ent set_var c team blue
+!status def burn tick ""
+!status def slow tick ""
+!status apply a burn 2 3
+!status apply a slow
+!find team=blue show:status
+!find team=blue show:status,hp sort:hp
+!eval "lowest_var(entities_within('hero', 5, 'hostile'), 'hp')"
+!eval "highest_var(entities_within('hero', 5, 'hostile'), 'hp')"
+!eval "lowest_var(entities_within('hero', 5, 'hostile'), 'nosuchvar')"
+
+Expected: statuses live in `e.status`, NOT in vars, so `show:status` used to
+render `—` for everyone. `status` (and the alias `statuses`) is now a
+pseudo-column listing the entity's statuses, annotating `name(level)` above
+level 1 — `a` shows `burn(2)/slow`, the others `—`. The names are joined with
+`/` because `show:` already separates its COLUMNS with `, `, so a comma would
+make `[status=burn, slow, hp=40]` read as three columns instead of two. The
+pseudo-column takes precedence over a same-named var (writing a var literally
+called `status` is a known GM mistake — statuses are edited with `!ent status`).
+`lowest_var(list, path)` / `highest_var(list, path)` return the id of the entity
+in a list with the smallest / largest numeric value at a dotted var path — the
+"weakest target" / "biggest threat" pick, fed straight from an enumerator. They
+exist because the sandbox has no comprehensions and no loop `break`, so this
+otherwise needs a hand-rolled running-minimum accumulator in every targeting
+formula. Entities missing the var (or holding a non-numeric value) are SKIPPED,
+ties break on the lower id so results are deterministic, and `''` comes back
+when nothing qualifies — so `b` (12 hp) and `c` (44 hp) here, and `''` for a var
+nobody has. Both are read-only and classified ARG_SAFE, so they work inside
+inline `$()` arguments.
