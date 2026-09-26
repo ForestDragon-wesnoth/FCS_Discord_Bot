@@ -7755,7 +7755,19 @@ class Match:
         else:
             rec = {"cells": clipped, "clock": "round",
                    "until": self.round_number + int(duration)}
-        self.fog_reveals.setdefault(team, []).append(rec)
+        # Merge into an existing record with the SAME expiry (every permanent
+        # reveal, or temporaries sharing a deadline) — they're
+        # interchangeable. Without this a scout that reveals every turn
+        # piles up one record per use, and every fog check scans them all:
+        # a 60x60 render went 19 ms -> 166 ms at 300 permanent records.
+        recs = self.fog_reveals.setdefault(team, [])
+        for r in recs:
+            if (r.get("until") == rec["until"]
+                    and (rec["until"] is None
+                         or r.get("clock", "round") == rec["clock"])):
+                r["cells"] = set(r.get("cells", ())) | clipped
+                return len(clipped)
+        recs.append(rec)
         return len(clipped)
 
     def clear_reveals(self, team: str) -> int:
