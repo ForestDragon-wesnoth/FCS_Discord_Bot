@@ -5,12 +5,13 @@ from logic import MatchManager
 from discord_commands import wire_commands
 
 # --- Token loading ---
+TOKEN_FILE = "1bot_token.txt"
+
+
 def load_token() -> str:
     """
-    Load the Discord bot token.
-    Priority:
-      1. Environment variable DISCORD_TOKEN
-      2. 'bot_token.txt' file (ignored in git)
+    Load the Discord bot token from the first line of TOKEN_FILE (ignored in
+    git). The DISCORD_TOKEN environment-variable path below is disabled.
     """
 
 #unused
@@ -18,7 +19,7 @@ def load_token() -> str:
 #    if token:
 #        return token.strip()
 
-    token_path = "1bot_token.txt"
+    token_path = TOKEN_FILE
     if os.path.exists(token_path):
         with open(token_path, "r", encoding="utf-8") as f:
             line = f.readline().strip()
@@ -26,8 +27,8 @@ def load_token() -> str:
                 return line
 
     raise RuntimeError(
-        "❌ Discord token not found. Set DISCORD_TOKEN environment variable "
-        "or create a 'bot_token.txt' file containing your token."
+        f"❌ Discord token not found. Create a '{TOKEN_FILE}' file in the folder "
+        f"you run bot.py from, with your token on its first line."
     )
 
 # --- Discord setup ---

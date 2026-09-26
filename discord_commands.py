@@ -287,7 +287,7 @@ class DiscordCtxWrapper:
         )
         try:
             view = _ApprovalView(req, self._mgr, self.channel_key)
-            await self._ctx.send(text, view=view)
+            view.message = await self._ctx.send(text, view=view)
         except Exception:
             # No UI support (older discord.py) — text prompt + commands.
             await self._ctx.send(
@@ -335,6 +335,27 @@ class _ApprovalView(discord.ui.View):
         self._req = req
         self._mgr = mgr
         self._channel_key = channel_key
+        # The posted message, set by send_approval, so on_timeout can edit it.
+        self.message = None
+
+    async def on_timeout(self):
+        """The buttons stop responding after `timeout`, but they used to stay
+        clickable-looking ("This interaction failed" on click). Grey them out
+        and say how to resolve the request, which is still queued: the text
+        `!approve` / `!deny` commands have no timeout."""
+        for child in self.children:
+            child.disabled = True
+        if self.message is None:
+            return
+        try:
+            rid = self._req.get("id")
+            await self.message.edit(
+                content=(self.message.content or "")
+                + f"\n⌛ Buttons expired — use `!approve {rid}` or "
+                  f"`!deny {rid}`.",
+                view=self)
+        except Exception:
+            pass
 
     def _match(self):
         if self._mgr is None:
