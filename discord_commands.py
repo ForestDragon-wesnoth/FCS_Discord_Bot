@@ -163,6 +163,14 @@ async def _parse_and_run_single_line(ctx, line: str, mgr, known_roots) -> bool:
         return False
 
 
+def _is_guild_admin(user) -> bool:
+    """True iff `user` is a guild Member holding the Administrator
+    permission. In DMs the author is a plain User with no guild permissions,
+    so bot-wide commands are refused there."""
+    perms = getattr(user, "guild_permissions", None)
+    return bool(getattr(perms, "administrator", False))
+
+
 class DiscordCtxWrapper:
     # Discord renders ANSI colors inside ```ansi code blocks, so the
     # colorized map renderer is enabled for this surface.
@@ -188,6 +196,9 @@ class DiscordCtxWrapper:
         # Real Discord authors are fixed — identity can't be reassigned
         # mid-session the way the CLI's stand-in can.
         self.cli_mutable = False
+        # Bot-wide commands (!system edits, !store, !run, ...) need the
+        # guild Administrator permission — see vtt_commands.ctx_is_admin.
+        self.is_admin = _is_guild_admin(author)
     async def send(self, message: str):
         # Split over-long output at line boundaries so we never trip
         # Discord's content-length cap (see _split_for_discord). Discord also
@@ -297,6 +308,7 @@ class _InteractionCtx:
         gid = getattr(guild, "id", "DM")
         self.channel_key = f"{gid}:{interaction.channel_id}"
         user = interaction.user
+        self.is_admin = _is_guild_admin(user)
         self.user_id = str(getattr(user, "id", "")) or "unknown"
         self.user_name = (
             getattr(user, "display_name", None)

@@ -75,6 +75,13 @@ class _Ctx:
         self.user_id = "cli"
         self.user_name = "cli"
 
+    @property
+    def is_admin(self) -> bool:
+        # Bot-wide commands (!system edits, !store, !run, ...) need an admin.
+        # The harness's owner identity stands in for a server administrator;
+        # `!as player <name>` drops it, so scenarios can test the refusal.
+        return self.user_id == "cli"
+
     async def send(self, message: str) -> None:
         self.out.append(message)
 
@@ -220,15 +227,26 @@ async def main_async(args: argparse.Namespace) -> int:
         f"\n{len(scenarios)} scenario(s) run; "
         f"{total_fail} with flagged failures."
     )
-    # Clean up any save artifacts scenarios may have dropped in cwd.
-    for p in ("tpl_save", "tpl_save.json", "groups_test.json",
-              "savetest.json", "test_compat"):
-        if os.path.exists(p):
-            os.remove(p)
     return 1 if total_fail else 0
 
 
 def main() -> None:
+    # File commands (!store / !run / !history export|import) are confined to
+    # vtt_commands.SAVES_DIR. Point it at a throwaway folder for the run, so
+    # scenarios never touch — or leave junk in — a real `saves/` folder that
+    # holds someone's campaign files.
+    import shutil
+    import tempfile
+    import vtt_commands
+    scratch = tempfile.mkdtemp(prefix="fcs_scenarios_")
+    vtt_commands.SAVES_DIR = scratch
+    try:
+        _main()
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _main() -> None:
     ap = argparse.ArgumentParser(description="Run test_sequences.txt scenarios.")
     ap.add_argument("scenarios", nargs="*", type=int,
                     help="scenario numbers to run (default: all)")

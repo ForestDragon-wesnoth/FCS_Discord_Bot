@@ -437,9 +437,9 @@ SCENARIO 19 — Save/load preserves target/scope
 !ent add hero Hero 30 4 4 10
 !passive add hero spy on_var_created target=inventory scope=children "entity[self].spy_log = changed_key"
 !passive info hero spy
-!store save /tmp/m19_save.json
+!store save m19_save.json
 !match delete m19
-!store load /tmp/m19_save.json
+!store load m19_save.json
 !match use m19
 !passive info hero spy
 
@@ -2151,9 +2151,9 @@ SCENARIO 108 — Full match round-trip
 !passive add hero regen on_turn_start "entity[self].mana = entity[self].mana + 5"
 !clamp add hero mana max=100 mode=soft
 !turn next
-!store save /tmp/save108.json
+!store save save108.json
 !match delete save108
-!store load /tmp/save108.json
+!store load save108.json
 !match use save108
 !list
 !ent info hero
@@ -2172,9 +2172,9 @@ SCENARIO 109 — Save/load preserves global passives
 !match use save109
 !ent add hero Hero 30 3 3 10
 !gpassive add gas on_round_start "entity[self].hp = entity[self].hp - 1"
-!store save /tmp/save109.json
+!store save save109.json
 !match delete save109
-!store load /tmp/save109.json
+!store load save109.json
 !match use save109
 !gpassive list
 
@@ -2189,9 +2189,9 @@ SCENARIO 110 — Save/load preserves system-level clamps
 !ent add hero Hero 30 3 3 10
 !gclamp add mp max=100 min=0 mode=soft
 !gclamp list
-!store save /tmp/sl110.json
+!store save sl110.json
 !match delete sl110
-!store load /tmp/sl110.json
+!store load sl110.json
 !match use sl110
 !gclamp list
 
@@ -2208,10 +2208,10 @@ SCENARIO 111 — Saving multiple matches in one file
 !ent add a1 Alpha 30 1 1 10
 !match use m111b
 !ent add b1 Bravo 25 2 2 8
-!store save /tmp/multi111.json
+!store save multi111.json
 !match delete m111a
 !match delete m111b
-!store load /tmp/multi111.json
+!store load multi111.json
 !match list
 !match use m111a
 !list
@@ -2948,8 +2948,8 @@ SCENARIO 151 — Demonstration of save/load equivalence
 !turn next
 !turn next
 !ent info hero
-!store save /tmp/eq151_before.json
-!store load /tmp/eq151_before.json
+!store save eq151_before.json
+!store load eq151_before.json
 !ent info hero
 
 Expected: !ent info before save and after load show identical state.
@@ -3493,10 +3493,10 @@ SCENARIO 172 — Snapshot export and import as a manual save
 !turn next
 !history save checkpoint
 !ent hp a -10
-!history export manual:checkpoint /tmp/_hist_export_test.json
+!history export manual:checkpoint _hist_export_test.json
 !history delete checkpoint
 !history list manual
-!history import /tmp/_hist_export_test.json as restored
+!history import _hist_export_test.json as restored
 !history list manual
 !history restore restored confirm
 !ent info a
@@ -3522,14 +3522,14 @@ SCENARIO 173 — !store save with include_history round-trips autosaves
 !turn next
 !turn next
 !history save important
-!store save /tmp/_hist_store_no.json
-!store save /tmp/_hist_store_yes.json include_history=yes
+!store save _hist_store_no.json
+!store save _hist_store_yes.json include_history=yes
 !match delete mhist6
-!store load /tmp/_hist_store_no.json
+!store load _hist_store_no.json
 !match use mhist6
 !history list
 !match delete mhist6
-!store load /tmp/_hist_store_yes.json
+!store load _hist_store_yes.json
 !match use mhist6
 !history list
 
@@ -3927,9 +3927,9 @@ SCENARIO 181 — Tile data round-trips through !store save/load
 !tile set 2 2 glyph %
 !tile set 4 4 loot.gold 500
 !tile list
-!store save /tmp/_tile_store_test.json
+!store save _tile_store_test.json
 !match delete mtile3
-!store load /tmp/_tile_store_test.json
+!store load _tile_store_test.json
 !match use mtile3
 !tile list
 !tile info 2 2
@@ -5225,11 +5225,11 @@ SCENARIO 222 — Formula functions: persistence and deletion
 !func def triple x "x * 3"
 !func def viafn x "triple(x) + 1"
 !eval "viafn(10)"
-!store save /tmp/scenario222
+!store save scenario222
 !func del triple
 !eval "viafn(10)"
 !func list
-!store load /tmp/scenario222
+!store load scenario222
 !func list
 !eval "viafn(10)"
 
@@ -14839,7 +14839,121 @@ restarted: the first `!pending` read "No pending requests", the next request
 reused `r1`, and `!approve r1` would have applied `-30`. On Discord that meant an
 Approve button still on screen for the OLD `r1` resolved the NEW request.
 
-SCENARIO 572 — command undo: count cap + repeated single-step undo
+
+SCENARIO 572 — bot-wide commands need a server administrator
+--------------------------------------------------------------------------------
+
+!as player bob
+!match new bobm BobsMatch 8 8
+!match use bobm
+!system set default fog_glyph x
+!batch system set default fog_glyph x
+!defvar add default fog_vision_radius 3
+!store save bobsave.json
+!run bobscript.txt
+!history save cp
+!history export manual:cp cp.json
+!system list
+!system rules default
+!defvar list default
+!as host
+!system set default fog_glyph x
+!system set default fog_glyph ?
+
+Expected: `bob` created and hosts `bobm`, but hosting a match is NOT enough
+for bot-wide state. `!system set`, `!defvar add`, `!store save`, `!run` and
+`!history export` all reply "Only a server administrator can do that" and
+change nothing — `!store`/`!run`/`history export` touch the host's disk, and
+system edits reach every match on that system in every server. Wrapping the
+edit in `!batch` doesn't help: the check also runs on the ungated inner-command
+path (batch / macro / foreach / run lines, action `cmd()`). The admin check is
+rejected outright (not queued — no match host could approve it). Per-match
+history (`!history save cp`) is still bob's to run as host. Read-only forms stay
+open: `!system list`, `!system rules default`, `!defvar list default`. Back as
+the owner identity (the harness's stand-in for a Discord guild Administrator;
+the CLI/GUI are always admin), `!system set default fog_glyph x` succeeds —
+directly, even though the channel's active match is bob's: bot-wide commands
+skip the per-match gate once the admin check passes, since they don't act on
+that match and its host shouldn't have to approve a system edit. The last line
+restores the default glyph so later scenarios aren't affected.
+
+
+SCENARIO 573 — file commands are confined to the saves/ folder
+--------------------------------------------------------------------------------
+
+!match new svm SavesMatch 6 6
+!match use svm
+!ent add hero Hero 20 1 1 5
+!store save ../escape.json
+!store save /etc/evil.json
+!store load "..\1bot_token.txt"
+!run ../1bot_token.txt
+!history save cp
+!history export manual:cp ../../cp.json
+!history export manual:cp campaign/cp.json
+!history import campaign/cp.json as back
+!store save campaign/session1.json
+!ent hp hero -5
+!store load campaign/session1.json
+!match use svm
+!ent info hero
+
+Expected: every path that leaves the `saves/` folder is refused before any
+file is touched — `..`, an absolute path, and a Windows-style `..\` all get
+"isn't allowed — use a plain file name". (The backslash form has to be quoted
+to reach the command at all: shlex drops an unquoted backslash, turning it into
+the harmless plain name `..1bot_token.txt`.) This is what stops `!run
+../1bot_token.txt` from echoing the bot token back line by line, and `!store
+save` from overwriting files on the host. Plain names (subfolders allowed) work:
+a history snapshot exports to and imports from `saves/campaign/cp.json`, and
+`campaign/session1.json` saves and loads (hero back at 20 hp after the load).
+Replies name files as `saves/...`, never the host's absolute path. (The harness points saves/ at a throwaway temp folder.)
+
+
+SCENARIO 574 — commands that name another match need host rights on it
+--------------------------------------------------------------------------------
+
+!match new alice AliceCampaign 8 4
+!match use alice
+!match bind pov=red
+!match fog on
+!ent add scout Scout 10 1 1 5
+!ent set_var scout team red
+!ent add assassin Hidden 10 7 3 5
+!ent set_var assassin team blue
+!match unbind
+!as player mallory
+!match use alice
+!match bind alice
+!match rename alice Pwned
+!match delete alice
+!match new mal MalMatch 6 6
+!match use mal
+!ent add bot Bot 10 1 1 5
+!ent copy bot alice 2 2
+!ent transfer bot alice 2 2
+!ent info bot
+!match unbind
+!match
+!as host
+!match use alice
+!ent info assassin
+
+Expected: with no active match in the channel the access gate doesn't engage,
+so the TARGET check is what stops `mallory`: `!match use alice` / `!match bind
+alice` ("Only a host of `alice` can bind a channel to it"), `!match rename
+alice` and `!match delete alice` ("Only the owner of `alice` can delete it") are
+all refused. Before the fix `use` bound her channel with an unset
+(omniscient) POV — a full view of Alice's fogged board, hidden assassin
+included — and `delete` removed another person's match. Mallory can still
+create and use her OWN match, but `!ent copy`/`!ent transfer` into `alice` is
+refused ("Only a host of `alice` can copy or transfer entities into it"), so
+`bot` stays in `mal`. After Mallory unbinds her channel, the bare `!match`
+listing still shows `AliceCampaign` (not renamed, not deleted), and the owner
+can `use` it again and find the assassin untouched.
+
+
+SCENARIO 575 — command undo: count cap + repeated single-step undo
 --------------------------------------------------------------------------------
 
 !system set default autosave_command_retention_max 3

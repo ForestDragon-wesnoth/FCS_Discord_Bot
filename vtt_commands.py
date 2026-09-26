@@ -22,6 +22,7 @@ from logic import ClampSpec
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick
 
+import os
 import re
 import json
 import random
@@ -58,6 +59,44 @@ def ctx_user_name(ctx: "ReplyContext") -> str:
     if isinstance(name, str) and name:
         return name
     return ctx_user(ctx) or "someone"
+
+
+def ctx_is_admin(ctx: "ReplyContext") -> bool:
+    """Whether the sender may run BOT-WIDE commands (see _admin_required).
+
+    Single-operator local surfaces (the CLI / GUI set `auto_approve`) are
+    always admin — the operator owns the machine. Otherwise the surface must
+    say so via `is_admin`: Discord sets it from the author's guild
+    Administrator permission. DEFAULT-DENY: a context that doesn't declare it
+    (e.g. an action body's buffered cmd() context) is NOT admin, so an action
+    authored by a host can't become a route to bot-wide state."""
+    if getattr(ctx, "auto_approve", False):
+        return True
+    return bool(getattr(ctx, "is_admin", False))
+
+
+def require_target_host(ctx: "ReplyContext", m: "Match", action: str,
+                        *, owner: bool = False) -> None:
+    """Raise unless the sender is a host (or, with owner=True, the owner) of
+    `m` — the match a command NAMES, which may differ from the channel's
+    active match the access gate checked. Without this, `!match use <id>`
+    from another server gave an omniscient view of a fogged match, and
+    `!match delete <id>` / `!ent copy <id> <dest>` reached any match.
+
+    Same no-op conditions as the gate: a single-operator surface
+    (auto_approve), an identity-less context, or a match with no owner
+    (legacy / open) is not checked."""
+    if getattr(ctx, "auto_approve", False) or m.owner is None:
+        return
+    user = ctx_user(ctx)
+    if user is None:
+        return
+    if owner and not m.is_owner(user):
+        raise VTTError(f"Only the owner of `{m.id}` can {action}.")
+    if not owner and not m.is_host(user):
+        raise VTTError(
+            f"Only a host of `{m.id}` can {action}. A host can run "
+            f"`!match bind {m.id}` in this channel to connect it.")
 
 # ---- Command registry --------------------------------------------------------
 Handler = Callable[[ReplyContext, List[str], MatchManager], Any]
@@ -139,6 +178,45 @@ ELEVATED_ARGS: Dict[str, frozenset] = {
                       "legend", "autoupdate", "background", "border", "mode"}),
     "list": frozenset({"full"}),
 }
+
+# Commands that act on BOT-WIDE state — shared GameSystems (every match on
+# a system picks up an edit on its next rule refresh, across servers), the
+# save store (`!store load` replaces EVERY match), and files on the host's
+# disk. The per-match host gate can't protect these: it only engages when
+# the channel has an active match, and anyone can create a match and host it.
+# So they need an administrator (ctx_is_admin) regardless of any match, and
+# no per-match `!host access` / system `command_access` override can open
+# them. Read-only forms stay open (see _admin_required).
+#
+# INTERIM: "administrator" is the Discord guild Administrator permission,
+# but systems and the save store are still shared by EVERY guild the bot
+# serves, so one server's admin can change another server's rules. Proper
+# per-guild isolation is part of the planned data-storage redesign (see
+# CLAUDE.md, "Multi-tenant caveat").
+_ADMIN_MSG = ("❌ Only a server administrator can do that — it changes "
+              "bot-wide state shared by every server this bot runs in.")
+
+
+def _admin_required(name: str, args: List[str]) -> bool:
+    """True iff this invocation changes bot-wide state (see _ADMIN_MSG)."""
+    sub = args[0].lower() if args else ""
+    if name in ("store", "run"):
+        return True
+    if name in ("defvar", "defpassive", "gclamp"):
+        # System-level defaults; `list` (and the bare usage form) only read.
+        return bool(args) and sub != "list"
+    if name == "system":
+        if not args or sub in ("list", "info", "rules"):
+            return False
+        if sub == "access":                 # !system access <sys> <action>
+            return len(args) < 3 or args[2].lower() != "list"
+        if sub == "alias":                  # !system alias <action> <sys>
+            return len(args) < 2 or args[1].lower() not in ("list", "info")
+        return True
+    if name == "history":
+        return sub in ("export", "import")  # host disk I/O
+    return False
+
 
 class CommandRegistry:
     def __init__(self):
@@ -288,6 +366,12 @@ class CommandRegistry:
         h = self._handlers.get(name)
         if not h:
             await ctx.send(self._unknown_command_message(name, mgr, ctx))
+            return
+        # Bot-wide commands need an admin even here: this path is ungated
+        # (batch / macro / foreach / run lines, action cmd()), so without the
+        # check a host could wrap `!system set` in a `!batch`.
+        if _admin_required(name, args) and not ctx_is_admin(ctx):
+            await ctx.send(_ADMIN_MSG)
             return
         # Inline-formula `$(...)` substitution for sub-command lines (a macro /
         # batch / foreach inner command), so $() resolves per line in the
@@ -481,14 +565,24 @@ class CommandRegistry:
             await ctx.send(self._unknown_command_message(name, mgr, ctx))
             return
 
+        # Bot-wide commands: an administrator, checked BEFORE the per-match
+        # gate (which is a no-op without an active match) and not subject to
+        # its overrides. Rejected outright — no match host can approve them.
+        admin_cmd = _admin_required(name, args)
+        if admin_cmd and not ctx_is_admin(ctx):
+            await ctx.send(_ADMIN_MSG)
+            return
+
         # Host / approval gate. Resolved against the channel's ACTIVE
-        # match (the thing the command would act on). If there's no active
+        # match (the thing the command would act on). Bot-wide commands
+        # skip it: they don't act on the channel's match, and an admin must
+        # not need that match's host to approve a system edit. If there's no active
         # match, or the surface carries no identity, the gate is a no-op —
         # so match creation, help, and identity-less contexts all run
         # freely. Otherwise: owner/host commands run directly for the
         # right role, a non-host's mutating command is held for approval,
         # and owner_only / host_only violations are rejected outright.
-        gate = self._gate_decision(name, args, ctx, mgr)
+        gate = "allow" if admin_cmd else self._gate_decision(name, args, ctx, mgr)
         if gate == "reject_owner":
             await ctx.send("❌ Only the match owner can do that.")
             return
@@ -1134,12 +1228,17 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 2, "match", "use"):
             return
         mid = args[1]
+        m = mgr.matches.get(mid)
+        if m is None:
+            raise NotFound(f"Match '{mid}' not found.")
+        # `use` binds this channel to the NAMED match (and views it from an
+        # unset — omniscient — POV), so it needs host rights on THAT match,
+        # not just on whatever the channel had active.
+        require_target_host(ctx, m, "bind a channel to it")
         mgr.set_active_for_channel(ctx.channel_key, mid)
         # `use` makes this channel act on the match; treat that as binding
         # the channel too so the match's channel set stays accurate.
-        m = mgr.matches.get(mid)
-        if m is not None:
-            m.bind_channel(ctx.channel_key)
+        m.bind_channel(ctx.channel_key)
         return await ctx.send(f"Active match is now **{m.name}** (`{mid}`, system `{m.system_name}`).")
     if sub == "bind":
         # !match bind [<match_id>] [label=<text>]
@@ -1169,6 +1268,7 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         m = mgr.matches.get(target_mid)
         if not m:
             raise NotFound(f"Match '{target_mid}' not found.")
+        require_target_host(ctx, m, "bind a channel to it")
         newly = m.bind_channel(ctx.channel_key, label=label, pov=pov)
         mgr.set_active_for_channel(ctx.channel_key, target_mid)
         bits = []
@@ -1296,6 +1396,10 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "delete":# and len(args) >= 2:
         if await return_help_if_not_enough_args(ctx, args, 2, "match", "delete"):
             return
+        target = mgr.matches.get(args[1])
+        if target is None:
+            raise NotFound(f"Match '{args[1]}' not found.")
+        require_target_host(ctx, target, "delete it", owner=True)
         mgr.delete_match(args[1])
         return await ctx.send(f"Deleted `{args[1]}`.")
     if sub == "rename":
@@ -1305,6 +1409,7 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         m = mgr.matches.get(mid)
         if not m:
             raise NotFound(f"Match '{mid}' not found.")
+        require_target_host(ctx, m, "rename it")
         m.name = " ".join(args[2:])
         return await ctx.send(f"Renamed match `{mid}`.")
     # win / outcome: declare or inspect the match VICTORY (100). There is no
@@ -3238,6 +3343,10 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if dest_mid not in mgr.matches:
             return await ctx.send(
                 f"❌ No match with id `{dest_mid}` (see `!match list`).")
+        # The access gate checked the SOURCE (this channel's match); placing
+        # an entity into another match needs host rights there too.
+        require_target_host(ctx, mgr.matches[dest_mid],
+                            "copy or transfer entities into it")
         x = y = None
         if len(args) >= 5:
             try:
@@ -5003,13 +5112,13 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "history", "export"):
             return
         selector = args[1]
-        path = args[2]
+        full, path = saves_path(args[2], write=True)
         snap = _resolve_snapshot_selector(m, selector)
         try:
-            with open(path, "w", encoding="utf-8") as f:
+            with open(full, "w", encoding="utf-8") as f:
                 json.dump(snap.to_dict(), f, indent=2)
         except OSError as ex:
-            raise VTTError(f"Failed to write '{path}': {ex}")
+            raise VTTError(f"Failed to write '{path}': {ex.strerror}")
         return await ctx.send(
             f"Exported {snap.kind} snapshot (seq {snap.sequence}) to `{path}`."
         )
@@ -5022,12 +5131,12 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "import":
         if await return_help_if_not_enough_args(ctx, args, 2, "history", "import"):
             return
-        path = args[1]
+        full, path = saves_path(args[1])
         override_name = None
         if len(args) >= 4 and args[2].lower() == "as":
             override_name = args[3]
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(full, "r", encoding="utf-8") as f:
                 snap = Snapshot.from_dict(json.load(f))
         except FileNotFoundError:
             raise VTTError(f"File not found: '{path}'")
@@ -5357,7 +5466,43 @@ async def undo_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     return await history_cmd(ctx, ["undo"] + list(args), mgr)
 
 
-@registry.command("store", usage="!store save <path> | !store load <path>", desc="Save/load all matches and channel bindings.", snapshot=False)
+# Every command that touches the host's disk (!store save/load, !run,
+# !history export/import) reads and writes ONLY inside this folder, on every
+# surface. A raw path used to reach the whole machine: `!run 1bot_token.txt`
+# echoed the bot token back line by line ("Unknown command `<token>`"), and
+# `!store save` could overwrite any file. Names are relative; subfolders are
+# fine; `..`, absolute paths and drive letters are refused, and the resolved
+# path must still sit inside the folder (a symlink can't escape it either).
+SAVES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saves")
+
+
+def saves_path(name: str, *, write: bool = False) -> Tuple[str, str]:
+    """Resolve a user-supplied file name inside SAVES_DIR. Returns
+    (absolute path, display name). The display name ("saves/<name>") is
+    what replies show, so the host's directory layout never leaks. With
+    write=True the parent folders are created."""
+    raw = (name or "").strip()
+    if not raw:
+        raise VTTError("A file name is required.")
+    # Split on BOTH separators so a Windows-style `..\\x` is caught too.
+    parts = [p for p in re.split(r"[\\/]+", raw) if p not in ("", ".")]
+    if (os.path.isabs(raw) or raw[:1] in ("/", "\\")
+            or re.match(r"^[A-Za-z]:", raw) or not parts
+            or any(p == ".." for p in parts)):
+        raise VTTError(
+            f"`{raw}` isn't allowed — use a plain file name (subfolders are "
+            f"fine). Files live in the bot's `saves/` folder; absolute paths "
+            f"and `..` are refused.")
+    base = os.path.realpath(SAVES_DIR)
+    full = os.path.realpath(os.path.join(base, *parts))
+    if os.path.commonpath([full, base]) != base:
+        raise VTTError(f"`{raw}` resolves outside the `saves/` folder.")
+    if write:
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+    return full, "saves/" + "/".join(parts)
+
+
+@registry.command("store", usage="!store save <name> | !store load <name>", desc="Save/load all matches and channel bindings (files in the bot's saves/ folder; server administrators only).", snapshot=False)
 async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
         title, body = registry.help_for(["store"])
@@ -5373,22 +5518,31 @@ async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         for extra in args[2:]:
             if extra.startswith("include_history="):
                 include_history = _parse_bool(extra[len("include_history="):])
-        mgr.save(args[1], include_history=include_history)
+        path, shown = saves_path(args[1], write=True)
+        mgr.save(path, include_history=include_history)
         suffix = " (with autosave history)" if include_history else ""
-        return await ctx.send(f"Saved to `{args[1]}`{suffix}")
+        return await ctx.send(f"Saved to `{shown}`{suffix}")
     if sub == "load":# and len(args) >= 2:
         if await return_help_if_not_enough_args(ctx, args, 2, "store", "load"):
             return
-        mgr.load(args[1]); return await ctx.send(f"Loaded from `{args[1]}`")
+        path, shown = saves_path(args[1])
+        try:
+            mgr.load(path)
+        except VTTError as ex:
+            # MatchManager.load names the absolute path it failed on; report
+            # the saves-relative name instead so no host path leaks.
+            raise VTTError(str(ex).replace(path, shown))
+        return await ctx.send(f"Loaded from `{shown}`")
     # Fallback: show authoritative help
     title, body = registry.help_for(["store"])
     return await ctx.send(f"**{title}**\n{body}")
 #annonate subcommands next to the command itself:
 registry.annotate_sub(
     "store", "save",
-    usage="!store save <path> [include_history=yes]",
+    usage="!store save <name> [include_history=yes]",
     desc=(
-        "Save all matches and channel bindings to a JSON file. By default "
+        "Save all matches and channel bindings to a JSON file in the bot's "
+        "`saves/` folder (plain names only; server administrators). By default "
         "excludes per-match autosave history (which can be large); pass "
         "`include_history=yes` to bundle the round/turn/command/manual "
         "saves for full campaign backup."
@@ -5396,8 +5550,10 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "store", "load",
-    usage="!store load <path>",
-    desc="Load matches and channel bindings from a JSON file."
+    usage="!store load <name>",
+    desc=("Load matches and channel bindings from a JSON file in the bot's "
+          "`saves/` folder, REPLACING every current match (server "
+          "administrators).")
 )
 
 
@@ -8954,14 +9110,14 @@ async def batch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 async def run_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if await return_help_if_not_enough_args(ctx, args, 1, "run"):
         return
-    path = args[0]
+    full, path = saves_path(args[0])
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(full, encoding="utf-8") as f:
             raw = f.read()
     except FileNotFoundError:
         return await ctx.send(f"❌ no such file: `{path}`")
     except OSError as ex:
-        return await ctx.send(f"❌ cannot read `{path}`: {ex}")
+        return await ctx.send(f"❌ cannot read `{path}`: {ex.strerror}")
     # Build subcommand argv lists. Each non-blank, non-comment line is
     # one subcommand. Leading `!` is optional — both forms are common in
     # human-written script files.

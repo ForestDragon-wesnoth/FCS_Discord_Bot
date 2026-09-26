@@ -290,6 +290,49 @@ behavior is what shipped).
 
 Add cross-cutting features here, not at the call sites.
 
+### ⚠️ Multi-tenant caveat (INTERIM — read before touching access or storage)
+
+ONE bot process serves EVERY Discord guild it's in, and today they all share
+one `MatchManager`: the GameSystems (rules, `command_access`, default vars /
+passives / clamps, system aliases), the match table, and the `saves/` folder
+are GLOBAL. Nothing is partitioned per guild. The current protections are
+stop-gaps (audit-pass-29, user-approved):
+- **Bot-wide commands need a server administrator** — `!system` edits,
+  `!defvar`/`!defpassive`/`!gclamp` edits, `!store`, `!run`, `!history
+  export/import` (`vtt_commands._admin_required` + `ctx_is_admin`; Discord =
+  the guild Administrator permission, CLI/GUI = always). Checked in BOTH
+  `CommandRegistry.run` and `dispatch_no_snapshot` (so batch/macro/foreach/
+  `!run` lines and action `cmd()` can't wrap them), rejected outright (never
+  queued), not overridable by `!host access` / `command_access`, and it skips
+  the per-match gate once passed. Action bodies can't run them at all
+  (`_BufferCtx` carries no admin flag — default-deny).
+- **Commands that NAME another match** (`!match use/bind/rename/delete <id>`,
+  `!ent copy/transfer <id> <dest>`) need host (delete: owner) of THAT match
+  (`require_target_host`) — the access gate only checks the CHANNEL's match.
+- **Disk paths are confined to `saves/`** (next section).
+The hole that remains BY DESIGN for now: an administrator of guild A can still
+change a shared system that guild B's matches use, `!store load` replaces every
+guild's matches, and `!match` lists every match id bot-wide. **When the bot is
+redesigned for proper data storage, systems, matches, saves and access MUST be
+split per guild** (each guild its own systems + match table + save folder, and
+cross-guild references impossible by construction). Don't build new features
+that deepen the sharing (e.g. a cross-guild match browser); do route any new
+global-state command through `_admin_required`.
+
+### Disk access is confined to `saves/`
+
+Every command that reads or writes a host file — `!store save/load`, `!run`,
+`!history export/import` — goes through `vtt_commands.saves_path(name,
+write=)`, which resolves plain relative names (subfolders allowed) inside
+`SAVES_DIR` (`saves/` next to the code) and refuses `..`, absolute paths,
+drive letters and anything whose realpath (symlinks included) leaves the
+folder. Replies show `saves/<name>`, never the host's absolute path. Before
+this, `!run 1bot_token.txt` echoed the bot token back line by line ("Unknown
+command `<token>`") to ANY user, and `!store save` could overwrite any file.
+`saves/` is git-ignored. The scenario harness points `SAVES_DIR` at a temp
+folder for the run (never touch a real campaign folder). If you add a new
+file-touching command, use `saves_path` AND list it in `_admin_required`.
+
 ---
 
 ## 4. The formula sandbox — what you can and can't do
@@ -632,7 +675,9 @@ Shipped capabilities (roughly chronological; all merged):
     content, not a subcommand — scenario 570); a new command gets no
     downgrade until its read-only subs are listed there. Gate is a NO-OP when there's
     no active match, no identity, or `owner is None` (legacy/open
-    matches). Alias resolution runs BEFORE the gate; `dispatch_no_snapshot`
+    matches) — which is why BOT-WIDE commands have their own admin check and
+    match-NAMING commands their own target check (see "Multi-tenant caveat"
+    in §3). Alias resolution runs BEFORE the gate; `dispatch_no_snapshot`
     (batch/run/action `cmd()`) is intentionally ungated since it's only
     reached from an already-approved/host context — gate stays at the
     top level only.
@@ -2648,8 +2693,9 @@ More shipped work (continuing the list above):
     tweaked rules, active channel bindings, zones/anchored auras, macros, team
     data, nested inventory and a part subtree all survive into a FRESH manager,
     and the loaded match is fully functional (list/map/turn/move/macro/part all
-    clean). Path handling is host-gated disk I/O by design (same self-hosted
-    stance as sprites). **Event-log retention** is a plain count cap (not
+    clean). (Path handling was "host-gated by design" here — SUPERSEDED in
+    audit-pass-29: the gate was a no-op without an active match, so any user
+    could read/write host files; now admin-only and confined to `saves/`.) **Event-log retention** is a plain count cap (not
     round-keyed, so unlike pass-24 it's ATB-safe): cap enforced, 0 = keep
     nothing, -1 = unlimited. **Dict-rule editors** — `!system set` correctly
     refuses dict rules and points at the dedicated editor; `!log format` (incl.
@@ -3438,6 +3484,61 @@ More shipped work (continuing the list above):
   after an undo — always RE-FETCH `mgr.matches[id]` after a restore/undo or
   you'll read the pre-undo object and think undo is broken. Two clean passes
   (14-15) in a row → the harness-testable engine core is solid.
+
+- **Audit-pass-29 (hands-on, broad): gate bypass, cross-guild access, Discord
+  rendering, undo (scenarios 570-575).** Started with a harness bug (scenarios
+  230/232/236 never ran — no blank line before their headers; the harness now
+  cross-checks header lines against parsed scenarios). Fixes:
+  - **Read-only subcommand downgrade was GLOBAL → gate bypass (HIGH).**
+    `READ_ONLY_SUBCOMMANDS` applied its words to EVERY host root, so for roots
+    whose args[0] is content (`batch`, `emit`, `eval`, `run`) a player's
+    `!batch list ; ent hp boss -40` ran unapproved. Now a per-root dict of the
+    read-only subs each handler really dispatches, plus a module-end assert
+    that every key is a registered command (570).
+  - **Cross-guild / global-state access (CRITICAL, user design calls).** See
+    §3 "Multi-tenant caveat" + "Disk access is confined to `saves/`":
+    admin-only bot-wide commands, target-host checks, `saves/` confinement
+    (572-574). Verified before the fix: token file readable via `!run`; one
+    guild's user opened `ent` to all in another guild's match via `!system
+    access`; `!match use <id>` gave an omniscient view of another guild's
+    fogged board.
+  - **Undo dropped the approval queue (MED).** `_restore_snapshot` builds a
+    fresh Match; `pending_requests`/`_request_seq` are runtime-only, so every
+    undo silently dropped queued player requests and restarted ids at r1 — a
+    Discord Approve button still on screen then resolved a DIFFERENT request.
+    Now carried across; `_ApprovalView._pop_own` also resolves by identity (571).
+  - **Repeated `!undo command 1` was stuck (MED).** `truncate_after` kept the
+    restored command snapshot (= the current state), so each later single undo
+    re-restored it while reporting "Undid 1 command(s)". Command snapshots are
+    now dropped on restore; round/turn ones stay (they mark a START) (575).
+  - **Command autosaves had no count cap (MED, user default 100).** The turn
+    window only prunes on turn advance, so a setup phase kept a full match
+    snapshot per command (600 tile edits → 16 MB). New rule
+    `autosave_command_retention_max` (575).
+  - **Discord colored maps (MED, Discord-only).** A 30×30 viewport with ~16
+    team-colored units is >2000 chars: `_split_for_discord` split INSIDE the
+    ```ansi fence (garbage on both halves) and an over-cap board edit raised,
+    silently DROPPING the auto-update board. Splitter is now fence-aware
+    (property-tested: size, balanced fences, content preserved, no empty
+    blocks); `_board_render` degrades (no color → no legend → a message naming
+    the viewport rules); `render_ascii` emits one ANSI code per same-color RUN
+    (a colored-terrain board 4478 → 2050 chars, cells decode identical); empty
+    messages are skipped at the send chokepoint (Discord rejects them).
+  - **Graphics canvas sizing (MED).** `render_match_png` rendered at full cell
+    size then downscaled (80×80: an 8000² intermediate, 3.2 s); the GUI had no
+    cap (40×40 at 4× zoom ≈ 1 GB). `sprite_render.fit_cell_size` sizes the
+    canvas to the pixel budget first (0.33 s); GUI caps at 8000 px and pins its
+    zoom readout.
+  - **Fog reveal records piled up (LOW-MED perf).** One record per
+    `!reveal_fog`; every fog check scans them (300 permanent → 166 ms per
+    60×60 render). Records sharing an expiry now merge (23 ms).
+  - OPEN (flagged to the user, not changed): with `random_seed` set, the seeded
+    RNG's position isn't in snapshots, so after any undo/restore the sequence
+    RESTARTS from the seed (the next roll repeats the session's first roll).
+    Whether undo should restore the RNG position (anti-reroll) or continue it is
+    a design call. Also: the `_ApprovalView` buttons don't disable themselves on
+    timeout (they just stop working); `bot.py`'s missing-token message names
+    `bot_token.txt` + `DISCORD_TOKEN` while it actually reads `1bot_token.txt`.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
