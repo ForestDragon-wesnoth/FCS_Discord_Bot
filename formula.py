@@ -924,6 +924,124 @@ def _ceil(v: Any) -> int:
     return math.ceil(v)
 
 
+# ---- resource bounds ---------------------------------------------------
+# A formula's cost must not follow its ARGUMENTS unboundedly: inline `$()`
+# args put read-only formulas in every player's hands, and one `9**9**9` or
+# `cells_in_rect(0, 0, 10**6, 10**6)` would block the event loop — for every
+# server the bot is in. Defaults mirror the formula_cell_limit /
+# formula_size_limit rules; FormulaEngine._namespace binds the match's values.
+_DEFAULT_CELL_LIMIT = 100_000
+_DEFAULT_SIZE_LIMIT = 100_000
+
+
+def _max_int_digits() -> int:
+    """Largest integer (in decimal digits) a formula may produce: Python's
+    own int-to-string limit, beyond which the value can't be shown in a
+    reply or written to a save file (json.dumps raises)."""
+    try:
+        import sys
+        lim = sys.get_int_max_str_digits()
+    except AttributeError:
+        lim = 4300
+    return lim if lim > 0 else 4300
+
+
+def _cell_budget(n: int, fname: str, limit: int) -> None:
+    """Refuse a geometry query that would generate or walk `n` cells."""
+    if n > limit:
+        raise FormulaError(
+            f"{fname}(...): would cover {n} cells, over the "
+            f"formula_cell_limit of {limit}."
+        )
+
+
+def _int_too_big(msg: str) -> FormulaError:
+    return FormulaError(
+        f"{msg}: the result would exceed {_max_int_digits()} digits "
+        f"(the largest integer that can be displayed or saved)."
+    )
+
+
+def _safe_pow(a: Any, b: Any) -> Any:
+    """`a ** b` with the integer result size checked BEFORE computing it
+    (9**9**9 is ~370 million digits and takes hours). Float overflow is
+    already fast (OverflowError)."""
+    if (isinstance(a, int) and isinstance(b, int) and b > 1
+            and abs(a) > 1 and b * math.log10(abs(a)) > _max_int_digits()):
+        raise _int_too_big("** / pow")
+    return a ** b
+
+
+def _safe_mul(a: Any, b: Any, limit: int = _DEFAULT_SIZE_LIMIT) -> Any:
+    """`a * b` with sequence repetition ('ab' * n, [0] * n) capped at
+    formula_size_limit and integer products at the displayable size."""
+    if isinstance(a, int) and isinstance(b, (str, list, tuple)):
+        a, b = b, a
+    if isinstance(a, (str, list, tuple)) and isinstance(b, int):
+        if b > 0 and len(a) * b > limit:
+            raise FormulaError(
+                f"*: would build a {type(a).__name__} of length "
+                f"{len(a) * b}, over the formula_size_limit of {limit}."
+            )
+    elif (isinstance(a, int) and isinstance(b, int) and a and b
+          and (a.bit_length() + b.bit_length()) * 0.30103
+          > _max_int_digits() + 1):
+        raise _int_too_big("*")
+    return a * b
+
+
+def _safe_add(a: Any, b: Any, limit: int = _DEFAULT_SIZE_LIMIT) -> Any:
+    """`a + b` with string/list concatenation capped at formula_size_limit
+    (a loop doubling `s = s + s` otherwise grows without bound)."""
+    if (isinstance(a, (str, list, tuple)) and isinstance(b, (str, list, tuple))
+            and len(a) + len(b) > limit):
+        raise FormulaError(
+            f"+: would build a {type(a).__name__} of length "
+            f"{len(a) + len(b)}, over the formula_size_limit of {limit}."
+        )
+    return a + b
+
+
+def _safe_mod(a: Any, b: Any) -> Any:
+    """`a % b` for numbers. `%` on a string is Python's printf formatting,
+    where a width like '%999999999d' allocates gigabytes; formulas build
+    strings with `+` and str() instead."""
+    if isinstance(a, str):
+        raise FormulaError(
+            "%: string formatting isn't supported in formulas — build the "
+            "text with + and str() instead."
+        )
+    return a % b
+
+
+_ARITH_GUARDS = {ast.Pow: "__safe_pow", ast.Mult: "__safe_mul",
+                 ast.Add: "__safe_add", ast.Mod: "__safe_mod"}
+
+
+class _ArithGuardTransformer(ast.NodeTransformer):
+    """Rewrites `a ** b`, `a * b`, `a + b` and `a % b` into the bounded
+    __safe_* helpers (see above). Runs AFTER validation — the validator
+    doesn't know the helper names — right before every compile, so each
+    user formula (expression, program, action body, !func) is covered.
+    Evaluation order is unchanged: left, then right, then the operation."""
+
+    def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
+        self.generic_visit(node)
+        fn = _ARITH_GUARDS.get(type(node.op))
+        if fn is None:
+            return node
+        return ast.copy_location(
+            ast.Call(func=ast.Name(id=fn, ctx=ast.Load()),
+                     args=[node.left, node.right], keywords=[]),
+            node)
+
+
+def _guard_arith(tree: ast.AST) -> ast.AST:
+    tree = _ArithGuardTransformer().visit(tree)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def _pow(base: Any, exp: Any) -> Any:
     _num_arg(base, "pow", "base")
     _num_arg(exp, "pow", "exp")
@@ -931,7 +1049,7 @@ def _pow(base: Any, exp: Any) -> Any:
     # the existing ** operator's behavior); guard the 0**negative and
     # negative-base-fractional-exp cases that raise/return complex.
     try:
-        result = base ** exp
+        result = _safe_pow(base, exp)
     except ZeroDivisionError:
         raise FormulaError("pow(base, exp): 0 raised to a negative power.")
     if isinstance(result, complex):
@@ -1057,7 +1175,8 @@ def _coord_int(v: Any, fname: str, argname: str) -> int:
 
 
 def _cells_in_burst(x: Any, y: Any, r: Any,
-                    mode: Any = "square_radius_distance") -> list:
+                    mode: Any = "square_radius_distance", *,
+                    limit: int = _DEFAULT_CELL_LIMIT) -> list:
     """cells_in_burst(x, y, r, mode="square_radius_distance"): every cell
     within distance r of (x, y) under the given distance metric, INCLUDING
     the center. Shape depends on mode: square_radius -> filled square,
@@ -1073,6 +1192,7 @@ def _cells_in_burst(x: Any, y: Any, r: Any,
     if r < 0:
         raise FormulaError(f"cells_in_burst(...): r must be >= 0, got {r}.")
     ri = int(math.floor(r))
+    _cell_budget((2 * ri + 1) ** 2, "cells_in_burst", limit)
     out = []
     for cx in range(cx0 - ri, cx0 + ri + 1):
         for cy in range(cy0 - ri, cy0 + ri + 1):
@@ -1083,7 +1203,8 @@ def _cells_in_burst(x: Any, y: Any, r: Any,
     return out
 
 
-def _cells_in_line(x1: Any, y1: Any, x2: Any, y2: Any) -> list:
+def _cells_in_line(x1: Any, y1: Any, x2: Any, y2: Any, *,
+                   limit: int = _DEFAULT_CELL_LIMIT) -> list:
     """cells_in_line(x1, y1, x2, y2): the cells on the straight line from
     (x1,y1) to (x2,y2) inclusive, via Bresenham's algorithm. Returns a
     list of (x, y) tuples ordered from start to end. Useful as the basis
@@ -1094,6 +1215,7 @@ def _cells_in_line(x1: Any, y1: Any, x2: Any, y2: Any) -> list:
     by = _coord_int(y2, "cells_in_line", "y2")
     dx = abs(bx - ax)
     dy = abs(by - ay)
+    _cell_budget(max(dx, dy) + 1, "cells_in_line", limit)
     sx = 1 if ax < bx else -1
     sy = 1 if ay < by else -1
     err = dx - dy
@@ -1122,7 +1244,8 @@ _DIRECTION_ANGLES: Dict[str, float] = {
 
 
 def _cells_in_cone(x: Any, y: Any, direction: Any, length: Any,
-                   half_angle: Any = 45) -> list:
+                   half_angle: Any = 45, *,
+                   limit: int = _DEFAULT_CELL_LIMIT) -> list:
     """cells_in_cone(x, y, direction, length, half_angle=45): the cells
     inside a cone emanating from (x, y).
 
@@ -1166,6 +1289,7 @@ def _cells_in_cone(x: Any, y: Any, direction: Any, length: Any,
             f"{type(half_angle).__name__}."
         )
     li = int(math.floor(length))
+    _cell_budget((2 * li + 1) ** 2, "cells_in_cone", limit)
     out = []
     for cx in range(cx0 - li, cx0 + li + 1):
         for cy in range(cy0 - li, cy0 + li + 1):
@@ -1182,7 +1306,8 @@ def _cells_in_cone(x: Any, y: Any, direction: Any, length: Any,
     return out
 
 
-def _cells_in_rect(x1: Any, y1: Any, x2: Any, y2: Any) -> list:
+def _cells_in_rect(x1: Any, y1: Any, x2: Any, y2: Any, *,
+                   limit: int = _DEFAULT_CELL_LIMIT) -> list:
     """cells_in_rect(x1, y1, x2, y2): every cell in the axis-aligned
     rectangle whose opposite corners are (x1,y1) and (x2,y2), inclusive.
     Corner order doesn't matter (the bounds are normalized), so
@@ -1195,6 +1320,7 @@ def _cells_in_rect(x1: Any, y1: Any, x2: Any, y2: Any) -> list:
     by = _coord_int(y2, "cells_in_rect", "y2")
     lo_x, hi_x = (ax, bx) if ax <= bx else (bx, ax)
     lo_y, hi_y = (ay, by) if ay <= by else (by, ay)
+    _cell_budget((hi_x - lo_x + 1) * (hi_y - lo_y + 1), "cells_in_rect", limit)
     out = []
     for cx in range(lo_x, hi_x + 1):
         for cy in range(lo_y, hi_y + 1):
@@ -2920,6 +3046,14 @@ class FormulaEngine:
                     f"formula_loop_limit rule if a higher cap is "
                     f"intentionally needed."
                 )
+        def _rule_int(key: str, default: int) -> int:
+            try:
+                return int(self._match.rules.get(key, default)) \
+                    if self._match else default
+            except (TypeError, ValueError):
+                return default
+        cell_limit = _rule_int("formula_cell_limit", _DEFAULT_CELL_LIMIT)
+        size_limit = _rule_int("formula_size_limit", _DEFAULT_SIZE_LIMIT)
         ns: Dict[str, Any] = {
             "__read":  lambda who, path:        self._read(who, path, ctx),
             "__write": lambda who, path, value: self._write(who, path, value, ctx),
@@ -2927,6 +3061,17 @@ class FormulaEngine:
             "__write_match": lambda path, value: self._write_match(path, value),
             "__loop_tick": _loop_tick,
             **_ALLOWED_FUNCS,
+            # Bounded arithmetic (_ArithGuardTransformer) + the cell budget.
+            # The cells_in_* wrappers pass `limit` themselves, so a formula
+            # passing its own `limit=` gets a duplicate-keyword error.
+            "__safe_pow": _safe_pow,
+            "__safe_mul": lambda a, b: _safe_mul(a, b, size_limit),
+            "__safe_add": lambda a, b: _safe_add(a, b, size_limit),
+            "__safe_mod": _safe_mod,
+            "cells_in_burst": lambda *a, **k: _cells_in_burst(*a, limit=cell_limit, **k),
+            "cells_in_line": lambda *a, **k: _cells_in_line(*a, limit=cell_limit, **k),
+            "cells_in_cone": lambda *a, **k: _cells_in_cone(*a, limit=cell_limit, **k),
+            "cells_in_rect": lambda *a, **k: _cells_in_rect(*a, limit=cell_limit, **k),
         }
         # Per-name default: was_clamped is boolean-flavored (default False);
         # args defaults to an empty dict (so attribute access via
@@ -6094,7 +6239,8 @@ class FormulaEngine:
             """entities_in_cone(x, y, direction, length, half_angle=45):
             alive entity ids inside the cone (see cells_in_cone), sorted
             by (distance from origin, id)."""
-            cells = set(_cells_in_cone(x, y, direction, length, half_angle))
+            cells = set(_cells_in_cone(x, y, direction, length, half_angle,
+                                       limit=cell_limit))
             cx0 = _coord_int(x, "entities_in_cone", "x")
             cy0 = _coord_int(y, "entities_in_cone", "y")
             # Order by NEAREST covered cell to the origin (so a large entity
@@ -6112,7 +6258,7 @@ class FormulaEngine:
             """entities_in_rect(x1, y1, x2, y2): alive entity ids inside the
             axis-aligned rectangle (see cells_in_rect), sorted by
             (x, y, id)."""
-            cells = set(_cells_in_rect(x1, y1, x2, y2))
+            cells = set(_cells_in_rect(x1, y1, x2, y2, limit=cell_limit))
             return [eid for (_x, _y, eid) in sorted(_alive_at(cells))]
 
         def _entities_in_line_until(x1: Any, y1: Any, x2: Any, y2: Any,
@@ -6511,7 +6657,7 @@ class FormulaEngine:
                        known_params=known_params)
         body_code = None
         if full.body:
-            body_code = compile(full, "<formula-fn>", "exec")
+            body_code = compile(_guard_arith(full), "<formula-fn>", "exec")
         expr_code = None
         if trailing_expr is not None:
             expr_tree = ast.Expression(body=trailing_expr)
@@ -6519,7 +6665,7 @@ class FormulaEngine:
             ast.fix_missing_locations(expr_tree)
             _validate_tree(expr_tree, known_funcs=known_funcs,
                            known_params=known_params)
-            expr_code = compile(expr_tree, "<formula-fn>", "eval")
+            expr_code = compile(_guard_arith(expr_tree), "<formula-fn>", "eval")
         compiled = (body_code, expr_code)
         try:
             fdef._compiled = compiled
@@ -6575,7 +6721,7 @@ class FormulaEngine:
             ctx.match = self._match  # enable `parent`-token resolution
         self._reset_affected()
         tree = self._prepare(src, "eval", known_funcs=self._known_funcs())
-        code = compile(tree, "<formula>", "eval")
+        code = compile(_guard_arith(tree), "<formula>", "eval")
         try:
             return eval(code, {"__builtins__": {}}, self._namespace(ctx))
         except FormulaError:
@@ -6646,7 +6792,8 @@ class FormulaEngine:
             ns.update(action_bindings)
         try:
             if full.body:
-                exec(compile(full, "<formula>", "exec"), {"__builtins__": {}}, ns)
+                exec(compile(_guard_arith(full), "<formula>", "exec"),
+                     {"__builtins__": {}}, ns)
             if trailing_expr is None:
                 return None
             expr_tree = ast.Expression(body=trailing_expr)
@@ -6658,7 +6805,7 @@ class FormulaEngine:
                 expr_tree, known_funcs=known, known_params=full_locals,
                 action_mode=action_mode,
             )
-            return eval(compile(expr_tree, "<formula>", "eval"),
+            return eval(compile(_guard_arith(expr_tree), "<formula>", "eval"),
                         {"__builtins__": {}}, ns)
         except FormulaError:
             raise

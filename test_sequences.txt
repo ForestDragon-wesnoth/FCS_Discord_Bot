@@ -15047,3 +15047,42 @@ undoing past `!match bind pov=blue` refuses and lists the difference (`CLI`: now
 POV blue, POV red in the snapshot), and nothing is restored (still POV blue).
 Re-running with `bindings=revert` restores the snapshot's POV red. A bad
 `bindings=` value is rejected. The last line restores the default.
+
+
+SCENARIO 578 — Formula resource limits: big ints, repetition, cell budgets
+--------------------------------------------------------------------------------
+
+!match new lim Limits 10 10
+!match use lim
+!ent add a A 10 1 1 5
+!eval "2**10 + 3*4"
+!eval "'ab' * 3 + 'c'"
+!eval "len(cells_in_rect(0, 0, 9, 9))"
+!as player mallory
+!dist $(9**9**9) 1 1 1
+!dist $(len([0]*10**9)) 1 1 1
+!dist $(len(cells_in_rect(0,0,10**6,10**6))) 1 1 1
+!dist $(has_los(0,0,0,10**8)) 1 1 1
+!as host
+!eval "pow(10, 5000)"
+!eval "len('a' * 10**10)"
+!eval "'%099999d' % 1"
+!eval "len(cells_in_rect(0, 0, 999, 999))"
+!system set default formula_cell_limit 1000000
+!eval "len(cells_in_rect(0, 0, 999, 999))"
+!system set default formula_cell_limit 100000
+
+Expected: ordinary arithmetic is untouched (1036, 'abababc', 100 cells). A
+formula's cost used to follow its ARGUMENTS without bound, and inline `$()` args
+hand read-only formulas to every player: `!dist $(9**9**9) 1 1 1` computed a
+370-million-digit integer (hours, blocking the event loop for every server) and
+`'a'*10**10` tried to allocate 10 GB (`[0]*10**9`, 8 GB). Now each is refused at once: integers are
+capped at the digits Python can still print and save (4300), `*`/`+` string/list
+building at `formula_size_limit` (100000), `%` string formatting is rejected (a
+'%099999d' width is another allocation bomb), and every geometry query —
+cells_in_burst/_rect/_cone/_line, entities_in_rect/_cone, and the sight-line
+walkers (has_los, raycast, first_opaque, entities_on_los, ...) — at
+`formula_cell_limit` (100000 cells). A 1000x1000 rect (1,000,000 cells) is
+refused by default and allowed after raising the rule; the last line restores
+the default. HARNESS-ALLOWS-ERRORS (the sight-line refusal surfaces as a
+wrapped Runtime error).

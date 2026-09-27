@@ -1383,6 +1383,34 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "for-loop counts toward the total."
         ),
     },
+    "formula_cell_limit": {
+        "default": 100000,
+        "schema": {"type": "int"},
+        "desc": (
+            "Maximum number of cells one geometry query in a formula may "
+            "generate or walk: cells_in_burst / _rect / _cone / _line, "
+            "entities_in_rect / _cone, and every sight line (has_los, "
+            "raycast, first_opaque, entities_on_los, "
+            "entities_in_line_ignorelos / _until, can_see*). Their cost "
+            "follows the ARGUMENTS, not the board, so without a cap "
+            "`cells_in_rect(0, 0, 100000, 100000)` — reachable by any "
+            "player through an inline `$()` arg — would hang the bot for "
+            "every server. Default 100000 (a 316x316 area, or a sight line "
+            "that long) is far beyond any real map."
+        ),
+    },
+    "formula_size_limit": {
+        "default": 100000,
+        "schema": {"type": "int"},
+        "desc": (
+            "Maximum length of a string or list a formula may build with "
+            "`*` or `+` (e.g. 'ab' * n, [0] * n, s + s). Guards against "
+            "`'a' * 10**10` (a multi-gigabyte allocation from one inline "
+            "`$()` arg). Integers are separately capped at the size Python "
+            "can still print and save (its int-to-string digit limit), so "
+            "`9**9**9` is refused instead of computed for hours."
+        ),
+    },
     "summon_event_limit": {
         "default": 50,
         "schema": {"type": "int"},
@@ -7535,6 +7563,7 @@ class Match:
         block."""
         if (x1, y1) == (x2, y2):
             return ((x2, y2), False, None)
+        self._check_line_budget(x1, y1, x2, y2)
         mode = str(self.rules.get("los_corner_mode", "permissive"))
         dx, dy = x2 - x1, y2 - y1
         sx = 1 if dx > 0 else (-1 if dx < 0 else 0)
@@ -7594,6 +7623,23 @@ class Match:
         drift on the corner rule."""
         return not self._los_stop(viewer_id, x1, y1, x2, y2)[1]
 
+    def _check_line_budget(self, x1: int, y1: int, x2: int, y2: int) -> None:
+        """Refuse a sight/geometry line longer than the formula_cell_limit
+        rule. The walk costs one step per cell crossed, and formulas (incl.
+        a player's inline `$()` arg) choose the endpoints freely — has_los(0,
+        0, 0, 10**8) would otherwise spin for minutes. Lines between on-grid
+        cells are always far under the default."""
+        n = abs(x2 - x1) + abs(y2 - y1) + 1
+        try:
+            limit = int(self.rules.get("formula_cell_limit", 100000))
+        except (TypeError, ValueError):
+            limit = 100000
+        if n > limit:
+            raise VTTError(
+                f"sight line ({x1},{y1})->({x2},{y2}) crosses up to {n} "
+                f"cells, over the formula_cell_limit of {limit}."
+            )
+
     def _line_cells(self, x1: int, y1: int, x2: int, y2: int) -> List[Tuple[int, int]]:
         """The ordered cells the segment (x1,y1)->(x2,y2) passes through,
         near->far, INCLUSIVE of both endpoints — the same thin line the LOS
@@ -7603,6 +7649,7 @@ class Match:
         cells = [(x1, y1)]
         if (x1, y1) == (x2, y2):
             return cells
+        self._check_line_budget(x1, y1, x2, y2)
         dx, dy = x2 - x1, y2 - y1
         sx = 1 if dx > 0 else (-1 if dx < 0 else 0)
         sy = 1 if dy > 0 else (-1 if dy < 0 else 0)

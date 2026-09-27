@@ -393,7 +393,10 @@ class CommandRegistry:
                     return
                 try:
                     args = [resolve_arg_token(a, m_arg, self_id=None) for a in args]
-                except FormulaError as e:
+                except Exception as e:
+                    # Not only FormulaError: turning the result into an argument
+                    # can fail too (str() of an oversized int raises ValueError),
+                    # and anything uncaught here escaped run() with no reply at all.
                     await ctx.send(f"❌ inline $() argument: {e}")
                     return
         try:
@@ -645,7 +648,10 @@ class CommandRegistry:
                 return
             try:
                 args = [resolve_arg_token(a, m_arg, self_id=None) for a in args]
-            except FormulaError as e:
+            except Exception as e:
+                # Not only FormulaError: turning the result into an argument
+                # can fail too (str() of an oversized int raises ValueError),
+                # and anything uncaught here escaped run() with no reply at all.
                 await ctx.send(f"❌ inline $() argument: {e}")
                 return
 
