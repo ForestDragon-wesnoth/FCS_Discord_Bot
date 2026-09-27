@@ -129,7 +129,9 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
     "macro":      frozenset({"list"}),
     "match":      frozenset({"channels", "hosts", "outcome"}),
     "mount":      frozenset({"list", "info"}),
-    "part":       frozenset({"list", "info"}),
+    # `info` is NOT here: it prints the part's full var JSON — what `!ent
+    # dump` is host-gated to hide.
+    "part":       frozenset({"list"}),
     "passive":    frozenset({"list", "info"}),
     "reveal_fog": frozenset({"list"}),
     "schedule":   frozenset({"list"}),
@@ -875,14 +877,16 @@ def _entity_line(e: Entity, pov_team: Optional[str] = None) -> str:
     return line
 
 
-def _entity_card(e: Entity) -> str:
-    """Multi-line entity card, rendered from the active match's entity_info_format rule."""
+def _entity_card(e: Entity, pov_team: Optional[str] = None) -> str:
+    """Multi-line entity card, rendered from the active match's
+    entity_info_format rule. A non-allied `pov_team` sees a disguised
+    entity's decoy (see _entity_template_context)."""
     tmpl = None
     if e._match is not None:
         tmpl = e._match.rules.get("entity_info_format")
     if not tmpl:
         tmpl = DEFAULT_SYSTEM_SETTINGS.get("entity_info_format", "")
-    return _render_template(tmpl, _entity_template_context(e))
+    return _render_template(tmpl, _entity_template_context(e, pov_team))
 
 
 def _corpse_template_context(
@@ -2580,11 +2584,8 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "info":
         if await return_help_if_not_enough_args(ctx, args, 2, "ent", "info"):
             return
-        eid = _resolve_eid(m, args[1])
-        if eid not in m.entities:
-            raise NotFound(f"Entity '{eid}' not found.")
-        e = m.entities[eid]
-        return await ctx.send(_entity_card(e))
+        eid = _query_eid(ctx, m, args[1])
+        return await ctx.send(_entity_card(m.entities[eid], _query_pov(ctx, m)))
 
     # --- dump (raw, template-free view of everything stored on the entity) ---
     if sub == "dump":
@@ -3802,6 +3803,51 @@ def _view_pov(ctx: ReplyContext, m: "Match", args: List[str]) -> Optional[str]:
     return m.channel_pov(ctx.channel_key)
 
 
+def _query_pov(ctx: ReplyContext, m: "Match") -> Optional[str]:
+    """The team POV a player-facing entity QUERY filters by (`!ent info`,
+    `!find`, `!dist`, ...), or None for unfiltered: the same channel POV /
+    `!as view` preview as `!map`, when the pov_filters_queries rule is on."""
+    if not m.rules.get("pov_filters_queries", True):
+        return None
+    return _view_pov(ctx, m, [])
+
+
+def _pov_hides(m: "Match", pov: Optional[str], eid: str) -> bool:
+    """Whether `eid` is hidden from a query made under `pov`. Your own
+    team's units (a body part counts as its root body's team) are never
+    hidden — a hidden rider or a unit in its own fog is still yours."""
+    if pov is None or eid not in m.entities:
+        return False
+    root = m.entities[eid]
+    seen = set()
+    while root.part_of and root.part_of in m.entities and root.id not in seen:
+        seen.add(root.id)
+        root = m.entities[root.part_of]
+    if root.team is not None and str(root.team) == str(pov):
+        return False
+    return not m.entity_visible_to(eid, pov)
+
+
+def _acts_as_host(ctx: ReplyContext, m: "Match") -> bool:
+    """Whether the caller has host authority on `m` — or the gate doesn't
+    apply at all (auto-approve surface, open match, no identity), the same
+    no-op shape as the access gate."""
+    if getattr(ctx, "auto_approve", False) or getattr(m, "owner", None) is None:
+        return True
+    user = ctx_user(ctx)
+    return user is None or m.is_host(user)
+
+
+def _query_eid(ctx: ReplyContext, m: "Match", token: str) -> str:
+    """Resolve an entity id for a read-only query, treating an entity the
+    channel's POV can't see exactly like a missing one (same message, which
+    echoes what was typed — never the resolved id)."""
+    eid = _resolve_eid(m, token)
+    if eid not in m.entities or _pov_hides(m, _query_pov(ctx, m), eid):
+        raise NotFound(f"Entity '{token}' not found.")
+    return eid
+
+
 _MAP_LAYERS = ("zones", "tiles", "entities", "fog")
 
 
@@ -4474,8 +4520,10 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             pred_tokens.append(t)
     try:
         predicates = [_parse_find_predicate(t) for t in pred_tokens]
+        pov = _query_pov(ctx, m)
         hits = [e for e in m.entities_in_turn_order()
-                if _find_match_entity(m, e, predicates)]
+                if not _pov_hides(m, pov, e.id)
+                and _find_match_entity(m, e, predicates)]
     except VTTError as ex:
         return await ctx.send(f"❌ {ex}")
     if not hits:
@@ -4500,7 +4548,7 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     word = "match" if len(hits) == 1 else "matches"
     lines = [f"**{len(hits)} {word}:**"]
     for e in hits:
-        row = f"- {_entity_line(e)}"
+        row = f"- {_entity_line(e, pov)}"
         if show_cols:
             cells = []
             for col in show_cols:
@@ -4595,11 +4643,7 @@ async def dist_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             break
     # Resolve the two endpoints from the leading tokens.
     def _ent(tok):
-        eid = _resolve_eid(m, tok)
-        e = m.entities.get(eid)
-        if e is None:
-            raise NotFound(f"Entity '{tok}' not found.")
-        return e
+        return m.entities[_query_eid(ctx, m, tok)]
 
     try:
         if len(toks) == 2:           # entity, entity
@@ -4825,8 +4869,13 @@ async def foreach_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     try:
         predicates = [_parse_find_predicate(t) for t in sel_tokens]
+        # A non-host's sweep (only reachable when every inner command is
+        # read-only) sees what `!find` would: $id/$x/$y would otherwise hand
+        # out hidden units' positions. A host's sweep acts on the real board.
+        pov = None if _acts_as_host(ctx, m) else _query_pov(ctx, m)
         hits = [e for e in m.entities_in_turn_order()
-                if _find_match_entity(m, e, predicates)]
+                if not _pov_hides(m, pov, e.id)
+                and _find_match_entity(m, e, predicates)]
     except VTTError as ex:
         return await ctx.send(f"❌ {ex}")
     if not hits:
@@ -5340,6 +5389,15 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "diff":
         if await return_help_if_not_enough_args(ctx, args, 3, "history", "diff"):
             return
+        # A diff reports every unit's changes, hidden ones included, so under
+        # a team POV with anything to hide it is host-only (pov_filters_queries).
+        if (_query_pov(ctx, m) is not None and not _acts_as_host(ctx, m)
+                and (m.fog_enabled
+                     or str(m.rules.get("entity_visibility_condition", "")).strip())):
+            return await ctx.send(
+                "❌ `!history diff` is host-only while this channel's view is "
+                "fogged or filtered — it would report hidden units' changes "
+                "(pov_filters_queries).")
         snap_a = _resolve_snapshot_selector(m, args[1])
         snap_b = _resolve_snapshot_selector(m, args[2])
         lines = _format_snapshot_diff(snap_a, snap_b, args[1], args[2])
@@ -5841,9 +5899,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "list":
         # Specific entity
         if len(args) >= 2:
-            eid = _resolve_eid(m, args[1])
-            if eid not in m.entities:
-                raise NotFound(f"Entity '{eid}' not found.")
+            eid = _query_eid(ctx, m, args[1])
             e = m.entities[eid]
             if not e.passives:
                 return await ctx.send(f"`{eid}` has no passives.")
@@ -5854,8 +5910,9 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # All entities
         lines = ["**All entity passives in this match:**"]
         any_found = False
+        pov = _query_pov(ctx, m)
         for eid, e in m.entities.items():
-            if not e.passives:
+            if not e.passives or _pov_hides(m, pov, eid):
                 continue
             any_found = True
             for pid, p in e.passives.items():
@@ -5867,9 +5924,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "info":
         if await return_help_if_not_enough_args(ctx, args, 3, "passive", "info"):
             return
-        eid = _resolve_eid(m, args[1])
-        if eid not in m.entities:
-            raise NotFound(f"Entity '{eid}' not found.")
+        eid = _query_eid(ctx, m, args[1])
         pid = args[2]
         e = m.entities[eid]
         if pid not in e.passives:
@@ -6151,9 +6206,7 @@ async def clamp_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "list":
         # Specific entity
         if len(args) >= 2:
-            eid = _resolve_eid(m, args[1])
-            if eid not in m.entities:
-                raise NotFound(f"Entity '{eid}' not found.")
+            eid = _query_eid(ctx, m, args[1])
             e = m.entities[eid]
             if not e.clamps:
                 return await ctx.send(f"`{eid}` has no entity-level clamps.")
@@ -6164,8 +6217,9 @@ async def clamp_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # All entities
         any_found = False
         lines = ["**All entity-level clamps in this match:**"]
+        pov = _query_pov(ctx, m)
         for eid, e in m.entities.items():
-            if not e.clamps:
+            if not e.clamps or _pov_hides(m, pov, eid):
                 continue
             any_found = True
             for path, c in e.clamps.items():
@@ -6638,10 +6692,13 @@ async def schedule_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     sub = args[0].lower()
 
     if sub == "list":
-        if not m.scheduled:
+        pov = _query_pov(ctx, m)
+        shown = [s for s in m.scheduled
+                 if not (s.get("eid") and _pov_hides(m, pov, s.get("eid")))]
+        if not shown:
             return await ctx.send("No scheduled effects pending.")
         lines = ["**Scheduled effects:**"]
-        lines.extend(_schedule_line(s) for s in m.scheduled)
+        lines.extend(_schedule_line(s) for s in shown)
         return await ctx.send("\n".join(lines))
 
     if sub in ("cancel", "del", "rm", "remove"):
@@ -8688,10 +8745,10 @@ async def part_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "list":
         if await return_help_if_not_enough_args(ctx, args, 2, "part", "list"):
             return
-        parent = _resolve_eid(m, args[1])
-        if parent not in m.entities:
-            return await ctx.send(f"❌ Entity `{parent}` not found.")
-        parts = m.entity_parts(parent)
+        parent = _query_eid(ctx, m, args[1])
+        pov = _query_pov(ctx, m)
+        parts = [p for p in m.entity_parts(parent)
+                 if not _pov_hides(m, pov, p.id)]
         if not parts:
             return await ctx.send(f"`{parent}` has no body parts.")
         name_var = m.part_name_var()
@@ -8740,9 +8797,7 @@ async def mod_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "show":
         if await return_help_if_not_enough_args(ctx, args, 3, "mod", "show"):
             return
-        eid = _resolve_eid(m, args[1])
-        if eid not in m.entities:
-            return await ctx.send(f"❌ Entity `{eid}` not found.")
+        eid = _query_eid(ctx, m, args[1])
         stat = args[2]
         rest = args[3:]
         base = None
@@ -10083,9 +10138,8 @@ async def mount_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "list":
         if await return_help_if_not_enough_args(ctx, args, 2, "mount", "list"):
             return
-        vid = _resolve_eid(m, args[1])
-        if vid not in m.entities:
-            raise NotFound(f"Entity '{vid}' not found.")
+        vid = _query_eid(ctx, m, args[1])
+        pov = _query_pov(ctx, m)
         slots = m.vehicle_slots(vid)
         if not slots:
             return await ctx.send(f"`{vid}` defines no slots (not a vehicle).")
@@ -10100,7 +10154,11 @@ async def mount_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 flags.append("drives")
             region = str(sd.get("region", "")).strip()
             flags.append(f"region={region}" if region else "hidden")
-            occ_str = ", ".join(f"`{e.id}`" for e in occ) or "(empty)"
+            # A hidden passenger still takes capacity (the used/cap figure
+            # stays true), but who it is stays hidden from the POV.
+            occ_str = ", ".join(
+                f"`{e.id}`" if not _pov_hides(m, pov, e.id) else "(unseen)"
+                for e in occ) or "(empty)"
             lines.append(
                 f"- `{name}` [{', '.join(flags)}] {used:g}/{cap:g}: {occ_str}")
         return await ctx.send("\n".join(lines))
@@ -10108,9 +10166,8 @@ async def mount_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "info":
         if await return_help_if_not_enough_args(ctx, args, 2, "mount", "info"):
             return
-        vid = _resolve_eid(m, args[1])
-        if vid not in m.entities:
-            raise NotFound(f"Entity '{vid}' not found.")
+        vid = _query_eid(ctx, m, args[1])
+        pov = _query_pov(ctx, m)
         slots = m.vehicle_slots(vid)
         if len(args) >= 3:
             name = args[2]
@@ -10125,8 +10182,10 @@ async def mount_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"```{json.dumps(sd, indent=2, sort_keys=True)}\n```\n"
                 f"capacity {m.slot_used_capacity(vid, name):g}/"
                 f"{m.slot_capacity(vid, name):g}; occupants: "
-                + (", ".join(f"`{e.id}`" for e in occ) or "(none)"))
-        riders = m.vehicle_riders(vid)
+                + (", ".join(f"`{e.id}`" if not _pov_hides(m, pov, e.id)
+                             else "(unseen)" for e in occ) or "(none)"))
+        riders = [e for e in m.vehicle_riders(vid)
+                  if not _pov_hides(m, pov, e.id)]
         return await ctx.send(
             f"`{vid}` slots: " + (", ".join(f"`{s}`" for s in slots) or "(none)")
             + "; riders: " + (", ".join(f"`{e.id}`({e.mount_slot})"
@@ -10232,16 +10291,12 @@ async def action_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "list":
         if await return_help_if_not_enough_args(ctx, args, 2, "action", "list"):
             return
-        actor_id = _resolve_eid(m, args[1])
-        if actor_id not in m.entities:
-            raise NotFound(f"Entity '{actor_id}' not found.")
+        actor_id = _query_eid(ctx, m, args[1])
         return await _action_list(ctx, m, actor_id)
     if sub == "info":
         if await return_help_if_not_enough_args(ctx, args, 3, "action", "info"):
             return
-        actor_id = _resolve_eid(m, args[1])
-        if actor_id not in m.entities:
-            raise NotFound(f"Entity '{actor_id}' not found.")
+        actor_id = _query_eid(ctx, m, args[1])
         return await _action_info(ctx, m, actor_id, args[2])
 
     actor_id = _resolve_eid(m, args[0])

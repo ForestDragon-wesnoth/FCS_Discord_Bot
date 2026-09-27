@@ -15086,3 +15086,97 @@ walkers (has_los, raycast, first_opaque, entities_on_los, ...) — at
 refused by default and allowed after raising the rule; the last line restores
 the default. HARNESS-ALLOWS-ERRORS (the sight-line refusal surfaces as a
 wrapped Runtime error).
+
+
+SCENARIO 579 — Queries respect the channel POV (pov_filters_queries)
+--------------------------------------------------------------------------------
+
+!match new pq PovQueries 12 12
+!match use pq
+!match fog on
+!ent add scout S 10 1 1 5
+!ent set_var scout team red
+!ent set_var scout fog_vision_radius 3
+!ent add ghost Ghost 30 10 10 5
+!ent set_var ghost team blue
+!ent add wall Wall 40 4 3 5
+!ent set_var wall team blue
+!ent set_var wall footprint_w 3
+!ent add jeep Jeep 20 2 2 5
+!ent set_var jeep team red
+!ent set_var jeep slots.seat.capacity 2
+!ent add pilot Pilot 10 2 3 5
+!ent set_var pilot team red
+!ent add spy Spy 10 3 3 5
+!ent set_var spy team blue
+!mount pilot jeep seat
+!mount spy jeep seat
+!history save s0
+!ent hp ghost -5
+!match bind pov=red
+!as player bob
+!list
+!ent info ghost
+!ent info wall
+!ent info pilot
+!ent info spy
+!find hp>0
+!dist scout ghost
+!mount list jeep
+!mount info jeep
+!foreach hp>0 ; ent info $id
+!history diff manual:s0 latest:command
+!as host
+!system set default pov_filters_queries false
+!as player bob
+!ent info ghost
+!find hp>0
+!as host
+!system set default pov_filters_queries true
+
+Expected: with the channel bound `pov=red` and fog on, the red scout sees 3 cells
+around (1,1). Player queries now hide what the red map hides: `!ent info ghost`
+and `!dist scout ghost` say "Entity 'ghost' not found" (the same message as a
+truly missing id), `!find hp>0` lists only scout, wall, jeep and pilot, and the
+read-only `!foreach` sweep runs `ent info` for those four only. The 3-wide blue
+wall at (4,3)-(6,3) is visible because one of its cells is in sight (any
+footprint cell counts). Riders tucked inside the jeep are hidden from the map,
+but your OWN team's units are never hidden from you: `!ent info pilot` shows the
+red pilot, while the blue spy riding in the same jeep is "not found";
+`!mount list jeep` shows `pilot, (unseen)` with capacity 2/2 still true, and
+`!mount info jeep` lists only the pilot. `!history diff` is refused for the
+player (it would report the ghost's hp change). With pov_filters_queries off,
+queries are omniscient again (ghost's card, ghost in `!find`); the last line
+restores the default.
+
+
+SCENARIO 580 — Disguise in !ent info; !part info is host-only
+--------------------------------------------------------------------------------
+
+!match new pd PovDisguise 10 10
+!match use pd
+!ent add scout S 10 1 1 5
+!ent set_var scout team red
+!ent add mimic Mimic 30 3 1 5
+!ent set_var mimic team blue
+!ent set_var mimic disguise.name Barrel
+!ent set_var mimic disguise.vars.hp 1
+!part add mimic mjaw Jaw 5 5
+!match bind pov=red
+!as player bob
+!ent info mimic
+!part list mimic
+!part info mjaw
+!as host
+!as view omniscient
+!ent info mimic
+!approve r1
+!as view clear
+
+Expected: no fog here, so the blue mimic is visible to the red channel — but it
+wears a disguise, and `!ent info` now shows the red POV what the map and roster
+show: the decoy card ("Barrel", hp 1). `!part list mimic` still lists the jaw
+(hp + knobs). `!part info` is no longer player-available: it prints the part's
+full var JSON, the same data `!ent dump` is host-gated to hide, so the player's
+request is queued (r1). The host previewing the omniscient view sees the real
+"Mimic" card and approves the queued `!part info`, which then runs.

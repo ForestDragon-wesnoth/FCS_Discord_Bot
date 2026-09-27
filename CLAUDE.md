@@ -1802,8 +1802,9 @@ More shipped work (continuing the list above):
   `_entity_line` take pov_team and overlay the disguise name + vars (disguise
   vars win over the computed hp/max_hp/team for display). Surfaces: `!map` /
   `!list` / `!state` (the board); use `!as view <team>` to preview a POV in the
-  CLI/harness. `!find` deliberately stays on REAL names — it already ignores
-  visibility/fog entirely (a search/GM tool). A moving/animated decoy or an
+  CLI/harness. `!ent info` shows the decoy card and `!find` rows render the
+  decoy line under a team POV (pov_filters_queries, audit-pass-29); `!find`
+  PREDICATES and `show:` columns still read the real vars. A moving/animated decoy or an
   illusion that fools enemy TARGETING is a GM composition on top (mechanics use
   real, so a true targeting-fooling illusion would need the deep-illusion
   variant, deferred).
@@ -1885,10 +1886,10 @@ More shipped work (continuing the list above):
     a nested foreach would recurse; and ELEVATED_ARGS (`; map full`). GOTCHA
     worth remembering: `ent dump` is NOT in READ_ONLY_SUBCOMMANDS by deliberate
     policy (it reveals GM-hidden vars), so `; ent dump $id` gates a sweep —
-    use `ent info` for the player-available readout. Also note the selector
-    itself still uses the `!find` grammar, which by design IGNORES fog/
-    visibility; that's pre-existing (a player could already run `!find`), not a
-    new leak, and `!host access` remains the lever for a fog match.
+    use `ent info` for the player-available readout. The selector uses the
+    `!find` grammar; for a NON-host sweep it now also skips entities the
+    channel POV can't see (pov_filters_queries, audit-pass-29), so `$x`/`$y`
+    can't hand out hidden positions. A host's sweep is unfiltered.
 - **Audit-pass-4 fixes: multi-tile interaction sweep (scenarios 491-492).** A
   fourth interaction-bug sweep, this time hunting anchor-only assumptions in
   OLDER features against multi-tile entities (three read-only survey agents
@@ -3554,6 +3555,51 @@ More shipped work (continuing the list above):
     outside `saves/` instead of raising. Discord approval buttons disable
     themselves and say so on timeout. `bot.py` names the file it really reads
     (`1bot_token.txt`).
+  - **Player queries respect the channel POV (HIGH fog leak → gamerule, user
+    call).** `!ent info <hidden id>` printed the full card, `!dist` located
+    hidden units, `!find`/`!foreach` listed them, `!history diff` reported their
+    changes, and `!part/!mount/!action/!passive/!clamp/!mod/!schedule` reads
+    exposed them — while `!map`/`!list` hid them. New rule
+    `pov_filters_queries` (bool, default on): under a team POV (channel binding
+    or `!as view`), `_query_eid` makes a hidden entity read exactly like a
+    missing one ("Entity '<typed>' not found"), listings skip hidden rows
+    (`_pov_hides`), a hidden rider shows as `(unseen)` in `!mount list` (the
+    capacity figure stays true), `!ent info` renders a disguise's decoy card,
+    and `!history diff` is host-only while fog or entity_visibility_condition is
+    active. Your own team's units — a body part counts as its root body's team
+    — are never hidden (a hidden rider is still yours). Helpers `_query_pov` /
+    `_pov_hides` / `_query_eid` / `_acts_as_host` in vtt_commands.py. Also
+    `!part info` (full var JSON, the data `!ent dump` is host-gated for) left
+    READ_ONLY_SUBCOMMANDS — players keep `!part list` (579-580).
+  - **Formula resource bounds (HIGH, bot-wide DoS).** A formula's cost followed
+    its ARGUMENTS, and inline `$()` gives read-only formulas to every player:
+    `!dist $(9**9**9) 1 1 1` froze the bot for every guild, `'a'*10**10`
+    allocated 10 GB, and `cells_in_*` / `entities_in_rect/cone` / every sight
+    line (`has_los`, `raycast`, `entities_on_los`, ...) walked as many cells as
+    the arguments asked. `_ArithGuardTransformer` rewrites `** * + %` into
+    bounded `__safe_*` helpers before EVERY compile (ints capped at Python's
+    int-to-string digit limit, checked before computing; strings/lists at the
+    new `formula_size_limit`; `%` on a string rejected); new
+    `formula_cell_limit` caps geometry generation and `Match._check_line_budget`
+    caps sight lines. A fuzzer over every `_ALLOWED_FUNCS` +
+    `ARG_SAFE_MATCH_FUNCS` function with huge args finds nothing over 0.4 s.
+    NEW FORMULA FUNCTIONS whose cost scales with an argument need the same
+    budget (578).
+  - **Discord adapter (probe-verified with stubs).** `!<alias>` never worked on
+    Discord (only built-in roots are registered with discord.py; an alias died
+    as CommandNotFound) — `on_command_error` now routes aliases of the
+    channel's active match through `_dispatch`, ignoring other unknown `!words`
+    so other bots' commands draw no reply. `!map image` / image boards ran
+    `render_scene` in a worker thread while the event loop mutated the match
+    (and render_scene switches on the shared `_vision_memo`, which a race could
+    leave on for good) — the scene is now built on the loop (`scene_for_png`)
+    and only the pixels in the thread (`render_scene_png`). An auto-update board
+    kept refreshing after its channel was unbound, and unbound = omniscient, so
+    a team board re-posted the whole fogged map — it is now retired. Text
+    `!approve` ran the request in the HOST's channel (a player's `!match bind
+    pov=blue` re-bound the host channel) and the Approve button permanently
+    re-pointed the channel's active match — both now go through
+    `run_approved_request` (requester's channel, pointer restored).
   - CLOSED (user: not a concern): with `random_seed` set, the seeded RNG's
     position isn't in snapshots, so after an undo/restore the sequence restarts
     from the seed. Leave it.

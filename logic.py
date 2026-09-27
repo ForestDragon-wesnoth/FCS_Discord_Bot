@@ -1595,6 +1595,25 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     #     — a flat stealth flag, same for every team.
     # A malformed formula is treated as VISIBLE, so a GM typo reveals
     # rather than blanking the whole board.
+    "pov_filters_queries": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether player-facing entity QUERIES respect the channel's team "
+            "POV the way `!map` / `!list` do. On (default): under a team POV "
+            "an entity that POV can't see (fog, entity_visibility_condition, "
+            "a hidden rider) reads as 'not found' in `!ent info`, `!dist`, "
+            "`!part list`, `!mount list/info`, `!action list/info`, "
+            "`!passive list/info`, `!clamp list` and `!mod show`, and is left "
+            "out of `!find`, entity-wide listings, `!schedule list` and a "
+            "non-host's `!foreach` selector; `!ent info` shows a disguised "
+            "unit's decoy card; and `!history diff` is host-only while fog "
+            "or a visibility condition is active (it reports every unit's "
+            "changes). Your own team's units are never hidden from you. Off "
+            "= queries stay omniscient (lock them down per match with `!host "
+            "access` instead). Omniscient channels are unaffected either way."
+        ),
+    },
     "entity_visibility_condition": {
         "default": "",
         "schema": {"type": "str"},
