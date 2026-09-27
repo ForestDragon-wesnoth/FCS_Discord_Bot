@@ -2837,8 +2837,13 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             hook_log = m.entities[eid].move_dirs(moves)
         except VTTError as e:
             return await ctx.send(f"❌ {e}")
-        e = m.entities[eid]
-        msg = f"Moved `{eid}` {total_steps} step(s) to ({e.x},{e.y}); facing {e.facing}."
+        e = m.entities.get(eid)
+        if e is None:
+            # A hook on the way (a lethal tile/zone on_enter) removed it.
+            msg = (f"Moved `{eid}` {total_steps} step(s), and it was removed "
+                   f"on the way (a triggered effect).")
+        else:
+            msg = f"Moved `{eid}` {total_steps} step(s) to ({e.x},{e.y}); facing {e.facing}."
         if hook_log:
             msg = msg + "\n" + "\n".join(hook_log)
         return await ctx.send(msg)
@@ -2865,8 +2870,10 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             steps, hook_log = m.push_entity(eid, args[2], n)
         except VTTError as e:
             return await ctx.send(f"❌ {e}")
-        e = m.entities[eid]
-        msg = f"Pushed `{eid}` {steps} cell(s) to ({e.x},{e.y})."
+        e = m.entities.get(eid)
+        msg = (f"Pushed `{eid}` {steps} cell(s) to ({e.x},{e.y})." if e is not None
+               else f"Pushed `{eid}` {steps} cell(s), and it was removed on the "
+                    f"way (a triggered effect).")
         if hook_log:
             msg = msg + "\n" + "\n".join(hook_log)
         return await ctx.send(msg)
@@ -2900,8 +2907,11 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             steps, hook_log = m.pull_entity(eid, tx, ty, n)
         except VTTError as e:
             return await ctx.send(f"❌ {e}")
-        e = m.entities[eid]
-        msg = f"Pulled `{eid}` {steps} cell(s) toward ({tx},{ty}) to ({e.x},{e.y})."
+        e = m.entities.get(eid)
+        msg = (f"Pulled `{eid}` {steps} cell(s) toward ({tx},{ty}) to ({e.x},{e.y})."
+               if e is not None else
+               f"Pulled `{eid}` {steps} cell(s) toward ({tx},{ty}), and it was "
+               f"removed on the way (a triggered effect).")
         if hook_log:
             msg = msg + "\n" + "\n".join(hook_log)
         return await ctx.send(msg)
@@ -10263,7 +10273,9 @@ async def mount_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             log = m.dismount_entity(rid, x, y)
         except (VTTError, NotFound) as ex:
             return await ctx.send(f"❌ {ex}")
-        msg = f"`{rid}` dismounted to ({m.entities[rid].x},{m.entities[rid].y})."
+        r_e = m.entities.get(rid)
+        msg = (f"`{rid}` dismounted to ({r_e.x},{r_e.y})." if r_e is not None
+               else f"`{rid}` dismounted, and was then removed by a triggered effect.")
         if log:
             msg += "\n" + "\n".join(l for l in log if l)
         return await ctx.send(msg)

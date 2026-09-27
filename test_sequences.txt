@@ -15308,3 +15308,30 @@ the command autosaves are intact, and `!undo command 5` walks back through the
 failed action, both set_vars and both hp changes to a at 50. action.py also
 gained a drift guard (checked on the first rollback) that raises if a Match
 field is neither serialized nor preserved by the rollback.
+
+
+SCENARIO 585 — Moving onto a lethal tile: the move/push/pull replies survive
+--------------------------------------------------------------------------------
+
+!match new lv Lava 10 10
+!match use lv
+!tile hook add 3 1 on_enter "entity[self].hp = 0"
+!tile hook add 3 5 on_enter "entity[self].hp = 0"
+!tile hook add 6 1 on_enter "entity[self].hp = 0"
+!ent add a A 10 1 1 5
+!ent move a 3 right
+!ent add b B 10 3 3 5
+!ent push b down 3
+!ent add p P 10 8 1 5
+!ent pull p 1 1 3
+!list
+!undo command 1
+!list
+
+Expected: each unit's path crosses a tile whose on_enter hook sets hp to 0.
+The death pipeline removes it mid-path (the corpse lies on the lava cell — A at
+(3,1), B at (3,5), P at (6,1) — and it moves no further), and the reply now
+says it "was removed on the way". Before, the move/push/pull replies looked the
+unit up after the move and crashed (💥 'a'), and because a crash reply skips
+the post-command bookkeeping the command got no undo entry of its own. Now
+`!undo command 1` reverts the pull, bringing P back alive at (8,1).
