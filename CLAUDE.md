@@ -3604,6 +3604,77 @@ More shipped work (continuing the list above):
     position isn't in snapshots, so after an undo/restore the sequence restarts
     from the seed. Leave it.
 
+- **Audit-pass-30 (hands-on, tool-driven): four reusable harnesses + fixes
+  (scenarios 579 ext, 581-586).** Techniques worth reusing (all throwaway
+  scripts, rebuild them from these descriptions):
+  1. **POV LEAK DETECTOR** — a fogged board with distinctively-named hidden
+     units (a part, a hidden rider, a corpse, an action, a status, a
+     schedule, a zone, a tile, team data), then EVERY registered root x
+     subcommand (from `registry._help[root]["subs"]`) x an argument pool run as
+     a red-POV player; replies grepped for the hidden names/values/cells after
+     stripping echoes of the typed args. ~136k invocations. Include list
+     KINDS (`commands`/`turns`) in the pool — the first version missed
+     `!history list commands` for lack of them.
+  2. **STATEFUL CHAOS** — ~70 command shapes (host + a red-POV player
+     context, undo/restore with bindings, transfer between two matches, ATB
+     toggling, disguises) on a rich board, asserting after EVERY step: no
+     dangling `part_of`/`mounted_on`/`__follows`/aura anchor, in-bounds
+     (coordinates are 1-BASED: `1 <= x <= grid_width`), turn cursor in range,
+     depth counters / vision memo / event stack at rest, JSON round-trip
+     idempotent, and manual saves never lost. Wrap every registry handler to
+     print the traceback of a non-VTTError. NOTE `!ent move <id> <n> <dir>`
+     (count first) but `!ent push <id> <dir> [n]`.
+  3. **FORMULA-FUNCTION FUZZER** — every `_ALLOWED_FUNCS`/`_MATCH_FUNC_NAMES`
+     name x wrong-typed / missing-entity / wrong-arity args under a 1 s
+     SIGALRM, classifying "Runtime error:" messages that are raw Python.
+  4. **COMMAND FUZZER** — every root x subcommand x a junk/ids/numbers/paths/
+     `$()` pool as HOST (~100k), flagging 💥 / Runtime / timeouts. Redirect
+     `vtt_commands.SAVES_DIR` to a temp dir first (it writes save files).
+  Also a MODEL-BASED undo test (random mutations + `undo command N`, checking
+  each lands on the recorded state N commands back, under retention caps
+  100/5/-1) — exact.
+  Fixes:
+  - **Failed action wiped the undo history (HIGH).** `action._rollback_match`
+    rebuilds the match from a pre-state taken WITHOUT history and copied the
+    empty `history` over the live one — every `fail()`/body exception AND
+    every interactive `choose()` replay deleted all autosaves and manual
+    saves. `history` is now preserved, and `_check_rollback_fields` raises if
+    any Match field is neither serialized nor preserved (the list went stale
+    twice) (584).
+  - **Despawn left the part subtree behind (HIGH, dangling-id class).**
+    `Entity.remove` (`!ent remove`, `!part remove`) didn't remove the body's
+    parts, leaving `part_of` naming a gone id (a later same-id entity would
+    inherit them). It now removes the subtree at the chokepoint (death and
+    transform already did). Removing or detaching a middle snake SEGMENT now
+    re-links the one behind it (`Match._splice_out_segment`); a detached
+    segment loses `__segment`/`__follows`; `copy_entity` drops a `__follows`
+    pointing outside the copied body; transform/revert keep the TARGET's own
+    segment linkage (`_SEGMENT_LINK_VARS` — a unit's place in a chain is
+    identity), and a stashed part that can't be re-placed on revert is
+    reported and the chain closes around it (581, 582, 586).
+  - **Crash replies after a lethal hook (MED).** `!ent move/push/pull`,
+    `!mount dismount`, `!ent transform/revert` looked the unit up after an
+    operation that can kill it (a lava tile's on_enter, a 0-hp transform) and
+    💥'd. AND `CommandRegistry.run` skipped the post-command bookkeeping on
+    both error branches, so a command that mutated then failed had no undo
+    entry of its own; the bookkeeping (which records only on a real state
+    change) now runs after errors too (582, 585).
+  - **More POV leaks (pov_filters_queries):** bare `!turn` listed hidden
+    units (now filtered like `!list`, disguise names; `!turn next` says "an
+    unseen unit's turn"), and `!log` / `!history list <kind>` reported hidden
+    units' events and verbatim command labels — now refused for non-hosts
+    while the view is fogged or filtered, via the shared
+    `_whole_board_read_blocked` (which also counts tile/zone/corpse visibility
+    conditions) (579).
+  - **Formula errors name the function (LOW).** `_cell_arg` for the sight
+    prims (no more "invalid literal for int()"), a radius check in
+    `entities_in_area`, `_runtime_msg` strips `FormulaEngine._namespace.
+    <locals>._` from arity errors, and a nameless summon template is named
+    after its minted id (was a bare "Runtime error: 'name'") (583).
+  - **`saves_path` refuses names Windows can't hold as files** (`:` = an NTFS
+    alternate data stream, CON/NUL/COM1…/LPT1… open DEVICES, `<>"|?*`,
+    trailing dots/spaces) (573 ext).
+
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
 and explain the "why").
