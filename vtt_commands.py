@@ -3715,17 +3715,29 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         order_lines = []
         # Get the initiative var name for display
         init_label = m.rules.get("turnorder_var", "initiative")
+        # Like !list, the order leaves out units this channel's POV can't
+        # see and shows a disguise's decoy name (pov_filters_queries).
+        pov = _query_pov(ctx, m)
         for idx, eid in enumerate(m.turn_order):
             mark = "➡️" if idx == m.active_index else "  "
             e = m.entities.get(eid)
-            if e: order_lines.append(f"{mark} `{eid[:8]}` **{e.name}** ({init_label} {e.initiative})")
+            if e and not _pov_hides(m, pov, eid):
+                order_lines.append(
+                    f"{mark} `{eid[:8]}` **{m.entity_display_name(e, pov)}** "
+                    f"({init_label} {e.initiative})")
         return await ctx.send("Turn order:\n" + ("\n".join(order_lines) or "(empty)"))
     sub = args[0].lower()
     if sub == "next":
         eid, fire_log = m.next_turn()
         if not eid: return await ctx.send("No turn order yet.")
         e = m.entities[eid]
-        out = f"It is now **{e.name}**'s turn (id `{eid[:8]}`)"
+        pov = _query_pov(ctx, m)
+        if _pov_hides(m, pov, eid):
+            # The reply lands in a channel whose POV can't see the actor.
+            out = "It is now an unseen unit's turn."
+        else:
+            out = (f"It is now **{m.entity_display_name(e, pov)}**'s turn "
+                   f"(id `{eid[:8]}`)")
         if fire_log:
             out += "\n" + "\n".join(fire_log)
         return await ctx.send(out)
@@ -3836,6 +3848,23 @@ def _acts_as_host(ctx: ReplyContext, m: "Match") -> bool:
         return True
     user = ctx_user(ctx)
     return user is None or m.is_host(user)
+
+
+_VISIBILITY_RULES = ("entity_visibility_condition", "tile_visibility_condition",
+                     "zone_visibility_condition", "corpse_visibility_condition")
+
+
+def _whole_board_read_blocked(ctx: ReplyContext, m: "Match") -> bool:
+    """True when a read that reports on the WHOLE board (every unit's
+    changes / events) must be refused: a non-host under a team POV, on a
+    match with something to hide (fog, or any visibility condition), with
+    pov_filters_queries on. Such a report can't be filtered line by line
+    (an old entry may name a unit that is hidden now, or was then), so it
+    is host-only while hiding is in play."""
+    if _query_pov(ctx, m) is None or _acts_as_host(ctx, m):
+        return False
+    return bool(m.fog_enabled) or any(
+        str(m.rules.get(r, "") or "").strip() for r in _VISIBILITY_RULES)
 
 
 def _query_eid(ctx: ReplyContext, m: "Match", token: str) -> str:
@@ -5391,9 +5420,7 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         # A diff reports every unit's changes, hidden ones included, so under
         # a team POV with anything to hide it is host-only (pov_filters_queries).
-        if (_query_pov(ctx, m) is not None and not _acts_as_host(ctx, m)
-                and (m.fog_enabled
-                     or str(m.rules.get("entity_visibility_condition", "")).strip())):
+        if _whole_board_read_blocked(ctx, m):
             return await ctx.send(
                 "❌ `!history diff` is host-only while this channel's view is "
                 "fogged or filtered — it would report hidden units' changes "
@@ -6881,6 +6908,13 @@ async def log_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(
                 f"Expected a number, 'clear', or 'format'; got '{args[0]}'."
             )
+    # The log names every unit's spawns, moves, damage and statuses, hidden
+    # ones included (pov_filters_queries).
+    if _whole_board_read_blocked(ctx, m):
+        return await ctx.send(
+            "❌ `!log` is host-only while this channel's view is fogged or "
+            "filtered — the log reports hidden units' events "
+            "(pov_filters_queries).")
     if not m.event_log:
         return await ctx.send("Event log is empty.")
     entries = m.event_log[-n:] if n > 0 else list(m.event_log)

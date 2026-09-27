@@ -15126,6 +15126,8 @@ SCENARIO 579 — Queries respect the channel POV (pov_filters_queries)
 !mount info jeep
 !foreach hp>0 ; ent info $id
 !history diff manual:s0 latest:command
+!turn
+!log
 !as host
 !system set default pov_filters_queries false
 !as player bob
@@ -15144,8 +15146,9 @@ footprint cell counts). Riders tucked inside the jeep are hidden from the map,
 but your OWN team's units are never hidden from you: `!ent info pilot` shows the
 red pilot, while the blue spy riding in the same jeep is "not found";
 `!mount list jeep` shows `pilot, (unseen)` with capacity 2/2 still true, and
-`!mount info jeep` lists only the pilot. `!history diff` is refused for the
-player (it would report the ghost's hp change). With pov_filters_queries off,
+`!mount info jeep` lists only the pilot. `!history diff` and `!log` are refused
+for the player (they report every unit's changes, the ghost's hp loss
+included), and bare `!turn` lists only the units the red view can see. With pov_filters_queries off,
 queries are omniscient again (ghost's card, ghost in `!find`); the last line
 restores the default.
 
