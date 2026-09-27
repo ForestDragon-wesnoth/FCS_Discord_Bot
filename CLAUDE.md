@@ -3532,13 +3532,31 @@ More shipped work (continuing the list above):
   - **Fog reveal records piled up (LOW-MED perf).** One record per
     `!reveal_fog`; every fog check scans them (300 permanent → 166 ms per
     60×60 render). Records sharing an expiry now merge (23 ms).
-  - OPEN (flagged to the user, not changed): with `random_seed` set, the seeded
-    RNG's position isn't in snapshots, so after any undo/restore the sequence
-    RESTARTS from the seed (the next roll repeats the session's first roll).
-    Whether undo should restore the RNG position (anti-reroll) or continue it is
-    a design call. Also: the `_ApprovalView` buttons don't disable themselves on
-    timeout (they just stop working); `bot.py`'s missing-token message names
-    `bot_token.txt` + `DISCORD_TOKEN` while it actually reads `1bot_token.txt`.
+  - **Undo vs channel bindings (MED, fog leak → gamerule, user call).** A
+    snapshot carries `bound_channels` (incl. each channel's `pov`), but
+    `MatchManager.active_by_channel` is not snapshotted. So undoing past a
+    `!match bind pov=red` left the players' channel ACTIVE on the match but
+    UNBOUND = omniscient: their `!map` showed the fogged board in full. New rule
+    `undo_channel_bindings_mode` (enum, default `keep`): `keep` = the live
+    bindings survive every undo (bindings are setup, not game state); `revert`
+    = restore the snapshot's bindings AND detach every channel bound now but not
+    in the snapshot (a channel unbound since the snapshot is re-bound, and
+    re-pointed only if it isn't showing another match); `confirm` = when the
+    bindings differ, refuse and list the differences. Every undo/restore accepts
+    a one-call `bindings=keep|revert` override. Core: `_restore_snapshot(...,
+    bindings, notes)` + `_resolve_bindings_mode` / `_binding_diff` in
+    vtt_commands.py (577).
+  - **Smaller fixes in the same pass (576 + probes).** `!log format` edits a
+    SHARED system template → admin-only; `!log clear` → host (was open to all).
+    `!run` nesting is bounded by `macro_recursion_limit` (a self-referencing file
+    recursed until Python's stack limit). Team passives are labelled as team
+    passives in failure warnings. `saves_path` treats a cross-drive path as
+    outside `saves/` instead of raising. Discord approval buttons disable
+    themselves and say so on timeout. `bot.py` names the file it really reads
+    (`1bot_token.txt`).
+  - CLOSED (user: not a concern): with `random_seed` set, the seeded RNG's
+    position isn't in snapshots, so after an undo/restore the sequence restarts
+    from the seed. Leave it.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

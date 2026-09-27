@@ -2328,6 +2328,27 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "positive value to require confirmation past that count."
         ),
     },
+    "undo_channel_bindings_mode": {
+        "default": "keep",
+        "schema": {"type": "enum", "choices": ["keep", "revert", "confirm"]},
+        "desc": (
+            "What an undo / `!history restore` does with the match's channel "
+            "bindings (`!match bind`, incl. each channel's `pov=`). A "
+            "snapshot carries the bindings as they were when it was taken, "
+            "but the channels themselves stay attached to the match, so "
+            "undoing past a bind would leave that channel ACTIVE but "
+            "UNBOUND — i.e. omniscient, showing a fogged board in full. "
+            "'keep' (default) = bindings are live setup, not game state: "
+            "the current bindings survive every undo. 'revert' = restore "
+            "the snapshot's bindings, and DETACH any channel that was "
+            "bound now but not in the snapshot (it stops pointing at the "
+            "match — no leak). 'confirm' = when the snapshot's bindings "
+            "differ from the current ones, refuse and list the "
+            "differences; re-run with `bindings=keep` or `bindings=revert`. "
+            "Any undo/restore accepts a `bindings=keep|revert` token that "
+            "overrides this rule for that one call."
+        ),
+    },
     "default_clamps": {
         # The canonical clamp: hp clamped by max_hp, soft mode, no min. This
         # preserves the historical "hp can't exceed max_hp" behavior that

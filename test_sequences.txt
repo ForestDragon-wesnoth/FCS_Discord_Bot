@@ -15011,3 +15011,39 @@ host-gated like any mutation — held for approval (request `r1` in `!pending`).
 Back as the host, the log still has both entries. Before the fix `!log` was
 access `all` with no elevation, so the player's two commands overwrote the
 system-wide `hp_changed` template and emptied the log.
+
+
+SCENARIO 577 — Undo and channel bindings: keep / confirm / revert
+--------------------------------------------------------------------------------
+
+!match new ubm UndoBind 6 3
+!match use ubm
+!match fog on
+!ent add scout S 10 1 1 5
+!ent set_var scout team red
+!ent add ghost G 10 6 3 5
+!ent set_var ghost team blue
+!match bind pov=red
+!ent hp scout -1
+!undo command 2
+!match channels
+!map
+!system set default undo_channel_bindings_mode confirm
+!match bind pov=blue
+!undo command 1
+!match channels
+!undo command 1 bindings=revert
+!match channels
+!undo command 1 bindings=sideways
+!system set default undo_channel_bindings_mode keep
+
+Expected: a snapshot carries the match's channel bindings, but a channel's
+active pointer lives outside the match, so restoring the snapshot's bindings
+would leave a channel bound since then still showing the match, unbound —
+omniscient. Under the default `keep`, undoing past `!match bind pov=red` keeps
+the binding: `!match channels` still lists `CLI` with POV red and `!map` stays
+fogged (the blue ghost at 6,3 is hidden). With the rule set to `confirm`,
+undoing past `!match bind pov=blue` refuses and lists the difference (`CLI`: now
+POV blue, POV red in the snapshot), and nothing is restored (still POV blue).
+Re-running with `bindings=revert` restores the snapshot's POV red. A bad
+`bindings=` value is rejected. The last line restores the default.

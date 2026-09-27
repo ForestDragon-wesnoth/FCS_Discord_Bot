@@ -4815,13 +4815,20 @@ async def state_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 # snapshots, undo, and JSON export/import. snapshot=False so this command
 # doesn't try to autosnapshot ITSELF — managing the history shouldn't
 # clutter the history.
-def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot) -> Match:
+def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot,
+                      bindings: str = "keep",
+                      notes: Optional[List[str]] = None) -> Match:
     """Replace mgr.matches[mid] with a Match restored from `snapshot`.
 
     The previous Match's MatchHistory is moved onto the new Match and
     truncated to drop autosaves with sequence > snapshot.sequence —
     those describe a timeline the user just abandoned. Manual saves
     survive (they're explicit bookmarks; the user owns their lifecycle).
+
+    `bindings` is the resolved `undo_channel_bindings_mode` ('keep' or
+    'revert' — 'confirm' is settled by the caller before this runs, see
+    `_resolve_bindings_mode`). Human-readable notes about channels the
+    restore detached / re-attached are appended to `notes`.
     Returns the new Match instance.
     """
     if mid not in mgr.matches:
@@ -4840,8 +4847,100 @@ def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot) -> Match:
     # part of the undone state: carry the queue and the id counter over.
     new_match.pending_requests = old.pending_requests
     new_match._request_seq = old._request_seq
+    # Channel bindings are serialized, but the channels' active pointers
+    # (MatchManager.active_by_channel) are not — so a restore that simply
+    # took the snapshot's bindings would leave a channel bound SINCE the
+    # snapshot still active on the match but unbound: omniscient, showing
+    # a fogged board in full. See the undo_channel_bindings_mode rule.
+    if bindings == "revert":
+        for ch in sorted(set(old.bound_channels) - set(new_match.bound_channels)):
+            if mgr.active_by_channel.get(ch) == mid:
+                mgr.active_by_channel.pop(ch, None)
+                if notes is not None:
+                    notes.append(f"detached `{ch}` (not bound in the snapshot)")
+        for ch in sorted(set(new_match.bound_channels) - set(old.bound_channels)):
+            # Re-bound by the revert. Re-point the channel only when it
+            # isn't showing another match — never steal a channel.
+            if ch not in mgr.active_by_channel:
+                mgr.active_by_channel[ch] = mid
+                if notes is not None:
+                    notes.append(f"re-bound `{ch}`")
+    else:
+        new_match.bound_channels = copy.deepcopy(old.bound_channels)
     mgr.matches[mid] = new_match
     return new_match
+
+
+def _bindings_token(args: List[str]) -> Optional[str]:
+    """The per-call `bindings=keep|revert` override on an undo/restore,
+    or None when absent. A bad value raises rather than silently falling
+    back to the rule (the caller asked for something specific)."""
+    for a in args:
+        if a.lower().startswith("bindings="):
+            val = a.split("=", 1)[1].lower()
+            if val not in ("keep", "revert"):
+                raise VTTError(
+                    f"bindings= must be 'keep' or 'revert', got '{val}'."
+                )
+            return val
+    return None
+
+
+def _describe_binding(meta: Dict[str, Any]) -> str:
+    pov = meta.get("pov")
+    label = meta.get("label")
+    bits = [f"POV {pov}" if pov and pov != "omniscient" else "POV omniscient"]
+    if label:
+        bits.append(f"label '{label}'")
+    return ", ".join(bits)
+
+
+def _binding_diff(cur: Dict[str, Dict[str, Any]],
+                  snap: Dict[str, Dict[str, Any]]) -> List[str]:
+    """One line per channel whose binding differs between the live match
+    (`cur`) and a snapshot (`snap`). Empty when they agree."""
+    lines = []
+    for ch in sorted(set(cur) | set(snap)):
+        if ch in cur and ch not in snap:
+            lines.append(f"- `{ch}`: bound now ({_describe_binding(cur[ch])}), "
+                         f"not bound in the snapshot — revert detaches it")
+        elif ch in snap and ch not in cur:
+            lines.append(f"- `{ch}`: not bound now, bound in the snapshot "
+                         f"({_describe_binding(snap[ch])}) — revert re-binds it")
+        elif (cur[ch] or {}) != (snap[ch] or {}):
+            lines.append(f"- `{ch}`: now {_describe_binding(cur[ch])}; in the "
+                         f"snapshot {_describe_binding(snap[ch])}")
+    return lines
+
+
+async def _resolve_bindings_mode(ctx, m: Match, snap: Snapshot,
+                                 args: List[str]) -> Optional[str]:
+    """Settle how an undo/restore treats channel bindings: the call's
+    `bindings=` token, else the undo_channel_bindings_mode rule. Under
+    'confirm' with differing bindings, sends the difference and returns
+    None (the caller stops; nothing is restored)."""
+    tok = _bindings_token(args)
+    if tok is not None:
+        return tok
+    mode = str(m.rules.get("undo_channel_bindings_mode", "keep"))
+    if mode != "confirm":
+        return "revert" if mode == "revert" else "keep"
+    diff = _binding_diff(m.bound_channels,
+                         snap.state.get("bound_channels") or {})
+    if not diff:
+        return "keep"
+    await ctx.send(
+        "⚠️ This restore point's channel bindings differ from the current "
+        "ones:\n" + "\n".join(diff) + "\n"
+        "• Keep the current bindings: re-run the same command with "
+        "`bindings=keep`\n"
+        "• Restore the snapshot's bindings: re-run with `bindings=revert`"
+    )
+    return None
+
+
+def _bindings_suffix(notes: List[str]) -> str:
+    return (" Channels: " + "; ".join(notes) + ".") if notes else ""
 
 
 def _parse_int_or(default: int, token: Optional[str]) -> int:
@@ -4999,9 +5098,14 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"taken after that point.\n"
                 f"• To proceed:  `!history restore {name} confirm`"
             )
-        _restore_snapshot(mgr, mid, snap)
+        bmode = await _resolve_bindings_mode(ctx, m, snap, args)
+        if bmode is None:
+            return
+        notes: List[str] = []
+        _restore_snapshot(mgr, mid, snap, bmode, notes)
         return await ctx.send(
             f"Restored manual `{name}` (now at round {snap.round_at_snapshot})."
+            + _bindings_suffix(notes)
         )
 
     # ---- undo --------------------------------------------------------
@@ -5039,8 +5143,13 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     "Jump to round start", distance, "rounds back",
                     f"to round {target_round}", erased,
                 ))
-            _restore_snapshot(mgr, mid, snap)
-            return await ctx.send(f"Restored start of round {target_round}.")
+            bmode = await _resolve_bindings_mode(ctx, m, snap, args)
+            if bmode is None:
+                return
+            notes = []
+            _restore_snapshot(mgr, mid, snap, bmode, notes)
+            return await ctx.send(f"Restored start of round {target_round}."
+                                  + _bindings_suffix(notes))
 
         # ---- undo {turn|round|command} [N] [confirm] ----
         if scope in ("turn", "turns"):
@@ -5056,11 +5165,16 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     "Undoing turns", n, "turn(s)",
                     f"turn {n}", erased,
                 ))
-            _restore_snapshot(mgr, mid, snap)
+            bmode = await _resolve_bindings_mode(ctx, m, snap, args)
+            if bmode is None:
+                return
+            notes = []
+            _restore_snapshot(mgr, mid, snap, bmode, notes)
             return await ctx.send(
                 f"Undid {n} turn(s). Now at start of "
                 f"{snap.active_entity_id or 'no-active'}'s turn "
                 f"(round {snap.round_at_snapshot})."
+                + _bindings_suffix(notes)
             )
 
         if scope in ("round", "rounds"):
@@ -5076,10 +5190,15 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     "Undoing rounds", n, "round(s)",
                     f"round {n}", erased,
                 ))
-            _restore_snapshot(mgr, mid, snap)
+            bmode = await _resolve_bindings_mode(ctx, m, snap, args)
+            if bmode is None:
+                return
+            notes = []
+            _restore_snapshot(mgr, mid, snap, bmode, notes)
             return await ctx.send(
                 f"Undid {n} round(s). Now at start of round "
                 f"{snap.round_at_snapshot}."
+                + _bindings_suffix(notes)
             )
 
         if scope in ("command", "commands"):
@@ -5095,9 +5214,14 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     "Undoing commands", n, "command(s)",
                     f"command {n}", erased,
                 ))
-            _restore_snapshot(mgr, mid, snap)
+            bmode = await _resolve_bindings_mode(ctx, m, snap, args)
+            if bmode is None:
+                return
+            notes = []
+            _restore_snapshot(mgr, mid, snap, bmode, notes)
             return await ctx.send(
                 f"Undid {n} command(s). Reverted past `{snap.label}`."
+                + _bindings_suffix(notes)
             )
 
         return await ctx.send(
@@ -5393,11 +5517,13 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "history", "restore",
-    usage="!history restore <name> [confirm]",
+    usage="!history restore <name> [confirm] [bindings=keep|revert]",
     desc=(
         "Replace the active match state with the named manual save's "
         "state. Always requires `confirm` because the autosaves taken "
-        "after the manual save's point will be erased."
+        "after the manual save's point will be erased. Channel bindings "
+        "follow the undo_channel_bindings_mode rule unless `bindings=` "
+        "overrides it."
     ),
 )
 registry.annotate_sub(
@@ -5411,7 +5537,9 @@ registry.annotate_sub(
         "Roll the match back to an earlier autosave. N defaults to 1 "
         "for the turn/round/command forms; `undo to round X` jumps "
         "directly to that round's start. Confirmation thresholds are "
-        "configurable via the undo_confirmation_* rules."
+        "configurable via the undo_confirmation_* rules. Channel "
+        "bindings follow the undo_channel_bindings_mode rule; add "
+        "`bindings=keep` or `bindings=revert` to override it for one undo."
     ),
 )
 registry.annotate_sub(
