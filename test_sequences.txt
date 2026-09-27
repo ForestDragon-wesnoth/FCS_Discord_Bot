@@ -15633,6 +15633,9 @@ SCENARIO 595 — Mistyped options and subcommands are errors, not silent no-ops
 !passive add x p on_var_changed scop=exact "entity[self].hp = 1"
 !ent team x red
 !ent move x 1 sideways
+!ent set_var x note hello world
+!ent add y Y 10 3 3 5 team=red
+!ent set_var x note "hello world"
 !match list
 !match info
 !reveal_fog red all turns=2
@@ -15646,5 +15649,8 @@ mistyped `!map` subcommand (it used to draw the map), `!zone add` with a
 rectangle's worth of coordinates (it used to add one cell and ignore the rest),
 a mistyped passive option (it used to fail as a formula "Syntax error"), a
 removed subcommand (`!ent team` used to print help as if it had worked), and an
-unknown direction (the reply now carries the ❌). `!match list` and `!match
+unknown direction (the reply now carries the ❌), an unquoted value with a
+space (`!ent set_var x note hello world` used to store just "hello"), and an
+option `!ent add` doesn't take (`team=red` used to be dropped). The quoted
+value then stores "hello world". `!match list` and `!match
 info` work. The correctly-spelled reveal and clamp succeed.

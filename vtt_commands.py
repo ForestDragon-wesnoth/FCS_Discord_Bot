@@ -1231,6 +1231,19 @@ def _check_options(tokens: List[str], allowed, where: str) -> None:
                            f"takes: {opts}).")
 
 
+def _check_tail(args: List[str], n: int, allowed, usage: str) -> None:
+    """Raise when anything past the first `n` args isn't one of the
+    `allowed` options. A stray word used to be dropped: `!ent set_var h
+    note hello world` stored just "hello", `!ent add ... team=red` added a
+    unit with no team."""
+    _check_options(args[n:], allowed, usage.split(" <")[0])
+    stray = [a for a in args[n:] if "=" not in a]
+    if stray:
+        raise VTTError(
+            f"Unexpected `{' '.join(stray)}` — usage: `{usage}`. Quote a "
+            f"value that contains spaces.")
+
+
 def _parse_clamp_args(tokens: List[str]) -> Dict[str, Any]:
     """Parse [max=X] [min=X] [mode=hard|soft] tokens. Returns a dict with
     the named values present. Any other `key=` token raises."""
@@ -2644,6 +2657,8 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "add":# and len(args) >= 6:
         if await return_help_if_not_enough_args(ctx, args, 6, "ent", "add"):
             return
+        _check_tail(args, 7, (), "!ent add <id> <name> <hp> <x> <y> [init] "
+                    "(set other vars with !ent set_var)")
         eid, name = args[1], args[2]
         try:
             hp, x, y = int(args[3]), int(args[4]), int(args[5])
@@ -2870,6 +2885,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "tp":#and len(args) >= 4:
         if await return_help_if_not_enough_args(ctx, args, 4, "ent", "tp"):
             return
+        _check_tail(args, 4, (), "!ent tp <id> <x> <y>")
         eid = _resolve_eid(m, args[1]);
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
@@ -3114,6 +3130,8 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "hp":# and len(args) >= 3:
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "hp"):
             return
+        _check_tail(args, 3, {"bypass_clamp"},
+                    "!ent hp <id> <±n> [bypass_clamp=yes]")
         eid = _resolve_eid(m, args[1]);
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
@@ -3151,6 +3169,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "init":# and len(args) >= 3:
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "init"):
             return
+        _check_tail(args, 3, (), "!ent init <id> <value>")
         eid = _resolve_eid(m, args[1]);
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
@@ -3305,6 +3324,8 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         value = _parse_scalar(raw_value)  # int → float → str
 
         # Optional bypass_clamp named arg in any trailing position
+        _check_tail(args, 4, {"bypass_clamp"},
+                    "!ent set_var <id> <path> <value> [bypass_clamp=yes]")
         bypass_clamp = False
         for extra in args[4:]:
             if extra.startswith("bypass_clamp="):
