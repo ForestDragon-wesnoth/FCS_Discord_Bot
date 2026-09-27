@@ -15442,3 +15442,25 @@ The kill phase now repeats until nothing would be cut, so the Spawn is killed
 too (the reply lists `ghoul`, `spawn`) and every surviving unit is on the grid;
 before, the Spawn appeared after the cut list was taken and was left at (9,2)
 on an 8x8 map. Only Hero remains alive. The last line restores the default.
+
+
+SCENARIO 590 — Players can read the map layer / team-color settings
+--------------------------------------------------------------------------------
+
+!match new ml MapLists 8 8
+!match use ml
+!map teamcolor red red
+!map layer zones off
+!as player bob
+!map layer list
+!map teamcolor list
+!map layer zones on
+!as host
+!pending
+
+Expected: `!map layer list` and `!map teamcolor list` only show settings, so a
+player gets them directly (zones hidden; red → red). Before, elevation looked
+only at the first argument, so these read forms were held for host approval
+along with their mutating siblings. Changing a setting (`!map layer zones on`)
+is still host-gated: the player's request queues, and the host sees it as
+`r1` in `!pending`.

@@ -183,6 +183,12 @@ ELEVATED_ARGS: Dict[str, frozenset] = {
     "log": frozenset({"clear"}),
 }
 
+# Exact read-only forms of an elevated subcommand: `!map layer list` and
+# `!map teamcolor list` only SHOW settings, so they stay open while the
+# setting-changing forms of the same subcommand are host-gated.
+_ELEVATED_READ_FORMS = frozenset({("map", "layer", "list"),
+                                  ("map", "teamcolor", "list")})
+
 # Commands that act on BOT-WIDE state — shared GameSystems (every match on
 # a system picks up an edit on its next rule refresh, across servers), the
 # save store (`!store load` replaces EVERY match), and files on the host's
@@ -419,7 +425,10 @@ class CommandRegistry:
         elif base == "host" and not args and name in READ_ONLY_BARE_ROOTS:
             # Bare view form of a root that mutates only via subcommands.
             base = "all"
-        elif base == "all" and args and args[0].lower() in ELEVATED_ARGS.get(name, ()):
+        elif (base == "all" and args
+              and args[0].lower() in ELEVATED_ARGS.get(name, ())
+              and not (len(args) == 2 and (name, args[0].lower(), args[1].lower())
+                       in _ELEVATED_READ_FORMS)):
             # Full-reveal flag on a normally-open read -> host-gated.
             base = "host"
         if base == "host" and name == "foreach" and self._foreach_read_only(args, m):
