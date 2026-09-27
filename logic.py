@@ -11860,39 +11860,83 @@ class Match:
         # Spawn parents before children: a part whose part_of points at another
         # part in this list waits until that part has spawned.
         pending = list(part_list)
+
+        def _place(d: Dict[str, Any], relocate: bool) -> bool:
+            """Spawn one part. True = done (spawned or dropped); False = a
+            located part whose stored cell is taken, deferred until every
+            other part has had its own cell (so a displaced part can't take
+            the cell a later part is stored at)."""
+            po = d.get("part_of")
+            new_po = idmap[po] if po in own_ids else parent.id
+            located = bool((d.get("vars") or {}).get("__part_located"))
+            px = int(d.get("x", parent.x)) if located else parent.x
+            py = int(d.get("y", parent.y)) if located else parent.y
+            spec = {k: v for k, v in d.items() if k not in ("__nid", "parts")}
+            spec["id"] = d["__nid"]
+            spec["part_of"] = new_po
+            spec["x"], spec["y"] = px, py
+            if "name" not in spec:
+                spec["name"] = str((spec.get("vars") or {}).get(
+                    name_var, spec["id"]))
+            try:
+                pe = Entity.from_dict(spec)
+                try:
+                    _, slog = pe.spawn(self, px, py)
+                except VTTError as ex:
+                    # A located part (a snake segment, a turret on its own
+                    # cell) whose stored cell is now taken or off-grid goes
+                    # to the nearest free cell instead.
+                    if not located:
+                        raise
+                    if not relocate:
+                        return False
+                    near = self._find_free_cell_near(
+                        px, py, max(self.grid_width, self.grid_height), e=pe)
+                    if near is None or near == (px, py):
+                        raise
+                    pe = Entity.from_dict(spec)
+                    _, slog = pe.spawn(self, near[0], near[1])
+                    slog = [f"⚠️ part `{spec['id']}` couldn't return to "
+                            f"({px},{py}) ({ex}); placed at "
+                            f"({near[0]},{near[1]})."] + list(slog)
+                log.extend(slog)
+            except VTTError as ex:
+                # Malformed, or a located part with no free cell left: skip
+                # it rather than abort the swap, but say so (it used to
+                # vanish silently).
+                log.append(f"⚠️ part `{spec['id']}` couldn't be restored "
+                           f"({ex}) — dropped.")
+            return True
+
+        # Spawn parents before children: a part whose part_of points at another
+        # part in this list waits until that part has spawned. Displaced
+        # located parts are placed in a second phase, after every part that
+        # can return to its own cell has done so.
+        relocate = False
         guard = 0
-        while pending and guard <= len(part_list):
+        while pending and guard <= 2 * len(part_list) + 2:
             guard += 1
             progressed = False
             for d in list(pending):
                 po = d.get("part_of")
                 if po in own_ids and idmap.get(po) not in self.entities:
-                    continue  # its parent part isn't spawned yet
-                new_po = idmap[po] if po in own_ids else parent.id
-                located = bool((d.get("vars") or {}).get("__part_located"))
-                px = int(d.get("x", parent.x)) if located else parent.x
-                py = int(d.get("y", parent.y)) if located else parent.y
-                spec = {k: v for k, v in d.items() if k not in ("__nid", "parts")}
-                spec["id"] = d["__nid"]
-                spec["part_of"] = new_po
-                spec["x"], spec["y"] = px, py
-                if "name" not in spec:
-                    spec["name"] = str((spec.get("vars") or {}).get(
-                        name_var, spec["id"]))
-                try:
-                    pe = Entity.from_dict(spec)
-                    _, slog = pe.spawn(self, px, py)
-                    log += slog
-                except VTTError as ex:
-                    # Malformed, or a located part whose stored cell is now
-                    # taken/off-grid: skip it rather than abort the swap, but
-                    # say so (it used to vanish silently).
-                    log.append(f"⚠️ part `{spec['id']}` couldn't be restored "
-                               f"({ex}) — dropped.")
-                pending.remove(d)
-                progressed = True
+                    # Its parent part isn't spawned yet. In the last phase a
+                    # dropped parent means it never will be: drop the child.
+                    if relocate and not any(idmap.get(po) == q["__nid"]
+                                            for q in pending):
+                        log.append(f"⚠️ part `{d['__nid']}` couldn't be "
+                                   f"restored (its parent part is gone) — "
+                                   f"dropped.")
+                        pending.remove(d)
+                        progressed = True
+                    continue
+                if _place(d, relocate):
+                    pending.remove(d)
+                    progressed = True
             if not progressed:
-                break
+                if relocate:
+                    break
+                relocate = True
         # A segment that didn't come back must not leave the one behind it
         # following an id that was never created: close the chain around it,
         # the same rule as removing a segment (_splice_out_segment).

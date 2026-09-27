@@ -15343,7 +15343,7 @@ the post-command bookkeeping the command got no undo entry of its own. Now
 `!undo command 1` reverts the pull, bringing P back alive at (8,1).
 
 
-SCENARIO 586 — Revert with a segment's cell taken: the chain closes around it
+SCENARIO 586 — Revert with a segment's cell taken: nearest free cell, else dropped
 --------------------------------------------------------------------------------
 
 !match new rv RevertSeg 12 6
@@ -15355,16 +15355,29 @@ SCENARIO 586 — Revert with a segment's cell taken: the chain closes around it
 !ent transform worm hero stash
 !ent add rock Rock 5 8 1 5
 !ent revert worm stash
+!eval entity[w1].x
 !eval "var_get('w2', '__follows')"
+!match new rf RevertFull 5 1
+!match use rf
+!ent add worm Worm 40 1 1 5
+!part segment worm w1 Seg 5 5
+!part segment worm w2 Seg 5 5
+!ent add hero Hero 20 5 1 5
+!ent transform worm hero stash
+!ent add r2 Rock 5 2 1 5
+!ent add r3 Rock 5 3 1 5
+!ent add r4 Rock 5 4 1 5
+!ent revert worm stash
 !eval "has_part('worm', 'w1')"
 
 Expected: w1 (at 8,1) and w2 (at 7,1) are segments of the worm. Transforming
 the worm into a copy of Hero despawns them; a rock then takes w1's old cell.
-Reverting restores the worm and its segments from the stash, but w1 can't be
-placed on the occupied cell — the reply now says so ("part `w1` couldn't be
-restored … — dropped") where it used to drop it silently — and w2, which
-followed w1, is re-linked to the head (`'worm'`) instead of following an id
-that was never created.
+Reverting restores the worm and its segments from the stash. w1 can't return
+to its occupied cell, so it goes to the nearest free cell and the reply says
+so ("part `w1` couldn't return to (8,1) …; placed at (9,1)"). w2 still follows
+w1. In the second match (a 5×1 strip) rocks fill every cell the segments could
+use, so the revert drops both with a warning ("couldn't be restored … —
+dropped") and the worm comes back without them.
 
 
 SCENARIO 587 — A unit killed mid-path stops; group moves survive a removed member
