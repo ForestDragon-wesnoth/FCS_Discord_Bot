@@ -15278,3 +15278,33 @@ private "FormulaEngine._namespace.<locals>._slot_capacity()". A summon template
 with no `name` used to fail with a bare "Runtime error: 'name'"; it now spawns,
 named after its minted id (`summon`). HARNESS-ALLOWS-ERRORS (the arity case is
 reported as a Runtime error by design).
+
+
+SCENARIO 584 — A failed action keeps the undo history
+--------------------------------------------------------------------------------
+
+!match new fh FailHistory 8 8
+!match use fh
+!ent add a A 50 1 1 5
+!ent add b B 50 3 3 5
+!history save keep
+!ent hp a -1
+!ent hp a -1
+!ent set_var b actions.nope.body "entity[a].hp = entity[a].hp - 7\nfail('no')"
+!ent set_var b actions.nope.target none
+!action b nope
+!history list manual
+!history list commands
+!undo command 5
+!ent info a
+
+Expected: the failing action rolls back its own -7 (a stays at 48) and — the
+fix — leaves the match's undo history alone. Before, the rollback rebuilt the
+match from a pre-state taken WITHOUT history and copied the empty history over
+the live one: the manual save `keep` and every command/turn/round autosave
+vanished on any `fail()` or body exception (and on every interactive
+`choose()` replay, which rolls back the same way). Now `keep` is still listed,
+the command autosaves are intact, and `!undo command 5` walks back through the
+failed action, both set_vars and both hp changes to a at 50. action.py also
+gained a drift guard (checked on the first rollback) that raises if a Match
+field is neither serialized nor preserved by the rollback.

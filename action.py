@@ -1242,6 +1242,32 @@ async def run_action(
     return True, None
 
 
+_ROLLBACK_FIELDS_CHECKED = False
+
+
+def _check_rollback_fields(preserved_attrs) -> None:
+    """Drift guard, run once: every Match field the rollback pre-state does
+    NOT carry must be in `preserved_attrs`, or a rollback silently resets it
+    (this list went stale twice: the event-bus fields, then `history`)."""
+    global _ROLLBACK_FIELDS_CHECKED
+    if _ROLLBACK_FIELDS_CHECKED:
+        return
+    import dataclasses
+    from logic import Match
+    probe = Match(id="_probe", name="_probe", grid_width=1, grid_height=1,
+                  system_name="default")
+    carried = probe.to_dict(include_history=False)
+    missing = [f.name for f in dataclasses.fields(Match)
+               if f.name not in carried and f.name not in preserved_attrs]
+    if missing:
+        raise RuntimeError(
+            f"action._rollback_match: Match field(s) {missing} are neither "
+            f"serialized nor in preserved_attrs — a rollback would reset "
+            f"them. Add them to preserved_attrs (runtime state) or to "
+            f"Match.to_dict (game state).")
+    _ROLLBACK_FIELDS_CHECKED = True
+
+
 def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None:
     """Restore a Match in-place to the given pre-state dict. Used by
     the action runner when the body raises. We swap the live Match
@@ -1285,7 +1311,12 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
         "_event_depth", "_event_stack", "_event_warned", "_event_warnings",
         # ATB latches (one-time dormant-round warning + last-actor-skipped).
         "_atb_round_warned", "_atb_last_skipped",
+        # The undo history. The pre-state is taken WITHOUT history, so
+        # from_dict builds an empty one; copying that over wiped every
+        # autosave AND manual save on each failed action.
+        "history",
     )
+    _check_rollback_fields(preserved_attrs)
     preserved = {a: getattr(match, a) for a in preserved_attrs
                  if hasattr(match, a)}
     # Replace serialized state. We iterate a snapshot of restored's
