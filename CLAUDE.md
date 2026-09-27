@@ -129,9 +129,13 @@ missing the blank line is silently swallowed into the previous
 scenario's Expected: prose and never runs (scenarios 230/232/236 sat
 unexecuted this way for a long time). The harness now cross-checks every
 header line against what it parsed and refuses to run on a mismatch or a
-duplicate number. **But the harness only
-catches Python exceptions and "Syntax error" — it does NOT verify
-behavior.** A scenario can "pass" with a `❌` reply that means the
+duplicate number. Only lines ABOVE a scenario's first `Expected:` run: a
+staged scenario labels its intermediate prose `Result:` (see 13, 26) —
+commands written after an `Expected:` block silently never execute. The
+harness also flags `❌ Runtime error:`, `❌ Unexpected error:`, an unknown
+subcommand ("isn't a valid command") and missing arguments ("is missing
+arguments") unless the prose carries `HARNESS-ALLOWS-ERRORS`. **But the
+harness only catches those markers — it does NOT verify behavior.** A scenario can "pass" with a `❌` reply that means the
 opposite of what it should. Always also do at least one of:
 
 - Run the new scenarios with `-v` and read the per-line transcript
@@ -2944,9 +2948,10 @@ More shipped work (continuing the list above):
   Also re-confirmed clean by inspection: the Discord adapter board/approval/image
   logic (pass-18's per-match approval fix holds) and status dispel/transfer
   (tag dispel, max cap, consume-on-reject to an immune dest). NOTE for future
-  harness authors: hp is clamped to `[0, max_hp]` and max_hp defaults to the
-  spawn hp — so a bare `!ent add x X 30 ...` caps hp at 30; raise max_hp first or
-  your "hp write is broken" repro is really the clamp working (this cost me a
+  harness authors: the default clamp caps hp at max_hp (soft, NO minimum — hp
+  can go negative) and max_hp defaults to the spawn hp — so a bare `!ent add x
+  X 30 ...` caps hp at 30; raise max_hp first or your "hp write is broken"
+  repro is really the clamp working (this cost me a
   false lead this pass).
 
 - **Audit-pass-20 (hands-on): macro runaway backstops — two DoS/crash fixes
@@ -3724,6 +3729,48 @@ More shipped work (continuing the list above):
     name and silently made a default-system match; scenarios 32/106/146/147
     had never run under the systems they describe. The bare form now
     selects the system; any other unknown argument is an error.
+
+- **Audit-pass-31 (hands-on): the scenario suite as a bug detector
+  (scenarios 594-595).** Technique worth reusing: list every `❌` / `⚠️`
+  reply and every "X → Y" figure in the Expected prose, and check each
+  against its scenario. Scenarios that "pass" while testing nothing hide
+  real bugs. Fixes:
+  - **Round 1 opened on the first-ADDED unit (HIGH).** `_rebuild_turn_order`
+    kept the pointer on the current unit even before the match started, so
+    whoever was added first took the first turn regardless of initiative
+    (scenario 168's prose even called it "the spawn-order quirk"). The
+    pointer now resets to the order's top until the first `!turn next`.
+    KNOWN LIMIT: a pre-start `!turn set` is lost if units are added
+    afterwards — set the opener last.
+  - **Killing the unit whose turn it is skipped the next unit (HIGH).**
+    Removal moved the pointer onto the successor; `!turn next` then fired
+    the successor's turn-end hooks and advanced past it. `Entity.remove` now
+    sets the serialized `Match.turn_vacated` ("same" | "wrap"); `next_turn`
+    skips the gone actor's turn-end and starts the successor without
+    advancing (wrapping the round if the dead unit was last);
+    `_start_current_turn`, ATB and `!turn set` consume/clear it (594).
+  - **`random_seed` ignored by `!roll` / `!table roll` / damage_spread**
+    until some formula happened to run (the seeded RNG was built lazily by
+    the formula engine). `Match.formula_rng()` is now the single accessor
+    for every caller, and the choice-replay RNG snapshot calls it too.
+  - **Silent failures in the command surface:** unknown subcommands printed
+    only help (`_help_fallback` now leads with "❌ `!x y` isn't a valid
+    command"); missing arguments did the same (now "is missing arguments");
+    mistyped `key=` options were dropped (`_check_options`: clamp, reveal_fog
+    `turns=`, store save, undo `bindings=`, bare `!map`, passive
+    `target=`/`scope=`); stray trailing words were dropped (`_check_tail` on
+    `!ent add/tp/hp/init/set_var` — an unquoted `hello world` stored
+    "hello"); 21 error replies lacked the ❌ prefix. New: `!match list`
+    (host-gated like bare `!match`, it lists every match bot-wide) and
+    `!match info` (this channel's match, player-available) (595).
+  - **Rotten scenarios repaired** (each "passed" while testing nothing):
+    removed subcommands (`!ent team`, `set_facing`, `list_vars`, `macro
+    def`, `turn start`), seeds set on systems that didn't exist, units
+    added before `!match use` or off-grid, value-less `set_var` used as a
+    read, a truncated scenario (107), stranded stages (13, 26), and prose
+    whose numbers were wrong (475, 545) or described the old turn order.
+  - OPEN QUESTION raised with the user: a unit's display NAME isn't
+    readable from formulas (`entity[x].name` errors).
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
