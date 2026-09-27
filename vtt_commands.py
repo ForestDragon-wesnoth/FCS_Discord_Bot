@@ -657,15 +657,19 @@ class CommandRegistry:
                 await ctx.send(f"❌ inline $() argument: {e}")
                 return
 
+        result = None
         try:
             result = await h(ctx, args, mgr)
         except VTTError as e:
             await ctx.send(f"❌ {e}")
-            # Command failed — don't record a snapshot for a no-op.
-            return
         except Exception as e:
             await ctx.send(f"💥 Unexpected error: {e}")
-            return
+        # Even a failed command goes through the bookkeeping below: it only
+        # records a snapshot when the state REALLY changed, so a clean failure
+        # stays a no-op, while a command that mutated and THEN failed (a hook
+        # killing the mover before the reply was built, an error on line 3 of
+        # a batch) gets its own undo entry instead of being folded into
+        # whatever the next command's undo reverts.
 
         # Post-dispatch: if we captured pre-state and the active match
         # still exists and its serialized state genuinely changed, the
