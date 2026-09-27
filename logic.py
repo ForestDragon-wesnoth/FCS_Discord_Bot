@@ -5099,6 +5099,10 @@ class Entity:
 # -------------------------
 # Match
 # -------------------------
+# Engine-managed snake linkage + trail vars (identity-bound: a unit's place in
+# a chain and the head's own trail). Preserved across transform/revert.
+_SEGMENT_LINK_VARS = ("__segment", "__follows", "__seg_path", "__seg_last")
+
 @dataclass
 class Match:
     id: str
@@ -11887,6 +11891,14 @@ class Match:
             new_vars[team_var] = old_team
         if old_init is not None:
             new_vars[turnorder_var] = old_init
+        # A unit's place in a snake chain is identity too (like part_of,
+        # which transform never touches): keep the target's own linkage and
+        # drop the statblock's. Taking a segment's statblock used to copy its
+        # __follows, so a free unit claimed to follow that snake's head.
+        for k in _SEGMENT_LINK_VARS:
+            new_vars.pop(k, None)
+            if k in e.vars:
+                new_vars[k] = copy.deepcopy(e.vars[k])
         self._death_check_suppressed_ids.add(e.id)
         log: List[str] = []
         try:

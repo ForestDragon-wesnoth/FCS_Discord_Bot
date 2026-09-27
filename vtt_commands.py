@@ -3364,6 +3364,11 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         stash_note = (f" (original stashed at vars.{stash_path} — "
                       f"`!ent revert {tid} {stash_path}` to restore)"
                       if stash_path else "")
+        if tid not in m.entities:
+            # The new form's hp (e.g. percent mode from 0 hp) failed the death
+            # condition once the swap settled, so the death pipeline took it.
+            return await ctx.send(
+                f"`{tid}` transformed{stash_note}, then died in its new form.")
         return await ctx.send(
             f"`{tid}` transformed into **{m.entities[tid].name}**{stash_note}.")
 
@@ -3378,6 +3383,9 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             m.revert_entity(tid, args[2])
         except (VTTError, NotFound, Occupied) as ex:
             return await ctx.send(f"❌ {ex}")
+        if tid not in m.entities:
+            return await ctx.send(
+                f"`{tid}` reverted, then died in its restored form.")
         return await ctx.send(
             f"`{tid}` reverted to **{m.entities[tid].name}**.")
 

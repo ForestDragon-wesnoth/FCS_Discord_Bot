@@ -15218,3 +15218,32 @@ to follow w1 (`'w1'`); detaching w1 then re-links w3 to the head (`'worm'`) and
 w1 stops being a segment (`False` — no `__follows`), standing free on the map.
 Moving the head 2 down from (8,2) drags w3 along the closed chain into
 the cell the head just left (8,3).
+
+
+SCENARIO 582 — Transform keeps the target's own snake linkage; dying on transform
+--------------------------------------------------------------------------------
+
+!match new tl TransformLinks 12 6
+!match use tl
+!ent add worm Worm 40 8 2 5
+!part segment worm w1 Seg 5 5
+!ent add bob Bob 10 2 4 5
+!ent transform bob w1 stash
+!eval "var_has('bob', '__follows')"
+!eval "var_get('w1', '__follows')"
+!ent add ogre Ogre 30 4 2 5
+!part add ogre arm Arm 5 5
+!ent hp arm -5
+!part detach arm
+!ent transform arm ogre stash
+!list
+
+Expected: transforming Bob into a copy of the segment w1 gives him w1's stats
+but not w1's place in the worm — his place in a snake chain is identity, like
+his id/position/team — so `var_has('bob', '__follows')` is False (before the
+fix he claimed to follow `worm` without being part of it), and w1 still follows
+`worm`. The ogre's arm is knocked to 0 hp (a part never dies by itself) and
+detached, leaving a 0-hp free entity; transforming it into the ogre keeps its
+hp fraction (percent mode: 0), so the death check removes it as the swap
+settles. The reply now says it "transformed …, then died in its new form" —
+before, looking up the removed entity crashed the command (💥 'arm').
