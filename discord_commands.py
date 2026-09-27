@@ -251,7 +251,7 @@ class DiscordCtxWrapper:
         viewport window; returns a short status line (the image is the
         payload). Reports a clean message if Pillow isn't installed."""
         try:
-            from sprite_render import render_match_png
+            from sprite_render import scene_for_png, render_scene_png
         except Exception:
             return ("❌ Graphics rendering needs Pillow on the bot host "
                     "(`pip install Pillow`).")
@@ -260,9 +260,11 @@ class DiscordCtxWrapper:
         viewport = m.resolve_viewport(self.channel_key, enabled=enabled)
         try:
             import asyncio
+            # Build the scene HERE (it reads the match) and only draw pixels
+            # in the worker thread — see sprite_render.scene_for_png.
+            scene, cell = scene_for_png(m, pov_team=pov, viewport=viewport)
             data = await asyncio.to_thread(
-                render_match_png, m, _get_sprite_loader(),
-                pov_team=pov, viewport=viewport)
+                render_scene_png, scene, _get_sprite_loader(), cell)
         except RuntimeError as e:
             return f"❌ {e}"
         except Exception as e:
@@ -535,14 +537,15 @@ async def _board_image(m, channel_key: str):
     POV + viewport as the text board, rendered to a PNG via sprite_render.
     Raises if Pillow is unavailable (caller falls back to a text board)."""
     import asyncio
-    from sprite_render import render_match_png
+    from sprite_render import scene_for_png, render_scene_png
     pov = m.channel_pov(channel_key)
     vmode = str(m.rules.get("viewport_mode", "auto"))
     enabled = vmode != "off"
     viewport = m.resolve_viewport(channel_key, enabled=enabled)
+    # Scene on the event loop (reads the match), pixels in a worker thread.
+    scene, cell = scene_for_png(m, pov_team=pov, viewport=viewport)
     data = await asyncio.to_thread(
-        render_match_png, m, _get_sprite_loader(),
-        pov_team=pov, viewport=viewport)
+        render_scene_png, scene, _get_sprite_loader(), cell)
     header = ""
     if viewport:
         vx, vy, vw, vh = viewport

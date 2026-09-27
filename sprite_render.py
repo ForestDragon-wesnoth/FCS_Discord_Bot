@@ -327,7 +327,26 @@ def render_match_png(match, loader: "SpriteLoader",
     """Render `match`'s graphics scene to PNG bytes. cell_size defaults to the
     sprite_cell_size rule; the result is downscaled to fit `max_dim` on its
     longest side (0 = no cap) so a big board stays a reasonable attachment.
-    Raises RuntimeError if Pillow is unavailable."""
+    Raises RuntimeError if Pillow is unavailable.
+
+    Reads the live match, so call it on the thread that owns the match. To
+    keep the pixel work off an event loop, build the scene there with
+    `scene_for_png` and hand only the scene to `render_scene_png` in a worker
+    thread (see discord_commands)."""
+    scene, cell_size = scene_for_png(match, pov_team, viewport, cell_size,
+                                     max_dim)
+    return render_scene_png(scene, loader, cell_size, max_dim)
+
+
+def scene_for_png(match, pov_team: Optional[str] = None,
+                  viewport: Optional[Tuple[int, int, int, int]] = None,
+                  cell_size: Optional[int] = None,
+                  max_dim: int = 1600) -> Tuple[Dict[str, Any], int]:
+    """(scene model, cell size) for a PNG render — the part that READS THE
+    MATCH. render_scene switches on the match's shared vision memo while it
+    runs, so running it in a worker thread while commands mutate the match
+    on the event loop could serve those commands stale sight (or leave the
+    memo switched on for good). Call this on the match's own thread."""
     if not _PIL_OK:
         raise RuntimeError("graphics rendering needs Pillow (pip install Pillow).")
     if cell_size is None:
@@ -336,7 +355,16 @@ def render_match_png(match, loader: "SpriteLoader",
         except (TypeError, ValueError):
             cell_size = 100
     scene = match.render_scene(pov_team=pov_team, viewport=viewport)
-    cell_size = fit_cell_size(scene, cell_size, max_dim)
+    return scene, fit_cell_size(scene, cell_size, max_dim)
+
+
+def render_scene_png(scene: Dict[str, Any], loader: "SpriteLoader",
+                     cell_size: int, max_dim: int = 1600) -> bytes:
+    """Draw an already-built scene model to PNG bytes. Touches only the scene
+    dict and the sprite loader — never the match — so it is safe to run in a
+    worker thread."""
+    if not _PIL_OK:
+        raise RuntimeError("graphics rendering needs Pillow (pip install Pillow).")
     img = SceneRenderer(loader, cell_size).render(scene)
     # Safety net only: fit_cell_size already sized the canvas to the cap.
     if max_dim and max(img.size) > max_dim:

@@ -14,7 +14,8 @@
 #
 # Scope: static sprites only (no animation), command input only (no mouse
 # select/drag). The canvas pans and zooms locally (see GuiApp); Discord renders
-# the same model to an image attachment via sprite_render.render_match_png.
+# the same model to an image attachment via sprite_render (scene_for_png +
+# render_scene_png).
 from __future__ import annotations
 import os
 import asyncio
