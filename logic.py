@@ -11518,6 +11518,13 @@ class Match:
         for pid, amt in shares.items():
             if amt == 0:
                 continue
+            # An earlier share can end the body (a vital part destroyed runs
+            # the parent through the death pipeline, which removes the other
+            # parts): the rest of the blast has nothing left to hit. Raising
+            # "Entity not found" here failed the whole formula, and inside an
+            # action that ROLLED BACK the kill.
+            if pid not in self.entities or target_id not in self.entities:
+                continue
             tm, plog = self.damage_part(pid, amt)
             to_main += tm
             log += plog

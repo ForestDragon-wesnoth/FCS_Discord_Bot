@@ -15392,3 +15392,26 @@ fired every remaining cell's hooks for it (trips = 2 — a corpse tripping traps
 down the path). In the group move, g1's step onto (2,3) removes g2 before g2
 moves; the commit loop now skips the missing member (it used to crash with 💥
 'g2'), and g1 ends at (2,3).
+
+
+SCENARIO 588 — A blast that destroys a vital part completes (no rollback)
+--------------------------------------------------------------------------------
+
+!match new ds DeadlySpread 10 10
+!match use ds
+!ent add troll Troll 40 5 5 5
+!part add troll head Head 5 5
+!part add troll legs Legs 5 5
+!ent set_var head vital true
+!ent add mage Mage 10 1 1 5
+!ent set_var mage actions.blast.body "damage_spread(target, 20, 'uniform')\ncmd('ent info mage')"
+!ent set_var mage actions.blast.target entity
+!action mage blast troll
+!list
+
+Expected: the 20-point blast splits across the troll's two parts (10 each, in
+id order: head first). Destroying the vital head runs the troll through the
+death pipeline, which removes its parts — so the legs' share has nothing left
+to hit and is skipped. The action completes (its `cmd()` echo runs) and the
+troll is a corpse. Before, the legs' share raised "Entity 'legs' not found",
+failing the action — and the action's transactional rollback UNDID the kill.
