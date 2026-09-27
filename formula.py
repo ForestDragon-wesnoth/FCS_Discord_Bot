@@ -5081,7 +5081,8 @@ class FormulaEngine:
             turns', 'banish', cleanup of summoned waves. Raises if the
             id isn't a live entity."""
             eid, e = _resolve_entity(eid_t, "remove_entity")
-            e.remove()
+            # A snake segment follows the segment_removal_mode rule.
+            match.despawn_entity(e)
             return True
 
         ns["entity_snapshot"] = _entity_snapshot

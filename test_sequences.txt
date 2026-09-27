@@ -15508,3 +15508,44 @@ wraps to round 2 and A. A then gets the same doom passive. The fourth
 `!turn next` goes A → C, and the fifth wraps to round 3 and A. A dies at its
 turn start, and C is the next unit, so it is C's turn in round 3. The order
 now holds only C.
+
+
+SCENARIO 592 — segment_removal_mode: what despawning a middle segment does
+--------------------------------------------------------------------------------
+
+!match new sr SegRemove 20 12
+!match use sr
+!ent add worm Worm 40 6 2 5
+!ent set_var worm footprint_w 2
+!ent set_var worm footprint_h 2
+!part segment worm s1 Seg 5 5
+!part segment worm s2 Seg 5 5
+!part segment worm s3 Seg 5 5
+!ent remove s1
+!eval "var_get('s2', '__follows')"
+!ent add wb WormB 40 6 6 5
+!part segment wb b1 Seg 5 5
+!part segment wb b2 Seg 5 5
+!part segment wb b3 Seg 5 5
+!ent set_var wb __segment_removal_mode cascade
+!part remove b1
+!eval "has_part('wb', 'b2')"
+!ent add wc WormC 40 6 10 5
+!part segment wc c1 Seg 5 5
+!part segment wc c2 Seg 5 5
+!part segment wc c3 Seg 5 5
+!ent set_var wc __segment_removal_mode death
+!ent set_var wc __segment_death_mode split
+!eval "remove_entity('c1')"
+!eval "part_of('c2')"
+!eval "var_get('c3', '__follows')"
+!list
+
+Expected: Each worm has three segments trailing a head. Worm is a 2×2 head.
+Under the default `close`, removing s1 closes the chain: s2 now follows the
+head (`'worm'`) and s3 still follows s2. WormB's `__segment_removal_mode` is
+`cascade`, so `!part remove b1` also removes b2 and b3 ("`wb` severed at `b1`:
+3 segment(s) destroyed.") and `has_part('wb','b2')` is False. WormC uses
+`death`, which follows its segment_death_mode, `split`. remove_entity('c1')
+promotes c2 to an independent head: `part_of('c2')` is `''` and c3 now follows
+c2. The roster shows c2 as its own unit, with c3 as its part.

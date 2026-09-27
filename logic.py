@@ -454,6 +454,28 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "override: the head's (or a segment's) `__segment_death_mode` var."
         ),
     },
+    "segment_removal_mode": {
+        "default": "close",
+        "schema": {"type": "str",
+                   "choices": ["close", "cascade", "split", "death"]},
+        "desc": (
+            "What happens to the rest of a snake when one of its body "
+            "SEGMENTS is despawned (`!ent remove`, `!part remove`, "
+            "remove_entity) — a GM removal, not a death. `close` (default): "
+            "the chain closes around the gap; the segment behind it follows "
+            "the one ahead of it, so the body stays one linked chain. "
+            "`cascade`: every segment BEHIND the removed one is removed too. "
+            "`split`: the segment behind the removed one is PROMOTED to a new "
+            "independent head (stamped with segment_split_head_template) and "
+            "keeps the rest of the tail. `death`: treat the removal like the "
+            "segment being destroyed, i.e. use its segment_death_mode "
+            "(`cascade`/`split` as above; `none`/`solid` close the chain). "
+            "Removing the HEAD removes the whole body regardless, and a "
+            "detached segment (`!part detach`) always closes the chain. "
+            "Per-snake override: the segment's (or the head's) "
+            "`__segment_removal_mode` var."
+        ),
+    },
     "segment_split_head_template": {
         "default": {},
         "schema": {"type": "dict"},
@@ -11366,8 +11388,10 @@ class Match:
                 log += self._sever_segment(p)
         return log
 
-    def _sever_segment(self, p: "Entity") -> List[str]:
-        """Apply a destroyed segment's `segment_death_mode`:
+    def _sever_segment(self, p: "Entity",
+                       mode: Optional[str] = None) -> List[str]:
+        """Apply a destroyed segment's `segment_death_mode` (or `mode`, when
+        despawn_entity passes the segment_removal_mode it resolved):
           cascade — destroy `p` and every segment BEHIND it (the back of the
                     worm is severed and removed; no corpses).
           split   — remove `p` (the cut), promote the segment behind it to a
@@ -11380,9 +11404,8 @@ class Match:
         head = self.entities.get(head_id)
         if head is None:
             return []
-        mode = str(p.vars.get("__segment_death_mode")
-                   or head.vars.get("__segment_death_mode")
-                   or self.rules.get("segment_death_mode", "none"))
+        if mode is None:
+            mode = self._segment_death_mode_of(p, head)
         if mode in ("none", "solid"):
             return []
         chain = self.snake_segments(head_id)
@@ -11412,6 +11435,38 @@ class Match:
                            mode="split", part_of=head_id)
             p.remove()
             self._rebuild_turn_order()
+        return log
+
+    def _segment_death_mode_of(self, p: "Entity", head: "Entity") -> str:
+        """The segment_death_mode for segment `p`: its `__segment_death_mode`
+        var > the head's > the rule."""
+        return str(p.vars.get("__segment_death_mode")
+                   or head.vars.get("__segment_death_mode")
+                   or self.rules.get("segment_death_mode", "none"))
+
+    def despawn_entity(self, e: "Entity") -> List[str]:
+        """GM despawn (`!ent remove`, `!part remove`, remove_entity). Same as
+        `e.remove()`, except that a snake SEGMENT whose head is still here
+        applies the segment_removal_mode rule to the rest of the body
+        (segment var > head var > rule): `close` splices the chain (what
+        remove() does), `cascade`/`split` sever it like a death would, and
+        `death` uses the segment's segment_death_mode (`none`/`solid` →
+        close). Returns log lines describing a sever."""
+        head = self.entities.get(e.part_of) if e.part_of else None
+        if head is None or not e.vars.get("__segment"):
+            e.remove()
+            return []
+        mode = str(e.vars.get("__segment_removal_mode")
+                   or head.vars.get("__segment_removal_mode")
+                   or self.rules.get("segment_removal_mode", "close"))
+        if mode == "death":
+            mode = self._segment_death_mode_of(e, head)
+        if mode not in ("cascade", "split"):
+            e.remove()
+            return []
+        log = self._sever_segment(e, mode=mode)
+        if e.id in self.entities and e._match is self:
+            e.remove()   # not in the head's chain: plain removal
         return log
 
     def _promote_segment_to_head(self, seg: "Entity", old_head: "Entity") -> None:

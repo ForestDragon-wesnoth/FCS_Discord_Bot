@@ -2616,8 +2616,9 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         eid = _resolve_eid(m, args[1])
         if eid not in m.entities:
             return await ctx.send(f"Entity `{eid}` not found.")
-        m.entities[eid].remove()
-        return await ctx.send(f"Removed `{eid}` from match.")
+        sever = m.despawn_entity(m.entities[eid])
+        return await ctx.send("\n".join([f"Removed `{eid}` from match."]
+                                         + sever))
 
     # rename
     if sub == "rename":
@@ -8849,8 +8850,9 @@ async def part_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         part_id = _resolve_eid(m, args[1])
         if part_id not in m.entities:
             return await ctx.send(f"❌ Entity `{part_id}` not found.")
-        m.entities[part_id].remove()
-        return await ctx.send(f"Removed body part `{part_id}`.")
+        sever = m.despawn_entity(m.entities[part_id])
+        return await ctx.send("\n".join([f"Removed body part `{part_id}`."]
+                                         + sever))
 
     if sub == "list":
         if await return_help_if_not_enough_args(ctx, args, 2, "part", "list"):
