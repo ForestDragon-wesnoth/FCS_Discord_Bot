@@ -3605,7 +3605,7 @@ More shipped work (continuing the list above):
     from the seed. Leave it.
 
 - **Audit-pass-30 (hands-on, tool-driven): four reusable harnesses + fixes
-  (scenarios 579 ext, 581-590).** Techniques worth reusing (all throwaway
+  (scenarios 579 ext, 581-593).** Techniques worth reusing (all throwaway
   scripts, rebuild them from these descriptions):
   1. **POV LEAK DETECTOR** — a fogged board with distinctively-named hidden
      units (a part, a hidden rider, a corpse, an action, a status, a
@@ -3698,6 +3698,32 @@ More shipped work (continuing the list above):
     args[0], so `!map layer list` / `!map teamcolor list` were queued for
     approval with their mutating siblings. `_ELEVATED_READ_FORMS` names the
     exact read forms that stay player-available (590).
+  - **Design calls the user made at the end of the pass (591-593):**
+    - **A unit that dies to its own turn-start effects passes the turn on.**
+      A dead unit can't hold the turn, so `Match._start_current_turn` (round
+      mode; the ATB loop does the same by charge bar) starts the next unit's
+      turn at once, logging "💀 `x` died at the start of its turn; the turn
+      passes to the next unit." The successor is the first unit after the
+      dead one in the order as it stood when its turn began; a wrap fires the
+      round hooks. Bounded by the order size. When nobody is left, `!turn
+      next` says so and shows the log (591).
+    - **A displaced located part goes to the nearest free cell** on
+      transform/revert, with a warning naming both cells; it is dropped only
+      when no cell fits. Placement is two-phase so a displaced part can't
+      take a later part's stored cell (586).
+    - **`segment_removal_mode` rule** (close default | cascade | split |
+      death; segment > head `__segment_removal_mode` > rule) decides what a
+      GM despawn of a snake segment does to the body. `!ent remove`, `!part
+      remove` and `remove_entity` go through `Match.despawn_entity`;
+      internal removals (head removal, death, transform, transfer) and `!part
+      detach` always close the chain (592).
+    - **`team_data_visibility` rule** (own default | all | host) filters
+      `!team list/get`; `!team get` is now player-available (593). `!log`
+      stays host-only under a hidden view (no per-line filtering).
+  - **`!match new <id> <name> <w> <h> <system>`** ignored the bare system
+    name and silently made a default-system match; scenarios 32/106/146/147
+    had never run under the systems they describe. The bare form now
+    selects the system; any other unknown argument is an error.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
