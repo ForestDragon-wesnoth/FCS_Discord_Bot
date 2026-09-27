@@ -15655,3 +15655,46 @@ space (`!ent set_var x note hello world` used to store just "hello"), and an
 option `!ent add` doesn't take (`team=red` used to be dropped). The quoted
 value then stores "hello world". `!match list` and `!match
 info` work. The correctly-spelled reveal and clamp succeed.
+
+
+SCENARIO 596 — `name` is a reserved var path: formulas and !find read the display name
+---------------------------------------------------------------------------------------
+
+!match new nm596 Names 8 6
+!match use nm596
+!ent add hero Hero 30 3 3 10
+!ent add spy Assassin 30 5 3 5
+!ent set_var hero team blue
+!ent set_var spy team red
+!ent set_var spy disguise.name Villager
+!eval "\"Hello, \" + entity[hero].name"
+!eval "var_get('spy', 'name') + '/' + str(var_has('spy', 'name'))"
+!eval "var_get('hero', 'x') + var_get('hero', 'y')"
+!ent rename hero Robert
+!eval "entity[hero].name"
+!find name=Robert show:x
+!find sort:name show:name
+!as view blue
+!find name=Villager
+!find name=Assassin
+!as view omniscient
+!ent set_var hero name Bob
+!ent set_var hero name.first Bob
+!ent set_var hero x 4
+!eval "var_set('hero', 'name', 'Bob')"
+!eval "entity[hero].name.first"
+!defvar add name Nobody
+!eval "entity[hero].name"
+
+Expected: HARNESS-ALLOWS-ERRORS. `entity[hero].name` reads the display name, so
+the first eval returns "Hello, Hero". `var_get`/`var_has` treat the reserved
+paths the same way: "Assassin/True" (a formula reads the REAL name, disguise or
+not), and `var_get('hero','x') + var_get('hero','y')` = 6. After `!ent rename
+hero Robert` the read returns "Robert". `!find name=Robert show:x` matches Robert
+with `[x=3]`; `sort:name` orders Assassin before Robert and shows each name.
+Under the blue view the spy's disguise applies to searches too: `name=Villager`
+finds it and `name=Assassin` finds nothing. Every write under `name` or `x` is
+refused with a ❌ naming the fix (`!ent rename` / `!ent tp`): the two `name`
+set_vars, the `x` set_var and `var_set`. Reading a field under `name` is a ❌
+(a name has no fields), and `!defvar add name ...` is refused (a reserved path
+can't have a default). The final read still returns "Robert".

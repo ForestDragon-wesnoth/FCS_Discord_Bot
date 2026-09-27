@@ -14,7 +14,7 @@ from logic import (
 )
 
 # Passive system
-from logic import Passive, HOOK_NAMES, is_event_hook
+from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS
 
 # Clamp system
 from logic import ClampSpec
@@ -4563,6 +4563,23 @@ def _resolve_dotted_var(vars_dict: Dict[str, Any], path: str) -> Tuple[bool, Any
     return True, cur
 
 
+def _entity_path_value(m: Match, e: Entity, path: str,
+                       pov: Optional[str] = None) -> Tuple[bool, Any]:
+    """`!find`'s read of `path` on `e`: the reserved var paths (x / y / name,
+    logic.RESERVED_VAR_PATHS) come from the entity's own fields, matching
+    `entity[X].path` in formulas; anything else walks the vars. `name` is
+    the name shown to `pov`, so a disguise's decoy name is what a fooled
+    team can search and sort by."""
+    seg0 = path.split(".", 1)[0]
+    if seg0 in RESERVED_VAR_PATHS:
+        if "." in path:
+            return False, None
+        if seg0 == "name":
+            return True, m.entity_display_name(e, pov)
+        return True, getattr(e, seg0)
+    return _resolve_dotted_var(e.vars, path)
+
+
 def _coerce_for_compare(s: str) -> Any:
     """Best-effort coercion for find values: ints, floats, bools, then
     fall back to the raw string. Numeric inputs let `hp<20` work
@@ -4580,7 +4597,8 @@ def _coerce_for_compare(s: str) -> Any:
     return s
 
 
-def _find_match_entity(m: Match, e: Entity, predicates: List[Tuple[str, str, Optional[str]]]) -> bool:
+def _find_match_entity(m: Match, e: Entity, predicates: List[Tuple[str, str, Optional[str]]],
+                       pov: Optional[str] = None) -> bool:
     """Return True iff every predicate matches `e`. Predicates short-
     circuit on the first failure."""
     for kind, key, val in predicates:
@@ -4634,7 +4652,7 @@ def _find_match_entity(m: Match, e: Entity, predicates: List[Tuple[str, str, Opt
         # Var-comparison forms. Missing var never matches any operator
         # (including !=) — that keeps "team=red" from spuriously
         # matching entities that don't have a team set at all.
-        found, lhs = _resolve_dotted_var(e.vars, key)
+        found, lhs = _entity_path_value(m, e, key, pov)
         if not found:
             return False
         rhs = _coerce_for_compare(val)
@@ -4718,14 +4736,14 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         pov = _query_pov(ctx, m)
         hits = [e for e in m.entities_in_turn_order()
                 if not _pov_hides(m, pov, e.id)
-                and _find_match_entity(m, e, predicates)]
+                and _find_match_entity(m, e, predicates, pov)]
     except VTTError as ex:
         return await ctx.send(f"❌ {ex}")
     if not hits:
         return await ctx.send("No entities match.")
     if sort_var:
         def _sort_key(e):
-            found, v = _resolve_dotted_var(e.vars, sort_var)
+            found, v = _entity_path_value(m, e, sort_var, pov)
             # Missing vars sort last: a (rank, number, string) tuple groups
             # present values together and compares numbers vs strings cleanly
             # within their own kind (a numeric string sorts as a number).
@@ -4753,7 +4771,7 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     # status dict; a level > 1 is shown as name(level).
                     cells.append(f"{col}={_fmt_status_names(e) or '—'}")
                     continue
-                found, v = _resolve_dotted_var(e.vars, col)
+                found, v = _entity_path_value(m, e, col, pov)
                 cells.append(f"{col}={v if found else '—'}")
             row += "  [" + ", ".join(cells) + "]"
         lines.append(row)
@@ -5071,7 +5089,7 @@ async def foreach_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         pov = None if _acts_as_host(ctx, m) else _query_pov(ctx, m)
         hits = [e for e in m.entities_in_turn_order()
                 if not _pov_hides(m, pov, e.id)
-                and _find_match_entity(m, e, predicates)]
+                and _find_match_entity(m, e, predicates, pov)]
     except VTTError as ex:
         return await ctx.send(f"❌ {ex}")
     if not hits:
@@ -6819,6 +6837,10 @@ async def defvar_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "defvar", "add"):
             return
         path = args[1]
+        if path.split(".", 1)[0] in RESERVED_VAR_PATHS:
+            return await ctx.send(
+                f"❌ `{path.split('.', 1)[0]}` is a reserved var path (read from "
+                f"the entity itself: x / y / name); it can't have a default.")
         value = _parse_scalar(args[2])  # same coercion as !ent set_var
         existing = _read_vars()
         existing[path] = value

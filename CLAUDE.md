@@ -365,6 +365,9 @@ can be a literal id, `self`/`this`/`current`, a known param, an
 action binding (target), or any HOOK_CONTEXT_NAMES name (actor, etc.).
 Other bare Names inside `entity[X]` are treated as **literal entity
 ids** for backward compat — be careful.
+The PATH side has reserved names too (`logic.RESERVED_VAR_PATHS`): `x`, `y`
+and `name` read the entity's own position / display name, and no var can be
+written at or under them.
 
 **Action mode** lifts three restrictions:
 1. Bare-name assignments (`raw = 5`) become locals
@@ -1808,7 +1811,8 @@ More shipped work (continuing the list above):
   `!list` / `!state` (the board); use `!as view <team>` to preview a POV in the
   CLI/harness. `!ent info` shows the decoy card and `!find` rows render the
   decoy line under a team POV (pov_filters_queries, audit-pass-29); `!find`
-  PREDICATES and `show:` columns still read the real vars. A moving/animated decoy or an
+  PREDICATES and `show:` columns still read the real vars, except the
+  reserved `name` path, which reads the decoy name under that POV. A moving/animated decoy or an
   illusion that fools enemy TARGETING is a GM composition on top (mechanics use
   real, so a true targeting-fooling illusion would need the deep-illusion
   variant, deferred).
@@ -3769,8 +3773,19 @@ More shipped work (continuing the list above):
     added before `!match use` or off-grid, value-less `set_var` used as a
     read, a truncated scenario (107), stranded stages (13, 26), and prose
     whose numbers were wrong (475, 545) or described the old turn order.
-  - OPEN QUESTION raised with the user: a unit's display NAME isn't
-    readable from formulas (`entity[x].name` errors).
+  - **`name` is a reserved var path (user call, scenario 596).** A unit's
+    display name wasn't readable from formulas (`entity[x].name` errored).
+    `logic.RESERVED_VAR_PATHS` = x / y / name: entity FIELDS that read like
+    vars. `entity[x].name`, `var_get(x,'name')` and `var_has` read the real
+    name (`formula._read_entity_path`); `!find` predicates / `show:` /
+    `sort:` read the name SHOWN to the viewer's POV, so a disguise's decoy
+    name is what a fooled team searches by (`_entity_path_value`). No var
+    may exist at or under a reserved path: `Entity.write_var` refuses it
+    (`reserved_var_path_error`, pointing at `!ent rename` / `!ent tp`), as
+    do the formula writes and `!defvar add`. Renaming stays a command; a
+    formula can't rename. A nested read (`name.first`) is a ❌.
+  - Pre-start `!turn set` lost when units are added afterwards: the user
+    chose to keep this (set the opener last).
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

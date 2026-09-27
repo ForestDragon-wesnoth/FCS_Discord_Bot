@@ -380,7 +380,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import random
 
-from logic import VTTError, NotFound
+from logic import VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error
 
 
 class FormulaError(VTTError):
@@ -2920,6 +2920,21 @@ def validate_formula(
 
 # --- engine ------------------------------------------------------------------
 
+
+def _read_entity_path(e: Any, path: str) -> Any:
+    """Read `path` on entity `e` the way `entity[X].path` does: a reserved
+    var path (x / y / name) comes from the Entity's own field, anything else
+    from its vars."""
+    seg0 = path.split(".", 1)[0]
+    if seg0 in RESERVED_VAR_PATHS:
+        if "." in path:
+            raise FormulaError(
+                f"`{e.id}`.{seg0} is the entity's "
+                f"{'display name' if seg0 == 'name' else 'position'}, "
+                f"which has no fields ('{path}').")
+        return getattr(e, seg0)
+    return _get_path(e.vars, path)
+
 class FormulaEngine:
     """Parses and evaluates formulas against a Match."""
 
@@ -2969,6 +2984,11 @@ class FormulaEngine:
     # the engine can validate full 2D destinations in one shot.
     # Read-only x/y also keeps the "rollback" question moot: there's
     # nothing to roll back if the write was never accepted.
+    #
+    # `name` joins x/y as a RESERVED var path (logic.RESERVED_VAR_PATHS):
+    # `entity[x].name` reads the display name, and writes are refused with a
+    # pointer at `!ent rename`. write_var refuses all three as var names, so
+    # no GM var can shadow them.
     _POSITIONAL_PATHS = ("x", "y")
 
     def _read(self, who: str, path: str, ctx: EvalCtx) -> Any:
@@ -2976,12 +2996,7 @@ class FormulaEngine:
         e = self._match.entities.get(eid)
         if e is None:
             raise FormulaError(f"Entity '{eid}' not found.")
-        if path in self._POSITIONAL_PATHS:
-            # Direct attribute read — x and y live on the dataclass,
-            # not in vars, so the normal _get_path(e.vars, path) would
-            # raise "Variable 'x' is not defined" for every entity.
-            return getattr(e, path)
-        return _get_path(e.vars, path)
+        return _read_entity_path(e, path)
 
     def _write(self, who: str, path: str, value: Any, ctx: EvalCtx) -> Any:
         """Route formula writes through Entity.write_var so var hooks fire.
@@ -3013,6 +3028,9 @@ class FormulaEngine:
                 f"avoiding the per-axis collision quirk that would "
                 f"break legal 2D moves past another entity."
             )
+        msg = reserved_var_path_error(path, f"entity[{who}].{path}")
+        if msg:
+            raise FormulaError(msg)
         # write_var does the diff + event firing + mutation in one shot.
         e.write_var(path, value)
         # Track for the "Affected: a, b, c" command-layer summary.
@@ -4345,6 +4363,9 @@ class FormulaEngine:
             if not isinstance(path, str) or not path:
                 raise FormulaError("var_has(eid, path): path must be a non-empty string.")
             _, e = _resolve_entity(eid_t, "var_has")
+            if path.split(".", 1)[0] in RESERVED_VAR_PATHS:
+                # A reserved path always exists at the top and never nests.
+                return "." not in path
             cur: Any = e.vars
             for k in path.split("."):
                 if not isinstance(cur, dict) or k not in cur:
@@ -4365,6 +4386,8 @@ class FormulaEngine:
             _, e = _resolve_entity(eid_t, "var_get")
             if default is not _VAR_GET_MISSING and not _var_has(eid_t, path):
                 return default
+            if path.split(".", 1)[0] in RESERVED_VAR_PATHS:
+                return _read_entity_path(e, path)
             return _walk_vars(e, path, must_exist=True)
 
         def _var_set(eid_t: Any, path: Any, value: Any) -> Any:
@@ -4378,12 +4401,9 @@ class FormulaEngine:
             # Mirror the positional-axis safety check in _write: x/y
             # are read-only here too. Reusing the same set keeps the
             # static and dynamic paths consistent.
-            if path in self._POSITIONAL_PATHS:
-                raise FormulaError(
-                    f"var_set({eid!r}, '{path}', ...): `{path}` is "
-                    f"read-only from formulas. Use `!ent tp` (or, once "
-                    f"available, move_entity from formulas)."
-                )
+            msg = reserved_var_path_error(path, f"var_set({eid!r}, '{path}', ...)")
+            if msg:
+                raise FormulaError(msg)
             e.write_var(path, value)
             engine._note_affected(eid)
             return value
@@ -4417,9 +4437,9 @@ class FormulaEngine:
             if isinstance(delta, bool) or not isinstance(delta, (int, float)):
                 raise FormulaError("var_add(eid, path, delta): delta must be a number.")
             eid, e = _resolve_entity(eid_t, "var_add")
-            if path in self._POSITIONAL_PATHS:
-                raise FormulaError(
-                    f"var_add({eid!r}, '{path}', ...): `{path}` is read-only from formulas.")
+            msg = reserved_var_path_error(path, f"var_add({eid!r}, '{path}', ...)")
+            if msg:
+                raise FormulaError(msg)
             cur: Any = 0
             if _var_has(eid_t, path):
                 cur = _walk_vars(e, path, must_exist=True)
@@ -4442,8 +4462,10 @@ class FormulaEngine:
                 raise FormulaError("var_move: src_path must be a non-empty string.")
             if not (isinstance(dest_path, str) and dest_path):
                 raise FormulaError("var_move: dest_path must be a non-empty string.")
-            if src_path in self._POSITIONAL_PATHS or dest_path in self._POSITIONAL_PATHS:
-                raise FormulaError("var_move: x/y are read-only.")
+            msg = (reserved_var_path_error(src_path, "var_move (source)")
+                   or reserved_var_path_error(dest_path, "var_move (destination)"))
+            if msg:
+                raise FormulaError(msg)
             seid, se = _resolve_entity(src_t, "var_move")
             deid, de = _resolve_entity(dest_t, "var_move")
             if not _var_has(src_t, src_path):

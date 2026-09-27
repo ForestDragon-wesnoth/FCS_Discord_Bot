@@ -2769,6 +2769,26 @@ def _default_facing_for(
 
 RESERVED_IDS: Set[str] = {"current", "this", "self", "parent"}
 
+# Reserved var PATHS: entity FIELDS that formulas read as if they were vars
+# (`entity[x].name`, `entity[x].x`), resolved from the Entity itself. Their
+# names are reserved: no entity var may be created under them (write_var
+# refuses), so a read can never be ambiguous. Formula writes are refused too;
+# `name` changes via `!ent rename`, x/y via `!ent tp`.
+RESERVED_VAR_PATHS: Tuple[str, ...] = ("x", "y", "name")
+
+
+def reserved_var_path_error(path: str, where: str) -> Optional[str]:
+    """The refusal message for a write at `path` whose first segment is a
+    reserved var path, or None when the path is an ordinary var."""
+    seg0 = path.split(".", 1)[0]
+    if seg0 not in RESERVED_VAR_PATHS:
+        return None
+    fix = ("`!ent rename <id> <name>`" if seg0 == "name"
+           else "`!ent tp <id> <x> <y>`")
+    return (f"{where}: `{seg0}` is a reserved var path (the entity's own "
+            f"{'display name' if seg0 == 'name' else 'position'}); it can't "
+            f"be written or nested under. Use {fix}.")
+
 # Recognized modifier fold ops (see Match._apply_modifier_op). An op outside
 # this set still folds as a lenient add, but `!mod show` flags it as a likely
 # typo via Match.unknown_modifier_ops.
@@ -4750,6 +4770,10 @@ class Entity:
         """
         if not path:
             raise VTTError("Variable path cannot be empty.")
+        if self._match is not None:
+            msg = reserved_var_path_error(path, f"Writing '{path}' on `{self.id}`")
+            if msg:
+                raise VTTError(msg)
 
         # VITAL-var write protection (symmetric with remove_var's delete
         # guard): hp / max_hp / initiative must stay numeric SCALARS — the
