@@ -11812,12 +11812,35 @@ class Match:
                     pe = Entity.from_dict(spec)
                     _, slog = pe.spawn(self, px, py)
                     log += slog
-                except VTTError:
-                    pass  # malformed part entry — skip, don't abort the swap
+                except VTTError as ex:
+                    # Malformed, or a located part whose stored cell is now
+                    # taken/off-grid: skip it rather than abort the swap, but
+                    # say so (it used to vanish silently).
+                    log.append(f"⚠️ part `{spec['id']}` couldn't be restored "
+                               f"({ex}) — dropped.")
                 pending.remove(d)
                 progressed = True
             if not progressed:
                 break
+        # A segment that didn't come back must not leave the one behind it
+        # following an id that was never created: close the chain around it,
+        # the same rule as removing a segment (_splice_out_segment).
+        dropped_pred = {d["__nid"]: (d.get("vars") or {}).get("__follows")
+                        for d in part_list if d["__nid"] not in self.entities}
+        if dropped_pred:
+            for d in part_list:
+                pe = self.entities.get(d["__nid"])
+                if pe is None:
+                    continue
+                fol, seen = pe.vars.get("__follows"), set()
+                while fol in dropped_pred and fol not in seen:
+                    seen.add(fol)
+                    fol = dropped_pred[fol]
+                if fol != pe.vars.get("__follows"):
+                    if fol:
+                        pe.vars["__follows"] = fol
+                    else:
+                        pe.vars.pop("__follows", None)
         self._restamp_parts_for(parent.id)
         return log
 

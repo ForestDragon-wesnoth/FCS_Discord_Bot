@@ -3372,9 +3372,10 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     f"❌ No template found: `{ref}` is neither a dict var on "
                     f"`{tid}` nor a live entity id.")
         try:
-            m.transform_entity(tid, template, stash_path)
+            tlog = m.transform_entity(tid, template, stash_path)
         except (VTTError, NotFound, Occupied) as ex:
             return await ctx.send(f"❌ {ex}")
+        tail = ("\n" + "\n".join(l for l in tlog if l)) if tlog else ""
         stash_note = (f" (original stashed at vars.{stash_path} — "
                       f"`!ent revert {tid} {stash_path}` to restore)"
                       if stash_path else "")
@@ -3382,9 +3383,11 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             # The new form's hp (e.g. percent mode from 0 hp) failed the death
             # condition once the swap settled, so the death pipeline took it.
             return await ctx.send(
-                f"`{tid}` transformed{stash_note}, then died in its new form.")
+                f"`{tid}` transformed{stash_note}, then died in its new form."
+                + tail)
         return await ctx.send(
-            f"`{tid}` transformed into **{m.entities[tid].name}**{stash_note}.")
+            f"`{tid}` transformed into **{m.entities[tid].name}**{stash_note}."
+            + tail)
 
     # ---- revert <id> <stash_path> ----
     if sub == "revert":
@@ -3394,14 +3397,15 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if tid not in m.entities:
             raise NotFound(f"Entity '{tid}' not found.")
         try:
-            m.revert_entity(tid, args[2])
+            rlog = m.revert_entity(tid, args[2])
         except (VTTError, NotFound, Occupied) as ex:
             return await ctx.send(f"❌ {ex}")
+        tail = ("\n" + "\n".join(l for l in rlog if l)) if rlog else ""
         if tid not in m.entities:
             return await ctx.send(
-                f"`{tid}` reverted, then died in its restored form.")
+                f"`{tid}` reverted, then died in its restored form." + tail)
         return await ctx.send(
-            f"`{tid}` reverted to **{m.entities[tid].name}**.")
+            f"`{tid}` reverted to **{m.entities[tid].name}**." + tail)
 
     # ---- copy / transfer <id> <dest_match> [x] [y] ----
     # Cross-match entity transfer (107): copy duplicates into another live

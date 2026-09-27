@@ -15338,3 +15338,27 @@ says it "was removed on the way". Before, the move/push/pull replies looked the
 unit up after the move and crashed (💥 'a'), and because a crash reply skips
 the post-command bookkeeping the command got no undo entry of its own. Now
 `!undo command 1` reverts the pull, bringing P back alive at (8,1).
+
+
+SCENARIO 586 — Revert with a segment's cell taken: the chain closes around it
+--------------------------------------------------------------------------------
+
+!match new rv RevertSeg 12 6
+!match use rv
+!ent add worm Worm 40 8 2 5
+!part segment worm w1 Seg 5 5
+!part segment worm w2 Seg 5 5
+!ent add hero Hero 20 2 4 5
+!ent transform worm hero stash
+!ent add rock Rock 5 8 1 5
+!ent revert worm stash
+!eval "var_get('w2', '__follows')"
+!eval "has_part('worm', 'w1')"
+
+Expected: w1 (at 8,1) and w2 (at 7,1) are segments of the worm. Transforming
+the worm into a copy of Hero despawns them; a rock then takes w1's old cell.
+Reverting restores the worm and its segments from the stash, but w1 can't be
+placed on the occupied cell — the reply now says so ("part `w1` couldn't be
+restored … — dropped") where it used to drop it silently — and w2, which
+followed w1, is re-linked to the head (`'worm'`) instead of following an id
+that was never created.
