@@ -592,8 +592,21 @@ class _PanView(discord.ui.View):
         self._mgr = mgr
 
     async def _pan(self, interaction, dx: int, dy: int):
-        mid = self._mgr.get_active_for_channel(self.channel_key)
+        # Pan the match the BOARD shows (the channel may have switched its
+        # active match since); a board whose channel was unbound is retired.
+        entry = _boards.get(self.channel_key)
+        mid = (entry or {}).get("match_id") or \
+            self._mgr.get_active_for_channel(self.channel_key)
         m = self._mgr.get(mid) if mid else None
+        if m is not None and self.channel_key not in m.bound_channels:
+            try:
+                await interaction.response.defer()
+            except Exception:
+                pass
+            if entry is not None:
+                entry["message"] = interaction.message
+                await _retire_board(self.channel_key, entry, mid)
+            return
         if m is None or not m.viewport_engaged():
             try:
                 await interaction.response.defer()
@@ -645,10 +658,32 @@ async def _refresh_boards_for_match(mgr: MatchManager, match_id: str) -> None:
         if m is None:
             _boards.pop(ck, None)
             continue
+        if ck not in m.bound_channels:
+            # The channel was unbound (`!match unbind`, or an undo under
+            # undo_channel_bindings_mode=revert). An unbound channel has no
+            # POV, i.e. omniscient — refreshing would post the whole fogged
+            # board into what was a team channel. Retire the board instead.
+            await _retire_board(ck, entry, match_id)
+            continue
         try:
             await _apply_board(entry["message"], m, ck, mgr)
         except Exception:
             _boards.pop(ck, None)
+
+
+async def _retire_board(channel_key: str, entry: Dict[str, Any],
+                        match_id: str) -> None:
+    """Stop a board whose channel no longer belongs to its match: drop it
+    from the registry and replace its content (and pan buttons) with a
+    note, so nothing stale or unfiltered stays on screen."""
+    _boards.pop(channel_key, None)
+    try:
+        await entry["message"].edit(
+            content=(f"🗺️ Auto-update board stopped — this channel is no "
+                     f"longer bound to `{match_id}`."),
+            attachments=[], view=None)
+    except Exception:
+        pass
 
 
 def wire_commands(bot: commands.Bot, mgr: MatchManager):
