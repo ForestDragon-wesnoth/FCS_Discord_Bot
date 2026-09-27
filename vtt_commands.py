@@ -5151,6 +5151,15 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "list":
         if len(args) >= 2:
             kind = args[1].lower()
+            # Detailed lists quote every command verbatim (`!ent tp spy 16
+            # 16`) and name whose turn each save marks, hidden units included
+            # — same rule as !log / !history diff. The bare summary (counts
+            # only) stays open.
+            if _whole_board_read_blocked(ctx, m):
+                return await ctx.send(
+                    "❌ `!history list <kind>` is host-only while this "
+                    "channel's view is fogged or filtered — its labels quote "
+                    "commands on hidden units (pov_filters_queries).")
             if kind in ("rounds", "round"):
                 if not m.history.round_saves:
                     return await ctx.send("No round autosaves retained.")
