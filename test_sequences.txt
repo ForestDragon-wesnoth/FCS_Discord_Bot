@@ -12247,7 +12247,7 @@ Expected: the troll's leg has an `acid` DoT whose tick calls `damage_part(self,
 begins round 1; the second ends the troll's turn.) Ending the troll's
 turn ticks the leg (it shares the parent's clock); the leg's tick routes 4
 damage through the part-damage pipeline: with to_main_percent=100 the parent
-troll takes 4 (50→46) and the leg itself drops 25→21. This proves a status on a
+troll takes 4 (30→26) and the leg itself drops 25→21. This proves a status on a
 limb can both live on the limb and bleed into the main body.
 
 
@@ -14068,8 +14068,9 @@ SCENARIO 545 — Macro control flow: if / elif / else branching
 
 Expected: `if <formula>` / `elif <formula>` / `else` / `end` branch on a
 READ-ONLY formula (truthy = run that block; first matching branch wins). `heal`
-adds 1 when hp ≥ 10 (30 → 31) and adds 20 when hp < 10 (after `ent hp g -25` →
-6, then +20 → 26). `tier` is an elif chain: hp 26 → `tier=mid`. Conditions only
+adds 1 when hp ≥ 10 (30 → 30: the heal is capped at max_hp) and adds 20 when
+hp < 10 (after `ent hp g -25` → 5, then +20 → 25). `tier` is an elif chain: hp
+25 → `tier=mid`. Conditions only
 read state; a condition that mutates is rejected (see scenario 546).
 
 SCENARIO 546 — Macro control flow: read-only conditions + structure + clamp
