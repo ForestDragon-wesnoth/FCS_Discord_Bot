@@ -3764,7 +3764,13 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     sub = args[0].lower()
     if sub == "next":
         eid, fire_log = m.next_turn()
-        if not eid: return await ctx.send("No turn order yet.")
+        if not eid:
+            if not fire_log:
+                return await ctx.send("No turn order yet.")
+            # The transition ran (hooks fired, units may have died on their
+            # turn start) and left no one to take the turn.
+            return await ctx.send("No one is left to take a turn.\n"
+                                  + "\n".join(fire_log))
         e = m.entities.get(eid)
         pov = _query_pov(ctx, m)
         if e is None:

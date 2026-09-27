@@ -15464,3 +15464,34 @@ only at the first argument, so these read forms were held for host approval
 along with their mutating siblings. Changing a setting (`!map layer zones on`)
 is still host-gated: the player's request queues, and the host sees it as
 `r1` in `!pending`.
+
+
+SCENARIO 591 — A unit that dies at its turn start passes the turn on
+--------------------------------------------------------------------------------
+
+!match new ds DeathStart 10 10
+!match use ds
+!ent add a A 10 1 1 30
+!ent add b B 10 2 1 20
+!ent add c C 10 3 1 10
+!passive add b doom on_turn_start "entity[self].hp = 0"
+!passive add c wake on_turn_start "entity[self].woke = 1"
+!turn next
+!turn next
+!eval entity[c].woke
+!turn next
+!passive add a doom on_turn_start "entity[self].hp = 0"
+!turn next
+!turn next
+!turn
+!match_toplevel
+
+Expected: Round 1 opens on A. The second `!turn next` reaches B, whose
+on_turn_start passive kills it; a dead unit can't hold the turn, so the reply
+reads "💀 `b` died at the start of its turn; the turn passes to the next unit."
+and it is now C's turn, with C's own on_turn_start fired (`woke` = 1). Before,
+the cursor landed on C without firing C's turn start. The next `!turn next`
+wraps to round 2 and A. A then gets the same doom passive. The fourth
+`!turn next` goes A → C, and the fifth wraps to round 3 and A. A dies at its
+turn start, and C is the next unit, so it is C's turn in round 3. The order
+now holds only C.
