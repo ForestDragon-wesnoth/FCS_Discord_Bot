@@ -1750,7 +1750,7 @@ async def host_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             )
         removed = m.remove_cohost(target)
         if not removed:
-            return await ctx.send(f"{_mention(target)} is not a co-host.")
+            return await ctx.send(f"❌ {_mention(target)} is not a co-host.")
         return await ctx.send(f"Removed co-host {_mention(target)} from **{m.name}**.")
 
     return await _help_fallback(ctx, ["host"], args[0] if args else None)
@@ -2198,7 +2198,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return
             key = args[3]
             if key not in current:
-                return await ctx.send(f"System `{name}` has no override for `{key}`.")
+                return await ctx.send(f"❌ System `{name}` has no override for `{key}`.")
             del current[key]
             s.set("command_access", current)
             refreshed = mgr.refresh_match_rules(name)
@@ -2225,7 +2225,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             mgr.set_channel_default_system(ctx.channel_key, name)
             return await ctx.send(f"Channel default GameSystem is now `{name}`.")
         else:
-            return await ctx.send("Scope must be one of: global | server | channel")
+            return await ctx.send("❌ Scope must be one of: global | server | channel")
 
     # ---- system alias <subcommand> -----------------------------------
     # System-level alias library. These don't affect any currently live
@@ -2451,10 +2451,10 @@ async def _ent_move_group(ctx, args, mgr, m):
             except ValueError:
                 return await ctx.send(f"Unexpected token '{t}'.")
             if i + 1 >= len(tokens):
-                return await ctx.send("Count must be followed by a direction.")
+                return await ctx.send("❌ Count must be followed by a direction.")
             d = tokens[i + 1]
             if normalize_direction(d) is None:
-                return await ctx.send(f"'{d}' is not a direction.")
+                return await ctx.send(f"❌ '{d}' is not a direction.")
             moves.append((d, n)); i += 2
     try:
         count, steps, hook_log = m.move_group_dirs(group_name, moves)
@@ -2665,7 +2665,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         eid = _resolve_eid(m, args[1])
         if eid not in m.entities:
-            return await ctx.send(f"Entity `{eid}` not found.")
+            return await ctx.send(f"❌ Entity `{eid}` not found.")
         sever = m.despawn_entity(m.entities[eid])
         return await ctx.send("\n".join([f"Removed `{eid}` from match."]
                                          + sever))
@@ -2758,10 +2758,10 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     if event_log:
                         msg += "\n" + "\n".join(event_log)
                     return await ctx.send(msg)
-                return await ctx.send(f"`{eid}` has no status `{name}`.")
+                return await ctx.send(f"❌ `{eid}` has no status `{name}`.")
             if action == "info":
                 if name not in e.status:
-                    return await ctx.send(f"`{eid}` has no status `{name}`.")
+                    return await ctx.send(f"❌ `{eid}` has no status `{name}`.")
                 data = e.status[name]
                 if not data:
                     return await ctx.send(f"**`{eid}.{name}`** (no data)")
@@ -2809,7 +2809,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                         f"`!ent status {eid} remove {name}`.)"
                     )
                 if name not in e.status:
-                    return await ctx.send(f"`{eid}` has no status `{name}`.")
+                    return await ctx.send(f"❌ `{eid}` has no status `{name}`.")
                 path = args[4]
                 before = copy.deepcopy(e.status[name])
                 data = e.status[name]
@@ -2890,10 +2890,10 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 try: n = int(t)
                 except ValueError:
                     return await ctx.send(f"Unexpected token '{t}'.")
-                if i + 1 >= len(tokens): return await ctx.send("Count must be followed by a direction.")
+                if i + 1 >= len(tokens): return await ctx.send("❌ Count must be followed by a direction.")
                 d = tokens[i+1]
                 if normalize_direction(d) is None:
-                    return await ctx.send(f"'{d}' is not a direction.")
+                    return await ctx.send(f"❌ '{d}' is not a direction.")
                 moves.append((d, n)); i += 2
 
         total_steps = sum(max(1, int(n)) for _, n in moves)
@@ -4126,7 +4126,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             try:
                 val = max(0, min(100, int(args[2])))
             except ValueError:
-                return await ctx.send("Opacity must be an integer 0-100.")
+                return await ctx.send("❌ Opacity must be an integer 0-100.")
             m.border_opacity = val
             return await ctx.send(f"Grid border opacity set to {val}%.")
         return await ctx.send(
@@ -4230,7 +4230,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         try:
             new_w, new_h = int(args[1]), int(args[2])
         except ValueError:
-            return await ctx.send("Width and height must be integers.")
+            return await ctx.send("❌ Width and height must be integers.")
         anchor = args[3] if len(args) >= 4 else "top-left"
         try:
             summary, log = m.resize_grid(new_w, new_h, anchor)
@@ -5375,7 +5375,7 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             try:
                 target_round = int(args[3])
             except ValueError:
-                return await ctx.send(f"Round number must be an integer, got '{args[3]}'.")
+                return await ctx.send(f"❌ Round number must be an integer, got '{args[3]}'.")
             confirmed = "confirm" in (a.lower() for a in args[4:])
             snap = m.history.get_round_with_number(target_round)
             # `undo to round X` always prompts unless the round threshold
@@ -6880,7 +6880,7 @@ async def schedule_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         try:
             delay = int(args[1])
         except ValueError:
-            return await ctx.send(f"Delay must be an integer, got '{args[1]}'.")
+            return await ctx.send(f"❌ Delay must be an integer, got '{args[1]}'.")
         body = " ".join(args[2:])
         try:
             name = m.add_scheduled(delay, body)
@@ -6898,7 +6898,7 @@ async def schedule_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         try:
             delay = int(args[2])
         except ValueError:
-            return await ctx.send(f"Delay must be an integer, got '{args[2]}'.")
+            return await ctx.send(f"❌ Delay must be an integer, got '{args[2]}'.")
         body = " ".join(args[3:])
         try:
             name = m.add_scheduled_on(eid, delay, body)
@@ -8222,7 +8222,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # A zone hidden from this POV reads as absent (don't reveal a
         # secret region exists to a player channel).
         if not m.zone_visible_to(name, _view_pov(ctx, m, args)):
-            return await ctx.send(f"zone `{name}`: not found.")
+            return await ctx.send(f"❌ zone `{name}`: not found.")
         try:
             cells = m.zone_cell_list(name)
         except NotFound as ex:
@@ -8241,7 +8241,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         name = args[1]
         z = m.zones.get(name)
         if z is None or not m.zone_visible_to(name, _view_pov(ctx, m, args)):
-            return await ctx.send(f"zone `{name}`: not found.")
+            return await ctx.send(f"❌ zone `{name}`: not found.")
         cells = m.zone_cell_list(name)
         view = {
             "cells": cells,
@@ -8337,7 +8337,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if z is None:
                 return await ctx.send(f"❌ Zone '{name}' not found.")
             if when not in (z.get("hooks") or {}):
-                return await ctx.send(f"zone `{name}` has no `{when}` hook.")
+                return await ctx.send(f"❌ zone `{name}` has no `{when}` hook.")
             del z["hooks"][when]
             return await ctx.send(f"Removed zone `{name}` `{when}` hook.")
 
@@ -8931,7 +8931,7 @@ async def part_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(f"❌ Entity `{part_id}` not found.")
         p = m.entities[part_id]
         if not p.part_of:
-            return await ctx.send(f"`{part_id}` is not a body part.")
+            return await ctx.send(f"❌ `{part_id}` is not a body part.")
         return await ctx.send(_entity_dump(p))
 
     return await _help_fallback(ctx, ["part"], args[0] if args else None)
@@ -10135,7 +10135,7 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if len(args) >= 3:
             d = m.team_data.get(team, {})
             if d.pop(args[2], None) is None:
-                return await ctx.send(f"team `{team}` has no `{args[2]}`.")
+                return await ctx.send(f"❌ team `{team}` has no `{args[2]}`.")
             return await ctx.send(f"Cleared team `{team}`.{args[2]}.")
         m.team_data.pop(team, None)
         m.team_passives.pop(team, None)
