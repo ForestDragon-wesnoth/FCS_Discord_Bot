@@ -3605,7 +3605,7 @@ More shipped work (continuing the list above):
     from the seed. Leave it.
 
 - **Audit-pass-30 (hands-on, tool-driven): four reusable harnesses + fixes
-  (scenarios 579 ext, 581-586).** Techniques worth reusing (all throwaway
+  (scenarios 579 ext, 581-590).** Techniques worth reusing (all throwaway
   scripts, rebuild them from these descriptions):
   1. **POV LEAK DETECTOR** — a fogged board with distinctively-named hidden
      units (a part, a hidden rider, a corpse, an action, a status, a
@@ -3674,6 +3674,30 @@ More shipped work (continuing the list above):
   - **`saves_path` refuses names Windows can't hold as files** (`:` = an NTFS
     alternate data stream, CON/NUL/COM1…/LPT1… open DEVICES, `<>"|?*`,
     trailing dots/spaces) (573 ext).
+  - **HOSTILE chaos mode** (the chaos harness with lethal global passives,
+    lava tiles and killing zones layered on) found the "unit removed
+    mid-operation" class, all fixed:
+    - `move_dirs` kept walking a mover a tile hook had killed (it returned
+      a log for a ghost). It now stops the moment the mover leaves
+      `m.entities` and skips the stop/moved hooks.
+    - `move_group_dirs` looked each member up with `entities[eid]` (KeyError
+      once one died) and fired stop hooks for dead members. Removed members
+      are now skipped (587).
+    - `damage_spread` routed shares to parts the cascade had already removed
+      (destroying a vital part kills the parent, which removes the siblings).
+      The whole blast rolled back. It now skips gone parts and stops when the
+      target itself is gone (588).
+    - In kill mode, `resize_grid` computed the off-grid set once, so a unit
+      that a death hook summoned into the cut region survived off-grid. It
+      now loops until nothing is off-grid (589).
+    - The `!turn next` / `!ent swap` replies say what happened when the
+      actor was removed by its own effects.
+  - **More POV:** `!map center <hidden id>` framed the camera on the hidden
+    unit, revealing its position. It now reads as "no entity" (579 ext).
+  - **Read-only forms of elevated commands.** ELEVATED_ARGS looked only at
+    args[0], so `!map layer list` / `!map teamcolor list` were queued for
+    approval with their mutating siblings. `_ELEVATED_READ_FORMS` names the
+    exact read forms that stay player-available (590).
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
