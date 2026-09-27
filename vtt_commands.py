@@ -4240,7 +4240,9 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"nothing to center.")
         if len(args) == 2:
             eid = _resolve_eid(m, args[1])
-            if eid not in m.entities:
+            # A unit this channel's POV can't see reads as missing — centring
+            # on it would frame (and so reveal) where it is.
+            if eid not in m.entities or _pov_hides(m, _query_pov(ctx, m), eid):
                 return await ctx.send(f"❌ no entity `{args[1]}`.")
             e = m.entities[eid]
             m.center_view(ctx.channel_key, e.x, e.y)
