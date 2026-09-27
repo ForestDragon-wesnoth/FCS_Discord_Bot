@@ -780,3 +780,23 @@ def wire_commands(bot: commands.Bot, mgr: MatchManager):
         if bot.get_command(root):
             bot.remove_command(root)
         register_one(root)
+
+    # Aliases (`!alias add fb "ent hp ..."`) are per-match data, not
+    # discord.py commands, so `!fb` used to die in discord.py's own lookup
+    # (CommandNotFound — logged, never answered) and aliases only worked on
+    # the CLI. Route an unknown command through the registry when it is an
+    # alias on the channel's active match; anything else stays ignored so a
+    # server's other `!`-prefixed bots don't get "unknown command" replies.
+    @bot.event
+    async def on_command_error(ctx, error):
+        if isinstance(error, commands.CommandNotFound):
+            name = getattr(ctx, "invoked_with", None) or ""
+            gid = getattr(ctx.guild, "id", "DM")
+            mid = mgr.get_active_for_channel(f"{gid}:{ctx.channel.id}")
+            m = mgr.get(mid) if mid else None
+            if name and m is not None and name in m.aliases:
+                await _dispatch(ctx, name)
+            return
+        # Keep discord.py's default reporting for everything else.
+        import traceback
+        traceback.print_exception(type(error), error, error.__traceback__)
