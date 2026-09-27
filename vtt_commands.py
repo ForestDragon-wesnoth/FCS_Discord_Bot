@@ -127,7 +127,10 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
     "gpassive":   frozenset({"list", "info"}),
     "history":    frozenset({"list", "diff"}),
     "macro":      frozenset({"list"}),
-    "match":      frozenset({"channels", "hosts", "outcome", "list", "info"}),
+    # `list` stays host-gated like a bare `!match`: it names every match
+    # bot-wide (see the multi-tenant caveat). `info` covers only the
+    # channel's own match.
+    "match":      frozenset({"channels", "hosts", "outcome", "info"}),
     "mount":      frozenset({"list", "info"}),
     # `info` is NOT here: it prints the part's full var JSON — what `!ent
     # dump` is host-gated to hide.
