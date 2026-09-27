@@ -1064,7 +1064,16 @@ async def return_help_if_not_enough_args(
     if len(args) < required:
         keys = [command] + ([subcommand] if subcommand else [])
         title, body = registry.help_for(keys)
-        await ctx.send(f"**{title}**\n{body}")
+        # With some arguments given, the caller tried the command and fell
+        # short: lead with the error so it can't read as success. A bare
+        # `!cmd` / `!cmd sub` stays a plain help request.
+        if len(args) > (1 if subcommand else 0):
+            await ctx.send(f"❌ `!{' '.join(keys)}` is missing arguments "
+                           f"(got {len(args) - (1 if subcommand else 0)}, "
+                           f"needs {required - (1 if subcommand else 0)}).\n"
+                           f"**{title}**\n{body}")
+        else:
+            await ctx.send(f"**{title}**\n{body}")
         return True
     return False
 

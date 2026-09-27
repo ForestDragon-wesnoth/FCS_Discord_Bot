@@ -60,7 +60,8 @@ _FAILURE_MARKERS = ("💥", "Syntax error")
 # deliberately exercises error handling (a func-deletion test, a rejection
 # test) and opts out with the `HARNESS-ALLOWS-ERRORS` tag in its Expected prose.
 _ERROR_MARKERS = ("❌ Runtime error:", "❌ Unexpected error:",
-                  "isn't a valid command (unknown subcommand")
+                  "isn't a valid command (unknown subcommand",
+                  "is missing arguments (got")
 _ALLOW_ERRORS_TAG = "harness-allows-errors"
 
 

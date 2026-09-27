@@ -302,7 +302,7 @@ SCENARIO 12 — Var hooks: creation events fire at every level
 !passive add hero log_creates on_var_created target=inventory scope=deep "entity[self].create_log = entity[self].create_log + \"|\" + changed_key"
 !ent set_var hero create_log start
 !ent set_var hero inventory.gold_pouch.coins 50
-!ent set_var hero create_log
+!eval "entity[hero].create_log"
 
 Expected: After the !ent set_var to inventory.gold_pouch.coins, the
 create_log should read "start|inventory|inventory.gold_pouch|inventory.gold_pouch.coins"
@@ -322,9 +322,9 @@ SCENARIO 13 — Var hooks: changed only when value differs; removed bottom-up
 !ent set_var hero hp 20
 !ent set_var hero hp 20
 !ent set_var hero hp 5
-!ent set_var hero change_log
+!eval "entity[hero].change_log"
 
-Expected: change_log should be "start|30->20|20->5" — no change event
+Result: change_log should be "start|30->20|20->5" — no change event
 fires when the same value is written.
 
 !ent set_var hero inventory.spell.fire 10
@@ -332,10 +332,10 @@ fires when the same value is written.
 !passive add hero log_removes on_var_removed target=inventory scope=deep "entity[self].removal_log = entity[self].removal_log + \"|\" + changed_key"
 !ent set_var hero removal_log start
 !ent delete_var hero inventory.spell
-!ent set_var hero removal_log
+!eval "entity[hero].removal_log"
 
-Expected: removal_log reads "start|inventory.spell.fire|inventory.spell.ice|inventory.spell"
-- leaves first, then container (bottom-up).
+Expected: removal_log reads "start|inventory.spell.ice|inventory.spell.fire|inventory.spell"
+- leaves first (the most recently added first), then the container (bottom-up).
 
 
 SCENARIO 14 — Scope filtering: exact vs children vs deep
@@ -351,9 +351,9 @@ SCENARIO 14 — Scope filtering: exact vs children vs deep
 !ent set_var hero ch_log start
 !ent set_var hero dp_log start
 !ent set_var hero inventory.sword.damage 12
-!ent set_var hero ex_log
-!ent set_var hero ch_log
-!ent set_var hero dp_log
+!eval "entity[hero].ex_log"
+!eval "entity[hero].ch_log"
+!eval "entity[hero].dp_log"
 
 Expected:
 - ex_log = "start|inventory" (only the exact path)
@@ -372,7 +372,7 @@ SCENARIO 15 — on_var_written catch-all with hook_name discrimination
 !ent set_var hero mood happy
 !ent set_var hero mood angry
 !ent delete_var hero mood
-!ent set_var hero audit_log
+!eval "entity[hero].audit_log"
 
 Expected: audit_log reads "start|on_var_created|on_var_changed|on_var_removed"
 - the catch-all on_var_written fires alongside each kind, and hook_name
@@ -409,8 +409,6 @@ Expected: counter advances some number of times bounded by the limit (5),
 and the response includes a warning line beginning with "var-hook
 recursion limit (5) reached". The chain halts gracefully rather than
 hanging the bot.
-
-!system set default var_hook_recursion_limit 128
 
 
 SCENARIO 18 — Reactive passive: poison drains hp on item removal
@@ -460,7 +458,7 @@ SCENARIO 20 — Property setters route through chokepoint (no more limitation)
 !ent hp hero -5
 !ent hp hero 10
 !ent hp hero -8
-!ent set_var hero hp_audit_log
+!eval "entity[hero].hp_audit_log"
 
 Expected: hp_audit_log reads "start|30->25|25->30|30->22" — every !ent hp
 command fires on_var_changed via the property setter, which now routes
@@ -592,7 +590,7 @@ Stage A: on_var_changed catches heal-from-below clamping
 !ent hp hero 100
 !ent info hero
 
-Expected: hp goes from 5 toward 105 but the default soft clamp engages at
+Result: hp goes from 5 toward 105 but the default soft clamp engages at
 max_hp=30. The on_var_changed event fires with intended_value=105 and
 new_value=30, so overheal_changed = 75. This part works perfectly with
 just the existing hooks.
@@ -602,7 +600,7 @@ Stage B: the gap — heal at full HP produces NO on_var_changed event
 !ent hp hero 50
 !ent info hero
 
-Expected: hp stays at 30 (already at cap, soft clamp dormant from below
+Result: hp stays at 30 (already at cap, soft clamp dormant from below
 since old=30=cap, write 80 → clamped to 30 — but 30==30 means the diff is
 empty and on_var_changed does NOT fire). overheal_changed is still 75
 because the tracker never ran. So 50 wasted heal points went unrecorded.
@@ -617,11 +615,15 @@ Stage C: on_var_write_attempt closes the gap
 !ent info hero
 !ent hp hero 50
 !ent info hero
+!eval "entity[hero].overheal_attempt"
+!eval "entity[hero].overheal_changed"
 
 Expected: overheal_attempt = 75 + 50 = 125. The attempt hook fires for
 EVERY write to hp regardless of whether the diff produces a change event.
 The first heal (5 → clamped to 30) contributes 75; the second heal (30 →
-clamped to 30) contributes 50. The user sees the full 125 wasted points.
+clamped to 30) contributes 50. The user sees the full 125 wasted points. overheal_changed
+ends at 150: Stage C's heal from 5 was clamped too (+75), while the at-cap heal
+again recorded nothing.
 
 Why two hooks exist: on_var_changed says "the data actually changed,"
 on_var_write_attempt says "a write was attempted." Most game mechanics
@@ -2138,7 +2140,14 @@ SCENARIO 107 — !ent dump shows everything regardless of template
 !match new dump107 Dump 6 6
 !match use dump107
 !ent add hero Hero 30 3 3 10
-!ent set_var her
+!ent set_var hero inventory.sword.damage 12
+!ent set_var hero secret 7
+!list
+!ent dump hero
+
+Expected: `!list` renders the entity_line_format template, which shows neither
+the inventory nor `secret`. `!ent dump` shows every var — the nested
+inventory.sword.damage = 12 and secret = 7 — whatever the template says.
 
 ===============================================================================
 SAVE/LOAD AND PERSISTENCE
