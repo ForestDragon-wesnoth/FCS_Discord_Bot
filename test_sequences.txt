@@ -15247,3 +15247,30 @@ detached, leaving a 0-hp free entity; transforming it into the ogre keeps its
 hp fraction (percent mode: 0), so the death check removes it as the swap
 settles. The reply now says it "transformed …, then died in its new form" —
 before, looking up the removed entity crashed the command (💥 'arm').
+
+
+SCENARIO 583 — Formula errors name the function; nameless summon templates work
+--------------------------------------------------------------------------------
+
+!match new fe FormulaErrors 10 10
+!match use fe
+!ent add a A 10 1 1 5
+!eval "has_los(1, 1, 'x', 2)"
+!eval "can_see('a', 'up', 3)"
+!eval "entities_in_area(3, 3, 'far')"
+!eval "slot_capacity()"
+!ent set_var a tmpl.vars.hp 5
+!ent set_var a tmpl.vars.max_hp 5
+!eval "summon(var_get('a', 'tmpl'), 4, 4)"
+!list
+
+Expected: bad arguments to the sight functions name the function and the
+argument ("has_los(...): x2 must be a number, got str ('x')", "can_see(...): x
+must be a number…", "entities_in_area(...): n (the radius) must be a number")
+where they used to surface Python's "invalid literal for int() with base 10" or
+"'<=' not supported between instances". A wrong-arity call reads
+"slot_capacity() missing 2 required positional arguments" instead of the
+private "FormulaEngine._namespace.<locals>._slot_capacity()". A summon template
+with no `name` used to fail with a bare "Runtime error: 'name'"; it now spawns,
+named after its minted id (`summon`). HARNESS-ALLOWS-ERRORS (the arity case is
+reported as a Runtime error by design).

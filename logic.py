@@ -10848,6 +10848,11 @@ class Match:
         # summon/summon_near/summon_from raised KeyError('x') and created nothing.
         d.setdefault("x", x)
         d.setdefault("y", y)
+        # from_dict also requires a name; a hand-built template without one
+        # used to fail with a bare "Runtime error: 'name'". Name it after its
+        # minted id (the engine shows the id wherever a name is missing).
+        if not d.get("name"):
+            d["name"] = new_id
         e = Entity.from_dict(d)
         # Apply default vars to the probe so the footprint size reflects
         # them; spawn re-applies (fill-only, idempotent).

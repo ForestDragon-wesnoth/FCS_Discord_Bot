@@ -1163,6 +1163,32 @@ def _len(v: Any) -> int:
 # directly. Coordinates are 1-indexed to match the rest of the engine,
 # but nothing here enforces the grid bounds.
 
+_IMPL_NAME_RE = re.compile(
+    r"(?:FormulaEngine\._namespace\.<locals>\.)?_([a-z][a-z0-9_]*)\(\)")
+
+
+def _runtime_msg(e: BaseException) -> str:
+    """A Python exception's message as a formula author should read it: a
+    wrong-arity call reports `slot_capacity() missing 2 required positional
+    arguments`, not the private `FormulaEngine._namespace.<locals>.
+    _slot_capacity()` it is implemented as."""
+    return _IMPL_NAME_RE.sub(r"\1()", str(e))
+
+
+def _cell_arg(v: Any, fname: str, argname: str) -> int:
+    """int(v) for a cell coordinate, as permissive as a bare int() (numeric
+    strings and floats work), but a bad value names the function and the
+    argument instead of surfacing Python's 'invalid literal for int()'."""
+    if isinstance(v, bool):
+        raise FormulaError(f"{fname}(...): {argname} must be a number, got bool.")
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        raise FormulaError(
+            f"{fname}(...): {argname} must be a number, got "
+            f"{type(v).__name__} ({v!r}).")
+
+
 def _coord_int(v: Any, fname: str, argname: str) -> int:
     """Coerce a coordinate arg to int, rejecting non-numerics. Floats are
     floored (a fractional coordinate snaps to its containing cell)."""
@@ -5580,8 +5606,8 @@ class FormulaEngine:
             """dismount(rider [,x,y]): disembark a rider to (x,y) or the
             nearest free cell. Raises if not mounted / no room. True."""
             try:
-                xi = int(x) if x is not None else None
-                yi = int(y) if y is not None else None
+                xi = _cell_arg(x, "dismount", "x") if x is not None else None
+                yi = _cell_arg(y, "dismount", "y") if y is not None else None
                 match.dismount_entity(_eid(rider), xi, yi)
             except (VTTError, NotFound) as ex:
                 raise FormulaError(str(ex))
@@ -6116,6 +6142,10 @@ class FormulaEngine:
             # bad input); then measure the footprint-aware nearest-cell gap
             # per entity so a large body partly inside the radius counts.
             _distance(x, y, x, y, mode)
+            if isinstance(n, bool) or not isinstance(n, (int, float)):
+                raise FormulaError(
+                    f"entities_in_area(...): n (the radius) must be a number, "
+                    f"got {type(n).__name__}.")
             scored = []
             for eid, e in match.entities.items():
                 if not e.is_alive or e.is_glued_part or e.is_hidden_rider:
@@ -6518,13 +6548,13 @@ class FormulaEngine:
             return None if team is None else str(team)
 
         def _team_sees_cell(team: Any, x: Any, y: Any) -> bool:
-            return match._team_sees(_tm(team), int(x), int(y), los=True)
+            return match._team_sees(_tm(team), _cell_arg(x, "team_sees_cell", "x"), _cell_arg(y, "team_sees_cell", "y"), los=True)
 
         def _team_sees_cell_rangeonly(team: Any, x: Any, y: Any) -> bool:
-            return match._team_sees(_tm(team), int(x), int(y), los=False)
+            return match._team_sees(_tm(team), _cell_arg(x, "team_sees_cell_rangeonly", "x"), _cell_arg(y, "team_sees_cell_rangeonly", "y"), los=False)
 
         def _team_sees_cell_losonly(team: Any, x: Any, y: Any) -> bool:
-            return match._team_has_los(_tm(team), int(x), int(y))
+            return match._team_has_los(_tm(team), _cell_arg(x, "team_sees_cell_losonly", "x"), _cell_arg(y, "team_sees_cell_losonly", "y"))
 
         def _team_sees_entity(team: Any, eid_t: Any) -> bool:
             # Footprint-aware: a large target is seen if ANY of its cells is.
@@ -6537,13 +6567,13 @@ class FormulaEngine:
             return match._team_has_los_entity(_tm(team), _eid(eid_t))
 
         def _can_see(eid_t: Any, x: Any, y: Any) -> bool:
-            return match._entity_sees(_eid(eid_t), int(x), int(y), los=True)
+            return match._entity_sees(_eid(eid_t), _cell_arg(x, "can_see", "x"), _cell_arg(y, "can_see", "y"), los=True)
 
         def _can_see_rangeonly(eid_t: Any, x: Any, y: Any) -> bool:
-            return match.entity_can_see(_eid(eid_t), int(x), int(y))
+            return match.entity_can_see(_eid(eid_t), _cell_arg(x, "can_see_rangeonly", "x"), _cell_arg(y, "can_see_rangeonly", "y"))
 
         def _can_see_losonly(eid_t: Any, x: Any, y: Any) -> bool:
-            return match._entity_has_los(_eid(eid_t), int(x), int(y))
+            return match._entity_has_los(_eid(eid_t), _cell_arg(x, "can_see_losonly", "x"), _cell_arg(y, "can_see_losonly", "y"))
 
         def _has_los(x1: Any, y1: Any, x2: Any, y2: Any,
                      viewer: Any = None) -> bool:
@@ -6551,7 +6581,10 @@ class FormulaEngine:
             two cells? Pass a viewer entity for viewer-conditional opacity
             (without one, such conditions read transparent)."""
             vid = None if viewer is None else _eid(viewer)
-            return match.has_los(vid, int(x1), int(y1), int(x2), int(y2))
+            return match.has_los(vid, _cell_arg(x1, "has_los", "x1"),
+                                 _cell_arg(y1, "has_los", "y1"),
+                                 _cell_arg(x2, "has_los", "x2"),
+                                 _cell_arg(y2, "has_los", "y2"))
 
         ns["team_sees_cell"] = _team_sees_cell
         ns["team_sees_cell_rangeonly"] = _team_sees_cell_rangeonly
@@ -6735,7 +6768,7 @@ class FormulaEngine:
             from action import ActionFail, ActionEngineFault, ChoiceNeeded
             if isinstance(e, (ActionFail, ActionEngineFault, ChoiceNeeded)):
                 raise
-            raise FormulaError(f"Runtime error: {e}")
+            raise FormulaError(f"Runtime error: {_runtime_msg(e)}")
 
     def eval_program(self, src: str, ctx: EvalCtx,
                      *, action_mode: bool = False,
@@ -6818,7 +6851,7 @@ class FormulaEngine:
             from action import ActionFail, ActionEngineFault, ChoiceNeeded
             if isinstance(e, (ActionFail, ActionEngineFault, ChoiceNeeded)):
                 raise
-            raise FormulaError(f"Runtime error: {e}")
+            raise FormulaError(f"Runtime error: {_runtime_msg(e)}")
 
 
 # --- arg-token resolution ($(...) substitution) -----------------------------
