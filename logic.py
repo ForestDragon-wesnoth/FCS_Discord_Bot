@@ -4548,6 +4548,12 @@ class Entity:
         log: List[str] = []
         origin_x, origin_y = self.x, self.y
         for nx, ny, step_facing in step_path:
+            # A hook on an earlier step (a lethal tile/zone, a passive) may
+            # have removed the mover: stop. Walking on would move a detached
+            # unit and fire the remaining cells' hooks for it — a corpse
+            # tripping traps down the rest of the path.
+            if self._match is not m or self.id not in m.entities:
+                return log
             step_from_x, step_from_y = self.x, self.y
             old_cells = m.entity_cells(self, step_from_x, step_from_y)
             new_cells = m.entity_cells(self, nx, ny)
@@ -4574,6 +4580,8 @@ class Entity:
                 log.extend(m.fire_entity_step(
                     self.id, step_from_x, step_from_y, nx, ny,
                 ))
+        if self._match is not m or self.id not in m.entities:
+            return log  # removed by the last step's hooks — no stop/moved hooks
         if fire_hooks and step_path:
             # on_stop fires once per final footprint cell, even if no actual
             # movement happened (zero-step move_dirs) — empty step_path
@@ -14195,9 +14203,15 @@ class Match:
         # per intermediate tile (same as single-entity move_dirs).
         log: List[str] = []
         for eid, path in plans.items():
-            e = self.entities[eid]
+            # An earlier member's hooks may have removed this one (or it
+            # died on a previous step): skip / stop, like move_dirs.
+            e = self.entities.get(eid)
+            if e is None:
+                continue
             origin_x, origin_y = e.x, e.y
             for nx, ny, facing in path:
+                if eid not in self.entities:
+                    break
                 # Footprint-aware per-step hooks (a multi-tile member must
                 # fire tile/zone hooks for EVERY covered cell it vacates /
                 # enters, not just its anchor) — identical to the anchor
@@ -14221,7 +14235,7 @@ class Match:
                     log.extend(self.fire_entity_step(
                         eid, step_from_x, step_from_y, nx, ny,
                     ))
-            if fire_hooks and path:
+            if fire_hooks and path and eid in self.entities:
                 final_cells = self.entity_cells(e, e.x, e.y)
                 log.extend(self.fire_footprint_tile_stop(eid, final_cells))
                 log.extend(self.fire_footprint_zone_stop(eid, final_cells))

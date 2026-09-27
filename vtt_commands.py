@@ -2940,11 +2940,11 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"No swap: `{aid}` and `{bid}` are the same entity "
                 f"or already share a cell."
             )
-        ea = m.entities[aid]; eb = m.entities[bid]
-        msg = (
-            f"Swapped `{aid}` ↔ `{bid}`; now at "
-            f"({ea.x},{ea.y}) and ({eb.x},{eb.y})."
-        )
+        # Movement hooks fire during the swap and can remove either unit.
+        def _at(i):
+            e_ = m.entities.get(i)
+            return f"({e_.x},{e_.y})" if e_ is not None else "(removed by a triggered effect)"
+        msg = f"Swapped `{aid}` ↔ `{bid}`; now at {_at(aid)} and {_at(bid)}."
         if hook_log:
             msg = msg + "\n" + "\n".join(hook_log)
         return await ctx.send(msg)
@@ -3756,8 +3756,16 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "next":
         eid, fire_log = m.next_turn()
         if not eid: return await ctx.send("No turn order yet.")
-        e = m.entities[eid]
+        e = m.entities.get(eid)
         pov = _query_pov(ctx, m)
+        if e is None:
+            # Its own turn-start effects (a lethal DoT tick, an on_turn_start
+            # hook) removed it before the reply was built.
+            out = (f"`{eid[:8]}`'s turn began, and it was removed by its "
+                   f"turn-start effects.")
+            if fire_log:
+                out += "\n" + "\n".join(fire_log)
+            return await ctx.send(out)
         if _pov_hides(m, pov, eid):
             # The reply lands in a channel whose POV can't see the actor.
             out = "It is now an unseen unit's turn."

@@ -15362,3 +15362,33 @@ placed on the occupied cell — the reply now says so ("part `w1` couldn't be
 restored … — dropped") where it used to drop it silently — and w2, which
 followed w1, is re-linked to the head (`'worm'`) instead of following an id
 that was never created.
+
+
+SCENARIO 587 — A unit killed mid-path stops; group moves survive a removed member
+--------------------------------------------------------------------------------
+
+!match new gs GhostSteps 10 10
+!match use gs
+!match var set trips 0
+!tile hook add 2 1 on_enter "entity[self].hp = 0"
+!tile hook add 3 1 on_enter "match_var_set('trips', match_var_get('trips') + 1)"
+!tile hook add 4 1 on_enter "match_var_set('trips', match_var_get('trips') + 1)"
+!ent add a A 10 1 1 5
+!ent move a 4 right
+!match var get trips
+!ent add g1 G 10 1 3 5
+!ent add g2 G 10 1 4 5
+!ent group new grp
+!ent group add grp g1
+!ent group add grp g2
+!tile hook add 2 3 on_enter "remove_entity('g2')"
+!ent move group:grp 1 right
+!list
+
+Expected: A's first step lands on a lethal tile and the death pipeline takes
+it; its remaining steps no longer run, so the two counter tiles further along
+never fire (`trips` = 0). Before, the loop kept walking the detached unit and
+fired every remaining cell's hooks for it (trips = 2 — a corpse tripping traps
+down the path). In the group move, g1's step onto (2,3) removes g2 before g2
+moves; the commit loop now skips the missing member (it used to crash with 💥
+'g2'), and g1 ends at (2,3).
