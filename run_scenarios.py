@@ -59,7 +59,8 @@ _FAILURE_MARKERS = ("💥", "Syntax error")
 # undetected across eleven of its own tests. They're flagged UNLESS a scenario
 # deliberately exercises error handling (a func-deletion test, a rejection
 # test) and opts out with the `HARNESS-ALLOWS-ERRORS` tag in its Expected prose.
-_ERROR_MARKERS = ("❌ Runtime error:", "❌ Unexpected error:")
+_ERROR_MARKERS = ("❌ Runtime error:", "❌ Unexpected error:",
+                  "isn't a valid command (unknown subcommand")
 _ALLOW_ERRORS_TAG = "harness-allows-errors"
 
 

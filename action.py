@@ -176,7 +176,11 @@ def _snapshot_rng(match: "Match") -> Dict[str, Any]:
     global RNG (unseeded) and the match-seeded RNG."""
     import random
     state: Dict[str, Any] = {"global": random.getstate()}
-    rng = getattr(match, "_rng", None)
+    # Build the seeded RNG now if a seed is set, so a body that makes the
+    # first roll of the match still replays it identically.
+    rng = match.formula_rng() if hasattr(match, "formula_rng") else None
+    if rng is random:
+        rng = None
     if rng is not None:
         state["match"] = rng.getstate()
     return state

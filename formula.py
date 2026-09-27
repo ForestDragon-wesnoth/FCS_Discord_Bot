@@ -3128,13 +3128,8 @@ class FormulaEngine:
         # lives on the match and advances across calls (so a SEQUENCE of
         # rolls is deterministic, not every roll identical). It's rebuilt
         # when the seed changes or the match reloads (runtime-only state).
-        seed = self._match.rules.get("random_seed", "") if self._match else ""
-        if seed:
-            rng = getattr(self._match, "_rng", None)
-            if rng is None or getattr(self._match, "_rng_seed", None) != seed:
-                rng = random.Random(seed)
-                self._match._rng = rng
-                self._match._rng_seed = seed
+        rng = self._match.formula_rng() if self._match else random
+        if rng is not random:
             ns["random_int"] = (
                 lambda lo, hi, _r=rng: _random_int_impl(_r, lo, hi)
             )
@@ -3156,7 +3151,7 @@ class FormulaEngine:
             use: the match-seeded random.Random when random_seed is set,
             else the global `random` module. Both honor getstate/setstate,
             so the action choice-replay snapshot covers either."""
-            return getattr(match, "_rng", None) or random
+            return match.formula_rng() if match is not None else random
 
         def _roll_table(spec: Any) -> str:
             """roll_table("a:3,b:2,c") / roll_table({...}): weighted random
@@ -4801,10 +4796,8 @@ class FormulaEngine:
             if not isinstance(cur, dict) or not cur:
                 return None
             keys = list(cur.keys())
-            rng = getattr(self._match, "_rng", None) if self._match else None
-            if rng is not None:
-                return rng.choice(keys)
-            return random.choice(keys)
+            rng = self._match.formula_rng() if self._match else random
+            return rng.choice(keys)
 
         def _var_clear(eid_t: Any, path: Any = "") -> int:
             """var_clear(eid, path=""): drop the contents at `path`.

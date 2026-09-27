@@ -22,9 +22,10 @@ SCENARIO 1 — Setup, formulas, and inline $() substitution
 !ent hp hero "$(entity[self].regen)"
 !eval "entity[hero].hp"
 
-Expected: list shows two entities; sum eval returns 55; min returns 25; the
-$(entity[this].hp * -1 + 5) expression damages Hero by 25 (HP 30 -> 5);
-$(entity[self].regen) then heals by 7 (HP 5 -> 12).
+Expected: list shows two entities, Rogue first (initiative 20 beats Hero's 10, so
+Rogue is the current unit, `this`). The sum eval returns 55; min returns 25.
+$(entity[this].hp * -1 + 5) reads Rogue's hp: -25 + 5 = -20, so Hero takes 20
+(HP 30 -> 10); $(entity[self].regen) then heals by 7 (HP 10 -> 17).
 
 
 SCENARIO 2 — Entity passives + hook firing
@@ -50,10 +51,10 @@ SCENARIO 2 — Entity passives + hook firing
 !passive remove hero regen
 !passive list hero
 
-Expected: stamina starts at 5. First !turn next fires on_round_start +
-on_turn_start (regen 5 -> 15). Second !turn next is Rogue's turn (no regen,
-still 15). Third !turn next is Hero again (15 -> 25). After remove, list
-reports no passives.
+Expected: stamina starts at 5. Rogue (initiative 20) opens round 1, so the first
+!turn next fires only Rogue's turn start (stamina stays 5). The second is
+Hero's turn (regen 5 -> 15). The third is Rogue's again (still 15). After
+remove, list reports no passives.
 
 
 SCENARIO 3 — Global passives + buggy passive isolation
@@ -77,10 +78,11 @@ SCENARIO 3 — Global passives + buggy passive isolation
 !passive remove hero broken
 !gpassive list
 
-Expected: First !turn next applies gas to both (Hero 30 -> 29, Rogue 25 ->
-24). The broken passive fires on Hero's next turn and shows a "CRASHED"
-log line, but Hero's hp is unaffected and the turn cycle continues
-normally. Final gpassive list reports none.
+Expected: First !turn next applies gas to both (Hero 30 -> 29, Rogue 25 -> 24);
+Rogue opens the round. The broken passive fires on Hero's turn (the second
+!turn next) and shows a "FAILED" log line, but Hero's hp is unaffected and the
+turn cycle continues normally. The third !turn next opens round 2 (gas again,
+Hero 28). Final gpassive list reports none.
 
 
 SCENARIO 4 — Custom entity_line_format
@@ -709,10 +711,9 @@ SCENARIO 30 — Match info and deletion
 !match delete doomed
 !match list
 
-Expected: !match info shows the match's grid size, current system,
-turn order, and active entity. After !match delete, the match is gone
-from !match list. (Note: if the match was active in this channel, the
-channel no longer has an active match.)
+Expected: !match info summarises the channel's match: system, grid size, round,
+whose turn it is (not started yet), fog and owner. After !match delete, the
+match is gone from !match list (the channel no longer has an active match).
 
 
 SCENARIO 31 — Listing available systems and their rules
@@ -848,13 +849,13 @@ SCENARIO 39 — Entity facing direction
 !match use face39
 !ent add hero Hero 30 4 4 10
 !ent info hero
-!ent set_facing hero left
+!ent face hero left
 !ent info hero
-!ent set_facing hero down
+!ent face hero down
 !ent info hero
 
 Expected: Initial facing is set by spawn rules (typically toward map
-center). After !ent set_facing, the facing updates to the specified
+center). After !ent face, the facing updates to the specified
 direction (up/down/left/right).
 
 
@@ -884,8 +885,8 @@ SCENARIO 41 — Entity team assignment
 !match use team41
 !ent add ally Ally 30 1 1 10
 !ent add enemy Enemy 25 6 6 8
-!ent team ally blue
-!ent team enemy red
+!ent set_var ally team blue
+!ent set_var enemy team red
 !ent info ally
 !ent info enemy
 
@@ -917,12 +918,10 @@ SCENARIO 43 — Listing all vars on an entity
 !ent set_var hero mana 50
 !ent set_var hero inventory.gold 100
 !ent set_var hero inventory.gems 3
-!ent list_vars hero
 !ent dump hero
 
-Expected: !ent list_vars enumerates the top-level keys. !ent dump shows
-the full JSON tree including nested structure (inventory.gold,
-inventory.gems).
+Expected: !ent dump shows the full JSON tree including nested structure
+(inventory.gold, inventory.gems).
 
 
 ===============================================================================
@@ -1451,8 +1450,9 @@ Expected: Note this uses on_var_write_attempt because we want to react
 even when the resulting hp is unchanged. The passive doesn't actually
 prevent hp loss (that would need write modification, deferred). It just
 drains shield in parallel: first damage drops shield 20→5 and hp 30→15;
-second damage drops shield 5→0 and hp 15→0. For full damage prevention,
-wait for the damage system / write modification feature.
+second damage drops shield 5→0 and hp 15→0, which meets the default death
+condition — Hero dies and the last `!ent info` reports it not found. For full
+damage prevention, compose absorb_damage / shield pools instead.
 
 
 SCENARIO 71 — Cooldown timer on a special ability
@@ -1484,17 +1484,20 @@ SCENARIO 72 — Death save: when hp hits 0, roll a save (counter)
 !ent add hero Hero 30 3 3 10
 !ent set_var hero death_saves 0
 !ent set_var hero status_downed 0
+!ent set_var hero __death_mode replace
+!ent set_var hero __death_condition "entity[self].death_saves >= 3"
 !passive add hero on_dying on_var_changed target=hp scope=exact "if new_value <= 0 and entity[self].status_downed == 0:\n    entity[self].status_downed = 1\n    entity[self].hp = 0"
 !ent hp hero -50
 !ent info hero
 !ent hp hero -5
 !ent info hero
 
-Expected: First massive damage brings hp to 0 (it would have gone
-negative but the passive forces it to 0 and sets status_downed). Second
-damage: hp is already 0, the conditional doesn't trigger again
-(status_downed == 1). The GM can now adjudicate death-save rolls
-externally and write back to hp/status_downed.
+Expected: The hero's own death condition replaces the default (`__death_mode
+replace`, `__death_condition` = three failed saves), so hp 0 downs it without
+killing it. The massive damage would take hp to -20; the passive forces it to 0
+and sets status_downed. Second damage: status_downed is already 1, so the
+passive doesn't fire again and hp drops to -5. The GM adjudicates death-save
+rolls externally by writing death_saves; the third failure kills.
 
 
 SCENARIO 73 — Mana cost validation via formula in $()
@@ -1584,9 +1587,9 @@ SCENARIO 77 — Aura: global passive applies to every entity each round
 !ent add ally Ally 25 2 2 8
 !ent add enemy Enemy 30 5 5 12
 !gpassive add inspiring_aura on_round_start "if entity[self].team == \"blue\":\n    entity[self].morale_bonus = 2\nelse:\n    entity[self].morale_bonus = 0"
-!ent team hero blue
-!ent team ally blue
-!ent team enemy red
+!ent set_var hero team blue
+!ent set_var ally team blue
+!ent set_var enemy team red
 !turn next
 !ent info hero
 !ent info ally
@@ -1673,12 +1676,14 @@ SCENARIO 81 — Counter-attack: when you dodge, you hit back
 !turn next
 !list
 !ent set_var hero counter_damage 7
+!ent set_var hero last_dodge 0
 !passive add hero counter_strike on_var_changed target=last_dodge scope=exact "if new_value == 1:\n    entity[this].hp = entity[this].hp - entity[self].counter_damage\n    entity[self].last_dodge = 0"
 !ent set_var hero last_dodge 1
 !ent info foe
 
-Expected: When the GM signals a dodge by setting last_dodge=1, the
-passive fires: applies counter_damage to "this" (the current turn entity
+Expected: last_dodge starts at 0 (on_var_changed fires on a CHANGE, not on
+the var's creation, so the var has to exist first). When the GM signals a
+dodge by setting last_dodge=1, the passive fires: applies counter_damage to "this" (the current turn entity
 = foe), then resets last_dodge so the passive doesn't loop. Foe takes 7
 damage from the counter.
 
@@ -2053,7 +2058,7 @@ SCENARIO 102 — Conditional template section appears only when populated
 !match use tmpl102
 !ent add hero Hero 30 3 3 10
 !ent add ally Ally 25 5 5 8
-!ent team ally blue
+!ent set_var ally team blue
 !system set default entity_line_format "{name}{?team?} ({team}){/?}: {hp}hp"
 !list
 
@@ -2100,7 +2105,7 @@ SCENARIO 105 — Multi-line entity_info_format
 !ent set_var hero stats.str 14
 !system set default entity_info_format "**{name}** L{level}\nHP: {hp}/{max_hp}\nSTR: {stats.str}{?team?}\nTeam: {team}{/?}"
 !ent info hero
-!ent team hero blue
+!ent set_var hero team blue
 !ent info hero
 
 Expected: !ent info shows a 3-line card initially. After setting the
@@ -2451,7 +2456,8 @@ SCENARIO 127 — String concatenation
 !match new str127 Strings 6 6
 !match use str127
 !ent add hero Hero 30 3 3 10
-!eval "\"Hello, \" + entity[hero].name"
+!ent set_var hero title Hero
+!eval "\"Hello, \" + entity[hero].title"
 
 Expected: Returns "Hello, Hero".
 
@@ -2603,9 +2609,9 @@ SCENARIO 135 — Heal-on-kill: when enemy hp hits 0, allies heal
 !match new hok135 HealKill 6 6
 !match use hok135
 !ent add hero Hero 30 1 1 10
-!ent team hero blue
+!ent set_var hero team blue
 !ent add foe Foe 20 5 5 20
-!ent team foe red
+!ent set_var foe team red
 !gpassive add heal_on_kill on_var_changed target=hp scope=exact "if new_value <= 0 and entity[self].team != entity[this].team and entity[this].team == \"blue\":\n    entity[this].hp = entity[this].hp + 5"
 !turn next
 !ent set_var hero hp 15
@@ -2613,13 +2619,13 @@ SCENARIO 135 — Heal-on-kill: when enemy hp hits 0, allies heal
 !ent info hero
 !ent info foe
 
-Expected: Foe is current (init=20). Hero damages foe; foe.hp drops to
--5 (or 0 depending on min clamp). The heal_on_kill global fires with
-self=foe and this=foe (since on_var_changed fires for the entity whose
-var changed, "this" is the current-turn entity)... actually wait, the
-intent here is to heal the OPPOSING team's ally. The model would need
-an attacker concept. For now this scenario demonstrates the conditional
-syntax but the actual mechanic needs the future damage system.
+Expected: Foe (initiative 20) opens the round, so `this` = foe. The global
+passive fires on each hp change, but in a var hook `self` is also the
+current-turn unit (foe), so `entity[self].team != entity[this].team` is never
+true and nobody is healed: Hero stays at 15, and the -25 kills Foe (its
+`!ent info` reports it not found). Healing the killer's allies needs an
+attacker binding, which var hooks don't carry; an on_death passive that reads
+the killer from a var the attack wrote is the composable route.
 
 
 SCENARIO 136 — Stack count with cap
@@ -3368,15 +3374,13 @@ SCENARIO 168 — self_id/current_id and group-gated passive
 !eval "entity[b].sworn_tick"
 !eval "current_id()"
 
-Expected: B is in the 'sworn' group; the passive ticks on every
-B-turn. Turn order is [b, a] (B's init=11 > A's init=10) but the
-active index sticks to the first-spawned entity, so the cycle here
-runs A → B → A, with B ticking once and A's turns not firing the
-passive at all. sworn_tick is 1 after the three turn-nexts. After
-group_remove, the passive still fires on B's turn but group_has
-returns False, so the ternary contributes 0 — sworn_tick stays at 1.
-current_id() returns whichever entity's turn it is at the time of
-the eval; in the final call it's A.
+Expected: B is in the 'sworn' group; the passive ticks on every B-turn. Turn
+order is [b, a] (B's init=11 > A's init=10), and B opens round 1. The three
+turn-nexts run B → A → B, so sworn_tick is 2. After group_remove, the passive
+still fires on B's turn but group_has returns False, so the ternary
+contributes 0 — sworn_tick stays at 2 after A's and B's next turns.
+current_id() returns whichever entity's turn it is at the time of the eval; in
+the final call it's B.
 
 
 SCENARIO 169 — Autosaves, manual save, and silent command undo
@@ -3398,16 +3402,14 @@ SCENARIO 169 — Autosaves, manual save, and silent command undo
 !history undo command
 !ent info a
 
-Expected: Three turn-nexts open round 1 (A's turn) and advance into
-round 2 (B then A) thanks to the spawn-order quirk that puts A at
-active_index=1 initially. By that point the history holds 2 round
-snapshots and 3 turn snapshots. !ent hp -7 creates a command
-snapshot of the pre-damage state, then the manual save bookmarks
-the post-7-damage state. A second -7 brings A to 16 HP. !ent info
-is read-only — no extra command snapshot appears. !history list
-commands shows just the two -7 commands. `undo command` is below
-every confirmation threshold (default command threshold is -1 =
-never prompts), so it executes silently, reverting A back to 23 HP.
+Expected: Three turn-nexts open round 1 (B, initiative 11), then A, then
+round 2 (B). By that point the history holds 2 round snapshots and 3 turn
+snapshots. !ent hp -7 creates a command snapshot of the pre-damage state, then
+the manual save bookmarks the post-7-damage state. A second -7 brings A to 16
+HP. !ent info is read-only — no extra command snapshot appears. !history list
+commands shows just the two -7 commands. `undo command` is below every
+confirmation threshold (default command threshold is -1 = never prompts), so it
+executes silently, reverting A back to 23 HP.
 
 
 SCENARIO 170 — Confirmation thresholds for destructive undos
@@ -3473,14 +3475,13 @@ SCENARIO 171 — Retention pruning of turn autosaves
 !turn next
 !history list
 
-Expected: The first match uses default rules (turn retention = 3
-rounds). After 8 turn-nexts it's deep into round 5; the turn
-snapshot list spans only the most recent 3 rounds (rounds 3-5, so
-roughly 5 entries depending on how many turns each round held).
-Round snapshots are unlimited so all 5 are still there. The second
-match uses a custom system with autosave_turn_retention_rounds=1;
-after 4 turn-nexts only the current round's turn snapshots survive,
-demonstrating that the rule is per-system and per-match.
+Expected: The first match uses default rules (turn retention = 3 rounds).
+After 8 turn-nexts (B then A each round) it is in round 4; the turn snapshot
+list spans only the most recent 3 rounds (rounds 2-4, 6 entries). Round
+snapshots are unlimited so all 4 are still there. The second match uses a
+custom system with autosave_turn_retention_rounds=1; after 4 turn-nexts (round
+2) only the current round's 2 turn snapshots survive, demonstrating that the
+rule is per-system and per-match.
 
 
 SCENARIO 172 — Snapshot export and import as a manual save
@@ -3726,35 +3727,23 @@ SCENARIO 177 — Friendly-fire damage aura via a team check inside a global pass
 !ent info archer
 !ent info goblin
 
-Expected: The `aura` global passive runs on_round_start, which fires
-for EVERY entity in turn-order (unlike on_turn_start which fires
-only for the entity whose turn just began). For each fire the
-formula inspects the team of the entity it's being applied to
-(entity[self].team) versus the team of whoever's turn it is right
-then (entity[this].team). When the teams differ the entity takes 5
-damage; when they match the formula evaluates to the entity's
+Expected: The `aura` global passive runs on_round_start, which fires for
+EVERY entity in turn-order (unlike on_turn_start which fires only for the
+entity whose turn just began). For each fire the formula inspects the team of
+the entity it's being applied to (entity[self].team) versus the team of
+whoever's turn it is right then (entity[this].team). When the teams differ the
+entity takes 5 damage; when they match the formula evaluates to the entity's
 current hp (a no-op write).
-
-Turn order is sorted by initiative descending: [Goblin (12), Archer
-(11), Knight (10)]. Match.active_index starts at the last-spawned
-entity, so the first turn-next opens round 1 with this=knight. The
-on_round_start hook fires once per entity:
-  - Goblin (horde) != knight (alliance) → Goblin loses 5
-  - Archer & Knight (alliance) == knight (alliance) → no damage
-After turn-next #1: Goblin 25/30, Archer 30/30, Knight 30/30.
-
-The next three turn-nexts advance through the turn cycle. Turn-next
-#2 wraps the active_index past the end, firing on_round_end /
-on_round_start for round 2 — and on this round this=goblin (the
-new round-opener). The aura fires again per entity:
+Turn order is sorted by initiative descending: [Goblin (12), Archer (11),
+Knight (10)], and Goblin opens each round, so `this` = goblin whenever the
+aura fires:
   - Knight & Archer (alliance) != goblin (horde) → each loses 5
   - Goblin (horde) == goblin → no damage
-Turn-nexts #3 and #4 stay inside round 2 (no wrap, no
-on_round_start), so the totals don't move further.
-After turn-next #4: Goblin 25/30, Archer 25/30, Knight 25/30 —
-exactly the symmetric cross-team damage you'd expect over the
-course of two rounds.
-
+After turn-next #1: Knight 25/30, Archer 25/30, Goblin 30/30. Turn-nexts #2
+and #3 stay inside round 1; #4 wraps into round 2 and the aura fires again the
+same way: Knight 20/30, Archer 20/30, Goblin 30/30. The damage is one-sided
+because the round opener is always the goblin — the aura keys on whoever holds
+the turn, so an "enemies of the current unit" aura favours the fastest side.
 This wouldn't have been expressible before — team was a Python-only
 dataclass field, invisible to the formula engine. Putting it in
 vars makes it a first-class part of the formula vocabulary, which
@@ -5700,7 +5689,7 @@ SCENARIO 234 — Seedable RNG: reproducible roll sequences
 !eval "random_int(1, 1000)"
 !eval "random_int(1, 1000)"
 !eval "random_int(1, 1000)"
-!system set default random_seed
+!system set default random_seed ""
 
 Expected: With the `random_seed` rule set to a non-empty value, the
 match's formula RNG becomes deterministic — each match seeded with
@@ -5709,7 +5698,7 @@ rolls in Seeded1 exactly match the three rolls in Seeded2
 (same seed "encounter42", same call order). The RNG advances across
 calls (the three rolls within a match differ from each other — it's
 a reproducible SEQUENCE, not a stuck value). The trailing
-`!system set default random_seed` with no value clears the seed
+`!system set default random_seed ""` (an empty value) clears the seed
 back to unseeded (independent rolls) so later scenarios aren't
 affected. (Test note: because the two matches share the same seed
 and the same number of prior rolls, their roll lists are equal —
@@ -5729,7 +5718,7 @@ SCENARIO 235 — Seedable RNG: random_string and reseeding on change
 !match use mseed4
 !eval "random_string('n', 's', 'e', 'w')"
 !eval "random_string('n', 's', 'e', 'w')"
-!system set default random_seed
+!system set default random_seed ""
 
 Expected: Seeding applies to `random_string` too — Seeded3 and
 Seeded4 (same seed "alpha", same call order) draw the same two
@@ -7181,10 +7170,10 @@ SCENARIO 282 — Action body locals + control flow + args proxy
 !action hero shoot target1 crit=true
 !ent dump target1
 
-Expected: First call: raw = 4 + 3 = 7, no crit branch -> hp
-drops 20 -> 13. Second call: raw = 7, crit branch doubles to
-14 -> hp drops 13 -> -1. This proves locals (`raw = ...`)
-work, control flow (`if args.crit: ...`) routes correctly, and
+Expected: First call: raw = 4 + 3 = 7, no crit branch -> hp drops 20 -> 13.
+Second call: raw = 7, crit branch doubles to 14 -> hp drops 13 -> -1, which
+kills target1 (the last `!ent dump` reports it not found). This proves locals
+(`raw = ...`) work, control flow (`if args.crit: ...`) routes correctly, and
 args.<key> attribute access reads through the ArgsProxy.
 
 
@@ -11553,7 +11542,7 @@ SCENARIO 451 — Status resistance / immunity: source-gated, level-reducing
 !eval "status_resist_of('knight', 'poison')"
 !status apply knight poison 5 4
 !eval "status_get('knight', 'poison', 'level')"
-!ent add squire Squire 30 7 7 5
+!ent add squire Squire 30 7 5 5
 !ent set_var squire equipped.ring.status_resist.poison 5
 !status apply squire poison 2 3
 !eval "status_has('squire', 'poison')"
@@ -13446,11 +13435,13 @@ SCENARIO 523 — A lethal status tick stops the entity's remaining statuses from
 !ent add other O 30 5 5 5
 !turn next
 !turn next
+!turn next
 !eval "var_get('w', 'marks')"
 
-Expected: Victim carries two turn_end statuses — `lethal` (applied first, so it
+Expected: All three share initiative 5, so the order is O, Victim, Wit (name
+tiebreak). Victim carries two turn_end statuses — `lethal` (applied first, so it
 ticks first) deals 999 and kills/removes Victim, and `marker` (would mark the
-witness). When Victim's turn_end fires, `lethal` removes it; `marker` must NOT
+witness). The third `!turn next` ends Victim's turn. When Victim's turn_end fires, `lethal` removes it; `marker` must NOT
 tick from beyond the grave, so the witness stays at marks=0. Before the fix
 fire_status_tick snapshotted only the status NAMES and never re-checked the
 entity still existed, so `marker` ghost-ticked on the removed entity (marks=1,
@@ -13829,9 +13820,10 @@ unaffected (the overlay emission is verified headlessly, not via `!map`).
 SCENARIO 536 — !roll: chat dice roller (total + individual dice)
 --------------------------------------------------------------------------------
 
-!match new rl Roll 6 6
-!match use rl
+!system new rl
 !system set rl random_seed 7
+!match new rl Roll 6 6 rl
+!match use rl
 !roll 2d6+3
 !roll d20
 !roll 4d6kh3
@@ -13876,10 +13868,10 @@ SCENARIO 538 — !find show/sort columns
 --------------------------------------------------------------------------------
 
 !match new fc FindCols 8 8
+!match use fc
 !ent add a Aaa 30 2 2 5
 !ent add b Bbb 30 4 4 5
 !ent add c Ccc 30 6 6 5
-!match use fc
 !ent set_var a team red
 !ent set_var b team red
 !ent set_var c team red
@@ -13899,14 +13891,15 @@ predicates are unaffected.
 SCENARIO 539 — Named random tables: !table def/roll/list/show + table_roll()
 --------------------------------------------------------------------------------
 
-!match new tb Tables 5 5
-!match use tb
+!system new tb
 !system set tb random_seed 4
+!match new tb Tables 5 5 tb
+!match use tb
 !table def loot sword:1,shield:1,gold:5
 !table roll loot
 !table list
 !table show loot
-!eval table_roll("loot")
+!eval "table_roll('loot')"
 !table def bad x:-1
 !table remove loot
 !table roll loot
@@ -13949,9 +13942,10 @@ active reveals; `clear` drops them. Reveals are per-team, serialized, host-gated
 SCENARIO 541 — Inline $() args: read-only math/dice/reads across commands
 --------------------------------------------------------------------------------
 
-!match new ia InlineArgs 12 12
-!match use ia
+!system new ia
 !system set ia random_seed 5
+!match new ia InlineArgs 12 12 ia
+!match use ia
 !ent add boss Boss 100 5 5 5
 !ent add goblin Goblin 30 6 6 5
 !dist $(2+3) $(1+1) 10 10
@@ -14007,20 +14001,21 @@ that makes inline args usable.
 SCENARIO 543 — Inline $() args: per-line in macro + ent self-handling
 --------------------------------------------------------------------------------
 
-!match new ml MacroArgs 10 10
-!match use ml
+!system new ml
 !system set ml random_seed 9
+!match new ml MacroArgs 10 10 ml
+!match use ml
 !ent add goblin Goblin 30 4 4 5
-!macro def zap ent hp $1 $(0-4)
+!macro set zap ent hp $1 $(0-4)
 !macro run zap goblin
-!macro def measure dist $(1+1) 1 5 5
+!macro set measure dist $(1+1) 1 5 5
 !macro run measure
 !batch dist $(2+2) 1 6 6 ; ent hp goblin $(0-1)
 
 Expected: `$(...)` resolves PER LINE inside a macro / batch (dispatch_no_snapshot
-applies the same read-only gate per sub-command). `!macro def zap ent hp $1
+applies the same read-only gate per sub-command). `!macro set zap ent hp $1
 $(0-4)` then `!macro run zap goblin` substitutes $1→goblin and the inner `ent hp
-goblin $(0-4)` runs (ent self-handles the $(): -4 damage). `!macro def measure
+goblin $(0-4)` runs (ent self-handles the $(): -4 damage). `!macro set measure
 dist $(1+1) 1 5 5` shows the dispatcher substituting a non-ent inner command's
 $() per run. `!batch ... ; ...` likewise substitutes each sub-command's $().
 ent stays raw_args (its own substitution), non-ent inner commands use the
@@ -14549,7 +14544,6 @@ SCENARIO 563 — snapshots copy turn_order (no retroactive corruption)
 !ent add a A 40 1 1 12
 !ent add b B 40 3 3 9
 !ent add c C 40 5 5 6
-!turn start
 !turn next
 !turn next
 !ent remove a
@@ -15585,3 +15579,31 @@ red in `!team list`, reads red's supply (3), and is refused blue's ("team
 omniscient view the player reads blue's supply (9). On a match whose system
 sets `host`, the player's `!team list` says team data is host-only and `get`
 is refused; the host reads red's supply.
+
+
+SCENARIO 594 — Turn order: the fastest unit opens; a unit killed on its turn doesn't cost the next one theirs
+--------------------------------------------------------------------------------
+
+!match new to TurnOpen 8 8
+!match use to
+!ent add slow Slow 10 1 1 5
+!ent add fast Fast 10 2 1 30
+!ent add mid Mid 10 3 1 15
+!gpassive add ended on_turn_end "entity[self].ends = var_get(self_id(), 'ends', 0) + 1"
+!turn next
+!ent hp fast -99
+!turn next
+!eval "var_get('mid', 'ends', 0)"
+!turn next
+!ent hp slow -99
+!turn next
+!match_toplevel
+
+Expected: Slow is added first, but Fast (initiative 30) opens round 1 — the
+order's top. Before, the pointer stayed on whichever unit was added first, so
+Slow took the first turn. Fast is killed during its own turn. The next
+`!turn next` goes to Mid (the unit after Fast), and Mid's on_turn_end has not
+fired (`ends` = 0). Before, the removal shifted the pointer onto Mid and the
+advance then skipped it: Mid's turn-end fired although it never acted, and Slow
+got the turn. Mid's turn then passes to Slow. Slow dies during its turn, and it
+was last in the round, so the next `!turn next` wraps: round 2 opens with Mid.

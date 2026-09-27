@@ -4405,7 +4405,18 @@ class Entity:
         if self.id in m.turn_order:
             idx = m.turn_order.index(self.id)
             m.turn_order.remove(self.id)
-            if m.active_index >= len(m.turn_order):
+            if m.round_started and idx == m.active_index:
+                # The unit whose turn it is is gone. The next unit in the
+                # order now sits at active_index — or, if it was last, the
+                # next turn opens a new round from the top. next_turn reads
+                # this so it neither fires the gone actor's turn-end on
+                # someone else nor advances past the next unit.
+                if idx < len(m.turn_order):
+                    m.turn_vacated = "same"
+                else:
+                    m.turn_vacated = "wrap"
+                    m.active_index = 0
+            elif m.active_index >= len(m.turn_order):
                 m.active_index = max(0, len(m.turn_order) - 1)
             elif m.active_index > idx:
                 m.active_index = max(0, m.active_index - 1)
@@ -5183,6 +5194,13 @@ class Match:
     # make that first call begin the round (fire start-hooks for active_index)
     # rather than advance past entity 0.
     round_started: bool = False
+    # Set when the unit whose turn it is gets removed mid-turn (death,
+    # despawn): "same" = the next unit in this round now sits at
+    # active_index; "wrap" = the removed unit was last, so the next turn opens
+    # a new round. next_turn then skips the gone actor's turn-end and starts
+    # the next unit's turn without advancing past it. None otherwise.
+    # Serialized, so an undo or reload keeps it.
+    turn_vacated: Optional[str] = None
     # Game system binding - currently NOT YET DIRECTLY CONNECTED TO A GAMESYSTEM CLASS, JUST COPYING THE DICTIONARY OF RULES FROM IT.
     rules: Dict[str, Any] = field(default_factory=dict)  # denormalized copy for fast access
 
@@ -5514,8 +5532,8 @@ class Match:
     # nothing was deferred). Cleared at every successful rebuild.
     _turn_order_dirty: bool = field(default=False, repr=False)
 
-    # Runtime-only seeded RNG for formulas, lazily built by the formula
-    # engine when the random_seed rule is non-empty. Not serialized: the
+    # Runtime-only seeded RNG, built by formula_rng() on first use when the
+    # random_seed rule is non-empty. Not serialized: the
     # seed (a rule) is saved, but the live cursor position is not — a
     # reloaded match reseeds from scratch. _rng_seed tracks which seed
     # _rng was built with so a seed change triggers a rebuild.
@@ -8919,6 +8937,23 @@ class Match:
 
     # ------------- turns -------------
 
+    def formula_rng(self):
+        """The match's RNG: a random.Random seeded from the random_seed rule
+        (built on first use, rebuilt when the seed changes), or the global
+        `random` module when unseeded. Every roll goes through here —
+        formulas, !roll, !table roll, damage_spread — so a seed holds from
+        the first roll. (It used to be built only when a formula engine
+        started, so a !roll before any formula ignored the seed.)"""
+        seed = self.rules.get("random_seed", "")
+        if not seed:
+            self._rng = None
+            self._rng_seed = None
+            return random
+        if self._rng is None or self._rng_seed != seed:
+            self._rng = random.Random(seed)
+            self._rng_seed = seed
+        return self._rng
+
     def _rebuild_turn_order(self):
         """Sort the alive, initiative-bearing entities into `self.turn_order`
         according to the active rules. Preserves the currently-acting
@@ -9077,7 +9112,12 @@ class Match:
                 ordered = [m for _, _, members, _ in interleaved_entries for m in members]
             self.turn_order = [e.id for e in ordered]
 
-        if prev_current_id and prev_current_id in self.turn_order:
+        # Before the first turn nobody is acting yet, so the order's top
+        # opens the match. Keeping the pointer on whoever happened to be
+        # added first handed round 1 to them even when a faster unit
+        # joined afterwards.
+        if (self.round_started and prev_current_id
+                and prev_current_id in self.turn_order):
             self.active_index = self.turn_order.index(prev_current_id)
         else:
             self.active_index = 0
@@ -9197,22 +9237,34 @@ class Match:
             self._begin_turn()
             return (cur, log)
 
-        # Normal transition.
-        cur = self.turn_order[self.active_index]
-        log.extend(self.fire_status_tick("turn_end"))
-        log.extend(self.fire_tile_time_hooks("on_turn_end"))
-        log.extend(self.fire_zone_time_hooks("on_turn_end"))
-        log.extend(self.fire_hook(
-            "on_turn_end", target_ids=[cur],
-            own_only_targets=self._attached_tick_parts([cur])))
+        # Normal transition. If the acting unit was removed mid-turn, its
+        # turn-end surface has nothing to fire on (the unit now at
+        # active_index hasn't had its turn yet).
+        if not self.turn_vacated:
+            cur = self.turn_order[self.active_index]
+            log.extend(self.fire_status_tick("turn_end"))
+            log.extend(self.fire_tile_time_hooks("on_turn_end"))
+            log.extend(self.fire_zone_time_hooks("on_turn_end"))
+            log.extend(self.fire_hook(
+                "on_turn_end", target_ids=[cur],
+                own_only_targets=self._attached_tick_parts([cur])))
         # A turn_end hook/tick may have removed the last entity (e.g. a
         # lethal DoT — directly, or routed to a parent via a part tick).
         # With no one left, end here rather than advancing into an empty
         # turn order.
         if not self.turn_order:
+            self.turn_vacated = None
             self._begin_turn()
             return (None, log)
-        self._advance_index(log)
+        # The actor may also have died at its own turn end.
+        vacated, self.turn_vacated = self.turn_vacated, None
+        if vacated == "same":
+            pass    # the next unit already sits at active_index
+        elif vacated == "wrap":
+            self.active_index = len(self.turn_order) - 1
+            self._advance_index(log)
+        else:
+            self._advance_index(log)
         # _advance_index's round-wrap hooks (on_round_end/start ticks) can
         # likewise empty the order; re-check before reading the next entity.
         if not self.turn_order:
@@ -9236,6 +9288,17 @@ class Match:
 
         Returns the unit whose turn it now is, or None when the order is
         empty."""
+        # A round hook on the way here may have removed the unit that was
+        # about to act: the next one already sits at active_index ("same"),
+        # or the order has to wrap ("wrap"). Either way the turn starts
+        # below; the marker must not linger into the next transition.
+        vacated, self.turn_vacated = self.turn_vacated, None
+        if vacated == "wrap" and self.turn_order:
+            self.active_index = len(self.turn_order) - 1
+            self._advance_index(log)
+            self.turn_vacated = None
+            if not self.turn_order:
+                return None
         guard = len(self.turn_order) + 1
         while True:
             # Skip over any entity carrying a skip-status flag. Its internal
@@ -9265,6 +9328,7 @@ class Match:
             if e is not None and e.is_alive:
                 return cur
             if not self.turn_order:
+                self.turn_vacated = None
                 log.append(f"💀 `{cur}` died at the start of its turn; "
                            f"no one is left to take the turn.")
                 return None
@@ -9278,6 +9342,17 @@ class Match:
                 return cur
             log.append(f"💀 `{cur}` died at the start of its turn; the turn "
                        f"passes to the next unit.")
+            vacated, self.turn_vacated = self.turn_vacated, None
+            if vacated == "same":
+                continue    # the next unit already sits at active_index
+            if vacated == "wrap":
+                self.active_index = len(self.turn_order) - 1
+                self._advance_index(log)
+                if not self.turn_order:
+                    return None
+                continue
+            # Dead but still in the order (an alive_condition that disagrees
+            # with the death pipeline): find the unit after it by hand.
             # The next unit is the first one after the dead unit (in the
             # order as it stood when its turn began) that's still in the
             # order. None left after it → the round wraps to the top.
@@ -9468,7 +9543,9 @@ class Match:
         # turn_end for the outgoing actor (active_index still points at it).
         # If its turn was skipped, only its status ticks fire (decay), not
         # its action surface (act=not _atb_last_skipped).
-        if self.round_started and 0 <= self.active_index < len(self.turn_order):
+        vacated, self.turn_vacated = self.turn_vacated, None
+        if (self.round_started and not vacated
+                and 0 <= self.active_index < len(self.turn_order)):
             cur = self.turn_order[self.active_index]
             if cur in self.entities:
                 log.extend(self._atb_turn_phase(
@@ -9496,6 +9573,9 @@ class Match:
             # turn_start for the new actor (active_index now points at it).
             log.extend(self._atb_turn_phase(
                 new_cur, "turn_start", act=not skipping))
+            # ATB selects by charge bar; the vacated marker a death set is
+            # not needed here.
+            self.turn_vacated = None
             e = self.entities.get(new_cur)
             if e is not None and e.is_alive:
                 break
@@ -11599,7 +11679,7 @@ class Match:
             n = max(1, n)
             weighted = [(p, self._part_aoe_weight(p)) for p in parts]
             wsum = sum(w for _p, w in weighted)
-            rng = getattr(self, "_rng", None) or random
+            rng = self.formula_rng()
             per = total // n
             rem = total - per * n      # give the remainder to the first frags
             for i in range(n):
@@ -12900,6 +12980,7 @@ class Match:
             "round_number": self.round_number,
             "turns_elapsed": self.turns_elapsed,
             "round_started": self.round_started,
+            "turn_vacated": self.turn_vacated,
             "global_passives": {pid: p.to_dict() for pid, p in self.global_passives.items()},
             "groups": {name: list(members) for name, members in self.groups.items()},
             # Tile keys are tuples internally; JSON object keys must be
@@ -13010,6 +13091,8 @@ class Match:
         m.round_number = int(d.get("round_number", 1))
         m.turns_elapsed = int(d.get("turns_elapsed", 0))
         m.round_started = bool(d.get("round_started", False))
+        m.turn_vacated = d.get("turn_vacated") if d.get("turn_vacated") in (
+            "same", "wrap") else None
         m.global_passives = {
             pid: Passive.from_dict(pd)
             for pid, pd in (d.get("global_passives", {}) or {}).items()

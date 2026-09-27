@@ -127,7 +127,7 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
     "gpassive":   frozenset({"list", "info"}),
     "history":    frozenset({"list", "diff"}),
     "macro":      frozenset({"list"}),
-    "match":      frozenset({"channels", "hosts", "outcome"}),
+    "match":      frozenset({"channels", "hosts", "outcome", "list", "info"}),
     "mount":      frozenset({"list", "info"}),
     # `info` is NOT here: it prints the part's full var JSON — what `!ent
     # dump` is host-gated to hide.
@@ -1037,6 +1037,20 @@ def active_match(mgr: MatchManager, ctx: ReplyContext):
     return mgr.get(mid)
 
 #boilerplate code for returning if not enough arguments for a command/subcommand were sent
+
+async def _help_fallback(ctx: ReplyContext, path: List[str],
+                         token: Optional[str]):
+    """The end-of-handler fallback: show `path`'s help. With a `token`
+    (the word the handler didn't recognise) it leads with an error naming
+    it — a typo'd or removed subcommand used to print only the help, which
+    read like success and let scripts and scenarios fail silently."""
+    title, body = registry.help_for(path)
+    if token is None:
+        return await ctx.send(f"**{title}**\n{body}")
+    return await ctx.send(
+        f"❌ `!{' '.join(path)} {token}` isn't a valid command (unknown "
+        f"subcommand, or arguments missing).\n**{title}**\n{body}")
+
 async def return_help_if_not_enough_args(
     ctx: ReplyContext,
     args: List[str],
@@ -1230,12 +1244,33 @@ def _format_clamp_line(path: str, c: "ClampSpec") -> str:
 # ---- Commands ----------------------------------------------------------------
 @registry.command("match", usage="!match <subcommand> ...", desc="List matches, create one, or switch the active match for this channel.")
 async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
-    if not args:
+    if not args or args[0].lower() == "list":
         pairs = mgr.list()
         if not pairs: return await ctx.send("No matches. Create a new match with first (see '!help match new')")
         lines = [f"**{name}** — `{mid}`" for mid, name in pairs]
         return await ctx.send("Matches:\n" + "\n".join(lines))
     sub = args[0]
+    if sub.lower() == "info":
+        # The channel's own match only: naming another match would widen
+        # the cross-guild visibility the multi-tenant caveat warns about.
+        m = active_match(mgr, ctx)
+        pov = _query_pov(ctx, m)
+        cur = (m.turn_order[m.active_index]
+               if m.round_started and 0 <= m.active_index < len(m.turn_order)
+               else None)
+        if cur is None:
+            turn = "not started"
+        elif _pov_hides(m, pov, cur):
+            turn = "an unseen unit"
+        else:
+            turn = f"`{cur}`"
+        clock = (f"turns elapsed {m.turns_elapsed}" if m.rules.get("atb_enabled")
+                 else f"round {m.round_number}")
+        return await ctx.send(
+            f"**{m.name}** (`{m.id}`) — system `{m.system_name}`, grid "
+            f"{m.grid_width}×{m.grid_height}, {clock}, current turn: {turn}, "
+            f"fog {'on' if m.fog_enabled else 'off'}, owner "
+            f"{_mention(m.owner) if m.owner else '(none)'}.")
     if sub == "new":# and len(args) >= 5:
         if await return_help_if_not_enough_args(ctx, args, 5, "match", "new"):
             return
@@ -1536,8 +1571,7 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"Use set / get / del / list."
         )
     # Fallback: show help menu for the command if it's not properly typed
-    title, body = registry.help_for(["match"])
-    return await ctx.send(f"**{title}**\n{body}")
+    return await _help_fallback(ctx, ["match"], args[0] if args else None)
 #annonate subcommands next to the command itself:
 registry.annotate_sub(
     "match", "new",
@@ -1568,6 +1602,17 @@ registry.annotate_sub(
     "match", "unbind",
     usage="!match unbind [<id>]",
     desc="Unbind THIS channel from a match (defaults to the active one).",
+)
+registry.annotate_sub(
+    "match", "list",
+    usage="!match list",
+    desc="List every match (same as a bare `!match`).",
+)
+registry.annotate_sub(
+    "match", "info",
+    usage="!match info",
+    desc=("Summary of this channel's match: system, grid, round (or turns "
+          "elapsed under ATB), whose turn it is, fog, owner."),
 )
 registry.annotate_sub(
     "match", "channels",
@@ -1685,8 +1730,7 @@ async def host_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if m.access_overrides.pop(key, None) is None:
                 return await ctx.send(f"No override for `{key}`.")
             return await ctx.send(f"Cleared access override for `{key}`.")
-        title, body = registry.help_for(["host", "access"])
-        return await ctx.send(f"**{title}**\n{body}")
+        return await _help_fallback(ctx, ["host", "access"], args[1] if len(args) > 1 else None)
 
     if sub in ("add", "remove"):
         if await return_help_if_not_enough_args(ctx, args, 2, "host", sub):
@@ -1709,8 +1753,7 @@ async def host_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(f"{_mention(target)} is not a co-host.")
         return await ctx.send(f"Removed co-host {_mention(target)} from **{m.name}**.")
 
-    title, body = registry.help_for(["host"])
-    return await ctx.send(f"**{title}**\n{body}")
+    return await _help_fallback(ctx, ["host"], args[0] if args else None)
 
 
 def _normalize_user_token(tok: str) -> str:
@@ -2164,8 +2207,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"Cleared `{key}` from system `{name}` command_access{suffix}."
             )
 
-        title, body = registry.help_for(["system", "access"])
-        return await ctx.send(f"**{title}**\n{body}")
+        return await _help_fallback(ctx, ["system", "access"], args[2] if len(args) > 2 else None)
 
     if sub == "default":
         if await return_help_if_not_enough_args(ctx, args, 3, "system", "default"):
@@ -2284,8 +2326,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"Use one of: def, del, list, info."
         )
 
-    title, body = registry.help_for(["system"])
-    return await ctx.send(f"**{title}**\n{body}")
+    return await _help_fallback(ctx, ["system"], args[0] if args else None)
 registry.annotate_sub("system", "list", usage="!system list", desc="List existing GameSystems.")
 registry.annotate_sub("system", "info", usage="!system info <name>", desc="Show a GameSystem's settings.")
 registry.annotate_sub("system", "rules", usage="!system rules", desc="List all available rules, their defaults, their types, and descriptions")
@@ -2521,8 +2562,7 @@ async def _ent_group_subcmd(ctx, args, mgr, m):
         return await ctx.send(f"Deleted group `{name}`.")
 
     # Fallback: show authoritative help for !ent group
-    title, body = registry.help_for(["ent", "group"])
-    return await ctx.send(f"**{title}**\n{body}")
+    return await _help_fallback(ctx, ["ent", "group"], args[1] if len(args) > 1 else None)
 
 
 @registry.command("ent", raw_args=True, usage="!ent <subcommand> ...", desc="Manage entities in the active match, lots of available sub-commands. Note: <id> parameter also accepts 'this' or 'current', to target the entity whose turn it is right now")
@@ -3467,8 +3507,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"{dest.entities[new_id].y}).{tail}")
 
     # Fallback: show authoritative help for the root command
-    title, body = registry.help_for(["ent"])
-    return await ctx.send(f"**{title}**\n{body}")
+    return await _help_fallback(ctx, ["ent"], args[0] if args else None)
 #annonate subcommands next to the command itself:
 registry.annotate_sub(
     "ent", "group",
@@ -3808,10 +3847,10 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if eid not in m.turn_order:
             raise NotFound(f"Entity '{eid}' not in turn order.")
         m.active_index = m.turn_order.index(eid)
+        m.turn_vacated = None   # the GM chose the current unit explicitly
         return await ctx.send(f"Active turn set to `{eid}` (round {m.round_number})")
     # Fallback: show authoritative help
-    title, body = registry.help_for(["turn"])
-    return await ctx.send(f"**{title}**\n{body}")
+    return await _help_fallback(ctx, ["turn"], args[0] if args else None)
 #annonate subcommands next to the command itself:
 registry.annotate_sub(
     "turn", "next",
@@ -4695,7 +4734,7 @@ async def roll_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     rng = random
     try:
         m = active_match(mgr, ctx)
-        rng = getattr(m, "_rng", None) or random
+        rng = m.formula_rng()
     except VTTError:
         pass
     try:
@@ -5516,8 +5555,7 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send("\n".join(lines))
 
     # Fallback to help
-    title, body = registry.help_for(["history"])
-    return await ctx.send(f"**{title}**\n{body}")
+    return await _help_fallback(ctx, ["history"], args[0] if args else None)
 
 
 def _resolve_snapshot_selector(m: Match, selector: str) -> Snapshot:
@@ -5906,8 +5944,7 @@ async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             raise VTTError(str(ex).replace(path, shown))
         return await ctx.send(f"Loaded from `{shown}`")
     # Fallback: show authoritative help
-    title, body = registry.help_for(["store"])
-    return await ctx.send(f"**{title}**\n{body}")
+    return await _help_fallback(ctx, ["store"], args[0] if args else None)
 #annonate subcommands next to the command itself:
 registry.annotate_sub(
     "store", "save",
@@ -6072,8 +6109,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"Formula:\n```\n{p.formula}\n```"
         )
 
-    title, body = registry.help_for(["passive"])
-    return await ctx.send(f"**{title}**\n{body}")
+    return await _help_fallback(ctx, ["passive"], args[0] if args else None)
 
 registry.annotate_sub(
     "passive", "add",
@@ -6218,8 +6254,7 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"Formula:\n```\n{p.formula}\n```"
         )
 
-    title, body = registry.help_for(["gpassive"])
-    return await ctx.send(f"**{title}**\n{body}")
+    return await _help_fallback(ctx, ["gpassive"], args[0] if args else None)
 
 registry.annotate_sub(
     "gpassive", "add",
@@ -7239,8 +7274,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 lines.append(f"- `{when}`: {snippet}")
             return await ctx.send("\n".join(lines))
 
-        title, body = registry.help_for(["tile", "hook"])
-        return await ctx.send(f"**{title}**\n{body}")
+        return await _help_fallback(ctx, ["tile", "hook"], args[1] if len(args) > 1 else None)
 
     # ---- def: template management --------------------------------------
     # Templates are reusable tile-kind definitions (e.g. "flame",
@@ -7435,8 +7469,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"**template `{name}`** ({placed} placed)\n```{body}\n```"
             )
 
-        title, body = registry.help_for(["tile", "def"])
-        return await ctx.send(f"**{title}**\n{body}")
+        return await _help_fallback(ctx, ["tile", "def"], args[1] if len(args) > 1 else None)
 
     # ---- place <template> <x> <y> [k=v ...] ----------------------------
     # Instantiate a template at (x, y). Optional override tokens look
@@ -7748,8 +7781,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"Set `{path}` = {value!r} on {n} tile(s) "
             f"({sub} {x1},{y1} → {x2},{y2}).{tail}")
 
-    title, body = registry.help_for(["tile"])
-    return await ctx.send(f"**{title}**\n{body}")
+    return await _help_fallback(ctx, ["tile"], args[0] if args else None)
 
 
 registry.annotate_sub(
@@ -8327,11 +8359,9 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 lines.append(f"- `{when}`: {snippet}")
             return await ctx.send("\n".join(lines))
 
-        title, body = registry.help_for(["zone", "hook"])
-        return await ctx.send(f"**{title}**\n{body}")
+        return await _help_fallback(ctx, ["zone", "hook"], args[1] if len(args) > 1 else None)
 
-    title, body = registry.help_for(["zone"])
-    return await ctx.send(f"**{title}**\n{body}")
+    return await _help_fallback(ctx, ["zone"], args[0] if args else None)
 
 
 @registry.command(
@@ -8704,8 +8734,7 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"duration={inst.get('duration', '∞')}).{tail}"
         )
 
-    title, body = registry.help_for(["status"])
-    return await ctx.send(f"**{title}**\n{body}")
+    return await _help_fallback(ctx, ["status"], args[0] if args else None)
 
 
 @registry.command(
@@ -8905,8 +8934,7 @@ async def part_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(f"`{part_id}` is not a body part.")
         return await ctx.send(_entity_dump(p))
 
-    title, body = registry.help_for(["part"])
-    return await ctx.send(f"**{title}**\n{body}")
+    return await _help_fallback(ctx, ["part"], args[0] if args else None)
 
 
 @registry.command(
@@ -8970,8 +8998,7 @@ async def mod_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 + ", ".join(MODIFIER_OPS) + ".")
         return await ctx.send("\n".join(lines))
 
-    title, body = registry.help_for(["mod"])
-    return await ctx.send(f"**{title}**\n{body}")
+    return await _help_fallback(ctx, ["mod"], args[0] if args else None)
 
 
 @registry.command(
@@ -9088,8 +9115,7 @@ async def func_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"**`{fn.signature()}`**\n```\n{fn.body}\n```"
         )
 
-    title, body = registry.help_for(["func"])
-    return await ctx.send(f"**{title}**\n{body}")
+    return await _help_fallback(ctx, ["func"], args[0] if args else None)
 
 
 registry.annotate_sub(
@@ -9376,8 +9402,7 @@ async def alias_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(f"❌ alias `{name}` not found.")
         return await ctx.send(f"**`!{name}`** → `!{exp}`")
 
-    title, body = registry.help_for(["alias"])
-    return await ctx.send(f"**{title}**\n{body}")
+    return await _help_fallback(ctx, ["alias"], args[0] if args else None)
 
 
 registry.annotate_sub(
@@ -9833,8 +9858,7 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(f"❌ no macro `{name}`.")
         return await ctx.send(f"Removed macro `{name}`.")
 
-    title, body = registry.help_for(["macro"])
-    return await ctx.send(f"**{title}**\n{body}")
+    return await _help_fallback(ctx, ["macro"], args[0] if args else None)
 
 
 @registry.command(
@@ -9877,7 +9901,7 @@ async def table_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         name = args[1]
         if name not in m.tables:
             return await ctx.send(f"❌ no table `{name}`.")
-        rng = getattr(m, "_rng", None) or random
+        rng = m.formula_rng()
         try:
             pick = roll_table_pick(rng, m.tables[name])
         except FormulaError as ex:
@@ -9908,8 +9932,7 @@ async def table_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(f"❌ no table `{name}`.")
         return await ctx.send(f"Removed table `{name}`.")
 
-    title, body = registry.help_for(["table"])
-    return await ctx.send(f"**{title}**\n{body}")
+    return await _help_fallback(ctx, ["table"], args[0] if args else None)
 
 
 @registry.command(
@@ -9982,8 +10005,7 @@ async def watch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         tail = ("\n" + "\n".join(log)) if log else ""
         return await ctx.send(f"Watchers checked.{tail}")
 
-    title, body = registry.help_for(["watch"])
-    return await ctx.send(f"**{title}**\n{body}")
+    return await _help_fallback(ctx, ["watch"], args[0] if args else None)
 
 
 @registry.command(
@@ -10161,8 +10183,7 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send("\n".join(lines))
         return await ctx.send("Usage: `!team passive <add|remove|list> ...`")
 
-    title, body = registry.help_for(["team"])
-    return await ctx.send(f"**{title}**\n{body}")
+    return await _help_fallback(ctx, ["team"], args[0] if args else None)
 
 
 @registry.command(
