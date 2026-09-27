@@ -1832,7 +1832,47 @@ async def _run_approved(req: dict, ctx: ReplyContext, mgr: MatchManager):
     the command's own output follows it."""
     cmd = "!" + req["name"] + (" " + " ".join(req["args"]) if req["args"] else "")
     await ctx.send(f"✅ Approved `{req['id']}` ({cmd}, by {req['user_name']}).")
-    await registry.run(req["name"], req["args"], ctx, mgr)
+    await run_approved_request(req, ctx, mgr)
+
+
+class _RequesterChannelCtx:
+    """The approver's context re-pointed at the channel the request came
+    from: the approver's identity and authority, the approver's replies,
+    but the REQUESTER's channel for everything keyed by channel (active
+    match, binding + POV, viewport camera)."""
+
+    def __init__(self, inner: ReplyContext, channel_key: str):
+        self._inner = inner
+        self.channel_key = channel_key
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+async def run_approved_request(req: dict, ctx: ReplyContext,
+                               mgr: MatchManager) -> None:
+    """Run an approved request as if typed in its own channel, against its
+    own match. A host usually approves from ANOTHER channel (`!approve` in
+    the host channel), and a player's `!match bind pov=blue` or `!match use`
+    means THEIR channel — run in the approver's channel it re-bound the
+    host channel instead. The requester's channel is pointed at the
+    request's match only for the run, then restored, unless the command
+    itself changed it (an approved `!match use`)."""
+    ch = req.get("channel_key") or ctx.channel_key
+    mid = req.get("match_id")
+    run_ctx = ctx if ch == ctx.channel_key else _RequesterChannelCtx(ctx, ch)
+    prev = mgr.active_by_channel.get(ch)
+    repoint = mid is not None and mid in mgr.matches and prev != mid
+    if repoint:
+        mgr.active_by_channel[ch] = mid
+    try:
+        await registry.run(req["name"], req["args"], run_ctx, mgr)
+    finally:
+        if repoint and mgr.active_by_channel.get(ch) == mid:
+            if prev is None:
+                mgr.active_by_channel.pop(ch, None)
+            else:
+                mgr.active_by_channel[ch] = prev
 
 
 @registry.command(

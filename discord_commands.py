@@ -5,7 +5,7 @@ from typing import Any, List, Dict, Optional, Tuple
 import discord
 from discord.ext import commands
 from logic import MatchManager
-from vtt_commands import registry
+from vtt_commands import registry, run_approved_request
 import shlex
 
 #DEBUG_CMDS = True         # console logging
@@ -411,17 +411,13 @@ class _ApprovalView(discord.ui.View):
         await ictx.send(
             f"✅ {ictx.user_name} approved `{cmd}` (by {req['user_name']})."
         )
-        # Re-dispatch against the request's OWN match, not whatever is active on
-        # the channel now — registry.run resolves the target via
-        # active_by_channel, so point the channel at the request's match for the
-        # approved run (the host is now acting on that match). Legacy requests
-        # without match_id keep the channel's current active match.
-        req_mid = req.get("match_id")
-        if req_mid is not None and req_mid in self._mgr.matches:
-            self._mgr.active_by_channel[ictx.channel_key] = req_mid
-        await registry.run(req["name"], req["args"], ictx, self._mgr)
+        # Re-dispatch against the request's OWN match and channel, not whatever
+        # is active where the button was clicked — and without permanently
+        # re-pointing that channel (see vtt_commands.run_approved_request).
+        await run_approved_request(req, ictx, self._mgr)
         if _boards:
-            mid = self._mgr.get_active_for_channel(ictx.channel_key)
+            mid = req.get("match_id") or \
+                self._mgr.get_active_for_channel(ictx.channel_key)
             if mid:
                 await _refresh_boards_for_match(self._mgr, mid)
         await self._disable(interaction)
