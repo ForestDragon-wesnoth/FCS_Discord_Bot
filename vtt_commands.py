@@ -1207,10 +1207,25 @@ def _parse_clamp_bound(raw: str) -> Any:
     return s  # treat as path
 
 
+def _check_options(tokens: List[str], allowed, where: str) -> None:
+    """Raise on a `key=value` token whose key `where` doesn't take. A
+    typo'd option used to be dropped silently, which changed behavior with
+    no hint (`turn=2` made a temporary fog reveal permanent, `mod=hard`
+    left a clamp soft, `include_histroy=yes` saved without history)."""
+    for t in tokens:
+        if "=" not in t or t.startswith("$("):
+            continue
+        key = t.split("=", 1)[0].lower()
+        if key not in allowed:
+            opts = ", ".join(f"`{a}=`" for a in sorted(allowed)) or "none"
+            raise VTTError(f"Unknown option `{key}=` for `{where}` (it "
+                           f"takes: {opts}).")
+
+
 def _parse_clamp_args(tokens: List[str]) -> Dict[str, Any]:
     """Parse [max=X] [min=X] [mode=hard|soft] tokens. Returns a dict with
-    the named values present. Tokens unrelated to clamps are ignored (lets
-    callers chain other args). Unknown clamp-namespace tokens raise."""
+    the named values present. Any other `key=` token raises."""
+    _check_options(tokens, {"max", "min", "mode"}, "clamp")
     out: Dict[str, Any] = {}
     for tok in tokens:
         if tok.startswith("max="):
@@ -1224,9 +1239,6 @@ def _parse_clamp_args(tokens: List[str]) -> Dict[str, Any]:
                     f"Clamp mode must be 'soft' or 'hard', got '{mode}'."
                 )
             out["mode"] = mode
-        # Other tokens silently passed through — we don't error on unknown
-        # so callers can interleave (e.g. !ent clamp add ... target=... in
-        # the future if needed).
     return out
 
 
@@ -4351,6 +4363,12 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # `full` is honored only as args[0] (the host-gated position) via
     # _view_pov, so a player can't sneak omniscient via `!map hide=.. full`.
     extra_hidden = set()
+    _check_options(args, {"hide", "legend"}, "!map")
+    for i, a in enumerate(args):
+        # Anything else here is a mistyped subcommand (`!map pna up`), which
+        # used to fall through to a plain render.
+        if "=" not in a and not (i == 0 and a.lower() == "full"):
+            return await _help_fallback(ctx, ["map"], a)
     for a in args:
         low = a.lower()
         if low.startswith("hide="):
@@ -4872,6 +4890,7 @@ async def reveal_fog_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # are the form's positional args.
     duration: Optional[int] = None
     rest: List[str] = []
+    _check_options(args[2:], {"turns"}, "!reveal_fog")
     for t in args[2:]:
         if t.lower().startswith("turns="):
             try:
@@ -5114,6 +5133,7 @@ def _bindings_token(args: List[str]) -> Optional[str]:
     """The per-call `bindings=keep|revert` override on an undo/restore,
     or None when absent. A bad value raises rather than silently falling
     back to the rule (the caller asked for something specific)."""
+    _check_options(args, {"bindings"}, "undo / restore")
     for a in args:
         if a.lower().startswith("bindings="):
             val = a.split("=", 1)[1].lower()
@@ -5925,6 +5945,7 @@ async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # autosave history into the save file. Off by default to keep
         # files small; on for full campaign backups.
         include_history = False
+        _check_options(args[2:], {"include_history"}, "!store save")
         for extra in args[2:]:
             if extra.startswith("include_history="):
                 include_history = _parse_bool(extra[len("include_history="):])
@@ -6015,6 +6036,12 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 target_val = tok[len("target="):]
             elif not formula_parts and tok.startswith("scope="):
                 scope_val = tok[len("scope="):].lower()
+            elif (not formula_parts and re.fullmatch(r"[A-Za-z_]\w*=\S*", tok)
+                    and len(args) > args.index(tok) + 1):
+                # A mistyped option (`scop=exact`) would otherwise become the
+                # start of the formula and fail as a bare "Syntax error".
+                raise VTTError(f"Unknown option `{tok.split('=', 1)[0]}=` "
+                               f"(it takes: `target=`, `scope=`).")
             else:
                 formula_parts.append(tok)
         # Translate `\n`/`\t` so a multi-line body typed at the CLI
@@ -6189,6 +6216,12 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 target_val = tok[len("target="):]
             elif not formula_parts and tok.startswith("scope="):
                 scope_val = tok[len("scope="):].lower()
+            elif (not formula_parts and re.fullmatch(r"[A-Za-z_]\w*=\S*", tok)
+                    and len(args) > args.index(tok) + 1):
+                # A mistyped option (`scop=exact`) would otherwise become the
+                # start of the formula and fail as a bare "Syntax error".
+                raise VTTError(f"Unknown option `{tok.split('=', 1)[0]}=` "
+                               f"(it takes: `target=`, `scope=`).")
             else:
                 formula_parts.append(tok)
         # Same `\n`/`\t` normalization as entity-scoped !passive add.
@@ -6594,6 +6627,12 @@ async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 target_val = tok[len("target="):]
             elif not formula_parts and tok.startswith("scope="):
                 scope_val = tok[len("scope="):].lower()
+            elif (not formula_parts and re.fullmatch(r"[A-Za-z_]\w*=\S*", tok)
+                    and len(args) > args.index(tok) + 1):
+                # A mistyped option (`scop=exact`) would otherwise become the
+                # start of the formula and fail as a bare "Syntax error".
+                raise VTTError(f"Unknown option `{tok.split('=', 1)[0]}=` "
+                               f"(it takes: `target=`, `scope=`).")
             else:
                 formula_parts.append(tok)
         formula = normalize_body_source(" ".join(formula_parts).strip())
@@ -8012,6 +8051,10 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "add":
         if await return_help_if_not_enough_args(ctx, args, 4, "zone", "add"):
             return
+        if len(args) > 4:
+            return await ctx.send(
+                "❌ `!zone add` takes one cell (`<name> <x> <y>`); use "
+                "`!zone fill <name> <x1> <y1> <x2> <y2>` for a rectangle.")
         name = args[1]
         x, y = _parse_xy(args, offset=2)
         try:

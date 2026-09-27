@@ -15607,3 +15607,35 @@ fired (`ends` = 0). Before, the removal shifted the pointer onto Mid and the
 advance then skipped it: Mid's turn-end fired although it never acted, and Slow
 got the turn. Mid's turn then passes to Slow. Slow dies during its turn, and it
 was last in the round, so the next `!turn next` wraps: round 2 opens with Mid.
+
+
+SCENARIO 595 — Mistyped options and subcommands are errors, not silent no-ops
+--------------------------------------------------------------------------------
+
+!match new ty Typos 8 8
+!match use ty
+!ent add x X 10 2 2 5
+!reveal_fog red all turn=2
+!clamp add x mana max=10 mod=hard
+!store save typo.json include_histroy=yes
+!map legnd=on
+!map pna up
+!zone add z 1 1 2 2
+!passive add x p on_var_changed scop=exact "entity[self].hp = 1"
+!ent team x red
+!ent move x 1 sideways
+!match list
+!match info
+!reveal_fog red all turns=2
+!clamp add x mana max=10 mode=hard
+
+Expected: HARNESS-ALLOWS-ERRORS. Each mistyped form now fails with a ❌ that
+names the problem, where it used to be dropped silently: `turn=` (a temporary
+reveal would have gone permanent), `mod=` (the clamp would have stayed soft),
+`include_histroy=` (the save would have left out history), `legnd=`, a
+mistyped `!map` subcommand (it used to draw the map), `!zone add` with a
+rectangle's worth of coordinates (it used to add one cell and ignore the rest),
+a mistyped passive option (it used to fail as a formula "Syntax error"), a
+removed subcommand (`!ent team` used to print help as if it had worked), and an
+unknown direction (the reply now carries the ❌). `!match list` and `!match
+info` work. The correctly-spelled reveal and clamp succeed.
