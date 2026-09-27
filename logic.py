@@ -456,7 +456,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "segment_removal_mode": {
         "default": "close",
-        "schema": {"type": "str",
+        "schema": {"type": "enum",
                    "choices": ["close", "cascade", "split", "death"]},
         "desc": (
             "What happens to the rest of a snake when one of its body "
@@ -1629,11 +1629,27 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "`!passive list/info`, `!clamp list` and `!mod show`, and is left "
             "out of `!find`, entity-wide listings, `!schedule list` and a "
             "non-host's `!foreach` selector; `!ent info` shows a disguised "
-            "unit's decoy card; and `!history diff` is host-only while fog "
-            "or a visibility condition is active (it reports every unit's "
+            "unit's decoy card; bare `!turn` leaves hidden units out of the "
+            "order and `!map center` won't frame one; and `!history diff`, "
+            "`!history list <kind>` and `!log` are host-only while fog or a "
+            "visibility condition is active (they report every unit's "
             "changes). Your own team's units are never hidden from you. Off "
             "= queries stay omniscient (lock them down per match with `!host "
             "access` instead). Omniscient channels are unaffected either way."
+        ),
+    },
+    "team_data_visibility": {
+        "default": "own",
+        "schema": {"type": "enum", "choices": ["own", "all", "host"]},
+        "desc": (
+            "Who may read team data (`!team list` / `!team get`: resources, "
+            "team modifiers). `own` (default): a player in a channel with a "
+            "team POV reads only that team's data; `!team list` names only "
+            "that team. `all`: every player reads every team's data. `host`: "
+            "only hosts read team data. Hosts, and players in an omniscient "
+            "channel under `own`, always read everything. Formulas "
+            "(team_get) are unaffected; lock inline `$()` args with "
+            "inline_args_access."
         ),
     },
     "entity_visibility_condition": {

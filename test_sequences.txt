@@ -2829,7 +2829,6 @@ SCENARIO 146 — Build a custom RPG system from scratch
 !system set dnd5e hp_var hp
 !system set dnd5e max_hp_var max_hp
 !system set dnd5e turnorder_var initiative
-!gclamp add hp max=max_hp mode=soft
 !system set dnd5e entity_line_format "{name} (L{level}) — HP:{hp}/{max_hp} AC:{ac}"
 !system set dnd5e entity_info_format "**{name}** Level {level} {class}\nHP: {hp}/{max_hp}\nAC: {ac}\nInit: {initiative}{?status_csv?}\nStatus: {status_csv}{/?}"
 !match new dnd1 Adventure 10 10 dnd5e
@@ -15549,3 +15548,40 @@ head (`'worm'`) and s3 still follows s2. WormB's `__segment_removal_mode` is
 `death`, which follows its segment_death_mode, `split`. remove_entity('c1')
 promotes c2 to an independent head: `part_of('c2')` is `''` and c3 now follows
 c2. The roster shows c2 as its own unit, with c3 as its part.
+
+
+SCENARIO 593 — team_data_visibility: players read their own team's data
+--------------------------------------------------------------------------------
+
+!match new td TeamData 8 8
+!match use td
+!team set red supply 3
+!team set blue supply 9
+!as player bob
+!as view red
+!team list
+!team get red supply
+!team get blue supply
+!team list blue
+!as view omniscient
+!team get blue supply
+!as host
+!system new tvhost
+!system set tvhost team_data_visibility host
+!match new th TeamHost 8 8 tvhost
+!match use th
+!team set red supply 3
+!as player bob
+!as view red
+!team list
+!team get red supply
+!as host
+!team get red supply
+
+Expected: Under the default `own`, a player previewing red's view sees only
+red in `!team list`, reads red's supply (3), and is refused blue's ("team
+`blue`'s data is hidden from this channel") by both `get` and `list blue`.
+`!team get` is now player-available (it used to queue for approval). From an
+omniscient view the player reads blue's supply (9). On a match whose system
+sets `host`, the player's `!team list` says team data is host-only and `get`
+is refused; the host reads red's supply.

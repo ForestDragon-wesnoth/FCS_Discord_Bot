@@ -141,7 +141,8 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
     # board mutation), so players may roll a GM-defined table. def/remove stay
     # host-gated.
     "table":      frozenset({"list", "roll"}),
-    "team":       frozenset({"list"}),
+    # team_data_visibility decides whose data a player may read.
+    "team":       frozenset({"list", "get"}),
     "tile":       frozenset({"list", "info"}),
     "watch":      frozenset({"list"}),
     "zone":       frozenset({"list", "info", "cells"}),
@@ -1249,8 +1250,17 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             elif args[i].startswith("system="):
                 system_name = args[i].split("=", 1)[1]
                 i += 1
-            else:
+            elif i == 5 and "=" not in args[i] and not args[i].startswith("-"):
+                # `!match new <id> <name> <w> <h> <system>` — the bare form
+                # people write. It used to be ignored silently, so the match
+                # got the default system.
+                system_name = args[i]
                 i += 1
+            else:
+                return await ctx.send(
+                    f"❌ Unknown argument `{args[i]}`. Usage: `!match new "
+                    f"<id> <name> <w> <h> [<system> | system=<name> | "
+                    f"--system <name>]`")
         mid = mgr.create_match(match_id, name, w, h, channel_key=ctx.channel_key, system_name=system_name, owner=ctx_user(ctx))
         return await ctx.send(f"Created match `{name}` with id `{mid}` using system `{mgr.get(mid).system_name}`.")
     if sub == "use":# and len(args) >= 2:
@@ -1531,7 +1541,7 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 #annonate subcommands next to the command itself:
 registry.annotate_sub(
     "match", "new",
-    usage="!match new <id> <name> <w> <h> [--system <name>]", 
+    usage="!match new <id> <name> <w> <h> [<system> | system=<name> | --system <name>]", 
     desc="Create a match; optionally override the default GameSystem, the argument has to be started with --system."
 )
 registry.annotate_sub(
@@ -3915,6 +3925,20 @@ def _whole_board_read_blocked(ctx: ReplyContext, m: "Match") -> bool:
         return False
     return bool(m.fog_enabled) or any(
         str(m.rules.get(r, "") or "").strip() for r in _VISIBILITY_RULES)
+
+
+def _team_data_readable(ctx: ReplyContext, m: "Match", team: str) -> bool:
+    """Whether the caller may read `team`'s data under the
+    team_data_visibility rule: `all` = anyone; `host` = hosts only; `own`
+    (default) = hosts, omniscient channels, and a team-POV channel for its
+    own team."""
+    mode = str(m.rules.get("team_data_visibility", "own"))
+    if mode == "all" or _acts_as_host(ctx, m):
+        return True
+    if mode == "host":
+        return False
+    pov = _view_pov(ctx, m, [])
+    return pov is None or str(pov) == str(team)
 
 
 def _query_eid(ctx: ReplyContext, m: "Match", token: str) -> str:
@@ -10053,6 +10077,9 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "get":
         if await return_help_if_not_enough_args(ctx, args, 3, "team", "get"):
             return
+        if not _team_data_readable(ctx, m, args[1]):
+            return await ctx.send(f"❌ team `{args[1]}`'s data is hidden "
+                                  f"from this channel.")
         _sent = object()
         v = m.team_get(args[1], args[2], _sent)
         if v is _sent:
@@ -10061,15 +10088,23 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
     if sub == "list":
         if len(args) >= 2:
+            if not _team_data_readable(ctx, m, args[1]):
+                return await ctx.send(f"❌ team `{args[1]}`'s data is hidden "
+                                      f"from this channel.")
             d = m.team_data.get(args[1])
             if not d:
                 return await ctx.send(f"team `{args[1]}` has no data.")
             return await ctx.send(
                 f"**team `{args[1]}`**\n```{json.dumps(d, indent=2, sort_keys=True)}\n```")
-        if not m.team_data:
+        teams = [t for t in sorted(m.team_data)
+                 if _team_data_readable(ctx, m, t)]
+        if not teams:
+            if m.team_data and str(m.rules.get(
+                    "team_data_visibility", "own")) == "host":
+                return await ctx.send("❌ Team data is host-only on this match.")
             return await ctx.send("No team data.")
         return await ctx.send("Teams with data: " + ", ".join(
-            f"`{t}`" for t in sorted(m.team_data)))
+            f"`{t}`" for t in teams))
 
     if sub in ("clear", "del"):
         if await return_help_if_not_enough_args(ctx, args, 2, "team", "clear"):
