@@ -5749,6 +5749,11 @@ async def undo_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 SAVES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saves")
 
 
+_WINDOWS_DEVICE_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+    + [f"COM{i}" for i in range(1, 10)] + [f"LPT{i}" for i in range(1, 10)])
+
+
 def saves_path(name: str, *, write: bool = False) -> Tuple[str, str]:
     """Resolve a user-supplied file name inside SAVES_DIR. Returns
     (absolute path, display name). The display name ("saves/<name>") is
@@ -5766,6 +5771,17 @@ def saves_path(name: str, *, write: bool = False) -> Tuple[str, str]:
             f"`{raw}` isn't allowed — use a plain file name (subfolders are "
             f"fine). Files live in the bot's `saves/` folder; absolute paths "
             f"and `..` are refused.")
+    # Names Windows can't hold as files (the bot is often self-hosted there):
+    # `a:b` writes an NTFS alternate data stream on `a`, and CON/NUL/COM1...
+    # open DEVICES (a serial port can block the bot) — refused everywhere so
+    # a save name means the same file on every host.
+    for p in parts:
+        stem = p.split(".")[0].upper()
+        if (re.search(r'[<>:"|?*\x00-\x1f]', p) or p.endswith((" ", "."))
+                or stem in _WINDOWS_DEVICE_NAMES):
+            raise VTTError(
+                f"`{raw}` isn't a usable file name (reserved device names, "
+                f"`<>:\"|?*`, and trailing dots/spaces are refused).")
     base = os.path.realpath(SAVES_DIR)
     full = os.path.realpath(os.path.join(base, *parts))
     try:

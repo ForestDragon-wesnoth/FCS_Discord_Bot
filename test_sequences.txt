@@ -14888,6 +14888,8 @@ SCENARIO 573 — file commands are confined to the saves/ folder
 !store save /etc/evil.json
 !store load "..\1bot_token.txt"
 !run ../1bot_token.txt
+!store save group:g
+!store save con.json
 !history save cp
 !history export manual:cp ../../cp.json
 !history export manual:cp campaign/cp.json
@@ -14904,7 +14906,9 @@ file is touched — `..`, an absolute path, and a Windows-style `..\` all get
 to reach the command at all: shlex drops an unquoted backslash, turning it into
 the harmless plain name `..1bot_token.txt`.) This is what stops `!run
 ../1bot_token.txt` from echoing the bot token back line by line, and `!store
-save` from overwriting files on the host. Plain names (subfolders allowed) work:
+save` from overwriting files on the host. Names Windows can't hold as files
+are refused too: `group:g` would write an NTFS alternate data stream and
+`con.json` opens the console DEVICE there. Plain names (subfolders allowed) work:
 a history snapshot exports to and imports from `saves/campaign/cp.json`, and
 `campaign/session1.json` saves and loads (hero back at 20 hp after the load).
 Replies name files as `saves/...`, never the host's absolute path. (The harness points saves/ at a throwaway temp folder.)
