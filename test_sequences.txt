@@ -15183,3 +15183,38 @@ show: the decoy card ("Barrel", hp 1). `!part list mimic` still lists the jaw
 full var JSON, the same data `!ent dump` is host-gated to hide, so the player's
 request is queued (r1). The host previewing the omniscient view sees the real
 "Mimic" card and approves the queued `!part info`, which then runs.
+
+
+SCENARIO 581 — Removing a body removes its parts; segments re-link on remove/detach
+--------------------------------------------------------------------------------
+
+!match new rp RemoveParts 12 6
+!match use rp
+!ent add ogre Ogre 40 2 2 5
+!ent set_var ogre footprint_w 2
+!part add ogre ohead Head 10 10
+!part add ohead ohorn Horn 3 3
+!ent remove ogre
+!list
+!find hp>0
+!ent add worm Worm 40 8 2 5
+!part segment worm w1 Seg 5 5
+!part segment worm w2 Seg 5 5
+!part segment worm w3 Seg 5 5
+!ent remove w2
+!eval "var_get('w3', '__follows')"
+!part detach w1
+!eval "var_get('w3', '__follows')"
+!eval "var_has('w1', '__follows')"
+!ent move worm 2 down
+!eval "str(entity[w3].x) + ',' + str(entity[w3].y)"
+
+Expected: removing the 2-wide ogre also removes its head and the horn attached
+to the head (the whole part subtree, as death and transform already did) —
+`!list` / `!find` show neither. Before the fix both stayed behind with `part_of`
+naming the removed id, and would have become limbs of any later entity called
+`ogre`. For the worm (w1 → w2 → w3), removing the middle segment w2 re-links w3
+to follow w1 (`'w1'`); detaching w1 then re-links w3 to the head (`'worm'`) and
+w1 stops being a segment (`False` — no `__follows`), standing free on the map.
+Moving the head 2 down from (8,2) drags w3 along the closed chain into
+the cell the head just left (8,3).

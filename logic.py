@@ -4358,6 +4358,9 @@ class Entity:
         # route here) per the mount_on_host_death rule — done while `self` is
         # still in the match so the eject search can use its footprint.
         m._release_riders(self.id)
+        # A removed snake segment closes the chain behind it, or the next
+        # segment would keep following an id that no longer exists.
+        m._splice_out_segment(self)
         if self.id in m.entities:
             del m.entities[self.id]
         # scrub from turn order & clamp active index
@@ -4377,6 +4380,14 @@ class Entity:
         # both route through here): delete or freeze per the
         # anchored_zone_on_anchor_loss rule.
         m._release_anchored_zones(self.id)
+        # The body's parts go with it — death and transform already remove
+        # the whole subtree; a plain despawn (`!ent remove`, `!part remove`)
+        # used to leave each part with part_of naming a gone id, which would
+        # latch onto whatever entity later took that id. Parents first; each
+        # part's own remove() handles its riders, auras and sub-parts.
+        for part in m.entity_part_subtree(self.id):
+            if part.id in m.entities and part._match is m:
+                part.remove()
         self._match = None
         m._rebuild_turn_order()
 
@@ -6089,6 +6100,20 @@ class Match:
                 self._restamp_riders_for(e.id)
 
     # ---------- snake / segmented bodies ----------
+    def _splice_out_segment(self, seg: "Entity") -> None:
+        """Close a snake's chain around `seg` (being removed or detached):
+        whatever followed it now follows what it followed, so the body stays
+        one linked chain. No-op for a non-segment."""
+        if not seg.vars.get("__segment"):
+            return
+        pred = seg.vars.get("__follows")
+        for e in self.entities.values():
+            if e is not seg and e.vars.get("__follows") == seg.id:
+                if pred:
+                    e.vars["__follows"] = pred
+                else:
+                    e.vars.pop("__follows", None)
+
     def snake_segments(self, head_id: str) -> List["Entity"]:
         """The ordered body chain of a snake (head -> tail). Built by walking
         each segment's `__follows` back-pointer from the head; assumes a
@@ -6301,6 +6326,11 @@ class Match:
             raise NotFound(f"Entity '{part_id}' not found.")
         if not p.part_of:
             raise VTTError(f"`{part_id}` is not a body part.")
+        # A detached segment leaves the body: the chain closes around it and
+        # it stops being a segment (it no longer follows anything).
+        self._splice_out_segment(p)
+        for k in ("__segment", "__follows"):
+            p.vars.pop(k, None)
         p.part_of = None
         self._rebuild_turn_order()
         return p
@@ -14403,6 +14433,10 @@ class MatchManager:
             fol = ne.vars.get("__follows")
             if fol in idmap:
                 ne.vars["__follows"] = idmap[fol]
+            elif fol is not None:
+                # Points outside the copied body: it would dangle in the
+                # destination (or latch onto an unrelated same-id entity).
+                ne.vars.pop("__follows", None)
             # Offset the head's snake-trail coords to the destination cell so a
             # transferred path-mode snake re-lays at its new location, not the
             # source's (same delta the anchor moves by).
