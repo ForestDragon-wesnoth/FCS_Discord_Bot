@@ -5632,6 +5632,7 @@ class Match:
                      if not all(in_new(cx + ox, cy + oy)
                                 for cx, cy in self.entity_cells(e)))
         log: List[str] = []
+        killed: List[str] = []
         if cut:
             mode = str(self.rules.get("map_resize_shrink_mode", "block"))
             if mode != "kill":
@@ -5645,9 +5646,20 @@ class Match:
             # kill mode: kill the cut entities before shifting. Their corpses
             # land at the current cell and are dropped below if that cell
             # shifts off-grid (which, being in the cut region, it does).
-            for eid in cut:
-                _, klog = self.kill_entity(eid)
-                log.extend(klog)
+            # Death hooks can SPAWN units (a summon-on-death) after the cut
+            # list was taken; one landing in the cut region would then shift
+            # off the new grid. Repeat until nothing would be cut. Terminates:
+            # every pass kills at least one unit, and summons per command are
+            # capped by summon_event_limit.
+            while cut:
+                for eid in cut:
+                    if eid in self.entities:
+                        _, klog = self.kill_entity(eid)
+                        log.extend(klog)
+                        killed.append(eid)
+                cut = sorted(e.id for e in self.entities.values()
+                             if not all(in_new(cx + ox, cy + oy)
+                                        for cx, cy in self.entity_cells(e)))
 
         # Shift survivors — each is in-bounds by construction (the off-grid
         # ones were just killed or we'd have raised).
@@ -5690,7 +5702,7 @@ class Match:
                     self.channel_views[ck] = [off[0] + ox, off[1] + oy]
 
         self.grid_width, self.grid_height = new_w, new_h
-        return ({"offset": (ox, oy), "anchor": key, "killed": cut,
+        return ({"offset": (ox, oy), "anchor": key, "killed": killed,
                  "dropped_tiles": dropped_tiles,
                  "clipped_zone_cells": clipped_cells}, log)
 

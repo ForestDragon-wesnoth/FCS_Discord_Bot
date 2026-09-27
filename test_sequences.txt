@@ -15415,3 +15415,27 @@ death pipeline, which removes its parts — so the legs' share has nothing left
 to hit and is skipped. The action completes (its `cmd()` echo runs) and the
 troll is a corpse. Before, the legs' share raised "Entity 'legs' not found",
 failing the action — and the action's transactional rollback UNDID the kill.
+
+
+SCENARIO 589 — Resize in kill mode also catches units its death hooks summon
+--------------------------------------------------------------------------------
+
+!match new rk ResizeKill 10 10
+!match use rk
+!system set default map_resize_shrink_mode kill
+!ent add hero Hero 10 1 1 5
+!ent add ghoul Ghoul 10 10 10 5
+!ent set_var hero tmpl.vars.hp 3
+!ent set_var hero tmpl.vars.max_hp 3
+!ent set_var hero tmpl.name Spawn
+!gpassive add spawnling on_death "if self_id() == 'ghoul':\n    summon(var_get('hero', 'tmpl'), 9, 2)"
+!map resize 8 8
+!list
+!system set default map_resize_shrink_mode block
+
+Expected: shrinking 10x10 to 8x8 cuts the ghoul at (10,10), so kill mode kills
+it — and its on_death hook summons a Spawn at (9,2), also outside the new grid.
+The kill phase now repeats until nothing would be cut, so the Spawn is killed
+too (the reply lists `ghoul`, `spawn`) and every surviving unit is on the grid;
+before, the Spawn appeared after the cut list was taken and was left at (9,2)
+on an 8x8 map. Only Hero remains alive. The last line restores the default.
