@@ -64,6 +64,13 @@ _ERROR_MARKERS = ("❌ Runtime error:", "❌ Unexpected error:",
                   "is missing arguments (got")
 _ALLOW_ERRORS_TAG = "harness-allows-errors"
 
+# A failed `!assert` is a scenario checking its own end state and finding it
+# wrong — always a failure, whatever HARNESS-ALLOWS-ERRORS says. Only a
+# scenario demonstrating a failing assert on purpose opts out, with its own
+# `HARNESS-ALLOWS-ASSERT-FAIL` tag.
+_ASSERT_MARKERS = ("❌ Assertion failed",)
+_ALLOW_ASSERT_TAG = "harness-allows-assert-fail"
+
 
 class _Ctx:
     """Minimal ReplyContext stand-in: collects sent messages. Carries a
@@ -96,18 +103,22 @@ def _interpret_escapes(raw: str) -> str:
     return raw.replace("\\n", "\n").replace("\\t", "\t")
 
 
-def parse_scenarios(path: str) -> List[Tuple[int, str, List[str], bool]]:
-    """Return [(number, title, [command_line, ...], allow_errors), ...] in file
-    order. allow_errors is True when the scenario's prose carries the
-    HARNESS-ALLOWS-ERRORS opt-out tag (a deliberate error-handling test)."""
+def parse_scenarios(path: str) -> List[Tuple[int, str, List[str], "frozenset[str]"]]:
+    """Return [(number, title, [command_line, ...], allows), ...] in file
+    order. `allows` holds "errors" when the scenario's prose carries the
+    HARNESS-ALLOWS-ERRORS opt-out tag (a deliberate error-handling test) and
+    "assert" for HARNESS-ALLOWS-ASSERT-FAIL (a deliberately failing !assert)."""
     with open(path, encoding="utf-8") as f:
         text = f.read()
-    out: List[Tuple[int, str, List[str], bool]] = []
+    out: List[Tuple[int, str, List[str], "frozenset[str]"]] = []
     for m in SCENARIO_RE.finditer(text):
         num = int(m.group(1))
         title = m.group(2).strip()
         body = m.group(3)
-        allow_errors = _ALLOW_ERRORS_TAG in body.lower()
+        low = body.lower()
+        allows = frozenset(
+            (["errors"] if _ALLOW_ERRORS_TAG in low else [])
+            + (["assert"] if _ALLOW_ASSERT_TAG in low else []))
         # Commands live ABOVE the "Expected:" prose. Stop collecting at
         # the Expected marker so prose lines that happen to start with
         # `!` (e.g. "!ent info shows ...", "!map renders ...") aren't
@@ -118,7 +129,7 @@ def parse_scenarios(path: str) -> List[Tuple[int, str, List[str], bool]]:
                 break
             if ln.startswith("!"):
                 cmds.append(ln)
-        out.append((num, title, cmds, allow_errors))
+        out.append((num, title, cmds, allows))
     return out
 
 
@@ -147,11 +158,16 @@ async def run_one(cmds: List[str]) -> List[Tuple[str, List[str]]]:
 
 
 def _flagged(transcript: List[Tuple[str, List[str]]],
-             allow_errors: bool = False) -> List[Tuple[str, str]]:
+             allows: "frozenset[str]" = frozenset()) -> List[Tuple[str, str]]:
     """Return [(command, output_line), ...] for every flagged failure. 💥 /
     Syntax error always flag; a top-level ❌ Runtime/Unexpected error flags too
-    unless the scenario opted out (allow_errors)."""
-    markers = _FAILURE_MARKERS if allow_errors else _FAILURE_MARKERS + _ERROR_MARKERS
+    unless the scenario opted out ("errors" in allows); a failed !assert
+    flags unless "assert" is in allows."""
+    markers = _FAILURE_MARKERS
+    if "errors" not in allows:
+        markers = markers + _ERROR_MARKERS
+    if "assert" not in allows:
+        markers = markers + _ASSERT_MARKERS
     hits = []
     for cmd, outs in transcript:
         for o in outs:
@@ -210,9 +226,9 @@ async def main_async(args: argparse.Namespace) -> int:
             print(f"⚠️ no such scenario(s): {sorted(missing)}")
 
     total_fail = 0
-    for num, title, cmds, allow_errors in scenarios:
+    for num, title, cmds, allows in scenarios:
         transcript = await run_one(cmds)
-        hits = _flagged(transcript, allow_errors)
+        hits = _flagged(transcript, allows)
         if args.verbose:
             print(f"\n=== SCENARIO {num} — {title} ===")
             for cmd, outs in transcript:

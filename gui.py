@@ -54,6 +54,11 @@ class GuiCtx:
     async def send(self, message: str):
         self.app.log(message)
 
+    def show_preview(self, highlights) -> None:
+        """`!map preview` hook: draw these highlight squares on the canvas
+        (over units) until the next command runs."""
+        self.app._preview = highlights
+
     async def prompt_choice(self, prompt, options, lo, hi):
         from tkinter import simpledialog
         if options is not None:
@@ -98,6 +103,7 @@ class GuiApp:
         self.mgr = MatchManager()
         self.ctx = GuiCtx(self)
         self.loader = SpriteLoader(sprites_dir)
+        self._preview = None  # highlight squares from `!map preview`
         self.loop = asyncio.new_event_loop()
         self._photo = None  # keep a ref so Tk doesn't GC the image
         self._zoom = 1.0
@@ -229,6 +235,8 @@ class GuiApp:
             self.canvas.delete("all")
             return
         scene = m.render_scene()
+        if getattr(self, "_preview", None):
+            scene["highlights"] = self._preview
         cell = self._cell_size(m, scene)
         base = self._base_cell(m)
         if cell < int(base * self._zoom):
@@ -254,6 +262,7 @@ class GuiApp:
     def _run_input(self):
         block = self.entry.get("1.0", "end")
         self.entry.delete("1.0", "end")
+        self._preview = None  # a `!map preview` lasts until the next command
         lines = [ln.strip() for ln in block.splitlines()]
         ran = False
         for line in lines:

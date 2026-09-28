@@ -947,7 +947,7 @@ async def run_action(
         # init, so importing the registry at module scope would
         # cycle. Inside this closure we're past both modules' loads.
         import shlex
-        from vtt_commands import registry  # noqa: PLC0415
+        from vtt_commands import registry, ASSERT_STOP  # noqa: PLC0415
         try:
             tokens = shlex.split(line)
         except ValueError as ex:
@@ -974,7 +974,11 @@ async def run_action(
         coro = registry.dispatch_no_snapshot(
             tokens[0], tokens[1:], match._runtime_buffer or buffer_ctx, mgr,
         )
-        _sync_dispatch(coro)
+        # A failed `!assert` line stops the body like fail() does (rolled
+        # back); the ❌ Assertion failed line is already in the buffer.
+        if _sync_dispatch_returning(coro) == ASSERT_STOP:
+            raise ActionFail(f"cmd(): `{line}` failed its assertion.",
+                             reason="assert")
 
     def _fail(*fail_args: Any) -> None:
         """fail(message) | fail(reason, message): abort the action

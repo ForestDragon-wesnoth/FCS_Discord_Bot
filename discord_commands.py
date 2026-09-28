@@ -244,7 +244,7 @@ class DiscordCtxWrapper:
         return (f"🗺️ Auto-update {kind} board ON — this message refreshes on "
                 "every change" + (" (use the arrows to pan)." if engaged else "."))
 
-    async def post_scene_image(self, m, pov) -> str:
+    async def post_scene_image(self, m, pov, highlights=None) -> str:
         """Render the match's graphics scene to a PNG and post it as an
         attachment. Called by `!map image` via getattr (Discord-only — other
         surfaces lack this method). Respects the resolved POV + the channel's
@@ -262,7 +262,8 @@ class DiscordCtxWrapper:
             import asyncio
             # Build the scene HERE (it reads the match) and only draw pixels
             # in the worker thread — see sprite_render.scene_for_png.
-            scene, cell = scene_for_png(m, pov_team=pov, viewport=viewport)
+            scene, cell = scene_for_png(m, pov_team=pov, viewport=viewport,
+                                        highlights=highlights)
             data = await asyncio.to_thread(
                 render_scene_png, scene, _get_sprite_loader(), cell)
         except RuntimeError as e:

@@ -73,6 +73,11 @@ Ternary:           value_if_true if cond else value_if_false
 
 Allowed functions:
   Core:      min, max, abs, round, int, float, str, len
+  Lists:     sum(list), sorted(list, desc=False), any(list), all(list),
+             count(list, value)   (membership needs no helper: `x in lst`)
+  Loops:     range(stop) / range(start, stop[, step])   (counted loops),
+             each(list_or_dict)   (a list's items or a dict's keys — the
+             loop source for a list held in a local or a var)
   Math:      sqrt, floor, ceil, pow, clamp(v, lo, hi), sign
   Random:    random_int, random_string, roll("2d6+3")
   Geometry:  distance, angle, direction_to
@@ -137,8 +142,12 @@ For-loops (CONSTRAINED form):
       entity[eid].hp = entity[eid].hp - 5
   for (cx, cy) in cells_in_burst(5, 5, 1):
       tile_set(cx, cy, "burned", 1)
+  for i in range(3):                     # count
+      entity[target].hp = entity[target].hp - 4
+  for item in each(entity[self].queue):  # a list var (or a dict's keys)
+      ...
 The iterable MUST be a direct call to a loopable function (e.g.
-entities_within, group_members, cells_in_burst/line/cone/rect,
+range, each, entities_within, group_members, cells_in_burst/line/cone/rect,
 entities_in_area/line/cone/rect, clip_cells, and the introspection
 helpers — see _LOOPABLE_FUNCS). The target may be a single name
 (entity id / scalar) or a tuple of names (for coord unpacking). Total iterations across all loops in
@@ -1480,6 +1489,121 @@ def _coord_y(c: Any) -> Any:
         f"{'None' if c is None else type(c).__name__}.")
 
 
+# ---- counted loops + list helpers ----------------------------------------
+# The for-loop only iterates a call to a _LOOPABLE_FUNCS name, and the
+# sandbox has no comprehensions, so `range` (count N times) and `each` (walk
+# a list held in a local or a var) are the two loop sources formulas lacked.
+# Both return plain lists, capped at formula_size_limit (the namespace binds
+# the match's value); total iterations stay bounded by formula_loop_limit.
+def _int_arg(v: Any, fname: str, argname: str) -> int:
+    ok = isinstance(v, (int, float)) and not isinstance(v, bool)
+    if ok and isinstance(v, float):
+        ok = math.isfinite(v) and v == int(v)
+    if not ok:
+        raise FormulaError(
+            f"{fname}(...): {argname} must be a whole number, got {v!r}.")
+    return int(v)
+
+
+def _range(*args: Any, limit: int = _DEFAULT_SIZE_LIMIT) -> list:
+    """range(stop) / range(start, stop) / range(start, stop, step): the
+    whole numbers from start (default 0) up to but NOT including stop,
+    counting by step (default 1; negative counts down) — Python's range, as
+    a list. `for i in range(3):` runs the body with i = 0, 1, 2."""
+    if not 1 <= len(args) <= 3:
+        raise FormulaError(
+            f"range(...) takes 1 to 3 arguments (stop / start, stop / "
+            f"start, stop, step), got {len(args)}.")
+    names = (("stop",) if len(args) == 1 else
+             ("start", "stop") if len(args) == 2 else ("start", "stop", "step"))
+    nums = [_int_arg(a, "range", n) for a, n in zip(args, names)]
+    if len(nums) == 1:
+        nums = [0, nums[0]]
+    if len(nums) == 3 and nums[2] == 0:
+        raise FormulaError("range(...): step can't be 0.")
+    r = range(*nums)
+    try:
+        n = len(r)
+    except OverflowError:     # more numbers than a machine word can count
+        n = limit + 1
+    if n > limit:
+        raise FormulaError(
+            f"range(...): would build more than {limit} numbers (the "
+            f"formula_size_limit).")
+    return list(r)
+
+
+def _each(v: Any, *, limit: int = _DEFAULT_SIZE_LIMIT) -> list:
+    """each(value): the items of a list, or the KEYS of a dict (insertion
+    order) — the loop source for a list held in a local or a var:
+    `for item in each(entity[self].queue):`. A number or string is an
+    error (use range(n) to count, len() for a string's length)."""
+    if isinstance(v, dict):
+        out = list(v.keys())
+    elif isinstance(v, (list, tuple)):
+        out = list(v)
+    else:
+        raise FormulaError(
+            f"each(value): expected a list or a dict, got "
+            f"{'None' if v is None else type(v).__name__}.")
+    if len(out) > limit:
+        raise FormulaError(
+            f"each(...): {len(out)} items, over the formula_size_limit of "
+            f"{limit}.")
+    return out
+
+
+def _list_arg(v: Any, fname: str) -> list:
+    if isinstance(v, (list, tuple)):
+        return list(v)
+    hint = (" (for a dict var's values use var_sum / var_keys)"
+            if isinstance(v, dict) else "")
+    raise FormulaError(
+        f"{fname}(list): expected a list, got "
+        f"{'None' if v is None else type(v).__name__}{hint}.")
+
+
+def _is_num(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _sum(v: Any) -> Any:
+    """sum(list): the total of a list of numbers (0 for an empty list)."""
+    items = _list_arg(v, "sum")
+    bad = [x for x in items if not _is_num(x)]
+    if bad:
+        raise FormulaError(
+            f"sum(list): every item must be a number, got {bad[0]!r}.")
+    return sum(items)
+
+
+def _sorted(v: Any, desc: Any = False) -> list:
+    """sorted(list, desc=False): a sorted copy of a list — ascending, or
+    descending with desc=True. The items must all be numbers or all be
+    strings."""
+    items = _list_arg(v, "sorted")
+    if items and not (all(_is_num(x) for x in items)
+                      or all(isinstance(x, str) for x in items)):
+        raise FormulaError(
+            "sorted(list): the items must all be numbers or all be strings.")
+    return sorted(items, reverse=bool(desc))
+
+
+def _any(v: Any) -> bool:
+    """any(list): True if at least one item is truthy (False when empty)."""
+    return any(_list_arg(v, "any"))
+
+
+def _all(v: Any) -> bool:
+    """all(list): True if every item is truthy (True when empty)."""
+    return all(_list_arg(v, "all"))
+
+
+def _count(v: Any, value: Any) -> int:
+    """count(list, value): how many items equal `value`."""
+    return sum(1 for x in _list_arg(v, "count") if x == value)
+
+
 _ALLOWED_FUNCS: Dict[str, Any] = {
     "min": min, "max": max, "abs": abs, "round": round,
     "int": int, "float": float, "str": str,
@@ -1504,6 +1628,13 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
     "relative_angle": _relative_angle,
     "coord_x": _coord_x,
     "coord_y": _coord_y,
+    "range": _range,
+    "each": _each,
+    "sum": _sum,
+    "sorted": _sorted,
+    "any": _any,
+    "all": _all,
+    "count": _count,
 }
 
 # Match-bound function names. These functions are bound at namespace build
@@ -2101,6 +2232,8 @@ _ALLOWED_NODES: Tuple[type, ...] = (
 # (cells_in_*). The for-loop target shape must match: a single Name for
 # the id case, a 2-tuple of Names for the coord case.
 _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
+    "range",
+    "each",
     "entities_within",
     "chain_targets",
     "group_members",
@@ -3116,6 +3249,8 @@ class FormulaEngine:
             "cells_in_line": lambda *a, **k: _cells_in_line(*a, limit=cell_limit, **k),
             "cells_in_cone": lambda *a, **k: _cells_in_cone(*a, limit=cell_limit, **k),
             "cells_in_rect": lambda *a, **k: _cells_in_rect(*a, limit=cell_limit, **k),
+            "range": lambda *a: _range(*a, limit=size_limit),
+            "each": lambda v: _each(v, limit=size_limit),
         }
         # Per-name default: was_clamped is boolean-flavored (default False);
         # args defaults to an empty dict (so attribute access via

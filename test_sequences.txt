@@ -6713,9 +6713,10 @@ SCENARIO 265 — !history diff between two command snapshots
 Expected: The diff names the two selectors and lists:
 entities added (ally), entities removed (foe), and entity changes
 for hero — vars.hp moved 30 -> 20 and vars.blessed was added
-(+ true). Round/active_index unchanged so those lines do not
-appear. Direction is `start -> end`; swapping the args would
-flip adds/removes.
+(+ true). The turn order line shows ['hero', 'foe'] -> ['hero',
+'ally']; the round and the current turn (hero) are unchanged, so
+those lines do not appear. Direction is `start -> end`; swapping
+the args would flip adds/removes.
 
 
 SCENARIO 266 — !find predicate AND queries (vars, status, group)
@@ -15698,3 +15699,397 @@ refused with a ❌ naming the fix (`!ent rename` / `!ent tp`): the two `name`
 set_vars, the `x` set_var and `var_set`. Reading a field under `name` is a ❌
 (a name has no fields), and `!defvar add name ...` is refused (a reserved path
 can't have a default). The final read still returns "Robert".
+
+
+SCENARIO 597 — range(): counted loops in formulas (a three-shot volley)
+------------------------------------------------------------------------
+
+!match new rg597 Ranges 8 6
+!match use rg597
+!ent add archer Archer 30 1 1 10
+!ent add dummy Dummy 50 5 1 5
+!ent set_var dummy max_hp 50
+!ent set_var archer actions.volley.target entity
+!ent set_var archer actions.volley.body "for i in range(3):\n    entity[target].hp = entity[target].hp - 4\nentity[self].shots = len(range(3))"
+!action archer volley dummy
+!assert "entity[dummy].hp == 38" three hits of 4
+!assert "entity[archer].shots == 3"
+!ent set_var archer actions.countdown.target none
+!ent set_var archer actions.countdown.body "for k in range(10, 0, -3):\n    entity[self].log = entity[self].log + [k]"
+!eval "entity[archer].log = []"
+!action archer countdown
+!eval "entity[archer].log"
+!eval "range(2, 5)"
+!eval "range(5, 2)"
+!eval "range(10**9)"
+!eval "range(1, 5, 0)"
+!eval "range(2.5)"
+!ent set_var archer actions.spin.target none
+!ent set_var archer actions.spin.body "t = 0\nfor i in range(20000):\n    t = t + 1"
+!action archer spin
+
+Expected: HARNESS-ALLOWS-ERRORS. `for i in range(3)` runs the volley body
+three times, so the dummy drops 50 -> 38, and `len(range(3))` stores 3 —
+both asserts pass. `range(10, 0, -3)` counts down: the countdown action
+appends 10, 7, 4, 1 to the archer's `log` list. `range(2, 5)` = [2, 3, 4];
+`range(5, 2)` is empty. `range(10**9)` is refused (over the
+formula_size_limit of 100000), a 0 step is refused, and a fractional count
+is refused (whole numbers only). A body that loops 20000 times fails on the
+formula_loop_limit (10000), so the spin action rolls back.
+
+
+SCENARIO 598 — each(): iterate a list var, a local list, or a dict's keys
+-------------------------------------------------------------------------
+
+!match new ea598 Each 8 6
+!match use ea598
+!ent add hero Hero 30 1 1 10
+!ent add a A 20 3 1 5
+!ent add b B 20 4 1 5
+!ent add c C 20 5 1 5
+!eval "entity[hero].marks = ['a', 'c']"
+!ent set_var hero actions.mark_hit.target none
+!ent set_var hero actions.mark_hit.body "for eid in each(entity[self].marks):\n    entity[eid].hp = entity[eid].hp - 6"
+!action hero mark_hit
+!assert "entity[a].hp == 14 and entity[b].hp == 20 and entity[c].hp == 14" marked units hit, b untouched
+!ent set_var hero bag.rope 1
+!ent set_var hero bag.torch 3
+!ent set_var hero bag.coin 12
+!ent set_var hero actions.tally.target none
+!ent set_var hero actions.tally.body "total = 0\nnames = []\nfor k in each(entity[self].bag):\n    total = total + var_get(self_id(), 'bag.' + k)\n    names = names + [k]\nentity[self].bag_total = total\nentity[self].bag_names = names"
+!action hero tally
+!assert "entity[hero].bag_total == 16"
+!eval "entity[hero].bag_names"
+!ent set_var hero actions.pairs.target none
+!ent set_var hero actions.pairs.body "pts = [[1, 2], [3, 4]]\nacc = 0\nfor (px, py) in each(pts):\n    acc = acc + px * py\nentity[self].acc = acc"
+!action hero pairs
+!assert "entity[hero].acc == 14"
+!eval "each(5)"
+!eval "each('abc')"
+
+Expected: HARNESS-ALLOWS-ERRORS. `each(entity[self].marks)` walks the list
+held in the `marks` var, so a and c drop 20 -> 14 and b stays at 20. `each`
+over the `bag` dict walks its keys in insertion order: the tally totals
+1 + 3 + 12 = 16 and records ['rope', 'torch', 'coin']. A local list of
+pairs unpacks into `(px, py)`: 1*2 + 3*4 = 14. All asserts pass. `each` on a
+number or a string is refused ("expected a list or a dict").
+
+
+SCENARIO 599 — List helpers: sum, sorted, any, all, count
+----------------------------------------------------------
+
+!match new lh599 Lists 8 6
+!match use lh599
+!ent add hero Hero 30 1 1 10
+!eval "sum([1, 2, 3.5])"
+!eval "sum([])"
+!eval "sorted([3, 1, 2])"
+!eval "sorted(['orc', 'elf', 'dwarf'], True)"
+!eval "any([0, '', 1])"
+!eval "all([1, True, 'x'])"
+!eval "all([])"
+!eval "count(['hit', 'miss', 'hit'], 'hit')"
+!eval "3 in [1, 2, 3]"
+!dist $(sum([1,1])) 1 $(count([5,5,5],5)) 1
+!eval "sum(['a'])"
+!eval "sorted([1, 'a'])"
+!eval "sum({'a': 1})"
+!eval "count(5, 1)"
+
+Expected: HARNESS-ALLOWS-ERRORS. sum → 6.5 (0 for an empty list); sorted
+→ [1, 2, 3] and, descending, ['orc', 'elf', 'dwarf']; any → True; all →
+True (and True for an empty list); count → 2. Membership needs no helper:
+`3 in [1, 2, 3]` → True. The helpers are read-only, so they work inside
+inline `$()` args: `!dist $(sum([1,1])) 1 $(count([5,5,5],5)) 1` measures
+(2,1) → (3,1) = 1. Refused: sum of a non-number, sorted over mixed numbers
+and strings, sum of a dict (the error points at var_sum / var_keys), and
+count on a non-list.
+
+
+SCENARIO 600 — List helpers in real use: a focus-fire action over a mixed board
+--------------------------------------------------------------------------------
+
+!match new ff600 FocusFire 10 8
+!match use ff600
+!ent add mage Mage 30 2 4 10
+!ent set_var mage team blue
+!ent add ogre Ogre 40 4 3 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent set_var ogre team red
+!ent add imp Imp 8 3 6 5
+!ent set_var imp team red
+!ent add rat Rat 12 1 1 5
+!ent set_var rat team red
+!ent add far Far 5 9 8 5
+!ent set_var far team red
+!ent set_var mage actions.focus.target none
+!ent set_var mage actions.focus.body "foes = entities_within(self, 2, 'square_radius', 'hostile')\nhps = []\nlow = []\nfor f in each(foes):\n    hps = hps + [entity[f].hp]\n    low = low + [entity[f].hp <= 10]\nentity[self].seen = len(foes)\nentity[self].pool = sum(hps)\nentity[self].order = sorted(hps)\nentity[self].weak = count(low, True)\nentity[self].any_weak = any(low)\nentity[self].all_weak = all(low)\nweakest = lowest_var(foes, 'hp')\nentity[weakest].hp = entity[weakest].hp - min(hps)"
+!action mage focus
+!assert "entity[mage].seen == 2" ogre (2x2, nearest cell 2 away) and imp; rat and far are out of range
+!assert "entity[mage].pool == 48"
+!assert "entity[mage].order == [8, 40]"
+!assert "entity[mage].weak == 1 and entity[mage].any_weak and not entity[mage].all_weak"
+!assert "has_corpse('imp') and entity[ogre].hp == 40" the weakest in range died; the ogre is untouched
+!list
+
+Expected: The focus action gathers the hostile units within 2 cells
+(footprint-aware: the 2×2 ogre anchored at (4,3) is 2 cells from the mage
+at (2,4) — its left column is 2 away; the imp at (3,6) is 2 away; the rat
+at (1,1) is 3 away and `far` is far off). It loops them with `each`,
+collecting hp into a list: sum = 40 + 8 = 48, sorted = [8, 40], one of
+them has hp <= 10 (any True, all False). It then hits the weakest
+(`lowest_var`, the imp) for the smallest hp in the list, so the imp
+dies and `!list` no longer shows it alive. (The sandbox has no
+subscripts, so the smallest value is `min(hps)` — the first item of
+`sorted(hps)` read another way.) Every assert passes.
+
+
+SCENARIO 601 — !assert: pass, fail, --as, and the read-only gate
+----------------------------------------------------------------
+
+!match new as601 Asserts 8 6
+!match use as601
+!ent add hero Hero 30 2 3 10
+!assert "entity[hero].hp == 30" fresh hero
+!assert --as hero "entity[self].x == 2 and entity[self].y == 3"
+!assert "entity[hero].hp < 10" hero should be nearly dead
+!assert "entity[nobody].hp > 0"
+!assert "kill('hero')"
+!assert "entity[hero].hp = 1"
+!assert "entity[hero].hp == 30" still alive and untouched
+!as player bob
+!assert "entity[hero].hp == 30"
+!as host
+!pending
+
+Expected: HARNESS-ALLOWS-ASSERT-FAIL. A true formula replies `✅ Assertion
+passed` (with the optional message after it); `--as hero` binds `self`. A
+false formula replies `❌ Assertion failed: ... is False — hero should be
+nearly dead`. A formula that can't be evaluated also fails: a missing
+entity, a state-changing function (`kill` is refused by the same read-only
+gate as inline `$()` args) and an assignment. Nothing was changed — the
+last host assert still passes at hp 30. `!assert` is host-gated like
+`!eval`, so the player's assert is queued for approval (`!pending` lists
+it) and doesn't run.
+
+
+SCENARIO 602 — !assert stops the enclosing batch, macro, foreach and action
+---------------------------------------------------------------------------
+
+!system set default action_cmd_allowlist ent,assert
+!match new as602 AssertStop 8 6
+!match use as602
+!ent add hero Hero 30 2 3 10
+!ent add orc Orc 20 5 3 7
+!ent set_var orc team red
+!ent add imp Imp 20 6 3 5
+!ent set_var imp team red
+!batch ent hp orc -5 ; assert "entity[orc].hp == 15" ; ent hp orc -5 ; assert "entity[orc].hp == 0" ; ent hp orc -5
+!assert "entity[orc].hp == 10" the batch stopped before its last line
+!macro set drain "repeat 5\nent hp hero -4\nassert \"entity[hero].hp > 20\" keep the hero above 20\nend\nent hp hero -100"
+!macro run drain
+!assert "entity[hero].hp == 18" three drains ran, the fourth never did, nor the -100
+!foreach team=red ; ent hp $id -1 ; assert "entity[$id].hp > 15"
+!assert "entity[orc].hp == 9 and entity[imp].hp == 20" the sweep stopped at the orc
+!batch macro run drain ; ent hp hero 50
+!assert "entity[hero].hp == 14" the nested stop skipped the heal too
+!ent set_var hero actions.guarded.target none
+!ent set_var hero actions.guarded.body "entity[self].hp = entity[self].hp + 5\ncmd('assert \"entity[hero].hp > 100\"')\nentity[self].hp = 1"
+!action hero guarded
+!assert "entity[hero].hp == 14" the failed action rolled back its +5
+
+Expected: HARNESS-ALLOWS-ASSERT-FAIL. The batch damages the orc to 15,
+passes the first assert, damages it to 10, fails the second assert, and
+stops (`⏹ batch stopped: an assertion failed; 1 line(s) skipped`) — the
+orc stays at 10. The macro drains the hero 30 → 26 → 22 → 18, the third
+assert fails, and the macro stops (the -100 never runs): 18. The foreach
+sweep hits the orc first (initiative 7, so it leads the turn order;
+10 → 9), its assert fails, and the sweep stops before the imp (still 20). A macro inside a batch that stops also stops the batch:
+the hero drops 18 → 14 and the +50 heal is skipped. Inside an action,
+`cmd('assert ...')` (with `assert` on the action_cmd_allowlist) that fails
+fails the action, which rolls back its +5: the hero stays at 14 and the
+body's last line never runs.
+
+
+SCENARIO 603 — !assert as a scenario's own end-state check (multi-tile push)
+----------------------------------------------------------------------------
+
+!match new as603 AssertPush 10 6
+!match use as603
+!ent add golem Golem 60 3 2 5
+!ent set_var golem footprint_w 2
+!ent set_var golem footprint_h 2
+!ent add hero Hero 30 1 2 10
+!tile set 8 2 block true
+!tile set 8 2 glyph #
+!ent push golem right 5
+!assert "entity[golem].x == 6 and entity[golem].y == 2" the 2x2 stops with its right column at x=7, before the wall
+!assert "occupies('golem', 7, 3) and not occupies('golem', 8, 3)"
+!assert "cell_entity(6, 2) == 'golem' and cell_entity(3, 2) == ''"
+!assert "len(footprint_cells('golem')) == 4"
+
+Expected: The golem (2×2 at (3,2)) is pushed 5 right toward a wall at
+(8,2). Its right column may not enter x=8, so it stops with its anchor at
+x=6 (cells x=6..7). Each assert passes, checking the end state directly —
+the anchor, a covered and an uncovered cell of the footprint, the cell
+occupancy query at the new and old anchor, and the 4-cell footprint.
+
+
+SCENARIO 604 — Undo preview: see what `!undo command N` would change, then undo
+-------------------------------------------------------------------------------
+
+!match new up604 UndoPreview 8 6
+!match use up604
+!ent add hero Hero 30 2 2 10
+!ent add ogre Ogre 40 5 3 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent hp hero -7
+!ent tp ogre 6 4
+!ent status hero add burning
+!tile set 3 5 glyph #
+!undo command 4 preview
+!assert "entity[hero].hp == 23 and entity[ogre].x == 6 and status_has('hero', 'burning') and tile_has(3, 5, 'glyph')" preview restored nothing
+!undo command 1 preview
+!undo command 4
+!assert "entity[hero].hp == 30 and entity[ogre].x == 5 and entity[ogre].y == 3" the real undo matches the preview
+!assert "not status_has('hero', 'burning') and not tile_has(3, 5, 'glyph')"
+
+Expected: `!undo command 4 preview` lists exactly what undoing the last four
+commands would change, without changing anything: hero `vars.hp: 23 -> 30`
+and `status.burning: removed`; ogre `position: (6,4) -> (5,3)` (the 2×2's
+anchor); and `- tile (3,5)`. It notes that the undo would also drop 3 later
+autosaves. The first assert confirms nothing was restored. `!undo command 1
+preview` shows only the tile removal. The real `!undo command 4` then
+produces the previewed state, which the last two asserts check.
+
+
+SCENARIO 605 — Undo preview for turns, rounds and `to round`; the fuller diff
+------------------------------------------------------------------------------
+
+!match new up605 UndoPreviewTurns 8 6
+!match use up605
+!ent add hero Hero 30 2 2 10
+!ent add foe Foe 30 5 5 5
+!turn next
+!ent hp foe -6
+!zone add pit 4 4
+!team set red supplies 3
+!match var set alarm 1
+!macro set ping "ent hp foe -1"
+!turn next
+!ent hp hero -2
+!undo turn 1 preview
+!undo round 1 preview
+!undo to round 1 preview
+!assert "entity[hero].hp == 28 and entity[foe].hp == 24" nothing restored by the previews
+!history diff round:1 latest:command
+
+Expected: `!undo turn 1 preview` goes back to the start of the foe's turn,
+so it only shows hero `vars.hp: 28 -> 30` (and that 1 later autosave
+would be dropped). `!undo round 1 preview` and
+`!undo to round 1 preview` go back to the start of round 1: they show the
+current turn changing ('foe' -> 'hero'), turns_elapsed going back, hero
+28 -> 30, foe 24 -> 30, `- zone pit`, the removed match var `alarm` and
+team data `red.supplies`, and `Other changes: macros` (the ping macro).
+Both say 8 later autosaves would be dropped. The assert
+confirms the previews changed nothing. `!history diff` uses the same
+diff: it now reports positions, statuses, tiles, zones, match vars, team
+data and the current turn, and names any other changed field.
+
+
+SCENARIO 606 — !map preview: burst, cone, line and rect over a multi-tile unit
+------------------------------------------------------------------------------
+
+!match new mp606 MapPreview 10 7
+!match use mp606
+!ent add hero Hero 30 2 4 10
+!ent add ogre Ogre 40 6 3 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent add gob Gob 10 9 6 5
+!tile set 5 5 glyph #
+!map preview burst hero 2
+!map preview burst 5 4 1 manhattan
+!map preview cone hero right 4
+!map preview line hero gob
+!map preview rect 8 1 10 2
+!assert "entity[ogre].hp == 40 and entity[gob].hp == 10 and entity[hero].x == 2" previews change nothing
+
+Expected: Each preview draws the map with the covered cells marked `*`
+(the preview_glyph rule), clipped to the grid, and lists the visible units
+inside. A burst of radius 2 around the hero (its own cell as the centre)
+covers 20 on-map cells and lists only the Hero. A radius-1 manhattan burst
+at (5,4) is a 5-cell diamond; it reaches (6,4), one cell of the 2×2 ogre,
+so the Ogre is listed and its whole body keeps its glyph. The 90° cone
+from the hero to the right, length 4, covers 14 cells and lists the Ogre.
+The line from the hero to the goblin lists both endpoints' units. The
+rect in the top-right corner lists no units. Cells showing a unit keep
+the unit's glyph; the tile `#` at (5,5) is marked where an area covers
+it. Nothing on the board changes (the assert).
+
+
+SCENARIO 607 — !map preview under fog: players can plan, hidden units stay hidden
+----------------------------------------------------------------------------------
+
+!match new mp607 PreviewFog 10 7
+!match use mp607
+!ent add scout Scout 30 2 4 10
+!ent set_var scout team red
+!ent set_var scout fog_vision_radius 2
+!ent add lurker Lurker 30 7 4 5
+!ent set_var lurker team blue
+!ent add brute Brute 30 4 5 5
+!ent set_var brute team blue
+!match fog on
+!as player bob
+!as view red
+!map preview burst scout 3
+!map preview burst lurker 1
+!map preview line 2 4 8 4
+!as view clear
+!as host
+!map preview burst scout 3
+
+Expected: HARNESS-ALLOWS-ERRORS. `!map preview` stays player-available
+(it's read-only): bob runs it directly, from red's view. With fog on, the
+scout sees 2 cells. The burst of radius 3 around the scout lists the Scout
+and the Brute (at (4,5), in sight); cells outside red's sight still show
+the preview mark over fog but reveal nothing, and the Lurker at (7,4) is
+out of sight, so the line through its cell doesn't list it. Using the
+hidden Lurker as an origin reads exactly like a missing entity. The
+host's omniscient preview lists the Scout and the Brute (the Lurker is 5
+cells away, outside radius 3).
+
+
+SCENARIO 608 — !map preview options: colour/opacity, glyph rule, legend, image fallback
+----------------------------------------------------------------------------------------
+
+!match new mp608 PreviewOpts 8 5
+!match use mp608
+!ent add hero Hero 30 2 2 10
+!map preview rect 1 1 2 2 color=0,0,255 opacity=70
+!map preview rect 1 1 2 2 color=#00ff80
+!map preview rect 1 1 2 2 colour=blue
+!map preview rect 1 1 2 2 color=300,0,0
+!map preview rect 1 1 2 2 opacity=150
+!map preview spiral 1 1
+!map preview burst 3 3
+!map preview burst 3 3 1 extra
+!system set default preview_glyph +
+!match new mp608b PreviewOpts2 8 5
+!match use mp608b
+!ent add hero Hero 30 2 2 10
+!map legend on
+!map mode image
+!map preview burst 4 3 1
+
+Expected: HARNESS-ALLOWS-ERRORS. `color=` takes `r,g,b` or `#rrggbb` and
+`opacity=` 0-100 (they only affect graphics surfaces; the ASCII reply is
+the same). Refused with a ❌: a mistyped option (`colour=`), a channel
+over 255, an opacity over 100, an unknown shape, a missing radius, and a
+stray word where the metric goes. After the preview_glyph rule is set to
+`+`, the new match marks previewed cells with `+`, and the legend explains
+`+ — preview area`. The match is in image render mode, but the harness has
+no image surface, so the preview falls back to the ASCII map.

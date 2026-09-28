@@ -135,7 +135,12 @@ commands written after an `Expected:` block silently never execute. The
 harness also flags `❌ Runtime error:`, `❌ Unexpected error:`, an unknown
 subcommand ("isn't a valid command") and missing arguments ("is missing
 arguments") unless the prose carries `HARNESS-ALLOWS-ERRORS`. **But the
-harness only catches those markers — it does NOT verify behavior.** A scenario can "pass" with a `❌` reply that means the
+harness only catches those markers — it does NOT verify behavior** unless
+the scenario says what it expects with `!assert "<formula>" [message]`: a
+false assert prints `❌ Assertion failed`, which the harness ALWAYS flags
+(even under HARNESS-ALLOWS-ERRORS; only `HARNESS-ALLOWS-ASSERT-FAIL`, for a
+scenario demonstrating a failing assert, opts out). Prefer asserts for
+end-state checks in new scenarios (see 597-608). A scenario can "pass" with a `❌` reply that means the
 opposite of what it should. Always also do at least one of:
 
 - Run the new scenarios with `-v` and read the per-line transcript
@@ -3786,6 +3791,64 @@ More shipped work (continuing the list above):
     formula can't rename. A nested read (`name.first`) is a ❌.
   - Pre-start `!turn set` lost when units are added afterwards: the user
     chose to keep this (set the opener last).
+
+- **Formula loops + list helpers, `!assert`, undo preview, `!map preview`
+  — SHIPPED (scenarios 597-608).** Five user-approved features.
+  - **`range` / `each` (597-598).** The for-loop only iterates a call to a
+    `_LOOPABLE_FUNCS` name, so counted loops and loops over a list held in a
+    local or a var were impossible. `range(stop)` / `range(start, stop[,
+    step])` (Python semantics, whole numbers only) and `each(value)` (a
+    list's items or a dict's keys) are loopable `_ALLOWED_FUNCS`, return
+    plain lists capped at `formula_size_limit` (the namespace binds the
+    match's value); iterations stay bounded by `formula_loop_limit`.
+  - **List helpers (599-600):** `sum`, `sorted(list, desc=False)`, `any`,
+    `all`, `count(list, value)` — pure, read-only (usable in `$()`). Lists
+    only (a dict error points at var_sum / var_keys); `x in lst` already
+    works for membership. A local named `count` / `sum` still shadows the
+    function as before. No subscripts: the smallest item is `min(lst)`.
+  - **`!assert [--as <eid>] "<formula>" [message]` (601-603).** Host-gated
+    like `!eval`; the formula passes the inline-`$()` read-only gate
+    (`validate_arg_safe`), so no mutation / `!func`s. False or unevaluable
+    → raises `AssertionStop` (a VTTError): the reply is `❌ Assertion
+    failed: ...`, and `dispatch_no_snapshot` returns the `ASSERT_STOP`
+    sentinel, which `!batch` / `!run` / `!foreach` / `!macro` (incl. nested
+    if/repeat blocks) check after each line, stop, report `⏹ <runner>
+    stopped: an assertion failed`, and RETURN the sentinel so an enclosing
+    runner stops too. In an action body, `cmd('assert ...')` (with `assert`
+    on action_cmd_allowlist) that fails raises ActionFail(reason="assert"),
+    rolling the action back.
+  - **Undo preview (604-605).** `preview` on any `!undo` / `!history undo`
+    form (turn / round / command / to round) shows the diff from the CURRENT
+    state to the snapshot it would restore, plus how many later autosaves
+    the undo would drop, and restores nothing (`_undo_preview`; host-only
+    under a fogged view like `!history diff`). The shared diff
+    (`_format_snapshot_diff`) had a real gap, fixed here: it looked for a
+    `position` key the entity dict never had (x / y), so `!history diff`
+    NEVER reported moves; it also ignored statuses, names, clamps,
+    part/mount links, tiles, zones, groups (a match-level dict — it read a
+    nonexistent per-entity field), match vars, team data and the turn.
+    Now all are reported, and every other changed top-level field is named
+    in an "Other changes" line (event_log excluded — it changes every
+    command).
+  - **`!map preview <burst|cone|line|rect> ...` (606-608).** Shows the cells
+    an area shape covers (same geometry as `cells_in_*`, bounded by
+    formula_cell_limit, clipped to the grid) and lists the visible units
+    inside (footprint-aware; glued / region parts and hidden riders
+    skipped). Points are `x y` or an entity id (its aoe origin — centre or
+    anchor per aoe_origin_mode); an id the channel can't see reads as
+    missing. Player-available (read-only, drawn under the channel POV).
+    ASCII (user call): cells showing a unit keep its glyph, every other
+    covered cell (terrain, zone, fog included) shows the `preview_glyph`
+    rule's character (`render_ascii(marks=, mark_glyph=)`; tracked via a
+    `unit_shown` set that the fog overlay clears); the legend says
+    "preview area". GRAPHICS (user call): translucent squares drawn ABOVE
+    units and fog — a scene `highlights` list [{cells, rgb, opacity}] drawn
+    last by `SceneRenderer._draw_highlight`; colour/opacity from the
+    `preview_color` (`r,g,b` / `#rrggbb`) / `preview_opacity` rules or
+    `color=` / `opacity=` args. Surfaces: Discord in image render mode
+    passes `highlights` to `post_scene_image`; gui.py's `GuiCtx.show_preview`
+    keeps them on the canvas until the next command; text surfaces get the
+    ASCII map.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

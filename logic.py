@@ -1796,6 +1796,36 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "formula modes."
         ),
     },
+    "preview_glyph": {
+        "default": "*",
+        "schema": {"type": "str"},
+        "desc": (
+            "`!map preview` (ASCII): the character marking the cells an "
+            "area shape would cover. Cells showing a unit keep the unit's "
+            "glyph (the reply lists the units inside); every other cell in "
+            "the area shows this mark over its terrain, zone or fog glyph. "
+            "Only the first character is used."
+        ),
+    },
+    "preview_color": {
+        "default": "255,64,64",
+        "schema": {"type": "str"},
+        "desc": (
+            "`!map preview` (graphics — Discord image mode, gui.py): the "
+            "colour of the translucent square drawn over each covered cell, "
+            "ABOVE units, as `r,g,b` (0-255 each) or `#rrggbb`. A "
+            "`color=` arg on the command overrides it for one preview."
+        ),
+    },
+    "preview_opacity": {
+        "default": 40,
+        "schema": {"type": "int"},
+        "desc": (
+            "`!map preview` (graphics): opacity 0-100 of the covered-cell "
+            "squares. An `opacity=` arg on the command overrides it for one "
+            "preview."
+        ),
+    },
     "fog_glyph": {
         "default": "?",
         "schema": {"type": "str"},
@@ -13784,7 +13814,9 @@ class Match:
                      colorize: bool = False,
                      hidden_layers: Optional["set[str]"] = None,
                      viewport: Optional[Tuple[int, int, int, int]] = None,
-                     legend: bool = False) -> str:
+                     legend: bool = False,
+                     marks: Optional["set[Tuple[int, int]]"] = None,
+                     mark_glyph: str = "*") -> str:
         """Render the ASCII map. Thin wrapper that activates the read-only
         _fog_team_sees memo for the duration of the render, so the per-cell,
         per-layer fog scan doesn't recompute the same team-sight (each
@@ -13793,14 +13825,18 @@ class Match:
         it can't go stale. See _render_ascii_impl for the actual rendering.
 
         `hidden_layers` (None = use this match's persistent self.hidden_layers)
-        suppresses render layers by name: zones / tiles / entities / fog."""
+        suppresses render layers by name: zones / tiles / entities / fog.
+
+        `marks` (a set of (x, y) cells, used by `!map preview`) paints
+        `mark_glyph` on each of those cells that isn't showing a unit."""
         hidden = self.hidden_layers if hidden_layers is None else hidden_layers
         prev = self._vision_memo
         if prev is None:
             self._vision_memo = {}
         try:
             return self._render_ascii_impl(pov_team, colorize, hidden,
-                                           viewport=viewport, legend=legend)
+                                           viewport=viewport, legend=legend,
+                                           marks=marks, mark_glyph=mark_glyph)
         finally:
             self._vision_memo = prev
 
@@ -13808,7 +13844,9 @@ class Match:
                            colorize: bool = False,
                            hidden: "set[str]" = frozenset(),
                            viewport: Optional[Tuple[int, int, int, int]] = None,
-                           legend: bool = False) -> str:
+                           legend: bool = False,
+                           marks: Optional["set[Tuple[int, int]]"] = None,
+                           mark_glyph: str = "*") -> str:
         # `pov_team` filters EVERY layer through its visibility rule: a
         # zone / tile / entity hidden from that team isn't painted (its
         # cell falls back to whatever layer is visible underneath, so the
@@ -13893,6 +13931,10 @@ class Match:
             elif tc is not None:
                 colors[ty][tx] = tc
 
+        # Cells currently showing a unit's glyph (so a preview mark leaves
+        # them alone; a fog overlay takes them back out).
+        unit_shown: "set[Tuple[int, int]]" = set()
+
         # Entity layer (top, above tiles): the "who is where" question wins
         # over tile features. An entity always paints a glyph, so it owns
         # the cell's color too (its resolved color, or None = uncolored,
@@ -13916,6 +13958,7 @@ class Match:
                 if self.in_bounds(cx, cy):
                     grid[cy][cx] = sym
                     colors[cy][cx] = ecol
+                    unit_shown.add((cx, cy))
                     if meanings is not None:
                         meanings[cy][cx] = self.entity_display_name(e, pov_team)
 
@@ -13932,6 +13975,7 @@ class Match:
                 if self.in_bounds(cx, cy):
                     grid[cy][cx] = sym
                     colors[cy][cx] = ecol
+                    unit_shown.add((cx, cy))
                     if meanings is not None:
                         meanings[cy][cx] = self.entity_display_name(e, pov_team)
 
@@ -13952,6 +13996,7 @@ class Match:
                     if self.in_bounds(cx, cy):
                         grid[cy][cx] = sym
                         colors[cy][cx] = ecol
+                        unit_shown.add((cx, cy))
                         if meanings is not None:
                             meanings[cy][cx] = self.entity_display_name(e, pov_team)
 
@@ -13965,9 +14010,22 @@ class Match:
                     if not self._fog_terrain_visible(pov_team, xx, yy):
                         grid[yy][xx] = fg
                         colors[yy][xx] = None
+                        unit_shown.discard((xx, yy))
                         if meanings is not None:
                             meanings[yy][xx] = ("fog (unseen)"
                                                 if fg != "." else None)
+
+        # Preview marks (`!map preview`): the area's cells, except the ones
+        # showing a unit — those keep the unit's glyph (the reply lists who is
+        # inside). Drawn over terrain / zone / fog glyphs, uncolored.
+        if marks:
+            mg = (mark_glyph or "*")[0]
+            for (mx, my) in marks:
+                if self.in_bounds(mx, my) and (mx, my) not in unit_shown:
+                    grid[my][mx] = mg
+                    colors[my][mx] = None
+                    if meanings is not None:
+                        meanings[my][mx] = "preview area"
 
         # Window bounds: the viewport (vx, vy, vw, vh) clips the rendered
         # cells to a sub-rectangle of the grid (clamped); None = whole grid.

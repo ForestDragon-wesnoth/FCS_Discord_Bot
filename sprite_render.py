@@ -178,6 +178,11 @@ class SceneRenderer:
             if in_window(f.get("x"), f.get("y")):
                 self._draw_fog(canvas, f, *px(f["x"], f["y"]))
 
+        # Highlights (`!map preview`): translucent squares over the covered
+        # cells, drawn last so they sit ABOVE units (and fog).
+        for hl in scene.get("highlights") or []:
+            self._draw_highlight(canvas, hl, ox, oy, cols, rows)
+
         return canvas
 
     # -- layers ----------------------------------------------------------
@@ -266,6 +271,25 @@ class SceneRenderer:
             overlay = Image.new("RGBA", (cell, cell), (10, 10, 14, a))
             canvas.alpha_composite(overlay, (x0, y0))
 
+    def _draw_highlight(self, canvas, hl, ox, oy, cols, rows):
+        """One highlight group: {cells: [[x, y], ...], rgb: [r, g, b],
+        opacity: 0-100} — a flat translucent square on every cell."""
+        cell = self.cell
+        try:
+            r, g, b = (max(0, min(255, int(c))) for c in hl.get("rgb", (255, 64, 64)))
+        except (TypeError, ValueError):
+            r, g, b = 255, 64, 64
+        a = max(0, min(255, int(max(0, min(100, int(hl.get("opacity", 40)))) / 100.0 * 255)))
+        overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+        d = ImageDraw.Draw(overlay)
+        for c in hl.get("cells") or []:
+            gx, gy = int(c[0]), int(c[1])
+            if not (ox <= gx <= ox + cols - 1 and oy <= gy <= oy + rows - 1):
+                continue
+            x0, y0 = (gx - ox) * cell, (gy - oy) * cell
+            d.rectangle([x0, y0, x0 + cell - 1, y0 + cell - 1], fill=(r, g, b, a))
+        canvas.alpha_composite(overlay)
+
     def _draw_borders(self, canvas, borders, ox, oy, cols, rows):
         cell = self.cell
         base_color = borders.get("color", "white")
@@ -341,7 +365,8 @@ def render_match_png(match, loader: "SpriteLoader",
 def scene_for_png(match, pov_team: Optional[str] = None,
                   viewport: Optional[Tuple[int, int, int, int]] = None,
                   cell_size: Optional[int] = None,
-                  max_dim: int = 1600) -> Tuple[Dict[str, Any], int]:
+                  max_dim: int = 1600,
+                  highlights: Optional[list] = None) -> Tuple[Dict[str, Any], int]:
     """(scene model, cell size) for a PNG render — the part that READS THE
     MATCH. render_scene switches on the match's shared vision memo while it
     runs, so running it in a worker thread while commands mutate the match
@@ -355,6 +380,8 @@ def scene_for_png(match, pov_team: Optional[str] = None,
         except (TypeError, ValueError):
             cell_size = 100
     scene = match.render_scene(pov_team=pov_team, viewport=viewport)
+    if highlights:
+        scene["highlights"] = highlights
     return scene, fit_cell_size(scene, cell_size, max_dim)
 
 
