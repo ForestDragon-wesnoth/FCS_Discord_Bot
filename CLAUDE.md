@@ -4035,6 +4035,51 @@ More shipped work (continuing the list above):
     a unit a fogged channel can't see.
   - **Harness (96/97)** — see §2: `??` / `?!` reply checks and `--review`.
 
+- **Audit-pass-32 (hands-on, freshest code first): `!again` recursion +
+  `!ent hp` reply (scenarios 646-647).** Probes, the pass-30 chaos harness
+  extended with every new command (pause/resume with the host rule
+  toggled, `!again` / alias of it, `!cancel`, tile copy, hp forms, `!map
+  cell`, `!find count/ids`, the new formula functions, clone; plus a
+  "held commands only while paused" invariant — 48 seeds normal + hostile,
+  clean), the formula fuzzer over the new functions (clean) and the
+  command fuzzer over the touched roots (37.5k runs, clean). Fixes:
+  - **`!again` recursed until Python's stack limit (HIGH).** Inside a
+    batch / macro / foreach / `!run` file / action `cmd()`, the remembered
+    command is the one CONTAINING the `again` line, so it reran its
+    container forever (`!batch eval 1 ; again` → 💥). An alias of `again`
+    was remembered under the alias name, so `!ag` reran itself. Now:
+    `dispatch_no_snapshot` refuses `again` with a ❌; `run()` skips
+    remembering when the ALIAS-RESOLVED name is again/as; a contextvar
+    `_AGAIN_ACTIVE` refuses a replay that reaches `again` again (a name that
+    became an alias of `again` after it was stored); `again` is in
+    `_SELF_DISPATCHING_COMMANDS`. `_effective_access` returns `all` for
+    `again` regardless of overrides: gating it queued the bare word, and
+    approving that replayed the APPROVER's last command.
+  - **Clicks were recorded as typed commands.** A Discord Approve button
+    (via `run_approved_request`) and the Resume button ran `registry.run`
+    at depth 0, so the click became the clicker's `!again` command. Both
+    now raise `_RUN_DEPTH` to 1 first.
+  - **Held commands ran against the holder's CURRENT match.** `!match
+    resume` dispatched each held command in its channel, which might show
+    another match by then. The re-point logic of `run_approved_request` is
+    now the shared context manager `_channel_pointed_at(mgr, ch, mid)`,
+    used by approvals, resume, and the Discord Resume button.
+  - **`!ent hp` dropped hook output and deaths (pre-existing).** heal /
+    damage went through the hp property, which discards write_var's log,
+    so on_var passives fired silently (`!ent set_var` always showed them),
+    and a lethal set said nothing about the death. The handler now writes
+    once through `write_var`, appends the hook log, adds "`x` died." when
+    the unit left the match, and rebuilds the turn order on an alive/dead
+    flip the way heal_entity / damage_entity did. Also: a doubled sign
+    (`+-5`, `--5`) is refused, an integer amount is read exactly (no float
+    round trip for long numbers), and a zero change reads "hp unchanged".
+  - `!ent move` / group move: "Unexpected token" replies lacked the ❌.
+  - Verified clean: despawn-hook re-entrancy (`remove_entity(self)` /
+    `kill(self)` in an on_entity_despawned handler), tile copy with corpses
+    on both cells + undo, ATB prints no round line, POV of `!find
+    count/ids` / `!map cell` / `!whoami` / `!match info`, `!roll odds`
+    caps and edge specs, the skip loop.
+
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
 and explain the "why").

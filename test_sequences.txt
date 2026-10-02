@@ -17381,3 +17381,77 @@ and gives the turn to the hero (round 2), with no "every entity is
 skippable" line — the skip loop tracks which units it has looked at, so a
 unit removed mid-pass can't cut it short. The next pass skips the orc
 and wraps once more (round 3).
+
+
+SCENARIO 646 — !again only as a typed command: no recursion through batches, macros, foreach or aliases
+-------------------------------------------------------------------------------------------------------
+
+!match new s646 Echo 8 6
+!match use s646
+!ent add hero Hero 30 2 2 10
+!ent set_var hero team red
+!alias def ag again
+!batch ent hp hero -1 ; again
+?? `!again` only works as a command typed on its own
+!again
+?? 🔁 `!batch ent hp hero -1 ; again`
+?? `!again` only works as a command typed on its own
+!assert "entity[hero].hp == 28" the batch ran twice and its again line was refused both times
+!macro set redo "again"
+!macro run redo
+?? `!again` only works as a command typed on its own
+!foreach team=red ; again
+?? `!again` only works as a command typed on its own
+!ent hp hero -2
+!ag
+?? 🔁 `!ent hp hero -2`
+!ag
+?? 🔁 `!ent hp hero -2`
+!assert "entity[hero].hp == 22" the alias repeats the last real command and is never remembered itself
+!host access set again host
+!as player
+!again
+?? Nothing to repeat
+?! needs host approval
+!as host
+
+Expected: Inside a batch, macro or foreach the last command typed is the
+one containing the `again` line, so `again` there is refused with a ❌
+(it used to rerun its container until Python's recursion limit). A
+typed `!again` after the batch reruns the batch once (30 → 29 → 28). An
+alias of `again` works like `!again` and is never the remembered
+command, so `!ag` twice repeats `!ent hp hero -2` twice (28 → 26 → 24 →
+22). An access override on `again` doesn't apply: it carries no
+authority of its own (the replayed command meets the gate), so the
+player's `!again` runs directly ("Nothing to repeat") instead of
+queueing.
+
+
+SCENARIO 647 — !ent hp reports hook output and deaths; malformed amounts are refused
+-------------------------------------------------------------------------------------
+
+!match new s647 Wounds 8 6
+!match use s647
+!ent add hero Hero 30 2 2 10
+!ent add orc Orc 10 4 2 5
+!passive add hero watch on_var_changed target=hp "log('hero hp now ' + str(entity[hero].hp))"
+!ent hp hero -5
+?? Damaged `hero` by 5.
+?? passive `hero.watch` fired
+!ent hp hero -0
+?? `hero` hp unchanged.
+!ent hp hero +-5
+?? ❌ hp amount must be a whole number
+!ent hp hero --5
+?? ❌ hp amount must be a whole number
+!ent hp hero 12345678901234567
+?? Set `hero` hp to 12345678901234567 (was 25). It is at 30.
+!ent hp orc =-3
+?? Set `orc` hp to -3 (was 10). `orc` died.
+!assert "has_corpse('orc') and entity[hero].hp == 30"
+
+Expected: A plain change shows the on_var_changed passive's output
+(it used to be dropped; `!ent set_var` always showed it). A zero change
+reads "hp unchanged". A doubled sign (`+-5`, `--5`) is a typo and is
+refused. A long number is read exactly (not through a float) and then
+clamped to max_hp. A set that kills says so.

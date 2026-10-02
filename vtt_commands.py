@@ -25,6 +25,7 @@ from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, val
 import os
 import re
 from fractions import Fraction
+import contextlib
 import contextvars
 import json
 import random
@@ -169,7 +170,7 @@ READ_ONLY_BARE_ROOTS: frozenset = frozenset({
 # to look inside these (and a nested foreach would recurse), treating them as
 # mutating. Their own base access is host anyway — this is defense in depth.
 _SELF_DISPATCHING_COMMANDS: frozenset = frozenset({
-    "foreach", "batch", "run", "macro", "eval",
+    "foreach", "batch", "run", "macro", "eval", "again",
 })
 # The inverse of READ_ONLY_SUBCOMMANDS: an otherwise player-available
 # ("all") command whose FIRST ARG here ELEVATES it to host-gated. Used by
@@ -407,6 +408,14 @@ class CommandRegistry:
         if not h:
             await ctx.send(self._unknown_command_message(name, mgr, ctx))
             return
+        if name == "again":
+            # Inside a batch / macro / foreach / !run file / action cmd() the
+            # last command typed is the one CONTAINING this line, so `again`
+            # would rerun it, reach this line again and recurse without end.
+            await ctx.send("❌ `!again` only works as a command typed on its "
+                           "own: here it would rerun the command that "
+                           "contains it.")
+            return
         # Bot-wide commands need an admin even here: this path is ungated
         # (batch / macro / foreach / run lines, action cmd()), so without the
         # check a host could wrap `!system set` in a `!batch`.
@@ -448,6 +457,12 @@ class CommandRegistry:
         base level, downgraded to 'all' for a read-only subcommand, then
         overridden by the active match's command_access rule. `m` is the
         active Match (or None)."""
+        if name == "again":
+            # `!again` carries no authority of its own: the command it replays
+            # goes through this gate itself. Gating `again` too would queue
+            # the bare word, and approving it replayed the APPROVER's last
+            # command, so access overrides don't apply to it.
+            return "all"
         base = self._access.get(name, "host")
         if base == "host" and args and args[0].lower() in READ_ONLY_SUBCOMMANDS.get(name, ()):
             base = "all"
@@ -635,7 +650,11 @@ class CommandRegistry:
         # interleaved Discord messages don't see each other's depth.
         depth_token = _RUN_DEPTH.set(_RUN_DEPTH.get() + 1)
         try:
-            if _RUN_DEPTH.get() == 1 and name.lower() not in ("again", "as"):
+            # Judged on the alias-RESOLVED name: an alias of `again` stored as
+            # the last command made `!again` rerun itself forever.
+            if (_RUN_DEPTH.get() == 1
+                    and self._resolve_alias(name, args, mgr, ctx)[0].lower()
+                    not in ("again", "as")):
                 _remember_command(mgr, ctx, name, args)
             return await self._run(name, args, ctx, mgr)
         finally:
@@ -794,6 +813,9 @@ registry = CommandRegistry()
 # Nesting depth of CommandRegistry.run within one asyncio task (see run()).
 _RUN_DEPTH: "contextvars.ContextVar[int]" = contextvars.ContextVar(
     "vtt_run_depth", default=0)
+# True while `!again` replays a command (see again_cmd).
+_AGAIN_ACTIVE: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "vtt_again_active", default=False)
 
 
 def _remember_command(mgr: MatchManager, ctx: ReplyContext, name: str,
@@ -1494,7 +1516,11 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             await ctx.send(f"▶ `{cmd}` ({h['user_name']})")
             run_ctx = (ctx if h["channel_key"] == ctx.channel_key
                        else _RequesterChannelCtx(ctx, h["channel_key"]))
-            await registry.dispatch_no_snapshot(h["name"], h["args"], run_ctx, mgr)
+            # Against THIS match, even if the holder's channel now shows
+            # another one.
+            with _channel_pointed_at(mgr, h["channel_key"], m.id):
+                await registry.dispatch_no_snapshot(h["name"], h["args"],
+                                                    run_ctx, mgr)
         return
     if sub == "new":# and len(args) >= 5:
         if await return_help_if_not_enough_args(ctx, args, 5, "match", "new"):
@@ -2235,7 +2261,9 @@ async def cancel_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         "`!ent move hero 2 right`, `!again` moves another 2. It goes through "
         "the same host approval and pause rules as typing it. Remembered per "
         "user and channel while the bot runs; `!again` itself (and the CLI's "
-        "`!as`) is never the remembered command."
+        "`!as`) is never the remembered command. Only works typed on its "
+        "own (an alias of it counts): inside a batch, macro, foreach or "
+        "action it would rerun the command containing it."
     ),
 )
 async def again_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -2246,14 +2274,20 @@ async def again_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if last is None:
         return await ctx.send("❌ Nothing to repeat — you haven't run a "
                               "command in this channel yet.")
+    if _AGAIN_ACTIVE.get():
+        # The replayed name became an alias of `again` after it was stored.
+        raise VTTError("the command `!again` would repeat now runs `!again` "
+                       "itself (an alias changed since you typed it).")
     name, cargs = last
     await ctx.send("🔁 `!" + name + (" " + " ".join(cargs) if cargs else "") + "`")
     # A fresh top-level run: its own gate, pause check, undo entry and
     # watcher poll, exactly as if retyped.
     token = _RUN_DEPTH.set(0)
+    active = _AGAIN_ACTIVE.set(True)
     try:
         return await registry.run(name, list(cargs), ctx, mgr)
     finally:
+        _AGAIN_ACTIVE.reset(active)
         _RUN_DEPTH.reset(token)
 
 
@@ -2342,14 +2376,27 @@ async def run_approved_request(req: dict, ctx: ReplyContext,
     request's match only for the run, then restored, unless the command
     itself changed it (an approved `!match use`)."""
     ch = req.get("channel_key") or ctx.channel_key
-    mid = req.get("match_id")
     run_ctx = ctx if ch == ctx.channel_key else _RequesterChannelCtx(ctx, ch)
+    # Never the approver's `!again` command: a Discord button click runs this
+    # at the top level, where run() would record it.
+    depth = _RUN_DEPTH.set(max(_RUN_DEPTH.get(), 1))
+    try:
+        with _channel_pointed_at(mgr, ch, req.get("match_id")):
+            await registry.run(req["name"], req["args"], run_ctx, mgr)
+    finally:
+        _RUN_DEPTH.reset(depth)
+
+
+@contextlib.contextmanager
+def _channel_pointed_at(mgr: MatchManager, ch: str, mid: Optional[str]):
+    """Point channel `ch` at match `mid` for a run, then restore it unless
+    the run itself changed it (an approved / held `!match use`)."""
     prev = mgr.active_by_channel.get(ch)
     repoint = mid is not None and mid in mgr.matches and prev != mid
     if repoint:
         mgr.active_by_channel[ch] = mid
     try:
-        await registry.run(req["name"], req["args"], run_ctx, mgr)
+        yield
     finally:
         if repoint and mgr.active_by_channel.get(ch) == mid:
             if prev is None:
@@ -2815,6 +2862,9 @@ def _parse_hp_amount(raw: str, resolved: str, e, m,
     elif tok[:1] in "+-":
         sign = 1 if tok[0] == "+" else -1
         tok = tok[1:]
+        if tok[:1] in "+-":
+            # `+-5` / `--5`: a typo, whichever way it was meant.
+            tok = ""
     if sign == 0:
         if tok.lower() == "max":
             if e.max_hp is None:
@@ -2825,10 +2875,13 @@ def _parse_hp_amount(raw: str, resolved: str, e, m,
             if tok.startswith("$("):
                 tok = resolve_arg_token(tok, m, self_id)
     try:
-        value = float(tok)
-        if value != int(value):
-            raise ValueError
-        value = int(value)
+        try:
+            value = int(str(tok).strip())  # exact for any size
+        except ValueError:
+            value = float(tok)             # `1e3`, or a $() float like 4.0
+            if value != int(value):
+                raise ValueError
+            value = int(value)
     except (TypeError, ValueError, OverflowError):
         raise VTTError(f"hp amount must be a whole number, `max`, `=n` or a "
                        f"signed change like `-5` — got `{raw}`.")
@@ -2843,8 +2896,10 @@ def _hp_ack(eid: str, mode: str, delta: int, before: int, after: int,
     clamp (or a death) made that differ."""
     if mode == "set":
         msg = f"Set `{eid}` hp to {before + delta} (was {before}{note})."
+    elif delta == 0:
+        msg = f"`{eid}` hp unchanged" + (f" ({note[2:]})" if note else "") + "."
     else:
-        verb = "Healed" if delta >= 0 else "Damaged"
+        verb = "Healed" if delta > 0 else "Damaged"
         msg = f"{verb} `{eid}` by {abs(delta)}" + (f" ({note[2:]})" if note else "") + "."
     if after != before + delta:
         msg += f" It is at {after}."
@@ -2912,7 +2967,7 @@ async def _ent_move_group(ctx, args, mgr, m):
             try:
                 n = int(t)
             except ValueError:
-                return await ctx.send(f"Unexpected token '{t}'.")
+                return await ctx.send(f"❌ Unexpected token '{t}'.")
             if i + 1 >= len(tokens):
                 return await ctx.send("❌ Count must be followed by a direction.")
             d = tokens[i + 1]
@@ -3380,7 +3435,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             else:
                 try: n = int(t)
                 except ValueError:
-                    return await ctx.send(f"Unexpected token '{t}'.")
+                    return await ctx.send(f"❌ Unexpected token '{t}'.")
                 if i + 1 >= len(tokens): return await ctx.send("❌ Count must be followed by a direction.")
                 d = tokens[i+1]
                 if normalize_direction(d) is None:
@@ -3612,11 +3667,25 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if hook_log:
                 ack += "\n" + "\n".join(hook_log)
             return await ctx.send(ack)
-        if delta >= 0:
-            e.heal_entity(delta)
+        # One write through the chokepoint (clamps, var hooks, death) whose
+        # hook output reaches the reply; heal_entity / damage_entity go
+        # through the hp property, which drops it.
+        hp_var, _, _ = e._vital_var_names()
+        was_alive = e.is_alive
+        hook_log = e.write_var(hp_var, before + delta)
+        if eid not in m.entities:
+            ack = _hp_ack(eid, mode, delta, before, before + delta, "")
+            ack += f" `{eid}` died."
         else:
-            e.damage_entity(-delta)
-        return await ctx.send(_hp_ack(eid, mode, delta, before, e.hp, ""))
+            if e._match is not None and e.is_alive != was_alive:
+                # What heal_entity / damage_entity do: a revive by heal, or
+                # a death the death pipeline didn't take (a death_condition
+                # that ignores hp), changes who is in the turn order.
+                m._rebuild_turn_order()
+            ack = _hp_ack(eid, mode, delta, before, e.hp, "")
+        if hook_log:
+            ack += "\n" + "\n".join(hook_log)
+        return await ctx.send(ack)
 
     # init
     if sub == "init":# and len(args) >= 3:

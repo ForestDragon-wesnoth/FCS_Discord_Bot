@@ -5,6 +5,7 @@ from typing import Any, List, Dict, Optional, Tuple
 import discord
 from discord.ext import commands
 from logic import MatchManager
+import vtt_commands
 from vtt_commands import registry, run_approved_request
 import shlex
 
@@ -523,16 +524,14 @@ class _ResumeView(discord.ui.View):
         ictx = _InteractionCtx(interaction)
         # Point the run at this match even if the clicked channel shows
         # another one, then put the channel back (run_approved_request's rule).
-        prev = self._mgr.active_by_channel.get(ictx.channel_key)
-        self._mgr.active_by_channel[ictx.channel_key] = self._mid
+        # A click is not a typed command, so it isn't the clicker's `!again`.
+        depth = vtt_commands._RUN_DEPTH.set(1)
         try:
-            await registry.run("match", ["resume"], ictx, self._mgr)
+            with vtt_commands._channel_pointed_at(
+                    self._mgr, ictx.channel_key, self._mid):
+                await registry.run("match", ["resume"], ictx, self._mgr)
         finally:
-            if self._mgr.active_by_channel.get(ictx.channel_key) == self._mid:
-                if prev is None:
-                    self._mgr.active_by_channel.pop(ictx.channel_key, None)
-                else:
-                    self._mgr.active_by_channel[ictx.channel_key] = prev
+            vtt_commands._RUN_DEPTH.reset(depth)
         if _boards:
             await _refresh_boards_for_match(self._mgr, self._mid)
         await self._disable(interaction)
