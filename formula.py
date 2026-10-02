@@ -2176,6 +2176,9 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     "grid_width", "grid_height", "in_bounds",
     "entity_distance", "cell_blocked", "cell_opaque",
     "free_cell_near", "team_members",
+    # zone_distance: body-to-nearest-zone-cell gap; entities_at: every unit
+    # covering a cell (stackable ones included).
+    "zone_distance", "entities_at",
     # Footprint / large-entity primitives. A large entity occupies a W×H
     # rectangle anchored at its top-left cell (entity[X].x / .y); these
     # expose that footprint to formulas.
@@ -2265,6 +2268,7 @@ ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'highest_var', 'lowest_var',
     'grid_width', 'grid_height', 'in_bounds', 'entity_distance',
     'cell_blocked', 'cell_opaque', 'free_cell_near', 'team_members',
+    'zone_distance', 'entities_at',
     'relative_side', 'riders', 'roll_table', 'round_number', 'rule_get',
     'self_id', 'shield_total', 'side_hit', 'slot_capacity', 'slot_free',
     'slot_of', 'slot_riders', 'status_get', 'status_has',
@@ -2398,6 +2402,7 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "each",
     "shuffle",
     "team_members",
+    "entities_at",
     "entities_within",
     "chain_targets",
     "group_members",
@@ -2483,6 +2488,9 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
                         # status_tick_formula evaluation (see
                         # status_tick_when / status_tick_formula rules
                         # and Match.fire_status_tick); None elsewhere.
+    "skip_status",      # on_turn_skipped: the status(es) whose skips_turn
+                        # cost the unit its turn, sorted and comma-joined
+                        # ("stunned" / "frozen, stunned"); None elsewhere.
     # Movement-event bindings. Bound only during on_entity_moved
     # firing (see Match.fire_entity_moved); None elsewhere. from_*
     # are the position the entity moved FROM, to_* are where it
@@ -6951,6 +6959,38 @@ class FormulaEngine:
         ns["cell_opaque"] = _cell_opaque
         ns["free_cell_near"] = _free_cell_near
         ns["team_members"] = _team_members
+
+        def _zone_distance(eid_t: Any, zone: Any,
+                           mode: Any = "square_radius_distance") -> Any:
+            """zone_distance(eid, zone, mode='square_radius_distance'): how
+            far the unit's body is from the nearest cell of the zone — 0
+            when any of its cells is inside. None for a zone with no cells
+            (e.g. a suspended aura)."""
+            _, e = _resolve_entity(eid_t, "zone_distance")
+            if not isinstance(zone, str) or zone not in match.zones:
+                raise FormulaError(f"zone_distance: no zone named {zone!r}.")
+            _distance(0, 0, 0, 0, mode)        # validates the metric name
+            cells = match.zones[zone].get("cells") or ()
+            if not cells:
+                return None
+            return min(match.cell_entity_distance(cx, cy, e, mode)
+                       for cx, cy in cells)
+
+        def _entities_at(x: Any, y: Any) -> list:
+            """entities_at(x, y): ids of every alive unit whose body covers
+            the cell — stackable ones too (cell_entity returns only the one
+            that blocks it) — in turn order, then in the order added. Attached body
+            parts and riders hidden inside a vehicle are left out, as in the
+            other spatial queries. Loopable."""
+            cx = _cell_arg(x, "entities_at", "x")
+            cy = _cell_arg(y, "entities_at", "y")
+            return [e.id for e in match.entities_in_turn_order()
+                    if e.is_alive and not e.is_glued_part
+                    and not e.is_hidden_rider
+                    and (cx, cy) in match.entity_cells(e)]
+
+        ns["zone_distance"] = _zone_distance
+        ns["entities_at"] = _entities_at
 
         def _hit_location(target_t: Any, from_x: Any, from_y: Any,
                           aim: Any = None, aim_weight: Any = None,

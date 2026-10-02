@@ -23,11 +23,20 @@ bot receives actual newlines (Discord message content / CLI stdin), so
 this runner converts `\n`/`\t` back to real characters BEFORE shlex,
 exactly reproducing what the command layer would see.
 
+Reply expectations: a line `?? <text>` right after a command checks that
+the command's reply CONTAINS <text>; `?! <text>` checks that it does NOT.
+They run in order with the commands (above the Expected: prose) and a miss
+prints `❌ Expectation failed`, which is always flagged — the way to check
+wording and refusal messages, which `!assert` (formulas only) can't see.
+Surrounding double quotes on <text> are stripped, so `?? "  spaced "` keeps
+its inner spaces.
+
 Usage:
     python run_scenarios.py                 # run all, summarize failures
     python run_scenarios.py -v              # also print a transcript
     python run_scenarios.py 244 245         # run only these scenarios
     python run_scenarios.py --list          # list scenario numbers/titles
+    python run_scenarios.py --review 613    # full replies next to the prose
 
 Exit code is nonzero if any scenario produced a flagged failure.
 """
@@ -68,7 +77,7 @@ _ALLOW_ERRORS_TAG = "harness-allows-errors"
 # wrong — always a failure, whatever HARNESS-ALLOWS-ERRORS says. Only a
 # scenario demonstrating a failing assert on purpose opts out, with its own
 # `HARNESS-ALLOWS-ASSERT-FAIL` tag.
-_ASSERT_MARKERS = ("❌ Assertion failed",)
+_ASSERT_MARKERS = ("❌ Assertion failed", "❌ Expectation failed")
 _ALLOW_ASSERT_TAG = "harness-allows-assert-fail"
 
 
@@ -127,19 +136,44 @@ def parse_scenarios(path: str) -> List[Tuple[int, str, List[str], "frozenset[str
         for ln in body.splitlines():
             if ln.strip().lower().startswith("expected:"):
                 break
-            if ln.startswith("!"):
+            if ln.startswith("!") or ln.startswith(_EXPECT_PREFIXES):
                 cmds.append(ln)
         out.append((num, title, cmds, allows))
     return out
 
 
+_EXPECT_PREFIXES = ("??", "?!")
+
+
+def _check_expectation(line: str, previous: List[str]) -> str:
+    """The transcript reply for a `?? text` / `?! text` line, checked
+    against the previous command's reply."""
+    want = line[2:].strip()
+    if len(want) >= 2 and want[0] == want[-1] == '"':
+        want = want[1:-1]
+    reply = "\n".join(previous)
+    if not want:
+        return f"❌ Expectation failed: `{line}` has no text to look for."
+    present = want in reply
+    if line.startswith("??"):
+        return ("✅ reply contains the text" if present else
+                f"❌ Expectation failed: the reply doesn't contain {want!r}")
+    return ("✅ reply doesn't contain the text" if not present else
+            f"❌ Expectation failed: the reply contains {want!r}")
+
+
 async def run_one(cmds: List[str]) -> List[Tuple[str, List[str]]]:
     """Run a scenario's commands against a fresh MatchManager. Returns
-    [(command_line, [output_line, ...]), ...]."""
+    [(command_line, [output_line, ...]), ...]. A `??` / `?!` line checks the
+    reply of the command before it (see the module docstring)."""
     mgr = MatchManager()
     ctx = _Ctx()
     transcript: List[Tuple[str, List[str]]] = []
+    previous: List[str] = []
     for line in cmds:
+        if line.startswith(_EXPECT_PREFIXES):
+            transcript.append((line, [_check_expectation(line, previous)]))
+            continue
         ctx.out = []
         body = _interpret_escapes(line.lstrip("!"))
         try:
@@ -154,6 +188,7 @@ async def run_one(cmds: List[str]) -> List[Tuple[str, List[str]]]:
         except Exception as e:  # noqa: BLE001 - surface as a flagged failure
             ctx.out.append(f"💥 Uncaught: {type(e).__name__}: {e}")
         transcript.append((line, list(ctx.out)))
+        previous = list(ctx.out)
     return transcript
 
 
@@ -203,6 +238,33 @@ def header_problems(path: str,
     return problems
 
 
+def scenario_prose(path: str) -> Dict[int, str]:
+    """{number: the scenario's prose from `Expected:` on} — for --review."""
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    out: Dict[int, str] = {}
+    for m in SCENARIO_RE.finditer(text):
+        body = m.group(3)
+        idx = body.lower().find("\nexpected:")
+        if body.lower().startswith("expected:"):
+            idx = 0
+        out[int(m.group(1))] = body[idx:].strip() if idx >= 0 else ""
+    return out
+
+
+def _print_review(num: int, title: str, transcript, prose: str) -> None:
+    """Every command with its FULL reply, then the scenario's prose, so the
+    two can be read side by side (the prose is documentation nobody checks
+    by machine; this is the quick way to spot it drifting)."""
+    print(f"\n{'=' * 72}\nSCENARIO {num} — {title}\n{'=' * 72}")
+    for cmd, outs in transcript:
+        print(f"> {cmd}")
+        for o in outs:
+            for ln in o.splitlines() or [""]:
+                print(f"    {ln}")
+    print(f"{'-' * 72}\n{prose}")
+
+
 async def main_async(args: argparse.Namespace) -> int:
     here = os.path.dirname(os.path.abspath(__file__))
     seq_path = os.path.join(here, "test_sequences.txt")
@@ -225,10 +287,13 @@ async def main_async(args: argparse.Namespace) -> int:
         if missing:
             print(f"⚠️ no such scenario(s): {sorted(missing)}")
 
+    prose = scenario_prose(seq_path) if args.review else {}
     total_fail = 0
     for num, title, cmds, allows in scenarios:
         transcript = await run_one(cmds)
         hits = _flagged(transcript, allows)
+        if args.review:
+            _print_review(num, title, transcript, prose.get(num, ""))
         if args.verbose:
             print(f"\n=== SCENARIO {num} — {title} ===")
             for cmd, outs in transcript:
@@ -272,6 +337,9 @@ def _main() -> None:
                     help="print a per-command transcript")
     ap.add_argument("--list", action="store_true",
                     help="list scenario numbers and titles, then exit")
+    ap.add_argument("--review", action="store_true",
+                    help="print every command's full reply followed by the "
+                         "scenario's Expected prose, to compare the two")
     args = ap.parse_args()
     sys.exit(asyncio.run(main_async(args)))
 

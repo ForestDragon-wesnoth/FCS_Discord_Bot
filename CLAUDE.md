@@ -140,7 +140,13 @@ the scenario says what it expects with `!assert "<formula>" [message]`: a
 false assert prints `❌ Assertion failed`, which the harness ALWAYS flags
 (even under HARNESS-ALLOWS-ERRORS; only `HARNESS-ALLOWS-ASSERT-FAIL`, for a
 scenario demonstrating a failing assert, opts out). Prefer asserts for
-end-state checks in new scenarios (see 597-608). A scenario can "pass" with a `❌` reply that means the
+end-state checks in new scenarios (see 597-608). For REPLY WORDING (a
+refusal message, a reported number) use a `?? <text>` line right after the
+command — the reply must contain the text — or `?! <text>` (must not); a
+miss prints `❌ Expectation failed`, flagged like a failed assert (see
+633-645). `python run_scenarios.py --review N ...` prints every command's
+FULL reply followed by the Expected prose, the quick way to check prose
+against reality. A scenario can "pass" with a `❌` reply that means the
 opposite of what it should. Always also do at least one of:
 
 - Run the new scenarios with `-v` and read the per-line transcript
@@ -2627,7 +2633,7 @@ More shipped work (continuing the list above):
      var value) — substitution is per-token and happens AFTER shlex, so nothing
      re-splits and a player can't smuggle extra args/subcommands through a
      computed value. A space-containing value fed to a numeric arg gives a clean
-     `❌ hp delta must be an integer`, not a split.
+     `❌ hp amount must be a whole number ...`, not a split.
   2. **The `$()` read-only gate is airtight under attack** — every mutating
      function tried (`kill` / `var_set` / `summon` / `status_apply` /
      `damage_part`) is REJECTED with ZERO state change (entity still alive, hp
@@ -3959,6 +3965,75 @@ More shipped work (continuing the list above):
     bodies; `_visible_tile_data` drops corpses failing corpse_visible_to (a
     tile holding only hidden corpses reads as no tile). Shared with
     `!map cell`.
+
+- **Table-control bundle + `!ent hp` sets by default — SHIPPED (scenarios
+  633-645).** Ideas 77, 78, 80, 82, 84, 86, 88, 91, 92, 96, 97.
+  - **`!ent hp` SETS by default (user call, 633-634).** A bare number,
+    `=n` (the way to set a negative value), `max` (max_hp) and a bare
+    `$(expr)` set hp; a leading sign CHANGES it: `+5` heals, `-5` damages,
+    `+$(expr)` / `-$(expr)` a computed change. The ent handler keeps
+    `raw_args` (tokens before its `$()` pass) so `$(x)` resolving to -5 still
+    SETS. A set goes through heal/damage (delta = target − hp), so clamps,
+    hooks and death behave as for any hp write; the reply adds "It is at N"
+    when a clamp or a death changed the result. MIGRATION: every scenario's
+    change written as a bare positive number or bare `$()` was rewritten to
+    the signed form (`-N` lines were already changes); verified by recording
+    every unit's hp after every command on the old code vs the new — the
+    only differences were scenarios 174-175, which roll unseeded random
+    damage. GOTCHA for new scenarios / aliases / macros: `!ent hp x 5` now
+    SETS 5 — write `+5` to heal.
+  - **`!cancel [id|all]` (636)** — a requester withdraws their own queued
+    request (bare = their latest); someone else's → "a host can `!deny`".
+  - **`!match pause [reason]` / `!match resume [drop]` (637-638).**
+    `Match.paused` ({by, reason}; serialized, but `_restore_snapshot` keeps
+    the LIVE value and the pause field is ignored when deciding whether a
+    command changed state, so pause/resume are never undo steps). While
+    paused, a non-host's state-changing command is REFUSED (not queued);
+    reads still run. Rule `pause_affects_hosts` (default off, user call):
+    when on, a host's state-changing command is HELD in the runtime
+    `Match.held_commands` (carried across undo, preserved by action
+    rollback) and the bot asks to unpause — `!match resume` runs them in
+    order through `dispatch_no_snapshot` (one undo entry with the resume),
+    skipping any whose author is no longer a host; `resume drop` discards.
+    Discord: `DiscordCtxWrapper.offer_resume` posts Resume & run / Cancel
+    buttons (`_ResumeView`; Cancel drops that one held command). "State-
+    changing" = effective access other than `all`, MINUS the host-only
+    reads in `_HOST_READS` (`!assert`, `!pending`, `!ent dump/diff`, bare
+    `!match`/`list`, `!map|list|state full`, ...) and undo `preview` —
+    `_pause_control`. A new host-only READ command must be added there or a
+    pause with the rule on will hold it.
+  - **`!again` (639)** — reruns the caller's last command in the channel
+    through a fresh top-level `run()` (gate, pause, undo, watchers).
+    Recorded in `CommandRegistry.run` only at the OUTERMOST level, tracked
+    with a `contextvars` depth (`_RUN_DEPTH`) so interleaved Discord tasks
+    don't see each other's depth; approvals / held commands don't overwrite
+    it; `!again` and `!as` are never remembered. Runtime-only
+    (`mgr._last_commands`, keyed by (channel, user)).
+  - **`!tile copy <x1> <y1> <x2> <y2> [move]` (640)** — copies a cell's
+    tile data (template link, glyph, block/opaque, hooks) over another,
+    replacing it; corpses stay on their own cells on both sides.
+  - **`zone_distance(eid, zone[, mode])` (641)** — body-to-nearest-zone-cell
+    gap, 0 when overlapping, None for a cell-less (suspended) zone.
+    **`entities_at(x, y)` (642)** — every alive unit whose body covers the
+    cell, stackable ones included (`cell_entity` names only the blocker);
+    glued parts and hidden riders left out; loopable. Both ARG_SAFE.
+  - **`on_turn_skipped` hook (643, 645)** — fires on the unit right after
+    the "turn skipped" line, before the turn moves on, binding
+    `skip_status` (the responsible statuses, sorted, comma-joined; new
+    HOOK_CONTEXT name). Also under ATB. FIX found with it:
+    `_skip_to_eligible` bounded its pass with a step count, which a removal
+    mid-pass broke both ways (pass-10 fixed the over-run); it now tracks the
+    ids it has looked at and stops on reaching one again (eligible units are
+    still taken even if seen), with a cap only against an order that keeps
+    growing. A skip handler removing the last unit used to end the pass with
+    "every entity is skippable" before reaching the unit that could act.
+  - **`round_start_message_format` rule (644)** — default "— Round {round}
+    —", printed by `!turn next` at each round start (round 1 included),
+    ahead of round-start hook output. Placeholders {round}, {match},
+    {match.<path>} (missing → empty); empty = no line. No `{first unit}`
+    placeholder on purpose: the line goes to every channel, so it could name
+    a unit a fogged channel can't see.
+  - **Harness (96/97)** — see §2: `??` / `?!` reply checks and `--review`.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

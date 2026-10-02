@@ -1313,7 +1313,7 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
         # In-flight operation guards/state that span a nested rollback.
         "_summon_count", "_death_processing", "_death_check_suppressed_ids",
         "_alive_eval_depth", "_vision_memo", "_turn_order_dirty",
-        "_request_seq", "pending_requests",
+        "_request_seq", "pending_requests", "held_commands",
         # Event bus: the live emit stack/depth + warning latch. Resetting
         # these mid-emit corrupts the outer emit (the verified crash).
         "_event_depth", "_event_stack", "_event_warned", "_event_warnings",

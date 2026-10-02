@@ -25,6 +25,7 @@ from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, val
 import os
 import re
 from fractions import Fraction
+import contextvars
 import json
 import random
 import copy
@@ -576,6 +577,32 @@ class CommandRegistry:
         # access == "host": hosts run directly, everyone else is queued.
         return "allow" if is_host else "queue"
 
+    @staticmethod
+    def _paused_match(ctx: ReplyContext, mgr: MatchManager):
+        mid = mgr.active_by_channel.get(ctx.channel_key)
+        m = mgr.matches.get(mid) if mid is not None else None
+        return m if m is not None and m.paused else None
+
+    async def _hold_command(self, m, name: str, args: List[str],
+                            ctx: ReplyContext):
+        """Hold a host's state-changing command while the match is paused
+        (pause_affects_hosts) and ask to unpause: `!match resume` runs it.
+        A surface with buttons (Discord) offers Resume & run / Cancel."""
+        entry = {"user": ctx_user(ctx), "user_name": ctx_user_name(ctx),
+                 "channel_key": ctx.channel_key, "name": name,
+                 "args": list(args)}
+        m.held_commands.append(entry)
+        offer = getattr(ctx, "offer_resume", None)
+        if callable(offer):
+            return await offer(m, entry)
+        cmd = "!" + name + (" " + " ".join(args) if args else "")
+        n = len(m.held_commands)
+        await ctx.send(
+            f"⏸ **{m.name}** is paused — `{cmd}` is held"
+            + (f" ({n} commands waiting)" if n > 1 else "")
+            + ". `!match resume` unpauses and runs it; `!match resume drop` "
+              "unpauses and discards held commands.")
+
     async def _queue_request(self, name: str, args: List[str],
                              ctx: ReplyContext, mgr: MatchManager):
         """Hold a non-host's command for host approval. Stores the request
@@ -601,6 +628,20 @@ class CommandRegistry:
         )
 
     async def run(self, name: str, args: List[str], ctx: ReplyContext, mgr: MatchManager):
+        # `!again` remembers the command each user typed last in a channel.
+        # Only the OUTERMOST run records: an approval re-dispatch or a held
+        # command running inside `!approve` / `!match resume` is not what the
+        # caller typed. A context var keeps the depth per asyncio task, so
+        # interleaved Discord messages don't see each other's depth.
+        depth_token = _RUN_DEPTH.set(_RUN_DEPTH.get() + 1)
+        try:
+            if _RUN_DEPTH.get() == 1 and name.lower() not in ("again", "as"):
+                _remember_command(mgr, ctx, name, args)
+            return await self._run(name, args, ctx, mgr)
+        finally:
+            _RUN_DEPTH.reset(depth_token)
+
+    async def _run(self, name: str, args: List[str], ctx: ReplyContext, mgr: MatchManager):
         # Alias resolution happens BEFORE handler lookup so an alias can
         # shadow a built-in name on this match.
         name, args = self._resolve_alias(name, args, mgr, ctx)
@@ -637,6 +678,17 @@ class CommandRegistry:
         if gate == "reject_host":
             await ctx.send("❌ Only a host can do that.")
             return
+        # A paused table: non-hosts' state-changing commands are refused
+        # (not queued — the table is on a break), and with
+        # pause_affects_hosts a host's are held for `!match resume`.
+        if not admin_cmd:
+            pm = self._paused_match(ctx, mgr)
+            if pm is not None and self._effective_access(name, args, pm) != "all":
+                if gate == "queue":
+                    return await ctx.send(_paused_msg(pm))
+                if (bool(pm.rules.get("pause_affects_hosts", False))
+                        and not _pause_control(name, args)):
+                    return await self._hold_command(pm, name, args, ctx)
         if gate == "queue":
             return await self._queue_request(name, args, ctx, mgr)
         # gate == "allow" -> fall through and run normally.
@@ -716,7 +768,9 @@ class CommandRegistry:
         if pre_state is not None and pre_active_mid in mgr.matches:
             m_post = mgr.matches[pre_active_mid]
             post_state = m_post.to_dict(include_history=False)
-            if pre_state != post_state:
+            # Pausing is table management that an undo leaves alone (see
+            # _restore_snapshot), so a pause/resume alone is not an undo step.
+            if _differs_beyond_pause(pre_state, post_state):
                 # Build a short, human-meaningful label. The full args
                 # list can be very long (multi-line passive formulas);
                 # cap it so the !history list output stays readable.
@@ -736,6 +790,72 @@ class CommandRegistry:
         return result
 
 registry = CommandRegistry()
+
+# Nesting depth of CommandRegistry.run within one asyncio task (see run()).
+_RUN_DEPTH: "contextvars.ContextVar[int]" = contextvars.ContextVar(
+    "vtt_run_depth", default=0)
+
+
+def _remember_command(mgr: MatchManager, ctx: ReplyContext, name: str,
+                      args: List[str]) -> None:
+    """Record the command a user typed, per channel, for `!again`.
+    Runtime-only, on the manager (it outlives a match switch)."""
+    store = getattr(mgr, "_last_commands", None)
+    if store is None:
+        store = {}
+        mgr._last_commands = store
+    store[(ctx.channel_key, ctx_user(ctx) or "")] = (name, list(args))
+
+
+def _differs_beyond_pause(pre: Dict[str, Any], post: Dict[str, Any]) -> bool:
+    """Whether two match snapshots differ in anything but the pause."""
+    if pre == post:
+        return False
+    if pre.get("paused") == post.get("paused"):
+        return True
+    return ({k: v for k, v in pre.items() if k != "paused"}
+            != {k: v for k, v in post.items() if k != "paused"})
+
+
+# Host-only READS: gated to hosts (they show hidden data) but they change
+# nothing, so a pause with pause_affects_hosts never holds them. root ->
+# the read subcommands (args[0]); None = the whole root is a read.
+_HOST_READS: Dict[str, Optional[frozenset]] = {
+    "assert": None, "pending": None,
+    "ent": frozenset({"dump", "diff"}),
+    "match": frozenset({"list", "info", "channels", "hosts", "outcome"}),
+    "host": frozenset({"list"}),
+    "map": frozenset({"full"}),
+    "list": frozenset({"full"}),
+    "state": frozenset({"full"}),
+}
+
+
+def _pause_control(name: str, args: List[str]) -> bool:
+    """What a host may still run while paused with pause_affects_hosts:
+    `!match pause` / `!match resume`, the host-only reads (`!assert`,
+    `!ent dump`, `!map full`, a bare `!match`, ...), and an undo `preview`."""
+    root = name.lower()
+    sub = str(args[0]).lower() if args else None
+    if root == "match" and sub in ("pause", "resume"):
+        return True
+    if root in ("undo", "history") and any(
+            str(a).lower() == "preview" for a in args):
+        return True
+    if root in _HOST_READS:
+        subs = _HOST_READS[root]
+        if subs is None or (sub is None and root == "match") or sub in subs:
+            return True
+    return False
+
+
+def _paused_msg(m) -> str:
+    p = m.paused or {}
+    who = f" by {p['by']}" if p.get("by") else ""
+    why = f": {p['reason']}" if p.get("reason") else ""
+    return (f"⏸ **{m.name}** is paused{who}{why}. Commands that change the "
+            f"match wait until a host runs `!match resume`; read-only "
+            f"commands still work.")
 
 # ---- Helpers ----------------------------------------------------------------
 
@@ -1331,7 +1451,51 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"**{m.name}** (`{m.id}`) — system `{m.system_name}`, grid "
             f"{m.grid_width}×{m.grid_height}, {clock}, current turn: {turn}, "
             f"fog {'on' if m.fog_enabled else 'off'}, owner "
-            f"{_mention(m.owner) if m.owner else '(none)'}.")
+            f"{_mention(m.owner) if m.owner else '(none)'}."
+            + (f"\n{_paused_msg(m)}" if m.paused else ""))
+    if sub.lower() == "pause":
+        m = active_match(mgr, ctx)
+        if m.paused:
+            return await ctx.send(_paused_msg(m))
+        reason = " ".join(args[1:]).strip()
+        m.paused = {"by": ctx_user_name(ctx), "reason": reason}
+        hosts_too = bool(m.rules.get("pause_affects_hosts", False))
+        return await ctx.send(
+            f"⏸ Paused **{m.name}**" + (f": {reason}" if reason else "")
+            + ". Non-hosts' commands that change the match are refused until "
+              "`!match resume`"
+            + ("; hosts' are held and run on resume (pause_affects_hosts)."
+               if hosts_too else "; hosts keep playing."))
+    if sub.lower() == "resume":
+        m = active_match(mgr, ctx)
+        if len(args) > 2 or (len(args) > 1 and args[1].lower() != "drop"):
+            raise VTTError("Usage: `!match resume [drop]`.")
+        drop = len(args) > 1
+        if not m.paused:
+            return await ctx.send(f"**{m.name}** isn't paused.")
+        m.paused = None
+        held = list(m.held_commands)
+        m.held_commands.clear()
+        if drop or not held:
+            return await ctx.send(
+                f"▶ Resumed **{m.name}**."
+                + (f" Dropped {len(held)} held command(s)." if held else ""))
+        await ctx.send(f"▶ Resumed **{m.name}**; running {len(held)} held "
+                       f"command(s).")
+        for h in held:
+            cmd = "!" + h["name"] + (" " + " ".join(h["args"]) if h["args"] else "")
+            # Whoever held it must still host the match (a co-host may have
+            # been removed while the table was paused).
+            if m.owner is not None and h.get("user") is not None \
+                    and not m.is_host(h["user"]):
+                await ctx.send(f"⏭ Skipped `{cmd}` — {h['user_name']} is no "
+                               f"longer a host.")
+                continue
+            await ctx.send(f"▶ `{cmd}` ({h['user_name']})")
+            run_ctx = (ctx if h["channel_key"] == ctx.channel_key
+                       else _RequesterChannelCtx(ctx, h["channel_key"]))
+            await registry.dispatch_no_snapshot(h["name"], h["args"], run_ctx, mgr)
+        return
     if sub == "new":# and len(args) >= 5:
         if await return_help_if_not_enough_args(ctx, args, 5, "match", "new"):
             return
@@ -1697,6 +1861,23 @@ registry.annotate_sub(
           "elapsed under ATB), whose turn it is, fog, owner."),
 )
 registry.annotate_sub(
+    "match", "pause",
+    usage="!match pause [reason]",
+    desc=("Pause the table (a break, a rules question, the GM setting up). "
+          "While paused, non-hosts' commands that change the match are "
+          "refused — read-only commands still work. Hosts keep playing "
+          "unless the pause_affects_hosts rule is on: then a host's changing "
+          "command is held and the bot asks to unpause. Shown in `!match "
+          "info` and `!whoami`; survives a save, and an undo leaves it alone."),
+)
+registry.annotate_sub(
+    "match", "resume",
+    usage="!match resume [drop]",
+    desc=("Unpause the table. Commands hosts typed while paused "
+          "(pause_affects_hosts) then run in order, as one undo entry; "
+          "`drop` discards them instead."),
+)
+registry.annotate_sub(
     "match", "channels",
     usage="!match channels [<id>]",
     desc="List every channel bound to a match, with labels.",
@@ -1992,6 +2173,13 @@ async def whoami_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     else:
         runs = ("read-only commands run directly; commands that change the "
                 "match wait for a host to approve them")
+    if m.paused:
+        if _acts_as_host(ctx, m) and not bool(
+                m.rules.get("pause_affects_hosts", False)):
+            runs += " (the match is paused, but hosts keep playing)"
+        else:
+            runs = ("⏸ the match is paused — read-only commands run; "
+                    "commands that change it wait for `!match resume`")
     lines.append(f"**Your commands:** {runs}")
     mine = sorted((rid for rid, req in m.pending_requests.items()
                    if user is not None and req.get("user") == user),
@@ -2000,6 +2188,73 @@ async def whoami_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         lines.append(f"**Waiting for approval:** {len(mine)} "
                      f"({', '.join(f'`{r}`' for r in mine)})")
     return await ctx.send("\n".join(lines))
+
+
+@registry.command(
+    "cancel", access="all", snapshot=False,
+    usage="!cancel [<request id> | all]",
+    desc=(
+        "Withdraw your own command that's waiting for host approval: "
+        "`!cancel r3`, `!cancel all`, or a bare `!cancel` for your most "
+        "recent one. Only your own requests — a host clears anyone's with "
+        "`!deny`."
+    ),
+)
+async def cancel_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    m = active_match(mgr, ctx)
+    _check_tail(args, 1, (), "!cancel [<request id> | all]")
+    user = ctx_user(ctx)
+    mine = sorted((rid for rid, req in m.pending_requests.items()
+                   if user is not None and req.get("user") == user),
+                  key=lambda r: int(r[1:]) if r[1:].isdigit() else 0)
+    if not mine:
+        return await ctx.send("You have no requests waiting for approval.")
+    target = args[0] if args else mine[-1]
+    if target.lower() == "all":
+        picked = mine
+    elif target in mine:
+        picked = [target]
+    elif target in m.pending_requests:
+        return await ctx.send(
+            f"❌ `{target}` isn't your request — a host can `!deny {target}`.")
+    else:
+        return await ctx.send(f"❌ No pending request `{target}`.")
+    lines = []
+    for rid in picked:
+        req = m.pop_pending_request(rid)
+        cmd = "!" + req["name"] + (" " + " ".join(req["args"]) if req["args"] else "")
+        lines.append(f"↩ Withdrew `{rid}` (`{cmd}`).")
+    return await ctx.send("\n".join(lines))
+
+
+@registry.command(
+    "again", access="all", snapshot=False, raw_args=True,
+    usage="!again",
+    desc=(
+        "Run the command you last typed in this channel again — e.g. after "
+        "`!ent move hero 2 right`, `!again` moves another 2. It goes through "
+        "the same host approval and pause rules as typing it. Remembered per "
+        "user and channel while the bot runs; `!again` itself (and the CLI's "
+        "`!as`) is never the remembered command."
+    ),
+)
+async def again_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if args:
+        raise VTTError("`!again` takes no arguments.")
+    store = getattr(mgr, "_last_commands", None) or {}
+    last = store.get((ctx.channel_key, ctx_user(ctx) or ""))
+    if last is None:
+        return await ctx.send("❌ Nothing to repeat — you haven't run a "
+                              "command in this channel yet.")
+    name, cargs = last
+    await ctx.send("🔁 `!" + name + (" " + " ".join(cargs) if cargs else "") + "`")
+    # A fresh top-level run: its own gate, pause check, undo entry and
+    # watcher poll, exactly as if retyped.
+    token = _RUN_DEPTH.set(0)
+    try:
+        return await registry.run(name, list(cargs), ctx, mgr)
+    finally:
+        _RUN_DEPTH.reset(token)
 
 
 # ---- approval queue (host approves / denies player commands) -----
@@ -2540,6 +2795,62 @@ _ENT_GROUP_ITERABLE_SUBS = {
 _ENT_GROUP_REJECTING_SUBS = {"add", "tp", "rename", "clone", "diff"}
 
 
+_ENT_HP_USAGE = "!ent hp <id> <n | =n | +n | -n | max> [bypass_clamp=yes]"
+
+
+def _parse_hp_amount(raw: str, resolved: str, e, m,
+                     self_id: Optional[str]) -> Tuple[str, int]:
+    """Read `!ent hp`'s amount token. A leading sign makes it a CHANGE (`+5`
+    heals, `-5` damages, `-$(expr)` / `+$(expr)` a computed change);
+    anything else SETS hp: a bare number, `=n` (the way to set a negative
+    value), a bare `$(expr)`, or `max` (the unit's max_hp). `raw` is the
+    token before $() substitution — `$(expr)` resolving to -5 still sets."""
+    tok = raw.strip()
+    sign = 0
+    if tok[:1] in "+-" and tok[1:].startswith("$("):
+        sign = 1 if tok[0] == "+" else -1
+        tok = resolve_arg_token(tok[1:], m, self_id)
+    elif tok.startswith("$("):
+        tok = resolved
+    elif tok[:1] in "+-":
+        sign = 1 if tok[0] == "+" else -1
+        tok = tok[1:]
+    if sign == 0:
+        if tok.lower() == "max":
+            if e.max_hp is None:
+                raise VTTError(f"`{e.id}` has no max_hp to set hp to.")
+            return "set", int(e.max_hp)
+        if tok.startswith("="):
+            tok = tok[1:]
+            if tok.startswith("$("):
+                tok = resolve_arg_token(tok, m, self_id)
+    try:
+        value = float(tok)
+        if value != int(value):
+            raise ValueError
+        value = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise VTTError(f"hp amount must be a whole number, `max`, `=n` or a "
+                       f"signed change like `-5` — got `{raw}`.")
+    if sign:
+        return "change", sign * value
+    return "set", value
+
+
+def _hp_ack(eid: str, mode: str, delta: int, before: int, after: int,
+            note: str) -> str:
+    """The `!ent hp` reply: what was asked, and the hp it landed on when a
+    clamp (or a death) made that differ."""
+    if mode == "set":
+        msg = f"Set `{eid}` hp to {before + delta} (was {before}{note})."
+    else:
+        verb = "Healed" if delta >= 0 else "Damaged"
+        msg = f"{verb} `{eid}` by {abs(delta)}" + (f" ({note[2:]})" if note else "") + "."
+    if after != before + delta:
+        msg += f" It is at {after}."
+    return msg
+
+
 async def _ent_group_dispatch(ctx, args, mgr, m, sub: str):
     """Handle a `group:NAME` target on the !ent command."""
     if sub in _ENT_GROUP_REJECTING_SUBS:
@@ -2755,6 +3066,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # args[2:]. args[1] may itself be a $() expression — resolved first with
     # self_id=None (self isn't bound yet at that point).
     args = list(args)
+    raw_args = list(args)
     if len(args) >= 2:
         args[1] = resolve_arg_token(args[1], m, self_id=None)
 
@@ -3276,41 +3588,36 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "hp":# and len(args) >= 3:
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "hp"):
             return
-        _check_tail(args, 3, {"bypass_clamp"},
-                    "!ent hp <id> <±n> [bypass_clamp=yes]")
+        _check_tail(args, 3, {"bypass_clamp"}, _ENT_HP_USAGE)
         eid = _resolve_eid(m, args[1]);
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
-        try:
-            delta = int(args[2])
-        except ValueError:
-            return await ctx.send("❌ hp delta must be an integer.")
+        e = m.entities[eid]
+        mode, amount = _parse_hp_amount(raw_args[2], args[2], e, m, self_id)
         # Optional bypass_clamp arg for overheal effects
         bypass_clamp = False
         for extra in args[3:]:
             if extra.startswith("bypass_clamp="):
                 bypass_clamp = _parse_bool(extra[len("bypass_clamp="):])
-        e = m.entities[eid]
+        before = e.hp
+        delta = amount if mode == "change" else amount - before
         if bypass_clamp:
             # Direct write through chokepoint, skipping the heal/damage
             # clamp pipeline. The property setter would re-apply clamps,
             # so we go through write_var explicitly with the bypass flag.
             hp_var, _, _ = e._vital_var_names()
-            new_hp = e.hp + delta
-            hook_log = e.write_var(hp_var, new_hp, bypass_clamp=True)
-            action = "Healed" if delta >= 0 else "Damaged"
-            mag = delta if delta >= 0 else -delta
-            ack = f"{action} `{eid}` by {mag} (clamp bypassed)."
+            hook_log = e.write_var(hp_var, before + delta, bypass_clamp=True)
+            ack = _hp_ack(eid, mode, delta, before, before + delta,
+                          ", clamp bypassed")
             if hook_log:
                 ack += "\n" + "\n".join(hook_log)
             return await ctx.send(ack)
         if delta >= 0:
             e.heal_entity(delta)
-            return await ctx.send(f"Healed `{eid}` by {delta}.")
         else:
             e.damage_entity(-delta)
-            return await ctx.send(f"Damaged `{eid}` by {-delta}.")
-    
+        return await ctx.send(_hp_ack(eid, mode, delta, before, e.hp, ""))
+
     # init
     if sub == "init":# and len(args) >= 3:
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", "init"):
@@ -3705,7 +4012,7 @@ registry.annotate_sub(
         "belong to any number of groups; group membership is stored "
         "separately from entity vars. Once a group exists, most !ent "
         "subcommands accept `group:NAME` as the target to fan out across "
-        "all members (`!ent hp group:swarm 10` heals everyone). "
+        "all members (`!ent hp group:swarm +10` heals everyone). "
         "!ent move on a group is atomic — if any member can't complete "
         "the move, nobody moves; fellow group members are treated as "
         "transparent during path validation. Actions: "
@@ -3847,9 +4154,15 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "ent", "hp",
-    usage="!ent hp <id> <±n> [bypass_clamp=yes]",
-    desc=("Adjust HP by a signed amount; death/prone handled by rules. "
-          "Optional bypass_clamp=yes lets a heal exceed max_hp for overheal effects.")
+    usage=_ENT_HP_USAGE,
+    desc=("Set or change HP. A plain number SETS it (`!ent hp hero 20`), as "
+          "do `max` (the unit's max_hp) and `=n` (the way to set a negative "
+          "value). A leading sign CHANGES it: `+5` heals, `-5` damages; a "
+          "computed change is `-$(expr)` / `+$(expr)`, while a bare "
+          "`$(expr)` sets. Clamps, var hooks and death apply as for any hp "
+          "write; the reply names the final hp when a clamp or a death "
+          "changed the result. Optional bypass_clamp=yes skips the clamps "
+          "(overheal).")
 )
 registry.annotate_sub(
     "ent", "init",
@@ -4087,6 +4400,8 @@ async def match_top_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         oc = m.outcome
         extra = f" — {oc.get('reason')}" if oc.get("reason") else ""
         parts.append(f"🏆 Winner: **{oc.get('winner')}**{extra}")
+    if m.paused:
+        parts.append(_paused_msg(m))
     if m.global_passives:
         parts.append("")
         parts.append("**Global passives:**")
@@ -5785,6 +6100,10 @@ def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot,
     # part of the undone state: carry the queue and the id counter over.
     new_match.pending_requests = old.pending_requests
     new_match._request_seq = old._request_seq
+    # Pausing is table management: an undo doesn't un-pause (or re-pause)
+    # the table, and host commands held for `!match resume` stay held.
+    new_match.paused = old.paused
+    new_match.held_commands = old.held_commands
     # Channel bindings are serialized, but the channels' active pointers
     # (MatchManager.active_by_channel) are not — so a restore that simply
     # took the snapshot's bindings would leave a channel bound SINCE the
@@ -7962,7 +8281,7 @@ def _parse_xy(args: List[str], offset: int = 1) -> Tuple[int, int]:
 
 @registry.command(
     "tile",
-    usage=("!tile <set|line|fill|del|info|list|clear> ..."),
+    usage=("!tile <set|line|fill|copy|del|info|list|clear> ..."),
     desc=(
         "Special-tile data store. Each (x, y) tile has a free-form "
         "data dict — set arbitrary nested keys with `set`, read with "
@@ -8013,6 +8332,46 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if path:
             return await ctx.send(f"Removed `{path}` from tile ({x},{y}).")
         return await ctx.send(f"Cleared tile ({x},{y}).")
+
+    # ---- copy <x1> <y1> <x2> <y2> [move] ----
+    if sub == "copy":
+        if await return_help_if_not_enough_args(ctx, args, 5, "tile", "copy"):
+            return
+        x1, y1 = _parse_xy(args)
+        x2, y2 = _parse_xy(args, 3)
+        extra = [a.lower() for a in args[5:]]
+        if extra not in ([], ["move"]):
+            raise VTTError("Usage: `!tile copy <x1> <y1> <x2> <y2> [move]`.")
+        move = extra == ["move"]
+        if not m.in_bounds(x2, y2):
+            raise VTTError(f"({x2}, {y2}) is off the {m.grid_width}×"
+                           f"{m.grid_height} map.")
+        if (x1, y1) == (x2, y2):
+            raise VTTError("The source and destination are the same cell.")
+        src = m.tiles.get((x1, y1))
+        # Corpses are bodies lying on the cell, stored in its tile data:
+        # they stay where they are (a copy would duplicate corpse ids).
+        data = {k: copy.deepcopy(v) for k, v in (src or {}).items()
+                if k != "corpses"}
+        if not data:
+            return await ctx.send(f"❌ tile ({x1},{y1}) has no tile data to "
+                                  f"{'move' if move else 'copy'}.")
+        dest_corpses = (m.tiles.get((x2, y2)) or {}).get("corpses")
+        if dest_corpses:
+            data["corpses"] = dest_corpses
+        replaced = (x2, y2) in m.tiles and any(
+            k != "corpses" for k in m.tiles[(x2, y2)])
+        m.tiles[(x2, y2)] = data
+        if move:
+            src_corpses = src.get("corpses")
+            if src_corpses:
+                m.tiles[(x1, y1)] = {"corpses": src_corpses}
+            else:
+                del m.tiles[(x1, y1)]
+        verb = "Moved" if move else "Copied"
+        return await ctx.send(
+            f"{verb} tile ({x1},{y1}) to ({x2},{y2})"
+            + (" (its old data replaced)" if replaced else "") + ".")
 
     # ---- info <x> <y> ----
     if sub == "info":
@@ -8681,6 +9040,16 @@ registry.annotate_sub(
         "List every tile that has data, one per line, with its top-"
         "level feature names. For the full nested data dump, use "
         "!tile info on a specific coordinate."
+    ),
+)
+registry.annotate_sub(
+    "tile", "copy",
+    usage="!tile copy <x1> <y1> <x2> <y2> [move]",
+    desc=(
+        "Copy one cell's tile data — template link, glyph, block / opaque, "
+        "hooks, every field — onto another cell, replacing what was there. "
+        "`move` also clears the source. Corpses lying on either cell stay "
+        "put (they're bodies, not terrain)."
     ),
 )
 registry.annotate_sub(

@@ -2621,6 +2621,31 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "dedicated command."
         ),
     },
+    "round_start_message_format": {
+        "default": "— Round {round} —",
+        "schema": {"type": "str"},
+        "desc": (
+            "The line `!turn next` prints when a new round begins (round 1 "
+            "included), ahead of the round-start hook output. Placeholders: "
+            "{round} (the new round number), {match} (the match name) and "
+            "{match.<path>} (a match var, e.g. {match.weather}; a missing "
+            "var renders empty). Empty = no line. Not used under ATB, which "
+            "has no rounds."
+        ),
+    },
+    "pause_affects_hosts": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "While a match is paused (`!match pause`), whether HOSTS are "
+            "paused too. Off (default): hosts keep playing and only "
+            "non-hosts' state-changing commands are refused. On: a host's "
+            "state-changing command is HELD and the bot asks to unpause — "
+            "`!match resume` unpauses and runs the held commands in order, "
+            "`!match resume drop` unpauses and discards them. Read-only "
+            "commands and `!match pause/resume` themselves always run."
+        ),
+    },
     "inline_args_access": {
         "default": "all",
         "schema": {"type": "enum", "choices": ["all", "host"]},
@@ -2953,6 +2978,11 @@ HOOK_NAMES: Set[str] = {
     # `self` and its vars/position still resolve. A death fires on_death
     # instead (as do the parts that go into the dying body's corpse).
     "on_entity_despawned",
+    # A unit lost its turn to a `skips_turn` status. Fires on that unit
+    # (`self`), with `skip_status` = the status name(s) responsible, right
+    # after the "turn skipped" line and before the turn moves on (so before
+    # any round wrap that skip causes).
+    "on_turn_skipped",
     # Death event. Fires on the entity once the death-condition formula
     # evaluates truthy, BEFORE the entity is removed from the match (so
     # `self` is still bound and entity[self].x/.y still resolve). The
@@ -5593,6 +5623,21 @@ class Match:
     # team -> {pid: Passive}: passives that fire for events on any member of
     # the team (self = the member), alongside global + entity passives.
     team_passives: Dict[str, Dict[str, "Passive"]] = field(default_factory=dict)
+
+    # ---- table pause (`!match pause` / `!match resume`) ----
+    # None while play runs; {"by": user name, "reason": str} while paused.
+    # Serialized (a paused table stays paused across a save/load), but an
+    # undo/restore keeps the LIVE value: pausing is table management, not
+    # game state. While paused, non-hosts' state-changing commands are
+    # refused (reads still work); with the pause_affects_hosts rule on, a
+    # host's state-changing command is held in `held_commands` and runs on
+    # `!match resume`.
+    paused: Optional[Dict[str, Any]] = None
+    # Host commands held while paused (pause_affects_hosts): dicts {user,
+    # user_name, channel_key, name, args}. Runtime-only, like the approval
+    # queue below.
+    held_commands: List[Dict[str, Any]] = field(default_factory=list,
+                                                repr=False)
 
     # ---- runtime-only: pending approval queue ----
     # Requests from non-host users awaiting host approval, keyed by a
@@ -9316,6 +9361,9 @@ class Match:
         # First-ever next_turn call: begin round 1 without advancing.
         if not self.round_started:
             self.round_started = True
+            line = self.round_start_line()
+            if line:
+                log.append(line)
             log.extend(self.fire_hook(
                 "on_round_start",
                 own_only_targets=self._attached_tick_parts(list(self.turn_order))))
@@ -9668,8 +9716,11 @@ class Match:
             skipping = self._skipping_statuses(self.entities[new_cur])
             self._atb_last_skipped = bool(skipping)
             if skipping:
-                log.append(f"⏭️ `{new_cur}`'s turn skipped "
-                           f"({', '.join(sorted(skipping))}).")
+                matched = ", ".join(sorted(skipping))
+                log.append(f"⏭️ `{new_cur}`'s turn skipped ({matched}).")
+                log.extend(self.fire_hook(
+                    "on_turn_skipped", target_ids=[new_cur],
+                    extras={"skip_status": matched}))
             # turn_start for the new actor (active_index now points at it).
             log.extend(self._atb_turn_phase(
                 new_cur, "turn_start", act=not skipping))
@@ -9728,6 +9779,9 @@ class Match:
         self.active_index = new_index
         if wrapped:
             self.round_number += 1
+            line = self.round_start_line()
+            if line:
+                log.append(line)
             log.extend(self.fire_hook(
                 "on_round_start",
                 own_only_targets=self._attached_tick_parts(list(self.turn_order))))
@@ -9736,6 +9790,28 @@ class Match:
             log.extend(self.fire_zone_time_hooks("on_round_start"))
             log.extend(self.fire_scheduled_round())
             self.history.record_round(self)
+
+    _ROUND_FMT_RE = re.compile(r"\{(round|match)(?:\.([\w.]+))?\}")
+
+    def round_start_line(self) -> str:
+        """The round_start_message_format line for the round that is
+        starting now ("" when the rule is empty)."""
+        fmt = str(self.rules.get("round_start_message_format", "") or "")
+        if not fmt:
+            return ""
+
+        def sub(mo):
+            if mo.group(1) == "round":
+                return str(self.round_number) if mo.group(2) is None else mo.group(0)
+            if mo.group(2) is None:
+                return self.name
+            cur: Any = self.vars
+            for seg in mo.group(2).split("."):
+                if not isinstance(cur, dict) or seg not in cur:
+                    return ""
+                cur = cur[seg]
+            return str(cur)
+        return self._ROUND_FMT_RE.sub(sub, fmt)
 
     def _skipping_statuses(self, e: "Entity") -> List[str]:
         """Names of `e`'s statuses whose data dict carries
@@ -9756,9 +9832,17 @@ class Match:
         (the caller then passes the round without firing on_turn_start).
         Bounded to one full turn-order cycle so an all-skippable table
         can't loop forever."""
-        n = len(self.turn_order)   # hard cap vs. a skip-hook that GROWS the order
-        checked = 0
-        while checked < n:
+        # Stop on reaching a unit already skipped in this pass: everyone
+        # still in the order has been looked at. Tracking ids (not a step
+        # count) stays right when skip / round hooks SHRINK the order — a
+        # stale count over-ran and fired extra round wraps — and when a hook
+        # removes the unit just skipped (a count sized to the old order then
+        # stopped before reaching a unit that could act). `cap` only guards
+        # against a hook that keeps ADDING skippable units.
+        seen = set()
+        steps = 0
+        cap = 2 * len(self.turn_order) + 2
+        while steps <= cap:
             # A skip's round-wrap (or a skip-status side effect) can empty
             # the order; stop rather than indexing into nothing.
             if not self.turn_order:
@@ -9772,19 +9856,27 @@ class Match:
             skipping = self._skipping_statuses(e)
             if not skipping:
                 return True
+            if cur in seen:
+                return False
+            seen.add(cur)
             matched = ", ".join(sorted(skipping))
             log.append(f"⏭️ `{cur}`'s turn skipped ({matched}).")
-            self._advance_index(log)
-            checked += 1
-            # Bound by the CURRENT order size, not the stale `n`. If a
-            # round-wrap hook SHRANK the order mid-skip, `n` over-counts and
-            # the loop would keep cycling the survivors — firing extra round
-            # wraps (inflating round_number) before exhausting `n`. Once we've
-            # taken a full cycle's worth of steps for the live order and found
-            # nobody eligible, stop.
-            if checked >= len(self.turn_order):
-                return False
-        # Full cycle without finding an eligible entity.
+            log.extend(self.fire_hook(
+                "on_turn_skipped", target_ids=[cur],
+                extras={"skip_status": matched}))
+            if cur in self.turn_order:
+                self._advance_index(log)
+            else:
+                # The handler removed the skipped unit: removal already moved
+                # the pointer onto the next unit ("same"), or marked that the
+                # unit was last ("wrap"), which still needs the round wrap.
+                vacated, self.turn_vacated = self.turn_vacated, None
+                if not self.turn_order:
+                    return False
+                if vacated == "wrap":
+                    self.active_index = len(self.turn_order) - 1
+                    self._advance_index(log)
+            steps += 1
         return False
 
     def _effective_clamp(self, entity: "Entity", path: str) -> Optional["ClampSpec"]:
@@ -13196,6 +13288,7 @@ class Match:
             "border_color": self.border_color,
             "border_opacity": self.border_opacity,
             "render_mode": self.render_mode,
+            "paused": copy.deepcopy(self.paused),
         }
         if include_history:
             d["history"] = self.history.to_dict()
@@ -13420,6 +13513,8 @@ class Match:
             and not isinstance(bop, bool) else None
         rm = d.get("render_mode")
         m.render_mode = rm if rm in ("text", "image") else "text"
+        pz = d.get("paused")
+        m.paused = copy.deepcopy(pz) if isinstance(pz, dict) else None
         # History is optional in saved dicts. It's only present when the
         # original save was made with include_history=True. A snapshot's
         # state.dict deliberately omits history (snapshots-within-

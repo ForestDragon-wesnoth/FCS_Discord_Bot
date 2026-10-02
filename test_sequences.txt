@@ -17,9 +17,9 @@ SCENARIO 1 — Setup, formulas, and inline $() substitution
 !eval "entity[rogue].hp + entity[hero].hp"
 !eval "min(entity[hero].hp, entity[rogue].hp)"
 !ent set_var hero regen 7
-!ent hp hero "$(entity[this].hp * -1 + 5)"
+!ent hp hero "+$(entity[this].hp * -1 + 5)"
 !eval "entity[hero].hp"
-!ent hp hero "$(entity[self].regen)"
+!ent hp hero "+$(entity[self].regen)"
 !eval "entity[hero].hp"
 
 Expected: list shows two entities, Rogue first (initiative 20 beats Hero's 10, so
@@ -211,7 +211,7 @@ SCENARIO 9 — Error handling sanity checks
 !eval "entity[ghost].hp"
 !eval "[x for x in range(3)]"
 !eval "__import__('os')"
-!ent hp self 5
+!ent hp self +5
 !passive add hero bad on_lunch_break "entity[self].hp = 1"
 !passive add hero bad on_turn_start "entity[self].x[0]"
 !passive add ghost x on_turn_start "1"
@@ -254,7 +254,7 @@ SCENARIO 10 — Conditional flow in formulas (if/elif/else, ternary)
 !eval "entity[hero].hp"
 !ent set_var hero blessed 1
 !ent set_var hero hp 10
-!ent hp hero "$(15 if entity[self].blessed else 5)"
+!ent hp hero "+$(15 if entity[self].blessed else 5)"
 !eval "entity[hero].hp"
 
 Expected: ternary returns 5; first if/else hits then-branch (stamina 5 ->
@@ -456,7 +456,7 @@ SCENARIO 20 — Property setters route through chokepoint (no more limitation)
 !passive add hero hp_audit on_var_changed target=hp scope=exact "entity[self].hp_audit_log = entity[self].hp_audit_log + \"|\" + str(old_value) + \"->\" + str(new_value)"
 !ent set_var hero hp_audit_log start
 !ent hp hero -5
-!ent hp hero 10
+!ent hp hero +10
 !ent hp hero -8
 !eval "entity[hero].hp_audit_log"
 
@@ -474,13 +474,13 @@ SCENARIO 21 — Default soft clamp on hp via max_hp
 !match use m21
 !ent add hero Hero 30 4 4 10
 !ent set_var hero hp 10
-!ent hp hero 100
+!ent hp hero +100
 !ent info hero
 !ent set_var hero hp 50
 !ent set_var hero hp 80
 
 Expected: Hero starts at hp=30/30. After !ent set_var hp 10, hp=10. The
-huge heal !ent hp hero 100 raises hp from 10 toward 110 but the default
+huge heal !ent hp hero +100 raises hp from 10 toward 110 but the default
 soft clamp engages (crossing from below max_hp=30), so hp lands at 30.
 Then setting hp directly to 50 puts hp above max (since soft is dormant
 when not crossing from below — but setting 50 is a write from below the
@@ -495,7 +495,7 @@ SCENARIO 22 — Bypass clamp for overheal
 !match use m22
 !ent add hero Hero 30 4 4 10
 !ent set_var hero hp 10
-!ent hp hero 100 bypass_clamp=yes
+!ent hp hero +100 bypass_clamp=yes
 !ent info hero
 !ent set_var hero hp 999 bypass_clamp=yes
 !ent info hero
@@ -551,9 +551,9 @@ SCENARIO 25 — Overheal tracking passive via was_clamped/intended_value
 !ent set_var hero hp 5
 !ent set_var hero overheal_log 0
 !passive add hero overheal_track on_var_changed target=hp scope=exact "entity[self].overheal_log = entity[self].overheal_log + (intended_value - new_value) if was_clamped else entity[self].overheal_log"
-!ent hp hero 100
+!ent hp hero +100
 !ent info hero
-!ent hp hero 50
+!ent hp hero +50
 
 Expected: Hero hp goes from 5 toward 105 but clamps at max_hp=30, so the
 overheal passive sees intended_value=105, new_value=30, was_clamped=True
@@ -587,7 +587,7 @@ Stage A: on_var_changed catches heal-from-below clamping
 !ent set_var hero overheal_changed 0
 !passive add hero track_changed on_var_changed target=hp scope=exact "entity[self].overheal_changed = entity[self].overheal_changed + (intended_value - new_value) if was_clamped else entity[self].overheal_changed"
 !ent set_var hero hp 5
-!ent hp hero 100
+!ent hp hero +100
 !ent info hero
 
 Result: hp goes from 5 toward 105 but the default soft clamp engages at
@@ -597,7 +597,7 @@ just the existing hooks.
 
 Stage B: the gap — heal at full HP produces NO on_var_changed event
 
-!ent hp hero 50
+!ent hp hero +50
 !ent info hero
 
 Result: hp stays at 30 (already at cap, soft clamp dormant from below
@@ -611,9 +611,9 @@ Stage C: on_var_write_attempt closes the gap
 !ent set_var hero overheal_attempt 0
 !passive add hero track_attempt on_var_write_attempt target=hp scope=exact "entity[self].overheal_attempt = entity[self].overheal_attempt + (intended_value - new_value) if intended_value > new_value else entity[self].overheal_attempt"
 !ent set_var hero hp 5
-!ent hp hero 100
+!ent hp hero +100
 !ent info hero
-!ent hp hero 50
+!ent hp hero +50
 !ent info hero
 !eval "entity[hero].overheal_attempt"
 !eval "entity[hero].overheal_changed"
@@ -646,7 +646,7 @@ SCENARIO 27 — on_var_write_attempt fires on bypassed writes
 !ent set_var hero attempt_log ""
 !passive add hero audit on_var_write_attempt target=hp scope=exact "entity[self].attempt_log = entity[self].attempt_log + \"|\" + str(intended_value) + \"->\" + str(new_value)"
 !ent set_var hero hp 25
-!ent hp hero 100 bypass_clamp=yes
+!ent hp hero +100 bypass_clamp=yes
 !ent set_var hero hp 5
 !ent info hero
 
@@ -1038,9 +1038,9 @@ SCENARIO 50 — Reading and writing inside formulas via $(...)
 !match use sub50
 !ent add hero Hero 30 3 3 10
 !ent set_var hero strength 8
-!ent hp hero "$(entity[this].strength * -2)"
+!ent hp hero "+$(entity[this].strength * -2)"
 !ent info hero
-!ent hp hero "$(entity[this].strength)"
+!ent hp hero "+$(entity[this].strength)"
 !ent info hero
 
 Expected: First $() evaluates to strength*-2 = -16, applied as damage
@@ -1411,7 +1411,7 @@ SCENARIO 68 — Berserker: damage output scales with missing HP
 
 Expected: Damage formula evaluates to base + missing_hp/5 = 5 + 24/5 =
 5 + 4 = 9. At full HP it would be 5; at 6 HP it's 9. Use the result
-as a damage value: !ent hp foe "$(...)".
+as a damage value: !ent hp foe "+$(...)".
 
 
 SCENARIO 69 — Phase transition: boss changes state below 50% hp
@@ -1665,7 +1665,7 @@ SCENARIO 80 — Resistance: damage multiplier based on type
 
 Expected: Hero has 50% fire resistance and 0% ice resistance. Computed
 damage: fire 20 * 50/100 = 10, ice 20 * 100/100 = 20. Apply via
-!ent hp hero "$(...)" with the appropriate calculation.
+!ent hp hero "+$(...)" with the appropriate calculation.
 
 
 SCENARIO 81 — Counter-attack: when you dodge, you hit back
@@ -1798,9 +1798,9 @@ SCENARIO 87 — Use intended_value to validate writes that would have been waste
 !ent set_var hero wasted_heal_log 0
 !passive add hero heal_audit on_var_write_attempt target=hp scope=exact "if intended_value > old_value and intended_value > new_value:\n    entity[self].wasted_heal_log = entity[self].wasted_heal_log + (intended_value - new_value)"
 !ent set_var hero hp 25
-!ent hp hero 100
+!ent hp hero +100
 !ent info hero
-!ent hp hero 30
+!ent hp hero +30
 
 Expected: First heal: intended=125, new=30, wasted=95. Counter += 95.
 Second heal at full: intended=60, new=30, wasted=30. Counter += 30.
@@ -1838,8 +1838,8 @@ SCENARIO 89 — Was_clamped flag distinguishes natural changes from clamped ones
 !ent set_var hero clamped_count 0
 !ent set_var hero unclamped_count 0
 !passive add hero distinguish on_var_changed target=hp scope=exact "if was_clamped:\n    entity[self].clamped_count = entity[self].clamped_count + 1\nelse:\n    entity[self].unclamped_count = entity[self].unclamped_count + 1"
-!ent hp hero 3
-!ent hp hero 100
+!ent hp hero +3
+!ent hp hero +100
 !ent hp hero -10
 !ent info hero
 
@@ -1950,7 +1950,7 @@ SCENARIO 95 — Bypass clamp for overheal scaling
 !match use oh95
 !ent add hero Hero 30 3 3 10
 !ent set_var hero hp 25
-!ent hp hero 50 bypass_clamp=yes
+!ent hp hero +50 bypass_clamp=yes
 !ent info hero
 
 Expected: Heal 25→75, bypassing the max_hp=30 clamp. Useful for
@@ -1984,7 +1984,7 @@ SCENARIO 97 — Removing the default hp clamp lets hp go free
 !match use free97
 !ent add hero Hero 30 3 3 10
 !gclamp remove hp
-!ent hp hero 100
+!ent hp hero +100
 !ent info hero
 !gclamp add hp max=max_hp mode=soft
 
@@ -2247,7 +2247,7 @@ SCENARIO 112 — $() with self binding
 !match use arg112
 !ent add hero Hero 30 3 3 10
 !ent set_var hero atk 8
-!ent hp hero "$(entity[self].atk * -1)"
+!ent hp hero "+$(entity[self].atk * -1)"
 !ent info hero
 
 Expected: $() evaluates with self=hero (the entity in arg[1] of !ent hp).
@@ -2263,7 +2263,7 @@ SCENARIO 113 — $() with this binding (current-turn entity)
 !ent add foe Foe 25 5 5 20
 !turn next
 !ent set_var foe weapon_dmg 12
-!ent hp hero "$(entity[this].weapon_dmg * -1)"
+!ent hp hero "+$(entity[this].weapon_dmg * -1)"
 !ent info hero
 
 Expected: Foe is current (init=20). $() resolves this=foe. Foe's
@@ -2290,10 +2290,10 @@ SCENARIO 115 — Conditional damage via $()
 !match use arg115
 !ent add hero Hero 30 3 3 10
 !ent set_var hero dodging 0
-!ent hp hero "$(0 if entity[self].dodging else -10)"
+!ent hp hero "+$(0 if entity[self].dodging else -10)"
 !ent info hero
 !ent set_var hero dodging 1
-!ent hp hero "$(0 if entity[self].dodging else -10)"
+!ent hp hero "+$(0 if entity[self].dodging else -10)"
 !ent info hero
 
 Expected: First hit: dodging=0, takes -10, hp 30→20. Second hit:
@@ -2439,7 +2439,7 @@ SCENARIO 125 — Self unbound at command level
 !match new self125 SelfUnbound 6 6
 !match use self125
 !ent add hero Hero 30 3 3 10
-!ent hp self 5
+!ent hp self +5
 !eval "entity[self].hp"
 
 Expected: Both fail. `self` is only bound inside passive formulas and
@@ -2562,7 +2562,7 @@ SCENARIO 132 — Counter-attack damage based on enemy's missing HP
 !ent add foe Foe 100 5 5 20
 !turn next
 !ent set_var foe hp 20
-!ent hp hero "$((entity[this].max_hp - entity[this].hp) // 5)"
+!ent hp hero "+$((entity[this].max_hp - entity[this].hp) // 5)"
 !ent info hero
 
 Expected: Foe (this) is at 20/100, missing 80. Execute heal scales with
@@ -2666,7 +2666,7 @@ SCENARIO 137 — Cumulative damage tracker (lifetime stat)
 !passive add hero track_damage on_var_changed target=hp scope=exact "if new_value < old_value:\n    entity[self].damage_taken_lifetime = entity[self].damage_taken_lifetime + (old_value - new_value)"
 !ent hp hero -5
 !ent hp hero -8
-!ent hp hero 3
+!ent hp hero +3
 !ent hp hero -10
 !ent info hero
 
@@ -3021,7 +3021,7 @@ SCENARIO 154 — Multiple matching var passives all fire on one event
 !passive add hero count_changes on_var_changed target=hp scope=exact "entity[self].hp_changes = entity[self].hp_changes + 1"
 !passive add hero count_writes on_var_written target=hp scope=exact "entity[self].written_events = entity[self].written_events + 1"
 !ent hp hero -5
-!ent hp hero 3
+!ent hp hero +3
 !ent info hero
 
 Expected: hp_changes=2 (both writes produced changes), written_events=2
@@ -3220,7 +3220,7 @@ SCENARIO 162 — Iterating !ent subcommands across a group
 !ent face group:mooks down
 !ent info group:mooks
 !ent group new ghosts
-!ent hp group:ghosts 5
+!ent hp group:ghosts +5
 
 Expected: '!ent hp group:mooks -5' damages each of a, b, c by 5
 (three separate ack lines, one per member). 'set_var group:mooks
@@ -6628,7 +6628,7 @@ SCENARIO 262 — !alias define / list / info / use / overwrite / delete
 !alias info dmg
 !dmg -5
 !ent dump hero
-!heal 7
+!heal +7
 !ent dump hero
 !alias def dmg "ent set_var this"
 !alias info dmg
@@ -6643,7 +6643,7 @@ Expected:
 `!alias def dmg "ent hp this"` and `!alias def heal "ent hp this"`,
 list shows both with their expansions. `!alias info dmg` shows
 `!dmg` -> `!ent hp this`. `!dmg -5` expands to `!ent hp this -5`,
-damaging hero to 25; `!heal 7` heals back to 32 (capped at 30
+damaging hero to 25; `!heal +7` heals back to 32 (capped at 30
 unless max_hp differs — depending on default clamp behaviour the
 final HP may be 30). Redefining `dmg` to `ent set_var this` shows
 the before/after in the response, then `!dmg poked yes` sets the
@@ -13960,8 +13960,8 @@ SCENARIO 541 — Inline $() args: read-only math/dice/reads across commands
 !ent add goblin Goblin 30 6 6 5
 !dist $(2+3) $(1+1) 10 10
 !dist boss $(5+1) $(5+1)
-!ent hp goblin $(0-5)
-!ent hp boss $(0-1*entity[goblin].hp)
+!ent hp goblin +$(0-5)
+!ent hp boss +$(0-1*entity[goblin].hp)
 !map center $(3+3) $(2+2)
 !status def burn
 !status apply goblin burn $(1+1) $(2*3)
@@ -13971,7 +13971,7 @@ formula and substituted with the result, for any command except the raw_args
 ones (eval/batch/run/foreach/macro do it per-line; ent does its own self-aware
 pass). `!dist $(2+3) $(1+1) 10 10` measures (5,2)→(10,10). `$()` can read entity
 vars via `entity[goblin].hp` (quote-free literal id) and roll dice (`$(2d6)`).
-`!ent hp goblin $(0-5)` damages by 5 (ent self-handles $()). `!status apply
+`!ent hp goblin +$(0-5)` damages by 5 (ent self-handles $()). `!status apply
 goblin burn $(1+1) $(2*3)` applies burn at level 2, duration 6. All reads/maths;
 no state mutated by the substitution itself.
 
@@ -14016,11 +14016,11 @@ SCENARIO 543 — Inline $() args: per-line in macro + ent self-handling
 !match new ml MacroArgs 10 10 ml
 !match use ml
 !ent add goblin Goblin 30 4 4 5
-!macro set zap ent hp $1 $(0-4)
+!macro set zap ent hp $1 +$(0-4)
 !macro run zap goblin
 !macro set measure dist $(1+1) 1 5 5
 !macro run measure
-!batch dist $(2+2) 1 6 6 ; ent hp goblin $(0-1)
+!batch dist $(2+2) 1 6 6 ; ent hp goblin +$(0-1)
 
 Expected: `$(...)` resolves PER LINE inside a macro / batch (dispatch_no_snapshot
 applies the same read-only gate per sub-command). `!macro set zap ent hp $1
@@ -14037,16 +14037,16 @@ SCENARIO 544 — Macro control flow: repeat + $# loop index + nesting
 !match new mr MacroRepeat 12 12
 !match use mr
 !ent add g Goblin 100 2 2 5
-!macro set tri "repeat 3\nent hp g $(0-2)\nend"
+!macro set tri "repeat 3\nent hp g +$(0-2)\nend"
 !macro run tri
 !macro set idx "repeat 4\nent set_var g last $#\nend"
 !macro run idx
-!macro set nest "repeat 2\nif entity[g].hp > 0\nent hp g $(0-1)\nend\nend"
+!macro set nest "repeat 2\nif entity[g].hp > 0\nent hp g +$(0-1)\nend\nend"
 !macro run nest
 !ent dump g
 
 Expected: a macro can `repeat <count>\n...\nend` to loop a block; the count is a
-read-only formula. `tri` repeats `ent hp g $(0-2)` three times (100 → 94). `$#`
+read-only formula. `tri` repeats `ent hp g +$(0-2)` three times (100 → 94). `$#`
 is the current 1-based iteration, so `idx` leaves `last=4` after four passes.
 Blocks nest: `nest` repeats an `if`-guarded damage twice (94 → 92). The whole
 macro run is ONE undo entry. A macro with no directives still runs linearly
@@ -14059,7 +14059,7 @@ SCENARIO 545 — Macro control flow: if / elif / else branching
 !match new mb MacroBranch 10 10
 !match use mb
 !ent add g Goblin 30 2 2 5
-!macro set heal "if entity[g].hp < 10\nent hp g 20\nelse\nent hp g 1\nend"
+!macro set heal "if entity[g].hp < 10\nent hp g +20\nelse\nent hp g +1\nend"
 !macro run heal
 !ent hp g -25
 !macro run heal
@@ -14081,11 +14081,11 @@ SCENARIO 546 — Macro control flow: read-only conditions + structure + clamp
 !match use ms
 !ent add g Goblin 100 2 2 5
 !system set default macro_repeat_limit 5
-!macro set evil "if kill(g)\nent hp g 1\nend"
+!macro set evil "if kill(g)\nent hp g +1\nend"
 !macro run evil
-!macro set big "repeat 99999\nent hp g $(0-1)\nend"
+!macro set big "repeat 99999\nent hp g +$(0-1)\nend"
 !macro run big
-!macro set broken "if entity[g].hp > 0\nent hp g 1"
+!macro set broken "if entity[g].hp > 0\nent hp g +1"
 !ent dump g
 
 Expected: macro control-flow formulas are evaluated with the SAME strict read-
@@ -14279,7 +14279,7 @@ SCENARIO 553 — Non-numeric numeric args give ❌, not 💥 (ent hp/init/add/tp
 
 Expected: the four `!ent` subcommands that were missing int() guards
 (hp/init/add/tp) now return a clean ❌ on a non-numeric numeric arg instead of a
-💥 (`ent hp h abc` → "hp delta must be an integer", `ent init h abc`, `ent tp h
+💥 (`ent hp h abc` → "hp amount must be a whole number, `max`, `=n` or a signed change", `ent init h abc`, `ent tp h
 a b` → "x and y must be integers", `ent add z Z 10 x 2` → "hp, x, y ... must be
 integers"). The crash was pre-mutation so no state was corrupted — it was a 💥
 where a ❌ belongs. A valid `ent hp h -5` still works (damages by 5).
@@ -14351,7 +14351,7 @@ SCENARIO 556 — Macro backstops don't break legitimate loops / nesting
 !match new mok MacroOK 8 8
 !match use mok
 !ent add g Goblin 100 2 2 5
-!macro set tri "repeat 3\nent hp g $(0-2)\nend"
+!macro set tri "repeat 3\nent hp g +$(0-2)\nend"
 !macro run tri
 !macro set leaf "ent set_var g touched 1"
 !macro set mid "macro run leaf"
@@ -14363,7 +14363,7 @@ SCENARIO 556 — Macro backstops don't break legitimate loops / nesting
 
 Expected: the runaway backstops leave normal macros untouched. Charging loop
 ITERATIONS against macro_step_limit doesn't break a bounded loop — `tri` still
-repeats `ent hp g $(0-2)` three times (100 → 94). Legitimate macro NESTING under
+repeats `ent hp g +$(0-2)` three times (100 → 94). Legitimate macro NESTING under
 the recursion limit still works: `top` → `mid` → `leaf` is 3 deep (well under the
 default 20) and sets `touched=1`; the depth counter resets between top-level
 runs, so running `top` a second time (after zeroing) sets `touched=1` again.
@@ -15892,7 +15892,7 @@ SCENARIO 602 — !assert stops the enclosing batch, macro, foreach and action
 !assert "entity[hero].hp == 18" three drains ran, the fourth never did, nor the -100
 !foreach team=red ; ent hp $id -1 ; assert "entity[$id].hp > 15"
 !assert "entity[orc].hp == 9 and entity[imp].hp == 20" the sweep stopped at the orc
-!batch macro run drain ; ent hp hero 50
+!batch macro run drain ; ent hp hero +50
 !assert "entity[hero].hp == 14" the nested stop skipped the heal too
 !ent set_var hero actions.guarded.target none
 !ent set_var hero actions.guarded.body "entity[self].hp = entity[self].hp + 5\ncmd('assert \"entity[hero].hp > 100\"')\nentity[self].hp = 1"
@@ -16890,3 +16890,494 @@ carol, `!tile info 4 4` shows the tile's glyph but no `corpses` entry
 corpse; `!tile list` lists (4, 4) with only `glyph` and (5, 4) with
 `corpses`. `!list`'s Dead: section shows only the mook. From an
 omniscient channel the host's `!tile info 4 4` includes the spy's corpse.
+
+
+SCENARIO 633 — !ent hp sets by default; a sign changes it
+---------------------------------------------------------
+
+!match new h633 HP 8 6
+!match use h633
+!ent add hero Hero 30 2 2 10
+!ent add orc Orc 20 4 2 5
+!ent hp hero 20
+?? Set `hero` hp to 20 (was 30)
+!ent hp hero -3
+?? Damaged `hero` by 3
+!ent hp hero +5
+?? Healed `hero` by 5
+!assert "entity[hero].hp == 22"
+!ent hp hero max
+!assert "entity[hero].hp == 30" max sets to max_hp
+!ent hp hero 45
+?? It is at 30
+!assert "entity[hero].hp == 30" a set above max_hp is clamped like a heal
+!ent hp hero 45 bypass_clamp=yes
+?? (was 30, clamp bypassed)
+!assert "entity[hero].hp == 45"
+!ent set_var orc dmg 6
+!ent hp orc -$(entity[orc].dmg)
+?? Damaged `orc` by 6
+!ent hp orc "$(entity[orc].dmg)"
+?? Set `orc` hp to 6
+!ent hp orc +$(entity[orc].dmg)
+!assert "entity[orc].hp == 12" a bare $() sets, a signed one changes
+!ent group add pack orc
+!ent group add pack hero
+!ent hp group:pack 10
+!assert "entity[orc].hp == 10 and entity[hero].hp == 10" a group target sets each member
+!ent hp group:pack +4
+!assert "entity[orc].hp == 14 and entity[hero].hp == 14"
+!ent hp hero 2.5
+?? whole number
+!ent hp hero =
+?? hp amount must be
+
+Expected: HARNESS-ALLOWS-ERRORS. A plain number sets hp (30 → 20); `-3`
+damages and `+5` heals (→ 22); `max` sets max_hp (30). Setting 45 runs
+through the max_hp clamp like a heal, so the reply adds "It is at 30";
+`bypass_clamp=yes` lets it stand (45). For a computed amount the sign
+sits in front of the `$()`: `-$(entity[orc].dmg)` damages by 6, a bare
+`"$(...)"` sets 6, `+$(...)` heals 6 (→ 12). A group target sets or
+changes every member. A fraction and an empty `=` are refused (❌). Each
+`??` line checks the reply wording.
+
+
+SCENARIO 634 — !ent hp set in real use: a rally macro, `=-n`, and a lethal set
+------------------------------------------------------------------------------
+
+!match new h634 Rally 8 6
+!match use h634
+!ent add hero Hero 30 2 2 10
+!ent add rook Rook 25 3 2 8
+!ent add imp Imp 6 5 5 1
+!ent hp hero -18
+!ent hp rook -20
+!macro set rally "ent hp $1 max\nent hp $2 max"
+!macro run rally hero rook
+!assert "entity[hero].hp == 30 and entity[rook].hp == 25" the macro sets both back to max_hp
+!alias def setto "ent hp"
+!setto rook 9
+!assert "entity[rook].hp == 9" an alias over !ent hp sets too
+!ent hp imp 0
+?? Set `imp` hp to 0
+!assert "has_corpse('imp')" setting hp to 0 runs the death check like damage
+!ent hp hero =-4
+!assert "has_corpse('hero')" =-4 sets a negative value
+
+Expected: The `rally` macro uses `ent hp <id> max` to restore both units
+to their max_hp (30 and 25). An alias over `ent hp` sets as well (rook →
+9). Setting the imp's hp to 0 kills it through the normal death pipeline
+(it leaves a corpse), and `=-4` sets a negative value, which also kills
+the hero.
+
+
+SCENARIO 635 — Harness `??` / `?!` reply checks (a failing one on purpose)
+--------------------------------------------------------------------------
+
+!match new e635 Expect 8 6
+!match use e635
+!ent add hero Hero 30 2 2 10
+!ent move hero 1 right
+?? Moved `hero`
+?! ❌
+!ent move nobody 1 right
+?? not found
+?! Moved
+!ent info hero
+?? "Hero"
+?? this text is not in the reply
+
+Expected: HARNESS-ALLOWS-ERRORS. HARNESS-ALLOWS-ASSERT-FAIL. A `?? text`
+line checks that the reply of the command just before it contains the
+text; `?! text` checks it does not. Surrounding double quotes are
+stripped. The last line fails on purpose (❌ Expectation failed), which
+is why this scenario carries HARNESS-ALLOWS-ASSERT-FAIL — every other
+scenario has failing expectations flagged.
+
+
+SCENARIO 636 — !cancel: a player withdraws their own queued requests
+-------------------------------------------------------------------
+
+!match new c636 Cancel 8 6
+!match use c636
+!ent add hero Hero 30 2 2 10
+!ent add gob Gob 10 5 2 5
+!as player carol
+!ent move gob 1 down
+?? request `r1`
+!cancel
+?? Withdrew `r1`
+!ent move gob 1 down
+!ent move gob 1 left
+!ent hp gob -1
+!cancel r3
+?? Withdrew `r3`
+!as player dan
+!ent tp gob 1 1
+!cancel r2
+?? isn't your request
+!as player carol
+!cancel all
+?? Withdrew `r2`
+?? Withdrew `r4`
+!cancel
+?? You have no requests waiting
+!as host
+!pending
+?? `r5` by dan
+?! by carol
+
+Expected: HARNESS-ALLOWS-ERRORS. A bare `!cancel` withdraws carol's
+latest request (`r1`). `!cancel r3` withdraws one by id. Dan can't
+cancel carol's `r2` (❌ — a host uses `!deny`). `!cancel all` withdraws
+carol's remaining requests (`r2`, `r4`), after which she has none. The
+host's `!pending` lists only dan's `r5`.
+
+
+SCENARIO 637 — !match pause: players wait, reads still work, hosts keep playing
+------------------------------------------------------------------------------
+
+!match new p637 Pause 8 6
+!match use p637
+!ent add hero Hero 30 2 2 10
+!ent add gob Gob 10 5 2 5
+!match pause rules question
+?? hosts keep playing
+!as player carol
+!ent move gob 1 down
+?? is paused by cli: rules question
+?! request
+!list
+?? Gob
+!whoami
+?? the match is paused
+!match info
+?? paused
+!as host
+!pending
+?? No pending requests
+!ent move hero 1 right
+?? Moved `hero`
+!ent hp gob -2
+!undo command
+!assert "entity[gob].hp == 10"
+!match info
+?? is paused
+!match pause again
+?? is paused by cli
+!match resume
+?? Resumed
+!as player carol
+!ent move gob 1 down
+?? needs host approval
+
+Expected: HARNESS-ALLOWS-ERRORS. While paused, carol's state-changing
+command is refused outright with the reason (not queued — `!pending` stays
+empty), while `!list`, `!whoami` and `!match info` still work and say the
+match is paused. Hosts keep playing (pause_affects_hosts is off): the
+host moves the hero and damages the goblin. An undo reverts the damage but
+leaves the pause in place (pausing isn't game state). A second `!match
+pause` reports the existing pause. After `!match resume`, carol's
+commands queue for approval again.
+
+
+SCENARIO 638 — pause_affects_hosts: held host commands run on resume
+--------------------------------------------------------------------
+
+!system set default pause_affects_hosts true
+!match new p638 Hold 8 6
+!match use p638
+!ent add hero Hero 30 2 2 10
+!ent add gob Gob 10 5 2 5
+!host add bob
+!match pause
+?? hosts' are held
+!ent move hero 1 right
+?? `!ent move hero 1 right` is held
+!ent hp gob -3
+?? 2 commands waiting
+!map
+?! held
+!assert "entity[hero].x == 2 and entity[gob].hp == 10" nothing ran yet
+!match resume
+?? running 2 held command(s)
+?? Damaged `gob` by 3
+!assert "entity[hero].x == 3 and entity[gob].hp == 7" both ran, in order
+!assert "entity[hero].x == 3"
+?! held
+!undo command
+!assert "entity[hero].x == 2 and entity[gob].hp == 10" the resume and its held commands are one undo entry
+!match pause
+!as player bob
+!ent hp gob -1
+?? is held
+!as host
+!ent hp gob -2
+!system set default pause_affects_hosts false
+!host remove bob
+!system set default pause_affects_hosts true
+!match resume
+?? Skipped `!ent hp gob -1` — bob is no longer a host
+?? Damaged `gob` by 2
+!match pause
+!ent hp gob -5
+!match resume drop
+?? Dropped 1 held command(s)
+!assert "entity[gob].hp == 8"
+
+Expected: With pause_affects_hosts on, a host's state-changing commands
+are held while paused, while reads still run — `!map`, and `!assert`,
+which is host-only but changes nothing. `!match resume` runs the held move
+and damage in order (hero to x 3, goblin 10 → 7), and one undo reverts all
+of it. A command held by co-host bob is skipped on resume because bob was
+removed as a host in the meantime (with the rule briefly off so the removal
+runs at once); the owner's held damage still runs (→ 8).
+`!match resume drop` unpauses and discards what was held.
+
+
+SCENARIO 639 — !again: rerun your last command, through the same gate
+---------------------------------------------------------------------
+
+!again
+?? Nothing to repeat
+!match new a639 Again 10 6
+!match use a639
+!ent add hero Hero 30 2 2 10
+!ent add gob Gob 10 8 2 5
+!ent move hero 2 right
+!again
+?? 🔁 `!ent move hero 2 right`
+!assert "entity[hero].x == 6"
+!undo command
+!assert "entity[hero].x == 4" each rerun is its own undo entry
+!list
+!again
+?? Entities:
+!as player carol
+!ent move gob 1 left
+!again
+?? needs host approval (request `r2`
+!as host
+!again
+?? 🔁 `!list`
+
+Expected: HARNESS-ALLOWS-ERRORS. With nothing typed yet, `!again` says
+there's nothing to repeat. After `!ent move hero 2 right`, `!again` moves
+another 2 (x 6); one undo reverts only the rerun (x 4). `!again` reruns
+reads too (`!list`). It remembers each user separately: carol's `!again`
+repeats her move and is queued for approval like the original, while the
+host's `!again` still reruns the host's `!list` (the CLI's `!as` identity
+switch is never remembered).
+
+
+SCENARIO 640 — !tile copy: a trap tile copied (with its hook) and moved
+-----------------------------------------------------------------------
+
+!match new t640 Tiles 10 6
+!match use t640
+!ent add hero Hero 30 2 2 10
+!tile set 4 2 glyph ^
+!tile set 4 2 block "entity[self].flying != True"
+!tile hook add 4 2 on_enter "entity[self].hp = entity[self].hp - 5"
+!ent add rat Rat 3 6 4 1
+!ent kill rat
+!tile set 6 4 glyph ~
+!tile copy 4 2 6 4
+?? Copied tile (4,2) to (6,4) (its old data replaced)
+!assert "tile_get(6, 4, 'glyph') == '^' and has_corpse('rat')" the copy replaced the glyph; the corpse stayed
+!tile copy 4 2 3 3 move
+!assert "tile_get(3, 3, 'glyph') == '^' and not tile_has(4, 2, 'glyph')"
+!ent set_var hero flying true
+!ent tp hero 3 3
+!assert "entity[hero].hp == 25" the moved trap still fires
+!tile copy 4 2 5 5
+?? has no tile data
+!tile copy 3 3 11 1
+?? off the
+
+Expected: HARNESS-ALLOWS-ERRORS. Copying the trap at (4, 2) onto (6, 4)
+replaces the `~` glyph there with the trap's glyph, block condition and
+on_enter hook, while the rat's corpse lying on (6, 4) stays put. Moving
+it to (3, 3) empties (4, 2). A flying hero (the block condition lets it
+in) teleports onto (3, 3) and the moved hook fires (30 → 25). An empty
+source and an off-map destination are ❌.
+
+
+SCENARIO 641 — zone_distance: how far a 2x2 body is from a zone
+----------------------------------------------------------------
+
+!match new z641 Zones 12 8
+!match use z641
+!ent add ogre Ogre 40 2 2 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent add mage Mage 20 9 6 8
+!zone new fire
+!zone add fire 6 3
+!zone add fire 7 3
+!assert "zone_distance('ogre', 'fire') == 3" from the right edge of the body (x 3) to x 6
+!assert "zone_distance('ogre', 'fire', 'manhattan') == 3 and zone_distance('mage', 'fire') == 3"
+!ent tp ogre 5 2
+!assert "zone_distance('ogre', 'fire') == 0" any covered cell inside reads 0
+!zone new halo
+!zone anchor halo mage 1
+!system set default anchored_zone_on_anchor_loss suspend
+!ent kill mage
+!assert "zone_distance('ogre', 'halo') == None" a suspended aura has no cells
+!ent set_var ogre actions.scorch.target none
+!ent set_var ogre actions.scorch.body "if zone_distance(self, 'fire') > 1:\n    fail('too far from the fire')\nentity[self].hp = entity[self].hp - 3"
+!action ogre scorch
+!assert "entity[ogre].hp == 37"
+!ent set_var ogre gap "$(zone_distance('ogre','fire'))"
+!ent set_var ogre crowd "$(len(entities_at(5,2)))"
+!assert "entity[ogre].gap == 0 and entity[ogre].crowd == 1" both are read-only, so they work in $() arguments
+!eval "zone_distance('ogre', 'nowhere')"
+
+Expected: HARNESS-ALLOWS-ERRORS. The 2×2 ogre at (2, 2) covers x 2–3; the
+nearest fire cell (6, 3) is 3 away, whatever the metric here. The mage
+is 3 away too. After a teleport the ogre's body overlaps the zone: 0.
+The mage's halo aura is suspended when the mage dies, so it has no cells
+and the distance is None. An action gated on `zone_distance(self,
+'fire') > 1` runs (ogre 40 → 37). Both functions are read-only and work
+inside `$()` arguments. An unknown zone is a ❌.
+
+
+SCENARIO 642 — entities_at: every unit on a cell, stackable ones and riders
+--------------------------------------------------------------------------
+
+!match new e642 Stack 10 6
+!match use e642
+!ent add ogre Ogre 40 2 2 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent add wisp Wisp 5 6 2 3
+!ent set_var wisp __cell_stackable true
+!ent add rat Rat 3 6 3 1
+!ent tp wisp 3 3
+!assert "entities_at(3, 3) == ['ogre', 'wisp']" the ogre covers (3,3); the stackable wisp shares it
+!assert "cell_entity(3, 3) == 'ogre'" cell_entity names only the blocker
+!assert "entities_at(9, 5) == []"
+!ent add cart Cart 30 6 4 2
+!ent set_var cart slots.seat.capacity 1
+!ent set_var cart slots.top.capacity 1
+!ent set_var cart slots.top.region front
+!ent add p1 Pass 5 8 5 2
+!ent add g1 Gunner 5 9 5 2
+!mount p1 cart seat
+!mount g1 cart top
+!assert "entities_at(6, 4) == ['cart', 'g1']" the visible gunner is on the cell; the hidden passenger is not
+!ent set_var ogre actions.slam.target location
+!ent set_var ogre actions.slam.body "for t in entities_at(target.x, target.y):\n    entity[t].hp = entity[t].hp - 2"
+!action ogre slam 6 4
+!assert "entity[cart].hp == 28 and entity[g1].hp == 3 and entity[p1].hp == 5"
+
+Expected: The 2×2 ogre covers (3, 3), and the stackable wisp teleported
+there shares the cell: `entities_at(3, 3)` lists both in turn order, while
+`cell_entity` names only the ogre (the one that blocks). An empty cell
+gives []. On the cart's cell, the gunner in the visible `top` slot is
+listed, the passenger hidden inside is not. The ogre's `slam` hits
+everyone `entities_at` the target cell: cart 30 → 28, gunner 5 → 3, the
+passenger untouched.
+
+
+SCENARIO 643 — on_turn_skipped: react when a stun costs a unit its turn
+-----------------------------------------------------------------------
+
+!match new s643 Stun 8 6
+!match use s643
+!ent add hero Hero 30 2 2 10
+!ent add orc Orc 20 4 2 5
+!ent status orc add stunned
+!ent status orc set stunned skips_turn true
+!ent status orc add frozen
+!ent status orc set frozen skips_turn true
+!passive add orc shake on_turn_skipped "entity[self].lost = entity[self].lost + 1\nentity[self].why = skip_status"
+!ent set_var orc lost 0
+!turn next
+!turn next
+?? `orc`'s turn skipped (frozen, stunned)
+!assert "entity[orc].lost == 1 and entity[orc].why == 'frozen, stunned'"
+!gpassive add note on_turn_skipped "match.skips = match_var_get('skips', 0) + 1"
+!turn next
+!assert "entity[orc].lost == 2 and match.skips == 1"
+!ent status orc clear
+!turn next
+!turn next
+!assert "entity[orc].lost == 2" no skip, no hook
+!system set default atb_enabled true
+!ent status orc add stunned
+!ent status orc set stunned skips_turn true
+!turn next
+!turn next
+!turn next
+!assert "entity[orc].lost >= 3" under ATB too
+
+Expected: The orc carries two skips_turn statuses. When its turn comes up
+the skip line names both and `on_turn_skipped` fires on the orc with
+`skip_status` = "frozen, stunned" (lost 1). A global passive on the hook
+fires too on the next skip (lost 2, skips 1). With the statuses cleared,
+nothing fires. Under ATB the orc's skipped turns fire the hook as well.
+
+
+SCENARIO 644 — round_start_message_format: the round line
+--------------------------------------------------------
+
+!match new r644 Rounds 8 6
+!match use r644
+!ent add hero Hero 30 2 2 10
+!ent add orc Orc 20 4 2 5
+!turn next
+?? — Round 1 —
+!turn next
+?! Round
+!turn next
+?? — Round 2 —
+!system set default round_start_message_format "Round {round} of {match}: {match.weather}"
+!match var set weather rain
+!turn next
+!turn next
+?? Round 3 of Rounds: rain
+!system set default round_start_message_format "{match.missing}!"
+!turn next
+!turn next
+?? "!"
+!system set default round_start_message_format ""
+!turn next
+!turn next
+?! Round
+
+Expected: The default rule prints "— Round 1 —" on the first `!turn
+next` and "— Round 2 —" when the order wraps; a mid-round turn has no
+round line. A custom format fills {round}, {match} and a match var
+({match.weather} → rain); a missing match var renders empty. An empty
+rule prints no line.
+
+
+SCENARIO 645 — on_turn_skipped removing the last unit: the turn still reaches an able unit
+--------------------------------------------------------------------------------------------
+
+!match new s645 Fizzle 8 6
+!match use s645
+!ent add hero Hero 30 2 2 10
+!ent add orc Orc 20 4 2 5
+!ent add imp Imp 9 6 2 1
+!ent status orc add stunned
+!ent status orc set stunned skips_turn true
+!ent status imp add stunned
+!ent status imp set stunned skips_turn true
+!passive add imp fizzle on_turn_skipped "kill(self)"
+!turn next
+!turn next
+?? ⏭️ `imp`'s turn skipped (stunned).
+?? — Round 2 —
+?! every entity is skippable
+!assert "current_id() == 'hero' and round_number() == 2 and has_corpse('imp')"
+!turn next
+!assert "current_id() == 'hero' and round_number() == 3" one round per pass over the order
+
+Expected: The imp is last in the order and dies in its own on_turn_skipped
+handler. The pass over the stunned orc and imp then wraps the round once
+and gives the turn to the hero (round 2), with no "every entity is
+skippable" line — the skip loop tracks which units it has looked at, so a
+unit removed mid-pass can't cut it short. The next pass skips the orc
+and wraps once more (round 3).

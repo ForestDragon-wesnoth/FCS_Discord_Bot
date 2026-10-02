@@ -298,6 +298,24 @@ class DiscordCtxWrapper:
             )
 
 
+    async def offer_resume(self, m, entry: dict):
+        """A host's command held on a paused match (pause_affects_hosts):
+        ask to unpause, with Resume & run / Cancel buttons. Called by the
+        dispatcher (CommandRegistry._hold_command)."""
+        cmd = "!" + entry["name"] + (" " + " ".join(entry["args"]) if entry["args"] else "")
+        n = len(m.held_commands)
+        text = (f"⏸ **{m.name}** is paused — `{cmd}` is held"
+                + (f" ({n} commands waiting)" if n > 1 else "")
+                + ". Resume the match to run it?")
+        try:
+            view = _ResumeView(m.id, entry, self._mgr)
+            view.message = await self._ctx.send(text, view=view)
+        except Exception:
+            await self._ctx.send(
+                text + " `!match resume` runs it; `!match resume drop` "
+                       "discards held commands.")
+
+
 class _InteractionCtx:
     """ReplyContext built from a button-click interaction, so an approved
     command runs with the CLICKER's identity (a host) against the
@@ -451,6 +469,99 @@ class _ApprovalView(discord.ui.View):
         self._finish()
 
     def _finish(self):
+        self.stop()
+
+class _ResumeView(discord.ui.View):
+    """Resume & run / Cancel for one command held on a paused match.
+    Resume & run = `!match resume` from the clicker (a host): it unpauses
+    and runs EVERY held command in order, this one included. Cancel drops
+    only this held command and leaves the match paused."""
+
+    def __init__(self, match_id: str, entry: dict, mgr, timeout: float = 600.0):
+        super().__init__(timeout=timeout)
+        self._mid = match_id
+        self._entry = entry
+        self._mgr = mgr
+        self.message = None
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content=(self.message.content or "")
+                + "\n⌛ Buttons expired — use `!match resume` (or `!match "
+                  "resume drop`).",
+                view=self)
+        except Exception:
+            pass
+
+    def _match(self):
+        return self._mgr.matches.get(self._mid) if self._mgr else None
+
+    async def _require_host(self, interaction) -> bool:
+        m = self._match()
+        ictx = _InteractionCtx(interaction)
+        if m is None or (m.owner is not None and not m.is_host(ictx.user_id)):
+            await interaction.response.send_message(
+                "❌ Only a host can resume the match.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Resume & run", style=discord.ButtonStyle.success)
+    async def resume(self, interaction, button):
+        if not await self._require_host(interaction):
+            return
+        m = self._match()
+        if m is None or not m.paused:
+            await interaction.response.send_message(
+                "The match isn't paused any more.", ephemeral=True)
+            return await self._disable(interaction)
+        await interaction.response.defer()
+        ictx = _InteractionCtx(interaction)
+        # Point the run at this match even if the clicked channel shows
+        # another one, then put the channel back (run_approved_request's rule).
+        prev = self._mgr.active_by_channel.get(ictx.channel_key)
+        self._mgr.active_by_channel[ictx.channel_key] = self._mid
+        try:
+            await registry.run("match", ["resume"], ictx, self._mgr)
+        finally:
+            if self._mgr.active_by_channel.get(ictx.channel_key) == self._mid:
+                if prev is None:
+                    self._mgr.active_by_channel.pop(ictx.channel_key, None)
+                else:
+                    self._mgr.active_by_channel[ictx.channel_key] = prev
+        if _boards:
+            await _refresh_boards_for_match(self._mgr, self._mid)
+        await self._disable(interaction)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction, button):
+        if not await self._require_host(interaction):
+            return
+        m = self._match()
+        held = m.held_commands if m is not None else []
+        # By identity: the same text may be held twice.
+        for i, h in enumerate(held):
+            if h is self._entry:
+                del held[i]
+                cmd = "!" + h["name"] + (" " + " ".join(h["args"]) if h["args"] else "")
+                await interaction.response.send_message(
+                    f"🚫 Dropped held `{cmd}`; the match stays paused.")
+                return await self._disable(interaction)
+        await interaction.response.send_message(
+            "That command isn't held any more.", ephemeral=True)
+        await self._disable(interaction)
+
+    async def _disable(self, interaction):
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
         self.stop()
 
 #now supports-multiple commands in one message - one command per line
