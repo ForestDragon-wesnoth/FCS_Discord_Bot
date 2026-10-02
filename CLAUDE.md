@@ -3884,6 +3884,82 @@ More shipped work (continuing the list above):
     hosts the clone. Host-gated by the normal gate (it checks the channel's
     match, which is the source).
 
+- **Small-ideas bundle: formula functions, despawn hook, five commands —
+  SHIPPED (scenarios 613-632).** Ideas 46-54, 58, 61-65 from the second
+  idea list (an `on_facing_changed` hook was dropped by the user).
+  - **Facing writes (613-614).** `set_facing(eid, dir|cw|ccw)` and
+    `face_toward(eid, target_eid | x, y | coord)` (MUTATING), plus `!ent face
+    <id> toward <eid | x y>`. All three go through `Match.set_entity_facing`
+    (the allow_diagonal_facing gate) — the old `!ent face` code was inlined.
+    `Match.facing_toward` measures from the true centre of the unit's body
+    (multi-tile aware): nearest of 8 by bearing with diagonals on, dominant
+    axis (ties vertical, like direction_to) with them off; a point at its own
+    centre → None (facing unchanged). NOTE this is angle-based, while
+    `direction_to` snaps 8-way by the SIGN of dx/dy — (5, 1) is `right` here
+    and `down_right` there. FIX found on the way: `!ent face` on a vehicle
+    left its region-slot riders on the old side (rider x/y are re-stamped
+    only on moves); set_entity_facing now calls `_restamp_riders_for` (614).
+  - **Read-only geometry (ARG_SAFE, 615-618).** `grid_width()` /
+    `grid_height()` / `in_bounds(x, y)` (formulas couldn't read the map size
+    before); `entity_distance(a, b[, mode])` (= `entity_gap_distance`, the
+    `!dist` / entities_within measure); `cell_blocked(eid, x, y[, mode])`
+    (= `cell_blocks`; off-map → True; a mode walk/tp/push/swap consults its
+    block_<mode> rule; units standing there don't count — that's
+    cell_entity) and `cell_opaque(x, y[, viewer])`; `free_cell_near(x, y,
+    radius[, eid])` → coord or None (`Match.free_cell_near`: with a unit, the
+    whole footprint in bounds, clear of OTHER units — its own body, snake
+    segments and riders ignored — and not movement-blocked; ring order like
+    `_find_free_cell_near`; (2r+1)² is charged against formula_cell_limit).
+  - **`team_members(team)` (619)** — alive, non-part units of a team in turn
+    order (then id order for units outside it). Loopable.
+  - **`pick(list)` / `shuffle(list)` (620)** — `_ALLOWED_FUNCS`, rebound to
+    the match RNG like random_int (random_seed + choose() replay). pick of an
+    empty list → None; a dict → its keys. shuffle returns a new list and is
+    loopable.
+  - **`var_copy(src, path, dest, path)` (621)** — var_move without the
+    delete (deep copy). MUTATING. A reserved path may be the source, not the
+    destination.
+  - **`on_entity_despawned` hook (623-624).** Fires from `Entity.remove`
+    (which now takes `despawn=True` and RETURNS the hook's log lines) BEFORE
+    the unit leaves, so it can still be read. Covers every non-death
+    removal: `!ent remove` / `!part remove` / remove_entity, the part subtree
+    removed with its owner, segments a sever cascades away, `!ent transfer`
+    out of the match, and the old parts a transform drops. The death pipeline
+    passes `despawn=False` (the dying unit AND the parts going into its
+    corpse); `_sever_segment(..., died=True)` keeps the destroyed segment
+    itself silent while the severed tail fires. Each remove() re-checks the
+    unit after the hook (a handler may remove or kill it); apply_statblock
+    stops cleanly if a despawn handler removes the transform target.
+  - **`!roll odds <dice> [<op> <n>]` (625)** — `formula.dice_distribution`:
+    exact integer counts by convolution; keep-highest/lowest by enumerating
+    combinations (cap `_ODDS_MAX_KEEP_COMBOS` 200k); exploding dice as floats
+    with chains under 1e-12 cut (reported with ≈); explode+keep refused; total
+    work capped by `_ODDS_MAX_STEPS`. Shows the reduced fraction; without a
+    comparison, range + average + a bar table up to 40 totals.
+  - **`!whoami` (626)** — identity, admin, channel match, role, view (incl.
+    an `!as view` preview), whether commands run directly or queue, and the
+    caller's own pending request ids.
+  - **`as=<team>` on `!map` / `!list` (and anything reading `_view_pov`)
+    (627)** — host-only one-off POV preview (`as=omniscient` = everything),
+    checked inside `_view_pov` (raises for non-hosts); the reply starts with a
+    "👁 Preview" line (`_as_note`). `!list` now rejects unknown words/options.
+  - **`!map cell <x> <y> [for=<eid>] [as=<team>]` (628-629)** — player-
+    available report of one cell under the channel POV: units (footprint
+    aware), tile data, zones, corpses, and where the block/opaque settings
+    come from (tile / template / rule; zone data / zone rule; corpse rule).
+    `for=<eid>` evaluates them for that unit using ONLY the layers the POV
+    can see (a hidden blocking zone reads as "no"); a fogged cell is just
+    "unseen (fog)".
+  - **`!ent diff <a> <b>` (630)** — host-only (shows vars like dump); reuses
+    `_diff_entity`, which gained a `words` param for the one-side labels.
+  - **`!find ... count | ids` (631)** — bare words (they can't be
+    predicates); `ids` follows `sort:`.
+  - **FIX: `!tile info` / `!tile list` showed corpses the POV can't see
+    (632).** Corpses live in tile data, so the full tile dict leaked hidden
+    bodies; `_visible_tile_data` drops corpses failing corpse_visible_to (a
+    tile holding only hidden corpses reads as no tile). Shared with
+    `!map cell`.
+
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
 and explain the "why").

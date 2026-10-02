@@ -384,6 +384,7 @@ from __future__ import annotations
 import ast
 import copy
 import math
+import itertools
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -461,6 +462,43 @@ def _random_string(*choices: Any) -> str:
     so we surface that as a FormulaError instead. Honors the
     random_seed rule the same way random_int does."""
     return _random_string_impl(random, choices)
+
+
+def _pick_source(v: Any, fname: str) -> list:
+    """The items pick/shuffle draw from: a list's items or a dict's keys."""
+    if isinstance(v, dict):
+        return list(v.keys())
+    if isinstance(v, (list, tuple)):
+        return list(v)
+    raise FormulaError(
+        f"{fname}(list): expected a list or a dict, got "
+        f"{'None' if v is None else type(v).__name__}.")
+
+
+def _pick_impl(rng, v: Any) -> Any:
+    items = _pick_source(v, "pick")
+    return rng.choice(items) if items else None
+
+
+def _shuffle_impl(rng, v: Any) -> list:
+    items = _pick_source(v, "shuffle")
+    rng.shuffle(items)
+    return items
+
+
+def _pick(v: Any) -> Any:
+    """pick(list): one random item of a list (or key of a dict); None when
+    it's empty — test `== None` before using the result. Honors the
+    random_seed rule like random_int, and replays identically across a
+    choose() replay."""
+    return _pick_impl(random, v)
+
+
+def _shuffle(v: Any) -> list:
+    """shuffle(list): a new list holding the same items (a dict's keys) in
+    random order; the argument itself is left untouched. Loopable. Honors
+    random_seed like pick."""
+    return _shuffle_impl(random, v)
 
 
 # Caps on a single roll() so a typo can't hang the bot. A spell that
@@ -574,6 +612,116 @@ def roll_detail(rng, spec: Any) -> "Tuple[int, list]":
             f"NdM (with optional !, kh<n>, kl<n>) or a flat integer."
         )
     return total, parts
+
+
+# Work caps for dice_distribution: convolution steps (outcome-table size x die
+# faces, summed over every die) and the dice combinations a keep-highest /
+# keep-lowest group may enumerate. Generous for table dice, small enough that
+# a player's `!roll odds 1000d1000` can't stall the bot.
+_ODDS_MAX_STEPS = 2_000_000
+_ODDS_MAX_KEEP_COMBOS = 200_000
+# An exploding die's chain is cut once its probability falls below this.
+_ODDS_EXPLODE_EPS = 1e-12
+
+
+def dice_distribution(spec: Any) -> "Tuple[Dict[int, Any], Any, bool]":
+    """The probability distribution of a dice expression (same grammar as
+    roll()). Returns (weights, total, exact): weights maps each possible total
+    to its weight and `total` is the sum of the weights, so P(v) =
+    weights[v] / total. Without exploding dice the weights are whole counts of
+    equally likely outcomes (exact=True); an exploding group makes them floats
+    with its improbable long chains cut off (exact=False). Raises FormulaError
+    on bad notation or when the expression is too large to work out."""
+    if not isinstance(spec, str):
+        raise FormulaError("dice odds need a dice string like '2d6+3'.")
+    s = spec.replace(" ", "").lower()
+    terms = re.findall(r"[+-]?[^+-]+", s) if s else []
+    if not terms or "".join(terms) != s:
+        raise FormulaError(f"malformed dice expression '{spec}'.")
+    steps = 0
+
+    def _spend(n: int) -> None:
+        nonlocal steps
+        steps += n
+        if steps > _ODDS_MAX_STEPS:
+            raise FormulaError(
+                f"'{spec}' has too many outcomes to work out exact odds.")
+
+    def _conv(a: Dict[int, Any], b: Dict[int, Any]) -> Dict[int, Any]:
+        _spend(len(a) * len(b))
+        out: Dict[int, Any] = {}
+        for va, wa in a.items():
+            for vb, wb in b.items():
+                out[va + vb] = out.get(va + vb, 0) + wa * wb
+        return out
+
+    dist: Dict[int, Any] = {0: 1}
+    exact = True
+    for term in terms:
+        fm = _ROLL_FLAT_RE.match(term)
+        if fm is not None:
+            k = int(fm.group(2)) * (-1 if fm.group(1) == "-" else 1)
+            dist = {v + k: w for v, w in dist.items()}
+            continue
+        dm = _ROLL_DIE_RE.match(term)
+        if dm is None:
+            raise FormulaError(
+                f"malformed term '{term}' in '{spec}' — expected NdM (with "
+                f"optional !, kh<n>, kl<n>) or a flat integer.")
+        sgn = -1 if dm.group(1) == "-" else 1
+        count = int(dm.group(2)) if dm.group(2) else 1
+        sides = int(dm.group(3))
+        explode = dm.group(4) == "!" and sides > 1
+        keep_mode, keep_n = dm.group(5), dm.group(6)
+        if not 1 <= count <= _ROLL_MAX_DICE or not 1 <= sides <= _ROLL_MAX_SIDES:
+            raise FormulaError(f"die count or sides out of range in '{term}'.")
+        if keep_mode is not None:
+            if explode:
+                raise FormulaError(
+                    f"odds for a group that both explodes and keeps dice "
+                    f"('{term}') aren't supported.")
+            combos = sides ** count if count * math.log10(sides) < 9 else None
+            if combos is None or combos > _ODDS_MAX_KEEP_COMBOS:
+                raise FormulaError(
+                    f"'{term}' has too many dice combinations to work out "
+                    f"exact odds (limit {_ODDS_MAX_KEEP_COMBOS}).")
+            _spend(combos)
+            k = max(0, min(int(keep_n), count))
+            group: Dict[int, Any] = {}
+            for faces in itertools.product(range(1, sides + 1), repeat=count):
+                ordered = sorted(faces)
+                kept = (ordered[-k:] if k else []) if keep_mode == "kh" \
+                    else ordered[:k]
+                t = sum(kept)
+                group[t] = group.get(t, 0) + 1
+        else:
+            if explode:
+                exact = False
+                die: Dict[int, Any] = {}
+                p, depth = 1.0 / sides, 0
+                while True:
+                    reach = p ** depth            # chance of `depth` max faces
+                    for r in range(1, sides):
+                        v = sides * depth + r
+                        die[v] = die.get(v, 0.0) + reach * p
+                    depth += 1
+                    if reach * p < _ODDS_EXPLODE_EPS or depth >= _ROLL_EXPLODE_CAP:
+                        die[sides * depth] = die.get(sides * depth, 0.0) + reach * p
+                        break
+            else:
+                die = {v: 1 for v in range(1, sides + 1)}
+            group = {0: 1}
+            for _ in range(count):
+                group = _conv(group, die)
+        if sgn < 0:
+            group = {-v: w for v, w in group.items()}
+        if not exact:
+            dist = {v: float(w) for v, w in dist.items()}
+            gtot = sum(group.values())
+            group = {v: float(w) / gtot for v, w in group.items()}
+        dist = _conv(dist, group)
+    total = sum(dist.values())
+    return dist, total, exact
 
 
 def roll_table_pick(rng, spec: Any) -> str:
@@ -1610,6 +1758,8 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
     "len": _len,
     "random_int": _random_int,
     "random_string": _random_string,
+    "pick": _pick,
+    "shuffle": _shuffle,
     "roll": _roll,
     "distance": _distance,
     "angle": _angle,
@@ -1801,6 +1951,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # the amount-aware pair item_add / item_consume (stack +N / consume-and-
     # drop-at-0), with the amount field defaulting to the amount_field rule.
     "var_add", "var_move", "var_sum_field", "item_add", "item_consume",
+    # var_copy: var_move's non-destructive sibling (deep copy, source kept).
+    "var_copy",
     # Match-level var accessors: runtime-path twins of the reserved
     # `match.<path>` formula root (which itself mirrors entity[X].path).
     # All read/write the single match-wide vars dict — global GM state
@@ -2017,6 +2169,13 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # directional_corner_arc rule.
     "facing_of", "relative_side", "side_hit", "directional_get",
     "hit_location",
+    # Facing writes (set_facing / face_toward share !ent face's rules), map
+    # size, unit-to-unit body distance, movement/sight cell checks, the
+    # nearest free cell for a body, and a team roster.
+    "set_facing", "face_toward",
+    "grid_width", "grid_height", "in_bounds",
+    "entity_distance", "cell_blocked", "cell_opaque",
+    "free_cell_near", "team_members",
     # Footprint / large-entity primitives. A large entity occupies a W×H
     # rectangle anchored at its top-left cell (entity[X].x / .y); these
     # expose that footprint to formulas.
@@ -2060,8 +2219,9 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "status_counter_add", "status_counter_set",
     "declare_winner",
     "var_set", "var_del", "var_clear",
-    "var_add", "var_move", "item_add", "item_consume",
+    "var_add", "var_move", "var_copy", "item_add", "item_consume",
     "match_var_set", "match_var_del",
+    "set_facing", "face_toward",
     "emit",
     "use_action",
     "summon", "summon_near", "summon_from", "remove_entity",
@@ -2103,6 +2263,8 @@ ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'match_var_has', 'match_var_keys', 'match_winner', 'mount_of',
     'nearest_entity', 'occupies', 'part', 'part_of', 'parts', 'raycast',
     'highest_var', 'lowest_var',
+    'grid_width', 'grid_height', 'in_bounds', 'entity_distance',
+    'cell_blocked', 'cell_opaque', 'free_cell_near', 'team_members',
     'relative_side', 'riders', 'roll_table', 'round_number', 'rule_get',
     'self_id', 'shield_total', 'side_hit', 'slot_capacity', 'slot_free',
     'slot_of', 'slot_riders', 'status_get', 'status_has',
@@ -2234,6 +2396,8 @@ _ALLOWED_NODES: Tuple[type, ...] = (
 _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "range",
     "each",
+    "shuffle",
+    "team_members",
     "entities_within",
     "chain_targets",
     "group_members",
@@ -3289,6 +3453,8 @@ class FormulaEngine:
             ns["random_string"] = (
                 lambda *choices, _r=rng: _random_string_impl(_r, choices)
             )
+            ns["pick"] = lambda v, _r=rng: _pick_impl(_r, v)
+            ns["shuffle"] = lambda v, _r=rng: _shuffle_impl(_r, v)
             ns["roll"] = (
                 lambda spec, _r=rng: _roll_impl(_r, spec)
             )
@@ -3540,10 +3706,9 @@ class FormulaEngine:
             """move_entity(eid, x, y): teleport the entity to (x, y) with
             full tp() semantics (bounds + occupancy validated, tile
             hooks + on_entity_moved fire). Returns (x, y) on success;
-            raises FormulaError on validation failure so a formula can
-            safeguard with prior reads (in_bounds / is_occupied are not
-            yet exposed; check via tile_keys or entity coordinate
-            equality)."""
+            raises FormulaError on validation failure, so check first:
+            in_bounds(x, y), cell_entity(x, y) == '', cell_blocked(eid,
+            x, y, 'tp') — or ask free_cell_near for a cell that fits."""
             eid = _eid(eid_t)
             e = match.entities.get(eid)
             if e is None:
@@ -4615,6 +4780,30 @@ class FormulaEngine:
             engine._note_affected(deid)
             return True
 
+        def _var_copy(src_t: Any, src_path: Any,
+                      dest_t: Any, dest_path: Any) -> bool:
+            """var_copy(src_eid, src_path, dest_eid, dest_path): write a DEEP
+            COPY of a var (or a whole subtree) to another entity/path and
+            keep the source — var_move without the delete (grant a copy of
+            an item, seed a stat block from a template). Returns True iff the
+            source existed; False (no-op) when it's absent."""
+            if not (isinstance(src_path, str) and src_path):
+                raise FormulaError("var_copy: src_path must be a non-empty string.")
+            if not (isinstance(dest_path, str) and dest_path):
+                raise FormulaError("var_copy: dest_path must be a non-empty string.")
+            msg = reserved_var_path_error(dest_path, "var_copy (destination)")
+            if msg:
+                raise FormulaError(msg)
+            _resolve_entity(src_t, "var_copy")
+            deid, de = _resolve_entity(dest_t, "var_copy")
+            if not _var_has(src_t, src_path):
+                return False
+            _, se = _resolve_entity(src_t, "var_copy")
+            val = copy.deepcopy(_read_entity_path(se, src_path))
+            de.write_var(dest_path, val)
+            engine._note_affected(deid)
+            return True
+
         def _var_sum_field(eid_t: Any, path: Any, field: Any) -> Any:
             """var_sum_field(eid, path, field): sum a named sub-FIELD across the
             immediate children of a container var — e.g.
@@ -4700,6 +4889,7 @@ class FormulaEngine:
         ns["var_del"]  = _var_del
         ns["var_add"]  = _var_add
         ns["var_move"] = _var_move
+        ns["var_copy"] = _var_copy
         ns["var_sum_field"] = _var_sum_field
         ns["item_add"] = _item_add
         ns["item_consume"] = _item_consume
@@ -6622,6 +6812,145 @@ class FormulaEngine:
         ns["relative_side"] = _relative_side
         ns["side_hit"] = _side_hit
         ns["directional_get"] = _directional_get
+
+        # ---- facing writes / map size / unit geometry -------------------
+        def _set_facing(eid_t: Any, direction: Any) -> str:
+            """set_facing(eid, dir): turn a unit to `dir` (any direction
+            alias, or cw/ccw to rotate one step) — same rules as `!ent face`
+            (diagonals need allow_diagonal_facing). Returns the new facing."""
+            eid, e = _resolve_entity(eid_t, "set_facing")
+            if not isinstance(direction, str):
+                raise FormulaError("set_facing(eid, dir): dir must be a string.")
+            try:
+                d = match.set_entity_facing(e, direction)
+            except VTTError as ex:
+                raise FormulaError(f"set_facing: {ex}")
+            engine._note_affected(eid)
+            return d
+
+        def _face_toward(eid_t: Any, a: Any, b: Any = None) -> str:
+            """face_toward(eid, target) / face_toward(eid, x, y) /
+            face_toward(eid, coord): turn a unit toward another unit's body
+            centre or a cell, measured from the centre of its own body —
+            the nearest of 8 directions, or the dominant axis when
+            allow_diagonal_facing is off. A target at its own centre leaves
+            the facing unchanged. Returns the (new) facing."""
+            eid, e = _resolve_entity(eid_t, "face_toward")
+            if b is None and isinstance(a, str):
+                _, t = _resolve_entity(a, "face_toward")
+                tw, th = match.entity_footprint(t)
+                tx, ty = t.x + (tw - 1) / 2, t.y + (th - 1) / 2
+            elif b is None:
+                tx = _cell_arg(_coord_x(a), "face_toward", "x")
+                ty = _cell_arg(_coord_y(a), "face_toward", "y")
+            else:
+                tx = _cell_arg(a, "face_toward", "x")
+                ty = _cell_arg(b, "face_toward", "y")
+            d = match.facing_toward(e, tx, ty)
+            if d is None:
+                return e.facing
+            match.set_entity_facing(e, d)
+            engine._note_affected(eid)
+            return d
+
+        def _grid_width() -> int:
+            """grid_width(): the map's width in cells."""
+            return match.grid_width
+
+        def _grid_height() -> int:
+            """grid_height(): the map's height in cells."""
+            return match.grid_height
+
+        def _in_bounds(x: Any, y: Any) -> bool:
+            """in_bounds(x, y): whether (x, y) is a cell on the map."""
+            return match.in_bounds(_cell_arg(x, "in_bounds", "x"),
+                                   _cell_arg(y, "in_bounds", "y"))
+
+        def _entity_distance(a_t: Any, b_t: Any,
+                             mode: Any = "square_radius_distance") -> Any:
+            """entity_distance(a, b, mode='square_radius_distance'): the gap
+            between two units' bodies — nearest cell to nearest cell, so 0
+            for overlapping bodies and 1 for adjacent ones whatever their
+            size. Same measure as entities_within and `!dist`."""
+            _, ea = _resolve_entity(a_t, "entity_distance")
+            _, eb = _resolve_entity(b_t, "entity_distance")
+            _distance(0, 0, 0, 0, mode)        # validates the metric name
+            return match.entity_gap_distance(ea, eb, mode)
+
+        def _cell_blocked(eid_t: Any, x: Any, y: Any, mode: Any = None) -> bool:
+            """cell_blocked(eid, x, y, mode=None): whether the unit can't
+            enter (x, y) — the tile, a zone or a corpse there blocks it, or
+            the cell is off the map. Units standing there don't count (see
+            cell_entity). With a mode ('walk', 'tp', 'push' or 'swap') a
+            block only counts when that block_<mode> rule is on."""
+            eid, _ = _resolve_entity(eid_t, "cell_blocked")
+            cx = _cell_arg(x, "cell_blocked", "x")
+            cy = _cell_arg(y, "cell_blocked", "y")
+            if not match.in_bounds(cx, cy):
+                return True
+            if mode is None:
+                return match.cell_blocks(eid, cx, cy)
+            if mode not in ("walk", "tp", "push", "swap"):
+                raise FormulaError(
+                    "cell_blocked(...): mode must be 'walk', 'tp', 'push' or "
+                    "'swap'.")
+            return match._check_block(eid, cx, cy, mode)
+
+        def _cell_opaque(x: Any, y: Any, viewer: Any = None) -> bool:
+            """cell_opaque(x, y, viewer=None): whether (x, y) blocks sight —
+            for `viewer` when given (opacity conditions can depend on who is
+            looking), else with no viewer bound."""
+            cx = _cell_arg(x, "cell_opaque", "x")
+            cy = _cell_arg(y, "cell_opaque", "y")
+            vid = None
+            if viewer is not None:
+                vid, _ = _resolve_entity(viewer, "cell_opaque")
+            return match.cell_opaque(vid, cx, cy)
+
+        def _free_cell_near(x: Any, y: Any, radius: Any, eid_t: Any = None):
+            """free_cell_near(x, y, radius, eid=None): the nearest cell within
+            `radius` (Chebyshev rings, nearest first) where a unit could
+            stand, as a coordinate (read with coord_x / coord_y), or None.
+            With `eid` the unit's whole body must fit there, clear of other
+            units and not movement-blocked for it; without, any empty cell."""
+            cx = _cell_arg(x, "free_cell_near", "x")
+            cy = _cell_arg(y, "free_cell_near", "y")
+            if isinstance(radius, bool) or not isinstance(radius, int) or radius < 0:
+                raise FormulaError(
+                    "free_cell_near(...): radius must be a whole number >= 0.")
+            _cell_budget((2 * radius + 1) ** 2, "free_cell_near", cell_limit)
+            e = None
+            if eid_t is not None:
+                _, e = _resolve_entity(eid_t, "free_cell_near")
+            return match.free_cell_near(cx, cy, radius, e)
+
+        def _team_members(team: Any) -> list:
+            """team_members(team): ids of the alive units on `team`, in turn
+            order then id order; attached body parts are left out (they act
+            through their owner). Loopable."""
+            if not isinstance(team, str):
+                raise FormulaError("team_members(team): team must be a string.")
+            out = []
+            for e in match.entities_in_turn_order():
+                if e.is_alive and not e.is_part and e.team == team:
+                    out.append(e.id)
+            seen = set(out)
+            for eid, e in sorted(match.entities.items()):
+                if eid not in seen and e.is_alive and not e.is_part \
+                        and e.team == team:
+                    out.append(eid)
+            return out
+
+        ns["set_facing"] = _set_facing
+        ns["face_toward"] = _face_toward
+        ns["grid_width"] = _grid_width
+        ns["grid_height"] = _grid_height
+        ns["in_bounds"] = _in_bounds
+        ns["entity_distance"] = _entity_distance
+        ns["cell_blocked"] = _cell_blocked
+        ns["cell_opaque"] = _cell_opaque
+        ns["free_cell_near"] = _free_cell_near
+        ns["team_members"] = _team_members
 
         def _hit_location(target_t: Any, from_x: Any, from_y: Any,
                           aim: Any = None, aim_weight: Any = None,

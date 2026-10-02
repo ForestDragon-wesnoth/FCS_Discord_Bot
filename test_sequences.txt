@@ -16223,3 +16223,670 @@ along. The copy's channel list holds only the channel that just ran
 `!match use c2` (the original's red-POV binding didn't come along), the
 undo history is empty (nothing from the original), and the hero's damage
 did come along (27).
+
+
+SCENARIO 613 — set_facing / face_toward: an attack that turns toward its target
+-------------------------------------------------------------------------------
+
+!match new f613 Facing 10 8
+!match use f613
+!ent add hero Hero 30 2 2 10
+!ent add ogre Ogre 40 6 5 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent add gob Gob 10 2 7 3
+!ent set_var hero actions.strike.target entity
+!ent set_var hero actions.strike.body "face_toward(self, target)\nentity[target].hp = entity[target].hp - 5"
+!action hero strike gob
+!assert "facing_of('hero') == 'down' and entity[gob].hp == 5" striking turns the hero toward its target
+!action hero strike ogre
+!assert "facing_of('hero') == 'right'" cardinal-only: the dominant axis toward the 2x2 body centre
+!system set default allow_diagonal_facing true
+!eval "face_toward('hero', 'ogre')"
+!assert "facing_of('hero') == 'down_right'" with diagonals: the nearest of 8 directions
+!ent face ogre toward hero
+!assert "facing_of('ogre') == 'up_left'" measured from the centre of the ogre body
+!eval "face_toward('gob', 6, 7)"
+!assert "facing_of('gob') == 'right'"
+!eval "set_facing('hero', 'cw')"
+!assert "facing_of('hero') == 'down'" cw rotates one 45-degree step
+!eval "face_toward('hero', 2, 2)"
+!assert "facing_of('hero') == 'down'" a point at its own centre leaves the facing alone
+!system set default allow_diagonal_facing false
+!eval "set_facing('hero', 'up_left')"
+!assert "facing_of('hero') == 'down'" a refused diagonal changes nothing
+
+Expected: HARNESS-ALLOWS-ERRORS. The `strike` action calls
+`face_toward(self, target)` before dealing damage: against the goblin
+straight below, the hero turns `down` (gob 10 → 5). Against the 2×2 ogre
+(centre 6.5, 5.5 from the hero at 2, 2) a cardinal-only system picks the
+dominant axis, `right`; once allow_diagonal_facing is on the same call
+picks `down_right`, the nearest of the 8 directions. `!ent face ogre
+toward hero` measures from the ogre's body centre and gives `up_left`.
+`face_toward(eid, x, y)` takes a cell; `set_facing('hero', 'cw')` rotates
+one 45° step to `down`; aiming at its own centre changes nothing. With
+diagonals off again, `set_facing('hero', 'up_left')` is refused (❌, the
+same message as `!ent face`) and the facing stays `down`.
+
+
+SCENARIO 614 — Turning a vehicle re-seats the riders in its facing-relative slot
+--------------------------------------------------------------------------------
+
+!match new f614 Turret 10 8
+!match use f614
+!ent add tank Tank 60 3 3 4
+!ent set_var tank footprint_w 3
+!ent set_var tank footprint_h 3
+!ent set_var tank slots.gunner.capacity 1
+!ent set_var tank slots.gunner.region front
+!ent add gun Gunner 10 8 8 6
+!ent face tank up
+!mount gun tank gunner
+!assert "entity[gun].y == 3" facing up, the front row is the top row
+!ent face tank right
+!assert "entity[gun].x == 5" facing right, the gunner moves to the right-hand column
+!eval "set_facing('tank', 'down')"
+!assert "entity[gun].y == 5" set_facing re-seats the gunner too
+!eval "face_toward('tank', 1, 4)"
+!assert "facing_of('tank') == 'left' and entity[gun].x == 3"
+
+Expected: The gunner sits in the tank's `front` region, which turns with
+the 3×3 tank (anchor 3, 3). Facing up the gunner is on the top row
+(y 3); `!ent face tank right` moves it to the right-hand column (x 5);
+`set_facing('tank', 'down')` puts it on the bottom row (y 5), and
+`face_toward('tank', 1, 4)` turns the tank left, seating the gunner in
+the left column (x 3). Every assert passes.
+
+
+SCENARIO 615 — grid_width / grid_height / in_bounds: a knockback that stops at the edge
+--------------------------------------------------------------------------------------
+
+!match new g615 Edge 8 6
+!match use g615
+!ent add hero Hero 30 2 3 10
+!ent add brute Brute 50 6 3 5
+!assert "grid_width() == 8 and grid_height() == 6"
+!assert "in_bounds(1, 1) and in_bounds(8, 6) and not in_bounds(0, 3) and not in_bounds(9, 3) and not in_bounds(3, 7)" cells are numbered from 1
+!ent set_var hero actions.slam.target entity
+!ent set_var hero actions.slam.body "nx = entity[target].x + 3\nif not in_bounds(nx, entity[target].y):\n    nx = grid_width()\nentity[self].landing = nx\nmove_entity(target, nx, entity[target].y)"
+!action hero slam brute
+!assert "entity[brute].x == 8 and entity[hero].landing == 8" the knockback stops on the last column
+!ent tp brute 3 3
+!action hero slam brute
+!assert "entity[brute].x == 6" a knockback with room goes the full 3 cells
+!ent set_var hero tall $(grid_height())
+!assert "entity[hero].tall == 6" read-only, so usable in $() arguments
+
+Expected: `grid_width()` / `grid_height()` read the map size (8×6) and
+`in_bounds` uses the same 1-based cells as every command. The `slam`
+action pushes its target 3 cells right but clamps the landing to the last
+column with `in_bounds` + `grid_width()`: the brute at x 6 lands on x 8,
+the brute at x 3 lands on x 6. `$(grid_height())` works as an inline
+argument. Every assert passes.
+
+
+SCENARIO 616 — entity_distance: body-to-body gap for multi-tile units
+---------------------------------------------------------------------
+
+!match new d616 Gap 10 8
+!match use d616
+!ent add ogre Ogre 40 6 3 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent add hero Hero 30 9 5 10
+!ent add gob Gob 10 8 4 3
+!assert "entity_distance('hero', 'ogre') == 2 and distance(9, 5, 6, 3) == 3" nearest cell to nearest cell, not anchor to anchor
+!assert "entity_distance('hero', 'ogre', 'manhattan') == 3 and entity_distance('gob', 'ogre') == 1"
+!assert "entity_distance('ogre', 'hero') == entity_distance('hero', 'ogre')" symmetric
+!ent set_var hero actions.bite.target entity
+!ent set_var hero actions.bite.body "if entity_distance(self, target) > 1:\n    fail('out of reach')\nentity[target].hp = entity[target].hp - 7"
+!action hero bite ogre
+!assert "entity[ogre].hp == 40" the nearest ogre cell is 2 away: refused
+!ent tp hero 8 5
+!action hero bite ogre
+!assert "entity[ogre].hp == 33" diagonal to the ogre corner cell: in reach
+!dist hero ogre
+
+Expected: HARNESS-ALLOWS-ERRORS. The 2×2 ogre covers (6-7, 3-4). From the
+hero at (9, 5) its nearest cell (7, 4) is 2 away — the anchor (6, 3) is 3
+away, which is what `distance` on the anchors would give.
+`entity_distance` takes the same metrics (manhattan gives 3), is
+symmetric, and reports 1 for the adjacent goblin. The `bite` action
+refuses at range 2 (❌ out of reach, ogre stays 40) and lands once the
+hero stands at (8, 5), diagonal to the ogre's corner (7, 4) (40 → 33). `!dist hero ogre` agrees:
+1.
+
+
+SCENARIO 617 — cell_blocked / cell_opaque: check a cell before moving or looking
+--------------------------------------------------------------------------------
+
+!match new b617 Walls 10 6
+!match use b617
+!ent add hero Hero 30 2 2 10
+!ent set_var hero team red
+!ent set_var hero flying false
+!ent add bird Bird 10 2 4 5
+!ent set_var bird flying true
+!ent set_var bird team blue
+!tile set 4 2 block true
+!tile set 5 2 block "entity[self].flying != True"
+!tile set 6 2 opaque "entity[self].team != 'red'"
+!zone new smoke
+!zone add smoke 7 2
+!zone set smoke opaque true
+!assert "cell_blocked('hero', 4, 2) and cell_blocked('hero', 5, 2) and not cell_blocked('hero', 3, 2)"
+!assert "not cell_blocked('bird', 5, 2)" the low wall only stops walkers
+!assert "cell_blocked('hero', 0, 2) and cell_blocked('hero', 11, 2)" off the map counts as blocked
+!system set default block_tp false
+!assert "not cell_blocked('hero', 4, 2, 'tp') and cell_blocked('hero', 4, 2, 'walk')" a mode consults its block_<mode> rule
+!assert "not cell_opaque(6, 2, 'hero') and cell_opaque(6, 2, 'bird')" viewer-conditional opacity
+!assert "cell_opaque(7, 2) and not cell_opaque(3, 2)" a smoke zone blocks sight
+!ent set_var hero actions.dash.target location
+!ent set_var hero actions.dash.body "if cell_blocked(self, target.x, target.y, 'walk'):\n    fail('blocked')\nmove_entity(self, target.x, target.y)"
+!action hero dash 4 2
+!assert "entity[hero].x == 2" the dash checks the wall first
+!action hero dash 3 3
+!assert "entity[hero].x == 3 and entity[hero].y == 3"
+!eval "cell_blocked('hero', 4, 2, 'fly')"
+
+Expected: HARNESS-ALLOWS-ERRORS. `cell_blocked` evaluates the same block
+settings movement uses: the solid wall (4, 2) blocks everyone, the low
+wall (5, 2) blocks the hero but not the flying bird, an open cell doesn't
+block, and off-map cells count as blocked. With block_tp off, a `tp`
+check ignores the wall while a `walk` check still sees it.
+`cell_opaque` asks with a viewer: the red-only window at (6, 2) is clear
+for the red hero and opaque for the blue bird; the smoke zone blocks
+sight. The `dash` action refuses the wall (❌ blocked) and moves to an
+open cell. An unknown mode (`fly`) is a ❌.
+
+
+SCENARIO 618 — free_cell_near: a blink that lands a 2x2 body where it fits
+--------------------------------------------------------------------------
+
+!match new c618 Blink 10 8
+!match use c618
+!ent add golem Golem 60 1 1 5
+!ent set_var golem footprint_w 2
+!ent set_var golem footprint_h 2
+!ent add wall1 Pillar 50 6 4 0
+!tile set 7 4 block true
+!tile set 7 5 block true
+!assert "free_cell_near(6, 4, 0) == None" the cell itself is taken
+!assert "coord_x(free_cell_near(6, 4, 1)) == 5 and coord_y(free_cell_near(6, 4, 1)) == 3" without a unit: the nearest empty cell
+!assert "coord_x(free_cell_near(6, 4, 2, 'golem')) == 5 and coord_y(free_cell_near(6, 4, 2, 'golem')) == 5" the whole 2x2 body must fit, clear of the pillar and the walls
+!assert "coord_x(free_cell_near(1, 1, 3, 'golem')) == 1" its own body does not count as occupied
+!ent set_var golem actions.blink.target location
+!ent set_var golem actions.blink.body "c = free_cell_near(target.x, target.y, 2, self)\nif c == None:\n    fail('nowhere to land')\nmove_entity(self, coord_x(c), coord_y(c))"
+!action golem blink 6 4
+!assert "entity[golem].x == 5 and entity[golem].y == 5 and occupies('golem', 6, 6)"
+!eval "free_cell_near(1, 1, 5000)"
+
+Expected: HARNESS-ALLOWS-ERRORS. The pillar stands on (6, 4) and walls
+block (7, 4) and (7, 5). Without a unit, `free_cell_near` returns the
+nearest empty cell in rings around the point (radius 0 = the point
+itself, here taken → None). With `golem` the whole 2×2 body must fit in
+bounds, clear of other units and of blocking tiles: the first anchor that
+works around (6, 4) is (5, 5) — every anchor in the first ring overlaps
+the pillar or a wall except that one. The golem's own current cells don't
+count against it. The `blink` action lands the golem there (it now
+covers (6, 6)). A radius whose search area exceeds formula_cell_limit is
+refused (❌).
+
+
+SCENARIO 619 — team_members: a rally that heals every living member of a team
+-----------------------------------------------------------------------------
+
+!match new t619 Rally 10 8
+!match use t619
+!ent add ogre Ogre 40 6 3 5
+!ent set_var ogre team blue
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!part add ogre oarm arm 10 10
+!ent set_var oarm team blue
+!ent add gob Gob 10 2 7 3
+!ent set_var gob team blue
+!ent add imp Imp 6 4 7 1
+!ent set_var imp team blue
+!ent add hero Hero 30 2 2 10
+!ent set_var hero team red
+!assert "team_members('blue') == ['ogre', 'gob', 'imp']" turn order; the arm acts through the ogre
+!assert "team_members('red') == ['hero'] and team_members('green') == []"
+!ent hp ogre -10
+!ent hp gob -5
+!ent kill imp
+!ent set_var ogre actions.rally.target none
+!ent set_var ogre actions.rally.body "n = 0\nfor m in team_members(entity[self].team):\n    entity[m].hp = entity[m].hp + 3\n    n = n + 1\nentity[self].rallied = n"
+!action ogre rally
+!assert "entity[ogre].hp == 33 and entity[gob].hp == 8 and entity[ogre].rallied == 2" the dead imp is left out
+!assert "entity[hero].hp == 30"
+
+Expected: `team_members('blue')` lists the alive blue units in turn order
+— ogre, goblin, imp — and leaves out the ogre's arm (an attached body
+part) even though it carries `team blue`. An unknown team gives `[]`.
+After the imp dies, the ogre's `rally` loops over `team_members` and heals
+the two living members by 3 (ogre 30 → 33, goblin 5 → 8, `rallied` = 2);
+the red hero is untouched.
+
+
+SCENARIO 620 — pick / shuffle: random picks that follow random_seed
+-------------------------------------------------------------------
+
+!system set default random_seed 7
+!match new r620 Picks 8 6
+!match use r620
+!ent add hero Hero 30 2 2 10
+!match clone r620b
+!ent set_var hero first "$(pick(['a','b','c','d','e','f','g','h']))"
+!ent set_var hero order "$(shuffle([1,2,3,4,5]))"
+!ent copy hero r620b 5 5
+!match use r620b
+!assert "entity[hero_2].first == pick(['a','b','c','d','e','f','g','h'])" same seed, same first pick
+!assert "sorted(shuffle([5,3,1,4,2])) == [1,2,3,4,5]" shuffle keeps every item
+!assert "pick([]) == None and pick(['only']) == 'only' and pick({'k': 1}) == 'k'"
+!ent set_var hero actions.scatter.target none
+!ent set_var hero actions.scatter.body "seen = []\nfor v in shuffle(['x', 'y', 'z']):\n    seen = seen + [v]\nentity[self].seen = sorted(seen)"
+!action hero scatter
+!assert "entity[hero].seen == ['x', 'y', 'z']" shuffle is loopable
+
+Expected: Both matches share random_seed 7. `r620b` is cloned before any
+roll, so its random sequence starts where `r620`'s did: the first pick
+`r620` made (stored on its hero, then copied across as `hero_2`) equals
+`r620b`'s own first pick. `shuffle` returns the same items in another
+order, `pick([])` is None, a one-item list gives that item and a dict
+gives one of its keys. `for v in shuffle(...)` loops. Every assert
+passes.
+
+
+SCENARIO 621 — var_copy: hand out a copy of an item and keep the original
+-------------------------------------------------------------------------
+
+!match new v621 Copy 8 6
+!match use v621
+!ent add hero Hero 30 2 2 10
+!ent add ally Ally 20 3 2 5
+!ent set_var hero inventory.potion.heal 5
+!ent set_var hero inventory.potion.amount 2
+!eval "entity[ally].copied = var_copy('hero', 'inventory.potion', 'ally', 'inventory.potion')"
+!assert "entity[ally].copied == True"
+!assert "entity[ally].inventory.potion.heal == 5 and entity[hero].inventory.potion.amount == 2" the source stays
+!eval "entity[ally].inventory.potion.amount = 1"
+!assert "entity[hero].inventory.potion.amount == 2" a deep copy: editing it leaves the source alone
+!eval "entity[ally].copied = var_copy('hero', 'inventory.elixir', 'ally', 'inventory.elixir')"
+!assert "entity[ally].copied == False and not var_has('ally', 'inventory.elixir')" a missing source is a no-op
+!eval "var_copy('hero', 'name', 'ally', 'alias')"
+!assert "entity[ally].alias == 'Hero'" reads the reserved paths too
+!eval "var_copy('hero', 'hp', 'ally', 'name')"
+!assert "entity[ally].name == 'Ally'"
+
+Expected: HARNESS-ALLOWS-ERRORS. `var_copy` writes a deep copy of the
+potion onto the ally and keeps the hero's; changing the ally's amount
+doesn't touch the hero's. A missing source returns False and writes
+nothing. A reserved path can be the source (`name` → `alias` copies the
+display name), but not the destination: writing to `name` is refused (❌,
+use `!ent rename`) and the ally keeps its name.
+
+
+SCENARIO 622 — The new read-only functions in $() args; the new writers are refused
+-----------------------------------------------------------------------------------
+
+!match new a622 Args 10 8
+!match use a622
+!ent add hero Hero 30 2 2 10
+!ent set_var hero team red
+!ent add ogre Ogre 40 6 3 5
+!ent set_var ogre team blue
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent face hero up
+!ent set_var hero gap "$(entity_distance('hero','ogre'))"
+!ent set_var hero blues "$(len(team_members('blue')))"
+!ent set_var hero edge $(in_bounds(10,8))
+!ent set_var hero wall "$(cell_blocked('hero',3,3))"
+!assert "entity[hero].gap == 4 and entity[hero].blues == 1 and entity[hero].edge == True and entity[hero].wall == False"
+!ent set_var hero spin "$(set_facing('hero','down'))"
+!ent set_var hero aim "$(face_toward('hero','ogre'))"
+!ent set_var hero loot "$(var_copy('ogre','hp','hero','stolen'))"
+!assert "facing_of('hero') == 'up' and not var_has('hero', 'spin') and not var_has('hero', 'stolen')" nothing ran
+
+Expected: HARNESS-ALLOWS-ERRORS. The read-only additions work as inline
+`$()` arguments: the hero is 4 from the ogre's body, blue has 1 member,
+(10, 8) is on the map and (3, 3) is open. The state-changing ones —
+`set_facing`, `face_toward`, `var_copy` — are refused by the read-only
+gate (❌ each), so the hero still faces up and no var was written.
+
+
+SCENARIO 623 — on_entity_despawned: remove, part cascade and transfer fire it; a death doesn't
+---------------------------------------------------------------------------------------------
+
+!match new h623 Despawn 12 8
+!match new h623b Elsewhere 12 8
+!match use h623
+!ent add hero Hero 30 3 3 10
+!ent add ogre Ogre 40 8 3 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!part add ogre oarm arm 10 10
+!ent add gob Gob 10 3 6 2
+!ent add imp Imp 5 6 6 1
+!match var set gone ""
+!gpassive add tally on_entity_despawned "match.gone = match.gone + entity[self].name + ';'"
+!passive add hero bye on_entity_despawned "match.left_from = entity[self].x"
+!ent remove gob
+!assert "match.gone == 'Gob;'"
+!ent remove ogre
+!assert "match.gone == 'Gob;Ogre;arm;'" the arm leaves with its body
+!ent kill imp
+!assert "match.gone == 'Gob;Ogre;arm;' and has_corpse('imp')" a death fires on_death only
+!ent transfer hero h623b 1 1
+!assert "match.gone == 'Gob;Ogre;arm;Hero;'" leaving the match is a despawn too
+!assert "match.left_from == 3" the handler ran while the hero was still on its cell
+!match use h623b
+!assert "entity[hero].x == 1"
+!gpassive hooks
+
+Expected: A global passive on `on_entity_despawned` appends each departing
+unit's name. `!ent remove gob` fires it once; removing the ogre fires it
+for the ogre and then for its arm (body parts leave with their body).
+Killing the imp fires nothing (a death fires on_death and leaves a
+corpse). `!ent transfer` out of the match fires it for the hero — and the
+hero's own passive runs while it is still on its cell, recording x 3; the
+copy stands at (1, 1) in the other match. `!gpassive hooks` lists the new hook.
+
+
+SCENARIO 624 — on_entity_despawned in real use: a despawning unit drops its loot
+---------------------------------------------------------------------------------
+
+!match new h624 Loot 12 8
+!match use h624
+!gpassive add drop on_entity_despawned "if var_has(self, 'loot'):\n    tile_set(entity[self].x, entity[self].y, 'loot', entity[self].loot)"
+!ent add sprite Sprite 5 2 2 3
+!ent set_var sprite loot gem
+!ent remove sprite
+!assert "tile_get(2, 2, 'loot') == 'gem'" the summon dropped its gem on its cell
+!ent add wolf Wolf 8 4 4 2
+!ent set_var wolf loot pelt
+!ent kill wolf
+!assert "not tile_has(4, 4, 'loot')" a kill is not a despawn
+!ent add ogre Ogre 40 8 3 5
+!ent add gob Gob 10 2 6 2
+!part add ogre oarm arm 10 10
+!ent set_var oarm loot claw
+!ent store_entity_into_var gob ogre forms.small
+!ent transform ogre forms.small
+!assert "tile_get(8, 3, 'loot') == 'claw' and not has_part('ogre', 'oarm')" the arm of the old form despawned and dropped its claw
+!ent add head Worm 30 2 7 4
+!part segment head s1 Seg 5 5
+!part segment head s2 Seg 5 5
+!part segment head s3 Seg 5 5
+!ent set_var s3 loot scale
+!assert "entity[s3].x == 1 and entity[s3].y == 5"
+!system set default segment_removal_mode cascade
+!ent remove s2
+!assert "tile_get(1, 5, 'loot') == 'scale' and has_part('head', 's1') and not has_part('head', 's3')" the cut takes the tail with it
+
+Expected: A global `drop` passive on `on_entity_despawned` writes a
+departing unit's `loot` onto the tile it stood on. Removing the sprite
+leaves its gem at (2, 2). Killing the wolf is a death, so nothing drops
+at (4, 4). Transforming the ogre into the goblin's statblock despawns the
+old form's arm, whose claw lands on the ogre's cell (8, 3). With
+segment_removal_mode `cascade`, removing the middle segment of a
+three-segment worm removes the tail behind it too; the tail segment
+despawns and its scale drops at (1, 5), while the first segment stays.
+
+
+SCENARIO 625 — !roll odds: exact chances and whole distributions
+----------------------------------------------------------------
+
+!roll odds 2d6 >= 8
+!roll odds 2d20kh1 >= 15
+!roll odds 1d20+5 < 10
+!roll odds 4d6kh3 >= 16
+!roll odds 3d6-1d4 = 0
+!roll odds 2d6
+!roll odds 1d6! > 6
+!roll odds 1000d1000
+!roll odds 2d6!kh1
+!roll odds >= 5
+
+Expected: HARNESS-ALLOWS-ERRORS. Exact figures with the reduced fraction:
+2d6 ≥ 8 is 41.67% (5/12); advantage (2d20kh1) ≥ 15 is 51.00% (51/100);
+1d20+5 < 10 is 20.00% (1/5); 4d6 keep 3 ≥ 16 is 13.04% (169/1296); 3d6−1d4
+= 0 is 0.46% (1/216). With no comparison, `!roll odds 2d6` shows the
+range (2–12), the average (7.00) and an 11-row distribution with bars.
+An exploding d6 above 6 is ≈ 16.67% with a note that improbably long
+chains are left out. 1000d1000 is refused as too large, a group that
+both explodes and keeps dice is refused, and a comparison with no dice is
+a ❌. No match is needed: `!roll odds` reads nothing from the board.
+
+
+SCENARIO 626 — !whoami: identity, role, view and approval for host and player
+-----------------------------------------------------------------------------
+
+!whoami
+!match new w626 Who 8 6
+!match use w626
+!host add bob
+!match bind pov=red
+!whoami
+!as player bob
+!whoami
+!as player carol
+!ent add imp Imp 5 2 2 1
+!whoami
+!as host
+!pending
+
+Expected: With no match yet, `!whoami` names `cli`, flags it as a server
+administrator and says the channel has no match. After the owner binds
+the channel with POV red, the owner's `!whoami` shows role owner, team
+`red`'s POV, and commands that run directly. Bob, a co-host, gets role
+co-host and also runs commands directly (no administrator line — he
+isn't one here). Carol is a player: her `!ent add` waits for approval,
+and her `!whoami` says her changing commands wait for a host and lists
+her waiting request `r1`. The host's `!pending` shows that request.
+
+
+SCENARIO 627 — !map as= / !list as=: a host previews a team view without binding
+--------------------------------------------------------------------------------
+
+!match new p627 Peek 10 6
+!match use p627
+!ent add hero Hero 30 2 2 10
+!ent set_var hero team red
+!ent set_var hero fog_vision_radius 2
+!ent add spy Spy 10 9 5 5
+!ent set_var spy team blue
+!ent set_var spy fog_vision_radius 1
+!match fog on
+!list
+!list as=red
+!map as=red
+!list as=blue
+!map cell 9 5 as=red
+!list as=omniscient
+!match bind pov=red
+!as player carol
+!list
+!list as=blue
+!map as=blue
+!as host
+!list as=blue
+!list nonsense
+
+Expected: HARNESS-ALLOWS-ERRORS. The channel isn't bound, so the host's
+plain `!list` shows both units. `!list as=red` and `!map as=red` start
+with a "👁 Preview: team `red`'s view" line and hide the spy (out of
+red's sight; the map is fogged beyond radius 2 of the hero). `as=blue`
+shows only the spy; `!map cell 9 5 as=red` reports the cell as unseen.
+`as=omniscient` shows everything. After binding the channel to red, the
+player carol sees only the hero, and her `as=blue` previews are refused
+(host-only, ❌). The host can still preview blue. An unknown word on
+`!list` is a ❌ with the help.
+
+
+SCENARIO 628 — !map cell: everything at a cell, where block settings come from, for=
+------------------------------------------------------------------------------------
+
+!match new c628 Cell 10 8
+!match use c628
+!ent add ogre Ogre 40 6 3 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent add hero Hero 30 2 2 10
+!ent set_var hero flying false
+!ent add bird Bird 10 2 6 4
+!ent set_var bird flying true
+!tile def new mire
+!tile def data mire block "entity[self].flying != True"
+!tile place mire 4 4
+!tile set 4 4 glyph ~
+!zone new fog
+!zone add fog 4 4
+!zone add fog 5 4
+!zone set fog opaque true
+!ent add rat Rat 3 5 5 1
+!ent kill rat
+!map cell 7 4
+!map cell 4 4
+!map cell 4 4 for=hero
+!map cell 4 4 for=bird
+!map cell 5 5
+!map cell 3 3
+!map cell 0 3
+!map cell 4 4 for=nobody
+
+Expected: HARNESS-ALLOWS-ERRORS. (7, 4) is the bottom-right cell of the
+2×2 ogre anchored at (6, 3), so the ogre is listed there. (4, 4) shows the
+`mire` tile (its data: the template name, the block condition the
+template copied in when placed, and the glyph), the `fog` zone, and where
+each setting comes from: movement — the tile's condition; sight — the
+zone's `always`. `for=hero` evaluates them for the
+walking hero (blocks movement: yes, blocks sight: yes); `for=bird`
+(flying) gives movement no, sight yes. (5, 5) lists the rat's corpse. An
+empty cell reads none / nothing set. An off-map cell and an unknown
+`for=` unit are ❌.
+
+
+SCENARIO 629 — !map cell under fog: hidden zones stay out of the report and of for=
+-----------------------------------------------------------------------------------
+
+!match new c629 Hidden 10 6
+!match use c629
+!ent add hero Hero 30 2 2 10
+!ent set_var hero team red
+!ent set_var hero fog_vision_radius 3
+!zone new pit
+!zone add pit 4 2
+!zone set pit block true
+!system set default zone_visibility_condition "zone_name != 'pit' or pov_team == 'blue'"
+!match fog on
+!match bind pov=red
+!as player carol
+!map cell 4 2 for=hero
+!map cell 9 5
+!as host
+!map cell 4 2 for=hero as=omniscient
+!ent move hero 2 right
+
+Expected: The pit at (4, 2) is invisible to red (zone_visibility_condition)
+and blocks movement. From the red channel, carol's `!map cell 4 2
+for=hero` shows no zone and "blocks movement: no" — a hidden layer is
+left out of the evaluation as well as the listing, so the report can't
+reveal it. (9, 5) is beyond the hero's sight: "unseen (fog)". The host's
+omniscient preview of the same cell lists the `pit` zone and "blocks
+movement: yes", and walking the hero into it stops it.
+
+
+SCENARIO 630 — !ent diff: compare an instance against its source
+----------------------------------------------------------------
+
+!match new d630 Diff 10 6
+!match use d630
+!ent add orc Orc 20 2 2 5
+!ent set_var orc team red
+!ent set_var orc inventory.axe.damage 6
+!ent clone orc orc2 4 2
+!ent diff orc orc2
+!ent set_var orc2 inventory.axe.damage 9
+!ent set_var orc2 inventory.shield.block 2
+!ent delete_var orc2 team
+!ent hp orc2 -5
+!ent status orc2 add burning
+!passive add orc2 rage on_turn_start "entity[self].hp = entity[self].hp + 1"
+!ent face orc2 left
+!ent diff orc orc2
+!ent diff orc nobody
+!as player carol
+!ent diff orc orc2
+
+Expected: HARNESS-ALLOWS-ERRORS. A fresh clone differs only in position:
+`position: (2,2) -> (4,2)`. After editing the clone, the diff lists, with
+the orc's value first: facing, `vars.hp: 20 -> 15`, the axe damage `6 ->
+9`, `vars.inventory.shield.block: + 2` (only on orc2), `vars.team: -
+'red'` (only on orc), the `burning` status and the `rage` passive as
+"only on `orc2`". An unknown id is a ❌. `!ent diff` shows vars like
+`!ent dump`, so carol's request is queued for a host.
+
+
+SCENARIO 631 — !find count / ids: a number, or ids to paste into another command
+---------------------------------------------------------------------------------
+
+!match new f631 Count 10 6
+!match use f631
+!ent add a1 Archer 10 2 2 5
+!ent set_var a1 team red
+!ent add a2 Archer 10 3 2 4
+!ent set_var a2 team red
+!ent add g1 Guard 20 6 2 3
+!ent set_var g1 team blue
+!find team=red count
+!find count
+!find team=green count
+!find team=red ids
+!find hp<15 ids sort:initiative
+!find team=green ids
+!find team=red count show:hp
+!foreach team=red ; ent hp $id -3
+!find hp<10 ids
+
+Expected: `count` prints just the number (2 reds, 3 in all, 0 greens).
+`ids` prints the matching ids space-separated in turn order — `a1 a2` —
+and follows `sort:` (`sort:initiative` gives `a2 a1`).
+An empty match set reads "No entities match." for `ids`. `count` ignores
+display directives. After the foreach deals 3 to each archer, `!find
+hp<10 ids` gives `a1 a2`.
+
+
+SCENARIO 632 — !tile info / list hide corpses the POV can't see
+---------------------------------------------------------------
+
+!match new t632 Bodies 8 6
+!match use t632
+!ent add hero Hero 30 2 2 10
+!ent set_var hero team red
+!ent add spy Spy 5 4 4 1
+!ent set_var spy team blue
+!ent add mook Mook 5 5 4 1
+!ent set_var mook team red
+!tile set 4 4 glyph ,
+!system set default corpse_visibility_condition "corpse_team == pov_team"
+!ent kill spy
+!ent kill mook
+!match bind pov=red
+!as player carol
+!tile info 4 4
+!tile info 5 4
+!tile list
+!list
+!as host
+!match bind pov=omniscient
+!tile info 4 4
+
+Expected: Corpses are stored in the tile data of the cell they lie on. The
+red channel may only see red corpses (corpse_visibility_condition). For
+carol, `!tile info 4 4` shows the tile's glyph but no `corpses` entry
+(the blue spy's body is hidden); `!tile info 5 4` shows the red mook's
+corpse; `!tile list` lists (4, 4) with only `glyph` and (5, 4) with
+`corpses`. `!list`'s Dead: section shows only the mook. From an
+omniscient channel the host's `!tile info 4 4` includes the spy's corpse.

@@ -20,10 +20,11 @@ from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS
 from logic import ClampSpec
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
-from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick
+from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution
 
 import os
 import re
+from fractions import Fraction
 import json
 import random
 import copy
@@ -1945,6 +1946,62 @@ async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     return await ctx.send(f"You are now `{role}`.")
 
 
+@registry.command(
+    "whoami", access="all", snapshot=False,
+    usage="!whoami",
+    desc=(
+        "Who the bot thinks you are, in this channel: your identity, "
+        "whether you're a server administrator, the channel's match and "
+        "your role in it (owner / co-host / player), the view you get "
+        "(a team's POV or everything), whether your commands run directly "
+        "or wait for a host's approval, and how many of your requests are "
+        "waiting. Read-only."
+    ),
+)
+async def whoami_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    user = ctx_user(ctx)
+    who = f"**{ctx_user_name(ctx)}**" + (f" (id `{user}`)" if user else "")
+    lines = [f"**You:** {who}"
+             + (" · server administrator" if ctx_is_admin(ctx) else "")]
+    mid = mgr.get_active_for_channel(ctx.channel_key)
+    m = mgr.matches.get(mid) if mid else None
+    if m is None:
+        lines.append("**This channel:** no active match (`!match use <id>` "
+                     "or `!match bind <id>` connects one).")
+        return await ctx.send("\n".join(lines))
+    lines.append(f"**This channel:** match **{m.name}** (`{m.id}`)")
+    single_op = getattr(ctx, "auto_approve", False)
+    if m.owner is None:
+        role = "open match — it has no owner, so there are no host checks"
+    elif user is not None and m.is_owner(user):
+        role = "owner"
+    elif user is not None and m.is_host(user):
+        role = "co-host"
+    else:
+        role = "player"
+    lines.append(f"**Your role:** {role}")
+    pov = _view_pov(ctx, m, [])
+    preview = getattr(ctx, "pov_override", _NO_POV) is not _NO_POV
+    view = "everything (no team POV)" if pov is None else f"team `{pov}`'s POV"
+    lines.append(f"**Your view:** {view}"
+                 + (" — previewing with `!as view`" if preview else ""))
+    if single_op:
+        runs = "run directly (single-operator surface)"
+    elif _acts_as_host(ctx, m):
+        runs = "run directly"
+    else:
+        runs = ("read-only commands run directly; commands that change the "
+                "match wait for a host to approve them")
+    lines.append(f"**Your commands:** {runs}")
+    mine = sorted((rid for rid, req in m.pending_requests.items()
+                   if user is not None and req.get("user") == user),
+                  key=lambda r: int(r[1:]) if r[1:].isdigit() else 0)
+    if mine:
+        lines.append(f"**Waiting for approval:** {len(mine)} "
+                     f"({', '.join(f'`{r}`' for r in mine)})")
+    return await ctx.send("\n".join(lines))
+
+
 # ---- approval queue (host approves / denies player commands) -----
 @registry.command(
     "pending", access="host_only", snapshot=False,
@@ -2480,7 +2537,7 @@ _ENT_GROUP_ITERABLE_SUBS = {
     "info", "dump", "remove", "del", "rm", "face",
     "hp", "init", "set_var", "delete_var", "delete_var_silent",
 }
-_ENT_GROUP_REJECTING_SUBS = {"add", "tp", "rename", "clone"}
+_ENT_GROUP_REJECTING_SUBS = {"add", "tp", "rename", "clone", "diff"}
 
 
 async def _ent_group_dispatch(ctx, args, mgr, m, sub: str):
@@ -2755,6 +2812,30 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if eid not in m.entities:
             raise NotFound(f"Entity '{eid}' not found.")
         return await ctx.send(_entity_dump(m.entities[eid]))
+
+    # diff: compare two units side by side
+    if sub == "diff":
+        if await return_help_if_not_enough_args(ctx, args, 3, "ent", "diff"):
+            return
+        _check_tail(args, 3, set(), "!ent diff <a> <b>")
+        ids = []
+        for tok in args[1:3]:
+            eid = _resolve_eid(m, tok)
+            if eid not in m.entities:
+                raise NotFound(f"Entity '{tok}' not found.")
+            ids.append(eid)
+        a, b = ids
+        lines = _diff_entity(a, m.entities[a].to_dict(), m.entities[b].to_dict(),
+                             words=(f"only on `{a}`", f"only on `{b}`"))
+        if not lines:
+            return await ctx.send(
+                f"`{a}` and `{b}` match: same name, position, facing, vars, "
+                f"statuses, passives and clamps.")
+        head = (f"**`{a}` vs `{b}`** — `x -> y` is {a}'s value -> {b}'s; "
+                f"`+` = only on `{b}`, `-` = only on `{a}`:")
+        body = "\n".join(line[2:] if line.startswith("  ") else line
+                         for line in lines)
+        return await ctx.send(f"{head}\n```\n{body}\n```")
 
     # delete / remove
     if sub in ("remove", "del", "rm"):# and len(args) >= 2:
@@ -3155,36 +3236,40 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             raise NotFound(f"Entity '{eid}' not found.")
         e = m.entities[eid]
         raw = args[2].strip().lower()
-        eight_way_face = bool(m.rules.get("allow_diagonal_facing", False))
-
-        rotation_aliases_cw = {"cw", "clockwise", "right_turn", "turn_right"}
-        rotation_aliases_ccw = {"ccw", "counterclockwise", "anticlockwise",
-                                "left_turn", "turn_left"}
-        if raw in rotation_aliases_cw or raw in rotation_aliases_ccw:
-            clockwise = raw in rotation_aliases_cw
-            new_facing = rotate_direction(
-                e.facing, clockwise=clockwise, eight_way=eight_way_face,
-            )
-            e.facing = new_facing
-            label = "clockwise" if clockwise else "counterclockwise"
+        if raw == "toward":
+            # !ent face <id> toward <eid> | toward <x> <y>
+            tail = args[3:]
+            if len(tail) == 1:
+                tid = _query_eid(ctx, m, tail[0])
+                t = m.entities[tid]
+                tw, th = m.entity_footprint(t)
+                tx, ty = t.x + (tw - 1) / 2, t.y + (th - 1) / 2
+                what = f"`{tid}`"
+            elif len(tail) == 2:
+                try:
+                    tx, ty = int(tail[0]), int(tail[1])
+                except ValueError:
+                    return await ctx.send(
+                        "❌ `!ent face <id> toward <x> <y>` needs whole-number "
+                        "coordinates.")
+                what = f"({tx}, {ty})"
+            else:
+                return await ctx.send(
+                    "❌ Use `!ent face <id> toward <eid>` or "
+                    "`!ent face <id> toward <x> <y>`.")
+            d = m.facing_toward(e, tx, ty)
+            if d is None:
+                return await ctx.send(
+                    f"`{eid}` is centred on {what}; facing unchanged "
+                    f"({e.facing}).")
+            m.set_entity_facing(e, d)
+            return await ctx.send(f"`{eid}` now faces {d}, toward {what}.")
+        _check_tail(args, 3, set(), "!ent face <id> <dir|cw|ccw>")
+        canon = m.set_entity_facing(e, raw)
+        if raw in m._FACING_CW or raw in m._FACING_CCW:
+            label = "clockwise" if raw in m._FACING_CW else "counterclockwise"
             return await ctx.send(
-                f"Rotated `{eid}` {label}; now facing {new_facing}."
-            )
-
-        canon = normalize_direction(raw)
-        if canon is None:
-            return await ctx.send(
-                "Use: up/down/left/right (or up_left/up_right/down_left/"
-                "down_right when allow_diagonal_facing is enabled), or "
-                "cw/ccw to rotate."
-            )
-        if canon in DIAGONAL_DIRECTIONS and not eight_way_face:
-            raise VTTError(
-                f"Diagonal facing '{raw}' is not allowed by the active "
-                f"game system. Enable rule 'allow_diagonal_facing' to "
-                f"permit it."
-            )
-        e.facing = canon
+                f"Rotated `{eid}` {label}; now facing {canon}.")
         return await ctx.send(f"Facing of `{eid}` set to {canon}.")
 
     # hp
@@ -3681,14 +3766,28 @@ registry.annotate_sub(
     ),
 )
 registry.annotate_sub(
+    "ent", "diff",
+    usage="!ent diff <a> <b>",
+    desc=(
+        "Compare two units: name, position, facing, body-part / mount links, "
+        "every var (nested ones by dotted path), statuses, passives and "
+        "clamps. Only differences are listed — e.g. an instance against the "
+        "unit it was cloned from. Host-only (it shows vars like `!ent "
+        "dump`). Read-only."
+    ),
+)
+registry.annotate_sub(
     "ent", "face",
-    usage="!ent face <id> <dir|cw|ccw>",
+    usage="!ent face <id> <dir|cw|ccw> | !ent face <id> toward <eid | x y>",
     desc=(
         "Set or rotate facing. <dir> accepts the same direction aliases as "
         "!ent move (cardinals always; diagonals only when "
         "'allow_diagonal_facing' is enabled). Use 'cw'/'clockwise' or "
         "'ccw'/'counterclockwise' to rotate one step — 90° in cardinal-"
-        "only systems, 45° when diagonal facing is enabled."
+        "only systems, 45° when diagonal facing is enabled. `toward <eid>` "
+        "/ `toward <x> <y>` turns the unit to face a unit or a cell, "
+        "measured from the centre of its body (nearest of 8 directions, or "
+        "the dominant axis when diagonal facing is off)."
     ),
 )
 registry.annotate_sub(
@@ -4001,14 +4100,44 @@ async def match_top_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 _NO_POV = object()
 
 
+def _as_arg(args: List[str]) -> Any:
+    """The team named by an `as=<team>` render arg (None for
+    `as=omniscient`), or _NO_POV when there is none."""
+    for a in args or ():
+        if isinstance(a, str) and a.lower().startswith("as="):
+            team = a[3:]
+            if not team:
+                raise VTTError("`as=` needs a team name (or `as=omniscient`).")
+            return None if team.lower() in ("omniscient", "all", "full") else team
+    return _NO_POV
+
+
+def _as_note(args: List[str]) -> str:
+    """A header line marking an `as=` preview, so a host can't mistake it
+    for the channel's normal view."""
+    team = _as_arg(args)
+    if team is _NO_POV:
+        return ""
+    who = "everything" if team is None else f"team `{team}`'s view"
+    return f"👁 Preview: {who} (host-only `as=`).\n"
+
+
 def _view_pov(ctx: ReplyContext, m: "Match", args: List[str]) -> Optional[str]:
     """Resolve the POV team for a render/list command. Returns a team
     string, or None for an omniscient view (no filtering). Precedence:
+      0. an `as=<team>` arg (host-only, checked here): a one-off preview of
+         that team's view (`as=omniscient` = everything);
       1. a `full` first-arg forces omniscient (host-gated by the access
          layer via ELEVATED_ARGS);
       2. a transient ctx POV override (CLI `!as view <team>`), which lets
          a tester preview a team's fog without mutating the binding;
       3. the channel's bound POV (Match.channel_pov)."""
+    team = _as_arg(args)
+    if team is not _NO_POV:
+        if not _acts_as_host(ctx, m):
+            raise VTTError("`as=<team>` previews are host-only — they show "
+                           "what another team can see.")
+        return team
     if args and args[0].lower() == "full":
         return None
     ov = getattr(ctx, "pov_override", _NO_POV)
@@ -4151,7 +4280,166 @@ def _map_render_reply(ctx: ReplyContext, m, args: List[str],
                   f"of {m.grid_width}×{m.grid_height} · "
                   f"`!map pan <dir> [n]` / `!map center <eid>`\n")
         block = header + block
-    return block
+    return _as_note(args) + block
+
+
+def _visible_tile_data(m, x: int, y: int,
+                       pov: Optional[str]) -> Optional[Dict[str, Any]]:
+    """The tile data at (x, y) as `pov` may see it, or None when there's no
+    tile or it's hidden. Corpses are stored inside tile data, so the ones
+    the POV can't see (corpse_visibility_condition, fog) are dropped; a tile
+    holding only hidden corpses reads as no tile."""
+    if (x, y) not in m.tiles or not m.tile_visible_to(x, y, pov):
+        return None
+    data = m.tiles[(x, y)]
+    if pov is None or not isinstance(data.get("corpses"), dict):
+        return data
+    seen = {cid: c for cid, c in data["corpses"].items()
+            if m.corpse_visible_to(cid, c, x, y, pov)}
+    view = {k: v for k, v in data.items() if k != "corpses"}
+    if seen:
+        view["corpses"] = seen
+    return view or None
+
+
+def _cell_spec_source(m, x: int, y: int, key: str,
+                      rule_key: str) -> Tuple[Any, str]:
+    """The tile-layer `block` / `opaque` spec governing (x, y) and where it
+    comes from: the tile itself, its template, or the rule. ("", "") when
+    nothing applies."""
+    cell = m.tiles.get((x, y))
+    if cell is not None:
+        if cell.get(key) not in (None, ""):
+            return cell[key], "tile"
+        tname = cell.get("_template")
+        tpl = m.tile_templates.get(tname) if isinstance(tname, str) else None
+        if tpl is not None and tpl.data.get(key) not in (None, ""):
+            return tpl.data[key], f"template `{tname}`"
+    spec = m.rules.get(rule_key, "")
+    return (spec, f"rule {rule_key}") if spec not in (None, "") else ("", "")
+
+
+def _fmt_spec(spec: Any) -> str:
+    if isinstance(spec, bool):
+        return "always" if spec else "never"
+    if isinstance(spec, (int, float)):
+        return "always" if spec else "never"
+    return f"`{spec}`"
+
+
+def _map_cell(ctx: ReplyContext, m, args: List[str]) -> str:
+    """`!map cell <x> <y> [for=<eid>] [as=<team>]`: everything at one cell
+    the channel's POV can see — units, tile data, zones, corpses, and the
+    movement / sight block settings — plus, with for=<eid>, whether the cell
+    blocks that unit. Hidden layers are left out of the evaluation too, so
+    the for= answer can't reveal an unseen zone."""
+    _check_options(args[3:], {"for", "as"}, "!map cell")
+    try:
+        x, y = int(args[1]), int(args[2])
+    except (IndexError, ValueError):
+        raise VTTError("Usage: `!map cell <x> <y> [for=<eid>]` — x and y are "
+                       "whole numbers.")
+    for a in args[3:]:
+        if "=" not in a:
+            raise VTTError(f"Unexpected `{a}`. Usage: `!map cell <x> <y> "
+                           f"[for=<eid>]`.")
+    if not m.in_bounds(x, y):
+        raise VTTError(f"({x}, {y}) is off the {m.grid_width}×{m.grid_height} "
+                       f"map.")
+    pov = _view_pov(ctx, m, args[3:])
+    mover = None
+    for a in args[3:]:
+        if a.lower().startswith("for="):
+            mover = _query_eid(ctx, m, a[4:])
+    head = _as_note(args[3:]) + f"📍 **Cell ({x}, {y})**"
+    if not m._fog_terrain_visible(pov, x, y):
+        return head + " — unseen (fog)."
+    lines = [head]
+    units = []
+    for e in m.entities_in_turn_order() + sorted(
+            (e for e in m.entities.values() if e.id not in m.turn_order),
+            key=lambda e: e.id):
+        if (not e.is_alive or e.is_glued_part or e.is_hidden_rider
+                or _pov_hides(m, pov, e.id) or not m.entity_visible_to(e.id, pov)):
+            continue
+        if (x, y) in m.entity_cells(e) and e.id not in {u.id for u in units}:
+            units.append(e)
+    lines.append("Units: " + ("; ".join(_entity_line(e, pov) for e in units)
+                              if units else "none"))
+    data = _visible_tile_data(m, x, y, pov)
+    tile_data = {k: v for k, v in (data or {}).items() if k != "corpses"}
+    if tile_data:
+        shown = json.dumps(tile_data, sort_keys=True, default=str)
+        if len(shown) > 300:
+            shown = shown[:297] + "..."
+        lines.append(f"Tile: `{shown}`")
+    else:
+        lines.append("Tile: none")
+    zones = sorted(n for n, z in m.zones.items()
+                   if (x, y) in z.get("cells", ()) and m.zone_visible_to(n, pov))
+    lines.append("Zones: " + (", ".join(f"`{n}`" for n in zones) or "none"))
+    corpses = [(cid, c) for cx, cy, cid, c in m.all_corpses()
+               if (x, y) in m.corpse_cells(cx, cy, c)
+               and m.corpse_visible_to(cid, c, cx, cy, pov)]
+    if corpses:
+        lines.append("Corpses: " + ", ".join(
+            f"`{cid}` ({(c.get('entity') or {}).get('name', cid)})"
+            for cid, c in corpses))
+    show_tile = m.tile_visible_to(x, y, pov)
+    for key, rule_key, zone_rule, label in (
+            ("block", "tile_block_condition", "zone_block_condition",
+             "Blocks movement"),
+            ("opaque", "tile_opaque_condition", "zone_opaque_condition",
+             "Blocks sight")):
+        parts = []
+        if show_tile:
+            spec, src = _cell_spec_source(m, x, y, key, rule_key)
+            if src:
+                parts.append(f"{src}: {_fmt_spec(spec)}")
+        for n in zones:
+            zspec = (m.zones[n].get("data") or {}).get(key)
+            if zspec not in (None, ""):
+                parts.append(f"zone `{n}`: {_fmt_spec(zspec)}")
+            elif m.rules.get(zone_rule, "") not in (None, ""):
+                parts.append(f"zone `{n}` (rule {zone_rule}): "
+                             f"{_fmt_spec(m.rules.get(zone_rule))}")
+        if key == "block" and corpses and \
+                m.rules.get("corpse_block_condition", "") not in (None, ""):
+            parts.append("corpses (rule corpse_block_condition): "
+                         f"{_fmt_spec(m.rules.get('corpse_block_condition'))}")
+        lines.append(f"{label}: " + ("; ".join(parts) if parts else "nothing set"))
+    if mover is not None:
+        blocks = sees_blocked = False
+        if show_tile:
+            blocks = m._eval_block_spec(m._tile_block_spec(x, y), mover,
+                                        {"tile_x": x, "tile_y": y})
+            sees_blocked = m._eval_opaque_spec(
+                m._tile_opaque_spec(x, y), mover, {"tile_x": x, "tile_y": y})
+        for n in zones:
+            zd = m.zones[n].get("data") or {}
+            bspec = zd.get("block")
+            if bspec in (None, ""):
+                bspec = m.rules.get("zone_block_condition", "")
+            ospec = zd.get("opaque")
+            if ospec in (None, ""):
+                ospec = m.rules.get("zone_opaque_condition", "")
+            blocks = blocks or m._eval_block_spec(bspec, mover,
+                                                  {"zone_name": n})
+            sees_blocked = sees_blocked or m._eval_opaque_spec(
+                ospec, mover, {"zone_name": n, "tile_x": x, "tile_y": y})
+        cspec = m.rules.get("corpse_block_condition", "")
+        if cspec not in (None, ""):
+            team_var = str(m.rules.get("team_var", "team"))
+            for cid, c in corpses:
+                cv = (c.get("entity") or {}).get("vars") or {}
+                if m._eval_block_spec(cspec, mover, {
+                        "tile_x": x, "tile_y": y, "corpse_id": cid,
+                        "corpse_team": str(cv.get(team_var, "") or "")}):
+                    blocks = True
+        lines.append(f"For `{mover}`: blocks movement: "
+                     f"{'yes' if blocks else 'no'} · blocks sight: "
+                     f"{'yes' if sees_blocked else 'no'}")
+    return "\n".join(lines)
 
 
 _PREVIEW_USAGE = (
@@ -4344,11 +4632,13 @@ def _color_guide() -> str:
     )
 
 
-@registry.command("map", access="all", usage="!map [full] | !map preview <burst|cone|line|rect> ... | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 30), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map preview burst|cone|line|rect ...` shows the cells an area shape would cover (marked with the preview_glyph rule's character on cells without a unit; graphics surfaces draw translucent squares above units, colour/opacity from the preview_color / preview_opacity rules or `color=` / `opacity=`) and lists the visible units inside — nothing happens to them. `!map full` (host-gated) forces the omniscient view. `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets a per-match background sprite; `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). `!map border on|off` / `color <name>` / `opacity <0-100>` / `clear` (host-gated) overrides the grid-line border rules per match (borders draw above the ground, below tiles/entities). `!map mode text|image` (host-gated) sets the per-match default render mode — `image` makes a plain `!map` and the auto-update board render graphically on Discord (text surfaces fall back to ASCII). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
+@registry.command("map", access="all", usage="!map [full] [as=<team>] | !map cell <x> <y> [for=<eid>] | !map preview <burst|cone|line|rect> ... | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 30), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map preview burst|cone|line|rect ...` shows the cells an area shape would cover (marked with the preview_glyph rule's character on cells without a unit; graphics surfaces draw translucent squares above units, colour/opacity from the preview_color / preview_opacity rules or `color=` / `opacity=`) and lists the visible units inside — nothing happens to them. `!map full` (host-gated) forces the omniscient view; `as=<team>` (host-only) previews what that team sees (`as=omniscient` = everything), without binding a channel. `!map cell <x> <y> [for=<eid>]` reports everything at one cell the channel can see — units, tile data, zones, corpses, and where its movement / sight block settings come from; `for=<eid>` adds whether the cell blocks that unit (hidden layers are left out). `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets a per-match background sprite; `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). `!map border on|off` / `color <name>` / `opacity <0-100>` / `clear` (host-gated) overrides the grid-line border rules per match (borders draw above the ground, below tiles/entities). `!map mode text|image` (host-gated) sets the per-match default render mode — `image` makes a plain `!map` and the auto-update board render graphically on Discord (text surfaces fall back to ASCII). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     if args and args[0].lower() == "colors":
         return await ctx.send(_color_guide())
+    if args and args[0].lower() == "cell":
+        return await ctx.send(_map_cell(ctx, m, args))
     if args and args[0].lower() == "preview":
         return await _map_preview(ctx, m, args[1:])
     if args and args[0].lower() == "background":
@@ -4631,7 +4921,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # `full` is honored only as args[0] (the host-gated position) via
     # _view_pov, so a player can't sneak omniscient via `!map hide=.. full`.
     extra_hidden = set()
-    _check_options(args, {"hide", "legend"}, "!map")
+    _check_options(args, {"hide", "legend", "as"}, "!map")
     for i, a in enumerate(args):
         # Anything else here is a mistyped subcommand (`!map pna up`), which
         # used to fall through to a plain render.
@@ -4656,9 +4946,13 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return None
     return await ctx.send(_map_render_reply(ctx, m, args, extra_hidden))
 
-@registry.command("list", access="all", usage="!list [full]", desc="List entities (turn order) from this channel's POV, plus a Dead: section of corpses when show_corpses_in_entity_list is enabled. `!list full` (host-gated) ignores visibility.")
+@registry.command("list", access="all", usage="!list [full] [as=<team>]", desc="List entities (turn order) from this channel's POV, plus a Dead: section of corpses when show_corpses_in_entity_list is enabled. `!list full` (host-gated) ignores visibility; `as=<team>` (host-only) previews what that team sees.")
 async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
+    _check_options(args, {"as"}, "!list")
+    for i, a in enumerate(args):
+        if "=" not in a and not (i == 0 and a.lower() == "full"):
+            return await _help_fallback(ctx, ["list"], a)
     pov = _view_pov(ctx, m, args)
     es = m.entities_in_turn_order()
     active_id = m.turn_order[m.active_index] if m.turn_order else None
@@ -4688,8 +4982,8 @@ async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             for (x, y, eid, corpse) in corpses:
                 lines.append(f"   {_corpse_line(m, x, y, eid, corpse)}")
     if not lines:
-        return await ctx.send("(no entities)")
-    return await ctx.send("\n".join(lines))
+        return await ctx.send(_as_note(args) + "(no entities)")
+    return await ctx.send(_as_note(args) + "\n".join(lines))
 
 # ---- !find ----------------------------------------------------------
 # Token-based entity query. Each arg is one predicate; all predicates
@@ -4920,7 +5214,7 @@ def _find_match_entity(m: Match, e: Entity, predicates: List[Tuple[str, str, Opt
 
 @registry.command(
     "find", access="all",
-    usage="!find <predicate> [<predicate> ...]",
+    usage="!find <predicate> [<predicate> ...] [show:<csv>] [sort:<var>] [count|ids]",
     desc=(
         "Query entities by AND-ed predicates. Predicate forms: "
         "`var=value`, `var!=value`, `var<value`, `var<=value`, "
@@ -4937,7 +5231,10 @@ def _find_match_entity(m: Match, e: Entity, predicates: List[Tuple[str, str, Opt
         "`sort:hp:desc`) — both read dotted paths. Example: "
         "`!find team=red hp<20 status:bleeding near:boss:3 show:hp sort:hp` "
         "lists every red-team entity below 20 HP that is bleeding AND within "
-        "3 cells of `boss`, showing each one's hp, lowest first."
+        "3 cells of `boss`, showing each one's hp, lowest first. OUTPUT: a "
+        "bare `count` prints only the number of matches; a bare `ids` prints "
+        "the matching ids space-separated, ready to paste into another "
+        "command (`!find team=red ids`)."
     ),
     snapshot=False,
 )
@@ -4951,10 +5248,15 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     show_cols: List[str] = []
     sort_var: Optional[str] = None
     sort_desc = False
+    output = "rows"          # rows | count | ids
     pred_tokens: List[str] = []
     for t in args:
         low = t.lower()
-        if low.startswith("show:"):
+        if low in ("count", "ids"):
+            # Bare words can't be predicates (those need an operator or a
+            # `kind:` prefix), so these output forms can't collide with one.
+            output = low
+        elif low.startswith("show:"):
             show_cols.extend(c.strip() for c in t[5:].split(",") if c.strip())
         elif low.startswith("sort:"):
             spec = t[5:]
@@ -4974,6 +5276,9 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 and _find_match_entity(m, e, predicates, pov)]
     except VTTError as ex:
         return await ctx.send(f"❌ {ex}")
+    if output == "count":
+        return await ctx.send(
+            f"**{len(hits)}** {'match' if len(hits) == 1 else 'matches'}.")
     if not hits:
         return await ctx.send("No entities match.")
     if sort_var:
@@ -4993,6 +5298,9 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             except (TypeError, ValueError):
                 return (0, 0.0, str(v))
         hits.sort(key=_sort_key, reverse=sort_desc)
+    if output == "ids":
+        # Plain space-separated ids, ready to paste into another command.
+        return await ctx.send(" ".join(e.id for e in hits))
     word = "match" if len(hits) == 1 else "matches"
     lines = [f"**{len(hits)} {word}:**"]
     for e in hits:
@@ -5015,7 +5323,9 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 # ---- !roll --------------------------------------------------------------
 @registry.command(
-    "roll", access="all", usage="!roll <dice> [<dice> ...]", snapshot=False,
+    "roll", access="all",
+    usage="!roll <dice> [<dice> ...] | !roll odds <dice> [<op> <n>]",
+    snapshot=False,
     desc=(
         "Roll dice and show the total plus the individual dice. Uses the same "
         "notation as the roll() formula primitive: `NdM` (N optional), with "
@@ -5024,13 +5334,17 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         "(`2d20kh1` = advantage, `2d20kl1` = disadvantage). Examples: "
         "`!roll 2d6+3`, `!roll d20`, `!roll 4d6kh3`, `!roll 10d6!`. Replay-"
         "safe via the match's random_seed rule (a seeded match rolls "
-        "reproducibly). Read-only — rolling never mutates the match."
+        "reproducibly). Read-only — rolling never mutates the match. "
+        "`!roll odds` works out probabilities instead of rolling (see "
+        "`!help roll odds`)."
     ),
 )
 async def roll_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
         title, body = registry.help_for(["roll"])
         return await ctx.send(f"**{title}**\n{body}")
+    if args[0].lower() == "odds":
+        return await _roll_odds(ctx, "".join(args[1:]))
     # Join so `!roll 2d6 + 3` and `!roll 2d6+3` both work (roll strips spaces).
     spec = "".join(args)
     # Use the match RNG when a match is active (honors random_seed); otherwise
@@ -5049,6 +5363,83 @@ async def roll_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # Hide the breakdown when it's just the same single number (e.g. a flat).
     tail = f"   ({breakdown})" if breakdown and breakdown != str(total) else ""
     return await ctx.send(f"🎲 `{spec}` → **{total}**{tail}")
+
+
+_ODDS_OPS = {">=": "≥", "<=": "≤", "==": "=", "!=": "≠", "=": "=",
+             ">": ">", "<": "<"}
+_ODDS_TABLE_MAX = 40   # distribution rows shown when no comparison is given
+
+
+def _fmt_pct(p: float) -> str:
+    if 0 < p < 0.00005:
+        return "<0.01%"
+    if 0.99995 < p < 1:
+        return ">99.99%"
+    return f"{p * 100:.2f}%"
+
+
+async def _roll_odds(ctx: ReplyContext, text: str):
+    """`!roll odds <dice> [<op> <n>]`: the chance a roll meets a target, or
+    the whole distribution when no comparison is given. Read-only."""
+    if not text:
+        return await ctx.send(
+            "❌ `!roll odds` is missing arguments. Usage: "
+            "`!roll odds <dice> [<op> <n>]`, e.g. `!roll odds 2d6 >= 8`.")
+    mt = re.match(r"^(.*?)(>=|<=|==|!=|=|>|<)(-?\d+)$", text)
+    spec, op, target = (mt.group(1), mt.group(2), int(mt.group(3))) if mt \
+        else (text, None, None)
+    if not spec:
+        return await ctx.send("❌ `!roll odds` needs a dice expression before "
+                              "the comparison.")
+    try:
+        dist, total, exact = dice_distribution(spec)
+    except FormulaError as ex:
+        return await ctx.send(f"❌ {ex}")
+    approx = "" if exact else "≈ "
+    note = ("" if exact else
+            "\n(exploding dice: chains rarer than 1 in a trillion are left out)")
+    if op is not None:
+        test = {">=": lambda v: v >= target, "<=": lambda v: v <= target,
+                ">": lambda v: v > target, "<": lambda v: v < target,
+                "=": lambda v: v == target, "==": lambda v: v == target,
+                "!=": lambda v: v != target}[op]
+        hit = sum(w for v, w in dist.items() if test(v))
+        ratio = ""
+        if exact:
+            fr = Fraction(hit, total)
+            ratio = f" ({fr.numerator}/{fr.denominator})" if 0 < fr < 1 else ""
+        return await ctx.send(
+            f"🎲 P(`{spec}` {_ODDS_OPS[op]} {target}) = "
+            f"**{approx}{_fmt_pct(hit / total)}**{ratio}{note}")
+    lo, hi = min(dist), max(dist)
+    mean = sum(v * w for v, w in dist.items()) / total
+    lines = [f"🎲 `{spec}`: {lo}–{hi}, average {approx}{mean:.2f}{note}"]
+    if hi - lo + 1 <= _ODDS_TABLE_MAX:
+        peak = max(dist.values())
+        rows = []
+        for v in range(lo, hi + 1):
+            w = dist.get(v, 0)
+            bar = "█" * int(round(20 * w / peak)) if peak else ""
+            rows.append(f"{v:>5}  {_fmt_pct(w / total):>7}  {bar}")
+        lines.append("```\n" + "\n".join(rows) + "\n```")
+    else:
+        lines.append(f"({hi - lo + 1} possible totals — add a comparison, "
+                     f"e.g. `!roll odds {spec} >= {round(mean)}`.)")
+    return await ctx.send("\n".join(lines))
+
+
+registry.annotate_sub(
+    "roll", "odds",
+    usage="!roll odds <dice> [<op> <n>]",
+    desc=(
+        "The exact chance of a roll: `!roll odds 2d6 >= 8` → 41.67% (5/12). "
+        "Operators: >= <= > < = !=. Without a comparison it shows the range, "
+        "the average and (up to 40 possible totals) the whole distribution. "
+        "Same dice notation as `!roll`; exploding dice give a near-exact "
+        "figure (≈), and a group that both explodes and keeps dice isn't "
+        "supported. Very large expressions are refused. Read-only."
+    ),
+)
 
 
 # ---- !dist --------------------------------------------------------------
@@ -6007,10 +6398,13 @@ def _diff_named(label: str, a: Dict[str, Any], b: Dict[str, Any]) -> List[str]:
     return out
 
 
-def _diff_entity(eid: str, ea: Dict[str, Any], eb: Dict[str, Any]) -> List[str]:
+def _diff_entity(eid: str, ea: Dict[str, Any], eb: Dict[str, Any],
+                 words: Tuple[str, str] = ("removed", "added")) -> List[str]:
     """Per-entity diff lines: name, position, facing, body-part / mount
     links, vars (flattened to leaves), statuses, passives and clamps. Only
-    fields that actually differ contribute lines."""
+    fields that actually differ contribute lines. `words` names a status /
+    passive / clamp present only on the first / only on the second side."""
+    gone, new = words
     lines: List[str] = []
     if ea.get("name") != eb.get("name"):
         lines.append(f"    name: {ea.get('name')!r} -> {eb.get('name')!r}")
@@ -6026,9 +6420,9 @@ def _diff_entity(eid: str, ea: Dict[str, Any], eb: Dict[str, Any]) -> List[str]:
     sa, sb = ea.get("status") or {}, eb.get("status") or {}
     for name in sorted(set(sa) | set(sb), key=str):
         if name not in sa:
-            lines.append(f"    status.{name}: added")
+            lines.append(f"    status.{name}: {new}")
         elif name not in sb:
-            lines.append(f"    status.{name}: removed")
+            lines.append(f"    status.{name}: {gone}")
         else:
             lines.extend(_diff_flat(f"status.{name}", sa[name], sb[name], "    "))
     # Passives / clamps: id-level. A changed passive shows as `changed`; we
@@ -6037,9 +6431,9 @@ def _diff_entity(eid: str, ea: Dict[str, Any], eb: Dict[str, Any]) -> List[str]:
         a, b = ea.get(key) or {}, eb.get(key) or {}
         for pid in sorted(set(a) | set(b), key=str):
             if pid not in a:
-                lines.append(f"    {label}.{pid}: added")
+                lines.append(f"    {label}.{pid}: {new}")
             elif pid not in b:
-                lines.append(f"    {label}.{pid}: removed")
+                lines.append(f"    {label}.{pid}: {gone}")
             elif a[pid] != b[pid]:
                 lines.append(f"    {label}.{pid}: changed")
     return lines
@@ -7630,9 +8024,9 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # hidden trap. `!tile info` carries no `full` flag; a host views
         # from an omniscient channel (or `!as view omniscient`).
         pov = _view_pov(ctx, m, args)
-        if (x, y) not in m.tiles or not m.tile_visible_to(x, y, pov):
+        data = _visible_tile_data(m, x, y, pov)
+        if data is None:
             return await ctx.send(f"tile ({x},{y}): no data.")
-        data = m.tiles[(x, y)]
         return await ctx.send(
             f"**tile ({x},{y})**\n```{json.dumps(data, indent=2, sort_keys=True)}\n```"
         )
@@ -7642,8 +8036,9 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # POV-filtered: hidden tiles are omitted entirely (no enumeration
         # of hidden traps from a player channel).
         pov = _view_pov(ctx, m, args)
-        coords = [(x, y) for (x, y) in sorted(m.tiles.keys())
-                  if m.tile_visible_to(x, y, pov)]
+        views = {(x, y): _visible_tile_data(m, x, y, pov)
+                 for (x, y) in sorted(m.tiles.keys())}
+        coords = [c for c, v in views.items() if v is not None]
         if not coords:
             return await ctx.send("No special tiles in this match.")
         # Compact one-line summary per tile: list top-level feature
@@ -7651,7 +8046,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # for the full nested dump.
         lines = ["**Special tiles:**"]
         for (x, y) in coords:
-            features = ", ".join(sorted(m.tiles[(x, y)].keys()))
+            features = ", ".join(sorted(views[(x, y)].keys()))
             lines.append(f"- ({x},{y}): {features}")
         return await ctx.send("\n".join(lines))
 

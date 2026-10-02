@@ -2946,6 +2946,13 @@ HOOK_NAMES: Set[str] = {
     "on_round_start",
     "on_round_end",
     "on_entity_spawned",
+    # Despawn event: the unit is leaving the match WITHOUT dying — `!ent
+    # remove`, `!part remove`, remove_entity(), the body parts and snake
+    # segments removed along with it, `!ent transfer` out of the match, and
+    # the old parts a transform drops. Fires on the unit BEFORE it goes, so
+    # `self` and its vars/position still resolve. A death fires on_death
+    # instead (as do the parts that go into the dying body's corpse).
+    "on_entity_despawned",
     # Death event. Fires on the entity once the death-condition formula
     # evaluates truthy, BEFORE the entity is removed from the match (so
     # `self` is still bound and entity[self].x/.y still resolve). The
@@ -4462,13 +4469,23 @@ class Entity:
         match._record_vision(getattr(self, "team", None))
         return (self.id, log)
 
-    def remove(self):
+    def remove(self, *, despawn: bool = True) -> List[str]:
         """
         Remove this entity from its match and turn order.
         Also scrubs the entity from every group it was a member of, so
         no group is left holding a dangling id.
+
+        `despawn` (the default) fires on_entity_despawned on the unit first,
+        and on each body part removed with it; the death pipeline passes
+        False (a death fires on_death). Returns the hook's log lines.
         """
         m = self._require_match()
+        log: List[str] = []
+        if despawn:
+            log = m.fire_hook("on_entity_despawned", target_ids=[self.id])
+            # A handler may already have removed (or killed) the unit.
+            if self._match is not m or self.id not in m.entities:
+                return log
         # Resolve any riders this entity was carrying (death OR despawn both
         # route here) per the mount_on_host_death rule — done while `self` is
         # still in the match so the eject search can use its footprint.
@@ -4513,9 +4530,10 @@ class Entity:
         # part's own remove() handles its riders, auras and sub-parts.
         for part in m.entity_part_subtree(self.id):
             if part.id in m.entities and part._match is m:
-                part.remove()
+                log.extend(part.remove(despawn=despawn))
         self._match = None
         m._rebuild_turn_order()
+        return log
 
     # Teleport (absolute move)
     def tp(self, x: int, y: int, *, fire_hooks: bool = True) -> List[str]:
@@ -11264,6 +11282,39 @@ class Match:
                     return (cx, cy)
         return None
 
+    def free_cell_near(self, x: int, y: int, radius: int,
+                       e: Optional["Entity"] = None) -> Optional[Tuple[int, int]]:
+        """The nearest cell (same ring order as _find_free_cell_near) where a
+        unit could stand: with `e`, its whole footprint anchored there is in
+        bounds, clear of other units (its own body, snake segments and
+        riders don't count) and not movement-blocked for it; without `e`, a
+        single in-bounds unoccupied cell. Returns the anchor or None. The
+        read-only query behind the free_cell_near formula function."""
+        ignore: Tuple[str, ...] = ()
+        if e is not None:
+            ignore = self._occupancy_ignore(
+                e, tuple(r.id for r in self.vehicle_riders(e.id)))
+        for r in range(0, max(0, radius) + 1):
+            ring = [(x + dx, y + dy)
+                    for dy in range(-r, r + 1) for dx in range(-r, r + 1)
+                    if max(abs(dx), abs(dy)) == r]
+            for cx, cy in ring:
+                if e is None:
+                    if self.in_bounds(cx, cy) and not self.is_occupied(cx, cy):
+                        return (cx, cy)
+                    continue
+                if not self.footprint_in_bounds(e, cx, cy):
+                    continue
+                cells = self.entity_cells(e, cx, cy)
+                if not e.is_cell_stackable and any(
+                        self.cell_occupant(fx, fy, ignore) is not None
+                        for fx, fy in cells):
+                    continue
+                if any(self.cell_blocks(e.id, fx, fy) for fx, fy in cells):
+                    continue
+                return (cx, cy)
+        return None
+
     # ---- death / corpse machinery ----------------------------------------
     # A "corpse" is an entry under `tile[(x,y)].corpses.<eid>` carrying
     # the dead entity's full Entity.to_dict (so revive can spawn it back
@@ -11379,7 +11430,7 @@ class Match:
                 self._store_corpse(e)   # also snapshots the parts
             # Remove from match (entity.remove handles turn-order
             # bookkeeping + group scrubbing) regardless of result.
-            e.remove()
+            e.remove(despawn=False)
             # Cascade: the creature is gone, so its body parts go with it
             # (no orphaned, suddenly-visible limbs). The WHOLE subtree —
             # parts, their parts, ... — is removed, not just direct parts,
@@ -11389,7 +11440,7 @@ class Match:
             # limb destruction, not whole-creature death.
             for part in self.entity_part_subtree(entity_id):
                 if part.id in self.entities:
-                    part.remove()
+                    part.remove(despawn=False)
             self.log_event("death", entity=entity_id, name=dead_name,
                            x=dead_x, y=dead_y)
         finally:
@@ -11563,11 +11614,11 @@ class Match:
             # whole-creature death cascade removed the parts and is_segment is
             # now false, so this is a no-op.
             if p.is_segment:
-                log += self._sever_segment(p)
+                log += self._sever_segment(p, died=True)
         return log
 
-    def _sever_segment(self, p: "Entity",
-                       mode: Optional[str] = None) -> List[str]:
+    def _sever_segment(self, p: "Entity", mode: Optional[str] = None,
+                       *, died: bool = False) -> List[str]:
         """Apply a destroyed segment's `segment_death_mode` (or `mode`, when
         despawn_entity passes the segment_removal_mode it resolved):
           cascade — destroy `p` and every segment BEHIND it (the back of the
@@ -11577,7 +11628,8 @@ class Match:
                     it, and stamp segment_split_head_template.
         `none` / `solid` do nothing extra (the segment just lingers as a dead
         limb). Resolution: the segment's `__segment_death_mode` var > the
-        head's > the rule."""
+        head's > the rule. `died` = `p` was destroyed (its on_death already
+        fired), so only the segments severed behind it count as despawned."""
         head_id = p.part_of
         head = self.entities.get(head_id)
         if head is None:
@@ -11596,7 +11648,8 @@ class Match:
             for s in [p] + behind:
                 self.log_event("segment_severed", entity=s.id,
                                mode="cascade", part_of=head_id)
-                s.remove()
+                if s.id in self.entities and s._match is self:
+                    log.extend(s.remove(despawn=not (died and s is p)))
             log.append(
                 f"`{head_id}` severed at `{p.id}`: "
                 f"{len(behind) + 1} segment(s) destroyed.")
@@ -11611,7 +11664,8 @@ class Match:
                     f"independent head trailing {len(behind) - 1} segment(s).")
             self.log_event("segment_severed", entity=p.id,
                            mode="split", part_of=head_id)
-            p.remove()
+            if p.id in self.entities and p._match is self:
+                log.extend(p.remove(despawn=not died))
             self._rebuild_turn_order()
         return log
 
@@ -11629,22 +11683,20 @@ class Match:
         (segment var > head var > rule): `close` splices the chain (what
         remove() does), `cascade`/`split` sever it like a death would, and
         `death` uses the segment's segment_death_mode (`none`/`solid` →
-        close). Returns log lines describing a sever."""
+        close). Returns log lines: a sever, plus any on_entity_despawned output."""
         head = self.entities.get(e.part_of) if e.part_of else None
         if head is None or not e.vars.get("__segment"):
-            e.remove()
-            return []
+            return e.remove()
         mode = str(e.vars.get("__segment_removal_mode")
                    or head.vars.get("__segment_removal_mode")
                    or self.rules.get("segment_removal_mode", "close"))
         if mode == "death":
             mode = self._segment_death_mode_of(e, head)
         if mode not in ("cascade", "split"):
-            e.remove()
-            return []
+            return e.remove()
         log = self._sever_segment(e, mode=mode)
         if e.id in self.entities and e._match is self:
-            e.remove()   # not in the head's chain: plain removal
+            log.extend(e.remove())   # not in the head's chain: plain removal
         return log
 
     def _promote_segment_to_head(self, seg: "Entity", old_head: "Entity") -> None:
@@ -12234,10 +12286,17 @@ class Match:
         old_team = e.vars.get(team_var)
         old_init = e.vars.get(turnorder_var)
         # Despawn current attached parts (children first). This is a despawn,
-        # not a death — no corpse, no on_death.
+        # not a death — no corpse, no on_death; each part's
+        # on_entity_despawned fires.
+        drop_log: List[str] = []
         for p in reversed(self.entity_part_subtree(e.id)):
             if p.id in self.entities:
-                p.remove()
+                drop_log.extend(p.remove())
+        if e._match is not self or e.id not in self.entities:
+            # A despawn handler removed the unit itself: nothing to swap.
+            return drop_log + [
+                f"`{e.id}` was removed while its old parts despawned; "
+                f"the transform stopped."]
         # Swap the presented fields. Death checks are suppressed across the
         # swap window: an intermediate var state (e.g. new max_hp before hp is
         # set) could momentarily satisfy the death condition.
@@ -12276,7 +12335,7 @@ class Match:
             if k in e.vars:
                 new_vars[k] = copy.deepcopy(e.vars[k])
         self._death_check_suppressed_ids.add(e.id)
-        log: List[str] = []
+        log: List[str] = list(drop_log)
         try:
             e.vars = new_vars
             e.name = sb.get("name", e.name)
@@ -14355,6 +14414,60 @@ class Match:
             "borders": self._scene_borders(),
         }
 
+    # ---- facing writes ----
+    # The one place that turns a unit (outside movement, which faces each
+    # step as it walks): `!ent face` and the set_facing / face_toward formula
+    # functions go through set_entity_facing, so the allow_diagonal_facing
+    # gate and the rider re-seat can't drift apart.
+    _FACING_CW = {"cw", "clockwise", "right_turn", "turn_right"}
+    _FACING_CCW = {"ccw", "counterclockwise", "anticlockwise",
+                   "left_turn", "turn_left"}
+
+    def set_entity_facing(self, e: "Entity", raw: Any) -> Direction:
+        """Turn `e` to the direction `raw` names (any normalize_direction
+        alias) or rotate it one step with cw/ccw. Raises VTTError on an
+        unknown direction, or a diagonal while allow_diagonal_facing is off.
+        Riders in a facing-relative slot region are re-seated, since the
+        region turns with the vehicle. Returns the new facing."""
+        tok = str(raw).strip().lower() if isinstance(raw, str) else ""
+        eight_way = bool(self.rules.get("allow_diagonal_facing", False))
+        if tok in self._FACING_CW or tok in self._FACING_CCW:
+            canon = rotate_direction(e.facing, clockwise=tok in self._FACING_CW,
+                                     eight_way=eight_way)
+        else:
+            canon = normalize_direction(tok)
+            if canon is None:
+                raise VTTError(
+                    f"Unknown direction '{raw}'. Use up/down/left/right (or "
+                    "up_left/up_right/down_left/down_right when "
+                    "allow_diagonal_facing is enabled), or cw/ccw to rotate.")
+            if canon in DIAGONAL_DIRECTIONS and not eight_way:
+                raise VTTError(
+                    f"Diagonal facing '{raw}' is not allowed by the active "
+                    "game system. Enable rule 'allow_diagonal_facing' to "
+                    "permit it.")
+        e.facing = canon
+        self._restamp_riders_for(e.id)
+        return canon
+
+    def facing_toward(self, e: "Entity", tx: float, ty: float) -> Optional[Direction]:
+        """The direction from the centre of `e`'s body to the point (tx, ty):
+        the nearest of the 8 directions to the true bearing, or the dominant
+        axis (ties go vertical, like direction_to) when allow_diagonal_facing
+        is off. None when the point is the body's own centre."""
+        w, h = self.entity_footprint(e)
+        dx = tx - (e.x + (w - 1) / 2)
+        dy = ty - (e.y + (h - 1) / 2)
+        if dx == 0 and dy == 0:
+            return None
+        if not bool(self.rules.get("allow_diagonal_facing", False)):
+            if abs(dx) > abs(dy):
+                return "right" if dx > 0 else "left"
+            return "down" if dy > 0 else "up"
+        # Screen bearing: 0 = up, clockwise. Sector k covers k*45 ± 22.5.
+        bearing = math.degrees(math.atan2(dx, -dy)) % 360
+        return DIRECTION_CW_ORDER_8[int((bearing + 22.5) // 45) % 8]
+
     def _spawn_facing(self, x: int, y: int) -> Direction:
         eight_way = bool(self.rules.get("allow_diagonal_facing", False))
         if self.rules.get("spawn_face_toward_center", True):
@@ -14877,7 +14990,7 @@ class MatchManager:
         if move:
             for oid in reversed(order):  # children first
                 if oid in src.entities:
-                    src.entities[oid].remove()
+                    log.extend(src.entities[oid].remove())
         return idmap[eid], log
 
     def refresh_match_rules(self, system_name: str) -> int:
