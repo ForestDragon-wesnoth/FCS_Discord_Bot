@@ -1334,7 +1334,13 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "new":# and len(args) >= 5:
         if await return_help_if_not_enough_args(ctx, args, 5, "match", "new"):
             return
-        match_id, name, w, h = args[1], args[2], int(args[3]), int(args[4])
+        match_id, name = args[1], args[2]
+        try:
+            w, h = int(args[3]), int(args[4])
+        except ValueError:
+            return await ctx.send(
+                f"❌ Width and height must be whole numbers, got `{args[3]}` "
+                f"and `{args[4]}`.")
         system_name = None
         # parse optional --system <name>
         i = 5
@@ -1536,6 +1542,21 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         require_target_host(ctx, target, "delete it", owner=True)
         mgr.delete_match(args[1])
         return await ctx.send(f"Deleted `{args[1]}`.")
+    if sub == "clone":
+        # !match clone <new_id> [name ...] — duplicate THIS channel's match
+        # (host-gated by the normal gate, which checks the channel's match).
+        # The channel keeps showing the original.
+        if await return_help_if_not_enough_args(ctx, args, 2, "match", "clone"):
+            return
+        src = active_match(mgr, ctx)
+        new_name = " ".join(args[2:]) or None
+        c = mgr.clone_match(src.id, args[1], new_name,
+                            owner=ctx_user(ctx) or src.owner)
+        return await ctx.send(
+            f"Cloned **{src.name}** (`{src.id}`) as **{c.name}** (`{c.id}`): "
+            f"{len(c.entities)} entit{'y' if len(c.entities) == 1 else 'ies'}, "
+            f"round {c.round_number}. This channel still shows `{src.id}`; "
+            f"`!match use {c.id}` switches to the copy.")
     if sub == "rename":
         if await return_help_if_not_enough_args(ctx, args, 3, "match", "rename"):
             return
@@ -1710,6 +1731,20 @@ registry.annotate_sub(
     "match", "rename",
     usage="!match rename <id> <new_name>",
     desc="Rename a selected match."
+)
+registry.annotate_sub(
+    "match", "clone",
+    usage="!match clone <new_id> [name ...]",
+    desc=("Duplicate this channel's match under a new id — prepare an "
+          "encounter once, run it as many times as you like. The copy gets "
+          "the whole board and game state (entities, map, statuses, rules, "
+          "macros, watchers, the turn, the log) and shares nothing with the "
+          "original. You become its owner (the original's owner, if that's "
+          "someone else, becomes a co-host); co-hosts and per-match access "
+          "overrides are copied; channel bindings, the undo history and "
+          "pending requests start empty. Name defaults to '<name> (copy)'. "
+          "This channel keeps showing the original — `!match use <new_id>` "
+          "switches."),
 )
 registry.annotate_sub(
     "match", "var",
@@ -11226,8 +11261,75 @@ async def _run_action_dispatch(
 
 
 # ---- Automated Help command (shows available commands----------------------------------------------------------
-@registry.command("help", access="all", usage="!help [command [sub]]", desc="Show command usage. Try `!help ent` or `!help ent move`.")
+_HELP_FIND_CAP = 15      # hits listed per section before "...and N more"
+
+
+def _clip(text: str, n: int) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= n else text[:n - 1].rstrip() + "…"
+
+
+def _help_find(ctx: ReplyContext, mgr: MatchManager, words: List[str]) -> str:
+    """`!help find <word> [word ...]`: commands, subcommands and gamerules
+    whose name, usage or description contains EVERY word (case-insensitive).
+    Name hits list first. A gamerule hit shows its current value on this
+    channel's match (else the built-in default)."""
+    terms = [w.lower() for w in words]
+
+    def hit(*fields: str) -> bool:
+        blob = " ".join(f or "" for f in fields).lower()
+        return all(t in blob for t in terms)
+
+    def name_hit(name: str) -> bool:
+        low = name.lower()
+        return any(t in low for t in terms)
+
+    cmds: List[Tuple[bool, str]] = []
+    for root in sorted(registry._handlers):
+        meta = registry._help.get(root, {})
+        usage = meta.get("usage") or f"!{root}"
+        if hit(root, usage, meta.get("desc") or ""):
+            cmds.append((name_hit(root),
+                         f"- `{_clip(usage, 70)}` — {_clip(meta.get('desc'), 110)}"))
+        for sub, sm in sorted((meta.get("subs") or {}).items()):
+            if hit(root, sub, sm.get("usage") or "", sm.get("desc") or ""):
+                cmds.append((name_hit(f"{root} {sub}"),
+                             f"- `{_clip(sm.get('usage') or f'!{root} {sub}', 70)}` — "
+                             f"{_clip(sm.get('desc'), 110)}"))
+    mid = mgr.active_by_channel.get(ctx.channel_key)
+    m = mgr.matches.get(mid) if mid is not None else None
+    rules: List[Tuple[bool, str]] = []
+    for name in sorted(RULES_REGISTRY):
+        spec = RULES_REGISTRY[name]
+        if hit(name, spec.get("desc") or ""):
+            val = (m.rules.get(name, DEFAULT_SYSTEM_SETTINGS.get(name))
+                   if m is not None else DEFAULT_SYSTEM_SETTINGS.get(name))
+            rules.append((name_hit(name),
+                          f"- `{name}` = `{_clip(repr(val), 40)}` — "
+                          f"{_clip(spec.get('desc'), 110)}"))
+    if not cmds and not rules:
+        return (f"🔎 Nothing matches `{' '.join(words)}`. Try fewer or "
+                f"shorter words.")
+    where = f"match `{m.id}`" if m is not None else "the defaults (no match here)"
+    out = [f"🔎 `{' '.join(words)}` — {len(cmds)} command(s), "
+           f"{len(rules)} gamerule(s) (rule values: {where})"]
+    for title, rows in (("Commands", cmds), ("Gamerules", rules)):
+        if not rows:
+            continue
+        rows = sorted(rows, key=lambda r: not r[0])    # name hits first, stable
+        out.append(f"**{title}**")
+        out.extend(r for _, r in rows[:_HELP_FIND_CAP])
+        if len(rows) > _HELP_FIND_CAP:
+            out.append(f"…and {len(rows) - _HELP_FIND_CAP} more — add a word "
+                       f"to narrow the search.")
+    out.append("Full text: `!help <command> [sub]`; all rules: `!system rules`.")
+    return "\n".join(out)
+
+
+@registry.command("help", access="all", usage="!help [command [sub]] | !help find <word> [word ...]", desc="Show command usage. Try `!help ent` or `!help ent move`. `!help find <word> [word ...]` searches every command, subcommand and gamerule (name and description, all words must match) and shows each matching rule's current value on this match. (`!help find` alone is the help for the `!find` command.)")
 async def help_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if len(args) >= 2 and args[0].lower() == "find":
+        return await ctx.send(_help_find(ctx, mgr, args[1:]))
     title, body = registry.help_for(args)
     await ctx.send(f"**{title}**\n{body}")
 

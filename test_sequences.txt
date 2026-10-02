@@ -16093,3 +16093,133 @@ stray word where the metric goes. After the preview_glyph rule is set to
 `+`, the new match marks previewed cells with `+`, and the legend explains
 `+ — preview area`. The match is in image render mode, but the harness has
 no image surface, so the preview falls back to the ASCII map.
+
+
+SCENARIO 609 — !help find: search commands, subcommands and gamerules
+---------------------------------------------------------------------
+
+!help find fog memory
+!system set default viewport_width 24
+!match new hf609 HelpFind 10 6
+!match use hf609
+!help find viewport
+!help find corpse block
+!help find zzzqqq
+!help find
+!as player bob
+!help find grid dimension
+
+Expected: `!help find fog memory` lists the `!match fog` command and the
+fog_los / fog_memory_enabled_by_default / fog_memory_mode rules (every
+word must appear), with rule values from the defaults since no match is
+active here. After the system's viewport_width is set to 24 and a match
+created, `!help find viewport` lists the `!map` command and the four
+viewport rules, with `viewport_width = 24` read from this match. `corpse
+block` finds the corpse_block_condition rule, plus map_resize_shrink_mode
+(whose description mentions both words). A word nothing contains says so.
+`!help find` alone is still the help for the `!find` command. A player can
+search too (it's read-only): `grid dimension` finds the max_grid_dimension
+rule (= 500) and the `!map` command (its description mentions both).
+
+
+SCENARIO 610 — max_grid_dimension caps new grids and resizes
+------------------------------------------------------------
+
+!match new big Big 501 10
+!match new edge Edge 500 3
+!match use edge
+!map resize 500 501
+!map resize 400 3
+!assert "1 == 1" the 500-wide match exists and resized to 400
+!system set default max_grid_dimension -1
+!match new huge Huge 800 2
+!system new tiny
+!system set tiny max_grid_dimension 20
+!match new t1 Tiny 21 5 tiny
+!match new t2 Tiny 20 5 tiny
+!match new bad Bad x 5
+
+Expected: HARNESS-ALLOWS-ERRORS. A 501-wide match is refused (over the
+max_grid_dimension of 500); a 500-wide one is created. Resizing to height
+501 is refused, to 400×3 succeeds. With the rule set to -1 an 800-wide
+match is allowed. A system's own cap applies to matches created under it:
+under `tiny` (cap 20) a 21-wide match is refused and a 20-wide one created.
+A non-numeric width is a clean ❌.
+
+
+SCENARIO 611 — !match clone: an independent copy of the whole board
+--------------------------------------------------------------------
+
+!match new src611 Arena 10 6
+!match use src611
+!ent add ogre Ogre 40 3 2 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent set_var ogre inv.gold 5
+!part add ogre ogre_head Head 10 10
+!ent add hero Hero 30 7 4 10
+!ent status hero add burning
+!tile set 5 5 glyph #
+!zone add pit 6 6
+!macro set hit "ent hp ogre -1"
+!turn next
+!match clone run611 Arena Run 1
+!match clone run611
+!assert "entity[ogre].hp == 40" this channel still shows the original
+!match use run611
+!assert "footprint_width('ogre') == 2 and has_part('ogre', 'ogre_head') and status_has('hero', 'burning')" the copy has the 2x2 ogre, its head and the status
+!assert "tile_has(5, 5, 'glyph') and zone_exists('pit') and current_id() == 'hero'" the map and the turn came along
+!macro run hit
+!ent set_var ogre inv.gold 99
+!ent tp hero 1 1
+!assert "entity[ogre].hp == 39 and entity[ogre].inv.gold == 99 and entity[hero].x == 1"
+!match use src611
+!assert "entity[ogre].hp == 40 and entity[ogre].inv.gold == 5 and entity[hero].x == 7" the original is untouched
+
+Expected: HARNESS-ALLOWS-ERRORS. `!match clone run611 Arena Run 1` copies the
+channel's match as **Arena Run 1**; a second clone to the same id is
+refused. The channel keeps showing the original (its ogre is at 40). The
+copy has everything: the 2×2 ogre with its head part and inventory, the
+hero's burning status, the tile, the zone, the macro and the current turn
+(hero's). Changes in the copy — the macro's hit, a nested var, a move —
+leave the original untouched. Every assert passes.
+
+
+SCENARIO 612 — !match clone: owner, co-hosts, channels, history
+---------------------------------------------------------------
+
+!match new src612 Arena 8 5
+!match use src612
+!ent add hero Hero 30 2 2 10
+!host add bob
+!host access set "ent info" host
+!match bind pov=red
+!ent hp hero -3
+!as player carol
+!match clone c1
+!as host
+!pending
+!deny r1
+!as player bob
+!match clone c2 Bobs Copy
+!as host
+!match use c2
+!host list
+!as player bob
+!host list
+!host access list
+!as host
+!match channels
+!history list commands
+!assert "entity[hero].hp == 27"
+
+Expected: A player who isn't a host can't clone right away: carol's clone
+is queued for approval, `!pending` lists it, and the host denies it. Bob, a
+co-host, clones the match as **Bobs Copy** (`c2`): bob owns the copy and
+the original's owner `cli` becomes its co-host, so both still host it —
+`!host list` is owner-only, so `cli` is refused and bob sees `owner: bob,
+co-hosts: cli`. The per-match access override (`ent info` → host) came
+along. The copy's channel list holds only the channel that just ran
+`!match use c2` (the original's red-POV binding didn't come along), the
+undo history is empty (nothing from the original), and the hero's damage
+did come along (27).

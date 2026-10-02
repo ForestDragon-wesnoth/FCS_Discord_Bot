@@ -2058,6 +2058,17 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # limited width, like Discord): when EITHER grid dimension exceeds its
     # cap, only a window of that size renders and the channel pans it around.
     # A grid that fits both caps renders whole (no viewport).
+    "max_grid_dimension": {
+        "default": 500,
+        "schema": {"type": "int"},
+        "desc": (
+            "Largest width or height a grid may have, checked by `!match "
+            "new` (against the new match's system) and `!map resize`. A "
+            "full map render costs width x height cells (1500x1500 is ~0.45 "
+            "s and 4 MB of text on the CLI / gui.py), so a typo'd size "
+            "would stall the bot. -1 = unlimited."
+        ),
+    },
     "viewport_width": {
         "default": 30,
         "schema": {"type": "int"},
@@ -2805,6 +2816,22 @@ RESERVED_IDS: Set[str] = {"current", "this", "self", "parent"}
 # refuses), so a read can never be ambiguous. Formula writes are refused too;
 # `name` changes via `!ent rename`, x/y via `!ent tp`.
 RESERVED_VAR_PATHS: Tuple[str, ...] = ("x", "y", "name")
+
+
+def check_grid_dimensions(width: Any, height: Any, rules: Dict[str, Any],
+                          where: str) -> None:
+    """Refuse a grid side over the max_grid_dimension rule (-1 = no cap)."""
+    try:
+        cap = int(rules.get("max_grid_dimension", 500))
+    except (TypeError, ValueError):
+        cap = 500
+    if cap < 0:
+        return
+    for label, v in (("width", width), ("height", height)):
+        if isinstance(v, int) and not isinstance(v, bool) and v > cap:
+            raise VTTError(
+                f"{where}: {label} {v} is over the max_grid_dimension of {cap} "
+                f"(the max_grid_dimension rule; -1 = unlimited).")
 
 
 def reserved_var_path_error(path: str, where: str) -> Optional[str]:
@@ -5720,6 +5747,7 @@ class Match:
             raise VTTError("resize: width and height must be integers.")
         if new_w < 1 or new_h < 1:
             raise VTTError("resize: width and height must be at least 1.")
+        check_grid_dimensions(new_w, new_h, self.rules, "resize")
         key = str(anchor).strip().lower()
         if key not in _RESIZE_ANCHORS:
             raise VTTError(
@@ -14715,6 +14743,7 @@ class MatchManager:
             self.effective_system(channel_key or "CLI")
         )
         rules = self._build_rules_dict(sysobj)
+        check_grid_dimensions(width, height, rules, "New match")
         m = Match(id=match_id, name=name, grid_width=width, grid_height=height,
                   system_name=sysobj.name, rules=rules)
         # The creator becomes the match owner (full privileges + sole host
@@ -14864,6 +14893,39 @@ class MatchManager:
                 m.rules = self._build_rules_dict(sysobj)
                 count += 1
         return count
+
+    def clone_match(self, src_id: str, new_id: str, new_name: Optional[str] = None,
+                    owner: Optional[str] = None) -> "Match":
+        """Duplicate a match under a new id: the whole board and its game
+        state (entities, map, statuses, rules, macros, watchers, the turn,
+        the event log, ...) via a to_dict / from_dict round trip, so the copy
+        shares nothing with the source. The cloner (`owner`) becomes owner
+        and the source's owner joins the co-hosts, so every host of the
+        source hosts the copy; co-hosts and per-match access overrides are
+        copied. Channel state
+        starts empty — no bound channels, no per-channel camera, no pending
+        requests — and the undo history starts fresh. The source match is
+        untouched and stays active wherever it was."""
+        src = self.get(src_id)
+        if new_id in self.matches:
+            raise DuplicateId(f"Match id '{new_id}' already exists")
+        d = src.to_dict(include_history=False)
+        d["id"] = new_id
+        d["name"] = new_name or f"{src.name} (copy)"
+        m = Match.from_dict(d)
+        if owner is not None and owner != src.owner:
+            # A co-host cloning becomes the copy's owner; the source's owner
+            # stays a host of the copy (as a co-host), so everyone who hosted
+            # the original still hosts the clone.
+            m.owner = owner
+            if src.owner is not None and src.owner not in m.cohosts:
+                m.cohosts.append(src.owner)
+        m.cohosts = [c for c in m.cohosts if c != m.owner]
+        m.bound_channels = {}
+        m.channel_views = {}
+        m.pending_requests = {}
+        self.matches[m.id] = m
+        return m
 
     def delete_match(self, match_id: str):
         if match_id not in self.matches:

@@ -2660,7 +2660,8 @@ More shipped work (continuing the list above):
     default generous enough to be safe could still reject a legitimate large
     campaign map — that default is a design call. The codebase's own precedent
     (`macro_repeat_limit`'s "guards against a typo'd huge count") argues FOR
-    adding one; say so and it's a small rule.
+    adding one; say so and it's a small rule. RESOLVED — the `max_grid_dimension` rule (default 500)
+    shipped; see the `!help find` / clone entry.
   - PROCESS NOTE for future harness authors: THREE apparent "failures" this pass
     were my own harness bugs, not engine defects — `!passive add` takes
     `target=`/`scope=` BEFORE the quoted formula (formula LAST; wrong order makes
@@ -3849,6 +3850,39 @@ More shipped work (continuing the list above):
     passes `highlights` to `post_scene_image`; gui.py's `GuiCtx.show_preview`
     keeps them on the canvas until the next command; text surfaces get the
     ASCII map.
+
+- **`!help find`, `max_grid_dimension`, `!match clone` — SHIPPED
+  (scenarios 609-612).** Three user-approved ideas.
+  - **`!help find <word> [word ...]` (609).** One search over every command,
+    subcommand (`registry._help`) and gamerule (RULES_REGISTRY): a hit needs
+    EVERY word in its name / usage / description (case-insensitive), name
+    hits list first, 15 per section (`_HELP_FIND_CAP`) then "…and N more".
+    A rule hit shows its current value on the channel's match (else the
+    built-in default). Player-available (`!help` is `all`; rule values are
+    already public via `!system info`). `!help find` with NO word is still
+    the help for the `!find` command. Only annotated subcommands are
+    searchable — `!map`'s subcommands live in its one description, so they
+    match as `!map`.
+  - **`max_grid_dimension` rule (610; resolves the pass-27 observation).**
+    Default 500, -1 = unlimited; `logic.check_grid_dimensions` refuses a
+    side over it in `MatchManager.create_match` (against the NEW match's
+    system rules) and `Match.resize_grid`. Clones and loaded saves aren't
+    re-checked. Same pass: `!match new` with a non-numeric width/height was
+    a 💥 (bare `int()`), now a clean ❌.
+  - **`!match clone <new_id> [name ...]` (611-612).** `MatchManager.
+    clone_match` = a `to_dict(include_history=False)` / `from_dict` round
+    trip under the new id (default name "<name> (copy)"), so the copy
+    shares nothing with the source — verified: every serialized field but
+    id / name / bound_channels is identical, on a board with a 2×2 vehicle
+    + rider, an anchored aura, a segment, statuses, a watcher, team data,
+    fog + reveals and an advanced turn. User calls: the channel STAYS on the
+    original (the reply names `!match use <new_id>`); the cloner becomes
+    owner, co-hosts and per-match access overrides are copied, and channel
+    bindings / per-channel camera / pending requests / undo history start
+    empty. My call on top (not asked): when a co-host clones, the source's
+    owner joins the copy's co-hosts, so every host of the original still
+    hosts the clone. Host-gated by the normal gate (it checks the channel's
+    match, which is the source).
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
