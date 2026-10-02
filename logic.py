@@ -454,6 +454,28 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "override: the head's (or a segment's) `__segment_death_mode` var."
         ),
     },
+    "segment_removal_mode": {
+        "default": "close",
+        "schema": {"type": "enum",
+                   "choices": ["close", "cascade", "split", "death"]},
+        "desc": (
+            "What happens to the rest of a snake when one of its body "
+            "SEGMENTS is despawned (`!ent remove`, `!part remove`, "
+            "remove_entity) — a GM removal, not a death. `close` (default): "
+            "the chain closes around the gap; the segment behind it follows "
+            "the one ahead of it, so the body stays one linked chain. "
+            "`cascade`: every segment BEHIND the removed one is removed too. "
+            "`split`: the segment behind the removed one is PROMOTED to a new "
+            "independent head (stamped with segment_split_head_template) and "
+            "keeps the rest of the tail. `death`: treat the removal like the "
+            "segment being destroyed, i.e. use its segment_death_mode "
+            "(`cascade`/`split` as above; `none`/`solid` close the chain). "
+            "Removing the HEAD removes the whole body regardless, and a "
+            "detached segment (`!part detach`) always closes the chain. "
+            "Per-snake override: the segment's (or the head's) "
+            "`__segment_removal_mode` var."
+        ),
+    },
     "segment_split_head_template": {
         "default": {},
         "schema": {"type": "dict"},
@@ -1257,8 +1279,9 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "default": 20,
         "schema": {"type": "int"},
         "desc": (
-            "Max depth of nested `!macro run` calls (a macro line that runs "
-            "another macro). Guards against self/mutually-recursive macros "
+            "Max depth of nested `!macro run` / `!run` calls (a macro line or "
+            "script line that runs another macro or script, counted as one "
+            "stack). Guards against self/mutually-recursive macros and scripts "
             "exhausting the Python stack — the step limit can't, since each "
             "`!macro run` starts with a fresh step budget. The run aborts with "
             "an error when exceeded."
@@ -1380,6 +1403,34 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "ample for any realistic spell area; hitting it likely means "
             "an O(n²) pattern on a large board. Each iteration of any "
             "for-loop counts toward the total."
+        ),
+    },
+    "formula_cell_limit": {
+        "default": 100000,
+        "schema": {"type": "int"},
+        "desc": (
+            "Maximum number of cells one geometry query in a formula may "
+            "generate or walk: cells_in_burst / _rect / _cone / _line, "
+            "entities_in_rect / _cone, and every sight line (has_los, "
+            "raycast, first_opaque, entities_on_los, "
+            "entities_in_line_ignorelos / _until, can_see*). Their cost "
+            "follows the ARGUMENTS, not the board, so without a cap "
+            "`cells_in_rect(0, 0, 100000, 100000)` — reachable by any "
+            "player through an inline `$()` arg — would hang the bot for "
+            "every server. Default 100000 (a 316x316 area, or a sight line "
+            "that long) is far beyond any real map."
+        ),
+    },
+    "formula_size_limit": {
+        "default": 100000,
+        "schema": {"type": "int"},
+        "desc": (
+            "Maximum length of a string or list a formula may build with "
+            "`*` or `+` (e.g. 'ab' * n, [0] * n, s + s). Guards against "
+            "`'a' * 10**10` (a multi-gigabyte allocation from one inline "
+            "`$()` arg). Integers are separately capped at the size Python "
+            "can still print and save (its int-to-string digit limit), so "
+            "`9**9**9` is refused instead of computed for hours."
         ),
     },
     "summon_event_limit": {
@@ -1566,6 +1617,41 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     #     — a flat stealth flag, same for every team.
     # A malformed formula is treated as VISIBLE, so a GM typo reveals
     # rather than blanking the whole board.
+    "pov_filters_queries": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether player-facing entity QUERIES respect the channel's team "
+            "POV the way `!map` / `!list` do. On (default): under a team POV "
+            "an entity that POV can't see (fog, entity_visibility_condition, "
+            "a hidden rider) reads as 'not found' in `!ent info`, `!dist`, "
+            "`!part list`, `!mount list/info`, `!action list/info`, "
+            "`!passive list/info`, `!clamp list` and `!mod show`, and is left "
+            "out of `!find`, entity-wide listings, `!schedule list` and a "
+            "non-host's `!foreach` selector; `!ent info` shows a disguised "
+            "unit's decoy card; bare `!turn` leaves hidden units out of the "
+            "order and `!map center` won't frame one; and `!history diff`, "
+            "`!history list <kind>` and `!log` are host-only while fog or a "
+            "visibility condition is active (they report every unit's "
+            "changes). Your own team's units are never hidden from you. Off "
+            "= queries stay omniscient (lock them down per match with `!host "
+            "access` instead). Omniscient channels are unaffected either way."
+        ),
+    },
+    "team_data_visibility": {
+        "default": "own",
+        "schema": {"type": "enum", "choices": ["own", "all", "host"]},
+        "desc": (
+            "Who may read team data (`!team list` / `!team get`: resources, "
+            "team modifiers). `own` (default): a player in a channel with a "
+            "team POV reads only that team's data; `!team list` names only "
+            "that team. `all`: every player reads every team's data. `host`: "
+            "only hosts read team data. Hosts, and players in an omniscient "
+            "channel under `own`, always read everything. Formulas "
+            "(team_get) are unaffected; lock inline `$()` args with "
+            "inline_args_access."
+        ),
+    },
     "entity_visibility_condition": {
         "default": "",
         "schema": {"type": "str"},
@@ -1708,6 +1794,36 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "'manhattan' (|dx|+|dy|<=N, a diamond); 'euclidean' "
             "(dx^2+dy^2<=N^2, a disc). Same family as the distance() "
             "formula modes."
+        ),
+    },
+    "preview_glyph": {
+        "default": "*",
+        "schema": {"type": "str"},
+        "desc": (
+            "`!map preview` (ASCII): the character marking the cells an "
+            "area shape would cover. Cells showing a unit keep the unit's "
+            "glyph (the reply lists the units inside); every other cell in "
+            "the area shows this mark over its terrain, zone or fog glyph. "
+            "Only the first character is used."
+        ),
+    },
+    "preview_color": {
+        "default": "255,64,64",
+        "schema": {"type": "str"},
+        "desc": (
+            "`!map preview` (graphics — Discord image mode, gui.py): the "
+            "colour of the translucent square drawn over each covered cell, "
+            "ABOVE units, as `r,g,b` (0-255 each) or `#rrggbb`. A "
+            "`color=` arg on the command overrides it for one preview."
+        ),
+    },
+    "preview_opacity": {
+        "default": 40,
+        "schema": {"type": "int"},
+        "desc": (
+            "`!map preview` (graphics): opacity 0-100 of the covered-cell "
+            "squares. An `opacity=` arg on the command overrides it for one "
+            "preview."
         ),
     },
     "fog_glyph": {
@@ -1942,6 +2058,17 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # limited width, like Discord): when EITHER grid dimension exceeds its
     # cap, only a window of that size renders and the channel pans it around.
     # A grid that fits both caps renders whole (no viewport).
+    "max_grid_dimension": {
+        "default": 500,
+        "schema": {"type": "int"},
+        "desc": (
+            "Largest width or height a grid may have, checked by `!match "
+            "new` (against the new match's system) and `!map resize`. A "
+            "full map render costs width x height cells (1500x1500 is ~0.45 "
+            "s and 4 MB of text on the CLI / gui.py), so a typo'd size "
+            "would stall the bot. -1 = unlimited."
+        ),
+    },
     "viewport_width": {
         "default": 30,
         "schema": {"type": "int"},
@@ -2277,7 +2404,23 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "are taken before each MUTATING command runs and skipped when "
             "the command turns out to be a no-op (e.g. !ent info, !map). "
             "This gives users fine-grained undo at the cost of more "
-            "snapshots than the round/turn levels."
+            "snapshots than the round/turn levels. See also "
+            "autosave_command_retention_max, which caps the COUNT."
+        ),
+    },
+    "autosave_command_retention_max": {
+        "default": 100,
+        "schema": {"type": "int"},
+        "desc": (
+            "Hard cap on how many pre-command autosaves are kept, on top of "
+            "the autosave_command_retention_turns window (the oldest beyond "
+            "the cap are dropped). -1 = no cap. The turn window alone only "
+            "prunes when a turn ADVANCES, so a long setup session before "
+            "the first `!turn next` (map building, spawning) otherwise kept a "
+            "full match snapshot for EVERY command: 600 tile edits held 640 "
+            "snapshots / 16 MB and grew with the board. Each snapshot is a "
+            "complete copy of the match, so this is the memory ceiling for "
+            "command undo."
         ),
     },
     "undo_confirmation_turn_threshold": {
@@ -2309,6 +2452,27 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Undoing this many or more commands requires `confirm`. Default "
             "-1 = never prompt (commands are small-grain, low-risk). Set a "
             "positive value to require confirmation past that count."
+        ),
+    },
+    "undo_channel_bindings_mode": {
+        "default": "keep",
+        "schema": {"type": "enum", "choices": ["keep", "revert", "confirm"]},
+        "desc": (
+            "What an undo / `!history restore` does with the match's channel "
+            "bindings (`!match bind`, incl. each channel's `pov=`). A "
+            "snapshot carries the bindings as they were when it was taken, "
+            "but the channels themselves stay attached to the match, so "
+            "undoing past a bind would leave that channel ACTIVE but "
+            "UNBOUND — i.e. omniscient, showing a fogged board in full. "
+            "'keep' (default) = bindings are live setup, not game state: "
+            "the current bindings survive every undo. 'revert' = restore "
+            "the snapshot's bindings, and DETACH any channel that was "
+            "bound now but not in the snapshot (it stops pointing at the "
+            "match — no leak). 'confirm' = when the snapshot's bindings "
+            "differ from the current ones, refuse and list the "
+            "differences; re-run with `bindings=keep` or `bindings=revert`. "
+            "Any undo/restore accepts a `bindings=keep|revert` token that "
+            "overrides this rule for that one call."
         ),
     },
     "default_clamps": {
@@ -2645,6 +2809,42 @@ def _default_facing_for(
 
 
 RESERVED_IDS: Set[str] = {"current", "this", "self", "parent"}
+
+# Reserved var PATHS: entity FIELDS that formulas read as if they were vars
+# (`entity[x].name`, `entity[x].x`), resolved from the Entity itself. Their
+# names are reserved: no entity var may be created under them (write_var
+# refuses), so a read can never be ambiguous. Formula writes are refused too;
+# `name` changes via `!ent rename`, x/y via `!ent tp`.
+RESERVED_VAR_PATHS: Tuple[str, ...] = ("x", "y", "name")
+
+
+def check_grid_dimensions(width: Any, height: Any, rules: Dict[str, Any],
+                          where: str) -> None:
+    """Refuse a grid side over the max_grid_dimension rule (-1 = no cap)."""
+    try:
+        cap = int(rules.get("max_grid_dimension", 500))
+    except (TypeError, ValueError):
+        cap = 500
+    if cap < 0:
+        return
+    for label, v in (("width", width), ("height", height)):
+        if isinstance(v, int) and not isinstance(v, bool) and v > cap:
+            raise VTTError(
+                f"{where}: {label} {v} is over the max_grid_dimension of {cap} "
+                f"(the max_grid_dimension rule; -1 = unlimited).")
+
+
+def reserved_var_path_error(path: str, where: str) -> Optional[str]:
+    """The refusal message for a write at `path` whose first segment is a
+    reserved var path, or None when the path is an ordinary var."""
+    seg0 = path.split(".", 1)[0]
+    if seg0 not in RESERVED_VAR_PATHS:
+        return None
+    fix = ("`!ent rename <id> <name>`" if seg0 == "name"
+           else "`!ent tp <id> <x> <y>`")
+    return (f"{where}: `{seg0}` is a reserved var path (the entity's own "
+            f"{'display name' if seg0 == 'name' else 'position'}); it can't "
+            f"be written or nested under. Use {fix}.")
 
 # Recognized modifier fold ops (see Match._apply_modifier_op). An op outside
 # this set still folds as a lenient add, but `!mod show` flags it as a likely
@@ -3531,6 +3731,17 @@ def _run_passive_safely(engine, p: "Passive", ctx, *, target_id: str, is_global:
     # Lazy import to avoid logic <-> formula import cycle.
     from formula import FormulaError
     label = f"global passive `{p.id}`" if is_global else f"passive `{target_id}.{p.id}`"
+    if is_global:
+        # The fire sites pass is_global for everything _firing_passives
+        # yields, which includes TEAM passives — so a team passive used to be
+        # logged as "global passive `regen`", sending a GM to `!gpassive
+        # list` where it isn't. Name the table it actually lives in.
+        m = getattr(engine, "_match", None)
+        if m is not None and m.global_passives.get(p.id) is not p:
+            for team, tps in (getattr(m, "team_passives", None) or {}).items():
+                if tps.get(p.id) is p:
+                    label = f"team passive `{team}.{p.id}`"
+                    break
     try:
         result = engine.eval_program(p.formula, ctx)
         if result is None:
@@ -4262,13 +4473,27 @@ class Entity:
         # route here) per the mount_on_host_death rule — done while `self` is
         # still in the match so the eject search can use its footprint.
         m._release_riders(self.id)
+        # A removed snake segment closes the chain behind it, or the next
+        # segment would keep following an id that no longer exists.
+        m._splice_out_segment(self)
         if self.id in m.entities:
             del m.entities[self.id]
         # scrub from turn order & clamp active index
         if self.id in m.turn_order:
             idx = m.turn_order.index(self.id)
             m.turn_order.remove(self.id)
-            if m.active_index >= len(m.turn_order):
+            if m.round_started and idx == m.active_index:
+                # The unit whose turn it is is gone. The next unit in the
+                # order now sits at active_index — or, if it was last, the
+                # next turn opens a new round from the top. next_turn reads
+                # this so it neither fires the gone actor's turn-end on
+                # someone else nor advances past the next unit.
+                if idx < len(m.turn_order):
+                    m.turn_vacated = "same"
+                else:
+                    m.turn_vacated = "wrap"
+                    m.active_index = 0
+            elif m.active_index >= len(m.turn_order):
                 m.active_index = max(0, len(m.turn_order) - 1)
             elif m.active_index > idx:
                 m.active_index = max(0, m.active_index - 1)
@@ -4281,6 +4506,14 @@ class Entity:
         # both route through here): delete or freeze per the
         # anchored_zone_on_anchor_loss rule.
         m._release_anchored_zones(self.id)
+        # The body's parts go with it — death and transform already remove
+        # the whole subtree; a plain despawn (`!ent remove`, `!part remove`)
+        # used to leave each part with part_of naming a gone id, which would
+        # latch onto whatever entity later took that id. Parents first; each
+        # part's own remove() handles its riders, auras and sub-parts.
+        for part in m.entity_part_subtree(self.id):
+            if part.id in m.entities and part._match is m:
+                part.remove()
         self._match = None
         m._rebuild_turn_order()
 
@@ -4441,6 +4674,12 @@ class Entity:
         log: List[str] = []
         origin_x, origin_y = self.x, self.y
         for nx, ny, step_facing in step_path:
+            # A hook on an earlier step (a lethal tile/zone, a passive) may
+            # have removed the mover: stop. Walking on would move a detached
+            # unit and fire the remaining cells' hooks for it — a corpse
+            # tripping traps down the rest of the path.
+            if self._match is not m or self.id not in m.entities:
+                return log
             step_from_x, step_from_y = self.x, self.y
             old_cells = m.entity_cells(self, step_from_x, step_from_y)
             new_cells = m.entity_cells(self, nx, ny)
@@ -4467,6 +4706,8 @@ class Entity:
                 log.extend(m.fire_entity_step(
                     self.id, step_from_x, step_from_y, nx, ny,
                 ))
+        if self._match is not m or self.id not in m.entities:
+            return log  # removed by the last step's hooks — no stop/moved hooks
         if fire_hooks and step_path:
             # on_stop fires once per final footprint cell, even if no actual
             # movement happened (zero-step move_dirs) — empty step_path
@@ -4586,6 +4827,10 @@ class Entity:
         """
         if not path:
             raise VTTError("Variable path cannot be empty.")
+        if self._match is not None:
+            msg = reserved_var_path_error(path, f"Writing '{path}' on `{self.id}`")
+            if msg:
+                raise VTTError(msg)
 
         # VITAL-var write protection (symmetric with remove_var's delete
         # guard): hp / max_hp / initiative must stay numeric SCALARS — the
@@ -4992,6 +5237,10 @@ class Entity:
 # -------------------------
 # Match
 # -------------------------
+# Engine-managed snake linkage + trail vars (identity-bound: a unit's place in
+# a chain and the head's own trail). Preserved across transform/revert.
+_SEGMENT_LINK_VARS = ("__segment", "__follows", "__seg_path", "__seg_last")
+
 @dataclass
 class Match:
     id: str
@@ -5026,6 +5275,13 @@ class Match:
     # make that first call begin the round (fire start-hooks for active_index)
     # rather than advance past entity 0.
     round_started: bool = False
+    # Set when the unit whose turn it is gets removed mid-turn (death,
+    # despawn): "same" = the next unit in this round now sits at
+    # active_index; "wrap" = the removed unit was last, so the next turn opens
+    # a new round. next_turn then skips the gone actor's turn-end and starts
+    # the next unit's turn without advancing past it. None otherwise.
+    # Serialized, so an undo or reload keeps it.
+    turn_vacated: Optional[str] = None
     # Game system binding - currently NOT YET DIRECTLY CONNECTED TO A GAMESYSTEM CLASS, JUST COPYING THE DICTIONARY OF RULES FROM IT.
     rules: Dict[str, Any] = field(default_factory=dict)  # denormalized copy for fast access
 
@@ -5357,8 +5613,8 @@ class Match:
     # nothing was deferred). Cleared at every successful rebuild.
     _turn_order_dirty: bool = field(default=False, repr=False)
 
-    # Runtime-only seeded RNG for formulas, lazily built by the formula
-    # engine when the random_seed rule is non-empty. Not serialized: the
+    # Runtime-only seeded RNG, built by formula_rng() on first use when the
+    # random_seed rule is non-empty. Not serialized: the
     # seed (a rule) is saved, but the live cursor position is not — a
     # reloaded match reseeds from scratch. _rng_seed tracks which seed
     # _rng was built with so a seed change triggers a rebuild.
@@ -5491,6 +5747,7 @@ class Match:
             raise VTTError("resize: width and height must be integers.")
         if new_w < 1 or new_h < 1:
             raise VTTError("resize: width and height must be at least 1.")
+        check_grid_dimensions(new_w, new_h, self.rules, "resize")
         key = str(anchor).strip().lower()
         if key not in _RESIZE_ANCHORS:
             raise VTTError(
@@ -5513,6 +5770,7 @@ class Match:
                      if not all(in_new(cx + ox, cy + oy)
                                 for cx, cy in self.entity_cells(e)))
         log: List[str] = []
+        killed: List[str] = []
         if cut:
             mode = str(self.rules.get("map_resize_shrink_mode", "block"))
             if mode != "kill":
@@ -5526,9 +5784,20 @@ class Match:
             # kill mode: kill the cut entities before shifting. Their corpses
             # land at the current cell and are dropped below if that cell
             # shifts off-grid (which, being in the cut region, it does).
-            for eid in cut:
-                _, klog = self.kill_entity(eid)
-                log.extend(klog)
+            # Death hooks can SPAWN units (a summon-on-death) after the cut
+            # list was taken; one landing in the cut region would then shift
+            # off the new grid. Repeat until nothing would be cut. Terminates:
+            # every pass kills at least one unit, and summons per command are
+            # capped by summon_event_limit.
+            while cut:
+                for eid in cut:
+                    if eid in self.entities:
+                        _, klog = self.kill_entity(eid)
+                        log.extend(klog)
+                        killed.append(eid)
+                cut = sorted(e.id for e in self.entities.values()
+                             if not all(in_new(cx + ox, cy + oy)
+                                        for cx, cy in self.entity_cells(e)))
 
         # Shift survivors — each is in-bounds by construction (the off-grid
         # ones were just killed or we'd have raised).
@@ -5571,7 +5840,7 @@ class Match:
                     self.channel_views[ck] = [off[0] + ox, off[1] + oy]
 
         self.grid_width, self.grid_height = new_w, new_h
-        return ({"offset": (ox, oy), "anchor": key, "killed": cut,
+        return ({"offset": (ox, oy), "anchor": key, "killed": killed,
                  "dropped_tiles": dropped_tiles,
                  "clipped_zone_cells": clipped_cells}, log)
 
@@ -5993,6 +6262,20 @@ class Match:
                 self._restamp_riders_for(e.id)
 
     # ---------- snake / segmented bodies ----------
+    def _splice_out_segment(self, seg: "Entity") -> None:
+        """Close a snake's chain around `seg` (being removed or detached):
+        whatever followed it now follows what it followed, so the body stays
+        one linked chain. No-op for a non-segment."""
+        if not seg.vars.get("__segment"):
+            return
+        pred = seg.vars.get("__follows")
+        for e in self.entities.values():
+            if e is not seg and e.vars.get("__follows") == seg.id:
+                if pred:
+                    e.vars["__follows"] = pred
+                else:
+                    e.vars.pop("__follows", None)
+
     def snake_segments(self, head_id: str) -> List["Entity"]:
         """The ordered body chain of a snake (head -> tail). Built by walking
         each segment's `__follows` back-pointer from the head; assumes a
@@ -6205,6 +6488,11 @@ class Match:
             raise NotFound(f"Entity '{part_id}' not found.")
         if not p.part_of:
             raise VTTError(f"`{part_id}` is not a body part.")
+        # A detached segment leaves the body: the chain closes around it and
+        # it stops being a segment (it no longer follows anything).
+        self._splice_out_segment(p)
+        for k in ("__segment", "__follows"):
+            p.vars.pop(k, None)
         p.part_of = None
         self._rebuild_turn_order()
         return p
@@ -7486,6 +7774,7 @@ class Match:
         block."""
         if (x1, y1) == (x2, y2):
             return ((x2, y2), False, None)
+        self._check_line_budget(x1, y1, x2, y2)
         mode = str(self.rules.get("los_corner_mode", "permissive"))
         dx, dy = x2 - x1, y2 - y1
         sx = 1 if dx > 0 else (-1 if dx < 0 else 0)
@@ -7545,6 +7834,23 @@ class Match:
         drift on the corner rule."""
         return not self._los_stop(viewer_id, x1, y1, x2, y2)[1]
 
+    def _check_line_budget(self, x1: int, y1: int, x2: int, y2: int) -> None:
+        """Refuse a sight/geometry line longer than the formula_cell_limit
+        rule. The walk costs one step per cell crossed, and formulas (incl.
+        a player's inline `$()` arg) choose the endpoints freely — has_los(0,
+        0, 0, 10**8) would otherwise spin for minutes. Lines between on-grid
+        cells are always far under the default."""
+        n = abs(x2 - x1) + abs(y2 - y1) + 1
+        try:
+            limit = int(self.rules.get("formula_cell_limit", 100000))
+        except (TypeError, ValueError):
+            limit = 100000
+        if n > limit:
+            raise VTTError(
+                f"sight line ({x1},{y1})->({x2},{y2}) crosses up to {n} "
+                f"cells, over the formula_cell_limit of {limit}."
+            )
+
     def _line_cells(self, x1: int, y1: int, x2: int, y2: int) -> List[Tuple[int, int]]:
         """The ordered cells the segment (x1,y1)->(x2,y2) passes through,
         near->far, INCLUSIVE of both endpoints — the same thin line the LOS
@@ -7554,6 +7860,7 @@ class Match:
         cells = [(x1, y1)]
         if (x1, y1) == (x2, y2):
             return cells
+        self._check_line_budget(x1, y1, x2, y2)
         dx, dy = x2 - x1, y2 - y1
         sx = 1 if dx > 0 else (-1 if dx < 0 else 0)
         sy = 1 if dy > 0 else (-1 if dy < 0 else 0)
@@ -7755,7 +8062,19 @@ class Match:
         else:
             rec = {"cells": clipped, "clock": "round",
                    "until": self.round_number + int(duration)}
-        self.fog_reveals.setdefault(team, []).append(rec)
+        # Merge into an existing record with the SAME expiry (every permanent
+        # reveal, or temporaries sharing a deadline) — they're
+        # interchangeable. Without this a scout that reveals every turn
+        # piles up one record per use, and every fog check scans them all:
+        # a 60x60 render went 19 ms -> 166 ms at 300 permanent records.
+        recs = self.fog_reveals.setdefault(team, [])
+        for r in recs:
+            if (r.get("until") == rec["until"]
+                    and (rec["until"] is None
+                         or r.get("clock", "round") == rec["clock"])):
+                r["cells"] = set(r.get("cells", ())) | clipped
+                return len(clipped)
+        recs.append(rec)
         return len(clipped)
 
     def clear_reveals(self, team: str) -> int:
@@ -8700,6 +9019,23 @@ class Match:
 
     # ------------- turns -------------
 
+    def formula_rng(self):
+        """The match's RNG: a random.Random seeded from the random_seed rule
+        (built on first use, rebuilt when the seed changes), or the global
+        `random` module when unseeded. Every roll goes through here —
+        formulas, !roll, !table roll, damage_spread — so a seed holds from
+        the first roll. (It used to be built only when a formula engine
+        started, so a !roll before any formula ignored the seed.)"""
+        seed = self.rules.get("random_seed", "")
+        if not seed:
+            self._rng = None
+            self._rng_seed = None
+            return random
+        if self._rng is None or self._rng_seed != seed:
+            self._rng = random.Random(seed)
+            self._rng_seed = seed
+        return self._rng
+
     def _rebuild_turn_order(self):
         """Sort the alive, initiative-bearing entities into `self.turn_order`
         according to the active rules. Preserves the currently-acting
@@ -8858,7 +9194,12 @@ class Match:
                 ordered = [m for _, _, members, _ in interleaved_entries for m in members]
             self.turn_order = [e.id for e in ordered]
 
-        if prev_current_id and prev_current_id in self.turn_order:
+        # Before the first turn nobody is acting yet, so the order's top
+        # opens the match. Keeping the pointer on whoever happened to be
+        # added first handed round 1 to them even when a faster unit
+        # joined afterwards.
+        if (self.round_started and prev_current_id
+                and prev_current_id in self.turn_order):
             self.active_index = self.turn_order.index(prev_current_id)
         else:
             self.active_index = 0
@@ -8974,80 +9315,138 @@ class Match:
             if not self.turn_order:
                 self._begin_turn()
                 return (None, log)
-            # The opening entity may itself be skippable (e.g. starts
-            # stunned) — skip forward to the first eligible one.
-            eligible = self._skip_to_eligible(log)
-            # A skip's round-wrap (its internal _advance_index firing
-            # on_round_end/start hooks) can itself empty the order — re-check
-            # before indexing, same guard as after the turn_end/advance steps.
-            if not self.turn_order:
-                self._begin_turn()
-                return (None, log)
-            cur = self.turn_order[self.active_index]
-            if eligible:
-                log.extend(self.fire_hook(
-                    "on_turn_start", target_ids=[cur],
-                    own_only_targets=self._attached_tick_parts([cur])))
-                log.extend(self.fire_status_tick("turn_start"))
-                log.extend(self.fire_tile_time_hooks("on_turn_start"))
-                log.extend(self.fire_zone_time_hooks("on_turn_start"))
-                log.extend(self.fire_scheduled_turn(cur))
-                for pid in self._attached_tick_parts([cur]):
-                    log.extend(self.fire_scheduled_turn(pid))
-            else:
-                log.append(
-                    "⏭️ every entity is skippable; the round passes "
-                    "without anyone acting."
-                )
+            cur = self._start_current_turn(log)
             self._begin_turn()
             return (cur, log)
 
-        # Normal transition.
-        cur = self.turn_order[self.active_index]
-        log.extend(self.fire_status_tick("turn_end"))
-        log.extend(self.fire_tile_time_hooks("on_turn_end"))
-        log.extend(self.fire_zone_time_hooks("on_turn_end"))
-        log.extend(self.fire_hook(
-            "on_turn_end", target_ids=[cur],
-            own_only_targets=self._attached_tick_parts([cur])))
+        # Normal transition. If the acting unit was removed mid-turn, its
+        # turn-end surface has nothing to fire on (the unit now at
+        # active_index hasn't had its turn yet).
+        if not self.turn_vacated:
+            cur = self.turn_order[self.active_index]
+            log.extend(self.fire_status_tick("turn_end"))
+            log.extend(self.fire_tile_time_hooks("on_turn_end"))
+            log.extend(self.fire_zone_time_hooks("on_turn_end"))
+            log.extend(self.fire_hook(
+                "on_turn_end", target_ids=[cur],
+                own_only_targets=self._attached_tick_parts([cur])))
         # A turn_end hook/tick may have removed the last entity (e.g. a
         # lethal DoT — directly, or routed to a parent via a part tick).
         # With no one left, end here rather than advancing into an empty
         # turn order.
         if not self.turn_order:
+            self.turn_vacated = None
             self._begin_turn()
             return (None, log)
-        self._advance_index(log)
+        # The actor may also have died at its own turn end.
+        vacated, self.turn_vacated = self.turn_vacated, None
+        if vacated == "same":
+            pass    # the next unit already sits at active_index
+        elif vacated == "wrap":
+            self.active_index = len(self.turn_order) - 1
+            self._advance_index(log)
+        else:
+            self._advance_index(log)
         # _advance_index's round-wrap hooks (on_round_end/start ticks) can
         # likewise empty the order; re-check before reading the next entity.
         if not self.turn_order:
             self._begin_turn()
             return (None, log)
-        # Skip over any entity carrying a skip-status flag.
-        eligible = self._skip_to_eligible(log)
-        # _skip_to_eligible's internal round-wrap hooks can empty the order;
-        # re-check before reading the next entity (mirrors the guard above).
-        if not self.turn_order:
-            self._begin_turn()
-            return (None, log)
-        new_cur = self.turn_order[self.active_index]
-        if eligible:
+        new_cur = self._start_current_turn(log)
+        self._begin_turn()
+        return (new_cur, log)
+
+    def _start_current_turn(self, log: List[str]) -> Optional[str]:
+        """Start the turn of the unit at active_index: skip past skippable
+        units, then fire the turn-start surface (on_turn_start passives,
+        turn_start status ticks, tile/zone time-hooks, turn schedules).
+
+        A unit that DIES to its own turn-start effects (a lethal DoT tick, an
+        on_turn_start hook) never holds the turn: a dead unit can't act, so
+        the turn passes straight to the unit after it (its turn-start fires in
+        turn, and a round wrap on the way fires the round hooks as usual). The
+        log says so. Bounded by the order's size, so a table where every unit
+        dies on its turn start ends with an empty order, not a loop.
+
+        Returns the unit whose turn it now is, or None when the order is
+        empty."""
+        # A round hook on the way here may have removed the unit that was
+        # about to act: the next one already sits at active_index ("same"),
+        # or the order has to wrap ("wrap"). Either way the turn starts
+        # below; the marker must not linger into the next transition.
+        vacated, self.turn_vacated = self.turn_vacated, None
+        if vacated == "wrap" and self.turn_order:
+            self.active_index = len(self.turn_order) - 1
+            self._advance_index(log)
+            self.turn_vacated = None
+            if not self.turn_order:
+                return None
+        guard = len(self.turn_order) + 1
+        while True:
+            # Skip over any entity carrying a skip-status flag. Its internal
+            # round-wrap hooks can empty the order; re-check before indexing.
+            eligible = self._skip_to_eligible(log)
+            if not self.turn_order:
+                return None
+            cur = self.turn_order[self.active_index]
+            if not eligible:
+                log.append(
+                    "⏭️ every entity is skippable; the round passes "
+                    "without anyone acting."
+                )
+                return cur
+            order_before = list(self.turn_order)
+            idx = self.active_index
             log.extend(self.fire_hook(
-                "on_turn_start", target_ids=[new_cur],
-                own_only_targets=self._attached_tick_parts([new_cur])))
+                "on_turn_start", target_ids=[cur],
+                own_only_targets=self._attached_tick_parts([cur])))
             log.extend(self.fire_status_tick("turn_start"))
             log.extend(self.fire_tile_time_hooks("on_turn_start"))
             log.extend(self.fire_zone_time_hooks("on_turn_start"))
-            log.extend(self.fire_scheduled_turn(new_cur))
-            for pid in self._attached_tick_parts([new_cur]):
+            log.extend(self.fire_scheduled_turn(cur))
+            for pid in self._attached_tick_parts([cur]):
                 log.extend(self.fire_scheduled_turn(pid))
-        else:
-            log.append(
-                "⏭️ every entity is skippable; the round passes "
-                "without anyone acting."
-            )
-        self._begin_turn()
-        return (new_cur, log)
+            e = self.entities.get(cur)
+            if e is not None and e.is_alive:
+                return cur
+            if not self.turn_order:
+                self.turn_vacated = None
+                log.append(f"💀 `{cur}` died at the start of its turn; "
+                           f"no one is left to take the turn.")
+                return None
+            guard -= 1
+            if guard <= 0:
+                # Every unit has died on its turn start without leaving the
+                # order (an alive_condition that disagrees with the death
+                # pipeline). Stop here rather than cycling.
+                log.append(f"💀 `{cur}` died at the start of its turn, and so "
+                           f"did every unit after it; the turn stays here.")
+                return cur
+            log.append(f"💀 `{cur}` died at the start of its turn; the turn "
+                       f"passes to the next unit.")
+            vacated, self.turn_vacated = self.turn_vacated, None
+            if vacated == "same":
+                continue    # the next unit already sits at active_index
+            if vacated == "wrap":
+                self.active_index = len(self.turn_order) - 1
+                self._advance_index(log)
+                if not self.turn_order:
+                    return None
+                continue
+            # Dead but still in the order (an alive_condition that disagrees
+            # with the death pipeline): find the unit after it by hand.
+            # The next unit is the first one after the dead unit (in the
+            # order as it stood when its turn began) that's still in the
+            # order. None left after it → the round wraps to the top.
+            succ = next((x for x in order_before[idx + 1:]
+                         if x in self.turn_order), None)
+            if succ is not None:
+                self.active_index = self.turn_order.index(succ)
+            else:
+                self.active_index = len(self.turn_order) - 1
+                self._advance_index(log)
+                if not self.turn_order:
+                    return None
 
     def _begin_turn(self) -> None:
         """Mark a turn boundary: advance the persistent turn clock, then take
@@ -9226,7 +9625,9 @@ class Match:
         # turn_end for the outgoing actor (active_index still points at it).
         # If its turn was skipped, only its status ticks fire (decay), not
         # its action surface (act=not _atb_last_skipped).
-        if self.round_started and 0 <= self.active_index < len(self.turn_order):
+        vacated, self.turn_vacated = self.turn_vacated, None
+        if (self.round_started and not vacated
+                and 0 <= self.active_index < len(self.turn_order)):
             cur = self.turn_order[self.active_index]
             if cur in self.entities:
                 log.extend(self._atb_turn_phase(
@@ -9235,20 +9636,44 @@ class Match:
         if not self.turn_order:
             self._begin_turn()
             return (None, log)
-        new_cur = self._atb_select(log)
-        if new_cur is None:
-            self._begin_turn()
-            return (None, log)
-        # A skipped actor's turn still ELAPSES (bar already reset, status ticks
-        # fire) but it performs no action.
-        skipping = self._skipping_statuses(self.entities[new_cur])
-        self._atb_last_skipped = bool(skipping)
-        if skipping:
-            log.append(f"⏭️ `{new_cur}`'s turn skipped "
-                       f"({', '.join(sorted(skipping))}).")
-        # turn_start for the new actor (active_index now points at it).
-        log.extend(self._atb_turn_phase(
-            new_cur, "turn_start", act=not skipping))
+        # An actor that dies to its own turn-start effects never holds the
+        # turn (a dead unit can't act): the next charged unit is selected.
+        # Bounded by the order's size, like the round-mode loop.
+        guard = len(self.turn_order) + 1
+        while True:
+            new_cur = self._atb_select(log)
+            if new_cur is None:
+                self._begin_turn()
+                return (None, log)
+            # A skipped actor's turn still ELAPSES (bar already reset, status
+            # ticks fire) but it performs no action.
+            skipping = self._skipping_statuses(self.entities[new_cur])
+            self._atb_last_skipped = bool(skipping)
+            if skipping:
+                log.append(f"⏭️ `{new_cur}`'s turn skipped "
+                           f"({', '.join(sorted(skipping))}).")
+            # turn_start for the new actor (active_index now points at it).
+            log.extend(self._atb_turn_phase(
+                new_cur, "turn_start", act=not skipping))
+            # ATB selects by charge bar; the vacated marker a death set is
+            # not needed here.
+            self.turn_vacated = None
+            e = self.entities.get(new_cur)
+            if e is not None and e.is_alive:
+                break
+            if not self.turn_order:
+                log.append(f"💀 `{new_cur}` died at the start of its turn; "
+                           f"no one is left to take the turn.")
+                self._begin_turn()
+                return (None, log)
+            guard -= 1
+            if guard <= 0:
+                log.append(f"💀 `{new_cur}` died at the start of its turn, "
+                           f"and so did every unit after it; the turn stays "
+                           f"here.")
+                break
+            log.append(f"💀 `{new_cur}` died at the start of its turn; the "
+                       f"turn passes to the next unit.")
         self._begin_turn()
         return (new_cur, log)
 
@@ -10687,6 +11112,11 @@ class Match:
         # summon/summon_near/summon_from raised KeyError('x') and created nothing.
         d.setdefault("x", x)
         d.setdefault("y", y)
+        # from_dict also requires a name; a hand-built template without one
+        # used to fail with a bare "Runtime error: 'name'". Name it after its
+        # minted id (the engine shows the id wherever a name is missing).
+        if not d.get("name"):
+            d["name"] = new_id
         e = Entity.from_dict(d)
         # Apply default vars to the probe so the footprint size reflects
         # them; spawn re-applies (fill-only, idempotent).
@@ -11136,8 +11566,10 @@ class Match:
                 log += self._sever_segment(p)
         return log
 
-    def _sever_segment(self, p: "Entity") -> List[str]:
-        """Apply a destroyed segment's `segment_death_mode`:
+    def _sever_segment(self, p: "Entity",
+                       mode: Optional[str] = None) -> List[str]:
+        """Apply a destroyed segment's `segment_death_mode` (or `mode`, when
+        despawn_entity passes the segment_removal_mode it resolved):
           cascade — destroy `p` and every segment BEHIND it (the back of the
                     worm is severed and removed; no corpses).
           split   — remove `p` (the cut), promote the segment behind it to a
@@ -11150,9 +11582,8 @@ class Match:
         head = self.entities.get(head_id)
         if head is None:
             return []
-        mode = str(p.vars.get("__segment_death_mode")
-                   or head.vars.get("__segment_death_mode")
-                   or self.rules.get("segment_death_mode", "none"))
+        if mode is None:
+            mode = self._segment_death_mode_of(p, head)
         if mode in ("none", "solid"):
             return []
         chain = self.snake_segments(head_id)
@@ -11182,6 +11613,38 @@ class Match:
                            mode="split", part_of=head_id)
             p.remove()
             self._rebuild_turn_order()
+        return log
+
+    def _segment_death_mode_of(self, p: "Entity", head: "Entity") -> str:
+        """The segment_death_mode for segment `p`: its `__segment_death_mode`
+        var > the head's > the rule."""
+        return str(p.vars.get("__segment_death_mode")
+                   or head.vars.get("__segment_death_mode")
+                   or self.rules.get("segment_death_mode", "none"))
+
+    def despawn_entity(self, e: "Entity") -> List[str]:
+        """GM despawn (`!ent remove`, `!part remove`, remove_entity). Same as
+        `e.remove()`, except that a snake SEGMENT whose head is still here
+        applies the segment_removal_mode rule to the rest of the body
+        (segment var > head var > rule): `close` splices the chain (what
+        remove() does), `cascade`/`split` sever it like a death would, and
+        `death` uses the segment's segment_death_mode (`none`/`solid` →
+        close). Returns log lines describing a sever."""
+        head = self.entities.get(e.part_of) if e.part_of else None
+        if head is None or not e.vars.get("__segment"):
+            e.remove()
+            return []
+        mode = str(e.vars.get("__segment_removal_mode")
+                   or head.vars.get("__segment_removal_mode")
+                   or self.rules.get("segment_removal_mode", "close"))
+        if mode == "death":
+            mode = self._segment_death_mode_of(e, head)
+        if mode not in ("cascade", "split"):
+            e.remove()
+            return []
+        log = self._sever_segment(e, mode=mode)
+        if e.id in self.entities and e._match is self:
+            e.remove()   # not in the head's chain: plain removal
         return log
 
     def _promote_segment_to_head(self, seg: "Entity", old_head: "Entity") -> None:
@@ -11298,7 +11761,7 @@ class Match:
             n = max(1, n)
             weighted = [(p, self._part_aoe_weight(p)) for p in parts]
             wsum = sum(w for _p, w in weighted)
-            rng = getattr(self, "_rng", None) or random
+            rng = self.formula_rng()
             per = total // n
             rem = total - per * n      # give the remainder to the first frags
             for i in range(n):
@@ -11343,6 +11806,13 @@ class Match:
         log: List[str] = []
         for pid, amt in shares.items():
             if amt == 0:
+                continue
+            # An earlier share can end the body (a vital part destroyed runs
+            # the parent through the death pipeline, which removes the other
+            # parts): the rest of the blast has nothing left to hit. Raising
+            # "Entity not found" here failed the whole formula, and inside an
+            # action that ROLLED BACK the kill.
+            if pid not in self.entities or target_id not in self.entities:
                 continue
             tm, plog = self.damage_part(pid, amt)
             to_main += tm
@@ -11623,35 +12093,102 @@ class Match:
         # Spawn parents before children: a part whose part_of points at another
         # part in this list waits until that part has spawned.
         pending = list(part_list)
+
+        def _place(d: Dict[str, Any], relocate: bool) -> bool:
+            """Spawn one part. True = done (spawned or dropped); False = a
+            located part whose stored cell is taken, deferred until every
+            other part has had its own cell (so a displaced part can't take
+            the cell a later part is stored at)."""
+            po = d.get("part_of")
+            new_po = idmap[po] if po in own_ids else parent.id
+            located = bool((d.get("vars") or {}).get("__part_located"))
+            px = int(d.get("x", parent.x)) if located else parent.x
+            py = int(d.get("y", parent.y)) if located else parent.y
+            spec = {k: v for k, v in d.items() if k not in ("__nid", "parts")}
+            spec["id"] = d["__nid"]
+            spec["part_of"] = new_po
+            spec["x"], spec["y"] = px, py
+            if "name" not in spec:
+                spec["name"] = str((spec.get("vars") or {}).get(
+                    name_var, spec["id"]))
+            try:
+                pe = Entity.from_dict(spec)
+                try:
+                    _, slog = pe.spawn(self, px, py)
+                except VTTError as ex:
+                    # A located part (a snake segment, a turret on its own
+                    # cell) whose stored cell is now taken or off-grid goes
+                    # to the nearest free cell instead.
+                    if not located:
+                        raise
+                    if not relocate:
+                        return False
+                    near = self._find_free_cell_near(
+                        px, py, max(self.grid_width, self.grid_height), e=pe)
+                    if near is None or near == (px, py):
+                        raise
+                    pe = Entity.from_dict(spec)
+                    _, slog = pe.spawn(self, near[0], near[1])
+                    slog = [f"⚠️ part `{spec['id']}` couldn't return to "
+                            f"({px},{py}) ({ex}); placed at "
+                            f"({near[0]},{near[1]})."] + list(slog)
+                log.extend(slog)
+            except VTTError as ex:
+                # Malformed, or a located part with no free cell left: skip
+                # it rather than abort the swap, but say so (it used to
+                # vanish silently).
+                log.append(f"⚠️ part `{spec['id']}` couldn't be restored "
+                           f"({ex}) — dropped.")
+            return True
+
+        # Spawn parents before children: a part whose part_of points at another
+        # part in this list waits until that part has spawned. Displaced
+        # located parts are placed in a second phase, after every part that
+        # can return to its own cell has done so.
+        relocate = False
         guard = 0
-        while pending and guard <= len(part_list):
+        while pending and guard <= 2 * len(part_list) + 2:
             guard += 1
             progressed = False
             for d in list(pending):
                 po = d.get("part_of")
                 if po in own_ids and idmap.get(po) not in self.entities:
-                    continue  # its parent part isn't spawned yet
-                new_po = idmap[po] if po in own_ids else parent.id
-                located = bool((d.get("vars") or {}).get("__part_located"))
-                px = int(d.get("x", parent.x)) if located else parent.x
-                py = int(d.get("y", parent.y)) if located else parent.y
-                spec = {k: v for k, v in d.items() if k not in ("__nid", "parts")}
-                spec["id"] = d["__nid"]
-                spec["part_of"] = new_po
-                spec["x"], spec["y"] = px, py
-                if "name" not in spec:
-                    spec["name"] = str((spec.get("vars") or {}).get(
-                        name_var, spec["id"]))
-                try:
-                    pe = Entity.from_dict(spec)
-                    _, slog = pe.spawn(self, px, py)
-                    log += slog
-                except VTTError:
-                    pass  # malformed part entry — skip, don't abort the swap
-                pending.remove(d)
-                progressed = True
+                    # Its parent part isn't spawned yet. In the last phase a
+                    # dropped parent means it never will be: drop the child.
+                    if relocate and not any(idmap.get(po) == q["__nid"]
+                                            for q in pending):
+                        log.append(f"⚠️ part `{d['__nid']}` couldn't be "
+                                   f"restored (its parent part is gone) — "
+                                   f"dropped.")
+                        pending.remove(d)
+                        progressed = True
+                    continue
+                if _place(d, relocate):
+                    pending.remove(d)
+                    progressed = True
             if not progressed:
-                break
+                if relocate:
+                    break
+                relocate = True
+        # A segment that didn't come back must not leave the one behind it
+        # following an id that was never created: close the chain around it,
+        # the same rule as removing a segment (_splice_out_segment).
+        dropped_pred = {d["__nid"]: (d.get("vars") or {}).get("__follows")
+                        for d in part_list if d["__nid"] not in self.entities}
+        if dropped_pred:
+            for d in part_list:
+                pe = self.entities.get(d["__nid"])
+                if pe is None:
+                    continue
+                fol, seen = pe.vars.get("__follows"), set()
+                while fol in dropped_pred and fol not in seen:
+                    seen.add(fol)
+                    fol = dropped_pred[fol]
+                if fol != pe.vars.get("__follows"):
+                    if fol:
+                        pe.vars["__follows"] = fol
+                    else:
+                        pe.vars.pop("__follows", None)
         self._restamp_parts_for(parent.id)
         return log
 
@@ -11730,6 +12267,14 @@ class Match:
             new_vars[team_var] = old_team
         if old_init is not None:
             new_vars[turnorder_var] = old_init
+        # A unit's place in a snake chain is identity too (like part_of,
+        # which transform never touches): keep the target's own linkage and
+        # drop the statblock's. Taking a segment's statblock used to copy its
+        # __follows, so a free unit claimed to follow that snake's head.
+        for k in _SEGMENT_LINK_VARS:
+            new_vars.pop(k, None)
+            if k in e.vars:
+                new_vars[k] = copy.deepcopy(e.vars[k])
         self._death_check_suppressed_ids.add(e.id)
         log: List[str] = []
         try:
@@ -12517,6 +13062,7 @@ class Match:
             "round_number": self.round_number,
             "turns_elapsed": self.turns_elapsed,
             "round_started": self.round_started,
+            "turn_vacated": self.turn_vacated,
             "global_passives": {pid: p.to_dict() for pid, p in self.global_passives.items()},
             "groups": {name: list(members) for name, members in self.groups.items()},
             # Tile keys are tuples internally; JSON object keys must be
@@ -12627,6 +13173,8 @@ class Match:
         m.round_number = int(d.get("round_number", 1))
         m.turns_elapsed = int(d.get("turns_elapsed", 0))
         m.round_started = bool(d.get("round_started", False))
+        m.turn_vacated = d.get("turn_vacated") if d.get("turn_vacated") in (
+            "same", "wrap") else None
         m.global_passives = {
             pid: Passive.from_dict(pd)
             for pid, pd in (d.get("global_passives", {}) or {}).items()
@@ -13294,7 +13842,9 @@ class Match:
                      colorize: bool = False,
                      hidden_layers: Optional["set[str]"] = None,
                      viewport: Optional[Tuple[int, int, int, int]] = None,
-                     legend: bool = False) -> str:
+                     legend: bool = False,
+                     marks: Optional["set[Tuple[int, int]]"] = None,
+                     mark_glyph: str = "*") -> str:
         """Render the ASCII map. Thin wrapper that activates the read-only
         _fog_team_sees memo for the duration of the render, so the per-cell,
         per-layer fog scan doesn't recompute the same team-sight (each
@@ -13303,14 +13853,18 @@ class Match:
         it can't go stale. See _render_ascii_impl for the actual rendering.
 
         `hidden_layers` (None = use this match's persistent self.hidden_layers)
-        suppresses render layers by name: zones / tiles / entities / fog."""
+        suppresses render layers by name: zones / tiles / entities / fog.
+
+        `marks` (a set of (x, y) cells, used by `!map preview`) paints
+        `mark_glyph` on each of those cells that isn't showing a unit."""
         hidden = self.hidden_layers if hidden_layers is None else hidden_layers
         prev = self._vision_memo
         if prev is None:
             self._vision_memo = {}
         try:
             return self._render_ascii_impl(pov_team, colorize, hidden,
-                                           viewport=viewport, legend=legend)
+                                           viewport=viewport, legend=legend,
+                                           marks=marks, mark_glyph=mark_glyph)
         finally:
             self._vision_memo = prev
 
@@ -13318,7 +13872,9 @@ class Match:
                            colorize: bool = False,
                            hidden: "set[str]" = frozenset(),
                            viewport: Optional[Tuple[int, int, int, int]] = None,
-                           legend: bool = False) -> str:
+                           legend: bool = False,
+                           marks: Optional["set[Tuple[int, int]]"] = None,
+                           mark_glyph: str = "*") -> str:
         # `pov_team` filters EVERY layer through its visibility rule: a
         # zone / tile / entity hidden from that team isn't painted (its
         # cell falls back to whatever layer is visible underneath, so the
@@ -13403,6 +13959,10 @@ class Match:
             elif tc is not None:
                 colors[ty][tx] = tc
 
+        # Cells currently showing a unit's glyph (so a preview mark leaves
+        # them alone; a fog overlay takes them back out).
+        unit_shown: "set[Tuple[int, int]]" = set()
+
         # Entity layer (top, above tiles): the "who is where" question wins
         # over tile features. An entity always paints a glyph, so it owns
         # the cell's color too (its resolved color, or None = uncolored,
@@ -13426,6 +13986,7 @@ class Match:
                 if self.in_bounds(cx, cy):
                     grid[cy][cx] = sym
                     colors[cy][cx] = ecol
+                    unit_shown.add((cx, cy))
                     if meanings is not None:
                         meanings[cy][cx] = self.entity_display_name(e, pov_team)
 
@@ -13442,6 +14003,7 @@ class Match:
                 if self.in_bounds(cx, cy):
                     grid[cy][cx] = sym
                     colors[cy][cx] = ecol
+                    unit_shown.add((cx, cy))
                     if meanings is not None:
                         meanings[cy][cx] = self.entity_display_name(e, pov_team)
 
@@ -13462,6 +14024,7 @@ class Match:
                     if self.in_bounds(cx, cy):
                         grid[cy][cx] = sym
                         colors[cy][cx] = ecol
+                        unit_shown.add((cx, cy))
                         if meanings is not None:
                             meanings[cy][cx] = self.entity_display_name(e, pov_team)
 
@@ -13475,9 +14038,22 @@ class Match:
                     if not self._fog_terrain_visible(pov_team, xx, yy):
                         grid[yy][xx] = fg
                         colors[yy][xx] = None
+                        unit_shown.discard((xx, yy))
                         if meanings is not None:
                             meanings[yy][xx] = ("fog (unseen)"
                                                 if fg != "." else None)
+
+        # Preview marks (`!map preview`): the area's cells, except the ones
+        # showing a unit — those keep the unit's glyph (the reply lists who is
+        # inside). Drawn over terrain / zone / fog glyphs, uncolored.
+        if marks:
+            mg = (mark_glyph or "*")[0]
+            for (mx, my) in marks:
+                if self.in_bounds(mx, my) and (mx, my) not in unit_shown:
+                    grid[my][mx] = mg
+                    colors[my][mx] = None
+                    if meanings is not None:
+                        meanings[my][mx] = "preview area"
 
         # Window bounds: the viewport (vx, vy, vw, vh) clips the rendered
         # cells to a sub-rectangle of the grid (clamped); None = whole grid.
@@ -13490,19 +14066,35 @@ class Match:
         else:
             x0, y0, x1, y1 = 1, 1, self.grid_width, self.grid_height
 
-        # Compose, wrapping each cell in its ANSI color when colorizing.
+        # Compose. When colorizing, a color code is emitted once per RUN of
+        # same-colored cells (reset at each change and at row end) rather than
+        # wrapped around every cell: each code pair costs ~9 characters, and
+        # Discord caps a message at 2000, so a colored zone/terrain block
+        # would otherwise multiply the map's size. (The separator space
+        # inside a run takes the run's color — invisible on a space.)
         lines = []
         for yy in range(y0, y1 + 1):
-            cells = []
+            if not colorize:
+                lines.append(" ".join(grid[yy][xx]
+                                      for xx in range(x0, x1 + 1)))
+                continue
+            parts: List[str] = []
+            active = None
             for xx in range(x0, x1 + 1):
-                ch = grid[yy][xx]
-                if colorize:
-                    name = colors[yy][xx]
-                    code = TEXT_COLORS.get(name) if name else None
+                if xx > x0:
+                    parts.append(" ")     # stays in the previous run's span
+                name = colors[yy][xx]
+                code = TEXT_COLORS.get(name) if name else None
+                if code != active:
+                    if active:
+                        parts.append("\x1b[0m")
                     if code:
-                        ch = f"\x1b[{code}m{ch}\x1b[0m"
-                cells.append(ch)
-            lines.append(" ".join(cells))
+                        parts.append(f"\x1b[{code}m")
+                    active = code
+                parts.append(grid[yy][xx])
+            if active:
+                parts.append("\x1b[0m")
+            lines.append("".join(parts))
         out = "\n".join(lines)
 
         # Auto-legend: glyph -> meanings, collected from the cells actually
@@ -13982,9 +14574,15 @@ class Match:
         # per intermediate tile (same as single-entity move_dirs).
         log: List[str] = []
         for eid, path in plans.items():
-            e = self.entities[eid]
+            # An earlier member's hooks may have removed this one (or it
+            # died on a previous step): skip / stop, like move_dirs.
+            e = self.entities.get(eid)
+            if e is None:
+                continue
             origin_x, origin_y = e.x, e.y
             for nx, ny, facing in path:
+                if eid not in self.entities:
+                    break
                 # Footprint-aware per-step hooks (a multi-tile member must
                 # fire tile/zone hooks for EVERY covered cell it vacates /
                 # enters, not just its anchor) — identical to the anchor
@@ -14008,7 +14606,7 @@ class Match:
                     log.extend(self.fire_entity_step(
                         eid, step_from_x, step_from_y, nx, ny,
                     ))
-            if fire_hooks and path:
+            if fire_hooks and path and eid in self.entities:
                 final_cells = self.entity_cells(e, e.x, e.y)
                 log.extend(self.fire_footprint_tile_stop(eid, final_cells))
                 log.extend(self.fire_footprint_zone_stop(eid, final_cells))
@@ -14145,6 +14743,7 @@ class MatchManager:
             self.effective_system(channel_key or "CLI")
         )
         rules = self._build_rules_dict(sysobj)
+        check_grid_dimensions(width, height, rules, "New match")
         m = Match(id=match_id, name=name, grid_width=width, grid_height=height,
                   system_name=sysobj.name, rules=rules)
         # The creator becomes the match owner (full privileges + sole host
@@ -14260,6 +14859,10 @@ class MatchManager:
             fol = ne.vars.get("__follows")
             if fol in idmap:
                 ne.vars["__follows"] = idmap[fol]
+            elif fol is not None:
+                # Points outside the copied body: it would dangle in the
+                # destination (or latch onto an unrelated same-id entity).
+                ne.vars.pop("__follows", None)
             # Offset the head's snake-trail coords to the destination cell so a
             # transferred path-mode snake re-lays at its new location, not the
             # source's (same delta the anchor moves by).
@@ -14290,6 +14893,39 @@ class MatchManager:
                 m.rules = self._build_rules_dict(sysobj)
                 count += 1
         return count
+
+    def clone_match(self, src_id: str, new_id: str, new_name: Optional[str] = None,
+                    owner: Optional[str] = None) -> "Match":
+        """Duplicate a match under a new id: the whole board and its game
+        state (entities, map, statuses, rules, macros, watchers, the turn,
+        the event log, ...) via a to_dict / from_dict round trip, so the copy
+        shares nothing with the source. The cloner (`owner`) becomes owner
+        and the source's owner joins the co-hosts, so every host of the
+        source hosts the copy; co-hosts and per-match access overrides are
+        copied. Channel state
+        starts empty — no bound channels, no per-channel camera, no pending
+        requests — and the undo history starts fresh. The source match is
+        untouched and stays active wherever it was."""
+        src = self.get(src_id)
+        if new_id in self.matches:
+            raise DuplicateId(f"Match id '{new_id}' already exists")
+        d = src.to_dict(include_history=False)
+        d["id"] = new_id
+        d["name"] = new_name or f"{src.name} (copy)"
+        m = Match.from_dict(d)
+        if owner is not None and owner != src.owner:
+            # A co-host cloning becomes the copy's owner; the source's owner
+            # stays a host of the copy (as a co-host), so everyone who hosted
+            # the original still hosts the clone.
+            m.owner = owner
+            if src.owner is not None and src.owner not in m.cohosts:
+                m.cohosts.append(src.owner)
+        m.cohosts = [c for c in m.cohosts if c != m.owner]
+        m.bound_channels = {}
+        m.channel_views = {}
+        m.pending_requests = {}
+        self.matches[m.id] = m
+        return m
 
     def delete_match(self, match_id: str):
         if match_id not in self.matches:

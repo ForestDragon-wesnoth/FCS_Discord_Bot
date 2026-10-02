@@ -12,9 +12,10 @@
 #                    tkinter imported lazily so the testable pieces load on a
 #                    headless box.
 #
-# v1 scope (agreed): static sprites only (no animation), command input only
-# (no mouse select/drag), whole-map render (no in-GUI pan/zoom). Discord will
-# later render the same model to an image attachment.
+# Scope: static sprites only (no animation), command input only (no mouse
+# select/drag). The canvas pans and zooms locally (see GuiApp); Discord renders
+# the same model to an image attachment via sprite_render (scene_for_png +
+# render_scene_png).
 from __future__ import annotations
 import os
 import asyncio
@@ -25,7 +26,7 @@ from typing import Optional, Dict, Any, Tuple, List
 # Discord image surface can reuse them without depending on tkinter. gui.py is
 # the tkinter glue around them.
 from sprite_render import (
-    _PIL_OK, SpriteLoader, SceneRenderer, SPRITES_DIR_DEFAULT,
+    _PIL_OK, SpriteLoader, SceneRenderer, SPRITES_DIR_DEFAULT, fit_cell_size,
 )
 
 from logic import MatchManager
@@ -52,6 +53,11 @@ class GuiCtx:
 
     async def send(self, message: str):
         self.app.log(message)
+
+    def show_preview(self, highlights) -> None:
+        """`!map preview` hook: draw these highlight squares on the canvas
+        (over units) until the next command runs."""
+        self.app._preview = highlights
 
     async def prompt_choice(self, prompt, options, lo, hi):
         from tkinter import simpledialog
@@ -82,6 +88,11 @@ class GuiApp:
     _ZOOM_MIN = 0.25
     _ZOOM_MAX = 4.0
     _ZOOM_STEP = 1.25
+    # Longest side of the rendered canvas, in pixels. The image is
+    # cols*cell x rows*cell RGBA, so without a cap a 40x40 map at the default
+    # 100 px cells and 4x zoom is 16000x16000 (~1 GB) and hangs the window.
+    # Zooming past the cap does nothing; the readout shows the real zoom.
+    _MAX_CANVAS_PX = 8000
 
     def __init__(self, sprites_dir: str = SPRITES_DIR_DEFAULT):
         if not _PIL_OK:
@@ -92,6 +103,7 @@ class GuiApp:
         self.mgr = MatchManager()
         self.ctx = GuiCtx(self)
         self.loader = SpriteLoader(sprites_dir)
+        self._preview = None  # highlight squares from `!map preview`
         self.loop = asyncio.new_event_loop()
         self._photo = None  # keep a ref so Tk doesn't GC the image
         self._zoom = 1.0
@@ -187,12 +199,16 @@ class GuiApp:
         mid = self.mgr.active_by_channel.get(self.ctx.channel_key)
         return self.mgr.matches.get(mid) if mid else None
 
-    def _cell_size(self, m) -> int:
+    @staticmethod
+    def _base_cell(m) -> int:
         try:
-            base = int(m.rules.get("sprite_cell_size", 100))
+            return max(1, int(m.rules.get("sprite_cell_size", 100)))
         except (TypeError, ValueError):
-            base = 100
-        return max(1, int(base * self._zoom))
+            return 100
+
+    def _cell_size(self, m, scene) -> int:
+        return fit_cell_size(scene, int(self._base_cell(m) * self._zoom),
+                             self._MAX_CANVAS_PX)
 
     # -- zoom controls ---------------------------------------------------
     def _zoom_by(self, factor: float):
@@ -219,7 +235,16 @@ class GuiApp:
             self.canvas.delete("all")
             return
         scene = m.render_scene()
-        renderer = SceneRenderer(self.loader, self._cell_size(m))
+        if getattr(self, "_preview", None):
+            scene["highlights"] = self._preview
+        cell = self._cell_size(m, scene)
+        base = self._base_cell(m)
+        if cell < int(base * self._zoom):
+            # The pixel cap bit: pin the zoom to what was actually rendered,
+            # so further zoom-in stops instead of silently piling up a factor.
+            self._zoom = cell / base
+        self.zoom_label.config(text=f"{int(round(self._zoom * 100))}%")
+        renderer = SceneRenderer(self.loader, cell)
         img = renderer.render(scene)
         from PIL import ImageTk
         self._photo = ImageTk.PhotoImage(img)
@@ -237,6 +262,7 @@ class GuiApp:
     def _run_input(self):
         block = self.entry.get("1.0", "end")
         self.entry.delete("1.0", "end")
+        self._preview = None  # a `!map preview` lasts until the next command
         lines = [ln.strip() for ln in block.splitlines()]
         ran = False
         for line in lines:

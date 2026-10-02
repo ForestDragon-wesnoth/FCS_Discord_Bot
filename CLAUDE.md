@@ -123,9 +123,24 @@ python run_scenarios.py
 ```
 
 The harness is fast. Run it after every commit-worthy change. If it
-breaks, fix it before adding more code. **But the harness only
-catches Python exceptions and "Syntax error" — it does NOT verify
-behavior.** A scenario can "pass" with a `❌` reply that means the
+breaks, fix it before adding more code. Every `SCENARIO N — title`
+header needs a BLANK LINE before it and a dashes line after it; a header
+missing the blank line is silently swallowed into the previous
+scenario's Expected: prose and never runs (scenarios 230/232/236 sat
+unexecuted this way for a long time). The harness now cross-checks every
+header line against what it parsed and refuses to run on a mismatch or a
+duplicate number. Only lines ABOVE a scenario's first `Expected:` run: a
+staged scenario labels its intermediate prose `Result:` (see 13, 26) —
+commands written after an `Expected:` block silently never execute. The
+harness also flags `❌ Runtime error:`, `❌ Unexpected error:`, an unknown
+subcommand ("isn't a valid command") and missing arguments ("is missing
+arguments") unless the prose carries `HARNESS-ALLOWS-ERRORS`. **But the
+harness only catches those markers — it does NOT verify behavior** unless
+the scenario says what it expects with `!assert "<formula>" [message]`: a
+false assert prints `❌ Assertion failed`, which the harness ALWAYS flags
+(even under HARNESS-ALLOWS-ERRORS; only `HARNESS-ALLOWS-ASSERT-FAIL`, for a
+scenario demonstrating a failing assert, opts out). Prefer asserts for
+end-state checks in new scenarios (see 597-608). A scenario can "pass" with a `❌` reply that means the
 opposite of what it should. Always also do at least one of:
 
 - Run the new scenarios with `-v` and read the per-line transcript
@@ -284,6 +299,49 @@ behavior is what shipped).
 
 Add cross-cutting features here, not at the call sites.
 
+### ⚠️ Multi-tenant caveat (INTERIM — read before touching access or storage)
+
+ONE bot process serves EVERY Discord guild it's in, and today they all share
+one `MatchManager`: the GameSystems (rules, `command_access`, default vars /
+passives / clamps, system aliases), the match table, and the `saves/` folder
+are GLOBAL. Nothing is partitioned per guild. The current protections are
+stop-gaps (audit-pass-29, user-approved):
+- **Bot-wide commands need a server administrator** — `!system` edits,
+  `!defvar`/`!defpassive`/`!gclamp` edits, `!store`, `!run`, `!history
+  export/import` (`vtt_commands._admin_required` + `ctx_is_admin`; Discord =
+  the guild Administrator permission, CLI/GUI = always). Checked in BOTH
+  `CommandRegistry.run` and `dispatch_no_snapshot` (so batch/macro/foreach/
+  `!run` lines and action `cmd()` can't wrap them), rejected outright (never
+  queued), not overridable by `!host access` / `command_access`, and it skips
+  the per-match gate once passed. Action bodies can't run them at all
+  (`_BufferCtx` carries no admin flag — default-deny).
+- **Commands that NAME another match** (`!match use/bind/rename/delete <id>`,
+  `!ent copy/transfer <id> <dest>`) need host (delete: owner) of THAT match
+  (`require_target_host`) — the access gate only checks the CHANNEL's match.
+- **Disk paths are confined to `saves/`** (next section).
+The hole that remains BY DESIGN for now: an administrator of guild A can still
+change a shared system that guild B's matches use, `!store load` replaces every
+guild's matches, and `!match` lists every match id bot-wide. **When the bot is
+redesigned for proper data storage, systems, matches, saves and access MUST be
+split per guild** (each guild its own systems + match table + save folder, and
+cross-guild references impossible by construction). Don't build new features
+that deepen the sharing (e.g. a cross-guild match browser); do route any new
+global-state command through `_admin_required`.
+
+### Disk access is confined to `saves/`
+
+Every command that reads or writes a host file — `!store save/load`, `!run`,
+`!history export/import` — goes through `vtt_commands.saves_path(name,
+write=)`, which resolves plain relative names (subfolders allowed) inside
+`SAVES_DIR` (`saves/` next to the code) and refuses `..`, absolute paths,
+drive letters and anything whose realpath (symlinks included) leaves the
+folder. Replies show `saves/<name>`, never the host's absolute path. Before
+this, `!run 1bot_token.txt` echoed the bot token back line by line ("Unknown
+command `<token>`") to ANY user, and `!store save` could overwrite any file.
+`saves/` is git-ignored. The scenario harness points `SAVES_DIR` at a temp
+folder for the run (never touch a real campaign folder). If you add a new
+file-touching command, use `saves_path` AND list it in `_admin_required`.
+
 ---
 
 ## 4. The formula sandbox — what you can and can't do
@@ -312,6 +370,9 @@ can be a literal id, `self`/`this`/`current`, a known param, an
 action binding (target), or any HOOK_CONTEXT_NAMES name (actor, etc.).
 Other bare Names inside `entity[X]` are treated as **literal entity
 ids** for backward compat — be careful.
+The PATH side has reserved names too (`logic.RESERVED_VAR_PATHS`): `x`, `y`
+and `name` read the entity's own position / display name, and no var can be
+written at or under them.
 
 **Action mode** lifts three restrictions:
 1. Bare-name assignments (`raw = 5`) become locals
@@ -618,10 +679,17 @@ Shipped capabilities (roughly chronological; all merged):
     `"host"` (DEFAULT, mutating — non-host's invocation is held for
     approval) / `"host_only"` (approve/deny themselves) / `"owner"`
     (host mgmt). A host-gated root auto-downgrades to "all" when its
-    first arg is in `READ_ONLY_SUBCOMMANDS` (list/info/dump/cells/...),
-    so players can inspect but not mutate. Gate is a NO-OP when there's
+    first arg is one of THAT ROOT's read-only subcommands
+    (`READ_ONLY_SUBCOMMANDS`, a per-root dict — `list`/`info`/`cells`/...;
+    `dump` deliberately excluded), so players can inspect but not mutate.
+    It is PER ROOT because a global word set let a player's `!batch list ;
+    ent hp boss -40` run unapproved (args[0] of batch/emit/eval/run is
+    content, not a subcommand — scenario 570); a new command gets no
+    downgrade until its read-only subs are listed there. Gate is a NO-OP when there's
     no active match, no identity, or `owner is None` (legacy/open
-    matches). Alias resolution runs BEFORE the gate; `dispatch_no_snapshot`
+    matches) — which is why BOT-WIDE commands have their own admin check and
+    match-NAMING commands their own target check (see "Multi-tenant caveat"
+    in §3). Alias resolution runs BEFORE the gate; `dispatch_no_snapshot`
     (batch/run/action `cmd()`) is intentionally ungated since it's only
     reached from an already-approved/host context — gate stays at the
     top level only.
@@ -1746,8 +1814,10 @@ More shipped work (continuing the list above):
   `_entity_line` take pov_team and overlay the disguise name + vars (disguise
   vars win over the computed hp/max_hp/team for display). Surfaces: `!map` /
   `!list` / `!state` (the board); use `!as view <team>` to preview a POV in the
-  CLI/harness. `!find` deliberately stays on REAL names — it already ignores
-  visibility/fog entirely (a search/GM tool). A moving/animated decoy or an
+  CLI/harness. `!ent info` shows the decoy card and `!find` rows render the
+  decoy line under a team POV (pov_filters_queries, audit-pass-29); `!find`
+  PREDICATES and `show:` columns still read the real vars, except the
+  reserved `name` path, which reads the decoy name under that POV. A moving/animated decoy or an
   illusion that fools enemy TARGETING is a GM composition on top (mechanics use
   real, so a true targeting-fooling illusion would need the deep-illusion
   variant, deferred).
@@ -1829,10 +1899,10 @@ More shipped work (continuing the list above):
     a nested foreach would recurse; and ELEVATED_ARGS (`; map full`). GOTCHA
     worth remembering: `ent dump` is NOT in READ_ONLY_SUBCOMMANDS by deliberate
     policy (it reveals GM-hidden vars), so `; ent dump $id` gates a sweep —
-    use `ent info` for the player-available readout. Also note the selector
-    itself still uses the `!find` grammar, which by design IGNORES fog/
-    visibility; that's pre-existing (a player could already run `!find`), not a
-    new leak, and `!host access` remains the lever for a fog match.
+    use `ent info` for the player-available readout. The selector uses the
+    `!find` grammar; for a NON-host sweep it now also skips entities the
+    channel POV can't see (pov_filters_queries, audit-pass-29), so `$x`/`$y`
+    can't hand out hidden positions. A host's sweep is unfiltered.
 - **Audit-pass-4 fixes: multi-tile interaction sweep (scenarios 491-492).** A
   fourth interaction-bug sweep, this time hunting anchor-only assumptions in
   OLDER features against multi-tile entities (three read-only survey agents
@@ -2590,7 +2660,8 @@ More shipped work (continuing the list above):
     default generous enough to be safe could still reject a legitimate large
     campaign map — that default is a design call. The codebase's own precedent
     (`macro_repeat_limit`'s "guards against a typo'd huge count") argues FOR
-    adding one; say so and it's a small rule.
+    adding one; say so and it's a small rule. RESOLVED — the `max_grid_dimension` rule (default 500)
+    shipped; see the `!help find` / clone entry.
   - PROCESS NOTE for future harness authors: THREE apparent "failures" this pass
     were my own harness bugs, not engine defects — `!passive add` takes
     `target=`/`scope=` BEFORE the quoted formula (formula LAST; wrong order makes
@@ -2637,8 +2708,9 @@ More shipped work (continuing the list above):
     tweaked rules, active channel bindings, zones/anchored auras, macros, team
     data, nested inventory and a part subtree all survive into a FRESH manager,
     and the loaded match is fully functional (list/map/turn/move/macro/part all
-    clean). Path handling is host-gated disk I/O by design (same self-hosted
-    stance as sprites). **Event-log retention** is a plain count cap (not
+    clean). (Path handling was "host-gated by design" here — SUPERSEDED in
+    audit-pass-29: the gate was a no-op without an active match, so any user
+    could read/write host files; now admin-only and confined to `saves/`.) **Event-log retention** is a plain count cap (not
     round-keyed, so unlike pass-24 it's ATB-safe): cap enforced, 0 = keep
     nothing, -1 = unlimited. **Dict-rule editors** — `!system set` correctly
     refuses dict rules and points at the dedicated editor; `!log format` (incl.
@@ -2886,9 +2958,10 @@ More shipped work (continuing the list above):
   Also re-confirmed clean by inspection: the Discord adapter board/approval/image
   logic (pass-18's per-match approval fix holds) and status dispel/transfer
   (tag dispel, max cap, consume-on-reject to an immune dest). NOTE for future
-  harness authors: hp is clamped to `[0, max_hp]` and max_hp defaults to the
-  spawn hp — so a bare `!ent add x X 30 ...` caps hp at 30; raise max_hp first or
-  your "hp write is broken" repro is really the clamp working (this cost me a
+  harness authors: the default clamp caps hp at max_hp (soft, NO minimum — hp
+  can go negative) and max_hp defaults to the spawn hp — so a bare `!ent add x
+  X 30 ...` caps hp at 30; raise max_hp first or your "hp write is broken"
+  repro is really the clamp working (this cost me a
   false lead this pass).
 
 - **Audit-pass-20 (hands-on): macro runaway backstops — two DoS/crash fixes
@@ -3427,6 +3500,389 @@ More shipped work (continuing the list above):
   after an undo — always RE-FETCH `mgr.matches[id]` after a restore/undo or
   you'll read the pre-undo object and think undo is broken. Two clean passes
   (14-15) in a row → the harness-testable engine core is solid.
+
+- **Audit-pass-29 (hands-on, broad): gate bypass, cross-guild access, Discord
+  rendering, undo (scenarios 570-575).** Started with a harness bug (scenarios
+  230/232/236 never ran — no blank line before their headers; the harness now
+  cross-checks header lines against parsed scenarios). Fixes:
+  - **Read-only subcommand downgrade was GLOBAL → gate bypass (HIGH).**
+    `READ_ONLY_SUBCOMMANDS` applied its words to EVERY host root, so for roots
+    whose args[0] is content (`batch`, `emit`, `eval`, `run`) a player's
+    `!batch list ; ent hp boss -40` ran unapproved. Now a per-root dict of the
+    read-only subs each handler really dispatches, plus a module-end assert
+    that every key is a registered command (570).
+  - **Cross-guild / global-state access (CRITICAL, user design calls).** See
+    §3 "Multi-tenant caveat" + "Disk access is confined to `saves/`":
+    admin-only bot-wide commands, target-host checks, `saves/` confinement
+    (572-574). Verified before the fix: token file readable via `!run`; one
+    guild's user opened `ent` to all in another guild's match via `!system
+    access`; `!match use <id>` gave an omniscient view of another guild's
+    fogged board.
+  - **Undo dropped the approval queue (MED).** `_restore_snapshot` builds a
+    fresh Match; `pending_requests`/`_request_seq` are runtime-only, so every
+    undo silently dropped queued player requests and restarted ids at r1 — a
+    Discord Approve button still on screen then resolved a DIFFERENT request.
+    Now carried across; `_ApprovalView._pop_own` also resolves by identity (571).
+  - **Repeated `!undo command 1` was stuck (MED).** `truncate_after` kept the
+    restored command snapshot (= the current state), so each later single undo
+    re-restored it while reporting "Undid 1 command(s)". Command snapshots are
+    now dropped on restore; round/turn ones stay (they mark a START) (575).
+  - **Command autosaves had no count cap (MED, user default 100).** The turn
+    window only prunes on turn advance, so a setup phase kept a full match
+    snapshot per command (600 tile edits → 16 MB). New rule
+    `autosave_command_retention_max` (575).
+  - **Discord colored maps (MED, Discord-only).** A 30×30 viewport with ~16
+    team-colored units is >2000 chars: `_split_for_discord` split INSIDE the
+    ```ansi fence (garbage on both halves) and an over-cap board edit raised,
+    silently DROPPING the auto-update board. Splitter is now fence-aware
+    (property-tested: size, balanced fences, content preserved, no empty
+    blocks); `_board_render` degrades (no color → no legend → a message naming
+    the viewport rules); `render_ascii` emits one ANSI code per same-color RUN
+    (a colored-terrain board 4478 → 2050 chars, cells decode identical); empty
+    messages are skipped at the send chokepoint (Discord rejects them).
+  - **Graphics canvas sizing (MED).** `render_match_png` rendered at full cell
+    size then downscaled (80×80: an 8000² intermediate, 3.2 s); the GUI had no
+    cap (40×40 at 4× zoom ≈ 1 GB). `sprite_render.fit_cell_size` sizes the
+    canvas to the pixel budget first (0.33 s); GUI caps at 8000 px and pins its
+    zoom readout.
+  - **Fog reveal records piled up (LOW-MED perf).** One record per
+    `!reveal_fog`; every fog check scans them (300 permanent → 166 ms per
+    60×60 render). Records sharing an expiry now merge (23 ms).
+  - **Undo vs channel bindings (MED, fog leak → gamerule, user call).** A
+    snapshot carries `bound_channels` (incl. each channel's `pov`), but
+    `MatchManager.active_by_channel` is not snapshotted. So undoing past a
+    `!match bind pov=red` left the players' channel ACTIVE on the match but
+    UNBOUND = omniscient: their `!map` showed the fogged board in full. New rule
+    `undo_channel_bindings_mode` (enum, default `keep`): `keep` = the live
+    bindings survive every undo (bindings are setup, not game state); `revert`
+    = restore the snapshot's bindings AND detach every channel bound now but not
+    in the snapshot (a channel unbound since the snapshot is re-bound, and
+    re-pointed only if it isn't showing another match); `confirm` = when the
+    bindings differ, refuse and list the differences. Every undo/restore accepts
+    a one-call `bindings=keep|revert` override. Core: `_restore_snapshot(...,
+    bindings, notes)` + `_resolve_bindings_mode` / `_binding_diff` in
+    vtt_commands.py (577).
+  - **Smaller fixes in the same pass (576 + probes).** `!log format` edits a
+    SHARED system template → admin-only; `!log clear` → host (was open to all).
+    `!run` nesting is bounded by `macro_recursion_limit` (a self-referencing file
+    recursed until Python's stack limit). Team passives are labelled as team
+    passives in failure warnings. `saves_path` treats a cross-drive path as
+    outside `saves/` instead of raising. Discord approval buttons disable
+    themselves and say so on timeout. `bot.py` names the file it really reads
+    (`1bot_token.txt`).
+  - **Player queries respect the channel POV (HIGH fog leak → gamerule, user
+    call).** `!ent info <hidden id>` printed the full card, `!dist` located
+    hidden units, `!find`/`!foreach` listed them, `!history diff` reported their
+    changes, and `!part/!mount/!action/!passive/!clamp/!mod/!schedule` reads
+    exposed them — while `!map`/`!list` hid them. New rule
+    `pov_filters_queries` (bool, default on): under a team POV (channel binding
+    or `!as view`), `_query_eid` makes a hidden entity read exactly like a
+    missing one ("Entity '<typed>' not found"), listings skip hidden rows
+    (`_pov_hides`), a hidden rider shows as `(unseen)` in `!mount list` (the
+    capacity figure stays true), `!ent info` renders a disguise's decoy card,
+    and `!history diff` is host-only while fog or entity_visibility_condition is
+    active. Your own team's units — a body part counts as its root body's team
+    — are never hidden (a hidden rider is still yours). Helpers `_query_pov` /
+    `_pov_hides` / `_query_eid` / `_acts_as_host` in vtt_commands.py. Also
+    `!part info` (full var JSON, the data `!ent dump` is host-gated for) left
+    READ_ONLY_SUBCOMMANDS — players keep `!part list` (579-580).
+  - **Formula resource bounds (HIGH, bot-wide DoS).** A formula's cost followed
+    its ARGUMENTS, and inline `$()` gives read-only formulas to every player:
+    `!dist $(9**9**9) 1 1 1` froze the bot for every guild, `'a'*10**10`
+    allocated 10 GB, and `cells_in_*` / `entities_in_rect/cone` / every sight
+    line (`has_los`, `raycast`, `entities_on_los`, ...) walked as many cells as
+    the arguments asked. `_ArithGuardTransformer` rewrites `** * + %` into
+    bounded `__safe_*` helpers before EVERY compile (ints capped at Python's
+    int-to-string digit limit, checked before computing; strings/lists at the
+    new `formula_size_limit`; `%` on a string rejected); new
+    `formula_cell_limit` caps geometry generation and `Match._check_line_budget`
+    caps sight lines. A fuzzer over every `_ALLOWED_FUNCS` +
+    `ARG_SAFE_MATCH_FUNCS` function with huge args finds nothing over 0.4 s.
+    NEW FORMULA FUNCTIONS whose cost scales with an argument need the same
+    budget (578).
+  - **Discord adapter (probe-verified with stubs).** `!<alias>` never worked on
+    Discord (only built-in roots are registered with discord.py; an alias died
+    as CommandNotFound) — `on_command_error` now routes aliases of the
+    channel's active match through `_dispatch`, ignoring other unknown `!words`
+    so other bots' commands draw no reply. `!map image` / image boards ran
+    `render_scene` in a worker thread while the event loop mutated the match
+    (and render_scene switches on the shared `_vision_memo`, which a race could
+    leave on for good) — the scene is now built on the loop (`scene_for_png`)
+    and only the pixels in the thread (`render_scene_png`). An auto-update board
+    kept refreshing after its channel was unbound, and unbound = omniscient, so
+    a team board re-posted the whole fogged map — it is now retired. Text
+    `!approve` ran the request in the HOST's channel (a player's `!match bind
+    pov=blue` re-bound the host channel) and the Approve button permanently
+    re-pointed the channel's active match — both now go through
+    `run_approved_request` (requester's channel, pointer restored).
+  - CLOSED (user: not a concern): with `random_seed` set, the seeded RNG's
+    position isn't in snapshots, so after an undo/restore the sequence restarts
+    from the seed. Leave it.
+
+- **Audit-pass-30 (hands-on, tool-driven): four reusable harnesses + fixes
+  (scenarios 579 ext, 581-593).** Techniques worth reusing (all throwaway
+  scripts, rebuild them from these descriptions):
+  1. **POV LEAK DETECTOR** — a fogged board with distinctively-named hidden
+     units (a part, a hidden rider, a corpse, an action, a status, a
+     schedule, a zone, a tile, team data), then EVERY registered root x
+     subcommand (from `registry._help[root]["subs"]`) x an argument pool run as
+     a red-POV player; replies grepped for the hidden names/values/cells after
+     stripping echoes of the typed args. ~136k invocations. Include list
+     KINDS (`commands`/`turns`) in the pool — the first version missed
+     `!history list commands` for lack of them.
+  2. **STATEFUL CHAOS** — ~70 command shapes (host + a red-POV player
+     context, undo/restore with bindings, transfer between two matches, ATB
+     toggling, disguises) on a rich board, asserting after EVERY step: no
+     dangling `part_of`/`mounted_on`/`__follows`/aura anchor, in-bounds
+     (coordinates are 1-BASED: `1 <= x <= grid_width`), turn cursor in range,
+     depth counters / vision memo / event stack at rest, JSON round-trip
+     idempotent, and manual saves never lost. Wrap every registry handler to
+     print the traceback of a non-VTTError. NOTE `!ent move <id> <n> <dir>`
+     (count first) but `!ent push <id> <dir> [n]`.
+  3. **FORMULA-FUNCTION FUZZER** — every `_ALLOWED_FUNCS`/`_MATCH_FUNC_NAMES`
+     name x wrong-typed / missing-entity / wrong-arity args under a 1 s
+     SIGALRM, classifying "Runtime error:" messages that are raw Python.
+  4. **COMMAND FUZZER** — every root x subcommand x a junk/ids/numbers/paths/
+     `$()` pool as HOST (~100k), flagging 💥 / Runtime / timeouts. Redirect
+     `vtt_commands.SAVES_DIR` to a temp dir first (it writes save files).
+  Also a MODEL-BASED undo test (random mutations + `undo command N`, checking
+  each lands on the recorded state N commands back, under retention caps
+  100/5/-1) — exact.
+  Fixes:
+  - **Failed action wiped the undo history (HIGH).** `action._rollback_match`
+    rebuilds the match from a pre-state taken WITHOUT history and copied the
+    empty `history` over the live one — every `fail()`/body exception AND
+    every interactive `choose()` replay deleted all autosaves and manual
+    saves. `history` is now preserved, and `_check_rollback_fields` raises if
+    any Match field is neither serialized nor preserved (the list went stale
+    twice) (584).
+  - **Despawn left the part subtree behind (HIGH, dangling-id class).**
+    `Entity.remove` (`!ent remove`, `!part remove`) didn't remove the body's
+    parts, leaving `part_of` naming a gone id (a later same-id entity would
+    inherit them). It now removes the subtree at the chokepoint (death and
+    transform already did). Removing or detaching a middle snake SEGMENT now
+    re-links the one behind it (`Match._splice_out_segment`); a detached
+    segment loses `__segment`/`__follows`; `copy_entity` drops a `__follows`
+    pointing outside the copied body; transform/revert keep the TARGET's own
+    segment linkage (`_SEGMENT_LINK_VARS` — a unit's place in a chain is
+    identity), and a stashed part that can't be re-placed on revert is
+    reported and the chain closes around it (581, 582, 586).
+  - **Crash replies after a lethal hook (MED).** `!ent move/push/pull`,
+    `!mount dismount`, `!ent transform/revert` looked the unit up after an
+    operation that can kill it (a lava tile's on_enter, a 0-hp transform) and
+    💥'd. AND `CommandRegistry.run` skipped the post-command bookkeeping on
+    both error branches, so a command that mutated then failed had no undo
+    entry of its own; the bookkeeping (which records only on a real state
+    change) now runs after errors too (582, 585).
+  - **More POV leaks (pov_filters_queries):** bare `!turn` listed hidden
+    units (now filtered like `!list`, disguise names; `!turn next` says "an
+    unseen unit's turn"), and `!log` / `!history list <kind>` reported hidden
+    units' events and verbatim command labels — now refused for non-hosts
+    while the view is fogged or filtered, via the shared
+    `_whole_board_read_blocked` (which also counts tile/zone/corpse visibility
+    conditions) (579).
+  - **Formula errors name the function (LOW).** `_cell_arg` for the sight
+    prims (no more "invalid literal for int()"), a radius check in
+    `entities_in_area`, `_runtime_msg` strips `FormulaEngine._namespace.
+    <locals>._` from arity errors, and a nameless summon template is named
+    after its minted id (was a bare "Runtime error: 'name'") (583).
+  - **`saves_path` refuses names Windows can't hold as files** (`:` = an NTFS
+    alternate data stream, CON/NUL/COM1…/LPT1… open DEVICES, `<>"|?*`,
+    trailing dots/spaces) (573 ext).
+  - **HOSTILE chaos mode** (the chaos harness with lethal global passives,
+    lava tiles and killing zones layered on) found the "unit removed
+    mid-operation" class, all fixed:
+    - `move_dirs` kept walking a mover a tile hook had killed (it returned
+      a log for a ghost). It now stops the moment the mover leaves
+      `m.entities` and skips the stop/moved hooks.
+    - `move_group_dirs` looked each member up with `entities[eid]` (KeyError
+      once one died) and fired stop hooks for dead members. Removed members
+      are now skipped (587).
+    - `damage_spread` routed shares to parts the cascade had already removed
+      (destroying a vital part kills the parent, which removes the siblings).
+      The whole blast rolled back. It now skips gone parts and stops when the
+      target itself is gone (588).
+    - In kill mode, `resize_grid` computed the off-grid set once, so a unit
+      that a death hook summoned into the cut region survived off-grid. It
+      now loops until nothing is off-grid (589).
+    - The `!turn next` / `!ent swap` replies say what happened when the
+      actor was removed by its own effects.
+  - **More POV:** `!map center <hidden id>` framed the camera on the hidden
+    unit, revealing its position. It now reads as "no entity" (579 ext).
+  - **Read-only forms of elevated commands.** ELEVATED_ARGS looked only at
+    args[0], so `!map layer list` / `!map teamcolor list` were queued for
+    approval with their mutating siblings. `_ELEVATED_READ_FORMS` names the
+    exact read forms that stay player-available (590).
+  - **Design calls the user made at the end of the pass (591-593):**
+    - **A unit that dies to its own turn-start effects passes the turn on.**
+      A dead unit can't hold the turn, so `Match._start_current_turn` (round
+      mode; the ATB loop does the same by charge bar) starts the next unit's
+      turn at once, logging "💀 `x` died at the start of its turn; the turn
+      passes to the next unit." The successor is the first unit after the
+      dead one in the order as it stood when its turn began; a wrap fires the
+      round hooks. Bounded by the order size. When nobody is left, `!turn
+      next` says so and shows the log (591).
+    - **A displaced located part goes to the nearest free cell** on
+      transform/revert, with a warning naming both cells; it is dropped only
+      when no cell fits. Placement is two-phase so a displaced part can't
+      take a later part's stored cell (586).
+    - **`segment_removal_mode` rule** (close default | cascade | split |
+      death; segment > head `__segment_removal_mode` > rule) decides what a
+      GM despawn of a snake segment does to the body. `!ent remove`, `!part
+      remove` and `remove_entity` go through `Match.despawn_entity`;
+      internal removals (head removal, death, transform, transfer) and `!part
+      detach` always close the chain (592).
+    - **`team_data_visibility` rule** (own default | all | host) filters
+      `!team list/get`; `!team get` is now player-available (593). `!log`
+      stays host-only under a hidden view (no per-line filtering).
+  - **`!match new <id> <name> <w> <h> <system>`** ignored the bare system
+    name and silently made a default-system match; scenarios 32/106/146/147
+    had never run under the systems they describe. The bare form now
+    selects the system; any other unknown argument is an error.
+
+- **Audit-pass-31 (hands-on): the scenario suite as a bug detector
+  (scenarios 594-595).** Technique worth reusing: list every `❌` / `⚠️`
+  reply and every "X → Y" figure in the Expected prose, and check each
+  against its scenario. Scenarios that "pass" while testing nothing hide
+  real bugs. Fixes:
+  - **Round 1 opened on the first-ADDED unit (HIGH).** `_rebuild_turn_order`
+    kept the pointer on the current unit even before the match started, so
+    whoever was added first took the first turn regardless of initiative
+    (scenario 168's prose even called it "the spawn-order quirk"). The
+    pointer now resets to the order's top until the first `!turn next`.
+    KNOWN LIMIT: a pre-start `!turn set` is lost if units are added
+    afterwards — set the opener last.
+  - **Killing the unit whose turn it is skipped the next unit (HIGH).**
+    Removal moved the pointer onto the successor; `!turn next` then fired
+    the successor's turn-end hooks and advanced past it. `Entity.remove` now
+    sets the serialized `Match.turn_vacated` ("same" | "wrap"); `next_turn`
+    skips the gone actor's turn-end and starts the successor without
+    advancing (wrapping the round if the dead unit was last);
+    `_start_current_turn`, ATB and `!turn set` consume/clear it (594).
+  - **`random_seed` ignored by `!roll` / `!table roll` / damage_spread**
+    until some formula happened to run (the seeded RNG was built lazily by
+    the formula engine). `Match.formula_rng()` is now the single accessor
+    for every caller, and the choice-replay RNG snapshot calls it too.
+  - **Silent failures in the command surface:** unknown subcommands printed
+    only help (`_help_fallback` now leads with "❌ `!x y` isn't a valid
+    command"); missing arguments did the same (now "is missing arguments");
+    mistyped `key=` options were dropped (`_check_options`: clamp, reveal_fog
+    `turns=`, store save, undo `bindings=`, bare `!map`, passive
+    `target=`/`scope=`); stray trailing words were dropped (`_check_tail` on
+    `!ent add/tp/hp/init/set_var` — an unquoted `hello world` stored
+    "hello"); 21 error replies lacked the ❌ prefix. New: `!match list`
+    (host-gated like bare `!match`, it lists every match bot-wide) and
+    `!match info` (this channel's match, player-available) (595).
+  - **Rotten scenarios repaired** (each "passed" while testing nothing):
+    removed subcommands (`!ent team`, `set_facing`, `list_vars`, `macro
+    def`, `turn start`), seeds set on systems that didn't exist, units
+    added before `!match use` or off-grid, value-less `set_var` used as a
+    read, a truncated scenario (107), stranded stages (13, 26), and prose
+    whose numbers were wrong (475, 545) or described the old turn order.
+  - **`name` is a reserved var path (user call, scenario 596).** A unit's
+    display name wasn't readable from formulas (`entity[x].name` errored).
+    `logic.RESERVED_VAR_PATHS` = x / y / name: entity FIELDS that read like
+    vars. `entity[x].name`, `var_get(x,'name')` and `var_has` read the real
+    name (`formula._read_entity_path`); `!find` predicates / `show:` /
+    `sort:` read the name SHOWN to the viewer's POV, so a disguise's decoy
+    name is what a fooled team searches by (`_entity_path_value`). No var
+    may exist at or under a reserved path: `Entity.write_var` refuses it
+    (`reserved_var_path_error`, pointing at `!ent rename` / `!ent tp`), as
+    do the formula writes and `!defvar add`. Renaming stays a command; a
+    formula can't rename. A nested read (`name.first`) is a ❌.
+  - Pre-start `!turn set` lost when units are added afterwards: the user
+    chose to keep this (set the opener last).
+
+- **Formula loops + list helpers, `!assert`, undo preview, `!map preview`
+  — SHIPPED (scenarios 597-608).** Five user-approved features.
+  - **`range` / `each` (597-598).** The for-loop only iterates a call to a
+    `_LOOPABLE_FUNCS` name, so counted loops and loops over a list held in a
+    local or a var were impossible. `range(stop)` / `range(start, stop[,
+    step])` (Python semantics, whole numbers only) and `each(value)` (a
+    list's items or a dict's keys) are loopable `_ALLOWED_FUNCS`, return
+    plain lists capped at `formula_size_limit` (the namespace binds the
+    match's value); iterations stay bounded by `formula_loop_limit`.
+  - **List helpers (599-600):** `sum`, `sorted(list, desc=False)`, `any`,
+    `all`, `count(list, value)` — pure, read-only (usable in `$()`). Lists
+    only (a dict error points at var_sum / var_keys); `x in lst` already
+    works for membership. A local named `count` / `sum` still shadows the
+    function as before. No subscripts: the smallest item is `min(lst)`.
+  - **`!assert [--as <eid>] "<formula>" [message]` (601-603).** Host-gated
+    like `!eval`; the formula passes the inline-`$()` read-only gate
+    (`validate_arg_safe`), so no mutation / `!func`s. False or unevaluable
+    → raises `AssertionStop` (a VTTError): the reply is `❌ Assertion
+    failed: ...`, and `dispatch_no_snapshot` returns the `ASSERT_STOP`
+    sentinel, which `!batch` / `!run` / `!foreach` / `!macro` (incl. nested
+    if/repeat blocks) check after each line, stop, report `⏹ <runner>
+    stopped: an assertion failed`, and RETURN the sentinel so an enclosing
+    runner stops too. In an action body, `cmd('assert ...')` (with `assert`
+    on action_cmd_allowlist) that fails raises ActionFail(reason="assert"),
+    rolling the action back.
+  - **Undo preview (604-605).** `preview` on any `!undo` / `!history undo`
+    form (turn / round / command / to round) shows the diff from the CURRENT
+    state to the snapshot it would restore, plus how many later autosaves
+    the undo would drop, and restores nothing (`_undo_preview`; host-only
+    under a fogged view like `!history diff`). The shared diff
+    (`_format_snapshot_diff`) had a real gap, fixed here: it looked for a
+    `position` key the entity dict never had (x / y), so `!history diff`
+    NEVER reported moves; it also ignored statuses, names, clamps,
+    part/mount links, tiles, zones, groups (a match-level dict — it read a
+    nonexistent per-entity field), match vars, team data and the turn.
+    Now all are reported, and every other changed top-level field is named
+    in an "Other changes" line (event_log excluded — it changes every
+    command).
+  - **`!map preview <burst|cone|line|rect> ...` (606-608).** Shows the cells
+    an area shape covers (same geometry as `cells_in_*`, bounded by
+    formula_cell_limit, clipped to the grid) and lists the visible units
+    inside (footprint-aware; glued / region parts and hidden riders
+    skipped). Points are `x y` or an entity id (its aoe origin — centre or
+    anchor per aoe_origin_mode); an id the channel can't see reads as
+    missing. Player-available (read-only, drawn under the channel POV).
+    ASCII (user call): cells showing a unit keep its glyph, every other
+    covered cell (terrain, zone, fog included) shows the `preview_glyph`
+    rule's character (`render_ascii(marks=, mark_glyph=)`; tracked via a
+    `unit_shown` set that the fog overlay clears); the legend says
+    "preview area". GRAPHICS (user call): translucent squares drawn ABOVE
+    units and fog — a scene `highlights` list [{cells, rgb, opacity}] drawn
+    last by `SceneRenderer._draw_highlight`; colour/opacity from the
+    `preview_color` (`r,g,b` / `#rrggbb`) / `preview_opacity` rules or
+    `color=` / `opacity=` args. Surfaces: Discord in image render mode
+    passes `highlights` to `post_scene_image`; gui.py's `GuiCtx.show_preview`
+    keeps them on the canvas until the next command; text surfaces get the
+    ASCII map.
+
+- **`!help find`, `max_grid_dimension`, `!match clone` — SHIPPED
+  (scenarios 609-612).** Three user-approved ideas.
+  - **`!help find <word> [word ...]` (609).** One search over every command,
+    subcommand (`registry._help`) and gamerule (RULES_REGISTRY): a hit needs
+    EVERY word in its name / usage / description (case-insensitive), name
+    hits list first, 15 per section (`_HELP_FIND_CAP`) then "…and N more".
+    A rule hit shows its current value on the channel's match (else the
+    built-in default). Player-available (`!help` is `all`; rule values are
+    already public via `!system info`). `!help find` with NO word is still
+    the help for the `!find` command. Only annotated subcommands are
+    searchable — `!map`'s subcommands live in its one description, so they
+    match as `!map`.
+  - **`max_grid_dimension` rule (610; resolves the pass-27 observation).**
+    Default 500, -1 = unlimited; `logic.check_grid_dimensions` refuses a
+    side over it in `MatchManager.create_match` (against the NEW match's
+    system rules) and `Match.resize_grid`. Clones and loaded saves aren't
+    re-checked. Same pass: `!match new` with a non-numeric width/height was
+    a 💥 (bare `int()`), now a clean ❌.
+  - **`!match clone <new_id> [name ...]` (611-612).** `MatchManager.
+    clone_match` = a `to_dict(include_history=False)` / `from_dict` round
+    trip under the new id (default name "<name> (copy)"), so the copy
+    shares nothing with the source — verified: every serialized field but
+    id / name / bound_channels is identical, on a board with a 2×2 vehicle
+    + rider, an anchored aura, a segment, statuses, a watcher, team data,
+    fog + reveals and an advanced turn. User calls: the channel STAYS on the
+    original (the reply names `!match use <new_id>`); the cloner becomes
+    owner, co-hosts and per-match access overrides are copied, and channel
+    bindings / per-channel camera / pending requests / undo history start
+    empty. My call on top (not asked): when a co-host clones, the source's
+    owner joins the copy's co-hosts, so every host of the original still
+    hosts the clone. Host-gated by the normal gate (it checks the channel's
+    match, which is the source).
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

@@ -178,6 +178,11 @@ class SceneRenderer:
             if in_window(f.get("x"), f.get("y")):
                 self._draw_fog(canvas, f, *px(f["x"], f["y"]))
 
+        # Highlights (`!map preview`): translucent squares over the covered
+        # cells, drawn last so they sit ABOVE units (and fog).
+        for hl in scene.get("highlights") or []:
+            self._draw_highlight(canvas, hl, ox, oy, cols, rows)
+
         return canvas
 
     # -- layers ----------------------------------------------------------
@@ -266,6 +271,25 @@ class SceneRenderer:
             overlay = Image.new("RGBA", (cell, cell), (10, 10, 14, a))
             canvas.alpha_composite(overlay, (x0, y0))
 
+    def _draw_highlight(self, canvas, hl, ox, oy, cols, rows):
+        """One highlight group: {cells: [[x, y], ...], rgb: [r, g, b],
+        opacity: 0-100} — a flat translucent square on every cell."""
+        cell = self.cell
+        try:
+            r, g, b = (max(0, min(255, int(c))) for c in hl.get("rgb", (255, 64, 64)))
+        except (TypeError, ValueError):
+            r, g, b = 255, 64, 64
+        a = max(0, min(255, int(max(0, min(100, int(hl.get("opacity", 40)))) / 100.0 * 255)))
+        overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+        d = ImageDraw.Draw(overlay)
+        for c in hl.get("cells") or []:
+            gx, gy = int(c[0]), int(c[1])
+            if not (ox <= gx <= ox + cols - 1 and oy <= gy <= oy + rows - 1):
+                continue
+            x0, y0 = (gx - ox) * cell, (gy - oy) * cell
+            d.rectangle([x0, y0, x0 + cell - 1, y0 + cell - 1], fill=(r, g, b, a))
+        canvas.alpha_composite(overlay)
+
     def _draw_borders(self, canvas, borders, ox, oy, cols, rows):
         cell = self.cell
         base_color = borders.get("color", "white")
@@ -290,6 +314,32 @@ class SceneRenderer:
         canvas.alpha_composite(overlay)
 
 
+def scene_dims(scene: Dict[str, Any]) -> Tuple[int, int]:
+    """(cols, rows) of cells a scene renders — the viewport window when one is
+    set, else the whole grid. Mirrors SceneRenderer.render's own sizing."""
+    vp = scene.get("viewport")
+    if isinstance(vp, dict):
+        cols, rows = vp.get("w", 1), vp.get("h", 1)
+    else:
+        cols, rows = scene.get("grid_width", 1), scene.get("grid_height", 1)
+    try:
+        return max(1, int(cols)), max(1, int(rows))
+    except (TypeError, ValueError):
+        return 1, 1
+
+
+def fit_cell_size(scene: Dict[str, Any], cell: int, max_dim: int) -> int:
+    """The largest cell size <= `cell` whose rendered image fits `max_dim`
+    pixels on its longest side (0 = no cap). Picked BEFORE rendering: the
+    canvas is cols*cell x rows*cell RGBA, so an 80x80 grid at the default
+    100 px would otherwise allocate an 8000x8000 (~256 MB) image just to be
+    downscaled — or, in the GUI at 4x zoom, far more."""
+    cell = max(1, int(cell))
+    if not max_dim:
+        return cell
+    return max(1, min(cell, int(max_dim) // max(scene_dims(scene))))
+
+
 # ----------------------------------------------------------------------------
 # Convenience: render a match straight to PNG bytes (for the Discord surface).
 # ----------------------------------------------------------------------------
@@ -301,7 +351,27 @@ def render_match_png(match, loader: "SpriteLoader",
     """Render `match`'s graphics scene to PNG bytes. cell_size defaults to the
     sprite_cell_size rule; the result is downscaled to fit `max_dim` on its
     longest side (0 = no cap) so a big board stays a reasonable attachment.
-    Raises RuntimeError if Pillow is unavailable."""
+    Raises RuntimeError if Pillow is unavailable.
+
+    Reads the live match, so call it on the thread that owns the match. To
+    keep the pixel work off an event loop, build the scene there with
+    `scene_for_png` and hand only the scene to `render_scene_png` in a worker
+    thread (see discord_commands)."""
+    scene, cell_size = scene_for_png(match, pov_team, viewport, cell_size,
+                                     max_dim)
+    return render_scene_png(scene, loader, cell_size, max_dim)
+
+
+def scene_for_png(match, pov_team: Optional[str] = None,
+                  viewport: Optional[Tuple[int, int, int, int]] = None,
+                  cell_size: Optional[int] = None,
+                  max_dim: int = 1600,
+                  highlights: Optional[list] = None) -> Tuple[Dict[str, Any], int]:
+    """(scene model, cell size) for a PNG render — the part that READS THE
+    MATCH. render_scene switches on the match's shared vision memo while it
+    runs, so running it in a worker thread while commands mutate the match
+    on the event loop could serve those commands stale sight (or leave the
+    memo switched on for good). Call this on the match's own thread."""
     if not _PIL_OK:
         raise RuntimeError("graphics rendering needs Pillow (pip install Pillow).")
     if cell_size is None:
@@ -310,7 +380,20 @@ def render_match_png(match, loader: "SpriteLoader",
         except (TypeError, ValueError):
             cell_size = 100
     scene = match.render_scene(pov_team=pov_team, viewport=viewport)
+    if highlights:
+        scene["highlights"] = highlights
+    return scene, fit_cell_size(scene, cell_size, max_dim)
+
+
+def render_scene_png(scene: Dict[str, Any], loader: "SpriteLoader",
+                     cell_size: int, max_dim: int = 1600) -> bytes:
+    """Draw an already-built scene model to PNG bytes. Touches only the scene
+    dict and the sprite loader — never the match — so it is safe to run in a
+    worker thread."""
+    if not _PIL_OK:
+        raise RuntimeError("graphics rendering needs Pillow (pip install Pillow).")
     img = SceneRenderer(loader, cell_size).render(scene)
+    # Safety net only: fit_cell_size already sized the canvas to the cap.
     if max_dim and max(img.size) > max_dim:
         scale = max_dim / float(max(img.size))
         img = img.resize((max(1, int(img.width * scale)),

@@ -22,9 +22,10 @@ SCENARIO 1 — Setup, formulas, and inline $() substitution
 !ent hp hero "$(entity[self].regen)"
 !eval "entity[hero].hp"
 
-Expected: list shows two entities; sum eval returns 55; min returns 25; the
-$(entity[this].hp * -1 + 5) expression damages Hero by 25 (HP 30 -> 5);
-$(entity[self].regen) then heals by 7 (HP 5 -> 12).
+Expected: list shows two entities, Rogue first (initiative 20 beats Hero's 10, so
+Rogue is the current unit, `this`). The sum eval returns 55; min returns 25.
+$(entity[this].hp * -1 + 5) reads Rogue's hp: -25 + 5 = -20, so Hero takes 20
+(HP 30 -> 10); $(entity[self].regen) then heals by 7 (HP 10 -> 17).
 
 
 SCENARIO 2 — Entity passives + hook firing
@@ -50,10 +51,10 @@ SCENARIO 2 — Entity passives + hook firing
 !passive remove hero regen
 !passive list hero
 
-Expected: stamina starts at 5. First !turn next fires on_round_start +
-on_turn_start (regen 5 -> 15). Second !turn next is Rogue's turn (no regen,
-still 15). Third !turn next is Hero again (15 -> 25). After remove, list
-reports no passives.
+Expected: stamina starts at 5. Rogue (initiative 20) opens round 1, so the first
+!turn next fires only Rogue's turn start (stamina stays 5). The second is
+Hero's turn (regen 5 -> 15). The third is Rogue's again (still 15). After
+remove, list reports no passives.
 
 
 SCENARIO 3 — Global passives + buggy passive isolation
@@ -77,10 +78,11 @@ SCENARIO 3 — Global passives + buggy passive isolation
 !passive remove hero broken
 !gpassive list
 
-Expected: First !turn next applies gas to both (Hero 30 -> 29, Rogue 25 ->
-24). The broken passive fires on Hero's next turn and shows a "CRASHED"
-log line, but Hero's hp is unaffected and the turn cycle continues
-normally. Final gpassive list reports none.
+Expected: First !turn next applies gas to both (Hero 30 -> 29, Rogue 25 -> 24);
+Rogue opens the round. The broken passive fires on Hero's turn (the second
+!turn next) and shows a "FAILED" log line, but Hero's hp is unaffected and the
+turn cycle continues normally. The third !turn next opens round 2 (gas again,
+Hero 28). Final gpassive list reports none.
 
 
 SCENARIO 4 — Custom entity_line_format
@@ -300,7 +302,7 @@ SCENARIO 12 — Var hooks: creation events fire at every level
 !passive add hero log_creates on_var_created target=inventory scope=deep "entity[self].create_log = entity[self].create_log + \"|\" + changed_key"
 !ent set_var hero create_log start
 !ent set_var hero inventory.gold_pouch.coins 50
-!ent set_var hero create_log
+!eval "entity[hero].create_log"
 
 Expected: After the !ent set_var to inventory.gold_pouch.coins, the
 create_log should read "start|inventory|inventory.gold_pouch|inventory.gold_pouch.coins"
@@ -320,9 +322,9 @@ SCENARIO 13 — Var hooks: changed only when value differs; removed bottom-up
 !ent set_var hero hp 20
 !ent set_var hero hp 20
 !ent set_var hero hp 5
-!ent set_var hero change_log
+!eval "entity[hero].change_log"
 
-Expected: change_log should be "start|30->20|20->5" — no change event
+Result: change_log should be "start|30->20|20->5" — no change event
 fires when the same value is written.
 
 !ent set_var hero inventory.spell.fire 10
@@ -330,10 +332,10 @@ fires when the same value is written.
 !passive add hero log_removes on_var_removed target=inventory scope=deep "entity[self].removal_log = entity[self].removal_log + \"|\" + changed_key"
 !ent set_var hero removal_log start
 !ent delete_var hero inventory.spell
-!ent set_var hero removal_log
+!eval "entity[hero].removal_log"
 
-Expected: removal_log reads "start|inventory.spell.fire|inventory.spell.ice|inventory.spell"
-- leaves first, then container (bottom-up).
+Expected: removal_log reads "start|inventory.spell.ice|inventory.spell.fire|inventory.spell"
+- leaves first (the most recently added first), then the container (bottom-up).
 
 
 SCENARIO 14 — Scope filtering: exact vs children vs deep
@@ -349,9 +351,9 @@ SCENARIO 14 — Scope filtering: exact vs children vs deep
 !ent set_var hero ch_log start
 !ent set_var hero dp_log start
 !ent set_var hero inventory.sword.damage 12
-!ent set_var hero ex_log
-!ent set_var hero ch_log
-!ent set_var hero dp_log
+!eval "entity[hero].ex_log"
+!eval "entity[hero].ch_log"
+!eval "entity[hero].dp_log"
 
 Expected:
 - ex_log = "start|inventory" (only the exact path)
@@ -370,7 +372,7 @@ SCENARIO 15 — on_var_written catch-all with hook_name discrimination
 !ent set_var hero mood happy
 !ent set_var hero mood angry
 !ent delete_var hero mood
-!ent set_var hero audit_log
+!eval "entity[hero].audit_log"
 
 Expected: audit_log reads "start|on_var_created|on_var_changed|on_var_removed"
 - the catch-all on_var_written fires alongside each kind, and hook_name
@@ -408,8 +410,6 @@ and the response includes a warning line beginning with "var-hook
 recursion limit (5) reached". The chain halts gracefully rather than
 hanging the bot.
 
-!system set default var_hook_recursion_limit 128
-
 
 SCENARIO 18 — Reactive passive: poison drains hp on item removal
 -----------------------------------------------------------------
@@ -437,9 +437,9 @@ SCENARIO 19 — Save/load preserves target/scope
 !ent add hero Hero 30 4 4 10
 !passive add hero spy on_var_created target=inventory scope=children "entity[self].spy_log = changed_key"
 !passive info hero spy
-!store save /tmp/m19_save.json
+!store save m19_save.json
 !match delete m19
-!store load /tmp/m19_save.json
+!store load m19_save.json
 !match use m19
 !passive info hero spy
 
@@ -458,7 +458,7 @@ SCENARIO 20 — Property setters route through chokepoint (no more limitation)
 !ent hp hero -5
 !ent hp hero 10
 !ent hp hero -8
-!ent set_var hero hp_audit_log
+!eval "entity[hero].hp_audit_log"
 
 Expected: hp_audit_log reads "start|30->25|25->30|30->22" — every !ent hp
 command fires on_var_changed via the property setter, which now routes
@@ -590,7 +590,7 @@ Stage A: on_var_changed catches heal-from-below clamping
 !ent hp hero 100
 !ent info hero
 
-Expected: hp goes from 5 toward 105 but the default soft clamp engages at
+Result: hp goes from 5 toward 105 but the default soft clamp engages at
 max_hp=30. The on_var_changed event fires with intended_value=105 and
 new_value=30, so overheal_changed = 75. This part works perfectly with
 just the existing hooks.
@@ -600,7 +600,7 @@ Stage B: the gap — heal at full HP produces NO on_var_changed event
 !ent hp hero 50
 !ent info hero
 
-Expected: hp stays at 30 (already at cap, soft clamp dormant from below
+Result: hp stays at 30 (already at cap, soft clamp dormant from below
 since old=30=cap, write 80 → clamped to 30 — but 30==30 means the diff is
 empty and on_var_changed does NOT fire). overheal_changed is still 75
 because the tracker never ran. So 50 wasted heal points went unrecorded.
@@ -615,11 +615,15 @@ Stage C: on_var_write_attempt closes the gap
 !ent info hero
 !ent hp hero 50
 !ent info hero
+!eval "entity[hero].overheal_attempt"
+!eval "entity[hero].overheal_changed"
 
 Expected: overheal_attempt = 75 + 50 = 125. The attempt hook fires for
 EVERY write to hp regardless of whether the diff produces a change event.
 The first heal (5 → clamped to 30) contributes 75; the second heal (30 →
-clamped to 30) contributes 50. The user sees the full 125 wasted points.
+clamped to 30) contributes 50. The user sees the full 125 wasted points. overheal_changed
+ends at 150: Stage C's heal from 5 was clamped too (+75), while the at-cap heal
+again recorded nothing.
 
 Why two hooks exist: on_var_changed says "the data actually changed,"
 on_var_write_attempt says "a write was attempted." Most game mechanics
@@ -709,10 +713,9 @@ SCENARIO 30 — Match info and deletion
 !match delete doomed
 !match list
 
-Expected: !match info shows the match's grid size, current system,
-turn order, and active entity. After !match delete, the match is gone
-from !match list. (Note: if the match was active in this channel, the
-channel no longer has an active match.)
+Expected: !match info summarises the channel's match: system, grid size, round,
+whose turn it is (not started yet), fog and owner. After !match delete, the
+match is gone from !match list (the channel no longer has an active match).
 
 
 SCENARIO 31 — Listing available systems and their rules
@@ -848,13 +851,13 @@ SCENARIO 39 — Entity facing direction
 !match use face39
 !ent add hero Hero 30 4 4 10
 !ent info hero
-!ent set_facing hero left
+!ent face hero left
 !ent info hero
-!ent set_facing hero down
+!ent face hero down
 !ent info hero
 
 Expected: Initial facing is set by spawn rules (typically toward map
-center). After !ent set_facing, the facing updates to the specified
+center). After !ent face, the facing updates to the specified
 direction (up/down/left/right).
 
 
@@ -884,8 +887,8 @@ SCENARIO 41 — Entity team assignment
 !match use team41
 !ent add ally Ally 30 1 1 10
 !ent add enemy Enemy 25 6 6 8
-!ent team ally blue
-!ent team enemy red
+!ent set_var ally team blue
+!ent set_var enemy team red
 !ent info ally
 !ent info enemy
 
@@ -917,12 +920,10 @@ SCENARIO 43 — Listing all vars on an entity
 !ent set_var hero mana 50
 !ent set_var hero inventory.gold 100
 !ent set_var hero inventory.gems 3
-!ent list_vars hero
 !ent dump hero
 
-Expected: !ent list_vars enumerates the top-level keys. !ent dump shows
-the full JSON tree including nested structure (inventory.gold,
-inventory.gems).
+Expected: !ent dump shows the full JSON tree including nested structure
+(inventory.gold, inventory.gems).
 
 
 ===============================================================================
@@ -1451,8 +1452,9 @@ Expected: Note this uses on_var_write_attempt because we want to react
 even when the resulting hp is unchanged. The passive doesn't actually
 prevent hp loss (that would need write modification, deferred). It just
 drains shield in parallel: first damage drops shield 20→5 and hp 30→15;
-second damage drops shield 5→0 and hp 15→0. For full damage prevention,
-wait for the damage system / write modification feature.
+second damage drops shield 5→0 and hp 15→0, which meets the default death
+condition — Hero dies and the last `!ent info` reports it not found. For full
+damage prevention, compose absorb_damage / shield pools instead.
 
 
 SCENARIO 71 — Cooldown timer on a special ability
@@ -1484,17 +1486,20 @@ SCENARIO 72 — Death save: when hp hits 0, roll a save (counter)
 !ent add hero Hero 30 3 3 10
 !ent set_var hero death_saves 0
 !ent set_var hero status_downed 0
+!ent set_var hero __death_mode replace
+!ent set_var hero __death_condition "entity[self].death_saves >= 3"
 !passive add hero on_dying on_var_changed target=hp scope=exact "if new_value <= 0 and entity[self].status_downed == 0:\n    entity[self].status_downed = 1\n    entity[self].hp = 0"
 !ent hp hero -50
 !ent info hero
 !ent hp hero -5
 !ent info hero
 
-Expected: First massive damage brings hp to 0 (it would have gone
-negative but the passive forces it to 0 and sets status_downed). Second
-damage: hp is already 0, the conditional doesn't trigger again
-(status_downed == 1). The GM can now adjudicate death-save rolls
-externally and write back to hp/status_downed.
+Expected: The hero's own death condition replaces the default (`__death_mode
+replace`, `__death_condition` = three failed saves), so hp 0 downs it without
+killing it. The massive damage would take hp to -20; the passive forces it to 0
+and sets status_downed. Second damage: status_downed is already 1, so the
+passive doesn't fire again and hp drops to -5. The GM adjudicates death-save
+rolls externally by writing death_saves; the third failure kills.
 
 
 SCENARIO 73 — Mana cost validation via formula in $()
@@ -1584,9 +1589,9 @@ SCENARIO 77 — Aura: global passive applies to every entity each round
 !ent add ally Ally 25 2 2 8
 !ent add enemy Enemy 30 5 5 12
 !gpassive add inspiring_aura on_round_start "if entity[self].team == \"blue\":\n    entity[self].morale_bonus = 2\nelse:\n    entity[self].morale_bonus = 0"
-!ent team hero blue
-!ent team ally blue
-!ent team enemy red
+!ent set_var hero team blue
+!ent set_var ally team blue
+!ent set_var enemy team red
 !turn next
 !ent info hero
 !ent info ally
@@ -1673,12 +1678,14 @@ SCENARIO 81 — Counter-attack: when you dodge, you hit back
 !turn next
 !list
 !ent set_var hero counter_damage 7
+!ent set_var hero last_dodge 0
 !passive add hero counter_strike on_var_changed target=last_dodge scope=exact "if new_value == 1:\n    entity[this].hp = entity[this].hp - entity[self].counter_damage\n    entity[self].last_dodge = 0"
 !ent set_var hero last_dodge 1
 !ent info foe
 
-Expected: When the GM signals a dodge by setting last_dodge=1, the
-passive fires: applies counter_damage to "this" (the current turn entity
+Expected: last_dodge starts at 0 (on_var_changed fires on a CHANGE, not on
+the var's creation, so the var has to exist first). When the GM signals a
+dodge by setting last_dodge=1, the passive fires: applies counter_damage to "this" (the current turn entity
 = foe), then resets last_dodge so the passive doesn't loop. Foe takes 7
 damage from the counter.
 
@@ -2053,7 +2060,7 @@ SCENARIO 102 — Conditional template section appears only when populated
 !match use tmpl102
 !ent add hero Hero 30 3 3 10
 !ent add ally Ally 25 5 5 8
-!ent team ally blue
+!ent set_var ally team blue
 !system set default entity_line_format "{name}{?team?} ({team}){/?}: {hp}hp"
 !list
 
@@ -2100,7 +2107,7 @@ SCENARIO 105 — Multi-line entity_info_format
 !ent set_var hero stats.str 14
 !system set default entity_info_format "**{name}** L{level}\nHP: {hp}/{max_hp}\nSTR: {stats.str}{?team?}\nTeam: {team}{/?}"
 !ent info hero
-!ent team hero blue
+!ent set_var hero team blue
 !ent info hero
 
 Expected: !ent info shows a 3-line card initially. After setting the
@@ -2133,7 +2140,14 @@ SCENARIO 107 — !ent dump shows everything regardless of template
 !match new dump107 Dump 6 6
 !match use dump107
 !ent add hero Hero 30 3 3 10
-!ent set_var her
+!ent set_var hero inventory.sword.damage 12
+!ent set_var hero secret 7
+!list
+!ent dump hero
+
+Expected: `!list` renders the entity_line_format template, which shows neither
+the inventory nor `secret`. `!ent dump` shows every var — the nested
+inventory.sword.damage = 12 and secret = 7 — whatever the template says.
 
 ===============================================================================
 SAVE/LOAD AND PERSISTENCE
@@ -2151,9 +2165,9 @@ SCENARIO 108 — Full match round-trip
 !passive add hero regen on_turn_start "entity[self].mana = entity[self].mana + 5"
 !clamp add hero mana max=100 mode=soft
 !turn next
-!store save /tmp/save108.json
+!store save save108.json
 !match delete save108
-!store load /tmp/save108.json
+!store load save108.json
 !match use save108
 !list
 !ent info hero
@@ -2172,9 +2186,9 @@ SCENARIO 109 — Save/load preserves global passives
 !match use save109
 !ent add hero Hero 30 3 3 10
 !gpassive add gas on_round_start "entity[self].hp = entity[self].hp - 1"
-!store save /tmp/save109.json
+!store save save109.json
 !match delete save109
-!store load /tmp/save109.json
+!store load save109.json
 !match use save109
 !gpassive list
 
@@ -2189,9 +2203,9 @@ SCENARIO 110 — Save/load preserves system-level clamps
 !ent add hero Hero 30 3 3 10
 !gclamp add mp max=100 min=0 mode=soft
 !gclamp list
-!store save /tmp/sl110.json
+!store save sl110.json
 !match delete sl110
-!store load /tmp/sl110.json
+!store load sl110.json
 !match use sl110
 !gclamp list
 
@@ -2208,10 +2222,10 @@ SCENARIO 111 — Saving multiple matches in one file
 !ent add a1 Alpha 30 1 1 10
 !match use m111b
 !ent add b1 Bravo 25 2 2 8
-!store save /tmp/multi111.json
+!store save multi111.json
 !match delete m111a
 !match delete m111b
-!store load /tmp/multi111.json
+!store load multi111.json
 !match list
 !match use m111a
 !list
@@ -2451,7 +2465,8 @@ SCENARIO 127 — String concatenation
 !match new str127 Strings 6 6
 !match use str127
 !ent add hero Hero 30 3 3 10
-!eval "\"Hello, \" + entity[hero].name"
+!ent set_var hero title Hero
+!eval "\"Hello, \" + entity[hero].title"
 
 Expected: Returns "Hello, Hero".
 
@@ -2603,9 +2618,9 @@ SCENARIO 135 — Heal-on-kill: when enemy hp hits 0, allies heal
 !match new hok135 HealKill 6 6
 !match use hok135
 !ent add hero Hero 30 1 1 10
-!ent team hero blue
+!ent set_var hero team blue
 !ent add foe Foe 20 5 5 20
-!ent team foe red
+!ent set_var foe team red
 !gpassive add heal_on_kill on_var_changed target=hp scope=exact "if new_value <= 0 and entity[self].team != entity[this].team and entity[this].team == \"blue\":\n    entity[this].hp = entity[this].hp + 5"
 !turn next
 !ent set_var hero hp 15
@@ -2613,13 +2628,13 @@ SCENARIO 135 — Heal-on-kill: when enemy hp hits 0, allies heal
 !ent info hero
 !ent info foe
 
-Expected: Foe is current (init=20). Hero damages foe; foe.hp drops to
--5 (or 0 depending on min clamp). The heal_on_kill global fires with
-self=foe and this=foe (since on_var_changed fires for the entity whose
-var changed, "this" is the current-turn entity)... actually wait, the
-intent here is to heal the OPPOSING team's ally. The model would need
-an attacker concept. For now this scenario demonstrates the conditional
-syntax but the actual mechanic needs the future damage system.
+Expected: Foe (initiative 20) opens the round, so `this` = foe. The global
+passive fires on each hp change, but in a var hook `self` is also the
+current-turn unit (foe), so `entity[self].team != entity[this].team` is never
+true and nobody is healed: Hero stays at 15, and the -25 kills Foe (its
+`!ent info` reports it not found). Healing the killer's allies needs an
+attacker binding, which var hooks don't carry; an on_death passive that reads
+the killer from a var the attack wrote is the composable route.
 
 
 SCENARIO 136 — Stack count with cap
@@ -2829,7 +2844,6 @@ SCENARIO 146 — Build a custom RPG system from scratch
 !system set dnd5e hp_var hp
 !system set dnd5e max_hp_var max_hp
 !system set dnd5e turnorder_var initiative
-!gclamp add hp max=max_hp mode=soft
 !system set dnd5e entity_line_format "{name} (L{level}) — HP:{hp}/{max_hp} AC:{ac}"
 !system set dnd5e entity_info_format "**{name}** Level {level} {class}\nHP: {hp}/{max_hp}\nAC: {ac}\nInit: {initiative}{?status_csv?}\nStatus: {status_csv}{/?}"
 !match new dnd1 Adventure 10 10 dnd5e
@@ -2948,8 +2962,8 @@ SCENARIO 151 — Demonstration of save/load equivalence
 !turn next
 !turn next
 !ent info hero
-!store save /tmp/eq151_before.json
-!store load /tmp/eq151_before.json
+!store save eq151_before.json
+!store load eq151_before.json
 !ent info hero
 
 Expected: !ent info before save and after load show identical state.
@@ -3369,15 +3383,13 @@ SCENARIO 168 — self_id/current_id and group-gated passive
 !eval "entity[b].sworn_tick"
 !eval "current_id()"
 
-Expected: B is in the 'sworn' group; the passive ticks on every
-B-turn. Turn order is [b, a] (B's init=11 > A's init=10) but the
-active index sticks to the first-spawned entity, so the cycle here
-runs A → B → A, with B ticking once and A's turns not firing the
-passive at all. sworn_tick is 1 after the three turn-nexts. After
-group_remove, the passive still fires on B's turn but group_has
-returns False, so the ternary contributes 0 — sworn_tick stays at 1.
-current_id() returns whichever entity's turn it is at the time of
-the eval; in the final call it's A.
+Expected: B is in the 'sworn' group; the passive ticks on every B-turn. Turn
+order is [b, a] (B's init=11 > A's init=10), and B opens round 1. The three
+turn-nexts run B → A → B, so sworn_tick is 2. After group_remove, the passive
+still fires on B's turn but group_has returns False, so the ternary
+contributes 0 — sworn_tick stays at 2 after A's and B's next turns.
+current_id() returns whichever entity's turn it is at the time of the eval; in
+the final call it's B.
 
 
 SCENARIO 169 — Autosaves, manual save, and silent command undo
@@ -3399,16 +3411,14 @@ SCENARIO 169 — Autosaves, manual save, and silent command undo
 !history undo command
 !ent info a
 
-Expected: Three turn-nexts open round 1 (A's turn) and advance into
-round 2 (B then A) thanks to the spawn-order quirk that puts A at
-active_index=1 initially. By that point the history holds 2 round
-snapshots and 3 turn snapshots. !ent hp -7 creates a command
-snapshot of the pre-damage state, then the manual save bookmarks
-the post-7-damage state. A second -7 brings A to 16 HP. !ent info
-is read-only — no extra command snapshot appears. !history list
-commands shows just the two -7 commands. `undo command` is below
-every confirmation threshold (default command threshold is -1 =
-never prompts), so it executes silently, reverting A back to 23 HP.
+Expected: Three turn-nexts open round 1 (B, initiative 11), then A, then
+round 2 (B). By that point the history holds 2 round snapshots and 3 turn
+snapshots. !ent hp -7 creates a command snapshot of the pre-damage state, then
+the manual save bookmarks the post-7-damage state. A second -7 brings A to 16
+HP. !ent info is read-only — no extra command snapshot appears. !history list
+commands shows just the two -7 commands. `undo command` is below every
+confirmation threshold (default command threshold is -1 = never prompts), so it
+executes silently, reverting A back to 23 HP.
 
 
 SCENARIO 170 — Confirmation thresholds for destructive undos
@@ -3474,14 +3484,13 @@ SCENARIO 171 — Retention pruning of turn autosaves
 !turn next
 !history list
 
-Expected: The first match uses default rules (turn retention = 3
-rounds). After 8 turn-nexts it's deep into round 5; the turn
-snapshot list spans only the most recent 3 rounds (rounds 3-5, so
-roughly 5 entries depending on how many turns each round held).
-Round snapshots are unlimited so all 5 are still there. The second
-match uses a custom system with autosave_turn_retention_rounds=1;
-after 4 turn-nexts only the current round's turn snapshots survive,
-demonstrating that the rule is per-system and per-match.
+Expected: The first match uses default rules (turn retention = 3 rounds).
+After 8 turn-nexts (B then A each round) it is in round 4; the turn snapshot
+list spans only the most recent 3 rounds (rounds 2-4, 6 entries). Round
+snapshots are unlimited so all 4 are still there. The second match uses a
+custom system with autosave_turn_retention_rounds=1; after 4 turn-nexts (round
+2) only the current round's 2 turn snapshots survive, demonstrating that the
+rule is per-system and per-match.
 
 
 SCENARIO 172 — Snapshot export and import as a manual save
@@ -3493,10 +3502,10 @@ SCENARIO 172 — Snapshot export and import as a manual save
 !turn next
 !history save checkpoint
 !ent hp a -10
-!history export manual:checkpoint /tmp/_hist_export_test.json
+!history export manual:checkpoint _hist_export_test.json
 !history delete checkpoint
 !history list manual
-!history import /tmp/_hist_export_test.json as restored
+!history import _hist_export_test.json as restored
 !history list manual
 !history restore restored confirm
 !ent info a
@@ -3522,14 +3531,14 @@ SCENARIO 173 — !store save with include_history round-trips autosaves
 !turn next
 !turn next
 !history save important
-!store save /tmp/_hist_store_no.json
-!store save /tmp/_hist_store_yes.json include_history=yes
+!store save _hist_store_no.json
+!store save _hist_store_yes.json include_history=yes
 !match delete mhist6
-!store load /tmp/_hist_store_no.json
+!store load _hist_store_no.json
 !match use mhist6
 !history list
 !match delete mhist6
-!store load /tmp/_hist_store_yes.json
+!store load _hist_store_yes.json
 !match use mhist6
 !history list
 
@@ -3727,35 +3736,23 @@ SCENARIO 177 — Friendly-fire damage aura via a team check inside a global pass
 !ent info archer
 !ent info goblin
 
-Expected: The `aura` global passive runs on_round_start, which fires
-for EVERY entity in turn-order (unlike on_turn_start which fires
-only for the entity whose turn just began). For each fire the
-formula inspects the team of the entity it's being applied to
-(entity[self].team) versus the team of whoever's turn it is right
-then (entity[this].team). When the teams differ the entity takes 5
-damage; when they match the formula evaluates to the entity's
+Expected: The `aura` global passive runs on_round_start, which fires for
+EVERY entity in turn-order (unlike on_turn_start which fires only for the
+entity whose turn just began). For each fire the formula inspects the team of
+the entity it's being applied to (entity[self].team) versus the team of
+whoever's turn it is right then (entity[this].team). When the teams differ the
+entity takes 5 damage; when they match the formula evaluates to the entity's
 current hp (a no-op write).
-
-Turn order is sorted by initiative descending: [Goblin (12), Archer
-(11), Knight (10)]. Match.active_index starts at the last-spawned
-entity, so the first turn-next opens round 1 with this=knight. The
-on_round_start hook fires once per entity:
-  - Goblin (horde) != knight (alliance) → Goblin loses 5
-  - Archer & Knight (alliance) == knight (alliance) → no damage
-After turn-next #1: Goblin 25/30, Archer 30/30, Knight 30/30.
-
-The next three turn-nexts advance through the turn cycle. Turn-next
-#2 wraps the active_index past the end, firing on_round_end /
-on_round_start for round 2 — and on this round this=goblin (the
-new round-opener). The aura fires again per entity:
+Turn order is sorted by initiative descending: [Goblin (12), Archer (11),
+Knight (10)], and Goblin opens each round, so `this` = goblin whenever the
+aura fires:
   - Knight & Archer (alliance) != goblin (horde) → each loses 5
   - Goblin (horde) == goblin → no damage
-Turn-nexts #3 and #4 stay inside round 2 (no wrap, no
-on_round_start), so the totals don't move further.
-After turn-next #4: Goblin 25/30, Archer 25/30, Knight 25/30 —
-exactly the symmetric cross-team damage you'd expect over the
-course of two rounds.
-
+After turn-next #1: Knight 25/30, Archer 25/30, Goblin 30/30. Turn-nexts #2
+and #3 stay inside round 1; #4 wraps into round 2 and the aura fires again the
+same way: Knight 20/30, Archer 20/30, Goblin 30/30. The damage is one-sided
+because the round opener is always the goblin — the aura keys on whoever holds
+the turn, so an "enemies of the current unit" aura favours the fastest side.
 This wouldn't have been expressible before — team was a Python-only
 dataclass field, invisible to the formula engine. Putting it in
 vars makes it a first-class part of the formula vocabulary, which
@@ -3927,9 +3924,9 @@ SCENARIO 181 — Tile data round-trips through !store save/load
 !tile set 2 2 glyph %
 !tile set 4 4 loot.gold 500
 !tile list
-!store save /tmp/_tile_store_test.json
+!store save _tile_store_test.json
 !match delete mtile3
-!store load /tmp/_tile_store_test.json
+!store load _tile_store_test.json
 !match use mtile3
 !tile list
 !tile info 2 2
@@ -5225,11 +5222,11 @@ SCENARIO 222 — Formula functions: persistence and deletion
 !func def triple x "x * 3"
 !func def viafn x "triple(x) + 1"
 !eval "viafn(10)"
-!store save /tmp/scenario222
+!store save scenario222
 !func del triple
 !eval "viafn(10)"
 !func list
-!store load /tmp/scenario222
+!store load scenario222
 !func list
 !eval "viafn(10)"
 
@@ -5502,6 +5499,7 @@ store the result: after `!turn next` fires the on_turn_start
 passive, `mage.threatened` = 2, confirmed by `!ent dump`. This is
 the headline composition win — "count of adjacent enemies" is now
 a one-liner usable anywhere a formula runs.
+
 SCENARIO 236 — !ent clone: multiple coordinate pairs auto-number copies
 ------------------------------------------------------------------------
 
@@ -5627,6 +5625,7 @@ WITHOUT skips_turn (or with skips_turn explicitly False) doesn't
 skip — adding "poisoned" to bob wouldn't matter unless poisoned
 also had skips_turn:true. SCENARIO 245 covers auto-clear of a
 skips_turn status via the status_tick mechanism.
+
 SCENARIO 232 — Dynamic entity[<expr>]: literal still works, expressions resolve
 --------------------------------------------------------------------------------
 
@@ -5699,7 +5698,7 @@ SCENARIO 234 — Seedable RNG: reproducible roll sequences
 !eval "random_int(1, 1000)"
 !eval "random_int(1, 1000)"
 !eval "random_int(1, 1000)"
-!system set default random_seed
+!system set default random_seed ""
 
 Expected: With the `random_seed` rule set to a non-empty value, the
 match's formula RNG becomes deterministic — each match seeded with
@@ -5708,7 +5707,7 @@ rolls in Seeded1 exactly match the three rolls in Seeded2
 (same seed "encounter42", same call order). The RNG advances across
 calls (the three rolls within a match differ from each other — it's
 a reproducible SEQUENCE, not a stuck value). The trailing
-`!system set default random_seed` with no value clears the seed
+`!system set default random_seed ""` (an empty value) clears the seed
 back to unseeded (independent rolls) so later scenarios aren't
 affected. (Test note: because the two matches share the same seed
 and the same number of prior rolls, their roll lists are equal —
@@ -5728,7 +5727,7 @@ SCENARIO 235 — Seedable RNG: random_string and reseeding on change
 !match use mseed4
 !eval "random_string('n', 's', 'e', 'w')"
 !eval "random_string('n', 's', 'e', 'w')"
-!system set default random_seed
+!system set default random_seed ""
 
 Expected: Seeding applies to `random_string` too — Seeded3 and
 Seeded4 (same seed "alpha", same call order) draw the same two
@@ -5737,6 +5736,7 @@ reproducible "random scatter" or "wandering monster" tables a GM
 can replay. The trailing empty `random_seed` restores unseeded
 behavior. (As in 234, the assertion is that the two matches'
 draw sequences are equal; the specific letters depend on the seed.)
+
 SCENARIO 230 — !tile place_random: scatter instances across empty cells
 ------------------------------------------------------------------------
 
@@ -6713,9 +6713,10 @@ SCENARIO 265 — !history diff between two command snapshots
 Expected: The diff names the two selectors and lists:
 entities added (ally), entities removed (foe), and entity changes
 for hero — vars.hp moved 30 -> 20 and vars.blessed was added
-(+ true). Round/active_index unchanged so those lines do not
-appear. Direction is `start -> end`; swapping the args would
-flip adds/removes.
+(+ true). The turn order line shows ['hero', 'foe'] -> ['hero',
+'ally']; the round and the current turn (hero) are unchanged, so
+those lines do not appear. Direction is `start -> end`; swapping
+the args would flip adds/removes.
 
 
 SCENARIO 266 — !find predicate AND queries (vars, status, group)
@@ -7179,10 +7180,10 @@ SCENARIO 282 — Action body locals + control flow + args proxy
 !action hero shoot target1 crit=true
 !ent dump target1
 
-Expected: First call: raw = 4 + 3 = 7, no crit branch -> hp
-drops 20 -> 13. Second call: raw = 7, crit branch doubles to
-14 -> hp drops 13 -> -1. This proves locals (`raw = ...`)
-work, control flow (`if args.crit: ...`) routes correctly, and
+Expected: First call: raw = 4 + 3 = 7, no crit branch -> hp drops 20 -> 13.
+Second call: raw = 7, crit branch doubles to 14 -> hp drops 13 -> -1, which
+kills target1 (the last `!ent dump` reports it not found). This proves locals
+(`raw = ...`) work, control flow (`if args.crit: ...`) routes correctly, and
 args.<key> attribute access reads through the ArgsProxy.
 
 
@@ -11551,7 +11552,7 @@ SCENARIO 451 — Status resistance / immunity: source-gated, level-reducing
 !eval "status_resist_of('knight', 'poison')"
 !status apply knight poison 5 4
 !eval "status_get('knight', 'poison', 'level')"
-!ent add squire Squire 30 7 7 5
+!ent add squire Squire 30 7 5 5
 !ent set_var squire equipped.ring.status_resist.poison 5
 !status apply squire poison 2 3
 !eval "status_has('squire', 'poison')"
@@ -12247,7 +12248,7 @@ Expected: the troll's leg has an `acid` DoT whose tick calls `damage_part(self,
 begins round 1; the second ends the troll's turn.) Ending the troll's
 turn ticks the leg (it shares the parent's clock); the leg's tick routes 4
 damage through the part-damage pipeline: with to_main_percent=100 the parent
-troll takes 4 (50→46) and the leg itself drops 25→21. This proves a status on a
+troll takes 4 (30→26) and the leg itself drops 25→21. This proves a status on a
 limb can both live on the limb and bleed into the main body.
 
 
@@ -13444,11 +13445,13 @@ SCENARIO 523 — A lethal status tick stops the entity's remaining statuses from
 !ent add other O 30 5 5 5
 !turn next
 !turn next
+!turn next
 !eval "var_get('w', 'marks')"
 
-Expected: Victim carries two turn_end statuses — `lethal` (applied first, so it
+Expected: All three share initiative 5, so the order is O, Victim, Wit (name
+tiebreak). Victim carries two turn_end statuses — `lethal` (applied first, so it
 ticks first) deals 999 and kills/removes Victim, and `marker` (would mark the
-witness). When Victim's turn_end fires, `lethal` removes it; `marker` must NOT
+witness). The third `!turn next` ends Victim's turn. When Victim's turn_end fires, `lethal` removes it; `marker` must NOT
 tick from beyond the grave, so the witness stays at marks=0. Before the fix
 fire_status_tick snapshotted only the status NAMES and never re-checked the
 entity still existed, so `marker` ghost-ticked on the removed entity (marks=1,
@@ -13827,9 +13830,10 @@ unaffected (the overlay emission is verified headlessly, not via `!map`).
 SCENARIO 536 — !roll: chat dice roller (total + individual dice)
 --------------------------------------------------------------------------------
 
-!match new rl Roll 6 6
-!match use rl
+!system new rl
 !system set rl random_seed 7
+!match new rl Roll 6 6 rl
+!match use rl
 !roll 2d6+3
 !roll d20
 !roll 4d6kh3
@@ -13874,10 +13878,10 @@ SCENARIO 538 — !find show/sort columns
 --------------------------------------------------------------------------------
 
 !match new fc FindCols 8 8
+!match use fc
 !ent add a Aaa 30 2 2 5
 !ent add b Bbb 30 4 4 5
 !ent add c Ccc 30 6 6 5
-!match use fc
 !ent set_var a team red
 !ent set_var b team red
 !ent set_var c team red
@@ -13897,14 +13901,15 @@ predicates are unaffected.
 SCENARIO 539 — Named random tables: !table def/roll/list/show + table_roll()
 --------------------------------------------------------------------------------
 
-!match new tb Tables 5 5
-!match use tb
+!system new tb
 !system set tb random_seed 4
+!match new tb Tables 5 5 tb
+!match use tb
 !table def loot sword:1,shield:1,gold:5
 !table roll loot
 !table list
 !table show loot
-!eval table_roll("loot")
+!eval "table_roll('loot')"
 !table def bad x:-1
 !table remove loot
 !table roll loot
@@ -13947,9 +13952,10 @@ active reveals; `clear` drops them. Reveals are per-team, serialized, host-gated
 SCENARIO 541 — Inline $() args: read-only math/dice/reads across commands
 --------------------------------------------------------------------------------
 
-!match new ia InlineArgs 12 12
-!match use ia
+!system new ia
 !system set ia random_seed 5
+!match new ia InlineArgs 12 12 ia
+!match use ia
 !ent add boss Boss 100 5 5 5
 !ent add goblin Goblin 30 6 6 5
 !dist $(2+3) $(1+1) 10 10
@@ -14005,20 +14011,21 @@ that makes inline args usable.
 SCENARIO 543 — Inline $() args: per-line in macro + ent self-handling
 --------------------------------------------------------------------------------
 
-!match new ml MacroArgs 10 10
-!match use ml
+!system new ml
 !system set ml random_seed 9
+!match new ml MacroArgs 10 10 ml
+!match use ml
 !ent add goblin Goblin 30 4 4 5
-!macro def zap ent hp $1 $(0-4)
+!macro set zap ent hp $1 $(0-4)
 !macro run zap goblin
-!macro def measure dist $(1+1) 1 5 5
+!macro set measure dist $(1+1) 1 5 5
 !macro run measure
 !batch dist $(2+2) 1 6 6 ; ent hp goblin $(0-1)
 
 Expected: `$(...)` resolves PER LINE inside a macro / batch (dispatch_no_snapshot
-applies the same read-only gate per sub-command). `!macro def zap ent hp $1
+applies the same read-only gate per sub-command). `!macro set zap ent hp $1
 $(0-4)` then `!macro run zap goblin` substitutes $1→goblin and the inner `ent hp
-goblin $(0-4)` runs (ent self-handles the $(): -4 damage). `!macro def measure
+goblin $(0-4)` runs (ent self-handles the $(): -4 damage). `!macro set measure
 dist $(1+1) 1 5 5` shows the dispatcher substituting a non-ent inner command's
 $() per run. `!batch ... ; ...` likewise substitutes each sub-command's $().
 ent stays raw_args (its own substitution), non-ent inner commands use the
@@ -14062,8 +14069,9 @@ SCENARIO 545 — Macro control flow: if / elif / else branching
 
 Expected: `if <formula>` / `elif <formula>` / `else` / `end` branch on a
 READ-ONLY formula (truthy = run that block; first matching branch wins). `heal`
-adds 1 when hp ≥ 10 (30 → 31) and adds 20 when hp < 10 (after `ent hp g -25` →
-6, then +20 → 26). `tier` is an elif chain: hp 26 → `tier=mid`. Conditions only
+adds 1 when hp ≥ 10 (30 → 30: the heal is capped at max_hp) and adds 20 when
+hp < 10 (after `ent hp g -25` → 5, then +20 → 25). `tier` is an elif chain: hp
+25 → `tier=mid`. Conditions only
 read state; a condition that mutates is rejected (see scenario 546).
 
 SCENARIO 546 — Macro control flow: read-only conditions + structure + clamp
@@ -14547,7 +14555,6 @@ SCENARIO 563 — snapshots copy turn_order (no retroactive corruption)
 !ent add a A 40 1 1 12
 !ent add b B 40 3 3 9
 !ent add c C 40 5 5 6
-!turn start
 !turn next
 !turn next
 !ent remove a
@@ -14770,3 +14777,1449 @@ ties break on the lower id so results are deterministic, and `''` comes back
 when nothing qualifies — so `b` (12 hp) and `c` (44 hp) here, and `''` for a var
 nobody has. Both are read-only and classified ARG_SAFE, so they work inside
 inline `$()` arguments.
+
+
+SCENARIO 570 — read-only downgrade is per-command: no `!batch list` bypass
+--------------------------------------------------------------------------------
+
+!match new rsg ReadOnlyScope 12 12
+!match use rsg
+!ent add boss Boss 50 1 1 12
+!table def loot gold:1
+!gpassive add alarm event:list "entity[boss].hp = entity[boss].hp - 7"
+!as player bob
+!batch list ; ent hp boss -40
+!emit list
+!foreach list ; ent hp boss -5
+!list
+!table roll loot
+!table list
+!match outcome
+!status list
+!zone list
+!ent info boss
+!as host
+!pending
+!ent info boss
+
+Expected: the player's `!batch list ; ent hp boss -40`, `!emit list`, and
+`!foreach list ; ...` are all HELD for host approval (`!pending` lists r1-r3),
+and `boss` still has 50 hp at the end. Before the fix, a read-only word as the
+FIRST argument (`list`, `info`, `roll`, `cells`, ...) downgraded ANY host-gated
+command to player-available, including roots whose first argument is free
+content rather than a subcommand — so the batch ran unapproved (40 damage) and
+the emit fired the `event:list` handler (7 more). The downgrade is now keyed per
+command (READ_ONLY_SUBCOMMANDS maps each root to the read-only subcommands its
+handler actually dispatches), so real reads stay player-available: `!list`,
+`!table roll loot`, `!table list`, `!match outcome`, `!status list`,
+`!zone list`, and `!ent info boss` all run directly for the player.
+
+
+SCENARIO 571 — the approval queue survives an undo (no silent drop, no id reuse)
+--------------------------------------------------------------------------------
+
+!match new uq UndoQueue 10 10
+!match use uq
+!ent add boss Boss 50 1 1 5
+!ent hp boss -5
+!as player bob
+!ent hp boss -1
+!as host
+!history undo command 1 confirm
+!pending
+!as player bob
+!ent hp boss -30
+!as host
+!pending
+!approve r1
+!ent info boss
+
+Expected: the undo reverts the host's `-5` (boss back to 50) but bob's queued
+request `r1` (`!ent hp boss -1`) is still pending afterwards. Bob's next request
+is numbered `r2`, NOT a second `r1`. Approving `r1` runs the ORIGINAL `-1`
+command, leaving boss at 49 with `r2` still queued. Before the fix the undo
+built a fresh Match whose runtime-only queue was empty and whose id counter
+restarted: the first `!pending` read "No pending requests", the next request
+reused `r1`, and `!approve r1` would have applied `-30`. On Discord that meant an
+Approve button still on screen for the OLD `r1` resolved the NEW request.
+
+
+SCENARIO 572 — bot-wide commands need a server administrator
+--------------------------------------------------------------------------------
+
+!as player bob
+!match new bobm BobsMatch 8 8
+!match use bobm
+!system set default fog_glyph x
+!batch system set default fog_glyph x
+!defvar add default fog_vision_radius 3
+!store save bobsave.json
+!run bobscript.txt
+!history save cp
+!history export manual:cp cp.json
+!system list
+!system rules default
+!defvar list default
+!as host
+!system set default fog_glyph x
+!system set default fog_glyph ?
+
+Expected: `bob` created and hosts `bobm`, but hosting a match is NOT enough
+for bot-wide state. `!system set`, `!defvar add`, `!store save`, `!run` and
+`!history export` all reply "Only a server administrator can do that" and
+change nothing — `!store`/`!run`/`history export` touch the host's disk, and
+system edits reach every match on that system in every server. Wrapping the
+edit in `!batch` doesn't help: the check also runs on the ungated inner-command
+path (batch / macro / foreach / run lines, action `cmd()`). The admin check is
+rejected outright (not queued — no match host could approve it). Per-match
+history (`!history save cp`) is still bob's to run as host. Read-only forms stay
+open: `!system list`, `!system rules default`, `!defvar list default`. Back as
+the owner identity (the harness's stand-in for a Discord guild Administrator;
+the CLI/GUI are always admin), `!system set default fog_glyph x` succeeds —
+directly, even though the channel's active match is bob's: bot-wide commands
+skip the per-match gate once the admin check passes, since they don't act on
+that match and its host shouldn't have to approve a system edit. The last line
+restores the default glyph so later scenarios aren't affected.
+
+
+SCENARIO 573 — file commands are confined to the saves/ folder
+--------------------------------------------------------------------------------
+
+!match new svm SavesMatch 6 6
+!match use svm
+!ent add hero Hero 20 1 1 5
+!store save ../escape.json
+!store save /etc/evil.json
+!store load "..\1bot_token.txt"
+!run ../1bot_token.txt
+!store save group:g
+!store save con.json
+!history save cp
+!history export manual:cp ../../cp.json
+!history export manual:cp campaign/cp.json
+!history import campaign/cp.json as back
+!store save campaign/session1.json
+!ent hp hero -5
+!store load campaign/session1.json
+!match use svm
+!ent info hero
+
+Expected: every path that leaves the `saves/` folder is refused before any
+file is touched — `..`, an absolute path, and a Windows-style `..\` all get
+"isn't allowed — use a plain file name". (The backslash form has to be quoted
+to reach the command at all: shlex drops an unquoted backslash, turning it into
+the harmless plain name `..1bot_token.txt`.) This is what stops `!run
+../1bot_token.txt` from echoing the bot token back line by line, and `!store
+save` from overwriting files on the host. Names Windows can't hold as files
+are refused too: `group:g` would write an NTFS alternate data stream and
+`con.json` opens the console DEVICE there. Plain names (subfolders allowed) work:
+a history snapshot exports to and imports from `saves/campaign/cp.json`, and
+`campaign/session1.json` saves and loads (hero back at 20 hp after the load).
+Replies name files as `saves/...`, never the host's absolute path. (The harness points saves/ at a throwaway temp folder.)
+
+
+SCENARIO 574 — commands that name another match need host rights on it
+--------------------------------------------------------------------------------
+
+!match new alice AliceCampaign 8 4
+!match use alice
+!match bind pov=red
+!match fog on
+!ent add scout Scout 10 1 1 5
+!ent set_var scout team red
+!ent add assassin Hidden 10 7 3 5
+!ent set_var assassin team blue
+!match unbind
+!as player mallory
+!match use alice
+!match bind alice
+!match rename alice Pwned
+!match delete alice
+!match new mal MalMatch 6 6
+!match use mal
+!ent add bot Bot 10 1 1 5
+!ent copy bot alice 2 2
+!ent transfer bot alice 2 2
+!ent info bot
+!match unbind
+!match
+!as host
+!match use alice
+!ent info assassin
+
+Expected: with no active match in the channel the access gate doesn't engage,
+so the TARGET check is what stops `mallory`: `!match use alice` / `!match bind
+alice` ("Only a host of `alice` can bind a channel to it"), `!match rename
+alice` and `!match delete alice` ("Only the owner of `alice` can delete it") are
+all refused. Before the fix `use` bound her channel with an unset
+(omniscient) POV — a full view of Alice's fogged board, hidden assassin
+included — and `delete` removed another person's match. Mallory can still
+create and use her OWN match, but `!ent copy`/`!ent transfer` into `alice` is
+refused ("Only a host of `alice` can copy or transfer entities into it"), so
+`bot` stays in `mal`. After Mallory unbinds her channel, the bare `!match`
+listing still shows `AliceCampaign` (not renamed, not deleted), and the owner
+can `use` it again and find the assassin untouched.
+
+
+SCENARIO 575 — command undo: count cap + repeated single-step undo
+--------------------------------------------------------------------------------
+
+!system set default autosave_command_retention_max 3
+!match new ucm UndoCap 6 6
+!match use ucm
+!ent add boss Boss 50 1 1 5
+!ent hp boss -1
+!ent hp boss -2
+!ent hp boss -4
+!ent hp boss -8
+!history list commands
+!undo command 1 confirm
+!ent info boss
+!undo command 1 confirm
+!ent info boss
+!undo command 1 confirm
+!ent info boss
+!undo command 1 confirm
+!system set default autosave_command_retention_max 100
+
+Expected: `autosave_command_retention_max` caps command autosaves by COUNT on
+top of the turn window (default 100; here 3), so after five mutating commands
+only the last 3 pre-command snapshots are listed — without the cap a setup phase
+before the first `!turn next` kept one full match snapshot per command. Repeated
+single-step undos walk back ONE command each: boss 35 -> 43 -> 47 -> 49. Before
+the fix the restored command snapshot stayed in the list (it IS the current
+state after the undo), so every later `!undo command 1` re-restored it — a silent
+no-op still reporting "Undid 1 command(s)" — and boss stayed at 43. The fourth
+undo reports that no command snapshot is left. The last line restores the
+default so later scenarios aren't affected.
+
+
+SCENARIO 576 — !log: players read, host clears, admin edits templates
+--------------------------------------------------------------------------------
+
+!match new lgm LogGate 6 6
+!match use lgm
+!ent add a A 10 1 1 5
+!ent hp a -3
+!as player mallory
+!log
+!log format
+!log format hp_changed PWNED
+!log clear
+!as host
+!log
+!pending
+
+Expected: `!log` is open to everyone for READING — the player sees both entries
+(spawn + 3 damage) and can list the templates with bare `!log format`. Writing
+is not: `!log format hp_changed PWNED` is refused ("Only a server
+administrator") because templates live on the shared GAME SYSTEM and refresh
+into every match on it, and `!log clear` wipes the match's log, so it's
+host-gated like any mutation — held for approval (request `r1` in `!pending`).
+Back as the host, the log still has both entries. Before the fix `!log` was
+access `all` with no elevation, so the player's two commands overwrote the
+system-wide `hp_changed` template and emptied the log.
+
+
+SCENARIO 577 — Undo and channel bindings: keep / confirm / revert
+--------------------------------------------------------------------------------
+
+!match new ubm UndoBind 6 3
+!match use ubm
+!match fog on
+!ent add scout S 10 1 1 5
+!ent set_var scout team red
+!ent add ghost G 10 6 3 5
+!ent set_var ghost team blue
+!match bind pov=red
+!ent hp scout -1
+!undo command 2
+!match channels
+!map
+!system set default undo_channel_bindings_mode confirm
+!match bind pov=blue
+!undo command 1
+!match channels
+!undo command 1 bindings=revert
+!match channels
+!undo command 1 bindings=sideways
+!system set default undo_channel_bindings_mode keep
+
+Expected: a snapshot carries the match's channel bindings, but a channel's
+active pointer lives outside the match, so restoring the snapshot's bindings
+would leave a channel bound since then still showing the match, unbound —
+omniscient. Under the default `keep`, undoing past `!match bind pov=red` keeps
+the binding: `!match channels` still lists `CLI` with POV red and `!map` stays
+fogged (the blue ghost at 6,3 is hidden). With the rule set to `confirm`,
+undoing past `!match bind pov=blue` refuses and lists the difference (`CLI`: now
+POV blue, POV red in the snapshot), and nothing is restored (still POV blue).
+Re-running with `bindings=revert` restores the snapshot's POV red. A bad
+`bindings=` value is rejected. The last line restores the default.
+
+
+SCENARIO 578 — Formula resource limits: big ints, repetition, cell budgets
+--------------------------------------------------------------------------------
+
+!match new lim Limits 10 10
+!match use lim
+!ent add a A 10 1 1 5
+!eval "2**10 + 3*4"
+!eval "'ab' * 3 + 'c'"
+!eval "len(cells_in_rect(0, 0, 9, 9))"
+!as player mallory
+!dist $(9**9**9) 1 1 1
+!dist $(len([0]*10**9)) 1 1 1
+!dist $(len(cells_in_rect(0,0,10**6,10**6))) 1 1 1
+!dist $(has_los(0,0,0,10**8)) 1 1 1
+!as host
+!eval "pow(10, 5000)"
+!eval "len('a' * 10**10)"
+!eval "'%099999d' % 1"
+!eval "len(cells_in_rect(0, 0, 999, 999))"
+!system set default formula_cell_limit 1000000
+!eval "len(cells_in_rect(0, 0, 999, 999))"
+!system set default formula_cell_limit 100000
+
+Expected: ordinary arithmetic is untouched (1036, 'abababc', 100 cells). A
+formula's cost used to follow its ARGUMENTS without bound, and inline `$()` args
+hand read-only formulas to every player: `!dist $(9**9**9) 1 1 1` computed a
+370-million-digit integer (hours, blocking the event loop for every server) and
+`'a'*10**10` tried to allocate 10 GB (`[0]*10**9`, 8 GB). Now each is refused at once: integers are
+capped at the digits Python can still print and save (4300), `*`/`+` string/list
+building at `formula_size_limit` (100000), `%` string formatting is rejected (a
+'%099999d' width is another allocation bomb), and every geometry query —
+cells_in_burst/_rect/_cone/_line, entities_in_rect/_cone, and the sight-line
+walkers (has_los, raycast, first_opaque, entities_on_los, ...) — at
+`formula_cell_limit` (100000 cells). A 1000x1000 rect (1,000,000 cells) is
+refused by default and allowed after raising the rule; the last line restores
+the default. HARNESS-ALLOWS-ERRORS (the sight-line refusal surfaces as a
+wrapped Runtime error).
+
+
+SCENARIO 579 — Queries respect the channel POV (pov_filters_queries)
+--------------------------------------------------------------------------------
+
+!match new pq PovQueries 12 12
+!match use pq
+!match fog on
+!ent add scout S 10 1 1 5
+!ent set_var scout team red
+!ent set_var scout fog_vision_radius 3
+!ent add ghost Ghost 30 10 10 5
+!ent set_var ghost team blue
+!ent add wall Wall 40 4 3 5
+!ent set_var wall team blue
+!ent set_var wall footprint_w 3
+!ent add jeep Jeep 20 2 2 5
+!ent set_var jeep team red
+!ent set_var jeep slots.seat.capacity 2
+!ent add pilot Pilot 10 2 3 5
+!ent set_var pilot team red
+!ent add spy Spy 10 3 3 5
+!ent set_var spy team blue
+!mount pilot jeep seat
+!mount spy jeep seat
+!history save s0
+!ent hp ghost -5
+!match bind pov=red
+!as player bob
+!list
+!ent info ghost
+!ent info wall
+!ent info pilot
+!ent info spy
+!find hp>0
+!dist scout ghost
+!mount list jeep
+!mount info jeep
+!foreach hp>0 ; ent info $id
+!map center ghost
+!history diff manual:s0 latest:command
+!history list commands
+!history list
+!turn
+!log
+!as host
+!system set default pov_filters_queries false
+!as player bob
+!ent info ghost
+!find hp>0
+!as host
+!system set default pov_filters_queries true
+
+Expected: with the channel bound `pov=red` and fog on, the red scout sees 3 cells
+around (1,1). Player queries now hide what the red map hides: `!ent info ghost`
+and `!dist scout ghost` say "Entity 'ghost' not found" (the same message as a
+truly missing id), `!find hp>0` lists only scout, wall, jeep and pilot, and the
+read-only `!foreach` sweep runs `ent info` for those four only. `!map center
+ghost` answers "no entity" (on a map big enough for the viewport it would
+otherwise frame the ghost's location). The 3-wide blue
+wall at (4,3)-(6,3) is visible because one of its cells is in sight (any
+footprint cell counts). Riders tucked inside the jeep are hidden from the map,
+but your OWN team's units are never hidden from you: `!ent info pilot` shows the
+red pilot, while the blue spy riding in the same jeep is "not found";
+`!mount list jeep` shows `pilot, (unseen)` with capacity 2/2 still true, and
+`!mount info jeep` lists only the pilot. `!history diff`, `!history list
+commands` and `!log` are refused for the player (they report every unit's
+changes, the ghost's hp loss included — the autosave labels quote each command
+verbatim), while the bare `!history list` summary (counts only) still works, and bare `!turn` lists only the units the red view can see. With pov_filters_queries off,
+queries are omniscient again (ghost's card, ghost in `!find`); the last line
+restores the default.
+
+
+SCENARIO 580 — Disguise in !ent info; !part info is host-only
+--------------------------------------------------------------------------------
+
+!match new pd PovDisguise 10 10
+!match use pd
+!ent add scout S 10 1 1 5
+!ent set_var scout team red
+!ent add mimic Mimic 30 3 1 5
+!ent set_var mimic team blue
+!ent set_var mimic disguise.name Barrel
+!ent set_var mimic disguise.vars.hp 1
+!part add mimic mjaw Jaw 5 5
+!match bind pov=red
+!as player bob
+!ent info mimic
+!part list mimic
+!part info mjaw
+!as host
+!as view omniscient
+!ent info mimic
+!approve r1
+!as view clear
+
+Expected: no fog here, so the blue mimic is visible to the red channel — but it
+wears a disguise, and `!ent info` now shows the red POV what the map and roster
+show: the decoy card ("Barrel", hp 1). `!part list mimic` still lists the jaw
+(hp + knobs). `!part info` is no longer player-available: it prints the part's
+full var JSON, the same data `!ent dump` is host-gated to hide, so the player's
+request is queued (r1). The host previewing the omniscient view sees the real
+"Mimic" card and approves the queued `!part info`, which then runs.
+
+
+SCENARIO 581 — Removing a body removes its parts; segments re-link on remove/detach
+--------------------------------------------------------------------------------
+
+!match new rp RemoveParts 12 6
+!match use rp
+!ent add ogre Ogre 40 2 2 5
+!ent set_var ogre footprint_w 2
+!part add ogre ohead Head 10 10
+!part add ohead ohorn Horn 3 3
+!ent remove ogre
+!list
+!find hp>0
+!ent add worm Worm 40 8 2 5
+!part segment worm w1 Seg 5 5
+!part segment worm w2 Seg 5 5
+!part segment worm w3 Seg 5 5
+!ent remove w2
+!eval "var_get('w3', '__follows')"
+!part detach w1
+!eval "var_get('w3', '__follows')"
+!eval "var_has('w1', '__follows')"
+!ent move worm 2 down
+!eval "str(entity[w3].x) + ',' + str(entity[w3].y)"
+
+Expected: removing the 2-wide ogre also removes its head and the horn attached
+to the head (the whole part subtree, as death and transform already did) —
+`!list` / `!find` show neither. Before the fix both stayed behind with `part_of`
+naming the removed id, and would have become limbs of any later entity called
+`ogre`. For the worm (w1 → w2 → w3), removing the middle segment w2 re-links w3
+to follow w1 (`'w1'`); detaching w1 then re-links w3 to the head (`'worm'`) and
+w1 stops being a segment (`False` — no `__follows`), standing free on the map.
+Moving the head 2 down from (8,2) drags w3 along the closed chain into
+the cell the head just left (8,3).
+
+
+SCENARIO 582 — Transform keeps the target's own snake linkage; dying on transform
+--------------------------------------------------------------------------------
+
+!match new tl TransformLinks 12 6
+!match use tl
+!ent add worm Worm 40 8 2 5
+!part segment worm w1 Seg 5 5
+!ent add bob Bob 10 2 4 5
+!ent transform bob w1 stash
+!eval "var_has('bob', '__follows')"
+!eval "var_get('w1', '__follows')"
+!ent add ogre Ogre 30 4 2 5
+!part add ogre arm Arm 5 5
+!ent hp arm -5
+!part detach arm
+!ent transform arm ogre stash
+!list
+
+Expected: transforming Bob into a copy of the segment w1 gives him w1's stats
+but not w1's place in the worm — his place in a snake chain is identity, like
+his id/position/team — so `var_has('bob', '__follows')` is False (before the
+fix he claimed to follow `worm` without being part of it), and w1 still follows
+`worm`. The ogre's arm is knocked to 0 hp (a part never dies by itself) and
+detached, leaving a 0-hp free entity; transforming it into the ogre keeps its
+hp fraction (percent mode: 0), so the death check removes it as the swap
+settles. The reply now says it "transformed …, then died in its new form" —
+before, looking up the removed entity crashed the command (💥 'arm').
+
+
+SCENARIO 583 — Formula errors name the function; nameless summon templates work
+--------------------------------------------------------------------------------
+
+!match new fe FormulaErrors 10 10
+!match use fe
+!ent add a A 10 1 1 5
+!eval "has_los(1, 1, 'x', 2)"
+!eval "can_see('a', 'up', 3)"
+!eval "entities_in_area(3, 3, 'far')"
+!eval "slot_capacity()"
+!ent set_var a tmpl.vars.hp 5
+!ent set_var a tmpl.vars.max_hp 5
+!eval "summon(var_get('a', 'tmpl'), 4, 4)"
+!list
+
+Expected: bad arguments to the sight functions name the function and the
+argument ("has_los(...): x2 must be a number, got str ('x')", "can_see(...): x
+must be a number…", "entities_in_area(...): n (the radius) must be a number")
+where they used to surface Python's "invalid literal for int() with base 10" or
+"'<=' not supported between instances". A wrong-arity call reads
+"slot_capacity() missing 2 required positional arguments" instead of the
+private "FormulaEngine._namespace.<locals>._slot_capacity()". A summon template
+with no `name` used to fail with a bare "Runtime error: 'name'"; it now spawns,
+named after its minted id (`summon`). HARNESS-ALLOWS-ERRORS (the arity case is
+reported as a Runtime error by design).
+
+
+SCENARIO 584 — A failed action keeps the undo history
+--------------------------------------------------------------------------------
+
+!match new fh FailHistory 8 8
+!match use fh
+!ent add a A 50 1 1 5
+!ent add b B 50 3 3 5
+!history save keep
+!ent hp a -1
+!ent hp a -1
+!ent set_var b actions.nope.body "entity[a].hp = entity[a].hp - 7\nfail('no')"
+!ent set_var b actions.nope.target none
+!action b nope
+!history list manual
+!history list commands
+!undo command 5
+!ent info a
+
+Expected: the failing action rolls back its own -7 (a stays at 48) and — the
+fix — leaves the match's undo history alone. Before, the rollback rebuilt the
+match from a pre-state taken WITHOUT history and copied the empty history over
+the live one: the manual save `keep` and every command/turn/round autosave
+vanished on any `fail()` or body exception (and on every interactive
+`choose()` replay, which rolls back the same way). Now `keep` is still listed,
+the command autosaves are intact, and `!undo command 5` walks back through the
+failed action, both set_vars and both hp changes to a at 50. action.py also
+gained a drift guard (checked on the first rollback) that raises if a Match
+field is neither serialized nor preserved by the rollback.
+
+
+SCENARIO 585 — Moving onto a lethal tile: the move/push/pull replies survive
+--------------------------------------------------------------------------------
+
+!match new lv Lava 10 10
+!match use lv
+!tile hook add 3 1 on_enter "entity[self].hp = 0"
+!tile hook add 3 5 on_enter "entity[self].hp = 0"
+!tile hook add 6 1 on_enter "entity[self].hp = 0"
+!ent add a A 10 1 1 5
+!ent move a 3 right
+!ent add b B 10 3 3 5
+!ent push b down 3
+!ent add p P 10 8 1 5
+!ent pull p 1 1 3
+!list
+!undo command 1
+!list
+
+Expected: each unit's path crosses a tile whose on_enter hook sets hp to 0.
+The death pipeline removes it mid-path (the corpse lies on the lava cell — A at
+(3,1), B at (3,5), P at (6,1) — and it moves no further), and the reply now
+says it "was removed on the way". Before, the move/push/pull replies looked the
+unit up after the move and crashed (💥 'a'), and because a crash reply skips
+the post-command bookkeeping the command got no undo entry of its own. Now
+`!undo command 1` reverts the pull, bringing P back alive at (8,1).
+
+
+SCENARIO 586 — Revert with a segment's cell taken: nearest free cell, else dropped
+--------------------------------------------------------------------------------
+
+!match new rv RevertSeg 12 6
+!match use rv
+!ent add worm Worm 40 8 2 5
+!part segment worm w1 Seg 5 5
+!part segment worm w2 Seg 5 5
+!ent add hero Hero 20 2 4 5
+!ent transform worm hero stash
+!ent add rock Rock 5 8 1 5
+!ent revert worm stash
+!eval entity[w1].x
+!eval "var_get('w2', '__follows')"
+!match new rf RevertFull 5 1
+!match use rf
+!ent add worm Worm 40 1 1 5
+!part segment worm w1 Seg 5 5
+!part segment worm w2 Seg 5 5
+!ent add hero Hero 20 5 1 5
+!ent transform worm hero stash
+!ent add r2 Rock 5 2 1 5
+!ent add r3 Rock 5 3 1 5
+!ent add r4 Rock 5 4 1 5
+!ent revert worm stash
+!eval "has_part('worm', 'w1')"
+
+Expected: w1 (at 8,1) and w2 (at 7,1) are segments of the worm. Transforming
+the worm into a copy of Hero despawns them; a rock then takes w1's old cell.
+Reverting restores the worm and its segments from the stash. w1 can't return
+to its occupied cell, so it goes to the nearest free cell and the reply says
+so ("part `w1` couldn't return to (8,1) …; placed at (9,1)"). w2 still follows
+w1. In the second match (a 5×1 strip) rocks fill every cell the segments could
+use, so the revert drops both with a warning ("couldn't be restored … —
+dropped") and the worm comes back without them.
+
+
+SCENARIO 587 — A unit killed mid-path stops; group moves survive a removed member
+--------------------------------------------------------------------------------
+
+!match new gs GhostSteps 10 10
+!match use gs
+!match var set trips 0
+!tile hook add 2 1 on_enter "entity[self].hp = 0"
+!tile hook add 3 1 on_enter "match_var_set('trips', match_var_get('trips') + 1)"
+!tile hook add 4 1 on_enter "match_var_set('trips', match_var_get('trips') + 1)"
+!ent add a A 10 1 1 5
+!ent move a 4 right
+!match var get trips
+!ent add g1 G 10 1 3 5
+!ent add g2 G 10 1 4 5
+!ent group new grp
+!ent group add grp g1
+!ent group add grp g2
+!tile hook add 2 3 on_enter "remove_entity('g2')"
+!ent move group:grp 1 right
+!list
+
+Expected: A's first step lands on a lethal tile and the death pipeline takes
+it; its remaining steps no longer run, so the two counter tiles further along
+never fire (`trips` = 0). Before, the loop kept walking the detached unit and
+fired every remaining cell's hooks for it (trips = 2 — a corpse tripping traps
+down the path). In the group move, g1's step onto (2,3) removes g2 before g2
+moves; the commit loop now skips the missing member (it used to crash with 💥
+'g2'), and g1 ends at (2,3).
+
+
+SCENARIO 588 — A blast that destroys a vital part completes (no rollback)
+--------------------------------------------------------------------------------
+
+!match new ds DeadlySpread 10 10
+!match use ds
+!ent add troll Troll 40 5 5 5
+!part add troll head Head 5 5
+!part add troll legs Legs 5 5
+!ent set_var head vital true
+!ent add mage Mage 10 1 1 5
+!ent set_var mage actions.blast.body "damage_spread(target, 20, 'uniform')\ncmd('ent info mage')"
+!ent set_var mage actions.blast.target entity
+!action mage blast troll
+!list
+
+Expected: the 20-point blast splits across the troll's two parts (10 each, in
+id order: head first). Destroying the vital head runs the troll through the
+death pipeline, which removes its parts — so the legs' share has nothing left
+to hit and is skipped. The action completes (its `cmd()` echo runs) and the
+troll is a corpse. Before, the legs' share raised "Entity 'legs' not found",
+failing the action — and the action's transactional rollback UNDID the kill.
+
+
+SCENARIO 589 — Resize in kill mode also catches units its death hooks summon
+--------------------------------------------------------------------------------
+
+!match new rk ResizeKill 10 10
+!match use rk
+!system set default map_resize_shrink_mode kill
+!ent add hero Hero 10 1 1 5
+!ent add ghoul Ghoul 10 10 10 5
+!ent set_var hero tmpl.vars.hp 3
+!ent set_var hero tmpl.vars.max_hp 3
+!ent set_var hero tmpl.name Spawn
+!gpassive add spawnling on_death "if self_id() == 'ghoul':\n    summon(var_get('hero', 'tmpl'), 9, 2)"
+!map resize 8 8
+!list
+!system set default map_resize_shrink_mode block
+
+Expected: shrinking 10x10 to 8x8 cuts the ghoul at (10,10), so kill mode kills
+it — and its on_death hook summons a Spawn at (9,2), also outside the new grid.
+The kill phase now repeats until nothing would be cut, so the Spawn is killed
+too (the reply lists `ghoul`, `spawn`) and every surviving unit is on the grid;
+before, the Spawn appeared after the cut list was taken and was left at (9,2)
+on an 8x8 map. Only Hero remains alive. The last line restores the default.
+
+
+SCENARIO 590 — Players can read the map layer / team-color settings
+--------------------------------------------------------------------------------
+
+!match new ml MapLists 8 8
+!match use ml
+!map teamcolor red red
+!map layer zones off
+!as player bob
+!map layer list
+!map teamcolor list
+!map layer zones on
+!as host
+!pending
+
+Expected: `!map layer list` and `!map teamcolor list` only show settings, so a
+player gets them directly (zones hidden; red → red). Before, elevation looked
+only at the first argument, so these read forms were held for host approval
+along with their mutating siblings. Changing a setting (`!map layer zones on`)
+is still host-gated: the player's request queues, and the host sees it as
+`r1` in `!pending`.
+
+
+SCENARIO 591 — A unit that dies at its turn start passes the turn on
+--------------------------------------------------------------------------------
+
+!match new ds DeathStart 10 10
+!match use ds
+!ent add a A 10 1 1 30
+!ent add b B 10 2 1 20
+!ent add c C 10 3 1 10
+!passive add b doom on_turn_start "entity[self].hp = 0"
+!passive add c wake on_turn_start "entity[self].woke = 1"
+!turn next
+!turn next
+!eval entity[c].woke
+!turn next
+!passive add a doom on_turn_start "entity[self].hp = 0"
+!turn next
+!turn next
+!turn
+!match_toplevel
+
+Expected: Round 1 opens on A. The second `!turn next` reaches B, whose
+on_turn_start passive kills it; a dead unit can't hold the turn, so the reply
+reads "💀 `b` died at the start of its turn; the turn passes to the next unit."
+and it is now C's turn, with C's own on_turn_start fired (`woke` = 1). Before,
+the cursor landed on C without firing C's turn start. The next `!turn next`
+wraps to round 2 and A. A then gets the same doom passive. The fourth
+`!turn next` goes A → C, and the fifth wraps to round 3 and A. A dies at its
+turn start, and C is the next unit, so it is C's turn in round 3. The order
+now holds only C.
+
+
+SCENARIO 592 — segment_removal_mode: what despawning a middle segment does
+--------------------------------------------------------------------------------
+
+!match new sr SegRemove 20 12
+!match use sr
+!ent add worm Worm 40 6 2 5
+!ent set_var worm footprint_w 2
+!ent set_var worm footprint_h 2
+!part segment worm s1 Seg 5 5
+!part segment worm s2 Seg 5 5
+!part segment worm s3 Seg 5 5
+!ent remove s1
+!eval "var_get('s2', '__follows')"
+!ent add wb WormB 40 6 6 5
+!part segment wb b1 Seg 5 5
+!part segment wb b2 Seg 5 5
+!part segment wb b3 Seg 5 5
+!ent set_var wb __segment_removal_mode cascade
+!part remove b1
+!eval "has_part('wb', 'b2')"
+!ent add wc WormC 40 6 10 5
+!part segment wc c1 Seg 5 5
+!part segment wc c2 Seg 5 5
+!part segment wc c3 Seg 5 5
+!ent set_var wc __segment_removal_mode death
+!ent set_var wc __segment_death_mode split
+!eval "remove_entity('c1')"
+!eval "part_of('c2')"
+!eval "var_get('c3', '__follows')"
+!list
+
+Expected: Each worm has three segments trailing a head. Worm is a 2×2 head.
+Under the default `close`, removing s1 closes the chain: s2 now follows the
+head (`'worm'`) and s3 still follows s2. WormB's `__segment_removal_mode` is
+`cascade`, so `!part remove b1` also removes b2 and b3 ("`wb` severed at `b1`:
+3 segment(s) destroyed.") and `has_part('wb','b2')` is False. WormC uses
+`death`, which follows its segment_death_mode, `split`. remove_entity('c1')
+promotes c2 to an independent head: `part_of('c2')` is `''` and c3 now follows
+c2. The roster shows c2 as its own unit, with c3 as its part.
+
+
+SCENARIO 593 — team_data_visibility: players read their own team's data
+--------------------------------------------------------------------------------
+
+!match new td TeamData 8 8
+!match use td
+!team set red supply 3
+!team set blue supply 9
+!as player bob
+!as view red
+!team list
+!team get red supply
+!team get blue supply
+!team list blue
+!as view omniscient
+!team get blue supply
+!as host
+!system new tvhost
+!system set tvhost team_data_visibility host
+!match new th TeamHost 8 8 tvhost
+!match use th
+!team set red supply 3
+!as player bob
+!as view red
+!team list
+!team get red supply
+!as host
+!team get red supply
+
+Expected: Under the default `own`, a player previewing red's view sees only
+red in `!team list`, reads red's supply (3), and is refused blue's ("team
+`blue`'s data is hidden from this channel") by both `get` and `list blue`.
+`!team get` is now player-available (it used to queue for approval). From an
+omniscient view the player reads blue's supply (9). On a match whose system
+sets `host`, the player's `!team list` says team data is host-only and `get`
+is refused; the host reads red's supply.
+
+
+SCENARIO 594 — Turn order: the fastest unit opens; a unit killed on its turn doesn't cost the next one theirs
+--------------------------------------------------------------------------------
+
+!match new to TurnOpen 8 8
+!match use to
+!ent add slow Slow 10 1 1 5
+!ent add fast Fast 10 2 1 30
+!ent add mid Mid 10 3 1 15
+!gpassive add ended on_turn_end "entity[self].ends = var_get(self_id(), 'ends', 0) + 1"
+!turn next
+!ent hp fast -99
+!turn next
+!eval "var_get('mid', 'ends', 0)"
+!turn next
+!ent hp slow -99
+!turn next
+!match_toplevel
+
+Expected: Slow is added first, but Fast (initiative 30) opens round 1 — the
+order's top. Before, the pointer stayed on whichever unit was added first, so
+Slow took the first turn. Fast is killed during its own turn. The next
+`!turn next` goes to Mid (the unit after Fast), and Mid's on_turn_end has not
+fired (`ends` = 0). Before, the removal shifted the pointer onto Mid and the
+advance then skipped it: Mid's turn-end fired although it never acted, and Slow
+got the turn. Mid's turn then passes to Slow. Slow dies during its turn, and it
+was last in the round, so the next `!turn next` wraps: round 2 opens with Mid.
+
+
+SCENARIO 595 — Mistyped options and subcommands are errors, not silent no-ops
+--------------------------------------------------------------------------------
+
+!match new ty Typos 8 8
+!match use ty
+!ent add x X 10 2 2 5
+!reveal_fog red all turn=2
+!clamp add x mana max=10 mod=hard
+!store save typo.json include_histroy=yes
+!map legnd=on
+!map pna up
+!zone add z 1 1 2 2
+!passive add x p on_var_changed scop=exact "entity[self].hp = 1"
+!ent team x red
+!ent move x 1 sideways
+!ent set_var x note hello world
+!ent add y Y 10 3 3 5 team=red
+!ent set_var x note "hello world"
+!match list
+!match info
+!reveal_fog red all turns=2
+!clamp add x mana max=10 mode=hard
+
+Expected: HARNESS-ALLOWS-ERRORS. Each mistyped form now fails with a ❌ that
+names the problem, where it used to be dropped silently: `turn=` (a temporary
+reveal would have gone permanent), `mod=` (the clamp would have stayed soft),
+`include_histroy=` (the save would have left out history), `legnd=`, a
+mistyped `!map` subcommand (it used to draw the map), `!zone add` with a
+rectangle's worth of coordinates (it used to add one cell and ignore the rest),
+a mistyped passive option (it used to fail as a formula "Syntax error"), a
+removed subcommand (`!ent team` used to print help as if it had worked), and an
+unknown direction (the reply now carries the ❌), an unquoted value with a
+space (`!ent set_var x note hello world` used to store just "hello"), and an
+option `!ent add` doesn't take (`team=red` used to be dropped). The quoted
+value then stores "hello world". `!match list` and `!match
+info` work. The correctly-spelled reveal and clamp succeed.
+
+
+SCENARIO 596 — `name` is a reserved var path: formulas and !find read the display name
+---------------------------------------------------------------------------------------
+
+!match new nm596 Names 8 6
+!match use nm596
+!ent add hero Hero 30 3 3 10
+!ent add spy Assassin 30 5 3 5
+!ent set_var hero team blue
+!ent set_var spy team red
+!ent set_var spy disguise.name Villager
+!eval "\"Hello, \" + entity[hero].name"
+!eval "var_get('spy', 'name') + '/' + str(var_has('spy', 'name'))"
+!eval "var_get('hero', 'x') + var_get('hero', 'y')"
+!ent rename hero Robert
+!eval "entity[hero].name"
+!find name=Robert show:x
+!find sort:name show:name
+!as view blue
+!find name=Villager
+!find name=Assassin
+!as view omniscient
+!ent set_var hero name Bob
+!ent set_var hero name.first Bob
+!ent set_var hero x 4
+!eval "var_set('hero', 'name', 'Bob')"
+!eval "entity[hero].name.first"
+!defvar add name Nobody
+!eval "entity[hero].name"
+
+Expected: HARNESS-ALLOWS-ERRORS. `entity[hero].name` reads the display name, so
+the first eval returns "Hello, Hero". `var_get`/`var_has` treat the reserved
+paths the same way: "Assassin/True" (a formula reads the REAL name, disguise or
+not), and `var_get('hero','x') + var_get('hero','y')` = 6. After `!ent rename
+hero Robert` the read returns "Robert". `!find name=Robert show:x` matches Robert
+with `[x=3]`; `sort:name` orders Assassin before Robert and shows each name.
+Under the blue view the spy's disguise applies to searches too: `name=Villager`
+finds it and `name=Assassin` finds nothing. Every write under `name` or `x` is
+refused with a ❌ naming the fix (`!ent rename` / `!ent tp`): the two `name`
+set_vars, the `x` set_var and `var_set`. Reading a field under `name` is a ❌
+(a name has no fields), and `!defvar add name ...` is refused (a reserved path
+can't have a default). The final read still returns "Robert".
+
+
+SCENARIO 597 — range(): counted loops in formulas (a three-shot volley)
+------------------------------------------------------------------------
+
+!match new rg597 Ranges 8 6
+!match use rg597
+!ent add archer Archer 30 1 1 10
+!ent add dummy Dummy 50 5 1 5
+!ent set_var dummy max_hp 50
+!ent set_var archer actions.volley.target entity
+!ent set_var archer actions.volley.body "for i in range(3):\n    entity[target].hp = entity[target].hp - 4\nentity[self].shots = len(range(3))"
+!action archer volley dummy
+!assert "entity[dummy].hp == 38" three hits of 4
+!assert "entity[archer].shots == 3"
+!ent set_var archer actions.countdown.target none
+!ent set_var archer actions.countdown.body "for k in range(10, 0, -3):\n    entity[self].log = entity[self].log + [k]"
+!eval "entity[archer].log = []"
+!action archer countdown
+!eval "entity[archer].log"
+!eval "range(2, 5)"
+!eval "range(5, 2)"
+!eval "range(10**9)"
+!eval "range(1, 5, 0)"
+!eval "range(2.5)"
+!ent set_var archer actions.spin.target none
+!ent set_var archer actions.spin.body "t = 0\nfor i in range(20000):\n    t = t + 1"
+!action archer spin
+
+Expected: HARNESS-ALLOWS-ERRORS. `for i in range(3)` runs the volley body
+three times, so the dummy drops 50 -> 38, and `len(range(3))` stores 3 —
+both asserts pass. `range(10, 0, -3)` counts down: the countdown action
+appends 10, 7, 4, 1 to the archer's `log` list. `range(2, 5)` = [2, 3, 4];
+`range(5, 2)` is empty. `range(10**9)` is refused (over the
+formula_size_limit of 100000), a 0 step is refused, and a fractional count
+is refused (whole numbers only). A body that loops 20000 times fails on the
+formula_loop_limit (10000), so the spin action rolls back.
+
+
+SCENARIO 598 — each(): iterate a list var, a local list, or a dict's keys
+-------------------------------------------------------------------------
+
+!match new ea598 Each 8 6
+!match use ea598
+!ent add hero Hero 30 1 1 10
+!ent add a A 20 3 1 5
+!ent add b B 20 4 1 5
+!ent add c C 20 5 1 5
+!eval "entity[hero].marks = ['a', 'c']"
+!ent set_var hero actions.mark_hit.target none
+!ent set_var hero actions.mark_hit.body "for eid in each(entity[self].marks):\n    entity[eid].hp = entity[eid].hp - 6"
+!action hero mark_hit
+!assert "entity[a].hp == 14 and entity[b].hp == 20 and entity[c].hp == 14" marked units hit, b untouched
+!ent set_var hero bag.rope 1
+!ent set_var hero bag.torch 3
+!ent set_var hero bag.coin 12
+!ent set_var hero actions.tally.target none
+!ent set_var hero actions.tally.body "total = 0\nnames = []\nfor k in each(entity[self].bag):\n    total = total + var_get(self_id(), 'bag.' + k)\n    names = names + [k]\nentity[self].bag_total = total\nentity[self].bag_names = names"
+!action hero tally
+!assert "entity[hero].bag_total == 16"
+!eval "entity[hero].bag_names"
+!ent set_var hero actions.pairs.target none
+!ent set_var hero actions.pairs.body "pts = [[1, 2], [3, 4]]\nacc = 0\nfor (px, py) in each(pts):\n    acc = acc + px * py\nentity[self].acc = acc"
+!action hero pairs
+!assert "entity[hero].acc == 14"
+!eval "each(5)"
+!eval "each('abc')"
+
+Expected: HARNESS-ALLOWS-ERRORS. `each(entity[self].marks)` walks the list
+held in the `marks` var, so a and c drop 20 -> 14 and b stays at 20. `each`
+over the `bag` dict walks its keys in insertion order: the tally totals
+1 + 3 + 12 = 16 and records ['rope', 'torch', 'coin']. A local list of
+pairs unpacks into `(px, py)`: 1*2 + 3*4 = 14. All asserts pass. `each` on a
+number or a string is refused ("expected a list or a dict").
+
+
+SCENARIO 599 — List helpers: sum, sorted, any, all, count
+----------------------------------------------------------
+
+!match new lh599 Lists 8 6
+!match use lh599
+!ent add hero Hero 30 1 1 10
+!eval "sum([1, 2, 3.5])"
+!eval "sum([])"
+!eval "sorted([3, 1, 2])"
+!eval "sorted(['orc', 'elf', 'dwarf'], True)"
+!eval "any([0, '', 1])"
+!eval "all([1, True, 'x'])"
+!eval "all([])"
+!eval "count(['hit', 'miss', 'hit'], 'hit')"
+!eval "3 in [1, 2, 3]"
+!dist $(sum([1,1])) 1 $(count([5,5,5],5)) 1
+!eval "sum(['a'])"
+!eval "sorted([1, 'a'])"
+!eval "sum({'a': 1})"
+!eval "count(5, 1)"
+
+Expected: HARNESS-ALLOWS-ERRORS. sum → 6.5 (0 for an empty list); sorted
+→ [1, 2, 3] and, descending, ['orc', 'elf', 'dwarf']; any → True; all →
+True (and True for an empty list); count → 2. Membership needs no helper:
+`3 in [1, 2, 3]` → True. The helpers are read-only, so they work inside
+inline `$()` args: `!dist $(sum([1,1])) 1 $(count([5,5,5],5)) 1` measures
+(2,1) → (3,1) = 1. Refused: sum of a non-number, sorted over mixed numbers
+and strings, sum of a dict (the error points at var_sum / var_keys), and
+count on a non-list.
+
+
+SCENARIO 600 — List helpers in real use: a focus-fire action over a mixed board
+--------------------------------------------------------------------------------
+
+!match new ff600 FocusFire 10 8
+!match use ff600
+!ent add mage Mage 30 2 4 10
+!ent set_var mage team blue
+!ent add ogre Ogre 40 4 3 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent set_var ogre team red
+!ent add imp Imp 8 3 6 5
+!ent set_var imp team red
+!ent add rat Rat 12 1 1 5
+!ent set_var rat team red
+!ent add far Far 5 9 8 5
+!ent set_var far team red
+!ent set_var mage actions.focus.target none
+!ent set_var mage actions.focus.body "foes = entities_within(self, 2, 'square_radius', 'hostile')\nhps = []\nlow = []\nfor f in each(foes):\n    hps = hps + [entity[f].hp]\n    low = low + [entity[f].hp <= 10]\nentity[self].seen = len(foes)\nentity[self].pool = sum(hps)\nentity[self].order = sorted(hps)\nentity[self].weak = count(low, True)\nentity[self].any_weak = any(low)\nentity[self].all_weak = all(low)\nweakest = lowest_var(foes, 'hp')\nentity[weakest].hp = entity[weakest].hp - min(hps)"
+!action mage focus
+!assert "entity[mage].seen == 2" ogre (2x2, nearest cell 2 away) and imp; rat and far are out of range
+!assert "entity[mage].pool == 48"
+!assert "entity[mage].order == [8, 40]"
+!assert "entity[mage].weak == 1 and entity[mage].any_weak and not entity[mage].all_weak"
+!assert "has_corpse('imp') and entity[ogre].hp == 40" the weakest in range died; the ogre is untouched
+!list
+
+Expected: The focus action gathers the hostile units within 2 cells
+(footprint-aware: the 2×2 ogre anchored at (4,3) is 2 cells from the mage
+at (2,4) — its left column is 2 away; the imp at (3,6) is 2 away; the rat
+at (1,1) is 3 away and `far` is far off). It loops them with `each`,
+collecting hp into a list: sum = 40 + 8 = 48, sorted = [8, 40], one of
+them has hp <= 10 (any True, all False). It then hits the weakest
+(`lowest_var`, the imp) for the smallest hp in the list, so the imp
+dies and `!list` no longer shows it alive. (The sandbox has no
+subscripts, so the smallest value is `min(hps)` — the first item of
+`sorted(hps)` read another way.) Every assert passes.
+
+
+SCENARIO 601 — !assert: pass, fail, --as, and the read-only gate
+----------------------------------------------------------------
+
+!match new as601 Asserts 8 6
+!match use as601
+!ent add hero Hero 30 2 3 10
+!assert "entity[hero].hp == 30" fresh hero
+!assert --as hero "entity[self].x == 2 and entity[self].y == 3"
+!assert "entity[hero].hp < 10" hero should be nearly dead
+!assert "entity[nobody].hp > 0"
+!assert "kill('hero')"
+!assert "entity[hero].hp = 1"
+!assert "entity[hero].hp == 30" still alive and untouched
+!as player bob
+!assert "entity[hero].hp == 30"
+!as host
+!pending
+
+Expected: HARNESS-ALLOWS-ASSERT-FAIL. A true formula replies `✅ Assertion
+passed` (with the optional message after it); `--as hero` binds `self`. A
+false formula replies `❌ Assertion failed: ... is False — hero should be
+nearly dead`. A formula that can't be evaluated also fails: a missing
+entity, a state-changing function (`kill` is refused by the same read-only
+gate as inline `$()` args) and an assignment. Nothing was changed — the
+last host assert still passes at hp 30. `!assert` is host-gated like
+`!eval`, so the player's assert is queued for approval (`!pending` lists
+it) and doesn't run.
+
+
+SCENARIO 602 — !assert stops the enclosing batch, macro, foreach and action
+---------------------------------------------------------------------------
+
+!system set default action_cmd_allowlist ent,assert
+!match new as602 AssertStop 8 6
+!match use as602
+!ent add hero Hero 30 2 3 10
+!ent add orc Orc 20 5 3 7
+!ent set_var orc team red
+!ent add imp Imp 20 6 3 5
+!ent set_var imp team red
+!batch ent hp orc -5 ; assert "entity[orc].hp == 15" ; ent hp orc -5 ; assert "entity[orc].hp == 0" ; ent hp orc -5
+!assert "entity[orc].hp == 10" the batch stopped before its last line
+!macro set drain "repeat 5\nent hp hero -4\nassert \"entity[hero].hp > 20\" keep the hero above 20\nend\nent hp hero -100"
+!macro run drain
+!assert "entity[hero].hp == 18" three drains ran, the fourth never did, nor the -100
+!foreach team=red ; ent hp $id -1 ; assert "entity[$id].hp > 15"
+!assert "entity[orc].hp == 9 and entity[imp].hp == 20" the sweep stopped at the orc
+!batch macro run drain ; ent hp hero 50
+!assert "entity[hero].hp == 14" the nested stop skipped the heal too
+!ent set_var hero actions.guarded.target none
+!ent set_var hero actions.guarded.body "entity[self].hp = entity[self].hp + 5\ncmd('assert \"entity[hero].hp > 100\"')\nentity[self].hp = 1"
+!action hero guarded
+!assert "entity[hero].hp == 14" the failed action rolled back its +5
+
+Expected: HARNESS-ALLOWS-ASSERT-FAIL. The batch damages the orc to 15,
+passes the first assert, damages it to 10, fails the second assert, and
+stops (`⏹ batch stopped: an assertion failed; 1 line(s) skipped`) — the
+orc stays at 10. The macro drains the hero 30 → 26 → 22 → 18, the third
+assert fails, and the macro stops (the -100 never runs): 18. The foreach
+sweep hits the orc first (initiative 7, so it leads the turn order;
+10 → 9), its assert fails, and the sweep stops before the imp (still 20). A macro inside a batch that stops also stops the batch:
+the hero drops 18 → 14 and the +50 heal is skipped. Inside an action,
+`cmd('assert ...')` (with `assert` on the action_cmd_allowlist) that fails
+fails the action, which rolls back its +5: the hero stays at 14 and the
+body's last line never runs.
+
+
+SCENARIO 603 — !assert as a scenario's own end-state check (multi-tile push)
+----------------------------------------------------------------------------
+
+!match new as603 AssertPush 10 6
+!match use as603
+!ent add golem Golem 60 3 2 5
+!ent set_var golem footprint_w 2
+!ent set_var golem footprint_h 2
+!ent add hero Hero 30 1 2 10
+!tile set 8 2 block true
+!tile set 8 2 glyph #
+!ent push golem right 5
+!assert "entity[golem].x == 6 and entity[golem].y == 2" the 2x2 stops with its right column at x=7, before the wall
+!assert "occupies('golem', 7, 3) and not occupies('golem', 8, 3)"
+!assert "cell_entity(6, 2) == 'golem' and cell_entity(3, 2) == ''"
+!assert "len(footprint_cells('golem')) == 4"
+
+Expected: The golem (2×2 at (3,2)) is pushed 5 right toward a wall at
+(8,2). Its right column may not enter x=8, so it stops with its anchor at
+x=6 (cells x=6..7). Each assert passes, checking the end state directly —
+the anchor, a covered and an uncovered cell of the footprint, the cell
+occupancy query at the new and old anchor, and the 4-cell footprint.
+
+
+SCENARIO 604 — Undo preview: see what `!undo command N` would change, then undo
+-------------------------------------------------------------------------------
+
+!match new up604 UndoPreview 8 6
+!match use up604
+!ent add hero Hero 30 2 2 10
+!ent add ogre Ogre 40 5 3 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent hp hero -7
+!ent tp ogre 6 4
+!ent status hero add burning
+!tile set 3 5 glyph #
+!undo command 4 preview
+!assert "entity[hero].hp == 23 and entity[ogre].x == 6 and status_has('hero', 'burning') and tile_has(3, 5, 'glyph')" preview restored nothing
+!undo command 1 preview
+!undo command 4
+!assert "entity[hero].hp == 30 and entity[ogre].x == 5 and entity[ogre].y == 3" the real undo matches the preview
+!assert "not status_has('hero', 'burning') and not tile_has(3, 5, 'glyph')"
+
+Expected: `!undo command 4 preview` lists exactly what undoing the last four
+commands would change, without changing anything: hero `vars.hp: 23 -> 30`
+and `status.burning: removed`; ogre `position: (6,4) -> (5,3)` (the 2×2's
+anchor); and `- tile (3,5)`. It notes that the undo would also drop 3 later
+autosaves. The first assert confirms nothing was restored. `!undo command 1
+preview` shows only the tile removal. The real `!undo command 4` then
+produces the previewed state, which the last two asserts check.
+
+
+SCENARIO 605 — Undo preview for turns, rounds and `to round`; the fuller diff
+------------------------------------------------------------------------------
+
+!match new up605 UndoPreviewTurns 8 6
+!match use up605
+!ent add hero Hero 30 2 2 10
+!ent add foe Foe 30 5 5 5
+!turn next
+!ent hp foe -6
+!zone add pit 4 4
+!team set red supplies 3
+!match var set alarm 1
+!macro set ping "ent hp foe -1"
+!turn next
+!ent hp hero -2
+!undo turn 1 preview
+!undo round 1 preview
+!undo to round 1 preview
+!assert "entity[hero].hp == 28 and entity[foe].hp == 24" nothing restored by the previews
+!history diff round:1 latest:command
+
+Expected: `!undo turn 1 preview` goes back to the start of the foe's turn,
+so it only shows hero `vars.hp: 28 -> 30` (and that 1 later autosave
+would be dropped). `!undo round 1 preview` and
+`!undo to round 1 preview` go back to the start of round 1: they show the
+current turn changing ('foe' -> 'hero'), turns_elapsed going back, hero
+28 -> 30, foe 24 -> 30, `- zone pit`, the removed match var `alarm` and
+team data `red.supplies`, and `Other changes: macros` (the ping macro).
+Both say 8 later autosaves would be dropped. The assert
+confirms the previews changed nothing. `!history diff` uses the same
+diff: it now reports positions, statuses, tiles, zones, match vars, team
+data and the current turn, and names any other changed field.
+
+
+SCENARIO 606 — !map preview: burst, cone, line and rect over a multi-tile unit
+------------------------------------------------------------------------------
+
+!match new mp606 MapPreview 10 7
+!match use mp606
+!ent add hero Hero 30 2 4 10
+!ent add ogre Ogre 40 6 3 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent add gob Gob 10 9 6 5
+!tile set 5 5 glyph #
+!map preview burst hero 2
+!map preview burst 5 4 1 manhattan
+!map preview cone hero right 4
+!map preview line hero gob
+!map preview rect 8 1 10 2
+!assert "entity[ogre].hp == 40 and entity[gob].hp == 10 and entity[hero].x == 2" previews change nothing
+
+Expected: Each preview draws the map with the covered cells marked `*`
+(the preview_glyph rule), clipped to the grid, and lists the visible units
+inside. A burst of radius 2 around the hero (its own cell as the centre)
+covers 20 on-map cells and lists only the Hero. A radius-1 manhattan burst
+at (5,4) is a 5-cell diamond; it reaches (6,4), one cell of the 2×2 ogre,
+so the Ogre is listed and its whole body keeps its glyph. The 90° cone
+from the hero to the right, length 4, covers 14 cells and lists the Ogre.
+The line from the hero to the goblin lists both endpoints' units. The
+rect in the top-right corner lists no units. Cells showing a unit keep
+the unit's glyph; the tile `#` at (5,5) is marked where an area covers
+it. Nothing on the board changes (the assert).
+
+
+SCENARIO 607 — !map preview under fog: players can plan, hidden units stay hidden
+----------------------------------------------------------------------------------
+
+!match new mp607 PreviewFog 10 7
+!match use mp607
+!ent add scout Scout 30 2 4 10
+!ent set_var scout team red
+!ent set_var scout fog_vision_radius 2
+!ent add lurker Lurker 30 7 4 5
+!ent set_var lurker team blue
+!ent add brute Brute 30 4 5 5
+!ent set_var brute team blue
+!match fog on
+!as player bob
+!as view red
+!map preview burst scout 3
+!map preview burst lurker 1
+!map preview line 2 4 8 4
+!as view clear
+!as host
+!map preview burst scout 3
+
+Expected: HARNESS-ALLOWS-ERRORS. `!map preview` stays player-available
+(it's read-only): bob runs it directly, from red's view. With fog on, the
+scout sees 2 cells. The burst of radius 3 around the scout lists the Scout
+and the Brute (at (4,5), in sight); cells outside red's sight still show
+the preview mark over fog but reveal nothing, and the Lurker at (7,4) is
+out of sight, so the line through its cell doesn't list it. Using the
+hidden Lurker as an origin reads exactly like a missing entity. The
+host's omniscient preview lists the Scout and the Brute (the Lurker is 5
+cells away, outside radius 3).
+
+
+SCENARIO 608 — !map preview options: colour/opacity, glyph rule, legend, image fallback
+----------------------------------------------------------------------------------------
+
+!match new mp608 PreviewOpts 8 5
+!match use mp608
+!ent add hero Hero 30 2 2 10
+!map preview rect 1 1 2 2 color=0,0,255 opacity=70
+!map preview rect 1 1 2 2 color=#00ff80
+!map preview rect 1 1 2 2 colour=blue
+!map preview rect 1 1 2 2 color=300,0,0
+!map preview rect 1 1 2 2 opacity=150
+!map preview spiral 1 1
+!map preview burst 3 3
+!map preview burst 3 3 1 extra
+!system set default preview_glyph +
+!match new mp608b PreviewOpts2 8 5
+!match use mp608b
+!ent add hero Hero 30 2 2 10
+!map legend on
+!map mode image
+!map preview burst 4 3 1
+
+Expected: HARNESS-ALLOWS-ERRORS. `color=` takes `r,g,b` or `#rrggbb` and
+`opacity=` 0-100 (they only affect graphics surfaces; the ASCII reply is
+the same). Refused with a ❌: a mistyped option (`colour=`), a channel
+over 255, an opacity over 100, an unknown shape, a missing radius, and a
+stray word where the metric goes. After the preview_glyph rule is set to
+`+`, the new match marks previewed cells with `+`, and the legend explains
+`+ — preview area`. The match is in image render mode, but the harness has
+no image surface, so the preview falls back to the ASCII map.
+
+
+SCENARIO 609 — !help find: search commands, subcommands and gamerules
+---------------------------------------------------------------------
+
+!help find fog memory
+!system set default viewport_width 24
+!match new hf609 HelpFind 10 6
+!match use hf609
+!help find viewport
+!help find corpse block
+!help find zzzqqq
+!help find
+!as player bob
+!help find grid dimension
+
+Expected: `!help find fog memory` lists the `!match fog` command and the
+fog_los / fog_memory_enabled_by_default / fog_memory_mode rules (every
+word must appear), with rule values from the defaults since no match is
+active here. After the system's viewport_width is set to 24 and a match
+created, `!help find viewport` lists the `!map` command and the four
+viewport rules, with `viewport_width = 24` read from this match. `corpse
+block` finds the corpse_block_condition rule, plus map_resize_shrink_mode
+(whose description mentions both words). A word nothing contains says so.
+`!help find` alone is still the help for the `!find` command. A player can
+search too (it's read-only): `grid dimension` finds the max_grid_dimension
+rule (= 500) and the `!map` command (its description mentions both).
+
+
+SCENARIO 610 — max_grid_dimension caps new grids and resizes
+------------------------------------------------------------
+
+!match new big Big 501 10
+!match new edge Edge 500 3
+!match use edge
+!map resize 500 501
+!map resize 400 3
+!assert "1 == 1" the 500-wide match exists and resized to 400
+!system set default max_grid_dimension -1
+!match new huge Huge 800 2
+!system new tiny
+!system set tiny max_grid_dimension 20
+!match new t1 Tiny 21 5 tiny
+!match new t2 Tiny 20 5 tiny
+!match new bad Bad x 5
+
+Expected: HARNESS-ALLOWS-ERRORS. A 501-wide match is refused (over the
+max_grid_dimension of 500); a 500-wide one is created. Resizing to height
+501 is refused, to 400×3 succeeds. With the rule set to -1 an 800-wide
+match is allowed. A system's own cap applies to matches created under it:
+under `tiny` (cap 20) a 21-wide match is refused and a 20-wide one created.
+A non-numeric width is a clean ❌.
+
+
+SCENARIO 611 — !match clone: an independent copy of the whole board
+--------------------------------------------------------------------
+
+!match new src611 Arena 10 6
+!match use src611
+!ent add ogre Ogre 40 3 2 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent set_var ogre inv.gold 5
+!part add ogre ogre_head Head 10 10
+!ent add hero Hero 30 7 4 10
+!ent status hero add burning
+!tile set 5 5 glyph #
+!zone add pit 6 6
+!macro set hit "ent hp ogre -1"
+!turn next
+!match clone run611 Arena Run 1
+!match clone run611
+!assert "entity[ogre].hp == 40" this channel still shows the original
+!match use run611
+!assert "footprint_width('ogre') == 2 and has_part('ogre', 'ogre_head') and status_has('hero', 'burning')" the copy has the 2x2 ogre, its head and the status
+!assert "tile_has(5, 5, 'glyph') and zone_exists('pit') and current_id() == 'hero'" the map and the turn came along
+!macro run hit
+!ent set_var ogre inv.gold 99
+!ent tp hero 1 1
+!assert "entity[ogre].hp == 39 and entity[ogre].inv.gold == 99 and entity[hero].x == 1"
+!match use src611
+!assert "entity[ogre].hp == 40 and entity[ogre].inv.gold == 5 and entity[hero].x == 7" the original is untouched
+
+Expected: HARNESS-ALLOWS-ERRORS. `!match clone run611 Arena Run 1` copies the
+channel's match as **Arena Run 1**; a second clone to the same id is
+refused. The channel keeps showing the original (its ogre is at 40). The
+copy has everything: the 2×2 ogre with its head part and inventory, the
+hero's burning status, the tile, the zone, the macro and the current turn
+(hero's). Changes in the copy — the macro's hit, a nested var, a move —
+leave the original untouched. Every assert passes.
+
+
+SCENARIO 612 — !match clone: owner, co-hosts, channels, history
+---------------------------------------------------------------
+
+!match new src612 Arena 8 5
+!match use src612
+!ent add hero Hero 30 2 2 10
+!host add bob
+!host access set "ent info" host
+!match bind pov=red
+!ent hp hero -3
+!as player carol
+!match clone c1
+!as host
+!pending
+!deny r1
+!as player bob
+!match clone c2 Bobs Copy
+!as host
+!match use c2
+!host list
+!as player bob
+!host list
+!host access list
+!as host
+!match channels
+!history list commands
+!assert "entity[hero].hp == 27"
+
+Expected: A player who isn't a host can't clone right away: carol's clone
+is queued for approval, `!pending` lists it, and the host denies it. Bob, a
+co-host, clones the match as **Bobs Copy** (`c2`): bob owns the copy and
+the original's owner `cli` becomes its co-host, so both still host it —
+`!host list` is owner-only, so `cli` is refused and bob sees `owner: bob,
+co-hosts: cli`. The per-match access override (`ent info` → host) came
+along. The copy's channel list holds only the channel that just ran
+`!match use c2` (the original's red-POV binding didn't come along), the
+undo history is empty (nothing from the original), and the hero's damage
+did come along (27).

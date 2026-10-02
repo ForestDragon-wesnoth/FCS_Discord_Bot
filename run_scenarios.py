@@ -59,8 +59,17 @@ _FAILURE_MARKERS = ("💥", "Syntax error")
 # undetected across eleven of its own tests. They're flagged UNLESS a scenario
 # deliberately exercises error handling (a func-deletion test, a rejection
 # test) and opts out with the `HARNESS-ALLOWS-ERRORS` tag in its Expected prose.
-_ERROR_MARKERS = ("❌ Runtime error:", "❌ Unexpected error:")
+_ERROR_MARKERS = ("❌ Runtime error:", "❌ Unexpected error:",
+                  "isn't a valid command (unknown subcommand",
+                  "is missing arguments (got")
 _ALLOW_ERRORS_TAG = "harness-allows-errors"
+
+# A failed `!assert` is a scenario checking its own end state and finding it
+# wrong — always a failure, whatever HARNESS-ALLOWS-ERRORS says. Only a
+# scenario demonstrating a failing assert on purpose opts out, with its own
+# `HARNESS-ALLOWS-ASSERT-FAIL` tag.
+_ASSERT_MARKERS = ("❌ Assertion failed",)
+_ALLOW_ASSERT_TAG = "harness-allows-assert-fail"
 
 
 class _Ctx:
@@ -75,6 +84,13 @@ class _Ctx:
         self.user_id = "cli"
         self.user_name = "cli"
 
+    @property
+    def is_admin(self) -> bool:
+        # Bot-wide commands (!system edits, !store, !run, ...) need an admin.
+        # The harness's owner identity stands in for a server administrator;
+        # `!as player <name>` drops it, so scenarios can test the refusal.
+        return self.user_id == "cli"
+
     async def send(self, message: str) -> None:
         self.out.append(message)
 
@@ -87,18 +103,22 @@ def _interpret_escapes(raw: str) -> str:
     return raw.replace("\\n", "\n").replace("\\t", "\t")
 
 
-def parse_scenarios(path: str) -> List[Tuple[int, str, List[str], bool]]:
-    """Return [(number, title, [command_line, ...], allow_errors), ...] in file
-    order. allow_errors is True when the scenario's prose carries the
-    HARNESS-ALLOWS-ERRORS opt-out tag (a deliberate error-handling test)."""
+def parse_scenarios(path: str) -> List[Tuple[int, str, List[str], "frozenset[str]"]]:
+    """Return [(number, title, [command_line, ...], allows), ...] in file
+    order. `allows` holds "errors" when the scenario's prose carries the
+    HARNESS-ALLOWS-ERRORS opt-out tag (a deliberate error-handling test) and
+    "assert" for HARNESS-ALLOWS-ASSERT-FAIL (a deliberately failing !assert)."""
     with open(path, encoding="utf-8") as f:
         text = f.read()
-    out: List[Tuple[int, str, List[str], bool]] = []
+    out: List[Tuple[int, str, List[str], "frozenset[str]"]] = []
     for m in SCENARIO_RE.finditer(text):
         num = int(m.group(1))
         title = m.group(2).strip()
         body = m.group(3)
-        allow_errors = _ALLOW_ERRORS_TAG in body.lower()
+        low = body.lower()
+        allows = frozenset(
+            (["errors"] if _ALLOW_ERRORS_TAG in low else [])
+            + (["assert"] if _ALLOW_ASSERT_TAG in low else []))
         # Commands live ABOVE the "Expected:" prose. Stop collecting at
         # the Expected marker so prose lines that happen to start with
         # `!` (e.g. "!ent info shows ...", "!map renders ...") aren't
@@ -109,7 +129,7 @@ def parse_scenarios(path: str) -> List[Tuple[int, str, List[str], bool]]:
                 break
             if ln.startswith("!"):
                 cmds.append(ln)
-        out.append((num, title, cmds, allow_errors))
+        out.append((num, title, cmds, allows))
     return out
 
 
@@ -138,11 +158,16 @@ async def run_one(cmds: List[str]) -> List[Tuple[str, List[str]]]:
 
 
 def _flagged(transcript: List[Tuple[str, List[str]]],
-             allow_errors: bool = False) -> List[Tuple[str, str]]:
+             allows: "frozenset[str]" = frozenset()) -> List[Tuple[str, str]]:
     """Return [(command, output_line), ...] for every flagged failure. 💥 /
     Syntax error always flag; a top-level ❌ Runtime/Unexpected error flags too
-    unless the scenario opted out (allow_errors)."""
-    markers = _FAILURE_MARKERS if allow_errors else _FAILURE_MARKERS + _ERROR_MARKERS
+    unless the scenario opted out ("errors" in allows); a failed !assert
+    flags unless "assert" is in allows."""
+    markers = _FAILURE_MARKERS
+    if "errors" not in allows:
+        markers = markers + _ERROR_MARKERS
+    if "assert" not in allows:
+        markers = markers + _ASSERT_MARKERS
     hits = []
     for cmd, outs in transcript:
         for o in outs:
@@ -151,9 +176,42 @@ def _flagged(transcript: List[Tuple[str, List[str]]],
     return hits
 
 
+_HEADER_RE = re.compile(r"^SCENARIO (\d+)\b", re.MULTILINE)
+
+
+def header_problems(path: str,
+                    scenarios: List[Tuple[int, str, List[str], bool]]) -> List[str]:
+    """Cross-check every `SCENARIO N` header line against what SCENARIO_RE
+    actually parsed. A header the regex misses (e.g. no blank line before it,
+    or no dashes underline) is silently folded into the PREVIOUS scenario's
+    Expected: prose — where command collection has already stopped — so its
+    commands never run. That hid scenarios 230/232/236 for a long stretch.
+    Also reports duplicate numbers. Returns human-readable problem lines."""
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    headers = [int(n) for n in _HEADER_RE.findall(text)]
+    parsed = [s[0] for s in scenarios]
+    problems = []
+    unparsed = sorted(set(headers) - set(parsed))
+    if unparsed:
+        problems.append(
+            f"header(s) not parsed (need a blank line before + a dashes "
+            f"line after): {unparsed}")
+    dupes = sorted({n for n in headers if headers.count(n) > 1})
+    if dupes:
+        problems.append(f"duplicate scenario number(s): {dupes}")
+    return problems
+
+
 async def main_async(args: argparse.Namespace) -> int:
     here = os.path.dirname(os.path.abspath(__file__))
-    scenarios = parse_scenarios(os.path.join(here, "test_sequences.txt"))
+    seq_path = os.path.join(here, "test_sequences.txt")
+    scenarios = parse_scenarios(seq_path)
+    problems = header_problems(seq_path, scenarios)
+    if problems:
+        for p in problems:
+            print(f"❌ test_sequences.txt: {p}")
+        return 1
 
     if args.list:
         for num, title, _, _ in scenarios:
@@ -168,9 +226,9 @@ async def main_async(args: argparse.Namespace) -> int:
             print(f"⚠️ no such scenario(s): {sorted(missing)}")
 
     total_fail = 0
-    for num, title, cmds, allow_errors in scenarios:
+    for num, title, cmds, allows in scenarios:
         transcript = await run_one(cmds)
-        hits = _flagged(transcript, allow_errors)
+        hits = _flagged(transcript, allows)
         if args.verbose:
             print(f"\n=== SCENARIO {num} — {title} ===")
             for cmd, outs in transcript:
@@ -187,15 +245,26 @@ async def main_async(args: argparse.Namespace) -> int:
         f"\n{len(scenarios)} scenario(s) run; "
         f"{total_fail} with flagged failures."
     )
-    # Clean up any save artifacts scenarios may have dropped in cwd.
-    for p in ("tpl_save", "tpl_save.json", "groups_test.json",
-              "savetest.json", "test_compat"):
-        if os.path.exists(p):
-            os.remove(p)
     return 1 if total_fail else 0
 
 
 def main() -> None:
+    # File commands (!store / !run / !history export|import) are confined to
+    # vtt_commands.SAVES_DIR. Point it at a throwaway folder for the run, so
+    # scenarios never touch — or leave junk in — a real `saves/` folder that
+    # holds someone's campaign files.
+    import shutil
+    import tempfile
+    import vtt_commands
+    scratch = tempfile.mkdtemp(prefix="fcs_scenarios_")
+    vtt_commands.SAVES_DIR = scratch
+    try:
+        _main()
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _main() -> None:
     ap = argparse.ArgumentParser(description="Run test_sequences.txt scenarios.")
     ap.add_argument("scenarios", nargs="*", type=int,
                     help="scenario numbers to run (default: all)")
