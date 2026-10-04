@@ -17999,6 +17999,8 @@ SCENARIO 663 — a dict copied through a formula is a copy, not a shared object
 !eval "tile_set(2, 2, 'loot', var_get('b', 'inv'))"
 !eval "entity[b].inv.sword.dmg = 3"
 !assert "match_var_get('mv.sword.dmg') == 5 and tile_get(2, 2, 'loot.sword.dmg') == 5"
+!eval "entity[a].ranks = {1: 'gold', 2: 'silver'}"
+!assert "var_get('a', 'ranks.1') == 'gold'" "a stored dict's keys are strings, reachable by path"
 
 Expected: Reading a dict out of one unit's vars and writing it into another
 (or into team data, a match var, a tile, a zone or a status) stores a copy.
@@ -18006,4 +18008,6 @@ Before, both places held ONE object: setting a's sword to 99 also changed
 b's (without b's on_var_changed hook firing — b never saw the write), the
 blue team's stash edit changed red's, and later edits to b's inventory
 showed up in the match var and the tile. A save/load then split them into
-separate copies, so the board behaved differently after a reload.
+separate copies, so the board behaved differently after a reload. For the
+same reason a stored dict's keys become strings, as a save/load makes them:
+`{1: 'gold'}` couldn't be reached by the path `ranks.1` until a reload.
