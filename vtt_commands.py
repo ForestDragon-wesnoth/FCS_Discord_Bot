@@ -28,6 +28,7 @@ from fractions import Fraction
 import contextlib
 import contextvars
 import json
+import math
 import random
 import copy
 
@@ -1323,9 +1324,13 @@ def _parse_scalar(token: str):
     except ValueError:
         pass
     try:
-        return float(token)
+        f = float(token)
     except ValueError:
         return token  # leave as string
+    # float() also reads "inf", "nan", "Infinity" and "1e999": a word like
+    # that is a label, and a non-finite number would poison every
+    # comparison and sort that later reads the var.
+    return f if math.isfinite(f) else token
 
 # Note: the former _set_deep_key and _del_deep helpers used to live here.
 # They've been removed because Entity.write_var and Entity.remove_var now
@@ -3767,57 +3772,67 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(
                 f"❌ `{src_id}` is a body part — clone its parent instead.")
         logs: List[str] = []
-        for cid, x, y in plan:
-            # Clone the WHOLE part subtree (parents before children) so a
-            # multi-part creature keeps its limbs, remapping part_of / __follows
-            # onto the new ids and STRIPPING the mount link (a clone is never
-            # auto-mounted — it would bypass slot capacity / on_mounted). Mirror
-            # of MatchManager.copy_entity, but same-match with clone's id-naming.
-            order = [src_id]
-            k = 0
-            while k < len(order):
-                pid = order[k]; k += 1
-                for child in m.entities.values():
-                    if child.part_of == pid and child.id not in order:
-                        order.append(child.id)
-            # `taken` = ids already live (+ corpses); NOT the planned cid, which
-            # the planning phase validated unique and the root must take. Each
-            # created clone joins m.entities, so a later plan entry sees it.
-            taken = set(m._taken_entity_ids())
-            idmap: Dict[str, str] = {}
-            for oid in order:
-                nid = cid if oid == src_id else f"{cid}_{oid}"
-                if nid in taken:
-                    j = 2
-                    while f"{nid}_{j}" in taken:
-                        j += 1
-                    nid = f"{nid}_{j}"
-                idmap[oid] = nid
-                taken.add(nid)
-            for oid in order:
-                oe = m.entities[oid]
-                payload = oe.to_dict()
-                payload["id"] = idmap[oid]
-                # Strip / remap relational fields.
-                payload.pop("mounted_on", None)
-                payload.pop("mount_slot", None)
-                if oid == src_id:
-                    payload.pop("part_of", None)  # root clone is standalone
-                elif payload.get("part_of") in idmap:
-                    payload["part_of"] = idmap[payload["part_of"]]
-                fol = (payload.get("vars") or {}).get("__follows")
-                if fol in idmap:
-                    payload["vars"]["__follows"] = idmap[fol]
-                if oid == src_id or not oe.is_located_part:
-                    px, py = x, y
-                else:  # a located part keeps its offset from the anchor
-                    px, py = x + (oe.x - src.x), y + (oe.y - src.y)
-                clone = Entity.from_dict(payload)
-                _, spawn_log = clone.spawn(
-                    m, px, py, initiative=(src.initiative if oid == src_id else None))
-                clone.facing = oe.facing
-                logs.extend(spawn_log)
-            m._restamp_parts_for(idmap[src_id])
+        # The checks above cover each clone's anchor cell; a footprint, a
+        # located part's cell or a block condition can still refuse a spawn
+        # midway. Roll the match back then, or the clones (and parts) made
+        # so far stayed on the board beside the ❌.
+        from action import _rollback_match
+        pre_clone = m.to_dict(include_history=False)
+        try:
+            for cid, x, y in plan:
+                # Clone the WHOLE part subtree (parents before children) so a
+                # multi-part creature keeps its limbs, remapping part_of / __follows
+                # onto the new ids and STRIPPING the mount link (a clone is never
+                # auto-mounted — it would bypass slot capacity / on_mounted). Mirror
+                # of MatchManager.copy_entity, but same-match with clone's id-naming.
+                order = [src_id]
+                k = 0
+                while k < len(order):
+                    pid = order[k]; k += 1
+                    for child in m.entities.values():
+                        if child.part_of == pid and child.id not in order:
+                            order.append(child.id)
+                # `taken` = ids already live (+ corpses); NOT the planned cid, which
+                # the planning phase validated unique and the root must take. Each
+                # created clone joins m.entities, so a later plan entry sees it.
+                taken = set(m._taken_entity_ids())
+                idmap: Dict[str, str] = {}
+                for oid in order:
+                    nid = cid if oid == src_id else f"{cid}_{oid}"
+                    if nid in taken:
+                        j = 2
+                        while f"{nid}_{j}" in taken:
+                            j += 1
+                        nid = f"{nid}_{j}"
+                    idmap[oid] = nid
+                    taken.add(nid)
+                for oid in order:
+                    oe = m.entities[oid]
+                    payload = oe.to_dict()
+                    payload["id"] = idmap[oid]
+                    # Strip / remap relational fields.
+                    payload.pop("mounted_on", None)
+                    payload.pop("mount_slot", None)
+                    if oid == src_id:
+                        payload.pop("part_of", None)  # root clone is standalone
+                    elif payload.get("part_of") in idmap:
+                        payload["part_of"] = idmap[payload["part_of"]]
+                    fol = (payload.get("vars") or {}).get("__follows")
+                    if fol in idmap:
+                        payload["vars"]["__follows"] = idmap[fol]
+                    if oid == src_id or not oe.is_located_part:
+                        px, py = x, y
+                    else:  # a located part keeps its offset from the anchor
+                        px, py = x + (oe.x - src.x), y + (oe.y - src.y)
+                    clone = Entity.from_dict(payload)
+                    _, spawn_log = clone.spawn(
+                        m, px, py, initiative=(src.initiative if oid == src_id else None))
+                    clone.facing = oe.facing
+                    logs.extend(spawn_log)
+                m._restamp_parts_for(idmap[src_id])
+        except VTTError as ex:
+            _rollback_match(m, mgr, pre_clone)
+            return await ctx.send(f"❌ {ex} — nothing was cloned.")
         if single:
             cid, x, y = plan[0]
             msg = f"Cloned `{src_id}` → `{cid}` at ({x},{y})."
@@ -4061,14 +4076,18 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 m.id, dest_mid, src_id, x, y, move=(sub == "transfer"))
         except (VTTError, NotFound) as ex:
             return await ctx.send(f"❌ {ex}")
+        tail = ("\n" + "\n".join(log)) if log else ""
+        if new_id is None:   # died on the way out; the log says so
+            return await ctx.send(tail.lstrip("\n"))
         verb = "Moved" if sub == "transfer" else "Copied"
         dest = mgr.matches[dest_mid]
         rid = f" as `{new_id}`" if new_id != src_id else ""
-        tail = ("\n" + "\n".join(log)) if log else ""
+        ne = dest.entities.get(new_id)
+        # A destination on_entity_spawned handler may already have removed it.
+        where = f" at ({ne.x},{ne.y})" if ne is not None else ""
         return await ctx.send(
             f"{verb} `{src_id}` to **{dest.name}** "
-            f"({dest_mid}){rid} at ({dest.entities[new_id].x},"
-            f"{dest.entities[new_id].y}).{tail}")
+            f"({dest_mid}){rid}{where}.{tail}")
 
     # Fallback: show authoritative help for the root command
     return await _help_fallback(ctx, ["ent"], args[0] if args else None)
@@ -5708,7 +5727,7 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 # ---- !roll --------------------------------------------------------------
 @registry.command(
     "roll", access="all",
-    usage="!roll <dice> [<dice> ...] | !roll odds <dice> [<op> <n>]",
+    usage="!roll <dice expression> | !roll odds <dice> [<op> <n>]",
     snapshot=False,
     desc=(
         "Roll dice and show the total plus the individual dice. Uses the same "
@@ -5727,9 +5746,18 @@ async def roll_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
         title, body = registry.help_for(["roll"])
         return await ctx.send(f"**{title}**\n{body}")
+    terms = args[1:] if args[0].lower() == "odds" else args
+    # Joined below so `!roll 2d6 + 3` and `!roll 2d6+3` both work; two terms
+    # with no operator between them (`1d6 1d6`) joined into the malformed
+    # term `1d61d6`.
+    ops = ("+", "-", "<", ">", "=", "!")
+    for left, right in zip(terms, terms[1:]):
+        if not left.endswith(ops) and not right.startswith(ops):
+            return await ctx.send(
+                f"❌ `{left} {right}`: put `+` or `-` between dice terms "
+                f"(`{left}+{right}`).")
     if args[0].lower() == "odds":
         return await _roll_odds(ctx, "".join(args[1:]))
-    # Join so `!roll 2d6 + 3` and `!roll 2d6+3` both work (roll strips spaces).
     spec = "".join(args)
     # Use the match RNG when a match is active (honors random_seed); otherwise
     # the global RNG, so `!roll` works even with no active match.
@@ -5807,7 +5835,10 @@ async def _roll_odds(ctx: ReplyContext, text: str):
             rows.append(f"{v:>5}  {_fmt_pct(w / total):>7}  {bar}")
         lines.append("```\n" + "\n".join(rows) + "\n```")
     else:
-        lines.append(f"({hi - lo + 1} possible totals — add a comparison, "
+        # Count totals that can occur: an exploding die skips some (a d6!
+        # never totals 6), so the span hi - lo + 1 overstates it.
+        n_tot = sum(1 for w in dist.values() if w)
+        lines.append(f"({n_tot} possible totals — add a comparison, "
                      f"e.g. `!roll odds {spec} >= {round(mean)}`.)")
     return await ctx.send("\n".join(lines))
 
@@ -6752,7 +6783,8 @@ def _flatten_vars(prefix: str, val: Any, out: Dict[str, Any]) -> None:
 
 def _diff_flat(prefix: str, a: Any, b: Any, indent: str) -> List[str]:
     """Leaf-level diff of two nested values (dicts flattened to dotted
-    paths), one `path: old -> new` / `+ new` / `- old` line per change."""
+    paths), one `path: old -> new` line per change, `(unset)` standing in
+    for the side that lacks the path."""
     fa: Dict[str, Any] = {}
     fb: Dict[str, Any] = {}
     _flatten_vars("", a if a is not None else {}, fa)
@@ -6764,10 +6796,11 @@ def _diff_flat(prefix: str, a: Any, b: Any, indent: str) -> List[str]:
     out: List[str] = []
     for k in sorted(set(fa) | set(fb), key=str):
         path = f"{prefix}.{k}" if prefix and k else (prefix or k)
+        # "(unset)" for the missing side: a bare "- 5" read as minus five.
         if k not in fa:
-            out.append(f"{indent}{path}: + {fb[k]!r}")
+            out.append(f"{indent}{path}: (unset) -> {fb[k]!r}")
         elif k not in fb:
-            out.append(f"{indent}{path}: - {fa[k]!r}")
+            out.append(f"{indent}{path}: {fa[k]!r} -> (unset)")
         elif fa[k] != fb[k]:
             out.append(f"{indent}{path}: {fa[k]!r} -> {fb[k]!r}")
     return out

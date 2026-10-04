@@ -17455,3 +17455,104 @@ Expected: A plain change shows the on_var_changed passive's output
 reads "hp unchanged". A doubled sign (`+-5`, `--5`) is a typo and is
 refused. A long number is read exactly (not through a float) and then
 clamped to max_hp. A set that kills says so.
+
+
+SCENARIO 648 — !ent transfer is all-or-nothing: a death on the way out or an unplaceable part leaves the destination untouched
+-----------------------------------------------------------------------------------------------------------------------------
+
+!match new dst648 Haven 5 5
+!match new s648 Exodus 10 10
+!match use s648
+!ent add runner Runner 10 1 1 5
+!gpassive add trap on_entity_despawned "kill(self)"
+!ent transfer runner dst648
+?? 💀 `runner` died as it left **Exodus**; it was not transferred.
+!assert "has_corpse('runner')" the runner died in the source
+!gpassive remove trap
+!ent add golem Golem 20 2 2 5
+!part add golem arm Arm 5 5
+!part locate arm 8 8
+!ent transfer golem dst648
+?? ❌ (8,8) outside 5x5
+!assert "has_part('golem', 'arm') and entity[arm].x == 8" the source keeps the whole body
+!match use dst648
+!list
+?? (no entities)
+!match use s648
+!ent transfer golem dst648 1 1
+?? (7,7) outside 5x5
+!ent add rock Rock 10 10 9 1
+!ent clone golem twin 3 5
+?? ❌ (9,11) outside 10x10 — nothing was cloned.
+!ent clone golem twin 3 3 4 3
+?? Cell (10,9) already occupied
+!assert "len(entities_at(3, 3)) == 0 and len(entities_at(4, 3)) == 0 and len(entities_at(9, 9)) == 0" no stray clone or arm
+
+Expected: An on_entity_despawned handler that kills the runner as it
+leaves makes it die in Exodus; the transfer is cancelled and Haven gets
+nothing (it used to get a living copy while the corpse lay in Exodus). A
+golem whose located arm would land off Haven's 5×5 map can't be moved:
+the transfer fails with Haven unchanged (it used to keep the golem
+without its arm while Exodus kept the original — two golems). Moving the
+anchor to (1,1) doesn't help: the arm keeps its offset from the body, so
+it would land on (7,7). `!ent clone` has the same all-or-nothing
+contract: a golem cloned to (3,5) puts its arm on (9,11) — off the map
+— and cloned to (3,3) and (4,3) the second copy's arm lands on the rock
+at (10,9); either way nothing is cloned. It used to leave the armless
+copies made before the failure on the board beside the ❌.
+
+
+SCENARIO 649 — Revive puts a located part whose cell is taken on the nearest free cell
+---------------------------------------------------------------------------------------
+
+!match new s649 Return 10 10
+!match use s649
+!ent add golem Golem 20 2 2 5
+!ent set_var golem footprint_w 2
+!ent set_var golem footprint_h 2
+!part add golem arm Arm 5 5
+!part locate arm 6 6
+!part add arm claw Claw 2 2
+!ent kill golem
+!ent add rock Rock 10 6 6 1
+!ent revive golem
+?? ⚠️ part `arm` couldn't return to (6,6) (Cell (6,6) already occupied); placed at (5,5).
+!assert "part_of('arm') == 'golem' and entity[arm].x == 5 and entity[arm].y == 5"
+!assert "part_of('claw') == 'arm' and entity[claw].x == 5 and entity[claw].y == 5" the glued claw rides with its arm
+
+Expected: The arm's stored cell (6,6) holds a rock, so the revived arm
+goes to the nearest free cell (5,5) and the reply says so; it used to be
+dropped without a word, losing the limb for good. Its glued claw comes
+back on the arm's new cell. Transform / revert already placed displaced
+located parts this way.
+
+
+SCENARIO 650 — set_var keeps inf / nan as words; !roll needs an operator between terms; diffs name unset values
+---------------------------------------------------------------------------------------------------------------
+
+!match new s650 Odds 8 8
+!match use s650
+!ent add hero Hero 30 2 2 5
+!ent set_var hero title Infinity
+!ent set_var hero mood nan
+!assert "entity[hero].title == 'Infinity' and entity[hero].mood == 'nan'" words stay strings
+!eval "var_set('hero', 'hp', float('inf'))"
+?? ❌ Runtime error: Vital var 'hp' must be a finite number
+!roll 1d6 1d6
+?? ❌ `1d6 1d6`: put `+` or `-` between dice terms
+!roll odds 1d6!
+?? (81 possible totals
+!team set red gold 5
+!undo command 1 preview
+?? red.gold: 5 -> (unset)
+
+Expected: float() reads "inf" / "nan" / "Infinity" as numbers, so
+`!ent set_var` used to store a non-finite float that poisons comparisons
+and sorts; words like these now stay strings. Writing infinity to hp is
+refused with a clear message (it was a raw "cannot convert float
+infinity" error). `!roll 1d6 1d6` joined into the malformed term
+`1d61d6`; it now asks for an operator. An exploding d6 never totals a
+multiple of 6, so `!roll odds 1d6!` counts 81 reachable totals over the
+1–96 span. The undo preview says `5 -> (unset)` where it used to print
+`- 5`, which read as minus five.
+HARNESS-ALLOWS-ERRORS: the hp write is refused on purpose.

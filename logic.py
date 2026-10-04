@@ -2711,13 +2711,13 @@ def _coerce_vital_value(v: Any) -> Optional[int]:
         return None
     if isinstance(v, int):
         return v
-    if isinstance(v, float):
-        return int(v)
-    if isinstance(v, str):
-        try:
+    try:
+        if isinstance(v, float):
+            return int(v)
+        if isinstance(v, str):
             return int(float(v.strip()))
-        except (ValueError, AttributeError):
-            return None
+    except (ValueError, OverflowError):   # "abc", NaN, infinity
+        return None
     return None
 
 
@@ -4896,7 +4896,7 @@ class Entity:
                 coerced = _coerce_vital_value(value)
                 if coerced is None:
                     raise VTTError(
-                        f"Vital var '{seg0}' must be a number, got {value!r} "
+                        f"Vital var '{seg0}' must be a finite number, got {value!r} "
                         f"on `{self.id}`.")
                 value = coerced
 
@@ -12090,27 +12090,54 @@ class Match:
             # Restore the creature's body parts at the parent's cell. Each
             # snapshot carries its part_of (-> e.id) so it re-attaches; a
             # part already taking that id (somehow still alive) is skipped.
-            for pd in stored_parts:
-                pdc = copy.deepcopy(pd)
-                # A glued part respawns at the parent's cell; a LOCATED part
-                # keeps its own snapshotted position.
-                located = bool((pdc.get("vars") or {}).get("__part_located"))
-                px = int(pdc.get("x", x)) if located else x
-                py = int(pdc.get("y", y)) if located else y
-                pdc["x"] = px
-                pdc["y"] = py
-                pid = str(pdc.get("id", ""))
-                if not pid or pid in self._taken_entity_ids():
-                    continue
-                part_e = Entity.from_dict(pdc)
-                try:
-                    _, plog = part_e.spawn(self, px, py)
-                    spawn_log += plog
-                except VTTError:
-                    # A part that can't be placed (e.g. id clash or its cell
-                    # is now occupied) is skipped rather than aborting the
-                    # whole revive.
-                    pass
+            # Two phases, like transform / revert: every part that can return
+            # to its own cell does, then a LOCATED part whose stored cell is
+            # now taken (and the parts under it) goes to the nearest free
+            # cell, so it can't take a cell another part is stored at. It
+            # used to be dropped without a word.
+            deferred: set = set()
+            for relocate in (False, True):
+                for pd in stored_parts:
+                    pdc = copy.deepcopy(pd)
+                    pid = str(pdc.get("id", ""))
+                    if relocate != (pid in deferred):
+                        continue
+                    if not pid or pid in self._taken_entity_ids():
+                        continue   # an id clash: something else took the id
+                    if not relocate and pdc.get("part_of") in deferred:
+                        deferred.add(pid)   # waits for its own parent
+                        continue
+                    # A glued part respawns at its parent's cell; a LOCATED
+                    # part keeps its own snapshotted position.
+                    located = bool((pdc.get("vars") or {}).get("__part_located"))
+                    px = int(pdc.get("x", x)) if located else x
+                    py = int(pdc.get("y", y)) if located else y
+                    pdc["x"], pdc["y"] = px, py
+                    try:
+                        try:
+                            _, plog = Entity.from_dict(pdc).spawn(self, px, py)
+                        except VTTError as ex:
+                            if not located:
+                                raise
+                            if not relocate:
+                                deferred.add(pid)
+                                continue
+                            near = self._find_free_cell_near(
+                                px, py, max(self.grid_width, self.grid_height),
+                                e=Entity.from_dict(pdc))
+                            if near is None or near == (px, py):
+                                raise
+                            _, plog = Entity.from_dict(pdc).spawn(
+                                self, near[0], near[1])
+                            plog = [f"⚠️ part `{pid}` couldn't return to "
+                                    f"({px},{py}) ({ex}); placed at "
+                                    f"({near[0]},{near[1]})."] + list(plog)
+                        spawn_log += plog
+                    except VTTError as ex:
+                        # Skipped rather than aborting the whole revive.
+                        spawn_log.append(f"⚠️ part `{pid}` couldn't be "
+                                         f"restored ({ex}) — dropped.")
+            self._restamp_parts_for(e.id)
             # Run the revive-effects formula on the freshly-spawned entity
             # BEFORE on_revive so on_revive observers see the post-effect
             # state (matching on_death's "see settled state" contract).
@@ -14998,7 +15025,10 @@ class MatchManager:
                     *, move: bool = False) -> Tuple[str, List[str]]:
         """Copy (move=False) or MOVE (move=True) an entity — with its vars,
         statuses, passives, clamps, facing, and its whole body-part subtree —
-        from one live match to another. Returns (new_id, spawn_log).
+        from one live match to another. Returns (new_id, spawn_log); new_id
+        is None when a transferred unit died on the way out (an
+        on_entity_despawned handler killed it), in which case the
+        destination is left as it was.
 
         Placement defaults to the entity's current cell; pass x/y to override.
         Parts ride along: glued/region parts are re-stamped onto the new
@@ -15044,6 +15074,36 @@ class MatchManager:
         tx = e.x if x is None else int(x)
         ty = e.y if y is None else int(y)
         log: List[str] = []
+        # The destination is restored exactly if the transfer can't finish:
+        # a part that can't be placed used to leave the parts spawned before
+        # it behind (a partial duplicate), and a unit killed by its own
+        # on_entity_despawned handler as it left lived on in the destination
+        # beside its corpse in the source.
+        from action import _rollback_match
+        pre_dest = dest.to_dict(include_history=False)
+        try:
+            self._spawn_copies(src, dest, e, order, idmap, tx, ty, log)
+        except Exception:
+            _rollback_match(dest, self, pre_dest)
+            raise
+        if move:
+            before = src.find_corpse(eid)
+            for oid in reversed(order):  # children first
+                if oid in src.entities:
+                    log.extend(src.entities[oid].remove())
+            after = src.find_corpse(eid)
+            if after is not None and (before is None or after[2] is not before[2]):
+                _rollback_match(dest, self, pre_dest)
+                log.append(f"💀 `{eid}` died as it left **{src.name}**; "
+                           f"it was not transferred.")
+                return None, log
+        return idmap[eid], log
+
+    def _spawn_copies(self, src: "Match", dest: "Match", e: "Entity",
+                      order: List[str], idmap: Dict[str, str],
+                      tx: int, ty: int, log: List[str]) -> None:
+        """copy_entity's spawn pass: each unit of the body (parents first)
+        into `dest`, anchored at (tx, ty)."""
         for oid in order:
             oe = src.entities[oid]
             ne = Entity.from_dict(oe.to_dict())
@@ -15075,18 +15135,13 @@ class MatchManager:
             # transferred path-mode snake re-lays at its new location, not the
             # source's (same delta the anchor moves by).
             Match._shift_snake_path_vars(ne.vars, tx - e.x, ty - e.y)
-            if oid == eid or not oe.is_located_part:
+            if oid == e.id or not oe.is_located_part:
                 px, py = tx, ty
             else:  # a located part keeps its offset from the anchor
                 px, py = tx + (oe.x - e.x), ty + (oe.y - e.y)
             _, slog = ne.spawn(dest, px, py)
             log.extend(slog)
-        dest._restamp_parts_for(idmap[eid])
-        if move:
-            for oid in reversed(order):  # children first
-                if oid in src.entities:
-                    log.extend(src.entities[oid].remove())
-        return idmap[eid], log
+        dest._restamp_parts_for(idmap[e.id])
 
     def refresh_match_rules(self, system_name: str) -> int:
         """Re-snapshot rules onto every match bound to `system_name`. Returns count refreshed.

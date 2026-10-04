@@ -4080,6 +4080,54 @@ More shipped work (continuing the list above):
     count/ids` / `!map cell` / `!whoami` / `!match info`, `!roll odds`
     caps and edge specs, the skip loop.
 
+- **Audit-pass-33 (hands-on): all-or-nothing body spawns + input edges
+  (scenarios 648-650).** The pass-30 POV leak detector re-run over every
+  command added since (546k invocations, extended pool: `!map cell`
+  coordinates, `for=`, `count`/`ids`, preview shapes, `status:`/`team=`/
+  `near:` selectors) — no leak (two false hits: status DEFINITION names in
+  `!status list` are match-wide setup like rules, and `!whoami` request
+  ids that contained "999"). The full command fuzzer (98k runs, every
+  root), the chaos harness (normal + hostile) and the model-based undo
+  test were clean. Fixes:
+  - **Multi-unit spawns are transactional (HIGH, dangling/duplicate
+    class).** `copy_entity` (`!ent copy` / `transfer`) spawned the body
+    into the destination unit by unit, so a located part that couldn't be
+    placed left the parts before it there (a partial duplicate beside the
+    untouched source); and a transferred unit killed by its own
+    on_entity_despawned handler as it left lived on in the destination
+    beside its corpse. The destination is now snapshotted and restored in
+    place with `action._rollback_match` on any spawn failure, and when the
+    unit dies on the way out (a NEW corpse with its id) — copy_entity then
+    returns `(None, log)` and the command reports "died as it left".
+    `!ent clone` claimed all-or-nothing but validated only anchor cells;
+    a footprint / located-part / block refusal midway left the clones made
+    so far. It now rolls the match back the same way. The transferred copy
+    is the unit as it stood when the transfer began: writes a despawn
+    handler makes to the leaving unit don't carry.
+  - **Revive drops no limbs silently.** `revive_corpse` skipped a located
+    part whose stored cell was taken, losing it for good with no message.
+    It now uses transform's two-phase placement: parts that can return do,
+    then displaced located parts (and the sub-parts glued to them) go to
+    the nearest free cell with a ⚠️ line; dropped only when nothing fits,
+    and said so.
+  - **`_parse_scalar` (every `!ent set_var` / `!defvar` / `!team set`
+    value) kept `inf` / `nan` / `Infinity` / `1e999` as non-finite
+    floats** — a word became a number that poisons comparisons and sorts.
+    Non-finite parses now stay strings. `_coerce_vital_value` caught only
+    ValueError, so writing infinity to hp leaked "cannot convert float
+    infinity to integer"; it now reads as "must be a finite number".
+  - `!roll 1d6 1d6` joined into the malformed term `1d61d6` (the usage
+    line even advertised `<dice> [<dice> ...]`): adjacent terms with no
+    operator get a clear ❌, usage reads `<dice expression>`. `!roll odds`
+    counted the span `hi - lo + 1` as "possible totals" (an exploding d6
+    never totals 6); it counts reachable totals. The diff formatter
+    (`!history diff`, undo preview, `!ent diff`) printed a missing side as
+    `- 5` (read as minus five); it is now `5 -> (unset)`.
+  - OBSERVED, not changed: every formula mutator (`summon`, `kill`,
+    `revive`, `transform`, ...) discards the log its Match method returns,
+    so hook output and warnings from formula-driven spawns/deaths never
+    reach the user (only commands show them).
+
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
 and explain the "why").
