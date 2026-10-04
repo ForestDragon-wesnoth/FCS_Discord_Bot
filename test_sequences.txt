@@ -17784,3 +17784,58 @@ blocks, broken smoke never hides), so the typo used to go unnoticed. A
 valid formula (the opaque line) sets quietly. `!map cell ... for=<unit>`
 names a condition that failed at use and counted as "no" — here the
 scout has no `flying` var yet; once it does, the wall blocks it.
+
+
+SCENARIO 658 — a save file that fails to load leaves the bot as it was
+-----------------------------------------------------------------------
+
+!match new s658 Keep 8 6
+!match use s658
+!ent add hero Hero 30 2 2 10
+!history save cp
+!history export manual:cp snap658.json
+!store load snap658.json
+?? ❌ Invalid save file format in 'saves/snap658.json'
+!match info
+?? Keep
+!assert "entity[hero].hp == 30" "the match survived the failed load"
+
+Expected: `!history export` writes one match snapshot, which isn't a full
+save (it has no game systems), so `!store load` refuses it. The load is
+all-or-nothing: the matches, systems and channel pointers are only
+replaced once the whole file has parsed. Before, a file that failed
+partway had already replaced the matches (here with none), so the
+refusal came with every match on the bot gone.
+
+
+SCENARIO 659 — a snapshot imported from another match restores its board, not its identity
+-------------------------------------------------------------------------------------------
+
+!match new s659a Source 8 8
+!match use s659a
+!ent add scout Scout 10 1 1 5
+!history save board
+!history export manual:board board659.json
+!store save full659.json
+!match new s659b Target 6 6
+!match use s659b
+!ent add guard Guard 10 2 2 5
+!history import full659.json
+?? it's a full bot save — that loads with `!store load`
+!history import board659.json as fromsource
+!history restore fromsource confirm
+!match info
+?? **Target** (`s659b`)
+!list
+?? Scout (scout)
+!match use s659a
+!match info
+?? **Source** (`s659a`)
+
+Expected: Importing a whole-bot save with `!history import` names the
+command that loads it (it used to fail with the bare key `'kind'`). The
+Source board exported and restored into Target replaces Target's board
+(Scout instead of Guard, an 8×8 grid), but Target keeps its id, name and
+hosts. Before, the restore installed the snapshot's own id: two matches
+both reported `s659a`, and Target's approval requests were filed under
+the other match.

@@ -15333,24 +15333,47 @@ class MatchManager:
             raise VTTError(f"File not found: '{path}'")
         except (OSError, json.JSONDecodeError) as e:
             raise VTTError(f"Failed to load from '{path}': {e}")
+        # Everything is built into locals and committed only once the whole
+        # file has parsed: a file that failed partway used to leave the bot
+        # with the new matches but the old systems (and the old matches
+        # gone) while reporting the error.
         try:
-            self.matches = {mid: Match.from_dict(md) for mid, md in data.get("matches", {}).items()}
-            self.active_by_channel = data.get("active_by_channel", {})
-            self.systems = {
+            matches = {mid: Match.from_dict(md)
+                       for mid, md in data.get("matches", {}).items()}
+            active_by_channel = dict(data.get("active_by_channel", {}))
+            if not isinstance(data, dict) or "systems" not in data:
+                raise VTTError(
+                    "it isn't a full bot save (no game systems) — a "
+                    "`!history export` snapshot loads with `!history import`")
+            systems = {
                 name: GameSystem.from_dict(sd)
                 for name, sd in data["systems"].items()
             }
-            self.default_system_name = data.get("default_system_name", "default")
-            self.default_system_per_server = data.get("default_system_per_server", {})
-            self.default_system_per_channel = data.get("default_system_per_channel", {})
+            default_name = data.get("default_system_name", "default")
+            if default_name not in systems:
+                raise VTTError(
+                    f"its default system '{default_name}' isn't among its "
+                    f"systems ({', '.join(sorted(systems)) or 'none'})")
+            per_server = dict(data.get("default_system_per_server", {}))
+            per_channel = dict(data.get("default_system_per_channel", {}))
             # Re-snapshot each match's rules dict from its bound system so
             # mid-write rule edits since the save took effect when reloaded.
-            for m in self.matches.values():
-                if m.system_name not in self.systems:
-                    m.system_name = self.default_system_name
-                m.rules = self._build_rules_dict(self.systems[m.system_name])
+            for m in matches.values():
+                if m.system_name not in systems:
+                    m.system_name = default_name
+                m.rules = self._build_rules_dict(systems[m.system_name])
                 for e in m.entities.values():
                     e.bind(m, set_spawn_facing=False)
+            # A channel pointing at a match the file doesn't have would
+            # make every command there fail on a missing match.
+            active_by_channel = {ch: mid for ch, mid in active_by_channel.items()
+                                 if mid in matches}
         except Exception as e:
             # Defensive: any schema mismatch should be surfaced as a friendly VTTError
             raise VTTError(f"Invalid save file format in '{path}': {e}")
+        self.matches = matches
+        self.active_by_channel = active_by_channel
+        self.systems = systems
+        self.default_system_name = default_name
+        self.default_system_per_server = per_server
+        self.default_system_per_channel = per_channel

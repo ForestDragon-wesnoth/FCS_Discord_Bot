@@ -6345,6 +6345,17 @@ def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot,
     # the table, and host commands held for `!match resume` stay held.
     new_match.paused = old.paused
     new_match.held_commands = old.held_commands
+    # A snapshot `!history import`ed from ANOTHER match restores that board
+    # here, but the match stays itself: its id (the key everything files
+    # under — two matches reporting one id sent this match's approval
+    # requests to the other), its name, and who runs it.
+    if new_match.id != old.id:
+        new_match.id = old.id
+        new_match.name = old.name
+        new_match.owner = old.owner
+        new_match.cohosts = copy.deepcopy(old.cohosts)
+        new_match.access_overrides = copy.deepcopy(old.access_overrides)
+        bindings = "keep"
     # A match's rules are a copy of its GameSystem's, refreshed on every
     # system edit. Those edits are bot-wide (admin) settings that an undo of
     # one match doesn't revert: restoring the snapshot's copy would run this
@@ -6791,11 +6802,26 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             override_name = args[3]
         try:
             with open(full, "r", encoding="utf-8") as f:
-                snap = Snapshot.from_dict(json.load(f))
+                raw = json.load(f)
+            if isinstance(raw, dict) and "systems" in raw and "matches" in raw:
+                raise VTTError(f"Failed to import from '{path}': it's a full "
+                               f"bot save — that loads with `!store load`.")
+            snap = Snapshot.from_dict(raw)
         except FileNotFoundError:
             raise VTTError(f"File not found: '{path}'")
         except (OSError, json.JSONDecodeError, KeyError) as ex:
             raise VTTError(f"Failed to import from '{path}': {ex}")
+        except (TypeError, ValueError, AttributeError) as ex:
+            raise VTTError(f"Failed to import from '{path}': {ex}")
+        if not isinstance(getattr(snap, "state", None), dict) or \
+                "entities" not in snap.state:
+            raise VTTError(f"Failed to import from '{path}': it isn't a "
+                           f"snapshot export.")
+        try:
+            Match.from_dict(copy.deepcopy(snap.state))
+        except Exception as ex:
+            raise VTTError(f"Failed to import from '{path}': its match state "
+                           f"doesn't load ({type(ex).__name__}: {ex}).")
         name = override_name or snap.label or f"imported-{snap.sequence}"
         # The imported snapshot keeps its OLD sequence number, which
         # could collide with the current match's sequence space. That's
