@@ -14749,15 +14749,22 @@ SCENARIO 569 — `!find show:status` + lowest_var / highest_var targeting helper
 !ent set_var b team blue
 !ent add c C 44 4 5 5
 !ent set_var c team blue
+!ent add d D 5 5 6 5
+!ent set_var d team red
 !status def burn tick ""
 !status def slow tick ""
 !status apply a burn 2 3
 !status apply a slow
 !find team=blue show:status
 !find team=blue show:status,hp sort:hp
-!eval "lowest_var(entities_within('hero', 5, 'hostile'), 'hp')"
-!eval "highest_var(entities_within('hero', 5, 'hostile'), 'hp')"
-!eval "lowest_var(entities_within('hero', 5, 'hostile'), 'nosuchvar')"
+!eval "lowest_var(entities_within('hero', 5, 'square_radius', 'hostile'), 'hp')"
+?? = `'b'`
+!eval "highest_var(entities_within('hero', 5, 'square_radius', 'hostile'), 'hp')"
+?? = `'c'`
+!eval "lowest_var(entities_within('hero', 5), 'hp')"
+?? = `'d'`
+!eval "lowest_var(entities_within('hero', 5, 'square_radius', 'hostile'), 'nosuchvar')"
+?? = `''`
 
 Expected: statuses live in `e.status`, NOT in vars, so `show:status` used to
 render `—` for everyone. `status` (and the alias `statuses`) is now a
@@ -14774,8 +14781,11 @@ exist because the sandbox has no comprehensions and no loop `break`, so this
 otherwise needs a hand-rolled running-minimum accumulator in every targeting
 formula. Entities missing the var (or holding a non-numeric value) are SKIPPED,
 ties break on the lower id so results are deterministic, and `''` comes back
-when nothing qualifies — so `b` (12 hp) and `c` (44 hp) here, and `''` for a var
-nobody has. Both are read-only and classified ARG_SAFE, so they work inside
+when nothing qualifies — so among the hostile units `b` (12 hp) and `c` (44
+hp) here, the ally `d` (5 hp) when the list isn't filtered by relation, and
+`''` for a var nobody has. (The relation is entities_within's FOURTH
+argument, after the distance mode; this scenario used to pass 'hostile' as
+the mode, which was read as Chebyshev with no filter.) Both are read-only and classified ARG_SAFE, so they work inside
 inline `$()` arguments.
 
 
@@ -17839,3 +17849,77 @@ Source board exported and restored into Target replaces Target's board
 hosts. Before, the restore installed the snapshot's own id: two matches
 both reported `s659a`, and Target's approval requests were filed under
 the other match.
+
+
+SCENARIO 660 — a part hit and a `source.` write show their hook output
+-----------------------------------------------------------------------
+
+!match new s660 Output 8 8
+!match use s660
+!ent add boss Boss 5 3 3 5
+!part add boss head Head 20 20
+!ent set_var head to_main_percent 100
+!ent set_var head to_main_cap none
+!gpassive add obit on_death "log('obit')"
+!passive add boss flinch on_var_changed target=hp "entity[boss].flinched = 1"
+!eval "damage_part('head', 3)"
+?? ⚙️ passive `boss.flinch` fired on `boss` (on_var_changed)
+!eval "damage_part('head', 10)"
+?? ⚙️ global passive `obit` fired on `boss` (on_death)
+!list
+?? Boss (`boss`): HP: -8/5
+!ent add hero Hero 20 6 6 5
+!ent set_var hero inventory.potion.uses 2
+!ent set_var hero inventory.potion.actions.drink.body "source.uses = source.uses - 1"
+!passive add hero tally on_var_changed target=inventory.potion.uses "entity[hero].drinks = 1"
+!action hero drink
+?? ⚙️ passive `hero.tally` fired on `hero` (on_var_changed)
+!assert "entity[hero].inventory.potion.uses == 1"
+
+Expected: Damage to a part goes to the parent's hp first (100% here); the
+parent's hp hook and, on the lethal hit, its death now show in the reply.
+Before, damage_part dropped the log of both hp writes, so a boss killed
+through its head died without a line, and after that death removed the
+head (snapshotted into the corpse) the part's own write went to a
+detached object. An action body that writes through `source.` (an item's
+own vars) shows the hook it triggers too, like an `entity[x].path = ...`
+write does.
+
+
+SCENARIO 661 — mode names are checked: distance metrics, damage_spread, to_main_cap, str rules
+-------------------------------------------------------------------------------------------------
+
+!match new s661 Modes 8 8
+!match use s661
+!ent add a A 20 1 1 5
+!ent add b B 20 4 4 5
+!part add b arm Arm 5 5
+!eval --as a "entities_within('a', 3, 'manhatan')"
+?? ❌ unknown distance mode 'manhatan'
+!eval --as a "entities_within('a', 6, 'manhattan')"
+?? = `['b']`
+!dist a b manhatan
+?? ❌ `manhatan` isn't a metric
+!eval "damage_spread('b', 4, 'wieghted')"
+?? ❌ damage_spread: mode 'wieghted' isn't weighted, uniform, fragment or main_only.
+!eval "damage_spread('b', 4, 'fragment', 10**9)"
+?? over the formula_loop_limit of 10000
+!ent set_var arm to_main_percent 50
+!ent set_var arm to_main_cap max_HP
+!eval "damage_part('arm', 2)"
+?? ❌ damage_part `arm`: to_main_cap 'max_HP' isn't none, max_hp, remaining_hp or absolute:<n>.
+!assert "entity[b].hp == 20 and entity[arm].hp == 5" "the refused hit changed nothing"
+!system set default aoe_default_mode wieghted
+?? ❌ Setting 'aoe_default_mode' must be one of: weighted, uniform, fragment, main_only
+!system set default part_to_main_cap_default absolute:4
+?? part_to_main_cap_default = 'absolute:4'
+!system set default part_to_main_cap_default max_hp
+
+Expected: Each of these used to accept a typo and quietly do something
+else. entities_within / nearest_entity / `near:` / `!dist` read an unknown
+distance mode as Chebyshev (now refused at the shared _rect_gap);
+damage_spread split by weight on an unknown mode, and a fragment count of
+10**9 looped a billion times; a part whose `to_main_cap` was misspelled
+passed the whole hit through uncapped; the str rules with fixed choices
+(aoe_default_mode, hit_location_mode, the segment modes,
+part_to_main_cap_default, which also takes absolute:<n>) stored any value.

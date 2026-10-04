@@ -2817,6 +2817,15 @@ def _coerce_rule_value(key: str, raw_value: str):
     if t == "str":
         # keep raw as-is; CLI passes a single token
         # (you can extend later to join the rest of args for multi-word strings)
+        choices = spec.get("choices")
+        if choices and raw_value not in choices and not (
+                key == "part_to_main_cap_default"
+                and re.fullmatch(r"absolute:\d+", raw_value)):
+            # A typo'd mode used to be stored and then read as the default.
+            extra = (", or absolute:<n>" if key == "part_to_main_cap_default"
+                     else "")
+            raise VTTError(f"Setting '{key}' must be one of: "
+                           f"{', '.join(choices)}{extra}")
         return raw_value
 
     if t == "list":
@@ -8671,7 +8680,15 @@ class Match:
             return int(gx + gy)
         if mode in ("euclidean", "euclidean_distance"):
             return math.sqrt(gx * gx + gy * gy)
-        return int(max(gx, gy))   # square_radius (Chebyshev), the default
+        if mode in ("square_radius", "square_radius_distance"):
+            return int(max(gx, gy))   # Chebyshev, the default
+        # Any other name used to fall through to Chebyshev, so a typo'd
+        # metric in entities_within / nearest_entity / `near:` was silently
+        # ignored.
+        raise VTTError(
+            f"unknown distance mode {mode!r}. Allowed: euclidean, "
+            f"euclidean_distance, manhattan, manhattan_distance, "
+            f"square_radius, square_radius_distance.")
 
     def entity_gap_distance(self, e_ref: "Entity", e_other: "Entity",
                             mode: str = "square_radius") -> float:
@@ -11660,8 +11677,14 @@ class Match:
             try:
                 return min(amount, int(cap.split(":", 1)[1]))
             except (TypeError, ValueError):
-                return amount
-        return amount              # "none" / unknown -> uncapped
+                pass
+        elif cap == "none":
+            return amount          # uncapped
+        # An unknown value (a typo'd `to_main_cap` var) used to mean
+        # "uncapped": a big hit then tapped through in full.
+        raise VTTError(
+            f"to_main_cap {cap!r} isn't none, max_hp, remaining_hp or "
+            f"absolute:<n>.")
 
     def damage_part(self, part_id: str, amount: int) -> Tuple[int, List[str]]:
         """Deal `amount` damage to body part `part_id`, routing the
@@ -11699,16 +11722,28 @@ class Match:
         to_main = 0
         parent = self.entities.get(p.part_of) if p.part_of else None
         if parent is not None and pct != 0:
-            base = self._part_transfer_base(amount, cur_hp, max_hp, cap)
+            try:
+                base = self._part_transfer_base(amount, cur_hp, max_hp, cap)
+            except VTTError as ex:
+                raise VTTError(f"damage_part `{p.id}`: {ex}")
             to_main = int(round(base * pct / 100.0))
             if to_main != 0:
                 p_hp_var, _, _ = parent._vital_var_names()
-                parent.write_var(p_hp_var,
-                                 int(parent.vars.get(p_hp_var, 0) or 0) - to_main)
+                # Its log carries the parent's hp hooks and, on a lethal
+                # transfer, its death (both used to be dropped).
+                log += parent.write_var(
+                    p_hp_var,
+                    int(parent.vars.get(p_hp_var, 0) or 0) - to_main) or []
+        # The transfer can kill the parent, whose death removes its parts:
+        # this part is then gone with the corpse and takes no hit of its own.
+        if p.id not in self.entities:
+            return to_main, log
         # (3) write the part's own hp, floored at 0.
         new_hp = max(0, cur_hp - amount)
         if new_hp != cur_hp:
-            p.write_var(hp_var, new_hp)
+            log += p.write_var(hp_var, new_hp) or []
+            if p.id not in self.entities:
+                return to_main, log
         # A heal that lifts a previously-destroyed part back above 0 clears
         # the destroyed latch so it can break (and re-fire on_death) again,
         # and RESUMES any aura suspended when it was destroyed (no-op unless
@@ -11921,6 +11956,11 @@ class Match:
             raise VTTError("damage_spread: total must be an integer.")
         mode = str(mode) if mode is not None else \
             str(self.rules.get("aoe_default_mode", "weighted"))
+        if mode not in ("weighted", "uniform", "fragment", "main_only"):
+            # An unknown mode used to split by weight without a word.
+            raise VTTError(
+                f"damage_spread: mode {mode!r} isn't weighted, uniform, "
+                f"fragment or main_only.")
 
         parts = self.entity_parts(target_id)
         if origin is not None and radius is not None:
@@ -11948,6 +11988,15 @@ class Match:
             n = int(fragments) if fragments is not None else \
                 int(self.rules.get("aoe_fragment_count", 4))
             n = max(1, n)
+            try:
+                loop_limit = int(self.rules.get("formula_loop_limit", 10000))
+            except (TypeError, ValueError):
+                loop_limit = 10000
+            if n > loop_limit:
+                # One random pick per fragment: 10**9 fragments hung the bot.
+                raise VTTError(
+                    f"damage_spread: {n} fragments is over the "
+                    f"formula_loop_limit of {loop_limit}.")
             weighted = [(p, self._part_aoe_weight(p)) for p in parts]
             wsum = sum(w for _p, w in weighted)
             rng = self.formula_rng()

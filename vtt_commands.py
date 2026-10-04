@@ -6064,6 +6064,13 @@ async def dist_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     except NotFound as ex:
         return await ctx.send(f"❌ {ex}")
     except ValueError:
+        last = toks[-1]
+        if len(toks) == 3 and not last.lstrip("-").isdigit() \
+                and not toks[1].lstrip("-").isdigit():
+            # `!dist a b manhatan`: a typo'd metric left three endpoints.
+            return await ctx.send(
+                f"❌ `{last}` isn't a metric — use square_radius (or "
+                f"chebyshev), manhattan or euclidean, optionally with `los`.")
         return await ctx.send("❌ coordinates must be integers.")
     dstr = f"{d:g}"
     out = f"📏 {label}: **{dstr}** ({mode})"
@@ -10307,7 +10314,7 @@ async def part_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             k, _, v = tok.partition("=")
             if not k:
                 return await ctx.send(f"❌ extra var `{tok}` has an empty key.")
-            e.write_var(k, _parse_scalar(v))
+            log = list(log or []) + (e.write_var(k, _parse_scalar(v)) or [])
             applied.append(k)
         extra = f" Set: {', '.join(applied)}." if applied else ""
         tail = ("\n" + "\n".join(log)) if log else ""
@@ -10337,7 +10344,7 @@ async def part_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             k, _, v = tok.partition("=")
             if not k:
                 return await ctx.send(f"❌ extra var `{tok}` has an empty key.")
-            e.write_var(k, _parse_scalar(v))
+            log = list(log or []) + (e.write_var(k, _parse_scalar(v)) or [])
             applied.append(k)
         extra = f" Set: {', '.join(applied)}." if applied else ""
         n = len(m.snake_segments(head))

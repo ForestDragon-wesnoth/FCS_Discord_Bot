@@ -613,7 +613,12 @@ class SourceProxy:
             object.__setattr__(self, attr, value)
             return
         path = self._full(attr)
-        self._entity.write_var(path, value)
+        log = self._entity.write_var(path, value)
+        # Hook output of the write joins the action's output (like an
+        # `entity[x].path = ...` write; it used to be dropped).
+        m = getattr(self._entity, "_match", None)
+        if m is not None:
+            m.surface_log(log)
 
 
 class Coord:
