@@ -390,7 +390,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import random
 
-from logic import VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, _own_value
+from logic import VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, _own_value, check_store_path
 
 
 class FormulaError(VTTError):
@@ -3190,6 +3190,7 @@ def _get_path(d: Dict[str, Any], path: str) -> Any:
 
 
 def _set_path(d: Dict[str, Any], path: str, value: Any) -> None:
+    check_store_path(path)
     keys = path.split(".")
     cur = d
     for k in keys[:-1]:
@@ -4298,6 +4299,10 @@ class FormulaEngine:
             e = match.entities.get(eid)
             if e is None:
                 raise FormulaError(f"unknown entity id '{eid}'.")
+            try:
+                check_store_path(path, "status path")
+            except VTTError as ex:
+                raise FormulaError(str(ex))
             before = copy.deepcopy(e.status[name]) if name in e.status else None
             data = e.status.setdefault(name, {})
             keys = path.split(".")

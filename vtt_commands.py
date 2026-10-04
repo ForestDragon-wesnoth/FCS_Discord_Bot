@@ -14,7 +14,7 @@ from logic import (
 )
 
 # Passive system
-from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK
+from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, check_store_path
 
 # Clamp system
 from logic import ClampSpec
@@ -8262,6 +8262,7 @@ async def defvar_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "defvar", "add"):
             return
         path = args[1]
+        check_store_path(path, "var path")
         if path.split(".", 1)[0] in RESERVED_VAR_PATHS:
             return await ctx.send(
                 f"❌ `{path.split('.', 1)[0]}` is a reserved var path (read from "
@@ -8878,6 +8879,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     f"({', '.join(sorted(TILE_RESERVED_KEYS))})."
                 )
             value = _parse_scalar(args[4])
+            check_store_path(path, "template path")
             tpl = m.tile_templates[name]
             # Reuse Match.tile_set_path's path-walking semantics by
             # operating directly on the template's data dict — we don't

@@ -18072,3 +18072,30 @@ False, the walker kept its old facing, the block_tp rule applied instead
 of block_walk, on_entity_step never fired, and a snake head left its body
 behind (s1 / s2 stayed put). Now the head's two steps pull s1 into (2,5)
 and s2 into (1,5).
+
+
+SCENARIO 666 — a path with an empty segment is refused, not stored under ""
+----------------------------------------------------------------------------
+
+!match new s666 Paths 8 8
+!match use s666
+!ent add a A 20 1 1 5
+!ent set_var a inventory..sword 1
+?? ❌ Variable path 'inventory..sword' has an empty segment
+!ent set_var a .lead 1
+?? has an empty segment
+!eval "var_set('a', 'bag.', 2)"
+?? has an empty segment
+!tile set 2 2 a..b 1
+?? ❌ tile path 'a..b' has an empty segment
+!team set red a..b 1
+?? ❌ team path 'a..b' has an empty segment
+!eval "match_var_set('m..n', 1)"
+?? has an empty segment
+!assert "not var_has('a', 'inventory') and not var_has('a', 'bag')" "nothing was stored"
+
+Expected: A doubled, leading or trailing dot in a var / tile / team / zone
+/ match-var / status / template / default-var path is refused. Before, the
+empty segment became a key named "": `inventory..sword` stored
+inventory[""]["sword"], `.lead` stored vars[""]["lead"], and the typo never
+surfaced.

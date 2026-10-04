@@ -2906,6 +2906,18 @@ def check_grid_dimensions(width: Any, height: Any, rules: Dict[str, Any],
                 f"(the max_grid_dimension rule; -1 = unlimited).")
 
 
+def check_store_path(path: Any, what: str = "path") -> None:
+    """Refuse a dotted path with an empty segment before anything is stored
+    under it. `.lead`, `trail.` and `inventory..sword` used to create keys
+    named "" (inventory[""]["sword"]) instead of reporting the typo."""
+    p = str(path)
+    if not p:
+        raise VTTError(f"{what} cannot be empty.")
+    if "" in p.split("."):
+        raise VTTError(f"{what} '{p}' has an empty segment (a doubled, "
+                       f"leading or trailing dot).")
+
+
 def _own_value(value: Any) -> Any:
     """`value` ready to store: a dict or list is deep-copied so the store owns
     it (no object shared with another var, team, tile, zone or status),
@@ -4937,8 +4949,7 @@ class Entity:
         newly-created level along the path, matching the documented "top-down
         for creation" semantics.
         """
-        if not path:
-            raise VTTError("Variable path cannot be empty.")
+        check_store_path(path, "Variable path")
         if self._match is not None:
             msg = reserved_var_path_error(path, f"Writing '{path}' on `{self.id}`")
             if msg:
@@ -6047,8 +6058,7 @@ class Match:
             raise OutOfBounds(
                 f"({x},{y}) outside {self.grid_width}x{self.grid_height}"
             )
-        if not path:
-            raise VTTError("tile path cannot be empty.")
+        check_store_path(path, "tile path")
         d = self.tiles.setdefault((x, y), {})
         parts = path.split(".")
         for i, key in enumerate(parts[:-1]):
@@ -7388,6 +7398,7 @@ class Match:
     def team_set(self, team: str, path: str, value: Any) -> None:
         """Set a dotted path in a team's data dict (creating it + nested
         dicts as needed)."""
+        check_store_path(path, "team path")
         cur = self.team_data.setdefault(str(team), {})
         segs = str(path).split(".")
         for seg in segs[:-1]:
@@ -7627,13 +7638,12 @@ class Match:
 
     def zone_set_path(self, name: str, path: str, value: Any,
                       *, create: bool = True) -> None:
+        check_store_path(path, "zone path")
         z = self.zones.get(name)
         if z is None:
             if not create:
                 raise NotFound(f"Zone '{name}' not found.")
             z = self.create_zone(name)
-        if not path:
-            raise VTTError("zone path cannot be empty.")
         d = z["data"]
         parts = path.split(".")
         for i, key in enumerate(parts[:-1]):
