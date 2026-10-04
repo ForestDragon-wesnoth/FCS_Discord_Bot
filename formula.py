@@ -3708,6 +3708,7 @@ class FormulaEngine:
             DIAGONAL_DIRECTIONS as _DIAGONAL_DIRECTIONS,
             OutOfBounds as _OutOfBounds,
             Occupied as _Occupied,
+            Blocked as _Blocked,
         )
 
         def _move_entity(eid_t: Any, x: Any, y: Any) -> tuple:
@@ -3765,19 +3766,15 @@ class FormulaEngine:
                     f"move_step: diagonal direction '{direction}' "
                     f"requires allow_diagonal_movement=True."
                 )
-            dx, dy = _DIRECTION_VECTORS[canon]
-            nx, ny = e.x + dx, e.y + dy
-            if not match.in_bounds(nx, ny):
-                return False
-            # Stackable movers bypass the precheck — Entity.tp itself
-            # would also bypass, but we precheck here to return False
-            # (the formula's documented "blocked" signal) rather than
-            # raising. For stackable, "blocked" never applies.
-            if not e.is_cell_stackable and match.is_occupied(nx, ny, ignore_entity_id=e.id):
-                return False
+            # A one-cell WALK, the same as `!ent move <id> 1 <dir>`: it turns
+            # the walker to face the step, checks the block_walk rule, fires
+            # on_entity_step, and drags a snake's body along. It used to
+            # teleport to the next cell, which skipped all of that (a snake
+            # head left its body behind) and raised on a wall instead of
+            # returning False.
             try:
-                match.surface_log(e.tp(nx, ny))
-            except (_OutOfBounds, _Occupied):
+                match.surface_log(e.move_dirs([(canon, 1)]))
+            except (_OutOfBounds, _Occupied, _Blocked):
                 return False
             self._note_affected(eid)
             return True

@@ -6566,10 +6566,8 @@ Trace: move_entity to (5,5) succeeds → a at (5,5), moves = 1
 move_step right → would land on (7,5) but b is there → False,
 a still at (6,5), moves still 2. After tp a 8 5 (the grid edge),
 move_step right → False (off-grid), a unchanged. After tp a 6 5,
-move_step right → True, lands on (7,5) — wait, b is there. So
-False. The point: move_step honors the same bounds/occupancy
-rules !ent move does, and is observationally identical (tile
-hooks fire, on_entity_moved fires) when the step succeeds.
+move_step right → False again: (7,5) is b's cell. move_step is a
+one-cell walk, the same as `!ent move <id> 1 <dir>` (see 665).
 
 
 SCENARIO 261 — Composition: status event triggers cleanup passive
@@ -18044,3 +18042,33 @@ rider) and is on team red; red's `!list` still shows it, like `!turn` and
 Before, the roster dropped every hidden rider, so red's own scout vanished
 from red's `!list` while it rode. Spy (team blue) rides in the same cart
 and stays hidden from red.
+
+
+SCENARIO 665 — move_step walks: facing, walls and a snake's body
+-----------------------------------------------------------------
+
+!match new s665 Step 8 8
+!match use s665
+!ent add a A 20 1 1 5
+!tile set 2 1 block true
+!eval "move_step('a', 'right')"
+?? = `False`
+!eval "move_step('a', 'down')"
+?? = `True`
+!assert "facing_of('a') == 'down'" "the walker faces its step"
+!ent add w W 20 1 5 4
+!part segment w s1 S 5 5
+!part segment w s2 S 5 5
+!eval "move_step('w', 'right')"
+!eval "move_step('w', 'up')"
+!assert "entity[s1].x == 2 and entity[s1].y == 5" "the first segment trails into the head's old cell"
+!assert "entity[s2].x == 1 and entity[s2].y == 5"
+!assert "facing_of('w') == 'up'"
+
+Expected: move_step is now a one-cell walk through the same path as `!ent
+move <id> 1 <dir>`. Before, it teleported to the next cell: a wall
+(`block true`) raised "Cell (2,1) blocks `a`" where the docs promise
+False, the walker kept its old facing, the block_tp rule applied instead
+of block_walk, on_entity_step never fired, and a snake head left its body
+behind (s1 / s2 stayed put). Now the head's two steps pull s1 into (2,5)
+and s2 into (1,5).
