@@ -7304,6 +7304,11 @@ class FormulaEngine:
             from action import ActionFail, ActionEngineFault, ChoiceNeeded
             if isinstance(e, (ActionFail, ActionEngineFault, ChoiceNeeded)):
                 raise
+            if isinstance(e, VTTError):
+                # The engine refused something (an entity not found, a cell
+                # occupied, a budget exceeded) and its message says what.
+                # "Runtime error:" is kept for raw Python errors.
+                raise FormulaError(str(e))
             raise FormulaError(f"Runtime error: {_runtime_msg(e)}")
 
     def eval_program(self, src: str, ctx: EvalCtx,
@@ -7387,6 +7392,11 @@ class FormulaEngine:
             from action import ActionFail, ActionEngineFault, ChoiceNeeded
             if isinstance(e, (ActionFail, ActionEngineFault, ChoiceNeeded)):
                 raise
+            if isinstance(e, VTTError):
+                # The engine refused something (an entity not found, a cell
+                # occupied, a budget exceeded) and its message says what.
+                # "Runtime error:" is kept for raw Python errors.
+                raise FormulaError(str(e))
             raise FormulaError(f"Runtime error: {_runtime_msg(e)}")
 
 

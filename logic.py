@@ -423,7 +423,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "segment_spacing": {
         "default": 1,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "For `path` follow mode, how many cells of head travel separate "
             "consecutive segments (1 = adjacent). Ignored by `trail` mode "
@@ -547,7 +547,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "aoe_fragment_count": {
         "default": 4,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Default number of discrete random hits in damage_spread's "
             "`fragment` mode (each lands on a weighted-random part, dealing "
@@ -831,7 +831,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "atb_threshold": {
         "default": 100,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "The ATB bar value an entity must reach to take a turn. Higher = "
             "slower cadence overall. Per-entity pace is expressed via the "
@@ -1239,7 +1239,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # ---- Directional / facing-relative geometry ----
     "directional_corner_arc": {
         "default": 30,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "max": 90},
         "desc": (
             "Default angular width (degrees) of each diagonal CORNER side "
             "when the directional primitives (side_hit / relative_side / "
@@ -1256,7 +1256,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "event_recursion_limit": {
         "default": 64,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Max nesting depth for the custom event bus (emit). A handler "
             "fired by an event may itself emit; this caps the chain so a "
@@ -1267,7 +1267,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "macro_repeat_limit": {
         "default": 1000,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0},
         "desc": (
             "Max iterations a single `repeat N` block in a macro will run "
             "(N is clamped to this). Guards against a typo'd huge count."
@@ -1275,7 +1275,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "macro_step_limit": {
         "default": 10000,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Hard backstop on the TOTAL work a single `!macro run` may do — "
             "command lines dispatched PLUS `repeat` loop iterations (across all "
@@ -1286,7 +1286,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "macro_recursion_limit": {
         "default": 20,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Max depth of nested `!macro run` / `!run` calls (a macro line or "
             "script line that runs another macro or script, counted as one "
@@ -1366,7 +1366,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     ## Var-hook system rules
     "var_hook_recursion_limit": {
         "default": 128,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Maximum depth of var-event recursion before further hook firing "
             "is suppressed. A var-hook passive's formula may itself write vars, "
@@ -1391,7 +1391,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "formula_function_recursion_limit": {
         "default": 64,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Maximum call depth for user-defined formula functions (see "
             "!func). A function may call other functions (or itself); if "
@@ -1403,7 +1403,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "formula_loop_limit": {
         "default": 10000,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Maximum total iterations across all for-loops in a single "
             "formula evaluation. Loops over entities_within / "
@@ -1416,7 +1416,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "formula_cell_limit": {
         "default": 100000,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Maximum number of cells one geometry query in a formula may "
             "generate or walk: cells_in_burst / _rect / _cone / _line, "
@@ -1432,7 +1432,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "formula_size_limit": {
         "default": 100000,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Maximum length of a string or list a formula may build with "
             "`*` or `+` (e.g. 'ab' * n, [0] * n, s + s). Guards against "
@@ -1444,7 +1444,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "summon_event_limit": {
         "default": 50,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0},
         "desc": (
             "Maximum number of entities that may be summoned during a "
             "single top-level command (including all hook fires and "
@@ -1841,7 +1841,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "preview_opacity": {
         "default": 40,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "max": 100},
         "desc": (
             "`!map preview` (graphics): opacity 0-100 of the covered-cell "
             "squares. An `opacity=` arg on the command overrides it for one "
@@ -1939,7 +1939,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "fog_opacity": {
         "default": 60,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "max": 100},
         "desc": (
             "Opacity (0-100 percent) of the graphics fog overlay over unseen "
             "cells. 100 = fully hides what's underneath; lower = translucent "
@@ -1970,7 +1970,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "border_opacity": {
         "default": 50,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "max": 100},
         "desc": (
             "Opacity (0-100 percent) of the grid border lines. Default 50 (a "
             "subtle grid). Per-tile override: the tile's `border_opacity` "
@@ -2059,7 +2059,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "corpse_sprite_opacity": {
         "default": 50,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "max": 100},
         "desc": (
             "Opacity (0-100 percent) of a corpse's sprite. Default 50 (a "
             "semi-transparent body). Combined with corpse_sprite_tint."
@@ -2067,7 +2067,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "sprite_cell_size": {
         "default": 100,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Pixel size of one grid cell in the graphics surface (gui.py). "
             "Default 100 -> a 100x100 px cell. A sprite is scaled to its "
@@ -2082,7 +2082,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # A grid that fits both caps renders whole (no viewport).
     "max_grid_dimension": {
         "default": 500,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1, "unlimited": True},
         "desc": (
             "Largest width or height a grid may have, checked by `!match "
             "new` (against the new match's system) and `!map resize`. A "
@@ -2093,7 +2093,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "viewport_width": {
         "default": 30,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Max map columns shown at once before a horizontal viewport "
             "engages. A grid wider than this renders a window and the "
@@ -2102,7 +2102,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "viewport_height": {
         "default": 30,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Max map rows shown at once before a vertical viewport engages "
             "(see viewport_width)."
@@ -2129,7 +2129,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # always pans exactly n (default 1) regardless of this.
     "viewport_button_step": {
         "default": 0,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0},
         "desc": (
             "Tiles per Discord pan-button click (0 = half the viewport — a "
             "half-screen scroll). The `!map pan <dir> [n]` command pans an "
@@ -2266,7 +2266,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # surface; see also Match.discover_actions and the !action command.
     "action_recursion_limit": {
         "default": 8,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Maximum action call depth — an action body that calls "
             "use_action() into another action counts as a nested call. "
@@ -2279,7 +2279,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "action_choice_limit": {
         "default": 20,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0},
         "desc": (
             "Maximum number of mid-body choices (choose / choose_number "
             "prompts) a single action invocation may make. The runner "
@@ -2377,7 +2377,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # means "disable that snapshot kind / prompt entirely".
     "autosave_round_retention": {
         "default": -1,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "unlimited": True},
         "desc": (
             "Cap on retained round-start autosaves. -1 = unlimited (default; "
             "the original spec is 'every start of round, for the entirety of "
@@ -2389,7 +2389,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "autosave_turn_retention_rounds": {
         "default": 3,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "unlimited": True},
         "desc": (
             "How many rounds' worth of turn-start autosaves to keep. -1 = "
             "unlimited (one per entity per round, forever — memory-heavy "
@@ -2404,7 +2404,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "autosave_turn_retention_turns": {
         "default": 20,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "unlimited": True},
         "desc": (
             "The ATB counterpart of autosave_turn_retention_rounds: how many "
             "of the most recent turn-start autosaves to keep when atb_enabled "
@@ -2418,7 +2418,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "autosave_command_retention_turns": {
         "default": 3,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "unlimited": True},
         "desc": (
             "How many turns' worth of pre-command autosaves to keep. -1 = "
             "unlimited. 0 = disable command autosaves entirely. Default 3 = "
@@ -2432,7 +2432,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "autosave_command_retention_max": {
         "default": 100,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "unlimited": True},
         "desc": (
             "Hard cap on how many pre-command autosaves are kept, on top of "
             "the autosave_command_retention_turns window (the oldest beyond "
@@ -2447,7 +2447,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "undo_confirmation_turn_threshold": {
         "default": 3,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "unlimited": True},
         "desc": (
             "Undoing this many or more turns requires the user to repeat the "
             "command with a trailing `confirm` token. Smaller undos go "
@@ -2458,7 +2458,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "undo_confirmation_round_threshold": {
         "default": 1,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "unlimited": True},
         "desc": (
             "Undoing this many or more rounds requires `confirm`. Default 1 "
             "(any round-undo prompts, since a round is a lot of state). -1 "
@@ -2469,7 +2469,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "undo_confirmation_command_threshold": {
         "default": -1,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "unlimited": True},
         "desc": (
             "Undoing this many or more commands requires `confirm`. Default "
             "-1 = never prompt (commands are small-grain, low-risk). Set a "
@@ -2599,7 +2599,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "event_log_retention": {
         "default": 200,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "unlimited": True},
         "desc": (
             "Cap on the number of event-log entries kept. When the log "
             "exceeds this, the oldest entries are dropped. Default 200. "
@@ -2786,9 +2786,25 @@ def _coerce_rule_value(key: str, raw_value: str):
 
     if t == "int":
         try:
-            return int(raw_value, 10)
+            v = int(raw_value, 10)
         except ValueError:
             raise VTTError(f"Setting '{key}' expects an integer.")
+        # Bounds: a limit set to -1 (the "unlimited" of the retention rules)
+        # or an opacity of 150 used to be accepted and then refuse or
+        # misbehave on use. `unlimited` rules also take -1.
+        lo, hi = spec.get("min"), spec.get("max")
+        if spec.get("unlimited") and v == -1:
+            return v
+        if (lo is not None and v < lo) or (hi is not None and v > hi):
+            if hi is None:
+                rng = f"at least {lo}"
+            elif lo is None:
+                rng = f"at most {hi}"
+            else:
+                rng = f"between {lo} and {hi}"
+            extra = " (or -1 for unlimited)" if spec.get("unlimited") else ""
+            raise VTTError(f"Setting '{key}' must be {rng}{extra}, got {v}.")
+        return v
 
     if t == "enum":
         choices = spec["choices"]

@@ -25,6 +25,7 @@ from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, val
 import os
 import re
 from fractions import Fraction
+import asyncio
 import contextlib
 import contextvars
 import json
@@ -647,6 +648,24 @@ class CommandRegistry:
         )
 
     async def run(self, name: str, args: List[str], ctx: ReplyContext, mgr: MatchManager):
+        # One command at a time per manager. On Discord every message is its
+        # own asyncio task, and a handler awaits each reply it sends, so a
+        # second command could otherwise run in the middle of the first: its
+        # changes then landed inside the first command's undo step (undoing
+        # that one reverted both), and a `!batch` stopped being one unit.
+        # A run nested in this task (an approval, `!again`, a held command)
+        # already holds the lock.
+        if _HOLDS_COMMAND_LOCK.get():
+            return await self._run_top(name, args, ctx, mgr)
+        async with _command_lock(mgr):
+            token = _HOLDS_COMMAND_LOCK.set(True)
+            try:
+                return await self._run_top(name, args, ctx, mgr)
+            finally:
+                _HOLDS_COMMAND_LOCK.reset(token)
+
+    async def _run_top(self, name: str, args: List[str], ctx: ReplyContext,
+                       mgr: MatchManager):
         # `!again` remembers the command each user typed last in a channel.
         # Only the OUTERMOST run records: an approval re-dispatch or a held
         # command running inside `!approve` / `!match resume` is not what the
@@ -798,9 +817,10 @@ class CommandRegistry:
         if pre_state is not None and pre_active_mid in mgr.matches:
             m_post = mgr.matches[pre_active_mid]
             post_state = m_post.to_dict(include_history=False)
-            # Pausing is table management that an undo leaves alone (see
-            # _restore_snapshot), so a pause/resume alone is not an undo step.
-            if _differs_beyond_pause(pre_state, post_state):
+            # Pausing and the system's rules are things an undo leaves alone
+            # (see _restore_snapshot), so a change to them alone is not an
+            # undo step.
+            if _differs_in_undo_state(pre_state, post_state):
                 # Build a short, human-meaningful label. The full args
                 # list can be very long (multi-line passive formulas);
                 # cap it so the !history list output stays readable.
@@ -813,6 +833,9 @@ class CommandRegistry:
         # command has settled (edge-triggered effects fire here). Only the
         # top-level run() polls — not dispatch_no_snapshot (batch / action
         # cmd / macro lines), so a multi-step command polls once at the end.
+        # The command's own formula output goes out first, so a watcher's
+        # lines follow the change that triggered it.
+        await _flush_formula_log(ctx)
         mid_now = mgr.active_by_channel.get(ctx.channel_key)
         if mid_now is not None and mid_now in mgr.matches:
             for line in mgr.matches[mid_now].fire_watchers():
@@ -822,13 +845,36 @@ class CommandRegistry:
 registry = CommandRegistry()
 
 
+def _take_formula_log() -> List[str]:
+    """Remove and return what formulas logged into this command's sink, for
+    a handler that places those lines in its own reply."""
+    sink = FORMULA_LOG_SINK.get()
+    if not sink:
+        return []
+    lines = list(sink)
+    sink.clear()
+    return lines
+
+
 async def _flush_formula_log(ctx: ReplyContext) -> None:
     """Show (and clear) what formulas logged into this command's sink."""
-    sink = FORMULA_LOG_SINK.get()
-    if sink:
-        lines = list(sink)
-        sink.clear()
+    lines = _take_formula_log()
+    if lines:
         await ctx.send("\n".join(lines))
+
+# Whether this asyncio task holds its manager's command lock (see run()).
+_HOLDS_COMMAND_LOCK: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "vtt_holds_command_lock", default=False)
+
+
+def _command_lock(mgr: MatchManager) -> "asyncio.Lock":
+    """The lock that runs one command at a time on `mgr` (runtime-only)."""
+    lock = getattr(mgr, "_command_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        mgr._command_lock = lock
+    return lock
+
 
 # Nesting depth of CommandRegistry.run within one asyncio task (see run()).
 _RUN_DEPTH: "contextvars.ContextVar[int]" = contextvars.ContextVar(
@@ -849,14 +895,20 @@ def _remember_command(mgr: MatchManager, ctx: ReplyContext, name: str,
     store[(ctx.channel_key, ctx_user(ctx) or "")] = (name, list(args))
 
 
-def _differs_beyond_pause(pre: Dict[str, Any], post: Dict[str, Any]) -> bool:
-    """Whether two match snapshots differ in anything but the pause."""
+# Snapshot fields an undo leaves alone, so a change to them alone is not an
+# undo step: the pause (table management, see _restore_snapshot) and the
+# rules (a copy of the GameSystem's, changed only by bot-wide system edits).
+_NOT_UNDO_STATE = ("paused", "rules")
+
+
+def _differs_in_undo_state(pre: Dict[str, Any], post: Dict[str, Any]) -> bool:
+    """Whether two match snapshots differ in anything an undo restores."""
     if pre == post:
         return False
-    if pre.get("paused") == post.get("paused"):
+    if all(pre.get(k) == post.get(k) for k in _NOT_UNDO_STATE):
         return True
-    return ({k: v for k, v in pre.items() if k != "paused"}
-            != {k: v for k, v in post.items() if k != "paused"})
+    return ({k: v for k, v in pre.items() if k not in _NOT_UNDO_STATE}
+            != {k: v for k, v in post.items() if k not in _NOT_UNDO_STATE})
 
 
 # Host-only READS: gated to hosts (they show hidden data) but they change
@@ -2558,6 +2610,11 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             extra = ""
             if t == "enum":
                 extra = f", one of {{{', '.join(sorted(schema.get('choices', [])))}}}"
+            elif t == "int" and ("min" in schema or "max" in schema):
+                lo, hi = schema.get("min"), schema.get("max")
+                extra = (f", {lo}-{hi}" if hi is not None else f", >= {lo}")
+                if schema.get("unlimited"):
+                    extra += " or -1 = unlimited"
             default_val = DEFAULT_SYSTEM_SETTINGS.get(k)
             desc = spec.get("desc", "")
             lines.append(
@@ -4436,6 +4493,9 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     sub = args[0].lower()
     if sub == "next":
         eid, fire_log = m.next_turn()
+        # Output of the changes the turn's hooks made through formulas goes
+        # with the hook lines, ahead of whose turn it now is.
+        fire_log = list(fire_log) + _take_formula_log()
         if not eid:
             if not fire_log:
                 return await ctx.send("No turn order yet.")
@@ -6224,6 +6284,13 @@ def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot,
     # the table, and host commands held for `!match resume` stay held.
     new_match.paused = old.paused
     new_match.held_commands = old.held_commands
+    # A match's rules are a copy of its GameSystem's, refreshed on every
+    # system edit. Those edits are bot-wide (admin) settings that an undo of
+    # one match doesn't revert: restoring the snapshot's copy would run this
+    # match on the old rules while the system keeps the new ones, until a
+    # reload re-copied them.
+    if new_match.system_name in mgr.systems:
+        new_match.rules = mgr._build_rules_dict(mgr.systems[new_match.system_name])
     # Channel bindings are serialized, but the channels' active pointers
     # (MatchManager.active_by_channel) are not — so a restore that simply
     # took the snapshot's bindings would leave a channel bound SINCE the

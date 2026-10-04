@@ -7129,14 +7129,14 @@ SCENARIO 280 — Recursion limit guards an action chain
 !ent set_var hero actions.bounce.target none
 !ent set_var hero actions.bounce.body "use_action(self, 'bounce')"
 !action hero bounce
+?? action recursion limit reached (3)
 
 Expected: The action recursively calls itself via use_action.
-With action_recursion_limit=3, the third nested call refuses;
-the runner returns False with the message "action recursion
-limit reached (3). ..." which the use_action() formula
-primitive bubbles up as a FormulaError, surfaced by the OUTER
-!action as `❌ action bounce: Runtime error: ...recursion
-limit...`. All mid-chain writes are rolled back. The limit
+With action_recursion_limit=3, call #4 in the chain is refused;
+the use_action() formula primitive bubbles the refusal up, and
+the OUTER !action reports "❌ action `bounce`: action recursion
+limit reached (3). The action `bounce` would be call #4 in a
+chain — ...". All mid-chain writes are rolled back. The limit
 acts as the backstop against accidentally cyclic actions.
 
 
@@ -14233,9 +14233,9 @@ True`) → ❌ "Vital var 'hp' must be a number"; nesting under a vital
 (`hp.x`, `var_add hp.inner`) → ❌ "Cannot nest under vital var". Valid writes
 still work and coerce: `hp 15`, `var_set hp '12'` → 12, `var_add hp 3` → 15.
 `!list` and `!ent dump` never 💥. bool is rejected (a True flag isn't hp=1).
-HARNESS-ALLOWS-ERRORS: the `!eval "var_set/var_add(...)"` rejection lines
-deliberately surface a top-level ❌ Runtime error (the vital-var guard firing
-through the formula path), so this scenario opts out of the runtime-error marker.
+The `!eval "var_set/var_add(...)"` rejection lines surface the vital-var
+guard's own message (a plain ❌, with no "Runtime error:" prefix — that is
+kept for raw Python errors).
 
 SCENARIO 552 — !ent clone: parts subtree + mount safety (no phantom limb/rider)
 --------------------------------------------------------------------------------
@@ -14310,9 +14310,9 @@ scenario would FAIL the hardened harness if any summon returned a ❌ Runtime
 error. var_get gains an optional default: `var_get('anchor','ctr',0)` returns 0
 on a missing path (so `... + 1` = 1, the create-or-read idiom, mirroring
 corpse_var); without a default it still raises.
-HARNESS-ALLOWS-ERRORS: the final `!eval "var_get('anchor','ctr')"` (no default)
-deliberately surfaces a top-level ❌ Runtime error to prove the raise-on-missing
-default-less behavior is preserved.
+The final `!eval "var_get('anchor','ctr')"` (no default) is refused with
+"❌ `anchor` has no var at 'ctr'.", proving the raise-on-missing default-less
+behavior is preserved.
 
 
 SCENARIO 555 — Macro runaway backstops: loop-iteration budget + recursion depth
@@ -15092,8 +15092,9 @@ cells_in_burst/_rect/_cone/_line, entities_in_rect/_cone, and the sight-line
 walkers (has_los, raycast, first_opaque, entities_on_los, ...) — at
 `formula_cell_limit` (100000 cells). A 1000x1000 rect (1,000,000 cells) is
 refused by default and allowed after raising the rule; the last line restores
-the default. HARNESS-ALLOWS-ERRORS (the sight-line refusal surfaces as a
-wrapped Runtime error).
+the default. The sight-line refusal reads "❌ inline $() argument: sight
+line ... over the formula_cell_limit" (an engine refusal, so no "Runtime
+error:" prefix).
 
 
 SCENARIO 579 — Queries respect the channel POV (pov_filters_queries)
@@ -17537,7 +17538,7 @@ SCENARIO 650 — set_var keeps inf / nan as words; !roll needs an operator betwe
 !ent set_var hero mood nan
 !assert "entity[hero].title == 'Infinity' and entity[hero].mood == 'nan'" words stay strings
 !eval "var_set('hero', 'hp', float('inf'))"
-?? ❌ Runtime error: Vital var 'hp' must be a finite number
+?? ❌ Vital var 'hp' must be a finite number
 !roll 1d6 1d6
 ?? ❌ `1d6 1d6`: put `+` or `-` between dice terms
 !roll odds 1d6!
@@ -17663,3 +17664,60 @@ round line and the round-start hook output first and "It is now **Hero**'s
 turn" last, in the order things happened (the summary used to come
 first). Cloning the paused table gives an unpaused copy (the pause
 belongs to the original table, which stays paused).
+
+
+SCENARIO 654 — undo and restore keep the GameSystem's current rules
+--------------------------------------------------------------------
+
+!match new s654 Rules 8 6
+!match use s654
+!ent add hero Hero 30 2 2 10
+!history save before
+!ent hp hero -5
+!system set default round_start_message_format "== R{round} =="
+!undo command 1
+!assert "entity[hero].hp == 30" "the undo reverted the hp change"
+!turn next
+?? == R1 ==
+!history restore before confirm
+!turn next
+?? == R1 ==
+!system set default round_start_message_format "— Round {round} —"
+
+Expected: `!system set` is a bot-wide setting, so it is not an undo step
+on the match: `!undo command 1` reverts the hp change before it (hero
+back to 30). The undo and the restore of a save taken before the edit
+both keep the system's current rules on the match — the custom round
+line still prints. Before, they restored the snapshot's copy of the
+rules, running the match on the old format until a reload.
+
+
+SCENARIO 655 — !system set refuses out-of-range numbers for bounded rules
+--------------------------------------------------------------------------
+
+!system set default formula_cell_limit -1
+?? ❌ Setting 'formula_cell_limit' must be at least 1, got -1.
+!system set default fog_opacity 150
+?? ❌ Setting 'fog_opacity' must be between 0 and 100, got 150.
+!system set default max_grid_dimension 0
+?? (or -1 for unlimited)
+!system set default max_grid_dimension -1
+?? max_grid_dimension = -1
+!system set default event_log_retention -2
+?? ❌ Setting 'event_log_retention' must be at least 0 (or -1 for unlimited), got -2.
+!system set default summon_event_limit 0
+?? summon_event_limit = 0
+!system rules
+?? (type: int, 0-100; default: 60)
+?? (type: int, >= 1 or -1 = unlimited; default: 500)
+!system set default max_grid_dimension 500
+!system set default summon_event_limit 50
+
+Expected: Bounded integer rules are checked when set. `formula_cell_limit
+-1` used to be accepted and then refuse every sight line and burst ("over
+the formula_cell_limit of -1"); `-1` means "unlimited" only on the rules
+that say so (the autosave / event-log retentions, the undo confirmation
+thresholds, max_grid_dimension). An opacity outside 0-100 is refused at
+set time (it used to be stored and refused or clamped on use). A limit
+whose 0 has a meaning (summon_event_limit 0 = no summons) still takes 0.
+`!system rules` shows each bounded rule's range.
