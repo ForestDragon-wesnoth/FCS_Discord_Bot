@@ -13466,7 +13466,13 @@ class Match:
             grid_width=d["grid_width"],
             grid_height=d["grid_height"],
             system_name=d.get("system_name", "default"),
-            rules=d.get("rules", {}),
+            # Every rule present: a snapshot or save written before a rule
+            # existed lacks its key, and the scattered rules.get(key, x)
+            # fallbacks don't all match the registry default (border_opacity
+            # 100 vs 50, background_mode stretch vs tile, an empty
+            # default_clamps, ...). The engine defaults fill the gaps.
+            rules={**copy.deepcopy(DEFAULT_SYSTEM_SETTINGS),
+                   **copy.deepcopy(d.get("rules") or {})},
         )
         for eid, ed in d.get("entities", {}).items():
             e = Entity.from_dict(ed)
