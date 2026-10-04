@@ -5548,10 +5548,12 @@ async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     active_id = m.turn_order[m.active_index] if m.turn_order else None
     lines: List[str] = []
     # Filter out entities hidden from this POV (omniscient pov=None keeps
-    # all). Corpses (the Dead: section below) are filtered too, via
+    # all). The viewer's own team is never hidden, as in `!turn` and the
+    # queries: a red unit riding inside a vehicle (a hidden rider) still
+    # lists for red. Corpses (the Dead: section below) are filtered too, via
     # corpse_visible_to.
     visible = [e for e in es
-               if m.roster_shows(e) and m.entity_visible_to(e.id, pov)]
+               if m.roster_shows(e) and not _pov_hides(m, pov, e.id)]
     if visible:
         lines.append("Entities:")
         for e in visible:

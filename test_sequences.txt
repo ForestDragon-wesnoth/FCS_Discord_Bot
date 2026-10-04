@@ -18011,3 +18011,36 @@ showed up in the match var and the tile. A save/load then split them into
 separate copies, so the board behaved differently after a reload. For the
 same reason a stored dict's keys become strings, as a save/load makes them:
 `{1: 'gold'}` couldn't be reached by the path `ranks.1` until a reload.
+
+
+SCENARIO 664 — a team's own passenger stays on its roster
+----------------------------------------------------------
+
+!match new s664 Ride 10 10
+!match use s664
+!match fog on
+!ent add scout Scout 20 1 1 5
+!ent set_var scout team red
+!ent set_var scout fog_vision_radius 3
+!ent add cart Cart 20 2 2 4
+!ent set_var cart team red
+!ent set_var cart slots.seat.capacity 1
+!mount scout cart seat
+!ent add spy Spy 20 3 2 3
+!ent set_var spy team blue
+!ent set_var cart slots.hold.capacity 1
+!mount spy cart hold
+!as view red
+!list
+?? Scout (scout)
+?! Spy (spy)
+!turn
+?? Scout
+!as view clear
+
+Expected: Scout rides inside the cart (a slot with no region, so a hidden
+rider) and is on team red; red's `!list` still shows it, like `!turn` and
+`!find` already did — a team's own units are never hidden from its view.
+Before, the roster dropped every hidden rider, so red's own scout vanished
+from red's `!list` while it rode. Spy (team blue) rides in the same cart
+and stays hidden from red.
