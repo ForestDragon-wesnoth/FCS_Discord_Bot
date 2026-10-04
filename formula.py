@@ -390,7 +390,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import random
 
-from logic import VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error
+from logic import VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, _own_value
 
 
 class FormulaError(VTTError):
@@ -3358,7 +3358,7 @@ class FormulaEngine:
         written value so it composes inside larger expressions."""
         if self._match is None:
             raise FormulaError("match vars are unavailable in this context.")
-        _set_path(self._match.vars, path, value)
+        _set_path(self._match.vars, path, _own_value(value))
         return value
 
     def _namespace(self, ctx: EvalCtx) -> Dict[str, Any]:
@@ -4316,7 +4316,7 @@ class FormulaEngine:
                 if k not in cur:
                     cur[k] = {}
                 cur = cur[k]
-            cur[keys[-1]] = value
+            cur[keys[-1]] = _own_value(value)
             after = copy.deepcopy(e.status[name])
             match._emit_status_diff(eid, name, before, after)
             self._note_affected(eid)

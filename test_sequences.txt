@@ -17975,3 +17975,35 @@ to walk the whole rectangle (trillions of cells) before keeping the 8x8
 on-grid part, which hung the bot; `!tile line` to a far point is refused
 over formula_cell_limit. A negative status level or duration (command or
 formula) is refused instead of applied as given.
+
+
+SCENARIO 663 — a dict copied through a formula is a copy, not a shared object
+------------------------------------------------------------------------------
+
+!match new s663 Alias 8 8
+!match use s663
+!ent add a A 20 1 1 5
+!ent add b B 20 3 3 4
+!ent set_var b inv.sword.dmg 5
+!passive add b watch on_var_changed target=inv "entity[b].noticed = 1"
+!eval "entity[a].inv = entity[b].inv"
+!eval "entity[a].inv.sword.dmg = 99"
+?! passive `b.watch` fired
+!assert "var_get('b', 'inv.sword.dmg') == 5" "b's sword is its own"
+!assert "not var_has('b', 'noticed')" "b's hook didn't fire for a's write"
+!team set red stash.k 1
+!eval "team_set('blue', 'stash', team_get('red', 'stash'))"
+!eval "team_set('blue', 'stash.k', 50)"
+!assert "team_get('red', 'stash.k') == 1"
+!eval "match_var_set('mv', var_get('b', 'inv'))"
+!eval "tile_set(2, 2, 'loot', var_get('b', 'inv'))"
+!eval "entity[b].inv.sword.dmg = 3"
+!assert "match_var_get('mv.sword.dmg') == 5 and tile_get(2, 2, 'loot.sword.dmg') == 5"
+
+Expected: Reading a dict out of one unit's vars and writing it into another
+(or into team data, a match var, a tile, a zone or a status) stores a copy.
+Before, both places held ONE object: setting a's sword to 99 also changed
+b's (without b's on_var_changed hook firing — b never saw the write), the
+blue team's stash edit changed red's, and later edits to b's inventory
+showed up in the match var and the tile. A save/load then split them into
+separate copies, so the board behaved differently after a reload.

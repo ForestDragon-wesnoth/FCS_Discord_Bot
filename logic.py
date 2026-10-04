@@ -2906,6 +2906,15 @@ def check_grid_dimensions(width: Any, height: Any, rules: Dict[str, Any],
                 f"(the max_grid_dimension rule; -1 = unlimited).")
 
 
+def _own_value(value: Any) -> Any:
+    """`value` ready to store: a dict or list is deep-copied so the store owns
+    it (no object shared with another var, team, tile, zone or status),
+    scalars pass through unchanged."""
+    if isinstance(value, (dict, list, tuple, set)):
+        return copy.deepcopy(value)
+    return value
+
+
 def reserved_var_path_error(path: str, where: str) -> Optional[str]:
     """The refusal message for a write at `path` whose first segment is a
     reserved var path, or None when the path is an ordinary var."""
@@ -4946,6 +4955,12 @@ class Entity:
                         f"Vital var '{seg0}' must be a finite number, got {value!r} "
                         f"on `{self.id}`.")
                 value = coerced
+        # A dict / list is stored as this unit's own copy. A formula can hand
+        # over another unit's live object (`entity[a].inv = entity[b].inv`,
+        # var_set(..., var_get(...))), which used to make both vars ONE object:
+        # a write to one changed the other with none of its hooks or clamps,
+        # and a save/load split them apart again.
+        value = _own_value(value)
 
         # Snapshot whether this is the top-level entry into a write/event
         # chain. We only drain the warning buffer at top-level exit so
@@ -6040,7 +6055,7 @@ class Match:
             if key not in d:
                 d[key] = {}
             d = d[key]
-        d[parts[-1]] = value
+        d[parts[-1]] = _own_value(value)
 
     def tile_del_path(self, x: int, y: int, path: Optional[str]) -> None:
         """Delete a dotted-path key from a tile's data, OR (when
@@ -7373,7 +7388,7 @@ class Match:
                 nxt = {}
                 cur[seg] = nxt
             cur = nxt
-        cur[segs[-1]] = value
+        cur[segs[-1]] = _own_value(value)
 
     def team_add(self, team: str, path: str, delta: float) -> Any:
         """Add `delta` to a numeric team value (0 if absent). Returns the new
@@ -7625,7 +7640,7 @@ class Match:
             if key not in d:
                 d[key] = {}
             d = d[key]
-        d[parts[-1]] = value
+        d[parts[-1]] = _own_value(value)
 
     def zone_del_path(self, name: str, path: str) -> None:
         """Delete a dotted key from a zone's data, pruning emptied
