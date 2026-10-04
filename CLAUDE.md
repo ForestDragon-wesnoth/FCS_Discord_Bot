@@ -4160,6 +4160,89 @@ More shipped work (continuing the list above):
       requester's POV can't see) shows there. Pre-existing; formula output
       now adds to it. The pass-30 leak detector skipped queued commands, so
       approved replies were never checked.
+      (On hold at the user's request.)
+
+- **Audit-pass-34 (hands-on): undo vs system rules, command interleaving,
+  typo'd modes, unbounded areas (scenarios 654-662).** Two new harnesses
+  worth reusing: a **RELOAD DIFFERENTIAL** (play the same random commands on
+  a live manager and on a `save`/`load` copy taken mid-game, compare every
+  reply and the full state each step — catches runtime-only state that
+  changes behaviour; exclude the deliberately runtime-only queues: pending
+  requests, held commands, `!again`) and a **HUGE-NUMBER TIMING FUZZER**
+  (10⁹ / -10⁹ in every numeric position of every command and every
+  state-changing formula function, under a SIGALRM). Fixes:
+  - **Undo restored the snapshot's copy of `rules` (HIGH).** Undoing past a
+    `!system set` ran that match on the old rules while the system kept the
+    new ones, until a reload re-copied them. `_restore_snapshot` now
+    re-copies the rules from the match's GameSystem (as `MatchManager.load`
+    does), and a rules-only change is not an undo step
+    (`_differs_in_undo_state`, `_NOT_UNDO_STATE` = paused + rules).
+  - **Commands interleaved on Discord (HIGH).** Each message is its own
+    asyncio task and handlers await their replies, so a second command ran
+    inside the first: its changes landed in the first one's undo step
+    (`!undo command 1` reverted both while naming one) and a `!batch` was
+    not one unit. `CommandRegistry.run` holds a per-manager `asyncio.Lock`
+    (`_command_lock(mgr)`, runtime-only), re-entrant within a task through
+    the `_HOLDS_COMMAND_LOCK` context var (approvals, `!again`, held
+    commands run nested). It is ONE lock for the whole bot — every guild's
+    commands queue behind each other; fine while the bot is small, and one
+    more thing the per-guild split (§3 multi-tenant caveat) should revisit.
+  - **`!store load` was not all-or-nothing (HIGH).** It replaced the matches
+    before parsing the systems, so loading a `!history export` file (no
+    systems) wiped every match and then reported the error. `load` now
+    builds everything into locals and commits at the end; a missing default
+    system is refused; channel pointers at matches the file lacks are
+    dropped. `!history import` names a whole-bot save and refuses a
+    snapshot whose state doesn't load.
+  - **A snapshot imported from ANOTHER match installed that match's id**
+    under this match's key (two matches reporting one id; this match's
+    approval requests resolved against the other). A foreign snapshot now
+    restores only the board: id, name, owner, co-hosts, access overrides
+    and bindings stay.
+  - **Typo'd modes were silently read as a default.** `_rect_gap` (behind
+    entities_within / nearest_entity / entities_in_area / `near:` /
+    `within:` / `!dist`) read any unknown metric as Chebyshev — scenario 569
+    had passed 'hostile' as entities_within's MODE (the relation is the
+    FOURTH argument; note nearest_entity takes relation SECOND — the two
+    orders differ) and passed with no filter. damage_spread split by weight
+    on an unknown mode; a part's misspelled `to_main_cap` passed hits
+    through uncapped. All refused now. `str` rules with `choices` are
+    checked by `!system set` (they stored anything); `!ent set_var` warns
+    on an engine-read var with fixed words (`_ENGINE_VAR_RULES`).
+  - **Rule values are bounded.** Int rule schemas carry `min` / `max` /
+    `unlimited` (-1 accepted), checked by `!system set` and shown by
+    `!system rules`: `formula_cell_limit -1` used to be accepted and then
+    refuse every sight line. The 16 formula-valued rules carry `"formula":
+    "expression"|"program"` and are validated when set (they fail open at
+    use: a typo'd visibility condition showed everything); a call to an
+    unknown function is stored with a warning (a `!func` may come later).
+    A NEW int or formula rule needs these schema keys.
+  - **Cell conditions:** `!tile set / line / fill`, template data and `!zone
+    set` warn when a `block` / `opaque` value is a broken formula;
+    `_eval_block_spec` / `_eval_opaque_spec` take an `errors` list, and
+    `!map cell ... for=<unit>` names each condition that failed at use and
+    counted as "no".
+  - **Output that was dropped:** damage_part discarded both hp writes' logs
+    (a boss killed through its head died without a line) and wrote the
+    part's hp on a detached object after that death removed it;
+    `source.<path> = ...` in an action body dropped its hook output
+    (SourceProxy); formula output now precedes the watcher poll, and `!turn
+    next` puts turn-hook formula output before whose turn it is
+    (`_take_formula_log`). Engine refusals inside a formula keep their own
+    message; "Runtime error:" is kept for raw Python errors.
+  - **Unbounded loops on user numbers:** `!reveal_fog` at/rect/around,
+    `!tile fill` and `zone_fill_rect` walked the whole rectangle before
+    keeping the on-grid part (a far corner hung the bot) — now clipped while
+    built (`_grid_box`); `!tile line` checks formula_cell_limit;
+    `_find_free_cell_near` stops at the farthest grid corner; damage_spread
+    fragments are capped by formula_loop_limit. Also refused: step counts
+    below 1 (`!ent move a 0 right` moved one step), a negative reveal
+    radius, `turns=` below 1, negative status level / duration.
+  - Verified clean: 40 reload-differential seeds, the POV leak detector
+    (546k runs, only the two known false hits), the model-based undo test,
+    chaos (normal + hostile), both huge-number fuzzers, the command fuzzer
+    on every touched root, and the prose-quote check (every double-quoted
+    ❌/⚠ reply in Expected prose appears in the actual output).
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
