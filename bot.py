@@ -36,7 +36,11 @@ TOKEN = load_token()
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+# Replies echo text users and GMs typed (unit names, bad arguments, command
+# names), so a reply could carry @everyone, a role or a <@user> mention and
+# ping the server. The bot's messages never mean to ping anyone.
+bot = commands.Bot(command_prefix="!", intents=intents,
+                   allowed_mentions=discord.AllowedMentions.none())
 _mgr = MatchManager()
 
 @bot.event
