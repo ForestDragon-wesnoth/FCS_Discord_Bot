@@ -845,6 +845,55 @@ class CommandRegistry:
 registry = CommandRegistry()
 
 
+def _cell_formula_warning(m: Match, path: str, value: Any) -> str:
+    """Advisory for a tile / template / zone `block` or `opaque` value that
+    is a formula with an error. Those fail OPEN at use (a broken block
+    condition never blocks, a broken opacity never hides), so a typo used to
+    leave a wall passable without a word. The value is still stored. Returns
+    the warning line (with a leading newline) or ""."""
+    if path not in ("block", "opaque") or not isinstance(value, str) \
+            or not value.strip():
+        return ""
+    try:
+        validate_formula(value, mode="eval",
+                         known_funcs=frozenset(m.formula_functions))
+    except FormulaError as ex:
+        what = "never blocks" if path == "block" else "never hides"
+        return (f"\n⚠️ `{path}` isn't a working formula ({ex}); until it is "
+                f"fixed it {what}.")
+    return ""
+
+
+def _check_formula_rule(mgr: MatchManager, system: Any, key: str,
+                        value: Any) -> Optional[str]:
+    """Validate a formula-valued rule (its schema names the mode) before
+    `!system set` stores it. Most of these fail OPEN or silently at use (a
+    typo'd visibility condition shows everything), so a syntax error or a
+    disallowed construct is refused here. A call to an unknown function is
+    stored with a warning: a `!func` may be defined on a match later.
+    Returns the warning, or None."""
+    mode = (RULES_REGISTRY.get(key, {}).get("schema") or {}).get("formula")
+    if not mode or not isinstance(value, str) or not value.strip():
+        return None
+    known = set(getattr(system, "formula_functions", {}) or {})
+    for m in mgr.matches.values():
+        if m.system_name == system.name:
+            known.update(m.formula_functions)
+    try:
+        if mode == "expression":
+            validate_formula(value, mode="eval", known_funcs=frozenset(known))
+        else:
+            validate_program(value, known_funcs=frozenset(known))
+    except FormulaError as ex:
+        msg = str(ex)
+        if msg.startswith("Function '") and msg.endswith("is not allowed."):
+            return (f"⚠️ {msg[:-len(' is not allowed.')]} isn't a built-in or a "
+                    f"`!func` on this system or its matches yet; the rule fails "
+                    f"until one is defined.")
+        raise VTTError(f"`{key}` must be a valid formula {mode}: {msg}")
+    return None
+
+
 def _take_formula_log() -> List[str]:
     """Remove and return what formulas logged into this command's sink, for
     a handler that places those lines in its own reply."""
@@ -2654,10 +2703,12 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             raise VTTError(f"'{key}' is not in engine defaults. Add it to DEFAULT_SYSTEM_SETTINGS first.")
     
         s = mgr.get_system(name)
+        warn = _check_formula_rule(mgr, s, key, value)
         s.set(key, value)
         refreshed = mgr.refresh_match_rules(name)
         suffix = f" (refreshed {refreshed} live match{'es' if refreshed != 1 else ''})" if refreshed else ""
-        return await ctx.send(f"`{name}`.{key} = {value!r}{suffix}")
+        return await ctx.send(f"`{name}`.{key} = {value!r}{suffix}"
+                              + (f"\n{warn}" if warn else ""))
 
     # ---- system access <system> <set|clear|list> ---------------------
     # Dedicated editor for the command_access RULE on a GameSystem. This
@@ -4892,11 +4943,14 @@ def _map_cell(ctx: ReplyContext, m, args: List[str]) -> str:
         lines.append(f"{label}: " + ("; ".join(parts) if parts else "nothing set"))
     if mover is not None:
         blocks = sees_blocked = False
+        berr: List[str] = []
+        oerr: List[str] = []
         if show_tile:
             blocks = m._eval_block_spec(m._tile_block_spec(x, y), mover,
-                                        {"tile_x": x, "tile_y": y})
+                                        {"tile_x": x, "tile_y": y}, berr)
             sees_blocked = m._eval_opaque_spec(
-                m._tile_opaque_spec(x, y), mover, {"tile_x": x, "tile_y": y})
+                m._tile_opaque_spec(x, y), mover, {"tile_x": x, "tile_y": y},
+                oerr)
         for n in zones:
             zd = m.zones[n].get("data") or {}
             bspec = zd.get("block")
@@ -4905,10 +4959,11 @@ def _map_cell(ctx: ReplyContext, m, args: List[str]) -> str:
             ospec = zd.get("opaque")
             if ospec in (None, ""):
                 ospec = m.rules.get("zone_opaque_condition", "")
-            blocks = blocks or m._eval_block_spec(bspec, mover,
-                                                  {"zone_name": n})
-            sees_blocked = sees_blocked or m._eval_opaque_spec(
-                ospec, mover, {"zone_name": n, "tile_x": x, "tile_y": y})
+            blocks = m._eval_block_spec(bspec, mover, {"zone_name": n},
+                                        berr) or blocks
+            sees_blocked = m._eval_opaque_spec(
+                ospec, mover, {"zone_name": n, "tile_x": x, "tile_y": y},
+                oerr) or sees_blocked
         cspec = m.rules.get("corpse_block_condition", "")
         if cspec not in (None, ""):
             team_var = str(m.rules.get("team_var", "team"))
@@ -4916,11 +4971,17 @@ def _map_cell(ctx: ReplyContext, m, args: List[str]) -> str:
                 cv = (c.get("entity") or {}).get("vars") or {}
                 if m._eval_block_spec(cspec, mover, {
                         "tile_x": x, "tile_y": y, "corpse_id": cid,
-                        "corpse_team": str(cv.get(team_var, "") or "")}):
+                        "corpse_team": str(cv.get(team_var, "") or "")},
+                        berr):
                     blocks = True
         lines.append(f"For `{mover}`: blocks movement: "
                      f"{'yes' if blocks else 'no'} · blocks sight: "
                      f"{'yes' if sees_blocked else 'no'}")
+        # These conditions fail open, so a broken one reads as "no".
+        for what, errs in (("movement", berr), ("sight", oerr)):
+            for err in dict.fromkeys(errs):
+                lines.append(f"⚠️ a {what} condition failed for `{mover}` and "
+                             f"counts as no: {err}")
     return "\n".join(lines)
 
 
@@ -8496,7 +8557,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         path = args[3]
         value = _parse_scalar(args[4])
         m.tile_set_path(x, y, path, value)
-        ack = f"tile ({x},{y}).{path} = {value!r}"
+        ack = f"tile ({x},{y}).{path} = {value!r}" + _cell_formula_warning(m, path, value)
         # Advisory for a likely-bad render color (same spirit as entity
         # set_var): the renderer reads the top-level `color` field, which may
         # be a palette name OR a color formula — so only nudge on a value
@@ -8750,7 +8811,8 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     d[key] = {}
                 d = d[key]
             d[parts[-1]] = value
-            return await ctx.send(f"template `{name}`.{path} = {value!r}")
+            return await ctx.send(f"template `{name}`.{path} = {value!r}"
+                                  + _cell_formula_warning(m, path, value))
 
         if dsub == "del-data":
             # !tile def del-data <name> <path>
@@ -9192,7 +9254,8 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         tail = f" ({skipped} off-grid cell(s) skipped)" if skipped else ""
         return await ctx.send(
             f"Set `{path}` = {value!r} on {n} tile(s) "
-            f"({sub} {x1},{y1} → {x2},{y2}).{tail}")
+            f"({sub} {x1},{y1} → {x2},{y2}).{tail}"
+            + _cell_formula_warning(m, path, value))
 
     return await _help_fallback(ctx, ["tile"], args[0] if args else None)
 
@@ -9554,7 +9617,8 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             m.zone_set_path(name, path, value)
         except VTTError as ex:
             return await ctx.send(f"❌ {ex}")
-        return await ctx.send(f"zone `{name}`.{path} = {value!r}")
+        return await ctx.send(f"zone `{name}`.{path} = {value!r}"
+                              + _cell_formula_warning(m, path, value))
 
     # ---- del <name> <path> ----  (data delete, dotted path)
     if sub == "del":

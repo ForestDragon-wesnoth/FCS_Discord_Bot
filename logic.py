@@ -816,7 +816,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "atb_charge_formula": {
         "default": "entity[self].initiative",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Formula EXPRESSION giving an entity's per-tick ATB charge RATE "
             "(`self` = the entity). The bar fills by this rate; the entity "
@@ -840,7 +840,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "atb_reset_formula": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "program"},
         "desc": (
             "What happens to the actor's ATB bar after it takes a turn. EMPTY "
             "(default) = the built-in: subtract atb_threshold (keeping any "
@@ -897,7 +897,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "status_tick_formula": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "program"},
         "desc": (
             "Formula body run once per (entity, status) at the time "
             "specified by status_tick_when. Empty (default) is a no-op "
@@ -1020,7 +1020,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # read always resolves. Empty = nothing blocks (default).
     "tile_block_condition": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Default formula deciding whether a TILE blocks an entity from "
             "entering its cell. Bindings: tile_x / tile_y (read the tile's "
@@ -1037,7 +1037,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "zone_block_condition": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Default formula deciding whether a ZONE blocks an entity from "
             "entering any of its cells. Bindings: zone_name and entity[self] "
@@ -1049,7 +1049,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "corpse_block_condition": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Default formula deciding whether a CORPSE blocks an entity from "
             "entering its cell (corpses are passable by default — empty rule). "
@@ -1470,7 +1470,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # the system defaults; see Match._evaluate_death_condition.
     "death_condition": {
         "default": "entity[self].hp <= 0",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Formula expression evaluated on an entity after any var "
             "change. When it returns truthy the entity dies. Default "
@@ -1500,7 +1500,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "alive_condition": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Formula expression deciding whether an entity reads as ALIVE — "
             "the gate behind Entity.is_alive, which governs render, occupancy, "
@@ -1574,7 +1574,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "default_kill_function_effects": {
         "default": "entity[self].hp = 0",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "program"},
         "desc": (
             "Formula program run on the entity BEFORE the death pipeline "
             "fires when the `kill()` primitive is invoked. The default "
@@ -1591,7 +1591,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "default_revive_function_effects": {
         "default": "entity[self].hp = entity[self].max_hp",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "program"},
         "desc": (
             "Formula program run on the freshly-revived entity AFTER "
             "spawn (before on_revive fires). The default restores hp "
@@ -1676,7 +1676,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "entity_visibility_condition": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Formula expression deciding whether an entity is visible to "
             "a team POV (a player channel). Truthy = visible, falsy = "
@@ -1718,7 +1718,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     #    tile_has(tile_x, tile_y, 'detected.' + pov_team)"
     "tile_visibility_condition": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Formula expression deciding whether a TILE (its glyph on the "
             "map and its !tile list/info/cells rows) is visible to a team "
@@ -1738,7 +1738,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # every zone visible.
     "zone_visibility_condition": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Formula expression deciding whether a ZONE (its glyph on the "
             "map and its !zone listing rows) is visible to a team POV. "
@@ -1758,7 +1758,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # own team's corpses show: "corpse_team == pov_team".
     "corpse_visibility_condition": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Formula expression deciding whether a CORPSE row (Dead: "
             "section of !list/!state) is visible to a team POV. Truthy = "
@@ -2197,7 +2197,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # auto-fog feature factors LOS in.
     "tile_opaque_condition": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Default formula deciding whether a TILE blocks line of sight "
             "through its cell. Bindings: tile_x / tile_y (read the tile's "
@@ -2212,7 +2212,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "zone_opaque_condition": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Default formula deciding whether a ZONE blocks line of sight "
             "through any of its cells. Bindings: zone_name, tile_x / tile_y, "
@@ -7815,10 +7815,12 @@ class Match:
         return self.rules.get("tile_opaque_condition", "")
 
     def _eval_opaque_spec(self, spec: Any, viewer_id: Optional[str],
-                          extras: Dict[str, Any]) -> bool:
+                          extras: Dict[str, Any],
+                          errors: Optional[List[str]] = None) -> bool:
         """Evaluate an opacity spec with `self`=the viewer. bool/number used
         directly; a string runs as a formula. Empty/None or a malformed
-        formula -> NOT opaque (transparent; fail toward visible)."""
+        formula -> NOT opaque (transparent; fail toward visible). A failing
+        formula's message is appended to `errors` when given."""
         if spec is None:
             return False
         if isinstance(spec, bool):
@@ -7834,7 +7836,9 @@ class Match:
                       extras=dict(extras))
         try:
             return bool(engine.eval_expression(cond, ctx))
-        except FormulaError:
+        except FormulaError as ex:
+            if errors is not None:
+                errors.append(f"`{cond}`: {ex}")
             return False
 
     def cell_opaque(self, viewer_id: Optional[str], x: int, y: int) -> bool:
@@ -8807,7 +8811,8 @@ class Match:
         return self.rules.get("tile_block_condition", "")
 
     def _eval_block_spec(self, spec: Any, mover_id: str,
-                         extras: Dict[str, Any]) -> bool:
+                         extras: Dict[str, Any],
+                         errors: Optional[List[str]] = None) -> bool:
         """Evaluate a block spec for `mover_id`. bool/number specs are used
         directly; a string is run as a formula with `self`=the mover plus
         `extras` bindings. Empty/None = not blocking. A malformed formula
@@ -8828,7 +8833,9 @@ class Match:
                       extras=dict(extras))
         try:
             return bool(engine.eval_expression(cond, ctx))
-        except FormulaError:
+        except FormulaError as ex:
+            if errors is not None:
+                errors.append(f"`{cond}`: {ex}")
             return False
 
     def cell_blocks(self, mover_id: str, x: int, y: int) -> bool:

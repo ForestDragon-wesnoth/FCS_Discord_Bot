@@ -17721,3 +17721,66 @@ thresholds, max_grid_dimension). An opacity outside 0-100 is refused at
 set time (it used to be stored and refused or clamped on use). A limit
 whose 0 has a meaning (summon_event_limit 0 = no summons) still takes 0.
 `!system rules` shows each bounded rule's range.
+
+
+SCENARIO 656 — !system set checks formula-valued rules
+-------------------------------------------------------
+
+!match new s656 Formulas 8 6
+!match use s656
+!ent add hero Hero 30 2 2 10
+!system set default entity_visibility_condition "entity[self].team == redd"
+?? ❌ `entity_visibility_condition` must be a valid formula expression: Unknown identifier 'redd'
+!system set default death_condition "[x for x in range(3)]"
+?? must be a valid formula expression: Disallowed syntax: ListComp
+!system set default default_kill_function_effects "entity[self].hp = 0\nentity[self].downed = True"
+?! ❌
+!system set default alive_condition "lucky(self)"
+?? ⚠️ Function 'lucky' isn't a built-in or a `!func` on this system or its matches yet
+!system set default alive_condition ""
+!func def lucky e "entity[e].hp > 0"
+!system set default alive_condition "lucky(self)"
+?! ⚠️
+!list
+?? Hero (hero)
+!system set default alive_condition ""
+!system set default default_kill_function_effects "entity[self].hp = 0"
+
+Expected: A formula rule with an error (an unknown name, a disallowed
+construct, a syntax error) is refused when set. Before, it was stored and failed open at use: a typo'd
+visibility condition showed every unit, a broken death condition never
+killed. A program rule (the kill effects) takes several statements. A call
+to a function nobody defines is stored with a warning, since a `!func` may
+come later; once the match defines `lucky` the same rule sets cleanly and
+works.
+
+
+SCENARIO 657 — block / opaque formulas: a warning when set, the failure named by !map cell
+-------------------------------------------------------------------------------------------
+
+!match new s657 Walls 8 6
+!match use s657
+!ent add scout Scout 20 1 1 5
+!tile set 2 1 block "not entity[self].flying or flyng"
+?? ⚠️ `block` isn't a working formula (Unknown identifier 'flyng'
+!tile line 1 3 4 3 opaque "entity[self].eyes >= 2"
+?! ⚠️
+!zone new smoke
+!zone fill smoke 3 1 3 1
+!zone set smoke opaque "entity[self].eyes > two"
+?? ⚠️ `opaque` isn't a working formula
+!tile set 3 1 block "not entity[self].flying"
+!map cell 3 1 for=scout
+?? For `scout`: blocks movement: no · blocks sight: no
+?? ⚠️ a movement condition failed for `scout` and counts as no: `not entity[self].flying`: Variable 'flying' is not defined.
+!ent set_var scout flying false
+!map cell 3 1 for=scout
+?? For `scout`: blocks movement: yes
+?! a movement condition failed
+
+Expected: A `block` / `opaque` value that is a broken formula is still
+stored, with a warning: these conditions fail open (a broken wall never
+blocks, broken smoke never hides), so the typo used to go unnoticed. A
+valid formula (the opaque line) sets quietly. `!map cell ... for=<unit>`
+names a condition that failed at use and counted as "no" — here the
+scout has no `flying` var yet; once it does, the wall blocks it.
