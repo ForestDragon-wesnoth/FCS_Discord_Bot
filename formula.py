@@ -3337,7 +3337,7 @@ class FormulaEngine:
         if msg:
             raise FormulaError(msg)
         # write_var does the diff + event firing + mutation in one shot.
-        e.write_var(path, value)
+        self._match.surface_log(e.write_var(path, value))
         # Track for the "Affected: a, b, c" command-layer summary.
         self._note_affected(eid)
         return value
@@ -3732,7 +3732,7 @@ class FormulaEngine:
                     f"{type(y).__name__}."
                 )
             try:
-                e.tp(x, y)
+                match.surface_log(e.tp(x, y))
             except (_OutOfBounds, _Occupied) as ex:
                 raise FormulaError(str(ex))
             self._note_affected(eid)
@@ -3776,7 +3776,7 @@ class FormulaEngine:
             if not e.is_cell_stackable and match.is_occupied(nx, ny, ignore_entity_id=e.id):
                 return False
             try:
-                e.tp(nx, ny)
+                match.surface_log(e.tp(nx, ny))
             except (_OutOfBounds, _Occupied):
                 return False
             self._note_affected(eid)
@@ -3840,6 +3840,7 @@ class FormulaEngine:
             # error as a FormulaError, and records the affected entity.
             try:
                 steps, _log = match.push_entity(eid, direction, n)
+                match.surface_log(_log)
             except VTTError as ex:
                 raise FormulaError(str(ex))
             if steps:
@@ -3862,6 +3863,7 @@ class FormulaEngine:
             # Match.pull_entity (shared with the !ent pull command).
             try:
                 steps, _log = match.pull_entity(eid, x, y, n)
+                match.surface_log(_log)
             except VTTError as ex:
                 raise FormulaError(str(ex))
             if steps:
@@ -3883,6 +3885,7 @@ class FormulaEngine:
             # Match.swap_entities (shared with the !ent swap command).
             try:
                 swapped, _log = match.swap_entities(aid, bid)
+                match.surface_log(_log)
             except VTTError as ex:
                 raise FormulaError(str(ex))
             if swapped:
@@ -4389,7 +4392,7 @@ class FormulaEngine:
             lv = None if level is None else int(level)
             du = None if duration is None else int(duration)
             try:
-                match.apply_status(eid, name, lv, du, force=force)
+                match.surface_log(match.apply_status(eid, name, lv, du, force=force))
             except (VTTError, NotFound) as ex:
                 raise FormulaError(str(ex))
             self._note_affected(eid)
@@ -4419,6 +4422,7 @@ class FormulaEngine:
                 raise FormulaError("status_dispel(...): max must be a number.")
             try:
                 n, _log = match.dispel_statuses(eid, token, int(max))
+                match.surface_log(_log)
             except (VTTError, NotFound) as ex:
                 raise FormulaError(str(ex))
             self._note_affected(eid)
@@ -4440,6 +4444,7 @@ class FormulaEngine:
                 raise FormulaError("status_transfer(from, to, name): name must be a string.")
             try:
                 landed, _log = match.transfer_status(fid, tid, name)
+                match.surface_log(_log)
             except (VTTError, NotFound) as ex:
                 raise FormulaError(str(ex))
             self._note_affected(fid)
@@ -4584,7 +4589,10 @@ class FormulaEngine:
             action, or an on_death passive). Returns the winner string."""
             if not isinstance(winner, str) or not winner:
                 raise FormulaError("declare_winner(winner[, reason]): winner must be a non-empty string.")
-            match.declare_winner(winner, str(reason) if reason else "")
+            out: List[str] = []
+            match.declare_winner(winner, str(reason) if reason else "",
+                                 log_out=out)
+            match.surface_log(out)
             return str(winner)
 
         def _match_winner() -> str:
@@ -4712,7 +4720,7 @@ class FormulaEngine:
             msg = reserved_var_path_error(path, f"var_set({eid!r}, '{path}', ...)")
             if msg:
                 raise FormulaError(msg)
-            e.write_var(path, value)
+            match.surface_log(e.write_var(path, value))
             engine._note_affected(eid)
             return value
 
@@ -4728,7 +4736,7 @@ class FormulaEngine:
             if not _var_has(eid_t, path):
                 return False
             try:
-                e.remove_var(path)
+                match.surface_log(e.remove_var(path))
             except VTTError as ex:
                 raise FormulaError(str(ex))
             engine._note_affected(eid)
@@ -4755,7 +4763,7 @@ class FormulaEngine:
                     raise FormulaError(
                         f"var_add: existing value at '{path}' is not a number.")
             new = cur + delta
-            e.write_var(path, new)
+            match.surface_log(e.write_var(path, new))
             engine._note_affected(eid)
             return new
 
@@ -4779,9 +4787,9 @@ class FormulaEngine:
             if not _var_has(src_t, src_path):
                 return False
             val = copy.deepcopy(_walk_vars(se, src_path, must_exist=True))
-            de.write_var(dest_path, val)
+            match.surface_log(de.write_var(dest_path, val))
             try:
-                se.remove_var(src_path)
+                match.surface_log(se.remove_var(src_path))
             except VTTError as ex:
                 raise FormulaError(str(ex))
             engine._note_affected(seid)
@@ -4808,7 +4816,7 @@ class FormulaEngine:
                 return False
             _, se = _resolve_entity(src_t, "var_copy")
             val = copy.deepcopy(_read_entity_path(se, src_path))
-            de.write_var(dest_path, val)
+            match.surface_log(de.write_var(dest_path, val))
             engine._note_affected(deid)
             return True
 
@@ -4881,12 +4889,12 @@ class FormulaEngine:
             if remaining <= 0:
                 if _var_has(eid_t, path):
                     try:
-                        e.remove_var(path)
+                        match.surface_log(e.remove_var(path))
                     except VTTError as ex:
                         raise FormulaError(str(ex))
                 engine._note_affected(eid)
                 return 0
-            e.write_var(full, remaining)
+            match.surface_log(e.write_var(full, remaining))
             engine._note_affected(eid)
             return remaining
 
@@ -4995,7 +5003,9 @@ class FormulaEngine:
             if payload is not None and not isinstance(payload, dict):
                 raise FormulaError("emit(...): payload must be a dict.")
             tid = None if target is None else _eid(target)
-            return len(match.emit_event(name, payload, tid))
+            lines = match.emit_event(name, payload, tid)
+            match.surface_log(lines)
+            return len(lines)
 
         def _event_get(key: Any, default: Any = None) -> Any:
             """event_get(key, default=None): a value from the payload of the
@@ -5180,7 +5190,7 @@ class FormulaEngine:
                 # Leaf scalar at `path` — drop the var itself.
                 # Path is non-empty here (root is always a dict).
                 try:
-                    e.remove_var(path)
+                    match.surface_log(e.remove_var(path))
                 except VTTError as ex:
                     raise FormulaError(str(ex))
                 engine._note_affected(eid)
@@ -5195,7 +5205,7 @@ class FormulaEngine:
             for k in children:
                 child_path = f"{path}.{k}" if path else k
                 try:
-                    e.remove_var(child_path)
+                    match.surface_log(e.remove_var(child_path))
                     removed += 1
                 except (VTTError, NotFound):
                     # Vital-var protection (initiative / team / hp) or
@@ -5367,6 +5377,7 @@ class FormulaEngine:
                 new_id, _log = match.summon_entity(
                     template, x, y, id_prefix=prefix,
                 )
+                match.surface_log(_log)
             except (VTTError, NotFound) as ex:
                 raise FormulaError(str(ex))
             engine._note_affected(new_id)
@@ -5386,6 +5397,7 @@ class FormulaEngine:
                 new_id, _log = match.summon_entity(
                     template, x, y, id_prefix=prefix, near_radius=radius,
                 )
+                match.surface_log(_log)
             except (VTTError, NotFound) as ex:
                 raise FormulaError(str(ex))
             engine._note_affected(new_id)
@@ -5430,7 +5442,7 @@ class FormulaEngine:
             id isn't a live entity."""
             eid, e = _resolve_entity(eid_t, "remove_entity")
             # A snake segment follows the segment_removal_mode rule.
-            match.despawn_entity(e)
+            match.surface_log(match.despawn_entity(e))
             return True
 
         ns["entity_snapshot"] = _entity_snapshot
@@ -5465,6 +5477,7 @@ class FormulaEngine:
             # Effects-formula run + unconditional death pipeline live in
             # Match.kill_entity (shared with the !ent kill command).
             killed, _log = match.kill_entity(_eid(eid_t))
+            match.surface_log(_log)
             return killed
 
         def _revive(eid_t: Any) -> str:
@@ -5477,6 +5490,7 @@ class FormulaEngine:
             eid = str(_eid(eid_t))
             try:
                 new_id, _log = match.revive_corpse(eid)
+                match.surface_log(_log)
             except (VTTError, NotFound, OutOfBounds, Occupied) as ex:
                 raise FormulaError(str(ex))
             engine._note_affected(new_id)
@@ -5493,7 +5507,7 @@ class FormulaEngine:
             eid = str(_eid(eid_t))
             sp = None if stash_path is None else str(stash_path)
             try:
-                match.transform_entity(eid, template, sp)
+                match.surface_log(match.transform_entity(eid, template, sp))
             except (VTTError, NotFound, OutOfBounds, Occupied) as ex:
                 raise FormulaError(str(ex))
             engine._note_affected(eid)
@@ -5505,7 +5519,7 @@ class FormulaEngine:
             Returns eid. Raises if no stashed statblock is found there."""
             eid = str(_eid(eid_t))
             try:
-                match.revert_entity(eid, str(stash_path))
+                match.surface_log(match.revert_entity(eid, str(stash_path)))
             except (VTTError, NotFound, OutOfBounds, Occupied) as ex:
                 raise FormulaError(str(ex))
             engine._note_affected(eid)
@@ -5946,7 +5960,7 @@ class FormulaEngine:
             slot (validated — capacity, condition, no cycle). Raises on
             failure. Returns True."""
             try:
-                match.mount_entity(_eid(rider), _eid(vehicle), str(slot))
+                match.surface_log(match.mount_entity(_eid(rider), _eid(vehicle), str(slot)))
             except (VTTError, NotFound) as ex:
                 raise FormulaError(str(ex))
             return True
@@ -5957,7 +5971,7 @@ class FormulaEngine:
             try:
                 xi = _cell_arg(x, "dismount", "x") if x is not None else None
                 yi = _cell_arg(y, "dismount", "y") if y is not None else None
-                match.dismount_entity(_eid(rider), xi, yi)
+                match.surface_log(match.dismount_entity(_eid(rider), xi, yi))
             except (VTTError, NotFound) as ex:
                 raise FormulaError(str(ex))
             return True
@@ -5966,7 +5980,7 @@ class FormulaEngine:
             """switch_slot(rider, slot): move a mounted rider to another slot
             of the same vehicle (validated). Raises on failure. True."""
             try:
-                match.switch_slot(_eid(rider), str(slot))
+                match.surface_log(match.switch_slot(_eid(rider), str(slot)))
             except (VTTError, NotFound) as ex:
                 raise FormulaError(str(ex))
             return True
@@ -6174,6 +6188,7 @@ class FormulaEngine:
             if isinstance(amount, bool) or not isinstance(amount, (int, float)):
                 raise FormulaError("damage_part(part, amount): amount must be a number.")
             to_main, _log = match.damage_part(pid, int(amount))
+            match.surface_log(_log)
             return to_main
         ns["damage_part"] = _damage_part
 
@@ -6209,6 +6224,7 @@ class FormulaEngine:
                     raise FormulaError("damage_spread(...): radius must be a number.")
                 radius_i = int(radius)
             to_main, _log = match.damage_spread(tid, int(total), m, f, origin, radius_i)
+            match.surface_log(_log)
             return to_main
         ns["damage_spread"] = _damage_spread
 
@@ -6333,11 +6349,11 @@ class FormulaEngine:
                 new_amt = amt - absorbed
                 path = root + "." + name
                 if new_amt <= 0:
-                    e.remove_var(path)
+                    match.surface_log(e.remove_var(path))
                 elif isinstance(pool, dict):
-                    e.write_var(path + ".amount", _clean_num(new_amt))
+                    match.surface_log(e.write_var(path + ".amount", _clean_num(new_amt)))
                 else:
-                    e.write_var(path, _clean_num(new_amt))
+                    match.surface_log(e.write_var(path, _clean_num(new_amt)))
             return _clean_num(remaining)
 
         def _shield_total(eid_token: Any, tags: Any = None):

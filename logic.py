@@ -10,6 +10,15 @@ import copy
 import re
 import math
 import random
+import contextvars
+
+# Lines a formula's changes produced while a command runs (see
+# Match.surface_log). A context variable, so each command — on Discord, each
+# message is its own asyncio task — collects only its own: a per-match list
+# drained after the command could hand one channel's output to another
+# channel's command that ran while the first awaited a send.
+FORMULA_LOG_SINK: "contextvars.ContextVar[Optional[List[str]]]" = (
+    contextvars.ContextVar("vtt_formula_log_sink", default=None))
 
 # -------------------------
 # Exceptions
@@ -1334,8 +1343,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "show at a glance which body a part belongs to. Placeholders: "
             "{parent} (parent id), {parent_name} (parent's name), plus every "
             "key entity_line_format exposes (resolved against the PART). Empty "
-            "= no suffix. Only parts that appear on the roster (located / "
-            "segment / region parts; glued parts are hidden) ever show it."
+            "= no suffix. Only parts that appear on the roster ever show it "
+            "(see the roster_glued_parts rule and the `__roster_show` var)."
         ),
     },
     "entity_info_format": {
@@ -1521,6 +1530,19 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "`delete` removes the entity outright (no corpse left). "
             "Per-entity override: set `__death_result` in the "
             "entity's vars."
+        ),
+    },
+    "roster_glued_parts": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether GLUED body parts (attached with `!part add`, sharing the "
+            "body's cell — not located, region or segment parts) get their own "
+            "row in `!list` / `!state`. False (default) keeps the roster to "
+            "the units on the board; `!part list <body>` shows the parts. A "
+            "part with its own place in the turn order (it acts on its own "
+            "turn) is always listed. A part's `__roster_show` var (true / "
+            "false) overrides this rule for that part, glued or not."
         ),
     },
     "show_corpses_in_entity_list": {
@@ -14853,6 +14875,40 @@ class Match:
         total_steps = sum(max(1, int(n)) for _, n in moves)
         return len(members), total_steps, log
 
+    def surface_log(self, lines: Optional[List[str]]) -> None:
+        """Pass on the log of a change a FORMULA made (summon, kill, a var
+        write, ...): the Match methods return their hook output and warnings,
+        which only commands used to show. Inside an action the lines join its
+        output buffer (shown when it succeeds, dropped when it rolls back);
+        otherwise they go to the running command's FORMULA_LOG_SINK, which it
+        shows. With neither (no command running) they are dropped."""
+        lines = [str(ln) for ln in (lines or []) if ln]
+        if not lines:
+            return
+        buf = self._runtime_buffer
+        if buf is not None:
+            buf.out.extend(lines)
+            return
+        sink = FORMULA_LOG_SINK.get()
+        if sink is not None:
+            sink.extend(lines)
+
+    def roster_shows(self, e: "Entity") -> bool:
+        """Whether `e` gets a row in the `!list` / `!state` roster. Only body
+        parts can be left out: a part's `__roster_show` var decides, else a
+        glued part without its own turn-order slot follows the
+        roster_glued_parts rule; every other part is listed."""
+        if not e.is_part:
+            return True
+        ov = e.vars.get("__roster_show")
+        if isinstance(ov, str):
+            ov = ov.strip().lower() in ("true", "yes", "on", "1")
+        if ov is not None:
+            return bool(ov)
+        if e.is_glued_part and e.id not in self.turn_order:
+            return bool(self.rules.get("roster_glued_parts", False))
+        return True
+
     def entities_in_turn_order(self) -> List["Entity"]:
         # Returns Entity objects in current turn order; appends any missing at the end
         ordered = []
@@ -15167,7 +15223,8 @@ class MatchManager:
         source hosts the copy; co-hosts and per-match access overrides are
         copied. Channel state
         starts empty — no bound channels, no per-channel camera, no pending
-        requests — and the undo history starts fresh. The source match is
+        requests — the copy is never paused, and the undo history starts
+        fresh. The source match is
         untouched and stays active wherever it was."""
         src = self.get(src_id)
         if new_id in self.matches:
@@ -15187,6 +15244,8 @@ class MatchManager:
         m.bound_channels = {}
         m.channel_views = {}
         m.pending_requests = {}
+        # A pause belongs to the table that paused it; the copy starts live.
+        m.paused = None
         self.matches[m.id] = m
         return m
 

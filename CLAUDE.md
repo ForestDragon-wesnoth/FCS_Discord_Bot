@@ -1465,8 +1465,9 @@ More shipped work (continuing the list above):
   default `" [part of {parent}]"`. Rendered in `_entity_line` only when
   `e.is_part` (parent alive); placeholders `{parent}` / `{parent_name}` plus
   every entity_line_format key (resolved against the part). Empty = off. Only
-  parts on the roster (located / segment / region) show it — glued parts are
-  hidden anyway.
+  parts on the roster show it — glued parts are left off by default (the
+  `roster_glued_parts` rule + per-part `__roster_show`, audit-pass-33
+  follow-up).
 - **Directional/vision geometry — SHIPPED (scenarios 434-436).** Three
   primitives extending the directional + LOS + footprint layers.
   (1) **Box-face (footprint-aware) side_hit** — `side_hit` / `directional_get`
@@ -4030,7 +4031,9 @@ More shipped work (continuing the list above):
   - **`round_start_message_format` rule (644)** — default "— Round {round}
     —", printed by `!turn next` at each round start (round 1 included),
     ahead of round-start hook output. Placeholders {round}, {match},
-    {match.<path>} (missing → empty); empty = no line. No `{first unit}`
+    {match.<path>} (missing → empty); empty = no line. (Since
+    audit-pass-33 the "It is now X's turn" summary comes LAST in the reply,
+    after the round line and hook output.) No `{first unit}`
     placeholder on purpose: the line goes to every channel, so it could name
     a unit a fogged channel can't see.
   - **Harness (96/97)** — see §2: `??` / `?!` reply checks and `--review`.
@@ -4123,10 +4126,40 @@ More shipped work (continuing the list above):
     never totals 6); it counts reachable totals. The diff formatter
     (`!history diff`, undo preview, `!ent diff`) printed a missing side as
     `- 5` (read as minus five); it is now `5 -> (unset)`.
-  - OBSERVED, not changed: every formula mutator (`summon`, `kill`,
-    `revive`, `transform`, ...) discards the log its Match method returns,
-    so hook output and warnings from formula-driven spawns/deaths never
-    reach the user (only commands show them).
+  - **User calls at the end of the pass (scenarios 651-653):**
+    - **Formula changes show their output.** Every formula mutator
+      (`summon*`, `kill`, `revive`, `transform`/`revert`, `remove_entity`,
+      `mount`/`dismount`/`switch_slot`, `damage_part`/`damage_spread`,
+      push/pull/swap, `move_entity`/steps, status apply/dispel/transfer,
+      `emit`, `declare_winner`, and every var write / delete incl.
+      `entity[x].path = ...`) discarded the log its Match method returned, so
+      hook output and warnings from formula-driven changes never reached
+      chat. They now go through `Match.surface_log`: inside an action, into
+      its output buffer (shown on success, dropped with a rollback);
+      otherwise into `logic.FORMULA_LOG_SINK`, a CONTEXT VARIABLE each
+      `CommandRegistry.run` sets to a fresh list and shows at its end
+      (`dispatch_no_snapshot` flushes after every inner line, so batch /
+      macro output stays in order). A contextvar, not a per-match list: on
+      Discord each message is its own asyncio task, and a shared list drained
+      after a command could hand a host's hook lines (naming hidden units) to
+      a player's command that ran while the host's awaited a send. A nested
+      run (approval, `!again`) collects its own, so the lines land in its
+      channel. No sink and no buffer (no command running) = dropped.
+      NEW formula mutators must call `match.surface_log(<log>)`.
+    - **Glued parts leave the roster by default.** Rule `roster_glued_parts`
+      (bool, default False) + per-part `__roster_show` var (true/false, wins
+      for any part, glued or not); a glued part with its own turn-order slot
+      always lists (`Match.roster_shows`, used by `!list` / `!state`).
+      `!part list` still shows every part. CLAUDE.md had claimed glued parts
+      were hidden while the code listed them.
+    - **`!turn next` reads in order:** turn-end / round lines and hook
+      output first, "It is now X's turn" last.
+    - **`!match clone` starts unpaused** (`clone_match` clears `paused`).
+    - OPEN observation: an APPROVED player command runs in the requester's
+      channel, so whatever it prints (including hook output naming units the
+      requester's POV can't see) shows there. Pre-existing; formula output
+      now adds to it. The pass-30 leak detector skipped queued commands, so
+      approved replies were never checked.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

@@ -17556,3 +17556,110 @@ multiple of 6, so `!roll odds 1d6!` counts 81 reachable totals over the
 1–96 span. The undo preview says `5 -> (unset)` where it used to print
 `- 5`, which read as minus five.
 HARNESS-ALLOWS-ERRORS: the hp write is refused on purpose.
+
+
+SCENARIO 651 — roster_glued_parts: glued parts stay off !list by default; a part's __roster_show overrides
+----------------------------------------------------------------------------------------------------------
+
+!match new s651 Roster 10 6
+!match use s651
+!ent add ogre Ogre 60 2 2 5
+!ent set_var ogre footprint_w 2
+!part add ogre head Head 20 20
+!part add ogre arm Arm 15 15
+!part add ogre turret Turret 10 10
+!ent init turret 3
+!part add ogre tail Tail 8 8
+!part locate tail 6 2
+!list
+?! (head)
+?! (arm)
+?? Turret (turret)
+?? Tail (tail)
+!ent set_var arm __roster_show true
+!ent set_var tail __roster_show false
+!list
+?? Arm (arm)
+?! (head)
+?! (tail)
+!system set default roster_glued_parts true
+!list
+?? Head (head)
+?! (tail)
+!system set default roster_glued_parts false
+!part list ogre
+?? `head` (Head)
+
+Expected: By default the roster lists the Ogre, its turret (a glued part
+with its own initiative takes its own turns, so it always lists) and the
+tail (a located part on its own cell), but not the glued head and arm —
+`!part list ogre` still shows every part. `__roster_show true` brings the
+arm back and `__roster_show false` hides the located tail. Turning
+roster_glued_parts on lists the head too; the tail's own false still
+wins.
+
+
+SCENARIO 652 — Formula changes show their hook output: !eval, actions, passive chains, batch lines
+---------------------------------------------------------------------------------------------------
+
+!match new s652 Echoes 10 10
+!match use s652
+!ent add mage Mage 20 1 1 5
+!ent add rat Rat 5 3 3 3
+!ent add bat Bat 5 5 5 3
+!gpassive add obit on_death "log('obit')"
+!eval "kill('rat')"
+?? ⚙️ global passive `obit` fired on `rat` (on_death)
+!ent set_var mage tmpl.name Imp
+!ent set_var mage tmpl.vars.hp 3
+!ent set_var mage tmpl.vars.max_hp 3
+!gpassive add hello on_entity_spawned "log('spawned')"
+!ent set_var mage actions.call.body "summon_from('tmpl', 8, 8)"
+!ent set_var mage actions.call.target none
+!action mage call
+?? ⚙️ global passive `hello` fired on `imp` (on_entity_spawned)
+!ent set_var mage actions.flop.body "summon_from('tmpl', 9, 9)\nfail('nope')"
+!ent set_var mage actions.flop.target none
+!action mage flop
+?! hello
+!assert "len(entities_at(9, 9)) == 0" the failed action rolled its summon back
+!passive add bat grudge on_var_changed target=hp "kill('mage')"
+!batch ent hp bat -1 ; eval 1
+?? ⚙️ global passive `obit` fired on `mage` (on_death)
+!assert "has_corpse('mage') and has_corpse('rat')"
+
+Expected: A formula's changes used to drop their hook output; commands
+were the only thing that showed it. Now `!eval "kill('rat')"` shows the
+on_death passive line after the result. A successful action shows the
+on_entity_spawned line of the imp it summoned (in the action's own
+output), and a failed action shows none (its output is dropped with its
+rollback). A passive chain (the bat's hp change kills the mage) shows
+the mage's on_death line right after that batch line.
+
+
+SCENARIO 653 — !turn next lists what happened before whose turn it is; a clone starts unpaused
+-----------------------------------------------------------------------------------------------
+
+!match new s653 Order 8 6
+!match use s653
+!ent add hero Hero 30 2 2 10
+!ent add orc Orc 20 4 2 5
+!gpassive add dawn on_round_start "log('dawn')"
+!turn next
+!turn next
+!turn next
+?? — Round 2 —
+!match pause tea break
+!match clone s653b
+!match use s653b
+!match info
+?! paused
+!match use s653
+!match info
+?? paused
+
+Expected: The third `!turn next` wraps to round 2; its reply prints the
+round line and the round-start hook output first and "It is now **Hero**'s
+turn" last, in the order things happened (the summary used to come
+first). Cloning the paused table gives an unpaused copy (the pause
+belongs to the original table, which stays paused).

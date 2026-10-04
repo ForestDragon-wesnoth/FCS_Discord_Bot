@@ -14,7 +14,7 @@ from logic import (
 )
 
 # Passive system
-from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS
+from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK
 
 # Clamp system
 from logic import ClampSpec
@@ -444,13 +444,16 @@ class CommandRegistry:
                     await ctx.send(f"❌ inline $() argument: {e}")
                     return
         try:
-            return await h(ctx, args, mgr)
+            result = await h(ctx, args, mgr)
         except VTTError as e:
             await ctx.send(f"❌ {e}")
             # A failed `!assert` stops the enclosing batch / run / foreach /
             # macro: the sentinel travels back up through each handler's
             # return value (see ASSERT_STOP).
-            return ASSERT_STOP if isinstance(e, AssertionStop) else None
+            result = ASSERT_STOP if isinstance(e, AssertionStop) else None
+        # Each batch / macro / foreach line's formula output right after it.
+        await _flush_formula_log(ctx)
+        return result
 
     def _effective_access(self, name: str, args: List[str],
                           m: "Any") -> str:
@@ -650,6 +653,10 @@ class CommandRegistry:
         # caller typed. A context var keeps the depth per asyncio task, so
         # interleaved Discord messages don't see each other's depth.
         depth_token = _RUN_DEPTH.set(_RUN_DEPTH.get() + 1)
+        # Output of the changes formulas make during this command (hook lines,
+        # warnings), shown after it. A nested run (an approval, `!again`)
+        # collects its own, so its lines land in its own channel.
+        sink_token = FORMULA_LOG_SINK.set([])
         try:
             # Judged on the alias-RESOLVED name: an alias of `again` stored as
             # the last command made `!again` rerun itself forever.
@@ -657,8 +664,11 @@ class CommandRegistry:
                     and self._resolve_alias(name, args, mgr, ctx)[0].lower()
                     not in ("again", "as")):
                 _remember_command(mgr, ctx, name, args)
-            return await self._run(name, args, ctx, mgr)
+            result = await self._run(name, args, ctx, mgr)
+            await _flush_formula_log(ctx)
+            return result
         finally:
+            FORMULA_LOG_SINK.reset(sink_token)
             _RUN_DEPTH.reset(depth_token)
 
     async def _run(self, name: str, args: List[str], ctx: ReplyContext, mgr: MatchManager):
@@ -810,6 +820,15 @@ class CommandRegistry:
         return result
 
 registry = CommandRegistry()
+
+
+async def _flush_formula_log(ctx: ReplyContext) -> None:
+    """Show (and clear) what formulas logged into this command's sink."""
+    sink = FORMULA_LOG_SINK.get()
+    if sink:
+        lines = list(sink)
+        sink.clear()
+        await ctx.send("\n".join(lines))
 
 # Nesting depth of CommandRegistry.run within one asyncio task (see run()).
 _RUN_DEPTH: "contextvars.ContextVar[int]" = contextvars.ContextVar(
@@ -4436,13 +4455,13 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(out)
         if _pov_hides(m, pov, eid):
             # The reply lands in a channel whose POV can't see the actor.
-            out = "It is now an unseen unit's turn."
+            now = "It is now an unseen unit's turn."
         else:
-            out = (f"It is now **{m.entity_display_name(e, pov)}**'s turn "
+            now = (f"It is now **{m.entity_display_name(e, pov)}**'s turn "
                    f"(id `{eid[:8]}`)")
-        if fire_log:
-            out += "\n" + "\n".join(fire_log)
-        return await ctx.send(out)
+        # In the order things happened: the turn-end / round lines and hook
+        # output first, whose turn it now is last.
+        return await ctx.send("\n".join(list(fire_log) + [now]))
     if sub == "set":
         if await return_help_if_not_enough_args(ctx, args, 2, "turn", "set"):
             return
@@ -5363,7 +5382,8 @@ async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # Filter out entities hidden from this POV (omniscient pov=None keeps
     # all). Corpses (the Dead: section below) are filtered too, via
     # corpse_visible_to.
-    visible = [e for e in es if m.entity_visible_to(e.id, pov)]
+    visible = [e for e in es
+               if m.roster_shows(e) and m.entity_visible_to(e.id, pov)]
     if visible:
         lines.append("Entities:")
         for e in visible:
