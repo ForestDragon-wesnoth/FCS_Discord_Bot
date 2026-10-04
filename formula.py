@@ -4391,6 +4391,10 @@ class FormulaEngine:
                     raise FormulaError(f"{fname}(...): {label} must be a number.")
             lv = None if level is None else int(level)
             du = None if duration is None else int(duration)
+            for label, v in (("level", lv), ("duration", du)):
+                if v is not None and v < 0:
+                    raise FormulaError(f"{fname}(...): {label} can't be "
+                                       f"negative, got {v}.")
             try:
                 match.surface_log(match.apply_status(eid, name, lv, du, force=force))
             except (VTTError, NotFound) as ex:

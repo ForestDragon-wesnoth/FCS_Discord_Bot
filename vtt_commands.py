@@ -845,6 +845,45 @@ class CommandRegistry:
 registry = CommandRegistry()
 
 
+def _grid_box(m: Match, x1: int, y1: int, x2: int, y2: int) -> set:
+    """The on-grid cells of the rectangle between two corners. Clipped while
+    it is built, so a typo'd radius (`!reveal_fog red at 1 1 1000000`) costs
+    at most the grid instead of trillions of off-grid cells."""
+    lx, hx = max(1, min(x1, x2)), min(m.grid_width, max(x1, x2))
+    ly, hy = max(1, min(y1, y2)), min(m.grid_height, max(y1, y2))
+    return {(x, y) for x in range(lx, hx + 1) for y in range(ly, hy + 1)}
+
+
+# Entity vars the engine reads as one of a fixed set of words, mapped to the
+# rule whose choices list them (the var overrides that rule per unit). A
+# typo used to be stored and then read as the rule's value, or ignored.
+_ENGINE_VAR_RULES = {
+    "sprite_mode": "sprite_mode",
+    "sprite_mirror": "sprite_mirror",
+    "mount_action_actor": "mount_action_actor",
+    "__segment_follow": "segment_follow_mode",
+    "__segment_death_mode": "segment_death_mode",
+    "__segment_removal_mode": "segment_removal_mode",
+    "to_main_cap": "part_to_main_cap_default",
+}
+
+
+def _engine_var_warning(path: str, value: Any) -> str:
+    """Advisory for `!ent set_var` on an engine-read var holding a word the
+    engine doesn't know. Returns the line (leading newline) or ""."""
+    rule = _ENGINE_VAR_RULES.get(path)
+    if rule is None or not isinstance(value, str):
+        return ""
+    choices = list((RULES_REGISTRY[rule]["schema"] or {}).get("choices") or ())
+    if value in choices or (path == "to_main_cap"
+                            and re.fullmatch(r"absolute:\d+", value)):
+        return ""
+    extra = " or absolute:<n>" if path == "to_main_cap" else ""
+    return (f"\n⚠️ the engine reads `{path}` as one of "
+            f"{', '.join(choices)}{extra} — `{value}` isn't one of them "
+            f"(it overrides the `{rule}` rule).")
+
+
 def _cell_formula_warning(m: Match, path: str, value: Any) -> str:
     """Advisory for a tile / template / zone `block` or `opaque` value that
     is a formula with an error. Those fail OPEN at use (a broken block
@@ -3100,6 +3139,9 @@ async def _ent_move_group(ctx, args, mgr, m):
                 n = int(t)
             except ValueError:
                 return await ctx.send(f"❌ Unexpected token '{t}'.")
+            if n < 1:
+                return await ctx.send(
+                    f"❌ A step count must be at least 1, got {n}.")
             if i + 1 >= len(tokens):
                 return await ctx.send("❌ Count must be followed by a direction.")
             d = tokens[i + 1]
@@ -3568,6 +3610,10 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 try: n = int(t)
                 except ValueError:
                     return await ctx.send(f"❌ Unexpected token '{t}'.")
+                if n < 1:
+                    # The walk ran max(1, n) steps: `0 right` moved one.
+                    return await ctx.send(
+                        f"❌ A step count must be at least 1, got {n}.")
                 if i + 1 >= len(tokens): return await ctx.send("❌ Count must be followed by a direction.")
                 d = tokens[i+1]
                 if normalize_direction(d) is None:
@@ -4011,6 +4057,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             from logic import TEXT_COLORS
             if value not in TEXT_COLORS:
                 ack += f"\n⚠ `{value}` isn't a recognized render color (renders uncolored). " + _color_guide()
+        ack += _engine_var_warning(key_path, value)
         if hook_log:
             ack += "\n" + "\n".join(hook_log)
         return await ctx.send(ack)
@@ -6137,6 +6184,10 @@ async def reveal_fog_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 duration = int(t[6:])
             except ValueError:
                 return await ctx.send("❌ `turns=` must be an integer.")
+            if duration < 1:
+                return await ctx.send(
+                    f"❌ `turns=` must be at least 1, got {duration} (leave it "
+                    f"out for a permanent reveal).")
         else:
             rest.append(t)
     if form == "clear":
@@ -6149,22 +6200,22 @@ async def reveal_fog_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                      for y in range(1, m.grid_height + 1)}
         elif form == "at":
             cx, cy, r = int(rest[0]), int(rest[1]), int(rest[2])
-            cells = {(x, y) for x in range(cx - r, cx + r + 1)
-                     for y in range(cy - r, cy + r + 1)}
+            if r < 0:
+                return await ctx.send(f"❌ the radius must be 0 or more, got {r}.")
+            cells = _grid_box(m, cx - r, cy - r, cx + r, cy + r)
         elif form == "rect":
             x1, y1, x2, y2 = (int(rest[i]) for i in range(4))
-            cells = {(x, y) for x in range(min(x1, x2), max(x1, x2) + 1)
-                     for y in range(min(y1, y2), max(y1, y2) + 1)}
+            cells = _grid_box(m, x1, y1, x2, y2)
         elif form == "around":
             eid = _resolve_eid(m, rest[0])
             e = m.entities.get(eid)
             if e is None:
                 raise NotFound(f"Entity '{rest[0]}' not found.")
             r = int(rest[1])
+            if r < 0:
+                return await ctx.send(f"❌ the radius must be 0 or more, got {r}.")
             for (ex, ey) in m.entity_cells(e):
-                for x in range(ex - r, ex + r + 1):
-                    for y in range(ey - r, ey + r + 1):
-                        cells.add((x, y))
+                cells |= _grid_box(m, ex - r, ey - r, ex + r, ey + r)
         else:
             return await ctx.send(
                 "Usage: `!reveal_fog <team> all|at|rect|around|clear ...`.")
@@ -9272,18 +9323,21 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         path = args[5]
         value = _parse_scalar(args[6])
         if sub == "line":
+            m._check_line_budget(x1, y1, x2, y2, "line")
             cells = m._line_cells(x1, y1, x2, y2)
         else:
-            cells = [(cx, cy)
-                     for cy in range(min(y1, y2), max(y1, y2) + 1)
-                     for cx in range(min(x1, x2), max(x1, x2) + 1)]
+            # Off-grid cells are only counted (for the "skipped" note), not
+            # built: a typo'd corner used to build the whole rectangle.
+            area = (abs(x2 - x1) + 1) * (abs(y2 - y1) + 1)
+            cells = sorted(_grid_box(m, x1, y1, x2, y2),
+                           key=lambda c: (c[1], c[0]))
         n = 0
-        for (cx, cy) in cells:
-            if not m.in_bounds(cx, cy):
+        for c in cells:
+            if not m.in_bounds(*c):
                 continue
-            m.tile_set_path(cx, cy, path, value)
+            m.tile_set_path(c[0], c[1], path, value)
             n += 1
-        skipped = len(cells) - n
+        skipped = (len(cells) if sub == "line" else area) - n
         tail = f" ({skipped} off-grid cell(s) skipped)" if skipped else ""
         return await ctx.send(
             f"Set `{path}` = {value!r} on {n} tile(s) "
@@ -10212,6 +10266,10 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 duration = int(args[4])
             except ValueError:
                 return await ctx.send("❌ duration must be an integer.")
+        # A negative level or duration used to be applied as given.
+        for label, v in (("level", level), ("duration", duration)):
+            if v is not None and v < 0:
+                return await ctx.send(f"❌ {label} can't be negative, got {v}.")
         try:
             event_log = m.apply_status(eid, name, level, duration, force=force)
         except (VTTError, NotFound) as ex:

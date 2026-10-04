@@ -6221,6 +6221,10 @@ class Match:
             z = self.create_zone(name)
         xa, xb = sorted((int(x1), int(x2)))
         ya, yb = sorted((int(y1), int(y2)))
+        # Clipped to the grid before the walk: zone_fill(z, 1, 1, 10**6,
+        # 10**6) used to visit a trillion cells to keep the on-grid ones.
+        xa, xb = max(1, xa), min(self.grid_width, xb)
+        ya, yb = max(1, ya), min(self.grid_height, yb)
         added = 0
         for xx in range(xa, xb + 1):
             for yy in range(ya, yb + 1):
@@ -7948,7 +7952,8 @@ class Match:
         drift on the corner rule."""
         return not self._los_stop(viewer_id, x1, y1, x2, y2)[1]
 
-    def _check_line_budget(self, x1: int, y1: int, x2: int, y2: int) -> None:
+    def _check_line_budget(self, x1: int, y1: int, x2: int, y2: int,
+                           what: str = "sight line") -> None:
         """Refuse a sight/geometry line longer than the formula_cell_limit
         rule. The walk costs one step per cell crossed, and formulas (incl.
         a player's inline `$()` arg) choose the endpoints freely — has_los(0,
@@ -7961,7 +7966,7 @@ class Match:
             limit = 100000
         if n > limit:
             raise VTTError(
-                f"sight line ({x1},{y1})->({x2},{y2}) crosses up to {n} "
+                f"{what} ({x1},{y1})->({x2},{y2}) crosses up to {n} "
                 f"cells, over the formula_cell_limit of {limit}."
             )
 
@@ -11421,7 +11426,12 @@ class Match:
                 return True
             return all(self.cell_occupant(fx, fy) is None
                        for fx, fy in self.entity_cells(e, cx, cy))
-        for r in range(0, max(0, radius) + 1):
+        # Rings past the farthest grid corner hold no on-grid cell, so the
+        # search stops there: summon_near(t, x, y, 10**6) on a full board
+        # used to walk every ring out to a million.
+        reach = max(abs(x - 1), abs(x - self.grid_width),
+                    abs(y - 1), abs(y - self.grid_height))
+        for r in range(0, min(max(0, radius), reach) + 1):
             if r == 0:
                 candidates = [(x, y)]
             else:

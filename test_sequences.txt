@@ -17914,6 +17914,10 @@ SCENARIO 661 — mode names are checked: distance metrics, damage_spread, to_mai
 !system set default part_to_main_cap_default absolute:4
 ?? part_to_main_cap_default = 'absolute:4'
 !system set default part_to_main_cap_default max_hp
+!ent set_var b sprite_mode stretchh
+?? ⚠️ the engine reads `sprite_mode` as one of single, stretch, tile — `stretchh` isn't one of them
+!ent set_var b sprite_mode stretch
+?! ⚠️
 
 Expected: Each of these used to accept a typo and quietly do something
 else. entities_within / nearest_entity / `near:` / `!dist` read an unknown
@@ -17922,4 +17926,52 @@ damage_spread split by weight on an unknown mode, and a fragment count of
 10**9 looped a billion times; a part whose `to_main_cap` was misspelled
 passed the whole hit through uncapped; the str rules with fixed choices
 (aoe_default_mode, hit_location_mode, the segment modes,
-part_to_main_cap_default, which also takes absolute:<n>) stored any value.
+part_to_main_cap_default, which also takes absolute:<n>) stored any
+value. Engine-read vars with fixed words (sprite_mode, sprite_mirror,
+mount_action_actor, the `__segment_*` modes, to_main_cap) still store
+what `!ent set_var` is given, with a warning naming the words the engine
+reads.
+
+
+SCENARIO 662 — counts, radii and areas: zero / negative refused, huge areas clipped to the grid
+-----------------------------------------------------------------------------------------------
+
+!match new s662 Bounds 8 8
+!match use s662
+!match fog on
+!ent add scout Scout 20 1 1 5
+!ent set_var scout team red
+!ent move scout 0 right
+?? ❌ A step count must be at least 1, got 0.
+!ent move scout -2 down
+?? ❌ A step count must be at least 1, got -2.
+!assert "entity[scout].x == 1 and entity[scout].y == 1" "the refused moves left it in place"
+!reveal_fog red at 1 1 -1
+?? ❌ the radius must be 0 or more, got -1.
+!reveal_fog red around scout 2 turns=0
+?? ❌ `turns=` must be at least 1, got 0
+!reveal_fog red at 1 1 1000000
+?? Revealed 64 cell(s) to team `red` permanently.
+!tile fill 7 7 1000000 1000000 glyph #
+?? on 4 tile(s)
+!tile line 1 1 1 1000000000 glyph =
+?? ❌ line (1,1)->(1,1000000000) crosses up to 1000000000 cells, over the formula_cell_limit
+!zone new zz
+!eval "zone_fill('zz', 1, 1, 10**6, 10**6)"
+?? = `64`
+!status def burn
+!status apply scout burn -2
+?? ❌ level can't be negative, got -2.
+!eval "status_apply('scout', 'burn', 1, -5)"
+?? duration can't be negative, got -5.
+
+Expected: `!ent move <id> 0 right` and `-2 down` each used to move one step
+(the walk ran max(1, n) steps); a count below 1 is now refused. A negative
+reveal radius used to "reveal 0 cells permanently" and `turns=0` /
+negative made a reveal that expired at once; both are refused. Huge areas
+are clipped to the grid while they are built: `!reveal_fog ... at 1 1
+1000000`, `!tile fill` to a far corner and `zone_fill` to 10**6 each used
+to walk the whole rectangle (trillions of cells) before keeping the 8x8
+on-grid part, which hung the bot; `!tile line` to a far point is refused
+over formula_cell_limit. A negative status level or duration (command or
+formula) is refused instead of applied as given.
