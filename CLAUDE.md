@@ -207,6 +207,20 @@ footprints. Two corollaries the user stated explicitly:
 - **If CLAUDE.md's wording was ambiguous about the behavior in question, it
   MUST be amended** as part of the fix, so the ambiguity doesn't recur.
 
+### Usage strings are authoritative (stray-word check)
+
+The dispatcher refuses positional words past the end of a command's usage
+string (`_stray_words_error`, audit-pass-36): `!ent remove a b` used to remove
+only `a`. So **every new subcommand needs an exact `annotate_sub` usage**
+(and a root without subcommands an exact root usage): `<x>` one word,
+`[...]` optional, `|` alternatives (an alternative LED by a literal word —
+`list`, `cell <x> <y>` — applies only when that word is typed), `...` /
+`<x ...>` any number more, `key=<v>` / `[key=value ...]` options (left to
+the handler). Alias spellings (`del`/`rm`) go in `_SUB_ALIASES`. A wrong
+usage string refuses a valid command; the regression catches most. An
+optional slot that takes any word (`[full]`, `[once]`, `[N]`) can't be
+checked this way: the handler must refuse a word that doesn't fit.
+
 ### Commit messages: dense, factual, no fluff
 
 Look at existing commit messages on `main`. They explain WHY a change
@@ -880,7 +894,10 @@ More shipped work (continuing the list above):
   entity (`!ent set_var dragon footprint_w 3`), via a summon template, or
   globally with `!defvar` (defaults are applied in `spawn`/`summon` BEFORE
   the footprint-aware bounds/occupancy check). There is NO `!ent add` size
-  arg — footprint is "just a var." Core geometry on `Match`:
+  arg — footprint is "just a var," but a write that GROWS the body is
+  checked like a move (`Match.check_body_fits`, called from write_var and
+  transform: refused if a new cell is off-grid or taken; audit-pass-36), and
+  a side is read capped one past the grid side. Core geometry on `Match`:
   `entity_footprint(e)`→(w,h), `entity_cells(e[,ax,ay])` (row-major, [0]=
   anchor), `entity_occupies(e,x,y)`, `cell_occupant(x,y,ignore=())` (the
   footprint-aware occupancy core behind `is_occupied`), and the single
@@ -1036,6 +1053,10 @@ More shipped work (continuing the list above):
     turn clock; the GM calls status_counter_add(-1) from whatever the trigger
     is). Also `!status counter <eid> <name> <add|set> <value> [field]`. Auto-
     removal goes through the status diff chokepoint (`_status_remove`).
+    OPEN (user: decide later): a status with NO `duration` shows as ∞, but
+    `status_counter_add(eid, name, -1)` (default field duration) reads the
+    missing duration as 0 and REMOVES the status. Whether ∞ should stay ∞
+    (no-op, return None) is undecided; don't change it without asking.
   - apply_status now also surfaces a block reason to the command layer via
     `Match.status_apply_block_reason(eid, name, level)` (immune / blocked by X
     / fully resisted). All def fields serialize (deepcopy); resistances are
@@ -1165,6 +1186,10 @@ More shipped work (continuing the list above):
     default · `remaining_hp` · `absolute:<n>`; `none` auto for 0/0), `vital`
     (part death kills parent), `indestructible` (auto for max_hp==0). Routing
     happens ONLY via `damage_part` — a raw `entity[part].hp -=` does not spill.
+    `damage_part` / `damage_spread` REFUSE a negative amount (user call,
+    audit-pass-36: a negative hit used to heal the part AND send a share of
+    the heal to main); heal a part with an hp write, which also clears its
+    destroyed latch and resumes a suspended aura (handled in write_var).
   - **Part destruction** (hp→0 by damage, non-indestructible): the part LINGERS
     attached & dead, fires `on_death` ONCE (latched by the `__part_destroyed`
     var; a heal above 0 clears it), and if `vital` runs the parent through the
@@ -4308,6 +4333,62 @@ More shipped work (continuing the list above):
     detector (546k runs, only the known false hits); the full command fuzzer
     (98k runs; 4 hits are `!eval` formulas subtracting from a string); the
     huge-number fuzzers; chaos normal + hostile; the reload differential.
+
+- **Audit-pass-36 (hands-on): wholesale var writes, stray words, a hidden
+  NameError (scenarios 671-677).** Reusable harnesses: a STORE FUZZER (every
+  read-only formula function's result written into a var, then JSON round
+  trip and equality checked — clean), a STRAY-WORD DETECTOR (every scenario
+  command re-run with an extra word appended; reports replies that are not
+  errors and don't mention it — 181 command shapes before, 10 after, all
+  variadic by design), and `pyflakes` (pip-installable; caught nothing new
+  after the fix below, run it after edits to error paths). Fixes:
+  - **Wholesale var writes skipped the write_var checks (HIGH).** Spawn
+    (summon templates, part / segment templates) and transform set a unit's
+    vars wholesale: a template `hp: 'abc'` made a unit that 💥'd `!list`, and
+    a template var `x` / `name` made a var the engine can't reach.
+    `logic.checked_unit_vars` (vital vars coerced to whole numbers or
+    refused, reserved names refused, own copy with string keys) runs in
+    `Entity.spawn` and `apply_statblock`; a transform checks BEFORE dropping
+    the old parts, and refuses a form with no hp. Skipped template parts /
+    segments now log a ⚠️ line. `!defvar add` refuses a non-number vital
+    default.
+  - **Status `level` / `duration` are number fields.** `!ent status a set
+    burn level abc` was stored and the next `!status apply` 💥'd.
+    `logic.checked_status_value` guards `!ent status set`, `!status data`
+    and status_set; stacking keeps a float level (add_level used int()); a
+    counter on a text field reports it (it read as 0 and removed the
+    status). `!ent status ... add <name> <extra>` is refused.
+  - **revive / transform / revert formula errors were a NameError (MED).**
+    Their `except (VTTError, NotFound, OutOfBounds, Occupied)` named two
+    classes formula.py never imported, so EVERY failure read "name
+    'OutOfBounds' is not defined". Now `except VTTError`.
+  - **Footprint (user call → refuse if it doesn't fit).** `!ent set_var a
+    footprint_w 3` grew a over its neighbour (which vanished from the map)
+    or off the grid, and `footprint_w 30000` hung the bot for every guild
+    (every cell walk built 9*10^8 cells). `Match.check_body_fits` (only
+    newly covered cells; glued / region parts and riders skipped) runs on a
+    footprint write in write_var and on transform; `_cap_footprint` reads a
+    side as at most grid side + 1.
+  - **Negative part damage (user call → refuse).** See the locational-damage
+    entry; also a text / infinite `to_main_percent` gives a clean message
+    (was a raw Python error) and `absolute:<n>` needs n >= 0 (a negative cap
+    healed the body on every hit). The destroyed-latch clear + aura resume
+    moved from damage_part's heal branch to write_var (a plain hp write
+    never cleared it).
+  - **Stray words (user call → central check).** See §2 "Usage strings are
+    authoritative". Annotated every unannotated subcommand (`!map` ×17,
+    `!status` ×19, `!part`, `!table`, `!team`, `!watch`, `!macro`, `!mod`,
+    ent copy/transfer, match win/outcome, tile line/fill, zone
+    anchor/unanchor/sprite), rewrote ambiguous usages (`!reveal_fog`,
+    `!ent status`, `!ent group`, `!system alias`, `!dist`, `!roll`), and
+    added handler checks where an optional slot took any word: `!undo
+    command zz` undid one command, `!ent copy a m 4` dropped the x, `!watch
+    add ... onec` made a repeating watcher. Four scenario lines were
+    themselves malformed (572 `!defvar add default ...`, 212, 569) and are
+    fixed. `!map scene full` now works (it read only args[0]) and is
+    host-only.
+  - OPEN (user: decide later): status_counter_add on a missing (∞) duration
+    removes the status — see the status-counters entry.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
