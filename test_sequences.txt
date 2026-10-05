@@ -18099,3 +18099,37 @@ Expected: A doubled, leading or trailing dot in a var / tile / team / zone
 empty segment became a key named "": `inventory..sword` stored
 inventory[""]["sword"], `.lead` stored vars[""]["lead"], and the typo never
 surfaced.
+
+
+SCENARIO 667 — rounding_mode decides how a half lands (damage_part, transform)
+-------------------------------------------------------------------------------
+
+!match new s667 Round 8 8
+!match use s667
+!ent add boss Boss 100 3 3 5
+!part add boss arm Arm 20 20
+!ent set_var arm to_main_percent 50
+!eval "damage_part('arm', 5)"
+?? = `3`
+!system set default rounding_mode half_even
+!eval "damage_part('arm', 5)"
+?? = `2`
+!eval "damage_part('arm', 7)"
+?? = `4`
+!system set default rounding_mode floor
+!eval "damage_part('arm', 7)"
+?? = `3`
+!system set default rounding_mode half_up
+!ent add w W 3 6 6 4
+!ent set_var w max_hp 4
+!ent set_var w form.name Ogre
+!ent set_var w form.vars.hp 10
+!ent set_var w form.vars.max_hp 10
+!ent transform w form
+!assert "entity[w].hp == 8" "3/4 of 10 = 7.5 rounds up to 8"
+
+Expected: half of a 5-point arm hit goes to the boss: 2.5, which half_up
+(the default) rounds to 3. half_even gives Python's round(): 2 for 2.5 and
+4 for 3.5; floor gives 3 for 3.5. Transform's percent hp uses the same
+rule: 3/4 hp carried into a 10-hp form is 7.5, so 8. Before, both always
+used round(), so a half went to the even number.

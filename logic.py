@@ -302,6 +302,22 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # transform()/revert()). 'percent' keeps the same fraction of max_hp into
     # the new form (50% of old max -> 50% of new max); 'keep' carries current
     # hp clamped to the new max; 'full' uses the target statblock's own hp.
+    # How the engine rounds a computed share to a whole number: damage_part's
+    # to-main transfer and transform's percent hp.
+    "rounding_mode": {
+        "default": "half_up",
+        "schema": {"type": "enum",
+                   "choices": ["half_up", "half_even", "floor", "ceil"]},
+        "desc": (
+            "How the engine rounds a computed amount to a whole number: "
+            "damage_part's to-main share (part damage x to_main_percent) and "
+            "transform's `percent` hp. `half_up` (default): .5 rounds away "
+            "from zero (50% of 5 -> 3). `half_even`: .5 rounds to the even "
+            "number (50% of 5 -> 2, of 7 -> 4; Python's round()). `floor` / "
+            "`ceil`: always down / up. The formula round() function is "
+            "unaffected."
+        ),
+    },
     "transform_hp_mode": {
         "default": "percent",
         "schema": {"type": "enum", "choices": ["percent", "keep", "full"]},
@@ -11729,6 +11745,28 @@ class Match:
             f"to_main_cap {cap!r} isn't none, max_hp, remaining_hp or "
             f"absolute:<n>.")
 
+    def round_by_rule(self, value: Any) -> int:
+        """Round `value` (a number or a Fraction) to an int per the
+        rounding_mode rule. Floats are read as their decimal text, so a
+        computed 2.5 is exactly a half."""
+        from fractions import Fraction
+        import math as _m
+        if isinstance(value, Fraction):
+            v = value
+        elif isinstance(value, int):
+            return value
+        else:
+            v = Fraction(repr(float(value)))
+        mode = str(self.rules.get("rounding_mode", "half_up"))
+        if mode == "floor":
+            return _m.floor(v)
+        if mode == "ceil":
+            return _m.ceil(v)
+        if mode == "half_even":
+            return round(v)
+        # half_up: a half rounds away from zero.
+        return int(_m.floor(abs(v) + Fraction(1, 2))) * (1 if v >= 0 else -1)
+
     def damage_part(self, part_id: str, amount: int) -> Tuple[int, List[str]]:
         """Deal `amount` damage to body part `part_id`, routing the
         configured share to the parent's main HP (the HD2 'damage to main'
@@ -11769,7 +11807,9 @@ class Match:
                 base = self._part_transfer_base(amount, cur_hp, max_hp, cap)
             except VTTError as ex:
                 raise VTTError(f"damage_part `{p.id}`: {ex}")
-            to_main = int(round(base * pct / 100.0))
+            from fractions import Fraction
+            to_main = self.round_by_rule(
+                Fraction(base) * Fraction(repr(float(pct))) / 100)
             if to_main != 0:
                 p_hp_var, _, _ = parent._vital_var_names()
                 # Its log carries the parent's hp hooks and, on a lethal
@@ -12564,7 +12604,14 @@ class Match:
                     and old_max not in (None, 0)):
                 frac = float(old_hp) / float(old_max)
                 scaled = new_max * frac
-                target_hp = int(round(scaled)) if isinstance(new_max, int) else scaled
+                if isinstance(new_max, int):
+                    from fractions import Fraction
+                    target_hp = self.round_by_rule(
+                        Fraction(int(old_hp)) / Fraction(int(old_max)) * new_max
+                        if isinstance(old_hp, int) and isinstance(old_max, int)
+                        else scaled)
+                else:
+                    target_hp = scaled
             elif (hp_mode == "keep" and isinstance(new_max, (int, float))
                   and old_hp is not None):
                 target_hp = min(float(old_hp), float(new_max))
