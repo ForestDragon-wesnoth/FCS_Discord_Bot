@@ -3,7 +3,7 @@
 # logic.py
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
-from typing import Literal, Any, Dict, List, Optional, Tuple, Set
+from typing import Literal, Any, Dict, Iterable, List, Optional, Tuple, Set
 import uuid
 import json
 import copy
@@ -2998,6 +2998,83 @@ def reserved_var_path_error(path: str, where: str) -> Optional[str]:
             f"{'display name' if seg0 == 'name' else 'position'}); it can't "
             f"be written or nested under. Use {fix}.")
 
+def checked_unit_vars(vars_: Any, vitals: Iterable[str], where: str) -> Dict[str, Any]:
+    """`vars_` ready to become a whole unit's vars, held to the rules
+    write_var applies one write at a time: each vital var present (hp /
+    max_hp / initiative) is a whole number (a numeric string or float is
+    coerced; text, a bool, a dict or a non-finite number is refused), no
+    top-level key is a reserved var path (x / y / name) or empty, and the
+    dict is the unit's own copy with string keys. Spawn (summon templates,
+    part / segment templates) and transform set a unit's vars wholesale;
+    they used to store `hp: 'abc'` as given, and the unit then broke
+    `!list` and every hp read."""
+    if not isinstance(vars_, dict):
+        raise VTTError(f"{where}: vars must be a dict, got "
+                       f"{type(vars_).__name__}.")
+    out = _own_value(vars_)
+    for k in list(out):
+        if k == "":
+            raise VTTError(f"{where}: a var has an empty name.")
+        if k in RESERVED_VAR_PATHS:
+            raise VTTError(
+                f"{where}: `{k}` is a reserved var path (the unit's own "
+                f"{'display name' if k == 'name' else 'position'}), so a "
+                f"template or statblock can't carry a var by that name.")
+    for k in vitals:
+        if k not in out:
+            continue
+        coerced = _coerce_vital_value(out[k])
+        if coerced is None:
+            raise VTTError(f"{where}: vital var '{k}' must be a finite "
+                           f"whole number, got {out[k]!r}.")
+        out[k] = coerced
+    return out
+
+
+# Status instance fields the engine does arithmetic on (stacking, extend,
+# counters, the `name(level)` display).
+STATUS_NUMBER_FIELDS: Tuple[str, ...] = ("level", "duration")
+
+
+def _coerce_number(v: Any) -> Optional[Any]:
+    """`v` as a finite int or float (a numeric string is parsed), or None.
+    bool is refused (True is not level 1)."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str):
+        t = v.strip()
+        try:
+            return int(t)
+        except ValueError:
+            try:
+                v = float(t)
+            except ValueError:
+                return None
+    if isinstance(v, float):
+        return v if math.isfinite(v) else None
+    return None
+
+
+def checked_status_value(path: str, value: Any, where: str) -> Any:
+    """`value` ready to store at `path` in a status instance (or a status
+    definition's seed data): `level` and `duration` must be finite numbers
+    with nothing nested under them. `!ent status a set burn level abc` used
+    to be stored, and the next `!status apply` crashed on it."""
+    seg0 = str(path).split(".", 1)[0]
+    if seg0 not in STATUS_NUMBER_FIELDS:
+        return value
+    if "." in str(path):
+        raise VTTError(f"{where}: `{seg0}` is a number field of a status; "
+                       f"nothing can be nested under it.")
+    n = _coerce_number(value)
+    if n is None:
+        raise VTTError(f"{where}: `{seg0}` must be a finite number, "
+                       f"got {value!r}.")
+    return n
+
+
 # Recognized modifier fold ops (see Match._apply_modifier_op). An op outside
 # this set still folds as a lenient add, but `!mod show` flags it as a likely
 # typo via Match.unknown_modifier_ops.
@@ -4565,6 +4642,12 @@ class Entity:
         # footprint-aware bounds/occupancy check below must see the
         # defaults. Fill-only, so an explicitly-provided value wins.
         match._apply_default_vars(self)
+        self.vars = checked_unit_vars(
+            self.vars,
+            (match.rules.get("hp_var", "hp"),
+             match.rules.get("max_hp_var", "max_hp"),
+             match.rules.get("turnorder_var", "initiative")),
+            f"`{self.id}`")
 
         # Validate the WHOLE footprint anchored at (x, y): every covered
         # cell in bounds and unoccupied (stackable spawners skip
@@ -5095,8 +5178,26 @@ class Entity:
         # mutated vars (legitimately, through write_var). That's fine — we
         # re-resolve `old` against the current state for the diff, so we
         # capture only the change attributable to THIS write call.
+        # A footprint write that grows the body must fit, like a move.
+        if self._match is not None and "." not in path and path in (
+                self._match.rules.get("footprint_width_var", "footprint_w"),
+                self._match.rules.get("footprint_height_var", "footprint_h")):
+            trial = dict(self.vars)
+            trial[path] = value
+            self._match.check_body_fits(self, trial, f"`{self.id}`.{path}")
         old_post_attempt = _path_resolve(self.vars, path)
         self._set_path(path, value)
+        # A heal that lifts a destroyed body part back above 0 clears the
+        # destroyed latch, so it can break (and re-fire on_death) again, and
+        # RESUMES any aura suspended when it broke (a no-op unless
+        # anchored_zone_on_anchor_loss is 'suspend'). Here, at the hp write,
+        # so any heal counts: damage_part refuses negative amounts.
+        if (self._match is not None and self.part_of
+                and self.vars.get("__part_destroyed")
+                and path == self._vital_var_names()[0]
+                and isinstance(value, (int, float)) and value > 0):
+            self.vars.pop("__part_destroyed", None)
+            self._match._resume_anchored_zones(self.id)
         # Diff old vs new at this path and collect the resulting events
         leaf_events = _diff_subtree(path, old_post_attempt, value)
         # Now we can fill in new_value for the ancestor events by re-resolving
@@ -8443,12 +8544,14 @@ class Match:
         cv = ent.get("vars", {}) if isinstance(ent, dict) else {}
         if isinstance(cv, dict):
             try:
-                w = max(1, int(cv.get(str(self.rules.get("footprint_width_var", "footprint_w")))))
-            except (TypeError, ValueError):
+                w = self._cap_footprint(int(cv.get(str(self.rules.get(
+                    "footprint_width_var", "footprint_w")))), "footprint_width_var")
+            except (TypeError, ValueError, OverflowError):
                 w = 1
             try:
-                h = max(1, int(cv.get(str(self.rules.get("footprint_height_var", "footprint_h")))))
-            except (TypeError, ValueError):
+                h = self._cap_footprint(int(cv.get(str(self.rules.get(
+                    "footprint_height_var", "footprint_h")))), "footprint_height_var")
+            except (TypeError, ValueError, OverflowError):
                 h = 1
         return w, h
 
@@ -8739,9 +8842,18 @@ class Match:
         var = str(self.rules.get(rule_key, default_name))
         try:
             v = int(e.vars.get(var))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return 1
-        return v if v >= 1 else 1
+        return self._cap_footprint(v, rule_key)
+
+    def _cap_footprint(self, v: int, rule_key: str) -> int:
+        """A footprint side, at least 1 and at most one past the grid side.
+        Every larger value is just as off-grid, and `footprint_w 30000` used
+        to make every cell walk (render, occupancy, vision) build 9*10^8
+        cells and hang the bot."""
+        side = (self.grid_width if rule_key == "footprint_width_var"
+                else self.grid_height)
+        return max(1, min(v, max(1, side) + 1))
 
     def entity_footprint(self, e: "Entity") -> Tuple[int, int]:
         """(width, height) of `e`'s footprint, each >= 1. 1×1 when the
@@ -8877,6 +8989,55 @@ class Match:
         """True iff every cell of `e`'s footprint anchored at (ax, ay)
         is on the grid."""
         return all(self.in_bounds(cx, cy) for cx, cy in self.entity_cells(e, ax, ay))
+
+    def check_body_fits(self, e: "Entity", trial_vars: Dict[str, Any],
+                        where: str, extra_ignore: Tuple[str, ...] = ()) -> None:
+        """Refuse a change of `e`'s vars to `trial_vars` whose footprint would
+        leave the grid or cover another unit, as a move or a spawn would.
+        Writing footprint_w / footprint_h (or transforming into a bigger form)
+        used to grow a unit over its neighbour, which then vanished from the
+        map, or off the grid. Only cells the body doesn't cover now are
+        checked, so shrinking always fits. Units that don't stand on the
+        ground themselves (glued / region parts, mounted riders) and units
+        not yet placed are skipped."""
+        if (e._match is not self or e.id not in self.entities
+                or e.is_glued_part or e.is_region_part or e.mounted_on):
+            return
+        old_cells = set(self.entity_cells(e))
+        saved = e.vars
+        e.vars = trial_vars
+        try:
+            new_cells = self.entity_cells(e)
+            w, h = self.entity_footprint(e)
+        finally:
+            e.vars = saved
+        grown = [c for c in new_cells if c not in old_cells]
+        if not grown:
+            return
+        # The size as written (the cell walk caps a side one past the grid).
+        for key, dim in (("footprint_width_var", "w"), ("footprint_height_var", "h")):
+            raw = trial_vars.get(self.rules.get(key, "footprint_" + dim))
+            if isinstance(raw, int) and not isinstance(raw, bool) and raw > 1:
+                if dim == "w":
+                    w = raw
+                else:
+                    h = raw
+        size = f"{w}x{h}"
+        for cx, cy in grown:
+            if not self.in_bounds(cx, cy):
+                raise OutOfBounds(
+                    f"{where}: `{e.id}` can't become {size} at ({e.x},{e.y}) — "
+                    f"({cx},{cy}) is outside the {self.grid_width}x"
+                    f"{self.grid_height} grid.")
+        if e.is_cell_stackable:
+            return
+        ignore = self._occupancy_ignore(e, extra_ignore)
+        for cx, cy in grown:
+            other = self.cell_occupant(cx, cy, ignore)
+            if other is not None:
+                raise Occupied(
+                    f"{where}: `{e.id}` can't become {size} at ({e.x},{e.y}) — "
+                    f"({cx},{cy}) is taken by `{other}`.")
 
     def _validate_placement(self, e: "Entity", ax: int, ay: int,
                             mode: Optional[str]) -> None:
@@ -10712,7 +10873,8 @@ class Match:
         before = copy.deepcopy(e.status.get(name))
         if name not in e.status:
             inst = copy.deepcopy(sdef.get("data")) if isinstance(sdef.get("data"), dict) else {}
-            seed_lv = new_level if new_level is not None else int(inst.get("level", 1))
+            seed_lv = (new_level if new_level is not None
+                       else _coerce_number(inst.get("level", 1)) or 1)
             inst["level"] = self._cap_status_level(sdef, seed_lv)
             if new_duration is not None:
                 inst["duration"] = new_duration
@@ -10729,10 +10891,10 @@ class Match:
                     inst["duration"] = new_duration
             elif mode == "extend":
                 if new_duration is not None:
-                    inst["duration"] = int(inst.get("duration", 0)) + new_duration
+                    inst["duration"] = (_coerce_number(inst.get("duration", 0)) or 0) + new_duration
             elif mode == "add_level":
                 add = new_level if new_level is not None else 1
-                nl = int(inst.get("level", 0)) + add
+                nl = (_coerce_number(inst.get("level", 0)) or 0) + add
                 inst["level"] = self._cap_status_level(sdef, nl)
                 if new_duration is not None:
                     inst["duration"] = new_duration
@@ -11474,10 +11636,10 @@ class Match:
                 pe = Entity.from_dict(ptc)
                 _, plog = pe.spawn(self, place_x, place_y)
                 log += plog
-            except VTTError:
+            except VTTError as ex:
                 # A malformed part entry (missing hp var, id clash) is
-                # skipped rather than aborting the whole summon.
-                pass
+                # skipped rather than aborting the whole summon, and said so.
+                log.append(f"⚠️ `{new_id}`: part `{pid}` was not created: {ex}")
         # Snake body: a `segments` list/dict spawns SEGMENTS chained behind
         # the head (this entity), in order. Each entry: {name?, id?, hp,
         # maxhp, vars?}. add_segment finds a free trailing cell and sets the
@@ -11497,16 +11659,17 @@ class Match:
                 svars[name_var] = role
             sname = str(st.get("name") or svars.get(name_var) or f"{new_id}_seg")
             sid = self.mint_entity_id(str(st.get("id") or sname))
-            try:
-                shp = int(st.get("hp", 0))
-                smhp = int(st.get("maxhp", shp))
-            except (TypeError, ValueError):
+            shp = _coerce_vital_value(st.get("hp", 0))
+            smhp = _coerce_vital_value(st.get("maxhp", shp))
+            if shp is None or smhp is None:
+                log.append(f"⚠️ `{new_id}`: segment `{sid}` was not created: "
+                           f"its hp / maxhp must be whole numbers.")
                 continue
             try:
                 _, slog = self.add_segment(new_id, sid, sname, shp, smhp, svars)
                 log += slog
-            except VTTError:
-                pass
+            except VTTError as ex:
+                log.append(f"⚠️ `{new_id}`: segment `{sid}` was not created: {ex}")
         return new_id, log
 
     def _find_free_cell_near(
@@ -11789,16 +11952,19 @@ class Match:
             return min(amount, max(0, cur_hp))
         if cap.startswith("absolute:"):
             try:
-                return min(amount, int(cap.split(":", 1)[1]))
+                n = int(cap.split(":", 1)[1])
             except (TypeError, ValueError):
-                pass
+                n = -1
+            # A negative cap turned every hit into a heal of the main body.
+            if n >= 0:
+                return min(amount, n)
         elif cap == "none":
             return amount          # uncapped
         # An unknown value (a typo'd `to_main_cap` var) used to mean
         # "uncapped": a big hit then tapped through in full.
         raise VTTError(
             f"to_main_cap {cap!r} isn't none, max_hp, remaining_hp or "
-            f"absolute:<n>.")
+            f"absolute:<n> (n a whole number, 0 or more).")
 
     def round_by_rule(self, value: Any) -> int:
         """Round `value` (a number or a Fraction) to an int per the
@@ -11844,13 +12010,23 @@ class Match:
             raise NotFound(f"Entity '{part_id}' not found.")
         try:
             amount = int(amount)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise VTTError("damage_part: amount must be an integer.")
+        if amount < 0:
+            # A negative hit used to heal the part AND move to_main_percent
+            # of the heal to the main body. Heal with a plain hp write.
+            raise VTTError(f"damage_part `{part_id}`: amount can't be negative "
+                           f"(heal a part with an hp write: `entity[{part_id}]"
+                           f".hp = ...`).")
         hp_var, mhp_var, _ = p._vital_var_names()
         cur_hp = int(p.vars.get(hp_var, 0) or 0)
         max_hp = int(p.vars.get(mhp_var, 0) or 0)
-        pct = float(p.vars.get("to_main_percent",
-                              self.rules.get("part_to_main_percent_default", 0)) or 0)
+        raw_pct = p.vars.get("to_main_percent",
+                             self.rules.get("part_to_main_percent_default", 0)) or 0
+        pct = _coerce_number(raw_pct)
+        if pct is None:
+            raise VTTError(f"damage_part `{p.id}`: to_main_percent must be a "
+                           f"finite number, got {raw_pct!r}.")
         cap = str(p.vars.get("to_main_cap",
                             self.rules.get("part_to_main_cap_default", "max_hp")))
         log: List[str] = []
@@ -11882,13 +12058,6 @@ class Match:
             log += p.write_var(hp_var, new_hp) or []
             if p.id not in self.entities:
                 return to_main, log
-        # A heal that lifts a previously-destroyed part back above 0 clears
-        # the destroyed latch so it can break (and re-fire on_death) again,
-        # and RESUMES any aura suspended when it was destroyed (no-op unless
-        # anchored_zone_on_anchor_loss is 'suspend').
-        if new_hp > 0 and p.vars.get("__part_destroyed"):
-            p.vars.pop("__part_destroyed", None)
-            self._resume_anchored_zones(p.id)
         # (4) destruction.
         if new_hp <= 0 and (cur_hp - amount) <= 0 and not self.is_indestructible(p):
             log += self._process_part_death(p)
@@ -12090,8 +12259,13 @@ class Match:
             raise NotFound(f"Entity '{target_id}' not found.")
         try:
             total = int(total)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise VTTError("damage_spread: total must be an integer.")
+        if total < 0:
+            # A negative total used to heal the parts AND move a share of
+            # the heal to the main body. Heal with a plain hp write.
+            raise VTTError("damage_spread: total can't be negative (heal with "
+                           "an hp write: `entity[x].hp = ...`).")
         mode = str(mode) if mode is not None else \
             str(self.rules.get("aoe_default_mode", "weighted"))
         if mode not in ("weighted", "uniform", "fragment", "main_only"):
@@ -12639,19 +12813,13 @@ class Match:
         # Despawn current attached parts (children first). This is a despawn,
         # not a death — no corpse, no on_death; each part's
         # on_entity_despawned fires.
-        drop_log: List[str] = []
-        for p in reversed(self.entity_part_subtree(e.id)):
-            if p.id in self.entities:
-                drop_log.extend(p.remove())
-        if e._match is not self or e.id not in self.entities:
-            # A despawn handler removed the unit itself: nothing to swap.
-            return drop_log + [
-                f"`{e.id}` was removed while its old parts despawned; "
-                f"the transform stopped."]
         # Swap the presented fields. Death checks are suppressed across the
         # swap window: an intermediate var state (e.g. new max_hp before hp is
         # set) could momentarily satisfy the death condition.
-        new_vars = copy.deepcopy(sb.get("vars") or {})
+        sb_vars = sb.get("vars")
+        new_vars = copy.deepcopy(sb_vars if sb_vars is not None else {})
+        if not isinstance(new_vars, dict):
+            raise VTTError("transform: the statblock's vars must be a dict.")
         new_max = new_vars.get(max_hp_var)
         target_hp = new_vars.get(hp_var)
         try:
@@ -12692,6 +12860,26 @@ class Match:
             new_vars.pop(k, None)
             if k in e.vars:
                 new_vars[k] = copy.deepcopy(e.vars[k])
+        # Checked BEFORE the old parts go, so a bad statblock changes nothing.
+        new_vars = checked_unit_vars(new_vars, (hp_var, max_hp_var, turnorder_var),
+                                     "transform")
+        if hp_var not in new_vars:
+            raise VTTError(f"transform: the new form has no `{hp_var}`.")
+        # The new body must fit where the unit stands (its own parts, which
+        # the transform replaces, don't count).
+        self.check_body_fits(
+            e, new_vars, "transform",
+            extra_ignore=tuple(p.id for p in self.entity_part_subtree(e.id)
+                               if p.id != e.id))
+        drop_log: List[str] = []
+        for p in reversed(self.entity_part_subtree(e.id)):
+            if p.id in self.entities:
+                drop_log.extend(p.remove())
+        if e._match is not self or e.id not in self.entities:
+            # A despawn handler removed the unit itself: nothing to swap.
+            return drop_log + [
+                f"`{e.id}` was removed while its old parts despawned; "
+                f"the transform stopped."]
         self._death_check_suppressed_ids.add(e.id)
         log: List[str] = list(drop_log)
         try:

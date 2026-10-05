@@ -390,7 +390,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, _own_value, check_store_path, check_no_value_ancestor
+from logic import VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number
 
 
 class FormulaError(VTTError):
@@ -4360,6 +4360,7 @@ class FormulaEngine:
                 raise FormulaError(f"unknown entity id '{eid}'.")
             try:
                 check_store_path(path, "status path")
+                value = checked_status_value(path, value, f"status '{eid}.{name}'")
             except VTTError as ex:
                 raise FormulaError(str(ex))
             before = copy.deepcopy(e.status[name]) if name in e.status else None
@@ -4606,11 +4607,13 @@ class FormulaEngine:
                 raise FormulaError(f"unknown entity id '{eid}'.")
             if name not in e.status:
                 raise FormulaError(f"entity '{eid}' has no status '{name}'.")
-            cur = e.status[name].get(field, 0)
-            try:
-                cur = float(cur)
-            except (TypeError, ValueError):
-                cur = 0.0
+            raw = e.status[name].get(field, 0)
+            cur = _coerce_number(raw)
+            if cur is None:
+                raise FormulaError(
+                    f"status '{eid}.{name}' field '{field}' holds {raw!r}, "
+                    f"not a number.")
+            cur = float(cur)
             new = float(amount) if absolute else cur + float(amount)
             if new == int(new):
                 new = int(new)
@@ -5556,7 +5559,7 @@ class FormulaEngine:
             try:
                 new_id, _log = match.revive_corpse(eid)
                 match.surface_log(_log)
-            except (VTTError, NotFound, OutOfBounds, Occupied) as ex:
+            except VTTError as ex:
                 raise FormulaError(str(ex))
             engine._note_affected(new_id)
             return new_id
@@ -5573,7 +5576,7 @@ class FormulaEngine:
             sp = None if stash_path is None else str(stash_path)
             try:
                 match.surface_log(match.transform_entity(eid, template, sp))
-            except (VTTError, NotFound, OutOfBounds, Occupied) as ex:
+            except VTTError as ex:
                 raise FormulaError(str(ex))
             engine._note_affected(eid)
             return eid
@@ -5585,7 +5588,7 @@ class FormulaEngine:
             eid = str(_eid(eid_t))
             try:
                 match.surface_log(match.revert_entity(eid, str(stash_path)))
-            except (VTTError, NotFound, OutOfBounds, Occupied) as ex:
+            except VTTError as ex:
                 raise FormulaError(str(ex))
             engine._note_affected(eid)
             return eid

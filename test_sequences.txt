@@ -4923,7 +4923,7 @@ SCENARIO 212 — !tile place_area: corners off-grid → all-or-nothing failure
 !tile place_area flame 2 2 4 4
 !tile place_area flame 3 3 9 4
 !tile find flame
-!tile place_area flame missing 1 1 2 2
+!tile place_area missing 1 1 2 2
 
 Expected: An off-grid corner is rejected BEFORE any placement
 happens — the engine validates the rectangle against the grid
@@ -13356,16 +13356,17 @@ SCENARIO 520 — Anchored aura 'suspend' mode: part destruction suspends, heal r
 !eval "zone_size('poison')"
 !eval "zone_anchor_of('poison')"
 !ent set_var hitter actions.mend.target entity
-!ent set_var hitter actions.mend.body "damage_part(part(target, 'arm'), -40)"
+!ent set_var hitter actions.mend.body "entity[part(target, 'arm')].hp = 40"
 !action hitter mend ogre
 !eval "zone_size('poison')"
 
 Expected: the ogre's arm carries a radius-1 aura (size 9). With suspend mode,
 destroying the arm (damage_part 50 → arm hp 0) SUSPENDS its aura — size 0, but
 the binding stays (zone_anchor_of='arm'); the destroyed limb lingers attached.
-Healing the arm back above 0 (damage_part -40) clears the destroyed latch and
-RESUMES the aura to size 9. (A destroyed limb never routes through Entity.remove,
-so this is handled directly in _process_part_death / the damage_part heal path.)
+Healing the arm back above 0 (a plain hp write of 40; damage_part refuses a
+negative amount) clears the destroyed latch and RESUMES the aura to size 9. (A
+destroyed limb never routes through Entity.remove, so this is handled directly
+in _process_part_death and at the part's hp write in write_var.)
 
 
 SCENARIO 521 — Invalid status-tick formula reports cleanly (no FormulaError crash)
@@ -14749,8 +14750,8 @@ SCENARIO 569 — `!find show:status` + lowest_var / highest_var targeting helper
 !ent set_var c team blue
 !ent add d D 5 5 6 5
 !ent set_var d team red
-!status def burn tick ""
-!status def slow tick ""
+!status def burn
+!status def slow
 !status apply a burn 2 3
 !status apply a slow
 !find team=blue show:status
@@ -14860,14 +14861,14 @@ SCENARIO 572 — bot-wide commands need a server administrator
 !match use bobm
 !system set default fog_glyph x
 !batch system set default fog_glyph x
-!defvar add default fog_vision_radius 3
+!defvar add fog_vision_radius 3
 !store save bobsave.json
 !run bobscript.txt
 !history save cp
 !history export manual:cp cp.json
 !system list
-!system rules default
-!defvar list default
+!system rules
+!defvar list
 !as host
 !system set default fog_glyph x
 !system set default fog_glyph ?
@@ -14881,7 +14882,7 @@ edit in `!batch` doesn't help: the check also runs on the ungated inner-command
 path (batch / macro / foreach / run lines, action `cmd()`). The admin check is
 rejected outright (not queued — no match host could approve it). Per-match
 history (`!history save cp`) is still bob's to run as host. Read-only forms stay
-open: `!system list`, `!system rules default`, `!defvar list default`. Back as
+open: `!system list`, `!system rules`, `!defvar list`. Back as
 the owner identity (the harness's stand-in for a Discord guild Administrator;
 the CLI/GUI are always admin), `!system set default fog_glyph x` succeeds —
 directly, even though the channel's active match is bob's: bot-wide commands
@@ -17905,7 +17906,7 @@ SCENARIO 661 — mode names are checked: distance metrics, damage_spread, to_mai
 !ent set_var arm to_main_percent 50
 !ent set_var arm to_main_cap max_HP
 !eval "damage_part('arm', 2)"
-?? ❌ damage_part `arm`: to_main_cap 'max_HP' isn't none, max_hp, remaining_hp or absolute:<n>.
+?? ❌ damage_part `arm`: to_main_cap 'max_HP' isn't none, max_hp, remaining_hp or absolute:<n>
 !assert "entity[b].hp == 20 and entity[arm].hp == 5" "the refused hit changed nothing"
 !system set default aoe_default_mode wieghted
 ?? ❌ Setting 'aoe_default_mode' must be one of: weighted, uniform, fragment, main_only
@@ -18222,3 +18223,262 @@ and a stored coordinate is a list. Before, functions returned tuples that
 stayed tuples in a var until a save/load turned them into lists, so
 `entity[a].spot == (3, 3)` and `(6, 5) in entity[a].traps` were True
 before a reload and False after. Both are True on both sides now.
+
+
+SCENARIO 671 — templates and statblocks hold to the vital-var and reserved-name checks
+---------------------------------------------------------------------------------------
+
+!match new s671 Templates 10 10
+!match use s671
+!ent add mage Mage 20 1 1 5
+!ent set_var mage gob.name Gob
+!ent set_var mage gob.vars.hp abc
+!eval --as mage "summon_from('gob', 4, 4)"
+?? vital var 'hp' must be a finite whole number
+!ent set_var mage gob.vars.hp 6
+!ent set_var mage gob.vars.x 9
+!eval --as mage "summon_from('gob', 4, 4)"
+?? `x` is a reserved var path
+!ent delete_var mage gob.vars.x
+!ent set_var mage gob.vars.max_hp 7.9
+!ent set_var mage gob.parts.arm.vars.hp oops
+!eval --as mage "summon_from('gob', 4, 4)"
+?? part `arm` was not created
+!assert "var_get('gob', 'max_hp') == 7 and not has_part('gob', 'arm')"
+!part add mage staff Staff 5 5
+!ent set_var mage forms.bad.name Bad
+!ent set_var mage forms.bad.vars.hp 10
+!ent set_var mage forms.bad.vars.name Evil
+!ent transform mage forms.bad old
+?? `name` is a reserved var path
+!system set default transform_hp_mode full
+!ent set_var mage forms.nohp.name NoHp
+!ent set_var mage forms.nohp.vars.max_hp 10
+!ent transform mage forms.nohp old
+?? the new form has no `hp`
+!assert "has_part('mage', 'staff') and not var_has('mage', 'old')" "a refused transform changes nothing"
+!defvar add max_hp abc
+?? its default must be a whole number
+!defvar add initiative.x 3
+?? its default must be a whole number
+!system set default transform_hp_mode percent
+
+Expected: HARNESS-ALLOWS-ERRORS. Spawning and transforming set a unit's vars
+wholesale, and used to store whatever the template held: a summon template
+with `hp: 'abc'` made a unit that broke `!list` and every hp read, and a
+template var named `x` (a reserved var path) made a var the engine can't
+reach. Both are refused now, as write_var refuses them one write at a time; a
+numeric string or float is coerced (max_hp 7.9 -> 7). A part template the
+summon can't create is skipped with a ⚠️ line naming it, where it used to
+vanish without a word. A transform into a statblock with a reserved var or
+no hp is refused before anything changes (the staff part and the stash path
+stay as they were). `!defvar add` refuses a non-number default for a vital
+var, and nesting under one.
+
+
+SCENARIO 672 — a status's level and duration are numbers
+---------------------------------------------------------
+
+!match new s672 StatusNums 10 10
+!match use s672
+!ent add h Hero 30 1 1 5
+!status def burn
+!status stack burn add_level
+!status apply h burn
+!ent status h set burn level abc
+?? `level` must be a finite number
+!ent status h set burn duration.x 1
+?? nothing can be nested under it
+!status data burn level abc
+?? `level` must be a finite number
+!eval "status_set('h', 'burn', 'level', True)"
+?? `level` must be a finite number
+!ent status h set burn level 2.5
+!status apply h burn
+?? level=3.5
+!eval "status_set('h', 'burn', 'charges', 'q')"
+!eval "status_counter_add('h', 'burn', -1, 'charges')"
+?? holds 'q', not a number
+!assert "status_has('h', 'burn')"
+
+Expected: HARNESS-ALLOWS-ERRORS. `level` and `duration` on a status instance
+(and in a definition's seed data) are number fields: text, a bool or a
+nested key is refused by `!ent status set`, `!status data` and status_set.
+Before, `!ent status h set burn level abc` was stored and the next `!status
+apply` crashed (💥) on it. A float stays a float (2.5 + 1 = 3.5). A status
+counter on a field holding text reports it, where it used to read it as 0
+and remove the status.
+
+
+SCENARIO 673 — damage_part / damage_spread refuse negative amounts and bad knobs
+---------------------------------------------------------------------------------
+
+!match new s673 PartHeal 10 10
+!match use s673
+!ent add ogre Ogre 50 5 5 5
+!ent hp ogre 30
+!part add ogre arm Arm 10 10
+!ent set_var arm to_main_percent 50
+!eval "damage_part('arm', -5)"
+?? amount can't be negative
+!eval "damage_spread('ogre', -10)"
+?? total can't be negative
+!ent set_var arm to_main_percent abc
+!eval "damage_part('arm', 3)"
+?? to_main_percent must be a finite number, got 'abc'
+!ent set_var arm to_main_percent 100
+!ent set_var arm to_main_cap absolute:-5
+!eval "damage_part('arm', 3)"
+?? n a whole number, 0 or more
+!ent set_var arm to_main_cap max_hp
+!eval "damage_part('arm', 10)"
+!assert "var_get('arm', 'hp') == 0 and var_get('ogre', 'hp') == 20"
+!ent hp arm 6
+!eval "damage_part('arm', 6)"
+!assert "var_get('ogre', 'hp') == 14 and var_get('arm', 'hp') == 0"
+
+Expected: HARNESS-ALLOWS-ERRORS. A negative amount used to heal the part AND
+move to_main_percent of the heal to the main body (the ogre went 30 -> 33 from
+`damage_part('arm', -5)`); both functions refuse it now (heal with an hp
+write). A text to_main_percent gives a message naming it (it was a raw Python
+"could not convert string to float"), and a negative absolute cap is refused
+(absolute:-5 made every hit heal the body). Healing the destroyed arm with a
+plain hp write clears its destroyed latch, so the second break routes and
+destroys normally: the ogre takes 10 then 6 (30 -> 20 -> 14).
+
+
+SCENARIO 674 — a footprint write that doesn't fit is refused (multi-tile)
+--------------------------------------------------------------------------
+
+!match new s674 Grow 8 8
+!match use s674
+!ent add a A 10 1 1 5
+!ent add b B 10 3 3 5
+!ent set_var a footprint_w 2
+!ent set_var a footprint_h 2
+!ent set_var a footprint_w 3
+!ent set_var a footprint_h 3
+?? (3,3) is taken by `b`
+!ent set_var a footprint_w 9
+?? is outside the 8x8 grid
+!assert "footprint_width('a') == 3 and footprint_height('a') == 2"
+!ent set_var a big.name Big
+!ent set_var a big.vars.hp 10
+!ent set_var a big.vars.footprint_w 4
+!ent set_var a big.vars.footprint_h 4
+!ent transform a big old
+?? `a` can't become 4x4
+!ent tp b 7 7
+!ent transform a big old
+!assert "footprint_width('a') == 4 and cell_entity(4, 4) == 'a'"
+!ent revert a old
+!ent set_var b footprint_w 30000
+?? can't become 30000x1
+!ent set_var b footprint_w 1
+!map
+
+Expected: HARNESS-ALLOWS-ERRORS. Growing a body by writing footprint_w /
+footprint_h is checked like a move: the 3x3 would cover b, the 9-wide body
+would leave the grid, so both writes are refused and a stays 3x2. Before, a
+grew over b (b vanished from the map) or off the grid. A transform into a
+4x4 form is refused the same way until b moves away. A huge footprint is
+refused too; reading one (from an old save) is capped one past the grid side,
+where `footprint_w 30000` used to make every map render, occupancy check and
+vision pass walk 9*10^8 cells and hang the bot.
+
+
+SCENARIO 675 — revive / transform / revert report their own errors in formulas
+-------------------------------------------------------------------------------
+
+!match new s675 FormulaErrs 8 8
+!match use s675
+!ent add a A 10 1 1 5
+!eval "revive('nobody')"
+?! OutOfBounds
+!eval "transform('a', 'nowhere')"
+?! OutOfBounds
+!eval "revert('a', 'nostash')"
+?! OutOfBounds
+
+Expected: HARNESS-ALLOWS-ERRORS. Each failure reads as the engine's own
+message. The three functions caught `(VTTError, NotFound, OutOfBounds,
+Occupied)`, but formula.py never imported the last two names, so building
+that except clause raised NameError and every failure of these functions
+read "Runtime error: name 'OutOfBounds' is not defined".
+
+
+SCENARIO 676 — words past the end of a command's usage are refused
+-------------------------------------------------------------------
+
+!match new s676 Stray 10 10
+!match use s676
+!ent add a A 10 1 1 5
+!ent add b B 10 3 3 4
+!ent remove a b
+?? Unexpected `b`
+!turn next 2
+?? Unexpected `2`
+!system rules spaceship
+?? Unexpected `spaceship`
+!map layer list x
+?? usage: `!map layer <list | <name> <on|off>>`
+!map pna up
+?? `pna` isn't a `!map` subcommand either
+!ent status a add burn level=3
+?? Unexpected `level=3`
+!ent status a add burn extra
+?? Unexpected `extra`
+!undo command zz
+?? Unexpected `zz`
+!ent copy a s676 4
+?? Give both x and y, or neither
+!watch add w "1 == 1" "1" onec
+?? is `once` or nothing
+!map scene bogus
+?? Unexpected `bogus`
+!assert "len(all_entities()) == 2" "nothing was removed"
+!ent del a
+!ent hp b +5 bypass_clamp=yes
+!map full
+!roll 1d6 + 2
+!dist 1 1 4 4 manhattan
+
+Expected: HARNESS-ALLOWS-ERRORS. A word past the end of a command's usage used
+to be dropped without a word: `!ent remove a b` removed only a, `!turn next 2`
+advanced one turn, `!system rules spaceship` listed every rule. The
+dispatcher now reads the usage string of the subcommand (or the root's forms)
+and refuses positional words past its end, naming the matching form. A
+mistyped subcommand of a root with a bare form gets a hint. Options
+(`key=value`) are left to each handler; `!ent status add` now refuses
+anything after the name (it used to add a bare status and drop `level=3`).
+Handlers whose optional slot took any word now check it: `!undo command zz`
+used to undo one command, `!ent copy a s676 4` dropped the x, `!watch add ...
+onec` made a repeating watcher, `!map scene bogus` ignored the word. Valid
+forms (the last five lines) run as before.
+
+
+SCENARIO 677 — !map scene full is the omniscient summary, host-only
+--------------------------------------------------------------------
+
+!match new s677 SceneFull 10 10
+!match use s677
+!match fog on
+!ent add r R 10 1 1 5
+!ent set_var r team red
+!ent add b B 10 9 9 5
+!ent set_var b team blue
+!match bind pov=red
+!map scene
+?? 1 placement(s)
+!map scene full
+?? 2 placement(s)
+!as player bob
+!map scene full
+?? host-only
+!as host
+!match unbind
+
+Expected: HARNESS-ALLOWS-ERRORS. `!map scene full` summarizes the whole board
+(2 units) where the channel's red view sees 1. It used to read only its first
+word (`scene`) for `full`, so `full` did nothing. Like `!map image full` it is
+host-only.

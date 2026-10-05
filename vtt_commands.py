@@ -14,7 +14,7 @@ from logic import (
 )
 
 # Passive system
-from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, check_store_path, check_no_value_ancestor
+from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value
 
 # Clamp system
 from logic import ClampSpec
@@ -418,6 +418,10 @@ class CommandRegistry:
                            "own: here it would rerun the command that "
                            "contains it.")
             return
+        stray = _stray_words_error(self, name, args)
+        if stray:
+            await ctx.send(stray)
+            return
         # Bot-wide commands need an admin even here: this path is ungated
         # (batch / macro / foreach / run lines, action cmd()), so without the
         # check a host could wrap `!system set` in a `!batch`.
@@ -703,6 +707,11 @@ class CommandRegistry:
             await ctx.send(self._unknown_command_message(name, mgr, ctx))
             return
 
+        stray = _stray_words_error(self, name, args)
+        if stray:
+            await ctx.send(stray)
+            return
+
         # Bot-wide commands: an administrator, checked BEFORE the per-match
         # gate (which is a no-op without an active match) and not subject to
         # its overrides. Rejected outright — no match host can approve them.
@@ -970,6 +979,195 @@ _RUN_DEPTH: "contextvars.ContextVar[int]" = contextvars.ContextVar(
 # True while `!again` replays a command (see again_cmd).
 _AGAIN_ACTIVE: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
     "vtt_again_active", default=False)
+
+
+# ---- stray-word check (usage strings are authoritative) -------------------
+# A word past the end of a command's usage used to be dropped without a word:
+# `!ent remove a b` removed only a, `!turn next 2` advanced one turn,
+# `!system rules spaceship` listed every rule. The dispatcher now reads the
+# usage string of the subcommand (or the root's forms) and refuses positional
+# words past its end. So a usage string must be EXACT: `<x>` one word,
+# `[..]` optional, `|` alternatives, `...` / `<x ...>` any number more,
+# `key=<v>` an option (options are checked by each handler, not here).
+
+def _usage_tokens(text: str) -> List[str]:
+    """Split a usage tail into top-level tokens (brackets kept whole)."""
+    toks: List[str] = []
+    depth, cur = 0, ""
+    for ch in text:
+        if ch in "[<":
+            depth += 1
+        elif ch in "]>":
+            depth = max(0, depth - 1)
+        if ch == " " and depth == 0:
+            if cur:
+                toks.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if cur:
+        toks.append(cur)
+    return toks
+
+
+def _split_top(text: str, sep: str = "|") -> List[str]:
+    """Split on `sep` outside brackets."""
+    parts: List[str] = []
+    depth, cur = 0, ""
+    for ch in text:
+        if ch in "[<":
+            depth += 1
+        elif ch in "]>":
+            depth = max(0, depth - 1)
+        if ch == sep and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    parts.append(cur)
+    return [p.strip() for p in parts]
+
+
+def _is_option_group(tok: str) -> bool:
+    """`key=<v>`, `[key=<v>]` or `[key=value ...]`: options, not words."""
+    if tok.startswith("<"):
+        return False
+    if not tok.startswith("["):
+        return "=" in tok
+    words = _usage_tokens(tok[1:-1])
+    return bool(words) and all("=" in w or w in ("...", "…") for w in words)
+
+
+_OPTION_WORD = re.compile(r"^[A-Za-z_][\w.]*=")
+
+
+def _is_variadic(tok: str) -> bool:
+    return tok in ("...", "…") or tok.endswith(
+        ("...", "...>", "...]", "…", "…>", "…]"))
+
+
+def _leading_word(alt: str) -> Optional[str]:
+    toks = _usage_tokens(alt)
+    if toks and toks[0][0] not in "[<" and not _is_option_group(toks[0]):
+        return toks[0].lower()
+    return None
+
+
+def _usage_reach(alts: List[str], words: List[str], i: int,
+                 depth: int = 0) -> int:
+    """How far into `words` (from index i) any of the alternatives can
+    match. A bare word matches any word, except that alternatives LED by a
+    word equal to words[i] are tried alone (`<list | <name> <on|off>>` with
+    `list` stops after one word). A variadic token reaches the end. Running
+    out of words counts as a match: missing arguments are the handler's to
+    report."""
+    if depth > 12:
+        return len(words)
+    if i < len(words) and len(alts) > 1:
+        # `def new <name> | def data <name> ...`: every form shares its first
+        # word, so step past it and choose by the next one.
+        leads = {_leading_word(a) for a in alts}
+        if len(leads) == 1 and None not in leads and words[i].lower() in leads:
+            rest = [" ".join(_usage_tokens(a)[1:]) for a in alts]
+            return _usage_reach(rest, words, i + 1, depth + 1)
+    if i < len(words) and len(alts) > 1:
+        led = [a for a in alts if _leading_word(a) == words[i].lower()]
+        if led:
+            alts = led
+        else:
+            # `cell <x> <y>` is a subcommand form: it only applies when the
+            # word IS `cell`. A lone bare word (`<id|all>`) may be a
+            # placeholder name, so it still matches anything.
+            alts = [a for a in alts if _leading_word(a) is None
+                    or len(_usage_tokens(a)) == 1]
+    best = i
+    for alt in alts:
+        best = max(best, _seq_reach(_usage_tokens(alt), words, i, depth + 1))
+    return best
+
+
+def _seq_reach(toks: List[str], words: List[str], i: int, depth: int) -> int:
+    if not toks or i >= len(words):
+        return i
+    tok, rest = toks[0], toks[1:]
+    if _is_option_group(tok):
+        return _seq_reach(rest, words, i, depth)
+    if _is_variadic(tok):
+        return len(words)
+    if tok.startswith("[") or (tok.startswith("<") and " " in tok[1:-1]):
+        inner = _split_top(tok[1:-1])
+        best = 0
+        ends = {_usage_reach(inner, words, i, depth)}
+        if tok.startswith("["):
+            ends.add(i)
+        # An inner group's result is the furthest it reaches; also try the
+        # rest of the sequence from each end.
+        for e in ends:
+            best = max(best, _seq_reach(rest, words, e, depth) if e > i or
+                       tok.startswith("[") else e)
+        return best
+    # <placeholder> or a bare word: one word.
+    return _seq_reach(rest, words, i + 1, depth)
+
+
+def _usage_tails(usage: str, root: str) -> List[str]:
+    """The forms of a usage string with the leading `!root` removed:
+    `!map cell <x> <y> | !map pan <dir> [n]` gives two."""
+    tails = []
+    for form in re.split(r"\s\|\s(?=!)", usage.strip()):
+        form = form.strip()
+        if form.startswith(f"!{root}"):
+            tails.append(form[len(root) + 1:].strip())
+    return tails
+
+
+def _stray_words_error(registry: "CommandRegistry", name: str,
+                       args: List[str]) -> Optional[str]:
+    """The refusal for positional words past the end of the command's
+    usage, or None. `key=value` words are options (left to the handler)."""
+    meta = registry._help.get(name) or {}
+    subs = meta.get("subs") or {}
+    sub = args[0].lower() if args else None
+    usage = None
+    if sub is not None:
+        if sub in subs:
+            usage = subs[sub].get("usage") or ""
+        elif (name, sub) in _SUB_ALIASES and _SUB_ALIASES[(name, sub)] in subs:
+            canon = _SUB_ALIASES[(name, sub)]
+            usage = (subs[canon].get("usage") or "").replace(
+                f"!{name} {canon}", f"!{name} {sub}", 1)
+    from_root = usage is None
+    if from_root:
+        usage = meta.get("usage") or ""
+    tails = _usage_tails(usage, name)
+    if not tails:
+        return None
+    words = [w for w in args if not _OPTION_WORD.match(w)]
+    if from_root and words:
+        led = [t for t in tails if _leading_word(t) == words[0].lower()]
+        if not led and not any(_leading_word(t) is None for t in tails):
+            return None          # an unknown subcommand: the handler says so
+    reach = _usage_reach(tails, words, 0)
+    if reach >= len(words):
+        return None
+    extra = words[reach:]
+    if words and any(_leading_word(t) == words[0].lower() for t in tails):
+        tails = [t for t in tails if _leading_word(t) == words[0].lower()]
+    elif from_root:
+        tails = [t for t in tails if _leading_word(t) is None] or tails
+    shown = " | ".join(f"!{name} {t}".strip() for t in tails)
+    hint = ""
+    bare_takes_word = any(
+        "<" in tok or tok[1:-1].lower() == args[0].lower()
+        for t in tails for tok in _usage_tokens(t)
+        if not _is_option_group(tok)) if args else True
+    if (from_root and args and subs and args[0].lower() not in subs
+            and not bare_takes_word):
+        # `!map pna up`: more likely a mistyped subcommand than stray words.
+        hint = (f" (`{args[0]}` isn't a `!{name}` subcommand either — see "
+                f"`!help {name}`)")
+    return (f"❌ Unexpected `{' '.join(extra)}` — usage: `{shown}`{hint}. "
+            f"Quote a value that contains spaces.")
 
 
 def _remember_command(mgr: MatchManager, ctx: ReplyContext, name: str,
@@ -2053,7 +2251,7 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "match", "pause",
-    usage="!match pause [reason]",
+    usage="!match pause [reason ...]",
     desc=("Pause the table (a break, a rules question, the GM setting up). "
           "While paused, non-hosts' commands that change the match are "
           "refused — read-only commands still work. Hosts keep playing "
@@ -2988,7 +3186,9 @@ registry.annotate_sub(
 registry.annotate_sub(
     "system", "alias",
     usage=(
-        "!system alias <def|del|list|info> <system> [<name> [<expansion>]]"
+        "!system alias <list <system> | info <system> <name> | "
+        "def <system> <name> <expansion ...> | del <system> <name> | "
+        "delete <system> <name> | remove <system> <name> | rm <system> <name>>"
     ),
     desc=(
         "Manage a GameSystem's alias library. Aliases are copied into "
@@ -3456,6 +3656,13 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 )
             name = args[3]
             if action == "add":
+                if len(args) > 4:
+                    # `add burn level=3` used to add a bare burn and drop the rest.
+                    return await ctx.send(
+                        f"❌ Unexpected `{' '.join(args[4:])}` — `!ent status "
+                        f"{eid} add {name}` adds an empty status; set fields with "
+                        f"`!ent status {eid} set {name} <path> <value>` or use "
+                        f"`!status apply`.")
                 if name not in e.status:
                     before = None
                     e.status[name] = {}
@@ -3495,6 +3702,8 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     )
                 path = args[4]
                 value = _parse_scalar(args[5])
+                check_store_path(path, "status path")
+                value = checked_status_value(path, value, f"`{eid}.{name}`")
                 # Snapshot for the diff-based event firing. Use None for
                 # the "status didn't exist" case so set acts as an
                 # implicit add when applied to a fresh status.
@@ -4241,6 +4450,9 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         require_target_host(ctx, mgr.matches[dest_mid],
                             "copy or transfer entities into it")
         x = y = None
+        if len(args) == 4:
+            # An x with no y used to be dropped (placed at the same cell).
+            return await ctx.send("❌ Give both x and y, or neither.")
         if len(args) >= 5:
             try:
                 x, y = int(args[3]), int(args[4])
@@ -4269,7 +4481,9 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 #annonate subcommands next to the command itself:
 registry.annotate_sub(
     "ent", "group",
-    usage="!ent group <list|info|new|add|remove|delete> ...",
+    usage=("!ent group <list | info <name> | new <name> | add <name> <eid ...> | "
+           "remove <name> <eid ...> | rm <name> <eid ...> | del <name> <eid ...> | "
+           "delete <name>>"),
     desc=(
         "Manage named entity groups in the active match. An entity can "
         "belong to any number of groups; group membership is stored "
@@ -4516,8 +4730,9 @@ registry.annotate_sub(
 registry.annotate_sub(
     "ent", "status",
     usage=(
-        "!ent status <id> <add|remove|clear|list|info|set|del> [name] "
-        "[path] [value]"
+        "!ent status <id> <add <name> | remove <name> | rm <name> | "
+        "del-status <name> | info <name> | set <name> <path> <value> | "
+        "del <name> <path> | clear | list>"
     ),
     desc=(
         "Manage an entity's statuses. Each status name maps to its own "
@@ -5219,6 +5434,27 @@ def _color_guide() -> str:
     )
 
 
+for _sub, _usage in (
+        ("colors", "!map colors"),
+        ("cell", "!map cell <x> <y> [for=<eid>] [as=<team>]"),
+        ("preview", "!map preview <burst|cone|line|rect> <shape args ...>"),
+        ("background", "!map background <key|clear> [stretch|tile|center]"),
+        ("border", "!map border <on | off | clear | color <name> | opacity <0-100>>"),
+        ("mode", "!map mode <text|image>"),
+        ("scene", "!map scene [full] [as=<team>]"),
+        ("image", "!map image [full] [as=<team>]"),
+        ("color", "!map color <on|off>"),
+        ("teamcolor", "!map teamcolor <list | clear <team> | <team> <color>>"),
+        ("resize", "!map resize <w> <h> [anchor]"),
+        ("layer", "!map layer <list | <name> <on|off>>"),
+        ("autoupdate", "!map autoupdate [on|off]"),
+        ("legend", "!map legend <on|off>"),
+        ("pan", "!map pan <dir> [n]"),
+        ("center", "!map center <eid | <x> <y>>"),
+        ("view", "!map view <reset | <x> <y>>")):
+    registry.annotate_sub("map", _sub, usage=_usage)
+
+
 @registry.command("map", access="all", usage="!map [full] [as=<team>] | !map cell <x> <y> [for=<eid>] | !map preview <burst|cone|line|rect> ... | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 30), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map preview burst|cone|line|rect ...` shows the cells an area shape would cover (marked with the preview_glyph rule's character on cells without a unit; graphics surfaces draw translucent squares above units, colour/opacity from the preview_color / preview_opacity rules or `color=` / `opacity=`) and lists the visible units inside — nothing happens to them. `!map full` (host-gated) forces the omniscient view; `as=<team>` (host-only) previews what that team sees (`as=omniscient` = everything), without binding a channel. `!map cell <x> <y> [for=<eid>]` reports everything at one cell the channel can see — units, tile data, zones, corpses, and where its movement / sight block settings come from; `for=<eid>` adds whether the cell blocks that unit (hidden layers are left out). `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets a per-match background sprite; `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). `!map border on|off` / `color <name>` / `opacity <0-100>` / `clear` (host-gated) overrides the grid-line border rules per match (borders draw above the ground, below tiles/entities). `!map mode text|image` (host-gated) sets the per-match default render mode — `image` makes a plain `!map` and the auto-update board render graphically on Discord (text surfaces fall back to ASCII). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
@@ -5309,9 +5545,18 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(f"Render mode set to `{mode}`{extra}")
     if args and args[0].lower() == "scene":
         # !map scene [full] — debug summary of the graphics render model
-        # (respects the channel/POV unless `full`). The model itself is for
-        # the graphics surface; this is a textual at-a-glance.
-        pov = _view_pov(ctx, m, args)
+        # (respects the channel/POV unless `full`, host-only like `!map image
+        # full`; it used to read only args[0], so `full` did nothing). The
+        # model itself is for the graphics surface; this is a textual
+        # at-a-glance.
+        sub = args[1:]
+        words = [a for a in sub if not _OPTION_WORD.match(a)]
+        if words and words[0].lower() != "full":
+            return await ctx.send(f"❌ Unexpected `{words[0]}` — usage: "
+                                  f"`!map scene [full] [as=<team>]`.")
+        if sub and sub[0].lower() == "full" and not _acts_as_host(ctx, m):
+            return await ctx.send("❌ `!map scene full` (omniscient) is host-only.")
+        pov = _view_pov(ctx, m, sub)
         scene = m.render_scene(pov_team=pov)
         bg = scene["background"]
         kinds: Dict[str, int] = {}
@@ -5331,6 +5576,10 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # harness) report it as graphics-only. Respects channel POV; `full`
         # (omniscient) is host-gated like the rest of the map's elevated args.
         sub = args[1:]
+        words = [a for a in sub if not _OPTION_WORD.match(a)]
+        if words and words[0].lower() != "full":
+            return await ctx.send(f"❌ Unexpected `{words[0]}` — usage: "
+                                  f"`!map image [full] [as=<team>]`.")
         want_full = bool(sub) and sub[0].lower() == "full"
         if want_full and not m.is_host(ctx_user(ctx)):
             return await ctx.send("❌ `!map image full` (omniscient) is host-only.")
@@ -5914,7 +6163,7 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 # ---- !roll --------------------------------------------------------------
 @registry.command(
     "roll", access="all",
-    usage="!roll <dice expression> | !roll odds <dice> [<op> <n>]",
+    usage="!roll <dice ...> | !roll odds <dice> [<op> <n>]",
     snapshot=False,
     desc=(
         "Roll dice and show the total plus the individual dice. Uses the same "
@@ -6051,7 +6300,7 @@ _DIST_METRICS = {"square_radius": "square_radius", "chebyshev": "square_radius",
 
 @registry.command(
     "dist", access="all",
-    usage="!dist <a> <b> [metric] [los] | !dist <eid> <x> <y> ... | !dist <x1> <y1> <x2> <y2> ...",
+    usage="!dist <a> <b> [metric] [los] | !dist <eid> <x> <y> [metric] [los] | !dist <x1> <y1> <x2> <y2> [metric] [los]",
     snapshot=False,
     desc=(
         "Measure distance between two entities, an entity and a cell, or two "
@@ -6131,8 +6380,8 @@ async def dist_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 # ---- !reveal_fog --------------------------------------------------------
 @registry.command(
     "reveal_fog",
-    usage=("!reveal_fog <team> all|at <x> <y> <r>|rect <x1> <y1> <x2> <y2>|"
-           "around <eid> <r>|clear [turns=N] | !reveal_fog list"),
+    usage=("!reveal_fog <team> <all | at <x> <y> <r> | rect <x1> <y1> <x2> <y2> "
+           "| around <eid> <r> | clear> [turns=N] | !reveal_fog list"),
     desc=(
         "Reveal fogged cells to a TEAM independent of unit vision (a scout "
         "ping / clairvoyance / GM reveal). A revealed cell shows terrain AND "
@@ -6711,6 +6960,12 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 target_round = int(args[3])
             except ValueError:
                 return await ctx.send(f"❌ Round number must be an integer, got '{args[3]}'.")
+            bad = [a for a in args[4:] if not _OPTION_WORD.match(a)
+                   and a.lower() not in ("confirm", "preview")]
+            if bad:
+                return await ctx.send(
+                    f"❌ Unexpected `{' '.join(bad)}` — usage: `!history undo "
+                    f"to round <X> [confirm|preview]`.")
             confirmed = "confirm" in (a.lower() for a in args[4:])
             snap = m.history.get_round_with_number(target_round)
             if "preview" in (a.lower() for a in args[4:]):
@@ -6738,6 +6993,16 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                                   + _bindings_suffix(notes))
 
         # ---- undo {turn|round|command} [N] [confirm] ----
+        if scope in ("turn", "turns", "round", "rounds", "command", "commands"):
+            # [N] used to read any non-number as 1: `!undo command zz` undid one.
+            words = [a for a in args[2:] if not _OPTION_WORD.match(a)]
+            if words and re.fullmatch(r"-?\d+", words[0]):
+                words = words[1:]
+            bad = [w for w in words if w.lower() not in ("confirm", "preview")]
+            if bad:
+                return await ctx.send(
+                    f"❌ Unexpected `{' '.join(bad)}` — usage: `!history undo "
+                    f"{scope} [N] [confirm|preview]` (N a whole number).")
         if scope in ("turn", "turns"):
             n = _parse_int_or(1, args[2] if len(args) >= 3 else None)
             confirmed = "confirm" in (a.lower() for a in args[2:])
@@ -8265,6 +8530,15 @@ async def defvar_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"❌ `{path.split('.', 1)[0]}` is a reserved var path (read from "
                 f"the entity itself: x / y / name); it can't have a default.")
         value = _parse_scalar(args[2])  # same coercion as !ent set_var
+        vitals = {m.rules.get("hp_var", "hp"), m.rules.get("max_hp_var", "max_hp"),
+                  m.rules.get("turnorder_var", "initiative")}
+        seg0 = path.split(".", 1)[0]
+        if seg0 in vitals:
+            if "." in path or _coerce_vital_value(value) is None:
+                return await ctx.send(
+                    f"❌ `{seg0}` is a vital var: its default must be a whole "
+                    f"number (no nested keys), got `{args[2]}` at `{path}`.")
+            value = _coerce_vital_value(value)
         existing = _read_vars()
         existing[path] = value
         refreshed = _write_vars(existing)
@@ -9943,10 +10217,34 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     return await _help_fallback(ctx, ["zone"], args[0] if args else None)
 
 
+for _sub, _usage in (
+        ("def", "!status def <name>"),
+        ("drop", "!status drop <name>"),
+        ("tick", "!status tick <name> <formula ...>"),
+        ("when", "!status when <name> <turn_end|turn_start|round_start|round_end|never>"),
+        ("stack", "!status stack <name> <refresh|add_level|extend|replace|none>"),
+        ("maxlevel", "!status maxlevel <name> <n>"),
+        ("data", "!status data <name> <path> <value>"),
+        ("tags", "!status tags <name> <csv ...>"),
+        ("removes", "!status removes <name> <tokens ...>"),
+        ("blockedby", "!status blockedby <name> <tokens ...>"),
+        ("resist", "!status resist <eid> <name>"),
+        ("counter", "!status counter <eid> <name> <add|set> <value> [field]"),
+        ("dispel", "!status dispel <eid> <token> [max]"),
+        ("transfer", "!status transfer <from> <to> <name>"),
+        ("sprite", "!status sprite <name> <key|clear> [opacity=<n>] [tint=<color>] [layer=<n>]"),
+        ("list", "!status list"),
+        ("info", "!status info <name>"),
+        ("apply", "!status apply <eid> <name> [level] [duration]"),
+        ("force", "!status force <eid> <name> [level] [duration]")):
+    registry.annotate_sub("status", _sub, usage=_usage)
+
+
 @registry.command(
     "status",
     usage=("!status <def|drop|tick|when|stack|maxlevel|data|tags|removes|"
-           "blockedby|resist|counter|sprite|list|info|apply|force> ..."),
+           "blockedby|resist|counter|dispel|transfer|sprite|list|info|apply|"
+           "force> ..."),
     desc=(
         "Status DEFINITIONS — self-describing statuses. Define a status "
         "once (its per-tick effect, when it ticks, how it stacks, its max "
@@ -10115,6 +10413,8 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(f"❌ No status definition `{name}`.")
         path = args[2]
         value = _parse_scalar(args[3])
+        check_store_path(path, "status data path")
+        value = checked_status_value(path, value, f"status def `{name}` data")
         d = m.status_definitions[name].setdefault("data", {})
         try:
             _set_path(d, path, value)
@@ -10320,6 +10620,20 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     return await _help_fallback(ctx, ["status"], args[0] if args else None)
 
 
+for _subs, _usage in (
+        (('add',), '!part add <parent> <part_id> <name> <hp> <maxhp> [key=value ...]'),
+        (('segment',), '!part segment <head> <seg_id> <name> <hp> <maxhp> [key=value ...]'),
+        (('attach',), '!part attach <parent> <part_id>'),
+        (('detach',), '!part detach <part_id>'),
+        (('locate',), '!part locate <part_id> <x> <y>'),
+        (('region',), '!part region <part_id> <region>'),
+        (('glue',), '!part glue <part_id>'),
+        (('remove',), '!part remove <part_id>'),
+        (('list',), '!part list <parent>'),
+        (('info',), '!part info <part_id>')):
+    registry.annotate_sub('part', *_subs, usage=_usage)
+
+
 @registry.command(
     "part",
     usage="!part <add|segment|attach|detach|locate|region|glue|remove|list|info> ...",
@@ -10518,6 +10832,11 @@ async def part_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(_entity_dump(p))
 
     return await _help_fallback(ctx, ["part"], args[0] if args else None)
+
+
+for _subs, _usage in (
+        (('show',), '!mod show <eid> <stat> [base] [tag ...]'),):
+    registry.annotate_sub('mod', *_subs, usage=_usage)
 
 
 @registry.command(
@@ -11358,6 +11677,15 @@ async def _exec_macro(nodes, ctx, mgr, mac_args, loop_idx, name, budget):
                     return ASSERT_STOP
 
 
+for _subs, _usage in (
+        (('set',), '!macro set <name> <body ...>'),
+        (('run',), '!macro run <name> [args ...]'),
+        (('list',), '!macro list'),
+        (('show',), '!macro show <name>'),
+        (('remove',), '!macro remove <name>')):
+    registry.annotate_sub('macro', *_subs, usage=_usage)
+
+
 @registry.command(
     "macro",
     raw_args=True,
@@ -11459,6 +11787,15 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     return await _help_fallback(ctx, ["macro"], args[0] if args else None)
 
 
+for _subs, _usage in (
+        (('def',), '!table def <name> <spec ...>'),
+        (('roll',), '!table roll <name>'),
+        (('list',), '!table list'),
+        (('show',), '!table show <name>'),
+        (('remove',), '!table remove <name>')):
+    registry.annotate_sub('table', *_subs, usage=_usage)
+
+
 @registry.command(
     "table",
     usage="!table <def|roll|list|show|remove> ...",
@@ -11533,6 +11870,15 @@ async def table_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     return await _help_fallback(ctx, ["table"], args[0] if args else None)
 
 
+for _subs, _usage in (
+        (('add',), '!watch add <name> <condition> <effect> [once]'),
+        (('list',), '!watch list'),
+        (('show',), '!watch show <name>'),
+        (('remove',), '!watch remove <name>'),
+        (('check',), '!watch check')):
+    registry.annotate_sub('watch', *_subs, usage=_usage)
+
+
 @registry.command(
     "watch",
     usage='!watch <add|remove|list|show|check> ...',
@@ -11560,7 +11906,12 @@ async def watch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         name = args[1]
         cond = normalize_body_source(args[2])
         effect = normalize_body_source(args[3])
-        once = len(args) >= 5 and args[4].lower() in ("once", "true", "yes")
+        if len(args) >= 5 and args[4].lower() not in ("once", "true", "yes"):
+            # Any other word used to be read as "not once" without a word.
+            return await ctx.send(
+                f"❌ `{args[4]}` — the 4th argument of `!watch add` is `once` "
+                f"or nothing.")
+        once = len(args) >= 5
         try:
             validate_program(cond, known_funcs=frozenset(m.formula_functions.keys()))
             validate_program(effect, known_funcs=frozenset(m.formula_functions.keys()))
@@ -11647,6 +11998,16 @@ async def emit_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     tail = ("\n" + "\n".join(x for x in log if x)) if any(log) else ""
     return await ctx.send(
         f"Emitted `{name}`{at}; {fired} handler(s) fired.{tail}")
+
+
+for _subs, _usage in (
+        (('set',), '!team set <team> <path> <value>'),
+        (('add',), '!team add <team> <path> <delta>'),
+        (('get',), '!team get <team> <path>'),
+        (('list',), '!team list [team]'),
+        (('clear',), '!team clear <team> [path]'),
+        (('passive',), '!team passive <add <team> <pid> <when> <formula ...> | remove <team> <pid> | list <team>>')):
+    registry.annotate_sub('team', *_subs, usage=_usage)
 
 
 @registry.command(
@@ -12009,6 +12370,8 @@ async def mount_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         rid = _resolve_eid(m, args[1])
         x = y = None
+        if len(args) == 3:
+            return await ctx.send("❌ Give both x and y, or neither.")
         if len(args) >= 4:
             try:
                 x, y = int(args[2]), int(args[3])
@@ -12448,3 +12811,41 @@ async def help_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 _unregistered_ro = set(READ_ONLY_SUBCOMMANDS) - set(registry._handlers)
 assert not _unregistered_ro, (
     f"READ_ONLY_SUBCOMMANDS names unregistered commands: {sorted(_unregistered_ro)}")
+
+
+# Usage strings the stray-word check reads (see _stray_words_error) for
+# subcommands registered without one, and for the alias spellings each
+# handler accepts (`del` / `rm` for `remove`, ...).
+for _root, _sub, _usage in (
+        ("ent", "copy", "!ent copy <id> <dest_match> [x y]"),
+        ("ent", "transfer", "!ent transfer <id> <dest_match> [x y]"),
+        ("match", "win", "!match win <clear | <winner> [reason ...]>"),
+        ("match", "outcome", "!match outcome"),
+        ("tile", "line", "!tile line <x1> <y1> <x2> <y2> <path> <value>"),
+        ("tile", "fill", "!tile fill <x1> <y1> <x2> <y2> <path> <value>"),
+        ("zone", "anchor", "!zone anchor <name> <eid> [radius] [metric]"),
+        ("zone", "unanchor", "!zone unanchor <name>"),
+        ("zone", "sprite", "!zone sprite <name> <key|clear>")):
+    registry.annotate_sub(_root, _sub, usage=_usage)
+# Alias spellings each handler accepts for a subcommand; the stray-word
+# check reads the canonical subcommand's usage for them.
+_SUB_ALIASES: Dict[Tuple[str, str], str] = {}
+for _root, _canon, _aliases in (
+        ("clamp", "remove", ("del", "rm")),
+        ("gclamp", "remove", ("del", "rm")),
+        ("defpassive", "remove", ("del", "rm")),
+        ("defvar", "remove", ("del", "rm")),
+        ("gpassive", "remove", ("del", "rm")),
+        ("passive", "remove", ("del", "rm")),
+        ("schedule", "cancel", ("del", "rm", "remove")),
+        ("system", "delete", ("del", "remove", "rm")),
+        ("ent", "remove", ("del", "rm")),
+        ("ent", "store_entity_into_var", ("store_entity",)),
+        ("mount", "dismount", ("off",)),
+        ("part", "remove", ("del", "rm")),
+        ("table", "remove", ("del", "rm")),
+        ("watch", "remove", ("del", "rm")),
+        ("macro", "remove", ("del", "rm")),
+        ("team", "clear", ("del",))):
+    for _alias in _aliases:
+        _SUB_ALIASES[(_root, _alias)] = _canon
