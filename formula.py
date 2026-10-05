@@ -387,7 +387,7 @@ import math
 import itertools
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
 from logic import VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, _own_value, check_store_path, check_no_value_ancestor
@@ -1182,6 +1182,27 @@ class _ArithGuardTransformer(ast.NodeTransformer):
     user formula (expression, program, action body, !func) is covered.
     Evaluation order is unchanged: left, then right, then the operation."""
 
+    def visit_Tuple(self, node: ast.Tuple) -> ast.AST:
+        # Coordinates are lists in formulas: a tuple VALUE written in a
+        # formula ((3, 3)) is built as a list, so it equals a stored
+        # coordinate and a function's [x, y] result. Loop targets
+        # (`for x, y in ...`) are Store tuples and stay as they are.
+        self.generic_visit(node)
+        if isinstance(node.ctx, ast.Load):
+            return ast.copy_location(ast.List(elts=node.elts, ctx=ast.Load()),
+                                     node)
+        return node
+
+    def visit_Dict(self, node: ast.Dict) -> ast.AST:
+        # A tuple used as a dict KEY stays a tuple (a list can't be a key).
+        node.keys = [k if isinstance(k, ast.Tuple) or k is None
+                     else self.visit(k) for k in node.keys]
+        for k in node.keys:
+            if isinstance(k, ast.Tuple):
+                k.elts = [self.visit(e) for e in k.elts]
+        node.values = [self.visit(v) for v in node.values]
+        return node
+
     def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
         self.generic_visit(node)
         fn = _ARITH_GUARDS.get(type(node.op))
@@ -1191,6 +1212,36 @@ class _ArithGuardTransformer(ast.NodeTransformer):
             ast.Call(func=ast.Name(id=fn, ctx=ast.Load()),
                      args=[node.left, node.right], keywords=[]),
             node)
+
+
+def _listify(v: Any) -> Any:
+    """`v` with every tuple inside turned into a list. Returns the same object
+    when there is no tuple to convert (no copy on the common path)."""
+    if isinstance(v, tuple):
+        return [_listify(x) for x in v]
+    if isinstance(v, list):
+        out = None
+        for i, x in enumerate(v):
+            y = _listify(x)
+            if y is not x:
+                if out is None:
+                    out = list(v[:i])
+                out.append(y)
+            elif out is not None:
+                out.append(x)
+        return v if out is None else out
+    if isinstance(v, dict):
+        changed = {k: _listify(x) for k, x in v.items()}
+        return v if all(changed[k] is v[k] for k in v) else changed
+    return v
+
+
+def _lists_out(fn: Callable) -> Callable:
+    def wrapped(*a: Any, **k: Any) -> Any:
+        return _listify(fn(*a, **k))
+    wrapped.__name__ = getattr(fn, "__name__", "fn")
+    wrapped.__doc__ = getattr(fn, "__doc__", None)
+    return wrapped
 
 
 def _guard_arith(tree: ast.AST) -> ast.AST:
@@ -2305,6 +2356,10 @@ assert not _arg_unknown_mutating, (
 # live in _ALLOWED_FUNCS.) User-defined !func functions are NOT included — they
 # can't be verified read-only, so they're banned from args.
 ARG_SAFE_FUNC_NAMES: "frozenset[str]" = frozenset(_ALLOWED_FUNCS) | ARG_SAFE_MATCH_FUNCS
+
+# Built-in functions whose results _namespace passes through _listify (see
+# there): every match function and pure helper.
+_TUPLE_FREE_FUNCS = frozenset(_MATCH_FUNC_NAMES) | frozenset(_ALLOWED_FUNCS)
 
 
 def validate_arg_safe(src: str) -> None:
@@ -7196,6 +7251,14 @@ class FormulaEngine:
             for fname, fdef in funcs.items():
                 ns[fname] = _make_callable(fdef)
 
+        # Coordinates are lists in formulas: every built-in function's
+        # result has its tuples turned into lists, so a coordinate from
+        # free_cell_near / raycast / cells_in_* equals one read back from a
+        # var (stored values are lists, as a save/load makes them).
+        for fname in _TUPLE_FREE_FUNCS:
+            fn = ns.get(fname)
+            if callable(fn):
+                ns[fname] = _lists_out(fn)
         return ns
 
     def _compile_function_body(self, fdef):

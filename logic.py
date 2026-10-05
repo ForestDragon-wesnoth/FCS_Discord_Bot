@@ -2971,13 +2971,16 @@ def _own_value(value: Any) -> Any:
     it (no object shared with another var, team, tile, zone or status),
     scalars pass through unchanged. Dict keys become strings, as a save/load
     makes them: `{1: 5}` stored by a formula couldn't be reached by the path
-    `d.1` until a reload turned the key into '1'."""
+    `d.1` until a reload turned the key into '1'. Tuples become lists for the
+    same reason (a stored coordinate stops equalling (3, 3) after a reload
+    otherwise)."""
     if isinstance(value, dict):
         return {str(k): _own_value(v) for k, v in value.items()}
     if isinstance(value, list):
         return [_own_value(v) for v in value]
     if isinstance(value, tuple):
-        return tuple(_own_value(v) for v in value)
+        # Coordinates are lists (a save/load turns tuples into lists).
+        return [_own_value(v) for v in value]
     if isinstance(value, set):
         return copy.deepcopy(value)
     return value

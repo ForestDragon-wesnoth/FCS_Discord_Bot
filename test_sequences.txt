@@ -5359,7 +5359,7 @@ SCENARIO 226 — cells_in_burst: area shapes by distance mode
 
 Expected: `cells_in_burst(x, y, r, mode)` returns every cell
 within distance r of (x,y) INCLUDING the center, as a list of
-(x,y) tuples. The shape depends on the metric: with the default
+[x, y] pairs (coordinates are lists in formulas). The shape depends on the metric: with the default
 square_radius (Chebyshev), r=1 is the 3x3 block = 9 cells; r=0 is
 just the center = 1 cell. Manhattan r=1 is a plus/diamond = 5
 cells (center + 4 orthogonal neighbors). Euclidean r=2 is a disc
@@ -6553,7 +6553,7 @@ SCENARIO 260 — move_entity / move_step from formulas
 
 Expected: `move_entity(eid, x, y)` teleports the entity with full
 tp() semantics (bounds + occupancy validated, tile hooks +
-on_entity_moved fire). Returns (x, y) on success; raises
+on_entity_moved fire). Returns [x, y] on success; raises
 FormulaError on validation failure.
 
 `move_step(eid, direction)` is the single-cell-toward-a-direction
@@ -9769,7 +9769,7 @@ SCENARIO 381 — first_opaque + coord_x/coord_y; entities_in_line_ignorelos
 
 Expected: An opaque wall sits at (4,3). first_opaque(1,3,7,3)
 returns the first terrain blocker strictly between the points as
-an (x,y) coordinate — (4, 3). Because the sandbox bans subscript
+an [x, y] coordinate — [4, 3]. Because the sandbox bans subscript
 and attribute-on-call, the coordinate is read with the new
 extractors: coord_x(...) = 4 and coord_y(...) = 3. A clear line
 (row 5 has no wall) makes first_opaque return None — a GM checks
@@ -18198,3 +18198,27 @@ pov_own_team_visible), and stays hidden from blue. With the rule off, the
 condition applies to red's own units too: the scout disappears from red's
 map and `!list`. Before, the map always applied the condition to a team's
 own units while the roster and queries never did.
+
+
+SCENARIO 670 — coordinates are lists, the same before and after a reload
+-------------------------------------------------------------------------
+
+!match new s670 Coords 8 8
+!match use s670
+!ent add a A 20 2 2 5
+!eval "free_cell_near(3, 3, 1)"
+?? = `[3, 3]`
+!eval "entity[a].spot = free_cell_near(3, 3, 1)"
+!eval "entity[a].traps = cells_in_rect(5, 5, 6, 5)"
+!assert "entity[a].spot == (3, 3) and [6, 5] in entity[a].traps"
+!store save coords670.json
+!store load coords670.json
+!match use s670
+!assert "entity[a].spot == (3, 3) and (6, 5) in entity[a].traps" "same answers after the reload"
+
+Expected: Coordinates in formulas are lists: functions return [x, y] (and
+lists of them), a tuple written in a formula ((3, 3)) is built as a list,
+and a stored coordinate is a list. Before, functions returned tuples that
+stayed tuples in a var until a save/load turned them into lists, so
+`entity[a].spot == (3, 3)` and `(6, 5) in entity[a].traps` were True
+before a reload and False after. Both are True on both sides now.
