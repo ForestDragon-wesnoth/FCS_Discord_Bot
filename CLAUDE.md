@@ -849,8 +849,10 @@ More shipped work (continuing the list above):
   follow-ons to the LOS slice. (1) **Coords as return values.** The sandbox
   bans subscript/attr-on-call, so a returned `(x,y)` was unreadable; the
   convention is now pure extractors `coord_x(c)`/`coord_y(c)` (accept an
-  (x,y) tuple/list or an action `Coord`; raise on None — check `c == None`
-  first). `first_opaque(x1,y1,x2,y2[,viewer])` returns the first opaque cell
+  [x, y] pair or an action `Coord`; raise on None — check `c == None`
+  first). Coordinates are LISTS in formulas since audit-pass-35: function
+  results are listified, a `(3, 3)` literal compiles to a list, stored
+  tuples become lists. `first_opaque(x1,y1,x2,y2[,viewer])` returns the first opaque cell
   strictly between as an (x,y) pair (read via coord_x/coord_y) or `None` if
   clear — `Match.first_opaque` over the shared `Match._line_cells` (the thin
   DDA path used by has_los, factored out). (2) **Entity-factoring LOS** as
@@ -3589,7 +3591,9 @@ More shipped work (continuing the list above):
     capacity figure stays true), `!ent info` renders a disguise's decoy card,
     and `!history diff` is host-only while fog or entity_visibility_condition is
     active. Your own team's units — a body part counts as its root body's team
-    — are never hidden (a hidden rider is still yours). Helpers `_query_pov` /
+    — are never hidden (a hidden rider is still yours) while the
+    `pov_own_team_visible` rule is on (default; audit-pass-35 made it a rule
+    and extended it to the map). Helpers `_query_pov` /
     `_pov_hides` / `_query_eid` / `_acts_as_host` in vtt_commands.py. Also
     `!part info` (full var JSON, the data `!ent dump` is host-gated for) left
     READ_ONLY_SUBCOMMANDS — players keep `!part list` (579-580).
@@ -4243,6 +4247,67 @@ More shipped work (continuing the list above):
     chaos (normal + hostile), both huge-number fuzzers, the command fuzzer
     on every touched root, and the prose-quote check (every double-quoted
     ❌/⚠ reply in Expected prose appears in the actual output).
+
+- **Audit-pass-35 (hands-on): object aliasing, reload/parity differentials,
+  four user calls (scenarios 663-670).** Two more reusable harnesses: the
+  reload differential EXTENDED with formula commands that move dicts between
+  units / teams / match vars / tiles (it reproduces the aliasing bug on the
+  old code), and a COMMAND-VS-FORMULA PARITY harness (each operation run as
+  `!command` and as its formula function on identical boards from several
+  starting states; end states compared). Also a POV consistency check
+  (`!list` vs `!find ids` vs `!ent info` under a fogged team view). Fixes:
+  - **Stores shared objects (HIGH).** `entity[a].inv = entity[b].inv` /
+    var_set(var_get(...)) / team_set / match_var_set / tile_set / zone_set /
+    status_set stored the SAME dict, so a write to one changed the other
+    with none of its hooks or clamps, and a save/load split them.
+    `logic._own_value` deep-copies at every store, makes dict keys strings
+    (`{1: 5}` was unreachable by the path `d.1` until a reload) and stores
+    tuples as lists.
+  - **Coordinates are lists (user call).** See the coord-return entry: a
+    tuple-returning function's result went into a var as a tuple and came
+    back from a reload as a list, so equality / `in` flipped.
+    `formula._listify` wraps every built-in function's result
+    (`_TUPLE_FREE_FUNCS`), the arith guard transformer compiles tuple VALUES
+    as lists (loop targets and dict keys keep tuples). Output shows [3, 3].
+  - **`move_step` teleported** (e.tp): no facing change, block_tp instead of
+    block_walk, no on_entity_step, a snake head left its body behind, and a
+    wall raised where the docs promise False. Now `move_dirs([(dir, 1)])`.
+    The parity harness found it; every other pair (tp, hp, kill, revive,
+    status apply/force/transfer/dispel/counter, mount/dismount, remove,
+    push/pull/swap, face, team/tile/zone writes, transform/revert, aura
+    anchor, var delete) matched.
+  - **Own-team view (user call → rule `pov_own_team_visible`, default on).**
+    `!list` dropped a team's own hidden passenger (entity_visible_to) while
+    `!turn` / `!find` / `!ent info` kept it (_pov_hides); and the map applied
+    entity_visibility_condition to a team's own units while the roster
+    didn't. `Match.own_team_unit` now makes entity_visible_to true for the
+    viewer's own units (root-body team) — map, scene, roster and queries
+    agree; a hidden rider is listed but not drawn. Off = own units follow
+    fog and the condition everywhere.
+  - **Nested writes under a value are refused everywhere (user call).** `k.x`
+    while k = 5 replaced the 5 in unit vars / team data / match vars but was
+    refused in tiles / zones / statuses; `check_no_value_ancestor` refuses
+    it in every store.
+  - **`rounding_mode` rule (user call, default half_up).** damage_part's
+    to-main share and transform's percent hp used round() (halves to even:
+    50% of 5 -> 2). `Match.round_by_rule` on exact Fractions; half_up /
+    half_even / floor / ceil. The formula round() is unchanged.
+  - **Dotted paths with an empty segment** (`.lead`, `trail.`,
+    `inventory..sword`) created keys named "" — refused by
+    `check_store_path` in every store, `!defvar add` and template data.
+  - **The bot never pings:** bot.py builds the bot with
+    `AllowedMentions.none()` (replies echo unit names and typed arguments,
+    so `@everyone` / `<@id>` text pinged the server).
+  - **A loaded match always has every rule:** `Match.from_dict` overlays the
+    snapshot's rules on DEFAULT_SYSTEM_SETTINGS (12 `rules.get(key, x)`
+    fallbacks disagree with the registry; defensive, today's restore/load
+    paths re-copy rules from the system anyway).
+  - Verified clean: the command lock can't be inherited by a spawned task
+    (only `to_thread` rendering is spawned); the Discord adapter path with
+    two concurrent messages (stub bot, discord.py 2.7.1); the POV leak
+    detector (546k runs, only the known false hits); the full command fuzzer
+    (98k runs; 4 hits are `!eval` formulas subtracting from a string); the
+    huge-number fuzzers; chaos normal + hostile; the reload differential.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
