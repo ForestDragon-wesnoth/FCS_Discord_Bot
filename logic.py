@@ -1655,6 +1655,20 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     #     — a flat stealth flag, same for every team.
     # A malformed formula is treated as VISIBLE, so a GM typo reveals
     # rather than blanking the whole board.
+    "pov_own_team_visible": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "A team's view always shows its own units — on the map, in the "
+            "roster (!list / !state / !turn) and in queries — even where fog "
+            "or entity_visibility_condition would hide them (a body part "
+            "counts as its root body's team). A passenger inside a vehicle "
+            "(a hidden rider) is listed but not drawn: it's inside. Off: a "
+            "team's own units follow fog and the condition like anyone "
+            "else's (write the condition with `entity[self].team == "
+            "pov_team or ...` to exempt them selectively)."
+        ),
+    },
     "pov_filters_queries": {
         "default": True,
         "schema": {"type": "bool"},
@@ -8346,6 +8360,20 @@ class Match:
         except FormulaError:
             return True
 
+    def own_team_unit(self, e: "Entity", pov_team: Optional[str]) -> bool:
+        """Whether `e` belongs to the viewing team `pov_team` (a body part
+        counts as its root body's team) and the pov_own_team_visible rule
+        keeps a team's own units visible to it."""
+        if pov_team is None or not bool(
+                self.rules.get("pov_own_team_visible", True)):
+            return False
+        root, seen = e, set()
+        while root.part_of and root.part_of in self.entities \
+                and root.id not in seen:
+            seen.add(root.id)
+            root = self.entities[root.part_of]
+        return root.team is not None and str(root.team) == str(pov_team)
+
     def entity_visible_to(self, eid: str, pov_team: Optional[str]) -> bool:
         """Whether entity `eid` is visible to a viewer whose POV is
         `pov_team` (None = omniscient = always visible). Evaluates
@@ -8361,6 +8389,9 @@ class Match:
         # visible (region-slot) rider stays subject to the normal checks.
         if e.is_hidden_rider:
             return False
+        # The viewer's own units (pov_own_team_visible).
+        if self.own_team_unit(e, pov_team):
+            return True
         # A large entity is fog-visible if ANY footprint cell passes the
         # entity fog gate (current vision, or remembered when memory mode
         # is 'full') — so a giant is hidden only when its whole body is

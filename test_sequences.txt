@@ -18159,3 +18159,42 @@ under a key holding a value, as tiles, zones and statuses already did.
 Before, `potion.amount` silently replaced potion's 99 with {amount: 1}
 (a typo wiped a number). Delete or overwrite the key first to make it a
 dict on purpose.
+
+
+SCENARIO 669 — pov_own_team_visible: a team sees its own invisible unit
+------------------------------------------------------------------------
+
+!match new s669 Cloak 6 3
+!match use s669
+!ent add scout Scout 20 1 1 5
+!ent set_var scout team red
+!ent set_var scout glyph S
+!ent set_var scout invisible true
+!ent add brute Brute 20 4 1 4
+!ent set_var brute team blue
+!ent set_var brute glyph B
+!system set default entity_visibility_condition "not var_get(self_id(), 'invisible', False)"
+!as view red
+!map
+?? S
+!list
+?? Scout (scout)
+!as view blue
+!map
+?! S
+!system set default pov_own_team_visible false
+!as view red
+!map
+?! S
+!list
+?! Scout (scout)
+!as view clear
+!system set default pov_own_team_visible true
+!system set default entity_visibility_condition ""
+
+Expected: The visibility condition hides invisible units. Red's own
+invisible scout still shows on red's map and roster (the default
+pov_own_team_visible), and stays hidden from blue. With the rule off, the
+condition applies to red's own units too: the scout disappears from red's
+map and `!list`. Before, the map always applied the condition to a team's
+own units while the roster and queries never did.

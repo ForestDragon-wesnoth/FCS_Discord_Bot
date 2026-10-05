@@ -4738,16 +4738,12 @@ def _query_pov(ctx: ReplyContext, m: "Match") -> Optional[str]:
 
 def _pov_hides(m: "Match", pov: Optional[str], eid: str) -> bool:
     """Whether `eid` is hidden from a query made under `pov`. Your own
-    team's units (a body part counts as its root body's team) are never
-    hidden — a hidden rider or a unit in its own fog is still yours."""
+    team's units (a body part counts as its root body's team) aren't hidden
+    while pov_own_team_visible is on — a hidden rider or a unit in its own
+    fog is still yours."""
     if pov is None or eid not in m.entities:
         return False
-    root = m.entities[eid]
-    seen = set()
-    while root.part_of and root.part_of in m.entities and root.id not in seen:
-        seen.add(root.id)
-        root = m.entities[root.part_of]
-    if root.team is not None and str(root.team) == str(pov):
+    if m.own_team_unit(m.entities[eid], pov):
         return False
     return not m.entity_visible_to(eid, pov)
 
