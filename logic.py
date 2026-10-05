@@ -2934,6 +2934,24 @@ def check_store_path(path: Any, what: str = "path") -> None:
                        f"leading or trailing dot).")
 
 
+def check_no_value_ancestor(root: Any, path: str, where: str) -> None:
+    """Refuse writing at `path` under `root` when a key on the way holds a
+    value (a number, a string, a list): `k.x` while k = 5. Unit vars, team
+    data and match vars used to replace the 5 with {x: ...} without a word,
+    while tiles, zones and statuses refused; every store now refuses."""
+    keys = str(path).split(".")
+    cur = root
+    for i, k in enumerate(keys[:-1]):
+        if not isinstance(cur, dict) or k not in cur:
+            return
+        cur = cur[k]
+        if not isinstance(cur, dict):
+            at = ".".join(keys[:i + 1])
+            raise VTTError(
+                f"{where} value at '{at}' is {type(cur).__name__}, not a dict "
+                f"— cannot set a nested key under it without clobbering.")
+
+
 def _own_value(value: Any) -> Any:
     """`value` ready to store: a dict or list is deep-copied so the store owns
     it (no object shared with another var, team, tile, zone or status),
@@ -4996,6 +5014,7 @@ class Entity:
         # a write to one changed the other with none of its hooks or clamps,
         # and a save/load split them apart again.
         value = _own_value(value)
+        check_no_value_ancestor(self.vars, path, f"`{self.id}`")
 
         # Snapshot whether this is the top-level entry into a write/event
         # chain. We only drain the warning buffer at top-level exit so
@@ -7415,6 +7434,8 @@ class Match:
         """Set a dotted path in a team's data dict (creating it + nested
         dicts as needed)."""
         check_store_path(path, "team path")
+        check_no_value_ancestor(self.team_data.get(str(team), {}), path,
+                                f"team `{team}`")
         cur = self.team_data.setdefault(str(team), {})
         segs = str(path).split(".")
         for seg in segs[:-1]:

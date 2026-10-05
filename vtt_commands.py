@@ -14,7 +14,7 @@ from logic import (
 )
 
 # Passive system
-from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, check_store_path
+from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, check_store_path, check_no_value_ancestor
 
 # Clamp system
 from logic import ClampSpec
@@ -1972,6 +1972,7 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return
             path = args[2]
             value = _parse_scalar(args[3])
+            check_no_value_ancestor(m.vars, path, "match var")
             _set_path(m.vars, path, value)
             return await ctx.send(f"match var `{path}` = {value!r}")
         if vsub == "get":

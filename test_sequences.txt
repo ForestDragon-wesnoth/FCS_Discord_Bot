@@ -18133,3 +18133,29 @@ Expected: half of a 5-point arm hit goes to the boss: 2.5, which half_up
 4 for 3.5; floor gives 3 for 3.5. Transform's percent hp uses the same
 rule: 3/4 hp carried into a 10-hp form is 7.5, so 8. Before, both always
 used round(), so a half went to the even number.
+
+
+SCENARIO 668 — writing under a key that holds a value is refused everywhere
+----------------------------------------------------------------------------
+
+!match new s668 Nest 8 8
+!match use s668
+!ent add a A 20 1 1 5
+!ent set_var a potion 99
+!ent set_var a potion.amount 1
+?? ❌ `a` value at 'potion' is int, not a dict — cannot set a nested key under it without clobbering.
+!eval "var_set('a', 'potion.amount', 1)"
+?? cannot set a nested key
+!team set red gold 5
+!team set red gold.coins 1
+?? ❌ team `red` value at 'gold' is int
+!match var set k 5
+!match var set k.x 1
+?? ❌ match var value at 'k' is int
+!assert "entity[a].potion == 99 and team_get('red', 'gold') == 5 and match_var_get('k') == 5" "nothing was clobbered"
+
+Expected: Unit vars, team data and match vars now refuse a nested write
+under a key holding a value, as tiles, zones and statuses already did.
+Before, `potion.amount` silently replaced potion's 99 with {amount: 1}
+(a typo wiped a number). Delete or overwrite the key first to make it a
+dict on purpose.

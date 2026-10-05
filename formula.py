@@ -390,7 +390,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import random
 
-from logic import VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, _own_value, check_store_path
+from logic import VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, _own_value, check_store_path, check_no_value_ancestor
 
 
 class FormulaError(VTTError):
@@ -3359,6 +3359,10 @@ class FormulaEngine:
         written value so it composes inside larger expressions."""
         if self._match is None:
             raise FormulaError("match vars are unavailable in this context.")
+        try:
+            check_no_value_ancestor(self._match.vars, path, "match var")
+        except VTTError as ex:
+            raise FormulaError(str(ex))
         _set_path(self._match.vars, path, _own_value(value))
         return value
 
