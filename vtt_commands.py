@@ -14,7 +14,7 @@ from logic import (
 )
 
 # Passive system
-from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value
+from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file
 
 # Clamp system
 from logic import ClampSpec
@@ -186,7 +186,8 @@ ELEVATED_ARGS: Dict[str, frozenset] = {
     # settings all elevate to host-gated. (pan/center/view are per-CHANNEL
     # camera state — harmless, so they stay player-available.)
     "map": frozenset({"full", "resize", "color", "teamcolor", "layer",
-                      "legend", "autoupdate", "background", "border", "mode"}),
+                      "legend", "autoupdate", "background", "border", "mode",
+                      "coords"}),
     "list": frozenset({"full"}),
     # `!log` reads for anyone, but `clear` wipes the match's event log.
     "log": frozenset({"clear"}),
@@ -560,7 +561,9 @@ class CommandRegistry:
 
     @staticmethod
     def _has_inline_token(args: List[str]) -> bool:
-        return any(isinstance(a, str) and a.startswith("$(") for a in args)
+        # `key=$(...)` counts too (`!ent set_vars` evaluates it).
+        return any(isinstance(a, str) and (a.startswith("$(") or "=$(" in a)
+                   for a in args)
 
     def _gate_decision(self, name: str, args: List[str],
                        ctx: ReplyContext, mgr: MatchManager) -> str:
@@ -3209,7 +3212,7 @@ registry.annotate_sub("system", "default", usage="!system default <global|server
 # (a new id, a single destination cell, a single new name).
 _ENT_GROUP_ITERABLE_SUBS = {
     "info", "dump", "remove", "del", "rm", "face",
-    "hp", "init", "set_var", "delete_var", "delete_var_silent",
+    "hp", "init", "set_var", "set_vars", "delete_var", "delete_var_silent",
 }
 _ENT_GROUP_REJECTING_SUBS = {"add", "tp", "rename", "clone", "diff"}
 
@@ -4271,6 +4274,64 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if hook_log:
             ack += "\n" + "\n".join(hook_log)
         return await ctx.send(ack)
+    if sub == "set_vars":
+        # Usage: !ent set_vars <id> key=value [key=value ...] [bypass_clamp=yes]
+        # Several set_var writes as one command (one undo entry), applied in
+        # the order given and all-or-nothing: a refused write (a vital var
+        # set to text, a reserved path, a footprint that doesn't fit) rolls
+        # the match back, so no half-applied set stays.
+        if await return_help_if_not_enough_args(ctx, args, 3, "ent", "set_vars"):
+            return
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        pairs: List[Tuple[str, Any]] = []
+        bypass_clamp = False
+        for tok in args[2:]:
+            key, sep, raw = tok.partition("=")
+            if not sep or not key:
+                raise VTTError(
+                    f"`{tok}` isn't key=value — usage: `!ent set_vars <id> "
+                    f"key=value [key=value ...]`. Quote a value that contains "
+                    f"spaces: note=\"hello world\".")
+            if key == "bypass_clamp":
+                bypass_clamp = _parse_bool(raw)
+                continue
+            if any(k == key for k, _ in pairs):
+                raise VTTError(f"`{key}` is given twice.")
+            if raw.startswith("$("):
+                raw = resolve_arg_token(raw, m, self_id=eid)
+            pairs.append((key, _parse_scalar(raw)))
+        if not pairs:
+            raise VTTError("Give at least one key=value.")
+        from action import _rollback_match
+        pre = m.to_dict(include_history=False)
+        shown: List[str] = []
+        notes: List[str] = []
+        hook_log: List[str] = []
+        try:
+            for key, value in pairs:
+                if eid not in m.entities:
+                    raise VTTError(
+                        f"`{eid}` was removed by a triggered effect before "
+                        f"`{key}` was set.")
+                hook_log += m.entities[eid].write_var(
+                    key, value, bypass_clamp=bypass_clamp) or []
+                shown.append(f"{key} = {value!r}")
+                warn = _engine_var_warning(key, value)
+                if warn:
+                    notes.append(warn.strip())
+        except VTTError as ex:
+            _rollback_match(m, mgr, pre)
+            raise VTTError(f"{ex} Nothing was set.")
+        ack = f"`{eid}` vars: " + ", ".join(shown)
+        if bypass_clamp:
+            ack += " (clamp bypassed)"
+        if notes:
+            ack += "\n" + "\n".join(notes)
+        if hook_log:
+            ack += "\n" + "\n".join(hook_log)
+        return await ctx.send(ack)
     # delete_var: removes a var and FIRES on_var_removed hooks (plus
     # on_var_written) for every level of the removed subtree (bottom-up).
     if sub == "delete_var":
@@ -4750,6 +4811,17 @@ registry.annotate_sub(
     ),
 )
 registry.annotate_sub(
+    "ent", "set_vars",
+    usage="!ent set_vars <id> [key=value ...] [bypass_clamp=yes]",
+    desc=(
+        "Set several vars in one command and one undo entry: `!ent set_vars "
+        "hero hp=20 mana=5 inventory.gold=12`. Values coerce like set_var; "
+        "quote one with spaces (note=\"hello world\"); a value may be a "
+        "$() formula. Applied in order and all-or-nothing: if any write is "
+        "refused, nothing is set. Accepts `group:NAME`."
+    ),
+)
+registry.annotate_sub(
     "ent", "set_var",
     usage="!ent set_var <id> <key> <value> [bypass_clamp=yes]",
     desc=(
@@ -5018,7 +5090,7 @@ _MAP_LAYERS = ("zones", "tiles", "entities", "fog")
 
 
 def _map_block(ctx: ReplyContext, m, pov, hidden=None, *,
-               viewport=None, legend=False) -> str:
+               viewport=None, legend=False, coords=None) -> str:
     """The fenced ASCII map. Colorizes only when the surface declares
     `supports_color` AND the match has color enabled; uses an ```ansi
     fence so Discord renders the ANSI codes (a no-op label on a terminal /
@@ -5027,7 +5099,7 @@ def _map_block(ctx: ReplyContext, m, pov, hidden=None, *,
     (vx,vy,vw,vh) clips to a window; `legend` appends a glyph key."""
     colorize = bool(getattr(ctx, "supports_color", False)) and getattr(m, "color_enabled", True)
     body = m.render_ascii(pov, colorize=colorize, hidden_layers=hidden,
-                          viewport=viewport, legend=legend)
+                          viewport=viewport, legend=legend, coords=coords)
     fence = "ansi" if colorize else ""
     return f"```{fence}\n{body}\n```"
 
@@ -5056,6 +5128,19 @@ def _legend_flag(m, args: List[str]) -> bool:
     return bool(getattr(m, "map_legend_enabled", False))
 
 
+def _coords_flag(args: List[str]) -> Optional[bool]:
+    """A one-off `coords=on|off` arg, or None (the match's setting)."""
+    for a in args:
+        low = a.lower()
+        if low == "coords=on":
+            return True
+        if low == "coords=off":
+            return False
+        if low.startswith("coords="):
+            raise VTTError(f"`{a}` — use coords=on or coords=off.")
+    return None
+
+
 def _map_render_reply(ctx: ReplyContext, m, args: List[str],
                       extra_hidden=None) -> str:
     """Build the standard map reply: POV + viewport + legend resolution, a
@@ -5065,14 +5150,31 @@ def _map_render_reply(ctx: ReplyContext, m, args: List[str],
     viewport = m.resolve_viewport(
         ctx.channel_key, enabled=_viewport_enabled(ctx, m))
     legend = _legend_flag(m, args)
-    block = _map_block(ctx, m, pov, hidden, viewport=viewport, legend=legend)
+    coords = _coords_flag(args)
+    header = ""
     if viewport:
         vx, vy, vw, vh = viewport
         header = (f"🗺️ viewport ({vx},{vy})–({vx + vw - 1},{vy + vh - 1}) "
                   f"of {m.grid_width}×{m.grid_height} · "
                   f"`!map pan <dir> [n]` / `!map center <eid>`\n")
-        block = header + block
-    return _as_note(args) + block
+    block = _map_block(ctx, m, pov, hidden, viewport=viewport, legend=legend,
+                       coords=coords)
+    # A surface with a message cap (Discord, 2000) splits a longer reply,
+    # cutting the map in two. The rulers are the part to give up: they add
+    # two-plus lines and a margin on every row, so a 30x30 window that fits
+    # bare doesn't fit with them. An explicit coords=on is kept as asked.
+    limit = getattr(ctx, "message_limit", None)
+    note = _as_note(args)
+    if (limit and coords is None and m.coords_on()
+            and len(note + header + block) > limit):
+        bare = _map_block(ctx, m, pov, hidden, viewport=viewport,
+                          legend=legend, coords=False)
+        if len(note + header + bare) <= limit:
+            block = bare
+            header = header.replace(
+                "\n", " · coordinates left out to fit one message\n", 1) \
+                if header else "(coordinates left out to fit one message)\n"
+    return note + header + block
 
 
 def _visible_tile_data(m, x: int, y: int,
@@ -5449,13 +5551,14 @@ for _sub, _usage in (
         ("layer", "!map layer <list | <name> <on|off>>"),
         ("autoupdate", "!map autoupdate [on|off]"),
         ("legend", "!map legend <on|off>"),
+        ("coords", "!map coords [on|off|clear]"),
         ("pan", "!map pan <dir> [n]"),
         ("center", "!map center <eid | <x> <y>>"),
         ("view", "!map view <reset | <x> <y>>")):
     registry.annotate_sub("map", _sub, usage=_usage)
 
 
-@registry.command("map", access="all", usage="!map [full] [as=<team>] | !map cell <x> <y> [for=<eid>] | !map preview <burst|cone|line|rect> ... | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 30), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map preview burst|cone|line|rect ...` shows the cells an area shape would cover (marked with the preview_glyph rule's character on cells without a unit; graphics surfaces draw translucent squares above units, colour/opacity from the preview_color / preview_opacity rules or `color=` / `opacity=`) and lists the visible units inside — nothing happens to them. `!map full` (host-gated) forces the omniscient view; `as=<team>` (host-only) previews what that team sees (`as=omniscient` = everything), without binding a channel. `!map cell <x> <y> [for=<eid>]` reports everything at one cell the channel can see — units, tile data, zones, corpses, and where its movement / sight block settings come from; `for=<eid>` adds whether the cell blocks that unit (hidden layers are left out). `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets a per-match background sprite; `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). `!map border on|off` / `color <name>` / `opacity <0-100>` / `clear` (host-gated) overrides the grid-line border rules per match (borders draw above the ground, below tiles/entities). `!map mode text|image` (host-gated) sets the per-match default render mode — `image` makes a plain `!map` and the auto-update board render graphically on Discord (text surfaces fall back to ASCII). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
+@registry.command("map", access="all", usage="!map [full] [as=<team>] [hide=<layers>] [legend=on|off] [coords=on|off] | !map cell <x> <y> [for=<eid>] | !map preview <burst|cone|line|rect> ... | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 30), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map preview burst|cone|line|rect ...` shows the cells an area shape would cover (marked with the preview_glyph rule's character on cells without a unit; graphics surfaces draw translucent squares above units, colour/opacity from the preview_color / preview_opacity rules or `color=` / `opacity=`) and lists the visible units inside — nothing happens to them. `!map full` (host-gated) forces the omniscient view; `as=<team>` (host-only) previews what that team sees (`as=omniscient` = everything), without binding a channel. `!map cell <x> <y> [for=<eid>]` reports everything at one cell the channel can see — units, tile data, zones, corpses, and where its movement / sight block settings come from; `for=<eid>` adds whether the cell blocks that unit (hidden layers are left out). `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets a per-match background sprite; `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). `!map border on|off` / `color <name>` / `opacity <0-100>` / `clear` (host-gated) overrides the grid-line border rules per match (borders draw above the ground, below tiles/entities). `!map mode text|image` (host-gated) sets the per-match default render mode — `image` makes a plain `!map` and the auto-update board render graphically on Discord (text surfaces fall back to ASCII). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     if args and args[0].lower() == "colors":
@@ -5568,7 +5671,8 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"{len(scene['placements'])} placement(s) [{breakdown}], "
             f"{len(scene['fog'])} fogged cell(s), "
             f"background={bg['sprite'] if bg else 'none'}, "
-            f"borders={'on' if scene['borders']['show'] else 'off'}.")
+            f"borders={'on' if scene['borders']['show'] else 'off'}, "
+            f"coords={'on' if scene.get('coords') else 'off'}.")
     if args and args[0].lower() == "image":
         # !map image [full] — render the graphics scene to a PNG and post it as
         # an attachment. Surface-gated: only a surface that implements the
@@ -5690,6 +5794,25 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 "Auto-update boards are a Discord-only feature — on the CLI "
                 "the whole map already prints each time.")
         return await ctx.send(await hook(m, on))
+    if args and args[0].lower() == "coords":
+        # !map coords on|off|clear — this match's coordinate rulers (clear =
+        # back to the map_coords rule). Bare: show the current setting.
+        if len(args) < 2:
+            src = ("this match's setting" if m.map_coords is not None
+                   else "the map_coords rule")
+            return await ctx.send(
+                f"Coordinate rulers are {'ON' if m.coords_on() else 'OFF'} for "
+                f"**{m.name}** ({src}). Usage: `!map coords on|off|clear` (or "
+                f"one-off `!map coords=off`).")
+        op = args[1].lower()
+        if op not in ("on", "off", "clear"):
+            return await ctx.send("❌ Usage: `!map coords on|off|clear`.")
+        m.map_coords = None if op == "clear" else (op == "on")
+        how = ("back to the map_coords rule" if op == "clear"
+               else "for this match")
+        return await ctx.send(
+            f"Coordinate rulers {'ON' if m.coords_on() else 'OFF'} for "
+            f"**{m.name}** ({how}).")
     if args and args[0].lower() == "legend":
         if len(args) < 2 or args[1].lower() not in ("on", "off"):
             state = "ON" if m.map_legend_enabled else "OFF"
@@ -5757,7 +5880,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # `full` is honored only as args[0] (the host-gated position) via
     # _view_pov, so a player can't sneak omniscient via `!map hide=.. full`.
     extra_hidden = set()
-    _check_options(args, {"hide", "legend", "as"}, "!map")
+    _check_options(args, {"hide", "legend", "as", "coords"}, "!map")
     for i, a in enumerate(args):
         # Anything else here is a mistyped subcommand (`!map pna up`), which
         # used to fall through to a plain render.
@@ -7102,10 +7225,9 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         full, path = saves_path(args[2], write=True)
         snap = _resolve_snapshot_selector(m, selector)
         try:
-            with open(full, "w", encoding="utf-8") as f:
-                json.dump(snap.to_dict(), f, indent=2)
-        except OSError as ex:
-            raise VTTError(f"Failed to write '{path}': {ex.strerror}")
+            write_json_file(full, snap.to_dict())
+        except VTTError as ex:
+            raise VTTError(f"Failed to write `{path}`: {ex}")
         return await ctx.send(
             f"Exported {snap.kind} snapshot (seq {snap.sequence}) to `{path}`."
         )
@@ -7688,7 +7810,10 @@ async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if extra.startswith("include_history="):
                 include_history = _parse_bool(extra[len("include_history="):])
         path, shown = saves_path(args[1], write=True)
-        mgr.save(path, include_history=include_history)
+        try:
+            mgr.save(path, include_history=include_history)
+        except VTTError as ex:
+            raise VTTError(f"Failed to save to `{shown}`: {ex}")
         suffix = " (with autosave history)" if include_history else ""
         return await ctx.send(f"Saved to `{shown}`{suffix}")
     if sub == "load":# and len(args) >= 2:

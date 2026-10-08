@@ -179,6 +179,9 @@ class DiscordCtxWrapper:
     # Discord messages are narrow, so the map viewport engages in 'auto'
     # mode on large maps (pan with `!map pan` / the arrow buttons).
     viewport_capable = True
+    # Discord's message cap; the map reply drops its coordinate rulers rather
+    # than split a map across two messages.
+    message_limit = DISCORD_MAX_CONTENT
 
     def __init__(self, ctx, mgr=None):
         self._ctx = ctx
@@ -617,15 +620,20 @@ def _board_render(m, channel_key: str) -> Tuple[str, bool]:
         vx, vy, vw, vh = viewport
         header = (f"🗺️ viewport ({vx},{vy})–({vx + vw - 1},{vy + vh - 1}) "
                   f"of {m.grid_width}×{m.grid_height}\n")
-    # Richest first; each fallback drops one optional layer.
-    attempts = [(colorize, legend), (False, legend), (False, False)]
+    coords = m.coords_on()
+    # Richest first; each fallback drops one optional layer (the coordinate
+    # rulers first: two-plus lines and a margin on every row).
+    attempts = [(colorize, legend, coords), (colorize, legend, False),
+                (False, legend, False), (False, False, False)]
     text = ""
-    for col, leg in dict.fromkeys(attempts):
-        body = m.render_ascii(pov, colorize=col, viewport=viewport, legend=leg)
+    for col, leg, crd in dict.fromkeys(attempts):
+        body = m.render_ascii(pov, colorize=col, viewport=viewport, legend=leg,
+                              coords=crd)
         text = f"{header}```{'ansi' if col else ''}\n{body}\n```"
         if len(text) <= DISCORD_MAX_CONTENT:
-            if (col, leg) != attempts[0]:
-                dropped = [n for n, was, now in (("color", colorize, col),
+            if (col, leg, crd) != attempts[0]:
+                dropped = [n for n, was, now in (("coordinates", coords, crd),
+                                                 ("color", colorize, col),
                                                  ("legend", legend, leg))
                            if was and not now]
                 text = (f"(board too large for one Discord message — "
@@ -635,7 +643,7 @@ def _board_render(m, channel_key: str) -> Tuple[str, bool]:
             return text, bool(viewport)
     return (f"⚠️ This map board is {len(text)} characters, over Discord's "
             f"{DISCORD_MAX_CONTENT}-character message limit even without "
-            f"color or legend. Lower the `viewport_width` / `viewport_height` "
+            f"coordinates, color or legend. Lower the `viewport_width` / `viewport_height` "
             f"rules to shrink the window."), bool(viewport)
 
 

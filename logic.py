@@ -4,6 +4,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from typing import Literal, Any, Dict, Iterable, List, Optional, Tuple, Set
+import os
 import uuid
 import json
 import copy
@@ -1147,11 +1148,13 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "default": "block",
         "schema": {"type": "enum", "choices": ["block", "eject"]},
         "desc": (
-            "When transforming/polymorphing a VEHICLE whose new form lacks a "
-            "slot for some current rider: 'block' (refuse the transform, no "
-            "change) or 'eject' (dismount all riders to nearby cells, then "
-            "transform). If the new form has matching slots for ALL riders, "
-            "they stay mounted regardless of this rule."
+            "When a transform breaks a mount: a VEHICLE's new form lacks a "
+            "slot for some current rider, or a mounted RIDER's new form fails "
+            "its slot's `condition` or no longer fits the slot's capacity. "
+            "'block' refuses the transform (no change); 'eject' dismounts the "
+            "affected riders to nearby cells (a rider's cell is picked for "
+            "its new body). If every rider still fits, they stay mounted "
+            "regardless of this rule."
         ),
     },
     # Whether a HIDDEN rider (a passenger in a slot with no `region`, tucked
@@ -1974,6 +1977,18 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Opacity (0-100 percent) of the graphics fog overlay over unseen "
             "cells. 100 = fully hides what's underneath; lower = translucent "
             "haze. Only used by render_scene (fog_glyph drives text fog)."
+        ),
+    },
+    "map_coords": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Coordinate rulers on the map. ASCII: column numbers above the "
+            "map, their digits stacked top to bottom (so a two-digit column "
+            "number fits a one-character cell), and row numbers in a margin "
+            "on the left. Graphics: x / y labels along the top and left edges. "
+            "Both follow the viewport window. Per-match override: `!map "
+            "coords on|off|clear`; one render: `!map coords=off`."
         ),
     },
     "show_borders": {
@@ -2981,9 +2996,39 @@ def _own_value(value: Any) -> Any:
     if isinstance(value, tuple):
         # Coordinates are lists (a save/load turns tuples into lists).
         return [_own_value(v) for v in value]
-    if isinstance(value, set):
-        return copy.deepcopy(value)
-    return value
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    # Anything else (a function named as a value — `entity[a].f = min` —
+    # a set, an object) can't be saved: it used to be stored as-is, after
+    # which `!store save` failed and `!ent dump` crashed on that match.
+    what = ("a function" if callable(value)
+            else f"a {type(value).__name__}")
+    raise VTTError(f"Can't store {what}: only numbers, text, true/false, "
+                   f"None, lists and dicts can be stored.")
+
+
+def write_json_file(path: str, data: Any) -> None:
+    """Write `data` as JSON to `path` all-or-nothing: the text is built
+    first and written to a temp file beside the target, then moved over it.
+    json.dump straight into the target truncated an existing good save when
+    serialization failed partway. Raises VTTError (no host path in the
+    message: callers name the file the way they show it)."""
+    try:
+        text = json.dumps(data, indent=2)
+    except (TypeError, ValueError) as e:
+        raise VTTError(f"the data holds a value that can't be saved ({e}).")
+    folder = os.path.dirname(os.path.abspath(path))
+    tmp = os.path.join(folder, f".{os.path.basename(path)}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise VTTError(f"the file couldn't be written ({e.strerror or e}).")
 
 
 def reserved_var_path_error(path: str, where: str) -> Optional[str]:
@@ -5833,6 +5878,9 @@ class Match:
     border_show: Optional[bool] = None
     border_color: Optional[str] = None
     border_opacity: Optional[int] = None
+    # Coordinate rulers: None = the map_coords rule, else this match's
+    # override (`!map coords on|off|clear`). Serialized.
+    map_coords: Optional[bool] = None
 
     # ---- graphics: per-match render mode ----
     # "text" (ASCII, the default) or "image" (graphical PNG). On a graphics-
@@ -10814,7 +10862,8 @@ class Match:
     def apply_status(self, eid: str, name: str,
                      level: Optional[int] = None,
                      duration: Optional[int] = None,
-                     *, force: bool = False) -> List[str]:
+                     *, force: bool = False,
+                     seed_data: Optional[Dict[str, Any]] = None) -> List[str]:
         """Apply status `name` to entity `eid`, honoring the definition's
         `stack` mode (else the status_default_stack rule) when the status
         is already present. A FIRST application seeds the definition's
@@ -10827,7 +10876,11 @@ class Match:
         immunity + resistance gating entirely — the level/increment is
         applied regardless of resistance. blocked_by (cross-status) and the
         part immune/redirect rules are still honored; force is specifically
-        the 'ignore resistance' axis."""
+        the 'ignore resistance' axis.
+
+        `seed_data` (status_transfer) replaces the definition's `data` as the
+        new instance's fields on a FIRST application, so a moved status keeps
+        its custom fields; stacking onto an existing instance ignores it."""
         e = self.entities.get(eid)
         if e is None:
             raise NotFound(f"Entity '{eid}' not found.")
@@ -10842,7 +10895,7 @@ class Match:
                     e, "__status_redirect", "part_status_redirect"):
                 if e.part_of in self.entities:
                     return self.apply_status(e.part_of, name, level, duration,
-                                             force=force)
+                                             force=force, seed_data=seed_data)
                 return []
         sdef = self.status_definitions.get(name) or {}
         new_level = None if level is None else int(level)
@@ -10872,7 +10925,11 @@ class Match:
                 new_level = eff
         before = copy.deepcopy(e.status.get(name))
         if name not in e.status:
-            inst = copy.deepcopy(sdef.get("data")) if isinstance(sdef.get("data"), dict) else {}
+            if isinstance(seed_data, dict):
+                inst = copy.deepcopy(seed_data)
+            else:
+                inst = (copy.deepcopy(sdef.get("data"))
+                        if isinstance(sdef.get("data"), dict) else {})
             seed_lv = (new_level if new_level is not None
                        else _coerce_number(inst.get("level", 1)) or 1)
             inst["level"] = self._cap_status_level(sdef, seed_lv)
@@ -10953,9 +11010,9 @@ class Match:
         destination via apply_status — so the destination's stacking mode +
         resistance/immunity/blocked_by all apply (a RESISTIBLE move: if the
         dest resists or is immune, the status is consumed — gone from the
-        source, doesn't stick). Carries level + duration; custom instance data
-        re-seeds from the definition, exactly like the part_status_redirect
-        path. Returns (landed_on_dest, log). No-op (False) if the source lacks
+        source, doesn't stick). Carries level + duration, and the moved
+        instance keeps its custom fields (user call; it used to re-seed them
+        from the definition). Returns (landed_on_dest, log). No-op (False) if the source lacks
         the status or from==to. Raises NotFound for an unknown entity."""
         src = self.entities.get(from_eid)
         if src is None:
@@ -10977,7 +11034,11 @@ class Match:
         # The source's on_status_removed hook could have removed the dest.
         if to_eid not in self.entities:
             return False, log
-        log += self.apply_status(to_eid, name, lv, du)
+        # The moved instance keeps every field (custom data, sprite
+        # overrides); level and duration still go through the destination's
+        # stacking, resistance and immunity. Onto an existing instance only
+        # the stacking applies (that instance keeps its own data).
+        log += self.apply_status(to_eid, name, lv, du, seed_data=inst)
         landed = (to_eid in self.entities
                   and name in self.entities[to_eid].status)
         return landed, log
@@ -12871,6 +12932,38 @@ class Match:
             e, new_vars, "transform",
             extra_ignore=tuple(p.id for p in self.entity_part_subtree(e.id)
                                if p.id != e.id))
+        # A mounted rider's new form must still suit its seat: the slot's
+        # `condition` and its share of the capacity are re-checked against
+        # the new vars. transform_rider_mismatch_mode decides a misfit, as it
+        # does for a vehicle's riders: block refuses here, before any
+        # change; eject picks the drop cell for the NEW body now and
+        # dismounts the rider right after the swap.
+        eject_to: Optional[Tuple[int, int]] = None
+        eject_note = ""
+        veh = self.entities.get(e.mounted_on) if e.mounted_on else None
+        if veh is not None:
+            saved_vars = e.vars
+            e.vars = new_vars
+            try:
+                ok, why = self.can_mount(e.id, veh.id, e.mount_slot)
+                if not ok and str(self.rules.get(
+                        "transform_rider_mismatch_mode", "block")) == "eject":
+                    eject_to = self._find_dismount_cell(e, veh)
+                    if eject_to is None:
+                        raise VTTError(
+                            f"transform: the new form can't stay in slot "
+                            f"'{e.mount_slot}' of `{veh.id}` ({why}) and has "
+                            f"no free cell to dismount to.")
+                    eject_note = (f"`{e.id}`'s new form doesn't fit slot "
+                                  f"'{e.mount_slot}' of `{veh.id}` ({why}); "
+                                  f"it dismounts to {eject_to}.")
+            finally:
+                e.vars = saved_vars
+            if not ok and eject_to is None:
+                raise VTTError(
+                    f"transform: the new form can't stay in slot "
+                    f"'{e.mount_slot}' of `{veh.id}`: {why} Dismount first "
+                    f"(or set transform_rider_mismatch_mode=eject).")
         drop_log: List[str] = []
         for p in reversed(self.entity_part_subtree(e.id)):
             if p.id in self.entities:
@@ -12891,6 +12984,9 @@ class Match:
                         for path, cd in (sb.get("clamps") or {}).items()}
             e.status = copy.deepcopy(sb.get("status") or {})
             # facing is identity — preserved (not taken from the statblock).
+            if eject_to is not None:
+                log.append(eject_note)
+                log += self.dismount_entity(e.id, *eject_to)
             self._turn_order_dirty = True
             self._rebuild_turn_order()
             self._restamp_anchors_for(e.id)
@@ -13741,6 +13837,7 @@ class Match:
             "border_show": self.border_show,
             "border_color": self.border_color,
             "border_opacity": self.border_opacity,
+            "map_coords": self.map_coords,
             "render_mode": self.render_mode,
             "paused": copy.deepcopy(self.paused),
         }
@@ -13966,6 +14063,8 @@ class Match:
         m.background = copy.deepcopy(raw_bg) if isinstance(raw_bg, dict) else None
         bs = d.get("border_show")
         m.border_show = bool(bs) if isinstance(bs, bool) else None
+        mc = d.get("map_coords")
+        m.map_coords = mc if isinstance(mc, bool) else None
         bcol = d.get("border_color")
         m.border_color = bcol if isinstance(bcol, str) and bcol else None
         bop = d.get("border_opacity")
@@ -14458,7 +14557,8 @@ class Match:
                      viewport: Optional[Tuple[int, int, int, int]] = None,
                      legend: bool = False,
                      marks: Optional["set[Tuple[int, int]]"] = None,
-                     mark_glyph: str = "*") -> str:
+                     mark_glyph: str = "*",
+                     coords: Optional[bool] = None) -> str:
         """Render the ASCII map. Thin wrapper that activates the read-only
         _fog_team_sees memo for the duration of the render, so the per-cell,
         per-layer fog scan doesn't recompute the same team-sight (each
@@ -14470,15 +14570,20 @@ class Match:
         suppresses render layers by name: zones / tiles / entities / fog.
 
         `marks` (a set of (x, y) cells, used by `!map preview`) paints
-        `mark_glyph` on each of those cells that isn't showing a unit."""
+        `mark_glyph` on each of those cells that isn't showing a unit.
+
+        `coords` (None = coords_on()) adds the coordinate rulers."""
         hidden = self.hidden_layers if hidden_layers is None else hidden_layers
+        if coords is None:
+            coords = self.coords_on()
         prev = self._vision_memo
         if prev is None:
             self._vision_memo = {}
         try:
             return self._render_ascii_impl(pov_team, colorize, hidden,
                                            viewport=viewport, legend=legend,
-                                           marks=marks, mark_glyph=mark_glyph)
+                                           marks=marks, mark_glyph=mark_glyph,
+                                           coords=coords)
         finally:
             self._vision_memo = prev
 
@@ -14488,7 +14593,8 @@ class Match:
                            viewport: Optional[Tuple[int, int, int, int]] = None,
                            legend: bool = False,
                            marks: Optional["set[Tuple[int, int]]"] = None,
-                           mark_glyph: str = "*") -> str:
+                           mark_glyph: str = "*",
+                           coords: bool = False) -> str:
         # `pov_team` filters EVERY layer through its visibility rule: a
         # zone / tile / entity hidden from that team isn't painted (its
         # cell falls back to whatever layer is visible underneath, so the
@@ -14709,6 +14815,8 @@ class Match:
             if active:
                 parts.append("\x1b[0m")
             lines.append("".join(parts))
+        if coords and x1 >= x0 and y1 >= y0:
+            lines = self._ascii_rulers(lines, x0, x1, y0, y1)
         out = "\n".join(lines)
 
         # Auto-legend: glyph -> meanings, collected from the cells actually
@@ -14740,6 +14848,24 @@ class Match:
     # _render_ascii_impl (a parallel method, by design, to avoid risking the
     # heavily-used ASCII path; both reuse the same predicate + resolver
     # helpers, so only the loop skeleton is duplicated).
+    @staticmethod
+    def _ascii_rulers(lines: List[str], x0: int, x1: int,
+                      y0: int, y1: int) -> List[str]:
+        """`lines` (one per map row y0..y1, cells x0..x1 one character each
+        with a space between) with coordinate rulers: a header of column
+        numbers whose digits are stacked top to bottom, so column 12 reads
+        1 over 2 and every number fits its one-character column, and the
+        row numbers right-aligned in a left margin. Coordinates are 1-based,
+        as every command takes them."""
+        margin = len(str(y1))
+        depth = len(str(x1))
+        header = []
+        for d in range(depth):
+            digits = [str(xx).rjust(depth)[d] for xx in range(x0, x1 + 1)]
+            header.append((" " * (margin + 1) + " ".join(digits)).rstrip())
+        rows = [f"{y:>{margin}} {line}" for y, line in zip(range(y0, y1 + 1), lines)]
+        return header + rows
+
     def render_scene(self, pov_team: Optional[str] = None,
                      hidden_layers: Optional["set[str]"] = None,
                      viewport: Optional[Tuple[int, int, int, int]] = None
@@ -14800,6 +14926,13 @@ class Match:
                 "tint": ov["tint"], "opacity": ov["opacity"],
                 "flip_h": False, "flip_v": False, "layer": ov["layer"],
             })
+
+    def coords_on(self) -> bool:
+        """Whether maps carry coordinate rulers: this match's override, else
+        the map_coords rule."""
+        if self.map_coords is not None:
+            return bool(self.map_coords)
+        return bool(self.rules.get("map_coords", True))
 
     def _scene_borders(self) -> Dict[str, Any]:
         """Border (grid-line) config for the scene: the show_borders /
@@ -14967,6 +15100,7 @@ class Match:
             "viewport": vp, "background": self.background_layer(),
             "placements": placements, "fog": fog,
             "borders": self._scene_borders(),
+            "coords": self.coords_on(),
         }
 
     # ---- facing writes ----
@@ -15706,12 +15840,7 @@ class MatchManager:
             "default_system_per_server": self.default_system_per_server,
             "default_system_per_channel": self.default_system_per_channel,
         }
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-        except (OSError, TypeError) as e:
-            # OSError: permission / dir missing; TypeError: unserializable data (shouldn't happen)
-            raise VTTError(f"Failed to save to '{path}': {e}")
+        write_json_file(path, data)
     
     def load(self, path: str):
         try:

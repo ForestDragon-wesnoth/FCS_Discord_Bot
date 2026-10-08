@@ -183,7 +183,43 @@ class SceneRenderer:
         for hl in scene.get("highlights") or []:
             self._draw_highlight(canvas, hl, ox, oy, cols, rows)
 
+        if scene.get("coords"):
+            canvas = self._add_rulers(canvas, ox, oy, cols, rows)
         return canvas
+
+    def _ruler_margin(self, labels: int) -> int:
+        """Pixels of margin a ruler with numbers up to `labels` takes."""
+        return ruler_margin(self.cell, labels)
+
+    def _add_rulers(self, canvas, ox, oy, cols, rows):
+        """The map with coordinate labels in a margin along the top (x) and
+        the left (y), numbered as commands take them (1-based) and following
+        the viewport window. Graphics have room for whole numbers, so no
+        digit stacking as in the ASCII rulers."""
+        cell = self.cell
+        top = self._ruler_margin(1)
+        left = self._ruler_margin(oy + rows - 1)
+        out = Image.new("RGBA", (canvas.width + left, canvas.height + top),
+                        _BG_FILL)
+        out.alpha_composite(canvas, (left, top))
+        d = ImageDraw.Draw(out)
+        font = _label_font(cell)
+        fill = (200, 200, 200, 255)
+
+        def centred(text, cx, cy):
+            try:
+                b = d.textbbox((0, 0), text, font=font)
+                w, h = b[2] - b[0], b[3] - b[1]
+                d.text((cx - w // 2 - b[0], cy - h // 2 - b[1]), text,
+                       font=font, fill=fill)
+            except Exception:
+                d.text((cx, cy), text, font=font, fill=fill)
+
+        for i in range(cols):
+            centred(str(ox + i), left + i * cell + cell // 2, top // 2)
+        for j in range(rows):
+            centred(str(oy + j), left // 2, top + j * cell + cell // 2)
+        return out
 
     # -- layers ----------------------------------------------------------
     def _draw_background(self, canvas, bg, W, H) -> bool:
@@ -314,6 +350,21 @@ class SceneRenderer:
         canvas.alpha_composite(overlay)
 
 
+def _label_font(cell: int):
+    size = max(8, int(cell * 0.3))
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:  # older Pillow: load_default() takes no size
+        return ImageFont.load_default()
+
+
+def ruler_margin(cell: int, largest: int) -> int:
+    """Margin (pixels) for coordinate labels up to `largest` at this cell
+    size: room for the digits plus padding, at least half a cell."""
+    digits = len(str(max(1, int(largest))))
+    return max(cell // 2, int(max(8, cell * 0.3) * 0.65 * digits) + cell // 4)
+
+
 def scene_dims(scene: Dict[str, Any]) -> Tuple[int, int]:
     """(cols, rows) of cells a scene renders — the viewport window when one is
     set, else the whole grid. Mirrors SceneRenderer.render's own sizing."""
@@ -323,9 +374,14 @@ def scene_dims(scene: Dict[str, Any]) -> Tuple[int, int]:
     else:
         cols, rows = scene.get("grid_width", 1), scene.get("grid_height", 1)
     try:
-        return max(1, int(cols)), max(1, int(rows))
+        cols, rows = max(1, int(cols)), max(1, int(rows))
     except (TypeError, ValueError):
         return 1, 1
+    if scene.get("coords"):
+        # The ruler margins: at most a cell along the top, and along the
+        # left a little more for three-digit row numbers.
+        cols, rows = cols + 2, rows + 1
+    return cols, rows
 
 
 def fit_cell_size(scene: Dict[str, Any], cell: int, max_dim: int) -> int:

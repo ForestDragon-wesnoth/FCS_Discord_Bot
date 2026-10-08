@@ -1803,6 +1803,163 @@ def _count(v: Any, value: Any) -> int:
     return sum(1 for x in _list_arg(v, "count") if x == value)
 
 
+# ---- string helpers ------------------------------------------------------
+# Method calls are banned in formulas ('abc'.upper() is rejected), so text is
+# handled through these functions. All are pure; the ones that can grow text
+# (replace, join, fmt) are capped at formula_size_limit (the namespace binds
+# the match's value, like range / each).
+def _text_arg(v: Any, fname: str, argname: str = "the argument") -> str:
+    if not isinstance(v, str):
+        raise FormulaError(
+            f"{fname}(...): {argname} must be text, got "
+            f"{'None' if v is None else type(v).__name__}.")
+    return v
+
+
+def _check_text_size(out: str, fname: str, limit: int) -> str:
+    if len(out) > limit:
+        raise FormulaError(
+            f"{fname}(...): the result is {len(out)} characters, over the "
+            f"formula_size_limit of {limit}.")
+    return out
+
+
+def _upper(v: Any) -> str:
+    """upper(text): the text in upper case."""
+    return _text_arg(v, "upper").upper()
+
+
+def _lower(v: Any) -> str:
+    """lower(text): the text in lower case."""
+    return _text_arg(v, "lower").lower()
+
+
+def _strip(v: Any) -> str:
+    """strip(text): the text without leading and trailing spaces."""
+    return _text_arg(v, "strip").strip()
+
+
+def _startswith(v: Any, prefix: Any) -> bool:
+    """startswith(text, prefix): True when the text starts with prefix."""
+    return _text_arg(v, "startswith").startswith(
+        _text_arg(prefix, "startswith", "prefix"))
+
+
+def _endswith(v: Any, suffix: Any) -> bool:
+    """endswith(text, suffix): True when the text ends with suffix."""
+    return _text_arg(v, "endswith").endswith(
+        _text_arg(suffix, "endswith", "suffix"))
+
+
+def _split(v: Any, sep: Any = None) -> list:
+    """split(text, sep=None): the text cut at each `sep` into a list; with
+    no sep, cut at runs of spaces (empty pieces dropped)."""
+    t = _text_arg(v, "split")
+    if sep is None:
+        return t.split()
+    sep = _text_arg(sep, "split", "sep")
+    if not sep:
+        raise FormulaError("split(...): sep can't be empty.")
+    return t.split(sep)
+
+
+def _replace(v: Any, old: Any, new: Any, *,
+             limit: int = _DEFAULT_SIZE_LIMIT) -> str:
+    """replace(text, old, new): the text with every `old` replaced by
+    `new`."""
+    t = _text_arg(v, "replace")
+    old = _text_arg(old, "replace", "old")
+    new = _text_arg(new, "replace", "new")
+    if not old:
+        raise FormulaError("replace(...): old can't be empty.")
+    # Size the result before building it: replace('a'*N, 'a', <long>)
+    # would otherwise allocate N * len(new) characters first.
+    size = len(t) + t.count(old) * (len(new) - len(old))
+    if size > limit:
+        raise FormulaError(
+            f"replace(...): the result would be {size} characters, over the "
+            f"formula_size_limit of {limit}.")
+    return t.replace(old, new)
+
+
+def _join(items: Any, sep: Any = "", *,
+          limit: int = _DEFAULT_SIZE_LIMIT) -> str:
+    """join(list, sep=""): the items as one text, `sep` between them.
+    Numbers and other values are written as str() would."""
+    parts = [x if isinstance(x, str) else str(x)
+             for x in _list_arg(items, "join")]
+    sep = _text_arg(sep, "join", "sep")
+    size = sum(len(p) for p in parts) + len(sep) * max(0, len(parts) - 1)
+    if size > limit:
+        raise FormulaError(
+            f"join(...): the result would be {size} characters, over the "
+            f"formula_size_limit of {limit}.")
+    return sep.join(parts)
+
+
+_FMT_FIELD = re.compile(r"\{\{|\}\}|\{([^{}]*)\}|[{}]")
+_FMT_NAME = re.compile(r"(\d+|[A-Za-z_]\w*)(?::(.*))?\Z", re.S)
+# A format spec is limited to alignment, sign, a width of up to 3 digits, a
+# precision of up to 2 and a type letter: {0:>5}, {1:.2f}, {2:+d}, {3:%}.
+# Python's str.format would also resolve {0.attr} / {0[key]}, reaching into
+# objects, so fields are parsed here and only plain names / numbers resolve.
+_FMT_SPEC = re.compile(r"[<>^]?[+-]?\d{0,3}(?:\.\d{1,2})?[dfeg%s]?\Z")
+
+
+def _fmt(template: Any, *args: Any, _limit: int = _DEFAULT_SIZE_LIMIT,
+         **kwargs: Any) -> str:
+    """fmt(template, a, b, ..., name=value, ...): the template with each
+    {0}, {1}, ... replaced by the matching argument and each {name} by the
+    keyword argument. A field may carry a short format spec ({0:.1f},
+    {1:>4}). {{ and }} write a literal brace."""
+    t = _text_arg(template, "fmt", "template")
+    out: List[str] = []
+    pos = 0
+    for m in _FMT_FIELD.finditer(t):
+        out.append(t[pos:m.start()])
+        pos = m.end()
+        tok = m.group(0)
+        if tok in ("{{", "}}"):
+            out.append(tok[0])
+            continue
+        if m.group(1) is None:
+            raise FormulaError(
+                "fmt(...): an unmatched brace in the template (write {{ or }} "
+                "for a literal one).")
+        f = _FMT_NAME.match(m.group(1))
+        if not f:
+            raise FormulaError(
+                f"fmt(...): {{{m.group(1)}}} isn't a field — use {{0}}, {{1}}, "
+                f"... or {{name}}.")
+        key, spec = f.group(1), f.group(2) or ""
+        if key.isdigit():
+            i = int(key)
+            if i >= len(args):
+                raise FormulaError(
+                    f"fmt(...): {{{key}}} has no argument ({len(args)} given).")
+            val = args[i]
+        else:
+            if key not in kwargs:
+                raise FormulaError(f"fmt(...): no {key}= argument for {{{key}}}.")
+            val = kwargs[key]
+        if spec:
+            if not _FMT_SPEC.match(spec):
+                raise FormulaError(f"fmt(...): unsupported format spec '{spec}'.")
+            try:
+                piece = format(val, spec)
+            except (ValueError, TypeError) as ex:
+                raise FormulaError(f"fmt(...): {{{m.group(1)}}}: {ex}")
+        else:
+            piece = val if isinstance(val, str) else str(val)
+        out.append(piece)
+        if sum(len(x) for x in out) > _limit:
+            raise FormulaError(
+                f"fmt(...): the result is over the formula_size_limit of "
+                f"{_limit} characters.")
+    out.append(t[pos:])
+    return _check_text_size("".join(out), "fmt", _limit)
+
+
 _ALLOWED_FUNCS: Dict[str, Any] = {
     "min": min, "max": max, "abs": abs, "round": round,
     "int": int, "float": float, "str": str,
@@ -1836,6 +1993,15 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
     "any": _any,
     "all": _all,
     "count": _count,
+    "upper": _upper,
+    "lower": _lower,
+    "strip": _strip,
+    "startswith": _startswith,
+    "endswith": _endswith,
+    "split": _split,
+    "replace": _replace,
+    "join": _join,
+    "fmt": _fmt,
 }
 
 # Match-bound function names. These functions are bound at namespace build
@@ -3483,6 +3649,9 @@ class FormulaEngine:
             "cells_in_rect": lambda *a, **k: _cells_in_rect(*a, limit=cell_limit, **k),
             "range": lambda *a: _range(*a, limit=size_limit),
             "each": lambda v: _each(v, limit=size_limit),
+            "replace": lambda *a: _replace(*a, limit=size_limit),
+            "join": lambda *a: _join(*a, limit=size_limit),
+            "fmt": lambda *a, **k: _fmt(*a, _limit=size_limit, **k),
         }
         # Per-name default: was_clamped is boolean-flavored (default False);
         # args defaults to an empty dict (so attribute access via
@@ -4500,8 +4669,9 @@ class FormulaEngine:
             and re-applies on the destination honoring the dest's stacking +
             resistance/immunity — a RESISTIBLE move: if the dest resists or is
             immune the status is consumed (gone from source, doesn't stick).
-            Carries level + duration; custom instance data re-seeds from the
-            definition (like the body-part redirect). Returns True iff it
+            Carries level + duration, and the moved instance keeps its
+            custom fields (onto an existing instance only the stacking
+            applies). Returns True iff it
             LANDED on the destination; False if the source lacked it / from==to
             / the dest rejected it."""
             fid = _eid(from_t)

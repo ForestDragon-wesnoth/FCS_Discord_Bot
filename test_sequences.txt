@@ -18482,3 +18482,250 @@ Expected: HARNESS-ALLOWS-ERRORS. `!map scene full` summarizes the whole board
 (2 units) where the channel's red view sees 1. It used to read only its first
 word (`scene`) for `full`, so `full` did nothing. Like `!map image full` it is
 host-only.
+
+
+SCENARIO 678 — string helpers: upper / lower / split / join / replace / fmt
+-----------------------------------------------------------------------------
+
+!match new s678 Strings 8 8
+!match use s678
+!ent add hero Hero 30 1 1 5
+!ent add orc Orc 20 3 1 5
+!assert "upper('abc') == 'ABC' and lower('DeF') == 'def' and strip('  x ') == 'x'"
+!assert "split('a,b,,c', ',') == ['a', 'b', '', 'c'] and split(' a  b ') == ['a', 'b']"
+!assert "join(['a', 1, 2.5], '-') == 'a-1-2.5' and replace('aaa', 'a', 'bb') == 'bbbbbb'"
+!assert "startswith('goblin_3', 'goblin') and endswith('goblin_3', '_3')"
+!assert "fmt('{0} hits {1} for {dmg:.1f}', 'Hero', 'Orc', dmg=7) == 'Hero hits Orc for 7.0'"
+!assert "fmt('{{braces}} {limit}', limit=3) == '{braces} 3'"
+!ent set_var hero actions.strike.target entity
+!ent set_var hero actions.strike.body "dmg = 4\nentity[target].hp = entity[target].hp - dmg\nlog(fmt('{0} strikes {1} for {2}', entity[self].name, upper(entity[target].name), dmg))"
+!action hero strike orc
+!log 2
+?? Hero strikes ORC for 4
+!dist "$(len(split('a,b,c', ',')))" 1 1 1
+?? (3,1) → (1,1): **2**
+
+Expected: The string helpers work in any formula. `fmt` fills {0}, {1}, ...
+from its arguments and {name} from keyword arguments, takes a short format
+spec ({dmg:.1f}) and writes {{ }} as literal braces. The strike action
+composes an event-log line with fmt + upper (read back with `!log 2`), and
+the helpers are read-only, so they work in an inline $() argument (`split`
+gives 3 items, so `!dist` measures from (3,1)).
+
+
+SCENARIO 679 — fmt can't reach into objects; text helpers are size-bounded
+---------------------------------------------------------------------------
+
+!match new s679 StringSafety 8 8
+!match use s679
+!eval "fmt('{0.__class__}', 'x')"
+?? isn't a field
+!eval "fmt('{0[0]}', 'x')"
+?? isn't a field
+!eval "fmt('{0:>999999}', 'x')"
+?? unsupported format spec
+!eval "fmt('{', 1)"
+?? unmatched brace
+!eval "fmt('{1}', 'x')"
+?? has no argument
+!eval "replace('a' * 50000, 'a', 'aaaaaaaaaa')"
+?? over the formula_size_limit
+!eval "upper(5)"
+?? must be text
+!eval "split('abc', '')"
+?? sep can't be empty
+
+Expected: HARNESS-ALLOWS-ERRORS. `fmt` parses its own fields: Python's
+str.format would resolve {0.__class__} or {0[0]} by reaching into the
+argument's attributes, so only plain numbers and names are fields, and a
+format spec is limited to alignment, sign, a width of at most three digits,
+a precision and a type letter. `replace`, `join` and `fmt` size their result
+before building it and refuse one over formula_size_limit (500000 characters
+here would be built from a 50000-character input). Wrong argument types read
+as clean errors.
+
+
+SCENARIO 680 — coordinate rulers on the ASCII map (multi-tile, viewport)
+-------------------------------------------------------------------------
+
+!match new s680 Rulers 12 11
+!match use s680
+!ent add a A 10 2 3 5
+!ent set_var a footprint_w 2
+!ent add b B 10 11 10 5
+!map
+?? 1 1 1
+?? 1 2 3 4 5 6 7 8 9 0 1 2
+?? 3 . > > .
+?? 10 . . . . . . . . . . ^ .
+!map coords=off
+?! 1 2 3 4
+!map coords off
+!map
+?! 1 2 3 4
+!map coords
+?? OFF for **Rulers** (this match's setting)
+!map coords clear
+!system set default viewport_mode on
+!system set default viewport_width 5
+!system set default viewport_height 4
+!map center b
+?? 8 9 0 1 2
+?? 10 . . . ^ .
+!map scene
+?? coords=on
+!as player bob
+!map coords off
+?? needs host approval
+!as host
+!deny r1
+!map coords=maybe
+?? use coords=on or coords=off
+!system set default viewport_mode auto
+!system set default viewport_width 30
+!system set default viewport_height 30
+
+Expected: HARNESS-ALLOWS-ERRORS. Maps carry coordinate rulers by default (the
+map_coords rule). Column numbers are stacked: the tens digits on the first
+line and the ones digits under them, so column 12 reads 1 over 2 and every
+cell stays one character wide. Row numbers sit in a left margin sized to the
+largest row. The 2×1 unit at (2,3) shows on row 3 in columns 2 and 3. `coords=off`
+drops the rulers for one render, `!map coords off` for this match, and `clear`
+returns to the rule. Through a 5×4 viewport centered on b, the rulers number
+the window's own columns (8-12) and rows (8-11). The graphics model carries the
+flag (`coords=on` in `!map scene`). Changing the setting is host-gated like the
+other `!map` settings, so a player's request queues.
+
+
+SCENARIO 681 — a function can't be stored in a var; saves are all-or-nothing
+-----------------------------------------------------------------------------
+
+!match new s681 NoFunctions 8 8
+!match use s681
+!ent add a A 10 1 1 5
+!eval "entity[a].f = min"
+?? Can't store a function
+!eval "match_var_set('g', [max, 1])"
+?? Can't store a function
+!eval "team_set('red', 'h', {'k': abs})"
+?? Can't store a function
+!store save fn681.json
+?? Saved to `saves/fn681.json`
+!ent dump a
+?! 💥
+
+Expected: HARNESS-ALLOWS-ERRORS. A function name used as a value (`min`,
+`max`) used to be stored as-is: the match could no longer be saved (the
+failure named the host's absolute file path) and `!ent dump` crashed. Every
+store (unit vars, match vars, team data, tiles, zones, statuses) now takes
+only numbers, text, true/false, None, lists and dicts. Saves and history
+exports are also built in full before the file is touched, then moved into
+place, so a failure can't truncate the previous save.
+
+
+SCENARIO 682 — a mounted rider's transform re-checks its slot (multi-tile)
+---------------------------------------------------------------------------
+
+!match new s682 RiderForm 10 10
+!match use s682
+!ent add cart Cart 30 3 3 5
+!ent set_var cart footprint_w 2
+!ent set_var cart footprint_h 2
+!ent set_var cart slots.seat.capacity 2
+!ent set_var cart slots.seat.condition "entity[self].size <= 1"
+!ent set_var cart slots.seat.cost "entity[self].size"
+!ent add rat Rat 5 8 8 5
+!ent set_var rat size 1
+!mount rat cart seat
+!ent set_var rat forms.ogre.name Ogre
+!ent set_var rat forms.ogre.vars.hp 20
+!ent set_var rat forms.ogre.vars.size 3
+!ent set_var rat forms.ogre.vars.footprint_w 2
+!ent set_var rat forms.ogre.vars.footprint_h 2
+!ent transform rat forms.ogre old
+?? can't stay in slot 'seat' of `cart`
+!assert "is_mounted('rat') and not var_has('rat', 'old')" "block changed nothing"
+!system set default transform_rider_mismatch_mode eject
+!ent transform rat forms.ogre old
+?? it dismounts to
+!assert "not is_mounted('rat') and footprint_width('rat') == 2"
+!assert "not occupies('cart', entity[rat].x, entity[rat].y)" "the 2x2 body landed clear of the cart"
+!ent revert rat old
+!mount rat cart seat
+!assert "is_mounted('rat')"
+!system set default transform_rider_mismatch_mode block
+
+Expected: HARNESS-ALLOWS-ERRORS. A transform used to re-check only the
+vehicle side (its slots). Now a mounted rider's new form is held to its
+slot's `condition` and capacity too, under the same
+transform_rider_mismatch_mode rule. With `block` the ogre form (size 3)
+can't stay in the seat, so the transform is refused and nothing changes.
+With `eject` the drop cell is picked for the NEW 2×2 body before anything
+changes, and the rider dismounts right after the swap. Reverted to the rat,
+it can mount again.
+
+
+SCENARIO 683 — status_transfer keeps the moved instance's own fields
+---------------------------------------------------------------------
+
+!match new s683 TransferData 10 10
+!match use s683
+!ent add a A 20 1 1 5
+!ent add b B 20 3 3 5
+!ent add c C 20 5 5 5
+!status def mark
+!status data mark caster none
+!status apply a mark 2 4
+!ent status a set mark caster hunter
+!ent status a set mark notes.hits 3
+!status transfer a b mark
+!assert "status_get('b', 'mark', 'caster') == 'hunter' and status_get('b', 'mark', 'notes.hits') == 3"
+!assert "status_get('b', 'mark', 'level') == 2 and status_get('b', 'mark', 'duration') == 4"
+!status apply c mark
+!ent status c set mark caster other
+!status transfer b c mark
+!assert "status_get('c', 'mark', 'caster') == 'other' and status_get('c', 'mark', 'duration') == 4"
+
+Expected: A transferred status keeps every field of the moved instance
+(caster, notes): it used to re-seed them from the definition, losing
+`caster = hunter`. Level and duration still go through the destination's
+stacking, resistance and immunity. Onto a destination that already has the
+status, only the stacking applies (the default refresh sets duration 4) and
+the destination's own data stays (`caster = other`).
+
+
+SCENARIO 684 — !ent set_vars: several vars, one undo step, all-or-nothing
+--------------------------------------------------------------------------
+
+!match new s684 SetVars 10 10
+!match use s684
+!ent add a A 20 1 1 5
+!ent add b B 20 5 5 5
+!ent set_vars a mana=5 note="hello world" inventory.gold=12 lvl=$(entity[self].hp+1)
+?? `a` vars: mana = 5, note = 'hello world', inventory.gold = 12, lvl = 21
+!ent set_vars a mana=9 hp=abc
+?? Nothing was set
+!assert "var_get('a', 'mana') == 5"
+!ent set_vars a mana=1 mana=2
+?? `mana` is given twice
+!ent set_vars a mana
+?? Unexpected `mana`
+!ent set_vars a footprint_w=2 footprint_h=2 mana=7
+!ent set_vars a footprint_w=5 footprint_h=5
+?? (5,5) is taken by `b`
+!assert "var_get('a', 'mana') == 7 and footprint_width('a') == 2 and footprint_height('a') == 2" "the width written first was rolled back too"
+!ent group new g
+!ent group add g a b
+!ent set_vars group:g tag=x
+!find tag=x count
+?? 2
+!undo command 1 confirm
+!find tag=x count
+?? 0
+
+Expected: HARNESS-ALLOWS-ERRORS. `!ent set_vars` writes several vars in the
+order given, in one command and one undo step. A value may be quoted (spaces)
+or a $() formula read with self = the unit. If any write is refused (hp set to
+text, a footprint that would cover b), the match rolls back and the reply says
+nothing was set. A key given twice, or a word that isn't key=value, is
+refused. It accepts a group target, and one undo reverts the whole group write.
