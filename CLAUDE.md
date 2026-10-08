@@ -4468,6 +4468,72 @@ More shipped work (continuing the list above):
     the previous save, and the error names only `saves/<name>`.
   - The `!map scene` summary shows `coords=on|off`.
 
+- **Container reads, flanking, nearest_cell, visible_entities, `!batch
+  strict`, selector `!` / `|` — SHIPPED (scenarios 685-695).** Ideas #99,
+  #100, #102, #103, #106, #109, #110 from the 2026-10 small list. #101
+  (random_cell / random_free_cell) is deferred: the user wants to decide
+  later whether a multi-tile unit's whole body or only its anchor must lie in
+  the area.
+  - **`get(container, key[, default])` (685-686).** Subscripts are banned, so a
+    list or dict held in a local or read with var_get couldn't be read one
+    element at a time. `key` is a dict key, a list index (-1 = last) or a
+    dotted path ('a.1.b'; user call); a number key reads a dict's text key (dict
+    keys are text since pass-35). Missing → default, else an error (like
+    var_get). Pure `_ALLOWED_FUNCS`.
+  - **`keys(dict)` / `values(dict)` / `index_of(list, value)` /
+    `unique(list)`.** keys / values in insertion order; index_of returns None
+    when absent (user call: -1 would read as the last item in get); unique keeps
+    first positions, compares with == (lists / dicts by content via JSON).
+    keys / values / unique are loopable. Pure.
+  - **Flanking (687-688; user call: both variants + a mode rule).**
+    `flanking_angle(target, a, b[, min_angle])`: seen from the target's body
+    centre, the bearings to a's and b's body centres are at least
+    `flanking_min_angle` (rule, default 135, 0-180) apart; for a multi-tile
+    target the bearings are scaled by its half-extents like side_hit (the
+    side_hit_hitbox_mode rule). `flanking_line(target, a, b)`: the D&D rule —
+    the segment between a's and b's centres crosses the target's body through
+    two OPPOSITE sides or corners (exact: doubled coordinates + Fractions,
+    Liang-Barsky clip, then the entry/exit sides compared). A line clipping one
+    corner or touching one point doesn't flank. `flanking(target, a, b[,
+    mode])` uses the `flanking_mode` rule (angle default | line). A unit paired
+    with itself or the target never flanks; range is the GM's own check.
+  - **`nearest_cell(eid, x, y | coord | other_eid)` (689)** — the unit's body
+    cell nearest the point (or any cell of another body), by straight-line
+    distance, ties to the first cell row by row. Where a big body's breath /
+    shot starts.
+  - **`visible_entities(eid[, relation])` (690-691)** — loopable ids the unit
+    sees now, nearest first then id: some cell of the other body within its
+    vision radius with LOS from some cell of its own body (fog toggles
+    ignored, like can_see), MINUS units `entity_visibility_condition` hides
+    from the viewer's team (user call), except its own team's units
+    (pov_own_team_visible). A viewer with no team skips the stealth rule. Same
+    skip surface as entities_within (glued parts, hidden riders). Core:
+    `Match.unit_sees_unit(viewer, other, budget)`. Every sight line walked is
+    charged against formula_cell_limit for the whole call: a 40×40 viewer and
+    25 unseen 20×20 bodies used to walk ~40M lines (minutes); now a clean
+    error in under a second.
+  - **`!batch strict ...` (692-693; user call: stop AND undo).** The first
+    line whose reply has a line starting with ❌ (or a failed `!assert`) stops
+    the batch and undoes the lines before it: every match is restored in place
+    with `_rollback_match` (undo history kept), matches the batch created are
+    removed, a deleted one comes back from its snapshot (without its undo
+    history), channel pointers are restored, and rules are re-copied from the
+    systems. Bot-wide settings a line changed (`!system`, `!defvar`, ...) are
+    NOT undone. Detection wraps the ctx in `_ErrorWatchCtx` (sends pass
+    through; attribute writes reach the real ctx, so `!as` lines work); a
+    nested strict batch's ❌ reaches the outer one too. A rolled-back strict
+    batch leaves no undo step.
+  - **Selector `!` / `|` in `!find` / `!foreach` (694-695).** A leading `!`
+    negates the whole word (`!status:stunned`; `!team=red` also matches a unit
+    with no team, `team!=red` needs one); `|` separates alternatives, any of
+    which may match. An alternative that doesn't parse as a predicate reuses
+    the previous one's kind and key (user call): `team=red|green`,
+    `status:burn|poison`, `near:a:1|d:0`. `!` inside a word, an empty
+    alternative or a bare `!` is refused. `_parse_find_selector` →
+    `(negated, alternatives)`; `_find_match_entity` takes those groups,
+    `_find_all_preds` is the old single-predicate body. The POV filter runs
+    first, so a negated selector can't surface a hidden unit.
+
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
 and explain the "why").

@@ -385,6 +385,7 @@ import ast
 import copy
 import math
 import itertools
+import json
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -1803,6 +1804,115 @@ def _count(v: Any, value: Any) -> int:
     return sum(1 for x in _list_arg(v, "count") if x == value)
 
 
+# ---- container reads -----------------------------------------------------
+# Subscripts are banned, so a list or dict held in a local (or read with
+# var_get) could be looped over but no single element read out of it. These
+# fill that gap. All pure; none can grow data beyond its input.
+_GET_MISSING = object()
+
+
+def _get_step(cur: Any, seg: Any, where: str) -> Tuple[bool, Any]:
+    """One step of get(): (found, value). A dict is read by key (keys are
+    text, so 3 reads key '3'); a list by a whole-number index, negative
+    counting from the end."""
+    if isinstance(cur, dict):
+        k = seg if isinstance(seg, str) else str(seg)
+        return (True, cur[k]) if k in cur else (False, None)
+    if isinstance(cur, (list, tuple)):
+        if isinstance(seg, str):
+            try:
+                seg = int(seg)
+            except ValueError:
+                raise FormulaError(
+                    f"get(...): '{where}' is a list, so the next part must be "
+                    f"a whole-number index, got '{seg}'.")
+        if not -len(cur) <= seg < len(cur):
+            return False, None
+        return True, cur[seg]
+    raise FormulaError(
+        f"get(...): '{where}' is "
+        f"{'None' if cur is None else type(cur).__name__}, not a list or dict.")
+
+
+def _get(container: Any, key: Any, default: Any = _GET_MISSING) -> Any:
+    """get(container, key[, default]): one element of a list or dict held in
+    a local or read with var_get. `key` is a dict key, a list index (-1 =
+    the last item), or a dotted path through nested data ('stats.hp',
+    'queue.0'). A missing key or an index past the end returns `default`,
+    or is an error when no default is given (like var_get)."""
+    if isinstance(key, bool) or not isinstance(key, (str, int)):
+        raise FormulaError(
+            f"get(container, key): key must be text or a whole number, got "
+            f"{'None' if key is None else type(key).__name__}.")
+    if not isinstance(container, (dict, list, tuple)):
+        raise FormulaError(
+            f"get(container, key): container must be a list or dict, got "
+            f"{'None' if container is None else type(container).__name__}.")
+    segs: List[Any] = [key] if isinstance(key, int) else key.split(".")
+    if any(s == "" for s in segs):
+        raise FormulaError(
+            f"get(container, key): '{key}' has an empty part.")
+    cur, walked = container, "the container"
+    for seg in segs:
+        found, cur = _get_step(cur, seg, walked)
+        if not found:
+            if default is not _GET_MISSING:
+                return default
+            raise FormulaError(f"get(...): '{key}' not found ('{seg}' is "
+                               f"missing).")
+        walked = str(seg) if walked == "the container" else f"{walked}.{seg}"
+    return cur
+
+
+def _dict_arg(v: Any, fname: str) -> dict:
+    if isinstance(v, dict):
+        return v
+    raise FormulaError(
+        f"{fname}(dict): expected a dict, got "
+        f"{'None' if v is None else type(v).__name__}.")
+
+
+def _keys(v: Any) -> list:
+    """keys(dict): a dict's keys, in insertion order (each() over a dict
+    gives the same list)."""
+    return list(_dict_arg(v, "keys").keys())
+
+
+def _values(v: Any) -> list:
+    """values(dict): a dict's values, in the same order as keys()."""
+    return list(_dict_arg(v, "values").values())
+
+
+def _index_of(v: Any, value: Any) -> Any:
+    """index_of(list, value): the index of the first item equal to `value`,
+    or None when there is none (-1 would read as the last item in get)."""
+    for i, x in enumerate(_list_arg(v, "index_of")):
+        if x == value:
+            return i
+    return None
+
+
+def _unique(v: Any) -> list:
+    """unique(list): the list without repeats, keeping each item's first
+    position. Items compare with ==, so 1 and 1.0 count as one; equal lists
+    and dicts are repeats too."""
+    seen_h: set = set()
+    seen_u: set = set()
+    out = []
+    for x in _list_arg(v, "unique"):
+        try:
+            if x in seen_h:
+                continue
+            seen_h.add(x)
+        except TypeError:          # a list / dict item: compare by content
+            k = json.dumps(x, sort_keys=True, default=str)
+            if k in seen_u:
+                continue
+            seen_u.add(k)
+        out.append(x)
+    return out
+
+
 # ---- string helpers ------------------------------------------------------
 # Method calls are banned in formulas ('abc'.upper() is rejected), so text is
 # handled through these functions. All are pure; the ones that can grow text
@@ -1993,6 +2103,11 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
     "any": _any,
     "all": _all,
     "count": _count,
+    "get": _get,
+    "keys": _keys,
+    "values": _values,
+    "index_of": _index_of,
+    "unique": _unique,
     "upper": _upper,
     "lower": _lower,
     "strip": _strip,
@@ -2396,6 +2511,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # zone_distance: body-to-nearest-zone-cell gap; entities_at: every unit
     # covering a cell (stackable ones included).
     "zone_distance", "entities_at",
+    "flanking", "flanking_angle", "flanking_line", "nearest_cell",
+    "visible_entities",
     # Footprint / large-entity primitives. A large entity occupies a W×H
     # rectangle anchored at its top-left cell (entity[X].x / .y); these
     # expose that footprint to formulas.
@@ -2462,6 +2579,8 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
 # never silently expose a function in $() args. When unsure, classify a
 # function as MUTATING (leave it out of this set).
 ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
+    'flanking', 'flanking_angle', 'flanking_line', 'nearest_cell',
+    'visible_entities',
     'all_corpses', 'all_entities', 'aoe_origin', 'apply_mods',
     'atb_rate', 'atb_threshold', 'can_mount', 'can_see',
     'can_see_losonly', 'can_see_rangeonly', 'cell_entity',
@@ -2621,9 +2740,13 @@ _ALLOWED_NODES: Tuple[type, ...] = (
 _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "range",
     "each",
+    "keys",
+    "values",
+    "unique",
     "shuffle",
     "team_members",
     "entities_at",
+    "visible_entities",
     "entities_within",
     "chain_targets",
     "group_members",
@@ -7245,6 +7368,162 @@ class FormulaEngine:
 
         ns["zone_distance"] = _zone_distance
         ns["entities_at"] = _entities_at
+
+        # ---- flanking / nearest body cell / sight list -------------------
+        def _body_center2(e) -> Tuple[int, int]:
+            """A unit's body centre in DOUBLED cell coordinates (whole
+            numbers even for an even-sized body)."""
+            w, h = match.entity_footprint(e)
+            return 2 * e.x + (w - 1), 2 * e.y + (h - 1)
+
+        def _flank_units(fname: str, target_t: Any, a_t: Any, b_t: Any):
+            _, t = _resolve_entity(target_t, fname)
+            _, ea = _resolve_entity(a_t, fname)
+            _, eb = _resolve_entity(b_t, fname)
+            return t, ea, eb
+
+        def _flanking_angle(target_t: Any, a_t: Any, b_t: Any,
+                            min_angle: Any = None) -> bool:
+            """flanking_angle(target, a, b, min_angle=None): whether a and b
+            flank the target by ANGLE — seen from the centre of the target's
+            body, the bearings to the centres of a's and b's bodies are at
+            least min_angle degrees apart (default the flanking_min_angle
+            rule; 180 = exactly opposite). For a multi-tile target the
+            bearings are corrected for its shape like side_hit (the
+            side_hit_hitbox_mode rule). Range is not checked."""
+            t, ea, eb = _flank_units("flanking_angle", target_t, a_t, b_t)
+            if min_angle is None:
+                min_angle = match.rules.get("flanking_min_angle", 135)
+            if isinstance(min_angle, bool) or not isinstance(
+                    min_angle, (int, float)) or not 0 <= min_angle <= 180:
+                raise FormulaError(
+                    "flanking_angle(...): min_angle must be a number from 0 "
+                    "to 180.")
+            if ea.id == eb.id or t.id in (ea.id, eb.id):
+                return False
+            tcx, tcy = _body_center2(t)
+            w, h = match.entity_footprint(t)
+            box = _hitbox_mode(None) == "box"
+            bearings = []
+            for e in (ea, eb):
+                ex, ey = _body_center2(e)
+                dx, dy = float(ex - tcx), float(ey - tcy)
+                if box:
+                    dx, dy = dx / w, dy / h
+                if dx == 0 and dy == 0:
+                    return False          # an attacker at the target's centre
+                bearings.append(math.degrees(math.atan2(dy, dx)))
+            diff = abs(bearings[0] - bearings[1]) % 360
+            diff = min(diff, 360 - diff)
+            return diff >= float(min_angle) - 1e-9
+
+        def _flanking_line(target_t: Any, a_t: Any, b_t: Any) -> bool:
+            """flanking_line(target, a, b): whether a and b flank the target
+            by LINE — the straight line between the centres of a's and b's
+            bodies crosses the target's body through two OPPOSITE sides
+            (or opposite corners), the D&D rule. A line that only clips one
+            corner, or touches a single point, doesn't flank. Range is not
+            checked."""
+            from fractions import Fraction
+            t, ea, eb = _flank_units("flanking_line", target_t, a_t, b_t)
+            if ea.id == eb.id or t.id in (ea.id, eb.id):
+                return False
+            w, h = match.entity_footprint(t)
+            # Doubled coordinates: cell centres are even, cell edges odd.
+            xmin, xmax = 2 * t.x - 1, 2 * (t.x + w) - 1
+            ymin, ymax = 2 * t.y - 1, 2 * (t.y + h) - 1
+            (ax, ay), (bx, by) = _body_center2(ea), _body_center2(eb)
+            for px, py in ((ax, ay), (bx, by)):
+                if xmin < px < xmax and ymin < py < ymax:
+                    return False          # an attacker inside the body
+            dx, dy = bx - ax, by - ay
+            t0, t1 = Fraction(0), Fraction(1)
+            for p, q in ((-dx, ax - xmin), (dx, xmax - ax),
+                         (-dy, ay - ymin), (dy, ymax - ay)):
+                if p == 0:
+                    if q < 0:
+                        return False      # parallel and outside
+                    continue
+                r = Fraction(q, p)
+                if p < 0:
+                    t0 = max(t0, r)
+                else:
+                    t1 = min(t1, r)
+            if t0 > t1:
+                return False
+
+            def sides(tt):
+                px, py = ax + tt * dx, ay + tt * dy
+                return {s for s, on in (("l", px == xmin), ("r", px == xmax),
+                                        ("t", py == ymin), ("b", py == ymax))
+                        if on}
+            s0, s1 = sides(t0), sides(t1)
+            return (("l" in s0 and "r" in s1) or ("r" in s0 and "l" in s1)
+                    or ("t" in s0 and "b" in s1) or ("b" in s0 and "t" in s1))
+
+        def _flanking(target_t: Any, a_t: Any, b_t: Any,
+                      mode: Any = None) -> bool:
+            """flanking(target, a, b, mode=None): whether a and b flank the
+            target, by the flanking_mode rule ('angle' or 'line') unless
+            `mode` names one — see flanking_angle and flanking_line."""
+            mode_s = str(mode if mode is not None
+                         else match.rules.get("flanking_mode", "angle"))
+            if mode_s == "angle":
+                return _flanking_angle(target_t, a_t, b_t)
+            if mode_s == "line":
+                return _flanking_line(target_t, a_t, b_t)
+            raise FormulaError("flanking(...): mode must be 'angle' or 'line'.")
+
+        def _nearest_cell(eid_t: Any, a: Any, b: Any = None) -> list:
+            """nearest_cell(eid, x, y) / nearest_cell(eid, coord) /
+            nearest_cell(eid, other): the cell of the unit's body nearest the
+            point, or nearest any cell of the other unit's body, as [x, y] —
+            where a big body's breath, shot or reach starts from. Nearest is
+            the straight-line distance; a tie goes to the first cell
+            row by row from the top-left."""
+            _, e = _resolve_entity(eid_t, "nearest_cell")
+            if b is None and isinstance(a, str):
+                _, o = _resolve_entity(a, "nearest_cell")
+                targets = match.entity_cells(o)
+            elif b is None:
+                targets = [(_cell_arg(_coord_x(a), "nearest_cell", "x"),
+                            _cell_arg(_coord_y(a), "nearest_cell", "y"))]
+            else:
+                targets = [(_cell_arg(a, "nearest_cell", "x"),
+                            _cell_arg(b, "nearest_cell", "y"))]
+            best, best_d = None, None
+            for cx, cy in match.entity_cells(e):
+                d = min((cx - tx) ** 2 + (cy - ty) ** 2 for tx, ty in targets)
+                if best_d is None or d < best_d:
+                    best, best_d = [cx, cy], d
+            return best
+
+        def _visible_entities(eid_t: Any, relation: Any = "") -> list:
+            """visible_entities(eid, relation=''): ids of the units this unit
+            sees right now — some cell of their body within its vision radius
+            with a clear line from its body (range + LOS, like can_see, fog
+            toggles ignored) — leaving out units the stealth rule
+            (entity_visibility_condition, with the unit's team as pov_team)
+            hides from its team. `relation` filters like entities_within
+            (any / hostile / ally / same_team / attackable). Nearest first,
+            then by id. Loopable."""
+            eid, viewer = _resolve_entity(eid_t, "visible_entities")
+            if not isinstance(relation, str):
+                raise FormulaError(
+                    "visible_entities(...): relation must be a string.")
+            scored = []
+            budget = [cell_limit]
+            for oid, oe, _ref in _candidates(eid, relation):
+                if match.unit_sees_unit(viewer, oe, budget):
+                    scored.append((match.entity_gap_distance(viewer, oe), oid))
+            scored.sort()
+            return [oid for _, oid in scored]
+
+        ns["flanking"] = _flanking
+        ns["flanking_angle"] = _flanking_angle
+        ns["flanking_line"] = _flanking_line
+        ns["nearest_cell"] = _nearest_cell
+        ns["visible_entities"] = _visible_entities
 
         def _hit_location(target_t: Any, from_x: Any, from_y: Any,
                           aim: Any = None, aim_weight: Any = None,

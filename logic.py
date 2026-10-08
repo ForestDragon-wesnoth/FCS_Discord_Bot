@@ -1332,6 +1332,29 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "hit_location."
         ),
     },
+    "flanking_mode": {
+        "default": "angle",
+        "schema": {"type": "enum", "choices": ["angle", "line"]},
+        "desc": (
+            "What flanking(target, a, b) checks when no mode is passed. "
+            "`angle` (default): seen from the target's body centre, a and b "
+            "are at least flanking_min_angle degrees apart (flanking_angle). "
+            "`line`: the line between a's and b's centres crosses the "
+            "target's body through two opposite sides or corners, the D&D "
+            "rule (flanking_line)."
+        ),
+    },
+    "flanking_min_angle": {
+        "default": 135,
+        "schema": {"type": "int", "min": 0, "max": 180},
+        "desc": (
+            "Degrees two attackers must be apart, seen from the target's body "
+            "centre, to flank it in angle mode (flanking_angle). 180 = only "
+            "exactly opposite; 135 (default) also counts e.g. north + "
+            "south-east; 90 = any quarter turn. Bearings to a multi-tile "
+            "target are corrected for its shape (side_hit_hitbox_mode)."
+        ),
+    },
     # ---- UI / display templates ----
     # These rules drive !list and !ent info rendering — see
     # vtt_commands._entity_line / _entity_card. Template syntax:
@@ -8526,6 +8549,46 @@ class Match:
             seen.add(root.id)
             root = self.entities[root.part_of]
         return root.team is not None and str(root.team) == str(pov_team)
+
+    def unit_sees_unit(self, viewer: "Entity", other: "Entity",
+                       budget: Optional[List[int]] = None) -> bool:
+        """Whether the single unit `viewer` sees `other` right now: some cell
+        of other's body is within viewer's vision radius with a clear line
+        from some cell of viewer's body (range + LOS, ignoring the fog
+        toggles, like can_see), AND entity_visibility_condition lets
+        viewer's team see it (stealth), unless `other` is viewer's own
+        team's unit (pov_own_team_visible). A viewer with no team skips the
+        stealth rule. The query behind visible_entities.
+
+        `budget` ([cells left]) charges every sight line walked, so a call
+        over many big bodies that can't see each other (each pair of cells
+        walked) stops with an error instead of running for minutes."""
+        r = self._vision_radius_of(viewer)
+        vcells = self.entity_cells(viewer)
+        seen = False
+        for tx, ty in self.entity_cells(other):
+            for vx, vy in vcells:
+                if not self._within_vision(vx, vy, tx, ty, r):
+                    continue
+                if budget is not None:
+                    budget[0] -= abs(tx - vx) + abs(ty - vy) + 1
+                    if budget[0] < 0:
+                        raise VTTError(
+                            "visible_entities(...): the sight lines to check "
+                            "cross more cells than the formula_cell_limit "
+                            "allows (big bodies far apart).")
+                if self.has_los(viewer.id, vx, vy, tx, ty):
+                    seen = True
+                    break
+            if seen:
+                break
+        if not seen:
+            return False
+        team = viewer.team
+        if team is None or self.own_team_unit(other, str(team)):
+            return True
+        return self._visibility_visible(
+            "entity_visibility_condition", str(team), target=other.id)
 
     def entity_visible_to(self, eid: str, pov_team: Optional[str]) -> bool:
         """Whether entity `eid` is visible to a viewer whose POV is

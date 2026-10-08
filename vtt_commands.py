@@ -6088,8 +6088,55 @@ def _coerce_for_compare(s: str) -> Any:
     return s
 
 
-def _find_match_entity(m: Match, e: Entity, predicates: List[Tuple[str, str, Optional[str]]],
+def _parse_find_selector(token: str) -> Tuple[bool, List[Tuple[str, str, Optional[str]]]]:
+    """One `!find` / `!foreach` selector word -> (negated, alternatives).
+    A leading `!` negates the whole word; `|` separates alternatives, any
+    of which may match. An alternative that isn't a predicate on its own
+    reuses the previous one's kind and key: `team=red|green` is
+    `team=red|team=green`, `status:burn|poison` is
+    `status:burn|status:poison`, `near:boss:3|imp:2` is two near: tests."""
+    neg = token.startswith("!")
+    body = token[1:] if neg else token
+    if not body:
+        raise VTTError("`!` needs a predicate after it (`!status:stunned`).")
+    alts: List[Tuple[str, str, Optional[str]]] = []
+    for raw in body.split("|"):
+        if not raw:
+            raise VTTError(f"`{token}` has an empty alternative around `|`.")
+        if raw.startswith("!"):
+            raise VTTError(
+                f"`{token}`: put `!` at the start of the whole word; it "
+                f"negates every alternative together.")
+        try:
+            alts.append(_parse_find_predicate(raw))
+            continue
+        except VTTError:
+            if not alts:
+                raise
+        kind, key, _val = alts[-1]
+        if kind in ("status", "group", "action"):
+            alts.append((kind, raw, None))
+        elif kind == "near":
+            alts.append(_parse_find_predicate("near:" + raw))
+        elif kind == "within":
+            alts.append(_parse_find_predicate("within:" + raw))
+        else:
+            alts.append((kind, key, raw))
+    return neg, alts
+
+
+def _find_match_entity(m: Match, e: Entity, selectors: List[Tuple[bool, List[Tuple[str, str, Optional[str]]]]],
                        pov: Optional[str] = None) -> bool:
+    """Return True iff every selector word matches `e`: some alternative
+    of the word matches, flipped when the word is negated."""
+    for neg, alts in selectors:
+        if any(_find_all_preds(m, e, [p], pov) for p in alts) == neg:
+            return False
+    return True
+
+
+def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Optional[str]]],
+                    pov: Optional[str] = None) -> bool:
     """Return True iff every predicate matches `e`. Predicates short-
     circuit on the first failure."""
     for kind, key, val in predicates:
@@ -6178,7 +6225,13 @@ def _find_match_entity(m: Match, e: Entity, predicates: List[Tuple[str, str, Opt
     "find", access="all",
     usage="!find <predicate> [<predicate> ...] [show:<csv>] [sort:<var>] [count|ids]",
     desc=(
-        "Query entities by AND-ed predicates. Predicate forms: "
+        "Query entities by AND-ed predicates. A leading `!` negates a "
+        "predicate (`!status:stunned`; `!team=red` also matches units with no "
+        "team, `team!=red` needs one) and `|` gives alternatives, any of which "
+        "may match (`team=red|team=green`); an alternative that isn't a "
+        "predicate on its own reuses the previous one's key: `team=red|green`, "
+        "`status:burn|poison`. `!` covers the whole word: `!team=red|green` = "
+        "on neither team. Predicate forms: "
         "`var=value`, `var!=value`, `var<value`, `var<=value`, "
         "`var>value`, `var>=value` for vars; `status:NAME` for a status "
         "flag; `group:NAME` for group membership; `action:NAME` for "
@@ -6231,7 +6284,7 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         else:
             pred_tokens.append(t)
     try:
-        predicates = [_parse_find_predicate(t) for t in pred_tokens]
+        predicates = [_parse_find_selector(t) for t in pred_tokens]
         pov = _query_pov(ctx, m)
         hits = [e for e in m.entities_in_turn_order()
                 if not _pov_hides(m, pov, e.id)
@@ -6693,7 +6746,7 @@ async def foreach_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send("❌ foreach command is empty (nothing after `;`).")
     m = active_match(mgr, ctx)
     try:
-        predicates = [_parse_find_predicate(t) for t in sel_tokens]
+        predicates = [_parse_find_selector(t) for t in sel_tokens]
         # A non-host's sweep (only reachable when every inner command is
         # read-only) sees what `!find` would: $id/$x/$y would otherwise hand
         # out hidden units' positions. A host's sweep acts on the real board.
@@ -11489,10 +11542,71 @@ def _split_batch(args: List[str], sep: str = ";") -> List[List[str]]:
     return parts
 
 
+class _ErrorWatchCtx:
+    """A reply context that passes everything through to `inner` and notes
+    whether any reply had a line starting with ❌ — how `!batch strict`
+    tells that a line failed (handlers report most refusals with a ❌ reply
+    rather than an exception). Attribute writes (`!as host`, `!as view`)
+    reach the real context."""
+
+    def __init__(self, inner: Any):
+        object.__setattr__(self, "_inner", inner)
+        object.__setattr__(self, "error_seen", False)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(object.__getattribute__(self, "_inner"), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "error_seen":
+            object.__setattr__(self, name, value)
+        else:
+            setattr(object.__getattribute__(self, "_inner"), name, value)
+
+    async def send(self, message: str, *a: Any, **k: Any) -> Any:
+        if isinstance(message, str) and any(
+                ln.lstrip().startswith("❌") for ln in message.split("\n")):
+            object.__setattr__(self, "error_seen", True)
+        return await object.__getattribute__(self, "_inner").send(
+            message, *a, **k)
+
+
+def _snapshot_all_matches(mgr: MatchManager) -> Dict[str, Any]:
+    """Everything `!batch strict` restores on a failure: every match's state
+    (a line may move a unit to another match) and the channel pointers."""
+    return {
+        "matches": {mid: m.to_dict(include_history=False)
+                    for mid, m in mgr.matches.items()},
+        "active": dict(mgr.active_by_channel),
+    }
+
+
+def _restore_all_matches(mgr: MatchManager, snap: Dict[str, Any]) -> None:
+    """Undo `!batch strict`'s lines: matches the batch created go, the
+    others go back to their state before it (in place, keeping their undo
+    history, like an action rollback), and channel pointers are restored."""
+    from action import _rollback_match
+    pre = snap["matches"]
+    for mid in [mid for mid in mgr.matches if mid not in pre]:
+        del mgr.matches[mid]
+    for mid, state in pre.items():
+        m = mgr.matches.get(mid)
+        if m is None:
+            m = Match.from_dict(copy.deepcopy(state))
+            mgr.matches[mid] = m
+        elif m.to_dict(include_history=False) != state:
+            _rollback_match(m, mgr, state)
+        # Rules are a copy of the match's system, which isn't rolled back
+        # (as in an undo, see _restore_snapshot).
+        if m.system_name in mgr.systems:
+            m.rules = mgr._build_rules_dict(mgr.systems[m.system_name])
+    mgr.active_by_channel.clear()
+    mgr.active_by_channel.update(snap["active"])
+
+
 @registry.command(
     "batch",
     raw_args=True,
-    usage="!batch <cmd1> <args...> ; <cmd2> <args...> ; ...",
+    usage="!batch [strict] <cmd1> <args...> ; <cmd2> <args...> ; ...",
     desc=(
         "Run multiple commands as a single undo unit. The whole batch "
         "produces one history entry, so one `!history undo command` "
@@ -11501,14 +11615,19 @@ def _split_batch(args: List[str], sep: str = ";") -> List[List[str]]:
         "`\";\"`). If a subcommand fails with an `❌ ...` error the "
         "batch continues with the next subcommand — the rollback is "
         "still one-shot because the outer snapshot was taken before "
-        "any of them ran."
+        "any of them ran. `!batch strict ...` is all-or-nothing: the first "
+        "line whose reply carries a ❌ stops the batch and undoes the lines "
+        "before it (every match goes back to how it was, matches the batch "
+        "created are removed, channels point where they did). Bot-wide "
+        "settings a line changed (`!system`, `!defvar`, ...) are not undone."
     ),
 )
 async def batch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
         title, body = registry.help_for(["batch"])
         return await ctx.send(f"**{title}**\n{body}")
-    parts = _split_batch(args)
+    strict = args[0] == "strict"
+    parts = _split_batch(args[1:] if strict else args)
     if not parts:
         return await ctx.send(
             "❌ batch is empty — provide at least one subcommand."
@@ -11516,14 +11635,35 @@ async def batch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # We rely on the outer dispatcher's snapshot for undo, so subcommands
     # use dispatch_no_snapshot. We surface a brief header so the GM can
     # tell the responses apart from a normal single-command reply.
-    await ctx.send(f"Running batch of {len(parts)} command(s)...")
+    await ctx.send(f"Running {'strict ' if strict else ''}batch of "
+                   f"{len(parts)} command(s)...")
+    if not strict:
+        for i, sub in enumerate(parts):
+            if not sub:
+                continue
+            if await registry.dispatch_no_snapshot(sub[0], sub[1:], ctx, mgr) \
+                    == ASSERT_STOP:
+                return await _stop_after_assert(
+                    ctx, "batch", sum(1 for p in parts[i + 1:] if p))
+        return
+    snap = _snapshot_all_matches(mgr)
+    watch = _ErrorWatchCtx(ctx)
     for i, sub in enumerate(parts):
-        if not sub:
-            continue
-        if await registry.dispatch_no_snapshot(sub[0], sub[1:], ctx, mgr) \
-                == ASSERT_STOP:
-            return await _stop_after_assert(
-                ctx, "batch", sum(1 for p in parts[i + 1:] if p))
+        result = await registry.dispatch_no_snapshot(sub[0], sub[1:], watch, mgr)
+        if watch.error_seen or result == ASSERT_STOP:
+            _restore_all_matches(mgr, snap)
+            # The output a rolled-back line queued for the end of the
+            # command describes changes that no longer happened.
+            sink = FORMULA_LOG_SINK.get()
+            if sink is not None:
+                sink.clear()
+            skipped = len(parts) - i - 1
+            await ctx.send(
+                f"⏹ strict batch stopped at line {i + 1} (`{sub[0]}`): it "
+                f"failed, so the {i} line(s) before it were undone"
+                + (f" and {skipped} line(s) were not run." if skipped
+                   else "."))
+            return ASSERT_STOP if result == ASSERT_STOP else None
 
 
 # -- !run --------------------------------------------------------------------

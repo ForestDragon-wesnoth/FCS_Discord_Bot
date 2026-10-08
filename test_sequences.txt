@@ -18729,3 +18729,366 @@ or a $() formula read with self = the unit. If any write is refused (hp set to
 text, a footprint that would cover b), the match rolls back and the reply says
 nothing was set. A key given twice, or a word that isn't key=value, is
 refused. It accepts a group target, and one undo reverts the whole group write.
+
+SCENARIO 685 — get / keys / values / index_of / unique on lists and dicts
+-------------------------------------------------------------------------
+
+!match new s685 Containers 10 10
+!match use s685
+!ent add hero Hero 20 1 1 5
+!ent set_var hero inventory.sword.dmg 5
+!ent set_var hero inventory.bow.dmg 3
+!assert "get(var_get('hero', 'inventory'), 'sword.dmg') == 5"
+!assert "get([10, 20, 30], -1) == 30 and get([10, 20, 30], 0) == 10"
+!assert "get({'a': [1, {'b': 7}]}, 'a.1.b') == 7"
+!assert "get([1, 2], 5, 'none') == 'none' and get({'x': 1}, 'y', 0) == 0"
+!assert "get({'3': 'three'}, 3) == 'three'" a number key reads the text key
+!assert "keys(var_get('hero', 'inventory')) == ['sword', 'bow']"
+!assert "values({'x': 1, 'y': 2}) == [1, 2]"
+!assert "index_of([3, 4, 5], 5) == 2 and index_of([3, 4, 5], 9) == None"
+!assert "unique([1, 2, 1, 'x', 'x', [1], [1]]) == [1, 2, 'x', [1]]"
+!eval "get([1, 2], 5)"
+?? ❌ get(...): '5' not found
+!eval "get({'a': [1]}, 'a.x')"
+?? must be a whole-number index
+!eval "get(5, 'a')"
+?? container must be a list or dict
+!eval "keys([1])"
+?? keys(dict): expected a dict
+!dist "$(get([4, 9], 0))" 1 1 1
+?? (4,1) → (1,1): **3**
+
+Expected: HARNESS-ALLOWS-ERRORS. `get` reads one element of a list or dict:
+a dict key, a list index (-1 = the last), or a dotted path through nested
+data ('a.1.b'). A missing key returns the default when one is given and is
+an error otherwise; a word that isn't an index where a list is reached, or a
+container that is a number, is an error. `keys` / `values` give a dict's
+keys and values in insertion order, `index_of` the first matching index or
+None, `unique` the list without repeats (equal lists count as repeats). All
+are read-only, so they work in an inline $() argument.
+
+SCENARIO 686 — container helpers in an action: total an inventory, drop repeats
+--------------------------------------------------------------------------------
+
+!match new s686 Loot 10 10
+!match use s686
+!ent add hero Hero 20 1 1 5
+!ent set_var hero inventory.sword.dmg 5
+!ent set_var hero inventory.bow.dmg 3
+!ent set_var hero inventory.dagger.dmg 2
+!ent set_var hero actions.tally.target none
+!ent set_var hero actions.tally.body "inv = var_get(self_id(), 'inventory')\ntotal = 0\nfor item in values(inv):\n    total = total + get(item, 'dmg', 0)\nentity[self].total_dmg = total\nnames = keys(inv)\nentity[self].first = get(names, 0)\nentity[self].last = get(names, -1)\nentity[self].bow_at = index_of(names, 'bow')\nseen = unique(['bow', 'sword', 'bow', 'dagger', 'sword'])\nentity[self].seen = len(seen)"
+!action hero tally
+!assert "entity[hero].total_dmg == 10"
+!assert "entity[hero].first == 'sword' and entity[hero].last == 'dagger'"
+!assert "entity[hero].bow_at == 1 and entity[hero].seen == 3"
+
+Expected: The tally action loops over the inventory's values (values() is
+loopable), reads each item's dmg with get(), and stores the total 10. keys()
+lists sword, bow, dagger in insertion order: get(names, 0) is sword,
+get(names, -1) is dagger, index_of finds bow at 1, and unique() leaves 3 of
+the 5 names.
+
+SCENARIO 687 — flanking: angle vs line on a 1×1 target, the flanking rules
+--------------------------------------------------------------------------
+
+!match new s687 Flank 10 10
+!match use s687
+!ent add orc Orc 20 5 5 5
+!ent add n N 10 5 4 5
+!ent add s S 10 5 6 5
+!ent add e E 10 6 5 5
+!ent add se SE 10 6 6 5
+!ent add nw NW 10 4 4 5
+!assert "flanking_angle('orc', 'n', 's') and flanking_line('orc', 'n', 's')" opposite sides
+!assert "flanking_angle('orc', 'nw', 'se') and flanking_line('orc', 'nw', 'se')" opposite corners
+!assert "flanking_angle('orc', 'n', 'se') and not flanking_line('orc', 'n', 'se')" 135 degrees apart; the line clips one corner
+!assert "not flanking_angle('orc', 'n', 'e') and not flanking_line('orc', 'n', 'e')" a quarter turn
+!assert "flanking('orc', 'n', 'se')" the default mode is angle
+!assert "not flanking('orc', 'n', 'se', 'line')"
+!system set default flanking_mode line
+!assert "not flanking('orc', 'n', 'se')"
+!system set default flanking_mode angle
+!system set default flanking_min_angle 180
+!assert "not flanking('orc', 'n', 'se') and flanking('orc', 'n', 's')"
+!assert "flanking_angle('orc', 'n', 'e', 90)" a per-call minimum
+!system set default flanking_min_angle 135
+!system set default flanking_min_angle 200
+?? ❌
+!eval "flanking('orc', 'n', 's', 'side')"
+?? mode must be 'angle' or 'line'
+!assert "not flanking('orc', 'n', 'n') and not flanking('orc', 'orc', 's')" "a unit can't flank with itself or the target"
+
+Expected: HARNESS-ALLOWS-ERRORS. North + south and the two opposite corners
+flank in both modes. North + south-east is 135° apart, so it flanks by angle
+(the 135 default) but not by line: the line between them enters the orc's
+cell through its top side and leaves through its right side, which aren't
+opposite. A quarter turn flanks in neither. flanking() follows the
+flanking_mode rule unless a mode is passed; flanking_min_angle 180 counts
+only exactly opposite pairs, and a value over 180 is refused. A unit paired
+with itself or the target never flanks.
+
+SCENARIO 688 — flanking a multi-tile target with multi-tile attackers, in an action
+----------------------------------------------------------------------------------
+
+!match new s688 FlankBig 12 12
+!match use s688
+!ent add wyrm Wyrm 40 5 5 5
+!ent set_var wyrm footprint_w 3
+!ent add a A 10 4 5 5
+!ent add b B 10 8 5 5
+!ent add top Top 10 6 4 5
+!ent add bot Bot 10 7 6 5
+!ent add ogre Ogre 20 2 9 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!assert "flanking_line('wyrm', 'a', 'b') and flanking_angle('wyrm', 'a', 'b')" the two ends of the long body
+!assert "flanking_line('wyrm', 'top', 'bot')" across the body, top side to bottom side
+!assert "not flanking('wyrm', 'a', 'top')" an end and the top
+!assert "flanking_line('wyrm', 'a', 'ogre') == False" "the ogre's centre is below-left; the line clips one corner"
+!ent set_var a actions.stab.target entity
+!ent set_var a actions.stab.body "dmg = 3\nif flanking(target, self_id(), 'b'):\n    dmg = dmg * 2\nentity[target].hp = entity[target].hp - dmg"
+!action a stab wyrm
+!assert "entity[wyrm].hp == 34" flanked with b: 6 damage
+!ent tp b 9 2
+!action a stab wyrm
+!assert "entity[wyrm].hp == 31" b moved away: 3 damage
+
+Expected: The wyrm covers (5,5)-(7,5). a at its left end and b at its right
+end flank it in both modes; top (6,4) and bot (7,6) cross it from its top
+side to its bottom side. An end and the top don't flank. The 2×2 ogre at
+(2,9)-(3,10) has its centre below-left of the body, so the line from a
+only clips a corner. a's stab doubles its damage while b flanks: 40 → 34,
+then after b moves to (9,2) only 3 more (34 → 31).
+
+SCENARIO 689 — nearest_cell: where a big body's attack starts
+-------------------------------------------------------------
+
+!match new s689 Breath 15 15
+!match use s689
+!ent add dragon Dragon 50 3 3 5
+!ent set_var dragon footprint_w 3
+!ent set_var dragon footprint_h 3
+!ent add knight Knight 20 10 4 5
+!ent add squire Squire 20 1 1 5
+!assert "nearest_cell('dragon', 10, 4) == [5, 4]" the middle of the right side
+!assert "nearest_cell('dragon', [1, 1]) == [3, 3]" a coordinate pair
+!assert "nearest_cell('dragon', 'knight') == [5, 4]" "toward another unit's body"
+!assert "nearest_cell('dragon', 'squire') == [3, 3]"
+!assert "nearest_cell('knight', 'dragon') == [10, 4]" a 1×1 unit is its own cell
+!ent set_var dragon actions.breath.target entity
+!ent set_var dragon actions.breath.body "c = nearest_cell(self_id(), target)\nfor e in entities_on_los(coord_x(c), coord_y(c), entity[target].x, entity[target].y):\n    entity[e].hp = entity[e].hp - 1\nentity[target].hp = entity[target].hp - 5\nentity[self].breath_from = c"
+!ent add page Page 20 7 4 5
+!action dragon breath knight
+!assert "entity[dragon].breath_from == [5, 4]"
+!assert "entity[knight].hp == 15 and entity[page].hp == 19" the page stands on the line from (5,4)
+
+Expected: nearest_cell returns the dragon's body cell nearest a point, a
+coordinate pair or another unit's body; (10, 4) is level with the middle
+row, so the answer is (5, 4), not a corner. The breath action starts from
+that cell: the page at (7, 4) stands between it and the knight and takes 1,
+the knight takes 5 (20 → 15).
+
+SCENARIO 690 — visible_entities: range, walls, stealth, own team, relation
+---------------------------------------------------------------------------
+
+!match new s690 Sight 20 20
+!match use s690
+!ent add scout Scout 10 5 5 5
+!ent set_var scout team red
+!ent set_var scout fog_vision_radius 4
+!ent add ally Ally 10 6 5 5
+!ent set_var ally team red
+!ent add near Near 10 7 7 5
+!ent set_var near team blue
+!ent add far Far 10 12 5 5
+!ent set_var far team blue
+!ent add behind Behind 10 5 9 5
+!ent set_var behind team blue
+!ent add ghost Ghost 10 4 4 5
+!ent set_var ghost team blue
+!ent set_var ghost invisible true
+!tile set 5 7 opaque true
+!tile set 5 8 opaque true
+!assert "visible_entities('scout') == ['ally', 'ghost', 'near']" nearest first
+!assert "visible_entities('scout', 'hostile') == ['ghost', 'near']"
+!system set default entity_visibility_condition "not var_get(self_id(), 'invisible', False)"
+!assert "visible_entities('scout', 'hostile') == ['near']" the stealth rule hides the ghost from red
+!ent set_var ally invisible true
+!assert "'ally' in visible_entities('scout')" "a team's own invisible unit still counts"
+!system set default pov_own_team_visible false
+!assert "not ('ally' in visible_entities('scout'))"
+!system set default pov_own_team_visible true
+!ent set_var scout actions.volley.target none
+!ent set_var scout actions.volley.body "for t in visible_entities(self_id(), 'hostile'):\n    entity[t].hp = entity[t].hp - 2"
+!action scout volley
+!assert "entity[near].hp == 8 and entity[ghost].hp == 10 and entity[behind].hp == 10 and entity[far].hp == 10"
+!system set default entity_visibility_condition ""
+!find "hp<10" ids
+?? near
+
+Expected: The scout (radius 4) sees ally, ghost and near, nearest first.
+far is out of range and behind is past the opaque cells at (5,7)-(5,8).
+With the stealth rule set, the invisible ghost drops out of red's list; red's
+own invisible ally stays while pov_own_team_visible is on. The volley hits
+every hostile unit the scout can see: only near (10 → 8).
+
+SCENARIO 691 — visible_entities with multi-tile viewers and targets
+-------------------------------------------------------------------
+
+!match new s691 BigSight 20 20
+!match use s691
+!ent add giant Giant 30 10 10 5
+!ent set_var giant footprint_w 2
+!ent set_var giant footprint_h 2
+!ent set_var giant fog_vision_radius 1
+!ent add x1 X1 5 13 11 5
+!ent add x2 X2 5 12 12 5
+!ent add wall Wall 30 2 3 5
+!ent set_var wall footprint_w 4
+!ent add eye Eye 5 4 6 5
+!ent set_var eye fog_vision_radius 3
+!assert "visible_entities('giant') == ['x2']" "seen from the giant's lower-right cell"
+!assert "not ('x1' in visible_entities('giant'))" two cells from its nearest cell
+!assert "visible_entities('eye') == ['wall']" "every cell of the wall is within 3 of (4, 6)"
+!tile set 4 4 opaque true
+!tile set 5 4 opaque true
+!tile set 3 4 opaque true
+!tile set 2 4 opaque true
+!assert "visible_entities('eye') == []" every line to the wall crosses the opaque row
+!system set default formula_cell_limit 10
+!eval "visible_entities('eye')"
+?? cross more cells than the formula_cell_limit allows
+!system set default formula_cell_limit 100000
+
+Expected: The 2×2 giant (radius 1) sees from every cell of its body: x2 at
+(12, 12) is one step from its lower-right cell (11, 11), x1 at (13, 11) is
+two. The eye at (4, 6) sees the 4×1 wall at (2-5, 3); once the cells
+(2-5, 4) between them are opaque, no line from the eye reaches any cell of
+the wall's body. Every sight line checked counts against formula_cell_limit:
+at 10 the same call is refused instead of walking them all.
+HARNESS-ALLOWS-ERRORS.
+
+SCENARIO 692 — !batch strict: stop at the first failing line and undo the rest
+-------------------------------------------------------------------------------
+
+!match new s692 Strict 10 10
+!match use s692
+!ent add a A 10 1 1 5
+!batch strict ent hp a 5 ; ent set_var a gold 3 ; ent tp a 99 99 ; ent hp a 1
+?? ⏹ strict batch stopped at line 3 (`ent`): it failed, so the 2 line(s) before it were undone and 1 line(s) were not run.
+!assert "entity[a].hp == 10 and not var_has('a', 'gold')"
+!batch strict ent hp a 5 ; ent set_var a gold 3
+!assert "entity[a].hp == 5 and entity[a].gold == 3"
+!batch ent hp a 7 ; ent tp a 99 99 ; ent hp a 2
+!assert "entity[a].hp == 2" a plain batch keeps going
+!batch strict ent hp a 9 ; assert "entity[a].hp == 1"
+?? the 1 line(s) before it were undone
+!assert "entity[a].hp == 2"
+!undo command 1 preview
+?? vars.hp: 2 -> 5
+!batch strict
+?? ❌ batch is empty
+
+Expected: HARNESS-ALLOWS-ERRORS. HARNESS-ALLOWS-ASSERT-FAIL. A strict batch stops at the first line that
+replies with ❌ (the off-map teleport) and undoes the lines before it, so a
+keeps hp 10 and gets no gold. A strict batch with no failure applies like a
+plain one, and a plain batch still runs every line. A failed assert also
+stops it and undoes the line before. A rolled-back strict batch leaves no
+undo step: undoing one command still goes back to before the plain batch.
+
+SCENARIO 693 — !batch strict across matches: created matches and transfers undone
+---------------------------------------------------------------------------------
+
+!match new s693 Home 10 10
+!match use s693
+!ent add a A 10 1 1 5
+!batch strict match new s693b Away 5 5 ; ent transfer a s693b 1 1 ; ent tp zz 1 1
+?? ⏹ strict batch stopped at line 3
+!match list
+?! s693b
+!list
+?? A (a)
+!match info
+?? s693
+!batch strict match new s693b Away 5 5 ; match use s693b ; ent add b B 5 1 1 ; ent hp nobody 3
+!match info
+?? s693
+?! s693b
+
+Expected: HARNESS-ALLOWS-ERRORS. The first strict batch creates match s693b
+and moves a into it, then fails on the unknown unit: s693b is removed again
+and a is back in s693. The second one switches the channel to the new match
+before failing; the rollback points the channel back at s693.
+
+SCENARIO 694 — !find negation and alternatives
+----------------------------------------------
+
+!match new s694 Select 10 10
+!match use s694
+!ent add a A 10 1 1
+!ent set_var a team red
+!ent add b B 10 2 1
+!ent set_var b team green
+!ent add c C 10 3 1
+!ent set_var c team blue
+!ent add d D 10 4 1
+!ent status a add burn
+!ent status c add poison
+!find team=red|green ids
+?? a b
+!find team=red|team=green ids
+?? a b
+!find !team=red ids
+?? b c d
+!find team!=red ids
+?? b c
+!find !team=red|green ids
+?? c d
+!find status:burn|poison ids
+?? a c
+!find !status:burn|poison ids
+?? b d
+!find near:a:1|d:0 ids
+?? a b d
+!find !status:burn team=red|blue ids
+?? c
+!find team=red| ids
+?? empty alternative
+!find team=red|!status:burn ids
+?? put `!` at the start of the whole word
+!find ! ids
+?? needs a predicate after it
+
+Expected: HARNESS-ALLOWS-ERRORS. `|` gives alternatives and a bare word after
+it reuses the previous predicate's key (team=red|green, status:burn|poison,
+near:a:1|d:0). A leading `!` negates the whole word: !team=red also matches
+d, who has no team, while team!=red needs a team. Words still AND together.
+An empty alternative, a `!` inside the word or a bare `!` is refused.
+
+SCENARIO 695 — !foreach with negated selectors; a player can't find hidden units by negation
+--------------------------------------------------------------------------------------------
+
+!match new s695 Sweep 10 10
+!match use s695
+!ent add a A 10 1 1
+!ent set_var a team red
+!ent add b B 10 2 1
+!ent set_var b team green
+!ent add c C 10 3 1
+!ent set_var c team blue
+!foreach !team=blue|red ; ent set_var $id tagged 1
+!find tagged=1 ids
+?? b
+!ent set_var c invisible true
+!system set default entity_visibility_condition "not var_get(self_id(), 'invisible', False)"
+!as view red
+!find !team=red ids
+?? b
+?! c
+!as view clear
+!system set default entity_visibility_condition ""
+
+Expected: The sweep tags every unit on neither blue nor red: b. Under red's
+view the invisible c is hidden, and a negated selector doesn't bring it
+back: !team=red lists only b.
