@@ -569,6 +569,17 @@ about things that are obviously settled (don't ask "should I
 keep the existing test passing?"), but otherwise the bar for
 asking is low. A 30-second clarification beats a 300-line refactor.
 
+### When to ask: ordering questions against the work (user directive)
+
+- **Bugfix / improvement passes:** when a pass turns up several issues and
+  only some have open questions, fix the ones with a clear solution FIRST,
+  then ask the open questions together at the end. Don't stop the pass at
+  the first question.
+- **Feature additions:** put as many implementation questions as possible
+  UPFRONT, before coding. Then build everything you're certain about. Save
+  any questions that come up during the work for near the end. Ask mid-way
+  only when the answer blocks the rest of development or testing.
+
 ---
 
 ## 7. Current state of the project (as of this handoff)
