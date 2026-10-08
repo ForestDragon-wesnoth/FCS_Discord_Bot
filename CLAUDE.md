@@ -656,7 +656,8 @@ Shipped capabilities (roughly chronological; all merged):
   `_relative_angle`, `_facing_degrees`, `_SIDE_CARDINALS`/`_SIDE_CORNERS`.
   Malformed/missing-var fails by raising (FormulaError) like other funcs.
   Verified: directional armor/weakspot (back hit > front hit) via an action.
-  FUTURE slices the user may want: configurable side NAMES (gamerule).
+  FUTURE slices the user may want: configurable side NAMES (gamerule) —
+  deferred by the user in the 2026-10 idea round ("decide later").
   (entity-shape hitboxes + LOS-aware raycast SHIPPED — see the
   "Directional/vision geometry" entry below.)
 - Action system (full body language with cmd/fail/source/target/args,
@@ -1292,7 +1293,8 @@ More shipped work (continuing the list above):
     CUSTOM glyph (a default-glyph region part yields, so it doesn't clobber the
     parent's customization); done in a second render pass. Located parts (own
     cell, no overlap) are unaffected.
-  - Per-damage-TYPE `to_main_percent`; the **armor layer** (coverage % +
+  - Per-damage-TYPE `to_main_percent` (deferred again by the user in the
+    2026-10 idea round, "decide later"); the **armor layer** (coverage % +
     directional, damage-type AR-vs-ARP mitigation); the **to-hit roll**
     (accuracy/evasion/suppression/spread, SEPARATE from hit-location); **AP/FP/
     ARC action economy + reactionary actions** (block/dodge → the reaction
@@ -1664,9 +1666,12 @@ More shipped work (continuing the list above):
     `slot_capacity` / `slot_free` / `can_mount`. Command `!mount <rider>
     <vehicle> <slot>` / `dismount` / `switch` / `list` / `info` (list/info
     player-available via READ_ONLY_SUBCOMMANDS). All serialized.
-    FUTURE the user may want: per-rider footprint inside a vehicle, edge-aware
-    boarding range (mount only from an adjacent cell), nested vehicles' shared
-    fuel/initiative, and an armor layer for riders-inside (positional cover).
+    FUTURE the user may want: per-rider footprint inside a vehicle, nested
+    vehicles' shared fuel/initiative, and an armor layer for riders-inside
+    (positional cover). REJECTED (user): a built-in boarding range / "mount
+    only from an adjacent cell" rule. Whether a mounting is legal is the GM's
+    call, made in the slot `condition` and in the GM's own mount actions;
+    don't add engine rules for it.
   - **Mount bug fixes (scenarios 465-466).** (1) NESTED carry: a vehicle that
     is itself a rider now carries its OWN cargo when the rig moves —
     `_restamp_riders_for` replays fire_entity_moved's carry-restamp trio
@@ -2177,12 +2182,13 @@ More shipped work (continuing the list above):
     mode + resistance/immunity/blocked_by all apply. Design call (user):
     RESISTIBLE move, consume-on-reject — if the dest resists/is immune the
     status is gone from the source AND doesn't stick (returns False). Carries
-    level + duration; custom instance data RE-SEEDS from the definition (same
-    behavior as the existing part_status_redirect, which also re-applies rather
-    than byte-copying). Command `!status transfer <from> <to> <name>`. Both are
+    level + duration, and (user call, 2026-10) the moved instance KEEPS its
+    custom fields: `apply_status(..., seed_data=)` seeds a first application
+    from the moved instance in place of the definition's `data`; onto an
+    existing instance only the stacking applies and that instance keeps its
+    own data. Command `!status transfer <from> <to> <name>`. Both are
     mutating `!status` subcommands (host-gated); prims registered in
-    `_MATCH_FUNC_NAMES`. (A future variant could preserve full instance data
-    or be force/reflect-flavored.)
+    `_MATCH_FUNC_NAMES`. (A future variant could be force/reflect-flavored.)
 
 - **Graphics / sprite rendering — PHASE 1 SHIPPED (the engine render model;
   scenario 530).** The long-planned image-rendered map. CORE PRINCIPLE: the
@@ -4404,6 +4410,60 @@ More shipped work (continuing the list above):
     host-only.
   - OPEN (user: decide later): status_counter_add on a missing (∞) duration
     removes the status — see the status-counters entry.
+
+- **String helpers, coordinate rulers, mount/status follow-ups, `!ent
+  set_vars` — SHIPPED (scenarios 678-684).** Ideas #3, #4, #81 and two parts
+  of #14 from the 2026-10 idea list. The other #14 parts: edge-aware boarding
+  REJECTED (see the mounts entry), configurable side names and per-type
+  `to_main_percent` deferred.
+  - **String helpers (678-679):** `upper`, `lower`, `strip`, `startswith`,
+    `endswith`, `split(text, sep=None)`, `join(list, sep="")`, `replace(text,
+    old, new)` and `fmt(template, a, b, ..., name=value)`. Pure
+    `_ALLOWED_FUNCS`, so usable in `$()`. `fmt` parses its own fields: only
+    `{0}` / `{name}` with a short spec (`_FMT_SPEC`: align, sign, width up to 3
+    digits, precision up to 2, a type letter), because Python's str.format
+    resolves `{0.attr}` / `{0[k]}` and would reach into objects. `replace`,
+    `join` and `fmt` size their result before building it
+    (formula_size_limit; the namespace binds the match's value). fmt's
+    internal size parameter is `_limit`, so a template field `{limit}` works.
+  - **Coordinate rulers (680; user call: default ON).** Rule `map_coords`
+    (bool, default True) + per-match `Match.map_coords` (None = rule;
+    serialized; `!map coords on|off|clear`, host-gated via ELEVATED_ARGS) +
+    one-off `!map coords=on|off`. ASCII (`Match._ascii_rulers`, in
+    `render_ascii(coords=None)` → `coords_on()`): column numbers with their
+    digits STACKED top to bottom (column 12 = 1 over 2), so every cell stays
+    one character wide, and row numbers right-aligned in a left margin;
+    1-based and viewport-aware. Graphics: the scene model carries `coords`;
+    `SceneRenderer._add_rulers` draws whole numbers in a top/left margin
+    (`ruler_margin`), and `scene_dims` counts the margins so `fit_cell_size`
+    still fits the pixel budget. Discord: a 30x30 window with rulers is ~2030
+    characters (over the 2000 cap), so the auto-update board drops the rulers
+    first (then color, then legend), and a plain `!map` on a surface with
+    `ctx.message_limit` (Discord sets it) leaves them out with a note instead of
+    splitting the map. An explicit `coords=on` is kept as asked.
+  - **Mounted rider re-check on transform (682).** `apply_statblock` runs
+    `can_mount` with the NEW vars for a mounted rider (slot `condition` and
+    capacity share); `transform_rider_mismatch_mode` decides a misfit:
+    `block` refuses before any change; `eject` picks the drop cell for the new
+    body up front (refusing if none fits) and dismounts right after the swap,
+    so a refused transform never leaves the rider dismounted.
+  - **`status_transfer` keeps instance data (683).** See the dispel/transfer
+    entry.
+  - **`!ent set_vars <id> key=value ... [bypass_clamp=yes]` (684).** One
+    command and one undo step, applied in order, all-or-nothing through
+    `action._rollback_match` (a refused write sets nothing); `$()` values
+    resolve with self = the unit; duplicate keys refused; group targets
+    accepted. `_has_inline_token` now also counts `key=$(...)` for the
+    inline_args_access rule.
+  - **Two pre-existing bugs found while testing (681):** a FUNCTION used as a
+    value (`entity[a].f = min`) was stored as-is, which made the match
+    unsaveable and crashed `!ent dump` — `_own_value` (every store) now
+    refuses anything but numbers, text, bools, None, lists and dicts. And the
+    failed-save reply printed the host's absolute path; saves and history
+    exports now go through `logic.write_json_file` (build the JSON, write a
+    temp file beside the target, `os.replace`), so a failure can't truncate
+    the previous save, and the error names only `saves/<name>`.
+  - The `!map scene` summary shows `coords=on|off`.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense
