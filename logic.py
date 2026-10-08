@@ -1472,6 +1472,19 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "that long) is far beyond any real map."
         ),
     },
+    "sight_check_limit": {
+        "default": 1000000,
+        "schema": {"type": "int", "min": 1000, "max": 10000000},
+        "desc": (
+            "Work budget of one `!map ent_sight` answer: every range check "
+            "(each map cell against each cell of the unit's body) and every "
+            "cell a sight line crosses counts one. Past it the command stops "
+            "with an error. Its cost follows the unit's vision radius and "
+            "size, and the work holds up every server while it runs. The "
+            "default 1000000 is about a second; a 1x1 unit with vision "
+            "radius 50 on open ground uses about half of it."
+        ),
+    },
     "formula_size_limit": {
         "default": 100000,
         "schema": {"type": "int", "min": 1},
@@ -4258,7 +4271,15 @@ class GameSystem:
     def from_dict(d: Dict[str, Any]) -> "GameSystem":
         raw = d.get("settings", {}) or {}
         settings: Dict[str, Rule] = {}
+        dropped: List[str] = []
         for k, v in raw.items():
+            # A system saved by an older build may set a gamerule that no
+            # longer exists: drop it (noted on the console). Rules missing
+            # from the save need nothing: get() / the rules snapshot fall
+            # back to the registry default.
+            if k not in RULES_REGISTRY:
+                dropped.append(k)
+                continue
             settings[k] = Rule(
                 key=k,
                 value=v["value"],
@@ -4280,6 +4301,9 @@ class GameSystem:
             str(k): str(v) for k, v in raw_sys_aliases.items()
             if isinstance(k, str) and isinstance(v, str)
         }
+        if dropped:
+            print(f"[systems] '{d.get('name')}': dropped gamerule(s) that no "
+                  f"longer exist: {', '.join(sorted(map(str, dropped)))}")
         return GameSystem(
             name=d["name"], settings=settings,
             tile_templates=templates, formula_functions=funcs,
@@ -8589,6 +8613,48 @@ class Match:
             return True
         return self._visibility_visible(
             "entity_visibility_condition", str(team), target=other.id)
+
+    def unit_sight_cells(self, viewer: "Entity",
+                         budget: Optional[int] = None) -> List[Tuple[int, int]]:
+        """The on-map cells the single unit `viewer` sees right now, row by
+        row: within its vision radius of some cell of its body with a clear
+        line from that cell (range + LOS, ignoring the fog toggles, like
+        can_see). The cells behind `!map ent_sight`.
+
+        Every range check and sight line walked is charged against `budget`
+        (default the sight_check_limit rule), so a huge vision radius on a
+        big map stops with an error instead of tying the bot up."""
+        if budget is None:
+            try:
+                budget = int(self.rules.get("sight_check_limit", 1000000))
+            except (TypeError, ValueError):
+                budget = 1000000
+        left = budget
+        r = self._vision_radius_of(viewer)
+        body = self.entity_cells(viewer)
+        xs = [c[0] for c in body]
+        ys = [c[1] for c in body]
+        x0, x1 = max(1, min(xs) - r), min(self.grid_width, max(xs) + r)
+        y0, y1 = max(1, min(ys) - r), min(self.grid_height, max(ys) + r)
+        cells: List[Tuple[int, int]] = []
+        for y in range(y0, y1 + 1):
+            for x in range(x0, x1 + 1):
+                for vx, vy in body:
+                    # One unit per range check (a big body tests every cell
+                    # pair), plus the length of each sight line walked.
+                    left -= 1
+                    if self._within_vision(vx, vy, x, y, r):
+                        left -= abs(x - vx) + abs(y - vy) + 1
+                    if left < 0:
+                        raise VTTError(
+                            f"Checking `{viewer.id}`'s sight takes more than "
+                            f"the sight_check_limit of {budget} (its vision "
+                            f"radius is {r}).")
+                    if self._within_vision(vx, vy, x, y, r) and \
+                            self.has_los(viewer.id, vx, vy, x, y):
+                        cells.append((x, y))
+                        break
+        return cells
 
     def entity_visible_to(self, eid: str, pov_team: Optional[str]) -> bool:
         """Whether entity `eid` is visible to a viewer whose POV is
@@ -15586,17 +15652,35 @@ class Match:
 # -------------------------
 # Match Manager (multi-match, now stores GameSystems and defaults))
 # -------------------------
+# The workspace key of a single-operator surface (CLI / GUI / scenario
+# harness). A Discord server's workspace is keyed by its guild id.
+LOCAL_WORKSPACE = "local"
+
+
 class MatchManager:
-    def __init__(self):
+    """One WORKSPACE: the game systems, matches, channel pointers and save
+    folder of one Discord server (or of the local CLI / GUI). Each server
+    gets its own (see Workspaces), so nothing here is shared between
+    servers: a match id, a system name or a save file name only means
+    something inside its own workspace."""
+
+    def __init__(self, guild_key: str = LOCAL_WORKSPACE):
+        self.guild_key: str = str(guild_key)
+        # A display name for the workspace (the Discord server's name; the
+        # adapter refreshes it on each command). Runtime-only.
+        self.guild_name: str = self.guild_key
+        # The Workspaces registry holding this manager (None when built
+        # alone, e.g. by a test). Lets bot-owner commands see every server.
+        self.workspaces: Optional["Workspaces"] = None
         self.matches: Dict[str, Match] = {}
         # optional: track per-channel active match
         self.active_by_channel: Dict[str, str] = {}
-        # GameSystems
+        # GameSystems. Every workspace starts with its own `default`, built
+        # from the engine defaults in RULES_REGISTRY.
         self.systems: Dict[str, GameSystem] = {
             "default": GameSystem("default", settings={})
         }
         self.default_system_name: str = "default"
-        self.default_system_per_server: Dict[str, str] = {}
         self.default_system_per_channel: Dict[str, str] = {}
 
     # ----- game systems -----
@@ -15618,12 +15702,12 @@ class MatchManager:
         broken state:
           - the system must exist
           - at least one system must remain afterward (there's always a
-            global default to fall back to)
-          - it must not be the global default (reassign that first)
+            server default to fall back to)
+          - it must not be the server default (reassign that first)
           - no live match may still be bound to it (rebind or delete
             those matches first)
-        Per-server / per-channel default pointers AT this system are
-        scrubbed (they fall back to the global default automatically via
+        Per-channel default pointers AT this system are scrubbed (they fall
+        back to the server default automatically via
         effective_system_name)."""
         if name not in self.systems:
             raise NotFound(f"GameSystem '{name}' not found.")
@@ -15634,9 +15718,9 @@ class MatchManager:
             )
         if name == self.default_system_name:
             raise VTTError(
-                f"'{name}' is the global default GameSystem. Set a "
-                f"different global default first "
-                f"(!system default global <other>)."
+                f"'{name}' is this server's default GameSystem. Set a "
+                f"different default first "
+                f"(!system default server <other>)."
             )
         bound = [mid for mid, m in self.matches.items() if m.system_name == name]
         if bound:
@@ -15648,34 +15732,23 @@ class MatchManager:
                 f"matches first."
             )
         del self.systems[name]
-        # Scrub server/channel default pointers that referenced it; they
-        # fall back to the global default via effective_system_name.
-        self.default_system_per_server = {
-            k: v for k, v in self.default_system_per_server.items() if v != name
-        }
+        # Scrub channel default pointers that referenced it; they fall back
+        # to the server default via effective_system_name.
         self.default_system_per_channel = {
             k: v for k, v in self.default_system_per_channel.items() if v != name
         }
 
-    def set_global_default_system(self, name: str):
+    def set_default_system(self, name: str):
         self.get_system(name)
         self.default_system_name = name
-
-    def set_server_default_system(self, server_id: str, name: str):
-        self.get_system(name)
-        self.default_system_per_server[server_id] = name
 
     def set_channel_default_system(self, channel_key: str, name: str):
         self.get_system(name)
         self.default_system_per_channel[channel_key] = name
 
     def effective_system_name(self, channel_key: str) -> str:
-        # channel_key is typically "<server_id>:<channel_id>"
-        server_id = channel_key.split(":", 1)[0] if ":" in channel_key else channel_key
         return self.default_system_per_channel.get(
-            channel_key,
-            self.default_system_per_server.get(server_id, self.default_system_name)
-        )
+            channel_key, self.default_system_name)
 
     def effective_system(self, channel_key: str) -> GameSystem:
         return self.get_system(self.effective_system_name(channel_key))
@@ -15953,7 +16026,6 @@ class MatchManager:
             "active_by_channel": self.active_by_channel,
             "systems": {name: s.to_dict() for name, s in self.systems.items()},
             "default_system_name": self.default_system_name,
-            "default_system_per_server": self.default_system_per_server,
             "default_system_per_channel": self.default_system_per_channel,
         }
         write_json_file(path, data)
@@ -15987,7 +16059,6 @@ class MatchManager:
                 raise VTTError(
                     f"its default system '{default_name}' isn't among its "
                     f"systems ({', '.join(sorted(systems)) or 'none'})")
-            per_server = dict(data.get("default_system_per_server", {}))
             per_channel = dict(data.get("default_system_per_channel", {}))
             # Re-snapshot each match's rules dict from its bound system so
             # mid-write rule edits since the save took effect when reloaded.
@@ -16008,5 +16079,35 @@ class MatchManager:
         self.active_by_channel = active_by_channel
         self.systems = systems
         self.default_system_name = default_name
-        self.default_system_per_server = per_server
         self.default_system_per_channel = per_channel
+
+
+class Workspaces:
+    """Every server's workspace, one MatchManager each, created on first
+    use (a fresh `default` system, no matches). The Discord adapter routes
+    each command to the manager of the server it came from, so systems,
+    matches, channel pointers, saves and the command lock are all per
+    server; the local surfaces (CLI / GUI / harness) use LOCAL_WORKSPACE.
+
+    `owner_ids` holds the bot owner's user ids (the Discord application's
+    owner or team members, read at startup) for the bot-owner commands."""
+
+    def __init__(self):
+        self._by_key: Dict[str, MatchManager] = {}
+        self.owner_ids: Set[str] = set()
+
+    def get(self, guild_key: Any) -> MatchManager:
+        key = str(guild_key)
+        mgr = self._by_key.get(key)
+        if mgr is None:
+            mgr = MatchManager(key)
+            mgr.workspaces = self
+            self._by_key[key] = mgr
+        return mgr
+
+    def peek(self, guild_key: Any) -> Optional[MatchManager]:
+        """The workspace if it exists, without creating it."""
+        return self._by_key.get(str(guild_key))
+
+    def items(self) -> List[Tuple[str, MatchManager]]:
+        return sorted(self._by_key.items())

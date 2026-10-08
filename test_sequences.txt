@@ -19170,3 +19170,204 @@ and never onto the guard at (14, 14); a second blink lands inside again. The
 one-cell pit can't hold the body, so random_free_cell returns None and the
 dive fails, leaving the wyrm where it was. With random_seed set, the picks
 follow the seed.
+
+SCENARIO 698 — Each server has its own workspace: systems, matches and saves stay apart
+----------------------------------------------------------------------------------------
+
+!as server 111
+!system set default fog_enabled_by_default true
+!match new camp Camp 10 10
+!match use camp
+!ent add hero Hero 10 2 2
+!store save shared
+?? Saved to `saves/shared`
+!as server 222
+!system info default
+?! fog_enabled_by_default` = True
+!match use camp
+?? not found
+!match new camp Other 6 6
+?? Created match `Other` with id `camp`
+!match use camp
+!assert "grid_width() == 6" "server 222's camp is its own match"
+!ent info hero
+?? not found
+!store load shared
+?? File not found
+!as server 111
+!match use camp
+!assert "grid_width() == 10 and entity[hero].hp == 10" "server 111's camp is untouched"
+!store load shared
+?? Loaded from `saves/shared`
+!as server local
+!match
+?? No matches
+
+Expected: HARNESS-ALLOWS-ERRORS. Each `!as server <key>` moves the harness
+into that server's workspace. Server 111 turns fog on by default in its own
+`default` system and saves its board as `shared`. In server 222 the default
+system still has fog off, `!match use camp` finds nothing, the id `camp` is
+free to reuse for a different 6×6 match, `hero` doesn't exist, and loading
+`shared` fails with "File not found" because each server reads its own saves
+folder. Back in server 111 the 10×10 camp with its hero is untouched and the
+save loads. The local workspace has no matches.
+
+SCENARIO 699 — !system default is per server or per channel; !match list is open to players
+--------------------------------------------------------------------------------------------
+
+!system new skirmish
+!system default server skirmish
+?? This server's default GameSystem is now `skirmish`
+!match new a A 5 5
+?? using system `skirmish`
+!system default global default
+?? Scope must be one of: server | channel
+!system default channel default
+!match new b B 5 5
+?? using system `default`
+!system delete skirmish
+?? this server's default GameSystem
+!match use a
+!as player pip
+!match list
+?? `a`
+?? `b`
+!match
+?? `b`
+!as host
+
+Expected: HARNESS-ALLOWS-ERRORS. A server-wide default makes `a` use
+`skirmish`; the old `global` scope is gone (a workspace IS one server). A
+channel default wins over it, so `b` uses `default`. The server default
+can't be deleted. A player may list the server's matches (bare `!match` or
+`!match list`): every match listed belongs to this server.
+
+SCENARIO 700 — !owner servers lists every workspace; only the bot owner may use it
+-----------------------------------------------------------------------------------
+
+!match new here Here 5 5
+!as server 333
+!match new there There 5 5
+!match new there2 There2 5 5
+!owner servers
+?? Server workspaces (2)
+?? `local`): 1 match(es)
+?? `333`): 2 match(es), 1 system(s) ← this one
+!whoami
+?? bot owner
+?? **Server workspace:**
+!as player pip
+!owner servers
+?? Only the bot's owner can use `!owner`
+!whoami
+?! bot owner
+!as host
+!owner nonsense
+?? isn't a valid command
+
+Expected: HARNESS-ALLOWS-ERRORS. The harness's `cli` identity stands in for
+the bot owner. `!owner servers` lists both workspaces with their match and
+system counts and marks the one the command ran in; `!whoami` shows "bot
+owner" and names the server workspace. A player is refused and `!whoami`
+drops the badge. An unknown `!owner` subcommand is reported.
+
+SCENARIO 701 — !map ent_sight marks the cells one unit sees and lists the units it sees
+----------------------------------------------------------------------------------------
+
+!match new s701 Sight 12 8
+!match use s701
+!ent add arch Archer 10 3 3 1
+!ent set_var arch team red
+!ent set_var arch fog_vision_radius 3
+!tile set 5 3 opaque true
+!tile set 5 3 glyph #
+!ent add orc Orc 10 7 3 1
+!ent set_var orc team blue
+!ent add gob Gob 10 6 5 1
+!ent set_var gob team blue
+!map ent_sight arch
+?? Archer (`arch`) sees 35 cell(s): vision radius 3, range + line of sight.
+?? Sees: Gob (`gob`)
+?! Orc
+!assert "can_see('arch', 6, 5) and not can_see('arch', 6, 3)" "the marks follow can_see"
+!map ent_sight arch extra
+?? Unexpected `extra`
+!map ent_sight arch color=0,0,255 opacity=101
+?? `opacity=` must be between 0 and 100
+!map ent_sight ghost
+?? Entity 'ghost' not found
+
+Expected: HARNESS-ALLOWS-ERRORS. The archer at (3, 3) has vision radius 3.
+The opaque wall at (5, 3) blocks the line to (6, 3) and the orc at (7, 3),
+so 35 of the 36 on-map cells within range are marked with `*` (the wall cell
+itself is seen; cells showing a unit keep its glyph). The goblin at (6, 5)
+is in range with a clear line and is listed; the orc behind the wall is not.
+A stray word, a bad opacity and an unknown unit are refused.
+
+SCENARIO 702 — !map ent_sight from a multi-tile body; a huge sight is bounded
+----------------------------------------------------------------------------
+
+!match new s702 Big 12 8
+!match use s702
+!ent add big Big 10 9 6 1
+!ent set_var big footprint_w 2
+!ent set_var big footprint_h 2
+!ent set_var big fog_vision_radius 1
+!ent add rat Rat 3 8 5 1
+!map ent_sight big
+?? sees 16 cell(s)
+?? Sees: Rat (`rat`)
+!match new s702b Plain 60 60
+!match use s702b
+!ent add eye Eye 10 30 30
+!ent set_var eye fog_vision_radius 20
+!system set default sight_check_limit 1000
+!map ent_sight eye
+?? takes more than the sight_check_limit of 1000
+!system set default sight_check_limit 1000000
+
+Expected: HARNESS-ALLOWS-ERRORS. The 2×2 body at (9, 6)-(10, 7) sees from
+every cell it covers: radius 1 around the whole body is the 4×4 block
+(8, 5)-(11, 8), 16 cells, so the rat at (8, 5), diagonal to the body's top
+left cell, is seen. On an open 60×60 map, with sight_check_limit at 1000,
+a unit with vision radius 20 (1681 cells in range, each with its sight line)
+stops with an error instead of running on.
+
+SCENARIO 703 — !map ent_sight under a team POV: own units only, nothing past the fog
+-------------------------------------------------------------------------------------
+
+!match new s703 Fog 12 8
+!match use s703
+!ent add arch Archer 10 3 3 1
+!ent set_var arch team red
+!ent set_var arch fog_vision_radius 3
+!ent add scout Scout 10 3 7 1
+!ent set_var scout team red
+!ent set_var scout fog_vision_radius 1
+!ent add gob Gob 10 6 5 1
+!ent set_var gob team blue
+!ent set_var gob fog_vision_radius 3
+!ent add orc Orc 10 11 3 1
+!ent set_var orc team blue
+!system set default fog_los true
+!match fog on
+!match bind s703 pov=red
+!as player pip
+!map ent_sight arch
+?? Sees: Gob (`gob`)
+!map ent_sight gob
+?? You can check the sight of your own team's units only
+!map ent_sight orc
+?? Entity 'orc' not found
+!as host
+!map ent_sight gob
+?? Gob (`gob`) sees 24 cell(s)
+!system set default fog_los false
+
+Expected: HARNESS-ALLOWS-ERRORS. The channel is bound to red's POV with fog
+on. Player pip may ask about red's archer (it sees the goblin). The goblin is
+visible but blue, so pip is refused; the orc is in fog, so it reads as
+missing, exactly like `!ent info`. The host may ask about any unit, but the
+marks still stop at red's fog: the goblin's radius-3 sight covers 49 cells,
+and only the 24 red also sees (x 3-6 rows 2-6 from the archer, x 3-4 rows
+7-8 from the scout) are marked.

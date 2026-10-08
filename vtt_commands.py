@@ -14,7 +14,7 @@ from logic import (
 )
 
 # Passive system
-from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file
+from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, LOCAL_WORKSPACE
 
 # Clamp system
 from logic import ClampSpec
@@ -67,26 +67,37 @@ def ctx_user_name(ctx: "ReplyContext") -> str:
 
 
 def ctx_is_admin(ctx: "ReplyContext") -> bool:
-    """Whether the sender may run BOT-WIDE commands (see _admin_required).
+    """Whether the sender may run SERVER-WIDE commands (see _admin_required).
 
     Single-operator local surfaces (the CLI / GUI set `auto_approve`) are
     always admin — the operator owns the machine. Otherwise the surface must
     say so via `is_admin`: Discord sets it from the author's guild
     Administrator permission. DEFAULT-DENY: a context that doesn't declare it
     (e.g. an action body's buffered cmd() context) is NOT admin, so an action
-    authored by a host can't become a route to bot-wide state."""
+    authored by a host can't become a route to server-wide state."""
     if getattr(ctx, "auto_approve", False):
         return True
     return bool(getattr(ctx, "is_admin", False))
+
+
+def ctx_is_bot_owner(ctx: "ReplyContext") -> bool:
+    """Whether the sender owns the bot (the `!owner` commands). Discord
+    sets `is_bot_owner` from the application's owner / team, read at
+    startup; a single-operator local surface (auto_approve) is the owner.
+    Default-deny like ctx_is_admin, so an action body can't claim it."""
+    if getattr(ctx, "auto_approve", False):
+        return True
+    return bool(getattr(ctx, "is_bot_owner", False))
 
 
 def require_target_host(ctx: "ReplyContext", m: "Match", action: str,
                         *, owner: bool = False) -> None:
     """Raise unless the sender is a host (or, with owner=True, the owner) of
     `m` — the match a command NAMES, which may differ from the channel's
-    active match the access gate checked. Without this, `!match use <id>`
-    from another server gave an omniscient view of a fogged match, and
-    `!match delete <id>` / `!ent copy <id> <dest>` reached any match.
+    active match the access gate checked. Without this, any player could
+    `!match use <id>` a fogged match of their server for an omniscient view,
+    and `!match delete <id>` / `!ent copy <id> <dest>` reached any match of
+    the server.
 
     Same no-op conditions as the gate: a single-operator surface
     (auto_approve), an identity-less context, or a match with no owner
@@ -132,10 +143,8 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
     "gpassive":   frozenset({"list", "info"}),
     "history":    frozenset({"list", "diff"}),
     "macro":      frozenset({"list"}),
-    # `list` stays host-gated like a bare `!match`: it names every match
-    # bot-wide (see the multi-tenant caveat). `info` covers only the
-    # channel's own match.
-    "match":      frozenset({"channels", "hosts", "outcome", "info"}),
+    # `list` (like a bare `!match`) names this server's matches only.
+    "match":      frozenset({"list", "channels", "hosts", "outcome", "info"}),
     "mount":      frozenset({"list", "info"}),
     # `info` is NOT here: it prints the part's full var JSON — what `!ent
     # dump` is host-gated to hide.
@@ -165,7 +174,7 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
 # next`, `!history undo`). Only the bare invocation downgrades — `!undo`,
 # whose bare form itself mutates, deliberately stays gated.
 READ_ONLY_BARE_ROOTS: frozenset = frozenset({
-    "turn", "history",
+    "turn", "history", "match",
 })
 # Commands that dispatch arbitrary inner content of their own, so their real
 # authority is NOT visible in args[0]. `!foreach`'s read-only downgrade refuses
@@ -199,26 +208,21 @@ ELEVATED_ARGS: Dict[str, frozenset] = {
 _ELEVATED_READ_FORMS = frozenset({("map", "layer", "list"),
                                   ("map", "teamcolor", "list")})
 
-# Commands that act on BOT-WIDE state — shared GameSystems (every match on
-# a system picks up an edit on its next rule refresh, across servers), the
-# save store (`!store load` replaces EVERY match), and files on the host's
-# disk. The per-match host gate can't protect these: it only engages when
-# the channel has an active match, and anyone can create a match and host it.
-# So they need an administrator (ctx_is_admin) regardless of any match, and
-# no per-match `!host access` / system `command_access` override can open
-# them. Read-only forms stay open (see _admin_required).
-#
-# INTERIM: "administrator" is the Discord guild Administrator permission,
-# but systems and the save store are still shared by EVERY guild the bot
-# serves, so one server's admin can change another server's rules. Proper
-# per-guild isolation is part of the planned data-storage redesign (see
-# CLAUDE.md, "Multi-tenant caveat").
+# Commands that act on SERVER-WIDE state — the server's GameSystems (every
+# match on a system picks up an edit on its next rule refresh), its save store
+# (`!store load` replaces every match of the server), and files in its saves
+# folder. The per-match host gate can't protect these: it only engages when the
+# channel has an active match, and anyone can create a match and host it. So
+# they need a server administrator (ctx_is_admin) regardless of any match, and
+# no per-match `!host access` / system `command_access` override can open them.
+# Read-only forms stay open (see _admin_required). Each server has its own
+# workspace (logic.Workspaces), so none of this reaches another server.
 _ADMIN_MSG = ("❌ Only a server administrator can do that — it changes "
-              "bot-wide state shared by every server this bot runs in.")
+              "server-wide state shared by every match on this server.")
 
 
 def _admin_required(name: str, args: List[str]) -> bool:
-    """True iff this invocation changes bot-wide state (see _ADMIN_MSG)."""
+    """True iff this invocation changes server-wide state (see _ADMIN_MSG)."""
     sub = args[0].lower() if args else ""
     if name in ("store", "run"):
         return True
@@ -423,7 +427,7 @@ class CommandRegistry:
         if stray:
             await ctx.send(stray)
             return
-        # Bot-wide commands need an admin even here: this path is ungated
+        # Server-wide commands need an admin even here: this path is ungated
         # (batch / macro / foreach / run lines, action cmd()), so without the
         # check a host could wrap `!system set` in a `!batch`.
         if _admin_required(name, args) and not ctx_is_admin(ctx):
@@ -715,7 +719,7 @@ class CommandRegistry:
             await ctx.send(stray)
             return
 
-        # Bot-wide commands: an administrator, checked BEFORE the per-match
+        # Server-wide commands: an administrator, checked BEFORE the per-match
         # gate (which is a no-op without an active match) and not subject to
         # its overrides. Rejected outright — no match host can approve them.
         admin_cmd = _admin_required(name, args)
@@ -724,7 +728,7 @@ class CommandRegistry:
             return
 
         # Host / approval gate. Resolved against the channel's ACTIVE
-        # match (the thing the command would act on). Bot-wide commands
+        # match (the thing the command would act on). Server-wide commands
         # skip it: they don't act on the channel's match, and an admin must
         # not need that match's host to approve a system edit. If there's no active
         # match, or the surface carries no identity, the gate is a no-op —
@@ -968,7 +972,9 @@ _HOLDS_COMMAND_LOCK: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
 
 
 def _command_lock(mgr: MatchManager) -> "asyncio.Lock":
-    """The lock that runs one command at a time on `mgr` (runtime-only)."""
+    """The lock that runs one command at a time on `mgr` (runtime-only).
+    Each server has its own manager (logic.Workspaces), so servers never
+    wait on each other's commands."""
     lock = getattr(mgr, "_command_lock", None)
     if lock is None:
         lock = asyncio.Lock()
@@ -1186,7 +1192,7 @@ def _remember_command(mgr: MatchManager, ctx: ReplyContext, name: str,
 
 # Snapshot fields an undo leaves alone, so a change to them alone is not an
 # undo step: the pause (table management, see _restore_snapshot) and the
-# rules (a copy of the GameSystem's, changed only by bot-wide system edits).
+# rules (a copy of the GameSystem's, changed only by server-wide system edits).
 _NOT_UNDO_STATE = ("paused", "rules")
 
 
@@ -1819,8 +1825,8 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send("Matches:\n" + "\n".join(lines))
     sub = args[0]
     if sub.lower() == "info":
-        # The channel's own match only: naming another match would widen
-        # the cross-guild visibility the multi-tenant caveat warns about.
+        # The channel's own match only: naming another match would show a
+        # match the player may have no part in.
         m = active_match(mgr, ctx)
         pov = _query_pov(ctx, m)
         cur = (m.turn_order[m.active_index]
@@ -2454,7 +2460,7 @@ def _mention(user_id: Optional[str]) -> str:
 # ---- as (CLI identity switch for previewing host vs player) -----
 @registry.command(
     "as", access="all",
-    usage="!as <host|player|owner> [<name>] | !as view <team|omniscient|clear>",
+    usage="!as <host|player|owner> [<name>] | !as view <team|omniscient|clear> | !as server [<key>|local]",
     desc=(
         "Switch your previewing identity OR point-of-view. CLI-only "
         "(on Discord both come from your account / the channel, so this "
@@ -2466,8 +2472,11 @@ def _mention(user_id: Optional[str]) -> str:
         "preview, a SEPARATE axis from identity): `!as view <team>` "
         "renders !state/!map/!list as that team sees them; `!as view "
         "omniscient` forces the full view; `!as view clear` drops the "
-        "override and falls back to the channel's bound POV. Bare `!as` "
-        "reports both your identity and your effective POV."
+        "override and falls back to the channel's bound POV. SERVER (CLI / "
+        "test harness): `!as server <key>` moves you into another server's "
+        "workspace — its own systems, matches and saves, as on Discord where "
+        "each server is separate; `!as server local` (or bare) returns. Bare "
+        "`!as` reports your identity and your effective POV."
     ),
 )
 async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -2489,6 +2498,21 @@ async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"Use `!as host`/`!as player [name]` or `!as view <team>`."
         )
     role = args[0].lower()
+    if role == "server":
+        if not getattr(ctx, "workspace_switchable", False):
+            return await ctx.send(
+                "❌ This surface has a single workspace; `!as server` works "
+                "in the CLI and the scenario harness.")
+        key = args[1] if len(args) >= 2 else LOCAL_WORKSPACE
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", key):
+            return await ctx.send(
+                "❌ A server key is letters, digits, `_` or `-` (up to 40).")
+        ctx.guild_key = key
+        if key == LOCAL_WORKSPACE:
+            return await ctx.send("Back in the local workspace.")
+        return await ctx.send(
+            f"Now in server `{key}`'s workspace (its own systems, matches "
+            f"and saves).")
     if role == "view":
         target = args[1].lower() if len(args) >= 2 else "omniscient"
         if target == "clear":
@@ -2535,7 +2559,11 @@ async def whoami_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     user = ctx_user(ctx)
     who = f"**{ctx_user_name(ctx)}**" + (f" (id `{user}`)" if user else "")
     lines = [f"**You:** {who}"
-             + (" · server administrator" if ctx_is_admin(ctx) else "")]
+             + (" · server administrator" if ctx_is_admin(ctx) else "")
+             + (" · bot owner" if ctx_is_bot_owner(ctx) else "")]
+    if getattr(mgr, "guild_key", LOCAL_WORKSPACE) != LOCAL_WORKSPACE:
+        lines.append(f"**Server workspace:** {mgr.guild_name} "
+                     f"(`{mgr.guild_key}`)")
     mid = mgr.get_active_for_channel(ctx.channel_key)
     m = mgr.matches.get(mid) if mid else None
     if m is None:
@@ -2580,6 +2608,41 @@ async def whoami_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         lines.append(f"**Waiting for approval:** {len(mine)} "
                      f"({', '.join(f'`{r}`' for r in mine)})")
     return await ctx.send("\n".join(lines))
+
+
+@registry.command(
+    "owner", access="all", snapshot=False,
+    usage="!owner <servers>",
+    desc=(
+        "Bot-owner tools (the owner of the bot's Discord application, or its "
+        "team). `!owner servers` lists every server workspace the bot holds, "
+        "with its match and system counts. Everyone else is refused."
+    ),
+)
+async def owner_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not ctx_is_bot_owner(ctx):
+        raise VTTError("Only the bot's owner can use `!owner`.")
+    if not args:
+        title, body = registry.help_for(["owner"])
+        return await ctx.send(f"**{title}**\n{body}")
+    sub = args[0].lower()
+    if sub == "servers":
+        _check_tail(args, 1, (), "!owner servers")
+        ws = getattr(mgr, "workspaces", None)
+        items = ws.items() if ws is not None else [(mgr.guild_key, mgr)]
+        lines = []
+        for key, w in items:
+            here = " ← this one" if w is mgr else ""
+            lines.append(f"- **{w.guild_name}** (`{key}`): {len(w.matches)} "
+                         f"match(es), {len(w.systems)} system(s){here}")
+        return await ctx.send(f"Server workspaces ({len(lines)}):\n"
+                              + "\n".join(lines))
+    return await _help_fallback(ctx, ["owner"], args[0])
+
+
+registry.annotate_sub("owner", "servers", usage="!owner servers",
+                      desc="List every server workspace with its match and "
+                           "system counts.")
 
 
 @registry.command(
@@ -2830,7 +2893,7 @@ registry.annotate_sub(
 # ---- system (gamesystem commands)-----
 
 #TODO: add "delete" command for gamesystems (but TEST IT VERY CAREFULLY, like making sure there is always at least one gamesystem per server that's defaulted to, etc.)
-@registry.command("system", usage="!system <subcommand> ...", desc="Manage GameSystems and defaults (global/server/channel).")
+@registry.command("system", usage="!system <subcommand> ...", desc="Manage this server's GameSystems and defaults (server/channel). Every server has its own systems, starting with its own `default`.")
 async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
         names = mgr.list_systems()
@@ -3039,20 +3102,18 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "default":
         if await return_help_if_not_enough_args(ctx, args, 3, "system", "default"):
             return
-        scope = args[1]
+        scope = args[1].lower()
         name = args[2]
-        if scope == "global":
-            mgr.set_global_default_system(name)
-            return await ctx.send(f"Global default GameSystem is now `{name}`.")
-        elif scope == "server":
-            server_id = (ctx.channel_key.split(":",1)[0])
-            mgr.set_server_default_system(server_id, name)
-            return await ctx.send(f"Server default GameSystem for `{server_id}` is now `{name}`.")
+        if scope == "server":
+            mgr.set_default_system(name)
+            return await ctx.send(
+                f"This server's default GameSystem is now `{name}` (new "
+                f"matches use it unless the channel has its own default).")
         elif scope == "channel":
             mgr.set_channel_default_system(ctx.channel_key, name)
             return await ctx.send(f"Channel default GameSystem is now `{name}`.")
         else:
-            return await ctx.send("❌ Scope must be one of: global | server | channel")
+            return await ctx.send("❌ Scope must be one of: server | channel")
 
     # ---- system alias <subcommand> -----------------------------------
     # System-level alias library. These don't affect any currently live
@@ -3203,7 +3264,7 @@ registry.annotate_sub(
         "token must be a real registered command (no alias chains)."
     ),
 )
-registry.annotate_sub("system", "default", usage="!system default <global|server|channel> <name>", desc="Set default GameSystem.")
+registry.annotate_sub("system", "default", usage="!system default <server|channel> <name>", desc="Set the GameSystem new matches use: this server's default, or this channel's own.")
 
 # ---- group fan-out helpers -------------------------------------------------
 # Subcommands of !ent that sensibly iterate one-at-a-time over group members.
@@ -5475,13 +5536,7 @@ async def _map_preview(ctx, m, args: List[str]):
     toks = [a for a in args if "=" not in a]
     _check_options(opts, {"color", "opacity"}, "map preview")
     kv = {a.split("=", 1)[0].lower(): a.split("=", 1)[1] for a in opts}
-    rgb = _preview_rgb(kv.get("color", m.rules.get("preview_color", "255,64,64")))
-    try:
-        opacity = int(kv.get("opacity", m.rules.get("preview_opacity", 40)))
-    except ValueError:
-        raise VTTError("`opacity=` must be a whole number 0-100.")
-    if not 0 <= opacity <= 100:
-        raise VTTError("`opacity=` must be between 0 and 100.")
+    rgb, opacity = _mark_style(m, kv)
     desc, cells = _preview_cells(ctx, m, toks)
     pov = _view_pov(ctx, m, [])
     area = set(cells)
@@ -5498,7 +5553,32 @@ async def _map_preview(ctx, m, args: List[str]):
             inside.append(f"{m.entity_display_name(e, pov)} (`{e.id}`)")
     head = f"🎯 Preview: {desc} — {len(cells)} cell(s) on the map."
     who = ("In area: " + ", ".join(inside)) if inside else "In area: no visible units."
-    highlights = [{"cells": [[x, y] for (x, y) in cells], "rgb": rgb,
+    return await _show_marked_map(ctx, m, pov, cells, head, who, rgb, opacity)
+
+
+def _mark_style(m, kv: Dict[str, str]) -> Tuple[List[int], int]:
+    """The highlight colour and opacity for a marked map (`!map preview` /
+    `!map ent_sight`): `color=` / `opacity=` args, else the preview_color /
+    preview_opacity rules."""
+    rgb = _preview_rgb(kv.get("color", m.rules.get("preview_color", "255,64,64")))
+    try:
+        opacity = int(kv.get("opacity", m.rules.get("preview_opacity", 40)))
+    except ValueError:
+        raise VTTError("`opacity=` must be a whole number 0-100.")
+    if not 0 <= opacity <= 100:
+        raise VTTError("`opacity=` must be between 0 and 100.")
+    return rgb, opacity
+
+
+async def _show_marked_map(ctx, m, pov, cells, head: str, who: str,
+                           rgb: List[int], opacity: int):
+    """Show the map with `cells` marked, under `pov`: gui.py draws
+    translucent squares on its canvas, Discord in image mode posts a PNG
+    with them, and text surfaces mark the cells not showing a unit with the
+    preview_glyph rule's character. `head` goes above the map, `who`
+    below it."""
+    area = set(cells)
+    highlights = [{"cells": [[x, y] for (x, y) in sorted(area)], "rgb": rgb,
                    "opacity": opacity}]
     show = getattr(ctx, "show_preview", None)
     if show is not None:                       # gui.py draws it on its canvas
@@ -5521,6 +5601,69 @@ async def _map_preview(ctx, m, args: List[str]):
     return await ctx.send(f"{head}\n```{fence}\n{body}\n```\n{who}")
 
 
+async def _map_ent_sight(ctx, m, args: List[str]):
+    """`!map ent_sight <eid>`: the cells one unit sees right now (range +
+    line of sight from its whole body, like can_see), marked like a
+    `!map preview`, plus the units it sees. Under a team POV a non-host may
+    only ask about their own team's units (a body part counts as its root
+    body's team), and only cells the POV can see are marked, so the answer
+    never shows anything past the channel's fog."""
+    opts = [a for a in args if "=" in a]
+    toks = [a for a in args if "=" not in a]
+    _check_options(opts, {"color", "opacity"}, "map ent_sight")
+    if len(toks) != 1:
+        raise VTTError("Usage: `!map ent_sight <eid> [color=<r,g,b>] "
+                       "[opacity=<0-100>]`.")
+    kv = {a.split("=", 1)[0].lower(): a.split("=", 1)[1] for a in opts}
+    rgb, opacity = _mark_style(m, kv)
+    eid = _query_eid(ctx, m, toks[0])
+    e = m.entities[eid]
+    pov = _view_pov(ctx, m, [])
+    qpov = _query_pov(ctx, m)
+    if qpov is not None and not _acts_as_host(ctx, m):
+        root, walked = e, set()
+        while root.part_of in m.entities and root.id not in walked:
+            walked.add(root.id)
+            root = m.entities[root.part_of]
+        if root.team is None or str(root.team) != str(qpov):
+            raise VTTError(
+                f"You can check the sight of your own team's units only "
+                f"(this channel's team is `{qpov}`).")
+    if not e.is_alive:
+        raise VTTError(f"`{eid}` is dead and sees nothing.")
+    cells = m.unit_sight_cells(e)
+    if pov is not None:
+        # Mark only what the channel's own view shows: a sight shape drawn
+        # over fog would trace the walls hidden in it.
+        cells = [c for c in cells if m._fog_terrain_visible(pov, *c)]
+    area = set(cells)
+    seen = []
+    for o in m.entities_in_turn_order() + [
+            x for x in m.entities.values() if x.id not in m.turn_order]:
+        if o.id == eid or not getattr(o, "is_alive", True):
+            continue
+        if o.is_glued_part or o.is_region_part:
+            continue
+        if o.is_mounted and not o.is_visible_rider:
+            continue
+        if not m.entity_visible_to(o.id, pov):
+            continue
+        if not any(c in area for c in m.entity_cells(o)):
+            continue
+        # The stealth rule, from the unit's own team (as visible_entities).
+        team = e.team
+        if team is not None and not m.own_team_unit(o, str(team)) and \
+                not m._visibility_visible("entity_visibility_condition",
+                                          str(team), target=o.id):
+            continue
+        seen.append(f"{m.entity_display_name(o, pov)} (`{o.id}`)")
+    name = m.entity_display_name(e, pov)
+    head = (f"👁 {name} (`{eid}`) sees {len(cells)} cell(s): vision radius "
+            f"{m._vision_radius_of(e)}, range + line of sight.")
+    who = ("Sees: " + ", ".join(seen)) if seen else "Sees: no visible units."
+    return await _show_marked_map(ctx, m, pov, cells, head, who, rgb, opacity)
+
+
 def _color_guide() -> str:
     """Human-readable list of the supported render color names. The palette
     is deliberately the Discord-safe set (30-37 + bold), so every listed
@@ -5540,6 +5683,7 @@ for _sub, _usage in (
         ("colors", "!map colors"),
         ("cell", "!map cell <x> <y> [for=<eid>] [as=<team>]"),
         ("preview", "!map preview <burst|cone|line|rect> <shape args ...>"),
+        ("ent_sight", "!map ent_sight <eid> [color=<r,g,b>] [opacity=<0-100>]"),
         ("background", "!map background <key|clear> [stretch|tile|center]"),
         ("border", "!map border <on | off | clear | color <name> | opacity <0-100>>"),
         ("mode", "!map mode <text|image>"),
@@ -5558,7 +5702,7 @@ for _sub, _usage in (
     registry.annotate_sub("map", _sub, usage=_usage)
 
 
-@registry.command("map", access="all", usage="!map [full] [as=<team>] [hide=<layers>] [legend=on|off] [coords=on|off] | !map cell <x> <y> [for=<eid>] | !map preview <burst|cone|line|rect> ... | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 28), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map preview burst|cone|line|rect ...` shows the cells an area shape would cover (marked with the preview_glyph rule's character on cells without a unit; graphics surfaces draw translucent squares above units, colour/opacity from the preview_color / preview_opacity rules or `color=` / `opacity=`) and lists the visible units inside — nothing happens to them. `!map full` (host-gated) forces the omniscient view; `as=<team>` (host-only) previews what that team sees (`as=omniscient` = everything), without binding a channel. `!map cell <x> <y> [for=<eid>]` reports everything at one cell the channel can see — units, tile data, zones, corpses, and where its movement / sight block settings come from; `for=<eid>` adds whether the cell blocks that unit (hidden layers are left out). `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets a per-match background sprite; `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). `!map border on|off` / `color <name>` / `opacity <0-100>` / `clear` (host-gated) overrides the grid-line border rules per match (borders draw above the ground, below tiles/entities). `!map mode text|image` (host-gated) sets the per-match default render mode — `image` makes a plain `!map` and the auto-update board render graphically on Discord (text surfaces fall back to ASCII). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
+@registry.command("map", access="all", usage="!map [full] [as=<team>] [hide=<layers>] [legend=on|off] [coords=on|off] | !map cell <x> <y> [for=<eid>] | !map preview <burst|cone|line|rect> ... | !map ent_sight <eid> | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 28), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map preview burst|cone|line|rect ...` shows the cells an area shape would cover (marked with the preview_glyph rule's character on cells without a unit; graphics surfaces draw translucent squares above units, colour/opacity from the preview_color / preview_opacity rules or `color=` / `opacity=`) and lists the visible units inside — nothing happens to them. `!map ent_sight <eid>` marks the cells that unit sees right now (range + line of sight from its whole body, like can_see) and lists the units it sees; under a team POV players may ask about their own team's units only. `!map full` (host-gated) forces the omniscient view; `as=<team>` (host-only) previews what that team sees (`as=omniscient` = everything), without binding a channel. `!map cell <x> <y> [for=<eid>]` reports everything at one cell the channel can see — units, tile data, zones, corpses, and where its movement / sight block settings come from; `for=<eid>` adds whether the cell blocks that unit (hidden layers are left out). `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets a per-match background sprite; `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). `!map border on|off` / `color <name>` / `opacity <0-100>` / `clear` (host-gated) overrides the grid-line border rules per match (borders draw above the ground, below tiles/entities). `!map mode text|image` (host-gated) sets the per-match default render mode — `image` makes a plain `!map` and the auto-update board render graphically on Discord (text surfaces fall back to ASCII). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     if args and args[0].lower() == "colors":
@@ -5567,6 +5711,8 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(_map_cell(ctx, m, args))
     if args and args[0].lower() == "preview":
         return await _map_preview(ctx, m, args[1:])
+    if args and args[0].lower() == "ent_sight":
+        return await _map_ent_sight(ctx, m, args[1:])
     if args and args[0].lower() == "background":
         # !map background <key> [stretch|tile|center] | clear  (host-gated)
         if len(args) < 2:
@@ -6839,7 +6985,7 @@ def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot,
         new_match.access_overrides = copy.deepcopy(old.access_overrides)
         bindings = "keep"
     # A match's rules are a copy of its GameSystem's, refreshed on every
-    # system edit. Those edits are bot-wide (admin) settings that an undo of
+    # system edit. Those edits are server-wide (admin) settings that an undo of
     # one match doesn't revert: restoring the snapshot's copy would run this
     # match on the old rules while the system keeps the new ones, until a
     # reload re-copied them.
@@ -7275,7 +7421,7 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "history", "export"):
             return
         selector = args[1]
-        full, path = saves_path(args[2], write=True)
+        full, path = saves_path(args[2], mgr, write=True)
         snap = _resolve_snapshot_selector(m, selector)
         try:
             write_json_file(full, snap.to_dict())
@@ -7293,7 +7439,7 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "import":
         if await return_help_if_not_enough_args(ctx, args, 2, "history", "import"):
             return
-        full, path = saves_path(args[1])
+        full, path = saves_path(args[1], mgr)
         override_name = None
         if len(args) >= 4 and args[2].lower() == "as":
             override_name = args[3]
@@ -7802,11 +7948,26 @@ _WINDOWS_DEVICE_NAMES = frozenset(
     + [f"COM{i}" for i in range(1, 10)] + [f"LPT{i}" for i in range(1, 10)])
 
 
-def saves_path(name: str, *, write: bool = False) -> Tuple[str, str]:
-    """Resolve a user-supplied file name inside SAVES_DIR. Returns
-    (absolute path, display name). The display name ("saves/<name>") is
-    what replies show, so the host's directory layout never leaks. With
-    write=True the parent folders are created."""
+def server_saves_dir(mgr: Optional[MatchManager]) -> str:
+    """The saves folder of `mgr`'s workspace: SAVES_DIR itself for the local
+    CLI / GUI workspace, `SAVES_DIR/servers/<guild id>` for a Discord
+    server, so one server's `!store load <name>` can't reach another's
+    files."""
+    key = getattr(mgr, "guild_key", LOCAL_WORKSPACE)
+    if key == LOCAL_WORKSPACE:
+        return SAVES_DIR
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", str(key)):
+        raise VTTError("This server's workspace key can't name a folder.")
+    return os.path.join(SAVES_DIR, "servers", str(key))
+
+
+def saves_path(name: str, mgr: Optional[MatchManager] = None, *,
+               write: bool = False) -> Tuple[str, str]:
+    """Resolve a user-supplied file name inside the workspace's saves
+    folder (server_saves_dir). Returns (absolute path, display name). The
+    display name ("saves/<name>") is what replies show, so the host's
+    directory layout never leaks. With write=True the parent folders are
+    created."""
     raw = (name or "").strip()
     if not raw:
         raise VTTError("A file name is required.")
@@ -7817,7 +7978,7 @@ def saves_path(name: str, *, write: bool = False) -> Tuple[str, str]:
             or any(p == ".." for p in parts)):
         raise VTTError(
             f"`{raw}` isn't allowed — use a plain file name (subfolders are "
-            f"fine). Files live in the bot's `saves/` folder; absolute paths "
+            f"fine). Files live in this server's saves folder; absolute paths "
             f"and `..` are refused.")
     # Names Windows can't hold as files (the bot is often self-hosted there):
     # `a:b` writes an NTFS alternate data stream on `a`, and CON/NUL/COM1...
@@ -7830,7 +7991,7 @@ def saves_path(name: str, *, write: bool = False) -> Tuple[str, str]:
             raise VTTError(
                 f"`{raw}` isn't a usable file name (reserved device names, "
                 f"`<>:\"|?*`, and trailing dots/spaces are refused).")
-    base = os.path.realpath(SAVES_DIR)
+    base = os.path.realpath(server_saves_dir(mgr))
     full = os.path.realpath(os.path.join(base, *parts))
     try:
         inside = os.path.commonpath([full, base]) == base
@@ -7845,7 +8006,7 @@ def saves_path(name: str, *, write: bool = False) -> Tuple[str, str]:
     return full, "saves/" + "/".join(parts)
 
 
-@registry.command("store", usage="!store save <name> | !store load <name>", desc="Save/load all matches and channel bindings (files in the bot's saves/ folder; server administrators only).", snapshot=False)
+@registry.command("store", usage="!store save <name> | !store load <name>", desc="Save/load this server's matches, game systems and channel bindings (files in the server's own saves folder; server administrators only).", snapshot=False)
 async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
         title, body = registry.help_for(["store"])
@@ -7862,7 +8023,7 @@ async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         for extra in args[2:]:
             if extra.startswith("include_history="):
                 include_history = _parse_bool(extra[len("include_history="):])
-        path, shown = saves_path(args[1], write=True)
+        path, shown = saves_path(args[1], mgr, write=True)
         try:
             mgr.save(path, include_history=include_history)
         except VTTError as ex:
@@ -7872,7 +8033,7 @@ async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "load":# and len(args) >= 2:
         if await return_help_if_not_enough_args(ctx, args, 2, "store", "load"):
             return
-        path, shown = saves_path(args[1])
+        path, shown = saves_path(args[1], mgr)
         try:
             mgr.load(path)
         except VTTError as ex:
@@ -7887,8 +8048,9 @@ registry.annotate_sub(
     "store", "save",
     usage="!store save <name> [include_history=yes]",
     desc=(
-        "Save all matches and channel bindings to a JSON file in the bot's "
-        "`saves/` folder (plain names only; server administrators). By default "
+        "Save this server's matches, game systems and channel bindings to a "
+        "JSON file in its saves folder (plain names only; server "
+        "administrators). Each server has its own folder. By default "
         "excludes per-match autosave history (which can be large); pass "
         "`include_history=yes` to bundle the round/turn/command/manual "
         "saves for full campaign backup."
@@ -7897,9 +8059,10 @@ registry.annotate_sub(
 registry.annotate_sub(
     "store", "load",
     usage="!store load <name>",
-    desc=("Load matches and channel bindings from a JSON file in the bot's "
-          "`saves/` folder, REPLACING every current match (server "
-          "administrators).")
+    desc=("Load matches, game systems and channel bindings from a JSON file "
+          "in this server's saves folder, REPLACING the server's current "
+          "matches and systems (server administrators). Gamerules the save "
+          "lacks take their defaults; ones that no longer exist are dropped.")
 )
 
 
@@ -11618,7 +11781,7 @@ def _restore_all_matches(mgr: MatchManager, snap: Dict[str, Any]) -> None:
         "any of them ran. `!batch strict ...` is all-or-nothing: the first "
         "line whose reply carries a ❌ stops the batch and undoes the lines "
         "before it (every match goes back to how it was, matches the batch "
-        "created are removed, channels point where they did). Bot-wide "
+        "created are removed, channels point where they did). Server-wide "
         "settings a line changed (`!system`, `!defvar`, ...) are not undone."
     ),
 )
@@ -11682,7 +11845,7 @@ async def batch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 async def run_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if await return_help_if_not_enough_args(ctx, args, 1, "run"):
         return
-    full, path = saves_path(args[0])
+    full, path = saves_path(args[0], mgr)
     try:
         with open(full, encoding="utf-8") as f:
             raw = f.read()

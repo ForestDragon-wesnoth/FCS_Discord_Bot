@@ -3,7 +3,7 @@
 # cli.py
 import asyncio, shlex, os, sys
 from typing import List
-from logic import MatchManager
+from logic import Workspaces, LOCAL_WORKSPACE
 from vtt_commands import registry
 
 
@@ -58,10 +58,14 @@ class CLICtx:
     # identity. `!as player` still changes the identity for previewing,
     # it just no longer bounces mutating commands to an approval dead-end.
     auto_approve = True
+    # `!as server <key>` switches to another server's workspace (main()
+    # routes each command by guild_key), for trying out server isolation.
+    workspace_switchable = True
 
     def __init__(self):
         self.user_id = "cli"
         self.user_name = "cli"
+        self.guild_key = LOCAL_WORKSPACE
 
     async def send(self, message: str):
         print(message)
@@ -97,7 +101,7 @@ def parse(line: str):
         raise RuntimeError(f"Parse error: {e}")
 
 async def main():
-    mgr = MatchManager()
+    workspaces = Workspaces()
     ctx = CLICtx()
     color_ok = _enable_terminal_color()
     CLICtx.supports_color = color_ok
@@ -135,7 +139,8 @@ async def main():
 
             root, *args = parts
             try:
-                await registry.run(root, args, ctx, mgr)
+                await registry.run(root, args, ctx,
+                                   workspaces.get(ctx.guild_key))
             except Exception as e:
                 # Surface command/logic errors without killing the CLI
                 print(f"❌ {e}")

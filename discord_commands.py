@@ -4,7 +4,7 @@
 from typing import Any, List, Dict, Optional, Tuple
 import discord
 from discord.ext import commands
-from logic import MatchManager
+from logic import MatchManager, Workspaces
 import vtt_commands
 from vtt_commands import registry, run_approved_request
 import shlex
@@ -166,10 +166,24 @@ async def _parse_and_run_single_line(ctx, line: str, mgr, known_roots) -> bool:
 
 def _is_guild_admin(user) -> bool:
     """True iff `user` is a guild Member holding the Administrator
-    permission. In DMs the author is a plain User with no guild permissions,
-    so bot-wide commands are refused there."""
+    permission (server-wide commands, see vtt_commands.ctx_is_admin)."""
     perms = getattr(user, "guild_permissions", None)
     return bool(getattr(perms, "administrator", False))
+
+
+def _is_bot_owner(user, mgr) -> bool:
+    """True iff `user` is among the bot owner ids read at startup (the
+    Discord application's owner, or its team's members)."""
+    owners = getattr(getattr(mgr, "workspaces", None), "owner_ids", None) or ()
+    return str(getattr(user, "id", "")) in owners
+
+
+# Every server has its own workspace (systems, matches, saves); a DM has no
+# server to hold one, so commands there are refused with this reply.
+DM_REFUSAL = ("❌ This bot only works in servers: each server keeps its own "
+              "game systems, matches and saves. To play alone, create a "
+              "server just for yourself (it takes a few seconds) and invite "
+              "the bot there.")
 
 
 class DiscordCtxWrapper:
@@ -200,9 +214,10 @@ class DiscordCtxWrapper:
         # Real Discord authors are fixed — identity can't be reassigned
         # mid-session the way the CLI's stand-in can.
         self.cli_mutable = False
-        # Bot-wide commands (!system edits, !store, !run, ...) need the
+        # Server-wide commands (!system edits, !store, !run, ...) need the
         # guild Administrator permission — see vtt_commands.ctx_is_admin.
         self.is_admin = _is_guild_admin(author)
+        self.is_bot_owner = _is_bot_owner(author, mgr)
     async def send(self, message: str):
         # Split over-long output at line boundaries so we never trip
         # Discord's content-length cap (see _split_for_discord). Discord also
@@ -243,7 +258,8 @@ class DiscordCtxWrapper:
                     else await self._ctx.send(text)
             except Exception:
                 msg = await self._ctx.send(text)
-        _boards[self.channel_key] = {"message": msg, "match_id": m.id}
+        _boards[self.channel_key] = {"message": msg, "match_id": m.id,
+                                     "workspace": getattr(self._mgr, "guild_key", None)}
         kind = "image" if getattr(m, "render_mode", "text") == "image" else "map"
         return (f"🗺️ Auto-update {kind} board ON — this message refreshes on "
                 "every change" + (" (use the arrows to pan)." if engaged else "."))
@@ -328,12 +344,13 @@ class _InteractionCtx:
     supports_color = True
     viewport_capable = True
 
-    def __init__(self, interaction):
+    def __init__(self, interaction, mgr=None):
         guild = getattr(interaction, "guild", None)
         gid = getattr(guild, "id", "DM")
         self.channel_key = f"{gid}:{interaction.channel_id}"
         user = interaction.user
         self.is_admin = _is_guild_admin(user)
+        self.is_bot_owner = _is_bot_owner(user, mgr)
         self.user_id = str(getattr(user, "id", "")) or "unknown"
         self.user_name = (
             getattr(user, "display_name", None)
@@ -409,7 +426,7 @@ class _ApprovalView(discord.ui.View):
 
     async def _require_host(self, interaction) -> bool:
         m = self._match()
-        ictx = _InteractionCtx(interaction)
+        ictx = _InteractionCtx(interaction, self._mgr)
         if m is None or not m.is_host(ictx.user_id):
             await interaction.response.send_message(
                 "❌ Only a host can resolve this request.", ephemeral=True
@@ -429,7 +446,7 @@ class _ApprovalView(discord.ui.View):
             )
             return self._finish()
         await interaction.response.defer()
-        ictx = _InteractionCtx(interaction)
+        ictx = _InteractionCtx(interaction, self._mgr)
         cmd = "!" + req["name"] + (" " + " ".join(req["args"]) if req["args"] else "")
         await ictx.send(
             f"✅ {ictx.user_name} approved `{cmd}` (by {req['user_name']})."
@@ -507,7 +524,7 @@ class _ResumeView(discord.ui.View):
 
     async def _require_host(self, interaction) -> bool:
         m = self._match()
-        ictx = _InteractionCtx(interaction)
+        ictx = _InteractionCtx(interaction, self._mgr)
         if m is None or (m.owner is not None and not m.is_host(ictx.user_id)):
             await interaction.response.send_message(
                 "❌ Only a host can resume the match.", ephemeral=True)
@@ -524,7 +541,7 @@ class _ResumeView(discord.ui.View):
                 "The match isn't paused any more.", ephemeral=True)
             return await self._disable(interaction)
         await interaction.response.defer()
-        ictx = _InteractionCtx(interaction)
+        ictx = _InteractionCtx(interaction, self._mgr)
         # Point the run at this match even if the clicked channel shows
         # another one, then put the channel back (run_approved_request's rule).
         # A click is not a typed command, so it isn't the clicker's `!again`.
@@ -578,7 +595,8 @@ class _ResumeView(discord.ui.View):
 # same surface-agnostic render_ascii the `!map` command uses; only the
 # message lifecycle lives here, which is why it can't be harness-tested.
 
-# channel_key -> {"message": discord.Message, "match_id": str}
+# channel_key -> {"message": discord.Message, "match_id": str,
+#                 "workspace": the server's workspace key}
 _boards: Dict[str, Dict[str, Any]] = {}
 
 
@@ -715,7 +733,7 @@ class _PanView(discord.ui.View):
         entry = _boards.get(self.channel_key)
         mid = (entry or {}).get("match_id") or \
             self._mgr.get_active_for_channel(self.channel_key)
-        m = self._mgr.get(mid) if mid else None
+        m = self._mgr.matches.get(mid) if mid else None
         if m is not None and self.channel_key not in m.bound_channels:
             try:
                 await interaction.response.defer()
@@ -770,9 +788,12 @@ async def _refresh_boards_for_match(mgr: MatchManager, match_id: str) -> None:
     """Edit every board bound to `match_id` in place (after a state change).
     Best-effort: a failed edit (deleted message, perms) drops that board."""
     for ck, entry in list(_boards.items()):
-        if entry.get("match_id") != match_id:
+        # Match ids are per server: another server's board on a match with
+        # the same id is not this match's board.
+        if (entry.get("match_id") != match_id
+                or entry.get("workspace") != getattr(mgr, "guild_key", None)):
             continue
-        m = mgr.get(match_id)
+        m = mgr.matches.get(match_id)
         if m is None:
             _boards.pop(ck, None)
             continue
@@ -804,8 +825,42 @@ async def _retire_board(channel_key: str, entry: Dict[str, Any],
         pass
 
 
-def wire_commands(bot: commands.Bot, mgr: MatchManager):
+def wire_commands(bot: commands.Bot, workspaces: Workspaces):
+    """Register every registry root as a discord.py command. Each command
+    runs against the workspace (MatchManager) of the server it came from;
+    DMs are refused (DM_REFUSAL)."""
+
+    def _workspace(ctx) -> Optional[MatchManager]:
+        guild = getattr(ctx, "guild", None)
+        if guild is None:
+            return None
+        mgr = workspaces.get(guild.id)
+        mgr.guild_name = str(getattr(guild, "name", "") or guild.id)
+        return mgr
+
+    async def _load_owners():
+        # The bot owner: the Discord application's owner, or every member of
+        # the team that owns it.
+        try:
+            app = await bot.application_info()
+        except Exception as ex:  # noqa: BLE001 - startup must not die on it
+            print(f"⚠️ Couldn't read the bot's owner ({ex}); `!owner` is "
+                  f"refused to everyone until the next start.")
+            return
+        team = getattr(app, "team", None)
+        if team is not None:
+            ids = {str(mem.id) for mem in getattr(team, "members", [])}
+        else:
+            owner = getattr(app, "owner", None)
+            ids = {str(owner.id)} if owner is not None else set()
+        workspaces.owner_ids = ids
+
+    bot.add_listener(_load_owners, "on_ready")
+
     async def _dispatch(ctx, bound_root: str):
+        mgr = _workspace(ctx)
+        if mgr is None:
+            return await ctx.send(DM_REFUSAL)
         content = ctx.message.content or ""
         s = content.lstrip()
     
@@ -906,9 +961,13 @@ def wire_commands(bot: commands.Bot, mgr: MatchManager):
     async def on_command_error(ctx, error):
         if isinstance(error, commands.CommandNotFound):
             name = getattr(ctx, "invoked_with", None) or ""
-            gid = getattr(ctx.guild, "id", "DM")
-            mid = mgr.get_active_for_channel(f"{gid}:{ctx.channel.id}")
-            m = mgr.get(mid) if mid else None
+            guild = getattr(ctx, "guild", None)
+            # peek: an unknown word must not create a workspace, and a DM
+            # (no server) has no aliases.
+            mgr = workspaces.peek(guild.id) if guild is not None else None
+            mid = mgr.get_active_for_channel(f"{guild.id}:{ctx.channel.id}") \
+                if mgr is not None else None
+            m = mgr.matches.get(mid) if mid else None
             if name and m is not None and name in m.aliases:
                 await _dispatch(ctx, name)
             return

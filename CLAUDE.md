@@ -65,6 +65,25 @@ even those should fall out of existing primitives (a passive/watcher
 the GM writes), not a new AI subsystem. When a feature idea reduces to
 "the engine decides what an entity does," stop and reconsider.
 
+### Don't add features that existing primitives already compose
+
+User rule: **we shouldn't add features that can easily be implemented by
+stringing together existing functionality, unless it is something that needs
+to be simplified often enough.** Before proposing a feature, try to build it
+from what ships (formulas, actions, passives, watchers, macros, `!foreach`,
+events). If that works in a few lines, the answer is a scenario that shows how,
+not new engine code. Add a shortcut only when GMs would write the same
+composition over and over (lowest_var / highest_var exist because every
+targeting formula needed the same accumulator loop).
+
+### The square grid is fundamental
+
+The map is a grid of square cells and stays that way: every geometry
+primitive, footprint, LOS walk, region, renderer and coordinate convention
+assumes it. Hex grids were proposed and rejected by the user (a refactor
+touching everything, harder maths and rendering, and they make hex games in
+Battle for Wesnoth). Don't propose other grid shapes.
+
 ### Backwards compat is irrelevant this early
 
 The user has said this repeatedly. **Rewrite > dual-implementation
@@ -319,41 +338,72 @@ behavior is what shipped).
 
 Add cross-cutting features here, not at the call sites.
 
-### ⚠️ Multi-tenant caveat (INTERIM — read before touching access or storage)
+### Server workspaces (each Discord server is separate)
 
-ONE bot process serves EVERY Discord guild it's in, and today they all share
-one `MatchManager`: the GameSystems (rules, `command_access`, default vars /
-passives / clamps, system aliases), the match table, and the `saves/` folder
-are GLOBAL. Nothing is partitioned per guild. The current protections are
-stop-gaps (audit-pass-29, user-approved):
-- **Bot-wide commands need a server administrator** — `!system` edits,
+ONE bot process serves every Discord server it's in, and each server has its
+own WORKSPACE: a `MatchManager` holding that server's GameSystems (rules,
+`command_access`, default vars / passives / clamps, system aliases), matches,
+channel pointers, saves folder and command lock. `logic.Workspaces` maps a
+guild id to its manager, creating it (with a fresh `default` system built from
+RULES_REGISTRY) on the server's first command. The Discord adapter
+(`discord_commands.wire_commands(bot, workspaces)`) routes every command,
+alias, button click and board refresh by the guild the message came from, so
+a match id, system name or save name only means something inside its own
+server, and nothing can name another server's data. The CLI / GUI / harness
+use the `local` workspace (`logic.LOCAL_WORKSPACE`); the CLI and the harness
+switch workspaces with `!as server <key>` (scenarios 698-700).
+- **DMs are refused** (`DM_REFUSAL`: make a one-person server instead) — a
+  DM has no server to hold a workspace. An unknown `!word` in a DM is ignored.
+- **Server-wide commands need a server administrator** — `!system` edits,
   `!defvar`/`!defpassive`/`!gclamp` edits, `!store`, `!run`, `!history
   export/import` (`vtt_commands._admin_required` + `ctx_is_admin`; Discord =
-  the guild Administrator permission, CLI/GUI = always). Checked in BOTH
-  `CommandRegistry.run` and `dispatch_no_snapshot` (so batch/macro/foreach/
-  `!run` lines and action `cmd()` can't wrap them), rejected outright (never
-  queued), not overridable by `!host access` / `command_access`, and it skips
-  the per-match gate once passed. Action bodies can't run them at all
-  (`_BufferCtx` carries no admin flag — default-deny).
+  the guild Administrator permission, CLI/GUI = always). They change state
+  shared by every match of the server, and anyone can create and host a
+  match, so a match host isn't enough. Checked in BOTH `CommandRegistry.run`
+  and `dispatch_no_snapshot` (so batch/macro/foreach/`!run` lines and action
+  `cmd()` can't wrap them), rejected outright (never queued), not overridable
+  by `!host access` / `command_access`, and it skips the per-match gate once
+  passed. Action bodies can't run them at all (`_BufferCtx` carries no admin
+  flag — default-deny).
 - **Commands that NAME another match** (`!match use/bind/rename/delete <id>`,
   `!ent copy/transfer <id> <dest>`) need host (delete: owner) of THAT match
-  (`require_target_host`) — the access gate only checks the CHANNEL's match.
-- **Disk paths are confined to `saves/`** (next section).
-The hole that remains BY DESIGN for now: an administrator of guild A can still
-change a shared system that guild B's matches use, `!store load` replaces every
-guild's matches, and `!match` lists every match id bot-wide. **When the bot is
-redesigned for proper data storage, systems, matches, saves and access MUST be
-split per guild** (each guild its own systems + match table + save folder, and
-cross-guild references impossible by construction). Don't build new features
-that deepen the sharing (e.g. a cross-guild match browser); do route any new
-global-state command through `_admin_required`.
+  (`require_target_host`) — the access gate only checks the CHANNEL's match,
+  and one server can run several matches with different hosts.
+- **Bot owner.** `Workspaces.owner_ids` is read at startup from Discord
+  (`bot.application_info()`: the application's owner, or its team's members);
+  `ctx_is_bot_owner` (Discord sets `is_bot_owner`; CLI/GUI = always; default-
+  deny elsewhere). Owner-only commands live under `!owner` (`!owner servers`
+  lists every workspace); `!whoami` shows the badge. Owner is NOT admin of
+  every server: server-wide commands still need that server's Administrator.
+- **System rules on load:** a system saved by an older build may name a
+  gamerule that no longer exists — `GameSystem.from_dict` drops it with a
+  console note. A gamerule the save lacks needs nothing: systems store only
+  overrides, so it reads the RULES_REGISTRY default.
+- `!system default server|channel` (the old `global` scope and the per-server
+  default map are gone — a workspace is one server). `!match` / `!match list`
+  are player-available: they list only this server's matches.
+- STILL SHARED across servers: the process and its event loop. A slow command
+  in one server delays every server, so anything whose cost follows a user's
+  numbers needs a budget rule (formula_cell_limit, sight_check_limit, ...).
+  formula_cell_limit has no maximum, so a server's admin can still set it
+  high enough to stall the bot — a job for the limits work below.
+- Persistence is the NEXT step (agreed with the user, not built yet): a JSON
+  storage class under `data/<guild_id>/` (systems.json, matches/, saves/,
+  sprites/) plus `data/bot_settings.json`, written after every state-changing
+  command, loaded at startup; per-server (1000 MB) and global (20 GB) storage
+  limits with rollback + warning, owner-overridable via `!owner limit`; per-
+  server sprites; `!server wipe` with a typed confirmation phrase and a 24 h
+  trash. Until then everything lives in memory and `!store save` is the only
+  way to keep a server's state across a restart.
 
-### Disk access is confined to `saves/`
+### Disk access is confined to the server's saves folder
 
 Every command that reads or writes a host file — `!store save/load`, `!run`,
-`!history export/import` — goes through `vtt_commands.saves_path(name,
-write=)`, which resolves plain relative names (subfolders allowed) inside
-`SAVES_DIR` (`saves/` next to the code) and refuses `..`, absolute paths,
+`!history export/import` — goes through `vtt_commands.saves_path(name, mgr,
+write=)`, which resolves plain relative names (subfolders allowed) inside the
+workspace's folder (`server_saves_dir`: `SAVES_DIR` itself for `local`,
+`SAVES_DIR/servers/<guild id>/` for a Discord server, so one server's
+`!store load` can't read another's files) and refuses `..`, absolute paths,
 drive letters and anything whose realpath (symlinks included) leaves the
 folder. Replies show `saves/<name>`, never the host's absolute path. Before
 this, `!run 1bot_token.txt` echoed the bot token back line by line ("Unknown
@@ -723,8 +773,8 @@ Shipped capabilities (roughly chronological; all merged):
     content, not a subcommand — scenario 570); a new command gets no
     downgrade until its read-only subs are listed there. Gate is a NO-OP when there's
     no active match, no identity, or `owner is None` (legacy/open
-    matches) — which is why BOT-WIDE commands have their own admin check and
-    match-NAMING commands their own target check (see "Multi-tenant caveat"
+    matches) — which is why SERVER-WIDE commands have their own admin check and
+    match-NAMING commands their own target check (see "Server workspaces"
     in §3). Alias resolution runs BEFORE the gate; `dispatch_no_snapshot`
     (batch/run/action `cmd()`) is intentionally ungated since it's only
     reached from an already-approved/host context — gate stays at the
@@ -3568,7 +3618,7 @@ More shipped work (continuing the list above):
     read-only subs each handler really dispatches, plus a module-end assert
     that every key is a registered command (570).
   - **Cross-guild / global-state access (CRITICAL, user design calls).** See
-    §3 "Multi-tenant caveat" + "Disk access is confined to `saves/`":
+    §3 "Server workspaces" + "Disk access is confined to the server's saves folder":
     admin-only bot-wide commands, target-host checks, `saves/` confinement
     (572-574). Verified before the fix: token file readable via `!run`; one
     guild's user opened `ent` to all in another guild's match via `!system
@@ -3829,7 +3879,8 @@ More shipped work (continuing the list above):
     `target=`/`scope=`); stray trailing words were dropped (`_check_tail` on
     `!ent add/tp/hp/init/set_var` — an unquoted `hello world` stored
     "hello"); 21 error replies lacked the ❌ prefix. New: `!match list`
-    (host-gated like bare `!match`, it lists every match bot-wide) and
+    (host-gated like bare `!match` back then, when it listed every match
+    bot-wide; player-available since the server-workspace split) and
     `!match info` (this channel's match, player-available) (595).
   - **Rotten scenarios repaired** (each "passed" while testing nothing):
     removed subcommands (`!ent team`, `set_facing`, `list_vars`, `macro
@@ -4235,9 +4286,8 @@ More shipped work (continuing the list above):
     not one unit. `CommandRegistry.run` holds a per-manager `asyncio.Lock`
     (`_command_lock(mgr)`, runtime-only), re-entrant within a task through
     the `_HOLDS_COMMAND_LOCK` context var (approvals, `!again`, held
-    commands run nested). It is ONE lock for the whole bot — every guild's
-    commands queue behind each other; fine while the bot is small, and one
-    more thing the per-guild split (§3 multi-tenant caveat) should revisit.
+    commands run nested). (Since the server-workspace split each server has
+    its own manager, so its own lock: servers don't queue behind each other.)
   - **`!store load` was not all-or-nothing (HIGH).** It replaced the matches
     before parsing the systems, so loading a `!history export` file (no
     systems) wiped every match and then reported the error. `load` now
@@ -4542,6 +4592,38 @@ More shipped work (continuing the list above):
     `(negated, alternatives)`; `_find_match_entity` takes those groups,
     `_find_all_preds` is the old single-predicate body. The POV filter runs
     first, so a negated selector can't surface a hidden unit.
+
+- **Server workspaces + `!map ent_sight` — SHIPPED (scenarios 698-703).**
+  - **Workspace split** — see §3 "Server workspaces" for the shape. Mechanics:
+    `MatchManager(guild_key)` + `guild_name` / `workspaces` backref;
+    `logic.Workspaces` (`get` creates, `peek` doesn't, `items`, `owner_ids`);
+    `wire_commands(bot, workspaces)` with `_workspace(ctx)` per command,
+    `DM_REFUSAL`, `_load_owners` on `on_ready`; boards carry their
+    `workspace` key and `_refresh_boards_for_match` only touches its own
+    server's boards (match ids repeat across servers, so a refresh in one
+    server used to be able to retire another's board). Per-server saves via
+    `saves_path(name, mgr)`. `!system default server|channel` (no `global`,
+    no per-server map). `!match` / `!match list` player-available. New
+    `!owner servers`, `!as server <key>` (CLI / harness), `!whoami` shows
+    bot owner + server workspace. Unknown gamerules in a loaded system are
+    dropped with a console note.
+  - **`!map ent_sight <eid> [color=] [opacity=]` (701-703).** The cells one
+    unit sees right now — `Match.unit_sight_cells`: within its vision radius
+    of some body cell with a clear line from that cell (range + LOS, fog
+    toggles ignored, like can_see; a multi-tile body sees from every cell) —
+    marked like `!map preview` (shared `_show_marked_map` / `_mark_style`:
+    ASCII preview_glyph, graphics highlights) and the units it sees (minus
+    the stealth rule from its own team, as visible_entities). Under a team
+    POV a non-host may ask about their own team's units only (root body's
+    team), a hidden unit reads as missing, and marks are cut to cells the
+    POV terrain-sees (a sight shape drawn over fog would trace hidden walls);
+    hosts may ask about any unit, still under the channel POV. Work (one per
+    range check + each sight line's length) is capped by the new
+    `sight_check_limit` rule (default 1000000 ≈ 1 s, max 10000000): the
+    event loop is shared by every server.
+  - **Struck ideas (user, 2026-10):** small #7 (composable, see §1), medium
+    #156, large #44 hex grid (§1: square grid is fundamental), large #45
+    translation. Nested maps per match: wanted, later.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

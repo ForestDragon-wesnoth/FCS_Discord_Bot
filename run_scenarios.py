@@ -49,7 +49,7 @@ import shlex
 import sys
 from typing import Dict, List, Tuple
 
-from logic import MatchManager
+from logic import Workspaces, LOCAL_WORKSPACE
 from vtt_commands import registry
 
 SCENARIO_RE = re.compile(
@@ -87,17 +87,28 @@ class _Ctx:
     the host/player gating with `!as host` / `!as player <name>`."""
     channel_key = "CLI"
     cli_mutable = True
+    # `!as server <key>` moves the harness into another server's workspace
+    # (run_one routes each command by guild_key), so scenarios can show two
+    # servers' systems, matches and saves staying apart.
+    workspace_switchable = True
 
     def __init__(self) -> None:
         self.out: List[str] = []
         self.user_id = "cli"
         self.user_name = "cli"
+        self.guild_key = LOCAL_WORKSPACE
 
     @property
     def is_admin(self) -> bool:
-        # Bot-wide commands (!system edits, !store, !run, ...) need an admin.
-        # The harness's owner identity stands in for a server administrator;
-        # `!as player <name>` drops it, so scenarios can test the refusal.
+        # Server-wide commands (!system edits, !store, !run, ...) need an
+        # admin. The harness's owner identity stands in for a server
+        # administrator; `!as player <name>` drops it, so scenarios can test
+        # the refusal.
+        return self.user_id == "cli"
+
+    @property
+    def is_bot_owner(self) -> bool:
+        # Same stand-in for the bot owner (the `!owner` commands).
         return self.user_id == "cli"
 
     async def send(self, message: str) -> None:
@@ -163,10 +174,11 @@ def _check_expectation(line: str, previous: List[str]) -> str:
 
 
 async def run_one(cmds: List[str]) -> List[Tuple[str, List[str]]]:
-    """Run a scenario's commands against a fresh MatchManager. Returns
+    """Run a scenario's commands against fresh workspaces (the local one
+    unless `!as server <key>` switches). Returns
     [(command_line, [output_line, ...]), ...]. A `??` / `?!` line checks the
     reply of the command before it (see the module docstring)."""
-    mgr = MatchManager()
+    workspaces = Workspaces()
     ctx = _Ctx()
     transcript: List[Tuple[str, List[str]]] = []
     previous: List[str] = []
@@ -184,6 +196,7 @@ async def run_one(cmds: List[str]) -> List[Tuple[str, List[str]]]:
         if not parts:
             continue
         try:
+            mgr = workspaces.get(ctx.guild_key)
             await registry.run(parts[0], parts[1:], ctx, mgr)
         except Exception as e:  # noqa: BLE001 - surface as a flagged failure
             ctx.out.append(f"💥 Uncaught: {type(e).__name__}: {e}")
