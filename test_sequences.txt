@@ -18582,8 +18582,8 @@ SCENARIO 680 — coordinate rulers on the ASCII map (multi-tile, viewport)
 !map coords=maybe
 ?? use coords=on or coords=off
 !system set default viewport_mode auto
-!system set default viewport_width 30
-!system set default viewport_height 30
+!system set default viewport_width 28
+!system set default viewport_height 28
 
 Expected: HARNESS-ALLOWS-ERRORS. Maps carry coordinate rulers by default (the
 map_coords rule). Column numbers are stacked: the tens digits on the first

@@ -1686,7 +1686,8 @@ More shipped work (continuing the list above):
   - **Viewport / panning (#110, headless-testable core).** Caps how much grid
     renders at once: engages when EITHER dimension exceeds its cap (a 70×5 grid
     still windows horizontally), window size = min(cap, grid) per axis. Caps are
-    the `viewport_width` / `viewport_height` rules (default 30). Per-CHANNEL
+    the `viewport_width` / `viewport_height` rules (default 28; was 30 until the
+    rulers shipped). Per-CHANNEL
     offset in `Match.channel_views` (channel_key -> [x,y], serialized), the
     panning analog of per-channel POV. Surface gating: the `viewport_mode` rule
     (`auto` default | `on` | `off`) — `auto` defers to the surface's
@@ -4436,8 +4437,10 @@ More shipped work (continuing the list above):
     1-based and viewport-aware. Graphics: the scene model carries `coords`;
     `SceneRenderer._add_rulers` draws whole numbers in a top/left margin
     (`ruler_margin`), and `scene_dims` counts the margins so `fit_cell_size`
-    still fits the pixel budget. Discord: a 30x30 window with rulers is ~2030
-    characters (over the 2000 cap), so the auto-update board drops the rulers
+    still fits the pixel budget. Discord: the viewport default dropped from 30 to 28 (user
+    call) so a full window with rulers fits one message (~1860 characters;
+    30x30 is ~2100, over the 2000 cap). A larger window still fits through
+    the fallbacks: the auto-update board drops the rulers
     first (then color, then legend), and a plain `!map` on a surface with
     `ctx.message_limit` (Discord sets it) leaves them out with a note instead of
     splitting the map. An explicit `coords=on` is kept as asked.

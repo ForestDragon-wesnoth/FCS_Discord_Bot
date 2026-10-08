@@ -605,7 +605,7 @@ def _board_render(m, channel_key: str) -> Tuple[str, bool]:
     A board is ONE message edited in place, so unlike a `!map` reply it
     can't be split across messages — and an edit over Discord's content cap
     fails, which used to silently drop the board. ANSI color costs ~9 chars
-    per colored cell, so a default 30x30 window with a dozen or so team-
+    per colored cell, so a default 28x28 window with a dozen or so team-
     colored units already crosses 2000. Degrade instead: drop color, then
     the legend; if even the bare map is too big, say so (the viewport rules
     set the window size)."""

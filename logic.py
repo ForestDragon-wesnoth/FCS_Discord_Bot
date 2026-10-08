@@ -2137,16 +2137,17 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "viewport_width": {
-        "default": 30,
+        "default": 28,
         "schema": {"type": "int", "min": 1},
         "desc": (
             "Max map columns shown at once before a horizontal viewport "
             "engages. A grid wider than this renders a window and the "
-            "channel pans it (`!map pan left|right`)."
+            "channel pans it (`!map pan left|right`). The 28 default keeps "
+            "a full window with coordinate rulers inside one Discord message."
         ),
     },
     "viewport_height": {
-        "default": 30,
+        "default": 28,
         "schema": {"type": "int", "min": 1},
         "desc": (
             "Max map rows shown at once before a vertical viewport engages "
