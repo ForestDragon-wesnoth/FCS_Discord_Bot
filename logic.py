@@ -11846,30 +11846,82 @@ class Match:
         riders don't count) and not movement-blocked for it; without `e`, a
         single in-bounds unoccupied cell. Returns the anchor or None. The
         read-only query behind the free_cell_near formula function."""
-        ignore: Tuple[str, ...] = ()
-        if e is not None:
-            ignore = self._occupancy_ignore(
-                e, tuple(r.id for r in self.vehicle_riders(e.id)))
+        ignore = self._stand_ignore(e)
         for r in range(0, max(0, radius) + 1):
             ring = [(x + dx, y + dy)
                     for dy in range(-r, r + 1) for dx in range(-r, r + 1)
                     if max(abs(dx), abs(dy)) == r]
             for cx, cy in ring:
-                if e is None:
-                    if self.in_bounds(cx, cy) and not self.is_occupied(cx, cy):
-                        return (cx, cy)
-                    continue
-                if not self.footprint_in_bounds(e, cx, cy):
-                    continue
-                cells = self.entity_cells(e, cx, cy)
-                if not e.is_cell_stackable and any(
-                        self.cell_occupant(fx, fy, ignore) is not None
-                        for fx, fy in cells):
-                    continue
-                if any(self.cell_blocks(e.id, fx, fy) for fx, fy in cells):
-                    continue
-                return (cx, cy)
+                if self._can_stand_at(e, cx, cy, ignore):
+                    return (cx, cy)
         return None
+
+    def _stand_ignore(self, e: Optional["Entity"]) -> Tuple[str, ...]:
+        """Units that don't count as in the way of `e` standing somewhere:
+        its own body, snake segments and riders."""
+        if e is None:
+            return ()
+        return self._occupancy_ignore(
+            e, tuple(r.id for r in self.vehicle_riders(e.id)))
+
+    def _can_stand_at(self, e: Optional["Entity"], cx: int, cy: int,
+                      ignore: Tuple[str, ...] = ()) -> bool:
+        """The free_cell_near test for one anchor: with `e`, its whole body
+        anchored at (cx, cy) is on the map, clear of other units (unless
+        stackable) and not movement-blocked for it; without, one on-map
+        empty cell."""
+        if e is None:
+            return self.in_bounds(cx, cy) and not self.is_occupied(cx, cy)
+        if not self.footprint_in_bounds(e, cx, cy):
+            return False
+        cells = self.entity_cells(e, cx, cy)
+        if not e.is_cell_stackable and any(
+                self.cell_occupant(fx, fy, ignore) is not None
+                for fx, fy in cells):
+            return False
+        return not any(self.cell_blocks(e.id, fx, fy) for fx, fy in cells)
+
+    RANDOM_CELL_FITS = ("body", "center", "any", "anchor")
+
+    def free_anchors_in_area(self, area: Set[Tuple[int, int]],
+                             e: Optional["Entity"], fit: str = "body",
+                             limit: Optional[int] = None) -> List[Tuple[int, int]]:
+        """Every anchor where `e` could stand (_can_stand_at) with its body
+        placed in `area` by `fit`: `body` = every cell of the body in the
+        area, `center` = its centre cell (rounded down for even sizes, like
+        entity_center), `any` = at least one cell, `anchor` = its top-left
+        cell. Without `e`, the area's empty cells. Sorted top-to-bottom,
+        left-to-right so a seeded pick is reproducible. `limit` caps the
+        cells examined (candidates x body size) — the formula_cell_limit."""
+        if fit not in self.RANDOM_CELL_FITS:
+            raise VTTError(
+                f"fit must be one of {', '.join(self.RANDOM_CELL_FITS)}, "
+                f"got {fit!r}.")
+        ignore = self._stand_ignore(e)
+        if e is None:
+            w = h = 1
+        else:
+            w, h = self.entity_footprint(e)
+        if e is None or fit in ("body", "anchor"):
+            cand = set(area)
+        elif fit == "center":
+            ox, oy = (w - 1) // 2, (h - 1) // 2
+            cand = {(x - ox, y - oy) for x, y in area}
+        else:
+            cand = {(x - dx, y - dy) for x, y in area
+                    for dy in range(h) for dx in range(w)}
+        if limit is not None and len(cand) * w * h > limit:
+            raise VTTError(
+                f"checking {len(cand)} spots for a {w}x{h} body covers more "
+                f"than the formula_cell_limit of {limit} cells.")
+        out = []
+        for ax, ay in sorted(cand, key=lambda c: (c[1], c[0])):
+            if (e is not None and fit == "body"
+                    and any(c not in area for c in self.entity_cells(e, ax, ay))):
+                continue
+            if self._can_stand_at(e, ax, ay, ignore):
+                out.append((ax, ay))
+        return out
 
     # ---- death / corpse machinery ----------------------------------------
     # A "corpse" is an entry under `tile[(x,y)].corpses.<eid>` carrying

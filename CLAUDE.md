@@ -4469,11 +4469,20 @@ More shipped work (continuing the list above):
   - The `!map scene` summary shows `coords=on|off`.
 
 - **Container reads, flanking, nearest_cell, visible_entities, `!batch
-  strict`, selector `!` / `|` — SHIPPED (scenarios 685-695).** Ideas #99,
-  #100, #102, #103, #106, #109, #110 from the 2026-10 small list. #101
-  (random_cell / random_free_cell) is deferred: the user wants to decide
-  later whether a multi-tile unit's whole body or only its anchor must lie in
-  the area.
+  strict`, selector `!` / `|`, random cells — SHIPPED (scenarios 685-697).**
+  Ideas #99-#103, #106, #109, #110 from the 2026-10 small list.
+  - **`random_cell(zone | x1, y1, x2, y2)` / `random_free_cell(zone | x1, y1,
+    x2, y2[, eid], fit='body')` (696-697).** Match RNG (random_seed, choose()
+    replay); [x, y] or None. A rectangle is clipped to the map and charged to
+    formula_cell_limit. random_free_cell returns an ANCHOR where the unit
+    passes the free_cell_near test (`Match._can_stand_at`, factored out of
+    free_cell_near: body on the map, no other unit, not cell_blocks).
+    `fit` (user call: an argument, default whole body) says how a multi-tile
+    body sits in the area: `body` (every cell inside), `center` (centre cell,
+    floored like entity_center), `any` (one cell), `anchor` (top-left cell).
+    Without eid: a random empty cell of the area. Core
+    `Match.free_anchors_in_area(area, e, fit, limit)`; candidates sorted so a
+    seeded pick reproduces; candidates × body size is charged to the limit.
   - **`get(container, key[, default])` (685-686).** Subscripts are banned, so a
     list or dict held in a local or read with var_get couldn't be read one
     element at a time. `key` is a dict key, a list index (-1 = last) or a

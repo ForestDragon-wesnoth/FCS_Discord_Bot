@@ -19092,3 +19092,81 @@ SCENARIO 695 — !foreach with negated selectors; a player can't find hidden uni
 Expected: The sweep tags every unit on neither blue nor red: b. Under red's
 view the invisible c is hidden, and a negated selector doesn't bring it
 back: !team=red lists only b.
+
+SCENARIO 696 — random_cell / random_free_cell: how a multi-tile body must fit the area
+---------------------------------------------------------------------------------------
+
+!match new s696 Drop 20 20
+!match use s696
+!ent add dragon Dragon 50 1 15 5
+!ent set_var dragon footprint_w 3
+!ent set_var dragon footprint_h 3
+!zone new fire
+!zone fill fire 6 6 10 10
+!zone new hall
+!zone fill hall 2 3 14 4
+!assert "random_cell('fire') in cells_in_rect(6, 6, 10, 10)"
+!assert "random_cell(18, 18, 30, 30) in cells_in_rect(18, 18, 20, 20)" the rectangle is clipped to the map
+!assert "random_cell(25, 25, 30, 30) == None" no cell on the map
+!assert "random_free_cell('fire', 'dragon') in cells_in_rect(6, 6, 8, 8)" "the default 'body' fit: the whole 3×3 inside the 5×5 zone"
+!assert "random_free_cell('fire', 'dragon', fit='center') in cells_in_rect(5, 5, 9, 9)" the centre cell inside
+!assert "random_free_cell('fire', 'dragon', fit='any') in cells_in_rect(4, 4, 10, 10)" one cell inside
+!assert "random_free_cell('fire', 'dragon', fit='anchor') in cells_in_rect(6, 6, 10, 10)"
+!assert "random_free_cell('hall', 'dragon') == None" "a 2-row hall can't hold the whole body"
+!assert "random_free_cell('hall', 'dragon', fit='any') != None" straddling it can
+!ent add rock Rock 5 10 10 5
+!tile set 6 6 block true
+!assert "random_free_cell('fire', 'dragon') in [[7, 6], [8, 6], [6, 7], [7, 7], [8, 7], [6, 8], [7, 8]]" "the rock and the wall rule out (8, 8) and (6, 6)"
+!assert "random_free_cell(10, 10, 10, 10) == None and random_free_cell(9, 9, 9, 9) == [9, 9]" without a unit, an empty cell
+!eval "random_free_cell('fire', 'dragon', fit='middle')"
+?? fit must be one of body, center, any, anchor
+!eval "random_cell('nope')"
+?? no zone named 'nope'
+!eval "random_cell(1, 2, 3)"
+?? give a zone name or x1, y1, x2, y2
+
+Expected: HARNESS-ALLOWS-ERRORS. random_cell picks a cell of a zone or of a
+rectangle clipped to the map (None when nothing is on the map).
+random_free_cell returns an anchor where the dragon could stand. By default
+its whole 3×3 body must be inside the 5×5 fire zone (anchors (6-8, 6-8));
+fit='center' needs only its centre cell inside, 'any' one cell, 'anchor' its
+top-left cell. The 2-row hall can't hold the whole body, so the default
+returns None while 'any' finds a spot. The rock at (10, 10) and the blocking
+wall at (6, 6) leave 7 spots. Without a unit it returns an empty cell. An
+unknown fit or zone, or the wrong number of numbers, is an error.
+
+SCENARIO 697 — random_free_cell in an action: a blink that always lands the whole body
+---------------------------------------------------------------------------------------
+
+!match new s697 Blink 20 20
+!system set default random_seed 7
+!match use s697
+!ent add wyrm Wyrm 40 1 1 5
+!ent set_var wyrm footprint_w 2
+!ent set_var wyrm footprint_h 2
+!zone new lair
+!zone fill lair 12 12 16 16
+!ent add guard Guard 10 14 14 5
+!ent set_var wyrm actions.blink.target none
+!ent set_var wyrm actions.blink.body "spot = random_free_cell('lair', self_id())\nif spot == None:\n    fail('nowhere to land')\nmove_entity(self_id(), coord_x(spot), coord_y(spot))"
+!action wyrm blink
+!assert "occupies('wyrm', entity[wyrm].x, entity[wyrm].y) and entity[wyrm].x >= 12 and entity[wyrm].x <= 15 and entity[wyrm].y >= 12 and entity[wyrm].y <= 15" the whole 2×2 body is in the lair
+!assert "not occupies('wyrm', 14, 14)" "the guard's cell is never covered"
+!action wyrm blink
+!assert "entity[wyrm].x >= 12 and entity[wyrm].x <= 15 and entity[wyrm].y >= 12 and entity[wyrm].y <= 15"
+!zone new pit
+!zone add pit 2 18
+!ent set_var wyrm stay_x $(entity[wyrm].x)
+!ent set_var wyrm actions.dive.target none
+!ent set_var wyrm actions.dive.body "spot = random_free_cell('pit', self_id())\nif spot == None:\n    fail('nowhere to land')\nmove_entity(self_id(), coord_x(spot), coord_y(spot))"
+!action wyrm dive
+?? nowhere to land
+!assert "entity[wyrm].x == entity[wyrm].stay_x" the failed dive left it in place
+!system set default random_seed ""
+
+Expected: HARNESS-ALLOWS-ERRORS. The blink teleports the 2×2 wyrm to a random
+spot where its whole body fits in the 5×5 lair (anchors 12-15 on both axes)
+and never onto the guard at (14, 14); a second blink lands inside again. The
+one-cell pit can't hold the body, so random_free_cell returns None and the
+dive fails, leaving the wyrm where it was. With random_seed set, the picks
+follow the seed.

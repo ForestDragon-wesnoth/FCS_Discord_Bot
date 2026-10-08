@@ -2512,7 +2512,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # covering a cell (stackable ones included).
     "zone_distance", "entities_at",
     "flanking", "flanking_angle", "flanking_line", "nearest_cell",
-    "visible_entities",
+    "visible_entities", "random_cell", "random_free_cell",
     # Footprint / large-entity primitives. A large entity occupies a W×H
     # rectangle anchored at its top-left cell (entity[X].x / .y); these
     # expose that footprint to formulas.
@@ -2580,7 +2580,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
 # function as MUTATING (leave it out of this set).
 ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'flanking', 'flanking_angle', 'flanking_line', 'nearest_cell',
-    'visible_entities',
+    'visible_entities', 'random_cell', 'random_free_cell',
     'all_corpses', 'all_entities', 'aoe_origin', 'apply_mods',
     'atb_rate', 'atb_threshold', 'can_mount', 'can_see',
     'can_see_losonly', 'can_see_rangeonly', 'cell_entity',
@@ -7519,6 +7519,64 @@ class FormulaEngine:
             scored.sort()
             return [oid for _, oid in scored]
 
+        def _area_cells(fname: str, args: tuple) -> set:
+            """The on-map cells of a zone name or an x1, y1, x2, y2
+            rectangle (corners in any order) — the area random_cell /
+            random_free_cell pick from."""
+            if len(args) == 1 and isinstance(args[0], str):
+                z = match.zones.get(args[0])
+                if z is None:
+                    raise FormulaError(f"{fname}: no zone named {args[0]!r}.")
+                return {c for c in (z.get("cells") or ())
+                        if match.in_bounds(*c)}
+            if len(args) == 4:
+                xs = sorted(_cell_arg(v, fname, "x") for v in args[0::2])
+                ys = sorted(_cell_arg(v, fname, "y") for v in args[1::2])
+                x1, x2 = max(xs[0], 1), min(xs[1], match.grid_width)
+                y1, y2 = max(ys[0], 1), min(ys[1], match.grid_height)
+                if x1 > x2 or y1 > y2:
+                    return set()
+                _cell_budget((x2 - x1 + 1) * (y2 - y1 + 1), fname, cell_limit)
+                return {(x, y) for y in range(y1, y2 + 1)
+                        for x in range(x1, x2 + 1)}
+            raise FormulaError(
+                f"{fname}(...): give a zone name or x1, y1, x2, y2.")
+
+        def _random_cell(*args: Any) -> Any:
+            """random_cell(zone) / random_cell(x1, y1, x2, y2): a random cell
+            of the zone or rectangle (clipped to the map) as [x, y], or None
+            when it has no cell on the map. Uses the match RNG (random_seed,
+            choose() replay)."""
+            cells = sorted(_area_cells("random_cell", args),
+                           key=lambda c: (c[1], c[0]))
+            return list(_active_rng().choice(cells)) if cells else None
+
+        def _random_free_cell(*args: Any, fit: Any = "body") -> Any:
+            """random_free_cell(zone[, eid], fit='body') /
+            random_free_cell(x1, y1, x2, y2[, eid], fit='body'): a random spot
+            in the area where the unit could stand (its whole body on the map,
+            clear of other units, not blocked for it — the free_cell_near
+            test), as its anchor [x, y], or None. `fit` says how a multi-tile
+            body must sit in the area: 'body' (every cell inside, the
+            default), 'center' (its centre cell inside), 'any' (at least one
+            cell inside) or 'anchor' (its top-left cell inside). Without eid,
+            a random empty cell of the area. Uses the match RNG."""
+            e = None
+            area_args = args
+            if len(args) in (2, 5):
+                area_args = args[:-1]
+                _, e = _resolve_entity(args[-1], "random_free_cell")
+            if not isinstance(fit, str):
+                raise FormulaError("random_free_cell(...): fit must be text.")
+            area = _area_cells("random_free_cell", area_args)
+            try:
+                spots = match.free_anchors_in_area(area, e, fit, cell_limit)
+            except VTTError as ex:
+                raise FormulaError(f"random_free_cell(...): {ex}")
+            return list(_active_rng().choice(spots)) if spots else None
+
+        ns["random_cell"] = _random_cell
+        ns["random_free_cell"] = _random_free_cell
         ns["flanking"] = _flanking
         ns["flanking_angle"] = _flanking_angle
         ns["flanking_line"] = _flanking_line
