@@ -580,6 +580,10 @@ asking is low. A 30-second clarification beats a 300-line refactor.
   any questions that come up during the work for near the end. Ask mid-way
   only when the answer blocks the rest of development or testing.
 
+Why: the user checks in only occasionally while a pass or feature runs
+(often many minutes). A question asked mid-work leaves the session idle until
+they return; asked at the end, it costs nothing.
+
 ---
 
 ## 7. Current state of the project (as of this handoff)
