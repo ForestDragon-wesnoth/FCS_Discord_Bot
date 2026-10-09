@@ -14778,6 +14778,28 @@ class Match:
         s = e.vars.get("sprite")
         return isinstance(s, str) and bool(s)
 
+    @staticmethod
+    def corpse_glyph(corpse: Dict[str, Any], custom_only: bool = False
+                     ) -> Optional[str]:
+        """The glyph a corpse's graphics fallback draws, from its frozen
+        snapshot, resolved like entity_glyph (no disguise):
+        `glyphs.<facing>` > `glyph` > the facing arrow. `custom_only` = None
+        instead of the arrow."""
+        ent = corpse.get("entity") if isinstance(corpse, dict) else None
+        if not isinstance(ent, dict):
+            return None
+        facing = ent.get("facing", "")
+        vars_ = ent.get("vars") or {}
+        glyphs = vars_.get("glyphs")
+        if isinstance(glyphs, dict):
+            g = glyphs.get(facing)
+            if isinstance(g, str) and len(g) == 1:
+                return g
+        g = vars_.get("glyph")
+        if isinstance(g, str) and len(g) == 1:
+            return g
+        return None if custom_only else DIRECTION_ARROWS.get(facing, "@")
+
     def corpse_sprite(self, corpse: Dict[str, Any]) -> Optional[str]:
         """The sprite key for a corpse, read from its frozen snapshot vars:
         `sprites.<facing>` > `sprite`. No mirror/fallback (a corpse is static
@@ -15374,10 +15396,12 @@ class Match:
                 if not self.corpse_visible_to(cid, corpse, cx, cy, pov_team):
                     continue
                 spr = self.corpse_sprite(corpse)
-                gl = ((corpse.get("entity") or {}).get("vars") or {}).get("glyph")
-                gl = gl if isinstance(gl, str) and len(gl) == 1 else None
-                if spr is None and gl is None:
+                # Drawn when the dead unit had a sprite or a custom glyph; a
+                # sprite whose PNG is missing falls back to its glyph (as a
+                # living unit's does), tinted and faded like the sprite.
+                if spr is None and self.corpse_glyph(corpse, custom_only=True) is None:
                     continue
+                gl = self.corpse_glyph(corpse)
                 cw, ch = self._corpse_footprint(corpse)
                 c_mode = (self._sprite_mode_of(
                               (corpse.get("entity") or {}).get("vars") or {})

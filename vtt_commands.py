@@ -6198,9 +6198,10 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             # Drawing order (lowest layer first), one line per placement.
             for p in sorted(scene["placements"], key=lambda d: d.get("layer", 0)):
                 size = f" {p['w']}x{p['h']} {p['mode']}" if (p["w"], p["h"]) != (1, 1) else ""
-                what = (f"sprite {p['sprite']}" if p.get("sprite")
-                        else f"glyph {p['glyph']}" if p.get("glyph")
-                        else f"color {p['tint']}" if p.get("tint") else "nothing")
+                what = ", ".join(
+                    f"{label} {p[key]}" for label, key in
+                    (("sprite", "sprite"), ("glyph", "glyph"), ("color", "tint"))
+                    if p.get(key)) or "nothing"
                 lines.append(f"• {p['kind']} `{p['ref']}` at ({p['x']},{p['y']})"
                              f"{size} — {what} (layer {p['layer']})")
         return await ctx.send("\n".join(lines))

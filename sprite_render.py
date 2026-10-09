@@ -296,6 +296,10 @@ class SceneRenderer:
             if not (isinstance(glyph, str) and glyph):
                 # A coloured zone / tile with no sprite or glyph: a
                 # translucent square of its colour (ASCII tints the `.`).
+                # Only those: a corpse's or overlay's tint recolours its
+                # sprite, so a missing PNG there draws nothing.
+                if p.get("kind") not in ("zone", "tile"):
+                    return
                 rgb = self._rgb(p.get("tint"))
                 fill = self._tint_fill * opacity // 100
                 if rgb is None or fill <= 0:

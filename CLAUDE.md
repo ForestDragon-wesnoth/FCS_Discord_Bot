@@ -2448,7 +2448,12 @@ More shipped work (continuing the list above):
       - A zone / tile with a `color` but no sprite or glyph drew nothing
         (ASCII tints its `.`): the renderer fills the cell with the colour
         at the new `tint_fill_opacity` rule (default 40; carried in the
-        scene).
+        scene). ONLY zones and tiles: a corpse's / overlay's tint recolours
+        its sprite, and filling the cell with it painted a grey square that
+        read as fog (scenario 714). A corpse whose PNG is missing draws its
+        glyph instead (`Match.corpse_glyph`: glyphs.<facing> > glyph > the
+        facing arrow), grey and faded like the sprite; a corpse with
+        neither a sprite nor a custom glyph is still not drawn.
       - Image render mode dropped `!map hide=` / `coords=`;
         `post_scene_image(m, pov, highlights, hidden, coords)` and
         `scene_for_png(..., hidden_layers, coords)` now take them, as do

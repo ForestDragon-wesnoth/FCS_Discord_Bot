@@ -19727,3 +19727,27 @@ passes them on too (it used to drop them and draw every layer with the
 match's ruler setting). The harness has no image surface, so `!map image`
 reports that graphics are drawn on Discord / gui.py. Unknown options and
 stray words are refused. HARNESS-ALLOWS-ERRORS
+
+SCENARIO 714 — Graphics: a corpse whose sprite is missing shows its glyph, faded
+---------------------------------------------------------------------------------
+
+!match new m714 Fallen 6 4
+!match use m714
+!system set default death_result corpse
+!ent add slain Slain 1 3 3 5
+!ent face slain down
+!ent set_var slain sprite slain_sprite
+!ent kill slain
+!ent add plain Plain 1 5 3 5
+!ent kill plain
+!map scene list
+?? • corpse `slain` at (3,3) — sprite slain_sprite, glyph v, color gray (layer 75)
+?! corpse `plain`
+
+Expected: The corpse is drawn as the dead unit's sprite, tinted grey and at
+50% opacity (corpse_sprite_tint / corpse_sprite_opacity). When the PNG is
+missing, gui.py and Discord images draw its glyph instead, as for a living
+unit: glyphs.<facing> > glyph > the facing arrow (`v`), in that grey at that
+opacity. Before, the grey tint was painted as a translucent square over the
+whole cell, which looked like fog. A corpse whose unit had neither a sprite
+nor a custom glyph (`plain`) is not drawn, as before.
