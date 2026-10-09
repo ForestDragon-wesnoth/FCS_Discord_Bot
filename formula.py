@@ -392,7 +392,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number
+from logic import CURRENT_WORKSPACE, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number
 
 
 class FormulaError(VTTError):
@@ -2438,6 +2438,12 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   remove_entity(eid)                    -> True (despawn)
     "entity_snapshot", "summon", "summon_near", "summon_from",
     "remove_entity",
+    # The server's saved entity templates (`!template`), by name:
+    #   summon_template(name, x, y)              -> new id (strict placement)
+    #   summon_template_near(name, x, y, radius) -> new id (ring search)
+    #   has_template(name) / template_names()    -> read the library
+    "summon_template", "summon_template_near", "has_template",
+    "template_names",
     # Death / corpse family. kill / revive route through the same
     # death pipeline as the natural-death chokepoint; the introspection
     # trio (has_corpse, corpse_at, all_corpses) reads tile-data
@@ -2655,6 +2661,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "emit",
     "use_action",
     "summon", "summon_near", "summon_from", "remove_entity",
+    "summon_template", "summon_template_near",
     "kill", "revive", "transform", "revert",
     "schedule", "schedule_on", "cancel_schedule",
     "log",
@@ -2672,6 +2679,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
 # never silently expose a function in $() args. When unsure, classify a
 # function as MUTATING (leave it out of this set).
 ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
+    'has_template', 'template_names',
     'flanking', 'flanking_angle', 'flanking_line', 'nearest_cell',
     'visible_entities', 'random_cell', 'random_free_cell',
     'all_corpses', 'all_entities', 'aoe_origin', 'apply_mods',
@@ -2831,6 +2839,7 @@ _ALLOWED_NODES: Tuple[type, ...] = (
 # (cells_in_*). The for-loop target shape must match: a single Name for
 # the id case, a 2-tuple of Names for the coord case.
 _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
+    "template_names",
     "range",
     "each",
     "keys",
@@ -5902,6 +5911,62 @@ class FormulaEngine:
             match.surface_log(match.despawn_entity(e))
             return True
 
+        def _workspace_templates() -> Dict[str, Any]:
+            ws = CURRENT_WORKSPACE.get()
+            return getattr(ws, "templates", None) or {}
+
+        def _template_spawn(fn: str, name: Any, x: Any, y: Any,
+                            radius: Any) -> str:
+            if not isinstance(name, str):
+                raise FormulaError(f"{fn}: the template name must be text.")
+            for v, what in ((x, "x"), (y, "y")):
+                if not isinstance(v, int) or isinstance(v, bool):
+                    raise FormulaError(f"{fn}: {what} must be a whole number.")
+            key = name.strip().lower()
+            tpl = _workspace_templates().get(key)
+            if tpl is None:
+                raise FormulaError(f"{fn}: this server has no template "
+                                   f"`{name}` (see `!template list`).")
+            try:
+                new_id, _log = match.spawn_template(key, tpl, x, y,
+                                                    near_radius=radius)
+                match.surface_log(_log)
+            except (VTTError, NotFound) as ex:
+                raise FormulaError(f"{fn}: {ex}")
+            engine._note_affected(new_id)
+            return new_id
+
+        def _summon_template(name: Any, x: Any, y: Any) -> str:
+            """summon_template(name, x, y): spawn the server's saved template
+            `name` (`!template save`) at exactly (x, y), with its body parts.
+            Its id is the template name (`guardsman`, then `guardsman2`,
+            ...). Returns the new id."""
+            return _template_spawn("summon_template", name, x, y, None)
+
+        def _summon_template_near(name: Any, x: Any, y: Any, radius: Any) -> str:
+            """summon_template_near(name, x, y, radius): summon_template, but
+            at the nearest free cell within `radius` (Chebyshev rings)."""
+            if not isinstance(radius, int) or isinstance(radius, bool) \
+                    or radius < 0:
+                raise FormulaError("summon_template_near: radius must be a "
+                                   "whole number >= 0.")
+            return _template_spawn("summon_template_near", name, x, y, radius)
+
+        def _has_template(name: Any) -> bool:
+            """has_template(name): True when this server has a saved template
+            of that name."""
+            return isinstance(name, str) and \
+                name.strip().lower() in _workspace_templates()
+
+        def _template_names() -> List[str]:
+            """template_names(): the server's saved template names, sorted.
+            Loopable."""
+            return sorted(_workspace_templates())
+
+        ns["summon_template"]      = _summon_template
+        ns["summon_template_near"] = _summon_template_near
+        ns["has_template"]         = _has_template
+        ns["template_names"]       = _template_names
         ns["entity_snapshot"] = _entity_snapshot
         ns["summon"]          = _summon
         ns["summon_near"]     = _summon_near

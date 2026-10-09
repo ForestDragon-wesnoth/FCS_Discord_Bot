@@ -7,7 +7,7 @@ from discord.ext import commands
 from logic import MatchManager, Workspaces
 import vtt_commands
 from vtt_commands import registry, run_approved_request
-import shlex
+import re
 
 #DEBUG_CMDS = True         # console logging
 DEBUG_CMDS = False         # console logging
@@ -139,7 +139,7 @@ async def _parse_and_run_single_line(ctx, line: str, mgr, known_roots) -> bool:
         # If user omitted '!' but started with a known root, allow it.
         # Otherwise, if they included '!', the prefix strip already handled it.
         # After this, s should be "root arg1 arg2 ..."
-        parts = shlex.split(s)
+        parts = vtt_commands.split_command_line(s)
         if not parts:
             #_dbg(ctx, batch_skip="empty_after_strip", line=line)
             return False
@@ -886,6 +886,12 @@ def wire_commands(bot: commands.Bot, workspaces: Workspaces):
     
         # --- BATCH MODE: multiple non-empty lines pasted in one message ---
         lines = [ln for ln in content.splitlines() if not _is_comment_or_blank(ln)]
+        # `!template import <name> <json>`: the JSON may span lines; it is one
+        # command, never a batch.
+        head = s[len(getattr(ctx, "prefix", "") or ""):] \
+            if s.startswith(getattr(ctx, "prefix", "") or "\0") else s
+        if re.match(r"template\s+import\s", head, re.IGNORECASE):
+            lines = lines[:1]
         if len(lines) > 1:
             known_roots = set(registry._handlers.keys())
             _dbg(ctx, batch_detected=True, line_count=len(lines))
@@ -935,7 +941,7 @@ def wire_commands(bot: commands.Bot, workspaces: Workspaces):
             _dbg(ctx, root_stripped_by="fallback_first_token", after_root=s)
     
         try:
-            args = shlex.split(s)
+            args = vtt_commands.split_command_args(bound_root, s)
         except ValueError as e:
             _dbg(ctx, parse_error=str(e), raw_tail=s)
             await _dbg_chat(ctx, f"parse error: {e}")

@@ -19,7 +19,9 @@ Layout under the data root (default `data/` next to the code):
         saves/                  `!store save`, `!history export`, `!run` files
         sprites/                the server's own sprites (searched before the
                                 shared sprites/ folder)
-        templates/              reserved for saved templates (future)
+        templates/<name>.json   saved entity templates (`!template`): written
+                                when saved, deleted when deleted, loaded at
+                                start — even with match persistence off
         corrupt/                files that failed to load, moved aside
 
 The live state is in memory (logic.Workspaces); this module mirrors it. After
@@ -47,7 +49,8 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from logic import (GameSystem, ID_RE, Match, MatchManager,
-                   RULE_CEILINGS, VTTError, Workspaces)
+                   RULE_CEILINGS, VTTError, Workspaces, check_template,
+                   check_template_name)
 from match_history import MatchHistory
 
 MB = 1024 * 1024
@@ -132,7 +135,7 @@ class Storage:
     def __init__(self, root: str, persist: bool = True):
         self.root = os.path.abspath(root)
         os.makedirs(self.root, exist_ok=True)
-        # persist=False (cli.py / gui.py with persistence off in
+        # persist=False (cli.py / gui.py with match persistence off in
         # local_settings.json): nothing is loaded from or committed to the
         # server folders; the data folder still holds the bot settings and
         # each server's saves/ and sprites/.
@@ -179,6 +182,58 @@ class Storage:
 
     def _trash_root(self) -> str:
         return os.path.join(self.root, TRASH_DIR)
+
+    def templates_dir(self, key: str) -> str:
+        return os.path.join(self.server_dir(key), "templates")
+
+    def template_file(self, key: str, name: str) -> str:
+        return os.path.join(self.templates_dir(key), f"{name}.json")
+
+    # ---- entity templates -------------------------------------------------
+    # Templates are the server's library, outside the match state: each one
+    # is written the moment it is saved and removed the moment it is deleted
+    # (never through commit / rollback), and they load at start whether or
+    # not match persistence is on.
+    def write_template(self, mgr: MatchManager, name: str,
+                       data: Dict[str, Any]) -> None:
+        key = mgr.guild_key
+        path = self.template_file(key, name)
+        text = json.dumps(data, indent=2, sort_keys=True) + "\n"
+        self.check_room(key, path, len(text.encode("utf-8")))
+        old = _file_size(path)
+        _write_text(path, text)
+        self.note_written(key, path, old)
+
+    def delete_template(self, mgr: MatchManager, name: str) -> None:
+        key = mgr.guild_key
+        path = self.template_file(key, name)
+        old = _file_size(path)
+        _remove_path(path)
+        self._add_usage(key, -old)
+
+    def load_templates(self, mgr: MatchManager) -> List[str]:
+        """Read the server's templates/ folder into `mgr.templates`; a file
+        that doesn't load is moved to corrupt/."""
+        key = mgr.guild_key
+        notes: List[str] = []
+        mgr.templates = {}
+        tdir = self.templates_dir(key)
+        if not os.path.isdir(tdir):
+            return notes
+        for fname in sorted(os.listdir(tdir)):
+            if not fname.endswith(".json"):
+                continue
+            fpath = os.path.join(tdir, fname)
+            try:
+                name = check_template_name(fname[:-5])
+                if name != fname[:-5]:
+                    raise ValueError("file name isn't a template name")
+                data, _ = check_template(self._read_json(fpath), name)
+            except Exception as ex:  # noqa: BLE001 - any bad file is quarantined
+                notes.append(self._quarantine(key, fpath, type(ex).__name__))
+                continue
+            mgr.templates[name] = data
+        return notes
 
     # ---- bot settings -----------------------------------------------------
     def _load_settings(self) -> None:
@@ -280,7 +335,14 @@ class Storage:
         corrupt/ folder and everything else still loads."""
         notes: List[str] = []
         if not self.persist:
+            # Match persistence off: templates still load (they ignore it).
+            for name in sorted(os.listdir(self.root)):
+                path = os.path.join(self.root, name, "templates")
+                if os.path.isdir(path) and valid_id(name):
+                    notes.extend(self.load_templates(workspaces.get(name)))
             self.rescan()
+            for n in notes:
+                print(n)
             return notes
         self.purge_trash()
         for name in sorted(os.listdir(self.root)):
@@ -368,6 +430,7 @@ class Storage:
                 mgr.matches[mid] = m
         mgr.active_by_channel = {ch: mid for ch, mid in mgr.active_by_channel.items()
                                  if mid in mgr.matches}
+        notes.extend(self.load_templates(mgr))
         self._remember(mgr, w)
         return notes
 
@@ -700,7 +763,8 @@ class Storage:
     def move_to_trash(self, mgr: MatchManager, scope: str) -> str:
         """Move the files a `!server wipe <scope>` removes into the trash and
         return the trash entry's path. `matches`: the matches folder (with
-        their histories). `all`: also systems.json and saves/. A copy of
+        their histories). `all`: also systems.json, saves/ and templates/.
+        A copy of
         workspace.json goes along so an undo can restore the channel
         pointers."""
         if not self.persist:
@@ -711,7 +775,8 @@ class Storage:
         self.commit_all_one(mgr)
         entry = os.path.join(self._trash_root(), key, f"{time.time():.3f}-{scope}")
         os.makedirs(entry, exist_ok=True)
-        moved = ["matches"] + (["systems.json", "saves"] if scope == "all" else [])
+        moved = ["matches"] + (["systems.json", "saves", "templates"]
+                               if scope == "all" else [])
         for name in moved:
             src = os.path.join(sdir, name)
             if os.path.exists(src):
@@ -746,7 +811,7 @@ class Storage:
         key = mgr.guild_key
         sdir = self.server_dir(key)
         os.makedirs(sdir, exist_ok=True)
-        for name in ("matches", "systems.json", "saves"):
+        for name in ("matches", "systems.json", "saves", "templates"):
             src = os.path.join(entry, name)
             if not os.path.exists(src):
                 continue
@@ -777,7 +842,7 @@ class Storage:
 
 DATA_DIR_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
-NO_PERSIST_WIPE = ("Persistence is off (local_settings.json), so this session "
+NO_PERSIST_WIPE = ("Match persistence is off (local_settings.json), so this session "
                    "keeps its matches in memory only: restart for a clean "
                    "state, or `!match delete <id>`. A wipe would act on the "
                    "data left on disk, which this session ignores.")
@@ -788,26 +853,29 @@ LOCAL_SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    "local_settings.json")
 _LOCAL_SETTINGS_COMMENT = [
     "Settings for cli.py and gui.py (the Discord bot always saves its data).",
-    "persistence: true = matches, undo history, game systems and channel "
-    "pointers are written to data/local after every command and loaded at "
-    "the next start.",
-    "persistence: false = every session starts empty and writes none of "
-    "that. Whatever is already in data/local is IGNORED and LEFT ON DISK "
-    "untouched; setting persistence back to true loads it again.",
-    "Either way, manual saves (!store save, !history export) go to "
-    "data/local/saves, and data/local/sprites is used.",
+    "match_persistence: true = matches, undo history, game systems and "
+    "channel pointers are written to data/local after every command and "
+    "loaded at the next start.",
+    "match_persistence: false = every session starts empty and writes none "
+    "of that. Whatever is already in data/local is IGNORED and LEFT ON DISK "
+    "untouched; setting match_persistence back to true loads it again.",
+    "Either way, entity templates (!template) are saved to and loaded from "
+    "data/local/templates, manual saves (!store save, !history export) go "
+    "to data/local/saves, and data/local/sprites is used.",
 ]
 
 
 def load_local_settings(path: str = LOCAL_SETTINGS_FILE) -> Dict[str, Any]:
-    """The local surfaces' settings: {"persistence": bool}. A missing file
-    is created with the defaults (persistence off) and its _comment notes;
-    an unreadable one is reported and the defaults are used."""
-    settings: Dict[str, Any] = {"persistence": False}
+    """The local surfaces' settings: {"match_persistence": bool}. A missing
+    file is created with the defaults (match persistence off) and its
+    _comment notes; an unreadable one is reported and the defaults are
+    used."""
+    settings: Dict[str, Any] = {"match_persistence": False}
     if not os.path.exists(path):
         try:
             _write_text(path, json.dumps(
-                {"_comment": _LOCAL_SETTINGS_COMMENT, "persistence": False},
+                {"_comment": _LOCAL_SETTINGS_COMMENT,
+                 "match_persistence": False},
                 indent=2) + "\n")
         except OSError as ex:
             print(f"⚠️ Couldn't create {os.path.basename(path)} ({ex}).")
@@ -819,26 +887,33 @@ def load_local_settings(path: str = LOCAL_SETTINGS_FILE) -> Dict[str, Any]:
             raise ValueError("not an object")
     except (OSError, ValueError) as ex:
         print(f"⚠️ {os.path.basename(path)} couldn't be read ({ex}); "
-              f"persistence stays off.")
+              f"match persistence stays off.")
         return settings
-    val = data.get("persistence", False)
+    key = "match_persistence"
+    if key not in data and "persistence" in data:
+        print(f"⚠️ {os.path.basename(path)}: `persistence` is now called "
+              f"`match_persistence` (templates are always saved); rename it "
+              f"in the file. Using its value for now.")
+        key = "persistence"
+    val = data.get(key, False)
     if not isinstance(val, bool):
-        print(f"⚠️ {os.path.basename(path)}: `persistence` must be true or "
-              f"false; it stays off.")
+        print(f"⚠️ {os.path.basename(path)}: `match_persistence` must be "
+              f"true or false; it stays off.")
         val = False
-    settings["persistence"] = val
+    settings["match_persistence"] = val
     return settings
 
 
 def local_persistence_note(settings: Dict[str, Any]) -> Optional[str]:
-    """The startup warning while local persistence is off, else None."""
-    if settings.get("persistence"):
+    """The startup warning while local match persistence is off, else None."""
+    if settings.get("match_persistence"):
         return None
-    return ("⚠️ Persistence is off: this session's matches and undo history "
-            "are lost when you close it, and nothing already saved in "
-            "data/local is loaded (it stays on disk). Manual saves (`!store "
-            "save`) still go to data/local/saves. To keep sessions, set "
-            "\"persistence\": true in local_settings.json.")
+    return ("⚠️ Match persistence is off: this session's matches and undo "
+            "history are lost when you close it, and nothing already saved "
+            "in data/local is loaded (it stays on disk). Entity templates "
+            "(`!template`) are still saved and loaded, and manual saves "
+            "(`!store save`) still go to data/local/saves. To keep sessions, "
+            "set \"match_persistence\": true in local_settings.json.")
 
 
 def open_workspaces(root: str = DATA_DIR_DEFAULT,

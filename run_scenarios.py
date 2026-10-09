@@ -45,12 +45,11 @@ import argparse
 import asyncio
 import os
 import re
-import shlex
 import sys
 from typing import Dict, List, Tuple
 
 from logic import Workspaces, LOCAL_WORKSPACE
-from vtt_commands import registry
+from vtt_commands import registry, split_command_line
 
 SCENARIO_RE = re.compile(
     r"\nSCENARIO (\d+)\s*[—-]\s*([^\n]*)\n[-]+\n(.*?)(?=\n\nSCENARIO |\Z)",
@@ -206,7 +205,7 @@ async def _run_cmds(cmds: List[str], workspaces) -> List[Tuple[str, List[str]]]:
         ctx.out = []
         body = _interpret_escapes(line.lstrip("!"))
         try:
-            parts = shlex.split(body)
+            parts = split_command_line(body)
         except ValueError as e:
             transcript.append((line, [f"💥 shlex parse error: {e}"]))
             continue
