@@ -30,7 +30,7 @@ from sprite_render import (
 )
 
 from logic import LOCAL_WORKSPACE
-from storage import open_workspaces
+from storage import open_workspaces, load_local_settings, local_persistence_note
 from vtt_commands import registry, _view_pov
 
 
@@ -101,8 +101,13 @@ class GuiApp:
                 "The GUI surface needs Pillow: pip install Pillow")
         import tkinter as tk  # lazy: needs a display
         self.tk = tk
-        # The local workspace, persisted to data/local/ like the CLI's.
-        self.workspaces = open_workspaces()
+        # The local workspace, persisted to data/local/ like the CLI's when
+        # local_settings.json turns persistence on.
+        local = load_local_settings()
+        self._persist_note = local_persistence_note(local)
+        if self._persist_note:
+            print(self._persist_note)
+        self.workspaces = open_workspaces(persist=local["persistence"])
         self.mgr = self.workspaces.get(LOCAL_WORKSPACE)
         self.ctx = GuiCtx(self)
         self.loader = SpriteLoader(
@@ -192,6 +197,8 @@ class GuiApp:
         self.log("FCS VTT graphics surface. Type !help (one command per line; "
                  "Enter runs all lines, Shift+Enter for a newline). Sprites "
                  f"from: {self.loader.folder}")
+        if self._persist_note:
+            self.log(self._persist_note)
 
     def log(self, message: str):
         self.log_widget.config(state="normal")

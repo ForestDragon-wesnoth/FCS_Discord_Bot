@@ -447,6 +447,19 @@ plus `data/bot_settings.json` (owner limits + rule ceilings) and
   server folder; a file that fails to load moves to `corrupt/` with a console
   note and the rest loads; unknown gamerules in systems are dropped. Data of
   servers the bot left is kept. On shutdown `commit_all` writes once more.
+- **cli.py / gui.py persist only when asked (user call).** They read
+  `local_settings.json` beside the code (`storage.load_local_settings`;
+  created on first start with `"persistence": false` and a `_comment` list
+  explaining it — JSON has no comments; git-ignored). One switch for both.
+  Off = `open_workspaces(persist=False)`: `Storage.persist` False makes
+  load_all load no server folder and every commit a no-op, so each session
+  starts empty; whatever is in data/local is IGNORED AND LEFT ON DISK
+  (turning it back on loads it). Manual saves still go to data/local/saves
+  and data/local/sprites is still searched. `!server wipe` is refused
+  (`NO_PERSIST_WIPE`: it would act on the ignored disk state); `!as restart`
+  gives an empty session. A startup warning (`local_persistence_note`) is
+  printed by both and shown in the GUI log. The Discord bot always persists;
+  the harness uses its own temp Storage (persist on).
 - **`!server wipe matches|all`** (admin; refused inside batch / macro / alias
   / action / `!again`: `_SERVER_TYPED_ONLY`): prints a phrase, accepted from the
   same admin in the same channel within 2 minutes (case / spaces ignored);

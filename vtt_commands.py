@@ -2921,6 +2921,9 @@ async def server_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"its {fmt_bytes(st.server_limit(mgr.guild_key))} storage limit.")
     if sub != "wipe":
         return await _help_fallback(ctx, ["server"], args[0])
+    if st is not None and not st.persist:
+        from storage import NO_PERSIST_WIPE
+        raise VTTError(NO_PERSIST_WIPE)
     if len(args) < 2:
         raise VTTError("Usage: `!server wipe <matches|all|confirm <phrase>|undo>`.")
     action = args[1].lower()

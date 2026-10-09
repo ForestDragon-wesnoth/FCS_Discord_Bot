@@ -4,7 +4,7 @@
 import asyncio, shlex, os, sys
 from typing import List
 from logic import LOCAL_WORKSPACE
-from storage import open_workspaces
+from storage import open_workspaces, load_local_settings, local_persistence_note
 from vtt_commands import registry
 
 
@@ -102,8 +102,10 @@ def parse(line: str):
         raise RuntimeError(f"Parse error: {e}")
 
 async def main():
-    # The local workspace (and any `!as server` one) persists to data/.
-    workspaces = open_workspaces()
+    # The local workspace (and any `!as server` one) persists to data/ when
+    # local_settings.json turns persistence on.
+    local = load_local_settings()
+    workspaces = open_workspaces(persist=local["persistence"])
     ctx = CLICtx()
     from storage import reload_workspaces
     ctx.restart_workspaces = lambda: reload_workspaces(workspaces)
@@ -114,6 +116,9 @@ async def main():
         "Type !help [command] to see available subcommands for a specific command\n"
         "Type 'exit' or 'quit' to leave."
     )
+    note = local_persistence_note(local)
+    if note:
+        print(note)
     if not color_ok:
         print(
             "(note: this terminal can't render ANSI color — the map will "
