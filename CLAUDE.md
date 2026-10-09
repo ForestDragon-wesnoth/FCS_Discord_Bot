@@ -2414,6 +2414,16 @@ More shipped work (continuing the list above):
       FIRST (reserved, never clipped — input first-class, log second) and the
       canvas frame packed LAST with expand, so on resize the MAP shrinks while
       the fields stay visible (default canvas 420px, `minsize(480,300)`).
+    - **Glyph fallback follows `sprite_mode`.** A unit with no loadable
+      sprite is drawn as its glyph by `SceneRenderer._draw_placement`:
+      `single` = one glyph in the anchor cell, `tile` = the glyph in every
+      body cell (as in ASCII), `stretch` = one glyph whose drawn shape is
+      scaled, proportions kept, to fill `_GLYPH_FILL` (70%) of the body,
+      centred (`_fill_glyph`). Every placement draws its whole body and
+      pastes the part inside the window, so a body whose anchor is left of
+      or above the viewport still shows its other cells (before, it
+      vanished whole, sprites included). Pixel-tested by a throwaway
+      script; the harness has no image path.
     - **Default grid borders + per-match override (scenario 532).** The
       `show_borders` rule now DEFAULTS to True: white grid lines drawn ABOVE the
       ground/background but BELOW tiles/zones/entities (in `render()` the border

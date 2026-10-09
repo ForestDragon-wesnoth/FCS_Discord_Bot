@@ -23,6 +23,8 @@ _BG_FILL = (20, 20, 24, 255)  # canvas backdrop behind everything
 # OR the configured one (default `ground_default`) can't be loaded, so cells
 # stay visible as terrain rather than a black void. A real background wins.
 _GROUND_FALLBACK = "#5b4632"  # muted brown earth
+# Share of a stretch-mode body (each side) its glyph fallback fills.
+_GLYPH_FILL = 0.7
 
 
 # ----------------------------------------------------------------------------
@@ -94,16 +96,17 @@ class SceneRenderer:
     def __init__(self, loader: SpriteLoader, cell_size: int = 100):
         self.loader = loader
         self.cell = max(1, int(cell_size))
-        self._font = None
+        self._fonts: Dict[int, Any] = {}
 
-    def font(self):
-        if self._font is None:
-            size = max(8, int(self.cell * 0.6))
+    def font(self, box: Optional[int] = None):
+        """The glyph font for a square of `box` pixels (default one cell)."""
+        size = max(8, int((box or self.cell) * 0.6))
+        if size not in self._fonts:
             try:
-                self._font = ImageFont.load_default(size=size)
+                self._fonts[size] = ImageFont.load_default(size=size)
             except TypeError:  # older Pillow: load_default() takes no size
-                self._font = ImageFont.load_default()
-        return self._font
+                self._fonts[size] = ImageFont.load_default()
+        return self._fonts[size]
 
     # -- colour / alpha helpers ------------------------------------------
     @staticmethod
@@ -259,12 +262,18 @@ class SceneRenderer:
         canvas.alpha_composite(Image.new("RGBA", canvas.size, rgb))
 
     def _draw_placement(self, canvas, p, ox, oy, cols, rows):
+        """One placement: its whole body is drawn, then the part inside the
+        window is pasted (a body whose anchor is off the window can still
+        show its other cells)."""
         cell = self.cell
         gx, gy = int(p.get("x", 1)), int(p.get("y", 1))
         w, h = max(1, int(p.get("w", 1))), max(1, int(p.get("h", 1)))
-        if not (ox <= gx <= ox + cols - 1 and oy <= gy <= oy + rows - 1):
+        mode = p.get("mode", "single")
+        if mode not in ("stretch", "tile"):
+            w = h = 1  # single: one cell at the anchor
+        if gx + w - 1 < ox or gx > ox + cols - 1 \
+                or gy + h - 1 < oy or gy > oy + rows - 1:
             return
-        x0, y0 = (gx - ox) * cell, (gy - oy) * cell
         key = p.get("sprite")
         img = self.loader.get(key) if key else None
         opacity = int(p.get("opacity", 100))
@@ -275,36 +284,60 @@ class SceneRenderer:
                 img = ImageOps.flip(img)
             img = self._tint(img, p.get("tint"))
             img = self._scale_alpha(img, opacity)
-            mode = p.get("mode", "single")
-            if mode == "stretch":
-                canvas.alpha_composite(img.resize((w * cell, h * cell)), (x0, y0))
-            elif mode == "tile":
-                tiled = img.resize((cell, cell))
-                for dy in range(h):
-                    for dx in range(w):
-                        canvas.alpha_composite(tiled, (x0 + dx * cell, y0 + dy * cell))
-            else:  # single
-                canvas.alpha_composite(img.resize((cell, cell)), (x0, y0))
+            piece = img.resize((cell, cell)) if mode != "stretch" \
+                else img.resize((w * cell, h * cell))
         else:
             glyph = p.get("glyph")
-            if isinstance(glyph, str) and glyph:
-                self._draw_glyph(canvas, glyph, x0, y0, p.get("tint"), opacity)
+            if not (isinstance(glyph, str) and glyph):
+                return
+            if mode == "stretch":
+                piece = self._fill_glyph(glyph, w * cell, h * cell,
+                                         p.get("tint"), opacity)
+            else:
+                piece = self._glyph_layer(glyph, cell, p.get("tint"), opacity)
+        body = piece
+        if mode == "tile":
+            body = Image.new("RGBA", (w * cell, h * cell), (0, 0, 0, 0))
+            for dy in range(h):
+                for dx in range(w):
+                    body.alpha_composite(piece, (dx * cell, dy * cell))
+        x0, y0 = (gx - ox) * cell, (gy - oy) * cell
+        sx, sy = max(0, -x0), max(0, -y0)
+        canvas.alpha_composite(body, (x0 + sx, y0 + sy), (sx, sy))
 
-    def _draw_glyph(self, canvas, glyph, x0, y0, tint, opacity):
-        cell = self.cell
+    def _fill_glyph(self, glyph, bw, bh, tint, opacity):
+        """A bw x bh layer with the glyph's drawn shape scaled up (keeping
+        its proportions) to fill _GLYPH_FILL of the box, centred: the glyph
+        fallback of a stretch-mode body."""
+        side = max(bw, bh)
+        layer = self._glyph_layer(glyph, side, tint, opacity)
+        out = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
+        ink = layer.getchannel("A").getbbox()
+        if not ink:
+            return out
+        shape = layer.crop(ink)
+        k = min(bw * _GLYPH_FILL / shape.width, bh * _GLYPH_FILL / shape.height)
+        size = (max(1, round(shape.width * k)), max(1, round(shape.height * k)))
+        shape = shape.resize(size, Image.LANCZOS)
+        out.alpha_composite(shape, ((bw - size[0]) // 2, (bh - size[1]) // 2))
+        return out
+
+    def _glyph_layer(self, glyph, side, tint, opacity):
+        """A `side`-pixel square with the glyph centred in it."""
         rgb = self._rgb(tint) or (220, 220, 220)
         a = max(0, min(255, int(opacity / 100.0 * 255)))
-        layer = Image.new("RGBA", (cell, cell), (0, 0, 0, 0))
+        layer = Image.new("RGBA", (side, side), (0, 0, 0, 0))
         d = ImageDraw.Draw(layer)
+        font = self.font(side)
         try:
-            bbox = d.textbbox((0, 0), glyph, font=self.font())
+            bbox = d.textbbox((0, 0), glyph, font=font)
             tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            tx = (cell - tw) // 2 - bbox[0]
-            ty = (cell - th) // 2 - bbox[1]
+            tx = (side - tw) // 2 - bbox[0]
+            ty = (side - th) // 2 - bbox[1]
         except Exception:
-            tx = ty = cell // 4
-        d.text((tx, ty), glyph, font=self.font(), fill=(rgb[0], rgb[1], rgb[2], a))
-        canvas.alpha_composite(layer, (x0, y0))
+            tx = ty = side // 4
+        d.text((tx, ty), glyph, font=font, fill=(rgb[0], rgb[1], rgb[2], a))
+        return layer
 
     def _draw_fog(self, canvas, f, x0, y0):
         cell = self.cell
