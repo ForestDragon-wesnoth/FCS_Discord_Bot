@@ -3,7 +3,8 @@
 # cli.py
 import asyncio, shlex, os, sys
 from typing import List
-from logic import Workspaces, LOCAL_WORKSPACE
+from logic import LOCAL_WORKSPACE
+from storage import open_workspaces
 from vtt_commands import registry
 
 
@@ -101,8 +102,11 @@ def parse(line: str):
         raise RuntimeError(f"Parse error: {e}")
 
 async def main():
-    workspaces = Workspaces()
+    # The local workspace (and any `!as server` one) persists to data/.
+    workspaces = open_workspaces()
     ctx = CLICtx()
+    from storage import reload_workspaces
+    ctx.restart_workspaces = lambda: reload_workspaces(workspaces)
     color_ok = _enable_terminal_color()
     CLICtx.supports_color = color_ok
     print(
@@ -146,6 +150,8 @@ async def main():
                 print(f"❌ {e}")
         else:
             print("Commands must start with '!'")
+    # Every command already wrote its changes; write once more on the way out.
+    workspaces.storage.commit_all(workspaces)
 
 if __name__ == "__main__":
     asyncio.run(main())

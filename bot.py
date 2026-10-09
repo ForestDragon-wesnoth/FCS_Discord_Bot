@@ -1,7 +1,7 @@
 import os
 import discord
 from discord.ext import commands
-from logic import Workspaces
+from storage import open_workspaces
 from discord_commands import wire_commands
 
 # --- Token loading ---
@@ -41,9 +41,9 @@ intents.message_content = True
 # ping the server. The bot's messages never mean to ping anyone.
 bot = commands.Bot(command_prefix="!", intents=intents,
                    allowed_mentions=discord.AllowedMentions.none())
-# One workspace per Discord server (systems, matches, saves), created on the
-# server's first command.
-_workspaces = Workspaces()
+# One workspace per Discord server (systems, matches, saves), loaded from the
+# data/ folder at startup and written back after every command.
+_workspaces = open_workspaces()
 
 @bot.event
 async def on_ready():
@@ -51,4 +51,9 @@ async def on_ready():
 
 wire_commands(bot, _workspaces)
 
-bot.run(TOKEN)
+try:
+    bot.run(TOKEN)
+finally:
+    # Every command already wrote its changes; this catches anything else
+    # (a pan button's camera move that failed to write, ...).
+    _workspaces.storage.commit_all(_workspaces)

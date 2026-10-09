@@ -82,8 +82,9 @@ Allowed functions:
   Random:    random_int, random_string, roll("2d6+3")
   Geometry:  distance, angle, direction_to
   Areas:     cells_in_burst, cells_in_line, cells_in_cone, cells_in_rect
-             (return lists of (x,y) tuples; pair with len() OR iterate
-             with a for-loop). clip_cells(cells) drops off-grid cells.
+             (return lists of [x, y] cells ON the map; pair with len() OR
+             iterate with a for-loop). clip_cells(cells) drops off-grid
+             cells from a list built some other way.
   Spatial:   entities_within(eid, n, mode, relation),
              nearest_entity(eid, relation, mode)   (scan alive entities
              relative to a reference; relation = ""/"hostile"/"ally"/
@@ -1365,12 +1366,11 @@ def _len(v: Any) -> int:
 
 # --- area / shape helpers ----------------------------------------------------
 # Pure geometric functions that return LISTS of (x, y) coordinate tuples
-# for an area shape. They take no match and do no grid clipping — a burst
-# at the map edge will include off-grid coordinates, which simply match
-# no tile/entity downstream. Combine with entities_within (to find who's
-# in the shape) or, once formula for-loops exist, iterate the cells
-# directly. Coordinates are 1-indexed to match the rest of the engine,
-# but nothing here enforces the grid bounds.
+# for an area shape. Called with `bounds` (width, height) — formulas always
+# pass the match's — they keep only the cells ON the map and never visit the
+# others, so a shape with far-off coordinates costs no more than the map
+# (without bounds they are plain geometry and may list off-grid cells).
+# Coordinates are 1-indexed to match the rest of the engine.
 
 _IMPL_NAME_RE = re.compile(
     r"(?:FormulaEngine\._namespace\.<locals>\.)?_([a-z][a-z0-9_]*)\(\)")
@@ -1409,9 +1409,21 @@ def _coord_int(v: Any, fname: str, argname: str) -> int:
     return int(math.floor(v))
 
 
+def _clip_range(x_lo: int, x_hi: int, y_lo: int, y_hi: int,
+                bounds: Optional[Tuple[int, int]]) -> Tuple[range, range]:
+    """The x and y ranges of a box, cut to the map when `bounds` (width,
+    height) is given: the area builders then never visit a cell off the map,
+    so their cost follows the map, not the numbers a formula passes."""
+    if bounds is not None:
+        x_lo, x_hi = max(x_lo, 1), min(x_hi, bounds[0])
+        y_lo, y_hi = max(y_lo, 1), min(y_hi, bounds[1])
+    return range(x_lo, x_hi + 1), range(y_lo, y_hi + 1)
+
+
 def _cells_in_burst(x: Any, y: Any, r: Any,
                     mode: Any = "square_radius_distance", *,
-                    limit: int = _DEFAULT_CELL_LIMIT) -> list:
+                    limit: int = _DEFAULT_CELL_LIMIT,
+                    bounds: Optional[Tuple[int, int]] = None) -> list:
     """cells_in_burst(x, y, r, mode="square_radius_distance"): every cell
     within distance r of (x, y) under the given distance metric, INCLUDING
     the center. Shape depends on mode: square_radius -> filled square,
@@ -1427,10 +1439,11 @@ def _cells_in_burst(x: Any, y: Any, r: Any,
     if r < 0:
         raise FormulaError(f"cells_in_burst(...): r must be >= 0, got {r}.")
     ri = int(math.floor(r))
-    _cell_budget((2 * ri + 1) ** 2, "cells_in_burst", limit)
+    xs, ys = _clip_range(cx0 - ri, cx0 + ri, cy0 - ri, cy0 + ri, bounds)
+    _cell_budget(len(xs) * len(ys), "cells_in_burst", limit)
     out = []
-    for cx in range(cx0 - ri, cx0 + ri + 1):
-        for cy in range(cy0 - ri, cy0 + ri + 1):
+    for cx in xs:
+        for cy in ys:
             # Reuse _distance for the metric so burst shape exactly
             # matches what distance()/entities_within consider "within r".
             if _distance(cx0, cy0, cx, cy, mode) <= r:
@@ -1439,17 +1452,22 @@ def _cells_in_burst(x: Any, y: Any, r: Any,
 
 
 def _cells_in_line(x1: Any, y1: Any, x2: Any, y2: Any, *,
-                   limit: int = _DEFAULT_CELL_LIMIT) -> list:
+                   limit: int = _DEFAULT_CELL_LIMIT,
+                   bounds: Optional[Tuple[int, int]] = None) -> list:
     """cells_in_line(x1, y1, x2, y2): the cells on the straight line from
     (x1,y1) to (x2,y2) inclusive, via Bresenham's algorithm. Returns a
     list of (x, y) tuples ordered from start to end. Useful as the basis
-    of a line-of-sight or beam-attack check."""
+    of a line-of-sight or beam-attack check. With `bounds` (width, height;
+    formulas always pass the map's) only the cells on the map are listed,
+    and only those are computed."""
     ax = _coord_int(x1, "cells_in_line", "x1")
     ay = _coord_int(y1, "cells_in_line", "y1")
     bx = _coord_int(x2, "cells_in_line", "x2")
     by = _coord_int(y2, "cells_in_line", "y2")
     dx = abs(bx - ax)
     dy = abs(by - ay)
+    if bounds is not None:
+        return _bresenham_on_map(ax, ay, bx, by, bounds, limit)
     _cell_budget(max(dx, dy) + 1, "cells_in_line", limit)
     sx = 1 if ax < bx else -1
     sy = 1 if ay < by else -1
@@ -1470,6 +1488,78 @@ def _cells_in_line(x1: Any, y1: Any, x2: Any, y2: Any, *,
     return out
 
 
+def _bresenham_on_map(ax: int, ay: int, bx: int, by: int,
+                      bounds: Tuple[int, int], limit: int) -> list:
+    """The on-map cells of _cells_in_line's Bresenham line, computed without
+    visiting the off-map ones. Step k of that line (k = 0..L along the major
+    axis) is the cell major = a + s*k, minor = b + s'*max(0, ceil((2*dmin*k
+    - dmaj) / (2*dmaj))) — the same cells the step-by-step loop yields. The
+    minor coordinate never goes back, so the steps on the map are one run,
+    found by binary search."""
+    w, h = bounds
+    dx, dy = abs(bx - ax), abs(by - ay)
+    if dx == 0 and dy == 0:
+        return [(ax, ay)] if (1 <= ax <= w and 1 <= ay <= h) else []
+    sx = 1 if ax < bx else -1
+    sy = 1 if ay < by else -1
+    if dx >= dy:
+        a0, sa, amax = ax, sx, w
+        b0, sb, bmax = ay, sy, h
+        dmaj, dmin = dx, dy
+    else:
+        a0, sa, amax = ay, sy, h
+        b0, sb, bmax = ax, sx, w
+        dmaj, dmin = dy, dx
+
+    def minor(k: int) -> int:
+        v = 2 * dmin * k - dmaj
+        return b0 + sb * max(0, -((-v) // (2 * dmaj)))
+
+    def first_k(pred) -> int:
+        # Smallest k in 0..dmaj+1 with pred(k) (pred is monotone).
+        lo, hi = 0, dmaj + 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if pred(mid):
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo
+
+    def inside_major(k: int) -> bool:
+        return 1 <= a0 + sa * k <= amax
+
+    def inside_minor(k: int) -> bool:
+        return 1 <= minor(k) <= bmax
+
+    # Major axis: a0 + sa*k in [1, amax] is an interval of k.
+    if sa > 0:
+        k_lo, k_hi = 1 - a0, amax - a0
+    else:
+        k_lo, k_hi = a0 - amax, a0 - 1
+    k_lo, k_hi = max(k_lo, 0), min(k_hi, dmaj)
+    if k_lo > k_hi:
+        return []
+    # Minor axis: monotone in k, so the k with minor in [1, bmax] form an
+    # interval too. Moving up (sb > 0): below 1 first, then inside, then
+    # above bmax; moving down: the reverse.
+    if sb > 0:
+        m_lo = first_k(lambda k: minor(k) >= 1)
+        m_hi = first_k(lambda k: minor(k) > bmax) - 1
+    else:
+        m_lo = first_k(lambda k: minor(k) <= bmax)
+        m_hi = first_k(lambda k: minor(k) < 1) - 1
+    k_lo, k_hi = max(k_lo, m_lo), min(k_hi, m_hi)
+    if k_lo > k_hi:
+        return []
+    _cell_budget(k_hi - k_lo + 1, "cells_in_line", limit)
+    out = []
+    for k in range(k_lo, k_hi + 1):
+        a, b = a0 + sa * k, minor(k)
+        out.append((a, b) if dx >= dy else (b, a))
+    return out
+
+
 # Compass angle (0=up, clockwise) of each named direction, for cone
 # orientation. Matches angle()/direction_to conventions.
 _DIRECTION_ANGLES: Dict[str, float] = {
@@ -1480,7 +1570,8 @@ _DIRECTION_ANGLES: Dict[str, float] = {
 
 def _cells_in_cone(x: Any, y: Any, direction: Any, length: Any,
                    half_angle: Any = 45, *,
-                   limit: int = _DEFAULT_CELL_LIMIT) -> list:
+                   limit: int = _DEFAULT_CELL_LIMIT,
+                   bounds: Optional[Tuple[int, int]] = None) -> list:
     """cells_in_cone(x, y, direction, length, half_angle=45): the cells
     inside a cone emanating from (x, y).
 
@@ -1524,10 +1615,11 @@ def _cells_in_cone(x: Any, y: Any, direction: Any, length: Any,
             f"{type(half_angle).__name__}."
         )
     li = int(math.floor(length))
-    _cell_budget((2 * li + 1) ** 2, "cells_in_cone", limit)
+    xs, ys = _clip_range(cx0 - li, cx0 + li, cy0 - li, cy0 + li, bounds)
+    _cell_budget(len(xs) * len(ys), "cells_in_cone", limit)
     out = []
-    for cx in range(cx0 - li, cx0 + li + 1):
-        for cy in range(cy0 - li, cy0 + li + 1):
+    for cx in xs:
+        for cy in ys:
             if cx == cx0 and cy == cy0:
                 continue  # exclude the origin
             if _distance(cx0, cy0, cx, cy, "euclidean_distance") > length:
@@ -1542,7 +1634,8 @@ def _cells_in_cone(x: Any, y: Any, direction: Any, length: Any,
 
 
 def _cells_in_rect(x1: Any, y1: Any, x2: Any, y2: Any, *,
-                   limit: int = _DEFAULT_CELL_LIMIT) -> list:
+                   limit: int = _DEFAULT_CELL_LIMIT,
+                   bounds: Optional[Tuple[int, int]] = None) -> list:
     """cells_in_rect(x1, y1, x2, y2): every cell in the axis-aligned
     rectangle whose opposite corners are (x1,y1) and (x2,y2), inclusive.
     Corner order doesn't matter (the bounds are normalized), so
@@ -1555,10 +1648,11 @@ def _cells_in_rect(x1: Any, y1: Any, x2: Any, y2: Any, *,
     by = _coord_int(y2, "cells_in_rect", "y2")
     lo_x, hi_x = (ax, bx) if ax <= bx else (bx, ax)
     lo_y, hi_y = (ay, by) if ay <= by else (by, ay)
-    _cell_budget((hi_x - lo_x + 1) * (hi_y - lo_y + 1), "cells_in_rect", limit)
+    xs, ys = _clip_range(lo_x, hi_x, lo_y, hi_y, bounds)
+    _cell_budget(len(xs) * len(ys), "cells_in_rect", limit)
     out = []
-    for cx in range(lo_x, hi_x + 1):
-        for cy in range(lo_y, hi_y + 1):
+    for cx in xs:
+        for cy in ys:
             out.append((cx, cy))
     return out
 
@@ -2462,9 +2556,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     "entities_in_line_ignorelos", "entities_on_los",
     "entities_in_line_until", "first_opaque", "raycast",
     # clip_cells(cells) -> the subset of an (x,y) cell list that is on the
-    # grid. The cells_in_* helpers can return off-grid cells (they're pure
-    # geometry); wrap one to keep only valid cells, e.g.
-    # `clip_cells(cells_in_burst(x, y, 3))`. Loopable (yields (x,y)).
+    # grid (the cells_in_* helpers already list only on-map cells; this is
+    # for a list built some other way). Loopable (yields (x,y)).
     "clip_cells",
     # Vision primitives. All return bool and ignore the fog_enabled /
     # fog_los toggles — raw "is it in sight?" queries a GM composes with.
@@ -3752,6 +3845,9 @@ class FormulaEngine:
                 return default
         cell_limit = _rule_int("formula_cell_limit", _DEFAULT_CELL_LIMIT)
         size_limit = _rule_int("formula_size_limit", _DEFAULT_SIZE_LIMIT)
+        # The area builders only list (and only visit) cells on the map.
+        grid = ((self._match.grid_width, self._match.grid_height)
+                if self._match is not None else None)
         ns: Dict[str, Any] = {
             "__read":  lambda who, path:        self._read(who, path, ctx),
             "__write": lambda who, path, value: self._write(who, path, value, ctx),
@@ -3766,10 +3862,10 @@ class FormulaEngine:
             "__safe_mul": lambda a, b: _safe_mul(a, b, size_limit),
             "__safe_add": lambda a, b: _safe_add(a, b, size_limit),
             "__safe_mod": _safe_mod,
-            "cells_in_burst": lambda *a, **k: _cells_in_burst(*a, limit=cell_limit, **k),
-            "cells_in_line": lambda *a, **k: _cells_in_line(*a, limit=cell_limit, **k),
-            "cells_in_cone": lambda *a, **k: _cells_in_cone(*a, limit=cell_limit, **k),
-            "cells_in_rect": lambda *a, **k: _cells_in_rect(*a, limit=cell_limit, **k),
+            "cells_in_burst": lambda *a, **k: _cells_in_burst(*a, limit=cell_limit, bounds=grid, **k),
+            "cells_in_line": lambda *a, **k: _cells_in_line(*a, limit=cell_limit, bounds=grid, **k),
+            "cells_in_cone": lambda *a, **k: _cells_in_cone(*a, limit=cell_limit, bounds=grid, **k),
+            "cells_in_rect": lambda *a, **k: _cells_in_rect(*a, limit=cell_limit, bounds=grid, **k),
             "range": lambda *a: _range(*a, limit=size_limit),
             "each": lambda v: _each(v, limit=size_limit),
             "replace": lambda *a: _replace(*a, limit=size_limit),
@@ -6949,7 +7045,9 @@ class FormulaEngine:
             endpoint_ids = set(here.get((cx1, cy1), ())) | set(here.get((cx2, cy2), ()))
             out: list = []
             seen: set = set(endpoint_ids)
-            for cell in match._line_cells(cx1, cy1, cx2, cy2)[1:-1]:
+            ends = ((cx1, cy1), (cx2, cy2))
+            for cell in [c for c in match._line_cells(cx1, cy1, cx2, cy2)
+                         if c not in ends]:
                 ids = here.get(cell)
                 if not ids:
                     continue
@@ -6996,7 +7094,7 @@ class FormulaEngine:
             alive entity ids inside the cone (see cells_in_cone), sorted
             by (distance from origin, id)."""
             cells = set(_cells_in_cone(x, y, direction, length, half_angle,
-                                       limit=cell_limit))
+                                       limit=cell_limit, bounds=grid))
             cx0 = _coord_int(x, "entities_in_cone", "x")
             cy0 = _coord_int(y, "entities_in_cone", "y")
             # Order by NEAREST covered cell to the origin (so a large entity
@@ -7014,7 +7112,8 @@ class FormulaEngine:
             """entities_in_rect(x1, y1, x2, y2): alive entity ids inside the
             axis-aligned rectangle (see cells_in_rect), sorted by
             (x, y, id)."""
-            cells = set(_cells_in_rect(x1, y1, x2, y2, limit=cell_limit))
+            cells = set(_cells_in_rect(x1, y1, x2, y2, limit=cell_limit,
+                                       bounds=grid))
             return [eid for (_x, _y, eid) in sorted(_alive_at(cells))]
 
         def _entities_in_line_until(x1: Any, y1: Any, x2: Any, y2: Any,

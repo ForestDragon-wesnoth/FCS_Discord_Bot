@@ -29,7 +29,8 @@ from sprite_render import (
     _PIL_OK, SpriteLoader, SceneRenderer, SPRITES_DIR_DEFAULT, fit_cell_size,
 )
 
-from logic import MatchManager
+from logic import LOCAL_WORKSPACE
+from storage import open_workspaces
 from vtt_commands import registry
 
 
@@ -100,9 +101,12 @@ class GuiApp:
                 "The GUI surface needs Pillow: pip install Pillow")
         import tkinter as tk  # lazy: needs a display
         self.tk = tk
-        self.mgr = MatchManager()
+        # The local workspace, persisted to data/local/ like the CLI's.
+        self.workspaces = open_workspaces()
+        self.mgr = self.workspaces.get(LOCAL_WORKSPACE)
         self.ctx = GuiCtx(self)
-        self.loader = SpriteLoader(sprites_dir)
+        self.loader = SpriteLoader(
+            sprites_dir, first=self.workspaces.storage.sprites_dir(LOCAL_WORKSPACE))
         self._preview = None  # highlight squares from `!map preview`
         self.loop = asyncio.new_event_loop()
         self._photo = None  # keep a ref so Tk doesn't GC the image
@@ -299,7 +303,10 @@ class GuiApp:
             self.log(f"❌ {e}")
 
     def run(self):
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            self.workspaces.storage.commit_all(self.workspaces)
 
 
 def main(sprites_dir: str = SPRITES_DIR_DEFAULT):

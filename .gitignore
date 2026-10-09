@@ -190,3 +190,6 @@ cython_debug/
 # write only inside saves/ (see vtt_commands.SAVES_DIR). Campaign saves are
 # local data, not source. The scenario harness uses a temp folder instead.
 saves/
+
+# The bot's data (one folder per server, see storage.py) and bot settings.
+data/

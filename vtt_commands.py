@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Callable, Dict, List, Optional, Protocol, Any, Tuple
 from logic import MatchManager, Match, Entity, VTTError, OutOfBounds, Occupied, NotFound, DuplicateId, ReservedId, _coerce_rule_value, _parse_bool
 from match_history import MatchHistory, Snapshot, HistoryError
+from storage import storage_of, valid_id, fmt_bytes
 
 #used for Gamesystem-related commands
 from logic import (
@@ -14,7 +15,7 @@ from logic import (
 )
 
 # Passive system
-from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, LOCAL_WORKSPACE
+from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS
 
 # Clamp system
 from logic import ClampSpec
@@ -32,6 +33,7 @@ import json
 import math
 import random
 import copy
+import time
 
 # ---- Context abstraction -----------------------------------------------------
 class ReplyContext(Protocol):
@@ -152,6 +154,7 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
     "passive":    frozenset({"list", "info"}),
     "reveal_fog": frozenset({"list"}),
     "schedule":   frozenset({"list"}),
+    "server":     frozenset({"storage"}),
     "status":     frozenset({"list", "info"}),
     "system":     frozenset({"list", "info"}),
     # `!table roll <name>` only rolls a stored table (advances the RNG, no
@@ -221,11 +224,20 @@ _ADMIN_MSG = ("❌ Only a server administrator can do that — it changes "
               "server-wide state shared by every match on this server.")
 
 
+# `!server` (wipe) runs only when typed as its own command: never inside a
+# batch / macro / foreach / `!run` file / action cmd(), through an alias, by
+# `!again`, or as an approved request.
+_SERVER_TYPED_ONLY = ("❌ `!server` commands only run when typed on their own "
+                      "— not inside a batch, macro, alias or action.")
+
+
 def _admin_required(name: str, args: List[str]) -> bool:
     """True iff this invocation changes server-wide state (see _ADMIN_MSG)."""
     sub = args[0].lower() if args else ""
     if name in ("store", "run"):
         return True
+    if name == "server":
+        return sub == "wipe"
     if name in ("defvar", "defpassive", "gclamp"):
         # System-level defaults; `list` (and the bare usage form) only read.
         return bool(args) and sub != "list"
@@ -422,6 +434,9 @@ class CommandRegistry:
             await ctx.send("❌ `!again` only works as a command typed on its "
                            "own: here it would rerun the command that "
                            "contains it.")
+            return
+        if name == "server":
+            await ctx.send(_SERVER_TYPED_ONLY)
             return
         stray = _stray_words_error(self, name, args)
         if stray:
@@ -673,7 +688,10 @@ class CommandRegistry:
             try:
                 return await self._run_top(name, args, ctx, mgr)
             finally:
-                _HOLDS_COMMAND_LOCK.reset(token)
+                try:
+                    await persist_workspace(mgr, ctx)
+                finally:
+                    _HOLDS_COMMAND_LOCK.reset(token)
 
     async def _run_top(self, name: str, args: List[str], ctx: ReplyContext,
                        mgr: MatchManager):
@@ -692,7 +710,7 @@ class CommandRegistry:
             # the last command made `!again` rerun itself forever.
             if (_RUN_DEPTH.get() == 1
                     and self._resolve_alias(name, args, mgr, ctx)[0].lower()
-                    not in ("again", "as")):
+                    not in ("again", "as", "server")):
                 _remember_command(mgr, ctx, name, args)
             result = await self._run(name, args, ctx, mgr)
             await _flush_formula_log(ctx)
@@ -704,7 +722,11 @@ class CommandRegistry:
     async def _run(self, name: str, args: List[str], ctx: ReplyContext, mgr: MatchManager):
         # Alias resolution happens BEFORE handler lookup so an alias can
         # shadow a built-in name on this match.
+        typed = name
         name, args = self._resolve_alias(name, args, mgr, ctx)
+        if name == "server" and typed.lower() != "server":
+            await ctx.send(_SERVER_TYPED_ONLY)
+            return
         h = self._handlers.get(name)
         if not h:
             # Did-you-mean: suggest close matches from registered
@@ -965,6 +987,24 @@ async def _flush_formula_log(ctx: ReplyContext) -> None:
     lines = _take_formula_log()
     if lines:
         await ctx.send("\n".join(lines))
+
+async def persist_workspace(mgr: MatchManager, ctx: Optional[ReplyContext]) -> None:
+    """Write what the command just changed to disk (storage.Storage.commit),
+    once per top-level command, and show what the commit reports: autosaves
+    cut to fit the storage limit, or the command undone because it didn't
+    fit. A no-op when nothing persists."""
+    st = storage_of(mgr)
+    if st is None:
+        return
+    try:
+        msgs = st.commit(mgr)
+    except Exception as ex:  # noqa: BLE001 - a disk error must not crash a command
+        print(f"⚠️ [{mgr.guild_key}] saving to disk failed: {ex!r}")
+        msgs = [f"⚠️ Saving to disk failed ({type(ex).__name__}); the change "
+                f"is kept in memory and saved with the next command."]
+    if msgs and ctx is not None:
+        await ctx.send("\n".join(msgs))
+
 
 # Whether this asyncio task holds its manager's command lock (see run()).
 _HOLDS_COMMAND_LOCK: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
@@ -2460,7 +2500,7 @@ def _mention(user_id: Optional[str]) -> str:
 # ---- as (CLI identity switch for previewing host vs player) -----
 @registry.command(
     "as", access="all",
-    usage="!as <host|player|owner> [<name>] | !as view <team|omniscient|clear> | !as server [<key>|local]",
+    usage="!as <host|player|owner> [<name>] | !as view <team|omniscient|clear> | !as server [<key>|local] | !as restart",
     desc=(
         "Switch your previewing identity OR point-of-view. CLI-only "
         "(on Discord both come from your account / the channel, so this "
@@ -2475,8 +2515,10 @@ def _mention(user_id: Optional[str]) -> str:
         "override and falls back to the channel's bound POV. SERVER (CLI / "
         "test harness): `!as server <key>` moves you into another server's "
         "workspace — its own systems, matches and saves, as on Discord where "
-        "each server is separate; `!as server local` (or bare) returns. Bare "
-        "`!as` reports your identity and your effective POV."
+        "each server is separate; `!as server local` (or bare) returns. "
+        "`!as restart` reloads every server from the data folder, as a bot "
+        "restart would (unsaved runtime state — pending requests, `!again` — "
+        "is gone). Bare `!as` reports your identity and your effective POV."
     ),
 )
 async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -2498,6 +2540,16 @@ async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"Use `!as host`/`!as player [name]` or `!as view <team>`."
         )
     role = args[0].lower()
+    if role == "restart":
+        restart = getattr(ctx, "restart_workspaces", None)
+        if restart is None:
+            return await ctx.send(
+                "❌ `!as restart` works in the CLI and the scenario harness.")
+        _check_tail(args, 1, (), "!as restart")
+        notes = restart()
+        return await ctx.send(
+            "🔄 Reloaded every server from the data folder, as after a "
+            "restart." + ("\n" + "\n".join(notes) if notes else ""))
     if role == "server":
         if not getattr(ctx, "workspace_switchable", False):
             return await ctx.send(
@@ -2612,11 +2664,13 @@ async def whoami_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 @registry.command(
     "owner", access="all", snapshot=False,
-    usage="!owner <servers>",
+    usage="!owner <servers|limit|storage|ceiling> ...",
     desc=(
         "Bot-owner tools (the owner of the bot's Discord application, or its "
-        "team). `!owner servers` lists every server workspace the bot holds, "
-        "with its match and system counts. Everyone else is refused."
+        "team). `!owner servers` lists every server workspace; `!owner limit` "
+        "/ `!owner storage` show and set the storage limits and disk use; "
+        "`!owner ceiling` caps the limit rules servers may set. Everyone else "
+        "is refused."
     ),
 )
 async def owner_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -2637,12 +2691,318 @@ async def owner_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                          f"match(es), {len(w.systems)} system(s){here}")
         return await ctx.send(f"Server workspaces ({len(lines)}):\n"
                               + "\n".join(lines))
+    if sub == "limit":
+        return await _owner_limit(ctx, args[1:], mgr)
+    if sub == "storage":
+        return await _owner_storage(ctx, args[1:], mgr)
+    if sub == "ceiling":
+        return await _owner_ceiling(ctx, args[1:], mgr)
     return await _help_fallback(ctx, ["owner"], args[0])
+
+
+def _owner_storage_or_fail(mgr: MatchManager):
+    st = storage_of(mgr)
+    if st is None:
+        raise VTTError("This bot runs without a data folder (nothing is "
+                       "saved to disk), so there are no storage limits.")
+    return st
+
+
+def _parse_mb(text: str) -> float:
+    try:
+        v = float(text)
+    except ValueError:
+        v = -1.0
+    if not (v > 0 and v < 10 ** 9):
+        raise VTTError(f"`{text}` isn't a size: give megabytes above 0 "
+                       f"(decimals allowed), or `reset`.")
+    return v
+
+
+async def _owner_limit(ctx, args: List[str], mgr: MatchManager):
+    """`!owner limit [<global|default|<server>> <MB|reset>]`."""
+    st = _owner_storage_or_fail(mgr)
+    lim = st.settings.setdefault("limits", {})
+    if not args:
+        servers = lim.get("servers") or {}
+        lines = [f"Global: {fmt_bytes(st.global_limit())}",
+                 f"Each server (default): {fmt_bytes(st.server_limit('_no_server_'))}"]
+        for key in sorted(servers):
+            lines.append(f"Server `{key}`: {fmt_bytes(st.server_limit(key))}")
+        return await ctx.send("**Storage limits**\n" + "\n".join(lines))
+    _check_tail(args, 2, (), "!owner limit <global|default|<server>> <MB|reset>")
+    if len(args) < 2:
+        raise VTTError("Usage: `!owner limit <global|default|<server>> "
+                       "<MB|reset>`.")
+    target, value = args[0], args[1].lower()
+    mb = None if value == "reset" else _parse_mb(args[1])
+    if target.lower() == "global":
+        if mb is None:
+            lim.pop("global", None)
+        else:
+            lim["global"] = mb
+        what = "The global limit"
+    elif target.lower() == "default":
+        if mb is None:
+            lim.pop("server_default", None)
+        else:
+            lim["server_default"] = mb
+        what = "The default per-server limit"
+    else:
+        if not valid_id(target):
+            raise VTTError(f"`{target}` isn't a server key (`!owner servers` "
+                           f"lists them).")
+        servers = lim.setdefault("servers", {})
+        if mb is None:
+            servers.pop(target, None)
+        else:
+            servers[target] = mb
+        what = f"Server `{target}`'s limit"
+    st.save_settings()
+    shown = (fmt_bytes(st.global_limit()) if target.lower() == "global" else
+             fmt_bytes(st.server_limit("_no_server_" if target.lower() == "default"
+                                       else target)))
+    return await ctx.send(f"{what} is now {shown}"
+                          + (" (the default)." if mb is None else "."))
+
+
+async def _owner_storage(ctx, args: List[str], mgr: MatchManager):
+    """`!owner storage [<server>]`: disk use, measured fresh."""
+    st = _owner_storage_or_fail(mgr)
+    _check_tail(args, 1, (), "!owner storage [<server>]")
+    st.rescan()
+    from storage import TRASH_DIR
+    if args:
+        key = args[0]
+        if not valid_id(key):
+            raise VTTError(f"`{key}` isn't a server key.")
+        return await ctx.send(
+            f"Server `{key}`: {fmt_bytes(st.server_usage(key))} of "
+            f"{fmt_bytes(st.server_limit(key))}.")
+    lines = [f"**Total:** {fmt_bytes(st.global_usage())} of "
+             f"{fmt_bytes(st.global_limit())} "
+             f"(trash: {fmt_bytes(st.server_usage(TRASH_DIR))})"]
+    ws = getattr(mgr, "workspaces", None)
+    names = {k: w.guild_name for k, w in (ws.items() if ws is not None else [])}
+    for key in sorted(k for k in st._usage if k != TRASH_DIR):
+        label = f"**{names[key]}** (`{key}`)" if key in names and names[key] != key \
+            else f"`{key}`"
+        lines.append(f"- {label}: {fmt_bytes(st.server_usage(key))} of "
+                     f"{fmt_bytes(st.server_limit(key))}")
+    return await ctx.send("\n".join(lines))
+
+
+async def _owner_ceiling(ctx, args: List[str], mgr: MatchManager):
+    """`!owner ceiling [<rule> <value|reset>]`: the highest value a server may
+    give a limit rule (logic.RULE_CEILINGS)."""
+    ceilinged = sorted(k for k, v in RULES_REGISTRY.items()
+                       if v["schema"].get("ceiling"))
+    if not args:
+        lines = []
+        for k in ceilinged:
+            mark = " (set by you)" if k in RULE_CEILINGS else ""
+            lines.append(f"- `{k}`: at most {rule_max(k)}{mark} "
+                         f"(default value {RULES_REGISTRY[k]['default']})")
+        return await ctx.send("**Rule ceilings** (the highest value any "
+                              "server may set):\n" + "\n".join(lines))
+    _check_tail(args, 2, (), "!owner ceiling <rule> <value|reset>")
+    if len(args) < 2:
+        raise VTTError("Usage: `!owner ceiling <rule> <value|reset>`.")
+    key, value = args[0], args[1]
+    if key not in ceilinged:
+        raise VTTError(f"`{key}` has no ceiling. Rules with one: "
+                       f"{', '.join(ceilinged)}.")
+    st = storage_of(mgr)
+    if value.lower() == "reset":
+        RULE_CEILINGS.pop(key, None)
+    else:
+        try:
+            v = int(value)
+        except ValueError:
+            raise VTTError(f"`{value}` isn't a whole number.")
+        lo = RULES_REGISTRY[key]["schema"].get("min", 1)
+        floor = max(lo, int(RULES_REGISTRY[key]["default"]))
+        if v < floor:
+            raise VTTError(f"The ceiling of `{key}` can't go below {floor} "
+                           f"(its default value).")
+        RULE_CEILINGS[key] = v
+    if st is not None:
+        st.settings["ceilings"] = dict(RULE_CEILINGS)
+        st.save_settings()
+    # Running matches pick the ceiling up now (a lower one clamps them).
+    ws = getattr(mgr, "workspaces", None)
+    for _k, w in (ws.items() if ws is not None else [(mgr.guild_key, mgr)]):
+        for name in list(w.systems):
+            w.refresh_match_rules(name)
+    return await ctx.send(f"`{key}` is now capped at {rule_max(key)} for "
+                          f"every server.")
 
 
 registry.annotate_sub("owner", "servers", usage="!owner servers",
                       desc="List every server workspace with its match and "
                            "system counts.")
+registry.annotate_sub("owner", "limit",
+                      usage="!owner limit [<global|default|<server>> <MB|reset>]",
+                      desc="Show or set the storage limits: the whole bot's "
+                           "(`global`), every server's (`default`), or one "
+                           "server's. Sizes in megabytes; `reset` goes back to "
+                           "the default (1000 MB a server, 20 GB in all).")
+registry.annotate_sub("owner", "storage", usage="!owner storage [<server>]",
+                      desc="How much disk each server uses, measured fresh, "
+                           "against its limit; the total includes the wipe "
+                           "trash.")
+registry.annotate_sub("owner", "ceiling", usage="!owner ceiling [<rule> <value|reset>]",
+                      desc="Show or set the highest value a server may give a "
+                           "limit rule (formula_cell_limit, macro limits, "
+                           "max_grid_dimension, ...). Every server shares one "
+                           "process, so these stop one server's settings from "
+                           "stalling the bot for the others.")
+
+
+_WIPE_CONFIRM_SECONDS = 120
+
+
+def _wipe_phrase(mgr: MatchManager, scope: str) -> str:
+    return f"wipe {scope} of {mgr.guild_name}"
+
+
+def _norm_phrase(text: str) -> str:
+    return " ".join(text.split()).casefold()
+
+
+def _wipe_blockers(mgr: MatchManager, scope: str) -> List[str]:
+    """What exists now that a `!server wipe undo` would collide with."""
+    out = []
+    if mgr.matches:
+        out.append("matches " + ", ".join(f"`{m}`" for m in sorted(mgr.matches))
+                   + " (`!match delete <id>`)")
+    if scope == "all":
+        extra = [n for n in sorted(mgr.systems) if n != "default"]
+        if extra:
+            out.append("game systems " + ", ".join(f"`{n}`" for n in extra)
+                       + " (`!system delete <name>`)")
+        d = mgr.systems.get("default")
+        if d is not None and (d.settings or d.tile_templates
+                              or d.formula_functions or d.aliases):
+            out.append("changes to the `default` system (its rules, tile "
+                       "templates, functions or aliases)")
+        sdir = server_saves_dir(mgr)
+        if os.path.isdir(sdir) and any(os.scandir(sdir)):
+            out.append("files in this server's saves folder")
+    return out
+
+
+@registry.command(
+    "server", snapshot=False,
+    usage="!server <wipe|storage> ...",
+    desc=(
+        "This server's data. `!server storage` shows how much disk it uses "
+        "against its limit. `!server wipe matches|all` (server "
+        "administrators) deletes every match — `all` also resets the game "
+        "systems to a fresh `default` and empties the saves folder; sprites "
+        "are kept. It asks you to type a confirmation phrase naming the "
+        "server within 2 minutes; the wiped data is kept 24 hours, and "
+        "`!server wipe undo` brings it back. Only runs typed on its own."
+    ),
+)
+async def server_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["server"])
+        return await ctx.send(f"**{title}**\n{body}")
+    sub = args[0].lower()
+    st = storage_of(mgr)
+    if sub == "storage":
+        _check_tail(args, 1, (), "!server storage")
+        if st is None:
+            return await ctx.send("This bot keeps nothing on disk, so there "
+                                  "is no storage use to show.")
+        return await ctx.send(
+            f"This server uses {fmt_bytes(st.server_usage(mgr.guild_key))} of "
+            f"its {fmt_bytes(st.server_limit(mgr.guild_key))} storage limit.")
+    if sub != "wipe":
+        return await _help_fallback(ctx, ["server"], args[0])
+    if len(args) < 2:
+        raise VTTError("Usage: `!server wipe <matches|all|confirm <phrase>|undo>`.")
+    action = args[1].lower()
+    if action in ("matches", "all"):
+        _check_tail(args, 2, (), "!server wipe <matches|all>")
+        phrase = _wipe_phrase(mgr, action)
+        mgr._wipe_pending = {
+            "scope": action, "user": ctx_user(ctx),
+            "channel": ctx.channel_key, "phrase": phrase,
+            "expires": time.time() + _WIPE_CONFIRM_SECONDS}
+        what = ("every match on this server (with their undo history)"
+                if action == "matches" else
+                "every match, every game system (back to a fresh `default`) "
+                "and every file in the saves folder (sprites stay)")
+        return await ctx.send(
+            f"⚠️ This deletes {what}. Channels will show no match. The data "
+            f"is kept for 24 hours (`!server wipe undo`).\nTo go ahead, type "
+            f"within 2 minutes:\n`!server wipe confirm {phrase}`")
+    if action == "confirm":
+        pend = getattr(mgr, "_wipe_pending", None)
+        if (not pend or pend["expires"] < time.time()
+                or pend["user"] != ctx_user(ctx)
+                or pend["channel"] != ctx.channel_key):
+            mgr._wipe_pending = None
+            raise VTTError("There's no wipe of yours waiting in this channel "
+                           "(it lasts 2 minutes). Start with `!server wipe "
+                           "matches` or `!server wipe all`.")
+        if _norm_phrase(" ".join(args[2:])) != _norm_phrase(pend["phrase"]):
+            raise VTTError(f"That isn't the phrase. Type exactly: "
+                           f"`!server wipe confirm {pend['phrase']}`")
+        mgr._wipe_pending = None
+        scope = pend["scope"]
+        retire = getattr(ctx, "retire_server_boards", None)
+        if retire is not None:
+            await retire(mgr)
+        n = len(mgr.matches)
+        if st is not None:
+            st.move_to_trash(mgr, scope)
+        mgr.matches = {}
+        mgr.active_by_channel = {}
+        if scope == "all":
+            from logic import GameSystem
+            mgr.systems = {"default": GameSystem("default", settings={})}
+            mgr.default_system_name = "default"
+            mgr.default_system_per_channel = {}
+        tail = ("Changed your mind? `!server wipe undo` within 24 hours."
+                if st is not None else
+                "This bot keeps nothing on disk, so it can't be undone.")
+        what = f"{n} match(es)" + (", the game systems and the saves folder"
+                                   if scope == "all" else "")
+        return await ctx.send(f"🧹 Wiped {what}. {tail}")
+    if action == "undo":
+        _check_tail(args, 2, (), "!server wipe undo")
+        if st is None:
+            raise VTTError("This bot keeps nothing on disk, so a wipe can't "
+                           "be undone.")
+        entries = st.trash_entries(mgr.guild_key)
+        if not entries:
+            raise VTTError("There's no wipe to undo (wiped data is kept 24 "
+                           "hours).")
+        stamp, scope, path = entries[0]
+        blockers = _wipe_blockers(mgr, scope)
+        if blockers:
+            raise VTTError(
+                "This server has things made after the wipe, which the undo "
+                "would overwrite. Remove them first: " + "; ".join(blockers)
+                + ".")
+        st.restore_from_trash(mgr, path, scope)
+        return await ctx.send(
+            f"♻️ Undid the wipe ({scope}): {len(mgr.matches)} match(es) "
+            f"back" + (", with the game systems and saves" if scope == "all"
+                       else "") + ".")
+    return await _help_fallback(ctx, ["server", "wipe"], args[1])
+
+
+registry.annotate_sub("server", "storage", usage="!server storage",
+                      desc="This server's disk use against its storage limit.")
+registry.annotate_sub("server", "wipe",
+                      usage="!server wipe <matches | all | confirm <phrase ...> | undo>",
+                      desc="Delete the server's matches (`all`: also systems "
+                           "and saves) after a typed confirmation; `undo` "
+                           "within 24 hours.")
 
 
 @registry.command(
@@ -2964,7 +3324,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if t == "enum":
                 extra = f", one of {{{', '.join(sorted(schema.get('choices', [])))}}}"
             elif t == "int" and ("min" in schema or "max" in schema):
-                lo, hi = schema.get("min"), schema.get("max")
+                lo, hi = schema.get("min"), rule_max(k)
                 extra = (f", {lo}-{hi}" if hi is not None else f", >= {lo}")
                 if schema.get("unlimited"):
                     extra += " or -1 = unlimited"
@@ -7423,10 +7783,7 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         selector = args[1]
         full, path = saves_path(args[2], mgr, write=True)
         snap = _resolve_snapshot_selector(m, selector)
-        try:
-            write_json_file(full, snap.to_dict())
-        except VTTError as ex:
-            raise VTTError(f"Failed to write `{path}`: {ex}")
+        _write_save_file(mgr, full, path, snap.to_dict())
         return await ctx.send(
             f"Exported {snap.kind} snapshot (seq {snap.sequence}) to `{path}`."
         )
@@ -7722,8 +8079,12 @@ def _format_snapshot_diff(snap_a: Snapshot, snap_b: Snapshot,
     if sa.get("outcome") != sb.get("outcome"):
         lines.append(f"- outcome: {sa.get('outcome')!r} -> {sb.get('outcome')!r}")
     # Rule changes: report at the key level (one line per changed rule).
+    # A snapshot read back from disk has no rules (storage leaves them out:
+    # they're a copy of the system's), so compare only when both sides do.
     ra = sa.get("rules", {}) or {}
     rb = sb.get("rules", {}) or {}
+    if "rules" not in sa or "rules" not in sb:
+        ra = rb = {}
     rule_keys = sorted(set(ra) | set(rb))
     rule_changes = []
     for rk in rule_keys:
@@ -7948,11 +8309,35 @@ _WINDOWS_DEVICE_NAMES = frozenset(
     + [f"COM{i}" for i in range(1, 10)] + [f"LPT{i}" for i in range(1, 10)])
 
 
+def _write_save_file(mgr: MatchManager, full: str, shown: str,
+                     data: Any) -> None:
+    """Write a save file (`!store save`, `!history export`) after checking
+    it fits the server's storage limit."""
+    try:
+        text = json_text(data)
+    except VTTError as ex:
+        raise VTTError(f"Failed to write `{shown}`: {ex}")
+    st = storage_of(mgr)
+    old = os.path.getsize(full) if os.path.exists(full) else 0
+    if st is not None:
+        st.check_room(mgr.guild_key, full, len(text.encode("utf-8")))
+    try:
+        write_text_file(full, text)
+    except VTTError as ex:
+        raise VTTError(f"Failed to write `{shown}`: {ex}")
+    if st is not None:
+        st.note_written(mgr.guild_key, full, old)
+
+
 def server_saves_dir(mgr: Optional[MatchManager]) -> str:
-    """The saves folder of `mgr`'s workspace: SAVES_DIR itself for the local
-    CLI / GUI workspace, `SAVES_DIR/servers/<guild id>` for a Discord
-    server, so one server's `!store load <name>` can't reach another's
-    files."""
+    """The saves folder of `mgr`'s workspace. With storage, the server's
+    `saves/` folder under the data root; without it, SAVES_DIR itself for the
+    local CLI / GUI workspace and `SAVES_DIR/servers/<guild id>` for a
+    Discord server, so one server's `!store load <name>` can't reach
+    another's files."""
+    st = storage_of(mgr)
+    if st is not None:
+        return st.saves_dir(mgr.guild_key)
     key = getattr(mgr, "guild_key", LOCAL_WORKSPACE)
     if key == LOCAL_WORKSPACE:
         return SAVES_DIR
@@ -8024,10 +8409,8 @@ async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if extra.startswith("include_history="):
                 include_history = _parse_bool(extra[len("include_history="):])
         path, shown = saves_path(args[1], mgr, write=True)
-        try:
-            mgr.save(path, include_history=include_history)
-        except VTTError as ex:
-            raise VTTError(f"Failed to save to `{shown}`: {ex}")
+        _write_save_file(mgr, path, shown,
+                         mgr.save_data(include_history=include_history))
         suffix = " (with autosave history)" if include_history else ""
         return await ctx.send(f"Saved to `{shown}`{suffix}")
     if sub == "load":# and len(args) >= 2:
@@ -9940,7 +10323,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         value = _parse_scalar(args[6])
         if sub == "line":
             m._check_line_budget(x1, y1, x2, y2, "line")
-            cells = m._line_cells(x1, y1, x2, y2)
+            cells = m._line_cells(x1, y1, x2, y2, clip=False)
         else:
             # Off-grid cells are only counted (for the "skipped" note), not
             # built: a typo'd corner used to build the whole rectangle.

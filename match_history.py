@@ -41,6 +41,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 import datetime
+import json
 
 # Import VTTError eagerly so HistoryError can subclass it. This works
 # because logic.py imports us AFTER its exception classes are defined
@@ -88,6 +89,11 @@ class Snapshot:
                                  snapshots store the user-provided name;
                                  round/turn snapshots leave this empty
       state                      Match.to_dict(include_history=False)
+
+    A snapshot persisted by the storage layer (storage.py) can drop its
+    state from memory: `path` names the file holding it, and `state` reads
+    it back on first use. A snapshot loaded at startup starts that way, so
+    a long history costs disk, not memory, until an undo needs it.
     """
     kind: str
     sequence: int
@@ -97,7 +103,56 @@ class Snapshot:
     active_entity_id: Optional[str]
     timestamp: str
     label: str
-    state: Dict[str, Any]
+    _state: Optional[Dict[str, Any]] = None
+    path: Optional[str] = None
+
+    @property
+    def state(self) -> Dict[str, Any]:
+        if self._state is None:
+            if self.path is None:
+                raise HistoryError(
+                    f"Snapshot {self.sequence} has no saved state.")
+            try:
+                with open(self.path, encoding="utf-8") as f:
+                    self._state = json.load(f)["state"]
+            except (OSError, ValueError, KeyError, TypeError) as ex:
+                raise HistoryError(
+                    f"Snapshot {self.sequence} couldn't be read from disk "
+                    f"({type(ex).__name__}).")
+        return self._state
+
+    def release_state(self) -> None:
+        """Drop the in-memory state of a snapshot whose file is written."""
+        if self.path is not None:
+            self._state = None
+
+    def meta(self) -> Dict[str, Any]:
+        """Everything but the state (the storage index entry)."""
+        return {
+            "kind": self.kind,
+            "sequence": self.sequence,
+            "turn_index_at_snapshot": self.turn_index_at_snapshot,
+            "round_at_snapshot": self.round_at_snapshot,
+            "active_index": self.active_index,
+            "active_entity_id": self.active_entity_id,
+            "timestamp": self.timestamp,
+            "label": self.label,
+        }
+
+    @staticmethod
+    def from_meta(d: Dict[str, Any], path: str) -> "Snapshot":
+        """A snapshot whose state stays on disk until read."""
+        return Snapshot(
+            kind=d["kind"],
+            sequence=int(d["sequence"]),
+            turn_index_at_snapshot=int(d.get("turn_index_at_snapshot", 0)),
+            round_at_snapshot=int(d["round_at_snapshot"]),
+            active_index=int(d["active_index"]),
+            active_entity_id=d.get("active_entity_id"),
+            timestamp=d.get("timestamp", ""),
+            label=d.get("label", ""),
+            path=path,
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -123,7 +178,7 @@ class Snapshot:
             active_entity_id=d.get("active_entity_id"),
             timestamp=d.get("timestamp", ""),
             label=d.get("label", ""),
-            state=d["state"],
+            _state=d["state"],
         )
 
     def short_summary(self) -> str:
@@ -197,7 +252,7 @@ class MatchHistory:
             active_entity_id=match.current_entity_id(),
             timestamp=_now_iso(),
             label=label,
-            state=state,
+            _state=state,
         )
 
     # ---- recording (called by Match.next_turn and the dispatcher) ----
@@ -401,6 +456,48 @@ class MatchHistory:
         cap = int(match.rules.get("autosave_command_retention_max", 100))
         if cap >= 0 and len(self.command_saves) > cap:
             del self.command_saves[:len(self.command_saves) - cap]
+
+    def all_snapshots(self) -> List[Snapshot]:
+        """Every snapshot this history holds (autosaves and manual saves)."""
+        return (list(self.round_saves) + list(self.turn_saves)
+                + list(self.command_saves) + list(self.manual_saves.values()))
+
+    def drop_sequences(self, seqs) -> None:
+        """Remove the autosaves with these sequence numbers (the storage
+        layer cutting old autosaves to fit a storage limit). Manual saves
+        are never dropped this way."""
+        seqs = set(seqs)
+        self.round_saves = [s for s in self.round_saves if s.sequence not in seqs]
+        self.turn_saves = [s for s in self.turn_saves if s.sequence not in seqs]
+        self.command_saves = [s for s in self.command_saves
+                              if s.sequence not in seqs]
+
+    def index(self) -> Dict[str, Any]:
+        """The history's shape without any state: what storage writes to
+        the history index file (each snapshot's state is its own file)."""
+        return {
+            "round_saves": [s.meta() for s in self.round_saves],
+            "turn_saves": [s.meta() for s in self.turn_saves],
+            "command_saves": [s.meta() for s in self.command_saves],
+            "manual_saves": {n: s.meta() for n, s in self.manual_saves.items()},
+            "_seq": self._seq,
+            "_turn_index": self._turn_index,
+        }
+
+    @staticmethod
+    def from_index(d: Dict[str, Any], path_of) -> "MatchHistory":
+        """Rebuild a history from its index; `path_of(sequence)` names the
+        file holding each snapshot's state (read on first use)."""
+        h = MatchHistory()
+        def mk(m):
+            return Snapshot.from_meta(m, path_of(int(m["sequence"])))
+        h.round_saves = [mk(m) for m in d.get("round_saves", [])]
+        h.turn_saves = [mk(m) for m in d.get("turn_saves", [])]
+        h.command_saves = [mk(m) for m in d.get("command_saves", [])]
+        h.manual_saves = {n: mk(m) for n, m in d.get("manual_saves", {}).items()}
+        h._seq = int(d.get("_seq", 0))
+        h._turn_index = int(d.get("_turn_index", 0))
+        return h
 
     # ---- serialization ----
 
