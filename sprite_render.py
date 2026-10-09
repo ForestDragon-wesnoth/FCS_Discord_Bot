@@ -7,7 +7,7 @@
 from __future__ import annotations
 import os
 import io
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 
 try:
     from PIL import Image, ImageDraw, ImageOps, ImageColor, ImageFont
@@ -23,6 +23,81 @@ _BG_FILL = (20, 20, 24, 255)  # canvas backdrop behind everything
 # OR the configured one (default `ground_default`) can't be loaded, so cells
 # stay visible as terrain rather than a black void. A real background wins.
 _GROUND_FALLBACK = "#5b4632"  # muted brown earth
+# Fonts tried, in order, for a glyph outside ASCII (Pillow looks a bare file
+# name up in the system font folders). A host can also drop a font into a
+# `fonts/` folder of the sprites folder; those are tried first. Colour emoji
+# fonts aren't listed: Pillow draws them only at fixed sizes.
+_SYSTEM_FONTS = (
+    "DejaVuSans.ttf", "seguisym.ttf", "segoeui.ttf", "arial.ttf",
+    "Arial Unicode.ttf", "NotoSans-Regular.ttf", "NotoSansSymbols2-Regular.ttf",
+    "FreeSans.ttf", "FreeSerif.ttf", "unifont.otf", "msgothic.ttc",
+    "YuGothR.ttc", "msyh.ttc", "wqy-zenhei.ttc", "NotoSansCJK-Regular.ttc",
+    "Apple Symbols.ttf", "AppleGothic.ttf",
+)
+_FONT_OK: Dict[Tuple[str, str], bool] = {}
+# Loaded fonts by (source, size); None = the file can't be loaded. Shared by
+# every renderer (gui.py builds one per redraw), since Pillow looks a bare
+# font name up by walking the system font folders.
+_FONT_CACHE: Dict[Tuple[Optional[str], int], Any] = {}
+
+
+def _truetype(src: str, size: int):
+    key = (src, size)
+    if key not in _FONT_CACHE:
+        try:
+            _FONT_CACHE[key] = ImageFont.truetype(src, size)
+        except (OSError, ValueError):
+            _FONT_CACHE[key] = None
+    return _FONT_CACHE[key]
+
+
+def _load_font(src: Optional[str], size: int):
+    if src is not None:
+        f = _truetype(src, size)
+        if f is not None:
+            return f
+    key = (None, size)
+    if key not in _FONT_CACHE:
+        try:
+            _FONT_CACHE[key] = ImageFont.load_default(size=size)
+        except TypeError:  # older Pillow: load_default() takes no size
+            _FONT_CACHE[key] = ImageFont.load_default()
+    return _FONT_CACHE[key]
+
+
+def _font_has(src: str, text: str) -> bool:
+    """Whether the font file `src` exists and draws every character of
+    `text` as something other than its missing-character box."""
+    key = (src, text)
+    if key not in _FONT_OK:
+        f = _truetype(src, 32)
+        if f is None:
+            _FONT_OK[key] = False
+            return False
+        try:
+
+            def mask(c: str) -> bytes:
+                im = Image.new("L", (48, 48))
+                ImageDraw.Draw(im).text((4, 4), c, font=f, fill=255)
+                return im.tobytes()
+            missing = mask("\U000F0000")
+            _FONT_OK[key] = all(
+                (m := mask(c)) != missing and any(m)
+                for c in text if not c.isspace())
+        except (OSError, ValueError):
+            _FONT_OK[key] = False
+    return _FONT_OK[key]
+
+
+# The colour palette (logic.TEXT_COLORS) names Pillow doesn't know: the
+# bright_* variants, as the usual bright ANSI colours. The other palette
+# names (red, gray, ...) are Pillow colour names already.
+_PALETTE_RGB: Dict[str, Tuple[int, int, int]] = {
+    "bright_red": (255, 85, 85), "bright_green": (85, 255, 85),
+    "bright_yellow": (255, 255, 85), "bright_blue": (85, 85, 255),
+    "bright_magenta": (255, 85, 255), "bright_cyan": (85, 255, 255),
+    "bright_white": (255, 255, 255),
+}
 # Share of a stretch-mode body (each side) its glyph fallback fills.
 _GLYPH_FILL = 0.7
 
@@ -96,24 +171,50 @@ class SceneRenderer:
     def __init__(self, loader: SpriteLoader, cell_size: int = 100):
         self.loader = loader
         self.cell = max(1, int(cell_size))
-        self._fonts: Dict[int, Any] = {}
+        self._glyph_fonts: Dict[str, Optional[str]] = {}
         self._tint_fill = 40  # set from the scene by render()
 
-    def font(self, box: Optional[int] = None):
-        """The glyph font for a square of `box` pixels (default one cell)."""
+    def font(self, box: Optional[int] = None, glyph: str = ""):
+        """The glyph font for a square of `box` pixels (default one cell).
+        Pillow's built-in font has ASCII only, so a glyph outside it is
+        drawn with the first font that has it (`_font_source_for`)."""
         size = max(8, int((box or self.cell) * 0.6))
-        if size not in self._fonts:
-            try:
-                self._fonts[size] = ImageFont.load_default(size=size)
-            except TypeError:  # older Pillow: load_default() takes no size
-                self._fonts[size] = ImageFont.load_default()
-        return self._fonts[size]
+        src = self._font_source_for(glyph) if glyph else None
+        return _load_font(src, size)
+
+    def _font_source_for(self, glyph: str) -> Optional[str]:
+        """None (the built-in font) for ASCII; else the first font file —
+        a `fonts/` folder of the sprites folders, then common system fonts
+        — that has every character of `glyph`. None if none does (the
+        built-in font then draws its empty-box glyph)."""
+        if all(32 <= ord(c) < 127 for c in glyph):
+            return None
+        if glyph not in self._glyph_fonts:
+            found = None
+            for src in self._font_candidates():
+                if _font_has(src, glyph):
+                    found = src
+                    break
+            self._glyph_fonts[glyph] = found
+        return self._glyph_fonts[glyph]
+
+    def _font_candidates(self) -> List[str]:
+        out: List[str] = []
+        for folder in getattr(self.loader, "folders", [self.loader.folder]):
+            fdir = os.path.join(folder, "fonts")
+            if os.path.isdir(fdir):
+                out.extend(os.path.join(fdir, n) for n in sorted(os.listdir(fdir))
+                           if n.lower().endswith((".ttf", ".otf", ".ttc")))
+        return out + list(_SYSTEM_FONTS)
 
     # -- colour / alpha helpers ------------------------------------------
     @staticmethod
     def _rgb(name: Any) -> Optional[Tuple[int, int, int]]:
         if not isinstance(name, str) or not name.strip():
             return None
+        key = name.strip().lower()
+        if key in _PALETTE_RGB:
+            return _PALETTE_RGB[key]
         try:
             return ImageColor.getrgb(name.strip())
         except (ValueError, Exception):
@@ -176,7 +277,7 @@ class SceneRenderer:
         bg = scene.get("background")
         drew_bg = False
         if isinstance(bg, dict):
-            drew_bg = self._draw_background(canvas, bg, W, H)
+            drew_bg = self._draw_background(canvas, bg, scene, ox, oy, cols, rows)
         if not drew_bg:
             # No (loadable) background sprite: paint a primitive default ground
             # so empty cells read as terrain instead of a black void. A real
@@ -241,22 +342,45 @@ class SceneRenderer:
         return out
 
     # -- layers ----------------------------------------------------------
-    def _draw_background(self, canvas, bg, W, H) -> bool:
+    def _draw_background(self, canvas, bg, scene, ox, oy, cols, rows) -> bool:
+        """The background sprite, placed on the WHOLE grid and cut to the
+        window, so it stays put under the units when the view pans:
+        `stretch` = one copy over the whole map; `tile` = one copy per cell;
+        `center` = one copy at its own size (drawn for sprite_cell_size
+        cells, scaled with the cell) at the middle of the map."""
         img = self.loader.get(bg.get("sprite"))
         if img is None:
             return False
+        cell = self.cell
+        W, H = cols * cell, rows * cell
+        gw = max(1, int(scene.get("grid_width", cols)))
+        gh = max(1, int(scene.get("grid_height", rows)))
+        # The window's top-left in map pixels.
+        wx, wy = (ox - 1) * cell, (oy - 1) * cell
         mode = bg.get("mode", "stretch")
         if mode == "stretch":
-            canvas.alpha_composite(img.resize((W, H)))
+            # Map pixels -> source pixels; only the window's part is resized.
+            sx, sy = img.width / (gw * cell), img.height / (gh * cell)
+            box = (wx * sx, wy * sy, (wx + W) * sx, (wy + H) * sy)
+            canvas.alpha_composite(img.resize((W, H), box=box))
         elif mode == "center":
-            x = (W - img.width) // 2
-            y = (H - img.height) // 2
-            canvas.alpha_composite(img, (x, y))
-        else:  # tile
-            iw, ih = max(1, img.width), max(1, img.height)
-            for yy in range(0, H, ih):
-                for xx in range(0, W, iw):
-                    canvas.alpha_composite(img, (xx, yy))
+            try:
+                base = max(1, int(scene.get("sprite_cell_size", cell)))
+            except (TypeError, ValueError):
+                base = cell
+            k = cell / base
+            iw, ih = max(1, round(img.width * k)), max(1, round(img.height * k))
+            x = (gw * cell - iw) // 2 - wx
+            y = (gh * cell - ih) // 2 - wy
+            if x + iw > 0 and y + ih > 0 and x < W and y < H:
+                part = img.resize((iw, ih))
+                sx0, sy0 = max(0, -x), max(0, -y)
+                canvas.alpha_composite(part, (x + sx0, y + sy0), (sx0, sy0))
+        else:  # tile: one copy per cell
+            piece = img.resize((cell, cell))
+            for yy in range(0, H, cell):
+                for xx in range(0, W, cell):
+                    canvas.alpha_composite(piece, (xx, yy))
         return True
 
     def _draw_default_ground(self, canvas, ox, oy, cols, rows):
@@ -345,7 +469,7 @@ class SceneRenderer:
         a = max(0, min(255, int(opacity / 100.0 * 255)))
         layer = Image.new("RGBA", (side, side), (0, 0, 0, 0))
         d = ImageDraw.Draw(layer)
-        font = self.font(side)
+        font = self.font(side, glyph)
         try:
             bbox = d.textbbox((0, 0), glyph, font=font)
             tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]

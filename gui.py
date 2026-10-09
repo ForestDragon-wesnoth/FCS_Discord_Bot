@@ -55,6 +55,23 @@ class GuiCtx:
     async def send(self, message: str):
         self.app.log(message)
 
+    def show_scene_view(self, pov, hidden=None, coords=None) -> None:
+        """A `!map` with its own view options (`as=`, `full`, `hide=`,
+        `coords=`): the canvas draws that view until the next command, as
+        the ASCII reply does."""
+        self.app._view = {"pov": pov, "hidden": hidden, "coords": coords}
+
+    async def post_scene_image(self, m, pov, highlights=None, hidden=None,
+                               coords=None) -> str:
+        """`!map image` (or a plain `!map` in image render mode): the
+        canvas is the image here, so draw that view on it until the next
+        command."""
+        self.show_scene_view(pov, hidden, coords)
+        if highlights:
+            self.app._preview = highlights
+        return ("🖼 Drawn on the canvas — "
+                + (f"`{pov}`'s view." if pov is not None else "everything."))
+
     def show_preview(self, highlights) -> None:
         """`!map preview` hook: draw these highlight squares on the canvas
         (over units) until the next command runs."""
@@ -113,6 +130,7 @@ class GuiApp:
         self.loader = SpriteLoader(
             sprites_dir, first=self.workspaces.storage.sprites_dir(LOCAL_WORKSPACE))
         self._preview = None  # highlight squares from `!map preview`
+        self._view = None     # a `!map` / `!map image` view, until the next command
         self.loop = asyncio.new_event_loop()
         self._photo = None  # keep a ref so Tk doesn't GC the image
         self._zoom = 1.0
@@ -247,11 +265,18 @@ class GuiApp:
             return
         # The canvas shows the GUI channel's view, as `!map` would: the
         # channel's bound POV, or an `!as view <team>` preview (fog drawn).
-        try:
-            pov = _view_pov(self.ctx, m, [])
-        except Exception:
-            pov = None
-        scene = m.render_scene(pov_team=pov)
+        view = getattr(self, "_view", None)
+        hidden = coords = None
+        if view is not None:
+            pov, hidden, coords = view["pov"], view["hidden"], view["coords"]
+        else:
+            try:
+                pov = _view_pov(self.ctx, m, [])
+            except Exception:
+                pov = None
+        scene = m.render_scene(pov_team=pov, hidden_layers=hidden)
+        if coords is not None:
+            scene["coords"] = coords
         if getattr(self, "_preview", None):
             scene["highlights"] = self._preview
         cell = self._cell_size(m, scene)
@@ -281,6 +306,7 @@ class GuiApp:
         block = self.entry.get("1.0", "end")
         self.entry.delete("1.0", "end")
         self._preview = None  # a `!map preview` lasts until the next command
+        self._view = None     # so does a `!map` view
         lines = [ln.strip() for ln in block.splitlines()]
         ran = False
         for line in lines:

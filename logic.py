@@ -15466,6 +15466,7 @@ class Match:
             "placements": placements, "fog": fog,
             "borders": self._scene_borders(),
             "coords": self.coords_on(),
+            "sprite_cell_size": self._layer_rule("sprite_cell_size", 100),
             "tint_fill_opacity": max(0, min(100, self._layer_rule(
                 "tint_fill_opacity", 40))),
         }

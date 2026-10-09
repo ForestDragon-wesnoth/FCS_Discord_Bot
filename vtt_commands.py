@@ -6229,7 +6229,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if hook is None:
             return await ctx.send(
                 "Graphics image rendering is available on the Discord surface "
-                "(and the `gui.py` desktop window). On the CLI/harness, use "
+                "and in the `gui.py` window. On the CLI/harness, use "
                 "`!map` for the ASCII view or `!map scene` for the model summary.")
         img_hidden = set()
         for a in sub:
@@ -6447,7 +6447,14 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if reply:
                 return await ctx.send(reply)
             return None
-    return await ctx.send(_map_render_reply(ctx, m, args, extra_hidden))
+    reply = _map_render_reply(ctx, m, args, extra_hidden)
+    # gui.py draws the same view on its canvas until the next command.
+    show = getattr(ctx, "show_scene_view", None)
+    if show is not None:
+        show(_view_pov(ctx, m, args),
+             (m.hidden_layers | extra_hidden) if extra_hidden else None,
+             _coords_flag(args))
+    return await ctx.send(reply)
 
 @registry.command("list", access="all", usage="!list [full] [as=<team>]", desc="List entities (turn order) from this channel's POV, plus a Dead: section of corpses when show_corpses_in_entity_list is enabled. `!list full` (host-gated) ignores visibility; `as=<team>` (host-only) previews what that team sees.")
 async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):

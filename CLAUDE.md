@@ -213,6 +213,25 @@ does an attached part get included where it should (and excluded where it
 shouldn't)? If the feature is spatial, vision-related, movement-related, or
 fires per-entity, this is non-negotiable.
 
+### Rendering changes need a GUI-vs-ASCII pass (user directive)
+
+Text (`_render_ascii_impl`) and graphics (`_render_scene_impl` → the
+`sprite_render.SceneRenderer` pixels) are two parallel renderers over the
+same predicates, and they drift. After ANY change that touches what a map
+shows (a layer, a visibility rule, a glyph / sprite / colour resolver, the
+viewport, a new kind of placement), do a thorough pass on the differences
+between them, not just the feature: read both paths side by side and run
+the throwaway harnesses — (1) per-cell ownership: the ASCII glyph vs the
+top scene placement; (2) pixel parity: render the scene with no sprites and
+check a glyph is drawn exactly where ASCII shows a non-`.` character, fog
+where it shows the fog glyph; (3) a windowed render equals the same crop of
+the full render. Run them over random boards with multi-tile bodies, region
+parts, riders, every facing, team views, hidden layers and viewports.
+Intended differences: corpses and status overlays are graphics-only, a
+`single`-mode multi-tile body draws one sprite/glyph in its anchor cell,
+colour-only cells are a translucent fill, and layer order follows the
+sprite_layer_* rules.
+
 ### ANY bug is worth fixing — multi-tile is where they CLUSTER, not a filter
 
 The multi-tile emphasis above is about where bugs concentrate, NOT a
@@ -2474,6 +2493,27 @@ More shipped work (continuing the list above):
         placement (position, size, mode, sprite/glyph/colour, layer) in
         drawing order, under the channel POV, and the summary names the
         fog sprite.
+    - **GUI-vs-ASCII pass 2 (pixel parity).** Fixes: (1) the BACKGROUND
+      was placed on the window, not the map: `stretch` squeezed the whole
+      image into every viewport window and `tile` repeated it at the PNG's
+      own size from the window corner, so a panned Discord image shifted it
+      under the units. `_draw_background` now places it on the whole grid
+      and cuts the window out: stretch = one copy over the map (only the
+      window's part resized, `resize(box=)`), tile = one copy PER CELL,
+      center = native size at sprite_cell_size cells (the scene carries
+      `sprite_cell_size`), at the map's middle. (2) The `bright_*` palette
+      names aren't Pillow colours, so a `bright_red` unit was untinted in
+      graphics (`_PALETTE_RGB`). (3) Pillow's built-in font is ASCII-only:
+      any other custom glyph (`é`, `█`, `★`, `龍`) drew as a box. A glyph
+      outside ASCII uses the first font that has it — a `fonts/` folder of
+      the sprites folders, then `_SYSTEM_FONTS` (coverage tested against the
+      font's missing-character mask; fonts and results cached module-wide).
+      Colour emoji are not supported. (4) gui.py: `!map image` replied
+      "available on Discord / gui.py" inside gui.py, and `!map as= / full /
+      hide= / coords=` changed only the ASCII text in the log. GuiCtx now
+      has `post_scene_image` and `show_scene_view` (called by the plain
+      `!map` handler when the surface has it): the canvas draws that view
+      until the next command, like `!map preview`.
     - **Default grid borders + per-match override (scenario 532).** The
       `show_borders` rule now DEFAULTS to True: white grid lines drawn ABOVE the
       ground/background but BELOW tiles/zones/entities (in `render()` the border
