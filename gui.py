@@ -55,18 +55,20 @@ class GuiCtx:
     async def send(self, message: str):
         self.app.log(message)
 
-    def show_scene_view(self, pov, hidden=None, coords=None) -> None:
+    def show_scene_view(self, pov, hidden=None, coords=None,
+                        legend=None) -> None:
         """A `!map` with its own view options (`as=`, `full`, `hide=`,
-        `coords=`): the canvas draws that view until the next command, as
-        the ASCII reply does."""
-        self.app._view = {"pov": pov, "hidden": hidden, "coords": coords}
+        `coords=`, `legend=`): the canvas draws that view until the next
+        command, as the ASCII reply does."""
+        self.app._view = {"pov": pov, "hidden": hidden, "coords": coords,
+                          "legend": legend}
 
     async def post_scene_image(self, m, pov, highlights=None, hidden=None,
-                               coords=None) -> str:
+                               coords=None, legend=None) -> str:
         """`!map image` (or a plain `!map` in image render mode): the
         canvas is the image here, so draw that view on it until the next
         command."""
-        self.show_scene_view(pov, hidden, coords)
+        self.show_scene_view(pov, hidden, coords, legend)
         if highlights:
             self.app._preview = highlights
         return ("🖼 Drawn on the canvas — "
@@ -266,15 +268,18 @@ class GuiApp:
         # The canvas shows the GUI channel's view, as `!map` would: the
         # channel's bound POV, or an `!as view <team>` preview (fog drawn).
         view = getattr(self, "_view", None)
-        hidden = coords = None
+        hidden = coords = legend = None
         if view is not None:
             pov, hidden, coords = view["pov"], view["hidden"], view["coords"]
+            legend = view.get("legend")
         else:
             try:
                 pov = _view_pov(self.ctx, m, [])
             except Exception:
                 pov = None
-        scene = m.render_scene(pov_team=pov, hidden_layers=hidden)
+        if legend is None:
+            legend = bool(getattr(m, "map_legend_enabled", False))
+        scene = m.render_scene(pov_team=pov, hidden_layers=hidden, legend=legend)
         if coords is not None:
             scene["coords"] = coords
         if getattr(self, "_preview", None):

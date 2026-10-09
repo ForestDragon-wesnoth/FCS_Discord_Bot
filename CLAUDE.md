@@ -228,9 +228,11 @@ where it shows the fog glyph; (3) a windowed render equals the same crop of
 the full render. Run them over random boards with multi-tile bodies, region
 parts, riders, every facing, team views, hidden layers and viewports.
 Intended differences: corpses and status overlays are graphics-only, a
-`single`-mode multi-tile body draws one sprite/glyph in its anchor cell,
-colour-only cells are a translucent fill, and layer order follows the
-sprite_layer_* rules.
+multi-tile body follows `sprite_mode` (`stretch` default = one sprite/glyph
+over the body; `single` = its anchor cell), colour-only cells are a
+translucent fill, a unit's colour is an outline around its sprite, the image
+legend lists every look in the window (ASCII lists top-layer glyphs only),
+and layer order follows the sprite_layer_* rules.
 
 ### ANY bug is worth fixing — multi-tile is where they CLUSTER, not a filter
 
@@ -2514,6 +2516,38 @@ More shipped work (continuing the list above):
       has `post_scene_image` and `show_scene_view` (called by the plain
       `!map` handler when the surface has it): the canvas draws that view
       until the next command, like `!map preview`.
+    - **Corpse sprites, team outline, `stretch` default, image legend
+      (scenarios 715-717, user calls).**
+      (1) A unit's own corpse picture: `corpse_sprites.<facing>` >
+      `corpse_sprite` vars, else the new `corpse_default_sprite` rule (empty
+      default) — both drawn AS-IS (`Match.corpse_sprite_info` → (key,
+      is_corpse_picture)); with neither, the living sprite greyed and faded
+      by corpse_sprite_tint / corpse_sprite_opacity as before. A corpse
+      placement carries `glyph_tint` / `glyph_opacity` so the glyph drawn
+      when a PNG is missing is always greyed and faded.
+      (2) Team colour: rules `team_outline_width` (default 3 px at
+      sprite_cell_size, scaled with the cell; 0 = off), `team_outline_opacity`
+      (100) and `team_tint_opacity` (default 0; the old behaviour was a full
+      multiply, which wiped a sprite to pure red). Carried in the scene's
+      `unit_style`; `SceneRenderer._outline` draws the ring outside the
+      sprite's shape (alpha >= 128) where the body has transparent room and
+      just inside the body edge where the shape reaches it. Only `entity`
+      placements with a loaded sprite: glyph units keep their coloured glyph,
+      tiles / zones / overlays keep their own full tint. `!map scene` shows
+      the three values.
+      (3) `sprite_mode` defaults to `stretch` (single stays an option).
+      (4) Image legend (`render_scene(legend=True)` → `scene["legend"]`,
+      `Match._scene_legend`): one entry per distinct look among placements
+      inside the window (overlays left out), every meaning that look has
+      (unit shown name — disguise-aware —, `tile: <template>` / `tile`,
+      `zone: <name>`, `corpse: <name>`), in row-major order of first cell,
+      fog last; `!map preview` highlights add "preview area" in the
+      renderer. Drawn below the map by `SceneRenderer._add_legend` at fixed
+      pixel sizes (28 px swatches, 15 px text, columns to the map width,
+      long labels cut with …, at most 40 entries). Follows `!map legend
+      on|off` and the one-off `legend=on|off` on `!map` (image mode), `!map
+      image`, `!map scene` (`list` prints the entries), the GUI canvas and
+      Discord image boards.
     - **Default grid borders + per-match override (scenario 532).** The
       `show_borders` rule now DEFAULTS to True: white grid lines drawn ABOVE the
       ground/background but BELOW tiles/zones/entities (in `render()` the border

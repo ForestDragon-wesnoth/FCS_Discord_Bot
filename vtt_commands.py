@@ -6050,8 +6050,8 @@ for _sub, _usage in (
         ("background", "!map background <key|clear> [stretch|tile|center]"),
         ("border", "!map border <on | off | clear | color <name> | opacity <0-100>>"),
         ("mode", "!map mode <text|image>"),
-        ("scene", "!map scene [full] [list] [as=<team>] [hide=<layers>] [coords=on|off]"),
-        ("image", "!map image [full] [as=<team>] [hide=<layers>] [coords=on|off]"),
+        ("scene", "!map scene [full] [list] [as=<team>] [hide=<layers>] [coords=on|off] [legend=on|off]"),
+        ("image", "!map image [full] [as=<team>] [hide=<layers>] [coords=on|off] [legend=on|off]"),
         ("color", "!map color <on|off>"),
         ("teamcolor", "!map teamcolor <list | clear <team> | <team> <color>>"),
         ("resize", "!map resize <w> <h> [anchor]"),
@@ -6162,9 +6162,10 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # model itself is for the graphics surface; this is a textual
         # at-a-glance.
         sub = args[1:]
-        _check_options(sub, {"as", "hide", "coords"}, "!map scene")
+        _check_options(sub, {"as", "hide", "coords", "legend"}, "!map scene")
         words = [a.lower() for a in sub if not _OPTION_WORD.match(a)]
-        usage = "`!map scene [full] [list] [as=<team>] [hide=<layers>] [coords=on|off]`"
+        usage = ("`!map scene [full] [list] [as=<team>] [hide=<layers>] "
+                 "[coords=on|off] [legend=on|off]`")
         want_full = bool(sub) and sub[0].lower() == "full"
         rest = words[1:] if want_full else words
         if rest not in ([], ["list"]):
@@ -6179,7 +6180,8 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 scene_hidden |= {x.strip() for x in a[5:].lower().split(",") if x.strip()}
         scene = m.render_scene(
             pov_team=pov,
-            hidden_layers=(m.hidden_layers | scene_hidden) if scene_hidden else None)
+            hidden_layers=(m.hidden_layers | scene_hidden) if scene_hidden else None,
+            legend=_legend_flag(m, sub))
         coords = _coords_flag(sub)
         if coords is not None:
             scene["coords"] = coords
@@ -6196,7 +6198,13 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             + (f" (sprite {fog_key or 'none'})" if scene["fog"] else "") + ", "
             f"background={bg['sprite'] if bg else 'none'}, "
             f"borders={'on' if scene['borders']['show'] else 'off'}, "
-            f"coords={'on' if scene.get('coords') else 'off'}."]
+            f"coords={'on' if scene.get('coords') else 'off'}, "
+            f"unit outline {scene['unit_style']['outline_width']}px at "
+            f"{scene['unit_style']['outline_opacity']}%, "
+            f"unit tint {scene['unit_style']['tint_opacity']}%"
+            + (f", legend: {len(scene['legend'])} entr"
+               f"{'y' if len(scene['legend']) == 1 else 'ies'}"
+               if "legend" in scene else "") + "."]
         if rest == ["list"]:
             # Drawing order (lowest layer first), one line per placement.
             for p in sorted(scene["placements"], key=lambda d: d.get("layer", 0)):
@@ -6207,6 +6215,11 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     if p.get(key)) or "nothing"
                 lines.append(f"• {p['kind']} `{p['ref']}` at ({p['x']},{p['y']})"
                              f"{size} — {what} (layer {p['layer']})")
+            for e in scene.get("legend") or []:
+                look = ", ".join(f"{label} {e[key]}" for label, key in
+                                 (("sprite", "sprite"), ("glyph", "glyph"),
+                                  ("color", "tint")) if e.get(key)) or "fog"
+                lines.append(f"Legend: {look} = {', '.join(e['labels'])}")
         return await ctx.send("\n".join(lines))
     if args and args[0].lower() == "image":
         # !map image [full] — render the graphics scene to a PNG and post it as
@@ -6215,12 +6228,13 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # harness) report it as graphics-only. Respects channel POV; `full`
         # (omniscient) is host-gated like the rest of the map's elevated args.
         sub = args[1:]
-        _check_options(sub, {"as", "hide", "coords"}, "!map image")
+        _check_options(sub, {"as", "hide", "coords", "legend"}, "!map image")
         words = [a for a in sub if not _OPTION_WORD.match(a)]
         if words and words[0].lower() != "full":
             return await ctx.send(f"❌ Unexpected `{words[0]}` — usage: "
                                   f"`!map image [full] [as=<team>] "
-                                  f"[hide=<layers>] [coords=on|off]`.")
+                                  f"[hide=<layers>] [coords=on|off] "
+                                  f"[legend=on|off]`.")
         want_full = bool(sub) and sub[0].lower() == "full"
         if want_full and not m.is_host(ctx_user(ctx)):
             return await ctx.send("❌ `!map image full` (omniscient) is host-only.")
@@ -6237,7 +6251,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 img_hidden |= {x.strip() for x in a[5:].lower().split(",") if x.strip()}
         reply = await hook(m, pov,
                            hidden=(m.hidden_layers | img_hidden) if img_hidden else None,
-                           coords=_coords_flag(sub))
+                           coords=_coords_flag(sub), legend=_legend_flag(m, sub))
         if reply:  # the image attachment is the payload; only speak on error/status
             return await ctx.send(reply)
         return None
@@ -6443,7 +6457,8 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if hook is not None:
             pov = _view_pov(ctx, m, args)
             hidden = (m.hidden_layers | extra_hidden) if extra_hidden else None
-            reply = await hook(m, pov, hidden=hidden, coords=_coords_flag(args))
+            reply = await hook(m, pov, hidden=hidden, coords=_coords_flag(args),
+                               legend=_legend_flag(m, args))
             if reply:
                 return await ctx.send(reply)
             return None
@@ -6453,7 +6468,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if show is not None:
         show(_view_pov(ctx, m, args),
              (m.hidden_layers | extra_hidden) if extra_hidden else None,
-             _coords_flag(args))
+             _coords_flag(args), _legend_flag(m, args))
     return await ctx.send(reply)
 
 @registry.command("list", access="all", usage="!list [full] [as=<team>]", desc="List entities (turn order) from this channel's POV, plus a Dead: section of corpses when show_corpses_in_entity_list is enabled. `!list full` (host-gated) ignores visibility; `as=<team>` (host-only) previews what that team sees.")
