@@ -1998,12 +1998,13 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "fog_sprite": {
-        "default": "",
+        "default": "fog_default",
         "schema": {"type": "str"},
         "desc": (
             "Sprite KEY drawn over every cell the POV team can't see (the "
-            "graphics analog of fog_glyph), at fog_opacity. Empty = the "
-            "surface just dims/hides unseen cells with no sprite."
+            "graphics analog of fog_glyph), at fog_opacity. Default "
+            "`fog_default` (sprites/fog_default.png). Empty, or a key with no "
+            "PNG = the surface darkens unseen cells at fog_opacity instead."
         ),
     },
     "fog_opacity": {

@@ -2424,6 +2424,14 @@ More shipped work (continuing the list above):
       or above the viewport still shows its other cells (before, it
       vanished whole, sprites included). Pixel-tested by a throwaway
       script; the harness has no image path.
+    - **Default fog sprite + GUI view.** The `fog_sprite` rule defaults to
+      `fog_default` (sprites/fog_default.png); a key with no PNG falls back
+      to darkening fogged cells at fog_opacity. Fog is drawn only for a
+      team view (the omniscient view hides nothing), so gui.py now renders
+      the GUI channel's view through `_view_pov` — the channel's bound POV
+      or an `!as view <team>` preview, like `!map` — where it used to call
+      `render_scene()` with no view and never showed fog. The toolbar shows
+      the current view.
     - **Default grid borders + per-match override (scenario 532).** The
       `show_borders` rule now DEFAULTS to True: white grid lines drawn ABOVE the
       ground/background but BELOW tiles/zones/entities (in `render()` the border
