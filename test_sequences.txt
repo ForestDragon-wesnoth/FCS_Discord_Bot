@@ -17705,31 +17705,36 @@ SCENARIO 655 — !system set refuses out-of-range numbers for bounded rules
 --------------------------------------------------------------------------
 
 !system set default formula_cell_limit -1
-?? ❌ Setting 'formula_cell_limit' must be at least 1, got -1.
+?? ❌ Setting 'formula_cell_limit' must be between 1 and 1000000, got -1.
 !system set default fog_opacity 150
 ?? ❌ Setting 'fog_opacity' must be between 0 and 100, got 150.
 !system set default max_grid_dimension 0
-?? (or -1 for unlimited)
+?? must be between 1 and 1000, got 0
 !system set default max_grid_dimension -1
-?? max_grid_dimension = -1
+?! max_grid_dimension = -1
+!system set default max_grid_dimension 5000
+?? must be between 1 and 1000 — the bot owner's ceiling, got 5000
 !system set default event_log_retention -2
 ?? ❌ Setting 'event_log_retention' must be at least 0 (or -1 for unlimited), got -2.
 !system set default summon_event_limit 0
 ?? summon_event_limit = 0
 !system rules
 ?? (type: int, 0-100; default: 60)
-?? (type: int, >= 1 or -1 = unlimited; default: 500)
+?? (type: int, 1-1000; default: 500)
 !system set default max_grid_dimension 500
 !system set default summon_event_limit 50
 
-Expected: Bounded integer rules are checked when set. `formula_cell_limit
--1` used to be accepted and then refuse every sight line and burst ("over
-the formula_cell_limit of -1"); `-1` means "unlimited" only on the rules
-that say so (the autosave / event-log retentions, the undo confirmation
-thresholds, max_grid_dimension). An opacity outside 0-100 is refused at
-set time (it used to be stored and refused or clamped on use). A limit
-whose 0 has a meaning (summon_event_limit 0 = no summons) still takes 0.
-`!system rules` shows each bounded rule's range.
+Expected: HARNESS-ALLOWS-ERRORS. Bounded integer rules are checked when set.
+`formula_cell_limit -1` used to be accepted and then refuse every sight line
+and burst ("over the formula_cell_limit of -1"); `-1` means "unlimited" only
+on the rules that say so (the autosave / event-log retentions, the undo
+confirmation thresholds). The limit rules a server could raise high enough
+to stall the bot for every server (formula_cell_limit, max_grid_dimension,
+the macro and recursion limits, ...) have a ceiling the bot owner sets with
+`!owner ceiling`; `max_grid_dimension` no longer takes -1. An opacity
+outside 0-100 is refused at set time. A limit whose 0 has a meaning
+(summon_event_limit 0 = no summons) still takes 0. `!system rules` shows
+each bounded rule's range.
 
 
 SCENARIO 656 — !system set checks formula-valued rules
@@ -19371,3 +19376,243 @@ missing, exactly like `!ent info`. The host may ask about any unit, but the
 marks still stop at red's fog: the goblin's radius-3 sight covers 49 cells,
 and only the 24 red also sees (x 3-6 rows 2-6 from the archer, x 3-4 rows
 7-8 from the scout) are marked.
+
+SCENARIO 704 — Matches, systems, channels and undo history survive a restart
+-----------------------------------------------------------------------------
+
+!system new skirmish
+!system set skirmish fog_los true
+!match new keep Keep 10 8 skirmish
+!match use keep
+!ent add hero Hero 20 2 2 5
+!ent set_var hero inv.sword.dmg 4
+!ent add big Big 30 6 5 3
+!ent set_var big footprint_w 2
+!ent set_var big footprint_h 2
+!history save before_fight
+!ent hp hero -5
+!ent move big 1 left
+!as restart
+?? Reloaded every server
+!assert "entity[hero].hp == 15 and entity[hero].inv.sword.dmg == 4" the hero came back as it was
+!assert "entity[big].x == 5 and occupies('big', 6, 6)" the 2x2 body came back where it moved
+!list
+?? Hero (hero)
+!system info skirmish
+?? `fog_los` = True
+!undo command 1
+?? Undid 1 command(s)
+!assert "entity[big].x == 6" the undo history survived the restart
+!history restore before_fight confirm
+!assert "entity[hero].hp == 20" the manual save survived the restart
+!as restart
+!assert "entity[hero].hp == 20 and entity[big].x == 6" the restored state was saved too
+
+Expected: Every command is written to the server's data folder, and `!as
+restart` (CLI / harness) reloads everything from it the way a bot restart
+does. The match, its system and the channel pointer come back; the hero's
+nested var, the 2×2 body's moved position and the custom system's rule are
+intact. The undo history is on disk too: `!undo command 1` after the restart
+undoes the move made before it, and the manual save `before_fight` restores
+the hero's full hp. A second restart shows the restored state was saved.
+
+SCENARIO 705 — persist_undo_history off keeps the history in memory only
+--------------------------------------------------------------------------
+
+!match new m705 Hist 8 6
+!match use m705
+!ent add a A 10 2 2 5
+!system set default persist_undo_history false
+!ent hp a -1
+!ent hp a -1
+!history list commands
+?? before '!ent hp a -1'
+!as restart
+!history list commands
+?! before '!ent hp a -1'
+!undo command 1
+?? Cannot undo 1 command(s)
+!system set default persist_undo_history true
+!ent hp a -1
+!as restart
+!undo command 1
+?? Undid 1 command(s)
+!assert "entity[a].hp == 8"
+
+Expected: HARNESS-ALLOWS-ERRORS. With persist_undo_history off the undo
+history lives in memory only: the two command autosaves are listed, but
+after a restart they're gone and `!undo command 1` has nothing to undo. Back
+on, the next command's autosave is written to disk and undo works after the
+next restart (hp 7 back to 8).
+
+SCENARIO 706 — Storage limits: old autosaves are cut first, then the command is undone
+----------------------------------------------------------------------------------------
+
+!match new m706 Lim 8 6
+!match use m706
+!ent add a A 10 2 2 5
+!ent hp a -1
+!ent hp a -1
+!ent hp a -1
+!history save mark
+!owner limit local 0.001
+?? Server `local`'s limit is now 1.0 KB.
+!ent set_var a note "a long note that makes the match bigger than before, padded out with more words"
+?? Storage limit: cut the
+!assert "entity[a].note == 'a long note that makes the match bigger than before, padded out with more words'" the command kept its change
+!history list
+?? Manual: 1 (`mark`)
+!system set default storage_trim_autosaves false
+?? storage_trim_autosaves = False
+!ent set_var a note2 "another long note that would need room the server does not have any more at all"
+?? The command was undone.
+!assert "not var_has('a', 'note2')" "the refused change isn't there"
+!store save big
+?? This server's storage limit is reached
+!server storage
+?? of its 1.0 KB storage limit
+!owner limit local reset
+?? (the default).
+!ent set_var a note2 "fits now"
+?! storage limit
+!system set default storage_trim_autosaves true
+
+Expected: HARNESS-ALLOWS-ERRORS. The bot owner lowers this server's limit to
+0.001 MB (well under what the server already holds). A command that grows the data past it first cuts the oldest undo
+autosaves (storage_trim_autosaves, on by default; manual saves are never
+cut), and the change stands. Turning trimming off works even over the
+limit (that command may still cut, since trimming was on when it started).
+With trimming off, the next growing command is undone with a warning and its
+change is gone. `!store save` is refused when
+the file wouldn't fit, `!server storage` shows the use against the limit,
+and `!owner limit local reset` restores the 1000 MB default.
+
+SCENARIO 707 — !server wipe: typed confirmation, refusals, undo
+----------------------------------------------------------------
+
+!system new rpg
+!match new w1 One 8 6
+!match use w1
+!ent add a A 10 2 2
+!store save before
+!alias def wipeall "server wipe all"
+!wipeall
+?? only run when typed on their own
+!batch server wipe all
+?? only run when typed on their own
+!as player pip
+!server wipe all
+?? Only a server administrator can do that
+!as host
+!server wipe confirm wipe all of local
+?? There's no wipe of yours waiting
+!server wipe all
+?? `!server wipe confirm wipe all of local`
+!server wipe confirm wipe matches of local
+?? That isn't the phrase
+!server wipe confirm Wipe ALL of   local
+?? Wiped 1 match(es), the game systems and the saves folder
+!match
+?? No matches
+!system
+?! rpg
+!store load before
+?? File not found
+!match new w2 Two 5 5
+!server wipe undo
+?? Remove them first: matches `w2`
+!match delete w2
+!server wipe undo
+?? Undid the wipe (all): 1 match(es) back
+!system
+?? rpg
+!list
+?? A (a)
+!store load before
+?? Loaded from
+
+Expected: HARNESS-ALLOWS-ERRORS. `!server wipe` refuses to run through an
+alias or a batch, and refuses non-administrators. A confirm with nothing
+pending, or with the wrong phrase, is refused; the phrase is matched without
+case or extra spaces. `wipe all` removes the match, the `rpg` system and the
+saves folder (the save can't be loaded). The undo is refused while a match
+made after the wipe exists, naming it; once it's deleted, the undo brings
+back the match, the system, the saves and the channel's pointer (`!list`
+works again).
+
+SCENARIO 708 — Rule ceilings: the bot owner caps the limits a server may set
+-------------------------------------------------------------------------------
+
+!match new m708 Cap 8 6
+!match use m708
+!system set default formula_cell_limit 2000000
+?? must be between 1 and 1000000 — the bot owner's ceiling
+!owner ceiling formula_cell_limit 2000000
+?? capped at 2000000
+!system set default formula_cell_limit 1500000
+?? formula_cell_limit = 1500000
+!owner ceiling formula_cell_limit 500000
+!assert "len(cells_in_rect(1, 1, 8, 6)) == 48" formulas still run under the lowered cap
+!owner ceiling formula_cell_limit 10
+?? can't go below 100000
+!owner ceiling sprite_cell_size 5
+?? has no ceiling
+!owner ceiling
+?? `formula_cell_limit`: at most 500000 (set by you)
+!as player pip
+!owner ceiling
+?? Only the bot's owner
+!as host
+!owner ceiling formula_cell_limit reset
+?? capped at 1000000
+!system set default formula_cell_limit 100000
+
+Expected: HARNESS-ALLOWS-ERRORS. formula_cell_limit can't be set above its
+ceiling (1,000,000 by default). The bot owner raises the ceiling, a server
+sets a higher value, and when the owner lowers the ceiling again the value
+in force is held to it. A ceiling can't go below the rule's default, a rule
+without a ceiling is refused, and players can't use `!owner`.
+
+SCENARIO 709 — Match ids and system names are file-safe
+---------------------------------------------------------
+
+!match new ../evil Evil 5 5
+?? can use letters, digits, `_` and `-` only
+!match new "two words" X 5 5
+?? can't be one
+!match new ok-id_1 Fine 5 5
+?? Created match `Fine` with id `ok-id_1`
+!system new "bad:name"
+?? can use letters, digits, `_` and `-` only
+!match use ok-id_1
+!match clone a.b
+?? can use letters, digits, `_` and `-` only
+!match clone copy_1
+?? copy_1
+
+Expected: HARNESS-ALLOWS-ERRORS. Match ids, clone ids and system names
+become file names in the data folder, so only letters, digits, `_` and `-`
+(up to 40) are accepted; anything else is refused with that rule.
+
+SCENARIO 710 — Sight lines and area shapes only walk the map
+--------------------------------------------------------------
+
+!match new m710 Clip 10 8
+!match use m710
+!ent add a A 10 2 2
+!tile set 5 2 opaque true
+!assert "has_los(1, 1, 1, 99999) and not has_los(2, 2, 99999, 2)" "a far-off end only costs the map's part"
+!assert "raycast(2, 2, 99999, 2) == [4, 2]" the beam stops before the wall
+!assert "raycast(2, 3, 99999, 3) == [99999, 3]" a clear beam reaches its far target
+!assert "len(cells_in_rect(-1000000, -1000000, 1000000, 1000000)) == 80" "only the 10x8 map's cells are listed"
+!assert "cells_in_line(-5, 2, 3, 2) == [[1, 2], [2, 2], [3, 2]]" a line from off the map starts at the edge
+!assert "len(cells_in_burst(1, 1, 100000)) == 80"
+!assert "entities_in_line_ignorelos(-50, 2, 50, 2) == ['a']"
+!assert "first_opaque(-50, 2, 50, 2) == [5, 2]"
+
+Expected: Sight lines and area builders are cut to the map before they are
+walked, so far-off coordinates cost no more than the map itself (a line to
+y = 99999 used to walk ~100,000 cells; a 2,000,000-wide rectangle was
+refused by formula_cell_limit). The results are unchanged on the map: off-map
+cells are never opaque, so a clear line to an off-map point is still clear
+and a beam to it still reaches it; the area builders list only on-map cells.

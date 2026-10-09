@@ -243,7 +243,7 @@ class DiscordCtxWrapper:
         # available); otherwise the ASCII board. Falls back to text on failure.
         if getattr(m, "render_mode", "text") == "image":
             try:
-                header, data, engaged = await _board_image(m, self.channel_key)
+                header, data, engaged = await _board_image(m, self.channel_key, self._mgr)
                 view = _PanView(self.channel_key, self._mgr) if engaged else None
                 file = discord.File(io.BytesIO(data), filename=f"{m.id}.png")
                 msg = await self._ctx.send(header or "🗺️", file=file, view=view) \
@@ -263,6 +263,14 @@ class DiscordCtxWrapper:
         kind = "image" if getattr(m, "render_mode", "text") == "image" else "map"
         return (f"🗺️ Auto-update {kind} board ON — this message refreshes on "
                 "every change" + (" (use the arrows to pan)." if engaged else "."))
+
+    async def retire_server_boards(self, mgr) -> None:
+        """Stop every auto-update board of this server (`!server wipe`: the
+        matches they show are gone)."""
+        key = getattr(mgr, "guild_key", None)
+        for ck, entry in list(_boards.items()):
+            if entry.get("workspace") == key:
+                await _retire_board(ck, entry, entry.get("match_id", "?"))
 
     async def post_scene_image(self, m, pov, highlights=None) -> str:
         """Render the match's graphics scene to a PNG and post it as an
@@ -285,7 +293,7 @@ class DiscordCtxWrapper:
             scene, cell = scene_for_png(m, pov_team=pov, viewport=viewport,
                                         highlights=highlights)
             data = await asyncio.to_thread(
-                render_scene_png, scene, _get_sprite_loader(), cell)
+                render_scene_png, scene, _get_sprite_loader(self._mgr), cell)
         except RuntimeError as e:
             return f"❌ {e}"
         except Exception as e:
@@ -605,15 +613,20 @@ _boards: Dict[str, Dict[str, Any]] = {}
 # from the sprites/ folder; we lazily build it once and reuse it. Importing
 # sprite_render is deferred so a Discord deployment without Pillow still loads
 # (the hook reports graphics as unavailable instead of crashing the adapter).
-_sprite_loader = None
+# One loader per server: its own data/<guild>/sprites/ folder is searched
+# before the shared sprites/ folder.
+_sprite_loaders: Dict[Any, Any] = {}
 
 
-def _get_sprite_loader():
-    global _sprite_loader
-    if _sprite_loader is None:
+def _get_sprite_loader(mgr=None):
+    key = getattr(mgr, "guild_key", None)
+    if key not in _sprite_loaders:
         from sprite_render import SpriteLoader
-        _sprite_loader = SpriteLoader()
-    return _sprite_loader
+        from storage import storage_of
+        st = storage_of(mgr)
+        _sprite_loaders[key] = SpriteLoader(
+            first=st.sprites_dir(key) if st is not None and key else None)
+    return _sprite_loaders[key]
 
 
 def _board_render(m, channel_key: str) -> Tuple[str, bool]:
@@ -665,7 +678,7 @@ def _board_render(m, channel_key: str) -> Tuple[str, bool]:
             f"rules to shrink the window."), bool(viewport)
 
 
-async def _board_image(m, channel_key: str):
+async def _board_image(m, channel_key: str, mgr=None):
     """(header text, PNG bytes, viewport_engaged) for an IMAGE board: the same
     POV + viewport as the text board, rendered to a PNG via sprite_render.
     Raises if Pillow is unavailable (caller falls back to a text board)."""
@@ -678,7 +691,7 @@ async def _board_image(m, channel_key: str):
     # Scene on the event loop (reads the match), pixels in a worker thread.
     scene, cell = scene_for_png(m, pov_team=pov, viewport=viewport)
     data = await asyncio.to_thread(
-        render_scene_png, scene, _get_sprite_loader(), cell)
+        render_scene_png, scene, _get_sprite_loader(mgr), cell)
     header = ""
     if viewport:
         vx, vy, vw, vh = viewport
@@ -695,7 +708,7 @@ async def _apply_board(message, m, channel_key: str, mgr: MatchManager) -> bool:
     import io
     if getattr(m, "render_mode", "text") == "image":
         try:
-            header, data, engaged = await _board_image(m, channel_key)
+            header, data, engaged = await _board_image(m, channel_key, mgr)
             view = _PanView(channel_key, mgr) if engaged else None
             await message.edit(
                 content=(header or None),
@@ -752,6 +765,8 @@ class _PanView(discord.ui.View):
         vw, vh = m._viewport_dims()
         m.pan_view(self.channel_key,
                    dx * _pan_step(m, vw), dy * _pan_step(m, vh))
+        # The camera is match state, but a click isn't a command: save it.
+        await vtt_commands.persist_workspace(self._mgr, None)
         entry = _boards.get(self.channel_key)
         if entry is not None:
             entry["message"] = interaction.message

@@ -384,26 +384,95 @@ switch workspaces with `!as server <key>` (scenarios 698-700).
   are player-available: they list only this server's matches.
 - STILL SHARED across servers: the process and its event loop. A slow command
   in one server delays every server, so anything whose cost follows a user's
-  numbers needs a budget rule (formula_cell_limit, sight_check_limit, ...).
-  formula_cell_limit has no maximum, so a server's admin can still set it
-  high enough to stall the bot — a job for the limits work below.
-- Persistence is the NEXT step (agreed with the user, not built yet): a JSON
-  storage class under `data/<guild_id>/` (systems.json, matches/, saves/,
-  sprites/) plus `data/bot_settings.json`, written after every state-changing
-  command, loaded at startup; per-server (1000 MB) and global (20 GB) storage
-  limits with rollback + warning, owner-overridable via `!owner limit`; per-
-  server sprites; `!server wipe` with a typed confirmation phrase and a 24 h
-  trash. Until then everything lives in memory and `!store save` is the only
-  way to keep a server's state across a restart.
+  numbers needs a budget. The limit rules a server could raise high enough to
+  stall everyone carry a CEILING (schema `"max"` + `"ceiling": True`; the bot
+  owner changes it with `!owner ceiling`, kept in `logic.RULE_CEILINGS` and
+  bot_settings.json; `_build_rules_dict` clamps values above it). Sight lines
+  and area builders are CLIPPED to the map before they are walked
+  (`Match._line_span`, `formula._clip_range` / `_bresenham_on_map`), so their
+  cost follows the map, not the arguments. A NEW limit rule a server can set
+  needs a ceiling; a NEW function whose cost follows its arguments needs
+  clipping or a budget.
+- **DEFERRED (user, 2026-10): a per-server CPU work budget.** The per-call
+  limits multiply: a loop of 10,000 iterations (formula_loop_limit) each
+  walking a long line is still minutes of a frozen bot for EVERY server, and
+  any match host can write such an action (measured before clipping: 20 calls
+  of `has_los(1, 1, 1, 99999)` = 1.5 s, so the default loop limit ≈ 12
+  minutes; clipping cut the per-call cost to the map, but 10,000 calls × a
+  1,000-cell line on a 500×500 map is still ~7 s). The fix the user prefers:
+  a work counter charged at every cell walked / loop iteration / macro step /
+  summon / event firing, per SERVER, owner-set, in deterministic work units
+  (not wall-clock, so scenarios stay reproducible). Revisit before any public
+  rollout; it needs careful decisions about compromises and abuse.
+- **PR 3 (planned):** entity / statblock / other TEMPLATE storage per server,
+  reusable across matches. `data/<guild_id>/templates/` is reserved for it
+  (counts toward the server limit; `!server wipe all` should clear it).
+
+### Persistence: the data folder (storage.py)
+
+Everything persists to `data/` (`storage.DATA_DIR_DEFAULT`, git-ignored),
+one folder per server (`local` for the CLI / GUI):
+`workspace.json` (channel pointers, default system, per-channel defaults),
+`systems.json`, `matches/<id>.json`, `matches/<id>/history/` (`index.json` +
+one `<sequence>.json` per undo snapshot), `saves/`, `sprites/`, `corrupt/`;
+plus `data/bot_settings.json` (owner limits + rule ceilings) and
+`data/.trash/` (wiped data, 24 h). Mechanics worth knowing:
+- **Commit after every top-level command** (`vtt_commands.persist_workspace`,
+  called from `CommandRegistry.run` inside the command lock, also after a
+  Discord pan click). `Storage.commit(mgr)` serializes every match and the
+  workspace / systems and rewrites only files whose text changed (compared
+  with `_written`, the text last written); removed matches / snapshots are
+  deleted. Each file is atomic (temp + rename); no journal (user-accepted:
+  a crash can leave two files of one command a command apart).
+- **Match files and snapshot files leave out `rules`** (`_disk_state`): it
+  was 87% of an empty match file and is rebuilt from the system on every load
+  / restore. A snapshot read back from disk therefore has no `rules`; the
+  snapshot diff only compares rules when both sides have them.
+- **Lazy history:** `Snapshot.state` is a property; a persisted snapshot
+  drops its state from memory after the commit (`release_state`) and reads
+  `path` on first use. `MatchHistory.index()` / `from_index()` are the disk
+  shape. `persist_undo_history` (rule, default on) = history files written;
+  off = memory only, files deleted.
+- **Limits** (`Storage._over_limit`): per server (default 1000 MB, the whole
+  server folder) and global (20 GB, everything incl. trash), owner-set with
+  `!owner limit`. A commit that GROWS past a limit first cuts the server's
+  oldest autosaves (never manual saves) from matches with
+  `storage_trim_autosaves` on (now OR at the last commit, so turning it off
+  works over the limit); if that can't make room, `Storage.rollback` puts
+  the server back to what's on disk — matches in place via
+  `action._rollback_match`, history from the index — and the user is warned.
+  A commit that doesn't grow is always allowed. `!store save` / `!history
+  export` check room first (`check_room`) and are refused if over.
+- **Startup:** `storage.open_workspaces()` (bot.py, cli.py, gui.py) loads every
+  server folder; a file that fails to load moves to `corrupt/` with a console
+  note and the rest loads; unknown gamerules in systems are dropped. Data of
+  servers the bot left is kept. On shutdown `commit_all` writes once more.
+- **`!server wipe matches|all`** (admin; refused inside batch / macro / alias
+  / action / `!again`: `_SERVER_TYPED_ONLY`): prints a phrase, accepted from the
+  same admin in the same channel within 2 minutes (case / spaces ignored);
+  `Storage.move_to_trash`; channels then point at no match and Discord boards
+  are retired (`retire_server_boards`). `!server wipe undo` restores the
+  newest trash entry within 24 h, refused while anything made since exists
+  (`_wipe_blockers` lists it). `!server storage` shows use vs limit.
+- **Tests:** the scenario harness gives every scenario its own temp data
+  folder, so every command runs through the real commit / rollback; `!as
+  restart` (CLI / harness, `storage.reload_workspaces`) reloads everything
+  from disk as a bot restart would — use it to prove something persists.
+- **FUTURE PROBLEM TO WATCH (user, 2026-10):** persisted undo history is on
+  by default and every snapshot is a full match state (minus rules). Long
+  campaigns with big boards could make history the bulk of a server's disk
+  use; the limit + autosave cutting bound it, but if it starts to hurt,
+  revisit retention defaults or a diff-based snapshot format.
 
 ### Disk access is confined to the server's saves folder
 
 Every command that reads or writes a host file — `!store save/load`, `!run`,
 `!history export/import` — goes through `vtt_commands.saves_path(name, mgr,
 write=)`, which resolves plain relative names (subfolders allowed) inside the
-workspace's folder (`server_saves_dir`: `SAVES_DIR` itself for `local`,
-`SAVES_DIR/servers/<guild id>/` for a Discord server, so one server's
-`!store load` can't read another's files) and refuses `..`, absolute paths,
+workspace's folder (`server_saves_dir`: with storage `data/<guild id>/saves/`;
+without it `SAVES_DIR` for `local` and `SAVES_DIR/servers/<guild id>/` for a
+Discord server, so one server's `!store load` can't read another's files)
+and refuses `..`, absolute paths,
 drive letters and anything whose realpath (symlinks included) leaves the
 folder. Replies show `saves/<name>`, never the host's absolute path. Before
 this, `!run 1bot_token.txt` echoed the bot token back line by line ("Unknown
@@ -4624,6 +4693,41 @@ More shipped work (continuing the list above):
   - **Struck ideas (user, 2026-10):** small #7 (composable, see §1), medium
     #156, large #44 hex grid (§1: square grid is fundamental), large #45
     translation. Nested maps per match: wanted, later.
+
+- **Persistence, storage limits, `!server wipe`, rule ceilings, off-map
+  clipping — SHIPPED (scenarios 704-710).** PR 2 of the storage work; the
+  mechanics are in §3 "Persistence: the data folder". Also:
+  - **Ids are file-safe:** match ids, clone ids and system names must match
+    `logic.ID_RE` (letters, digits, `_`, `-`, 1-40; `check_id`), checked in
+    create / clone / create_system and `!store load` (709).
+  - **Owner commands:** `!owner limit [<global|default|<server>> <MB|reset>]`,
+    `!owner storage [<server>]` (rescans the disk), `!owner ceiling [<rule>
+    <value|reset>]` (a ceiling can't go below the rule's default). The 14
+    ceilinged rules and their defaults: formula_cell_limit 1M,
+    formula_loop_limit 100k, formula_size_limit 1M, macro_step_limit 100k,
+    macro_repeat_limit 10k, macro_recursion_limit 128, event_recursion_limit
+    128, var_hook_recursion_limit 1024, action_recursion_limit 64,
+    formula_function_recursion_limit 256, summon_event_limit 500,
+    action_choice_limit 100, max_grid_dimension 1000 (no more -1),
+    sight_check_limit 10M. The recursion ceilings were measured: just under
+    the depth where Python's own recursion limit hits at the top level (a
+    RecursionError is caught, not a crash, but it reads badly).
+  - **Clipping (710):** `has_los` / `raycast` / `first_opaque` /
+    `entities_on_los` / `entities_in_line_*` and the `cells_in_*` builders
+    (+ `entities_in_rect/cone`) walk only the map's part; off-map cells are
+    never opaque (`cell_opaque`). Verified against the old full walk on
+    48,000 random segments (all corner modes) and 120,000 area/line cases:
+    identical on the map. `cells_in_line`'s Bresenham has the closed form
+    step k → minor = b + s·max(0, ceil((2·dmin·k − dmaj)/(2·dmaj))), which
+    `_bresenham_on_map` binary-searches.
+  - **Per-server sprites:** `SpriteLoader(shared, first=<server sprites>)`;
+    the Discord adapter keeps one loader per server.
+  - Verified: a memory-equals-disk chaos harness (reload the data folder into
+    fresh workspaces after EVERY command and compare every match, history
+    index + snapshot states, channel pointers and systems) over 20 seeds incl.
+    hostile, with wipes, wipe undos, autosave cuts, rollbacks, store loads and
+    history restores in the mix; corrupt-file quarantine; ~12 ms commit per
+    command with 20 matches × 30 units.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

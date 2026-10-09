@@ -1275,7 +1275,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "event_recursion_limit": {
         "default": 64,
-        "schema": {"type": "int", "min": 1},
+        "schema": {"type": "int", "min": 1, "max": 128, "ceiling": True},
         "desc": (
             "Max nesting depth for the custom event bus (emit). A handler "
             "fired by an event may itself emit; this caps the chain so a "
@@ -1286,7 +1286,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "macro_repeat_limit": {
         "default": 1000,
-        "schema": {"type": "int", "min": 0},
+        "schema": {"type": "int", "min": 0, "max": 10000, "ceiling": True},
         "desc": (
             "Max iterations a single `repeat N` block in a macro will run "
             "(N is clamped to this). Guards against a typo'd huge count."
@@ -1294,7 +1294,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "macro_step_limit": {
         "default": 10000,
-        "schema": {"type": "int", "min": 1},
+        "schema": {"type": "int", "min": 1, "max": 100000, "ceiling": True},
         "desc": (
             "Hard backstop on the TOTAL work a single `!macro run` may do — "
             "command lines dispatched PLUS `repeat` loop iterations (across all "
@@ -1305,7 +1305,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "macro_recursion_limit": {
         "default": 20,
-        "schema": {"type": "int", "min": 1},
+        "schema": {"type": "int", "min": 1, "max": 128, "ceiling": True},
         "desc": (
             "Max depth of nested `!macro run` / `!run` calls (a macro line or "
             "script line that runs another macro or script, counted as one "
@@ -1408,7 +1408,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     ## Var-hook system rules
     "var_hook_recursion_limit": {
         "default": 128,
-        "schema": {"type": "int", "min": 1},
+        "schema": {"type": "int", "min": 1, "max": 1024, "ceiling": True},
         "desc": (
             "Maximum depth of var-event recursion before further hook firing "
             "is suppressed. A var-hook passive's formula may itself write vars, "
@@ -1433,7 +1433,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "formula_function_recursion_limit": {
         "default": 64,
-        "schema": {"type": "int", "min": 1},
+        "schema": {"type": "int", "min": 1, "max": 256, "ceiling": True},
         "desc": (
             "Maximum call depth for user-defined formula functions (see "
             "!func). A function may call other functions (or itself); if "
@@ -1445,7 +1445,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "formula_loop_limit": {
         "default": 10000,
-        "schema": {"type": "int", "min": 1},
+        "schema": {"type": "int", "min": 1, "max": 100000, "ceiling": True},
         "desc": (
             "Maximum total iterations across all for-loops in a single "
             "formula evaluation. Loops over entities_within / "
@@ -1458,23 +1458,23 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "formula_cell_limit": {
         "default": 100000,
-        "schema": {"type": "int", "min": 1},
+        "schema": {"type": "int", "min": 1, "max": 1000000, "ceiling": True},
         "desc": (
             "Maximum number of cells one geometry query in a formula may "
             "generate or walk: cells_in_burst / _rect / _cone / _line, "
             "entities_in_rect / _cone, and every sight line (has_los, "
             "raycast, first_opaque, entities_on_los, "
-            "entities_in_line_ignorelos / _until, can_see*). Their cost "
-            "follows the ARGUMENTS, not the board, so without a cap "
-            "`cells_in_rect(0, 0, 100000, 100000)` — reachable by any "
-            "player through an inline `$()` arg — would hang the bot for "
-            "every server. Default 100000 (a 316x316 area, or a sight line "
-            "that long) is far beyond any real map."
+            "entities_in_line_ignorelos / _until, can_see*). Shapes and "
+            "lines are cut to the map before they are walked (cells off the "
+            "map are never visited), so this caps a large area on a large "
+            "map: a full burst over a 500x500 grid is 250000 cells. Default "
+            "100000 (a 316x316 area); the bot owner's ceiling (`!owner "
+            "ceiling`) caps how high a server may set it."
         ),
     },
     "sight_check_limit": {
         "default": 1000000,
-        "schema": {"type": "int", "min": 1000, "max": 10000000},
+        "schema": {"type": "int", "min": 1000, "max": 10000000, "ceiling": True},
         "desc": (
             "Work budget of one `!map ent_sight` answer: every range check "
             "(each map cell against each cell of the unit's body) and every "
@@ -1487,7 +1487,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "formula_size_limit": {
         "default": 100000,
-        "schema": {"type": "int", "min": 1},
+        "schema": {"type": "int", "min": 1, "max": 1000000, "ceiling": True},
         "desc": (
             "Maximum length of a string or list a formula may build with "
             "`*` or `+` (e.g. 'ab' * n, [0] * n, s + s). Guards against "
@@ -1499,7 +1499,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "summon_event_limit": {
         "default": 50,
-        "schema": {"type": "int", "min": 0},
+        "schema": {"type": "int", "min": 0, "max": 500, "ceiling": True},
         "desc": (
             "Maximum number of entities that may be summoned during a "
             "single top-level command (including all hook fires and "
@@ -2163,13 +2163,14 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # A grid that fits both caps renders whole (no viewport).
     "max_grid_dimension": {
         "default": 500,
-        "schema": {"type": "int", "min": 1, "unlimited": True},
+        "schema": {"type": "int", "min": 1, "max": 1000, "ceiling": True},
         "desc": (
             "Largest width or height a grid may have, checked by `!match "
             "new` (against the new match's system) and `!map resize`. A "
             "full map render costs width x height cells (1500x1500 is ~0.45 "
             "s and 4 MB of text on the CLI / gui.py), so a typo'd size "
-            "would stall the bot. -1 = unlimited."
+            "would stall the bot. Capped by the bot owner's ceiling "
+            "(`!owner ceiling`, default 1000)."
         ),
     },
     "viewport_width": {
@@ -2348,7 +2349,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # surface; see also Match.discover_actions and the !action command.
     "action_recursion_limit": {
         "default": 8,
-        "schema": {"type": "int", "min": 1},
+        "schema": {"type": "int", "min": 1, "max": 64, "ceiling": True},
         "desc": (
             "Maximum action call depth — an action body that calls "
             "use_action() into another action counts as a nested call. "
@@ -2361,7 +2362,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "action_choice_limit": {
         "default": 20,
-        "schema": {"type": "int", "min": 0},
+        "schema": {"type": "int", "min": 0, "max": 100, "ceiling": True},
         "desc": (
             "Maximum number of mid-body choices (choose / choose_number "
             "prompts) a single action invocation may make. The runner "
@@ -2510,6 +2511,29 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "This gives users fine-grained undo at the cost of more "
             "snapshots than the round/turn levels. See also "
             "autosave_command_retention_max, which caps the COUNT."
+        ),
+    },
+    "persist_undo_history": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether a match's undo history (round / turn / command autosaves "
+            "and manual saves) is written to disk with it, so undo still "
+            "works after the bot restarts. Each snapshot is a full copy of "
+            "the match, so a long history takes room in the server's storage "
+            "limit. Off: the history lives in memory only (lost on restart) "
+            "and its files are deleted."
+        ),
+    },
+    "storage_trim_autosaves": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "When a command would push the server past its storage limit, "
+            "first delete the server's oldest undo autosaves (round / turn / "
+            "command; never manual saves) from matches with this rule on. "
+            "The command is undone only if that can't make room. Off: this "
+            "match's autosaves are never cut for room."
         ),
     },
     "autosave_command_retention_max": {
@@ -2841,6 +2865,22 @@ def _parse_bool(token: str) -> bool:
         "Expected a boolean: use 'true'/'false', 'yes'/'no', 'on'/'off', or '1'/'0'."
     )
 
+# The bot owner's ceilings on the limit rules marked `"ceiling": True` in
+# their schema (`!owner ceiling`, kept in data/bot_settings.json): rule key ->
+# highest value a server may set. A rule without an entry uses its schema
+# `max`. Every server shares one process, so a server must not be able to set
+# a limit high enough to stall the bot for the others.
+RULE_CEILINGS: Dict[str, int] = {}
+
+
+def rule_max(key: str) -> Optional[int]:
+    """The highest value rule `key` accepts (owner ceiling, else schema max)."""
+    spec = RULES_REGISTRY.get(key, {}).get("schema", {})
+    if spec.get("ceiling") and key in RULE_CEILINGS:
+        return RULE_CEILINGS[key]
+    return spec.get("max")
+
+
 def _coerce_rule_value(key: str, raw_value: str):
     # Unknown key? block (prevents typos or unimplemented settings).
     # When the rule schema gets large the bare "Allowed: ..." dump is
@@ -2874,7 +2914,7 @@ def _coerce_rule_value(key: str, raw_value: str):
         # Bounds: a limit set to -1 (the "unlimited" of the retention rules)
         # or an opacity of 150 used to be accepted and then refuse or
         # misbehave on use. `unlimited` rules also take -1.
-        lo, hi = spec.get("min"), spec.get("max")
+        lo, hi = spec.get("min"), rule_max(key)
         if spec.get("unlimited") and v == -1:
             return v
         if (lo is not None and v < lo) or (hi is not None and v > hi):
@@ -2885,6 +2925,8 @@ def _coerce_rule_value(key: str, raw_value: str):
             else:
                 rng = f"between {lo} and {hi}"
             extra = " (or -1 for unlimited)" if spec.get("unlimited") else ""
+            if spec.get("ceiling") and hi is not None and v > hi:
+                extra += " — the bot owner's ceiling"
             raise VTTError(f"Setting '{key}' must be {rng}{extra}, got {v}.")
         return v
 
@@ -3044,16 +3086,26 @@ def _own_value(value: Any) -> Any:
                    f"None, lists and dicts can be stored.")
 
 
-def write_json_file(path: str, data: Any) -> None:
-    """Write `data` as JSON to `path` all-or-nothing: the text is built
-    first and written to a temp file beside the target, then moved over it.
-    json.dump straight into the target truncated an existing good save when
-    serialization failed partway. Raises VTTError (no host path in the
-    message: callers name the file the way they show it)."""
+def json_text(data: Any) -> str:
+    """The JSON text a save file holds (raises VTTError on a value JSON
+    can't hold)."""
     try:
-        text = json.dumps(data, indent=2)
+        return json.dumps(data, indent=2)
     except (TypeError, ValueError) as e:
         raise VTTError(f"the data holds a value that can't be saved ({e}).")
+
+
+def write_json_file(path: str, data: Any) -> None:
+    """Write `data` as JSON to `path` all-or-nothing (see write_text_file)."""
+    write_text_file(path, json_text(data))
+
+
+def write_text_file(path: str, text: str) -> None:
+    """Write `text` to `path` all-or-nothing: it goes to a temp file beside
+    the target, then is moved over it. json.dump straight into the target
+    truncated an existing good save when serialization failed partway.
+    Raises VTTError (no host path in the message: callers name the file the
+    way they show it)."""
     folder = os.path.dirname(os.path.abspath(path))
     tmp = os.path.join(folder, f".{os.path.basename(path)}.{uuid.uuid4().hex}.tmp")
     try:
@@ -8140,7 +8192,10 @@ class Match:
 
     def cell_opaque(self, viewer_id: Optional[str], x: int, y: int) -> bool:
         """True iff the tile or any zone covering (x, y) blocks the sight of
-        `viewer_id`. The raw opacity query (ignores fog toggles)."""
+        `viewer_id`. The raw opacity query (ignores fog toggles). A cell off
+        the map is never opaque (the sight walks skip it, see _line_span)."""
+        if not self.in_bounds(x, y):
+            return False
         if self._eval_opaque_spec(self._tile_opaque_spec(x, y), viewer_id,
                                   {"tile_x": x, "tile_y": y}):
             return True
@@ -8176,22 +8231,26 @@ class Match:
         block."""
         if (x1, y1) == (x2, y2):
             return ((x2, y2), False, None)
-        self._check_line_budget(x1, y1, x2, y2)
+        # Only the map's part of the line is walked (off-map cells are never
+        # opaque, see _line_span), so the cost follows the map's size.
+        span = self._line_span(x1, y1, x2, y2)
+        if span is None:
+            return ((x2, y2), False, None)
         mode = str(self.rules.get("los_corner_mode", "permissive"))
         dx, dy = x2 - x1, y2 - y1
         sx = 1 if dx > 0 else (-1 if dx < 0 else 0)
         sy = 1 if dy > 0 else (-1 if dy < 0 else 0)
         adx, ady = abs(dx), abs(dy)
-        cx, cy = x1, y1
-        last = (x1, y1)
-        nx = ny = 0  # boundary crossings consumed per axis
-        guard = adx + ady + 2
-        while guard > 0:
+        nx, ny, nx1, ny1 = span  # boundary crossings consumed per axis
+        cx, cy = x1 + sx * nx, y1 + sy * ny
+        last = (cx, cy)
+        guard = (nx1 - nx) + (ny1 - ny) + 2
+        while guard > 0 and (nx < nx1 or ny < ny1):
             guard -= 1
             if adx == 0:
-                cy += sy
+                cy += sy; ny += 1
             elif ady == 0:
-                cx += sx
+                cx += sx; nx += 1
             else:
                 # tMaxX=(2nx+1)/(2adx) vs tMaxY=(2ny+1)/(2ady), cross-
                 # multiplied to integers (no float drift at corners).
@@ -8254,29 +8313,87 @@ class Match:
                 f"cells, over the formula_cell_limit of {limit}."
             )
 
-    def _line_cells(self, x1: int, y1: int, x2: int, y2: int) -> List[Tuple[int, int]]:
+    def _line_span(self, x1: int, y1: int, x2: int, y2: int
+                   ) -> Optional[Tuple[int, int, int, int]]:
+        """The part of the segment between the centres of cells (x1,y1) and
+        (x2,y2) that crosses the map, in line-walk steps: (nx0, ny0, nx1,
+        ny1), where the walk's x / y boundary crossings numbered nx0..nx1-1 /
+        ny0..ny1-1 are the ones on or inside the map's edge. Starting the walk
+        at crossing (nx0, ny0) puts it on the cell just before the line enters
+        the map, so a corner check at the edge still runs; after crossing
+        (nx1, ny1) it has left the map for good. None if the line never
+        touches the map. Off-map cells hold nothing and are never opaque, so
+        the sight / line walks skip them: their cost follows the map, not
+        coordinates a formula made up."""
+        from fractions import Fraction
+        dx, dy = x2 - x1, y2 - y1
+        t0, t1 = Fraction(0), Fraction(1)
+        # Liang-Barsky against the closed rectangle [0.5, W+0.5] x [0.5, H+0.5]
+        # (cell (x, y) spans x-0.5..x+0.5).
+        for p, q in ((-dx, Fraction(x1) - Fraction(1, 2)),
+                     (dx, Fraction(self.grid_width) + Fraction(1, 2) - x1),
+                     (-dy, Fraction(y1) - Fraction(1, 2)),
+                     (dy, Fraction(self.grid_height) + Fraction(1, 2) - y1)):
+            if p == 0:
+                if q < 0:
+                    return None
+                continue
+            r = q / p
+            if p < 0:
+                t0 = max(t0, r)
+            else:
+                t1 = min(t1, r)
+            if t0 > t1:
+                return None
+
+        def crossings(a: int, t: Fraction, strict: bool) -> int:
+            # Boundary k is crossed at t = (2k+1)/(2a): count those < t
+            # (strict) or <= t.
+            if a == 0:
+                return 0
+            v = a * t - Fraction(1, 2)
+            if strict:
+                n = -((-v.numerator) // v.denominator)        # ceil(v)
+            else:
+                n = v.numerator // v.denominator + 1          # floor(v) + 1
+            return max(0, min(a, n))
+
+        adx, ady = abs(dx), abs(dy)
+        return (crossings(adx, t0, True), crossings(ady, t0, True),
+                crossings(adx, t1, False), crossings(ady, t1, False))
+
+    def _line_cells(self, x1: int, y1: int, x2: int, y2: int, *,
+                    clip: bool = True) -> List[Tuple[int, int]]:
         """The ordered cells the segment (x1,y1)->(x2,y2) passes through,
-        near->far, INCLUSIVE of both endpoints — the same thin line the LOS
-        walk uses (a diagonal step at an exact corner). Geometry only, no
-        opacity. The shared path behind first_opaque / entities_on_los /
-        entities_in_line_ignorelos."""
-        cells = [(x1, y1)]
+        near->far — the same thin line the LOS walk uses (a diagonal step at
+        an exact corner). Geometry only, no opacity. The shared path behind
+        first_opaque / entities_on_los / entities_in_line_ignorelos. With
+        `clip` (default) only cells ON the map are listed (endpoints included
+        when on the map) and the walk covers only the map's part of the line
+        (_line_span); without it, every cell of the line, endpoints included."""
         if (x1, y1) == (x2, y2):
-            return cells
-        self._check_line_budget(x1, y1, x2, y2)
+            return [(x1, y1)] if (not clip or self.in_bounds(x1, y1)) else []
         dx, dy = x2 - x1, y2 - y1
         sx = 1 if dx > 0 else (-1 if dx < 0 else 0)
         sy = 1 if dy > 0 else (-1 if dy < 0 else 0)
         adx, ady = abs(dx), abs(dy)
-        cx, cy = x1, y1
-        nx = ny = 0
-        guard = adx + ady + 2
-        while (cx, cy) != (x2, y2) and guard > 0:
+        if clip:
+            span = self._line_span(x1, y1, x2, y2)
+            if span is None:
+                return []
+            nx, ny, nx1, ny1 = span
+        else:
+            self._check_line_budget(x1, y1, x2, y2)
+            nx, ny, nx1, ny1 = 0, 0, adx, ady
+        cx, cy = x1 + sx * nx, y1 + sy * ny
+        cells = [(cx, cy)]
+        guard = (nx1 - nx) + (ny1 - ny) + 2
+        while (cx, cy) != (x2, y2) and guard > 0 and (nx < nx1 or ny < ny1):
             guard -= 1
             if adx == 0:
-                cy += sy
+                cy += sy; ny += 1
             elif ady == 0:
-                cx += sx
+                cx += sx; nx += 1
             else:
                 a = (2 * nx + 1) * ady
                 b = (2 * ny + 1) * adx
@@ -8287,6 +8404,8 @@ class Match:
                 else:
                     cy += sy; ny += 1
             cells.append((cx, cy))
+        if clip:
+            cells = [c for c in cells if self.in_bounds(*c)]
         return cells
 
     def first_opaque(self, viewer_id: Optional[str], x1: int, y1: int,
@@ -15652,6 +15771,19 @@ class Match:
 # -------------------------
 # Match Manager (multi-match, now stores GameSystems and defaults))
 # -------------------------
+# Match ids, system names and server keys become file / folder names in the
+# data folder (storage.py), so they are limited to these characters.
+ID_RE = re.compile(r"[A-Za-z0-9_-]{1,40}")
+
+
+def check_id(kind: str, name: Any) -> None:
+    """Raise unless `name` is a usable match id / system name."""
+    if not isinstance(name, str) or not ID_RE.fullmatch(name):
+        raise VTTError(
+            f"A {kind} can use letters, digits, `_` and `-` only (1-40 "
+            f"characters); `{name}` can't be one.")
+
+
 # The workspace key of a single-operator surface (CLI / GUI / scenario
 # harness). A Discord server's workspace is keyed by its guild id.
 LOCAL_WORKSPACE = "local"
@@ -15693,6 +15825,7 @@ class MatchManager:
         return self.systems[name]
 
     def create_system(self, name: str, settings: Optional[Dict[str, Any]] = None):
+        check_id("system name", name)
         if name in self.systems:
             raise DuplicateId(f"GameSystem '{name}' already exists")
         self.systems[name] = GameSystem(name, settings or {})
@@ -15759,9 +15892,17 @@ class MatchManager:
         rules = dict(DEFAULT_SYSTEM_SETTINGS)
         for k, r in (getattr(sysobj, "settings", {}) or {}).items():
             rules[k] = r.value
+        # A value set before the owner lowered a ceiling (or loaded from an
+        # older save) is held to the ceiling.
+        for k, v in rules.items():
+            hi = rule_max(k) if RULES_REGISTRY.get(k, {}).get(
+                "schema", {}).get("ceiling") else None
+            if hi is not None and isinstance(v, int) and v > hi:
+                rules[k] = hi
         return rules
 
     def create_match(self, match_id: str, name: str, width: int, height: int, channel_key: Optional[str] = None, system_name: Optional[str] = None, owner: Optional[str] = None) -> str:
+        check_id("match id", match_id)
         if match_id in self.matches:
             raise DuplicateId(f"Match id '{match_id}' already exists")
         sysobj = self.get_system(system_name) if system_name else (
@@ -15961,6 +16102,7 @@ class MatchManager:
         fresh. The source match is
         untouched and stays active wherever it was."""
         src = self.get(src_id)
+        check_id("match id", new_id)
         if new_id in self.matches:
             raise DuplicateId(f"Match id '{new_id}' already exists")
         d = src.to_dict(include_history=False)
@@ -16010,15 +16152,9 @@ class MatchManager:
         return self.active_by_channel.get(channel_key)
 
     # ---------- persistence ----------
-    def save(self, path: str, include_history: bool = False):
-        """Persist all matches & bindings to JSON.
-
-        `include_history` is forwarded to Match.to_dict — if True, each
-        match's autosave history is bundled into the save file. Off by
-        default to keep save files small; opt in via
-        `!store save <path> include_history=yes` for a complete backup.
-        """
-        data = {
+    def save_data(self, include_history: bool = False) -> Dict[str, Any]:
+        """Everything `!store save` writes (see save)."""
+        return {
             "matches": {
                 mid: m.to_dict(include_history=include_history)
                 for mid, m in self.matches.items()
@@ -16028,7 +16164,16 @@ class MatchManager:
             "default_system_name": self.default_system_name,
             "default_system_per_channel": self.default_system_per_channel,
         }
-        write_json_file(path, data)
+
+    def save(self, path: str, include_history: bool = False):
+        """Persist all matches & bindings to JSON.
+
+        `include_history` is forwarded to Match.to_dict — if True, each
+        match's autosave history is bundled into the save file. Off by
+        default to keep save files small; opt in via
+        `!store save <path> include_history=yes` for a complete backup.
+        """
+        write_json_file(path, self.save_data(include_history))
     
     def load(self, path: str):
         try:
@@ -16054,6 +16199,10 @@ class MatchManager:
                 name: GameSystem.from_dict(sd)
                 for name, sd in data["systems"].items()
             }
+            for name in systems:
+                check_id("system name", name)
+            for mid in matches:
+                check_id("match id", mid)
             default_name = data.get("default_system_name", "default")
             if default_name not in systems:
                 raise VTTError(
@@ -16095,6 +16244,8 @@ class Workspaces:
     def __init__(self):
         self._by_key: Dict[str, MatchManager] = {}
         self.owner_ids: Set[str] = set()
+        # The disk mirror (storage.Storage), or None when nothing persists.
+        self.storage: Any = None
 
     def get(self, guild_key: Any) -> MatchManager:
         key = str(guild_key)

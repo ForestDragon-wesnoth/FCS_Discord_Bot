@@ -178,8 +178,25 @@ async def run_one(cmds: List[str]) -> List[Tuple[str, List[str]]]:
     unless `!as server <key>` switches). Returns
     [(command_line, [output_line, ...]), ...]. A `??` / `?!` line checks the
     reply of the command before it (see the module docstring)."""
+    # Each scenario gets its own throwaway data folder, so every command
+    # runs through the real storage commit (writes, limits, rollback) and
+    # nothing persists past the scenario.
+    import shutil
+    import tempfile
+    from storage import Storage
+    data_root = tempfile.mkdtemp(prefix="fcs_data_")
     workspaces = Workspaces()
+    workspaces.storage = Storage(data_root)
+    try:
+        return await _run_cmds(cmds, workspaces)
+    finally:
+        shutil.rmtree(data_root, ignore_errors=True)
+
+
+async def _run_cmds(cmds: List[str], workspaces) -> List[Tuple[str, List[str]]]:
+    from storage import reload_workspaces
     ctx = _Ctx()
+    ctx.restart_workspaces = lambda: reload_workspaces(workspaces)
     transcript: List[Tuple[str, List[str]]] = []
     previous: List[str] = []
     for line in cmds:

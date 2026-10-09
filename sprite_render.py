@@ -35,11 +35,17 @@ class SpriteLoader:
     missing / non-PNG / unsafe key caches and returns None (the renderer
     then falls back to the glyph-as-text the model carries)."""
 
-    def __init__(self, folder: str = SPRITES_DIR_DEFAULT):
+    def __init__(self, folder: str = SPRITES_DIR_DEFAULT,
+                 first: Optional[str] = None):
+        """`folder` is the shared sprites folder; `first`, when given, is a
+        server's own sprites folder, searched before it (a server's PNG of
+        the same key wins)."""
         self.folder = os.path.abspath(folder)
+        self.folders = ([os.path.abspath(first)] if first else []) + [self.folder]
         self._cache: Dict[Optional[str], Optional["Image.Image"]] = {}
 
-    def _safe_path(self, key: Any) -> Optional[str]:
+    def _safe_path(self, key: Any, folder: Optional[str] = None) -> Optional[str]:
+        folder = folder or self.folder
         if not isinstance(key, str) or not key.strip():
             return None
         key = key.strip().replace("\\", "/")
@@ -48,9 +54,9 @@ class SpriteLoader:
             key = key + ".png"
         elif ext.lower() not in ALLOWED_EXT:
             return None  # only PNG
-        full = os.path.normpath(os.path.join(self.folder, key))
+        full = os.path.normpath(os.path.join(folder, key))
         # Must stay inside the sprites folder (blocks `..` and absolute keys).
-        if full != self.folder and not full.startswith(self.folder + os.sep):
+        if full != folder and not full.startswith(folder + os.sep):
             return None
         return full
 
@@ -59,8 +65,13 @@ class SpriteLoader:
         if ck in self._cache:
             return self._cache[ck]
         img: Optional["Image.Image"] = None
-        path = self._safe_path(key)
-        if path and os.path.isfile(path):
+        path = None
+        for folder in self.folders:
+            cand = self._safe_path(key, folder)
+            if cand and os.path.isfile(cand):
+                path = cand
+                break
+        if path:
             try:
                 with Image.open(path) as im:
                     if (im.format or "").upper() == "PNG":
