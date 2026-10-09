@@ -19616,3 +19616,114 @@ y = 99999 used to walk ~100,000 cells; a 2,000,000-wide rectangle was
 refused by formula_cell_limit). The results are unchanged on the map: off-map
 cells are never opaque, so a clear line to an off-map point is still clear
 and a beam to it still reaches it; the area builders list only on-map cells.
+
+SCENARIO 711 — Graphics: a region body part is drawn on its region
+--------------------------------------------------------------------
+
+!system new s711
+!system set s711 allow_diagonal_facing true
+!match new m711 Regions 12 8 s711
+!match use m711
+!ent add dragon Dragon 100 4 2 5
+!ent set_var dragon footprint_w 3
+!ent set_var dragon footprint_h 3
+!ent set_var dragon glyph D
+!ent face dragon right
+!part add dragon head head 0 0
+!part region head front
+!ent set_var head glyph H
+!map scene list
+?? • entity `dragon` at (4,2) 3x3 single — glyph D
+?? • entity `head` at (6,2) 1x3 single — glyph H
+!ent face dragon up
+!map scene list
+?? • entity `head` at (4,2) 3x1 single — glyph H
+!ent face dragon up_right
+!map scene list
+?? • entity `head` at (5,2) — glyph H
+?? • entity `head` at (6,3) — glyph H
+?! 3x1
+!ent set_var dragon sprite_mode stretch
+!map scene list
+?? • entity `dragon` at (4,2) 3x3 stretch — glyph D
+
+Expected: The graphics scene draws a region part where the ASCII map does.
+Facing right, the head (region `front`) is the dragon's right column, one
+1x3 placement at (6,2); facing up it is the top row, 3x1 at (4,2). A diagonal
+facing (up_right) makes the region the three cells of the front corner,
+(5,2), (6,2) and (6,3), which don't fill a rectangle and are drawn cell by
+cell. Before, every region part
+was one cell at the parent's top-left corner whatever its region. With
+sprite_mode stretch the dragon's glyph is one large glyph over its 3x3 body.
+
+SCENARIO 712 — Graphics: fog sprite, colour-only cells, corpse sprite mode
+---------------------------------------------------------------------------
+
+!match new m712 Paint 8 6
+!match use m712
+!ent add scout Scout 10 2 2 5
+!ent set_var scout team red
+!ent set_var scout fog_vision_radius 1
+!zone new pool
+!zone fill pool 6 1 7 2
+!zone color pool blue
+!ent add ogre Ogre 10 5 5 3
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent set_var ogre glyph O
+!ent set_var ogre sprite_mode stretch
+!ent hp ogre 0
+!map scene list
+?? • zone `pool` at (6,1) — color blue
+?? • corpse `ogre` at (5,5) 2x2 stretch — glyph O
+!match fog on
+!as view red
+!map scene
+?? 39 fogged cell(s) (sprite fog_default)
+!as view clear
+!system set default fog_sprite ""
+!as view red
+!map scene
+?? (sprite none)
+!as view clear
+
+Expected: A zone with a colour but no glyph or sprite is a `color blue`
+placement; gui.py and Discord images fill its cells with that colour at the
+tint_fill_opacity rule (default 40; they drew nothing before, while ASCII
+tints the `.`). The ogre's corpse keeps its sprite_mode, so its glyph is
+drawn stretched over the 2x2 body (corpses were always single). Under red's
+view 39 of the 48 cells are fogged (the scout sees the 3x3 around it), and
+fog uses the `fog_default` sprite by default; with fog_sprite cleared it
+names none (the surfaces then darken unseen cells at fog_opacity).
+
+SCENARIO 713 — Graphics: hide= / coords= / list on the scene and image commands
+--------------------------------------------------------------------------------
+
+!match new m713 Opts 6 4
+!match use m713
+!ent add a A 10 2 2 5
+!tile set 1 1 glyph #
+!zone new pool
+!zone fill pool 4 1 5 2
+!zone glyph pool ~
+!map scene
+?? [entity:1, tile:1, zone:4]
+?? coords=on
+!map scene hide=zones,tiles coords=off
+?? [entity:1]
+?? coords=off
+!map image hide=zones coords=off
+?? available on the Discord surface
+!map image bogus=1
+?? Unknown option `bogus=` for `!map image`
+!map scene list extra
+?? Unexpected `extra`
+!map scene bogus
+?? Unexpected `bogus`
+
+Expected: `!map scene` and `!map image` take the same one-off `hide=` and
+`coords=` options as a plain `!map`; in image render mode a plain `!map`
+passes them on too (it used to drop them and draw every layer with the
+match's ruler setting). The harness has no image surface, so `!map image`
+reports that graphics are drawn on Discord / gui.py. Unknown options and
+stray words are refused. HARNESS-ALLOWS-ERRORS

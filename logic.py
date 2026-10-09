@@ -1998,12 +1998,13 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "fog_sprite": {
-        "default": "",
+        "default": "fog_default",
         "schema": {"type": "str"},
         "desc": (
             "Sprite KEY drawn over every cell the POV team can't see (the "
-            "graphics analog of fog_glyph), at fog_opacity. Empty = the "
-            "surface just dims/hides unseen cells with no sprite."
+            "graphics analog of fog_glyph), at fog_opacity. Default "
+            "`fog_default` (sprites/fog_default.png). Empty, or a key with no "
+            "PNG = the surface darkens unseen cells at fog_opacity instead."
         ),
     },
     "fog_opacity": {
@@ -2013,6 +2014,15 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Opacity (0-100 percent) of the graphics fog overlay over unseen "
             "cells. 100 = fully hides what's underneath; lower = translucent "
             "haze. Only used by render_scene (fog_glyph drives text fog)."
+        ),
+    },
+    "tint_fill_opacity": {
+        "default": 40,
+        "schema": {"type": "int", "min": 0, "max": 100},
+        "desc": (
+            "Graphics only: opacity (0-100 percent) of the colour square drawn "
+            "on a zone or tile cell that has a `color` but no sprite or glyph "
+            "(the ASCII map tints that cell's `.`). 0 = draw nothing."
         ),
     },
     "map_coords": {
@@ -14606,7 +14616,12 @@ class Match:
     def entity_sprite_mode(self, e: "Entity") -> str:
         """How a multi-tile entity's sprite fills its footprint: the
         `sprite_mode` var > the rule (single | stretch | tile)."""
-        val = e.vars.get("sprite_mode")
+        return self._sprite_mode_of(e.vars)
+
+    def _sprite_mode_of(self, vars_: Dict[str, Any]) -> str:
+        """The sprite_mode a vars dict (a unit's, or a corpse's frozen
+        copy) asks for, else the rule."""
+        val = vars_.get("sprite_mode")
         if not (isinstance(val, str) and val in ("single", "stretch", "tile")):
             val = str(self.rules.get("sprite_mode", "single"))
         return val if val in ("single", "stretch", "tile") else "single"
@@ -15203,30 +15218,52 @@ class Match:
 
     def _emit_entity_placement(self, out: List[Dict[str, Any]], e: "Entity",
                                pov_team: Optional[str], layer: int) -> None:
-        w, h = self.entity_footprint(e)
+        rects = self._cell_rects(self.entity_cells(e))
         spr = self.entity_sprite(e, pov_team)
         key, fh, fv = spr if spr is not None else (None, False, False)
-        mode = self.entity_sprite_mode(e) if (w > 1 or h > 1) else "single"
+        body_mode = self.entity_sprite_mode(e)
         # Per-entity override: a `sprite_layer` var wins over the pass default.
         eff_layer = self._coerce_layer(e.vars.get("sprite_layer"), layer)
-        out.append({
-            "kind": "entity", "ref": e.id,
-            "x": e.x, "y": e.y, "w": w, "h": h, "mode": mode,
-            "sprite": key, "glyph": self.entity_glyph(e, pov_team),
-            "tint": self.entity_color(e, pov_team), "opacity": 100,
-            "flip_h": fh, "flip_v": fv, "layer": eff_layer,
-        })
-        # Overlay sprites (status FX + overlay var), drawn over the entity at
-        # their own layer (default 150). Footprint + mode follow the entity so
-        # a multi-tile body's overlay covers the whole body. Graphics-only.
-        for ov in self.entity_overlays(e, pov_team):
+        glyph = self.entity_glyph(e, pov_team)
+        tint = self.entity_color(e, pov_team)
+        overlays = self.entity_overlays(e, pov_team)
+        # One placement per rectangle of the cells the unit covers: its body
+        # for a plain unit, or a region part's region (a non-rectangular
+        # region, from a diagonal facing, is drawn cell by cell).
+        for (x, y, w, h) in rects:
+            mode = body_mode if (w > 1 or h > 1) else "single"
             out.append({
-                "kind": "overlay", "ref": e.id,
-                "x": e.x, "y": e.y, "w": w, "h": h, "mode": mode,
-                "sprite": ov["sprite"], "glyph": None,
-                "tint": ov["tint"], "opacity": ov["opacity"],
-                "flip_h": False, "flip_v": False, "layer": ov["layer"],
+                "kind": "entity", "ref": e.id,
+                "x": x, "y": y, "w": w, "h": h, "mode": mode,
+                "sprite": key, "glyph": glyph,
+                "tint": tint, "opacity": 100,
+                "flip_h": fh, "flip_v": fv, "layer": eff_layer,
             })
+            # Overlay sprites (status FX + overlay var), drawn over the entity
+            # at their own layer (default 150). Footprint + mode follow the
+            # entity so a multi-tile body's overlay covers the whole body.
+            for ov in overlays:
+                out.append({
+                    "kind": "overlay", "ref": e.id,
+                    "x": x, "y": y, "w": w, "h": h, "mode": mode,
+                    "sprite": ov["sprite"], "glyph": None,
+                    "tint": ov["tint"], "opacity": ov["opacity"],
+                    "flip_h": False, "flip_v": False, "layer": ov["layer"],
+                })
+
+    def _cell_rects(self, cells) -> List[Tuple[int, int, int, int]]:
+        """(x, y, w, h) rectangles to draw a unit's on-map cells as: one
+        bounding rectangle when the cells fill it, else one per cell."""
+        cs = {(cx, cy) for (cx, cy) in cells if self.in_bounds(cx, cy)}
+        if not cs:
+            return []
+        xs = [c[0] for c in cs]
+        ys = [c[1] for c in cs]
+        x0, y0 = min(xs), min(ys)
+        w, h = max(xs) - x0 + 1, max(ys) - y0 + 1
+        if len(cs) == w * h:
+            return [(x0, y0, w, h)]
+        return [(cx, cy, 1, 1) for (cy, cx) in sorted((c[1], c[0]) for c in cs)]
 
     def coords_on(self) -> bool:
         """Whether maps carry coordinate rulers: this match's override, else
@@ -15342,9 +15379,12 @@ class Match:
                 if spr is None and gl is None:
                     continue
                 cw, ch = self._corpse_footprint(corpse)
+                c_mode = (self._sprite_mode_of(
+                              (corpse.get("entity") or {}).get("vars") or {})
+                          if (cw > 1 or ch > 1) else "single")
                 placements.append({
                     "kind": "corpse", "ref": cid, "x": cx, "y": cy,
-                    "w": cw, "h": ch, "mode": "single", "sprite": spr,
+                    "w": cw, "h": ch, "mode": c_mode, "sprite": spr,
                     "glyph": gl, "tint": c_tint, "opacity": c_op,
                     "flip_h": False, "flip_v": False, "layer": corpse_layer})
 
@@ -15402,6 +15442,8 @@ class Match:
             "placements": placements, "fog": fog,
             "borders": self._scene_borders(),
             "coords": self.coords_on(),
+            "tint_fill_opacity": max(0, min(100, self._layer_rule(
+                "tint_fill_opacity", 40))),
         }
 
     # ---- facing writes ----

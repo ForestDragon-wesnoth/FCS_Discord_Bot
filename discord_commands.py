@@ -272,7 +272,8 @@ class DiscordCtxWrapper:
             if entry.get("workspace") == key:
                 await _retire_board(ck, entry, entry.get("match_id", "?"))
 
-    async def post_scene_image(self, m, pov, highlights=None) -> str:
+    async def post_scene_image(self, m, pov, highlights=None,
+                               hidden=None, coords=None) -> str:
         """Render the match's graphics scene to a PNG and post it as an
         attachment. Called by `!map image` via getattr (Discord-only — other
         surfaces lack this method). Respects the resolved POV + the channel's
@@ -291,7 +292,8 @@ class DiscordCtxWrapper:
             # Build the scene HERE (it reads the match) and only draw pixels
             # in the worker thread — see sprite_render.scene_for_png.
             scene, cell = scene_for_png(m, pov_team=pov, viewport=viewport,
-                                        highlights=highlights)
+                                        highlights=highlights,
+                                        hidden_layers=hidden, coords=coords)
             data = await asyncio.to_thread(
                 render_scene_png, scene, _get_sprite_loader(self._mgr), cell)
         except RuntimeError as e:

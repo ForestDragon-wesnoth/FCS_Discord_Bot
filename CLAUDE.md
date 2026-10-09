@@ -2414,6 +2414,48 @@ More shipped work (continuing the list above):
       FIRST (reserved, never clipped — input first-class, log second) and the
       canvas frame packed LAST with expand, so on resize the MAP shrinks while
       the fields stay visible (default canvas 420px, `minsize(480,300)`).
+    - **Glyph fallback follows `sprite_mode`.** A unit with no loadable
+      sprite is drawn as its glyph by `SceneRenderer._draw_placement`:
+      `single` = one glyph in the anchor cell, `tile` = the glyph in every
+      body cell (as in ASCII), `stretch` = one glyph whose drawn shape is
+      scaled, proportions kept, to fill `_GLYPH_FILL` (70%) of the body,
+      centred (`_fill_glyph`). Every placement draws its whole body and
+      pastes the part inside the window, so a body whose anchor is left of
+      or above the viewport still shows its other cells (before, it
+      vanished whole, sprites included). Pixel-tested by a throwaway
+      script; the harness has no image path.
+    - **Default fog sprite + GUI view.** The `fog_sprite` rule defaults to
+      `fog_default` (sprites/fog_default.png); a key with no PNG falls back
+      to darkening fogged cells at fog_opacity. Fog is drawn only for a
+      team view (the omniscient view hides nothing), so gui.py now renders
+      the GUI channel's view through `_view_pov` — the channel's bound POV
+      or an `!as view <team>` preview, like `!map` — where it used to call
+      `render_scene()` with no view and never showed fog. The toolbar shows
+      the current view.
+    - **ASCII-vs-graphics parity pass (scenarios 711-713).** A throwaway
+      harness compared, per cell, the ASCII glyph with the top scene
+      placement over 330+ boards (facings incl. diagonal, hidden layers,
+      team views, region parts, riders, located parts, random moves);
+      reuse it after touching either renderer. Corpses are the one
+      intended difference (ASCII never draws them). Fixes:
+      - A REGION part was emitted as one footprint rectangle at its
+        parent's anchor, so a head on the `front` region drew in the
+        top-left cell. `_emit_entity_placement` now draws `entity_cells`
+        via `_cell_rects`: one rectangle when the cells fill it, else one
+        1x1 placement per cell (a diagonal facing's corner region).
+      - A multi-tile corpse follows its frozen `sprite_mode` var (else the
+        rule) instead of always `single` (`_sprite_mode_of`).
+      - A zone / tile with a `color` but no sprite or glyph drew nothing
+        (ASCII tints its `.`): the renderer fills the cell with the colour
+        at the new `tint_fill_opacity` rule (default 40; carried in the
+        scene).
+      - Image render mode dropped `!map hide=` / `coords=`;
+        `post_scene_image(m, pov, highlights, hidden, coords)` and
+        `scene_for_png(..., hidden_layers, coords)` now take them, as do
+        `!map image` and `!map scene`. `!map scene list` prints every
+        placement (position, size, mode, sprite/glyph/colour, layer) in
+        drawing order, under the channel POV, and the summary names the
+        fog sprite.
     - **Default grid borders + per-match override (scenario 532).** The
       `show_borders` rule now DEFAULTS to True: white grid lines drawn ABOVE the
       ground/background but BELOW tiles/zones/entities (in `render()` the border

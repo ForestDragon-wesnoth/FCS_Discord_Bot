@@ -31,7 +31,7 @@ from sprite_render import (
 
 from logic import LOCAL_WORKSPACE
 from storage import open_workspaces
-from vtt_commands import registry
+from vtt_commands import registry, _view_pov
 
 
 # ----------------------------------------------------------------------------
@@ -238,7 +238,13 @@ class GuiApp:
         if m is None:
             self.canvas.delete("all")
             return
-        scene = m.render_scene()
+        # The canvas shows the GUI channel's view, as `!map` would: the
+        # channel's bound POV, or an `!as view <team>` preview (fog drawn).
+        try:
+            pov = _view_pov(self.ctx, m, [])
+        except Exception:
+            pov = None
+        scene = m.render_scene(pov_team=pov)
         if getattr(self, "_preview", None):
             scene["highlights"] = self._preview
         cell = self._cell_size(m, scene)
@@ -247,7 +253,8 @@ class GuiApp:
             # The pixel cap bit: pin the zoom to what was actually rendered,
             # so further zoom-in stops instead of silently piling up a factor.
             self._zoom = cell / base
-        self.zoom_label.config(text=f"{int(round(self._zoom * 100))}%")
+        view = f"view: {pov}" if pov is not None else "view: everything"
+        self.zoom_label.config(text=f"{int(round(self._zoom * 100))}% · {view}")
         renderer = SceneRenderer(self.loader, cell)
         img = renderer.render(scene)
         from PIL import ImageTk
