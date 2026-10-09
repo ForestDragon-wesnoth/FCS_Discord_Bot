@@ -97,6 +97,7 @@ class SceneRenderer:
         self.loader = loader
         self.cell = max(1, int(cell_size))
         self._fonts: Dict[int, Any] = {}
+        self._tint_fill = 40  # set from the scene by render()
 
     def font(self, box: Optional[int] = None):
         """The glyph font for a square of `box` pixels (default one cell)."""
@@ -161,6 +162,10 @@ class SceneRenderer:
         cols, rows = max(1, cols), max(1, rows)
         W, H = cols * cell, rows * cell
         canvas = Image.new("RGBA", (W, H), _BG_FILL)
+        try:
+            self._tint_fill = max(0, min(100, int(scene.get("tint_fill_opacity", 40))))
+        except (TypeError, ValueError):
+            self._tint_fill = 40
 
         def px(gx: int, gy: int) -> Tuple[int, int]:
             return (gx - ox) * cell, (gy - oy) * cell
@@ -289,8 +294,16 @@ class SceneRenderer:
         else:
             glyph = p.get("glyph")
             if not (isinstance(glyph, str) and glyph):
-                return
-            if mode == "stretch":
+                # A coloured zone / tile with no sprite or glyph: a
+                # translucent square of its colour (ASCII tints the `.`).
+                rgb = self._rgb(p.get("tint"))
+                fill = self._tint_fill * opacity // 100
+                if rgb is None or fill <= 0:
+                    return
+                a = max(0, min(255, int(fill / 100.0 * 255)))
+                piece = Image.new("RGBA", (cell, cell), tuple(rgb[:3]) + (a,))
+                mode = "tile"
+            elif mode == "stretch":
                 piece = self._fill_glyph(glyph, w * cell, h * cell,
                                          p.get("tint"), opacity)
             else:
@@ -466,7 +479,9 @@ def scene_for_png(match, pov_team: Optional[str] = None,
                   viewport: Optional[Tuple[int, int, int, int]] = None,
                   cell_size: Optional[int] = None,
                   max_dim: int = 1600,
-                  highlights: Optional[list] = None) -> Tuple[Dict[str, Any], int]:
+                  highlights: Optional[list] = None,
+                  hidden_layers: Optional[set] = None,
+                  coords: Optional[bool] = None) -> Tuple[Dict[str, Any], int]:
     """(scene model, cell size) for a PNG render — the part that READS THE
     MATCH. render_scene switches on the match's shared vision memo while it
     runs, so running it in a worker thread while commands mutate the match
@@ -479,7 +494,10 @@ def scene_for_png(match, pov_team: Optional[str] = None,
             cell_size = int(match.rules.get("sprite_cell_size", 100))
         except (TypeError, ValueError):
             cell_size = 100
-    scene = match.render_scene(pov_team=pov_team, viewport=viewport)
+    scene = match.render_scene(pov_team=pov_team, hidden_layers=hidden_layers,
+                               viewport=viewport)
+    if coords is not None:
+        scene["coords"] = bool(coords)
     if highlights:
         scene["highlights"] = highlights
     return scene, fit_cell_size(scene, cell_size, max_dim)
