@@ -19633,19 +19633,19 @@ SCENARIO 711 — Graphics: a region body part is drawn on its region
 !part region head front
 !ent set_var head glyph H
 !map scene list
-?? • entity `dragon` at (4,2) 3x3 single — glyph D
-?? • entity `head` at (6,2) 1x3 single — glyph H
+?? • entity `dragon` at (4,2) 3x3 stretch — glyph D
+?? • entity `head` at (6,2) 1x3 stretch — glyph H
 !ent face dragon up
 !map scene list
-?? • entity `head` at (4,2) 3x1 single — glyph H
+?? • entity `head` at (4,2) 3x1 stretch — glyph H
 !ent face dragon up_right
 !map scene list
 ?? • entity `head` at (5,2) — glyph H
 ?? • entity `head` at (6,3) — glyph H
 ?! 3x1
-!ent set_var dragon sprite_mode stretch
+!ent set_var dragon sprite_mode single
 !map scene list
-?? • entity `dragon` at (4,2) 3x3 stretch — glyph D
+?? • entity `dragon` at (4,2) 3x3 single — glyph D
 
 Expected: The graphics scene draws a region part where the ASCII map does.
 Facing right, the head (region `front`) is the dragon's right column, one
@@ -19653,8 +19653,9 @@ Facing right, the head (region `front`) is the dragon's right column, one
 facing (up_right) makes the region the three cells of the front corner,
 (5,2), (6,2) and (6,3), which don't fill a rectangle and are drawn cell by
 cell. Before, every region part
-was one cell at the parent's top-left corner whatever its region. With
-sprite_mode stretch the dragon's glyph is one large glyph over its 3x3 body.
+was one cell at the parent's top-left corner whatever its region. Multi-cell
+placements use sprite_mode, `stretch` by default (one large glyph or sprite
+over the whole body); set to `single`, the dragon draws in its anchor cell.
 
 SCENARIO 712 — Graphics: fog sprite, colour-only cells, corpse sprite mode
 ---------------------------------------------------------------------------
@@ -19727,3 +19728,156 @@ passes them on too (it used to drop them and draw every layer with the
 match's ruler setting). The harness has no image surface, so `!map image`
 reports that graphics are drawn on Discord / gui.py. Unknown options and
 stray words are refused. HARNESS-ALLOWS-ERRORS
+
+SCENARIO 714 — Graphics: a corpse whose sprite is missing shows its glyph, faded
+---------------------------------------------------------------------------------
+
+!match new m714 Fallen 6 4
+!match use m714
+!system set default death_result corpse
+!ent add slain Slain 1 3 3 5
+!ent face slain down
+!ent set_var slain sprite slain_sprite
+!ent kill slain
+!ent add plain Plain 1 5 3 5
+!ent kill plain
+!map scene list
+?? • corpse `slain` at (3,3) — sprite slain_sprite, glyph v, color gray (layer 75)
+?! corpse `plain`
+
+Expected: The corpse is drawn as the dead unit's sprite, tinted grey and at
+50% opacity (corpse_sprite_tint / corpse_sprite_opacity). When the PNG is
+missing, gui.py and Discord images draw its glyph instead, as for a living
+unit: glyphs.<facing> > glyph > the facing arrow (`v`), in that grey at that
+opacity. Before, the grey tint was painted as a translucent square over the
+whole cell, which looked like fog. A corpse whose unit had neither a sprite
+nor a custom glyph (`plain`) is not drawn, as before.
+
+SCENARIO 715 — Graphics: corpse sprites per unit and a default corpse sprite
+-----------------------------------------------------------------------------
+
+!match new m715 Bodies 8 4
+!match use m715
+!system set default death_result corpse
+!ent add slain Slain 1 2 2 5
+!ent face slain down
+!ent set_var slain sprite slain_sprite
+!ent kill slain
+!ent add skel Skeleton 1 4 2 5
+!ent set_var skel sprite skel_alive
+!ent set_var skel corpse_sprite bones
+!ent kill skel
+!ent add orc Orc 1 6 2 5
+!ent face orc left
+!ent set_var orc corpse_sprite orc_body
+!ent set_var orc corpse_sprites.left orc_body_left
+!ent kill orc
+!ent add plain Plain 1 2 4 5
+!ent kill plain
+!map scene list
+?? • corpse `slain` at (2,2) — sprite slain_sprite, glyph v, color gray (layer 75)
+?? • corpse `skel` at (4,2) — sprite bones, glyph ^ (layer 75)
+?? • corpse `orc` at (6,2) — sprite orc_body_left, glyph < (layer 75)
+?! corpse `plain`
+!system set default corpse_default_sprite blood
+!map scene list
+?? • corpse `slain` at (2,2) — sprite blood, glyph v (layer 75)
+?? • corpse `plain` at (2,4) — sprite blood, glyph ^ (layer 75)
+?? • corpse `skel` at (4,2) — sprite bones, glyph ^ (layer 75)
+
+Expected: A unit's own corpse picture is its `corpse_sprites.<facing>` var,
+else its `corpse_sprite` var (the orc, facing left, uses orc_body_left), and
+is drawn as-is: no colour on the placement, full opacity. With neither, the
+corpse_default_sprite rule is used, also as-is; while that rule is empty the
+corpse shows the unit's living sprite greyed and faded (`color gray`, 50%)
+as before (`slain`), and a unit with no sprite and no custom glyph has no
+corpse drawing (`plain`). Once the rule names `blood`, every corpse without a
+picture of its own uses it, `plain` included. The glyph listed is what is
+drawn when the PNG can't be loaded; it stays greyed and faded either way.
+
+SCENARIO 716 — Graphics: team colour as a sprite outline, tint off by default
+------------------------------------------------------------------------------
+
+!match new m716 Teams 6 4
+!match use m716
+!ent add a A 10 2 2 5
+!ent set_var a team red
+!ent set_var a sprite knight
+!map scene
+?? unit outline 3px at 100%, unit tint 0%
+!map scene list
+?? • entity `a` at (2,2) — sprite knight, glyph >, color red (layer 100)
+!system set default team_outline_width 0
+!system set default team_tint_opacity 60
+!system set default team_outline_opacity 40
+!map scene
+?? unit outline 0px at 40%, unit tint 60%
+!system set default team_tint_opacity 101
+?? ❌
+!system set default team_outline_width -1
+?? ❌
+
+Expected: A unit's colour (its `color` var, else its team colour; team `red`
+is red) is drawn in graphics as an outline around its sprite's shape,
+team_outline_width pixels at sprite_cell_size cells (3 by default, scaled
+with the cell) at team_outline_opacity, and the sprite itself is no longer
+multiplied by the colour unless team_tint_opacity is above 0 (it blends that
+share of the tinted sprite in). A unit drawn as a glyph keeps its coloured
+glyph. Tiles, zones and overlays keep their own tint. The rules are bounded:
+opacities 0-100, width 0-50. HARNESS-ALLOWS-ERRORS
+
+SCENARIO 717 — Graphics: the image legend
+------------------------------------------
+
+!match new m717 Legend 10 6
+!match use m717
+!ent add dragon Dragon 100 2 2 5
+!ent set_var dragon footprint_w 2
+!ent set_var dragon footprint_h 2
+!ent set_var dragon sprite dragon_sprite
+!ent set_var dragon team red
+!ent set_var dragon fog_vision_radius 2
+!ent add spy Spy 10 4 4 4
+!ent set_var spy glyph s
+!ent set_var spy team blue
+!ent set_var spy disguise.name Merchant
+!ent add ghost Ghost 10 9 5 3
+!ent set_var ghost team blue
+!tile set 1 1 glyph #
+!tile set 2 1 glyph #
+!zone new pool
+!zone fill pool 5 1 6 2
+!zone color pool blue
+!map scene list
+?! Legend:
+!map scene list legend=on
+?? legend: 5 entries
+?? Legend: glyph # = tile
+?? Legend: sprite dragon_sprite, glyph >, color red = Dragon
+?? Legend: glyph s, color blue = Spy
+?? Legend: color blue = zone: pool
+?? Legend: glyph <, color blue = Ghost
+!match fog on
+!as view red
+!map scene list legend=on
+?? Legend: glyph s, color blue = Merchant
+?? Legend: sprite fog_default = fog (unseen)
+?! Ghost
+!as view clear
+!map legend on
+!map view 1 1
+!map scene list
+?? Legend: glyph # = tile
+!map image legend=on
+?? available on the Discord surface
+
+Expected: With the legend on (a one-off `legend=on`, or `!map legend on` for
+the match), graphics draw a legend below the map: one row per distinct look
+(the sprite or glyph as drawn, with its colour) and every meaning that look
+has, in the order the looks first appear row by row — units by their shown
+name, `tile: <template>` / `tile`, `zone: <name>`, `corpse: <name>`, then
+`fog (unseen)`. `!map scene list` prints those entries. It follows the
+channel's view: under red's view the spy shows as its disguise, Merchant, the
+ghost in the fog is left out, and fog gets an entry. The harness has no image
+surface, so `!map image legend=on` reports that images are drawn on Discord
+and in gui.py.

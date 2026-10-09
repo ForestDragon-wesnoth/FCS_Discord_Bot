@@ -1938,14 +1938,14 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # behavior, so ASCII rendering is unaffected. Opacities are 0-100 percent
     # (the schema has no float type); the surface divides by 100.
     "sprite_mode": {
-        "default": "single",
+        "default": "stretch",
         "schema": {"type": "enum",
                    "choices": ["single", "stretch", "tile"]},
         "desc": (
-            "How a MULTI-TILE entity's sprite fills its footprint: 'single' "
-            "(one sprite at the anchor cell), 'stretch' (one sprite scaled "
-            "across the whole footprint), or 'tile' (the sprite repeated once "
-            "per covered cell). Per-entity override: the `sprite_mode` var. "
+            "How a MULTI-TILE entity's sprite (or its glyph, when it has no "
+            "sprite) fills its footprint: 'stretch' (default: one sprite scaled "
+            "across the whole footprint), 'tile' (the sprite repeated once per "
+            "covered cell) or 'single' (one sprite at the anchor cell). Per-entity override: the `sprite_mode` var. "
             "Irrelevant for 1x1 entities. Only used by render_scene."
         ),
     },
@@ -2014,6 +2014,38 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Opacity (0-100 percent) of the graphics fog overlay over unseen "
             "cells. 100 = fully hides what's underneath; lower = translucent "
             "haze. Only used by render_scene (fog_glyph drives text fog)."
+        ),
+    },
+    "team_outline_width": {
+        "default": 3,
+        "schema": {"type": "int", "min": 0, "max": 50},
+        "desc": (
+            "Graphics only: thickness of the outline drawn in a unit's colour "
+            "(its `color` var, else its team colour) around the edge of its "
+            "sprite, in pixels at sprite_cell_size cells (it scales with the "
+            "cell, so zoom and image size don't change how it looks). Where "
+            "the sprite fills its cells to the border, the outline runs just "
+            "inside the cell edges. 0 = no outline. Units drawn as a glyph "
+            "keep their coloured glyph instead."
+        ),
+    },
+    "team_outline_opacity": {
+        "default": 100,
+        "schema": {"type": "int", "min": 0, "max": 100},
+        "desc": (
+            "Graphics only: opacity (0-100 percent) of the team_outline_width "
+            "outline."
+        ),
+    },
+    "team_tint_opacity": {
+        "default": 0,
+        "schema": {"type": "int", "min": 0, "max": 100},
+        "desc": (
+            "Graphics only: how strongly a unit's sprite is tinted with its "
+            "colour (its `color` var, else its team colour), 0-100 percent. "
+            "100 = the sprite multiplied by the colour (pure red wipes out "
+            "greens and blues); 0 (default) = no tint, the outline "
+            "(team_outline_width) marks the team instead."
         ),
     },
     "tint_fill_opacity": {
@@ -2142,18 +2174,33 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "default": "gray",
         "schema": {"type": "str"},
         "desc": (
-            "Tint the surface applies to a corpse's sprite so a body reads as "
-            "dead — default 'gray' (desaturate). Empty = no tint. A corpse "
-            "renders the dead entity's own stored sprite at this tint + "
-            "corpse_sprite_opacity."
+            "Tint the surface applies to a corpse drawn with the dead unit's "
+            "LIVING sprite (it has no corpse sprite of its own and "
+            "corpse_default_sprite is empty), so the body reads as dead — "
+            "default 'gray' (desaturate). Empty = no tint. Also used for a "
+            "corpse's glyph when its picture can't be loaded."
         ),
     },
     "corpse_sprite_opacity": {
         "default": 50,
         "schema": {"type": "int", "min": 0, "max": 100},
         "desc": (
-            "Opacity (0-100 percent) of a corpse's sprite. Default 50 (a "
-            "semi-transparent body). Combined with corpse_sprite_tint."
+            "Opacity (0-100 percent) of a corpse drawn with the dead unit's "
+            "living sprite, and of a corpse's glyph. Default 50 (a "
+            "semi-transparent body). Combined with corpse_sprite_tint. A "
+            "corpse sprite (the unit's `corpse_sprite` var or "
+            "corpse_default_sprite) is drawn as-is."
+        ),
+    },
+    "corpse_default_sprite": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "Sprite KEY every corpse uses when its unit has no corpse sprite "
+            "of its own (the `corpse_sprites.<facing>` / `corpse_sprite` "
+            "vars), drawn as-is (a pile of bones, a blood stain). Empty = such "
+            "a corpse shows the unit's living sprite, greyed and faded by "
+            "corpse_sprite_tint / corpse_sprite_opacity. Graphics only."
         ),
     },
     "sprite_cell_size": {
@@ -14623,8 +14670,8 @@ class Match:
         copy) asks for, else the rule."""
         val = vars_.get("sprite_mode")
         if not (isinstance(val, str) and val in ("single", "stretch", "tile")):
-            val = str(self.rules.get("sprite_mode", "single"))
-        return val if val in ("single", "stretch", "tile") else "single"
+            val = str(self.rules.get("sprite_mode", "stretch"))
+        return val if val in ("single", "stretch", "tile") else "stretch"
 
     # ---- overlay sprites (status FX + entity overlay var) ----
     @staticmethod
@@ -14778,21 +14825,61 @@ class Match:
         s = e.vars.get("sprite")
         return isinstance(s, str) and bool(s)
 
-    def corpse_sprite(self, corpse: Dict[str, Any]) -> Optional[str]:
-        """The sprite key for a corpse, read from its frozen snapshot vars:
-        `sprites.<facing>` > `sprite`. No mirror/fallback (a corpse is static
-        and undisguised). None when the dead entity had no sprite."""
+    @staticmethod
+    def corpse_glyph(corpse: Dict[str, Any], custom_only: bool = False
+                     ) -> Optional[str]:
+        """The glyph a corpse's graphics fallback draws, from its frozen
+        snapshot, resolved like entity_glyph (no disguise):
+        `glyphs.<facing>` > `glyph` > the facing arrow. `custom_only` = None
+        instead of the arrow."""
         ent = corpse.get("entity") if isinstance(corpse, dict) else None
         if not isinstance(ent, dict):
             return None
+        facing = ent.get("facing", "")
         vars_ = ent.get("vars") or {}
-        sd = vars_.get("sprites")
-        if isinstance(sd, dict):
-            k = sd.get(ent.get("facing", ""))
-            if isinstance(k, str) and k:
-                return k
-        k = vars_.get("sprite")
-        return k if isinstance(k, str) and k else None
+        glyphs = vars_.get("glyphs")
+        if isinstance(glyphs, dict):
+            g = glyphs.get(facing)
+            if isinstance(g, str) and len(g) == 1:
+                return g
+        g = vars_.get("glyph")
+        if isinstance(g, str) and len(g) == 1:
+            return g
+        return None if custom_only else DIRECTION_ARROWS.get(facing, "@")
+
+    def corpse_sprite(self, corpse: Dict[str, Any]) -> Optional[str]:
+        """The sprite key for a corpse (see corpse_sprite_info)."""
+        return self.corpse_sprite_info(corpse)[0]
+
+    def corpse_sprite_info(self, corpse: Dict[str, Any]
+                           ) -> Tuple[Optional[str], bool]:
+        """(sprite key, is a corpse picture) for a corpse, from its frozen
+        snapshot vars: the unit's own corpse sprite (`corpse_sprites.<facing>`
+        > `corpse_sprite`) > the corpse_default_sprite rule — corpse pictures,
+        drawn as-is — > its living sprite (`sprites.<facing>` > `sprite`),
+        drawn greyed and faded. (None, False) when there is none. No mirror
+        (a corpse is static and undisguised)."""
+        ent = corpse.get("entity") if isinstance(corpse, dict) else None
+        if not isinstance(ent, dict):
+            return None, False
+        vars_ = ent.get("vars") or {}
+        facing = ent.get("facing", "")
+
+        def pick(many: str, one: str) -> Optional[str]:
+            sd = vars_.get(many)
+            if isinstance(sd, dict):
+                k = sd.get(facing)
+                if isinstance(k, str) and k:
+                    return k
+            k = vars_.get(one)
+            return k if isinstance(k, str) and k else None
+        k = pick("corpse_sprites", "corpse_sprite")
+        if k:
+            return k, True
+        k = str(self.rules.get("corpse_default_sprite", "") or "").strip()
+        if k:
+            return k, True
+        return pick("sprites", "sprite"), False
 
     # ---- map viewport (panning) -------------------------------------
     # The viewport caps how much grid renders at once. It engages when
@@ -15184,7 +15271,8 @@ class Match:
 
     def render_scene(self, pov_team: Optional[str] = None,
                      hidden_layers: Optional["set[str]"] = None,
-                     viewport: Optional[Tuple[int, int, int, int]] = None
+                     viewport: Optional[Tuple[int, int, int, int]] = None,
+                     legend: bool = False
                      ) -> Dict[str, Any]:
         """Build the graphics render model (see _render_scene_impl). Activates
         the read-only fog-sight memo for the duration, exactly like
@@ -15194,7 +15282,10 @@ class Match:
         if prev is None:
             self._vision_memo = {}
         try:
-            return self._render_scene_impl(pov_team, hidden, viewport)
+            scene = self._render_scene_impl(pov_team, hidden, viewport)
+            if legend:
+                scene["legend"] = self._scene_legend(scene, pov_team)
+            return scene
         finally:
             self._vision_memo = prev
 
@@ -15215,6 +15306,76 @@ class Match:
 
     def _layer_rule(self, key: str, default: int) -> int:
         return self._coerce_layer(self.rules.get(key, default), default)
+
+    _LEGEND_LOOK = ("kind", "sprite", "glyph", "tint", "opacity",
+                    "glyph_tint", "glyph_opacity", "flip_h", "flip_v")
+
+    def _scene_legend(self, scene: Dict[str, Any],
+                      pov_team: Optional[str]) -> List[Dict[str, Any]]:
+        """The image legend: one entry per distinct look among the placements
+        inside the rendered window (overlays left out), with every meaning
+        that look has — the graphics counterpart of the ASCII legend, and
+        under the same POV, since it is built from the scene. Entries keep
+        the scan order of their first cell (row by row); fog comes last.
+        Meanings: a unit's shown name, `tile: <template>` / `tile`,
+        `zone: <name>`, `corpse: <name>`."""
+        vp = scene.get("viewport")
+        if isinstance(vp, dict):
+            x0, y0 = vp["x"], vp["y"]
+            x1, y1 = x0 + vp["w"] - 1, y0 + vp["h"] - 1
+        else:
+            x0, y0, x1, y1 = 1, 1, self.grid_width, self.grid_height
+        entries: Dict[Tuple, Dict[str, Any]] = {}
+        for p in scene.get("placements", []):
+            if p.get("kind") == "overlay":
+                continue
+            px0, py0 = max(x0, p["x"]), max(y0, p["y"])
+            px1 = min(x1, p["x"] + p.get("w", 1) - 1)
+            py1 = min(y1, p["y"] + p.get("h", 1) - 1)
+            if px0 > px1 or py0 > py1:
+                continue
+            if not (p.get("sprite") or p.get("glyph") or p.get("tint")):
+                continue
+            kind, ref = p.get("kind"), p.get("ref")
+            if kind == "entity":
+                e = self.entities.get(ref)
+                label = self.entity_display_name(e, pov_team) if e else str(ref)
+            elif kind == "tile":
+                try:
+                    tx, ty = (int(v) for v in str(ref).split(","))
+                except ValueError:
+                    tx = ty = None
+                data = self.tiles.get((tx, ty)) if tx is not None else None
+                tname = data.get("_template") if isinstance(data, dict) else None
+                label = f"tile: {tname}" if isinstance(tname, str) and tname else "tile"
+            elif kind == "zone":
+                label = f"zone: {ref}"
+            elif kind == "corpse":
+                c = self.find_corpse(ref) if hasattr(self, "find_corpse") else None
+                name = None
+                if isinstance(c, tuple) and len(c) >= 3 and isinstance(c[2], dict):
+                    name = (c[2].get("entity") or {}).get("name")
+                label = f"corpse: {name or ref}"
+            else:
+                continue
+            look = tuple(p.get(k) for k in self._LEGEND_LOOK)
+            ent = entries.get(look)
+            if ent is None:
+                ent = entries[look] = {k: p.get(k) for k in self._LEGEND_LOOK
+                                       if p.get(k) is not None}
+                ent["labels"] = []
+                ent["_at"] = (py0, px0)
+            ent["_at"] = min(ent["_at"], (py0, px0))
+            if label not in ent["labels"]:
+                ent["labels"].append(label)
+        out = sorted(entries.values(), key=lambda d: d.pop("_at"))
+        fog = [f for f in scene.get("fog", [])
+               if x0 <= f["x"] <= x1 and y0 <= f["y"] <= y1]
+        if fog:
+            out.append({"kind": "fog", "sprite": fog[0].get("sprite"),
+                        "opacity": fog[0].get("opacity"),
+                        "labels": ["fog (unseen)"]})
+        return out
 
     def _emit_entity_placement(self, out: List[Dict[str, Any]], e: "Entity",
                                pov_team: Optional[str], layer: int) -> None:
@@ -15373,11 +15534,15 @@ class Match:
             for (cx, cy, cid, corpse) in self.all_corpses():
                 if not self.corpse_visible_to(cid, corpse, cx, cy, pov_team):
                     continue
-                spr = self.corpse_sprite(corpse)
-                gl = ((corpse.get("entity") or {}).get("vars") or {}).get("glyph")
-                gl = gl if isinstance(gl, str) and len(gl) == 1 else None
-                if spr is None and gl is None:
+                spr, own = self.corpse_sprite_info(corpse)
+                # Drawn when the dead unit had a sprite or a custom glyph (or
+                # corpse_default_sprite is set); a sprite whose PNG is missing
+                # falls back to its glyph (as a living unit's does), greyed
+                # and faded. A corpse picture is drawn as-is; the unit's
+                # living sprite takes the corpse tint and opacity.
+                if spr is None and self.corpse_glyph(corpse, custom_only=True) is None:
                     continue
+                gl = self.corpse_glyph(corpse)
                 cw, ch = self._corpse_footprint(corpse)
                 c_mode = (self._sprite_mode_of(
                               (corpse.get("entity") or {}).get("vars") or {})
@@ -15385,7 +15550,12 @@ class Match:
                 placements.append({
                     "kind": "corpse", "ref": cid, "x": cx, "y": cy,
                     "w": cw, "h": ch, "mode": c_mode, "sprite": spr,
-                    "glyph": gl, "tint": c_tint, "opacity": c_op,
+                    "glyph": gl,
+                    "tint": None if own else c_tint,
+                    "opacity": 100 if own else c_op,
+                    # The glyph drawn when the picture can't be loaded is
+                    # always greyed and faded, so it reads as a body.
+                    "glyph_tint": c_tint, "glyph_opacity": c_op,
                     "flip_h": False, "flip_v": False, "layer": corpse_layer})
 
         if "entities" not in hidden:
@@ -15442,6 +15612,14 @@ class Match:
             "placements": placements, "fog": fog,
             "borders": self._scene_borders(),
             "coords": self.coords_on(),
+            "sprite_cell_size": self._layer_rule("sprite_cell_size", 100),
+            "unit_style": {
+                "outline_width": max(0, self._layer_rule("team_outline_width", 3)),
+                "outline_opacity": max(0, min(100, self._layer_rule(
+                    "team_outline_opacity", 100))),
+                "tint_opacity": max(0, min(100, self._layer_rule(
+                    "team_tint_opacity", 0))),
+            },
             "tint_fill_opacity": max(0, min(100, self._layer_rule(
                 "tint_fill_opacity", 40))),
         }

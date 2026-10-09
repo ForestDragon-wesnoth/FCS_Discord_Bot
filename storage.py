@@ -129,9 +129,14 @@ class Storage:
     """See the module docstring. One instance serves every workspace; it is
     reached from a manager as `mgr.workspaces.storage`."""
 
-    def __init__(self, root: str):
+    def __init__(self, root: str, persist: bool = True):
         self.root = os.path.abspath(root)
         os.makedirs(self.root, exist_ok=True)
+        # persist=False (cli.py / gui.py with persistence off in
+        # local_settings.json): nothing is loaded from or committed to the
+        # server folders; the data folder still holds the bot settings and
+        # each server's saves/ and sprites/.
+        self.persist = persist
         self.settings: Dict[str, Any] = {"limits": {}, "ceilings": {}}
         # What was last written, per server: the text of each file, so a
         # commit rewrites only what changed and a rollback can read it back.
@@ -274,6 +279,9 @@ class Storage:
         (also printed): files that failed to load are moved to the server's
         corrupt/ folder and everything else still loads."""
         notes: List[str] = []
+        if not self.persist:
+            self.rescan()
+            return notes
         self.purge_trash()
         for name in sorted(os.listdir(self.root)):
             path = os.path.join(self.root, name)
@@ -532,6 +540,8 @@ class Storage:
     def commit(self, mgr: MatchManager) -> List[str]:
         """Write what changed in server `mgr` since the last commit. Returns
         lines to show the user (a trim note, or the rollback warning)."""
+        if not self.persist:
+            return []
         key = mgr.guild_key
         w = self._written.setdefault(key, self._blank_written())
         msgs: List[str] = []
@@ -629,6 +639,8 @@ class Storage:
     def commit_all(self, workspaces: Workspaces) -> None:
         """Write every workspace (shutdown). Limits are not enforced: the
         state was already accepted command by command."""
+        if not self.persist:
+            return
         for _key, mgr in workspaces.items():
             w = self._written.setdefault(mgr.guild_key, self._blank_written())
             plan, after = self._plan(mgr, w)
@@ -691,6 +703,8 @@ class Storage:
         their histories). `all`: also systems.json and saves/. A copy of
         workspace.json goes along so an undo can restore the channel
         pointers."""
+        if not self.persist:
+            raise VTTError(NO_PERSIST_WIPE)
         key = mgr.guild_key
         sdir = self.server_dir(key)
         # Make sure what's in memory is what gets trashed.
@@ -713,6 +727,8 @@ class Storage:
         return entry
 
     def commit_all_one(self, mgr: MatchManager) -> None:
+        if not self.persist:
+            return
         w = self._written.setdefault(mgr.guild_key, self._blank_written())
         plan, after = self._plan(mgr, w)
         for path, text in plan.items():
@@ -725,6 +741,8 @@ class Storage:
     def restore_from_trash(self, mgr: MatchManager, entry: str, scope: str) -> None:
         """Move a trash entry back into the server's folder and reload the
         server from disk."""
+        if not self.persist:
+            raise VTTError(NO_PERSIST_WIPE)
         key = mgr.guild_key
         sdir = self.server_dir(key)
         os.makedirs(sdir, exist_ok=True)
@@ -759,12 +777,77 @@ class Storage:
 
 DATA_DIR_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
+NO_PERSIST_WIPE = ("Persistence is off (local_settings.json), so this session "
+                   "keeps its matches in memory only: restart for a clean "
+                   "state, or `!match delete <id>`. A wipe would act on the "
+                   "data left on disk, which this session ignores.")
 
-def open_workspaces(root: str = DATA_DIR_DEFAULT) -> Workspaces:
+# cli.py / gui.py settings (the Discord bot always persists). A JSON file
+# beside the code, created with these defaults on first start.
+LOCAL_SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "local_settings.json")
+_LOCAL_SETTINGS_COMMENT = [
+    "Settings for cli.py and gui.py (the Discord bot always saves its data).",
+    "persistence: true = matches, undo history, game systems and channel "
+    "pointers are written to data/local after every command and loaded at "
+    "the next start.",
+    "persistence: false = every session starts empty and writes none of "
+    "that. Whatever is already in data/local is IGNORED and LEFT ON DISK "
+    "untouched; setting persistence back to true loads it again.",
+    "Either way, manual saves (!store save, !history export) go to "
+    "data/local/saves, and data/local/sprites is used.",
+]
+
+
+def load_local_settings(path: str = LOCAL_SETTINGS_FILE) -> Dict[str, Any]:
+    """The local surfaces' settings: {"persistence": bool}. A missing file
+    is created with the defaults (persistence off) and its _comment notes;
+    an unreadable one is reported and the defaults are used."""
+    settings: Dict[str, Any] = {"persistence": False}
+    if not os.path.exists(path):
+        try:
+            _write_text(path, json.dumps(
+                {"_comment": _LOCAL_SETTINGS_COMMENT, "persistence": False},
+                indent=2) + "\n")
+        except OSError as ex:
+            print(f"⚠️ Couldn't create {os.path.basename(path)} ({ex}).")
+        return settings
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("not an object")
+    except (OSError, ValueError) as ex:
+        print(f"⚠️ {os.path.basename(path)} couldn't be read ({ex}); "
+              f"persistence stays off.")
+        return settings
+    val = data.get("persistence", False)
+    if not isinstance(val, bool):
+        print(f"⚠️ {os.path.basename(path)}: `persistence` must be true or "
+              f"false; it stays off.")
+        val = False
+    settings["persistence"] = val
+    return settings
+
+
+def local_persistence_note(settings: Dict[str, Any]) -> Optional[str]:
+    """The startup warning while local persistence is off, else None."""
+    if settings.get("persistence"):
+        return None
+    return ("⚠️ Persistence is off: this session's matches and undo history "
+            "are lost when you close it, and nothing already saved in "
+            "data/local is loaded (it stays on disk). Manual saves (`!store "
+            "save`) still go to data/local/saves. To keep sessions, set "
+            "\"persistence\": true in local_settings.json.")
+
+
+def open_workspaces(root: str = DATA_DIR_DEFAULT,
+                    persist: bool = True) -> Workspaces:
     """Workspaces backed by the data folder at `root`, with every server
-    already loaded from it (the bot / CLI / GUI startup)."""
+    already loaded from it (the bot / CLI / GUI startup). persist=False:
+    start empty and write nothing (Storage.persist)."""
     ws = Workspaces()
-    ws.storage = Storage(root)
+    ws.storage = Storage(root, persist=persist)
     ws.storage.load_all(ws)
     return ws
 
@@ -775,7 +858,7 @@ def reload_workspaces(workspaces: Workspaces) -> List[str]:
     st = workspaces.storage
     st.commit_all(workspaces)
     fresh = Workspaces()
-    fresh.storage = Storage(st.root)
+    fresh.storage = Storage(st.root, persist=st.persist)
     notes = fresh.storage.load_all(fresh)
     workspaces._by_key = fresh._by_key
     workspaces.storage = fresh.storage

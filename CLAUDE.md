@@ -213,6 +213,27 @@ does an attached part get included where it should (and excluded where it
 shouldn't)? If the feature is spatial, vision-related, movement-related, or
 fires per-entity, this is non-negotiable.
 
+### Rendering changes need a GUI-vs-ASCII pass (user directive)
+
+Text (`_render_ascii_impl`) and graphics (`_render_scene_impl` → the
+`sprite_render.SceneRenderer` pixels) are two parallel renderers over the
+same predicates, and they drift. After ANY change that touches what a map
+shows (a layer, a visibility rule, a glyph / sprite / colour resolver, the
+viewport, a new kind of placement), do a thorough pass on the differences
+between them, not just the feature: read both paths side by side and run
+the throwaway harnesses — (1) per-cell ownership: the ASCII glyph vs the
+top scene placement; (2) pixel parity: render the scene with no sprites and
+check a glyph is drawn exactly where ASCII shows a non-`.` character, fog
+where it shows the fog glyph; (3) a windowed render equals the same crop of
+the full render. Run them over random boards with multi-tile bodies, region
+parts, riders, every facing, team views, hidden layers and viewports.
+Intended differences: corpses and status overlays are graphics-only, a
+multi-tile body follows `sprite_mode` (`stretch` default = one sprite/glyph
+over the body; `single` = its anchor cell), colour-only cells are a
+translucent fill, a unit's colour is an outline around its sprite, the image
+legend lists every look in the window (ASCII lists top-layer glyphs only),
+and layer order follows the sprite_layer_* rules.
+
 ### ANY bug is worth fixing — multi-tile is where they CLUSTER, not a filter
 
 The multi-tile emphasis above is about where bugs concentrate, NOT a
@@ -447,6 +468,19 @@ plus `data/bot_settings.json` (owner limits + rule ceilings) and
   server folder; a file that fails to load moves to `corrupt/` with a console
   note and the rest loads; unknown gamerules in systems are dropped. Data of
   servers the bot left is kept. On shutdown `commit_all` writes once more.
+- **cli.py / gui.py persist only when asked (user call).** They read
+  `local_settings.json` beside the code (`storage.load_local_settings`;
+  created on first start with `"persistence": false` and a `_comment` list
+  explaining it — JSON has no comments; git-ignored). One switch for both.
+  Off = `open_workspaces(persist=False)`: `Storage.persist` False makes
+  load_all load no server folder and every commit a no-op, so each session
+  starts empty; whatever is in data/local is IGNORED AND LEFT ON DISK
+  (turning it back on loads it). Manual saves still go to data/local/saves
+  and data/local/sprites is still searched. `!server wipe` is refused
+  (`NO_PERSIST_WIPE`: it would act on the ignored disk state); `!as restart`
+  gives an empty session. A startup warning (`local_persistence_note`) is
+  printed by both and shown in the GUI log. The Discord bot always persists;
+  the harness uses its own temp Storage (persist on).
 - **`!server wipe matches|all`** (admin; refused inside batch / macro / alias
   / action / `!again`: `_SERVER_TYPED_ONLY`): prints a phrase, accepted from the
   same admin in the same channel within 2 minutes (case / spaces ignored);
@@ -2448,7 +2482,12 @@ More shipped work (continuing the list above):
       - A zone / tile with a `color` but no sprite or glyph drew nothing
         (ASCII tints its `.`): the renderer fills the cell with the colour
         at the new `tint_fill_opacity` rule (default 40; carried in the
-        scene).
+        scene). ONLY zones and tiles: a corpse's / overlay's tint recolours
+        its sprite, and filling the cell with it painted a grey square that
+        read as fog (scenario 714). A corpse whose PNG is missing draws its
+        glyph instead (`Match.corpse_glyph`: glyphs.<facing> > glyph > the
+        facing arrow), grey and faded like the sprite; a corpse with
+        neither a sprite nor a custom glyph is still not drawn.
       - Image render mode dropped `!map hide=` / `coords=`;
         `post_scene_image(m, pov, highlights, hidden, coords)` and
         `scene_for_png(..., hidden_layers, coords)` now take them, as do
@@ -2456,6 +2495,59 @@ More shipped work (continuing the list above):
         placement (position, size, mode, sprite/glyph/colour, layer) in
         drawing order, under the channel POV, and the summary names the
         fog sprite.
+    - **GUI-vs-ASCII pass 2 (pixel parity).** Fixes: (1) the BACKGROUND
+      was placed on the window, not the map: `stretch` squeezed the whole
+      image into every viewport window and `tile` repeated it at the PNG's
+      own size from the window corner, so a panned Discord image shifted it
+      under the units. `_draw_background` now places it on the whole grid
+      and cuts the window out: stretch = one copy over the map (only the
+      window's part resized, `resize(box=)`), tile = one copy PER CELL,
+      center = native size at sprite_cell_size cells (the scene carries
+      `sprite_cell_size`), at the map's middle. (2) The `bright_*` palette
+      names aren't Pillow colours, so a `bright_red` unit was untinted in
+      graphics (`_PALETTE_RGB`). (3) Pillow's built-in font is ASCII-only:
+      any other custom glyph (`é`, `█`, `★`, `龍`) drew as a box. A glyph
+      outside ASCII uses the first font that has it — a `fonts/` folder of
+      the sprites folders, then `_SYSTEM_FONTS` (coverage tested against the
+      font's missing-character mask; fonts and results cached module-wide).
+      Colour emoji are not supported. (4) gui.py: `!map image` replied
+      "available on Discord / gui.py" inside gui.py, and `!map as= / full /
+      hide= / coords=` changed only the ASCII text in the log. GuiCtx now
+      has `post_scene_image` and `show_scene_view` (called by the plain
+      `!map` handler when the surface has it): the canvas draws that view
+      until the next command, like `!map preview`.
+    - **Corpse sprites, team outline, `stretch` default, image legend
+      (scenarios 715-717, user calls).**
+      (1) A unit's own corpse picture: `corpse_sprites.<facing>` >
+      `corpse_sprite` vars, else the new `corpse_default_sprite` rule (empty
+      default) — both drawn AS-IS (`Match.corpse_sprite_info` → (key,
+      is_corpse_picture)); with neither, the living sprite greyed and faded
+      by corpse_sprite_tint / corpse_sprite_opacity as before. A corpse
+      placement carries `glyph_tint` / `glyph_opacity` so the glyph drawn
+      when a PNG is missing is always greyed and faded.
+      (2) Team colour: rules `team_outline_width` (default 3 px at
+      sprite_cell_size, scaled with the cell; 0 = off), `team_outline_opacity`
+      (100) and `team_tint_opacity` (default 0; the old behaviour was a full
+      multiply, which wiped a sprite to pure red). Carried in the scene's
+      `unit_style`; `SceneRenderer._outline` draws the ring outside the
+      sprite's shape (alpha >= 128) where the body has transparent room and
+      just inside the body edge where the shape reaches it. Only `entity`
+      placements with a loaded sprite: glyph units keep their coloured glyph,
+      tiles / zones / overlays keep their own full tint. `!map scene` shows
+      the three values.
+      (3) `sprite_mode` defaults to `stretch` (single stays an option).
+      (4) Image legend (`render_scene(legend=True)` → `scene["legend"]`,
+      `Match._scene_legend`): one entry per distinct look among placements
+      inside the window (overlays left out), every meaning that look has
+      (unit shown name — disguise-aware —, `tile: <template>` / `tile`,
+      `zone: <name>`, `corpse: <name>`), in row-major order of first cell,
+      fog last; `!map preview` highlights add "preview area" in the
+      renderer. Drawn below the map by `SceneRenderer._add_legend` at fixed
+      pixel sizes (28 px swatches, 15 px text, columns to the map width,
+      long labels cut with …, at most 40 entries). Follows `!map legend
+      on|off` and the one-off `legend=on|off` on `!map` (image mode), `!map
+      image`, `!map scene` (`list` prints the entries), the GUI canvas and
+      Discord image boards.
     - **Default grid borders + per-match override (scenario 532).** The
       `show_borders` rule now DEFAULTS to True: white grid lines drawn ABOVE the
       ground/background but BELOW tiles/zones/entities (in `render()` the border

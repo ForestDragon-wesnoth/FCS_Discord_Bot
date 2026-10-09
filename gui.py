@@ -30,7 +30,7 @@ from sprite_render import (
 )
 
 from logic import LOCAL_WORKSPACE
-from storage import open_workspaces
+from storage import open_workspaces, load_local_settings, local_persistence_note
 from vtt_commands import registry, _view_pov
 
 
@@ -54,6 +54,25 @@ class GuiCtx:
 
     async def send(self, message: str):
         self.app.log(message)
+
+    def show_scene_view(self, pov, hidden=None, coords=None,
+                        legend=None) -> None:
+        """A `!map` with its own view options (`as=`, `full`, `hide=`,
+        `coords=`, `legend=`): the canvas draws that view until the next
+        command, as the ASCII reply does."""
+        self.app._view = {"pov": pov, "hidden": hidden, "coords": coords,
+                          "legend": legend}
+
+    async def post_scene_image(self, m, pov, highlights=None, hidden=None,
+                               coords=None, legend=None) -> str:
+        """`!map image` (or a plain `!map` in image render mode): the
+        canvas is the image here, so draw that view on it until the next
+        command."""
+        self.show_scene_view(pov, hidden, coords, legend)
+        if highlights:
+            self.app._preview = highlights
+        return ("🖼 Drawn on the canvas — "
+                + (f"`{pov}`'s view." if pov is not None else "everything."))
 
     def show_preview(self, highlights) -> None:
         """`!map preview` hook: draw these highlight squares on the canvas
@@ -101,13 +120,19 @@ class GuiApp:
                 "The GUI surface needs Pillow: pip install Pillow")
         import tkinter as tk  # lazy: needs a display
         self.tk = tk
-        # The local workspace, persisted to data/local/ like the CLI's.
-        self.workspaces = open_workspaces()
+        # The local workspace, persisted to data/local/ like the CLI's when
+        # local_settings.json turns persistence on.
+        local = load_local_settings()
+        self._persist_note = local_persistence_note(local)
+        if self._persist_note:
+            print(self._persist_note)
+        self.workspaces = open_workspaces(persist=local["persistence"])
         self.mgr = self.workspaces.get(LOCAL_WORKSPACE)
         self.ctx = GuiCtx(self)
         self.loader = SpriteLoader(
             sprites_dir, first=self.workspaces.storage.sprites_dir(LOCAL_WORKSPACE))
         self._preview = None  # highlight squares from `!map preview`
+        self._view = None     # a `!map` / `!map image` view, until the next command
         self.loop = asyncio.new_event_loop()
         self._photo = None  # keep a ref so Tk doesn't GC the image
         self._zoom = 1.0
@@ -192,6 +217,8 @@ class GuiApp:
         self.log("FCS VTT graphics surface. Type !help (one command per line; "
                  "Enter runs all lines, Shift+Enter for a newline). Sprites "
                  f"from: {self.loader.folder}")
+        if self._persist_note:
+            self.log(self._persist_note)
 
     def log(self, message: str):
         self.log_widget.config(state="normal")
@@ -240,11 +267,21 @@ class GuiApp:
             return
         # The canvas shows the GUI channel's view, as `!map` would: the
         # channel's bound POV, or an `!as view <team>` preview (fog drawn).
-        try:
-            pov = _view_pov(self.ctx, m, [])
-        except Exception:
-            pov = None
-        scene = m.render_scene(pov_team=pov)
+        view = getattr(self, "_view", None)
+        hidden = coords = legend = None
+        if view is not None:
+            pov, hidden, coords = view["pov"], view["hidden"], view["coords"]
+            legend = view.get("legend")
+        else:
+            try:
+                pov = _view_pov(self.ctx, m, [])
+            except Exception:
+                pov = None
+        if legend is None:
+            legend = bool(getattr(m, "map_legend_enabled", False))
+        scene = m.render_scene(pov_team=pov, hidden_layers=hidden, legend=legend)
+        if coords is not None:
+            scene["coords"] = coords
         if getattr(self, "_preview", None):
             scene["highlights"] = self._preview
         cell = self._cell_size(m, scene)
@@ -274,6 +311,7 @@ class GuiApp:
         block = self.entry.get("1.0", "end")
         self.entry.delete("1.0", "end")
         self._preview = None  # a `!map preview` lasts until the next command
+        self._view = None     # so does a `!map` view
         lines = [ln.strip() for ln in block.splitlines()]
         ran = False
         for line in lines:
