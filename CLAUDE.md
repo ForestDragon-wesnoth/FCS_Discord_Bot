@@ -65,6 +65,25 @@ even those should fall out of existing primitives (a passive/watcher
 the GM writes), not a new AI subsystem. When a feature idea reduces to
 "the engine decides what an entity does," stop and reconsider.
 
+### Don't add features that existing primitives already compose
+
+User rule: **we shouldn't add features that can easily be implemented by
+stringing together existing functionality, unless it is something that needs
+to be simplified often enough.** Before proposing a feature, try to build it
+from what ships (formulas, actions, passives, watchers, macros, `!foreach`,
+events). If that works in a few lines, the answer is a scenario that shows how,
+not new engine code. Add a shortcut only when GMs would write the same
+composition over and over (lowest_var / highest_var exist because every
+targeting formula needed the same accumulator loop).
+
+### The square grid is fundamental
+
+The map is a grid of square cells and stays that way: every geometry
+primitive, footprint, LOS walk, region, renderer and coordinate convention
+assumes it. Hex grids were proposed and rejected by the user (a refactor
+touching everything, harder maths and rendering, and they make hex games in
+Battle for Wesnoth). Don't propose other grid shapes.
+
 ### Backwards compat is irrelevant this early
 
 The user has said this repeatedly. **Rewrite > dual-implementation
@@ -140,7 +159,13 @@ the scenario says what it expects with `!assert "<formula>" [message]`: a
 false assert prints `❌ Assertion failed`, which the harness ALWAYS flags
 (even under HARNESS-ALLOWS-ERRORS; only `HARNESS-ALLOWS-ASSERT-FAIL`, for a
 scenario demonstrating a failing assert, opts out). Prefer asserts for
-end-state checks in new scenarios (see 597-608). A scenario can "pass" with a `❌` reply that means the
+end-state checks in new scenarios (see 597-608). For REPLY WORDING (a
+refusal message, a reported number) use a `?? <text>` line right after the
+command — the reply must contain the text — or `?! <text>` (must not); a
+miss prints `❌ Expectation failed`, flagged like a failed assert (see
+633-645). `python run_scenarios.py --review N ...` prints every command's
+FULL reply followed by the Expected prose, the quick way to check prose
+against reality. A scenario can "pass" with a `❌` reply that means the
 opposite of what it should. Always also do at least one of:
 
 - Run the new scenarios with `-v` and read the per-line transcript
@@ -200,6 +225,20 @@ footprints. Two corollaries the user stated explicitly:
   A wrong "fix" that drifts from intent is worse than a question.
 - **If CLAUDE.md's wording was ambiguous about the behavior in question, it
   MUST be amended** as part of the fix, so the ambiguity doesn't recur.
+
+### Usage strings are authoritative (stray-word check)
+
+The dispatcher refuses positional words past the end of a command's usage
+string (`_stray_words_error`, audit-pass-36): `!ent remove a b` used to remove
+only `a`. So **every new subcommand needs an exact `annotate_sub` usage**
+(and a root without subcommands an exact root usage): `<x>` one word,
+`[...]` optional, `|` alternatives (an alternative LED by a literal word —
+`list`, `cell <x> <y>` — applies only when that word is typed), `...` /
+`<x ...>` any number more, `key=<v>` / `[key=value ...]` options (left to
+the handler). Alias spellings (`del`/`rm`) go in `_SUB_ALIASES`. A wrong
+usage string refuses a valid command; the regression catches most. An
+optional slot that takes any word (`[full]`, `[once]`, `[N]`) can't be
+checked this way: the handler must refuse a word that doesn't fit.
 
 ### Commit messages: dense, factual, no fluff
 
@@ -299,41 +338,72 @@ behavior is what shipped).
 
 Add cross-cutting features here, not at the call sites.
 
-### ⚠️ Multi-tenant caveat (INTERIM — read before touching access or storage)
+### Server workspaces (each Discord server is separate)
 
-ONE bot process serves EVERY Discord guild it's in, and today they all share
-one `MatchManager`: the GameSystems (rules, `command_access`, default vars /
-passives / clamps, system aliases), the match table, and the `saves/` folder
-are GLOBAL. Nothing is partitioned per guild. The current protections are
-stop-gaps (audit-pass-29, user-approved):
-- **Bot-wide commands need a server administrator** — `!system` edits,
+ONE bot process serves every Discord server it's in, and each server has its
+own WORKSPACE: a `MatchManager` holding that server's GameSystems (rules,
+`command_access`, default vars / passives / clamps, system aliases), matches,
+channel pointers, saves folder and command lock. `logic.Workspaces` maps a
+guild id to its manager, creating it (with a fresh `default` system built from
+RULES_REGISTRY) on the server's first command. The Discord adapter
+(`discord_commands.wire_commands(bot, workspaces)`) routes every command,
+alias, button click and board refresh by the guild the message came from, so
+a match id, system name or save name only means something inside its own
+server, and nothing can name another server's data. The CLI / GUI / harness
+use the `local` workspace (`logic.LOCAL_WORKSPACE`); the CLI and the harness
+switch workspaces with `!as server <key>` (scenarios 698-700).
+- **DMs are refused** (`DM_REFUSAL`: make a one-person server instead) — a
+  DM has no server to hold a workspace. An unknown `!word` in a DM is ignored.
+- **Server-wide commands need a server administrator** — `!system` edits,
   `!defvar`/`!defpassive`/`!gclamp` edits, `!store`, `!run`, `!history
   export/import` (`vtt_commands._admin_required` + `ctx_is_admin`; Discord =
-  the guild Administrator permission, CLI/GUI = always). Checked in BOTH
-  `CommandRegistry.run` and `dispatch_no_snapshot` (so batch/macro/foreach/
-  `!run` lines and action `cmd()` can't wrap them), rejected outright (never
-  queued), not overridable by `!host access` / `command_access`, and it skips
-  the per-match gate once passed. Action bodies can't run them at all
-  (`_BufferCtx` carries no admin flag — default-deny).
+  the guild Administrator permission, CLI/GUI = always). They change state
+  shared by every match of the server, and anyone can create and host a
+  match, so a match host isn't enough. Checked in BOTH `CommandRegistry.run`
+  and `dispatch_no_snapshot` (so batch/macro/foreach/`!run` lines and action
+  `cmd()` can't wrap them), rejected outright (never queued), not overridable
+  by `!host access` / `command_access`, and it skips the per-match gate once
+  passed. Action bodies can't run them at all (`_BufferCtx` carries no admin
+  flag — default-deny).
 - **Commands that NAME another match** (`!match use/bind/rename/delete <id>`,
   `!ent copy/transfer <id> <dest>`) need host (delete: owner) of THAT match
-  (`require_target_host`) — the access gate only checks the CHANNEL's match.
-- **Disk paths are confined to `saves/`** (next section).
-The hole that remains BY DESIGN for now: an administrator of guild A can still
-change a shared system that guild B's matches use, `!store load` replaces every
-guild's matches, and `!match` lists every match id bot-wide. **When the bot is
-redesigned for proper data storage, systems, matches, saves and access MUST be
-split per guild** (each guild its own systems + match table + save folder, and
-cross-guild references impossible by construction). Don't build new features
-that deepen the sharing (e.g. a cross-guild match browser); do route any new
-global-state command through `_admin_required`.
+  (`require_target_host`) — the access gate only checks the CHANNEL's match,
+  and one server can run several matches with different hosts.
+- **Bot owner.** `Workspaces.owner_ids` is read at startup from Discord
+  (`bot.application_info()`: the application's owner, or its team's members);
+  `ctx_is_bot_owner` (Discord sets `is_bot_owner`; CLI/GUI = always; default-
+  deny elsewhere). Owner-only commands live under `!owner` (`!owner servers`
+  lists every workspace); `!whoami` shows the badge. Owner is NOT admin of
+  every server: server-wide commands still need that server's Administrator.
+- **System rules on load:** a system saved by an older build may name a
+  gamerule that no longer exists — `GameSystem.from_dict` drops it with a
+  console note. A gamerule the save lacks needs nothing: systems store only
+  overrides, so it reads the RULES_REGISTRY default.
+- `!system default server|channel` (the old `global` scope and the per-server
+  default map are gone — a workspace is one server). `!match` / `!match list`
+  are player-available: they list only this server's matches.
+- STILL SHARED across servers: the process and its event loop. A slow command
+  in one server delays every server, so anything whose cost follows a user's
+  numbers needs a budget rule (formula_cell_limit, sight_check_limit, ...).
+  formula_cell_limit has no maximum, so a server's admin can still set it
+  high enough to stall the bot — a job for the limits work below.
+- Persistence is the NEXT step (agreed with the user, not built yet): a JSON
+  storage class under `data/<guild_id>/` (systems.json, matches/, saves/,
+  sprites/) plus `data/bot_settings.json`, written after every state-changing
+  command, loaded at startup; per-server (1000 MB) and global (20 GB) storage
+  limits with rollback + warning, owner-overridable via `!owner limit`; per-
+  server sprites; `!server wipe` with a typed confirmation phrase and a 24 h
+  trash. Until then everything lives in memory and `!store save` is the only
+  way to keep a server's state across a restart.
 
-### Disk access is confined to `saves/`
+### Disk access is confined to the server's saves folder
 
 Every command that reads or writes a host file — `!store save/load`, `!run`,
-`!history export/import` — goes through `vtt_commands.saves_path(name,
-write=)`, which resolves plain relative names (subfolders allowed) inside
-`SAVES_DIR` (`saves/` next to the code) and refuses `..`, absolute paths,
+`!history export/import` — goes through `vtt_commands.saves_path(name, mgr,
+write=)`, which resolves plain relative names (subfolders allowed) inside the
+workspace's folder (`server_saves_dir`: `SAVES_DIR` itself for `local`,
+`SAVES_DIR/servers/<guild id>/` for a Discord server, so one server's
+`!store load` can't read another's files) and refuses `..`, absolute paths,
 drive letters and anything whose realpath (symlinks included) leaves the
 folder. Replies show `saves/<name>`, never the host's absolute path. Before
 this, `!run 1bot_token.txt` echoed the bot token back line by line ("Unknown
@@ -549,6 +619,21 @@ about things that are obviously settled (don't ask "should I
 keep the existing test passing?"), but otherwise the bar for
 asking is low. A 30-second clarification beats a 300-line refactor.
 
+### When to ask: ordering questions against the work (user directive)
+
+- **Bugfix / improvement passes:** when a pass turns up several issues and
+  only some have open questions, fix the ones with a clear solution FIRST,
+  then ask the open questions together at the end. Don't stop the pass at
+  the first question.
+- **Feature additions:** put as many implementation questions as possible
+  UPFRONT, before coding. Then build everything you're certain about. Save
+  any questions that come up during the work for near the end. Ask mid-way
+  only when the answer blocks the rest of development or testing.
+
+Why: the user checks in only occasionally while a pass or feature runs
+(often many minutes). A question asked mid-work leaves the session idle until
+they return; asked at the end, it costs nothing.
+
 ---
 
 ## 7. Current state of the project (as of this handoff)
@@ -621,7 +706,8 @@ Shipped capabilities (roughly chronological; all merged):
   `_relative_angle`, `_facing_degrees`, `_SIDE_CARDINALS`/`_SIDE_CORNERS`.
   Malformed/missing-var fails by raising (FormulaError) like other funcs.
   Verified: directional armor/weakspot (back hit > front hit) via an action.
-  FUTURE slices the user may want: configurable side NAMES (gamerule).
+  FUTURE slices the user may want: configurable side NAMES (gamerule) —
+  deferred by the user in the 2026-10 idea round ("decide later").
   (entity-shape hitboxes + LOS-aware raycast SHIPPED — see the
   "Directional/vision geometry" entry below.)
 - Action system (full body language with cmd/fail/source/target/args,
@@ -687,8 +773,8 @@ Shipped capabilities (roughly chronological; all merged):
     content, not a subcommand — scenario 570); a new command gets no
     downgrade until its read-only subs are listed there. Gate is a NO-OP when there's
     no active match, no identity, or `owner is None` (legacy/open
-    matches) — which is why BOT-WIDE commands have their own admin check and
-    match-NAMING commands their own target check (see "Multi-tenant caveat"
+    matches) — which is why SERVER-WIDE commands have their own admin check and
+    match-NAMING commands their own target check (see "Server workspaces"
     in §3). Alias resolution runs BEFORE the gate; `dispatch_no_snapshot`
     (batch/run/action `cmd()`) is intentionally ungated since it's only
     reached from an already-approved/host context — gate stays at the
@@ -843,8 +929,10 @@ More shipped work (continuing the list above):
   follow-ons to the LOS slice. (1) **Coords as return values.** The sandbox
   bans subscript/attr-on-call, so a returned `(x,y)` was unreadable; the
   convention is now pure extractors `coord_x(c)`/`coord_y(c)` (accept an
-  (x,y) tuple/list or an action `Coord`; raise on None — check `c == None`
-  first). `first_opaque(x1,y1,x2,y2[,viewer])` returns the first opaque cell
+  [x, y] pair or an action `Coord`; raise on None — check `c == None`
+  first). Coordinates are LISTS in formulas since audit-pass-35: function
+  results are listified, a `(3, 3)` literal compiles to a list, stored
+  tuples become lists. `first_opaque(x1,y1,x2,y2[,viewer])` returns the first opaque cell
   strictly between as an (x,y) pair (read via coord_x/coord_y) or `None` if
   clear — `Match.first_opaque` over the shared `Match._line_cells` (the thin
   DDA path used by has_los, factored out). (2) **Entity-factoring LOS** as
@@ -872,7 +960,10 @@ More shipped work (continuing the list above):
   entity (`!ent set_var dragon footprint_w 3`), via a summon template, or
   globally with `!defvar` (defaults are applied in `spawn`/`summon` BEFORE
   the footprint-aware bounds/occupancy check). There is NO `!ent add` size
-  arg — footprint is "just a var." Core geometry on `Match`:
+  arg — footprint is "just a var," but a write that GROWS the body is
+  checked like a move (`Match.check_body_fits`, called from write_var and
+  transform: refused if a new cell is off-grid or taken; audit-pass-36), and
+  a side is read capped one past the grid side. Core geometry on `Match`:
   `entity_footprint(e)`→(w,h), `entity_cells(e[,ax,ay])` (row-major, [0]=
   anchor), `entity_occupies(e,x,y)`, `cell_occupant(x,y,ignore=())` (the
   footprint-aware occupancy core behind `is_occupied`), and the single
@@ -1028,6 +1119,10 @@ More shipped work (continuing the list above):
     turn clock; the GM calls status_counter_add(-1) from whatever the trigger
     is). Also `!status counter <eid> <name> <add|set> <value> [field]`. Auto-
     removal goes through the status diff chokepoint (`_status_remove`).
+    OPEN (user: decide later): a status with NO `duration` shows as ∞, but
+    `status_counter_add(eid, name, -1)` (default field duration) reads the
+    missing duration as 0 and REMOVES the status. Whether ∞ should stay ∞
+    (no-op, return None) is undecided; don't change it without asking.
   - apply_status now also surfaces a block reason to the command layer via
     `Match.status_apply_block_reason(eid, name, level)` (immune / blocked by X
     / fully resisted). All def fields serialize (deepcopy); resistances are
@@ -1157,6 +1252,10 @@ More shipped work (continuing the list above):
     default · `remaining_hp` · `absolute:<n>`; `none` auto for 0/0), `vital`
     (part death kills parent), `indestructible` (auto for max_hp==0). Routing
     happens ONLY via `damage_part` — a raw `entity[part].hp -=` does not spill.
+    `damage_part` / `damage_spread` REFUSE a negative amount (user call,
+    audit-pass-36: a negative hit used to heal the part AND send a share of
+    the heal to main); heal a part with an hp write, which also clears its
+    destroyed latch and resumes a suspended aura (handled in write_var).
   - **Part destruction** (hp→0 by damage, non-indestructible): the part LINGERS
     attached & dead, fires `on_death` ONCE (latched by the `__part_destroyed`
     var; a heal above 0 clears it), and if `vital` runs the parent through the
@@ -1244,7 +1343,8 @@ More shipped work (continuing the list above):
     CUSTOM glyph (a default-glyph region part yields, so it doesn't clobber the
     parent's customization); done in a second render pass. Located parts (own
     cell, no overlap) are unaffected.
-  - Per-damage-TYPE `to_main_percent`; the **armor layer** (coverage % +
+  - Per-damage-TYPE `to_main_percent` (deferred again by the user in the
+    2026-10 idea round, "decide later"); the **armor layer** (coverage % +
     directional, damage-type AR-vs-ARP mitigation); the **to-hit roll**
     (accuracy/evasion/suppression/spread, SEPARATE from hit-location); **AP/FP/
     ARC action economy + reactionary actions** (block/dodge → the reaction
@@ -1459,8 +1559,9 @@ More shipped work (continuing the list above):
   default `" [part of {parent}]"`. Rendered in `_entity_line` only when
   `e.is_part` (parent alive); placeholders `{parent}` / `{parent_name}` plus
   every entity_line_format key (resolved against the part). Empty = off. Only
-  parts on the roster (located / segment / region) show it — glued parts are
-  hidden anyway.
+  parts on the roster show it — glued parts are left off by default (the
+  `roster_glued_parts` rule + per-part `__roster_show`, audit-pass-33
+  follow-up).
 - **Directional/vision geometry — SHIPPED (scenarios 434-436).** Three
   primitives extending the directional + LOS + footprint layers.
   (1) **Box-face (footprint-aware) side_hit** — `side_hit` / `directional_get`
@@ -1615,9 +1716,12 @@ More shipped work (continuing the list above):
     `slot_capacity` / `slot_free` / `can_mount`. Command `!mount <rider>
     <vehicle> <slot>` / `dismount` / `switch` / `list` / `info` (list/info
     player-available via READ_ONLY_SUBCOMMANDS). All serialized.
-    FUTURE the user may want: per-rider footprint inside a vehicle, edge-aware
-    boarding range (mount only from an adjacent cell), nested vehicles' shared
-    fuel/initiative, and an armor layer for riders-inside (positional cover).
+    FUTURE the user may want: per-rider footprint inside a vehicle, nested
+    vehicles' shared fuel/initiative, and an armor layer for riders-inside
+    (positional cover). REJECTED (user): a built-in boarding range / "mount
+    only from an adjacent cell" rule. Whether a mounting is legal is the GM's
+    call, made in the slot `condition` and in the GM's own mount actions;
+    don't add engine rules for it.
   - **Mount bug fixes (scenarios 465-466).** (1) NESTED carry: a vehicle that
     is itself a rider now carries its OWN cargo when the rig moves —
     `_restamp_riders_for` replays fire_entity_moved's carry-restamp trio
@@ -1632,7 +1736,8 @@ More shipped work (continuing the list above):
   - **Viewport / panning (#110, headless-testable core).** Caps how much grid
     renders at once: engages when EITHER dimension exceeds its cap (a 70×5 grid
     still windows horizontally), window size = min(cap, grid) per axis. Caps are
-    the `viewport_width` / `viewport_height` rules (default 30). Per-CHANNEL
+    the `viewport_width` / `viewport_height` rules (default 28; was 30 until the
+    rulers shipped). Per-CHANNEL
     offset in `Match.channel_views` (channel_key -> [x,y], serialized), the
     panning analog of per-channel POV. Surface gating: the `viewport_mode` rule
     (`auto` default | `on` | `off`) — `auto` defers to the surface's
@@ -2128,12 +2233,13 @@ More shipped work (continuing the list above):
     mode + resistance/immunity/blocked_by all apply. Design call (user):
     RESISTIBLE move, consume-on-reject — if the dest resists/is immune the
     status is gone from the source AND doesn't stick (returns False). Carries
-    level + duration; custom instance data RE-SEEDS from the definition (same
-    behavior as the existing part_status_redirect, which also re-applies rather
-    than byte-copying). Command `!status transfer <from> <to> <name>`. Both are
+    level + duration, and (user call, 2026-10) the moved instance KEEPS its
+    custom fields: `apply_status(..., seed_data=)` seeds a first application
+    from the moved instance in place of the definition's `data`; onto an
+    existing instance only the stacking applies and that instance keeps its
+    own data. Command `!status transfer <from> <to> <name>`. Both are
     mutating `!status` subcommands (host-gated); prims registered in
-    `_MATCH_FUNC_NAMES`. (A future variant could preserve full instance data
-    or be force/reflect-flavored.)
+    `_MATCH_FUNC_NAMES`. (A future variant could be force/reflect-flavored.)
 
 - **Graphics / sprite rendering — PHASE 1 SHIPPED (the engine render model;
   scenario 530).** The long-planned image-rendered map. CORE PRINCIPLE: the
@@ -2627,7 +2733,7 @@ More shipped work (continuing the list above):
      var value) — substitution is per-token and happens AFTER shlex, so nothing
      re-splits and a player can't smuggle extra args/subcommands through a
      computed value. A space-containing value fed to a numeric arg gives a clean
-     `❌ hp delta must be an integer`, not a split.
+     `❌ hp amount must be a whole number ...`, not a split.
   2. **The `$()` read-only gate is airtight under attack** — every mutating
      function tried (`kill` / `var_set` / `summon` / `status_apply` /
      `damage_part`) is REJECTED with ZERO state change (entity still alive, hp
@@ -3512,7 +3618,7 @@ More shipped work (continuing the list above):
     read-only subs each handler really dispatches, plus a module-end assert
     that every key is a registered command (570).
   - **Cross-guild / global-state access (CRITICAL, user design calls).** See
-    §3 "Multi-tenant caveat" + "Disk access is confined to `saves/`":
+    §3 "Server workspaces" + "Disk access is confined to the server's saves folder":
     admin-only bot-wide commands, target-host checks, `saves/` confinement
     (572-574). Verified before the fix: token file readable via `!run`; one
     guild's user opened `ent` to all in another guild's match via `!system
@@ -3582,7 +3688,9 @@ More shipped work (continuing the list above):
     capacity figure stays true), `!ent info` renders a disguise's decoy card,
     and `!history diff` is host-only while fog or entity_visibility_condition is
     active. Your own team's units — a body part counts as its root body's team
-    — are never hidden (a hidden rider is still yours). Helpers `_query_pov` /
+    — are never hidden (a hidden rider is still yours) while the
+    `pov_own_team_visible` rule is on (default; audit-pass-35 made it a rule
+    and extended it to the map). Helpers `_query_pov` /
     `_pov_hides` / `_query_eid` / `_acts_as_host` in vtt_commands.py. Also
     `!part info` (full var JSON, the data `!ent dump` is host-gated for) left
     READ_ONLY_SUBCOMMANDS — players keep `!part list` (579-580).
@@ -3771,7 +3879,8 @@ More shipped work (continuing the list above):
     `target=`/`scope=`); stray trailing words were dropped (`_check_tail` on
     `!ent add/tp/hp/init/set_var` — an unquoted `hello world` stored
     "hello"); 21 error replies lacked the ❌ prefix. New: `!match list`
-    (host-gated like bare `!match`, it lists every match bot-wide) and
+    (host-gated like bare `!match` back then, when it listed every match
+    bot-wide; player-available since the server-workspace split) and
     `!match info` (this channel's match, player-available) (595).
   - **Rotten scenarios repaired** (each "passed" while testing nothing):
     removed subcommands (`!ent team`, `set_facing`, `list_vars`, `macro
@@ -3883,6 +3992,638 @@ More shipped work (continuing the list above):
     owner joins the copy's co-hosts, so every host of the original still
     hosts the clone. Host-gated by the normal gate (it checks the channel's
     match, which is the source).
+
+- **Small-ideas bundle: formula functions, despawn hook, five commands —
+  SHIPPED (scenarios 613-632).** Ideas 46-54, 58, 61-65 from the second
+  idea list (an `on_facing_changed` hook was dropped by the user).
+  - **Facing writes (613-614).** `set_facing(eid, dir|cw|ccw)` and
+    `face_toward(eid, target_eid | x, y | coord)` (MUTATING), plus `!ent face
+    <id> toward <eid | x y>`. All three go through `Match.set_entity_facing`
+    (the allow_diagonal_facing gate) — the old `!ent face` code was inlined.
+    `Match.facing_toward` measures from the true centre of the unit's body
+    (multi-tile aware): nearest of 8 by bearing with diagonals on, dominant
+    axis (ties vertical, like direction_to) with them off; a point at its own
+    centre → None (facing unchanged). NOTE this is angle-based, while
+    `direction_to` snaps 8-way by the SIGN of dx/dy — (5, 1) is `right` here
+    and `down_right` there. FIX found on the way: `!ent face` on a vehicle
+    left its region-slot riders on the old side (rider x/y are re-stamped
+    only on moves); set_entity_facing now calls `_restamp_riders_for` (614).
+  - **Read-only geometry (ARG_SAFE, 615-618).** `grid_width()` /
+    `grid_height()` / `in_bounds(x, y)` (formulas couldn't read the map size
+    before); `entity_distance(a, b[, mode])` (= `entity_gap_distance`, the
+    `!dist` / entities_within measure); `cell_blocked(eid, x, y[, mode])`
+    (= `cell_blocks`; off-map → True; a mode walk/tp/push/swap consults its
+    block_<mode> rule; units standing there don't count — that's
+    cell_entity) and `cell_opaque(x, y[, viewer])`; `free_cell_near(x, y,
+    radius[, eid])` → coord or None (`Match.free_cell_near`: with a unit, the
+    whole footprint in bounds, clear of OTHER units — its own body, snake
+    segments and riders ignored — and not movement-blocked; ring order like
+    `_find_free_cell_near`; (2r+1)² is charged against formula_cell_limit).
+  - **`team_members(team)` (619)** — alive, non-part units of a team in turn
+    order (then id order for units outside it). Loopable.
+  - **`pick(list)` / `shuffle(list)` (620)** — `_ALLOWED_FUNCS`, rebound to
+    the match RNG like random_int (random_seed + choose() replay). pick of an
+    empty list → None; a dict → its keys. shuffle returns a new list and is
+    loopable.
+  - **`var_copy(src, path, dest, path)` (621)** — var_move without the
+    delete (deep copy). MUTATING. A reserved path may be the source, not the
+    destination.
+  - **`on_entity_despawned` hook (623-624).** Fires from `Entity.remove`
+    (which now takes `despawn=True` and RETURNS the hook's log lines) BEFORE
+    the unit leaves, so it can still be read. Covers every non-death
+    removal: `!ent remove` / `!part remove` / remove_entity, the part subtree
+    removed with its owner, segments a sever cascades away, `!ent transfer`
+    out of the match, and the old parts a transform drops. The death pipeline
+    passes `despawn=False` (the dying unit AND the parts going into its
+    corpse); `_sever_segment(..., died=True)` keeps the destroyed segment
+    itself silent while the severed tail fires. Each remove() re-checks the
+    unit after the hook (a handler may remove or kill it); apply_statblock
+    stops cleanly if a despawn handler removes the transform target.
+  - **`!roll odds <dice> [<op> <n>]` (625)** — `formula.dice_distribution`:
+    exact integer counts by convolution; keep-highest/lowest by enumerating
+    combinations (cap `_ODDS_MAX_KEEP_COMBOS` 200k); exploding dice as floats
+    with chains under 1e-12 cut (reported with ≈); explode+keep refused; total
+    work capped by `_ODDS_MAX_STEPS`. Shows the reduced fraction; without a
+    comparison, range + average + a bar table up to 40 totals.
+  - **`!whoami` (626)** — identity, admin, channel match, role, view (incl.
+    an `!as view` preview), whether commands run directly or queue, and the
+    caller's own pending request ids.
+  - **`as=<team>` on `!map` / `!list` (and anything reading `_view_pov`)
+    (627)** — host-only one-off POV preview (`as=omniscient` = everything),
+    checked inside `_view_pov` (raises for non-hosts); the reply starts with a
+    "👁 Preview" line (`_as_note`). `!list` now rejects unknown words/options.
+  - **`!map cell <x> <y> [for=<eid>] [as=<team>]` (628-629)** — player-
+    available report of one cell under the channel POV: units (footprint
+    aware), tile data, zones, corpses, and where the block/opaque settings
+    come from (tile / template / rule; zone data / zone rule; corpse rule).
+    `for=<eid>` evaluates them for that unit using ONLY the layers the POV
+    can see (a hidden blocking zone reads as "no"); a fogged cell is just
+    "unseen (fog)".
+  - **`!ent diff <a> <b>` (630)** — host-only (shows vars like dump); reuses
+    `_diff_entity`, which gained a `words` param for the one-side labels.
+  - **`!find ... count | ids` (631)** — bare words (they can't be
+    predicates); `ids` follows `sort:`.
+  - **FIX: `!tile info` / `!tile list` showed corpses the POV can't see
+    (632).** Corpses live in tile data, so the full tile dict leaked hidden
+    bodies; `_visible_tile_data` drops corpses failing corpse_visible_to (a
+    tile holding only hidden corpses reads as no tile). Shared with
+    `!map cell`.
+
+- **Table-control bundle + `!ent hp` sets by default — SHIPPED (scenarios
+  633-645).** Ideas 77, 78, 80, 82, 84, 86, 88, 91, 92, 96, 97.
+  - **`!ent hp` SETS by default (user call, 633-634).** A bare number,
+    `=n` (the way to set a negative value), `max` (max_hp) and a bare
+    `$(expr)` set hp; a leading sign CHANGES it: `+5` heals, `-5` damages,
+    `+$(expr)` / `-$(expr)` a computed change. The ent handler keeps
+    `raw_args` (tokens before its `$()` pass) so `$(x)` resolving to -5 still
+    SETS. A set goes through heal/damage (delta = target − hp), so clamps,
+    hooks and death behave as for any hp write; the reply adds "It is at N"
+    when a clamp or a death changed the result. MIGRATION: every scenario's
+    change written as a bare positive number or bare `$()` was rewritten to
+    the signed form (`-N` lines were already changes); verified by recording
+    every unit's hp after every command on the old code vs the new — the
+    only differences were scenarios 174-175, which roll unseeded random
+    damage. GOTCHA for new scenarios / aliases / macros: `!ent hp x 5` now
+    SETS 5 — write `+5` to heal.
+  - **`!cancel [id|all]` (636)** — a requester withdraws their own queued
+    request (bare = their latest); someone else's → "a host can `!deny`".
+  - **`!match pause [reason]` / `!match resume [drop]` (637-638).**
+    `Match.paused` ({by, reason}; serialized, but `_restore_snapshot` keeps
+    the LIVE value and the pause field is ignored when deciding whether a
+    command changed state, so pause/resume are never undo steps). While
+    paused, a non-host's state-changing command is REFUSED (not queued);
+    reads still run. Rule `pause_affects_hosts` (default off, user call):
+    when on, a host's state-changing command is HELD in the runtime
+    `Match.held_commands` (carried across undo, preserved by action
+    rollback) and the bot asks to unpause — `!match resume` runs them in
+    order through `dispatch_no_snapshot` (one undo entry with the resume),
+    skipping any whose author is no longer a host; `resume drop` discards.
+    Discord: `DiscordCtxWrapper.offer_resume` posts Resume & run / Cancel
+    buttons (`_ResumeView`; Cancel drops that one held command). "State-
+    changing" = effective access other than `all`, MINUS the host-only
+    reads in `_HOST_READS` (`!assert`, `!pending`, `!ent dump/diff`, bare
+    `!match`/`list`, `!map|list|state full`, ...) and undo `preview` —
+    `_pause_control`. A new host-only READ command must be added there or a
+    pause with the rule on will hold it.
+  - **`!again` (639)** — reruns the caller's last command in the channel
+    through a fresh top-level `run()` (gate, pause, undo, watchers).
+    Recorded in `CommandRegistry.run` only at the OUTERMOST level, tracked
+    with a `contextvars` depth (`_RUN_DEPTH`) so interleaved Discord tasks
+    don't see each other's depth; approvals / held commands don't overwrite
+    it; `!again` and `!as` are never remembered. Runtime-only
+    (`mgr._last_commands`, keyed by (channel, user)).
+  - **`!tile copy <x1> <y1> <x2> <y2> [move]` (640)** — copies a cell's
+    tile data (template link, glyph, block/opaque, hooks) over another,
+    replacing it; corpses stay on their own cells on both sides.
+  - **`zone_distance(eid, zone[, mode])` (641)** — body-to-nearest-zone-cell
+    gap, 0 when overlapping, None for a cell-less (suspended) zone.
+    **`entities_at(x, y)` (642)** — every alive unit whose body covers the
+    cell, stackable ones included (`cell_entity` names only the blocker);
+    glued parts and hidden riders left out; loopable. Both ARG_SAFE.
+  - **`on_turn_skipped` hook (643, 645)** — fires on the unit right after
+    the "turn skipped" line, before the turn moves on, binding
+    `skip_status` (the responsible statuses, sorted, comma-joined; new
+    HOOK_CONTEXT name). Also under ATB. FIX found with it:
+    `_skip_to_eligible` bounded its pass with a step count, which a removal
+    mid-pass broke both ways (pass-10 fixed the over-run); it now tracks the
+    ids it has looked at and stops on reaching one again (eligible units are
+    still taken even if seen), with a cap only against an order that keeps
+    growing. A skip handler removing the last unit used to end the pass with
+    "every entity is skippable" before reaching the unit that could act.
+  - **`round_start_message_format` rule (644)** — default "— Round {round}
+    —", printed by `!turn next` at each round start (round 1 included),
+    ahead of round-start hook output. Placeholders {round}, {match},
+    {match.<path>} (missing → empty); empty = no line. (Since
+    audit-pass-33 the "It is now X's turn" summary comes LAST in the reply,
+    after the round line and hook output.) No `{first unit}`
+    placeholder on purpose: the line goes to every channel, so it could name
+    a unit a fogged channel can't see.
+  - **Harness (96/97)** — see §2: `??` / `?!` reply checks and `--review`.
+
+- **Audit-pass-32 (hands-on, freshest code first): `!again` recursion +
+  `!ent hp` reply (scenarios 646-647).** Probes, the pass-30 chaos harness
+  extended with every new command (pause/resume with the host rule
+  toggled, `!again` / alias of it, `!cancel`, tile copy, hp forms, `!map
+  cell`, `!find count/ids`, the new formula functions, clone; plus a
+  "held commands only while paused" invariant — 48 seeds normal + hostile,
+  clean), the formula fuzzer over the new functions (clean) and the
+  command fuzzer over the touched roots (37.5k runs, clean). Fixes:
+  - **`!again` recursed until Python's stack limit (HIGH).** Inside a
+    batch / macro / foreach / `!run` file / action `cmd()`, the remembered
+    command is the one CONTAINING the `again` line, so it reran its
+    container forever (`!batch eval 1 ; again` → 💥). An alias of `again`
+    was remembered under the alias name, so `!ag` reran itself. Now:
+    `dispatch_no_snapshot` refuses `again` with a ❌; `run()` skips
+    remembering when the ALIAS-RESOLVED name is again/as; a contextvar
+    `_AGAIN_ACTIVE` refuses a replay that reaches `again` again (a name that
+    became an alias of `again` after it was stored); `again` is in
+    `_SELF_DISPATCHING_COMMANDS`. `_effective_access` returns `all` for
+    `again` regardless of overrides: gating it queued the bare word, and
+    approving that replayed the APPROVER's last command.
+  - **Clicks were recorded as typed commands.** A Discord Approve button
+    (via `run_approved_request`) and the Resume button ran `registry.run`
+    at depth 0, so the click became the clicker's `!again` command. Both
+    now raise `_RUN_DEPTH` to 1 first.
+  - **Held commands ran against the holder's CURRENT match.** `!match
+    resume` dispatched each held command in its channel, which might show
+    another match by then. The re-point logic of `run_approved_request` is
+    now the shared context manager `_channel_pointed_at(mgr, ch, mid)`,
+    used by approvals, resume, and the Discord Resume button.
+  - **`!ent hp` dropped hook output and deaths (pre-existing).** heal /
+    damage went through the hp property, which discards write_var's log,
+    so on_var passives fired silently (`!ent set_var` always showed them),
+    and a lethal set said nothing about the death. The handler now writes
+    once through `write_var`, appends the hook log, adds "`x` died." when
+    the unit left the match, and rebuilds the turn order on an alive/dead
+    flip the way heal_entity / damage_entity did. Also: a doubled sign
+    (`+-5`, `--5`) is refused, an integer amount is read exactly (no float
+    round trip for long numbers), and a zero change reads "hp unchanged".
+  - `!ent move` / group move: "Unexpected token" replies lacked the ❌.
+  - Verified clean: despawn-hook re-entrancy (`remove_entity(self)` /
+    `kill(self)` in an on_entity_despawned handler), tile copy with corpses
+    on both cells + undo, ATB prints no round line, POV of `!find
+    count/ids` / `!map cell` / `!whoami` / `!match info`, `!roll odds`
+    caps and edge specs, the skip loop.
+
+- **Audit-pass-33 (hands-on): all-or-nothing body spawns + input edges
+  (scenarios 648-650).** The pass-30 POV leak detector re-run over every
+  command added since (546k invocations, extended pool: `!map cell`
+  coordinates, `for=`, `count`/`ids`, preview shapes, `status:`/`team=`/
+  `near:` selectors) — no leak (two false hits: status DEFINITION names in
+  `!status list` are match-wide setup like rules, and `!whoami` request
+  ids that contained "999"). The full command fuzzer (98k runs, every
+  root), the chaos harness (normal + hostile) and the model-based undo
+  test were clean. Fixes:
+  - **Multi-unit spawns are transactional (HIGH, dangling/duplicate
+    class).** `copy_entity` (`!ent copy` / `transfer`) spawned the body
+    into the destination unit by unit, so a located part that couldn't be
+    placed left the parts before it there (a partial duplicate beside the
+    untouched source); and a transferred unit killed by its own
+    on_entity_despawned handler as it left lived on in the destination
+    beside its corpse. The destination is now snapshotted and restored in
+    place with `action._rollback_match` on any spawn failure, and when the
+    unit dies on the way out (a NEW corpse with its id) — copy_entity then
+    returns `(None, log)` and the command reports "died as it left".
+    `!ent clone` claimed all-or-nothing but validated only anchor cells;
+    a footprint / located-part / block refusal midway left the clones made
+    so far. It now rolls the match back the same way. The transferred copy
+    is the unit as it stood when the transfer began: writes a despawn
+    handler makes to the leaving unit don't carry.
+  - **Revive drops no limbs silently.** `revive_corpse` skipped a located
+    part whose stored cell was taken, losing it for good with no message.
+    It now uses transform's two-phase placement: parts that can return do,
+    then displaced located parts (and the sub-parts glued to them) go to
+    the nearest free cell with a ⚠️ line; dropped only when nothing fits,
+    and said so.
+  - **`_parse_scalar` (every `!ent set_var` / `!defvar` / `!team set`
+    value) kept `inf` / `nan` / `Infinity` / `1e999` as non-finite
+    floats** — a word became a number that poisons comparisons and sorts.
+    Non-finite parses now stay strings. `_coerce_vital_value` caught only
+    ValueError, so writing infinity to hp leaked "cannot convert float
+    infinity to integer"; it now reads as "must be a finite number".
+  - `!roll 1d6 1d6` joined into the malformed term `1d61d6` (the usage
+    line even advertised `<dice> [<dice> ...]`): adjacent terms with no
+    operator get a clear ❌, usage reads `<dice expression>`. `!roll odds`
+    counted the span `hi - lo + 1` as "possible totals" (an exploding d6
+    never totals 6); it counts reachable totals. The diff formatter
+    (`!history diff`, undo preview, `!ent diff`) printed a missing side as
+    `- 5` (read as minus five); it is now `5 -> (unset)`.
+  - **User calls at the end of the pass (scenarios 651-653):**
+    - **Formula changes show their output.** Every formula mutator
+      (`summon*`, `kill`, `revive`, `transform`/`revert`, `remove_entity`,
+      `mount`/`dismount`/`switch_slot`, `damage_part`/`damage_spread`,
+      push/pull/swap, `move_entity`/steps, status apply/dispel/transfer,
+      `emit`, `declare_winner`, and every var write / delete incl.
+      `entity[x].path = ...`) discarded the log its Match method returned, so
+      hook output and warnings from formula-driven changes never reached
+      chat. They now go through `Match.surface_log`: inside an action, into
+      its output buffer (shown on success, dropped with a rollback);
+      otherwise into `logic.FORMULA_LOG_SINK`, a CONTEXT VARIABLE each
+      `CommandRegistry.run` sets to a fresh list and shows at its end
+      (`dispatch_no_snapshot` flushes after every inner line, so batch /
+      macro output stays in order). A contextvar, not a per-match list: on
+      Discord each message is its own asyncio task, and a shared list drained
+      after a command could hand a host's hook lines (naming hidden units) to
+      a player's command that ran while the host's awaited a send. A nested
+      run (approval, `!again`) collects its own, so the lines land in its
+      channel. No sink and no buffer (no command running) = dropped.
+      NEW formula mutators must call `match.surface_log(<log>)`.
+    - **Glued parts leave the roster by default.** Rule `roster_glued_parts`
+      (bool, default False) + per-part `__roster_show` var (true/false, wins
+      for any part, glued or not); a glued part with its own turn-order slot
+      always lists (`Match.roster_shows`, used by `!list` / `!state`).
+      `!part list` still shows every part. CLAUDE.md had claimed glued parts
+      were hidden while the code listed them.
+    - **`!turn next` reads in order:** turn-end / round lines and hook
+      output first, "It is now X's turn" last.
+    - **`!match clone` starts unpaused** (`clone_match` clears `paused`).
+    - OPEN observation: an APPROVED player command runs in the requester's
+      channel, so whatever it prints (including hook output naming units the
+      requester's POV can't see) shows there. Pre-existing; formula output
+      now adds to it. The pass-30 leak detector skipped queued commands, so
+      approved replies were never checked.
+      (On hold at the user's request.)
+
+- **Audit-pass-34 (hands-on): undo vs system rules, command interleaving,
+  typo'd modes, unbounded areas (scenarios 654-662).** Two new harnesses
+  worth reusing: a **RELOAD DIFFERENTIAL** (play the same random commands on
+  a live manager and on a `save`/`load` copy taken mid-game, compare every
+  reply and the full state each step — catches runtime-only state that
+  changes behaviour; exclude the deliberately runtime-only queues: pending
+  requests, held commands, `!again`) and a **HUGE-NUMBER TIMING FUZZER**
+  (10⁹ / -10⁹ in every numeric position of every command and every
+  state-changing formula function, under a SIGALRM). Fixes:
+  - **Undo restored the snapshot's copy of `rules` (HIGH).** Undoing past a
+    `!system set` ran that match on the old rules while the system kept the
+    new ones, until a reload re-copied them. `_restore_snapshot` now
+    re-copies the rules from the match's GameSystem (as `MatchManager.load`
+    does), and a rules-only change is not an undo step
+    (`_differs_in_undo_state`, `_NOT_UNDO_STATE` = paused + rules).
+  - **Commands interleaved on Discord (HIGH).** Each message is its own
+    asyncio task and handlers await their replies, so a second command ran
+    inside the first: its changes landed in the first one's undo step
+    (`!undo command 1` reverted both while naming one) and a `!batch` was
+    not one unit. `CommandRegistry.run` holds a per-manager `asyncio.Lock`
+    (`_command_lock(mgr)`, runtime-only), re-entrant within a task through
+    the `_HOLDS_COMMAND_LOCK` context var (approvals, `!again`, held
+    commands run nested). (Since the server-workspace split each server has
+    its own manager, so its own lock: servers don't queue behind each other.)
+  - **`!store load` was not all-or-nothing (HIGH).** It replaced the matches
+    before parsing the systems, so loading a `!history export` file (no
+    systems) wiped every match and then reported the error. `load` now
+    builds everything into locals and commits at the end; a missing default
+    system is refused; channel pointers at matches the file lacks are
+    dropped. `!history import` names a whole-bot save and refuses a
+    snapshot whose state doesn't load.
+  - **A snapshot imported from ANOTHER match installed that match's id**
+    under this match's key (two matches reporting one id; this match's
+    approval requests resolved against the other). A foreign snapshot now
+    restores only the board: id, name, owner, co-hosts, access overrides
+    and bindings stay.
+  - **Typo'd modes were silently read as a default.** `_rect_gap` (behind
+    entities_within / nearest_entity / entities_in_area / `near:` /
+    `within:` / `!dist`) read any unknown metric as Chebyshev — scenario 569
+    had passed 'hostile' as entities_within's MODE (the relation is the
+    FOURTH argument; note nearest_entity takes relation SECOND — the two
+    orders differ) and passed with no filter. damage_spread split by weight
+    on an unknown mode; a part's misspelled `to_main_cap` passed hits
+    through uncapped. All refused now. `str` rules with `choices` are
+    checked by `!system set` (they stored anything); `!ent set_var` warns
+    on an engine-read var with fixed words (`_ENGINE_VAR_RULES`).
+  - **Rule values are bounded.** Int rule schemas carry `min` / `max` /
+    `unlimited` (-1 accepted), checked by `!system set` and shown by
+    `!system rules`: `formula_cell_limit -1` used to be accepted and then
+    refuse every sight line. The 16 formula-valued rules carry `"formula":
+    "expression"|"program"` and are validated when set (they fail open at
+    use: a typo'd visibility condition showed everything); a call to an
+    unknown function is stored with a warning (a `!func` may come later).
+    A NEW int or formula rule needs these schema keys.
+  - **Cell conditions:** `!tile set / line / fill`, template data and `!zone
+    set` warn when a `block` / `opaque` value is a broken formula;
+    `_eval_block_spec` / `_eval_opaque_spec` take an `errors` list, and
+    `!map cell ... for=<unit>` names each condition that failed at use and
+    counted as "no".
+  - **Output that was dropped:** damage_part discarded both hp writes' logs
+    (a boss killed through its head died without a line) and wrote the
+    part's hp on a detached object after that death removed it;
+    `source.<path> = ...` in an action body dropped its hook output
+    (SourceProxy); formula output now precedes the watcher poll, and `!turn
+    next` puts turn-hook formula output before whose turn it is
+    (`_take_formula_log`). Engine refusals inside a formula keep their own
+    message; "Runtime error:" is kept for raw Python errors.
+  - **Unbounded loops on user numbers:** `!reveal_fog` at/rect/around,
+    `!tile fill` and `zone_fill_rect` walked the whole rectangle before
+    keeping the on-grid part (a far corner hung the bot) — now clipped while
+    built (`_grid_box`); `!tile line` checks formula_cell_limit;
+    `_find_free_cell_near` stops at the farthest grid corner; damage_spread
+    fragments are capped by formula_loop_limit. Also refused: step counts
+    below 1 (`!ent move a 0 right` moved one step), a negative reveal
+    radius, `turns=` below 1, negative status level / duration.
+  - Verified clean: 40 reload-differential seeds, the POV leak detector
+    (546k runs, only the two known false hits), the model-based undo test,
+    chaos (normal + hostile), both huge-number fuzzers, the command fuzzer
+    on every touched root, and the prose-quote check (every double-quoted
+    ❌/⚠ reply in Expected prose appears in the actual output).
+
+- **Audit-pass-35 (hands-on): object aliasing, reload/parity differentials,
+  four user calls (scenarios 663-670).** Two more reusable harnesses: the
+  reload differential EXTENDED with formula commands that move dicts between
+  units / teams / match vars / tiles (it reproduces the aliasing bug on the
+  old code), and a COMMAND-VS-FORMULA PARITY harness (each operation run as
+  `!command` and as its formula function on identical boards from several
+  starting states; end states compared). Also a POV consistency check
+  (`!list` vs `!find ids` vs `!ent info` under a fogged team view). Fixes:
+  - **Stores shared objects (HIGH).** `entity[a].inv = entity[b].inv` /
+    var_set(var_get(...)) / team_set / match_var_set / tile_set / zone_set /
+    status_set stored the SAME dict, so a write to one changed the other
+    with none of its hooks or clamps, and a save/load split them.
+    `logic._own_value` deep-copies at every store, makes dict keys strings
+    (`{1: 5}` was unreachable by the path `d.1` until a reload) and stores
+    tuples as lists.
+  - **Coordinates are lists (user call).** See the coord-return entry: a
+    tuple-returning function's result went into a var as a tuple and came
+    back from a reload as a list, so equality / `in` flipped.
+    `formula._listify` wraps every built-in function's result
+    (`_TUPLE_FREE_FUNCS`), the arith guard transformer compiles tuple VALUES
+    as lists (loop targets and dict keys keep tuples). Output shows [3, 3].
+  - **`move_step` teleported** (e.tp): no facing change, block_tp instead of
+    block_walk, no on_entity_step, a snake head left its body behind, and a
+    wall raised where the docs promise False. Now `move_dirs([(dir, 1)])`.
+    The parity harness found it; every other pair (tp, hp, kill, revive,
+    status apply/force/transfer/dispel/counter, mount/dismount, remove,
+    push/pull/swap, face, team/tile/zone writes, transform/revert, aura
+    anchor, var delete) matched.
+  - **Own-team view (user call → rule `pov_own_team_visible`, default on).**
+    `!list` dropped a team's own hidden passenger (entity_visible_to) while
+    `!turn` / `!find` / `!ent info` kept it (_pov_hides); and the map applied
+    entity_visibility_condition to a team's own units while the roster
+    didn't. `Match.own_team_unit` now makes entity_visible_to true for the
+    viewer's own units (root-body team) — map, scene, roster and queries
+    agree; a hidden rider is listed but not drawn. Off = own units follow
+    fog and the condition everywhere.
+  - **Nested writes under a value are refused everywhere (user call).** `k.x`
+    while k = 5 replaced the 5 in unit vars / team data / match vars but was
+    refused in tiles / zones / statuses; `check_no_value_ancestor` refuses
+    it in every store.
+  - **`rounding_mode` rule (user call, default half_up).** damage_part's
+    to-main share and transform's percent hp used round() (halves to even:
+    50% of 5 -> 2). `Match.round_by_rule` on exact Fractions; half_up /
+    half_even / floor / ceil. The formula round() is unchanged.
+  - **Dotted paths with an empty segment** (`.lead`, `trail.`,
+    `inventory..sword`) created keys named "" — refused by
+    `check_store_path` in every store, `!defvar add` and template data.
+  - **The bot never pings:** bot.py builds the bot with
+    `AllowedMentions.none()` (replies echo unit names and typed arguments,
+    so `@everyone` / `<@id>` text pinged the server).
+  - **A loaded match always has every rule:** `Match.from_dict` overlays the
+    snapshot's rules on DEFAULT_SYSTEM_SETTINGS (12 `rules.get(key, x)`
+    fallbacks disagree with the registry; defensive, today's restore/load
+    paths re-copy rules from the system anyway).
+  - Verified clean: the command lock can't be inherited by a spawned task
+    (only `to_thread` rendering is spawned); the Discord adapter path with
+    two concurrent messages (stub bot, discord.py 2.7.1); the POV leak
+    detector (546k runs, only the known false hits); the full command fuzzer
+    (98k runs; 4 hits are `!eval` formulas subtracting from a string); the
+    huge-number fuzzers; chaos normal + hostile; the reload differential.
+
+- **Audit-pass-36 (hands-on): wholesale var writes, stray words, a hidden
+  NameError (scenarios 671-677).** Reusable harnesses: a STORE FUZZER (every
+  read-only formula function's result written into a var, then JSON round
+  trip and equality checked — clean), a STRAY-WORD DETECTOR (every scenario
+  command re-run with an extra word appended; reports replies that are not
+  errors and don't mention it — 181 command shapes before, 10 after, all
+  variadic by design), and `pyflakes` (pip-installable; caught nothing new
+  after the fix below, run it after edits to error paths). Fixes:
+  - **Wholesale var writes skipped the write_var checks (HIGH).** Spawn
+    (summon templates, part / segment templates) and transform set a unit's
+    vars wholesale: a template `hp: 'abc'` made a unit that 💥'd `!list`, and
+    a template var `x` / `name` made a var the engine can't reach.
+    `logic.checked_unit_vars` (vital vars coerced to whole numbers or
+    refused, reserved names refused, own copy with string keys) runs in
+    `Entity.spawn` and `apply_statblock`; a transform checks BEFORE dropping
+    the old parts, and refuses a form with no hp. Skipped template parts /
+    segments now log a ⚠️ line. `!defvar add` refuses a non-number vital
+    default.
+  - **Status `level` / `duration` are number fields.** `!ent status a set
+    burn level abc` was stored and the next `!status apply` 💥'd.
+    `logic.checked_status_value` guards `!ent status set`, `!status data`
+    and status_set; stacking keeps a float level (add_level used int()); a
+    counter on a text field reports it (it read as 0 and removed the
+    status). `!ent status ... add <name> <extra>` is refused.
+  - **revive / transform / revert formula errors were a NameError (MED).**
+    Their `except (VTTError, NotFound, OutOfBounds, Occupied)` named two
+    classes formula.py never imported, so EVERY failure read "name
+    'OutOfBounds' is not defined". Now `except VTTError`.
+  - **Footprint (user call → refuse if it doesn't fit).** `!ent set_var a
+    footprint_w 3` grew a over its neighbour (which vanished from the map)
+    or off the grid, and `footprint_w 30000` hung the bot for every guild
+    (every cell walk built 9*10^8 cells). `Match.check_body_fits` (only
+    newly covered cells; glued / region parts and riders skipped) runs on a
+    footprint write in write_var and on transform; `_cap_footprint` reads a
+    side as at most grid side + 1.
+  - **Negative part damage (user call → refuse).** See the locational-damage
+    entry; also a text / infinite `to_main_percent` gives a clean message
+    (was a raw Python error) and `absolute:<n>` needs n >= 0 (a negative cap
+    healed the body on every hit). The destroyed-latch clear + aura resume
+    moved from damage_part's heal branch to write_var (a plain hp write
+    never cleared it).
+  - **Stray words (user call → central check).** See §2 "Usage strings are
+    authoritative". Annotated every unannotated subcommand (`!map` ×17,
+    `!status` ×19, `!part`, `!table`, `!team`, `!watch`, `!macro`, `!mod`,
+    ent copy/transfer, match win/outcome, tile line/fill, zone
+    anchor/unanchor/sprite), rewrote ambiguous usages (`!reveal_fog`,
+    `!ent status`, `!ent group`, `!system alias`, `!dist`, `!roll`), and
+    added handler checks where an optional slot took any word: `!undo
+    command zz` undid one command, `!ent copy a m 4` dropped the x, `!watch
+    add ... onec` made a repeating watcher. Four scenario lines were
+    themselves malformed (572 `!defvar add default ...`, 212, 569) and are
+    fixed. `!map scene full` now works (it read only args[0]) and is
+    host-only.
+  - OPEN (user: decide later): status_counter_add on a missing (∞) duration
+    removes the status — see the status-counters entry.
+
+- **String helpers, coordinate rulers, mount/status follow-ups, `!ent
+  set_vars` — SHIPPED (scenarios 678-684).** Ideas #3, #4, #81 and two parts
+  of #14 from the 2026-10 idea list. The other #14 parts: edge-aware boarding
+  REJECTED (see the mounts entry), configurable side names and per-type
+  `to_main_percent` deferred.
+  - **String helpers (678-679):** `upper`, `lower`, `strip`, `startswith`,
+    `endswith`, `split(text, sep=None)`, `join(list, sep="")`, `replace(text,
+    old, new)` and `fmt(template, a, b, ..., name=value)`. Pure
+    `_ALLOWED_FUNCS`, so usable in `$()`. `fmt` parses its own fields: only
+    `{0}` / `{name}` with a short spec (`_FMT_SPEC`: align, sign, width up to 3
+    digits, precision up to 2, a type letter), because Python's str.format
+    resolves `{0.attr}` / `{0[k]}` and would reach into objects. `replace`,
+    `join` and `fmt` size their result before building it
+    (formula_size_limit; the namespace binds the match's value). fmt's
+    internal size parameter is `_limit`, so a template field `{limit}` works.
+  - **Coordinate rulers (680; user call: default ON).** Rule `map_coords`
+    (bool, default True) + per-match `Match.map_coords` (None = rule;
+    serialized; `!map coords on|off|clear`, host-gated via ELEVATED_ARGS) +
+    one-off `!map coords=on|off`. ASCII (`Match._ascii_rulers`, in
+    `render_ascii(coords=None)` → `coords_on()`): column numbers with their
+    digits STACKED top to bottom (column 12 = 1 over 2), so every cell stays
+    one character wide, and row numbers right-aligned in a left margin;
+    1-based and viewport-aware. Graphics: the scene model carries `coords`;
+    `SceneRenderer._add_rulers` draws whole numbers in a top/left margin
+    (`ruler_margin`), and `scene_dims` counts the margins so `fit_cell_size`
+    still fits the pixel budget. Discord: the viewport default dropped from 30 to 28 (user
+    call) so a full window with rulers fits one message (~1860 characters;
+    30x30 is ~2100, over the 2000 cap). A larger window still fits through
+    the fallbacks: the auto-update board drops the rulers
+    first (then color, then legend), and a plain `!map` on a surface with
+    `ctx.message_limit` (Discord sets it) leaves them out with a note instead of
+    splitting the map. An explicit `coords=on` is kept as asked.
+  - **Mounted rider re-check on transform (682).** `apply_statblock` runs
+    `can_mount` with the NEW vars for a mounted rider (slot `condition` and
+    capacity share); `transform_rider_mismatch_mode` decides a misfit:
+    `block` refuses before any change; `eject` picks the drop cell for the new
+    body up front (refusing if none fits) and dismounts right after the swap,
+    so a refused transform never leaves the rider dismounted.
+  - **`status_transfer` keeps instance data (683).** See the dispel/transfer
+    entry.
+  - **`!ent set_vars <id> key=value ... [bypass_clamp=yes]` (684).** One
+    command and one undo step, applied in order, all-or-nothing through
+    `action._rollback_match` (a refused write sets nothing); `$()` values
+    resolve with self = the unit; duplicate keys refused; group targets
+    accepted. `_has_inline_token` now also counts `key=$(...)` for the
+    inline_args_access rule.
+  - **Two pre-existing bugs found while testing (681):** a FUNCTION used as a
+    value (`entity[a].f = min`) was stored as-is, which made the match
+    unsaveable and crashed `!ent dump` — `_own_value` (every store) now
+    refuses anything but numbers, text, bools, None, lists and dicts. And the
+    failed-save reply printed the host's absolute path; saves and history
+    exports now go through `logic.write_json_file` (build the JSON, write a
+    temp file beside the target, `os.replace`), so a failure can't truncate
+    the previous save, and the error names only `saves/<name>`.
+  - The `!map scene` summary shows `coords=on|off`.
+
+- **Container reads, flanking, nearest_cell, visible_entities, `!batch
+  strict`, selector `!` / `|`, random cells — SHIPPED (scenarios 685-697).**
+  Ideas #99-#103, #106, #109, #110 from the 2026-10 small list.
+  - **`random_cell(zone | x1, y1, x2, y2)` / `random_free_cell(zone | x1, y1,
+    x2, y2[, eid], fit='body')` (696-697).** Match RNG (random_seed, choose()
+    replay); [x, y] or None. A rectangle is clipped to the map and charged to
+    formula_cell_limit. random_free_cell returns an ANCHOR where the unit
+    passes the free_cell_near test (`Match._can_stand_at`, factored out of
+    free_cell_near: body on the map, no other unit, not cell_blocks).
+    `fit` (user call: an argument, default whole body) says how a multi-tile
+    body sits in the area: `body` (every cell inside), `center` (centre cell,
+    floored like entity_center), `any` (one cell), `anchor` (top-left cell).
+    Without eid: a random empty cell of the area. Core
+    `Match.free_anchors_in_area(area, e, fit, limit)`; candidates sorted so a
+    seeded pick reproduces; candidates × body size is charged to the limit.
+  - **`get(container, key[, default])` (685-686).** Subscripts are banned, so a
+    list or dict held in a local or read with var_get couldn't be read one
+    element at a time. `key` is a dict key, a list index (-1 = last) or a
+    dotted path ('a.1.b'; user call); a number key reads a dict's text key (dict
+    keys are text since pass-35). Missing → default, else an error (like
+    var_get). Pure `_ALLOWED_FUNCS`.
+  - **`keys(dict)` / `values(dict)` / `index_of(list, value)` /
+    `unique(list)`.** keys / values in insertion order; index_of returns None
+    when absent (user call: -1 would read as the last item in get); unique keeps
+    first positions, compares with == (lists / dicts by content via JSON).
+    keys / values / unique are loopable. Pure.
+  - **Flanking (687-688; user call: both variants + a mode rule).**
+    `flanking_angle(target, a, b[, min_angle])`: seen from the target's body
+    centre, the bearings to a's and b's body centres are at least
+    `flanking_min_angle` (rule, default 135, 0-180) apart; for a multi-tile
+    target the bearings are scaled by its half-extents like side_hit (the
+    side_hit_hitbox_mode rule). `flanking_line(target, a, b)`: the D&D rule —
+    the segment between a's and b's centres crosses the target's body through
+    two OPPOSITE sides or corners (exact: doubled coordinates + Fractions,
+    Liang-Barsky clip, then the entry/exit sides compared). A line clipping one
+    corner or touching one point doesn't flank. `flanking(target, a, b[,
+    mode])` uses the `flanking_mode` rule (angle default | line). A unit paired
+    with itself or the target never flanks; range is the GM's own check.
+  - **`nearest_cell(eid, x, y | coord | other_eid)` (689)** — the unit's body
+    cell nearest the point (or any cell of another body), by straight-line
+    distance, ties to the first cell row by row. Where a big body's breath /
+    shot starts.
+  - **`visible_entities(eid[, relation])` (690-691)** — loopable ids the unit
+    sees now, nearest first then id: some cell of the other body within its
+    vision radius with LOS from some cell of its own body (fog toggles
+    ignored, like can_see), MINUS units `entity_visibility_condition` hides
+    from the viewer's team (user call), except its own team's units
+    (pov_own_team_visible). A viewer with no team skips the stealth rule. Same
+    skip surface as entities_within (glued parts, hidden riders). Core:
+    `Match.unit_sees_unit(viewer, other, budget)`. Every sight line walked is
+    charged against formula_cell_limit for the whole call: a 40×40 viewer and
+    25 unseen 20×20 bodies used to walk ~40M lines (minutes); now a clean
+    error in under a second.
+  - **`!batch strict ...` (692-693; user call: stop AND undo).** The first
+    line whose reply has a line starting with ❌ (or a failed `!assert`) stops
+    the batch and undoes the lines before it: every match is restored in place
+    with `_rollback_match` (undo history kept), matches the batch created are
+    removed, a deleted one comes back from its snapshot (without its undo
+    history), channel pointers are restored, and rules are re-copied from the
+    systems. Bot-wide settings a line changed (`!system`, `!defvar`, ...) are
+    NOT undone. Detection wraps the ctx in `_ErrorWatchCtx` (sends pass
+    through; attribute writes reach the real ctx, so `!as` lines work); a
+    nested strict batch's ❌ reaches the outer one too. A rolled-back strict
+    batch leaves no undo step.
+  - **Selector `!` / `|` in `!find` / `!foreach` (694-695).** A leading `!`
+    negates the whole word (`!status:stunned`; `!team=red` also matches a unit
+    with no team, `team!=red` needs one); `|` separates alternatives, any of
+    which may match. An alternative that doesn't parse as a predicate reuses
+    the previous one's kind and key (user call): `team=red|green`,
+    `status:burn|poison`, `near:a:1|d:0`. `!` inside a word, an empty
+    alternative or a bare `!` is refused. `_parse_find_selector` →
+    `(negated, alternatives)`; `_find_match_entity` takes those groups,
+    `_find_all_preds` is the old single-predicate body. The POV filter runs
+    first, so a negated selector can't surface a hidden unit.
+
+- **Server workspaces + `!map ent_sight` — SHIPPED (scenarios 698-703).**
+  - **Workspace split** — see §3 "Server workspaces" for the shape. Mechanics:
+    `MatchManager(guild_key)` + `guild_name` / `workspaces` backref;
+    `logic.Workspaces` (`get` creates, `peek` doesn't, `items`, `owner_ids`);
+    `wire_commands(bot, workspaces)` with `_workspace(ctx)` per command,
+    `DM_REFUSAL`, `_load_owners` on `on_ready`; boards carry their
+    `workspace` key and `_refresh_boards_for_match` only touches its own
+    server's boards (match ids repeat across servers, so a refresh in one
+    server used to be able to retire another's board). Per-server saves via
+    `saves_path(name, mgr)`. `!system default server|channel` (no `global`,
+    no per-server map). `!match` / `!match list` player-available. New
+    `!owner servers`, `!as server <key>` (CLI / harness), `!whoami` shows
+    bot owner + server workspace. Unknown gamerules in a loaded system are
+    dropped with a console note.
+  - **`!map ent_sight <eid> [color=] [opacity=]` (701-703).** The cells one
+    unit sees right now — `Match.unit_sight_cells`: within its vision radius
+    of some body cell with a clear line from that cell (range + LOS, fog
+    toggles ignored, like can_see; a multi-tile body sees from every cell) —
+    marked like `!map preview` (shared `_show_marked_map` / `_mark_style`:
+    ASCII preview_glyph, graphics highlights) and the units it sees (minus
+    the stealth rule from its own team, as visible_entities). Under a team
+    POV a non-host may ask about their own team's units only (root body's
+    team), a hidden unit reads as missing, and marks are cut to cells the
+    POV terrain-sees (a sight shape drawn over fog would trace hidden walls);
+    hosts may ask about any unit, still under the channel POV. Work (one per
+    range check + each sight line's length) is capped by the new
+    `sight_check_limit` rule (default 1000000 ≈ 1 s, max 10000000): the
+    event loop is shared by every server.
+  - **Struck ideas (user, 2026-10):** small #7 (composable, see §1), medium
+    #156, large #44 hex grid (§1: square grid is fundamental), large #45
+    translation. Nested maps per match: wanted, later.
 
 For context on the latest design conversations and rationale, read the
 descriptions of the most recently merged PRs on the repo (they're dense

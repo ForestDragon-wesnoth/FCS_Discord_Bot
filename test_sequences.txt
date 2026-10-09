@@ -17,9 +17,9 @@ SCENARIO 1 — Setup, formulas, and inline $() substitution
 !eval "entity[rogue].hp + entity[hero].hp"
 !eval "min(entity[hero].hp, entity[rogue].hp)"
 !ent set_var hero regen 7
-!ent hp hero "$(entity[this].hp * -1 + 5)"
+!ent hp hero "+$(entity[this].hp * -1 + 5)"
 !eval "entity[hero].hp"
-!ent hp hero "$(entity[self].regen)"
+!ent hp hero "+$(entity[self].regen)"
 !eval "entity[hero].hp"
 
 Expected: list shows two entities, Rogue first (initiative 20 beats Hero's 10, so
@@ -211,7 +211,7 @@ SCENARIO 9 — Error handling sanity checks
 !eval "entity[ghost].hp"
 !eval "[x for x in range(3)]"
 !eval "__import__('os')"
-!ent hp self 5
+!ent hp self +5
 !passive add hero bad on_lunch_break "entity[self].hp = 1"
 !passive add hero bad on_turn_start "entity[self].x[0]"
 !passive add ghost x on_turn_start "1"
@@ -254,7 +254,7 @@ SCENARIO 10 — Conditional flow in formulas (if/elif/else, ternary)
 !eval "entity[hero].hp"
 !ent set_var hero blessed 1
 !ent set_var hero hp 10
-!ent hp hero "$(15 if entity[self].blessed else 5)"
+!ent hp hero "+$(15 if entity[self].blessed else 5)"
 !eval "entity[hero].hp"
 
 Expected: ternary returns 5; first if/else hits then-branch (stamina 5 ->
@@ -456,7 +456,7 @@ SCENARIO 20 — Property setters route through chokepoint (no more limitation)
 !passive add hero hp_audit on_var_changed target=hp scope=exact "entity[self].hp_audit_log = entity[self].hp_audit_log + \"|\" + str(old_value) + \"->\" + str(new_value)"
 !ent set_var hero hp_audit_log start
 !ent hp hero -5
-!ent hp hero 10
+!ent hp hero +10
 !ent hp hero -8
 !eval "entity[hero].hp_audit_log"
 
@@ -474,13 +474,13 @@ SCENARIO 21 — Default soft clamp on hp via max_hp
 !match use m21
 !ent add hero Hero 30 4 4 10
 !ent set_var hero hp 10
-!ent hp hero 100
+!ent hp hero +100
 !ent info hero
 !ent set_var hero hp 50
 !ent set_var hero hp 80
 
 Expected: Hero starts at hp=30/30. After !ent set_var hp 10, hp=10. The
-huge heal !ent hp hero 100 raises hp from 10 toward 110 but the default
+huge heal !ent hp hero +100 raises hp from 10 toward 110 but the default
 soft clamp engages (crossing from below max_hp=30), so hp lands at 30.
 Then setting hp directly to 50 puts hp above max (since soft is dormant
 when not crossing from below — but setting 50 is a write from below the
@@ -495,7 +495,7 @@ SCENARIO 22 — Bypass clamp for overheal
 !match use m22
 !ent add hero Hero 30 4 4 10
 !ent set_var hero hp 10
-!ent hp hero 100 bypass_clamp=yes
+!ent hp hero +100 bypass_clamp=yes
 !ent info hero
 !ent set_var hero hp 999 bypass_clamp=yes
 !ent info hero
@@ -551,9 +551,9 @@ SCENARIO 25 — Overheal tracking passive via was_clamped/intended_value
 !ent set_var hero hp 5
 !ent set_var hero overheal_log 0
 !passive add hero overheal_track on_var_changed target=hp scope=exact "entity[self].overheal_log = entity[self].overheal_log + (intended_value - new_value) if was_clamped else entity[self].overheal_log"
-!ent hp hero 100
+!ent hp hero +100
 !ent info hero
-!ent hp hero 50
+!ent hp hero +50
 
 Expected: Hero hp goes from 5 toward 105 but clamps at max_hp=30, so the
 overheal passive sees intended_value=105, new_value=30, was_clamped=True
@@ -587,7 +587,7 @@ Stage A: on_var_changed catches heal-from-below clamping
 !ent set_var hero overheal_changed 0
 !passive add hero track_changed on_var_changed target=hp scope=exact "entity[self].overheal_changed = entity[self].overheal_changed + (intended_value - new_value) if was_clamped else entity[self].overheal_changed"
 !ent set_var hero hp 5
-!ent hp hero 100
+!ent hp hero +100
 !ent info hero
 
 Result: hp goes from 5 toward 105 but the default soft clamp engages at
@@ -597,7 +597,7 @@ just the existing hooks.
 
 Stage B: the gap — heal at full HP produces NO on_var_changed event
 
-!ent hp hero 50
+!ent hp hero +50
 !ent info hero
 
 Result: hp stays at 30 (already at cap, soft clamp dormant from below
@@ -611,9 +611,9 @@ Stage C: on_var_write_attempt closes the gap
 !ent set_var hero overheal_attempt 0
 !passive add hero track_attempt on_var_write_attempt target=hp scope=exact "entity[self].overheal_attempt = entity[self].overheal_attempt + (intended_value - new_value) if intended_value > new_value else entity[self].overheal_attempt"
 !ent set_var hero hp 5
-!ent hp hero 100
+!ent hp hero +100
 !ent info hero
-!ent hp hero 50
+!ent hp hero +50
 !ent info hero
 !eval "entity[hero].overheal_attempt"
 !eval "entity[hero].overheal_changed"
@@ -646,7 +646,7 @@ SCENARIO 27 — on_var_write_attempt fires on bypassed writes
 !ent set_var hero attempt_log ""
 !passive add hero audit on_var_write_attempt target=hp scope=exact "entity[self].attempt_log = entity[self].attempt_log + \"|\" + str(intended_value) + \"->\" + str(new_value)"
 !ent set_var hero hp 25
-!ent hp hero 100 bypass_clamp=yes
+!ent hp hero +100 bypass_clamp=yes
 !ent set_var hero hp 5
 !ent info hero
 
@@ -1038,9 +1038,9 @@ SCENARIO 50 — Reading and writing inside formulas via $(...)
 !match use sub50
 !ent add hero Hero 30 3 3 10
 !ent set_var hero strength 8
-!ent hp hero "$(entity[this].strength * -2)"
+!ent hp hero "+$(entity[this].strength * -2)"
 !ent info hero
-!ent hp hero "$(entity[this].strength)"
+!ent hp hero "+$(entity[this].strength)"
 !ent info hero
 
 Expected: First $() evaluates to strength*-2 = -16, applied as damage
@@ -1411,7 +1411,7 @@ SCENARIO 68 — Berserker: damage output scales with missing HP
 
 Expected: Damage formula evaluates to base + missing_hp/5 = 5 + 24/5 =
 5 + 4 = 9. At full HP it would be 5; at 6 HP it's 9. Use the result
-as a damage value: !ent hp foe "$(...)".
+as a damage value: !ent hp foe "+$(...)".
 
 
 SCENARIO 69 — Phase transition: boss changes state below 50% hp
@@ -1665,7 +1665,7 @@ SCENARIO 80 — Resistance: damage multiplier based on type
 
 Expected: Hero has 50% fire resistance and 0% ice resistance. Computed
 damage: fire 20 * 50/100 = 10, ice 20 * 100/100 = 20. Apply via
-!ent hp hero "$(...)" with the appropriate calculation.
+!ent hp hero "+$(...)" with the appropriate calculation.
 
 
 SCENARIO 81 — Counter-attack: when you dodge, you hit back
@@ -1798,9 +1798,9 @@ SCENARIO 87 — Use intended_value to validate writes that would have been waste
 !ent set_var hero wasted_heal_log 0
 !passive add hero heal_audit on_var_write_attempt target=hp scope=exact "if intended_value > old_value and intended_value > new_value:\n    entity[self].wasted_heal_log = entity[self].wasted_heal_log + (intended_value - new_value)"
 !ent set_var hero hp 25
-!ent hp hero 100
+!ent hp hero +100
 !ent info hero
-!ent hp hero 30
+!ent hp hero +30
 
 Expected: First heal: intended=125, new=30, wasted=95. Counter += 95.
 Second heal at full: intended=60, new=30, wasted=30. Counter += 30.
@@ -1838,8 +1838,8 @@ SCENARIO 89 — Was_clamped flag distinguishes natural changes from clamped ones
 !ent set_var hero clamped_count 0
 !ent set_var hero unclamped_count 0
 !passive add hero distinguish on_var_changed target=hp scope=exact "if was_clamped:\n    entity[self].clamped_count = entity[self].clamped_count + 1\nelse:\n    entity[self].unclamped_count = entity[self].unclamped_count + 1"
-!ent hp hero 3
-!ent hp hero 100
+!ent hp hero +3
+!ent hp hero +100
 !ent hp hero -10
 !ent info hero
 
@@ -1950,7 +1950,7 @@ SCENARIO 95 — Bypass clamp for overheal scaling
 !match use oh95
 !ent add hero Hero 30 3 3 10
 !ent set_var hero hp 25
-!ent hp hero 50 bypass_clamp=yes
+!ent hp hero +50 bypass_clamp=yes
 !ent info hero
 
 Expected: Heal 25→75, bypassing the max_hp=30 clamp. Useful for
@@ -1984,7 +1984,7 @@ SCENARIO 97 — Removing the default hp clamp lets hp go free
 !match use free97
 !ent add hero Hero 30 3 3 10
 !gclamp remove hp
-!ent hp hero 100
+!ent hp hero +100
 !ent info hero
 !gclamp add hp max=max_hp mode=soft
 
@@ -2247,7 +2247,7 @@ SCENARIO 112 — $() with self binding
 !match use arg112
 !ent add hero Hero 30 3 3 10
 !ent set_var hero atk 8
-!ent hp hero "$(entity[self].atk * -1)"
+!ent hp hero "+$(entity[self].atk * -1)"
 !ent info hero
 
 Expected: $() evaluates with self=hero (the entity in arg[1] of !ent hp).
@@ -2263,7 +2263,7 @@ SCENARIO 113 — $() with this binding (current-turn entity)
 !ent add foe Foe 25 5 5 20
 !turn next
 !ent set_var foe weapon_dmg 12
-!ent hp hero "$(entity[this].weapon_dmg * -1)"
+!ent hp hero "+$(entity[this].weapon_dmg * -1)"
 !ent info hero
 
 Expected: Foe is current (init=20). $() resolves this=foe. Foe's
@@ -2290,10 +2290,10 @@ SCENARIO 115 — Conditional damage via $()
 !match use arg115
 !ent add hero Hero 30 3 3 10
 !ent set_var hero dodging 0
-!ent hp hero "$(0 if entity[self].dodging else -10)"
+!ent hp hero "+$(0 if entity[self].dodging else -10)"
 !ent info hero
 !ent set_var hero dodging 1
-!ent hp hero "$(0 if entity[self].dodging else -10)"
+!ent hp hero "+$(0 if entity[self].dodging else -10)"
 !ent info hero
 
 Expected: First hit: dodging=0, takes -10, hp 30→20. Second hit:
@@ -2439,7 +2439,7 @@ SCENARIO 125 — Self unbound at command level
 !match new self125 SelfUnbound 6 6
 !match use self125
 !ent add hero Hero 30 3 3 10
-!ent hp self 5
+!ent hp self +5
 !eval "entity[self].hp"
 
 Expected: Both fail. `self` is only bound inside passive formulas and
@@ -2562,7 +2562,7 @@ SCENARIO 132 — Counter-attack damage based on enemy's missing HP
 !ent add foe Foe 100 5 5 20
 !turn next
 !ent set_var foe hp 20
-!ent hp hero "$((entity[this].max_hp - entity[this].hp) // 5)"
+!ent hp hero "+$((entity[this].max_hp - entity[this].hp) // 5)"
 !ent info hero
 
 Expected: Foe (this) is at 20/100, missing 80. Execute heal scales with
@@ -2666,7 +2666,7 @@ SCENARIO 137 — Cumulative damage tracker (lifetime stat)
 !passive add hero track_damage on_var_changed target=hp scope=exact "if new_value < old_value:\n    entity[self].damage_taken_lifetime = entity[self].damage_taken_lifetime + (old_value - new_value)"
 !ent hp hero -5
 !ent hp hero -8
-!ent hp hero 3
+!ent hp hero +3
 !ent hp hero -10
 !ent info hero
 
@@ -3021,7 +3021,7 @@ SCENARIO 154 — Multiple matching var passives all fire on one event
 !passive add hero count_changes on_var_changed target=hp scope=exact "entity[self].hp_changes = entity[self].hp_changes + 1"
 !passive add hero count_writes on_var_written target=hp scope=exact "entity[self].written_events = entity[self].written_events + 1"
 !ent hp hero -5
-!ent hp hero 3
+!ent hp hero +3
 !ent info hero
 
 Expected: hp_changes=2 (both writes produced changes), written_events=2
@@ -3220,7 +3220,7 @@ SCENARIO 162 — Iterating !ent subcommands across a group
 !ent face group:mooks down
 !ent info group:mooks
 !ent group new ghosts
-!ent hp group:ghosts 5
+!ent hp group:ghosts +5
 
 Expected: '!ent hp group:mooks -5' damages each of a, b, c by 5
 (three separate ack lines, one per member). 'set_var group:mooks
@@ -4923,7 +4923,7 @@ SCENARIO 212 — !tile place_area: corners off-grid → all-or-nothing failure
 !tile place_area flame 2 2 4 4
 !tile place_area flame 3 3 9 4
 !tile find flame
-!tile place_area flame missing 1 1 2 2
+!tile place_area missing 1 1 2 2
 
 Expected: An off-grid corner is rejected BEFORE any placement
 happens — the engine validates the rectangle against the grid
@@ -5359,7 +5359,7 @@ SCENARIO 226 — cells_in_burst: area shapes by distance mode
 
 Expected: `cells_in_burst(x, y, r, mode)` returns every cell
 within distance r of (x,y) INCLUDING the center, as a list of
-(x,y) tuples. The shape depends on the metric: with the default
+[x, y] pairs (coordinates are lists in formulas). The shape depends on the metric: with the default
 square_radius (Chebyshev), r=1 is the 3x3 block = 9 cells; r=0 is
 just the center = 1 cell. Manhattan r=1 is a plus/diamond = 5
 cells (center + 4 orthogonal neighbors). Euclidean r=2 is a disc
@@ -6553,7 +6553,7 @@ SCENARIO 260 — move_entity / move_step from formulas
 
 Expected: `move_entity(eid, x, y)` teleports the entity with full
 tp() semantics (bounds + occupancy validated, tile hooks +
-on_entity_moved fire). Returns (x, y) on success; raises
+on_entity_moved fire). Returns [x, y] on success; raises
 FormulaError on validation failure.
 
 `move_step(eid, direction)` is the single-cell-toward-a-direction
@@ -6566,10 +6566,8 @@ Trace: move_entity to (5,5) succeeds → a at (5,5), moves = 1
 move_step right → would land on (7,5) but b is there → False,
 a still at (6,5), moves still 2. After tp a 8 5 (the grid edge),
 move_step right → False (off-grid), a unchanged. After tp a 6 5,
-move_step right → True, lands on (7,5) — wait, b is there. So
-False. The point: move_step honors the same bounds/occupancy
-rules !ent move does, and is observationally identical (tile
-hooks fire, on_entity_moved fires) when the step succeeds.
+move_step right → False again: (7,5) is b's cell. move_step is a
+one-cell walk, the same as `!ent move <id> 1 <dir>` (see 665).
 
 
 SCENARIO 261 — Composition: status event triggers cleanup passive
@@ -6628,7 +6626,7 @@ SCENARIO 262 — !alias define / list / info / use / overwrite / delete
 !alias info dmg
 !dmg -5
 !ent dump hero
-!heal 7
+!heal +7
 !ent dump hero
 !alias def dmg "ent set_var this"
 !alias info dmg
@@ -6643,7 +6641,7 @@ Expected:
 `!alias def dmg "ent hp this"` and `!alias def heal "ent hp this"`,
 list shows both with their expansions. `!alias info dmg` shows
 `!dmg` -> `!ent hp this`. `!dmg -5` expands to `!ent hp this -5`,
-damaging hero to 25; `!heal 7` heals back to 32 (capped at 30
+damaging hero to 25; `!heal +7` heals back to 32 (capped at 30
 unless max_hp differs — depending on default clamp behaviour the
 final HP may be 30). Redefining `dmg` to `ent set_var this` shows
 the before/after in the response, then `!dmg poked yes` sets the
@@ -7129,14 +7127,14 @@ SCENARIO 280 — Recursion limit guards an action chain
 !ent set_var hero actions.bounce.target none
 !ent set_var hero actions.bounce.body "use_action(self, 'bounce')"
 !action hero bounce
+?? action recursion limit reached (3)
 
 Expected: The action recursively calls itself via use_action.
-With action_recursion_limit=3, the third nested call refuses;
-the runner returns False with the message "action recursion
-limit reached (3). ..." which the use_action() formula
-primitive bubbles up as a FormulaError, surfaced by the OUTER
-!action as `❌ action bounce: Runtime error: ...recursion
-limit...`. All mid-chain writes are rolled back. The limit
+With action_recursion_limit=3, call #4 in the chain is refused;
+the use_action() formula primitive bubbles the refusal up, and
+the OUTER !action reports "❌ action `bounce`: action recursion
+limit reached (3). The action `bounce` would be call #4 in a
+chain — ...". All mid-chain writes are rolled back. The limit
 acts as the backstop against accidentally cyclic actions.
 
 
@@ -9771,7 +9769,7 @@ SCENARIO 381 — first_opaque + coord_x/coord_y; entities_in_line_ignorelos
 
 Expected: An opaque wall sits at (4,3). first_opaque(1,3,7,3)
 returns the first terrain blocker strictly between the points as
-an (x,y) coordinate — (4, 3). Because the sandbox bans subscript
+an [x, y] coordinate — [4, 3]. Because the sandbox bans subscript
 and attribute-on-call, the coordinate is read with the new
 extractors: coord_x(...) = 4 and coord_y(...) = 3. A clear line
 (row 5 has no wall) makes first_opaque return None — a GM checks
@@ -13358,16 +13356,17 @@ SCENARIO 520 — Anchored aura 'suspend' mode: part destruction suspends, heal r
 !eval "zone_size('poison')"
 !eval "zone_anchor_of('poison')"
 !ent set_var hitter actions.mend.target entity
-!ent set_var hitter actions.mend.body "damage_part(part(target, 'arm'), -40)"
+!ent set_var hitter actions.mend.body "entity[part(target, 'arm')].hp = 40"
 !action hitter mend ogre
 !eval "zone_size('poison')"
 
 Expected: the ogre's arm carries a radius-1 aura (size 9). With suspend mode,
 destroying the arm (damage_part 50 → arm hp 0) SUSPENDS its aura — size 0, but
 the binding stays (zone_anchor_of='arm'); the destroyed limb lingers attached.
-Healing the arm back above 0 (damage_part -40) clears the destroyed latch and
-RESUMES the aura to size 9. (A destroyed limb never routes through Entity.remove,
-so this is handled directly in _process_part_death / the damage_part heal path.)
+Healing the arm back above 0 (a plain hp write of 40; damage_part refuses a
+negative amount) clears the destroyed latch and RESUMES the aura to size 9. (A
+destroyed limb never routes through Entity.remove, so this is handled directly
+in _process_part_death and at the part's hp write in write_var.)
 
 
 SCENARIO 521 — Invalid status-tick formula reports cleanly (no FormulaError crash)
@@ -13960,8 +13959,8 @@ SCENARIO 541 — Inline $() args: read-only math/dice/reads across commands
 !ent add goblin Goblin 30 6 6 5
 !dist $(2+3) $(1+1) 10 10
 !dist boss $(5+1) $(5+1)
-!ent hp goblin $(0-5)
-!ent hp boss $(0-1*entity[goblin].hp)
+!ent hp goblin +$(0-5)
+!ent hp boss +$(0-1*entity[goblin].hp)
 !map center $(3+3) $(2+2)
 !status def burn
 !status apply goblin burn $(1+1) $(2*3)
@@ -13971,7 +13970,7 @@ formula and substituted with the result, for any command except the raw_args
 ones (eval/batch/run/foreach/macro do it per-line; ent does its own self-aware
 pass). `!dist $(2+3) $(1+1) 10 10` measures (5,2)→(10,10). `$()` can read entity
 vars via `entity[goblin].hp` (quote-free literal id) and roll dice (`$(2d6)`).
-`!ent hp goblin $(0-5)` damages by 5 (ent self-handles $()). `!status apply
+`!ent hp goblin +$(0-5)` damages by 5 (ent self-handles $()). `!status apply
 goblin burn $(1+1) $(2*3)` applies burn at level 2, duration 6. All reads/maths;
 no state mutated by the substitution itself.
 
@@ -14016,11 +14015,11 @@ SCENARIO 543 — Inline $() args: per-line in macro + ent self-handling
 !match new ml MacroArgs 10 10 ml
 !match use ml
 !ent add goblin Goblin 30 4 4 5
-!macro set zap ent hp $1 $(0-4)
+!macro set zap ent hp $1 +$(0-4)
 !macro run zap goblin
 !macro set measure dist $(1+1) 1 5 5
 !macro run measure
-!batch dist $(2+2) 1 6 6 ; ent hp goblin $(0-1)
+!batch dist $(2+2) 1 6 6 ; ent hp goblin +$(0-1)
 
 Expected: `$(...)` resolves PER LINE inside a macro / batch (dispatch_no_snapshot
 applies the same read-only gate per sub-command). `!macro set zap ent hp $1
@@ -14037,16 +14036,16 @@ SCENARIO 544 — Macro control flow: repeat + $# loop index + nesting
 !match new mr MacroRepeat 12 12
 !match use mr
 !ent add g Goblin 100 2 2 5
-!macro set tri "repeat 3\nent hp g $(0-2)\nend"
+!macro set tri "repeat 3\nent hp g +$(0-2)\nend"
 !macro run tri
 !macro set idx "repeat 4\nent set_var g last $#\nend"
 !macro run idx
-!macro set nest "repeat 2\nif entity[g].hp > 0\nent hp g $(0-1)\nend\nend"
+!macro set nest "repeat 2\nif entity[g].hp > 0\nent hp g +$(0-1)\nend\nend"
 !macro run nest
 !ent dump g
 
 Expected: a macro can `repeat <count>\n...\nend` to loop a block; the count is a
-read-only formula. `tri` repeats `ent hp g $(0-2)` three times (100 → 94). `$#`
+read-only formula. `tri` repeats `ent hp g +$(0-2)` three times (100 → 94). `$#`
 is the current 1-based iteration, so `idx` leaves `last=4` after four passes.
 Blocks nest: `nest` repeats an `if`-guarded damage twice (94 → 92). The whole
 macro run is ONE undo entry. A macro with no directives still runs linearly
@@ -14059,7 +14058,7 @@ SCENARIO 545 — Macro control flow: if / elif / else branching
 !match new mb MacroBranch 10 10
 !match use mb
 !ent add g Goblin 30 2 2 5
-!macro set heal "if entity[g].hp < 10\nent hp g 20\nelse\nent hp g 1\nend"
+!macro set heal "if entity[g].hp < 10\nent hp g +20\nelse\nent hp g +1\nend"
 !macro run heal
 !ent hp g -25
 !macro run heal
@@ -14081,11 +14080,11 @@ SCENARIO 546 — Macro control flow: read-only conditions + structure + clamp
 !match use ms
 !ent add g Goblin 100 2 2 5
 !system set default macro_repeat_limit 5
-!macro set evil "if kill(g)\nent hp g 1\nend"
+!macro set evil "if kill(g)\nent hp g +1\nend"
 !macro run evil
-!macro set big "repeat 99999\nent hp g $(0-1)\nend"
+!macro set big "repeat 99999\nent hp g +$(0-1)\nend"
 !macro run big
-!macro set broken "if entity[g].hp > 0\nent hp g 1"
+!macro set broken "if entity[g].hp > 0\nent hp g +1"
 !ent dump g
 
 Expected: macro control-flow formulas are evaluated with the SAME strict read-
@@ -14233,9 +14232,9 @@ True`) → ❌ "Vital var 'hp' must be a number"; nesting under a vital
 (`hp.x`, `var_add hp.inner`) → ❌ "Cannot nest under vital var". Valid writes
 still work and coerce: `hp 15`, `var_set hp '12'` → 12, `var_add hp 3` → 15.
 `!list` and `!ent dump` never 💥. bool is rejected (a True flag isn't hp=1).
-HARNESS-ALLOWS-ERRORS: the `!eval "var_set/var_add(...)"` rejection lines
-deliberately surface a top-level ❌ Runtime error (the vital-var guard firing
-through the formula path), so this scenario opts out of the runtime-error marker.
+The `!eval "var_set/var_add(...)"` rejection lines surface the vital-var
+guard's own message (a plain ❌, with no "Runtime error:" prefix — that is
+kept for raw Python errors).
 
 SCENARIO 552 — !ent clone: parts subtree + mount safety (no phantom limb/rider)
 --------------------------------------------------------------------------------
@@ -14279,7 +14278,7 @@ SCENARIO 553 — Non-numeric numeric args give ❌, not 💥 (ent hp/init/add/tp
 
 Expected: the four `!ent` subcommands that were missing int() guards
 (hp/init/add/tp) now return a clean ❌ on a non-numeric numeric arg instead of a
-💥 (`ent hp h abc` → "hp delta must be an integer", `ent init h abc`, `ent tp h
+💥 (`ent hp h abc` → "hp amount must be a whole number, `max`, `=n` or a signed change", `ent init h abc`, `ent tp h
 a b` → "x and y must be integers", `ent add z Z 10 x 2` → "hp, x, y ... must be
 integers"). The crash was pre-mutation so no state was corrupted — it was a 💥
 where a ❌ belongs. A valid `ent hp h -5` still works (damages by 5).
@@ -14310,9 +14309,9 @@ scenario would FAIL the hardened harness if any summon returned a ❌ Runtime
 error. var_get gains an optional default: `var_get('anchor','ctr',0)` returns 0
 on a missing path (so `... + 1` = 1, the create-or-read idiom, mirroring
 corpse_var); without a default it still raises.
-HARNESS-ALLOWS-ERRORS: the final `!eval "var_get('anchor','ctr')"` (no default)
-deliberately surfaces a top-level ❌ Runtime error to prove the raise-on-missing
-default-less behavior is preserved.
+The final `!eval "var_get('anchor','ctr')"` (no default) is refused with
+"❌ `anchor` has no var at 'ctr'.", proving the raise-on-missing default-less
+behavior is preserved.
 
 
 SCENARIO 555 — Macro runaway backstops: loop-iteration budget + recursion depth
@@ -14351,7 +14350,7 @@ SCENARIO 556 — Macro backstops don't break legitimate loops / nesting
 !match new mok MacroOK 8 8
 !match use mok
 !ent add g Goblin 100 2 2 5
-!macro set tri "repeat 3\nent hp g $(0-2)\nend"
+!macro set tri "repeat 3\nent hp g +$(0-2)\nend"
 !macro run tri
 !macro set leaf "ent set_var g touched 1"
 !macro set mid "macro run leaf"
@@ -14363,7 +14362,7 @@ SCENARIO 556 — Macro backstops don't break legitimate loops / nesting
 
 Expected: the runaway backstops leave normal macros untouched. Charging loop
 ITERATIONS against macro_step_limit doesn't break a bounded loop — `tri` still
-repeats `ent hp g $(0-2)` three times (100 → 94). Legitimate macro NESTING under
+repeats `ent hp g +$(0-2)` three times (100 → 94). Legitimate macro NESTING under
 the recursion limit still works: `top` → `mid` → `leaf` is 3 deep (well under the
 default 20) and sets `touched=1`; the depth counter resets between top-level
 runs, so running `top` a second time (after zeroing) sets `touched=1` again.
@@ -14749,15 +14748,22 @@ SCENARIO 569 — `!find show:status` + lowest_var / highest_var targeting helper
 !ent set_var b team blue
 !ent add c C 44 4 5 5
 !ent set_var c team blue
-!status def burn tick ""
-!status def slow tick ""
+!ent add d D 5 5 6 5
+!ent set_var d team red
+!status def burn
+!status def slow
 !status apply a burn 2 3
 !status apply a slow
 !find team=blue show:status
 !find team=blue show:status,hp sort:hp
-!eval "lowest_var(entities_within('hero', 5, 'hostile'), 'hp')"
-!eval "highest_var(entities_within('hero', 5, 'hostile'), 'hp')"
-!eval "lowest_var(entities_within('hero', 5, 'hostile'), 'nosuchvar')"
+!eval "lowest_var(entities_within('hero', 5, 'square_radius', 'hostile'), 'hp')"
+?? = `'b'`
+!eval "highest_var(entities_within('hero', 5, 'square_radius', 'hostile'), 'hp')"
+?? = `'c'`
+!eval "lowest_var(entities_within('hero', 5), 'hp')"
+?? = `'d'`
+!eval "lowest_var(entities_within('hero', 5, 'square_radius', 'hostile'), 'nosuchvar')"
+?? = `''`
 
 Expected: statuses live in `e.status`, NOT in vars, so `show:status` used to
 render `—` for everyone. `status` (and the alias `statuses`) is now a
@@ -14774,8 +14780,11 @@ exist because the sandbox has no comprehensions and no loop `break`, so this
 otherwise needs a hand-rolled running-minimum accumulator in every targeting
 formula. Entities missing the var (or holding a non-numeric value) are SKIPPED,
 ties break on the lower id so results are deterministic, and `''` comes back
-when nothing qualifies — so `b` (12 hp) and `c` (44 hp) here, and `''` for a var
-nobody has. Both are read-only and classified ARG_SAFE, so they work inside
+when nothing qualifies — so among the hostile units `b` (12 hp) and `c` (44
+hp) here, the ally `d` (5 hp) when the list isn't filtered by relation, and
+`''` for a var nobody has. (The relation is entities_within's FOURTH
+argument, after the distance mode; this scenario used to pass 'hostile' as
+the mode, which was read as Chebyshev with no filter.) Both are read-only and classified ARG_SAFE, so they work inside
 inline `$()` arguments.
 
 
@@ -14852,14 +14861,14 @@ SCENARIO 572 — bot-wide commands need a server administrator
 !match use bobm
 !system set default fog_glyph x
 !batch system set default fog_glyph x
-!defvar add default fog_vision_radius 3
+!defvar add fog_vision_radius 3
 !store save bobsave.json
 !run bobscript.txt
 !history save cp
 !history export manual:cp cp.json
 !system list
-!system rules default
-!defvar list default
+!system rules
+!defvar list
 !as host
 !system set default fog_glyph x
 !system set default fog_glyph ?
@@ -14873,7 +14882,7 @@ edit in `!batch` doesn't help: the check also runs on the ungated inner-command
 path (batch / macro / foreach / run lines, action `cmd()`). The admin check is
 rejected outright (not queued — no match host could approve it). Per-match
 history (`!history save cp`) is still bob's to run as host. Read-only forms stay
-open: `!system list`, `!system rules default`, `!defvar list default`. Back as
+open: `!system list`, `!system rules`, `!defvar list`. Back as
 the owner identity (the harness's stand-in for a Discord guild Administrator;
 the CLI/GUI are always admin), `!system set default fog_glyph x` succeeds —
 directly, even though the channel's active match is bob's: bot-wide commands
@@ -15092,8 +15101,9 @@ cells_in_burst/_rect/_cone/_line, entities_in_rect/_cone, and the sight-line
 walkers (has_los, raycast, first_opaque, entities_on_los, ...) — at
 `formula_cell_limit` (100000 cells). A 1000x1000 rect (1,000,000 cells) is
 refused by default and allowed after raising the rule; the last line restores
-the default. HARNESS-ALLOWS-ERRORS (the sight-line refusal surfaces as a
-wrapped Runtime error).
+the default. The sight-line refusal reads "❌ inline $() argument: sight
+line ... over the formula_cell_limit" (an engine refusal, so no "Runtime
+error:" prefix).
 
 
 SCENARIO 579 — Queries respect the channel POV (pov_filters_queries)
@@ -15892,7 +15902,7 @@ SCENARIO 602 — !assert stops the enclosing batch, macro, foreach and action
 !assert "entity[hero].hp == 18" three drains ran, the fourth never did, nor the -100
 !foreach team=red ; ent hp $id -1 ; assert "entity[$id].hp > 15"
 !assert "entity[orc].hp == 9 and entity[imp].hp == 20" the sweep stopped at the orc
-!batch macro run drain ; ent hp hero 50
+!batch macro run drain ; ent hp hero +50
 !assert "entity[hero].hp == 14" the nested stop skipped the heal too
 !ent set_var hero actions.guarded.target none
 !ent set_var hero actions.guarded.body "entity[self].hp = entity[self].hp + 5\ncmd('assert \"entity[hero].hp > 100\"')\nentity[self].hp = 1"
@@ -16223,3 +16233,3141 @@ along. The copy's channel list holds only the channel that just ran
 `!match use c2` (the original's red-POV binding didn't come along), the
 undo history is empty (nothing from the original), and the hero's damage
 did come along (27).
+
+
+SCENARIO 613 — set_facing / face_toward: an attack that turns toward its target
+-------------------------------------------------------------------------------
+
+!match new f613 Facing 10 8
+!match use f613
+!ent add hero Hero 30 2 2 10
+!ent add ogre Ogre 40 6 5 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent add gob Gob 10 2 7 3
+!ent set_var hero actions.strike.target entity
+!ent set_var hero actions.strike.body "face_toward(self, target)\nentity[target].hp = entity[target].hp - 5"
+!action hero strike gob
+!assert "facing_of('hero') == 'down' and entity[gob].hp == 5" striking turns the hero toward its target
+!action hero strike ogre
+!assert "facing_of('hero') == 'right'" cardinal-only: the dominant axis toward the 2x2 body centre
+!system set default allow_diagonal_facing true
+!eval "face_toward('hero', 'ogre')"
+!assert "facing_of('hero') == 'down_right'" with diagonals: the nearest of 8 directions
+!ent face ogre toward hero
+!assert "facing_of('ogre') == 'up_left'" measured from the centre of the ogre body
+!eval "face_toward('gob', 6, 7)"
+!assert "facing_of('gob') == 'right'"
+!eval "set_facing('hero', 'cw')"
+!assert "facing_of('hero') == 'down'" cw rotates one 45-degree step
+!eval "face_toward('hero', 2, 2)"
+!assert "facing_of('hero') == 'down'" a point at its own centre leaves the facing alone
+!system set default allow_diagonal_facing false
+!eval "set_facing('hero', 'up_left')"
+!assert "facing_of('hero') == 'down'" a refused diagonal changes nothing
+
+Expected: HARNESS-ALLOWS-ERRORS. The `strike` action calls
+`face_toward(self, target)` before dealing damage: against the goblin
+straight below, the hero turns `down` (gob 10 → 5). Against the 2×2 ogre
+(centre 6.5, 5.5 from the hero at 2, 2) a cardinal-only system picks the
+dominant axis, `right`; once allow_diagonal_facing is on the same call
+picks `down_right`, the nearest of the 8 directions. `!ent face ogre
+toward hero` measures from the ogre's body centre and gives `up_left`.
+`face_toward(eid, x, y)` takes a cell; `set_facing('hero', 'cw')` rotates
+one 45° step to `down`; aiming at its own centre changes nothing. With
+diagonals off again, `set_facing('hero', 'up_left')` is refused (❌, the
+same message as `!ent face`) and the facing stays `down`.
+
+
+SCENARIO 614 — Turning a vehicle re-seats the riders in its facing-relative slot
+--------------------------------------------------------------------------------
+
+!match new f614 Turret 10 8
+!match use f614
+!ent add tank Tank 60 3 3 4
+!ent set_var tank footprint_w 3
+!ent set_var tank footprint_h 3
+!ent set_var tank slots.gunner.capacity 1
+!ent set_var tank slots.gunner.region front
+!ent add gun Gunner 10 8 8 6
+!ent face tank up
+!mount gun tank gunner
+!assert "entity[gun].y == 3" facing up, the front row is the top row
+!ent face tank right
+!assert "entity[gun].x == 5" facing right, the gunner moves to the right-hand column
+!eval "set_facing('tank', 'down')"
+!assert "entity[gun].y == 5" set_facing re-seats the gunner too
+!eval "face_toward('tank', 1, 4)"
+!assert "facing_of('tank') == 'left' and entity[gun].x == 3"
+
+Expected: The gunner sits in the tank's `front` region, which turns with
+the 3×3 tank (anchor 3, 3). Facing up the gunner is on the top row
+(y 3); `!ent face tank right` moves it to the right-hand column (x 5);
+`set_facing('tank', 'down')` puts it on the bottom row (y 5), and
+`face_toward('tank', 1, 4)` turns the tank left, seating the gunner in
+the left column (x 3). Every assert passes.
+
+
+SCENARIO 615 — grid_width / grid_height / in_bounds: a knockback that stops at the edge
+--------------------------------------------------------------------------------------
+
+!match new g615 Edge 8 6
+!match use g615
+!ent add hero Hero 30 2 3 10
+!ent add brute Brute 50 6 3 5
+!assert "grid_width() == 8 and grid_height() == 6"
+!assert "in_bounds(1, 1) and in_bounds(8, 6) and not in_bounds(0, 3) and not in_bounds(9, 3) and not in_bounds(3, 7)" cells are numbered from 1
+!ent set_var hero actions.slam.target entity
+!ent set_var hero actions.slam.body "nx = entity[target].x + 3\nif not in_bounds(nx, entity[target].y):\n    nx = grid_width()\nentity[self].landing = nx\nmove_entity(target, nx, entity[target].y)"
+!action hero slam brute
+!assert "entity[brute].x == 8 and entity[hero].landing == 8" the knockback stops on the last column
+!ent tp brute 3 3
+!action hero slam brute
+!assert "entity[brute].x == 6" a knockback with room goes the full 3 cells
+!ent set_var hero tall $(grid_height())
+!assert "entity[hero].tall == 6" read-only, so usable in $() arguments
+
+Expected: `grid_width()` / `grid_height()` read the map size (8×6) and
+`in_bounds` uses the same 1-based cells as every command. The `slam`
+action pushes its target 3 cells right but clamps the landing to the last
+column with `in_bounds` + `grid_width()`: the brute at x 6 lands on x 8,
+the brute at x 3 lands on x 6. `$(grid_height())` works as an inline
+argument. Every assert passes.
+
+
+SCENARIO 616 — entity_distance: body-to-body gap for multi-tile units
+---------------------------------------------------------------------
+
+!match new d616 Gap 10 8
+!match use d616
+!ent add ogre Ogre 40 6 3 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent add hero Hero 30 9 5 10
+!ent add gob Gob 10 8 4 3
+!assert "entity_distance('hero', 'ogre') == 2 and distance(9, 5, 6, 3) == 3" nearest cell to nearest cell, not anchor to anchor
+!assert "entity_distance('hero', 'ogre', 'manhattan') == 3 and entity_distance('gob', 'ogre') == 1"
+!assert "entity_distance('ogre', 'hero') == entity_distance('hero', 'ogre')" symmetric
+!ent set_var hero actions.bite.target entity
+!ent set_var hero actions.bite.body "if entity_distance(self, target) > 1:\n    fail('out of reach')\nentity[target].hp = entity[target].hp - 7"
+!action hero bite ogre
+!assert "entity[ogre].hp == 40" the nearest ogre cell is 2 away: refused
+!ent tp hero 8 5
+!action hero bite ogre
+!assert "entity[ogre].hp == 33" diagonal to the ogre corner cell: in reach
+!dist hero ogre
+
+Expected: HARNESS-ALLOWS-ERRORS. The 2×2 ogre covers (6-7, 3-4). From the
+hero at (9, 5) its nearest cell (7, 4) is 2 away — the anchor (6, 3) is 3
+away, which is what `distance` on the anchors would give.
+`entity_distance` takes the same metrics (manhattan gives 3), is
+symmetric, and reports 1 for the adjacent goblin. The `bite` action
+refuses at range 2 (❌ out of reach, ogre stays 40) and lands once the
+hero stands at (8, 5), diagonal to the ogre's corner (7, 4) (40 → 33). `!dist hero ogre` agrees:
+1.
+
+
+SCENARIO 617 — cell_blocked / cell_opaque: check a cell before moving or looking
+--------------------------------------------------------------------------------
+
+!match new b617 Walls 10 6
+!match use b617
+!ent add hero Hero 30 2 2 10
+!ent set_var hero team red
+!ent set_var hero flying false
+!ent add bird Bird 10 2 4 5
+!ent set_var bird flying true
+!ent set_var bird team blue
+!tile set 4 2 block true
+!tile set 5 2 block "entity[self].flying != True"
+!tile set 6 2 opaque "entity[self].team != 'red'"
+!zone new smoke
+!zone add smoke 7 2
+!zone set smoke opaque true
+!assert "cell_blocked('hero', 4, 2) and cell_blocked('hero', 5, 2) and not cell_blocked('hero', 3, 2)"
+!assert "not cell_blocked('bird', 5, 2)" the low wall only stops walkers
+!assert "cell_blocked('hero', 0, 2) and cell_blocked('hero', 11, 2)" off the map counts as blocked
+!system set default block_tp false
+!assert "not cell_blocked('hero', 4, 2, 'tp') and cell_blocked('hero', 4, 2, 'walk')" a mode consults its block_<mode> rule
+!assert "not cell_opaque(6, 2, 'hero') and cell_opaque(6, 2, 'bird')" viewer-conditional opacity
+!assert "cell_opaque(7, 2) and not cell_opaque(3, 2)" a smoke zone blocks sight
+!ent set_var hero actions.dash.target location
+!ent set_var hero actions.dash.body "if cell_blocked(self, target.x, target.y, 'walk'):\n    fail('blocked')\nmove_entity(self, target.x, target.y)"
+!action hero dash 4 2
+!assert "entity[hero].x == 2" the dash checks the wall first
+!action hero dash 3 3
+!assert "entity[hero].x == 3 and entity[hero].y == 3"
+!eval "cell_blocked('hero', 4, 2, 'fly')"
+
+Expected: HARNESS-ALLOWS-ERRORS. `cell_blocked` evaluates the same block
+settings movement uses: the solid wall (4, 2) blocks everyone, the low
+wall (5, 2) blocks the hero but not the flying bird, an open cell doesn't
+block, and off-map cells count as blocked. With block_tp off, a `tp`
+check ignores the wall while a `walk` check still sees it.
+`cell_opaque` asks with a viewer: the red-only window at (6, 2) is clear
+for the red hero and opaque for the blue bird; the smoke zone blocks
+sight. The `dash` action refuses the wall (❌ blocked) and moves to an
+open cell. An unknown mode (`fly`) is a ❌.
+
+
+SCENARIO 618 — free_cell_near: a blink that lands a 2x2 body where it fits
+--------------------------------------------------------------------------
+
+!match new c618 Blink 10 8
+!match use c618
+!ent add golem Golem 60 1 1 5
+!ent set_var golem footprint_w 2
+!ent set_var golem footprint_h 2
+!ent add wall1 Pillar 50 6 4 0
+!tile set 7 4 block true
+!tile set 7 5 block true
+!assert "free_cell_near(6, 4, 0) == None" the cell itself is taken
+!assert "coord_x(free_cell_near(6, 4, 1)) == 5 and coord_y(free_cell_near(6, 4, 1)) == 3" without a unit: the nearest empty cell
+!assert "coord_x(free_cell_near(6, 4, 2, 'golem')) == 5 and coord_y(free_cell_near(6, 4, 2, 'golem')) == 5" the whole 2x2 body must fit, clear of the pillar and the walls
+!assert "coord_x(free_cell_near(1, 1, 3, 'golem')) == 1" its own body does not count as occupied
+!ent set_var golem actions.blink.target location
+!ent set_var golem actions.blink.body "c = free_cell_near(target.x, target.y, 2, self)\nif c == None:\n    fail('nowhere to land')\nmove_entity(self, coord_x(c), coord_y(c))"
+!action golem blink 6 4
+!assert "entity[golem].x == 5 and entity[golem].y == 5 and occupies('golem', 6, 6)"
+!eval "free_cell_near(1, 1, 5000)"
+
+Expected: HARNESS-ALLOWS-ERRORS. The pillar stands on (6, 4) and walls
+block (7, 4) and (7, 5). Without a unit, `free_cell_near` returns the
+nearest empty cell in rings around the point (radius 0 = the point
+itself, here taken → None). With `golem` the whole 2×2 body must fit in
+bounds, clear of other units and of blocking tiles: the first anchor that
+works around (6, 4) is (5, 5) — every anchor in the first ring overlaps
+the pillar or a wall except that one. The golem's own current cells don't
+count against it. The `blink` action lands the golem there (it now
+covers (6, 6)). A radius whose search area exceeds formula_cell_limit is
+refused (❌).
+
+
+SCENARIO 619 — team_members: a rally that heals every living member of a team
+-----------------------------------------------------------------------------
+
+!match new t619 Rally 10 8
+!match use t619
+!ent add ogre Ogre 40 6 3 5
+!ent set_var ogre team blue
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!part add ogre oarm arm 10 10
+!ent set_var oarm team blue
+!ent add gob Gob 10 2 7 3
+!ent set_var gob team blue
+!ent add imp Imp 6 4 7 1
+!ent set_var imp team blue
+!ent add hero Hero 30 2 2 10
+!ent set_var hero team red
+!assert "team_members('blue') == ['ogre', 'gob', 'imp']" turn order; the arm acts through the ogre
+!assert "team_members('red') == ['hero'] and team_members('green') == []"
+!ent hp ogre -10
+!ent hp gob -5
+!ent kill imp
+!ent set_var ogre actions.rally.target none
+!ent set_var ogre actions.rally.body "n = 0\nfor m in team_members(entity[self].team):\n    entity[m].hp = entity[m].hp + 3\n    n = n + 1\nentity[self].rallied = n"
+!action ogre rally
+!assert "entity[ogre].hp == 33 and entity[gob].hp == 8 and entity[ogre].rallied == 2" the dead imp is left out
+!assert "entity[hero].hp == 30"
+
+Expected: `team_members('blue')` lists the alive blue units in turn order
+— ogre, goblin, imp — and leaves out the ogre's arm (an attached body
+part) even though it carries `team blue`. An unknown team gives `[]`.
+After the imp dies, the ogre's `rally` loops over `team_members` and heals
+the two living members by 3 (ogre 30 → 33, goblin 5 → 8, `rallied` = 2);
+the red hero is untouched.
+
+
+SCENARIO 620 — pick / shuffle: random picks that follow random_seed
+-------------------------------------------------------------------
+
+!system set default random_seed 7
+!match new r620 Picks 8 6
+!match use r620
+!ent add hero Hero 30 2 2 10
+!match clone r620b
+!ent set_var hero first "$(pick(['a','b','c','d','e','f','g','h']))"
+!ent set_var hero order "$(shuffle([1,2,3,4,5]))"
+!ent copy hero r620b 5 5
+!match use r620b
+!assert "entity[hero_2].first == pick(['a','b','c','d','e','f','g','h'])" same seed, same first pick
+!assert "sorted(shuffle([5,3,1,4,2])) == [1,2,3,4,5]" shuffle keeps every item
+!assert "pick([]) == None and pick(['only']) == 'only' and pick({'k': 1}) == 'k'"
+!ent set_var hero actions.scatter.target none
+!ent set_var hero actions.scatter.body "seen = []\nfor v in shuffle(['x', 'y', 'z']):\n    seen = seen + [v]\nentity[self].seen = sorted(seen)"
+!action hero scatter
+!assert "entity[hero].seen == ['x', 'y', 'z']" shuffle is loopable
+
+Expected: Both matches share random_seed 7. `r620b` is cloned before any
+roll, so its random sequence starts where `r620`'s did: the first pick
+`r620` made (stored on its hero, then copied across as `hero_2`) equals
+`r620b`'s own first pick. `shuffle` returns the same items in another
+order, `pick([])` is None, a one-item list gives that item and a dict
+gives one of its keys. `for v in shuffle(...)` loops. Every assert
+passes.
+
+
+SCENARIO 621 — var_copy: hand out a copy of an item and keep the original
+-------------------------------------------------------------------------
+
+!match new v621 Copy 8 6
+!match use v621
+!ent add hero Hero 30 2 2 10
+!ent add ally Ally 20 3 2 5
+!ent set_var hero inventory.potion.heal 5
+!ent set_var hero inventory.potion.amount 2
+!eval "entity[ally].copied = var_copy('hero', 'inventory.potion', 'ally', 'inventory.potion')"
+!assert "entity[ally].copied == True"
+!assert "entity[ally].inventory.potion.heal == 5 and entity[hero].inventory.potion.amount == 2" the source stays
+!eval "entity[ally].inventory.potion.amount = 1"
+!assert "entity[hero].inventory.potion.amount == 2" a deep copy: editing it leaves the source alone
+!eval "entity[ally].copied = var_copy('hero', 'inventory.elixir', 'ally', 'inventory.elixir')"
+!assert "entity[ally].copied == False and not var_has('ally', 'inventory.elixir')" a missing source is a no-op
+!eval "var_copy('hero', 'name', 'ally', 'alias')"
+!assert "entity[ally].alias == 'Hero'" reads the reserved paths too
+!eval "var_copy('hero', 'hp', 'ally', 'name')"
+!assert "entity[ally].name == 'Ally'"
+
+Expected: HARNESS-ALLOWS-ERRORS. `var_copy` writes a deep copy of the
+potion onto the ally and keeps the hero's; changing the ally's amount
+doesn't touch the hero's. A missing source returns False and writes
+nothing. A reserved path can be the source (`name` → `alias` copies the
+display name), but not the destination: writing to `name` is refused (❌,
+use `!ent rename`) and the ally keeps its name.
+
+
+SCENARIO 622 — The new read-only functions in $() args; the new writers are refused
+-----------------------------------------------------------------------------------
+
+!match new a622 Args 10 8
+!match use a622
+!ent add hero Hero 30 2 2 10
+!ent set_var hero team red
+!ent add ogre Ogre 40 6 3 5
+!ent set_var ogre team blue
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent face hero up
+!ent set_var hero gap "$(entity_distance('hero','ogre'))"
+!ent set_var hero blues "$(len(team_members('blue')))"
+!ent set_var hero edge $(in_bounds(10,8))
+!ent set_var hero wall "$(cell_blocked('hero',3,3))"
+!assert "entity[hero].gap == 4 and entity[hero].blues == 1 and entity[hero].edge == True and entity[hero].wall == False"
+!ent set_var hero spin "$(set_facing('hero','down'))"
+!ent set_var hero aim "$(face_toward('hero','ogre'))"
+!ent set_var hero loot "$(var_copy('ogre','hp','hero','stolen'))"
+!assert "facing_of('hero') == 'up' and not var_has('hero', 'spin') and not var_has('hero', 'stolen')" nothing ran
+
+Expected: HARNESS-ALLOWS-ERRORS. The read-only additions work as inline
+`$()` arguments: the hero is 4 from the ogre's body, blue has 1 member,
+(10, 8) is on the map and (3, 3) is open. The state-changing ones —
+`set_facing`, `face_toward`, `var_copy` — are refused by the read-only
+gate (❌ each), so the hero still faces up and no var was written.
+
+
+SCENARIO 623 — on_entity_despawned: remove, part cascade and transfer fire it; a death doesn't
+---------------------------------------------------------------------------------------------
+
+!match new h623 Despawn 12 8
+!match new h623b Elsewhere 12 8
+!match use h623
+!ent add hero Hero 30 3 3 10
+!ent add ogre Ogre 40 8 3 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!part add ogre oarm arm 10 10
+!ent add gob Gob 10 3 6 2
+!ent add imp Imp 5 6 6 1
+!match var set gone ""
+!gpassive add tally on_entity_despawned "match.gone = match.gone + entity[self].name + ';'"
+!passive add hero bye on_entity_despawned "match.left_from = entity[self].x"
+!ent remove gob
+!assert "match.gone == 'Gob;'"
+!ent remove ogre
+!assert "match.gone == 'Gob;Ogre;arm;'" the arm leaves with its body
+!ent kill imp
+!assert "match.gone == 'Gob;Ogre;arm;' and has_corpse('imp')" a death fires on_death only
+!ent transfer hero h623b 1 1
+!assert "match.gone == 'Gob;Ogre;arm;Hero;'" leaving the match is a despawn too
+!assert "match.left_from == 3" the handler ran while the hero was still on its cell
+!match use h623b
+!assert "entity[hero].x == 1"
+!gpassive hooks
+
+Expected: A global passive on `on_entity_despawned` appends each departing
+unit's name. `!ent remove gob` fires it once; removing the ogre fires it
+for the ogre and then for its arm (body parts leave with their body).
+Killing the imp fires nothing (a death fires on_death and leaves a
+corpse). `!ent transfer` out of the match fires it for the hero — and the
+hero's own passive runs while it is still on its cell, recording x 3; the
+copy stands at (1, 1) in the other match. `!gpassive hooks` lists the new hook.
+
+
+SCENARIO 624 — on_entity_despawned in real use: a despawning unit drops its loot
+---------------------------------------------------------------------------------
+
+!match new h624 Loot 12 8
+!match use h624
+!gpassive add drop on_entity_despawned "if var_has(self, 'loot'):\n    tile_set(entity[self].x, entity[self].y, 'loot', entity[self].loot)"
+!ent add sprite Sprite 5 2 2 3
+!ent set_var sprite loot gem
+!ent remove sprite
+!assert "tile_get(2, 2, 'loot') == 'gem'" the summon dropped its gem on its cell
+!ent add wolf Wolf 8 4 4 2
+!ent set_var wolf loot pelt
+!ent kill wolf
+!assert "not tile_has(4, 4, 'loot')" a kill is not a despawn
+!ent add ogre Ogre 40 8 3 5
+!ent add gob Gob 10 2 6 2
+!part add ogre oarm arm 10 10
+!ent set_var oarm loot claw
+!ent store_entity_into_var gob ogre forms.small
+!ent transform ogre forms.small
+!assert "tile_get(8, 3, 'loot') == 'claw' and not has_part('ogre', 'oarm')" the arm of the old form despawned and dropped its claw
+!ent add head Worm 30 2 7 4
+!part segment head s1 Seg 5 5
+!part segment head s2 Seg 5 5
+!part segment head s3 Seg 5 5
+!ent set_var s3 loot scale
+!assert "entity[s3].x == 1 and entity[s3].y == 5"
+!system set default segment_removal_mode cascade
+!ent remove s2
+!assert "tile_get(1, 5, 'loot') == 'scale' and has_part('head', 's1') and not has_part('head', 's3')" the cut takes the tail with it
+
+Expected: A global `drop` passive on `on_entity_despawned` writes a
+departing unit's `loot` onto the tile it stood on. Removing the sprite
+leaves its gem at (2, 2). Killing the wolf is a death, so nothing drops
+at (4, 4). Transforming the ogre into the goblin's statblock despawns the
+old form's arm, whose claw lands on the ogre's cell (8, 3). With
+segment_removal_mode `cascade`, removing the middle segment of a
+three-segment worm removes the tail behind it too; the tail segment
+despawns and its scale drops at (1, 5), while the first segment stays.
+
+
+SCENARIO 625 — !roll odds: exact chances and whole distributions
+----------------------------------------------------------------
+
+!roll odds 2d6 >= 8
+!roll odds 2d20kh1 >= 15
+!roll odds 1d20+5 < 10
+!roll odds 4d6kh3 >= 16
+!roll odds 3d6-1d4 = 0
+!roll odds 2d6
+!roll odds 1d6! > 6
+!roll odds 1000d1000
+!roll odds 2d6!kh1
+!roll odds >= 5
+
+Expected: HARNESS-ALLOWS-ERRORS. Exact figures with the reduced fraction:
+2d6 ≥ 8 is 41.67% (5/12); advantage (2d20kh1) ≥ 15 is 51.00% (51/100);
+1d20+5 < 10 is 20.00% (1/5); 4d6 keep 3 ≥ 16 is 13.04% (169/1296); 3d6−1d4
+= 0 is 0.46% (1/216). With no comparison, `!roll odds 2d6` shows the
+range (2–12), the average (7.00) and an 11-row distribution with bars.
+An exploding d6 above 6 is ≈ 16.67% with a note that improbably long
+chains are left out. 1000d1000 is refused as too large, a group that
+both explodes and keeps dice is refused, and a comparison with no dice is
+a ❌. No match is needed: `!roll odds` reads nothing from the board.
+
+
+SCENARIO 626 — !whoami: identity, role, view and approval for host and player
+-----------------------------------------------------------------------------
+
+!whoami
+!match new w626 Who 8 6
+!match use w626
+!host add bob
+!match bind pov=red
+!whoami
+!as player bob
+!whoami
+!as player carol
+!ent add imp Imp 5 2 2 1
+!whoami
+!as host
+!pending
+
+Expected: With no match yet, `!whoami` names `cli`, flags it as a server
+administrator and says the channel has no match. After the owner binds
+the channel with POV red, the owner's `!whoami` shows role owner, team
+`red`'s POV, and commands that run directly. Bob, a co-host, gets role
+co-host and also runs commands directly (no administrator line — he
+isn't one here). Carol is a player: her `!ent add` waits for approval,
+and her `!whoami` says her changing commands wait for a host and lists
+her waiting request `r1`. The host's `!pending` shows that request.
+
+
+SCENARIO 627 — !map as= / !list as=: a host previews a team view without binding
+--------------------------------------------------------------------------------
+
+!match new p627 Peek 10 6
+!match use p627
+!ent add hero Hero 30 2 2 10
+!ent set_var hero team red
+!ent set_var hero fog_vision_radius 2
+!ent add spy Spy 10 9 5 5
+!ent set_var spy team blue
+!ent set_var spy fog_vision_radius 1
+!match fog on
+!list
+!list as=red
+!map as=red
+!list as=blue
+!map cell 9 5 as=red
+!list as=omniscient
+!match bind pov=red
+!as player carol
+!list
+!list as=blue
+!map as=blue
+!as host
+!list as=blue
+!list nonsense
+
+Expected: HARNESS-ALLOWS-ERRORS. The channel isn't bound, so the host's
+plain `!list` shows both units. `!list as=red` and `!map as=red` start
+with a "👁 Preview: team `red`'s view" line and hide the spy (out of
+red's sight; the map is fogged beyond radius 2 of the hero). `as=blue`
+shows only the spy; `!map cell 9 5 as=red` reports the cell as unseen.
+`as=omniscient` shows everything. After binding the channel to red, the
+player carol sees only the hero, and her `as=blue` previews are refused
+(host-only, ❌). The host can still preview blue. An unknown word on
+`!list` is a ❌ with the help.
+
+
+SCENARIO 628 — !map cell: everything at a cell, where block settings come from, for=
+------------------------------------------------------------------------------------
+
+!match new c628 Cell 10 8
+!match use c628
+!ent add ogre Ogre 40 6 3 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent add hero Hero 30 2 2 10
+!ent set_var hero flying false
+!ent add bird Bird 10 2 6 4
+!ent set_var bird flying true
+!tile def new mire
+!tile def data mire block "entity[self].flying != True"
+!tile place mire 4 4
+!tile set 4 4 glyph ~
+!zone new fog
+!zone add fog 4 4
+!zone add fog 5 4
+!zone set fog opaque true
+!ent add rat Rat 3 5 5 1
+!ent kill rat
+!map cell 7 4
+!map cell 4 4
+!map cell 4 4 for=hero
+!map cell 4 4 for=bird
+!map cell 5 5
+!map cell 3 3
+!map cell 0 3
+!map cell 4 4 for=nobody
+
+Expected: HARNESS-ALLOWS-ERRORS. (7, 4) is the bottom-right cell of the
+2×2 ogre anchored at (6, 3), so the ogre is listed there. (4, 4) shows the
+`mire` tile (its data: the template name, the block condition the
+template copied in when placed, and the glyph), the `fog` zone, and where
+each setting comes from: movement — the tile's condition; sight — the
+zone's `always`. `for=hero` evaluates them for the
+walking hero (blocks movement: yes, blocks sight: yes); `for=bird`
+(flying) gives movement no, sight yes. (5, 5) lists the rat's corpse. An
+empty cell reads none / nothing set. An off-map cell and an unknown
+`for=` unit are ❌.
+
+
+SCENARIO 629 — !map cell under fog: hidden zones stay out of the report and of for=
+-----------------------------------------------------------------------------------
+
+!match new c629 Hidden 10 6
+!match use c629
+!ent add hero Hero 30 2 2 10
+!ent set_var hero team red
+!ent set_var hero fog_vision_radius 3
+!zone new pit
+!zone add pit 4 2
+!zone set pit block true
+!system set default zone_visibility_condition "zone_name != 'pit' or pov_team == 'blue'"
+!match fog on
+!match bind pov=red
+!as player carol
+!map cell 4 2 for=hero
+!map cell 9 5
+!as host
+!map cell 4 2 for=hero as=omniscient
+!ent move hero 2 right
+
+Expected: The pit at (4, 2) is invisible to red (zone_visibility_condition)
+and blocks movement. From the red channel, carol's `!map cell 4 2
+for=hero` shows no zone and "blocks movement: no" — a hidden layer is
+left out of the evaluation as well as the listing, so the report can't
+reveal it. (9, 5) is beyond the hero's sight: "unseen (fog)". The host's
+omniscient preview of the same cell lists the `pit` zone and "blocks
+movement: yes", and walking the hero into it stops it.
+
+
+SCENARIO 630 — !ent diff: compare an instance against its source
+----------------------------------------------------------------
+
+!match new d630 Diff 10 6
+!match use d630
+!ent add orc Orc 20 2 2 5
+!ent set_var orc team red
+!ent set_var orc inventory.axe.damage 6
+!ent clone orc orc2 4 2
+!ent diff orc orc2
+!ent set_var orc2 inventory.axe.damage 9
+!ent set_var orc2 inventory.shield.block 2
+!ent delete_var orc2 team
+!ent hp orc2 -5
+!ent status orc2 add burning
+!passive add orc2 rage on_turn_start "entity[self].hp = entity[self].hp + 1"
+!ent face orc2 left
+!ent diff orc orc2
+!ent diff orc nobody
+!as player carol
+!ent diff orc orc2
+
+Expected: HARNESS-ALLOWS-ERRORS. A fresh clone differs only in position:
+`position: (2,2) -> (4,2)`. After editing the clone, the diff lists, with
+the orc's value first: facing, `vars.hp: 20 -> 15`, the axe damage `6 ->
+9`, `vars.inventory.shield.block: + 2` (only on orc2), `vars.team: -
+'red'` (only on orc), the `burning` status and the `rage` passive as
+"only on `orc2`". An unknown id is a ❌. `!ent diff` shows vars like
+`!ent dump`, so carol's request is queued for a host.
+
+
+SCENARIO 631 — !find count / ids: a number, or ids to paste into another command
+---------------------------------------------------------------------------------
+
+!match new f631 Count 10 6
+!match use f631
+!ent add a1 Archer 10 2 2 5
+!ent set_var a1 team red
+!ent add a2 Archer 10 3 2 4
+!ent set_var a2 team red
+!ent add g1 Guard 20 6 2 3
+!ent set_var g1 team blue
+!find team=red count
+!find count
+!find team=green count
+!find team=red ids
+!find hp<15 ids sort:initiative
+!find team=green ids
+!find team=red count show:hp
+!foreach team=red ; ent hp $id -3
+!find hp<10 ids
+
+Expected: `count` prints just the number (2 reds, 3 in all, 0 greens).
+`ids` prints the matching ids space-separated in turn order — `a1 a2` —
+and follows `sort:` (`sort:initiative` gives `a2 a1`).
+An empty match set reads "No entities match." for `ids`. `count` ignores
+display directives. After the foreach deals 3 to each archer, `!find
+hp<10 ids` gives `a1 a2`.
+
+
+SCENARIO 632 — !tile info / list hide corpses the POV can't see
+---------------------------------------------------------------
+
+!match new t632 Bodies 8 6
+!match use t632
+!ent add hero Hero 30 2 2 10
+!ent set_var hero team red
+!ent add spy Spy 5 4 4 1
+!ent set_var spy team blue
+!ent add mook Mook 5 5 4 1
+!ent set_var mook team red
+!tile set 4 4 glyph ,
+!system set default corpse_visibility_condition "corpse_team == pov_team"
+!ent kill spy
+!ent kill mook
+!match bind pov=red
+!as player carol
+!tile info 4 4
+!tile info 5 4
+!tile list
+!list
+!as host
+!match bind pov=omniscient
+!tile info 4 4
+
+Expected: Corpses are stored in the tile data of the cell they lie on. The
+red channel may only see red corpses (corpse_visibility_condition). For
+carol, `!tile info 4 4` shows the tile's glyph but no `corpses` entry
+(the blue spy's body is hidden); `!tile info 5 4` shows the red mook's
+corpse; `!tile list` lists (4, 4) with only `glyph` and (5, 4) with
+`corpses`. `!list`'s Dead: section shows only the mook. From an
+omniscient channel the host's `!tile info 4 4` includes the spy's corpse.
+
+
+SCENARIO 633 — !ent hp sets by default; a sign changes it
+---------------------------------------------------------
+
+!match new h633 HP 8 6
+!match use h633
+!ent add hero Hero 30 2 2 10
+!ent add orc Orc 20 4 2 5
+!ent hp hero 20
+?? Set `hero` hp to 20 (was 30)
+!ent hp hero -3
+?? Damaged `hero` by 3
+!ent hp hero +5
+?? Healed `hero` by 5
+!assert "entity[hero].hp == 22"
+!ent hp hero max
+!assert "entity[hero].hp == 30" max sets to max_hp
+!ent hp hero 45
+?? It is at 30
+!assert "entity[hero].hp == 30" a set above max_hp is clamped like a heal
+!ent hp hero 45 bypass_clamp=yes
+?? (was 30, clamp bypassed)
+!assert "entity[hero].hp == 45"
+!ent set_var orc dmg 6
+!ent hp orc -$(entity[orc].dmg)
+?? Damaged `orc` by 6
+!ent hp orc "$(entity[orc].dmg)"
+?? Set `orc` hp to 6
+!ent hp orc +$(entity[orc].dmg)
+!assert "entity[orc].hp == 12" a bare $() sets, a signed one changes
+!ent group add pack orc
+!ent group add pack hero
+!ent hp group:pack 10
+!assert "entity[orc].hp == 10 and entity[hero].hp == 10" a group target sets each member
+!ent hp group:pack +4
+!assert "entity[orc].hp == 14 and entity[hero].hp == 14"
+!ent hp hero 2.5
+?? whole number
+!ent hp hero =
+?? hp amount must be
+
+Expected: HARNESS-ALLOWS-ERRORS. A plain number sets hp (30 → 20); `-3`
+damages and `+5` heals (→ 22); `max` sets max_hp (30). Setting 45 runs
+through the max_hp clamp like a heal, so the reply adds "It is at 30";
+`bypass_clamp=yes` lets it stand (45). For a computed amount the sign
+sits in front of the `$()`: `-$(entity[orc].dmg)` damages by 6, a bare
+`"$(...)"` sets 6, `+$(...)` heals 6 (→ 12). A group target sets or
+changes every member. A fraction and an empty `=` are refused (❌). Each
+`??` line checks the reply wording.
+
+
+SCENARIO 634 — !ent hp set in real use: a rally macro, `=-n`, and a lethal set
+------------------------------------------------------------------------------
+
+!match new h634 Rally 8 6
+!match use h634
+!ent add hero Hero 30 2 2 10
+!ent add rook Rook 25 3 2 8
+!ent add imp Imp 6 5 5 1
+!ent hp hero -18
+!ent hp rook -20
+!macro set rally "ent hp $1 max\nent hp $2 max"
+!macro run rally hero rook
+!assert "entity[hero].hp == 30 and entity[rook].hp == 25" the macro sets both back to max_hp
+!alias def setto "ent hp"
+!setto rook 9
+!assert "entity[rook].hp == 9" an alias over !ent hp sets too
+!ent hp imp 0
+?? Set `imp` hp to 0
+!assert "has_corpse('imp')" setting hp to 0 runs the death check like damage
+!ent hp hero =-4
+!assert "has_corpse('hero')" =-4 sets a negative value
+
+Expected: The `rally` macro uses `ent hp <id> max` to restore both units
+to their max_hp (30 and 25). An alias over `ent hp` sets as well (rook →
+9). Setting the imp's hp to 0 kills it through the normal death pipeline
+(it leaves a corpse), and `=-4` sets a negative value, which also kills
+the hero.
+
+
+SCENARIO 635 — Harness `??` / `?!` reply checks (a failing one on purpose)
+--------------------------------------------------------------------------
+
+!match new e635 Expect 8 6
+!match use e635
+!ent add hero Hero 30 2 2 10
+!ent move hero 1 right
+?? Moved `hero`
+?! ❌
+!ent move nobody 1 right
+?? not found
+?! Moved
+!ent info hero
+?? "Hero"
+?? this text is not in the reply
+
+Expected: HARNESS-ALLOWS-ERRORS. HARNESS-ALLOWS-ASSERT-FAIL. A `?? text`
+line checks that the reply of the command just before it contains the
+text; `?! text` checks it does not. Surrounding double quotes are
+stripped. The last line fails on purpose (❌ Expectation failed), which
+is why this scenario carries HARNESS-ALLOWS-ASSERT-FAIL — every other
+scenario has failing expectations flagged.
+
+
+SCENARIO 636 — !cancel: a player withdraws their own queued requests
+-------------------------------------------------------------------
+
+!match new c636 Cancel 8 6
+!match use c636
+!ent add hero Hero 30 2 2 10
+!ent add gob Gob 10 5 2 5
+!as player carol
+!ent move gob 1 down
+?? request `r1`
+!cancel
+?? Withdrew `r1`
+!ent move gob 1 down
+!ent move gob 1 left
+!ent hp gob -1
+!cancel r3
+?? Withdrew `r3`
+!as player dan
+!ent tp gob 1 1
+!cancel r2
+?? isn't your request
+!as player carol
+!cancel all
+?? Withdrew `r2`
+?? Withdrew `r4`
+!cancel
+?? You have no requests waiting
+!as host
+!pending
+?? `r5` by dan
+?! by carol
+
+Expected: HARNESS-ALLOWS-ERRORS. A bare `!cancel` withdraws carol's
+latest request (`r1`). `!cancel r3` withdraws one by id. Dan can't
+cancel carol's `r2` (❌ — a host uses `!deny`). `!cancel all` withdraws
+carol's remaining requests (`r2`, `r4`), after which she has none. The
+host's `!pending` lists only dan's `r5`.
+
+
+SCENARIO 637 — !match pause: players wait, reads still work, hosts keep playing
+------------------------------------------------------------------------------
+
+!match new p637 Pause 8 6
+!match use p637
+!ent add hero Hero 30 2 2 10
+!ent add gob Gob 10 5 2 5
+!match pause rules question
+?? hosts keep playing
+!as player carol
+!ent move gob 1 down
+?? is paused by cli: rules question
+?! request
+!list
+?? Gob
+!whoami
+?? the match is paused
+!match info
+?? paused
+!as host
+!pending
+?? No pending requests
+!ent move hero 1 right
+?? Moved `hero`
+!ent hp gob -2
+!undo command
+!assert "entity[gob].hp == 10"
+!match info
+?? is paused
+!match pause again
+?? is paused by cli
+!match resume
+?? Resumed
+!as player carol
+!ent move gob 1 down
+?? needs host approval
+
+Expected: HARNESS-ALLOWS-ERRORS. While paused, carol's state-changing
+command is refused outright with the reason (not queued — `!pending` stays
+empty), while `!list`, `!whoami` and `!match info` still work and say the
+match is paused. Hosts keep playing (pause_affects_hosts is off): the
+host moves the hero and damages the goblin. An undo reverts the damage but
+leaves the pause in place (pausing isn't game state). A second `!match
+pause` reports the existing pause. After `!match resume`, carol's
+commands queue for approval again.
+
+
+SCENARIO 638 — pause_affects_hosts: held host commands run on resume
+--------------------------------------------------------------------
+
+!system set default pause_affects_hosts true
+!match new p638 Hold 8 6
+!match use p638
+!ent add hero Hero 30 2 2 10
+!ent add gob Gob 10 5 2 5
+!host add bob
+!match pause
+?? hosts' are held
+!ent move hero 1 right
+?? `!ent move hero 1 right` is held
+!ent hp gob -3
+?? 2 commands waiting
+!map
+?! held
+!assert "entity[hero].x == 2 and entity[gob].hp == 10" nothing ran yet
+!match resume
+?? running 2 held command(s)
+?? Damaged `gob` by 3
+!assert "entity[hero].x == 3 and entity[gob].hp == 7" both ran, in order
+!assert "entity[hero].x == 3"
+?! held
+!undo command
+!assert "entity[hero].x == 2 and entity[gob].hp == 10" the resume and its held commands are one undo entry
+!match pause
+!as player bob
+!ent hp gob -1
+?? is held
+!as host
+!ent hp gob -2
+!system set default pause_affects_hosts false
+!host remove bob
+!system set default pause_affects_hosts true
+!match resume
+?? Skipped `!ent hp gob -1` — bob is no longer a host
+?? Damaged `gob` by 2
+!match pause
+!ent hp gob -5
+!match resume drop
+?? Dropped 1 held command(s)
+!assert "entity[gob].hp == 8"
+
+Expected: With pause_affects_hosts on, a host's state-changing commands
+are held while paused, while reads still run — `!map`, and `!assert`,
+which is host-only but changes nothing. `!match resume` runs the held move
+and damage in order (hero to x 3, goblin 10 → 7), and one undo reverts all
+of it. A command held by co-host bob is skipped on resume because bob was
+removed as a host in the meantime (with the rule briefly off so the removal
+runs at once); the owner's held damage still runs (→ 8).
+`!match resume drop` unpauses and discards what was held.
+
+
+SCENARIO 639 — !again: rerun your last command, through the same gate
+---------------------------------------------------------------------
+
+!again
+?? Nothing to repeat
+!match new a639 Again 10 6
+!match use a639
+!ent add hero Hero 30 2 2 10
+!ent add gob Gob 10 8 2 5
+!ent move hero 2 right
+!again
+?? 🔁 `!ent move hero 2 right`
+!assert "entity[hero].x == 6"
+!undo command
+!assert "entity[hero].x == 4" each rerun is its own undo entry
+!list
+!again
+?? Entities:
+!as player carol
+!ent move gob 1 left
+!again
+?? needs host approval (request `r2`
+!as host
+!again
+?? 🔁 `!list`
+
+Expected: HARNESS-ALLOWS-ERRORS. With nothing typed yet, `!again` says
+there's nothing to repeat. After `!ent move hero 2 right`, `!again` moves
+another 2 (x 6); one undo reverts only the rerun (x 4). `!again` reruns
+reads too (`!list`). It remembers each user separately: carol's `!again`
+repeats her move and is queued for approval like the original, while the
+host's `!again` still reruns the host's `!list` (the CLI's `!as` identity
+switch is never remembered).
+
+
+SCENARIO 640 — !tile copy: a trap tile copied (with its hook) and moved
+-----------------------------------------------------------------------
+
+!match new t640 Tiles 10 6
+!match use t640
+!ent add hero Hero 30 2 2 10
+!tile set 4 2 glyph ^
+!tile set 4 2 block "entity[self].flying != True"
+!tile hook add 4 2 on_enter "entity[self].hp = entity[self].hp - 5"
+!ent add rat Rat 3 6 4 1
+!ent kill rat
+!tile set 6 4 glyph ~
+!tile copy 4 2 6 4
+?? Copied tile (4,2) to (6,4) (its old data replaced)
+!assert "tile_get(6, 4, 'glyph') == '^' and has_corpse('rat')" the copy replaced the glyph; the corpse stayed
+!tile copy 4 2 3 3 move
+!assert "tile_get(3, 3, 'glyph') == '^' and not tile_has(4, 2, 'glyph')"
+!ent set_var hero flying true
+!ent tp hero 3 3
+!assert "entity[hero].hp == 25" the moved trap still fires
+!tile copy 4 2 5 5
+?? has no tile data
+!tile copy 3 3 11 1
+?? off the
+
+Expected: HARNESS-ALLOWS-ERRORS. Copying the trap at (4, 2) onto (6, 4)
+replaces the `~` glyph there with the trap's glyph, block condition and
+on_enter hook, while the rat's corpse lying on (6, 4) stays put. Moving
+it to (3, 3) empties (4, 2). A flying hero (the block condition lets it
+in) teleports onto (3, 3) and the moved hook fires (30 → 25). An empty
+source and an off-map destination are ❌.
+
+
+SCENARIO 641 — zone_distance: how far a 2x2 body is from a zone
+----------------------------------------------------------------
+
+!match new z641 Zones 12 8
+!match use z641
+!ent add ogre Ogre 40 2 2 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent add mage Mage 20 9 6 8
+!zone new fire
+!zone add fire 6 3
+!zone add fire 7 3
+!assert "zone_distance('ogre', 'fire') == 3" from the right edge of the body (x 3) to x 6
+!assert "zone_distance('ogre', 'fire', 'manhattan') == 3 and zone_distance('mage', 'fire') == 3"
+!ent tp ogre 5 2
+!assert "zone_distance('ogre', 'fire') == 0" any covered cell inside reads 0
+!zone new halo
+!zone anchor halo mage 1
+!system set default anchored_zone_on_anchor_loss suspend
+!ent kill mage
+!assert "zone_distance('ogre', 'halo') == None" a suspended aura has no cells
+!ent set_var ogre actions.scorch.target none
+!ent set_var ogre actions.scorch.body "if zone_distance(self, 'fire') > 1:\n    fail('too far from the fire')\nentity[self].hp = entity[self].hp - 3"
+!action ogre scorch
+!assert "entity[ogre].hp == 37"
+!ent set_var ogre gap "$(zone_distance('ogre','fire'))"
+!ent set_var ogre crowd "$(len(entities_at(5,2)))"
+!assert "entity[ogre].gap == 0 and entity[ogre].crowd == 1" both are read-only, so they work in $() arguments
+!eval "zone_distance('ogre', 'nowhere')"
+
+Expected: HARNESS-ALLOWS-ERRORS. The 2×2 ogre at (2, 2) covers x 2–3; the
+nearest fire cell (6, 3) is 3 away, whatever the metric here. The mage
+is 3 away too. After a teleport the ogre's body overlaps the zone: 0.
+The mage's halo aura is suspended when the mage dies, so it has no cells
+and the distance is None. An action gated on `zone_distance(self,
+'fire') > 1` runs (ogre 40 → 37). Both functions are read-only and work
+inside `$()` arguments. An unknown zone is a ❌.
+
+
+SCENARIO 642 — entities_at: every unit on a cell, stackable ones and riders
+--------------------------------------------------------------------------
+
+!match new e642 Stack 10 6
+!match use e642
+!ent add ogre Ogre 40 2 2 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!ent add wisp Wisp 5 6 2 3
+!ent set_var wisp __cell_stackable true
+!ent add rat Rat 3 6 3 1
+!ent tp wisp 3 3
+!assert "entities_at(3, 3) == ['ogre', 'wisp']" the ogre covers (3,3); the stackable wisp shares it
+!assert "cell_entity(3, 3) == 'ogre'" cell_entity names only the blocker
+!assert "entities_at(9, 5) == []"
+!ent add cart Cart 30 6 4 2
+!ent set_var cart slots.seat.capacity 1
+!ent set_var cart slots.top.capacity 1
+!ent set_var cart slots.top.region front
+!ent add p1 Pass 5 8 5 2
+!ent add g1 Gunner 5 9 5 2
+!mount p1 cart seat
+!mount g1 cart top
+!assert "entities_at(6, 4) == ['cart', 'g1']" the visible gunner is on the cell; the hidden passenger is not
+!ent set_var ogre actions.slam.target location
+!ent set_var ogre actions.slam.body "for t in entities_at(target.x, target.y):\n    entity[t].hp = entity[t].hp - 2"
+!action ogre slam 6 4
+!assert "entity[cart].hp == 28 and entity[g1].hp == 3 and entity[p1].hp == 5"
+
+Expected: The 2×2 ogre covers (3, 3), and the stackable wisp teleported
+there shares the cell: `entities_at(3, 3)` lists both in turn order, while
+`cell_entity` names only the ogre (the one that blocks). An empty cell
+gives []. On the cart's cell, the gunner in the visible `top` slot is
+listed, the passenger hidden inside is not. The ogre's `slam` hits
+everyone `entities_at` the target cell: cart 30 → 28, gunner 5 → 3, the
+passenger untouched.
+
+
+SCENARIO 643 — on_turn_skipped: react when a stun costs a unit its turn
+-----------------------------------------------------------------------
+
+!match new s643 Stun 8 6
+!match use s643
+!ent add hero Hero 30 2 2 10
+!ent add orc Orc 20 4 2 5
+!ent status orc add stunned
+!ent status orc set stunned skips_turn true
+!ent status orc add frozen
+!ent status orc set frozen skips_turn true
+!passive add orc shake on_turn_skipped "entity[self].lost = entity[self].lost + 1\nentity[self].why = skip_status"
+!ent set_var orc lost 0
+!turn next
+!turn next
+?? `orc`'s turn skipped (frozen, stunned)
+!assert "entity[orc].lost == 1 and entity[orc].why == 'frozen, stunned'"
+!gpassive add note on_turn_skipped "match.skips = match_var_get('skips', 0) + 1"
+!turn next
+!assert "entity[orc].lost == 2 and match.skips == 1"
+!ent status orc clear
+!turn next
+!turn next
+!assert "entity[orc].lost == 2" no skip, no hook
+!system set default atb_enabled true
+!ent status orc add stunned
+!ent status orc set stunned skips_turn true
+!turn next
+!turn next
+!turn next
+!assert "entity[orc].lost >= 3" under ATB too
+
+Expected: The orc carries two skips_turn statuses. When its turn comes up
+the skip line names both and `on_turn_skipped` fires on the orc with
+`skip_status` = "frozen, stunned" (lost 1). A global passive on the hook
+fires too on the next skip (lost 2, skips 1). With the statuses cleared,
+nothing fires. Under ATB the orc's skipped turns fire the hook as well.
+
+
+SCENARIO 644 — round_start_message_format: the round line
+--------------------------------------------------------
+
+!match new r644 Rounds 8 6
+!match use r644
+!ent add hero Hero 30 2 2 10
+!ent add orc Orc 20 4 2 5
+!turn next
+?? — Round 1 —
+!turn next
+?! Round
+!turn next
+?? — Round 2 —
+!system set default round_start_message_format "Round {round} of {match}: {match.weather}"
+!match var set weather rain
+!turn next
+!turn next
+?? Round 3 of Rounds: rain
+!system set default round_start_message_format "{match.missing}!"
+!turn next
+!turn next
+?? "!"
+!system set default round_start_message_format ""
+!turn next
+!turn next
+?! Round
+
+Expected: The default rule prints "— Round 1 —" on the first `!turn
+next` and "— Round 2 —" when the order wraps; a mid-round turn has no
+round line. A custom format fills {round}, {match} and a match var
+({match.weather} → rain); a missing match var renders empty. An empty
+rule prints no line.
+
+
+SCENARIO 645 — on_turn_skipped removing the last unit: the turn still reaches an able unit
+--------------------------------------------------------------------------------------------
+
+!match new s645 Fizzle 8 6
+!match use s645
+!ent add hero Hero 30 2 2 10
+!ent add orc Orc 20 4 2 5
+!ent add imp Imp 9 6 2 1
+!ent status orc add stunned
+!ent status orc set stunned skips_turn true
+!ent status imp add stunned
+!ent status imp set stunned skips_turn true
+!passive add imp fizzle on_turn_skipped "kill(self)"
+!turn next
+!turn next
+?? ⏭️ `imp`'s turn skipped (stunned).
+?? — Round 2 —
+?! every entity is skippable
+!assert "current_id() == 'hero' and round_number() == 2 and has_corpse('imp')"
+!turn next
+!assert "current_id() == 'hero' and round_number() == 3" one round per pass over the order
+
+Expected: The imp is last in the order and dies in its own on_turn_skipped
+handler. The pass over the stunned orc and imp then wraps the round once
+and gives the turn to the hero (round 2), with no "every entity is
+skippable" line — the skip loop tracks which units it has looked at, so a
+unit removed mid-pass can't cut it short. The next pass skips the orc
+and wraps once more (round 3).
+
+
+SCENARIO 646 — !again only as a typed command: no recursion through batches, macros, foreach or aliases
+-------------------------------------------------------------------------------------------------------
+
+!match new s646 Echo 8 6
+!match use s646
+!ent add hero Hero 30 2 2 10
+!ent set_var hero team red
+!alias def ag again
+!batch ent hp hero -1 ; again
+?? `!again` only works as a command typed on its own
+!again
+?? 🔁 `!batch ent hp hero -1 ; again`
+?? `!again` only works as a command typed on its own
+!assert "entity[hero].hp == 28" the batch ran twice and its again line was refused both times
+!macro set redo "again"
+!macro run redo
+?? `!again` only works as a command typed on its own
+!foreach team=red ; again
+?? `!again` only works as a command typed on its own
+!ent hp hero -2
+!ag
+?? 🔁 `!ent hp hero -2`
+!ag
+?? 🔁 `!ent hp hero -2`
+!assert "entity[hero].hp == 22" the alias repeats the last real command and is never remembered itself
+!host access set again host
+!as player
+!again
+?? Nothing to repeat
+?! needs host approval
+!as host
+
+Expected: Inside a batch, macro or foreach the last command typed is the
+one containing the `again` line, so `again` there is refused with a ❌
+(it used to rerun its container until Python's recursion limit). A
+typed `!again` after the batch reruns the batch once (30 → 29 → 28). An
+alias of `again` works like `!again` and is never the remembered
+command, so `!ag` twice repeats `!ent hp hero -2` twice (28 → 26 → 24 →
+22). An access override on `again` doesn't apply: it carries no
+authority of its own (the replayed command meets the gate), so the
+player's `!again` runs directly ("Nothing to repeat") instead of
+queueing.
+
+
+SCENARIO 647 — !ent hp reports hook output and deaths; malformed amounts are refused
+-------------------------------------------------------------------------------------
+
+!match new s647 Wounds 8 6
+!match use s647
+!ent add hero Hero 30 2 2 10
+!ent add orc Orc 10 4 2 5
+!passive add hero watch on_var_changed target=hp "log('hero hp now ' + str(entity[hero].hp))"
+!ent hp hero -5
+?? Damaged `hero` by 5.
+?? passive `hero.watch` fired
+!ent hp hero -0
+?? `hero` hp unchanged.
+!ent hp hero +-5
+?? ❌ hp amount must be a whole number
+!ent hp hero --5
+?? ❌ hp amount must be a whole number
+!ent hp hero 12345678901234567
+?? Set `hero` hp to 12345678901234567 (was 25). It is at 30.
+!ent hp orc =-3
+?? Set `orc` hp to -3 (was 10). `orc` died.
+!assert "has_corpse('orc') and entity[hero].hp == 30"
+
+Expected: A plain change shows the on_var_changed passive's output
+(it used to be dropped; `!ent set_var` always showed it). A zero change
+reads "hp unchanged". A doubled sign (`+-5`, `--5`) is a typo and is
+refused. A long number is read exactly (not through a float) and then
+clamped to max_hp. A set that kills says so.
+
+
+SCENARIO 648 — !ent transfer is all-or-nothing: a death on the way out or an unplaceable part leaves the destination untouched
+-----------------------------------------------------------------------------------------------------------------------------
+
+!match new dst648 Haven 5 5
+!match new s648 Exodus 10 10
+!match use s648
+!ent add runner Runner 10 1 1 5
+!gpassive add trap on_entity_despawned "kill(self)"
+!ent transfer runner dst648
+?? 💀 `runner` died as it left **Exodus**; it was not transferred.
+!assert "has_corpse('runner')" the runner died in the source
+!gpassive remove trap
+!ent add golem Golem 20 2 2 5
+!part add golem arm Arm 5 5
+!part locate arm 8 8
+!ent transfer golem dst648
+?? ❌ (8,8) outside 5x5
+!assert "has_part('golem', 'arm') and entity[arm].x == 8" the source keeps the whole body
+!match use dst648
+!list
+?? (no entities)
+!match use s648
+!ent transfer golem dst648 1 1
+?? (7,7) outside 5x5
+!ent add rock Rock 10 10 9 1
+!ent clone golem twin 3 5
+?? ❌ (9,11) outside 10x10 — nothing was cloned.
+!ent clone golem twin 3 3 4 3
+?? Cell (10,9) already occupied
+!assert "len(entities_at(3, 3)) == 0 and len(entities_at(4, 3)) == 0 and len(entities_at(9, 9)) == 0" no stray clone or arm
+
+Expected: An on_entity_despawned handler that kills the runner as it
+leaves makes it die in Exodus; the transfer is cancelled and Haven gets
+nothing (it used to get a living copy while the corpse lay in Exodus). A
+golem whose located arm would land off Haven's 5×5 map can't be moved:
+the transfer fails with Haven unchanged (it used to keep the golem
+without its arm while Exodus kept the original — two golems). Moving the
+anchor to (1,1) doesn't help: the arm keeps its offset from the body, so
+it would land on (7,7). `!ent clone` has the same all-or-nothing
+contract: a golem cloned to (3,5) puts its arm on (9,11) — off the map
+— and cloned to (3,3) and (4,3) the second copy's arm lands on the rock
+at (10,9); either way nothing is cloned. It used to leave the armless
+copies made before the failure on the board beside the ❌.
+
+
+SCENARIO 649 — Revive puts a located part whose cell is taken on the nearest free cell
+---------------------------------------------------------------------------------------
+
+!match new s649 Return 10 10
+!match use s649
+!ent add golem Golem 20 2 2 5
+!ent set_var golem footprint_w 2
+!ent set_var golem footprint_h 2
+!part add golem arm Arm 5 5
+!part locate arm 6 6
+!part add arm claw Claw 2 2
+!ent kill golem
+!ent add rock Rock 10 6 6 1
+!ent revive golem
+?? ⚠️ part `arm` couldn't return to (6,6) (Cell (6,6) already occupied); placed at (5,5).
+!assert "part_of('arm') == 'golem' and entity[arm].x == 5 and entity[arm].y == 5"
+!assert "part_of('claw') == 'arm' and entity[claw].x == 5 and entity[claw].y == 5" the glued claw rides with its arm
+
+Expected: The arm's stored cell (6,6) holds a rock, so the revived arm
+goes to the nearest free cell (5,5) and the reply says so; it used to be
+dropped without a word, losing the limb for good. Its glued claw comes
+back on the arm's new cell. Transform / revert already placed displaced
+located parts this way.
+
+
+SCENARIO 650 — set_var keeps inf / nan as words; !roll needs an operator between terms; diffs name unset values
+---------------------------------------------------------------------------------------------------------------
+
+!match new s650 Odds 8 8
+!match use s650
+!ent add hero Hero 30 2 2 5
+!ent set_var hero title Infinity
+!ent set_var hero mood nan
+!assert "entity[hero].title == 'Infinity' and entity[hero].mood == 'nan'" words stay strings
+!eval "var_set('hero', 'hp', float('inf'))"
+?? ❌ Vital var 'hp' must be a finite number
+!roll 1d6 1d6
+?? ❌ `1d6 1d6`: put `+` or `-` between dice terms
+!roll odds 1d6!
+?? (81 possible totals
+!team set red gold 5
+!undo command 1 preview
+?? red.gold: 5 -> (unset)
+
+Expected: float() reads "inf" / "nan" / "Infinity" as numbers, so
+`!ent set_var` used to store a non-finite float that poisons comparisons
+and sorts; words like these now stay strings. Writing infinity to hp is
+refused with a clear message (it was a raw "cannot convert float
+infinity" error). `!roll 1d6 1d6` joined into the malformed term
+`1d61d6`; it now asks for an operator. An exploding d6 never totals a
+multiple of 6, so `!roll odds 1d6!` counts 81 reachable totals over the
+1–96 span. The undo preview says `5 -> (unset)` where it used to print
+`- 5`, which read as minus five.
+HARNESS-ALLOWS-ERRORS: the hp write is refused on purpose.
+
+
+SCENARIO 651 — roster_glued_parts: glued parts stay off !list by default; a part's __roster_show overrides
+----------------------------------------------------------------------------------------------------------
+
+!match new s651 Roster 10 6
+!match use s651
+!ent add ogre Ogre 60 2 2 5
+!ent set_var ogre footprint_w 2
+!part add ogre head Head 20 20
+!part add ogre arm Arm 15 15
+!part add ogre turret Turret 10 10
+!ent init turret 3
+!part add ogre tail Tail 8 8
+!part locate tail 6 2
+!list
+?! (head)
+?! (arm)
+?? Turret (turret)
+?? Tail (tail)
+!ent set_var arm __roster_show true
+!ent set_var tail __roster_show false
+!list
+?? Arm (arm)
+?! (head)
+?! (tail)
+!system set default roster_glued_parts true
+!list
+?? Head (head)
+?! (tail)
+!system set default roster_glued_parts false
+!part list ogre
+?? `head` (Head)
+
+Expected: By default the roster lists the Ogre, its turret (a glued part
+with its own initiative takes its own turns, so it always lists) and the
+tail (a located part on its own cell), but not the glued head and arm —
+`!part list ogre` still shows every part. `__roster_show true` brings the
+arm back and `__roster_show false` hides the located tail. Turning
+roster_glued_parts on lists the head too; the tail's own false still
+wins.
+
+
+SCENARIO 652 — Formula changes show their hook output: !eval, actions, passive chains, batch lines
+---------------------------------------------------------------------------------------------------
+
+!match new s652 Echoes 10 10
+!match use s652
+!ent add mage Mage 20 1 1 5
+!ent add rat Rat 5 3 3 3
+!ent add bat Bat 5 5 5 3
+!gpassive add obit on_death "log('obit')"
+!eval "kill('rat')"
+?? ⚙️ global passive `obit` fired on `rat` (on_death)
+!ent set_var mage tmpl.name Imp
+!ent set_var mage tmpl.vars.hp 3
+!ent set_var mage tmpl.vars.max_hp 3
+!gpassive add hello on_entity_spawned "log('spawned')"
+!ent set_var mage actions.call.body "summon_from('tmpl', 8, 8)"
+!ent set_var mage actions.call.target none
+!action mage call
+?? ⚙️ global passive `hello` fired on `imp` (on_entity_spawned)
+!ent set_var mage actions.flop.body "summon_from('tmpl', 9, 9)\nfail('nope')"
+!ent set_var mage actions.flop.target none
+!action mage flop
+?! hello
+!assert "len(entities_at(9, 9)) == 0" the failed action rolled its summon back
+!passive add bat grudge on_var_changed target=hp "kill('mage')"
+!batch ent hp bat -1 ; eval 1
+?? ⚙️ global passive `obit` fired on `mage` (on_death)
+!assert "has_corpse('mage') and has_corpse('rat')"
+
+Expected: A formula's changes used to drop their hook output; commands
+were the only thing that showed it. Now `!eval "kill('rat')"` shows the
+on_death passive line after the result. A successful action shows the
+on_entity_spawned line of the imp it summoned (in the action's own
+output), and a failed action shows none (its output is dropped with its
+rollback). A passive chain (the bat's hp change kills the mage) shows
+the mage's on_death line right after that batch line.
+
+
+SCENARIO 653 — !turn next lists what happened before whose turn it is; a clone starts unpaused
+-----------------------------------------------------------------------------------------------
+
+!match new s653 Order 8 6
+!match use s653
+!ent add hero Hero 30 2 2 10
+!ent add orc Orc 20 4 2 5
+!gpassive add dawn on_round_start "log('dawn')"
+!turn next
+!turn next
+!turn next
+?? — Round 2 —
+!match pause tea break
+!match clone s653b
+!match use s653b
+!match info
+?! paused
+!match use s653
+!match info
+?? paused
+
+Expected: The third `!turn next` wraps to round 2; its reply prints the
+round line and the round-start hook output first and "It is now **Hero**'s
+turn" last, in the order things happened (the summary used to come
+first). Cloning the paused table gives an unpaused copy (the pause
+belongs to the original table, which stays paused).
+
+
+SCENARIO 654 — undo and restore keep the GameSystem's current rules
+--------------------------------------------------------------------
+
+!match new s654 Rules 8 6
+!match use s654
+!ent add hero Hero 30 2 2 10
+!history save before
+!ent hp hero -5
+!system set default round_start_message_format "== R{round} =="
+!undo command 1
+!assert "entity[hero].hp == 30" "the undo reverted the hp change"
+!turn next
+?? == R1 ==
+!history restore before confirm
+!turn next
+?? == R1 ==
+!system set default round_start_message_format "— Round {round} —"
+
+Expected: `!system set` is a bot-wide setting, so it is not an undo step
+on the match: `!undo command 1` reverts the hp change before it (hero
+back to 30). The undo and the restore of a save taken before the edit
+both keep the system's current rules on the match — the custom round
+line still prints. Before, they restored the snapshot's copy of the
+rules, running the match on the old format until a reload.
+
+
+SCENARIO 655 — !system set refuses out-of-range numbers for bounded rules
+--------------------------------------------------------------------------
+
+!system set default formula_cell_limit -1
+?? ❌ Setting 'formula_cell_limit' must be at least 1, got -1.
+!system set default fog_opacity 150
+?? ❌ Setting 'fog_opacity' must be between 0 and 100, got 150.
+!system set default max_grid_dimension 0
+?? (or -1 for unlimited)
+!system set default max_grid_dimension -1
+?? max_grid_dimension = -1
+!system set default event_log_retention -2
+?? ❌ Setting 'event_log_retention' must be at least 0 (or -1 for unlimited), got -2.
+!system set default summon_event_limit 0
+?? summon_event_limit = 0
+!system rules
+?? (type: int, 0-100; default: 60)
+?? (type: int, >= 1 or -1 = unlimited; default: 500)
+!system set default max_grid_dimension 500
+!system set default summon_event_limit 50
+
+Expected: Bounded integer rules are checked when set. `formula_cell_limit
+-1` used to be accepted and then refuse every sight line and burst ("over
+the formula_cell_limit of -1"); `-1` means "unlimited" only on the rules
+that say so (the autosave / event-log retentions, the undo confirmation
+thresholds, max_grid_dimension). An opacity outside 0-100 is refused at
+set time (it used to be stored and refused or clamped on use). A limit
+whose 0 has a meaning (summon_event_limit 0 = no summons) still takes 0.
+`!system rules` shows each bounded rule's range.
+
+
+SCENARIO 656 — !system set checks formula-valued rules
+-------------------------------------------------------
+
+!match new s656 Formulas 8 6
+!match use s656
+!ent add hero Hero 30 2 2 10
+!system set default entity_visibility_condition "entity[self].team == redd"
+?? ❌ `entity_visibility_condition` must be a valid formula expression: Unknown identifier 'redd'
+!system set default death_condition "[x for x in range(3)]"
+?? must be a valid formula expression: Disallowed syntax: ListComp
+!system set default default_kill_function_effects "entity[self].hp = 0\nentity[self].downed = True"
+?! ❌
+!system set default alive_condition "lucky(self)"
+?? ⚠️ Function 'lucky' isn't a built-in or a `!func` on this system or its matches yet
+!system set default alive_condition ""
+!func def lucky e "entity[e].hp > 0"
+!system set default alive_condition "lucky(self)"
+?! ⚠️
+!list
+?? Hero (hero)
+!system set default alive_condition ""
+!system set default default_kill_function_effects "entity[self].hp = 0"
+
+Expected: A formula rule with an error (an unknown name, a disallowed
+construct, a syntax error) is refused when set. Before, it was stored and failed open at use: a typo'd
+visibility condition showed every unit, a broken death condition never
+killed. A program rule (the kill effects) takes several statements. A call
+to a function nobody defines is stored with a warning, since a `!func` may
+come later; once the match defines `lucky` the same rule sets cleanly and
+works.
+
+
+SCENARIO 657 — block / opaque formulas: a warning when set, the failure named by !map cell
+-------------------------------------------------------------------------------------------
+
+!match new s657 Walls 8 6
+!match use s657
+!ent add scout Scout 20 1 1 5
+!tile set 2 1 block "not entity[self].flying or flyng"
+?? ⚠️ `block` isn't a working formula (Unknown identifier 'flyng'
+!tile line 1 3 4 3 opaque "entity[self].eyes >= 2"
+?! ⚠️
+!zone new smoke
+!zone fill smoke 3 1 3 1
+!zone set smoke opaque "entity[self].eyes > two"
+?? ⚠️ `opaque` isn't a working formula
+!tile set 3 1 block "not entity[self].flying"
+!map cell 3 1 for=scout
+?? For `scout`: blocks movement: no · blocks sight: no
+?? ⚠️ a movement condition failed for `scout` and counts as no: `not entity[self].flying`: Variable 'flying' is not defined.
+!ent set_var scout flying false
+!map cell 3 1 for=scout
+?? For `scout`: blocks movement: yes
+?! a movement condition failed
+
+Expected: A `block` / `opaque` value that is a broken formula is still
+stored, with a warning: these conditions fail open (a broken wall never
+blocks, broken smoke never hides), so the typo used to go unnoticed. A
+valid formula (the opaque line) sets quietly. `!map cell ... for=<unit>`
+names a condition that failed at use and counted as "no" — here the
+scout has no `flying` var yet; once it does, the wall blocks it.
+
+
+SCENARIO 658 — a save file that fails to load leaves the bot as it was
+-----------------------------------------------------------------------
+
+!match new s658 Keep 8 6
+!match use s658
+!ent add hero Hero 30 2 2 10
+!history save cp
+!history export manual:cp snap658.json
+!store load snap658.json
+?? ❌ Invalid save file format in 'saves/snap658.json'
+!match info
+?? Keep
+!assert "entity[hero].hp == 30" "the match survived the failed load"
+
+Expected: `!history export` writes one match snapshot, which isn't a full
+save (it has no game systems), so `!store load` refuses it. The load is
+all-or-nothing: the matches, systems and channel pointers are only
+replaced once the whole file has parsed. Before, a file that failed
+partway had already replaced the matches (here with none), so the
+refusal came with every match on the bot gone.
+
+
+SCENARIO 659 — a snapshot imported from another match restores its board, not its identity
+-------------------------------------------------------------------------------------------
+
+!match new s659a Source 8 8
+!match use s659a
+!ent add scout Scout 10 1 1 5
+!history save board
+!history export manual:board board659.json
+!store save full659.json
+!match new s659b Target 6 6
+!match use s659b
+!ent add guard Guard 10 2 2 5
+!history import full659.json
+?? it's a full bot save — that loads with `!store load`
+!history import board659.json as fromsource
+!history restore fromsource confirm
+!match info
+?? **Target** (`s659b`)
+!list
+?? Scout (scout)
+!match use s659a
+!match info
+?? **Source** (`s659a`)
+
+Expected: Importing a whole-bot save with `!history import` names the
+command that loads it (it used to fail with the bare key `'kind'`). The
+Source board exported and restored into Target replaces Target's board
+(Scout instead of Guard, an 8×8 grid), but Target keeps its id, name and
+hosts. Before, the restore installed the snapshot's own id: two matches
+both reported `s659a`, and Target's approval requests were filed under
+the other match.
+
+
+SCENARIO 660 — a part hit and a `source.` write show their hook output
+-----------------------------------------------------------------------
+
+!match new s660 Output 8 8
+!match use s660
+!ent add boss Boss 5 3 3 5
+!part add boss head Head 20 20
+!ent set_var head to_main_percent 100
+!ent set_var head to_main_cap none
+!gpassive add obit on_death "log('obit')"
+!passive add boss flinch on_var_changed target=hp "entity[boss].flinched = 1"
+!eval "damage_part('head', 3)"
+?? ⚙️ passive `boss.flinch` fired on `boss` (on_var_changed)
+!eval "damage_part('head', 10)"
+?? ⚙️ global passive `obit` fired on `boss` (on_death)
+!list
+?? Boss (`boss`): HP: -8/5
+!ent add hero Hero 20 6 6 5
+!ent set_var hero inventory.potion.uses 2
+!ent set_var hero inventory.potion.actions.drink.body "source.uses = source.uses - 1"
+!passive add hero tally on_var_changed target=inventory.potion.uses "entity[hero].drinks = 1"
+!action hero drink
+?? ⚙️ passive `hero.tally` fired on `hero` (on_var_changed)
+!assert "entity[hero].inventory.potion.uses == 1"
+
+Expected: Damage to a part goes to the parent's hp first (100% here); the
+parent's hp hook and, on the lethal hit, its death now show in the reply.
+Before, damage_part dropped the log of both hp writes, so a boss killed
+through its head died without a line, and after that death removed the
+head (snapshotted into the corpse) the part's own write went to a
+detached object. An action body that writes through `source.` (an item's
+own vars) shows the hook it triggers too, like an `entity[x].path = ...`
+write does.
+
+
+SCENARIO 661 — mode names are checked: distance metrics, damage_spread, to_main_cap, str rules
+-------------------------------------------------------------------------------------------------
+
+!match new s661 Modes 8 8
+!match use s661
+!ent add a A 20 1 1 5
+!ent add b B 20 4 4 5
+!part add b arm Arm 5 5
+!eval --as a "entities_within('a', 3, 'manhatan')"
+?? ❌ unknown distance mode 'manhatan'
+!eval --as a "entities_within('a', 6, 'manhattan')"
+?? = `['b']`
+!dist a b manhatan
+?? ❌ `manhatan` isn't a metric
+!eval "damage_spread('b', 4, 'wieghted')"
+?? ❌ damage_spread: mode 'wieghted' isn't weighted, uniform, fragment or main_only.
+!eval "damage_spread('b', 4, 'fragment', 10**9)"
+?? over the formula_loop_limit of 10000
+!ent set_var arm to_main_percent 50
+!ent set_var arm to_main_cap max_HP
+!eval "damage_part('arm', 2)"
+?? ❌ damage_part `arm`: to_main_cap 'max_HP' isn't none, max_hp, remaining_hp or absolute:<n>
+!assert "entity[b].hp == 20 and entity[arm].hp == 5" "the refused hit changed nothing"
+!system set default aoe_default_mode wieghted
+?? ❌ Setting 'aoe_default_mode' must be one of: weighted, uniform, fragment, main_only
+!system set default part_to_main_cap_default absolute:4
+?? part_to_main_cap_default = 'absolute:4'
+!system set default part_to_main_cap_default max_hp
+!ent set_var b sprite_mode stretchh
+?? ⚠️ the engine reads `sprite_mode` as one of single, stretch, tile — `stretchh` isn't one of them
+!ent set_var b sprite_mode stretch
+?! ⚠️
+
+Expected: Each of these used to accept a typo and quietly do something
+else. entities_within / nearest_entity / `near:` / `!dist` read an unknown
+distance mode as Chebyshev (now refused at the shared _rect_gap);
+damage_spread split by weight on an unknown mode, and a fragment count of
+10**9 looped a billion times; a part whose `to_main_cap` was misspelled
+passed the whole hit through uncapped; the str rules with fixed choices
+(aoe_default_mode, hit_location_mode, the segment modes,
+part_to_main_cap_default, which also takes absolute:<n>) stored any
+value. Engine-read vars with fixed words (sprite_mode, sprite_mirror,
+mount_action_actor, the `__segment_*` modes, to_main_cap) still store
+what `!ent set_var` is given, with a warning naming the words the engine
+reads.
+
+
+SCENARIO 662 — counts, radii and areas: zero / negative refused, huge areas clipped to the grid
+-----------------------------------------------------------------------------------------------
+
+!match new s662 Bounds 8 8
+!match use s662
+!match fog on
+!ent add scout Scout 20 1 1 5
+!ent set_var scout team red
+!ent move scout 0 right
+?? ❌ A step count must be at least 1, got 0.
+!ent move scout -2 down
+?? ❌ A step count must be at least 1, got -2.
+!assert "entity[scout].x == 1 and entity[scout].y == 1" "the refused moves left it in place"
+!reveal_fog red at 1 1 -1
+?? ❌ the radius must be 0 or more, got -1.
+!reveal_fog red around scout 2 turns=0
+?? ❌ `turns=` must be at least 1, got 0
+!reveal_fog red at 1 1 1000000
+?? Revealed 64 cell(s) to team `red` permanently.
+!tile fill 7 7 1000000 1000000 glyph #
+?? on 4 tile(s)
+!tile line 1 1 1 1000000000 glyph =
+?? ❌ line (1,1)->(1,1000000000) crosses up to 1000000000 cells, over the formula_cell_limit
+!zone new zz
+!eval "zone_fill('zz', 1, 1, 10**6, 10**6)"
+?? = `64`
+!status def burn
+!status apply scout burn -2
+?? ❌ level can't be negative, got -2.
+!eval "status_apply('scout', 'burn', 1, -5)"
+?? duration can't be negative, got -5.
+
+Expected: `!ent move <id> 0 right` and `-2 down` each used to move one step
+(the walk ran max(1, n) steps); a count below 1 is now refused. A negative
+reveal radius used to "reveal 0 cells permanently" and `turns=0` /
+negative made a reveal that expired at once; both are refused. Huge areas
+are clipped to the grid while they are built: `!reveal_fog ... at 1 1
+1000000`, `!tile fill` to a far corner and `zone_fill` to 10**6 each used
+to walk the whole rectangle (trillions of cells) before keeping the 8x8
+on-grid part, which hung the bot; `!tile line` to a far point is refused
+over formula_cell_limit. A negative status level or duration (command or
+formula) is refused instead of applied as given.
+
+
+SCENARIO 663 — a dict copied through a formula is a copy, not a shared object
+------------------------------------------------------------------------------
+
+!match new s663 Alias 8 8
+!match use s663
+!ent add a A 20 1 1 5
+!ent add b B 20 3 3 4
+!ent set_var b inv.sword.dmg 5
+!passive add b watch on_var_changed target=inv "entity[b].noticed = 1"
+!eval "entity[a].inv = entity[b].inv"
+!eval "entity[a].inv.sword.dmg = 99"
+?! passive `b.watch` fired
+!assert "var_get('b', 'inv.sword.dmg') == 5" "b's sword is its own"
+!assert "not var_has('b', 'noticed')" "b's hook didn't fire for a's write"
+!team set red stash.k 1
+!eval "team_set('blue', 'stash', team_get('red', 'stash'))"
+!eval "team_set('blue', 'stash.k', 50)"
+!assert "team_get('red', 'stash.k') == 1"
+!eval "match_var_set('mv', var_get('b', 'inv'))"
+!eval "tile_set(2, 2, 'loot', var_get('b', 'inv'))"
+!eval "entity[b].inv.sword.dmg = 3"
+!assert "match_var_get('mv.sword.dmg') == 5 and tile_get(2, 2, 'loot.sword.dmg') == 5"
+!eval "entity[a].ranks = {1: 'gold', 2: 'silver'}"
+!assert "var_get('a', 'ranks.1') == 'gold'" "a stored dict's keys are strings, reachable by path"
+
+Expected: Reading a dict out of one unit's vars and writing it into another
+(or into team data, a match var, a tile, a zone or a status) stores a copy.
+Before, both places held ONE object: setting a's sword to 99 also changed
+b's (without b's on_var_changed hook firing — b never saw the write), the
+blue team's stash edit changed red's, and later edits to b's inventory
+showed up in the match var and the tile. A save/load then split them into
+separate copies, so the board behaved differently after a reload. For the
+same reason a stored dict's keys become strings, as a save/load makes them:
+`{1: 'gold'}` couldn't be reached by the path `ranks.1` until a reload.
+
+
+SCENARIO 664 — a team's own passenger stays on its roster
+----------------------------------------------------------
+
+!match new s664 Ride 10 10
+!match use s664
+!match fog on
+!ent add scout Scout 20 1 1 5
+!ent set_var scout team red
+!ent set_var scout fog_vision_radius 3
+!ent add cart Cart 20 2 2 4
+!ent set_var cart team red
+!ent set_var cart slots.seat.capacity 1
+!mount scout cart seat
+!ent add spy Spy 20 3 2 3
+!ent set_var spy team blue
+!ent set_var cart slots.hold.capacity 1
+!mount spy cart hold
+!as view red
+!list
+?? Scout (scout)
+?! Spy (spy)
+!turn
+?? Scout
+!as view clear
+
+Expected: Scout rides inside the cart (a slot with no region, so a hidden
+rider) and is on team red; red's `!list` still shows it, like `!turn` and
+`!find` already did — a team's own units are never hidden from its view.
+Before, the roster dropped every hidden rider, so red's own scout vanished
+from red's `!list` while it rode. Spy (team blue) rides in the same cart
+and stays hidden from red.
+
+
+SCENARIO 665 — move_step walks: facing, walls and a snake's body
+-----------------------------------------------------------------
+
+!match new s665 Step 8 8
+!match use s665
+!ent add a A 20 1 1 5
+!tile set 2 1 block true
+!eval "move_step('a', 'right')"
+?? = `False`
+!eval "move_step('a', 'down')"
+?? = `True`
+!assert "facing_of('a') == 'down'" "the walker faces its step"
+!ent add w W 20 1 5 4
+!part segment w s1 S 5 5
+!part segment w s2 S 5 5
+!eval "move_step('w', 'right')"
+!eval "move_step('w', 'up')"
+!assert "entity[s1].x == 2 and entity[s1].y == 5" "the first segment trails into the head's old cell"
+!assert "entity[s2].x == 1 and entity[s2].y == 5"
+!assert "facing_of('w') == 'up'"
+
+Expected: move_step is now a one-cell walk through the same path as `!ent
+move <id> 1 <dir>`. Before, it teleported to the next cell: a wall
+(`block true`) raised "Cell (2,1) blocks `a`" where the docs promise
+False, the walker kept its old facing, the block_tp rule applied instead
+of block_walk, on_entity_step never fired, and a snake head left its body
+behind (s1 / s2 stayed put). Now the head's two steps pull s1 into (2,5)
+and s2 into (1,5).
+
+
+SCENARIO 666 — a path with an empty segment is refused, not stored under ""
+----------------------------------------------------------------------------
+
+!match new s666 Paths 8 8
+!match use s666
+!ent add a A 20 1 1 5
+!ent set_var a inventory..sword 1
+?? ❌ Variable path 'inventory..sword' has an empty segment
+!ent set_var a .lead 1
+?? has an empty segment
+!eval "var_set('a', 'bag.', 2)"
+?? has an empty segment
+!tile set 2 2 a..b 1
+?? ❌ tile path 'a..b' has an empty segment
+!team set red a..b 1
+?? ❌ team path 'a..b' has an empty segment
+!eval "match_var_set('m..n', 1)"
+?? has an empty segment
+!assert "not var_has('a', 'inventory') and not var_has('a', 'bag')" "nothing was stored"
+
+Expected: A doubled, leading or trailing dot in a var / tile / team / zone
+/ match-var / status / template / default-var path is refused. Before, the
+empty segment became a key named "": `inventory..sword` stored
+inventory[""]["sword"], `.lead` stored vars[""]["lead"], and the typo never
+surfaced.
+
+
+SCENARIO 667 — rounding_mode decides how a half lands (damage_part, transform)
+-------------------------------------------------------------------------------
+
+!match new s667 Round 8 8
+!match use s667
+!ent add boss Boss 100 3 3 5
+!part add boss arm Arm 20 20
+!ent set_var arm to_main_percent 50
+!eval "damage_part('arm', 5)"
+?? = `3`
+!system set default rounding_mode half_even
+!eval "damage_part('arm', 5)"
+?? = `2`
+!eval "damage_part('arm', 7)"
+?? = `4`
+!system set default rounding_mode floor
+!eval "damage_part('arm', 7)"
+?? = `3`
+!system set default rounding_mode half_up
+!ent add w W 3 6 6 4
+!ent set_var w max_hp 4
+!ent set_var w form.name Ogre
+!ent set_var w form.vars.hp 10
+!ent set_var w form.vars.max_hp 10
+!ent transform w form
+!assert "entity[w].hp == 8" "3/4 of 10 = 7.5 rounds up to 8"
+
+Expected: half of a 5-point arm hit goes to the boss: 2.5, which half_up
+(the default) rounds to 3. half_even gives Python's round(): 2 for 2.5 and
+4 for 3.5; floor gives 3 for 3.5. Transform's percent hp uses the same
+rule: 3/4 hp carried into a 10-hp form is 7.5, so 8. Before, both always
+used round(), so a half went to the even number.
+
+
+SCENARIO 668 — writing under a key that holds a value is refused everywhere
+----------------------------------------------------------------------------
+
+!match new s668 Nest 8 8
+!match use s668
+!ent add a A 20 1 1 5
+!ent set_var a potion 99
+!ent set_var a potion.amount 1
+?? ❌ `a` value at 'potion' is int, not a dict — cannot set a nested key under it without clobbering.
+!eval "var_set('a', 'potion.amount', 1)"
+?? cannot set a nested key
+!team set red gold 5
+!team set red gold.coins 1
+?? ❌ team `red` value at 'gold' is int
+!match var set k 5
+!match var set k.x 1
+?? ❌ match var value at 'k' is int
+!assert "entity[a].potion == 99 and team_get('red', 'gold') == 5 and match_var_get('k') == 5" "nothing was clobbered"
+
+Expected: Unit vars, team data and match vars now refuse a nested write
+under a key holding a value, as tiles, zones and statuses already did.
+Before, `potion.amount` silently replaced potion's 99 with {amount: 1}
+(a typo wiped a number). Delete or overwrite the key first to make it a
+dict on purpose.
+
+
+SCENARIO 669 — pov_own_team_visible: a team sees its own invisible unit
+------------------------------------------------------------------------
+
+!match new s669 Cloak 6 3
+!match use s669
+!ent add scout Scout 20 1 1 5
+!ent set_var scout team red
+!ent set_var scout glyph S
+!ent set_var scout invisible true
+!ent add brute Brute 20 4 1 4
+!ent set_var brute team blue
+!ent set_var brute glyph B
+!system set default entity_visibility_condition "not var_get(self_id(), 'invisible', False)"
+!as view red
+!map
+?? S
+!list
+?? Scout (scout)
+!as view blue
+!map
+?! S
+!system set default pov_own_team_visible false
+!as view red
+!map
+?! S
+!list
+?! Scout (scout)
+!as view clear
+!system set default pov_own_team_visible true
+!system set default entity_visibility_condition ""
+
+Expected: The visibility condition hides invisible units. Red's own
+invisible scout still shows on red's map and roster (the default
+pov_own_team_visible), and stays hidden from blue. With the rule off, the
+condition applies to red's own units too: the scout disappears from red's
+map and `!list`. Before, the map always applied the condition to a team's
+own units while the roster and queries never did.
+
+
+SCENARIO 670 — coordinates are lists, the same before and after a reload
+-------------------------------------------------------------------------
+
+!match new s670 Coords 8 8
+!match use s670
+!ent add a A 20 2 2 5
+!eval "free_cell_near(3, 3, 1)"
+?? = `[3, 3]`
+!eval "entity[a].spot = free_cell_near(3, 3, 1)"
+!eval "entity[a].traps = cells_in_rect(5, 5, 6, 5)"
+!assert "entity[a].spot == (3, 3) and [6, 5] in entity[a].traps"
+!store save coords670.json
+!store load coords670.json
+!match use s670
+!assert "entity[a].spot == (3, 3) and (6, 5) in entity[a].traps" "same answers after the reload"
+
+Expected: Coordinates in formulas are lists: functions return [x, y] (and
+lists of them), a tuple written in a formula ((3, 3)) is built as a list,
+and a stored coordinate is a list. Before, functions returned tuples that
+stayed tuples in a var until a save/load turned them into lists, so
+`entity[a].spot == (3, 3)` and `(6, 5) in entity[a].traps` were True
+before a reload and False after. Both are True on both sides now.
+
+
+SCENARIO 671 — templates and statblocks hold to the vital-var and reserved-name checks
+---------------------------------------------------------------------------------------
+
+!match new s671 Templates 10 10
+!match use s671
+!ent add mage Mage 20 1 1 5
+!ent set_var mage gob.name Gob
+!ent set_var mage gob.vars.hp abc
+!eval --as mage "summon_from('gob', 4, 4)"
+?? vital var 'hp' must be a finite whole number
+!ent set_var mage gob.vars.hp 6
+!ent set_var mage gob.vars.x 9
+!eval --as mage "summon_from('gob', 4, 4)"
+?? `x` is a reserved var path
+!ent delete_var mage gob.vars.x
+!ent set_var mage gob.vars.max_hp 7.9
+!ent set_var mage gob.parts.arm.vars.hp oops
+!eval --as mage "summon_from('gob', 4, 4)"
+?? part `arm` was not created
+!assert "var_get('gob', 'max_hp') == 7 and not has_part('gob', 'arm')"
+!part add mage staff Staff 5 5
+!ent set_var mage forms.bad.name Bad
+!ent set_var mage forms.bad.vars.hp 10
+!ent set_var mage forms.bad.vars.name Evil
+!ent transform mage forms.bad old
+?? `name` is a reserved var path
+!system set default transform_hp_mode full
+!ent set_var mage forms.nohp.name NoHp
+!ent set_var mage forms.nohp.vars.max_hp 10
+!ent transform mage forms.nohp old
+?? the new form has no `hp`
+!assert "has_part('mage', 'staff') and not var_has('mage', 'old')" "a refused transform changes nothing"
+!defvar add max_hp abc
+?? its default must be a whole number
+!defvar add initiative.x 3
+?? its default must be a whole number
+!system set default transform_hp_mode percent
+
+Expected: HARNESS-ALLOWS-ERRORS. Spawning and transforming set a unit's vars
+wholesale, and used to store whatever the template held: a summon template
+with `hp: 'abc'` made a unit that broke `!list` and every hp read, and a
+template var named `x` (a reserved var path) made a var the engine can't
+reach. Both are refused now, as write_var refuses them one write at a time; a
+numeric string or float is coerced (max_hp 7.9 -> 7). A part template the
+summon can't create is skipped with a ⚠️ line naming it, where it used to
+vanish without a word. A transform into a statblock with a reserved var or
+no hp is refused before anything changes (the staff part and the stash path
+stay as they were). `!defvar add` refuses a non-number default for a vital
+var, and nesting under one.
+
+
+SCENARIO 672 — a status's level and duration are numbers
+---------------------------------------------------------
+
+!match new s672 StatusNums 10 10
+!match use s672
+!ent add h Hero 30 1 1 5
+!status def burn
+!status stack burn add_level
+!status apply h burn
+!ent status h set burn level abc
+?? `level` must be a finite number
+!ent status h set burn duration.x 1
+?? nothing can be nested under it
+!status data burn level abc
+?? `level` must be a finite number
+!eval "status_set('h', 'burn', 'level', True)"
+?? `level` must be a finite number
+!ent status h set burn level 2.5
+!status apply h burn
+?? level=3.5
+!eval "status_set('h', 'burn', 'charges', 'q')"
+!eval "status_counter_add('h', 'burn', -1, 'charges')"
+?? holds 'q', not a number
+!assert "status_has('h', 'burn')"
+
+Expected: HARNESS-ALLOWS-ERRORS. `level` and `duration` on a status instance
+(and in a definition's seed data) are number fields: text, a bool or a
+nested key is refused by `!ent status set`, `!status data` and status_set.
+Before, `!ent status h set burn level abc` was stored and the next `!status
+apply` crashed (💥) on it. A float stays a float (2.5 + 1 = 3.5). A status
+counter on a field holding text reports it, where it used to read it as 0
+and remove the status.
+
+
+SCENARIO 673 — damage_part / damage_spread refuse negative amounts and bad knobs
+---------------------------------------------------------------------------------
+
+!match new s673 PartHeal 10 10
+!match use s673
+!ent add ogre Ogre 50 5 5 5
+!ent hp ogre 30
+!part add ogre arm Arm 10 10
+!ent set_var arm to_main_percent 50
+!eval "damage_part('arm', -5)"
+?? amount can't be negative
+!eval "damage_spread('ogre', -10)"
+?? total can't be negative
+!ent set_var arm to_main_percent abc
+!eval "damage_part('arm', 3)"
+?? to_main_percent must be a finite number, got 'abc'
+!ent set_var arm to_main_percent 100
+!ent set_var arm to_main_cap absolute:-5
+!eval "damage_part('arm', 3)"
+?? n a whole number, 0 or more
+!ent set_var arm to_main_cap max_hp
+!eval "damage_part('arm', 10)"
+!assert "var_get('arm', 'hp') == 0 and var_get('ogre', 'hp') == 20"
+!ent hp arm 6
+!eval "damage_part('arm', 6)"
+!assert "var_get('ogre', 'hp') == 14 and var_get('arm', 'hp') == 0"
+
+Expected: HARNESS-ALLOWS-ERRORS. A negative amount used to heal the part AND
+move to_main_percent of the heal to the main body (the ogre went 30 -> 33 from
+`damage_part('arm', -5)`); both functions refuse it now (heal with an hp
+write). A text to_main_percent gives a message naming it (it was a raw Python
+"could not convert string to float"), and a negative absolute cap is refused
+(absolute:-5 made every hit heal the body). Healing the destroyed arm with a
+plain hp write clears its destroyed latch, so the second break routes and
+destroys normally: the ogre takes 10 then 6 (30 -> 20 -> 14).
+
+
+SCENARIO 674 — a footprint write that doesn't fit is refused (multi-tile)
+--------------------------------------------------------------------------
+
+!match new s674 Grow 8 8
+!match use s674
+!ent add a A 10 1 1 5
+!ent add b B 10 3 3 5
+!ent set_var a footprint_w 2
+!ent set_var a footprint_h 2
+!ent set_var a footprint_w 3
+!ent set_var a footprint_h 3
+?? (3,3) is taken by `b`
+!ent set_var a footprint_w 9
+?? is outside the 8x8 grid
+!assert "footprint_width('a') == 3 and footprint_height('a') == 2"
+!ent set_var a big.name Big
+!ent set_var a big.vars.hp 10
+!ent set_var a big.vars.footprint_w 4
+!ent set_var a big.vars.footprint_h 4
+!ent transform a big old
+?? `a` can't become 4x4
+!ent tp b 7 7
+!ent transform a big old
+!assert "footprint_width('a') == 4 and cell_entity(4, 4) == 'a'"
+!ent revert a old
+!ent set_var b footprint_w 30000
+?? can't become 30000x1
+!ent set_var b footprint_w 1
+!map
+
+Expected: HARNESS-ALLOWS-ERRORS. Growing a body by writing footprint_w /
+footprint_h is checked like a move: the 3x3 would cover b, the 9-wide body
+would leave the grid, so both writes are refused and a stays 3x2. Before, a
+grew over b (b vanished from the map) or off the grid. A transform into a
+4x4 form is refused the same way until b moves away. A huge footprint is
+refused too; reading one (from an old save) is capped one past the grid side,
+where `footprint_w 30000` used to make every map render, occupancy check and
+vision pass walk 9*10^8 cells and hang the bot.
+
+
+SCENARIO 675 — revive / transform / revert report their own errors in formulas
+-------------------------------------------------------------------------------
+
+!match new s675 FormulaErrs 8 8
+!match use s675
+!ent add a A 10 1 1 5
+!eval "revive('nobody')"
+?! OutOfBounds
+!eval "transform('a', 'nowhere')"
+?! OutOfBounds
+!eval "revert('a', 'nostash')"
+?! OutOfBounds
+
+Expected: HARNESS-ALLOWS-ERRORS. Each failure reads as the engine's own
+message. The three functions caught `(VTTError, NotFound, OutOfBounds,
+Occupied)`, but formula.py never imported the last two names, so building
+that except clause raised NameError and every failure of these functions
+read "Runtime error: name 'OutOfBounds' is not defined".
+
+
+SCENARIO 676 — words past the end of a command's usage are refused
+-------------------------------------------------------------------
+
+!match new s676 Stray 10 10
+!match use s676
+!ent add a A 10 1 1 5
+!ent add b B 10 3 3 4
+!ent remove a b
+?? Unexpected `b`
+!turn next 2
+?? Unexpected `2`
+!system rules spaceship
+?? Unexpected `spaceship`
+!map layer list x
+?? usage: `!map layer <list | <name> <on|off>>`
+!map pna up
+?? `pna` isn't a `!map` subcommand either
+!ent status a add burn level=3
+?? Unexpected `level=3`
+!ent status a add burn extra
+?? Unexpected `extra`
+!undo command zz
+?? Unexpected `zz`
+!ent copy a s676 4
+?? Give both x and y, or neither
+!watch add w "1 == 1" "1" onec
+?? is `once` or nothing
+!map scene bogus
+?? Unexpected `bogus`
+!assert "len(all_entities()) == 2" "nothing was removed"
+!ent del a
+!ent hp b +5 bypass_clamp=yes
+!map full
+!roll 1d6 + 2
+!dist 1 1 4 4 manhattan
+
+Expected: HARNESS-ALLOWS-ERRORS. A word past the end of a command's usage used
+to be dropped without a word: `!ent remove a b` removed only a, `!turn next 2`
+advanced one turn, `!system rules spaceship` listed every rule. The
+dispatcher now reads the usage string of the subcommand (or the root's forms)
+and refuses positional words past its end, naming the matching form. A
+mistyped subcommand of a root with a bare form gets a hint. Options
+(`key=value`) are left to each handler; `!ent status add` now refuses
+anything after the name (it used to add a bare status and drop `level=3`).
+Handlers whose optional slot took any word now check it: `!undo command zz`
+used to undo one command, `!ent copy a s676 4` dropped the x, `!watch add ...
+onec` made a repeating watcher, `!map scene bogus` ignored the word. Valid
+forms (the last five lines) run as before.
+
+
+SCENARIO 677 — !map scene full is the omniscient summary, host-only
+--------------------------------------------------------------------
+
+!match new s677 SceneFull 10 10
+!match use s677
+!match fog on
+!ent add r R 10 1 1 5
+!ent set_var r team red
+!ent add b B 10 9 9 5
+!ent set_var b team blue
+!match bind pov=red
+!map scene
+?? 1 placement(s)
+!map scene full
+?? 2 placement(s)
+!as player bob
+!map scene full
+?? host-only
+!as host
+!match unbind
+
+Expected: HARNESS-ALLOWS-ERRORS. `!map scene full` summarizes the whole board
+(2 units) where the channel's red view sees 1. It used to read only its first
+word (`scene`) for `full`, so `full` did nothing. Like `!map image full` it is
+host-only.
+
+
+SCENARIO 678 — string helpers: upper / lower / split / join / replace / fmt
+-----------------------------------------------------------------------------
+
+!match new s678 Strings 8 8
+!match use s678
+!ent add hero Hero 30 1 1 5
+!ent add orc Orc 20 3 1 5
+!assert "upper('abc') == 'ABC' and lower('DeF') == 'def' and strip('  x ') == 'x'"
+!assert "split('a,b,,c', ',') == ['a', 'b', '', 'c'] and split(' a  b ') == ['a', 'b']"
+!assert "join(['a', 1, 2.5], '-') == 'a-1-2.5' and replace('aaa', 'a', 'bb') == 'bbbbbb'"
+!assert "startswith('goblin_3', 'goblin') and endswith('goblin_3', '_3')"
+!assert "fmt('{0} hits {1} for {dmg:.1f}', 'Hero', 'Orc', dmg=7) == 'Hero hits Orc for 7.0'"
+!assert "fmt('{{braces}} {limit}', limit=3) == '{braces} 3'"
+!ent set_var hero actions.strike.target entity
+!ent set_var hero actions.strike.body "dmg = 4\nentity[target].hp = entity[target].hp - dmg\nlog(fmt('{0} strikes {1} for {2}', entity[self].name, upper(entity[target].name), dmg))"
+!action hero strike orc
+!log 2
+?? Hero strikes ORC for 4
+!dist "$(len(split('a,b,c', ',')))" 1 1 1
+?? (3,1) → (1,1): **2**
+
+Expected: The string helpers work in any formula. `fmt` fills {0}, {1}, ...
+from its arguments and {name} from keyword arguments, takes a short format
+spec ({dmg:.1f}) and writes {{ }} as literal braces. The strike action
+composes an event-log line with fmt + upper (read back with `!log 2`), and
+the helpers are read-only, so they work in an inline $() argument (`split`
+gives 3 items, so `!dist` measures from (3,1)).
+
+
+SCENARIO 679 — fmt can't reach into objects; text helpers are size-bounded
+---------------------------------------------------------------------------
+
+!match new s679 StringSafety 8 8
+!match use s679
+!eval "fmt('{0.__class__}', 'x')"
+?? isn't a field
+!eval "fmt('{0[0]}', 'x')"
+?? isn't a field
+!eval "fmt('{0:>999999}', 'x')"
+?? unsupported format spec
+!eval "fmt('{', 1)"
+?? unmatched brace
+!eval "fmt('{1}', 'x')"
+?? has no argument
+!eval "replace('a' * 50000, 'a', 'aaaaaaaaaa')"
+?? over the formula_size_limit
+!eval "upper(5)"
+?? must be text
+!eval "split('abc', '')"
+?? sep can't be empty
+
+Expected: HARNESS-ALLOWS-ERRORS. `fmt` parses its own fields: Python's
+str.format would resolve {0.__class__} or {0[0]} by reaching into the
+argument's attributes, so only plain numbers and names are fields, and a
+format spec is limited to alignment, sign, a width of at most three digits,
+a precision and a type letter. `replace`, `join` and `fmt` size their result
+before building it and refuse one over formula_size_limit (500000 characters
+here would be built from a 50000-character input). Wrong argument types read
+as clean errors.
+
+
+SCENARIO 680 — coordinate rulers on the ASCII map (multi-tile, viewport)
+-------------------------------------------------------------------------
+
+!match new s680 Rulers 12 11
+!match use s680
+!ent add a A 10 2 3 5
+!ent set_var a footprint_w 2
+!ent add b B 10 11 10 5
+!map
+?? 1 1 1
+?? 1 2 3 4 5 6 7 8 9 0 1 2
+?? 3 . > > .
+?? 10 . . . . . . . . . . ^ .
+!map coords=off
+?! 1 2 3 4
+!map coords off
+!map
+?! 1 2 3 4
+!map coords
+?? OFF for **Rulers** (this match's setting)
+!map coords clear
+!system set default viewport_mode on
+!system set default viewport_width 5
+!system set default viewport_height 4
+!map center b
+?? 8 9 0 1 2
+?? 10 . . . ^ .
+!map scene
+?? coords=on
+!as player bob
+!map coords off
+?? needs host approval
+!as host
+!deny r1
+!map coords=maybe
+?? use coords=on or coords=off
+!system set default viewport_mode auto
+!system set default viewport_width 28
+!system set default viewport_height 28
+
+Expected: HARNESS-ALLOWS-ERRORS. Maps carry coordinate rulers by default (the
+map_coords rule). Column numbers are stacked: the tens digits on the first
+line and the ones digits under them, so column 12 reads 1 over 2 and every
+cell stays one character wide. Row numbers sit in a left margin sized to the
+largest row. The 2×1 unit at (2,3) shows on row 3 in columns 2 and 3. `coords=off`
+drops the rulers for one render, `!map coords off` for this match, and `clear`
+returns to the rule. Through a 5×4 viewport centered on b, the rulers number
+the window's own columns (8-12) and rows (8-11). The graphics model carries the
+flag (`coords=on` in `!map scene`). Changing the setting is host-gated like the
+other `!map` settings, so a player's request queues.
+
+
+SCENARIO 681 — a function can't be stored in a var; saves are all-or-nothing
+-----------------------------------------------------------------------------
+
+!match new s681 NoFunctions 8 8
+!match use s681
+!ent add a A 10 1 1 5
+!eval "entity[a].f = min"
+?? Can't store a function
+!eval "match_var_set('g', [max, 1])"
+?? Can't store a function
+!eval "team_set('red', 'h', {'k': abs})"
+?? Can't store a function
+!store save fn681.json
+?? Saved to `saves/fn681.json`
+!ent dump a
+?! 💥
+
+Expected: HARNESS-ALLOWS-ERRORS. A function name used as a value (`min`,
+`max`) used to be stored as-is: the match could no longer be saved (the
+failure named the host's absolute file path) and `!ent dump` crashed. Every
+store (unit vars, match vars, team data, tiles, zones, statuses) now takes
+only numbers, text, true/false, None, lists and dicts. Saves and history
+exports are also built in full before the file is touched, then moved into
+place, so a failure can't truncate the previous save.
+
+
+SCENARIO 682 — a mounted rider's transform re-checks its slot (multi-tile)
+---------------------------------------------------------------------------
+
+!match new s682 RiderForm 10 10
+!match use s682
+!ent add cart Cart 30 3 3 5
+!ent set_var cart footprint_w 2
+!ent set_var cart footprint_h 2
+!ent set_var cart slots.seat.capacity 2
+!ent set_var cart slots.seat.condition "entity[self].size <= 1"
+!ent set_var cart slots.seat.cost "entity[self].size"
+!ent add rat Rat 5 8 8 5
+!ent set_var rat size 1
+!mount rat cart seat
+!ent set_var rat forms.ogre.name Ogre
+!ent set_var rat forms.ogre.vars.hp 20
+!ent set_var rat forms.ogre.vars.size 3
+!ent set_var rat forms.ogre.vars.footprint_w 2
+!ent set_var rat forms.ogre.vars.footprint_h 2
+!ent transform rat forms.ogre old
+?? can't stay in slot 'seat' of `cart`
+!assert "is_mounted('rat') and not var_has('rat', 'old')" "block changed nothing"
+!system set default transform_rider_mismatch_mode eject
+!ent transform rat forms.ogre old
+?? it dismounts to
+!assert "not is_mounted('rat') and footprint_width('rat') == 2"
+!assert "not occupies('cart', entity[rat].x, entity[rat].y)" "the 2x2 body landed clear of the cart"
+!ent revert rat old
+!mount rat cart seat
+!assert "is_mounted('rat')"
+!system set default transform_rider_mismatch_mode block
+
+Expected: HARNESS-ALLOWS-ERRORS. A transform used to re-check only the
+vehicle side (its slots). Now a mounted rider's new form is held to its
+slot's `condition` and capacity too, under the same
+transform_rider_mismatch_mode rule. With `block` the ogre form (size 3)
+can't stay in the seat, so the transform is refused and nothing changes.
+With `eject` the drop cell is picked for the NEW 2×2 body before anything
+changes, and the rider dismounts right after the swap. Reverted to the rat,
+it can mount again.
+
+
+SCENARIO 683 — status_transfer keeps the moved instance's own fields
+---------------------------------------------------------------------
+
+!match new s683 TransferData 10 10
+!match use s683
+!ent add a A 20 1 1 5
+!ent add b B 20 3 3 5
+!ent add c C 20 5 5 5
+!status def mark
+!status data mark caster none
+!status apply a mark 2 4
+!ent status a set mark caster hunter
+!ent status a set mark notes.hits 3
+!status transfer a b mark
+!assert "status_get('b', 'mark', 'caster') == 'hunter' and status_get('b', 'mark', 'notes.hits') == 3"
+!assert "status_get('b', 'mark', 'level') == 2 and status_get('b', 'mark', 'duration') == 4"
+!status apply c mark
+!ent status c set mark caster other
+!status transfer b c mark
+!assert "status_get('c', 'mark', 'caster') == 'other' and status_get('c', 'mark', 'duration') == 4"
+
+Expected: A transferred status keeps every field of the moved instance
+(caster, notes): it used to re-seed them from the definition, losing
+`caster = hunter`. Level and duration still go through the destination's
+stacking, resistance and immunity. Onto a destination that already has the
+status, only the stacking applies (the default refresh sets duration 4) and
+the destination's own data stays (`caster = other`).
+
+
+SCENARIO 684 — !ent set_vars: several vars, one undo step, all-or-nothing
+--------------------------------------------------------------------------
+
+!match new s684 SetVars 10 10
+!match use s684
+!ent add a A 20 1 1 5
+!ent add b B 20 5 5 5
+!ent set_vars a mana=5 note="hello world" inventory.gold=12 lvl=$(entity[self].hp+1)
+?? `a` vars: mana = 5, note = 'hello world', inventory.gold = 12, lvl = 21
+!ent set_vars a mana=9 hp=abc
+?? Nothing was set
+!assert "var_get('a', 'mana') == 5"
+!ent set_vars a mana=1 mana=2
+?? `mana` is given twice
+!ent set_vars a mana
+?? Unexpected `mana`
+!ent set_vars a footprint_w=2 footprint_h=2 mana=7
+!ent set_vars a footprint_w=5 footprint_h=5
+?? (5,5) is taken by `b`
+!assert "var_get('a', 'mana') == 7 and footprint_width('a') == 2 and footprint_height('a') == 2" "the width written first was rolled back too"
+!ent group new g
+!ent group add g a b
+!ent set_vars group:g tag=x
+!find tag=x count
+?? 2
+!undo command 1 confirm
+!find tag=x count
+?? 0
+
+Expected: HARNESS-ALLOWS-ERRORS. `!ent set_vars` writes several vars in the
+order given, in one command and one undo step. A value may be quoted (spaces)
+or a $() formula read with self = the unit. If any write is refused (hp set to
+text, a footprint that would cover b), the match rolls back and the reply says
+nothing was set. A key given twice, or a word that isn't key=value, is
+refused. It accepts a group target, and one undo reverts the whole group write.
+
+SCENARIO 685 — get / keys / values / index_of / unique on lists and dicts
+-------------------------------------------------------------------------
+
+!match new s685 Containers 10 10
+!match use s685
+!ent add hero Hero 20 1 1 5
+!ent set_var hero inventory.sword.dmg 5
+!ent set_var hero inventory.bow.dmg 3
+!assert "get(var_get('hero', 'inventory'), 'sword.dmg') == 5"
+!assert "get([10, 20, 30], -1) == 30 and get([10, 20, 30], 0) == 10"
+!assert "get({'a': [1, {'b': 7}]}, 'a.1.b') == 7"
+!assert "get([1, 2], 5, 'none') == 'none' and get({'x': 1}, 'y', 0) == 0"
+!assert "get({'3': 'three'}, 3) == 'three'" a number key reads the text key
+!assert "keys(var_get('hero', 'inventory')) == ['sword', 'bow']"
+!assert "values({'x': 1, 'y': 2}) == [1, 2]"
+!assert "index_of([3, 4, 5], 5) == 2 and index_of([3, 4, 5], 9) == None"
+!assert "unique([1, 2, 1, 'x', 'x', [1], [1]]) == [1, 2, 'x', [1]]"
+!eval "get([1, 2], 5)"
+?? ❌ get(...): '5' not found
+!eval "get({'a': [1]}, 'a.x')"
+?? must be a whole-number index
+!eval "get(5, 'a')"
+?? container must be a list or dict
+!eval "keys([1])"
+?? keys(dict): expected a dict
+!dist "$(get([4, 9], 0))" 1 1 1
+?? (4,1) → (1,1): **3**
+
+Expected: HARNESS-ALLOWS-ERRORS. `get` reads one element of a list or dict:
+a dict key, a list index (-1 = the last), or a dotted path through nested
+data ('a.1.b'). A missing key returns the default when one is given and is
+an error otherwise; a word that isn't an index where a list is reached, or a
+container that is a number, is an error. `keys` / `values` give a dict's
+keys and values in insertion order, `index_of` the first matching index or
+None, `unique` the list without repeats (equal lists count as repeats). All
+are read-only, so they work in an inline $() argument.
+
+SCENARIO 686 — container helpers in an action: total an inventory, drop repeats
+--------------------------------------------------------------------------------
+
+!match new s686 Loot 10 10
+!match use s686
+!ent add hero Hero 20 1 1 5
+!ent set_var hero inventory.sword.dmg 5
+!ent set_var hero inventory.bow.dmg 3
+!ent set_var hero inventory.dagger.dmg 2
+!ent set_var hero actions.tally.target none
+!ent set_var hero actions.tally.body "inv = var_get(self_id(), 'inventory')\ntotal = 0\nfor item in values(inv):\n    total = total + get(item, 'dmg', 0)\nentity[self].total_dmg = total\nnames = keys(inv)\nentity[self].first = get(names, 0)\nentity[self].last = get(names, -1)\nentity[self].bow_at = index_of(names, 'bow')\nseen = unique(['bow', 'sword', 'bow', 'dagger', 'sword'])\nentity[self].seen = len(seen)"
+!action hero tally
+!assert "entity[hero].total_dmg == 10"
+!assert "entity[hero].first == 'sword' and entity[hero].last == 'dagger'"
+!assert "entity[hero].bow_at == 1 and entity[hero].seen == 3"
+
+Expected: The tally action loops over the inventory's values (values() is
+loopable), reads each item's dmg with get(), and stores the total 10. keys()
+lists sword, bow, dagger in insertion order: get(names, 0) is sword,
+get(names, -1) is dagger, index_of finds bow at 1, and unique() leaves 3 of
+the 5 names.
+
+SCENARIO 687 — flanking: angle vs line on a 1×1 target, the flanking rules
+--------------------------------------------------------------------------
+
+!match new s687 Flank 10 10
+!match use s687
+!ent add orc Orc 20 5 5 5
+!ent add n N 10 5 4 5
+!ent add s S 10 5 6 5
+!ent add e E 10 6 5 5
+!ent add se SE 10 6 6 5
+!ent add nw NW 10 4 4 5
+!assert "flanking_angle('orc', 'n', 's') and flanking_line('orc', 'n', 's')" opposite sides
+!assert "flanking_angle('orc', 'nw', 'se') and flanking_line('orc', 'nw', 'se')" opposite corners
+!assert "flanking_angle('orc', 'n', 'se') and not flanking_line('orc', 'n', 'se')" 135 degrees apart; the line clips one corner
+!assert "not flanking_angle('orc', 'n', 'e') and not flanking_line('orc', 'n', 'e')" a quarter turn
+!assert "flanking('orc', 'n', 'se')" the default mode is angle
+!assert "not flanking('orc', 'n', 'se', 'line')"
+!system set default flanking_mode line
+!assert "not flanking('orc', 'n', 'se')"
+!system set default flanking_mode angle
+!system set default flanking_min_angle 180
+!assert "not flanking('orc', 'n', 'se') and flanking('orc', 'n', 's')"
+!assert "flanking_angle('orc', 'n', 'e', 90)" a per-call minimum
+!system set default flanking_min_angle 135
+!system set default flanking_min_angle 200
+?? ❌
+!eval "flanking('orc', 'n', 's', 'side')"
+?? mode must be 'angle' or 'line'
+!assert "not flanking('orc', 'n', 'n') and not flanking('orc', 'orc', 's')" "a unit can't flank with itself or the target"
+
+Expected: HARNESS-ALLOWS-ERRORS. North + south and the two opposite corners
+flank in both modes. North + south-east is 135° apart, so it flanks by angle
+(the 135 default) but not by line: the line between them enters the orc's
+cell through its top side and leaves through its right side, which aren't
+opposite. A quarter turn flanks in neither. flanking() follows the
+flanking_mode rule unless a mode is passed; flanking_min_angle 180 counts
+only exactly opposite pairs, and a value over 180 is refused. A unit paired
+with itself or the target never flanks.
+
+SCENARIO 688 — flanking a multi-tile target with multi-tile attackers, in an action
+----------------------------------------------------------------------------------
+
+!match new s688 FlankBig 12 12
+!match use s688
+!ent add wyrm Wyrm 40 5 5 5
+!ent set_var wyrm footprint_w 3
+!ent add a A 10 4 5 5
+!ent add b B 10 8 5 5
+!ent add top Top 10 6 4 5
+!ent add bot Bot 10 7 6 5
+!ent add ogre Ogre 20 2 9 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!assert "flanking_line('wyrm', 'a', 'b') and flanking_angle('wyrm', 'a', 'b')" the two ends of the long body
+!assert "flanking_line('wyrm', 'top', 'bot')" across the body, top side to bottom side
+!assert "not flanking('wyrm', 'a', 'top')" an end and the top
+!assert "flanking_line('wyrm', 'a', 'ogre') == False" "the ogre's centre is below-left; the line clips one corner"
+!ent set_var a actions.stab.target entity
+!ent set_var a actions.stab.body "dmg = 3\nif flanking(target, self_id(), 'b'):\n    dmg = dmg * 2\nentity[target].hp = entity[target].hp - dmg"
+!action a stab wyrm
+!assert "entity[wyrm].hp == 34" flanked with b: 6 damage
+!ent tp b 9 2
+!action a stab wyrm
+!assert "entity[wyrm].hp == 31" b moved away: 3 damage
+
+Expected: The wyrm covers (5,5)-(7,5). a at its left end and b at its right
+end flank it in both modes; top (6,4) and bot (7,6) cross it from its top
+side to its bottom side. An end and the top don't flank. The 2×2 ogre at
+(2,9)-(3,10) has its centre below-left of the body, so the line from a
+only clips a corner. a's stab doubles its damage while b flanks: 40 → 34,
+then after b moves to (9,2) only 3 more (34 → 31).
+
+SCENARIO 689 — nearest_cell: where a big body's attack starts
+-------------------------------------------------------------
+
+!match new s689 Breath 15 15
+!match use s689
+!ent add dragon Dragon 50 3 3 5
+!ent set_var dragon footprint_w 3
+!ent set_var dragon footprint_h 3
+!ent add knight Knight 20 10 4 5
+!ent add squire Squire 20 1 1 5
+!assert "nearest_cell('dragon', 10, 4) == [5, 4]" the middle of the right side
+!assert "nearest_cell('dragon', [1, 1]) == [3, 3]" a coordinate pair
+!assert "nearest_cell('dragon', 'knight') == [5, 4]" "toward another unit's body"
+!assert "nearest_cell('dragon', 'squire') == [3, 3]"
+!assert "nearest_cell('knight', 'dragon') == [10, 4]" a 1×1 unit is its own cell
+!ent set_var dragon actions.breath.target entity
+!ent set_var dragon actions.breath.body "c = nearest_cell(self_id(), target)\nfor e in entities_on_los(coord_x(c), coord_y(c), entity[target].x, entity[target].y):\n    entity[e].hp = entity[e].hp - 1\nentity[target].hp = entity[target].hp - 5\nentity[self].breath_from = c"
+!ent add page Page 20 7 4 5
+!action dragon breath knight
+!assert "entity[dragon].breath_from == [5, 4]"
+!assert "entity[knight].hp == 15 and entity[page].hp == 19" the page stands on the line from (5,4)
+
+Expected: nearest_cell returns the dragon's body cell nearest a point, a
+coordinate pair or another unit's body; (10, 4) is level with the middle
+row, so the answer is (5, 4), not a corner. The breath action starts from
+that cell: the page at (7, 4) stands between it and the knight and takes 1,
+the knight takes 5 (20 → 15).
+
+SCENARIO 690 — visible_entities: range, walls, stealth, own team, relation
+---------------------------------------------------------------------------
+
+!match new s690 Sight 20 20
+!match use s690
+!ent add scout Scout 10 5 5 5
+!ent set_var scout team red
+!ent set_var scout fog_vision_radius 4
+!ent add ally Ally 10 6 5 5
+!ent set_var ally team red
+!ent add near Near 10 7 7 5
+!ent set_var near team blue
+!ent add far Far 10 12 5 5
+!ent set_var far team blue
+!ent add behind Behind 10 5 9 5
+!ent set_var behind team blue
+!ent add ghost Ghost 10 4 4 5
+!ent set_var ghost team blue
+!ent set_var ghost invisible true
+!tile set 5 7 opaque true
+!tile set 5 8 opaque true
+!assert "visible_entities('scout') == ['ally', 'ghost', 'near']" nearest first
+!assert "visible_entities('scout', 'hostile') == ['ghost', 'near']"
+!system set default entity_visibility_condition "not var_get(self_id(), 'invisible', False)"
+!assert "visible_entities('scout', 'hostile') == ['near']" the stealth rule hides the ghost from red
+!ent set_var ally invisible true
+!assert "'ally' in visible_entities('scout')" "a team's own invisible unit still counts"
+!system set default pov_own_team_visible false
+!assert "not ('ally' in visible_entities('scout'))"
+!system set default pov_own_team_visible true
+!ent set_var scout actions.volley.target none
+!ent set_var scout actions.volley.body "for t in visible_entities(self_id(), 'hostile'):\n    entity[t].hp = entity[t].hp - 2"
+!action scout volley
+!assert "entity[near].hp == 8 and entity[ghost].hp == 10 and entity[behind].hp == 10 and entity[far].hp == 10"
+!system set default entity_visibility_condition ""
+!find "hp<10" ids
+?? near
+
+Expected: The scout (radius 4) sees ally, ghost and near, nearest first.
+far is out of range and behind is past the opaque cells at (5,7)-(5,8).
+With the stealth rule set, the invisible ghost drops out of red's list; red's
+own invisible ally stays while pov_own_team_visible is on. The volley hits
+every hostile unit the scout can see: only near (10 → 8).
+
+SCENARIO 691 — visible_entities with multi-tile viewers and targets
+-------------------------------------------------------------------
+
+!match new s691 BigSight 20 20
+!match use s691
+!ent add giant Giant 30 10 10 5
+!ent set_var giant footprint_w 2
+!ent set_var giant footprint_h 2
+!ent set_var giant fog_vision_radius 1
+!ent add x1 X1 5 13 11 5
+!ent add x2 X2 5 12 12 5
+!ent add wall Wall 30 2 3 5
+!ent set_var wall footprint_w 4
+!ent add eye Eye 5 4 6 5
+!ent set_var eye fog_vision_radius 3
+!assert "visible_entities('giant') == ['x2']" "seen from the giant's lower-right cell"
+!assert "not ('x1' in visible_entities('giant'))" two cells from its nearest cell
+!assert "visible_entities('eye') == ['wall']" "every cell of the wall is within 3 of (4, 6)"
+!tile set 4 4 opaque true
+!tile set 5 4 opaque true
+!tile set 3 4 opaque true
+!tile set 2 4 opaque true
+!assert "visible_entities('eye') == []" every line to the wall crosses the opaque row
+!system set default formula_cell_limit 10
+!eval "visible_entities('eye')"
+?? cross more cells than the formula_cell_limit allows
+!system set default formula_cell_limit 100000
+
+Expected: The 2×2 giant (radius 1) sees from every cell of its body: x2 at
+(12, 12) is one step from its lower-right cell (11, 11), x1 at (13, 11) is
+two. The eye at (4, 6) sees the 4×1 wall at (2-5, 3); once the cells
+(2-5, 4) between them are opaque, no line from the eye reaches any cell of
+the wall's body. Every sight line checked counts against formula_cell_limit:
+at 10 the same call is refused instead of walking them all.
+HARNESS-ALLOWS-ERRORS.
+
+SCENARIO 692 — !batch strict: stop at the first failing line and undo the rest
+-------------------------------------------------------------------------------
+
+!match new s692 Strict 10 10
+!match use s692
+!ent add a A 10 1 1 5
+!batch strict ent hp a 5 ; ent set_var a gold 3 ; ent tp a 99 99 ; ent hp a 1
+?? ⏹ strict batch stopped at line 3 (`ent`): it failed, so the 2 line(s) before it were undone and 1 line(s) were not run.
+!assert "entity[a].hp == 10 and not var_has('a', 'gold')"
+!batch strict ent hp a 5 ; ent set_var a gold 3
+!assert "entity[a].hp == 5 and entity[a].gold == 3"
+!batch ent hp a 7 ; ent tp a 99 99 ; ent hp a 2
+!assert "entity[a].hp == 2" a plain batch keeps going
+!batch strict ent hp a 9 ; assert "entity[a].hp == 1"
+?? the 1 line(s) before it were undone
+!assert "entity[a].hp == 2"
+!undo command 1 preview
+?? vars.hp: 2 -> 5
+!batch strict
+?? ❌ batch is empty
+
+Expected: HARNESS-ALLOWS-ERRORS. HARNESS-ALLOWS-ASSERT-FAIL. A strict batch stops at the first line that
+replies with ❌ (the off-map teleport) and undoes the lines before it, so a
+keeps hp 10 and gets no gold. A strict batch with no failure applies like a
+plain one, and a plain batch still runs every line. A failed assert also
+stops it and undoes the line before. A rolled-back strict batch leaves no
+undo step: undoing one command still goes back to before the plain batch.
+
+SCENARIO 693 — !batch strict across matches: created matches and transfers undone
+---------------------------------------------------------------------------------
+
+!match new s693 Home 10 10
+!match use s693
+!ent add a A 10 1 1 5
+!batch strict match new s693b Away 5 5 ; ent transfer a s693b 1 1 ; ent tp zz 1 1
+?? ⏹ strict batch stopped at line 3
+!match list
+?! s693b
+!list
+?? A (a)
+!match info
+?? s693
+!batch strict match new s693b Away 5 5 ; match use s693b ; ent add b B 5 1 1 ; ent hp nobody 3
+!match info
+?? s693
+?! s693b
+
+Expected: HARNESS-ALLOWS-ERRORS. The first strict batch creates match s693b
+and moves a into it, then fails on the unknown unit: s693b is removed again
+and a is back in s693. The second one switches the channel to the new match
+before failing; the rollback points the channel back at s693.
+
+SCENARIO 694 — !find negation and alternatives
+----------------------------------------------
+
+!match new s694 Select 10 10
+!match use s694
+!ent add a A 10 1 1
+!ent set_var a team red
+!ent add b B 10 2 1
+!ent set_var b team green
+!ent add c C 10 3 1
+!ent set_var c team blue
+!ent add d D 10 4 1
+!ent status a add burn
+!ent status c add poison
+!find team=red|green ids
+?? a b
+!find team=red|team=green ids
+?? a b
+!find !team=red ids
+?? b c d
+!find team!=red ids
+?? b c
+!find !team=red|green ids
+?? c d
+!find status:burn|poison ids
+?? a c
+!find !status:burn|poison ids
+?? b d
+!find near:a:1|d:0 ids
+?? a b d
+!find !status:burn team=red|blue ids
+?? c
+!find team=red| ids
+?? empty alternative
+!find team=red|!status:burn ids
+?? put `!` at the start of the whole word
+!find ! ids
+?? needs a predicate after it
+
+Expected: HARNESS-ALLOWS-ERRORS. `|` gives alternatives and a bare word after
+it reuses the previous predicate's key (team=red|green, status:burn|poison,
+near:a:1|d:0). A leading `!` negates the whole word: !team=red also matches
+d, who has no team, while team!=red needs a team. Words still AND together.
+An empty alternative, a `!` inside the word or a bare `!` is refused.
+
+SCENARIO 695 — !foreach with negated selectors; a player can't find hidden units by negation
+--------------------------------------------------------------------------------------------
+
+!match new s695 Sweep 10 10
+!match use s695
+!ent add a A 10 1 1
+!ent set_var a team red
+!ent add b B 10 2 1
+!ent set_var b team green
+!ent add c C 10 3 1
+!ent set_var c team blue
+!foreach !team=blue|red ; ent set_var $id tagged 1
+!find tagged=1 ids
+?? b
+!ent set_var c invisible true
+!system set default entity_visibility_condition "not var_get(self_id(), 'invisible', False)"
+!as view red
+!find !team=red ids
+?? b
+?! c
+!as view clear
+!system set default entity_visibility_condition ""
+
+Expected: The sweep tags every unit on neither blue nor red: b. Under red's
+view the invisible c is hidden, and a negated selector doesn't bring it
+back: !team=red lists only b.
+
+SCENARIO 696 — random_cell / random_free_cell: how a multi-tile body must fit the area
+---------------------------------------------------------------------------------------
+
+!match new s696 Drop 20 20
+!match use s696
+!ent add dragon Dragon 50 1 15 5
+!ent set_var dragon footprint_w 3
+!ent set_var dragon footprint_h 3
+!zone new fire
+!zone fill fire 6 6 10 10
+!zone new hall
+!zone fill hall 2 3 14 4
+!assert "random_cell('fire') in cells_in_rect(6, 6, 10, 10)"
+!assert "random_cell(18, 18, 30, 30) in cells_in_rect(18, 18, 20, 20)" the rectangle is clipped to the map
+!assert "random_cell(25, 25, 30, 30) == None" no cell on the map
+!assert "random_free_cell('fire', 'dragon') in cells_in_rect(6, 6, 8, 8)" "the default 'body' fit: the whole 3×3 inside the 5×5 zone"
+!assert "random_free_cell('fire', 'dragon', fit='center') in cells_in_rect(5, 5, 9, 9)" the centre cell inside
+!assert "random_free_cell('fire', 'dragon', fit='any') in cells_in_rect(4, 4, 10, 10)" one cell inside
+!assert "random_free_cell('fire', 'dragon', fit='anchor') in cells_in_rect(6, 6, 10, 10)"
+!assert "random_free_cell('hall', 'dragon') == None" "a 2-row hall can't hold the whole body"
+!assert "random_free_cell('hall', 'dragon', fit='any') != None" straddling it can
+!ent add rock Rock 5 10 10 5
+!tile set 6 6 block true
+!assert "random_free_cell('fire', 'dragon') in [[7, 6], [8, 6], [6, 7], [7, 7], [8, 7], [6, 8], [7, 8]]" "the rock and the wall rule out (8, 8) and (6, 6)"
+!assert "random_free_cell(10, 10, 10, 10) == None and random_free_cell(9, 9, 9, 9) == [9, 9]" without a unit, an empty cell
+!eval "random_free_cell('fire', 'dragon', fit='middle')"
+?? fit must be one of body, center, any, anchor
+!eval "random_cell('nope')"
+?? no zone named 'nope'
+!eval "random_cell(1, 2, 3)"
+?? give a zone name or x1, y1, x2, y2
+
+Expected: HARNESS-ALLOWS-ERRORS. random_cell picks a cell of a zone or of a
+rectangle clipped to the map (None when nothing is on the map).
+random_free_cell returns an anchor where the dragon could stand. By default
+its whole 3×3 body must be inside the 5×5 fire zone (anchors (6-8, 6-8));
+fit='center' needs only its centre cell inside, 'any' one cell, 'anchor' its
+top-left cell. The 2-row hall can't hold the whole body, so the default
+returns None while 'any' finds a spot. The rock at (10, 10) and the blocking
+wall at (6, 6) leave 7 spots. Without a unit it returns an empty cell. An
+unknown fit or zone, or the wrong number of numbers, is an error.
+
+SCENARIO 697 — random_free_cell in an action: a blink that always lands the whole body
+---------------------------------------------------------------------------------------
+
+!match new s697 Blink 20 20
+!system set default random_seed 7
+!match use s697
+!ent add wyrm Wyrm 40 1 1 5
+!ent set_var wyrm footprint_w 2
+!ent set_var wyrm footprint_h 2
+!zone new lair
+!zone fill lair 12 12 16 16
+!ent add guard Guard 10 14 14 5
+!ent set_var wyrm actions.blink.target none
+!ent set_var wyrm actions.blink.body "spot = random_free_cell('lair', self_id())\nif spot == None:\n    fail('nowhere to land')\nmove_entity(self_id(), coord_x(spot), coord_y(spot))"
+!action wyrm blink
+!assert "occupies('wyrm', entity[wyrm].x, entity[wyrm].y) and entity[wyrm].x >= 12 and entity[wyrm].x <= 15 and entity[wyrm].y >= 12 and entity[wyrm].y <= 15" the whole 2×2 body is in the lair
+!assert "not occupies('wyrm', 14, 14)" "the guard's cell is never covered"
+!action wyrm blink
+!assert "entity[wyrm].x >= 12 and entity[wyrm].x <= 15 and entity[wyrm].y >= 12 and entity[wyrm].y <= 15"
+!zone new pit
+!zone add pit 2 18
+!ent set_var wyrm stay_x $(entity[wyrm].x)
+!ent set_var wyrm actions.dive.target none
+!ent set_var wyrm actions.dive.body "spot = random_free_cell('pit', self_id())\nif spot == None:\n    fail('nowhere to land')\nmove_entity(self_id(), coord_x(spot), coord_y(spot))"
+!action wyrm dive
+?? nowhere to land
+!assert "entity[wyrm].x == entity[wyrm].stay_x" the failed dive left it in place
+!system set default random_seed ""
+
+Expected: HARNESS-ALLOWS-ERRORS. The blink teleports the 2×2 wyrm to a random
+spot where its whole body fits in the 5×5 lair (anchors 12-15 on both axes)
+and never onto the guard at (14, 14); a second blink lands inside again. The
+one-cell pit can't hold the body, so random_free_cell returns None and the
+dive fails, leaving the wyrm where it was. With random_seed set, the picks
+follow the seed.
+
+SCENARIO 698 — Each server has its own workspace: systems, matches and saves stay apart
+----------------------------------------------------------------------------------------
+
+!as server 111
+!system set default fog_enabled_by_default true
+!match new camp Camp 10 10
+!match use camp
+!ent add hero Hero 10 2 2
+!store save shared
+?? Saved to `saves/shared`
+!as server 222
+!system info default
+?! fog_enabled_by_default` = True
+!match use camp
+?? not found
+!match new camp Other 6 6
+?? Created match `Other` with id `camp`
+!match use camp
+!assert "grid_width() == 6" "server 222's camp is its own match"
+!ent info hero
+?? not found
+!store load shared
+?? File not found
+!as server 111
+!match use camp
+!assert "grid_width() == 10 and entity[hero].hp == 10" "server 111's camp is untouched"
+!store load shared
+?? Loaded from `saves/shared`
+!as server local
+!match
+?? No matches
+
+Expected: HARNESS-ALLOWS-ERRORS. Each `!as server <key>` moves the harness
+into that server's workspace. Server 111 turns fog on by default in its own
+`default` system and saves its board as `shared`. In server 222 the default
+system still has fog off, `!match use camp` finds nothing, the id `camp` is
+free to reuse for a different 6×6 match, `hero` doesn't exist, and loading
+`shared` fails with "File not found" because each server reads its own saves
+folder. Back in server 111 the 10×10 camp with its hero is untouched and the
+save loads. The local workspace has no matches.
+
+SCENARIO 699 — !system default is per server or per channel; !match list is open to players
+--------------------------------------------------------------------------------------------
+
+!system new skirmish
+!system default server skirmish
+?? This server's default GameSystem is now `skirmish`
+!match new a A 5 5
+?? using system `skirmish`
+!system default global default
+?? Scope must be one of: server | channel
+!system default channel default
+!match new b B 5 5
+?? using system `default`
+!system delete skirmish
+?? this server's default GameSystem
+!match use a
+!as player pip
+!match list
+?? `a`
+?? `b`
+!match
+?? `b`
+!as host
+
+Expected: HARNESS-ALLOWS-ERRORS. A server-wide default makes `a` use
+`skirmish`; the old `global` scope is gone (a workspace IS one server). A
+channel default wins over it, so `b` uses `default`. The server default
+can't be deleted. A player may list the server's matches (bare `!match` or
+`!match list`): every match listed belongs to this server.
+
+SCENARIO 700 — !owner servers lists every workspace; only the bot owner may use it
+-----------------------------------------------------------------------------------
+
+!match new here Here 5 5
+!as server 333
+!match new there There 5 5
+!match new there2 There2 5 5
+!owner servers
+?? Server workspaces (2)
+?? `local`): 1 match(es)
+?? `333`): 2 match(es), 1 system(s) ← this one
+!whoami
+?? bot owner
+?? **Server workspace:**
+!as player pip
+!owner servers
+?? Only the bot's owner can use `!owner`
+!whoami
+?! bot owner
+!as host
+!owner nonsense
+?? isn't a valid command
+
+Expected: HARNESS-ALLOWS-ERRORS. The harness's `cli` identity stands in for
+the bot owner. `!owner servers` lists both workspaces with their match and
+system counts and marks the one the command ran in; `!whoami` shows "bot
+owner" and names the server workspace. A player is refused and `!whoami`
+drops the badge. An unknown `!owner` subcommand is reported.
+
+SCENARIO 701 — !map ent_sight marks the cells one unit sees and lists the units it sees
+----------------------------------------------------------------------------------------
+
+!match new s701 Sight 12 8
+!match use s701
+!ent add arch Archer 10 3 3 1
+!ent set_var arch team red
+!ent set_var arch fog_vision_radius 3
+!tile set 5 3 opaque true
+!tile set 5 3 glyph #
+!ent add orc Orc 10 7 3 1
+!ent set_var orc team blue
+!ent add gob Gob 10 6 5 1
+!ent set_var gob team blue
+!map ent_sight arch
+?? Archer (`arch`) sees 35 cell(s): vision radius 3, range + line of sight.
+?? Sees: Gob (`gob`)
+?! Orc
+!assert "can_see('arch', 6, 5) and not can_see('arch', 6, 3)" "the marks follow can_see"
+!map ent_sight arch extra
+?? Unexpected `extra`
+!map ent_sight arch color=0,0,255 opacity=101
+?? `opacity=` must be between 0 and 100
+!map ent_sight ghost
+?? Entity 'ghost' not found
+
+Expected: HARNESS-ALLOWS-ERRORS. The archer at (3, 3) has vision radius 3.
+The opaque wall at (5, 3) blocks the line to (6, 3) and the orc at (7, 3),
+so 35 of the 36 on-map cells within range are marked with `*` (the wall cell
+itself is seen; cells showing a unit keep its glyph). The goblin at (6, 5)
+is in range with a clear line and is listed; the orc behind the wall is not.
+A stray word, a bad opacity and an unknown unit are refused.
+
+SCENARIO 702 — !map ent_sight from a multi-tile body; a huge sight is bounded
+----------------------------------------------------------------------------
+
+!match new s702 Big 12 8
+!match use s702
+!ent add big Big 10 9 6 1
+!ent set_var big footprint_w 2
+!ent set_var big footprint_h 2
+!ent set_var big fog_vision_radius 1
+!ent add rat Rat 3 8 5 1
+!map ent_sight big
+?? sees 16 cell(s)
+?? Sees: Rat (`rat`)
+!match new s702b Plain 60 60
+!match use s702b
+!ent add eye Eye 10 30 30
+!ent set_var eye fog_vision_radius 20
+!system set default sight_check_limit 1000
+!map ent_sight eye
+?? takes more than the sight_check_limit of 1000
+!system set default sight_check_limit 1000000
+
+Expected: HARNESS-ALLOWS-ERRORS. The 2×2 body at (9, 6)-(10, 7) sees from
+every cell it covers: radius 1 around the whole body is the 4×4 block
+(8, 5)-(11, 8), 16 cells, so the rat at (8, 5), diagonal to the body's top
+left cell, is seen. On an open 60×60 map, with sight_check_limit at 1000,
+a unit with vision radius 20 (1681 cells in range, each with its sight line)
+stops with an error instead of running on.
+
+SCENARIO 703 — !map ent_sight under a team POV: own units only, nothing past the fog
+-------------------------------------------------------------------------------------
+
+!match new s703 Fog 12 8
+!match use s703
+!ent add arch Archer 10 3 3 1
+!ent set_var arch team red
+!ent set_var arch fog_vision_radius 3
+!ent add scout Scout 10 3 7 1
+!ent set_var scout team red
+!ent set_var scout fog_vision_radius 1
+!ent add gob Gob 10 6 5 1
+!ent set_var gob team blue
+!ent set_var gob fog_vision_radius 3
+!ent add orc Orc 10 11 3 1
+!ent set_var orc team blue
+!system set default fog_los true
+!match fog on
+!match bind s703 pov=red
+!as player pip
+!map ent_sight arch
+?? Sees: Gob (`gob`)
+!map ent_sight gob
+?? You can check the sight of your own team's units only
+!map ent_sight orc
+?? Entity 'orc' not found
+!as host
+!map ent_sight gob
+?? Gob (`gob`) sees 24 cell(s)
+!system set default fog_los false
+
+Expected: HARNESS-ALLOWS-ERRORS. The channel is bound to red's POV with fog
+on. Player pip may ask about red's archer (it sees the goblin). The goblin is
+visible but blue, so pip is refused; the orc is in fog, so it reads as
+missing, exactly like `!ent info`. The host may ask about any unit, but the
+marks still stop at red's fog: the goblin's radius-3 sight covers 49 cells,
+and only the 24 red also sees (x 3-6 rows 2-6 from the archer, x 3-4 rows
+7-8 from the scout) are marked.

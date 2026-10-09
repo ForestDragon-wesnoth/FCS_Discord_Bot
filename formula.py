@@ -384,12 +384,14 @@ from __future__ import annotations
 import ast
 import copy
 import math
+import itertools
+import json
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error
+from logic import VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number
 
 
 class FormulaError(VTTError):
@@ -461,6 +463,43 @@ def _random_string(*choices: Any) -> str:
     so we surface that as a FormulaError instead. Honors the
     random_seed rule the same way random_int does."""
     return _random_string_impl(random, choices)
+
+
+def _pick_source(v: Any, fname: str) -> list:
+    """The items pick/shuffle draw from: a list's items or a dict's keys."""
+    if isinstance(v, dict):
+        return list(v.keys())
+    if isinstance(v, (list, tuple)):
+        return list(v)
+    raise FormulaError(
+        f"{fname}(list): expected a list or a dict, got "
+        f"{'None' if v is None else type(v).__name__}.")
+
+
+def _pick_impl(rng, v: Any) -> Any:
+    items = _pick_source(v, "pick")
+    return rng.choice(items) if items else None
+
+
+def _shuffle_impl(rng, v: Any) -> list:
+    items = _pick_source(v, "shuffle")
+    rng.shuffle(items)
+    return items
+
+
+def _pick(v: Any) -> Any:
+    """pick(list): one random item of a list (or key of a dict); None when
+    it's empty — test `== None` before using the result. Honors the
+    random_seed rule like random_int, and replays identically across a
+    choose() replay."""
+    return _pick_impl(random, v)
+
+
+def _shuffle(v: Any) -> list:
+    """shuffle(list): a new list holding the same items (a dict's keys) in
+    random order; the argument itself is left untouched. Loopable. Honors
+    random_seed like pick."""
+    return _shuffle_impl(random, v)
 
 
 # Caps on a single roll() so a typo can't hang the bot. A spell that
@@ -574,6 +613,116 @@ def roll_detail(rng, spec: Any) -> "Tuple[int, list]":
             f"NdM (with optional !, kh<n>, kl<n>) or a flat integer."
         )
     return total, parts
+
+
+# Work caps for dice_distribution: convolution steps (outcome-table size x die
+# faces, summed over every die) and the dice combinations a keep-highest /
+# keep-lowest group may enumerate. Generous for table dice, small enough that
+# a player's `!roll odds 1000d1000` can't stall the bot.
+_ODDS_MAX_STEPS = 2_000_000
+_ODDS_MAX_KEEP_COMBOS = 200_000
+# An exploding die's chain is cut once its probability falls below this.
+_ODDS_EXPLODE_EPS = 1e-12
+
+
+def dice_distribution(spec: Any) -> "Tuple[Dict[int, Any], Any, bool]":
+    """The probability distribution of a dice expression (same grammar as
+    roll()). Returns (weights, total, exact): weights maps each possible total
+    to its weight and `total` is the sum of the weights, so P(v) =
+    weights[v] / total. Without exploding dice the weights are whole counts of
+    equally likely outcomes (exact=True); an exploding group makes them floats
+    with its improbable long chains cut off (exact=False). Raises FormulaError
+    on bad notation or when the expression is too large to work out."""
+    if not isinstance(spec, str):
+        raise FormulaError("dice odds need a dice string like '2d6+3'.")
+    s = spec.replace(" ", "").lower()
+    terms = re.findall(r"[+-]?[^+-]+", s) if s else []
+    if not terms or "".join(terms) != s:
+        raise FormulaError(f"malformed dice expression '{spec}'.")
+    steps = 0
+
+    def _spend(n: int) -> None:
+        nonlocal steps
+        steps += n
+        if steps > _ODDS_MAX_STEPS:
+            raise FormulaError(
+                f"'{spec}' has too many outcomes to work out exact odds.")
+
+    def _conv(a: Dict[int, Any], b: Dict[int, Any]) -> Dict[int, Any]:
+        _spend(len(a) * len(b))
+        out: Dict[int, Any] = {}
+        for va, wa in a.items():
+            for vb, wb in b.items():
+                out[va + vb] = out.get(va + vb, 0) + wa * wb
+        return out
+
+    dist: Dict[int, Any] = {0: 1}
+    exact = True
+    for term in terms:
+        fm = _ROLL_FLAT_RE.match(term)
+        if fm is not None:
+            k = int(fm.group(2)) * (-1 if fm.group(1) == "-" else 1)
+            dist = {v + k: w for v, w in dist.items()}
+            continue
+        dm = _ROLL_DIE_RE.match(term)
+        if dm is None:
+            raise FormulaError(
+                f"malformed term '{term}' in '{spec}' — expected NdM (with "
+                f"optional !, kh<n>, kl<n>) or a flat integer.")
+        sgn = -1 if dm.group(1) == "-" else 1
+        count = int(dm.group(2)) if dm.group(2) else 1
+        sides = int(dm.group(3))
+        explode = dm.group(4) == "!" and sides > 1
+        keep_mode, keep_n = dm.group(5), dm.group(6)
+        if not 1 <= count <= _ROLL_MAX_DICE or not 1 <= sides <= _ROLL_MAX_SIDES:
+            raise FormulaError(f"die count or sides out of range in '{term}'.")
+        if keep_mode is not None:
+            if explode:
+                raise FormulaError(
+                    f"odds for a group that both explodes and keeps dice "
+                    f"('{term}') aren't supported.")
+            combos = sides ** count if count * math.log10(sides) < 9 else None
+            if combos is None or combos > _ODDS_MAX_KEEP_COMBOS:
+                raise FormulaError(
+                    f"'{term}' has too many dice combinations to work out "
+                    f"exact odds (limit {_ODDS_MAX_KEEP_COMBOS}).")
+            _spend(combos)
+            k = max(0, min(int(keep_n), count))
+            group: Dict[int, Any] = {}
+            for faces in itertools.product(range(1, sides + 1), repeat=count):
+                ordered = sorted(faces)
+                kept = (ordered[-k:] if k else []) if keep_mode == "kh" \
+                    else ordered[:k]
+                t = sum(kept)
+                group[t] = group.get(t, 0) + 1
+        else:
+            if explode:
+                exact = False
+                die: Dict[int, Any] = {}
+                p, depth = 1.0 / sides, 0
+                while True:
+                    reach = p ** depth            # chance of `depth` max faces
+                    for r in range(1, sides):
+                        v = sides * depth + r
+                        die[v] = die.get(v, 0.0) + reach * p
+                    depth += 1
+                    if reach * p < _ODDS_EXPLODE_EPS or depth >= _ROLL_EXPLODE_CAP:
+                        die[sides * depth] = die.get(sides * depth, 0.0) + reach * p
+                        break
+            else:
+                die = {v: 1 for v in range(1, sides + 1)}
+            group = {0: 1}
+            for _ in range(count):
+                group = _conv(group, die)
+        if sgn < 0:
+            group = {-v: w for v, w in group.items()}
+        if not exact:
+            dist = {v: float(w) for v, w in dist.items()}
+            gtot = sum(group.values())
+            group = {v: float(w) / gtot for v, w in group.items()}
+        dist = _conv(dist, group)
+    total = sum(dist.values())
+    return dist, total, exact
 
 
 def roll_table_pick(rng, spec: Any) -> str:
@@ -1034,6 +1183,27 @@ class _ArithGuardTransformer(ast.NodeTransformer):
     user formula (expression, program, action body, !func) is covered.
     Evaluation order is unchanged: left, then right, then the operation."""
 
+    def visit_Tuple(self, node: ast.Tuple) -> ast.AST:
+        # Coordinates are lists in formulas: a tuple VALUE written in a
+        # formula ((3, 3)) is built as a list, so it equals a stored
+        # coordinate and a function's [x, y] result. Loop targets
+        # (`for x, y in ...`) are Store tuples and stay as they are.
+        self.generic_visit(node)
+        if isinstance(node.ctx, ast.Load):
+            return ast.copy_location(ast.List(elts=node.elts, ctx=ast.Load()),
+                                     node)
+        return node
+
+    def visit_Dict(self, node: ast.Dict) -> ast.AST:
+        # A tuple used as a dict KEY stays a tuple (a list can't be a key).
+        node.keys = [k if isinstance(k, ast.Tuple) or k is None
+                     else self.visit(k) for k in node.keys]
+        for k in node.keys:
+            if isinstance(k, ast.Tuple):
+                k.elts = [self.visit(e) for e in k.elts]
+        node.values = [self.visit(v) for v in node.values]
+        return node
+
     def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
         self.generic_visit(node)
         fn = _ARITH_GUARDS.get(type(node.op))
@@ -1043,6 +1213,36 @@ class _ArithGuardTransformer(ast.NodeTransformer):
             ast.Call(func=ast.Name(id=fn, ctx=ast.Load()),
                      args=[node.left, node.right], keywords=[]),
             node)
+
+
+def _listify(v: Any) -> Any:
+    """`v` with every tuple inside turned into a list. Returns the same object
+    when there is no tuple to convert (no copy on the common path)."""
+    if isinstance(v, tuple):
+        return [_listify(x) for x in v]
+    if isinstance(v, list):
+        out = None
+        for i, x in enumerate(v):
+            y = _listify(x)
+            if y is not x:
+                if out is None:
+                    out = list(v[:i])
+                out.append(y)
+            elif out is not None:
+                out.append(x)
+        return v if out is None else out
+    if isinstance(v, dict):
+        changed = {k: _listify(x) for k, x in v.items()}
+        return v if all(changed[k] is v[k] for k in v) else changed
+    return v
+
+
+def _lists_out(fn: Callable) -> Callable:
+    def wrapped(*a: Any, **k: Any) -> Any:
+        return _listify(fn(*a, **k))
+    wrapped.__name__ = getattr(fn, "__name__", "fn")
+    wrapped.__doc__ = getattr(fn, "__doc__", None)
+    return wrapped
 
 
 def _guard_arith(tree: ast.AST) -> ast.AST:
@@ -1604,12 +1804,280 @@ def _count(v: Any, value: Any) -> int:
     return sum(1 for x in _list_arg(v, "count") if x == value)
 
 
+# ---- container reads -----------------------------------------------------
+# Subscripts are banned, so a list or dict held in a local (or read with
+# var_get) could be looped over but no single element read out of it. These
+# fill that gap. All pure; none can grow data beyond its input.
+_GET_MISSING = object()
+
+
+def _get_step(cur: Any, seg: Any, where: str) -> Tuple[bool, Any]:
+    """One step of get(): (found, value). A dict is read by key (keys are
+    text, so 3 reads key '3'); a list by a whole-number index, negative
+    counting from the end."""
+    if isinstance(cur, dict):
+        k = seg if isinstance(seg, str) else str(seg)
+        return (True, cur[k]) if k in cur else (False, None)
+    if isinstance(cur, (list, tuple)):
+        if isinstance(seg, str):
+            try:
+                seg = int(seg)
+            except ValueError:
+                raise FormulaError(
+                    f"get(...): '{where}' is a list, so the next part must be "
+                    f"a whole-number index, got '{seg}'.")
+        if not -len(cur) <= seg < len(cur):
+            return False, None
+        return True, cur[seg]
+    raise FormulaError(
+        f"get(...): '{where}' is "
+        f"{'None' if cur is None else type(cur).__name__}, not a list or dict.")
+
+
+def _get(container: Any, key: Any, default: Any = _GET_MISSING) -> Any:
+    """get(container, key[, default]): one element of a list or dict held in
+    a local or read with var_get. `key` is a dict key, a list index (-1 =
+    the last item), or a dotted path through nested data ('stats.hp',
+    'queue.0'). A missing key or an index past the end returns `default`,
+    or is an error when no default is given (like var_get)."""
+    if isinstance(key, bool) or not isinstance(key, (str, int)):
+        raise FormulaError(
+            f"get(container, key): key must be text or a whole number, got "
+            f"{'None' if key is None else type(key).__name__}.")
+    if not isinstance(container, (dict, list, tuple)):
+        raise FormulaError(
+            f"get(container, key): container must be a list or dict, got "
+            f"{'None' if container is None else type(container).__name__}.")
+    segs: List[Any] = [key] if isinstance(key, int) else key.split(".")
+    if any(s == "" for s in segs):
+        raise FormulaError(
+            f"get(container, key): '{key}' has an empty part.")
+    cur, walked = container, "the container"
+    for seg in segs:
+        found, cur = _get_step(cur, seg, walked)
+        if not found:
+            if default is not _GET_MISSING:
+                return default
+            raise FormulaError(f"get(...): '{key}' not found ('{seg}' is "
+                               f"missing).")
+        walked = str(seg) if walked == "the container" else f"{walked}.{seg}"
+    return cur
+
+
+def _dict_arg(v: Any, fname: str) -> dict:
+    if isinstance(v, dict):
+        return v
+    raise FormulaError(
+        f"{fname}(dict): expected a dict, got "
+        f"{'None' if v is None else type(v).__name__}.")
+
+
+def _keys(v: Any) -> list:
+    """keys(dict): a dict's keys, in insertion order (each() over a dict
+    gives the same list)."""
+    return list(_dict_arg(v, "keys").keys())
+
+
+def _values(v: Any) -> list:
+    """values(dict): a dict's values, in the same order as keys()."""
+    return list(_dict_arg(v, "values").values())
+
+
+def _index_of(v: Any, value: Any) -> Any:
+    """index_of(list, value): the index of the first item equal to `value`,
+    or None when there is none (-1 would read as the last item in get)."""
+    for i, x in enumerate(_list_arg(v, "index_of")):
+        if x == value:
+            return i
+    return None
+
+
+def _unique(v: Any) -> list:
+    """unique(list): the list without repeats, keeping each item's first
+    position. Items compare with ==, so 1 and 1.0 count as one; equal lists
+    and dicts are repeats too."""
+    seen_h: set = set()
+    seen_u: set = set()
+    out = []
+    for x in _list_arg(v, "unique"):
+        try:
+            if x in seen_h:
+                continue
+            seen_h.add(x)
+        except TypeError:          # a list / dict item: compare by content
+            k = json.dumps(x, sort_keys=True, default=str)
+            if k in seen_u:
+                continue
+            seen_u.add(k)
+        out.append(x)
+    return out
+
+
+# ---- string helpers ------------------------------------------------------
+# Method calls are banned in formulas ('abc'.upper() is rejected), so text is
+# handled through these functions. All are pure; the ones that can grow text
+# (replace, join, fmt) are capped at formula_size_limit (the namespace binds
+# the match's value, like range / each).
+def _text_arg(v: Any, fname: str, argname: str = "the argument") -> str:
+    if not isinstance(v, str):
+        raise FormulaError(
+            f"{fname}(...): {argname} must be text, got "
+            f"{'None' if v is None else type(v).__name__}.")
+    return v
+
+
+def _check_text_size(out: str, fname: str, limit: int) -> str:
+    if len(out) > limit:
+        raise FormulaError(
+            f"{fname}(...): the result is {len(out)} characters, over the "
+            f"formula_size_limit of {limit}.")
+    return out
+
+
+def _upper(v: Any) -> str:
+    """upper(text): the text in upper case."""
+    return _text_arg(v, "upper").upper()
+
+
+def _lower(v: Any) -> str:
+    """lower(text): the text in lower case."""
+    return _text_arg(v, "lower").lower()
+
+
+def _strip(v: Any) -> str:
+    """strip(text): the text without leading and trailing spaces."""
+    return _text_arg(v, "strip").strip()
+
+
+def _startswith(v: Any, prefix: Any) -> bool:
+    """startswith(text, prefix): True when the text starts with prefix."""
+    return _text_arg(v, "startswith").startswith(
+        _text_arg(prefix, "startswith", "prefix"))
+
+
+def _endswith(v: Any, suffix: Any) -> bool:
+    """endswith(text, suffix): True when the text ends with suffix."""
+    return _text_arg(v, "endswith").endswith(
+        _text_arg(suffix, "endswith", "suffix"))
+
+
+def _split(v: Any, sep: Any = None) -> list:
+    """split(text, sep=None): the text cut at each `sep` into a list; with
+    no sep, cut at runs of spaces (empty pieces dropped)."""
+    t = _text_arg(v, "split")
+    if sep is None:
+        return t.split()
+    sep = _text_arg(sep, "split", "sep")
+    if not sep:
+        raise FormulaError("split(...): sep can't be empty.")
+    return t.split(sep)
+
+
+def _replace(v: Any, old: Any, new: Any, *,
+             limit: int = _DEFAULT_SIZE_LIMIT) -> str:
+    """replace(text, old, new): the text with every `old` replaced by
+    `new`."""
+    t = _text_arg(v, "replace")
+    old = _text_arg(old, "replace", "old")
+    new = _text_arg(new, "replace", "new")
+    if not old:
+        raise FormulaError("replace(...): old can't be empty.")
+    # Size the result before building it: replace('a'*N, 'a', <long>)
+    # would otherwise allocate N * len(new) characters first.
+    size = len(t) + t.count(old) * (len(new) - len(old))
+    if size > limit:
+        raise FormulaError(
+            f"replace(...): the result would be {size} characters, over the "
+            f"formula_size_limit of {limit}.")
+    return t.replace(old, new)
+
+
+def _join(items: Any, sep: Any = "", *,
+          limit: int = _DEFAULT_SIZE_LIMIT) -> str:
+    """join(list, sep=""): the items as one text, `sep` between them.
+    Numbers and other values are written as str() would."""
+    parts = [x if isinstance(x, str) else str(x)
+             for x in _list_arg(items, "join")]
+    sep = _text_arg(sep, "join", "sep")
+    size = sum(len(p) for p in parts) + len(sep) * max(0, len(parts) - 1)
+    if size > limit:
+        raise FormulaError(
+            f"join(...): the result would be {size} characters, over the "
+            f"formula_size_limit of {limit}.")
+    return sep.join(parts)
+
+
+_FMT_FIELD = re.compile(r"\{\{|\}\}|\{([^{}]*)\}|[{}]")
+_FMT_NAME = re.compile(r"(\d+|[A-Za-z_]\w*)(?::(.*))?\Z", re.S)
+# A format spec is limited to alignment, sign, a width of up to 3 digits, a
+# precision of up to 2 and a type letter: {0:>5}, {1:.2f}, {2:+d}, {3:%}.
+# Python's str.format would also resolve {0.attr} / {0[key]}, reaching into
+# objects, so fields are parsed here and only plain names / numbers resolve.
+_FMT_SPEC = re.compile(r"[<>^]?[+-]?\d{0,3}(?:\.\d{1,2})?[dfeg%s]?\Z")
+
+
+def _fmt(template: Any, *args: Any, _limit: int = _DEFAULT_SIZE_LIMIT,
+         **kwargs: Any) -> str:
+    """fmt(template, a, b, ..., name=value, ...): the template with each
+    {0}, {1}, ... replaced by the matching argument and each {name} by the
+    keyword argument. A field may carry a short format spec ({0:.1f},
+    {1:>4}). {{ and }} write a literal brace."""
+    t = _text_arg(template, "fmt", "template")
+    out: List[str] = []
+    pos = 0
+    for m in _FMT_FIELD.finditer(t):
+        out.append(t[pos:m.start()])
+        pos = m.end()
+        tok = m.group(0)
+        if tok in ("{{", "}}"):
+            out.append(tok[0])
+            continue
+        if m.group(1) is None:
+            raise FormulaError(
+                "fmt(...): an unmatched brace in the template (write {{ or }} "
+                "for a literal one).")
+        f = _FMT_NAME.match(m.group(1))
+        if not f:
+            raise FormulaError(
+                f"fmt(...): {{{m.group(1)}}} isn't a field — use {{0}}, {{1}}, "
+                f"... or {{name}}.")
+        key, spec = f.group(1), f.group(2) or ""
+        if key.isdigit():
+            i = int(key)
+            if i >= len(args):
+                raise FormulaError(
+                    f"fmt(...): {{{key}}} has no argument ({len(args)} given).")
+            val = args[i]
+        else:
+            if key not in kwargs:
+                raise FormulaError(f"fmt(...): no {key}= argument for {{{key}}}.")
+            val = kwargs[key]
+        if spec:
+            if not _FMT_SPEC.match(spec):
+                raise FormulaError(f"fmt(...): unsupported format spec '{spec}'.")
+            try:
+                piece = format(val, spec)
+            except (ValueError, TypeError) as ex:
+                raise FormulaError(f"fmt(...): {{{m.group(1)}}}: {ex}")
+        else:
+            piece = val if isinstance(val, str) else str(val)
+        out.append(piece)
+        if sum(len(x) for x in out) > _limit:
+            raise FormulaError(
+                f"fmt(...): the result is over the formula_size_limit of "
+                f"{_limit} characters.")
+    out.append(t[pos:])
+    return _check_text_size("".join(out), "fmt", _limit)
+
+
 _ALLOWED_FUNCS: Dict[str, Any] = {
     "min": min, "max": max, "abs": abs, "round": round,
     "int": int, "float": float, "str": str,
     "len": _len,
     "random_int": _random_int,
     "random_string": _random_string,
+    "pick": _pick,
+    "shuffle": _shuffle,
     "roll": _roll,
     "distance": _distance,
     "angle": _angle,
@@ -1635,6 +2103,20 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
     "any": _any,
     "all": _all,
     "count": _count,
+    "get": _get,
+    "keys": _keys,
+    "values": _values,
+    "index_of": _index_of,
+    "unique": _unique,
+    "upper": _upper,
+    "lower": _lower,
+    "strip": _strip,
+    "startswith": _startswith,
+    "endswith": _endswith,
+    "split": _split,
+    "replace": _replace,
+    "join": _join,
+    "fmt": _fmt,
 }
 
 # Match-bound function names. These functions are bound at namespace build
@@ -1801,6 +2283,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # the amount-aware pair item_add / item_consume (stack +N / consume-and-
     # drop-at-0), with the amount field defaulting to the amount_field rule.
     "var_add", "var_move", "var_sum_field", "item_add", "item_consume",
+    # var_copy: var_move's non-destructive sibling (deep copy, source kept).
+    "var_copy",
     # Match-level var accessors: runtime-path twins of the reserved
     # `match.<path>` formula root (which itself mirrors entity[X].path).
     # All read/write the single match-wide vars dict — global GM state
@@ -2017,6 +2501,18 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # directional_corner_arc rule.
     "facing_of", "relative_side", "side_hit", "directional_get",
     "hit_location",
+    # Facing writes (set_facing / face_toward share !ent face's rules), map
+    # size, unit-to-unit body distance, movement/sight cell checks, the
+    # nearest free cell for a body, and a team roster.
+    "set_facing", "face_toward",
+    "grid_width", "grid_height", "in_bounds",
+    "entity_distance", "cell_blocked", "cell_opaque",
+    "free_cell_near", "team_members",
+    # zone_distance: body-to-nearest-zone-cell gap; entities_at: every unit
+    # covering a cell (stackable ones included).
+    "zone_distance", "entities_at",
+    "flanking", "flanking_angle", "flanking_line", "nearest_cell",
+    "visible_entities", "random_cell", "random_free_cell",
     # Footprint / large-entity primitives. A large entity occupies a W×H
     # rectangle anchored at its top-left cell (entity[X].x / .y); these
     # expose that footprint to formulas.
@@ -2060,8 +2556,9 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "status_counter_add", "status_counter_set",
     "declare_winner",
     "var_set", "var_del", "var_clear",
-    "var_add", "var_move", "item_add", "item_consume",
+    "var_add", "var_move", "var_copy", "item_add", "item_consume",
     "match_var_set", "match_var_del",
+    "set_facing", "face_toward",
     "emit",
     "use_action",
     "summon", "summon_near", "summon_from", "remove_entity",
@@ -2082,6 +2579,8 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
 # never silently expose a function in $() args. When unsure, classify a
 # function as MUTATING (leave it out of this set).
 ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
+    'flanking', 'flanking_angle', 'flanking_line', 'nearest_cell',
+    'visible_entities', 'random_cell', 'random_free_cell',
     'all_corpses', 'all_entities', 'aoe_origin', 'apply_mods',
     'atb_rate', 'atb_threshold', 'can_mount', 'can_see',
     'can_see_losonly', 'can_see_rangeonly', 'cell_entity',
@@ -2103,6 +2602,9 @@ ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'match_var_has', 'match_var_keys', 'match_winner', 'mount_of',
     'nearest_entity', 'occupies', 'part', 'part_of', 'parts', 'raycast',
     'highest_var', 'lowest_var',
+    'grid_width', 'grid_height', 'in_bounds', 'entity_distance',
+    'cell_blocked', 'cell_opaque', 'free_cell_near', 'team_members',
+    'zone_distance', 'entities_at',
     'relative_side', 'riders', 'roll_table', 'round_number', 'rule_get',
     'self_id', 'shield_total', 'side_hit', 'slot_capacity', 'slot_free',
     'slot_of', 'slot_riders', 'status_get', 'status_has',
@@ -2139,6 +2641,10 @@ assert not _arg_unknown_mutating, (
 # live in _ALLOWED_FUNCS.) User-defined !func functions are NOT included — they
 # can't be verified read-only, so they're banned from args.
 ARG_SAFE_FUNC_NAMES: "frozenset[str]" = frozenset(_ALLOWED_FUNCS) | ARG_SAFE_MATCH_FUNCS
+
+# Built-in functions whose results _namespace passes through _listify (see
+# there): every match function and pure helper.
+_TUPLE_FREE_FUNCS = frozenset(_MATCH_FUNC_NAMES) | frozenset(_ALLOWED_FUNCS)
 
 
 def validate_arg_safe(src: str) -> None:
@@ -2234,6 +2740,13 @@ _ALLOWED_NODES: Tuple[type, ...] = (
 _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "range",
     "each",
+    "keys",
+    "values",
+    "unique",
+    "shuffle",
+    "team_members",
+    "entities_at",
+    "visible_entities",
     "entities_within",
     "chain_targets",
     "group_members",
@@ -2319,6 +2832,9 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
                         # status_tick_formula evaluation (see
                         # status_tick_when / status_tick_formula rules
                         # and Match.fire_status_tick); None elsewhere.
+    "skip_status",      # on_turn_skipped: the status(es) whose skips_turn
+                        # cost the unit its turn, sorted and comma-joined
+                        # ("stunned" / "frozen, stunned"); None elsewhere.
     # Movement-event bindings. Bound only during on_entity_moved
     # firing (see Match.fire_entity_moved); None elsewhere. from_*
     # are the position the entity moved FROM, to_* are where it
@@ -3018,6 +3534,7 @@ def _get_path(d: Dict[str, Any], path: str) -> Any:
 
 
 def _set_path(d: Dict[str, Any], path: str, value: Any) -> None:
+    check_store_path(path)
     keys = path.split(".")
     cur = d
     for k in keys[:-1]:
@@ -3165,7 +3682,7 @@ class FormulaEngine:
         if msg:
             raise FormulaError(msg)
         # write_var does the diff + event firing + mutation in one shot.
-        e.write_var(path, value)
+        self._match.surface_log(e.write_var(path, value))
         # Track for the "Affected: a, b, c" command-layer summary.
         self._note_affected(eid)
         return value
@@ -3186,7 +3703,11 @@ class FormulaEngine:
         written value so it composes inside larger expressions."""
         if self._match is None:
             raise FormulaError("match vars are unavailable in this context.")
-        _set_path(self._match.vars, path, value)
+        try:
+            check_no_value_ancestor(self._match.vars, path, "match var")
+        except VTTError as ex:
+            raise FormulaError(str(ex))
+        _set_path(self._match.vars, path, _own_value(value))
         return value
 
     def _namespace(self, ctx: EvalCtx) -> Dict[str, Any]:
@@ -3251,6 +3772,9 @@ class FormulaEngine:
             "cells_in_rect": lambda *a, **k: _cells_in_rect(*a, limit=cell_limit, **k),
             "range": lambda *a: _range(*a, limit=size_limit),
             "each": lambda v: _each(v, limit=size_limit),
+            "replace": lambda *a: _replace(*a, limit=size_limit),
+            "join": lambda *a: _join(*a, limit=size_limit),
+            "fmt": lambda *a, **k: _fmt(*a, _limit=size_limit, **k),
         }
         # Per-name default: was_clamped is boolean-flavored (default False);
         # args defaults to an empty dict (so attribute access via
@@ -3289,6 +3813,8 @@ class FormulaEngine:
             ns["random_string"] = (
                 lambda *choices, _r=rng: _random_string_impl(_r, choices)
             )
+            ns["pick"] = lambda v, _r=rng: _pick_impl(_r, v)
+            ns["shuffle"] = lambda v, _r=rng: _shuffle_impl(_r, v)
             ns["roll"] = (
                 lambda spec, _r=rng: _roll_impl(_r, spec)
             )
@@ -3534,16 +4060,16 @@ class FormulaEngine:
             DIAGONAL_DIRECTIONS as _DIAGONAL_DIRECTIONS,
             OutOfBounds as _OutOfBounds,
             Occupied as _Occupied,
+            Blocked as _Blocked,
         )
 
         def _move_entity(eid_t: Any, x: Any, y: Any) -> tuple:
             """move_entity(eid, x, y): teleport the entity to (x, y) with
             full tp() semantics (bounds + occupancy validated, tile
             hooks + on_entity_moved fire). Returns (x, y) on success;
-            raises FormulaError on validation failure so a formula can
-            safeguard with prior reads (in_bounds / is_occupied are not
-            yet exposed; check via tile_keys or entity coordinate
-            equality)."""
+            raises FormulaError on validation failure, so check first:
+            in_bounds(x, y), cell_entity(x, y) == '', cell_blocked(eid,
+            x, y, 'tp') — or ask free_cell_near for a cell that fits."""
             eid = _eid(eid_t)
             e = match.entities.get(eid)
             if e is None:
@@ -3559,7 +4085,7 @@ class FormulaEngine:
                     f"{type(y).__name__}."
                 )
             try:
-                e.tp(x, y)
+                match.surface_log(e.tp(x, y))
             except (_OutOfBounds, _Occupied) as ex:
                 raise FormulaError(str(ex))
             self._note_affected(eid)
@@ -3592,19 +4118,15 @@ class FormulaEngine:
                     f"move_step: diagonal direction '{direction}' "
                     f"requires allow_diagonal_movement=True."
                 )
-            dx, dy = _DIRECTION_VECTORS[canon]
-            nx, ny = e.x + dx, e.y + dy
-            if not match.in_bounds(nx, ny):
-                return False
-            # Stackable movers bypass the precheck — Entity.tp itself
-            # would also bypass, but we precheck here to return False
-            # (the formula's documented "blocked" signal) rather than
-            # raising. For stackable, "blocked" never applies.
-            if not e.is_cell_stackable and match.is_occupied(nx, ny, ignore_entity_id=e.id):
-                return False
+            # A one-cell WALK, the same as `!ent move <id> 1 <dir>`: it turns
+            # the walker to face the step, checks the block_walk rule, fires
+            # on_entity_step, and drags a snake's body along. It used to
+            # teleport to the next cell, which skipped all of that (a snake
+            # head left its body behind) and raised on a wall instead of
+            # returning False.
             try:
-                e.tp(nx, ny)
-            except (_OutOfBounds, _Occupied):
+                match.surface_log(e.move_dirs([(canon, 1)]))
+            except (_OutOfBounds, _Occupied, _Blocked):
                 return False
             self._note_affected(eid)
             return True
@@ -3667,6 +4189,7 @@ class FormulaEngine:
             # error as a FormulaError, and records the affected entity.
             try:
                 steps, _log = match.push_entity(eid, direction, n)
+                match.surface_log(_log)
             except VTTError as ex:
                 raise FormulaError(str(ex))
             if steps:
@@ -3689,6 +4212,7 @@ class FormulaEngine:
             # Match.pull_entity (shared with the !ent pull command).
             try:
                 steps, _log = match.pull_entity(eid, x, y, n)
+                match.surface_log(_log)
             except VTTError as ex:
                 raise FormulaError(str(ex))
             if steps:
@@ -3710,6 +4234,7 @@ class FormulaEngine:
             # Match.swap_entities (shared with the !ent swap command).
             try:
                 swapped, _log = match.swap_entities(aid, bid)
+                match.surface_log(_log)
             except VTTError as ex:
                 raise FormulaError(str(ex))
             if swapped:
@@ -4125,6 +4650,11 @@ class FormulaEngine:
             e = match.entities.get(eid)
             if e is None:
                 raise FormulaError(f"unknown entity id '{eid}'.")
+            try:
+                check_store_path(path, "status path")
+                value = checked_status_value(path, value, f"status '{eid}.{name}'")
+            except VTTError as ex:
+                raise FormulaError(str(ex))
             before = copy.deepcopy(e.status[name]) if name in e.status else None
             data = e.status.setdefault(name, {})
             keys = path.split(".")
@@ -4140,7 +4670,7 @@ class FormulaEngine:
                 if k not in cur:
                     cur[k] = {}
                 cur = cur[k]
-            cur[keys[-1]] = value
+            cur[keys[-1]] = _own_value(value)
             after = copy.deepcopy(e.status[name])
             match._emit_status_diff(eid, name, before, after)
             self._note_affected(eid)
@@ -4215,8 +4745,12 @@ class FormulaEngine:
                     raise FormulaError(f"{fname}(...): {label} must be a number.")
             lv = None if level is None else int(level)
             du = None if duration is None else int(duration)
+            for label, v in (("level", lv), ("duration", du)):
+                if v is not None and v < 0:
+                    raise FormulaError(f"{fname}(...): {label} can't be "
+                                       f"negative, got {v}.")
             try:
-                match.apply_status(eid, name, lv, du, force=force)
+                match.surface_log(match.apply_status(eid, name, lv, du, force=force))
             except (VTTError, NotFound) as ex:
                 raise FormulaError(str(ex))
             self._note_affected(eid)
@@ -4246,6 +4780,7 @@ class FormulaEngine:
                 raise FormulaError("status_dispel(...): max must be a number.")
             try:
                 n, _log = match.dispel_statuses(eid, token, int(max))
+                match.surface_log(_log)
             except (VTTError, NotFound) as ex:
                 raise FormulaError(str(ex))
             self._note_affected(eid)
@@ -4257,8 +4792,9 @@ class FormulaEngine:
             and re-applies on the destination honoring the dest's stacking +
             resistance/immunity — a RESISTIBLE move: if the dest resists or is
             immune the status is consumed (gone from source, doesn't stick).
-            Carries level + duration; custom instance data re-seeds from the
-            definition (like the body-part redirect). Returns True iff it
+            Carries level + duration, and the moved instance keeps its
+            custom fields (onto an existing instance only the stacking
+            applies). Returns True iff it
             LANDED on the destination; False if the source lacked it / from==to
             / the dest rejected it."""
             fid = _eid(from_t)
@@ -4267,6 +4803,7 @@ class FormulaEngine:
                 raise FormulaError("status_transfer(from, to, name): name must be a string.")
             try:
                 landed, _log = match.transfer_status(fid, tid, name)
+                match.surface_log(_log)
             except (VTTError, NotFound) as ex:
                 raise FormulaError(str(ex))
             self._note_affected(fid)
@@ -4363,11 +4900,13 @@ class FormulaEngine:
                 raise FormulaError(f"unknown entity id '{eid}'.")
             if name not in e.status:
                 raise FormulaError(f"entity '{eid}' has no status '{name}'.")
-            cur = e.status[name].get(field, 0)
-            try:
-                cur = float(cur)
-            except (TypeError, ValueError):
-                cur = 0.0
+            raw = e.status[name].get(field, 0)
+            cur = _coerce_number(raw)
+            if cur is None:
+                raise FormulaError(
+                    f"status '{eid}.{name}' field '{field}' holds {raw!r}, "
+                    f"not a number.")
+            cur = float(cur)
             new = float(amount) if absolute else cur + float(amount)
             if new == int(new):
                 new = int(new)
@@ -4411,7 +4950,10 @@ class FormulaEngine:
             action, or an on_death passive). Returns the winner string."""
             if not isinstance(winner, str) or not winner:
                 raise FormulaError("declare_winner(winner[, reason]): winner must be a non-empty string.")
-            match.declare_winner(winner, str(reason) if reason else "")
+            out: List[str] = []
+            match.declare_winner(winner, str(reason) if reason else "",
+                                 log_out=out)
+            match.surface_log(out)
             return str(winner)
 
         def _match_winner() -> str:
@@ -4539,7 +5081,7 @@ class FormulaEngine:
             msg = reserved_var_path_error(path, f"var_set({eid!r}, '{path}', ...)")
             if msg:
                 raise FormulaError(msg)
-            e.write_var(path, value)
+            match.surface_log(e.write_var(path, value))
             engine._note_affected(eid)
             return value
 
@@ -4555,7 +5097,7 @@ class FormulaEngine:
             if not _var_has(eid_t, path):
                 return False
             try:
-                e.remove_var(path)
+                match.surface_log(e.remove_var(path))
             except VTTError as ex:
                 raise FormulaError(str(ex))
             engine._note_affected(eid)
@@ -4582,7 +5124,7 @@ class FormulaEngine:
                     raise FormulaError(
                         f"var_add: existing value at '{path}' is not a number.")
             new = cur + delta
-            e.write_var(path, new)
+            match.surface_log(e.write_var(path, new))
             engine._note_affected(eid)
             return new
 
@@ -4606,12 +5148,36 @@ class FormulaEngine:
             if not _var_has(src_t, src_path):
                 return False
             val = copy.deepcopy(_walk_vars(se, src_path, must_exist=True))
-            de.write_var(dest_path, val)
+            match.surface_log(de.write_var(dest_path, val))
             try:
-                se.remove_var(src_path)
+                match.surface_log(se.remove_var(src_path))
             except VTTError as ex:
                 raise FormulaError(str(ex))
             engine._note_affected(seid)
+            engine._note_affected(deid)
+            return True
+
+        def _var_copy(src_t: Any, src_path: Any,
+                      dest_t: Any, dest_path: Any) -> bool:
+            """var_copy(src_eid, src_path, dest_eid, dest_path): write a DEEP
+            COPY of a var (or a whole subtree) to another entity/path and
+            keep the source — var_move without the delete (grant a copy of
+            an item, seed a stat block from a template). Returns True iff the
+            source existed; False (no-op) when it's absent."""
+            if not (isinstance(src_path, str) and src_path):
+                raise FormulaError("var_copy: src_path must be a non-empty string.")
+            if not (isinstance(dest_path, str) and dest_path):
+                raise FormulaError("var_copy: dest_path must be a non-empty string.")
+            msg = reserved_var_path_error(dest_path, "var_copy (destination)")
+            if msg:
+                raise FormulaError(msg)
+            _resolve_entity(src_t, "var_copy")
+            deid, de = _resolve_entity(dest_t, "var_copy")
+            if not _var_has(src_t, src_path):
+                return False
+            _, se = _resolve_entity(src_t, "var_copy")
+            val = copy.deepcopy(_read_entity_path(se, src_path))
+            match.surface_log(de.write_var(dest_path, val))
             engine._note_affected(deid)
             return True
 
@@ -4684,12 +5250,12 @@ class FormulaEngine:
             if remaining <= 0:
                 if _var_has(eid_t, path):
                     try:
-                        e.remove_var(path)
+                        match.surface_log(e.remove_var(path))
                     except VTTError as ex:
                         raise FormulaError(str(ex))
                 engine._note_affected(eid)
                 return 0
-            e.write_var(full, remaining)
+            match.surface_log(e.write_var(full, remaining))
             engine._note_affected(eid)
             return remaining
 
@@ -4700,6 +5266,7 @@ class FormulaEngine:
         ns["var_del"]  = _var_del
         ns["var_add"]  = _var_add
         ns["var_move"] = _var_move
+        ns["var_copy"] = _var_copy
         ns["var_sum_field"] = _var_sum_field
         ns["item_add"] = _item_add
         ns["item_consume"] = _item_consume
@@ -4797,7 +5364,9 @@ class FormulaEngine:
             if payload is not None and not isinstance(payload, dict):
                 raise FormulaError("emit(...): payload must be a dict.")
             tid = None if target is None else _eid(target)
-            return len(match.emit_event(name, payload, tid))
+            lines = match.emit_event(name, payload, tid)
+            match.surface_log(lines)
+            return len(lines)
 
         def _event_get(key: Any, default: Any = None) -> Any:
             """event_get(key, default=None): a value from the payload of the
@@ -4982,7 +5551,7 @@ class FormulaEngine:
                 # Leaf scalar at `path` — drop the var itself.
                 # Path is non-empty here (root is always a dict).
                 try:
-                    e.remove_var(path)
+                    match.surface_log(e.remove_var(path))
                 except VTTError as ex:
                     raise FormulaError(str(ex))
                 engine._note_affected(eid)
@@ -4997,7 +5566,7 @@ class FormulaEngine:
             for k in children:
                 child_path = f"{path}.{k}" if path else k
                 try:
-                    e.remove_var(child_path)
+                    match.surface_log(e.remove_var(child_path))
                     removed += 1
                 except (VTTError, NotFound):
                     # Vital-var protection (initiative / team / hp) or
@@ -5169,6 +5738,7 @@ class FormulaEngine:
                 new_id, _log = match.summon_entity(
                     template, x, y, id_prefix=prefix,
                 )
+                match.surface_log(_log)
             except (VTTError, NotFound) as ex:
                 raise FormulaError(str(ex))
             engine._note_affected(new_id)
@@ -5188,6 +5758,7 @@ class FormulaEngine:
                 new_id, _log = match.summon_entity(
                     template, x, y, id_prefix=prefix, near_radius=radius,
                 )
+                match.surface_log(_log)
             except (VTTError, NotFound) as ex:
                 raise FormulaError(str(ex))
             engine._note_affected(new_id)
@@ -5232,7 +5803,7 @@ class FormulaEngine:
             id isn't a live entity."""
             eid, e = _resolve_entity(eid_t, "remove_entity")
             # A snake segment follows the segment_removal_mode rule.
-            match.despawn_entity(e)
+            match.surface_log(match.despawn_entity(e))
             return True
 
         ns["entity_snapshot"] = _entity_snapshot
@@ -5267,6 +5838,7 @@ class FormulaEngine:
             # Effects-formula run + unconditional death pipeline live in
             # Match.kill_entity (shared with the !ent kill command).
             killed, _log = match.kill_entity(_eid(eid_t))
+            match.surface_log(_log)
             return killed
 
         def _revive(eid_t: Any) -> str:
@@ -5279,7 +5851,8 @@ class FormulaEngine:
             eid = str(_eid(eid_t))
             try:
                 new_id, _log = match.revive_corpse(eid)
-            except (VTTError, NotFound, OutOfBounds, Occupied) as ex:
+                match.surface_log(_log)
+            except VTTError as ex:
                 raise FormulaError(str(ex))
             engine._note_affected(new_id)
             return new_id
@@ -5295,8 +5868,8 @@ class FormulaEngine:
             eid = str(_eid(eid_t))
             sp = None if stash_path is None else str(stash_path)
             try:
-                match.transform_entity(eid, template, sp)
-            except (VTTError, NotFound, OutOfBounds, Occupied) as ex:
+                match.surface_log(match.transform_entity(eid, template, sp))
+            except VTTError as ex:
                 raise FormulaError(str(ex))
             engine._note_affected(eid)
             return eid
@@ -5307,8 +5880,8 @@ class FormulaEngine:
             Returns eid. Raises if no stashed statblock is found there."""
             eid = str(_eid(eid_t))
             try:
-                match.revert_entity(eid, str(stash_path))
-            except (VTTError, NotFound, OutOfBounds, Occupied) as ex:
+                match.surface_log(match.revert_entity(eid, str(stash_path)))
+            except VTTError as ex:
                 raise FormulaError(str(ex))
             engine._note_affected(eid)
             return eid
@@ -5748,7 +6321,7 @@ class FormulaEngine:
             slot (validated — capacity, condition, no cycle). Raises on
             failure. Returns True."""
             try:
-                match.mount_entity(_eid(rider), _eid(vehicle), str(slot))
+                match.surface_log(match.mount_entity(_eid(rider), _eid(vehicle), str(slot)))
             except (VTTError, NotFound) as ex:
                 raise FormulaError(str(ex))
             return True
@@ -5759,7 +6332,7 @@ class FormulaEngine:
             try:
                 xi = _cell_arg(x, "dismount", "x") if x is not None else None
                 yi = _cell_arg(y, "dismount", "y") if y is not None else None
-                match.dismount_entity(_eid(rider), xi, yi)
+                match.surface_log(match.dismount_entity(_eid(rider), xi, yi))
             except (VTTError, NotFound) as ex:
                 raise FormulaError(str(ex))
             return True
@@ -5768,7 +6341,7 @@ class FormulaEngine:
             """switch_slot(rider, slot): move a mounted rider to another slot
             of the same vehicle (validated). Raises on failure. True."""
             try:
-                match.switch_slot(_eid(rider), str(slot))
+                match.surface_log(match.switch_slot(_eid(rider), str(slot)))
             except (VTTError, NotFound) as ex:
                 raise FormulaError(str(ex))
             return True
@@ -5976,6 +6549,7 @@ class FormulaEngine:
             if isinstance(amount, bool) or not isinstance(amount, (int, float)):
                 raise FormulaError("damage_part(part, amount): amount must be a number.")
             to_main, _log = match.damage_part(pid, int(amount))
+            match.surface_log(_log)
             return to_main
         ns["damage_part"] = _damage_part
 
@@ -6011,6 +6585,7 @@ class FormulaEngine:
                     raise FormulaError("damage_spread(...): radius must be a number.")
                 radius_i = int(radius)
             to_main, _log = match.damage_spread(tid, int(total), m, f, origin, radius_i)
+            match.surface_log(_log)
             return to_main
         ns["damage_spread"] = _damage_spread
 
@@ -6135,11 +6710,11 @@ class FormulaEngine:
                 new_amt = amt - absorbed
                 path = root + "." + name
                 if new_amt <= 0:
-                    e.remove_var(path)
+                    match.surface_log(e.remove_var(path))
                 elif isinstance(pool, dict):
-                    e.write_var(path + ".amount", _clean_num(new_amt))
+                    match.surface_log(e.write_var(path + ".amount", _clean_num(new_amt)))
                 else:
-                    e.write_var(path, _clean_num(new_amt))
+                    match.surface_log(e.write_var(path, _clean_num(new_amt)))
             return _clean_num(remaining)
 
         def _shield_total(eid_token: Any, tags: Any = None):
@@ -6623,6 +7198,391 @@ class FormulaEngine:
         ns["side_hit"] = _side_hit
         ns["directional_get"] = _directional_get
 
+        # ---- facing writes / map size / unit geometry -------------------
+        def _set_facing(eid_t: Any, direction: Any) -> str:
+            """set_facing(eid, dir): turn a unit to `dir` (any direction
+            alias, or cw/ccw to rotate one step) — same rules as `!ent face`
+            (diagonals need allow_diagonal_facing). Returns the new facing."""
+            eid, e = _resolve_entity(eid_t, "set_facing")
+            if not isinstance(direction, str):
+                raise FormulaError("set_facing(eid, dir): dir must be a string.")
+            try:
+                d = match.set_entity_facing(e, direction)
+            except VTTError as ex:
+                raise FormulaError(f"set_facing: {ex}")
+            engine._note_affected(eid)
+            return d
+
+        def _face_toward(eid_t: Any, a: Any, b: Any = None) -> str:
+            """face_toward(eid, target) / face_toward(eid, x, y) /
+            face_toward(eid, coord): turn a unit toward another unit's body
+            centre or a cell, measured from the centre of its own body —
+            the nearest of 8 directions, or the dominant axis when
+            allow_diagonal_facing is off. A target at its own centre leaves
+            the facing unchanged. Returns the (new) facing."""
+            eid, e = _resolve_entity(eid_t, "face_toward")
+            if b is None and isinstance(a, str):
+                _, t = _resolve_entity(a, "face_toward")
+                tw, th = match.entity_footprint(t)
+                tx, ty = t.x + (tw - 1) / 2, t.y + (th - 1) / 2
+            elif b is None:
+                tx = _cell_arg(_coord_x(a), "face_toward", "x")
+                ty = _cell_arg(_coord_y(a), "face_toward", "y")
+            else:
+                tx = _cell_arg(a, "face_toward", "x")
+                ty = _cell_arg(b, "face_toward", "y")
+            d = match.facing_toward(e, tx, ty)
+            if d is None:
+                return e.facing
+            match.set_entity_facing(e, d)
+            engine._note_affected(eid)
+            return d
+
+        def _grid_width() -> int:
+            """grid_width(): the map's width in cells."""
+            return match.grid_width
+
+        def _grid_height() -> int:
+            """grid_height(): the map's height in cells."""
+            return match.grid_height
+
+        def _in_bounds(x: Any, y: Any) -> bool:
+            """in_bounds(x, y): whether (x, y) is a cell on the map."""
+            return match.in_bounds(_cell_arg(x, "in_bounds", "x"),
+                                   _cell_arg(y, "in_bounds", "y"))
+
+        def _entity_distance(a_t: Any, b_t: Any,
+                             mode: Any = "square_radius_distance") -> Any:
+            """entity_distance(a, b, mode='square_radius_distance'): the gap
+            between two units' bodies — nearest cell to nearest cell, so 0
+            for overlapping bodies and 1 for adjacent ones whatever their
+            size. Same measure as entities_within and `!dist`."""
+            _, ea = _resolve_entity(a_t, "entity_distance")
+            _, eb = _resolve_entity(b_t, "entity_distance")
+            _distance(0, 0, 0, 0, mode)        # validates the metric name
+            return match.entity_gap_distance(ea, eb, mode)
+
+        def _cell_blocked(eid_t: Any, x: Any, y: Any, mode: Any = None) -> bool:
+            """cell_blocked(eid, x, y, mode=None): whether the unit can't
+            enter (x, y) — the tile, a zone or a corpse there blocks it, or
+            the cell is off the map. Units standing there don't count (see
+            cell_entity). With a mode ('walk', 'tp', 'push' or 'swap') a
+            block only counts when that block_<mode> rule is on."""
+            eid, _ = _resolve_entity(eid_t, "cell_blocked")
+            cx = _cell_arg(x, "cell_blocked", "x")
+            cy = _cell_arg(y, "cell_blocked", "y")
+            if not match.in_bounds(cx, cy):
+                return True
+            if mode is None:
+                return match.cell_blocks(eid, cx, cy)
+            if mode not in ("walk", "tp", "push", "swap"):
+                raise FormulaError(
+                    "cell_blocked(...): mode must be 'walk', 'tp', 'push' or "
+                    "'swap'.")
+            return match._check_block(eid, cx, cy, mode)
+
+        def _cell_opaque(x: Any, y: Any, viewer: Any = None) -> bool:
+            """cell_opaque(x, y, viewer=None): whether (x, y) blocks sight —
+            for `viewer` when given (opacity conditions can depend on who is
+            looking), else with no viewer bound."""
+            cx = _cell_arg(x, "cell_opaque", "x")
+            cy = _cell_arg(y, "cell_opaque", "y")
+            vid = None
+            if viewer is not None:
+                vid, _ = _resolve_entity(viewer, "cell_opaque")
+            return match.cell_opaque(vid, cx, cy)
+
+        def _free_cell_near(x: Any, y: Any, radius: Any, eid_t: Any = None):
+            """free_cell_near(x, y, radius, eid=None): the nearest cell within
+            `radius` (Chebyshev rings, nearest first) where a unit could
+            stand, as a coordinate (read with coord_x / coord_y), or None.
+            With `eid` the unit's whole body must fit there, clear of other
+            units and not movement-blocked for it; without, any empty cell."""
+            cx = _cell_arg(x, "free_cell_near", "x")
+            cy = _cell_arg(y, "free_cell_near", "y")
+            if isinstance(radius, bool) or not isinstance(radius, int) or radius < 0:
+                raise FormulaError(
+                    "free_cell_near(...): radius must be a whole number >= 0.")
+            _cell_budget((2 * radius + 1) ** 2, "free_cell_near", cell_limit)
+            e = None
+            if eid_t is not None:
+                _, e = _resolve_entity(eid_t, "free_cell_near")
+            return match.free_cell_near(cx, cy, radius, e)
+
+        def _team_members(team: Any) -> list:
+            """team_members(team): ids of the alive units on `team`, in turn
+            order then id order; attached body parts are left out (they act
+            through their owner). Loopable."""
+            if not isinstance(team, str):
+                raise FormulaError("team_members(team): team must be a string.")
+            out = []
+            for e in match.entities_in_turn_order():
+                if e.is_alive and not e.is_part and e.team == team:
+                    out.append(e.id)
+            seen = set(out)
+            for eid, e in sorted(match.entities.items()):
+                if eid not in seen and e.is_alive and not e.is_part \
+                        and e.team == team:
+                    out.append(eid)
+            return out
+
+        ns["set_facing"] = _set_facing
+        ns["face_toward"] = _face_toward
+        ns["grid_width"] = _grid_width
+        ns["grid_height"] = _grid_height
+        ns["in_bounds"] = _in_bounds
+        ns["entity_distance"] = _entity_distance
+        ns["cell_blocked"] = _cell_blocked
+        ns["cell_opaque"] = _cell_opaque
+        ns["free_cell_near"] = _free_cell_near
+        ns["team_members"] = _team_members
+
+        def _zone_distance(eid_t: Any, zone: Any,
+                           mode: Any = "square_radius_distance") -> Any:
+            """zone_distance(eid, zone, mode='square_radius_distance'): how
+            far the unit's body is from the nearest cell of the zone — 0
+            when any of its cells is inside. None for a zone with no cells
+            (e.g. a suspended aura)."""
+            _, e = _resolve_entity(eid_t, "zone_distance")
+            if not isinstance(zone, str) or zone not in match.zones:
+                raise FormulaError(f"zone_distance: no zone named {zone!r}.")
+            _distance(0, 0, 0, 0, mode)        # validates the metric name
+            cells = match.zones[zone].get("cells") or ()
+            if not cells:
+                return None
+            return min(match.cell_entity_distance(cx, cy, e, mode)
+                       for cx, cy in cells)
+
+        def _entities_at(x: Any, y: Any) -> list:
+            """entities_at(x, y): ids of every alive unit whose body covers
+            the cell — stackable ones too (cell_entity returns only the one
+            that blocks it) — in turn order, then in the order added. Attached body
+            parts and riders hidden inside a vehicle are left out, as in the
+            other spatial queries. Loopable."""
+            cx = _cell_arg(x, "entities_at", "x")
+            cy = _cell_arg(y, "entities_at", "y")
+            return [e.id for e in match.entities_in_turn_order()
+                    if e.is_alive and not e.is_glued_part
+                    and not e.is_hidden_rider
+                    and (cx, cy) in match.entity_cells(e)]
+
+        ns["zone_distance"] = _zone_distance
+        ns["entities_at"] = _entities_at
+
+        # ---- flanking / nearest body cell / sight list -------------------
+        def _body_center2(e) -> Tuple[int, int]:
+            """A unit's body centre in DOUBLED cell coordinates (whole
+            numbers even for an even-sized body)."""
+            w, h = match.entity_footprint(e)
+            return 2 * e.x + (w - 1), 2 * e.y + (h - 1)
+
+        def _flank_units(fname: str, target_t: Any, a_t: Any, b_t: Any):
+            _, t = _resolve_entity(target_t, fname)
+            _, ea = _resolve_entity(a_t, fname)
+            _, eb = _resolve_entity(b_t, fname)
+            return t, ea, eb
+
+        def _flanking_angle(target_t: Any, a_t: Any, b_t: Any,
+                            min_angle: Any = None) -> bool:
+            """flanking_angle(target, a, b, min_angle=None): whether a and b
+            flank the target by ANGLE — seen from the centre of the target's
+            body, the bearings to the centres of a's and b's bodies are at
+            least min_angle degrees apart (default the flanking_min_angle
+            rule; 180 = exactly opposite). For a multi-tile target the
+            bearings are corrected for its shape like side_hit (the
+            side_hit_hitbox_mode rule). Range is not checked."""
+            t, ea, eb = _flank_units("flanking_angle", target_t, a_t, b_t)
+            if min_angle is None:
+                min_angle = match.rules.get("flanking_min_angle", 135)
+            if isinstance(min_angle, bool) or not isinstance(
+                    min_angle, (int, float)) or not 0 <= min_angle <= 180:
+                raise FormulaError(
+                    "flanking_angle(...): min_angle must be a number from 0 "
+                    "to 180.")
+            if ea.id == eb.id or t.id in (ea.id, eb.id):
+                return False
+            tcx, tcy = _body_center2(t)
+            w, h = match.entity_footprint(t)
+            box = _hitbox_mode(None) == "box"
+            bearings = []
+            for e in (ea, eb):
+                ex, ey = _body_center2(e)
+                dx, dy = float(ex - tcx), float(ey - tcy)
+                if box:
+                    dx, dy = dx / w, dy / h
+                if dx == 0 and dy == 0:
+                    return False          # an attacker at the target's centre
+                bearings.append(math.degrees(math.atan2(dy, dx)))
+            diff = abs(bearings[0] - bearings[1]) % 360
+            diff = min(diff, 360 - diff)
+            return diff >= float(min_angle) - 1e-9
+
+        def _flanking_line(target_t: Any, a_t: Any, b_t: Any) -> bool:
+            """flanking_line(target, a, b): whether a and b flank the target
+            by LINE — the straight line between the centres of a's and b's
+            bodies crosses the target's body through two OPPOSITE sides
+            (or opposite corners), the D&D rule. A line that only clips one
+            corner, or touches a single point, doesn't flank. Range is not
+            checked."""
+            from fractions import Fraction
+            t, ea, eb = _flank_units("flanking_line", target_t, a_t, b_t)
+            if ea.id == eb.id or t.id in (ea.id, eb.id):
+                return False
+            w, h = match.entity_footprint(t)
+            # Doubled coordinates: cell centres are even, cell edges odd.
+            xmin, xmax = 2 * t.x - 1, 2 * (t.x + w) - 1
+            ymin, ymax = 2 * t.y - 1, 2 * (t.y + h) - 1
+            (ax, ay), (bx, by) = _body_center2(ea), _body_center2(eb)
+            for px, py in ((ax, ay), (bx, by)):
+                if xmin < px < xmax and ymin < py < ymax:
+                    return False          # an attacker inside the body
+            dx, dy = bx - ax, by - ay
+            t0, t1 = Fraction(0), Fraction(1)
+            for p, q in ((-dx, ax - xmin), (dx, xmax - ax),
+                         (-dy, ay - ymin), (dy, ymax - ay)):
+                if p == 0:
+                    if q < 0:
+                        return False      # parallel and outside
+                    continue
+                r = Fraction(q, p)
+                if p < 0:
+                    t0 = max(t0, r)
+                else:
+                    t1 = min(t1, r)
+            if t0 > t1:
+                return False
+
+            def sides(tt):
+                px, py = ax + tt * dx, ay + tt * dy
+                return {s for s, on in (("l", px == xmin), ("r", px == xmax),
+                                        ("t", py == ymin), ("b", py == ymax))
+                        if on}
+            s0, s1 = sides(t0), sides(t1)
+            return (("l" in s0 and "r" in s1) or ("r" in s0 and "l" in s1)
+                    or ("t" in s0 and "b" in s1) or ("b" in s0 and "t" in s1))
+
+        def _flanking(target_t: Any, a_t: Any, b_t: Any,
+                      mode: Any = None) -> bool:
+            """flanking(target, a, b, mode=None): whether a and b flank the
+            target, by the flanking_mode rule ('angle' or 'line') unless
+            `mode` names one — see flanking_angle and flanking_line."""
+            mode_s = str(mode if mode is not None
+                         else match.rules.get("flanking_mode", "angle"))
+            if mode_s == "angle":
+                return _flanking_angle(target_t, a_t, b_t)
+            if mode_s == "line":
+                return _flanking_line(target_t, a_t, b_t)
+            raise FormulaError("flanking(...): mode must be 'angle' or 'line'.")
+
+        def _nearest_cell(eid_t: Any, a: Any, b: Any = None) -> list:
+            """nearest_cell(eid, x, y) / nearest_cell(eid, coord) /
+            nearest_cell(eid, other): the cell of the unit's body nearest the
+            point, or nearest any cell of the other unit's body, as [x, y] —
+            where a big body's breath, shot or reach starts from. Nearest is
+            the straight-line distance; a tie goes to the first cell
+            row by row from the top-left."""
+            _, e = _resolve_entity(eid_t, "nearest_cell")
+            if b is None and isinstance(a, str):
+                _, o = _resolve_entity(a, "nearest_cell")
+                targets = match.entity_cells(o)
+            elif b is None:
+                targets = [(_cell_arg(_coord_x(a), "nearest_cell", "x"),
+                            _cell_arg(_coord_y(a), "nearest_cell", "y"))]
+            else:
+                targets = [(_cell_arg(a, "nearest_cell", "x"),
+                            _cell_arg(b, "nearest_cell", "y"))]
+            best, best_d = None, None
+            for cx, cy in match.entity_cells(e):
+                d = min((cx - tx) ** 2 + (cy - ty) ** 2 for tx, ty in targets)
+                if best_d is None or d < best_d:
+                    best, best_d = [cx, cy], d
+            return best
+
+        def _visible_entities(eid_t: Any, relation: Any = "") -> list:
+            """visible_entities(eid, relation=''): ids of the units this unit
+            sees right now — some cell of their body within its vision radius
+            with a clear line from its body (range + LOS, like can_see, fog
+            toggles ignored) — leaving out units the stealth rule
+            (entity_visibility_condition, with the unit's team as pov_team)
+            hides from its team. `relation` filters like entities_within
+            (any / hostile / ally / same_team / attackable). Nearest first,
+            then by id. Loopable."""
+            eid, viewer = _resolve_entity(eid_t, "visible_entities")
+            if not isinstance(relation, str):
+                raise FormulaError(
+                    "visible_entities(...): relation must be a string.")
+            scored = []
+            budget = [cell_limit]
+            for oid, oe, _ref in _candidates(eid, relation):
+                if match.unit_sees_unit(viewer, oe, budget):
+                    scored.append((match.entity_gap_distance(viewer, oe), oid))
+            scored.sort()
+            return [oid for _, oid in scored]
+
+        def _area_cells(fname: str, args: tuple) -> set:
+            """The on-map cells of a zone name or an x1, y1, x2, y2
+            rectangle (corners in any order) — the area random_cell /
+            random_free_cell pick from."""
+            if len(args) == 1 and isinstance(args[0], str):
+                z = match.zones.get(args[0])
+                if z is None:
+                    raise FormulaError(f"{fname}: no zone named {args[0]!r}.")
+                return {c for c in (z.get("cells") or ())
+                        if match.in_bounds(*c)}
+            if len(args) == 4:
+                xs = sorted(_cell_arg(v, fname, "x") for v in args[0::2])
+                ys = sorted(_cell_arg(v, fname, "y") for v in args[1::2])
+                x1, x2 = max(xs[0], 1), min(xs[1], match.grid_width)
+                y1, y2 = max(ys[0], 1), min(ys[1], match.grid_height)
+                if x1 > x2 or y1 > y2:
+                    return set()
+                _cell_budget((x2 - x1 + 1) * (y2 - y1 + 1), fname, cell_limit)
+                return {(x, y) for y in range(y1, y2 + 1)
+                        for x in range(x1, x2 + 1)}
+            raise FormulaError(
+                f"{fname}(...): give a zone name or x1, y1, x2, y2.")
+
+        def _random_cell(*args: Any) -> Any:
+            """random_cell(zone) / random_cell(x1, y1, x2, y2): a random cell
+            of the zone or rectangle (clipped to the map) as [x, y], or None
+            when it has no cell on the map. Uses the match RNG (random_seed,
+            choose() replay)."""
+            cells = sorted(_area_cells("random_cell", args),
+                           key=lambda c: (c[1], c[0]))
+            return list(_active_rng().choice(cells)) if cells else None
+
+        def _random_free_cell(*args: Any, fit: Any = "body") -> Any:
+            """random_free_cell(zone[, eid], fit='body') /
+            random_free_cell(x1, y1, x2, y2[, eid], fit='body'): a random spot
+            in the area where the unit could stand (its whole body on the map,
+            clear of other units, not blocked for it — the free_cell_near
+            test), as its anchor [x, y], or None. `fit` says how a multi-tile
+            body must sit in the area: 'body' (every cell inside, the
+            default), 'center' (its centre cell inside), 'any' (at least one
+            cell inside) or 'anchor' (its top-left cell inside). Without eid,
+            a random empty cell of the area. Uses the match RNG."""
+            e = None
+            area_args = args
+            if len(args) in (2, 5):
+                area_args = args[:-1]
+                _, e = _resolve_entity(args[-1], "random_free_cell")
+            if not isinstance(fit, str):
+                raise FormulaError("random_free_cell(...): fit must be text.")
+            area = _area_cells("random_free_cell", area_args)
+            try:
+                spots = match.free_anchors_in_area(area, e, fit, cell_limit)
+            except VTTError as ex:
+                raise FormulaError(f"random_free_cell(...): {ex}")
+            return list(_active_rng().choice(spots)) if spots else None
+
+        ns["random_cell"] = _random_cell
+        ns["random_free_cell"] = _random_free_cell
+        ns["flanking"] = _flanking
+        ns["flanking_angle"] = _flanking_angle
+        ns["flanking_line"] = _flanking_line
+        ns["nearest_cell"] = _nearest_cell
+        ns["visible_entities"] = _visible_entities
+
         def _hit_location(target_t: Any, from_x: Any, from_y: Any,
                           aim: Any = None, aim_weight: Any = None,
                           aim_bonus: Any = None, mode: Any = None,
@@ -6801,6 +7761,14 @@ class FormulaEngine:
             for fname, fdef in funcs.items():
                 ns[fname] = _make_callable(fdef)
 
+        # Coordinates are lists in formulas: every built-in function's
+        # result has its tuples turned into lists, so a coordinate from
+        # free_cell_near / raycast / cells_in_* equals one read back from a
+        # var (stored values are lists, as a save/load makes them).
+        for fname in _TUPLE_FREE_FUNCS:
+            fn = ns.get(fname)
+            if callable(fn):
+                ns[fname] = _lists_out(fn)
         return ns
 
     def _compile_function_body(self, fdef):
@@ -6919,6 +7887,11 @@ class FormulaEngine:
             from action import ActionFail, ActionEngineFault, ChoiceNeeded
             if isinstance(e, (ActionFail, ActionEngineFault, ChoiceNeeded)):
                 raise
+            if isinstance(e, VTTError):
+                # The engine refused something (an entity not found, a cell
+                # occupied, a budget exceeded) and its message says what.
+                # "Runtime error:" is kept for raw Python errors.
+                raise FormulaError(str(e))
             raise FormulaError(f"Runtime error: {_runtime_msg(e)}")
 
     def eval_program(self, src: str, ctx: EvalCtx,
@@ -7002,6 +7975,11 @@ class FormulaEngine:
             from action import ActionFail, ActionEngineFault, ChoiceNeeded
             if isinstance(e, (ActionFail, ActionEngineFault, ChoiceNeeded)):
                 raise
+            if isinstance(e, VTTError):
+                # The engine refused something (an entity not found, a cell
+                # occupied, a budget exceeded) and its message says what.
+                # "Runtime error:" is kept for raw Python errors.
+                raise FormulaError(str(e))
             raise FormulaError(f"Runtime error: {_runtime_msg(e)}")
 
 

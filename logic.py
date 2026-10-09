@@ -3,13 +3,23 @@
 # logic.py
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
-from typing import Literal, Any, Dict, List, Optional, Tuple, Set
+from typing import Literal, Any, Dict, Iterable, List, Optional, Tuple, Set
+import os
 import uuid
 import json
 import copy
 import re
 import math
 import random
+import contextvars
+
+# Lines a formula's changes produced while a command runs (see
+# Match.surface_log). A context variable, so each command — on Discord, each
+# message is its own asyncio task — collects only its own: a per-match list
+# drained after the command could hand one channel's output to another
+# channel's command that ran while the first awaited a send.
+FORMULA_LOG_SINK: "contextvars.ContextVar[Optional[List[str]]]" = (
+    contextvars.ContextVar("vtt_formula_log_sink", default=None))
 
 # -------------------------
 # Exceptions
@@ -293,6 +303,22 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # transform()/revert()). 'percent' keeps the same fraction of max_hp into
     # the new form (50% of old max -> 50% of new max); 'keep' carries current
     # hp clamped to the new max; 'full' uses the target statblock's own hp.
+    # How the engine rounds a computed share to a whole number: damage_part's
+    # to-main transfer and transform's percent hp.
+    "rounding_mode": {
+        "default": "half_up",
+        "schema": {"type": "enum",
+                   "choices": ["half_up", "half_even", "floor", "ceil"]},
+        "desc": (
+            "How the engine rounds a computed amount to a whole number: "
+            "damage_part's to-main share (part damage x to_main_percent) and "
+            "transform's `percent` hp. `half_up` (default): .5 rounds away "
+            "from zero (50% of 5 -> 3). `half_even`: .5 rounds to the even "
+            "number (50% of 5 -> 2, of 7 -> 4; Python's round()). `floor` / "
+            "`ceil`: always down / up. The formula round() function is "
+            "unaffected."
+        ),
+    },
     "transform_hp_mode": {
         "default": "percent",
         "schema": {"type": "enum", "choices": ["percent", "keep", "full"]},
@@ -414,7 +440,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "segment_spacing": {
         "default": 1,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "For `path` follow mode, how many cells of head travel separate "
             "consecutive segments (1 = adjacent). Ignored by `trail` mode "
@@ -538,7 +564,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "aoe_fragment_count": {
         "default": 4,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Default number of discrete random hits in damage_spread's "
             "`fragment` mode (each lands on a weighted-random part, dealing "
@@ -807,7 +833,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "atb_charge_formula": {
         "default": "entity[self].initiative",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Formula EXPRESSION giving an entity's per-tick ATB charge RATE "
             "(`self` = the entity). The bar fills by this rate; the entity "
@@ -822,7 +848,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "atb_threshold": {
         "default": 100,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "The ATB bar value an entity must reach to take a turn. Higher = "
             "slower cadence overall. Per-entity pace is expressed via the "
@@ -831,7 +857,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "atb_reset_formula": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "program"},
         "desc": (
             "What happens to the actor's ATB bar after it takes a turn. EMPTY "
             "(default) = the built-in: subtract atb_threshold (keeping any "
@@ -888,7 +914,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "status_tick_formula": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "program"},
         "desc": (
             "Formula body run once per (entity, status) at the time "
             "specified by status_tick_when. Empty (default) is a no-op "
@@ -1011,7 +1037,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # read always resolves. Empty = nothing blocks (default).
     "tile_block_condition": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Default formula deciding whether a TILE blocks an entity from "
             "entering its cell. Bindings: tile_x / tile_y (read the tile's "
@@ -1028,7 +1054,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "zone_block_condition": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Default formula deciding whether a ZONE blocks an entity from "
             "entering any of its cells. Bindings: zone_name and entity[self] "
@@ -1040,7 +1066,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "corpse_block_condition": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Default formula deciding whether a CORPSE blocks an entity from "
             "entering its cell (corpses are passable by default — empty rule). "
@@ -1122,11 +1148,13 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "default": "block",
         "schema": {"type": "enum", "choices": ["block", "eject"]},
         "desc": (
-            "When transforming/polymorphing a VEHICLE whose new form lacks a "
-            "slot for some current rider: 'block' (refuse the transform, no "
-            "change) or 'eject' (dismount all riders to nearby cells, then "
-            "transform). If the new form has matching slots for ALL riders, "
-            "they stay mounted regardless of this rule."
+            "When a transform breaks a mount: a VEHICLE's new form lacks a "
+            "slot for some current rider, or a mounted RIDER's new form fails "
+            "its slot's `condition` or no longer fits the slot's capacity. "
+            "'block' refuses the transform (no change); 'eject' dismounts the "
+            "affected riders to nearby cells (a rider's cell is picked for "
+            "its new body). If every rider still fits, they stay mounted "
+            "regardless of this rule."
         ),
     },
     # Whether a HIDDEN rider (a passenger in a slot with no `region`, tucked
@@ -1230,7 +1258,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # ---- Directional / facing-relative geometry ----
     "directional_corner_arc": {
         "default": 30,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "max": 90},
         "desc": (
             "Default angular width (degrees) of each diagonal CORNER side "
             "when the directional primitives (side_hit / relative_side / "
@@ -1247,7 +1275,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "event_recursion_limit": {
         "default": 64,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Max nesting depth for the custom event bus (emit). A handler "
             "fired by an event may itself emit; this caps the chain so a "
@@ -1258,7 +1286,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "macro_repeat_limit": {
         "default": 1000,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0},
         "desc": (
             "Max iterations a single `repeat N` block in a macro will run "
             "(N is clamped to this). Guards against a typo'd huge count."
@@ -1266,7 +1294,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "macro_step_limit": {
         "default": 10000,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Hard backstop on the TOTAL work a single `!macro run` may do — "
             "command lines dispatched PLUS `repeat` loop iterations (across all "
@@ -1277,7 +1305,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "macro_recursion_limit": {
         "default": 20,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Max depth of nested `!macro run` / `!run` calls (a macro line or "
             "script line that runs another macro or script, counted as one "
@@ -1302,6 +1330,29 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "correction is uniform when width == height. Per-call override: "
             "pass hitbox='box'|'center' to side_hit / directional_get / "
             "hit_location."
+        ),
+    },
+    "flanking_mode": {
+        "default": "angle",
+        "schema": {"type": "enum", "choices": ["angle", "line"]},
+        "desc": (
+            "What flanking(target, a, b) checks when no mode is passed. "
+            "`angle` (default): seen from the target's body centre, a and b "
+            "are at least flanking_min_angle degrees apart (flanking_angle). "
+            "`line`: the line between a's and b's centres crosses the "
+            "target's body through two opposite sides or corners, the D&D "
+            "rule (flanking_line)."
+        ),
+    },
+    "flanking_min_angle": {
+        "default": 135,
+        "schema": {"type": "int", "min": 0, "max": 180},
+        "desc": (
+            "Degrees two attackers must be apart, seen from the target's body "
+            "centre, to flank it in angle mode (flanking_angle). 180 = only "
+            "exactly opposite; 135 (default) also counts e.g. north + "
+            "south-east; 90 = any quarter turn. Bearings to a multi-tile "
+            "target are corrected for its shape (side_hit_hitbox_mode)."
         ),
     },
     # ---- UI / display templates ----
@@ -1334,8 +1385,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "show at a glance which body a part belongs to. Placeholders: "
             "{parent} (parent id), {parent_name} (parent's name), plus every "
             "key entity_line_format exposes (resolved against the PART). Empty "
-            "= no suffix. Only parts that appear on the roster (located / "
-            "segment / region parts; glued parts are hidden) ever show it."
+            "= no suffix. Only parts that appear on the roster ever show it "
+            "(see the roster_glued_parts rule and the `__roster_show` var)."
         ),
     },
     "entity_info_format": {
@@ -1357,7 +1408,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     ## Var-hook system rules
     "var_hook_recursion_limit": {
         "default": 128,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Maximum depth of var-event recursion before further hook firing "
             "is suppressed. A var-hook passive's formula may itself write vars, "
@@ -1382,7 +1433,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "formula_function_recursion_limit": {
         "default": 64,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Maximum call depth for user-defined formula functions (see "
             "!func). A function may call other functions (or itself); if "
@@ -1394,7 +1445,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "formula_loop_limit": {
         "default": 10000,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Maximum total iterations across all for-loops in a single "
             "formula evaluation. Loops over entities_within / "
@@ -1407,7 +1458,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "formula_cell_limit": {
         "default": 100000,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Maximum number of cells one geometry query in a formula may "
             "generate or walk: cells_in_burst / _rect / _cone / _line, "
@@ -1421,9 +1472,22 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "that long) is far beyond any real map."
         ),
     },
+    "sight_check_limit": {
+        "default": 1000000,
+        "schema": {"type": "int", "min": 1000, "max": 10000000},
+        "desc": (
+            "Work budget of one `!map ent_sight` answer: every range check "
+            "(each map cell against each cell of the unit's body) and every "
+            "cell a sight line crosses counts one. Past it the command stops "
+            "with an error. Its cost follows the unit's vision radius and "
+            "size, and the work holds up every server while it runs. The "
+            "default 1000000 is about a second; a 1x1 unit with vision "
+            "radius 50 on open ground uses about half of it."
+        ),
+    },
     "formula_size_limit": {
         "default": 100000,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Maximum length of a string or list a formula may build with "
             "`*` or `+` (e.g. 'ab' * n, [0] * n, s + s). Guards against "
@@ -1435,7 +1499,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "summon_event_limit": {
         "default": 50,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0},
         "desc": (
             "Maximum number of entities that may be summoned during a "
             "single top-level command (including all hook fires and "
@@ -1461,7 +1525,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # the system defaults; see Match._evaluate_death_condition.
     "death_condition": {
         "default": "entity[self].hp <= 0",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Formula expression evaluated on an entity after any var "
             "change. When it returns truthy the entity dies. Default "
@@ -1491,7 +1555,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "alive_condition": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Formula expression deciding whether an entity reads as ALIVE — "
             "the gate behind Entity.is_alive, which governs render, occupancy, "
@@ -1523,6 +1587,19 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "entity's vars."
         ),
     },
+    "roster_glued_parts": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether GLUED body parts (attached with `!part add`, sharing the "
+            "body's cell — not located, region or segment parts) get their own "
+            "row in `!list` / `!state`. False (default) keeps the roster to "
+            "the units on the board; `!part list <body>` shows the parts. A "
+            "part with its own place in the turn order (it acts on its own "
+            "turn) is always listed. A part's `__roster_show` var (true / "
+            "false) overrides this rule for that part, glued or not."
+        ),
+    },
     "show_corpses_in_entity_list": {
         "default": True,
         "schema": {"type": "bool"},
@@ -1552,7 +1629,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "default_kill_function_effects": {
         "default": "entity[self].hp = 0",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "program"},
         "desc": (
             "Formula program run on the entity BEFORE the death pipeline "
             "fires when the `kill()` primitive is invoked. The default "
@@ -1569,7 +1646,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "default_revive_function_effects": {
         "default": "entity[self].hp = entity[self].max_hp",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "program"},
         "desc": (
             "Formula program run on the freshly-revived entity AFTER "
             "spawn (before on_revive fires). The default restores hp "
@@ -1617,6 +1694,20 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     #     — a flat stealth flag, same for every team.
     # A malformed formula is treated as VISIBLE, so a GM typo reveals
     # rather than blanking the whole board.
+    "pov_own_team_visible": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "A team's view always shows its own units — on the map, in the "
+            "roster (!list / !state / !turn) and in queries — even where fog "
+            "or entity_visibility_condition would hide them (a body part "
+            "counts as its root body's team). A passenger inside a vehicle "
+            "(a hidden rider) is listed but not drawn: it's inside. Off: a "
+            "team's own units follow fog and the condition like anyone "
+            "else's (write the condition with `entity[self].team == "
+            "pov_team or ...` to exempt them selectively)."
+        ),
+    },
     "pov_filters_queries": {
         "default": True,
         "schema": {"type": "bool"},
@@ -1654,7 +1745,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "entity_visibility_condition": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Formula expression deciding whether an entity is visible to "
             "a team POV (a player channel). Truthy = visible, falsy = "
@@ -1696,7 +1787,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     #    tile_has(tile_x, tile_y, 'detected.' + pov_team)"
     "tile_visibility_condition": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Formula expression deciding whether a TILE (its glyph on the "
             "map and its !tile list/info/cells rows) is visible to a team "
@@ -1716,7 +1807,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # every zone visible.
     "zone_visibility_condition": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Formula expression deciding whether a ZONE (its glyph on the "
             "map and its !zone listing rows) is visible to a team POV. "
@@ -1736,7 +1827,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # own team's corpses show: "corpse_team == pov_team".
     "corpse_visibility_condition": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Formula expression deciding whether a CORPSE row (Dead: "
             "section of !list/!state) is visible to a team POV. Truthy = "
@@ -1819,7 +1910,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "preview_opacity": {
         "default": 40,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "max": 100},
         "desc": (
             "`!map preview` (graphics): opacity 0-100 of the covered-cell "
             "squares. An `opacity=` arg on the command overrides it for one "
@@ -1917,11 +2008,23 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "fog_opacity": {
         "default": 60,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "max": 100},
         "desc": (
             "Opacity (0-100 percent) of the graphics fog overlay over unseen "
             "cells. 100 = fully hides what's underneath; lower = translucent "
             "haze. Only used by render_scene (fog_glyph drives text fog)."
+        ),
+    },
+    "map_coords": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Coordinate rulers on the map. ASCII: column numbers above the "
+            "map, their digits stacked top to bottom (so a two-digit column "
+            "number fits a one-character cell), and row numbers in a margin "
+            "on the left. Graphics: x / y labels along the top and left edges. "
+            "Both follow the viewport window. Per-match override: `!map "
+            "coords on|off|clear`; one render: `!map coords=off`."
         ),
     },
     "show_borders": {
@@ -1948,7 +2051,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "border_opacity": {
         "default": 50,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "max": 100},
         "desc": (
             "Opacity (0-100 percent) of the grid border lines. Default 50 (a "
             "subtle grid). Per-tile override: the tile's `border_opacity` "
@@ -2037,7 +2140,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "corpse_sprite_opacity": {
         "default": 50,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "max": 100},
         "desc": (
             "Opacity (0-100 percent) of a corpse's sprite. Default 50 (a "
             "semi-transparent body). Combined with corpse_sprite_tint."
@@ -2045,7 +2148,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "sprite_cell_size": {
         "default": 100,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Pixel size of one grid cell in the graphics surface (gui.py). "
             "Default 100 -> a 100x100 px cell. A sprite is scaled to its "
@@ -2060,7 +2163,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # A grid that fits both caps renders whole (no viewport).
     "max_grid_dimension": {
         "default": 500,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1, "unlimited": True},
         "desc": (
             "Largest width or height a grid may have, checked by `!match "
             "new` (against the new match's system) and `!map resize`. A "
@@ -2070,17 +2173,18 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "viewport_width": {
-        "default": 30,
-        "schema": {"type": "int"},
+        "default": 28,
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Max map columns shown at once before a horizontal viewport "
             "engages. A grid wider than this renders a window and the "
-            "channel pans it (`!map pan left|right`)."
+            "channel pans it (`!map pan left|right`). The 28 default keeps "
+            "a full window with coordinate rulers inside one Discord message."
         ),
     },
     "viewport_height": {
-        "default": 30,
-        "schema": {"type": "int"},
+        "default": 28,
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Max map rows shown at once before a vertical viewport engages "
             "(see viewport_width)."
@@ -2107,7 +2211,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # always pans exactly n (default 1) regardless of this.
     "viewport_button_step": {
         "default": 0,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0},
         "desc": (
             "Tiles per Discord pan-button click (0 = half the viewport — a "
             "half-screen scroll). The `!map pan <dir> [n]` command pans an "
@@ -2175,7 +2279,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # auto-fog feature factors LOS in.
     "tile_opaque_condition": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Default formula deciding whether a TILE blocks line of sight "
             "through its cell. Bindings: tile_x / tile_y (read the tile's "
@@ -2190,7 +2294,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "zone_opaque_condition": {
         "default": "",
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "formula": "expression"},
         "desc": (
             "Default formula deciding whether a ZONE blocks line of sight "
             "through any of its cells. Bindings: zone_name, tile_x / tile_y, "
@@ -2244,7 +2348,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # surface; see also Match.discover_actions and the !action command.
     "action_recursion_limit": {
         "default": 8,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 1},
         "desc": (
             "Maximum action call depth — an action body that calls "
             "use_action() into another action counts as a nested call. "
@@ -2257,7 +2361,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "action_choice_limit": {
         "default": 20,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0},
         "desc": (
             "Maximum number of mid-body choices (choose / choose_number "
             "prompts) a single action invocation may make. The runner "
@@ -2355,7 +2459,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # means "disable that snapshot kind / prompt entirely".
     "autosave_round_retention": {
         "default": -1,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "unlimited": True},
         "desc": (
             "Cap on retained round-start autosaves. -1 = unlimited (default; "
             "the original spec is 'every start of round, for the entirety of "
@@ -2367,7 +2471,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "autosave_turn_retention_rounds": {
         "default": 3,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "unlimited": True},
         "desc": (
             "How many rounds' worth of turn-start autosaves to keep. -1 = "
             "unlimited (one per entity per round, forever — memory-heavy "
@@ -2382,7 +2486,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "autosave_turn_retention_turns": {
         "default": 20,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "unlimited": True},
         "desc": (
             "The ATB counterpart of autosave_turn_retention_rounds: how many "
             "of the most recent turn-start autosaves to keep when atb_enabled "
@@ -2396,7 +2500,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "autosave_command_retention_turns": {
         "default": 3,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "unlimited": True},
         "desc": (
             "How many turns' worth of pre-command autosaves to keep. -1 = "
             "unlimited. 0 = disable command autosaves entirely. Default 3 = "
@@ -2410,7 +2514,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "autosave_command_retention_max": {
         "default": 100,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "unlimited": True},
         "desc": (
             "Hard cap on how many pre-command autosaves are kept, on top of "
             "the autosave_command_retention_turns window (the oldest beyond "
@@ -2425,7 +2529,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "undo_confirmation_turn_threshold": {
         "default": 3,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "unlimited": True},
         "desc": (
             "Undoing this many or more turns requires the user to repeat the "
             "command with a trailing `confirm` token. Smaller undos go "
@@ -2436,7 +2540,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "undo_confirmation_round_threshold": {
         "default": 1,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "unlimited": True},
         "desc": (
             "Undoing this many or more rounds requires `confirm`. Default 1 "
             "(any round-undo prompts, since a round is a lot of state). -1 "
@@ -2447,7 +2551,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "undo_confirmation_command_threshold": {
         "default": -1,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "unlimited": True},
         "desc": (
             "Undoing this many or more commands requires `confirm`. Default "
             "-1 = never prompt (commands are small-grain, low-risk). Set a "
@@ -2577,7 +2681,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "event_log_retention": {
         "default": 200,
-        "schema": {"type": "int"},
+        "schema": {"type": "int", "min": 0, "unlimited": True},
         "desc": (
             "Cap on the number of event-log entries kept. When the log "
             "exceeds this, the oldest entries are dropped. Default 200. "
@@ -2619,6 +2723,31 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "bare 'name' key. Edit via `!system set` is awkward for a "
             "dict; set it through the system's settings or a future "
             "dedicated command."
+        ),
+    },
+    "round_start_message_format": {
+        "default": "— Round {round} —",
+        "schema": {"type": "str"},
+        "desc": (
+            "The line `!turn next` prints when a new round begins (round 1 "
+            "included), ahead of the round-start hook output. Placeholders: "
+            "{round} (the new round number), {match} (the match name) and "
+            "{match.<path>} (a match var, e.g. {match.weather}; a missing "
+            "var renders empty). Empty = no line. Not used under ATB, which "
+            "has no rounds."
+        ),
+    },
+    "pause_affects_hosts": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "While a match is paused (`!match pause`), whether HOSTS are "
+            "paused too. Off (default): hosts keep playing and only "
+            "non-hosts' state-changing commands are refused. On: a host's "
+            "state-changing command is HELD and the bot asks to unpause — "
+            "`!match resume` unpauses and runs the held commands in order, "
+            "`!match resume drop` unpauses and discards them. Read-only "
+            "commands and `!match pause/resume` themselves always run."
         ),
     },
     "inline_args_access": {
@@ -2686,13 +2815,13 @@ def _coerce_vital_value(v: Any) -> Optional[int]:
         return None
     if isinstance(v, int):
         return v
-    if isinstance(v, float):
-        return int(v)
-    if isinstance(v, str):
-        try:
+    try:
+        if isinstance(v, float):
+            return int(v)
+        if isinstance(v, str):
             return int(float(v.strip()))
-        except (ValueError, AttributeError):
-            return None
+    except (ValueError, OverflowError):   # "abc", NaN, infinity
+        return None
     return None
 
 
@@ -2739,9 +2868,25 @@ def _coerce_rule_value(key: str, raw_value: str):
 
     if t == "int":
         try:
-            return int(raw_value, 10)
+            v = int(raw_value, 10)
         except ValueError:
             raise VTTError(f"Setting '{key}' expects an integer.")
+        # Bounds: a limit set to -1 (the "unlimited" of the retention rules)
+        # or an opacity of 150 used to be accepted and then refuse or
+        # misbehave on use. `unlimited` rules also take -1.
+        lo, hi = spec.get("min"), spec.get("max")
+        if spec.get("unlimited") and v == -1:
+            return v
+        if (lo is not None and v < lo) or (hi is not None and v > hi):
+            if hi is None:
+                rng = f"at least {lo}"
+            elif lo is None:
+                rng = f"at most {hi}"
+            else:
+                rng = f"between {lo} and {hi}"
+            extra = " (or -1 for unlimited)" if spec.get("unlimited") else ""
+            raise VTTError(f"Setting '{key}' must be {rng}{extra}, got {v}.")
+        return v
 
     if t == "enum":
         choices = spec["choices"]
@@ -2754,6 +2899,15 @@ def _coerce_rule_value(key: str, raw_value: str):
     if t == "str":
         # keep raw as-is; CLI passes a single token
         # (you can extend later to join the rest of args for multi-word strings)
+        choices = spec.get("choices")
+        if choices and raw_value not in choices and not (
+                key == "part_to_main_cap_default"
+                and re.fullmatch(r"absolute:\d+", raw_value)):
+            # A typo'd mode used to be stored and then read as the default.
+            extra = (", or absolute:<n>" if key == "part_to_main_cap_default"
+                     else "")
+            raise VTTError(f"Setting '{key}' must be one of: "
+                           f"{', '.join(choices)}{extra}")
         return raw_value
 
     if t == "list":
@@ -2834,6 +2988,86 @@ def check_grid_dimensions(width: Any, height: Any, rules: Dict[str, Any],
                 f"(the max_grid_dimension rule; -1 = unlimited).")
 
 
+def check_store_path(path: Any, what: str = "path") -> None:
+    """Refuse a dotted path with an empty segment before anything is stored
+    under it. `.lead`, `trail.` and `inventory..sword` used to create keys
+    named "" (inventory[""]["sword"]) instead of reporting the typo."""
+    p = str(path)
+    if not p:
+        raise VTTError(f"{what} cannot be empty.")
+    if "" in p.split("."):
+        raise VTTError(f"{what} '{p}' has an empty segment (a doubled, "
+                       f"leading or trailing dot).")
+
+
+def check_no_value_ancestor(root: Any, path: str, where: str) -> None:
+    """Refuse writing at `path` under `root` when a key on the way holds a
+    value (a number, a string, a list): `k.x` while k = 5. Unit vars, team
+    data and match vars used to replace the 5 with {x: ...} without a word,
+    while tiles, zones and statuses refused; every store now refuses."""
+    keys = str(path).split(".")
+    cur = root
+    for i, k in enumerate(keys[:-1]):
+        if not isinstance(cur, dict) or k not in cur:
+            return
+        cur = cur[k]
+        if not isinstance(cur, dict):
+            at = ".".join(keys[:i + 1])
+            raise VTTError(
+                f"{where} value at '{at}' is {type(cur).__name__}, not a dict "
+                f"— cannot set a nested key under it without clobbering.")
+
+
+def _own_value(value: Any) -> Any:
+    """`value` ready to store: a dict or list is deep-copied so the store owns
+    it (no object shared with another var, team, tile, zone or status),
+    scalars pass through unchanged. Dict keys become strings, as a save/load
+    makes them: `{1: 5}` stored by a formula couldn't be reached by the path
+    `d.1` until a reload turned the key into '1'. Tuples become lists for the
+    same reason (a stored coordinate stops equalling (3, 3) after a reload
+    otherwise)."""
+    if isinstance(value, dict):
+        return {str(k): _own_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_own_value(v) for v in value]
+    if isinstance(value, tuple):
+        # Coordinates are lists (a save/load turns tuples into lists).
+        return [_own_value(v) for v in value]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    # Anything else (a function named as a value — `entity[a].f = min` —
+    # a set, an object) can't be saved: it used to be stored as-is, after
+    # which `!store save` failed and `!ent dump` crashed on that match.
+    what = ("a function" if callable(value)
+            else f"a {type(value).__name__}")
+    raise VTTError(f"Can't store {what}: only numbers, text, true/false, "
+                   f"None, lists and dicts can be stored.")
+
+
+def write_json_file(path: str, data: Any) -> None:
+    """Write `data` as JSON to `path` all-or-nothing: the text is built
+    first and written to a temp file beside the target, then moved over it.
+    json.dump straight into the target truncated an existing good save when
+    serialization failed partway. Raises VTTError (no host path in the
+    message: callers name the file the way they show it)."""
+    try:
+        text = json.dumps(data, indent=2)
+    except (TypeError, ValueError) as e:
+        raise VTTError(f"the data holds a value that can't be saved ({e}).")
+    folder = os.path.dirname(os.path.abspath(path))
+    tmp = os.path.join(folder, f".{os.path.basename(path)}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise VTTError(f"the file couldn't be written ({e.strerror or e}).")
+
+
 def reserved_var_path_error(path: str, where: str) -> Optional[str]:
     """The refusal message for a write at `path` whose first segment is a
     reserved var path, or None when the path is an ordinary var."""
@@ -2845,6 +3079,83 @@ def reserved_var_path_error(path: str, where: str) -> Optional[str]:
     return (f"{where}: `{seg0}` is a reserved var path (the entity's own "
             f"{'display name' if seg0 == 'name' else 'position'}); it can't "
             f"be written or nested under. Use {fix}.")
+
+def checked_unit_vars(vars_: Any, vitals: Iterable[str], where: str) -> Dict[str, Any]:
+    """`vars_` ready to become a whole unit's vars, held to the rules
+    write_var applies one write at a time: each vital var present (hp /
+    max_hp / initiative) is a whole number (a numeric string or float is
+    coerced; text, a bool, a dict or a non-finite number is refused), no
+    top-level key is a reserved var path (x / y / name) or empty, and the
+    dict is the unit's own copy with string keys. Spawn (summon templates,
+    part / segment templates) and transform set a unit's vars wholesale;
+    they used to store `hp: 'abc'` as given, and the unit then broke
+    `!list` and every hp read."""
+    if not isinstance(vars_, dict):
+        raise VTTError(f"{where}: vars must be a dict, got "
+                       f"{type(vars_).__name__}.")
+    out = _own_value(vars_)
+    for k in list(out):
+        if k == "":
+            raise VTTError(f"{where}: a var has an empty name.")
+        if k in RESERVED_VAR_PATHS:
+            raise VTTError(
+                f"{where}: `{k}` is a reserved var path (the unit's own "
+                f"{'display name' if k == 'name' else 'position'}), so a "
+                f"template or statblock can't carry a var by that name.")
+    for k in vitals:
+        if k not in out:
+            continue
+        coerced = _coerce_vital_value(out[k])
+        if coerced is None:
+            raise VTTError(f"{where}: vital var '{k}' must be a finite "
+                           f"whole number, got {out[k]!r}.")
+        out[k] = coerced
+    return out
+
+
+# Status instance fields the engine does arithmetic on (stacking, extend,
+# counters, the `name(level)` display).
+STATUS_NUMBER_FIELDS: Tuple[str, ...] = ("level", "duration")
+
+
+def _coerce_number(v: Any) -> Optional[Any]:
+    """`v` as a finite int or float (a numeric string is parsed), or None.
+    bool is refused (True is not level 1)."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str):
+        t = v.strip()
+        try:
+            return int(t)
+        except ValueError:
+            try:
+                v = float(t)
+            except ValueError:
+                return None
+    if isinstance(v, float):
+        return v if math.isfinite(v) else None
+    return None
+
+
+def checked_status_value(path: str, value: Any, where: str) -> Any:
+    """`value` ready to store at `path` in a status instance (or a status
+    definition's seed data): `level` and `duration` must be finite numbers
+    with nothing nested under them. `!ent status a set burn level abc` used
+    to be stored, and the next `!status apply` crashed on it."""
+    seg0 = str(path).split(".", 1)[0]
+    if seg0 not in STATUS_NUMBER_FIELDS:
+        return value
+    if "." in str(path):
+        raise VTTError(f"{where}: `{seg0}` is a number field of a status; "
+                       f"nothing can be nested under it.")
+    n = _coerce_number(value)
+    if n is None:
+        raise VTTError(f"{where}: `{seg0}` must be a finite number, "
+                       f"got {value!r}.")
+    return n
+
 
 # Recognized modifier fold ops (see Match._apply_modifier_op). An op outside
 # this set still folds as a lenient add, but `!mod show` flags it as a likely
@@ -2946,6 +3257,18 @@ HOOK_NAMES: Set[str] = {
     "on_round_start",
     "on_round_end",
     "on_entity_spawned",
+    # Despawn event: the unit is leaving the match WITHOUT dying — `!ent
+    # remove`, `!part remove`, remove_entity(), the body parts and snake
+    # segments removed along with it, `!ent transfer` out of the match, and
+    # the old parts a transform drops. Fires on the unit BEFORE it goes, so
+    # `self` and its vars/position still resolve. A death fires on_death
+    # instead (as do the parts that go into the dying body's corpse).
+    "on_entity_despawned",
+    # A unit lost its turn to a `skips_turn` status. Fires on that unit
+    # (`self`), with `skip_status` = the status name(s) responsible, right
+    # after the "turn skipped" line and before the turn moves on (so before
+    # any round wrap that skip causes).
+    "on_turn_skipped",
     # Death event. Fires on the entity once the death-condition formula
     # evaluates truthy, BEFORE the entity is removed from the match (so
     # `self` is still bound and entity[self].x/.y still resolve). The
@@ -3948,7 +4271,15 @@ class GameSystem:
     def from_dict(d: Dict[str, Any]) -> "GameSystem":
         raw = d.get("settings", {}) or {}
         settings: Dict[str, Rule] = {}
+        dropped: List[str] = []
         for k, v in raw.items():
+            # A system saved by an older build may set a gamerule that no
+            # longer exists: drop it (noted on the console). Rules missing
+            # from the save need nothing: get() / the rules snapshot fall
+            # back to the registry default.
+            if k not in RULES_REGISTRY:
+                dropped.append(k)
+                continue
             settings[k] = Rule(
                 key=k,
                 value=v["value"],
@@ -3970,6 +4301,9 @@ class GameSystem:
             str(k): str(v) for k, v in raw_sys_aliases.items()
             if isinstance(k, str) and isinstance(v, str)
         }
+        if dropped:
+            print(f"[systems] '{d.get('name')}': dropped gamerule(s) that no "
+                  f"longer exist: {', '.join(sorted(map(str, dropped)))}")
         return GameSystem(
             name=d["name"], settings=settings,
             tile_templates=templates, formula_functions=funcs,
@@ -4401,6 +4735,12 @@ class Entity:
         # footprint-aware bounds/occupancy check below must see the
         # defaults. Fill-only, so an explicitly-provided value wins.
         match._apply_default_vars(self)
+        self.vars = checked_unit_vars(
+            self.vars,
+            (match.rules.get("hp_var", "hp"),
+             match.rules.get("max_hp_var", "max_hp"),
+             match.rules.get("turnorder_var", "initiative")),
+            f"`{self.id}`")
 
         # Validate the WHOLE footprint anchored at (x, y): every covered
         # cell in bounds and unoccupied (stackable spawners skip
@@ -4462,13 +4802,23 @@ class Entity:
         match._record_vision(getattr(self, "team", None))
         return (self.id, log)
 
-    def remove(self):
+    def remove(self, *, despawn: bool = True) -> List[str]:
         """
         Remove this entity from its match and turn order.
         Also scrubs the entity from every group it was a member of, so
         no group is left holding a dangling id.
+
+        `despawn` (the default) fires on_entity_despawned on the unit first,
+        and on each body part removed with it; the death pipeline passes
+        False (a death fires on_death). Returns the hook's log lines.
         """
         m = self._require_match()
+        log: List[str] = []
+        if despawn:
+            log = m.fire_hook("on_entity_despawned", target_ids=[self.id])
+            # A handler may already have removed (or killed) the unit.
+            if self._match is not m or self.id not in m.entities:
+                return log
         # Resolve any riders this entity was carrying (death OR despawn both
         # route here) per the mount_on_host_death rule — done while `self` is
         # still in the match so the eject search can use its footprint.
@@ -4513,9 +4863,10 @@ class Entity:
         # part's own remove() handles its riders, auras and sub-parts.
         for part in m.entity_part_subtree(self.id):
             if part.id in m.entities and part._match is m:
-                part.remove()
+                log.extend(part.remove(despawn=despawn))
         self._match = None
         m._rebuild_turn_order()
+        return log
 
     # Teleport (absolute move)
     def tp(self, x: int, y: int, *, fire_hooks: bool = True) -> List[str]:
@@ -4825,8 +5176,7 @@ class Entity:
         newly-created level along the path, matching the documented "top-down
         for creation" semantics.
         """
-        if not path:
-            raise VTTError("Variable path cannot be empty.")
+        check_store_path(path, "Variable path")
         if self._match is not None:
             msg = reserved_var_path_error(path, f"Writing '{path}' on `{self.id}`")
             if msg:
@@ -4848,9 +5198,16 @@ class Entity:
                 coerced = _coerce_vital_value(value)
                 if coerced is None:
                     raise VTTError(
-                        f"Vital var '{seg0}' must be a number, got {value!r} "
+                        f"Vital var '{seg0}' must be a finite number, got {value!r} "
                         f"on `{self.id}`.")
                 value = coerced
+        # A dict / list is stored as this unit's own copy. A formula can hand
+        # over another unit's live object (`entity[a].inv = entity[b].inv`,
+        # var_set(..., var_get(...))), which used to make both vars ONE object:
+        # a write to one changed the other with none of its hooks or clamps,
+        # and a save/load split them apart again.
+        value = _own_value(value)
+        check_no_value_ancestor(self.vars, path, f"`{self.id}`")
 
         # Snapshot whether this is the top-level entry into a write/event
         # chain. We only drain the warning buffer at top-level exit so
@@ -4914,8 +5271,26 @@ class Entity:
         # mutated vars (legitimately, through write_var). That's fine — we
         # re-resolve `old` against the current state for the diff, so we
         # capture only the change attributable to THIS write call.
+        # A footprint write that grows the body must fit, like a move.
+        if self._match is not None and "." not in path and path in (
+                self._match.rules.get("footprint_width_var", "footprint_w"),
+                self._match.rules.get("footprint_height_var", "footprint_h")):
+            trial = dict(self.vars)
+            trial[path] = value
+            self._match.check_body_fits(self, trial, f"`{self.id}`.{path}")
         old_post_attempt = _path_resolve(self.vars, path)
         self._set_path(path, value)
+        # A heal that lifts a destroyed body part back above 0 clears the
+        # destroyed latch, so it can break (and re-fire on_death) again, and
+        # RESUMES any aura suspended when it broke (a no-op unless
+        # anchored_zone_on_anchor_loss is 'suspend'). Here, at the hp write,
+        # so any heal counts: damage_part refuses negative amounts.
+        if (self._match is not None and self.part_of
+                and self.vars.get("__part_destroyed")
+                and path == self._vital_var_names()[0]
+                and isinstance(value, (int, float)) and value > 0):
+            self.vars.pop("__part_destroyed", None)
+            self._match._resume_anchored_zones(self.id)
         # Diff old vs new at this path and collect the resulting events
         leaf_events = _diff_subtree(path, old_post_attempt, value)
         # Now we can fill in new_value for the ancestor events by re-resolving
@@ -5551,6 +5926,9 @@ class Match:
     border_show: Optional[bool] = None
     border_color: Optional[str] = None
     border_opacity: Optional[int] = None
+    # Coordinate rulers: None = the map_coords rule, else this match's
+    # override (`!map coords on|off|clear`). Serialized.
+    map_coords: Optional[bool] = None
 
     # ---- graphics: per-match render mode ----
     # "text" (ASCII, the default) or "image" (graphical PNG). On a graphics-
@@ -5575,6 +5953,21 @@ class Match:
     # team -> {pid: Passive}: passives that fire for events on any member of
     # the team (self = the member), alongside global + entity passives.
     team_passives: Dict[str, Dict[str, "Passive"]] = field(default_factory=dict)
+
+    # ---- table pause (`!match pause` / `!match resume`) ----
+    # None while play runs; {"by": user name, "reason": str} while paused.
+    # Serialized (a paused table stays paused across a save/load), but an
+    # undo/restore keeps the LIVE value: pausing is table management, not
+    # game state. While paused, non-hosts' state-changing commands are
+    # refused (reads still work); with the pause_affects_hosts rule on, a
+    # host's state-changing command is held in `held_commands` and runs on
+    # `!match resume`.
+    paused: Optional[Dict[str, Any]] = None
+    # Host commands held while paused (pause_affects_hosts): dicts {user,
+    # user_name, channel_key, name, args}. Runtime-only, like the approval
+    # queue below.
+    held_commands: List[Dict[str, Any]] = field(default_factory=list,
+                                                repr=False)
 
     # ---- runtime-only: pending approval queue ----
     # Requests from non-host users awaiting host approval, keyed by a
@@ -5914,8 +6307,7 @@ class Match:
             raise OutOfBounds(
                 f"({x},{y}) outside {self.grid_width}x{self.grid_height}"
             )
-        if not path:
-            raise VTTError("tile path cannot be empty.")
+        check_store_path(path, "tile path")
         d = self.tiles.setdefault((x, y), {})
         parts = path.split(".")
         for i, key in enumerate(parts[:-1]):
@@ -5930,7 +6322,7 @@ class Match:
             if key not in d:
                 d[key] = {}
             d = d[key]
-        d[parts[-1]] = value
+        d[parts[-1]] = _own_value(value)
 
     def tile_del_path(self, x: int, y: int, path: Optional[str]) -> None:
         """Delete a dotted-path key from a tile's data, OR (when
@@ -6111,6 +6503,10 @@ class Match:
             z = self.create_zone(name)
         xa, xb = sorted((int(x1), int(x2)))
         ya, yb = sorted((int(y1), int(y2)))
+        # Clipped to the grid before the walk: zone_fill(z, 1, 1, 10**6,
+        # 10**6) used to visit a trillion cells to keep the on-grid ones.
+        xa, xb = max(1, xa), min(self.grid_width, xb)
+        ya, yb = max(1, ya), min(self.grid_height, yb)
         added = 0
         for xx in range(xa, xb + 1):
             for yy in range(ya, yb + 1):
@@ -7251,6 +7647,9 @@ class Match:
     def team_set(self, team: str, path: str, value: Any) -> None:
         """Set a dotted path in a team's data dict (creating it + nested
         dicts as needed)."""
+        check_store_path(path, "team path")
+        check_no_value_ancestor(self.team_data.get(str(team), {}), path,
+                                f"team `{team}`")
         cur = self.team_data.setdefault(str(team), {})
         segs = str(path).split(".")
         for seg in segs[:-1]:
@@ -7259,7 +7658,7 @@ class Match:
                 nxt = {}
                 cur[seg] = nxt
             cur = nxt
-        cur[segs[-1]] = value
+        cur[segs[-1]] = _own_value(value)
 
     def team_add(self, team: str, path: str, delta: float) -> Any:
         """Add `delta` to a numeric team value (0 if absent). Returns the new
@@ -7490,13 +7889,12 @@ class Match:
 
     def zone_set_path(self, name: str, path: str, value: Any,
                       *, create: bool = True) -> None:
+        check_store_path(path, "zone path")
         z = self.zones.get(name)
         if z is None:
             if not create:
                 raise NotFound(f"Zone '{name}' not found.")
             z = self.create_zone(name)
-        if not path:
-            raise VTTError("zone path cannot be empty.")
         d = z["data"]
         parts = path.split(".")
         for i, key in enumerate(parts[:-1]):
@@ -7511,7 +7909,7 @@ class Match:
             if key not in d:
                 d[key] = {}
             d = d[key]
-        d[parts[-1]] = value
+        d[parts[-1]] = _own_value(value)
 
     def zone_del_path(self, name: str, path: str) -> None:
         """Delete a dotted key from a zone's data, pruning emptied
@@ -7714,10 +8112,12 @@ class Match:
         return self.rules.get("tile_opaque_condition", "")
 
     def _eval_opaque_spec(self, spec: Any, viewer_id: Optional[str],
-                          extras: Dict[str, Any]) -> bool:
+                          extras: Dict[str, Any],
+                          errors: Optional[List[str]] = None) -> bool:
         """Evaluate an opacity spec with `self`=the viewer. bool/number used
         directly; a string runs as a formula. Empty/None or a malformed
-        formula -> NOT opaque (transparent; fail toward visible)."""
+        formula -> NOT opaque (transparent; fail toward visible). A failing
+        formula's message is appended to `errors` when given."""
         if spec is None:
             return False
         if isinstance(spec, bool):
@@ -7733,7 +8133,9 @@ class Match:
                       extras=dict(extras))
         try:
             return bool(engine.eval_expression(cond, ctx))
-        except FormulaError:
+        except FormulaError as ex:
+            if errors is not None:
+                errors.append(f"`{cond}`: {ex}")
             return False
 
     def cell_opaque(self, viewer_id: Optional[str], x: int, y: int) -> bool:
@@ -7834,7 +8236,8 @@ class Match:
         drift on the corner rule."""
         return not self._los_stop(viewer_id, x1, y1, x2, y2)[1]
 
-    def _check_line_budget(self, x1: int, y1: int, x2: int, y2: int) -> None:
+    def _check_line_budget(self, x1: int, y1: int, x2: int, y2: int,
+                           what: str = "sight line") -> None:
         """Refuse a sight/geometry line longer than the formula_cell_limit
         rule. The walk costs one step per cell crossed, and formulas (incl.
         a player's inline `$()` arg) choose the endpoints freely — has_los(0,
@@ -7847,7 +8250,7 @@ class Match:
             limit = 100000
         if n > limit:
             raise VTTError(
-                f"sight line ({x1},{y1})->({x2},{y2}) crosses up to {n} "
+                f"{what} ({x1},{y1})->({x2},{y2}) crosses up to {n} "
                 f"cells, over the formula_cell_limit of {limit}."
             )
 
@@ -8157,6 +8560,102 @@ class Match:
         except FormulaError:
             return True
 
+    def own_team_unit(self, e: "Entity", pov_team: Optional[str]) -> bool:
+        """Whether `e` belongs to the viewing team `pov_team` (a body part
+        counts as its root body's team) and the pov_own_team_visible rule
+        keeps a team's own units visible to it."""
+        if pov_team is None or not bool(
+                self.rules.get("pov_own_team_visible", True)):
+            return False
+        root, seen = e, set()
+        while root.part_of and root.part_of in self.entities \
+                and root.id not in seen:
+            seen.add(root.id)
+            root = self.entities[root.part_of]
+        return root.team is not None and str(root.team) == str(pov_team)
+
+    def unit_sees_unit(self, viewer: "Entity", other: "Entity",
+                       budget: Optional[List[int]] = None) -> bool:
+        """Whether the single unit `viewer` sees `other` right now: some cell
+        of other's body is within viewer's vision radius with a clear line
+        from some cell of viewer's body (range + LOS, ignoring the fog
+        toggles, like can_see), AND entity_visibility_condition lets
+        viewer's team see it (stealth), unless `other` is viewer's own
+        team's unit (pov_own_team_visible). A viewer with no team skips the
+        stealth rule. The query behind visible_entities.
+
+        `budget` ([cells left]) charges every sight line walked, so a call
+        over many big bodies that can't see each other (each pair of cells
+        walked) stops with an error instead of running for minutes."""
+        r = self._vision_radius_of(viewer)
+        vcells = self.entity_cells(viewer)
+        seen = False
+        for tx, ty in self.entity_cells(other):
+            for vx, vy in vcells:
+                if not self._within_vision(vx, vy, tx, ty, r):
+                    continue
+                if budget is not None:
+                    budget[0] -= abs(tx - vx) + abs(ty - vy) + 1
+                    if budget[0] < 0:
+                        raise VTTError(
+                            "visible_entities(...): the sight lines to check "
+                            "cross more cells than the formula_cell_limit "
+                            "allows (big bodies far apart).")
+                if self.has_los(viewer.id, vx, vy, tx, ty):
+                    seen = True
+                    break
+            if seen:
+                break
+        if not seen:
+            return False
+        team = viewer.team
+        if team is None or self.own_team_unit(other, str(team)):
+            return True
+        return self._visibility_visible(
+            "entity_visibility_condition", str(team), target=other.id)
+
+    def unit_sight_cells(self, viewer: "Entity",
+                         budget: Optional[int] = None) -> List[Tuple[int, int]]:
+        """The on-map cells the single unit `viewer` sees right now, row by
+        row: within its vision radius of some cell of its body with a clear
+        line from that cell (range + LOS, ignoring the fog toggles, like
+        can_see). The cells behind `!map ent_sight`.
+
+        Every range check and sight line walked is charged against `budget`
+        (default the sight_check_limit rule), so a huge vision radius on a
+        big map stops with an error instead of tying the bot up."""
+        if budget is None:
+            try:
+                budget = int(self.rules.get("sight_check_limit", 1000000))
+            except (TypeError, ValueError):
+                budget = 1000000
+        left = budget
+        r = self._vision_radius_of(viewer)
+        body = self.entity_cells(viewer)
+        xs = [c[0] for c in body]
+        ys = [c[1] for c in body]
+        x0, x1 = max(1, min(xs) - r), min(self.grid_width, max(xs) + r)
+        y0, y1 = max(1, min(ys) - r), min(self.grid_height, max(ys) + r)
+        cells: List[Tuple[int, int]] = []
+        for y in range(y0, y1 + 1):
+            for x in range(x0, x1 + 1):
+                for vx, vy in body:
+                    # One unit per range check (a big body tests every cell
+                    # pair), plus the length of each sight line walked.
+                    left -= 1
+                    if self._within_vision(vx, vy, x, y, r):
+                        left -= abs(x - vx) + abs(y - vy) + 1
+                    if left < 0:
+                        raise VTTError(
+                            f"Checking `{viewer.id}`'s sight takes more than "
+                            f"the sight_check_limit of {budget} (its vision "
+                            f"radius is {r}).")
+                    if self._within_vision(vx, vy, x, y, r) and \
+                            self.has_los(viewer.id, vx, vy, x, y):
+                        cells.append((x, y))
+                        break
+        return cells
+
     def entity_visible_to(self, eid: str, pov_team: Optional[str]) -> bool:
         """Whether entity `eid` is visible to a viewer whose POV is
         `pov_team` (None = omniscient = always visible). Evaluates
@@ -8172,6 +8671,9 @@ class Match:
         # visible (region-slot) rider stays subject to the normal checks.
         if e.is_hidden_rider:
             return False
+        # The viewer's own units (pov_own_team_visible).
+        if self.own_team_unit(e, pov_team):
+            return True
         # A large entity is fog-visible if ANY footprint cell passes the
         # entity fog gate (current vision, or remembered when memory mode
         # is 'full') — so a giant is hidden only when its whole body is
@@ -8220,12 +8722,14 @@ class Match:
         cv = ent.get("vars", {}) if isinstance(ent, dict) else {}
         if isinstance(cv, dict):
             try:
-                w = max(1, int(cv.get(str(self.rules.get("footprint_width_var", "footprint_w")))))
-            except (TypeError, ValueError):
+                w = self._cap_footprint(int(cv.get(str(self.rules.get(
+                    "footprint_width_var", "footprint_w")))), "footprint_width_var")
+            except (TypeError, ValueError, OverflowError):
                 w = 1
             try:
-                h = max(1, int(cv.get(str(self.rules.get("footprint_height_var", "footprint_h")))))
-            except (TypeError, ValueError):
+                h = self._cap_footprint(int(cv.get(str(self.rules.get(
+                    "footprint_height_var", "footprint_h")))), "footprint_height_var")
+            except (TypeError, ValueError, OverflowError):
                 h = 1
         return w, h
 
@@ -8516,9 +9020,18 @@ class Match:
         var = str(self.rules.get(rule_key, default_name))
         try:
             v = int(e.vars.get(var))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return 1
-        return v if v >= 1 else 1
+        return self._cap_footprint(v, rule_key)
+
+    def _cap_footprint(self, v: int, rule_key: str) -> int:
+        """A footprint side, at least 1 and at most one past the grid side.
+        Every larger value is just as off-grid, and `footprint_w 30000` used
+        to make every cell walk (render, occupancy, vision) build 9*10^8
+        cells and hang the bot."""
+        side = (self.grid_width if rule_key == "footprint_width_var"
+                else self.grid_height)
+        return max(1, min(v, max(1, side) + 1))
 
     def entity_footprint(self, e: "Entity") -> Tuple[int, int]:
         """(width, height) of `e`'s footprint, each >= 1. 1×1 when the
@@ -8566,7 +9079,15 @@ class Match:
             return int(gx + gy)
         if mode in ("euclidean", "euclidean_distance"):
             return math.sqrt(gx * gx + gy * gy)
-        return int(max(gx, gy))   # square_radius (Chebyshev), the default
+        if mode in ("square_radius", "square_radius_distance"):
+            return int(max(gx, gy))   # Chebyshev, the default
+        # Any other name used to fall through to Chebyshev, so a typo'd
+        # metric in entities_within / nearest_entity / `near:` was silently
+        # ignored.
+        raise VTTError(
+            f"unknown distance mode {mode!r}. Allowed: euclidean, "
+            f"euclidean_distance, manhattan, manhattan_distance, "
+            f"square_radius, square_radius_distance.")
 
     def entity_gap_distance(self, e_ref: "Entity", e_other: "Entity",
                             mode: str = "square_radius") -> float:
@@ -8647,6 +9168,55 @@ class Match:
         is on the grid."""
         return all(self.in_bounds(cx, cy) for cx, cy in self.entity_cells(e, ax, ay))
 
+    def check_body_fits(self, e: "Entity", trial_vars: Dict[str, Any],
+                        where: str, extra_ignore: Tuple[str, ...] = ()) -> None:
+        """Refuse a change of `e`'s vars to `trial_vars` whose footprint would
+        leave the grid or cover another unit, as a move or a spawn would.
+        Writing footprint_w / footprint_h (or transforming into a bigger form)
+        used to grow a unit over its neighbour, which then vanished from the
+        map, or off the grid. Only cells the body doesn't cover now are
+        checked, so shrinking always fits. Units that don't stand on the
+        ground themselves (glued / region parts, mounted riders) and units
+        not yet placed are skipped."""
+        if (e._match is not self or e.id not in self.entities
+                or e.is_glued_part or e.is_region_part or e.mounted_on):
+            return
+        old_cells = set(self.entity_cells(e))
+        saved = e.vars
+        e.vars = trial_vars
+        try:
+            new_cells = self.entity_cells(e)
+            w, h = self.entity_footprint(e)
+        finally:
+            e.vars = saved
+        grown = [c for c in new_cells if c not in old_cells]
+        if not grown:
+            return
+        # The size as written (the cell walk caps a side one past the grid).
+        for key, dim in (("footprint_width_var", "w"), ("footprint_height_var", "h")):
+            raw = trial_vars.get(self.rules.get(key, "footprint_" + dim))
+            if isinstance(raw, int) and not isinstance(raw, bool) and raw > 1:
+                if dim == "w":
+                    w = raw
+                else:
+                    h = raw
+        size = f"{w}x{h}"
+        for cx, cy in grown:
+            if not self.in_bounds(cx, cy):
+                raise OutOfBounds(
+                    f"{where}: `{e.id}` can't become {size} at ({e.x},{e.y}) — "
+                    f"({cx},{cy}) is outside the {self.grid_width}x"
+                    f"{self.grid_height} grid.")
+        if e.is_cell_stackable:
+            return
+        ignore = self._occupancy_ignore(e, extra_ignore)
+        for cx, cy in grown:
+            other = self.cell_occupant(cx, cy, ignore)
+            if other is not None:
+                raise Occupied(
+                    f"{where}: `{e.id}` can't become {size} at ({e.x},{e.y}) — "
+                    f"({cx},{cy}) is taken by `{other}`.")
+
     def _validate_placement(self, e: "Entity", ax: int, ay: int,
                             mode: Optional[str]) -> None:
         """Validate that `e` can occupy the footprint anchored at
@@ -8706,7 +9276,8 @@ class Match:
         return self.rules.get("tile_block_condition", "")
 
     def _eval_block_spec(self, spec: Any, mover_id: str,
-                         extras: Dict[str, Any]) -> bool:
+                         extras: Dict[str, Any],
+                         errors: Optional[List[str]] = None) -> bool:
         """Evaluate a block spec for `mover_id`. bool/number specs are used
         directly; a string is run as a formula with `self`=the mover plus
         `extras` bindings. Empty/None = not blocking. A malformed formula
@@ -8727,7 +9298,9 @@ class Match:
                       extras=dict(extras))
         try:
             return bool(engine.eval_expression(cond, ctx))
-        except FormulaError:
+        except FormulaError as ex:
+            if errors is not None:
+                errors.append(f"`{cond}`: {ex}")
             return False
 
     def cell_blocks(self, mover_id: str, x: int, y: int) -> bool:
@@ -9298,6 +9871,9 @@ class Match:
         # First-ever next_turn call: begin round 1 without advancing.
         if not self.round_started:
             self.round_started = True
+            line = self.round_start_line()
+            if line:
+                log.append(line)
             log.extend(self.fire_hook(
                 "on_round_start",
                 own_only_targets=self._attached_tick_parts(list(self.turn_order))))
@@ -9650,8 +10226,11 @@ class Match:
             skipping = self._skipping_statuses(self.entities[new_cur])
             self._atb_last_skipped = bool(skipping)
             if skipping:
-                log.append(f"⏭️ `{new_cur}`'s turn skipped "
-                           f"({', '.join(sorted(skipping))}).")
+                matched = ", ".join(sorted(skipping))
+                log.append(f"⏭️ `{new_cur}`'s turn skipped ({matched}).")
+                log.extend(self.fire_hook(
+                    "on_turn_skipped", target_ids=[new_cur],
+                    extras={"skip_status": matched}))
             # turn_start for the new actor (active_index now points at it).
             log.extend(self._atb_turn_phase(
                 new_cur, "turn_start", act=not skipping))
@@ -9710,6 +10289,9 @@ class Match:
         self.active_index = new_index
         if wrapped:
             self.round_number += 1
+            line = self.round_start_line()
+            if line:
+                log.append(line)
             log.extend(self.fire_hook(
                 "on_round_start",
                 own_only_targets=self._attached_tick_parts(list(self.turn_order))))
@@ -9718,6 +10300,28 @@ class Match:
             log.extend(self.fire_zone_time_hooks("on_round_start"))
             log.extend(self.fire_scheduled_round())
             self.history.record_round(self)
+
+    _ROUND_FMT_RE = re.compile(r"\{(round|match)(?:\.([\w.]+))?\}")
+
+    def round_start_line(self) -> str:
+        """The round_start_message_format line for the round that is
+        starting now ("" when the rule is empty)."""
+        fmt = str(self.rules.get("round_start_message_format", "") or "")
+        if not fmt:
+            return ""
+
+        def sub(mo):
+            if mo.group(1) == "round":
+                return str(self.round_number) if mo.group(2) is None else mo.group(0)
+            if mo.group(2) is None:
+                return self.name
+            cur: Any = self.vars
+            for seg in mo.group(2).split("."):
+                if not isinstance(cur, dict) or seg not in cur:
+                    return ""
+                cur = cur[seg]
+            return str(cur)
+        return self._ROUND_FMT_RE.sub(sub, fmt)
 
     def _skipping_statuses(self, e: "Entity") -> List[str]:
         """Names of `e`'s statuses whose data dict carries
@@ -9738,9 +10342,17 @@ class Match:
         (the caller then passes the round without firing on_turn_start).
         Bounded to one full turn-order cycle so an all-skippable table
         can't loop forever."""
-        n = len(self.turn_order)   # hard cap vs. a skip-hook that GROWS the order
-        checked = 0
-        while checked < n:
+        # Stop on reaching a unit already skipped in this pass: everyone
+        # still in the order has been looked at. Tracking ids (not a step
+        # count) stays right when skip / round hooks SHRINK the order — a
+        # stale count over-ran and fired extra round wraps — and when a hook
+        # removes the unit just skipped (a count sized to the old order then
+        # stopped before reaching a unit that could act). `cap` only guards
+        # against a hook that keeps ADDING skippable units.
+        seen = set()
+        steps = 0
+        cap = 2 * len(self.turn_order) + 2
+        while steps <= cap:
             # A skip's round-wrap (or a skip-status side effect) can empty
             # the order; stop rather than indexing into nothing.
             if not self.turn_order:
@@ -9754,19 +10366,27 @@ class Match:
             skipping = self._skipping_statuses(e)
             if not skipping:
                 return True
+            if cur in seen:
+                return False
+            seen.add(cur)
             matched = ", ".join(sorted(skipping))
             log.append(f"⏭️ `{cur}`'s turn skipped ({matched}).")
-            self._advance_index(log)
-            checked += 1
-            # Bound by the CURRENT order size, not the stale `n`. If a
-            # round-wrap hook SHRANK the order mid-skip, `n` over-counts and
-            # the loop would keep cycling the survivors — firing extra round
-            # wraps (inflating round_number) before exhausting `n`. Once we've
-            # taken a full cycle's worth of steps for the live order and found
-            # nobody eligible, stop.
-            if checked >= len(self.turn_order):
-                return False
-        # Full cycle without finding an eligible entity.
+            log.extend(self.fire_hook(
+                "on_turn_skipped", target_ids=[cur],
+                extras={"skip_status": matched}))
+            if cur in self.turn_order:
+                self._advance_index(log)
+            else:
+                # The handler removed the skipped unit: removal already moved
+                # the pointer onto the next unit ("same"), or marked that the
+                # unit was last ("wrap"), which still needs the round wrap.
+                vacated, self.turn_vacated = self.turn_vacated, None
+                if not self.turn_order:
+                    return False
+                if vacated == "wrap":
+                    self.active_index = len(self.turn_order) - 1
+                    self._advance_index(log)
+            steps += 1
         return False
 
     def _effective_clamp(self, entity: "Entity", path: str) -> Optional["ClampSpec"]:
@@ -10372,7 +10992,8 @@ class Match:
     def apply_status(self, eid: str, name: str,
                      level: Optional[int] = None,
                      duration: Optional[int] = None,
-                     *, force: bool = False) -> List[str]:
+                     *, force: bool = False,
+                     seed_data: Optional[Dict[str, Any]] = None) -> List[str]:
         """Apply status `name` to entity `eid`, honoring the definition's
         `stack` mode (else the status_default_stack rule) when the status
         is already present. A FIRST application seeds the definition's
@@ -10385,7 +11006,11 @@ class Match:
         immunity + resistance gating entirely — the level/increment is
         applied regardless of resistance. blocked_by (cross-status) and the
         part immune/redirect rules are still honored; force is specifically
-        the 'ignore resistance' axis."""
+        the 'ignore resistance' axis.
+
+        `seed_data` (status_transfer) replaces the definition's `data` as the
+        new instance's fields on a FIRST application, so a moved status keeps
+        its custom fields; stacking onto an existing instance ignores it."""
         e = self.entities.get(eid)
         if e is None:
             raise NotFound(f"Entity '{eid}' not found.")
@@ -10400,7 +11025,7 @@ class Match:
                     e, "__status_redirect", "part_status_redirect"):
                 if e.part_of in self.entities:
                     return self.apply_status(e.part_of, name, level, duration,
-                                             force=force)
+                                             force=force, seed_data=seed_data)
                 return []
         sdef = self.status_definitions.get(name) or {}
         new_level = None if level is None else int(level)
@@ -10430,8 +11055,13 @@ class Match:
                 new_level = eff
         before = copy.deepcopy(e.status.get(name))
         if name not in e.status:
-            inst = copy.deepcopy(sdef.get("data")) if isinstance(sdef.get("data"), dict) else {}
-            seed_lv = new_level if new_level is not None else int(inst.get("level", 1))
+            if isinstance(seed_data, dict):
+                inst = copy.deepcopy(seed_data)
+            else:
+                inst = (copy.deepcopy(sdef.get("data"))
+                        if isinstance(sdef.get("data"), dict) else {})
+            seed_lv = (new_level if new_level is not None
+                       else _coerce_number(inst.get("level", 1)) or 1)
             inst["level"] = self._cap_status_level(sdef, seed_lv)
             if new_duration is not None:
                 inst["duration"] = new_duration
@@ -10448,10 +11078,10 @@ class Match:
                     inst["duration"] = new_duration
             elif mode == "extend":
                 if new_duration is not None:
-                    inst["duration"] = int(inst.get("duration", 0)) + new_duration
+                    inst["duration"] = (_coerce_number(inst.get("duration", 0)) or 0) + new_duration
             elif mode == "add_level":
                 add = new_level if new_level is not None else 1
-                nl = int(inst.get("level", 0)) + add
+                nl = (_coerce_number(inst.get("level", 0)) or 0) + add
                 inst["level"] = self._cap_status_level(sdef, nl)
                 if new_duration is not None:
                     inst["duration"] = new_duration
@@ -10510,9 +11140,9 @@ class Match:
         destination via apply_status — so the destination's stacking mode +
         resistance/immunity/blocked_by all apply (a RESISTIBLE move: if the
         dest resists or is immune, the status is consumed — gone from the
-        source, doesn't stick). Carries level + duration; custom instance data
-        re-seeds from the definition, exactly like the part_status_redirect
-        path. Returns (landed_on_dest, log). No-op (False) if the source lacks
+        source, doesn't stick). Carries level + duration, and the moved
+        instance keeps its custom fields (user call; it used to re-seed them
+        from the definition). Returns (landed_on_dest, log). No-op (False) if the source lacks
         the status or from==to. Raises NotFound for an unknown entity."""
         src = self.entities.get(from_eid)
         if src is None:
@@ -10534,7 +11164,11 @@ class Match:
         # The source's on_status_removed hook could have removed the dest.
         if to_eid not in self.entities:
             return False, log
-        log += self.apply_status(to_eid, name, lv, du)
+        # The moved instance keeps every field (custom data, sprite
+        # overrides); level and duration still go through the destination's
+        # stacking, resistance and immunity. Onto an existing instance only
+        # the stacking applies (that instance keeps its own data).
+        log += self.apply_status(to_eid, name, lv, du, seed_data=inst)
         landed = (to_eid in self.entities
                   and name in self.entities[to_eid].status)
         return landed, log
@@ -11193,10 +11827,10 @@ class Match:
                 pe = Entity.from_dict(ptc)
                 _, plog = pe.spawn(self, place_x, place_y)
                 log += plog
-            except VTTError:
+            except VTTError as ex:
                 # A malformed part entry (missing hp var, id clash) is
-                # skipped rather than aborting the whole summon.
-                pass
+                # skipped rather than aborting the whole summon, and said so.
+                log.append(f"⚠️ `{new_id}`: part `{pid}` was not created: {ex}")
         # Snake body: a `segments` list/dict spawns SEGMENTS chained behind
         # the head (this entity), in order. Each entry: {name?, id?, hp,
         # maxhp, vars?}. add_segment finds a free trailing cell and sets the
@@ -11216,16 +11850,17 @@ class Match:
                 svars[name_var] = role
             sname = str(st.get("name") or svars.get(name_var) or f"{new_id}_seg")
             sid = self.mint_entity_id(str(st.get("id") or sname))
-            try:
-                shp = int(st.get("hp", 0))
-                smhp = int(st.get("maxhp", shp))
-            except (TypeError, ValueError):
+            shp = _coerce_vital_value(st.get("hp", 0))
+            smhp = _coerce_vital_value(st.get("maxhp", shp))
+            if shp is None or smhp is None:
+                log.append(f"⚠️ `{new_id}`: segment `{sid}` was not created: "
+                           f"its hp / maxhp must be whole numbers.")
                 continue
             try:
                 _, slog = self.add_segment(new_id, sid, sname, shp, smhp, svars)
                 log += slog
-            except VTTError:
-                pass
+            except VTTError as ex:
+                log.append(f"⚠️ `{new_id}`: segment `{sid}` was not created: {ex}")
         return new_id, log
 
     def _find_free_cell_near(
@@ -11249,7 +11884,12 @@ class Match:
                 return True
             return all(self.cell_occupant(fx, fy) is None
                        for fx, fy in self.entity_cells(e, cx, cy))
-        for r in range(0, max(0, radius) + 1):
+        # Rings past the farthest grid corner hold no on-grid cell, so the
+        # search stops there: summon_near(t, x, y, 10**6) on a full board
+        # used to walk every ring out to a million.
+        reach = max(abs(x - 1), abs(x - self.grid_width),
+                    abs(y - 1), abs(y - self.grid_height))
+        for r in range(0, min(max(0, radius), reach) + 1):
             if r == 0:
                 candidates = [(x, y)]
             else:
@@ -11263,6 +11903,91 @@ class Match:
                 if fits(cx, cy):
                     return (cx, cy)
         return None
+
+    def free_cell_near(self, x: int, y: int, radius: int,
+                       e: Optional["Entity"] = None) -> Optional[Tuple[int, int]]:
+        """The nearest cell (same ring order as _find_free_cell_near) where a
+        unit could stand: with `e`, its whole footprint anchored there is in
+        bounds, clear of other units (its own body, snake segments and
+        riders don't count) and not movement-blocked for it; without `e`, a
+        single in-bounds unoccupied cell. Returns the anchor or None. The
+        read-only query behind the free_cell_near formula function."""
+        ignore = self._stand_ignore(e)
+        for r in range(0, max(0, radius) + 1):
+            ring = [(x + dx, y + dy)
+                    for dy in range(-r, r + 1) for dx in range(-r, r + 1)
+                    if max(abs(dx), abs(dy)) == r]
+            for cx, cy in ring:
+                if self._can_stand_at(e, cx, cy, ignore):
+                    return (cx, cy)
+        return None
+
+    def _stand_ignore(self, e: Optional["Entity"]) -> Tuple[str, ...]:
+        """Units that don't count as in the way of `e` standing somewhere:
+        its own body, snake segments and riders."""
+        if e is None:
+            return ()
+        return self._occupancy_ignore(
+            e, tuple(r.id for r in self.vehicle_riders(e.id)))
+
+    def _can_stand_at(self, e: Optional["Entity"], cx: int, cy: int,
+                      ignore: Tuple[str, ...] = ()) -> bool:
+        """The free_cell_near test for one anchor: with `e`, its whole body
+        anchored at (cx, cy) is on the map, clear of other units (unless
+        stackable) and not movement-blocked for it; without, one on-map
+        empty cell."""
+        if e is None:
+            return self.in_bounds(cx, cy) and not self.is_occupied(cx, cy)
+        if not self.footprint_in_bounds(e, cx, cy):
+            return False
+        cells = self.entity_cells(e, cx, cy)
+        if not e.is_cell_stackable and any(
+                self.cell_occupant(fx, fy, ignore) is not None
+                for fx, fy in cells):
+            return False
+        return not any(self.cell_blocks(e.id, fx, fy) for fx, fy in cells)
+
+    RANDOM_CELL_FITS = ("body", "center", "any", "anchor")
+
+    def free_anchors_in_area(self, area: Set[Tuple[int, int]],
+                             e: Optional["Entity"], fit: str = "body",
+                             limit: Optional[int] = None) -> List[Tuple[int, int]]:
+        """Every anchor where `e` could stand (_can_stand_at) with its body
+        placed in `area` by `fit`: `body` = every cell of the body in the
+        area, `center` = its centre cell (rounded down for even sizes, like
+        entity_center), `any` = at least one cell, `anchor` = its top-left
+        cell. Without `e`, the area's empty cells. Sorted top-to-bottom,
+        left-to-right so a seeded pick is reproducible. `limit` caps the
+        cells examined (candidates x body size) — the formula_cell_limit."""
+        if fit not in self.RANDOM_CELL_FITS:
+            raise VTTError(
+                f"fit must be one of {', '.join(self.RANDOM_CELL_FITS)}, "
+                f"got {fit!r}.")
+        ignore = self._stand_ignore(e)
+        if e is None:
+            w = h = 1
+        else:
+            w, h = self.entity_footprint(e)
+        if e is None or fit in ("body", "anchor"):
+            cand = set(area)
+        elif fit == "center":
+            ox, oy = (w - 1) // 2, (h - 1) // 2
+            cand = {(x - ox, y - oy) for x, y in area}
+        else:
+            cand = {(x - dx, y - dy) for x, y in area
+                    for dy in range(h) for dx in range(w)}
+        if limit is not None and len(cand) * w * h > limit:
+            raise VTTError(
+                f"checking {len(cand)} spots for a {w}x{h} body covers more "
+                f"than the formula_cell_limit of {limit} cells.")
+        out = []
+        for ax, ay in sorted(cand, key=lambda c: (c[1], c[0])):
+            if (e is not None and fit == "body"
+                    and any(c not in area for c in self.entity_cells(e, ax, ay))):
+                continue
+            if self._can_stand_at(e, ax, ay, ignore):
+                out.append((ax, ay))
+        return out
 
     # ---- death / corpse machinery ----------------------------------------
     # A "corpse" is an entry under `tile[(x,y)].corpses.<eid>` carrying
@@ -11379,7 +12104,7 @@ class Match:
                 self._store_corpse(e)   # also snapshots the parts
             # Remove from match (entity.remove handles turn-order
             # bookkeeping + group scrubbing) regardless of result.
-            e.remove()
+            e.remove(despawn=False)
             # Cascade: the creature is gone, so its body parts go with it
             # (no orphaned, suddenly-visible limbs). The WHOLE subtree —
             # parts, their parts, ... — is removed, not just direct parts,
@@ -11389,7 +12114,7 @@ class Match:
             # limb destruction, not whole-creature death.
             for part in self.entity_part_subtree(entity_id):
                 if part.id in self.entities:
-                    part.remove()
+                    part.remove(despawn=False)
             self.log_event("death", entity=entity_id, name=dead_name,
                            x=dead_x, y=dead_y)
         finally:
@@ -11470,10 +12195,41 @@ class Match:
             return min(amount, max(0, cur_hp))
         if cap.startswith("absolute:"):
             try:
-                return min(amount, int(cap.split(":", 1)[1]))
+                n = int(cap.split(":", 1)[1])
             except (TypeError, ValueError):
-                return amount
-        return amount              # "none" / unknown -> uncapped
+                n = -1
+            # A negative cap turned every hit into a heal of the main body.
+            if n >= 0:
+                return min(amount, n)
+        elif cap == "none":
+            return amount          # uncapped
+        # An unknown value (a typo'd `to_main_cap` var) used to mean
+        # "uncapped": a big hit then tapped through in full.
+        raise VTTError(
+            f"to_main_cap {cap!r} isn't none, max_hp, remaining_hp or "
+            f"absolute:<n> (n a whole number, 0 or more).")
+
+    def round_by_rule(self, value: Any) -> int:
+        """Round `value` (a number or a Fraction) to an int per the
+        rounding_mode rule. Floats are read as their decimal text, so a
+        computed 2.5 is exactly a half."""
+        from fractions import Fraction
+        import math as _m
+        if isinstance(value, Fraction):
+            v = value
+        elif isinstance(value, int):
+            return value
+        else:
+            v = Fraction(repr(float(value)))
+        mode = str(self.rules.get("rounding_mode", "half_up"))
+        if mode == "floor":
+            return _m.floor(v)
+        if mode == "ceil":
+            return _m.ceil(v)
+        if mode == "half_even":
+            return round(v)
+        # half_up: a half rounds away from zero.
+        return int(_m.floor(abs(v) + Fraction(1, 2))) * (1 if v >= 0 else -1)
 
     def damage_part(self, part_id: str, amount: int) -> Tuple[int, List[str]]:
         """Deal `amount` damage to body part `part_id`, routing the
@@ -11497,13 +12253,23 @@ class Match:
             raise NotFound(f"Entity '{part_id}' not found.")
         try:
             amount = int(amount)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise VTTError("damage_part: amount must be an integer.")
+        if amount < 0:
+            # A negative hit used to heal the part AND move to_main_percent
+            # of the heal to the main body. Heal with a plain hp write.
+            raise VTTError(f"damage_part `{part_id}`: amount can't be negative "
+                           f"(heal a part with an hp write: `entity[{part_id}]"
+                           f".hp = ...`).")
         hp_var, mhp_var, _ = p._vital_var_names()
         cur_hp = int(p.vars.get(hp_var, 0) or 0)
         max_hp = int(p.vars.get(mhp_var, 0) or 0)
-        pct = float(p.vars.get("to_main_percent",
-                              self.rules.get("part_to_main_percent_default", 0)) or 0)
+        raw_pct = p.vars.get("to_main_percent",
+                             self.rules.get("part_to_main_percent_default", 0)) or 0
+        pct = _coerce_number(raw_pct)
+        if pct is None:
+            raise VTTError(f"damage_part `{p.id}`: to_main_percent must be a "
+                           f"finite number, got {raw_pct!r}.")
         cap = str(p.vars.get("to_main_cap",
                             self.rules.get("part_to_main_cap_default", "max_hp")))
         log: List[str] = []
@@ -11511,23 +12277,30 @@ class Match:
         to_main = 0
         parent = self.entities.get(p.part_of) if p.part_of else None
         if parent is not None and pct != 0:
-            base = self._part_transfer_base(amount, cur_hp, max_hp, cap)
-            to_main = int(round(base * pct / 100.0))
+            try:
+                base = self._part_transfer_base(amount, cur_hp, max_hp, cap)
+            except VTTError as ex:
+                raise VTTError(f"damage_part `{p.id}`: {ex}")
+            from fractions import Fraction
+            to_main = self.round_by_rule(
+                Fraction(base) * Fraction(repr(float(pct))) / 100)
             if to_main != 0:
                 p_hp_var, _, _ = parent._vital_var_names()
-                parent.write_var(p_hp_var,
-                                 int(parent.vars.get(p_hp_var, 0) or 0) - to_main)
+                # Its log carries the parent's hp hooks and, on a lethal
+                # transfer, its death (both used to be dropped).
+                log += parent.write_var(
+                    p_hp_var,
+                    int(parent.vars.get(p_hp_var, 0) or 0) - to_main) or []
+        # The transfer can kill the parent, whose death removes its parts:
+        # this part is then gone with the corpse and takes no hit of its own.
+        if p.id not in self.entities:
+            return to_main, log
         # (3) write the part's own hp, floored at 0.
         new_hp = max(0, cur_hp - amount)
         if new_hp != cur_hp:
-            p.write_var(hp_var, new_hp)
-        # A heal that lifts a previously-destroyed part back above 0 clears
-        # the destroyed latch so it can break (and re-fire on_death) again,
-        # and RESUMES any aura suspended when it was destroyed (no-op unless
-        # anchored_zone_on_anchor_loss is 'suspend').
-        if new_hp > 0 and p.vars.get("__part_destroyed"):
-            p.vars.pop("__part_destroyed", None)
-            self._resume_anchored_zones(p.id)
+            log += p.write_var(hp_var, new_hp) or []
+            if p.id not in self.entities:
+                return to_main, log
         # (4) destruction.
         if new_hp <= 0 and (cur_hp - amount) <= 0 and not self.is_indestructible(p):
             log += self._process_part_death(p)
@@ -11563,11 +12336,11 @@ class Match:
             # whole-creature death cascade removed the parts and is_segment is
             # now false, so this is a no-op.
             if p.is_segment:
-                log += self._sever_segment(p)
+                log += self._sever_segment(p, died=True)
         return log
 
-    def _sever_segment(self, p: "Entity",
-                       mode: Optional[str] = None) -> List[str]:
+    def _sever_segment(self, p: "Entity", mode: Optional[str] = None,
+                       *, died: bool = False) -> List[str]:
         """Apply a destroyed segment's `segment_death_mode` (or `mode`, when
         despawn_entity passes the segment_removal_mode it resolved):
           cascade — destroy `p` and every segment BEHIND it (the back of the
@@ -11577,7 +12350,8 @@ class Match:
                     it, and stamp segment_split_head_template.
         `none` / `solid` do nothing extra (the segment just lingers as a dead
         limb). Resolution: the segment's `__segment_death_mode` var > the
-        head's > the rule."""
+        head's > the rule. `died` = `p` was destroyed (its on_death already
+        fired), so only the segments severed behind it count as despawned."""
         head_id = p.part_of
         head = self.entities.get(head_id)
         if head is None:
@@ -11596,7 +12370,8 @@ class Match:
             for s in [p] + behind:
                 self.log_event("segment_severed", entity=s.id,
                                mode="cascade", part_of=head_id)
-                s.remove()
+                if s.id in self.entities and s._match is self:
+                    log.extend(s.remove(despawn=not (died and s is p)))
             log.append(
                 f"`{head_id}` severed at `{p.id}`: "
                 f"{len(behind) + 1} segment(s) destroyed.")
@@ -11611,7 +12386,8 @@ class Match:
                     f"independent head trailing {len(behind) - 1} segment(s).")
             self.log_event("segment_severed", entity=p.id,
                            mode="split", part_of=head_id)
-            p.remove()
+            if p.id in self.entities and p._match is self:
+                log.extend(p.remove(despawn=not died))
             self._rebuild_turn_order()
         return log
 
@@ -11629,22 +12405,20 @@ class Match:
         (segment var > head var > rule): `close` splices the chain (what
         remove() does), `cascade`/`split` sever it like a death would, and
         `death` uses the segment's segment_death_mode (`none`/`solid` →
-        close). Returns log lines describing a sever."""
+        close). Returns log lines: a sever, plus any on_entity_despawned output."""
         head = self.entities.get(e.part_of) if e.part_of else None
         if head is None or not e.vars.get("__segment"):
-            e.remove()
-            return []
+            return e.remove()
         mode = str(e.vars.get("__segment_removal_mode")
                    or head.vars.get("__segment_removal_mode")
                    or self.rules.get("segment_removal_mode", "close"))
         if mode == "death":
             mode = self._segment_death_mode_of(e, head)
         if mode not in ("cascade", "split"):
-            e.remove()
-            return []
+            return e.remove()
         log = self._sever_segment(e, mode=mode)
         if e.id in self.entities and e._match is self:
-            e.remove()   # not in the head's chain: plain removal
+            log.extend(e.remove())   # not in the head's chain: plain removal
         return log
 
     def _promote_segment_to_head(self, seg: "Entity", old_head: "Entity") -> None:
@@ -11728,10 +12502,20 @@ class Match:
             raise NotFound(f"Entity '{target_id}' not found.")
         try:
             total = int(total)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise VTTError("damage_spread: total must be an integer.")
+        if total < 0:
+            # A negative total used to heal the parts AND move a share of
+            # the heal to the main body. Heal with a plain hp write.
+            raise VTTError("damage_spread: total can't be negative (heal with "
+                           "an hp write: `entity[x].hp = ...`).")
         mode = str(mode) if mode is not None else \
             str(self.rules.get("aoe_default_mode", "weighted"))
+        if mode not in ("weighted", "uniform", "fragment", "main_only"):
+            # An unknown mode used to split by weight without a word.
+            raise VTTError(
+                f"damage_spread: mode {mode!r} isn't weighted, uniform, "
+                f"fragment or main_only.")
 
         parts = self.entity_parts(target_id)
         if origin is not None and radius is not None:
@@ -11759,6 +12543,15 @@ class Match:
             n = int(fragments) if fragments is not None else \
                 int(self.rules.get("aoe_fragment_count", 4))
             n = max(1, n)
+            try:
+                loop_limit = int(self.rules.get("formula_loop_limit", 10000))
+            except (TypeError, ValueError):
+                loop_limit = 10000
+            if n > loop_limit:
+                # One random pick per fragment: 10**9 fragments hung the bot.
+                raise VTTError(
+                    f"damage_spread: {n} fragments is over the "
+                    f"formula_loop_limit of {loop_limit}.")
             weighted = [(p, self._part_aoe_weight(p)) for p in parts]
             wsum = sum(w for _p, w in weighted)
             rng = self.formula_rng()
@@ -11946,27 +12739,54 @@ class Match:
             # Restore the creature's body parts at the parent's cell. Each
             # snapshot carries its part_of (-> e.id) so it re-attaches; a
             # part already taking that id (somehow still alive) is skipped.
-            for pd in stored_parts:
-                pdc = copy.deepcopy(pd)
-                # A glued part respawns at the parent's cell; a LOCATED part
-                # keeps its own snapshotted position.
-                located = bool((pdc.get("vars") or {}).get("__part_located"))
-                px = int(pdc.get("x", x)) if located else x
-                py = int(pdc.get("y", y)) if located else y
-                pdc["x"] = px
-                pdc["y"] = py
-                pid = str(pdc.get("id", ""))
-                if not pid or pid in self._taken_entity_ids():
-                    continue
-                part_e = Entity.from_dict(pdc)
-                try:
-                    _, plog = part_e.spawn(self, px, py)
-                    spawn_log += plog
-                except VTTError:
-                    # A part that can't be placed (e.g. id clash or its cell
-                    # is now occupied) is skipped rather than aborting the
-                    # whole revive.
-                    pass
+            # Two phases, like transform / revert: every part that can return
+            # to its own cell does, then a LOCATED part whose stored cell is
+            # now taken (and the parts under it) goes to the nearest free
+            # cell, so it can't take a cell another part is stored at. It
+            # used to be dropped without a word.
+            deferred: set = set()
+            for relocate in (False, True):
+                for pd in stored_parts:
+                    pdc = copy.deepcopy(pd)
+                    pid = str(pdc.get("id", ""))
+                    if relocate != (pid in deferred):
+                        continue
+                    if not pid or pid in self._taken_entity_ids():
+                        continue   # an id clash: something else took the id
+                    if not relocate and pdc.get("part_of") in deferred:
+                        deferred.add(pid)   # waits for its own parent
+                        continue
+                    # A glued part respawns at its parent's cell; a LOCATED
+                    # part keeps its own snapshotted position.
+                    located = bool((pdc.get("vars") or {}).get("__part_located"))
+                    px = int(pdc.get("x", x)) if located else x
+                    py = int(pdc.get("y", y)) if located else y
+                    pdc["x"], pdc["y"] = px, py
+                    try:
+                        try:
+                            _, plog = Entity.from_dict(pdc).spawn(self, px, py)
+                        except VTTError as ex:
+                            if not located:
+                                raise
+                            if not relocate:
+                                deferred.add(pid)
+                                continue
+                            near = self._find_free_cell_near(
+                                px, py, max(self.grid_width, self.grid_height),
+                                e=Entity.from_dict(pdc))
+                            if near is None or near == (px, py):
+                                raise
+                            _, plog = Entity.from_dict(pdc).spawn(
+                                self, near[0], near[1])
+                            plog = [f"⚠️ part `{pid}` couldn't return to "
+                                    f"({px},{py}) ({ex}); placed at "
+                                    f"({near[0]},{near[1]})."] + list(plog)
+                        spawn_log += plog
+                    except VTTError as ex:
+                        # Skipped rather than aborting the whole revive.
+                        spawn_log.append(f"⚠️ part `{pid}` couldn't be "
+                                         f"restored ({ex}) — dropped.")
+            self._restamp_parts_for(e.id)
             # Run the revive-effects formula on the freshly-spawned entity
             # BEFORE on_revive so on_revive observers see the post-effect
             # state (matching on_death's "see settled state" contract).
@@ -12234,14 +13054,15 @@ class Match:
         old_team = e.vars.get(team_var)
         old_init = e.vars.get(turnorder_var)
         # Despawn current attached parts (children first). This is a despawn,
-        # not a death — no corpse, no on_death.
-        for p in reversed(self.entity_part_subtree(e.id)):
-            if p.id in self.entities:
-                p.remove()
+        # not a death — no corpse, no on_death; each part's
+        # on_entity_despawned fires.
         # Swap the presented fields. Death checks are suppressed across the
         # swap window: an intermediate var state (e.g. new max_hp before hp is
         # set) could momentarily satisfy the death condition.
-        new_vars = copy.deepcopy(sb.get("vars") or {})
+        sb_vars = sb.get("vars")
+        new_vars = copy.deepcopy(sb_vars if sb_vars is not None else {})
+        if not isinstance(new_vars, dict):
+            raise VTTError("transform: the statblock's vars must be a dict.")
         new_max = new_vars.get(max_hp_var)
         target_hp = new_vars.get(hp_var)
         try:
@@ -12249,7 +13070,14 @@ class Match:
                     and old_max not in (None, 0)):
                 frac = float(old_hp) / float(old_max)
                 scaled = new_max * frac
-                target_hp = int(round(scaled)) if isinstance(new_max, int) else scaled
+                if isinstance(new_max, int):
+                    from fractions import Fraction
+                    target_hp = self.round_by_rule(
+                        Fraction(int(old_hp)) / Fraction(int(old_max)) * new_max
+                        if isinstance(old_hp, int) and isinstance(old_max, int)
+                        else scaled)
+                else:
+                    target_hp = scaled
             elif (hp_mode == "keep" and isinstance(new_max, (int, float))
                   and old_hp is not None):
                 target_hp = min(float(old_hp), float(new_max))
@@ -12275,8 +13103,60 @@ class Match:
             new_vars.pop(k, None)
             if k in e.vars:
                 new_vars[k] = copy.deepcopy(e.vars[k])
+        # Checked BEFORE the old parts go, so a bad statblock changes nothing.
+        new_vars = checked_unit_vars(new_vars, (hp_var, max_hp_var, turnorder_var),
+                                     "transform")
+        if hp_var not in new_vars:
+            raise VTTError(f"transform: the new form has no `{hp_var}`.")
+        # The new body must fit where the unit stands (its own parts, which
+        # the transform replaces, don't count).
+        self.check_body_fits(
+            e, new_vars, "transform",
+            extra_ignore=tuple(p.id for p in self.entity_part_subtree(e.id)
+                               if p.id != e.id))
+        # A mounted rider's new form must still suit its seat: the slot's
+        # `condition` and its share of the capacity are re-checked against
+        # the new vars. transform_rider_mismatch_mode decides a misfit, as it
+        # does for a vehicle's riders: block refuses here, before any
+        # change; eject picks the drop cell for the NEW body now and
+        # dismounts the rider right after the swap.
+        eject_to: Optional[Tuple[int, int]] = None
+        eject_note = ""
+        veh = self.entities.get(e.mounted_on) if e.mounted_on else None
+        if veh is not None:
+            saved_vars = e.vars
+            e.vars = new_vars
+            try:
+                ok, why = self.can_mount(e.id, veh.id, e.mount_slot)
+                if not ok and str(self.rules.get(
+                        "transform_rider_mismatch_mode", "block")) == "eject":
+                    eject_to = self._find_dismount_cell(e, veh)
+                    if eject_to is None:
+                        raise VTTError(
+                            f"transform: the new form can't stay in slot "
+                            f"'{e.mount_slot}' of `{veh.id}` ({why}) and has "
+                            f"no free cell to dismount to.")
+                    eject_note = (f"`{e.id}`'s new form doesn't fit slot "
+                                  f"'{e.mount_slot}' of `{veh.id}` ({why}); "
+                                  f"it dismounts to {eject_to}.")
+            finally:
+                e.vars = saved_vars
+            if not ok and eject_to is None:
+                raise VTTError(
+                    f"transform: the new form can't stay in slot "
+                    f"'{e.mount_slot}' of `{veh.id}`: {why} Dismount first "
+                    f"(or set transform_rider_mismatch_mode=eject).")
+        drop_log: List[str] = []
+        for p in reversed(self.entity_part_subtree(e.id)):
+            if p.id in self.entities:
+                drop_log.extend(p.remove())
+        if e._match is not self or e.id not in self.entities:
+            # A despawn handler removed the unit itself: nothing to swap.
+            return drop_log + [
+                f"`{e.id}` was removed while its old parts despawned; "
+                f"the transform stopped."]
         self._death_check_suppressed_ids.add(e.id)
-        log: List[str] = []
+        log: List[str] = list(drop_log)
         try:
             e.vars = new_vars
             e.name = sb.get("name", e.name)
@@ -12286,6 +13166,9 @@ class Match:
                         for path, cd in (sb.get("clamps") or {}).items()}
             e.status = copy.deepcopy(sb.get("status") or {})
             # facing is identity — preserved (not taken from the statblock).
+            if eject_to is not None:
+                log.append(eject_note)
+                log += self.dismount_entity(e.id, *eject_to)
             self._turn_order_dirty = True
             self._rebuild_turn_order()
             self._restamp_anchors_for(e.id)
@@ -13136,7 +14019,9 @@ class Match:
             "border_show": self.border_show,
             "border_color": self.border_color,
             "border_opacity": self.border_opacity,
+            "map_coords": self.map_coords,
             "render_mode": self.render_mode,
+            "paused": copy.deepcopy(self.paused),
         }
         if include_history:
             d["history"] = self.history.to_dict()
@@ -13150,7 +14035,13 @@ class Match:
             grid_width=d["grid_width"],
             grid_height=d["grid_height"],
             system_name=d.get("system_name", "default"),
-            rules=d.get("rules", {}),
+            # Every rule present: a snapshot or save written before a rule
+            # existed lacks its key, and the scattered rules.get(key, x)
+            # fallbacks don't all match the registry default (border_opacity
+            # 100 vs 50, background_mode stretch vs tile, an empty
+            # default_clamps, ...). The engine defaults fill the gaps.
+            rules={**copy.deepcopy(DEFAULT_SYSTEM_SETTINGS),
+                   **copy.deepcopy(d.get("rules") or {})},
         )
         for eid, ed in d.get("entities", {}).items():
             e = Entity.from_dict(ed)
@@ -13354,6 +14245,8 @@ class Match:
         m.background = copy.deepcopy(raw_bg) if isinstance(raw_bg, dict) else None
         bs = d.get("border_show")
         m.border_show = bool(bs) if isinstance(bs, bool) else None
+        mc = d.get("map_coords")
+        m.map_coords = mc if isinstance(mc, bool) else None
         bcol = d.get("border_color")
         m.border_color = bcol if isinstance(bcol, str) and bcol else None
         bop = d.get("border_opacity")
@@ -13361,6 +14254,8 @@ class Match:
             and not isinstance(bop, bool) else None
         rm = d.get("render_mode")
         m.render_mode = rm if rm in ("text", "image") else "text"
+        pz = d.get("paused")
+        m.paused = copy.deepcopy(pz) if isinstance(pz, dict) else None
         # History is optional in saved dicts. It's only present when the
         # original save was made with include_history=True. A snapshot's
         # state.dict deliberately omits history (snapshots-within-
@@ -13844,7 +14739,8 @@ class Match:
                      viewport: Optional[Tuple[int, int, int, int]] = None,
                      legend: bool = False,
                      marks: Optional["set[Tuple[int, int]]"] = None,
-                     mark_glyph: str = "*") -> str:
+                     mark_glyph: str = "*",
+                     coords: Optional[bool] = None) -> str:
         """Render the ASCII map. Thin wrapper that activates the read-only
         _fog_team_sees memo for the duration of the render, so the per-cell,
         per-layer fog scan doesn't recompute the same team-sight (each
@@ -13856,15 +14752,20 @@ class Match:
         suppresses render layers by name: zones / tiles / entities / fog.
 
         `marks` (a set of (x, y) cells, used by `!map preview`) paints
-        `mark_glyph` on each of those cells that isn't showing a unit."""
+        `mark_glyph` on each of those cells that isn't showing a unit.
+
+        `coords` (None = coords_on()) adds the coordinate rulers."""
         hidden = self.hidden_layers if hidden_layers is None else hidden_layers
+        if coords is None:
+            coords = self.coords_on()
         prev = self._vision_memo
         if prev is None:
             self._vision_memo = {}
         try:
             return self._render_ascii_impl(pov_team, colorize, hidden,
                                            viewport=viewport, legend=legend,
-                                           marks=marks, mark_glyph=mark_glyph)
+                                           marks=marks, mark_glyph=mark_glyph,
+                                           coords=coords)
         finally:
             self._vision_memo = prev
 
@@ -13874,7 +14775,8 @@ class Match:
                            viewport: Optional[Tuple[int, int, int, int]] = None,
                            legend: bool = False,
                            marks: Optional["set[Tuple[int, int]]"] = None,
-                           mark_glyph: str = "*") -> str:
+                           mark_glyph: str = "*",
+                           coords: bool = False) -> str:
         # `pov_team` filters EVERY layer through its visibility rule: a
         # zone / tile / entity hidden from that team isn't painted (its
         # cell falls back to whatever layer is visible underneath, so the
@@ -14095,6 +14997,8 @@ class Match:
             if active:
                 parts.append("\x1b[0m")
             lines.append("".join(parts))
+        if coords and x1 >= x0 and y1 >= y0:
+            lines = self._ascii_rulers(lines, x0, x1, y0, y1)
         out = "\n".join(lines)
 
         # Auto-legend: glyph -> meanings, collected from the cells actually
@@ -14126,6 +15030,24 @@ class Match:
     # _render_ascii_impl (a parallel method, by design, to avoid risking the
     # heavily-used ASCII path; both reuse the same predicate + resolver
     # helpers, so only the loop skeleton is duplicated).
+    @staticmethod
+    def _ascii_rulers(lines: List[str], x0: int, x1: int,
+                      y0: int, y1: int) -> List[str]:
+        """`lines` (one per map row y0..y1, cells x0..x1 one character each
+        with a space between) with coordinate rulers: a header of column
+        numbers whose digits are stacked top to bottom, so column 12 reads
+        1 over 2 and every number fits its one-character column, and the
+        row numbers right-aligned in a left margin. Coordinates are 1-based,
+        as every command takes them."""
+        margin = len(str(y1))
+        depth = len(str(x1))
+        header = []
+        for d in range(depth):
+            digits = [str(xx).rjust(depth)[d] for xx in range(x0, x1 + 1)]
+            header.append((" " * (margin + 1) + " ".join(digits)).rstrip())
+        rows = [f"{y:>{margin}} {line}" for y, line in zip(range(y0, y1 + 1), lines)]
+        return header + rows
+
     def render_scene(self, pov_team: Optional[str] = None,
                      hidden_layers: Optional["set[str]"] = None,
                      viewport: Optional[Tuple[int, int, int, int]] = None
@@ -14186,6 +15108,13 @@ class Match:
                 "tint": ov["tint"], "opacity": ov["opacity"],
                 "flip_h": False, "flip_v": False, "layer": ov["layer"],
             })
+
+    def coords_on(self) -> bool:
+        """Whether maps carry coordinate rulers: this match's override, else
+        the map_coords rule."""
+        if self.map_coords is not None:
+            return bool(self.map_coords)
+        return bool(self.rules.get("map_coords", True))
 
     def _scene_borders(self) -> Dict[str, Any]:
         """Border (grid-line) config for the scene: the show_borders /
@@ -14353,7 +15282,62 @@ class Match:
             "viewport": vp, "background": self.background_layer(),
             "placements": placements, "fog": fog,
             "borders": self._scene_borders(),
+            "coords": self.coords_on(),
         }
+
+    # ---- facing writes ----
+    # The one place that turns a unit (outside movement, which faces each
+    # step as it walks): `!ent face` and the set_facing / face_toward formula
+    # functions go through set_entity_facing, so the allow_diagonal_facing
+    # gate and the rider re-seat can't drift apart.
+    _FACING_CW = {"cw", "clockwise", "right_turn", "turn_right"}
+    _FACING_CCW = {"ccw", "counterclockwise", "anticlockwise",
+                   "left_turn", "turn_left"}
+
+    def set_entity_facing(self, e: "Entity", raw: Any) -> Direction:
+        """Turn `e` to the direction `raw` names (any normalize_direction
+        alias) or rotate it one step with cw/ccw. Raises VTTError on an
+        unknown direction, or a diagonal while allow_diagonal_facing is off.
+        Riders in a facing-relative slot region are re-seated, since the
+        region turns with the vehicle. Returns the new facing."""
+        tok = str(raw).strip().lower() if isinstance(raw, str) else ""
+        eight_way = bool(self.rules.get("allow_diagonal_facing", False))
+        if tok in self._FACING_CW or tok in self._FACING_CCW:
+            canon = rotate_direction(e.facing, clockwise=tok in self._FACING_CW,
+                                     eight_way=eight_way)
+        else:
+            canon = normalize_direction(tok)
+            if canon is None:
+                raise VTTError(
+                    f"Unknown direction '{raw}'. Use up/down/left/right (or "
+                    "up_left/up_right/down_left/down_right when "
+                    "allow_diagonal_facing is enabled), or cw/ccw to rotate.")
+            if canon in DIAGONAL_DIRECTIONS and not eight_way:
+                raise VTTError(
+                    f"Diagonal facing '{raw}' is not allowed by the active "
+                    "game system. Enable rule 'allow_diagonal_facing' to "
+                    "permit it.")
+        e.facing = canon
+        self._restamp_riders_for(e.id)
+        return canon
+
+    def facing_toward(self, e: "Entity", tx: float, ty: float) -> Optional[Direction]:
+        """The direction from the centre of `e`'s body to the point (tx, ty):
+        the nearest of the 8 directions to the true bearing, or the dominant
+        axis (ties go vertical, like direction_to) when allow_diagonal_facing
+        is off. None when the point is the body's own centre."""
+        w, h = self.entity_footprint(e)
+        dx = tx - (e.x + (w - 1) / 2)
+        dy = ty - (e.y + (h - 1) / 2)
+        if dx == 0 and dy == 0:
+            return None
+        if not bool(self.rules.get("allow_diagonal_facing", False)):
+            if abs(dx) > abs(dy):
+                return "right" if dx > 0 else "left"
+            return "down" if dy > 0 else "up"
+        # Screen bearing: 0 = up, clockwise. Sector k covers k*45 ± 22.5.
+        bearing = math.degrees(math.atan2(dx, -dy)) % 360
+        return DIRECTION_CW_ORDER_8[int((bearing + 22.5) // 45) % 8]
 
     def _spawn_facing(self, x: int, y: int) -> Direction:
         eight_way = bool(self.rules.get("allow_diagonal_facing", False))
@@ -14618,6 +15602,40 @@ class Match:
         total_steps = sum(max(1, int(n)) for _, n in moves)
         return len(members), total_steps, log
 
+    def surface_log(self, lines: Optional[List[str]]) -> None:
+        """Pass on the log of a change a FORMULA made (summon, kill, a var
+        write, ...): the Match methods return their hook output and warnings,
+        which only commands used to show. Inside an action the lines join its
+        output buffer (shown when it succeeds, dropped when it rolls back);
+        otherwise they go to the running command's FORMULA_LOG_SINK, which it
+        shows. With neither (no command running) they are dropped."""
+        lines = [str(ln) for ln in (lines or []) if ln]
+        if not lines:
+            return
+        buf = self._runtime_buffer
+        if buf is not None:
+            buf.out.extend(lines)
+            return
+        sink = FORMULA_LOG_SINK.get()
+        if sink is not None:
+            sink.extend(lines)
+
+    def roster_shows(self, e: "Entity") -> bool:
+        """Whether `e` gets a row in the `!list` / `!state` roster. Only body
+        parts can be left out: a part's `__roster_show` var decides, else a
+        glued part without its own turn-order slot follows the
+        roster_glued_parts rule; every other part is listed."""
+        if not e.is_part:
+            return True
+        ov = e.vars.get("__roster_show")
+        if isinstance(ov, str):
+            ov = ov.strip().lower() in ("true", "yes", "on", "1")
+        if ov is not None:
+            return bool(ov)
+        if e.is_glued_part and e.id not in self.turn_order:
+            return bool(self.rules.get("roster_glued_parts", False))
+        return True
+
     def entities_in_turn_order(self) -> List["Entity"]:
         # Returns Entity objects in current turn order; appends any missing at the end
         ordered = []
@@ -14634,17 +15652,35 @@ class Match:
 # -------------------------
 # Match Manager (multi-match, now stores GameSystems and defaults))
 # -------------------------
+# The workspace key of a single-operator surface (CLI / GUI / scenario
+# harness). A Discord server's workspace is keyed by its guild id.
+LOCAL_WORKSPACE = "local"
+
+
 class MatchManager:
-    def __init__(self):
+    """One WORKSPACE: the game systems, matches, channel pointers and save
+    folder of one Discord server (or of the local CLI / GUI). Each server
+    gets its own (see Workspaces), so nothing here is shared between
+    servers: a match id, a system name or a save file name only means
+    something inside its own workspace."""
+
+    def __init__(self, guild_key: str = LOCAL_WORKSPACE):
+        self.guild_key: str = str(guild_key)
+        # A display name for the workspace (the Discord server's name; the
+        # adapter refreshes it on each command). Runtime-only.
+        self.guild_name: str = self.guild_key
+        # The Workspaces registry holding this manager (None when built
+        # alone, e.g. by a test). Lets bot-owner commands see every server.
+        self.workspaces: Optional["Workspaces"] = None
         self.matches: Dict[str, Match] = {}
         # optional: track per-channel active match
         self.active_by_channel: Dict[str, str] = {}
-        # GameSystems
+        # GameSystems. Every workspace starts with its own `default`, built
+        # from the engine defaults in RULES_REGISTRY.
         self.systems: Dict[str, GameSystem] = {
             "default": GameSystem("default", settings={})
         }
         self.default_system_name: str = "default"
-        self.default_system_per_server: Dict[str, str] = {}
         self.default_system_per_channel: Dict[str, str] = {}
 
     # ----- game systems -----
@@ -14666,12 +15702,12 @@ class MatchManager:
         broken state:
           - the system must exist
           - at least one system must remain afterward (there's always a
-            global default to fall back to)
-          - it must not be the global default (reassign that first)
+            server default to fall back to)
+          - it must not be the server default (reassign that first)
           - no live match may still be bound to it (rebind or delete
             those matches first)
-        Per-server / per-channel default pointers AT this system are
-        scrubbed (they fall back to the global default automatically via
+        Per-channel default pointers AT this system are scrubbed (they fall
+        back to the server default automatically via
         effective_system_name)."""
         if name not in self.systems:
             raise NotFound(f"GameSystem '{name}' not found.")
@@ -14682,9 +15718,9 @@ class MatchManager:
             )
         if name == self.default_system_name:
             raise VTTError(
-                f"'{name}' is the global default GameSystem. Set a "
-                f"different global default first "
-                f"(!system default global <other>)."
+                f"'{name}' is this server's default GameSystem. Set a "
+                f"different default first "
+                f"(!system default server <other>)."
             )
         bound = [mid for mid, m in self.matches.items() if m.system_name == name]
         if bound:
@@ -14696,34 +15732,23 @@ class MatchManager:
                 f"matches first."
             )
         del self.systems[name]
-        # Scrub server/channel default pointers that referenced it; they
-        # fall back to the global default via effective_system_name.
-        self.default_system_per_server = {
-            k: v for k, v in self.default_system_per_server.items() if v != name
-        }
+        # Scrub channel default pointers that referenced it; they fall back
+        # to the server default via effective_system_name.
         self.default_system_per_channel = {
             k: v for k, v in self.default_system_per_channel.items() if v != name
         }
 
-    def set_global_default_system(self, name: str):
+    def set_default_system(self, name: str):
         self.get_system(name)
         self.default_system_name = name
-
-    def set_server_default_system(self, server_id: str, name: str):
-        self.get_system(name)
-        self.default_system_per_server[server_id] = name
 
     def set_channel_default_system(self, channel_key: str, name: str):
         self.get_system(name)
         self.default_system_per_channel[channel_key] = name
 
     def effective_system_name(self, channel_key: str) -> str:
-        # channel_key is typically "<server_id>:<channel_id>"
-        server_id = channel_key.split(":", 1)[0] if ":" in channel_key else channel_key
         return self.default_system_per_channel.get(
-            channel_key,
-            self.default_system_per_server.get(server_id, self.default_system_name)
-        )
+            channel_key, self.default_system_name)
 
     def effective_system(self, channel_key: str) -> GameSystem:
         return self.get_system(self.effective_system_name(channel_key))
@@ -14790,7 +15815,10 @@ class MatchManager:
                     *, move: bool = False) -> Tuple[str, List[str]]:
         """Copy (move=False) or MOVE (move=True) an entity — with its vars,
         statuses, passives, clamps, facing, and its whole body-part subtree —
-        from one live match to another. Returns (new_id, spawn_log).
+        from one live match to another. Returns (new_id, spawn_log); new_id
+        is None when a transferred unit died on the way out (an
+        on_entity_despawned handler killed it), in which case the
+        destination is left as it was.
 
         Placement defaults to the entity's current cell; pass x/y to override.
         Parts ride along: glued/region parts are re-stamped onto the new
@@ -14836,6 +15864,36 @@ class MatchManager:
         tx = e.x if x is None else int(x)
         ty = e.y if y is None else int(y)
         log: List[str] = []
+        # The destination is restored exactly if the transfer can't finish:
+        # a part that can't be placed used to leave the parts spawned before
+        # it behind (a partial duplicate), and a unit killed by its own
+        # on_entity_despawned handler as it left lived on in the destination
+        # beside its corpse in the source.
+        from action import _rollback_match
+        pre_dest = dest.to_dict(include_history=False)
+        try:
+            self._spawn_copies(src, dest, e, order, idmap, tx, ty, log)
+        except Exception:
+            _rollback_match(dest, self, pre_dest)
+            raise
+        if move:
+            before = src.find_corpse(eid)
+            for oid in reversed(order):  # children first
+                if oid in src.entities:
+                    log.extend(src.entities[oid].remove())
+            after = src.find_corpse(eid)
+            if after is not None and (before is None or after[2] is not before[2]):
+                _rollback_match(dest, self, pre_dest)
+                log.append(f"💀 `{eid}` died as it left **{src.name}**; "
+                           f"it was not transferred.")
+                return None, log
+        return idmap[eid], log
+
+    def _spawn_copies(self, src: "Match", dest: "Match", e: "Entity",
+                      order: List[str], idmap: Dict[str, str],
+                      tx: int, ty: int, log: List[str]) -> None:
+        """copy_entity's spawn pass: each unit of the body (parents first)
+        into `dest`, anchored at (tx, ty)."""
         for oid in order:
             oe = src.entities[oid]
             ne = Entity.from_dict(oe.to_dict())
@@ -14867,18 +15925,13 @@ class MatchManager:
             # transferred path-mode snake re-lays at its new location, not the
             # source's (same delta the anchor moves by).
             Match._shift_snake_path_vars(ne.vars, tx - e.x, ty - e.y)
-            if oid == eid or not oe.is_located_part:
+            if oid == e.id or not oe.is_located_part:
                 px, py = tx, ty
             else:  # a located part keeps its offset from the anchor
                 px, py = tx + (oe.x - e.x), ty + (oe.y - e.y)
             _, slog = ne.spawn(dest, px, py)
             log.extend(slog)
-        dest._restamp_parts_for(idmap[eid])
-        if move:
-            for oid in reversed(order):  # children first
-                if oid in src.entities:
-                    src.entities[oid].remove()
-        return idmap[eid], log
+        dest._restamp_parts_for(idmap[e.id])
 
     def refresh_match_rules(self, system_name: str) -> int:
         """Re-snapshot rules onto every match bound to `system_name`. Returns count refreshed.
@@ -14904,7 +15957,8 @@ class MatchManager:
         source hosts the copy; co-hosts and per-match access overrides are
         copied. Channel state
         starts empty — no bound channels, no per-channel camera, no pending
-        requests — and the undo history starts fresh. The source match is
+        requests — the copy is never paused, and the undo history starts
+        fresh. The source match is
         untouched and stays active wherever it was."""
         src = self.get(src_id)
         if new_id in self.matches:
@@ -14924,6 +15978,8 @@ class MatchManager:
         m.bound_channels = {}
         m.channel_views = {}
         m.pending_requests = {}
+        # A pause belongs to the table that paused it; the copy starts live.
+        m.paused = None
         self.matches[m.id] = m
         return m
 
@@ -14970,15 +16026,9 @@ class MatchManager:
             "active_by_channel": self.active_by_channel,
             "systems": {name: s.to_dict() for name, s in self.systems.items()},
             "default_system_name": self.default_system_name,
-            "default_system_per_server": self.default_system_per_server,
             "default_system_per_channel": self.default_system_per_channel,
         }
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-        except (OSError, TypeError) as e:
-            # OSError: permission / dir missing; TypeError: unserializable data (shouldn't happen)
-            raise VTTError(f"Failed to save to '{path}': {e}")
+        write_json_file(path, data)
     
     def load(self, path: str):
         try:
@@ -14988,24 +16038,76 @@ class MatchManager:
             raise VTTError(f"File not found: '{path}'")
         except (OSError, json.JSONDecodeError) as e:
             raise VTTError(f"Failed to load from '{path}': {e}")
+        # Everything is built into locals and committed only once the whole
+        # file has parsed: a file that failed partway used to leave the bot
+        # with the new matches but the old systems (and the old matches
+        # gone) while reporting the error.
         try:
-            self.matches = {mid: Match.from_dict(md) for mid, md in data.get("matches", {}).items()}
-            self.active_by_channel = data.get("active_by_channel", {})
-            self.systems = {
+            matches = {mid: Match.from_dict(md)
+                       for mid, md in data.get("matches", {}).items()}
+            active_by_channel = dict(data.get("active_by_channel", {}))
+            if not isinstance(data, dict) or "systems" not in data:
+                raise VTTError(
+                    "it isn't a full bot save (no game systems) — a "
+                    "`!history export` snapshot loads with `!history import`")
+            systems = {
                 name: GameSystem.from_dict(sd)
                 for name, sd in data["systems"].items()
             }
-            self.default_system_name = data.get("default_system_name", "default")
-            self.default_system_per_server = data.get("default_system_per_server", {})
-            self.default_system_per_channel = data.get("default_system_per_channel", {})
+            default_name = data.get("default_system_name", "default")
+            if default_name not in systems:
+                raise VTTError(
+                    f"its default system '{default_name}' isn't among its "
+                    f"systems ({', '.join(sorted(systems)) or 'none'})")
+            per_channel = dict(data.get("default_system_per_channel", {}))
             # Re-snapshot each match's rules dict from its bound system so
             # mid-write rule edits since the save took effect when reloaded.
-            for m in self.matches.values():
-                if m.system_name not in self.systems:
-                    m.system_name = self.default_system_name
-                m.rules = self._build_rules_dict(self.systems[m.system_name])
+            for m in matches.values():
+                if m.system_name not in systems:
+                    m.system_name = default_name
+                m.rules = self._build_rules_dict(systems[m.system_name])
                 for e in m.entities.values():
                     e.bind(m, set_spawn_facing=False)
+            # A channel pointing at a match the file doesn't have would
+            # make every command there fail on a missing match.
+            active_by_channel = {ch: mid for ch, mid in active_by_channel.items()
+                                 if mid in matches}
         except Exception as e:
             # Defensive: any schema mismatch should be surfaced as a friendly VTTError
             raise VTTError(f"Invalid save file format in '{path}': {e}")
+        self.matches = matches
+        self.active_by_channel = active_by_channel
+        self.systems = systems
+        self.default_system_name = default_name
+        self.default_system_per_channel = per_channel
+
+
+class Workspaces:
+    """Every server's workspace, one MatchManager each, created on first
+    use (a fresh `default` system, no matches). The Discord adapter routes
+    each command to the manager of the server it came from, so systems,
+    matches, channel pointers, saves and the command lock are all per
+    server; the local surfaces (CLI / GUI / harness) use LOCAL_WORKSPACE.
+
+    `owner_ids` holds the bot owner's user ids (the Discord application's
+    owner or team members, read at startup) for the bot-owner commands."""
+
+    def __init__(self):
+        self._by_key: Dict[str, MatchManager] = {}
+        self.owner_ids: Set[str] = set()
+
+    def get(self, guild_key: Any) -> MatchManager:
+        key = str(guild_key)
+        mgr = self._by_key.get(key)
+        if mgr is None:
+            mgr = MatchManager(key)
+            mgr.workspaces = self
+            self._by_key[key] = mgr
+        return mgr
+
+    def peek(self, guild_key: Any) -> Optional[MatchManager]:
+        """The workspace if it exists, without creating it."""
+        return self._by_key.get(str(guild_key))
+
+    def items(self) -> List[Tuple[str, MatchManager]]:
+        return sorted(self._by_key.items())

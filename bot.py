@@ -1,7 +1,7 @@
 import os
 import discord
 from discord.ext import commands
-from logic import MatchManager
+from logic import Workspaces
 from discord_commands import wire_commands
 
 # --- Token loading ---
@@ -36,13 +36,19 @@ TOKEN = load_token()
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
-_mgr = MatchManager()
+# Replies echo text users and GMs typed (unit names, bad arguments, command
+# names), so a reply could carry @everyone, a role or a <@user> mention and
+# ping the server. The bot's messages never mean to ping anyone.
+bot = commands.Bot(command_prefix="!", intents=intents,
+                   allowed_mentions=discord.AllowedMentions.none())
+# One workspace per Discord server (systems, matches, saves), created on the
+# server's first command.
+_workspaces = Workspaces()
 
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
 
-wire_commands(bot, _mgr)
+wire_commands(bot, _workspaces)
 
 bot.run(TOKEN)

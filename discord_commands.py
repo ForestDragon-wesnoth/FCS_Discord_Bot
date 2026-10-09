@@ -4,7 +4,8 @@
 from typing import Any, List, Dict, Optional, Tuple
 import discord
 from discord.ext import commands
-from logic import MatchManager
+from logic import MatchManager, Workspaces
+import vtt_commands
 from vtt_commands import registry, run_approved_request
 import shlex
 
@@ -165,10 +166,24 @@ async def _parse_and_run_single_line(ctx, line: str, mgr, known_roots) -> bool:
 
 def _is_guild_admin(user) -> bool:
     """True iff `user` is a guild Member holding the Administrator
-    permission. In DMs the author is a plain User with no guild permissions,
-    so bot-wide commands are refused there."""
+    permission (server-wide commands, see vtt_commands.ctx_is_admin)."""
     perms = getattr(user, "guild_permissions", None)
     return bool(getattr(perms, "administrator", False))
+
+
+def _is_bot_owner(user, mgr) -> bool:
+    """True iff `user` is among the bot owner ids read at startup (the
+    Discord application's owner, or its team's members)."""
+    owners = getattr(getattr(mgr, "workspaces", None), "owner_ids", None) or ()
+    return str(getattr(user, "id", "")) in owners
+
+
+# Every server has its own workspace (systems, matches, saves); a DM has no
+# server to hold one, so commands there are refused with this reply.
+DM_REFUSAL = ("❌ This bot only works in servers: each server keeps its own "
+              "game systems, matches and saves. To play alone, create a "
+              "server just for yourself (it takes a few seconds) and invite "
+              "the bot there.")
 
 
 class DiscordCtxWrapper:
@@ -178,6 +193,9 @@ class DiscordCtxWrapper:
     # Discord messages are narrow, so the map viewport engages in 'auto'
     # mode on large maps (pan with `!map pan` / the arrow buttons).
     viewport_capable = True
+    # Discord's message cap; the map reply drops its coordinate rulers rather
+    # than split a map across two messages.
+    message_limit = DISCORD_MAX_CONTENT
 
     def __init__(self, ctx, mgr=None):
         self._ctx = ctx
@@ -196,9 +214,10 @@ class DiscordCtxWrapper:
         # Real Discord authors are fixed — identity can't be reassigned
         # mid-session the way the CLI's stand-in can.
         self.cli_mutable = False
-        # Bot-wide commands (!system edits, !store, !run, ...) need the
+        # Server-wide commands (!system edits, !store, !run, ...) need the
         # guild Administrator permission — see vtt_commands.ctx_is_admin.
         self.is_admin = _is_guild_admin(author)
+        self.is_bot_owner = _is_bot_owner(author, mgr)
     async def send(self, message: str):
         # Split over-long output at line boundaries so we never trip
         # Discord's content-length cap (see _split_for_discord). Discord also
@@ -239,7 +258,8 @@ class DiscordCtxWrapper:
                     else await self._ctx.send(text)
             except Exception:
                 msg = await self._ctx.send(text)
-        _boards[self.channel_key] = {"message": msg, "match_id": m.id}
+        _boards[self.channel_key] = {"message": msg, "match_id": m.id,
+                                     "workspace": getattr(self._mgr, "guild_key", None)}
         kind = "image" if getattr(m, "render_mode", "text") == "image" else "map"
         return (f"🗺️ Auto-update {kind} board ON — this message refreshes on "
                 "every change" + (" (use the arrows to pan)." if engaged else "."))
@@ -298,6 +318,24 @@ class DiscordCtxWrapper:
             )
 
 
+    async def offer_resume(self, m, entry: dict):
+        """A host's command held on a paused match (pause_affects_hosts):
+        ask to unpause, with Resume & run / Cancel buttons. Called by the
+        dispatcher (CommandRegistry._hold_command)."""
+        cmd = "!" + entry["name"] + (" " + " ".join(entry["args"]) if entry["args"] else "")
+        n = len(m.held_commands)
+        text = (f"⏸ **{m.name}** is paused — `{cmd}` is held"
+                + (f" ({n} commands waiting)" if n > 1 else "")
+                + ". Resume the match to run it?")
+        try:
+            view = _ResumeView(m.id, entry, self._mgr)
+            view.message = await self._ctx.send(text, view=view)
+        except Exception:
+            await self._ctx.send(
+                text + " `!match resume` runs it; `!match resume drop` "
+                       "discards held commands.")
+
+
 class _InteractionCtx:
     """ReplyContext built from a button-click interaction, so an approved
     command runs with the CLICKER's identity (a host) against the
@@ -306,12 +344,13 @@ class _InteractionCtx:
     supports_color = True
     viewport_capable = True
 
-    def __init__(self, interaction):
+    def __init__(self, interaction, mgr=None):
         guild = getattr(interaction, "guild", None)
         gid = getattr(guild, "id", "DM")
         self.channel_key = f"{gid}:{interaction.channel_id}"
         user = interaction.user
         self.is_admin = _is_guild_admin(user)
+        self.is_bot_owner = _is_bot_owner(user, mgr)
         self.user_id = str(getattr(user, "id", "")) or "unknown"
         self.user_name = (
             getattr(user, "display_name", None)
@@ -387,7 +426,7 @@ class _ApprovalView(discord.ui.View):
 
     async def _require_host(self, interaction) -> bool:
         m = self._match()
-        ictx = _InteractionCtx(interaction)
+        ictx = _InteractionCtx(interaction, self._mgr)
         if m is None or not m.is_host(ictx.user_id):
             await interaction.response.send_message(
                 "❌ Only a host can resolve this request.", ephemeral=True
@@ -407,7 +446,7 @@ class _ApprovalView(discord.ui.View):
             )
             return self._finish()
         await interaction.response.defer()
-        ictx = _InteractionCtx(interaction)
+        ictx = _InteractionCtx(interaction, self._mgr)
         cmd = "!" + req["name"] + (" " + " ".join(req["args"]) if req["args"] else "")
         await ictx.send(
             f"✅ {ictx.user_name} approved `{cmd}` (by {req['user_name']})."
@@ -453,6 +492,97 @@ class _ApprovalView(discord.ui.View):
     def _finish(self):
         self.stop()
 
+class _ResumeView(discord.ui.View):
+    """Resume & run / Cancel for one command held on a paused match.
+    Resume & run = `!match resume` from the clicker (a host): it unpauses
+    and runs EVERY held command in order, this one included. Cancel drops
+    only this held command and leaves the match paused."""
+
+    def __init__(self, match_id: str, entry: dict, mgr, timeout: float = 600.0):
+        super().__init__(timeout=timeout)
+        self._mid = match_id
+        self._entry = entry
+        self._mgr = mgr
+        self.message = None
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content=(self.message.content or "")
+                + "\n⌛ Buttons expired — use `!match resume` (or `!match "
+                  "resume drop`).",
+                view=self)
+        except Exception:
+            pass
+
+    def _match(self):
+        return self._mgr.matches.get(self._mid) if self._mgr else None
+
+    async def _require_host(self, interaction) -> bool:
+        m = self._match()
+        ictx = _InteractionCtx(interaction, self._mgr)
+        if m is None or (m.owner is not None and not m.is_host(ictx.user_id)):
+            await interaction.response.send_message(
+                "❌ Only a host can resume the match.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Resume & run", style=discord.ButtonStyle.success)
+    async def resume(self, interaction, button):
+        if not await self._require_host(interaction):
+            return
+        m = self._match()
+        if m is None or not m.paused:
+            await interaction.response.send_message(
+                "The match isn't paused any more.", ephemeral=True)
+            return await self._disable(interaction)
+        await interaction.response.defer()
+        ictx = _InteractionCtx(interaction, self._mgr)
+        # Point the run at this match even if the clicked channel shows
+        # another one, then put the channel back (run_approved_request's rule).
+        # A click is not a typed command, so it isn't the clicker's `!again`.
+        depth = vtt_commands._RUN_DEPTH.set(1)
+        try:
+            with vtt_commands._channel_pointed_at(
+                    self._mgr, ictx.channel_key, self._mid):
+                await registry.run("match", ["resume"], ictx, self._mgr)
+        finally:
+            vtt_commands._RUN_DEPTH.reset(depth)
+        if _boards:
+            await _refresh_boards_for_match(self._mgr, self._mid)
+        await self._disable(interaction)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction, button):
+        if not await self._require_host(interaction):
+            return
+        m = self._match()
+        held = m.held_commands if m is not None else []
+        # By identity: the same text may be held twice.
+        for i, h in enumerate(held):
+            if h is self._entry:
+                del held[i]
+                cmd = "!" + h["name"] + (" " + " ".join(h["args"]) if h["args"] else "")
+                await interaction.response.send_message(
+                    f"🚫 Dropped held `{cmd}`; the match stays paused.")
+                return await self._disable(interaction)
+        await interaction.response.send_message(
+            "That command isn't held any more.", ephemeral=True)
+        await self._disable(interaction)
+
+    async def _disable(self, interaction):
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+        self.stop()
+
 #now supports-multiple commands in one message - one command per line
 # ----------------------------------------------------------------------
 # Auto-update boards (#24) + pan buttons (#110, Discord surface)
@@ -465,7 +595,8 @@ class _ApprovalView(discord.ui.View):
 # same surface-agnostic render_ascii the `!map` command uses; only the
 # message lifecycle lives here, which is why it can't be harness-tested.
 
-# channel_key -> {"message": discord.Message, "match_id": str}
+# channel_key -> {"message": discord.Message, "match_id": str,
+#                 "workspace": the server's workspace key}
 _boards: Dict[str, Dict[str, Any]] = {}
 
 
@@ -492,7 +623,7 @@ def _board_render(m, channel_key: str) -> Tuple[str, bool]:
     A board is ONE message edited in place, so unlike a `!map` reply it
     can't be split across messages — and an edit over Discord's content cap
     fails, which used to silently drop the board. ANSI color costs ~9 chars
-    per colored cell, so a default 30x30 window with a dozen or so team-
+    per colored cell, so a default 28x28 window with a dozen or so team-
     colored units already crosses 2000. Degrade instead: drop color, then
     the legend; if even the bare map is too big, say so (the viewport rules
     set the window size)."""
@@ -507,15 +638,20 @@ def _board_render(m, channel_key: str) -> Tuple[str, bool]:
         vx, vy, vw, vh = viewport
         header = (f"🗺️ viewport ({vx},{vy})–({vx + vw - 1},{vy + vh - 1}) "
                   f"of {m.grid_width}×{m.grid_height}\n")
-    # Richest first; each fallback drops one optional layer.
-    attempts = [(colorize, legend), (False, legend), (False, False)]
+    coords = m.coords_on()
+    # Richest first; each fallback drops one optional layer (the coordinate
+    # rulers first: two-plus lines and a margin on every row).
+    attempts = [(colorize, legend, coords), (colorize, legend, False),
+                (False, legend, False), (False, False, False)]
     text = ""
-    for col, leg in dict.fromkeys(attempts):
-        body = m.render_ascii(pov, colorize=col, viewport=viewport, legend=leg)
+    for col, leg, crd in dict.fromkeys(attempts):
+        body = m.render_ascii(pov, colorize=col, viewport=viewport, legend=leg,
+                              coords=crd)
         text = f"{header}```{'ansi' if col else ''}\n{body}\n```"
         if len(text) <= DISCORD_MAX_CONTENT:
-            if (col, leg) != attempts[0]:
-                dropped = [n for n, was, now in (("color", colorize, col),
+            if (col, leg, crd) != attempts[0]:
+                dropped = [n for n, was, now in (("coordinates", coords, crd),
+                                                 ("color", colorize, col),
                                                  ("legend", legend, leg))
                            if was and not now]
                 text = (f"(board too large for one Discord message — "
@@ -525,7 +661,7 @@ def _board_render(m, channel_key: str) -> Tuple[str, bool]:
             return text, bool(viewport)
     return (f"⚠️ This map board is {len(text)} characters, over Discord's "
             f"{DISCORD_MAX_CONTENT}-character message limit even without "
-            f"color or legend. Lower the `viewport_width` / `viewport_height` "
+            f"coordinates, color or legend. Lower the `viewport_width` / `viewport_height` "
             f"rules to shrink the window."), bool(viewport)
 
 
@@ -597,7 +733,7 @@ class _PanView(discord.ui.View):
         entry = _boards.get(self.channel_key)
         mid = (entry or {}).get("match_id") or \
             self._mgr.get_active_for_channel(self.channel_key)
-        m = self._mgr.get(mid) if mid else None
+        m = self._mgr.matches.get(mid) if mid else None
         if m is not None and self.channel_key not in m.bound_channels:
             try:
                 await interaction.response.defer()
@@ -652,9 +788,12 @@ async def _refresh_boards_for_match(mgr: MatchManager, match_id: str) -> None:
     """Edit every board bound to `match_id` in place (after a state change).
     Best-effort: a failed edit (deleted message, perms) drops that board."""
     for ck, entry in list(_boards.items()):
-        if entry.get("match_id") != match_id:
+        # Match ids are per server: another server's board on a match with
+        # the same id is not this match's board.
+        if (entry.get("match_id") != match_id
+                or entry.get("workspace") != getattr(mgr, "guild_key", None)):
             continue
-        m = mgr.get(match_id)
+        m = mgr.matches.get(match_id)
         if m is None:
             _boards.pop(ck, None)
             continue
@@ -686,8 +825,42 @@ async def _retire_board(channel_key: str, entry: Dict[str, Any],
         pass
 
 
-def wire_commands(bot: commands.Bot, mgr: MatchManager):
+def wire_commands(bot: commands.Bot, workspaces: Workspaces):
+    """Register every registry root as a discord.py command. Each command
+    runs against the workspace (MatchManager) of the server it came from;
+    DMs are refused (DM_REFUSAL)."""
+
+    def _workspace(ctx) -> Optional[MatchManager]:
+        guild = getattr(ctx, "guild", None)
+        if guild is None:
+            return None
+        mgr = workspaces.get(guild.id)
+        mgr.guild_name = str(getattr(guild, "name", "") or guild.id)
+        return mgr
+
+    async def _load_owners():
+        # The bot owner: the Discord application's owner, or every member of
+        # the team that owns it.
+        try:
+            app = await bot.application_info()
+        except Exception as ex:  # noqa: BLE001 - startup must not die on it
+            print(f"⚠️ Couldn't read the bot's owner ({ex}); `!owner` is "
+                  f"refused to everyone until the next start.")
+            return
+        team = getattr(app, "team", None)
+        if team is not None:
+            ids = {str(mem.id) for mem in getattr(team, "members", [])}
+        else:
+            owner = getattr(app, "owner", None)
+            ids = {str(owner.id)} if owner is not None else set()
+        workspaces.owner_ids = ids
+
+    bot.add_listener(_load_owners, "on_ready")
+
     async def _dispatch(ctx, bound_root: str):
+        mgr = _workspace(ctx)
+        if mgr is None:
+            return await ctx.send(DM_REFUSAL)
         content = ctx.message.content or ""
         s = content.lstrip()
     
@@ -788,9 +961,13 @@ def wire_commands(bot: commands.Bot, mgr: MatchManager):
     async def on_command_error(ctx, error):
         if isinstance(error, commands.CommandNotFound):
             name = getattr(ctx, "invoked_with", None) or ""
-            gid = getattr(ctx.guild, "id", "DM")
-            mid = mgr.get_active_for_channel(f"{gid}:{ctx.channel.id}")
-            m = mgr.get(mid) if mid else None
+            guild = getattr(ctx, "guild", None)
+            # peek: an unknown word must not create a workspace, and a DM
+            # (no server) has no aliases.
+            mgr = workspaces.peek(guild.id) if guild is not None else None
+            mid = mgr.get_active_for_channel(f"{guild.id}:{ctx.channel.id}") \
+                if mgr is not None else None
+            m = mgr.matches.get(mid) if mid else None
             if name and m is not None and name in m.aliases:
                 await _dispatch(ctx, name)
             return
