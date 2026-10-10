@@ -13,7 +13,9 @@
 #                    headless box.
 #
 # Scope: static sprites only (no animation), command input only (no mouse
-# select/drag). The canvas pans and zooms locally (see GuiApp); Discord renders
+# select/drag). The input box has shell-style editing: Tab completion
+# (completion.py, shared with the CLI), Up/Down history on its first / last
+# line, Ctrl+R reverse search, Esc to clear it and Ctrl+L to clear the log. The canvas pans and zooms locally (see GuiApp); Discord renders
 # the same model to an image attachment via sprite_render (scene_for_png +
 # render_scene_png).
 from __future__ import annotations
@@ -32,6 +34,7 @@ from sprite_render import (
 from logic import LOCAL_WORKSPACE
 from storage import open_workspaces, load_local_settings, local_persistence_note
 from vtt_commands import registry, _view_pov, split_command_line
+from completion import apply_completion, format_candidates
 
 
 # ----------------------------------------------------------------------------
@@ -183,7 +186,43 @@ class GuiApp:
         self.entry.bind("<Return>", self._on_enter)
         self.entry.bind("<Shift-Return>", lambda e: None)  # literal newline
         self.entry.bind("<Control-Return>", self._on_enter)
+        # Shell-style editing (see the methods below).
+        self.entry.bind("<Tab>", self._on_tab)
+        self.entry.bind("<Up>", self._on_up)
+        self.entry.bind("<Down>", self._on_down)
+        self.entry.bind("<Escape>", self._on_escape)
+        self.entry.bind("<Control-r>", self._search_start)
+        self.entry.bind("<Control-R>", self._search_start)
+        self.root.bind("<Control-l>", self._clear_log)
+        self.root.bind("<Control-L>", self._clear_log)
         self.entry.focus_set()
+        # Commands run this session, oldest first (consecutive repeats kept
+        # once); _hist_pos is the entry shown while browsing (None = not
+        # browsing) and _draft the unsent text browsing started from.
+        self._history: List[str] = []
+        self._hist_pos: Optional[int] = None
+        self._draft = ""
+        # (input text, cursor) after a Tab that added nothing: a second Tab
+        # there lists the candidates.
+        self._last_tab: Optional[Tuple[str, str]] = None
+
+        # Ctrl+R reverse search: a bar above the input, shown while searching.
+        self._search_bar = tk.Frame(self.root, bg="#0e0e12")
+        self._search_label = tk.Label(self._search_bar, text="",
+                                      bg="#0e0e12", fg="#a0a0a0", anchor="w")
+        self._search_entry = tk.Entry(self._search_bar, bg="#1a1a20",
+                                      fg="#e0e0e0", insertbackground="#e0e0e0")
+        tk.Label(self._search_bar, text="(reverse-i-search)", bg="#0e0e12",
+                 fg="#d0d0d0").pack(side="left")
+        self._search_entry.pack(side="left")
+        self._search_label.pack(side="left", fill="x", expand=True, padx=6)
+        self._search_entry.bind("<KeyRelease>", self._search_update)
+        self._search_entry.bind("<Control-r>", self._search_older)
+        self._search_entry.bind("<Control-R>", self._search_older)
+        self._search_entry.bind("<Return>", self._search_accept)
+        self._search_entry.bind("<Escape>", self._search_cancel)
+        self._search_idx: Optional[int] = None
+        self._inbar = inbar
 
         # ---- Layout / resize priority ----
         # Pack order = clipping priority (earliest packed keeps its space). We
@@ -217,6 +256,9 @@ class GuiApp:
         self.log("FCS VTT graphics surface. Type !help (one command per line; "
                  "Enter runs all lines, Shift+Enter for a newline). Sprites "
                  f"from: {self.loader.folder}")
+        self.log("Tab completes (twice lists the choices) · Up/Down recall "
+                 "commands · Ctrl+R searches them · Esc clears the input · "
+                 "Ctrl+L clears this log.")
         if self._persist_note:
             self.log(self._persist_note)
 
@@ -225,6 +267,159 @@ class GuiApp:
         self.log_widget.insert("end", str(message) + "\n")
         self.log_widget.see("end")
         self.log_widget.config(state="disabled")
+
+    def _clear_log(self, _event=None):
+        self.log_widget.config(state="normal")
+        self.log_widget.delete("1.0", "end")
+        self.log_widget.config(state="disabled")
+        return "break"
+
+    # ---- shell-style input: completion, history, search -----------------
+    def _set_input(self, text: str, cursor: str = "end-1c"):
+        self.entry.delete("1.0", "end")
+        self.entry.insert("1.0", text)
+        self.entry.mark_set("insert", cursor)
+        self.entry.see("insert")
+
+    def _input_text(self) -> str:
+        return self.entry.get("1.0", "end-1c")
+
+    def _on_tab(self, _event=None):
+        """Bash-style: complete the word before the cursor (on its line);
+        when several candidates share nothing more, a second Tab lists them
+        in the log."""
+        before = self.entry.get("insert linestart", "insert")
+        new, cands = apply_completion(before, self.mgr, self.ctx)
+        if new != before:
+            self.entry.delete("insert linestart", "insert")
+            self.entry.insert("insert", new)
+            self._last_tab = None
+        elif cands:
+            here = (self._input_text(), self.entry.index("insert"))
+            if self._last_tab == here:
+                self.log(format_candidates(cands))
+                self._last_tab = None
+            else:
+                self._last_tab = here
+                self.root.bell()
+        else:
+            self.root.bell()
+        return "break"
+
+    def _remember(self, block: str):
+        block = block.strip()
+        if block and (not self._history or self._history[-1] != block):
+            self._history.append(block)
+        self._hist_pos = None
+        self._draft = ""
+
+    def _on_up(self, _event=None):
+        # Inside a multi-line block, Up moves the cursor; on its first line
+        # it recalls the previous command (cursor at the end of its first
+        # line, so another Up goes further back).
+        if self.entry.index("insert").split(".")[0] != "1" or not self._history:
+            return None
+        if self._hist_pos is None:
+            self._draft = self._input_text()
+            self._hist_pos = len(self._history)
+        if self._hist_pos == 0:
+            self.root.bell()
+            return "break"
+        self._hist_pos -= 1
+        self._set_input(self._history[self._hist_pos], "1.end")
+        return "break"
+
+    def _on_down(self, _event=None):
+        last = self.entry.index("end-1c").split(".")[0]
+        if (self.entry.index("insert").split(".")[0] != last
+                or self._hist_pos is None):
+            return None
+        self._hist_pos += 1
+        if self._hist_pos >= len(self._history):
+            self._hist_pos = None
+            self._set_input(self._draft)
+        else:
+            self._set_input(self._history[self._hist_pos])
+        return "break"
+
+    def _on_escape(self, _event=None):
+        self._set_input("")
+        self._hist_pos = None
+        self._draft = ""
+        return "break"
+
+    def _search_find(self, query: str, before: int) -> Optional[int]:
+        q = query.lower()
+        for i in range(min(before, len(self._history)) - 1, -1, -1):
+            if q in self._history[i].lower():
+                return i
+        return None
+
+    def _search_show(self):
+        if self._search_idx is None:
+            self._search_label.config(
+                text="no match" if self._search_entry.get() else
+                "type to search; Ctrl+R older · Enter takes it · Esc cancels")
+            return
+        self._set_input(self._history[self._search_idx])
+        self._search_label.config(
+            text=f"{len(self._history) - self._search_idx} back · Ctrl+R "
+                 f"older · Enter takes it · Esc cancels")
+
+    def _search_start(self, _event=None):
+        if self._hist_pos is None:
+            self._draft = self._input_text()
+        self._search_entry.delete(0, "end")
+        self._search_idx = None
+        self._search_bar.pack(side="bottom", fill="x", after=self._inbar)
+        self._search_entry.focus_set()
+        self._search_show()
+        return "break"
+
+    def _search_update(self, event=None):
+        # Enter / Esc have their own handlers; Ctrl+<key> (Ctrl+R: older)
+        # isn't typing.
+        if event is not None and (
+                event.keysym in ("Return", "KP_Enter", "Escape")
+                or event.keysym.startswith("Control") or event.state & 0x4):
+            return None
+        q = self._search_entry.get()
+        self._search_idx = (self._search_find(q, len(self._history))
+                            if q else None)
+        self._search_show()
+        return None
+
+    def _search_older(self, _event=None):
+        q = self._search_entry.get()
+        if q:
+            start = (self._search_idx if self._search_idx is not None
+                     else len(self._history))
+            found = self._search_find(q, start)
+            if found is None:
+                self.root.bell()
+            else:
+                self._search_idx = found
+            self._search_show()
+        return "break"
+
+    def _search_end(self):
+        self._search_bar.pack_forget()
+        self._search_idx = None
+        self.entry.focus_set()
+
+    def _search_accept(self, _event=None):
+        if self._search_idx is None:
+            self._set_input(self._draft)
+        self._hist_pos = None
+        self._search_end()
+        self.entry.mark_set("insert", "end-1c")
+        return "break"
+
+    def _search_cancel(self, _event=None):
+        self._set_input(self._draft)
+        self._hist_pos = None
+        self._search_end()
+        return "break"
 
     def _active_match(self):
         mid = self.mgr.active_by_channel.get(self.ctx.channel_key)
@@ -310,6 +505,8 @@ class GuiApp:
     def _run_input(self):
         block = self.entry.get("1.0", "end")
         self.entry.delete("1.0", "end")
+        self._remember(block)
+        self._last_tab = None
         self._preview = None  # a `!map preview` lasts until the next command
         self._view = None     # so does a `!map` view
         lines = [ln.strip() for ln in block.splitlines()]

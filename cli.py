@@ -94,6 +94,48 @@ class CLICtx:
                 return options[idx]
         return line
 
+def _install_readline(workspaces, ctx) -> bool:
+    """Line editing for the prompt where the terminal has readline (Linux,
+    macOS; pyreadline3 on Windows): this session's history on Up/Down, Ctrl+R
+    reverse search, and Tab completion from completion.py (the GUI's). A
+    second Tab lists the choices. Returns whether it is on."""
+    try:
+        import readline
+    except ImportError:
+        return False
+    from completion import complete
+
+    matches: List[str] = []
+
+    def completer(text: str, state: int):
+        if state == 0:
+            matches.clear()
+            try:
+                line = readline.get_line_buffer()[:readline.get_endidx()]
+                start, cands = complete(line, workspaces.get(ctx.guild_key),
+                                        ctx)
+                # readline replaces from ITS word start; ours can begin
+                # later (after the `!`).
+                lead = line[readline.get_begidx():start]
+                if len(cands) == 1 and not cands[0].endswith((".", "=", ":")):
+                    cands = [cands[0] + " "]
+                matches.extend(lead + c for c in cands)
+            except Exception:
+                pass             # completion must never break the prompt
+        return matches[state] if state < len(matches) else None
+
+    readline.set_completer(completer)
+    readline.set_completer_delims(" \t\n\"'")
+    if "libedit" in (getattr(readline, "__doc__", "") or ""):
+        readline.parse_and_bind("bind ^I rl_complete")     # macOS
+    else:
+        readline.parse_and_bind("tab: complete")
+        # List the choices on the second Tab (GNU's default waits for a
+        # third when the first one extended the word).
+        readline.parse_and_bind("set show-all-if-unmodified on")
+    return True
+
+
 def parse(line: str):
     try:
         return split_command_line(line)
@@ -119,6 +161,9 @@ async def main():
     note = local_persistence_note(local)
     if note:
         print(note)
+    if _install_readline(workspaces, ctx):
+        print("Tab completes (twice lists the choices) · Up/Down recall "
+              "commands · Ctrl+R searches them.")
     if not color_ok:
         print(
             "(note: this terminal can't render ANSI color — the map will "

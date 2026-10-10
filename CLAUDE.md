@@ -155,6 +155,9 @@ code. How the harness works (`run_scenarios.py`, scenarios in
   lines right after the command (see 633-645).
 - **Reading replies.** `python run_scenarios.py --review N ...` prints every
   command's full reply next to the Expected prose; `-v` prints a transcript.
+- **Tab completion** is tested in scenarios too: `?tab "<text>"` replies with
+  what Tab does at the end of the text (`→ '<line>'` and `candidates: ...`)
+  in the scenario's workspace; check it with `??` / `?!` (732-733).
 - **Isolation.** Each scenario gets its own temp data folder (real storage
   commits) and a temp saves folder; `!as restart` reloads everything from
   disk as a bot restart would.
@@ -251,7 +254,9 @@ Each of these was learned from a shipped bug.
   or moves an entity across a boundary (corpse, clone, transfer/copy,
   transform, template save/spawn, revive) must remap or strip it (§5).
 - **A command / subcommand:** an exact `annotate_sub` usage (the stray-word
-  check reads it); alias spellings in `_SUB_ALIASES`; player-available reads
+  check and Tab completion read it; a NEW placeholder name that names
+  something — a unit, a template, a rule — goes in `completion.py`'s slot
+  tables, or it completes from the general name pool); alias spellings in `_SUB_ALIASES`; player-available reads
   in `READ_ONLY_SUBCOMMANDS[root]`; a host-only READ in `_HOST_READS` (or a
   pause with `pause_affects_hosts` holds it); a read form of an elevated arg
   in `_ELEVATED_READ_FORMS`; anything touching server-wide state or host files
@@ -316,6 +321,12 @@ back, load the schema with `ToolSearch` before calling
   `Snapshot.state` is `Match.to_dict(include_history=False)`, read lazily
   from disk once persisted.
 - **`storage.py`**: the data folder on disk (§3 "Persistence").
+- **`completion.py`**: Tab completion for a typed line, shared by gui.py and
+  cli.py (readline). It walks the typed words through the command's usage
+  strings (`_usage_tails` / `_usage_tokens`, the stray-word check's
+  tokenizer) and offers the literal words, `key=` options and names a
+  placeholder takes (`_slot_names`: unit ids filtered by the channel's POV,
+  templates, rules, var paths one segment at a time, ...). Read-only.
 - **`sprite_render.py`**: the surface-agnostic Pillow renderer
   (`SpriteLoader`, `SceneRenderer`, `render_scene_png`, `fit_cell_size`).
 - **Surfaces:** `bot.py` + `discord_commands.py` (Discord: per-server
@@ -1359,6 +1370,14 @@ hardcodes**.
 - **Surfaces:** `!map image`, `!map mode text|image` (plain `!map` posts an
   image), `!map autoupdate` boards (Discord, runtime-only), `!map scene
   [list]` (textual model), gui.py (canvas; zoom / pan local to the GUI).
+- **Input editing** (gui.py and cli.py): Tab completes (`completion.py`;
+  bash-style, a second Tab lists the choices), Up / Down recall this
+  session's commands (GUI: only on the input's first / last line, so they
+  still move through a multi-line block; an unsent draft comes back past
+  the newest), Ctrl+R reverse search (GUI: a bar above the input, Enter
+  takes the match for editing, Esc restores the draft), and in the GUI Esc
+  clears the input and Ctrl+L the log. History is per session (user call).
+  The CLI gets all of it from readline where the terminal has one.
   Sprites come from `sprites/` and per-server `data/<server>/sprites/`
   (server-side only — there is NO in-chat upload, deliberately).
 - **Intended ASCII / graphics differences:** corpses and overlays are
