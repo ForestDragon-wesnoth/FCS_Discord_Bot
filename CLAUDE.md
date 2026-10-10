@@ -95,45 +95,35 @@ break — fix them, don't paper over.)
 
 ## 2. Process discipline (the things you'll forget)
 
-### Always start with `git fetch origin main`
+### Start every task from a fresh main
 
-Multiple sessions burned tokens because Claude built on a stale main,
-got into stacked-branch hell, and had to rebase / retarget PRs. The
-**first command of every new task** should be:
+Multiple sessions burned tokens because Claude built on a stale main, got into
+stacked-branch hell, and had to rebase / retarget PRs. The first command of a
+new task:
 
 ```bash
 git fetch origin main && git checkout main && git pull origin main && git checkout -b claude/<descriptive-name>
 ```
 
-If you're continuing from a previous session, check whether prior PRs
-have merged — the user merges fast.
+(When the session names a designated branch, recreate THAT branch from
+origin/main instead.) The user merges fast: when continuing from a previous
+session, check whether its PRs merged before building on them.
 
 ### ONE active PR at a time
 
-Unless the user explicitly says otherwise, only have one PR open. If
-they ask for a follow-up on a feature whose PR is still open, **fold
-the new work into the existing PR's branch** — don't open a second PR.
-The user has corrected this twice now. The recipe:
-
-```bash
-git checkout <existing-feature-branch>
-# add new changes, commit, push
-# update the existing PR's title/body to cover the combined scope
-# if you had started a second branch, close its PR and delete the branch
-```
+Unless the user explicitly says otherwise, only have one PR open. A follow-up
+on a feature whose PR is still open goes on that PR's branch: add the commits,
+push, and update the PR's title/body to cover the combined scope. If you had
+started a second branch, close its PR and delete the branch. The user has
+corrected this twice.
 
 ### Verify the PR is still open after every push
 
-Pushing to an existing feature branch does NOT silently extend an
-already-merged PR. If the user merged the PR while you were doing
-follow-up work, your follow-up commits become orphaned on a dead
-branch — they show up nowhere, and the user only notices when GitHub
-prompts them with a "Compare & pull request" banner. **After every
-`git push` to a feature branch, run `git fetch && git log
-origin/main` (or check the PR's state via the MCP tool) to confirm
-the PR is still open.** If the PR merged, the unmerged commits need
-either a rebase or a fresh branch and a new PR — don't just keep
-pushing.
+Pushing to a feature branch does NOT extend an already-merged PR: follow-up
+commits land on a dead branch, show up nowhere, and the user only notices from
+GitHub's "Compare & pull request" banner. After every push, check
+`git fetch && git log origin/main` (or the PR state via the MCP tool). If it
+merged, restart the branch from main and open a new PR.
 
 ### Run the regression after every meaningful change
 
@@ -141,148 +131,160 @@ pushing.
 python run_scenarios.py
 ```
 
-The harness is fast. Run it after every commit-worthy change. If it
-breaks, fix it before adding more code. Every `SCENARIO N — title`
-header needs a BLANK LINE before it and a dashes line after it; a header
-missing the blank line is silently swallowed into the previous
-scenario's Expected: prose and never runs (scenarios 230/232/236 sat
-unexecuted this way for a long time). The harness now cross-checks every
-header line against what it parsed and refuses to run on a mismatch or a
-duplicate number. Only lines ABOVE a scenario's first `Expected:` run: a
-staged scenario labels its intermediate prose `Result:` (see 13, 26) —
-commands written after an `Expected:` block silently never execute. The
-harness also flags `❌ Runtime error:`, `❌ Unexpected error:`, an unknown
-subcommand ("isn't a valid command") and missing arguments ("is missing
-arguments") unless the prose carries `HARNESS-ALLOWS-ERRORS`. **But the
-harness only catches those markers — it does NOT verify behavior** unless
-the scenario says what it expects with `!assert "<formula>" [message]`: a
-false assert prints `❌ Assertion failed`, which the harness ALWAYS flags
-(even under HARNESS-ALLOWS-ERRORS; only `HARNESS-ALLOWS-ASSERT-FAIL`, for a
-scenario demonstrating a failing assert, opts out). Prefer asserts for
-end-state checks in new scenarios (see 597-608). For REPLY WORDING (a
-refusal message, a reported number) use a `?? <text>` line right after the
-command — the reply must contain the text — or `?! <text>` (must not); a
-miss prints `❌ Expectation failed`, flagged like a failed assert (see
-633-645). `python run_scenarios.py --review N ...` prints every command's
-FULL reply followed by the Expected prose, the quick way to check prose
-against reality. A scenario can "pass" with a `❌` reply that means the
-opposite of what it should. Always also do at least one of:
+Run it after every commit-worthy change and fix a break before adding more
+code. How the harness works (`run_scenarios.py`, scenarios in
+`test_sequences.txt`):
 
-- Run the new scenarios with `-v` and read the per-line transcript
-- Write a small Python assertion script (see existing examples in
-  prior commits' verification work) that parses `!ent dump` / `!list`
-  output and asserts exact end-state values
+- **Format.** Every `SCENARIO N — title` header needs a BLANK LINE before it
+  and a dashes line after it (a header missing the blank line used to be
+  swallowed into the previous scenario's prose and never run; the harness now
+  cross-checks header lines against what it parsed and refuses to run on a
+  mismatch or a duplicate number). Only lines ABOVE a scenario's first
+  `Expected:` run: a staged scenario labels intermediate prose `Result:`
+  (see 13, 26). Multi-line bodies use literal `\n` (`_interpret_escapes`).
+- **What it flags.** `💥` and "Syntax error" always; `❌ Runtime error:`,
+  `❌ Unexpected error:`, an unknown subcommand ("isn't a valid command") and
+  missing arguments ("is missing arguments") unless the prose carries
+  `HARNESS-ALLOWS-ERRORS`; a false `!assert "<formula>"` (`❌ Assertion
+  failed`) and a missed `?? <text>` / `?! <text>` reply check (`❌ Expectation
+  failed`) ALWAYS (only `HARNESS-ALLOWS-ASSERT-FAIL` opts out, for a scenario
+  demonstrating a failing assert).
+- **What it doesn't.** Anything else. A scenario "passes" with a `❌` reply
+  that means the opposite of what it should, so new scenarios check their end
+  state with `!assert` (see 597-608) and their reply wording with `??` / `?!`
+  lines right after the command (see 633-645).
+- **Reading replies.** `python run_scenarios.py --review N ...` prints every
+  command's full reply next to the Expected prose; `-v` prints a transcript.
+- **Isolation.** Each scenario gets its own temp data folder (real storage
+  commits) and a temp saves folder; `!as restart` reloads everything from
+  disk as a bot restart would.
 
-### How many scenarios per PR (coverage rule of thumb)
+### Don't trust your own scenario expected-text
 
-The user enforces this — a prior session shipped many PRs with only ONE
-scenario each, which under-tested complex features (e.g. modifiers without a
-formula that actually CONSUMES them; multi-tile body parts without a real
-composite shape). Match coverage to PR size:
+You'll write Expected prose from your mental model and sometimes be wrong (the
+user has caught off-by-one round counts more than once). Run the scenarios and
+read the actual replies before declaring done; the prose is documentation of
+what shipped, so fix the prose when reality differs.
+
+### How many scenarios per PR
+
+The user enforces this (a prior session shipped many PRs with one scenario
+each, which under-tested complex features):
 
 - **Simple PR** (one small primitive, one rule): **1-2** scenarios.
-- **Complex PR** (a subsystem, multiple sub-features, or anything with
-  several interacting knobs): **3+** scenarios, ideally more — one per
-  distinct behavior, plus a failure/edge case.
+- **Complex PR** (a subsystem, several sub-features or interacting knobs):
+  **3+**, one per distinct behavior plus a failure/edge case.
 
-Each scenario should exercise a DIFFERENT facet, and at least one should
-prove the feature in REAL USE (a formula/action that consumes the new
-primitive end-to-end), not just that the setter command runs. When you add
-follow-up tests for an older feature, insert them right after that feature's
-existing scenarios and renumber the rest (the tail-rewrite pattern); update
-the `Scenario N` citations in this file to match.
+Each scenario exercises a DIFFERENT facet, and at least one proves the feature
+in REAL USE (a formula/action consuming the new primitive end-to-end), not
+just that the setter runs. Follow-up tests for an older feature go right after
+that feature's scenarios, renumbering the rest; update the scenario numbers
+cited in this file to match.
 
 ### ALWAYS smoke-test new features on a multi-tile entity
 
-Multi-tile / footprint entities (and their cousins: body parts, mounts,
-anchored auras, segments) are the SINGLE biggest source of interaction bugs
-in this codebase — almost every audit-pass fix traced back to code that
-silently assumed a 1×1, anchor-only entity (anchor-only bounds/occupancy,
-LOS/vision cast from the anchor cell, a hook or clock that skipped attached
-parts, a carry/restamp that moved the anchor but not the footprint). So:
-
-**Any new feature MUST be exercised at least once against a multi-tile
-entity (give something a `footprint_w`/`footprint_h` > 1, or a body part /
-rider / segment) before you call it done — even if that check never becomes
-a committed scenario.** A throwaway Python repro or a `-v` transcript is
-fine; the point is to actually run the new code path with a footprint and
-confirm it uses the WHOLE footprint, not just `(x, y)`. Ask the standard
-questions: does it measure/membership-test by ANY covered cell? does it
-validate the WHOLE swept footprint? does it carry the whole body on move?
-does an attached part get included where it should (and excluded where it
-shouldn't)? If the feature is spatial, vision-related, movement-related, or
-fires per-entity, this is non-negotiable.
+Multi-tile / footprint entities and their cousins (body parts, riders,
+anchored auras, segments) are the single biggest source of interaction bugs:
+almost every audit fix traced back to code that assumed a 1×1, anchor-only
+entity (anchor-only bounds or occupancy, sight cast from the anchor cell, a
+hook or clock that skipped attached parts, a carry that moved the anchor but
+not the footprint). **Any new feature is exercised at least once against a
+multi-tile entity (`footprint_w`/`footprint_h` > 1, a body part, a rider or a
+segment) before it's done** — a throwaway repro or a `-v` transcript is fine.
+The questions: does it measure / membership-test by ANY covered cell? Does it
+validate the WHOLE swept footprint? Does it carry the whole body on move? Is an
+attached part included where it should be, and excluded where it shouldn't?
 
 ### Rendering changes need a GUI-vs-ASCII pass (user directive)
 
-Text (`_render_ascii_impl`) and graphics (`_render_scene_impl` → the
-`sprite_render.SceneRenderer` pixels) are two parallel renderers over the
-same predicates, and they drift. After ANY change that touches what a map
-shows (a layer, a visibility rule, a glyph / sprite / colour resolver, the
-viewport, a new kind of placement), do a thorough pass on the differences
-between them, not just the feature: read both paths side by side and run
-the throwaway harnesses — (1) per-cell ownership: the ASCII glyph vs the
-top scene placement; (2) pixel parity: render the scene with no sprites and
-check a glyph is drawn exactly where ASCII shows a non-`.` character, fog
-where it shows the fog glyph; (3) a windowed render equals the same crop of
-the full render. Run them over random boards with multi-tile bodies, region
-parts, riders, every facing, team views, hidden layers and viewports.
-Intended differences: corpses and status overlays are graphics-only, a
-multi-tile body follows `sprite_mode` (`stretch` default = one sprite/glyph
-over the body; `single` = its anchor cell), colour-only cells are a
-translucent fill, a unit's colour is an outline around its sprite, the image
-legend lists every look in the window (ASCII lists top-layer glyphs only),
-and layer order follows the sprite_layer_* rules.
+Text (`_render_ascii_impl`) and graphics (`_render_scene_impl` →
+`sprite_render.SceneRenderer`) are two parallel renderers over the same
+predicates, and they drift. After ANY change to what a map shows (a layer, a
+visibility rule, a glyph / sprite / colour resolver, the viewport, a new kind
+of placement), compare the two paths side by side and run the parity
+harnesses (§5 "Audit toolkit") over random boards with multi-tile bodies,
+region parts, riders, every facing, team views, hidden layers and viewports.
+The intended differences are listed in §7 "Rendering".
 
-### ANY bug is worth fixing — multi-tile is where they CLUSTER, not a filter
+### Every bug is in scope; multi-tile is where they cluster
 
-The multi-tile emphasis above is about where bugs concentrate, NOT a
-restriction on what to fix. When auditing or stumbling on a defect,
-multi-tile or not, investigate and fix it (e.g. the shallow-copy undo
-corruption and the resistance/stacking questions found in audit-pass-5 are
-footprint-independent). Do not dismiss a bug because it isn't about
-footprints. Two corollaries the user stated explicitly:
-- **If a fix's intended behavior is ambiguous, ASK the user — don't guess.**
-  A wrong "fix" that drifts from intent is worse than a question.
-- **If CLAUDE.md's wording was ambiguous about the behavior in question, it
-  MUST be amended** as part of the fix, so the ambiguity doesn't recur.
+The multi-tile emphasis says where bugs concentrate. Fix any defect you find,
+whatever it touches (the shallow-copy undo corruption, for one, had nothing to
+do with footprints). Two corollaries the user stated:
+- **If a fix's intended behavior is ambiguous, ASK.** A wrong "fix" that
+  drifts from intent is worse than a question.
+- **If this file's wording was ambiguous about the behavior, amend it** as
+  part of the fix.
+
+### Checklists: when you add X, also do Y
+
+Each of these was learned from a shipped bug.
+
+- **A formula function:** add it to `_MATCH_FUNC_NAMES` AND the namespace
+  builder (or `_ALLOWED_FUNCS` for a pure helper); classify it in
+  `ARG_SAFE_MATCH_FUNCS` (reads / calculates) or `ARG_MUTATING_MATCH_FUNCS`
+  (changes state — banned from `$()` args; when unsure, MUTATING). The
+  module-load drift guard fails the build if you forget, but decide
+  deliberately: a mis-classified mutator lets a player `$(kill(boss))`. Add a
+  `$()` scenario: a read-only happy path and a security case proving a mutator
+  is rejected and changes nothing (see 541-543). A mutator calls
+  `match.surface_log(<log>)` so its hook output reaches chat. A function whose
+  cost follows its arguments clips to the map or charges `formula_cell_limit`
+  / `formula_loop_limit` / `sight_check_limit`. Loopable → `_LOOPABLE_FUNCS`.
+  Exercise every new function: import-time checks prove only registration (a
+  nonexistent helper name once hid in a function body).
+- **A HOOK_CONTEXT binding:** `_who_arg` handles HOOK_CONTEXT_NAMES by set
+  membership, so `entity[<binding>]` works automatically; check the binding is
+  actually supplied in the fire site's extras.
+- **A gamerule:** schema keys — int rules carry `min` / `max` / `unlimited`
+  (-1), str rules with fixed words carry `choices` (enum), formula-valued
+  rules carry `"formula": "expression"|"program"`; a limit a server could
+  raise high enough to stall the bot carries a ceiling (`"ceiling": True`,
+  §3). Read it with the exact registry name (a typo'd `rules.get` returns the
+  default forever).
+- **A serialized Match field:** `to_dict` / `from_dict` with deep copies on
+  BOTH sides; a runtime-only field goes in `action._rollback_match`'s preserve
+  list (`_check_rollback_fields` raises if a field is neither); decide whether
+  undo restores it (`_NOT_UNDO_STATE`, `_restore_snapshot`) and whether
+  `resize_grid` / `copy_entity` must shift or remap it.
+- **A field or var that names another entity by id:** every path that copies
+  or moves an entity across a boundary (corpse, clone, transfer/copy,
+  transform, template save/spawn, revive) must remap or strip it (§5).
+- **A command / subcommand:** an exact `annotate_sub` usage (the stray-word
+  check reads it); alias spellings in `_SUB_ALIASES`; player-available reads
+  in `READ_ONLY_SUBCOMMANDS[root]`; a host-only READ in `_HOST_READS` (or a
+  pause with `pause_affects_hosts` holds it); a read form of an elevated arg
+  in `_ELEVATED_READ_FORMS`; anything touching server-wide state or host files
+  in `_admin_required` (files via `saves_path`); naming another match →
+  `require_target_host`; a raw (un-shlexed) tail → `split_command_args`;
+  `int()` on user input wrapped to a clean ❌; an optional slot that takes
+  any word refuses a word that doesn't fit; a body-accepting command calls
+  `normalize_body_source`.
+- **A query that names or lists units:** run it through the POV helpers
+  (`_query_eid`, `_pov_hides`) so a fogged player can't probe hidden units;
+  re-run the POV leak detector (§5).
+- **Anything iterating units and firing hooks:** re-check
+  `eid in m.entities` after each hook (§5 "ghost firing").
 
 ### Usage strings are authoritative (stray-word check)
 
 The dispatcher refuses positional words past the end of a command's usage
-string (`_stray_words_error`, audit-pass-36): `!ent remove a b` used to remove
-only `a`. So **every new subcommand needs an exact `annotate_sub` usage**
-(and a root without subcommands an exact root usage): `<x>` one word,
-`[...]` optional, `|` alternatives (an alternative LED by a literal word —
-`list`, `cell <x> <y>` — applies only when that word is typed), `...` /
-`<x ...>` any number more, `key=<v>` / `[key=value ...]` options (left to
-the handler). Alias spellings (`del`/`rm`) go in `_SUB_ALIASES`. A wrong
-usage string refuses a valid command; the regression catches most. An
-optional slot that takes any word (`[full]`, `[once]`, `[N]`) can't be
-checked this way: the handler must refuse a word that doesn't fit.
+string (`_stray_words_error`): `!ent remove a b` used to remove only `a`. Usage
+grammar: `<x>` one word, `[...]` optional, `|` alternatives (an alternative LED
+by a literal word applies only when that word is typed), `...` / `<x ...>` any
+number more, `key=<v>` / `[key=value ...]` options (left to the handler). A
+wrong usage string refuses a valid command; the regression catches most.
 
 ### Commit messages: dense, factual, no fluff
 
-Look at existing commit messages on `main`. They explain WHY a change
-was made, name the mechanism, flag known trade-offs. They don't have
-sections like "Closes #N" or emoji or marketing language. Match this
-style.
+Match the existing messages on main: why the change was made, the mechanism,
+known trade-offs. No "Closes #N", emoji or marketing language.
 
-### Tool-search MCP servers gracefully
+### MCP tools reconnect
 
-`mcp__github__*` tools drop and reconnect frequently. After every
-notification that they're back, use `ToolSearch` to load the schema
-before calling. Cache: `mcp__github__create_pull_request`,
-`mcp__github__update_pull_request` are the two you'll use most.
-
-### Don't trust your own scenario expected-text
-
-You'll write Expected: prose for new scenarios based on your mental
-model. **Sometimes you'll be wrong** (the user has caught off-by-one
-errors in round counting more than once). Run the scenarios and read
-the actual output before declaring done. If the prose doesn't match
-reality, update the prose (the prose is documentation; the actual
-behavior is what shipped).
+`mcp__github__*` tools drop and reconnect often. After a notice that they're
+back, load the schema with `ToolSearch` before calling
+(`mcp__github__create_pull_request` / `update_pull_request` are the usual two).
 
 ---
 
@@ -290,74 +292,67 @@ behavior is what shipped).
 
 ### Files (with role)
 
-- **`logic.py`**: the domain model. `Entity`, `Match`,
-  `MatchManager`, `Passive`, `ClampSpec`, `SpecialTileTemplate`,
-  `FormulaFunction`, `GameSystem`. **`RULES_REGISTRY`** at the top is
-  the single source of truth for every gamerule. **`HOOK_NAMES`** is
-  the registered event surface. The vars chokepoint
-  (`Entity.write_var` / `remove_var`) and status chokepoint
-  (`Match._emit_status_diff`) are where almost every cross-cutting
-  feature hooks in (death checks, var hooks, clamps).
-
-- **`formula.py`**: the sandboxed expression/program
-  language. The validator (`_EntityAccessTransformer` +
-  `_validate_tree`) rewrites `entity[X].path` reads/writes into safe
-  `__read`/`__write` calls and rejects anything outside the
-  whitelist. `_MATCH_FUNC_NAMES` is the list of identifiers callable
-  from formulas — add a function there AND register it in the
-  namespace builder when you add a new primitive. `_LOOPABLE_FUNCS`
-  gates what `for ... in <func>` accepts.
-
-  Action bodies use the same engine with `action_mode=True`, which
-  enables bare-name assignments (locals), `cmd`/`fail` calls,
-  attribute access on `source`/`args`/`target` proxies, and dynamic
-  `entity[<binding>]` lookup.
-
-- **`vtt_commands.py`**: the user-facing command surface
-  with `CommandRegistry`. Every `!command` is a `@registry.command`
-  decorator. The dispatcher (`CommandRegistry.run`) takes the
-  pre/post snapshot for undo history and resolves aliases. There's
-  also `dispatch_no_snapshot` for `!batch` / `!run` / action `cmd()`.
-
-- **`action.py`**: the action subsystem. `Action`
-  dataclass, `discover_actions` (walks vars looking for `.actions.`
-  subdicts), `SourceProxy` / `ArgsProxy` / `Coord` (the runtime
-  bindings the body sees), `run_action` (transactional runner —
-  takes pre-state, fires the body, rolls back on `fail()` or
-  exception). `_BufferCtx` + `_sync_dispatch` solve the
-  "synchronous formula engine needs to dispatch an async command"
-  problem.
-
-- **`match_history.py`**: snapshot storage for autosave/undo. Three
-  flavors: round, turn, command. `Snapshot.state` is
-  `Match.to_dict(include_history=False)`.
-
-- **`test_sequences.txt`**: scenario integration tests.
-  Each `SCENARIO N — title` block has `!command` lines and an
-  `Expected:` prose section. **The prose is not machine-checked.**
-  Multi-line bodies use literal `\n` (the harness pre-translates them
-  via `_interpret_escapes`).
-
-- **`run_scenarios.py`**: the harness. Catches `💥` and "Syntax
-  error" in command output as failures. **Does NOT verify behavior
-  correctness** — see process discipline above.
-
-- **`discord_commands.py`** / **`bot.py`** / **`cli.py`**: the three
-  surfaces that wire the registry into a real chat client (Discord),
-  a REPL (CLI), or the harness. You'll rarely touch these.
+- **`logic.py`**: the domain model — `Entity`, `Match`, `MatchManager`,
+  `Workspaces`, `Passive`, `ClampSpec`, `SpecialTileTemplate`,
+  `FormulaFunction`, `GameSystem`, the store helpers (`_own_value`,
+  `check_store_path`, `checked_unit_vars`, ...) and the template helpers.
+  **`RULES_REGISTRY`** at the top is the single source of truth for every
+  gamerule; its `desc` strings are the detailed documentation of each rule
+  (searchable in play with `!help find <words>`), so this file names rules
+  without repeating them. **`HOOK_NAMES`** is the registered event surface.
+- **`formula.py`**: the sandboxed expression/program language (§4) and every
+  formula function. `_MATCH_FUNC_NAMES` (match-bound) / `_ALLOWED_FUNCS` (pure)
+  / `_LOOPABLE_FUNCS` / `ARG_SAFE_MATCH_FUNCS` / `ARG_MUTATING_MATCH_FUNCS`.
+- **`vtt_commands.py`**: the command surface. `CommandRegistry` (every
+  `!command` is a `@registry.command` handler; `annotate_sub` documents
+  subcommands), the dispatcher and access gate, and the shared command-line
+  splitter (`split_command_line` / `split_command_args`) every surface uses.
+- **`action.py`**: actions — `Action`, `discover_actions`, the runtime
+  bindings (`SourceProxy` / `ArgsProxy` / `Coord`), `run_action` (the
+  transactional runner), `_rollback_match` (restores a match in place; also
+  used by spawns, `!batch strict` and storage rollback), `_BufferCtx` +
+  `_sync_dispatch` (the sync formula engine dispatching async commands).
+- **`match_history.py`**: undo snapshots (round / turn / command / manual).
+  `Snapshot.state` is `Match.to_dict(include_history=False)`, read lazily
+  from disk once persisted.
+- **`storage.py`**: the data folder on disk (§3 "Persistence").
+- **`sprite_render.py`**: the surface-agnostic Pillow renderer
+  (`SpriteLoader`, `SceneRenderer`, `render_scene_png`, `fit_cell_size`).
+- **Surfaces:** `bot.py` + `discord_commands.py` (Discord: per-server
+  routing, approval / resume buttons, auto-update boards, image posts),
+  `cli.py` (REPL), `gui.py` (tkinter canvas over the scene model),
+  `run_scenarios.py` (the harness). All of them are live code that features
+  touch.
+- **Surface capabilities are optional ctx attributes**, read with
+  `getattr`, so the engine stays surface-agnostic and the harness exercises
+  the fallback: `supports_color`, `viewport_capable`, `message_limit`,
+  `auto_approve`, `post_scene_image`, `show_scene_view`, `set_autoupdate`,
+  `offer_resume`, `prompt_choice`, `retire_server_boards`. The Discord
+  adapter also routes `!<alias>` through `on_command_error`, never pings
+  (`AllowedMentions.none()`), splits long replies fence-aware, and retires a
+  board whose channel was unbound.
+- **`test_sequences.txt`**: the scenarios (§2).
+- **`docs/audit_history.md`**: the narratives of audit passes 2-36 — what was
+  swept, verified clean, measured. Read the relevant passes before auditing
+  an area again.
 
 ### The cross-cutting chokepoints (memorize these)
 
 | Chokepoint | What flows through | What hooks in |
 |---|---|---|
-| `Entity.write_var` / `remove_var` | every var mutation | clamps, var hooks (`on_var_*`), death check (top-level only) |
-| `Match._emit_status_diff` | every status mutation | status hooks (`on_status_*`), death check |
-| `CommandRegistry.run` | every `!command` | pre/post snapshot for undo, alias resolution, snapshot suspension during actions, summon-budget reset |
-| `action.run_action` | every action invocation | pre-state capture for rollback, `_action_depth` bump, on_action_used/failed/on_target firing |
-| `Match.summon_entity` | every dynamic entity creation | id uniqueness, occupancy (with `__cell_stackable` bypass), `on_entity_spawned`, summon-budget guard |
-| `Match._process_death` | every death | on_death, corpse storage vs delete, turn-order rebuild |
+| `Entity.write_var` / `remove_var` | every var write / delete | store checks (vitals, reserved paths, footprint fit), clamps, var hooks (`on_var_*`), death check (top level only) |
+| `Match._emit_status_diff` | every status change | status hooks (`on_status_*`), death check |
+| `CommandRegistry.run` → `_run_top` / `_run` | every typed `!command` | command lock, alias resolution, access / admin gate, pause, inline `$()`, undo snapshot, formula log sink, `CURRENT_WORKSPACE`, watcher poll, storage commit |
+| `dispatch_no_snapshot` | batch / run / macro / foreach lines, action `cmd()` | admin check, inline `$()`, `!assert` stop sentinel, no gate (reached only from an already-gated command) |
+| `action.run_action` | every action | pre-state for rollback, `_action_depth`, choice replay, on_action_used / failed / on_target |
+| `Match.summon_entity` / `Entity.spawn` | every dynamic creation | id minting, placement, `default_entity_vars`, `checked_unit_vars`, on_entity_spawned, summon budget |
+| `Entity.remove` | every removal | part subtree, riders, auras, schedules, turn pointer (`turn_vacated`), on_entity_despawned |
+| `Match._process_death` | every death | on_death, corpse vs delete, part death routing, turn rebuild |
+| `Match.fire_entity_moved` | every completed move | part / aura / rider re-stamp, snake resettle, fog memory |
+| `Match.surface_log` | log lines from formula-driven changes | the action buffer or the command's `FORMULA_LOG_SINK` |
+| `Storage.commit` | after every top-level command | disk mirror, limits, autosave / old-template cuts, rollback |
 
-Add cross-cutting features here, not at the call sites.
+Add cross-cutting features at these points, not at the call sites.
 
 ### Server workspaces (each Discord server is separate)
 
@@ -376,8 +371,8 @@ switch workspaces with `!as server <key>` (scenarios 698-700).
 - **DMs are refused** (`DM_REFUSAL`: make a one-person server instead) — a
   DM has no server to hold a workspace. An unknown `!word` in a DM is ignored.
 - **Server-wide commands need a server administrator** — `!system` edits,
-  `!defvar`/`!defpassive`/`!gclamp` edits, `!store`, `!run`, `!history
-  export/import` (`vtt_commands._admin_required` + `ctx_is_admin`; Discord =
+  `!defvar`/`!defpassive`/`!gclamp` edits, `!log format`, `!store`, `!run`,
+  `!history export/import`, `!server wipe` (`vtt_commands._admin_required` + `ctx_is_admin`; Discord =
   the guild Administrator permission, CLI/GUI = always). They change state
   shared by every match of the server, and anyone can create and host a
   match, so a match host isn't enough. Checked in BOTH `CommandRegistry.run`
@@ -414,22 +409,6 @@ switch workspaces with `!as server <key>` (scenarios 698-700).
   cost follows the map, not the arguments. A NEW limit rule a server can set
   needs a ceiling; a NEW function whose cost follows its arguments needs
   clipping or a budget.
-- **DEFERRED (user, 2026-10): a per-server CPU work budget.** The per-call
-  limits multiply: a loop of 10,000 iterations (formula_loop_limit) each
-  walking a long line is still minutes of a frozen bot for EVERY server, and
-  any match host can write such an action (measured before clipping: 20 calls
-  of `has_los(1, 1, 1, 99999)` = 1.5 s, so the default loop limit ≈ 12
-  minutes; clipping cut the per-call cost to the map, but 10,000 calls × a
-  1,000-cell line on a 500×500 map is still ~7 s). The fix the user prefers:
-  a work counter charged at every cell walked / loop iteration / macro step /
-  summon / event firing, per SERVER, owner-set, in deterministic work units
-  (not wall-clock, so scenarios stay reproducible). Revisit before any public
-  rollout; it needs careful decisions about compromises and abuse.
-- **Entity templates per server — SHIPPED (PR 3, see the `!template` entry
-  in §7).** `MatchManager.templates`, `data/<guild_id>/templates/<name>.json`.
-- **Direct template editing — SHIPPED** (`!template set / unset / part
-  remove / rename / copy`, whole-JSON replacement through `import`, and a
-  24-hour version trash); see the `!template` entry in §7.
 
 ### Persistence: the data folder (storage.py)
 
@@ -441,7 +420,7 @@ one `<sequence>.json` per undo snapshot), `saves/`, `sprites/`, `templates/`
 (entity templates, outside commits; `templates/.trash/` = their replaced /
 edited / deleted versions, 24 h), `corrupt/`;
 plus `data/bot_settings.json` (owner limits + rule ceilings) and
-`data/.trash/` (wiped data, 24 h). Mechanics worth knowing:
+`data/.trash/` (wiped data, 24 h). Mechanics:
 - **Commit after every top-level command** (`vtt_commands.persist_workspace`,
   called from `CommandRegistry.run` inside the command lock, also after a
   Discord pan click). `Storage.commit(mgr)` serializes every match and the
@@ -501,11 +480,7 @@ plus `data/bot_settings.json` (owner limits + rule ceilings) and
   folder, so every command runs through the real commit / rollback; `!as
   restart` (CLI / harness, `storage.reload_workspaces`) reloads everything
   from disk as a bot restart would — use it to prove something persists.
-- **FUTURE PROBLEM TO WATCH (user, 2026-10):** persisted undo history is on
-  by default and every snapshot is a full match state (minus rules). Long
-  campaigns with big boards could make history the bulk of a server's disk
-  use; the limit + autosave cutting bound it, but if it starts to hurt,
-  revisit retention defaults or a diff-based snapshot format.
+- Undo history disk growth is a tracked concern (§8 "Deferred").
 
 ### Disk access is confined to the server's saves folder
 
@@ -526,4445 +501,1096 @@ file-touching command, use `saves_path` AND list it in `_admin_required`.
 
 ---
 
+---
+
 ## 4. The formula sandbox — what you can and can't do
 
-**Allowed AST nodes** (`_ALLOWED_NODES`): Module, Expression, Expr,
-Assign, If, Pass, For, Tuple, BinOp, UnaryOp, BoolOp, IfExp, Compare,
-Call, keyword, Attribute, Dict, List, Name, Constant, Load, Store,
-arithmetic operators, comparison operators (including In/NotIn), And,
-Or. **Notably banned**: Subscript (except `entity[X]`), Lambda, While,
-Comprehensions, Import, Try, With, Class/Function defs, AugAssign,
-chained/tuple Assign.
+**Allowed AST nodes** (`_ALLOWED_NODES`): Module, Expression, Expr, Assign,
+If, Pass, For, Tuple, BinOp, UnaryOp, BoolOp, IfExp, Compare, Call, keyword,
+Attribute, Dict, List, Name, Constant, Load, Store, arithmetic and comparison
+operators (incl. In/NotIn), And, Or. **Banned:** Subscript (except
+`entity[X]`), Lambda, While, comprehensions, Import, Try, With, class/function
+defs, AugAssign, chained/tuple Assign, loop `break`. A Call's function must be
+a bare Name.
 
-**Identifier surfaces** that resolve at runtime:
-- `_ALLOWED_FUNCS` — pure-Python helpers (min, max, abs, round, ...)
-- `_MATCH_FUNC_NAMES` — match-bound funcs (distance, entities_within,
-  summon, kill, has_action, var_keys, ...)
-- `HOOK_CONTEXT_NAMES` — bindings populated from EvalCtx.extras
-  during hook fires (action_name, actor, fail_reason, target, args,
-  ...)
-- `_ENTITY_TOKEN_NAMES` — self / this / current
-- `known_funcs` — user-defined `!func def`s on this match
-- `known_params` — for-loop variables (and locals in action mode)
+**Two modes.** EXPRESSION formulas (conditions: block / opaque / visibility /
+alive / death conditions, watcher conditions, slot conditions, modifier
+values, `$()` args) can't assign. PROGRAMS (passives, ticks, watcher effects,
+`!func` bodies, actions) can. A rule's schema says which (`"formula":
+"expression"|"program"`), and `!system set` validates it.
 
-**`entity[X].path`** is the read/write surface for entity vars. X
-can be a literal id, `self`/`this`/`current`, a known param, an
-action binding (target), or any HOOK_CONTEXT_NAMES name (actor, etc.).
-Other bare Names inside `entity[X]` are treated as **literal entity
-ids** for backward compat — be careful.
-The PATH side has reserved names too (`logic.RESERVED_VAR_PATHS`): `x`, `y`
-and `name` read the entity's own position / display name, and no var can be
-written at or under them.
+**Identifier surfaces** resolved at runtime: `_ALLOWED_FUNCS` (pure helpers),
+`_MATCH_FUNC_NAMES` (match-bound), `HOOK_CONTEXT_NAMES` (bindings a fire site
+supplies in EvalCtx.extras: actor, target, args, changed_key, pov_team,
+tile_x, corpse_id, vehicle, slot, skip_status, event_name, ...),
+`_ENTITY_TOKEN_NAMES` (self / this / current, and `parent` for a body part),
+`known_funcs` (the match's `!func`s), `known_params` (loop variables, and
+locals in action mode).
 
-**Action mode** lifts three restrictions:
-1. Bare-name assignments (`raw = 5`) become locals
-2. `source.x`, `target.x`, `args.x`, `loc.x` (any bare-Name root)
-   passes through to Python runtime attribute resolution
-3. `for x in target:` (loopable Name) when `target` is a list
+**`entity[X].path`** reads and writes entity vars. X is a literal id, a token,
+a known param, an action binding or any HOOK_CONTEXT name; any OTHER bare Name
+is read as a LITERAL id (`entity[foo]` = the unit with id "foo"). The path side
+has reserved names (`logic.RESERVED_VAR_PATHS`): `x`, `y` and `name` read the
+unit's position / display name, and nothing can be written at or under them.
 
-The validator pre-collects all `Assign` target names so RHS refs
-forward-validate.
+**Loops.** `for v in <call>` iterates only a `_LOOPABLE_FUNCS` function
+(`entities_within`, `parts`, `range`, `each`, `keys`, `team_members`, ...);
+`range(...)` gives counted loops and `each(value)` iterates a list or a dict's
+keys. No `break`: guard the body with a flag, or use a capped helper
+(`entities_in_line_until`, `lowest_var` / `highest_var`). Iterations are
+bounded by `formula_loop_limit`.
 
-**Important runtime semantics:**
-- `_fire_var_events` runs hooks bottom-up for subtree writes
-- `Match._var_event_depth` guards passive recursion
-- `Match._action_depth` suspends per-command snapshots during actions
-- `Match._death_processing` prevents recursive death checks
-- `Match._summon_count` per-command summon budget
+**Values.** Coordinates are LISTS (`[3, 3]`): built-in results are listified
+(`_listify`), a tuple literal compiles to a list, stored tuples become lists;
+read them with `coord_x` / `coord_y` or `get(c, 0)`. `get(container, key)`
+reads a list index / dict key / dotted path (subscripts are banned). Stored
+values are deep copies with string dict keys (`_own_value`), and only JSON
+values (numbers, text, bools, None, lists, dicts) can be stored.
 
----
+**Resource bounds.** `_ArithGuardTransformer` rewrites `** * + %` into bounded
+helpers before every compile (huge ints, huge strings / lists refused;
+`formula_size_limit`); geometry builders charge `formula_cell_limit`, sight
+lines `_check_line_budget`; `!func` recursion has its own limit. One bot
+process serves every server, so a formula's cost must follow the map, never
+its arguments.
 
-## 5. Specific traps and bugs that bit prior sessions
+**Action mode** (`action_mode=True`) adds: bare-name assignments become
+locals (the validator pre-collects assign targets, so later references
+validate); `source.<path>`, `args.<key>`, `target.x` etc. (any bare-Name root)
+pass through to runtime attribute resolution — Python dunders (`__x__`) are
+rejected there, engine dunder vars (`__follows`) are fine; `for x in target`
+when target is a list; the builtins `cmd`, `fail`, `choose`, `choose_number`.
 
-These are real bugs Claude shipped and then fixed. **Don't reintroduce
-them.**
+**Body sources** from chat contain a literal backslash-n: every body-accepting
+command calls `formula.normalize_body_source` (the harness un-escapes earlier,
+so scenarios mask a missing call — test with raw shlex input).
 
-### Action `cmd()` async crash
-
-The formula engine is synchronous; `ctx.send()` in the real Discord
-bot awaits a network round-trip. Driving an async coroutine with
-`.send(None)` raises `await wasn't used with future` on a real
-suspension. Fix: `_BufferCtx` collects send output synchronously
-during the action body; the top-level `run_action` flushes through
-the real awaitable ctx after the body completes. Don't break this.
-
-### CLI line-continuation `\n`
-
-shlex preserves literal `\n` (two chars: backslash + n) from
-CLI/Discord input. The formula sandbox can't parse a Python
-line-continuation followed by `n`. Fix: `formula.normalize_body_source`
-translates `\n`/`\t` at every user-input body boundary (passive add,
-gpassive add, func def, action discovery via `Action.from_dict`). If
-you add a new body-accepting command, **call this helper**. The
-scenario harness has its own `_interpret_escapes` that does the same
-thing earlier — so harness scenarios will MASK this bug. You must
-test with raw shlex input, not just the harness.
-
-### `entity[<binding>]` literal fallthrough
-
-The `_who_arg` helper defaults bare-Name subscripts to LITERAL ids
-unless explicitly handled. After adding new HOOK_CONTEXT_NAMES, also
-ensure they're in `_who_arg`'s dynamic-evaluation branch — otherwise
-`entity[actor].hp` reads the (nonexistent) entity with id `"actor"`.
-The handler is at `formula.py: _who_arg`.
-
-### Stale entity after damage
-
-`Entity.damage_entity` previously assumed the entity stayed in the
-match. The death pipeline detaches entities; `_require_match()` then
-raises. Always guard `self._match is not None` after any mutation that
-could trigger death.
-
-### Scenario harness ≠ correctness
-
-I'll say it again: **the harness only catches exceptions.** A
-scenario that should output "Damaged foe by 5" but actually outputs
-"❌ Cell occupied" will PASS the harness. Write end-state assertions
-that parse `!ent dump` / `!list` output.
-
-### Do audit/interaction passes YOURSELF — don't delegate to weak survey agents
-
-**User directive (standing, as of the audit-pass era):** for correctness /
-interaction audits on this system, do the work DIRECTLY — read the code, trace
-the cross-cutting paths, and write numeric/behavioral assertion harnesses
-yourself. Do NOT fan the audit out to a swarm of survey subagents running
-weaker models (e.g. Haiku). They are no longer sufficient for this task: a
-giant interconnected engine is the opposite of "obvious," and that's exactly
-where they fall down. They're fine for catching shallow, LOCAL issues (a
-missing import, a typo, "does X exist") — not for the interaction bugs that
-are the entire point of these passes.
-
-The evidence from the passes themselves: the swarm largely reported "clean,"
-while the bugs that actually mattered came from doing it by hand —
-`damage_spread`'s fragment-mode `NameError` (caught by a numeric harness, not
-an agent), the turn-order skip-loop crash + round inflation, the mount
-push/pull footprint bug, and the load-side deepcopy class. The agents'
-serialization "findings" were false positives that cost verification time.
-
-Yes, doing it yourself is more token-expensive. The user has explicitly said
-that's the right trade: **more results per pass beats cheaper passes.** So:
-- Read the relevant subsystems end-to-end and reason about how they compose.
-- Write throwaway numeric/end-state assertion scripts for every gnarly
-  primitive (damage_part, the modifier fold, damage_spread, clamps, geometry
-  — see the prior passes for the pattern). The harness only catches `💥`;
-  YOUR assertions catch wrong answers.
-- Reserve subagents for genuinely parallel, mechanical, LOCAL lookups, not for
-  holding the whole model in their head.
-
-### Don't blindly trust agent recommendations
-
-If you DO use an Explore or general-purpose agent for a narrow lookup, treat
-its output as a lead, not a conclusion. The agents get things wrong — they'll
-claim features don't exist when they do, miss key context, recommend features
-that already shipped, or flag false-positive "bugs" (e.g. the pass-11
-watchers/bound_channels shallow-copy claims, which were verified safe).
-**Verify every agent claim against the code yourself before acting or
-presenting it to the user.** Past survey agents have hallucinated ~30% of
-their recommendations.
+**Runtime guards** (all restored in `finally`): `_var_event_depth` (var-hook
+recursion), `_event_depth` / `_event_stack` (the event bus), `_action_depth`
+(also suspends per-command snapshots), `_death_processing`,
+`_alive_eval_depth`, `MatchManager._macro_depth`, `_summon_count` (per-command
+summon budget).
 
 ---
 
-## 6. Workflow patterns that work
+## 5. Bug classes, traps and the audit toolkit
+
+Every class below shipped at least once and was fixed in an audit pass
+(details per pass in `docs/audit_history.md`). Check new code against them.
+
+### Bug classes
+
+- **Aliasing (shared mutable objects).** A snapshot, a stored value or a
+  loaded match that shares a dict / list with live state gets corrupted by a
+  later in-place write: undo restored mutated values, a second restore of the
+  same snapshot differed, `entity[a].inv = entity[b].inv` made two units share
+  one inventory. Rules: `to_dict` AND `from_dict` deep-copy every nested field
+  (vars, statuses, tiles, zones, turn_order, rules, ...); every store goes
+  through `_own_value`. When live state looks right but a restored one
+  doesn't, suspect aliasing before the writer. Also: an undo / restore REPLACES
+  the Match object in `mgr.matches`, so re-fetch it after one.
+- **Ghost firing (a unit removed mid-operation).** A hook or tick that kills
+  or removes the unit, after which the code keeps acting on it: own passives
+  firing after a global handler removed the unit, the remaining statuses of a
+  unit killed by its first tick, a mover walking on after a lava tile killed
+  it, a damage share routed to a part the cascade already removed, a reply
+  looking up a unit that just died (💥). Rule: after any hook-firing call,
+  re-check `eid in m.entities` before touching the unit again; guard
+  `self._match is not None` after a mutation that can trigger death.
+- **Dangling relational ids.** Units reference each other by bare id
+  (`part_of`, `mounted_on` / `mount_slot`, `__follows`, a zone's `anchor`,
+  schedules). An id is the engine's only identity, so a stale one silently
+  latches onto whatever later takes that id. Every path that copies or moves
+  a unit across a boundary (corpse, clone, transfer / copy, transform, template
+  save / spawn, revive) remaps or strips these; removing a unit removes its
+  part subtree and closes snake chains.
+- **Anchor-only assumptions.** See §2 "smoke-test on a multi-tile entity".
+- **Round-keyed logic under ATB.** ATB disables rounds (`round_number` stays
+  1), so anything windowed or expiring by round silently never advances.
+  Key durations on `turns_elapsed` (counts in both turn models) or record
+  which clock a deadline used.
+- **Work that follows user numbers.** One process serves every server: a
+  loop, rectangle, line, repeat or recursion sized by an argument stalls the
+  whole bot. Clip to the map while building (`_grid_box`, `_line_span`,
+  `_clip_range`), charge a limit rule, give the rule a ceiling. A runaway must
+  also count iterations that dispatch nothing (an empty nested `repeat` once
+  bypassed `macro_step_limit`).
+- **Indirect recursion.** `!macro run` inside a macro, a `!run` file running
+  itself, `!again` inside a batch rerunning its container, an alias of `again`:
+  each recursed to Python's stack limit. Each indirection has a depth guard or
+  a refusal.
+- **Silent fallbacks.** A typo'd mode read as the default (a misspelled
+  metric became Chebyshev, an unknown damage mode split by weight), an unknown
+  `key=` option or a stray word dropped, a rule value stored unchecked, a
+  rule defined but read nowhere. Refuse unknown words, validate rule values
+  (schema min / max / choices / formula), and make fail-open conditions
+  report their errors where a GM looks (`!map cell ... for=`).
+- **Dropped output.** A Match method returns its hook log and the caller
+  threw it away, so passives fired silently. Formula mutators call
+  `surface_log`; command handlers append the log of every write they make.
+- **Rollback / undo vs runtime state.** `_rollback_match` copies serialized
+  state back and preserves an explicit list of runtime fields (event stack,
+  summon budget, pending requests, held commands, undo history, ...); a
+  stale list once wiped live emit frames and all undo history on any failed
+  action. `_restore_snapshot` carries the approval queue and held commands,
+  keeps live bindings per `undo_channel_bindings_mode`, keeps `paused`, and
+  re-copies `rules` from the system.
+- **Discord concurrency.** Each message is its own asyncio task and handlers
+  await their replies, so commands interleaved: one command's changes landed
+  in another's undo step. `CommandRegistry.run` holds a per-server lock
+  (re-entrant within a task via `_HOLDS_COMMAND_LOCK`). Per-command state
+  lives in context variables (`FORMULA_LOG_SINK`, `CURRENT_WORKSPACE`,
+  `_RUN_DEPTH`, `_AGAIN_ACTIVE`), never in a per-match list another task
+  could drain. Rendering in a worker thread gets a scene built on the loop
+  (`scene_for_png`) and only draws pixels.
+- **POV leaks.** Any reply naming units, positions, vars or events can leak
+  what a fogged team shouldn't see: listings, `!ent info`, `!dist`, `!find`,
+  diffs, logs, camera centering, corpses inside tile data. See §7 "Access,
+  POV".
+- **Non-string joins.** `", ".join(...)` / an `re.sub` replacement fed a
+  number from a var (a numeric team, an int dict key) 💥'd. `str()` values
+  from vars before joining.
+- **Function-local imports shadow module names.** `from formula import
+  FormulaError` deep inside a handler makes `FormulaError` local to the
+  WHOLE function, so an earlier `except FormulaError` raised
+  UnboundLocalError. Import at module level (an `as` alias is safe).
+- **Non-JSON values.** A `type` object reached via a dunder, or a function
+  used as a value, stored in a var made the match unsaveable. Stores refuse
+  anything but JSON values; action mode rejects dunder attributes.
+
+### Other traps
+
+- **Action `cmd()` and async.** The formula engine is synchronous and a real
+  Discord `send()` awaits; `_BufferCtx` collects output during the body and
+  the top-level `run_action` flushes it afterwards. Don't drive coroutines
+  with `.send(None)`.
+- **The harness masks escape handling** (§4 "Body sources").
+- **Harness-author mistakes that looked like engine bugs:** there is no `!ent
+  damage` (use `!ent hp x -5`; a bare `!ent hp x 5` SETS 5); `!passive add`
+  takes `target=` / `scope=` BEFORE the quoted formula; `!ent move <id> <n>
+  <dir>` (count first) but `!ent push <id> <dir> [n]`; the default soft clamp
+  caps hp at max_hp, which defaults to the spawn hp; spawning onto an occupied
+  cell fails (so a later mount has no rider); transform needs a CAPTURED
+  statblock; coordinates are 1-based; `nearest_entity` takes the relation
+  SECOND, `entities_within` FOURTH. Write probes to a FILE: `bash -c "python
+  -c ..."` mangles nested quotes.
+
+### Do audits yourself
+
+User directive: for correctness / interaction audits, do the work directly —
+read the subsystems end to end, trace the cross-cutting paths, write numeric
+and behavioral assertion harnesses. Survey subagents on weaker models
+reported "clean" while the bugs that mattered came from by-hand work, and
+their findings were ~30% false positives. More results per pass beats cheaper
+passes. Use subagents only for mechanical, local lookups, and verify every
+claim an agent makes against the code before acting on it or repeating it.
+The freshest code is the highest-yield target.
+
+### Audit toolkit
+
+Throwaway harnesses that found real bugs; rebuild them from these
+descriptions (pass numbers point at `docs/audit_history.md`):
+
+- **Stateful chaos** (28, 30): ~70 command shapes on a rich board (multi-tile,
+  parts, segments, mounts, auras, statuses, fog, two matches, host + a
+  red-POV player, undo with bindings, transfers, ATB toggling, disguises),
+  asserting after EVERY step: no dangling ids, coordinates in bounds,
+  turn cursor in range, guards / vision memo / event stack at rest, JSON round
+  trip idempotent, manual saves intact. Wrap every handler to print the
+  traceback of a non-VTTError. HOSTILE mode adds lethal global passives, lava
+  tiles and killing zones.
+- **POV leak detector** (30, 33): a fogged board with distinctively named
+  hidden things (part, hidden rider, corpse, action, status, schedule, zone,
+  tile, team data); every root × subcommand (`registry._help`) × an argument
+  pool run as a red-POV player; replies grepped for the hidden names, values
+  and cells after stripping echoes of the typed args. Include list KINDS
+  (`commands`, `turns`) in the pool.
+- **Formula-function fuzzer** (30): every function × wrong-typed /
+  missing-entity / wrong-arity args under a 1 s SIGALRM; flag raw Python
+  messages after "Runtime error:".
+- **Command fuzzer** (30): every root × subcommand × junk / ids / numbers /
+  paths / `$()` as host (~100k runs), flag 💥 / Runtime / timeouts; point
+  `vtt_commands.SAVES_DIR` at a temp dir first.
+- **Huge-number timing fuzzer** (34): 10⁹ / -10⁹ in every numeric position of
+  every command and every state-changing function, under SIGALRM.
+- **Reload differential** (34, 35): the same random commands on a live
+  manager and on a save/load copy taken mid-game, comparing every reply and
+  the full state each step (exclude the runtime-only queues).
+- **Memory-equals-disk chaos** (storage work): reload the data folder into
+  fresh workspaces after every command and compare every match, history index
+  and snapshot state, channel pointers and systems.
+- **Command-vs-formula parity** (35): each operation as `!command` and as its
+  formula function on identical boards; compare end states.
+- **Model-based undo** (30): random mutations + `undo command N`, checking each
+  lands on the state recorded N commands back, under several retention caps.
+- **Store fuzzer** (36): every read-only function's result written into a var,
+  then JSON round trip and equality.
+- **Stray-word detector** (36): every scenario command re-run with an extra
+  word; report replies that aren't errors and don't mention it.
+- **Renderer parity** (graphics passes): per-cell ownership (ASCII glyph vs
+  top scene placement), pixel parity (glyph pixels where ASCII shows a
+  non-`.`, fog where it shows the fog glyph), windowed render == crop of the
+  full render.
+- **Registry-vs-code checks** (28): every literal `rules.get("X")` exists in
+  RULES_REGISTRY; every `_MATCH_FUNC_NAMES` entry is registered and callable;
+  the ARG_SAFE / ARG_MUTATING sets partition the match functions.
+- **Statistics for RNG primitives** (28): sample thousands of
+  `hit_location` / `roll_table` picks and compare to the weights.
+- **The suite as a detector** (31): list every `❌` / `⚠️` reply and every
+  "X → Y" figure in the Expected prose and check each against its scenario;
+  scenarios that pass while testing nothing hide real bugs.
+- `pyflakes` after edits to error paths (catches NameErrors in except clauses).
+
+---
+
+## 6. Working with the user
 
 ### Designing a new feature
 
-1. `git fetch origin main && git checkout main && git pull && git checkout -b claude/<name>`
-2. **Ask design questions before coding** if the feature has >2
-   reasonable shapes. Use `AskUserQuestion` with the recommended
-   option labeled. The user is decisive and appreciates being asked
-   crisply, but hates being asked obvious questions.
-3. Locate the existing chokepoints/primitives you'll extend. Read
-   the surrounding 50-100 lines so your code matches the local
-   conventions (comment density, helper naming, error message
-   formatting).
-4. Land the change in small commits if it's >300 lines. Each commit
-   should pass the regression on its own.
-5. Write scenarios that demonstrate the **happy path** AND at least
-   one **failure/edge case** for each new behavior.
-6. Run the harness. Spot-check verbose output. Write assertion
-   scripts for hp deltas, var values, error messages.
-7. Commit with a dense message naming the mechanism + trade-offs.
-8. Push, open the PR, write a body that covers: summary, mechanism,
-   new surface, test plan with the regression count, and a "notes"
-   section flagging known limitations or follow-ups.
+1. Fresh branch from main (§2).
+2. **Ask the design questions before coding** (below).
+3. Find the chokepoints / primitives you'll extend (§3) and read the
+   surrounding 50-100 lines, so your code matches the local conventions
+   (comment density, helper naming, error message wording).
+4. Land a change of 300+ lines in small commits, each passing the regression.
+5. Scenarios: the happy path AND a failure / edge case for each new behavior,
+   with `!assert` / `??` checks (§2).
+6. Run the harness, read the replies (`--review`), write assertion scripts
+   for hp deltas, var values and error messages, and do the multi-tile smoke
+   test.
+7. Dense commit message; push; open the PR with a summary, the mechanism, the
+   new surface, a test plan with the regression count, and notes on known
+   limitations and follow-ups. Update this file (§7, §8) in the same PR.
 
-### Communicating with the user
+### Asking questions
 
-- They prefer **short, direct messages** with content over ceremony.
-- They like seeing the **regression count** ("330/330") and a quick
-  summary of the most important behavioral change.
-- They will **catch sloppy work**. Don't claim something works
-  without verifying. Don't write speculative prose in scenarios — if
-  the behavior is X, write that X is the expected.
-- They are **OK with imperfect first attempts** if you flag what
-  needs follow-up. Don't pretend you've nailed everything when
-  there are open questions.
-- They are **fast** — they'll merge a PR within minutes, ask for the
-  next feature immediately. Sync main and start a fresh branch
-  before doing the new work.
+The user has said it explicitly: more questions beat an implementation that
+drifted from intent. If a feature is ambiguous in shape, signature, behavior,
+edge cases, naming or scope, ask. They answer fast and read good questions as
+care; they're unhappy having to ask "why does this do X instead of Y?" after a
+merge. Skip questions whose answer is obviously settled.
 
-### When something feels architecturally murky
+- **Bounded choices** (which mode, which stat, which enable mechanism): use
+  `AskUserQuestion` with the recommended option first and labelled.
+- **Open-ended direction** ("which idea next", a menu of features): ask in
+  PLAIN PROSE, never the questionnaire — each idea needs room, and the user
+  answers in their own words (directive, restated more than once).
+- **Read free-text answers fully:** they often add requirements beyond the
+  options (the template version trash came that way). Confirm the full list
+  before building when an answer reshaped the plan.
 
-Ask one focused `AskUserQuestion` with the recommended path
-labeled. The user has strong preferences and will tell you which
-way to go. Better than guessing wrong and having to refactor.
+**Ordering questions against the work** (directive — the user checks in only
+occasionally, so a question asked mid-work idles the session until they
+return):
+- **Bugfix / audit passes:** fix everything with a clear answer FIRST, then
+  ask the open questions together at the end.
+- **Features:** as many questions as possible UPFRONT, then build everything
+  certain, and save questions that come up during the work for the end. Ask
+  mid-way only when the answer blocks development or testing.
 
-### When in doubt, ask — implementation drift is much worse than questions
+### Communicating
 
-More questions is always better than the user later seeing the
-implementation drifted from intent. The user has said this
-explicitly. If a feature has ambiguity in shape, signature,
-behavior, edge case handling, naming, or scope — **ask, don't
-guess**. The user is fast to answer and treats good questions as a
-sign of care, not slowness. They will be unhappy if they have to
-ask "why does this do X instead of Y?" after merge.
-
-Prefer `AskUserQuestion` with a recommended-option-first list over
-free-text questions; they're easier to answer. EXCEPTION (user
-directive, restated more than once): for OPEN-ENDED "what feature
-should I build / which idea next" questions, ask in PLAIN TEXT prose,
-NOT the questionnaire — the menu of ideas needs room to explain each,
-and the user wants to answer in their own words. Use the questionnaire
-for bounded design choices (enum-shaped: which stat, which mode, which
-enable-mechanism), not for picking a direction. Skip questions
-about things that are obviously settled (don't ask "should I
-keep the existing test passing?"), but otherwise the bar for
-asking is low. A 30-second clarification beats a 300-line refactor.
-
-### When to ask: ordering questions against the work (user directive)
-
-- **Bugfix / improvement passes:** when a pass turns up several issues and
-  only some have open questions, fix the ones with a clear solution FIRST,
-  then ask the open questions together at the end. Don't stop the pass at
-  the first question.
-- **Feature additions:** put as many implementation questions as possible
-  UPFRONT, before coding. Then build everything you're certain about. Save
-  any questions that come up during the work for near the end. Ask mid-way
-  only when the answer blocks the rest of development or testing.
-
-Why: the user checks in only occasionally while a pass or feature runs
-(often many minutes). A question asked mid-work leaves the session idle until
-they return; asked at the end, it costs nothing.
+- **Short, direct messages** with content over ceremony. Lead with the
+  regression count ("722/722") and the most important behavioral change.
+- **Never claim something works without verifying it.** The user catches
+  sloppy work. Scenario prose states the observed behavior, never a guess.
+- **Imperfect first attempts are fine when flagged.** Say what needs
+  follow-up and which questions are open.
+- **The user merges within minutes** and asks for the next thing; sync main
+  before new work. They test after merging (not production code yet), so
+  bugs they find arrive with the next request.
+- **Scope grows in flight** — the user expects you to adapt. Keep each PR
+  internally consistent and say when a follow-up would be cleaner as its own
+  PR.
 
 ---
 
-## 7. Current state of the project (as of this handoff)
+## 7. Subsystem reference
 
-Shipped capabilities (roughly chronological; all merged):
-- Match history / undo system
-- Passives + var hooks + tile hooks
-- Status system (entity.status dicts; self-describing status
-  definitions — see the rich-statuses entry below)
-- Clamp system (entity + system-level)
-- Tile templates + tile time-hooks
-- Formula functions (`!func`)
-- Alias system (per-match + per-system)
-- `!batch` / `!run` for grouped commands under one undo entry
-- `!history diff` between snapshots
-- `!find` with predicate prefixes (status:, group:, action:)
-- Push/swap/step movement primitives + `on_entity_step` hook
-- **Movement blocking (impassable tiles / zones) — SHIPPED.** A cell blocks
-  a mover when its tile OR any covering zone evaluates a block condition
-  truthy for that entity. Conditions are formula EXPRESSIONS (NOT action
-  mode — read mover vars via `entity[self].flying`, not `self.flying`) so
-  blocking is conditional ("short wall blocks unless flying"). Resolution
-  mirrors glyph layering: a tile's own `block` data field > its template's
-  `block` > the `tile_block_condition` rule; zones use the zone's `block`
-  data > `zone_block_condition`. A block value is a formula string OR a bare
-  bool/number (`block=true` = always impassable). Fail-OPEN: a malformed
-  formula — or one reading a var the mover lacks — does NOT block (give
-  gating vars a default via `!defvar` so reads resolve). Hooked into every
-  movement verb (`Entity.tp`, `Entity.move_dirs` via a new `block_mode`
-  param, `push_entity`/`pull_entity` prefix-walk, `swap_entities`); the raw
-  `move_to` primitive and spawn/summon are never gated. Per-kind toggles:
-  `block_walk`/`block_tp`/`block_push`/`block_swap` rules (all default True;
-  walk/tp/swap RAISE `Blocked`, push/pull stop at the cell before the wall).
-  Core helpers: `Match.cell_blocks(mover, x, y)` (raw geometry) +
-  `_check_block(mover, x, y, mode)` (consults the block_<mode> rule).
-- **`!map resize <w> <h> [anchor]` — SHIPPED.** `Match.resize_grid(new_w,
-  new_h, anchor)` repositions ALL coordinate-bearing content (entities,
-  tiles, corpses-in-tile-data, zone cells, fog `explored`) by an offset
-  derived from a 9-point anchor (`_RESIZE_ANCHORS`): the compass point
-  where existing content stays put. top-left (default) = offset (0,0)
-  (coords unchanged, grow/cut at bottom-right); right/bottom = full delta;
-  center/middle = half. Shrinking that pushes a live entity off-grid obeys
-  the `map_resize_shrink_mode` rule (enum block|kill, default block): block
-  RAISES listing the offenders (no change); kill runs `kill_entity` (the
-  configured kill function) on them then proceeds. Off-grid tiles/corpses
-  are dropped + zone cells clipped regardless (only entities trigger
-  block). Host-gated via `ELEVATED_ARGS["map"]` (resize bumps the
-  otherwise-`all` `!map` to host). Undoable (command snapshot).
-- **Directional values / facing-relative sides — SHIPPED (first slice).** The
-  facing-relative layer on top of the existing absolute geometry
-  (`angle`/`direction_to` already give objective up/down/left/right). Formula
-  primitives (all in `formula.py`): `relative_angle(facing, abs_angle [,signed])`
-  (pure; abs bearing → entity frame, 0=front), `relative_side(facing,
-  abs_angle [,sides,corner_arc])`, `side_hit(target, from_x, from_y
-  [,sides,corner_arc])` (the headline combat primitive: which side of the
-  target a hit FROM (x,y) lands on — reads target facing + pos, bearing
-  target→source), `facing_of(eid)` (bridges the facing attribute, which is
-  NOT a var and was previously unreadable from formulas), and
-  `directional_get(eid, base, from_x, from_y [,default,sides,corner_arc])`
-  (computes the side, reads `base.<side>`, default if missing — the
-  one-call directional-armor read; equivalent to `var_get(eid, base + "." +
-  side_hit(...))`). Sides: `front`/`back`/`left_side`/`right_side` (NOT
-  bare left/right — those mean absolute map directions everywhere else),
-  plus `front_right_side`/`back_right_side`/`back_left_side`/`front_left_side`
-  when `sides=8`. 4-way = four 90° faces (exact for a square). 8-way: each
-  diagonal CORNER spans `corner_arc`° (rule `directional_corner_arc`,
-  default 30, per-call override), cardinal faces span `90 − arc` — so a
-  square's corners are narrower targets than its faces; arc=0 collapses to
-  4-way, arc=45 = equal octants. Helpers `_relative_side_name`,
-  `_relative_angle`, `_facing_degrees`, `_SIDE_CARDINALS`/`_SIDE_CORNERS`.
-  Malformed/missing-var fails by raising (FormulaError) like other funcs.
-  Verified: directional armor/weakspot (back hit > front hit) via an action.
-  FUTURE slices the user may want: configurable side NAMES (gamerule) —
-  deferred by the user in the 2026-10 idea round ("decide later").
-  (entity-shape hitboxes + LOS-aware raycast SHIPPED — see the
-  "Directional/vision geometry" entry below.)
-- Action system (full body language with cmd/fail/source/target/args,
-  transactional rollback, target types entity/location/entity_list/
-  location_list/none/corpse/corpse_list, recursion limit, allowlist,
-  on_action_used/on_action_used_on_target/on_action_failed, `kill`/
-  `revive`/`has_action`/`use_action`/etc.)
-- Container var primitives (var_keys, var_sum, var_clear, etc.)
-- Summon system (entity templates in vars/tiles; summon/summon_near/
-  summon_from/entity_snapshot/remove_entity)
-- round_number / turn_index match-clock primitives
-- Death and corpses — SHIPPED:
-  - Configurable death condition (default `hp <= 0`)
-  - Per-entity override modes (additive/replace)
-  - Corpse OR delete result; tile-data storage
-  - on_death / on_revive hooks
-  - kill() / revive() / has_corpse / corpse_at / all_corpses primitives
-  - corpse / corpse_list action targets
-  - !ent store_entity_into_var command (capture entity to template)
-  - !list Dead: section
-  - corpse_id_uniqueness rule
-  - __cell_stackable per-entity flag
-  - default_kill_function_effects / default_revive_function_effects
-    / corpse_line_format gamerules
-- Zones (named multi-cell regions): `Match.zones`, !zone command,
-  zone_* formula functions, boundary + per-cell + time hooks, drifting
-  via zone_shift. (See the zones commits.)
-- **Host / access-control system + multi-channel binding** — the big
-  structural one; read this before touching dispatch or the Discord
-  adapter:
-  - **Identity.** The command context now carries a user identity
-    (`ctx.user_id` / `user_name`), which the engine previously lacked.
-    Discord fills it from the message author; CLI + the scenario harness
-    use a switchable `"cli"` stand-in flipped by `!as host|player`
-    (gated behind `ctx.cli_mutable`). Read via `ctx_user(ctx)` /
-    `ctx_user_name(ctx)` in vtt_commands.py — both return None-safe
-    fallbacks so an identity-less surface DISABLES gating rather than
-    locking out.
-  - **Ownership.** `Match.owner` (the creator, set by
-    `create_match(owner=...)`) + `Match.cohosts`. is_owner / is_host /
-    add_cohost / remove_cohost. Owner = sole host-MANAGER; co-hosts share
-    full command privileges but can't appoint. `!host add/remove/list`
-    (owner-only). All persisted.
-  - **Multi-channel binding.** `Match.bound_channels`
-    (channel_key -> {"label"?, "pov"?}), uncapped. `!match
-    bind/unbind/channels`; `match use`/`bind` keep
-    `MatchManager.active_by_channel` in sync. The `label` is a free-form
-    tag; the per-channel `pov` (on-demand fogged views) is detailed in
-    Visibility Piece 1 below. PUSH auto-routing (the bot re-posting each
-    channel's view on state change) is the parked auto-update idea, not
-    built.
-  - **The gate** lives in `CommandRegistry.run` →
-    `_gate_decision` / `_effective_access` (vtt_commands.py). Per-command
-    access level via `registry.command(access=...)`: `"all"` /
-    `"host"` (DEFAULT, mutating — non-host's invocation is held for
-    approval) / `"host_only"` (approve/deny themselves) / `"owner"`
-    (host mgmt). A host-gated root auto-downgrades to "all" when its
-    first arg is one of THAT ROOT's read-only subcommands
-    (`READ_ONLY_SUBCOMMANDS`, a per-root dict — `list`/`info`/`cells`/...;
-    `dump` deliberately excluded), so players can inspect but not mutate.
-    It is PER ROOT because a global word set let a player's `!batch list ;
-    ent hp boss -40` run unapproved (args[0] of batch/emit/eval/run is
-    content, not a subcommand — scenario 570); a new command gets no
-    downgrade until its read-only subs are listed there. Gate is a NO-OP when there's
-    no active match, no identity, or `owner is None` (legacy/open
-    matches) — which is why SERVER-WIDE commands have their own admin check and
-    match-NAMING commands their own target check (see "Server workspaces"
-    in §3). Alias resolution runs BEFORE the gate; `dispatch_no_snapshot`
-    (batch/run/action `cmd()`) is intentionally ungated since it's only
-    reached from an already-approved/host context — gate stays at the
-    top level only.
-  - **Approval queue.** Non-host commands → `Match.add_pending_request`
-    (runtime-only, not serialized). Surfaced as Discord Approve/Deny
-    buttons (`_ApprovalView` in discord_commands.py, host-only,
-    re-dispatches with the clicker's authority) OR text
-    `!approve`/`!deny`/`!pending` (work everywhere, harness-testable).
-  - **TWO access-override layers — don't conflate them** (this bit
-    confused even me; comments at `!system access` in vtt_commands.py
-    spell it out):
-    1. The `command_access` RULE = system-wide default. It's a DICT rule,
-       so `!system set` refuses it (dict/list rules each get a dedicated
-       editor — `!log format`, `!gclamp`, and now `!system access`).
-       Edited via `!system access <sys> set/clear/list`; flows into a
-       match's `rules` snapshot at create + every `refresh_match_rules`.
-    2. `Match.access_overrides` = per-match host tweak, edited via
-       `!host access set/clear/list`. It lives in its OWN field, NOT in
-       `rules`, SPECIFICALLY so a rule refresh (any `!system set` /
-       `!system access`) does NOT wipe it. The gate checks
-       access_overrides FIRST, then the rule, then defaults — so a
-       per-match host decision always beats the system default. Do NOT
-       "simplify" by folding access_overrides into rules; that would let
-       `!system access` clobber every host's per-match lockdowns.
-    The point of both: fog-of-war / invisibility matches can host-gate
-    reads (`ent dump`, `find`, `map`) so players can't enumerate hidden
-    entities — per match (`!host access`) or as a system default
-    (`!system access`).
-- **Visibility rework — PIECE 1 (entity visibility + per-channel POV).**
-  The first slice of a since-completed arc — range fog, LOS, fog memory,
-  and tile/zone/corpse visibility (Pieces 2–3 + LOS) all shipped below.
-  - **Per-channel POV.** `bound_channels[ch]["pov"]` = a team string, or
-    absent/`"omniscient"` = sees all. `Match.channel_pov(ch)` returns the
-    team or None (None = omniscient = no filtering). Set via `!match bind
-    pov=<team>` / `pov=omniscient`; shown in `!match channels`. POV is
-    per-CHANNEL, not per-user (a player in red-channel sees red's view
-    regardless of who they are).
-  - **CLI preview.** `!as view <team> | omniscient | clear` sets a
-    TRANSIENT `ctx.pov_override` (CLI-only, not persisted) — the POV
-    analog of `!as host|player`. Orthogonal axis from identity (changing
-    identity doesn't touch POV). `_view_pov(ctx,m,args)` resolves:
-    `full` arg → omniscient; else ctx override; else channel binding.
-  - **The visibility primitive.** Gamerule `entity_visibility_condition`
-    (formula EXPRESSION, default "" = all visible). Evaluated per entity
-    by `Match.entity_visible_to(eid, pov_team)` with `self`=entity +
-    `pov_team` binding (added to HOOK_CONTEXT_NAMES). Truthy = visible.
-    Omniscient (None pov) or empty rule short-circuits to visible;
-    malformed formula → visible (don't blank the board on a GM typo).
-    Engine hardcodes no "invisible"/"stealth" concept — it's all in the
-    formula + entity data.
-  - **Where it filters.** `render_ascii(pov_team)` filters the ENTITY
-    glyph layer; `!list`/`!state`/`!map` filter the live-entity roster +
-    map. (Tile / zone / corpse POV filtering followed in Piece 2.)
-  - **Full reveal.** `!state full` / `!map full` / `!list full` force the
-    omniscient view and are HOST-GATED via `ELEVATED_ARGS` (the inverse
-    of `READ_ONLY_SUBCOMMANDS` in `_effective_access`: a `full` first-arg
-    bumps an otherwise-`all` read up to `host`).
-- **Visibility rework — PIECE 2 (tile / zone / corpse visibility).**
-  Same pattern as Piece 1, three more rules, all default "" = visible:
-  - `tile_visibility_condition` — bindings `pov_team` + `tile_x`/`tile_y`
-    (inspect via `tile_get`/`tile_has`). Filters the tile glyph layer +
-    `!tile list`/`!tile info` (a hidden tile reads as "no data", so a
-    player can't probe for a trap).
-  - `zone_visibility_condition` — bindings `pov_team` + `zone_name`.
-    Filters the zone glyph layer + `!zone list`/`info`/`cells` (hidden =
-    "not found").
-  - `corpse_visibility_condition` — a corpse is a stored SNAPSHOT, not a
-    live entity, so NO `self`/`entity[X]`. Bindings: `pov_team`,
-    `corpse_team` (the dead entity's team_var at death; new
-    HOOK_CONTEXT_NAME), `tile_x`/`tile_y`. Filters the Dead: section of
-    `!list`/`!state`.
-  - All four (incl. Piece 1's entity rule) now share
-    `Match._visibility_visible(rule_key, pov_team, target=, extras=)`.
-    Reminder asymmetry: a TILE stores its map glyph at the top level of
-    its data dict (`!tile set <x> <y> glyph <c>`), but a ZONE stores it
-    in a dedicated field set by `!zone glyph <name> <c>` (NOT `!zone
-    set ... glyph`, which writes zone DATA).
+How each part of the engine works NOW, with the invariants that bit before.
+Rule details live in RULES_REGISTRY descriptions; scenario ranges point at
+working examples. Standing direction from the user: **more gamerules, fewer
+hardcodes**.
 
-Standing direction the user keeps reaffirming: **"more gamerules, fewer
-hardcodes"** — almost every engine behavior should be configurable.
+### 7.1 Units, vars and stores
 
-More shipped work (continuing the list above):
-- **`default_entity_vars` gamerule (SHIPPED — fog precursor).** Dict rule
-  (var-path -> default value) applied in `Entity.spawn` at the very start,
-  before vital-var validation, filling only MISSING vars (so an `!ent add`
-  / summon-template / revive-snapshot value always wins). A default can
-  even satisfy a required var (e.g. hp). Edited via `!defvar
-  add/remove/list` (the var analog of `!defpassive`/`!gclamp`; values
-  coerce via `_parse_scalar` like `!ent set_var`, dotted paths nest). The
-  intended home for `fog_vision_radius`.
-- **Visibility rework — PIECE 3 SHIPPED (fog of war, RANGE-ONLY).**
-  Per-entity vision-radius var (`fog_vision_radius`, defaulted via
-  `default_entity_vars`); a team sees the UNION of cells within each
-  alive member's radius (metric = `fog_range_mode` rule, default
-  `square_radius`/Chebyshev; missing var = radius 0). Per-match
-  `Match.fog_enabled` (its OWN field, seeded at creation from the
-  `fog_enabled_by_default` rule, toggled by `!match fog on|off`, survives
-  rule refresh like access_overrides, serialized). HYBRID: the engine
-  auto-applies fog (`render_ascii` paints `fog_glyph` over unseen cells;
-  each `*_visible_to` ANDs a `_fog_sees` cell check so
-  entities/tiles/zones/corpses in fog hide across map + every listing)
-  AND exposes `team_sees_cell` / `team_sees_entity` / `can_see` formula
-  primitives (they ignore `fog_enabled` — raw sight queries). Omniscient
-  POV (None) / `!… full` / fog-off all bypass. Vision math:
-  `Match._within_vision` + `_vision_radius_of`; zone fog = "any cell
-  seen". LOS (opaque tiles blocking sight) and explored memory remain
-  SEPARATE future pieces, explicitly out of scope.
-- **Fog MEMORY (explored terrain) — SHIPPED.** Per-match `Match.fog_memory`
-  (own field; seeded at creation from `fog_memory_enabled_by_default`
-  rule, default off = "resets to current vision each time"; toggled by
-  `!match fog memory on|off`; survives refresh; serialized). `Match.explored`
-  = per-team set of seen (x,y), accumulated by `Match._record_vision` on
-  every entity move (`fire_entity_moved` + per-step `fire_entity_step`)
-  and spawn, and seeded for present teams when memory is toggled on;
-  cleared when toggled off; serialized as `{team: [[x,y],...]}`. Remembered
-  cells stay un-fogged. The `fog_memory_mode` rule (enum, default `full`)
-  controls remembered-cell CONTENT: `full` = everything incl. live
-  entities ("once seen, stays visible"); `terrain` = only static features
-  (tiles/zones/corpses) remembered, LIVE entities still need current
-  vision. Two gates: `_fog_terrain_visible` (current OR remembered — used
-  by tiles/zones/corpses + the map fog overlay) vs `_fog_entity_visible`
-  (current always; remembered only when mode==full).
-- **Line of sight / opacity — SHIPPED (first slice).** Sight is blocked by
-  OPAQUE cells, modeled exactly like the movement `block` system but for
-  vision. Rules `tile_opaque_condition` / `zone_opaque_condition` (formula
-  EXPRESSIONS, `self`=the VIEWER + `tile_x`/`tile_y`), overridden per-cell by
-  an `opaque` data field: instance > template > rule (zones: zone `opaque`
-  data > rule). Bare bool/number allowed; fail-TRANSPARENT (a typo must not
-  blind). Separate from `block` (window vs smoke). `Match.cell_opaque(viewer,
-  x, y)` = the raw opacity query; `Match.has_los(viewer, x1,y1,x2,y2)` =
-  the LOS walk: SUPERCOVER of the segment between tile centers (tiles = unit
-  squares), GEOMETRIC integer DDA (cross-multiplied `(2n+1)` boundary
-  compare, no floats) so it's SYMMETRIC; viewer's own cell + target's own
-  opacity never block. The diagonal-corner case obeys the `los_corner_mode`
-  rule (`permissive` default = only an X of BOTH flanking cells blocks;
-  `strict` = any corner-touch; `open` = corners never block). Fog wiring:
-  the `fog_los` rule (system-level, default False — NOT a per-match field,
-  unlike `fog_enabled`/`fog_memory`) switches whether the auto-fog factors
-  LOS; `Match._fog_team_sees` (= `_team_sees(..., los=fog_los)`) is the
-  single funnel behind `_fog_terrain_visible`/`_fog_entity_visible` +
-  `_record_vision`, so fog hiding/map-overlay/explored-memory all become
-  LOS-aware at once. `_record_vision` now iterates each member's vision-
-  radius NEIGHBOURHOOD (not the whole grid) — the radius-bounded perf fix.
-  Formula prims: bare `can_see`/`team_sees_cell`/`team_sees_entity` now mean
-  range AND los; `_rangeonly`/`_losonly` variants isolate each; `has_los(x1,
-  y1,x2,y2[,viewer])` is the raw line query (all ignore the toggles). NOTE
-  viewer-conditional opacity needs the gating var to exist (`!defvar`) or it
-  fails transparent. Vision math in `logic.py` ~`team_sees_cell`..
-  `_record_vision`.
-- **Coord-return convention + entity-LOS — SHIPPED (LOS slice 2).** Two
-  follow-ons to the LOS slice. (1) **Coords as return values.** The sandbox
-  bans subscript/attr-on-call, so a returned `(x,y)` was unreadable; the
-  convention is now pure extractors `coord_x(c)`/`coord_y(c)` (accept an
-  [x, y] pair or an action `Coord`; raise on None — check `c == None`
-  first). Coordinates are LISTS in formulas since audit-pass-35: function
-  results are listified, a `(3, 3)` literal compiles to a list, stored
-  tuples become lists. `first_opaque(x1,y1,x2,y2[,viewer])` returns the first opaque cell
-  strictly between as an (x,y) pair (read via coord_x/coord_y) or `None` if
-  clear — `Match.first_opaque` over the shared `Match._line_cells` (the thin
-  DDA path used by has_los, factored out). (2) **Entity-factoring LOS** as
-  pure primitives (fog NEVER factors entities — unchanged). The old
-  Bresenham `entities_in_line` is REPLACED by `entities_in_line_ignorelos(x1,
-  y1,x2,y2)` (supercover thin-line, endpoints INCLUDED, walls ignored,
-  near→far) + `entities_on_los(x1,y1,x2,y2[,viewer])` (STRICTLY BETWEEN —
-  shooter+target excluded — sight-aware: cut at the first opaque cell via
-  per-cell has_los; near→far). No `block_entities` flag (rejected — "a tiny
-  body shouldn't block a shot over it"); the GM composes the block rule in
-  the action loop (`for e in entities_on_los(...): if not entity[e].tiny:
-  fail(...)`). NOTE `!ent set_var x v false` coerces only LOWERCASE
-  true/false to bool (capitalized stays a string → truthy); formula BODIES
-  use `True`/`False`.
-  - Possible later: per-channel PUSH auto-routing (the auto-update idea
-    below); corpse STATUS introspection (vars now exposed via corpse_var,
-    status still not); elevation as a first-class rule; vision-result
-    caching beyond the radius bound.
-- **Large / multi-tile entities — SHIPPED.** An entity can occupy a W×H
-  RECTANGLE of cells anchored at its TOP-LEFT cell (`entity[X].x/.y` stays
-  the sole addressing convention; the footprint extends right/down). W and
-  H live in entity vars named by the `footprint_width_var` /
-  `footprint_height_var` rules (default vars `footprint_w`/`footprint_h`;
-  absent or <1 = 1, so a plain entity is byte-for-byte unchanged). Set per
-  entity (`!ent set_var dragon footprint_w 3`), via a summon template, or
-  globally with `!defvar` (defaults are applied in `spawn`/`summon` BEFORE
-  the footprint-aware bounds/occupancy check). There is NO `!ent add` size
-  arg — footprint is "just a var," but a write that GROWS the body is
-  checked like a move (`Match.check_body_fits`, called from write_var and
-  transform: refused if a new cell is off-grid or taken; audit-pass-36), and
-  a side is read capped one past the grid side. Core geometry on `Match`:
-  `entity_footprint(e)`→(w,h), `entity_cells(e[,ax,ay])` (row-major, [0]=
-  anchor), `entity_occupies(e,x,y)`, `cell_occupant(x,y,ignore=())` (the
-  footprint-aware occupancy core behind `is_occupied`), and the single
-  placement gate `_validate_placement(e,ax,ay,mode)` (bounds+occupancy+
-  block, ignoring the mover's own cells). Policies the user chose (all
-  hardcoded defaults, NOT gamerules — "only-anchor-matters" is too
-  unintuitive to warrant a knob): distance = NEAREST footprint cell;
-  boolean membership (fog/AoE/zone/LOS-line) = ANY footprint cell; outward
-  VISION = UNION of every footprint cell's sight disc. Threaded through:
-  movement (`tp`, `move_dirs` validates the WHOLE swept footprint each step
-  so a body can't squeeze through a gap narrower than itself; final
-  footprint must be unoccupied), push/pull (whole shifted body), swap
-  (different-size legal iff each relocated footprint fits — anchors
-  exchanged), spawn/summon (`summon_near` searches for an anchor where the
-  whole footprint fits), `render_ascii` (glyph painted on every covered
-  cell), resize (cut if ANY cell off-grid). Vision: `_member_sees` casts
-  from each footprint cell; `_record_vision` unions per-cell neighbourhoods;
-  target-side `_team_sees_entity`/`_team_has_los_entity` + `entity_visible_to`
-  use ANY cell; entity-LOS `_occupants` (formula.py) registers each body
-  cell (deduped, shooter/target excluded by id). Distance/AoE: nearest-cell
-  gap distance in `entities_within`/`nearest_entity`; `_alive_at` membership
-  by any covered cell. `side_hit`/`directional_get` measure the bearing from
-  the target's true (possibly fractional) footprint CENTER (facing stays a
-  single attribute; no footprint rotation, no edge-aware hit yet). Movement
-  hooks fire PER CELL: `fire_footprint_tile_{exit,enter,stop}` /
-  `fire_footprint_zone_{exit,enter,stop}` (boundary zone hook once per zone,
-  per-cell hooks per covered cell) — a 2×2 crossing a fire band burns once
-  per fire cell. Large corpses: ONE corpse identity (id-keyed, fully
-  compatible with existing corpse targeting), footprint DERIVED from the
-  stored entity vars (`corpse_cells`/`_corpse_footprint`); `corpse_visible_to`
-  reveals if ANY cell is fog-visible; revive restores the footprint for free;
-  corpses stay passable. New formula prims: `footprint_width`/`_height`,
-  `footprint_cells` (loopable, coord-readable), `occupies(eid,x,y)`,
-  `cell_entity(x,y)` (''=free), `entity_center(eid)` (center cell, floor for
-  even), `aoe_origin(eid)` (center|anchor per the `aoe_origin_mode` rule).
-  Scenarios 382–386. FUTURE the user may want: arbitrary/L-shaped
-  footprints, footprint rotation on facing change, edge-aware side_hit,
-  corpse occupancy as a gamerule.
-- **Corpse var introspection — SHIPPED.** `corpse_var(eid, path[, default])`
-  + `corpse_has(eid, path)` read a DEAD entity's frozen vars by dotted path
-  (the loot / "was it carrying the key" / "raise with the same statline"
-  patterns). Mirror var_get/var_has: corpse_var raises on a missing
-  corpse/path unless a default is supplied; corpse_has returns bool, never
-  raises. Read-only (snapshot immutable until revive). `corpse_team`
-  remains a HOOK_CONTEXT binding only. Status introspection deferred.
-  Scenario 387.
-- **Corpse STATUS introspection + corpse OCCUPANCY — SHIPPED.** Two corpse
-  follow-ons (the deferrals tracked since the corpse-var / corpse arc).
-  (1) **Status introspection:** `corpse_status_has(eid, name)` (bool, never
-  raises on a missing corpse), `corpse_status_get(eid, name, path[, default])`
-  (dotted field of a frozen status; raises on missing corpse/status/path
-  UNLESS a default, mirroring corpse_var + status_get), and
-  `corpse_status_names(eid)` (loopable, sorted, []=missing) read a DEAD
-  entity's frozen statuses from the corpse snapshot's `status` dict (the
-  "did it die cursed?" / "raise with the same affliction" patterns). The
-  status analog of corpse_var; read-only. Core in formula.py
-  (`_corpse_status_dict` + the three prims).
-  (2) **Occupancy as a gamerule:** the `corpse_block_condition` rule (formula
-  EXPRESSION, default "" = corpses passable, the old behavior). Plugged into
-  `Match.cell_blocks` (so it flows through `_check_block` → every movement
-  verb + the same block_walk/tp/push/swap toggles as tile/zone blocking).
-  Bindings: `self`=mover, `tile_x`/`tile_y`=the corpse cell, `corpse_id` (NEW
-  HOOK_CONTEXT name — read frozen vars via `corpse_var(corpse_id, ...)`),
-  `corpse_team`. A cell blocks if ANY corpse covering it (large corpses block
-  their whole footprint via `corpse_cells`) evaluates truthy. Fail-OPEN
-  (malformed / missing-var → not blocking) like the rest of the block system,
-  so gating vars need a real value on the MOVER (`!defvar` only defaults new
-  spawns). Gated on the rule being set = zero cost when off. Scenarios
-  447-448.
-- **Entity-anchored auras — SHIPPED.** A zone can be bound to an entity as
-  an AURA via reserved zone fields `anchor`/`anchor_radius`/`anchor_metric`.
-  Its `cells` are RE-STAMPED (footprint-aware disc of `anchor_radius` around
-  every footprint cell of the anchor; radius 0 = the footprint) whenever the
-  anchor moves — hooked into `fire_entity_moved` (so tp/move_dirs/push/pull/
-  swap all carry it), clipped to grid. Cells stay a concrete set, so all zone
-  queries/hooks/glyph render work unchanged; the restamp does NOT fire the
-  aura's own enter/exit hooks (same stance as zone_shift). On anchor death/
-  despawn (both route through `Entity.remove`) the `anchored_zone_on_anchor_loss`
-  rule decides: `delete` (default) drops the aura, `freeze` clears the binding
-  and leaves a static zone. Surface: `!zone anchor <name> <eid> [radius]
-  [metric]` / `!zone unanchor` (shown in `!zone info`/`list`); formula prims
-  `zone_anchor`/`zone_unanchor`/`zone_anchor_of`. Anchor fields serialize
-  (save + undo via `_zone_to_dict`/`_zone_from_dict`). Core: `_stamp_anchored_zone`
-  / `_restamp_anchors_for` / `_release_anchored_zones` / `anchor_zone` /
-  `unanchor_zone` in logic.py. Scenarios 388-389.
-- **Rich statuses (self-describing status definitions) — SHIPPED.** A status's
-  behavior no longer needs to live in the one global branch-on-name
-  `status_tick_formula`. `Match.status_definitions` (name -> {`tick`,
-  `tick_when`, `stack`, `max_level`, `data`}) defines a status ONCE; a status
-  INSTANCE on an entity (`entity.status[name]`) resolves its behavior from the
-  definition of the SAME name — the name IS the key, so NO `_template` tag
-  (unlike tiles). `fire_status_tick(when)` now: per status, run its
-  definition's `tick` at the definition's `tick_when` (default `turn_end`);
-  a status with NO definition falls back to the global `status_tick_formula`
-  at the global `status_tick_when` (full backward compat). DESIGN CALL:
-  duration decrement + self-removal stay INSIDE the tick formula (no forced
-  auto-decay) — the GM writes "hp -= 5*level; duration -= 1; remove at <=0"
-  once in the def. Application/stacking is configurable: `apply_status` (+
-  `status_apply` formula prim + `!status apply <eid> <name> [level]
-  [duration]`) honors the def's `stack` mode, else the `status_default_stack`
-  rule; modes `refresh`/`add_level`(capped by `max_level`)/`extend`/`replace`/
-  `none` (first application just sets level [default 1] + duration). New
-  top-level `!status` command (def/drop/tick/when/stack/maxlevel/data/list/
-  info/apply) for match-level DEFINITIONS — raw per-entity instance editing
-  stays on `!ent status`. Definitions serialize (save + undo). Core:
-  `define_status`/`remove_status_def`/`apply_status` + the rewritten
-  `fire_status_tick` in logic.py. Scenarios 390-391. DEFERRED then SHIPPED in
-  the status cluster below (cross-status interactions + resistance/immunity);
-  damage-buff scaling of applied level/duration is still composable via
-  `on_status_added`. This was framed as the modest precursor to the bigger
-  combat layers (damage pipeline, action economy, reactions) surfaced by
-  analyzing the three FCS combat-system docs.
-- **Status cluster: tags + cross-status + resistance + counters — SHIPPED.**
-  Four interlocking deepenings of the rich-status system (scenarios 449-452).
-  - **Tags / categories (84):** a status DEFINITION carries a `tags` list
-    (`!status tags <name> <csv|->`). The category other features key on. Prims:
-    `status_tags(name)` (loopable, declared order), `status_has_tag(eid, name,
-    tag)`, `statuses_with_tag(eid, tag)` (loopable, sorted — loop it to purge
-    every 'debuff'). Tags are DEFINITION-level (a def-less status has none).
-    `Match.status_def_tags(name)` is the accessor.
-  - **TOKEN convention (shared):** a "token" is a bare status NAME or
-    `tag:<x>` (matches any status whose def carries that tag). `Match.
-    _status_token_matches(token, name)` is the single matcher behind removes /
-    blocked_by / immune / resist.
-  - **Cross-status interactions (17):** declarative def fields `removes` and
-    `blocked_by` (CSV of tokens; `!status removes`/`!status blockedby`). On
-    apply (in `apply_status`, BEFORE the stacking math): if the target has any
-    `blocked_by` status → no-op; after an accepted application, statuses
-    matching `removes` are cleared (fires even on a no-change refresh; never
-    self-removes). "What freeze does is stored in freeze." on_status_added is
-    still the escape hatch for richer logic.
-  - **Resistance / immunity (18):** SOURCE-GATED like modifiers. Rule
-    `status_resist_sources` (CSV roots, default `equipped`; per-entity
-    `__status_resist_sources` replace / `__status_resist_sources_add` extend)
-    + the direct innate `status_immune`/`status_resist` entity vars. A nested
-    `status_immune` (list/CSV of tokens) or `status_resist` (map token->int
-    level reduction) found under a scanned root contributes — so an EQUIPPED
-    ring resists, an inventoried one does NOT. Immunity (any matching immune
-    token) blocks outright; resistance reduces the applied LEVEL (duration
-    untouched for now), and if it drops to <=0 the application is fully
-    resisted (no-op). Multiple reductions combine per the `status_resist_stack`
-    rule (sum default / max / first). Core: `Match.status_resistance(eid,
-    name)` -> (immune, reduction); `_gather_resist_records` +
-    `_effective_status_resist_sources`. Prims `status_resist_of` /
-    `is_status_immune`; read-only `!status resist <eid> <name>`. The existing
-    PARTS immune/redirect (`part_status_immune`) is a SEPARATE part-only
-    mechanism that still runs first in `apply_status`.
-  - **Universal counters (87):** `status_counter_add(eid, name, delta[,
-    field="duration"])` and `status_counter_set(eid, name, value[, field])`
-    adjust ANY numeric field on a live status instance and auto-remove the
-    status at <=0 — the same tool for time-based DURATIONS and per-trigger
-    CHARGES (charges differ only in that nothing auto-decrements them from the
-    turn clock; the GM calls status_counter_add(-1) from whatever the trigger
-    is). Also `!status counter <eid> <name> <add|set> <value> [field]`. Auto-
-    removal goes through the status diff chokepoint (`_status_remove`).
-    OPEN (user: decide later): a status with NO `duration` shows as ∞, but
-    `status_counter_add(eid, name, -1)` (default field duration) reads the
-    missing duration as 0 and REMOVES the status. Whether ∞ should stay ∞
-    (no-op, return None) is undecided; don't change it without asking.
-  - apply_status now also surfaces a block reason to the command layer via
-    `Match.status_apply_block_reason(eid, name, level)` (immune / blocked by X
-    / fully resisted). All def fields serialize (deepcopy); resistances are
-    plain entity vars; counters are instance data.
-- **Builder/objectives/transfer/layers bundle — SHIPPED (scenarios 453-457).**
-  Four small composable features.
-  - **Line/fill tile builder (49):** `!tile line <x1> <y1> <x2> <y2> <path>
-    <value>` and `!tile fill ...` stamp ONE path=value across many cells in a
-    single command (`line` = the engine's `_line_cells` segment geometry,
-    `fill` = the bounding rectangle). Pure sugar over `!tile set` (same
-    path=value shape — run twice for glyph+block on a wall). Off-grid cells
-    skipped + reported.
-  - **Toggleable map layers (114):** `Match.hidden_layers` (serialized set;
-    layers `zones`/`tiles`/`entities`/`fog`). `!map layer <name> on|off` (host-
-    gated via ELEVATED_ARGS) persists; `!map layer list` shows state; a one-off
-    `!map hide=zones,fog` arg (player-available) suppresses layers for a SINGLE
-    render without mutating state. Threaded as `render_ascii(..., hidden_layers=)`
-    → `_render_ascii_impl(hidden=)` (each layer loop gated; fog overlay too). NOT
-    a Discord-only feature — works in the CLI/harness. `full` stays honored only
-    as args[0] so `hide=` can't sneak a player past the fog gate. (No coords/axis
-    layer — infeasible with 1-char cells.)
-  - **Cross-match entity transfer (107):** `MatchManager.copy_entity(src_mid,
-    dest_mid, eid, x, y, move=)`. `!ent copy <id> <dest_match> [x y]` duplicates
-    into another LIVE match (keeps source); `!ent transfer ...` MOVES it (note:
-    `!ent move` is the movement verb, so transfer is the rename). Full fidelity:
-    vars/statuses/passives/clamps/facing + the whole body-part SUBTREE (BFS,
-    parents before children; `part_of` remapped; glued/region parts re-stamped,
-    located parts keep their offset). Colliding ids auto-suffixed (`goblin` →
-    `goblin_2`). Routes through `Entity.spawn` (fires on_entity_spawned in the
-    dest, validates placement). A part can't be transferred alone (move its
-    parent). Template-save-for-later is a SEPARATE future PR (cross-match
-    permanent storage); this is the direct match→match move.
-  - **Match outcome / victory (100):** NO built-in objective evaluator (the user
-    chose primitives over a `Match.objectives` table). `Match.outcome` (None =
-    ongoing, else `{winner, reason, round}`; serialized) + `Match.declare_winner
-    (winner, reason)` / `clear_outcome`. Formula prims `declare_winner(winner[,
-    reason])` / `match_winner()` / `match_over()` are MATCH funcs, so they fire
-    from ANY formula context — watcher effects, actions (Exodia auto-win),
-    on_death passives (boss slain), tile `on_enter` hooks (goal tile), zones,
-    status ticks, etc. Commands `!match win <winner> [reason]` (manual) / `!match
-    win clear` (resume) / `!match outcome` (read-only, player-available). Winner
-    shown in the `!state` header. "Victory is declared manually" is the default;
-    win conditions are COMPOSED, not configured.
-- **Pierce helper + composable penetration — SHIPPED.**
-  `entities_in_line_until(x1,y1,x2,y2, max_targets[, viewer])` (formula.py)
-  returns the first N alive entity ids the segment passes through, near→far,
-  endpoints INCLUDED — the capped sibling of `entities_in_line_ignorelos`
-  (the sandbox has no loop `break`, so a cap helper is the clean "pierce up
-  to N" tool). With a `viewer` it cuts at the first opaque cell (LOS-aware);
-  without one it ignores walls. Loopable. ARMOR-limited penetration (depth
-  varies by what it hits) needs NO new primitive — loop `entities_on_los` /
-  `entities_in_line_ignorelos` with your own `pen` accumulator gated on
-  `pen > 0` (no break needed). Scenarios 392 (cap helper) / 393 (armor
-  accumulator).
-- **Mid-body action choices — SHIPPED (the interactive-action layer).**
-  `choose(prompt, options)` → picked element; `choose_number(prompt, lo, hi)`
-  → int in range. Action-mode builtins (in `_ACTION_BUILTINS`), supplied as
-  `action_bindings` by the runner. EXECUTION = REPLAY (chosen over a
-  generator/interpreter rewrite): the TOP-LEVEL `run_action` seeds an answer
-  queue, runs the body, and when `choose()` has no answer yet it raises
-  `ChoiceNeeded`; the runner rolls the attempt back, obtains one more answer,
-  and re-runs the body from the top with answers replayed IN ORDER until it
-  completes, then commits. Reuses the existing transactional rollback. Per
-  attempt: RNG state is snapshot/restored (a roll BEFORE a choice stays
-  stable) and the cmd output buffer is reset (rolled-back attempts don't leak
-  echoes) — so side effects before a choice apply EXACTLY once (verified:
-  var writes + cmd()). Sequential/dependent choices "just work" (the replay
-  walks whichever branch prior answers chose). ANSWERING: `answer=<value>`
-  invocation tokens feed choices in order (repeatable, bypass the last-wins
-  args dict); if exhausted, the surface's `prompt_choice(prompt, options,
-  lo, hi)` coroutine is used (cli.py implements it via `input()`; the harness
-  has none → headless callers MUST pre-supply, yielding a clean "needs a
-  choice" fail, NOT a hang). Reserved answer `cancel` (or empty/None
-  interactive reply) aborts with full rollback; a bad interactive pick
-  re-prompts, a bad pre-supplied one fails. `ChoiceNeeded` joins
-  ActionFail/ActionEngineFault in `eval_program`'s unwrapped set so it
-  reaches the runner; nested actions let it propagate to the top-level loop;
-  Match runtime fields `_choice_answers`/`_choice_cursor` (preserved across
-  rollback); `action_choice_limit` rule bounds the replay. Core in action.py
-  (`ChoiceNeeded`, `_obtain_answer`, `_snapshot_rng`, the run_action replay
-  loop). Scenarios 394-395. FUTURE: this same pause/resume shape is the
-  groundwork for the bigger REACTION framework (block/dodge/counter during
-  another unit's turn) — interactive Discord menus for choices are also not
-  built yet (Discord currently relies on pre-supplied answer= tokens).
-- Idea parked (Discord-only, not built): **opt-in auto-updating views** —
-  `!map autoupdate` / `!state autoupdate` create a self-refreshing
-  (edit-in-place) board message per channel that the bot updates on
-  state-changing commands, HOST-ONLY by default, while plain `!map`/`!state`
-  stay throwaway on-demand renders. Lives in the Discord adapter; the headless
-  harness can't exercise it. The "push" half of per-channel POV.
-- **Locational / body-part damage — SHIPPED (first slice).**
-  The big locational-damage arc (scope ~ multi-tile entities). Reference the
-  FCS3 combat-rules docx (head=150% / chest=100% / stomach=70% / limbs=30%
-  "damage to main", directional hit-chance tables, armor coverage) and
-  Helldivers 2's "% to main" model. WHAT SHIPPED:
-  - **Parts are real `Entity`s** in `match.entities`, flagged attached via a
-    protected `part_of=<parent_id>` entity FIELD (serialized; not a var). Parent's
-    parts are DERIVED by scanning for `part_of==self` (no second structure); an
-    `Entity.is_part` property (true only while the parent exists). A part's `x,y`
-    MIRROR the parent's anchor, re-stamped on `fire_entity_moved` via
-    `_restamp_parts_for` (same hook+pattern as entity-anchored auras).
-  - **Skip surface:** attached parts are excluded from occupancy/`cell_occupant`,
-    render glyph, group-move, zone membership, team vision (sees + is-seen +
-    `_record_vision`), and the spatial/roster formula enums (`entities_within`/
-    `nearest_entity` via `_candidates`, `entities_in_area`, `all_entities`).
-    PROPERTY searches (`entities_with_status`/`_var`) still include parts. Turn
-    order is free — a part has no initiative unless made independent (give it one
-    → it acts on its own turn, the turret/eldritch case). `_validate_placement`
-    skips occupancy for parts (keyed off the raw `part_of` field, since spawn
-    validates before binding).
-  - **HP-less zones = `0/0` indestructible entities** (compatible with every
-    hp-assuming mechanic). `Match.is_indestructible(e)` = the `indestructible`
-    var OR (is_part AND max_hp<=0).
-  - **`parent` reference token** (child→parent), resolves like
-    `self`/`this`/`current` via `EvalCtx` (now carries a `match` backref for it);
-    wired into `_ENTITY_TOKEN_NAMES`, `_who_arg`, `RESERVED_IDS`. Parent→child is
-    primitive-based: `parts(eid)` (loopable), `part(parent, name_or_id)`,
-    `has_part`, `part_of(eid)`.
-  - **Damage model = HD2 "% to main", default but heavily configurable.**
-    `damage_part(part, amount)` → to-main dealt. Computes the to-main transfer
-    EXPLICITLY from pre-hit values (incoming + part hp read BEFORE mutation),
-    applies it to the parent via the NORMAL hp path FIRST (so parent clamp/hooks/
-    death fire — kills HD2's uncapped Trooper), THEN floors the part's hp at 0
-    (a 0/0 zone stays 0). Does NOT depend on clamp residue. Per-part vars +
-    gamerule defaults (`part_to_main_percent_default` etc.): `to_main_percent`
-    (doc 30/100/150), `to_main_cap` (`none`=uncapped/overflow · `max_hp`=HD2
-    default · `remaining_hp` · `absolute:<n>`; `none` auto for 0/0), `vital`
-    (part death kills parent), `indestructible` (auto for max_hp==0). Routing
-    happens ONLY via `damage_part` — a raw `entity[part].hp -=` does not spill.
-    `damage_part` / `damage_spread` REFUSE a negative amount (user call,
-    audit-pass-36: a negative hit used to heal the part AND send a share of
-    the heal to main); heal a part with an hp write, which also clears its
-    destroyed latch and resumes a suspended aura (handled in write_var).
-  - **Part destruction** (hp→0 by damage, non-indestructible): the part LINGERS
-    attached & dead, fires `on_death` ONCE (latched by the `__part_destroyed`
-    var; a heal above 0 clears it), and if `vital` runs the parent through the
-    kill function. `check_death` skips parts entirely (they end only via
-    damage_part / cascade). **Destroy effects** = the part's own `on_death`/
-    passives.
-  - **`hit_location(target, from_x, from_y[, aim, aim_weight, aim_bonus, mode,
-    sides, corner_arc])`** → part id. There are exactly TWO modes — `weighted`
-    (per-part `hit_weights.<side>`, side from the shipped `side_hit`) and
-    `uniform` — defaulting to the `hit_location_mode` rule; anything else
-    RAISES ("mode must be 'weighted' or 'uniform'"). **AIMING IS NOT A MODE**
-    (an earlier version of this file wrongly listed `aimed` as a third one, so
-    `mode='aimed'` reads plausible but is rejected): it's the separate `aim`
-    ARG, which biases toward the named part on top of whichever mode is
-    active — that part's weight becomes `w * aim_weight + aim_bonus`
-    (`aim_weight` defaults to the `hit_location_aim_weight` rule, 3;
-    `aim_bonus` to 0). Bias without guarantee, and a 0-weight side stays 0
-    unless aim_bonus lifts it. Verified statistically: weights 10/30/60 give
-    a 10/30/60 split; aiming at the 10 with weight 3 gives 30/(30+30+60) =
-    25%; a 0-weight side with aim_bonus=50 becomes 50/140 ≈ 36%. No parts /
-    nothing exposed → returns the target itself. RNG via the match RNG
-    (`_active_rng`, replay-safe with the choice system).
-  - **Creation:** template-driven — `summon_entity` consumes a reserved `parts`
-    key (dict `{role: part-template}` or a list), auto-spawning+linking each at
-    the parent's cell. AND mid-match `!part add/attach/detach/remove/list/info`
-    (`Match.create_part`/`attach_part`/`detach_part`). Config rides on plain
-    `!ent set_var <part> ...` (dotted paths like `hit_weights.front=15` nest);
-    only `part_of` is engine-special.
-  - **Detach** → the part becomes a free entity at the parent's cell, keeping
-    its state (a blown-off arm = a dead `0`-hp free entity; no corpse).
-  - **Parent death** → parts are snapshotted into the corpse and removed (no
-    orphaned visible limbs); `revive_corpse` re-spawns them (delivers "revive
-    parent ⇒ revive parts"). `!ent dump` shows a "body parts:" section + "Body
-    part of:"; `!part list` shows hp + knobs. Scenarios 396-398; further coverage 414 (composite 2×2 with region head + torso), 415 (detach → free entity), 416 (parent death snapshots parts + revive restores), 417 (killing a part = limb destruction, never a corpse — `_process_death` routes a part to `_process_part_death`; only non-parts corpse). Multi-level part SUBTREES (a part of a part, e.g. dragon→wing→feather — the shape `copy_entity`/transfer already walks via BFS) are now handled on death/revive too: `entity_part_subtree(root)` (BFS, parents before children) drives both the death cascade (the WHOLE subtree is removed, no deeper-limb zombie) and the corpse snapshot (whole subtree stored in parent-before-child order, so revive re-spawns each after its parent and re-attaches the tree). Scenario 467.
-  DEFERRED TODOs (the user explicitly wants these tracked):
-  - **AoE damage SPREAD between main and limbs — SHIPPED (scenario 410).**
-    `damage_spread(target, total[, mode, fragments])` → to-main; splits total
-    across the target's parts (DIVIDED, never full-to-each — no free AoE
-    headshots), each routed via damage_part. Modes (rule `aoe_default_mode`):
-    `weighted` (per-part `aoe_weight` var, defaulting to summed `hit_weights`,
-    else `part_aoe_weight_default`), `uniform`, `fragment` (N=`aoe_fragment_count`
-    discrete weighted-random hits, match-RNG), `main_only` (hit main hp
-    directly). No parts / zero weights → full total to main. Largest-remainder
-    apportionment so shares sum to total. GM loops `entities_in_area` + calls
-    it per entity (falloff stays GM-side). SPATIAL origin/radius filtering is
-    the NEXT PR (with footprint-region part positioning).
-  - **Status effects on body parts — SHIPPED (scenario 411).** Two list rules,
-    each overridable per part (the `__status_immune` / `__status_redirect`
-    vars replace the rule when set): `part_status_immune` (apply_status no-ops
-    these on a part) and `part_status_redirect` (applied to a part → applied to
-    the PARENT instead, for per-entity DoT). Hooked into `apply_status` only
-    (raw `!ent status` editing force-writes). Parts are real entities, so
-    statuses otherwise tick on them normally — a part's tick can `damage_part(
-    self, n)` to route to main.
-  - **Independently-LOCATED parts — SHIPPED (scenario 409).** A part with the
-    `__part_located` var keeps its OWN cell: `Entity.is_located_part` /
-    `is_glued_part` (the new skip-surface predicate — glued parts only).
-    A located part is NOT re-stamped to the parent and NOT hidden — it
-    renders, occupies (occupancy enforced on placement), is targetable, and
-    sees/is-seen; it still routes damage / resolves `parent` / dies + revives
-    with the parent (revive restores it at its own stored cell). `!part
-    locate <part> <x> <y>` / `!part glue <part>` (+ Match.locate_part /
-    glue_part). Parent move does NOT drag it. Per-cell independent TARGETING
-    (selecting the part by clicking its cell) still TBD per game system.
-  - **Multi-tile AoE + footprint-region part positioning — SHIPPED (scenarios
-    412-413).** (1) Spatial AoE: `damage_spread(target, total, mode, fragments,
-    origin_x, origin_y, radius)` filters to parts with a cell within `radius`
-    (Chebyshev) of the origin — a blast that doesn't reach the whole body
-    (no eligible parts → full total to main). (2) `part_region` (the
-    `__part_region` var, set by `!part region <part> <region>`): a part's cells
-    become a facing-aware REGION of the parent's footprint —
-    `front`/`back`/`left`/`right`/`center`/`all` + corners. Derivation
-    (`Match.part_region_cells` + `_region_match`) PROJECTS each footprint cell
-    onto the parent's forward/right axes (`FACING_VECTORS`) and selects by
-    SIGN, so it's full 8-way (a diagonal facing → a non-rectangular set);
-    `center` falls back to ALL on an even (no-true-center) footprint. The cells
-    are an explicit set returned via `entity_cells` (the single chokepoint, so
-    render/occupancy/AoE/vision all pick it up); the anchor follows the parent
-    (`_restamp_parts_for` restamps glued + region parts), cells re-derive each
-    call from the parent's live facing. `Entity.is_region_part`; `is_glued_part`
-    (the skip-surface predicate) now excludes BOTH located and region parts.
-    region and `!part locate` are mutually exclusive (each clears the other;
-    `!part glue` clears both). (3) Render priority: the `part_custom_glyph_priority`
-    rule (default True) — a region part draws over the parent only if it has a
-    CUSTOM glyph (a default-glyph region part yields, so it doesn't clobber the
-    parent's customization); done in a second render pass. Located parts (own
-    cell, no overlap) are unaffected.
-  - Per-damage-TYPE `to_main_percent` (deferred again by the user in the
-    2026-10 idea round, "decide later"); the **armor layer** (coverage % +
-    directional, damage-type AR-vs-ARP mitigation); the **to-hit roll**
-    (accuracy/evasion/suppression/spread, SEPARATE from hit-location); **AP/FP/
-    ARC action economy + reactionary actions** (block/dodge → the reaction
-    framework the choice-replay system seeded); fancier revive (regrow from
-    template).
-  - **Snake / segmented bodies — SHIPPED (scenarios 418-422).** A SEGMENT is a
-    LOCATED part (own cell — renders/occupies/targetable) that also FOLLOWS the
-    head along a chain. Linkage: segments are parts of the head, each carrying
-    `__segment` + `__follows` (= the segment/head directly ahead);
-    `Match.snake_segments(head)` walks the chain head→tail, `is_snake_head`
-    detects a head. **Follow** (rule `segment_follow_mode`, head-var override
-    `__segment_follow`): `trail` (default) — each segment moves into the cell
-    the one ahead just vacated (always adjacent), driven per-cell from
-    `fire_entity_step`; `path` — the head's cell path is recorded
-    (`__seg_path`) and segments sit `segment_spacing` cells back (gaps). A
-    discontinuous head move (tp/swap/push — no per-cell steps) is detected in
-    `fire_entity_moved` via a stale `__seg_last` and re-lays the body straight
-    behind the head (`_resettle_snake`). **Self-collision** (rule
-    `segment_self_collision`, default False = pass-through, the Destroyer): the
-    head ignores its OWN segments for occupancy via `Match._occupancy_ignore`
-    (threaded through move_dirs / tp `_validate_placement` / push / pull /
-    swap); True = blocked by its body (classic Snake). Other movers are always
-    blocked by segments. **Death/sever** (rule `segment_death_mode`, segment-
-    or head-var override `__segment_death_mode`), applied in
-    `_process_part_death` → `_sever_segment` when an own-hp segment is
-    destroyed: `solid` (Destroyer — segments are 0/0 indestructible routing to
-    main, never individually die, whole snake dies with the head); `cascade`
-    (destroying a segment removes it + every segment BEHIND it, no corpses);
-    `split` (Eater of Worlds — the segment behind the cut is PROMOTED to a new
-    independent head via `_promote_segment_to_head`: clears the part/segment
-    linkage, stamps `segment_split_head_template` [head-var override
-    `__segment_split_head_template`, dotted-fill of MISSING vars via
-    `_fill_missing_vars`], inherits the old head's initiative; trailing
-    segments re-parent to it; the cut segment is removed → one worm becomes
-    two). Built on the part-corpse invariant (killing a segment is limb
-    destruction, never a corpse). Authoring: `!part segment <head> <id> <name>
-    <hp> <maxhp> [k=v ...]` appends to the tail; the summon-template `segments`
-    list/dict chains a body at spawn. Serializes free (linkage is vars +
-    `part_of`). FUTURE (all low-priority / deferred): spacing>1 in `trail` mode
-    (currently always adjacent; `segment_spacing` only applies in `path` mode)
-    — the user is fine with the current spacing. Branching (non-linear, TREE)
-    bodies — a hydra / multi-tail where several segments share one `__follows`
-    predecessor; structurally invasive (chain walker + sever become subtree
-    ops), the user is NOT interested yet. NOTE explicitly OFF the table:
-    autonomous AI for split-off heads (or any entity) — see "NO automated
-    entity behavior" in §1; a promoted head is a complete independent UNIT
-    (own initiative + the stamped template's actions/passives), but it never
-    acts by itself.
-- **Stat / modifier system (derived effective stats) — SHIPPED (first slice).**
-  A generic derived-stat layer: base stats stay plain vars (NEVER mutated);
-  a modifier is a DATA record aggregated live from its source and combined on
-  demand. PURE COMPOSABLE QUERY — the engine never auto-applies modifiers
-  (the GM threads `apply_mods` through their own combat), same stance as
-  "no hardcoded combat".
-  - **Record:** `{stat, op, value, tags, not_tags, priority, condition}`.
-    `value` + `condition` may be FORMULAS, eval'd with `self`=the modifier's
-    owner plus the call's context entities (`target`/`attacker`/`defender`/
-    `other`, each optional — added to HOOK_CONTEXT_NAMES; `target`/`actor`
-    were already there). So "+25 vs undead" = `condition:"entity[target].undead"`,
-    and a value can scale (`"(entity[self].max_hp - entity[self].hp)"`).
-  - **Sources aggregated live** (`Match._raw_modifier_records`): every status
-    instance's `modifiers`, a direct `entity.modifiers` slot, and each scan-
-    root subtree (the `modifier_sources` rule, default `equipped`, walked for
-    nested `modifiers`). Per-entity `__modifier_sources` (replace the default
-    list) and `__modifier_sources_add` (extend it). Equip = move the item
-    under a scanned root; an `inventory` copy doesn't apply. A bundle is a
-    LIST of records OR a DICT of named records (the dict form is what
-    `!ent set_var hero modifiers.fireboost.op add` builds); `tags`/`not_tags`
-    accept a list or a CSV string — so the whole thing is command-authorable.
-  - **Tag match:** required ⊆ query tags AND excluded(not_tags) ∩ query empty.
-  - **Fold (`apply_modifiers`):** `eff_priority = priority + per-op offset`
-    (`modifier_op_priority` rule, a CSV `op:offset` string); group by priority,
-    combine same-op within a tier (add→sum, inc%→sum, more%→product, set→last,
-    min→floor, max→cap), apply tiers ascending; `modifier_op_order` (CSV)
-    breaks ties between different ops in a tier. Defaults reproduce
-    `((base+Σadd)×(1+Σinc%))×∏(1+more%)` then set/clamp; bumping one record's
-    `priority` pulls it into its own tier.
-  - **Surface:** formula prims `apply_mods(entity, stat, base, tags, target=,
-    attacker=, defender=, other=)` → number and `list_mods(...)` → the active
-    records (each carries a `source` label). Read-only `!mod show <eid> <stat>
-    [base] [tag ...]` renders the active modifiers (with [source]) + folded
-    result (context-dependent ones show only when their condition resolves
-    context-free). Scenarios 399-400; further coverage 407 (set/min/max ops + priority tiers), 408 (defender context role + scaling value formula).
-  - **C1 follow-ups SHIPPED (scenario 406):** (a) `source` tracking —
-    `_raw_modifier_records` returns (record, source) labels like
-    `status:burning.fireboost` / `equipped.sword.0`; (b) per-stat caps — the
-    `modifier_stat_caps` rule (CSV `stat:lo:hi`, lo/hi optional) clamps the
-    FINAL value even with no modifiers (per-entity caps stay the min/max ops);
-    (c) tag-granting — a record's `grants_tags` expands the query tag set in a
-    single pre-pass (no chain-granting). FUTURE: more context roles. This is
-    groundwork the combat refactor (damage types, armor AR-vs-ARP, to-hit)
-    will lean on.
-- **Text-renderer customization (glyphs + color) — SHIPPED (entities, v1).**
-  Two ways to tell units apart in the ASCII renderer, both config-as-vars.
-  - **Custom glyphs** (universal, no ANSI): `Match.entity_glyph(e)` resolves a
-    per-facing `glyphs.<facing>` var > a direction-agnostic single `glyph` var
-    > the default DIRECTION_ARROWS arrow (`@` fallback). Exactly ONE character
-    (else ignored → falls through), same rule as tile/zone glyphs, so columns
-    stay aligned. Works on every surface incl. the harness.
-  - **Color** (surface-gated, ANSI): `TEXT_COLORS` maps names (red/green/.../
-    bright_*) → ANSI SGR fg codes. Codes work on BOTH a terminal and Discord
-    `ansi` blocks: Discord only supports 30-37 + style 1 (bold) and NOT the
-    90-97 bright range, so the bright_* variants are `1;3X` (bold+base) and
-    `gray` is `1;30`. `Match.entity_color(e)` = the entity's
-    `color` var > its team's color (the per-match `team_colors` map, DEFAULTING
-    to the team's own name when that name is itself a palette color — a team
-    named "red" auto-renders red) > None. `render_ascii(pov, colorize=)` wraps
-    each entity glyph in `\x1b[<code>m…\x1b[0m` when colorize. FG only for now.
-  - **Surface plumbing:** the command layer colorizes only when
-    `ctx.supports_color` AND the match's `color_enabled` (default True); it
-    fences the map ` ```ansi ` so Discord renders the codes. Discord sets
-    `supports_color=True`; the CLI sets it per-run via `_enable_terminal_color()`
-    (turns on Windows VT processing via SetConsoleMode; respects NO_COLOR /
-    non-tty; on failure → plain + a one-time "use Discord / glyphs" warning,
-    so a legacy console never spews raw escapes); the scenario harness does
-    NOT set it → its `!map` is always plain (scenarios stay clean). Per-match
-    toggle `!map color on|off`; team
-    map via `!map teamcolor <team> <color>|clear|list` (host-gated via
-    ELEVATED_ARGS["map"]). Both fields serialized on Match.
-  - **Guide + invalid-color warnings:** `!map colors` (read-only, player-
-    available) lists the palette via `_color_guide()`; `!map teamcolor` with a
-    bad color and `!ent set_var <id> color <bad>` both cite it — the latter is
-    a non-blocking ⚠ advisory (still writes the var, since it may feed the
-    GM's own formulas). The whole palette is Discord-safe, so there's no
-    terminal-only color to warn about separately.
-  - Scenarios 401 (glyphs) / 402 (color settings) / 403 (guide + warning).
-  - **Colored TILES + ZONES — SHIPPED (follow-up slice).** render_ascii now
-    carries a parallel `colors` grid (palette NAMES) painted alongside the
-    glyph grid, layer by layer (zone < tile < entity < fog); each layer that
-    owns a cell sets BOTH its glyph and its color (color None = uncolored),
-    so the topmost feature owns the tint (keeps the positional layering), and
-    a zone/tile with a color but NO glyph still tints its `.` ("fill empty
-    cells"). `Match.tile_color(x,y)` (instance `color` data > template) and
-    `Match.zone_color(name)` (zone `color` field) via the shared
-    `_resolve_color_value`: a bare palette name is literal, anything else is a
-    FORMULA EXPRESSION (bindings tile_x/tile_y or zone_name) whose string
-    result must be a palette name — fail/non-palette → None (same fail-safe
-    as visibility/block conditions). Surface: tiles use the existing `!tile
-    set <x> <y> color <name|formula>`; zones get `!zone color <name>
-    <name|formula|->` (a dedicated field like the zone glyph, serialized in
-    _zone_to_dict/_from_dict). Both `!tile set color` and `!zone color` give
-    the same ⚠ advisory as entity color on a non-palette, non-formula-shaped
-    value (still stored — could be a formula). Entity color stays literal-var
-    only (not formula) — unchanged. Scenario 404. Long-term someday: an
-    actual image-rendered map.
-- **Range-band primitive — SHIPPED (scenarios 423-424).** `band(value, spec,
-  default=None)` (a pure `_ALLOWED_FUNCS` func) looks `value` up in a banded
-  table `spec` ('1-2:120,3-5:100,6-9:80,10+:0'), FIRST match wins. Ranges:
-  `lo-hi` (inclusive), `n` (exact), `lo+`/`lo-` (lo and up), `-hi` (up to hi).
-  Result coerced to a number when numeric. No match → `default`, else raises.
-  Models the doc's munition falloff without a conditional chain.
-- **Reusable named macros — SHIPPED (scenarios 425-426).** `Match.macros` (name ->
-  newline-separated command body). `!macro set/run/list/show/remove`. `run`
-  substitutes $1/$2/.../$@ (positional; missing → ""; leaves $(...) formula
-  tokens alone, via `_macro_subst`) then dispatches each line via
-  `dispatch_no_snapshot` — so the whole macro is ONE undo entry (the !macro
-  command itself is snapshotted). Per-match, serialized.
-  - **Macro CONTROL FLOW — SHIPPED (scenarios 544-546).** A macro body is parsed
-    (`_parse_macro` → a node tree, validated at `set` time) and executed by a
-    small interpreter (`_exec_macro`), so a macro can branch and loop; a macro
-    with no directives stays a flat command list (unchanged). Directives (own
-    lines): `if <formula>` / `elif <formula>` / `else` / `end` (truthy formula
-    runs the block, first match wins) and `repeat <count>` / `end` (loop the
-    block `count` times). Blocks NEST. `$#` substitutes the current 1-based
-    `repeat` iteration (empty outside a loop; added to `_macro_subst` alongside
-    $N/$@). Conditions + repeat counts are evaluated with the SAME strict
-    read-only gate as inline $() args (`formula.validate_arg_safe` + a read-only
-    `eval_expression`) — a state-changing function in control flow is rejected.
-    Safety caps: `macro_repeat_limit` rule (default 1000, clamps each repeat) +
-    `macro_step_limit` rule (default 10000, hard total-dispatch backstop that
-    aborts a runaway). The active match is re-fetched per condition/repeat eval
-    (no stale reference if a macro line switches/restores a match). Still ONE
-    undo entry.
-- **Condition-watchers — SHIPPED (scenarios 427-428).** `Match.watchers` (name ->
-  {condition, effect, once, last}). EDGE-triggered: `Match.fire_watchers`
-  evaluates each condition (a formula expr), records all edges, then runs the
-  effect (a formula program) for any that went false→true; `once` removes
-  after firing; malformed condition reads as not-met (fail-safe). Polled by
-  `CommandRegistry.run` AFTER each top-level command settles (single pass —
-  an effect's change is caught next poll, no loops; turn/round are covered
-  since they're commands). `!watch add <name> "<cond>" "<effect>" [once]` /
-  remove / list / show / check. `last` serialized so a reload doesn't
-  re-fire. Distinct from event passives: fires on the condition's transition
-  regardless of what changed it.
-- **Team-level state (resources + modifiers + passives) — SHIPPED (scenarios
-  429-431).** `Match.team_data` (team -> free-form dict) + `team_passives` (team
-  -> {pid: Passive}). (1) Resources: `team_get/team_has/team_set/team_add`
-  (Match methods + formula prims; dotted paths) and `!team set/get/add/list/
-  clear`. (2) Team-scoped MODIFIERS: a `modifiers` bundle in a team's data
-  (e.g. `!team set red modifiers.rally.op add`) is aggregated by
-  `_raw_modifier_records` for every member (source `team:<team>`), so it
-  flows through apply_mods. (3) Team-scoped PASSIVES: `!team passive add
-  <team> <pid> <when> <formula>` — fire for any member (self = the member) via
-  the new `Match._firing_passives(target)` helper, which yields global + the
-  target's team passives and replaced the raw `global_passives` iteration at
-  every fire site. All serialized.
-- **Aliveness as a rule + indestructible-0/0 render fix — SHIPPED (scenarios
-  418, 432).** `Entity.is_alive` was a hardcoded `hp > 0`, so an
-  INDESTRUCTIBLE 0/0 entity (a passthrough body part / zone — e.g. a Destroyer
-  segment routing all damage to main) read as DEAD and was silently dropped
-  from render AND occupancy (you could walk through the worm's body). Fixed +
-  generalized into the `alive_condition` rule (formula expr, `self`=the
-  entity, distinct from `death_condition` which drives the death PIPELINE):
-  EMPTY (default) = the built-in `hp > 0 OR is_indestructible` (the fix); set a
-  formula to REPLACE it (include the carve-out yourself via the new
-  `is_indestructible(eid)` formula primitive). Evaluated only when set (default
-  stays on the fast path), recursion-guarded via `Match._alive_eval_depth` (a
-  condition that calls an is_alive-using enumerator falls back to built-in),
-  malformed → built-in (never blanks the board).
-- **`body_part_entity_line_suffix` rule — SHIPPED (scenario 433).** A
-  SUB-ENTITY's `!list`/`!state` row now appends a suffix naming its parent;
-  default `" [part of {parent}]"`. Rendered in `_entity_line` only when
-  `e.is_part` (parent alive); placeholders `{parent}` / `{parent_name}` plus
-  every entity_line_format key (resolved against the part). Empty = off. Only
-  parts on the roster show it — glued parts are left off by default (the
-  `roster_glued_parts` rule + per-part `__roster_show`, audit-pass-33
-  follow-up).
-- **Directional/vision geometry — SHIPPED (scenarios 434-436).** Three
-  primitives extending the directional + LOS + footprint layers.
-  (1) **Box-face (footprint-aware) side_hit** — `side_hit` / `directional_get`
-  / `hit_location` now judge a MULTI-TILE target's struck side against its
-  real rectangle, not a center POINT. The `side_hit_hitbox_mode` rule
-  (`box` default | `center` legacy; per-call `hitbox=` override) selects it:
-  `box` aspect-corrects the center→attacker vector by the footprint
-  half-extents (`dx/hx, dy/hy`) and takes the bearing of that NORMALIZED
-  vector, then runs it through the existing `_relative_angle` +
-  `_relative_side_name` pipeline — so a hit along a long flank reads `side`
-  (not `front`) even near a corner, and 4/8-way + corner_arc + any facing all
-  keep working with no special diagonal case. 1×1 is byte-identical to
-  `center` (uniform correction when w==h), so the default-on change only
-  affects multi-tile bodies. (2) **`raycast(x1,y1,x2,y2[,viewer])`** —
-  `Match.raycast`, the IMPACT point of a beam: the farthest clear cell before
-  terrain stops it (or the target if clear), as an (x,y) read via
-  coord_x/coord_y. The companion to `first_opaque` (which returns the
-  BLOCKER); raycast returns where the beam LANDS. Walks the shared
-  `_line_cells`; the cell adjacent to an opaque origin-neighbour yields the
-  origin. (3) **Render vision memo (perf)** — `_fog_team_sees` is memoized via
-  a transient `Match._vision_memo` dict, activated only around `render_ascii`
-  (now a thin wrapper over `_render_ascii_impl`) and torn down in `finally`,
-  so the per-cell-per-layer fog scan (which loops every team member with a
-  per-member LOS walk) isn't recomputed. NEVER held across a mutation — lives
-  only for one synchronous read pass — so it can't go stale; renders are
-  byte-identical with it on/off. Cross-command caching intentionally out of
-  scope (avoids invalidation hazards).
-- **Custom event bus — SHIPPED (scenarios 437-439).** A GM-extensible hook
-  surface on top of the fixed HOOK_NAMES, decoupling cause from effect.
-  Handlers are ordinary PASSIVES whose `when` is `event:<name>` (`is_event_hook`
-  relaxes the when-validation in Passive.__post_init__ + the !passive /
-  !gpassive / !team passive command checks). Emission: the `emit(name,
-  payload=None, target=None)` formula prim and the `!emit <name> [to=<eid>]
-  [k=v ...]` command. `Match.emit_event` fires GLOBAL handlers ONCE (self =
-  target if given, else the current-turn entity, else None); when a `target`
-  is given it ALSO fires that target's TEAM + OWN handlers (self = target) — a
-  DIRECTED event. Broadcast-to-many is the GM looping emit per target (cause
-  stays explicit; no implicit fan-out). The `payload` dict is read inside a
-  handler via `event_get(key[,default])` / `event_has(key)` (from a transient
-  `Match._event_stack`, NOT a binding — sidesteps the sandbox's no-dynamic-
-  attribute rule); `event_name` is a HOOK_CONTEXT binding. Re-entrancy (a
-  handler that emits) is capped by the `event_recursion_limit` rule (default
-  64) with a var-hook-style warning latch (`_event_warnings`) drained by the
-  outermost emit. emit works from any formula context (action body, watcher
-  effect, another handler). All transient (`_event_depth`/`_event_stack`/
-  warnings not serialized); the subscribing passives serialize as normal
-  passives. The foundational primitive several other approved features
-  compose on.
-- **Combat helpers: shields + chain/bounce — SHIPPED (scenarios 440-443).**
-  Two new primitives where assembling them from existing pieces was painful
-  (the sandbox has no damage-interception or loop+visited-set); channeled /
-  charge-up were judged COMPOSABLE and shipped as demonstration scenarios
-  only (no new engine code), per "do we really need a whole feature for X?".
-  - **Shields / temp-HP** (the `temp_hp_sources` rule, CSV of vars roots,
-    default `shields`; per-entity `__temp_hp_sources`): named absorb POOLS
-    (`shields.plate`, `shields.ward`, ...) so multiple independent layers
-    coexist. A pool is `{amount, priority?, tags?, not_tags?}` or a bare
-    number. `absorb_damage(eid, amount, tags=None)` drains matching pools
-    HIGHEST priority first (ties by name), removes any emptied to 0, mutates
-    the pool vars (firing their var hooks), and RETURNS the leftover that
-    PENETRATES to HP — the GM applies it (`entity[t].hp = entity[t].hp -
-    absorb_damage(t, dmg)`). Tag match mirrors modifiers: an untagged pool
-    absorbs anything, a `tags` pool only hits carrying those tags (a typed
-    ward), `not_tags` excludes. `shield_total(eid, tags=None)` sums available
-    absorb (no mutation). Pools are plain vars — set/refresh via `!ent
-    set_var`; DECAY is GM-composed (a status tick / round hook), not an engine
-    feature. Core in formula.py (`_gather_pools` / `_absorb_damage` /
-    `_shield_total`).
-  - **Chain / bounce** — `chain_targets(from_eid, count, max_jump=0,
-    relation="")` (loopable): up to `count` entity ids, each the nearest alive
-    eligible entity to the PREVIOUS link, never revisiting, within max_jump
-    Chebyshev cells (0/None = unlimited); `relation` reuses the
-    any/hostile/ally/same_team/attackable filter (`_candidates`/`_relation_ok`).
-    The GM loops it and owns the per-hop falloff (engine never auto-applies
-    damage). Near→far.
-  - **Channeled (#60) / charge-up (#61) — DEMONSTRATED, not built.** Scenario
-    442: a `channeling` flag + an `on_entity_moved` passive (break on move) +
-    an `on_var_changed target=hp` passive (break on damage). Scenario 443: a
-    `charging` flag + `charge` counter advanced by an `on_turn_start` passive
-    that releases the wound-up attack at a threshold and resets. Both prove
-    the engine already supports the pattern via status/var + hooks + use_action
-    + the event bus — no new primitive warranted.
-- **Dice DSL extensions + weighted tables — SHIPPED (scenarios 444-446).** The
-  pre-existing `roll("NdM±k")` primitive (a shared `_roll_impl` used by both the
-  unseeded and the random_seed-bound bindings) gained per-die-group suffixes:
-  `!` (EXPLODE — a die on its max face rolls again and adds, capped at
-  `_ROLL_EXPLODE_CAP`, skipped for sides==1), and `kh<n>`/`kl<n>` (KEEP highest
-  / lowest n of the rolled dice — `2d20kh1` = advantage, `2d20kl1` =
-  disadvantage). Grammar via `_ROLL_DIE_RE` / `_ROLL_FLAT_RE`; dice are rolled
-  into a list (post-explosion per die) then keep-filtered. New
-  `roll_table(spec)` (match-bound, replay-safe via `_active_rng`): a weighted
-  random PICK returning a key — input is a `"key:weight,..."` CSV (weight
-  optional, default 1) or a `{key: weight}` dict; 0-weight entries never chosen;
-  the discrete-choice companion to `band` (which buckets a NUMBER into a range).
-  Both honor `random_seed` for reproducible sessions.
-- **Mounts / vehicles (slots + riders) — SHIPPED (scenarios 458-461).** A
-  VEHICLE is just an entity carrying a `slots` var (no hardcoded type); a SLOT
-  def lives at `vehicle.vars.slots.<name>` (author with `!ent set_var`). Slot
-  fields: `capacity` (numeric budget, default 1), `cost` (per-rider formula
-  consuming it, default "1"; `self`=rider + `vehicle` binding), `condition`
-  (valid-rider formula gate; fail-OPEN), `region` (a facing-relative footprint
-  region — reuses the part-region machinery via the factored
-  `Match.region_cells_of` — at which the rider RENDERS and is targeted; absent =
-  hidden inside), `controls_movement` (any number of slots may set it — an
-  occupant drives), and `actions` (a slot-scoped action bundle). The rider
-  back-link is the protected Entity fields `mounted_on` / `mount_slot` (serialized,
-  like `part_of`); occupancy is DERIVED by scanning (`vehicle_riders` /
-  `slot_occupants`), no second structure. Core on Match: `vehicle_slots` /
-  `slot_def` / `is_vehicle` / `slot_capacity` / `slot_cost_of` /
-  `slot_used_capacity` / `slot_condition_ok` / `can_mount`→(ok,reason) /
-  `mount_entity` / `dismount_entity` / `switch_slot` / `rider_cell` /
-  `_restamp_riders_for` / `_release_riders`.
-  - **Movement.** NO hardcoded "drive" action (the GM writes movement actions).
-    A rider's own move (`Entity.move_dirs` / `tp`, via `_mount_move_redirect`)
-    is REDIRECTED to the vehicle when its slot has `controls_movement` (the
-    whole rig moves; riders are carried), or REFUSED with a clear message when
-    it's a plain passenger ("dismount first"). Moving the vehicle directly
-    carries everyone: `_restamp_riders_for` is hooked into `fire_entity_moved`
-    alongside the part/anchor restamps (raw move_to — no rider hooks fire, like
-    parts). push/pull/swap operate on the vehicle (riders are excluded from
-    occupancy so they're never the push target).
-  - **Skip surfaces.** A HIDDEN rider (no region) is excluded from ground
-    occupancy (`cell_occupant`), render, POV visibility (`entity_visible_to`),
-    and the spatial enumerators (`_candidates`/`all_entities`/`entities_in_area`)
-    — the part-glued skip surface. A VISIBLE (region-slot) rider draws OVER the
-    vehicle at its region cell (a dedicated render priority pass) and stays
-    targetable; ALL mounted riders are off the ground (they share the vehicle's
-    cells). Riders keep their own turn/initiative + hp + actions; they show in
-    `!list` with a `mount_entity_line_suffix` suffix. Multiple visible occupants
-    spread across the region's cells by index.
-  - **Slot/vehicle actions.** A rider's available actions are augmented by
-    `discover_mount_actions`: (1) actions defined in its slot
-    (`slots.<slot>.actions.*`, container_path == `slots.<slot>`), and (2)
-    vehicle-wide actions carrying an `allowed_slots` field (list/CSV; `*`/`all`
-    = any) whose list includes the rider's slot. Other slots' actions and
-    vehicle-private (no allowed_slots) actions are NOT offered. Merged in
-    `_run_action_dispatch` + shown in `!action list`. Run-as is configurable:
-    the `mount_action_actor` rule (`rider` default | `vehicle`) with a
-    per-vehicle `mount_action_actor` var override decides which is the action's
-    `source`/actor; BOTH `vehicle` and `rider` ids are ALWAYS bound in the body
-    (new HOOK_CONTEXT names `vehicle`/`rider`/`slot`). In rider mode the action's
-    container is dropped (source = the rider's plain vars; read vehicle/slot
-    config via `entity[vehicle]`). Threaded via a new `extra_ctx` param on
-    `run_action`.
-  - **Lifecycle.** New hooks `on_mounted` / `on_dismounted` (fire on the rider,
-    bind `vehicle`+`slot`; switch fires dismount-then-mount). Host death/despawn
-    runs `_release_riders` from `Entity.remove` per the `mount_on_host_death`
-    rule (`eject` default — dismount to nearby free cells via
-    `_find_dismount_cell` | `kill` | `keep`). Formula prims: `mount` /
-    `dismount` / `switch_slot` (mutating), `is_mounted` / `mount_of` / `slot_of`
-    / `is_vehicle` / `riders` (loopable) / `slot_riders` (loopable) /
-    `slot_capacity` / `slot_free` / `can_mount`. Command `!mount <rider>
-    <vehicle> <slot>` / `dismount` / `switch` / `list` / `info` (list/info
-    player-available via READ_ONLY_SUBCOMMANDS). All serialized.
-    FUTURE the user may want: per-rider footprint inside a vehicle, nested
-    vehicles' shared fuel/initiative, and an armor layer for riders-inside
-    (positional cover). REJECTED (user): a built-in boarding range / "mount
-    only from an adjacent cell" rule. Whether a mounting is legal is the GM's
-    call, made in the slot `condition` and in the GM's own mount actions;
-    don't add engine rules for it.
-  - **Mount bug fixes (scenarios 465-466).** (1) NESTED carry: a vehicle that
-    is itself a rider now carries its OWN cargo when the rig moves —
-    `_restamp_riders_for` replays fire_entity_moved's carry-restamp trio
-    (anchors/parts/riders) for each moved rider, recursing down the stack
-    (cycles are can_mount-guarded), so a rider-on-a-cart-in-a-gunship follows
-    the gunship. (2) A rider that DIES revives UNMOUNTED: `_store_corpse` strips
-    `mounted_on`/`mount_slot` from the snapshot, so revive_corpse no longer
-    restores a phantom-mounted entity (an invisible "rider" on the ground / a
-    free re-seat). It can mount again afterward.
-- **Map viewport (panning) + auto-legend + auto-update boards — SHIPPED
-  (scenarios 463-464; #110 + #111 + #24).** The Discord-surface map block.
-  - **Viewport / panning (#110, headless-testable core).** Caps how much grid
-    renders at once: engages when EITHER dimension exceeds its cap (a 70×5 grid
-    still windows horizontally), window size = min(cap, grid) per axis. Caps are
-    the `viewport_width` / `viewport_height` rules (default 28; was 30 until the
-    rulers shipped). Per-CHANNEL
-    offset in `Match.channel_views` (channel_key -> [x,y], serialized), the
-    panning analog of per-channel POV. Surface gating: the `viewport_mode` rule
-    (`auto` default | `on` | `off`) — `auto` defers to the surface's
-    `ctx.viewport_capable` flag (Discord True, CLI/harness False), so the CLI
-    shows the whole map unless forced `on`. Core on Match: `viewport_engaged`,
-    `_viewport_dims`, `resolve_viewport(channel_key, enabled=)`→(vx,vy,vw,vh)|
-    None, `set_view` / `center_view` / `pan_view` / `clear_view` (all clamp the
-    window to the grid). `render_ascii(..., viewport=(x,y,w,h))` clips the
-    composition loop to the window. Commands: `!map pan <dir> [n]` (exact n
-    tiles, default 1), `!map center <eid>` / `!map center <x> <y>` (camera to an
-    entity/coord — clamped), `!map view <x> <y>` / `!map view reset`. pan/center/
-    view are per-CHANNEL camera state so they stay player-available; the bare
-    `!map` shows a "viewport (...)" header + pan hint when windowed.
-  - **Auto-legend (#111, headless-testable).** A glyph→meaning key appended
-    under the map, built from a parallel `meanings` grid populated only when
-    `legend=True` (so it reflects the FINAL top-layer glyph at each cell and
-    ONLY cells in the rendered window — POV/fog/viewport-correct). Entities →
-    name, tiles → template name or "tile", zones → "zone: <name>", fog →
-    "fog (unseen)"; grouped by glyph, row-major scan order. Per-match toggle
-    `Match.map_legend_enabled` (seeded from `map_legend_by_default`, default
-    off; serialized), command `!map legend on|off` (host-gated) + one-off
-    `legend=on|off` arg.
-  - **Auto-update boards (#24, Discord-ONLY — can't be harness-tested).** A
-    self-refreshing map message per channel, edited in place after every
-    command instead of re-posting. Lives in discord_commands.py (`_boards`
-    registry, `_board_render`, `_refresh_boards_for_match`, `_PanView` arrow
-    buttons, `DiscordCtxWrapper.set_autoupdate`); the post-dispatch refresh is
-    hooked in `_dispatch` (single + batch) and the approval re-dispatch. A
-    change in one channel refreshes every board on the same match. `!map
-    autoupdate on|off` (host-gated) — surface-agnostic handler calls the
-    optional `ctx.set_autoupdate` hook, so the CLI/harness report it as
-    Discord-only rather than erroring. Arrow buttons pan by `viewport_button_step`
-    tiles (0 = half-screen). NOTE: boards are runtime-only (Discord Message
-    handles don't serialize) — re-issue after a restart. Minimap (#110's other
-    half) was explicitly skipped.
-- **Audit-pass-2 bug fixes (scenarios 468-473).** A second interaction-bug
-  sweep (zones / fog-LOS / movement subsystems). Fixed:
-  - **`move_group_dirs` now validates the whole footprint + blocking** (was
-    anchor-only). Phase 1 checks every swept-footprint cell for bounds + the
-    `block_walk` condition each step, and the FINAL footprint for occupancy
-    (footprint-aware `cell_occupant`, fellow group members treated as
-    transparent via `_occupancy_ignore(extra=...)`) — so a multi-tile member
-    can't march off-grid / onto another body's non-anchor cells, and a group
-    can't walk through an impassable tile/zone/corpse. Mirrors the
-    single-entity `Entity.move_dirs` contract. Scenarios 468-469.
-  - **LOS-only vision casts from the whole body** (`_entity_has_los` /
-    `_team_has_los`). They used the anchor cell only, disagreeing with
-    `_member_sees` (which checks every footprint cell) — so a large viewer's
-    `can_see_losonly` / `team_sees_cell_losonly` was wrong. Now ANY footprint
-    cell with a clear line counts. Scenario 470.
-  - **`_restamp_parts_for` carries a part's auras + sub-parts.** It snapped a
-    part's position but never re-stamped that part's anchored aura or its own
-    sub-parts (a part-of-a-part) — same class as the nested-mount bug fixed in
-    #80. Now walks the whole part subtree (BFS via `entity_part_subtree`,
-    parents first) and re-stamps each moved part's auras. Scenario 471.
-  - **`hidden_rider_grants_vision` rule (default False).** A hidden rider
-    (passenger in a region-less slot) was excluded from being SEEN but still
-    contributed to its team's vision/fog — an asymmetry. Now gated by the rule
-    via the shared `_vision_member_ok` (used by `_team_sees` / `_team_has_los`
-    / `_record_vision`); default off = symmetric (a passenger grants no
-    sight). An explicit per-entity `can_see(<rider>,...)` is unaffected.
-    Scenario 472.
-  - **`resize_grid` shifts `channel_views`.** Resize repositions all
-    coordinate-bearing content by the anchor offset but had missed the
-    per-channel viewport CAMERA (added after resize was written), so a
-    center/edge-anchored resize left the camera framing the wrong region. Now
-    offset like everything else (resolve_viewport re-clamps on read).
-    Scenario 473.
-- **Audit-pass-3 fix: attached parts share the parent's TURN CLOCK (scenarios
-  474-477).** Three per-unit "clocks" iterated only `turn_order` members (round)
-  or the active entity (turn). Attached parts carry no initiative (excluded from
-  turn_order), so a glued/region/located part's statuses, turn/round passives,
-  and turn-scheduled effects NEVER fired — silently contradicting the doc
-  ("parts tick normally; a part's tick can `damage_part(self,n)` to route to
-  main"). Fix shape (user-approved): a part rides its parent's clock. The shared
-  `Match._attached_tick_parts(base_targets)` BFS-walks each base target's part
-  subtree and returns the parts that LACK independent initiative, STOPPING
-  descent at an independent part (it's its own target and ticks on its own turn,
-  carrying its own sub-parts) — deduped so a deep part isn't double-counted and
-  an independent part reached via both its own turn-order slot and its parent
-  isn't double-ticked. Wired into all three clocks:
-  - **Statuses:** `fire_status_tick` appends the helper's parts to its targets.
-    Each part's own definition `tick_when` still gates whether it fires.
-  - **Turn/round passives:** `fire_hook` gained an `own_only_targets` param —
-    those ids fire ONLY their entity-owned passives, NOT match-wide globals or
-    team passives (which already fired once per acting unit, so they must not
-    re-run per part). The six `on_turn_*`/`on_round_*` calls in `next_turn` /
-    `_advance_index` pass `own_only_targets=self._attached_tick_parts(...)`.
-  - **Turn-scheduled effects:** the two `fire_scheduled_turn(cur/new_cur)` sites
-    also call it for each attached part.
-  So a DoT/regen/bleed on a limb both lives on the limb and (via
-  `damage_part(self,n)`) can bleed into the main body. (Also re-audited and
-  found correct: `Match.to_dict`/`from_dict` round-trips every persistent field
-  — `pending_requests` is intentionally runtime-only — and push/pull/swap are
-  footprint-aware for multi-tile bodies.)
-- **Audit-pass-3 fix: action rollback preserves ALL runtime-only state
-  (scenario 478).** `action._rollback_match` restores a failed action's
-  transaction by rebuilding the Match from the pre-state snapshot and copying
-  its fields back, then re-applying a curated list of runtime-only (underscore)
-  fields the snapshot doesn't carry. That list had gone STALE — it missed the
-  event-bus fields (`_event_stack`/`_event_depth`/`_event_warned`/
-  `_event_warnings`) and others (`_summon_count`, `_death_processing`,
-  `_death_check_suppressed_ids`, `_alive_eval_depth`, `_vision_memo`,
-  `_turn_order_dirty`, `_request_seq`, `pending_requests`). The headline crash:
-  an action that `emit()`s an event whose handler runs a FAILING sub-action —
-  the sub-action's rollback wiped the LIVE `_event_stack` (holding the outer
-  emit's frame), so the handler's next `event_get` and the emit's own cleanup
-  hit "pop from empty list", crashing the whole outer action. Fix: preserve the
-  COMPLETE set of runtime fields (rollback only restores SERIALIZED state;
-  transient in-flight state — the emit stack, summon budget, etc. — must
-  survive). The list must stay in sync with Match's underscore fields; a
-  `hasattr` guard makes a future-missing name a no-op rather than a crash.
-  COMPANION fix in `run_action`: because `_summon_count` is now PRESERVED across
-  a rollback, the choice-REPLAY loop (which rolls back + re-runs the body per
-  interactive `choose`) resets it to the action-start value each attempt —
-  otherwise a summon-before-`choose` would accumulate the per-command summon
-  budget across replays and falsely hit `summon_event_limit`. Snapshotted
-  alongside the existing per-attempt RNG/cursor/buffer resets.
-- **Audit-pass-3 fix: a turn_end tick that empties the turn order no longer
-  crashes next_turn (scenario 479).** PRE-EXISTING (parts-independent): if a
-  `turn_end`/round hook or status tick removed the LAST entity in `turn_order`
-  (e.g. a lethal DoT on the only combatant — now also reachable via a part tick
-  routing `damage_part` to its vital parent), `next_turn` then computed
-  `(active_index + 1) % len(turn_order)` against an empty order →
-  ZeroDivisionError (surfacing as a 💥). Guarded every point a hook/tick can
-  empty the order: `_advance_index` bails if `turn_order` is empty; `next_turn`
-  returns `(None, log)` after the opening round_start, after `turn_end` hooks,
-  and after `_advance_index`'s round-wrap ticks; `_skip_to_eligible` stops on an
-  emptied order and clamps a stale `active_index`. A two-combatant table where
-  one self-kills still advances cleanly to the survivor.
-- **Audit-pass-3 enhancement: `!mod show` flags unrecognized modifier ops
-  (scenario 480).** The fold (`_apply_modifier_op`) treats an op outside the
-  recognized set (`add`/`inc%`/`more%`/`set`/`min`/`max`, now the module
-  constant `MODIFIER_OPS`) as a lenient ADD — convenient, but it silently
-  swallows a typo like `inc` for `inc%` (a flat +N instead of a %). Behavior is
-  UNCHANGED (still lenient-add, so no existing match breaks); `!mod show` now
-  marks any such line with ⚠️ and appends an advisory naming the bad op(s) +
-  the valid set, via `Match.unknown_modifier_ops(mods)`. Read-only diagnostic
-  surface only — the fold itself doesn't warn (no clean channel mid-formula).
-- **Polymorph / transform (115) — SHIPPED (scenarios 481-483).** An
-  identity-preserving statblock swap. `transform(eid, template, stash_path=None)`
-  / `revert(eid, stash_path)` formula prims (match funcs) + `!ent transform <id>
-  <template_ref> [stash_path]` / `!ent revert <id> <stash_path>`. REPLACES name,
-  vars (incl. actions + footprint), passives, clamps, status, and the attached
-  part subtree; PRESERVES identity — id, position, facing, team var, and
-  turn-order slot (the turnorder_var value) all carry over, so references,
-  initiative, and allegiance survive. Core: `Match.capture_statblock` /
-  `apply_statblock` / `transform_entity` / `revert_entity`. apply_statblock
-  despawns the old parts (despawn, NOT death — no corpse), swaps the fields in
-  place, re-mints + re-links the new statblock's `parts`/`segments` (handles
-  both the summon-style {role: template} dict AND a captured full-subtree list,
-  remapping part_of for multi-level limbs via `_apply_statblock_parts`), rebuilds
-  turn order, and suppresses death checks across the swap window. HP carries per
-  the `transform_hp_mode` rule: `percent` (default — preserve the fraction of
-  max_hp), `keep` (current hp clamped to new max), or `full` (the target's own
-  hp). REVERT DESIGN (user's call): the pre-transform statblock is stashed to a
-  CALLER-CHOSEN var path (not a protected var), and revert reads that path — so
-  the stash is an ordinary inspectable/editable var, transforms STACK (stash
-  each to a different path, revert in any order, even skipping levels), and
-  there's no hidden state. `template_ref` for the command resolves as a dotted
-  var path on the entity (the summon_from convention — store a template, then
-  transform into it) OR a live entity id to snapshot. Multi-tile is first-class:
-  swapping footprint_w/h vars swaps the footprint for free (482), and part
-  templates spawn/despawn their limbs across transform/revert. Both prims/
-  commands are mutating → host-gated.
-- **Fake-statblock / disguise (116) — SHIPPED (scenarios 484-485).** A
-  DISPLAY-ONLY, POV-gated presented statblock (the decoy/illusion primitive).
-  The `disguise_var` rule (default `disguise`) names an entity var holding
-  `{name?, glyph?, glyphs?, color?, vars?: {...}}`. A viewer NOT on the entity's
-  own team (and not omniscient) sees the disguise's name/glyph/color and its
-  `vars` overlaid on the roster; the entity's own team and the omniscient/GM
-  view see the truth. Engine MECHANICS (targeting, formulas, damage, `var_get`)
-  ALWAYS read the real statblock — a disguise only changes what's RENDERED.
-  Core: `Match._effective_disguise(e, pov_team)` (None = show real: gated on
-  pov_team being a non-None, non-own-team viewer + a disguise var present) +
-  `entity_glyph`/`entity_color`/`entity_display_name` now take an optional
-  `pov_team` and consult it; `render_ascii` threads pov_team through the three
-  glyph/color paint passes + the legend meanings; `_entity_template_context` /
-  `_entity_line` take pov_team and overlay the disguise name + vars (disguise
-  vars win over the computed hp/max_hp/team for display). Surfaces: `!map` /
-  `!list` / `!state` (the board); use `!as view <team>` to preview a POV in the
-  CLI/harness. `!ent info` shows the decoy card and `!find` rows render the
-  decoy line under a team POV (pov_filters_queries, audit-pass-29); `!find`
-  PREDICATES and `show:` columns still read the real vars, except the
-  reserved `name` path, which reads the decoy name under that POV. A moving/animated decoy or an
-  illusion that fools enemy TARGETING is a GM composition on top (mechanics use
-  real, so a true targeting-fooling illusion would need the deep-illusion
-  variant, deferred).
-- **`!find` spatial predicates + `!foreach` bulk-apply — SHIPPED (scenarios
-  486-490).** Two composing query/QoL features.
-  - **Spatial `!find` predicates.** `!find` already had var comparisons
-    (`hp<20`, `team=red`, `var!=v`, dotted paths), `status:`/`group:`/`action:`;
-    the only gap was SPATIAL, now `near:<eid>:<radius>` (within radius of an
-    entity — the reference itself matches at gap 0) and `within:<x>:<y>:<radius>`
-    (within radius of a coordinate). Both use the FOOTPRINT-AWARE nearest-cell
-    gap, Chebyshev (square_radius). The gap math is now the single
-    `Match.entity_gap_distance(e_ref, e_other, mode)` + `cell_entity_distance(x,
-    y, e, mode)` over a shared `_rect_gap` (rectangle nearest-cell distance);
-    `formula.py`'s inline `_ent_dist` (behind `entities_within`/`nearest_entity`)
-    was refactored to route through `entity_gap_distance` so the enumerators and
-    the `near:` predicate agree exactly. A malformed radius / missing reference
-    RAISES `VTTError` from `_find_match_entity` — so `find_cmd` (and `foreach`)
-    now run the match loop INSIDE the predicate-parse try.
-  - **`!foreach <predicates> ; <command>`.** Runs ONE command per entity matching
-    a `!find` selector (the selector reuses the exact find grammar). The bare `;`
-    token splits selector from command (first `;` only; like `!batch`); the
-    command runs once per match with `$id`/`$name`/`$x`/`$y` substituted
-    per-token (`$name` LAST so an injected name isn't re-substituted). Matches
-    are resolved to a fixed (id, name, x, y) snapshot BEFORE any command runs, so
-    mutating the board mid-loop (move/kill/spawn) can't change the target set.
-    ONE undo entry (foreach is snapshotted; inner commands go through
-    `dispatch_no_snapshot`); a per-entity `❌` is reported and the loop continues
-    (batch semantics). Host-gated by default (mutating) — a player can't wrap a
-    mutating command to bypass the gate, since the inner ungated
-    `dispatch_no_snapshot` is only reached after foreach passes the top-level
-    gate. Helpers `_foreach_subst` + the `foreach_cmd` handler in vtt_commands.py.
-    FUTURE the user might want: multiple commands per entity (extra `;`), a
-    read-only `!foreach` variant, more substitution tokens.
-  - **`!foreach` upgrades — SHIPPED (scenarios 557-558).** Two of the three
-    flagged follow-ups above. (1) **Multiple commands per entity:** after the
-    first bare `;` (selector separator), further bare `;` tokens split the tail
-    into MULTIPLE commands; all commands for one entity run before the next
-    (PER-ENTITY grouping, so a multi-step recipe reads top-to-bottom). Still ONE
-    undo entry (the whole sweep is snapshotted; inner commands via
-    `dispatch_no_snapshot`). Empty groups from a doubled/leading/trailing `;`
-    are dropped (like `!batch`). New helper `_split_foreach_commands`. (2) **More
-    substitution tokens:** `$team` (the entity's team var, "" if none), `$i`
-    (1-based index in the matched set, TURN-ORDER order), `$n` (total match
-    count), alongside the existing `$id`/`$name`/`$x`/`$y`. `_foreach_subst`
-    stays a SINGLE-pass `re.sub` with the alternation ordered longest-first
-    (`$name`/`$team`/`$id` before the `$i`/`$n` prefixes) so a substituted value
-    containing a token isn't re-expanded and `$id` isn't eaten by `$i`. `$x`/`$y`
-    remain the ANCHOR cell for a multi-tile entity (the addressing convention);
-    the near:/within: selector stays footprint-aware. Host-gated as before (the
-    inner ungated dispatch is only reached after foreach passes the top gate —
-    no player bypass). The DEFERRED third piece — a player-usable READ-ONLY
-    `!foreach` — was intentionally left out (it overlaps `!find show:/sort:`,
-    which already gives players per-entity readouts, and it adds an
-    access-gating surface worth a design decision first). SHIPPED — see below.
-  - **Read-only `!foreach` — SHIPPED (scenarios 564-565).** The third follow-up.
-    Enable mechanism (user's call): NO new command and no opt-in token —
-    `!foreach`'s access is DERIVED FROM CONTENT, the same shape as the existing
-    READ_ONLY_SUBCOMMANDS downgrade. `CommandRegistry._foreach_read_only(args,
-    m)` splits the sweep's inner command groups and downgrades the base access
-    from `host` to `all` iff EVERY group resolves to `all` via a recursive
-    `_effective_access` call. Rationale: a sweep of read-only commands carries
-    no more authority than running those commands one at a time. A MUTATING
-    sweep is unchanged — still host-gated, and a player's invocation still
-    QUEUES for approval (not refused), so the existing approval flow just works.
-    The downgrade is applied BEFORE the per-match override tables, so a host's
-    explicit `!host access set foreach host` still beats it; and because the
-    check calls `_effective_access` per inner command, it tracks per-match
-    overrides in BOTH directions — `!host access set "ent dump" all` immediately
-    makes a `; ent dump $id` sweep player-available.
-    STRICTLY DEFAULT-DENY (the safety rests here, since inner commands run
-    through the deliberately ungated `dispatch_no_snapshot`). Verified blocked:
-    a mutating inner command anywhere in the sweep (incl. mixed with read-only
-    ones); ALIASES (expanded only at inner-dispatch time, so the gate sees an
-    unknown name — players must spell the real command out); a `$`-token in the
-    command OR subcommand position (`; ent $id`, `; $id dump`, `; ent $(...)`)
-    since a token is never a known read-only subcommand; the SELF-DISPATCHING
-    metas (`foreach`/`batch`/`run`/`macro`/`eval`, new frozenset
-    `_SELF_DISPATCHING_COMMANDS`) whose real content isn't in args[0] and where
-    a nested foreach would recurse; and ELEVATED_ARGS (`; map full`). GOTCHA
-    worth remembering: `ent dump` is NOT in READ_ONLY_SUBCOMMANDS by deliberate
-    policy (it reveals GM-hidden vars), so `; ent dump $id` gates a sweep —
-    use `ent info` for the player-available readout. The selector uses the
-    `!find` grammar; for a NON-host sweep it now also skips entities the
-    channel POV can't see (pov_filters_queries, audit-pass-29), so `$x`/`$y`
-    can't hand out hidden positions. A host's sweep is unfiltered.
-- **Audit-pass-4 fixes: multi-tile interaction sweep (scenarios 491-492).** A
-  fourth interaction-bug sweep, this time hunting anchor-only assumptions in
-  OLDER features against multi-tile entities (three read-only survey agents
-  across zones/auras/tiles, vision/LOS/targeting, and AoE/spawn/corpse/mount;
-  every flagged candidate verified in code before fixing). Two real bugs found
-  + fixed; the rest of the surface re-confirmed footprint-correct.
-  - **`move_group_dirs` fired tile/zone movement hooks at the ANCHOR cell
-    only.** Group movement (`!ent move group:<name> ...`) validated the whole
-    swept footprint (audit-pass-2) but then fired `on_enter`/`on_exit`/`on_stop`
-    via the anchor-only `fire_tile_hook`/`fire_zone_*_hooks` instead of the
-    footprint-aware `fire_footprint_tile_*`/`fire_footprint_zone_*` that
-    `Entity.move_dirs` uses — contradicting its own docstring ("per intermediate
-    tile … same as single-entity move_dirs"). So a multi-tile group member
-    crossing a hazard band / zone edge under-fired hooks (a 2×2 walking over a
-    damage strip burned once, not per covered cell). Now mirrors `move_dirs`
-    exactly (per-step `old_cells`/`new_cells` via `entity_cells`); byte-identical
-    for a 1×1 member, correct for a footprint. Group move ALSO now fires the
-    per-step `on_entity_step` hook (after each cell's `on_enter`) that
-    single-entity `move_dirs` fires — a pre-existing, footprint-independent
-    parity gap (per-cell reactions + snake-trail follow now work under group
-    move). Scenario 493.
-  - **`entities_in_area(x, y, n)` measured distance to the ANCHOR cell.** The
-    coord-rooted twin of `entities_within` used `_distance(x, y, e.x, e.y, mode)`
-    while `entities_within` had been refactored to the footprint-aware
-    nearest-cell gap — so a large body partly inside an AoE radius was wrongly
-    excluded (a 4×4 at (10,10) missed a blast at (14,14) r2 because the anchor
-    was 4 away though a corner cell was 1 away). Now routes through
-    `Match.cell_entity_distance(x, y, e, mode)` (the point-vs-footprint gap added
-    with the `within:` find predicate), so the entity- and coord-rooted area
-    queries agree.
-  - **Re-verified footprint-correct (no change needed), so future sweeps can
-    skip them:** all vision/fog/LOS casts (`_member_sees`, `_entity_has_los`,
-    `_team_sees_entity`, `_record_vision`, `entity_visible_to` — union/any-cell),
-    targeting geometry (`side_hit`/`hit_location`/`directional_get` box-face
-    hitbox, `entity_center`/`aoe_origin`), the spatial/LOS enumerators
-    (`entities_within`/`nearest_entity` via `entity_gap_distance`,
-    `entities_in_cone`/`_rect`/`_line_ignorelos`/`_on_los`/`_line_until` via
-    `_alive_at`/`_occupants` any-cell), `damage_spread` spatial filtering,
-    `chain_targets`, `summon_near`/`_find_free_cell_near` (whole footprint
-    validated, defaults applied first), corpses (`corpse_cells`/`revive`),
-    mounts (`_find_dismount_cell`/`_restamp_riders_for`), `resize_grid` (cut if
-    ANY cell off-grid), and single-entity `tp`/`move_dirs`/push/pull/swap.
+- **Units** (`Entity`): id (immutable — `!ent rename` changes only the display
+  name), name, x / y (1-based), facing, vars, status, passives, clamps, plus
+  the protected link fields `part_of` / `mounted_on` / `mount_slot`. Vital
+  vars hp / max_hp / initiative (names from `hp_var` / `max_hp_var` /
+  `turnorder_var`).
+- **`Entity.write_var` / `remove_var`** are the only way to change vars:
+  vital vars are coerced to finite whole numbers or refused, nothing nests
+  under a vital, vitals can't be deleted (`allow_protected` only for the
+  property setters), reserved paths (x / y / name) are refused, a footprint
+  write must fit (`check_body_fits`), then clamps, var hooks and the death
+  check run. Wholesale var sets (spawn, summon / part / segment templates,
+  transform) run `checked_unit_vars` instead.
+- **Every store** (unit vars, team data, match vars, tiles, zones, statuses)
+  goes through `_own_value` (deep copy, string dict keys, JSON values only),
+  `check_store_path` (no empty path segment) and `check_no_value_ancestor`
+  (no `k.x` while k = 5). Status number fields (level, duration) via
+  `checked_status_value`.
+- **`default_entity_vars`** (`!defvar`) fills MISSING vars at spawn, before
+  vital validation; `!ent add` / template values win.
+- **Clamps** (entity + system `default_clamps`, `!clamp` / `!gclamp`): hard
+  always clamps; soft engages only when a write crosses from the legal side
+  and stays dormant past the bound; max applied before min. The default soft
+  clamp caps hp at max_hp.
+- **Aliveness:** `alive_condition` rule (empty = hp > 0 or indestructible);
+  the death PIPELINE uses `death_condition` (+ per-unit `__death_condition`,
+  `death_condition_mode`).
+- **Commands:** `!ent` add / remove / rename / info / dump / diff / set_var /
+  set_vars / delete_var / hp / init / tp / move / push / pull / swap / face /
+  kill / revive / clone / copy / transfer / transform / revert / status /
+  group / action / store_entity_into_var. `!ent hp` SETS by default (`5`, `=-3`, `max`, `$(...)`);
+  a leading sign changes (`+5` heals, `-5` damages); one `write_var`, hook
+  output and deaths reported (633-634, 647). `!ent set_vars <id> k=v ...` is
+  one all-or-nothing undo step (684). `!ent set_var` coerces only lowercase
+  `true` / `false` to bools and keeps `inf` / `nan` as text.
+- **Container helpers** (the engine has no inventory concept): `var_add`,
+  `var_move` (looting), `var_copy`, `var_sum_field`, `item_add` /
+  `item_consume` (drops the container at 0; `amount_field` rule), `var_keys`,
+  `var_sum`, `var_clear`, `get`, `keys` / `values` / `index_of` / `unique`
+  (547-548, 685-686). Authoring notes: in an item's action `source.<path>` is
+  the ITEM's container and `entity[self]` the HOLDER; dict keys are unique, so
+  identical items stack through an amount field; `!ent set_var hero
+  inventory.potion 99` replaces the whole item dict.
+- **`!ent clone`** copies the whole part subtree, strips mount links, refuses
+  a body part, and is all-or-nothing (`_rollback_match` on any refusal).
+- **Summons** (`Match.summon_entity`): `summon(template, x, y)` /
+  `summon_near(..., radius)` / `summon_from(path, ...)` turn an entity-shaped
+  dict into a unit (id minted from its name, footprint placement, parts /
+  segments keys, on_entity_spawned), bounded per command by
+  `summon_event_limit`; `entity_snapshot(eid)` and `!ent
+  store_entity_into_var` make such a dict; `remove_entity` despawns. Server
+  templates (§7.17) build on the same path.
+- **Occupancy:** one unit per cell, except units with the `__cell_stackable`
+  var; `cell_entity` names the blocker, `entities_at` everyone covering a cell.
+- **Shields / temp hp:** named absorb pools under the roots in
+  `temp_hp_sources` (default `shields`; per-unit `__temp_hp_sources`), each
+  `{amount, priority, tags, not_tags}` or a number. `absorb_damage(eid, n,
+  tags)` drains matching pools highest priority first and returns what
+  penetrates (the GM applies it to hp); `shield_total`. Decay is GM-composed
+  (440).
 
-- **Audit-pass-5 fixes: general correctness sweep (scenarios 494-495).** A
-  broader bug hunt (NOT multi-tile-scoped — four read-only survey agents across
-  serialization/undo, status/modifier/event, death/corpse/transform/mount, and
-  action/formula/dispatch; every candidate verified in code before fixing). Two
-  real bugs fixed:
-  - **`Entity.to_dict` shallow-copied `vars` → corrupted undo + action
-    rollback for nested vars.** `to_dict` did `"vars": dict(self.vars)` (shallow)
-    while the sibling `status` was `deepcopy`'d. Entity vars hold nested dicts
-    (`inventory`, `modifiers`, …) that `_set_path` mutates IN PLACE, so a command
-    snapshot SHARED the live nested objects; a later dotted-path write then
-    corrupted the snapshot, and `!history undo` / transactional action rollback
-    restored the wrong (mutated) value (a nested var could even vanish entirely).
-    Fixed to `copy.deepcopy(self.vars)`. This is the snapshot path behind BOTH
-    undo and `action._rollback_match` (both go through `Match.to_dict` →
-    `Entity.to_dict`), so it fixes both at once. Footprint-INDEPENDENT — a
-    long-standing latent bug any nested-var undo would hit.
-  - **`_restamp_parts_for` didn't carry a moved part's RIDERS.** When a parent
-    moved, the part-restamp synced each glued part's anchor + its anchored auras
-    (`_restamp_anchors_for`) but never `_restamp_riders_for(part)`, so a body
-    part that is ALSO a vehicle left its riders behind (same class as the
-    nested-mount bug #80, but for a part-vehicle). Added the symmetric
-    `_restamp_riders_for(e.id)` call (recursion stays bounded — part subtree is
-    acyclic, mount cycles are can_mount-guarded).
-  - **Re-verified correct (no change):** Match/zone serialization round-trips all
-    persistent fields; `action._rollback_match`'s runtime-field list is complete
-    (audit-pass-3); modifier fold min/max ops; event-stack preservation across
-    nested-action rollback; status counter auto-removal; formula sandbox
-    `_who_arg` HOOK_CONTEXT handling + `normalize_body_source` at every body
-    boundary; dispatch gate (no batch/foreach/macro/action bypass).
-  - **OPEN QUESTION raised with the user → RESOLVED (status resistance +
-    `add_level`).** The old gate `(name not in e.status or new_level is not
-    None)` let an implicit +1 (`!status apply x poison` with no level) on an
-    already-present `add_level` status BYPASS resistance, while an explicit
-    level was resisted — an asymmetry. The user's call: keep `apply_status`
-    consistently resistance-aware AND add a SEPARATE force primitive that
-    ignores resistance (resistance stays LEVEL-only — no duration channel).
-    Shipped (scenarios 496-497):
-    - **Resistance is now mode-aware** via `Match._resistance_applies(e, name,
-      sdef, level_given)`: a flat level-reduction resistance applies only when
-      a level is actually added/set — a FIRST application, an `add_level`
-      increment (implicit +1 OR explicit), or a `replace` with an explicit
-      level. `refresh`/`extend`/`none` set no level, so resistance no longer
-      touches them (fixes BOTH the implicit-+1 bypass AND a previously-possible
-      bug where an explicit level on a `refresh` ran the resistance gate and
-      could no-op the duration refresh). So an implicit `add_level` +1 with
-      resist≥1 is now fully resisted (consistent); `status_apply_block_reason`
-      shares the same helper so command feedback matches.
-    - **`force` path** — `apply_status(..., force=True)` skips the immunity +
-      resistance gating entirely (the level/increment lands regardless);
-      cross-status `blocked_by` and the part immune/redirect rules are STILL
-      honored (force is specifically the "ignore resistance" axis, not a
-      bypass-everything hammer). Surfaced as the `status_force(eid, name[,
-      level, duration])` formula primitive (twin of `status_apply`) and the
-      `!status force <eid> <name> [level] [duration]` command (host-gated like
-      apply; reply reads "Force-applied").
+### 7.2 Passives, hooks, events, watchers
 
-- **Audit-pass-6 fixes: cross-subsystem correctness sweep (scenarios 498-506).**
-  A sixth bug hunt (four read-only survey agents across transform/disguise,
-  dispatch/foreach/macro/watcher/undo, dice/modifier/shield numerics, and
-  mounts/vehicles; every candidate verified in code before fixing). Nine real
-  bugs fixed, three of which needed a user design call:
-  - **Snapshot shallow-copy, tiles + zones (HIGH).** `Match.to_dict` stored each
-    tile's data dict BY REFERENCE and `_zone_to_dict` stored a zone's
-    `data`/`hooks` by reference (only `cells` was rebuilt). Since `tile_set_path`/
-    `zone_set_path` (and the `tile_set`/`zone_set` primitives) mutate IN PLACE,
-    an in-place `!tile set`/`!zone set` corrupted the prior command snapshot —
-    defeating undo change-detection (pre==post → no snapshot) AND action
-    rollback. Same class as the audit-pass-5 `Entity.to_dict` vars fix, missed
-    for tiles/zones. Fixed with `copy.deepcopy` in both serializers (498-500).
-  - **Segment `__follows` not remapped on id re-mint (MED-HIGH).** Both
-    `_apply_statblock_parts` (transform/revert of a captured subtree) and
-    `copy_entity` (cross-match copy/transfer) remapped `part_of` but NOT the
-    snake-segment back-pointer `__follows`, so a 2+ segment snake lost its chain
-    past the first link when re-minted under an id collision. Fixed by remapping
-    `__follows` via the same idmap in both paths (505; verified under a forced
-    collision — worm→worm_2, s1's `__follows` s0→s0_2).
-  - **Dice `kh0` negative-zero slice (HIGH).** `dice[-0:]` is the WHOLE list in
-    Python, so `roll("NdMkh0")` returned the full sum instead of 0 (the `kl`
-    branch `dice[:0]` was fine). Guarded `k==0` explicitly (498).
-  - **Macro / foreach substitution (MED/LOW).** `_macro_subst` re-expanded a
-    token appearing INSIDE an arg value ($@ pass then positional pass) and
-    mis-parsed `$10`+ (the `$1` prefix). `_foreach_subst` only guarded
-    `$name`-contains-token, not an id/x/y value containing a later token. Both
-    rewritten as a SINGLE-pass `re.sub` (501; macro now also supports $10+).
-  - **Mount `slot` binding (MED, two sites).** The mount-action dispatch
-    `extra_ctx` never set the documented `slot` binding (read as None), and
-    `_eval_slot_expr` hard-wired `slot` to the rider's CURRENT mount_slot (None
-    on a fresh mount, stale on a switch) instead of the slot being EVALUATED.
-    Fixed: bind `slot` in the action ctx; thread the evaluated slot param through
-    `_eval_slot_expr` from `slot_cost_of`/`slot_condition_ok` (506).
-  - **chain_targets relation anchor (user call → ORIGIN).** `relation`
-    (hostile/ally/…) was judged vs the PREVIOUS link each hop, so a `hostile`
-    chain flipped allegiance (enemy→ally→enemy). Now judged vs the ORIGIN
-    `from_eid` (distance still measured from the previous link), so chain
-    lightning bounces among the caster's enemies (502).
-  - **swap + mounts (user call → REDIRECT).** `swap_entities` had no mount guard.
-    Now applies `_mount_move_redirect` to both participants: a driver (a
-    controls_movement slot) redirects the swap to its VEHICLE (riders carried), a
-    passenger raises "dismount first" — mirroring tp/move_dirs (503).
-  - **transform of a vehicle with riders (user call → gamerule, default block).**
-    Replacing a vehicle's `slots` var wholesale orphaned its riders. New rule
-    `transform_rider_mismatch_mode` (enum block|eject, default `block`): if EVERY
-    rider's slot still exists in the new form they stay mounted; otherwise block
-    (refuse, raise before any change) or eject (dismount all, then transform).
-    `_release_riders` gained an explicit `mode` override for the eject path (504).
-  - Re-verified CORRECT (no change): disguise POV gating + fog/footprint
-    interaction, HP carry modes, modifier fold + caps + tag/grants, shields/
-    absorb priority + drain, band()/roll_table boundary + weight handling,
-    damage_spread apportionment, watcher edge-trigger + serialization, the access
-    gate (no batch/foreach/macro bypass), nested-mount carry + cycle guards,
-    rider-death corpse strip, `_find_dismount_cell`.
+- **Passives** (`Passive`, `!passive` per unit, `!gpassive` global, `!team
+  passive` per team, `default_entity_passives`): `when` is a HOOK_NAMES entry
+  or `event:<name>`. `Match._firing_passives(target)` yields global + the
+  target's team passives; then the unit's own. Before each own-handler loop
+  the unit's existence is re-checked (ghost firing, §5).
+- **Var hooks** (`on_var_*`, `on_var_written`, `on_var_write_attempt`): run
+  bottom-up for subtree writes; `self` is the CURRENT-TURN unit, and the
+  extras carry changed_key / old_value / new_value / intended_value /
+  was_clamped. Status hooks bind `self` = the affected unit. Recursion capped
+  by `var_hook_recursion_limit`; `var_hook_warning_verbosity` (off / minimal /
+  detailed).
+- **Turn / round hooks** fire for the acting unit; its attached parts fire
+  only their OWN passives (`own_only_targets`). Movement hooks per footprint
+  cell (`fire_footprint_tile_*` / `fire_footprint_zone_*`) plus
+  `on_entity_step` per step. Lifecycle: on_entity_spawned,
+  on_entity_despawned (every non-death removal, fired BEFORE the unit
+  leaves; `Entity.remove(despawn=)` returns its log), on_death / on_revive,
+  on_entity_moved, on_mounted / on_dismounted, on_turn_skipped (`skip_status`), on_status_*,
+  on_action_used / on_action_failed / on_action_used_on_target.
+- **Event bus:** `emit(name, payload, target)` / `!emit`. Global handlers
+  fire ONCE (self = target, else the current unit); a directed event also
+  fires the target's team + own handlers. Payload via `event_get` /
+  `event_has`; `event_name` binding; `event_recursion_limit`.
+  `declare_winner` emits `match_outcome` (winner / reason / round) — the bus
+  was chosen because `fire_hook` runs globals once PER TARGET unit
+  (437-439, 568).
+- **Watchers** (`!watch`, `Match.watchers`): an expression condition +
+  program effect, EDGE-triggered (false → true), polled once after each
+  top-level command settles; `once` removes after firing; `last`
+  serialized; a malformed condition reads as not met (427-428).
+- **Output:** every formula-driven change hands its log to
+  `Match.surface_log` (action buffer, else the command's `FORMULA_LOG_SINK`),
+  shown at the end of the command in order (651).
+- **Schedules:** `schedule(delay, ...)` (round-based; raises under ATB),
+  `schedule_on(eid, ...)` (turn-based), `cancel_schedule`; a removed unit's
+  schedules go with it.
 
-- **Active Time Battle (ATB) turn model — SHIPPED (scenarios 524-526).** An
-  optional, SYSTEM-WIDE alternative turn engine (a plain rule, not a per-match
-  toggle — a system is designed around it from the start). When `atb_enabled`
-  is on, ROUNDS ARE DISABLED and `next_turn` no longer cycles `turn_order`:
-  instead each alive turn-order member accrues CHARGE into a bar var
-  (`atb_charge_var`, default `atb_charge`) at a per-entity RATE
-  (`atb_charge_formula`, an EXPRESSION with `self`=the entity, default
-  `entity[self].initiative` so initiative doubles as speed), and the next turn
-  goes to whoever's bar fills soonest. Core: `next_turn` branches to
-  `_atb_next_turn` → `_atb_select` (compute each rate, advance ALL bars by the
-  minimum time-to-fill `(atb_threshold - bar)/rate`, the soonest entity is the
-  actor, reset its bar) → `_atb_turn_phase` fires the actor's turn surface.
-  DESIGN POINTS:
-  - **Reset** via `atb_reset_formula` (program, `self`=actor; EMPTY default =
-    built-in subtract `atb_threshold` keeping overflow). Read the target in a
-    custom reset via the `atb_threshold()` prim.
-  - **Each next_turn is ONE entity's turn.** A skippable (`skips_turn`) actor's
-    turn ELAPSES — bar resets, status ticks STILL fire (so DoTs/stuns decay,
-    since there are no round ticks under ATB) — but its action surface
-    (tile/zone time-hooks, on_turn_* passives, schedule_on) does NOT fire. NO
-    skip-loop: a fast-but-stunned unit burns frequent wasted turns while a slow
-    unit charges (correct ATB), instead of starving the selection. `act` =
-    not-skipped gates the action surface in `_atb_turn_phase`; status ticks are
-    unconditional.
-  - **Round-coupled formulas RAISE a visible FormulaError** under ATB:
-    `round_number()`, `turn_index()` (it's a position-within-round), and the
-    round-based `schedule(delay, ...)`. Turn-based `schedule_on(eid, ...)`,
-    `turn_index`-free cadence, and all turn hooks/ticks keep working. A
-    ONE-TIME ⚠ warning fires from `_atb_next_turn` (latched `_atb_round_warned`,
-    reset when ATB is found off) if dormant round logic exists
-    (`_has_round_logic`: on_round_* passives global/team/entity, round status
-    ticks, round schedules, tile/zone on_round_* hooks).
-  - The charge bar is an ordinary var (read via `var_get`, nudge via a haste
-    formula / pre-fill for an ambush). New read prims `atb_threshold()` /
-    `atb_rate(eid)`. No new serialized Match field (bar = a var, enable = a
-    rule); `_atb_round_warned`/`_atb_last_skipped` are runtime-only (preserved
-    across action rollback). Tiebreak on simultaneous fills: higher rate, then
-    id. Rate <= 0 = the entity can't charge (excluded; all-zero → "no one can
-    act"). FUTURE the user may want: per-entity threshold, a turn-elapsed
-    counter to replace turn_index() under ATB, an ATB-aware `!state` readout.
-    INTERACTION PASS (hands-on, all clean — scenario 527): verified ATB composes
-    with death/self-kill mid-turn, mid-match summon (newcomer joins the charge
-    race), attached-part status ticks on the parent's ATB turn, multi-tile
-    actors, all-zero-rate (→ None + warning), mounts (rider + vehicle both
-    rotate), undo (the `turn` flavor restores charge bars + the active actor),
-    kill→corpse (round-internal `round_number` reads stay constant, no crash),
-    random_stable tiebreak, and the ATB→round toggle (round play + round_number
-    resume when atb_enabled is cleared). ONE v1 behavior to note:
-    `transform`/`revert` REPLACES vars, so it resets the actor's `atb_charge`
-    bar to the new form's value (absent → 0) — a fresh-form charge, NOT
-    preserved like hp via transform_hp_mode. Defensible (new statblock) but
-    flag if the user wants the bar to persist across a transform.
+### 7.3 Turns, rounds and ATB
 
-- **Status dispel + transfer — SHIPPED (scenarios 528-529).** Two status
-  primitives built on the existing token machinery (`_status_token_matches` /
-  `_token_list` / `_statuses_matching_tokens`) and the removal chokepoint
-  (`_emit_status_diff(..., None)` fires on_status_removed).
-  - **`status_dispel(eid, token, max=0)`** (Match.`dispel_statuses`) removes
-    every status matching `token` — a name, a `tag:<x>` token, or a CSV of
-    either — up to `max` (0 = all; capped removals go in sorted-name order).
-    Returns the count removed; fires on_status_removed per removal. Design
-    call (user): TOKEN-ONLY, NO 'undispellable' guard — keep un-strippable
-    effects outside the token's range. Command `!status dispel <eid> <token>
-    [max]`.
-  - **`status_transfer(from, to, name)`** (Match.`transfer_status`) MOVES a
-    status: it leaves the source unconditionally (on_status_removed) and
-    RE-APPLIES on the destination via `apply_status` — so the dest's stacking
-    mode + resistance/immunity/blocked_by all apply. Design call (user):
-    RESISTIBLE move, consume-on-reject — if the dest resists/is immune the
-    status is gone from the source AND doesn't stick (returns False). Carries
-    level + duration, and (user call, 2026-10) the moved instance KEEPS its
-    custom fields: `apply_status(..., seed_data=)` seeds a first application
-    from the moved instance in place of the definition's `data`; onto an
-    existing instance only the stacking applies and that instance keeps its
-    own data. Command `!status transfer <from> <to> <name>`. Both are
-    mutating `!status` subcommands (host-gated); prims registered in
-    `_MATCH_FUNC_NAMES`. (A future variant could be force/reflect-flavored.)
+- **Turn order:** sorted by `turnorder_var` per the `turnorder_*` rules
+  (direction, tiebreaker incl. `random_stable`, team grouping, change policy
+  immediate / deferred). Before the first `!turn next` the pointer sits at
+  the top of the order (a pre-start `!turn set` is lost if units are added
+  after it — set the opener last, user call).
+- **`!turn next`** (`Match.next_turn`): turn-end hooks / ticks → advance (round
+  wrap fires round hooks, ticks, `round_start_message_format` line) → skip
+  units whose statuses carry `skips_turn` (each skip fires on_turn_skipped;
+  `_skip_to_eligible` tracks the ids it has seen, so removals mid-pass can't
+  over- or under-run it) → `_start_current_turn`. The reply prints hook
+  output first and "It is now X's turn" last; an unseen unit reads as "an
+  unseen unit's turn".
+- **Removal and death mid-turn:** removing the current unit sets
+  `turn_vacated`, so the next `!turn next` starts the successor without
+  skipping it; a unit that dies to its own turn-start effects passes the turn
+  on at once (bounded by the order size). Every path that can empty the
+  order returns cleanly.
+- **Attached parts ride the parent's clock** (`_attached_tick_parts`): their
+  statuses tick, turn/round own-passives fire and turn schedules run on the
+  parent's turn; a part with its own initiative has its own turn instead.
+- **Status ticks** (`fire_status_tick`): per status, the definition's `tick`
+  at its `tick_when`, else the global `status_tick_formula` at
+  `status_tick_when` (default never); stops for a unit removed mid-tick.
+- **ATB** (`atb_enabled`, system-wide): no rounds; each turn goes to the unit
+  whose charge bar (`atb_charge_var`, rate `atb_charge_formula`) fills
+  soonest (ties: higher rate, then id; rate ≤ 0 can't act); reset via
+  `atb_reset_formula` (default subtract `atb_threshold`). A skipped unit's
+  turn still elapses (ticks fire, action surface doesn't). `round_number()`,
+  `turn_index()` and `schedule()` RAISE under ATB; a one-time warning lists
+  dormant round logic. `transform` resets the bar to the new form's value.
+  Prims `atb_threshold()` / `atb_rate(eid)` (524-527).
+- **`Match.turns_elapsed`**: serialized count of turn boundaries in both
+  models (`_begin_turn`); `turns_elapsed()`; the clock for ATB-safe expiry
+  (reveals record which clock they used) (566-567).
+- **Pause:** `!match pause [reason]` refuses players' state-changing
+  commands; `pause_affects_hosts` holds hosts' commands until `!match
+  resume` runs them (`resume drop` discards); never an undo step (637-638).
 
-- **Graphics / sprite rendering — PHASE 1 SHIPPED (the engine render model;
-  scenario 530).** The long-planned image-rendered map. CORE PRINCIPLE: the
-  engine stays PIXEL-AGNOSTIC — a sprite is a KEY STRING stored in data
-  (mirroring glyphs), and `render_scene()` emits a DECLARATIVE model that a
-  graphics surface draws; the engine never loads an image. ASCII rendering is
-  untouched (a parallel path), so all text surfaces/scenarios are unaffected.
-  - **Sprite addressing** mirrors glyphs exactly: entity `sprite` /
-    `sprites.<facing>` (resolved via `entity_sprite` → (key, flip_h, flip_v),
-    disguise-aware like entity_glyph); tile `sprite` data > template (`tile_sprite`);
-    zone `sprite` field (`zone_sprite`, set by `!zone sprite`); corpse sprite from
-    the frozen snapshot (`corpse_sprite`); a per-match `background` ({sprite, mode},
-    `!map background`, serialized) > the `background_sprite` rule (`background_layer`).
-  - **Facing mirror**: a missing `sprites.<facing>` is filled by MIRRORING an
-    existing facing (the `sprite_mirror` rule / per-entity var: none/horizontal
-    [default = left↔right]/vertical/both); the model emits the chosen key + flip
-    flags. Then the base `sprite`, then the `fallback_sprite` rule, then None
-    (→ the surface renders the glyph as text).
-  - **`render_scene(pov, hidden, viewport)`** → `{grid_w/h, viewport,
-    background, placements[], fog[], borders}`. Each placement: `{kind
-    (zone/tile/corpse/entity), ref, x, y, w, h, mode, sprite, glyph (text
-    fallback), tint, opacity, flip_h, flip_v, layer}`. LAYERS: background(0) <
-    zones(10) < tiles(20) < corpses(25) < entities(30) < riders/region-parts(40)
-    < fog(50). Multi-tile entities carry w/h + `sprite_mode` (single/stretch/tile,
-    rule + var). Corpses are greyed + semi-transparent (`corpse_sprite_tint` /
-    `corpse_sprite_opacity`). Fog cells carry `fog_sprite` + `fog_opacity`;
-    borders carry show/color/opacity + per-tile overrides (`border_color` /
-    `border_opacity` data). Opacities are 0-100 (the schema has no float type).
-    `render_scene` is PARALLEL to `_render_ascii_impl` (deliberately, to avoid
-    risking the heavily-used ASCII path) but REUSES every predicate/resolver
-    (visibility, POV, fog via `_fog_terrain_visible`, entity_cells, the
-    glued/region/mounted/rider skip surface) — only the loop skeleton is
-    duplicated; a keep-in-sync comment flags it. `!map scene` prints a textual
-    summary of the model.
-  - PHASE 2 SHIPPED: `gui.py` — a tkinter+Pillow desktop surface that runs the
-    SAME commands as cli.py but DRAWS the `render_scene()` model. Split for
-    headless-testability (tkinter is the ONLY non-testable part; it's thin glue,
-    imported lazily): `SpriteLoader` (PNG-only, path-traversal-safe, cached —
-    `sprites/` folder; extension + magic checked; `..`/absolute keys rejected;
-    missing → None → glyph-as-text fallback), `SceneRenderer` (pure Pillow:
-    background stretch/tile/center, placements in layer order, flip_h/flip_v,
-    tint [`gray`=desaturate for corpses, a colour=multiply for teams], opacity
-    [alpha-scale], multi-tile single/stretch/tile, glyph fallback, fog
-    sprite/dark-overlay at fog_opacity, grid borders + per-tile overrides; cell
-    size = the new `sprite_cell_size` rule, default 100), and `GuiCtx`/`GuiApp`
-    (command Entry + log + Canvas; redraws after each command, reloading sprites
-    so dropped-in art appears). **Pillow is an OPTIONAL dep, needed ONLY for
-    gui.py** (engine/CLI/harness unaffected); there is no requirements.txt in
-    this repo, so gui.py prints a `pip install Pillow` hint if it's missing.
-    Run: `python gui.py [sprites_dir]` (needs tkinter + a display). The renderer
-    is verified by PIXEL assertions in a headless test (loader security, sizing,
-    sprite/tile/background pixels, stretch/tile, flip, tint, opacity, glyph
-    fallback, borders+fog). NOTE one v1 behavior: `transform`/`revert` replaces
-    vars, so a transformed entity's sprite naturally follows its new statblock.
-  - PHASE 3 SHIPPED (the two parts the user wanted — #3 mouse select/drag and
-    #4 animation stay deferred "for the foreseeable future"; scenario 531):
-    - **(#1) Discord image attachments.** `sprite_render.py` was factored out of
-      gui.py so the rendering (SpriteLoader + SceneRenderer, VERBATIM) lives in
-      ONE surface-agnostic module with NO tkinter/discord dependency (loads +
-      unit-tests headlessly). gui.py now IMPORTS `_PIL_OK`/`SpriteLoader`/
-      `SceneRenderer`/`SPRITES_DIR_DEFAULT` from it (duplicate class defs
-      removed — no drift). New `sprite_render.render_match_png(match, loader,
-      pov_team=None, viewport=None, cell_size=None, max_dim=1600) -> bytes`:
-      render_scene → SceneRenderer → downscale to `max_dim` longest side (0 =
-      no cap) → PNG bytes; cell_size defaults to the `sprite_cell_size` rule.
-      New command `!map image [full]` (vtt_commands.py) calls the OPTIONAL ctx
-      hook `post_scene_image(m, pov)` via getattr — the set_autoupdate pattern:
-      Discord implements it, the CLI/harness don't and report "graphics
-      available on the Discord surface / gui.py" (so the harness exercises the
-      gating path cleanly). `full` (omniscient) is host-gated in-handler
-      (`m.is_host(ctx_user(ctx))`) since the dispatch gate only checks args[0]
-      and here it's args[1]; otherwise channel POV. `post_scene_image`
-      (discord_commands.py `DiscordCtxWrapper`) renders via a module-level
-      cached `SpriteLoader` + `render_match_png` (in `asyncio.to_thread` — PIL
-      is blocking), respects the channel's resolved viewport, posts a
-      `discord.File(<id>.png)`, and returns "" so the image IS the reply (the
-      handler suppresses an empty status). sprite_render imports are deferred so
-      a Pillow-less host still loads the adapter (the hook reports graphics
-      unavailable instead of crashing). Auto-update IMAGE boards (the graphics
-      twin of the text `!map autoupdate`) deferred — `!map image` is one-shot.
-    - **(#2) In-GUI pan/zoom.** gui.py's canvas got a toolbar (–/+/Reset zoom
-      buttons + a % readout), scrollbars, and bindings: left-drag pans
-      (scan_mark/scan_dragto), mouse wheel zooms (cross-platform: <MouseWheel>
-      delta on Win/Mac, Button-4/5 on Linux), Ctrl +/- zoom, arrow keys scroll.
-      Zoom is a GUI-LOCAL `_zoom` factor (0.25–4.0) that multiplies
-      `sprite_cell_size` at render time (re-renders crisp, not a bitmap
-      upscale); it does NOT touch the engine's per-channel viewport. tkinter
-      glue stays untestable headlessly; the render path (render_match_png) is
-      pixel-verified.
-    - **GUI polish + default ground (follow-ups).** gui.py: the output log is
-      READ-ONLY (state="disabled" except while inserting) so it can't be mistaken
-      for the input; the command box is a MULTI-LINE Text (height 7) so a pasted
-      block runs line-by-line (Enter runs all non-empty lines like a Discord
-      !batch; Shift+Enter = literal newline; a Run button too). Default GROUND:
-      the `background_sprite` rule now DEFAULTS to `ground_default` (mode `tile`
-      via `background_mode`'s new default) — a tiled ground PNG from the sprites
-      folder — so the map reads as terrain by default; if that PNG is missing,
-      `SceneRenderer._draw_default_ground` paints a flat brown fill
-      (`_GROUND_FALLBACK`) so cells never show as a black void. A per-match `!map
-      background` or any loadable background sprite still wins (`_draw_background`
-      returns whether it drew, so `render()` knows to fall back). gui.py layout:
-      pack order = clipping priority, so input + log are packed at the bottom
-      FIRST (reserved, never clipped — input first-class, log second) and the
-      canvas frame packed LAST with expand, so on resize the MAP shrinks while
-      the fields stay visible (default canvas 420px, `minsize(480,300)`).
-    - **Glyph fallback follows `sprite_mode`.** A unit with no loadable
-      sprite is drawn as its glyph by `SceneRenderer._draw_placement`:
-      `single` = one glyph in the anchor cell, `tile` = the glyph in every
-      body cell (as in ASCII), `stretch` = one glyph whose drawn shape is
-      scaled, proportions kept, to fill `_GLYPH_FILL` (70%) of the body,
-      centred (`_fill_glyph`). Every placement draws its whole body and
-      pastes the part inside the window, so a body whose anchor is left of
-      or above the viewport still shows its other cells (before, it
-      vanished whole, sprites included). Pixel-tested by a throwaway
-      script; the harness has no image path.
-    - **Default fog sprite + GUI view.** The `fog_sprite` rule defaults to
-      `fog_default` (sprites/fog_default.png); a key with no PNG falls back
-      to darkening fogged cells at fog_opacity. Fog is drawn only for a
-      team view (the omniscient view hides nothing), so gui.py now renders
-      the GUI channel's view through `_view_pov` — the channel's bound POV
-      or an `!as view <team>` preview, like `!map` — where it used to call
-      `render_scene()` with no view and never showed fog. The toolbar shows
-      the current view.
-    - **ASCII-vs-graphics parity pass (scenarios 711-713).** A throwaway
-      harness compared, per cell, the ASCII glyph with the top scene
-      placement over 330+ boards (facings incl. diagonal, hidden layers,
-      team views, region parts, riders, located parts, random moves);
-      reuse it after touching either renderer. Corpses are the one
-      intended difference (ASCII never draws them). Fixes:
-      - A REGION part was emitted as one footprint rectangle at its
-        parent's anchor, so a head on the `front` region drew in the
-        top-left cell. `_emit_entity_placement` now draws `entity_cells`
-        via `_cell_rects`: one rectangle when the cells fill it, else one
-        1x1 placement per cell (a diagonal facing's corner region).
-      - A multi-tile corpse follows its frozen `sprite_mode` var (else the
-        rule) instead of always `single` (`_sprite_mode_of`).
-      - A zone / tile with a `color` but no sprite or glyph drew nothing
-        (ASCII tints its `.`): the renderer fills the cell with the colour
-        at the new `tint_fill_opacity` rule (default 40; carried in the
-        scene). ONLY zones and tiles: a corpse's / overlay's tint recolours
-        its sprite, and filling the cell with it painted a grey square that
-        read as fog (scenario 714). A corpse whose PNG is missing draws its
-        glyph instead (`Match.corpse_glyph`: glyphs.<facing> > glyph > the
-        facing arrow), grey and faded like the sprite; a corpse with
-        neither a sprite nor a custom glyph is still not drawn.
-      - Image render mode dropped `!map hide=` / `coords=`;
-        `post_scene_image(m, pov, highlights, hidden, coords)` and
-        `scene_for_png(..., hidden_layers, coords)` now take them, as do
-        `!map image` and `!map scene`. `!map scene list` prints every
-        placement (position, size, mode, sprite/glyph/colour, layer) in
-        drawing order, under the channel POV, and the summary names the
-        fog sprite.
-    - **GUI-vs-ASCII pass 2 (pixel parity).** Fixes: (1) the BACKGROUND
-      was placed on the window, not the map: `stretch` squeezed the whole
-      image into every viewport window and `tile` repeated it at the PNG's
-      own size from the window corner, so a panned Discord image shifted it
-      under the units. `_draw_background` now places it on the whole grid
-      and cuts the window out: stretch = one copy over the map (only the
-      window's part resized, `resize(box=)`), tile = one copy PER CELL,
-      center = native size at sprite_cell_size cells (the scene carries
-      `sprite_cell_size`), at the map's middle. (2) The `bright_*` palette
-      names aren't Pillow colours, so a `bright_red` unit was untinted in
-      graphics (`_PALETTE_RGB`). (3) Pillow's built-in font is ASCII-only:
-      any other custom glyph (`é`, `█`, `★`, `龍`) drew as a box. A glyph
-      outside ASCII uses the first font that has it — a `fonts/` folder of
-      the sprites folders, then `_SYSTEM_FONTS` (coverage tested against the
-      font's missing-character mask; fonts and results cached module-wide).
-      Colour emoji are not supported. (4) gui.py: `!map image` replied
-      "available on Discord / gui.py" inside gui.py, and `!map as= / full /
-      hide= / coords=` changed only the ASCII text in the log. GuiCtx now
-      has `post_scene_image` and `show_scene_view` (called by the plain
-      `!map` handler when the surface has it): the canvas draws that view
-      until the next command, like `!map preview`.
-    - **Corpse sprites, team outline, `stretch` default, image legend
-      (scenarios 715-717, user calls).**
-      (1) A unit's own corpse picture: `corpse_sprites.<facing>` >
-      `corpse_sprite` vars, else the new `corpse_default_sprite` rule (empty
-      default) — both drawn AS-IS (`Match.corpse_sprite_info` → (key,
-      is_corpse_picture)); with neither, the living sprite greyed and faded
-      by corpse_sprite_tint / corpse_sprite_opacity as before. A corpse
-      placement carries `glyph_tint` / `glyph_opacity` so the glyph drawn
-      when a PNG is missing is always greyed and faded.
-      (2) Team colour: rules `team_outline_width` (default 3 px at
-      sprite_cell_size, scaled with the cell; 0 = off), `team_outline_opacity`
-      (100) and `team_tint_opacity` (default 0; the old behaviour was a full
-      multiply, which wiped a sprite to pure red). Carried in the scene's
-      `unit_style`; `SceneRenderer._outline` draws the ring outside the
-      sprite's shape (alpha >= 128) where the body has transparent room and
-      just inside the body edge where the shape reaches it. Only `entity`
-      placements with a loaded sprite: glyph units keep their coloured glyph,
-      tiles / zones / overlays keep their own full tint. `!map scene` shows
-      the three values.
-      (3) `sprite_mode` defaults to `stretch` (single stays an option).
-      (4) Image legend (`render_scene(legend=True)` → `scene["legend"]`,
-      `Match._scene_legend`): one entry per distinct look among placements
-      inside the window (overlays left out), every meaning that look has
-      (unit shown name — disguise-aware —, `tile: <template>` / `tile`,
-      `zone: <name>`, `corpse: <name>`), in row-major order of first cell,
-      fog last; `!map preview` highlights add "preview area" in the
-      renderer. Drawn below the map by `SceneRenderer._add_legend` at fixed
-      pixel sizes (28 px swatches, 15 px text, columns to the map width,
-      long labels cut with …, at most 40 entries). Follows `!map legend
-      on|off` and the one-off `legend=on|off` on `!map` (image mode), `!map
-      image`, `!map scene` (`list` prints the entries), the GUI canvas and
-      Discord image boards.
-    - **Default grid borders + per-match override (scenario 532).** The
-      `show_borders` rule now DEFAULTS to True: white grid lines drawn ABOVE the
-      ground/background but BELOW tiles/zones/entities (in `render()` the border
-      pass moved to right after the ground draw, before placements — so a
-      tile/entity sprite on a cell covers its border; the grid shows on open
-      ground for alignment). Color/opacity from `border_color`/`border_opacity`
-      rules, overridable PER-MATCH via new `Match.border_show`/`border_color`/
-      `border_opacity` fields (each None = fall through to the rule; serialized;
-      survive rule refresh) set by `!map border on|off | color <name> | opacity
-      <0-100> | clear` (host-gated). `_scene_borders` resolves match field >
-      rule, plus the existing per-TILE `border_color`/`border_opacity` data
-      overrides (keyed 'x,y').
-    - **Configurable sprite Z-layers (scenario 533).** The render-scene draw
-      order per kind is now driven by the `sprite_layer_*` rules (defaults:
-      background=floor < zone 25 < tile 50 < corpse 75 < entity 100 < rider 110;
-      fog is always drawn last/on-top). Higher = on top; ties keep insertion
-      order (stable sort), so default visuals are unchanged. Per-ITEM override:
-      an entity's `sprite_layer` VAR or a tile's `sprite_layer` DATA field (a
-      number) wins over the rule — `Match._coerce_layer` (junk → fall back to
-      the kind default) + `_layer_rule`; applied in `_emit_entity_placement`
-      (entity var) and the tile loop (tile data) in `_render_scene_impl`. The
-      rider/region-part pass uses `sprite_layer_rider`. ASCII rendering is
-      unaffected (z-layers are graphics-only). Default `border_opacity` was
-      later lowered 100 → 50 (a subtle grid).
-    - **Render-mode toggle + graphical auto-update board (scenario 534).**
-      `Match.render_mode` (`text` default | `image`; serialized) set by `!map
-      mode text|image` (host-gated). In `image` mode, a plain `!map` posts a
-      rendered PNG instead of the ASCII block (via the same `post_scene_image`
-      ctx hook as `!map image`), and `!map autoupdate` creates a self-refreshing
-      IMAGE board; TEXT-only surfaces (CLI/harness, no hook) always fall back to
-      ASCII. Discord board internals (discord_commands.py) are now mode-aware:
-      `_board_image` (render_scene → PNG in `asyncio.to_thread`) + the unified
-      `_apply_board` (edits content for text, or `attachments=[discord.File]`
-      for image, falling back to text if Pillow is missing) drive
-      `set_autoupdate`, `_refresh_boards_for_match`, and `_PanView._pan` (pan
-      buttons now defer the interaction then re-render in place, so panning
-      works for both modes). Boards follow the match's CURRENT render_mode on
-      each refresh. All Discord-only (verified with stubbed discord objects, not
-      the harness).
-    - **Overlay sprites: status FX + entity overlay var (scenario 535).** A
-      status (or a passive/action) can render a sprite OVERLAY drawn OVER an
-      afflicted entity — the burning-overlay case. Two sources, both collected
-      by `Match.entity_overlays(e, pov)` → `{sprite, opacity, tint, layer}`
-      records, emitted as `kind:"overlay"` placements in `_emit_entity_placement`
-      (so main entities, riders, and region parts all get them) over the
-      entity's footprint + sprite mode: (1) the entity's active STATUSES — a
-      status DEFINITION's `sprite`/`sprite_opacity`/`sprite_tint`/`sprite_layer`,
-      OVERRIDDEN by the same field on the entity's status INSTANCE (set via
-      `!status sprite <name> <key|clear> [opacity=] [tint=] [layer=]`); (2) the
-      entity's `overlay_var` (rule, default `overlays`) — a dict of records
-      (bare key string OR `{sprite, opacity, tint, layer}`), the path a PASSIVE
-      composes by writing `entity[self].overlays.<name>.sprite = ...` (passives
-      compose via vars, so no sprite field was bolted onto the Passive class).
-      Default layer = `sprite_layer_overlay` rule (150, above entities at 100);
-      per-overlay `layer`/`sprite_layer` overrides. DISGUISED entities (shown a
-      decoy to the viewing pov) emit NO overlays so real status FX don't leak.
-      Graphics-only — ASCII unaffected; no glyph fallback for overlays. Status
-      def overlay fields serialize (deepcopy); the overlay var is a normal var.
-    - **Sprites are SERVER-SIDE only — INTENDED (for now).** The bot does NOT
-      accept sprite uploads over Discord (or any chat surface): there is NO
-      inbound attachment handling anywhere (`bot.py` / `discord_commands.py`
-      never read `message.attachments`, never download, never write user files
-      to disk). Discord attachments are OUTBOUND only (the rendered map PNG from
-      `!map image` / image auto-update boards). `SpriteLoader` is READ-ONLY
-      (`Image.open` from the host's `sprites/` folder, path-traversal/PNG-only
-      guarded); the only on-disk `.save()` in the codebase is `!save` (match
-      JSON state), and render output goes to an in-memory `BytesIO`. This is a
-      deliberate choice while the bot is self-hosted (e.g. on a laptop):
-      validating the safety/legitimacy of arbitrary user-uploaded files on a
-      publicly reachable bot is OUT OF SCOPE for now — each instance curates its
-      own `sprites/` folder, so there is no untrusted-file ingestion surface. Do
-      NOT add an in-chat sprite-upload flow without revisiting this decision
-      (it would need validation/quotas/sandboxing). See `sprites/README.md`.
+### 7.4 Statuses
 
-- **QoL commands: `!roll`, `!dist`, `!find` columns (scenarios 536-538).** Three
-  small conveniences over existing primitives.
-  - **`!roll <dice>`** — chat dice roller. `roll_detail(rng, spec)` was factored
-    out of `formula._roll_impl` (which is now a thin wrapper) so it returns
-    `(total, parts)` — `parts` being per-term breakdown strings — and the
-    command shows the total PLUS the individual dice (`🎲 2d6+3 → 11 (2d6 [2,6],
-    +3)`). Same grammar as the roll() primitive (NdM, +/-, explode `!`, kh/kl).
-    Uses the match RNG (`m._rng or random`, replay-safe via random_seed) when a
-    match is active, else global; works with no active match too. Read-only.
-  - **`!dist <a> <b> [metric] [los]`** — distance: two entities, an entity + a
-    cell (`!dist <eid> <x> <y>`), or two cells (`!dist <x1> <y1> <x2> <y2>`).
-    Footprint-aware nearest-cell gap via `entity_gap_distance` /
-    `cell_entity_distance` / `_rect_gap`; trailing `metric` (square_radius/
-    chebyshev default, manhattan, euclidean) + `los` (anchor-to-anchor
-    `has_los`). Read-only.
-  - **`!find ... show:<csv> sort:<var>[:desc]`** — DISPLAY directives split off
-    before predicate parsing: `show:hp,mp` appends chosen var values per row,
-    `sort:hp` orders by a (dotted) var (`:desc`/`:asc`), missing var → `—` /
-    sorts last. Filtering unchanged.
-  - **Bonus bug fix:** `logic.py` never imported `math`, so the euclidean branch
-    of `_rect_gap` (footprint nearest-cell distance, e.g. `entities_within` /
-    `!dist ... euclidean` with the euclidean metric) raised `NameError` — a
-    latent crash never exercised before. Added `import math`.
+- **Instances** live in `entity.status[name]` (level, duration, any data);
+  raw editing via `!ent status`. **Definitions** (`Match.status_definitions`,
+  `!status def/tick/when/stack/maxlevel/data/tags/removes/blockedby/sprite/
+  drop/list/info`) describe a status ONCE; an instance resolves behaviour from
+  the definition of the same name. Duration decrement and self-removal live
+  in the GM's tick formula; the engine forces no decay (390-391).
+- **Applying** (`apply_status` / `status_apply` / `!status apply`): stacking
+  from the definition's `stack`, else `status_default_stack` (refresh /
+  add_level / extend / replace / none). `max_level` is a hard ceiling
+  everywhere (`_cap_status_level`).
+- **Prims:** `status_apply` / `status_force` / `status_get` / `status_set` /
+  `status_has` / `status_tags` / `status_has_tag` / `statuses_with_tag` /
+  `status_resist_of` / `is_status_immune` / counters / dispel / transfer.
+- **Tags and tokens:** a definition's `tags`; a token is a bare name or
+  `tag:<x>` (`_status_token_matches`), used by `removes` / `blocked_by`
+  (checked before stacking), immunity, resistance and dispel.
+- **Resistance / immunity** are source-gated like modifiers:
+  `status_resist_sources` (default `equipped`, per-unit replace / add vars)
+  plus innate `status_immune` / `status_resist` vars; `status_resist_stack`
+  (sum / max / first). Resistance reduces the applied LEVEL only, and only
+  when a level is set (first application, add_level, replace with a level —
+  `_resistance_applies`); ≤ 0 = fully resisted. `status_force` / `!status
+  force` ignores resistance and immunity (blocked_by and the part rules
+  still apply). `status_apply_block_reason` explains a refusal (449-452,
+  496-497).
+- **Body parts:** `part_status_immune` / `part_status_redirect` rules (per-part
+  `__status_immune` / `__status_redirect`) run first in apply_status.
+- **Counters:** `status_counter_add/set` (`!status counter`) on any numeric
+  field; the status is removed at ≤ 0 (durations and charges alike). A
+  counter on a text field is refused.
+- **Dispel / transfer:** `status_dispel(eid, token, max)` (token-only, no
+  undispellable guard, user call); `status_transfer(from, to, name)` removes
+  from the source unconditionally and re-applies on the destination through
+  apply_status — resistible, consumed on rejection, and the moved instance
+  keeps its custom data (`seed_data`) (528-529, 683).
+- **Display:** status sprite overlays (§7.13).
 
-- **Inline `$()` formula args + `!reveal_fog` + named tables (scenarios
-  539-543).** Three approved features bundled.
-  - **Inline `$()` command args (the careful one).** A `$(...)` token in ANY
-    command arg is evaluated as a READ-ONLY formula and substituted with the
-    result (`!dist $(2+3) $(1+1) 10 10`, `$(entity[boss].hp/2)`).
-    `resolve_arg_token` already did this for `!ent`; now the DISPATCHER
-    (`CommandRegistry.run` + `dispatch_no_snapshot`) applies it to every
-    command, gated by a `raw_args=True` registry flag that opts OUT the meta /
-    self-handling commands (eval, batch, run, foreach, macro resolve `$()`
-    per-line / in their own context; ent does its own self-aware pass).
-    Substitution runs AFTER the access gate (a `$()` can't alter the gated
-    subcommand) and only fires on `$(`-prefixed tokens (a stored formula body
-    never starts with `$(`, so it's untouched). NOTE: shlex splits on spaces, so
-    a `$()` containing inner quotes/spaces must be double-quoted; scenarios use
-    quote-free forms (bare ids, `entity[id].path`).
-    - **STRICT read-only safety** (the headline requirement): `$()` is parsed in
-      EXPRESSION mode (assignments impossible → no entity writes) AND
-      `formula.validate_arg_safe` rejects any call to a STATE-CHANGING function.
-      The classification is EXPLICIT: `ARG_MUTATING_MATCH_FUNCS` (the banned set
-      — kill/summon/var_set/status_apply/damage_part/emit/move_*/tile_set/
-      zone_*/mount/team_set/log/…) vs `ARG_SAFE_MATCH_FUNCS` (an EXPLICIT
-      read-only allowlist — NOT derived as all-minus-mutating, so default-DENY);
-      `ARG_SAFE_FUNC_NAMES` = pure `_ALLOWED_FUNCS` + the safe match funcs.
-      User-defined `!func`s are NOT allowed in args (unverifiable). A module-load
-      **drift guard** asserts the two sets are DISJOINT and together cover EVERY
-      `_MATCH_FUNC_NAMES` name, so adding a new match function without placing it
-      in one set BREAKS THE BUILD — never a silent default-allow (when unsure,
-      classify MUTATING). `FormulaError` (a `VTTError` subclass) surfaces as ❌,
-      not 💥.
-  - **`!reveal_fog <team> ...`** — reveal fogged cells to a team independent of
-    unit vision (scout/clairvoyance/GM reveal); a revealed cell shows terrain
-    AND live entities. Forms `all` / `at <x> <y> <r>` (Chebyshev disc) / `rect`
-    / `around <eid> <r>` (footprint disc) / `clear`, optional `turns=N` for a
-    TEMPORARY reveal (expires when `round_number` passes `until`; omit =
-    permanent). `Match.fog_reveals` (team → list of `{cells, until}`; serialized,
-    pruned lazily) ORs into `_fog_terrain_visible` + `_fog_entity_visible` via
-    `_cell_revealed`. Host-gated; `list` player-available.
-  - **Named random tables** — `Match.tables` (name → roll_table spec; serialized)
-    via `!table def/roll/list/show/remove` + the `table_roll(name)` formula
-    primitive. The picker (`formula.roll_table_pick`) was factored out of inline
-    `roll_table` so both share it. `!table roll` is player-available (read-only
-    RNG); def/remove host-gated. Replay-safe via the match RNG.
+### 7.5 Modifiers (derived stats)
 
-- **Container / inventory convenience primitives (scenarios 547-548).** The
-  engine still has NO inventory concept; these are GENERIC var/container ops
-  that make composing one (and counters, resources, loot) pleasant. Found by a
-  hands-on "how hard is an inventory" pass — the friction was real (stacking-add
-  needed a var_has conditional, transfer was read+write+del by hand, totalling a
-  nested field needed a loop). New formula prims (formula.py namespace):
-  - `var_add(eid, path, delta)` — create-or-increment a numeric var (the entity
-    twin of team_add; the clean 'stack +N' / counter). MUTATING.
-  - `var_move(src_eid, src_path, dest_eid, dest_path)` — MOVE a var/subtree
-    between entities (deep-copied), returns True iff the source existed. The
-    loot/give/drop primitive. MUTATING.
-  - `var_sum_field(eid, path, field)` — sum a nested FIELD across a container's
-    children (total weight/value), the companion to var_sum (direct children
-    only). READ-ONLY (allowed in `$()` args).
-  - `item_add(eid, path, amount=1, field=None)` / `item_consume(eid, path,
-    amount=1, field=None)` — the AMOUNT-aware pair: add to / subtract from the
-    container's amount FIELD (default the new `amount_field` rule = "amount",
-    overridable per call). item_consume DELETES THE WHOLE CONTAINER at `path`
-    when the amount hits <= 0 (the consumable 'use one, drop the empty stack'
-    boilerplate). Both MUTATING.
-  - New rule `amount_field` ("amount") — the default stack-amount key name.
-  - Per the process rule below, all four mutating prims are in
-    `ARG_MUTATING_MATCH_FUNCS` (banned in `$()` args) and `var_sum_field` is in
-    `ARG_SAFE_MATCH_FUNCS`; the same pass converted `ARG_SAFE_MATCH_FUNCS` to an
-    EXPLICIT allowlist so the drift guard truly forces classification.
-  - Inventory authoring NOTES surfaced by the pass (worth remembering): an
-    item's action has `source` rooted at the ITEM's container (`source.heal` =
-    the item's heal), while `entity[self]` is the HOLDER — reach the holder via
-    `entity[self].hp`, NOT `source.hp` / `entity[source]` / `entity[target]`.
-    `var_get(source, ...)` fails (source is a proxy; use `self_id()`). DICT keys
-    are unique, so two identical items can't share a top-level key — stack via
-    an amount field, or use distinct keys (sword_1/sword_2); `!ent set_var hero
-    inventory.potion 99` silently REPLACES the whole item dict (a footgun). A
-    consumable's action vanishes with the item when item_consume removes it.
+- Base stats stay plain vars; a modifier is a data record `{stat, op, value,
+  tags, not_tags, priority, condition, grants_tags}` aggregated live by
+  `_raw_modifier_records` from status instances, a unit's `modifiers` var,
+  scanned roots (`modifier_sources`, default `equipped`; per-unit
+  `__modifier_sources` / `__modifier_sources_add`) and team data (`team:<t>`).
+  A bundle is a list or a dict of named records.
+- `value` / `condition` may be formulas with `self` = owner plus the call's
+  `target` / `attacker` / `defender` / `other`.
+- **Fold** (`apply_modifiers`): effective priority = priority + per-op offset
+  (`modifier_op_priority`), same-op combine within a tier (add sum, inc% sum,
+  more% product, set last, min floor, max cap), tiers ascending,
+  `modifier_op_order` breaks ties; `modifier_stat_caps` clamps the result.
+  An unknown op folds as add and `!mod show` flags it.
+- Pure query: the engine never applies modifiers; the GM threads
+  `apply_mods(...)` / `list_mods(...)` through their own formulas. `!mod show
+  <eid> <stat> [base] [tag ...]` (399-400, 406-408, 480).
 
-- **Audit-pass-16 (hands-on, recent-features sweep): two fixes (scenarios
-  549-550).** A by-hand interaction pass over the recent work (containers,
-  inline `$()`, reveal_fog, macros, overlays) with numeric/behavioral harnesses.
-  Verified CORRECT (no change): item_consume transactional rollback on action
-  fail(), var_move deepcopy isolation + dest-overwrite, reveal_fog memory/expiry/
-  serialization, macro `if`/`repeat` read-only gate (enforced at RUN time —
-  mutating conditions rejected, entity survives), container edge cases (clamp on
-  var_add, non-numeric/missing paths, var_sum_field skipping non-dict children).
-  Two issues:
-  - **Vital-var deletion (HIGH, FIXED).** item_consume / var_del / var_clear
-    could DELETE a vital var (hp/max_hp/initiative) → corruption (a missing hp
-    reads as 0 → entity counts dead). The `!ent delete_var` command already
-    blocked it and var_del/var_clear docstrings CLAIMED remove_var protected
-    vitals — but it DIDN'T. Fixed at the chokepoint: `Entity.remove_var(path,
-    allow_protected=False)` raises VTTError on a protected var, so every formula
-    deletion path + the command are uniform; the two vital-var property setters
-    (max_hp/initiative = None) pass `allow_protected=True`. var_clear's existing
-    `except VTTError: continue` now actually skips vitals as intended.
-  - **Inline `$()` POV info-leak → mitigated by a gamerule (user-approved
-    default: a toggle).** Inline `$()` evaluates read-only formulas with NO
-    POV/fog filtering, so a non-host PLAYER could read hidden entity vars via a
-    player-available command (`!dist $(entity[boss].hp) 1 1 1` returned the
-    fogged boss's exact hp). NOT a bug in the engine's formula model (formulas
-    always saw all), but it undercuts fog-of-war info-hiding. New rule
-    `inline_args_access` (enum all|host, default `all` = unchanged): set to
-    `host` and a non-host's command containing a `$()` token is REFUSED
-    (`CommandRegistry._inline_args_blocked` + `_has_inline_token`, checked in
-    both `run` and `dispatch_no_snapshot` so the batch/macro inner-line vector is
-    covered too). No-op on an open match (no owner), an auto-approve/identity-
-    less surface, or for hosts. The same "tighten reads for a fog match" lever as
-    `command_access`. Default stays permissive; a fog GM opts into the lockdown.
+### 7.6 Actions and choices
 
-- **Small-features bundle: match_outcome event + show:status + targeting
-  helpers — SHIPPED (scenarios 568-569).** Three independent gaps found by
-  enumerating the ACTUAL surface (47 commands / 190 match funcs / 22 hooks)
-  rather than working from notes — worth repeating, since two earlier proposals
-  (`!undo`, auto-update boards) turned out already shipped.
-  - **Built-in `match_outcome` event.** `declare_winner` recorded the outcome
-    and logged an event but fired NO hook, so victory was a dead end — nowhere
-    to announce, award, roll loot, or clear lingering auras. It now EMITS
-    `match_outcome`; handlers are ordinary passives (`!gpassive add x
-    event:match_outcome "..."`) reading `event_get('winner'/'reason'/'round')`.
-    DESIGN CALL — the EVENT BUS, not a new HOOK_NAME: `fire_hook` runs global
-    passives once per TARGET ENTITY (so a 5-entity board would announce five
-    times), while `emit_event` fires globals exactly ONCE; the bus also already
-    carries a payload and caps re-entrancy via `event_recursion_limit`, so a
-    handler that itself calls `declare_winner` can't loop (verified). Emission
-    sits INSIDE `declare_winner` (the single chokepoint) so the formula
-    primitive — watchers, actions, on_death passives — fires it too. Handler log
-    lines reach the `!match win` reply through a new optional `log_out` list
-    param, which keeps the existing return type intact; callers that don't care
-    (the prim) just omit it. No handlers = byte-identical output.
-  - **`!find show:status`.** Statuses live in `e.status`, not vars, so
-    `show:status` rendered `—` for everyone. `status` / `statuses` are now
-    pseudo-columns (`_SHOW_STATUS_COLUMNS` + `_fmt_status_names`) listing status
-    names, annotated `name(level)` above level 1. Joined with `/` NOT `, `
-    because `show:` already separates its columns with `, ` — otherwise
-    `[status=burn, slow, hp=40]` reads as three columns. Takes precedence over a
-    same-named var (a var literally called `status` is a known GM mistake, see
-    the pass-23 note; statuses are edited via `!ent status`).
-  - **`lowest_var(list, path)` / `highest_var(list, path)`.** Return the id of
-    the entity in a list with the smallest / largest numeric value at a dotted
-    var path — the "weakest target" / "biggest threat" pick, fed straight from
-    `entities_within` / `entities_on_los` / `chain_targets`. They earn their
-    place because the sandbox has no comprehensions and no loop `break`, so this
-    otherwise needs a hand-rolled running-minimum accumulator in EVERY targeting
-    formula. Entities missing the var or holding a non-numeric value are
-    SKIPPED; ties break on the lower id (deterministic, mirroring
-    `nearest_entity`); `''` when nothing qualifies — so test `== ''` before use.
-    Both read-only → ARG_SAFE, usable in inline `$()`.
-  - **BONUS FIX found while testing: `match_var_get` gained an optional
-    `default`.** `var_get` (pass-19), `corpse_var` and `team_get` all take one,
-    but `match_var_get` did NOT — so the read-or-initialize idiom
-    `match_var_get('wins', 0) + 1` (exactly what an outcome tally handler wants)
-    died with a raw Python TypeError leaking through as
-    "❌ Runtime error: ... takes 1 positional argument but 2 were given". Now
-    mirrors its siblings: raises on a missing path unless a default is given.
-  - PROCESS NOTES: the module-load drift guard caught the unclassified
-    `lowest_var`/`highest_var` immediately, as designed. It does NOT catch a
-    bad identifier inside a prim body, though — I first wrote `_dig(...)`, a
-    helper that doesn't exist (the real one is `_get_path`, which RAISES rather
-    than returning a found-flag); that would have been a NameError only when
-    called. Import-time checks prove registration, not correctness — exercise
-    every new prim. And shell-quoting mangled a probe again; write probes to a
-    FILE (pass-27's note).
+- **Actions** are data at `vars.<container>.actions.<name>` (`target` type:
+  entity / location / entity_list / location_list / none / corpse /
+  corpse_list; `body` program). `discover_actions` walks containers
+  (`action_container_mode` / `_paths`); mount slots add their own (§7.10).
+  `!action <eid> <name> [target] [k=v ...] [answer=...]`, `use_action`,
+  `has_action`.
+- **`run_action`** is transactional: pre-state captured, body run,
+  `fail()` / an exception rolls the match back in place
+  (`_rollback_match`: serialized state restored, runtime fields and undo
+  history preserved). A failing NESTED action rolls back only its own
+  effects (check `use_action`'s result to abort the outer one).
+  `action_recursion_limit`. `cmd('...')` dispatches commands on
+  `action_cmd_allowlist` (default `ent`) through `_BufferCtx`; action bodies
+  can't run admin commands or save templates (no admin flag, no identity).
+- **Choices:** `choose(prompt, options)` / `choose_number(prompt, lo, hi)`
+  replay the body: on an unanswered choice the attempt rolls back and re-runs
+  with answers replayed in order (`answer=` tokens, else the surface's
+  `prompt_choice`; the harness must pre-supply). Per attempt the RNG, output
+  buffer and summon budget are reset, so side effects before a choice apply
+  once. `cancel` aborts; `action_choice_limit` (394-395).
+- **Rider actions:** a rider gets its slot's actions plus the vehicle's
+  actions whose `allowed_slots` list its slot; `mount_action_actor` decides
+  who is `source`; `vehicle` / `rider` / `slot` are always bound.
+- **Composed patterns** (no engine feature needed): channeled actions break on
+  move / damage through passives (442); charge-up attacks count turns in a
+  var (443); armor-limited penetration loops `entities_on_los` with an
+  accumulator (393).
 
-- **ATB turn clock (`Match.turns_elapsed`) — SHIPPED (scenarios 566-567).** The
-  monotonic count of TURN boundaries in a match, and the fix for the pass-24
-  open item. Under ATB rounds are disabled and `round_number` is frozen at 1
-  forever, so anything keyed on rounds silently misbehaves there; this is the
-  only clock that advances.
-  - **Where it bumps:** the new `Match._begin_turn()` — `turns_elapsed += 1`
-    then `history.record_turn(self)`. Every exit of `next_turn` /
-    `_atb_next_turn` already called `record_turn` (10 sites, INCLUDING the ones
-    that return no actor — an emptied turn order or an all-skippable table), so
-    routing them all through one helper keeps the counter exactly in lockstep
-    with `MatchHistory._turn_index` and stops the two drifting. It counts in
-    BOTH turn models: it is the SERIALIZED counterpart of `_turn_index`, which
-    `to_dict` excludes and so resets on save/load — that was precisely why
-    `_turn_index` couldn't back durations.
-  - **DESIGN CALLS (user-approved shape):** counts in round mode too (harmless
-    and more useful than an ATB-only field); `turn_index()` is UNCHANGED and
-    still RAISES under ATB, because it means "position within the round" — a
-    global elapsed count is a different quantity, so conflating them would
-    mislead. Rolled back by a history restore along with the rest of the state.
-  - **Fog reveals expire under ATB (the payoff).** `reveal_cells` keys the
-    deadline to whichever clock advances: under ATB `turns_elapsed + duration`
-    tagged `clock: "turn"`, else `round_number + duration` tagged
-    `clock: "round"`. `_active_reveals` compares each record against the clock
-    it was CREATED under, so a match that switches turn models mid-session
-    still expires existing reveals correctly, and a record with no `clock`
-    predates the field and reads as round-keyed. Both fields round-trip through
-    save/load. Round-based play is byte-for-byte unchanged.
-  - **Surface:** formula prim `turns_elapsed()` (read-only → classified
-    ARG_SAFE, so it works inside inline `$()` args; the module-load drift guard
-    caught the missing classification, as designed). `!match_toplevel` /
-    `!state` show "Turns Elapsed" instead of the frozen round number while ATB
-    is on — the flagged ATB-aware readout. `!reveal_fog` messages now name the
-    right unit ("for 2 turn(s)" / "through turn 2" under ATB, "round" otherwise)
-    rather than always saying rounds.
-  - NOTE `!undo` was already shipped (a thin forwarder to `!history undo` that
-    passes every arg through); it was listed as a feature idea in error.
+### 7.7 Command scripting
 
-- **Audit-pass-28 (hands-on, LONG): snapshot `turn_order` aliasing + a DEAD
-  gamerule (scenario 563).** Two new techniques carried this pass, both worth
-  reusing: **systematic REGISTRY-vs-CODE invariant checks** and a **randomized
-  stateful CHAOS test with structural invariant assertions**. Three findings.
-  - **Snapshot aliasing of `turn_order` (HIGH, FIXED — the headline).**
-    `Match.to_dict` stored `"turn_order": self.turn_order` BY REFERENCE, and
-    `Entity.remove` mutates that list IN PLACE (`m.turn_order.remove(self.id)`,
-    logic.py ~4270). So every entity removal retroactively SHRANK every
-    already-taken snapshot, while each snapshot's `active_index` int stayed put
-    — leaving snapshots internally INCONSISTENT (observed: `turn_order=['hero']`
-    with `active_index=1`), and `!history undo` then restored a match whose turn
-    cursor pointed past the end of its own turn order. This is the SAME
-    corruption class as the pass-5/6/7/11 vars/tiles/zones/watchers fixes;
-    `turn_order` was the one mutable field never copied. Fixed on BOTH sides
-    (`to_dict` stores `list(...)`; `from_dict` copies on load so a restored
-    match can't mutate the retained snapshot) plus a load-side CLAMP so a
-    snapshot written by an older build still restores to a usable cursor.
-    `rules` was also shared and is now deep-copied for symmetry (it is only ever
-    rebound today, never mutated in place — copied so a future in-place edit
-    can't silently reintroduce this). NOTE the diagnosis path: instrumenting
-    every `active_index` writer found NOTHING, because no live method ever
-    produced an out-of-range state — the snapshot was corrupted AFTER being
-    taken. When live state looks fine but a restored one doesn't, suspect
-    aliasing, not the writer.
-  - **`var_hook_warning_verbosity` was a DEAD RULE (MED-LOW, FIXED).** Defined
-    in RULES_REGISTRY, documented, listed by `!system rules`, settable — and
-    read NOWHERE in the codebase. A GM could set it to `off` and warnings kept
-    appearing (silent no-op config). Now honored at all three levels: `off`
-    suppresses the var-hook recursion-limit warnings (both fire sites),
-    `minimal` (default) keeps today's behavior, and `detailed` additionally
-    annotates a DESTRUCTIVE write with the count of dropped keys. Gotcha worth
-    remembering for anyone extending this: `_diff_subtree` collapses a
-    structural shift (dict -> scalar) into ONE `changed` event carrying the old
-    subtree as `old_value` — it does NOT emit per-leaf `removed` events — so the
-    count walks `old_value` via `_walk_subtree_keys` and excludes the root
-    (which survives, just holding a different value). Schema upgraded `str` ->
-    `enum` so a typo'd level is rejected instead of silently meaning 'minimal'.
-    New helper `Match.var_warn_verbosity()` (unrecognized value -> 'minimal',
-    so a bad value can't silence real warnings).
-  - **DOC FIX: `hit_location` has TWO modes, not three.** This file listed
-    "modes uniform / weighted / aimed", but the engine accepts only `weighted`
-    and `uniform` and RAISES on anything else — **aiming is a separate `aim`
-    ARG**, not a mode, so a GM following the old wording would write
-    `mode='aimed'` and get a rejection. Corrected in place, with the verified
-    statistics recorded (see below).
-  - **VERIFIED CLEAN — systematic invariant checks (new, reusable).** Every
-    literal `rules.get("X")` name across ALL modules exists in RULES_REGISTRY
-    (139 reads, no typos — a typo'd name silently returns the wrong default
-    forever, so this check is cheap insurance); the only registry rules with no
-    literal reference are the four `block_*`, built dynamically as
-    `f"block_{mode}"`. All **189** `_MATCH_FUNC_NAMES` + **28** `_ALLOWED_FUNCS`
-    are actually registered and callable (the empirical version of the
-    documented "add it to `_MATCH_FUNC_NAMES` AND the namespace builder" trap —
-    calling each with no args cleanly separates "unregistered" from "wrong
-    arity"). `ARG_SAFE_MATCH_FUNCS` / `ARG_MUTATING_MATCH_FUNCS` exactly
-    partition the match funcs. `_who_arg` handles HOOK_CONTEXT_NAMES by SET
-    membership (`if slice_node.id in HOOK_CONTEXT_NAMES`), so that documented
-    trap is structurally solved — new bindings are covered automatically.
-  - **VERIFIED CLEAN — chaos + smoke + statistics.** A randomized STATEFUL
-    chaos test (12 seeds x 200 steps over ~70 valid commands on a rich board:
-    multi-tile, parts, segments, mounts, auras, statuses, fog, two matches)
-    asserting structural invariants after EVERY step — no dangling
-    `part_of`/`mounted_on`/`__follows`/zone-anchor/schedule id, turn_order a
-    subset of entities, `active_index` in range, and state still
-    JSON-serializable. It found the turn_order bug (4/12 seeds) and is clean
-    after the fix. Also: 47 commands x 4 crash shapes (no args / bogus
-    subcommand / no active match / both) = 188 invocations, zero 💥. Statistical
-    verification of the RNG primitives (single-shot tests can't catch a bad
-    weight normalization): `hit_location` weighted with weights 10/30/60 gives
-    a 10/30/60 split; aiming at the 10 with the default `aim_weight` 3 gives
-    30/(30+30+60) = 25% (measured 24.8%); a 0-weight side stays 0 and
-    `aim_bonus=50` lifts it to ~36%; `roll_table 'a:1,b:3,c:6'` is exact and a
-    0-weight entry is NEVER chosen. A NESTED aliasing audit (walking live vs
-    snapshot in parallel to depth 4) now reports the snapshot fully independent
-    at every level, and it stays byte-identical after mutating every live
-    container — the whole corruption class is closed. Discord adapter by
-    inspection: the three `" ".join(req["args"])` sites are safe (queued args
-    are pre-substitution shlex strings — the gate runs before `$()`
-    substitution) and `int(viewport_button_step)` is schema-guarded.
+- **Inline `$()` args:** any command arg `$(...)` is evaluated as a READ-ONLY
+  expression after the access gate (`raw_args=True` commands — eval, batch,
+  run, foreach, macro, ent — resolve their own). `validate_arg_safe` allows
+  only `ARG_SAFE_FUNC_NAMES` (no mutators, no `!func`s); a result with spaces
+  stays one argument. `inline_args_access` = host refuses players' `$()`
+  (fog matches: formulas see everything) (539-543, 549-550).
+- **`!batch a ; b ; ...`** = one undo step; `!batch strict` stops at the first
+  ❌ and undoes the lines before it (every match restored in place, created
+  matches removed, deleted ones restored, pointers and rules restored;
+  bot-wide settings are not) (692-693). **`!run <file>`** reads a saves-folder
+  file (admin). Both nest within `macro_recursion_limit`.
+- **Macros** (`!macro set/run/list/show/remove`): `$1..$N`, `$@`, `$#`
+  (single-pass substitution); control flow `if / elif / else / repeat / end`
+  with read-only conditions; `macro_repeat_limit`, `macro_step_limit` (counts
+  dispatches AND loop iterations), `macro_recursion_limit`; one undo step
+  (425-426, 544-546, 555-556).
+- **`!foreach <selector> ; <cmd> [; <cmd> ...]`**: the `!find` selector
+  grammar; `$id $name $x $y $team $i $n` substituted single-pass; targets
+  resolved before any command runs; one undo step. Host-gated, EXCEPT that a
+  sweep whose every inner command is player-available downgrades to `all`
+  (`_foreach_read_only`, default-deny: aliases, `$` in the command position,
+  self-dispatching commands and elevated args keep it gated). A non-host's
+  sweep skips units their POV can't see (486-490, 557-558, 564-565).
+- **`!find`** selectors: `var<op>value`, `status:`, `group:`, `action:`,
+  `near:<eid>:<r>`, `within:<x>:<y>:<r>`, a leading `!` negates, `|`
+  alternatives (an alternative that doesn't parse reuses the previous kind and
+  key); `show:<csv>` (incl. `status`), `sort:<var>[:desc]`, `count`, `ids`
+  (536-538, 631, 694-695).
+- **`!assert [--as eid] "<expr>" [msg]`**: read-only; a failure raises
+  `AssertionStop`, and batch / run / foreach / macro stop on the `ASSERT_STOP`
+  sentinel; in an action, `cmd('assert ...')` fails the action (601-603).
+- **`!again`** reruns the caller's last top-level command in the channel
+  (runtime-only `mgr._last_commands`; never records `again` / `as` / clicks;
+  refused inside dispatch_no_snapshot; always player-available) (639, 646).
+- **Aliases** (`!alias`, per match; system aliases via `!system alias`)
+  resolve BEFORE the access gate. `!func` defines formula functions
+  (`formula_function_recursion_limit`). `!eval [--as eid]` runs a formula.
 
-- **Audit-pass-27 (hands-on): CLEAN PASS — no bug found.** An adversarial /
-  resource-exhaustion sweep (the class that produced the pass-20 macro runaway
-  and the pass-24 ATB history leak), plus a re-entrancy audit. No code change.
-  Verified:
-  1. **No `$()` ARGUMENT INJECTION.** A `$()` result containing SPACES stays
-     exactly ONE argument (`var_get` returning `'hello world'` lands as a single
-     var value) — substitution is per-token and happens AFTER shlex, so nothing
-     re-splits and a player can't smuggle extra args/subcommands through a
-     computed value. A space-containing value fed to a numeric arg gives a clean
-     `❌ hp amount must be a whole number ...`, not a split.
-  2. **The `$()` read-only gate is airtight under attack** — every mutating
-     function tried (`kill` / `var_set` / `summon` / `status_apply` /
-     `damage_part`) is REJECTED with ZERO state change (entity still alive, hp
-     untouched), user-defined `!func`s are banned as documented, and the
-     rejection still holds when the `$()` is inside a MACRO line or a `!foreach`
-     inner command (the two indirect dispatch paths).
-  3. **No DEPTH-GUARD LEAKS** (the "one error wedges the feature forever"
-     failure mode; audited because a leaked counter is silent). All six counters
-     — `_action_depth`, `_var_event_depth` (both fire sites), `_event_depth` +
-     `_event_stack`, `_death_processing`, `_alive_eval_depth`, and the new
-     `MatchManager._macro_depth` — are restored in `try/finally`, and
-     EMPIRICALLY: after 30 consecutive failures each (failing actions, an
-     erroring var-hook passive, erroring event handlers, bad macro runs, and a
-     malformed `alive_condition` across 5 kills) every counter read 0 and every
-     subsystem still worked (a later good action/passive/event/macro fired, and
-     death still processed).
-  4. **Degenerate grids are safe** — a match created 0×0, 1×0 or with NEGATIVE
-     dimensions handles `!map` / `!list` / `!state` / `!ent add` / `!map resize`
-     / `!zone add` / `!tile set` without a 💥 (bounds checks reject placement
-     cleanly and the renderer produces an empty map).
-  - OBSERVATION (not fixed — flagged for the user): **grid dimensions are
-    unvalidated and unbounded.** `!match new x X 20000 20000` and `!map resize`
-    accept anything; creation is LAZY (instant, no allocation) so the cost lands
-    at RENDER time, which is quadratic — measured 200²=0.01s/78 KiB,
-    600²=0.05s/703 KiB, 1500²=0.45s/4.4 MiB, so 20000² would be minutes and
-    ~780 MiB of output text. Discord is protected in practice (the viewport
-    engages there and clips to viewport_width/height), but the CLI/gui render
-    the whole grid. Deliberately NOT fixed: both commands are host-gated, the
-    failure is immediate/obvious/recoverable (restart), and a `max_grid_dimension`
-    default generous enough to be safe could still reject a legitimate large
-    campaign map — that default is a design call. The codebase's own precedent
-    (`macro_repeat_limit`'s "guards against a typo'd huge count") argues FOR
-    adding one; say so and it's a small rule. RESOLVED — the `max_grid_dimension` rule (default 500)
-    shipped; see the `!help find` / clone entry.
-  - PROCESS NOTE for future harness authors: THREE apparent "failures" this pass
-    were my own harness bugs, not engine defects — `!passive add` takes
-    `target=`/`scope=` BEFORE the quoted formula (formula LAST; wrong order makes
-    the formula parse as `target=hp` → "Syntax error"), and running probes via
-    `bash -c "python -c ..."` mangles nested quotes inside `$()`/formulas. Write
-    probes to a FILE and use the documented arg order.
+### 7.8 Geometry, movement and blocking
 
-- **Audit-pass-26 (hands-on): formula-sandbox dunder hole closed (scenario 562).**
-  Hand-attacked the sandbox for the first time this era (31 escape attempts in
-  expression mode + 20 in action mode). Expression mode rejected EVERYTHING
-  (`__import__`/`eval`/`exec`/`open`/`globals`/`type`/comprehensions/lambda/
-  subscript/`__builtins__` — all clean ❌, no 💥). Action mode leaked:
-  - **THE BUG.** `_is_action_attr_passthrough` deliberately leaves ANY attribute
-    chain rooted at a bare Name un-rewritten for Python's runtime attribute
-    resolution — that's how `source.<path>`, `args.<key>` and Coord `target.x`
-    work. But it also permitted PYTHON DUNDERS. Since `self` in an action body
-    binds to a plain STRING (the entity id), `self.__class__` resolved to a live
-    `type` object and `.__bases__` / `.__subclasses__` / `.__init__` walked
-    further into Python internals. **Not RCE** — a Call's func must be a bare
-    Name, so `...__subclasses__()` is rejected with "Only direct function calls
-    are allowed" (verified). The REAL harm: those objects can be ASSIGNED INTO
-    ENTITY VARS, and a var holding a `type` / bound method breaks
-    `json.dumps` — verified `TypeError: Object of type type is not JSON
-    serializable`, i.e. `!store save` fails and the match becomes unsaveable
-    (the failure is caught and surfaced as a clean ❌ by `MatchManager.save`, so
-    it's data-corruption/DoS, not a crash). Realistically hit by ACCIDENT (a
-    typo'd `self.something`) as much as by intent.
-  - **FIX:** reject Python dunder attribute names at VALIDATION time inside the
-    action-mode passthrough walk (new module helper `_is_python_dunder`). The
-    pattern is deliberately `__x__` — dunder on BOTH sides — because engine-
-    reserved entity vars are LEADING-dunder only (`__follows`, `__segment`,
-    `__part_located`, `__cell_stackable`, ...), so a legitimate `source.__follows`
-    still validates and reaches runtime. Verified after the fix: all 51 escape
-    attempts rejected; `source.<path>` (item container read), `args.<key>`, and
-    location-target Coord `target.x`/`.y` all still work; vars stay clean and the
-    match stays serializable. NOTE for future sweeps: authoring an action body
-    goes through host-gated `!ent set_var`, so this was never player-reachable —
-    but sandbox integrity is the whole point of the `_ALLOWED_NODES` whitelist +
-    empty `__builtins__`, so the hole was worth closing regardless.
-  - Verified CORRECT in the same sweep (no change): **no path mutates an entity
-    id** except `copy_entity`'s remap (`!ent rename` changes the display NAME
-    only), so the pass-25 dangling-id class is closed. **`!store save`/`load`
-    round-trip** through MatchManager — two matches, a custom GameSystem with
-    tweaked rules, active channel bindings, zones/anchored auras, macros, team
-    data, nested inventory and a part subtree all survive into a FRESH manager,
-    and the loaded match is fully functional (list/map/turn/move/macro/part all
-    clean). (Path handling was "host-gated by design" here — SUPERSEDED in
-    audit-pass-29: the gate was a no-op without an active match, so any user
-    could read/write host files; now admin-only and confined to `saves/`.) **Event-log retention** is a plain count cap (not
-    round-keyed, so unlike pass-24 it's ATB-safe): cap enforced, 0 = keep
-    nothing, -1 = unlimited. **Dict-rule editors** — `!system set` correctly
-    refuses dict rules and points at the dedicated editor; `!log format` (incl.
-    clearing with `-` and custom `log()` types), `!gclamp`, `!system access` all
-    validate and error cleanly; and per-match `access_overrides` SURVIVE a rule
-    refresh and serialization (the explicitly-documented "don't fold into rules"
-    invariant holds). **transform cross-products** — transforming a snake head
-    drops its segments and revert restores them; transforming an aura anchor
-    keeps the binding and re-stamps to the NEW footprint (25→36 cells);
-    transforming a mounted rider preserves the mount; `!history undo` after a
-    transform fully reverts name/footprint/inventory. OBSERVATION (not fixed, no
-    design call made): transform does NOT re-validate the slot `condition` for a
-    MOUNTED rider whose new form might no longer qualify — an asymmetry with the
-    vehicle side, which got `transform_rider_mismatch_mode` in pass-6. Flag if
-    the user wants symmetry.
+- **Grid:** square cells, 1-based; `max_grid_dimension` (default 500, owner
+  ceiling) checked on create and resize. `!map resize <w> <h> [anchor]`
+  shifts everything coordinate-bearing by the anchor's offset (units, tiles,
+  corpses, zones, fog memory, camera views, snake trail vars); a shrink that
+  pushes units off follows `map_resize_shrink_mode` (block / kill, looping
+  until nothing is off-grid).
+- **Movement verbs:** `!ent tp` / `move` (count first, `allow_diagonal_movement`)
+  / `push` / `pull` / `swap`, group moves (`group:<name>`,
+  `mount_group_move_mode`), formula `move_entity` / `move_step` (a real
+  one-step walk) / push / pull / swap. Every verb validates the WHOLE swept
+  footprint and the final footprint (`_validate_placement`,
+  `_occupancy_ignore` for the mover's own body / segments / group), fires
+  per-cell hooks and on_entity_step, stops when the mover dies, and
+  redirects a mounted driver to its vehicle (`_mount_move_redirect`; a
+  passenger is refused). The raw `move_to` and spawns are never gated.
+- **Blocking:** a cell blocks a mover when its tile or a covering zone or a
+  corpse evaluates truthy: tile `block` data > template > `tile_block_condition`;
+  zone `block` data > `zone_block_condition`; `corpse_block_condition`
+  (bindings corpse_id / corpse_team). Expressions with `self` = mover, or bare
+  bools; FAIL-OPEN (a broken or unreadable condition doesn't block — give
+  gating vars a `!defvar` default). `block_walk/tp/push/swap` rules: walk /
+  tp / swap raise `Blocked`, push / pull stop before the wall. `!map cell
+  <x> <y> for=<eid>` explains a cell, naming conditions that failed.
+  `cell_blocks` (raw), `_check_block(mode)`, prim `cell_blocked`.
+- **Facing:** `!ent face <id> <dir|cw|ccw|toward ...>`, `set_facing`,
+  `face_toward` all via `set_entity_facing` (`allow_diagonal_facing`;
+  re-seats region-slot riders). `facing_toward` is angle-based from the body
+  centre; `direction_to` snaps by the signs of dx / dy — (5, 1) is `right`
+  for one and `down_right` for the other (613-614). New units face per
+  `spawn_face_toward_center` / `spawn_default_facing`; template spawns and
+  restored parts keep their saved facing.
+- **Teams and relations:** a unit's team is the `team_var` var. `relation`
+  arguments filter any / hostile / ally / same_team / attackable
+  (`is_hostile`; `is_attackable` honours `friendlyfire`).
+- **Directional sides:** `relative_angle`, `relative_side`, `side_hit(target,
+  x, y[, sides, corner_arc])` (`front` / `back` / `left_side` /
+  `right_side`, plus diagonal corners when `sides=8`, each corner spanning
+  `directional_corner_arc`°), `directional_get(eid, base, x, y)`,
+  `facing_of`. Multi-tile targets use the box hitbox (`side_hit_hitbox_mode`):
+  the bearing is scaled by the footprint half-extents (434-436).
+- **Flanking:** `flanking_angle` (bearings from the target's centre at least
+  `flanking_min_angle` apart, box-scaled), `flanking_line` (the segment
+  between the two flankers crosses opposite sides / corners of the target's
+  body, exact arithmetic), `flanking` per `flanking_mode` (687-688).
+- **Distance and areas:** distance to a body = NEAREST footprint cell
+  (`entity_gap_distance`, `cell_entity_distance`, `_rect_gap`); metrics
+  square_radius (Chebyshev, default) / manhattan / euclidean — an unknown
+  metric is refused. `entities_within`, `nearest_entity` (relation SECOND),
+  `entities_in_area/cone/rect/zone`, `cells_in_*`, `chain_targets` (relation
+  judged against the ORIGIN), `entity_distance`, `nearest_cell`,
+  `free_cell_near`, `random_cell`, `random_free_cell(..., fit=body|center|any|
+  anchor)`, `entities_at`, `cell_entity`, `grid_width/height`, `in_bounds`.
+  Membership in an area = ANY covered cell. Builders are clipped to the map
+  and charged to `formula_cell_limit`. `!dist` and `!map preview
+  <burst|cone|line|rect>` show the same geometry.
 
-- **Audit-pass-25 (hands-on): the "dangling relational id" bug CLASS — transfer
-  phantom mount fixed (scenario 561).** Entities reference each other by BARE ID
-  (`mounted_on`, `part_of`, `__follows`, a zone's `anchor`). Any path that moves
-  or copies an entity across a boundary must REMAP or STRIP those ids, or they
-  dangle — and because an id is the engine's ONLY notion of entity identity, a
-  dangling id silently LATCHES onto whatever later takes that id. Two prior
-  fixes were instances of this (pass-6 corpse snapshot strips mounted_on;
-  pass-18 `!ent clone` strips it); this pass found the remaining hole and a
-  documentation error.
-  - **`copy_entity` (`!ent transfer` / `!ent copy`) carried mount linkage across
-    matches (REAL, FIXED).** It remapped `part_of` and `__follows` but left
-    `mounted_on`/`mount_slot` pointing at the SOURCE match's vehicle. The
-    transferred rider looked harmless at first (`is_mounted` defensively returns
-    False when the host is absent), but the stale id persisted and SERIALIZED —
-    so the moment the destination gained any entity with that id (a summon, a
-    later transfer, a plain `!ent add`), the rider read as mounted on it. Verified
-    harm: a rider "riding" an entity with NO `slots` var at all — bypassing slot
-    existence, capacity, the slot `condition` gate and the on_mounted hook — and
-    disappearing from the map/occupancy via the hidden-rider skip surface. Fixed
-    by stripping both fields in `copy_entity`, matching the corpse/clone paths.
-    Transferring a VEHICLE already ejects its riders (`_release_riders` via
-    `Entity.remove`), so a rider and its vehicle can never travel together —
-    arriving dismounted is the consistent outcome. Applies to `move=True`
-    (transfer) and `move=False` (copy) alike.
-  - **Suspended aura + id reuse: the DOCUMENTATION was wrong (amended, behavior
-    left).** The `anchored_zone_on_anchor_loss` rule desc and this file both
-    claimed a true despawn under `suspend` "leaves an inert bound zone that won't
-    resume (nothing to revive)". Not true: the binding is by ID, so if a later
-    entity is created with the despawned anchor's id, the suspended aura RESUMES
-    around that unrelated entity the first time it moves (`_restamp_anchors_for`
-    on `fire_entity_moved`). Verified. Left the BEHAVIOR as-is (there is no
-    entity identity beyond the id, so distinguishing "same id, different entity"
-    would need a new identity concept — a design call, not a bug fix) and
-    corrected both docs per the standing "ambiguous wording MUST be amended"
-    rule. Flag to the user if they'd rather change the semantics.
-  - Verified CORRECT in the same sweep (no change): **scheduled effects** —
-    `schedule_on` fires at the right turn in BOTH round mode and ATB (it's
-    turn-based, so ATB is fine), entity removal drops its pending schedules,
-    `cancel_schedule` works, schedules serialize, and round `schedule()` raises
-    a clean pointer-to-`schedule_on` error under ATB. **The access gate /
-    approval queue** (hand-verified for the first time, previously only
-    agent-checked): a non-host's mutating command is QUEUED not executed, and
-    there is NO bypass via `!batch`, `!foreach`, `!eval`, or `!macro` (each is
-    gated at the top level before its inner ungated dispatch); approve
-    re-dispatches with host authority, deny drops it, read-only subcommands pass
-    for players, and `!map full` is correctly elevated by ELEVATED_ARGS.
-    **Action transactional rollback** — an action that writes vars, damages hp,
-    applies a status, calls `damage_part`, summons an entity and emits an event
-    then `fail()`s reverts ALL of it (entity count included); a failing NESTED
-    action rolls back its own effects while the outer continues (the GM checks
-    `use_action`'s result if they want abort-on-failure); the recursion limit (8)
-    errors cleanly rather than crashing; a succeeding action commits.
+### 7.9 Multi-tile bodies
 
-- **Audit-pass-24 (hands-on): the "round-keyed logic breaks under ATB" bug CLASS
-  (scenario 560).** Drilled the history/undo subsystem (`match_history.py`, never
-  hand-audited before) and found a defect class worth remembering: **ATB disables
-  rounds, so `round_number` is frozen at 1 forever — every mechanism whose window
-  / expiry / seed is keyed on `round_number` silently misbehaves under ATB.**
-  Prior ATB work covered the LOUD cases (`round_number()`/`turn_index()`/round
-  `schedule()` RAISE, and `_has_round_logic` warns about dormant round logic);
-  these are the SILENT ones. Audit the whole class when touching ATB.
-  - **Turn-autosave retention never pruned under ATB (REAL, FIXED).**
-    `MatchHistory._prune_turns` kept `autosave_turn_retention_rounds` rounds'
-    worth of turn snapshots by comparing `s.round_at_snapshot >= round_number -
-    rounds + 1`. Under ATB that threshold never advances, so NOTHING was ever
-    pruned and turn snapshots accumulated for the entire session — each one a
-    FULL match state (measured: 40 ATB turns → 40 retained snapshots / 265 KiB,
-    vs 5 in round mode; 150 turns → 150). An unbounded memory leak in the
-    intended-for-long-sessions turn model. Fixed: under ATB, `_prune_turns`
-    prunes by the `_turn_index` counter (the only clock that advances there)
-    against a NEW `autosave_turn_retention_turns` rule (default 20 ≈ the
-    round-mode default for a mid-sized party; -1 unlimited / 0 disable, mirroring
-    the rounds rule). Round-based play is byte-for-byte unchanged (the ATB branch
-    is gated on the `atb_enabled` rule). Verified: 150 turns → capped at 20,
-    `!history undo turn` still restores correctly under ATB, turns keep advancing
-    after an undo, and the 0 / -1 knobs behave.
-  - **OPEN (raised with the user, NOT fixed — needs a design call): a
-    `!reveal_fog ... turns=N` TEMPORARY reveal never expires under ATB.**
-    `reveal_cells` stores `until = round_number + duration` and `_active_reveals`
-    prunes when `until >= round_number`; with rounds frozen the reveal is
-    permanent (verified: 30 ATB turns, cell still revealed, record still
-    `until: 3`). Fixing it properly needs a monotonic TURN counter on Match —
-    which does not exist (`history._turn_index` is unsuitable: it lives on the
-    history object, which `to_dict` excludes by default, so it resets on
-    save/load). That counter is exactly the "turn-elapsed counter to replace
-    turn_index() under ATB" already flagged as a FUTURE item in the ATB entry, so
-    its shape (field name, whether it's exposed as a formula prim, whether
-    `turn_index()` returns it under ATB instead of raising, whether it counts in
-    round mode too) is the user's design call — I asked rather than guess.
-    RESOLVED — the counter shipped as `Match.turns_elapsed`; see the ATB
-    turn-clock entry below.
-  - Verified CORRECT in the same sweep (no change): the rest of the history
-    subsystem — manual save → mutate → restore, restoring the SAME snapshot
-    TWICE (no snapshot corruption, i.e. the pass-7 load-side deepcopy holds),
-    `!history undo command N`, restore after an entity was removed (it comes
-    back), `!history list`, `!history diff manual:a manual:b` (correct per-var
-    old→new + additions), the confirmation-prompt gate, and linear-history
-    truncation of the orphaned future. Also re-checked and judged BENIGN under
-    ATB: the `random_stable` turn-order tiebreaker's `(match.id, round_number)`
-    seed is frozen, but ATB picks the actor by charge bar (ties broken by
-    time/rate/id), so turn_order ORDER doesn't drive selection — cosmetic only;
-    and round `schedule()`s created before ATB was switched on never fire, which
-    `_has_round_logic` already warns about by design.
+- A unit covers a W×H rectangle anchored at its TOP-LEFT cell; W / H are vars
+  named by `footprint_width_var` / `footprint_height_var` (absent or < 1 =
+  1). A write that grows the body must fit (`check_body_fits`: newly covered
+  cells on-grid and free); a side reads as at most grid side + 1
+  (`_cap_footprint`).
+- Core: `entity_footprint`, `entity_cells` (row-major, [0] = anchor; region
+  parts return their region), `entity_occupies`, `cell_occupant`. Policies
+  (user calls, hardcoded): distance = nearest cell; membership (fog, AoE,
+  zones, lines) = any cell; outward vision = union of every cell's sight.
+- Movement hooks fire per covered cell (a 2×2 crossing a fire band burns once
+  per fire cell). A large corpse keeps one id; its cells derive from its
+  stored footprint vars. Prims: `footprint_width/height`, `footprint_cells`,
+  `occupies`, `entity_center` (floored), `aoe_origin` (`aoe_origin_mode`)
+  (382-386).
 
-- **Audit-pass-23 (hands-on): CLEAN PASS — no bug found.** A by-hand sweep with
-  exhaustive serialization checks, an event-bus review, broad input fuzzing, and
-  numeric primitive re-verification; no code change. Verified combos (so future
-  passes can skip re-grinding):
-  1. **Serialization is airtight.** Built a match populating ~all 46 serialized
-     fields (nested-var entities, multi-tile + parts + segments, status defs with
-     overlay sprites + tags + modifiers, anchored zone, tiles, groups, aliases,
-     macros, tables, watchers, team data + team passives, fog + memory + reveals,
-     colors, layers, legend, border, render_mode, background, viewport). `to_dict
-     == to_dict(from_dict(to_dict))` idempotent; and a LOAD-SIDE ISOLATION test
-     (rebuild from a retained snapshot dict, mutate every nested structure on the
-     loaded match IN PLACE, confirm the snapshot dict is untouched) passed — so
-     `from_dict` deep-copies nested data, the passes-5/6/7/11 corruption class is
-     fully closed.
-  2. **Event bus (`emit_event`) is careful** — global handlers fire once; a
-     directed event also fires the target's team + own handlers with existence
-     re-checks (the passes-7/8 ghost-passive guards); `_event_stack` push/pop in
-     try/finally; recursion capped by `event_recursion_limit` with a
-     warning-latch drained at the outermost emit.
-  3. **Input fuzzing (58 inputs) all handled cleanly (❌, never 💥).** 28
-     numeric-arg commands fed non-numeric/huge/negative values (`!map resize/pan/
-     center/view/border`, `!zone shift/fill`, `!tile line/fill`, `!part segment`,
-     `!status apply/force/counter`, `!team add`, `!reveal_fog at/around`, `!ent
-     hp/init/tp/add`, `!dist`, `!roll`, …) — the pass-18 int()-guarding holds
-     broadly. 30 formula/structural edges (malformed passive/gpassive/func/clamp/
-     status-tick/watch/action bodies, empty/vital-nesting var paths, vital
-     deletion, ops on missing entities, self-referential alias/macro, a
-     200-deep paren expr) — all clean.
-  4. **Dice parser edge cases correct** — `1d1!`/`100d1!` don't infinite-loop
-     (explosion skipped for sides==1), `0d6` is a clean FormulaError, `d6`
-     implicit-1-die, combined suffixes (`2d6!kh1`, `3d6!kl1`), `kh` cap > dice
-     count, negative groups — all exact.
-  5. **Modifier fold is exact for the combat foundation** — status-instance +
-     team + equipped sources aggregate together with correct `[source]` labels;
-     `((10+5)+2)×(1+0.5)) = 25.5` to the decimal; a `modifier_stat_caps
-     strength:0:20` rule (set before match creation so it's in the rules
-     snapshot) clamps 110→20. NOTE: a status-instance modifier must be set via
-     `!ent status <id> set <name> modifiers.<k>.<field> ...` (the status
-     instance), NOT `!ent set_var <id> status.<name>...` (which writes a var
-     named `status`, a different location — a false lead this pass).
-  This is the third clean pass in the 20s (with 21); the harness-testable core +
-  serialization + command-input robustness are solid. Likeliest remaining defect
-  surface stays genuinely new code (as pass-22 showed — the bug was in the
-  freshest change) and the Discord adapter.
+### 7.10 Body parts, segments and mounts
 
-- **Audit-pass-22 (hands-on): two "non-string → string-join" crash fixes
-  (scenarios 558-559).** A by-hand sweep that (correctly) started with the
-  freshest code — the just-added `!foreach` upgrades — and found a bug there,
-  then a second of the SAME class elsewhere. Both are `💥`-level crashes where a
-  non-string value reached a `", ".join(...)` / `re.sub` replacement that
-  assumed strings:
-  - **`_foreach_subst` `$team` (introduced by the foreach-upgrade change).** The
-    `$team` token substituted the entity's team var without str-coercion (unlike
-    `$i`/`$n`/`$x`/`$y`, which were `str()`d). A NUMERIC team var (`!ent set_var
-    x team 5`) made the `re.sub` replacement lambda return an int →
-    "sequence item 0: expected str instance, int found" (💥). Fixed by
-    str()-coercing the replacement in the lambda (defensive for every token, not
-    just `$team`). Regression added to scenario 558 (a numeric-team entity).
-  - **`_tmpl_fmt_value` non-string DICT KEYS (pre-existing).** The `{placeholder}`
-    template value formatter (used by `entity_line_format` / status-line / part-
-    suffix templates) joined a dict var's keys with `", ".join(keys)` — but the
-    sibling list branch already `str()`d its items, and the dict branch didn't.
-    A formula can write a dict with non-string keys (`entity[a].loot = {1: 5}`);
-    referencing that var in a template placeholder (e.g. `entity_line_format`
-    `{loot}`) then crashed `!list`/`!state` with the same "expected str instance"
-    💥. Fixed to `", ".join(str(k) for k in keys)` in both the truncated (>6) and
-    full branches, mirroring the list branch. Scenario 559.
-  Same-class sites deliberately LEFT (verified non-crashing or pathological-only):
-  `!find sort:<var>` is type-safe by construction (a `(rank, number, string)`
-  sort-key tuple, so mixed-type var values across entities never raise); the
-  rule-name / slot-name joins (`logic.py` ~2545/6387) only take non-strings if a
-  GM pathologically builds `slots = {1: ...}` with integer keys, which is far
-  outside normal authoring. NOTE for future harness authors: the fastest bug this
-  pass came from auditing the code I'd JUST written — fresh code is the highest-
-  yield target, and a numeric team/var is a realistic GM input that scenarios
-  rarely exercise.
+- **Parts** are real units with the protected `part_of` field; a parent's
+  parts are derived by scanning (`parts`, `part`, `has_part`, `part_of`,
+  `entity_part_subtree` BFS parents-first). `parent` token. Created by
+  templates (`parts` key, `{role: part}` or a list) or `!part
+  add/attach/detach/remove/glue/locate/region/segment/list/info`.
+- **Kinds:** GLUED (mirrors the parent's anchor, skipped by occupancy, render,
+  vision, enumerators, roster unless `roster_glued_parts` / `__roster_show`),
+  LOCATED (`__part_located`: own cell, renders, occupies, targetable),
+  REGION (`__part_region`: a facing-aware region of the parent's footprint —
+  front / back / left / right / center / all / corners; drawn over the parent
+  only with a custom glyph, `part_custom_glyph_priority`). 0/0 parts are
+  indestructible pass-throughs (`is_indestructible`).
+- **Damage:** only `damage_part(part, n)` routes to main: `to_main_percent`
+  (default `part_to_main_percent_default`), `to_main_cap` (none / max_hp /
+  remaining_hp / absolute:<n ≥ 0> — a typo is refused), `vital`,
+  `indestructible`; the transfer is computed from pre-hit values and applied
+  to the parent first; `rounding_mode`. A destroyed part lingers dead, fires
+  on_death once (`__part_destroyed` latch, cleared by any heal above 0) and
+  kills the parent if vital. Negative amounts are refused.
+  `damage_spread(target, total[, mode, fragments, origin, radius])` divides
+  a total across parts (`aoe_default_mode`: weighted by `aoe_weight` /
+  hit_weights, uniform, fragment × `aoe_fragment_count`, main_only;
+  largest-remainder) and skips parts a cascade removed. Property searches
+  (`entities_with_status` / `_var`) include parts; spatial ones skip glued
+  parts. `hit_location(target,
+  x, y[, aim, aim_weight, aim_bonus, mode])`: TWO modes, weighted
+  (`hit_weights.<side>`) and uniform; aiming is the separate `aim` arg (that
+  part's weight × aim_weight + aim_bonus) (396-417, 467).
+- **Lifecycle:** parent death snapshots the whole subtree into the corpse and
+  revive restores it (displaced located parts go to the nearest free cell
+  with ⚠️, dropped only when nothing fits). Removing a unit removes its
+  subtree. Killing a part is limb destruction, never a corpse. Detach makes a
+  free unit. Parts share the parent's turn clock (§7.3).
+- **Snake segments:** located parts with `__segment` + `__follows` (the one
+  ahead); `snake_segments(head)`. Follow `segment_follow_mode` (trail /
+  path + `segment_spacing`; head override `__segment_follow`); a teleport
+  re-lays the body (`_resettle_snake`); `segment_self_collision`.
+  `segment_death_mode` (none default / solid / cascade / split, with
+  `segment_split_head_template`) when a segment is destroyed;
+  `segment_removal_mode` (close default / cascade / split / death) when a GM
+  despawns one (`despawn_entity`); internal removals close the chain
+  (`_splice_out_segment`). A promoted head never acts by itself (418-422,
+  592).
+- **Mounts:** a vehicle is any unit with a `slots` var; a slot has
+  `capacity`, `cost` (formula), `condition` (formula, fail-open), `region`
+  (where the rider is drawn and targeted; none = hidden inside),
+  `controls_movement`, `actions`. Links are the protected `mounted_on` /
+  `mount_slot` fields; occupancy derived (`vehicle_riders`, `slot_occupants`).
+  Moving the vehicle carries riders, nested (`_restamp_riders_for`); a
+  driver's own move moves the rig. Hidden riders are off the ground,
+  unrendered, unseen and grant no vision (`hidden_rider_grants_vision`).
+  `mount_on_host_death` (eject / kill / keep); a dead rider revives
+  unmounted; transform re-checks a mounted rider's slot (and a vehicle's
+  riders) per `transform_rider_mismatch_mode`. Boarding legality is the GM's
+  call through slot conditions — a built-in boarding range was REJECTED.
+  `!mount <rider> <vehicle> <slot> | dismount | switch | list | info`; prims
+  mount / dismount / switch_slot / riders / slot_riders / can_mount / ...
+  (458-461, 465-466, 503-506, 682).
 
-- **Audit-pass-21 (hands-on): CLEAN PASS — no bug found.** A by-hand sweep
-  targeting the recent-feature surface NOT already drilled in pass-20 (behavioral
-  harnesses, no agent swarm); every check exact, no code change. Recording the
-  verified combos so future passes can skip re-grinding them:
-  1. **Container-prim vs clamp/vital interaction** — `var_add` on a clamped var
-     RETURNS the pre-clamp computed value while STORING the clamped value; this
-     is the SAME convention as `var_set` (both return the requested value, not
-     the stored one) — NOT a bug (re-read via `var_get` for the stored value).
-     `var_add`/`item_consume` route through `write_var`, so pass-18's vital-write
-     coercion + the clamp system apply correctly (a write above max_hp clamps).
-  2. **`ARG_SAFE_MATCH_FUNCS` classification is genuinely side-effect-free** —
-     spot-audited the suspicious "safe" entries (`entity_snapshot` = pure
-     template builder, `var_pick_random`/`roll_table`/`table_roll` = read-only
-     except advancing the seeded RNG, which is intended/documented). No
-     mis-classified mutator is reachable from inline `$()`.
-  3. **`render_scene` vs `_render_ascii_impl` have NOT drifted** — both entity
-     passes gate on `is_alive` + the SAME `entity_visible_to` / `tile_visible_to`
-     / `zone_visible_to` / `corpse_visible_to` / `_fog_terrain_visible`
-     predicates, skip the same glued/region/mounted parts, and are disguise-
-     gated identically (the one deliberate difference: the scene region-part pass
-     also honors a custom SPRITE, ASCII only a custom glyph). Overlay placements
-     (`_emit_entity_placement`) are disguise-gated (no real-status-FX leak to an
-     enemy POV) and follow the entity footprint/mode.
-  4. **transform → save/load → revert round-trip** — a captured statblock stashed
-     to a caller-chosen var survives `to_dict`/`from_dict` (form, part subtree,
-     stash var all intact); revert on the RELOADED match restores the original
-     name/hp/footprint and its inventory, and drops the transformed form's parts.
-  5. **QoL commands** — `!find sort:<var>[:desc] show:<csv>` (missing var → `—`,
-     sorts last; dotted paths), `!dist` (entity/cell/mixed, all metrics,
-     footprint nearest-cell gap, `los`), `!roll` (NdM/kh/kl/explode, bad input →
-     clean ❌). No crashes.
-  6. **`roll_table_pick`** — weights validated (>=0, non-numeric → ❌), 0-weight
-     filtered, cumulative selection sound (harmless dead `return total` after the
-     final return; not worth a fix).
-  7. **SpriteLoader path-traversal guard** — every `..`/absolute/mixed-separator
-     key and non-PNG extension resolves to None (blocked); legit keys stay inside
-     the sprites folder. (Defense-in-depth; sprites are server-side-only, no
-     inbound upload path exists.)
-  8. **reveal_fog** — a `turns=N` temporary reveal shows terrain AND live
-     entities, then EXPIRES on the right round and is pruned from `fog_reveals`; a
-     permanent reveal persists across rounds. Serializes + is footprint-aware
-     (`around <eid>`).
-  9. **Choice-replay through batch/foreach** — an action using `choose()`
-     (transactional replay+rollback per choice) invoked inside `!batch` and
-     `!foreach` with pre-supplied `answer=` tokens: a var write BEFORE the choice
-     applies EXACTLY ONCE per invocation despite the replay, and the batch/foreach
-     dispatch isn't corrupted by the rollback.
-  Also re-confirmed clean by inspection: the Discord adapter board/approval/image
-  logic (pass-18's per-match approval fix holds) and status dispel/transfer
-  (tag dispel, max cap, consume-on-reject to an immune dest). NOTE for future
-  harness authors: the default clamp caps hp at max_hp (soft, NO minimum — hp
-  can go negative) and max_hp defaults to the spawn hp — so a bare `!ent add x
-  X 30 ...` caps hp at 30; raise max_hp first or your "hp write is broken"
-  repro is really the clamp working (this cost me a
-  false lead this pass).
+### 7.11 Death, corpses, revive, transform, disguise
 
-- **Audit-pass-20 (hands-on): macro runaway backstops — two DoS/crash fixes
-  (scenarios 555-556).** A by-hand sweep of the least-audited RECENT features
-  (container prims, inline `$()`, macro control flow, reveal_fog, named tables,
-  overlays, the Discord adapter) with behavioral harnesses. Verified CORRECT (no
-  change): the container/inventory prims (item_consume drop-at-0 / over-consume /
-  partial / custom field, var_add create-or-increment + non-numeric reject,
-  var_move deepcopy isolation between entities), status dispel/transfer (tag
-  dispel, max cap, consume-on-reject to an immune dest), transform/foreach/table/
-  reveal_fog smoke on a multi-tile board, reveal_fog serialization + footprint
-  `around`, the dice `kh0` guard (survived the roll_detail refactor), the inline
-  `$()` classification (drift guard + validate_arg_safe reject path) and the
-  raw_args opt-out set (ent/foreach/batch/run/macro/eval — exactly the meta
-  commands), the ATB selection math + death-mid-turn robustness, and the Discord
-  board/approval logic (pass-18's approval-match fix holds). Two real bugs in the
-  MACRO control-flow interpreter (both let a macro hang/crash the bot, defeating
-  the stated runaway backstop):
-  - **Nested `repeat` over an empty body bypassed macro_step_limit (HIGH).**
-    `_exec_macro` charged the step budget ONLY on `cmd` nodes, so a `repeat`
-    whose body emits no command (an empty or directive-only block) never touched
-    the budget. `repeat 1000 / repeat 1000 / end / end` ran 1e6 iterations (0.4s)
-    and a third nesting level (1e9) would hang the bot for minutes — exactly the
-    runaway macro_step_limit exists to stop. Fixed by charging one budget unit
-    PER `repeat` ITERATION (in the `for k in range(...)` loop), so total loop
-    work across all nesting is bounded by the limit regardless of body contents.
-    macro_step_limit's meaning is now "dispatches PLUS loop iterations"; its desc
-    updated. Tight legitimate loops are unaffected (default budget 10000).
-  - **Recursive macros overflowed the Python stack (HIGH → 💥).** A macro line
-    can `!macro run <other>`, and each `!macro run` allocated its OWN fresh step
-    budget — so a self-recursive macro (`loop` = `macro run loop`) or a mutually-
-    recursive pair recursed until `maximum recursion depth exceeded` (a caught
-    but ugly 💥, and a lot of wasted work). Actions guard this with a recursion
-    limit; macros had none. Fixed with a new `macro_recursion_limit` rule
-    (default 20) + a `MatchManager._macro_depth` counter (on the manager = the
-    dispatch stack, so it accumulates even if a macro line switches the active
-    match), incremented around each `!macro run`'s `_exec_macro` and restored in
-    `finally`. Beyond the limit the run aborts with a clean ❌, not a 💥. Legit
-    nesting (`top`→`mid`→`leaf`, 3 deep) and 30 SEQUENTIAL inner runs both still
-    work (depth returns to base between sequential cmds; resets between top-level
-    runs). NOTE for future sweeps: `!batch` CANNOT recurse this way (its
-    subcommands are literal text, no named indirection), but `!run <file>` on a
-    self-referencing file has the same unbounded-recursion shape — left as-is
-    (host-only disk I/O, far more exotic than a stored player-triggerable macro).
+- **Death** (`_process_death`): `death_result` (corpse / delete, per-unit
+  `__death_result`); a corpse is the unit's snapshot in its cell's tile data
+  (`corpses.<id>`, mount links stripped); `corpse_id_uniqueness`. `kill` /
+  `revive` run `default_kill_function_effects` /
+  `default_revive_function_effects`. Prims: has_corpse, corpse_at,
+  all_corpses, corpse_var / corpse_has, corpse_status_has / _get / _names;
+  corpse / corpse_list action targets.
+- **Transform** (`!ent transform <id> <ref> [stash]`, `transform` /
+  `revert`): swaps name, vars, passives, clamps, statuses and the part
+  subtree; keeps id, position, facing, team, turn slot and the unit's own
+  segment linkage; hp per `transform_hp_mode` (percent / keep / full); the
+  old statblock is stashed at a caller-chosen var path, so transforms stack.
+  New vars are checked before the old parts go (481-483, 586).
+- **Disguise** (`disguise_var`): `{name, glyph, glyphs, color, vars}` shown
+  to viewers outside the unit's team (maps, roster, `!ent info`, `!find`
+  rows); mechanics always read the real unit; overlays hidden under a
+  disguise (484-485).
+- **Outcome:** `declare_winner` / `!match win`, `match_winner()`,
+  `match_over()`; win conditions are composed (watchers, on_death passives),
+  never configured.
 
-- **Audit-pass-19 (external-report triage): summon regression + var_get default
-  + harness hardening (scenario 554).** A second Opus instance found two bugs
-  plus a harness blindspot; all verified and fixed:
-  - **The summon system was COMPLETELY BROKEN (HIGH, FIXED).** Every
-    `summon` / `summon_near` / `summon_from` raised `❌ Runtime error: 'x'` and
-    created NOTHING. `Match.summon_entity` called `Entity.from_dict(d)` BEFORE
-    seeding `d["x"]/d["y"]` (they're set later from the resolved placement), but
-    a template has its position STRIPPED and `from_dict` does `int(data["x"])`
-    (subscript, no default) → `KeyError('x')`. Fixed: `d.setdefault("x", x)` /
-    `setdefault("y", y)` before the from_dict probe-build (they're overwritten
-    with place_x/place_y anyway). This had rotted undetected across ELEVEN of
-    its own scenarios (317/318/321-324/336/340/351 + the summon-in-passive 319
-    and summon-tile 320) because the harness only flagged 💥, not a top-level ❌.
-  - **`var_get` rejected a default arg (LOW-MED, FIXED).** `var_get(eid, path)`
-    was 2-arg, but the obvious create-or-read idiom `var_get('h','alarms',0)+1`
-    (used by scenario 427's watcher effect, and mirroring `corpse_var`'s
-    `default`) errored "takes 2 positional arguments but 3 were given". Added an
-    optional `default`: returned on a missing path, still raises without one.
-  - **Harness blindspot hardened (the meta-fix).** `run_scenarios.py` only
-    flagged 💥 / "Syntax error", so a top-level `❌ Runtime error:` /
-    `❌ Unexpected error:` (a core feature silently failing) slid through — the
-    exact trap that hid the summon regression. Added `_ERROR_MARKERS` flagged
-    UNLESS a scenario opts out with a `HARNESS-ALLOWS-ERRORS` tag in its
-    Expected prose (for the few scenarios — 222 func-deletion, 551 vital-write
-    rejection, 554 var_get-no-default — that DELIBERATELY surface a top-level
-    error). 💥 / Syntax always flag regardless. So the whole suite now passing
-    (551/551) is a real signal that no core feature is silently ❌-ing.
+### 7.12 Zones, tiles and auras
 
-- **Audit-pass-18 (external-report triage): four fixes (scenarios 551-553).**
-  A second Opus instance was asked to find flaws; all four it reported were
-  verified against the code (repro'd where harness-reachable) and fixed:
-  - **Vital-var WRITE corruption (MED, FIXED).** Any write path could set
-    hp/max_hp/initiative to a non-number or nest under it (`!ent set_var h hp
-    abc`, `var_set('h','hp','boom')`, `hp.x`, `var_add('h','hp.inner',5)`),
-    after which the `int()`-based hp getter 💥'd `!list`/damage/is_alive — and it
-    round-tripped through save/load. The DELETE path was already guarded
-    (remove_var, pass-16); the symmetric WRITE path wasn't. Fixed at the
-    `Entity.write_var` chokepoint: a write whose top-level key is a protected
-    vital var is coerced to int (numeric strings/floats OK) or REJECTED
-    (non-numeric / bool), and NESTING under a vital (`hp.x`) is refused
-    (`_coerce_vital_value` helper). Skipped pre-bind (no match).
-  - **`!ent clone` ignored parts/mounts (MED, FIXED).** Clone did `src.to_dict()
-    → from_dict → spawn`, so it DROPPED a multi-part creature's limbs and copied
-    protected relational fields raw — a mounted clone inherited `mounted_on`/
-    `mount_slot` (a phantom rider bypassing slot capacity / on_mounted), a part
-    clone inherited `part_of` (a phantom limb on the original's parent). Fixed to
-    mirror `MatchManager.copy_entity`, same-match: clone the whole part SUBTREE
-    (parents first, ids/`part_of`/`__follows` remapped, located-part offsets
-    kept, `_restamp_parts_for`), STRIP `mounted_on`/`mount_slot`, and REFUSE
-    cloning a body part ("clone its parent instead"). Gotcha fixed mid-work: the
-    root must take the planned id, so `taken` excludes the plan's cid.
-  - **Unguarded `int()` in `!ent hp/init/add/tp` (LOW, FIXED).** A non-numeric
-    numeric arg (`!ent hp foe abc`) 💥'd pre-mutation where a clean ❌ belongs
-    (sibling verbs already wrapped int()). Wrapped the four sites in try/except
-    ValueError → ❌.
-  - **Discord approval resolved against the wrong match (LOW, Discord-only,
-    FIXED by inspection).** `_ApprovalView._match` popped/ran the request via the
-    channel's ACTIVE match, but request ids are per-match sequential (r1, r2…),
-    so a host switching matches mid-approval could pop a DIFFERENT match's
-    same-id request. Fixed: `add_pending_request` now stores `match_id` on the
-    request (runtime-only, harness-verified present); `_match` resolves against
-    it, and the approve re-dispatch points the channel at the request's match
-    before running (falls back to active for legacy requests).
+- **Tiles:** per-cell data (`!tile set/place/line/fill/copy/...`), templates
+  (`!tile def`, per system), precedence instance > template > rule for
+  glyph / color / sprite / block / opaque; tile hooks (on_enter / on_exit /
+  on_stop / time hooks).
+- **Zones:** named cell sets (`!zone ...`): data, hooks (boundary + per-cell
+  + time), dedicated glyph / color / sprite fields, `zone_shift`, `zone_*`
+  prims, `zone_distance`.
+- **Auras:** a zone anchored to a unit (`!zone anchor <name> <eid> [radius]
+  [metric]`): cells re-stamped around every footprint cell when the anchor
+  moves, without firing the aura's own enter/exit. On anchor loss
+  `anchored_zone_on_anchor_loss`: delete / freeze / suspend (cells cleared,
+  binding kept, resumes on revive or a part heal). The binding is by id, so
+  a suspended aura also resumes around a LATER unit that reuses the id
+  (left as-is) (388-389, 519-520).
 
-- **Audit-pass-17 (hands-on): CLEAN PASS — no bug found.** A by-hand
-  interaction sweep over the recent-feature cross-products (graphics + fog/POV +
-  mounts + status + transform + containers + macros), all exact, no code change.
-  Verified (so future passes can skip re-grinding these):
-  1. **Serialization idempotency** — `to_dict == to_dict(from_dict(to_dict))` on
-     a match exercising EVERY recent serialized field at once (named tables,
-     fog_reveals, border_show/color/opacity, render_mode, background, status-def
-     overlay sprites, the overlays var, mounts, parts, container vars, control-
-     flow macros, watchers, anchored zones, team data, sprite_layer var). No
-     missing/dropped field.
-  2. **`render_scene` POV/fog/disguise consistency** — for every POV the emitted
-     entity + tile placements match the SAME `entity_visible_to` /
-     `tile_visible_to` + `_fog_terrain_visible` predicates the ASCII path uses
-     (no graphics-side info leak); a disguised entity shows the decoy name to
-     enemies, the real name omniscient.
-  3. **Status cluster** — dispel by `tag:` removes all matching + keeps others;
-     transfer to an IMMUNE dest is consume-on-reject (gone from source, doesn't
-     stick); counter to 0 on a CUSTOM field auto-removes.
-  4. **Overlays render on a visible mounted rider** (the `_emit_entity_placement`
-     overlay pass covers riders/region parts); item_consume inside a macro
-     `repeat` decrements per iteration.
-  5. **transform/revert** — id/pos/team preserved, statblock wholesale-swapped
-     (old inventory dropped), revert restores it; needs a CAPTURED statblock
-     (`store_entity_into_var` / a live id), NOT a flat hand-built dict.
-  6. **Render resolution precedence** — per-tile `border_color` data >
-     per-match border field > rule; per-tile `sprite_layer` data overrides the
-     z-layer rule; inline `$()` negative result works in `!foreach`.
-  7. **Macro control flow** — nested `if`/`repeat` + `$#` index, `macro_repeat_limit`
-     clamp, `macro_step_limit` runaway abort, unbalanced-block rejected at `set`.
-  Process note for future harness authors: two "failures" this pass were BOTH
-  test errors — spawning a second entity ON a vehicle's occupied cell (the add
-  silently fails, so the later mount has no rider), and using a FLAT transform
-  template instead of a captured statblock (apply_statblock finds no `vars` →
-  max_hp None). Neither is an engine defect.
+### 7.13 Vision, fog and line of sight
 
-- **PROCESS RULE — args / formula functions (the user's standing directive).**
-  Inline `$()` args evaluate formula functions, so the read-vs-write
-  classification is a SAFETY boundary, not a nicety. WHENEVER you touch formula
-  functions or any feature that evaluates user formulas in args:
-  1. Every new `_MATCH_FUNC_NAMES` entry MUST be classified as
-     `ARG_SAFE_MATCH_FUNCS` (pure read/calc — anything that gets / calculates /
-     evaluates) or `ARG_MUTATING_MATCH_FUNCS` (anything that changes game state
-     — STRICTLY banned from args). The module-load drift guard in `formula.py`
-     fails the build if you forget, but DECIDE deliberately — a mis-classified
-     mutating function in args is a disaster (a player could `$(kill(boss))`).
-     When unsure, classify as MUTATING (default-deny).
-  2. Add `$()` arg scenarios — at minimum a read-only happy path AND a
-     security case proving the new/changed mutating functions are rejected and
-     do NOT mutate (see scenarios 541-543 for the pattern).
-  (scenarios 507-511).** A seventh sweep (three read-only survey agents across
-  status/passive/event, movement/geometry/LOS, action/choice/dispatch/clamp;
-  every candidate verified in code — and most behaviorally repro'd — before
-  fixing). Five real bugs + two user design calls:
-  - **Load-side shallow-copy (HIGH).** The SAVE side was deepcopied in passes
-    5/6 (`Entity.to_dict` vars, `Match.to_dict` tiles, `_zone_to_dict`), but the
-    LOAD side still re-shared nested data with the RETAINED snapshot:
-    `Entity.from_dict` did `vars=dict(...)`, `_coerce_status_dict` did `dict(v)`
-    per status, and `Match.from_dict` reused each tile dict by reference
-    (`m.tiles[(x,y)] = val`). Since `from_dict` runs on `!history restore` /
-    undo / action rollback (the snapshot stays in history), a later in-place
-    `!ent set_var inv.x` / `!tile set` corrupted the saved snapshot, so a second
-    restore returned the mutated value. Fixed all three with `copy.deepcopy`
-    (zones' `_zone_from_dict` already deepcopied `data` + rebuilt `hooks`, so it
-    was already safe). Scenarios 507-508.
-  - **Ghost passives (MED).** In `fire_status_event`, `fire_hook`, and
-    `emit_event`, global/team handlers fire BEFORE the entity's own handlers. If
-    a global/team handler removed the entity (kill/remove — in a status hook the
-    affected entity is bound as `self`, NOT `target`), the own-handler loop still
-    ran on the just-removed entity, firing side effects from beyond the grave.
-    Added an existence re-check (`id in self.entities`) before each own-handler
-    loop, mirroring the loops' existing top-of-iteration guard. Scenarios
-    510-511.
-  - **`!status apply` crash when a hook removes the target (MED, pre-existing).**
-    The command handler did `e = m.entities[eid]` right after `apply_status`,
-    KeyError'ing if a lifecycle hook (e.g. an on_status_added passive that kills
-    the entity) removed it mid-apply. Now reports "Applied ... which was then
-    removed by a triggered effect" instead of crashing. Surfaced by scenario 510.
-  - **max_level hard ceiling (user call → cap everywhere).** `max_level` capped
-    only the `add_level` stacking mode; a FIRST application or a `replace` with
-    an explicit level above max was uncapped (`!status apply h burn 10` on a
-    fresh max_level=3 → level 10). User's call: make max_level a hard ceiling on
-    the level field EVERYWHERE. New `Match._cap_status_level(sdef, lvl)` helper
-    applied at all three apply sites (first / replace / add_level). Scenario 509.
-  - **LOS-on-opaque (user call → KEEP current, no code change).** For the
-    sight-aware line queries (`entities_on_los`, `entities_in_line_until`), an
-    entity standing ON the FIRST opaque cell (e.g. an enemy at the near edge of
-    smoke) is RETURNED as visible/hittable; only entities BEYOND the opaque cell
-    are cut. CONFIRMED INTENDED (consistent with `has_los`'s "the target's own
-    opacity never blocks" convention — you can see/shoot something at the wall
-    surface, not past it). Documented here so the ambiguity doesn't recur; do
-    NOT "fix" it to exclude the on-opaque entity.
-  - Re-verified correct (no change): choice-replay RNG snapshot/restore +
-    summon-budget reset + buffer reset, the `action._rollback_match` runtime-
-    field list (incl. event-stack), clamp/death-check ordering in `write_var`,
-    the dispatch gate, status counter auto-removal + cross-status removes/
-    blocked_by, resistance mode-awareness + the force path, attached-part tick
-    sharing, and (re-confirmed footprint-correct) all vision/LOS casts, distance
-    gaps, and movement validation.
+- **Visibility conditions** (expressions; empty = visible; a broken one shows
+  everything): `entity_visibility_condition` (`self`, `pov_team`),
+  `tile_visibility_condition` (`tile_x` / `tile_y`), `zone_visibility_condition`
+  (`zone_name`), `corpse_visibility_condition` (`corpse_team`, no `self`).
+  All through `Match._visibility_visible`; `entity_visible_to` etc. Your own
+  team's units (root body's team) are always visible to you while
+  `pov_own_team_visible` is on (`own_team_unit`).
+- **Fog** (`Match.fog_enabled`, per match, `!match fog on|off`): a team sees
+  the union of cells within each alive member's `fog_vision_radius` var
+  (metric `fog_range_mode`), from every footprint cell. With `fog_los` the
+  fog also needs a clear line. Memory (`!match fog memory on|off`,
+  `Match.explored`, `fog_memory_mode` full / terrain). `!reveal_fog <team>
+  ...` adds reveals, optionally temporary (`turns=N`, keyed to whichever
+  clock advances). Everything funnels through `_fog_team_sees`; renders
+  memoize it for one pass (`_vision_memo`).
+- **Opacity / LOS:** `tile_opaque_condition` / `zone_opaque_condition` (`self`
+  = viewer), per-cell `opaque` data; FAIL-TRANSPARENT. `has_los`,
+  `raycast` (where a beam lands), `first_opaque` all walk ONE corner-aware
+  path (`_los_stop`; `los_corner_mode` permissive / strict / open), symmetric,
+  clipped to the map; the viewer's cell and the target's own opacity never
+  block — a unit standing ON the first opaque cell is seen / hit (user call:
+  intended). `entities_on_los` (strictly between, sight-aware),
+  `entities_in_line_ignorelos`, `entities_in_line_until` (cap). Entities never
+  block sight in fog; the GM composes body blocking in actions.
+- **Sight prims:** `can_see`, `team_sees_cell`, `team_sees_entity` (range AND
+  los; `_rangeonly` / `_losonly` variants; all ignore the fog toggles),
+  `visible_entities(eid[, relation])` (minus units the stealth rule hides
+  from the viewer's team), `!map ent_sight <eid>` (cells one unit sees; a
+  player may ask about their own team's units). Costs charged to
+  `formula_cell_limit` / `sight_check_limit` (690-691, 701-703).
 
-- **Audit-pass-8 fix: ghost passives in the VAR-hook firing paths (scenario
-  512).** An eighth sweep (three read-only survey agents across zones/clamps/
-  tiles/aliases, death/corpse/parts/segments, and action/choice/formula/
-  dispatch). Agents 1-2 found their subsystems correct (zones' anchored auras +
-  footprint interaction, clamp ordering, tile precedence, alias resolution; the
-  whole death/corpse/parts/segment/mount cluster incl. the part-destroy latch +
-  revive subtree + mount-strip — all re-confirmed sound). Agent 3 found the ONE
-  real bug: pass-7 guarded the ghost-passive case (a global/team handler removes
-  the entity, then its OWN handlers must not fire from beyond the grave) in
-  `fire_status_event` / `fire_hook` / `emit_event`, but MISSED the var-hook
-  firing paths. `_fire_var_event_inner` (wave 1 = exact `on_var_{kind}`, wave 2
-  = `on_var_written` catch-all) and `_fire_var_attempt_inner`
-  (`on_var_write_attempt`) each fire global/team handlers then the entity's own
-  passives WITHOUT re-checking the entity still exists. So a global var-hook that
-  removes the affected entity left the own-passive loops iterating a stale `e`.
-  Fixed with the same `if entity_id in self.entities:` guard before each own loop
-  (three sites). NOTE for repro authors: in a VAR hook `self`/`this` =
-  current_entity_id() (the active-turn entity), NOT the affected entity, and
-  `target` is NOT bound (var-event extras expose changed_key/old_value/
-  new_value/hook_name/intended_value/was_clamped only) — reference the affected
-  entity by literal id or via `self` only when it IS the active entity. (This
-  differs from STATUS hooks, where the affected entity is bound as `self`.)
+### 7.14 Access, approvals and POV
 
-- **Audit-pass-9 fix: snake-trail coords shift with resize + cross-match copy
-  (scenarios 513-514).** A ninth sweep — this one INTERACTION-focused (single
-  subsystems are heavily swept now). Three read-only survey agents: (1)
-  visibility/render/disguise × transform/mount/viewport/legend/fog, (2)
-  modifier/status/team × transform/death/parts, (3) resize/transfer/choice-
-  replay/undo. Agents 1-2 re-confirmed their interaction surfaces correct
-  (disguise POV gating vs fog vs mechanics separation; viewport/legend window
-  clipping; team-membership-change reads `e.team` fresh for modifiers+passives;
-  status-removal drops modifiers live; transform wholesale-replaces status;
-  part-on-different-team gets its own team passives; choice-replay preserves the
-  event stack + resets summon budget; watchers fire only at the top-level
-  command boundary, never mid-action). Agent 3 found the one real bug:
-  - **`__seg_path` / `__seg_last` (the engine-managed snake-trail coordinate
-    vars) were not shifted by `resize_grid` nor offset by `copy_entity`.** These
-    are the ONLY coordinate-bearing ENTITY VARS the engine owns (head vars: a
-    list of `[x,y]` cells the head has occupied + the head's last cell, used by
-    `path`-follow-mode segments). resize_grid shifted entities/tiles/zones/
-    explored/channel_views but missed them, and copy_entity remapped part_of +
-    `__follows` but didn't offset them — so a path-mode snake re-laid its body at
-    STALE cells after a center/edge-anchored resize, and a transferred snake
-    re-laid at the SOURCE's coordinates in the destination match. Fixed with a
-    shared `Match._shift_snake_path_vars(vars, ox, oy)` static helper called from
-    the resize entity-shift loop and per-spawned-entity in copy_entity (delta =
-    the same offset the anchor moves by). NOTE: copy_entity is a `MatchManager`
-    method, so it calls the helper as `Match._shift_snake_path_vars(...)`, not
-    `self.` (a transfer scenario now also guards that cross-match path against
-    a crash). KNOWN pre-existing quirk surfaced (NOT fixed — separate from the
-    coord bug): path-mode segments legitimately OVERLAP early (the trail is
-    shorter than `(segments+1)*spacing`), and copy_entity re-validates occupancy
-    on spawn, so transferring a snake whose trail hasn't spread yet fails with
-    "cell occupied" — left as-is since overlapping located parts are themselves
-    a questionable state.
+- **Identity:** `ctx_user` / `ctx_user_name`; the CLI and harness switch it
+  with `!as host|player <name>|owner`. Admin (`ctx_is_admin`: Discord
+  Administrator; CLI / GUI always) and bot owner (`ctx_is_bot_owner`) are
+  separate tiers (§3).
+- **The gate** (`_gate_decision` / `_effective_access`): per command
+  `access=` all / host (default; a player's command is QUEUED for approval) /
+  host_only / owner. Downgrades: `READ_ONLY_SUBCOMMANDS[root]` (per root),
+  `READ_ONLY_BARE_ROOTS`, the read-only `!foreach`. Upgrades: `ELEVATED_ARGS`
+  (`full`, `resize`, settings...) except the read forms in
+  `_ELEVATED_READ_FORMS`. Overrides: `Match.access_overrides` (`!host access`,
+  per match, kept out of `rules` so a refresh can't wipe it) beat the
+  `command_access` rule (`!system access`, per system). No-op without an
+  active match, identity or owner — hence the separate admin and
+  target-host checks.
+- **Approval queue:** `Match.add_pending_request` (runtime-only; carried
+  across undo); `!pending` / `!approve` / `!deny` / `!cancel`, Discord
+  buttons. Approved commands run with the approver's authority in the
+  requester's channel against the request's match (`run_approved_request`,
+  `_channel_pointed_at`).
+- **Hosts:** `Match.owner` + `cohosts` (`!host add/remove/list`, owner only).
+  Pause (§7.3).
+- **POV:** a channel's view is its binding's `pov` (`!match bind pov=<team>`;
+  absent = omniscient), or a CLI `!as view` preview, or a host's one-off
+  `as=<team>` (`_view_pov`). `full` forces omniscient (host).
+  `pov_filters_queries` (default on): under a team view `_query_eid` makes a
+  hidden unit read exactly like a missing one and listings skip it
+  (`_pov_hides`) across `!ent info`, `!dist`, `!find`, `!foreach`, `!turn`,
+  `!map center/cell`, `!part`, `!mount`, `!action`, `!passive`, `!clamp`,
+  `!mod`, `!schedule`, `!tile info` (corpses inside tile data too);
+  whole-board reads (`!history diff`, `!log`, `!history list <kind>`, undo
+  preview) are host-only while anything is hidden
+  (`_whole_board_read_blocked`). `team_data_visibility` (own / all / host)
+  filters `!team list/get`. `inline_args_access` closes the `$()` route
+  (579-580, 593).
 
-- **Audit-pass-10 fixes: turn-order skip-loop + mount push/pull footprint
-  (scenarios 515-517).** The widest sweep yet — FIVE read-only interaction
-  agents (mounts/vehicles deep; movement/block/opacity; turn-order & clocks;
-  formula-sandbox safety; access-gate/dispatch) PLUS hand-written numeric
-  assertion harnesses for the gnarliest primitives. Agents confirmed correct
-  (no change): the whole movement/block/opacity surface (footprint-aware
-  push/pull/swap/group, fail-open conditions, LOS symmetry/corner modes,
-  raycast/first_opaque endpoints), the formula SANDBOX (no escapes — empty
-  `__builtins__`, entity[X] mandatory-`.path`, every HOOK_CONTEXT name in
-  `_who_arg`'s dynamic branch, `normalize_body_source` at every body boundary,
-  kh0/explode/band/roll_table edges), and the ACCESS GATE (no batch/run/macro/
-  foreach/alias/cmd bypass; overrides-before-rule precedence; approval re-gates
-  with the approver's authority). My own numeric harnesses re-verified
-  `damage_part` (every cap mode × percent × rounding × 0/0 passthrough × vital)
-  and the `apply_modifiers` fold (add/inc%/more%/set/min/max tiers, priority
-  bumps, op-order, stat caps) — all exact. Three real bugs fixed:
-  - **Turn-order crash when a skip-status round-wrap empties the order
-    (HIGH).** pass-3 guarded next_turn against an emptied order after the
-    turn_end hooks and after `_advance_index`'s round-wrap, but NOT after
-    `_skip_to_eligible` — whose OWN internal `_advance_index` (stepping over a
-    `skips_turn` entity) can wrap and fire on_round_end/start hooks that remove
-    the last entity. next_turn then did `turn_order[active_index]` on an empty
-    list → IndexError (💥). Fixed: re-check `if not self.turn_order: return
-    (None, log)` after BOTH `_skip_to_eligible` calls (opening-round + normal
-    paths). Scenario 515.
-  - **Skip-loop stale bound inflates round_number (MED).**
-    `_skip_to_eligible` sampled `n = len(turn_order)` ONCE; if a round-wrap hook
-    SHRANK the order mid-skip, the stale `n` let the loop keep cycling the
-    survivors, firing on_round_end repeatedly and inflating round_number (a
-    command-only repro: 3 entities, two removed on round_end, advanced round by
-    3 instead of 1). Fixed: bound by the CURRENT order size each step
-    (`if checked >= len(self.turn_order): return False`), keeping the initial
-    `n` only as a hard cap against a skip-hook that GROWS the order. Identical
-    behavior in the common no-shrink case. Scenario 516.
-  - **push/pull validated the RIDER's footprint, not the vehicle's (HIGH).**
-    `push_entity`/`pull_entity` walked the legal-prefix using the target
-    entity's footprint, then committed via `e.move_dirs`, which redirects a
-    mounted DRIVER to its vehicle (`_mount_move_redirect`). So pushing a 1×1
-    pilot of a 2×2 tank validated the pilot's 1×1 path (which sat inside the
-    tank's own cells → read as blocked → silent no-op) or, on a clear lane,
-    committed the vehicle move that the prefix never validated (stop-early /
-    mid-commit mismatch). Fixed: resolve `_mount_move_redirect()` at the START
-    of push/pull (after the `n<=0` guard), so the VEHICLE's footprint is what's
-    validated AND committed — and a non-driver PASSENGER raises "dismount
-    first." Mirrors the tp/move_dirs/swap redirect (single-level, like swap).
-    Scenario 517. (Process note: while reverting this for a pre-fix check I
-    re-inserted the block at the wrong `dx,dy = DIRECTION_VECTORS[canon]`
-    occurrence — that string also appears in `move_dirs` — briefly corrupting
-    move_dirs. Lesson: a bare `s.find(old)` restore is unsafe when `old` isn't
-    unique; prefer the Edit tool with surrounding context.)
+### 7.15 Rendering
 
-- **Audit-pass-11 fix: damage_spread fragment-mode crash + serialization
-  consistency (scenario 518).** An eleventh sweep — three read-only interaction
-  agents (serialization round-trip completeness; corpse/aura/time-hooks;
-  status-tick/watchers/event-bus) PLUS hand-written numeric assertion harnesses
-  for the primitives that still lacked one (`damage_spread`, the clamp
-  chokepoint). The agents found NO confirmed correctness bugs (their flagged
-  serialization items were FALSE POSITIVES — see below), but my numeric harness
-  caught the real one:
-  - **`damage_spread` fragment mode crashed without a `random_seed` (HIGH).**
-    The `fragment` branch did `rng = getattr(self, "_rng", None) or random`, but
-    `logic.py` never imported `random` (only `formula.py` did, for its
-    `_active_rng`). `Match._rng` is None by default and only built when a
-    `random_seed` is configured AND a formula roll initializes it — so under the
-    DEFAULT (no-seed) config every `damage_spread(target, total, "fragment")`
-    hit the `or random` fallback → `NameError: name 'random' is not defined` (a
-    `❌ Runtime error` through the action/formula path). The weighted / uniform /
-    main_only modes use no RNG, which is why scenarios 410-413 never caught it.
-    Fix: `import random` at the top of logic.py (the fallback now mirrors
-    formula's `_active_rng` exactly: seeded `_rng` when present, global `random`
-    otherwise). Scenario 518.
-  - **Serialization deepcopy consistency (NOT a live bug — defensive).**
-    `Match.from_dict` restored `watchers` and `bound_channels` with a shallow
-    `dict(v)` while `to_dict` deepcopied them. Two survey agents flagged this as
-    the pass-5/6/7 load-side corruption class, but VERIFICATION showed it's a
-    FALSE POSITIVE for correctness: both hold FLAT scalar dicts (`watchers`:
-    condition/effect strings + bool `last` + bool `once`; `bound_channels`
-    meta: `label`/`pov` strings), and the only mutations (`w["last"] = now`,
-    `meta["pov"] = ...`) are TOP-LEVEL key reassignments on the already-
-    independent `dict(v)` copy — they never reach the retained snapshot (which
-    needs a NESTED in-place mutation to corrupt, as `vars`/tiles/zones had).
-    Still, switched both to `copy.deepcopy(v)` for symmetry with the save side +
-    every other dict field, so the inconsistency stops magnetizing audit
-    re-investigation and a future nested field can't silently reintroduce the
-    bug. (Documented as verified-safe so pass N+1 doesn't re-flag it.)
-  - Numeric harnesses re-verified EXACT (no bugs): `damage_part` (every cap mode
-    × percent × rounding × 0/0 passthrough × vital), the `apply_modifiers` fold
-    (add/inc%/more%/set/min/max tiers, priority bumps, op-order, stat caps),
-    `damage_spread` apportionment (largest-remainder shares sum to total across
-    weighted/uniform/fragment/main_only/spatial-miss/all-zero-weights), and the
-    CLAMP chokepoint (hard always clamps; soft engages only crossing from the
-    legal side and stays DORMANT past the bound; max-before-min ordering).
-  - OPEN QUESTION (RAISED → RESOLVED, shipped as the `suspend` mode below): a
-    non-vital body PART destroyed by damage (hp→0 via `damage_part`) LINGERS
-    attached-but-dead and does NOT route through `Entity.remove`, so its anchored
-    AURA was never released. While investigating, established the current
-    death-aura behavior: entity death/kill/despawn (and the part-death cascade)
-    all route through `Entity.remove` → `_release_anchored_zones` → the
-    `anchored_zone_on_anchor_loss` rule (delete/freeze); the ONE gap was the
-    lingering-destroyed-limb case. The user's call: add a third mode that
-    SUSPENDS the aura while the anchor is dead and RESUMES it on revive/heal,
-    for BOTH entity death/revive and part destroy/heal. Shipped — see next entry.
+- **ASCII** (`render_ascii` → `_render_ascii_impl`): layers zones < tiles <
+  units < fog; glyphs (`glyphs.<facing>` > `glyph` > facing arrow; one
+  character), colours (`color` var > `team_colors` / a palette-named team;
+  ANSI only when `ctx.supports_color`, one code per run), legend
+  (`map_legend_by_default`, `!map legend`, `legend=`), coordinate rulers
+  (`map_coords`, `!map coords`, stacked column digits), hidden layers (`!map
+  layer`, `hide=`), preview / sight marks (`preview_glyph`), viewport.
+- **Viewport** (`viewport_width/height` 28, `viewport_mode` auto = only
+  surfaces with `viewport_capable`): per-channel camera `Match.channel_views`
+  (`!map pan/center/view`). Discord fits a 2000-char message by dropping
+  rulers, then colour, then legend.
+- **Graphics:** `render_scene` (→ `_render_scene_impl`, parallel to the ASCII
+  path over the same predicates) emits a declarative model; the engine never
+  loads an image. Sprite keys mirror glyphs (`sprite` / `sprites.<facing>`,
+  `sprite_mirror` fills missing facings, `fallback_sprite`), tile / zone /
+  corpse sprites, background (`background_sprite` default `ground_default`,
+  `background_mode`, placed on the whole grid), fog (`fog_sprite` default
+  `fog_default`, `fog_opacity`), borders (`show_borders`, per-match `!map
+  border`, per-tile overrides), `sprite_mode` (stretch default / single /
+  tile), z-layers (`sprite_layer_*`, per-item `sprite_layer`), overlays
+  (status definition / instance `sprite`, the `overlays` var), corpse look
+  (`corpse_sprite(s)` > `corpse_default_sprite` > the living sprite greyed by
+  `corpse_sprite_tint` / `_opacity`), team colour as an outline
+  (`team_outline_width/opacity`, `team_tint_opacity`), colour-only cells
+  (`tint_fill_opacity`), legend, rulers, highlights (`preview_color` /
+  `preview_opacity`). `sprite_render.SceneRenderer` draws it; glyphs outside
+  ASCII use a font that has them (`fonts/` folders, then system fonts).
+- **Surfaces:** `!map image`, `!map mode text|image` (plain `!map` posts an
+  image), `!map autoupdate` boards (Discord, runtime-only), `!map scene
+  [list]` (textual model), gui.py (canvas; zoom / pan local to the GUI).
+  Sprites come from `sprites/` and per-server `data/<server>/sprites/`
+  (server-side only — there is NO in-chat upload, deliberately).
+- **Intended ASCII / graphics differences:** corpses and overlays are
+  graphics-only; a multi-tile body follows `sprite_mode`; colour-only cells
+  are a translucent fill; a unit's colour is an outline around its sprite;
+  the image legend lists every look in the window (ASCII only top-layer
+  glyphs); layer order follows `sprite_layer_*`. Everything else must agree
+  (§2 parity pass) (530-535, 711-717).
 
-- **Anchored-aura `suspend` mode (suspend-while-dead, resume-on-revive) —
-  SHIPPED (scenarios 519-520).** A third value for the
-  `anchored_zone_on_anchor_loss` rule, alongside `delete` (default) and
-  `freeze`: `suspend` clears the aura's CELLS (it goes inert — no render, no
-  hooks, no membership) but KEEPS the anchor binding, so the aura automatically
-  RE-STAMPS around the anchor if that entity is revived from its corpse or that
-  part is healed above 0. Implementation: `_release_anchored_zones` gained the
-  `suspend` branch (`z["cells"] = set()`, binding retained); the symmetric
-  `_resume_anchored_zones(eid)` = `_restamp_anchors_for` (a no-op unless the
-  anchor is alive again, since `_stamp_anchored_zone` only re-fills for a live
-  anchor). Wiring: (1) `_process_part_death` now calls `_release_anchored_zones`
-  on the destroyed limb (this ALSO closes the original gap for delete/freeze —
-  a destroyed limb's aura now follows the rule like any other anchor loss,
-  whereas before it was left stale); (2) `damage_part`'s heal path (latch clear
-  on hp>0) calls `_resume_anchored_zones`; (3) `revive_corpse` resumes the
-  entity + its whole part subtree AFTER the revive effects + check_death settle
-  (resuming only if the entity is actually `is_alive` — a revive policy that
-  leaves it dead keeps the aura suspended). Multi-tile anchors work (the
-  footprint disc re-stamps on resume). Suspended auras serialize for free (a
-  zone with empty cells + an anchor binding). CAVEAT (documented in the rule
-  desc): a true despawn (`!ent remove`) under `suspend` leaves an inert bound
-  zone that can't resume (nothing to revive) — re-anchor or delete it manually.
-  Default stays `delete` (backward compat); `delete`/`freeze` unchanged.
+### 7.16 Matches, history and the table
 
-- **Audit-pass-12 (stability sweep, HANDS-ON): FormulaError-shadowing crash
-  fixed (scenario 521).** First pass done entirely by hand per the standing
-  directive (no survey-agent swarm) — reading subsystems + writing numeric/
-  property assertion harnesses. Verified CORRECT with harnesses (no change):
-  `side_hit`/`hit_location` geometry (4-way all facings × cardinals, 8-way
-  corner detection, the 1×1 box==center invariant over 192 source/facing
-  combos), `has_los` SYMMETRY (property test, ~7k cell-pairs × permissive/
-  strict/open, 0 asymmetric), `raycast` straight-line, the serialization
-  round-trip (idempotent `to_dict==to_dict(from_dict(to_dict))` on a complex
-  match — multi-tile + parts + path-snake + mount + suspended aura + statuses
-  + team + watchers + macros + fog + disguise — AND load-side deepcopy holds),
-  `band()` boundaries (ranges / `n` / `lo+` / `-hi`), and dice (`kh`/`kl`/
-  explode in range). One real bug fixed:
-  - **`FormulaError` UnboundLocalError in `status_cmd` (HIGH, user-facing).**
-    `vtt_commands.py` imports `FormulaError` at module level (line 23), but
-    `status_cmd` had a REDUNDANT function-local `from formula import
-    FormulaEngine, EvalCtx, FormulaError` deep in the handler (the counter
-    path). That makes `FormulaError` a function-LOCAL for the WHOLE function,
-    so the EARLIER `except FormulaError` in the `!status tick` validation path
-    raised `UnboundLocalError: cannot access local variable 'FormulaError'`
-    instead of the intended `❌ Invalid tick formula: ...`. So setting ANY
-    invalid status-tick formula (typo / unknown identifier / bad syntax)
-    crashed with a `💥`. Fixed by deleting the redundant local import; also
-    hoisted `validate_formula` into the module-level import and removed the
-    same redundant-local pattern from the tile-hook / zone-hook / status-tick
-    handlers (they were latent versions of the same shadowing class). The
-    remaining `from formula import ... as _FE/_vp/_FEng` aliased locals are
-    SAFE (an alias doesn't shadow the module name). NOTE confirmed while here:
-    a status-tick formula reads the instance level via `status_get(self,
-    status_name, 'level')` — `level` is NOT a bare binding (only `status_name`
-    is in the tick EvalCtx extras), so the validator correctly rejects a bare
-    `level` (CLAUDE.md's earlier `5*level` shorthand was illustrative).
-  - OPEN QUESTION raised with the user (LOS corner-mode consistency) → RESOLVED
-    (corner-aware, shipped): `has_los` applied the `los_corner_mode` flanker
-    check at diagonal crossings, but `first_opaque` / `raycast` walked the same
-    thin `_line_cells` path WITHOUT it — so they only agreed in `open` mode.
-    With an opaque corner-X (both flankers opaque), `has_los`=False (blocked)
-    while `first_opaque`=None and `raycast` reported the beam reaching the
-    target. The user's call: make first_opaque/raycast corner-aware so sight
-    and beams agree. Fix: factored the corner-aware walk into the single shared
-    `Match._los_stop(viewer, x1,y1,x2,y2)` → `(last_clear, blocked, blocker)`,
-    and reimplemented all three over it — `has_los` = `not _los_stop(...)[1]`,
-    `raycast` = `last_clear` (stops at the pre-corner cell on a corner-X block),
-    `first_opaque` = the on-path `blocker` if any, else `last_clear` on a corner
-    block, else None. One walk = one source of truth, so the three can never
-    drift on the corner rule again. `_line_cells` stays for the geometry-only
-    consumers (`entities_in_line_ignorelos` = walls-ignored by design;
-    `entities_on_los` was already corner-aware via per-cell `has_los`).
-    Verified: property sweep across permissive/strict/open — `first_opaque`
-    None ⇔ `has_los` clear and `raycast`==target ⇔ clear, 0 mismatches; the
-    has_los refactor left the symmetry property + full regression intact.
-    Scenario 522.
+- **Matches:** `!match new/use/list/info/bind/unbind/channels/rename/delete/
+  clone/fog/pause/resume/var/win/outcome/hosts`. `!match clone <new_id>`
+  copies everything but bindings, cameras, pending requests and history; the
+  cloner owns the copy, co-hosts and access overrides carry, and when a
+  co-host clones the original owner becomes a co-host. Ids follow `ID_RE`.
+- **Systems and rules:** a `GameSystem` holds rule overrides, tile
+  templates, functions, aliases, default vars / passives / clamps. A match
+  copies its system's rules into `match.rules` at creation and on every
+  `refresh_match_rules` (any `!system set` / `!system access`); per-match
+  settings that must survive a refresh live in their own fields
+  (`access_overrides`, `fog_enabled`, `fog_memory`, `border_*`,
+  `render_mode`, `map_coords`, ...). Rules are left out of match files on
+  disk and rebuilt from the system on load / restore.
+- **Match vars:** `!match var`, `match_var_get` / `match_var_set` /
+  `match_var_del`. **Groups:** `!ent group`, `group:<name>` selectors and
+  group moves.
+- **Roster text:** `entity_line_format`, `entity_info_format`,
+  `corpse_line_format`, `body_part_entity_line_suffix`,
+  `mount_entity_line_suffix`, `show_corpses_in_entity_list`; `{placeholder}`
+  templates over vars. Event log: `!log`, `event_log_*` rules, `log()`.
+- **Whole-server saves:** `!store save/load <name>` (admin, saves folder;
+  load is all-or-nothing); `!history export/import` (a snapshot from another
+  match restores only the board).
+- **Undo** (`match_history.py`): autosaves per round (`autosave_round_retention`),
+  turn (`autosave_turn_retention_rounds`, under ATB `_turns`), command
+  (`autosave_command_retention_turns` / `_max`), manual (`!history save`).
+  `!undo turn|round|command [N] [confirm|preview]`, `!undo to round X`,
+  `!history list/diff/restore/delete/export/import`; big undos ask for
+  `confirm` past the `undo_confirmation_*` thresholds. A restore re-copies
+  rules from the system, drops command snapshots past it, carries pending
+  requests / held commands / `paused`, and handles channel bindings per
+  `undo_channel_bindings_mode` (keep / revert / confirm, `bindings=`
+  override). The diff (`_format_snapshot_diff`) reports positions, vars,
+  statuses, names, links, tiles, zones, groups, match vars, team data, the
+  turn and "other changes". The seeded RNG position is not in snapshots
+  (user: fine).
+- **Team data:** `!team set/get/add/list/clear/passive`, `team_get/set/add`;
+  a `modifiers` bundle applies to every member.
+- **Dice and tables:** `roll("NdM±k")` with explode `!` and keep `kh<n>` /
+  `kl<n>`; `!roll`, `!roll odds` (exact distributions); `roll_table`,
+  `band`, named tables (`!table`, `table_roll`); `pick` / `shuffle`. All use
+  `Match.formula_rng()` (honours `random_seed`, replay-safe).
+- **Other:** `!help find <words>` (commands, subcommands and rules),
+  `!whoami`, `!log` (event log rules), `!state`, `!list`, `!dist`, string
+  helpers (`upper` ... `fmt`, a safe field parser), list helpers (`sum`,
+  `sorted`, `any`, `all`, `count`), `lowest_var` / `highest_var`.
 
-- **Audit-pass-13 (hands-on): ghost STATUS-TICK guard (scenario 523).** Another
-  by-hand pass — numeric/behavioral harnesses, no agent swarm. Verified CORRECT
-  with harnesses (no change), broadening the "primitives are exact" coverage:
-  the AoE/area enumerators (`entities_in_cone`/`_rect`/`_area`/`_within`,
-  `nearest_entity`, `chain_targets` — incl. footprint nearest-cell distance and
-  the chain starting from the nearest to the origin, NOT including the origin),
-  `transform` hp modes (percent/keep/full) + revert fidelity, shield/absorb
-  (`absorb_damage`/`shield_total` — priority order, tag matching, penetration),
-  the whole fog/vision stack (range, multi-tile sight UNION, fog_los blocking,
-  fog_memory `full` vs `terrain` at remembered cells), status resistance
-  (source-gating equipped-vs-inventory, sum/max/first stack, immunity, applied-
-  level reduction, full-resist no-op, `force` bypass), and an edge/crash probe
-  across dice / `roll_table` / `band` / coord extractors (every invalid input
-  is a clean FormulaError, never a 💥), plus event-bus nested-payload integrity
-  and the choice-replay exactly-once invariant (a side effect before two
-  `choose()`s applies once net despite the rollback+replay per choice). One real
-  bug fixed:
-  - **Ghost status tick after a lethal tick (MED, the missed ghost-firing
-    site).** `fire_status_tick` snapshots an entity's status NAMES so
-    status-removal mid-tick doesn't break iteration, but it never re-checked the
-    ENTITY still existed. So if status A's tick kills/removes the entity (a
-    lethal DoT — or a part tick routing `damage_part` to a vital parent), its
-    remaining statuses B, C, … still ticked "from beyond the grave": a tick
-    writing to ANOTHER entity ghost-applied (e.g. a dead unit's aura still
-    damaging others), and one reading `entity[self]` logged a spurious
-    `⚠️ status_tick FAILED: Entity '<id>' not found` (caught, no crash). This is
-    the same invariant the passes-7/8 ghost-passive guards enforce for the hook
-    / event / var-hook firing sites; the status-TICK site was the one missed.
-    Fix: `if eid not in self.entities: break` at the top of the per-status loop
-    (after the name snapshot). A non-lethal multi-status tick still fires every
-    status; only an actually-removed entity stops. Scenario 523.
+### 7.17 Entity templates
 
-- **Audit-pass-14 (hands-on): FIRST CLEAN PASS — no bug found.** Continued the
-  by-hand discipline (numeric/behavioral harnesses, no agent swarm). Hand-
-  verified TEN subsystems/interaction-combos against assertion harnesses, ALL
-  exact — no code change. This is the first pass that surfaced zero defects, a
-  signal the harness-testable engine core is solid in these zones. Verified
-  (so future passes can skip re-grinding these):
-  1. **Multi-tile push/pull/swap geometry** — a 2×2 push stops exactly at the
-     cell before a wall; push-to-edge clamps the anchor; swap of a 2×2 with a
-     1×1 exchanges anchors; pull stops adjacent to a 2-wide body.
-  2. **Segment sever modes** — `cascade` removes the cut + everything behind;
-     `split` promotes the segment behind to a new independent head (cleared
-     part/segment linkage, re-parented tail, stamped split-head template, added
-     to turn order).
-  3. **Macro/foreach substitution** — `$10`/`$11` parse as the 10th/11th arg
-     (not `$1`+"0"), `$@` expands to all args, missing `$5`→"", no
-     re-expansion of a `$2` appearing inside an arg value, foreach `$id`/`$name`.
-  4. **Mount slot math** — capacity budget, per-rider `cost` formula, `condition`
-     gate, re-seat doesn't self-block, mount-cycle guard.
-  5. **Region parts** — facing-aware footprint-region projection (front/back/
-     left/right/corners/center) rotates correctly with the parent's facing on a
-     3×3.
-  6. **resize_grid coordinate shift** — corpses-in-tile-data, anchored auras
-     (re-stamped around the shifted anchor), mounts (vehicle + carried rider),
-     and a subsequent revive all land at the shifted cells; no crash.
-  7. **Recursion/limit guards** — event-bus re-emit bounded at
-     `event_recursion_limit` (64), var-hook self-write bounded by the
-     `_var_event_depth` guard, self-referential action bounded at the recursion
-     limit (8) with a clean error — no hangs/crashes.
-  8. **Multi-feature combos** — transforming into a larger footprint re-stamps
-     the anchored aura's disc bigger (and revert shrinks it back); pushing a
-     multi-tile vehicle carries its rider AND re-stamps its aura together.
-  9. **Watchers** — edge-trigger (false→true fires once, no re-fire while true,
-     re-fires after the condition resets), `once` removal, `last` serialization.
-  10. **Corpse introspection** — `corpse_var`/`corpse_has` (nested paths +
-      default), `corpse_status_has`/`get`/`names`, large-corpse `corpse_cells`
-      footprint, and revive restoring the footprint.
-  Note: numeric primitives (damage_part, modifier fold, damage_spread, clamps,
-  side_hit, LOS/raycast, dice/band/roll_table, shields, status resistance, fog/
-  vision) were already harness-verified exact in passes 11-13. With this pass,
-  the harness-testable core is broadly covered; the likeliest remaining defect
-  surface is the Discord adapter (not harness-testable) and genuinely new code.
-
-- **Audit-pass-15 (hands-on): SECOND CLEAN PASS — no bug found.** Swept the
-  remaining untouched-by-hand areas; all exact, no code change. Verified:
-  status interaction cluster (tags, cross-status `removes`/`blocked_by` by
-  bare-name + `tag:` tokens, counters auto-removing at <=0 on `duration` AND
-  custom fields); team-level state (resources `team_get`/`set`/`add` dotted,
-  team `modifiers` aggregated per member with a non-member excluded, team
-  passives firing on the acting member, membership-change picks up the new
-  team's modifiers); tile precedence (instance `glyph`/`block`/`opaque` >
-  template > rule) + tile time-hooks firing per placed instance; alias
-  resolution (expands before the gate); batch undo grouping (a `!batch` reverts
-  as ONE history entry) + single-command + tp undo; `!find` predicates
-  (var compare, `team=`, `hp<`, `near:<id>:<r>`, `within:<x>:<y>:<r>` — all
-  footprint/Chebyshev-correct). PROCESS NOTE for future harness authors: two
-  "failures" this pass were BOTH test-harness errors, not engine bugs — (1)
-  there is NO `ent damage` subcommand (damage is `ent hp <id> <-n>`), and (2)
-  `restore_snapshot` (undo/history restore) REPLACES the Match object in
-  `mgr.matches[mid]`, so a captured `m = mgr.matches[id]` reference goes STALE
-  after an undo — always RE-FETCH `mgr.matches[id]` after a restore/undo or
-  you'll read the pre-undo object and think undo is broken. Two clean passes
-  (14-15) in a row → the harness-testable engine core is solid.
-
-- **Audit-pass-29 (hands-on, broad): gate bypass, cross-guild access, Discord
-  rendering, undo (scenarios 570-575).** Started with a harness bug (scenarios
-  230/232/236 never ran — no blank line before their headers; the harness now
-  cross-checks header lines against parsed scenarios). Fixes:
-  - **Read-only subcommand downgrade was GLOBAL → gate bypass (HIGH).**
-    `READ_ONLY_SUBCOMMANDS` applied its words to EVERY host root, so for roots
-    whose args[0] is content (`batch`, `emit`, `eval`, `run`) a player's
-    `!batch list ; ent hp boss -40` ran unapproved. Now a per-root dict of the
-    read-only subs each handler really dispatches, plus a module-end assert
-    that every key is a registered command (570).
-  - **Cross-guild / global-state access (CRITICAL, user design calls).** See
-    §3 "Server workspaces" + "Disk access is confined to the server's saves folder":
-    admin-only bot-wide commands, target-host checks, `saves/` confinement
-    (572-574). Verified before the fix: token file readable via `!run`; one
-    guild's user opened `ent` to all in another guild's match via `!system
-    access`; `!match use <id>` gave an omniscient view of another guild's
-    fogged board.
-  - **Undo dropped the approval queue (MED).** `_restore_snapshot` builds a
-    fresh Match; `pending_requests`/`_request_seq` are runtime-only, so every
-    undo silently dropped queued player requests and restarted ids at r1 — a
-    Discord Approve button still on screen then resolved a DIFFERENT request.
-    Now carried across; `_ApprovalView._pop_own` also resolves by identity (571).
-  - **Repeated `!undo command 1` was stuck (MED).** `truncate_after` kept the
-    restored command snapshot (= the current state), so each later single undo
-    re-restored it while reporting "Undid 1 command(s)". Command snapshots are
-    now dropped on restore; round/turn ones stay (they mark a START) (575).
-  - **Command autosaves had no count cap (MED, user default 100).** The turn
-    window only prunes on turn advance, so a setup phase kept a full match
-    snapshot per command (600 tile edits → 16 MB). New rule
-    `autosave_command_retention_max` (575).
-  - **Discord colored maps (MED, Discord-only).** A 30×30 viewport with ~16
-    team-colored units is >2000 chars: `_split_for_discord` split INSIDE the
-    ```ansi fence (garbage on both halves) and an over-cap board edit raised,
-    silently DROPPING the auto-update board. Splitter is now fence-aware
-    (property-tested: size, balanced fences, content preserved, no empty
-    blocks); `_board_render` degrades (no color → no legend → a message naming
-    the viewport rules); `render_ascii` emits one ANSI code per same-color RUN
-    (a colored-terrain board 4478 → 2050 chars, cells decode identical); empty
-    messages are skipped at the send chokepoint (Discord rejects them).
-  - **Graphics canvas sizing (MED).** `render_match_png` rendered at full cell
-    size then downscaled (80×80: an 8000² intermediate, 3.2 s); the GUI had no
-    cap (40×40 at 4× zoom ≈ 1 GB). `sprite_render.fit_cell_size` sizes the
-    canvas to the pixel budget first (0.33 s); GUI caps at 8000 px and pins its
-    zoom readout.
-  - **Fog reveal records piled up (LOW-MED perf).** One record per
-    `!reveal_fog`; every fog check scans them (300 permanent → 166 ms per
-    60×60 render). Records sharing an expiry now merge (23 ms).
-  - **Undo vs channel bindings (MED, fog leak → gamerule, user call).** A
-    snapshot carries `bound_channels` (incl. each channel's `pov`), but
-    `MatchManager.active_by_channel` is not snapshotted. So undoing past a
-    `!match bind pov=red` left the players' channel ACTIVE on the match but
-    UNBOUND = omniscient: their `!map` showed the fogged board in full. New rule
-    `undo_channel_bindings_mode` (enum, default `keep`): `keep` = the live
-    bindings survive every undo (bindings are setup, not game state); `revert`
-    = restore the snapshot's bindings AND detach every channel bound now but not
-    in the snapshot (a channel unbound since the snapshot is re-bound, and
-    re-pointed only if it isn't showing another match); `confirm` = when the
-    bindings differ, refuse and list the differences. Every undo/restore accepts
-    a one-call `bindings=keep|revert` override. Core: `_restore_snapshot(...,
-    bindings, notes)` + `_resolve_bindings_mode` / `_binding_diff` in
-    vtt_commands.py (577).
-  - **Smaller fixes in the same pass (576 + probes).** `!log format` edits a
-    SHARED system template → admin-only; `!log clear` → host (was open to all).
-    `!run` nesting is bounded by `macro_recursion_limit` (a self-referencing file
-    recursed until Python's stack limit). Team passives are labelled as team
-    passives in failure warnings. `saves_path` treats a cross-drive path as
-    outside `saves/` instead of raising. Discord approval buttons disable
-    themselves and say so on timeout. `bot.py` names the file it really reads
-    (`1bot_token.txt`).
-  - **Player queries respect the channel POV (HIGH fog leak → gamerule, user
-    call).** `!ent info <hidden id>` printed the full card, `!dist` located
-    hidden units, `!find`/`!foreach` listed them, `!history diff` reported their
-    changes, and `!part/!mount/!action/!passive/!clamp/!mod/!schedule` reads
-    exposed them — while `!map`/`!list` hid them. New rule
-    `pov_filters_queries` (bool, default on): under a team POV (channel binding
-    or `!as view`), `_query_eid` makes a hidden entity read exactly like a
-    missing one ("Entity '<typed>' not found"), listings skip hidden rows
-    (`_pov_hides`), a hidden rider shows as `(unseen)` in `!mount list` (the
-    capacity figure stays true), `!ent info` renders a disguise's decoy card,
-    and `!history diff` is host-only while fog or entity_visibility_condition is
-    active. Your own team's units — a body part counts as its root body's team
-    — are never hidden (a hidden rider is still yours) while the
-    `pov_own_team_visible` rule is on (default; audit-pass-35 made it a rule
-    and extended it to the map). Helpers `_query_pov` /
-    `_pov_hides` / `_query_eid` / `_acts_as_host` in vtt_commands.py. Also
-    `!part info` (full var JSON, the data `!ent dump` is host-gated for) left
-    READ_ONLY_SUBCOMMANDS — players keep `!part list` (579-580).
-  - **Formula resource bounds (HIGH, bot-wide DoS).** A formula's cost followed
-    its ARGUMENTS, and inline `$()` gives read-only formulas to every player:
-    `!dist $(9**9**9) 1 1 1` froze the bot for every guild, `'a'*10**10`
-    allocated 10 GB, and `cells_in_*` / `entities_in_rect/cone` / every sight
-    line (`has_los`, `raycast`, `entities_on_los`, ...) walked as many cells as
-    the arguments asked. `_ArithGuardTransformer` rewrites `** * + %` into
-    bounded `__safe_*` helpers before EVERY compile (ints capped at Python's
-    int-to-string digit limit, checked before computing; strings/lists at the
-    new `formula_size_limit`; `%` on a string rejected); new
-    `formula_cell_limit` caps geometry generation and `Match._check_line_budget`
-    caps sight lines. A fuzzer over every `_ALLOWED_FUNCS` +
-    `ARG_SAFE_MATCH_FUNCS` function with huge args finds nothing over 0.4 s.
-    NEW FORMULA FUNCTIONS whose cost scales with an argument need the same
-    budget (578).
-  - **Discord adapter (probe-verified with stubs).** `!<alias>` never worked on
-    Discord (only built-in roots are registered with discord.py; an alias died
-    as CommandNotFound) — `on_command_error` now routes aliases of the
-    channel's active match through `_dispatch`, ignoring other unknown `!words`
-    so other bots' commands draw no reply. `!map image` / image boards ran
-    `render_scene` in a worker thread while the event loop mutated the match
-    (and render_scene switches on the shared `_vision_memo`, which a race could
-    leave on for good) — the scene is now built on the loop (`scene_for_png`)
-    and only the pixels in the thread (`render_scene_png`). An auto-update board
-    kept refreshing after its channel was unbound, and unbound = omniscient, so
-    a team board re-posted the whole fogged map — it is now retired. Text
-    `!approve` ran the request in the HOST's channel (a player's `!match bind
-    pov=blue` re-bound the host channel) and the Approve button permanently
-    re-pointed the channel's active match — both now go through
-    `run_approved_request` (requester's channel, pointer restored).
-  - CLOSED (user: not a concern): with `random_seed` set, the seeded RNG's
-    position isn't in snapshots, so after an undo/restore the sequence restarts
-    from the seed. Leave it.
-
-- **Audit-pass-30 (hands-on, tool-driven): four reusable harnesses + fixes
-  (scenarios 579 ext, 581-593).** Techniques worth reusing (all throwaway
-  scripts, rebuild them from these descriptions):
-  1. **POV LEAK DETECTOR** — a fogged board with distinctively-named hidden
-     units (a part, a hidden rider, a corpse, an action, a status, a
-     schedule, a zone, a tile, team data), then EVERY registered root x
-     subcommand (from `registry._help[root]["subs"]`) x an argument pool run as
-     a red-POV player; replies grepped for the hidden names/values/cells after
-     stripping echoes of the typed args. ~136k invocations. Include list
-     KINDS (`commands`/`turns`) in the pool — the first version missed
-     `!history list commands` for lack of them.
-  2. **STATEFUL CHAOS** — ~70 command shapes (host + a red-POV player
-     context, undo/restore with bindings, transfer between two matches, ATB
-     toggling, disguises) on a rich board, asserting after EVERY step: no
-     dangling `part_of`/`mounted_on`/`__follows`/aura anchor, in-bounds
-     (coordinates are 1-BASED: `1 <= x <= grid_width`), turn cursor in range,
-     depth counters / vision memo / event stack at rest, JSON round-trip
-     idempotent, and manual saves never lost. Wrap every registry handler to
-     print the traceback of a non-VTTError. NOTE `!ent move <id> <n> <dir>`
-     (count first) but `!ent push <id> <dir> [n]`.
-  3. **FORMULA-FUNCTION FUZZER** — every `_ALLOWED_FUNCS`/`_MATCH_FUNC_NAMES`
-     name x wrong-typed / missing-entity / wrong-arity args under a 1 s
-     SIGALRM, classifying "Runtime error:" messages that are raw Python.
-  4. **COMMAND FUZZER** — every root x subcommand x a junk/ids/numbers/paths/
-     `$()` pool as HOST (~100k), flagging 💥 / Runtime / timeouts. Redirect
-     `vtt_commands.SAVES_DIR` to a temp dir first (it writes save files).
-  Also a MODEL-BASED undo test (random mutations + `undo command N`, checking
-  each lands on the recorded state N commands back, under retention caps
-  100/5/-1) — exact.
-  Fixes:
-  - **Failed action wiped the undo history (HIGH).** `action._rollback_match`
-    rebuilds the match from a pre-state taken WITHOUT history and copied the
-    empty `history` over the live one — every `fail()`/body exception AND
-    every interactive `choose()` replay deleted all autosaves and manual
-    saves. `history` is now preserved, and `_check_rollback_fields` raises if
-    any Match field is neither serialized nor preserved (the list went stale
-    twice) (584).
-  - **Despawn left the part subtree behind (HIGH, dangling-id class).**
-    `Entity.remove` (`!ent remove`, `!part remove`) didn't remove the body's
-    parts, leaving `part_of` naming a gone id (a later same-id entity would
-    inherit them). It now removes the subtree at the chokepoint (death and
-    transform already did). Removing or detaching a middle snake SEGMENT now
-    re-links the one behind it (`Match._splice_out_segment`); a detached
-    segment loses `__segment`/`__follows`; `copy_entity` drops a `__follows`
-    pointing outside the copied body; transform/revert keep the TARGET's own
-    segment linkage (`_SEGMENT_LINK_VARS` — a unit's place in a chain is
-    identity), and a stashed part that can't be re-placed on revert is
-    reported and the chain closes around it (581, 582, 586).
-  - **Crash replies after a lethal hook (MED).** `!ent move/push/pull`,
-    `!mount dismount`, `!ent transform/revert` looked the unit up after an
-    operation that can kill it (a lava tile's on_enter, a 0-hp transform) and
-    💥'd. AND `CommandRegistry.run` skipped the post-command bookkeeping on
-    both error branches, so a command that mutated then failed had no undo
-    entry of its own; the bookkeeping (which records only on a real state
-    change) now runs after errors too (582, 585).
-  - **More POV leaks (pov_filters_queries):** bare `!turn` listed hidden
-    units (now filtered like `!list`, disguise names; `!turn next` says "an
-    unseen unit's turn"), and `!log` / `!history list <kind>` reported hidden
-    units' events and verbatim command labels — now refused for non-hosts
-    while the view is fogged or filtered, via the shared
-    `_whole_board_read_blocked` (which also counts tile/zone/corpse visibility
-    conditions) (579).
-  - **Formula errors name the function (LOW).** `_cell_arg` for the sight
-    prims (no more "invalid literal for int()"), a radius check in
-    `entities_in_area`, `_runtime_msg` strips `FormulaEngine._namespace.
-    <locals>._` from arity errors, and a nameless summon template is named
-    after its minted id (was a bare "Runtime error: 'name'") (583).
-  - **`saves_path` refuses names Windows can't hold as files** (`:` = an NTFS
-    alternate data stream, CON/NUL/COM1…/LPT1… open DEVICES, `<>"|?*`,
-    trailing dots/spaces) (573 ext).
-  - **HOSTILE chaos mode** (the chaos harness with lethal global passives,
-    lava tiles and killing zones layered on) found the "unit removed
-    mid-operation" class, all fixed:
-    - `move_dirs` kept walking a mover a tile hook had killed (it returned
-      a log for a ghost). It now stops the moment the mover leaves
-      `m.entities` and skips the stop/moved hooks.
-    - `move_group_dirs` looked each member up with `entities[eid]` (KeyError
-      once one died) and fired stop hooks for dead members. Removed members
-      are now skipped (587).
-    - `damage_spread` routed shares to parts the cascade had already removed
-      (destroying a vital part kills the parent, which removes the siblings).
-      The whole blast rolled back. It now skips gone parts and stops when the
-      target itself is gone (588).
-    - In kill mode, `resize_grid` computed the off-grid set once, so a unit
-      that a death hook summoned into the cut region survived off-grid. It
-      now loops until nothing is off-grid (589).
-    - The `!turn next` / `!ent swap` replies say what happened when the
-      actor was removed by its own effects.
-  - **More POV:** `!map center <hidden id>` framed the camera on the hidden
-    unit, revealing its position. It now reads as "no entity" (579 ext).
-  - **Read-only forms of elevated commands.** ELEVATED_ARGS looked only at
-    args[0], so `!map layer list` / `!map teamcolor list` were queued for
-    approval with their mutating siblings. `_ELEVATED_READ_FORMS` names the
-    exact read forms that stay player-available (590).
-  - **Design calls the user made at the end of the pass (591-593):**
-    - **A unit that dies to its own turn-start effects passes the turn on.**
-      A dead unit can't hold the turn, so `Match._start_current_turn` (round
-      mode; the ATB loop does the same by charge bar) starts the next unit's
-      turn at once, logging "💀 `x` died at the start of its turn; the turn
-      passes to the next unit." The successor is the first unit after the
-      dead one in the order as it stood when its turn began; a wrap fires the
-      round hooks. Bounded by the order size. When nobody is left, `!turn
-      next` says so and shows the log (591).
-    - **A displaced located part goes to the nearest free cell** on
-      transform/revert, with a warning naming both cells; it is dropped only
-      when no cell fits. Placement is two-phase so a displaced part can't
-      take a later part's stored cell (586).
-    - **`segment_removal_mode` rule** (close default | cascade | split |
-      death; segment > head `__segment_removal_mode` > rule) decides what a
-      GM despawn of a snake segment does to the body. `!ent remove`, `!part
-      remove` and `remove_entity` go through `Match.despawn_entity`;
-      internal removals (head removal, death, transform, transfer) and `!part
-      detach` always close the chain (592).
-    - **`team_data_visibility` rule** (own default | all | host) filters
-      `!team list/get`; `!team get` is now player-available (593). `!log`
-      stays host-only under a hidden view (no per-line filtering).
-  - **`!match new <id> <name> <w> <h> <system>`** ignored the bare system
-    name and silently made a default-system match; scenarios 32/106/146/147
-    had never run under the systems they describe. The bare form now
-    selects the system; any other unknown argument is an error.
-
-- **Audit-pass-31 (hands-on): the scenario suite as a bug detector
-  (scenarios 594-595).** Technique worth reusing: list every `❌` / `⚠️`
-  reply and every "X → Y" figure in the Expected prose, and check each
-  against its scenario. Scenarios that "pass" while testing nothing hide
-  real bugs. Fixes:
-  - **Round 1 opened on the first-ADDED unit (HIGH).** `_rebuild_turn_order`
-    kept the pointer on the current unit even before the match started, so
-    whoever was added first took the first turn regardless of initiative
-    (scenario 168's prose even called it "the spawn-order quirk"). The
-    pointer now resets to the order's top until the first `!turn next`.
-    KNOWN LIMIT: a pre-start `!turn set` is lost if units are added
-    afterwards — set the opener last.
-  - **Killing the unit whose turn it is skipped the next unit (HIGH).**
-    Removal moved the pointer onto the successor; `!turn next` then fired
-    the successor's turn-end hooks and advanced past it. `Entity.remove` now
-    sets the serialized `Match.turn_vacated` ("same" | "wrap"); `next_turn`
-    skips the gone actor's turn-end and starts the successor without
-    advancing (wrapping the round if the dead unit was last);
-    `_start_current_turn`, ATB and `!turn set` consume/clear it (594).
-  - **`random_seed` ignored by `!roll` / `!table roll` / damage_spread**
-    until some formula happened to run (the seeded RNG was built lazily by
-    the formula engine). `Match.formula_rng()` is now the single accessor
-    for every caller, and the choice-replay RNG snapshot calls it too.
-  - **Silent failures in the command surface:** unknown subcommands printed
-    only help (`_help_fallback` now leads with "❌ `!x y` isn't a valid
-    command"); missing arguments did the same (now "is missing arguments");
-    mistyped `key=` options were dropped (`_check_options`: clamp, reveal_fog
-    `turns=`, store save, undo `bindings=`, bare `!map`, passive
-    `target=`/`scope=`); stray trailing words were dropped (`_check_tail` on
-    `!ent add/tp/hp/init/set_var` — an unquoted `hello world` stored
-    "hello"); 21 error replies lacked the ❌ prefix. New: `!match list`
-    (host-gated like bare `!match` back then, when it listed every match
-    bot-wide; player-available since the server-workspace split) and
-    `!match info` (this channel's match, player-available) (595).
-  - **Rotten scenarios repaired** (each "passed" while testing nothing):
-    removed subcommands (`!ent team`, `set_facing`, `list_vars`, `macro
-    def`, `turn start`), seeds set on systems that didn't exist, units
-    added before `!match use` or off-grid, value-less `set_var` used as a
-    read, a truncated scenario (107), stranded stages (13, 26), and prose
-    whose numbers were wrong (475, 545) or described the old turn order.
-  - **`name` is a reserved var path (user call, scenario 596).** A unit's
-    display name wasn't readable from formulas (`entity[x].name` errored).
-    `logic.RESERVED_VAR_PATHS` = x / y / name: entity FIELDS that read like
-    vars. `entity[x].name`, `var_get(x,'name')` and `var_has` read the real
-    name (`formula._read_entity_path`); `!find` predicates / `show:` /
-    `sort:` read the name SHOWN to the viewer's POV, so a disguise's decoy
-    name is what a fooled team searches by (`_entity_path_value`). No var
-    may exist at or under a reserved path: `Entity.write_var` refuses it
-    (`reserved_var_path_error`, pointing at `!ent rename` / `!ent tp`), as
-    do the formula writes and `!defvar add`. Renaming stays a command; a
-    formula can't rename. A nested read (`name.first`) is a ❌.
-  - Pre-start `!turn set` lost when units are added afterwards: the user
-    chose to keep this (set the opener last).
-
-- **Formula loops + list helpers, `!assert`, undo preview, `!map preview`
-  — SHIPPED (scenarios 597-608).** Five user-approved features.
-  - **`range` / `each` (597-598).** The for-loop only iterates a call to a
-    `_LOOPABLE_FUNCS` name, so counted loops and loops over a list held in a
-    local or a var were impossible. `range(stop)` / `range(start, stop[,
-    step])` (Python semantics, whole numbers only) and `each(value)` (a
-    list's items or a dict's keys) are loopable `_ALLOWED_FUNCS`, return
-    plain lists capped at `formula_size_limit` (the namespace binds the
-    match's value); iterations stay bounded by `formula_loop_limit`.
-  - **List helpers (599-600):** `sum`, `sorted(list, desc=False)`, `any`,
-    `all`, `count(list, value)` — pure, read-only (usable in `$()`). Lists
-    only (a dict error points at var_sum / var_keys); `x in lst` already
-    works for membership. A local named `count` / `sum` still shadows the
-    function as before. No subscripts: the smallest item is `min(lst)`.
-  - **`!assert [--as <eid>] "<formula>" [message]` (601-603).** Host-gated
-    like `!eval`; the formula passes the inline-`$()` read-only gate
-    (`validate_arg_safe`), so no mutation / `!func`s. False or unevaluable
-    → raises `AssertionStop` (a VTTError): the reply is `❌ Assertion
-    failed: ...`, and `dispatch_no_snapshot` returns the `ASSERT_STOP`
-    sentinel, which `!batch` / `!run` / `!foreach` / `!macro` (incl. nested
-    if/repeat blocks) check after each line, stop, report `⏹ <runner>
-    stopped: an assertion failed`, and RETURN the sentinel so an enclosing
-    runner stops too. In an action body, `cmd('assert ...')` (with `assert`
-    on action_cmd_allowlist) that fails raises ActionFail(reason="assert"),
-    rolling the action back.
-  - **Undo preview (604-605).** `preview` on any `!undo` / `!history undo`
-    form (turn / round / command / to round) shows the diff from the CURRENT
-    state to the snapshot it would restore, plus how many later autosaves
-    the undo would drop, and restores nothing (`_undo_preview`; host-only
-    under a fogged view like `!history diff`). The shared diff
-    (`_format_snapshot_diff`) had a real gap, fixed here: it looked for a
-    `position` key the entity dict never had (x / y), so `!history diff`
-    NEVER reported moves; it also ignored statuses, names, clamps,
-    part/mount links, tiles, zones, groups (a match-level dict — it read a
-    nonexistent per-entity field), match vars, team data and the turn.
-    Now all are reported, and every other changed top-level field is named
-    in an "Other changes" line (event_log excluded — it changes every
-    command).
-  - **`!map preview <burst|cone|line|rect> ...` (606-608).** Shows the cells
-    an area shape covers (same geometry as `cells_in_*`, bounded by
-    formula_cell_limit, clipped to the grid) and lists the visible units
-    inside (footprint-aware; glued / region parts and hidden riders
-    skipped). Points are `x y` or an entity id (its aoe origin — centre or
-    anchor per aoe_origin_mode); an id the channel can't see reads as
-    missing. Player-available (read-only, drawn under the channel POV).
-    ASCII (user call): cells showing a unit keep its glyph, every other
-    covered cell (terrain, zone, fog included) shows the `preview_glyph`
-    rule's character (`render_ascii(marks=, mark_glyph=)`; tracked via a
-    `unit_shown` set that the fog overlay clears); the legend says
-    "preview area". GRAPHICS (user call): translucent squares drawn ABOVE
-    units and fog — a scene `highlights` list [{cells, rgb, opacity}] drawn
-    last by `SceneRenderer._draw_highlight`; colour/opacity from the
-    `preview_color` (`r,g,b` / `#rrggbb`) / `preview_opacity` rules or
-    `color=` / `opacity=` args. Surfaces: Discord in image render mode
-    passes `highlights` to `post_scene_image`; gui.py's `GuiCtx.show_preview`
-    keeps them on the canvas until the next command; text surfaces get the
-    ASCII map.
-
-- **`!help find`, `max_grid_dimension`, `!match clone` — SHIPPED
-  (scenarios 609-612).** Three user-approved ideas.
-  - **`!help find <word> [word ...]` (609).** One search over every command,
-    subcommand (`registry._help`) and gamerule (RULES_REGISTRY): a hit needs
-    EVERY word in its name / usage / description (case-insensitive), name
-    hits list first, 15 per section (`_HELP_FIND_CAP`) then "…and N more".
-    A rule hit shows its current value on the channel's match (else the
-    built-in default). Player-available (`!help` is `all`; rule values are
-    already public via `!system info`). `!help find` with NO word is still
-    the help for the `!find` command. Only annotated subcommands are
-    searchable — `!map`'s subcommands live in its one description, so they
-    match as `!map`.
-  - **`max_grid_dimension` rule (610; resolves the pass-27 observation).**
-    Default 500, -1 = unlimited; `logic.check_grid_dimensions` refuses a
-    side over it in `MatchManager.create_match` (against the NEW match's
-    system rules) and `Match.resize_grid`. Clones and loaded saves aren't
-    re-checked. Same pass: `!match new` with a non-numeric width/height was
-    a 💥 (bare `int()`), now a clean ❌.
-  - **`!match clone <new_id> [name ...]` (611-612).** `MatchManager.
-    clone_match` = a `to_dict(include_history=False)` / `from_dict` round
-    trip under the new id (default name "<name> (copy)"), so the copy
-    shares nothing with the source — verified: every serialized field but
-    id / name / bound_channels is identical, on a board with a 2×2 vehicle
-    + rider, an anchored aura, a segment, statuses, a watcher, team data,
-    fog + reveals and an advanced turn. User calls: the channel STAYS on the
-    original (the reply names `!match use <new_id>`); the cloner becomes
-    owner, co-hosts and per-match access overrides are copied, and channel
-    bindings / per-channel camera / pending requests / undo history start
-    empty. My call on top (not asked): when a co-host clones, the source's
-    owner joins the copy's co-hosts, so every host of the original still
-    hosts the clone. Host-gated by the normal gate (it checks the channel's
-    match, which is the source).
-
-- **Small-ideas bundle: formula functions, despawn hook, five commands —
-  SHIPPED (scenarios 613-632).** Ideas 46-54, 58, 61-65 from the second
-  idea list (an `on_facing_changed` hook was dropped by the user).
-  - **Facing writes (613-614).** `set_facing(eid, dir|cw|ccw)` and
-    `face_toward(eid, target_eid | x, y | coord)` (MUTATING), plus `!ent face
-    <id> toward <eid | x y>`. All three go through `Match.set_entity_facing`
-    (the allow_diagonal_facing gate) — the old `!ent face` code was inlined.
-    `Match.facing_toward` measures from the true centre of the unit's body
-    (multi-tile aware): nearest of 8 by bearing with diagonals on, dominant
-    axis (ties vertical, like direction_to) with them off; a point at its own
-    centre → None (facing unchanged). NOTE this is angle-based, while
-    `direction_to` snaps 8-way by the SIGN of dx/dy — (5, 1) is `right` here
-    and `down_right` there. FIX found on the way: `!ent face` on a vehicle
-    left its region-slot riders on the old side (rider x/y are re-stamped
-    only on moves); set_entity_facing now calls `_restamp_riders_for` (614).
-  - **Read-only geometry (ARG_SAFE, 615-618).** `grid_width()` /
-    `grid_height()` / `in_bounds(x, y)` (formulas couldn't read the map size
-    before); `entity_distance(a, b[, mode])` (= `entity_gap_distance`, the
-    `!dist` / entities_within measure); `cell_blocked(eid, x, y[, mode])`
-    (= `cell_blocks`; off-map → True; a mode walk/tp/push/swap consults its
-    block_<mode> rule; units standing there don't count — that's
-    cell_entity) and `cell_opaque(x, y[, viewer])`; `free_cell_near(x, y,
-    radius[, eid])` → coord or None (`Match.free_cell_near`: with a unit, the
-    whole footprint in bounds, clear of OTHER units — its own body, snake
-    segments and riders ignored — and not movement-blocked; ring order like
-    `_find_free_cell_near`; (2r+1)² is charged against formula_cell_limit).
-  - **`team_members(team)` (619)** — alive, non-part units of a team in turn
-    order (then id order for units outside it). Loopable.
-  - **`pick(list)` / `shuffle(list)` (620)** — `_ALLOWED_FUNCS`, rebound to
-    the match RNG like random_int (random_seed + choose() replay). pick of an
-    empty list → None; a dict → its keys. shuffle returns a new list and is
-    loopable.
-  - **`var_copy(src, path, dest, path)` (621)** — var_move without the
-    delete (deep copy). MUTATING. A reserved path may be the source, not the
-    destination.
-  - **`on_entity_despawned` hook (623-624).** Fires from `Entity.remove`
-    (which now takes `despawn=True` and RETURNS the hook's log lines) BEFORE
-    the unit leaves, so it can still be read. Covers every non-death
-    removal: `!ent remove` / `!part remove` / remove_entity, the part subtree
-    removed with its owner, segments a sever cascades away, `!ent transfer`
-    out of the match, and the old parts a transform drops. The death pipeline
-    passes `despawn=False` (the dying unit AND the parts going into its
-    corpse); `_sever_segment(..., died=True)` keeps the destroyed segment
-    itself silent while the severed tail fires. Each remove() re-checks the
-    unit after the hook (a handler may remove or kill it); apply_statblock
-    stops cleanly if a despawn handler removes the transform target.
-  - **`!roll odds <dice> [<op> <n>]` (625)** — `formula.dice_distribution`:
-    exact integer counts by convolution; keep-highest/lowest by enumerating
-    combinations (cap `_ODDS_MAX_KEEP_COMBOS` 200k); exploding dice as floats
-    with chains under 1e-12 cut (reported with ≈); explode+keep refused; total
-    work capped by `_ODDS_MAX_STEPS`. Shows the reduced fraction; without a
-    comparison, range + average + a bar table up to 40 totals.
-  - **`!whoami` (626)** — identity, admin, channel match, role, view (incl.
-    an `!as view` preview), whether commands run directly or queue, and the
-    caller's own pending request ids.
-  - **`as=<team>` on `!map` / `!list` (and anything reading `_view_pov`)
-    (627)** — host-only one-off POV preview (`as=omniscient` = everything),
-    checked inside `_view_pov` (raises for non-hosts); the reply starts with a
-    "👁 Preview" line (`_as_note`). `!list` now rejects unknown words/options.
-  - **`!map cell <x> <y> [for=<eid>] [as=<team>]` (628-629)** — player-
-    available report of one cell under the channel POV: units (footprint
-    aware), tile data, zones, corpses, and where the block/opaque settings
-    come from (tile / template / rule; zone data / zone rule; corpse rule).
-    `for=<eid>` evaluates them for that unit using ONLY the layers the POV
-    can see (a hidden blocking zone reads as "no"); a fogged cell is just
-    "unseen (fog)".
-  - **`!ent diff <a> <b>` (630)** — host-only (shows vars like dump); reuses
-    `_diff_entity`, which gained a `words` param for the one-side labels.
-  - **`!find ... count | ids` (631)** — bare words (they can't be
-    predicates); `ids` follows `sort:`.
-  - **FIX: `!tile info` / `!tile list` showed corpses the POV can't see
-    (632).** Corpses live in tile data, so the full tile dict leaked hidden
-    bodies; `_visible_tile_data` drops corpses failing corpse_visible_to (a
-    tile holding only hidden corpses reads as no tile). Shared with
-    `!map cell`.
-
-- **Table-control bundle + `!ent hp` sets by default — SHIPPED (scenarios
-  633-645).** Ideas 77, 78, 80, 82, 84, 86, 88, 91, 92, 96, 97.
-  - **`!ent hp` SETS by default (user call, 633-634).** A bare number,
-    `=n` (the way to set a negative value), `max` (max_hp) and a bare
-    `$(expr)` set hp; a leading sign CHANGES it: `+5` heals, `-5` damages,
-    `+$(expr)` / `-$(expr)` a computed change. The ent handler keeps
-    `raw_args` (tokens before its `$()` pass) so `$(x)` resolving to -5 still
-    SETS. A set goes through heal/damage (delta = target − hp), so clamps,
-    hooks and death behave as for any hp write; the reply adds "It is at N"
-    when a clamp or a death changed the result. MIGRATION: every scenario's
-    change written as a bare positive number or bare `$()` was rewritten to
-    the signed form (`-N` lines were already changes); verified by recording
-    every unit's hp after every command on the old code vs the new — the
-    only differences were scenarios 174-175, which roll unseeded random
-    damage. GOTCHA for new scenarios / aliases / macros: `!ent hp x 5` now
-    SETS 5 — write `+5` to heal.
-  - **`!cancel [id|all]` (636)** — a requester withdraws their own queued
-    request (bare = their latest); someone else's → "a host can `!deny`".
-  - **`!match pause [reason]` / `!match resume [drop]` (637-638).**
-    `Match.paused` ({by, reason}; serialized, but `_restore_snapshot` keeps
-    the LIVE value and the pause field is ignored when deciding whether a
-    command changed state, so pause/resume are never undo steps). While
-    paused, a non-host's state-changing command is REFUSED (not queued);
-    reads still run. Rule `pause_affects_hosts` (default off, user call):
-    when on, a host's state-changing command is HELD in the runtime
-    `Match.held_commands` (carried across undo, preserved by action
-    rollback) and the bot asks to unpause — `!match resume` runs them in
-    order through `dispatch_no_snapshot` (one undo entry with the resume),
-    skipping any whose author is no longer a host; `resume drop` discards.
-    Discord: `DiscordCtxWrapper.offer_resume` posts Resume & run / Cancel
-    buttons (`_ResumeView`; Cancel drops that one held command). "State-
-    changing" = effective access other than `all`, MINUS the host-only
-    reads in `_HOST_READS` (`!assert`, `!pending`, `!ent dump/diff`, bare
-    `!match`/`list`, `!map|list|state full`, ...) and undo `preview` —
-    `_pause_control`. A new host-only READ command must be added there or a
-    pause with the rule on will hold it.
-  - **`!again` (639)** — reruns the caller's last command in the channel
-    through a fresh top-level `run()` (gate, pause, undo, watchers).
-    Recorded in `CommandRegistry.run` only at the OUTERMOST level, tracked
-    with a `contextvars` depth (`_RUN_DEPTH`) so interleaved Discord tasks
-    don't see each other's depth; approvals / held commands don't overwrite
-    it; `!again` and `!as` are never remembered. Runtime-only
-    (`mgr._last_commands`, keyed by (channel, user)).
-  - **`!tile copy <x1> <y1> <x2> <y2> [move]` (640)** — copies a cell's
-    tile data (template link, glyph, block/opaque, hooks) over another,
-    replacing it; corpses stay on their own cells on both sides.
-  - **`zone_distance(eid, zone[, mode])` (641)** — body-to-nearest-zone-cell
-    gap, 0 when overlapping, None for a cell-less (suspended) zone.
-    **`entities_at(x, y)` (642)** — every alive unit whose body covers the
-    cell, stackable ones included (`cell_entity` names only the blocker);
-    glued parts and hidden riders left out; loopable. Both ARG_SAFE.
-  - **`on_turn_skipped` hook (643, 645)** — fires on the unit right after
-    the "turn skipped" line, before the turn moves on, binding
-    `skip_status` (the responsible statuses, sorted, comma-joined; new
-    HOOK_CONTEXT name). Also under ATB. FIX found with it:
-    `_skip_to_eligible` bounded its pass with a step count, which a removal
-    mid-pass broke both ways (pass-10 fixed the over-run); it now tracks the
-    ids it has looked at and stops on reaching one again (eligible units are
-    still taken even if seen), with a cap only against an order that keeps
-    growing. A skip handler removing the last unit used to end the pass with
-    "every entity is skippable" before reaching the unit that could act.
-  - **`round_start_message_format` rule (644)** — default "— Round {round}
-    —", printed by `!turn next` at each round start (round 1 included),
-    ahead of round-start hook output. Placeholders {round}, {match},
-    {match.<path>} (missing → empty); empty = no line. (Since
-    audit-pass-33 the "It is now X's turn" summary comes LAST in the reply,
-    after the round line and hook output.) No `{first unit}`
-    placeholder on purpose: the line goes to every channel, so it could name
-    a unit a fogged channel can't see.
-  - **Harness (96/97)** — see §2: `??` / `?!` reply checks and `--review`.
-
-- **Audit-pass-32 (hands-on, freshest code first): `!again` recursion +
-  `!ent hp` reply (scenarios 646-647).** Probes, the pass-30 chaos harness
-  extended with every new command (pause/resume with the host rule
-  toggled, `!again` / alias of it, `!cancel`, tile copy, hp forms, `!map
-  cell`, `!find count/ids`, the new formula functions, clone; plus a
-  "held commands only while paused" invariant — 48 seeds normal + hostile,
-  clean), the formula fuzzer over the new functions (clean) and the
-  command fuzzer over the touched roots (37.5k runs, clean). Fixes:
-  - **`!again` recursed until Python's stack limit (HIGH).** Inside a
-    batch / macro / foreach / `!run` file / action `cmd()`, the remembered
-    command is the one CONTAINING the `again` line, so it reran its
-    container forever (`!batch eval 1 ; again` → 💥). An alias of `again`
-    was remembered under the alias name, so `!ag` reran itself. Now:
-    `dispatch_no_snapshot` refuses `again` with a ❌; `run()` skips
-    remembering when the ALIAS-RESOLVED name is again/as; a contextvar
-    `_AGAIN_ACTIVE` refuses a replay that reaches `again` again (a name that
-    became an alias of `again` after it was stored); `again` is in
-    `_SELF_DISPATCHING_COMMANDS`. `_effective_access` returns `all` for
-    `again` regardless of overrides: gating it queued the bare word, and
-    approving that replayed the APPROVER's last command.
-  - **Clicks were recorded as typed commands.** A Discord Approve button
-    (via `run_approved_request`) and the Resume button ran `registry.run`
-    at depth 0, so the click became the clicker's `!again` command. Both
-    now raise `_RUN_DEPTH` to 1 first.
-  - **Held commands ran against the holder's CURRENT match.** `!match
-    resume` dispatched each held command in its channel, which might show
-    another match by then. The re-point logic of `run_approved_request` is
-    now the shared context manager `_channel_pointed_at(mgr, ch, mid)`,
-    used by approvals, resume, and the Discord Resume button.
-  - **`!ent hp` dropped hook output and deaths (pre-existing).** heal /
-    damage went through the hp property, which discards write_var's log,
-    so on_var passives fired silently (`!ent set_var` always showed them),
-    and a lethal set said nothing about the death. The handler now writes
-    once through `write_var`, appends the hook log, adds "`x` died." when
-    the unit left the match, and rebuilds the turn order on an alive/dead
-    flip the way heal_entity / damage_entity did. Also: a doubled sign
-    (`+-5`, `--5`) is refused, an integer amount is read exactly (no float
-    round trip for long numbers), and a zero change reads "hp unchanged".
-  - `!ent move` / group move: "Unexpected token" replies lacked the ❌.
-  - Verified clean: despawn-hook re-entrancy (`remove_entity(self)` /
-    `kill(self)` in an on_entity_despawned handler), tile copy with corpses
-    on both cells + undo, ATB prints no round line, POV of `!find
-    count/ids` / `!map cell` / `!whoami` / `!match info`, `!roll odds`
-    caps and edge specs, the skip loop.
-
-- **Audit-pass-33 (hands-on): all-or-nothing body spawns + input edges
-  (scenarios 648-650).** The pass-30 POV leak detector re-run over every
-  command added since (546k invocations, extended pool: `!map cell`
-  coordinates, `for=`, `count`/`ids`, preview shapes, `status:`/`team=`/
-  `near:` selectors) — no leak (two false hits: status DEFINITION names in
-  `!status list` are match-wide setup like rules, and `!whoami` request
-  ids that contained "999"). The full command fuzzer (98k runs, every
-  root), the chaos harness (normal + hostile) and the model-based undo
-  test were clean. Fixes:
-  - **Multi-unit spawns are transactional (HIGH, dangling/duplicate
-    class).** `copy_entity` (`!ent copy` / `transfer`) spawned the body
-    into the destination unit by unit, so a located part that couldn't be
-    placed left the parts before it there (a partial duplicate beside the
-    untouched source); and a transferred unit killed by its own
-    on_entity_despawned handler as it left lived on in the destination
-    beside its corpse. The destination is now snapshotted and restored in
-    place with `action._rollback_match` on any spawn failure, and when the
-    unit dies on the way out (a NEW corpse with its id) — copy_entity then
-    returns `(None, log)` and the command reports "died as it left".
-    `!ent clone` claimed all-or-nothing but validated only anchor cells;
-    a footprint / located-part / block refusal midway left the clones made
-    so far. It now rolls the match back the same way. The transferred copy
-    is the unit as it stood when the transfer began: writes a despawn
-    handler makes to the leaving unit don't carry.
-  - **Revive drops no limbs silently.** `revive_corpse` skipped a located
-    part whose stored cell was taken, losing it for good with no message.
-    It now uses transform's two-phase placement: parts that can return do,
-    then displaced located parts (and the sub-parts glued to them) go to
-    the nearest free cell with a ⚠️ line; dropped only when nothing fits,
-    and said so.
-  - **`_parse_scalar` (every `!ent set_var` / `!defvar` / `!team set`
-    value) kept `inf` / `nan` / `Infinity` / `1e999` as non-finite
-    floats** — a word became a number that poisons comparisons and sorts.
-    Non-finite parses now stay strings. `_coerce_vital_value` caught only
-    ValueError, so writing infinity to hp leaked "cannot convert float
-    infinity to integer"; it now reads as "must be a finite number".
-  - `!roll 1d6 1d6` joined into the malformed term `1d61d6` (the usage
-    line even advertised `<dice> [<dice> ...]`): adjacent terms with no
-    operator get a clear ❌, usage reads `<dice expression>`. `!roll odds`
-    counted the span `hi - lo + 1` as "possible totals" (an exploding d6
-    never totals 6); it counts reachable totals. The diff formatter
-    (`!history diff`, undo preview, `!ent diff`) printed a missing side as
-    `- 5` (read as minus five); it is now `5 -> (unset)`.
-  - **User calls at the end of the pass (scenarios 651-653):**
-    - **Formula changes show their output.** Every formula mutator
-      (`summon*`, `kill`, `revive`, `transform`/`revert`, `remove_entity`,
-      `mount`/`dismount`/`switch_slot`, `damage_part`/`damage_spread`,
-      push/pull/swap, `move_entity`/steps, status apply/dispel/transfer,
-      `emit`, `declare_winner`, and every var write / delete incl.
-      `entity[x].path = ...`) discarded the log its Match method returned, so
-      hook output and warnings from formula-driven changes never reached
-      chat. They now go through `Match.surface_log`: inside an action, into
-      its output buffer (shown on success, dropped with a rollback);
-      otherwise into `logic.FORMULA_LOG_SINK`, a CONTEXT VARIABLE each
-      `CommandRegistry.run` sets to a fresh list and shows at its end
-      (`dispatch_no_snapshot` flushes after every inner line, so batch /
-      macro output stays in order). A contextvar, not a per-match list: on
-      Discord each message is its own asyncio task, and a shared list drained
-      after a command could hand a host's hook lines (naming hidden units) to
-      a player's command that ran while the host's awaited a send. A nested
-      run (approval, `!again`) collects its own, so the lines land in its
-      channel. No sink and no buffer (no command running) = dropped.
-      NEW formula mutators must call `match.surface_log(<log>)`.
-    - **Glued parts leave the roster by default.** Rule `roster_glued_parts`
-      (bool, default False) + per-part `__roster_show` var (true/false, wins
-      for any part, glued or not); a glued part with its own turn-order slot
-      always lists (`Match.roster_shows`, used by `!list` / `!state`).
-      `!part list` still shows every part. CLAUDE.md had claimed glued parts
-      were hidden while the code listed them.
-    - **`!turn next` reads in order:** turn-end / round lines and hook
-      output first, "It is now X's turn" last.
-    - **`!match clone` starts unpaused** (`clone_match` clears `paused`).
-    - OPEN observation: an APPROVED player command runs in the requester's
-      channel, so whatever it prints (including hook output naming units the
-      requester's POV can't see) shows there. Pre-existing; formula output
-      now adds to it. The pass-30 leak detector skipped queued commands, so
-      approved replies were never checked.
-      (On hold at the user's request.)
-
-- **Audit-pass-34 (hands-on): undo vs system rules, command interleaving,
-  typo'd modes, unbounded areas (scenarios 654-662).** Two new harnesses
-  worth reusing: a **RELOAD DIFFERENTIAL** (play the same random commands on
-  a live manager and on a `save`/`load` copy taken mid-game, compare every
-  reply and the full state each step — catches runtime-only state that
-  changes behaviour; exclude the deliberately runtime-only queues: pending
-  requests, held commands, `!again`) and a **HUGE-NUMBER TIMING FUZZER**
-  (10⁹ / -10⁹ in every numeric position of every command and every
-  state-changing formula function, under a SIGALRM). Fixes:
-  - **Undo restored the snapshot's copy of `rules` (HIGH).** Undoing past a
-    `!system set` ran that match on the old rules while the system kept the
-    new ones, until a reload re-copied them. `_restore_snapshot` now
-    re-copies the rules from the match's GameSystem (as `MatchManager.load`
-    does), and a rules-only change is not an undo step
-    (`_differs_in_undo_state`, `_NOT_UNDO_STATE` = paused + rules).
-  - **Commands interleaved on Discord (HIGH).** Each message is its own
-    asyncio task and handlers await their replies, so a second command ran
-    inside the first: its changes landed in the first one's undo step
-    (`!undo command 1` reverted both while naming one) and a `!batch` was
-    not one unit. `CommandRegistry.run` holds a per-manager `asyncio.Lock`
-    (`_command_lock(mgr)`, runtime-only), re-entrant within a task through
-    the `_HOLDS_COMMAND_LOCK` context var (approvals, `!again`, held
-    commands run nested). (Since the server-workspace split each server has
-    its own manager, so its own lock: servers don't queue behind each other.)
-  - **`!store load` was not all-or-nothing (HIGH).** It replaced the matches
-    before parsing the systems, so loading a `!history export` file (no
-    systems) wiped every match and then reported the error. `load` now
-    builds everything into locals and commits at the end; a missing default
-    system is refused; channel pointers at matches the file lacks are
-    dropped. `!history import` names a whole-bot save and refuses a
-    snapshot whose state doesn't load.
-  - **A snapshot imported from ANOTHER match installed that match's id**
-    under this match's key (two matches reporting one id; this match's
-    approval requests resolved against the other). A foreign snapshot now
-    restores only the board: id, name, owner, co-hosts, access overrides
-    and bindings stay.
-  - **Typo'd modes were silently read as a default.** `_rect_gap` (behind
-    entities_within / nearest_entity / entities_in_area / `near:` /
-    `within:` / `!dist`) read any unknown metric as Chebyshev — scenario 569
-    had passed 'hostile' as entities_within's MODE (the relation is the
-    FOURTH argument; note nearest_entity takes relation SECOND — the two
-    orders differ) and passed with no filter. damage_spread split by weight
-    on an unknown mode; a part's misspelled `to_main_cap` passed hits
-    through uncapped. All refused now. `str` rules with `choices` are
-    checked by `!system set` (they stored anything); `!ent set_var` warns
-    on an engine-read var with fixed words (`_ENGINE_VAR_RULES`).
-  - **Rule values are bounded.** Int rule schemas carry `min` / `max` /
-    `unlimited` (-1 accepted), checked by `!system set` and shown by
-    `!system rules`: `formula_cell_limit -1` used to be accepted and then
-    refuse every sight line. The 16 formula-valued rules carry `"formula":
-    "expression"|"program"` and are validated when set (they fail open at
-    use: a typo'd visibility condition showed everything); a call to an
-    unknown function is stored with a warning (a `!func` may come later).
-    A NEW int or formula rule needs these schema keys.
-  - **Cell conditions:** `!tile set / line / fill`, template data and `!zone
-    set` warn when a `block` / `opaque` value is a broken formula;
-    `_eval_block_spec` / `_eval_opaque_spec` take an `errors` list, and
-    `!map cell ... for=<unit>` names each condition that failed at use and
-    counted as "no".
-  - **Output that was dropped:** damage_part discarded both hp writes' logs
-    (a boss killed through its head died without a line) and wrote the
-    part's hp on a detached object after that death removed it;
-    `source.<path> = ...` in an action body dropped its hook output
-    (SourceProxy); formula output now precedes the watcher poll, and `!turn
-    next` puts turn-hook formula output before whose turn it is
-    (`_take_formula_log`). Engine refusals inside a formula keep their own
-    message; "Runtime error:" is kept for raw Python errors.
-  - **Unbounded loops on user numbers:** `!reveal_fog` at/rect/around,
-    `!tile fill` and `zone_fill_rect` walked the whole rectangle before
-    keeping the on-grid part (a far corner hung the bot) — now clipped while
-    built (`_grid_box`); `!tile line` checks formula_cell_limit;
-    `_find_free_cell_near` stops at the farthest grid corner; damage_spread
-    fragments are capped by formula_loop_limit. Also refused: step counts
-    below 1 (`!ent move a 0 right` moved one step), a negative reveal
-    radius, `turns=` below 1, negative status level / duration.
-  - Verified clean: 40 reload-differential seeds, the POV leak detector
-    (546k runs, only the two known false hits), the model-based undo test,
-    chaos (normal + hostile), both huge-number fuzzers, the command fuzzer
-    on every touched root, and the prose-quote check (every double-quoted
-    ❌/⚠ reply in Expected prose appears in the actual output).
-
-- **Audit-pass-35 (hands-on): object aliasing, reload/parity differentials,
-  four user calls (scenarios 663-670).** Two more reusable harnesses: the
-  reload differential EXTENDED with formula commands that move dicts between
-  units / teams / match vars / tiles (it reproduces the aliasing bug on the
-  old code), and a COMMAND-VS-FORMULA PARITY harness (each operation run as
-  `!command` and as its formula function on identical boards from several
-  starting states; end states compared). Also a POV consistency check
-  (`!list` vs `!find ids` vs `!ent info` under a fogged team view). Fixes:
-  - **Stores shared objects (HIGH).** `entity[a].inv = entity[b].inv` /
-    var_set(var_get(...)) / team_set / match_var_set / tile_set / zone_set /
-    status_set stored the SAME dict, so a write to one changed the other
-    with none of its hooks or clamps, and a save/load split them.
-    `logic._own_value` deep-copies at every store, makes dict keys strings
-    (`{1: 5}` was unreachable by the path `d.1` until a reload) and stores
-    tuples as lists.
-  - **Coordinates are lists (user call).** See the coord-return entry: a
-    tuple-returning function's result went into a var as a tuple and came
-    back from a reload as a list, so equality / `in` flipped.
-    `formula._listify` wraps every built-in function's result
-    (`_TUPLE_FREE_FUNCS`), the arith guard transformer compiles tuple VALUES
-    as lists (loop targets and dict keys keep tuples). Output shows [3, 3].
-  - **`move_step` teleported** (e.tp): no facing change, block_tp instead of
-    block_walk, no on_entity_step, a snake head left its body behind, and a
-    wall raised where the docs promise False. Now `move_dirs([(dir, 1)])`.
-    The parity harness found it; every other pair (tp, hp, kill, revive,
-    status apply/force/transfer/dispel/counter, mount/dismount, remove,
-    push/pull/swap, face, team/tile/zone writes, transform/revert, aura
-    anchor, var delete) matched.
-  - **Own-team view (user call → rule `pov_own_team_visible`, default on).**
-    `!list` dropped a team's own hidden passenger (entity_visible_to) while
-    `!turn` / `!find` / `!ent info` kept it (_pov_hides); and the map applied
-    entity_visibility_condition to a team's own units while the roster
-    didn't. `Match.own_team_unit` now makes entity_visible_to true for the
-    viewer's own units (root-body team) — map, scene, roster and queries
-    agree; a hidden rider is listed but not drawn. Off = own units follow
-    fog and the condition everywhere.
-  - **Nested writes under a value are refused everywhere (user call).** `k.x`
-    while k = 5 replaced the 5 in unit vars / team data / match vars but was
-    refused in tiles / zones / statuses; `check_no_value_ancestor` refuses
-    it in every store.
-  - **`rounding_mode` rule (user call, default half_up).** damage_part's
-    to-main share and transform's percent hp used round() (halves to even:
-    50% of 5 -> 2). `Match.round_by_rule` on exact Fractions; half_up /
-    half_even / floor / ceil. The formula round() is unchanged.
-  - **Dotted paths with an empty segment** (`.lead`, `trail.`,
-    `inventory..sword`) created keys named "" — refused by
-    `check_store_path` in every store, `!defvar add` and template data.
-  - **The bot never pings:** bot.py builds the bot with
-    `AllowedMentions.none()` (replies echo unit names and typed arguments,
-    so `@everyone` / `<@id>` text pinged the server).
-  - **A loaded match always has every rule:** `Match.from_dict` overlays the
-    snapshot's rules on DEFAULT_SYSTEM_SETTINGS (12 `rules.get(key, x)`
-    fallbacks disagree with the registry; defensive, today's restore/load
-    paths re-copy rules from the system anyway).
-  - Verified clean: the command lock can't be inherited by a spawned task
-    (only `to_thread` rendering is spawned); the Discord adapter path with
-    two concurrent messages (stub bot, discord.py 2.7.1); the POV leak
-    detector (546k runs, only the known false hits); the full command fuzzer
-    (98k runs; 4 hits are `!eval` formulas subtracting from a string); the
-    huge-number fuzzers; chaos normal + hostile; the reload differential.
-
-- **Audit-pass-36 (hands-on): wholesale var writes, stray words, a hidden
-  NameError (scenarios 671-677).** Reusable harnesses: a STORE FUZZER (every
-  read-only formula function's result written into a var, then JSON round
-  trip and equality checked — clean), a STRAY-WORD DETECTOR (every scenario
-  command re-run with an extra word appended; reports replies that are not
-  errors and don't mention it — 181 command shapes before, 10 after, all
-  variadic by design), and `pyflakes` (pip-installable; caught nothing new
-  after the fix below, run it after edits to error paths). Fixes:
-  - **Wholesale var writes skipped the write_var checks (HIGH).** Spawn
-    (summon templates, part / segment templates) and transform set a unit's
-    vars wholesale: a template `hp: 'abc'` made a unit that 💥'd `!list`, and
-    a template var `x` / `name` made a var the engine can't reach.
-    `logic.checked_unit_vars` (vital vars coerced to whole numbers or
-    refused, reserved names refused, own copy with string keys) runs in
-    `Entity.spawn` and `apply_statblock`; a transform checks BEFORE dropping
-    the old parts, and refuses a form with no hp. Skipped template parts /
-    segments now log a ⚠️ line. `!defvar add` refuses a non-number vital
-    default.
-  - **Status `level` / `duration` are number fields.** `!ent status a set
-    burn level abc` was stored and the next `!status apply` 💥'd.
-    `logic.checked_status_value` guards `!ent status set`, `!status data`
-    and status_set; stacking keeps a float level (add_level used int()); a
-    counter on a text field reports it (it read as 0 and removed the
-    status). `!ent status ... add <name> <extra>` is refused.
-  - **revive / transform / revert formula errors were a NameError (MED).**
-    Their `except (VTTError, NotFound, OutOfBounds, Occupied)` named two
-    classes formula.py never imported, so EVERY failure read "name
-    'OutOfBounds' is not defined". Now `except VTTError`.
-  - **Footprint (user call → refuse if it doesn't fit).** `!ent set_var a
-    footprint_w 3` grew a over its neighbour (which vanished from the map)
-    or off the grid, and `footprint_w 30000` hung the bot for every guild
-    (every cell walk built 9*10^8 cells). `Match.check_body_fits` (only
-    newly covered cells; glued / region parts and riders skipped) runs on a
-    footprint write in write_var and on transform; `_cap_footprint` reads a
-    side as at most grid side + 1.
-  - **Negative part damage (user call → refuse).** See the locational-damage
-    entry; also a text / infinite `to_main_percent` gives a clean message
-    (was a raw Python error) and `absolute:<n>` needs n >= 0 (a negative cap
-    healed the body on every hit). The destroyed-latch clear + aura resume
-    moved from damage_part's heal branch to write_var (a plain hp write
-    never cleared it).
-  - **Stray words (user call → central check).** See §2 "Usage strings are
-    authoritative". Annotated every unannotated subcommand (`!map` ×17,
-    `!status` ×19, `!part`, `!table`, `!team`, `!watch`, `!macro`, `!mod`,
-    ent copy/transfer, match win/outcome, tile line/fill, zone
-    anchor/unanchor/sprite), rewrote ambiguous usages (`!reveal_fog`,
-    `!ent status`, `!ent group`, `!system alias`, `!dist`, `!roll`), and
-    added handler checks where an optional slot took any word: `!undo
-    command zz` undid one command, `!ent copy a m 4` dropped the x, `!watch
-    add ... onec` made a repeating watcher. Four scenario lines were
-    themselves malformed (572 `!defvar add default ...`, 212, 569) and are
-    fixed. `!map scene full` now works (it read only args[0]) and is
-    host-only.
-  - OPEN (user: decide later): status_counter_add on a missing (∞) duration
-    removes the status — see the status-counters entry.
-
-- **String helpers, coordinate rulers, mount/status follow-ups, `!ent
-  set_vars` — SHIPPED (scenarios 678-684).** Ideas #3, #4, #81 and two parts
-  of #14 from the 2026-10 idea list. The other #14 parts: edge-aware boarding
-  REJECTED (see the mounts entry), configurable side names and per-type
-  `to_main_percent` deferred.
-  - **String helpers (678-679):** `upper`, `lower`, `strip`, `startswith`,
-    `endswith`, `split(text, sep=None)`, `join(list, sep="")`, `replace(text,
-    old, new)` and `fmt(template, a, b, ..., name=value)`. Pure
-    `_ALLOWED_FUNCS`, so usable in `$()`. `fmt` parses its own fields: only
-    `{0}` / `{name}` with a short spec (`_FMT_SPEC`: align, sign, width up to 3
-    digits, precision up to 2, a type letter), because Python's str.format
-    resolves `{0.attr}` / `{0[k]}` and would reach into objects. `replace`,
-    `join` and `fmt` size their result before building it
-    (formula_size_limit; the namespace binds the match's value). fmt's
-    internal size parameter is `_limit`, so a template field `{limit}` works.
-  - **Coordinate rulers (680; user call: default ON).** Rule `map_coords`
-    (bool, default True) + per-match `Match.map_coords` (None = rule;
-    serialized; `!map coords on|off|clear`, host-gated via ELEVATED_ARGS) +
-    one-off `!map coords=on|off`. ASCII (`Match._ascii_rulers`, in
-    `render_ascii(coords=None)` → `coords_on()`): column numbers with their
-    digits STACKED top to bottom (column 12 = 1 over 2), so every cell stays
-    one character wide, and row numbers right-aligned in a left margin;
-    1-based and viewport-aware. Graphics: the scene model carries `coords`;
-    `SceneRenderer._add_rulers` draws whole numbers in a top/left margin
-    (`ruler_margin`), and `scene_dims` counts the margins so `fit_cell_size`
-    still fits the pixel budget. Discord: the viewport default dropped from 30 to 28 (user
-    call) so a full window with rulers fits one message (~1860 characters;
-    30x30 is ~2100, over the 2000 cap). A larger window still fits through
-    the fallbacks: the auto-update board drops the rulers
-    first (then color, then legend), and a plain `!map` on a surface with
-    `ctx.message_limit` (Discord sets it) leaves them out with a note instead of
-    splitting the map. An explicit `coords=on` is kept as asked.
-  - **Mounted rider re-check on transform (682).** `apply_statblock` runs
-    `can_mount` with the NEW vars for a mounted rider (slot `condition` and
-    capacity share); `transform_rider_mismatch_mode` decides a misfit:
-    `block` refuses before any change; `eject` picks the drop cell for the new
-    body up front (refusing if none fits) and dismounts right after the swap,
-    so a refused transform never leaves the rider dismounted.
-  - **`status_transfer` keeps instance data (683).** See the dispel/transfer
-    entry.
-  - **`!ent set_vars <id> key=value ... [bypass_clamp=yes]` (684).** One
-    command and one undo step, applied in order, all-or-nothing through
-    `action._rollback_match` (a refused write sets nothing); `$()` values
-    resolve with self = the unit; duplicate keys refused; group targets
-    accepted. `_has_inline_token` now also counts `key=$(...)` for the
-    inline_args_access rule.
-  - **Two pre-existing bugs found while testing (681):** a FUNCTION used as a
-    value (`entity[a].f = min`) was stored as-is, which made the match
-    unsaveable and crashed `!ent dump` — `_own_value` (every store) now
-    refuses anything but numbers, text, bools, None, lists and dicts. And the
-    failed-save reply printed the host's absolute path; saves and history
-    exports now go through `logic.write_json_file` (build the JSON, write a
-    temp file beside the target, `os.replace`), so a failure can't truncate
-    the previous save, and the error names only `saves/<name>`.
-  - The `!map scene` summary shows `coords=on|off`.
-
-- **Container reads, flanking, nearest_cell, visible_entities, `!batch
-  strict`, selector `!` / `|`, random cells — SHIPPED (scenarios 685-697).**
-  Ideas #99-#103, #106, #109, #110 from the 2026-10 small list.
-  - **`random_cell(zone | x1, y1, x2, y2)` / `random_free_cell(zone | x1, y1,
-    x2, y2[, eid], fit='body')` (696-697).** Match RNG (random_seed, choose()
-    replay); [x, y] or None. A rectangle is clipped to the map and charged to
-    formula_cell_limit. random_free_cell returns an ANCHOR where the unit
-    passes the free_cell_near test (`Match._can_stand_at`, factored out of
-    free_cell_near: body on the map, no other unit, not cell_blocks).
-    `fit` (user call: an argument, default whole body) says how a multi-tile
-    body sits in the area: `body` (every cell inside), `center` (centre cell,
-    floored like entity_center), `any` (one cell), `anchor` (top-left cell).
-    Without eid: a random empty cell of the area. Core
-    `Match.free_anchors_in_area(area, e, fit, limit)`; candidates sorted so a
-    seeded pick reproduces; candidates × body size is charged to the limit.
-  - **`get(container, key[, default])` (685-686).** Subscripts are banned, so a
-    list or dict held in a local or read with var_get couldn't be read one
-    element at a time. `key` is a dict key, a list index (-1 = last) or a
-    dotted path ('a.1.b'; user call); a number key reads a dict's text key (dict
-    keys are text since pass-35). Missing → default, else an error (like
-    var_get). Pure `_ALLOWED_FUNCS`.
-  - **`keys(dict)` / `values(dict)` / `index_of(list, value)` /
-    `unique(list)`.** keys / values in insertion order; index_of returns None
-    when absent (user call: -1 would read as the last item in get); unique keeps
-    first positions, compares with == (lists / dicts by content via JSON).
-    keys / values / unique are loopable. Pure.
-  - **Flanking (687-688; user call: both variants + a mode rule).**
-    `flanking_angle(target, a, b[, min_angle])`: seen from the target's body
-    centre, the bearings to a's and b's body centres are at least
-    `flanking_min_angle` (rule, default 135, 0-180) apart; for a multi-tile
-    target the bearings are scaled by its half-extents like side_hit (the
-    side_hit_hitbox_mode rule). `flanking_line(target, a, b)`: the D&D rule —
-    the segment between a's and b's centres crosses the target's body through
-    two OPPOSITE sides or corners (exact: doubled coordinates + Fractions,
-    Liang-Barsky clip, then the entry/exit sides compared). A line clipping one
-    corner or touching one point doesn't flank. `flanking(target, a, b[,
-    mode])` uses the `flanking_mode` rule (angle default | line). A unit paired
-    with itself or the target never flanks; range is the GM's own check.
-  - **`nearest_cell(eid, x, y | coord | other_eid)` (689)** — the unit's body
-    cell nearest the point (or any cell of another body), by straight-line
-    distance, ties to the first cell row by row. Where a big body's breath /
-    shot starts.
-  - **`visible_entities(eid[, relation])` (690-691)** — loopable ids the unit
-    sees now, nearest first then id: some cell of the other body within its
-    vision radius with LOS from some cell of its own body (fog toggles
-    ignored, like can_see), MINUS units `entity_visibility_condition` hides
-    from the viewer's team (user call), except its own team's units
-    (pov_own_team_visible). A viewer with no team skips the stealth rule. Same
-    skip surface as entities_within (glued parts, hidden riders). Core:
-    `Match.unit_sees_unit(viewer, other, budget)`. Every sight line walked is
-    charged against formula_cell_limit for the whole call: a 40×40 viewer and
-    25 unseen 20×20 bodies used to walk ~40M lines (minutes); now a clean
-    error in under a second.
-  - **`!batch strict ...` (692-693; user call: stop AND undo).** The first
-    line whose reply has a line starting with ❌ (or a failed `!assert`) stops
-    the batch and undoes the lines before it: every match is restored in place
-    with `_rollback_match` (undo history kept), matches the batch created are
-    removed, a deleted one comes back from its snapshot (without its undo
-    history), channel pointers are restored, and rules are re-copied from the
-    systems. Bot-wide settings a line changed (`!system`, `!defvar`, ...) are
-    NOT undone. Detection wraps the ctx in `_ErrorWatchCtx` (sends pass
-    through; attribute writes reach the real ctx, so `!as` lines work); a
-    nested strict batch's ❌ reaches the outer one too. A rolled-back strict
-    batch leaves no undo step.
-  - **Selector `!` / `|` in `!find` / `!foreach` (694-695).** A leading `!`
-    negates the whole word (`!status:stunned`; `!team=red` also matches a unit
-    with no team, `team!=red` needs one); `|` separates alternatives, any of
-    which may match. An alternative that doesn't parse as a predicate reuses
-    the previous one's kind and key (user call): `team=red|green`,
-    `status:burn|poison`, `near:a:1|d:0`. `!` inside a word, an empty
-    alternative or a bare `!` is refused. `_parse_find_selector` →
-    `(negated, alternatives)`; `_find_match_entity` takes those groups,
-    `_find_all_preds` is the old single-predicate body. The POV filter runs
-    first, so a negated selector can't surface a hidden unit.
-
-- **Server workspaces + `!map ent_sight` — SHIPPED (scenarios 698-703).**
-  - **Workspace split** — see §3 "Server workspaces" for the shape. Mechanics:
-    `MatchManager(guild_key)` + `guild_name` / `workspaces` backref;
-    `logic.Workspaces` (`get` creates, `peek` doesn't, `items`, `owner_ids`);
-    `wire_commands(bot, workspaces)` with `_workspace(ctx)` per command,
-    `DM_REFUSAL`, `_load_owners` on `on_ready`; boards carry their
-    `workspace` key and `_refresh_boards_for_match` only touches its own
-    server's boards (match ids repeat across servers, so a refresh in one
-    server used to be able to retire another's board). Per-server saves via
-    `saves_path(name, mgr)`. `!system default server|channel` (no `global`,
-    no per-server map). `!match` / `!match list` player-available. New
-    `!owner servers`, `!as server <key>` (CLI / harness), `!whoami` shows
-    bot owner + server workspace. Unknown gamerules in a loaded system are
-    dropped with a console note.
-  - **`!map ent_sight <eid> [color=] [opacity=]` (701-703).** The cells one
-    unit sees right now — `Match.unit_sight_cells`: within its vision radius
-    of some body cell with a clear line from that cell (range + LOS, fog
-    toggles ignored, like can_see; a multi-tile body sees from every cell) —
-    marked like `!map preview` (shared `_show_marked_map` / `_mark_style`:
-    ASCII preview_glyph, graphics highlights) and the units it sees (minus
-    the stealth rule from its own team, as visible_entities). Under a team
-    POV a non-host may ask about their own team's units only (root body's
-    team), a hidden unit reads as missing, and marks are cut to cells the
-    POV terrain-sees (a sight shape drawn over fog would trace hidden walls);
-    hosts may ask about any unit, still under the channel POV. Work (one per
-    range check + each sight line's length) is capped by the new
-    `sight_check_limit` rule (default 1000000 ≈ 1 s, max 10000000): the
-    event loop is shared by every server.
-  - **Struck ideas (user, 2026-10):** small #7 (composable, see §1), medium
-    #156, large #44 hex grid (§1: square grid is fundamental), large #45
-    translation. Nested maps per match: wanted, later.
-
-- **Persistence, storage limits, `!server wipe`, rule ceilings, off-map
-  clipping — SHIPPED (scenarios 704-710).** PR 2 of the storage work; the
-  mechanics are in §3 "Persistence: the data folder". Also:
-  - **Ids are file-safe:** match ids, clone ids and system names must match
-    `logic.ID_RE` (letters, digits, `_`, `-`, 1-40; `check_id`), checked in
-    create / clone / create_system and `!store load` (709).
-  - **Owner commands:** `!owner limit [<global|default|<server>> <MB|reset>]`,
-    `!owner storage [<server>]` (rescans the disk), `!owner ceiling [<rule>
-    <value|reset>]` (a ceiling can't go below the rule's default). The 14
-    ceilinged rules and their defaults: formula_cell_limit 1M,
-    formula_loop_limit 100k, formula_size_limit 1M, macro_step_limit 100k,
-    macro_repeat_limit 10k, macro_recursion_limit 128, event_recursion_limit
-    128, var_hook_recursion_limit 1024, action_recursion_limit 64,
-    formula_function_recursion_limit 256, summon_event_limit 500,
-    action_choice_limit 100, max_grid_dimension 1000 (no more -1),
-    sight_check_limit 10M. The recursion ceilings were measured: just under
-    the depth where Python's own recursion limit hits at the top level (a
-    RecursionError is caught, not a crash, but it reads badly).
-  - **Clipping (710):** `has_los` / `raycast` / `first_opaque` /
-    `entities_on_los` / `entities_in_line_*` and the `cells_in_*` builders
-    (+ `entities_in_rect/cone`) walk only the map's part; off-map cells are
-    never opaque (`cell_opaque`). Verified against the old full walk on
-    48,000 random segments (all corner modes) and 120,000 area/line cases:
-    identical on the map. `cells_in_line`'s Bresenham has the closed form
-    step k → minor = b + s·max(0, ceil((2·dmin·k − dmaj)/(2·dmaj))), which
-    `_bresenham_on_map` binary-searches.
-  - **Per-server sprites:** `SpriteLoader(shared, first=<server sprites>)`;
-    the Discord adapter keeps one loader per server.
-  - Verified: a memory-equals-disk chaos harness (reload the data folder into
-    fresh workspaces after EVERY command and compare every match, history
-    index + snapshot states, channel pointers and systems) over 20 seeds incl.
-    hostile, with wipes, wipe undos, autosave cuts, rollbacks, store loads and
-    history restores in the mix; corrupt-file quarantine; ~12 ms commit per
-    command with 20 matches × 30 units.
-
-For context on the latest design conversations and rationale, read the
-descriptions of the most recently merged PRs on the repo (they're dense
-and explain the "why").
+- **What:** a server library (`MatchManager.templates`,
+  `data/<server>/templates/<name>.json`) of units saved without identity
+  (`Match.capture_template`): name, vars incl. current hp, statuses,
+  passives, clamps, facing, the part subtree. No id / x / y / links; part
+  ids, `part_of` and `__follows` relative to `TEMPLATE_ROOT` (`@root_head`);
+  part positions and snake trail vars as anchor offsets. `check_template`
+  validates every write and load (vitals, reserved names, facing, status
+  numbers, part links); a summon-style `{role: part}` dict is accepted.
+- **Name = id prefix** (user call, "for now"): template `guardsman` spawns
+  `guardsman`, `guardsman2`, ... with parts `guardsman2_head`.
+- **Spawn** (`Match.spawn_template`): summon_entity, saved facing restored,
+  parts through `_apply_statblock_parts` (which also keeps each part's
+  stored facing); all-or-nothing.
+- **Commands:** `!template save <unit> [name]` (host of the channel's match
+  or admin; needs an identity), `spawn <name> <x> <y> [near=]`, `list`,
+  `show <name> [path] [compact] [part=]`, `import <name> <json>` (create or
+  replace — the text-editor route), `set` / `unset <name> <path> [part=]`
+  (fields name / vars / status / passives / clamps / facing), `part remove`,
+  `rename`, `copy`, `delete`, `trash [name]`, `restore <name> [n]`. Changing
+  or deleting a template needs its saver (`saved_by`) or an admin; an
+  admin's edit keeps the saver; a copy is the copier's. Reads are open to
+  everyone (user call).
+- **Storage:** written when saved, outside commit / rollback / undo, loaded
+  at start even with match persistence off. Every replace or delete keeps the
+  old version in `templates/.trash/` for 24 h, counted toward the server
+  limit and cut first when room is needed (`write_template` makes room
+  BEFORE moving anything). `!server wipe all` trashes templates.
+- **Raw JSON tail:** `split_command_line` / `split_command_args` keep
+  `template import <name> <rest>` whole (```json fence or single quotes
+  dropped) on every surface; a multi-line import is one command on Discord
+  and in the GUI.
+- **Formulas:** `summon_template` / `summon_template_near` (mutating),
+  `has_template` / `template_names` (read-only), via `CURRENT_WORKSPACE`
+  (718-726).
 
 ---
-- **Entity templates (`!template`) — SHIPPED (PR 3; scenarios 718-722).**
-  A server's library of units, shared by its matches.
-  - **Format.** A template is the unit's JSON (`Match.capture_template` =
-    capture_statblock: name, vars incl. CURRENT hp, statuses, passives,
-    clamps, facing, the whole part subtree) without identity: no id / x / y
-    / part_of / mount link (`_TEMPLATE_IDENTITY_KEYS`), plus `saved_by` /
-    `saved_by_name`. Parts are a list; each part id, `part_of` and segment
-    `__follows` is rewritten relative to `TEMPLATE_ROOT` (`"@root"`):
-    `boss_head` of `boss` -> `@root_head`, `torso` -> `@root_torso`, part_of
-    the unit -> `@root`; part x / y and snake `__seg_path` / `__seg_last`
-    are offsets from the anchor. A summon-style `{role: part}` dict is
-    accepted on import.
-  - **Name = id prefix (user call, "for now").** The template name (lower
-    case, `check_id`, not a RESERVED_ID) is the id spawned units take:
-    `guardsman`, `guardsman2`, ... (mint_entity_id); parts become
-    `<new id>_head` etc.
-  - **Spawn** (`Match.spawn_template`): summon_entity (budget, minting,
-    footprint placement / near ring search, on_entity_spawned), the saved
-    facing restored, then the parts through `_apply_statblock_parts` (multi
-    level, segment relink, located parts at their offset, displaced to the
-    nearest free cell with ⚠️). All or nothing: `_rollback_match` on any
-    raise. `_apply_statblock_parts` now also restores each part's stored
-    facing (spawn used to turn it toward the map centre; transform / revive
-    benefit too).
-  - **Storage** (`storage.py`): `templates/<name>.json`, written by
-    `write_template` the moment it's saved; never through commit / rollback,
-    outside undo (no `!template` subcommand but spawn changes match state).
-    Loaded by `load_templates` from load_server AND, with match persistence
-    off, from load_all's persist-off branch. A bad file goes to corrupt/.
-    `!server wipe all` trashes templates/ (wipe matches keeps it), the undo
-    restores it, and `_wipe_blockers` names templates saved since.
-  - **Version trash (user call).** Every replace (save / import over a
-    name, an edit, a restore, a rename onto a taken name) and every delete
-    moves the old file to `templates/.trash/<stamp>-<name>.json`, kept 24 h
-    (`template_trash` prunes on read; `purge_trash` hourly). It counts
-    toward the server limit and is the FIRST thing cut when room is needed:
-    `_room_for_template` (template writes) and `Storage.commit` (before
-    autosaves) cut the oldest versions first. `write_template(keep_old=)`
-    makes room BEFORE moving the old file, so a refused write changes
-    nothing (an earlier draft trashed first and could cut the version it
-    had just trashed, losing the template from disk).
-  - **Commands:** `!template save <unit> [name]` (host of the channel's
-    match or a server admin; needs an identity, so an action's cmd() can't),
-    `spawn <name> <x> <y> [near=<r>]`, `list` / `show <name> [path]
-    [compact] [part=<part>]` / `trash [name]` (READ_ONLY_SUBCOMMANDS:
-    anyone), `import <name> <json>` (create OR replace: the text-editor
-    route is show compact → edit → import), `set <name> <path> <value>
-    [part=<part>]` / `unset <name> <path> [part=]` (path rooted at
-    `_TEMPLATE_EDIT_FIELDS`: name / vars / status / passives / clamps /
-    facing; values parsed like `!ent set_var`), `part remove <name> <part>`
-    (`logic.template_remove_part`: the part's subtree goes, a segment behind
-    it follows the next one ahead), `rename` / `copy <name> <new>`,
-    `delete`, `restore <name> [n]` (#1 = newest; the current version goes to
-    the trash). A part is named by its local name (`head` for `@root_head`,
-    `logic.template_part`) or a summon-style role. Every edit runs
-    `check_template` on the result (vitals, reserved names, facing, status
-    level / duration, part links); a refusal changes nothing. Replacing,
-    editing, renaming, deleting and restoring over an existing name need
-    the saver (`saved_by`) or a server admin; an admin's edit keeps the
-    original saver; a copy is the copier's; restoring a deleted template
-    needs that version's saver or an admin.
-  - **Raw JSON argument.** shlex would strip the JSON's quotes, so every
-    surface splits command lines through `vtt_commands.split_command_line`
-    / `split_command_args`: `template import <name> <rest>` keeps `<rest>`
-    whole (a ```json fence or surrounding single quotes dropped; parsed with
-    `strict=False`). Used by the Discord adapter (both paths; a multi-line
-    `!template import` is one command, never a paste batch), cli.py, gui.py,
-    the harness and `!run` files. A NEW command needing a raw tail goes
-    there too.
-  - **Formulas:** `summon_template(name, x, y)` /
-    `summon_template_near(name, x, y, radius)` (MUTATING, surface_log) and
-    `has_template(name)` / `template_names()` (ARG_SAFE; template_names
-    loopable). They reach the server through `logic.CURRENT_WORKSPACE`, a
-    context var `CommandRegistry._run_top` sets per command (None outside a
-    command = no templates).
 
-## 8. Final advice
+## 8. Open questions, planned work, deferred and rejected ideas
 
-**Read this whole file before doing your first edit.** The user has
-shipped 50+ PRs of work with prior Claude instances. The codebase has
-patterns. Match them. Don't reinvent.
+Check here before proposing a feature: it may be planned, deferred or
+rejected already. Update this section in the PR that resolves an item.
 
-The user is genuinely a great collaborator — clear about goals,
-decisive on design questions, appreciative of good work, blunt about
-mistakes. Build that trust by being precise and process-disciplined.
+### Agreed design, not built yet: partial templates (user, 2026-10)
 
-When you finish a task, give a **short, factual summary** of what
-shipped. Mention the regression count. Flag what you're uncertain
-about. Move on to the next thing the user asks for.
+Reusable var-subtree templates (an `axe_common` item, a `fireball` spell, an
+`orc_base` statblock) that entity templates and units reference. Every point
+below was agreed in discussion; build it as specified.
 
-Good luck. The system is fun to work on.
+- **Library:** partials share the template library and ONE namespace with
+  entity templates (a `kind` field: entity / partial); same permissions (the
+  saver or an admin edits, anyone reads); same version trash.
+- **Reference:** a protected key INSIDE the container, so it travels with it
+  (looting, `var_copy`, `item_consume`). Template-file form: `"axe":
+  {"__template": "axe_common", "damage": 8, "__removed": ["flavor"]}` —
+  override values as plain keys, deletions as tombstones. Live form on a unit:
+  the full materialized data plus `"__template": {"name": "axe_common",
+  "overrides": ["damage", "actions.chop.cost"], "removed": ["flavor"]}`.
+  Spawn converts file → live, save converts live → file. Document both
+  formats in code comments where they are built.
+- **Materialize at spawn** (never a live link: library edits must not change
+  running matches). Nested dicts merge key by key; lists are replaced whole.
+- **Override tracking at the chokepoint:** every `write_var` / `remove_var`
+  inside a marked container records the path in the NEAREST marker's
+  overrides (a delete goes to `removed`); engine-written vars (hp,
+  atb_charge, ...) are recorded too. A listed parent covers its children.
+  **Back to the norm:** if a write sets a value equal to the partial's value
+  at that moment (deep equality; the partial read through
+  `CURRENT_WORKSPACE`, resolved once per command), the path leaves the list;
+  deleting a key the partial lacks, or restoring a removed key with the base
+  value, likewise; a listed parent leaves only when its whole subtree
+  matches. A missing partial at write time = recorded. The save also drops
+  overrides equal to the current partial.
+- **Protected marker:** `!ent set_var` / formula writes to it are refused; an
+  explicit detach command turns the container into plain data.
+- **Re-sync:** `!ent resync <id> [path]` rebuilds a container from the
+  partial plus its recorded overrides.
+- **Nesting:** partials reference partials (`axe_common` → `weapon_base`),
+  with a depth limit and cycle detection; resolve base first, then each
+  override layer outward. **Whole-unit inheritance** through
+  `vars.__template` (`orc_archer` = `orc_base` + overrides) from the start.
+- **Deleting a referenced partial** lists its dependents and is refused
+  unless forced (admin). A forced delete materializes the latest version into
+  every template and partial that referenced it (reference removed); live
+  units keep their data, and saving a container whose partial is missing
+  writes it in full without the marker, with a note (re-sync refuses with
+  the same note). The deleted partial goes to the 24-hour template trash.
+- **Display:** `var_keys` hides dunder keys (loops iterate it); `!ent dump`
+  shows them. `!template show <name> expanded` prints the resolved result next
+  to the raw overrides. Disguise `vars` may reference partials.
+- **Pinning gamerule** (default OFF): a match pins the partials it actually
+  uses — copies stored as match state (serialized, in undo snapshots, kept by
+  `!match clone`), each pinned by its own name on first use after the rule is
+  on. Rule off: pins kept but unused. `!match templates` lists pins;
+  `!match templates refresh [name]` (host) drops them so the next use pins
+  the current library version; undo past a refresh restores the old pins.
+  Saves from a pinning match diff against the PINNED version and the reply
+  says when the library copy differs. `!ent transfer` / `copy` follow the
+  destination match's pins.
+- **TODO to discuss with the user afterwards:** partial references inside
+  status instances and passives (they stay template-owned in this design).
+
+### Undecided (ask before changing)
+
+- **Status counter on a missing duration:** a status with no `duration` shows
+  as ∞, but `status_counter_add(eid, name, -1)` reads it as 0 and removes the
+  status. Whether ∞ should stay ∞ is open (user: decide later).
+- **Approved commands and POV:** an approved player command runs in the
+  requester's channel, so its output (including hook lines naming units that
+  POV can't see) shows there. On hold at the user's request.
+- **ATB bar across a transform:** transform replaces vars, so the charge bar
+  resets to the new form's value. Raise it if the user wants it kept.
+- **Aura id reuse:** a suspended aura resumes around a later unit that takes
+  the old anchor's id (§7.12). Distinguishing them needs an identity concept
+  beyond ids.
+- **Path-mode snake transfer:** segments overlap early in `path` mode, so
+  transferring a fresh snake can fail with "cell occupied".
+
+### Deferred (the user wants these tracked)
+
+- **Per-server CPU work budget** (revisit before any public rollout): the
+  per-call limits multiply — 10,000 loop iterations × a 1,000-cell line on a
+  500×500 map is still ~7 s of a frozen bot for every server. Preferred
+  shape: a deterministic work counter charged per cell walked, loop
+  iteration, macro step, summon and event, per server, owner-set. Needs
+  careful decisions about compromises and abuse.
+- **Undo history disk growth:** every snapshot is a full match state; if
+  history becomes the bulk of a server's disk use, revisit retention defaults
+  or a diff-based snapshot format.
+- **Combat layers:** armor (coverage %, directional, damage-type AR vs ARP),
+  the to-hit roll (accuracy / evasion / suppression, separate from
+  hit_location), AP / FP / ARC action economy and REACTIONS (block / dodge /
+  counter during another unit's turn — the choice-replay shape is the
+  groundwork), fancier revive (regrow from a template). Interactive Discord
+  menus for `choose()` (Discord relies on `answer=` tokens today).
+- **Decide later (user):** configurable side NAMES for directional prims;
+  per-damage-type `to_main_percent`.
+- **Later:** nested maps per match (wanted); graphics mouse select / drag and
+  animation ("foreseeable future"); a per-entity ATB threshold; arbitrary /
+  L-shaped footprints and footprint rotation; per-rider footprints inside a
+  vehicle, shared vehicle fuel / initiative, positional cover for riders;
+  `trail` segment spacing > 1; more modifier context roles; elevation as a
+  rule; vision caching beyond one render; a targeting-fooling "deep illusion"
+  disguise; a force / reflect status transfer.
+- **Not interested yet:** branching (tree-shaped) snake bodies.
+
+### Rejected (don't propose again)
+
+- Autonomous entity behavior / AI of any kind (§1).
+- Hex or other non-square grids (§1).
+- A built-in boarding range or "mount only from an adjacent cell" rule (slot
+  conditions and the GM's actions decide).
+- In-chat sprite uploads (while self-hosted; revisit only with validation,
+  quotas and sandboxing).
+- A `block_entities` flag on sight lines ("a tiny body shouldn't block a shot
+  over it" — the GM composes it).
+- An "undispellable" status guard (keep such effects outside the token).
+- A built-in objectives table (win conditions are composed).
+- Live-linked partial templates (materialize instead).
+- An `on_facing_changed` hook; the minimap; struck idea-list items small #7,
+  medium #156, large #45 (translation).
+
+---
+
+## 9. Final advice
+
+Read this whole file before your first edit; the codebase has patterns, so
+match them. When you finish a task, give a short, factual summary: what
+shipped, the regression count, what you're unsure of. Keep this file a
+reference of how things work NOW: describe new behavior in §7, move resolved
+items out of §8, and put long narratives (audit passes, investigations) in
+`docs/audit_history.md` or the PR description.
+
+The user is a great collaborator — clear about goals, decisive on design,
+blunt about mistakes. Build that trust by being precise and
+process-disciplined. The system is fun to work on.
