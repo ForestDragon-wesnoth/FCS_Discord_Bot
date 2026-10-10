@@ -18,8 +18,8 @@
 # render_scene_png).
 from __future__ import annotations
 import os
+import re
 import asyncio
-import shlex
 from typing import Optional, Dict, Any, Tuple, List
 
 # The sprite loading + scene-to-image rendering live in sprite_render.py so the
@@ -31,7 +31,7 @@ from sprite_render import (
 
 from logic import LOCAL_WORKSPACE
 from storage import open_workspaces, load_local_settings, local_persistence_note
-from vtt_commands import registry, _view_pov
+from vtt_commands import registry, _view_pov, split_command_line
 
 
 # ----------------------------------------------------------------------------
@@ -121,12 +121,12 @@ class GuiApp:
         import tkinter as tk  # lazy: needs a display
         self.tk = tk
         # The local workspace, persisted to data/local/ like the CLI's when
-        # local_settings.json turns persistence on.
+        # local_settings.json turns match persistence on.
         local = load_local_settings()
         self._persist_note = local_persistence_note(local)
         if self._persist_note:
             print(self._persist_note)
-        self.workspaces = open_workspaces(persist=local["persistence"])
+        self.workspaces = open_workspaces(persist=local["match_persistence"])
         self.mgr = self.workspaces.get(LOCAL_WORKSPACE)
         self.ctx = GuiCtx(self)
         self.loader = SpriteLoader(
@@ -313,6 +313,10 @@ class GuiApp:
         self._preview = None  # a `!map preview` lasts until the next command
         self._view = None     # so does a `!map` view
         lines = [ln.strip() for ln in block.splitlines()]
+        # `!template import <name> <json>`: the pasted JSON may span lines;
+        # it's one command.
+        if re.match(r"\s*!template\s+import\s", block, re.IGNORECASE):
+            lines = [block.strip()]
         ran = False
         for line in lines:
             if not line:
@@ -334,7 +338,7 @@ class GuiApp:
             self.log("Commands must start with '!'")
             return
         try:
-            parts = shlex.split(line[1:])
+            parts = split_command_line(line[1:])
         except ValueError as e:
             self.log(f"❌ Parse error: {e}")
             return

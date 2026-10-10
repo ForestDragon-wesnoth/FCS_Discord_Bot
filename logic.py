@@ -21,6 +21,12 @@ import contextvars
 FORMULA_LOG_SINK: "contextvars.ContextVar[Optional[List[str]]]" = (
     contextvars.ContextVar("vtt_formula_log_sink", default=None))
 
+# The workspace (MatchManager) whose command is running: formulas reach the
+# server's saved entity templates through it (summon_template). Set by each
+# CommandRegistry.run; None outside a command.
+CURRENT_WORKSPACE: "contextvars.ContextVar[Optional[Any]]" = (
+    contextvars.ContextVar("vtt_current_workspace", default=None))
+
 # -------------------------
 # Exceptions
 # -------------------------
@@ -11830,6 +11836,120 @@ class Match:
         d.pop("y", None)
         return d
 
+    # ---- saved entity templates (the server's library; see MatchManager) ----
+    def capture_template(self, e: "Entity", saved_by: Optional[str] = None,
+                         saved_by_name: Optional[str] = None) -> Dict[str, Any]:
+        """A unit as a server template: its JSON (Entity.to_dict) minus its
+        identity — no id, position or mount link — with its whole body-part
+        subtree under `parts`. Part positions are stored relative to the
+        unit's anchor, and links back to the unit itself (a part's
+        `part_of`, a first segment's `__follows`) read TEMPLATE_ROOT, so the
+        template holds no unit id. Part ids are stored as TEMPLATE_ROOT +
+        their own name (`dragon_head` of `dragon` -> `@root_head`, `torso` ->
+        `@root_torso`), so a spawned `dragon2` gets `dragon2_head` and
+        `dragon2_torso`."""
+        if e.part_of:
+            raise VTTError(f"`{e.id}` is a body part — save its parent instead.")
+        d = self.capture_statblock(e)
+        ax, ay = e.x, e.y
+        Match._shift_snake_path_vars(d.get("vars") or {}, -ax, -ay)
+
+        def local(i: Any) -> Any:
+            # `dragon_head` of `dragon` -> `@root_head` and `torso` ->
+            # `@root_torso`: spawned as `<new id>_head` / `<new id>_torso`,
+            # so the second dragon's head is dragon2_head.
+            if not isinstance(i, str) or not i:
+                return i
+            if i == e.id:
+                return TEMPLATE_ROOT
+            if i.startswith(e.id + "_"):
+                return TEMPLATE_ROOT + i[len(e.id):]
+            return f"{TEMPLATE_ROOT}_{i}"
+        parts = []
+        for p in d.pop("parts", None) or []:
+            p = copy.deepcopy(p)
+            p.pop("mounted_on", None)
+            p.pop("mount_slot", None)
+            p["id"] = local(p.get("id"))
+            p["part_of"] = local(p.get("part_of"))
+            pv = p.get("vars")
+            if isinstance(pv, dict):
+                if "__follows" in pv:
+                    pv["__follows"] = local(pv["__follows"])
+                Match._shift_snake_path_vars(pv, -ax, -ay)
+            p["x"] = int(p.get("x", ax)) - ax
+            p["y"] = int(p.get("y", ay)) - ay
+            parts.append(p)
+        if parts:
+            d["parts"] = parts
+        if saved_by is not None:
+            d["saved_by"] = str(saved_by)
+        if saved_by_name is not None:
+            d["saved_by_name"] = str(saved_by_name)
+        return d
+
+    def spawn_template(self, name: str, template: Dict[str, Any], x: int, y: int,
+                       near_radius: Optional[int] = None) -> Tuple[str, List[str]]:
+        """Spawn a saved template at (x, y) (or the nearest free cell within
+        `near_radius`): the unit through summon_entity — id minted from the
+        template name (`guardsman`, `guardsman2`, ...), summon budget,
+        footprint-aware placement, on_entity_spawned — then its parts through
+        the transform path (multi-level links, segment chains, located parts
+        at their offsets, a displaced one at the nearest free cell). All or
+        nothing: the match is restored if any step raises."""
+        from action import _rollback_match
+        if not isinstance(template, dict):
+            raise VTTError(f"Template `{name}` is not an entity dict.")
+        pre = self.to_dict(include_history=False)
+        root = {k: copy.deepcopy(v) for k, v in template.items()
+                if k not in ("parts",) + _TEMPLATE_META_KEYS}
+        if not root.get("name"):
+            root["name"] = name
+        try:
+            new_id, log = self.summon_entity(root, x, y, id_prefix=name,
+                                             near_radius=near_radius)
+            e = self.entities.get(new_id)
+            if e is not None and template.get("facing") \
+                    and template.get("facing") != e.facing:
+                # A spawn faces the spawn_face_toward_center way; the
+                # template keeps the facing it was saved with.
+                try:
+                    self.set_entity_facing(e, template["facing"])
+                except VTTError as ex:
+                    log.append(f"⚠️ `{new_id}` keeps facing {e.facing}: {ex}")
+            if e is not None:
+                Match._shift_snake_path_vars(e.vars, e.x, e.y)
+                parts = copy.deepcopy(template.get("parts"))
+
+                def glob(i: Any) -> Any:
+                    if isinstance(i, str) and i.startswith(TEMPLATE_ROOT):
+                        return new_id + i[len(TEMPLATE_ROOT):]
+                    return i
+                if isinstance(parts, list):
+                    for p in parts:
+                        if not isinstance(p, dict):
+                            continue
+                        p["part_of"] = (None if p.get("part_of") in
+                                        (None, TEMPLATE_ROOT)
+                                        else glob(p.get("part_of")))
+                        if p.get("id"):
+                            p["id"] = glob(p["id"])
+                        pv = p.get("vars")
+                        if isinstance(pv, dict):
+                            if "__follows" in pv:
+                                pv["__follows"] = glob(pv["__follows"])
+                            Match._shift_snake_path_vars(pv, e.x, e.y)
+                        p["x"] = int(p.get("x", 0)) + e.x
+                        p["y"] = int(p.get("y", 0)) + e.y
+                if parts:
+                    log += self._apply_statblock_parts(e, parts)
+                    if new_id in self.entities:
+                        self._restamp_parts_for(new_id)
+        except Exception:
+            _rollback_match(self, None, pre)
+            raise
+        return new_id, log
+
     def _taken_entity_ids(self) -> "set[str]":
         """Return the set of entity ids that should be considered
         already-in-use for collision purposes. Always includes live
@@ -13128,6 +13248,11 @@ class Match:
                     slog = [f"⚠️ part `{spec['id']}` couldn't return to "
                             f"({px},{py}) ({ex}); placed at "
                             f"({near[0]},{near[1]})."] + list(slog)
+                # Spawning turns a unit the spawn_face_toward_center way; a
+                # stored part keeps the facing it had.
+                if spec.get("facing") in FACING_VECTORS \
+                        and pe.id in self.entities:
+                    pe.facing = spec["facing"]
                 log.extend(slog)
             except VTTError as ex:
                 # Malformed, or a located part with no free cell left: skip
@@ -16009,6 +16134,198 @@ def check_id(kind: str, name: Any) -> None:
 LOCAL_WORKSPACE = "local"
 
 
+# Saved entity templates. A template is a unit's JSON without its identity
+# (see Match.capture_template); its NAME is the id spawned units take.
+TEMPLATE_ROOT = "@root"
+_TEMPLATE_META_KEYS = ("saved_by", "saved_by_name")
+_TEMPLATE_IDENTITY_KEYS = ("id", "x", "y", "part_of", "mounted_on", "mount_slot")
+
+
+def check_template_name(name: Any) -> str:
+    """A template name, lower-cased: it names the file and is the id spawned
+    units take (`guardsman`, `guardsman2`, ...), so it follows the id rule;
+    lower-case so two names can't differ only by case (one file on Windows)."""
+    n = str(name).strip().lower()
+    check_id("template name", n)
+    if n in RESERVED_IDS:
+        raise VTTError(f"`{n}` is a reserved name and can't name a template.")
+    return n
+
+
+def check_template(data: Any, name: str) -> Tuple[Dict[str, Any], List[str]]:
+    """(template, notes): `data` checked as a template — what `!template
+    import` accepts and what loading a template file checks. The unit and
+    each part must build as entities (vital vars whole numbers, reserved var
+    names refused); identity fields are dropped (a template carries none)
+    and named in the notes. Parts are a list of part entity dicts (`id` =
+    a local name; `part_of` = TEMPLATE_ROOT or another part's id; `x` / `y`
+    = offsets from the unit's anchor) or a {role: part} dict as in a summon
+    template."""
+    if not isinstance(data, dict):
+        raise VTTError(f"Template `{name}` must be a JSON object, got "
+                       f"{type(data).__name__}.")
+    d = copy.deepcopy(data)
+    notes: List[str] = []
+    dropped = [k for k in _TEMPLATE_IDENTITY_KEYS if k in d]
+    for k in dropped:
+        d.pop(k)
+    if dropped:
+        notes.append(f"Dropped {', '.join(f'`{k}`' for k in dropped)}: a "
+                     f"template carries no identity or position (its name is "
+                     f"the id).")
+    for k in _TEMPLATE_META_KEYS:
+        if k in d and d[k] is not None and not isinstance(d[k], str):
+            d[k] = str(d[k])
+
+    def probe(spec: Dict[str, Any], what: str) -> None:
+        trial = copy.deepcopy(spec)
+        trial.pop("parts", None)
+        trial.pop("segments", None)
+        trial.update({"id": "probe", "x": 1, "y": 1})
+        trial.setdefault("name", name)
+        if not isinstance(trial.get("vars", {}), dict):
+            raise VTTError(f"{what}: `vars` must be an object.")
+        facing = trial.get("facing")
+        if facing is not None and facing not in FACING_VECTORS:
+            raise VTTError(f"{what}: facing `{facing}` isn't a direction "
+                           f"({', '.join(FACING_VECTORS)}).")
+        st = trial.get("status", {})
+        if not isinstance(st, dict):
+            raise VTTError(f"{what}: `status` must be an object.")
+        for sname, inst in st.items():
+            if not isinstance(inst, dict):
+                raise VTTError(f"{what}: status `{sname}` must be an object.")
+            for f in STATUS_NUMBER_FIELDS:
+                if f in inst:
+                    checked_status_value(f, inst[f],
+                                         f"{what} status `{sname}`")
+        try:
+            pe = Entity.from_dict(trial)
+            checked_unit_vars(pe.vars, ("hp", "max_hp", "initiative"), what)
+        except VTTError:
+            raise
+        except (KeyError, TypeError, ValueError, AttributeError) as ex:
+            raise VTTError(f"{what} isn't a valid unit: {ex!r}")
+    probe(d, f"Template `{name}`")
+    parts = d.get("parts")
+    if parts is not None:
+        if isinstance(parts, dict):
+            for role, pt in parts.items():
+                if not isinstance(pt, dict):
+                    raise VTTError(f"Template `{name}`: part `{role}` must be "
+                                   f"an object.")
+                probe(pt, f"Template `{name}` part `{role}`")
+        elif isinstance(parts, list):
+            ids = [p.get("id") for p in parts if isinstance(p, dict)]
+            for i, pt in enumerate(parts):
+                if not isinstance(pt, dict):
+                    raise VTTError(f"Template `{name}`: part #{i + 1} must be "
+                                   f"an object.")
+                for k in ("mounted_on", "mount_slot"):
+                    pt.pop(k, None)
+                po = pt.get("part_of", TEMPLATE_ROOT)
+                if po not in (None, TEMPLATE_ROOT) and po not in ids:
+                    raise VTTError(
+                        f"Template `{name}`: part `{pt.get('id', i + 1)}` is "
+                        f"part of `{po}`, which isn't in the template (use "
+                        f"`{TEMPLATE_ROOT}` for the unit itself).")
+                for k in ("x", "y"):
+                    v = pt.get(k, 0)
+                    if isinstance(v, bool) or not isinstance(v, int):
+                        raise VTTError(
+                            f"Template `{name}`: part `{pt.get('id', i + 1)}` "
+                            f"`{k}` must be a whole-number offset.")
+                probe(pt, f"Template `{name}` part `{pt.get('id', i + 1)}`")
+        else:
+            raise VTTError(f"Template `{name}`: `parts` must be a list or an "
+                           f"object.")
+    json_text(d)  # refuses anything JSON can't hold
+    return d, notes
+
+
+def template_part_label(pid: Any) -> str:
+    """A template part's local name as people type it: `@root_head` ->
+    `head` (other ids as stored)."""
+    p = str(pid)
+    if p.startswith(TEMPLATE_ROOT + "_"):
+        return p[len(TEMPLATE_ROOT) + 1:]
+    return p
+
+
+def template_part(tpl: Dict[str, Any], name: str, part: str
+                  ) -> Tuple[Any, Dict[str, Any]]:
+    """(key, part dict) of the part `part` names in template `tpl`: a list
+    part by its local name (`head`) or stored id (`@root_head`), a
+    {role: part} part by its role. The dict is the one in `tpl`."""
+    parts = tpl.get("parts")
+    want = str(part)
+    if isinstance(parts, dict):
+        if want in parts and isinstance(parts[want], dict):
+            return want, parts[want]
+    elif isinstance(parts, list):
+        for i, p in enumerate(parts):
+            if isinstance(p, dict) and want in (
+                    p.get("id"), template_part_label(p.get("id"))):
+                return i, p
+    names = template_part_names(tpl)
+    raise VTTError(f"Template `{name}` has no part `{want}`"
+                   + (f" (parts: {', '.join(names)})." if names
+                      else " (it has no parts)."))
+
+
+def template_part_names(tpl: Dict[str, Any]) -> List[str]:
+    parts = tpl.get("parts")
+    if isinstance(parts, dict):
+        return [str(k) for k in parts]
+    if isinstance(parts, list):
+        return [template_part_label(p.get("id")) for p in parts
+                if isinstance(p, dict)]
+    return []
+
+
+def template_remove_part(tpl: Dict[str, Any], name: str, part: str) -> List[str]:
+    """Remove part `part` from template `tpl` in place, with every part
+    attached under it (as despawning a part does). A snake segment behind a
+    removed one follows the next segment ahead, as when a segment is removed
+    in play. Returns the local names removed."""
+    key, _p = template_part(tpl, name, part)
+    parts = tpl["parts"]
+    if isinstance(parts, dict):
+        del parts[key]
+        if not parts:
+            tpl.pop("parts")
+        return [str(key)]
+    ids = [p.get("id") for p in parts]
+    gone = {ids[key]}
+    grew = True
+    while grew:
+        grew = False
+        for p in parts:
+            if p.get("part_of") in gone and p.get("id") not in gone:
+                gone.add(p.get("id"))
+                grew = True
+    ahead = {p.get("id"): (p.get("vars") or {}).get("__follows")
+             for p in parts if p.get("id") in gone}
+    keep = [p for p in parts if p.get("id") not in gone]
+    for p in keep:
+        pv = p.get("vars")
+        if not isinstance(pv, dict) or pv.get("__follows") not in gone:
+            continue
+        fol, seen = pv["__follows"], set()
+        while fol in gone and fol not in seen:
+            seen.add(fol)
+            fol = ahead.get(fol)
+        if fol:
+            pv["__follows"] = fol
+        else:
+            pv.pop("__follows", None)
+    if keep:
+        tpl["parts"] = keep
+    else:
+        tpl.pop("parts")
+    return [template_part_label(i) for i in ids if i in gone]
+
+
 class MatchManager:
     """One WORKSPACE: the game systems, matches, channel pointers and save
     folder of one Discord server (or of the local CLI / GUI). Each server
@@ -16034,6 +16351,11 @@ class MatchManager:
         }
         self.default_system_name: str = "default"
         self.default_system_per_channel: Dict[str, str] = {}
+        # Saved entity templates, by name (lower-case; the name is the id
+        # spawned units take). The server's library: shared by its matches,
+        # written to templates/<name>.json as each is saved (storage.py),
+        # outside undo.
+        self.templates: Dict[str, Dict[str, Any]] = {}
 
     # ----- game systems -----
     def list_systems(self) -> List[str]:

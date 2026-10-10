@@ -19,7 +19,12 @@ Layout under the data root (default `data/` next to the code):
         saves/                  `!store save`, `!history export`, `!run` files
         sprites/                the server's own sprites (searched before the
                                 shared sprites/ folder)
-        templates/              reserved for saved templates (future)
+        templates/<name>.json   saved entity templates (`!template`): written
+                                when saved, loaded at start — even with
+                                match persistence off
+        templates/.trash/       replaced / edited / deleted template versions,
+                                kept 24 h (`!template restore`), cut first
+                                when the server nears its limit
         corrupt/                files that failed to load, moved aside
 
 The live state is in memory (logic.Workspaces); this module mirrors it. After
@@ -47,7 +52,8 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from logic import (GameSystem, ID_RE, Match, MatchManager,
-                   RULE_CEILINGS, VTTError, Workspaces)
+                   RULE_CEILINGS, VTTError, Workspaces, check_template,
+                   check_template_name)
 from match_history import MatchHistory
 
 MB = 1024 * 1024
@@ -132,7 +138,7 @@ class Storage:
     def __init__(self, root: str, persist: bool = True):
         self.root = os.path.abspath(root)
         os.makedirs(self.root, exist_ok=True)
-        # persist=False (cli.py / gui.py with persistence off in
+        # persist=False (cli.py / gui.py with match persistence off in
         # local_settings.json): nothing is loaded from or committed to the
         # server folders; the data folder still holds the bot settings and
         # each server's saves/ and sprites/.
@@ -179,6 +185,162 @@ class Storage:
 
     def _trash_root(self) -> str:
         return os.path.join(self.root, TRASH_DIR)
+
+    def templates_dir(self, key: str) -> str:
+        return os.path.join(self.server_dir(key), "templates")
+
+    def template_file(self, key: str, name: str) -> str:
+        return os.path.join(self.templates_dir(key), f"{name}.json")
+
+    # ---- entity templates -------------------------------------------------
+    # Templates are the server's library, outside the match state: each one
+    # is written the moment it is saved and removed the moment it is deleted
+    # (never through commit / rollback), and they load at start whether or
+    # not match persistence is on.
+    # Old versions: a template that is replaced, edited or deleted keeps its
+    # previous file in templates/.trash/<stamp>-<name>.json for 24 hours
+    # (`!template trash` / `!template restore`). They count toward the
+    # server's limit and are the first thing cut when a write needs room.
+    def template_trash_dir(self, key: str) -> str:
+        return os.path.join(self.templates_dir(key), ".trash")
+
+    def write_template(self, mgr: MatchManager, name: str,
+                       data: Dict[str, Any], keep_old: bool = True
+                       ) -> Tuple[List[str], bool]:
+        """Write template `name`, first moving the file it replaces into the
+        template trash (keep_old). Returns (notes, whether an old version
+        was kept). Room is made BEFORE anything moves (old versions are cut
+        oldest first), so a refused write changes nothing on disk."""
+        key = mgr.guild_key
+        path = self.template_file(key, name)
+        text = json.dumps(data, indent=2, sort_keys=True) + "\n"
+        size = len(text.encode("utf-8"))
+        old = _file_size(path)
+        kept = keep_old and os.path.isfile(path)
+        # A kept old version still counts, so the whole new file is growth.
+        notes = self._room_for_template(key, size if kept else size - old)
+        if kept:
+            self.trash_template(mgr, name)
+            old = 0
+        _write_text(path, text)
+        self.note_written(key, path, old)
+        return notes, kept
+
+    def trash_template(self, mgr: MatchManager, name: str) -> bool:
+        """Move template `name`'s file into the template trash (no change in
+        size). False when there is no file."""
+        key = mgr.guild_key
+        path = self.template_file(key, name)
+        if not os.path.isfile(path):
+            return False
+        tdir = self.template_trash_dir(key)
+        os.makedirs(tdir, exist_ok=True)
+        stamp = time.time()
+        dest = os.path.join(tdir, f"{stamp:.6f}-{name}.json")
+        while os.path.exists(dest):
+            stamp += 0.000001
+            dest = os.path.join(tdir, f"{stamp:.6f}-{name}.json")
+        os.replace(path, dest)
+        return True
+
+    def delete_template(self, mgr: MatchManager, name: str) -> None:
+        """Move template `name` to the template trash."""
+        self.trash_template(mgr, name)
+
+    def rename_template_file(self, mgr: MatchManager, old: str,
+                             new: str) -> None:
+        key = mgr.guild_key
+        src, dest = self.template_file(key, old), self.template_file(key, new)
+        if os.path.isfile(src):
+            os.replace(src, dest)
+
+    def template_trash(self, key: str, name: Optional[str] = None
+                       ) -> List[Tuple[float, str, str]]:
+        """(time, template name, path) of server `key`'s old template
+        versions from the last 24 hours, newest first; older ones are
+        deleted on the way."""
+        tdir = self.template_trash_dir(key)
+        out: List[Tuple[float, str, str]] = []
+        if not os.path.isdir(tdir):
+            return out
+        now = time.time()
+        for fname in os.listdir(tdir):
+            stamp_s, _, rest = fname.partition("-")
+            if not rest.endswith(".json"):
+                continue
+            try:
+                stamp = float(stamp_s)
+            except ValueError:
+                continue
+            path = os.path.join(tdir, fname)
+            if now - stamp > TRASH_SECONDS:
+                size = _file_size(path)
+                _remove_path(path)
+                self._add_usage(key, -size)
+                continue
+            tname = rest[:-5]
+            if name is None or tname == name:
+                out.append((stamp, tname, path))
+        out.sort(reverse=True)
+        return out
+
+    def drop_trashed_template(self, key: str, path: str) -> None:
+        size = _file_size(path)
+        _remove_path(path)
+        self._add_usage(key, -size)
+
+    def _cut_template_trash(self, key: str, need: int) -> Tuple[int, int]:
+        """Delete server `key`'s oldest old template versions until `need`
+        bytes are freed (or none are left). Returns (count, bytes freed)."""
+        n = freed = 0
+        for _stamp, _name, path in reversed(self.template_trash(key)):
+            if freed >= need:
+                break
+            size = _file_size(path)
+            _remove_path(path)
+            self._add_usage(key, -size)
+            n += 1
+            freed += size
+        return n, freed
+
+    def _room_for_template(self, key: str, delta: int) -> List[str]:
+        if self._over_limit(key, delta) is None:
+            return []
+        n = 0
+        while self._over_limit(key, delta) is not None:
+            cut, _freed = self._cut_template_trash(key, 1)
+            if not cut:
+                break
+            n += cut
+        msg = self._over_limit(key, delta)
+        if msg:
+            raise VTTError(msg.removeprefix("❌ "))
+        return [f"🗄️ Storage limit: cut the {n} oldest old template "
+                f"version(s) to make room."] if n else []
+
+    def load_templates(self, mgr: MatchManager) -> List[str]:
+        """Read the server's templates/ folder into `mgr.templates`; a file
+        that doesn't load is moved to corrupt/."""
+        key = mgr.guild_key
+        notes: List[str] = []
+        mgr.templates = {}
+        tdir = self.templates_dir(key)
+        if not os.path.isdir(tdir):
+            return notes
+        for fname in sorted(os.listdir(tdir)):
+            if not fname.endswith(".json"):
+                continue
+            fpath = os.path.join(tdir, fname)
+            try:
+                name = check_template_name(fname[:-5])
+                if name != fname[:-5]:
+                    raise ValueError("file name isn't a template name")
+                data, _ = check_template(self._read_json(fpath), name)
+            except Exception as ex:  # noqa: BLE001 - any bad file is quarantined
+                notes.append(self._quarantine(key, fpath, type(ex).__name__))
+                continue
+            mgr.templates[name] = data
+        return notes
 
     # ---- bot settings -----------------------------------------------------
     def _load_settings(self) -> None:
@@ -280,7 +442,14 @@ class Storage:
         corrupt/ folder and everything else still loads."""
         notes: List[str] = []
         if not self.persist:
+            # Match persistence off: templates still load (they ignore it).
+            for name in sorted(os.listdir(self.root)):
+                path = os.path.join(self.root, name, "templates")
+                if os.path.isdir(path) and valid_id(name):
+                    notes.extend(self.load_templates(workspaces.get(name)))
             self.rescan()
+            for n in notes:
+                print(n)
             return notes
         self.purge_trash()
         for name in sorted(os.listdir(self.root)):
@@ -368,6 +537,7 @@ class Storage:
                 mgr.matches[mid] = m
         mgr.active_by_channel = {ch: mid for ch, mid in mgr.active_by_channel.items()
                                  if mid in mgr.matches}
+        notes.extend(self.load_templates(mgr))
         self._remember(mgr, w)
         return notes
 
@@ -552,8 +722,20 @@ class Storage:
         delta = self._plan_delta(plan)
         refusal = self._over_limit(key, delta)
         if refusal:
-            # Cut the oldest autosaves first (storage_trim_autosaves), if that
-            # alone makes room; otherwise undo the command.
+            # Old template versions go first, then the oldest autosaves
+            # (storage_trim_autosaves), if that makes room; otherwise undo
+            # the command.
+            tcut = 0
+            while self._over_limit(key, delta) is not None:
+                n, _freed = self._cut_template_trash(key, 1)
+                if not n:
+                    break
+                tcut += n
+            if tcut:
+                msgs.append(f"🗄️ Storage limit: cut the {tcut} oldest old "
+                            f"template version(s) to make room.")
+            refusal = self._over_limit(key, delta)
+        if refusal:
             cut: Dict[str, List[int]] = {}
             freed = 0
             for _ts, mid, seq, size in self._trim_candidates(mgr):
@@ -662,24 +844,29 @@ class Storage:
             self.purge_trash()
 
     def purge_trash(self) -> None:
-        """Delete trash entries older than 24 hours."""
+        """Delete trash entries (and old template versions) older than 24
+        hours."""
         self._last_trash_purge = time.time()
         root = self._trash_root()
-        if not os.path.isdir(root):
-            return
         now = time.time()
-        for server in os.listdir(root):
-            sdir = os.path.join(root, server)
-            if not os.path.isdir(sdir):
-                continue
-            for entry in os.listdir(sdir):
-                try:
-                    stamp = float(entry.split("-", 1)[0])
-                except ValueError:
+        if os.path.isdir(root):
+            for server in os.listdir(root):
+                sdir = os.path.join(root, server)
+                if not os.path.isdir(sdir):
                     continue
-                if now - stamp > TRASH_SECONDS:
-                    _remove_path(os.path.join(sdir, entry))
-        self._usage[TRASH_DIR] = _dir_size(root)
+                for entry in os.listdir(sdir):
+                    try:
+                        stamp = float(entry.split("-", 1)[0])
+                    except ValueError:
+                        continue
+                    if now - stamp > TRASH_SECONDS:
+                        _remove_path(os.path.join(sdir, entry))
+            self._usage[TRASH_DIR] = _dir_size(root)
+        # Old template versions live in each server's templates/.trash.
+        for server in os.listdir(self.root):
+            if valid_id(server) and os.path.isdir(
+                    os.path.join(self.root, server, "templates", ".trash")):
+                self.template_trash(server)
 
     def trash_entries(self, key: str) -> List[Tuple[float, str, str]]:
         """(time, scope, path) of server `key`'s trash entries, newest first."""
@@ -700,7 +887,8 @@ class Storage:
     def move_to_trash(self, mgr: MatchManager, scope: str) -> str:
         """Move the files a `!server wipe <scope>` removes into the trash and
         return the trash entry's path. `matches`: the matches folder (with
-        their histories). `all`: also systems.json and saves/. A copy of
+        their histories). `all`: also systems.json, saves/ and templates/.
+        A copy of
         workspace.json goes along so an undo can restore the channel
         pointers."""
         if not self.persist:
@@ -711,7 +899,8 @@ class Storage:
         self.commit_all_one(mgr)
         entry = os.path.join(self._trash_root(), key, f"{time.time():.3f}-{scope}")
         os.makedirs(entry, exist_ok=True)
-        moved = ["matches"] + (["systems.json", "saves"] if scope == "all" else [])
+        moved = ["matches"] + (["systems.json", "saves", "templates"]
+                               if scope == "all" else [])
         for name in moved:
             src = os.path.join(sdir, name)
             if os.path.exists(src):
@@ -746,7 +935,7 @@ class Storage:
         key = mgr.guild_key
         sdir = self.server_dir(key)
         os.makedirs(sdir, exist_ok=True)
-        for name in ("matches", "systems.json", "saves"):
+        for name in ("matches", "systems.json", "saves", "templates"):
             src = os.path.join(entry, name)
             if not os.path.exists(src):
                 continue
@@ -777,7 +966,7 @@ class Storage:
 
 DATA_DIR_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
-NO_PERSIST_WIPE = ("Persistence is off (local_settings.json), so this session "
+NO_PERSIST_WIPE = ("Match persistence is off (local_settings.json), so this session "
                    "keeps its matches in memory only: restart for a clean "
                    "state, or `!match delete <id>`. A wipe would act on the "
                    "data left on disk, which this session ignores.")
@@ -788,26 +977,29 @@ LOCAL_SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    "local_settings.json")
 _LOCAL_SETTINGS_COMMENT = [
     "Settings for cli.py and gui.py (the Discord bot always saves its data).",
-    "persistence: true = matches, undo history, game systems and channel "
-    "pointers are written to data/local after every command and loaded at "
-    "the next start.",
-    "persistence: false = every session starts empty and writes none of "
-    "that. Whatever is already in data/local is IGNORED and LEFT ON DISK "
-    "untouched; setting persistence back to true loads it again.",
-    "Either way, manual saves (!store save, !history export) go to "
-    "data/local/saves, and data/local/sprites is used.",
+    "match_persistence: true = matches, undo history, game systems and "
+    "channel pointers are written to data/local after every command and "
+    "loaded at the next start.",
+    "match_persistence: false = every session starts empty and writes none "
+    "of that. Whatever is already in data/local is IGNORED and LEFT ON DISK "
+    "untouched; setting match_persistence back to true loads it again.",
+    "Either way, entity templates (!template) are saved to and loaded from "
+    "data/local/templates, manual saves (!store save, !history export) go "
+    "to data/local/saves, and data/local/sprites is used.",
 ]
 
 
 def load_local_settings(path: str = LOCAL_SETTINGS_FILE) -> Dict[str, Any]:
-    """The local surfaces' settings: {"persistence": bool}. A missing file
-    is created with the defaults (persistence off) and its _comment notes;
-    an unreadable one is reported and the defaults are used."""
-    settings: Dict[str, Any] = {"persistence": False}
+    """The local surfaces' settings: {"match_persistence": bool}. A missing
+    file is created with the defaults (match persistence off) and its
+    _comment notes; an unreadable one is reported and the defaults are
+    used."""
+    settings: Dict[str, Any] = {"match_persistence": False}
     if not os.path.exists(path):
         try:
             _write_text(path, json.dumps(
-                {"_comment": _LOCAL_SETTINGS_COMMENT, "persistence": False},
+                {"_comment": _LOCAL_SETTINGS_COMMENT,
+                 "match_persistence": False},
                 indent=2) + "\n")
         except OSError as ex:
             print(f"⚠️ Couldn't create {os.path.basename(path)} ({ex}).")
@@ -819,26 +1011,33 @@ def load_local_settings(path: str = LOCAL_SETTINGS_FILE) -> Dict[str, Any]:
             raise ValueError("not an object")
     except (OSError, ValueError) as ex:
         print(f"⚠️ {os.path.basename(path)} couldn't be read ({ex}); "
-              f"persistence stays off.")
+              f"match persistence stays off.")
         return settings
-    val = data.get("persistence", False)
+    key = "match_persistence"
+    if key not in data and "persistence" in data:
+        print(f"⚠️ {os.path.basename(path)}: `persistence` is now called "
+              f"`match_persistence` (templates are always saved); rename it "
+              f"in the file. Using its value for now.")
+        key = "persistence"
+    val = data.get(key, False)
     if not isinstance(val, bool):
-        print(f"⚠️ {os.path.basename(path)}: `persistence` must be true or "
-              f"false; it stays off.")
+        print(f"⚠️ {os.path.basename(path)}: `match_persistence` must be "
+              f"true or false; it stays off.")
         val = False
-    settings["persistence"] = val
+    settings["match_persistence"] = val
     return settings
 
 
 def local_persistence_note(settings: Dict[str, Any]) -> Optional[str]:
-    """The startup warning while local persistence is off, else None."""
-    if settings.get("persistence"):
+    """The startup warning while local match persistence is off, else None."""
+    if settings.get("match_persistence"):
         return None
-    return ("⚠️ Persistence is off: this session's matches and undo history "
-            "are lost when you close it, and nothing already saved in "
-            "data/local is loaded (it stays on disk). Manual saves (`!store "
-            "save`) still go to data/local/saves. To keep sessions, set "
-            "\"persistence\": true in local_settings.json.")
+    return ("⚠️ Match persistence is off: this session's matches and undo "
+            "history are lost when you close it, and nothing already saved "
+            "in data/local is loaded (it stays on disk). Entity templates "
+            "(`!template`) are still saved and loaded, and manual saves "
+            "(`!store save`) still go to data/local/saves. To keep sessions, "
+            "set \"match_persistence\": true in local_settings.json.")
 
 
 def open_workspaces(root: str = DATA_DIR_DEFAULT,

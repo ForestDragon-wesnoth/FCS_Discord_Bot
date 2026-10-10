@@ -425,9 +425,11 @@ switch workspaces with `!as server <key>` (scenarios 698-700).
   summon / event firing, per SERVER, owner-set, in deterministic work units
   (not wall-clock, so scenarios stay reproducible). Revisit before any public
   rollout; it needs careful decisions about compromises and abuse.
-- **PR 3 (planned):** entity / statblock / other TEMPLATE storage per server,
-  reusable across matches. `data/<guild_id>/templates/` is reserved for it
-  (counts toward the server limit; `!server wipe all` should clear it).
+- **Entity templates per server — SHIPPED (PR 3, see the `!template` entry
+  in §7).** `MatchManager.templates`, `data/<guild_id>/templates/<name>.json`.
+- **Direct template editing — SHIPPED** (`!template set / unset / part
+  remove / rename / copy`, whole-JSON replacement through `import`, and a
+  24-hour version trash); see the `!template` entry in §7.
 
 ### Persistence: the data folder (storage.py)
 
@@ -435,7 +437,9 @@ Everything persists to `data/` (`storage.DATA_DIR_DEFAULT`, git-ignored),
 one folder per server (`local` for the CLI / GUI):
 `workspace.json` (channel pointers, default system, per-channel defaults),
 `systems.json`, `matches/<id>.json`, `matches/<id>/history/` (`index.json` +
-one `<sequence>.json` per undo snapshot), `saves/`, `sprites/`, `corrupt/`;
+one `<sequence>.json` per undo snapshot), `saves/`, `sprites/`, `templates/`
+(entity templates, outside commits; `templates/.trash/` = their replaced /
+edited / deleted versions, 24 h), `corrupt/`;
 plus `data/bot_settings.json` (owner limits + rule ceilings) and
 `data/.trash/` (wiped data, 24 h). Mechanics worth knowing:
 - **Commit after every top-level command** (`vtt_commands.persist_workspace`,
@@ -457,7 +461,8 @@ plus `data/bot_settings.json` (owner limits + rule ceilings) and
 - **Limits** (`Storage._over_limit`): per server (default 1000 MB, the whole
   server folder) and global (20 GB, everything incl. trash), owner-set with
   `!owner limit`. A commit that GROWS past a limit first cuts the server's
-  oldest autosaves (never manual saves) from matches with
+  old template versions (`templates/.trash`), then its oldest autosaves
+  (never manual saves) from matches with
   `storage_trim_autosaves` on (now OR at the last commit, so turning it off
   works over the limit); if that can't make room, `Storage.rollback` puts
   the server back to what's on disk — matches in place via
@@ -470,13 +475,17 @@ plus `data/bot_settings.json` (owner limits + rule ceilings) and
   servers the bot left is kept. On shutdown `commit_all` writes once more.
 - **cli.py / gui.py persist only when asked (user call).** They read
   `local_settings.json` beside the code (`storage.load_local_settings`;
-  created on first start with `"persistence": false` and a `_comment` list
-  explaining it — JSON has no comments; git-ignored). One switch for both.
+  created on first start with `"match_persistence": false` and a `_comment`
+  list explaining it — JSON has no comments; git-ignored; the key was
+  `persistence` until templates shipped, an old file's key still works with
+  a rename warning). One switch for both.
   Off = `open_workspaces(persist=False)`: `Storage.persist` False makes
-  load_all load no server folder and every commit a no-op, so each session
-  starts empty; whatever is in data/local is IGNORED AND LEFT ON DISK
-  (turning it back on loads it). Manual saves still go to data/local/saves
-  and data/local/sprites is still searched. `!server wipe` is refused
+  load_all load no match / system / workspace data and every commit a
+  no-op, so each session starts empty; whatever is in data/local is IGNORED
+  AND LEFT ON DISK (turning it back on loads it). Entity TEMPLATES ignore
+  the switch (user call): always written as saved and loaded at start.
+  Manual saves still go to data/local/saves and data/local/sprites is still
+  searched. `!server wipe` is refused
   (`NO_PERSIST_WIPE`: it would act on the ignored disk state); `!as restart`
   gives an empty session. A startup warning (`local_persistence_note`) is
   printed by both and shown in the GUI log. The Discord bot always persists;
@@ -4868,6 +4877,81 @@ descriptions of the most recently merged PRs on the repo (they're dense
 and explain the "why").
 
 ---
+- **Entity templates (`!template`) — SHIPPED (PR 3; scenarios 718-722).**
+  A server's library of units, shared by its matches.
+  - **Format.** A template is the unit's JSON (`Match.capture_template` =
+    capture_statblock: name, vars incl. CURRENT hp, statuses, passives,
+    clamps, facing, the whole part subtree) without identity: no id / x / y
+    / part_of / mount link (`_TEMPLATE_IDENTITY_KEYS`), plus `saved_by` /
+    `saved_by_name`. Parts are a list; each part id, `part_of` and segment
+    `__follows` is rewritten relative to `TEMPLATE_ROOT` (`"@root"`):
+    `boss_head` of `boss` -> `@root_head`, `torso` -> `@root_torso`, part_of
+    the unit -> `@root`; part x / y and snake `__seg_path` / `__seg_last`
+    are offsets from the anchor. A summon-style `{role: part}` dict is
+    accepted on import.
+  - **Name = id prefix (user call, "for now").** The template name (lower
+    case, `check_id`, not a RESERVED_ID) is the id spawned units take:
+    `guardsman`, `guardsman2`, ... (mint_entity_id); parts become
+    `<new id>_head` etc.
+  - **Spawn** (`Match.spawn_template`): summon_entity (budget, minting,
+    footprint placement / near ring search, on_entity_spawned), the saved
+    facing restored, then the parts through `_apply_statblock_parts` (multi
+    level, segment relink, located parts at their offset, displaced to the
+    nearest free cell with ⚠️). All or nothing: `_rollback_match` on any
+    raise. `_apply_statblock_parts` now also restores each part's stored
+    facing (spawn used to turn it toward the map centre; transform / revive
+    benefit too).
+  - **Storage** (`storage.py`): `templates/<name>.json`, written by
+    `write_template` the moment it's saved; never through commit / rollback,
+    outside undo (no `!template` subcommand but spawn changes match state).
+    Loaded by `load_templates` from load_server AND, with match persistence
+    off, from load_all's persist-off branch. A bad file goes to corrupt/.
+    `!server wipe all` trashes templates/ (wipe matches keeps it), the undo
+    restores it, and `_wipe_blockers` names templates saved since.
+  - **Version trash (user call).** Every replace (save / import over a
+    name, an edit, a restore, a rename onto a taken name) and every delete
+    moves the old file to `templates/.trash/<stamp>-<name>.json`, kept 24 h
+    (`template_trash` prunes on read; `purge_trash` hourly). It counts
+    toward the server limit and is the FIRST thing cut when room is needed:
+    `_room_for_template` (template writes) and `Storage.commit` (before
+    autosaves) cut the oldest versions first. `write_template(keep_old=)`
+    makes room BEFORE moving the old file, so a refused write changes
+    nothing (an earlier draft trashed first and could cut the version it
+    had just trashed, losing the template from disk).
+  - **Commands:** `!template save <unit> [name]` (host of the channel's
+    match or a server admin; needs an identity, so an action's cmd() can't),
+    `spawn <name> <x> <y> [near=<r>]`, `list` / `show <name> [path]
+    [compact] [part=<part>]` / `trash [name]` (READ_ONLY_SUBCOMMANDS:
+    anyone), `import <name> <json>` (create OR replace: the text-editor
+    route is show compact → edit → import), `set <name> <path> <value>
+    [part=<part>]` / `unset <name> <path> [part=]` (path rooted at
+    `_TEMPLATE_EDIT_FIELDS`: name / vars / status / passives / clamps /
+    facing; values parsed like `!ent set_var`), `part remove <name> <part>`
+    (`logic.template_remove_part`: the part's subtree goes, a segment behind
+    it follows the next one ahead), `rename` / `copy <name> <new>`,
+    `delete`, `restore <name> [n]` (#1 = newest; the current version goes to
+    the trash). A part is named by its local name (`head` for `@root_head`,
+    `logic.template_part`) or a summon-style role. Every edit runs
+    `check_template` on the result (vitals, reserved names, facing, status
+    level / duration, part links); a refusal changes nothing. Replacing,
+    editing, renaming, deleting and restoring over an existing name need
+    the saver (`saved_by`) or a server admin; an admin's edit keeps the
+    original saver; a copy is the copier's; restoring a deleted template
+    needs that version's saver or an admin.
+  - **Raw JSON argument.** shlex would strip the JSON's quotes, so every
+    surface splits command lines through `vtt_commands.split_command_line`
+    / `split_command_args`: `template import <name> <rest>` keeps `<rest>`
+    whole (a ```json fence or surrounding single quotes dropped; parsed with
+    `strict=False`). Used by the Discord adapter (both paths; a multi-line
+    `!template import` is one command, never a paste batch), cli.py, gui.py,
+    the harness and `!run` files. A NEW command needing a raw tail goes
+    there too.
+  - **Formulas:** `summon_template(name, x, y)` /
+    `summon_template_near(name, x, y, radius)` (MUTATING, surface_log) and
+    `has_template(name)` / `template_names()` (ARG_SAFE; template_names
+    loopable). They reach the server through `logic.CURRENT_WORKSPACE`, a
+    context var `CommandRegistry._run_top` sets per command (None outside a
+    command = no templates).
 
 ## 8. Final advice
 

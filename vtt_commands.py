@@ -15,7 +15,7 @@ from logic import (
 )
 
 # Passive system
-from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS
+from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS
 
 # Clamp system
 from logic import ClampSpec
@@ -30,6 +30,7 @@ import asyncio
 import contextlib
 import contextvars
 import json
+import shlex
 import math
 import random
 import copy
@@ -161,6 +162,9 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
     # board mutation), so players may roll a GM-defined table. def/remove stay
     # host-gated.
     "table":      frozenset({"list", "roll"}),
+    # The server's template library is readable by anyone; save / import /
+    # delete check the saver themselves, spawn changes the match.
+    "template":   frozenset({"list", "show", "trash"}),
     # team_data_visibility decides whose data a player may read.
     "team":       frozenset({"list", "get"}),
     "tile":       frozenset({"list", "info"}),
@@ -705,6 +709,9 @@ class CommandRegistry:
         # warnings), shown after it. A nested run (an approval, `!again`)
         # collects its own, so its lines land in its own channel.
         sink_token = FORMULA_LOG_SINK.set([])
+        # The server whose command this is: summon_template reaches its
+        # saved templates through it.
+        ws_token = CURRENT_WORKSPACE.set(mgr)
         try:
             # Judged on the alias-RESOLVED name: an alias of `again` stored as
             # the last command made `!again` rerun itself forever.
@@ -716,6 +723,7 @@ class CommandRegistry:
             await _flush_formula_log(ctx)
             return result
         finally:
+            CURRENT_WORKSPACE.reset(ws_token)
             FORMULA_LOG_SINK.reset(sink_token)
             _RUN_DEPTH.reset(depth_token)
 
@@ -2889,6 +2897,10 @@ def _wipe_blockers(mgr: MatchManager, scope: str) -> List[str]:
         sdir = server_saves_dir(mgr)
         if os.path.isdir(sdir) and any(os.scandir(sdir)):
             out.append("files in this server's saves folder")
+        if mgr.templates:
+            out.append("templates " + ", ".join(
+                f"`{n}`" for n in sorted(mgr.templates))
+                + " (`!template delete <name>`)")
     return out
 
 
@@ -2899,8 +2911,8 @@ def _wipe_blockers(mgr: MatchManager, scope: str) -> List[str]:
         "This server's data. `!server storage` shows how much disk it uses "
         "against its limit. `!server wipe matches|all` (server "
         "administrators) deletes every match — `all` also resets the game "
-        "systems to a fresh `default` and empties the saves folder; sprites "
-        "are kept. It asks you to type a confirmation phrase naming the "
+        "systems to a fresh `default` and empties the saves folder and the "
+        "entity templates; sprites are kept. It asks you to type a confirmation phrase naming the "
         "server within 2 minutes; the wiped data is kept 24 hours, and "
         "`!server wipe undo` brings it back. Only runs typed on its own."
     ),
@@ -2936,8 +2948,9 @@ async def server_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             "expires": time.time() + _WIPE_CONFIRM_SECONDS}
         what = ("every match on this server (with their undo history)"
                 if action == "matches" else
-                "every match, every game system (back to a fresh `default`) "
-                "and every file in the saves folder (sprites stay)")
+                "every match, every game system (back to a fresh `default`), "
+                "every file in the saves folder and every entity template "
+                "(sprites stay)")
         return await ctx.send(
             f"⚠️ This deletes {what}. Channels will show no match. The data "
             f"is kept for 24 hours (`!server wipe undo`).\nTo go ahead, type "
@@ -2969,10 +2982,12 @@ async def server_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             mgr.systems = {"default": GameSystem("default", settings={})}
             mgr.default_system_name = "default"
             mgr.default_system_per_channel = {}
+            mgr.templates = {}
         tail = ("Changed your mind? `!server wipe undo` within 24 hours."
                 if st is not None else
                 "This bot keeps nothing on disk, so it can't be undone.")
-        what = f"{n} match(es)" + (", the game systems and the saves folder"
+        what = f"{n} match(es)" + (", the game systems, the saves folder "
+                                   "and the templates"
                                    if scope == "all" else "")
         return await ctx.send(f"🧹 Wiped {what}. {tail}")
     if action == "undo":
@@ -2994,8 +3009,8 @@ async def server_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         st.restore_from_trash(mgr, path, scope)
         return await ctx.send(
             f"♻️ Undid the wipe ({scope}): {len(mgr.matches)} match(es) "
-            f"back" + (", with the game systems and saves" if scope == "all"
-                       else "") + ".")
+            f"back" + (", with the game systems, saves and templates"
+                       if scope == "all" else "") + ".")
     return await _help_fallback(ctx, ["server", "wipe"], args[1])
 
 
@@ -3003,9 +3018,543 @@ registry.annotate_sub("server", "storage", usage="!server storage",
                       desc="This server's disk use against its storage limit.")
 registry.annotate_sub("server", "wipe",
                       usage="!server wipe <matches | all | confirm <phrase ...> | undo>",
-                      desc="Delete the server's matches (`all`: also systems "
-                           "and saves) after a typed confirmation; `undo` "
+                      desc="Delete the server's matches (`all`: also systems, "
+                           "saves and templates) after a typed confirmation; `undo` "
                            "within 24 hours.")
+
+
+# ---- saved entity templates (the server's library) -------------------------
+# `!template import <name> <json>` takes the rest of the line as raw JSON:
+# shlex would strip its quotes. The surfaces split command lines through
+# split_command_args, which keeps that tail whole.
+_RAW_JSON_TAIL = re.compile(r"^\s*(import)\s+(\S+)\s+(.+?)\s*$",
+                            re.IGNORECASE | re.DOTALL)
+
+
+def split_command_args(root: str, tail: str) -> List[str]:
+    """A command's arguments from the text after its root word: shlex, except
+    that `!template import <name> <json>` keeps the JSON as one argument (a
+    surrounding ```json fence or single quotes are dropped)."""
+    if root.strip().lower() == "template":
+        m = _RAW_JSON_TAIL.match(tail)
+        if m:
+            raw = m.group(3)
+            fence = re.match(r"^```[a-zA-Z]*\s*(.*?)\s*```$", raw, re.DOTALL)
+            if fence:
+                raw = fence.group(1)
+            elif len(raw) >= 2 and raw[0] == raw[-1] == "'":
+                raw = raw[1:-1]
+            return [m.group(1), m.group(2).strip("'\""), raw]
+    return shlex.split(tail)
+
+
+def split_command_line(line: str) -> List[str]:
+    """[root, args...] of a command line (no leading `!`)."""
+    parts = line.strip().split(None, 1)
+    if not parts:
+        return []
+    return [parts[0]] + split_command_args(parts[0],
+                                           parts[1] if len(parts) > 1 else "")
+
+
+def _template_saver_ok(ctx: ReplyContext, tpl: Dict[str, Any]) -> bool:
+    """Whether the caller may replace or delete `tpl`: its saver, or a server
+    administrator."""
+    if ctx_is_admin(ctx):
+        return True
+    user = ctx_user(ctx)
+    return user is not None and tpl.get("saved_by") == user
+
+
+def _template_may_save(ctx: ReplyContext, mgr: MatchManager) -> None:
+    """Saving a template needs a host of this channel's match (or a server
+    administrator), and an identity to record as its saver."""
+    if ctx_user(ctx) is None:
+        raise VTTError("Templates can only be saved by a person typing the "
+                       "command (an action body has no one to record as the "
+                       "saver).")
+    if ctx_is_admin(ctx):
+        return
+    mid = mgr.get_active_for_channel(ctx.channel_key)
+    m = mgr.matches.get(mid) if mid else None
+    if m is None or not m.is_host(ctx_user(ctx)):
+        raise VTTError("Saving a template needs a host of this channel's "
+                       "match (or a server administrator).")
+
+
+def _require_saver(ctx: ReplyContext, name: str, tpl: Dict[str, Any],
+                   verb: str) -> None:
+    if not _template_saver_ok(ctx, tpl):
+        who = tpl.get("saved_by_name") or tpl.get("saved_by") or "someone"
+        raise VTTError(f"Template `{name}` was saved by {who}: only they or "
+                       f"a server administrator can {verb} it.")
+
+
+def _get_template(mgr: MatchManager, raw: str) -> Tuple[str, Dict[str, Any]]:
+    name = check_template_name(raw)
+    tpl = mgr.templates.get(name)
+    if tpl is None:
+        raise VTTError(f"No template `{name}` (`!template list`).")
+    return name, tpl
+
+
+def _store_template(ctx: ReplyContext, mgr: MatchManager, name: str,
+                    data: Dict[str, Any], saver: Optional[Tuple[Any, Any]] = None
+                    ) -> Tuple[str, List[str]]:
+    """Write `data` as template `name` (memory + disk) and return (verb,
+    notes): 'Saved' or 'Replaced'. Replacing needs the old version's saver
+    or a server administrator, and the old version goes to the template
+    trash for 24 hours. `saver` = (id, name) to record; default the caller."""
+    old = mgr.templates.get(name)
+    if old is not None:
+        _require_saver(ctx, name, old, "replace")
+    by, by_name = saver if saver is not None else (ctx_user(ctx),
+                                                   ctx_user_name(ctx))
+    for k, v in (("saved_by", by), ("saved_by_name", by_name)):
+        if v is None:
+            data.pop(k, None)
+        else:
+            data[k] = str(v)
+    notes: List[str] = []
+    st = storage_of(mgr)
+    if st is not None:
+        notes, trashed = st.write_template(mgr, name, data)
+        if trashed:
+            notes.append(f"The previous version is kept 24 hours "
+                         f"(`!template restore {name}`).")
+    mgr.templates[name] = data
+    return ("Replaced" if old is not None else "Saved"), notes
+
+
+_TEMPLATE_EDIT_NOTE = (
+    "Edit a template with `!template set` / `unset` (add `part=<part>` for "
+    "a body part) and `!template part remove`, or replace it whole: `!template "
+    "show <name> compact`, change the JSON in any editor, and `!template "
+    "import` it under the same name. A replaced, edited or deleted version is "
+    "kept 24 hours (`!template trash`, `!template restore`).")
+
+# Fields of a template (or a template part) that `!template set` / `unset`
+# reach. Identity (id / position / links) isn't part of a template, and
+# parts are edited one at a time with part=.
+_TEMPLATE_EDIT_FIELDS = ("name", "vars", "status", "passives", "clamps",
+                         "facing")
+
+
+def _template_summary(name: str, tpl: Dict[str, Any]) -> str:
+    parts = tpl.get("parts")
+    n = len(parts) if isinstance(parts, (list, dict)) else 0
+    hp = (tpl.get("vars") or {}).get("hp")
+    bits = [f"`{name}` — {tpl.get('name') or name}"]
+    if hp is not None:
+        bits.append(f"hp {hp}")
+    if n:
+        bits.append(f"{n} part(s)")
+    by = tpl.get("saved_by_name") or tpl.get("saved_by")
+    if by:
+        bits.append(f"saved by {by}")
+    return ", ".join(bits)
+
+
+def _template_options(args: List[str], start: int, usage: str
+                      ) -> Tuple[List[str], Optional[str]]:
+    """(positional words, part=) of args[start:]; any other option refused."""
+    rest = args[start:]
+    opts = [a for a in rest if a.lower().startswith("part=")]
+    _check_options(opts, {"part"}, usage.split(" <")[0])
+    part = opts[-1].split("=", 1)[1] if opts else None
+    if part == "":
+        raise VTTError("part= needs a part name.")
+    return [a for a in rest if a not in opts], part
+
+
+def _template_edit_target(tpl: Dict[str, Any], name: str, part: Optional[str],
+                          path: str) -> Tuple[Dict[str, Any], str]:
+    """The dict `path` is edited in (the template or one of its parts) and
+    a label for replies."""
+    check_store_path(path)
+    root = path.split(".", 1)[0]
+    if root not in _TEMPLATE_EDIT_FIELDS:
+        raise VTTError(
+            f"`{root}` isn't an editable template field (they are: "
+            f"{', '.join(_TEMPLATE_EDIT_FIELDS)}). Body parts are edited "
+            f"with part=<part>; a template has no id or position.")
+    if part is None:
+        return tpl, f"`{name}`"
+    _key, p = template_part(tpl, name, part)
+    return p, f"`{name}` part `{part}`"
+
+
+def _json_block(value: Any, compact: bool) -> str:
+    if compact:
+        text = json.dumps(value, separators=(",", ":"), sort_keys=True)
+    else:
+        text = json.dumps(value, indent=2, sort_keys=True)
+    return f"```json\n{text}\n```"
+
+
+def _fmt_age(seconds: float) -> str:
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60} min"
+    return f"{s // 3600} h {s % 3600 // 60} min"
+
+
+@registry.command(
+    "template", snapshot=True,
+    usage="!template <save|spawn|list|show|import|set|unset|part|rename|copy|delete|trash|restore> ...",
+    desc=(
+        "This server's saved entity templates, shared by all its matches and "
+        "kept on disk (even when the CLI / GUI don't keep matches). A "
+        "template is a unit as JSON — vars (current hp included), statuses, "
+        "passives, clamps, facing and its whole body-part tree — without an "
+        "id or position: its NAME is the id spawned units take (`guardsman`, "
+        "`guardsman2`, ...). `save <unit> [name]` (a host of this channel's "
+        "match), `spawn <name> <x> <y> [near=<radius>]`, `list`, `show <name> "
+        "[path] [compact] [part=<part>]`, `import <name> <json>` (create, or "
+        "replace with JSON edited anywhere), `set` / `unset`, `part remove`, "
+        "`rename`, `copy`, `delete`, `trash` / `restore`. Only whoever saved a "
+        "template, or a server administrator, can change or delete it. "
+        "Formulas: summon_template / summon_template_near / has_template / "
+        "template_names. " + _TEMPLATE_EDIT_NOTE
+    ),
+)
+async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["template"])
+        return await ctx.send(f"**{title}**\n{body}")
+    sub = args[0].lower()
+
+    if sub == "list":
+        _check_tail(args, 1, (), "!template list")
+        if not mgr.templates:
+            return await ctx.send("This server has no saved templates "
+                                  "(`!template save <unit> [name]`).")
+        lines = [f"**Templates ({len(mgr.templates)}):**"]
+        lines += [f"- {_template_summary(n, mgr.templates[n])}"
+                  for n in sorted(mgr.templates)]
+        return await ctx.send("\n".join(lines))
+
+    if sub == "show":
+        if await return_help_if_not_enough_args(ctx, args, 2, "template", "show"):
+            return
+        usage = "!template show <name> [path] [compact] [part=<part>]"
+        words, part = _template_options(args, 2, usage)
+        compact = bool(words) and words[-1].lower() == "compact"
+        if compact:
+            words = words[:-1]
+        if len(words) > 1:
+            raise VTTError(f"Unexpected `{' '.join(words[1:])}` — usage: "
+                           f"`{usage}`.")
+        name, tpl = _get_template(mgr, args[1])
+        body = {k: v for k, v in tpl.items()
+                if k not in ("saved_by", "saved_by_name")}
+        label = f"**template `{name}`**"
+        if part is not None:
+            _key, body = template_part(tpl, name, part)
+            label += f" part `{part}`"
+        if words:
+            path = words[0]
+            try:
+                body = _get_path(body, path)
+            except FormulaError:
+                raise VTTError(f"Template `{name}`"
+                               + (f" part `{part}`" if part else "")
+                               + f" has nothing at `{path}`.")
+            label += f" `{path}`"
+        elif part is None:
+            label += f" ({_template_summary(name, tpl)})"
+        return await ctx.send(f"{label}\n{_json_block(body, compact)}")
+
+    if sub == "save":
+        if await return_help_if_not_enough_args(ctx, args, 2, "template", "save"):
+            return
+        _check_tail(args, 3, (), "!template save <unit> [name]")
+        m = active_match(mgr, ctx)
+        _template_may_save(ctx, mgr)
+        e = m.entities.get(args[1])
+        if e is None:
+            raise NotFound(f"Entity '{args[1]}' not found.")
+        name = check_template_name(args[2] if len(args) > 2 else e.id)
+        data = m.capture_template(e)
+        data, _ = check_template(data, name)
+        verb, notes = _store_template(ctx, mgr, name, data)
+        parts = data.get("parts") or []
+        return await ctx.send("\n".join(
+            [f"💾 {verb} template `{name}` from `{e.id}`"
+             + (f" with {len(parts)} body part(s)" if parts else "")
+             + f". `!template spawn {name} <x> <y>` makes `{name}`, "
+               f"`{name}2`, ..."] + notes))
+
+    if sub == "import":
+        if await return_help_if_not_enough_args(ctx, args, 3, "template", "import"):
+            return
+        _template_may_save(ctx, mgr)
+        name = check_template_name(args[1])
+        raw = " ".join(args[2:])
+        try:
+            data = json.loads(raw, strict=False)
+        except ValueError as ex:
+            raise VTTError(f"That isn't valid JSON ({ex}). Paste it after the "
+                           f"name, e.g. as `!template show` prints it.")
+        data, checks = check_template(data, name)
+        verb, notes = _store_template(ctx, mgr, name, data)
+        msg = (f"💾 {verb} template `{name}` from JSON "
+               f"({_template_summary(name, data)}).")
+        return await ctx.send("\n".join([msg] + [f"⚠️ {n}" for n in checks]
+                                        + notes))
+
+    if sub in ("set", "unset"):
+        need = 4 if sub == "set" else 3
+        if await return_help_if_not_enough_args(ctx, args, need, "template", sub):
+            return
+        usage = ("!template set <name> <path> <value> [part=<part>]"
+                 if sub == "set" else
+                 "!template unset <name> <path> [part=<part>]")
+        name, tpl = _get_template(mgr, args[1])
+        _require_saver(ctx, name, tpl, "edit")
+        path = args[2]
+        _words, part = _template_options(args, need, usage)
+        if _words:
+            raise VTTError(f"Unexpected `{' '.join(_words)}` — usage: "
+                           f"`{usage}`. Quote a value that contains spaces.")
+        new = copy.deepcopy(tpl)
+        target, where = _template_edit_target(new, name, part, path)
+        if sub == "set":
+            value = _parse_scalar(args[3])
+            if path in ("name", "facing"):
+                value = str(value)
+            check_no_value_ancestor(target, path, f"Template {where}")
+            _set_path(target, path, value)
+        else:
+            keys = path.split(".")
+            cur: Any = target
+            for k in keys[:-1]:
+                cur = cur.get(k) if isinstance(cur, dict) else None
+            if not isinstance(cur, dict) or keys[-1] not in cur:
+                raise VTTError(f"Template {where} has nothing at `{path}`.")
+            del cur[keys[-1]]
+        new, _ = check_template(new, name)
+        _verb, notes = _store_template(
+            ctx, mgr, name, new,
+            saver=(tpl.get("saved_by"), tpl.get("saved_by_name")))
+        if sub == "set":
+            shown = json.dumps(value) if not isinstance(value, str) else value
+            msg = f"✏️ Template {where}: `{path}` = `{shown}`."
+        else:
+            msg = f"✏️ Template {where}: removed `{path}`."
+        return await ctx.send("\n".join([msg] + notes))
+
+    if sub == "part":
+        if len(args) < 2 or args[1].lower() != "remove":
+            return await _help_fallback(ctx, ["template", "part"],
+                                        args[1] if len(args) > 1 else None)
+        if await return_help_if_not_enough_args(ctx, args, 4, "template", "part"):
+            return
+        _check_tail(args, 4, (), "!template part remove <name> <part>")
+        name, tpl = _get_template(mgr, args[2])
+        _require_saver(ctx, name, tpl, "edit")
+        new = copy.deepcopy(tpl)
+        gone = template_remove_part(new, name, args[3])
+        new, _ = check_template(new, name)
+        _verb, notes = _store_template(
+            ctx, mgr, name, new,
+            saver=(tpl.get("saved_by"), tpl.get("saved_by_name")))
+        msg = (f"✂️ Removed part(s) {', '.join(f'`{g}`' for g in gone)} from "
+               f"template `{name}`.")
+        return await ctx.send("\n".join([msg] + notes))
+
+    if sub in ("rename", "copy"):
+        if await return_help_if_not_enough_args(ctx, args, 3, "template", sub):
+            return
+        _check_tail(args, 3, (), f"!template {sub} <name> <new_name>")
+        name, tpl = _get_template(mgr, args[1])
+        new_name = check_template_name(args[2])
+        if new_name == name:
+            raise VTTError(f"`{new_name}` is already this template's name.")
+        if sub == "copy":
+            _template_may_save(ctx, mgr)
+            data = {k: copy.deepcopy(v) for k, v in tpl.items()
+                    if k not in ("saved_by", "saved_by_name")}
+            verb, notes = _store_template(ctx, mgr, new_name, data)
+            return await ctx.send("\n".join(
+                [f"📄 {verb} template `{new_name}` as a copy of `{name}`."]
+                + notes))
+        _require_saver(ctx, name, tpl, "rename")
+        notes = []
+        st = storage_of(mgr)
+        old = mgr.templates.get(new_name)
+        if old is not None:
+            _require_saver(ctx, new_name, old, "replace")
+            if st is not None and st.trash_template(mgr, new_name):
+                notes.append(f"The `{new_name}` it replaced is kept 24 hours "
+                             f"(`!template restore {new_name}`).")
+        if st is not None:
+            st.rename_template_file(mgr, name, new_name)
+        mgr.templates[new_name] = mgr.templates.pop(name)
+        return await ctx.send("\n".join(
+            [f"🏷️ Renamed template `{name}` to `{new_name}`"
+             + (" (replacing the old one)." if old is not None else ".")
+             + f" New spawns are `{new_name}`, `{new_name}2`, ..."] + notes))
+
+    if sub in ("delete", "del", "rm", "remove"):
+        if await return_help_if_not_enough_args(ctx, args, 2, "template", "delete"):
+            return
+        _check_tail(args, 2, (), "!template delete <name>")
+        name, tpl = _get_template(mgr, args[1])
+        _require_saver(ctx, name, tpl, "delete")
+        st = storage_of(mgr)
+        kept = st is not None and st.trash_template(mgr, name)
+        del mgr.templates[name]
+        return await ctx.send(
+            f"🗑️ Deleted template `{name}`. Units already spawned from it stay."
+            + (f" It is kept 24 hours (`!template restore {name}`)."
+               if kept else ""))
+
+    if sub == "trash":
+        _check_tail(args, 2, (), "!template trash [name]")
+        st = storage_of(mgr)
+        if st is None:
+            return await ctx.send("This bot keeps nothing on disk, so old "
+                                  "template versions aren't kept.")
+        want = check_template_name(args[1]) if len(args) > 1 else None
+        entries = st.template_trash(mgr.guild_key, want)
+        if not entries:
+            return await ctx.send(
+                "No old template versions"
+                + (f" of `{want}`" if want else "") + " from the last 24 hours.")
+        now = time.time()
+        index: Dict[str, int] = {}
+        lines = [f"**Old template versions ({len(entries)}, kept 24 hours):**"]
+        for stamp, tname, path in entries[:40]:
+            index[tname] = index.get(tname, 0) + 1
+            try:
+                with open(path, encoding="utf-8") as f:
+                    old = json.load(f)
+                desc = _template_summary(tname, old).split(" — ", 1)[1]
+            except (OSError, ValueError, AttributeError, IndexError):
+                desc = "unreadable"
+            lines.append(f"- `{tname}` #{index[tname]} — {_fmt_age(now - stamp)} "
+                         f"ago ({desc})")
+        if len(entries) > 40:
+            lines.append(f"…and {len(entries) - 40} more.")
+        lines.append("`!template restore <name> [#]` brings one back "
+                     "(#1 = the newest).")
+        return await ctx.send("\n".join(lines))
+
+    if sub == "restore":
+        if await return_help_if_not_enough_args(ctx, args, 2, "template", "restore"):
+            return
+        _check_tail(args, 3, (), "!template restore <name> [n]")
+        st = storage_of(mgr)
+        if st is None:
+            raise VTTError("This bot keeps nothing on disk, so there are no "
+                           "old template versions to restore.")
+        name = check_template_name(args[1])
+        try:
+            n = int(args[2]) if len(args) > 2 else 1
+        except ValueError:
+            raise VTTError(f"`{args[2]}` isn't a version number (1 = the newest; "
+                           f"see `!template trash {name}`).")
+        entries = st.template_trash(mgr.guild_key, name)
+        if not entries:
+            raise VTTError(f"No old version of `{name}` from the last 24 hours.")
+        if not 1 <= n <= len(entries):
+            raise VTTError(f"`{name}` has {len(entries)} old version(s); pick "
+                           f"1-{len(entries)} (`!template trash {name}`).")
+        if ctx_user(ctx) is None:
+            raise VTTError("Templates can only be restored by a person typing "
+                           "the command.")
+        _stamp, _tname, path = entries[n - 1]
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, ValueError) as ex:
+            raise VTTError(f"That old version can't be read ({type(ex).__name__}).")
+        data, _ = check_template(raw, name)
+        if name not in mgr.templates:
+            _require_saver(ctx, name, data, "restore")
+        verb, notes = _store_template(
+            ctx, mgr, name, data,
+            saver=(data.get("saved_by"), data.get("saved_by_name")))
+        st.drop_trashed_template(mgr.guild_key, path)
+        return await ctx.send("\n".join(
+            [f"♻️ Restored template `{name}` (version #{n}): "
+             f"{_template_summary(name, data)}."] + notes))
+
+    if sub == "spawn":
+        if await return_help_if_not_enough_args(ctx, args, 4, "template", "spawn"):
+            return
+        _check_tail(args, 4, ("near",),
+                    "!template spawn <name> <x> <y> [near=<radius>]")
+        m = active_match(mgr, ctx)
+        name, tpl = _get_template(mgr, args[1])
+        try:
+            x, y = int(args[2]), int(args[3])
+        except ValueError:
+            raise VTTError("x and y must be whole numbers.")
+        near = None
+        for t in args[4:]:
+            if t.lower().startswith("near="):
+                try:
+                    near = int(t.split("=", 1)[1])
+                except ValueError:
+                    near = -1
+                if near < 0:
+                    raise VTTError("near= must be a whole number >= 0.")
+        new_id, log = m.spawn_template(name, tpl, x, y, near_radius=near)
+        e = m.entities.get(new_id)
+        where = f" at ({e.x},{e.y})" if e is not None else ""
+        parts = m.entity_part_subtree(new_id) if e is not None else []
+        lines = [f"✨ Spawned `{new_id}` from template `{name}`{where}"
+                 + (f" with {len(parts)} body part(s)" if parts else "") + "."]
+        lines += [str(x) for x in log]
+        return await ctx.send("\n".join(lines))
+
+    return await _help_fallback(ctx, ["template"], args[0])
+
+
+for _subs, _usage, _desc in (
+        (("save",), "!template save <unit> [name]",
+         "Save a unit (and its body parts) as a template; the name defaults "
+         "to the unit's id. Needs a host of this channel's match. Saving over "
+         "an existing template replaces it (its saver or an administrator)."),
+        (("spawn",), "!template spawn <name> <x> <y> [near=<radius>]",
+         "Spawn a template at a cell (near=: the nearest free cell within the "
+         "radius). Its id is the template name, numbered when taken."),
+        (("list",), "!template list", "This server's saved templates."),
+        (("show",), "!template show <name> [path] [compact] [part=<part>]",
+         "A template's JSON, or one field of it (`vars`, `vars.hp`); "
+         "`part=` shows a body part; `compact` prints it on one line, easier "
+         "to copy into an editor."),
+        (("import",), "!template import <name> <json ...>",
+         "Save pasted JSON as a template, or replace one with JSON edited "
+         "anywhere (the rest of the line is the JSON; a ```json fence is "
+         "fine). It is checked like any template."),
+        (("set",), "!template set <name> <path> <value> [part=<part>]",
+         "Set one field of a template: `vars.hp 40`, `name Guard`, "
+         "`facing left`, `status.burn.level 2`; part= edits a body part. "
+         "The result is checked like an import."),
+        (("unset",), "!template unset <name> <path> [part=<part>]",
+         "Remove one field of a template (or of a body part with part=)."),
+        (("part",), "!template part remove <name> <part>",
+         "Remove a body part from a template, with the parts attached under "
+         "it; a snake segment behind it follows the next one ahead."),
+        (("rename",), "!template rename <name> <new_name>",
+         "Rename a template (new spawns take the new name)."),
+        (("copy",), "!template copy <name> <new_name>",
+         "Save a copy under another name; you are the copy's saver."),
+        (("delete",), "!template delete <name>",
+         "Delete a template (its saver or a server administrator); it is "
+         "kept 24 hours."),
+        (("trash",), "!template trash [name]",
+         "Replaced, edited and deleted template versions from the last 24 "
+         "hours (cut first when the server nears its storage limit)."),
+        (("restore",), "!template restore <name> [n]",
+         "Bring back an old version (#1 = the newest); the current one, if "
+         "any, goes to the trash.")):
+    registry.annotate_sub("template", *_subs, usage=_usage, desc=_desc)
 
 
 @registry.command(
@@ -12308,7 +12857,7 @@ async def run_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if stripped.startswith("!"):
             stripped = stripped[1:]
         try:
-            toks = _shlex.split(stripped)
+            toks = split_command_line(stripped)
         except ValueError as ex:
             return await ctx.send(
                 f"❌ parse error in `{path}`: {ex} (line: `{ln[:60]}`)"
@@ -13715,6 +14264,7 @@ for _root, _canon, _aliases in (
         ("mount", "dismount", ("off",)),
         ("part", "remove", ("del", "rm")),
         ("table", "remove", ("del", "rm")),
+        ("template", "delete", ("del", "rm", "remove")),
         ("watch", "remove", ("del", "rm")),
         ("macro", "remove", ("del", "rm")),
         ("team", "clear", ("del",))):

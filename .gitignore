@@ -194,5 +194,5 @@ saves/
 # The bot's data (one folder per server, see storage.py) and bot settings.
 data/
 
-# cli.py / gui.py settings (persistence switch), made on first start.
+# cli.py / gui.py settings (match persistence switch), made on first start.
 local_settings.json

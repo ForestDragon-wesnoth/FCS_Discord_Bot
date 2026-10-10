@@ -1,11 +1,11 @@
 
 ## cli.py (desktop runner using the same commands)
 # cli.py
-import asyncio, shlex, os, sys
+import asyncio, os, sys
 from typing import List
 from logic import LOCAL_WORKSPACE
 from storage import open_workspaces, load_local_settings, local_persistence_note
-from vtt_commands import registry
+from vtt_commands import registry, split_command_line
 
 
 def _enable_terminal_color() -> bool:
@@ -96,16 +96,16 @@ class CLICtx:
 
 def parse(line: str):
     try:
-        return shlex.split(line)
+        return split_command_line(line)
     except ValueError as e:
         # Catch unclosed quotes or other shlex errors
         raise RuntimeError(f"Parse error: {e}")
 
 async def main():
     # The local workspace (and any `!as server` one) persists to data/ when
-    # local_settings.json turns persistence on.
+    # local_settings.json turns match persistence on.
     local = load_local_settings()
-    workspaces = open_workspaces(persist=local["persistence"])
+    workspaces = open_workspaces(persist=local["match_persistence"])
     ctx = CLICtx()
     from storage import reload_workspaces
     ctx.restart_workspaces = lambda: reload_workspaces(workspaces)
