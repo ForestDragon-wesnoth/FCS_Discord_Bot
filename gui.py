@@ -289,7 +289,11 @@ class GuiApp:
         when several candidates share nothing more, a second Tab lists them
         in the log."""
         before = self.entry.get("insert linestart", "insert")
-        new, cands = apply_completion(before, self.mgr, self.ctx)
+        try:
+            new, cands = apply_completion(before, self.mgr, self.ctx)
+        except Exception as e:  # completion must never break the input box
+            self.log(f"⚠️ completion error: {e}")
+            return "break"
         if new != before:
             self.entry.delete("insert linestart", "insert")
             self.entry.insert("insert", new)
@@ -509,11 +513,18 @@ class GuiApp:
         self._last_tab = None
         self._preview = None  # a `!map preview` lasts until the next command
         self._view = None     # so does a `!map` view
-        lines = [ln.strip() for ln in block.splitlines()]
-        # `!template import <name> <json>`: the pasted JSON may span lines;
-        # it's one command.
-        if re.match(r"\s*!template\s+import\s", block, re.IGNORECASE):
-            lines = [block.strip()]
+        # One command per `!` line; a `!template import <name> <json>`
+        # continues over the lines that follow it without a `!` (pasted
+        # JSON spans lines), wherever it sits in the block.
+        lines: List[str] = []
+        for raw in block.splitlines():
+            ln = raw.strip()
+            if (lines and ln and not ln.startswith("!")
+                    and re.match(r"!template\s+import\s", lines[-1],
+                                 re.IGNORECASE)):
+                lines[-1] += "\n" + ln
+            else:
+                lines.append(ln)
         ran = False
         for line in lines:
             if not line:

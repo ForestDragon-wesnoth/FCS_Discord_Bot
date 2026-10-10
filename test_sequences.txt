@@ -20770,7 +20770,85 @@ later put there). The saved
 `golem2` spawns with the arm still on the front region, the eye on its own
 cell at the same offset, the empty pack, and the default armor.
 
-SCENARIO 735 — Tab completion: commands, subcommands, literal words and options
+SCENARIO 735 — Templates: file-safe names, multi-template changes all or nothing, JSON inside batch
+-----------------------------------------------------------------------------------------------------
+
+!match new con Arena 8 8
+?? reserved device name on Windows
+!match new t735 Arena 10 8
+!match use t735
+!ent add hero Hero 10 2 2 3
+!template save hero nul
+?? reserved device name on Windows
+!template save hero COM3
+?? reserved device name on Windows
+!as server lpt1
+?? not a Windows device name
+!template import axe {"kind": "partial", "data": {"dmg": 6}}
+!template import guard {"name": "Guard", "vars": {"hp": 3, "a": {"__template": "axe"}}}
+!owner limit local 0.001
+!template rename axe hatchet force
+?? storage limit is reached
+!template delete axe force
+?? storage limit is reached
+!assert "has_template('axe') and not has_template('hatchet') and has_template('guard')"
+!template show guard vars.a compact
+?? {"__template":"axe"}
+!owner limit local reset
+!template rename axe hatchet force
+!template show guard vars.a compact
+?? {"__template":"hatchet"}
+!batch template import gem {"kind":"partial","data":{"note":"cut ; polished"}} ; template give gem hero bag.gem
+!assert "entity[hero].bag.gem.note == 'cut ; polished'"
+!macro set mkpart "template import ring {\"kind\":\"partial\",\"data\":{\"bonus\":$1}}"
+!macro run mkpart 4
+!assert "has_template('ring')"
+!template show ring compact
+?? {"data":{"bonus":4},"kind":"partial"}
+
+Expected: HARNESS-ALLOWS-ERRORS. Match ids, template names and server keys
+become file and folder names, so Windows device names (CON, NUL, COM3,
+LPT1 ...; the bot may run on Windows, where `con.json` is the console) are
+refused for all of them. With the server's storage limit at 1 KB, a forced
+rename or delete of a referenced partial is refused before anything moves:
+`axe` keeps its name and `guard` still references it (before this, the
+partial moved and the dependent rewrites then failed, leaving `guard`
+naming a partial that no longer existed). With the limit back, the rename
+updates `guard`. A `!template import` inside `!batch` keeps its JSON
+whole, including a ` ; ` inside a string, and so does one in a macro body
+written with `\"`.
+
+SCENARIO 736 — Snapshots and summons don't carry links to other units
+-----------------------------------------------------------------------
+
+!match new t736 Road 12 10
+!match use t736
+!ent add cart Cart 20 3 3 1
+!ent set_var cart slots.seat.capacity 1
+!ent add rider Rider 10 6 6 3
+!mount rider cart seat
+!ent store_entity_into_var rider rider form
+!assert "not var_has('rider', 'form.mounted_on') and not var_has('rider', 'form.mount_slot')"
+!eval --as rider "summon_from('form', 8, 8)"
+!assert "slot_riders('cart', 'seat') == ['rider'] and entity[rider2].x == 8"
+!ent add w Worm 20 6 2 3
+!part segment w w_s1 S 3 3
+!eval "var_set('w', 'snap', entity_snapshot('w_s1'))"
+!eval --as w "summon_from('snap', 2, 8)"
+!assert "part_of('s') == '' and not var_has('s', '__follows')"
+!ent move w 1 right
+!assert "entity[s].x == 2 and entity[s].y == 8"
+
+Expected: HARNESS-ALLOWS-ERRORS. `!ent store_entity_into_var` and
+entity_snapshot used to keep the unit's links to other units: a summon
+from a mounted rider's snapshot created a second rider of the cart's
+one-person seat, standing at (8,8) away from the cart. Snapshots now drop
+part and mount links, and a summon strips them (and a segment's
+`__follows`) from any dict it is given: `rider2` is a free unit, the
+snapshot of a worm segment summons as a plain unit that doesn't follow the
+worm.
+
+SCENARIO 737 — Tab completion: commands, subcommands, literal words and options
 -------------------------------------------------------------------------------
 
 !match new t732 Field 10 8
@@ -20832,7 +20910,7 @@ coordinates; `!map pan` takes none). After ` ; ` in `!batch`, the next
 command completes. A line without `!` or inside an open quote gets nothing;
 an alias completes like the command it expands to.
 
-SCENARIO 736 — Tab completion: names, var paths, and what a fogged view hides
+SCENARIO 738 — Tab completion: names, var paths, and what a fogged view hides
 ------------------------------------------------------------------------------
 
 !match new t733 Keep 12 8
@@ -20884,6 +20962,10 @@ SCENARIO 736 — Tab completion: names, var paths, and what a fogged view hides
 ?? candidates: blue  red
 ?tab "!passive add hero p1 on_turn_s"
 ?? on_turn_skipped  on_turn_start
+!system set default template_pinning true
+!template give axe_common hero inventory.pick
+?tab "!match templates refresh "
+?? candidates: axe_common
 !match fog on
 !as view red
 ?tab "!ent info "

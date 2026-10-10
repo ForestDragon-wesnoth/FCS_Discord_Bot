@@ -372,6 +372,8 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         }
         if root == "ent" and sub == "group":
             return sorted(m.groups)
+        if root == "match" and sub == "templates":
+            return sorted(m.template_pins)
         if root in by_root:
             return sorted(str(x) for x in by_root[root])
     if slot in _FREE_SLOTS:

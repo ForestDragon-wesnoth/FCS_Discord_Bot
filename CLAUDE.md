@@ -157,7 +157,7 @@ code. How the harness works (`run_scenarios.py`, scenarios in
   command's full reply next to the Expected prose; `-v` prints a transcript.
 - **Tab completion** is tested in scenarios too: `?tab "<text>"` replies with
   what Tab does at the end of the text (`→ '<line>'` and `candidates: ...`)
-  in the scenario's workspace; check it with `??` / `?!` (735-736).
+  in the scenario's workspace; check it with `??` / `?!` (737-738).
 - **Isolation.** Each scenario gets its own temp data folder (real storage
   commits) and a temp saves folder; `!as restart` reloads everything from
   disk as a bot restart would.
@@ -879,8 +879,11 @@ hardcodes**.
   dict into a unit (id minted from its name, footprint placement, parts /
   segments keys, on_entity_spawned), bounded per command by
   `summon_event_limit`; `entity_snapshot(eid)` and `!ent
-  store_entity_into_var` make such a dict; `remove_entity` despawns. Server
-  templates (§7.17) build on the same path.
+  store_entity_into_var` make such a dict (identity and links stripped:
+  id, x, y, `part_of`, `mounted_on`, `mount_slot`; a summon also drops
+  `__follows`, so a snapshot of a rider or a segment summons a free unit);
+  `remove_entity` despawns. Server templates (§7.17) build on the same
+  path.
 - **Occupancy:** one unit per cell, except units with the `__cell_stackable`
   var; `cell_entity` names the blocker, `entities_at` everyone covering a cell.
 - **Shields / temp hp:** named absorb pools under the roots in
@@ -1398,7 +1401,10 @@ hardcodes**.
   clone/fog/pause/resume/var/win/outcome/hosts`. `!match clone <new_id>`
   copies everything but bindings, cameras, pending requests and history; the
   cloner owns the copy, co-hosts and access overrides carry, and when a
-  co-host clones the original owner becomes a co-host. Ids follow `ID_RE`.
+  co-host clones the original owner becomes a co-host. Ids follow `ID_RE`;
+  an id that becomes a file or folder name (match, template, save, server
+  key) also passes `logic.is_file_id`, which refuses Windows device names
+  (`CON`, `NUL`, `COM1`, ...) the bot could not write on Windows.
 - **Systems and rules:** a `GameSystem` holds rule overrides, tile
   templates, functions, aliases, default vars / passives / clamps. A match
   copies its system's rules into `match.rules` at creation and on every
@@ -1469,11 +1475,17 @@ hardcodes**.
   at start even with match persistence off. Every replace or delete keeps the
   old version in `templates/.trash/` for 24 h, counted toward the server
   limit and cut first when room is needed (`write_template` makes room
-  BEFORE moving anything). `!server wipe all` trashes templates.
+  BEFORE moving anything; a forced partial rename / delete that rewrites
+  several dependents reserves room for all of them first,
+  `_reserve_template_room`, so it is refused whole or done whole).
+  `!server wipe all` trashes templates.
 - **Raw JSON tail:** `split_command_line` / `split_command_args` keep
   `template import <name> <rest>` whole (```json fence or single quotes
   dropped) on every surface; a multi-line import is one command on Discord
-  and in the GUI.
+  and in the GUI (non-`!` lines after a `!template import` line join it).
+  The same splitter runs on every line inside `!batch` / `!foreach` (cut at
+  a standalone `;` outside quotes, `_split_semicolons`), macro run lines and
+  action `cmd()`, so an import's JSON survives them.
 - **Formulas:** `summon_template` / `summon_template_near` (mutating),
   `has_template` / `template_names` (read-only), via `CURRENT_WORKSPACE`
   (718-726).

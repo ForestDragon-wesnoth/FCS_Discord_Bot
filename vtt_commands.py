@@ -15,7 +15,7 @@ from logic import (
 )
 
 # Passive system
-from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS
+from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES
 
 # Clamp system
 from logic import ClampSpec
@@ -2624,9 +2624,10 @@ async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 "❌ This surface has a single workspace; `!as server` works "
                 "in the CLI and the scenario harness.")
         key = args[1] if len(args) >= 2 else LOCAL_WORKSPACE
-        if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", key):
+        if not valid_id(key):
             return await ctx.send(
-                "❌ A server key is letters, digits, `_` or `-` (up to 40).")
+                "❌ A server key is letters, digits, `_` or `-` (up to 40), "
+                "and not a Windows device name (it names a folder).")
         ctx.guild_key = key
         if key == LOCAL_WORKSPACE:
             return await ctx.send("Back in the local workspace.")
@@ -3091,11 +3092,59 @@ _RAW_JSON_TAIL = re.compile(r"^\s*(import)\s+(\S+)\s+(.+?)\s*$",
                             re.IGNORECASE | re.DOTALL)
 
 
+def _split_semicolons(text: str) -> List[str]:
+    """`text` cut at every `;` standing as a word of its own outside quotes
+    (the separator `!batch` / `!foreach` use), as raw text pieces."""
+    pieces: List[str] = []
+    cur: List[str] = []
+    quote = None
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            cur.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                cur.append(text[i + 1])
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+            cur.append(ch)
+        elif (ch == ";" and (i == 0 or text[i - 1].isspace())
+              and (i + 1 == n or text[i + 1].isspace())):
+            pieces.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    pieces.append("".join(cur))
+    return pieces
+
+
 def split_command_args(root: str, tail: str) -> List[str]:
     """A command's arguments from the text after its root word: shlex, except
     that `!template import <name> <json>` keeps the JSON as one argument (a
-    surrounding ```json fence or single quotes are dropped)."""
-    if root.strip().lower() == "template":
+    surrounding ```json fence or single quotes are dropped) — also as a
+    command inside `!batch` / `!foreach`, whose `;`-separated commands are
+    each split like a typed line."""
+    low = root.strip().lower()
+    if low in ("batch", "foreach") and re.search(r"(?:^|\s);(?:\s|$)", tail):
+        out: List[str] = []
+        for i, piece in enumerate(_split_semicolons(tail)):
+            if i:
+                out.append(";")
+            piece = piece.strip()
+            if i == 0 and low == "foreach":
+                out += shlex.split(piece)
+                continue
+            if i == 0 and low == "batch" and re.match(r"strict(\s|$)", piece):
+                out.append("strict")
+                piece = piece[6:].strip()
+            if piece:
+                out += split_command_line(piece.lstrip("!"))
+        return out
+    if low == "template":
         m = _RAW_JSON_TAIL.match(tail)
         if m:
             raw = m.group(3)
@@ -3223,6 +3272,19 @@ def _check_expansion(ctx: ReplyContext, mgr: MatchManager, name: str,
         else:
             mgr.templates[name] = old
         invalidate_partial_cache()
+
+
+def _reserve_template_room(mgr: MatchManager,
+                           datas: List[Dict[str, Any]]) -> None:
+    """Make room (or refuse, changing nothing) for writing all of `datas`
+    as templates whose old versions are kept: a multi-template change
+    checks the limit once, up front, so it can't stop halfway."""
+    st = storage_of(mgr)
+    if st is None or not datas:
+        return
+    total = sum(len((json.dumps(d, indent=2, sort_keys=True) + "\n")
+                    .encode("utf-8")) + 256 for d in datas)
+    st._room_for_template(mgr.guild_key, total)
 
 
 def _template_dependents(mgr: MatchManager, name: str) -> List[str]:
@@ -3696,6 +3758,9 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         for n in [new_name] + deps + [n for n in after
                                       if new_name in template_refs_of(after[n])]:
             check_template_refs(n, after[n], after)
+        # Room for every rewritten dependent first: a write refused halfway
+        # would leave templates naming a partial that has already moved.
+        _reserve_template_room(mgr, [after[d] for d in deps])
         notes = []
         st = storage_of(mgr)
         if old is not None:
@@ -3767,6 +3832,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return resolver.template_file_form(live)
         for d in deps:
             inlined[d] = _rewrite_template_refs(mgr.templates[d], inline)
+        _reserve_template_room(mgr, list(inlined.values()))
         st = storage_of(mgr)
         kept = st is not None and st.trash_template(mgr, name)
         del mgr.templates[name]
@@ -9401,9 +9467,7 @@ async def undo_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 SAVES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saves")
 
 
-_WINDOWS_DEVICE_NAMES = frozenset(
-    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
-    + [f"COM{i}" for i in range(1, 10)] + [f"LPT{i}" for i in range(1, 10)])
+_WINDOWS_DEVICE_NAMES = WINDOWS_DEVICE_NAMES
 
 
 def _write_save_file(mgr: MatchManager, full: str, shown: str,
@@ -13521,7 +13585,7 @@ async def _exec_macro(nodes, ctx, mgr, mac_args, loop_idx, name, budget):
             if line.startswith("!"):
                 line = line[1:]
             try:
-                toks = _shlex.split(line)
+                toks = split_command_line(line)
             except ValueError as ex:
                 await ctx.send(f"❌ macro `{name}`: parse error in `{line[:50]}`: {ex}")
                 continue

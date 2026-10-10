@@ -1945,3 +1945,39 @@ clamps and partial containers (300 seeds), a command fuzzer over every
   - OPEN: a snake whose head passed through its own body (the default)
     saves with a segment on the head's cell; spawn / revive / transform
     place that segment on the nearest free cell with a ⚠️.
+
+## Pass 38
+
+Recent features again (entity and partial templates, storage, completion,
+GUI / CLI input), right after pass 37. Method: a command fuzzer over every
+root × subcommand on a board with partial containers (15k lines, clean),
+completion timing on a 500-unit fogged board (~75 ms) and junk input, load
+of corrupt / device-named / dangling template files, wipe + undo with
+templates, an Xvfb key test of the GUI input (20 cases), the pass-37
+template fuzzers re-run after the fixes, and hand probes.
+  - **Windows device names.** A match, template, save or server key named
+    `con`, `nul`, `com1`, `lpt1`, ... became a file the bot can't write on
+    Windows (the commit failed every command after). `logic.is_file_id`
+    (ID_RE plus the device-name list) is used by `check_id`,
+    `storage.valid_id` and `!as server`.
+  - **Forced partial rename / delete were not all or nothing.** Each
+    dependent was rewritten through `write_template`, which made room per
+    file: near the server limit a rename moved the partial and some
+    dependents, then failed on the next. `_reserve_template_room` sums every
+    rewrite first and refuses before anything moves.
+  - **JSON inside batch / foreach / macro / cmd().** `!batch` and
+    `!foreach` shlex-split the whole tail, so a `!template import` line lost
+    its quotes and a `;` inside a JSON string cut the command. The tail is
+    now cut at standalone `;` outside quotes and each line runs through
+    `split_command_line`; macro run lines and action `cmd()` use it too.
+  - **Snapshots and summons kept links.** `entity_snapshot` of a mounted
+    rider kept `mounted_on` / `mount_slot`, and of a segment its
+    `__follows`: `summon_from` produced a unit linked to the original's
+    vehicle / chain (the dangling-id class). Identity keys are stripped on
+    snapshot and again on summon.
+  - **GUI.** A multi-line block with several `!` lines ran as one command;
+    each `!` line is now its own command (non-`!` lines after a `!template
+    import` line join it). A completion exception escaped the Tab handler;
+    it is logged.
+  - **Completion.** `!match templates refresh <name>` offered nothing; it
+    offers the match's pinned names.
