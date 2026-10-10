@@ -31,6 +31,12 @@ wording and refusal messages, which `!assert` (formulas only) can't see.
 Surrounding double quotes on <text> are stripped, so `?? "  spaced "` keeps
 its inner spaces.
 
+Tab completion: a line `?tab <text>` runs the completer (completion.py, the
+GUI's and the CLI's) on <text> as if Tab were pressed at its end, in the
+scenario's workspace, and replies with the completed line (`→ ...`) and the
+candidates; `??` / `?!` lines after it check that reply. Quote <text> to
+keep a trailing space: `?tab "!ent hp "`.
+
 Usage:
     python run_scenarios.py                 # run all, summarize failures
     python run_scenarios.py -v              # also print a transcript
@@ -146,13 +152,26 @@ def parse_scenarios(path: str) -> List[Tuple[int, str, List[str], "frozenset[str
         for ln in body.splitlines():
             if ln.strip().lower().startswith("expected:"):
                 break
-            if ln.startswith("!") or ln.startswith(_EXPECT_PREFIXES):
+            if ln.startswith(("!", _TAB_PREFIX)) or ln.startswith(_EXPECT_PREFIXES):
                 cmds.append(ln)
         out.append((num, title, cmds, allows))
     return out
 
 
 _EXPECT_PREFIXES = ("??", "?!")
+_TAB_PREFIX = "?tab "
+
+
+def _tab_reply(line: str, mgr, ctx) -> List[str]:
+    """The reply for a `?tab <text>` line: what Tab does at its end."""
+    from completion import apply_completion, complete, format_candidates
+    text = line[len(_TAB_PREFIX):].strip()
+    if len(text) >= 2 and text[0] == text[-1] == '"':
+        text = text[1:-1]
+    new, _listed = apply_completion(text, mgr, ctx)
+    _start, cands = complete(text, mgr, ctx)
+    return [f"→ {new!r}", "candidates: " + (format_candidates(cands)
+                                            if cands else "(none)")]
 
 
 def _check_expectation(line: str, previous: List[str]) -> str:
@@ -201,6 +220,14 @@ async def _run_cmds(cmds: List[str], workspaces) -> List[Tuple[str, List[str]]]:
     for line in cmds:
         if line.startswith(_EXPECT_PREFIXES):
             transcript.append((line, [_check_expectation(line, previous)]))
+            continue
+        if line.startswith(_TAB_PREFIX):
+            try:
+                out = _tab_reply(line, workspaces.get(ctx.guild_key), ctx)
+            except Exception as e:  # noqa: BLE001 - surface as a flagged failure
+                out = [f"💥 Uncaught: {type(e).__name__}: {e}"]
+            transcript.append((line, out))
+            previous = out
             continue
         ctx.out = []
         body = _interpret_escapes(line.lstrip("!"))

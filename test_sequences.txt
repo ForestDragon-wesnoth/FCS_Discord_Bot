@@ -20619,3 +20619,138 @@ of the library (armor 5). `!ent dump` shows the markers. A resync is all or
 nothing: when the library widens `ob` to 3 cells and the wall blocks the
 wider body, nothing changes (the speed stays 3); with the wall gone the ogre
 becomes 3×2 with speed 9 and keeps its own hp 20.
+
+SCENARIO 732 — Tab completion: commands, subcommands, literal words and options
+-------------------------------------------------------------------------------
+
+!match new t732 Field 10 8
+!match use t732
+!ent add hero Hero 30 2 2 5
+!ent add healer Healer 20 4 4 3
+?tab !en
+?? → '!ent '
+?tab !e
+?? → '!e'
+?? candidates: emit  ent  eval
+?tab "!ent "
+?? set_var
+?? hp
+?tab !ent h
+?? → '!ent hp '
+?tab "!ent hp "
+?? candidates: healer  hero
+?tab "!ent hp h"
+?? → '!ent hp he'
+?tab "!ent hp hero m"
+?? → '!ent hp hero max '
+?tab "!ent face hero "
+?? ccw  cw  down
+?? toward
+?tab "!ent rm h"
+?? healer  hero
+?tab "!template spawn guard 1 1 "
+?? candidates: near=
+?tab "!map pan "
+?? up_left
+?! as=
+?tab "!undo "
+?? candidates: command  round  to  turn
+?tab "!help ent s"
+?? set_var  set_vars  status  store_entity_into_var  swap
+?tab "!batch ent hp hero 5 ; ent tp h"
+?? candidates: healer  hero
+?tab ent
+?? candidates: (none)
+?tab "!ent hp \"he"
+?? candidates: (none)
+!alias def hit "ent hp"
+?tab "!hit "
+?? candidates: healer  hero
+?tab !hi
+?? candidates: history  hit
+
+Expected: HARNESS-ALLOWS-ERRORS. `?tab <text>` shows what Tab does at the
+end of the text. The first word completes from the command roots (and the
+match's aliases: `hit`); a unique match completes with a space, several
+extend to their common prefix and are listed (`emit ent eval`). Later words
+follow the command's usage strings: `!ent` subcommands, unit ids for
+`<id>` (`!ent rm` is an alias spelling of `remove`), the literal words a
+form allows (`max` for `!ent hp`, `cw`/`ccw`/`toward` and the directions
+for `!ent face`, the `!undo` kinds, `!help`'s subcommands of `ent`), and
+`key=` options where the form allows one (`near=` after a template spawn's
+coordinates; `!map pan` takes none). After ` ; ` in `!batch`, the next
+command completes. A line without `!` or inside an open quote gets nothing;
+an alias completes like the command it expands to.
+
+SCENARIO 733 — Tab completion: names, var paths, and what a fogged view hides
+------------------------------------------------------------------------------
+
+!match new t733 Keep 12 8
+!match use t733
+!ent add hero Hero 30 2 2 5
+!ent set_var hero team red
+!ent set_var hero fog_vision_radius 2
+!ent add spy Spy 10 11 7 3
+!ent set_var spy team blue
+!ent set_var hero inventory.potion.amount 2
+!ent set_var hero inventory.pick.weight 3
+!ent set_var hero __death_result delete
+!ent set_var hero actions.slash.target entity
+!ent set_var hero actions.slash.body pass
+!template import axe_common {"kind": "partial", "data": {"damage": 6, "edge": "keen"}}
+!template import guard {"name": "Guard", "vars": {"hp": 10}}
+!status def burn
+!macro set boom ent hp $1 0
+?tab "!ent set_var hero inv"
+?? → '!ent set_var hero inventory.'
+?tab "!ent set_var hero inventory."
+?? candidates: inventory.pick.  inventory.potion.
+?tab "!ent set_var hero inventory.po"
+?? → '!ent set_var hero inventory.potion.'
+?tab "!ent delete_var hero "
+?! __death_result
+?tab "!ent delete_var hero __"
+?? __death_result
+?tab "!template give "
+?? candidates: axe_common
+?tab "!template show "
+?? candidates: axe_common  guard
+?tab "!template show axe_common "
+?? edge
+?? expanded
+?tab "!template give axe_common hero inventory.p"
+?? inventory.pick.  inventory.potion.
+?tab "!action hero "
+?? candidates: slash
+?tab "!status apply hero "
+?? candidates: burn
+?tab "!macro run "
+?? candidates: boom
+?tab "!system set default turnorder_d"
+?? → '!system set default turnorder_direction '
+?tab "!match use "
+?? candidates: t733
+?tab "!team set "
+?? candidates: blue  red
+?tab "!passive add hero p1 on_turn_s"
+?? on_turn_skipped  on_turn_start
+!match fog on
+!as view red
+?tab "!ent info "
+?? candidates: hero
+?! spy
+!as view clear
+?tab "!ent info "
+?? candidates: hero  spy
+
+Expected: HARNESS-ALLOWS-ERRORS. Var paths complete one segment at a time:
+a container ends with `.` (no space), so the next Tab lists its children
+(`inventory.pick.`, `inventory.potion.`); engine keys (`__death_result`)
+show only once the typed segment starts with `_`. `!template give` offers
+only partials (`axe_common`), `!template show` every template, and a
+template's own paths (`edge`) and flags (`expanded`). `!template give
+<partial> <unit>` completes the unit's var paths. Names come from where
+each command looks: the unit's actions, status definitions, macros, rule
+names after `!system set <system>`, matches, teams, hook names. Under the
+red view with fog on, the blue spy out of sight is left out, as `!ent info`
+itself treats it; clearing the view offers it again.
