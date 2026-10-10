@@ -15,7 +15,7 @@ from logic import (
 )
 
 # Passive system
-from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS
+from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS
 
 # Clamp system
 from logic import ClampSpec
@@ -164,7 +164,7 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
     "table":      frozenset({"list", "roll"}),
     # The server's template library is readable by anyone; save / import /
     # delete check the saver themselves, spawn changes the match.
-    "template":   frozenset({"list", "show", "trash"}),
+    "template":   frozenset({"list", "show", "trash", "refs"}),
     # team_data_visibility decides whose data a player may read.
     "team":       frozenset({"list", "get"}),
     "tile":       frozenset({"list", "info"}),
@@ -712,6 +712,12 @@ class CommandRegistry:
         # The server whose command this is: summon_template reaches its
         # saved templates through it.
         ws_token = CURRENT_WORKSPACE.set(mgr)
+        # Partial templates resolved by this command (a nested run shares
+        # the outer one's: the library only changes through a template
+        # command, which clears it).
+        cache_token = PARTIAL_CACHE.set(PARTIAL_CACHE.get()
+                                        if PARTIAL_CACHE.get() is not None
+                                        else {})
         try:
             # Judged on the alias-RESOLVED name: an alias of `again` stored as
             # the last command made `!again` rerun itself forever.
@@ -723,6 +729,7 @@ class CommandRegistry:
             await _flush_formula_log(ctx)
             return result
         finally:
+            PARTIAL_CACHE.reset(cache_token)
             CURRENT_WORKSPACE.reset(ws_token)
             FORMULA_LOG_SINK.reset(sink_token)
             _RUN_DEPTH.reset(depth_token)
@@ -2204,6 +2211,47 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if fired:
             msg += "\n" + "\n".join(fired)
         return await ctx.send(msg)
+    if sub == "templates":
+        # Partial templates this match pinned (template_pinning): copies
+        # taken on first use, so library edits don't reach the match until a
+        # refresh drops them. Match state: saved, undone, cloned.
+        m = active_match(mgr, ctx)
+        if len(args) > 1 and args[1].lower() == "refresh":
+            _check_tail(args, 3, (), "!match templates refresh [name]")
+            want = args[2] if len(args) > 2 else None
+            if want is not None and want not in m.template_pins:
+                raise VTTError(f"This match has no pin of `{want}` "
+                               f"(`!match templates`).")
+            gone = [want] if want is not None else sorted(m.template_pins)
+            for n in gone:
+                del m.template_pins[n]
+            invalidate_partial_cache()
+            if not gone:
+                return await ctx.send("This match has no pinned partial "
+                                      "templates.")
+            return await ctx.send(
+                f"🔄 Dropped the pin(s) of {', '.join(f'`{n}`' for n in gone)}"
+                f"; the next use pins the library's current version.")
+        _check_tail(args, 1, (), "!match templates [refresh [name]]")
+        on = bool(m.rules.get("template_pinning", False))
+        state = ("template_pinning is on" if on else
+                 "template_pinning is off: these pins are kept but unused")
+        if not m.template_pins:
+            return await ctx.send(f"No pinned partial templates ({state}).")
+        lib = mgr.templates
+        lines = [f"**Pinned partial templates ({state}):**"]
+        for n in sorted(m.template_pins):
+            pin = m.template_pins[n]
+            t = lib.get(n)
+            if not isinstance(t, dict) or t.get("kind") != "partial":
+                note = "no longer in the library"
+            elif t.get("data") != pin.get("data"):
+                note = "the library's version differs"
+            else:
+                note = "same as the library"
+            lines.append(f"- `{n}` — pinned at turn {pin.get('turn', 0)}, "
+                         f"{note}")
+        return await ctx.send("\n".join(lines))
     if sub == "outcome":
         m = active_match(mgr, ctx)
         if m.outcome is None:
@@ -2332,6 +2380,15 @@ registry.annotate_sub(
     "match", "hosts",
     usage="!match hosts [<id>]",
     desc="Show a match's owner and co-hosts.",
+)
+registry.annotate_sub(
+    "match", "templates",
+    usage="!match templates [refresh [name]]",
+    desc=("The partial templates this match pinned (template_pinning: a "
+          "copy taken on first use, so later library edits don't reach "
+          "this match), and whether the library's version differs. "
+          "`refresh` drops every pin (or one), so the next use pins the "
+          "library's current version; undo restores dropped pins."),
 )
 registry.annotate_sub(
     "match", "fog",
@@ -3098,15 +3155,19 @@ def _get_template(mgr: MatchManager, raw: str) -> Tuple[str, Dict[str, Any]]:
     return name, tpl
 
 
+def _is_partial(tpl: Dict[str, Any]) -> bool:
+    return tpl.get("kind") == "partial"
+
+
 def _store_template(ctx: ReplyContext, mgr: MatchManager, name: str,
-                    data: Dict[str, Any], saver: Optional[Tuple[Any, Any]] = None
-                    ) -> Tuple[str, List[str]]:
+                    data: Dict[str, Any], saver: Optional[Tuple[Any, Any]] = None,
+                    check_saver: bool = True) -> Tuple[str, List[str]]:
     """Write `data` as template `name` (memory + disk) and return (verb,
     notes): 'Saved' or 'Replaced'. Replacing needs the old version's saver
     or a server administrator, and the old version goes to the template
     trash for 24 hours. `saver` = (id, name) to record; default the caller."""
     old = mgr.templates.get(name)
-    if old is not None:
+    if old is not None and check_saver:
         _require_saver(ctx, name, old, "replace")
     by, by_name = saver if saver is not None else (ctx_user(ctx),
                                                    ctx_user_name(ctx))
@@ -3123,7 +3184,90 @@ def _store_template(ctx: ReplyContext, mgr: MatchManager, name: str,
             notes.append(f"The previous version is kept 24 hours "
                          f"(`!template restore {name}`).")
     mgr.templates[name] = data
+    invalidate_partial_cache()
     return ("Replaced" if old is not None else "Saved"), notes
+
+
+def _template_dependents(mgr: MatchManager, name: str) -> List[str]:
+    """The templates whose data references partial `name`."""
+    return sorted(n for n, t in mgr.templates.items()
+                  if n != name and name in template_refs_of(t))
+
+
+def _template_resolver(mgr: MatchManager, ctx: ReplyContext,
+                       library: bool = False) -> Match:
+    """A match to resolve partials with: the channel's (its pins and rules),
+    else — or with `library`, so the library's current versions are read and
+    nothing gets pinned — a scratch match on the server's default system."""
+    mid = mgr.get_active_for_channel(ctx.channel_key)
+    if not library and mid and mid in mgr.matches:
+        return mgr.matches[mid]
+    sysname = mgr.default_system_name
+    return Match(id="_templates", name="", grid_width=1, grid_height=1,
+                 system_name=sysname,
+                 rules=mgr._build_rules_dict(mgr.systems[sysname]))
+
+
+def _merge_file_layers(base: Dict[str, Any], node: Dict[str, Any]
+                       ) -> Dict[str, Any]:
+    """Partial data `base` (file form) with the reference dict `node`'s
+    changes laid over it, as one file-form layer: plain dicts merge key by
+    key (into a reference dict too: those keys become its changes), a dict
+    naming a partial or any other value replaces, and both layers' removed
+    paths are kept (a path the node sets again leaves the base's)."""
+    out = copy.deepcopy(base)
+
+    def lay(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
+        for k, v in src.items():
+            cur = dst.get(k)
+            if (isinstance(v, dict) and not isinstance(v.get(TEMPLATE_MARKER), str)
+                    and isinstance(cur, dict)):
+                lay(cur, v)
+            else:
+                dst[k] = copy.deepcopy(v)
+    over = {k: v for k, v in node.items()
+            if k not in (TEMPLATE_MARKER, TEMPLATE_REMOVED)}
+    lay(out, over)
+    removed = [r for r in out.pop(TEMPLATE_REMOVED, None) or []
+               if r.split(".")[0] not in over]
+    for r in node.get(TEMPLATE_REMOVED) or []:
+        keys = str(r).split(".")
+        cur: Any = out
+        for k in keys[:-1]:
+            cur = cur.get(k) if isinstance(cur, dict) else None
+        if isinstance(cur, dict):
+            cur.pop(keys[-1], None)
+        removed.append(str(r))
+    if removed:
+        out[TEMPLATE_REMOVED] = sorted(set(removed))
+    return out
+
+
+def _rewrite_refs(node: Any, fn) -> Any:
+    """`node` with every file-form reference dict replaced by fn(dict)
+    (fn returns the replacement); other values copied."""
+    if isinstance(node, list):
+        return [_rewrite_refs(v, fn) for v in node]
+    if not isinstance(node, dict):
+        return copy.deepcopy(node)
+    if isinstance(node.get(TEMPLATE_MARKER), str):
+        new = fn(node)
+        if new is not node:
+            return new
+    return {k: _rewrite_refs(v, fn) for k, v in node.items()}
+
+
+def _rewrite_template_refs(tpl: Dict[str, Any], fn) -> Dict[str, Any]:
+    out = copy.deepcopy(tpl)
+    if _is_partial(out):
+        out["data"] = _rewrite_refs(out.get("data"), fn)
+        return out
+    out["vars"] = _rewrite_refs(out.get("vars") or {}, fn)
+    parts = out.get("parts")
+    for p in (parts.values() if isinstance(parts, dict) else parts or []):
+        if isinstance(p, dict) and "vars" in p:
+            p["vars"] = _rewrite_refs(p["vars"], fn)
+    return out
 
 
 _TEMPLATE_EDIT_NOTE = (
@@ -3133,45 +3277,65 @@ _TEMPLATE_EDIT_NOTE = (
     "import` it under the same name. A replaced, edited or deleted version is "
     "kept 24 hours (`!template trash`, `!template restore`).")
 
-# Fields of a template (or a template part) that `!template set` / `unset`
-# reach. Identity (id / position / links) isn't part of a template, and
-# parts are edited one at a time with part=.
+# Fields of an entity template (or a template part) that `!template set` /
+# `unset` reach. Identity (id / position / links) isn't part of a template,
+# and parts are edited one at a time with part=. A partial's paths are
+# relative to its data and reach anything.
 _TEMPLATE_EDIT_FIELDS = ("name", "vars", "status", "passives", "clamps",
                          "facing")
 
 
 def _template_summary(name: str, tpl: Dict[str, Any]) -> str:
-    parts = tpl.get("parts")
-    n = len(parts) if isinstance(parts, (list, dict)) else 0
-    hp = (tpl.get("vars") or {}).get("hp")
-    bits = [f"`{name}` — {tpl.get('name') or name}"]
-    if hp is not None:
-        bits.append(f"hp {hp}")
-    if n:
-        bits.append(f"{n} part(s)")
     by = tpl.get("saved_by_name") or tpl.get("saved_by")
+    if _is_partial(tpl):
+        data = tpl.get("data") or {}
+        bits = [f"`{name}` — partial, {len([k for k in data if k not in (TEMPLATE_MARKER, TEMPLATE_REMOVED)])} field(s)"]
+        if isinstance(data.get(TEMPLATE_MARKER), str):
+            bits.append(f"extends `{data[TEMPLATE_MARKER]}`")
+    else:
+        parts = tpl.get("parts")
+        n = len(parts) if isinstance(parts, (list, dict)) else 0
+        tvars = tpl.get("vars") or {}
+        bits = [f"`{name}` — {tpl.get('name') or name}"]
+        if isinstance(tvars.get(TEMPLATE_MARKER), str):
+            bits.append(f"based on `{tvars[TEMPLATE_MARKER]}`")
+        if tvars.get("hp") is not None:
+            bits.append(f"hp {tvars.get('hp')}")
+        if n:
+            bits.append(f"{n} part(s)")
     if by:
         bits.append(f"saved by {by}")
     return ", ".join(bits)
 
 
-def _template_options(args: List[str], start: int, usage: str
-                      ) -> Tuple[List[str], Optional[str]]:
-    """(positional words, part=) of args[start:]; any other option refused."""
+def _template_options(args: List[str], start: int, usage: str,
+                      allowed=("part",)) -> Tuple[List[str], Dict[str, str]]:
+    """(positional words, {option: value}) of args[start:]; options outside
+    `allowed` refused."""
     rest = args[start:]
-    opts = [a for a in rest if a.lower().startswith("part=")]
-    _check_options(opts, {"part"}, usage.split(" <")[0])
-    part = opts[-1].split("=", 1)[1] if opts else None
-    if part == "":
-        raise VTTError("part= needs a part name.")
-    return [a for a in rest if a not in opts], part
+    opts = [a for a in rest if "=" in a
+            and a.split("=", 1)[0].lower() in allowed]
+    _check_options([a for a in rest if "=" in a and a not in opts] + opts,
+                   set(allowed), usage.split(" <")[0])
+    found = {a.split("=", 1)[0].lower(): a.split("=", 1)[1] for a in opts}
+    for k, v in found.items():
+        if v == "":
+            raise VTTError(f"{k}= needs a value.")
+    return [a for a in rest if a not in opts], found
 
 
 def _template_edit_target(tpl: Dict[str, Any], name: str, part: Optional[str],
                           path: str) -> Tuple[Dict[str, Any], str]:
-    """The dict `path` is edited in (the template or one of its parts) and
-    a label for replies."""
+    """The dict `path` is edited in (an entity template, one of its parts, or
+    a partial's data) and a label for replies."""
     check_store_path(path)
+    if _is_partial(tpl):
+        if part is not None:
+            raise VTTError(f"`{name}` is a partial template; it has no parts.")
+        if TEMPLATE_MARKER in path.split(".") or path == TEMPLATE_REMOVED:
+            raise VTTError(f"`{TEMPLATE_MARKER}` / `{TEMPLATE_REMOVED}` are "
+                           f"references; edit them with `!template import`.")
+        return tpl.setdefault("data", {}), f"partial `{name}`"
     root = path.split(".", 1)[0]
     if root not in _TEMPLATE_EDIT_FIELDS:
         raise VTTError(
@@ -3201,23 +3365,43 @@ def _fmt_age(seconds: float) -> str:
     return f"{s // 3600} h {s % 3600 // 60} min"
 
 
+def _expanded_template(tpl: Dict[str, Any], m: Match) -> Dict[str, Any]:
+    """`tpl` with every partial reference resolved (markers dropped): what a
+    spawn or a give gets."""
+    if _is_partial(tpl):
+        return strip_markers(m.template_materialize(tpl.get("data") or {},
+                                                    root=True))
+    out = {k: copy.deepcopy(v) for k, v in tpl.items()
+           if k not in ("saved_by", "saved_by_name")}
+    out["vars"] = strip_markers(m.template_materialize(out.get("vars") or {}))
+    parts = out.get("parts")
+    for p in (parts.values() if isinstance(parts, dict) else parts or []):
+        if isinstance(p, dict) and "vars" in p:
+            p["vars"] = strip_markers(m.template_materialize(p["vars"]))
+    return out
+
+
 @registry.command(
     "template", snapshot=True,
-    usage="!template <save|spawn|list|show|import|set|unset|part|rename|copy|delete|trash|restore> ...",
+    usage="!template <save|spawn|give|list|show|import|set|unset|part|rename|copy|delete|trash|restore|resync|detach|refs> ...",
     desc=(
-        "This server's saved entity templates, shared by all its matches and "
-        "kept on disk (even when the CLI / GUI don't keep matches). A "
-        "template is a unit as JSON — vars (current hp included), statuses, "
-        "passives, clamps, facing and its whole body-part tree — without an "
-        "id or position: its NAME is the id spawned units take (`guardsman`, "
-        "`guardsman2`, ...). `save <unit> [name]` (a host of this channel's "
-        "match), `spawn <name> <x> <y> [near=<radius>]`, `list`, `show <name> "
-        "[path] [compact] [part=<part>]`, `import <name> <json>` (create, or "
-        "replace with JSON edited anywhere), `set` / `unset`, `part remove`, "
-        "`rename`, `copy`, `delete`, `trash` / `restore`. Only whoever saved a "
-        "template, or a server administrator, can change or delete it. "
-        "Formulas: summon_template / summon_template_near / has_template / "
-        "template_names. " + _TEMPLATE_EDIT_NOTE
+        "This server's library of saved templates, shared by all its matches "
+        "and kept on disk (even when the CLI / GUI don't keep matches). An "
+        "ENTITY template is a unit as JSON — vars (current hp included), "
+        "statuses, passives, clamps, facing and its body-part tree — without an "
+        "id or position; its NAME is the id spawned units take (`guardsman`, "
+        "`guardsman2`, ...). A PARTIAL template is a reusable container (an "
+        "`axe_common` item, an `orc_base` statblock) that units and templates "
+        "reference: a unit holds a full copy plus a record of what it changed, "
+        "and saving the unit stores only those changes. `save <unit> [name] "
+        "[path=<var.path>]`, `spawn`, `give <partial> <unit> <path>`, `list`, "
+        "`show <name> [path] [compact] [expanded] [part=]`, `import <name> "
+        "<json>`, `set` / `unset`, `part remove`, `rename`, `copy`, `delete`, "
+        "`trash` / `restore`, `resync <unit> [path]`, `detach <unit> [path]`, "
+        "`refs <unit>`. Only whoever saved a template, or a server "
+        "administrator, can change or delete it. Formulas: summon_template / "
+        "summon_template_near / give_template / has_template / template_names "
+        "/ template_of. " + _TEMPLATE_EDIT_NOTE
     ),
 )
 async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -3239,53 +3423,99 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "show":
         if await return_help_if_not_enough_args(ctx, args, 2, "template", "show"):
             return
-        usage = "!template show <name> [path] [compact] [part=<part>]"
-        words, part = _template_options(args, 2, usage)
-        compact = bool(words) and words[-1].lower() == "compact"
-        if compact:
-            words = words[:-1]
+        usage = "!template show <name> [path] [compact] [expanded] [part=<part>]"
+        words, opts = _template_options(args, 2, usage)
+        part = opts.get("part")
+        flags = set()
+        while words and words[-1].lower() in ("compact", "expanded"):
+            flags.add(words.pop().lower())
         if len(words) > 1:
             raise VTTError(f"Unexpected `{' '.join(words[1:])}` — usage: "
                            f"`{usage}`.")
         name, tpl = _get_template(mgr, args[1])
-        body = {k: v for k, v in tpl.items()
-                if k not in ("saved_by", "saved_by_name")}
+        raw = {k: v for k, v in tpl.items()
+               if k not in ("saved_by", "saved_by_name")}
+        views = [("", raw)]
+        if "expanded" in flags:
+            views.append(("expanded", _expanded_template(
+                tpl, _template_resolver(mgr, ctx, library=True))))
         label = f"**template `{name}`**"
+        out = []
+        for tag, body in views:
+            if part is not None:
+                if _is_partial(tpl):
+                    raise VTTError(f"`{name}` is a partial template; it has "
+                                   f"no parts.")
+                _key, body = template_part(body, name, part)
+            if words:
+                path = words[0]
+                base = body.get("data") if (_is_partial(tpl) and not tag) \
+                    else body
+                try:
+                    body = _get_path(base, path)
+                except FormulaError:
+                    raise VTTError(f"Template `{name}`"
+                                   + (f" part `{part}`" if part else "")
+                                   + f" has nothing at `{path}`.")
+            out.append((f"*{tag}:*\n" if tag else "")
+                       + _json_block(body, "compact" in flags))
         if part is not None:
-            _key, body = template_part(tpl, name, part)
             label += f" part `{part}`"
         if words:
-            path = words[0]
-            try:
-                body = _get_path(body, path)
-            except FormulaError:
-                raise VTTError(f"Template `{name}`"
-                               + (f" part `{part}`" if part else "")
-                               + f" has nothing at `{path}`.")
-            label += f" `{path}`"
+            label += f" `{words[0]}`"
         elif part is None:
             label += f" ({_template_summary(name, tpl)})"
-        return await ctx.send(f"{label}\n{_json_block(body, compact)}")
+        return await ctx.send(label + "\n" + "\n".join(out))
 
     if sub == "save":
         if await return_help_if_not_enough_args(ctx, args, 2, "template", "save"):
             return
-        _check_tail(args, 3, (), "!template save <unit> [name]")
+        usage = "!template save <unit> [name] [path=<var.path>]"
+        words, opts = _template_options(args, 1, usage, allowed=("path",))
+        if len(words) > 2:
+            raise VTTError(f"Unexpected `{' '.join(words[2:])}` — usage: "
+                           f"`{usage}`.")
         m = active_match(mgr, ctx)
         _template_may_save(ctx, mgr)
-        e = m.entities.get(args[1])
+        e = m.entities.get(words[0])
         if e is None:
-            raise NotFound(f"Entity '{args[1]}' not found.")
-        name = check_template_name(args[2] if len(args) > 2 else e.id)
-        data = m.capture_template(e)
-        data, _ = check_template(data, name)
-        verb, notes = _store_template(ctx, mgr, name, data)
-        parts = data.get("parts") or []
-        return await ctx.send("\n".join(
-            [f"💾 {verb} template `{name}` from `{e.id}`"
-             + (f" with {len(parts)} body part(s)" if parts else "")
-             + f". `!template spawn {name} <x> <y>` makes `{name}`, "
-               f"`{name}2`, ..."] + notes))
+            raise NotFound(f"Entity '{words[0]}' not found.")
+        notes: List[str] = []
+        path = opts.get("path")
+        if path is not None:
+            default = e.id if path in ("", ".") else path.split(".")[-1]
+            name = check_template_name(words[1] if len(words) > 1 else default)
+            data = {"kind": "partial",
+                    "data": m.capture_partial(e, path, notes)}
+        else:
+            name = check_template_name(words[1] if len(words) > 1 else e.id)
+            data = m.capture_template(e, notes=notes)
+        data, _ = check_template(data, name, mgr.templates)
+        if m.rules.get("template_pinning", False):
+            # The save diffed against this match's pins; say where the
+            # library has moved on since.
+            for r in sorted(set(template_refs_of(data))):
+                pin = m.template_pins.get(r)
+                lib = mgr.templates.get(r)
+                if (pin is not None and isinstance(lib, dict)
+                        and lib.get("data") != pin.get("data")):
+                    notes.append(f"`{r}` is pinned in this match and the "
+                                 f"library's version differs; the saved "
+                                 f"changes are against the pinned one.")
+        verb, more = _store_template(ctx, mgr, name, data)
+        if _is_partial(data):
+            src = (f"`{e.id}`'s vars" if path in ("", ".")
+                   else f"`{e.id}` `{path}`")
+            msg = (f"💾 {verb} partial template `{name}` from {src}. "
+                   f"`!template give {name} <unit> <path>` hands it out.")
+        else:
+            parts = data.get("parts") or []
+            msg = (f"💾 {verb} template `{name}` from `{e.id}`"
+                   + (f" with {len(parts)} body part(s)" if parts else "")
+                   + f". `!template spawn {name} <x> <y>` makes `{name}`, "
+                     f"`{name}2`, ...")
+        return await ctx.send("\n".join([msg] + [f"⚠️ {n}" for n in notes]
+                                        + more))
 
     if sub == "import":
         if await return_help_if_not_enough_args(ctx, args, 3, "template", "import"):
@@ -3298,7 +3528,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         except ValueError as ex:
             raise VTTError(f"That isn't valid JSON ({ex}). Paste it after the "
                            f"name, e.g. as `!template show` prints it.")
-        data, checks = check_template(data, name)
+        data, checks = check_template(data, name, mgr.templates)
         verb, notes = _store_template(ctx, mgr, name, data)
         msg = (f"💾 {verb} template `{name}` from JSON "
                f"({_template_summary(name, data)}).")
@@ -3315,7 +3545,8 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         name, tpl = _get_template(mgr, args[1])
         _require_saver(ctx, name, tpl, "edit")
         path = args[2]
-        _words, part = _template_options(args, need, usage)
+        _words, opts = _template_options(args, need, usage)
+        part = opts.get("part")
         if _words:
             raise VTTError(f"Unexpected `{' '.join(_words)}` — usage: "
                            f"`{usage}`. Quote a value that contains spaces.")
@@ -3323,7 +3554,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         target, where = _template_edit_target(new, name, part, path)
         if sub == "set":
             value = _parse_scalar(args[3])
-            if path in ("name", "facing"):
+            if path in ("name", "facing") and not _is_partial(tpl):
                 value = str(value)
             check_no_value_ancestor(target, path, f"Template {where}")
             _set_path(target, path, value)
@@ -3335,7 +3566,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if not isinstance(cur, dict) or keys[-1] not in cur:
                 raise VTTError(f"Template {where} has nothing at `{path}`.")
             del cur[keys[-1]]
-        new, _ = check_template(new, name)
+        new, _ = check_template(new, name, mgr.templates)
         _verb, notes = _store_template(
             ctx, mgr, name, new,
             saver=(tpl.get("saved_by"), tpl.get("saved_by_name")))
@@ -3354,10 +3585,12 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         _check_tail(args, 4, (), "!template part remove <name> <part>")
         name, tpl = _get_template(mgr, args[2])
+        if _is_partial(tpl):
+            raise VTTError(f"`{name}` is a partial template; it has no parts.")
         _require_saver(ctx, name, tpl, "edit")
         new = copy.deepcopy(tpl)
         gone = template_remove_part(new, name, args[3])
-        new, _ = check_template(new, name)
+        new, _ = check_template(new, name, mgr.templates)
         _verb, notes = _store_template(
             ctx, mgr, name, new,
             saver=(tpl.get("saved_by"), tpl.get("saved_by_name")))
@@ -3365,52 +3598,155 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                f"template `{name}`.")
         return await ctx.send("\n".join([msg] + notes))
 
-    if sub in ("rename", "copy"):
+    if sub == "copy":
         if await return_help_if_not_enough_args(ctx, args, 3, "template", sub):
             return
-        _check_tail(args, 3, (), f"!template {sub} <name> <new_name>")
+        _check_tail(args, 3, (), "!template copy <name> <new_name>")
         name, tpl = _get_template(mgr, args[1])
         new_name = check_template_name(args[2])
         if new_name == name:
             raise VTTError(f"`{new_name}` is already this template's name.")
-        if sub == "copy":
-            _template_may_save(ctx, mgr)
-            data = {k: copy.deepcopy(v) for k, v in tpl.items()
-                    if k not in ("saved_by", "saved_by_name")}
-            verb, notes = _store_template(ctx, mgr, new_name, data)
-            return await ctx.send("\n".join(
-                [f"📄 {verb} template `{new_name}` as a copy of `{name}`."]
-                + notes))
+        _template_may_save(ctx, mgr)
+        data = {k: copy.deepcopy(v) for k, v in tpl.items()
+                if k not in ("saved_by", "saved_by_name")}
+        data, _ = check_template(data, new_name, mgr.templates)
+        verb, notes = _store_template(ctx, mgr, new_name, data)
+        return await ctx.send("\n".join(
+            [f"📄 {verb} template `{new_name}` as a copy of `{name}`."]
+            + notes))
+
+    if sub == "rename":
+        if await return_help_if_not_enough_args(ctx, args, 3, "template", sub):
+            return
+        usage = "!template rename <name> <new_name> [force]"
+        force = len(args) > 3 and args[3].lower() == "force"
+        _check_tail(args, 4 if force else 3, (), usage)
+        name, tpl = _get_template(mgr, args[1])
+        new_name = check_template_name(args[2])
+        if new_name == name:
+            raise VTTError(f"`{new_name}` is already this template's name.")
         _require_saver(ctx, name, tpl, "rename")
-        notes = []
-        st = storage_of(mgr)
+        deps = _template_dependents(mgr, name)
+        if deps and not force:
+            raise VTTError(
+                f"`{name}` is referenced by {', '.join(f'`{d}`' for d in deps)}."
+                f" `!template rename {name} {new_name} force` (a server "
+                f"administrator) renames it and updates those references.")
+        if deps and not ctx_is_admin(ctx):
+            raise VTTError("Renaming a referenced partial needs a server "
+                           "administrator.")
         old = mgr.templates.get(new_name)
         if old is not None:
             _require_saver(ctx, new_name, old, "replace")
+
+        def repoint(node: Dict[str, Any]) -> Dict[str, Any]:
+            if node.get(TEMPLATE_MARKER) != name:
+                return node
+            out = {k: copy.deepcopy(v) for k, v in node.items()}
+            out[TEMPLATE_MARKER] = new_name
+            return out
+        # The library as it would be, checked before anything moves: taking
+        # over a name others reference can close a cycle.
+        after = {n: t for n, t in mgr.templates.items()
+                 if n not in (name, new_name)}
+        after[new_name] = tpl
+        for d in deps:
+            after[d] = _rewrite_template_refs(mgr.templates[d], repoint)
+        for n in [new_name] + deps + [n for n in after
+                                      if new_name in template_refs_of(after[n])]:
+            check_template_refs(n, after[n], after)
+        notes = []
+        st = storage_of(mgr)
+        if old is not None:
             if st is not None and st.trash_template(mgr, new_name):
                 notes.append(f"The `{new_name}` it replaced is kept 24 hours "
                              f"(`!template restore {new_name}`).")
         if st is not None:
             st.rename_template_file(mgr, name, new_name)
         mgr.templates[new_name] = mgr.templates.pop(name)
+        invalidate_partial_cache()
+        for d in deps:
+            dt = mgr.templates[d]
+            _v, more = _store_template(
+                ctx, mgr, d, _rewrite_template_refs(dt, repoint),
+                saver=(dt.get("saved_by"), dt.get("saved_by_name")),
+                check_saver=False)
+            notes += [n for n in more if "previous version" not in n]
+        if deps:
+            notes.append(f"Updated the references in "
+                         f"{', '.join(f'`{d}`' for d in deps)} (their previous "
+                         f"versions are kept 24 hours). Units built from "
+                         f"`{name}` keep that name in their markers until "
+                         f"resynced or saved.")
         return await ctx.send("\n".join(
             [f"🏷️ Renamed template `{name}` to `{new_name}`"
              + (" (replacing the old one)." if old is not None else ".")
-             + f" New spawns are `{new_name}`, `{new_name}2`, ..."] + notes))
+             + ("" if _is_partial(mgr.templates[new_name]) else
+                f" New spawns are `{new_name}`, `{new_name}2`, ...")] + notes))
 
     if sub in ("delete", "del", "rm", "remove"):
         if await return_help_if_not_enough_args(ctx, args, 2, "template", "delete"):
             return
-        _check_tail(args, 2, (), "!template delete <name>")
+        usage = "!template delete <name> [force]"
+        force = len(args) > 2 and args[2].lower() == "force"
+        _check_tail(args, 3 if force else 2, (), usage)
         name, tpl = _get_template(mgr, args[1])
         _require_saver(ctx, name, tpl, "delete")
+        deps = _template_dependents(mgr, name)
+        if deps and not force:
+            raise VTTError(
+                f"`{name}` is referenced by {', '.join(f'`{d}`' for d in deps)}."
+                f" `!template delete {name} force` (a server administrator) "
+                f"deletes it and writes its current contents into those "
+                f"templates in place of the reference.")
+        if deps and not ctx_is_admin(ctx):
+            raise VTTError("Deleting a referenced partial needs a server "
+                           "administrator.")
+        resolver = _template_resolver(mgr, ctx, library=True)
+        inlined: Dict[str, Dict[str, Any]] = {}
+
+        def inline(node: Dict[str, Any]) -> Any:
+            if node.get(TEMPLATE_MARKER) != name:
+                return node
+            # Write the partial's own (file-form) data into the reference,
+            # so a reference IT holds (`l1` extending `l0`) survives; when
+            # the two layers' removals and changes don't combine into the
+            # same result, write the resolved data in full instead.
+            want = strip_markers(resolver.template_materialize(node, root=True))
+            merged = _merge_file_layers(tpl.get("data") or {}, node)
+            try:
+                same = strip_markers(resolver.template_materialize(
+                    merged, root=True)) == want
+            except VTTError:
+                same = False
+            if same:
+                return merged
+            live = resolver.template_materialize(node)
+            live.pop(TEMPLATE_MARKER, None)
+            return resolver.template_file_form(live)
+        for d in deps:
+            inlined[d] = _rewrite_template_refs(mgr.templates[d], inline)
         st = storage_of(mgr)
         kept = st is not None and st.trash_template(mgr, name)
         del mgr.templates[name]
-        return await ctx.send(
-            f"🗑️ Deleted template `{name}`. Units already spawned from it stay."
-            + (f" It is kept 24 hours (`!template restore {name}`)."
-               if kept else ""))
+        invalidate_partial_cache()
+        notes = []
+        for d, new in inlined.items():
+            dt = mgr.templates[d]
+            _v, more = _store_template(
+                ctx, mgr, d, new,
+                saver=(dt.get("saved_by"), dt.get("saved_by_name")),
+                check_saver=False)
+            notes += [n for n in more if "previous version" not in n]
+        if deps:
+            notes.append(f"Wrote `{name}`'s contents into "
+                         f"{', '.join(f'`{d}`' for d in deps)} in place of the "
+                         f"reference (their previous versions are kept 24 "
+                         f"hours).")
+        return await ctx.send("\n".join(
+            [f"🗑️ Deleted template `{name}`. Units already built from it stay."
+             + (f" It is kept 24 hours (`!template restore {name}`)."
+                if kept else "")] + notes))
 
     if sub == "trash":
         _check_tail(args, 2, (), "!template trash [name]")
@@ -3472,7 +3808,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 raw = json.load(f)
         except (OSError, ValueError) as ex:
             raise VTTError(f"That old version can't be read ({type(ex).__name__}).")
-        data, _ = check_template(raw, name)
+        data, _ = check_template(raw, name, mgr.templates)
         if name not in mgr.templates:
             _require_saver(ctx, name, data, "restore")
         verb, notes = _store_template(
@@ -3490,6 +3826,10 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     "!template spawn <name> <x> <y> [near=<radius>]")
         m = active_match(mgr, ctx)
         name, tpl = _get_template(mgr, args[1])
+        if _is_partial(tpl):
+            raise VTTError(f"`{name}` is a partial template: hand it to a unit "
+                           f"with `!template give {name} <unit> <path>`, or "
+                           f"reference it from an entity template.")
         try:
             x, y = int(args[2]), int(args[3])
         except ValueError:
@@ -3512,48 +3852,153 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         lines += [str(x) for x in log]
         return await ctx.send("\n".join(lines))
 
+    if sub == "give":
+        if await return_help_if_not_enough_args(ctx, args, 4, "template", "give"):
+            return
+        _check_tail(args, 4, (), "!template give <partial> <unit> <path>")
+        m = active_match(mgr, ctx)
+        name = check_template_name(args[1])
+        e = m.entities.get(args[2])
+        if e is None:
+            raise NotFound(f"Entity '{args[2]}' not found.")
+        if args[3] in ("", "."):
+            raise VTTError("A partial is given into a var path (`inventory.axe`"
+                           "); a whole unit is built from one through an "
+                           "entity template whose vars reference it.")
+        log = m.give_partial(e, args[3], name)
+        return await ctx.send("\n".join(
+            [f"🎁 Gave `{e.id}` a `{name}` at `{args[3]}`."] + [str(x) for x in log]))
+
+    if sub in ("resync", "detach"):
+        if await return_help_if_not_enough_args(ctx, args, 2, "template", sub):
+            return
+        _check_tail(args, 3, (), f"!template {sub} <unit> [path]")
+        m = active_match(mgr, ctx)
+        e = m.entities.get(args[1])
+        if e is None:
+            raise NotFound(f"Entity '{args[1]}' not found.")
+        path = args[2] if len(args) > 2 else None
+        if sub == "detach":
+            pname = m.detach_container(e, path or "")
+            where = "its vars" if not path or path == "." else f"`{path}`"
+            return await ctx.send(f"🔓 {where} on `{e.id}` is plain data now "
+                                  f"(no longer tracked as `{pname}`).")
+        if path is None:
+            targets = [p for p, _m in _outermost_marked(m, e)]
+            if not targets:
+                raise VTTError(f"Nothing on `{e.id}` is built from a partial "
+                               f"template.")
+        else:
+            targets = [path]
+        log: List[str] = []
+        for p in targets:
+            log += m.resync_container(e, p)
+        shown = ", ".join("its vars" if p in ("", ".") else f"`{p}`"
+                          for p in targets)
+        return await ctx.send("\n".join(
+            [f"🔄 Rebuilt {shown} on `{e.id}` from the current partial "
+             f"template(s), keeping its own changes."] + [str(x) for x in log]))
+
+    if sub == "refs":
+        if await return_help_if_not_enough_args(ctx, args, 2, "template", "refs"):
+            return
+        _check_tail(args, 2, (), "!template refs <unit>")
+        m = active_match(mgr, ctx)
+        eid = _query_eid(ctx, m, args[1])
+        e = m.entities[eid]
+        found = m.template_containers(e)
+        if not found:
+            return await ctx.send(f"Nothing on `{e.id}` is built from a "
+                                  f"partial template.")
+        lines = [f"**Partial templates on `{e.id}`:**"]
+        for p, mk in found:
+            bits = []
+            if mk.get("overrides"):
+                bits.append("changed " + ", ".join(f"`{x}`" for x in mk["overrides"]))
+            if mk.get("removed"):
+                bits.append("removed " + ", ".join(f"`{x}`" for x in mk["removed"]))
+            lines.append(f"- {'(vars)' if not p else f'`{p}`'} ← `{mk['name']}`"
+                         + (": " + "; ".join(bits) if bits else " (unchanged)"))
+        return await ctx.send("\n".join(lines))
+
     return await _help_fallback(ctx, ["template"], args[0])
 
 
+def _outermost_marked(m: Match, e: Entity) -> List[Tuple[str, Dict[str, Any]]]:
+    """The marked containers a full resync rebuilds: the vars root if it is
+    marked (that covers everything), else each outermost marked container."""
+    found = m.template_containers(e)
+    if found and found[0][0] == "":
+        return [found[0]]
+    out: List[Tuple[str, Dict[str, Any]]] = []
+    for p, mk in found:
+        if not any(p == q or p.startswith(q + ".") for q, _ in out):
+            out.append((p, mk))
+    return out
+
+
 for _subs, _usage, _desc in (
-        (("save",), "!template save <unit> [name]",
-         "Save a unit (and its body parts) as a template; the name defaults "
-         "to the unit's id. Needs a host of this channel's match. Saving over "
-         "an existing template replaces it (its saver or an administrator)."),
+        (("save",), "!template save <unit> [name] [path=<var.path>]",
+         "Save a unit (and its body parts) as an entity template; the name "
+         "defaults to the unit's id. With path=, save that container "
+         "(`inventory.axe`, or `.` for all its vars) as a PARTIAL template, "
+         "named after its last key by default. Needs a host of this channel's "
+         "match. Saving over an existing template replaces it (its saver or "
+         "an administrator)."),
         (("spawn",), "!template spawn <name> <x> <y> [near=<radius>]",
-         "Spawn a template at a cell (near=: the nearest free cell within the "
-         "radius). Its id is the template name, numbered when taken."),
+         "Spawn an entity template at a cell (near=: the nearest free cell "
+         "within the radius). Its id is the template name, numbered when "
+         "taken."),
+        (("give",), "!template give <partial> <unit> <path>",
+         "Build a partial template into a unit's var path (replacing what is "
+         "there); the unit's own changes to it are recorded from then on."),
         (("list",), "!template list", "This server's saved templates."),
-        (("show",), "!template show <name> [path] [compact] [part=<part>]",
-         "A template's JSON, or one field of it (`vars`, `vars.hp`); "
-         "`part=` shows a body part; `compact` prints it on one line, easier "
-         "to copy into an editor."),
+        (("show",), "!template show <name> [path] [compact] [expanded] [part=<part>]",
+         "A template's JSON, or one field of it (`vars`, `vars.hp`; a "
+         "partial's paths start inside its data); `part=` shows a body part; "
+         "`compact` prints one line, easier to copy into an editor; "
+         "`expanded` adds the result with every partial reference resolved."),
         (("import",), "!template import <name> <json ...>",
          "Save pasted JSON as a template, or replace one with JSON edited "
          "anywhere (the rest of the line is the JSON; a ```json fence is "
-         "fine). It is checked like any template."),
+         "fine). A partial is {\"kind\": \"partial\", \"data\": {...}}. It is "
+         "checked like any template."),
         (("set",), "!template set <name> <path> <value> [part=<part>]",
          "Set one field of a template: `vars.hp 40`, `name Guard`, "
-         "`facing left`, `status.burn.level 2`; part= edits a body part. "
-         "The result is checked like an import."),
+         "`facing left`, `status.burn.level 2`, a partial's `damage 8`; "
+         "part= edits a body part. The result is checked like an import."),
         (("unset",), "!template unset <name> <path> [part=<part>]",
          "Remove one field of a template (or of a body part with part=)."),
         (("part",), "!template part remove <name> <part>",
          "Remove a body part from a template, with the parts attached under "
          "it; a snake segment behind it follows the next one ahead."),
-        (("rename",), "!template rename <name> <new_name>",
-         "Rename a template (new spawns take the new name)."),
+        (("rename",), "!template rename <name> <new_name> [force]",
+         "Rename a template (new spawns take the new name). A partial other "
+         "templates reference needs `force` (an administrator), which updates "
+         "those references."),
         (("copy",), "!template copy <name> <new_name>",
          "Save a copy under another name; you are the copy's saver."),
-        (("delete",), "!template delete <name>",
+        (("delete",), "!template delete <name> [force]",
          "Delete a template (its saver or a server administrator); it is "
-         "kept 24 hours."),
+         "kept 24 hours. A partial other templates reference needs `force` "
+         "(an administrator), which writes its contents into them in place "
+         "of the reference."),
         (("trash",), "!template trash [name]",
          "Replaced, edited and deleted template versions from the last 24 "
          "hours (cut first when the server nears its storage limit)."),
         (("restore",), "!template restore <name> [n]",
          "Bring back an old version (#1 = the newest); the current one, if "
-         "any, goes to the trash.")):
+         "any, goes to the trash."),
+        (("resync",), "!template resync <unit> [path]",
+         "Rebuild a unit's container (`.` = all its vars; none = every one) "
+         "from its partial template as the match sees it now, keeping the "
+         "unit's own changes."),
+        (("detach",), "!template detach <unit> [path]",
+         "Stop tracking a container (`.` / none = the vars root) as built "
+         "from a partial: it stays as plain data."),
+        (("refs",), "!template refs <unit>",
+         "Which of a unit's containers are built from partial templates, and "
+         "what the unit changed in each.")):
     registry.annotate_sub("template", *_subs, usage=_usage, desc=_desc)
 
 

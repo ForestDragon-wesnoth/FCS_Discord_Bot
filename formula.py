@@ -392,7 +392,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import CURRENT_WORKSPACE, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number
+from logic import CURRENT_WORKSPACE, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number
 
 
 class FormulaError(VTTError):
@@ -2444,6 +2444,11 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   has_template(name) / template_names()    -> read the library
     "summon_template", "summon_template_near", "has_template",
     "template_names",
+    # Partial templates on a unit's vars:
+    #   give_template(eid, path, name) -> True (build partial `name` at path)
+    #   template_of(eid, path="")      -> the partial a container is built
+    #                                     from, or None
+    "give_template", "template_of",
     # Death / corpse family. kill / revive route through the same
     # death pipeline as the natural-death chokepoint; the introspection
     # trio (has_corpse, corpse_at, all_corpses) reads tile-data
@@ -2661,7 +2666,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "emit",
     "use_action",
     "summon", "summon_near", "summon_from", "remove_entity",
-    "summon_template", "summon_template_near",
+    "summon_template", "summon_template_near", "give_template",
     "kill", "revive", "transform", "revert",
     "schedule", "schedule_on", "cancel_schedule",
     "log",
@@ -2679,7 +2684,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
 # never silently expose a function in $() args. When unsure, classify a
 # function as MUTATING (leave it out of this set).
 ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
-    'has_template', 'template_names',
+    'has_template', 'template_names', 'template_of',
     'flanking', 'flanking_angle', 'flanking_line', 'nearest_cell',
     'visible_entities', 'random_cell', 'random_free_cell',
     'all_corpses', 'all_entities', 'aoe_origin', 'apply_mods',
@@ -5124,19 +5129,21 @@ class FormulaEngine:
             """var_keys(eid, path=""): keys at a dotted vars path.
             Empty path = top-level var names. Non-dict at the path
             errors (you can't list keys of a scalar). Returns insertion
-            order — formulas iterating this get a stable order."""
+            order — formulas iterating this get a stable order. Engine
+            keys (`__template`, `__follows`, any `__name`) are left out, so
+            a loop over an inventory sees only its items."""
             _, e = _resolve_entity(eid_t, "var_keys")
             if not isinstance(path, str):
                 raise FormulaError("var_keys(eid, path): path must be a string.")
             if not path:
-                return list(e.vars.keys())
+                return [k for k in e.vars if not str(k).startswith("__")]
             v = _walk_vars(e, path, must_exist=True)
             if not isinstance(v, dict):
                 raise FormulaError(
                     f"var_keys(`{e.id}`, '{path}'): not a dict "
                     f"({type(v).__name__})."
                 )
-            return list(v.keys())
+            return [k for k in v if not str(k).startswith("__")]
 
         def _var_has(eid_t: Any, path: Any) -> bool:
             """var_has(eid, path): True iff the dotted vars path resolves
@@ -5963,6 +5970,42 @@ class FormulaEngine:
             Loopable."""
             return sorted(_workspace_templates())
 
+        def _give_template(eid_t: Any, path: Any, name: Any) -> bool:
+            """give_template(eid, path, name): build partial template `name`
+            at the unit's var `path` (replacing what is there), marked so
+            the unit's own changes to it are recorded (`!template give`).
+            Returns True."""
+            _, e = _resolve_entity(eid_t, "give_template")
+            if not isinstance(path, str) or not path or path == ".":
+                raise FormulaError("give_template: path must be a var path "
+                                   "(`inventory.axe`).")
+            if not isinstance(name, str):
+                raise FormulaError("give_template: the template name must "
+                                   "be text.")
+            try:
+                match.surface_log(match.give_partial(
+                    e, path, name.strip().lower()))
+            except (VTTError, NotFound) as ex:
+                raise FormulaError(f"give_template: {ex}")
+            engine._note_affected(e.id)
+            return True
+
+        def _template_of(eid_t: Any, path: Any = "") -> Any:
+            """template_of(eid, path=""): the name of the partial template
+            the container at `path` ('' = the unit's vars) is built from,
+            or None."""
+            _, e = _resolve_entity(eid_t, "template_of")
+            if not isinstance(path, str):
+                raise FormulaError("template_of(eid, path): path must be a "
+                                   "string.")
+            node: Any = e.vars
+            for k in ([] if path in ("", ".") else path.split(".")):
+                node = node.get(k) if isinstance(node, dict) else None
+            mk = node.get(TEMPLATE_MARKER) if isinstance(node, dict) else None
+            return mk.get("name") if isinstance(mk, dict) else None
+
+        ns["give_template"]        = _give_template
+        ns["template_of"]          = _template_of
         ns["summon_template"]      = _summon_template
         ns["summon_template_near"] = _summon_template_near
         ns["has_template"]         = _has_template

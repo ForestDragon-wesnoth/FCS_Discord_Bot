@@ -20279,3 +20279,343 @@ replace bob's template, but may copy it (the copy is hers). A server
 administrator (the harness owner) may edit it, and the template stays bob's.
 Restoring an old version replaces the current one, so the same rule applies:
 cara is refused, bob brings back the hp 20 version.
+
+SCENARIO 727 — Partial templates: give, track changes, back to the norm
+-----------------------------------------------------------------------
+
+!match new t727 Armory 10 6
+!match use t727
+!template import weapon_base {"kind": "partial", "data": {"type": "weapon", "durability": 50, "flavor": "plain", "tags": ["metal"]}}
+!template import axe_common {"kind": "partial", "data": {"__template": "weapon_base", "damage": 6, "flavor": "an axe", "actions": {"chop": {"target": "entity", "cost": 2, "body": "entity[target].hp = entity[target].hp - source.damage"}}}}
+!template list
+?? `axe_common` — partial, 3 field(s), extends `weapon_base`
+!ent add hero Hero 30 2 2 5
+!ent add dummy Dummy 40 4 2 1
+!template give axe_common hero inventory.axe
+?? Gave `hero` a `axe_common` at `inventory.axe`
+!assert "entity[hero].inventory.axe.damage == 6 and entity[hero].inventory.axe.durability == 50"
+!assert "template_of('hero', 'inventory.axe') == 'axe_common' and template_of('hero') == None"
+!assert "var_keys('hero', 'inventory.axe') == ['type', 'durability', 'flavor', 'tags', 'damage', 'actions']"
+!action hero chop dummy
+!assert "entity[dummy].hp == 34"
+!ent set_var hero inventory.axe.damage 9
+!ent set_var hero inventory.axe.actions.chop.cost 2
+!ent delete_var hero inventory.axe.flavor
+!template refs hero
+?? `inventory.axe` ← `axe_common`: changed `damage`; removed `flavor`
+!ent set_var hero inventory.axe.damage 6
+!template refs hero
+?? removed `flavor`
+!ent set_var hero inventory.axe.flavor "an axe"
+!template refs hero
+?? `inventory.axe` ← `axe_common` (unchanged)
+!ent set_var hero inventory.axe.durability 49
+!eval "var_set('hero', 'inventory.axe.tags', ['wood'])"
+!template refs hero
+?? changed `durability`, `tags`
+!ent set_var hero inventory.axe.__template.name sword
+?? __template
+!eval "var_set('hero', 'inventory.axe.__template', 'sword')"
+?? __template
+!assert "template_of('hero', 'inventory.axe') == 'axe_common'"
+!dist $(give_template('hero','inventory.bow','axe_common')) 1 1 1
+?? banned in a $() inline argument
+!assert "not var_has('hero', 'inventory.bow')"
+!template give hero_tpl hero inventory.x
+?? There is no partial template `hero_tpl`
+
+Expected: HARNESS-ALLOWS-ERRORS. Two partials: `axe_common` extends
+`weapon_base` (its own `flavor` replaces the base's). `!template give` builds
+the full axe into `hero`'s `inventory.axe` — the base's fields plus the axe's,
+marked so its changes are tracked — and its chop action works like any
+action stored in vars. `var_keys` lists the axe's fields without the marker.
+Setting damage to 9 records `damage`; setting the chop cost to its current
+value records nothing; deleting `flavor` records it as removed. Setting
+damage back to the partial's 6 takes it off the list, and writing `flavor`
+back with the partial's value clears the removal: the axe reads as unchanged.
+A list is recorded whole (`tags`). The marker can't be
+written by `!ent set_var` or a formula, `give_template` is a state-changing
+function and so is refused inside `$()`, and giving a name that isn't a
+partial is refused.
+
+SCENARIO 728 — Partial templates: whole-unit inheritance, save writes only the changes
+---------------------------------------------------------------------------------------
+
+!match new t728 Camp 12 8
+!match use t728
+!template import axe_common {"kind": "partial", "data": {"damage": 6, "flavor": "an axe"}}
+!template import orc_base {"kind": "partial", "data": {"hp": 30, "max_hp": 30, "initiative": 4, "team": "orcs", "footprint_w": 2, "footprint_h": 2, "inventory": {"axe": {"__template": "axe_common"}}}}
+!template import orc_archer {"name": "Orc Archer", "vars": {"__template": "orc_base", "hp": 24, "max_hp": 24, "inventory": {"bow": {"damage": 4}}}}
+!template show orc_archer vars expanded
+?? "footprint_w": 2
+!template spawn orc_archer 2 2
+?? Spawned `orc_archer` from template `orc_archer` at (2,2)
+!assert "entity[orc_archer].hp == 24 and entity[orc_archer].initiative == 4"
+!assert "len(footprint_cells('orc_archer')) == 4 and occupies('orc_archer', 3, 3)"
+!assert "entity[orc_archer].inventory.axe.damage == 6 and entity[orc_archer].inventory.bow.damage == 4"
+!assert "template_of('orc_archer') == 'orc_base' and template_of('orc_archer', 'inventory.axe') == 'axe_common'"
+!template refs orc_archer
+?? (vars) ← `orc_base`: changed `hp`, `inventory.bow`, `max_hp`
+?? `inventory.axe` ← `axe_common` (unchanged)
+!ent hp orc_archer -4
+!ent set_var orc_archer inventory.axe.damage 8
+!ent move orc_archer 2 right
+!template save orc_archer veteran
+?? Saved template `veteran` from `orc_archer`
+!template show veteran vars compact
+?? {"__template":"orc_base","hp":20,"inventory":{"axe":{"__template":"axe_common","damage":8},"bow":{"damage":4}},"max_hp":24}
+!template spawn veteran 8 5
+!assert "entity[veteran].hp == 20 and entity[veteran].inventory.axe.damage == 8"
+!assert "entity[veteran].inventory.axe.flavor == 'an axe' and len(footprint_cells('veteran')) == 4"
+!template save orc_archer axe_kit path=inventory.axe
+?? Saved partial template `axe_kit` from `orc_archer` `inventory.axe`
+!template show axe_kit compact
+?? {"data":{"__template":"axe_common","damage":8},"kind":"partial"}
+!template save orc_archer orc_line path=.
+?? Saved partial template `orc_line` from `orc_archer`'s vars
+!template show orc_line compact
+?? {"data":{"__template":"orc_base","hp":20,"inventory":{"axe":{"__template":"axe_common","damage":8},"bow":{"damage":4}},"max_hp":24},"kind":"partial"}
+!template import loop_a {"kind": "partial", "data": {"__template": "loop_b"}}
+?? isn't a partial template
+!template import loop_a {"kind": "partial", "data": {"x": 1}}
+!template import loop_b {"kind": "partial", "data": {"__template": "loop_a"}}
+!template import loop_a {"kind": "partial", "data": {"__template": "loop_b"}}
+?? cycle
+!template import self_ref {"kind": "partial", "data": {"__template": "self_ref"}}
+?? references itself
+!template spawn axe_common 5 5
+?? is a partial template
+!template import bad {"name": "Bad", "vars": {"hp": 5, "bag": {"__template": "orc_archer"}}}
+?? isn't a partial template
+
+Expected: HARNESS-ALLOWS-ERRORS. `orc_archer` is an entity template whose
+vars are built from the partial `orc_base` (`vars.__template`), which itself
+holds an `axe_common` axe. `show ... expanded` prints the resolved vars
+next to the raw ones. A spawn materializes the whole chain: the archer is a
+2×2 orc with initiative 4 and an axe, plus its own hp 24 and bow. Its vars
+root is marked with what the template changed (`hp`, `max_hp`,
+`inventory.bow`); the axe has its own marker. After the archer takes 4
+damage, sharpens its axe to 8 and moves, `!template save` writes only the
+changes against `orc_base`: hp 20, max_hp 24, the bow, and the axe as a
+reference plus damage 8 (position and id aren't template data); a spawn
+of `veteran` gets them back. `path=` saves a container as a partial: the
+axe becomes `axe_kit` (extending `axe_common` with damage 8), `.` saves all
+the vars as `orc_line` (extending `orc_base` with the same changes the
+entity template recorded). A reference to a template that isn't a partial, a
+self-reference and a reference cycle are refused; a partial can't be
+spawned.
+
+SCENARIO 729 — Partial templates: resync after a library edit, detach, forced delete and rename
+-------------------------------------------------------------------------------------------------
+
+!match new t729 Forge 10 6
+!match use t729
+!host add bob
+!template import axe_common {"kind": "partial", "data": {"damage": 6, "weight": 3, "flavor": "an axe"}}
+!template import raider {"name": "Raider", "vars": {"hp": 20, "inventory": {"axe": {"__template": "axe_common", "weight": 2}}}}
+!ent add smith Smith 10 1 1 3
+!template spawn raider 4 4
+!template give axe_common smith tools.axe
+!ent set_var smith tools.axe.damage 7
+!template set axe_common damage 10
+!template set axe_common edge keen
+!assert "entity[smith].tools.axe.damage == 7 and not var_has('smith', 'tools.axe.edge')"
+!template resync smith
+?? Rebuilt `tools.axe` on `smith`
+!assert "entity[smith].tools.axe.damage == 7 and entity[smith].tools.axe.edge == 'keen'"
+!template refs smith
+?? changed `damage`
+!template resync raider inventory.axe
+!assert "entity[raider].inventory.axe.damage == 10 and entity[raider].inventory.axe.weight == 2"
+!template delete axe_common
+?? `axe_common` is referenced by `raider`
+!as player bob
+!template delete axe_common force
+?? only they or a server administrator can delete it
+!template import trinket {"kind": "partial", "data": {"shine": 1}}
+!template import bauble {"kind": "partial", "data": {"__template": "trinket"}}
+!template delete trinket force
+?? needs a server administrator
+!as host
+!template rename axe_common hatchet force
+?? Renamed template `axe_common` to `hatchet`
+?? Updated the references in `raider`
+!template show raider vars.inventory.axe compact
+?? {"__template":"hatchet","weight":2}
+!template resync smith tools.axe
+?? There is no partial template `axe_common`
+!template save smith smith_t
+?? Partial `axe_common` can't be used
+!template show smith_t vars.tools.axe compact
+?? {"damage":7,"edge":"keen","flavor":"an axe","weight":3}
+!template delete hatchet force
+?? Deleted template `hatchet`
+?? Wrote `hatchet`'s contents into `raider`
+!template show raider vars.inventory.axe compact
+?? {"damage":10,"edge":"keen","flavor":"an axe","weight":2}
+!template restore hatchet
+?? Restored template `hatchet`
+!template detach raider inventory.axe
+?? `inventory.axe` on `raider` is plain data now
+!assert "template_of('raider', 'inventory.axe') == None and entity[raider].inventory.axe.weight == 2"
+!ent set_var raider inventory.axe.__template.name x
+?? __template
+!template detach raider inventory.axe
+?? isn't built from a partial template
+!template resync raider
+?? Nothing on `raider` is built from a partial template
+!template import l0 {"kind": "partial", "data": {"a": 1, "z": 0}}
+!template import l1 {"kind": "partial", "data": {"__template": "l0", "b": 1, "__removed": ["z"]}}
+!template import l2 {"kind": "partial", "data": {"__template": "l1", "c": 1}}
+!template delete l1 force
+!template show l2 compact
+?? {"data":{"__removed":["z"],"__template":"l0","b":1,"c":1},"kind":"partial"}
+
+Expected: HARNESS-ALLOWS-ERRORS. A library edit (damage 10, a new `edge`)
+doesn't reach units already built from `axe_common`. `!template resync`
+rebuilds the smith's axe from the current partial and keeps its own change
+(damage 7 stays, `edge` arrives); the raider's axe gets damage 10 and keeps
+its template's weight 2. Deleting a partial another template references is
+refused. A forced delete needs the template's saver or an administrator,
+and when the partial is referenced, an administrator: bob, a co-host who
+saved `trinket` and `bauble`, can't force-delete `trinket`.
+A forced rename (the harness owner is an administrator) updates `raider`'s
+reference to `hatchet`; the smith's marker keeps the old name, so its resync
+is refused and saving it writes the axe in full without a reference, with a
+note. A forced delete of `hatchet` writes its contents into `raider` in
+place of the reference (damage 10 and `edge` from the library, weight 2 from
+the raider) and keeps the deleted version 24 hours. Detach turns a marked
+container into plain data; a second detach and a resync of a unit without
+markers are refused. Deleting `l1`, which extends `l0`, writes `l1`'s own
+layer into `l2`: `l2` now extends `l0` directly, with `b`, `c` and the
+removal of `z`.
+
+SCENARIO 730 — Partial templates: pinning keeps a match on the versions it used
+---------------------------------------------------------------------------------
+
+!match new t730 Siege 10 6
+!match use t730
+!system set default template_pinning true
+!template import axe_common {"kind": "partial", "data": {"damage": 6}}
+!ent add a A 10 1 1 3
+!ent add b B 10 3 1 3
+!match templates
+?? No pinned partial templates (template_pinning is on)
+!template give axe_common a axe
+!template set axe_common damage 9
+!template give axe_common b axe
+!assert "entity[b].axe.damage == 6"
+!eval "give_template('b', 'spare', 'axe_common')"
+!assert "entity[b].spare.damage == 6"
+!match templates
+?? `axe_common` — pinned at turn 0, the library's version differs
+!ent set_var a axe.damage 7
+!template save a a_t
+?? `axe_common` is pinned in this match and the library's version differs
+!template show a_t vars.axe compact
+?? {"__template":"axe_common","damage":7}
+!match clone t730b
+!assert "entity[b].axe.damage == 6"
+!as restart
+!match use t730
+!match templates
+?? `axe_common` — pinned at turn 0
+!match templates refresh
+?? Dropped the pin(s) of `axe_common`
+!template give axe_common b axe
+!assert "entity[b].axe.damage == 9"
+!match templates
+?? same as the library
+!undo command 2
+!match templates
+?? the library's version differs
+!match use t730b
+!template give axe_common b axe
+!assert "entity[b].axe.damage == 6"
+!system set default template_pinning false
+!template give axe_common b axe
+!assert "entity[b].axe.damage == 9"
+!match templates
+?? template_pinning is off: these pins are kept but unused
+!match templates refresh nothing
+?? This match has no pin of `nothing`
+
+Expected: HARNESS-ALLOWS-ERRORS. With template_pinning on, a match pins
+each partial on its first use: after `a` gets the axe, a library edit to
+damage 9 doesn't reach this match — `b`'s axe (by command or by
+give_template) still has damage 6, and `!match templates` says the library's
+version differs. Saving `a` diffs against the pinned axe (damage 7 recorded)
+and the reply says the library moved on. Pins are match state: the clone
+`t730b` and a bot restart keep them. `refresh` drops the pin, so the next
+give pins (and uses) the library's damage 9; undoing two commands brings the
+old pin back. The clone still has its own pin. With the rule off, the match
+reads the library directly (damage 9) and keeps its pins unused; refreshing
+a name that isn't pinned is refused.
+
+SCENARIO 731 — Partial templates on body parts, looting and formula writes
+---------------------------------------------------------------------------
+
+!match new t731 Ruins 12 8
+!match use t731
+!match new t731b Vault 12 8
+!match use t731
+!template import claw_kit {"kind": "partial", "data": {"damage": 5, "reach": 1}}
+!template import plate {"kind": "partial", "data": {"armor": 3, "weight": 10}}
+!template import golem {"name": "Golem", "vars": {"hp": 60, "footprint_w": 2, "footprint_h": 2, "gear": {"plate": {"__template": "plate"}}}, "parts": [{"id": "@root_arm", "part_of": "@root", "vars": {"hp": 20, "max_hp": 20, "claw": {"__template": "claw_kit", "damage": 8}}}]}
+!template spawn golem 3 3
+?? with 1 body part(s)
+!assert "len(footprint_cells('golem')) == 4 and part_of('golem_arm') == 'golem'"
+!assert "entity[golem_arm].claw.damage == 8 and entity[golem_arm].claw.reach == 1"
+!assert "template_of('golem_arm', 'claw') == 'claw_kit' and template_of('golem', 'gear.plate') == 'plate'"
+!ent add thief Thief 10 8 2 6
+!ent set_var thief actions.loot.target entity
+!ent set_var thief actions.loot.body "var_move(target, 'gear.plate', self, 'bag.plate')\nentity[self].bag.plate.armor = entity[self].bag.plate.armor - 1"
+!action thief loot golem
+!assert "not var_has('golem', 'gear.plate') and template_of('thief', 'bag.plate') == 'plate'"
+!template refs thief
+?? `bag.plate` ← `plate`: changed `armor`
+!eval "entity[thief].bag.plate.armor = 3"
+!template refs thief
+?? `bag.plate` ← `plate` (unchanged)
+!eval "var_copy('golem_arm', 'claw', 'thief', 'bag.claw')"
+!template refs thief
+?? `bag.claw` ← `claw_kit`: changed `damage`
+!template save golem golem2
+!template show golem2 compact
+?? "claw":{"__template":"claw_kit","damage":8}
+!ent transfer thief t731b
+!match use t731b
+!template refs thief
+?? `bag.plate` ← `plate` (unchanged)
+!template set plate armor 5
+!template resync thief bag.plate
+!assert "entity[thief].bag.plate.armor == 5"
+!ent dump thief
+?? "__template"
+!template import ob {"kind": "partial", "data": {"hp": 30, "max_hp": 30, "footprint_w": 2, "footprint_h": 2, "speed": 3}}
+!template import ogre {"name": "Ogre", "vars": {"__template": "ob", "hp": 20}}
+!template spawn ogre 2 2
+!ent add wall Wall 10 4 2 1
+!template set ob footprint_w 3
+!template set ob speed 9
+!template resync ogre
+?? can't become 3x2 at (2,2)
+!assert "entity[ogre].footprint_w == 2 and entity[ogre].speed == 3 and entity[ogre].hp == 20"
+!ent tp wall 7 7
+!template resync ogre
+!assert "len(footprint_cells('ogre')) == 6 and entity[ogre].speed == 9 and entity[ogre].hp == 20"
+
+Expected: HARNESS-ALLOWS-ERRORS. An entity template's body part references a
+partial too: the 2×2 golem spawns with its arm (`golem_arm`), whose claw is
+`claw_kit` with the template's damage 8 (reach 1 from the partial), and its
+plate from `plate`. The marker travels with the container: the thief's loot
+action moves the golem's plate into its bag (var_move) and the plate stays
+tracked as `plate` there, with the formula's armor change recorded. A
+formula write back to the partial's armor 3 clears the record. var_copy of
+the claw keeps its recorded damage change. Saving the golem keeps the arm's
+claw as a reference plus damage 8 (the plate is gone). The transferred thief
+keeps its markers in the other match, where a resync reads that match's view
+of the library (armor 5). `!ent dump` shows the markers. A resync is all or
+nothing: when the library widens `ob` to 3 cells and the wall blocks the
+wider body, nothing changes (the speed stays 3); with the wall gone the ogre
+becomes 3×2 with speed 9 and keeps its own hp 20.

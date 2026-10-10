@@ -27,6 +27,25 @@ FORMULA_LOG_SINK: "contextvars.ContextVar[Optional[List[str]]]" = (
 CURRENT_WORKSPACE: "contextvars.ContextVar[Optional[Any]]" = (
     contextvars.ContextVar("vtt_current_workspace", default=None))
 
+# Partial templates resolved during the running command, by (server, match
+# id, pinning, name). The library can't change mid-command except through a
+# template command, which clears it (invalidate_partial_cache). Set by each
+# CommandRegistry.run; None outside a command (no caching).
+PARTIAL_CACHE: "contextvars.ContextVar[Optional[Dict[Any, Any]]]" = (
+    contextvars.ContextVar("vtt_partial_cache", default=None))
+
+
+# Set while the engine rebuilds a container (resync), so its own writes
+# aren't recorded as deviations.
+TEMPLATE_TRACK_OFF: "contextvars.ContextVar[bool]" = (
+    contextvars.ContextVar("vtt_template_track_off", default=False))
+
+
+def invalidate_partial_cache() -> None:
+    cache = PARTIAL_CACHE.get()
+    if cache is not None:
+        cache.clear()
+
 # -------------------------
 # Exceptions
 # -------------------------
@@ -1591,6 +1610,29 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "`delete` removes the entity outright (no corpse left). "
             "Per-entity override: set `__death_result` in the "
             "entity's vars."
+        ),
+    },
+    "template_pinning": {
+        "default": False,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether this match PINS the partial templates it uses. On: the "
+            "first time the match uses a partial (spawning a template that "
+            "references it, `!template give`, a write inside a container built "
+            "from it, a save), a copy is stored with the match, and from then "
+            "on the match uses that copy — later library edits don't reach it "
+            "until `!match templates refresh`. Pins are match state: saved, "
+            "undone, cloned. Off (default): the match reads the library each "
+            "time; pins already stored are kept but unused."
+        ),
+    },
+    "partial_template_depth_limit": {
+        "default": 16,
+        "schema": {"type": "int", "min": 1, "max": 64},
+        "desc": (
+            "How deep partial templates may reference each other (an axe "
+            "built on a weapon built on an item ...). Deeper chains, and any "
+            "cycle, are refused when a template is saved or used."
         ),
     },
     "roster_glued_parts": {
@@ -4849,6 +4891,8 @@ class Entity:
         # supply the required hp var OR the footprint size, so the
         # footprint-aware bounds/occupancy check below must see the
         # defaults. Fill-only, so an explicitly-provided value wins.
+        if has_file_refs(self.vars):
+            self.vars = match.template_materialize(self.vars)
         match._apply_default_vars(self)
         self.vars = checked_unit_vars(
             self.vars,
@@ -5323,6 +5367,12 @@ class Entity:
         # and a save/load split them apart again.
         value = _own_value(value)
         check_no_value_ancestor(self.vars, path, f"`{self.id}`")
+        if TEMPLATE_MARKER in path.split("."):
+            raise VTTError(
+                f"`{TEMPLATE_MARKER}` marks a container built from a partial "
+                f"template; `!template detach {self.id} ...` turns it into "
+                f"plain data (writing '{path}' on `{self.id}`).")
+        check_live_markers(value, f"Writing '{path}' on `{self.id}`")
 
         # Snapshot whether this is the top-level entry into a write/event
         # chain. We only drain the warning buffer at top-level exit so
@@ -5395,6 +5445,8 @@ class Entity:
             self._match.check_body_fits(self, trial, f"`{self.id}`.{path}")
         old_post_attempt = _path_resolve(self.vars, path)
         self._set_path(path, value)
+        if self._match is not None:
+            self._match.track_template_change(self, path, deleted=False)
         # A heal that lifts a destroyed body part back above 0 clears the
         # destroyed latch, so it can break (and re-fire on_death) again, and
         # RESUMES any aura suspended when it broke (a no-op unless
@@ -5564,10 +5616,16 @@ class Entity:
         is_top_level_write = (
             self._match is not None and self._match._var_event_depth == 0
         )
+        if TEMPLATE_MARKER in path.split("."):
+            raise VTTError(
+                f"`{TEMPLATE_MARKER}` marks a container built from a partial "
+                f"template; `!template detach {self.id} ...` drops it.")
         old = _path_resolve(self.vars, path)
         if old is _MISSING:
             raise NotFound(f"Variable '{path}' not found on entity '{self.id}'.")
         self._del_path(path)
+        if self._match is not None:
+            self._match.track_template_change(self, path, deleted=True)
         events = _diff_subtree(path, old, _MISSING)
         log = self._fire_var_events(events)
         # Removing the init or team var also dirties turn order — same
@@ -6013,6 +6071,13 @@ class Match:
     # `table_roll(name)` formula primitive or `!table roll <name>`. Per-match;
     # serialized. The named-resource companion to inline roll_table().
     tables: Dict[str, str] = field(default_factory=dict)
+
+    # ---- pinned partial templates ----
+    # name -> {"data": <file-form partial data>, "turn": turns_elapsed when
+    # pinned}. Filled on first use while the template_pinning rule is on
+    # (Match.partial_data); `!match templates refresh` drops them. Match
+    # state: serialized, undone, cloned.
+    template_pins: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     # ---- condition-watchers (edge-triggered triggers) ----
     # name -> {"condition": <formula expr>, "effect": <formula program>,
@@ -11838,7 +11903,8 @@ class Match:
 
     # ---- saved entity templates (the server's library; see MatchManager) ----
     def capture_template(self, e: "Entity", saved_by: Optional[str] = None,
-                         saved_by_name: Optional[str] = None) -> Dict[str, Any]:
+                         saved_by_name: Optional[str] = None,
+                         notes: Optional[List[str]] = None) -> Dict[str, Any]:
         """A unit as a server template: its JSON (Entity.to_dict) minus its
         identity — no id, position or mount link — with its whole body-part
         subtree under `parts`. Part positions are stored relative to the
@@ -11853,6 +11919,9 @@ class Match:
         d = self.capture_statblock(e)
         ax, ay = e.x, e.y
         Match._shift_snake_path_vars(d.get("vars") or {}, -ax, -ay)
+        # Containers built from partial templates are saved as the partial's
+        # name plus what deviates (file form).
+        d["vars"] = self.template_file_form(d.get("vars") or {}, notes)
 
         def local(i: Any) -> Any:
             # `dragon_head` of `dragon` -> `@root_head` and `torso` ->
@@ -11877,6 +11946,7 @@ class Match:
                 if "__follows" in pv:
                     pv["__follows"] = local(pv["__follows"])
                 Match._shift_snake_path_vars(pv, -ax, -ay)
+                p["vars"] = self.template_file_form(pv, notes)
             p["x"] = int(p.get("x", ax)) - ax
             p["y"] = int(p.get("y", ay)) - ay
             parts.append(p)
@@ -11949,6 +12019,334 @@ class Match:
             _rollback_match(self, None, pre)
             raise
         return new_id, log
+
+    # ---- partial templates (see TEMPLATE_MARKER for the two forms) ----------
+    def _template_library(self) -> Dict[str, Any]:
+        ws = CURRENT_WORKSPACE.get()
+        return getattr(ws, "templates", None) or {}
+
+    def partial_data(self, name: str) -> Optional[Dict[str, Any]]:
+        """The FILE-form data of partial `name` as this match sees it: its pin
+        when template_pinning is on (pinned on first use), else the
+        library's. None when there is no such partial."""
+        pinning = bool(self.rules.get("template_pinning", False))
+        if pinning and name in self.template_pins:
+            return self.template_pins[name].get("data")
+        t = self._template_library().get(name)
+        if not isinstance(t, dict) or t.get("kind") != "partial":
+            return None
+        if pinning:
+            self.template_pins[name] = {"data": copy.deepcopy(t.get("data")),
+                                        "turn": self.turns_elapsed}
+        return t.get("data")
+
+    def resolve_partial(self, name: str, _chain: Tuple[str, ...] = (),
+                        fresh: bool = True) -> Dict[str, Any]:
+        """Partial `name` fully materialized (LIVE form): its own root
+        reference flattened in, deeper references as live markers. Raises
+        on a missing partial, a cycle or a chain deeper than
+        partial_template_depth_limit. Cached for the running command;
+        `fresh=False` returns the cached value itself, for callers that
+        only read it (the per-write tracking)."""
+        if name in _chain:
+            raise VTTError("Partial templates reference each other in a "
+                           "cycle: " + " → ".join(_chain + (name,)) + ".")
+        limit = int(self.rules.get("partial_template_depth_limit", 16))
+        if len(_chain) >= limit:
+            raise VTTError(f"Partial templates nest deeper than "
+                           f"partial_template_depth_limit ({limit}): "
+                           + " → ".join(_chain + (name,)) + ".")
+        pinning = bool(self.rules.get("template_pinning", False))
+        cache = PARTIAL_CACHE.get()
+        key = (getattr(CURRENT_WORKSPACE.get(), "guild_key", None), self.id,
+               pinning, name)
+        if cache is not None and key in cache:
+            return copy.deepcopy(cache[key]) if fresh else cache[key]
+        data = self.partial_data(name)
+        if not isinstance(data, dict):
+            raise VTTError(f"There is no partial template `{name}`.")
+        res = self.template_materialize(data, root=True,
+                                        _chain=_chain + (name,))
+        if cache is None:
+            return res
+        cache[key] = res
+        return copy.deepcopy(res) if fresh else res
+
+    def template_materialize(self, node: Any, *, root: bool = False,
+                             _chain: Tuple[str, ...] = ()) -> Any:
+        """FILE form -> LIVE form (a new value). A dict naming a partial
+        becomes the partial's data with the overrides merged in (nested
+        dicts key by key, anything else replaced), the removed paths deleted
+        and a live marker listing them; `root` flattens a reference at the
+        top (a partial extending another) without a marker. Live markers
+        already present are kept."""
+        if isinstance(node, list):
+            return [self.template_materialize(v, _chain=_chain) for v in node]
+        if not isinstance(node, dict):
+            return copy.deepcopy(node)
+        ref = node.get(TEMPLATE_MARKER)
+        if not isinstance(ref, str):
+            return {k: (copy.deepcopy(v) if k == TEMPLATE_MARKER else
+                        self.template_materialize(v, _chain=_chain))
+                    for k, v in node.items() if k != TEMPLATE_REMOVED}
+        base = self.resolve_partial(ref, _chain)
+        over = {k: self.template_materialize(v, _chain=_chain)
+                for k, v in node.items()
+                if k not in (TEMPLATE_MARKER, TEMPLATE_REMOVED)}
+        paths = _merge_overrides(base, over)
+        removed = sorted({str(p) for p in node.get(TEMPLATE_REMOVED) or []
+                          if _rel_del(base, str(p))})
+        if not root:
+            base[TEMPLATE_MARKER] = {"name": ref, "overrides": sorted(set(paths)),
+                                     "removed": removed}
+        return base
+
+    def template_file_form(self, value: Any, notes: Optional[List[str]] = None
+                           ) -> Any:
+        """LIVE form -> FILE form (a new value): every marked container
+        becomes its partial's name plus only what deviates. A container
+        whose partial no longer exists is kept in full, without its
+        reference (said in `notes`)."""
+        if isinstance(value, list):
+            return [self.template_file_form(v, notes) for v in value]
+        if not isinstance(value, dict):
+            return copy.deepcopy(value)
+        if _is_live_marker(value.get(TEMPLATE_MARKER)):
+            return self._dematerialize(value, notes)
+        return {k: self.template_file_form(v, notes) for k, v in value.items()
+                if k != TEMPLATE_MARKER}
+
+    def _dematerialize(self, container: Dict[str, Any],
+                       notes: Optional[List[str]]) -> Dict[str, Any]:
+        m = container[TEMPLATE_MARKER]
+        name = m["name"]
+        plain = {k: v for k, v in container.items() if k != TEMPLATE_MARKER}
+        try:
+            base = self.resolve_partial(name, fresh=False)
+        except VTTError as ex:
+            if notes is not None:
+                notes.append(f"Partial `{name}` can't be used ({ex}): its "
+                             f"container was saved in full, without the "
+                             f"reference.")
+            return self.template_file_form(plain, notes)
+        out: Dict[str, Any] = {TEMPLATE_MARKER: name}
+        removed = set(m.get("removed") or [])
+        listed = sorted(set(m.get("overrides") or []))
+        listed = [p for p in listed
+                  if not any(a != p and _covers(a, p) for a in listed)]
+        for p in listed:
+            found, v = _rel_get(plain, p)
+            if not found:
+                if _rel_get(base, p)[0]:
+                    removed.add(p)
+                continue
+            _rel_set(out, p, self.template_file_form(v, notes))
+            # A listed dict REPLACES the base's subtree: keys the base has
+            # there and the unit dropped are recorded as removed, since the
+            # file form merges.
+            bf, bv = _rel_get(base, p)
+            if (isinstance(v, dict) and TEMPLATE_MARKER not in v and bf
+                    and isinstance(bv, dict)):
+                stack = [(p, bv, v)]
+                while stack:
+                    pre, b, c = stack.pop()
+                    for k, sub in b.items():
+                        if k == TEMPLATE_MARKER:
+                            continue
+                        if k not in c:
+                            removed.add(f"{pre}.{k}")
+                        elif (isinstance(sub, dict) and isinstance(c[k], dict)
+                              and TEMPLATE_MARKER not in c[k]):
+                            stack.append((f"{pre}.{k}", sub, c[k]))
+        # Marked containers inside that no listed path covers: their own
+        # markers hold their deviations.
+        for q, nested in _marked_containers(plain):
+            if any(_covers(a, q) for a in listed):
+                continue
+            nf = self._dematerialize(nested, notes)
+            bf, bv = _rel_get(base, q)
+            same = (bf and isinstance(bv, dict)
+                    and isinstance(bv.get(TEMPLATE_MARKER), dict)
+                    and bv[TEMPLATE_MARKER].get("name")
+                    == nested[TEMPLATE_MARKER]["name"])
+            if not same or set(nf) != {TEMPLATE_MARKER}:
+                _rel_set(out, q, nf)
+        rem = sorted(p for p in removed if _rel_get(base, p)[0])
+        if rem:
+            out[TEMPLATE_REMOVED] = rem
+        return out
+
+    def track_template_change(self, e: "Entity", path: str,
+                              deleted: bool) -> None:
+        """After a write / delete at `path` in e's vars: update the marker of
+        the nearest marked container ABOVE the path. A path whose value now
+        equals the partial's (or, deleted, that the partial lacks) leaves
+        the lists — "back to the norm"; a listed parent leaves only when its
+        whole subtree matches again."""
+        if TEMPLATE_TRACK_OFF.get():
+            return
+        keys = path.split(".")
+        cur: Any = e.vars
+        best = 0 if _is_live_marker(cur.get(TEMPLATE_MARKER)) else None
+        container = cur if best == 0 else None
+        for i, k in enumerate(keys[:-1]):
+            cur = cur.get(k) if isinstance(cur, dict) else None
+            if not isinstance(cur, dict):
+                break
+            if _is_live_marker(cur.get(TEMPLATE_MARKER)):
+                best, container = i + 1, cur
+        if container is None:
+            return
+        rel = ".".join(keys[best:])
+        m = container[TEMPLATE_MARKER]
+        try:
+            base: Optional[Dict[str, Any]] = self.resolve_partial(
+                m["name"], fresh=False)
+        except VTTError:
+            base = None
+        ov = list(m.get("overrides") or [])
+        rm = list(m.get("removed") or [])
+
+        def matches_base(p: str) -> bool:
+            if base is None:
+                return False
+            bf, bv = _rel_get(base, p)
+            cf, cv = _rel_get(container, p)
+            if not bf and not cf:
+                return True
+            return bf and cf and strip_markers(bv) == strip_markers(cv)
+
+        if not deleted:
+            # Writing under a removed key brings that key back: treat the
+            # removed key as overridden whole.
+            gone = [r for r in rm if r != rel and _covers(r, rel)]
+            if gone:
+                rm = [r for r in rm if r not in gone]
+                rel = min(gone, key=len)
+        anc = [a for a in ov if a != rel and _covers(a, rel)]
+        if anc:
+            if matches_base(anc[0]):
+                ov.remove(anc[0])
+        elif not deleted:
+            ov = [p for p in ov if not _covers(rel, p)]
+            rm = [p for p in rm if not _covers(rel, p)]
+            if not matches_base(rel):
+                ov.append(rel)
+        else:
+            ov = [p for p in ov if not _covers(rel, p)]
+            if not any(_covers(r, rel) for r in rm):
+                rm = [p for p in rm if not _covers(rel, p)]
+                if base is None or _rel_get(base, rel)[0]:
+                    rm.append(rel)
+        m["overrides"] = sorted(set(ov))
+        m["removed"] = sorted(set(rm))
+
+    def give_partial(self, e: "Entity", path: str, name: str) -> List[str]:
+        """Build partial `name` at e's var `path` (replacing what is there),
+        marked so its deviations are tracked. Goes through write_var, so a
+        marked container above records the new path."""
+        check_store_path(path, "Var path")
+        t = self._template_library().get(name)
+        if (isinstance(t, dict) and t.get("kind") != "partial"
+                and name not in self.template_pins):
+            raise VTTError(f"`{name}` is an entity template; `!template "
+                           f"spawn` it. Only partials are given to a unit.")
+        value = self.template_materialize({TEMPLATE_MARKER: name})
+        return e.write_var(path, value)
+
+    def template_containers(self, e: "Entity") -> List[Tuple[str, Dict[str, Any]]]:
+        """(path, marker) of every marked container in e's vars, outermost
+        first; '' is the vars root."""
+        out: List[Tuple[str, Dict[str, Any]]] = []
+
+        def walk(node: Any, prefix: str) -> None:
+            if not isinstance(node, dict):
+                return
+            if _is_live_marker(node.get(TEMPLATE_MARKER)):
+                out.append((prefix, node[TEMPLATE_MARKER]))
+            for k, v in node.items():
+                if k != TEMPLATE_MARKER:
+                    walk(v, f"{prefix}.{k}" if prefix else k)
+        walk(e.vars, "")
+        return out
+
+    def _marked_container_at(self, e: "Entity", path: str) -> Dict[str, Any]:
+        if path in ("", "."):
+            node: Any = e.vars
+        else:
+            found, node = _rel_get(e.vars, path)
+            if not found:
+                raise VTTError(f"`{e.id}` has no var `{path}`.")
+        if not isinstance(node, dict) or not _is_live_marker(
+                node.get(TEMPLATE_MARKER)):
+            where = "its vars" if path in ("", ".") else f"`{path}`"
+            raise VTTError(f"{where} on `{e.id}` isn't built from a partial "
+                           f"template (`!template refs {e.id}`).")
+        return node
+
+    def resync_container(self, e: "Entity", path: str) -> List[str]:
+        """Rebuild the marked container at `path` ('' = the whole vars) from
+        its partial as this match sees it now, re-applying its recorded
+        deviations (nested marked containers included)."""
+        node = self._marked_container_at(e, path)
+        name = node[TEMPLATE_MARKER]["name"]
+        self.resolve_partial(name)  # refuse a missing partial up front
+        file = self._dematerialize(node, None)
+        live = self.template_materialize(file)
+        log: List[str] = []
+        # All or nothing: a rebuilt body that no longer fits, or a hook that
+        # refuses a write, puts every var back.
+        from action import _rollback_match
+        pre = self.to_dict(include_history=False)
+        token = TEMPLATE_TRACK_OFF.set(True)
+        try:
+            if path not in ("", "."):
+                log += e.write_var(path, live)
+            else:
+                vitals = set(e.protected_var_names())
+                for k in [k for k in e.vars if k not in live
+                          and k not in vitals and k != TEMPLATE_MARKER]:
+                    log += e.remove_var(k)
+                for k, v in live.items():
+                    if k == TEMPLATE_MARKER:
+                        continue
+                    if e.id not in self.entities:
+                        break
+                    if e.vars.get(k, _MISSING) != v:
+                        log += e.write_var(k, v)
+                if e.id in self.entities:
+                    e.vars[TEMPLATE_MARKER] = live[TEMPLATE_MARKER]
+        except Exception:
+            _rollback_match(self, None, pre)
+            raise
+        finally:
+            TEMPLATE_TRACK_OFF.reset(token)
+        return log
+
+    def detach_container(self, e: "Entity", path: str) -> str:
+        """Drop the marker at `path` ('' = the vars root): the container
+        stays as plain data. Returns the partial's name."""
+        node = self._marked_container_at(e, path)
+        return node.pop(TEMPLATE_MARKER)["name"]
+
+    def capture_partial(self, e: "Entity", path: str,
+                        notes: Optional[List[str]] = None) -> Dict[str, Any]:
+        """A unit's container (path '' / '.' = all its vars) as partial
+        DATA in file form. A marked container becomes a partial that
+        extends its own partial. Position-bound snake vars are dropped."""
+        if path in ("", "."):
+            node: Any = {k: v for k, v in e.vars.items()
+                         if k not in _SEGMENT_LINK_VARS}
+            if TEMPLATE_MARKER in e.vars:
+                node[TEMPLATE_MARKER] = e.vars[TEMPLATE_MARKER]
+        else:
+            found, node = _rel_get(e.vars, path)
+            if not found:
+                raise VTTError(f"`{e.id}` has no var `{path}`.")
+        if not isinstance(node, dict):
+            raise VTTError(f"`{path}` on `{e.id}` isn't a container (a dict "
+                           f"of fields), so it can't be a partial template.")
+        return self.template_file_form(node, notes)
 
     def _taken_entity_ids(self) -> "set[str]":
         """Return the set of entity ids that should be considered
@@ -12034,6 +12432,10 @@ class Match:
         prefix = id_prefix or template.get("name") or template.get("id") or "summon"
         new_id = self.mint_entity_id(prefix)
         d = copy.deepcopy(template)
+        # Partial-template references in the vars are materialized now, so
+        # the footprint they carry is known before placement.
+        if has_file_refs(d.get("vars")):
+            d["vars"] = self.template_materialize(d["vars"])
         d["id"] = new_id
         # A template has its position STRIPPED (that's the point of a template),
         # but Entity.from_dict requires x/y (int(data["x"])) to build the probe.
@@ -13362,6 +13764,8 @@ class Match:
         # set) could momentarily satisfy the death condition.
         sb_vars = sb.get("vars")
         new_vars = copy.deepcopy(sb_vars if sb_vars is not None else {})
+        if has_file_refs(new_vars):
+            new_vars = self.template_materialize(new_vars)
         if not isinstance(new_vars, dict):
             raise VTTError("transform: the statblock's vars must be a dict.")
         new_max = new_vars.get(max_hp_var)
@@ -14281,6 +14685,7 @@ class Match:
             "aliases": dict(self.aliases),
             "macros": dict(self.macros),
             "tables": dict(self.tables),
+            "template_pins": copy.deepcopy(self.template_pins),
             "watchers": copy.deepcopy(self.watchers),
             "hidden_layers": sorted(self.hidden_layers),
             "outcome": copy.deepcopy(self.outcome),
@@ -14454,6 +14859,10 @@ class Match:
             str(k): str(v) for k, v in raw_tables.items()
             if isinstance(k, str) and isinstance(v, str)
         }
+        m.template_pins = {
+            str(k): copy.deepcopy(v)
+            for k, v in (d.get("template_pins") or {}).items()
+            if isinstance(v, dict) and isinstance(v.get("data"), dict)}
         raw_watch = d.get("watchers", {}) or {}
         m.watchers = {
             str(k): copy.deepcopy(v) for k, v in raw_watch.items()
@@ -16152,19 +16561,109 @@ def check_template_name(name: Any) -> str:
     return n
 
 
-def check_template(data: Any, name: str) -> Tuple[Dict[str, Any], List[str]]:
+_PARTIAL_KEYS = ("kind", "data", "saved_by", "saved_by_name")
+
+
+def _check_file_markers(value: Any, where: str) -> None:
+    """Template data holds partial references in FILE form only: a
+    `__template` key naming a partial, and beside it an optional `__removed`
+    list of relative paths. Keys must be usable in a dotted path."""
+    if isinstance(value, list):
+        for v in value:
+            _check_file_markers(v, where)
+        return
+    if not isinstance(value, dict):
+        return
+    for k in value:
+        if not isinstance(k, str) or k == "" or "." in k:
+            raise VTTError(f"{where}: key {k!r} can't be part of a var path "
+                           f"(empty, or contains a dot).")
+    if TEMPLATE_MARKER in value:
+        ref = value[TEMPLATE_MARKER]
+        if not isinstance(ref, str):
+            raise VTTError(f"{where}: `{TEMPLATE_MARKER}` must name a partial "
+                           f"template.")
+        check_id("partial template name", ref)
+    if TEMPLATE_REMOVED in value:
+        rem = value[TEMPLATE_REMOVED]
+        if TEMPLATE_MARKER not in value or not isinstance(rem, list) or \
+                not all(isinstance(p, str) and p for p in rem):
+            raise VTTError(f"{where}: `{TEMPLATE_REMOVED}` is a list of paths "
+                           f"beside a `{TEMPLATE_MARKER}` reference.")
+        for p in rem:
+            check_store_path(p, f"{where}: removed path")
+    for k, v in value.items():
+        if k not in (TEMPLATE_MARKER, TEMPLATE_REMOVED):
+            _check_file_markers(v, where)
+
+
+def check_template_refs(name: str, tpl: Dict[str, Any],
+                        library: Dict[str, Any]) -> None:
+    """Refuse a template whose partial references aren't partials in
+    `library`, or that would close a cycle through it."""
+    for r in template_refs_of(tpl):
+        if r == name:
+            raise VTTError(f"Template `{name}` references itself.")
+        t = library.get(r)
+        if not isinstance(t, dict) or t.get("kind") != "partial":
+            raise VTTError(f"Template `{name}` references `{r}`, which isn't "
+                           f"a partial template in this server's library.")
+    seen: set = set()
+
+    def walk(n: str, chain: Tuple[str, ...]) -> None:
+        if n == name:
+            raise VTTError("Partial templates would reference each other in "
+                           "a cycle: " + " → ".join((name,) + chain) + ".")
+        if n in seen:
+            return
+        seen.add(n)
+        t = library.get(n)
+        if isinstance(t, dict) and t.get("kind") == "partial":
+            for c in template_refs_of(t):
+                walk(c, chain + (c,))
+    for r in template_refs_of(tpl):
+        walk(r, (r,))
+
+
+def check_template(data: Any, name: str,
+                   library: Optional[Dict[str, Any]] = None
+                   ) -> Tuple[Dict[str, Any], List[str]]:
     """(template, notes): `data` checked as a template — what `!template
-    import` accepts and what loading a template file checks. The unit and
-    each part must build as entities (vital vars whole numbers, reserved var
-    names refused); identity fields are dropped (a template carries none)
-    and named in the notes. Parts are a list of part entity dicts (`id` =
-    a local name; `part_of` = TEMPLATE_ROOT or another part's id; `x` / `y`
-    = offsets from the unit's anchor) or a {role: part} dict as in a summon
-    template."""
+    import` accepts and what loading a template file checks. An ENTITY
+    template: the unit and each part must build as entities (vital vars
+    whole numbers, reserved var names refused); identity fields are dropped
+    (a template carries none) and named in the notes. Parts are a list of
+    part entity dicts (`id` = a local name; `part_of` = TEMPLATE_ROOT or
+    another part's id; `x` / `y` = offsets from the unit's anchor) or a
+    {role: part} dict as in a summon template. A PARTIAL template
+    (`kind: partial`) is {"kind": "partial", "data": {...}}. Partial
+    references are checked in file form; with `library`, each must name a
+    partial there and no cycle may form."""
     if not isinstance(data, dict):
         raise VTTError(f"Template `{name}` must be a JSON object, got "
                        f"{type(data).__name__}.")
+    kind = data.get("kind", "entity")
+    if kind not in ("entity", "partial"):
+        raise VTTError(f"Template `{name}`: `kind` is `entity` or `partial`, "
+                       f"got {kind!r}.")
+    if kind == "partial":
+        d = {k: copy.deepcopy(v) for k, v in data.items() if k in _PARTIAL_KEYS}
+        extra = sorted(k for k in data if k not in _PARTIAL_KEYS)
+        notes = [f"Dropped {', '.join(f'`{k}`' for k in extra)}: a partial "
+                 f"template is `kind`, `data`."] if extra else []
+        if not isinstance(d.get("data"), dict):
+            raise VTTError(f"Partial template `{name}` needs `data`: an object "
+                           f"(the container it describes).")
+        _check_file_markers(d["data"], f"Partial template `{name}`")
+        for k in ("saved_by", "saved_by_name"):
+            if k in d and d[k] is not None and not isinstance(d[k], str):
+                d[k] = str(d[k])
+        if library is not None:
+            check_template_refs(name, d, library)
+        json_text(d)
+        return d, notes
     d = copy.deepcopy(data)
+    d.pop("kind", None)
     notes: List[str] = []
     dropped = [k for k in _TEMPLATE_IDENTITY_KEYS if k in d]
     for k in dropped:
@@ -16239,8 +16738,229 @@ def check_template(data: Any, name: str) -> Tuple[Dict[str, Any], List[str]]:
         else:
             raise VTTError(f"Template `{name}`: `parts` must be a list or an "
                            f"object.")
+    _check_file_markers(d.get("vars"), f"Template `{name}`")
+    for pt in (parts.values() if isinstance(parts, dict) else parts or []):
+        if isinstance(pt, dict):
+            _check_file_markers(pt.get("vars"), f"Template `{name}` part")
+    if library is not None:
+        check_template_refs(name, d, library)
     json_text(d)  # refuses anything JSON can't hold
     return d, notes
+
+
+# ---- partial templates: the container marker --------------------------------
+#
+# A PARTIAL template is a reusable var subtree (an `axe_common` item, an
+# `orc_base` statblock) stored in the template library as
+# {"kind": "partial", "data": {...}}. A container built from one carries a
+# marker under TEMPLATE_MARKER, in one of two forms:
+#
+#   FILE form (in stored templates and partial data): the marker is the
+#   partial's NAME, the container's other keys are only the OVERRIDES, and
+#   TEMPLATE_REMOVED lists the partial's keys this container deletes:
+#       "axe": {"__template": "axe_common", "damage": 8,
+#               "__removed": ["flavor"]}
+#
+#   LIVE form (in a unit's vars): the container holds the full materialized
+#   data, and the marker records which relative paths deviate:
+#       "axe": {"__template": {"name": "axe_common",
+#                              "overrides": ["damage"], "removed": ["flavor"]},
+#               "damage": 8, "weight": 3, "actions": {...}}
+#
+# Spawning converts file -> live (Match.template_materialize); saving converts
+# live -> file (Match.template_file_form). Writes and deletes inside a marked
+# container update its lists (Match.track_template_change, called from
+# Entity.write_var / remove_var). The marker can sit at the root of a unit's
+# vars (whole-unit inheritance: `vars.__template = "orc_base"`). Inside a
+# partial's own data, a ROOT marker means "this partial extends that one" and
+# is flattened when the partial is resolved; deeper markers stay markers.
+TEMPLATE_MARKER = "__template"
+TEMPLATE_REMOVED = "__removed"
+_LIVE_MARKER_KEYS = frozenset({"name", "overrides", "removed"})
+
+
+def _is_live_marker(m: Any) -> bool:
+    return (isinstance(m, dict) and set(m) <= _LIVE_MARKER_KEYS
+            and isinstance(m.get("name"), str)
+            and all(isinstance(p, str) for p in m.get("overrides") or [])
+            and all(isinstance(p, str) for p in m.get("removed") or [])
+            and isinstance(m.get("overrides", []), list)
+            and isinstance(m.get("removed", []), list))
+
+
+def check_live_markers(value: Any, where: str) -> None:
+    """Refuse a value bound for unit vars that carries a malformed marker or
+    a FILE-form reference (a partial name as text): only `!template give` /
+    a template spawn build containers from partials."""
+    if isinstance(value, list):
+        for v in value:
+            check_live_markers(v, where)
+        return
+    if not isinstance(value, dict):
+        return
+    if TEMPLATE_MARKER in value:
+        m = value[TEMPLATE_MARKER]
+        if isinstance(m, str):
+            raise VTTError(
+                f"{where}: `{TEMPLATE_MARKER}: {m}` names a partial template; "
+                f"build the container with `!template give` (or "
+                f"give_template) instead of writing the reference.")
+        if not _is_live_marker(m):
+            raise VTTError(f"{where}: `{TEMPLATE_MARKER}` is the engine's "
+                           f"partial-template marker and can't be written "
+                           f"by hand.")
+    for k, v in value.items():
+        if k != TEMPLATE_MARKER:
+            check_live_markers(v, where)
+
+
+def has_file_refs(value: Any) -> bool:
+    """Whether `value` holds a FILE-form partial reference anywhere."""
+    if isinstance(value, dict):
+        if isinstance(value.get(TEMPLATE_MARKER), str):
+            return True
+        return any(has_file_refs(v) for v in value.values())
+    if isinstance(value, list):
+        return any(has_file_refs(v) for v in value)
+    return False
+
+
+def file_refs(value: Any) -> List[str]:
+    """Every partial name `value` references in file form."""
+    out: List[str] = []
+    if isinstance(value, dict):
+        if isinstance(value.get(TEMPLATE_MARKER), str):
+            out.append(value[TEMPLATE_MARKER])
+        for v in value.values():
+            out.extend(file_refs(v))
+    elif isinstance(value, list):
+        for v in value:
+            out.extend(file_refs(v))
+    return out
+
+
+def template_refs_of(tpl: Dict[str, Any]) -> List[str]:
+    """The partial names a stored template references (entity: its vars and
+    its parts' vars; partial: its data)."""
+    if tpl.get("kind") == "partial":
+        return sorted(set(file_refs(tpl.get("data"))))
+    names = file_refs(tpl.get("vars"))
+    parts = tpl.get("parts")
+    for p in (parts.values() if isinstance(parts, dict) else parts or []):
+        if isinstance(p, dict):
+            names += file_refs(p.get("vars"))
+    return sorted(set(names))
+
+
+def _rel_get(d: Any, path: str) -> Tuple[bool, Any]:
+    cur = d
+    for k in path.split("."):
+        if not isinstance(cur, dict) or k not in cur:
+            return False, None
+        cur = cur[k]
+    return True, cur
+
+
+def _rel_set(d: Dict[str, Any], path: str, value: Any) -> None:
+    keys = path.split(".")
+    cur = d
+    for k in keys[:-1]:
+        nxt = cur.get(k)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[k] = nxt
+        cur = nxt
+    cur[keys[-1]] = value
+
+
+def _rel_del(d: Any, path: str) -> bool:
+    keys = path.split(".")
+    found, parent = _rel_get(d, ".".join(keys[:-1])) if len(keys) > 1 \
+        else (True, d)
+    if not found or not isinstance(parent, dict) or keys[-1] not in parent:
+        return False
+    del parent[keys[-1]]
+    return True
+
+
+def strip_markers(value: Any) -> Any:
+    """`value` without partial-template markers (a copy): the data itself."""
+    if isinstance(value, dict):
+        return {k: strip_markers(v) for k, v in value.items()
+                if k not in (TEMPLATE_MARKER, TEMPLATE_REMOVED)}
+    if isinstance(value, list):
+        return [strip_markers(v) for v in value]
+    return value
+
+
+def _covers(anc: str, path: str) -> bool:
+    return path == anc or path.startswith(anc + ".")
+
+
+def _leaf_paths(tree: Dict[str, Any], prefix: str = "") -> List[str]:
+    """The override paths an override tree sets: a nested plain dict is
+    descended, anything else (a value, a list, an empty dict, a marked
+    container) is one path."""
+    out: List[str] = []
+    for k, v in tree.items():
+        p = f"{prefix}.{k}" if prefix else k
+        if isinstance(v, dict) and v and TEMPLATE_MARKER not in v:
+            out.extend(_leaf_paths(v, p))
+        else:
+            out.append(p)
+    return out
+
+
+def _merge_overrides(base: Dict[str, Any], over: Dict[str, Any],
+                     prefix: str = "") -> List[str]:
+    """Merge override tree `over` into `base` in place: nested plain dicts
+    merge key by key, anything else replaces. Returns the override paths
+    (relative to base). Overrides that land inside a marked container of
+    `base` are recorded in THAT container's marker, which owns them."""
+    paths: List[str] = []
+    for k, v in over.items():
+        p = f"{prefix}.{k}" if prefix else k
+        b = base.get(k)
+        if (isinstance(v, dict) and v and TEMPLATE_MARKER not in v
+                and isinstance(b, dict)):
+            if _is_live_marker(b.get(TEMPLATE_MARKER)):
+                inner = _merge_overrides(b, v)
+                m = b[TEMPLATE_MARKER]
+                m["overrides"] = sorted(set(m.get("overrides") or []) | set(inner))
+            else:
+                paths.extend(_merge_overrides(b, v, p))
+        else:
+            base[k] = v
+            # A marked container replacing one built from the same partial
+            # carries its own deviations; the parent didn't change it.
+            if not (isinstance(v, dict) and isinstance(b, dict)
+                    and _is_live_marker(v.get(TEMPLATE_MARKER))
+                    and _is_live_marker(b.get(TEMPLATE_MARKER))
+                    and v[TEMPLATE_MARKER]["name"]
+                    == b[TEMPLATE_MARKER]["name"]):
+                paths.append(p)
+    return paths
+
+
+def _marked_containers(value: Any, prefix: str = "",
+                       include_root: bool = False) -> List[Tuple[str, Dict[str, Any]]]:
+    """(path, container) of the LIVE-marked containers inside `value`,
+    outermost first; a marked container's own contents are not descended
+    (its marker owns them). The root itself only when include_root."""
+    out: List[Tuple[str, Dict[str, Any]]] = []
+    if not isinstance(value, dict):
+        return out
+    if include_root and _is_live_marker(value.get(TEMPLATE_MARKER)):
+        return [(prefix, value)]
+    for k, v in value.items():
+        if k == TEMPLATE_MARKER or not isinstance(v, dict):
+            continue
+        p = f"{prefix}.{k}" if prefix else k
+        if _is_live_marker(v.get(TEMPLATE_MARKER)):
+            out.append((p, v))
+        else:
+            out.extend(_marked_containers(v, p))
+    return out
 
 
 def template_part_label(pid: Any) -> str:
