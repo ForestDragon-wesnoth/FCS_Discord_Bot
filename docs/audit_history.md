@@ -1881,3 +1881,67 @@ Pass 1 predates this file and left no entry.
     host-only.
   - OPEN (user: decide later): status_counter_add on a missing (∞) duration
     removes the status — see the status-counters entry.
+
+## Pass 37
+
+Templates (entity + partial), right after partial templates shipped. Method:
+two model-based fuzzers (random writes / deletes / gives / detaches /
+copies on nested partial containers, checking after every step that the
+saved file form materializes back to the unit's exact data, and after
+random library edits — including edits inside nested references — that a
+resync equals the pre-edit save re-materialized under the new library; 500
+seeds × 400 steps), an entity-template save → spawn → save fuzzer on random
+multi-tile units with glued / located / region parts, segments, statuses,
+clamps and partial containers (300 seeds), a command fuzzer over every
+`!template` subcommand, `!match templates` and the two formula functions
+(~107k lines), and hand probes.
+  - **Expansion bomb.** Four 10-key partials nested in each other expanded
+    to 10^6 values: one `!template give` froze the bot 25 s (the next level
+    ~4 min). New rule `partial_template_size_limit` (20000, owner ceiling):
+    a node budget per materialization, charged per value built and per copy
+    of a cached partial; a template that expands past it is refused at
+    save / import too.
+  - **Intermediate overrides weren't base.** A nested container's marker
+    recorded the enclosing partial's own values (orc_base setting its axe's
+    damage 8) as if the unit had changed them, so editing orc_base never
+    reached saved or resynced orcs. Containers that come with a partial are
+    now INHERITED (`"inherited": true`, empty lists): their base is what the
+    enclosing partial holds there (`Match._container_base`), tracking
+    measures against it, and a save writes only their own deviations as
+    plain keys. A container copied out of its context (var_copy, a detached
+    parent) is re-measured against its own partial (`rebase_written`,
+    `_rebase`, by value).
+  - **Save depended on the current library.** The file form compared
+    against the library at save time, so a save or resync after a library
+    edit misread a dict the unit rewrote wholesale or a removal inside a
+    nested container. The file form is now a function of the markers alone:
+    a dict the unit wrote is listed in `__removed` AND set (materialization
+    applies removals first, so it replaces); removals inside a nested
+    container are recorded in that container's marker; a missing path is
+    merged into key by key so later library additions still arrive.
+  - **Engine-kept vars.** `__part_located` / `__part_region` / snake links /
+    the destroyed latch are set directly, not recorded: a resync of a unit's
+    whole vars deleted them (and its default vars), a save dropped them. A
+    save now writes them always and a root resync keeps them, the vitals and
+    the system's default vars.
+  - **Kind change.** Saving / importing / copying / restoring an entity
+    template over a partial other templates reference broke every one of
+    them; refused.
+  - **Reserved names.** `__removed` (the file-form tombstone key) was a
+    writable var name whose save then failed with a confusing message;
+    reserved like `__template`. A partial carrying `x` / `name` into a
+    whole-unit template was accepted and failed only at spawn; the expanded
+    template is now checked at save / import.
+  - **Hand-written markers** with empty or dotted-junk paths were accepted;
+    marker paths are validated.
+  - **Orphaned containers.** Deleting the last recorded field of a
+    container the base lacks left an empty dict that the save dropped; the
+    container is recorded.
+  - **Smaller:** `!template save path=x` with no unit 💥'd; a repeated
+    option was silently last-wins (refused); `!template refs` listed which
+    vars of any visible unit changed to players although vars are host-only
+    (now host-gated, a host read under pause); an undo clears the
+    per-command partial cache (pins may differ).
+  - OPEN: a snake whose head passed through its own body (the default)
+    saves with a segment on the head's cell; spawn / revive / transform
+    place that segment on the nearest free cell with a ⚠️.

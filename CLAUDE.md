@@ -157,7 +157,7 @@ code. How the harness works (`run_scenarios.py`, scenarios in
   command's full reply next to the Expected prose; `-v` prints a transcript.
 - **Tab completion** is tested in scenarios too: `?tab "<text>"` replies with
   what Tab does at the end of the text (`→ '<line>'` and `candidates: ...`)
-  in the scenario's workspace; check it with `??` / `?!` (732-733).
+  in the scenario's workspace; check it with `??` / `?!` (735-736).
 - **Isolation.** Each scenario gets its own temp data folder (real storage
   commits) and a temp saves folder; `!as restart` reloads everything from
   disk as a bot restart would.
@@ -343,7 +343,7 @@ back, load the schema with `ToolSearch` before calling
   (`AllowedMentions.none()`), splits long replies fence-aware, and retires a
   board whose channel was unbound.
 - **`test_sequences.txt`**: the scenarios (§2).
-- **`docs/audit_history.md`**: the narratives of audit passes 2-36 — what was
+- **`docs/audit_history.md`**: the narratives of audit passes 2-37 — what was
   swept, verified clean, measured. Read the relevant passes before auditing
   an area again.
 
@@ -734,6 +734,11 @@ descriptions (pass numbers point at `docs/audit_history.md`):
   formula function on identical boards; compare end states.
 - **Model-based undo** (30): random mutations + `undo command N`, checking each
   lands on the state recorded N commands back, under several retention caps.
+- **Template round-trip fuzzers** (37): random writes / deletes / gives /
+  detaches / copies on nested partial containers, asserting that the saved
+  file form materializes back to the unit's data, and that a resync after a
+  random library edit equals the pre-edit save re-materialized; plus
+  save → spawn → save idempotence on random multi-tile units with parts.
 - **Store fuzzer** (36): every read-only function's result written into a var,
   then JSON round trip and equality.
 - **Stray-word detector** (36): every scenario command re-run with an extra
@@ -1477,58 +1482,78 @@ hardcodes**.
 
 Reusable var subtrees (an `axe_common` item, an `orc_base` statblock) in the
 same library and namespace as entity templates: `{"kind": "partial",
-"data": {...}}`; same permissions and version trash (727-731).
+"data": {...}}`; same permissions and version trash (727-734).
 - **Two forms** (documented at `TEMPLATE_MARKER` in logic.py). FILE form, in
   templates: `{"__template": "axe_common", "damage": 8, "__removed":
   ["flavor"]}`: the partial's name, the changed values as plain keys (nested
-  plain dicts merge key by key; anything else, lists included, replaces),
-  deleted paths as tombstones. LIVE form, on units: the full data plus
-  `"__template": {"name", "overrides", "removed"}`. A partial may itself
-  reference one (`axe_common` extends `weapon_base`); an entity template's
-  `vars` may (`vars.__template` = whole-unit inheritance), and so may its
-  parts' vars. Refs must name partials; self-references and cycles are
-  refused at save / import (`check_template_refs`); resolution charges
-  `partial_template_depth_limit`.
+  plain dicts merge key by key, into a missing key too; anything else,
+  lists included, replaces) and deleted paths as tombstones. Removals apply
+  FIRST, so a path both removed and set is replaced whole (how a dict the
+  unit wrote itself is saved). LIVE form, on units: the full data plus
+  `"__template": {"name", "overrides", "removed"}`. A partial may reference
+  another (`axe_common` extends `weapon_base`); an entity template's `vars`
+  may (`vars.__template` = whole-unit inheritance), and so may its parts'
+  vars. Refs must name partials; self-references and cycles are refused at
+  save / import (`check_template_refs`); resolution charges
+  `partial_template_depth_limit` and `partial_template_size_limit` (a node
+  budget per materialization, owner ceiling: nested references multiply).
+- **Inherited containers:** a container that comes WITH a partial (orc_base's
+  axe) has `"inherited": true` and starts with empty lists; its base is what
+  the enclosing partial holds there (`Match._container_base`), so the
+  partial's own values (orc_base setting the axe's damage) are base, and an
+  edit of orc_base reaches the unit on resync / save. One copied out of its
+  context (var_copy, looting, a detached parent) is re-measured by value
+  against its own partial (`rebase_written` in write_var, `_rebase`).
 - **Materialized, never linked:** spawn / summon / apply_statblock turn file
   refs into live data (`Match.template_materialize`; `resolve_partial`
   cached per command in `PARTIAL_CACHE`, keyed by server, match, pinning and
-  name; any template command clears it). Library edits reach a unit only
-  through `!template resync`.
+  name; any template command and any undo clears it). Library edits reach a
+  unit only through `!template resync` (or a save and respawn).
 - **Tracking** (`Match.track_template_change`, called by write_var /
   remove_var): the path goes into the NEAREST marker above it (a delete
-  into `removed`); a value equal to the partial's at that moment takes it
-  off ("back to the norm"), as does restoring a removed key; a listed parent
-  leaves only when its whole subtree matches; engine writes (hp, ATB) count.
-  The marker key can't be written or deleted by path (write_var refuses a
-  `__template` segment; values carrying a well-formed live marker are fine,
-  so looting with `var_move` / `var_copy` carries the marker along). Values
-  bound for vars can't hold a FILE-form ref (`check_live_markers`).
-- **Saving** (`capture_template` / `capture_partial` → `template_file_form`):
-  each marked container becomes its name plus what deviates from the
-  partial as this match sees it now; a listed dict that dropped base keys
-  writes them as removed; a container whose partial is gone is written in
-  full without the ref, with a ⚠️ note.
+  into `removed`); a value equal to the container's base at that moment
+  takes it off ("back to the norm"), as does restoring a removed key; a
+  listed parent leaves only when its whole subtree matches; a container the
+  base lacks that a delete leaves behind is recorded. Engine writes through
+  write_var (hp, ATB) count; engine-kept vars set directly
+  (`_ENGINE_STATE_VARS`: snake links, located / region parts, the
+  destroyed latch) are written by every save and kept by a whole-vars
+  resync, as are vitals and default vars. `__template` / `__removed` are
+  reserved var names; values bound for vars can't hold a FILE-form ref or a
+  malformed marker (`check_live_markers`).
+- **Saving** (`capture_template` / `capture_partial` → `template_file_form`
+  → `_dematerialize`): from the markers alone, so a save means the same
+  whatever the library later holds: the recorded paths with the current
+  values, the recorded removals, and each inherited container's own
+  deviations as plain keys; a container whose partial is gone is written in
+  full without the ref, with a ⚠️ note. Storing a template (save / import /
+  copy / restore / set) expands it under the size limit and checks the
+  expanded result (a reserved var reached through a partial is refused
+  then, not at spawn); an entity template can't replace a partial other
+  templates reference.
 - **Commands:** `!template save <unit> [name] path=<var.path>` (`.` = all
   vars) saves a partial; `give <partial> <unit> <path>`; `show ... expanded`
   (resolved against the library, pins ignored, nothing pinned); `resync
-  <unit> [path]` (all or nothing, tracking off while it writes; no path =
-  the vars root or each outermost marked container); `detach <unit>
-  [path]` (plain data); `refs <unit>` (player-available, POV-filtered).
-  `delete` / `rename` of a referenced partial need `force` and an
-  administrator: rename rewrites the refs in dependent templates (live
-  markers keep the old name until resynced or saved; a rename that would
-  close a cycle is refused before anything moves); delete writes the
-  partial's own layer into each dependent (keeping a ref it holds itself),
-  or the resolved data when the two layers don't combine. Formulas:
-  `give_template(eid, path, name)` (mutating), `template_of(eid, path='')`
-  (read-only); `var_keys` hides `__` keys, `!ent dump` shows them.
+  <unit> [path]` (all or nothing, tracking off while it writes; an
+  inherited container rebuilds from its enclosing partial; no path = the
+  vars root or each outermost marked container); `detach <unit> [path]`
+  (plain data, recorded in the enclosing marker so a save keeps it);
+  `refs <unit>` (host-only like `!ent dump`). `delete` / `rename` of a
+  referenced partial need `force` and an administrator: rename rewrites
+  the refs in dependent templates (live markers keep the old name until
+  resynced or saved; a rename that would close a cycle is refused before
+  anything moves); delete writes the partial's own layer into each
+  dependent (keeping a ref it holds itself), or the resolved data when the
+  two layers don't combine. Formulas: `give_template(eid, path, name)`
+  (mutating), `template_of(eid, path='')` (read-only); `var_keys` hides `__`
+  keys, `!ent dump` shows them.
 - **Pinning** (`template_pinning`, default off): `Match.template_pins`
   (`{name: {data, turn}}`, serialized, in undo snapshots, kept by `!match
   clone`; a transferred unit resolves against its new match) —
-  `partial_data` pins a partial on its
-  first use while the rule is on; off = pins kept, unused. `!match templates
-  [refresh [name]]` lists them (with whether the library differs) or drops
-  them; a save in a pinning match notes refs whose library copy differs.
+  `partial_data` pins a partial on its first use while the rule is on;
+  off = pins kept, unused. `!match templates [refresh [name]]` lists them
+  (with whether the library differs) or drops them; a save in a pinning
+  match notes refs whose library copy differs.
 
 ---
 
@@ -1555,6 +1580,11 @@ rejected already. Update this section in the PR that resolves an item.
   beyond ids.
 - **Path-mode snake transfer:** segments overlap early in `path` mode, so
   transferring a fresh snake can fail with "cell occupied".
+- **Snake overlapping its own head:** the head passes through its own body
+  by default (`segment_self_collision` off), so a segment can share the
+  head's cell; a template spawn, revive or transform then puts that segment
+  on the nearest free cell with a ⚠️. Whether spawns should recreate the
+  overlap is open.
 
 ### Deferred (the user wants these tracked)
 

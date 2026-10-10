@@ -20355,7 +20355,7 @@ SCENARIO 728 — Partial templates: whole-unit inheritance, save writes only the
 !assert "entity[orc_archer].inventory.axe.damage == 6 and entity[orc_archer].inventory.bow.damage == 4"
 !assert "template_of('orc_archer') == 'orc_base' and template_of('orc_archer', 'inventory.axe') == 'axe_common'"
 !template refs orc_archer
-?? (vars) ← `orc_base`: changed `hp`, `inventory.bow`, `max_hp`
+?? (vars) ← `orc_base`: changed `hp`, `inventory.bow.damage`, `max_hp`
 ?? `inventory.axe` ← `axe_common` (unchanged)
 !ent hp orc_archer -4
 !ent set_var orc_archer inventory.axe.damage 8
@@ -20363,7 +20363,7 @@ SCENARIO 728 — Partial templates: whole-unit inheritance, save writes only the
 !template save orc_archer veteran
 ?? Saved template `veteran` from `orc_archer`
 !template show veteran vars compact
-?? {"__template":"orc_base","hp":20,"inventory":{"axe":{"__template":"axe_common","damage":8},"bow":{"damage":4}},"max_hp":24}
+?? {"__template":"orc_base","hp":20,"inventory":{"axe":{"damage":8},"bow":{"damage":4}},"max_hp":24}
 !template spawn veteran 8 5
 !assert "entity[veteran].hp == 20 and entity[veteran].inventory.axe.damage == 8"
 !assert "entity[veteran].inventory.axe.flavor == 'an axe' and len(footprint_cells('veteran')) == 4"
@@ -20374,7 +20374,7 @@ SCENARIO 728 — Partial templates: whole-unit inheritance, save writes only the
 !template save orc_archer orc_line path=.
 ?? Saved partial template `orc_line` from `orc_archer`'s vars
 !template show orc_line compact
-?? {"data":{"__template":"orc_base","hp":20,"inventory":{"axe":{"__template":"axe_common","damage":8},"bow":{"damage":4}},"max_hp":24},"kind":"partial"}
+?? {"data":{"__template":"orc_base","hp":20,"inventory":{"axe":{"damage":8},"bow":{"damage":4}},"max_hp":24},"kind":"partial"}
 !template import loop_a {"kind": "partial", "data": {"__template": "loop_b"}}
 ?? isn't a partial template
 !template import loop_a {"kind": "partial", "data": {"x": 1}}
@@ -20394,11 +20394,14 @@ holds an `axe_common` axe. `show ... expanded` prints the resolved vars
 next to the raw ones. A spawn materializes the whole chain: the archer is a
 2×2 orc with initiative 4 and an axe, plus its own hp 24 and bow. Its vars
 root is marked with what the template changed (`hp`, `max_hp`,
-`inventory.bow`); the axe has its own marker. After the archer takes 4
+`inventory.bow.damage`); the axe has its own marker, inherited from
+orc_base. After the archer takes 4
 damage, sharpens its axe to 8 and moves, `!template save` writes only the
-changes against `orc_base`: hp 20, max_hp 24, the bow, and the axe as a
-reference plus damage 8 (position and id aren't template data); a spawn
-of `veteran` gets them back. `path=` saves a container as a partial: the
+changes against `orc_base`: hp 20, max_hp 24, the bow, and the axe's
+damage 8 as a plain key — the axe comes with orc_base, so orc_base supplies
+its reference and a later edit of orc_base's axe still reaches the veteran
+(position and id aren't template data); a spawn of `veteran` gets them
+back. `path=` saves a container as a partial: the
 axe becomes `axe_kit` (extending `axe_common` with damage 8), `.` saves all
 the vars as `orc_line` (extending `orc_base` with the same changes the
 entity template recorded). A reference to a template that isn't a partial, a
@@ -20620,7 +20623,154 @@ nothing: when the library widens `ob` to 3 cells and the wall blocks the
 wider body, nothing changes (the speed stays 3); with the wall gone the ogre
 becomes 3×2 with speed 9 and keeps its own hp 20.
 
-SCENARIO 732 — Tab completion: commands, subcommands, literal words and options
+SCENARIO 732 — Partial templates: what comes with a partial follows library edits
+-----------------------------------------------------------------------------------
+
+!match new t732 Barracks 12 8
+!match use t732
+!template import axe_common {"kind": "partial", "data": {"damage": 6, "edge": "dull"}}
+!template import orc_base {"kind": "partial", "data": {"hp": 30, "max_hp": 30, "gear": {"axe": {"__template": "axe_common", "damage": 8}}}}
+!template import orc {"name": "Orc", "vars": {"__template": "orc_base"}}
+!template spawn orc 2 2
+!template spawn orc 5 2
+!template refs orc
+?? `gear.axe` ← `axe_common` (unchanged)
+!ent set_var orc gear.axe.edge keen
+!ent set_var orc2 gear.axe.damage 8
+!template refs orc2
+?? `gear.axe` ← `axe_common` (unchanged)
+!template save orc vet
+!template show vet vars compact
+?? {"__template":"orc_base","gear":{"axe":{"edge":"keen"}}}
+!template set orc_base gear.axe.damage 9
+!template resync orc
+!template resync orc2
+!assert "entity[orc].gear.axe.damage == 9 and entity[orc].gear.axe.edge == 'keen'"
+!assert "entity[orc2].gear.axe.damage == 9"
+!template spawn vet 8 2
+!assert "entity[vet].gear.axe.damage == 9 and entity[vet].gear.axe.edge == 'keen'"
+!ent add thief Thief 10 2 6 3
+!eval "var_copy('orc', 'gear.axe', 'thief', 'loot')"
+!template refs thief
+?? `loot` ← `axe_common`: changed `damage`, `edge`
+!template detach orc gear.axe
+!template refs orc
+?? (vars) ← `orc_base`: changed `gear.axe`
+!template save orc plain_vet
+!template show plain_vet vars compact
+?? {"__removed":["gear.axe"],"__template":"orc_base","gear":{"axe":{"damage":9,"edge":"keen"}}}
+!template spawn plain_vet 8 5
+!assert "template_of('plain_vet', 'gear.axe') == None and entity[plain_vet].gear.axe.edge == 'keen'"
+
+Expected: HARNESS-ALLOWS-ERRORS. orc_base gives its axe damage 8. That is part
+of what the orcs' axes come with: the axe is inherited from orc_base, so its
+marker starts unchanged, and setting damage to orc_base's 8 records nothing.
+The first orc's keen edge is its own change, and a save writes only that
+(`gear.axe.edge`, no reference: orc_base supplies the axe). When orc_base's
+axe goes to damage 9, a resync gives both orcs 9 and keeps the keen edge; a
+spawn of the saved `vet` gets the same. Looting the axe with var_copy
+re-measures it against axe_common itself, so on the thief its damage and
+edge are changes. Detaching the orc's axe makes it the orc's own plain data:
+orc_base records `gear.axe`, and the save writes it whole (removed and set:
+it replaces orc_base's axe), so the spawned copy has a plain axe.
+
+SCENARIO 733 — Partial templates: size limit, kind changes, reserved names
+---------------------------------------------------------------------------
+
+!match new t733 Vault 10 6
+!match use t733
+!system set default partial_template_size_limit 100
+!template import p1 {"kind": "partial", "data": {"k1": 1, "k2": 2, "k3": 3, "k4": 4, "k5": 5, "k6": 6, "k7": 7, "k8": 8, "k9": 9, "k10": 10}}
+!template import p2 {"kind": "partial", "data": {"a": {"__template": "p1"}, "b": {"__template": "p1"}}}
+!template import p3 {"kind": "partial", "data": {"a": {"__template": "p2"}, "b": {"__template": "p2"}, "c": {"__template": "p2"}, "d": {"__template": "p2"}}}
+?? expand past partial_template_size_limit (100 values)
+!assert "has_template('p2') and not has_template('p3')"
+!ent add hero Hero 10 2 2 3
+!template give p2 hero bag
+!assert "entity[hero].bag.a.k10 == 10"
+!template import p1 {"kind": "partial", "data": {"k1": 1, "k2": 2, "k3": 3, "k4": 4, "k5": 5, "k6": 6, "k7": 7, "k8": 8, "k9": 9, "k10": 10, "k11": 11, "k12": 12, "k13": 13, "k14": 14, "k15": 15, "k16": 16, "k17": 17, "k18": 18, "k19": 19, "k20": 20, "k21": 21, "k22": 22, "k23": 23, "k24": 24, "k25": 25, "k26": 26, "k27": 27, "k28": 28, "k29": 29, "k30": 30, "k31": 31, "k32": 32, "k33": 33, "k34": 34, "k35": 35, "k36": 36, "k37": 37, "k38": 38, "k39": 39, "k40": 40, "k41": 41, "k42": 42, "k43": 43, "k44": 44, "k45": 45, "k46": 46, "k47": 47, "k48": 48, "k49": 49, "k50": 50, "k51": 51, "k52": 52, "k53": 53, "k54": 54, "k55": 55, "k56": 56, "k57": 57, "k58": 58, "k59": 59, "k60": 60}}
+!template give p2 hero bag2
+?? expand past partial_template_size_limit (100 values)
+!assert "not var_has('hero', 'bag2')"
+!ent add z Zed 5 6 4 3
+!template save z p1
+?? `p1` is a partial template that `p2` reference
+!assert "not has_template('z')"
+!template import pos {"kind": "partial", "data": {"hp": 5, "x": 3}}
+!template import posunit {"name": "P", "vars": {"__template": "pos"}}
+?? `x` is a reserved var path
+!assert "not has_template('posunit')"
+!ent set_var hero bag.__removed x
+?? `__removed` is reserved
+!eval "var_set('hero', 'bag3', {'__removed': ['a']})"
+?? `__removed` is reserved
+!template save path=bag
+?? Which unit?
+!template save hero kit path=bag path=bag
+?? Each option goes once
+!as player carol
+!template refs hero
+?? needs host approval
+!as host
+
+Expected: HARNESS-ALLOWS-ERRORS. With partial_template_size_limit at 100,
+`p3` would expand past 100 values (four references to a partial holding two
+references to `p1`), so its import is refused; `p2` fits and is given to the
+hero. Once `p1` grows to 60 fields, `p2` no longer fits: giving it again is
+refused and changes nothing (the limit holds when a partial is used, not
+only when it is saved). An entity template can't take the name of a partial
+other templates reference (`z` saved as `p1`). An entity template that would
+carry a reserved var (`x`) through its partial is refused at import, not at
+spawn. `__removed` is reserved like `__template`: neither a var by that name
+nor a value carrying one is accepted. `!template save` without a unit, or
+with an option given twice, is refused. `!template refs` shows which of a
+unit's vars changed, so like `!ent dump` it is for hosts: a player's request
+waits for approval.
+
+SCENARIO 734 — Partial templates: engine-kept vars, default vars and empty containers survive
+----------------------------------------------------------------------------------------------
+
+!match new t734 Quarry 14 9
+!match use t734
+!defvar add armor 3
+!template import gbase {"kind": "partial", "data": {"hp": 30, "max_hp": 30, "footprint_w": 2, "footprint_h": 2}}
+!template import pbase {"kind": "partial", "data": {"hp": 5, "max_hp": 5, "plate": 1}}
+!template import golem {"name": "Golem", "vars": {"__template": "gbase"}, "parts": [{"id": "@root_arm", "part_of": "@root", "vars": {"__template": "pbase"}}, {"id": "@root_eye", "part_of": "@root", "vars": {"__template": "pbase"}}]}
+!template spawn golem 4 3
+!part locate golem_eye 8 3
+!part region golem_arm front
+!ent set_var golem pack.rope 1
+!ent delete_var golem pack.rope
+!template refs golem
+?? changed `pack`
+!template set pbase plate 2
+!template resync golem_arm
+!template resync golem_eye
+!template resync golem
+!assert "var_get('golem_arm', '__part_region') == 'front' and entity[golem_arm].plate == 2"
+!assert "var_get('golem_eye', '__part_located') and entity[golem_eye].x == 8"
+!assert "entity[golem].armor == 3 and len(footprint_cells('golem')) == 4"
+!template save golem golem2
+!template show golem2 vars compact
+?? {"__removed":["pack"],"__template":"gbase","pack":{}}
+!template spawn golem2 4 6
+!assert "var_get('golem2_arm', '__part_region') == 'front' and entity[golem2_eye].x == 8 and entity[golem2_eye].y == 6"
+!assert "entity[golem2].pack == {} and entity[golem2].armor == 3"
+
+Expected: HARNESS-ALLOWS-ERRORS. A 2×2 golem whose vars come from partials,
+with an arm drawn over its front and an eye on its own cell. Locating and
+regioning parts sets engine-kept vars (`__part_located`, `__part_region`)
+directly rather than as recorded changes: resyncing the parts after a library
+edit (plate 2) keeps them, and a resync of the golem's whole vars keeps its
+default var (armor 3) and its 2×2 body. The golem's `pack` started from
+nothing; once its last field is deleted it stays as an empty container,
+recorded as the golem's own, so the save keeps it (`"pack":{}`, listed as
+removed and set: a dict of the unit's own replaces whatever the partial may
+later put there). The saved
+`golem2` spawns with the arm still on the front region, the eye on its own
+cell at the same offset, the empty pack, and the default armor.
+
+SCENARIO 735 — Tab completion: commands, subcommands, literal words and options
 -------------------------------------------------------------------------------
 
 !match new t732 Field 10 8
@@ -20682,7 +20832,7 @@ coordinates; `!map pan` takes none). After ` ; ` in `!batch`, the next
 command completes. A line without `!` or inside an open quote gets nothing;
 an alias completes like the command it expands to.
 
-SCENARIO 733 — Tab completion: names, var paths, and what a fogged view hides
+SCENARIO 736 — Tab completion: names, var paths, and what a fogged view hides
 ------------------------------------------------------------------------------
 
 !match new t733 Keep 12 8

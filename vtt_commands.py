@@ -163,8 +163,10 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
     # host-gated.
     "table":      frozenset({"list", "roll"}),
     # The server's template library is readable by anyone; save / import /
-    # delete check the saver themselves, spawn changes the match.
-    "template":   frozenset({"list", "show", "trash", "refs"}),
+    # delete check the saver themselves, spawn changes the match. `refs`
+    # stays host-gated: it lists which of a unit's vars changed, and a
+    # unit's vars are host-only (`!ent dump`).
+    "template":   frozenset({"list", "show", "trash"}),
     # team_data_visibility decides whose data a player may read.
     "team":       frozenset({"list", "get"}),
     "tile":       frozenset({"list", "info"}),
@@ -1267,6 +1269,7 @@ def _differs_in_undo_state(pre: Dict[str, Any], post: Dict[str, Any]) -> bool:
 _HOST_READS: Dict[str, Optional[frozenset]] = {
     "assert": None, "pending": None,
     "ent": frozenset({"dump", "diff"}),
+    "template": frozenset({"refs"}),
     "match": frozenset({"list", "info", "channels", "hosts", "outcome"}),
     "host": frozenset({"list"}),
     "map": frozenset({"full"}),
@@ -3169,6 +3172,16 @@ def _store_template(ctx: ReplyContext, mgr: MatchManager, name: str,
     old = mgr.templates.get(name)
     if old is not None and check_saver:
         _require_saver(ctx, name, old, "replace")
+    if old is not None and _is_partial(old) and not _is_partial(data):
+        deps = _template_dependents(mgr, name)
+        if deps:
+            raise VTTError(
+                f"`{name}` is a partial template that "
+                f"{', '.join(f'`{d}`' for d in deps)} reference; an entity "
+                f"template in its place would break them. Save under another "
+                f"name, or `!template delete {name} force` first (it writes "
+                f"`{name}` into them).")
+    _check_expansion(ctx, mgr, name, data)
     by, by_name = saver if saver is not None else (ctx_user(ctx),
                                                    ctx_user_name(ctx))
     for k, v in (("saved_by", by), ("saved_by_name", by_name)):
@@ -3186,6 +3199,30 @@ def _store_template(ctx: ReplyContext, mgr: MatchManager, name: str,
     mgr.templates[name] = data
     invalidate_partial_cache()
     return ("Replaced" if old is not None else "Saved"), notes
+
+
+def _check_expansion(ctx: ReplyContext, mgr: MatchManager, name: str,
+                     data: Dict[str, Any]) -> None:
+    """Refuse a template whose partial references expand past
+    partial_template_size_limit, or whose expanded vars break a template
+    rule (a reserved var name like `x` reached through a partial): what a
+    spawn would refuse, refused when it is saved."""
+    if not template_refs_of(data):
+        return
+    old = mgr.templates.get(name)
+    mgr.templates[name] = data
+    invalidate_partial_cache()
+    try:
+        expanded = _expanded_template(data, _template_resolver(mgr, ctx,
+                                                               library=True))
+        if not _is_partial(data):
+            check_template(expanded, name)
+    finally:
+        if old is None:
+            mgr.templates.pop(name, None)
+        else:
+            mgr.templates[name] = old
+        invalidate_partial_cache()
 
 
 def _template_dependents(mgr: MatchManager, name: str) -> List[str]:
@@ -3318,6 +3355,8 @@ def _template_options(args: List[str], start: int, usage: str,
     _check_options([a for a in rest if "=" in a and a not in opts] + opts,
                    set(allowed), usage.split(" <")[0])
     found = {a.split("=", 1)[0].lower(): a.split("=", 1)[1] for a in opts}
+    if len(found) < len(opts):
+        raise VTTError(f"Each option goes once — usage: `{usage}`.")
     for k, v in found.items():
         if v == "":
             raise VTTError(f"{k}= needs a value.")
@@ -3472,6 +3511,8 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         usage = "!template save <unit> [name] [path=<var.path>]"
         words, opts = _template_options(args, 1, usage, allowed=("path",))
+        if not words:
+            raise VTTError(f"Which unit? Usage: `{usage}`.")
         if len(words) > 2:
             raise VTTError(f"Unexpected `{' '.join(words[2:])}` — usage: "
                            f"`{usage}`.")
@@ -8369,6 +8410,8 @@ def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot,
     """
     if mid not in mgr.matches:
         raise NotFound(f"Match '{mid}' no longer exists.")
+    # The restored match may pin other partial versions.
+    invalidate_partial_cache()
     old = mgr.matches[mid]
     new_match = Match.from_dict(snapshot.state)
     # Transfer history pointer first so the truncate below targets the
