@@ -16185,6 +16185,20 @@ def check_template(data: Any, name: str) -> Tuple[Dict[str, Any], List[str]]:
         trial.setdefault("name", name)
         if not isinstance(trial.get("vars", {}), dict):
             raise VTTError(f"{what}: `vars` must be an object.")
+        facing = trial.get("facing")
+        if facing is not None and facing not in FACING_VECTORS:
+            raise VTTError(f"{what}: facing `{facing}` isn't a direction "
+                           f"({', '.join(FACING_VECTORS)}).")
+        st = trial.get("status", {})
+        if not isinstance(st, dict):
+            raise VTTError(f"{what}: `status` must be an object.")
+        for sname, inst in st.items():
+            if not isinstance(inst, dict):
+                raise VTTError(f"{what}: status `{sname}` must be an object.")
+            for f in STATUS_NUMBER_FIELDS:
+                if f in inst:
+                    checked_status_value(f, inst[f],
+                                         f"{what} status `{sname}`")
         try:
             pe = Entity.from_dict(trial)
             checked_unit_vars(pe.vars, ("hp", "max_hp", "initiative"), what)
@@ -16227,6 +16241,89 @@ def check_template(data: Any, name: str) -> Tuple[Dict[str, Any], List[str]]:
                            f"object.")
     json_text(d)  # refuses anything JSON can't hold
     return d, notes
+
+
+def template_part_label(pid: Any) -> str:
+    """A template part's local name as people type it: `@root_head` ->
+    `head` (other ids as stored)."""
+    p = str(pid)
+    if p.startswith(TEMPLATE_ROOT + "_"):
+        return p[len(TEMPLATE_ROOT) + 1:]
+    return p
+
+
+def template_part(tpl: Dict[str, Any], name: str, part: str
+                  ) -> Tuple[Any, Dict[str, Any]]:
+    """(key, part dict) of the part `part` names in template `tpl`: a list
+    part by its local name (`head`) or stored id (`@root_head`), a
+    {role: part} part by its role. The dict is the one in `tpl`."""
+    parts = tpl.get("parts")
+    want = str(part)
+    if isinstance(parts, dict):
+        if want in parts and isinstance(parts[want], dict):
+            return want, parts[want]
+    elif isinstance(parts, list):
+        for i, p in enumerate(parts):
+            if isinstance(p, dict) and want in (
+                    p.get("id"), template_part_label(p.get("id"))):
+                return i, p
+    names = template_part_names(tpl)
+    raise VTTError(f"Template `{name}` has no part `{want}`"
+                   + (f" (parts: {', '.join(names)})." if names
+                      else " (it has no parts)."))
+
+
+def template_part_names(tpl: Dict[str, Any]) -> List[str]:
+    parts = tpl.get("parts")
+    if isinstance(parts, dict):
+        return [str(k) for k in parts]
+    if isinstance(parts, list):
+        return [template_part_label(p.get("id")) for p in parts
+                if isinstance(p, dict)]
+    return []
+
+
+def template_remove_part(tpl: Dict[str, Any], name: str, part: str) -> List[str]:
+    """Remove part `part` from template `tpl` in place, with every part
+    attached under it (as despawning a part does). A snake segment behind a
+    removed one follows the next segment ahead, as when a segment is removed
+    in play. Returns the local names removed."""
+    key, _p = template_part(tpl, name, part)
+    parts = tpl["parts"]
+    if isinstance(parts, dict):
+        del parts[key]
+        if not parts:
+            tpl.pop("parts")
+        return [str(key)]
+    ids = [p.get("id") for p in parts]
+    gone = {ids[key]}
+    grew = True
+    while grew:
+        grew = False
+        for p in parts:
+            if p.get("part_of") in gone and p.get("id") not in gone:
+                gone.add(p.get("id"))
+                grew = True
+    ahead = {p.get("id"): (p.get("vars") or {}).get("__follows")
+             for p in parts if p.get("id") in gone}
+    keep = [p for p in parts if p.get("id") not in gone]
+    for p in keep:
+        pv = p.get("vars")
+        if not isinstance(pv, dict) or pv.get("__follows") not in gone:
+            continue
+        fol, seen = pv["__follows"], set()
+        while fol in gone and fol not in seen:
+            seen.add(fol)
+            fol = ahead.get(fol)
+        if fol:
+            pv["__follows"] = fol
+        else:
+            pv.pop("__follows", None)
+    if keep:
+        tpl["parts"] = keep
+    else:
+        tpl.pop("parts")
+    return [template_part_label(i) for i in ids if i in gone]
 
 
 class MatchManager:

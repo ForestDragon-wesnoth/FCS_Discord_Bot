@@ -20092,3 +20092,190 @@ server's templates. `!server wipe all` also removes them (kept 24 hours with
 the rest of the wiped data). The undo is refused while a template saved
 after the wipe exists, naming it; once it's deleted, the undo brings the
 `scout` template back.
+
+SCENARIO 723 — !template set / unset / show <path>: edit a saved body without spawning it
+------------------------------------------------------------------------------------------
+
+!match new t723 Lair 14 8
+!match use t723
+!ent add boss Wyrm 300 3 3 9
+!ent set_var boss footprint_w 2
+!ent set_var boss footprint_h 2
+!part add boss boss_head head 0 0 to_main_percent=150
+!part region boss_head front
+!part add boss torso torso 0 0 to_main_percent=100
+!template save boss wyrm
+!template show wyrm vars.hp
+?? 300
+!template set wyrm vars.hp 120
+?? `vars.hp` = `120`
+!template set wyrm name "Old Wyrm"
+!template set wyrm vars.footprint_w 3
+!template set wyrm vars.to_main_percent 200 part=head
+?? Template `wyrm` part `head`
+!template set wyrm status.burn.level 2
+!template unset wyrm vars.to_main_percent part=torso
+!template show wyrm vars compact part=head
+?? "to_main_percent":200
+!template set wyrm facing sideways
+?? isn't a direction
+!template set wyrm vars.hp lots
+?? must be a finite whole number
+!template set wyrm vars.x 3
+?? reserved var path
+!template set wyrm id foo
+?? isn't an editable template field
+!template set wyrm vars.hp 5 part=wing
+?? has no part `wing` (parts: head, torso)
+!template unset wyrm vars.nothing
+?? has nothing at `vars.nothing`
+!template spawn wyrm 9 3
+!assert "entity[wyrm].hp == 120 and footprint_width('wyrm') == 3"
+!assert "status_get('wyrm', 'burn', 'level') == 2"
+!assert "var_get('wyrm_head', 'to_main_percent') == 200 and not var_has('wyrm_torso', 'to_main_percent')"
+!assert "len(footprint_cells('wyrm_head')) == 2"
+!ent info wyrm
+?? Old Wyrm
+
+Expected: HARNESS-ALLOWS-ERRORS. `!template show <name> <path>` prints one
+field. `!template set` / `unset` edit a saved template in place: a var, the
+name, a status field, and (with `part=`) a body part's vars. Each result is
+checked like an import, so a bad facing, a text hp, a reserved var name, a
+field that isn't part of a template (`id`), a missing part or a missing path
+is refused and the template stays as it was. The spawned unit carries every
+edit: hp 120, a 3-wide body, burn level 2, a head sending 200% to main over
+the front of the body, and a torso without its own to_main_percent.
+
+SCENARIO 724 — !template part remove: subtrees go, a snake chain closes
+------------------------------------------------------------------------
+
+!match new t724 Pit 16 8
+!match use t724
+!ent add boss Wyrm 300 3 3 9
+!part add boss boss_head head 0 0
+!part add boss_head boss_eye eye 0 0
+!part add boss torso torso 0 0
+!template save boss wyrm
+!template part remove wyrm head
+?? Removed part(s) `head`, `eye` from template `wyrm`
+!template show wyrm part=eye
+?? has no part `eye` (parts: torso)
+!ent add w Worm 50 3 7 5
+!ent face w right
+!part segment w w_s1 S1 0 0
+!part segment w w_s2 S2 0 0
+!part segment w w_s3 S3 0 0
+!template save w worm
+!template part remove worm s2
+?? Removed part(s) `s2`
+!template show worm vars.__follows part=s3
+?? "@root_s1"
+!template spawn worm 12 7
+!assert "sorted(parts('worm')) == ['worm_s1', 'worm_s3']"
+!assert "var_get('worm_s3', '__follows') == 'worm_s1'"
+!ent move worm 1 up
+!assert "entity[worm_s1].x == 12 and entity[worm_s1].y == 7"
+!assert "entity[worm_s3].x == entity[worm_s1].x - 1"
+!template part list worm
+?? isn't a valid command
+
+Expected: HARNESS-ALLOWS-ERRORS. Removing the head from `wyrm` also removes
+the eye attached to it. Removing the middle segment of the worm makes the
+segment behind it follow the one ahead (`s3` follows `s1`), as removing a
+segment in play does, so the spawned worm's two segments still trail the head
+when it moves.
+
+SCENARIO 725 — Template versions: replace with edited JSON, trash, restore, rename, copy
+-----------------------------------------------------------------------------------------
+
+!match new t725 Keep 8 6
+!match use t725
+!template import guard {"name": "Guard", "vars": {"hp": 12, "initiative": 3}}
+?? Saved template `guard`
+!template import guard {"name": "Veteran Guard", "vars": {"hp": 30, "initiative": 4}}
+?? Replaced template `guard`
+?? The previous version is kept 24 hours (`!template restore guard`)
+!template set guard vars.hp 35
+!template trash guard
+?? `guard` #1
+?? Veteran Guard, hp 30
+?? `guard` #2
+?? Guard, hp 12
+!template restore guard 2
+?? Restored template `guard` (version #2): `guard` — Guard, hp 12
+!template show guard vars.hp
+?? 12
+!template trash guard
+?? Veteran Guard, hp 35
+!template restore guard 9
+?? pick 1-
+!template copy guard sentry
+?? Saved template `sentry` as a copy of `guard`
+!template rename sentry warden
+?? Renamed template `sentry` to `warden`
+!template delete guard
+?? It is kept 24 hours
+!template list
+?! `guard`
+!template restore guard
+?? Restored template `guard`
+!as restart
+!template list
+?? `guard` — Guard
+?? `warden` — Guard
+!template trash
+?? `guard` #1
+!template restore ghost
+?? No old version of `ghost`
+
+Expected: HARNESS-ALLOWS-ERRORS. Importing JSON over an existing template
+replaces it, and the reply says so; the old version goes to the template
+trash for 24 hours. So do the versions an edit replaces and a deleted
+template. `!template trash` lists them newest first (#1), `!template restore
+<name> [#]` brings one back, putting the current version in the trash (the
+Veteran Guard at hp 35 is there after restoring #2). Copy and rename make new
+names; a deleted template comes back with restore. Templates and their old
+versions are on disk, so both survive `!as restart`.
+
+SCENARIO 726 — Template edits: only the saver or an administrator
+------------------------------------------------------------------
+
+!match new t726 Keep 8 6
+!match use t726
+!host add bob
+!host add cara
+!ent add knight Knight 20 2 2 5
+!as player bob
+!template save knight knight
+!as player cara
+!template set knight vars.hp 99
+?? only they or a server administrator can edit it
+!template unset knight vars.initiative
+?? can edit it
+!template rename knight kn
+?? can rename it
+!template restore knight
+?? No old version
+!template copy knight cara_knight
+?? Saved template `cara_knight` as a copy of `knight`
+!template list
+?? `cara_knight` — Knight, hp 20, saved by cara
+!as host
+!template set knight vars.hp 25
+?? `vars.hp` = `25`
+!template list
+?? `knight` — Knight, hp 25, saved by bob
+!as player cara
+!template restore knight
+?? can replace it
+!as player bob
+!template restore knight
+?? Restored template `knight`
+!template show knight vars.hp
+?? 20
+
+Expected: HARNESS-ALLOWS-ERRORS. Another host can't edit, unset, rename or
+replace bob's template, but may copy it (the copy is hers). A server
+administrator (the harness owner) may edit it, and the template stays bob's.
+Restoring an old version replaces the current one, so the same rule applies:
+cara is refused, bob brings back the hp 20 version.
