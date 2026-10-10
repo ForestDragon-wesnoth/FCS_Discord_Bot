@@ -51,7 +51,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from logic import (GameSystem, ID_RE, Match, MatchManager,
+from logic import (GameSystem, is_file_id, Match, MatchManager,
                    RULE_CEILINGS, VTTError, Workspaces, check_template,
                    check_template_name)
 from match_history import MatchHistory
@@ -64,7 +64,7 @@ TRASH_DIR = ".trash"
 SETTINGS_FILE = "bot_settings.json"
 
 def valid_id(name: Any) -> bool:
-    return isinstance(name, str) and bool(ID_RE.fullmatch(name))
+    return is_file_id(name)
 
 
 def _dump(obj: Any) -> str:

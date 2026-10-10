@@ -951,10 +951,10 @@ async def run_action(
         # Lazy import: action.py is loaded by vtt_commands at module
         # init, so importing the registry at module scope would
         # cycle. Inside this closure we're past both modules' loads.
-        import shlex
-        from vtt_commands import registry, ASSERT_STOP  # noqa: PLC0415
+        from vtt_commands import (registry, ASSERT_STOP,  # noqa: PLC0415
+                                  split_command_line)
         try:
-            tokens = shlex.split(line)
+            tokens = split_command_line(line)
         except ValueError as ex:
             raise ActionFail(f"cmd(): cannot parse `{line}`: {ex}")
         if not tokens:

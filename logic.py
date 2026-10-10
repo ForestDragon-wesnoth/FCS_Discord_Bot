@@ -11932,11 +11932,12 @@ class Match:
         Strips id and position — those are assigned at summon time, so
         a template never carries a stale id (which would collide) or a
         fixed cell. Everything else (name, vars, status, passives,
-        clamps, facing) carries over."""
+        clamps, facing) carries over. Links to other units (part_of, a
+        mount) are stripped too: a summoned copy is never a part or a rider
+        by its data, and the ids would latch onto the originals."""
         d = e.to_dict()
-        d.pop("id", None)
-        d.pop("x", None)
-        d.pop("y", None)
+        for k in _TEMPLATE_IDENTITY_KEYS:
+            d.pop(k, None)
         return d
 
     # ---- saved entity templates (the server's library; see MatchManager) ----
@@ -12661,6 +12662,13 @@ class Match:
         prefix = id_prefix or template.get("name") or template.get("id") or "summon"
         new_id = self.mint_entity_id(prefix)
         d = copy.deepcopy(template)
+        # A dict naming a parent / vehicle (an old snapshot, a hand-built
+        # one) must not attach the new unit to it: parts come through the
+        # `parts` key, mounting through mount().
+        for k in ("part_of", "mounted_on", "mount_slot"):
+            d.pop(k, None)
+        if isinstance(d.get("vars"), dict):
+            d["vars"].pop("__follows", None)   # a segment's link ahead
         # Partial-template references in the vars are materialized now, so
         # the footprint they carry is known before placement.
         if has_file_refs(d.get("vars")):
@@ -16757,6 +16765,18 @@ class Match:
 # Match ids, system names and server keys become file / folder names in the
 # data folder (storage.py), so they are limited to these characters.
 ID_RE = re.compile(r"[A-Za-z0-9_-]{1,40}")
+# Names Windows opens as DEVICES whatever the extension (`con.json` is the
+# console; a serial port can block the bot), so none can name a file.
+WINDOWS_DEVICE_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+    + [f"COM{i}" for i in range(1, 10)] + [f"LPT{i}" for i in range(1, 10)])
+
+
+def is_file_id(name: Any) -> bool:
+    """Whether `name` can be a match id / system name / template name /
+    server key: the id characters, and not a Windows device name."""
+    return (isinstance(name, str) and bool(ID_RE.fullmatch(name))
+            and name.upper() not in WINDOWS_DEVICE_NAMES)
 
 
 def check_id(kind: str, name: Any) -> None:
@@ -16765,6 +16785,10 @@ def check_id(kind: str, name: Any) -> None:
         raise VTTError(
             f"A {kind} can use letters, digits, `_` and `-` only (1-40 "
             f"characters); `{name}` can't be one.")
+    if not is_file_id(name):
+        raise VTTError(
+            f"`{name}` is a reserved device name on Windows (where the bot "
+            f"may run), so it can't be a {kind}.")
 
 
 # The workspace key of a single-operator surface (CLI / GUI / scenario
