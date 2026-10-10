@@ -340,7 +340,7 @@ back, load the schema with `ToolSearch` before calling
 
 | Chokepoint | What flows through | What hooks in |
 |---|---|---|
-| `Entity.write_var` / `remove_var` | every var write / delete | store checks (vitals, reserved paths, footprint fit), clamps, var hooks (`on_var_*`), death check (top level only) |
+| `Entity.write_var` / `remove_var` | every var write / delete | store checks (vitals, reserved paths, footprint fit, partial-template markers), clamps, partial-template change tracking, var hooks (`on_var_*`), death check (top level only) |
 | `Match._emit_status_diff` | every status change | status hooks (`on_status_*`), death check |
 | `CommandRegistry.run` → `_run_top` / `_run` | every typed `!command` | command lock, alias resolution, access / admin gate, pause, inline `$()`, undo snapshot, formula log sink, `CURRENT_WORKSPACE`, watcher poll, storage commit |
 | `dispatch_no_snapshot` | batch / run / macro / foreach lines, action `cmd()` | admin check, inline `$()`, `!assert` stop sentinel, no gate (reached only from an already-gated command) |
@@ -1454,6 +1454,63 @@ hardcodes**.
   `has_template` / `template_names` (read-only), via `CURRENT_WORKSPACE`
   (718-726).
 
+### 7.18 Partial templates
+
+Reusable var subtrees (an `axe_common` item, an `orc_base` statblock) in the
+same library and namespace as entity templates: `{"kind": "partial",
+"data": {...}}`; same permissions and version trash (727-731).
+- **Two forms** (documented at `TEMPLATE_MARKER` in logic.py). FILE form, in
+  templates: `{"__template": "axe_common", "damage": 8, "__removed":
+  ["flavor"]}`: the partial's name, the changed values as plain keys (nested
+  plain dicts merge key by key; anything else, lists included, replaces),
+  deleted paths as tombstones. LIVE form, on units: the full data plus
+  `"__template": {"name", "overrides", "removed"}`. A partial may itself
+  reference one (`axe_common` extends `weapon_base`); an entity template's
+  `vars` may (`vars.__template` = whole-unit inheritance), and so may its
+  parts' vars. Refs must name partials; self-references and cycles are
+  refused at save / import (`check_template_refs`); resolution charges
+  `partial_template_depth_limit`.
+- **Materialized, never linked:** spawn / summon / apply_statblock turn file
+  refs into live data (`Match.template_materialize`; `resolve_partial`
+  cached per command in `PARTIAL_CACHE`, keyed by server, match, pinning and
+  name; any template command clears it). Library edits reach a unit only
+  through `!template resync`.
+- **Tracking** (`Match.track_template_change`, called by write_var /
+  remove_var): the path goes into the NEAREST marker above it (a delete
+  into `removed`); a value equal to the partial's at that moment takes it
+  off ("back to the norm"), as does restoring a removed key; a listed parent
+  leaves only when its whole subtree matches; engine writes (hp, ATB) count.
+  The marker key can't be written or deleted by path (write_var refuses a
+  `__template` segment; values carrying a well-formed live marker are fine,
+  so looting with `var_move` / `var_copy` carries the marker along). Values
+  bound for vars can't hold a FILE-form ref (`check_live_markers`).
+- **Saving** (`capture_template` / `capture_partial` → `template_file_form`):
+  each marked container becomes its name plus what deviates from the
+  partial as this match sees it now; a listed dict that dropped base keys
+  writes them as removed; a container whose partial is gone is written in
+  full without the ref, with a ⚠️ note.
+- **Commands:** `!template save <unit> [name] path=<var.path>` (`.` = all
+  vars) saves a partial; `give <partial> <unit> <path>`; `show ... expanded`
+  (resolved against the library, pins ignored, nothing pinned); `resync
+  <unit> [path]` (all or nothing, tracking off while it writes; no path =
+  the vars root or each outermost marked container); `detach <unit>
+  [path]` (plain data); `refs <unit>` (player-available, POV-filtered).
+  `delete` / `rename` of a referenced partial need `force` and an
+  administrator: rename rewrites the refs in dependent templates (live
+  markers keep the old name until resynced or saved; a rename that would
+  close a cycle is refused before anything moves); delete writes the
+  partial's own layer into each dependent (keeping a ref it holds itself),
+  or the resolved data when the two layers don't combine. Formulas:
+  `give_template(eid, path, name)` (mutating), `template_of(eid, path='')`
+  (read-only); `var_keys` hides `__` keys, `!ent dump` shows them.
+- **Pinning** (`template_pinning`, default off): `Match.template_pins`
+  (`{name: {data, turn}}`, serialized, in undo snapshots, kept by `!match
+  clone`; a transferred unit resolves against its new match) —
+  `partial_data` pins a partial on its
+  first use while the rule is on; off = pins kept, unused. `!match templates
+  [refresh [name]]` lists them (with whether the library differs) or drops
+  them; a save in a pinning match notes refs whose library copy differs.
+
 ---
 
 ## 8. Open questions, planned work, deferred and rejected ideas
@@ -1461,67 +1518,11 @@ hardcodes**.
 Check here before proposing a feature: it may be planned, deferred or
 rejected already. Update this section in the PR that resolves an item.
 
-### Agreed design, not built yet: partial templates (user, 2026-10)
-
-Reusable var-subtree templates (an `axe_common` item, a `fireball` spell, an
-`orc_base` statblock) that entity templates and units reference. Every point
-below was agreed in discussion; build it as specified.
-
-- **Library:** partials share the template library and ONE namespace with
-  entity templates (a `kind` field: entity / partial); same permissions (the
-  saver or an admin edits, anyone reads); same version trash.
-- **Reference:** a protected key INSIDE the container, so it travels with it
-  (looting, `var_copy`, `item_consume`). Template-file form: `"axe":
-  {"__template": "axe_common", "damage": 8, "__removed": ["flavor"]}` —
-  override values as plain keys, deletions as tombstones. Live form on a unit:
-  the full materialized data plus `"__template": {"name": "axe_common",
-  "overrides": ["damage", "actions.chop.cost"], "removed": ["flavor"]}`.
-  Spawn converts file → live, save converts live → file. Document both
-  formats in code comments where they are built.
-- **Materialize at spawn** (never a live link: library edits must not change
-  running matches). Nested dicts merge key by key; lists are replaced whole.
-- **Override tracking at the chokepoint:** every `write_var` / `remove_var`
-  inside a marked container records the path in the NEAREST marker's
-  overrides (a delete goes to `removed`); engine-written vars (hp,
-  atb_charge, ...) are recorded too. A listed parent covers its children.
-  **Back to the norm:** if a write sets a value equal to the partial's value
-  at that moment (deep equality; the partial read through
-  `CURRENT_WORKSPACE`, resolved once per command), the path leaves the list;
-  deleting a key the partial lacks, or restoring a removed key with the base
-  value, likewise; a listed parent leaves only when its whole subtree
-  matches. A missing partial at write time = recorded. The save also drops
-  overrides equal to the current partial.
-- **Protected marker:** `!ent set_var` / formula writes to it are refused; an
-  explicit detach command turns the container into plain data.
-- **Re-sync:** `!ent resync <id> [path]` rebuilds a container from the
-  partial plus its recorded overrides.
-- **Nesting:** partials reference partials (`axe_common` → `weapon_base`),
-  with a depth limit and cycle detection; resolve base first, then each
-  override layer outward. **Whole-unit inheritance** through
-  `vars.__template` (`orc_archer` = `orc_base` + overrides) from the start.
-- **Deleting a referenced partial** lists its dependents and is refused
-  unless forced (admin). A forced delete materializes the latest version into
-  every template and partial that referenced it (reference removed); live
-  units keep their data, and saving a container whose partial is missing
-  writes it in full without the marker, with a note (re-sync refuses with
-  the same note). The deleted partial goes to the 24-hour template trash.
-- **Display:** `var_keys` hides dunder keys (loops iterate it); `!ent dump`
-  shows them. `!template show <name> expanded` prints the resolved result next
-  to the raw overrides. Disguise `vars` may reference partials.
-- **Pinning gamerule** (default OFF): a match pins the partials it actually
-  uses — copies stored as match state (serialized, in undo snapshots, kept by
-  `!match clone`), each pinned by its own name on first use after the rule is
-  on. Rule off: pins kept but unused. `!match templates` lists pins;
-  `!match templates refresh [name]` (host) drops them so the next use pins
-  the current library version; undo past a refresh restores the old pins.
-  Saves from a pinning match diff against the PINNED version and the reply
-  says when the library copy differs. `!ent transfer` / `copy` follow the
-  destination match's pins.
-- **TODO to discuss with the user afterwards:** partial references inside
-  status instances and passives (they stay template-owned in this design).
-
 ### Undecided (ask before changing)
 
+- **Partial references in status instances and passives** (user: discuss
+  after partial templates shipped): today only var subtrees reference
+  partials; statuses and passives stay template-owned.
 - **Status counter on a missing duration:** a status with no `duration` shows
   as ∞, but `status_counter_add(eid, name, -1)` reads it as 0 and removes the
   status. Whether ∞ should stay ∞ is open (user: decide later).
