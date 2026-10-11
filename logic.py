@@ -2950,6 +2950,21 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "has no rounds."
         ),
     },
+    "skip_all_round_limit": {
+        "default": 20,
+        "schema": {"type": "int", "min": 0, "max": 1000, "ceiling": True},
+        "desc": (
+            "When EVERY unit's turn is skipped (a `skips_turn` status on all "
+            "of them), how many more whole rounds `!turn next` runs looking "
+            "for a unit that can act. A skipped turn still ticks the unit's "
+            "statuses, so stuns with timers wear off and the first unit freed "
+            "takes the turn. The search also stops as soon as a round passes "
+            "with no status changing anywhere (permanent stuns: nothing would "
+            "ever change). 0 = stop after the first all-skipped round, on the "
+            "unit the order reached. Round-based play only (ATB already "
+            "passes one turn at a time)."
+        ),
+    },
     "pause_affects_hosts": {
         "default": False,
         "schema": {"type": "bool"},
@@ -10452,19 +10467,38 @@ class Match:
             if not self.turn_order:
                 return None
         guard = len(self.turn_order) + 1
+        try:
+            skip_limit = max(0, int(self.rules.get("skip_all_round_limit", 20)))
+        except (TypeError, ValueError):
+            skip_limit = 20
+        skipped_rounds = 0
         while True:
             # Skip over any entity carrying a skip-status flag. Its internal
             # round-wrap hooks can empty the order; re-check before indexing.
+            before = json_text({k: e.status for k, e in self.entities.items()})
             eligible = self._skip_to_eligible(log)
             if not self.turn_order:
                 return None
             cur = self.turn_order[self.active_index]
             if not eligible:
+                skipped_rounds += 1
+                changed = json_text({k: e.status for k, e in
+                                     self.entities.items()}) != before
+                if changed and skipped_rounds <= skip_limit:
+                    # Timers are still running down: keep cycling until a
+                    # unit is free to act (skip_all_round_limit).
+                    continue
+                why = ("no status changed, so nothing would"
+                       if not changed else
+                       f"skip_all_round_limit is {skip_limit}")
                 log.append(
                     "⏭️ every entity is skippable; the round passes "
-                    "without anyone acting."
+                    f"without anyone acting ({why})."
                 )
                 return cur
+            if skipped_rounds:
+                log.append(f"⏭️ everyone was skipped for {skipped_rounds} "
+                           f"round(s); `{cur}` is the first able to act.")
             order_before = list(self.turn_order)
             idx = self.active_index
             log.extend(self.fire_hook(
@@ -10868,6 +10902,15 @@ class Match:
             log.extend(self.fire_hook(
                 "on_turn_skipped", target_ids=[cur],
                 extras={"skip_status": matched}))
+            # The skipped turn still elapses: the unit's turn_start and
+            # turn_end status ticks fire (no action surface), as under ATB.
+            # Without them a stun counting down on its own turns never wore
+            # off, since its turns were all skipped.
+            for when in ("turn_start", "turn_end"):
+                if (cur in self.entities and self.turn_order
+                        and self.active_index < len(self.turn_order)
+                        and self.turn_order[self.active_index] == cur):
+                    log.extend(self.fire_status_tick(when))
             if cur in self.turn_order:
                 self._advance_index(log)
             else:

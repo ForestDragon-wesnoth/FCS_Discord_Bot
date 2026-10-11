@@ -987,9 +987,13 @@ hardcodes**.
   after it — set the opener last, user call).
 - **`!turn next`** (`Match.next_turn`): turn-end hooks / ticks → advance (round
   wrap fires round hooks, ticks, `round_start_message_format` line) → skip
-  units whose statuses carry `skips_turn` (each skip fires on_turn_skipped;
-  `_skip_to_eligible` tracks the ids it has seen, so removals mid-pass can't
-  over- or under-run it) → `_start_current_turn`. The reply prints hook
+  units whose statuses carry `skips_turn` (each skip fires on_turn_skipped
+  and the unit's turn_start / turn_end status ticks, as under ATB, so a stun
+  counting down on its own turns wears off; `_skip_to_eligible` tracks the
+  ids it has seen, so removals mid-pass can't over- or under-run it). When
+  every unit is skipped, whole rounds keep passing until one can act, up to
+  `skip_all_round_limit`, stopping early once a round changes no status
+  (permanent stuns) → `_start_current_turn`. The reply prints hook
   output first and "It is now X's turn" last; an unseen unit reads as "an
   unseen unit's turn".
 - **Removal and death mid-turn:** removing the current unit sets
@@ -1090,7 +1094,9 @@ hardcodes**.
   corpse_list; `body` program). `discover_actions` walks containers
   (`action_container_mode` / `_paths`); mount slots add their own (§7.10).
   `!action <eid> <name> [target] [k=v ...] [answer=...]`, `use_action`,
-  `has_action`. A location target must be on the map and is a `Coord`
+  `has_action`. A list target lists each unit / cell / corpse once: a repeat
+  is merged with a ⚠️ (user call: to act on one twice, run the action
+  twice; `dedupe_targets`). A location target must be on the map and is a `Coord`
   (`.x` / `.y`) that stores as [x, y]; `use_action` coerces its target to
   the action's type the way `!action` parses it (`action.coerce_target`:
   [x, y] → location, ids checked, lists non-empty).
@@ -1129,8 +1135,11 @@ hardcodes**.
   matches removed, deleted ones restored, pointers and rules restored;
   bot-wide settings are not) (692-693). **`!run <file>`** reads a saves-folder
   file (admin). Both nest within `macro_recursion_limit`.
-- **Macros** (`!macro set/run/list/show/remove`): `$1..$N`, `$@`, `$#`
-  (single-pass substitution); control flow `if / elif / else / repeat / end`
+- **Macros** (`!macro set/run/list/show/remove`): `$1..$N`, `$@`, `$#` (the
+  current `repeat` iteration) (single-pass substitution); a `$N` past the
+  args given becomes empty text, with no refusal (user call): an optional
+  arg is tested with `if "$3" != ""`, and a line that needed it fails after
+  the earlier lines ran; control flow `if / elif / else / repeat / end`
   with read-only conditions (a negative `repeat` count is refused);
   `macro_repeat_limit`, `macro_step_limit` (counts
   dispatches AND loop iterations), `macro_recursion_limit`; one undo step

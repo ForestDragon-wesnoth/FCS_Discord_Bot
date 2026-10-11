@@ -47,7 +47,7 @@ surface (vtt_commands.py) gains `!action`.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from logic import VTTError, NotFound
 
@@ -855,6 +855,33 @@ def _resolve_eid_for_action(token: str, match: "Match") -> str:
             raise NotFound("No current entity (turn order is empty).")
         return eid
     return token
+
+
+def dedupe_targets(target_type: str, value: Any,
+                   name: str) -> Tuple[Any, Optional[str]]:
+    """A list target with each unit / cell / corpse once (first-seen
+    order), and a warning naming the repeats, or None. Listing one twice
+    used to run the body on it twice (user call: merge and say so; to act
+    on something twice, run the action twice)."""
+    if not target_type.endswith("_list") or not isinstance(value, list):
+        return value, None
+    seen: Set[Any] = set()
+    out: List[Any] = []
+    dups: List[str] = []
+    for v in value:
+        k = (v.x, v.y) if isinstance(v, Coord) else v
+        if k in seen:
+            label = f"({k[0]},{k[1]})" if isinstance(k, tuple) else f"`{k}`"
+            if label not in dups:
+                dups.append(label)
+            continue
+        seen.add(k)
+        out.append(v)
+    if not dups:
+        return value, None
+    return out, (f"⚠️ {', '.join(dups)} listed more than once in `{name}`'s "
+                 f"targets: the action runs on each once. To act on one "
+                 f"twice, run the action twice.")
 
 
 def coerce_target(target_type: str, value: Any, match: "Match",

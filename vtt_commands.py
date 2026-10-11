@@ -13857,7 +13857,9 @@ for _subs, _usage in (
     desc=(
         "Reusable named command sequences (a step up from !batch/!run). "
         "`set <name> <commands>` stores a macro — commands separated by `\\n`; "
-        "lines may use $1/$2/... and $@ for run-time args. CONTROL FLOW: a "
+        "lines may use $1/$2/... and $@ for run-time args (a `$N` past the "
+        "args given becomes empty text; test an optional one with "
+        "`if \"$3\" != \"\"`). CONTROL FLOW: a "
         "line `if <formula>` / `elif <formula>` / `else` / `end` branches on a "
         "READ-ONLY formula (truthy = run the block); `repeat <count>` / `end` "
         "loops a block `count` times (count is a read-only formula too), with "
@@ -14857,6 +14859,11 @@ async def _run_action_dispatch(
         args_dict = parse_args_tokens(remaining)
     except VTTError as ex:
         return await ctx.send(f"❌ action `{action.name}`: {ex}")
+    from action import dedupe_targets
+    target_value, dup_note = dedupe_targets(action.target_type, target_value,
+                                            action.name)
+    if dup_note:
+        await ctx.send(dup_note)
     # The use_action formula primitive needs ctx/mgr to find a
     # dispatcher; stash them on the match as transient runtime
     # attributes for the duration of this dispatch chain. They're

@@ -5865,12 +5865,16 @@ class FormulaEngine:
                     "Call use_action from inside !action / !ent / a "
                     "passive that fires during command processing."
                 )
-            from action import coerce_target
+            from action import coerce_target, dedupe_targets
             try:
                 target_arg = coerce_target(action.target_type, target_arg,
                                            match, name)
             except VTTError as ex:
                 raise FormulaError(f"use_action: {ex}")
+            target_arg, dup_note = dedupe_targets(action.target_type,
+                                                  target_arg, name)
+            if dup_note:
+                match.surface_log([dup_note])
             coro = run_action(
                 action, actor_id=eid, target=target_arg,
                 args=args_dict, match=match, mgr=mgr_local,

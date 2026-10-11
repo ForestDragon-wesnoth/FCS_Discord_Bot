@@ -2149,3 +2149,10 @@ overflow with a warning; `!store load` shows its var-name notes.
     ignored a stray word; a negative macro `repeat` silently ran nothing.
   - 17 `Usage:` refusals lacked ❌; the harness now flags `❌ Usage:` and
     stray-word refusals unless a scenario allows errors.
+  - Follow-ups the user decided after pass 42: list targets merge repeats
+    with a warning; macro `$N` past the args given stays empty text,
+    documented. **A skipped turn never ticked its unit's statuses in round
+    play** (ATB did), so a stun counting down on its own turn_end ticks
+    never wore off; it ticks now, and an all-skipped table cycles rounds
+    until a unit is free (`skip_all_round_limit`, stopping early when a
+    round changes no status).

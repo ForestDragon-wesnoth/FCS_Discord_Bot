@@ -21570,3 +21570,93 @@ it). An unknown `!history list` kind and the usage refusals of `!map` /
 `!match fog` subcommands now carry ❌ like every other refusal. A macro's
 `repeat` with a negative count is refused (it ran the block zero times
 and replied nothing).
+
+SCENARIO 751 — List targets merge repeats; macro args past those given
+----------------------------------------------------------------------
+
+!match new t751 Yard 10 10
+!match use t751
+!ent add a A 20 2 2 5
+!ent add b B 20 4 4 5
+!ent set_var a actions.many.target entity_list
+!ent set_var a actions.many.body "for t in target:\n    entity[t].hp = entity[t].hp - 1"
+!action a many b b a b
+?? ⚠️ `b` listed more than once in `many`'s targets: the action runs on each once. To act on one twice, run the action twice.
+!assert "entity[b].hp == 19 and entity[a].hp == 19"
+!ent set_var a actions.spots.target location_list
+!ent set_var a actions.spots.body "entity[a].spots = target"
+!action a spots 1 1 1 1 2 2
+?? ⚠️ (1,1) listed more than once
+!assert "entity[a].spots == [[1, 1], [2, 2]]"
+!ent set_var a actions.go.target none
+!ent set_var a actions.go.body "use_action('a', 'many', ['b', 'b'])"
+!action a go
+?? ⚠️ `b` listed more than once
+!assert "entity[b].hp == 18"
+!macro set hit "ent hp $1 -$2\nif \"$3\" != \"\"\nent hp $3 -1\nend"
+!macro run hit a 2
+!assert "entity[a].hp == 17 and entity[b].hp == 18"
+!macro run hit a 2 b
+!assert "entity[a].hp == 15 and entity[b].hp == 17"
+
+Expected: A list target names each unit (or cell, or corpse) once: `b b a b`
+runs the body on b and a once each, with a warning saying so (before, b
+was hit three times). The same merge applies to location lists and to
+use_action's list targets (the warning reaches the reply). A macro's `$3`
+with only two arguments given becomes empty text, so `if "$3" != ""`
+tests for an optional argument.
+
+SCENARIO 752 — Skipped turns tick their statuses; everyone stunned cycles until one is free
+----------------------------------------------------------------------
+
+!match new t752 Hold 10 10
+!match use t752
+!ent add a A 20 2 2 5
+!ent add b B 20 4 4 3
+!status def stun
+!status data stun skips_turn true
+!status when stun turn_end
+!status tick stun "status_counter_add(self, 'stun', -1)"
+!status apply a stun 1 2
+!turn next
+?? ⏭️ `a`'s turn skipped (stun).
+!assert "status_get('a', 'stun', 'duration') == 1 and current_id() == 'b'"
+!turn next
+!assert "not status_has('a', 'stun') and current_id() == 'b' and round_number() == 2"
+!turn next
+!assert "current_id() == 'a' and round_number() == 3"
+!status apply a stun 1 3
+!status apply b stun 1 2
+!turn next
+?? ⏭️ everyone was skipped for 1 round(s); `b` is the first able to act.
+!assert "current_id() == 'b' and round_number() == 5 and not status_has('b', 'stun') and not status_has('a', 'stun')"
+!status def frozen
+!status data frozen skips_turn true
+!status apply a frozen
+!status apply b frozen
+!turn next
+?? every entity is skippable; the round passes without anyone acting (no status changed, so nothing would).
+!eval "round_number()"
+!system set default skip_all_round_limit 0
+!status def daze
+!status data daze skips_turn true
+!status when daze turn_end
+!status tick daze "status_counter_add(self, 'daze', -1)"
+!ent status a remove frozen
+!ent status b remove frozen
+!status apply a daze 1 5
+!status apply b daze 1 5
+!turn next
+?? the round passes without anyone acting (skip_all_round_limit is 0).
+
+Expected: A skipped turn still ticks the skipped unit's own turn statuses
+(no action surface), as ATB already did: a's 2-turn stun counts down on
+its two skipped turns and a acts in round 3 (before, its turn_end tick
+never ran while its turns were skipped, so the stun never wore off). With
+everyone stunned (a for 3 turns, ticking once at the end of the turn it
+was stunned in, b for 2), `!turn next` keeps passing whole rounds until a
+unit is free: b's stun and then a's run out on their skipped turns, and
+b, next in the order, takes the turn in round 5. A
+permanent stun (no tick) changes nothing, so the search stops after one
+round instead of burning skip_all_round_limit rounds; with the limit at
+0 it stops after the first all-skipped round as before.
