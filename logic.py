@@ -12030,6 +12030,19 @@ class Match:
             if e is not None:
                 Match._shift_snake_path_vars(e.vars, e.x, e.y)
                 parts = copy.deepcopy(template.get("parts"))
+                if isinstance(parts, dict):
+                    # The {role: part} form: each a direct part of the unit,
+                    # named <unit id>_<role>, at its offset like a listed one.
+                    name_var = self.part_name_var()
+                    listed = []
+                    for role, p in parts.items():
+                        if not isinstance(p, dict):
+                            continue
+                        p.setdefault("vars", {}).setdefault(name_var, role)
+                        p["id"] = f"{TEMPLATE_ROOT}_{role}"
+                        p["part_of"] = TEMPLATE_ROOT
+                        listed.append(p)
+                    parts = listed
 
                 def glob(i: Any) -> Any:
                     if isinstance(i, str) and i.startswith(TEMPLATE_ROOT):
@@ -16878,6 +16891,35 @@ def check_template_refs(name: str, tpl: Dict[str, Any],
         walk(r, (r,))
 
 
+def _check_template_passives_clamps(spec: Dict[str, Any], what: str) -> None:
+    """A template's (or part's) `passives` / `clamps`: objects of objects, a
+    passive with a hook `when` (as `!passive add` takes) and a text
+    `formula`, a clamp with a `path`. The id / path default to the key, so
+    a hand-written template may leave them out. Changes `spec` in place."""
+    for field_name, key_field in (("passives", "id"), ("clamps", "path")):
+        coll = spec.get(field_name)
+        if coll is None:
+            continue
+        if not isinstance(coll, dict):
+            raise VTTError(f"{what}: `{field_name}` must be an object.")
+        for k, v in coll.items():
+            if not isinstance(v, dict):
+                raise VTTError(f"{what}: {field_name[:-1]} `{k}` must be an "
+                               f"object.")
+            v.setdefault(key_field, k)
+            if field_name == "clamps":
+                continue
+            when, formula = v.get("when"), v.get("formula")
+            if not isinstance(when, str) or (when not in HOOK_NAMES
+                                             and not is_event_hook(when)):
+                raise VTTError(f"{what}: passive `{k}` needs `when`: a hook "
+                               f"(`!help passive`) or `event:<name>`, got "
+                               f"{when!r}.")
+            if not isinstance(formula, str) or not formula.strip():
+                raise VTTError(f"{what}: passive `{k}` needs `formula`: the "
+                               f"program it runs.")
+
+
 def check_template(data: Any, name: str,
                    library: Optional[Dict[str, Any]] = None
                    ) -> Tuple[Dict[str, Any], List[str]]:
@@ -16930,6 +16972,7 @@ def check_template(data: Any, name: str,
             d[k] = str(d[k])
 
     def probe(spec: Dict[str, Any], what: str) -> None:
+        _check_template_passives_clamps(spec, what)
         trial = copy.deepcopy(spec)
         trial.pop("parts", None)
         trial.pop("segments", None)
@@ -16938,7 +16981,8 @@ def check_template(data: Any, name: str,
         if not isinstance(trial.get("vars", {}), dict):
             raise VTTError(f"{what}: `vars` must be an object.")
         facing = trial.get("facing")
-        if facing is not None and facing not in FACING_VECTORS:
+        if facing is not None and (not isinstance(facing, str)
+                                   or facing not in FACING_VECTORS):
             raise VTTError(f"{what}: facing `{facing}` isn't a direction "
                            f"({', '.join(FACING_VECTORS)}).")
         st = trial.get("status", {})
@@ -16966,6 +17010,14 @@ def check_template(data: Any, name: str,
                 if not isinstance(pt, dict):
                     raise VTTError(f"Template `{name}`: part `{role}` must be "
                                    f"an object.")
+                for k in ("mounted_on", "mount_slot", "id", "part_of"):
+                    pt.pop(k, None)
+                for k in ("x", "y"):
+                    v = pt.get(k, 0)
+                    if isinstance(v, bool) or not isinstance(v, int):
+                        raise VTTError(
+                            f"Template `{name}`: part `{role}` `{k}` must be "
+                            f"a whole-number offset.")
                 probe(pt, f"Template `{name}` part `{role}`")
         elif isinstance(parts, list):
             ids = [p.get("id") for p in parts if isinstance(p, dict)]

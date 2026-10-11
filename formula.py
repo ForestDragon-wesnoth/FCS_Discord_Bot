@@ -466,10 +466,18 @@ def _random_string(*choices: Any) -> str:
     return _random_string_impl(random, choices)
 
 
+def _data_items(d: dict) -> list:
+    """A dict's (key, value) pairs minus a partial template's marker
+    (`__template`, engine bookkeeping on a container built from a partial):
+    what keys / values / each / len / pick / roll_table see, so a loop over
+    such an inventory meets only its items."""
+    return [(k, v) for k, v in d.items() if k != TEMPLATE_MARKER]
+
+
 def _pick_source(v: Any, fname: str) -> list:
     """The items pick/shuffle draw from: a list's items or a dict's keys."""
     if isinstance(v, dict):
-        return list(v.keys())
+        return [k for k, _ in _data_items(v)]
     if isinstance(v, (list, tuple)):
         return list(v)
     raise FormulaError(
@@ -746,7 +754,7 @@ def roll_table_pick(rng, spec: Any) -> str:
         return w
     pairs = []
     if isinstance(spec, dict):
-        for k, w in spec.items():
+        for k, w in _data_items(spec):
             pairs.append((str(k), _w(w, str(k))))
     elif isinstance(spec, str):
         for part in spec.split(","):
@@ -1355,7 +1363,9 @@ def _len(v: Any) -> int:
     Until formula for-loops land, this is the main way to consume the
     list/coordinate-list return values. Raises FormulaError on a value
     that has no length (e.g. a number)."""
-    if isinstance(v, (list, tuple, str, dict)):
+    if isinstance(v, dict):
+        return len(_data_items(v))
+    if isinstance(v, (list, tuple, str)):
         return len(v)
     raise FormulaError(
         f"len(value): value has no length (got {type(v).__name__}); "
@@ -1833,7 +1843,7 @@ def _each(v: Any, *, limit: int = _DEFAULT_SIZE_LIMIT) -> list:
     `for item in each(entity[self].queue):`. A number or string is an
     error (use range(n) to count, len() for a string's length)."""
     if isinstance(v, dict):
-        out = list(v.keys())
+        out = [k for k, _ in _data_items(v)]
     elif isinstance(v, (list, tuple)):
         out = list(v)
     else:
@@ -1969,12 +1979,12 @@ def _dict_arg(v: Any, fname: str) -> dict:
 def _keys(v: Any) -> list:
     """keys(dict): a dict's keys, in insertion order (each() over a dict
     gives the same list)."""
-    return list(_dict_arg(v, "keys").keys())
+    return [k for k, _ in _data_items(_dict_arg(v, "keys"))]
 
 
 def _values(v: Any) -> list:
     """values(dict): a dict's values, in the same order as keys()."""
-    return list(_dict_arg(v, "values").values())
+    return [x for _, x in _data_items(_dict_arg(v, "values"))]
 
 
 def _index_of(v: Any, value: Any) -> Any:

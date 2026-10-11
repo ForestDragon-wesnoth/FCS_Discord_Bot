@@ -225,13 +225,23 @@ def _corpse_ids(mgr, ctx) -> List[str]:
 
 
 def _teams(mgr, ctx) -> List[str]:
+    """Team names: every team a unit, team data or a colour names; under a
+    team view, only the viewer's own and those of the units it sees."""
     m = _match(mgr, ctx)
     if m is None:
         return []
+    try:
+        pov = _query_pov(ctx, m)
+    except Exception:
+        pov = None
     tv = str(m.rules.get("team_var", "team"))
+    seen = set(_entity_ids(mgr, ctx))
     out = {str(e.vars.get(tv)) for e in m.entities.values()
-           if e.vars.get(tv) is not None}
-    out |= {str(t) for t in m.team_data} | {str(t) for t in m.team_colors}
+           if e.vars.get(tv) is not None and e.id in seen}
+    if pov is None:
+        out |= {str(t) for t in m.team_data} | {str(t) for t in m.team_colors}
+    else:
+        out.add(str(pov))
     return sorted(out)
 
 
@@ -343,10 +353,11 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
     if slot == "token":
         return sorted(m.status_definitions) if m is not None else []
     if slot == "slot" and m is not None:
+        seen = set(_entity_ids(mgr, ctx))
         holder = binds.get("vehicle")
-        if holder is None and binds.get("rider") in m.entities:
+        if holder is None and binds.get("rider") in seen:
             holder = m.entities[binds["rider"]].mounted_on
-        e = m.entities.get(holder or "")
+        e = m.entities.get(holder or "") if holder in seen else None
         slots = e.vars.get("slots") if e is not None else None
         return sorted(str(s) for s in slots) if isinstance(slots, dict) else []
     if slot == "name":
@@ -356,13 +367,14 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
             return sorted(mgr.systems)
         if m is None:
             return []
+        seen = set(_entity_ids(mgr, ctx))
         if root in ("action", "ent") and (root == "action" or sub == "action"):
-            if ent in m.entities:
+            if ent in seen:
                 from action import discover_actions
                 return sorted(discover_actions(m.entities[ent], m.rules))
             return []
         if root == "ent" and sub == "status":
-            own = set(m.entities[ent].status) if ent in m.entities else set()
+            own = set(m.entities[ent].status) if ent in seen else set()
             return sorted(own | set(m.status_definitions))
         by_root = {
             "macro": m.macros, "table": m.tables, "alias": m.aliases,

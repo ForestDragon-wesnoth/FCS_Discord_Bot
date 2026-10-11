@@ -20848,7 +20848,53 @@ part and mount links, and a summon strips them (and a segment's
 snapshot of a worm segment summons as a plain unit that doesn't follow the
 worm.
 
-SCENARIO 737 — Tab completion: commands, subcommands, literal words and options
+SCENARIO 737 — Templates: {role: part} offsets, checked passives / clamps, a partial's marker unseen by loops
+-------------------------------------------------------------------------------------------------------------
+
+!match new t737 Lair 12 10
+!match use t737
+!template import drake {"name": "Drake", "vars": {"hp": 30, "footprint_w": 2, "footprint_h": 2}, "parts": {"head": {"name": "Head", "vars": {"hp": 10, "__part_located": true}, "x": 2, "y": 0}, "wing": {"name": "Wing", "vars": {"hp": 5}}}}
+!template spawn drake 3 3
+!assert "parts('drake') == ['drake_head', 'drake_wing'] or parts('drake') == ['drake_wing', 'drake_head']"
+!assert "entity[drake_head].x == 5 and entity[drake_head].y == 3"
+!template spawn drake 3 6
+!assert "entity[drake2_head].x == 5 and entity[drake2_head].y == 6 and part_of('drake2_wing') == 'drake2'"
+!template import bad1 {"name": "B", "vars": {"hp": 5}, "parts": {"head": {"vars": {"hp": 1}, "y": {"no": 1}}}}
+?? part `head` `y` must be a whole-number offset
+!template import bad2 {"name": "B", "vars": {"hp": 5}, "facing": ["up"]}
+?? facing
+!template import bad3 {"name": "B", "vars": {"hp": 5}, "passives": {"regen": 5}}
+?? passive `regen` must be an object
+!template import bad4 {"name": "B", "vars": {"hp": 5}, "passives": {"regen": {"when": "on_turn_starts", "formula": "pass"}}}
+?? needs `when`
+!template import regen {"name": "R", "vars": {"hp": 5, "max_hp": 9, "initiative": 4}, "passives": {"regen": {"when": "on_turn_start", "formula": "entity[self].hp = entity[self].hp + 1"}}, "clamps": {"hp": {"max": "max_hp"}}}
+!template spawn regen 8 2
+!turn next
+!assert "entity[regen].hp == 6"
+!template import sword {"kind": "partial", "data": {"weight": 3}}
+!template import kit {"kind": "partial", "data": {"sword": {"__template": "sword"}, "rope": {"weight": 1}}}
+!ent add hero Hero 20 8 8 3
+!template give kit hero bag
+!assert "keys(entity[hero].bag) == ['sword', 'rope'] and len(entity[hero].bag) == 2"
+!assert "each(entity[hero].bag) == ['sword', 'rope'] and values(entity[hero].bag.sword) == [3]"
+!assert "pick(entity[hero].bag) != '__template'"
+!eval "entity[hero].load = 0\nfor k in each(entity[hero].bag):\n    entity[hero].load = entity[hero].load + get(entity[hero].bag, k + '.weight')"
+!assert "entity[hero].load == 4"
+
+Expected: HARNESS-ALLOWS-ERRORS. A template whose parts are a {role: part}
+object (as a summon template writes them) used to spawn them at their x / y
+as map cells: the drake's head went to (2,0), off the map, and landed on the
+nearest free cell. Each is now a part of the unit named `<unit>_<role>`, its
+x / y an offset from the anchor like the listed form (head at (5,3) for a
+drake at (3,3)). Imports refuse a part offset that isn't a whole number, a
+facing that isn't text (a list used to 💥), and a passive that isn't an
+object with a hook `when` and a `formula` (one used to fail with a raw
+Python TypeError); a passive or clamp may leave out its id / path (the key
+fills it), and the spawned regen unit heals on its turn. keys / values /
+each / len / pick / roll_table skip a partial's `__template` marker, so a
+loop over the kit sees its two items and sums their weights (4).
+
+SCENARIO 738 — Tab completion: commands, subcommands, literal words and options
 -------------------------------------------------------------------------------
 
 !match new t732 Field 10 8
@@ -20910,7 +20956,7 @@ coordinates; `!map pan` takes none). After ` ; ` in `!batch`, the next
 command completes. A line without `!` or inside an open quote gets nothing;
 an alias completes like the command it expands to.
 
-SCENARIO 738 — Tab completion: names, var paths, and what a fogged view hides
+SCENARIO 739 — Tab completion: names, var paths, and what a fogged view hides
 ------------------------------------------------------------------------------
 
 !match new t733 Keep 12 8
@@ -20966,12 +21012,24 @@ SCENARIO 738 — Tab completion: names, var paths, and what a fogged view hides
 !template give axe_common hero inventory.pick
 ?tab "!match templates refresh "
 ?? candidates: axe_common
+!ent set_var spy actions.zap.target none
+!ent set_var spy actions.zap.body pass
+!ent status spy add hidden_mark
 !match fog on
 !as view red
 ?tab "!ent info "
 ?? candidates: hero
 ?! spy
+?tab "!team set "
+?? candidates: red
+?! blue
+?tab "!action spy "
+?! zap
+?tab "!ent status spy info "
+?! hidden_mark
 !as view clear
+?tab "!action spy "
+?? zap
 ?tab "!ent info "
 ?? candidates: hero  spy
 
@@ -20985,4 +21043,5 @@ template's own paths (`edge`) and flags (`expanded`). `!template give
 each command looks: the unit's actions, status definitions, macros, rule
 names after `!system set <system>`, matches, teams, hook names. Under the
 red view with fog on, the blue spy out of sight is left out, as `!ent info`
-itself treats it; clearing the view offers it again.
+itself treats it, and so are its team, its actions (`zap`) and its statuses
+(`hidden_mark`); clearing the view offers them again.

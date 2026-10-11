@@ -1,7 +1,7 @@
 
 ## cli.py (desktop runner using the same commands)
 # cli.py
-import asyncio, os, sys
+import asyncio, os, re, sys
 from typing import List
 from logic import LOCAL_WORKSPACE
 from storage import open_workspaces, load_local_settings, local_persistence_note
@@ -85,6 +85,7 @@ class CLICtx:
             line = input("  > ").strip()
         except (EOFError, KeyboardInterrupt):
             return None
+        _forget_lines(1)        # an answer isn't a command to recall
         if not line:
             return None
         # Allow picking an option by its 1-based number, too.
@@ -136,6 +137,76 @@ def _install_readline(workspaces, ctx) -> bool:
     return True
 
 
+def _forget_lines(n: int) -> None:
+    """Drop the last n lines input() added to readline's history."""
+    try:
+        import readline
+    except ImportError:
+        return
+    for _ in range(n):
+        size = readline.get_current_history_length()
+        if size <= 0:
+            return
+        readline.remove_history_item(size - 1)
+
+
+_IMPORT_RE = re.compile(r"!template\s+import\s+\S+\s*(.*)\Z", re.I | re.S)
+
+
+def _import_unfinished(line: str) -> bool:
+    """Whether `line` is a `!template import` whose JSON is still open (a
+    `{` / `[` not yet closed outside strings, or a ``` fence not yet
+    closed): a pasted multi-line JSON block continues on the next lines."""
+    m = _IMPORT_RE.match(line)
+    if not m:
+        return False
+    tail = m.group(1)
+    if tail.count("```") % 2:
+        return True
+    depth, in_str, esc = 0, False, False
+    for ch in tail:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+    return depth > 0
+
+
+def _read_continuation(line: str) -> str:
+    """A `!template import` line plus the lines of its pasted JSON (prompt
+    `...`), up to where the JSON closes, a blank line or end of input. The
+    block is one command and one history entry."""
+    extra = 0
+    while _import_unfinished(line):
+        try:
+            more = input("... ")
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not more.strip():
+            break
+        extra += 1
+        line += "\n" + more
+    if extra:
+        _forget_lines(extra + 1)
+        try:
+            import readline
+            readline.add_history(line if "```" in line
+                                 else " ".join(x.strip()
+                                               for x in line.splitlines()))
+        except ImportError:
+            pass
+    return line
+
+
 def parse(line: str):
     try:
         return split_command_line(line)
@@ -183,6 +254,7 @@ async def main():
             break
 
         if line.startswith("!"):
+            line = _read_continuation(line)
             try:
                 parts = parse(line[1:])
             except RuntimeError as e:

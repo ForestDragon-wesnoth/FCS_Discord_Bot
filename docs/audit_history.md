@@ -1981,3 +1981,43 @@ template fuzzers re-run after the fixes, and hand probes.
     it is logged.
   - **Completion.** `!match templates refresh <name>` offered nothing; it
     offers the match's pinned names.
+
+## Pass 39
+
+Templates again plus the input code of gui.py / cli.py / completion.py.
+Method: probes of partial-template markers against every engine reader of
+dict containers (modifiers, shields, actions, status resistance, var_sum /
+var_sum_field / var_keys, item helpers, the pure dict helpers), templates
+across transform / revert, kill / revive, clone, copy to a pinning match and
+summon_from; a random-JSON `!template import` fuzzer (10k shapes, each
+imported, shown expanded, given and spawned, the spawn saved back); the
+pass-37 template fuzzers re-run; the GUI read end to end with an Xvfb key
+test (28 cases) and the CLI with a pexpect test.
+  - **Marker seen as an item.** keys / values / each / len / pick /
+    shuffle / roll_table returned a partial container's `__template` marker
+    with its items: a loop over a kit met a phantom `__template` entry
+    (get(..., k + '.weight') failed on it), len counted it. They now skip
+    it (`formula._data_items`). The engine's own readers (modifier bundles,
+    shield pools, action discovery) already ignored it.
+  - **{role: part} templates.** spawn_template converted only listed parts'
+    offsets; a `parts` object (the summon form, which check_template
+    accepts) spawned its located parts at x / y read as map cells and
+    named them by role (`head`, `head2`). They are now direct parts named
+    `<unit>_<role>` at offsets; the import checks their offsets.
+  - **Passives / clamps in templates** were not checked: a passive that
+    wasn't an object failed with a raw Python TypeError, one with an unknown
+    `when` was stored and never fired. Checked like `!passive add` (hook
+    `when`, a `formula`); id / path default to the key.
+  - **Facing as a list or object** in an import 💥'd (unhashable).
+  - **Completion under a team view** listed the teams of units the view
+    can't see, and the actions, statuses and mount slots of hidden units.
+  - **GUI:** a blank line inside pasted JSON split the import from its
+    remaining lines; Up / Down on a wrapped long line recalled history
+    instead of moving between its rows (now by screen row); keypad Enter
+    inserted a newline; the Ctrl+R bar stayed open after focus left it, so
+    a later Ctrl+R saved the found match as the draft.
+  - **CLI:** a pasted multi-line `!template import` ran its first line and
+    then "Commands must start with '!'" per JSON line; it now reads `...`
+    continuation lines until the JSON closes and recalls the block as one
+    history line. Answers typed at choose() prompts went into the Up / Down
+    history.

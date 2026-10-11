@@ -157,7 +157,7 @@ code. How the harness works (`run_scenarios.py`, scenarios in
   command's full reply next to the Expected prose; `-v` prints a transcript.
 - **Tab completion** is tested in scenarios too: `?tab "<text>"` replies with
   what Tab does at the end of the text (`→ '<line>'` and `candidates: ...`)
-  in the scenario's workspace; check it with `??` / `?!` (737-738).
+  in the scenario's workspace; check it with `??` / `?!` (738-739).
 - **Isolation.** Each scenario gets its own temp data folder (real storage
   commits) and a temp saves folder; `!as restart` reloads everything from
   disk as a bot restart would.
@@ -343,7 +343,7 @@ back, load the schema with `ToolSearch` before calling
   (`AllowedMentions.none()`), splits long replies fence-aware, and retires a
   board whose channel was unbound.
 - **`test_sequences.txt`**: the scenarios (§2).
-- **`docs/audit_history.md`**: the narratives of audit passes 2-37 — what was
+- **`docs/audit_history.md`**: the narratives of audit passes 2-39 — what was
   swept, verified clean, measured. Read the relevant passes before auditing
   an area again.
 
@@ -868,7 +868,9 @@ hardcodes**.
   `var_move` (looting), `var_copy`, `var_sum_field`, `item_add` /
   `item_consume` (drops the container at 0; `amount_field` rule), `var_keys`,
   `var_sum`, `var_clear`, `get`, `keys` / `values` / `index_of` / `unique`
-  (547-548, 685-686). Authoring notes: in an item's action `source.<path>` is
+  (547-548, 685-686). keys / values / each / len / pick / shuffle /
+  roll_table skip a partial template's `__template` marker
+  (`formula._data_items`), as var_keys skips every `__` key. Authoring notes: in an item's action `source.<path>` is
   the ITEM's container and `entity[self]` the HOLDER; dict keys are unique, so
   identical items stack through an amount field; `!ent set_var hero
   inventory.potion 99` replaces the whole item dict.
@@ -1383,8 +1385,13 @@ hardcodes**.
   session's commands (GUI: only on the input's first / last line, so they
   still move through a multi-line block; an unsent draft comes back past
   the newest), Ctrl+R reverse search (GUI: a bar above the input, Enter
-  takes the match for editing, Esc restores the draft), and in the GUI Esc
-  clears the input and Ctrl+L the log. History is per session (user call).
+  takes the match for editing, Esc restores the draft, clicking away takes
+  the match), and in the GUI Esc clears the input and Ctrl+L the log; the
+  first / last line is a screen ROW, so Up / Down still move through a long
+  wrapped line; keypad Enter runs like Enter. History is per session (user
+  call); the CLI keeps answers to choose() prompts out of it. Completion
+  under a team view offers only what that view's queries show: unit ids,
+  their teams, actions, statuses and mount slots of visible units.
   The CLI gets all of it from readline where the terminal has one.
   Sprites come from `sprites/` and per-server `data/<server>/sprites/`
   (server-side only — there is NO in-chat upload, deliberately).
@@ -1456,7 +1463,10 @@ hardcodes**.
   ids, `part_of` and `__follows` relative to `TEMPLATE_ROOT` (`@root_head`);
   part positions and snake trail vars as anchor offsets. `check_template`
   validates every write and load (vitals, reserved names, facing, status
-  numbers, part links); a summon-style `{role: part}` dict is accepted.
+  numbers, part links, passives with a hook `when` and a `formula`, clamps;
+  a passive's id / a clamp's path default to its key); a summon-style
+  `{role: part}` dict is accepted, each a direct part named
+  `<unit>_<role>` at its x / y offset like a listed one.
 - **Name = id prefix** (user call, "for now"): template `guardsman` spawns
   `guardsman`, `guardsman2`, ... with parts `guardsman2_head`.
 - **Spawn** (`Match.spawn_template`): summon_entity, saved facing restored,
@@ -1481,8 +1491,11 @@ hardcodes**.
   `!server wipe all` trashes templates.
 - **Raw JSON tail:** `split_command_line` / `split_command_args` keep
   `template import <name> <rest>` whole (```json fence or single quotes
-  dropped) on every surface; a multi-line import is one command on Discord
-  and in the GUI (non-`!` lines after a `!template import` line join it).
+  dropped) on every surface; a multi-line import is one command on Discord,
+  in the GUI (non-`!` lines after a `!template import` line join it, blank
+  lines skipped) and in the CLI (`_read_continuation`: `...` lines until
+  the JSON's brackets or ``` fence close, or a blank line; recalled as one
+  history line).
   The same splitter runs on every line inside `!batch` / `!foreach` (cut at
   a standalone `;` outside quotes, `_split_semicolons`), macro run lines and
   action `cmd()`, so an import's JSON survives them.

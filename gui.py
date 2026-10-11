@@ -186,6 +186,7 @@ class GuiApp:
         self.entry.bind("<Return>", self._on_enter)
         self.entry.bind("<Shift-Return>", lambda e: None)  # literal newline
         self.entry.bind("<Control-Return>", self._on_enter)
+        self.entry.bind("<KP_Enter>", self._on_enter)
         # Shell-style editing (see the methods below).
         self.entry.bind("<Tab>", self._on_tab)
         self.entry.bind("<Up>", self._on_up)
@@ -221,6 +222,8 @@ class GuiApp:
         self._search_entry.bind("<Control-R>", self._search_older)
         self._search_entry.bind("<Return>", self._search_accept)
         self._search_entry.bind("<Escape>", self._search_cancel)
+        # Clicking away takes the match shown, as Enter does.
+        self._search_entry.bind("<FocusOut>", self._search_leave)
         self._search_idx: Optional[int] = None
         self._inbar = inbar
 
@@ -317,11 +320,17 @@ class GuiApp:
         self._hist_pos = None
         self._draft = ""
 
+    def _display_lines(self, a: str, b: str) -> int:
+        """Screen rows from index a to index b (a long line wraps)."""
+        n = self.entry.count(a, b, "displaylines")
+        return (n[0] if isinstance(n, tuple) else n) or 0
+
     def _on_up(self, _event=None):
-        # Inside a multi-line block, Up moves the cursor; on its first line
-        # it recalls the previous command (cursor at the end of its first
-        # line, so another Up goes further back).
-        if self.entry.index("insert").split(".")[0] != "1" or not self._history:
+        # Inside a multi-line block (or a line wrapped over several rows),
+        # Up moves the cursor; on the first row it recalls the previous
+        # command (cursor at the end of its first line, so another Up goes
+        # further back).
+        if self._display_lines("1.0", "insert") or not self._history:
             return None
         if self._hist_pos is None:
             self._draft = self._input_text()
@@ -334,8 +343,7 @@ class GuiApp:
         return "break"
 
     def _on_down(self, _event=None):
-        last = self.entry.index("end-1c").split(".")[0]
-        if (self.entry.index("insert").split(".")[0] != last
+        if (self._display_lines("insert", "end-1c")
                 or self._hist_pos is None):
             return None
         self._hist_pos += 1
@@ -418,6 +426,13 @@ class GuiApp:
         self._search_end()
         self.entry.mark_set("insert", "end-1c")
         return "break"
+
+    def _search_leave(self, _event=None):
+        if self._search_bar.winfo_ismapped():
+            self._hist_pos = None
+            self._search_bar.pack_forget()
+            self._search_idx = None
+        return None
 
     def _search_cancel(self, _event=None):
         self._set_input(self._draft)
@@ -519,20 +534,18 @@ class GuiApp:
         lines: List[str] = []
         for raw in block.splitlines():
             ln = raw.strip()
-            if (lines and ln and not ln.startswith("!")
+            if not ln:
+                continue        # a blank line (in pasted JSON too) is nothing
+            if (lines and not ln.startswith("!")
                     and re.match(r"!template\s+import\s", lines[-1],
                                  re.IGNORECASE)):
                 lines[-1] += "\n" + ln
             else:
                 lines.append(ln)
-        ran = False
-        for line in lines:
-            if not line:
-                continue
-            ran = True
-            self._run_line(line)
-        if not ran:
+        if not lines:
             return
+        for line in lines:
+            self._run_line(line)
         # Reload sprites the GM may have dropped in, then redraw once.
         self.loader.clear()
         try:
