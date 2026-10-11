@@ -1078,7 +1078,10 @@ hardcodes**.
   An unknown op folds as add and `!mod show` flags it.
 - Pure query: the engine never applies modifiers; the GM threads
   `apply_mods(...)` / `list_mods(...)` through their own formulas. `!mod show
-  <eid> <stat> [base] [tag ...]` (399-400, 406-408, 480).
+  <eid> <stat> [base] [tag ...]` (399-400, 406-408, 480) also lists records
+  left out for an unreadable condition / value / priority. A non-finite base
+  or folded result (stacked more% overflow) is refused with a warning naming
+  the records (user call).
 
 ### 7.6 Actions and choices
 
@@ -1087,7 +1090,10 @@ hardcodes**.
   corpse_list; `body` program). `discover_actions` walks containers
   (`action_container_mode` / `_paths`); mount slots add their own (§7.10).
   `!action <eid> <name> [target] [k=v ...] [answer=...]`, `use_action`,
-  `has_action`.
+  `has_action`. A location target must be on the map and is a `Coord`
+  (`.x` / `.y`) that stores as [x, y]; `use_action` coerces its target to
+  the action's type the way `!action` parses it (`action.coerce_target`:
+  [x, y] → location, ids checked, lists non-empty).
 - **`run_action`** is transactional: pre-state captured, body run,
   `fail()` / an exception rolls the match back in place
   (`_rollback_match`: serialized state restored, runtime fields and undo
@@ -1125,7 +1131,8 @@ hardcodes**.
   file (admin). Both nest within `macro_recursion_limit`.
 - **Macros** (`!macro set/run/list/show/remove`): `$1..$N`, `$@`, `$#`
   (single-pass substitution); control flow `if / elif / else / repeat / end`
-  with read-only conditions; `macro_repeat_limit`, `macro_step_limit` (counts
+  with read-only conditions (a negative `repeat` count is refused);
+  `macro_repeat_limit`, `macro_step_limit` (counts
   dispatches AND loop iterations), `macro_recursion_limit`; one undo step
   (425-426, 544-546, 555-556).
 - **`!foreach <selector> ; <cmd> [; <cmd> ...]`**: the `!find` selector
@@ -1503,8 +1510,9 @@ hardcodes**.
 - **Team data:** `!team set/get/add/list/clear/passive`, `team_get/set/add`;
   a `modifiers` bundle applies to every member.
 - **Dice and tables:** `roll("NdM±k")` with explode `!` and keep `kh<n>` /
-  `kl<n>`; `!roll`, `!roll odds` (exact distributions); `roll_table`,
-  `band`, named tables (`!table`, `table_roll`); `pick` / `shuffle`. All use
+  `kl<n>` (n ≥ 1); `!roll`, `!roll odds` (exact distributions); `roll_table`
+  (finite weights, keyed entries), `band` (ranges may be negative; an
+  unreadable or backwards band is refused), named tables (`!table`, `table_roll`); `pick` / `shuffle`. All use
   `Match.formula_rng()` (honours `random_seed`, replay-safe).
 - **Other:** `!help find <words>` (commands, subcommands and rules),
   `!whoami`, `!log` (event log rules), `!state`, `!list`, `!dist`, string

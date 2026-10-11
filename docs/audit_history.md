@@ -2121,3 +2121,31 @@ compared after swapping the names; 300k runs, none after the `near:` fix).
   - `!help`: 79 subcommands registered with a usage only printed a dangling
     dash; they now show the command's text, and `!ent copy` / `transfer`,
     `!match win` / `outcome` got descriptions.
+
+## Pass 42
+
+Hand probes of actions and choices, snakes, mounts, death / revive, turns,
+schedules, macros, history, plus reruns: the rule-change chaos harness (6
+seeds x 250, 4 hostile x 200), the model-based undo harness (25 seeds,
+clean), the formula-function fuzzer (only the builtin int / float / min /
+max / round / abs messages, as before) and the stray-word detector over
+the suite. User calls from pass 41: `kh0` refused; apply_mods refuses an
+overflow with a warning; `!store load` shows its var-name notes.
+  - **Action location targets** couldn't be stored ("Can't store a Coord");
+    they store as [x, y] now, and one off the map is refused.
+  - **use_action() passed its target raw:** [x, y] reached a location
+    action as a list (`target.x` failed with a Python error) and a missing
+    target errored as "got NoneType". It is coerced per target type now.
+  - **Snake re-lay after a teleport** laid a straight line behind the head:
+    the part running off the map stayed where it was (anywhere on the map),
+    and the line was laid over other units. It is now a walk that bends
+    toward free cells. A 2x2 head's walking body put its first segment on
+    the old anchor, still under the head; path mode likewise. Switching to
+    path mode mid-game moved every segment onto a stale recorded path (all
+    onto one cell). A segment could take segments of its own (a branching
+    body); refused.
+  - `!mount info` on a rider didn't say what it rides; `!history save`
+    over an existing name didn't say it replaced it; `!history import`
+    ignored a stray word; a negative macro `repeat` silently ran nothing.
+  - 17 `Usage:` refusals lacked ❌; the harness now flags `❌ Usage:` and
+    stray-word refusals unless a scenario allows errors.
