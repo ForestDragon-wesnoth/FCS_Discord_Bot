@@ -621,6 +621,14 @@ class SourceProxy:
             m.surface_log(log)
 
 
+def _check_on_map(match: Any, x: int, y: int) -> None:
+    """A location target names a cell of the map (one off it used to run
+    the body on a cell nothing can occupy)."""
+    if not match.in_bounds(x, y):
+        raise VTTError(f"location ({x},{y}) is off the map "
+                       f"({match.grid_width}x{match.grid_height}).")
+
+
 class Coord:
     """Tiny `.x` / `.y` value object used for `target` bindings on
     location-typed actions. The formula sandbox rejects subscript
@@ -642,6 +650,11 @@ class Coord:
 
     def __repr__(self) -> str:
         return f"Coord({self.x}, {self.y})"
+
+    def store_value(self) -> List[int]:
+        """How a var stores it: a coordinate list [x, y], like every other
+        stored coordinate (logic._own_value)."""
+        return [self.x, self.y]
 
     def __iter__(self):
         # Allow `for cx, cy in [coord1, coord2]:` style unpacking
@@ -777,6 +790,7 @@ def parse_target(
                 f"location target needs integer coords; got "
                 f"`{tokens[0]} {tokens[1]}`."
             )
+        _check_on_map(match, x, y)
         return Coord(x, y), list(tokens[2:])
     if target_type == "entity_list":
         eids: List[str] = []
@@ -798,6 +812,7 @@ def parse_target(
                 x = int(tokens[i]); y = int(tokens[i + 1])
             except ValueError:
                 break
+            _check_on_map(match, x, y)
             coords.append(Coord(x, y))
             i += 2
         if not coords:
@@ -840,6 +855,65 @@ def _resolve_eid_for_action(token: str, match: "Match") -> str:
             raise NotFound("No current entity (turn order is empty).")
         return eid
     return token
+
+
+def coerce_target(target_type: str, value: Any, match: "Match",
+                  name: str) -> Any:
+    """use_action()'s target turned into what the action's body gets from
+    `!action` (parse_target): an entity id, a Coord (from [x, y] or a
+    Coord), a list of either, a corpse id or None, checked the same way.
+    A coordinate list used to reach the body as a list, so `target.x`
+    failed with a Python error."""
+    def _coord(v: Any) -> "Coord":
+        if isinstance(v, Coord):
+            x, y = v.x, v.y
+        elif (isinstance(v, (list, tuple)) and len(v) == 2
+              and all(isinstance(c, int) and not isinstance(c, bool)
+                      for c in v)):
+            x, y = v
+        else:
+            raise VTTError(f"action `{name}` takes a location target: "
+                           f"[x, y], got {v!r}.")
+        _check_on_map(match, x, y)
+        return Coord(x, y)
+
+    def _eid(v: Any) -> str:
+        if not isinstance(v, str) or not v:
+            raise VTTError(f"action `{name}` takes an entity target: an id, "
+                           f"got {v!r}.")
+        eid = _resolve_eid_for_action(v, match)
+        if eid not in match.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        return eid
+
+    def _cid(v: Any) -> str:
+        if not isinstance(v, str) or match.find_corpse(v) is None:
+            raise NotFound(f"No corpse with id {v!r}.")
+        return v
+
+    def _many(each: Any, what: str) -> List[Any]:
+        if not isinstance(value, (list, tuple)) or not value:
+            raise VTTError(f"action `{name}` takes a non-empty list of "
+                           f"{what}, got {value!r}.")
+        return [each(v) for v in value]
+
+    if target_type == "none":
+        if value is not None:
+            raise VTTError(f"action `{name}` takes no target, got {value!r}.")
+        return None
+    if target_type == "entity":
+        return _eid(value)
+    if target_type == "location":
+        return _coord(value)
+    if target_type == "entity_list":
+        return _many(_eid, "entity ids")
+    if target_type == "location_list":
+        return _many(_coord, "[x, y] locations")
+    if target_type == "corpse":
+        return _cid(value)
+    if target_type == "corpse_list":
+        return _many(_cid, "corpse ids")
+    return value
 
 
 # ----------------------------------------------------------------------

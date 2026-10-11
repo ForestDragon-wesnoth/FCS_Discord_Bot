@@ -1263,7 +1263,10 @@ hardcodes**.
 - **Snake segments:** located parts with `__segment` + `__follows` (the one
   ahead); `snake_segments(head)`. Follow `segment_follow_mode` (trail /
   path + `segment_spacing`; head override `__segment_follow`); a teleport
-  re-lays the body (`_resettle_snake`); `segment_self_collision`.
+  re-lays the body (`_resettle_snake`: straight behind the head where the
+  cells are free and on the map, else bending toward the nearest free
+  cells, a ⚠️ for a segment with nowhere to go); `segment_self_collision`.
+  Segments go on the head only (a segment of a segment would branch).
   `segment_death_mode` (none default / solid / cascade / split, with
   `segment_split_head_template`) when a segment is destroyed;
   `segment_removal_mode` (close default / cascade / split / death) when a GM

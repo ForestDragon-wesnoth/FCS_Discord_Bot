@@ -579,6 +579,10 @@ def roll_detail(rng, spec: Any) -> "Tuple[int, list]":
                     f"roll(spec): die sides {sides} out of range "
                     f"(1..{_ROLL_MAX_SIDES}) in '{spec}'."
                 )
+            if keep_n is not None and keep_n < 1:
+                raise FormulaError(
+                    f"roll(spec): keeping {keep_n} dice keeps nothing in "
+                    f"'{term}' (kh / kl need at least 1).")
             dice = []
             for _ in range(count):
                 v = rng.randint(1, sides)
@@ -685,6 +689,10 @@ def dice_distribution(spec: Any) -> "Tuple[Dict[int, Any], Any, bool]":
         keep_mode, keep_n = dm.group(5), dm.group(6)
         if not 1 <= count <= _ROLL_MAX_DICE or not 1 <= sides <= _ROLL_MAX_SIDES:
             raise FormulaError(f"die count or sides out of range in '{term}'.")
+        if keep_n is not None and int(keep_n) < 1:
+            raise FormulaError(
+                f"keeping {keep_n} dice keeps nothing in '{term}' (kh / kl "
+                f"need at least 1).")
         if keep_mode is not None:
             if explode:
                 raise FormulaError(
@@ -5857,6 +5865,12 @@ class FormulaEngine:
                     "Call use_action from inside !action / !ent / a "
                     "passive that fires during command processing."
                 )
+            from action import coerce_target
+            try:
+                target_arg = coerce_target(action.target_type, target_arg,
+                                           match, name)
+            except VTTError as ex:
+                raise FormulaError(f"use_action: {ex}")
             coro = run_action(
                 action, actor_id=eid, target=target_arg,
                 args=args_dict, match=match, mgr=mgr_local,
@@ -7021,9 +7035,14 @@ class FormulaEngine:
                 raise FormulaError("apply_mods(...): stat must be a non-empty string.")
             if isinstance(base, bool) or not isinstance(base, (int, float)):
                 raise FormulaError("apply_mods(...): base must be a number.")
-            return match.apply_modifiers(
-                eid, stat, base, _norm_mod_tags(tags, "apply_mods"),
-                _mod_context(target, attacker, defender, other))
+            try:
+                return match.apply_modifiers(
+                    eid, stat, base, _norm_mod_tags(tags, "apply_mods"),
+                    _mod_context(target, attacker, defender, other))
+            except FormulaError:
+                raise
+            except VTTError as ex:
+                raise FormulaError(f"apply_mods(...): {ex}")
         ns["apply_mods"] = _apply_mods
 
         def _list_mods(entity_token: Any, stat: Any, tags: Any = None,

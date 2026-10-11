@@ -3274,6 +3274,10 @@ def _own_value(value: Any) -> Any:
     if isinstance(value, tuple):
         # Coordinates are lists (a save/load turns tuples into lists).
         return [_own_value(v) for v in value]
+    store = getattr(type(value), "store_value", None)
+    if store is not None:
+        # An action's `location` target (action.Coord) stores as [x, y].
+        return _own_value(store(value))
     if isinstance(value, float) and not math.isfinite(value):
         # JSON has no inf / nan: a stored one was written as `Infinity`,
         # which other JSON readers refuse.
@@ -7032,15 +7036,28 @@ class Match:
             return
         mode = str(self._segment_cfg(head, "__segment_follow", "segment_follow_mode"))
         if mode == "path":
-            self._advance_snake_path(head, chain)
+            self._advance_snake_path(head, chain, prev_x, prev_y)
         else:
             old = [(s.x, s.y) for s in chain]
-            chain[0].x, chain[0].y = prev_x, prev_y
+            # The first segment takes a cell the head's body just left: the
+            # head's old anchor for a 1x1 head; for a larger head that cell
+            # can still be under the body, which put the segment inside it.
+            w, h = self.entity_footprint(head)
+            body = set(map(tuple, self.entity_cells(head)))
+            left = [(prev_x + dx, prev_y + dy) for dy in range(h)
+                    for dx in range(w)
+                    if (prev_x + dx, prev_y + dy) not in body]
+            first = (min(left, key=lambda c: (abs(c[0] - old[0][0])
+                                              + abs(c[1] - old[0][1]),
+                                              c[1], c[0]))
+                     if left else (prev_x, prev_y))
+            chain[0].x, chain[0].y = first
             for i in range(1, len(chain)):
                 chain[i].x, chain[i].y = old[i - 1]
         head.vars["__seg_last"] = [head.x, head.y]
 
-    def _advance_snake_path(self, head: "Entity", chain: List["Entity"]) -> None:
+    def _advance_snake_path(self, head: "Entity", chain: List["Entity"],
+                            prev_x: int, prev_y: int) -> None:
         """`path` follow mode: prepend the head's current cell to the recorded
         path and place each segment `spacing` cells further back along it."""
         try:
@@ -7049,20 +7066,33 @@ class Match:
         except (TypeError, ValueError):
             spacing = 1
         path = head.vars.get("__seg_path")
-        if not isinstance(path, list):
-            path = []
+        if not (isinstance(path, list) and path and path[0] == [prev_x, prev_y]):
+            # The recorded path doesn't end where the head just was (it was
+            # recorded in trail mode, or before a re-lay): rebuild it from
+            # where the body lies now. A stale path moved every segment
+            # back onto old cells (all of them onto one at first).
+            path = [[prev_x, prev_y]] + [[s.x, s.y] for s in chain
+                                         for _ in range(spacing)]
         path.insert(0, [head.x, head.y])
-        need = (len(chain) + 1) * spacing + 1
+        # Cells under the head's body don't count: a larger head's recent
+        # anchors are still under it, and segments were placed inside it.
+        body = set(map(tuple, self.entity_cells(head)))
+        need = (len(chain) + 1) * spacing + 1 + len(body)
         del path[need:]
         head.vars["__seg_path"] = path
+        trail = [c for c in path if (c[0], c[1]) not in body] or path
         for i, s in enumerate(chain):
-            idx = min((i + 1) * spacing, len(path) - 1)
-            s.x, s.y = path[idx][0], path[idx][1]
+            idx = min((i + 1) * spacing - 1, len(trail) - 1)
+            s.x, s.y = trail[idx][0], trail[idx][1]
 
     def _resettle_snake(self, head_id: str) -> None:
-        """Re-lay a snake's body in a straight line behind the head, used
-        after a discontinuous head move (teleport / swap / push) where there
-        were no per-cell steps to trail through."""
+        """Re-lay a snake's body behind the head, used after a discontinuous
+        head move (teleport / swap / push) where there were no per-cell
+        steps to trail through. Each segment goes `spacing` cells on from
+        the one before it, straight behind the head where it can, else
+        turning (other directions, then the nearest free cell): a straight
+        line running off the map used to leave those segments where they
+        were, anywhere on the map, and the line ignored other units."""
         head = self.entities.get(head_id)
         if head is None:
             return
@@ -7076,14 +7106,50 @@ class Match:
             spacing = 1
         bdx, bdy = FACING_VECTORS.get(getattr(head, "facing", "up"), (0, -1))
         bdx, bdy = -bdx, -bdy            # behind = opposite of facing
+        body = {head_id} | {s.id for s in chain}
+        used: Set[Tuple[int, int]] = {tuple(c) for c in self.entity_cells(head)}
+
+        def free(cx: int, cy: int) -> bool:
+            return (self.in_bounds(cx, cy) and (cx, cy) not in used
+                    and self.cell_occupant(cx, cy, ignore=tuple(body)) is None)
+
+        # Straight behind first, then the directions closest to it (the
+        # body bends before it doubles back past the head).
+        dirs = sorted(((0, 1), (1, 0), (0, -1), (-1, 0),
+                       (1, 1), (-1, 1), (1, -1), (-1, -1)),
+                      key=lambda d: -(d[0] * bdx + d[1] * bdy)
+                      / math.hypot(*d))
+        # Start from the body's back edge (its middle cell there): for a
+        # larger head the anchor is a front or side corner.
+        cx2 = sum(c[0] for c in self.entity_cells(head)) / len(used)
+        cy2 = sum(c[1] for c in self.entity_cells(head)) / len(used)
+        px, py = max(used, key=lambda c: (c[0] * bdx + c[1] * bdy,
+                                          -abs(c[0] - cx2) - abs(c[1] - cy2),
+                                          -c[1], -c[0]))
         path = [[head.x, head.y]]
-        for i, s in enumerate(chain):
-            cx = head.x + bdx * (i + 1) * spacing
-            cy = head.y + bdy * (i + 1) * spacing
-            if not self.in_bounds(cx, cy):
-                cx, cy = s.x, s.y        # off-grid: leave the segment put
-            s.x, s.y = cx, cy
-            path.append([cx, cy])
+        stray: List[str] = []
+        for s in chain:
+            spot = next(((px + dx * spacing, py + dy * spacing)
+                         for dx, dy in dirs
+                         if free(px + dx * spacing, py + dy * spacing)), None)
+            if spot is None:
+                for r in range(1, max(self.grid_width,
+                                                self.grid_height) + 1):
+                    spot = next(((cx, cy) for cx, cy in self._ring_cells(
+                        px, py, r) if free(cx, cy)), None)
+                    if spot is not None:
+                        break
+            if spot is None:
+                stray.append(s.id)
+                spot = (s.x, s.y)
+            used.add(spot)
+            s.x, s.y = spot
+            px, py = spot
+            path.append([px, py])
+        if stray:
+            self.surface_log([f"⚠️ no free cell to lay segment(s) "
+                              f"{', '.join(f'`{i}`' for i in stray)} of "
+                              f"`{head_id}`; left where they were."])
         head.vars["__seg_last"] = [head.x, head.y]
         if str(self._segment_cfg(head, "__segment_follow",
                                  "segment_follow_mode")) == "path":
@@ -7121,6 +7187,12 @@ class Match:
         head = self.entities.get(head_id)
         if head is None:
             raise NotFound(f"Entity '{head_id}' not found.")
+        if head.vars.get("__segment"):
+            # A segment taking its own chain made a branching body, which
+            # follows nothing sensibly (branching snakes aren't supported).
+            raise VTTError(
+                f"`{head_id}` is a segment of `{head.part_of}`: add "
+                f"segments to the head (they go on the tail).")
         if seg_id in self._taken_entity_ids():
             raise DuplicateId(
                 f"Entity id '{seg_id}' already exists in this match.")
@@ -7922,6 +7994,9 @@ class Match:
             running = float(base)
         except (TypeError, ValueError):
             running = 0.0
+        if not math.isfinite(running):
+            raise VTTError(f"⚠️ apply_mods base for `{stat}` must be a "
+                           f"finite number, got {running}.")
         mods = self.gather_modifiers(eid, stat, tags, context)
         if not mods:
             return self._apply_stat_cap(stat, running)
@@ -7939,7 +8014,16 @@ class Match:
             for op in sorted({m["op"] for m in tier_mods}, key=order_key):
                 vals = [m["value"] for m in tier_mods if m["op"] == op]
                 running = self._apply_modifier_op(running, op, vals)
-        return self._apply_stat_cap(stat, running)
+        result = self._apply_stat_cap(stat, running)
+        if not math.isfinite(result):
+            # Stacked more% / huge values overflow a float: refused, since
+            # nothing can store or compare the result meaningfully.
+            raise VTTError(
+                f"⚠️ `{eid}`'s modifiers for `{stat}` overflow: base "
+                f"{base} folds to {result} (" + ", ".join(
+                    f"{m['op']} {m['value']:g} [{m['source']}]"
+                    for m in mods) + ").")
+        return result
 
     def _apply_stat_cap(self, stat: str, value: float) -> float:
         """Clamp the folded value to the per-stat [lo, hi] from the
@@ -18283,7 +18367,11 @@ class MatchManager:
         """
         write_json_file(path, self.save_data(include_history))
     
-    def load(self, path: str):
+    def load(self, path: str) -> List[str]:
+        """Replace this workspace's matches and systems with a `!store
+        save` file. Returns notes (units var_name_collision kept on their
+        old var names)."""
+        notes: List[str] = []
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -18323,7 +18411,7 @@ class MatchManager:
                 if m.system_name not in systems:
                     m.system_name = default_name
                 m.rules = self._build_rules_dict(systems[m.system_name])
-                m.sync_all_var_names()
+                notes += [f"{m.id}: {n}" for n in m.sync_all_var_names()]
                 for e in m.entities.values():
                     e.bind(m, set_spawn_facing=False)
             # A channel pointing at a match the file doesn't have would
@@ -18338,6 +18426,7 @@ class MatchManager:
         self.systems = systems
         self.default_system_name = default_name
         self.default_system_per_channel = per_channel
+        return notes
 
 
 class Workspaces:

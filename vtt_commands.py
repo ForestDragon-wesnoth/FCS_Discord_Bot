@@ -9742,12 +9742,13 @@ async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         path, shown = saves_path(args[1], mgr)
         try:
-            mgr.load(path)
+            notes = mgr.load(path)
         except VTTError as ex:
             # MatchManager.load names the absolute path it failed on; report
             # the saves-relative name instead so no host path leaks.
             raise VTTError(str(ex).replace(path, shown))
-        return await ctx.send(f"Loaded from `{shown}`")
+        return await ctx.send(f"Loaded from `{shown}`"
+                              + "".join(f"\n⚠️ {n}" for n in notes))
     # Fallback: show authoritative help
     return await _help_fallback(ctx, ["store"], args[0] if args else None)
 #annonate subcommands next to the command itself:
@@ -12941,8 +12942,11 @@ async def mod_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             lines.append(
                 f"  {md['op']} {md['value']:g} (pri {md['priority']:g}){tg}{ntg}{src}{bad}")
         if base is not None:
-            result = m.apply_modifiers(eid, stat, base, tags, {})
-            lines.append(f"  → base {base:g} becomes {result:g}")
+            try:
+                result = m.apply_modifiers(eid, stat, base, tags, {})
+                lines.append(f"  → base {base:g} becomes {result:g}")
+            except VTTError as ex:
+                lines.append(str(ex))
         unknown = m.unknown_modifier_ops(mods)
         if unknown:
             lines.append(
@@ -14521,10 +14525,18 @@ async def mount_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                              else "(unseen)" for e in occ) or "(none)"))
         riders = [e for e in m.vehicle_riders(vid)
                   if not _pov_hides(m, pov, e.id)]
+        # A rider's own line says what it rides (it used to read as a unit
+        # with no slots and no riders, as if unmounted).
+        unit = m.entities[vid]
+        rides = ""
+        if unit.mounted_on:
+            on = ("an unseen unit" if _pov_hides(m, pov, unit.mounted_on)
+                  else f"`{unit.mounted_on}`")
+            rides = f"; rides {on} in slot `{unit.mount_slot}`"
         return await ctx.send(
             f"`{vid}` slots: " + (", ".join(f"`{s}`" for s in slots) or "(none)")
             + "; riders: " + (", ".join(f"`{e.id}`({e.mount_slot})"
-                                        for e in riders) or "(none)"))
+                                        for e in riders) or "(none)") + rides)
 
     if sub in ("dismount", "off"):
         if await return_help_if_not_enough_args(ctx, args, 2, "mount", "dismount"):
