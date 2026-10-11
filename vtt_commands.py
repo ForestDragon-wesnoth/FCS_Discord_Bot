@@ -350,7 +350,7 @@ class CommandRegistry:
                 m = self._help.get(root, {})
                 usage = m.get("usage") or f"!{root}"
                 desc = m.get("desc") or ""
-                lines.append(f"`{usage}` — {desc}".rstrip())
+                lines.append(f"`{usage}`" + (f" — {desc}" if desc else ""))
             return ("Help", "\n".join(lines))
         root = path[0]
         if root not in self._handlers:
@@ -367,7 +367,8 @@ class CommandRegistry:
             if subs:
                 lines.append("\n**Subcommands**")
                 for s, sm in sorted(subs.items()):
-                    lines.append(f"- `{sm['usage']}` — {sm.get('desc','')}".rstrip())
+                    sd = sm.get("desc") or ""
+                    lines.append(f"- `{sm['usage']}`" + (f" — {sd}" if sd else ""))
             return (f"Help: {root}", "\n".join(lines))
         # Subcommand
         sub = path[1]
@@ -377,6 +378,10 @@ class CommandRegistry:
         lines = [f"**!{root} {sub}**", f"Usage: `{sm['usage']}`"]
         if sm.get("desc"):
             lines.append(sm["desc"])
+        elif meta.get("desc"):
+            # Subcommands registered with a usage only are described in
+            # their command's text.
+            lines.append(f"From `!help {root}`: {meta['desc']}")
         return (f"Help: {root} {sub}", "\n".join(lines))
 
     def _unknown_command_message(self, name: str, mgr: MatchManager,
@@ -7809,7 +7814,10 @@ def _parse_find_predicate(token: str) -> Tuple[str, str, Optional[str]]:
     for op in _FIND_OPS:
         idx = token.find(op)
         if idx > 0:  # key must be non-empty
-            return op, token[:idx], token[idx + len(op):]
+            rhs = token[idx + len(op):]
+            if not rhs and op not in ("=", "!="):
+                raise VTTError(f"`{token}` needs a value after `{op}`.")
+            return op, token[:idx], rhs
     raise VTTError(
         f"Unrecognized find predicate `{token}`. Expected `key=value`, "
         f"`key<value`, `status:NAME`, `group:NAME`, `action:NAME`, "
@@ -7971,8 +7979,12 @@ def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Option
             radius = _coerce_for_compare(val)
             if isinstance(radius, bool) or not isinstance(radius, (int, float)):
                 raise VTTError(f"`near:` radius must be a number, got `{val}`.")
+            if radius < 0:
+                raise VTTError(f"`near:` radius can't be negative, got `{val}`.")
             ref = m.entities.get(_resolve_eid(m, key))
-            if ref is None:
+            # A reference the query's POV can't see reads as missing:
+            # matching against it located a hidden unit by its radius.
+            if ref is None or _pov_hides(m, pov, ref.id):
                 raise VTTError(f"`near:` reference entity `{key}` not found.")
             if m.entity_gap_distance(ref, e) > radius:
                 return False
@@ -7983,6 +7995,8 @@ def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Option
             radius = _coerce_for_compare(val)
             if isinstance(radius, bool) or not isinstance(radius, (int, float)):
                 raise VTTError(f"`within:` radius must be a number, got `{val}`.")
+            if radius < 0:
+                raise VTTError(f"`within:` radius can't be negative, got `{val}`.")
             sx, sy = key.split(":")
             try:
                 cx, cy = int(sx), int(sy)
@@ -9174,7 +9188,14 @@ async def _undo_preview(ctx, m: Match, snap: Snapshot, what: str):
             "(pov_filters_queries).")
     from types import SimpleNamespace
     now = SimpleNamespace(state=m.to_dict(include_history=False))
-    lines = _format_snapshot_diff(now, snap, "now", what)
+    # The restore moves the snapshot's units to the var names the rules give
+    # now (apply_system_rules), so the preview compares against that.
+    after = Match.from_dict(copy.deepcopy(snap.state))
+    after.rules = dict(m.rules)
+    after.sync_all_var_names()
+    lines = _format_snapshot_diff(
+        now, SimpleNamespace(state=after.to_dict(include_history=False)),
+        "now", what)
     lines[0] = (f"🔍 **Undo preview** — `{what}` would make these changes "
                 f"(nothing restored yet):")
     later = sum(1 for x in (m.history.round_saves + m.history.turn_saves
@@ -12902,7 +12923,8 @@ async def mod_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 except ValueError:
                     pass
             tags.append(tok)
-        mods = m.gather_modifiers(eid, stat, tags, {})
+        problems: List[str] = []
+        mods = m.gather_modifiers(eid, stat, tags, {}, problems)
         tagstr = f" [{', '.join(tags)}]" if tags else ""
         lines = [f"Modifiers on `{eid}` for `{stat}`{tagstr}:"]
         if not mods:
@@ -12924,6 +12946,8 @@ async def mod_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 "⚠️ unrecognized op(s) " + ", ".join(f"`{o}`" for o in unknown)
                 + " — folded as a lenient add. Valid ops: "
                 + ", ".join(MODIFIER_OPS) + ".")
+        if problems:
+            lines.append("⚠️ left out: " + "; ".join(problems))
         return await ctx.send("\n".join(lines))
 
     return await _help_fallback(ctx, ["mod"], args[0] if args else None)
@@ -14033,14 +14057,26 @@ async def watch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"or nothing.")
         once = len(args) >= 5
         try:
-            validate_program(cond, known_funcs=frozenset(m.formula_functions.keys()))
-            validate_program(effect, known_funcs=frozenset(m.formula_functions.keys()))
+            # The condition is evaluated as an expression (fire_watchers):
+            # one validated as a program (`x = 1`) used to be accepted and
+            # then read as not met forever.
+            known = frozenset(m.formula_functions.keys())
+            try:
+                validate_formula(cond, mode="eval", known_funcs=known)
+            except FormulaError:
+                validate_program(cond, known_funcs=known)
+                return await ctx.send(
+                    "❌ A watcher condition is an expression (true or false): "
+                    "it can't assign or hold statements — put those in the "
+                    "effect.")
+            validate_program(effect, known_funcs=known)
         except FormulaError as ex:
             return await ctx.send(f"❌ invalid watcher formula: {ex}")
+        verb = "Replaced" if name in m.watchers else "Added"
         m.watchers[name] = {"condition": cond, "effect": effect,
                             "once": once, "last": False}
         return await ctx.send(
-            f"Added watcher `{name}`{' (once)' if once else ''}. Fires when "
+            f"{verb} watcher `{name}`{' (once)' if once else ''}. Fires when "
             f"the condition becomes true.")
 
     if sub == "list":
@@ -14099,6 +14135,8 @@ async def emit_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(f"**{title}**\n{body}")
     m = active_match(mgr, ctx)
     name = args[0]
+    if not name.strip():
+        return await ctx.send("❌ An event needs a name.")
     target = None
     payload: Dict[str, Any] = {}
     for tok in args[1:]:
@@ -14936,6 +14974,22 @@ assert not _unregistered_ro, (
 # Usage strings the stray-word check reads (see _stray_words_error) for
 # subcommands registered without one, and for the alias spellings each
 # handler accepts (`del` / `rm` for `remove`, ...).
+_SUB_DESCS = {
+    ("ent", "copy"): (
+        "Copy a unit, with its whole body-part subtree, into another match "
+        "of this server (you need host of both); the original stays. It "
+        "lands on its own cell unless x y say otherwise; ids taken there "
+        "get a suffix, mount links are dropped, and the destination's var "
+        "names apply. All-or-nothing."),
+    ("ent", "transfer"): (
+        "Like `!ent copy`, but the unit LEAVES this match (removed, not "
+        "killed): it moves to the other match with its parts."),
+    ("match", "win"): (
+        "Declare the match's winner (a team or unit name) with an optional "
+        "reason, or `clear` the outcome. Fires the `match_outcome` event "
+        "(winner / reason / round)."),
+    ("match", "outcome"): "Show the declared winner and reason, if any.",
+}
 for _root, _sub, _usage in (
         ("ent", "copy", "!ent copy <id> <dest_match> [x y]"),
         ("ent", "transfer", "!ent transfer <id> <dest_match> [x y]"),
@@ -14946,7 +15000,8 @@ for _root, _sub, _usage in (
         ("zone", "anchor", "!zone anchor <name> <eid> [radius] [metric]"),
         ("zone", "unanchor", "!zone unanchor <name>"),
         ("zone", "sprite", "!zone sprite <name> <key|clear>")):
-    registry.annotate_sub(_root, _sub, usage=_usage)
+    registry.annotate_sub(_root, _sub, usage=_usage,
+                          desc=_SUB_DESCS.get((_root, _sub)))
 # Alias spellings each handler accepts for a subcommand; the stray-word
 # check reads the canonical subcommand's usage for them.
 _SUB_ALIASES: Dict[Tuple[str, str], str] = {}

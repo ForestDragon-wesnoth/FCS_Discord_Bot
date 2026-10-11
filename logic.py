@@ -13,6 +13,7 @@ import re
 import math
 import random
 import contextvars
+import keyword
 
 # Lines a formula's changes produced while a command runs (see
 # Match.surface_log). A context variable, so each command — on Discord, each
@@ -3137,6 +3138,8 @@ def _coerce_rule_value(key: str, raw_value: str):
     if t == "str":
         # keep raw as-is; CLI passes a single token
         # (you can extend later to join the rest of args for multi-word strings)
+        if key in VAR_NAME_RULES:
+            return check_var_name_rule(key, raw_value)
         choices = spec.get("choices")
         if choices and raw_value not in choices and not (
                 key == "part_to_main_cap_default"
@@ -3271,6 +3274,11 @@ def _own_value(value: Any) -> Any:
     if isinstance(value, tuple):
         # Coordinates are lists (a save/load turns tuples into lists).
         return [_own_value(v) for v in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        # JSON has no inf / nan: a stored one was written as `Infinity`,
+        # which other JSON readers refuse.
+        raise VTTError(f"Can't store {value}: only finite numbers can be "
+                       f"stored.")
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     # Anything else (a function named as a value — `entity[a].f = min` —
@@ -4528,6 +4536,13 @@ class GameSystem:
             if k not in RULES_REGISTRY:
                 dropped.append(k)
                 continue
+            if k in VAR_NAME_RULES:
+                try:
+                    check_var_name_rule(k, (v or {}).get("value"))
+                except VTTError:
+                    dropped.append(f"{k} (invalid var name "
+                                   f"{(v or {}).get('value')!r})")
+                    continue
             settings[k] = Rule(
                 key=k,
                 value=v["value"],
@@ -7740,7 +7755,8 @@ class Match:
         return out
 
     def gather_modifiers(self, eid: str, stat: str, tags: Any,
-                         context: Optional[Dict[str, Any]] = None) -> List[dict]:
+                         context: Optional[Dict[str, Any]] = None,
+                         problems: Optional[List[str]] = None) -> List[dict]:
         """The active modifier records on `eid` for `stat` + `tags`:
         filtered by stat name, tag subset (required ⊆ query) and negative
         tags (excluded ∩ query empty) and condition, with value formulas
@@ -7752,7 +7768,11 @@ class Match:
         single pre-pass (the granting record must itself pass stat +
         required tags vs the ORIGINAL query + not_tags + condition); the
         main filter then runs against the expanded tag set. Single-pass —
-        a granted tag can activate other modifiers but not chain-grant."""
+        a granted tag can activate other modifiers but not chain-grant.
+
+        A record whose condition or value can't be read is left out (fail
+        safe); `problems`, when given, collects a line naming each such
+        record for `!mod show`."""
         e = self.entities.get(eid)
         if e is None:
             raise NotFound(f"Entity '{eid}' not found.")
@@ -7768,20 +7788,25 @@ class Match:
                 EvalCtx(this=this_id, target=eid, extras=dict(context)),
             )
 
-        def _cond_ok(m: dict) -> bool:
+        def _note(src: str, what: str) -> None:
+            if problems is not None and f"`{src}`: {what}" not in problems:
+                problems.append(f"`{src}`: {what}")
+
+        def _cond_ok(m: dict, src: str) -> bool:
             cond = m.get("condition", "")
             if not cond:
                 return True
             try:
                 return bool(_ev(cond))
-            except FormulaError:
+            except FormulaError as ex:
+                _note(src, f"condition error ({ex})")
                 return False          # malformed condition -> inactive (fail safe)
 
         records = self._raw_modifier_records(e)
 
         # Pass 1: expand the query tag set from grants_tags (vs original tags).
         granted: "set[str]" = set()
-        for m, _src in records:
+        for m, src in records:
             if not m.get("grants_tags"):
                 continue
             if str(m.get("stat", "")) != str(stat):
@@ -7790,7 +7815,7 @@ class Match:
             notg = self._modifier_tagset(m.get("not_tags"))
             if not (req <= tagset) or (notg & tagset):
                 continue
-            if not _cond_ok(m):
+            if not _cond_ok(m, src):
                 continue
             granted |= self._modifier_tagset(m.get("grants_tags"))
         eff_tags = tagset | granted
@@ -7806,21 +7831,31 @@ class Match:
             notg = self._modifier_tagset(m.get("not_tags"))
             if notg & eff_tags:
                 continue
-            if not _cond_ok(m):
+            if not _cond_ok(m, src):
                 continue
             raw_val = m.get("value", 0)
             if isinstance(raw_val, str):
                 try:
                     raw_val = _ev(raw_val)
-                except FormulaError:
+                except FormulaError as ex:
+                    _note(src, f"value error ({ex})")
                     continue          # malformed value -> skip this modifier
             try:
                 val = float(raw_val)
             except (TypeError, ValueError):
+                _note(src, f"value {raw_val!r} isn't a number")
+                continue
+            if not math.isfinite(val):
+                _note(src, f"value {val} isn't a finite number")
                 continue
             try:
                 pri = float(m.get("priority", 0) or 0)
             except (TypeError, ValueError):
+                _note(src, f"priority {m.get('priority')!r} isn't a number "
+                           f"(read as 0)")
+                pri = 0.0
+            if not math.isfinite(pri):
+                _note(src, f"priority {pri} isn't a finite number (read as 0)")
                 pri = 0.0
             out.append({
                 "op": str(m.get("op", "add")),
@@ -17577,13 +17612,40 @@ VAR_NAME_RULES = ("hp_var", "max_hp_var", "turnorder_var", "team_var",
                   "overlay_var")
 
 
+def check_var_name_rule(key: str, value: Any) -> str:
+    """A VAR_NAME_RULES value: one top-level var name the engine's formulas
+    can spell as `entity[X].<name>` (the vital accessors read a top-level
+    key, and the engine formula rules are rewritten to the new name), so an
+    identifier that isn't a Python keyword, a reserved path (x / y / name)
+    or an engine `__` name. Raises VTTError otherwise."""
+    v = str(value or "")
+    if not v.isidentifier() or keyword.iskeyword(v):
+        raise VTTError(
+            f"Setting '{key}' names a unit var: one word of letters, digits "
+            f"and _ (not starting with a digit, no dots or spaces), got "
+            f"'{v}'.")
+    if v in RESERVED_VAR_PATHS or v.startswith("__"):
+        raise VTTError(
+            f"Setting '{key}' can't be '{v}': "
+            + ("x, y and name are the unit's position and display name."
+               if v in RESERVED_VAR_PATHS else
+               "names starting with __ belong to the engine."))
+    return v
+
+
 def checked_var_names(raw: Any) -> Dict[str, str]:
     """A unit's remembered var names, kept to VAR_NAME_RULES keys with text
     values (anything else is dropped: the unit then takes the match's)."""
     if not isinstance(raw, dict):
         return {}
-    return {k: v for k, v in raw.items()
-            if k in VAR_NAME_RULES and isinstance(v, str) and v}
+    out: Dict[str, str] = {}
+    for k, v in raw.items():
+        if k in VAR_NAME_RULES and isinstance(v, str):
+            try:
+                out[k] = check_var_name_rule(k, v)
+            except VTTError:
+                pass
+    return out
 
 
 def rename_unit_vars(vars_: Dict[str, Any], clamps: Dict[str, Dict[str, Any]],

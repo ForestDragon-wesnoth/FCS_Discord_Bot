@@ -748,9 +748,15 @@ def roll_table_pick(rng, spec: Any) -> str:
                 raise FormulaError(
                     f"roll_table(...): weight for '{key}' must be a number.")
         w = float(x)
+        if not math.isfinite(w):
+            raise FormulaError(
+                f"roll_table(...): weight for '{key}' must be a finite "
+                f"number.")
         if w < 0:
             raise FormulaError(
                 f"roll_table(...): weight for '{key}' must be >= 0.")
+        if not key:
+            raise FormulaError("roll_table(...): an entry has no key.")
         return w
     pairs = []
     if isinstance(spec, dict):
@@ -772,6 +778,10 @@ def roll_table_pick(rng, spec: Any) -> str:
             "dict {key: weight}.")
     pairs = [(k, w) for k, w in pairs if w > 0]
     total = sum(w for _, w in pairs)
+    if not math.isfinite(total):
+        raise FormulaError(
+            "roll_table(spec): the weights add up past what a number can "
+            "hold.")
     if not pairs or total <= 0:
         raise FormulaError(
             "roll_table(spec): needs at least one entry with positive weight.")
@@ -1297,6 +1307,28 @@ def _clamp(v: Any, lo: Any, hi: Any) -> Any:
     return v
 
 
+_BAND_NUM = r"-?\d+(?:\.\d+)?"
+
+
+def _band_range(rng: str) -> Tuple[Optional[float], Optional[float]]:
+    """A band's range as (lo, hi), None for an open end; (None, None) when
+    it doesn't parse. `lo-hi` takes negative ends (`-5--1`, `-5-0`); a
+    leading `-` alone is `-hi` (up to hi)."""
+    m = re.fullmatch(f"({_BAND_NUM})-({_BAND_NUM})", rng)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+    m = re.fullmatch(f"({_BAND_NUM})([+-])", rng)
+    if m:
+        return float(m.group(1)), None
+    m = re.fullmatch(f"-({_BAND_NUM})", rng)
+    if m:
+        return None, float(m.group(1))
+    m = re.fullmatch(_BAND_NUM, rng)
+    if m:
+        return float(rng), float(rng)
+    return None, None
+
+
 def _band(value: Any, spec: Any, default: Any = None) -> Any:
     """band(value, spec, default=None): look `value` up in a banded table and
     return the matching band's result (FIRST match wins). `spec` is a comma-
@@ -1309,24 +1341,25 @@ def _band(value: Any, spec: Any, default: Any = None) -> Any:
         raise FormulaError("band(value, ...): value must be a number.")
     if not isinstance(spec, str):
         raise FormulaError("band(value, spec, ...): spec must be a string.")
+    bands: List[Tuple[Optional[float], Optional[float], str]] = []
     for entry in spec.split(","):
         entry = entry.strip()
-        if not entry or ":" not in entry:
+        if not entry:
             continue
-        rng, _, res = entry.partition(":")
-        rng = rng.strip()
-        try:
-            if rng.endswith("+") or rng.endswith("-"):
-                lo, hi = float(rng[:-1]), None
-            elif rng.startswith("-"):
-                lo, hi = None, float(rng[1:])
-            elif "-" in rng:
-                a, b = rng.split("-", 1)
-                lo, hi = float(a), float(b)
-            else:
-                lo = hi = float(rng)
-        except ValueError:
-            continue          # malformed entry -> skip it
+        rng, colon, res = entry.partition(":")
+        lo, hi = _band_range(rng.strip()) if colon else (None, None)
+        if not colon or (lo, hi) == (None, None):
+            # A typo'd entry used to be skipped, so a later band or the
+            # default answered instead (and `-5-0` couldn't be written).
+            raise FormulaError(
+                f"band(value, spec): can't read the band `{entry}` — use "
+                f"lo-hi, n, lo+, lo- or -hi, then :result.")
+        if lo is not None and hi is not None and lo > hi:
+            raise FormulaError(
+                f"band(value, spec): the band `{rng.strip()}` runs "
+                f"backwards (write it low-high).")
+        bands.append((lo, hi, res))
+    for lo, hi, res in bands:
         if (lo is None or value >= lo) and (hi is None or value <= hi):
             res = res.strip()
             try:

@@ -21249,3 +21249,154 @@ var rules can't name the same var. A unit copied into a match whose system
 calls hp `hull`, and a template saved under `hp` spawned there, take the
 `hull` name. A unit built from a partial holding `hp` records the rename in
 its marker (removed `hp`, set `health`), so its save spawns right.
+
+SCENARIO 743 — Var-name rules: only plain var names; undo preview after a rename
+----------------------------------------------------------------------
+
+!match new t743 Fort 10 8
+!match use t743
+!ent add a A 20 2 2 5
+!system set default hp_var stats.hp
+?? names a unit var: one word of letters, digits and _
+!system set default hp_var ""
+?? got ''
+!system set default team_var "h p"
+?? got 'h p'
+!system set default hp_var x
+?? x, y and name are the unit's position and display name
+!system set default hp_var __hp
+?? names starting with __ belong to the engine
+!system set default hp_var for
+?? names a unit var
+!assert "entity[a].hp == 20 and var_has('a', 'hp')"
+!system set default hp_var health
+!ent hp a -1
+!undo command 2 preview
+?? vars.health: 19 -> 20
+?! vars.hp
+!undo command 2 confirm
+!assert "entity[a].health == 20 and not var_has('a', 'hp')"
+!help status maxlevel
+?? From `!help status`: Status DEFINITIONS
+!help ent transfer
+?? the unit LEAVES this match
+
+Expected: HARNESS-ALLOWS-ERRORS. A var-name rule (hp_var, team_var, ...)
+takes one plain var name: a dotted path, an empty value, a name with a
+space, a reserved path (x / y / name), an engine `__` name or a Python
+keyword is refused (the vital accessors read a top-level key, and the
+engine's formula rules are rewritten to `entity[self].<name>`); before, a
+dotted hp_var killed the unit on its next hit. After hp_var becomes
+`health`, the undo preview compares against the state the restore will
+really make: the restored snapshot moves to the current names, so the
+preview shows only the hp change (19 -> 20), not a `health` / `hp` swap.
+A subcommand registered without its own description shows its command's
+text in `!help <cmd> <sub>`; `!ent copy` / `transfer` and `!match win` /
+`outcome` have their own.
+
+SCENARIO 744 — Dice tables and bands refuse what they can't read
+----------------------------------------------------------------------
+
+!match new t744 Range 6 6
+!match use t744
+!table def t a:1e308,b:1e308
+?? the weights add up past what a number can hold
+!table def t2 :1
+?? an entry has no key
+!eval "roll_table('a:inf,b:1')"
+?? weight for 'a' must be a finite number
+!eval "roll_table('a:nan,b:1')"
+?? weight for 'a' must be a finite number
+!assert "band(-3, '-5-0:cold,1+:warm') == 'cold'"
+!assert "band(-3, '-5--1:x') == 'x'"
+!assert "band(12, '1-2:120,3-5:100,6-9:80,10+:0') == 0"
+!assert "band(4, '1-3:a,4-6:b') == 'b'"
+!eval "band(1, '1:a,oops:b')"
+?? can't read the band `oops:b`
+!eval "band(5, '6-1:a', 'none')"
+?? the band `6-1` runs backwards
+
+Expected: HARNESS-ALLOWS-ERRORS. A table weight must be a finite number
+and every entry needs a key; weights whose sum overflows are refused
+(before, `inf` / `nan` weights were accepted and the pick ignored them, and
+`:1` defined a table that rolled an empty key). band() reads negative
+ranges (`-5-0`, `-5--1`), which it used to skip silently, and refuses an
+entry it can't read or a backwards range, wherever it sits in the spec:
+before, a typo'd entry was skipped, so a later band or the default
+answered.
+
+SCENARIO 745 — Watchers, events, modifiers and stores refuse silent no-ops
+----------------------------------------------------------------------
+
+!match new t745 Yard 8 8
+!match use t745
+!ent add a A 20 2 2 5
+!watch add w "entity[a].hp = 0" "1"
+?? A watcher condition is an expression (true or false): it can't assign
+!watch add w "entity[a].hp < 10" "entity[a].flag = 1"
+?? Added watcher `w`
+!watch add w "entity[a].hp < 5" "entity[a].flag = 2"
+?? Replaced watcher `w`
+!ent hp a 4
+!assert "entity[a].flag == 2"
+!emit ""
+?? An event needs a name.
+!eval "entity[a].s = 1e308 * 10"
+?? Can't store inf: only finite numbers can be stored.
+!eval "match_var_set('q', 1e308 + 1e308)"
+?? Can't store inf
+!assert "not var_has('a', 's')"
+!ent set_vars a modifiers.m1.stat=str modifiers.m1.op=add modifiers.m1.value=3
+!ent set_vars a modifiers.m2.stat=str modifiers.m2.op=add modifiers.m2.value=5 "modifiers.m2.condition=nosuch > 1"
+!ent set_vars a modifiers.m3.stat=str modifiers.m3.op=add modifiers.m3.value=oops
+!mod show a str 10
+?? → base 10 becomes 13
+?? ⚠️ left out: `modifiers.m2`: condition error
+?? `modifiers.m3`: value error
+!assert "apply_mods('a', 'str', 10) == 13"
+
+Expected: HARNESS-ALLOWS-ERRORS. A watcher condition is evaluated as an
+expression, so one written as an assignment is refused at `!watch add`
+(it used to be accepted and read as not met forever). Re-adding a watcher
+under its name says it replaced it. `!emit ""` is refused like emit('').
+Infinity and NaN can't be stored anywhere (JSON has no such numbers; they
+were saved as `Infinity`). `!mod show` names the modifier records it left
+out because their condition or value can't be read; apply_mods still skips
+them (fail safe).
+
+SCENARIO 746 — !find near: under fog; radius and value checks
+----------------------------------------------------------------------
+
+!match new t746 Moor 20 20
+!match use t746
+!ent add a A 20 2 2 5
+!ent set_var a team red
+!ent set_var a fog_vision_radius 2
+!ent add spy Spy 10 18 18 3
+!ent set_var spy team blue
+!match fog on
+!find near:spy:99
+?? A (a)
+!match bind pov=red
+!as player bob
+!find near:spy:99
+?? `near:` reference entity `spy` not found.
+!find near:ghost:99
+?? `near:` reference entity `ghost` not found.
+!foreach near:spy:99 ; ent info $id
+?? `near:` reference entity `spy` not found.
+!as host
+!find near:a:-1
+?? radius can't be negative
+!find within:3:3:-2
+?? radius can't be negative
+!find hp>
+?? `hp>` needs a value after `>`.
+
+Expected: HARNESS-ALLOWS-ERRORS. Under a team view, `near:<eid>` with a
+unit the view can't see answers exactly like a unit that doesn't exist:
+before, it matched the visible units near the hidden one, so a player
+could find a fogged unit's position by shrinking the radius. The host's
+omniscient view still uses it. A negative radius and an ordering
+comparison with no value are refused (they used to match nothing
+silently).
