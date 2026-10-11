@@ -363,6 +363,25 @@ EVENT_LOG_DEFAULT_FORMATS: Dict[str, str] = {
 # Schema types: "bool", "int", "enum"
 RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # --- Vital variable names (what var keys map to HP / MaxHP / turn-order) ---
+    "var_name_collision": {
+        "default": "tracked",
+        "schema": {"type": "enum", "choices": ["tracked", "existing", "refuse"]},
+        "desc": (
+            "Each unit remembers the var names it uses for the unit-var rules "
+            "(hp_var, max_hp_var, turnorder_var, team_var, part_name_var, "
+            "footprint_width_var / _height_var, atb_charge_var, disguise_var, "
+            "fog_vision_radius_var, overlay_var). When a rule names a different "
+            "var than a unit remembers (`!system set default hp_var health`, a "
+            "template saved under another system, an old snapshot restored), "
+            "the unit's var moves to the new name, silently (no var hooks), "
+            "and its clamps follow. This rule decides when the unit already "
+            "has a var under the new name: 'tracked' (default) = the var the "
+            "unit used moves there and overwrites it (noted in the reply); "
+            "'existing' = the var already there stays and the old one is left "
+            "as plain data; 'refuse' = the rule change (or the spawn) is "
+            "refused, naming the units."
+        ),
+    },
     "hp_var": {
         "default": "hp",
         "schema": {"type": "str"},
@@ -4631,6 +4650,13 @@ class Entity:
     mounted_on: "str | None" = field(default=None)
     mount_slot: "str | None" = field(default=None)
 
+    # The var names this unit uses for the unit-var rules (VAR_NAME_RULES:
+    # {"hp_var": "hp", ...}), set when it enters a match. When a rule later
+    # names another var (a system edit, a template from another system, an
+    # old snapshot), Match.sync_var_names moves the unit's vars to the new
+    # names. Protected (not a var), saved with the unit and its templates.
+    var_names: Dict[str, str] = field(default_factory=dict)
+
     #connect Entity to the Match (so functions like moving an entity can still access map size data, etc.)
     _match: "Match | None" = field(default=None, repr=False, compare=False)
 
@@ -4965,6 +4991,9 @@ class Entity:
         # defaults. Fill-only, so an explicitly-provided value wins.
         if has_file_refs(self.vars):
             self.vars = match.template_materialize(self.vars)
+        # Vars kept under another system's names (a template, a corpse or a
+        # unit copied from elsewhere) move to this match's names first.
+        rename_notes = match.sync_var_names(self)
         match._apply_default_vars(self)
         self.vars = checked_unit_vars(
             self.vars,
@@ -5005,6 +5034,7 @@ class Entity:
         self.move_to(x, y)
 
         self.bind(match, set_spawn_facing=True)
+        match._cap_unit_status_levels(self)
         if initiative is not None:
             self.initiative = initiative
 
@@ -5021,7 +5051,8 @@ class Entity:
         # re-runs spawn on a corpse snapshot that already has them)
         # idempotent, and lets a per-entity definition shadow a default.
         match._apply_default_passives(self)
-        log = match.fire_hook("on_entity_spawned", target_ids=[self.id])
+        log = rename_notes + match.fire_hook("on_entity_spawned",
+                                             target_ids=[self.id])
         # Spawn event — but NOT during a revive (the entity sits in the
         # death-suppressed set only across the revive's spawn window), so
         # a revive emits just its own "revive" event, not a duplicate
@@ -5838,6 +5869,7 @@ class Entity:
             "part_of": self.part_of,
             "mounted_on": self.mounted_on,
             "mount_slot": self.mount_slot,
+            "var_names": dict(self.var_names),
         }
 
     @staticmethod
@@ -5856,6 +5888,7 @@ class Entity:
             part_of=data.get("part_of", None),
             mounted_on=data.get("mounted_on", None),
             mount_slot=data.get("mount_slot", None),
+            var_names=checked_var_names(data.get("var_names")),
         )
         for pid, pd in (data.get("passives", {}) or {}).items():
             e.passives[pid] = Passive.from_dict(pd)
@@ -11291,6 +11324,45 @@ class Match:
             maxl = 0
         return min(lvl, maxl) if maxl > 0 else lvl
 
+    def _cap_live_status(self, entity_id: str, name: str, after: Any) -> Any:
+        """Hold the live instance `name` on `entity_id` (and the `after` data
+        a mutation reports) to its definition's max_level: every status
+        write reports through _emit_status_diff, so a level raised by
+        status_set, a counter or `!ent status set` is capped like an
+        application."""
+        e = self.entities.get(entity_id)
+        inst = e.status.get(name) if e is not None else None
+        sdef = self.status_definitions.get(name) or {}
+        for d in (inst, after):
+            lvl = d.get("level") if isinstance(d, dict) else None
+            if isinstance(lvl, (int, float)) and not isinstance(lvl, bool):
+                capped = self._cap_status_level(sdef, lvl)
+                if capped != lvl:
+                    d["level"] = capped
+        return after
+
+    def _cap_unit_status_levels(self, e: "Entity") -> None:
+        """Every status instance on `e` held to its max_level, silently: for
+        statuses a unit is created or transformed with."""
+        for name, inst in e.status.items():
+            lvl = inst.get("level") if isinstance(inst, dict) else None
+            if isinstance(lvl, (int, float)) and not isinstance(lvl, bool):
+                inst["level"] = self._cap_status_level(
+                    self.status_definitions.get(name) or {}, lvl)
+
+    def recap_status(self, name: str) -> List[str]:
+        """After a definition's max_level changes: every live instance of
+        `name` above it is lowered, as a status change (on_status_changed
+        fires). Returns the hook log."""
+        log: List[str] = []
+        for eid in list(self.entities):
+            e = self.entities.get(eid)
+            inst = e.status.get(name) if e is not None else None
+            if isinstance(inst, dict):
+                log += self._emit_status_diff(eid, name, copy.deepcopy(inst),
+                                              inst)
+        return log
+
     def _resistance_applies(self, e: "Entity", name: str,
                             sdef: Dict[str, Any], level_given: bool) -> bool:
         """Whether a flat level-reduction resistance applies to THIS status
@@ -11697,6 +11769,8 @@ class Match:
           {...} {...}      on_status_changed iff before != after
         """
         log: List[str] = []
+        if after is not None:
+            after = self._cap_live_status(entity_id, status_name, after)
         if before is None and after is not None:
             self.log_event("status_added", entity=entity_id,
                            name=self._entity_name(entity_id),
@@ -13877,6 +13951,81 @@ class Match:
     # different path, revert in any order) and the snapshot is inspectable /
     # editable like any other var.
 
+    # ---- per-unit var names (VAR_NAME_RULES) -----------------------------
+    def sync_var_names(self, e: "Entity",
+                       rules: Optional[Dict[str, Any]] = None) -> List[str]:
+        """Move `e`'s vars to the names this match's rules give (see
+        rename_unit_vars) and remember them; its clamps follow, and a
+        partial-template marker records the moves (so a save keeps them).
+        No var hooks fire. Raises VTTError (changing nothing) when
+        var_name_collision is refuse and a var is in the way."""
+        rules = self.rules if rules is None else rules
+        clamps = {p: c.to_dict() for p, c in e.clamps.items()}
+        names, new_clamps, notes, moved = rename_unit_vars(
+            e.vars, clamps, e.var_names, rules, f"`{e.id}`")
+        e.var_names = names
+        if moved:
+            e.clamps = {p: ClampSpec.from_dict(cd)
+                        for p, cd in new_clamps.items()}
+            for o, n in moved:
+                self.track_template_change(e, o, deleted=True)
+                self.track_template_change(e, n, deleted=False)
+        return notes
+
+    def _sync_unit_dict(self, d: Dict[str, Any], rules: Dict[str, Any],
+                        who: str) -> List[str]:
+        """sync_var_names for a stored unit dict (a corpse or one of its
+        parts): its vars, clamps and remembered names, in place."""
+        vars_ = d.get("vars")
+        if not isinstance(vars_, dict):
+            return []
+        clamps = d.get("clamps") if isinstance(d.get("clamps"), dict) else {}
+        names, new_clamps, notes, _moved = rename_unit_vars(
+            vars_, {p: dict(c) for p, c in clamps.items()
+                    if isinstance(c, dict)},
+            checked_var_names(d.get("var_names")), rules, who)
+        d["var_names"] = names
+        d["clamps"] = new_clamps
+        return notes
+
+    def sync_all_var_names(self) -> List[str]:
+        """Every unit and corpse of the match moved to the var names its
+        rules give: after the rules change (a system edit, a load, an undo
+        restoring an older state). A unit that var_name_collision=refuse
+        stops keeps its old names, with a note."""
+        notes: List[str] = []
+        for e in list(self.entities.values()):
+            try:
+                notes += self.sync_var_names(e)
+            except VTTError as ex:
+                notes.append(f"{ex} It keeps its old var names.")
+        for _x, _y, cid, corpse in self.all_corpses():
+            for d in [corpse.get("entity")] + list(corpse.get("parts") or []):
+                if not isinstance(d, dict):
+                    continue
+                try:
+                    notes += self._sync_unit_dict(
+                        d, self.rules, f"corpse `{d.get('id', cid)}`")
+                except VTTError as ex:
+                    notes.append(f"{ex} It keeps its old var names.")
+        return notes
+
+    def var_name_conflicts(self, rules: Dict[str, Any]) -> List[str]:
+        """What renaming every unit and corpse to `rules`' var names would
+        refuse (var_name_collision=refuse), without changing anything."""
+        out: List[str] = []
+        dicts = [e.to_dict() for e in self.entities.values()]
+        for _x, _y, _cid, corpse in self.all_corpses():
+            dicts += [d for d in [corpse.get("entity")]
+                      + list(corpse.get("parts") or []) if isinstance(d, dict)]
+        for d in dicts:
+            d = copy.deepcopy(d)
+            try:
+                self._sync_unit_dict(d, rules, f"`{d.get('id')}`")
+            except VTTError as ex:
+                out.append(str(ex))
+        return out
+
     def capture_statblock(self, e: "Entity") -> Dict[str, Any]:
         """Snapshot `e`'s restorable statblock: name, vars, status, passives,
         clamps, facing, plus the whole attached part SUBTREE as full entity
@@ -14103,6 +14252,14 @@ class Match:
             new_vars = self.template_materialize(new_vars)
         if not isinstance(new_vars, dict):
             raise VTTError("transform: the statblock's vars must be a dict.")
+        # A form captured under other var names (another system, an older
+        # rule) takes this match's names, clamps included.
+        sb_clamps = sb.get("clamps") if isinstance(sb.get("clamps"), dict) else {}
+        new_names, sb["clamps"], _rn, _moved = rename_unit_vars(
+            new_vars, {p: dict(c) for p, c in sb_clamps.items()
+                       if isinstance(c, dict)},
+            checked_var_names(sb.get("var_names")), self.rules,
+            f"`{e.id}`'s new form")
         new_max = new_vars.get(max_hp_var)
         target_hp = new_vars.get(hp_var)
         try:
@@ -14205,6 +14362,8 @@ class Match:
             e.clamps = {path: ClampSpec.from_dict(cd)
                         for path, cd in (sb.get("clamps") or {}).items()}
             e.status = copy.deepcopy(sb.get("status") or {})
+            e.var_names = new_names
+            self._cap_unit_status_levels(e)
             # facing is identity — preserved (not taken from the statblock).
             if eject_to is not None:
                 log.append(eject_note)
@@ -17410,6 +17569,79 @@ def _rel_del(d: Any, path: str) -> bool:
     return True
 
 
+# The rules that name a unit var. A unit remembers the names it uses
+# (Entity.var_names); rename_unit_vars moves its vars when a rule changes.
+VAR_NAME_RULES = ("hp_var", "max_hp_var", "turnorder_var", "team_var",
+                  "part_name_var", "footprint_width_var", "footprint_height_var",
+                  "atb_charge_var", "disguise_var", "fog_vision_radius_var",
+                  "overlay_var")
+
+
+def checked_var_names(raw: Any) -> Dict[str, str]:
+    """A unit's remembered var names, kept to VAR_NAME_RULES keys with text
+    values (anything else is dropped: the unit then takes the match's)."""
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items()
+            if k in VAR_NAME_RULES and isinstance(v, str) and v}
+
+
+def rename_unit_vars(vars_: Dict[str, Any], clamps: Dict[str, Dict[str, Any]],
+                     var_names: Dict[str, str], rules: Dict[str, Any],
+                     who: str
+                     ) -> Tuple[Dict[str, str], Dict[str, Dict[str, Any]],
+                                List[str], List[Tuple[str, str]]]:
+    """Move a unit's vars from the names it remembers (`var_names`) to the
+    ones `rules` give, in place on `vars_`. Returns (the names it now uses,
+    its clamps with paths / bounds renamed, notes, [(old, new)] moved). All
+    moves happen at once, so two rules swapping names work. A var already
+    under a new name follows the var_name_collision rule ('refuse' raises
+    VTTError, changing nothing). A name the unit doesn't remember is taken
+    as already matching."""
+    mode = str(rules.get("var_name_collision", "tracked"))
+    want = {k: str(rules.get(k, DEFAULT_SYSTEM_SETTINGS.get(k)) or "")
+            for k in VAR_NAME_RULES}
+    have = {k: var_names.get(k) or want[k] for k in VAR_NAME_RULES}
+    moves = [(k, have[k], want[k]) for k in VAR_NAME_RULES
+             if have[k] != want[k] and have[k] and want[k]]
+    if not moves:
+        return want, clamps, [], []
+    leaving = {o for _k, o, _n in moves}
+    notes: List[str] = []
+    plan: List[Tuple[str, str, Any]] = []
+    for k, o, n in moves:
+        found, value = _rel_get(vars_, o)
+        if not found:
+            continue
+        clash, _old = _rel_get(vars_, n)
+        clash = clash and n not in leaving
+        if clash and mode == "refuse":
+            raise VTTError(
+                f"{who} already has a var `{n}`: moving its `{o}` there "
+                f"({k}) would overwrite it (var_name_collision is refuse).")
+        if clash and mode == "existing":
+            notes.append(f"{who}: kept its existing `{n}`; `{o}` stays as "
+                         f"plain data ({k}).")
+            continue
+        if clash:
+            notes.append(f"{who}: `{o}` moved to `{n}` ({k}), replacing the "
+                         f"`{n}` it had.")
+        plan.append((o, n, copy.deepcopy(value)))
+    for o, _n, _v in plan:
+        _rel_del(vars_, o)
+    for _o, n, v in plan:
+        _rel_set(vars_, n, v)
+    names = {o: n for _k, o, n in moves}
+    new_clamps: Dict[str, Dict[str, Any]] = {}
+    for path, cd in clamps.items():
+        cd = dict(cd)
+        for f in ("path", "max", "min"):
+            if isinstance(cd.get(f), str) and cd[f] in names:
+                cd[f] = names[cd[f]]
+        new_clamps[names.get(path, path)] = cd
+    return want, new_clamps, notes, [(o, n) for o, n, _v in plan]
+
+
 def strip_markers(value: Any) -> Any:
     """`value` without partial-template markers (a copy): the data itself."""
     if isinstance(value, dict):
@@ -17877,17 +18109,28 @@ class MatchManager:
             log.extend(slog)
         dest._restamp_parts_for(idmap[e.id])
 
-    def refresh_match_rules(self, system_name: str) -> int:
+    def apply_system_rules(self, m: "Match") -> List[str]:
+        """Copy `m`'s system's rules into it (every path that rebuilds a
+        match's rules: a system edit, a load, an undo / restore) and move its
+        units and corpses to the var names those rules give. Returns the
+        rename notes."""
+        m.rules = self._build_rules_dict(self.systems[m.system_name])
+        return m.sync_all_var_names()
+
+    def refresh_match_rules(self, system_name: str,
+                            notes: Optional[List[str]] = None) -> int:
         """Re-snapshot rules onto every match bound to `system_name`. Returns count refreshed.
         Call this after mutating a GameSystem so live matches pick up the change.
+        Var-name renames are added to `notes` when given.
         """
         if system_name not in self.systems:
             return 0
-        sysobj = self.systems[system_name]
         count = 0
         for m in self.matches.values():
             if m.system_name == system_name:
-                m.rules = self._build_rules_dict(sysobj)
+                n = self.apply_system_rules(m)
+                if notes is not None:
+                    notes += n
                 count += 1
         return count
 
@@ -18018,6 +18261,7 @@ class MatchManager:
                 if m.system_name not in systems:
                     m.system_name = default_name
                 m.rules = self._build_rules_dict(systems[m.system_name])
+                m.sync_all_var_names()
                 for e in m.entities.values():
                     e.bind(m, set_spawn_facing=False)
             # A channel pointing at a match the file doesn't have would

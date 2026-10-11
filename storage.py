@@ -549,7 +549,8 @@ class Storage:
             raise ValueError("id doesn't match the file name")
         if m.system_name not in mgr.systems:
             m.system_name = mgr.default_system_name
-        m.rules = mgr._build_rules_dict(mgr.systems[m.system_name])
+        for note in mgr.apply_system_rules(m):
+            print(f"[storage] {mgr.guild_key}/{m.id}: {note}")
         return m
 
     def _load_history(self, mgr: MatchManager, m: Match) -> Optional[str]:
@@ -811,7 +812,7 @@ class Storage:
             elif _dump(_disk_state(m.to_dict(include_history=False))) != text:
                 _rollback_match(m, mgr, state)
             if m.system_name in mgr.systems:
-                m.rules = mgr._build_rules_dict(mgr.systems[m.system_name])
+                mgr.apply_system_rules(m)
             itext = w["index"].get(mid)
             if itext is not None:
                 m.history = MatchHistory.from_index(

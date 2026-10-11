@@ -4794,7 +4794,12 @@ class FormulaEngine:
             after = copy.deepcopy(e.status[name])
             match._emit_status_diff(eid, name, before, after)
             self._note_affected(eid)
-            return value
+            # What is stored (a level is held to the definition's max_level).
+            inst = e.status.get(name) if eid in match.entities else None
+            node: Any = inst
+            for k in keys:
+                node = node.get(k) if isinstance(node, dict) else None
+            return node if node is not None else value
 
         def _status_del(eid_t: Any, name: Any, path: Any) -> bool:
             eid = _eid(eid_t)
@@ -5033,8 +5038,7 @@ class FormulaEngine:
             if new <= 0:
                 _status_remove(eid_t, name)
                 return new
-            _status_set(eid_t, name, field, new)
-            return new
+            return _status_set(eid_t, name, field, new)
 
         def _status_counter_add(eid_t: Any, name: Any, delta: Any,
                                 field: Any = "duration") -> Any:

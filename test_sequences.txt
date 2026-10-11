@@ -21110,3 +21110,142 @@ names after `!system set <system>`, matches, teams, hook names. Under the
 red view with fog on, the blue spy out of sight is left out, as `!ent info`
 itself treats it, and so are its team, its actions (`zap`) and its statuses
 (`hidden_mark`); clearing the view offers them again.
+
+SCENARIO 740 — Statuses: max_level holds on every write
+-------------------------------------------------------
+
+!match new t740 Pyre 10 6
+!match use t740
+!status def burn
+!status maxlevel burn 3
+!ent add a A 20 2 2 5
+!status apply a burn 1
+!eval "status_set('a', 'burn', 'level', 9)"
+?? = `3`
+!assert "status_get('a', 'burn', 'level') == 3"
+!status counter a burn add 5 level
+?? `a.burn.level` = 3
+!ent status a set burn level 50
+?? (capped by `burn`'s max_level)
+!assert "status_get('a', 'burn', 'level') == 3"
+!template import hot {"name": "Hot", "vars": {"hp": 5}, "status": {"burn": {"level": 99}}}
+!template spawn hot 5 2
+!assert "status_get('hot', 'burn', 'level') == 3"
+!eval "summon({'name': 'S', 'vars': {'hp': 3}, 'status': {'burn': {'level': 40}}}, 7, 2)"
+!assert "status_get('s', 'burn', 'level') == 3"
+!ent set_var a form.name F
+!ent set_var a form.vars.hp 5
+!ent set_var a form.status.burn.level 77
+!ent transform a form stash
+!assert "status_get('a', 'burn', 'level') == 3"
+!gpassive add seen on_status_changed "entity[self].seen = 1"
+!status maxlevel burn 2
+?? fired on `hot` (on_status_changed)
+!assert "status_get('a', 'burn', 'level') == 2 and status_get('hot', 'burn', 'level') == 2 and status_get('s', 'burn', 'level') == 2 and entity[hot].seen == 1"
+
+Expected: HARNESS-ALLOWS-ERRORS. max_level is a hard ceiling on every
+write of a status's level, not only applications: status_set (it returns
+the stored 3), a counter, `!ent status set` (the reply says it was capped),
+the statuses a template spawn, a summon or a transform bring with them.
+Lowering a definition's max_level to 2 lowers every live instance above it,
+as a status change (on_status_changed fires for each of the three units).
+
+SCENARIO 741 — Var-name rules: units follow a renamed hp_var / footprint_width_var
+-----------------------------------------------------------------------------------
+
+!match new t741 Hold 12 8
+!match use t741
+!ent add ogre Ogre 30 2 2 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!part add ogre ohead Head 8 8
+!clamp add ogre hp max=max_hp mode=hard
+!ent add v V 10 8 2 3
+!ent kill v
+!template save ogre ogret
+!system set default hp_var health
+?? moved `hp` → `health` on 2 unit(s)
+?? so do `death_condition`, `default_kill_function_effects`, `default_revive_function_effects`
+!assert "entity[ogre].health == 30 and not var_has('ogre', 'hp') and entity[ohead].health == 8"
+!clamp list ogre
+?? `health`: max='max_hp', mode=hard
+!system info default
+?? [{'path': 'health', 'max': 'max_hp', 'mode': 'soft'}]
+!ent hp ogre +50
+!assert "entity[ogre].health == 30"
+!ent revive v
+!assert "entity[v].health == 10 and not var_has('v', 'hp')"
+!ent kill v
+!assert "has_corpse('v')"
+!system set default footprint_width_var fw
+!assert "entity[ogre].fw == 2 and footprint_width('ogre') == 2"
+!ent move ogre 1 right
+!assert "entity[ogre].x == 3 and occupies('ogre', 4, 3)"
+!template spawn ogret 7 5
+!assert "entity[ogret].health == 30 and entity[ogret].fw == 2 and not var_has('ogret', 'hp') and entity[ogret_ohead].health == 8"
+!undo command 5
+!assert "entity[ogre].health == 30 and not var_has('ogre', 'hp')"
+!as restart
+!match use t741
+!assert "entity[ogre].health == 30 and entity[ogre].fw == 2"
+
+Expected: HARNESS-ALLOWS-ERRORS. Each unit remembers the var names it uses.
+`!system set default hp_var health` moves `hp` to `health` on the ogre and
+its head (2 units); the dead `v`'s corpse is renamed too. The ogre's clamp
+on hp follows (`health` <= max_hp), and so do the system's default clamp
+and the engine formulas still in their default text (the death condition,
+the kill and revive effects), so `+50` is held at 30, a revive heals `v` to
+10 and a kill still kills. Renaming footprint_width_var keeps the ogre 2
+wide (it moves as a 2x2). The ogre template saved before the rename spawns
+with `health` / `fw` (it remembers the names it was saved with). An undo to
+before the footprint rename restores a state with the old names, which are
+moved again; a restart keeps the new names.
+
+SCENARIO 742 — Var-name rules: collisions, shared names, other systems
+----------------------------------------------------------------------
+
+!match new t742 Fort 10 8
+!match use t742
+!ent add a A 10 2 2 5
+!ent set_var a health 99
+!system set default var_name_collision refuse
+!system set default hp_var health
+?? `hp_var` stays `hp`: t742: `a` already has a var `health`
+!assert "entity[a].hp == 10 and entity[a].health == 99"
+!system set default var_name_collision existing
+!system set default hp_var health
+?? kept its existing `health`; `hp` stays as plain data
+!assert "entity[a].health == 99 and entity[a].hp == 10"
+!system set default var_name_collision tracked
+!system set default hp_var hp
+?? `health` moved to `hp` (hp_var), replacing the `hp` it had
+!assert "entity[a].hp == 99 and not var_has('a', 'health')"
+!system set default turnorder_var max_hp
+?? `max_hp` is already the var of `max_hp_var`
+!template import base {"kind": "partial", "data": {"hp": 7, "max_hp": 7, "str": 3}}
+!template import orc {"name": "Orc", "vars": {"__template": "base"}}
+!template spawn orc 6 2
+!system new s2
+!system set s2 hp_var hull
+!match new t742b Keep 8 8 s2
+!ent copy orc t742b
+!template save orc orc2
+!match use t742b
+!assert "entity[orc].hull == 7 and not var_has('orc', 'hp')"
+!template spawn orc2 4 4
+!assert "entity[orc2].hull == 7 and entity[orc2].str == 3"
+!match use t742
+!system set default hp_var health
+!template save orc orc3
+!template show orc3 vars compact
+?? {"__removed":["hp"],"__template":"base","health":7}
+
+Expected: HARNESS-ALLOWS-ERRORS. var_name_collision decides what happens
+when a unit already has a var under the new name: `refuse` refuses the rule
+change, naming the unit, and changes nothing; `existing` keeps the unit's
+own `health` (99) and leaves `hp` as plain data; `tracked` (the default)
+moves the var the unit used and replaces the one there, with a note. Two
+var rules can't name the same var. A unit copied into a match whose system
+calls hp `hull`, and a template saved under `hp` spawned there, take the
+`hull` name. A unit built from a partial holding `hp` records the rename in
+its marker (removed `hp`, set `health`), so its save spawns right.

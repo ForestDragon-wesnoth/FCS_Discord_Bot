@@ -15,7 +15,7 @@ from logic import (
 )
 
 # Passive system
-from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES
+from logic import VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES
 
 # Clamp system
 from logic import ClampSpec
@@ -4388,6 +4388,103 @@ registry.annotate_sub(
 
 # ---- system (gamesystem commands)-----
 
+def _rename_system_var(mgr: MatchManager, s: Any, name: str, key: str,
+                       value: Any) -> Optional[str]:
+    """Before `!system set <name> <key>` renames a unit var (VAR_NAME_RULES):
+    refuse when var_name_collision is refuse and a unit or corpse of a match
+    on the system has a var in the way; move the system's own references
+    (default_clamps paths / bounds, default_entity_vars keys) to the new
+    name. Returns a summary line of the units the refresh will move."""
+    if key not in VAR_NAME_RULES:
+        return None
+    old, new = str(s.get(key) or ""), str(value or "")
+    if not old or not new or old == new:
+        return None
+    taken = [k for k in VAR_NAME_RULES if k != key and str(s.get(k) or "") == new]
+    if taken:
+        raise VTTError(
+            f"`{new}` is already the var of `{taken[0]}` on `{name}`: two "
+            f"rules can't share a var (to swap two names, go through a third "
+            f"one).")
+    matches = [m for m in mgr.matches.values() if m.system_name == name]
+    if str(s.get("var_name_collision")) == "refuse":
+        conflicts: List[str] = []
+        for m in matches:
+            trial = dict(m.rules)
+            trial[key] = new
+            conflicts += [f"{m.id}: {c}" for c in m.var_name_conflicts(trial)]
+        if conflicts:
+            raise VTTError(
+                f"`{key}` stays `{old}`: " + " ".join(conflicts[:5])
+                + (f" (and {len(conflicts) - 5} more)"
+                   if len(conflicts) > 5 else ""))
+    clamps = s.get("default_clamps")
+    if isinstance(clamps, list):
+        out = []
+        for c in clamps:
+            c = dict(c) if isinstance(c, dict) else c
+            if isinstance(c, dict):
+                for f in ("path", "max", "min"):
+                    if c.get(f) == old:
+                        c[f] = new
+            out.append(c)
+        s.set("default_clamps", out)
+    dv = s.get("default_entity_vars")
+    if isinstance(dv, dict) and old in dv:
+        dv = dict(dv)
+        dv[new] = dv.pop(old)
+        s.set("default_entity_vars", dv)
+    # The engine's own formula rules (death_condition, the kill / revive
+    # effects, atb_charge_formula) name vars in their text: one still
+    # holding the engine's text follows the rename; one the GM wrote stays.
+    rewritten = []
+    for rk, reg in RULES_REGISTRY.items():
+        if not (reg.get("schema") or {}).get("formula"):
+            continue
+        cur = s.get(rk)
+        if (isinstance(cur, str) and cur
+                and cur == _engine_formula_text(s, rk)):
+            text = _engine_formula_text(s, rk, {key: new})
+            if text != cur:
+                s.set(rk, text)
+                rewritten.append(rk)
+    keep_existing = str(s.get("var_name_collision")) == "existing"
+    n = sum(1 for m in matches for e in m.entities.values()
+            if (e.var_names.get(key) or old) == old and _rel_has(e.vars, old)
+            and not (keep_existing and _rel_has(e.vars, new)))
+    bits = []
+    if n:
+        bits.append(f"moved `{old}` → `{new}` on {n} unit(s)")
+    bits.append("the system's default clamps and default vars follow")
+    if rewritten:
+        bits.append("so do " + ", ".join(f"`{r}`" for r in rewritten))
+    return ("Units keep this var as `" + new + "` now: " + "; ".join(bits)
+            + f". Formulas you wrote that name `{old}` are left as written.")
+
+
+def _engine_formula_text(s: Any, rule: str,
+                         override: Optional[Dict[str, str]] = None) -> str:
+    """The engine's default text of formula rule `rule` with each var it
+    names (`entity[...].hp`) spelled the way system `s` names it now (or as
+    `override` says)."""
+    text = str(RULES_REGISTRY[rule]["default"] or "")
+    for k in VAR_NAME_RULES:
+        dn = str(DEFAULT_SYSTEM_SETTINGS.get(k) or "")
+        cn = str((override or {}).get(k) or s.get(k) or dn)
+        if dn and cn != dn:
+            text = re.sub(r"(?<=\])\." + re.escape(dn) + r"\b", "." + cn,
+                          text)
+    return text
+
+
+def _rel_has(d: Any, path: str) -> bool:
+    for k in path.split("."):
+        if not isinstance(d, dict) or k not in d:
+            return False
+        d = d[k]
+    return True
+
+
 #TODO: add "delete" command for gamesystems (but TEST IT VERY CAREFULLY, like making sure there is always at least one gamesystem per server that's defaulted to, etc.)
 @registry.command("system", usage="!system <subcommand> ...", desc="Manage this server's GameSystems and defaults (server/channel). Every server has its own systems, starting with its own `default`.")
 async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -4504,11 +4601,15 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     
         s = mgr.get_system(name)
         warn = _check_formula_rule(mgr, s, key, value)
+        moved_line = _rename_system_var(mgr, s, name, key, value)
         s.set(key, value)
-        refreshed = mgr.refresh_match_rules(name)
+        notes: List[str] = []
+        refreshed = mgr.refresh_match_rules(name, notes)
         suffix = f" (refreshed {refreshed} live match{'es' if refreshed != 1 else ''})" if refreshed else ""
-        return await ctx.send(f"`{name}`.{key} = {value!r}{suffix}"
-                              + (f"\n{warn}" if warn else ""))
+        return await ctx.send("\n".join(
+            [f"`{name}`.{key} = {value!r}{suffix}"]
+            + ([warn] if warn else []) + ([moved_line] if moved_line else [])
+            + [f"⚠️ {n}" for n in notes]))
 
     # ---- system access <system> <set|clear|list> ---------------------
     # Dedicated editor for the command_access RULE on a GameSystem. This
@@ -5285,7 +5386,12 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 cur[parts_path[-1]] = value
                 after = copy.deepcopy(e.status[name])
                 event_log = m._emit_status_diff(eid, name, before, after)
-                msg = f"Set `{eid}.{name}.{path}` = {value!r}."
+                # What is stored (a level is held to max_level).
+                stored = cur.get(parts_path[-1], value) \
+                    if eid in m.entities else value
+                msg = f"Set `{eid}.{name}.{path}` = {stored!r}."
+                if stored != value:
+                    msg += f" (capped by `{name}`'s max_level)"
                 if event_log:
                     msg += "\n" + "\n".join(event_log)
                 return await ctx.send(msg)
@@ -8544,7 +8650,9 @@ def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot,
     # match on the old rules while the system keeps the new ones, until a
     # reload re-copied them.
     if new_match.system_name in mgr.systems:
-        new_match.rules = mgr._build_rules_dict(mgr.systems[new_match.system_name])
+        rename_notes = mgr.apply_system_rules(new_match)
+        if notes is not None:
+            notes.extend(rename_notes)
     # Channel bindings are serialized, but the channels' active pointers
     # (MatchManager.active_by_channel) are not — so a restore that simply
     # took the snapshot's bindings would leave a channel bound SINCE the
@@ -12319,7 +12427,9 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         except ValueError:
             return await ctx.send("❌ maxlevel must be an integer (0 = uncapped).")
         m.status_definitions[name]["max_level"] = max(0, n)
-        return await ctx.send(f"`{name}` max_level = {max(0, n)}.")
+        log = m.recap_status(name)
+        return await ctx.send("\n".join([f"`{name}` max_level = {max(0, n)}."]
+                                         + log))
 
     if sub == "data":
         if await return_help_if_not_enough_args(ctx, args, 4, "status", "data"):
@@ -13335,7 +13445,7 @@ def _restore_all_matches(mgr: MatchManager, snap: Dict[str, Any]) -> None:
         # Rules are a copy of the match's system, which isn't rolled back
         # (as in an undo, see _restore_snapshot).
         if m.system_name in mgr.systems:
-            m.rules = mgr._build_rules_dict(mgr.systems[m.system_name])
+            mgr.apply_system_rules(m)
     mgr.active_by_channel.clear()
     mgr.active_by_channel.update(snap["active"])
 

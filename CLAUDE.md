@@ -247,7 +247,8 @@ Each of these was learned from a shipped bug.
   default forever). Schemas and defaults must be JSON (a system saves an
   overridden rule's schema; an import-time check refuses a `set`).
   Changing a rule mid-game must leave derived state consistent (switching
-  `persist_undo_history` off once lost every snapshot already on disk).
+  `persist_undo_history` off once lost every snapshot already on disk). A
+  rule that names a unit var goes in `logic.VAR_NAME_RULES` (§7.1).
 - **A serialized Match field:** `to_dict` / `from_dict` with deep copies on
   BOTH sides; a runtime-only field goes in `action._rollback_match`'s preserve
   list (`_check_rollback_fields` raises if a field is neither); decide whether
@@ -848,6 +849,24 @@ hardcodes**.
   the protected link fields `part_of` / `mounted_on` / `mount_slot`. Vital
   vars hp / max_hp / initiative (names from `hp_var` / `max_hp_var` /
   `turnorder_var`).
+- **Var-name rules** (`VAR_NAME_RULES`: hp / max_hp / turnorder / team /
+  part_name / footprint width + height / atb_charge / disguise /
+  fog_vision_radius / overlay `_var`): each unit remembers the names it uses
+  (protected `Entity.var_names`, saved with it, its corpse and its
+  templates). `Match.sync_var_names` / `rename_unit_vars` move a unit's vars
+  to the names its match's rules give, all at once (no var hooks, clamps'
+  paths and bounds follow, a partial marker records the move), at
+  `Entity.spawn` (templates, summons, copies, revives from other names),
+  in `apply_statblock` (a form captured under other names) and wherever a
+  match's rules are rebuilt (`MatchManager.apply_system_rules`: a system
+  edit, load, undo / restore, store load; corpses too). A var already under
+  the new name follows `var_name_collision` (tracked default / existing /
+  refuse; refuse pre-checks every unit and corpse and changes nothing).
+  `!system set` of such a rule (`_rename_system_var`) also renames the
+  system's default_clamps / default_entity_vars and the engine formula
+  rules still in their default text (death_condition, the kill / revive
+  effects, atb_charge_formula; a GM's own formulas are left as written),
+  and refuses a name another var rule already uses (741-742).
 - **`Entity.write_var` / `remove_var`** are the only way to change vars:
   vital vars are coerced to finite whole numbers or refused, nothing nests
   under a vital, vitals can't be deleted (`allow_protected` only for the
@@ -998,8 +1017,12 @@ hardcodes**.
   in the GM's tick formula; the engine forces no decay (390-391).
 - **Applying** (`apply_status` / `status_apply` / `!status apply`): stacking
   from the definition's `stack`, else `status_default_stack` (refresh /
-  add_level / extend / replace / none). `max_level` is a hard ceiling
-  everywhere (`_cap_status_level`).
+  add_level / extend / replace / none). `max_level` is a hard ceiling on
+  every write of a level: applications (`_cap_status_level`), every status
+  change through `_emit_status_diff` (`_cap_live_status`: status_set,
+  counters, `!ent status set` report the stored value), statuses a spawn /
+  summon / transform brings (`_cap_unit_status_levels`); lowering it with
+  `!status maxlevel` lowers live instances as status changes (740).
 - **Prims:** `status_apply` / `status_force` / `status_get` / `status_set` /
   `status_has` / `status_tags` / `status_has_tag` / `statuses_with_tag` /
   `status_resist_of` / `is_status_immune` / counters / dispel / transfer.
@@ -1477,7 +1500,8 @@ hardcodes**.
 - **What:** a server library (`MatchManager.templates`,
   `data/<server>/templates/<name>.json`) of units saved without identity
   (`Match.capture_template`): name, vars incl. current hp, statuses,
-  passives, clamps, facing, the part subtree. No id / x / y / links; part
+  passives, clamps, facing, the part subtree, the var names it was saved
+  with (`var_names`: a spawn under other names renames). No id / x / y / links; part
   ids, `part_of` and `__follows` relative to `TEMPLATE_ROOT` (`@root_head`);
   part positions and snake trail vars as anchor offsets. `check_template`
   validates every write and load (vitals, reserved names, facing, status
@@ -1634,6 +1658,13 @@ rejected already. Update this section in the PR that resolves an item.
   head's cell; a template spawn, revive or transform then puts that segment
   on the nearest free cell with a ⚠️. Whether spawns should recreate the
   overlap is open.
+
+- **Large match state, per-command cost** (user: discuss later): after a
+  whole-map tile fill on 500x500 every command costs ~3.5 s (three full
+  serializations per command; numbers under "Undo history disk growth"
+  below). Options raised: a cap on what a match can hold, cheaper undo
+  snapshots (diffs / copy-on-write, reusing the post-command state for the
+  commit), or leaving it deferred.
 
 ### Deferred (the user wants these tracked)
 
