@@ -2127,7 +2127,7 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 )
             want = _truthy(args[2].lower())
             if want is None:
-                return await ctx.send("Usage: `!match fog memory on|off`.")
+                return await ctx.send("❌ Usage: `!match fog memory on|off`.")
             m.fog_memory = want
             if want:
                 # Seed explored from every present team's current vision so
@@ -2152,7 +2152,7 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             )
         want = _truthy(args[1].lower())
         if want is None:
-            return await ctx.send("Usage: `!match fog on|off` or `!match fog memory on|off`.")
+            return await ctx.send("❌ Usage: `!match fog on|off` or `!match fog memory on|off`.")
         m.fog_enabled = want
         return await ctx.send(
             f"Fog of war **{'on' if m.fog_enabled else 'off'}** for "
@@ -7361,7 +7361,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 "Grid border overrides cleared (back to the border_* rules).")
         if op == "color":
             if len(args) < 3:
-                return await ctx.send("Usage: `!map border color <name|hex>`.")
+                return await ctx.send("❌ Usage: `!map border color <name|hex>`.")
             col = args[2]
             m.border_color = col
             note = "" if col.lower() in TEXT_COLORS or col.startswith("#") \
@@ -7370,7 +7370,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(f"Grid border color set to `{col}`.{note}")
         if op == "opacity":
             if len(args) < 3:
-                return await ctx.send("Usage: `!map border opacity <0-100>`.")
+                return await ctx.send("❌ Usage: `!map border opacity <0-100>`.")
             try:
                 val = max(0, min(100, int(args[2])))
             except ValueError:
@@ -7392,7 +7392,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"graphics surface; text surfaces fall back to ASCII).")
         mode = args[1].lower()
         if mode not in ("text", "image"):
-            return await ctx.send("Usage: `!map mode text|image`.")
+            return await ctx.send("❌ Usage: `!map mode text|image`.")
         m.render_mode = mode
         extra = ("" if mode == "text" else
                  " — a plain `!map` and the auto-update board now post a "
@@ -7500,7 +7500,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return None
     if args and args[0].lower() == "color":
         if len(args) < 2 or args[1].lower() not in ("on", "off"):
-            return await ctx.send("Usage: `!map color on|off`.")
+            return await ctx.send("❌ Usage: `!map color on|off`.")
         m.color_enabled = (args[1].lower() == "on")
         return await ctx.send(
             f"Colorized rendering {'ON' if m.color_enabled else 'OFF'} for "
@@ -7520,12 +7520,12 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send("\n".join(lines))
         if op == "clear":
             if len(args) < 3:
-                return await ctx.send("Usage: `!map teamcolor clear <team>`.")
+                return await ctx.send("❌ Usage: `!map teamcolor clear <team>`.")
             m.team_colors.pop(args[2], None)
             return await ctx.send(f"Cleared team color for `{args[2]}`.")
         # set: !map teamcolor <team> <color>
         if len(args) < 3:
-            return await ctx.send("Usage: `!map teamcolor <team> <color>`.")
+            return await ctx.send("❌ Usage: `!map teamcolor <team> <color>`.")
         team, color = args[1], args[2].lower()
         if color not in TEXT_COLORS:
             return await ctx.send(f"❌ unknown color `{color}`. {_color_guide()}")
@@ -7563,7 +7563,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # ---- !map layer <name> on|off | !map layer list ----
     if args and args[0].lower() == "layer":
         if len(args) < 2:
-            return await ctx.send("Usage: `!map layer <zones|tiles|entities|fog> on|off` or `!map layer list`.")
+            return await ctx.send("❌ Usage: `!map layer <zones|tiles|entities|fog> on|off` or `!map layer list`.")
         if args[1].lower() == "list":
             shown = [L for L in _MAP_LAYERS if L not in m.hidden_layers]
             hid = sorted(m.hidden_layers)
@@ -7575,7 +7575,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(
                 f"❌ unknown layer `{name}`. Layers: {', '.join(_MAP_LAYERS)}.")
         if len(args) < 3 or args[2].lower() not in ("on", "off"):
-            return await ctx.send(f"Usage: `!map layer {name} on|off`.")
+            return await ctx.send(f"❌ Usage: `!map layer {name} on|off`.")
         if args[2].lower() == "off":
             m.hidden_layers.add(name)
         else:
@@ -7630,7 +7630,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"({m.rules.get('viewport_width')}×"
                 f"{m.rules.get('viewport_height')}); nothing to pan.")
         if len(args) < 2:
-            return await ctx.send("Usage: `!map pan <up|down|left|right> [n]`.")
+            return await ctx.send("❌ Usage: `!map pan <up|down|left|right> [n]`.")
         canon = normalize_direction(args[1])
         if canon is None or canon not in DIRECTION_VECTORS:
             return await ctx.send(f"❌ `{args[1]}` is not a direction.")
@@ -7658,10 +7658,10 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             try:
                 cx, cy = int(args[1]), int(args[2])
             except ValueError:
-                return await ctx.send("Usage: `!map center <eid>` or `!map center <x> <y>`.")
+                return await ctx.send("❌ Usage: `!map center <eid>` or `!map center <x> <y>`.")
             m.center_view(ctx.channel_key, cx, cy)
         else:
-            return await ctx.send("Usage: `!map center <eid>` or `!map center <x> <y>`.")
+            return await ctx.send("❌ Usage: `!map center <eid>` or `!map center <x> <y>`.")
         return await ctx.send(_map_render_reply(ctx, m, []))
     if args and args[0].lower() == "view":
         if len(args) >= 2 and args[1].lower() in ("reset", "clear"):
@@ -7671,10 +7671,10 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             try:
                 vx, vy = int(args[1]), int(args[2])
             except ValueError:
-                return await ctx.send("Usage: `!map view <x> <y>` | `!map view reset`.")
+                return await ctx.send("❌ Usage: `!map view <x> <y>` | `!map view reset`.")
             m.set_view(ctx.channel_key, vx, vy)
             return await ctx.send(_map_render_reply(ctx, m, []))
-        return await ctx.send("Usage: `!map view <x> <y>` (top-left) | `!map view reset`.")
+        return await ctx.send("❌ Usage: `!map view <x> <y>` (top-left) | `!map view reset`.")
     # One-off `hide=zones,fog` arg: suppress extra layers for this render
     # only (union with the persistent hidden set), without mutating state.
     # `full` is honored only as args[0] (the host-gated position) via
@@ -8867,7 +8867,7 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     lines.append(f"- `{name}`: {s.short_summary()}  [{s.timestamp}]")
                 return await ctx.send("\n".join(lines))
             return await ctx.send(
-                f"Unknown list kind '{kind}'. Use one of: rounds, turns, commands, manual."
+                f"❌ Unknown list kind '{kind}'. Use one of: rounds, turns, commands, manual."
             )
         # Summary
         lines = [f"**Match `{mid}` history:**"]
@@ -8898,10 +8898,12 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 2, "history", "save"):
             return
         name = args[1]
+        replaced = name in m.history.manual_saves
         s = m.history.save_manual(m, name)
         return await ctx.send(
             f"Saved manual `{name}` (round {s.round_at_snapshot}, "
-            f"seq {s.sequence})."
+            f"seq {s.sequence})"
+            + (f", replacing the old `{name}`." if replaced else ".")
         )
 
     if sub == "delete":
@@ -9117,7 +9119,12 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         full, path = saves_path(args[1], mgr)
         override_name = None
-        if len(args) >= 4 and args[2].lower() == "as":
+        if len(args) > 2 and not (len(args) == 4 and args[2].lower() == "as"):
+            # A word other than `as <name>` used to be ignored.
+            return await ctx.send(
+                f"❌ Unexpected `{' '.join(args[2:])}` — usage: "
+                f"`!history import <path> [as <name>]`.")
+        if len(args) == 4:
             override_name = args[3]
         try:
             with open(full, "r", encoding="utf-8") as f:
@@ -13806,6 +13813,12 @@ async def _exec_macro(nodes, ctx, mgr, mac_args, loop_idx, name, budget):
                 await ctx.send(f"❌ macro `{name}`: bad `repeat` count "
                                f"`{csrc[:50]}`: {ex}")
                 continue
+            if count < 0:
+                # A negative count used to run the block zero times silently.
+                await ctx.send(f"❌ macro `{name}`: `repeat` count "
+                               f"`{csrc[:50]}` is {count}; it can't be "
+                               f"negative.")
+                continue
             cap = int(m.rules.get("macro_repeat_limit", 1000))
             if count > cap:
                 await ctx.send(f"⚠️ macro `{name}`: repeat {count} clamped to "
@@ -14305,7 +14318,7 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             for pid, p in bucket.items():
                 lines.append(f"  `{pid}` ({p.when}): `{p.formula}`")
             return await ctx.send("\n".join(lines))
-        return await ctx.send("Usage: `!team passive <add|remove|list> ...`")
+        return await ctx.send("❌ Usage: `!team passive <add|remove|list> ...`")
 
     return await _help_fallback(ctx, ["team"], args[0] if args else None)
 

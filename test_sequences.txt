@@ -13785,7 +13785,7 @@ SCENARIO 534 — Render mode toggle: text vs image (graphics surface gating)
 !map mode text
 !map mode bogus
 
-Expected: `!map mode` shows the current per-match render mode (default `text`).
+Expected: HARNESS-ALLOWS-ERRORS. `!map mode` shows the current per-match render mode (default `text`).
 `!map mode image` sets it (host-gated, serialized via Match.render_mode). On a
 graphics-capable surface (Discord with Pillow) a plain `!map` then posts a
 rendered PNG instead of the ASCII block, and `!map autoupdate` makes a self-
@@ -21536,3 +21536,37 @@ the head (in `path` mode too). Switching to `path` mid-game rebuilds the
 recorded path from where the body lies (the first step leaves the body in
 place, the next pulls it on): the path recorded before the switch was
 stale, and both segments jumped onto one cell at the top of the map.
+
+SCENARIO 750 — History, macro and usage replies say what happened
+----------------------------------------------------------------------
+
+!match new t750 Hall 8 8
+!match use t750
+!ent add a A 20 2 2 5
+!history save s1
+?? Saved manual `s1`
+?! replacing
+!ent hp a -1
+!history save s1
+?? replacing the old `s1`.
+!history export manual:s1 h750
+!history import h750 zzstray
+?? ❌ Unexpected `zzstray` — usage: `!history import <path> [as <name>]`.
+!history import h750 as s2
+?? as manual save `s2`
+!history list nope
+?? ❌ Unknown list kind 'nope'.
+!macro set m "repeat -1\nent hp a -1\nend"
+!macro run m
+?? `repeat` count `-1` is -1; it can't be negative.
+!assert "entity[a].hp == 19"
+!map mode pdf
+?? ❌ Usage: `!map mode text|image`.
+
+Expected: HARNESS-ALLOWS-ERRORS. `!history save` under a name already used
+says it replaced the old save (it said "Saved" either way). `!history
+import` refuses a word other than `as <name>` after the path (it ignored
+it). An unknown `!history list` kind and the usage refusals of `!map` /
+`!match fog` subcommands now carry ❌ like every other refusal. A macro's
+`repeat` with a negative count is refused (it ran the block zero times
+and replied nothing).

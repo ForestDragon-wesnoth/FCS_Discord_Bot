@@ -75,7 +75,8 @@ _FAILURE_MARKERS = ("💥", "Syntax error")
 # test) and opts out with the `HARNESS-ALLOWS-ERRORS` tag in its Expected prose.
 _ERROR_MARKERS = ("❌ Runtime error:", "❌ Unexpected error:",
                   "isn't a valid command (unknown subcommand",
-                  "is missing arguments (got")
+                  "is missing arguments (got", "❌ Usage:",
+                  "❌ Unexpected `")
 _ALLOW_ERRORS_TAG = "harness-allows-errors"
 
 # A failed `!assert` is a scenario checking its own end state and finding it

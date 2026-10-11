@@ -143,8 +143,9 @@ code. How the harness works (`run_scenarios.py`, scenarios in
   `Expected:` run: a staged scenario labels intermediate prose `Result:`
   (see 13, 26). Multi-line bodies use literal `\n` (`_interpret_escapes`).
 - **What it flags.** `💥` and "Syntax error" always; `❌ Runtime error:`,
-  `❌ Unexpected error:`, an unknown subcommand ("isn't a valid command") and
-  missing arguments ("is missing arguments") unless the prose carries
+  `❌ Unexpected error:`, an unknown subcommand ("isn't a valid command"),
+  missing arguments ("is missing arguments"), a usage refusal (`❌ Usage:`)
+  and stray words ("❌ Unexpected ... — usage:") unless the prose carries
   `HARNESS-ALLOWS-ERRORS`; a false `!assert "<formula>"` (`❌ Assertion
   failed`) and a missed `?? <text>` / `?! <text>` reply check (`❌ Expectation
   failed`) ALWAYS (only `HARNESS-ALLOWS-ASSERT-FAIL` opts out, for a scenario
