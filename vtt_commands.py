@@ -8650,10 +8650,13 @@ def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot,
     # A snapshot `!history import`ed from ANOTHER match restores that board
     # here, but the match stays itself: its id (the key everything files
     # under — two matches reporting one id sent this match's approval
-    # requests to the other), its name, and who runs it.
+    # requests to the other), its name, who runs it, and its game system
+    # (no command moves a match to another system; the board's units take
+    # this system's var names below).
     if new_match.id != old.id:
         new_match.id = old.id
         new_match.name = old.name
+        new_match.system_name = old.system_name
         new_match.owner = old.owner
         new_match.cohosts = copy.deepcopy(old.cohosts)
         new_match.access_overrides = copy.deepcopy(old.access_overrides)

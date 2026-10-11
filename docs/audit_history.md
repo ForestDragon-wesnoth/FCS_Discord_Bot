@@ -2081,3 +2081,43 @@ commands; per-command timing on 500x500 maps.
   - Measured, not changed (reported to the user): after a whole-map tile
     fill every command costs ~3.5 s on 500x500 (full-state undo snapshots);
     `cell_occupant` is O(units) per cell.
+
+## Pass 41
+
+Freshest code first (per-unit var names, global max_level), then hand probes
+across dice / tables, watchers, events, modifiers, `!find`, zones / tiles,
+ATB and history import. Harnesses: the rule-change chaos harness with
+var-rule renames under every collision mode (16 seeds x 250 steps, and 5
+hostile x 200), clean; a new existence-oracle detector (each command run as
+a fogged player naming a hidden unit and naming a nonexistent id, replies
+compared after swapping the names; 300k runs, none after the `near:` fix).
+  - **Var-name rule values were unchecked.** `hp_var` took `stats.hp`, `""`,
+    `h p`, `x`, `name` or `__template`. The vital accessors read a top-level
+    key, so a dotted hp_var read hp as 0 and the next hit killed the unit;
+    the engine formula rules were rewritten to `entity[self].stats.hp`.
+    Values are now one identifier that isn't a keyword, a reserved path or
+    an engine `__` name, at `!system set`, on loading a system and in a
+    unit's remembered names.
+  - **Undo preview after a rename** diffed against the raw snapshot, so it
+    listed a `health` / `hp` swap the restore never makes (the restore moves
+    the snapshot's units to the current names). It now syncs a copy first.
+  - **A board imported from another match switched the match's system** to
+    the snapshot's (no command can move a match to another system), so it
+    ran on another system's rules and kept the old var names. It now keeps
+    its system like its id, name and hosts.
+  - **`!find near:<hidden>:<r>` was a position oracle** under fog: the
+    hidden reference was used, so the visible units near it matched and a
+    shrinking radius located it; a missing id said "not found". A hidden
+    reference now reads as missing. Negative radii and `hp>` with no value
+    are refused.
+  - **inf / nan were storable** in vars, match vars, team data and tiles,
+    saved as `Infinity`. `_own_value` refuses them.
+  - **Silent skips:** roll_table took `inf` / `nan` weights, an empty key
+    and an overflowing total; band() skipped a typo'd entry (a later band or
+    the default answered) and couldn't read negative ranges (`-5-0`);
+    `!watch add` validated the condition as a program, so an assignment was
+    accepted and never fired; `!emit ""` was accepted; `!mod show` hid
+    records left out for an unreadable condition / value / priority.
+  - `!help`: 79 subcommands registered with a usage only printed a dangling
+    dash; they now show the command's text, and `!ent copy` / `transfer`,
+    `!match win` / `outcome` got descriptions.

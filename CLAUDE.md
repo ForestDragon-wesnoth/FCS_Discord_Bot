@@ -248,7 +248,8 @@ Each of these was learned from a shipped bug.
   overridden rule's schema; an import-time check refuses a `set`).
   Changing a rule mid-game must leave derived state consistent (switching
   `persist_undo_history` off once lost every snapshot already on disk). A
-  rule that names a unit var goes in `logic.VAR_NAME_RULES` (§7.1).
+  rule that names a unit var goes in `logic.VAR_NAME_RULES` (§7.1; its value
+  is checked as one plain var name).
 - **A serialized Match field:** `to_dict` / `from_dict` with deep copies on
   BOTH sides; a runtime-only field goes in `action._rollback_match`'s preserve
   list (`_check_rollback_fields` raises if a field is neither); decide whether
@@ -271,7 +272,9 @@ Each of these was learned from a shipped bug.
   `normalize_body_source`.
 - **A query that names or lists units:** run it through the POV helpers
   (`_query_eid`, `_pov_hides`) so a fogged player can't probe hidden units;
-  re-run the POV leak detector (§5).
+  that includes ids inside arguments (`near:<eid>` matched the visible units
+  near a hidden one); re-run the POV leak detector and the existence-oracle
+  detector (§5).
 - **Anything iterating units and firing hooks:** re-check
   `eid in m.entities` after each hook (§5 "ghost firing").
 
@@ -721,6 +724,11 @@ descriptions (pass numbers point at `docs/audit_history.md`):
   pool run as a red-POV player; replies grepped for the hidden names, values
   and cells after stripping echoes of the typed args. Include list KINDS
   (`commands`, `turns`) in the pool.
+- **Existence-oracle detector** (41): the same board; each command run twice
+  as the player, once naming a hidden unit (as an arg, `near:<id>:60`,
+  `for=<id>`, `to=<id>`, `<id>.hp`) and once naming a nonexistent id; any
+  reply difference after swapping the names is an oracle (the grep detector
+  misses a reply that names no secret but behaves differently).
 - **Formula-function fuzzer** (30): every function × wrong-typed /
   missing-entity / wrong-arity args under a 1 s SIGALRM; flag raw Python
   messages after "Runtime error:".
@@ -851,7 +859,9 @@ hardcodes**.
   `turnorder_var`).
 - **Var-name rules** (`VAR_NAME_RULES`: hp / max_hp / turnorder / team /
   part_name / footprint width + height / atb_charge / disguise /
-  fog_vision_radius / overlay `_var`): each unit remembers the names it uses
+  fog_vision_radius / overlay `_var`; each value one plain var name, an
+  identifier that isn't a keyword, x / y / name or `__`-prefixed,
+  `check_var_name_rule`): each unit remembers the names it uses
   (protected `Entity.var_names`, saved with it, its corpse and its
   templates). `Match.sync_var_names` / `rename_unit_vars` move a unit's vars
   to the names its match's rules give, all at once (no var hooks, clamps'
@@ -1125,7 +1135,8 @@ hardcodes**.
   self-dispatching commands and elevated args keep it gated). A non-host's
   sweep skips units their POV can't see (486-490, 557-558, 564-565).
 - **`!find`** selectors: `var<op>value`, `status:`, `group:`, `action:`,
-  `near:<eid>:<r>`, `within:<x>:<y>:<r>`, a leading `!` negates, `|`
+  `near:<eid>:<r>` (a unit the query POV can't see reads as missing),
+  `within:<x>:<y>:<r>`, a leading `!` negates, `|`
   alternatives (an alternative that doesn't parse reuses the previous kind and
   key); `show:<csv>` (incl. `status`), `sort:<var>[:desc]`, `count`, `ids`
   (536-538, 631, 694-695).
@@ -1470,7 +1481,8 @@ hardcodes**.
   templates over vars. Event log: `!log`, `event_log_*` rules, `log()`.
 - **Whole-server saves:** `!store save/load <name>` (admin, saves folder;
   load is all-or-nothing); `!history export/import` (a snapshot from another
-  match restores only the board).
+  match restores only the board: the match keeps its id, name, hosts and
+  system, and the units take its var names).
 - **Undo** (`match_history.py`): autosaves per round (`autosave_round_retention`),
   turn (`autosave_turn_retention_rounds`, under ATB `_turns`), command
   (`autosave_command_retention_turns` / `_max`), manual (`!history save`).

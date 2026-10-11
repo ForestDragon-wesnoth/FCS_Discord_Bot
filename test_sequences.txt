@@ -21400,3 +21400,30 @@ could find a fogged unit's position by shrinking the radius. The host's
 omniscient view still uses it. A negative radius and an ordering
 comparison with no value are refused (they used to match nothing
 silently).
+
+SCENARIO 747 — A board imported from another system's match keeps this match's system
+----------------------------------------------------------------------
+
+!system new s747
+!system set s747 hp_var hull
+!match new t747a Old 10 10
+!match new t747b New 10 10 s747
+!match use t747a
+!ent add a A 20 2 2 5
+!history save snap
+!history export manual:snap snap747
+!match use t747b
+!history import snap747
+!history restore snap confirm
+!match info
+?? system `s747`
+!assert "entity[a].hull == 20 and not var_has('a', 'hp')"
+!ent hp a -3
+!assert "entity[a].hull == 17"
+
+Expected: A snapshot exported from a match on the `default` system and
+imported into a match on `s747` (whose hp var is `hull`) restores the
+board, but the match keeps its own system, like its id, name and hosts:
+before, the restore switched it to `default` (no command can move a match
+to another system), so it ran on the other system's rules. The restored
+unit takes this system's var names (its `hp` becomes `hull`).
