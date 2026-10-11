@@ -143,8 +143,9 @@ code. How the harness works (`run_scenarios.py`, scenarios in
   `Expected:` run: a staged scenario labels intermediate prose `Result:`
   (see 13, 26). Multi-line bodies use literal `\n` (`_interpret_escapes`).
 - **What it flags.** `💥` and "Syntax error" always; `❌ Runtime error:`,
-  `❌ Unexpected error:`, an unknown subcommand ("isn't a valid command") and
-  missing arguments ("is missing arguments") unless the prose carries
+  `❌ Unexpected error:`, an unknown subcommand ("isn't a valid command"),
+  missing arguments ("is missing arguments"), a usage refusal (`❌ Usage:`)
+  and stray words ("❌ Unexpected ... — usage:") unless the prose carries
   `HARNESS-ALLOWS-ERRORS`; a false `!assert "<formula>"` (`❌ Assertion
   failed`) and a missed `?? <text>` / `?! <text>` reply check (`❌ Expectation
   failed`) ALWAYS (only `HARNESS-ALLOWS-ASSERT-FAIL` opts out, for a scenario
@@ -157,7 +158,7 @@ code. How the harness works (`run_scenarios.py`, scenarios in
   command's full reply next to the Expected prose; `-v` prints a transcript.
 - **Tab completion** is tested in scenarios too: `?tab "<text>"` replies with
   what Tab does at the end of the text (`→ '<line>'` and `candidates: ...`)
-  in the scenario's workspace; check it with `??` / `?!` (735-736).
+  in the scenario's workspace; check it with `??` / `?!` (738-739).
 - **Isolation.** Each scenario gets its own temp data folder (real storage
   commits) and a temp saves folder; `!as restart` reloads everything from
   disk as a bot restart would.
@@ -244,7 +245,12 @@ Each of these was learned from a shipped bug.
   rules carry `"formula": "expression"|"program"`; a limit a server could
   raise high enough to stall the bot carries a ceiling (`"ceiling": True`,
   §3). Read it with the exact registry name (a typo'd `rules.get` returns the
-  default forever).
+  default forever). Schemas and defaults must be JSON (a system saves an
+  overridden rule's schema; an import-time check refuses a `set`).
+  Changing a rule mid-game must leave derived state consistent (switching
+  `persist_undo_history` off once lost every snapshot already on disk). A
+  rule that names a unit var goes in `logic.VAR_NAME_RULES` (§7.1; its value
+  is checked as one plain var name).
 - **A serialized Match field:** `to_dict` / `from_dict` with deep copies on
   BOTH sides; a runtime-only field goes in `action._rollback_match`'s preserve
   list (`_check_rollback_fields` raises if a field is neither); decide whether
@@ -267,7 +273,9 @@ Each of these was learned from a shipped bug.
   `normalize_body_source`.
 - **A query that names or lists units:** run it through the POV helpers
   (`_query_eid`, `_pov_hides`) so a fogged player can't probe hidden units;
-  re-run the POV leak detector (§5).
+  that includes ids inside arguments (`near:<eid>` matched the visible units
+  near a hidden one); re-run the POV leak detector and the existence-oracle
+  detector (§5).
 - **Anything iterating units and firing hooks:** re-check
   `eid in m.entities` after each hook (§5 "ghost firing").
 
@@ -343,7 +351,7 @@ back, load the schema with `ToolSearch` before calling
   (`AllowedMentions.none()`), splits long replies fence-aware, and retires a
   board whose channel was unbound.
 - **`test_sequences.txt`**: the scenarios (§2).
-- **`docs/audit_history.md`**: the narratives of audit passes 2-37 — what was
+- **`docs/audit_history.md`**: the narratives of audit passes 2-40 — what was
   swept, verified clean, measured. Read the relevant passes before auditing
   an area again.
 
@@ -447,7 +455,8 @@ plus `data/bot_settings.json` (owner limits + rule ceilings) and
   drops its state from memory after the commit (`release_state`) and reads
   `path` on first use. `MatchHistory.index()` / `from_index()` are the disk
   shape. `persist_undo_history` (rule, default on) = history files written;
-  off = memory only, files deleted.
+  off = memory only, files deleted (the commit that drops them first reads
+  each released snapshot's state back into memory).
 - **Limits** (`Storage._over_limit`): per server (default 1000 MB, the whole
   server folder) and global (20 GB, everything incl. trash), owner-set with
   `!owner limit`. A commit that GROWS past a limit first cuts the server's
@@ -716,6 +725,11 @@ descriptions (pass numbers point at `docs/audit_history.md`):
   pool run as a red-POV player; replies grepped for the hidden names, values
   and cells after stripping echoes of the typed args. Include list KINDS
   (`commands`, `turns`) in the pool.
+- **Existence-oracle detector** (41): the same board; each command run twice
+  as the player, once naming a hidden unit (as an arg, `near:<id>:60`,
+  `for=<id>`, `to=<id>`, `<id>.hp`) and once naming a nonexistent id; any
+  reply difference after swapping the names is an oracle (the grep detector
+  misses a reply that names no secret but behaves differently).
 - **Formula-function fuzzer** (30): every function × wrong-typed /
   missing-entity / wrong-arity args under a 1 s SIGALRM; flag raw Python
   messages after "Runtime error:".
@@ -755,6 +769,15 @@ descriptions (pass numbers point at `docs/audit_history.md`):
 - **The suite as a detector** (31): list every `❌` / `⚠️` reply and every
   "X → Y" figure in the Expected prose and check each against its scenario;
   scenarios that pass while testing nothing hide real bugs.
+- **Rule-change chaos** (40): the stateful chaos harness plus random
+  `!system set` of any rule to any valid value mid-game; disk == memory
+  checked after every step (caught persist_undo_history losing snapshots).
+- **Rule-value fuzzer** (40): every rule x each enum choice / bool / int
+  bound / formula / junk value, then a fixed suite touching every subsystem;
+  flag 💥 / Runtime and "saving to disk failed" printed to the console.
+- **Big-map timing** (40): per-command time after whole-map tiles, reveals
+  and explored fog on 500x500, and far-off coordinates (10⁹) in every
+  placement search.
 - `pyflakes` after edits to error paths (catches NameErrors in except clauses).
 
 ---
@@ -835,6 +858,26 @@ hardcodes**.
   the protected link fields `part_of` / `mounted_on` / `mount_slot`. Vital
   vars hp / max_hp / initiative (names from `hp_var` / `max_hp_var` /
   `turnorder_var`).
+- **Var-name rules** (`VAR_NAME_RULES`: hp / max_hp / turnorder / team /
+  part_name / footprint width + height / atb_charge / disguise /
+  fog_vision_radius / overlay `_var`; each value one plain var name, an
+  identifier that isn't a keyword, x / y / name or `__`-prefixed,
+  `check_var_name_rule`): each unit remembers the names it uses
+  (protected `Entity.var_names`, saved with it, its corpse and its
+  templates). `Match.sync_var_names` / `rename_unit_vars` move a unit's vars
+  to the names its match's rules give, all at once (no var hooks, clamps'
+  paths and bounds follow, a partial marker records the move), at
+  `Entity.spawn` (templates, summons, copies, revives from other names),
+  in `apply_statblock` (a form captured under other names) and wherever a
+  match's rules are rebuilt (`MatchManager.apply_system_rules`: a system
+  edit, load, undo / restore, store load; corpses too). A var already under
+  the new name follows `var_name_collision` (tracked default / existing /
+  refuse; refuse pre-checks every unit and corpse and changes nothing).
+  `!system set` of such a rule (`_rename_system_var`) also renames the
+  system's default_clamps / default_entity_vars and the engine formula
+  rules still in their default text (death_condition, the kill / revive
+  effects, atb_charge_formula; a GM's own formulas are left as written),
+  and refuses a name another var rule already uses (741-742).
 - **`Entity.write_var` / `remove_var`** are the only way to change vars:
   vital vars are coerced to finite whole numbers or refused, nothing nests
   under a vital, vitals can't be deleted (`allow_protected` only for the
@@ -868,7 +911,9 @@ hardcodes**.
   `var_move` (looting), `var_copy`, `var_sum_field`, `item_add` /
   `item_consume` (drops the container at 0; `amount_field` rule), `var_keys`,
   `var_sum`, `var_clear`, `get`, `keys` / `values` / `index_of` / `unique`
-  (547-548, 685-686). Authoring notes: in an item's action `source.<path>` is
+  (547-548, 685-686). keys / values / each / len / pick / shuffle /
+  roll_table skip a partial template's `__template` marker
+  (`formula._data_items`), as var_keys skips every `__` key. Authoring notes: in an item's action `source.<path>` is
   the ITEM's container and `entity[self]` the HOLDER; dict keys are unique, so
   identical items stack through an amount field; `!ent set_var hero
   inventory.potion 99` replaces the whole item dict.
@@ -878,9 +923,13 @@ hardcodes**.
   `summon_near(..., radius)` / `summon_from(path, ...)` turn an entity-shaped
   dict into a unit (id minted from its name, footprint placement, parts /
   segments keys, on_entity_spawned), bounded per command by
-  `summon_event_limit`; `entity_snapshot(eid)` and `!ent
-  store_entity_into_var` make such a dict; `remove_entity` despawns. Server
-  templates (§7.17) build on the same path.
+  `summon_event_limit` (free-cell searches walk only the on-map cells of
+  each Chebyshev ring, `_ring_radii` / `_ring_cells`); `entity_snapshot(eid)` and `!ent
+  store_entity_into_var` make such a dict (identity and links stripped:
+  id, x, y, `part_of`, `mounted_on`, `mount_slot`; a summon also drops
+  `__follows`, so a snapshot of a rider or a segment summons a free unit);
+  `remove_entity` despawns. Server templates (§7.17) build on the same
+  path.
 - **Occupancy:** one unit per cell, except units with the `__cell_stackable`
   var; `cell_entity` names the blocker, `entities_at` everyone covering a cell.
 - **Shields / temp hp:** named absorb pools under the roots in
@@ -938,9 +987,13 @@ hardcodes**.
   after it — set the opener last, user call).
 - **`!turn next`** (`Match.next_turn`): turn-end hooks / ticks → advance (round
   wrap fires round hooks, ticks, `round_start_message_format` line) → skip
-  units whose statuses carry `skips_turn` (each skip fires on_turn_skipped;
-  `_skip_to_eligible` tracks the ids it has seen, so removals mid-pass can't
-  over- or under-run it) → `_start_current_turn`. The reply prints hook
+  units whose statuses carry `skips_turn` (each skip fires on_turn_skipped
+  and the unit's turn_start / turn_end status ticks, as under ATB, so a stun
+  counting down on its own turns wears off; `_skip_to_eligible` tracks the
+  ids it has seen, so removals mid-pass can't over- or under-run it). When
+  every unit is skipped, whole rounds keep passing until one can act, up to
+  `skip_all_round_limit`, stopping early once a round changes no status
+  (permanent stuns) → `_start_current_turn`. The reply prints hook
   output first and "It is now X's turn" last; an unseen unit reads as "an
   unseen unit's turn".
 - **Removal and death mid-turn:** removing the current unit sets
@@ -979,8 +1032,12 @@ hardcodes**.
   in the GM's tick formula; the engine forces no decay (390-391).
 - **Applying** (`apply_status` / `status_apply` / `!status apply`): stacking
   from the definition's `stack`, else `status_default_stack` (refresh /
-  add_level / extend / replace / none). `max_level` is a hard ceiling
-  everywhere (`_cap_status_level`).
+  add_level / extend / replace / none). `max_level` is a hard ceiling on
+  every write of a level: applications (`_cap_status_level`), every status
+  change through `_emit_status_diff` (`_cap_live_status`: status_set,
+  counters, `!ent status set` report the stored value), statuses a spawn /
+  summon / transform brings (`_cap_unit_status_levels`); lowering it with
+  `!status maxlevel` lowers live instances as status changes (740).
 - **Prims:** `status_apply` / `status_force` / `status_get` / `status_set` /
   `status_has` / `status_tags` / `status_has_tag` / `statuses_with_tag` /
   `status_resist_of` / `is_status_immune` / counters / dispel / transfer.
@@ -1025,7 +1082,10 @@ hardcodes**.
   An unknown op folds as add and `!mod show` flags it.
 - Pure query: the engine never applies modifiers; the GM threads
   `apply_mods(...)` / `list_mods(...)` through their own formulas. `!mod show
-  <eid> <stat> [base] [tag ...]` (399-400, 406-408, 480).
+  <eid> <stat> [base] [tag ...]` (399-400, 406-408, 480) also lists records
+  left out for an unreadable condition / value / priority. A non-finite base
+  or folded result (stacked more% overflow) is refused with a warning naming
+  the records (user call).
 
 ### 7.6 Actions and choices
 
@@ -1034,7 +1094,12 @@ hardcodes**.
   corpse_list; `body` program). `discover_actions` walks containers
   (`action_container_mode` / `_paths`); mount slots add their own (§7.10).
   `!action <eid> <name> [target] [k=v ...] [answer=...]`, `use_action`,
-  `has_action`.
+  `has_action`. A list target lists each unit / cell / corpse once: a repeat
+  is merged with a ⚠️ (user call: to act on one twice, run the action
+  twice; `dedupe_targets`). A location target must be on the map and is a `Coord`
+  (`.x` / `.y`) that stores as [x, y]; `use_action` coerces its target to
+  the action's type the way `!action` parses it (`action.coerce_target`:
+  [x, y] → location, ids checked, lists non-empty).
 - **`run_action`** is transactional: pre-state captured, body run,
   `fail()` / an exception rolls the match back in place
   (`_rollback_match`: serialized state restored, runtime fields and undo
@@ -1046,7 +1111,8 @@ hardcodes**.
 - **Choices:** `choose(prompt, options)` / `choose_number(prompt, lo, hi)`
   replay the body: on an unanswered choice the attempt rolls back and re-runs
   with answers replayed in order (`answer=` tokens, else the surface's
-  `prompt_choice`; the harness must pre-supply). Per attempt the RNG, output
+  `prompt_choice`; the harness must pre-supply; answers the body never asks
+  for are named in a ⚠️, user call). Per attempt the RNG, output
   buffer and summon budget are reset, so side effects before a choice apply
   once. `cancel` aborts; `action_choice_limit` (394-395).
 - **Rider actions:** a rider gets its slot's actions plus the vehicle's
@@ -1070,9 +1136,13 @@ hardcodes**.
   matches removed, deleted ones restored, pointers and rules restored;
   bot-wide settings are not) (692-693). **`!run <file>`** reads a saves-folder
   file (admin). Both nest within `macro_recursion_limit`.
-- **Macros** (`!macro set/run/list/show/remove`): `$1..$N`, `$@`, `$#`
-  (single-pass substitution); control flow `if / elif / else / repeat / end`
-  with read-only conditions; `macro_repeat_limit`, `macro_step_limit` (counts
+- **Macros** (`!macro set/run/list/show/remove`): `$1..$N`, `$@`, `$#` (the
+  current `repeat` iteration) (single-pass substitution); a `$N` past the
+  args given becomes empty text, with no refusal (user call): an optional
+  arg is tested with `if "$3" != ""`, and a line that needed it fails after
+  the earlier lines ran; control flow `if / elif / else / repeat / end`
+  with read-only conditions (a negative `repeat` count is refused);
+  `macro_repeat_limit`, `macro_step_limit` (counts
   dispatches AND loop iterations), `macro_recursion_limit`; one undo step
   (425-426, 544-546, 555-556).
 - **`!foreach <selector> ; <cmd> [; <cmd> ...]`**: the `!find` selector
@@ -1083,7 +1153,8 @@ hardcodes**.
   self-dispatching commands and elevated args keep it gated). A non-host's
   sweep skips units their POV can't see (486-490, 557-558, 564-565).
 - **`!find`** selectors: `var<op>value`, `status:`, `group:`, `action:`,
-  `near:<eid>:<r>`, `within:<x>:<y>:<r>`, a leading `!` negates, `|`
+  `near:<eid>:<r>` (a unit the query POV can't see reads as missing),
+  `within:<x>:<y>:<r>`, a leading `!` negates, `|`
   alternatives (an alternative that doesn't parse reuses the previous kind and
   key); `show:<csv>` (incl. `status`), `sort:<var>[:desc]`, `count`, `ids`
   (536-538, 631, 694-695).
@@ -1210,7 +1281,10 @@ hardcodes**.
 - **Snake segments:** located parts with `__segment` + `__follows` (the one
   ahead); `snake_segments(head)`. Follow `segment_follow_mode` (trail /
   path + `segment_spacing`; head override `__segment_follow`); a teleport
-  re-lays the body (`_resettle_snake`); `segment_self_collision`.
+  re-lays the body (`_resettle_snake`: straight behind the head where the
+  cells are free and on the map, else bending toward the nearest free
+  cells, a ⚠️ for a segment with nowhere to go); `segment_self_collision`.
+  Segments go on the head only (a segment of a segment would branch).
   `segment_death_mode` (none default / solid / cascade / split, with
   `segment_split_head_template`) when a segment is destroyed;
   `segment_removal_mode` (close default / cascade / split / death) when a GM
@@ -1225,7 +1299,9 @@ hardcodes**.
   Moving the vehicle carries riders, nested (`_restamp_riders_for`); a
   driver's own move moves the rig. Hidden riders are off the ground,
   unrendered, unseen and grant no vision (`hidden_rider_grants_vision`).
-  `mount_on_host_death` (eject / kill / keep); a dead rider revives
+  `mount_on_host_death` (eject / kill / keep); dismount and eject take the
+  free cell nearest the vehicle's centre (rings outward, ties by y then x);
+  a dead rider revives
   unmounted; transform re-checks a mounted rider's slot (and a vehicle's
   riders) per `transform_rider_mismatch_mode`. Boarding legality is the GM's
   call through slot conditions — a built-in boarding range was REJECTED.
@@ -1289,7 +1365,9 @@ hardcodes**.
   `Match.explored`, `fog_memory_mode` full / terrain). `!reveal_fog <team>
   ...` adds reveals, optionally temporary (`turns=N`, keyed to whichever
   clock advances). Everything funnels through `_fog_team_sees`; renders
-  memoize it for one pass (`_vision_memo`).
+  memoize it for one pass (`_vision_memo`). Explored cells and reveals are
+  saved as row runs `[y, x_from, x_to]` (`_cells_to_runs`): a whole-map
+  reveal as one pair per cell cost every command ~0.6 s per save.
 - **Opacity / LOS:** `tile_opaque_condition` / `zone_opaque_condition` (`self`
   = viewer), per-cell `opaque` data; FAIL-TRANSPARENT. `has_los`,
   `raycast` (where a beam lands), `first_opaque` all walk ONE corner-aware
@@ -1380,8 +1458,13 @@ hardcodes**.
   session's commands (GUI: only on the input's first / last line, so they
   still move through a multi-line block; an unsent draft comes back past
   the newest), Ctrl+R reverse search (GUI: a bar above the input, Enter
-  takes the match for editing, Esc restores the draft), and in the GUI Esc
-  clears the input and Ctrl+L the log. History is per session (user call).
+  takes the match for editing, Esc restores the draft, clicking away takes
+  the match), and in the GUI Esc clears the input and Ctrl+L the log; the
+  first / last line is a screen ROW, so Up / Down still move through a long
+  wrapped line; keypad Enter runs like Enter. History is per session (user
+  call); the CLI keeps answers to choose() prompts out of it. Completion
+  under a team view offers only what that view's queries show: unit ids,
+  their teams, actions, statuses and mount slots of visible units.
   The CLI gets all of it from readline where the terminal has one.
   Sprites come from `sprites/` and per-server `data/<server>/sprites/`
   (server-side only — there is NO in-chat upload, deliberately).
@@ -1398,7 +1481,10 @@ hardcodes**.
   clone/fog/pause/resume/var/win/outcome/hosts`. `!match clone <new_id>`
   copies everything but bindings, cameras, pending requests and history; the
   cloner owns the copy, co-hosts and access overrides carry, and when a
-  co-host clones the original owner becomes a co-host. Ids follow `ID_RE`.
+  co-host clones the original owner becomes a co-host. Ids follow `ID_RE`;
+  an id that becomes a file or folder name (match, template, save, server
+  key) also passes `logic.is_file_id`, which refuses Windows device names
+  (`CON`, `NUL`, `COM1`, ...) the bot could not write on Windows.
 - **Systems and rules:** a `GameSystem` holds rule overrides, tile
   templates, functions, aliases, default vars / passives / clamps. A match
   copies its system's rules into `match.rules` at creation and on every
@@ -1416,7 +1502,8 @@ hardcodes**.
   templates over vars. Event log: `!log`, `event_log_*` rules, `log()`.
 - **Whole-server saves:** `!store save/load <name>` (admin, saves folder;
   load is all-or-nothing); `!history export/import` (a snapshot from another
-  match restores only the board).
+  match restores only the board: the match keeps its id, name, hosts and
+  system, and the units take its var names).
 - **Undo** (`match_history.py`): autosaves per round (`autosave_round_retention`),
   turn (`autosave_turn_retention_rounds`, under ATB `_turns`), command
   (`autosave_command_retention_turns` / `_max`), manual (`!history save`).
@@ -1433,8 +1520,9 @@ hardcodes**.
 - **Team data:** `!team set/get/add/list/clear/passive`, `team_get/set/add`;
   a `modifiers` bundle applies to every member.
 - **Dice and tables:** `roll("NdM±k")` with explode `!` and keep `kh<n>` /
-  `kl<n>`; `!roll`, `!roll odds` (exact distributions); `roll_table`,
-  `band`, named tables (`!table`, `table_roll`); `pick` / `shuffle`. All use
+  `kl<n>` (n ≥ 1); `!roll`, `!roll odds` (exact distributions); `roll_table`
+  (finite weights, keyed entries), `band` (ranges may be negative; an
+  unreadable or backwards band is refused), named tables (`!table`, `table_roll`); `pick` / `shuffle`. All use
   `Match.formula_rng()` (honours `random_seed`, replay-safe).
 - **Other:** `!help find <words>` (commands, subcommands and rules),
   `!whoami`, `!log` (event log rules), `!state`, `!list`, `!dist`, string
@@ -1446,11 +1534,15 @@ hardcodes**.
 - **What:** a server library (`MatchManager.templates`,
   `data/<server>/templates/<name>.json`) of units saved without identity
   (`Match.capture_template`): name, vars incl. current hp, statuses,
-  passives, clamps, facing, the part subtree. No id / x / y / links; part
+  passives, clamps, facing, the part subtree, the var names it was saved
+  with (`var_names`: a spawn under other names renames). No id / x / y / links; part
   ids, `part_of` and `__follows` relative to `TEMPLATE_ROOT` (`@root_head`);
   part positions and snake trail vars as anchor offsets. `check_template`
   validates every write and load (vitals, reserved names, facing, status
-  numbers, part links); a summon-style `{role: part}` dict is accepted.
+  numbers, part links, passives with a hook `when` and a `formula`, clamps;
+  a passive's id / a clamp's path default to its key); a summon-style
+  `{role: part}` dict is accepted, each a direct part named
+  `<unit>_<role>` at its x / y offset like a listed one.
 - **Name = id prefix** (user call, "for now"): template `guardsman` spawns
   `guardsman`, `guardsman2`, ... with parts `guardsman2_head`.
 - **Spawn** (`Match.spawn_template`): summon_entity, saved facing restored,
@@ -1469,11 +1561,24 @@ hardcodes**.
   at start even with match persistence off. Every replace or delete keeps the
   old version in `templates/.trash/` for 24 h, counted toward the server
   limit and cut first when room is needed (`write_template` makes room
-  BEFORE moving anything). `!server wipe all` trashes templates.
+  BEFORE moving anything; a forced partial rename / delete that rewrites
+  several dependents reserves room for all of them first,
+  `_reserve_template_room`, so it is refused whole or done whole).
+  `!server wipe all` trashes templates.
 - **Raw JSON tail:** `split_command_line` / `split_command_args` keep
   `template import <name> <rest>` whole (```json fence or single quotes
-  dropped) on every surface; a multi-line import is one command on Discord
-  and in the GUI.
+  dropped) on every surface; a multi-line import is one command on Discord,
+  in the GUI (non-`!` lines after a `!template import` line join it, blank
+  lines skipped) and in the CLI (`_read_continuation`: `...` lines until
+  the JSON's brackets or ``` fence close, or a blank line; recalled as one
+  history line).
+  The same splitter runs on every line inside `!batch` / `!foreach` (cut at
+  a standalone `;` outside quotes, `_split_semicolons`), macro run lines,
+  action `cmd()` and alias expansions, so an import's JSON survives them; a
+  `!run` file continues an import over the next lines while its JSON is open
+  (`import_unfinished`, shared with the CLI). Discord groups a message's
+  lines like the GUI (`discord_commands._command_lines`), so an import
+  anywhere in a pasted batch keeps its JSON lines.
 - **Formulas:** `summon_template` / `summon_template_near` (mutating),
   `has_template` / `template_names` (read-only), via `CURRENT_WORKSPACE`
   (718-726).
@@ -1553,7 +1658,9 @@ same library and namespace as entity templates: `{"kind": "partial",
   `partial_data` pins a partial on its first use while the rule is on;
   off = pins kept, unused. `!match templates [refresh [name]]` lists them
   (with whether the library differs) or drops them; a save in a pinning
-  match notes refs whose library copy differs.
+  match notes refs whose library copy differs, and writes a container whose
+  partial is only pinned (gone from the library) in full, with a ⚠️
+  (`_SAVING_TO_LIBRARY`: the library can't hold a reference to it).
 
 ---
 
@@ -1586,6 +1693,13 @@ rejected already. Update this section in the PR that resolves an item.
   on the nearest free cell with a ⚠️. Whether spawns should recreate the
   overlap is open.
 
+- **Large match state, per-command cost** (user: discuss later): after a
+  whole-map tile fill on 500x500 every command costs ~3.5 s (three full
+  serializations per command; numbers under "Undo history disk growth"
+  below). Options raised: a cap on what a match can hold, cheaper undo
+  snapshots (diffs / copy-on-write, reusing the post-command state for the
+  commit), or leaving it deferred.
+
 ### Deferred (the user wants these tracked)
 
 - **Per-server CPU work budget** (revisit before any public rollout): the
@@ -1596,7 +1710,11 @@ rejected already. Update this section in the PR that resolves an item.
   careful decisions about compromises and abuse.
 - **Undo history disk growth:** every snapshot is a full match state; if
   history becomes the bulk of a server's disk use, revisit retention defaults
-  or a diff-based snapshot format.
+  or a diff-based snapshot format. Measured (pass 40): after a whole-map
+  `!tile fill` on 500x500 every command costs ~3.5 s (the match is
+  serialized three times per command: undo pre / post state and the
+  commit); `cell_occupant` scans every unit per cell, so cell searches cost
+  cells x units.
 - **Combat layers:** armor (coverage %, directional, damage-type AR vs ARP),
   the to-hit roll (accuracy / evasion / suppression, separate from
   hit_location), AP / FP / ARC action economy and REACTIONS (block / dodge /

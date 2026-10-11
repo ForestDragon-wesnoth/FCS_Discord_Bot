@@ -15,7 +15,7 @@ from logic import (
 )
 
 # Passive system
-from logic import Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS
+from logic import VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES
 
 # Clamp system
 from logic import ClampSpec
@@ -350,7 +350,7 @@ class CommandRegistry:
                 m = self._help.get(root, {})
                 usage = m.get("usage") or f"!{root}"
                 desc = m.get("desc") or ""
-                lines.append(f"`{usage}` — {desc}".rstrip())
+                lines.append(f"`{usage}`" + (f" — {desc}" if desc else ""))
             return ("Help", "\n".join(lines))
         root = path[0]
         if root not in self._handlers:
@@ -367,7 +367,8 @@ class CommandRegistry:
             if subs:
                 lines.append("\n**Subcommands**")
                 for s, sm in sorted(subs.items()):
-                    lines.append(f"- `{sm['usage']}` — {sm.get('desc','')}".rstrip())
+                    sd = sm.get("desc") or ""
+                    lines.append(f"- `{sm['usage']}`" + (f" — {sd}" if sd else ""))
             return (f"Help: {root}", "\n".join(lines))
         # Subcommand
         sub = path[1]
@@ -377,6 +378,10 @@ class CommandRegistry:
         lines = [f"**!{root} {sub}**", f"Usage: `{sm['usage']}`"]
         if sm.get("desc"):
             lines.append(sm["desc"])
+        elif meta.get("desc"):
+            # Subcommands registered with a usage only are described in
+            # their command's text.
+            lines.append(f"From `!help {root}`: {meta['desc']}")
         return (f"Help: {root} {sub}", "\n".join(lines))
 
     def _unknown_command_message(self, name: str, mgr: MatchManager,
@@ -401,8 +406,9 @@ class CommandRegistry:
     def _resolve_alias(self, name: str, args: List[str],
                        mgr: MatchManager, ctx: ReplyContext) -> Tuple[str, List[str]]:
         """One-shot alias expansion. Returns (name, args) — unchanged if
-        no alias applies. Tokenized via shlex so a multi-word expansion
-        like `dmg -> "ent hp this"` produces real argv tokens. We
+        no alias applies. Tokenized like a typed line (split_command_line:
+        shlex, keeping a `template import`'s JSON whole) so a multi-word
+        expansion like `dmg -> "ent hp this"` produces real argv tokens. We
         deliberately do NOT re-resolve recursively (that would let
         aliases loop) — the alias's first token must already be a real
         registered command, which is enforced at alias-def time."""
@@ -412,9 +418,8 @@ class CommandRegistry:
         expansion = mgr.matches[mid].aliases.get(name)
         if not expansion:
             return name, args
-        import shlex as _shlex
         try:
-            tokens = _shlex.split(expansion)
+            tokens = split_command_line(expansion)
         except ValueError:
             tokens = expansion.split()
         if not tokens:
@@ -2122,7 +2127,7 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 )
             want = _truthy(args[2].lower())
             if want is None:
-                return await ctx.send("Usage: `!match fog memory on|off`.")
+                return await ctx.send("❌ Usage: `!match fog memory on|off`.")
             m.fog_memory = want
             if want:
                 # Seed explored from every present team's current vision so
@@ -2147,7 +2152,7 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             )
         want = _truthy(args[1].lower())
         if want is None:
-            return await ctx.send("Usage: `!match fog on|off` or `!match fog memory on|off`.")
+            return await ctx.send("❌ Usage: `!match fog on|off` or `!match fog memory on|off`.")
         m.fog_enabled = want
         return await ctx.send(
             f"Fog of war **{'on' if m.fog_enabled else 'off'}** for "
@@ -2568,7 +2573,7 @@ def _mention(user_id: Optional[str]) -> str:
 # ---- as (CLI identity switch for previewing host vs player) -----
 @registry.command(
     "as", access="all",
-    usage="!as <host|player|owner> [<name>] | !as view <team|omniscient|clear> | !as server [<key>|local] | !as restart",
+    usage="!as host | !as owner | !as player [<name>] | !as view <team|omniscient|clear> | !as server [<key>|local] | !as restart | !as <identity>",
     desc=(
         "Switch your previewing identity OR point-of-view. CLI-only "
         "(on Discord both come from your account / the channel, so this "
@@ -2624,9 +2629,10 @@ async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 "❌ This surface has a single workspace; `!as server` works "
                 "in the CLI and the scenario harness.")
         key = args[1] if len(args) >= 2 else LOCAL_WORKSPACE
-        if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", key):
+        if not valid_id(key):
             return await ctx.send(
-                "❌ A server key is letters, digits, `_` or `-` (up to 40).")
+                "❌ A server key is letters, digits, `_` or `-` (up to 40), "
+                "and not a Windows device name (it names a folder).")
         ctx.guild_key = key
         if key == LOCAL_WORKSPACE:
             return await ctx.send("Back in the local workspace.")
@@ -3091,11 +3097,59 @@ _RAW_JSON_TAIL = re.compile(r"^\s*(import)\s+(\S+)\s+(.+?)\s*$",
                             re.IGNORECASE | re.DOTALL)
 
 
+def _split_semicolons(text: str) -> List[str]:
+    """`text` cut at every `;` standing as a word of its own outside quotes
+    (the separator `!batch` / `!foreach` use), as raw text pieces."""
+    pieces: List[str] = []
+    cur: List[str] = []
+    quote = None
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            cur.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                cur.append(text[i + 1])
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+            cur.append(ch)
+        elif (ch == ";" and (i == 0 or text[i - 1].isspace())
+              and (i + 1 == n or text[i + 1].isspace())):
+            pieces.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    pieces.append("".join(cur))
+    return pieces
+
+
 def split_command_args(root: str, tail: str) -> List[str]:
     """A command's arguments from the text after its root word: shlex, except
     that `!template import <name> <json>` keeps the JSON as one argument (a
-    surrounding ```json fence or single quotes are dropped)."""
-    if root.strip().lower() == "template":
+    surrounding ```json fence or single quotes are dropped) — also as a
+    command inside `!batch` / `!foreach`, whose `;`-separated commands are
+    each split like a typed line."""
+    low = root.strip().lower()
+    if low in ("batch", "foreach") and re.search(r"(?:^|\s);(?:\s|$)", tail):
+        out: List[str] = []
+        for i, piece in enumerate(_split_semicolons(tail)):
+            if i:
+                out.append(";")
+            piece = piece.strip()
+            if i == 0 and low == "foreach":
+                out += shlex.split(piece)
+                continue
+            if i == 0 and low == "batch" and re.match(r"strict(\s|$)", piece):
+                out.append("strict")
+                piece = piece[6:].strip()
+            if piece:
+                out += split_command_line(piece.lstrip("!"))
+        return out
+    if low == "template":
         m = _RAW_JSON_TAIL.match(tail)
         if m:
             raw = m.group(3)
@@ -3106,6 +3160,38 @@ def split_command_args(root: str, tail: str) -> List[str]:
                 raw = raw[1:-1]
             return [m.group(1), m.group(2).strip("'\""), raw]
     return shlex.split(tail)
+
+
+_IMPORT_HEAD = re.compile(r"!?\s*template\s+import\s+\S+\s*(.*)\Z",
+                          re.I | re.S)
+
+
+def import_unfinished(line: str) -> bool:
+    """Whether `line` is a `template import` whose JSON is still open (a `{`
+    / `[` not yet closed outside strings, or a ``` fence not yet closed):
+    its pasted JSON continues on the next lines (the CLI, `!run` files)."""
+    m = _IMPORT_HEAD.match(line.strip())
+    if not m:
+        return False
+    tail = m.group(1)
+    if tail.count("```") % 2:
+        return True
+    depth, in_str, esc = 0, False, False
+    for ch in tail:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+    return depth > 0
 
 
 def split_command_line(line: str) -> List[str]:
@@ -3223,6 +3309,19 @@ def _check_expansion(ctx: ReplyContext, mgr: MatchManager, name: str,
         else:
             mgr.templates[name] = old
         invalidate_partial_cache()
+
+
+def _reserve_template_room(mgr: MatchManager,
+                           datas: List[Dict[str, Any]]) -> None:
+    """Make room (or refuse, changing nothing) for writing all of `datas`
+    as templates whose old versions are kept: a multi-template change
+    checks the limit once, up front, so it can't stop halfway."""
+    st = storage_of(mgr)
+    if st is None or not datas:
+        return
+    total = sum(len((json.dumps(d, indent=2, sort_keys=True) + "\n")
+                    .encode("utf-8")) + 256 for d in datas)
+    st._room_for_template(mgr.guild_key, total)
 
 
 def _template_dependents(mgr: MatchManager, name: str) -> List[str]:
@@ -3696,6 +3795,9 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         for n in [new_name] + deps + [n for n in after
                                       if new_name in template_refs_of(after[n])]:
             check_template_refs(n, after[n], after)
+        # Room for every rewritten dependent first: a write refused halfway
+        # would leave templates naming a partial that has already moved.
+        _reserve_template_room(mgr, [after[d] for d in deps])
         notes = []
         st = storage_of(mgr)
         if old is not None:
@@ -3767,6 +3869,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return resolver.template_file_form(live)
         for d in deps:
             inlined[d] = _rewrite_template_refs(mgr.templates[d], inline)
+        _reserve_template_room(mgr, list(inlined.values()))
         st = storage_of(mgr)
         kept = st is not None and st.trash_template(mgr, name)
         del mgr.templates[name]
@@ -4290,6 +4393,103 @@ registry.annotate_sub(
 
 # ---- system (gamesystem commands)-----
 
+def _rename_system_var(mgr: MatchManager, s: Any, name: str, key: str,
+                       value: Any) -> Optional[str]:
+    """Before `!system set <name> <key>` renames a unit var (VAR_NAME_RULES):
+    refuse when var_name_collision is refuse and a unit or corpse of a match
+    on the system has a var in the way; move the system's own references
+    (default_clamps paths / bounds, default_entity_vars keys) to the new
+    name. Returns a summary line of the units the refresh will move."""
+    if key not in VAR_NAME_RULES:
+        return None
+    old, new = str(s.get(key) or ""), str(value or "")
+    if not old or not new or old == new:
+        return None
+    taken = [k for k in VAR_NAME_RULES if k != key and str(s.get(k) or "") == new]
+    if taken:
+        raise VTTError(
+            f"`{new}` is already the var of `{taken[0]}` on `{name}`: two "
+            f"rules can't share a var (to swap two names, go through a third "
+            f"one).")
+    matches = [m for m in mgr.matches.values() if m.system_name == name]
+    if str(s.get("var_name_collision")) == "refuse":
+        conflicts: List[str] = []
+        for m in matches:
+            trial = dict(m.rules)
+            trial[key] = new
+            conflicts += [f"{m.id}: {c}" for c in m.var_name_conflicts(trial)]
+        if conflicts:
+            raise VTTError(
+                f"`{key}` stays `{old}`: " + " ".join(conflicts[:5])
+                + (f" (and {len(conflicts) - 5} more)"
+                   if len(conflicts) > 5 else ""))
+    clamps = s.get("default_clamps")
+    if isinstance(clamps, list):
+        out = []
+        for c in clamps:
+            c = dict(c) if isinstance(c, dict) else c
+            if isinstance(c, dict):
+                for f in ("path", "max", "min"):
+                    if c.get(f) == old:
+                        c[f] = new
+            out.append(c)
+        s.set("default_clamps", out)
+    dv = s.get("default_entity_vars")
+    if isinstance(dv, dict) and old in dv:
+        dv = dict(dv)
+        dv[new] = dv.pop(old)
+        s.set("default_entity_vars", dv)
+    # The engine's own formula rules (death_condition, the kill / revive
+    # effects, atb_charge_formula) name vars in their text: one still
+    # holding the engine's text follows the rename; one the GM wrote stays.
+    rewritten = []
+    for rk, reg in RULES_REGISTRY.items():
+        if not (reg.get("schema") or {}).get("formula"):
+            continue
+        cur = s.get(rk)
+        if (isinstance(cur, str) and cur
+                and cur == _engine_formula_text(s, rk)):
+            text = _engine_formula_text(s, rk, {key: new})
+            if text != cur:
+                s.set(rk, text)
+                rewritten.append(rk)
+    keep_existing = str(s.get("var_name_collision")) == "existing"
+    n = sum(1 for m in matches for e in m.entities.values()
+            if (e.var_names.get(key) or old) == old and _rel_has(e.vars, old)
+            and not (keep_existing and _rel_has(e.vars, new)))
+    bits = []
+    if n:
+        bits.append(f"moved `{old}` → `{new}` on {n} unit(s)")
+    bits.append("the system's default clamps and default vars follow")
+    if rewritten:
+        bits.append("so do " + ", ".join(f"`{r}`" for r in rewritten))
+    return ("Units keep this var as `" + new + "` now: " + "; ".join(bits)
+            + f". Formulas you wrote that name `{old}` are left as written.")
+
+
+def _engine_formula_text(s: Any, rule: str,
+                         override: Optional[Dict[str, str]] = None) -> str:
+    """The engine's default text of formula rule `rule` with each var it
+    names (`entity[...].hp`) spelled the way system `s` names it now (or as
+    `override` says)."""
+    text = str(RULES_REGISTRY[rule]["default"] or "")
+    for k in VAR_NAME_RULES:
+        dn = str(DEFAULT_SYSTEM_SETTINGS.get(k) or "")
+        cn = str((override or {}).get(k) or s.get(k) or dn)
+        if dn and cn != dn:
+            text = re.sub(r"(?<=\])\." + re.escape(dn) + r"\b", "." + cn,
+                          text)
+    return text
+
+
+def _rel_has(d: Any, path: str) -> bool:
+    for k in path.split("."):
+        if not isinstance(d, dict) or k not in d:
+            return False
+        d = d[k]
+    return True
+
+
 #TODO: add "delete" command for gamesystems (but TEST IT VERY CAREFULLY, like making sure there is always at least one gamesystem per server that's defaulted to, etc.)
 @registry.command("system", usage="!system <subcommand> ...", desc="Manage this server's GameSystems and defaults (server/channel). Every server has its own systems, starting with its own `default`.")
 async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -4406,11 +4606,15 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     
         s = mgr.get_system(name)
         warn = _check_formula_rule(mgr, s, key, value)
+        moved_line = _rename_system_var(mgr, s, name, key, value)
         s.set(key, value)
-        refreshed = mgr.refresh_match_rules(name)
+        notes: List[str] = []
+        refreshed = mgr.refresh_match_rules(name, notes)
         suffix = f" (refreshed {refreshed} live match{'es' if refreshed != 1 else ''})" if refreshed else ""
-        return await ctx.send(f"`{name}`.{key} = {value!r}{suffix}"
-                              + (f"\n{warn}" if warn else ""))
+        return await ctx.send("\n".join(
+            [f"`{name}`.{key} = {value!r}{suffix}"]
+            + ([warn] if warn else []) + ([moved_line] if moved_line else [])
+            + [f"⚠️ {n}" for n in notes]))
 
     # ---- system access <system> <set|clear|list> ---------------------
     # Dedicated editor for the command_access RULE on a GameSystem. This
@@ -4568,9 +4772,8 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     f"❌ invalid alias name `{aname}`: names must be a "
                     f"single whitespace-free token."
                 )
-            import shlex as _shlex
             try:
-                tokens = _shlex.split(expansion)
+                tokens = split_command_line(expansion)
             except ValueError as ex:
                 return await ctx.send(f"❌ invalid alias expansion: {ex}")
             if not tokens:
@@ -5188,7 +5391,12 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 cur[parts_path[-1]] = value
                 after = copy.deepcopy(e.status[name])
                 event_log = m._emit_status_diff(eid, name, before, after)
-                msg = f"Set `{eid}.{name}.{path}` = {value!r}."
+                # What is stored (a level is held to max_level).
+                stored = cur.get(parts_path[-1], value) \
+                    if eid in m.entities else value
+                msg = f"Set `{eid}.{name}.{path}` = {stored!r}."
+                if stored != value:
+                    msg += f" (capped by `{name}`'s max_level)"
                 if event_log:
                     msg += "\n" + "\n".join(event_log)
                 return await ctx.send(msg)
@@ -7153,7 +7361,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 "Grid border overrides cleared (back to the border_* rules).")
         if op == "color":
             if len(args) < 3:
-                return await ctx.send("Usage: `!map border color <name|hex>`.")
+                return await ctx.send("❌ Usage: `!map border color <name|hex>`.")
             col = args[2]
             m.border_color = col
             note = "" if col.lower() in TEXT_COLORS or col.startswith("#") \
@@ -7162,7 +7370,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(f"Grid border color set to `{col}`.{note}")
         if op == "opacity":
             if len(args) < 3:
-                return await ctx.send("Usage: `!map border opacity <0-100>`.")
+                return await ctx.send("❌ Usage: `!map border opacity <0-100>`.")
             try:
                 val = max(0, min(100, int(args[2])))
             except ValueError:
@@ -7184,7 +7392,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"graphics surface; text surfaces fall back to ASCII).")
         mode = args[1].lower()
         if mode not in ("text", "image"):
-            return await ctx.send("Usage: `!map mode text|image`.")
+            return await ctx.send("❌ Usage: `!map mode text|image`.")
         m.render_mode = mode
         extra = ("" if mode == "text" else
                  " — a plain `!map` and the auto-update board now post a "
@@ -7292,7 +7500,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return None
     if args and args[0].lower() == "color":
         if len(args) < 2 or args[1].lower() not in ("on", "off"):
-            return await ctx.send("Usage: `!map color on|off`.")
+            return await ctx.send("❌ Usage: `!map color on|off`.")
         m.color_enabled = (args[1].lower() == "on")
         return await ctx.send(
             f"Colorized rendering {'ON' if m.color_enabled else 'OFF'} for "
@@ -7312,12 +7520,12 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send("\n".join(lines))
         if op == "clear":
             if len(args) < 3:
-                return await ctx.send("Usage: `!map teamcolor clear <team>`.")
+                return await ctx.send("❌ Usage: `!map teamcolor clear <team>`.")
             m.team_colors.pop(args[2], None)
             return await ctx.send(f"Cleared team color for `{args[2]}`.")
         # set: !map teamcolor <team> <color>
         if len(args) < 3:
-            return await ctx.send("Usage: `!map teamcolor <team> <color>`.")
+            return await ctx.send("❌ Usage: `!map teamcolor <team> <color>`.")
         team, color = args[1], args[2].lower()
         if color not in TEXT_COLORS:
             return await ctx.send(f"❌ unknown color `{color}`. {_color_guide()}")
@@ -7355,7 +7563,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # ---- !map layer <name> on|off | !map layer list ----
     if args and args[0].lower() == "layer":
         if len(args) < 2:
-            return await ctx.send("Usage: `!map layer <zones|tiles|entities|fog> on|off` or `!map layer list`.")
+            return await ctx.send("❌ Usage: `!map layer <zones|tiles|entities|fog> on|off` or `!map layer list`.")
         if args[1].lower() == "list":
             shown = [L for L in _MAP_LAYERS if L not in m.hidden_layers]
             hid = sorted(m.hidden_layers)
@@ -7367,7 +7575,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(
                 f"❌ unknown layer `{name}`. Layers: {', '.join(_MAP_LAYERS)}.")
         if len(args) < 3 or args[2].lower() not in ("on", "off"):
-            return await ctx.send(f"Usage: `!map layer {name} on|off`.")
+            return await ctx.send(f"❌ Usage: `!map layer {name} on|off`.")
         if args[2].lower() == "off":
             m.hidden_layers.add(name)
         else:
@@ -7422,7 +7630,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"({m.rules.get('viewport_width')}×"
                 f"{m.rules.get('viewport_height')}); nothing to pan.")
         if len(args) < 2:
-            return await ctx.send("Usage: `!map pan <up|down|left|right> [n]`.")
+            return await ctx.send("❌ Usage: `!map pan <up|down|left|right> [n]`.")
         canon = normalize_direction(args[1])
         if canon is None or canon not in DIRECTION_VECTORS:
             return await ctx.send(f"❌ `{args[1]}` is not a direction.")
@@ -7450,10 +7658,10 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             try:
                 cx, cy = int(args[1]), int(args[2])
             except ValueError:
-                return await ctx.send("Usage: `!map center <eid>` or `!map center <x> <y>`.")
+                return await ctx.send("❌ Usage: `!map center <eid>` or `!map center <x> <y>`.")
             m.center_view(ctx.channel_key, cx, cy)
         else:
-            return await ctx.send("Usage: `!map center <eid>` or `!map center <x> <y>`.")
+            return await ctx.send("❌ Usage: `!map center <eid>` or `!map center <x> <y>`.")
         return await ctx.send(_map_render_reply(ctx, m, []))
     if args and args[0].lower() == "view":
         if len(args) >= 2 and args[1].lower() in ("reset", "clear"):
@@ -7463,10 +7671,10 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             try:
                 vx, vy = int(args[1]), int(args[2])
             except ValueError:
-                return await ctx.send("Usage: `!map view <x> <y>` | `!map view reset`.")
+                return await ctx.send("❌ Usage: `!map view <x> <y>` | `!map view reset`.")
             m.set_view(ctx.channel_key, vx, vy)
             return await ctx.send(_map_render_reply(ctx, m, []))
-        return await ctx.send("Usage: `!map view <x> <y>` (top-left) | `!map view reset`.")
+        return await ctx.send("❌ Usage: `!map view <x> <y>` (top-left) | `!map view reset`.")
     # One-off `hide=zones,fog` arg: suppress extra layers for this render
     # only (union with the persistent hidden set), without mutating state.
     # `full` is honored only as args[0] (the host-gated position) via
@@ -7606,7 +7814,10 @@ def _parse_find_predicate(token: str) -> Tuple[str, str, Optional[str]]:
     for op in _FIND_OPS:
         idx = token.find(op)
         if idx > 0:  # key must be non-empty
-            return op, token[:idx], token[idx + len(op):]
+            rhs = token[idx + len(op):]
+            if not rhs and op not in ("=", "!="):
+                raise VTTError(f"`{token}` needs a value after `{op}`.")
+            return op, token[:idx], rhs
     raise VTTError(
         f"Unrecognized find predicate `{token}`. Expected `key=value`, "
         f"`key<value`, `status:NAME`, `group:NAME`, `action:NAME`, "
@@ -7768,8 +7979,12 @@ def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Option
             radius = _coerce_for_compare(val)
             if isinstance(radius, bool) or not isinstance(radius, (int, float)):
                 raise VTTError(f"`near:` radius must be a number, got `{val}`.")
+            if radius < 0:
+                raise VTTError(f"`near:` radius can't be negative, got `{val}`.")
             ref = m.entities.get(_resolve_eid(m, key))
-            if ref is None:
+            # A reference the query's POV can't see reads as missing:
+            # matching against it located a hidden unit by its radius.
+            if ref is None or _pov_hides(m, pov, ref.id):
                 raise VTTError(f"`near:` reference entity `{key}` not found.")
             if m.entity_gap_distance(ref, e) > radius:
                 return False
@@ -7780,6 +7995,8 @@ def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Option
             radius = _coerce_for_compare(val)
             if isinstance(radius, bool) or not isinstance(radius, (int, float)):
                 raise VTTError(f"`within:` radius must be a number, got `{val}`.")
+            if radius < 0:
+                raise VTTError(f"`within:` radius can't be negative, got `{val}`.")
             sx, sy = key.split(":")
             try:
                 cx, cy = int(sx), int(sy)
@@ -8433,10 +8650,13 @@ def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot,
     # A snapshot `!history import`ed from ANOTHER match restores that board
     # here, but the match stays itself: its id (the key everything files
     # under — two matches reporting one id sent this match's approval
-    # requests to the other), its name, and who runs it.
+    # requests to the other), its name, who runs it, and its game system
+    # (no command moves a match to another system; the board's units take
+    # this system's var names below).
     if new_match.id != old.id:
         new_match.id = old.id
         new_match.name = old.name
+        new_match.system_name = old.system_name
         new_match.owner = old.owner
         new_match.cohosts = copy.deepcopy(old.cohosts)
         new_match.access_overrides = copy.deepcopy(old.access_overrides)
@@ -8447,7 +8667,9 @@ def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot,
     # match on the old rules while the system keeps the new ones, until a
     # reload re-copied them.
     if new_match.system_name in mgr.systems:
-        new_match.rules = mgr._build_rules_dict(mgr.systems[new_match.system_name])
+        rename_notes = mgr.apply_system_rules(new_match)
+        if notes is not None:
+            notes.extend(rename_notes)
     # Channel bindings are serialized, but the channels' active pointers
     # (MatchManager.active_by_channel) are not — so a restore that simply
     # took the snapshot's bindings would leave a channel bound SINCE the
@@ -8645,7 +8867,7 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     lines.append(f"- `{name}`: {s.short_summary()}  [{s.timestamp}]")
                 return await ctx.send("\n".join(lines))
             return await ctx.send(
-                f"Unknown list kind '{kind}'. Use one of: rounds, turns, commands, manual."
+                f"❌ Unknown list kind '{kind}'. Use one of: rounds, turns, commands, manual."
             )
         # Summary
         lines = [f"**Match `{mid}` history:**"]
@@ -8676,10 +8898,12 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 2, "history", "save"):
             return
         name = args[1]
+        replaced = name in m.history.manual_saves
         s = m.history.save_manual(m, name)
         return await ctx.send(
             f"Saved manual `{name}` (round {s.round_at_snapshot}, "
-            f"seq {s.sequence})."
+            f"seq {s.sequence})"
+            + (f", replacing the old `{name}`." if replaced else ".")
         )
 
     if sub == "delete":
@@ -8895,7 +9119,12 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         full, path = saves_path(args[1], mgr)
         override_name = None
-        if len(args) >= 4 and args[2].lower() == "as":
+        if len(args) > 2 and not (len(args) == 4 and args[2].lower() == "as"):
+            # A word other than `as <name>` used to be ignored.
+            return await ctx.send(
+                f"❌ Unexpected `{' '.join(args[2:])}` — usage: "
+                f"`!history import <path> [as <name>]`.")
+        if len(args) == 4:
             override_name = args[3]
         try:
             with open(full, "r", encoding="utf-8") as f:
@@ -8969,7 +9198,14 @@ async def _undo_preview(ctx, m: Match, snap: Snapshot, what: str):
             "(pov_filters_queries).")
     from types import SimpleNamespace
     now = SimpleNamespace(state=m.to_dict(include_history=False))
-    lines = _format_snapshot_diff(now, snap, "now", what)
+    # The restore moves the snapshot's units to the var names the rules give
+    # now (apply_system_rules), so the preview compares against that.
+    after = Match.from_dict(copy.deepcopy(snap.state))
+    after.rules = dict(m.rules)
+    after.sync_all_var_names()
+    lines = _format_snapshot_diff(
+        now, SimpleNamespace(state=after.to_dict(include_history=False)),
+        "now", what)
     lines[0] = (f"🔍 **Undo preview** — `{what}` would make these changes "
                 f"(nothing restored yet):")
     later = sum(1 for x in (m.history.round_saves + m.history.turn_saves
@@ -9401,9 +9637,7 @@ async def undo_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 SAVES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saves")
 
 
-_WINDOWS_DEVICE_NAMES = frozenset(
-    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
-    + [f"COM{i}" for i in range(1, 10)] + [f"LPT{i}" for i in range(1, 10)])
+_WINDOWS_DEVICE_NAMES = WINDOWS_DEVICE_NAMES
 
 
 def _write_save_file(mgr: MatchManager, full: str, shown: str,
@@ -9515,12 +9749,13 @@ async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         path, shown = saves_path(args[1], mgr)
         try:
-            mgr.load(path)
+            notes = mgr.load(path)
         except VTTError as ex:
             # MatchManager.load names the absolute path it failed on; report
             # the saves-relative name instead so no host path leaks.
             raise VTTError(str(ex).replace(path, shown))
-        return await ctx.send(f"Loaded from `{shown}`")
+        return await ctx.send(f"Loaded from `{shown}`"
+                              + "".join(f"\n⚠️ {n}" for n in notes))
     # Fallback: show authoritative help
     return await _help_fallback(ctx, ["store"], args[0] if args else None)
 #annonate subcommands next to the command itself:
@@ -12224,7 +12459,9 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         except ValueError:
             return await ctx.send("❌ maxlevel must be an integer (0 = uncapped).")
         m.status_definitions[name]["max_level"] = max(0, n)
-        return await ctx.send(f"`{name}` max_level = {max(0, n)}.")
+        log = m.recap_status(name)
+        return await ctx.send("\n".join([f"`{name}` max_level = {max(0, n)}."]
+                                         + log))
 
     if sub == "data":
         if await return_help_if_not_enough_args(ctx, args, 4, "status", "data"):
@@ -12697,7 +12934,8 @@ async def mod_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 except ValueError:
                     pass
             tags.append(tok)
-        mods = m.gather_modifiers(eid, stat, tags, {})
+        problems: List[str] = []
+        mods = m.gather_modifiers(eid, stat, tags, {}, problems)
         tagstr = f" [{', '.join(tags)}]" if tags else ""
         lines = [f"Modifiers on `{eid}` for `{stat}`{tagstr}:"]
         if not mods:
@@ -12711,14 +12949,19 @@ async def mod_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             lines.append(
                 f"  {md['op']} {md['value']:g} (pri {md['priority']:g}){tg}{ntg}{src}{bad}")
         if base is not None:
-            result = m.apply_modifiers(eid, stat, base, tags, {})
-            lines.append(f"  → base {base:g} becomes {result:g}")
+            try:
+                result = m.apply_modifiers(eid, stat, base, tags, {})
+                lines.append(f"  → base {base:g} becomes {result:g}")
+            except VTTError as ex:
+                lines.append(str(ex))
         unknown = m.unknown_modifier_ops(mods)
         if unknown:
             lines.append(
                 "⚠️ unrecognized op(s) " + ", ".join(f"`{o}`" for o in unknown)
                 + " — folded as a lenient add. Valid ops: "
                 + ", ".join(MODIFIER_OPS) + ".")
+        if problems:
+            lines.append("⚠️ left out: " + "; ".join(problems))
         return await ctx.send("\n".join(lines))
 
     return await _help_fallback(ctx, ["mod"], args[0] if args else None)
@@ -13070,9 +13313,8 @@ async def alias_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # command. We deliberately don't accept other aliases as the
         # target — resolution is one-shot, so a chained alias would just
         # fail at dispatch with a confusing "Unknown command" error.
-        import shlex as _shlex
         try:
-            tokens = _shlex.split(expansion)
+            tokens = split_command_line(expansion)
         except ValueError as ex:
             return await ctx.send(f"❌ invalid alias expansion: {ex}")
         if not tokens:
@@ -13241,7 +13483,7 @@ def _restore_all_matches(mgr: MatchManager, snap: Dict[str, Any]) -> None:
         # Rules are a copy of the match's system, which isn't rolled back
         # (as in an undo, see _restore_snapshot).
         if m.system_name in mgr.systems:
-            m.rules = mgr._build_rules_dict(mgr.systems[m.system_name])
+            mgr.apply_system_rules(m)
     mgr.active_by_channel.clear()
     mgr.active_by_channel.update(snap["active"])
 
@@ -13336,12 +13578,20 @@ async def run_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # Build subcommand argv lists. Each non-blank, non-comment line is
     # one subcommand. Leading `!` is optional — both forms are common in
     # human-written script files.
-    import shlex as _shlex
     subcommands: List[List[str]] = []
+    lines: List[str] = []
     for ln in raw.splitlines():
         stripped = ln.strip()
+        if lines and import_unfinished(lines[-1]):
+            # A `template import`'s JSON spans lines until it closes.
+            if stripped:
+                lines[-1] += "\n" + stripped
+            continue
         if not stripped or stripped.startswith("#"):
             continue
+        lines.append(stripped)
+    for stripped in lines:
+        ln = stripped
         if stripped.startswith("!"):
             stripped = stripped[1:]
         try:
@@ -13521,7 +13771,7 @@ async def _exec_macro(nodes, ctx, mgr, mac_args, loop_idx, name, budget):
             if line.startswith("!"):
                 line = line[1:]
             try:
-                toks = _shlex.split(line)
+                toks = split_command_line(line)
             except ValueError as ex:
                 await ctx.send(f"❌ macro `{name}`: parse error in `{line[:50]}`: {ex}")
                 continue
@@ -13563,6 +13813,12 @@ async def _exec_macro(nodes, ctx, mgr, mac_args, loop_idx, name, budget):
                 await ctx.send(f"❌ macro `{name}`: bad `repeat` count "
                                f"`{csrc[:50]}`: {ex}")
                 continue
+            if count < 0:
+                # A negative count used to run the block zero times silently.
+                await ctx.send(f"❌ macro `{name}`: `repeat` count "
+                               f"`{csrc[:50]}` is {count}; it can't be "
+                               f"negative.")
+                continue
             cap = int(m.rules.get("macro_repeat_limit", 1000))
             if count > cap:
                 await ctx.send(f"⚠️ macro `{name}`: repeat {count} clamped to "
@@ -13601,7 +13857,9 @@ for _subs, _usage in (
     desc=(
         "Reusable named command sequences (a step up from !batch/!run). "
         "`set <name> <commands>` stores a macro — commands separated by `\\n`; "
-        "lines may use $1/$2/... and $@ for run-time args. CONTROL FLOW: a "
+        "lines may use $1/$2/... and $@ for run-time args (a `$N` past the "
+        "args given becomes empty text; test an optional one with "
+        "`if \"$3\" != \"\"`). CONTROL FLOW: a "
         "line `if <formula>` / `elif <formula>` / `else` / `end` branches on a "
         "READ-ONLY formula (truthy = run the block); `repeat <count>` / `end` "
         "loops a block `count` times (count is a read-only formula too), with "
@@ -13821,14 +14079,26 @@ async def watch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"or nothing.")
         once = len(args) >= 5
         try:
-            validate_program(cond, known_funcs=frozenset(m.formula_functions.keys()))
-            validate_program(effect, known_funcs=frozenset(m.formula_functions.keys()))
+            # The condition is evaluated as an expression (fire_watchers):
+            # one validated as a program (`x = 1`) used to be accepted and
+            # then read as not met forever.
+            known = frozenset(m.formula_functions.keys())
+            try:
+                validate_formula(cond, mode="eval", known_funcs=known)
+            except FormulaError:
+                validate_program(cond, known_funcs=known)
+                return await ctx.send(
+                    "❌ A watcher condition is an expression (true or false): "
+                    "it can't assign or hold statements — put those in the "
+                    "effect.")
+            validate_program(effect, known_funcs=known)
         except FormulaError as ex:
             return await ctx.send(f"❌ invalid watcher formula: {ex}")
+        verb = "Replaced" if name in m.watchers else "Added"
         m.watchers[name] = {"condition": cond, "effect": effect,
                             "once": once, "last": False}
         return await ctx.send(
-            f"Added watcher `{name}`{' (once)' if once else ''}. Fires when "
+            f"{verb} watcher `{name}`{' (once)' if once else ''}. Fires when "
             f"the condition becomes true.")
 
     if sub == "list":
@@ -13887,6 +14157,8 @@ async def emit_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(f"**{title}**\n{body}")
     m = active_match(mgr, ctx)
     name = args[0]
+    if not name.strip():
+        return await ctx.send("❌ An event needs a name.")
     target = None
     payload: Dict[str, Any] = {}
     for tok in args[1:]:
@@ -14048,7 +14320,7 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             for pid, p in bucket.items():
                 lines.append(f"  `{pid}` ({p.when}): `{p.formula}`")
             return await ctx.send("\n".join(lines))
-        return await ctx.send("Usage: `!team passive <add|remove|list> ...`")
+        return await ctx.send("❌ Usage: `!team passive <add|remove|list> ...`")
 
     return await _help_fallback(ctx, ["team"], args[0] if args else None)
 
@@ -14268,10 +14540,18 @@ async def mount_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                              else "(unseen)" for e in occ) or "(none)"))
         riders = [e for e in m.vehicle_riders(vid)
                   if not _pov_hides(m, pov, e.id)]
+        # A rider's own line says what it rides (it used to read as a unit
+        # with no slots and no riders, as if unmounted).
+        unit = m.entities[vid]
+        rides = ""
+        if unit.mounted_on:
+            on = ("an unseen unit" if _pov_hides(m, pov, unit.mounted_on)
+                  else f"`{unit.mounted_on}`")
+            rides = f"; rides {on} in slot `{unit.mount_slot}`"
         return await ctx.send(
             f"`{vid}` slots: " + (", ".join(f"`{s}`" for s in slots) or "(none)")
             + "; riders: " + (", ".join(f"`{e.id}`({e.mount_slot})"
-                                        for e in riders) or "(none)"))
+                                        for e in riders) or "(none)") + rides)
 
     if sub in ("dismount", "off"):
         if await return_help_if_not_enough_args(ctx, args, 2, "mount", "dismount"):
@@ -14579,6 +14859,11 @@ async def _run_action_dispatch(
         args_dict = parse_args_tokens(remaining)
     except VTTError as ex:
         return await ctx.send(f"❌ action `{action.name}`: {ex}")
+    from action import dedupe_targets
+    target_value, dup_note = dedupe_targets(action.target_type, target_value,
+                                            action.name)
+    if dup_note:
+        await ctx.send(dup_note)
     # The use_action formula primitive needs ctx/mgr to find a
     # dispatcher; stash them on the match as transient runtime
     # attributes for the duration of this dispatch chain. They're
@@ -14724,6 +15009,22 @@ assert not _unregistered_ro, (
 # Usage strings the stray-word check reads (see _stray_words_error) for
 # subcommands registered without one, and for the alias spellings each
 # handler accepts (`del` / `rm` for `remove`, ...).
+_SUB_DESCS = {
+    ("ent", "copy"): (
+        "Copy a unit, with its whole body-part subtree, into another match "
+        "of this server (you need host of both); the original stays. It "
+        "lands on its own cell unless x y say otherwise; ids taken there "
+        "get a suffix, mount links are dropped, and the destination's var "
+        "names apply. All-or-nothing."),
+    ("ent", "transfer"): (
+        "Like `!ent copy`, but the unit LEAVES this match (removed, not "
+        "killed): it moves to the other match with its parts."),
+    ("match", "win"): (
+        "Declare the match's winner (a team or unit name) with an optional "
+        "reason, or `clear` the outcome. Fires the `match_outcome` event "
+        "(winner / reason / round)."),
+    ("match", "outcome"): "Show the declared winner and reason, if any.",
+}
 for _root, _sub, _usage in (
         ("ent", "copy", "!ent copy <id> <dest_match> [x y]"),
         ("ent", "transfer", "!ent transfer <id> <dest_match> [x y]"),
@@ -14734,7 +15035,8 @@ for _root, _sub, _usage in (
         ("zone", "anchor", "!zone anchor <name> <eid> [radius] [metric]"),
         ("zone", "unanchor", "!zone unanchor <name>"),
         ("zone", "sprite", "!zone sprite <name> <key|clear>")):
-    registry.annotate_sub(_root, _sub, usage=_usage)
+    registry.annotate_sub(_root, _sub, usage=_usage,
+                          desc=_SUB_DESCS.get((_root, _sub)))
 # Alias spellings each handler accepts for a subcommand; the stray-word
 # check reads the canonical subcommand's usage for them.
 _SUB_ALIASES: Dict[Tuple[str, str], str] = {}

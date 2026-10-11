@@ -466,10 +466,18 @@ def _random_string(*choices: Any) -> str:
     return _random_string_impl(random, choices)
 
 
+def _data_items(d: dict) -> list:
+    """A dict's (key, value) pairs minus a partial template's marker
+    (`__template`, engine bookkeeping on a container built from a partial):
+    what keys / values / each / len / pick / roll_table see, so a loop over
+    such an inventory meets only its items."""
+    return [(k, v) for k, v in d.items() if k != TEMPLATE_MARKER]
+
+
 def _pick_source(v: Any, fname: str) -> list:
     """The items pick/shuffle draw from: a list's items or a dict's keys."""
     if isinstance(v, dict):
-        return list(v.keys())
+        return [k for k, _ in _data_items(v)]
     if isinstance(v, (list, tuple)):
         return list(v)
     raise FormulaError(
@@ -571,6 +579,10 @@ def roll_detail(rng, spec: Any) -> "Tuple[int, list]":
                     f"roll(spec): die sides {sides} out of range "
                     f"(1..{_ROLL_MAX_SIDES}) in '{spec}'."
                 )
+            if keep_n is not None and keep_n < 1:
+                raise FormulaError(
+                    f"roll(spec): keeping {keep_n} dice keeps nothing in "
+                    f"'{term}' (kh / kl need at least 1).")
             dice = []
             for _ in range(count):
                 v = rng.randint(1, sides)
@@ -677,6 +689,10 @@ def dice_distribution(spec: Any) -> "Tuple[Dict[int, Any], Any, bool]":
         keep_mode, keep_n = dm.group(5), dm.group(6)
         if not 1 <= count <= _ROLL_MAX_DICE or not 1 <= sides <= _ROLL_MAX_SIDES:
             raise FormulaError(f"die count or sides out of range in '{term}'.")
+        if keep_n is not None and int(keep_n) < 1:
+            raise FormulaError(
+                f"keeping {keep_n} dice keeps nothing in '{term}' (kh / kl "
+                f"need at least 1).")
         if keep_mode is not None:
             if explode:
                 raise FormulaError(
@@ -740,13 +756,19 @@ def roll_table_pick(rng, spec: Any) -> str:
                 raise FormulaError(
                     f"roll_table(...): weight for '{key}' must be a number.")
         w = float(x)
+        if not math.isfinite(w):
+            raise FormulaError(
+                f"roll_table(...): weight for '{key}' must be a finite "
+                f"number.")
         if w < 0:
             raise FormulaError(
                 f"roll_table(...): weight for '{key}' must be >= 0.")
+        if not key:
+            raise FormulaError("roll_table(...): an entry has no key.")
         return w
     pairs = []
     if isinstance(spec, dict):
-        for k, w in spec.items():
+        for k, w in _data_items(spec):
             pairs.append((str(k), _w(w, str(k))))
     elif isinstance(spec, str):
         for part in spec.split(","):
@@ -764,6 +786,10 @@ def roll_table_pick(rng, spec: Any) -> str:
             "dict {key: weight}.")
     pairs = [(k, w) for k, w in pairs if w > 0]
     total = sum(w for _, w in pairs)
+    if not math.isfinite(total):
+        raise FormulaError(
+            "roll_table(spec): the weights add up past what a number can "
+            "hold.")
     if not pairs or total <= 0:
         raise FormulaError(
             "roll_table(spec): needs at least one entry with positive weight.")
@@ -1289,6 +1315,28 @@ def _clamp(v: Any, lo: Any, hi: Any) -> Any:
     return v
 
 
+_BAND_NUM = r"-?\d+(?:\.\d+)?"
+
+
+def _band_range(rng: str) -> Tuple[Optional[float], Optional[float]]:
+    """A band's range as (lo, hi), None for an open end; (None, None) when
+    it doesn't parse. `lo-hi` takes negative ends (`-5--1`, `-5-0`); a
+    leading `-` alone is `-hi` (up to hi)."""
+    m = re.fullmatch(f"({_BAND_NUM})-({_BAND_NUM})", rng)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+    m = re.fullmatch(f"({_BAND_NUM})([+-])", rng)
+    if m:
+        return float(m.group(1)), None
+    m = re.fullmatch(f"-({_BAND_NUM})", rng)
+    if m:
+        return None, float(m.group(1))
+    m = re.fullmatch(_BAND_NUM, rng)
+    if m:
+        return float(rng), float(rng)
+    return None, None
+
+
 def _band(value: Any, spec: Any, default: Any = None) -> Any:
     """band(value, spec, default=None): look `value` up in a banded table and
     return the matching band's result (FIRST match wins). `spec` is a comma-
@@ -1301,24 +1349,25 @@ def _band(value: Any, spec: Any, default: Any = None) -> Any:
         raise FormulaError("band(value, ...): value must be a number.")
     if not isinstance(spec, str):
         raise FormulaError("band(value, spec, ...): spec must be a string.")
+    bands: List[Tuple[Optional[float], Optional[float], str]] = []
     for entry in spec.split(","):
         entry = entry.strip()
-        if not entry or ":" not in entry:
+        if not entry:
             continue
-        rng, _, res = entry.partition(":")
-        rng = rng.strip()
-        try:
-            if rng.endswith("+") or rng.endswith("-"):
-                lo, hi = float(rng[:-1]), None
-            elif rng.startswith("-"):
-                lo, hi = None, float(rng[1:])
-            elif "-" in rng:
-                a, b = rng.split("-", 1)
-                lo, hi = float(a), float(b)
-            else:
-                lo = hi = float(rng)
-        except ValueError:
-            continue          # malformed entry -> skip it
+        rng, colon, res = entry.partition(":")
+        lo, hi = _band_range(rng.strip()) if colon else (None, None)
+        if not colon or (lo, hi) == (None, None):
+            # A typo'd entry used to be skipped, so a later band or the
+            # default answered instead (and `-5-0` couldn't be written).
+            raise FormulaError(
+                f"band(value, spec): can't read the band `{entry}` — use "
+                f"lo-hi, n, lo+, lo- or -hi, then :result.")
+        if lo is not None and hi is not None and lo > hi:
+            raise FormulaError(
+                f"band(value, spec): the band `{rng.strip()}` runs "
+                f"backwards (write it low-high).")
+        bands.append((lo, hi, res))
+    for lo, hi, res in bands:
         if (lo is None or value >= lo) and (hi is None or value <= hi):
             res = res.strip()
             try:
@@ -1355,7 +1404,9 @@ def _len(v: Any) -> int:
     Until formula for-loops land, this is the main way to consume the
     list/coordinate-list return values. Raises FormulaError on a value
     that has no length (e.g. a number)."""
-    if isinstance(v, (list, tuple, str, dict)):
+    if isinstance(v, dict):
+        return len(_data_items(v))
+    if isinstance(v, (list, tuple, str)):
         return len(v)
     raise FormulaError(
         f"len(value): value has no length (got {type(v).__name__}); "
@@ -1833,7 +1884,7 @@ def _each(v: Any, *, limit: int = _DEFAULT_SIZE_LIMIT) -> list:
     `for item in each(entity[self].queue):`. A number or string is an
     error (use range(n) to count, len() for a string's length)."""
     if isinstance(v, dict):
-        out = list(v.keys())
+        out = [k for k, _ in _data_items(v)]
     elif isinstance(v, (list, tuple)):
         out = list(v)
     else:
@@ -1969,12 +2020,12 @@ def _dict_arg(v: Any, fname: str) -> dict:
 def _keys(v: Any) -> list:
     """keys(dict): a dict's keys, in insertion order (each() over a dict
     gives the same list)."""
-    return list(_dict_arg(v, "keys").keys())
+    return [k for k, _ in _data_items(_dict_arg(v, "keys"))]
 
 
 def _values(v: Any) -> list:
     """values(dict): a dict's values, in the same order as keys()."""
-    return list(_dict_arg(v, "values").values())
+    return [x for _, x in _data_items(_dict_arg(v, "values"))]
 
 
 def _index_of(v: Any, value: Any) -> Any:
@@ -4784,7 +4835,12 @@ class FormulaEngine:
             after = copy.deepcopy(e.status[name])
             match._emit_status_diff(eid, name, before, after)
             self._note_affected(eid)
-            return value
+            # What is stored (a level is held to the definition's max_level).
+            inst = e.status.get(name) if eid in match.entities else None
+            node: Any = inst
+            for k in keys:
+                node = node.get(k) if isinstance(node, dict) else None
+            return node if node is not None else value
 
         def _status_del(eid_t: Any, name: Any, path: Any) -> bool:
             eid = _eid(eid_t)
@@ -5023,8 +5079,7 @@ class FormulaEngine:
             if new <= 0:
                 _status_remove(eid_t, name)
                 return new
-            _status_set(eid_t, name, field, new)
-            return new
+            return _status_set(eid_t, name, field, new)
 
         def _status_counter_add(eid_t: Any, name: Any, delta: Any,
                                 field: Any = "duration") -> Any:
@@ -5810,6 +5865,16 @@ class FormulaEngine:
                     "Call use_action from inside !action / !ent / a "
                     "passive that fires during command processing."
                 )
+            from action import coerce_target, dedupe_targets
+            try:
+                target_arg = coerce_target(action.target_type, target_arg,
+                                           match, name)
+            except VTTError as ex:
+                raise FormulaError(f"use_action: {ex}")
+            target_arg, dup_note = dedupe_targets(action.target_type,
+                                                  target_arg, name)
+            if dup_note:
+                match.surface_log([dup_note])
             coro = run_action(
                 action, actor_id=eid, target=target_arg,
                 args=args_dict, match=match, mgr=mgr_local,
@@ -6974,9 +7039,14 @@ class FormulaEngine:
                 raise FormulaError("apply_mods(...): stat must be a non-empty string.")
             if isinstance(base, bool) or not isinstance(base, (int, float)):
                 raise FormulaError("apply_mods(...): base must be a number.")
-            return match.apply_modifiers(
-                eid, stat, base, _norm_mod_tags(tags, "apply_mods"),
-                _mod_context(target, attacker, defender, other))
+            try:
+                return match.apply_modifiers(
+                    eid, stat, base, _norm_mod_tags(tags, "apply_mods"),
+                    _mod_context(target, attacker, defender, other))
+            except FormulaError:
+                raise
+            except VTTError as ex:
+                raise FormulaError(f"apply_mods(...): {ex}")
         ns["apply_mods"] = _apply_mods
 
         def _list_mods(entity_token: Any, stat: Any, tags: Any = None,

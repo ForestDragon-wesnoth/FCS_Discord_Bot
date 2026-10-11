@@ -5,7 +5,7 @@ import asyncio, os, sys
 from typing import List
 from logic import LOCAL_WORKSPACE
 from storage import open_workspaces, load_local_settings, local_persistence_note
-from vtt_commands import registry, split_command_line
+from vtt_commands import registry, split_command_line, import_unfinished
 
 
 def _enable_terminal_color() -> bool:
@@ -85,6 +85,7 @@ class CLICtx:
             line = input("  > ").strip()
         except (EOFError, KeyboardInterrupt):
             return None
+        _forget_lines(1)        # an answer isn't a command to recall
         if not line:
             return None
         # Allow picking an option by its 1-based number, too.
@@ -136,6 +137,45 @@ def _install_readline(workspaces, ctx) -> bool:
     return True
 
 
+def _forget_lines(n: int) -> None:
+    """Drop the last n lines input() added to readline's history."""
+    try:
+        import readline
+    except ImportError:
+        return
+    for _ in range(n):
+        size = readline.get_current_history_length()
+        if size <= 0:
+            return
+        readline.remove_history_item(size - 1)
+
+
+def _read_continuation(line: str) -> str:
+    """A `!template import` line plus the lines of its pasted JSON (prompt
+    `...`), up to where the JSON closes, a blank line or end of input. The
+    block is one command and one history entry."""
+    extra = 0
+    while import_unfinished(line):
+        try:
+            more = input("... ")
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not more.strip():
+            break
+        extra += 1
+        line += "\n" + more
+    if extra:
+        _forget_lines(extra + 1)
+        try:
+            import readline
+            readline.add_history(line if "```" in line
+                                 else " ".join(x.strip()
+                                               for x in line.splitlines()))
+        except ImportError:
+            pass
+    return line
+
+
 def parse(line: str):
     try:
         return split_command_line(line)
@@ -183,6 +223,7 @@ async def main():
             break
 
         if line.startswith("!"):
+            line = _read_continuation(line)
             try:
                 parts = parse(line[1:])
             except RuntimeError as e:

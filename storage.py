@@ -51,7 +51,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from logic import (GameSystem, ID_RE, Match, MatchManager,
+from logic import (GameSystem, is_file_id, Match, MatchManager,
                    RULE_CEILINGS, VTTError, Workspaces, check_template,
                    check_template_name)
 from match_history import MatchHistory
@@ -64,7 +64,7 @@ TRASH_DIR = ".trash"
 SETTINGS_FILE = "bot_settings.json"
 
 def valid_id(name: Any) -> bool:
-    return isinstance(name, str) and bool(ID_RE.fullmatch(name))
+    return is_file_id(name)
 
 
 def _dump(obj: Any) -> str:
@@ -549,7 +549,8 @@ class Storage:
             raise ValueError("id doesn't match the file name")
         if m.system_name not in mgr.systems:
             m.system_name = mgr.default_system_name
-        m.rules = mgr._build_rules_dict(mgr.systems[m.system_name])
+        for note in mgr.apply_system_rules(m):
+            print(f"[storage] {mgr.guild_key}/{m.id}: {note}")
         return m
 
     def _load_history(self, mgr: MatchManager, m: Match) -> Optional[str]:
@@ -659,7 +660,16 @@ class Storage:
                     after["index"][mid] = itext
                 after["seqs"][mid] = seqs
             elif mid in w["index"]:
-                # persist_undo_history was switched off: drop the files.
+                # persist_undo_history was switched off: drop the files, after
+                # reading back the states they hold (a persisted snapshot
+                # keeps only its path in memory).
+                for s in h.all_snapshots():
+                    if s.path is not None:
+                        try:
+                            s.state
+                        except Exception:
+                            pass        # unreadable: it stays unusable
+                        s.path = None
                 plan[os.path.join(sdir, "matches", mid)] = None
                 after["index"].pop(mid, None)
                 after["seqs"].pop(mid, None)
@@ -802,7 +812,7 @@ class Storage:
             elif _dump(_disk_state(m.to_dict(include_history=False))) != text:
                 _rollback_match(m, mgr, state)
             if m.system_name in mgr.systems:
-                m.rules = mgr._build_rules_dict(mgr.systems[m.system_name])
+                mgr.apply_system_rules(m)
             itext = w["index"].get(mid)
             if itext is not None:
                 m.history = MatchHistory.from_index(

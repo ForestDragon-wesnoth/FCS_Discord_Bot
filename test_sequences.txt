@@ -13785,7 +13785,7 @@ SCENARIO 534 — Render mode toggle: text vs image (graphics surface gating)
 !map mode text
 !map mode bogus
 
-Expected: `!map mode` shows the current per-match render mode (default `text`).
+Expected: HARNESS-ALLOWS-ERRORS. `!map mode` shows the current per-match render mode (default `text`).
 `!map mode image` sets it (host-gated, serialized via Match.render_mode). On a
 graphics-capable surface (Discord with Pillow) a plain `!map` then posts a
 rendered PNG instead of the ASCII block, and `!map autoupdate` makes a self-
@@ -13938,6 +13938,12 @@ SCENARIO 540 — Fog reveal: !reveal_fog (clairvoyance + temporary + clear)
 !reveal_fog red rect 3 3 4 4
 !reveal_fog red clear
 !reveal_fog red all turns=1
+!reveal_fog red rect 2 2 5 3
+!match fog memory on
+!as restart
+!match use rv
+!reveal_fog list
+?? `red`: 108 cell(s) [through round 2, permanent]
 
 Expected: `!reveal_fog <team> ...` forces cells visible to a team independent of
 unit vision (a scout/clairvoyance reveal) — a revealed cell shows terrain AND
@@ -13947,6 +13953,9 @@ reveal TEMPORARY (expires after N rounds via round_number); omitting it is
 permanent. With fog ON, after `reveal_fog red at 8 8 1` the red team can see
 cell (8,8) and the blue entity there though no red unit is near. `list` shows
 active reveals; `clear` drops them. Reveals are per-team, serialized, host-gated.
+A restart keeps both reveals (the whole map until round 2, and the 4x2 rect
+for good: 100 + 8 cells); reveals and fog memory are saved as row runs, so
+a whole-map reveal no longer costs every later command ~0.6 s per save.
 
 SCENARIO 541 — Inline $() args: read-only math/dice/reads across commands
 --------------------------------------------------------------------------------
@@ -19207,6 +19216,20 @@ SCENARIO 698 — Each server has its own workspace: systems, matches and saves s
 !as server local
 !match
 ?? No matches
+!as server 111 extra
+?? Unexpected `extra`
+!as host extra
+?? Unexpected `extra`
+!system set default spawn_face_toward_center false
+!system set default spawn_default_facing left
+?! Saving to disk failed
+!as restart
+!system info default
+?? `spawn_default_facing` = 'left'
+!match new face Face 6 6
+!match use face
+!ent add s S 5 3 3
+!assert "facing_of('s') == 'left'"
 
 Expected: HARNESS-ALLOWS-ERRORS. Each `!as server <key>` moves the harness
 into that server's workspace. Server 111 turns fog on by default in its own
@@ -19215,7 +19238,11 @@ system still has fog off, `!match use camp` finds nothing, the id `camp` is
 free to reuse for a different 6×6 match, `hero` doesn't exist, and loading
 `shared` fails with "File not found" because each server reads its own saves
 folder. Back in server 111 the 10×10 camp with its hero is untouched and the
-save loads. The local workspace has no matches.
+save loads. The local workspace has no matches. `!as` refuses a word past
+its form (`!as host extra` used to switch and ignore it). Setting
+spawn_default_facing is saved and survives a restart: its rule schema held
+its choices as a set, which made every save of the server fail after the
+rule was set.
 
 SCENARIO 699 — !system default is per server or per channel; !match list is open to players
 --------------------------------------------------------------------------------------------
@@ -19438,12 +19465,29 @@ SCENARIO 705 — persist_undo_history off keeps the history in memory only
 !undo command 1
 ?? Undid 1 command(s)
 !assert "entity[a].hp == 8"
+!ent hp a 6
+!ent hp a 5
+!system set default persist_undo_history false
+!ent hp a 4
+?! Saving to disk failed
+!undo command 3
+?? Undid 3 command(s)
+!assert "entity[a].hp == 8"
+!system set default persist_undo_history true
+!ent hp a 3
+?! Saving to disk failed
+!as restart
+!assert "entity[a].hp == 3"
 
 Expected: HARNESS-ALLOWS-ERRORS. With persist_undo_history off the undo
 history lives in memory only: the two command autosaves are listed, but
 after a restart they're gone and `!undo command 1` has nothing to undo. Back
 on, the next command's autosave is written to disk and undo works after the
-next restart (hp 7 back to 8).
+next restart (hp 7 back to 8). Switching the rule off mid-game (no
+restart) keeps the snapshots already written: their states are read back
+before the files go, so `!undo command 3` still reaches hp 8, and saving
+works on (it used to fail on every command after, "Snapshot N couldn't be
+read from disk"), through switching the rule back on and a restart.
 
 SCENARIO 706 — Storage limits: old autosaves are cut first, then the command is undone
 ----------------------------------------------------------------------------------------
@@ -20542,6 +20586,14 @@ SCENARIO 730 — Partial templates: pinning keeps a match on the versions it use
 ?? template_pinning is off: these pins are kept but unused
 !match templates refresh nothing
 ?? This match has no pin of `nothing`
+!system set default template_pinning true
+!template import rope {"kind": "partial", "data": {"len": 5}}
+!template give rope a rope
+!template delete rope
+!template save a a_rope
+?? `rope` can't be used (it is no longer in this server's library, only pinned in this match)
+!template show a_rope vars.rope compact
+?? {"len":5}
 
 Expected: HARNESS-ALLOWS-ERRORS. With template_pinning on, a match pins
 each partial on its first use: after `a` gets the axe, a library edit to
@@ -20553,7 +20605,10 @@ and the reply says the library moved on. Pins are match state: the clone
 give pins (and uses) the library's damage 9; undoing two commands brings the
 old pin back. The clone still has its own pin. With the rule off, the match
 reads the library directly (damage 9) and keeps its pins unused; refreshing
-a name that isn't pinned is refused.
+a name that isn't pinned is refused. A partial deleted from the library but
+still pinned here (`rope`) is written out in full when the unit is saved,
+with a ⚠️ note: the library can't hold a reference to it (the save used to
+be refused).
 
 SCENARIO 731 — Partial templates on body parts, looting and formula writes
 ---------------------------------------------------------------------------
@@ -20770,7 +20825,141 @@ later put there). The saved
 `golem2` spawns with the arm still on the front region, the eye on its own
 cell at the same offset, the empty pack, and the default armor.
 
-SCENARIO 735 — Tab completion: commands, subcommands, literal words and options
+SCENARIO 735 — Templates: file-safe names, multi-template changes all or nothing, JSON inside batch
+-----------------------------------------------------------------------------------------------------
+
+!match new con Arena 8 8
+?? reserved device name on Windows
+!match new t735 Arena 10 8
+!match use t735
+!ent add hero Hero 10 2 2 3
+!template save hero nul
+?? reserved device name on Windows
+!template save hero COM3
+?? reserved device name on Windows
+!as server lpt1
+?? not a Windows device name
+!template import axe {"kind": "partial", "data": {"dmg": 6}}
+!template import guard {"name": "Guard", "vars": {"hp": 3, "a": {"__template": "axe"}}}
+!owner limit local 0.001
+!template rename axe hatchet force
+?? storage limit is reached
+!template delete axe force
+?? storage limit is reached
+!assert "has_template('axe') and not has_template('hatchet') and has_template('guard')"
+!template show guard vars.a compact
+?? {"__template":"axe"}
+!owner limit local reset
+!template rename axe hatchet force
+!template show guard vars.a compact
+?? {"__template":"hatchet"}
+!batch template import gem {"kind":"partial","data":{"note":"cut ; polished"}} ; template give gem hero bag.gem
+!assert "entity[hero].bag.gem.note == 'cut ; polished'"
+!macro set mkpart "template import ring {\"kind\":\"partial\",\"data\":{\"bonus\":$1}}"
+!macro run mkpart 4
+!assert "has_template('ring')"
+!template show ring compact
+?? {"data":{"bonus":4},"kind":"partial"}
+!alias def mkgem 'template import gem {"kind":"partial","data":{"cut":"rose ; star"}}'
+!mkgem
+!template show gem compact
+?? {"data":{"cut":"rose ; star"},"kind":"partial"}
+
+Expected: HARNESS-ALLOWS-ERRORS. Match ids, template names and server keys
+become file and folder names, so Windows device names (CON, NUL, COM3,
+LPT1 ...; the bot may run on Windows, where `con.json` is the console) are
+refused for all of them. With the server's storage limit at 1 KB, a forced
+rename or delete of a referenced partial is refused before anything moves:
+`axe` keeps its name and `guard` still references it (before this, the
+partial moved and the dependent rewrites then failed, leaving `guard`
+naming a partial that no longer existed). With the limit back, the rename
+updates `guard`. A `!template import` inside `!batch` keeps its JSON
+whole, including a ` ; ` inside a string, and so does one in a macro body
+written with `\"` and one an alias expands to (`!mkgem`; the alias used to
+lose the JSON's quotes).
+
+SCENARIO 736 — Snapshots and summons don't carry links to other units
+-----------------------------------------------------------------------
+
+!match new t736 Road 12 10
+!match use t736
+!ent add cart Cart 20 3 3 1
+!ent set_var cart slots.seat.capacity 1
+!ent add rider Rider 10 6 6 3
+!mount rider cart seat
+!ent store_entity_into_var rider rider form
+!assert "not var_has('rider', 'form.mounted_on') and not var_has('rider', 'form.mount_slot')"
+!eval --as rider "summon_from('form', 8, 8)"
+!assert "slot_riders('cart', 'seat') == ['rider'] and entity[rider2].x == 8"
+!ent add w Worm 20 6 2 3
+!part segment w w_s1 S 3 3
+!eval "var_set('w', 'snap', entity_snapshot('w_s1'))"
+!eval --as w "summon_from('snap', 2, 8)"
+!assert "part_of('s') == '' and not var_has('s', '__follows')"
+!ent move w 1 right
+!assert "entity[s].x == 2 and entity[s].y == 8"
+
+Expected: HARNESS-ALLOWS-ERRORS. `!ent store_entity_into_var` and
+entity_snapshot used to keep the unit's links to other units: a summon
+from a mounted rider's snapshot created a second rider of the cart's
+one-person seat, standing at (8,8) away from the cart. Snapshots now drop
+part and mount links, and a summon strips them (and a segment's
+`__follows`) from any dict it is given: `rider2` is a free unit, the
+snapshot of a worm segment summons as a plain unit that doesn't follow the
+worm.
+
+SCENARIO 737 — Templates: {role: part} offsets, checked passives / clamps, a partial's marker unseen by loops
+-------------------------------------------------------------------------------------------------------------
+
+!match new t737 Lair 12 10
+!match use t737
+!template import drake {"name": "Drake", "vars": {"hp": 30, "footprint_w": 2, "footprint_h": 2}, "parts": {"head": {"name": "Head", "vars": {"hp": 10, "__part_located": true}, "x": 2, "y": 0}, "wing": {"name": "Wing", "vars": {"hp": 5}}}}
+!template spawn drake 3 3
+!assert "parts('drake') == ['drake_head', 'drake_wing'] or parts('drake') == ['drake_wing', 'drake_head']"
+!assert "entity[drake_head].x == 5 and entity[drake_head].y == 3"
+!template spawn drake 3 6
+!assert "entity[drake2_head].x == 5 and entity[drake2_head].y == 6 and part_of('drake2_wing') == 'drake2'"
+!template import far {"name": "Far", "vars": {"hp": 5}, "parts": {"eye": {"vars": {"hp": 1, "__part_located": true}, "x": 1000000000, "y": 0}}}
+!template spawn far 9 9
+?? part `far_eye` couldn't be restored
+!template import bad1 {"name": "B", "vars": {"hp": 5}, "parts": {"head": {"vars": {"hp": 1}, "y": {"no": 1}}}}
+?? part `head` `y` must be a whole-number offset
+!template import bad2 {"name": "B", "vars": {"hp": 5}, "facing": ["up"]}
+?? facing
+!template import bad3 {"name": "B", "vars": {"hp": 5}, "passives": {"regen": 5}}
+?? passive `regen` must be an object
+!template import bad4 {"name": "B", "vars": {"hp": 5}, "passives": {"regen": {"when": "on_turn_starts", "formula": "pass"}}}
+?? needs `when`
+!template import regen {"name": "R", "vars": {"hp": 5, "max_hp": 9, "initiative": 4}, "passives": {"regen": {"when": "on_turn_start", "formula": "entity[self].hp = entity[self].hp + 1"}}, "clamps": {"hp": {"max": "max_hp"}}}
+!template spawn regen 8 2
+!turn next
+!assert "entity[regen].hp == 6"
+!template import sword {"kind": "partial", "data": {"weight": 3}}
+!template import kit {"kind": "partial", "data": {"sword": {"__template": "sword"}, "rope": {"weight": 1}}}
+!ent add hero Hero 20 8 8 3
+!template give kit hero bag
+!assert "keys(entity[hero].bag) == ['sword', 'rope'] and len(entity[hero].bag) == 2"
+!assert "each(entity[hero].bag) == ['sword', 'rope'] and values(entity[hero].bag.sword) == [3]"
+!assert "pick(entity[hero].bag) != '__template'"
+!eval "entity[hero].load = 0\nfor k in each(entity[hero].bag):\n    entity[hero].load = entity[hero].load + get(entity[hero].bag, k + '.weight')"
+!assert "entity[hero].load == 4"
+
+Expected: HARNESS-ALLOWS-ERRORS. A template whose parts are a {role: part}
+object (as a summon template writes them) used to spawn them at their x / y
+as map cells: the drake's head went to (2,0), off the map, and landed on the
+nearest free cell. Each is now a part of the unit named `<unit>_<role>`, its
+x / y an offset from the anchor like the listed form (head at (5,3) for a
+drake at (3,3)). A part stored a billion cells away is dropped with a ⚠️
+at once (the free-cell search used to walk 500 empty rings cell by cell,
+~23 s of a frozen bot). Imports refuse a part offset that isn't a whole number, a
+facing that isn't text (a list used to 💥), and a passive that isn't an
+object with a hook `when` and a `formula` (one used to fail with a raw
+Python TypeError); a passive or clamp may leave out its id / path (the key
+fills it), and the spawned regen unit heals on its turn. keys / values /
+each / len / pick / roll_table skip a partial's `__template` marker, so a
+loop over the kit sees its two items and sums their weights (4).
+
+SCENARIO 738 — Tab completion: commands, subcommands, literal words and options
 -------------------------------------------------------------------------------
 
 !match new t732 Field 10 8
@@ -20832,7 +21021,7 @@ coordinates; `!map pan` takes none). After ` ; ` in `!batch`, the next
 command completes. A line without `!` or inside an open quote gets nothing;
 an alias completes like the command it expands to.
 
-SCENARIO 736 — Tab completion: names, var paths, and what a fogged view hides
+SCENARIO 739 — Tab completion: names, var paths, and what a fogged view hides
 ------------------------------------------------------------------------------
 
 !match new t733 Keep 12 8
@@ -20884,12 +21073,28 @@ SCENARIO 736 — Tab completion: names, var paths, and what a fogged view hides
 ?? candidates: blue  red
 ?tab "!passive add hero p1 on_turn_s"
 ?? on_turn_skipped  on_turn_start
+!system set default template_pinning true
+!template give axe_common hero inventory.pick
+?tab "!match templates refresh "
+?? candidates: axe_common
+!ent set_var spy actions.zap.target none
+!ent set_var spy actions.zap.body pass
+!ent status spy add hidden_mark
 !match fog on
 !as view red
 ?tab "!ent info "
 ?? candidates: hero
 ?! spy
+?tab "!team set "
+?? candidates: red
+?! blue
+?tab "!action spy "
+?! zap
+?tab "!ent status spy info "
+?! hidden_mark
 !as view clear
+?tab "!action spy "
+?? zap
 ?tab "!ent info "
 ?? candidates: hero  spy
 
@@ -20903,4 +21108,564 @@ template's own paths (`edge`) and flags (`expanded`). `!template give
 each command looks: the unit's actions, status definitions, macros, rule
 names after `!system set <system>`, matches, teams, hook names. Under the
 red view with fog on, the blue spy out of sight is left out, as `!ent info`
-itself treats it; clearing the view offers it again.
+itself treats it, and so are its team, its actions (`zap`) and its statuses
+(`hidden_mark`); clearing the view offers them again.
+
+SCENARIO 740 — Statuses: max_level holds on every write
+-------------------------------------------------------
+
+!match new t740 Pyre 10 6
+!match use t740
+!status def burn
+!status maxlevel burn 3
+!ent add a A 20 2 2 5
+!status apply a burn 1
+!eval "status_set('a', 'burn', 'level', 9)"
+?? = `3`
+!assert "status_get('a', 'burn', 'level') == 3"
+!status counter a burn add 5 level
+?? `a.burn.level` = 3
+!ent status a set burn level 50
+?? (capped by `burn`'s max_level)
+!assert "status_get('a', 'burn', 'level') == 3"
+!template import hot {"name": "Hot", "vars": {"hp": 5}, "status": {"burn": {"level": 99}}}
+!template spawn hot 5 2
+!assert "status_get('hot', 'burn', 'level') == 3"
+!eval "summon({'name': 'S', 'vars': {'hp': 3}, 'status': {'burn': {'level': 40}}}, 7, 2)"
+!assert "status_get('s', 'burn', 'level') == 3"
+!ent set_var a form.name F
+!ent set_var a form.vars.hp 5
+!ent set_var a form.status.burn.level 77
+!ent transform a form stash
+!assert "status_get('a', 'burn', 'level') == 3"
+!gpassive add seen on_status_changed "entity[self].seen = 1"
+!status maxlevel burn 2
+?? fired on `hot` (on_status_changed)
+!assert "status_get('a', 'burn', 'level') == 2 and status_get('hot', 'burn', 'level') == 2 and status_get('s', 'burn', 'level') == 2 and entity[hot].seen == 1"
+
+Expected: HARNESS-ALLOWS-ERRORS. max_level is a hard ceiling on every
+write of a status's level, not only applications: status_set (it returns
+the stored 3), a counter, `!ent status set` (the reply says it was capped),
+the statuses a template spawn, a summon or a transform bring with them.
+Lowering a definition's max_level to 2 lowers every live instance above it,
+as a status change (on_status_changed fires for each of the three units).
+
+SCENARIO 741 — Var-name rules: units follow a renamed hp_var / footprint_width_var
+-----------------------------------------------------------------------------------
+
+!match new t741 Hold 12 8
+!match use t741
+!ent add ogre Ogre 30 2 2 5
+!ent set_var ogre footprint_w 2
+!ent set_var ogre footprint_h 2
+!part add ogre ohead Head 8 8
+!clamp add ogre hp max=max_hp mode=hard
+!ent add v V 10 8 2 3
+!ent kill v
+!template save ogre ogret
+!system set default hp_var health
+?? moved `hp` → `health` on 2 unit(s)
+?? so do `death_condition`, `default_kill_function_effects`, `default_revive_function_effects`
+!assert "entity[ogre].health == 30 and not var_has('ogre', 'hp') and entity[ohead].health == 8"
+!clamp list ogre
+?? `health`: max='max_hp', mode=hard
+!system info default
+?? [{'path': 'health', 'max': 'max_hp', 'mode': 'soft'}]
+!ent hp ogre +50
+!assert "entity[ogre].health == 30"
+!ent revive v
+!assert "entity[v].health == 10 and not var_has('v', 'hp')"
+!ent kill v
+!assert "has_corpse('v')"
+!system set default footprint_width_var fw
+!assert "entity[ogre].fw == 2 and footprint_width('ogre') == 2"
+!ent move ogre 1 right
+!assert "entity[ogre].x == 3 and occupies('ogre', 4, 3)"
+!template spawn ogret 7 5
+!assert "entity[ogret].health == 30 and entity[ogret].fw == 2 and not var_has('ogret', 'hp') and entity[ogret_ohead].health == 8"
+!undo command 5
+!assert "entity[ogre].health == 30 and not var_has('ogre', 'hp')"
+!as restart
+!match use t741
+!assert "entity[ogre].health == 30 and entity[ogre].fw == 2"
+
+Expected: HARNESS-ALLOWS-ERRORS. Each unit remembers the var names it uses.
+`!system set default hp_var health` moves `hp` to `health` on the ogre and
+its head (2 units); the dead `v`'s corpse is renamed too. The ogre's clamp
+on hp follows (`health` <= max_hp), and so do the system's default clamp
+and the engine formulas still in their default text (the death condition,
+the kill and revive effects), so `+50` is held at 30, a revive heals `v` to
+10 and a kill still kills. Renaming footprint_width_var keeps the ogre 2
+wide (it moves as a 2x2). The ogre template saved before the rename spawns
+with `health` / `fw` (it remembers the names it was saved with). An undo to
+before the footprint rename restores a state with the old names, which are
+moved again; a restart keeps the new names.
+
+SCENARIO 742 — Var-name rules: collisions, shared names, other systems
+----------------------------------------------------------------------
+
+!match new t742 Fort 10 8
+!match use t742
+!ent add a A 10 2 2 5
+!ent set_var a health 99
+!system set default var_name_collision refuse
+!system set default hp_var health
+?? `hp_var` stays `hp`: t742: `a` already has a var `health`
+!assert "entity[a].hp == 10 and entity[a].health == 99"
+!system set default var_name_collision existing
+!system set default hp_var health
+?? kept its existing `health`; `hp` stays as plain data
+!assert "entity[a].health == 99 and entity[a].hp == 10"
+!system set default var_name_collision tracked
+!system set default hp_var hp
+?? `health` moved to `hp` (hp_var), replacing the `hp` it had
+!assert "entity[a].hp == 99 and not var_has('a', 'health')"
+!system set default turnorder_var max_hp
+?? `max_hp` is already the var of `max_hp_var`
+!template import base {"kind": "partial", "data": {"hp": 7, "max_hp": 7, "str": 3}}
+!template import orc {"name": "Orc", "vars": {"__template": "base"}}
+!template spawn orc 6 2
+!system new s2
+!system set s2 hp_var hull
+!match new t742b Keep 8 8 s2
+!ent copy orc t742b
+!template save orc orc2
+!match use t742b
+!assert "entity[orc].hull == 7 and not var_has('orc', 'hp')"
+!template spawn orc2 4 4
+!assert "entity[orc2].hull == 7 and entity[orc2].str == 3"
+!match use t742
+!system set default hp_var health
+!template save orc orc3
+!template show orc3 vars compact
+?? {"__removed":["hp"],"__template":"base","health":7}
+
+Expected: HARNESS-ALLOWS-ERRORS. var_name_collision decides what happens
+when a unit already has a var under the new name: `refuse` refuses the rule
+change, naming the unit, and changes nothing; `existing` keeps the unit's
+own `health` (99) and leaves `hp` as plain data; `tracked` (the default)
+moves the var the unit used and replaces the one there, with a note. Two
+var rules can't name the same var. A unit copied into a match whose system
+calls hp `hull`, and a template saved under `hp` spawned there, take the
+`hull` name. A unit built from a partial holding `hp` records the rename in
+its marker (removed `hp`, set `health`), so its save spawns right.
+
+SCENARIO 743 — Var-name rules: only plain var names; undo preview after a rename
+----------------------------------------------------------------------
+
+!match new t743 Fort 10 8
+!match use t743
+!ent add a A 20 2 2 5
+!system set default hp_var stats.hp
+?? names a unit var: one word of letters, digits and _
+!system set default hp_var ""
+?? got ''
+!system set default team_var "h p"
+?? got 'h p'
+!system set default hp_var x
+?? x, y and name are the unit's position and display name
+!system set default hp_var __hp
+?? names starting with __ belong to the engine
+!system set default hp_var for
+?? names a unit var
+!assert "entity[a].hp == 20 and var_has('a', 'hp')"
+!system set default hp_var health
+!ent hp a -1
+!undo command 2 preview
+?? vars.health: 19 -> 20
+?! vars.hp
+!undo command 2 confirm
+!assert "entity[a].health == 20 and not var_has('a', 'hp')"
+!help status maxlevel
+?? From `!help status`: Status DEFINITIONS
+!help ent transfer
+?? the unit LEAVES this match
+
+Expected: HARNESS-ALLOWS-ERRORS. A var-name rule (hp_var, team_var, ...)
+takes one plain var name: a dotted path, an empty value, a name with a
+space, a reserved path (x / y / name), an engine `__` name or a Python
+keyword is refused (the vital accessors read a top-level key, and the
+engine's formula rules are rewritten to `entity[self].<name>`); before, a
+dotted hp_var killed the unit on its next hit. After hp_var becomes
+`health`, the undo preview compares against the state the restore will
+really make: the restored snapshot moves to the current names, so the
+preview shows only the hp change (19 -> 20), not a `health` / `hp` swap.
+A subcommand registered without its own description shows its command's
+text in `!help <cmd> <sub>`; `!ent copy` / `transfer` and `!match win` /
+`outcome` have their own.
+
+SCENARIO 744 — Dice tables and bands refuse what they can't read
+----------------------------------------------------------------------
+
+!match new t744 Range 6 6
+!match use t744
+!table def t a:1e308,b:1e308
+?? the weights add up past what a number can hold
+!table def t2 :1
+?? an entry has no key
+!eval "roll_table('a:inf,b:1')"
+?? weight for 'a' must be a finite number
+!eval "roll_table('a:nan,b:1')"
+?? weight for 'a' must be a finite number
+!assert "band(-3, '-5-0:cold,1+:warm') == 'cold'"
+!assert "band(-3, '-5--1:x') == 'x'"
+!assert "band(12, '1-2:120,3-5:100,6-9:80,10+:0') == 0"
+!assert "band(4, '1-3:a,4-6:b') == 'b'"
+!eval "band(1, '1:a,oops:b')"
+?? can't read the band `oops:b`
+!eval "band(5, '6-1:a', 'none')"
+?? the band `6-1` runs backwards
+
+Expected: HARNESS-ALLOWS-ERRORS. A table weight must be a finite number
+and every entry needs a key; weights whose sum overflows are refused
+(before, `inf` / `nan` weights were accepted and the pick ignored them, and
+`:1` defined a table that rolled an empty key). band() reads negative
+ranges (`-5-0`, `-5--1`), which it used to skip silently, and refuses an
+entry it can't read or a backwards range, wherever it sits in the spec:
+before, a typo'd entry was skipped, so a later band or the default
+answered.
+
+SCENARIO 745 — Watchers, events, modifiers and stores refuse silent no-ops
+----------------------------------------------------------------------
+
+!match new t745 Yard 8 8
+!match use t745
+!ent add a A 20 2 2 5
+!watch add w "entity[a].hp = 0" "1"
+?? A watcher condition is an expression (true or false): it can't assign
+!watch add w "entity[a].hp < 10" "entity[a].flag = 1"
+?? Added watcher `w`
+!watch add w "entity[a].hp < 5" "entity[a].flag = 2"
+?? Replaced watcher `w`
+!ent hp a 4
+!assert "entity[a].flag == 2"
+!emit ""
+?? An event needs a name.
+!eval "entity[a].s = 1e308 * 10"
+?? Can't store inf: only finite numbers can be stored.
+!eval "match_var_set('q', 1e308 + 1e308)"
+?? Can't store inf
+!assert "not var_has('a', 's')"
+!ent set_vars a modifiers.m1.stat=str modifiers.m1.op=add modifiers.m1.value=3
+!ent set_vars a modifiers.m2.stat=str modifiers.m2.op=add modifiers.m2.value=5 "modifiers.m2.condition=nosuch > 1"
+!ent set_vars a modifiers.m3.stat=str modifiers.m3.op=add modifiers.m3.value=oops
+!mod show a str 10
+?? → base 10 becomes 13
+?? ⚠️ left out: `modifiers.m2`: condition error
+?? `modifiers.m3`: value error
+!assert "apply_mods('a', 'str', 10) == 13"
+
+Expected: HARNESS-ALLOWS-ERRORS. A watcher condition is evaluated as an
+expression, so one written as an assignment is refused at `!watch add`
+(it used to be accepted and read as not met forever). Re-adding a watcher
+under its name says it replaced it. `!emit ""` is refused like emit('').
+Infinity and NaN can't be stored anywhere (JSON has no such numbers; they
+were saved as `Infinity`). `!mod show` names the modifier records it left
+out because their condition or value can't be read; apply_mods still skips
+them (fail safe).
+
+SCENARIO 746 — !find near: under fog; radius and value checks
+----------------------------------------------------------------------
+
+!match new t746 Moor 20 20
+!match use t746
+!ent add a A 20 2 2 5
+!ent set_var a team red
+!ent set_var a fog_vision_radius 2
+!ent add spy Spy 10 18 18 3
+!ent set_var spy team blue
+!match fog on
+!find near:spy:99
+?? A (a)
+!match bind pov=red
+!as player bob
+!find near:spy:99
+?? `near:` reference entity `spy` not found.
+!find near:ghost:99
+?? `near:` reference entity `ghost` not found.
+!foreach near:spy:99 ; ent info $id
+?? `near:` reference entity `spy` not found.
+!as host
+!find near:a:-1
+?? radius can't be negative
+!find within:3:3:-2
+?? radius can't be negative
+!find hp>
+?? `hp>` needs a value after `>`.
+
+Expected: HARNESS-ALLOWS-ERRORS. Under a team view, `near:<eid>` with a
+unit the view can't see answers exactly like a unit that doesn't exist:
+before, it matched the visible units near the hidden one, so a player
+could find a fogged unit's position by shrinking the radius. The host's
+omniscient view still uses it. A negative radius and an ordering
+comparison with no value are refused (they used to match nothing
+silently).
+
+SCENARIO 747 — A board imported from another system's match keeps this match's system
+----------------------------------------------------------------------
+
+!system new s747
+!system set s747 hp_var hull
+!match new t747a Old 10 10
+!match new t747b New 10 10 s747
+!match use t747a
+!ent add a A 20 2 2 5
+!history save snap
+!history export manual:snap snap747
+!match use t747b
+!history import snap747
+!history restore snap confirm
+!match info
+?? system `s747`
+!assert "entity[a].hull == 20 and not var_has('a', 'hp')"
+!ent hp a -3
+!assert "entity[a].hull == 17"
+
+Expected: A snapshot exported from a match on the `default` system and
+imported into a match on `s747` (whose hp var is `hull`) restores the
+board, but the match keeps its own system, like its id, name and hosts:
+before, the restore switched it to `default` (no command can move a match
+to another system), so it ran on the other system's rules. The restored
+unit takes this system's var names (its `hp` becomes `hull`).
+
+SCENARIO 748 — Actions: location targets, use_action target types
+----------------------------------------------------------------------
+
+!match new t748 Field 10 10
+!match use t748
+!ent add a A 20 2 2 5
+!ent add b B 20 4 4 5
+!ent set_var a actions.loc.target location
+!ent set_var a actions.loc.body "entity[a].where = target"
+!ent set_var a actions.hit.target entity
+!ent set_var a actions.hit.body "entity[target].hp = entity[target].hp - 2"
+!ent set_var a actions.spots.target location_list
+!ent set_var a actions.spots.body "entity[a].spots = target"
+!action a loc 3 4
+!assert "entity[a].where == [3, 4]"
+!action a loc 0 0
+?? location (0,0) is off the map (10x10).
+!action a spots 1 1 2 2
+!assert "entity[a].spots == [[1, 1], [2, 2]]"
+!ent set_var a actions.go.target none
+!ent set_var a actions.go.body "use_action('a', 'loc', [7, 8])"
+!action a go
+!assert "entity[a].where == [7, 8]"
+!ent set_var a actions.go.body "use_action('a', 'loc', [30, 3])"
+!action a go
+?? use_action: location (30,3) is off the map
+!ent set_var a actions.go.body "use_action('a', 'hit')"
+!action a go
+?? action `hit` takes an entity target: an id, got None.
+!ent set_var a actions.go.body "use_action('a', 'hit', 'b')"
+!action a go
+!assert "entity[b].hp == 18"
+!roll 3d6kh0
+?? keeping 0 dice keeps nothing
+!ent set_vars a modifiers.m1.stat=str modifiers.m1.op=more% modifiers.m1.value=1e308 modifiers.m2.stat=str modifiers.m2.op=more% modifiers.m2.value=1e308
+!eval "apply_mods('a', 'str', 10)"
+?? ⚠️ `a`'s modifiers for `str` overflow
+!mod show a str 10
+?? folds to inf
+
+Expected: HARNESS-ALLOWS-ERRORS. An action's `location` target is stored
+as a coordinate list [x, y] (it used to fail with "Can't store a Coord"),
+and a location off the map is refused. use_action() turns its target into
+what `!action` would give the body: [x, y] becomes a location (it reached
+the body as a list, so `target.x` failed with a Python error), and a
+missing or wrong-typed target is refused naming the action. `kh0` / `kl0`
+keep no dice and are refused. apply_mods refuses a result that overflows
+(two more% 1e308 records), naming the records; `!mod show` prints the same
+warning in place of the result.
+
+SCENARIO 749 — Snakes re-lay around edges and units; mount info names the vehicle
+----------------------------------------------------------------------
+
+!match new t749 Pit 12 12
+!match use t749
+!ent add w Worm 30 5 5 2
+!part segment w s1 Seg 5 5
+!part segment w s2 Seg 5 5
+!part segment s1 s3 Seg 5 5
+?? `s1` is a segment of `w`: add segments to the head
+!ent face w down
+!ent tp w 1 1
+!assert "[entity[s1].x, entity[s1].y] == [2, 1] and [entity[s2].x, entity[s2].y] == [3, 1]"
+!ent add blk Blk 5 8 7 1
+!ent tp w 8 8
+!assert "[entity[s1].x, entity[s1].y] == [9, 7] and [entity[s2].x, entity[s2].y] == [9, 6]"
+!ent add cart Cart 30 3 9 2
+!ent set_vars cart footprint_w=2 footprint_h=2
+!ent set_var cart slots.top.capacity 1
+!ent add r R 10 6 11 5
+!mount r cart top
+!mount info r
+?? rides `cart` in slot `top`
+!ent add big Big 30 8 1 2
+!ent set_vars big footprint_w=2 footprint_h=2
+!part segment big b1 Seg 5 5
+!part segment big b2 Seg 5 5
+!ent face big up
+!ent tp big 8 2
+!assert "[entity[b1].x, entity[b1].y] == [8, 4] and [entity[b2].x, entity[b2].y] == [8, 5]"
+!ent face big left
+!ent tp big 6 11
+!assert "[entity[b1].x, entity[b1].y] == [8, 11] and [entity[b2].x, entity[b2].y] == [9, 11]"
+!ent move big 1 left
+!assert "[entity[b1].x, entity[b1].y] == [7, 11] and [entity[b2].x, entity[b2].y] == [8, 11]"
+!system set default segment_follow_mode path
+!ent move big 1 left
+!assert "[entity[b1].x, entity[b1].y] == [7, 11] and [entity[b2].x, entity[b2].y] == [8, 11]"
+!ent move big 1 left
+!assert "[entity[b1].x, entity[b1].y] == [5, 11] and [entity[b2].x, entity[b2].y] == [7, 11]"
+!system set default segment_follow_mode trail
+
+Expected: HARNESS-ALLOWS-ERRORS. A teleported snake re-lays its body from
+the head: straight behind it where the cells are on the map and free,
+else bending toward the free cells nearest that line. Facing down in the
+corner (1,1), "behind" runs off the map, so the body lies along the top
+edge (2,1), (3,1); before, those segments stayed where they were, across
+the map. With a unit straight behind (8,7), the body bends to (9,7),
+(9,6); before, it was laid on top of the unit. A segment can't take
+segments of its own (that built a branching body). `!mount info` on a
+rider says what it rides. A 2x2 head lays its body from the middle of its
+back edge ((8,4), (8,5) below a head on rows 2-3), and walking it puts the
+first segment on a cell the body just left: before, it went to the head's
+old anchor, which a larger head still covers, so the segment sat inside
+the head (in `path` mode too). Switching to `path` mid-game rebuilds the
+recorded path from where the body lies (the first step leaves the body in
+place, the next pulls it on): the path recorded before the switch was
+stale, and both segments jumped onto one cell at the top of the map.
+
+SCENARIO 750 — History, macro and usage replies say what happened
+----------------------------------------------------------------------
+
+!match new t750 Hall 8 8
+!match use t750
+!ent add a A 20 2 2 5
+!history save s1
+?? Saved manual `s1`
+?! replacing
+!ent hp a -1
+!history save s1
+?? replacing the old `s1`.
+!history export manual:s1 h750
+!history import h750 zzstray
+?? ❌ Unexpected `zzstray` — usage: `!history import <path> [as <name>]`.
+!history import h750 as s2
+?? as manual save `s2`
+!history list nope
+?? ❌ Unknown list kind 'nope'.
+!macro set m "repeat -1\nent hp a -1\nend"
+!macro run m
+?? `repeat` count `-1` is -1; it can't be negative.
+!assert "entity[a].hp == 19"
+!map mode pdf
+?? ❌ Usage: `!map mode text|image`.
+
+Expected: HARNESS-ALLOWS-ERRORS. `!history save` under a name already used
+says it replaced the old save (it said "Saved" either way). `!history
+import` refuses a word other than `as <name>` after the path (it ignored
+it). An unknown `!history list` kind and the usage refusals of `!map` /
+`!match fog` subcommands now carry ❌ like every other refusal. A macro's
+`repeat` with a negative count is refused (it ran the block zero times
+and replied nothing).
+
+SCENARIO 751 — List targets merge repeats; macro args past those given; unused answers
+----------------------------------------------------------------------
+
+!match new t751 Yard 10 10
+!match use t751
+!ent add a A 20 2 2 5
+!ent add b B 20 4 4 5
+!ent set_var a actions.many.target entity_list
+!ent set_var a actions.many.body "for t in target:\n    entity[t].hp = entity[t].hp - 1"
+!action a many b b a b
+?? ⚠️ `b` listed more than once in `many`'s targets: the action runs on each once. To act on one twice, run the action twice.
+!assert "entity[b].hp == 19 and entity[a].hp == 19"
+!ent set_var a actions.spots.target location_list
+!ent set_var a actions.spots.body "entity[a].spots = target"
+!action a spots 1 1 1 1 2 2
+?? ⚠️ (1,1) listed more than once
+!assert "entity[a].spots == [[1, 1], [2, 2]]"
+!ent set_var a actions.go.target none
+!ent set_var a actions.go.body "use_action('a', 'many', ['b', 'b'])"
+!action a go
+?? ⚠️ `b` listed more than once
+!assert "entity[b].hp == 18"
+!macro set hit "ent hp $1 -$2\nif \"$3\" != \"\"\nent hp $3 -1\nend"
+!macro run hit a 2
+!assert "entity[a].hp == 17 and entity[b].hp == 18"
+!macro run hit a 2 b
+!assert "entity[a].hp == 15 and entity[b].hp == 17"
+!ent set_var a actions.pick.target none
+!ent set_var a actions.pick.body "entity[a].picked = choose('which?', ['x', 'y'])"
+!action a pick answer=y answer=x
+?? ⚠️ `pick` asked for 1 answer(s); unused: `x`.
+!assert "entity[a].picked == 'y'"
+!action a pick answer=x
+?! unused
+
+Expected: A list target names each unit (or cell, or corpse) once: `b b a b`
+runs the body on b and a once each, with a warning saying so (before, b
+was hit three times). The same merge applies to location lists and to
+use_action's list targets (the warning reaches the reply). A macro's `$3`
+with only two arguments given becomes empty text, so `if "$3" != ""`
+tests for an optional argument. An action run with more `answer=` tokens
+than its body asks for runs, and warns which answers went unused (user
+call; they were ignored silently).
+
+SCENARIO 752 — Skipped turns tick their statuses; everyone stunned cycles until one is free
+----------------------------------------------------------------------
+
+!match new t752 Hold 10 10
+!match use t752
+!ent add a A 20 2 2 5
+!ent add b B 20 4 4 3
+!status def stun
+!status data stun skips_turn true
+!status when stun turn_end
+!status tick stun "status_counter_add(self, 'stun', -1)"
+!status apply a stun 1 2
+!turn next
+?? ⏭️ `a`'s turn skipped (stun).
+!assert "status_get('a', 'stun', 'duration') == 1 and current_id() == 'b'"
+!turn next
+!assert "not status_has('a', 'stun') and current_id() == 'b' and round_number() == 2"
+!turn next
+!assert "current_id() == 'a' and round_number() == 3"
+!status apply a stun 1 3
+!status apply b stun 1 2
+!turn next
+?? ⏭️ everyone was skipped for 1 round(s); `b` is the first able to act.
+!assert "current_id() == 'b' and round_number() == 5 and not status_has('b', 'stun') and not status_has('a', 'stun')"
+!status def frozen
+!status data frozen skips_turn true
+!status apply a frozen
+!status apply b frozen
+!turn next
+?? every entity is skippable; the round passes without anyone acting (no status changed, so nothing would).
+!eval "round_number()"
+!system set default skip_all_round_limit 0
+!status def daze
+!status data daze skips_turn true
+!status when daze turn_end
+!status tick daze "status_counter_add(self, 'daze', -1)"
+!ent status a remove frozen
+!ent status b remove frozen
+!status apply a daze 1 5
+!status apply b daze 1 5
+!turn next
+?? the round passes without anyone acting (skip_all_round_limit is 0).
+
+Expected: A skipped turn still ticks the skipped unit's own turn statuses
+(no action surface), as ATB already did: a's 2-turn stun counts down on
+its two skipped turns and a acts in round 3 (before, its turn_end tick
+never ran while its turns were skipped, so the stun never wore off). With
+everyone stunned (a for 3 turns, ticking once at the end of the turn it
+was stunned in, b for 2), `!turn next` keeps passing whole rounds until a
+unit is free: b's stun and then a's run out on their skipped turns, and
+b, next in the order, takes the turn in round 5. A
+permanent stun (no tick) changes nothing, so the search stops after one
+round instead of burning skip_all_round_limit rounds; with the limit at
+0 it stops after the first all-skipped round as before.

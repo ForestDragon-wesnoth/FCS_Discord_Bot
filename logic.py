@@ -13,6 +13,7 @@ import re
 import math
 import random
 import contextvars
+import keyword
 
 # Lines a formula's changes produced while a command runs (see
 # Match.surface_log). A context variable, so each command — on Discord, each
@@ -47,6 +48,47 @@ TEMPLATE_TRACK_OFF: "contextvars.ContextVar[bool]" = (
 # so a few small partials could otherwise expand into millions of values.
 _MATERIALIZE_BUDGET: "contextvars.ContextVar[Optional[List[int]]]" = (
     contextvars.ContextVar("vtt_materialize_budget", default=None))
+
+
+# Set while a unit is captured for the server library (a template save): a
+# reference is kept only to a partial the LIBRARY holds; one known only from
+# this match's pins is written out in full, as a missing one is.
+_SAVING_TO_LIBRARY: "contextvars.ContextVar[bool]" = (
+    contextvars.ContextVar("vtt_saving_to_library", default=False))
+
+
+def _cells_to_runs(cells: Any) -> List[List[int]]:
+    """A set of (x, y) cells as row runs [y, x_from, x_to], by y then x: a
+    team's fog memory or a reveal can cover a whole 500x500 map, and as one
+    [x, y] pair per cell it cost ~0.6 s to write on every undo snapshot and
+    disk commit."""
+    rows: Dict[int, List[int]] = {}
+    for x, y in cells:
+        rows.setdefault(y, []).append(x)
+    out: List[List[int]] = []
+    for y in sorted(rows):
+        xs = sorted(rows[y])
+        start = prev = xs[0]
+        for x in xs[1:]:
+            if x != prev + 1:
+                out.append([y, start, prev])
+                start = x
+            prev = x
+        out.append([y, start, prev])
+    return out
+
+
+def _runs_to_cells(runs: Any, width: int, height: int) -> "set":
+    """_cells_to_runs read back, clipped to a width x height grid (a run
+    can't make a file load build cells past the map)."""
+    out = set()
+    for r in runs if isinstance(runs, list) else []:
+        if (isinstance(r, (list, tuple)) and len(r) == 3
+                and all(isinstance(v, int) and not isinstance(v, bool)
+                        for v in r) and 1 <= r[0] <= height):
+            out.update((x, r[0]) for x in range(max(1, r[1]),
+                                                min(width, r[2]) + 1))
+    return out
 
 
 def invalidate_partial_cache() -> None:
@@ -322,6 +364,25 @@ EVENT_LOG_DEFAULT_FORMATS: Dict[str, str] = {
 # Schema types: "bool", "int", "enum"
 RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # --- Vital variable names (what var keys map to HP / MaxHP / turn-order) ---
+    "var_name_collision": {
+        "default": "tracked",
+        "schema": {"type": "enum", "choices": ["tracked", "existing", "refuse"]},
+        "desc": (
+            "Each unit remembers the var names it uses for the unit-var rules "
+            "(hp_var, max_hp_var, turnorder_var, team_var, part_name_var, "
+            "footprint_width_var / _height_var, atb_charge_var, disguise_var, "
+            "fog_vision_radius_var, overlay_var). When a rule names a different "
+            "var than a unit remembers (`!system set default hp_var health`, a "
+            "template saved under another system, an old snapshot restored), "
+            "the unit's var moves to the new name, silently (no var hooks), "
+            "and its clamps follow. This rule decides when the unit already "
+            "has a var under the new name: 'tracked' (default) = the var the "
+            "unit used moves there and overwrites it (noted in the reply); "
+            "'existing' = the var already there stays and the old one is left "
+            "as plain data; 'refuse' = the rule change (or the spawn) is "
+            "refused, naming the units."
+        ),
+    },
     "hp_var": {
         "default": "hp",
         "schema": {"type": "str"},
@@ -1020,7 +1081,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "spawn_default_facing": {
         "default": "up",
-        "schema": {"type": "enum", "choices": ALLOWED_DIRECTIONS},
+        "schema": {"type": "enum", "choices": sorted(ALLOWED_DIRECTIONS)},
         "desc": (
             "Default facing used when spawn_face_toward_center is False. "
             "Diagonal values (up_left/up_right/down_left/down_right) only "
@@ -2889,6 +2950,21 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "has no rounds."
         ),
     },
+    "skip_all_round_limit": {
+        "default": 20,
+        "schema": {"type": "int", "min": 0, "max": 1000, "ceiling": True},
+        "desc": (
+            "When EVERY unit's turn is skipped (a `skips_turn` status on all "
+            "of them), how many more whole rounds `!turn next` runs looking "
+            "for a unit that can act. A skipped turn still ticks the unit's "
+            "statuses, so stuns with timers wear off and the first unit freed "
+            "takes the turn. The search also stops as soon as a round passes "
+            "with no status changing anywhere (permanent stuns: nothing would "
+            "ever change). 0 = stop after the first all-skipped round, on the "
+            "unit the order reached. Round-based play only (ATB already "
+            "passes one turn at a time)."
+        ),
+    },
     "pause_affects_hosts": {
         "default": False,
         "schema": {"type": "bool"},
@@ -2948,6 +3024,14 @@ DEFAULT_SYSTEM_SETTINGS: Dict[str, Any] = {
 RULE_SCHEMA: Dict[str, Dict[str, Any]] = {
     k: v["schema"] for k, v in RULES_REGISTRY.items()
 }
+# A system that overrides a rule saves the rule's schema with it, so every
+# schema and default must be JSON (a `set` of choices once made every save of
+# the server fail after `!system set ... spawn_default_facing`).
+for _rk, _rv in RULES_REGISTRY.items():
+    try:
+        json.dumps({"default": _rv["default"], "schema": _rv["schema"]})
+    except TypeError as _ex:
+        raise TypeError(f"RULES_REGISTRY[{_rk!r}] isn't JSON: {_ex}")
 
 @dataclass
 class Rule:
@@ -3069,6 +3153,8 @@ def _coerce_rule_value(key: str, raw_value: str):
     if t == "str":
         # keep raw as-is; CLI passes a single token
         # (you can extend later to join the rest of args for multi-word strings)
+        if key in VAR_NAME_RULES:
+            return check_var_name_rule(key, raw_value)
         choices = spec.get("choices")
         if choices and raw_value not in choices and not (
                 key == "part_to_main_cap_default"
@@ -3203,6 +3289,15 @@ def _own_value(value: Any) -> Any:
     if isinstance(value, tuple):
         # Coordinates are lists (a save/load turns tuples into lists).
         return [_own_value(v) for v in value]
+    store = getattr(type(value), "store_value", None)
+    if store is not None:
+        # An action's `location` target (action.Coord) stores as [x, y].
+        return _own_value(store(value))
+    if isinstance(value, float) and not math.isfinite(value):
+        # JSON has no inf / nan: a stored one was written as `Infinity`,
+        # which other JSON readers refuse.
+        raise VTTError(f"Can't store {value}: only finite numbers can be "
+                       f"stored.")
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     # Anything else (a function named as a value — `entity[a].f = min` —
@@ -4460,6 +4555,13 @@ class GameSystem:
             if k not in RULES_REGISTRY:
                 dropped.append(k)
                 continue
+            if k in VAR_NAME_RULES:
+                try:
+                    check_var_name_rule(k, (v or {}).get("value"))
+                except VTTError:
+                    dropped.append(f"{k} (invalid var name "
+                                   f"{(v or {}).get('value')!r})")
+                    continue
             settings[k] = Rule(
                 key=k,
                 value=v["value"],
@@ -4581,6 +4683,13 @@ class Entity:
     # a rules refresh and can't be casually set_var'd. None = not riding.
     mounted_on: "str | None" = field(default=None)
     mount_slot: "str | None" = field(default=None)
+
+    # The var names this unit uses for the unit-var rules (VAR_NAME_RULES:
+    # {"hp_var": "hp", ...}), set when it enters a match. When a rule later
+    # names another var (a system edit, a template from another system, an
+    # old snapshot), Match.sync_var_names moves the unit's vars to the new
+    # names. Protected (not a var), saved with the unit and its templates.
+    var_names: Dict[str, str] = field(default_factory=dict)
 
     #connect Entity to the Match (so functions like moving an entity can still access map size data, etc.)
     _match: "Match | None" = field(default=None, repr=False, compare=False)
@@ -4916,6 +5025,9 @@ class Entity:
         # defaults. Fill-only, so an explicitly-provided value wins.
         if has_file_refs(self.vars):
             self.vars = match.template_materialize(self.vars)
+        # Vars kept under another system's names (a template, a corpse or a
+        # unit copied from elsewhere) move to this match's names first.
+        rename_notes = match.sync_var_names(self)
         match._apply_default_vars(self)
         self.vars = checked_unit_vars(
             self.vars,
@@ -4956,6 +5068,7 @@ class Entity:
         self.move_to(x, y)
 
         self.bind(match, set_spawn_facing=True)
+        match._cap_unit_status_levels(self)
         if initiative is not None:
             self.initiative = initiative
 
@@ -4972,7 +5085,8 @@ class Entity:
         # re-runs spawn on a corpse snapshot that already has them)
         # idempotent, and lets a per-entity definition shadow a default.
         match._apply_default_passives(self)
-        log = match.fire_hook("on_entity_spawned", target_ids=[self.id])
+        log = rename_notes + match.fire_hook("on_entity_spawned",
+                                             target_ids=[self.id])
         # Spawn event — but NOT during a revive (the entity sits in the
         # death-suppressed set only across the revive's spawn window), so
         # a revive emits just its own "revive" event, not a duplicate
@@ -5789,6 +5903,7 @@ class Entity:
             "part_of": self.part_of,
             "mounted_on": self.mounted_on,
             "mount_slot": self.mount_slot,
+            "var_names": dict(self.var_names),
         }
 
     @staticmethod
@@ -5807,6 +5922,7 @@ class Entity:
             part_of=data.get("part_of", None),
             mounted_on=data.get("mounted_on", None),
             mount_slot=data.get("mount_slot", None),
+            var_names=checked_var_names(data.get("var_names")),
         )
         for pid, pd in (data.get("passives", {}) or {}).items():
             e.passives[pid] = Passive.from_dict(pd)
@@ -6935,15 +7051,28 @@ class Match:
             return
         mode = str(self._segment_cfg(head, "__segment_follow", "segment_follow_mode"))
         if mode == "path":
-            self._advance_snake_path(head, chain)
+            self._advance_snake_path(head, chain, prev_x, prev_y)
         else:
             old = [(s.x, s.y) for s in chain]
-            chain[0].x, chain[0].y = prev_x, prev_y
+            # The first segment takes a cell the head's body just left: the
+            # head's old anchor for a 1x1 head; for a larger head that cell
+            # can still be under the body, which put the segment inside it.
+            w, h = self.entity_footprint(head)
+            body = set(map(tuple, self.entity_cells(head)))
+            left = [(prev_x + dx, prev_y + dy) for dy in range(h)
+                    for dx in range(w)
+                    if (prev_x + dx, prev_y + dy) not in body]
+            first = (min(left, key=lambda c: (abs(c[0] - old[0][0])
+                                              + abs(c[1] - old[0][1]),
+                                              c[1], c[0]))
+                     if left else (prev_x, prev_y))
+            chain[0].x, chain[0].y = first
             for i in range(1, len(chain)):
                 chain[i].x, chain[i].y = old[i - 1]
         head.vars["__seg_last"] = [head.x, head.y]
 
-    def _advance_snake_path(self, head: "Entity", chain: List["Entity"]) -> None:
+    def _advance_snake_path(self, head: "Entity", chain: List["Entity"],
+                            prev_x: int, prev_y: int) -> None:
         """`path` follow mode: prepend the head's current cell to the recorded
         path and place each segment `spacing` cells further back along it."""
         try:
@@ -6952,20 +7081,33 @@ class Match:
         except (TypeError, ValueError):
             spacing = 1
         path = head.vars.get("__seg_path")
-        if not isinstance(path, list):
-            path = []
+        if not (isinstance(path, list) and path and path[0] == [prev_x, prev_y]):
+            # The recorded path doesn't end where the head just was (it was
+            # recorded in trail mode, or before a re-lay): rebuild it from
+            # where the body lies now. A stale path moved every segment
+            # back onto old cells (all of them onto one at first).
+            path = [[prev_x, prev_y]] + [[s.x, s.y] for s in chain
+                                         for _ in range(spacing)]
         path.insert(0, [head.x, head.y])
-        need = (len(chain) + 1) * spacing + 1
+        # Cells under the head's body don't count: a larger head's recent
+        # anchors are still under it, and segments were placed inside it.
+        body = set(map(tuple, self.entity_cells(head)))
+        need = (len(chain) + 1) * spacing + 1 + len(body)
         del path[need:]
         head.vars["__seg_path"] = path
+        trail = [c for c in path if (c[0], c[1]) not in body] or path
         for i, s in enumerate(chain):
-            idx = min((i + 1) * spacing, len(path) - 1)
-            s.x, s.y = path[idx][0], path[idx][1]
+            idx = min((i + 1) * spacing - 1, len(trail) - 1)
+            s.x, s.y = trail[idx][0], trail[idx][1]
 
     def _resettle_snake(self, head_id: str) -> None:
-        """Re-lay a snake's body in a straight line behind the head, used
-        after a discontinuous head move (teleport / swap / push) where there
-        were no per-cell steps to trail through."""
+        """Re-lay a snake's body behind the head, used after a discontinuous
+        head move (teleport / swap / push) where there were no per-cell
+        steps to trail through. Each segment goes `spacing` cells on from
+        the one before it, straight behind the head where it can, else
+        turning (other directions, then the nearest free cell): a straight
+        line running off the map used to leave those segments where they
+        were, anywhere on the map, and the line ignored other units."""
         head = self.entities.get(head_id)
         if head is None:
             return
@@ -6979,14 +7121,50 @@ class Match:
             spacing = 1
         bdx, bdy = FACING_VECTORS.get(getattr(head, "facing", "up"), (0, -1))
         bdx, bdy = -bdx, -bdy            # behind = opposite of facing
+        body = {head_id} | {s.id for s in chain}
+        used: Set[Tuple[int, int]] = {tuple(c) for c in self.entity_cells(head)}
+
+        def free(cx: int, cy: int) -> bool:
+            return (self.in_bounds(cx, cy) and (cx, cy) not in used
+                    and self.cell_occupant(cx, cy, ignore=tuple(body)) is None)
+
+        # Straight behind first, then the directions closest to it (the
+        # body bends before it doubles back past the head).
+        dirs = sorted(((0, 1), (1, 0), (0, -1), (-1, 0),
+                       (1, 1), (-1, 1), (1, -1), (-1, -1)),
+                      key=lambda d: -(d[0] * bdx + d[1] * bdy)
+                      / math.hypot(*d))
+        # Start from the body's back edge (its middle cell there): for a
+        # larger head the anchor is a front or side corner.
+        cx2 = sum(c[0] for c in self.entity_cells(head)) / len(used)
+        cy2 = sum(c[1] for c in self.entity_cells(head)) / len(used)
+        px, py = max(used, key=lambda c: (c[0] * bdx + c[1] * bdy,
+                                          -abs(c[0] - cx2) - abs(c[1] - cy2),
+                                          -c[1], -c[0]))
         path = [[head.x, head.y]]
-        for i, s in enumerate(chain):
-            cx = head.x + bdx * (i + 1) * spacing
-            cy = head.y + bdy * (i + 1) * spacing
-            if not self.in_bounds(cx, cy):
-                cx, cy = s.x, s.y        # off-grid: leave the segment put
-            s.x, s.y = cx, cy
-            path.append([cx, cy])
+        stray: List[str] = []
+        for s in chain:
+            spot = next(((px + dx * spacing, py + dy * spacing)
+                         for dx, dy in dirs
+                         if free(px + dx * spacing, py + dy * spacing)), None)
+            if spot is None:
+                for r in range(1, max(self.grid_width,
+                                                self.grid_height) + 1):
+                    spot = next(((cx, cy) for cx, cy in self._ring_cells(
+                        px, py, r) if free(cx, cy)), None)
+                    if spot is not None:
+                        break
+            if spot is None:
+                stray.append(s.id)
+                spot = (s.x, s.y)
+            used.add(spot)
+            s.x, s.y = spot
+            px, py = spot
+            path.append([px, py])
+        if stray:
+            self.surface_log([f"⚠️ no free cell to lay segment(s) "
+                              f"{', '.join(f'`{i}`' for i in stray)} of "
+                              f"`{head_id}`; left where they were."])
         head.vars["__seg_last"] = [head.x, head.y]
         if str(self._segment_cfg(head, "__segment_follow",
                                  "segment_follow_mode")) == "path":
@@ -7024,6 +7202,12 @@ class Match:
         head = self.entities.get(head_id)
         if head is None:
             raise NotFound(f"Entity '{head_id}' not found.")
+        if head.vars.get("__segment"):
+            # A segment taking its own chain made a branching body, which
+            # follows nothing sensibly (branching snakes aren't supported).
+            raise VTTError(
+                f"`{head_id}` is a segment of `{head.part_of}`: add "
+                f"segments to the head (they go on the tail).")
         if seg_id in self._taken_entity_ids():
             raise DuplicateId(
                 f"Entity id '{seg_id}' already exists in this match.")
@@ -7493,16 +7677,24 @@ class Match:
             oy = sum(c[1] for c in origins) / len(origins)
         else:
             ox, oy = rider.x, rider.y
-        candidates = []
-        for gy in range(1, self.grid_height + 1):
-            for gx in range(1, self.grid_width + 1):
+        # Rings outward from the cell nearest the centre (it is within half
+        # a cell of it on each axis, so ring r is at least r - 0.5 away),
+        # nearest by distance then (y, x); stop once no farther ring can
+        # hold a nearer cell. (A scan of the whole grid made one dismount on
+        # a 500x500 map take 12 s.)
+        cx0, cy0 = math.floor(ox + 0.5), math.floor(oy + 0.5)
+        best: Optional[Tuple[float, int, int]] = None
+        for r in self._ring_radii(cx0, cy0,
+                                  self.grid_width + self.grid_height):
+            for gx, gy in self._ring_cells(cx0, cy0, r):
                 if self.footprint_in_bounds(rider, gx, gy) and \
                         not self._footprint_blocked_by_others(rider, gx, gy):
-                    candidates.append((gx, gy))
-        if not candidates:
-            return None
-        candidates.sort(key=lambda c: (c[0] - ox) ** 2 + (c[1] - oy) ** 2)
-        return candidates[0]
+                    key = ((gx - ox) ** 2 + (gy - oy) ** 2, gy, gx)
+                    if best is None or key < best:
+                        best = key
+            if best is not None and (r + 0.5) ** 2 > best[0]:
+                break
+        return (best[2], best[1]) if best is not None else None
 
     def _footprint_blocked_by_others(self, e: "Entity",
                                      ax: int, ay: int) -> bool:
@@ -7650,7 +7842,8 @@ class Match:
         return out
 
     def gather_modifiers(self, eid: str, stat: str, tags: Any,
-                         context: Optional[Dict[str, Any]] = None) -> List[dict]:
+                         context: Optional[Dict[str, Any]] = None,
+                         problems: Optional[List[str]] = None) -> List[dict]:
         """The active modifier records on `eid` for `stat` + `tags`:
         filtered by stat name, tag subset (required ⊆ query) and negative
         tags (excluded ∩ query empty) and condition, with value formulas
@@ -7662,7 +7855,11 @@ class Match:
         single pre-pass (the granting record must itself pass stat +
         required tags vs the ORIGINAL query + not_tags + condition); the
         main filter then runs against the expanded tag set. Single-pass —
-        a granted tag can activate other modifiers but not chain-grant."""
+        a granted tag can activate other modifiers but not chain-grant.
+
+        A record whose condition or value can't be read is left out (fail
+        safe); `problems`, when given, collects a line naming each such
+        record for `!mod show`."""
         e = self.entities.get(eid)
         if e is None:
             raise NotFound(f"Entity '{eid}' not found.")
@@ -7678,20 +7875,25 @@ class Match:
                 EvalCtx(this=this_id, target=eid, extras=dict(context)),
             )
 
-        def _cond_ok(m: dict) -> bool:
+        def _note(src: str, what: str) -> None:
+            if problems is not None and f"`{src}`: {what}" not in problems:
+                problems.append(f"`{src}`: {what}")
+
+        def _cond_ok(m: dict, src: str) -> bool:
             cond = m.get("condition", "")
             if not cond:
                 return True
             try:
                 return bool(_ev(cond))
-            except FormulaError:
+            except FormulaError as ex:
+                _note(src, f"condition error ({ex})")
                 return False          # malformed condition -> inactive (fail safe)
 
         records = self._raw_modifier_records(e)
 
         # Pass 1: expand the query tag set from grants_tags (vs original tags).
         granted: "set[str]" = set()
-        for m, _src in records:
+        for m, src in records:
             if not m.get("grants_tags"):
                 continue
             if str(m.get("stat", "")) != str(stat):
@@ -7700,7 +7902,7 @@ class Match:
             notg = self._modifier_tagset(m.get("not_tags"))
             if not (req <= tagset) or (notg & tagset):
                 continue
-            if not _cond_ok(m):
+            if not _cond_ok(m, src):
                 continue
             granted |= self._modifier_tagset(m.get("grants_tags"))
         eff_tags = tagset | granted
@@ -7716,21 +7918,31 @@ class Match:
             notg = self._modifier_tagset(m.get("not_tags"))
             if notg & eff_tags:
                 continue
-            if not _cond_ok(m):
+            if not _cond_ok(m, src):
                 continue
             raw_val = m.get("value", 0)
             if isinstance(raw_val, str):
                 try:
                     raw_val = _ev(raw_val)
-                except FormulaError:
+                except FormulaError as ex:
+                    _note(src, f"value error ({ex})")
                     continue          # malformed value -> skip this modifier
             try:
                 val = float(raw_val)
             except (TypeError, ValueError):
+                _note(src, f"value {raw_val!r} isn't a number")
+                continue
+            if not math.isfinite(val):
+                _note(src, f"value {val} isn't a finite number")
                 continue
             try:
                 pri = float(m.get("priority", 0) or 0)
             except (TypeError, ValueError):
+                _note(src, f"priority {m.get('priority')!r} isn't a number "
+                           f"(read as 0)")
+                pri = 0.0
+            if not math.isfinite(pri):
+                _note(src, f"priority {pri} isn't a finite number (read as 0)")
                 pri = 0.0
             out.append({
                 "op": str(m.get("op", "add")),
@@ -7797,6 +8009,9 @@ class Match:
             running = float(base)
         except (TypeError, ValueError):
             running = 0.0
+        if not math.isfinite(running):
+            raise VTTError(f"⚠️ apply_mods base for `{stat}` must be a "
+                           f"finite number, got {running}.")
         mods = self.gather_modifiers(eid, stat, tags, context)
         if not mods:
             return self._apply_stat_cap(stat, running)
@@ -7814,7 +8029,16 @@ class Match:
             for op in sorted({m["op"] for m in tier_mods}, key=order_key):
                 vals = [m["value"] for m in tier_mods if m["op"] == op]
                 running = self._apply_modifier_op(running, op, vals)
-        return self._apply_stat_cap(stat, running)
+        result = self._apply_stat_cap(stat, running)
+        if not math.isfinite(result):
+            # Stacked more% / huge values overflow a float: refused, since
+            # nothing can store or compare the result meaningfully.
+            raise VTTError(
+                f"⚠️ `{eid}`'s modifiers for `{stat}` overflow: base "
+                f"{base} folds to {result} (" + ", ".join(
+                    f"{m['op']} {m['value']:g} [{m['source']}]"
+                    for m in mods) + ").")
+        return result
 
     def _apply_stat_cap(self, stat: str, value: float) -> float:
         """Clamp the folded value to the per-stat [lo, hi] from the
@@ -10243,19 +10467,38 @@ class Match:
             if not self.turn_order:
                 return None
         guard = len(self.turn_order) + 1
+        try:
+            skip_limit = max(0, int(self.rules.get("skip_all_round_limit", 20)))
+        except (TypeError, ValueError):
+            skip_limit = 20
+        skipped_rounds = 0
         while True:
             # Skip over any entity carrying a skip-status flag. Its internal
             # round-wrap hooks can empty the order; re-check before indexing.
+            before = json_text({k: e.status for k, e in self.entities.items()})
             eligible = self._skip_to_eligible(log)
             if not self.turn_order:
                 return None
             cur = self.turn_order[self.active_index]
             if not eligible:
+                skipped_rounds += 1
+                changed = json_text({k: e.status for k, e in
+                                     self.entities.items()}) != before
+                if changed and skipped_rounds <= skip_limit:
+                    # Timers are still running down: keep cycling until a
+                    # unit is free to act (skip_all_round_limit).
+                    continue
+                why = ("no status changed, so nothing would"
+                       if not changed else
+                       f"skip_all_round_limit is {skip_limit}")
                 log.append(
                     "⏭️ every entity is skippable; the round passes "
-                    "without anyone acting."
+                    f"without anyone acting ({why})."
                 )
                 return cur
+            if skipped_rounds:
+                log.append(f"⏭️ everyone was skipped for {skipped_rounds} "
+                           f"round(s); `{cur}` is the first able to act.")
             order_before = list(self.turn_order)
             idx = self.active_index
             log.extend(self.fire_hook(
@@ -10659,6 +10902,15 @@ class Match:
             log.extend(self.fire_hook(
                 "on_turn_skipped", target_ids=[cur],
                 extras={"skip_status": matched}))
+            # The skipped turn still elapses: the unit's turn_start and
+            # turn_end status ticks fire (no action surface), as under ATB.
+            # Without them a stun counting down on its own turns never wore
+            # off, since its turns were all skipped.
+            for when in ("turn_start", "turn_end"):
+                if (cur in self.entities and self.turn_order
+                        and self.active_index < len(self.turn_order)
+                        and self.turn_order[self.active_index] == cur):
+                    log.extend(self.fire_status_tick(when))
             if cur in self.turn_order:
                 self._advance_index(log)
             else:
@@ -11234,6 +11486,45 @@ class Match:
             maxl = 0
         return min(lvl, maxl) if maxl > 0 else lvl
 
+    def _cap_live_status(self, entity_id: str, name: str, after: Any) -> Any:
+        """Hold the live instance `name` on `entity_id` (and the `after` data
+        a mutation reports) to its definition's max_level: every status
+        write reports through _emit_status_diff, so a level raised by
+        status_set, a counter or `!ent status set` is capped like an
+        application."""
+        e = self.entities.get(entity_id)
+        inst = e.status.get(name) if e is not None else None
+        sdef = self.status_definitions.get(name) or {}
+        for d in (inst, after):
+            lvl = d.get("level") if isinstance(d, dict) else None
+            if isinstance(lvl, (int, float)) and not isinstance(lvl, bool):
+                capped = self._cap_status_level(sdef, lvl)
+                if capped != lvl:
+                    d["level"] = capped
+        return after
+
+    def _cap_unit_status_levels(self, e: "Entity") -> None:
+        """Every status instance on `e` held to its max_level, silently: for
+        statuses a unit is created or transformed with."""
+        for name, inst in e.status.items():
+            lvl = inst.get("level") if isinstance(inst, dict) else None
+            if isinstance(lvl, (int, float)) and not isinstance(lvl, bool):
+                inst["level"] = self._cap_status_level(
+                    self.status_definitions.get(name) or {}, lvl)
+
+    def recap_status(self, name: str) -> List[str]:
+        """After a definition's max_level changes: every live instance of
+        `name` above it is lowered, as a status change (on_status_changed
+        fires). Returns the hook log."""
+        log: List[str] = []
+        for eid in list(self.entities):
+            e = self.entities.get(eid)
+            inst = e.status.get(name) if e is not None else None
+            if isinstance(inst, dict):
+                log += self._emit_status_diff(eid, name, copy.deepcopy(inst),
+                                              inst)
+        return log
+
     def _resistance_applies(self, e: "Entity", name: str,
                             sdef: Dict[str, Any], level_given: bool) -> bool:
         """Whether a flat level-reduction resistance applies to THIS status
@@ -11640,6 +11931,8 @@ class Match:
           {...} {...}      on_status_changed iff before != after
         """
         log: List[str] = []
+        if after is not None:
+            after = self._cap_live_status(entity_id, status_name, after)
         if before is None and after is not None:
             self.log_event("status_added", entity=entity_id,
                            name=self._entity_name(entity_id),
@@ -11932,11 +12225,12 @@ class Match:
         Strips id and position — those are assigned at summon time, so
         a template never carries a stale id (which would collide) or a
         fixed cell. Everything else (name, vars, status, passives,
-        clamps, facing) carries over."""
+        clamps, facing) carries over. Links to other units (part_of, a
+        mount) are stripped too: a summoned copy is never a part or a rider
+        by its data, and the ids would latch onto the originals."""
         d = e.to_dict()
-        d.pop("id", None)
-        d.pop("x", None)
-        d.pop("y", None)
+        for k in _TEMPLATE_IDENTITY_KEYS:
+            d.pop(k, None)
         return d
 
     # ---- saved entity templates (the server's library; see MatchManager) ----
@@ -11954,6 +12248,15 @@ class Match:
         `dragon2_torso`."""
         if e.part_of:
             raise VTTError(f"`{e.id}` is a body part — save its parent instead.")
+        token = _SAVING_TO_LIBRARY.set(True)
+        try:
+            return self._capture_template(e, saved_by, saved_by_name, notes)
+        finally:
+            _SAVING_TO_LIBRARY.reset(token)
+
+    def _capture_template(self, e: "Entity", saved_by: Optional[str],
+                          saved_by_name: Optional[str],
+                          notes: Optional[List[str]]) -> Dict[str, Any]:
         d = self.capture_statblock(e)
         ax, ay = e.x, e.y
         Match._shift_snake_path_vars(d.get("vars") or {}, -ax, -ay)
@@ -12029,6 +12332,19 @@ class Match:
             if e is not None:
                 Match._shift_snake_path_vars(e.vars, e.x, e.y)
                 parts = copy.deepcopy(template.get("parts"))
+                if isinstance(parts, dict):
+                    # The {role: part} form: each a direct part of the unit,
+                    # named <unit id>_<role>, at its offset like a listed one.
+                    name_var = self.part_name_var()
+                    listed = []
+                    for role, p in parts.items():
+                        if not isinstance(p, dict):
+                            continue
+                        p.setdefault("vars", {}).setdefault(name_var, role)
+                        p["id"] = f"{TEMPLATE_ROOT}_{role}"
+                        p["part_of"] = TEMPLATE_ROOT
+                        listed.append(p)
+                    parts = listed
 
                 def glob(i: Any) -> Any:
                     if isinstance(i, str) and i.startswith(TEMPLATE_ROOT):
@@ -12229,6 +12545,11 @@ class Match:
         plain = {k: v for k, v in container.items() if k != TEMPLATE_MARKER}
         if not m.get("inherited"):
             try:
+                if _SAVING_TO_LIBRARY.get():
+                    t = self._template_library().get(name)
+                    if not (isinstance(t, dict) and t.get("kind") == "partial"):
+                        raise VTTError("it is no longer in this server's "
+                                       "library, only pinned in this match")
                 self.resolve_partial(name, fresh=False)
             except VTTError as ex:
                 if notes is not None:
@@ -12575,7 +12896,11 @@ class Match:
         if not isinstance(node, dict):
             raise VTTError(f"`{path}` on `{e.id}` isn't a container (a dict "
                            f"of fields), so it can't be a partial template.")
-        return self.template_file_form(node, notes)
+        token = _SAVING_TO_LIBRARY.set(True)
+        try:
+            return self.template_file_form(node, notes)
+        finally:
+            _SAVING_TO_LIBRARY.reset(token)
 
     def _taken_entity_ids(self) -> "set[str]":
         """Return the set of entity ids that should be considered
@@ -12661,6 +12986,13 @@ class Match:
         prefix = id_prefix or template.get("name") or template.get("id") or "summon"
         new_id = self.mint_entity_id(prefix)
         d = copy.deepcopy(template)
+        # A dict naming a parent / vehicle (an old snapshot, a hand-built
+        # one) must not attach the new unit to it: parts come through the
+        # `parts` key, mounting through mount().
+        for k in ("part_of", "mounted_on", "mount_slot"):
+            d.pop(k, None)
+        if isinstance(d.get("vars"), dict):
+            d["vars"].pop("__follows", None)   # a segment's link ahead
         # Partial-template references in the vars are materialized now, so
         # the footprint they carry is known before placement.
         if has_file_refs(d.get("vars")):
@@ -12811,25 +13143,38 @@ class Match:
                 return True
             return all(self.cell_occupant(fx, fy) is None
                        for fx, fy in self.entity_cells(e, cx, cy))
-        # Rings past the farthest grid corner hold no on-grid cell, so the
-        # search stops there: summon_near(t, x, y, 10**6) on a full board
-        # used to walk every ring out to a million.
-        reach = max(abs(x - 1), abs(x - self.grid_width),
-                    abs(y - 1), abs(y - self.grid_height))
-        for r in range(0, min(max(0, radius), reach) + 1):
-            if r == 0:
-                candidates = [(x, y)]
-            else:
-                candidates = []
-                for dy in range(-r, r + 1):
-                    for dx in range(-r, r + 1):
-                        # Only the ring shell at exactly Chebyshev r.
-                        if max(abs(dx), abs(dy)) == r:
-                            candidates.append((x + dx, y + dy))
-            for cx, cy in candidates:
+        for r in self._ring_radii(x, y, radius):
+            for cx, cy in self._ring_cells(x, y, r):
                 if fits(cx, cy):
                     return (cx, cy)
         return None
+
+    def _ring_radii(self, x: int, y: int, radius: int) -> range:
+        """The Chebyshev rings around (x, y), up to `radius`, that hold an
+        on-grid cell: from the first that reaches the map to the farthest
+        grid corner (summon_near(t, x, y, 10**6) on a full board used to walk
+        every ring out to a million; a part stored a billion cells off the
+        map walked 500 empty rings)."""
+        w, h = self.grid_width, self.grid_height
+        start = max(0, 1 - x, x - w, 1 - y, y - h)
+        reach = max(abs(x - 1), abs(x - w), abs(y - 1), abs(y - h))
+        return range(start, min(max(0, radius), reach) + 1)
+
+    def _ring_cells(self, x: int, y: int, r: int) -> List[Tuple[int, int]]:
+        """The on-grid cells at exactly Chebyshev distance r from (x, y), by
+        (dy, dx): the ring's edge only, 8r cells at most (walking the whole
+        (2r+1)² square for it made a radius-500 search ~10⁸ steps)."""
+        w, h = self.grid_width, self.grid_height
+        if r == 0:
+            return [(x, y)] if 1 <= x <= w and 1 <= y <= h else []
+        out: List[Tuple[int, int]] = []
+        for cy in range(max(1, y - r), min(h, y + r) + 1):
+            if abs(cy - y) == r:
+                out.extend((cx, cy) for cx in range(max(1, x - r),
+                                                    min(w, x + r) + 1))
+            else:
+                out.extend((cx, cy) for cx in (x - r, x + r) if 1 <= cx <= w)
+        return out
 
     def free_cell_near(self, x: int, y: int, radius: int,
                        e: Optional["Entity"] = None) -> Optional[Tuple[int, int]]:
@@ -12840,11 +13185,8 @@ class Match:
         single in-bounds unoccupied cell. Returns the anchor or None. The
         read-only query behind the free_cell_near formula function."""
         ignore = self._stand_ignore(e)
-        for r in range(0, max(0, radius) + 1):
-            ring = [(x + dx, y + dy)
-                    for dy in range(-r, r + 1) for dx in range(-r, r + 1)
-                    if max(abs(dx), abs(dy)) == r]
-            for cx, cy in ring:
+        for r in self._ring_radii(x, y, radius):
+            for cx, cy in self._ring_cells(x, y, r):
                 if self._can_stand_at(e, cx, cy, ignore):
                     return (cx, cy)
         return None
@@ -13771,6 +14113,81 @@ class Match:
     # different path, revert in any order) and the snapshot is inspectable /
     # editable like any other var.
 
+    # ---- per-unit var names (VAR_NAME_RULES) -----------------------------
+    def sync_var_names(self, e: "Entity",
+                       rules: Optional[Dict[str, Any]] = None) -> List[str]:
+        """Move `e`'s vars to the names this match's rules give (see
+        rename_unit_vars) and remember them; its clamps follow, and a
+        partial-template marker records the moves (so a save keeps them).
+        No var hooks fire. Raises VTTError (changing nothing) when
+        var_name_collision is refuse and a var is in the way."""
+        rules = self.rules if rules is None else rules
+        clamps = {p: c.to_dict() for p, c in e.clamps.items()}
+        names, new_clamps, notes, moved = rename_unit_vars(
+            e.vars, clamps, e.var_names, rules, f"`{e.id}`")
+        e.var_names = names
+        if moved:
+            e.clamps = {p: ClampSpec.from_dict(cd)
+                        for p, cd in new_clamps.items()}
+            for o, n in moved:
+                self.track_template_change(e, o, deleted=True)
+                self.track_template_change(e, n, deleted=False)
+        return notes
+
+    def _sync_unit_dict(self, d: Dict[str, Any], rules: Dict[str, Any],
+                        who: str) -> List[str]:
+        """sync_var_names for a stored unit dict (a corpse or one of its
+        parts): its vars, clamps and remembered names, in place."""
+        vars_ = d.get("vars")
+        if not isinstance(vars_, dict):
+            return []
+        clamps = d.get("clamps") if isinstance(d.get("clamps"), dict) else {}
+        names, new_clamps, notes, _moved = rename_unit_vars(
+            vars_, {p: dict(c) for p, c in clamps.items()
+                    if isinstance(c, dict)},
+            checked_var_names(d.get("var_names")), rules, who)
+        d["var_names"] = names
+        d["clamps"] = new_clamps
+        return notes
+
+    def sync_all_var_names(self) -> List[str]:
+        """Every unit and corpse of the match moved to the var names its
+        rules give: after the rules change (a system edit, a load, an undo
+        restoring an older state). A unit that var_name_collision=refuse
+        stops keeps its old names, with a note."""
+        notes: List[str] = []
+        for e in list(self.entities.values()):
+            try:
+                notes += self.sync_var_names(e)
+            except VTTError as ex:
+                notes.append(f"{ex} It keeps its old var names.")
+        for _x, _y, cid, corpse in self.all_corpses():
+            for d in [corpse.get("entity")] + list(corpse.get("parts") or []):
+                if not isinstance(d, dict):
+                    continue
+                try:
+                    notes += self._sync_unit_dict(
+                        d, self.rules, f"corpse `{d.get('id', cid)}`")
+                except VTTError as ex:
+                    notes.append(f"{ex} It keeps its old var names.")
+        return notes
+
+    def var_name_conflicts(self, rules: Dict[str, Any]) -> List[str]:
+        """What renaming every unit and corpse to `rules`' var names would
+        refuse (var_name_collision=refuse), without changing anything."""
+        out: List[str] = []
+        dicts = [e.to_dict() for e in self.entities.values()]
+        for _x, _y, _cid, corpse in self.all_corpses():
+            dicts += [d for d in [corpse.get("entity")]
+                      + list(corpse.get("parts") or []) if isinstance(d, dict)]
+        for d in dicts:
+            d = copy.deepcopy(d)
+            try:
+                self._sync_unit_dict(d, rules, f"`{d.get('id')}`")
+            except VTTError as ex:
+                out.append(str(ex))
+        return out
+
     def capture_statblock(self, e: "Entity") -> Dict[str, Any]:
         """Snapshot `e`'s restorable statblock: name, vars, status, passives,
         clamps, facing, plus the whole attached part SUBTREE as full entity
@@ -13997,6 +14414,14 @@ class Match:
             new_vars = self.template_materialize(new_vars)
         if not isinstance(new_vars, dict):
             raise VTTError("transform: the statblock's vars must be a dict.")
+        # A form captured under other var names (another system, an older
+        # rule) takes this match's names, clamps included.
+        sb_clamps = sb.get("clamps") if isinstance(sb.get("clamps"), dict) else {}
+        new_names, sb["clamps"], _rn, _moved = rename_unit_vars(
+            new_vars, {p: dict(c) for p, c in sb_clamps.items()
+                       if isinstance(c, dict)},
+            checked_var_names(sb.get("var_names")), self.rules,
+            f"`{e.id}`'s new form")
         new_max = new_vars.get(max_hp_var)
         target_hp = new_vars.get(hp_var)
         try:
@@ -14099,6 +14524,8 @@ class Match:
             e.clamps = {path: ClampSpec.from_dict(cd)
                         for path, cd in (sb.get("clamps") or {}).items()}
             e.status = copy.deepcopy(sb.get("status") or {})
+            e.var_names = new_names
+            self._cap_unit_status_levels(e)
             # facing is identity — preserved (not taken from the statblock).
             if eject_to is not None:
                 log.append(eject_note)
@@ -14932,13 +15359,13 @@ class Match:
             "bound_channels": copy.deepcopy(self.bound_channels),
             "fog_enabled": bool(self.fog_enabled),
             "fog_memory": bool(self.fog_memory),
-            # sets/tuples aren't JSON-able; store as {team: [[x, y], ...]}
+            # cell sets as row runs [y, x_from, x_to] (_cells_to_runs)
             "explored": {
-                team: sorted([x, y] for (x, y) in cells)
+                team: _cells_to_runs(cells)
                 for team, cells in self.explored.items()
             },
             "fog_reveals": {
-                team: [{"cells": sorted([x, y] for (x, y) in r.get("cells", ())),
+                team: [{"cells": _cells_to_runs(r.get("cells", ())),
                         "until": r.get("until"),
                         "clock": r.get("clock", "round")}
                        for r in recs]
@@ -15150,17 +15577,16 @@ class Match:
         m.fog_enabled = bool(d.get("fog_enabled", False))
         m.fog_memory = bool(d.get("fog_memory", False))
         raw_expl = d.get("explored", {})
+        gw, gh = m.grid_width, m.grid_height
         m.explored = {
-            team: {(int(c[0]), int(c[1])) for c in cells
-                   if isinstance(c, (list, tuple)) and len(c) == 2}
+            team: _runs_to_cells(cells, gw, gh)
             for team, cells in raw_expl.items()
             if isinstance(team, str) and isinstance(cells, list)
         } if isinstance(raw_expl, dict) else {}
         raw_rev = d.get("fog_reveals", {})
         m.fog_reveals = {
             team: [
-                {"cells": {(int(c[0]), int(c[1])) for c in r.get("cells", [])
-                           if isinstance(c, (list, tuple)) and len(c) == 2},
+                {"cells": _runs_to_cells(r.get("cells", []), gw, gh),
                  "until": (int(r["until"]) if r.get("until") is not None else None),
                  "clock": ("turn" if r.get("clock") == "turn" else "round")}
                 for r in recs if isinstance(r, dict)
@@ -16757,6 +17183,18 @@ class Match:
 # Match ids, system names and server keys become file / folder names in the
 # data folder (storage.py), so they are limited to these characters.
 ID_RE = re.compile(r"[A-Za-z0-9_-]{1,40}")
+# Names Windows opens as DEVICES whatever the extension (`con.json` is the
+# console; a serial port can block the bot), so none can name a file.
+WINDOWS_DEVICE_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+    + [f"COM{i}" for i in range(1, 10)] + [f"LPT{i}" for i in range(1, 10)])
+
+
+def is_file_id(name: Any) -> bool:
+    """Whether `name` can be a match id / system name / template name /
+    server key: the id characters, and not a Windows device name."""
+    return (isinstance(name, str) and bool(ID_RE.fullmatch(name))
+            and name.upper() not in WINDOWS_DEVICE_NAMES)
 
 
 def check_id(kind: str, name: Any) -> None:
@@ -16765,6 +17203,10 @@ def check_id(kind: str, name: Any) -> None:
         raise VTTError(
             f"A {kind} can use letters, digits, `_` and `-` only (1-40 "
             f"characters); `{name}` can't be one.")
+    if not is_file_id(name):
+        raise VTTError(
+            f"`{name}` is a reserved device name on Windows (where the bot "
+            f"may run), so it can't be a {kind}.")
 
 
 # The workspace key of a single-operator surface (CLI / GUI / scenario
@@ -16854,6 +17296,35 @@ def check_template_refs(name: str, tpl: Dict[str, Any],
         walk(r, (r,))
 
 
+def _check_template_passives_clamps(spec: Dict[str, Any], what: str) -> None:
+    """A template's (or part's) `passives` / `clamps`: objects of objects, a
+    passive with a hook `when` (as `!passive add` takes) and a text
+    `formula`, a clamp with a `path`. The id / path default to the key, so
+    a hand-written template may leave them out. Changes `spec` in place."""
+    for field_name, key_field in (("passives", "id"), ("clamps", "path")):
+        coll = spec.get(field_name)
+        if coll is None:
+            continue
+        if not isinstance(coll, dict):
+            raise VTTError(f"{what}: `{field_name}` must be an object.")
+        for k, v in coll.items():
+            if not isinstance(v, dict):
+                raise VTTError(f"{what}: {field_name[:-1]} `{k}` must be an "
+                               f"object.")
+            v.setdefault(key_field, k)
+            if field_name == "clamps":
+                continue
+            when, formula = v.get("when"), v.get("formula")
+            if not isinstance(when, str) or (when not in HOOK_NAMES
+                                             and not is_event_hook(when)):
+                raise VTTError(f"{what}: passive `{k}` needs `when`: a hook "
+                               f"(`!help passive`) or `event:<name>`, got "
+                               f"{when!r}.")
+            if not isinstance(formula, str) or not formula.strip():
+                raise VTTError(f"{what}: passive `{k}` needs `formula`: the "
+                               f"program it runs.")
+
+
 def check_template(data: Any, name: str,
                    library: Optional[Dict[str, Any]] = None
                    ) -> Tuple[Dict[str, Any], List[str]]:
@@ -16906,6 +17377,7 @@ def check_template(data: Any, name: str,
             d[k] = str(d[k])
 
     def probe(spec: Dict[str, Any], what: str) -> None:
+        _check_template_passives_clamps(spec, what)
         trial = copy.deepcopy(spec)
         trial.pop("parts", None)
         trial.pop("segments", None)
@@ -16914,7 +17386,8 @@ def check_template(data: Any, name: str,
         if not isinstance(trial.get("vars", {}), dict):
             raise VTTError(f"{what}: `vars` must be an object.")
         facing = trial.get("facing")
-        if facing is not None and facing not in FACING_VECTORS:
+        if facing is not None and (not isinstance(facing, str)
+                                   or facing not in FACING_VECTORS):
             raise VTTError(f"{what}: facing `{facing}` isn't a direction "
                            f"({', '.join(FACING_VECTORS)}).")
         st = trial.get("status", {})
@@ -16942,6 +17415,14 @@ def check_template(data: Any, name: str,
                 if not isinstance(pt, dict):
                     raise VTTError(f"Template `{name}`: part `{role}` must be "
                                    f"an object.")
+                for k in ("mounted_on", "mount_slot", "id", "part_of"):
+                    pt.pop(k, None)
+                for k in ("x", "y"):
+                    v = pt.get(k, 0)
+                    if isinstance(v, bool) or not isinstance(v, int):
+                        raise VTTError(
+                            f"Template `{name}`: part `{role}` `{k}` must be "
+                            f"a whole-number offset.")
                 probe(pt, f"Template `{name}` part `{role}`")
         elif isinstance(parts, list):
             ids = [p.get("id") for p in parts if isinstance(p, dict)]
@@ -17248,6 +17729,106 @@ def _rel_del(d: Any, path: str) -> bool:
         return False
     del parent[keys[-1]]
     return True
+
+
+# The rules that name a unit var. A unit remembers the names it uses
+# (Entity.var_names); rename_unit_vars moves its vars when a rule changes.
+VAR_NAME_RULES = ("hp_var", "max_hp_var", "turnorder_var", "team_var",
+                  "part_name_var", "footprint_width_var", "footprint_height_var",
+                  "atb_charge_var", "disguise_var", "fog_vision_radius_var",
+                  "overlay_var")
+
+
+def check_var_name_rule(key: str, value: Any) -> str:
+    """A VAR_NAME_RULES value: one top-level var name the engine's formulas
+    can spell as `entity[X].<name>` (the vital accessors read a top-level
+    key, and the engine formula rules are rewritten to the new name), so an
+    identifier that isn't a Python keyword, a reserved path (x / y / name)
+    or an engine `__` name. Raises VTTError otherwise."""
+    v = str(value or "")
+    if not v.isidentifier() or keyword.iskeyword(v):
+        raise VTTError(
+            f"Setting '{key}' names a unit var: one word of letters, digits "
+            f"and _ (not starting with a digit, no dots or spaces), got "
+            f"'{v}'.")
+    if v in RESERVED_VAR_PATHS or v.startswith("__"):
+        raise VTTError(
+            f"Setting '{key}' can't be '{v}': "
+            + ("x, y and name are the unit's position and display name."
+               if v in RESERVED_VAR_PATHS else
+               "names starting with __ belong to the engine."))
+    return v
+
+
+def checked_var_names(raw: Any) -> Dict[str, str]:
+    """A unit's remembered var names, kept to VAR_NAME_RULES keys with text
+    values (anything else is dropped: the unit then takes the match's)."""
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for k, v in raw.items():
+        if k in VAR_NAME_RULES and isinstance(v, str):
+            try:
+                out[k] = check_var_name_rule(k, v)
+            except VTTError:
+                pass
+    return out
+
+
+def rename_unit_vars(vars_: Dict[str, Any], clamps: Dict[str, Dict[str, Any]],
+                     var_names: Dict[str, str], rules: Dict[str, Any],
+                     who: str
+                     ) -> Tuple[Dict[str, str], Dict[str, Dict[str, Any]],
+                                List[str], List[Tuple[str, str]]]:
+    """Move a unit's vars from the names it remembers (`var_names`) to the
+    ones `rules` give, in place on `vars_`. Returns (the names it now uses,
+    its clamps with paths / bounds renamed, notes, [(old, new)] moved). All
+    moves happen at once, so two rules swapping names work. A var already
+    under a new name follows the var_name_collision rule ('refuse' raises
+    VTTError, changing nothing). A name the unit doesn't remember is taken
+    as already matching."""
+    mode = str(rules.get("var_name_collision", "tracked"))
+    want = {k: str(rules.get(k, DEFAULT_SYSTEM_SETTINGS.get(k)) or "")
+            for k in VAR_NAME_RULES}
+    have = {k: var_names.get(k) or want[k] for k in VAR_NAME_RULES}
+    moves = [(k, have[k], want[k]) for k in VAR_NAME_RULES
+             if have[k] != want[k] and have[k] and want[k]]
+    if not moves:
+        return want, clamps, [], []
+    leaving = {o for _k, o, _n in moves}
+    notes: List[str] = []
+    plan: List[Tuple[str, str, Any]] = []
+    for k, o, n in moves:
+        found, value = _rel_get(vars_, o)
+        if not found:
+            continue
+        clash, _old = _rel_get(vars_, n)
+        clash = clash and n not in leaving
+        if clash and mode == "refuse":
+            raise VTTError(
+                f"{who} already has a var `{n}`: moving its `{o}` there "
+                f"({k}) would overwrite it (var_name_collision is refuse).")
+        if clash and mode == "existing":
+            notes.append(f"{who}: kept its existing `{n}`; `{o}` stays as "
+                         f"plain data ({k}).")
+            continue
+        if clash:
+            notes.append(f"{who}: `{o}` moved to `{n}` ({k}), replacing the "
+                         f"`{n}` it had.")
+        plan.append((o, n, copy.deepcopy(value)))
+    for o, _n, _v in plan:
+        _rel_del(vars_, o)
+    for _o, n, v in plan:
+        _rel_set(vars_, n, v)
+    names = {o: n for _k, o, n in moves}
+    new_clamps: Dict[str, Dict[str, Any]] = {}
+    for path, cd in clamps.items():
+        cd = dict(cd)
+        for f in ("path", "max", "min"):
+            if isinstance(cd.get(f), str) and cd[f] in names:
+                cd[f] = names[cd[f]]
+        new_clamps[names.get(path, path)] = cd
+    return want, new_clamps, notes, [(o, n) for o, n, _v in plan]
 
 
 def strip_markers(value: Any) -> Any:
@@ -17717,17 +18298,28 @@ class MatchManager:
             log.extend(slog)
         dest._restamp_parts_for(idmap[e.id])
 
-    def refresh_match_rules(self, system_name: str) -> int:
+    def apply_system_rules(self, m: "Match") -> List[str]:
+        """Copy `m`'s system's rules into it (every path that rebuilds a
+        match's rules: a system edit, a load, an undo / restore) and move its
+        units and corpses to the var names those rules give. Returns the
+        rename notes."""
+        m.rules = self._build_rules_dict(self.systems[m.system_name])
+        return m.sync_all_var_names()
+
+    def refresh_match_rules(self, system_name: str,
+                            notes: Optional[List[str]] = None) -> int:
         """Re-snapshot rules onto every match bound to `system_name`. Returns count refreshed.
         Call this after mutating a GameSystem so live matches pick up the change.
+        Var-name renames are added to `notes` when given.
         """
         if system_name not in self.systems:
             return 0
-        sysobj = self.systems[system_name]
         count = 0
         for m in self.matches.values():
             if m.system_name == system_name:
-                m.rules = self._build_rules_dict(sysobj)
+                n = self.apply_system_rules(m)
+                if notes is not None:
+                    notes += n
                 count += 1
         return count
 
@@ -17818,7 +18410,11 @@ class MatchManager:
         """
         write_json_file(path, self.save_data(include_history))
     
-    def load(self, path: str):
+    def load(self, path: str) -> List[str]:
+        """Replace this workspace's matches and systems with a `!store
+        save` file. Returns notes (units var_name_collision kept on their
+        old var names)."""
+        notes: List[str] = []
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -17858,6 +18454,7 @@ class MatchManager:
                 if m.system_name not in systems:
                     m.system_name = default_name
                 m.rules = self._build_rules_dict(systems[m.system_name])
+                notes += [f"{m.id}: {n}" for n in m.sync_all_var_names()]
                 for e in m.entities.values():
                     e.bind(m, set_spawn_facing=False)
             # A channel pointing at a match the file doesn't have would
@@ -17872,6 +18469,7 @@ class MatchManager:
         self.systems = systems
         self.default_system_name = default_name
         self.default_system_per_channel = per_channel
+        return notes
 
 
 class Workspaces:

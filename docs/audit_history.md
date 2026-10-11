@@ -1945,3 +1945,214 @@ clamps and partial containers (300 seeds), a command fuzzer over every
   - OPEN: a snake whose head passed through its own body (the default)
     saves with a segment on the head's cell; spawn / revive / transform
     place that segment on the nearest free cell with a ⚠️.
+
+## Pass 38
+
+Recent features again (entity and partial templates, storage, completion,
+GUI / CLI input), right after pass 37. Method: a command fuzzer over every
+root × subcommand on a board with partial containers (15k lines, clean),
+completion timing on a 500-unit fogged board (~75 ms) and junk input, load
+of corrupt / device-named / dangling template files, wipe + undo with
+templates, an Xvfb key test of the GUI input (20 cases), the pass-37
+template fuzzers re-run after the fixes, and hand probes.
+  - **Windows device names.** A match, template, save or server key named
+    `con`, `nul`, `com1`, `lpt1`, ... became a file the bot can't write on
+    Windows (the commit failed every command after). `logic.is_file_id`
+    (ID_RE plus the device-name list) is used by `check_id`,
+    `storage.valid_id` and `!as server`.
+  - **Forced partial rename / delete were not all or nothing.** Each
+    dependent was rewritten through `write_template`, which made room per
+    file: near the server limit a rename moved the partial and some
+    dependents, then failed on the next. `_reserve_template_room` sums every
+    rewrite first and refuses before anything moves.
+  - **JSON inside batch / foreach / macro / cmd().** `!batch` and
+    `!foreach` shlex-split the whole tail, so a `!template import` line lost
+    its quotes and a `;` inside a JSON string cut the command. The tail is
+    now cut at standalone `;` outside quotes and each line runs through
+    `split_command_line`; macro run lines and action `cmd()` use it too.
+  - **Snapshots and summons kept links.** `entity_snapshot` of a mounted
+    rider kept `mounted_on` / `mount_slot`, and of a segment its
+    `__follows`: `summon_from` produced a unit linked to the original's
+    vehicle / chain (the dangling-id class). Identity keys are stripped on
+    snapshot and again on summon.
+  - **GUI.** A multi-line block with several `!` lines ran as one command;
+    each `!` line is now its own command (non-`!` lines after a `!template
+    import` line join it). A completion exception escaped the Tab handler;
+    it is logged.
+  - **Completion.** `!match templates refresh <name>` offered nothing; it
+    offers the match's pinned names.
+
+## Pass 39
+
+Templates again plus the input code of gui.py / cli.py / completion.py.
+Method: probes of partial-template markers against every engine reader of
+dict containers (modifiers, shields, actions, status resistance, var_sum /
+var_sum_field / var_keys, item helpers, the pure dict helpers), templates
+across transform / revert, kill / revive, clone, copy to a pinning match and
+summon_from; a random-JSON `!template import` fuzzer (10k shapes, each
+imported, shown expanded, given and spawned, the spawn saved back); the
+pass-37 template fuzzers re-run; the GUI read end to end with an Xvfb key
+test (28 cases) and the CLI with a pexpect test.
+  - **Marker seen as an item.** keys / values / each / len / pick /
+    shuffle / roll_table returned a partial container's `__template` marker
+    with its items: a loop over a kit met a phantom `__template` entry
+    (get(..., k + '.weight') failed on it), len counted it. They now skip
+    it (`formula._data_items`). The engine's own readers (modifier bundles,
+    shield pools, action discovery) already ignored it.
+  - **{role: part} templates.** spawn_template converted only listed parts'
+    offsets; a `parts` object (the summon form, which check_template
+    accepts) spawned its located parts at x / y read as map cells and
+    named them by role (`head`, `head2`). They are now direct parts named
+    `<unit>_<role>` at offsets; the import checks their offsets.
+  - **Passives / clamps in templates** were not checked: a passive that
+    wasn't an object failed with a raw Python TypeError, one with an unknown
+    `when` was stored and never fired. Checked like `!passive add` (hook
+    `when`, a `formula`); id / path default to the key.
+  - **Facing as a list or object** in an import 💥'd (unhashable).
+  - **Completion under a team view** listed the teams of units the view
+    can't see, and the actions, statuses and mount slots of hidden units.
+  - **GUI:** a blank line inside pasted JSON split the import from its
+    remaining lines; Up / Down on a wrapped long line recalled history
+    instead of moving between its rows (now by screen row); keypad Enter
+    inserted a newline; the Ctrl+R bar stayed open after focus left it, so
+    a later Ctrl+R saved the found match as the draft.
+  - **CLI:** a pasted multi-line `!template import` ran its first line and
+    then "Commands must start with '!'" per JSON line; it now reads `...`
+    continuation lines until the JSON closes and recalls the block as one
+    history line. Answers typed at choose() prompts went into the Up / Down
+    history.
+
+## Pass 40
+
+Long pass across features. Method: the pass-30 stateful chaos harness
+extended with every template command (spawn / give / resync / detach / save /
+summon / var_copy / var_move of partial containers / pinning / JSON in
+batch), run with and without the hostile passives (35 seeds x 200 steps),
+then without wipes (30 x 300), then with random mid-game changes of any
+gamerule to any valid value (54 x 250); the POV leak detector with template
+commands (733k runs as a fogged player, only false positives); the reload
+differential with templates (30 seeds); the stray-word detector over the
+suite; a rule fuzzer (every rule x every enum choice / bool / int bound /
+formula / junk, then a 70-command suite covering templates, fog, mounts,
+segments, transform, undo and rendering); the formula-function fuzzer over
+all 269 functions; huge-number timing of part / template / summon / move
+commands; per-command timing on 500x500 maps.
+  - **persist_undo_history off mid-game** deleted the history files while
+    the snapshots written so far held only their path: `!undo` past them
+    failed ("Snapshot N couldn't be read from disk") and every later commit
+    failed, even after switching the rule back on. The commit now reads
+    their states back before deleting the files.
+  - **spawn_default_facing** had a `set` of choices in its schema; a system
+    overriding the rule saves the schema, so after `!system set ...
+    spawn_default_facing <dir>` every save of the server failed. Choices are
+    a list, and an import-time check refuses a schema JSON can't hold.
+  - **Free-cell search was cubic.** `_find_free_cell_near` / `free_cell_near`
+    built each Chebyshev ring by walking the whole (2r+1)² square: a
+    template part stored a billion cells off the map made one spawn take
+    ~23 s (500 empty rings), and a full 500x500 board did the same. Rings
+    now start at the first that reaches the map and list only their on-map
+    edge cells, in the same order (24k random cases identical to the old
+    search).
+  - **Dismount scanned the whole grid** for every rider (12 s on 500x500,
+    and per rider on a vehicle's death). It now walks rings outward and stops
+    once no farther ring can hold a nearer cell; 3,000 random cases
+    identical to the old choice, ties included.
+  - **Fog memory / reveals serialization:** stored as one [x, y] pair per
+    cell and sorted on every serialization (three per command): a whole-map
+    reveal on 500x500 made every later command cost ~1.7 s. Now row runs
+    [y, x_from, x_to] (0.17 s). Old saved matches load without their
+    explored / reveal cells (format change; backwards compatibility is not
+    kept at this stage).
+  - **Pinned-only partial:** with template_pinning on, a unit built from a
+    partial later deleted from the library couldn't be saved (the pin kept
+    the reference, the library check refused it); the container is now
+    written in full with a ⚠️, as without pinning.
+  - **JSON through aliases and `!run` files:** an alias expanding to a
+    `template import` was split with plain shlex and lost the JSON's
+    quotes; alias expansion uses split_command_line. A `!run` file's import
+    continues over the next lines while its JSON is open (shared
+    `import_unfinished` with the CLI).
+  - **Discord:** a pasted message kept an import's JSON lines only when the
+    import was the first line, and then also swallowed every following `!`
+    command into the JSON; lines are grouped like the GUI's
+    (`_command_lines`).
+  - **`!as host extra`** switched identity and ignored the word; the usage
+    string now lists each form, so the stray-word check refuses it.
+  - Measured, not changed (reported to the user): after a whole-map tile
+    fill every command costs ~3.5 s on 500x500 (full-state undo snapshots);
+    `cell_occupant` is O(units) per cell.
+
+## Pass 41
+
+Freshest code first (per-unit var names, global max_level), then hand probes
+across dice / tables, watchers, events, modifiers, `!find`, zones / tiles,
+ATB and history import. Harnesses: the rule-change chaos harness with
+var-rule renames under every collision mode (16 seeds x 250 steps, and 5
+hostile x 200), clean; a new existence-oracle detector (each command run as
+a fogged player naming a hidden unit and naming a nonexistent id, replies
+compared after swapping the names; 300k runs, none after the `near:` fix).
+  - **Var-name rule values were unchecked.** `hp_var` took `stats.hp`, `""`,
+    `h p`, `x`, `name` or `__template`. The vital accessors read a top-level
+    key, so a dotted hp_var read hp as 0 and the next hit killed the unit;
+    the engine formula rules were rewritten to `entity[self].stats.hp`.
+    Values are now one identifier that isn't a keyword, a reserved path or
+    an engine `__` name, at `!system set`, on loading a system and in a
+    unit's remembered names.
+  - **Undo preview after a rename** diffed against the raw snapshot, so it
+    listed a `health` / `hp` swap the restore never makes (the restore moves
+    the snapshot's units to the current names). It now syncs a copy first.
+  - **A board imported from another match switched the match's system** to
+    the snapshot's (no command can move a match to another system), so it
+    ran on another system's rules and kept the old var names. It now keeps
+    its system like its id, name and hosts.
+  - **`!find near:<hidden>:<r>` was a position oracle** under fog: the
+    hidden reference was used, so the visible units near it matched and a
+    shrinking radius located it; a missing id said "not found". A hidden
+    reference now reads as missing. Negative radii and `hp>` with no value
+    are refused.
+  - **inf / nan were storable** in vars, match vars, team data and tiles,
+    saved as `Infinity`. `_own_value` refuses them.
+  - **Silent skips:** roll_table took `inf` / `nan` weights, an empty key
+    and an overflowing total; band() skipped a typo'd entry (a later band or
+    the default answered) and couldn't read negative ranges (`-5-0`);
+    `!watch add` validated the condition as a program, so an assignment was
+    accepted and never fired; `!emit ""` was accepted; `!mod show` hid
+    records left out for an unreadable condition / value / priority.
+  - `!help`: 79 subcommands registered with a usage only printed a dangling
+    dash; they now show the command's text, and `!ent copy` / `transfer`,
+    `!match win` / `outcome` got descriptions.
+
+## Pass 42
+
+Hand probes of actions and choices, snakes, mounts, death / revive, turns,
+schedules, macros, history, plus reruns: the rule-change chaos harness (6
+seeds x 250, 4 hostile x 200), the model-based undo harness (25 seeds,
+clean), the formula-function fuzzer (only the builtin int / float / min /
+max / round / abs messages, as before) and the stray-word detector over
+the suite. User calls from pass 41: `kh0` refused; apply_mods refuses an
+overflow with a warning; `!store load` shows its var-name notes.
+  - **Action location targets** couldn't be stored ("Can't store a Coord");
+    they store as [x, y] now, and one off the map is refused.
+  - **use_action() passed its target raw:** [x, y] reached a location
+    action as a list (`target.x` failed with a Python error) and a missing
+    target errored as "got NoneType". It is coerced per target type now.
+  - **Snake re-lay after a teleport** laid a straight line behind the head:
+    the part running off the map stayed where it was (anywhere on the map),
+    and the line was laid over other units. It is now a walk that bends
+    toward free cells. A 2x2 head's walking body put its first segment on
+    the old anchor, still under the head; path mode likewise. Switching to
+    path mode mid-game moved every segment onto a stale recorded path (all
+    onto one cell). A segment could take segments of its own (a branching
+    body); refused.
+  - `!mount info` on a rider didn't say what it rides; `!history save`
+    over an existing name didn't say it replaced it; `!history import`
+    ignored a stray word; a negative macro `repeat` silently ran nothing.
+  - 17 `Usage:` refusals lacked ❌; the harness now flags `❌ Usage:` and
+    stray-word refusals unless a scenario allows errors.
+  - Follow-ups the user decided after pass 42: list targets merge repeats
+    with a warning; macro `$N` past the args given stays empty text,
+    documented. **A skipped turn never ticked its unit's statuses in round
+    play** (ATB did), so a stun counting down on its own turn_end ticks
+    never wore off; it ticks now, and an all-skipped table cycles rounds
+    until a unit is free (`skip_all_round_limit`, stopping early when a
+    round changes no status).

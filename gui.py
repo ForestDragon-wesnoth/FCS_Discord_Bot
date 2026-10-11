@@ -186,6 +186,7 @@ class GuiApp:
         self.entry.bind("<Return>", self._on_enter)
         self.entry.bind("<Shift-Return>", lambda e: None)  # literal newline
         self.entry.bind("<Control-Return>", self._on_enter)
+        self.entry.bind("<KP_Enter>", self._on_enter)
         # Shell-style editing (see the methods below).
         self.entry.bind("<Tab>", self._on_tab)
         self.entry.bind("<Up>", self._on_up)
@@ -221,6 +222,8 @@ class GuiApp:
         self._search_entry.bind("<Control-R>", self._search_older)
         self._search_entry.bind("<Return>", self._search_accept)
         self._search_entry.bind("<Escape>", self._search_cancel)
+        # Clicking away takes the match shown, as Enter does.
+        self._search_entry.bind("<FocusOut>", self._search_leave)
         self._search_idx: Optional[int] = None
         self._inbar = inbar
 
@@ -289,7 +292,11 @@ class GuiApp:
         when several candidates share nothing more, a second Tab lists them
         in the log."""
         before = self.entry.get("insert linestart", "insert")
-        new, cands = apply_completion(before, self.mgr, self.ctx)
+        try:
+            new, cands = apply_completion(before, self.mgr, self.ctx)
+        except Exception as e:  # completion must never break the input box
+            self.log(f"⚠️ completion error: {e}")
+            return "break"
         if new != before:
             self.entry.delete("insert linestart", "insert")
             self.entry.insert("insert", new)
@@ -313,11 +320,17 @@ class GuiApp:
         self._hist_pos = None
         self._draft = ""
 
+    def _display_lines(self, a: str, b: str) -> int:
+        """Screen rows from index a to index b (a long line wraps)."""
+        n = self.entry.count(a, b, "displaylines")
+        return (n[0] if isinstance(n, tuple) else n) or 0
+
     def _on_up(self, _event=None):
-        # Inside a multi-line block, Up moves the cursor; on its first line
-        # it recalls the previous command (cursor at the end of its first
-        # line, so another Up goes further back).
-        if self.entry.index("insert").split(".")[0] != "1" or not self._history:
+        # Inside a multi-line block (or a line wrapped over several rows),
+        # Up moves the cursor; on the first row it recalls the previous
+        # command (cursor at the end of its first line, so another Up goes
+        # further back).
+        if self._display_lines("1.0", "insert") or not self._history:
             return None
         if self._hist_pos is None:
             self._draft = self._input_text()
@@ -330,8 +343,7 @@ class GuiApp:
         return "break"
 
     def _on_down(self, _event=None):
-        last = self.entry.index("end-1c").split(".")[0]
-        if (self.entry.index("insert").split(".")[0] != last
+        if (self._display_lines("insert", "end-1c")
                 or self._hist_pos is None):
             return None
         self._hist_pos += 1
@@ -414,6 +426,13 @@ class GuiApp:
         self._search_end()
         self.entry.mark_set("insert", "end-1c")
         return "break"
+
+    def _search_leave(self, _event=None):
+        if self._search_bar.winfo_ismapped():
+            self._hist_pos = None
+            self._search_bar.pack_forget()
+            self._search_idx = None
+        return None
 
     def _search_cancel(self, _event=None):
         self._set_input(self._draft)
@@ -509,19 +528,24 @@ class GuiApp:
         self._last_tab = None
         self._preview = None  # a `!map preview` lasts until the next command
         self._view = None     # so does a `!map` view
-        lines = [ln.strip() for ln in block.splitlines()]
-        # `!template import <name> <json>`: the pasted JSON may span lines;
-        # it's one command.
-        if re.match(r"\s*!template\s+import\s", block, re.IGNORECASE):
-            lines = [block.strip()]
-        ran = False
-        for line in lines:
-            if not line:
-                continue
-            ran = True
-            self._run_line(line)
-        if not ran:
+        # One command per `!` line; a `!template import <name> <json>`
+        # continues over the lines that follow it without a `!` (pasted
+        # JSON spans lines), wherever it sits in the block.
+        lines: List[str] = []
+        for raw in block.splitlines():
+            ln = raw.strip()
+            if not ln:
+                continue        # a blank line (in pasted JSON too) is nothing
+            if (lines and not ln.startswith("!")
+                    and re.match(r"!template\s+import\s", lines[-1],
+                                 re.IGNORECASE)):
+                lines[-1] += "\n" + ln
+            else:
+                lines.append(ln)
+        if not lines:
             return
+        for line in lines:
+            self._run_line(line)
         # Reload sprites the GM may have dropped in, then redraw once.
         self.loader.clear()
         try:
