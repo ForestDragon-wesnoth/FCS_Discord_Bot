@@ -1292,6 +1292,16 @@ async def run_action(
                     match._runtime_buffer = None
                 raise
             else:
+                if is_top_level:
+                    # Answers the body never asked for (user call: warn,
+                    # still run): a typo'd count, or a body that took
+                    # another branch than the caller expected.
+                    unused = match._choice_answers[match._choice_cursor:]
+                    if unused:
+                        match.surface_log([
+                            f"⚠️ `{action.name}` asked for "
+                            f"{match._choice_cursor} answer(s); unused: "
+                            + ", ".join(f"`{a}`" for a in unused) + "."])
                 break  # body completed without needing another choice
     finally:
         # Defensive: depth back to baseline no matter how we exit.

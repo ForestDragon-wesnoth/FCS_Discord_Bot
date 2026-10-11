@@ -21571,7 +21571,7 @@ it). An unknown `!history list` kind and the usage refusals of `!map` /
 `repeat` with a negative count is refused (it ran the block zero times
 and replied nothing).
 
-SCENARIO 751 — List targets merge repeats; macro args past those given
+SCENARIO 751 — List targets merge repeats; macro args past those given; unused answers
 ----------------------------------------------------------------------
 
 !match new t751 Yard 10 10
@@ -21598,13 +21598,22 @@ SCENARIO 751 — List targets merge repeats; macro args past those given
 !assert "entity[a].hp == 17 and entity[b].hp == 18"
 !macro run hit a 2 b
 !assert "entity[a].hp == 15 and entity[b].hp == 17"
+!ent set_var a actions.pick.target none
+!ent set_var a actions.pick.body "entity[a].picked = choose('which?', ['x', 'y'])"
+!action a pick answer=y answer=x
+?? ⚠️ `pick` asked for 1 answer(s); unused: `x`.
+!assert "entity[a].picked == 'y'"
+!action a pick answer=x
+?! unused
 
 Expected: A list target names each unit (or cell, or corpse) once: `b b a b`
 runs the body on b and a once each, with a warning saying so (before, b
 was hit three times). The same merge applies to location lists and to
 use_action's list targets (the warning reaches the reply). A macro's `$3`
 with only two arguments given becomes empty text, so `if "$3" != ""`
-tests for an optional argument.
+tests for an optional argument. An action run with more `answer=` tokens
+than its body asks for runs, and warns which answers went unused (user
+call; they were ignored silently).
 
 SCENARIO 752 — Skipped turns tick their statuses; everyone stunned cycles until one is free
 ----------------------------------------------------------------------

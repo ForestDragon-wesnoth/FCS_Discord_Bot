@@ -1111,7 +1111,8 @@ hardcodes**.
 - **Choices:** `choose(prompt, options)` / `choose_number(prompt, lo, hi)`
   replay the body: on an unanswered choice the attempt rolls back and re-runs
   with answers replayed in order (`answer=` tokens, else the surface's
-  `prompt_choice`; the harness must pre-supply). Per attempt the RNG, output
+  `prompt_choice`; the harness must pre-supply; answers the body never asks
+  for are named in a ⚠️, user call). Per attempt the RNG, output
   buffer and summon budget are reset, so side effects before a choice apply
   once. `cancel` aborts; `action_choice_limit` (394-395).
 - **Rider actions:** a rider gets its slot's actions plus the vehicle's
