@@ -49,6 +49,47 @@ _MATERIALIZE_BUDGET: "contextvars.ContextVar[Optional[List[int]]]" = (
     contextvars.ContextVar("vtt_materialize_budget", default=None))
 
 
+# Set while a unit is captured for the server library (a template save): a
+# reference is kept only to a partial the LIBRARY holds; one known only from
+# this match's pins is written out in full, as a missing one is.
+_SAVING_TO_LIBRARY: "contextvars.ContextVar[bool]" = (
+    contextvars.ContextVar("vtt_saving_to_library", default=False))
+
+
+def _cells_to_runs(cells: Any) -> List[List[int]]:
+    """A set of (x, y) cells as row runs [y, x_from, x_to], by y then x: a
+    team's fog memory or a reveal can cover a whole 500x500 map, and as one
+    [x, y] pair per cell it cost ~0.6 s to write on every undo snapshot and
+    disk commit."""
+    rows: Dict[int, List[int]] = {}
+    for x, y in cells:
+        rows.setdefault(y, []).append(x)
+    out: List[List[int]] = []
+    for y in sorted(rows):
+        xs = sorted(rows[y])
+        start = prev = xs[0]
+        for x in xs[1:]:
+            if x != prev + 1:
+                out.append([y, start, prev])
+                start = x
+            prev = x
+        out.append([y, start, prev])
+    return out
+
+
+def _runs_to_cells(runs: Any, width: int, height: int) -> "set":
+    """_cells_to_runs read back, clipped to a width x height grid (a run
+    can't make a file load build cells past the map)."""
+    out = set()
+    for r in runs if isinstance(runs, list) else []:
+        if (isinstance(r, (list, tuple)) and len(r) == 3
+                and all(isinstance(v, int) and not isinstance(v, bool)
+                        for v in r) and 1 <= r[0] <= height):
+            out.update((x, r[0]) for x in range(max(1, r[1]),
+                                                min(width, r[2]) + 1))
+    return out
+
+
 def invalidate_partial_cache() -> None:
     cache = PARTIAL_CACHE.get()
     if cache is not None:
@@ -1020,7 +1061,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "spawn_default_facing": {
         "default": "up",
-        "schema": {"type": "enum", "choices": ALLOWED_DIRECTIONS},
+        "schema": {"type": "enum", "choices": sorted(ALLOWED_DIRECTIONS)},
         "desc": (
             "Default facing used when spawn_face_toward_center is False. "
             "Diagonal values (up_left/up_right/down_left/down_right) only "
@@ -2948,6 +2989,14 @@ DEFAULT_SYSTEM_SETTINGS: Dict[str, Any] = {
 RULE_SCHEMA: Dict[str, Dict[str, Any]] = {
     k: v["schema"] for k, v in RULES_REGISTRY.items()
 }
+# A system that overrides a rule saves the rule's schema with it, so every
+# schema and default must be JSON (a `set` of choices once made every save of
+# the server fail after `!system set ... spawn_default_facing`).
+for _rk, _rv in RULES_REGISTRY.items():
+    try:
+        json.dumps({"default": _rv["default"], "schema": _rv["schema"]})
+    except TypeError as _ex:
+        raise TypeError(f"RULES_REGISTRY[{_rk!r}] isn't JSON: {_ex}")
 
 @dataclass
 class Rule:
@@ -7493,16 +7542,24 @@ class Match:
             oy = sum(c[1] for c in origins) / len(origins)
         else:
             ox, oy = rider.x, rider.y
-        candidates = []
-        for gy in range(1, self.grid_height + 1):
-            for gx in range(1, self.grid_width + 1):
+        # Rings outward from the cell nearest the centre (it is within half
+        # a cell of it on each axis, so ring r is at least r - 0.5 away),
+        # nearest by distance then (y, x); stop once no farther ring can
+        # hold a nearer cell. (A scan of the whole grid made one dismount on
+        # a 500x500 map take 12 s.)
+        cx0, cy0 = math.floor(ox + 0.5), math.floor(oy + 0.5)
+        best: Optional[Tuple[float, int, int]] = None
+        for r in self._ring_radii(cx0, cy0,
+                                  self.grid_width + self.grid_height):
+            for gx, gy in self._ring_cells(cx0, cy0, r):
                 if self.footprint_in_bounds(rider, gx, gy) and \
                         not self._footprint_blocked_by_others(rider, gx, gy):
-                    candidates.append((gx, gy))
-        if not candidates:
-            return None
-        candidates.sort(key=lambda c: (c[0] - ox) ** 2 + (c[1] - oy) ** 2)
-        return candidates[0]
+                    key = ((gx - ox) ** 2 + (gy - oy) ** 2, gy, gx)
+                    if best is None or key < best:
+                        best = key
+            if best is not None and (r + 0.5) ** 2 > best[0]:
+                break
+        return (best[2], best[1]) if best is not None else None
 
     def _footprint_blocked_by_others(self, e: "Entity",
                                      ax: int, ay: int) -> bool:
@@ -11955,6 +12012,15 @@ class Match:
         `dragon2_torso`."""
         if e.part_of:
             raise VTTError(f"`{e.id}` is a body part — save its parent instead.")
+        token = _SAVING_TO_LIBRARY.set(True)
+        try:
+            return self._capture_template(e, saved_by, saved_by_name, notes)
+        finally:
+            _SAVING_TO_LIBRARY.reset(token)
+
+    def _capture_template(self, e: "Entity", saved_by: Optional[str],
+                          saved_by_name: Optional[str],
+                          notes: Optional[List[str]]) -> Dict[str, Any]:
         d = self.capture_statblock(e)
         ax, ay = e.x, e.y
         Match._shift_snake_path_vars(d.get("vars") or {}, -ax, -ay)
@@ -12243,6 +12309,11 @@ class Match:
         plain = {k: v for k, v in container.items() if k != TEMPLATE_MARKER}
         if not m.get("inherited"):
             try:
+                if _SAVING_TO_LIBRARY.get():
+                    t = self._template_library().get(name)
+                    if not (isinstance(t, dict) and t.get("kind") == "partial"):
+                        raise VTTError("it is no longer in this server's "
+                                       "library, only pinned in this match")
                 self.resolve_partial(name, fresh=False)
             except VTTError as ex:
                 if notes is not None:
@@ -12589,7 +12660,11 @@ class Match:
         if not isinstance(node, dict):
             raise VTTError(f"`{path}` on `{e.id}` isn't a container (a dict "
                            f"of fields), so it can't be a partial template.")
-        return self.template_file_form(node, notes)
+        token = _SAVING_TO_LIBRARY.set(True)
+        try:
+            return self.template_file_form(node, notes)
+        finally:
+            _SAVING_TO_LIBRARY.reset(token)
 
     def _taken_entity_ids(self) -> "set[str]":
         """Return the set of entity ids that should be considered
@@ -12832,25 +12907,38 @@ class Match:
                 return True
             return all(self.cell_occupant(fx, fy) is None
                        for fx, fy in self.entity_cells(e, cx, cy))
-        # Rings past the farthest grid corner hold no on-grid cell, so the
-        # search stops there: summon_near(t, x, y, 10**6) on a full board
-        # used to walk every ring out to a million.
-        reach = max(abs(x - 1), abs(x - self.grid_width),
-                    abs(y - 1), abs(y - self.grid_height))
-        for r in range(0, min(max(0, radius), reach) + 1):
-            if r == 0:
-                candidates = [(x, y)]
-            else:
-                candidates = []
-                for dy in range(-r, r + 1):
-                    for dx in range(-r, r + 1):
-                        # Only the ring shell at exactly Chebyshev r.
-                        if max(abs(dx), abs(dy)) == r:
-                            candidates.append((x + dx, y + dy))
-            for cx, cy in candidates:
+        for r in self._ring_radii(x, y, radius):
+            for cx, cy in self._ring_cells(x, y, r):
                 if fits(cx, cy):
                     return (cx, cy)
         return None
+
+    def _ring_radii(self, x: int, y: int, radius: int) -> range:
+        """The Chebyshev rings around (x, y), up to `radius`, that hold an
+        on-grid cell: from the first that reaches the map to the farthest
+        grid corner (summon_near(t, x, y, 10**6) on a full board used to walk
+        every ring out to a million; a part stored a billion cells off the
+        map walked 500 empty rings)."""
+        w, h = self.grid_width, self.grid_height
+        start = max(0, 1 - x, x - w, 1 - y, y - h)
+        reach = max(abs(x - 1), abs(x - w), abs(y - 1), abs(y - h))
+        return range(start, min(max(0, radius), reach) + 1)
+
+    def _ring_cells(self, x: int, y: int, r: int) -> List[Tuple[int, int]]:
+        """The on-grid cells at exactly Chebyshev distance r from (x, y), by
+        (dy, dx): the ring's edge only, 8r cells at most (walking the whole
+        (2r+1)² square for it made a radius-500 search ~10⁸ steps)."""
+        w, h = self.grid_width, self.grid_height
+        if r == 0:
+            return [(x, y)] if 1 <= x <= w and 1 <= y <= h else []
+        out: List[Tuple[int, int]] = []
+        for cy in range(max(1, y - r), min(h, y + r) + 1):
+            if abs(cy - y) == r:
+                out.extend((cx, cy) for cx in range(max(1, x - r),
+                                                    min(w, x + r) + 1))
+            else:
+                out.extend((cx, cy) for cx in (x - r, x + r) if 1 <= cx <= w)
+        return out
 
     def free_cell_near(self, x: int, y: int, radius: int,
                        e: Optional["Entity"] = None) -> Optional[Tuple[int, int]]:
@@ -12861,11 +12949,8 @@ class Match:
         single in-bounds unoccupied cell. Returns the anchor or None. The
         read-only query behind the free_cell_near formula function."""
         ignore = self._stand_ignore(e)
-        for r in range(0, max(0, radius) + 1):
-            ring = [(x + dx, y + dy)
-                    for dy in range(-r, r + 1) for dx in range(-r, r + 1)
-                    if max(abs(dx), abs(dy)) == r]
-            for cx, cy in ring:
+        for r in self._ring_radii(x, y, radius):
+            for cx, cy in self._ring_cells(x, y, r):
                 if self._can_stand_at(e, cx, cy, ignore):
                     return (cx, cy)
         return None
@@ -14953,13 +15038,13 @@ class Match:
             "bound_channels": copy.deepcopy(self.bound_channels),
             "fog_enabled": bool(self.fog_enabled),
             "fog_memory": bool(self.fog_memory),
-            # sets/tuples aren't JSON-able; store as {team: [[x, y], ...]}
+            # cell sets as row runs [y, x_from, x_to] (_cells_to_runs)
             "explored": {
-                team: sorted([x, y] for (x, y) in cells)
+                team: _cells_to_runs(cells)
                 for team, cells in self.explored.items()
             },
             "fog_reveals": {
-                team: [{"cells": sorted([x, y] for (x, y) in r.get("cells", ())),
+                team: [{"cells": _cells_to_runs(r.get("cells", ())),
                         "until": r.get("until"),
                         "clock": r.get("clock", "round")}
                        for r in recs]
@@ -15171,17 +15256,16 @@ class Match:
         m.fog_enabled = bool(d.get("fog_enabled", False))
         m.fog_memory = bool(d.get("fog_memory", False))
         raw_expl = d.get("explored", {})
+        gw, gh = m.grid_width, m.grid_height
         m.explored = {
-            team: {(int(c[0]), int(c[1])) for c in cells
-                   if isinstance(c, (list, tuple)) and len(c) == 2}
+            team: _runs_to_cells(cells, gw, gh)
             for team, cells in raw_expl.items()
             if isinstance(team, str) and isinstance(cells, list)
         } if isinstance(raw_expl, dict) else {}
         raw_rev = d.get("fog_reveals", {})
         m.fog_reveals = {
             team: [
-                {"cells": {(int(c[0]), int(c[1])) for c in r.get("cells", [])
-                           if isinstance(c, (list, tuple)) and len(c) == 2},
+                {"cells": _runs_to_cells(r.get("cells", []), gw, gh),
                  "until": (int(r["until"]) if r.get("until") is not None else None),
                  "clock": ("turn" if r.get("clock") == "turn" else "round")}
                 for r in recs if isinstance(r, dict)

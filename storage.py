@@ -659,7 +659,16 @@ class Storage:
                     after["index"][mid] = itext
                 after["seqs"][mid] = seqs
             elif mid in w["index"]:
-                # persist_undo_history was switched off: drop the files.
+                # persist_undo_history was switched off: drop the files, after
+                # reading back the states they hold (a persisted snapshot
+                # keeps only its path in memory).
+                for s in h.all_snapshots():
+                    if s.path is not None:
+                        try:
+                            s.state
+                        except Exception:
+                            pass        # unreadable: it stays unusable
+                        s.path = None
                 plan[os.path.join(sdir, "matches", mid)] = None
                 after["index"].pop(mid, None)
                 after["seqs"].pop(mid, None)

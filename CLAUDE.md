@@ -244,7 +244,10 @@ Each of these was learned from a shipped bug.
   rules carry `"formula": "expression"|"program"`; a limit a server could
   raise high enough to stall the bot carries a ceiling (`"ceiling": True`,
   §3). Read it with the exact registry name (a typo'd `rules.get` returns the
-  default forever).
+  default forever). Schemas and defaults must be JSON (a system saves an
+  overridden rule's schema; an import-time check refuses a `set`).
+  Changing a rule mid-game must leave derived state consistent (switching
+  `persist_undo_history` off once lost every snapshot already on disk).
 - **A serialized Match field:** `to_dict` / `from_dict` with deep copies on
   BOTH sides; a runtime-only field goes in `action._rollback_match`'s preserve
   list (`_check_rollback_fields` raises if a field is neither); decide whether
@@ -343,7 +346,7 @@ back, load the schema with `ToolSearch` before calling
   (`AllowedMentions.none()`), splits long replies fence-aware, and retires a
   board whose channel was unbound.
 - **`test_sequences.txt`**: the scenarios (§2).
-- **`docs/audit_history.md`**: the narratives of audit passes 2-39 — what was
+- **`docs/audit_history.md`**: the narratives of audit passes 2-40 — what was
   swept, verified clean, measured. Read the relevant passes before auditing
   an area again.
 
@@ -447,7 +450,8 @@ plus `data/bot_settings.json` (owner limits + rule ceilings) and
   drops its state from memory after the commit (`release_state`) and reads
   `path` on first use. `MatchHistory.index()` / `from_index()` are the disk
   shape. `persist_undo_history` (rule, default on) = history files written;
-  off = memory only, files deleted.
+  off = memory only, files deleted (the commit that drops them first reads
+  each released snapshot's state back into memory).
 - **Limits** (`Storage._over_limit`): per server (default 1000 MB, the whole
   server folder) and global (20 GB, everything incl. trash), owner-set with
   `!owner limit`. A commit that GROWS past a limit first cuts the server's
@@ -755,6 +759,15 @@ descriptions (pass numbers point at `docs/audit_history.md`):
 - **The suite as a detector** (31): list every `❌` / `⚠️` reply and every
   "X → Y" figure in the Expected prose and check each against its scenario;
   scenarios that pass while testing nothing hide real bugs.
+- **Rule-change chaos** (40): the stateful chaos harness plus random
+  `!system set` of any rule to any valid value mid-game; disk == memory
+  checked after every step (caught persist_undo_history losing snapshots).
+- **Rule-value fuzzer** (40): every rule x each enum choice / bool / int
+  bound / formula / junk value, then a fixed suite touching every subsystem;
+  flag 💥 / Runtime and "saving to disk failed" printed to the console.
+- **Big-map timing** (40): per-command time after whole-map tiles, reveals
+  and explored fog on 500x500, and far-off coordinates (10⁹) in every
+  placement search.
 - `pyflakes` after edits to error paths (catches NameErrors in except clauses).
 
 ---
@@ -880,7 +893,8 @@ hardcodes**.
   `summon_near(..., radius)` / `summon_from(path, ...)` turn an entity-shaped
   dict into a unit (id minted from its name, footprint placement, parts /
   segments keys, on_entity_spawned), bounded per command by
-  `summon_event_limit`; `entity_snapshot(eid)` and `!ent
+  `summon_event_limit` (free-cell searches walk only the on-map cells of
+  each Chebyshev ring, `_ring_radii` / `_ring_cells`); `entity_snapshot(eid)` and `!ent
   store_entity_into_var` make such a dict (identity and links stripped:
   id, x, y, `part_of`, `mounted_on`, `mount_slot`; a summon also drops
   `__follows`, so a snapshot of a rider or a segment summons a free unit);
@@ -1230,7 +1244,9 @@ hardcodes**.
   Moving the vehicle carries riders, nested (`_restamp_riders_for`); a
   driver's own move moves the rig. Hidden riders are off the ground,
   unrendered, unseen and grant no vision (`hidden_rider_grants_vision`).
-  `mount_on_host_death` (eject / kill / keep); a dead rider revives
+  `mount_on_host_death` (eject / kill / keep); dismount and eject take the
+  free cell nearest the vehicle's centre (rings outward, ties by y then x);
+  a dead rider revives
   unmounted; transform re-checks a mounted rider's slot (and a vehicle's
   riders) per `transform_rider_mismatch_mode`. Boarding legality is the GM's
   call through slot conditions — a built-in boarding range was REJECTED.
@@ -1294,7 +1310,9 @@ hardcodes**.
   `Match.explored`, `fog_memory_mode` full / terrain). `!reveal_fog <team>
   ...` adds reveals, optionally temporary (`turns=N`, keyed to whichever
   clock advances). Everything funnels through `_fog_team_sees`; renders
-  memoize it for one pass (`_vision_memo`).
+  memoize it for one pass (`_vision_memo`). Explored cells and reveals are
+  saved as row runs `[y, x_from, x_to]` (`_cells_to_runs`): a whole-map
+  reveal as one pair per cell cost every command ~0.6 s per save.
 - **Opacity / LOS:** `tile_opaque_condition` / `zone_opaque_condition` (`self`
   = viewer), per-cell `opaque` data; FAIL-TRANSPARENT. `has_los`,
   `raycast` (where a beam lands), `first_opaque` all walk ONE corner-aware
@@ -1497,8 +1515,12 @@ hardcodes**.
   the JSON's brackets or ``` fence close, or a blank line; recalled as one
   history line).
   The same splitter runs on every line inside `!batch` / `!foreach` (cut at
-  a standalone `;` outside quotes, `_split_semicolons`), macro run lines and
-  action `cmd()`, so an import's JSON survives them.
+  a standalone `;` outside quotes, `_split_semicolons`), macro run lines,
+  action `cmd()` and alias expansions, so an import's JSON survives them; a
+  `!run` file continues an import over the next lines while its JSON is open
+  (`import_unfinished`, shared with the CLI). Discord groups a message's
+  lines like the GUI (`discord_commands._command_lines`), so an import
+  anywhere in a pasted batch keeps its JSON lines.
 - **Formulas:** `summon_template` / `summon_template_near` (mutating),
   `has_template` / `template_names` (read-only), via `CURRENT_WORKSPACE`
   (718-726).
@@ -1578,7 +1600,9 @@ same library and namespace as entity templates: `{"kind": "partial",
   `partial_data` pins a partial on its first use while the rule is on;
   off = pins kept, unused. `!match templates [refresh [name]]` lists them
   (with whether the library differs) or drops them; a save in a pinning
-  match notes refs whose library copy differs.
+  match notes refs whose library copy differs, and writes a container whose
+  partial is only pinned (gone from the library) in full, with a ⚠️
+  (`_SAVING_TO_LIBRARY`: the library can't hold a reference to it).
 
 ---
 
@@ -1621,7 +1645,11 @@ rejected already. Update this section in the PR that resolves an item.
   careful decisions about compromises and abuse.
 - **Undo history disk growth:** every snapshot is a full match state; if
   history becomes the bulk of a server's disk use, revisit retention defaults
-  or a diff-based snapshot format.
+  or a diff-based snapshot format. Measured (pass 40): after a whole-map
+  `!tile fill` on 500x500 every command costs ~3.5 s (the match is
+  serialized three times per command: undo pre / post state and the
+  commit); `cell_occupant` scans every unit per cell, so cell searches cost
+  cells x units.
 - **Combat layers:** armor (coverage %, directional, damage-type AR vs ARP),
   the to-hit roll (accuracy / evasion / suppression, separate from
   hit_location), AP / FP / ARC action economy and REACTIONS (block / dodge /

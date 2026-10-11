@@ -13938,6 +13938,12 @@ SCENARIO 540 — Fog reveal: !reveal_fog (clairvoyance + temporary + clear)
 !reveal_fog red rect 3 3 4 4
 !reveal_fog red clear
 !reveal_fog red all turns=1
+!reveal_fog red rect 2 2 5 3
+!match fog memory on
+!as restart
+!match use rv
+!reveal_fog list
+?? `red`: 108 cell(s) [through round 2, permanent]
 
 Expected: `!reveal_fog <team> ...` forces cells visible to a team independent of
 unit vision (a scout/clairvoyance reveal) — a revealed cell shows terrain AND
@@ -13947,6 +13953,9 @@ reveal TEMPORARY (expires after N rounds via round_number); omitting it is
 permanent. With fog ON, after `reveal_fog red at 8 8 1` the red team can see
 cell (8,8) and the blue entity there though no red unit is near. `list` shows
 active reveals; `clear` drops them. Reveals are per-team, serialized, host-gated.
+A restart keeps both reveals (the whole map until round 2, and the 4x2 rect
+for good: 100 + 8 cells); reveals and fog memory are saved as row runs, so
+a whole-map reveal no longer costs every later command ~0.6 s per save.
 
 SCENARIO 541 — Inline $() args: read-only math/dice/reads across commands
 --------------------------------------------------------------------------------
@@ -19207,6 +19216,20 @@ SCENARIO 698 — Each server has its own workspace: systems, matches and saves s
 !as server local
 !match
 ?? No matches
+!as server 111 extra
+?? Unexpected `extra`
+!as host extra
+?? Unexpected `extra`
+!system set default spawn_face_toward_center false
+!system set default spawn_default_facing left
+?! Saving to disk failed
+!as restart
+!system info default
+?? `spawn_default_facing` = 'left'
+!match new face Face 6 6
+!match use face
+!ent add s S 5 3 3
+!assert "facing_of('s') == 'left'"
 
 Expected: HARNESS-ALLOWS-ERRORS. Each `!as server <key>` moves the harness
 into that server's workspace. Server 111 turns fog on by default in its own
@@ -19215,7 +19238,11 @@ system still has fog off, `!match use camp` finds nothing, the id `camp` is
 free to reuse for a different 6×6 match, `hero` doesn't exist, and loading
 `shared` fails with "File not found" because each server reads its own saves
 folder. Back in server 111 the 10×10 camp with its hero is untouched and the
-save loads. The local workspace has no matches.
+save loads. The local workspace has no matches. `!as` refuses a word past
+its form (`!as host extra` used to switch and ignore it). Setting
+spawn_default_facing is saved and survives a restart: its rule schema held
+its choices as a set, which made every save of the server fail after the
+rule was set.
 
 SCENARIO 699 — !system default is per server or per channel; !match list is open to players
 --------------------------------------------------------------------------------------------
@@ -19438,12 +19465,29 @@ SCENARIO 705 — persist_undo_history off keeps the history in memory only
 !undo command 1
 ?? Undid 1 command(s)
 !assert "entity[a].hp == 8"
+!ent hp a 6
+!ent hp a 5
+!system set default persist_undo_history false
+!ent hp a 4
+?! Saving to disk failed
+!undo command 3
+?? Undid 3 command(s)
+!assert "entity[a].hp == 8"
+!system set default persist_undo_history true
+!ent hp a 3
+?! Saving to disk failed
+!as restart
+!assert "entity[a].hp == 3"
 
 Expected: HARNESS-ALLOWS-ERRORS. With persist_undo_history off the undo
 history lives in memory only: the two command autosaves are listed, but
 after a restart they're gone and `!undo command 1` has nothing to undo. Back
 on, the next command's autosave is written to disk and undo works after the
-next restart (hp 7 back to 8).
+next restart (hp 7 back to 8). Switching the rule off mid-game (no
+restart) keeps the snapshots already written: their states are read back
+before the files go, so `!undo command 3` still reaches hp 8, and saving
+works on (it used to fail on every command after, "Snapshot N couldn't be
+read from disk"), through switching the rule back on and a restart.
 
 SCENARIO 706 — Storage limits: old autosaves are cut first, then the command is undone
 ----------------------------------------------------------------------------------------
@@ -20542,6 +20586,14 @@ SCENARIO 730 — Partial templates: pinning keeps a match on the versions it use
 ?? template_pinning is off: these pins are kept but unused
 !match templates refresh nothing
 ?? This match has no pin of `nothing`
+!system set default template_pinning true
+!template import rope {"kind": "partial", "data": {"len": 5}}
+!template give rope a rope
+!template delete rope
+!template save a a_rope
+?? `rope` can't be used (it is no longer in this server's library, only pinned in this match)
+!template show a_rope vars.rope compact
+?? {"len":5}
 
 Expected: HARNESS-ALLOWS-ERRORS. With template_pinning on, a match pins
 each partial on its first use: after `a` gets the axe, a library edit to
@@ -20553,7 +20605,10 @@ and the reply says the library moved on. Pins are match state: the clone
 give pins (and uses) the library's damage 9; undoing two commands brings the
 old pin back. The clone still has its own pin. With the rule off, the match
 reads the library directly (damage 9) and keeps its pins unused; refreshing
-a name that isn't pinned is refused.
+a name that isn't pinned is refused. A partial deleted from the library but
+still pinned here (`rope`) is written out in full when the unit is saved,
+with a ⚠️ note: the library can't hold a reference to it (the save used to
+be refused).
 
 SCENARIO 731 — Partial templates on body parts, looting and formula writes
 ---------------------------------------------------------------------------
@@ -20805,6 +20860,10 @@ SCENARIO 735 — Templates: file-safe names, multi-template changes all or nothi
 !assert "has_template('ring')"
 !template show ring compact
 ?? {"data":{"bonus":4},"kind":"partial"}
+!alias def mkgem 'template import gem {"kind":"partial","data":{"cut":"rose ; star"}}'
+!mkgem
+!template show gem compact
+?? {"data":{"cut":"rose ; star"},"kind":"partial"}
 
 Expected: HARNESS-ALLOWS-ERRORS. Match ids, template names and server keys
 become file and folder names, so Windows device names (CON, NUL, COM3,
@@ -20816,7 +20875,8 @@ partial moved and the dependent rewrites then failed, leaving `guard`
 naming a partial that no longer existed). With the limit back, the rename
 updates `guard`. A `!template import` inside `!batch` keeps its JSON
 whole, including a ` ; ` inside a string, and so does one in a macro body
-written with `\"`.
+written with `\"` and one an alias expands to (`!mkgem`; the alias used to
+lose the JSON's quotes).
 
 SCENARIO 736 — Snapshots and summons don't carry links to other units
 -----------------------------------------------------------------------
@@ -20859,6 +20919,9 @@ SCENARIO 737 — Templates: {role: part} offsets, checked passives / clamps, a p
 !assert "entity[drake_head].x == 5 and entity[drake_head].y == 3"
 !template spawn drake 3 6
 !assert "entity[drake2_head].x == 5 and entity[drake2_head].y == 6 and part_of('drake2_wing') == 'drake2'"
+!template import far {"name": "Far", "vars": {"hp": 5}, "parts": {"eye": {"vars": {"hp": 1, "__part_located": true}, "x": 1000000000, "y": 0}}}
+!template spawn far 9 9
+?? part `far_eye` couldn't be restored
 !template import bad1 {"name": "B", "vars": {"hp": 5}, "parts": {"head": {"vars": {"hp": 1}, "y": {"no": 1}}}}
 ?? part `head` `y` must be a whole-number offset
 !template import bad2 {"name": "B", "vars": {"hp": 5}, "facing": ["up"]}
@@ -20886,7 +20949,9 @@ object (as a summon template writes them) used to spawn them at their x / y
 as map cells: the drake's head went to (2,0), off the map, and landed on the
 nearest free cell. Each is now a part of the unit named `<unit>_<role>`, its
 x / y an offset from the anchor like the listed form (head at (5,3) for a
-drake at (3,3)). Imports refuse a part offset that isn't a whole number, a
+drake at (3,3)). A part stored a billion cells away is dropped with a ⚠️
+at once (the free-cell search used to walk 500 empty rings cell by cell,
+~23 s of a frozen bot). Imports refuse a part offset that isn't a whole number, a
 facing that isn't text (a list used to 💥), and a passive that isn't an
 object with a hook `when` and a `formula` (one used to fail with a raw
 Python TypeError); a passive or clamp may leave out its id / path (the key

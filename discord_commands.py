@@ -122,6 +122,26 @@ def _is_comment_or_blank(line: str) -> bool:
     s = (line or "").strip()
     return not s or s.startswith("#")
 
+def _command_lines(content: str, prefix: str) -> List[str]:
+    """The commands of a message, one per line (blank and `#` lines
+    dropped), except that the lines after a `template import` line that
+    don't start with the prefix continue it (its JSON spans lines), as in
+    the GUI."""
+    out: List[str] = []
+    for ln in content.splitlines():
+        if _is_comment_or_blank(ln):
+            continue
+        s = ln.strip()
+        if (out and not (prefix and s.startswith(prefix))
+                and re.match(r"template\s+import\s",
+                             _strip_prefix(out[-1].split("\n", 1)[0], prefix),
+                             re.IGNORECASE)):
+            out[-1] += "\n" + s
+        else:
+            out.append(ln)
+    return out
+
+
 def _strip_prefix(line: str, prefix: str) -> str:
     s = line.lstrip()
     if prefix and s.startswith(prefix):
@@ -882,16 +902,12 @@ def wire_commands(bot: commands.Bot, workspaces: Workspaces):
         if mgr is None:
             return await ctx.send(DM_REFUSAL)
         content = ctx.message.content or ""
-        s = content.lstrip()
-    
         # --- BATCH MODE: multiple non-empty lines pasted in one message ---
-        lines = [ln for ln in content.splitlines() if not _is_comment_or_blank(ln)]
-        # `!template import <name> <json>`: the JSON may span lines; it is one
-        # command, never a batch.
-        head = s[len(getattr(ctx, "prefix", "") or ""):] \
-            if s.startswith(getattr(ctx, "prefix", "") or "\0") else s
-        if re.match(r"template\s+import\s", head, re.IGNORECASE):
-            lines = lines[:1]
+        # (a `!template import`'s JSON lines stay with it: _command_lines)
+        lines = _command_lines(content, getattr(ctx, "prefix", "") or "")
+        if len(lines) == 1:
+            content = lines[0]
+        s = content.lstrip()
         if len(lines) > 1:
             known_roots = set(registry._handlers.keys())
             _dbg(ctx, batch_detected=True, line_count=len(lines))

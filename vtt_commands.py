@@ -401,8 +401,9 @@ class CommandRegistry:
     def _resolve_alias(self, name: str, args: List[str],
                        mgr: MatchManager, ctx: ReplyContext) -> Tuple[str, List[str]]:
         """One-shot alias expansion. Returns (name, args) — unchanged if
-        no alias applies. Tokenized via shlex so a multi-word expansion
-        like `dmg -> "ent hp this"` produces real argv tokens. We
+        no alias applies. Tokenized like a typed line (split_command_line:
+        shlex, keeping a `template import`'s JSON whole) so a multi-word
+        expansion like `dmg -> "ent hp this"` produces real argv tokens. We
         deliberately do NOT re-resolve recursively (that would let
         aliases loop) — the alias's first token must already be a real
         registered command, which is enforced at alias-def time."""
@@ -412,9 +413,8 @@ class CommandRegistry:
         expansion = mgr.matches[mid].aliases.get(name)
         if not expansion:
             return name, args
-        import shlex as _shlex
         try:
-            tokens = _shlex.split(expansion)
+            tokens = split_command_line(expansion)
         except ValueError:
             tokens = expansion.split()
         if not tokens:
@@ -2568,7 +2568,7 @@ def _mention(user_id: Optional[str]) -> str:
 # ---- as (CLI identity switch for previewing host vs player) -----
 @registry.command(
     "as", access="all",
-    usage="!as <host|player|owner> [<name>] | !as view <team|omniscient|clear> | !as server [<key>|local] | !as restart",
+    usage="!as host | !as owner | !as player [<name>] | !as view <team|omniscient|clear> | !as server [<key>|local] | !as restart | !as <identity>",
     desc=(
         "Switch your previewing identity OR point-of-view. CLI-only "
         "(on Discord both come from your account / the channel, so this "
@@ -3155,6 +3155,38 @@ def split_command_args(root: str, tail: str) -> List[str]:
                 raw = raw[1:-1]
             return [m.group(1), m.group(2).strip("'\""), raw]
     return shlex.split(tail)
+
+
+_IMPORT_HEAD = re.compile(r"!?\s*template\s+import\s+\S+\s*(.*)\Z",
+                          re.I | re.S)
+
+
+def import_unfinished(line: str) -> bool:
+    """Whether `line` is a `template import` whose JSON is still open (a `{`
+    / `[` not yet closed outside strings, or a ``` fence not yet closed):
+    its pasted JSON continues on the next lines (the CLI, `!run` files)."""
+    m = _IMPORT_HEAD.match(line.strip())
+    if not m:
+        return False
+    tail = m.group(1)
+    if tail.count("```") % 2:
+        return True
+    depth, in_str, esc = 0, False, False
+    for ch in tail:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+    return depth > 0
 
 
 def split_command_line(line: str) -> List[str]:
@@ -4634,9 +4666,8 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     f"❌ invalid alias name `{aname}`: names must be a "
                     f"single whitespace-free token."
                 )
-            import shlex as _shlex
             try:
-                tokens = _shlex.split(expansion)
+                tokens = split_command_line(expansion)
             except ValueError as ex:
                 return await ctx.send(f"❌ invalid alias expansion: {ex}")
             if not tokens:
@@ -13134,9 +13165,8 @@ async def alias_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # command. We deliberately don't accept other aliases as the
         # target — resolution is one-shot, so a chained alias would just
         # fail at dispatch with a confusing "Unknown command" error.
-        import shlex as _shlex
         try:
-            tokens = _shlex.split(expansion)
+            tokens = split_command_line(expansion)
         except ValueError as ex:
             return await ctx.send(f"❌ invalid alias expansion: {ex}")
         if not tokens:
@@ -13400,12 +13430,20 @@ async def run_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # Build subcommand argv lists. Each non-blank, non-comment line is
     # one subcommand. Leading `!` is optional — both forms are common in
     # human-written script files.
-    import shlex as _shlex
     subcommands: List[List[str]] = []
+    lines: List[str] = []
     for ln in raw.splitlines():
         stripped = ln.strip()
+        if lines and import_unfinished(lines[-1]):
+            # A `template import`'s JSON spans lines until it closes.
+            if stripped:
+                lines[-1] += "\n" + stripped
+            continue
         if not stripped or stripped.startswith("#"):
             continue
+        lines.append(stripped)
+    for stripped in lines:
+        ln = stripped
         if stripped.startswith("!"):
             stripped = stripped[1:]
         try:

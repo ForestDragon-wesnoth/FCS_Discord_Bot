@@ -1,11 +1,11 @@
 
 ## cli.py (desktop runner using the same commands)
 # cli.py
-import asyncio, os, re, sys
+import asyncio, os, sys
 from typing import List
 from logic import LOCAL_WORKSPACE
 from storage import open_workspaces, load_local_settings, local_persistence_note
-from vtt_commands import registry, split_command_line
+from vtt_commands import registry, split_command_line, import_unfinished
 
 
 def _enable_terminal_color() -> bool:
@@ -150,43 +150,12 @@ def _forget_lines(n: int) -> None:
         readline.remove_history_item(size - 1)
 
 
-_IMPORT_RE = re.compile(r"!template\s+import\s+\S+\s*(.*)\Z", re.I | re.S)
-
-
-def _import_unfinished(line: str) -> bool:
-    """Whether `line` is a `!template import` whose JSON is still open (a
-    `{` / `[` not yet closed outside strings, or a ``` fence not yet
-    closed): a pasted multi-line JSON block continues on the next lines."""
-    m = _IMPORT_RE.match(line)
-    if not m:
-        return False
-    tail = m.group(1)
-    if tail.count("```") % 2:
-        return True
-    depth, in_str, esc = 0, False, False
-    for ch in tail:
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-        elif ch == '"':
-            in_str = True
-        elif ch in "{[":
-            depth += 1
-        elif ch in "}]":
-            depth -= 1
-    return depth > 0
-
-
 def _read_continuation(line: str) -> str:
     """A `!template import` line plus the lines of its pasted JSON (prompt
     `...`), up to where the JSON closes, a blank line or end of input. The
     block is one command and one history entry."""
     extra = 0
-    while _import_unfinished(line):
+    while import_unfinished(line):
         try:
             more = input("... ")
         except (EOFError, KeyboardInterrupt):

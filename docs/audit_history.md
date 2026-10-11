@@ -2021,3 +2021,63 @@ test (28 cases) and the CLI with a pexpect test.
     continuation lines until the JSON closes and recalls the block as one
     history line. Answers typed at choose() prompts went into the Up / Down
     history.
+
+## Pass 40
+
+Long pass across features. Method: the pass-30 stateful chaos harness
+extended with every template command (spawn / give / resync / detach / save /
+summon / var_copy / var_move of partial containers / pinning / JSON in
+batch), run with and without the hostile passives (35 seeds x 200 steps),
+then without wipes (30 x 300), then with random mid-game changes of any
+gamerule to any valid value (54 x 250); the POV leak detector with template
+commands (733k runs as a fogged player, only false positives); the reload
+differential with templates (30 seeds); the stray-word detector over the
+suite; a rule fuzzer (every rule x every enum choice / bool / int bound /
+formula / junk, then a 70-command suite covering templates, fog, mounts,
+segments, transform, undo and rendering); the formula-function fuzzer over
+all 269 functions; huge-number timing of part / template / summon / move
+commands; per-command timing on 500x500 maps.
+  - **persist_undo_history off mid-game** deleted the history files while
+    the snapshots written so far held only their path: `!undo` past them
+    failed ("Snapshot N couldn't be read from disk") and every later commit
+    failed, even after switching the rule back on. The commit now reads
+    their states back before deleting the files.
+  - **spawn_default_facing** had a `set` of choices in its schema; a system
+    overriding the rule saves the schema, so after `!system set ...
+    spawn_default_facing <dir>` every save of the server failed. Choices are
+    a list, and an import-time check refuses a schema JSON can't hold.
+  - **Free-cell search was cubic.** `_find_free_cell_near` / `free_cell_near`
+    built each Chebyshev ring by walking the whole (2r+1)² square: a
+    template part stored a billion cells off the map made one spawn take
+    ~23 s (500 empty rings), and a full 500x500 board did the same. Rings
+    now start at the first that reaches the map and list only their on-map
+    edge cells, in the same order (24k random cases identical to the old
+    search).
+  - **Dismount scanned the whole grid** for every rider (12 s on 500x500,
+    and per rider on a vehicle's death). It now walks rings outward and stops
+    once no farther ring can hold a nearer cell; 3,000 random cases
+    identical to the old choice, ties included.
+  - **Fog memory / reveals serialization:** stored as one [x, y] pair per
+    cell and sorted on every serialization (three per command): a whole-map
+    reveal on 500x500 made every later command cost ~1.7 s. Now row runs
+    [y, x_from, x_to] (0.17 s). Old saved matches load without their
+    explored / reveal cells (format change; backwards compatibility is not
+    kept at this stage).
+  - **Pinned-only partial:** with template_pinning on, a unit built from a
+    partial later deleted from the library couldn't be saved (the pin kept
+    the reference, the library check refused it); the container is now
+    written in full with a ⚠️, as without pinning.
+  - **JSON through aliases and `!run` files:** an alias expanding to a
+    `template import` was split with plain shlex and lost the JSON's
+    quotes; alias expansion uses split_command_line. A `!run` file's import
+    continues over the next lines while its JSON is open (shared
+    `import_unfinished` with the CLI).
+  - **Discord:** a pasted message kept an import's JSON lines only when the
+    import was the first line, and then also swallowed every following `!`
+    command into the JSON; lines are grouped like the GUI's
+    (`_command_lines`).
+  - **`!as host extra`** switched identity and ignored the word; the usage
+    string now lists each form, so the stray-word check refuses it.
+  - Measured, not changed (reported to the user): after a whole-map tile
+    fill every command costs ~3.5 s on 500x500 (full-state undo snapshots);
+    `cell_occupant` is O(units) per cell.
