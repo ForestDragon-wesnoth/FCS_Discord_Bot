@@ -249,8 +249,12 @@ Each of these was learned from a shipped bug.
   overridden rule's schema; an import-time check refuses a `set`).
   Changing a rule mid-game must leave derived state consistent (switching
   `persist_undo_history` off once lost every snapshot already on disk). A
-  rule that names a unit var goes in `logic.VAR_NAME_RULES` (§7.1; its value
-  is checked as one plain var name). A dict / list rule: decide whether a
+  rule that names an ENGINE var (hp, team, ...) goes in
+  `logic.VAR_NAME_RULES` (§7.1; changing it renames that var on units); a
+  rule that only SELECTS a var the GM keeps (`turnorder_tiebreak_var`)
+  stays out, since changing it must rename nothing. A str rule whose value
+  is a comma list of fixed words carries `"word_list"` (each word checked,
+  `command_attribution`, `event_log_events`). A dict / list rule: decide whether a
   child system merges it entry by entry (`logic.MERGE_RULES`, §7.16) or
   replaces it whole; read a system's value with `mgr.system_value(s, key)`
   (it walks the inheritance chain), never from `s.settings`.
@@ -1000,8 +1004,12 @@ hardcodes**.
 ### 7.3 Turns, rounds and ATB
 
 - **Turn order:** sorted by `turnorder_var` per the `turnorder_*` rules
-  (direction, tiebreaker incl. `random_stable`, team grouping, change policy
-  immediate / deferred). Before the first `!turn next` the pointer sits at
+  (direction, `turnorder_tiebreak_var` / `_direction` (a GM var such as
+  `dex` or `stats.agi`; a unit without a number there goes after), then
+  tiebreaker incl. `random_stable`, team grouping, change policy
+  immediate / deferred). A write to the tiebreak var and a changed
+  `turnorder_*` rule (`apply_system_rules`) re-sort it like an initiative
+  write (770). Before the first `!turn next` the pointer sits at
   the top of the order (a pre-start `!turn set` is lost if units are added
   after it — set the opener last, user call).
 - **`!turn next`** (`Match.next_turn`): turn-end hooks / ticks → advance (round
@@ -1013,8 +1021,9 @@ hardcodes**.
   every unit is skipped, whole rounds keep passing until one can act, up to
   `skip_all_round_limit`, stopping early once a round changes no status
   (permanent stuns) → `_start_current_turn`. The reply prints hook
-  output first and "It is now X's turn" last; an unseen unit reads as "an
-  unseen unit's turn".
+  output first and the `turn_start_message_format` line last (unit
+  placeholders, `{short_id}`, `{round}`; `turn_start_hidden_message_format`
+  for a unit the channel's view can't see; empty = no line) (770).
 - **Removal and death mid-turn:** removing the current unit sets
   `turn_vacated`, so the next `!turn next` starts the successor without
   skipping it; a unit that dies to its own turn-start effects passes the turn
@@ -1351,6 +1360,17 @@ hardcodes**.
 
 ### 7.11 Death, corpses, revive, transform, disguise
 
+- **Death and revive lines:** every death (any source, a destroyed body
+  part too) and revive prints `death_message_format` /
+  `revive_message_format` (`Match._announce`, placeholders incl. vars;
+  empty = silent) through `surface_log`. The line carries an invisible tag
+  (`logic.UNIT_LINE_TAG`: match, unit, cell); `CommandRegistry._run_top`
+  wraps the reply context in `_UnitLineCtx`, which drops a tagged line the
+  channel's view can't see (the unit, its corpse, or the cell when
+  deleted) and strips the tag from the rest. Turn-start deaths read
+  "⏭ The turn passes ..." with the death line pulled in before it
+  (`_pull_surfaced`). A new line about one unit should be tagged the same
+  way; turn-flow lines name no unit (769).
 - **Death** (`_process_death`): `death_result` (corpse / delete, per-unit
   `__death_result`); a corpse is the unit's snapshot in its cell's tile data
   (`corpses.<id>`, mount links stripped); `corpse_id_uniqueness`. `kill` /
@@ -1403,8 +1423,10 @@ hardcodes**.
   (metric `fog_range_mode`), from every footprint cell. With `fog_los` the
   fog also needs a clear line. Memory (`!match fog memory on|off`,
   `Match.explored`, `fog_memory_mode` full / terrain). `!reveal_fog <team>
-  ...` adds reveals, optionally temporary (`turns=N`, keyed to whichever
-  clock advances). Everything funnels through `_fog_team_sees`; renders
+  ...` adds reveals (`all`, `at`, `rect`, `around`, `cone <x> <y> <dir>
+  <len> [half_angle]`, `line <x1> <y1> <x2> <y2>`: the cells_in_*
+  builders), optionally temporary (`turns=N`, keyed to whichever clock
+  advances). Everything funnels through `_fog_team_sees`; renders
   memoize it for one pass (`_vision_memo`). Explored cells and reveals are
   saved as row runs `[y, x_from, x_to]` (`_cells_to_runs`): a whole-map
   reveal as one pair per cell cost every command ~0.6 s per save.
@@ -1437,7 +1459,10 @@ hardcodes**.
   (`full`, `resize`, settings...) except the read forms in
   `_ELEVATED_READ_FORMS`. Overrides: `Match.access_overrides` (`!host access`,
   per match, kept out of `rules` so a refresh can't wipe it) beat the
-  `command_access` rule (`!system access`, per system). No-op without an
+  `command_access` rule (`!system access`, per system). Per-player
+  overrides (`!host access ... user=<player>`) live in the same dict as
+  `@<user id> <key>` and win over both (`_effective_access(..., user)`)
+  (773). No-op without an
   active match, identity or owner — hence the separate admin and
   target-host checks.
 - **Approval queue:** `Match.add_pending_request` (runtime-only; carried
@@ -1465,7 +1490,10 @@ hardcodes**.
 
 - **ASCII** (`render_ascii` → `_render_ascii_impl`): layers zones < tiles <
   units < fog; glyphs (`glyphs.<facing>` > `glyph` > facing arrow; one
-  character), colours (`color` var > `team_colors` / a palette-named team;
+  character), colours (`color` var — a palette name or a formula with
+  self = the unit, falling through when it fails or isn't a palette name,
+  shared by both renderers via `entity_color` (772) — > `team_colors` /
+  a palette-named team;
   ANSI only when `ctx.supports_color`, one code per run), legend
   (`map_legend_by_default`, `!map legend`, `legend=`), coordinate rulers
   (`map_coords`, `!map coords`, stacked column digits), hidden layers (`!map
@@ -1592,6 +1620,11 @@ hardcodes**.
 - **Match vars:** `!match var`, `match_var_get` / `match_var_set` /
   `match_var_del`. **Groups:** `!ent group`, `group:<name>` selectors and
   group moves.
+- **Attribution:** each command snapshot records who ran it
+  (`Snapshot.by`) and each event-log entry its command's author
+  (`logic.COMMAND_USER`, set in `_run_top`); `command_attribution` (words
+  history / log / diff) picks where it shows. `!log [n] type= who= round=
+  by=` filters (771).
 - **Roster text:** `entity_line_format`, `entity_info_format`,
   `corpse_line_format`, `body_part_entity_line_suffix`,
   `mount_entity_line_suffix`, `show_corpses_in_entity_list`; `{placeholder}`

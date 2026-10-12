@@ -15,7 +15,7 @@ from logic import (
 )
 
 # Passive system
-from logic import VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit
+from logic import COMMAND_USER, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit
 
 # Clamp system
 from logic import ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS
@@ -498,11 +498,12 @@ class CommandRegistry:
         return result
 
     def _effective_access(self, name: str, args: List[str],
-                          m: "Any") -> str:
+                          m: "Any", user: Optional[str] = None) -> str:
         """Resolve the access level for this invocation: the command's
         base level, downgraded to 'all' for a read-only subcommand, then
         overridden by the active match's command_access rule. `m` is the
-        active Match (or None)."""
+        active Match (or None); `user` (the caller's id) picks up the
+        per-player overrides `!host access ... user=` stores."""
         if name == "again":
             # `!again` carries no authority of its own: the command it replays
             # goes through this gate itself. Gating `again` too would queue
@@ -530,10 +531,19 @@ class CommandRegistry:
             base = "all"
         if m is not None:
             sub_key = f"{name} {args[0].lower()}" if args else None
-            # Per-match host overrides win over the system-level rule,
-            # which wins over the default. Within each layer, a precise
-            # "name sub" key beats a bare "name" key.
-            for table in (getattr(m, "access_overrides", None),
+            # A per-player override (`@<user id> <key>` in access_overrides)
+            # wins over the per-match host overrides, which win over the
+            # system-level rule, which wins over the default. Within each
+            # layer, a precise "name sub" key beats a bare "name" key.
+            mine = getattr(m, "access_overrides", None) or {}
+            if user and mine:
+                pre = f"@{user} "
+                if sub_key is not None and pre + sub_key in mine:
+                    return str(mine[pre + sub_key])
+                if pre + name in mine:
+                    return str(mine[pre + name])
+            for table in ({k: v for k, v in mine.items()
+                           if not k.startswith("@")},
                           m.rules.get("command_access")):
                 if not isinstance(table, dict) or not table:
                     continue
@@ -628,7 +638,7 @@ class CommandRegistry:
             # Identity-less surface (shouldn't happen for our contexts) —
             # don't gate, preserving pre-host-system behavior.
             return "allow"
-        access = self._effective_access(name, args, m)
+        access = self._effective_access(name, args, m, user)
         if access == "all":
             return "allow"
         is_owner = m.is_owner(user)
@@ -731,6 +741,13 @@ class CommandRegistry:
         cache_token = PARTIAL_CACHE.set(PARTIAL_CACHE.get()
                                         if PARTIAL_CACHE.get() is not None
                                         else {})
+        # Lines about one unit (deaths, revives) carry a tag naming it; every
+        # reply of this command drops those its channel's view can't see
+        # and strips the tag from the rest.
+        ctx = _UnitLineCtx(ctx, mgr)
+        user_token = COMMAND_USER.set(ctx_user_name(ctx) if ctx_user(ctx)
+                                      or getattr(ctx, "user_name", None)
+                                      else None)
         try:
             # Judged on the alias-RESOLVED name: an alias of `again` stored as
             # the last command made `!again` rerun itself forever.
@@ -742,6 +759,7 @@ class CommandRegistry:
             await _flush_formula_log(ctx)
             return result
         finally:
+            COMMAND_USER.reset(user_token)
             PARTIAL_CACHE.reset(cache_token)
             CURRENT_WORKSPACE.reset(ws_token)
             FORMULA_LOG_SINK.reset(sink_token)
@@ -798,7 +816,8 @@ class CommandRegistry:
         # pause_affects_hosts a host's are held for `!match resume`.
         if not admin_cmd:
             pm = self._paused_match(ctx, mgr)
-            if pm is not None and self._effective_access(name, args, pm) != "all":
+            if pm is not None and self._effective_access(
+                    name, args, pm, ctx_user(ctx)) != "all":
                 if gate == "queue":
                     return await ctx.send(_paused_msg(pm))
                 if (bool(pm.rules.get("pause_affects_hosts", False))
@@ -893,7 +912,9 @@ class CommandRegistry:
                 label = f"!{name} {' '.join(args)}".strip()
                 if len(label) > 80:
                     label = label[:77] + "..."
-                m_post.history.record_command(m_post, label, pre_state=pre_state)
+                m_post.history.record_command(m_post, label,
+                                              pre_state=pre_state,
+                                              by=COMMAND_USER.get() or "")
 
         # Condition-watchers: re-check on the active match now the top-level
         # command has settled (edge-triggered effects fire here). Only the
@@ -2648,6 +2669,18 @@ async def host_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # `map`) or loosen a gated one. Keys are "command" or
         # "command sub"; levels are all / host / host_only / owner.
         VALID = {"all", "host", "host_only", "owner"}
+        # user=<mention|id>: the override applies to that player only
+        # (stored as `@<id> <key>` among the match's overrides).
+        who = None
+        plain = []
+        for tok in args:
+            if tok.lower().startswith("user="):
+                who = _normalize_user_token(tok.split("=", 1)[1])
+                if not who:
+                    raise VTTError("user= names a player (a mention or id).")
+            else:
+                plain.append(tok)
+        args = plain
         asub = args[1].lower() if len(args) >= 2 else "list"
         if asub == "list":
             if not m.access_overrides:
@@ -2657,7 +2690,12 @@ async def host_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 )
             lines = [f"**{m.name}** command-access overrides:"]
             for k in sorted(m.access_overrides.keys()):
-                lines.append(f"- `{k}` → {m.access_overrides[k]}")
+                if k.startswith("@"):
+                    uid, _, key = k[1:].partition(" ")
+                    lines.append(f"- `{key}` → {m.access_overrides[k]} "
+                                 f"(for {_mention(uid)} only)")
+                else:
+                    lines.append(f"- `{k}` → {m.access_overrides[k]}")
             return await ctx.send("\n".join(lines))
         if asub == "set":
             if await return_help_if_not_enough_args(ctx, args, 4, "host", "access"):
@@ -2668,15 +2706,24 @@ async def host_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return await ctx.send(
                     f"❌ level must be one of: {', '.join(sorted(VALID))}."
                 )
-            m.access_overrides[key] = level
-            return await ctx.send(f"Access override set: `{key}` → {level}.")
+            if key.startswith("@"):
+                raise VTTError("Name the player with user=, not in the key.")
+            m.access_overrides[f"@{who} {key}" if who else key] = level
+            return await ctx.send(
+                f"Access override set: `{key}` → {level}"
+                + (f" for {_mention(who)} only." if who else "."))
         if asub == "clear":
             if await return_help_if_not_enough_args(ctx, args, 3, "host", "access"):
                 return
             key = args[2]
-            if m.access_overrides.pop(key, None) is None:
-                return await ctx.send(f"No override for `{key}`.")
-            return await ctx.send(f"Cleared access override for `{key}`.")
+            full = f"@{who} {key}" if who else key
+            if m.access_overrides.pop(full, None) is None:
+                return await ctx.send(
+                    f"No override for `{key}`"
+                    + (f" for {_mention(who)}." if who else "."))
+            return await ctx.send(
+                f"Cleared access override for `{key}`"
+                + (f" for {_mention(who)}." if who else "."))
         return await _help_fallback(ctx, ["host", "access"], args[1] if len(args) > 1 else None)
 
     if sub in ("add", "remove"):
@@ -4698,9 +4745,15 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "host", "access",
-    usage="!host access <set <cmd> <level> | clear <cmd> | list>",
+    usage=("!host access <set <cmd> <level> | clear <cmd> | list> "
+           "[user=<player>]"),
     desc=(
         "Per-match overrides of the command-access gate (owner only). "
+        "With `user=<mention or id>` an override applies to that player "
+        "only and wins over the match-wide ones: `!host access set ent all "
+        "user=@bob` lets bob run `!ent` without approval while everyone "
+        "else still needs it. Stored by user id, so a nickname change "
+        "keeps it. "
         "`set <cmd> <level>` keys on a command (\"find\") or "
         "command+sub (\"ent dump\"); levels: all / host / host_only / "
         "owner. Tighten a normally-free read so it needs host approval in "
@@ -6828,8 +6881,8 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         was_alive = e.is_alive
         hook_log = e.write_var(hp_var, before + delta)
         if eid not in m.entities:
+            # Its death line (death_message_format) follows the reply.
             ack = _hp_ack(eid, mode, delta, before, before + delta, "")
-            ack += f" `{eid}` died."
         else:
             if e._match is not None and e.is_alive != was_alive:
                 # What heal_entity / damage_entity do: a revive by heal, or
@@ -7664,13 +7717,16 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(out)
         if _pov_hides(m, pov, eid):
             # The reply lands in a channel whose POV can't see the actor.
-            now = "It is now an unseen unit's turn."
+            now = str(m.rules.get("turn_start_hidden_message_format", "") or "")
         else:
-            now = (f"It is now **{m.entity_display_name(e, pov)}**'s turn "
-                   f"(id `{eid[:8]}`)")
+            tctx = _entity_template_context(e, pov)
+            tctx.update({"short_id": eid[:8], "round": m.round_number})
+            fmt = str(m.rules.get("turn_start_message_format", "") or "")
+            now = _render_template(fmt, tctx) if fmt else ""
         # In the order things happened: the turn-end / round lines and hook
         # output first, whose turn it now is last.
-        return await ctx.send("\n".join(list(fire_log) + [now]))
+        lines = list(fire_log) + ([now] if now else [])
+        return await ctx.send("\n".join(lines) if lines else "✅")
     if sub == "set":
         if await return_help_if_not_enough_args(ctx, args, 2, "turn", "set"):
             return
@@ -7775,6 +7831,72 @@ def _view_pov(ctx: ReplyContext, m: "Match", args: List[str]) -> Optional[str]:
     if ov is not _NO_POV:
         return None if (ov is None or ov == "omniscient") else str(ov)
     return m.channel_pov(ctx.channel_key)
+
+
+def _unit_line_shown(ctx: ReplyContext, mgr: MatchManager, mid: str,
+                     eid: str, x: int, y: int) -> bool:
+    """Whether a tagged unit line (logic.UNIT_LINE_TAG) shows in this
+    channel: always without a filtering view; else when the view sees the
+    unit, its corpse, or (deleted) the cell. A line from another match than
+    the channel's shows only to an unfiltered view."""
+    cur = mgr.active_by_channel.get(ctx.channel_key)
+    m = mgr.matches.get(cur) if cur is not None else None
+    if m is None:
+        return True
+    pov = _query_pov(ctx, m)
+    if pov is None:
+        return True
+    if mid != m.id:
+        return False
+    if eid in m.entities:
+        return not _pov_hides(m, pov, eid)
+    loc = m.find_corpse(eid)
+    if loc is not None:
+        cx, cy, corpse = loc
+        return m.corpse_visible_to(eid, corpse, cx, cy, pov)
+    return m.in_bounds(x, y) and m.tile_visible_to(x, y, pov)
+
+
+def _filter_unit_lines(text: str, ctx: ReplyContext, mgr: MatchManager) -> str:
+    """`text` with tagged unit lines the channel's view can't see dropped
+    and the tags stripped from the rest."""
+    out = []
+    for line in text.split("\n"):
+        mo = UNIT_LINE_RE.search(line)
+        if mo is None:
+            out.append(line)
+            continue
+        if _unit_line_shown(ctx, mgr, mo.group(1), mo.group(2),
+                            int(mo.group(3)), int(mo.group(4))):
+            out.append(UNIT_LINE_RE.sub("", line))
+    return "\n".join(out)
+
+
+class _UnitLineCtx:
+    """A reply context whose send() filters tagged unit lines
+    (_filter_unit_lines); everything else passes through."""
+
+    def __init__(self, inner: Any, mgr: MatchManager):
+        object.__setattr__(self, "_inner", inner)
+        object.__setattr__(self, "_mgr", mgr)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(object.__getattribute__(self, "_inner"), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(object.__getattribute__(self, "_inner"), name, value)
+
+    def __delattr__(self, name: str) -> None:
+        delattr(object.__getattribute__(self, "_inner"), name)
+
+    async def send(self, message: Any = None, *a: Any, **k: Any) -> Any:
+        inner = object.__getattribute__(self, "_inner")
+        if isinstance(message, str) and UNIT_LINE_TAG in message:
+            message = _filter_unit_lines(
+                message, inner, object.__getattribute__(self, "_mgr"))
+            if not message.strip() and not a and not k:
+                return None
+        return await inner.send(message, *a, **k)
 
 
 def _query_pov(ctx: ReplyContext, m: "Match") -> Optional[str]:
@@ -9471,13 +9593,17 @@ async def dist_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 @registry.command(
     "reveal_fog",
     usage=("!reveal_fog <team> <all | at <x> <y> <r> | rect <x1> <y1> <x2> <y2> "
-           "| around <eid> <r> | clear> [turns=N] | !reveal_fog list"),
+           "| around <eid> <r> | cone <x> <y> <dir> <length> [half_angle] "
+           "| line <x1> <y1> <x2> <y2> | clear> [turns=N] | !reveal_fog list"),
     desc=(
         "Reveal fogged cells to a TEAM independent of unit vision (a scout "
         "ping / clairvoyance / GM reveal). A revealed cell shows terrain AND "
         "live entities. Forms: `all` (whole map), `at <x> <y> <r>` (Chebyshev "
         "disc), `rect <x1> <y1> <x2> <y2>`, `around <eid> <r>` (disc around an "
-        "entity's footprint), `clear` (drop the team's reveals). Optional "
+        "entity's footprint), `cone <x> <y> <dir> <length> [half_angle]` "
+        "(the cells_in_cone area, half angle 45 by default), `line <x1> <y1> "
+        "<x2> <y2>` (the cells_in_line cells), `clear` (drop the team's "
+        "reveals). Optional "
         "`turns=N` makes it TEMPORARY (expires after N rounds); omit for a "
         "permanent reveal. `!reveal_fog list` shows active reveals. Host-"
         "gated. Only meaningful with fog on; bypassed by omniscient views."
@@ -9508,7 +9634,8 @@ async def reveal_fog_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                               else "No active fog reveals.")
     if len(args) < 2:
         return await ctx.send(
-            "Usage: `!reveal_fog <team> all|at|rect|around|clear ...`.")
+            "Usage: `!reveal_fog <team> all|at|rect|around|cone|line|clear "
+            "...`.")
     team = args[0]
     form = args[1].lower()
     # Pull an optional turns=N from anywhere in the rest; the remaining tokens
@@ -9554,12 +9681,35 @@ async def reveal_fog_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return await ctx.send(f"❌ the radius must be 0 or more, got {r}.")
             for (ex, ey) in m.entity_cells(e):
                 cells |= _grid_box(m, ex - r, ey - r, ex + r, ey + r)
+        elif form in ("cone", "line"):
+            from formula import _cells_in_cone, _cells_in_line
+            limit = int(m.rules.get("formula_cell_limit", 100_000))
+            grid = (m.grid_width, m.grid_height)
+            if form == "cone":
+                # cone <x> <y> <dir> <length> [half_angle]
+                cx, cy, ln = int(rest[0]), int(rest[1]), int(rest[3])
+                half = int(rest[4]) if len(rest) > 4 else 45
+                if len(rest) > 5:
+                    raise IndexError
+                got = _cells_in_cone(cx, cy, rest[2], ln, half, limit=limit,
+                                     bounds=grid)
+            else:
+                # line <x1> <y1> <x2> <y2>
+                if len(rest) != 4:
+                    raise IndexError
+                got = _cells_in_line(*(int(v) for v in rest), limit=limit,
+                                     bounds=grid)
+            cells = {(int(c[0]), int(c[1])) for c in got
+                     if m.in_bounds(int(c[0]), int(c[1]))}
         else:
             return await ctx.send(
-                "Usage: `!reveal_fog <team> all|at|rect|around|clear ...`.")
+                "Usage: `!reveal_fog <team> all|at|rect|around|cone|line|clear "
+                "...`.")
     except (IndexError, ValueError):
         return await ctx.send(
             "❌ bad arguments for that form (coords/radius must be integers).")
+    except FormulaError as ex:
+        return await ctx.send(f"❌ {ex}")
     except NotFound as ex:
         return await ctx.send(f"❌ {ex}")
     n = m.reveal_cells(team, cells, duration)
@@ -9954,8 +10104,10 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 if not m.history.command_saves:
                     return await ctx.send("No command autosaves retained.")
                 lines = ["**Command autosaves:**"]
+                show_by = _attribution_shown(m, "history")
                 for s in m.history.command_saves:
-                    lines.append(f"- seq {s.sequence}: {s.short_summary()}  [{s.timestamp}]")
+                    by = f" — by {s.by}" if show_by and s.by else ""
+                    lines.append(f"- seq {s.sequence}: {s.short_summary()}{by}  [{s.timestamp}]")
                 return await ctx.send("\n".join(lines))
             if kind in ("manual", "manuals"):
                 if not m.history.manual_saves:
@@ -10278,10 +10430,37 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         snap_a = _resolve_snapshot_selector(m, args[1])
         snap_b = _resolve_snapshot_selector(m, args[2])
         lines = _format_snapshot_diff(snap_a, snap_b, args[1], args[2])
+        lines[1:1] = _authors_line(m, min(snap_a.sequence, snap_b.sequence),
+                                   max(snap_a.sequence, snap_b.sequence))
         return await ctx.send("\n".join(lines))
 
     # Fallback to help
     return await _help_fallback(ctx, ["history"], args[0] if args else None)
+
+
+def _attribution_shown(m: Match, where: str) -> bool:
+    """Whether the command_attribution rule shows authors in `where`
+    (history / log / diff)."""
+    raw = str(m.rules.get("command_attribution", "") or "")
+    return where in {w.strip() for w in raw.split(",")}
+
+
+def _authors_line(m: Match, lo: int, hi: Optional[int],
+                  undone: bool = False) -> List[str]:
+    """[a line naming who ran the commands between snapshot sequences `lo`
+    (included) and `hi` (excluded; None = up to now)], or [] when nobody is
+    known or command_attribution leaves `diff` out."""
+    if not _attribution_shown(m, "diff"):
+        return []
+    who: List[str] = []
+    for s in m.history.command_saves:
+        if s.sequence >= lo and (hi is None or s.sequence < hi) and s.by \
+                and s.by not in who:
+            who.append(s.by)
+    if not who:
+        return []
+    verb = "Undoes changes by" if undone else "Changes by"
+    return [f"{verb}: {', '.join(who)}"]
 
 
 async def _undo_preview(ctx, m: Match, snap: Snapshot, what: str):
@@ -10306,6 +10485,7 @@ async def _undo_preview(ctx, m: Match, snap: Snapshot, what: str):
         "now", what)
     lines[0] = (f"🔍 **Undo preview** — `{what}` would make these changes "
                 f"(nothing restored yet):")
+    lines[1:1] = _authors_line(m, snap.sequence, None, undone=True)
     later = sum(1 for x in (m.history.round_saves + m.history.turn_saves
                             + m.history.command_saves)
                 if x.sequence > snap.sequence)
@@ -11972,11 +12152,15 @@ async def _log_format_sub(ctx, fmt_args, mgr, m):
 
 @registry.command(
     "log", access="all",
-    usage="!log [n] | !log clear | !log format [<type> [<template>]]",
+    usage=("!log [n] [type=<t,...>] [who=<unit>] [round=<n|a-b>] [by=<user>] "
+           "| !log clear | !log format [<type> [<template>]]"),
     desc=(
         "Show the active match's event log (the combat log). `!log` or "
         "`!log <n>` shows the most recent n entries (default 20), rendered "
-        "via each event type's template. `!log clear` empties it. `!log "
+        "via each event type's template; `type=` (a comma list), `who=` (a "
+        "unit's id or name), `round=` (N or A-B) and `by=` (who ran the "
+        "command) filter them, and an entry names who ran its command when "
+        "the command_attribution rule includes `log`. `!log clear` empties it. `!log "
         "format` lists the per-type templates; `!log format <type> "
         "<template>` overrides one (placeholder syntax like "
         "entity_line_format); `!log format <type>` resets it to the "
@@ -11995,12 +12179,20 @@ async def log_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if args and args[0].lower() == "format":
         return await _log_format_sub(ctx, args[1:], mgr, m)
     n = 20
-    if args:
+    filters: Dict[str, str] = {}
+    for tok in args:
+        key, eq, val = tok.partition("=")
+        if eq and key.lower() in ("type", "who", "round", "by"):
+            if not val:
+                raise VTTError(f"`{tok}` needs a value.")
+            filters[key.lower()] = val
+            continue
         try:
-            n = int(args[0])
+            n = int(tok)
         except ValueError:
             return await ctx.send(
-                f"Expected a number, 'clear', or 'format'; got '{args[0]}'."
+                f"Expected a number, `type=`, `who=`, `round=`, `by=`, "
+                f"'clear', or 'format'; got '{tok}'."
             )
     # The log names every unit's spawns, moves, damage and statuses, hidden
     # ones included (pov_filters_queries).
@@ -12011,12 +12203,48 @@ async def log_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             "(pov_filters_queries).")
     if not m.event_log:
         return await ctx.send("Event log is empty.")
-    entries = m.event_log[-n:] if n > 0 else list(m.event_log)
-    header = f"**Event log** (showing {len(entries)} of {len(m.event_log)}):"
-    lines = [header]
+    pool = [e for e in m.event_log if _log_entry_matches(e, filters)]
+    if not pool:
+        return await ctx.send("No event log entry matches those filters.")
+    entries = pool[-n:] if n > 0 else list(pool)
+    of = (f"{len(pool)} matching, {len(m.event_log)} in all" if filters
+          else f"{len(m.event_log)}")
+    lines = [f"**Event log** (showing {len(entries)} of {of}):"]
+    show_by = _attribution_shown(m, "log")
     for e in entries:
-        lines.append(f"`R{e.get('round')}` " + _render_event(m, e))
+        by = f" — by {e['by']}" if show_by and e.get("by") else ""
+        lines.append(f"`R{e.get('round')}` " + _render_event(m, e) + by)
     return await ctx.send("\n".join(lines))
+
+
+def _log_entry_matches(e: Dict[str, Any], filters: Dict[str, str]) -> bool:
+    """Whether event-log entry `e` passes `!log`'s filters: type= (a comma
+    list), who= (the unit's id or name, also matching an action's actor),
+    round= (N or A-B), by= (who ran the command, case-insensitive)."""
+    if "type" in filters:
+        kinds = {t.strip() for t in filters["type"].split(",") if t.strip()}
+        if str(e.get("type")) not in kinds:
+            return False
+    if "who" in filters:
+        want = filters["who"].lower()
+        names = {str(e.get(k, "")).lower() for k in
+                 ("entity", "name", "actor", "actor_name", "target")}
+        if want not in names:
+            return False
+    if "round" in filters:
+        lo, _, hi = filters["round"].partition("-")
+        try:
+            lo_n = int(lo)
+            hi_n = int(hi) if hi else lo_n
+        except ValueError:
+            raise VTTError(f"round= is a number or a range like 2-4, not "
+                           f"`{filters['round']}`.")
+        if not (lo_n <= int(e.get("round") or 0) <= hi_n):
+            return False
+    if "by" in filters and str(e.get("by", "")).lower() != \
+            filters["by"].lower():
+        return False
+    return True
 
 
 registry.annotate_sub(
