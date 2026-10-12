@@ -23,6 +23,19 @@ import keyword
 FORMULA_LOG_SINK: "contextvars.ContextVar[Optional[List[str]]]" = (
     contextvars.ContextVar("vtt_formula_log_sink", default=None))
 
+# Who ran the command that is running (its display name): stamped on the
+# event-log entries it writes (`by`) for command attribution. None outside a
+# command.
+COMMAND_USER: "contextvars.ContextVar[Optional[str]]" = (
+    contextvars.ContextVar("vtt_command_user", default=None))
+
+# A line about one unit (a death, a revive) is prefixed with this tag —
+# UNIT_LINE_TAG + "<match>|<unit>|<x>|<y>" + UNIT_LINE_TAG — so the command
+# layer, which knows the channel's view, can drop it where that view can't
+# see the unit (vtt_commands._filter_unit_lines) and strips it everywhere.
+UNIT_LINE_TAG = "\u2063"
+UNIT_LINE_RE = re.compile("\u2063([^|\u2063]*)\\|([^|\u2063]*)\\|(-?\\d+)\\|(-?\\d+)\u2063")
+
 # The workspace (MatchManager) whose command is running: formulas reach the
 # server's saved entity templates through it (summon_template). Set by each
 # CommandRegistry.run; None outside a command.
@@ -863,6 +876,27 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "entities. 'last': all teamless go after all teamed. The "
             "teamless block is always internally sorted by individual "
             "turnorder_var. Ignored entirely when team_grouping='none'."
+        ),
+    },
+    "turnorder_tiebreak_var": {
+        "default": "",
+        "schema": {"type": "str"},
+        "desc": (
+            "A unit var (`dex`, or a dotted path like `stats.agi`) that breaks "
+            "a tie in turnorder_var BEFORE turnorder_tiebreaker does: the "
+            "higher value goes first (turnorder_tiebreak_direction). A unit "
+            "without a number there goes after those with one. It names a "
+            "var the GM already keeps, so changing it renames nothing. "
+            "Empty (default) = off."
+        ),
+    },
+    "turnorder_tiebreak_direction": {
+        "default": "highest_first",
+        "schema": {"type": "enum", "choices": ["highest_first", "lowest_first"]},
+        "desc": (
+            "Which turnorder_tiebreak_var value goes first on an initiative "
+            "tie: highest_first (default) or lowest_first. Independent of "
+            "turnorder_direction."
         ),
     },
     "turnorder_tiebreaker": {
@@ -2881,7 +2915,9 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "event_log_events": {
         "default": ",".join(EVENT_LOG_AUTO_TYPES),
-        "schema": {"type": "str"},
+        "schema": {"type": "str", "word_list": list(EVENT_LOG_AUTO_TYPES) + [
+            "part_destroyed", "segment_severed", "watcher_fired",
+            "winner_declared"]},
         "desc": (
             "Comma-separated list of which AUTO event types the engine "
             "records (subject to event_log_enabled). Default is all of "
@@ -2948,6 +2984,60 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "{match.<path>} (a match var, e.g. {match.weather}; a missing "
             "var renders empty). Empty = no line. Not used under ATB, which "
             "has no rounds."
+        ),
+    },
+    "command_attribution": {
+        "default": "history,log,diff",
+        "schema": {"type": "str", "word_list": ["history", "log", "diff"]},
+        "desc": (
+            "Where to show who ran a command (it is always recorded): "
+            "`history` in `!history list commands`, `log` on `!log` entries "
+            "a command wrote, `diff` in the header of `!history diff` and "
+            "undo previews. A comma list of those words; empty = shown "
+            "nowhere. `!log by=<name>` filters by it either way."
+        ),
+    },
+    "turn_start_message_format": {
+        "default": "It is now **{name}**'s turn (id `{short_id}`)",
+        "schema": {"type": "str"},
+        "desc": (
+            "The line `!turn next` ends with, naming whose turn it is now. "
+            "Placeholders as in entity_line_format ({name}, {id}, {hp}, "
+            "{team}, any var, {?var?}...{/?} conditionals), plus {short_id} "
+            "(the id's first 8 characters) and {round}. A viewer outside a "
+            "disguised unit's team sees the disguise. Empty = no line."
+        ),
+    },
+    "turn_start_hidden_message_format": {
+        "default": "It is now an unseen unit's turn.",
+        "schema": {"type": "str"},
+        "desc": (
+            "The turn_start_message_format line for a channel whose view can't "
+            "see the unit whose turn it is (no placeholders: it names "
+            "nothing). Empty = no line."
+        ),
+    },
+    "death_message_format": {
+        "default": "💀 **{name}** (`{id}`) died.",
+        "schema": {"type": "str"},
+        "desc": (
+            "The line printed for EVERY death, whatever caused it (a command, "
+            "a formula, a passive, a status tick, a turn-start effect), and "
+            "for a destroyed body part. Placeholders: {name}, {id}, {x}, {y} "
+            "(where it died), {team}, {part_of} (the parent of a part, else "
+            "empty), {round}, {match}, and any of the unit's vars by name or "
+            "dotted path ({max_hp}, {stats.str}; missing = empty). Hidden "
+            "from a channel whose view can't see the unit, its corpse or "
+            "the cell. Empty = no line."
+        ),
+    },
+    "revive_message_format": {
+        "default": "✨ **{name}** (`{id}`) was revived.",
+        "schema": {"type": "str"},
+        "desc": (
+            "The line printed for every revive (`!ent revive`, revive(), an "
+            "action), with the death_message_format placeholders. Hidden "
+            "from a channel whose view can't see the unit. Empty = no line."
         ),
     },
     "skip_all_round_limit": {
@@ -3155,6 +3245,16 @@ def _coerce_rule_value(key: str, raw_value: str):
         # (you can extend later to join the rest of args for multi-word strings)
         if key in VAR_NAME_RULES:
             return check_var_name_rule(key, raw_value)
+        words = spec.get("word_list")
+        if words is not None:
+            # A comma list of known words; a typo'd one used to be ignored.
+            got = [w.strip() for w in raw_value.split(",") if w.strip()]
+            bad = [w for w in got if w not in words]
+            if bad:
+                raise VTTError(f"Setting '{key}' takes a comma list of: "
+                               f"{', '.join(words)} (not "
+                               f"{', '.join(bad)}).")
+            return ",".join(got)
         choices = spec.get("choices")
         if choices and raw_value not in choices and not (
                 key == "part_to_main_cap_default"
@@ -5836,6 +5936,14 @@ class Entity:
                         f"{ev.old_value!r} → {ev.new_value!r}"
                     )
                     break
+                tb = str(self._match.rules.get("turnorder_tiebreak_var", "")
+                         or "")
+                if tb and (ev.key == tb or tb.startswith(ev.key + ".")):
+                    self._match._mark_turn_order_dirty(
+                        f"`{self.id}`.{ev.key}: "
+                        f"{ev.old_value!r} → {ev.new_value!r}"
+                    )
+                    break
         # Drain accumulated warnings ONLY at top-level. Nested writes
         # (from passive formulas) accumulate warnings on the match but
         # don't surface them — the outermost call collects them all.
@@ -5943,6 +6051,12 @@ class Entity:
                 self._match._mark_turn_order_dirty(
                     f"`{self.id}`.{team_var} removed (was {old!r})"
                 )
+            else:
+                tb = str(self._match.rules.get("turnorder_tiebreak_var", "")
+                         or "")
+                if tb and (path == tb or tb.startswith(path + ".")):
+                    self._match._mark_turn_order_dirty(
+                        f"`{self.id}`.{path} removed (was {old!r})")
         if is_top_level_write and self._match is not None and self._match._var_event_warnings:
             log.extend(self._match._var_event_warnings)
             self._match._var_event_warnings = []
@@ -10297,10 +10411,28 @@ class Match:
             # default 'name'
             return (e.name.lower(), e.id)
 
+        tb_var = str(self.rules.get("turnorder_tiebreak_var", "") or "")
+        tb_dir = -1 if self.rules.get("turnorder_tiebreak_direction",
+                                      "highest_first") == "highest_first" else 1
+
+        def tiebreak_value(e: "Entity") -> Tuple:
+            # (0, value) for a number at turnorder_tiebreak_var, (1, 0) for
+            # a unit without one (it goes after), () when the rule is off.
+            if not tb_var:
+                return ()
+            cur: Any = e.vars
+            for seg in tb_var.split("."):
+                cur = cur.get(seg) if isinstance(cur, dict) else None
+            if isinstance(cur, (int, float)) and not isinstance(cur, bool) \
+                    and math.isfinite(cur):
+                return (0, tb_dir * cur)
+            return (1, 0)
+
         def member_key(e: "Entity") -> Tuple:
             # Members are always sorted by direction-aware individual
-            # initiative first, then the configured tiebreaker.
-            return (init_dir * e.initiative,) + tie_key(e)
+            # initiative first, then turnorder_tiebreak_var, then the
+            # configured tiebreaker.
+            return (init_dir * e.initiative,) + tiebreak_value(e) + tie_key(e)
 
         if grouping == "none":
             ordered = sorted(candidates, key=member_key)
@@ -10632,19 +10764,20 @@ class Match:
                 return cur
             if not self.turn_order:
                 self.turn_vacated = None
-                log.append(f"💀 `{cur}` died at the start of its turn; "
-                           f"no one is left to take the turn.")
+                self._pull_surfaced(log)
+                log.append("⏭ No one is left to take the turn.")
                 return None
             guard -= 1
             if guard <= 0:
                 # Every unit has died on its turn start without leaving the
                 # order (an alive_condition that disagrees with the death
                 # pipeline). Stop here rather than cycling.
-                log.append(f"💀 `{cur}` died at the start of its turn, and so "
-                           f"did every unit after it; the turn stays here.")
+                self._pull_surfaced(log)
+                log.append("⏭ Every unit died at the start of its turn; the "
+                           "turn stays here.")
                 return cur
-            log.append(f"💀 `{cur}` died at the start of its turn; the turn "
-                       f"passes to the next unit.")
+            self._pull_surfaced(log)
+            log.append("⏭ The turn passes to the next unit.")
             vacated, self.turn_vacated = self.turn_vacated, None
             if vacated == "same":
                 continue    # the next unit already sits at active_index
@@ -10886,18 +11019,18 @@ class Match:
             if e is not None and e.is_alive:
                 break
             if not self.turn_order:
-                log.append(f"💀 `{new_cur}` died at the start of its turn; "
-                           f"no one is left to take the turn.")
+                self._pull_surfaced(log)
+                log.append("⏭ No one is left to take the turn.")
                 self._begin_turn()
                 return (None, log)
             guard -= 1
             if guard <= 0:
-                log.append(f"💀 `{new_cur}` died at the start of its turn, "
-                           f"and so did every unit after it; the turn stays "
-                           f"here.")
+                self._pull_surfaced(log)
+                log.append("⏭ Every unit died at the start of its turn; the "
+                           "turn stays here.")
                 break
-            log.append(f"💀 `{new_cur}` died at the start of its turn; the "
-                       f"turn passes to the next unit.")
+            self._pull_surfaced(log)
+            log.append("⏭ The turn passes to the next unit.")
         self._begin_turn()
         return (new_cur, log)
 
@@ -13596,6 +13729,7 @@ class Match:
         # Capture identity/position now — after e.remove() the entity is
         # detached, so the log event must read these up front.
         dead_name, dead_x, dead_y = e.name, e.x, e.y
+        dead_vars = copy.deepcopy(e.vars)
         try:
             log = self.fire_hook("on_death", target_ids=[entity_id])
             # Re-check entity still exists — a paranoid on_death passive
@@ -13604,6 +13738,8 @@ class Match:
             if entity_id not in self.entities:
                 self.log_event("death", entity=entity_id, name=dead_name,
                                x=dead_x, y=dead_y)
+                self._announce("death_message_format", entity_id, dead_name,
+                               dead_x, dead_y, dead_vars)
                 return log
             result = self._effective_death_result(e)
             if result == "corpse":
@@ -13623,9 +13759,41 @@ class Match:
                     part.remove(despawn=False)
             self.log_event("death", entity=entity_id, name=dead_name,
                            x=dead_x, y=dead_y)
+            self._announce("death_message_format", entity_id, dead_name,
+                           dead_x, dead_y, dead_vars)
         finally:
             self._death_processing = max(0, self._death_processing - 1)
         return log
+
+    _MSG_FMT_RE = re.compile(r"\{([\w.]+)\}")
+
+    def _announce(self, rule: str, eid: str, name: str, x: Any, y: Any,
+                  unit_vars: Dict[str, Any], part_of: str = "") -> None:
+        """Show the `rule` line (death_message_format /
+        revive_message_format) for unit `eid`, tagged for the channel-view
+        filter, through surface_log (the running command shows it last)."""
+        fmt = str(self.rules.get(rule, "") or "")
+        if not fmt:
+            return
+        team_var = str(self.rules.get("team_var", "team"))
+        fixed = {"name": name, "id": eid, "x": x, "y": y,
+                 "team": unit_vars.get(team_var, "") if isinstance(unit_vars, dict) else "",
+                 "part_of": part_of or "", "round": self.round_number,
+                 "match": self.name}
+
+        def sub(mo):
+            key = mo.group(1)
+            if key in fixed:
+                return str(fixed[key] if fixed[key] is not None else "")
+            cur: Any = unit_vars
+            for seg in key.split("."):
+                if not isinstance(cur, dict) or seg not in cur:
+                    return ""
+                cur = cur[seg]
+            return str(cur)
+        text = self._MSG_FMT_RE.sub(sub, fmt)
+        self.surface_log([f"{UNIT_LINE_TAG}{self.id}|{eid}|{x}|{y}"
+                          f"{UNIT_LINE_TAG}{text}"])
 
     def kill_entity(self, eid: str) -> Tuple[bool, List[str]]:
         """Unconditionally kill `eid`, bypassing the death CONDITION so
@@ -13825,6 +13993,8 @@ class Match:
         p.vars["__part_destroyed"] = True   # raw set: no write_var recursion
         self.log_event("part_destroyed", entity=p.id, name=p.name,
                        part_of=p.part_of or "")
+        self._announce("death_message_format", p.id, p.name, p.x, p.y,
+                       p.vars, part_of=p.part_of or "")
         log = self.fire_hook("on_death", target_ids=[p.id])
         # A destroyed limb LINGERS attached (it doesn't route through
         # Entity.remove), so resolve its anchored auras here too — same
@@ -14326,6 +14496,8 @@ class Match:
         # healed entity passes this check as a no-op.
         if e.id in self.entities:
             self.log_event("revive", entity=e.id, name=e.name)
+            self._announce("revive_message_format", e.id, e.name, e.x, e.y,
+                           e.vars, part_of=e.part_of or "")
         death_log: List[str] = []
         if e.id in self.entities:
             death_log = self.check_death(e.id)
@@ -15483,6 +15655,9 @@ class Match:
             "turn": self.active_index,
         }
         entry.update(fields)
+        by = COMMAND_USER.get()
+        if by and "by" not in entry:
+            entry["by"] = by
         self.event_log.append(entry)
         self._trim_event_log()
         return True
@@ -15937,8 +16112,9 @@ class Match:
 
     def entity_color(self, e: "Entity",
                      pov_team: Optional[str] = None) -> Optional[str]:
-        """The resolved color NAME for `e` (or None): its `color` var wins,
-        else its team's color — the match team_colors map, defaulting to
+        """The resolved color NAME for `e` (or None): its `color` var wins (a
+        palette name, or a formula expression with self = the unit whose
+        result is one; an unreadable one falls through), else its team's color — the match team_colors map, defaulting to
         the team's own name when that name is itself a palette color (so a
         team literally named 'red' renders red). Unknown names -> None. When
         `e` is disguised to `pov_team` (116), the disguise's `color` wins."""
@@ -15948,8 +16124,13 @@ class Match:
             if isinstance(dc, str) and dc in TEXT_COLORS:
                 return dc
         c = e.vars.get("color")
-        if isinstance(c, str) and c in TEXT_COLORS:
-            return c
+        if isinstance(c, str) and c:
+            # A palette name, or a formula with self = the unit (and
+            # pov_team): red when wounded, green when poisoned.
+            got = self._resolve_color_value(c, {"pov_team": pov_team},
+                                            target=e.id)
+            if got is not None:
+                return got
         team = e.team
         if team:
             tc = self.team_colors.get(team)
@@ -15970,8 +16151,8 @@ class Match:
                 return n
         return e.name or e.id
 
-    def _resolve_color_value(self, val: Any,
-                             extras: Dict[str, Any]) -> Optional[str]:
+    def _resolve_color_value(self, val: Any, extras: Dict[str, Any],
+                             target: Optional[str] = None) -> Optional[str]:
         """Resolve a tile/zone `color` data value to a palette NAME or None.
         A bare TEXT_COLORS name is a literal; anything else is treated as a
         formula EXPRESSION (evaluated with `extras` bound — tile_x/tile_y
@@ -15987,7 +16168,8 @@ class Match:
         from formula import FormulaEngine, EvalCtx, FormulaError
         try:
             res = FormulaEngine(self).eval_expression(
-                val, EvalCtx(this=self.current_entity_id(), extras=dict(extras)))
+                val, EvalCtx(this=self.current_entity_id(), target=target,
+                             extras=dict(extras)))
         except FormulaError:
             return None
         res = str(res) if res is not None else ""
@@ -17366,6 +17548,16 @@ class Match:
                 ))
         total_steps = sum(max(1, int(n)) for _, n in moves)
         return len(members), total_steps, log
+
+    def _pull_surfaced(self, log: List[str]) -> None:
+        """Move the lines surfaced so far in this command (deaths, ...) into
+        `log`, so they read in order with the lines a turn change returns."""
+        if self._runtime_buffer is not None:
+            return
+        sink = FORMULA_LOG_SINK.get()
+        if sink:
+            log.extend(sink)
+            sink.clear()
 
     def surface_log(self, lines: Optional[List[str]]) -> None:
         """Pass on the log of a change a FORMULA made (summon, kill, a var
@@ -18796,8 +18988,16 @@ class MatchManager:
         match's rules: a system edit, a load, an undo / restore) and move its
         units and corpses to the var names those rules give. Returns the
         rename notes."""
+        old = m.rules or {}
         m.rules = self._build_rules_dict(self.systems[m.system_name])
-        return m.sync_all_var_names()
+        notes = m.sync_all_var_names()
+        # A changed turn-order rule re-sorts the order (as a changed
+        # initiative does, under turnorder_change_policy); a match loaded
+        # from disk has no rules to compare yet and keeps its saved order.
+        if old and any(old.get(k) != m.rules.get(k) for k in m.rules
+                       if k.startswith("turnorder_")):
+            m._mark_turn_order_dirty("turn-order rules changed")
+        return notes
 
     def refresh_match_rules(self, system_name: str,
                             notes: Optional[List[str]] = None) -> int:

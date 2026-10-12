@@ -105,6 +105,9 @@ class Snapshot:
     label: str
     _state: Optional[Dict[str, Any]] = None
     path: Optional[str] = None
+    # Who ran the command a command snapshot comes before ("" for the
+    # automatic and manual ones, and for snapshots saved before it existed).
+    by: str = ""
 
     @property
     def state(self) -> Dict[str, Any]:
@@ -137,6 +140,7 @@ class Snapshot:
             "active_entity_id": self.active_entity_id,
             "timestamp": self.timestamp,
             "label": self.label,
+            "by": self.by,
         }
 
     @staticmethod
@@ -152,6 +156,7 @@ class Snapshot:
             timestamp=d.get("timestamp", ""),
             label=d.get("label", ""),
             path=path,
+            by=str(d.get("by") or ""),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -164,6 +169,7 @@ class Snapshot:
             "active_entity_id": self.active_entity_id,
             "timestamp": self.timestamp,
             "label": self.label,
+            "by": self.by,
             "state": self.state,
         }
 
@@ -179,6 +185,7 @@ class Snapshot:
             timestamp=d.get("timestamp", ""),
             label=d.get("label", ""),
             _state=d["state"],
+            by=str(d.get("by") or ""),
         )
 
     def short_summary(self) -> str:
@@ -281,13 +288,14 @@ class MatchHistory:
 
     def record_command(
         self, match: "Match", cmd_label: str,
-        pre_state: Optional[Dict[str, Any]] = None,
+        pre_state: Optional[Dict[str, Any]] = None, by: str = "",
     ) -> Snapshot:
         """Snapshot taken before a mutating command. The dispatcher
         captures pre-state up front and only calls this if the command
         actually changed the match — read-only commands and no-op
         mutations don't accumulate snapshots."""
         s = self._make_snapshot(match, "command", label=cmd_label, state=pre_state)
+        s.by = by
         self.command_saves.append(s)
         self._prune_commands(match)
         return s
