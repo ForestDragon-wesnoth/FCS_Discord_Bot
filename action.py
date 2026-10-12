@@ -47,6 +47,7 @@ surface (vtt_commands.py) gains `!action`.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
+import contextvars
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from logic import VTTError, NotFound
@@ -192,6 +193,12 @@ def _restore_rng(match: "Match", state: Dict[str, Any]) -> None:
     rng = getattr(match, "_rng", None)
     if rng is not None and "match" in state:
         rng.setstate(state["match"])
+
+
+# Answers given at an interactive prompt during the command running now, in
+# order: the command journal replays them as `answer=` tokens.
+INTERACTIVE_ANSWERS: "contextvars.ContextVar[Optional[list]]" = \
+    contextvars.ContextVar("vtt_interactive_answers", default=None)
 
 
 async def _obtain_answer(ctx: Any, nc: "ChoiceNeeded") -> Any:
@@ -1267,6 +1274,9 @@ async def run_action(
                     )
                 try:
                     ans = await _obtain_answer(ctx, nc)
+                    _log = INTERACTIVE_ANSWERS.get()
+                    if _log is not None:
+                        _log.append(ans)
                 except ActionFail as af:
                     return _finish_action_fail(af)
                 match._choice_answers.append(ans)
@@ -1421,6 +1431,10 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
     # clobbered. Only SERIALIZED state should come from `restored`.
     preserved_attrs = (
         "_rng", "_rng_seed",
+        # The RNG keeps its live seed and position (not undo state).
+        "rng_seed", "rng_pos",
+        # The command journal records the match from outside its state.
+        "journal",
         "_var_event_depth", "_var_event_warned", "_var_event_warnings",
         "_action_depth", "_runtime_buffer",
         # The mid-body choice queue + cursor must survive an action's

@@ -38,7 +38,7 @@ _FREE_SLOTS = {
     "args", "tokens", "label", "user", "server", "metric",
     "anchor", "word", "type", "template_text", "winner", "stat", "pid",
     "passive_id", "path", "var.path", "key", "dest_path", "stash_path",
-    "shape args", "cmd1", "cmd2",
+    "shape args", "cmd1", "cmd2", "file", "seed", "pos",
 }
 # Placeholders that name a unit.
 _ENTITY_SLOTS = {

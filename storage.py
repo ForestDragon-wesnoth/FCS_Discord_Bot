@@ -73,6 +73,14 @@ def _dump(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"))
 
 
+# Server-wide lists kept beside systems.json: `_written` key -> (file name,
+# MatchManager attribute).
+SERVER_LOGS: Dict[str, Tuple[str, str]] = {
+    "syshist": ("system_history.json", "system_history"),
+    "audit": ("audit.json", "audit_log"),
+}
+
+
 def _disk_state(d: Dict[str, Any]) -> Dict[str, Any]:
     """A match state as written to disk: without its `rules`, a copy of its
     game system's (5-6 KB a match, and again in every undo snapshot) that is
@@ -157,6 +165,12 @@ class Storage:
         # storage_trim_autosaves per match as of the last commit (see
         # _trim_candidates).
         self._trim_before: Dict[str, Dict[str, bool]] = {}
+        # Command journals on disk, per server: {match id: {segment number:
+        # entries written}} (see write_journals).
+        self._jwritten: Dict[str, Dict[str, Dict[int, int]]] = {}
+        # The matches whose files the last commit of each server rewrote:
+        # a journaled match changed from outside its channel shows up here.
+        self.last_changed: Dict[str, set] = {}
         self._load_settings()
         # The owner's rule ceilings are process-wide (logic.RULE_CEILINGS).
         RULE_CEILINGS.clear()
@@ -179,6 +193,9 @@ class Storage:
 
     def _history_dir(self, key: str, mid: str) -> str:
         return os.path.join(self.server_dir(key), "matches", mid, "history")
+
+    def _journal_dir(self, key: str, mid: str) -> str:
+        return os.path.join(self.server_dir(key), "matches", mid, "journal")
 
     def _snap_file(self, key: str, mid: str, seq: int) -> str:
         return os.path.join(self._history_dir(key, mid), f"{seq}.json")
@@ -405,8 +422,10 @@ class Storage:
                     label = f"match {name[:-5]}"
                     out[label] = out.get(label, 0) + _file_size(path)
                 elif os.path.isdir(path):
+                    jsize = _dir_size(os.path.join(path, "journal"))
                     label = f"match {name} undo history"
-                    out[label] = out.get(label, 0) + _dir_size(path)
+                    out[label] = out.get(label, 0) + _dir_size(path) - jsize
+                    out[f"match {name} journal"] = jsize
         tdir = os.path.join(sdir, "templates")
         if os.path.isdir(tdir):
             trash = _dir_size(os.path.join(tdir, TRASH_DIR))
@@ -418,6 +437,10 @@ class Storage:
         out["workspace and systems"] = sum(
             _file_size(os.path.join(sdir, f))
             for f in ("workspace.json", "systems.json"))
+        out["system undo history"] = _file_size(
+            os.path.join(sdir, SERVER_LOGS["syshist"][0]))
+        out["audit log"] = _file_size(os.path.join(sdir,
+                                                   SERVER_LOGS["audit"][0]))
         return sorted(((k, v) for k, v in out.items() if v > 0),
                       key=lambda kv: (-kv[1], kv[0]))
 
@@ -566,9 +589,26 @@ class Storage:
                 hnote = self._load_history(mgr, m)
                 if hnote:
                     notes.append(hnote)
+                jnote = self._load_journal(mgr, m)
+                if jnote:
+                    notes.append(jnote)
                 mgr.matches[mid] = m
         mgr.active_by_channel = {ch: mid for ch, mid in mgr.active_by_channel.items()
                                  if mid in mgr.matches}
+        # The `!system undo` steps and the `!server audit` log.
+        for _k, (fname, attr) in SERVER_LOGS.items():
+            setattr(mgr, attr, [])
+            path = os.path.join(sdir, fname)
+            if os.path.exists(path):
+                try:
+                    raw = self._read_json(path)
+                    if not isinstance(raw, list) or not all(
+                            isinstance(e, dict) for e in raw):
+                        raise ValueError("not a list of entries")
+                    setattr(mgr, attr, raw)
+                except Exception as ex:  # noqa: BLE001
+                    notes.append(self._quarantine(key, path,
+                                                  type(ex).__name__))
         notes.extend(self.load_templates(mgr))
         self._remember(mgr, w)
         return notes
@@ -613,7 +653,8 @@ class Storage:
     @staticmethod
     def _blank_written() -> Dict[str, Any]:
         return {"workspace": None, "systems": None, "matches": {},
-                "index": {}, "seqs": {}, "hist": {}}
+                "index": {}, "seqs": {}, "hist": {},
+                "syshist": None, "audit": None}
 
     @staticmethod
     def _workspace_dict(mgr: MatchManager) -> Dict[str, Any]:
@@ -632,6 +673,8 @@ class Storage:
         """Record the in-memory state as what's on disk (after a load)."""
         w["workspace"] = _dump(self._workspace_dict(mgr))
         w["systems"] = _dump(self._systems_dict(mgr))
+        for k, (_f, attr) in SERVER_LOGS.items():
+            w[k] = _dump(getattr(mgr, attr))
         w["matches"] = {mid: _dump(_disk_state(m.to_dict(include_history=False)))
                         for mid, m in mgr.matches.items()}
         w["index"] = {}
@@ -640,6 +683,9 @@ class Storage:
         self._trim_before[mgr.guild_key] = {
             mid: bool(m.rules.get("storage_trim_autosaves", True))
             for mid, m in mgr.matches.items()}
+        self._jwritten[mgr.guild_key] = {
+            mid: {seg["no"]: len(seg["entries"]) for seg in m.journal.segments}
+            for mid, m in mgr.matches.items() if m.journal is not None}
         for mid, m in mgr.matches.items():
             h = m.history
             w["hist"][mid] = (h._seq, h._turn_index)
@@ -660,6 +706,12 @@ class Storage:
                  "matches": dict(w["matches"]), "index": dict(w["index"]),
                  "seqs": {k: set(v) for k, v in w["seqs"].items()},
                  "hist": dict(w["hist"])}
+        for k, (fname, attr) in SERVER_LOGS.items():
+            after[k] = w.get(k)
+            text = _dump(getattr(mgr, attr))
+            if text != w.get(k):
+                plan[os.path.join(sdir, fname)] = text
+                after[k] = text
         text = _dump(self._workspace_dict(mgr))
         if text != w["workspace"]:
             plan[os.path.join(sdir, "workspace.json")] = text
@@ -702,7 +754,7 @@ class Storage:
                         except Exception:
                             pass        # unreadable: it stays unusable
                         s.path = None
-                plan[os.path.join(sdir, "matches", mid)] = None
+                plan[self._history_dir(key, mid)] = None
                 after["index"].pop(mid, None)
                 after["seqs"].pop(mid, None)
         for mid in list(w["matches"]):
@@ -758,6 +810,9 @@ class Storage:
         w = self._written.setdefault(key, self._blank_written())
         msgs: List[str] = []
         plan, after = self._plan(mgr, w)
+        self.last_changed[key] = {
+            mid for mid in mgr.matches
+            if plan.get(self._match_file(key, mid)) is not None}
         if not plan:
             self._maybe_purge_trash()
             return msgs
@@ -796,6 +851,7 @@ class Storage:
                 refusal = self._over_limit(key, delta)
             if refusal:
                 self.rollback(mgr)
+                self.last_changed[key] = set()
                 return [refusal + " The command was undone."]
         for path, text in plan.items():
             if text is None:
@@ -827,6 +883,9 @@ class Storage:
         if w["systems"] is not None:
             mgr.systems = {n: GameSystem.from_dict(d)
                            for n, d in json.loads(w["systems"]).items()}
+        for k, (_f, attr) in SERVER_LOGS.items():
+            if w.get(k) is not None:
+                setattr(mgr, attr, json.loads(w[k]))
         if w["workspace"] is not None:
             ws = json.loads(w["workspace"])
             mgr.active_by_channel = dict(ws.get("active_by_channel") or {})
@@ -845,6 +904,7 @@ class Storage:
                 _rollback_match(m, mgr, state)
             if m.system_name in mgr.systems:
                 mgr.apply_system_rules(m)
+            self._truncate_journal(key, m)
             itext = w["index"].get(mid)
             if itext is not None:
                 m.history = MatchHistory.from_index(
@@ -860,6 +920,113 @@ class Storage:
                     del h.manual_saves[name]
                 h._seq, h._turn_index = seq, turn
 
+    # ---- command journals (journal.py) -----------------------------------
+    def _truncate_journal(self, key: str, m: Match) -> None:
+        """After a rollback: the match's journal as it is on disk (entries a
+        refused command added go)."""
+        j = m.journal
+        done = self._jwritten.get(key, {}).get(m.id)
+        if j is None or done is None:
+            return
+        j.segments = [seg for seg in j.segments if seg["no"] in done]
+        for seg in j.segments:
+            del seg["entries"][done[seg["no"]]:]
+        last = [e["n"] for e in j.entries()]
+        j.next_n = (max(last) + 1 if last else
+                    (j.segments[-1]["start"].get("first_n", 1)
+                     if j.segments else 1))
+        if not j.segments:
+            m.journal = None
+
+    def write_journals(self, mgr: MatchManager) -> None:
+        """Bring each match's journal files in line with its journal: a new
+        segment writes its header and entries, a grown one appends its new
+        entries, a dropped one is deleted."""
+        if not self.persist:
+            return
+        key = mgr.guild_key
+        jw = self._jwritten.setdefault(key, {})
+        for mid in [mid for mid in jw if mid not in mgr.matches]:
+            del jw[mid]
+        grown = 0
+        for mid, m in mgr.matches.items():
+            j = m.journal
+            done = jw.setdefault(mid, {})
+            jdir = self._journal_dir(key, mid)
+            live = {seg["no"]: seg for seg in j.segments} if j else {}
+            for no in [no for no in done if no not in live]:
+                for ext in ("json", "jsonl"):
+                    path = os.path.join(jdir, f"{no}.{ext}")
+                    grown -= _file_size(path)
+                    _remove_path(path)
+                del done[no]
+            for no, seg in live.items():
+                n = len(seg["entries"])
+                head = os.path.join(jdir, f"{no}.json")
+                body = os.path.join(jdir, f"{no}.jsonl")
+                if no not in done or n < done[no]:
+                    grown -= _file_size(head) + _file_size(body)
+                    _write_text(head, _dump(seg["start"]))
+                    _write_text(body, "".join(_dump(e) + "\n"
+                                              for e in seg["entries"]))
+                    grown += _file_size(head) + _file_size(body)
+                elif n > done[no]:
+                    text = "".join(_dump(e) + "\n"
+                                   for e in seg["entries"][done[no]:])
+                    with open(body, "a", encoding="utf-8") as f:
+                        f.write(text)
+                    grown += len(text.encode("utf-8"))
+                done[no] = n
+            if not live and os.path.isdir(jdir):
+                _remove_path(jdir)
+        self._add_usage(key, grown)
+
+    def _load_journal(self, mgr: MatchManager, m: Match) -> Optional[str]:
+        from journal import Journal
+        key = mgr.guild_key
+        jdir = self._journal_dir(key, m.id)
+        m.journal = None
+        if not os.path.isdir(jdir):
+            return None
+        try:
+            nos = sorted(int(f[:-5]) for f in os.listdir(jdir)
+                         if f.endswith(".json") and f[:-5].isdigit())
+            j = Journal()
+            for no in nos:
+                start = self._read_json(os.path.join(jdir, f"{no}.json"))
+                entries = []
+                body = os.path.join(jdir, f"{no}.jsonl")
+                if os.path.exists(body):
+                    with open(body, encoding="utf-8") as f:
+                        for line in f:
+                            if not line.strip():
+                                continue
+                            try:
+                                entries.append(json.loads(line))
+                            except ValueError:
+                                break       # a write cut short: stop there
+                j.segments.append({"no": no, "start": start,
+                                   "entries": entries})
+            if j.segments:
+                last = [e.get("n", 0) for e in j.entries()]
+                j.next_n = (max(last) + 1 if last else
+                            j.segments[-1]["start"].get("first_n", 1))
+                m.journal = j
+        except Exception as ex:  # noqa: BLE001
+            m.journal = None
+            dest_dir = os.path.join(self.server_dir(key), "corrupt")
+            os.makedirs(dest_dir, exist_ok=True)
+            dest = os.path.join(dest_dir, f"{m.id}-journal."
+                                          f"{time.strftime('%Y%m%d-%H%M%S')}")
+            try:
+                shutil.move(jdir, dest)
+            except OSError:
+                pass
+            return (f"⚠️ [{key}] the command journal of `{m.id}` failed to "
+                    f"load ({type(ex).__name__}); moved to "
+                    f"{os.path.relpath(dest, self.root)}.")
+        return None
+
     def commit_all(self, workspaces: Workspaces) -> None:
         """Write every workspace (shutdown). Limits are not enforced: the
         state was already accepted command by command."""
@@ -874,11 +1041,13 @@ class Storage:
                 else:
                     _write_text(path, text)
             self._written[mgr.guild_key] = after
+            self.write_journals(mgr)
 
     def forget(self, key: str) -> None:
         """Treat server `key` as having nothing on disk (after its files were
         moved away), so the next commit writes everything fresh."""
         self._written[key] = self._blank_written()
+        self._jwritten[key] = {}
 
     # ---- trash (`!server wipe`) ------------------------------------------
     def _maybe_purge_trash(self) -> None:
@@ -968,6 +1137,7 @@ class Storage:
             else:
                 _write_text(path, text)
         self._written[mgr.guild_key] = after
+        self.write_journals(mgr)
 
     def restore_from_trash(self, mgr: MatchManager, entry: str, scope: str) -> None:
         """Move a trash entry back into the server's folder and reload the
