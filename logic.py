@@ -4470,6 +4470,88 @@ class FormulaFunction:
 # -------------------------
 # GameSystem (stores global rules for a game system, so not everything has to be manually set each match)
 # -------------------------
+
+# GameSystem inheritance (MatchManager.system_chain): the structured rules a
+# child MERGES over its parent entry by entry (dict rules by key, list rules
+# by the named field) instead of replacing whole, and the libraries a child
+# inherits by name. A child's removals of inherited entries live in
+# GameSystem.removed under the same names.
+MERGE_RULES: Dict[str, Optional[str]] = {
+    "command_access": None, "default_entity_vars": None,
+    "event_log_format": None, "default_clamps": "path",
+    "default_entity_passives": "id",
+}
+SYSTEM_LIBRARIES: Tuple[str, ...] = ("aliases", "tile_templates",
+                                     "formula_functions")
+
+# Bot-owner limits that aren't gamerules (a gamerule belongs to a system, so
+# it can't bound the system chain itself). Set with `!owner ceiling <key>
+# <n>`, kept with the rule ceilings in RULE_CEILINGS / bot_settings.json.
+OWNER_LIMITS: Dict[str, Dict[str, Any]] = {
+    "system_chain_depth": {
+        "default": 8, "min": 1, "max": 64,
+        "desc": "How many systems an inheritance chain may hold, the system "
+                "itself included (base -> skirmish -> night is 3).",
+    },
+}
+
+
+def owner_limit(key: str) -> int:
+    return int(RULE_CEILINGS.get(key, OWNER_LIMITS[key]["default"]))
+
+
+def _entry_key(entry: Any, field_name: Optional[str]) -> str:
+    """A list merge rule's entry key: its `field_name` value, or the entry's
+    JSON text when it has none (such entries never collide)."""
+    if isinstance(entry, dict) and entry.get(field_name) is not None:
+        return str(entry.get(field_name))
+    return json.dumps(entry, sort_keys=True, default=str)
+
+
+def merge_rule_value(rule: str, base: Any, own: Any,
+                     removed: Iterable[str]) -> Any:
+    """Merge rule `rule`'s child layer over the inherited value `base`:
+    inherited entries named in `removed` drop out, then the child's own
+    entries replace or add by key. Copies; never mutates its inputs."""
+    field_name = MERGE_RULES[rule]
+    gone = set(removed or ())
+    if field_name is None:
+        out = {k: copy.deepcopy(v) for k, v in (base or {}).items()
+               if str(k) not in gone} if isinstance(base, dict) else {}
+        if isinstance(own, dict):
+            out.update(copy.deepcopy(own))
+        return out
+    items: Dict[str, Any] = {}
+    for e in (base if isinstance(base, list) else []):
+        k = _entry_key(e, field_name)
+        if k not in gone:
+            items[k] = copy.deepcopy(e)
+    for e in (own if isinstance(own, list) else []):
+        items[_entry_key(e, field_name)] = copy.deepcopy(e)
+    return list(items.values())
+
+
+def diff_rule_value(rule: str, base: Any, new: Any
+                    ) -> Tuple[Any, List[str]]:
+    """The child layer (own entries, removed keys) that turns the inherited
+    `base` into `new` for merge rule `rule`: entries equal to the inherited
+    ones aren't stored, so a later parent edit still reaches them."""
+    field_name = MERGE_RULES[rule]
+    if field_name is None:
+        base = base if isinstance(base, dict) else {}
+        new = new if isinstance(new, dict) else {}
+        own = {k: copy.deepcopy(v) for k, v in new.items()
+               if k not in base or base[k] != v}
+        return own, sorted(str(k) for k in base if k not in new)
+    bmap = {_entry_key(e, field_name): e
+            for e in (base if isinstance(base, list) else [])}
+    nmap = {_entry_key(e, field_name): e
+            for e in (new if isinstance(new, list) else [])}
+    own_l = [copy.deepcopy(e) for k, e in nmap.items()
+             if k not in bmap or bmap[k] != e]
+    return own_l, sorted(k for k in bmap if k not in nmap)
+
+
 @dataclass
 class GameSystem:
     name: str
@@ -4497,12 +4579,20 @@ class GameSystem:
     # shorthands (`dmg`, `heal`, `mv`, ...) that every match in this
     # system starts with. Stored as plain `name -> expansion` strings.
     aliases: Dict[str, str] = field(default_factory=dict)
+    # The system this one inherits from (live: MatchManager resolves the
+    # chain on every read), or None for a root. `settings` and the three
+    # libraries above then hold only this system's OWN overrides.
+    parent: Optional[str] = None
+    # Inherited entries this system removes: a merge rule's keys
+    # (MERGE_RULES) or a library's names ("aliases", "tile_templates",
+    # "formula_functions") -> the keys hidden here.
+    removed: Dict[str, List[str]] = field(default_factory=dict)
 
-    def get(self, key: str) -> Any:
-        if key in self.settings:
-            return self.settings[key].value
-        # fall back to engine default from registry
-        return DEFAULT_SYSTEM_SETTINGS.get(key)
+    def own(self, key: str) -> Any:
+        """This system's own value of rule `key`, or None when it doesn't
+        set it (the value is then inherited: MatchManager.system_value)."""
+        r = self.settings.get(key)
+        return None if r is None else r.value
     
     def set(self, key: str, value: Any) -> None:
         # Build a Rule object from the registry entry and store/overwrite it
@@ -4540,6 +4630,9 @@ class GameSystem:
                 aname: str(self.aliases[aname])
                 for aname in sorted(self.aliases.keys())
             },
+            "parent": self.parent,
+            "removed": {k: sorted(set(map(str, v)))
+                        for k, v in sorted(self.removed.items()) if v},
         }
 
     @staticmethod
@@ -4586,10 +4679,20 @@ class GameSystem:
         if dropped:
             print(f"[systems] '{d.get('name')}': dropped gamerule(s) that no "
                   f"longer exist: {', '.join(sorted(map(str, dropped)))}")
+        parent = d.get("parent")
+        raw_removed = d.get("removed") or {}
+        removed: Dict[str, List[str]] = {}
+        if isinstance(raw_removed, dict):
+            for k, v in raw_removed.items():
+                if (k in MERGE_RULES or k in SYSTEM_LIBRARIES) and \
+                        isinstance(v, list):
+                    removed[str(k)] = sorted({str(x) for x in v})
         return GameSystem(
             name=d["name"], settings=settings,
             tile_templates=templates, formula_functions=funcs,
             aliases=sys_aliases,
+            parent=parent if isinstance(parent, str) and parent else None,
+            removed=removed,
         )
 
 # -------------------------
@@ -18048,11 +18151,225 @@ class MatchManager:
             raise NotFound(f"GameSystem '{name}' not found")
         return self.systems[name]
 
-    def create_system(self, name: str, settings: Optional[Dict[str, Any]] = None):
+    def create_system(self, name: str, settings: Optional[Dict[str, Any]] = None,
+                      parent: Optional[str] = None):
         check_id("system name", name)
         if name in self.systems:
             raise DuplicateId(f"GameSystem '{name}' already exists")
-        self.systems[name] = GameSystem(name, settings or {})
+        if parent is not None:
+            self.get_system(parent)
+            if len(self.system_chain(self.systems[parent])) + 1 > \
+                    owner_limit("system_chain_depth"):
+                raise VTTError(
+                    f"`{parent}` already heads a chain of "
+                    f"{len(self.system_chain(self.systems[parent]))} "
+                    f"system(s); the bot owner's limit is "
+                    f"{owner_limit('system_chain_depth')} "
+                    f"(system_chain_depth).")
+        self.systems[name] = GameSystem(name, settings or {}, parent=parent)
+
+    # ----- system inheritance -----
+    def system_chain(self, s: "GameSystem") -> List["GameSystem"]:
+        """`s` and its ancestors, ROOT FIRST. A link to a missing system or
+        one closing a cycle ends the chain there (check_system_links drops
+        such links at load; set_system_parent refuses them)."""
+        out = [s]
+        seen = {s.name}
+        cur = s
+        while cur.parent and cur.parent not in seen:
+            nxt = self.systems.get(cur.parent)
+            if nxt is None:
+                break
+            out.append(nxt)
+            seen.add(nxt.name)
+            cur = nxt
+        out.reverse()
+        return out
+
+    def system_children(self, name: str) -> List[str]:
+        return sorted(n for n, x in self.systems.items() if x.parent == name)
+
+    def system_descendants(self, name: str) -> List[str]:
+        """Every system inheriting from `name`, directly or not."""
+        out: List[str] = []
+        todo = [name]
+        while todo:
+            for c in self.system_children(todo.pop()):
+                if c not in out and c != name:
+                    out.append(c)
+                    todo.append(c)
+        return out
+
+    def _subtree_depth(self, name: str) -> int:
+        kids = self.system_children(name)
+        return 1 + max((self._subtree_depth(k) for k in kids), default=0)
+
+    def system_value(self, s: "GameSystem", key: str) -> Any:
+        """The effective value of rule `key` on system `s`: the nearest own
+        value up the chain (a merge rule merges every layer), else the
+        registry default. A copy."""
+        chain = self.system_chain(s)
+        val = copy.deepcopy(DEFAULT_SYSTEM_SETTINGS.get(key))
+        for i, x in enumerate(chain):
+            if key in MERGE_RULES and i > 0:
+                val = merge_rule_value(key, val, x.own(key),
+                                       x.removed.get(key, ()))
+            elif key in x.settings:
+                val = copy.deepcopy(x.own(key))
+        return val
+
+    def system_value_source(self, s: "GameSystem", key: str) -> Optional[str]:
+        """The nearest system in `s`'s chain that sets `key` itself (None:
+        the registry default)."""
+        for x in reversed(self.system_chain(s)):
+            if key in x.settings or x.removed.get(key):
+                return x.name
+        return None
+
+    def system_rule_write(self, s: "GameSystem", key: str, new: Any) -> None:
+        """Store `new` as `s`'s effective value of `key`. A merge rule on a
+        child keeps only the entries that differ from what it inherits, and
+        removals of inherited entries; elsewhere the value is set whole."""
+        chain = self.system_chain(s)
+        if key in MERGE_RULES and len(chain) > 1:
+            base = self.system_value(chain[-2], key)
+            own, gone = diff_rule_value(key, base, new)
+            if own:
+                s.set(key, own)
+            else:
+                s.settings.pop(key, None)   # all inherited
+            if gone:
+                s.removed[key] = gone
+            else:
+                s.removed.pop(key, None)
+        else:
+            s.set(key, copy.deepcopy(new))
+
+    def system_library(self, s: "GameSystem", kind: str) -> Dict[str, Any]:
+        """`s`'s effective library `kind` (aliases / tile_templates /
+        formula_functions): each layer's entries over its parent's, minus
+        the names it hides. Copies."""
+        out: Dict[str, Any] = {}
+        for x in self.system_chain(s):
+            for n in x.removed.get(kind, ()):
+                out.pop(n, None)
+            out.update(copy.deepcopy(getattr(x, kind)))
+        return out
+
+    def system_library_write(self, s: "GameSystem", kind: str,
+                             new: Dict[str, Any]) -> None:
+        """Store `new` as `s`'s effective library `kind`: its own entries
+        are those that differ from the inherited ones, and inherited names
+        missing from `new` are hidden."""
+        chain = self.system_chain(s)
+        base = self.system_library(chain[-2], kind) if len(chain) > 1 else {}
+        setattr(s, kind, {k: copy.deepcopy(v) for k, v in new.items()
+                          if k not in base or base[k] != v})
+        gone = sorted(k for k in base if k not in new)
+        if gone:
+            s.removed[kind] = gone
+        else:
+            s.removed.pop(kind, None)
+
+    def system_unset(self, s: "GameSystem", key: str,
+                     entry: Optional[str] = None) -> bool:
+        """Drop `s`'s own override of rule `key` (and its removals), or with
+        `entry` just that entry of a merge rule or library, so the inherited
+        value shows through. Returns whether anything changed."""
+        if entry is None:
+            if key in SYSTEM_LIBRARIES:
+                had = bool(getattr(s, key)) or bool(s.removed.get(key))
+                setattr(s, key, {})
+            else:
+                had = key in s.settings or bool(s.removed.get(key))
+                s.settings.pop(key, None)
+            s.removed.pop(key, None)
+            return had
+        had = False
+        gone = s.removed.get(key) or []
+        if entry in gone:
+            gone.remove(entry)
+            had = True
+            if not gone:
+                s.removed.pop(key, None)
+        if key in SYSTEM_LIBRARIES:
+            lib = getattr(s, key)
+            if entry in lib:
+                del lib[entry]
+                had = True
+        elif key in s.settings:
+            own = s.own(key)
+            field_name = MERGE_RULES[key]
+            if field_name is None and isinstance(own, dict) and entry in own:
+                own = dict(own)
+                del own[entry]
+                s.set(key, own)
+                had = True
+            elif field_name is not None and isinstance(own, list):
+                kept = [e for e in own if _entry_key(e, field_name) != entry]
+                if len(kept) != len(own):
+                    s.set(key, kept)
+                    had = True
+        return had
+
+    def set_system_parent(self, name: str, parent: Optional[str]) -> None:
+        """Link `name` to inherit from `parent`, or with None make it a root
+        that keeps every value it inherited (written into its own layer).
+        Refuses a missing parent, a cycle and a chain past the owner's
+        system_chain_depth."""
+        s = self.get_system(name)
+        if parent is None:
+            if s.parent is None:
+                return
+            flat = GameSystem(name, {})
+            for key in RULES_REGISTRY:
+                if self.system_value_source(s, key) is not None:
+                    flat.set(key, self.system_value(s, key))
+            for kind in SYSTEM_LIBRARIES:
+                setattr(flat, kind, self.system_library(s, kind))
+            s.settings, s.removed, s.parent = flat.settings, {}, None
+            for kind in SYSTEM_LIBRARIES:
+                setattr(s, kind, getattr(flat, kind))
+            return
+        p = self.get_system(parent)
+        if parent == name or name in [x.name for x in self.system_chain(p)]:
+            raise VTTError(f"`{parent}` inherits from `{name}`: linking "
+                           f"`{name}` to it would make a loop.")
+        depth = len(self.system_chain(p)) + self._subtree_depth(name)
+        if depth > owner_limit("system_chain_depth"):
+            raise VTTError(
+                f"That makes a chain of {depth} systems; the bot owner's "
+                f"limit is {owner_limit('system_chain_depth')} "
+                f"(system_chain_depth).")
+        s.parent = parent
+
+    def check_system_links(self) -> List[str]:
+        """Drop parent links to a missing system and links closing a cycle
+        (a hand-edited or older save). Returns a note per dropped link. The
+        owner's system_chain_depth bounds new links only: lowering it keeps
+        existing chains working."""
+        notes: List[str] = []
+        for name in sorted(self.systems):
+            s = self.systems[name]
+            if not s.parent:
+                continue
+            chain_names: List[str] = [name]
+            cur = s
+            bad = None
+            while cur.parent:
+                if cur.parent not in self.systems:
+                    bad = f"its parent `{cur.parent}` doesn't exist"
+                    break
+                if cur.parent in chain_names:
+                    bad = "its parents loop back to it"
+                    break
+                chain_names.append(cur.parent)
+                cur = self.systems[cur.parent]
+            if bad:
+                notes.append(f"system `{name}` no longer inherits from "
+                             f"`{s.parent}`: {bad}.")
+                s.parent = None
+        return notes
 
     def delete_system(self, name: str) -> None:
         """Remove a GameSystem. Guards against leaving the manager in a
@@ -18079,6 +18396,13 @@ class MatchManager:
                 f"different default first "
                 f"(!system default server <other>)."
             )
+        kids = self.system_children(name)
+        if kids:
+            raise VTTError(
+                f"GameSystem '{name}' is inherited by "
+                f"{', '.join(f'`{k}`' for k in kids)}. Give "
+                f"{'it' if len(kids) == 1 else 'them'} another parent "
+                f"(`!system parent <name> <other|none>`) first.")
         bound = [mid for mid, m in self.matches.items() if m.system_name == name]
         if bound:
             shown = ", ".join(sorted(bound)[:5])
@@ -18112,10 +18436,15 @@ class MatchManager:
 
     # ----- matches -----
     def _build_rules_dict(self, sysobj) -> Dict[str, Any]:
-        """Denormalized rule snapshot: engine defaults overlaid with system overrides."""
+        """Denormalized rule snapshot: engine defaults overlaid with the
+        system's chain (its parents' values, then its own)."""
         rules = dict(DEFAULT_SYSTEM_SETTINGS)
-        for k, r in (getattr(sysobj, "settings", {}) or {}).items():
-            rules[k] = r.value
+        keys = set()
+        for x in self.system_chain(sysobj):
+            keys.update(x.settings)
+            keys.update(k for k in x.removed if k in MERGE_RULES)
+        for k in keys:
+            rules[k] = self.system_value(sysobj, k)
         # A value set before the owner lowered a ceiling (or loaded from an
         # older save) is held to the ceiling.
         for k, v in rules.items():
@@ -18154,14 +18483,14 @@ class MatchManager:
         # into GameSystem.tile_templates — the system's library is the
         # canonical source for NEW matches but not a live link to
         # existing ones (mirrors how `rules` is snapshotted, not linked).
-        for tname, tdef in (sysobj.tile_templates or {}).items():
+        for tname, tdef in self.system_library(sysobj, "tile_templates").items():
             try:
                 m.tile_templates[tname] = SpecialTileTemplate.from_dict(tdef)
             except (KeyError, TypeError, VTTError):
                 continue
         # Seed match-level formula functions from the system's library,
         # same snapshot-not-link semantics as tile templates above.
-        for fname, fdef in (sysobj.formula_functions or {}).items():
+        for fname, fdef in self.system_library(sysobj, "formula_functions").items():
             try:
                 m.formula_functions[fname] = FormulaFunction.from_dict(fdef)
             except (KeyError, TypeError, VTTError):
@@ -18169,7 +18498,7 @@ class MatchManager:
         # Seed match-level aliases from the system's library, same
         # snapshot-not-link semantics. Plain string copy — match-side
         # !alias def/del afterwards doesn't reach back into the system.
-        for aname, expansion in (sysobj.aliases or {}).items():
+        for aname, expansion in self.system_library(sysobj, "aliases").items():
             if isinstance(aname, str) and isinstance(expansion, str):
                 m.aliases[aname] = expansion
         self.matches[m.id] = m
@@ -18315,8 +18644,10 @@ class MatchManager:
         if system_name not in self.systems:
             return 0
         count = 0
+        # A child system's matches follow its parents' edits (live link).
+        family = {system_name, *self.system_descendants(system_name)}
         for m in self.matches.values():
-            if m.system_name == system_name:
+            if m.system_name in family:
                 n = self.apply_system_rules(m)
                 if notes is not None:
                     notes += n
@@ -18415,6 +18746,7 @@ class MatchManager:
         save` file. Returns notes (units var_name_collision kept on their
         old var names)."""
         notes: List[str] = []
+        held_systems = self.systems
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -18440,6 +18772,11 @@ class MatchManager:
             }
             for name in systems:
                 check_id("system name", name)
+            # Inheritance links are checked against the loaded set, and the
+            # matches below resolve their rules through it: the loaded
+            # systems stand in until the load commits (restored on failure).
+            self.systems = systems
+            notes += self.check_system_links()
             for mid in matches:
                 check_id("match id", mid)
             default_name = data.get("default_system_name", "default")
@@ -18462,6 +18799,7 @@ class MatchManager:
             active_by_channel = {ch: mid for ch, mid in active_by_channel.items()
                                  if mid in matches}
         except Exception as e:
+            self.systems = held_systems
             # Defensive: any schema mismatch should be surfaced as a friendly VTTError
             raise VTTError(f"Invalid save file format in '{path}': {e}")
         self.matches = matches

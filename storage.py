@@ -497,6 +497,8 @@ class Storage:
             except Exception as ex:  # noqa: BLE001 - any bad file is quarantined
                 notes.append(self._quarantine(key, sys_path, type(ex).__name__))
         mgr.systems = systems
+        for note in mgr.check_system_links():
+            notes.append(f"{key}: {note}")
         # Workspace.
         mgr.active_by_channel = {}
         mgr.default_system_name = "default" if "default" in systems \

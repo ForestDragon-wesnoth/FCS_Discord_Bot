@@ -318,6 +318,9 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
                 paths += _entity_ids(mgr, ctx)
             return paths
         return _entity_ids(mgr, ctx) if slot == "template_ref" else []
+    if root == "system" and slot == "parent":
+        # `!system parent <name> <parent|none>` names a system, not a unit.
+        return sorted(mgr.systems)
     if slot in _ENTITY_SLOTS and not (root == "match" and slot == "id"):
         if root == "template" and slot == "part":
             t = mgr.templates.get(binds.get("name", ""))

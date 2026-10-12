@@ -250,7 +250,10 @@ Each of these was learned from a shipped bug.
   Changing a rule mid-game must leave derived state consistent (switching
   `persist_undo_history` off once lost every snapshot already on disk). A
   rule that names a unit var goes in `logic.VAR_NAME_RULES` (§7.1; its value
-  is checked as one plain var name).
+  is checked as one plain var name). A dict / list rule: decide whether a
+  child system merges it entry by entry (`logic.MERGE_RULES`, §7.16) or
+  replaces it whole; read a system's value with `mgr.system_value(s, key)`
+  (it walks the inheritance chain), never from `s.settings`.
 - **A serialized Match field:** `to_dict` / `from_dict` with deep copies on
   BOTH sides; a runtime-only field goes in `action._rollback_match`'s preserve
   list (`_check_rollback_fields` raises if a field is neither); decide whether
@@ -412,7 +415,8 @@ switch workspaces with `!as server <key>` (scenarios 698-700).
   every server: server-wide commands still need that server's Administrator.
 - **System rules on load:** a system saved by an older build may name a
   gamerule that no longer exists — `GameSystem.from_dict` drops it with a
-  console note. A gamerule the save lacks needs nothing: systems store only
+  console note; a parent link to a missing system or one closing a loop is
+  dropped too (`MatchManager.check_system_links`). A gamerule the save lacks needs nothing: systems store only
   overrides, so it reads the RULES_REGISTRY default.
 - `!system default server|channel` (the old `global` scope and the per-server
   default map are gone — a workspace is one server). `!match` / `!match list`
@@ -1488,11 +1492,38 @@ hardcodes**.
 - **Systems and rules:** a `GameSystem` holds rule overrides, tile
   templates, functions, aliases, default vars / passives / clamps. A match
   copies its system's rules into `match.rules` at creation and on every
-  `refresh_match_rules` (any `!system set` / `!system access`); per-match
+  `refresh_match_rules` (any `!system set` / `!system access`, which also
+  refreshes the matches of every system inheriting from it); per-match
   settings that must survive a refresh live in their own fields
   (`access_overrides`, `fog_enabled`, `fog_memory`, `border_*`,
   `render_mode`, `map_coords`, ...). Rules are left out of match files on
   disk and rebuilt from the system on load / restore.
+- **System inheritance** (user design: live link, everything inherited,
+  per-entry merge, refuse deleting a parent, multi-level, hiding allowed):
+  `GameSystem.parent` names the system it inherits from; its `settings` and
+  libraries hold only its OWN layer. `MatchManager.system_chain` (root
+  first), `system_value(s, key)` (nearest own value up the chain, else the
+  registry default; the MERGE_RULES — command_access, default_entity_vars,
+  event_log_format by key, default_clamps by path, default_entity_passives
+  by id — merge every layer over the parent's instead, a root's own value
+  replacing the default as before), `system_value_source`,
+  `system_library(s, kind)` (aliases / tile_templates / formula_functions,
+  copied into a NEW match at creation as before). Editors write an
+  effective value back through `system_rule_write` /
+  `system_library_write`, which store only the entries that differ from the
+  inherited ones plus `GameSystem.removed` for inherited entries taken
+  away (an entry equal to the inherited one isn't stored, so a later parent
+  edit still reaches it; a plain rule set on a child is stored even when
+  equal, pinning it). Commands: `!system new <name> [parent=]`, `!system
+  parent <name> <sys|none>` (none writes the inherited values into its own
+  layer; a loop and a chain past the owner limit `system_chain_depth`
+  (`logic.OWNER_LIMITS`, set with `!owner ceiling`, default 8) are refused),
+  `!system unset <name> <rule|rule:entry|library:name>`, `!system info`
+  grouping each rule under its source, `!system list` naming parents.
+  Deleting a system others inherit from is refused. A var-name rule renamed
+  on a parent moves the units of every inheriting system's matches and
+  renames their clamps / default vars (`_inheritors`); a child's own engine
+  formula equal to its parent's after a rename is dropped (753-756).
 - **Match vars:** `!match var`, `match_var_get` / `match_var_set` /
   `match_var_del`. **Groups:** `!ent group`, `group:<name>` selectors and
   group moves.

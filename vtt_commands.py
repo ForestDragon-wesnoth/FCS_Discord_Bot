@@ -15,10 +15,10 @@ from logic import (
 )
 
 # Passive system
-from logic import VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES
+from logic import VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit
 
 # Clamp system
-from logic import ClampSpec
+from logic import ClampSpec, GameSystem
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution
@@ -974,9 +974,10 @@ def _check_formula_rule(mgr: MatchManager, system: Any, key: str,
     mode = (RULES_REGISTRY.get(key, {}).get("schema") or {}).get("formula")
     if not mode or not isinstance(value, str) or not value.strip():
         return None
-    known = set(getattr(system, "formula_functions", {}) or {})
+    known = set(mgr.system_library(system, "formula_functions"))
+    family = {system.name, *mgr.system_descendants(system.name)}
     for m in mgr.matches.values():
-        if m.system_name == system.name:
+        if m.system_name in family:
             known.update(m.formula_functions)
     try:
         if mode == "expression":
@@ -2877,18 +2878,34 @@ async def _owner_ceiling(ctx, args: List[str], mgr: MatchManager):
             mark = " (set by you)" if k in RULE_CEILINGS else ""
             lines.append(f"- `{k}`: at most {rule_max(k)}{mark} "
                          f"(default value {RULES_REGISTRY[k]['default']})")
+        for k, spec in sorted(OWNER_LIMITS.items()):
+            mark = " (set by you)" if k in RULE_CEILINGS else ""
+            lines.append(f"- `{k}`: {owner_limit(k)}{mark} (default "
+                         f"{spec['default']}; not a gamerule) — "
+                         f"{spec['desc']}")
         return await ctx.send("**Rule ceilings** (the highest value any "
                               "server may set):\n" + "\n".join(lines))
     _check_tail(args, 2, (), "!owner ceiling <rule> <value|reset>")
     if len(args) < 2:
         raise VTTError("Usage: `!owner ceiling <rule> <value|reset>`.")
     key, value = args[0], args[1]
-    if key not in ceilinged:
+    if key not in ceilinged and key not in OWNER_LIMITS:
         raise VTTError(f"`{key}` has no ceiling. Rules with one: "
-                       f"{', '.join(ceilinged)}.")
+                       f"{', '.join(ceilinged)}; owner limits: "
+                       f"{', '.join(sorted(OWNER_LIMITS))}.")
     st = storage_of(mgr)
     if value.lower() == "reset":
         RULE_CEILINGS.pop(key, None)
+    elif key in OWNER_LIMITS:
+        spec = OWNER_LIMITS[key]
+        try:
+            v = int(value)
+        except ValueError:
+            raise VTTError(f"`{value}` isn't a whole number.")
+        if not spec["min"] <= v <= spec["max"]:
+            raise VTTError(f"`{key}` must be between {spec['min']} and "
+                           f"{spec['max']}.")
+        RULE_CEILINGS[key] = v
     else:
         try:
             v = int(value)
@@ -2908,6 +2925,10 @@ async def _owner_ceiling(ctx, args: List[str], mgr: MatchManager):
     for _k, w in (ws.items() if ws is not None else [(mgr.guild_key, mgr)]):
         for name in list(w.systems):
             w.refresh_match_rules(name)
+    if key in OWNER_LIMITS:
+        return await ctx.send(f"`{key}` is now {owner_limit(key)} for every "
+                              f"server (existing chains past it keep "
+                              f"working; new links are held to it).")
     return await ctx.send(f"`{key}` is now capped at {rule_max(key)} for "
                           f"every server.")
 
@@ -2957,7 +2978,8 @@ def _wipe_blockers(mgr: MatchManager, scope: str) -> List[str]:
                        + " (`!system delete <name>`)")
         d = mgr.systems.get("default")
         if d is not None and (d.settings or d.tile_templates
-                              or d.formula_functions or d.aliases):
+                              or d.formula_functions or d.aliases
+                              or d.parent or d.removed):
             out.append("changes to the `default` system (its rules, tile "
                        "templates, functions or aliases)")
         sdir = server_saves_dir(mgr)
@@ -4393,81 +4415,126 @@ registry.annotate_sub(
 
 # ---- system (gamesystem commands)-----
 
+def _inheritors(mgr: MatchManager, s: Any, key: str) -> List[Any]:
+    """`s` and every descendant that takes rule `key` from `s` (none of the
+    systems between it and `s` sets it), parents first."""
+    out = [s]
+    for d in mgr.system_descendants(s.name):
+        x = mgr.systems[d]
+        chain = mgr.system_chain(x)
+        names = [c.name for c in chain]
+        between = chain[names.index(s.name) + 1:]
+        if not any(key in c.settings for c in between):
+            out.append(x)
+    return out
+
+
 def _rename_system_var(mgr: MatchManager, s: Any, name: str, key: str,
                        value: Any) -> Optional[str]:
     """Before `!system set <name> <key>` renames a unit var (VAR_NAME_RULES):
     refuse when var_name_collision is refuse and a unit or corpse of a match
-    on the system has a var in the way; move the system's own references
-    (default_clamps paths / bounds, default_entity_vars keys) to the new
-    name. Returns a summary line of the units the refresh will move."""
+    on the system (or a system inheriting the rule from it) has a var in the
+    way; move those systems' references (default_clamps paths / bounds,
+    default_entity_vars keys, engine formula text) to the new name. Returns
+    a summary line of the units the refresh will move."""
     if key not in VAR_NAME_RULES:
         return None
-    old, new = str(s.get(key) or ""), str(value or "")
+    old = str(mgr.system_value(s, key) or "")
+    new = str(value or "")
     if not old or not new or old == new:
         return None
-    taken = [k for k in VAR_NAME_RULES if k != key and str(s.get(k) or "") == new]
-    if taken:
-        raise VTTError(
-            f"`{new}` is already the var of `{taken[0]}` on `{name}`: two "
-            f"rules can't share a var (to swap two names, go through a third "
-            f"one).")
-    matches = [m for m in mgr.matches.values() if m.system_name == name]
-    if str(s.get("var_name_collision")) == "refuse":
-        conflicts: List[str] = []
-        for m in matches:
+    family = _inheritors(mgr, s, key)
+    for x in family:
+        taken = [k for k in VAR_NAME_RULES if k != key
+                 and str(mgr.system_value(x, k) or "") == new]
+        if taken:
+            raise VTTError(
+                f"`{new}` is already the var of `{taken[0]}` on `{x.name}`: "
+                f"two rules can't share a var (to swap two names, go "
+                f"through a third one).")
+    names = {x.name for x in family}
+    matches = [m for m in mgr.matches.values() if m.system_name in names]
+    conflicts: List[str] = []
+    for m in matches:
+        if str(m.rules.get("var_name_collision")) == "refuse":
             trial = dict(m.rules)
             trial[key] = new
             conflicts += [f"{m.id}: {c}" for c in m.var_name_conflicts(trial)]
-        if conflicts:
-            raise VTTError(
-                f"`{key}` stays `{old}`: " + " ".join(conflicts[:5])
-                + (f" (and {len(conflicts) - 5} more)"
-                   if len(conflicts) > 5 else ""))
-    clamps = s.get("default_clamps")
-    if isinstance(clamps, list):
-        out = []
-        for c in clamps:
-            c = dict(c) if isinstance(c, dict) else c
-            if isinstance(c, dict):
-                for f in ("path", "max", "min"):
-                    if c.get(f) == old:
-                        c[f] = new
-            out.append(c)
-        s.set("default_clamps", out)
-    dv = s.get("default_entity_vars")
-    if isinstance(dv, dict) and old in dv:
-        dv = dict(dv)
-        dv[new] = dv.pop(old)
-        s.set("default_entity_vars", dv)
-    # The engine's own formula rules (death_condition, the kill / revive
-    # effects, atb_charge_formula) name vars in their text: one still
-    # holding the engine's text follows the rename; one the GM wrote stays.
-    rewritten = []
-    for rk, reg in RULES_REGISTRY.items():
-        if not (reg.get("schema") or {}).get("formula"):
+    if conflicts:
+        raise VTTError(
+            f"`{key}` stays `{old}`: " + " ".join(conflicts[:5])
+            + (f" (and {len(conflicts) - 5} more)"
+               if len(conflicts) > 5 else ""))
+    rewritten: List[str] = []
+    for x in family:          # parents first: a child diffs against them
+        clamps = mgr.system_value(x, "default_clamps")
+        if isinstance(clamps, list):
+            out = []
+            for c in clamps:
+                c = dict(c) if isinstance(c, dict) else c
+                if isinstance(c, dict):
+                    for f in ("path", "max", "min"):
+                        if c.get(f) == old:
+                            c[f] = new
+                out.append(c)
+            if out != clamps:
+                mgr.system_rule_write(x, "default_clamps", out)
+        dv = mgr.system_value(x, "default_entity_vars")
+        if isinstance(dv, dict) and old in dv:
+            dv = dict(dv)
+            dv[new] = dv.pop(old)
+            mgr.system_rule_write(x, "default_entity_vars", dv)
+        # The engine's own formula rules (death_condition, the kill /
+        # revive effects, atb_charge_formula) name vars in their text: one
+        # still holding the engine's text follows the rename; one the GM
+        # wrote stays. A descendant inheriting the formula follows `s`.
+        for rk, reg in RULES_REGISTRY.items():
+            if not (reg.get("schema") or {}).get("formula"):
+                continue
+            if x is not s and rk not in x.settings:
+                continue
+            cur = mgr.system_value(x, rk)
+            if (isinstance(cur, str) and cur
+                    and cur == _engine_formula_text(mgr, x, rk)):
+                text = _engine_formula_text(mgr, x, rk, {key: new})
+                if text != cur:
+                    x.set(rk, text)
+                    if rk not in rewritten:
+                        rewritten.append(rk)
+    # A child's own copy of an engine formula that now reads the same as
+    # its parent's (a rename back to the inherited name) is dropped, so the
+    # child follows its parent again.
+    for x in family:
+        chain = mgr.system_chain(x)
+        if len(chain) < 2:
             continue
-        cur = s.get(rk)
-        if (isinstance(cur, str) and cur
-                and cur == _engine_formula_text(s, rk)):
-            text = _engine_formula_text(s, rk, {key: new})
-            if text != cur:
-                s.set(rk, text)
-                rewritten.append(rk)
-    keep_existing = str(s.get("var_name_collision")) == "existing"
-    n = sum(1 for m in matches for e in m.entities.values()
-            if (e.var_names.get(key) or old) == old and _rel_has(e.vars, old)
-            and not (keep_existing and _rel_has(e.vars, new)))
+        for rk in list(x.settings):
+            if ((RULES_REGISTRY.get(rk, {}).get("schema") or {}).get("formula")
+                    and x.own(rk) == _engine_formula_text(
+                        mgr, x, rk, {key: new})
+                    and x.own(rk) == mgr.system_value(chain[-2], rk)):
+                x.settings.pop(rk)
+    n = 0
+    for m in matches:
+        keep_existing = str(m.rules.get("var_name_collision")) == "existing"
+        n += sum(1 for e in m.entities.values()
+                 if (e.var_names.get(key) or old) == old
+                 and _rel_has(e.vars, old)
+                 and not (keep_existing and _rel_has(e.vars, new)))
     bits = []
     if n:
         bits.append(f"moved `{old}` → `{new}` on {n} unit(s)")
     bits.append("the system's default clamps and default vars follow")
     if rewritten:
         bits.append("so do " + ", ".join(f"`{r}`" for r in rewritten))
+    if len(family) > 1:
+        bits.append("so do the systems inheriting it ("
+                    + ", ".join(f"`{x.name}`" for x in family[1:]) + ")")
     return ("Units keep this var as `" + new + "` now: " + "; ".join(bits)
             + f". Formulas you wrote that name `{old}` are left as written.")
 
 
-def _engine_formula_text(s: Any, rule: str,
+def _engine_formula_text(mgr: MatchManager, s: Any, rule: str,
                          override: Optional[Dict[str, str]] = None) -> str:
     """The engine's default text of formula rule `rule` with each var it
     names (`entity[...].hp`) spelled the way system `s` names it now (or as
@@ -4475,7 +4542,7 @@ def _engine_formula_text(s: Any, rule: str,
     text = str(RULES_REGISTRY[rule]["default"] or "")
     for k in VAR_NAME_RULES:
         dn = str(DEFAULT_SYSTEM_SETTINGS.get(k) or "")
-        cn = str((override or {}).get(k) or s.get(k) or dn)
+        cn = str((override or {}).get(k) or mgr.system_value(s, k) or dn)
         if dn and cn != dn:
             text = re.sub(r"(?<=\])\." + re.escape(dn) + r"\b", "." + cn,
                           text)
@@ -4502,19 +4569,21 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         systems = mgr.systems
         if not systems:
             return await ctx.send("No game systems exist yet.")
-        lines = [f"- **{name}**" for name in systems]
+        lines = [f"- **{name}**" + (f" (inherits from `{x.parent}`)"
+                                    if x.parent else "")
+                 for name, x in systems.items()]
         return await ctx.send("Current game systems:\n" + "\n".join(lines))
     if sub == "info":
         if await return_help_if_not_enough_args(ctx, args, 2, "system", "info"):
             return
-    
+
         name = args[1]
         s = mgr.get_system(name)
         default_badge = " (default)" if name == mgr.default_system_name else ""
-    
-        overridden_lines: List[str] = []
-        inherited_lines: List[str] = []
-    
+        chain = mgr.system_chain(s)
+        # Each rule under the system its value comes from: this one, an
+        # ancestor (the inheritance chain, nearest first), or the engine.
+        groups: Dict[Optional[str], List[str]] = {}
         for k in sorted(RULES_REGISTRY.keys()):
             spec = RULES_REGISTRY[k]
             schema = spec["schema"]
@@ -4522,35 +4591,39 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             extra = ""
             if t == "enum":
                 extra = f", one of {{{', '.join(sorted(schema.get('choices', [])))}}}"
-    
-            effective_val = s.get(k)
-            default_val = DEFAULT_SYSTEM_SETTINGS.get(k)
+            src = mgr.system_value_source(s, k)
+            val = mgr.system_value(s, k)
             desc = spec.get("desc", "")
-    
-            if k in (s.settings or {}) and s.settings[k].value != default_val:
-                overridden_lines.append(
-                    f"- `{k}` = {effective_val!r} — {desc} (type: {t}{extra})"
-                )
-            else:
-                inherited_lines.append(
-                    f"- `{k}` = {default_val!r} — {desc} (type: {t}{extra})"
-                )
-    
-        if not overridden_lines:
-            overridden_lines = ["(none)"]
-        if not inherited_lines:
-            inherited_lines = ["(none)"]
-    
-        header = f"**{name}**{default_badge} — rule breakdown"
-        msg = (
-            f"{header}\n\n"
-            f"**Rules overwritten by this system:**\n"
-            + "\n".join(overridden_lines)
-            + "\n\n**Rules inherited from default:**\n"
-            + "\n".join(inherited_lines)
-        )
-    
-        return await ctx.send(msg)
+            gone = s.removed.get(k)
+            hide = (f" (removes inherited: {', '.join(map(str, gone))})"
+                    if gone else "")
+            groups.setdefault(src, []).append(
+                f"- `{k}` = {val!r}{hide} — {desc} (type: {t}{extra})")
+        parts = [f"**{name}**{default_badge} — rule breakdown"]
+        if len(chain) > 1:
+            parts.append("Inherits from: " + " → ".join(
+                f"`{x.name}`" for x in reversed(chain[:-1]))
+                + (" (nearest first)" if len(chain) > 2 else ""))
+        parts.append("**Rules set by this system:**\n"
+                     + ("\n".join(groups.get(name, [])) or "(none)"))
+        for x in reversed(chain[:-1]):
+            if groups.get(x.name):
+                parts.append(f"**Rules inherited from `{x.name}`:**\n"
+                             + "\n".join(groups[x.name]))
+        parts.append("**Engine defaults:**\n"
+                     + ("\n".join(groups.get(None, [])) or "(none)"))
+        libs = []
+        for kind in SYSTEM_LIBRARIES:
+            eff = mgr.system_library(s, kind)
+            own = getattr(s, kind)
+            hidden = s.removed.get(kind) or []
+            if eff or hidden:
+                libs.append(f"- {kind}: {len(eff)} ({len(own)} set here"
+                            + (f", hides {', '.join(hidden)}" if hidden
+                               else "") + ")")
+        if libs:
+            parts.append("**Libraries:**\n" + "\n".join(libs))
+        return await ctx.send("\n\n".join(parts))
 
     if sub == "rules":
         lines: List[str] = []
@@ -4576,8 +4649,73 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 2, "system", "new"):
             return
         name = args[1]
-        mgr.create_system(name)
-        return await ctx.send(f"Created GameSystem `{name}`.")
+        parent = None
+        for tok in args[2:]:
+            k, eq, v = tok.partition("=")
+            if eq and k.lower() == "parent" and v:
+                parent = v
+            else:
+                raise VTTError(f"`{tok}` — `!system new <name>` takes only "
+                               f"`parent=<system>`.")
+        mgr.create_system(name, parent=parent)
+        return await ctx.send(f"Created GameSystem `{name}`"
+                              + (f", inheriting from `{parent}`."
+                                 if parent else "."))
+    if sub == "parent":
+        if await return_help_if_not_enough_args(ctx, args, 3, "system", "parent"):
+            return
+        name, target = args[1], args[2]
+        s = mgr.get_system(name)
+        old_parent = s.parent
+        new_parent = None if target.lower() == "none" else target
+        mgr.set_system_parent(name, new_parent)
+        notes: List[str] = []
+        refreshed = mgr.refresh_match_rules(name, notes)
+        suffix = (f" (refreshed {refreshed} live match"
+                  f"{'es' if refreshed != 1 else ''})" if refreshed else "")
+        if new_parent is None:
+            head = (f"`{name}` no longer inherits from `{old_parent}`; the "
+                    f"values it inherited are now its own."
+                    if old_parent else f"`{name}` has no parent already.")
+        else:
+            head = f"`{name}` now inherits from `{new_parent}`."
+        return await ctx.send("\n".join([head + suffix]
+                                         + [f"⚠️ {n}" for n in notes]))
+    if sub == "unset":
+        if await return_help_if_not_enough_args(ctx, args, 3, "system", "unset"):
+            return
+        name, spec = args[1], args[2]
+        s = mgr.get_system(name)
+        key, colon, entry = spec.partition(":")
+        if key not in RULES_REGISTRY and key not in SYSTEM_LIBRARIES:
+            raise VTTError(f"`{key}` isn't a gamerule or a library "
+                           f"({', '.join(SYSTEM_LIBRARIES)}).")
+        if colon and key not in MERGE_RULES and key not in SYSTEM_LIBRARIES:
+            raise VTTError(f"`{key}` has no entries to unset one by one; "
+                           f"`!system unset {name} {key}` drops it whole.")
+        if colon and not entry:
+            raise VTTError(f"Name the entry: `{key}:<entry>`.")
+        moved_line = None
+        if key in VAR_NAME_RULES and key in s.settings:
+            # Back to the inherited name: units move like any rename.
+            trial = GameSystem(s.name, dict(s.settings), parent=s.parent)
+            trial.settings.pop(key, None)
+            moved_line = _rename_system_var(
+                mgr, s, name, key, mgr.system_value(trial, key))
+        if not mgr.system_unset(s, key, entry or None):
+            raise VTTError(f"`{name}` sets nothing for `{spec}` itself.")
+        notes = []
+        refreshed = mgr.refresh_match_rules(name, notes)
+        src = mgr.system_value_source(s, key) if key in RULES_REGISTRY else None
+        shown = (f"now inherited from `{src}`" if src else
+                 "back to the engine default" if key in RULES_REGISTRY
+                 else "now inherited")
+        suffix = (f" (refreshed {refreshed} live match"
+                  f"{'es' if refreshed != 1 else ''})" if refreshed else "")
+        return await ctx.send("\n".join(
+            [f"`{name}`: `{spec}` {shown}{suffix}."]
+            + ([moved_line] if moved_line else [])
+            + [f"⚠️ {n}" for n in notes]))
     if sub in ("delete", "del", "remove", "rm"):
         if await return_help_if_not_enough_args(ctx, args, 2, "system", "delete"):
             return
@@ -4652,7 +4790,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         VALID = {"all", "host", "host_only", "owner"}
         # The system's current command_access dict (copy so we don't
         # mutate the stored value in place before set()).
-        current = s.get("command_access")
+        current = mgr.system_value(s, "command_access")
         current = dict(current) if isinstance(current, dict) else {}
 
         if action == "list":
@@ -4677,7 +4815,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     f"❌ level must be one of: {', '.join(sorted(VALID))}."
                 )
             current[key] = level
-            s.set("command_access", current)
+            mgr.system_rule_write(s, "command_access", current)
             refreshed = mgr.refresh_match_rules(name)
             suffix = f" ({refreshed} live match{'es' if refreshed != 1 else ''} refreshed)" if refreshed else ""
             return await ctx.send(
@@ -4692,7 +4830,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if key not in current:
                 return await ctx.send(f"❌ System `{name}` has no override for `{key}`.")
             del current[key]
-            s.set("command_access", current)
+            mgr.system_rule_write(s, "command_access", current)
             refreshed = mgr.refresh_match_rules(name)
             suffix = f" ({refreshed} live match{'es' if refreshed != 1 else ''} refreshed)" if refreshed else ""
             return await ctx.send(
@@ -4727,17 +4865,25 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         action = args[1].lower()
         sys_name = args[2]
         s = mgr.get_system(sys_name)
+        # The effective library: inherited aliases too (a child's own
+        # entries over its parents', minus the ones it hides).
+        lib = mgr.system_library(s, "aliases")
 
         if action == "list":
-            if not s.aliases:
+            if not lib:
                 return await ctx.send(
                     f"No aliases defined on system `{sys_name}`."
                 )
             lines = [f"**Aliases on `{sys_name}`:**"]
-            for aname in sorted(s.aliases.keys()):
-                exp = s.aliases[aname]
+            for aname in sorted(lib.keys()):
+                exp = lib[aname]
                 snippet = exp if len(exp) <= 60 else exp[:57] + "..."
-                lines.append(f"- `!{aname}` → `!{snippet}`")
+                src = "" if aname in s.aliases else " (inherited)"
+                lines.append(f"- `!{aname}` → `!{snippet}`{src}")
+            hidden = s.removed.get("aliases") or []
+            if hidden:
+                lines.append("Hidden here: " + ", ".join(
+                    f"`{h}`" for h in hidden))
             return await ctx.send("\n".join(lines))
 
         if action == "info":
@@ -4746,7 +4892,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     "Usage: `!system alias info <system> <name>`."
                 )
             aname = args[3]
-            exp = s.aliases.get(aname)
+            exp = lib.get(aname)
             if exp is None:
                 return await ctx.send(
                     f"❌ alias `{aname}` not defined on system `{sys_name}`."
@@ -4784,8 +4930,9 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     f"❌ alias expansion must start with a real command; "
                     f"`{target}` is not a registered command."
                 )
-            prior = s.aliases.get(aname)
-            s.aliases[aname] = expansion
+            prior = lib.get(aname)
+            lib[aname] = expansion
+            mgr.system_library_write(s, "aliases", lib)
             if prior is not None:
                 return await ctx.send(
                     f"Redefined alias `{aname}` on `{sys_name}` "
@@ -4801,14 +4948,18 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     "Usage: `!system alias del <system> <name>`."
                 )
             aname = args[3]
-            if aname not in s.aliases:
+            if aname not in lib:
                 return await ctx.send(
                     f"❌ alias `{aname}` not defined on system `{sys_name}`."
                 )
-            del s.aliases[aname]
+            del lib[aname]
+            mgr.system_library_write(s, "aliases", lib)
+            hid = aname in (s.removed.get("aliases") or [])
             return await ctx.send(
-                f"Deleted alias `{aname}` from system `{sys_name}`."
-            )
+                f"Deleted alias `{aname}` from system `{sys_name}`"
+                + (" (it hides the inherited one; `!system unset "
+                   f"{sys_name} aliases:{aname}` brings it back)."
+                   if hid else "."))
 
         return await ctx.send(
             f"Unknown `!system alias` action `{action}`. "
@@ -4819,14 +4970,33 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 registry.annotate_sub("system", "list", usage="!system list", desc="List existing GameSystems.")
 registry.annotate_sub("system", "info", usage="!system info <name>", desc="Show a GameSystem's settings.")
 registry.annotate_sub("system", "rules", usage="!system rules", desc="List all available rules, their defaults, their types, and descriptions")
-registry.annotate_sub("system", "new", usage="!system new <name>", desc="Create a GameSystem.")
+registry.annotate_sub("system", "new", usage="!system new <name> [parent=<system>]", desc="Create a GameSystem, optionally inheriting from another: a child holds only its own overrides and reads everything else (rules, structured rules, aliases, tile templates, formula functions) live from its parent chain.")
+registry.annotate_sub(
+    "system", "parent",
+    usage="!system parent <name> <parent|none>",
+    desc=("Make a GameSystem inherit from another, or with `none` stand on "
+          "its own (the values it inherited become its own, so nothing "
+          "changes). A loop is refused, and a chain longer than the bot "
+          "owner's system_chain_depth. Its matches and those of the systems "
+          "inheriting from it refresh."))
+registry.annotate_sub(
+    "system", "unset",
+    usage="!system unset <name> <rule|rule:entry|library:name>",
+    desc=("Drop a GameSystem's own value so the inherited one (or the engine "
+          "default) shows through: a whole rule, one entry of a merged rule "
+          "(`default_entity_vars:mana`, `command_access:find`, "
+          "`default_clamps:hp`, `default_entity_passives:<id>`, "
+          "`event_log_format:<type>`), or one library entry "
+          "(`aliases:dmg`, `tile_templates:fire`, `formula_functions:crit`) "
+          "it overrides or hides."))
 registry.annotate_sub(
     "system", "delete",
     usage="!system delete <name>",
     desc=(
         "Delete a GameSystem (aliases: del/remove/rm). Guarded: the "
         "system must exist, at least one system must remain, it can't be "
-        "the global default (reassign that first), and no live match may "
+        "the global default (reassign that first), no other system may "
+        "inherit from it (`!system parent`), and no live match may "
         "still be bound to it (rebind/delete those matches first). "
         "Per-server/channel default pointers at the deleted system are "
         "scrubbed and fall back to the global default."
@@ -10271,15 +10441,12 @@ async def gclamp_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
     def _read_clamps() -> List[Dict[str, Any]]:
         """Read the current default_clamps list, copying so we mutate freely."""
-        cur = sysobj.settings.get("default_clamps")
-        if cur is None:
-            # System never explicitly set; fall back to engine default
-            return list(DEFAULT_SYSTEM_SETTINGS.get("default_clamps", []))
-        return list(cur.value or [])
+        # The system's effective list: inherited from its parents too.
+        return list(mgr.system_value(sysobj, "default_clamps") or [])
 
     def _write_clamps(new_list: List[Dict[str, Any]]) -> int:
         """Persist the new clamp list onto the system and refresh live matches."""
-        sysobj.set("default_clamps", new_list)
+        mgr.system_rule_write(sysobj, "default_clamps", new_list)
         return mgr.refresh_match_rules(sys_name)
 
     if sub == "add":
@@ -10392,13 +10559,10 @@ async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     sysobj = mgr.get_system(sys_name)
 
     def _read_specs() -> List[Dict[str, Any]]:
-        cur = sysobj.settings.get("default_entity_passives")
-        if cur is None:
-            return list(DEFAULT_SYSTEM_SETTINGS.get("default_entity_passives", []))
-        return list(cur.value or [])
+        return list(mgr.system_value(sysobj, "default_entity_passives") or [])
 
     def _write_specs(new_list: List[Dict[str, Any]]) -> int:
-        sysobj.set("default_entity_passives", new_list)
+        mgr.system_rule_write(sysobj, "default_entity_passives", new_list)
         return mgr.refresh_match_rules(sys_name)
 
     if sub == "hooks":
@@ -10566,13 +10730,10 @@ async def defvar_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     sysobj = mgr.get_system(sys_name)
 
     def _read_vars() -> Dict[str, Any]:
-        cur = sysobj.settings.get("default_entity_vars")
-        if cur is None:
-            return dict(DEFAULT_SYSTEM_SETTINGS.get("default_entity_vars", {}))
-        return dict(cur.value or {})
+        return dict(mgr.system_value(sysobj, "default_entity_vars") or {})
 
     def _write_vars(new_map: Dict[str, Any]) -> int:
-        sysobj.set("default_entity_vars", new_map)
+        mgr.system_rule_write(sysobj, "default_entity_vars", new_map)
         return mgr.refresh_match_rules(sys_name)
 
     if sub == "add":
@@ -10821,13 +10982,10 @@ async def _log_format_sub(ctx, fmt_args, mgr, m):
     sysobj = mgr.get_system(sys_name)
 
     def _read() -> Dict[str, str]:
-        cur = sysobj.settings.get("event_log_format")
-        if cur is None:
-            return dict(DEFAULT_SYSTEM_SETTINGS.get("event_log_format", {}) or {})
-        return dict(cur.value or {})
+        return dict(mgr.system_value(sysobj, "event_log_format") or {})
 
     def _write(d: Dict[str, str]) -> int:
-        sysobj.set("event_log_format", d)
+        mgr.system_rule_write(sysobj, "event_log_format", d)
         return mgr.refresh_match_rules(sys_name)
 
     overrides = _read()
