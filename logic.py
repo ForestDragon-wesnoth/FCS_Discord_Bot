@@ -4467,6 +4467,51 @@ class FormulaFunction:
         )
 
 
+def check_formula_function(name: Any, params: List[Any]) -> None:
+    """Refuse a formula function name or parameter list that can't work:
+    names must be identifiers that don't shadow a built-in, parameters
+    unique identifiers that aren't built-ins, `entity` or `__`-prefixed.
+    Shared by match functions (`!func def`) and system libraries
+    (`!system func def`); the body is validated by the caller."""
+    if not isinstance(name, str) or not _FUNC_NAME_RE.match(name):
+        raise VTTError(
+            f"formula function name '{name}' must be a valid "
+            f"identifier (letters, digits, underscore; not starting "
+            f"with a digit)."
+        )
+    # Lazy import to avoid a logic <-> formula import cycle at module
+    # load. We only need the reserved-name set.
+    from formula import _ALLOWED_FUNCS, _MATCH_FUNC_NAMES
+    if name in _ALLOWED_FUNCS or name in _MATCH_FUNC_NAMES:
+        raise VTTError(
+            f"'{name}' is a built-in formula function and cannot be "
+            f"redefined."
+        )
+    seen = set()
+    for p in params:
+        if not isinstance(p, str) or not _FUNC_NAME_RE.match(p):
+            raise VTTError(
+                f"parameter name '{p}' must be a valid identifier."
+            )
+        if p in seen:
+            raise VTTError(f"duplicate parameter name '{p}'.")
+        seen.add(p)
+        if p in _ALLOWED_FUNCS or p in _MATCH_FUNC_NAMES:
+            raise VTTError(
+                f"parameter name '{p}' collides with a built-in "
+                f"formula function; pick a different name."
+            )
+        # `entity` is the magic accessor keyword and __-prefixed
+        # names are transformer-injected internals; a parameter
+        # using either would either shadow the accessor or never be
+        # reachable. Reject both up front.
+        if p == "entity" or p.startswith("__"):
+            raise VTTError(
+                f"parameter name '{p}' is reserved; pick a different "
+                f"name."
+            )
+
+
 # -------------------------
 # GameSystem (stores global rules for a game system, so not everything has to be manually set each match)
 # -------------------------
@@ -9563,45 +9608,9 @@ class Match:
         formula workflow); pass overwrite=False to raise DuplicateId on
         an existing name instead.
         """
-        if not isinstance(name, str) or not _FUNC_NAME_RE.match(name):
-            raise VTTError(
-                f"formula function name '{name}' must be a valid "
-                f"identifier (letters, digits, underscore; not starting "
-                f"with a digit)."
-            )
-        # Lazy import to avoid a logic <-> formula import cycle at module
-        # load. We only need the reserved-name set.
-        from formula import _ALLOWED_FUNCS, _MATCH_FUNC_NAMES
-        if name in _ALLOWED_FUNCS or name in _MATCH_FUNC_NAMES:
-            raise VTTError(
-                f"'{name}' is a built-in formula function and cannot be "
-                f"redefined."
-            )
+        check_formula_function(name, params)
         if not overwrite and name in self.formula_functions:
             raise DuplicateId(f"formula function '{name}' already exists.")
-        seen = set()
-        for p in params:
-            if not isinstance(p, str) or not _FUNC_NAME_RE.match(p):
-                raise VTTError(
-                    f"parameter name '{p}' must be a valid identifier."
-                )
-            if p in seen:
-                raise VTTError(f"duplicate parameter name '{p}'.")
-            seen.add(p)
-            if p in _ALLOWED_FUNCS or p in _MATCH_FUNC_NAMES:
-                raise VTTError(
-                    f"parameter name '{p}' collides with a built-in "
-                    f"formula function; pick a different name."
-                )
-            # `entity` is the magic accessor keyword and __-prefixed
-            # names are transformer-injected internals; a parameter
-            # using either would either shadow the accessor or never be
-            # reachable. Reject both up front.
-            if p == "entity" or p.startswith("__"):
-                raise VTTError(
-                    f"parameter name '{p}' is reserved; pick a different "
-                    f"name."
-                )
         fn = FormulaFunction(name=name, params=list(params), body=body)
         self.formula_functions[name] = fn
         return fn

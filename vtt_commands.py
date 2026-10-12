@@ -18,7 +18,7 @@ from logic import (
 from logic import VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit
 
 # Clamp system
-from logic import ClampSpec, GameSystem
+from logic import ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution
@@ -252,7 +252,7 @@ def _admin_required(name: str, args: List[str]) -> bool:
             return False
         if sub == "access":                 # !system access <sys> <action>
             return len(args) < 3 or args[2].lower() != "list"
-        if sub == "alias":                  # !system alias <action> <sys>
+        if sub in ("alias", "tile", "func"):  # !system alias <action> <sys>
             return len(args) < 2 or args[1].lower() not in ("list", "info")
         return True
     if name == "history":
@@ -944,6 +944,46 @@ def _engine_var_warning(path: str, value: Any) -> str:
             f"(it overrides the `{rule}` rule).")
 
 
+def _template_data_set(name: str, data: Dict[str, Any], path: str,
+                       value: Any) -> None:
+    """Write `value` at dotted `path` of tile template `name`'s data dict
+    (creating intermediate dicts), as `!tile def data` and `!system tile
+    data` do. Refuses the reserved keys and a path through a non-dict."""
+    if path.split(".", 1)[0] in TILE_RESERVED_KEYS:
+        raise VTTError(f"template data may not use reserved keys "
+                       f"({', '.join(sorted(TILE_RESERVED_KEYS))}).")
+    check_store_path(path, "template path")
+    parts = path.split(".")
+    d = data
+    for i, key in enumerate(parts[:-1]):
+        existing = d.get(key)
+        if existing is not None and not isinstance(existing, dict):
+            raise VTTError(f"template `{name}` value at "
+                           f"'{'.'.join(parts[:i + 1])}' is "
+                           f"{type(existing).__name__}, not a dict.")
+        d = d.setdefault(key, {})
+    d[parts[-1]] = value
+
+
+def _template_data_del(name: str, data: Dict[str, Any], path: str) -> None:
+    """Delete dotted `path` from tile template `name`'s data dict, pruning
+    dicts left empty (as tile_del_path does)."""
+    parts = path.split(".")
+    chain: List[Dict[str, Any]] = [data]
+    for key in parts[:-1]:
+        d = chain[-1]
+        if not isinstance(d, dict) or key not in d:
+            raise VTTError(f"template `{name}` has no value at '{path}'.")
+        chain.append(d[key])
+    if not isinstance(chain[-1], dict) or parts[-1] not in chain[-1]:
+        raise VTTError(f"template `{name}` has no value at '{path}'.")
+    del chain[-1][parts[-1]]
+    for i in range(len(chain) - 1, 0, -1):
+        if chain[i]:
+            break
+        del chain[i - 1][parts[i - 1]]
+
+
 def _cell_formula_warning(m: Match, path: str, value: Any) -> str:
     """Advisory for a tile / template / zone `block` or `opaque` value that
     is a formula with an error. Those fail OPEN at use (a broken block
@@ -974,23 +1014,42 @@ def _check_formula_rule(mgr: MatchManager, system: Any, key: str,
     mode = (RULES_REGISTRY.get(key, {}).get("schema") or {}).get("formula")
     if not mode or not isinstance(value, str) or not value.strip():
         return None
-    known = set(mgr.system_library(system, "formula_functions"))
+    return _system_formula_warning(
+        mgr, system, value, "eval" if mode == "expression" else "exec",
+        f"`{key}` must be a valid formula {mode}", "the rule fails")
+
+
+def _system_formula_warning(mgr: MatchManager, system: Any, src: str,
+                            mode: str, refusal: str, fails: str,
+                            known_params: frozenset = frozenset(),
+                            extra_funcs: frozenset = frozenset(),
+                            with_matches: bool = True) -> Optional[str]:
+    """Validate a formula a GameSystem stores (a rule, a library tile hook
+    or function body; `mode` eval / exec). A syntax error or a disallowed
+    construct raises VTTError(`refusal: <why>`). A call to a function that
+    isn't a built-in, in the system's library or a `!func` of one of its
+    family's matches is allowed — a match may define it later — and returns
+    a ⚠️ line saying `fails` until then. Otherwise None. `with_matches`
+    False counts only the system's own library (a promote: the matches
+    it reaches are new ones)."""
+    known = set(mgr.system_library(system, "formula_functions")) | extra_funcs
     family = {system.name, *mgr.system_descendants(system.name)}
     for m in mgr.matches.values():
-        if m.system_name in family:
+        if with_matches and m.system_name in family:
             known.update(m.formula_functions)
     try:
-        if mode == "expression":
-            validate_formula(value, mode="eval", known_funcs=frozenset(known))
-        else:
-            validate_program(value, known_funcs=frozenset(known))
+        validate_formula(src, mode=mode, known_funcs=frozenset(known),
+                         known_params=known_params)
     except FormulaError as ex:
         msg = str(ex)
-        if msg.startswith("Function '") and msg.endswith("is not allowed."):
-            return (f"⚠️ {msg[:-len(' is not allowed.')]} isn't a built-in or a "
-                    f"`!func` on this system or its matches yet; the rule fails "
-                    f"until one is defined.")
-        raise VTTError(f"`{key}` must be a valid formula {mode}: {msg}")
+        # The validator may add a "Did you mean" suggestion after the dot.
+        unknown = re.match(r"Function '(\w+)' is not allowed\.", msg)
+        if unknown:
+            where = ("this system or its matches" if with_matches
+                     else "this system")
+            return (f"⚠️ Function '{unknown.group(1)}' isn't a built-in or a "
+                    f"`!func` on {where} yet; {fails} until one is defined.")
+        raise VTTError(f"{refusal}: {msg}" if refusal else msg)
     return None
 
 
@@ -2261,6 +2320,68 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             lines.append(f"- `{n}` — pinned at turn {pin.get('turn', 0)}, "
                          f"{note}")
         return await ctx.send("\n".join(lines))
+    if sub == "sync":
+        # Copy the system's library entries (inherited ones included) over
+        # this match's: system edits reach only NEW matches by themselves.
+        # Match-only entries stay; an undo step like any match edit.
+        if await return_help_if_not_enough_args(ctx, args, 2, "match", "sync"):
+            return
+        m = active_match(mgr, ctx)
+        kinds = {"aliases": "aliases", "tiles": "tile_templates",
+                 "funcs": "formula_functions"}
+        singular = {"aliases": "alias", "tiles": "tile template",
+                    "funcs": "formula function"}
+        kind = args[1].lower()
+        if kind not in kinds and kind != "all":
+            raise VTTError(f"`{args[1]}` — sync one of: aliases, tiles, "
+                           f"funcs, all.")
+        _check_tail(args, 3 if kind != "all" else 2, (),
+                    "!match sync <aliases|tiles|funcs> [name] | "
+                    "!match sync all")
+        want = args[2] if len(args) > 2 else None
+        sysobj = mgr.get_system(m.system_name)
+        lines: List[str] = []
+        for word, lib_name in kinds.items():
+            if kind not in (word, "all"):
+                continue
+            lib = mgr.system_library(sysobj, lib_name)
+            if want is not None:
+                if want not in lib:
+                    raise NotFound(f"system `{m.system_name}` has no "
+                                   f"{singular[word]} `{want}`.")
+                lib = {want: lib[want]}
+            mine = getattr(m, lib_name)
+            added, replaced, same = [], [], 0
+            for n, entry in sorted(lib.items()):
+                if lib_name == "tile_templates":
+                    new = SpecialTileTemplate.from_dict(entry)
+                    old = mine[n].to_dict() if n in mine else None
+                    differs = old != new.to_dict()
+                elif lib_name == "formula_functions":
+                    new = FormulaFunction.from_dict(entry)
+                    old = mine[n].to_dict() if n in mine else None
+                    differs = old != new.to_dict()
+                else:
+                    new, old = entry, mine.get(n)
+                    differs = old != new
+                if not differs:
+                    same += 1
+                    continue
+                (replaced if old is not None else added).append(n)
+                mine[n] = new
+            if not lib:
+                lines.append(f"{word}: system `{m.system_name}` has none.")
+                continue
+            bits = []
+            if added:
+                bits.append("added " + ", ".join(f"`{n}`" for n in added))
+            if replaced:
+                bits.append("replaced " + ", ".join(f"`{n}`" for n in replaced))
+            if same:
+                bits.append(f"{same} already the same")
+            lines.append(f"{word}: " + "; ".join(bits) + ".")
+        return await ctx.send(f"🔄 Synced from system `{m.system_name}`:\n"
+                              + "\n".join(lines))
     if sub == "outcome":
         m = active_match(mgr, ctx)
         if m.outcome is None:
@@ -2398,6 +2519,16 @@ registry.annotate_sub(
           "this match), and whether the library's version differs. "
           "`refresh` drops every pin (or one), so the next use pins the "
           "library's current version; undo restores dropped pins."),
+)
+registry.annotate_sub(
+    "match", "sync",
+    usage="!match sync <aliases|tiles|funcs> [name] | !match sync all",
+    desc=("Copy the GameSystem's aliases, tile templates or formula "
+          "functions (its own and inherited ones; one by name, or all) over "
+          "this match's. A system's libraries reach only matches created "
+          "after an edit by themselves; this brings a live match up to date. "
+          "Entries only the match has are kept; undo reverts it. The other "
+          "way: `!system <alias|tile|func> promote`."),
 )
 registry.annotate_sub(
     "match", "fog",
@@ -4855,6 +4986,19 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         else:
             return await ctx.send("❌ Scope must be one of: server | channel")
 
+    # ---- system tile / func <action> <system> ... ----------------------
+    # The system's tile template and formula function libraries, edited in
+    # place with the grammar of `!tile def` / `!func`. Like aliases they
+    # reach NEW matches (copied at creation); a live match takes them with
+    # `!match sync`, and `promote` copies one the GM built in the channel's
+    # match into the system. Edits go through the effective library (a
+    # child's own entries over its parents'), so an inherited entry edited
+    # here becomes the child's own.
+    if sub == "tile":
+        return await _system_tile(ctx, args, mgr)
+    if sub == "func":
+        return await _system_func(ctx, args, mgr)
+
     # ---- system alias <subcommand> -----------------------------------
     # System-level alias library. These don't affect any currently live
     # match (parallel to how `!system set` only refreshes rules via
@@ -4961,12 +5105,266 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                    f"{sys_name} aliases:{aname}` brings it back)."
                    if hid else "."))
 
+        if action == "promote":
+            if len(args) < 4:
+                return await ctx.send(
+                    "Usage: `!system alias promote <system> <name>`."
+                )
+            aname = args[3]
+            m = active_match(mgr, ctx)
+            exp = m.aliases.get(aname)
+            if exp is None:
+                raise NotFound(f"alias `{aname}` isn't defined on match "
+                               f"`{m.id}`.")
+            prior = lib.get(aname)
+            lib[aname] = exp
+            mgr.system_library_write(s, "aliases", lib)
+            return await ctx.send(_promoted_line(
+                "alias", f"`!{aname}`", m.id, sys_name, prior is not None,
+                prior == exp))
+
         return await ctx.send(
             f"Unknown `!system alias` action `{action}`. "
-            f"Use one of: def, del, list, info."
+            f"Use one of: def, del, list, info, promote."
         )
 
     return await _help_fallback(ctx, ["system"], args[0] if args else None)
+def _promoted_line(kind: str, shown: str, match_id: str, sys_name: str,
+                   replaced: bool, same: bool) -> str:
+    """The reply of a `!system <alias|tile|func> promote`."""
+    if same:
+        return (f"{kind.capitalize()} {shown} on `{sys_name}` already equals "
+                f"match `{match_id}`'s; nothing changed.")
+    return (f"Promoted {kind} {shown} from match `{match_id}` to `{sys_name}`"
+            + (" (replaced the system's)." if replaced else ".")
+            + " New matches get it; live ones with `!match sync`.")
+
+
+def _promote_warning(mgr: MatchManager, s: Any, src: str, what: str,
+                     params: frozenset = frozenset(),
+                     funcs: frozenset = frozenset()) -> str:
+    """A ⚠️ line when promoted program `src` (`what`: a tile hook, a function
+    body) calls a function the system's family can't resolve — the match it
+    came from may hold `!func`s the system lacks — else ""."""
+    try:
+        warn = _system_formula_warning(mgr, s, src, "exec", "", "it fails",
+                                       known_params=params, extra_funcs=funcs,
+                                       with_matches=False)
+    except VTTError as ex:
+        return f"⚠️ {what} isn't a working formula: {ex}"
+    return f"⚠️ {what}: {warn.split(' ', 1)[1]}" if warn else ""
+
+
+def _system_lib_entry(mgr: MatchManager, s: Any, kind: str, name: str,
+                      sys_name: str, what: str) -> Dict[str, Any]:
+    """Entry `name` of `s`'s effective library `kind`, or NotFound."""
+    entry = mgr.system_library(s, kind).get(name)
+    if entry is None:
+        raise NotFound(f"{what} `{name}` isn't defined on system "
+                       f"`{sys_name}`.")
+    return entry
+
+
+async def _system_tile(ctx: ReplyContext, args: List[str],
+                       mgr: MatchManager):
+    """`!system tile <action> <system> ...` — see the system_cmd branch."""
+    if await return_help_if_not_enough_args(ctx, args, 3, "system", "tile"):
+        return
+    action, sys_name = args[1].lower(), args[2]
+    s = mgr.get_system(sys_name)
+    lib = mgr.system_library(s, "tile_templates")
+    need = {"new": 4, "data": 6, "del-data": 5, "hook": 6, "del-hook": 5,
+            "del": 4, "delete": 4, "remove": 4, "rm": 4, "info": 4,
+            "promote": 4, "list": 3}
+    if action not in need:
+        return await _help_fallback(ctx, ["system", "tile"], args[1])
+    if await return_help_if_not_enough_args(ctx, args, need[action],
+                                            "system", "tile"):
+        return
+    if action == "list":
+        if not lib:
+            return await ctx.send(f"No tile templates on system `{sys_name}`.")
+        lines = [f"**Tile templates on `{sys_name}`:**"]
+        for tname in sorted(lib):
+            hooks = ", ".join(sorted(lib[tname].get("hooks") or {})) or "—"
+            src = "" if tname in s.tile_templates else " (inherited)"
+            lines.append(f"- `{tname}` (hooks: {hooks}){src}")
+        hidden = s.removed.get("tile_templates") or []
+        if hidden:
+            lines.append("Hidden here: " + ", ".join(f"`{h}`" for h in hidden))
+        return await ctx.send("\n".join(lines))
+    name = args[3]
+    if action == "promote":
+        m = active_match(mgr, ctx)
+        tpl = m.tile_templates.get(name)
+        if tpl is None:
+            raise NotFound(f"tile template `{name}` isn't defined on match "
+                           f"`{m.id}`.")
+        prior = lib.get(name)
+        lib[name] = tpl.to_dict()
+        mgr.system_library_write(s, "tile_templates", lib)
+        warns = [_promote_warning(mgr, s, src, f"hook `{when}`")
+                 for when, src in sorted(tpl.hooks.items())]
+        return await ctx.send("\n".join(
+            [_promoted_line("tile template", f"`{name}`", m.id, sys_name,
+                            prior is not None, prior == lib[name])]
+            + [w for w in warns if w]))
+    if action == "new":
+        if name in lib:
+            raise DuplicateId(f"tile template `{name}` already exists on "
+                              f"system `{sys_name}`.")
+        lib[name] = SpecialTileTemplate(name=name).to_dict()
+        mgr.system_library_write(s, "tile_templates", lib)
+        return await ctx.send(f"Defined empty tile template `{name}` on "
+                              f"system `{sys_name}`.")
+    entry = _system_lib_entry(mgr, s, "tile_templates", name, sys_name,
+                              "tile template")
+    tpl = SpecialTileTemplate.from_dict(entry)
+    if action == "info":
+        body = json.dumps({"data": tpl.data, "hooks": tpl.hooks}, indent=2,
+                          default=str)
+        src = "" if name in s.tile_templates else " (inherited)"
+        return await ctx.send(f"**tile template `{name}`** on "
+                              f"`{sys_name}`{src}\n```{body}\n```")
+    if action in ("del", "delete", "remove", "rm"):
+        del lib[name]
+        mgr.system_library_write(s, "tile_templates", lib)
+        hid = name in (s.removed.get("tile_templates") or [])
+        return await ctx.send(
+            f"Deleted tile template `{name}` from system `{sys_name}`"
+            + (f" (it hides the inherited one; `!system unset {sys_name} "
+               f"tile_templates:{name}` brings it back)." if hid else "."))
+    warn = ""
+    if action == "data":
+        path, value = args[4], _parse_scalar(args[5])
+        _template_data_set(name, tpl.data, path, value)
+        reply = f"`{sys_name}` tile template `{name}`.{path} = {value!r}"
+        if path in ("block", "opaque") and isinstance(value, str) \
+                and value.strip():
+            try:
+                warn = _system_formula_warning(
+                    mgr, s, value, "eval", "", "it fails open") or ""
+            except VTTError as ex:
+                what = "never blocks" if path == "block" else "never hides"
+                warn = (f"⚠️ `{path}` isn't a working formula ({ex});"
+                        f" until it is fixed it {what}.")
+    elif action == "del-data":
+        _template_data_del(name, tpl.data, args[4])
+        reply = f"Removed `{sys_name}` tile template `{name}`.{args[4]}."
+    elif action == "hook":
+        when = args[4]
+        if when not in TILE_HOOK_NAMES:
+            raise VTTError(f"Unknown tile hook '{when}'. Allowed: "
+                           f"{', '.join(sorted(TILE_HOOK_NAMES))}.")
+        src = normalize_body_source(" ".join(args[5:]).strip())
+        warn = _system_formula_warning(
+            mgr, s, src, "exec", "Invalid hook formula", "the hook fails") or ""
+        tpl.hooks[when] = src
+        reply = f"Set `{sys_name}` tile template `{name}` `{when}` hook."
+    else:                                           # del-hook
+        when = args[4]
+        if when not in tpl.hooks:
+            raise NotFound(f"tile template `{name}` on `{sys_name}` has no "
+                           f"`{when}` hook.")
+        del tpl.hooks[when]
+        reply = f"Removed `{sys_name}` tile template `{name}` `{when}` hook."
+    lib[name] = tpl.to_dict()
+    mgr.system_library_write(s, "tile_templates", lib)
+    return await ctx.send(reply + (f"\n{warn}" if warn else ""))
+
+
+def _func_params(token: str) -> List[str]:
+    """The parameter list of `!func def` / `!system func def`: one token of
+    comma-separated names, or "", "-" or "none" for none."""
+    if token.strip().lower() in ("", "-", "none"):
+        return []
+    return [p.strip() for p in token.split(",") if p.strip()]
+
+
+async def _system_func(ctx: ReplyContext, args: List[str],
+                       mgr: MatchManager):
+    """`!system func <action> <system> ...` — see the system_cmd branch."""
+    if await return_help_if_not_enough_args(ctx, args, 3, "system", "func"):
+        return
+    action, sys_name = args[1].lower(), args[2]
+    s = mgr.get_system(sys_name)
+    lib = mgr.system_library(s, "formula_functions")
+    need = {"def": 6, "del": 4, "delete": 4, "remove": 4, "rm": 4,
+            "info": 4, "promote": 4, "list": 3}
+    if action not in need:
+        return await _help_fallback(ctx, ["system", "func"], args[1])
+    if await return_help_if_not_enough_args(ctx, args, need[action],
+                                            "system", "func"):
+        return
+    if action == "list":
+        if not lib:
+            return await ctx.send(
+                f"No formula functions on system `{sys_name}`.")
+        lines = [f"**Formula functions on `{sys_name}`:**"]
+        for fname in sorted(lib):
+            fn = FormulaFunction.from_dict(lib[fname])
+            snippet = fn.body if len(fn.body) <= 60 else fn.body[:57] + "..."
+            src = "" if fname in s.formula_functions else " (inherited)"
+            lines.append(f"- `{fn.signature()}` → {snippet}{src}")
+        hidden = s.removed.get("formula_functions") or []
+        if hidden:
+            lines.append("Hidden here: " + ", ".join(f"`{h}`" for h in hidden))
+        return await ctx.send("\n".join(lines))
+    name = args[3]
+    if action == "def":
+        params = _func_params(args[4])
+        body = normalize_body_source(" ".join(args[5:]).strip())
+        if not body:
+            raise VTTError("function body cannot be empty. Usage: `!system "
+                           "func def <system> <name> <params> <body>`.")
+        check_formula_function(name, params)
+        warn = _system_formula_warning(
+            mgr, s, body, "exec", "invalid function body", "it fails",
+            known_params=frozenset(params), extra_funcs=frozenset({name}))
+        prior = lib.get(name)
+        fn = FormulaFunction(name=name, params=params, body=body)
+        lib[name] = fn.to_dict()
+        mgr.system_library_write(s, "formula_functions", lib)
+        if prior is not None:
+            was = FormulaFunction.from_dict(prior)
+            reply = (f"Redefined formula function `{name}` on `{sys_name}`.\n"
+                     f"  was: `{was.signature()}` → {was.body}\n"
+                     f"  now: `{fn.signature()}` → {fn.body}")
+        else:
+            reply = (f"Defined formula function `{fn.signature()}` on "
+                     f"`{sys_name}`.")
+        return await ctx.send(reply + (f"\n{warn}" if warn else ""))
+    if action == "promote":
+        m = active_match(mgr, ctx)
+        fn = m.formula_functions.get(name)
+        if fn is None:
+            raise NotFound(f"formula function `{name}` isn't defined on "
+                           f"match `{m.id}`.")
+        prior = lib.get(name)
+        lib[name] = fn.to_dict()
+        mgr.system_library_write(s, "formula_functions", lib)
+        warn = _promote_warning(mgr, s, fn.body, "its body",
+                                frozenset(fn.params), frozenset({name}))
+        return await ctx.send("\n".join(
+            [_promoted_line("formula function", f"`{fn.signature()}`", m.id,
+                            sys_name, prior is not None, prior == lib[name])]
+            + ([warn] if warn else [])))
+    entry = _system_lib_entry(mgr, s, "formula_functions", name, sys_name,
+                              "formula function")
+    fn = FormulaFunction.from_dict(entry)
+    if action == "info":
+        src = "" if name in s.formula_functions else " (inherited)"
+        return await ctx.send(f"**`{fn.signature()}`** on `{sys_name}`{src}"
+                              f"\n```\n{fn.body}\n```")
+    del lib[name]                                   # del / delete / ...
+    mgr.system_library_write(s, "formula_functions", lib)
+    hid = name in (s.removed.get("formula_functions") or [])
+    return await ctx.send(
+        f"Deleted formula function `{name}` from system `{sys_name}`"
+        + (f" (it hides the inherited one; `!system unset {sys_name} "
+           f"formula_functions:{name}` brings it back)." if hid else "."))
+
+
 registry.annotate_sub("system", "list", usage="!system list", desc="List existing GameSystems.")
 registry.annotate_sub("system", "info", usage="!system info <name>", desc="Show a GameSystem's settings.")
 registry.annotate_sub("system", "rules", usage="!system rules", desc="List all available rules, their defaults, their types, and descriptions")
@@ -5023,16 +5421,60 @@ registry.annotate_sub(
     usage=(
         "!system alias <list <system> | info <system> <name> | "
         "def <system> <name> <expansion ...> | del <system> <name> | "
-        "delete <system> <name> | remove <system> <name> | rm <system> <name>>"
+        "delete <system> <name> | remove <system> <name> | rm <system> <name> | "
+        "promote <system> <name>>"
     ),
     desc=(
         "Manage a GameSystem's alias library. Aliases are copied into "
         "every NEW match created under this system (same inherit-at-"
         "create pattern as tile templates and formula functions); "
-        "match-side `!alias` edits afterwards don't reach back here. "
+        "a live match takes the system's with `!match sync aliases`. "
         "Forms: `def <sys> <name> <expansion>`, `del <sys> <name>`, "
-        "`list <sys>`, `info <sys> <name>`. The expansion's first "
-        "token must be a real registered command (no alias chains)."
+        "`list <sys>`, `info <sys> <name>`, `promote <sys> <name>` (copy "
+        "the channel's match's alias into the system). The expansion's "
+        "first token must be a real registered command (no alias chains)."
+    ),
+)
+registry.annotate_sub(
+    "system", "tile",
+    usage=(
+        "!system tile <list <system> | info <system> <name> | "
+        "new <system> <name> | data <system> <name> <path> <value> | "
+        "del-data <system> <name> <path> | "
+        "hook <system> <name> <when> <formula ...> | "
+        "del-hook <system> <name> <when> | del <system> <name> | "
+        "delete <system> <name> | remove <system> <name> | rm <system> <name> | "
+        "promote <system> <name>>"
+    ),
+    desc=(
+        "Manage a GameSystem's tile template library with the grammar of "
+        "`!tile def` (data fields and hook formulas). Like aliases, the "
+        "library is copied into every NEW match on the system (and the "
+        "systems inheriting from it); a live match takes it with `!match "
+        "sync tiles`. `promote <sys> <name>` copies a template from the "
+        "channel's match into the system. Editing an inherited template "
+        "makes it this system's own; deleting one hides it (`!system "
+        "unset <sys> tile_templates:<name>` brings it back). A hook calling "
+        "a function the system doesn't define is stored with a ⚠️."
+    ),
+)
+registry.annotate_sub(
+    "system", "func",
+    usage=(
+        "!system func <list <system> | info <system> <name> | "
+        "def <system> <name> <params> <body ...> | del <system> <name> | "
+        "delete <system> <name> | remove <system> <name> | rm <system> <name> | "
+        "promote <system> <name>>"
+    ),
+    desc=(
+        "Manage a GameSystem's formula function library with the grammar "
+        "of `!func` (`def <sys> <name> <params> <body>`, params one token: "
+        "`a,b` or `-`). Copied into every NEW match on the system (and the "
+        "systems inheriting from it); a live match takes it with `!match "
+        "sync funcs`. `promote <sys> <name>` copies a function from the "
+        "channel's match into the system. Editing an inherited function "
+        "makes it this system's own; deleting one hides it (`!system unset "
+        "<sys> formula_functions:<name>` brings it back)."
     ),
 )
 registry.annotate_sub("system", "default", usage="!system default <server|channel> <name>", desc="Set the GameSystem new matches use: this server's default, or this channel's own.")
@@ -11256,7 +11698,6 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # entity, this = current_entity_id(), tile_x/tile_y = the firing
     # tile's coords, hook_name = the `when`.
     if sub == "hook":
-        from logic import TILE_HOOK_NAMES
         if len(args) < 2:
             title, body = registry.help_for(["tile", "hook"])
             return await ctx.send(f"**{title}**\n{body}")
@@ -11330,7 +11771,6 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # deep-copied at place time, hooks are looked up live at fire
     # time).
     if sub == "def":
-        from logic import TILE_HOOK_NAMES, TILE_RESERVED_KEYS
         if len(args) < 2:
             title, body = registry.help_for(["tile", "def"])
             return await ctx.send(f"**{title}**\n{body}")
@@ -11358,32 +11798,8 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             path = args[3]
             if name not in m.tile_templates:
                 return await ctx.send(f"❌ template `{name}` not found.")
-            if path.split(".", 1)[0] in TILE_RESERVED_KEYS:
-                return await ctx.send(
-                    f"❌ template data may not use reserved keys "
-                    f"({', '.join(sorted(TILE_RESERVED_KEYS))})."
-                )
             value = _parse_scalar(args[4])
-            check_store_path(path, "template path")
-            tpl = m.tile_templates[name]
-            # Reuse Match.tile_set_path's path-walking semantics by
-            # operating directly on the template's data dict — we don't
-            # want to round-trip through self.tiles. The walk is short
-            # enough to inline here without pulling out a helper.
-            parts = path.split(".")
-            d = tpl.data
-            for i, key in enumerate(parts[:-1]):
-                existing = d.get(key)
-                if existing is not None and not isinstance(existing, dict):
-                    where = ".".join(parts[:i + 1])
-                    return await ctx.send(
-                        f"❌ template `{name}` value at '{where}' is "
-                        f"{type(existing).__name__}, not a dict."
-                    )
-                if key not in d:
-                    d[key] = {}
-                d = d[key]
-            d[parts[-1]] = value
+            _template_data_set(name, m.tile_templates[name].data, path, value)
             return await ctx.send(f"template `{name}`.{path} = {value!r}"
                                   + _cell_formula_warning(m, path, value))
 
@@ -11395,28 +11811,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             path = args[3]
             if name not in m.tile_templates:
                 return await ctx.send(f"❌ template `{name}` not found.")
-            tpl = m.tile_templates[name]
-            parts = path.split(".")
-            chain: List[Dict[str, Any]] = [tpl.data]
-            for i, key in enumerate(parts[:-1]):
-                d = chain[-1]
-                if not isinstance(d, dict) or key not in d:
-                    return await ctx.send(
-                        f"❌ template `{name}` has no value at '{path}'."
-                    )
-                chain.append(d[key])
-            leaf_parent = chain[-1]
-            leaf_key = parts[-1]
-            if not isinstance(leaf_parent, dict) or leaf_key not in leaf_parent:
-                return await ctx.send(
-                    f"❌ template `{name}` has no value at '{path}'."
-                )
-            del leaf_parent[leaf_key]
-            # Prune empty intermediate dicts the same way tile_del_path does.
-            for i in range(len(chain) - 1, 0, -1):
-                if chain[i]:
-                    break
-                del chain[i - 1][parts[i - 1]]
+            _template_data_del(name, m.tile_templates[name].data, path)
             return await ctx.send(f"Removed template `{name}`.{path}.")
 
         if dsub == "hook":
@@ -13166,11 +13561,7 @@ async def func_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 "❌ function body cannot be empty. Usage: "
                 "`!func def <name> <params> <body>`."
             )
-        # Parse the params token. "", "-", and "none" all mean no params.
-        if params_token.strip().lower() in ("", "-", "none"):
-            params: List[str] = []
-        else:
-            params = [p.strip() for p in params_token.split(",") if p.strip()]
+        params = _func_params(params_token)
         # Validate the body BEFORE storing — known_funcs is the current
         # registry plus the name being defined (so a recursive function
         # validates), and known_params is this function's parameters.

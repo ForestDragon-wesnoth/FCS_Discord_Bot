@@ -21855,3 +21855,195 @@ itself moves its units to its own name, and unsetting that moves them
 back, the child's engine formulas falling back to the parent's text.
 With var_name_collision refuse, a unit in the way on a child system's
 match refuses the parent's rename.
+
+SCENARIO 757 — GameSystem formula function library: !system func
+----------------------------------------------------------------------
+
+!system new skirm parent=default
+!system func def default dbl x "x * 2"
+?? Defined formula function `dbl(x)` on `default`
+!system func def default half - "1 / 2"
+!system func list skirm
+?? `dbl(x)` → x * 2 (inherited)
+!system func def skirm dbl x "x * 3"
+!system func info skirm dbl
+?? x * 3
+!system func info default dbl
+?? x * 2
+!match new t757 Skirm 6 6 --system skirm
+!match use t757
+!eval "[dbl(5), half()]"
+?? [15, 0.5]
+!system func del skirm half
+?? it hides the inherited one
+!match new t757b Second 6 6 --system skirm
+!match use t757b
+!eval "dbl(5)"
+?? 15
+!eval "half()"
+?? not allowed
+!system unset skirm formula_functions:half
+!system unset skirm formula_functions:dbl
+!match new t757c Third 6 6 --system skirm
+!match use t757c
+!eval "[dbl(5), half()]"
+?? [10, 0.5]
+!system func def default bad x "[i for i in range(x)]"
+?? ❌ invalid function body
+!system func def default len x "x"
+?? ❌ 'len' is a built-in formula function
+!system func def default twice x,x "x"
+?? ❌ duplicate parameter name 'x'
+!system func def default boom x "kaboom(x)"
+?? ⚠️ Function 'kaboom' isn't a built-in or a `!func` on this system or its matches yet
+
+Expected: HARNESS-ALLOWS-ERRORS. `!system func` edits a GameSystem's
+formula function library with the `!func` grammar. A child lists its
+parent's functions as inherited; redefining one makes it the child's own
+(the parent keeps x * 2), and deleting one hides it. New matches on the
+child get the effective library at creation: t757 sees dbl = x * 3 and
+half; t757b, made after the delete, has no half. Unsetting both entries
+brings the parent's back for a third match. A broken body, a built-in
+name and a duplicate parameter are refused; a call to an unknown
+function is stored with a ⚠️ (a match may define it later).
+
+SCENARIO 758 — GameSystem tile template library: !system tile, multi-tile use
+----------------------------------------------------------------------
+
+!system new skirm parent=default
+!system tile new default flame
+?? Defined empty tile template `flame` on system `default`
+!system tile data default flame burn 3
+!system tile data default flame glyph F
+!system tile hook default flame on_enter "entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, 'burn')"
+?? Set `default` tile template `flame` `on_enter` hook.
+!system tile data skirm flame burn 4
+!system tile info skirm flame
+?? "burn": 4
+!system tile info default flame
+?? "burn": 3
+!system tile list skirm
+?? `flame` (hooks: on_enter)
+!system tile new default flame
+?? ❌ tile template `flame` already exists on system `default`
+!system tile data default flame _template x
+?? ❌ template data may not use reserved keys
+!system tile hook default flame on_teleport "x = 1"
+?? ❌ Unknown tile hook 'on_teleport'
+!system tile hook default flame on_exit "[i for i in range(2)]"
+?? ❌ Invalid hook formula
+!system tile data default flame block "[i for i in range(2)]"
+?? ⚠️ `block` isn't a working formula
+!system tile del-data default flame block
+!system tile info nobody flame
+?? ❌
+!match new t758 Skirm 8 8 --system skirm
+!match use t758
+!tile place flame 3 2
+!tile place flame 3 3
+!ent add ogre Ogre 30 1 2 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent move ogre 1 right
+!assert "entity[ogre].hp == 22"
+!system tile del-hook skirm flame on_enter
+!system tile info skirm flame
+?! on_enter
+!system tile del default flame
+!system tile list default
+?? No tile templates on system `default`
+!system tile list skirm
+?? `flame`
+
+Expected: HARNESS-ALLOWS-ERRORS. `!system tile` edits a GameSystem's
+tile template library with the `!tile def` grammar. The child's data
+edit (burn 4) makes `flame` its own entry; the parent keeps burn 3.
+Duplicates, reserved data keys, unknown hook names and broken hook
+formulas are refused; a broken `block` formula is stored with a ⚠️ (it
+fails open). A match on the child gets the child's flame at creation: a
+2×2 ogre stepping right onto a column of two flames burns once per
+covered flame cell, 30 - 4 - 4 = 22. Dropping the child's hook and then
+deleting the parent's template leaves the child's own copy in place.
+
+SCENARIO 759 — System libraries: promote from a match, !match sync, undo, restart
+----------------------------------------------------------------------
+
+!match new t759 Lab 6 6
+!match use t759
+!func def helper x "x + 1"
+!func def calc x "helper(x) * 10"
+!tile def new pit
+!tile def data pit depth 2
+!tile def hook pit on_stop "entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, 'depth')"
+!alias def hit "ent hp"
+!system func promote default calc
+?? Promoted formula function `calc(x)` from match `t759` to `default`
+?? ⚠️ its body: Function 'helper' isn't a built-in or a `!func` on this system yet
+!system func promote default helper
+!system func promote default helper
+?? already equals match `t759`'s; nothing changed
+!system tile promote default pit
+!system alias promote default hit
+?? Promoted alias `!hit`
+!system func promote default nothere
+?? ❌ formula function `nothere` isn't defined on match `t759`
+!match new t759b Fresh 6 6
+!match use t759b
+!eval "calc(1)"
+?? 20
+!tile place pit 2 2
+!ent add a A 10 1 2 5
+!hit a 9
+!ent move a 1 right
+!assert "entity[a].hp == 7"
+!system func def default calc x "x * 100"
+!system tile data default pit depth 5
+!eval "calc(1)"
+?? 20
+!match sync funcs calc
+?? replaced `calc`
+!eval "calc(1)"
+?? 100
+!match sync tiles
+?? replaced `pit`
+!func def mine x "x"
+!match sync all
+?? funcs: 2 already the same
+?? aliases: 1 already the same
+!eval "[mine(4), calc(1)]"
+?? [4, 100]
+!undo command 4 confirm
+?? Undid 4 command(s)
+!eval "calc(1)"
+?? 20
+!eval "mine(1)"
+?? not allowed
+!match sync funcs nothere
+?? ❌ system `default` has no formula function `nothere`
+!match sync spells
+?? ❌ `spells` — sync one of: aliases, tiles, funcs, all.
+!match sync all calc
+?? ❌
+?tab "!system func info default ca"
+?? → '!system func info default calc '
+?tab "!system tile promote default p"
+?? → '!system tile promote default pit '
+?tab "!match sync tiles "
+?? → '!match sync tiles pit '
+!as restart
+!system func info default calc
+?? x * 100
+!system tile info default pit
+?? "depth": 5
+!system alias info default hit
+?? → `!ent hp`
+
+Expected: HARNESS-ALLOWS-ERRORS. `promote` copies an alias, tile
+template or formula function the GM built in the channel's match into a
+system's library; promoting `calc` before its helper warns that the
+system can't resolve `helper` yet, and promoting an identical entry
+changes nothing. A new match gets all three: `calc(1)` = 20, the pit's
+on_stop hook takes 2 hp, and the `hit` alias sets hp. A later system edit
+leaves the live match alone until `!match sync` copies it over (one
+entry, a whole library, or all three, keeping match-only `mine`); undo
+reverts the syncs. Unknown entries, unknown kinds and a name with `all`
+are refused. The promoted libraries survive a restart.

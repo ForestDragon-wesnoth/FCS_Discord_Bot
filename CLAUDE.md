@@ -1339,7 +1339,7 @@ hardcodes**.
 ### 7.12 Zones, tiles and auras
 
 - **Tiles:** per-cell data (`!tile set/place/line/fill/copy/...`), templates
-  (`!tile def`, per system), precedence instance > template > rule for
+  (`!tile def` per match, `!system tile` per system, §7.16), precedence instance > template > rule for
   glyph / color / sprite / block / opaque; tile hooks (on_enter / on_exit /
   on_stop / time hooks).
 - **Zones:** named cell sets (`!zone ...`): data, hooks (boundary + per-cell
@@ -1514,7 +1514,9 @@ hardcodes**.
   inherited ones plus `GameSystem.removed` for inherited entries taken
   away (an entry equal to the inherited one isn't stored, so a later parent
   edit still reaches it; a plain rule set on a child is stored even when
-  equal, pinning it). Commands: `!system new <name> [parent=]`, `!system
+  equal, pinning it — user call: a child system is a list of changes to
+  its parent, so a rule the GM set deliberately stays set, while partial
+  templates aim at consistency with their base). Commands: `!system new <name> [parent=]`, `!system
   parent <name> <sys|none>` (none writes the inherited values into its own
   layer; a loop and a chain past the owner limit `system_chain_depth`
   (`logic.OWNER_LIMITS`, set with `!owner ceiling`, default 8) are refused),
@@ -1524,6 +1526,19 @@ hardcodes**.
   on a parent moves the units of every inheriting system's matches and
   renames their clamps / default vars (`_inheritors`); a child's own engine
   formula equal to its parent's after a rename is dropped (753-756).
+- **System libraries** (aliases, tile templates, formula functions):
+  `!system alias|tile|func <action> <system> ...` edit them with the
+  grammar of `!alias` / `!tile def` / `!func` (action first, like alias),
+  through the effective library (editing an inherited entry makes it the
+  child's own whole entry; deleting one hides it). They reach NEW matches
+  only (copied at creation, user call); `!match sync <aliases|tiles|funcs>
+  [name] | all` copies the system's effective entries over a live match's
+  (match-only entries kept, an undo step), and `!system <lib> promote
+  <system> <name>` copies one from the channel's match into the system.
+  Formulas a system stores (rules, tile hooks / block / opaque, function
+  bodies) go through `_system_formula_warning`: a disallowed construct is
+  refused, a call to an unknown function is stored with a ⚠️ (a match may
+  define it later; a promote counts only the system's library) (757-759).
 - **Match vars:** `!match var`, `match_var_get` / `match_var_set` /
   `match_var_del`. **Groups:** `!ent group`, `group:<name>` selectors and
   group moves.
