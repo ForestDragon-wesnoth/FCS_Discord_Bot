@@ -22308,3 +22308,230 @@ template (resolved) from formulas: a `!func` resets a unit's hp to its
 template's, and as a read-only function it works inside a `$()` argument.
 A diff against a unit with a body part compares part by part: the
 head's hp is one line.
+
+SCENARIO 765 — break / continue and higher-order helpers with lambdas
+----------------------------------------------------------------------
+
+!match new t765 Lab 10 10
+!match use t765
+!ent add a A 10 1 1 5
+!ent add b B 3 3 3 7
+!ent add c C 7 5 5 2
+!eval "for i in range(10):\n    if i == 4:\n        break\n    entity[a].n = i"
+!assert "entity[a].n == 3"
+!eval "for i in range(3):\n    if i == 1:\n        continue\n    entity[a].last = i"
+!assert "entity[a].last == 2"
+!eval "break"
+?? ❌ `break` is only allowed inside a for-loop.
+!eval "map_with(all_entities(), lambda u: entity[u].hp)"
+?? [10, 3, 7]
+!eval "filter_with(all_entities(), lambda u: entity[u].hp > 5)"
+?? ['a', 'c']
+!eval "sort_by(all_entities(), lambda u: entity[u].hp, desc=True)"
+?? ['a', 'c', 'b']
+!func def weak u "entity[u].hp < 5"
+!eval "filter_with(all_entities(), 'weak')"
+?? ['b']
+!func def below lim "filter_with(all_entities(), lambda u: entity[u].hp < lim)"
+!eval "below(8)"
+?? ['b', 'c']
+!ent set_var a actions.smite.body "t = 8\nfor u in filter_with(all_entities(), lambda u: entity[u].hp < t):\n    entity[u].hp = entity[u].hp - 1"
+!action a smite
+!assert "entity[b].hp == 2 and entity[c].hp == 6 and entity[a].hp == 10"
+!eval "lambda u: 1"
+?? ❌ A lambda is only allowed as the function argument of filter_with, map_with, sort_by.
+!eval "map_with([1, 2], lambda u, v: 1)"
+?? ❌ map_with: a lambda takes exactly one plain parameter
+!eval "map_with([1, 2], lambda u: u.__class__)"
+?? ❌
+!eval "map_with([1, 2], 'nope')"
+?? ❌ map_with: no `!func` named `nope` on this match.
+!eval "sort_by([1, 'a'], lambda u: u)"
+?? ❌ sort_by: the keys must all be numbers or all text.
+!eval "map_with(range(20000), lambda u: u)"
+?? ❌ formula for-loop iteration limit (10000) exceeded
+!ent hp a "$(len(map_with([1], lambda u: u)))"
+?? ❌ function 'map_with' changes game state and is banned in a $() inline argument
+!assert "entity[a].hp == 10"
+!ent set_var a actions.bad.body "__builtins__ = 1"
+!action a bad
+?? ❌ `__builtins__` can't be a local's name
+!eval "for __read in range(2):\n    pass"
+?? ❌ `__read` can't be a loop variable's name
+
+Expected: HARNESS-ALLOWS-ERRORS. `break` stops a loop and `continue`
+skips the rest of an iteration; either outside a loop is refused.
+`map_with` / `filter_with` / `sort_by` take a `!func` name or a lambda:
+the action `smite` takes 1 hp from every unit below 8 with a lambda that
+reads the action's local `t`, and a `!func` can use a lambda over its own
+parameter. A lambda anywhere else, with two parameters, or touching a
+dunder is refused; each call counts against formula_loop_limit; the
+helpers are banned in `$()` (a `!func` they call may write). A local or
+loop variable named with a leading `__` is refused, since the formula's
+namespace holds the engine's own names.
+
+SCENARIO 766 — schedules_of / schedule_left, and macro defaults and named args
+----------------------------------------------------------------------
+
+!match new t766 Lab 10 10
+!match use t766
+!ent add a A 10 1 1 5
+!ent add b B 8 3 3 7
+!schedule turn b 2 "log('x')" 
+!schedule round 3 "log('y')"
+!eval "[len(schedules_of('b')), len(schedules_of()), schedule_left(get(schedules_of('b'), 0)), schedule_left(get(schedules_of(), 0)), schedule_left('nope')]"
+?? [1, 1, 2, 3, None]
+!ent hp a "$(schedule_left(get(schedules_of('b'), 0)) + 5)"
+!assert "entity[a].hp == 7"
+!macro set m "ent hp $1 ${2:4}\nent hp b ${hp:6}\neval \"'$who'\""
+!macro run m a
+?? Set `a` hp to 4
+?? Set `b` hp to 6
+?? = `'$who'`
+!macro run m a 7 hp=2 who=bob
+?? Set `a` hp to 7
+?? Set `b` hp to 2
+?? = `'bob'`
+!macro run m a "" note=x
+?? Set `a` hp to 4
+!macro set sweep "foreach team=${side:red} ; ent hp $id $amount"
+!ent set_var a team red
+!ent set_var b team blue
+!macro run sweep amount=9
+!assert "entity[a].hp == 9 and entity[b].hp == 6"
+!macro run sweep side=blue amount=1
+!assert "entity[a].hp == 9 and entity[b].hp == 1"
+
+Expected: HARNESS-ALLOWS-ERRORS. `schedules_of(eid)` lists a unit's
+pending schedules (no unit: the match-level ones) and `schedule_left`
+says how many of its turns / rounds remain (None when gone); both are
+read-only, so they work inside `$()`. Macros take `${N:default}` and
+named args: `hp=2` reaches `${hp:6}` and `who=bob` reaches `$who` because
+the body uses those names; `$who` with no such arg stays as written, as
+does `!foreach`'s own `$id` inside the macro, while `$amount` and
+`${side:red}` come from the run line.
+
+SCENARIO 767 — Renames (status, zone, table, macro) and copies
+----------------------------------------------------------------------
+
+!match new t767 Lab 10 10
+!match use t767
+!ent add a A 10 1 1 5
+!ent add b B 8 3 3 7
+!ent add ogre Ogre 30 6 6 3
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!part add ogre oarm arm 10 10
+!status def burn
+!status def wet
+!status removes wet burn
+!status apply a burn 2
+!status apply oarm burn 1
+!status apply b burn 1
+!ent set_var b status_resist.burn 1
+!ent set_var b gear.status_immune "burn, stun"
+!passive add a p1 on_turn_start "status_apply(self, 'burn', 1)"
+!ent kill b
+!status rename burn fire
+?? Renamed status `burn` to `fire` (with 2 live instance(s), 1 corpse(s), 1 other definition(s)' removes / blocked_by).
+?? ⚠️ These still name status `burn` as text and were left as written: `a` passive `p1`.
+!assert "status_has('a', 'fire') and status_has('oarm', 'fire') and not status_has('a', 'burn')"
+!assert "status_get('a', 'fire', 'level') == 2"
+!assert "corpse_status_has('b', 'fire') and not corpse_status_has('b', 'burn')"
+!status info wet
+?? "removes": "fire"
+!ent revive b
+!assert "entity[b].status_resist.fire == 1 and entity[b].gear.status_immune == 'fire, stun'"
+!status rename wet fire
+?? ❌ Status definition 'fire' already exists.
+!status rename nope x
+?? ❌ No status definition `nope`.
+!status copy fire fire2
+!status copy fire tag:x
+?? ❌
+!zone new z1
+!zone set z1 dmg 3
+!zone hook add z1 on_enter "entity[self].hp = entity[self].hp - zone_get('z1', 'dmg')"
+!zone rename z1 z2
+?? ⚠️ These still name zone `z1` as text and were left as written: zone `z2` hook `on_enter`.
+!assert "zone_get('z2', 'dmg') == 3"
+!table def loot "a:1, b:1"
+!table rename loot spoils
+!eval "table_roll('spoils') in ['a', 'b']"
+?? True
+!macro set m "ent hp a 5"
+!macro set caller "macro run m"
+!macro rename m m2
+?? ⚠️ These still name macro `m` as text and were left as written: macro `caller`.
+!macro copy m2 m3
+!macro list
+?? `caller`, `m2`, `m3`
+!passive copy a p1 ogre
+!passive copy a p1 ogre
+?? ❌ `ogre` already has a passive `p1`
+!passive copy a p1 ogre p2
+!passive list ogre
+?? `p2` (on_turn_start)
+!tile def new pit
+!tile def data pit depth 2
+!tile def copy pit pit2
+!tile def info pit2
+?? "depth": 2
+
+Expected: HARNESS-ALLOWS-ERRORS. `!status rename` moves the definition,
+the live instances on a unit and on the 2×2 ogre's arm part, the corpse's
+status, the other definition's `removes`, and the resistance and immunity
+vars (the corpse's here, back on b after the revive). The passive that
+names `burn` in its formula is listed and left as written. Zones, tables
+and macros rename the same way, listing what still names the old one
+(the zone's own hook, the `caller` macro). `copy` makes a variant of a
+status definition, a macro or a tile template, and `!passive copy` gives
+another unit the same passive, under a new id when the old one is taken.
+
+SCENARIO 768 — !dry runs a command and rolls everything back
+----------------------------------------------------------------------
+
+!system set default random_seed 7
+!match new t768 Lab 10 10
+!match use t768
+!ent add a A 10 1 1 5
+!ent add ogre Ogre 30 4 4 3
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!part add ogre oarm arm 10 10
+!dry ent move ogre 2 right
+?? 🧪 Dry run of `!ent move ogre 2 right` — none of this is kept:
+?? Moved `ogre` 2 step(s) to (6,4)
+?? 🧪 It would change:
+?? position: (4,4) -> (6,4)
+?? Rolled back.
+!assert "entity[ogre].x == 4 and entity[ogre].y == 4"
+!dry batch ent hp a 2 ; ent remove ogre ; system set default friendlyfire true
+?? ❌ `!dry` can't run `!system set`: its effect lives outside the match
+?? vars.hp: 10 -> 2
+?? Entities removed:
+!assert "entity[a].hp == 10 and has_part('ogre', 'arm')"
+!assert "rule_get('friendlyfire') == False"
+!dry eval "roll('1d1000')"
+?? = `730`
+!eval "roll('1d1000')"
+?? = `730`
+!dry undo command 1
+?? ❌ `!dry` can't run `!undo command`
+!dry template save a goblin
+?? ❌ `!dry` can't run `!template save`: the template library is written straight to disk.
+!dry dry ent hp a 1
+?? ❌ `!dry` can't run inside another `!dry`.
+!dry list
+?? It changes nothing on this match; rolled back.
+!as player bob
+!dry ent hp a 1
+?? ❌
+!as host
+!assert "entity[a].hp == 10"
+
+Expected: HARNESS-ALLOWS-ERRORS. `!dry` runs a command, shows its replies
+and the changes it made to the match, then rolls every match back: the
+2×2 ogre's move (with its arm) and a batch's hp change and removal leave
+no trace. A server-wide line inside the dry batch is refused, as are undo,
+template saves and a nested `!dry`. The seeded RNG position is restored
+too: `roll('1d1000')` gives the same value in the dry run and afterwards.
+A player can't use `!dry`.

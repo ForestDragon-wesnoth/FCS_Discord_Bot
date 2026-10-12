@@ -450,6 +450,11 @@ class CommandRegistry:
         if name == "server":
             await ctx.send(_SERVER_TYPED_ONLY)
             return
+        if _DRY_ACTIVE.get():
+            refusal = _dry_refusal(name, args)
+            if refusal:
+                await ctx.send(refusal)
+                return
         stray = _stray_words_error(self, name, args)
         if stray:
             await ctx.send(stray)
@@ -1111,6 +1116,9 @@ _RUN_DEPTH: "contextvars.ContextVar[int]" = contextvars.ContextVar(
 # True while `!again` replays a command (see again_cmd).
 _AGAIN_ACTIVE: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
     "vtt_again_active", default=False)
+# True while `!dry` runs a command (see dry_cmd and _dry_refusal).
+_DRY_ACTIVE: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "vtt_dry_active", default=False)
 
 
 # ---- stray-word check (usage strings are authoritative) -------------------
@@ -5382,6 +5390,100 @@ def _lint_one(src: Any, mode: str, known: frozenset,
     return None
 
 
+def _match_formula_slots(m: Match):
+    """Every formula match `m` stores, as (where, source, mode, params,
+    action_mode): its functions, global / team / unit passives, unit
+    actions, watchers, status ticks, tile templates' and tiles' hooks and
+    block / opaque conditions, zones' hooks and conditions. Read by
+    `!system lint` and by renames looking for formulas that name a thing."""
+    from action import discover_actions
+    for fname, fn in sorted(m.formula_functions.items()):
+        yield (f"function `{fname}`", fn.body, "exec", frozenset(fn.params),
+               False)
+    for pid, p in sorted(m.global_passives.items()):
+        yield f"global passive `{pid}`", p.formula, "exec", frozenset(), False
+    for team, ps in sorted(m.team_passives.items()):
+        for pid, p in sorted(ps.items()):
+            yield (f"team `{team}` passive `{pid}`", p.formula, "exec",
+                   frozenset(), False)
+    for eid, e in sorted(m.entities.items()):
+        for pid, p in sorted(e.passives.items()):
+            yield f"`{eid}` passive `{pid}`", p.formula, "exec", frozenset(), False
+        for _aname, acts in sorted(discover_actions(e, m.rules).items()):
+            for act in acts:
+                yield (f"`{eid}` action `{act.full_path}`", act.body, "exec",
+                       frozenset(), True)
+    for wname, w in sorted(m.watchers.items()):
+        yield (f"watcher `{wname}` condition", w.get("condition"), "eval",
+               frozenset(), False)
+        yield (f"watcher `{wname}` effect", w.get("effect"), "exec",
+               frozenset(), False)
+    for sname, sdef in sorted(m.status_definitions.items()):
+        yield f"status `{sname}` tick", sdef.get("tick"), "exec", frozenset(), False
+    for tname, tpl in sorted(m.tile_templates.items()):
+        for when, src in sorted(tpl.hooks.items()):
+            yield (f"tile template `{tname}` hook `{when}`", src, "exec",
+                   frozenset(), False)
+        for key in ("block", "opaque"):
+            yield (f"tile template `{tname}` {key}", tpl.data.get(key), "eval",
+                   frozenset(), False)
+    for (x, y), tile in sorted(m.tiles.items()):
+        if not isinstance(tile, dict):
+            continue
+        for when, src in sorted((tile.get("hooks") or {}).items()):
+            yield (f"tile ({x},{y}) hook `{when}`", src, "exec", frozenset(),
+                   False)
+        for key in ("block", "opaque"):
+            yield (f"tile ({x},{y}) {key}", tile.get(key), "eval", frozenset(),
+                   False)
+    for zname, z in sorted(m.zones.items()):
+        for when, src in sorted((z.get("hooks") or {}).items()):
+            yield (f"zone `{zname}` hook `{when}`", src, "exec", frozenset(),
+                   False)
+        for key in ("block", "opaque"):
+            yield (f"zone `{zname}` {key}", (z.get("data") or {}).get(key),
+                   "eval", frozenset(), False)
+
+
+def _rename_entry(d: Dict[str, Any], old: str, new: str, what: str) -> Dict[str, Any]:
+    """`d` with key `old` renamed `new` (order kept). Refuses a missing
+    `old`, a taken or blank `new`."""
+    if old not in d:
+        raise NotFound(f"No {what} `{old}`.")
+    if not new or any(c.isspace() for c in new):
+        raise VTTError(f"`{new}` can't be a {what} name (one word).")
+    if new in d:
+        raise DuplicateId(f"A {what} `{new}` already exists.")
+    return {(new if k == old else k): v for k, v in d.items()}
+
+
+def _copy_entry(d: Dict[str, Any], src: str, new: str, what: str) -> None:
+    """Copy entry `src` of `d` to `new` (a deep copy)."""
+    if src not in d:
+        raise NotFound(f"No {what} `{src}`.")
+    if not new or any(c.isspace() for c in new):
+        raise VTTError(f"`{new}` can't be a {what} name (one word).")
+    if new in d:
+        raise DuplicateId(f"A {what} `{new}` already exists.")
+    d[new] = copy.deepcopy(d[src])
+
+
+def _mentions_note(m: Match, name: str, what: str) -> Optional[str]:
+    """After a rename: a ⚠️ naming the formulas and macros that still say
+    `name` as quoted text (`'old'`), which a rename can't safely rewrite."""
+    quoted = (f"'{name}'", f'"{name}"')
+    where = [w for w, src, *_ in _match_formula_slots(m)
+             if isinstance(src, str) and any(q in src for q in quoted)]
+    where += [f"macro `{mn}`" for mn, body in sorted(m.macros.items())
+              if re.search(rf"(?<![\w]){re.escape(name)}(?![\w])", body)]
+    if not where:
+        return None
+    shown = ", ".join(where[:8]) + (f" (+{len(where) - 8} more)"
+                                    if len(where) > 8 else "")
+    return (f"⚠️ These still name {what} `{name}` as text and were left as "
+            f"written: {shown}.")
+
+
 def _system_lint(mgr: MatchManager, s: Any) -> str:
     """`!system lint <name>`: every formula the system and its matches
     store, checked at once. Each is checked when stored, but a function
@@ -5389,7 +5491,6 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
     removed leaves formulas that fail at use, mostly silently (fail-open
     conditions). A call to a function the system's library lacks is a ⚠️
     at system level (a match may define it); everything else is a ❌."""
-    from action import discover_actions
     sys_known = frozenset(mgr.system_library(s, "formula_functions"))
     bad: List[str] = []
     warn: List[str] = []
@@ -5441,64 +5542,10 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
                       if m.system_name == s.name), key=lambda m: m.id)
     for m in matches:
         known = frozenset(m.formula_functions)
-        at = f"match `{m.id}`"
-        for fname, fn in sorted(m.formula_functions.items()):
+        for where, src, mode, params, action_mode in _match_formula_slots(m):
             n += 1
-            check(f"{at} function `{fname}`", fn.body, "exec", known,
-                  frozenset(fn.params))
-        passives = [(f"global passive `{pid}`", p)
-                    for pid, p in sorted(m.global_passives.items())]
-        for team, ps in sorted(m.team_passives.items()):
-            passives += [(f"team `{team}` passive `{pid}`", p)
-                         for pid, p in sorted(ps.items())]
-        for eid, e in sorted(m.entities.items()):
-            passives += [(f"`{eid}` passive `{pid}`", p)
-                         for pid, p in sorted(e.passives.items())]
-            for aname, acts in sorted(discover_actions(e, m.rules).items()):
-                for act in acts:
-                    n += 1
-                    check(f"{at} `{eid}` action `{act.full_path}`", act.body,
-                          "exec", known, action_mode=True)
-        for where, p in passives:
-            n += 1
-            check(f"{at} {where}", p.formula, "exec", known)
-        for wname, w in sorted(m.watchers.items()):
-            n += 2
-            check(f"{at} watcher `{wname}` condition", w.get("condition"),
-                  "eval", known)
-            check(f"{at} watcher `{wname}` effect", w.get("effect"), "exec",
-                  known)
-        for sname, sdef in sorted(m.status_definitions.items()):
-            n += 1
-            check(f"{at} status `{sname}` tick", sdef.get("tick"), "exec",
-                  known)
-        for tname, tpl in sorted(m.tile_templates.items()):
-            for when, src in sorted(tpl.hooks.items()):
-                n += 1
-                check(f"{at} tile template `{tname}` hook `{when}`", src,
-                      "exec", known)
-            for key in ("block", "opaque"):
-                n += 1
-                check(f"{at} tile template `{tname}` {key}",
-                      tpl.data.get(key), "eval", known)
-        for (x, y), tile in sorted(m.tiles.items()):
-            if not isinstance(tile, dict):
-                continue
-            for when, src in sorted((tile.get("hooks") or {}).items()):
-                n += 1
-                check(f"{at} tile ({x},{y}) hook `{when}`", src, "exec", known)
-            for key in ("block", "opaque"):
-                n += 1
-                check(f"{at} tile ({x},{y}) {key}", tile.get(key), "eval",
-                      known)
-        for zname, z in sorted(m.zones.items()):
-            for when, src in sorted((z.get("hooks") or {}).items()):
-                n += 1
-                check(f"{at} zone `{zname}` hook `{when}`", src, "exec", known)
-            for key in ("block", "opaque"):
-                n += 1
-                check(f"{at} zone `{zname}` {key}",
-                      (z.get("data") or {}).get(key), "eval", known)
+            check(f"match `{m.id}` {where}", src, mode, known, params,
+                  action_mode)
     head = (f"🔍 `{s.name}` and its {len(matches)} match"
             f"{'es' if len(matches) != 1 else ''}: {n} formula slot(s) "
             f"checked")
@@ -10853,6 +10900,31 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             "**Passive hooks:** " + ", ".join(f"`{h}`" for h in sorted(HOOK_NAMES))
         )
 
+    if sub == "copy":
+        # !passive copy <eid> <pid> <dest_eid> [new_pid]: the same passive on
+        # another unit (its own copy).
+        if await return_help_if_not_enough_args(ctx, args, 4, "passive", "copy"):
+            return
+        _check_tail(args, 5, (), "!passive copy <eid> <pid> <dest_eid> [new_pid]")
+        src = m.entities.get(_resolve_eid(m, args[1]))
+        if src is None:
+            raise NotFound(f"Entity '{args[1]}' not found.")
+        if args[2] not in src.passives:
+            raise NotFound(f"`{src.id}` has no passive `{args[2]}`.")
+        dest = m.entities.get(_resolve_eid(m, args[3]))
+        if dest is None:
+            raise NotFound(f"Entity '{args[3]}' not found.")
+        pid = args[4] if len(args) > 4 else args[2]
+        if pid in dest.passives:
+            raise DuplicateId(f"`{dest.id}` already has a passive `{pid}` "
+                              f"(name the copy: `!passive copy {args[1]} "
+                              f"{args[2]} {args[3]} <new_pid>`).")
+        p = Passive.from_dict(src.passives[args[2]].to_dict())
+        p.id = pid
+        dest.passives[pid] = p
+        return await ctx.send(f"Copied passive `{args[2]}` from `{src.id}` to "
+                              f"`{dest.id}` as `{pid}`.")
+
     if sub == "add":
         # Syntax:
         #   !passive add <eid> <pid> <when> [target=PATH] [scope=exact|children|deep] "<formula>"
@@ -12315,6 +12387,21 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             )
             return await ctx.send(f"Deleted template `{name}`{extra}.")
 
+        if dsub == "copy":
+            # !tile def copy <name> <new_name>
+            if await return_help_if_not_enough_args(ctx, args, 4, "tile", "def"):
+                return
+            src, dst = args[2], args[3]
+            if src not in m.tile_templates:
+                raise NotFound(f"template `{src}` not found.")
+            if dst in m.tile_templates:
+                raise DuplicateId(f"template `{dst}` already exists.")
+            tpl = SpecialTileTemplate.from_dict(m.tile_templates[src].to_dict())
+            tpl.name = dst
+            m.tile_templates[dst] = tpl
+            return await ctx.send(f"Copied tile template `{src}` to `{dst}` "
+                                  f"(placed `{src}` tiles stay `{src}`).")
+
         if dsub == "list":
             if not m.tile_templates:
                 return await ctx.send("No tile templates defined.")
@@ -12751,7 +12838,8 @@ registry.annotate_sub(
         "!tile def del-hook <name> <when> | "
         "!tile def del <name> [confirm] | "
         "!tile def list | "
-        "!tile def info <name>"
+        "!tile def info <name> | "
+        "!tile def copy <name> <new_name>"
     ),
     desc=(
         "Manage reusable tile templates. A template defines a kind of "
@@ -12859,7 +12947,7 @@ registry.annotate_sub(
 
 @registry.command(
     "zone",
-    usage=("!zone <new|drop|add|remove|fill|shift|anchor|unanchor|set|del|clear|glyph|sprite|color|info|list|cells> ..."),
+    usage=("!zone <new|drop|rename|add|remove|fill|shift|anchor|unanchor|set|del|clear|glyph|sprite|color|info|list|cells> ..."),
     desc=(
         "Named multi-cell regions. A zone is a SET of cells plus a "
         "free-form data dict, optional hooks, and an optional map glyph "
@@ -12891,6 +12979,16 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         except (VTTError, DuplicateId) as ex:
             return await ctx.send(f"❌ {ex}")
         return await ctx.send(f"Created empty zone `{name}`.")
+
+    # ---- rename <old> <new> ----
+    if sub == "rename":
+        if await return_help_if_not_enough_args(ctx, args, 3, "zone", "rename"):
+            return
+        _check_tail(args, 3, (), "!zone rename <name> <new_name>")
+        m.zones = _rename_entry(m.zones, args[1], args[2], "zone")
+        note = _mentions_note(m, args[1], "zone")
+        return await ctx.send(f"Renamed zone `{args[1]}` to `{args[2]}`."
+                              + (f"\n{note}" if note else ""))
 
     # ---- drop <name> ----  (delete the whole zone)
     if sub == "drop":
@@ -13290,9 +13388,9 @@ for _sub, _usage in (
 
 @registry.command(
     "status",
-    usage=("!status <def|drop|tick|when|stack|maxlevel|data|tags|removes|"
-           "blockedby|resist|counter|dispel|transfer|sprite|list|info|apply|"
-           "force> ..."),
+    usage=("!status <def|drop|rename|copy|tick|when|stack|maxlevel|data|tags|"
+           "removes|blockedby|resist|counter|dispel|transfer|sprite|list|info|"
+           "apply|force> ..."),
     desc=(
         "Status DEFINITIONS — self-describing statuses. Define a status "
         "once (its per-tick effect, when it ticks, how it stacks, its max "
@@ -13315,8 +13413,8 @@ for _sub, _usage in (
         "resistible move). `sprite <name> <key|clear> [opacity=<n>] [tint=<name>] "
         "[layer=<n>]` sets a graphics OVERLAY drawn over afflicted entities "
         "(e.g. a burning overlay; default layer 150, above entities). "
-        "Subcommands: def, drop, tick, when, stack, maxlevel, data, list, "
-        "info, apply, force, dispel, transfer, sprite."
+        "Subcommands: def, drop, rename, copy, tick, when, stack, maxlevel, "
+        "data, list, info, apply, force, dispel, transfer, sprite."
     ),
 )
 async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -13340,6 +13438,32 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"Defined status `{name}` (tick_when=turn_end, no tick yet). "
             f"Set its effect with `!status tick {name} \"<formula>\"`."
         )
+
+    if sub == "rename":
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "rename"):
+            return
+        _check_tail(args, 3, (), "!status rename <name> <new_name>")
+        n = m.rename_status(args[1], args[2])
+        bits = [f"{v} {k}" for k, v in (
+            ("live instance(s)", n["instances"]),
+            ("corpse(s)", n["corpses"]),
+            ("other definition(s)' removes / blocked_by", n["definitions"]),
+            ("immunity / resistance var(s)", n["vars"])) if v]
+        note = _mentions_note(m, args[1], "status")
+        return await ctx.send(
+            f"Renamed status `{args[1]}` to `{args[2]}`"
+            + (f" (with {', '.join(bits)})." if bits else ".")
+            + (f"\n{note}" if note else ""))
+
+    if sub == "copy":
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "copy"):
+            return
+        _check_tail(args, 3, (), "!status copy <name> <new_name>")
+        if args[2].startswith("tag:"):
+            raise VTTError(f"`{args[2]}` can't be a status name.")
+        _copy_entry(m.status_definitions, args[1], args[2], "status definition")
+        return await ctx.send(f"Copied status definition `{args[1]}` to "
+                              f"`{args[2]}`.")
 
     if sub == "drop":
         if await return_help_if_not_enough_args(ctx, args, 2, "status", "drop"):
@@ -14213,6 +14337,38 @@ registry.annotate_sub(
     ),
 )
 registry.annotate_sub(
+    "zone", "rename", usage="!zone rename <name> <new_name>",
+    desc=("Rename a zone (cells, data, hooks and anchor go with it). Formulas "
+          "and macros naming the old name as text are listed with a ⚠️ and "
+          "left as written."))
+registry.annotate_sub(
+    "table", "rename", usage="!table rename <name> <new_name>",
+    desc=("Rename a named table. Formulas (`table_roll('old')`) and macros "
+          "still naming the old one are listed with a ⚠️."))
+registry.annotate_sub(
+    "macro", "rename", usage="!macro rename <name> <new_name>",
+    desc=("Rename a macro. Other macros naming it (`macro run old`) and "
+          "formulas quoting it are listed with a ⚠️."))
+registry.annotate_sub(
+    "macro", "copy", usage="!macro copy <name> <new_name>",
+    desc="Copy a macro under a new name, to make a variant.")
+registry.annotate_sub(
+    "status", "rename", usage="!status rename <name> <new_name>",
+    desc=("Rename a status definition with its live instances (units, body "
+          "parts, corpses) and the references naming it: other definitions' "
+          "removes / blocked_by and status_immune / status_resist / "
+          "__status_immune / __status_redirect anywhere in units' vars "
+          "(equipped items too). No status hooks fire. Formulas naming it as "
+          "text are listed with a ⚠️ and left as written; server templates "
+          "keep the old name."))
+registry.annotate_sub(
+    "status", "copy", usage="!status copy <name> <new_name>",
+    desc="Copy a status definition under a new name, to make a variant.")
+registry.annotate_sub(
+    "passive", "copy", usage="!passive copy <eid> <pid> <dest_eid> [new_pid]",
+    desc=("Give another unit its own copy of a unit's passive (same hook, "
+          "formula, target and scope), under the same id or `new_pid`."))
+registry.annotate_sub(
     "func", "def",
     usage="!func def <name> <params> <body>",
     desc=(
@@ -14476,6 +14632,96 @@ def _restore_all_matches(mgr: MatchManager, snap: Dict[str, Any]) -> None:
     mgr.active_by_channel.update(snap["active"])
 
 
+# What `!dry` can't run (nor can a batch / macro / foreach inside it): its
+# rollback restores the matches, so anything whose effect lives elsewhere is
+# refused — server-wide settings and files, the template library, undo
+# history and the approval queue (kept across a rollback), pause state, the
+# channel's identity.
+_DRY_REFUSED_ROOTS = frozenset({
+    "undo", "history", "store", "run", "dry", "again", "server", "owner",
+    "as", "approve", "deny", "cancel"})
+_DRY_TEMPLATE_READS = frozenset({"spawn", "list", "show", "diff", "refs",
+                                 "trash"})
+
+
+def _dry_refusal(name: str, args: List[str]) -> Optional[str]:
+    """Why `!dry` can't run `!name args`, or None."""
+    sub = args[0].lower() if args else ""
+    if name == "dry":
+        return "❌ `!dry` can't run inside another `!dry`."
+    why = None
+    if name in _DRY_REFUSED_ROOTS or _admin_required(name, args):
+        why = "its effect lives outside the match, which a dry run can't undo"
+    elif name == "template" and sub not in _DRY_TEMPLATE_READS:
+        why = "the template library is written straight to disk"
+    elif name == "match" and sub in ("delete", "pause", "resume"):
+        why = "a dry run can't put that back as it was"
+    if why is None:
+        return None
+    return f"❌ `!dry` can't run `!{name}{' ' + sub if sub else ''}`: {why}."
+
+
+@registry.command(
+    "dry", raw_args=True, snapshot=False, access="host_only",
+    usage="!dry <command ...>",
+    desc=(
+        "Run a command to see what it would do, then put everything back: its "
+        "replies and hook output show, followed by the changes it made to "
+        "this channel's match, and then every match is rolled back (the RNG "
+        "position too, so a seeded match rolls the same afterwards). Works "
+        "with any match command, `!action`, `!macro run`, `!batch` and "
+        "`!foreach` included. Refused, also inside a batch or macro it runs: "
+        "server-wide edits, files, the template library (spawn and reads "
+        "are fine), undo / history, approvals, `!match delete/pause/resume`. "
+        "Hosts only."),
+)
+async def dry_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    if not args:
+        title, body = registry.help_for(["dry"])
+        return await ctx.send(f"**{title}**\n{body}")
+    name, rest = registry._resolve_alias(args[0].lower().lstrip("!"),
+                                         list(args[1:]), mgr, ctx)
+    refusal = _dry_refusal(name, rest)
+    if refusal:
+        return await ctx.send(refusal)
+    m = active_match(mgr, ctx)
+    mid = m.id
+    snap = _snapshot_all_matches(mgr)
+    rngs = {k: x._rng.getstate() for k, x in mgr.matches.items()
+            if getattr(x, "_rng", None) is not None}
+    await ctx.send(f"🧪 Dry run of `!{' '.join([name] + rest)}` — none of "
+                   f"this is kept:")
+    token = _DRY_ACTIVE.set(True)
+    try:
+        await registry.dispatch_no_snapshot(name, rest, ctx, mgr)
+    finally:
+        _DRY_ACTIVE.reset(token)
+        after = mgr.matches.get(mid)
+        post = after.to_dict(include_history=False) if after is not None \
+            else None
+        _restore_all_matches(mgr, snap)
+        for k, state in rngs.items():
+            x = mgr.matches.get(k)
+            if x is not None and getattr(x, "_rng", None) is not None:
+                x._rng.setstate(state)
+    pre = snap["matches"].get(mid)
+    if post is None:
+        return await ctx.send("🧪 It would have deleted this match; rolled "
+                              "back.")
+    if post == pre:
+        return await ctx.send("🧪 It changes nothing on this match; rolled "
+                              "back.")
+    if _whole_board_read_blocked(ctx, m):
+        return await ctx.send("🧪 Rolled back (the change list is hidden "
+                              "under this channel's view).")
+    from types import SimpleNamespace
+    lines = _format_snapshot_diff(SimpleNamespace(state=pre),
+                                  SimpleNamespace(state=post),
+                                  "before", "after")
+    return await ctx.send("\n".join(["🧪 It would change:"] + lines[1:]
+                                     + ["Rolled back."]))
+
+
 @registry.command(
     "batch",
     raw_args=True,
@@ -14623,24 +14869,71 @@ async def run_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         mgr._macro_depth = depth
 
 
+class _MacroArgs(list):
+    """A macro run's positional args, carrying its named args (`count=3` for
+    a body that uses `$count`) as `.named`."""
+    named: Dict[str, str] = {}
+
+
+# $@, $#, ${key[:default]}, $N, $name: one alternation, matched left to right.
+_MACRO_TOKEN_RE = re.compile(
+    r"\$@|\$#|\$\{(\w+)(?::([^}]*))?\}|\$(\d+)|\$([A-Za-z_]\w*)")
+# Names a body references as $name / ${name...} (for which `name=value` args
+# are named).
+_MACRO_NAME_RE = re.compile(r"\$\{?([A-Za-z_]\w*)")
+
+
+def _macro_args(body: str, raw: List[str]) -> "_MacroArgs":
+    """Split a `!macro run` tail into positional args and named ones: a
+    `key=value` token is named when the body uses `$key` or `${key...}`;
+    anything else stays positional (`hp=5` reaches a body that never reads
+    `$hp` as `$1`, as before)."""
+    used = set(_MACRO_NAME_RE.findall(body))
+    pos = _MacroArgs()
+    pos.named = {}
+    for tok in raw:
+        key, eq, val = tok.partition("=")
+        if eq and key in used and re.fullmatch(r"[A-Za-z_]\w*", key):
+            pos.named[key] = val
+        else:
+            pos.append(tok)
+    return pos
+
+
 def _macro_subst(line: str, mac_args: List[str],
                  loop_idx: Optional[int] = None) -> str:
-    """Substitute $@ (all args, space-joined), $# (current `repeat` iteration,
-    1-based — empty outside a loop), and $1, $2, ... (positional; missing ->
-    empty) in a macro line, in a SINGLE left-to-right pass. The single pass
-    matters: an arg VALUE that itself contains a `$N`/`$@`/`$#` token is NOT
-    re-substituted, and a multi-digit `$10`+ is parsed as the whole index
-    (not `$1` followed by a literal `0`). Leaves $(...) formula tokens alone
-    (a `$` not followed by `@`, `#`, or a digit)."""
+    """Substitute a macro line in a SINGLE left-to-right pass: $@ (the
+    positional args, space-joined), $# (the current `repeat` iteration,
+    1-based — empty outside a loop), $1, $2, ... (positional; missing ->
+    empty), $name (a named arg; left as written when none was given, so
+    `!foreach`'s own $id / $name inside a macro still work) and
+    ${1:default} / ${name:default} (the arg, or the default when it is
+    missing or empty; ${name} without a default -> empty). The single pass
+    matters: an arg VALUE that itself contains a `$` token is NOT
+    re-substituted, and a multi-digit `$10`+ is parsed as the whole index.
+    Leaves $(...) formula tokens alone."""
+    named = getattr(mac_args, "named", None) or {}
+
+    def arg(key: str) -> Optional[str]:
+        if key.isdigit():
+            idx = int(key)
+            return mac_args[idx - 1] if 1 <= idx <= len(mac_args) else None
+        return named.get(key)
+
     def repl(m: "re.Match") -> str:
         tok = m.group(0)
         if tok == "$@":
             return " ".join(mac_args)
         if tok == "$#":
             return "" if loop_idx is None else str(loop_idx)
-        idx = int(m.group(1))
-        return mac_args[idx - 1] if 1 <= idx <= len(mac_args) else ""
-    return re.sub(r"\$@|\$#|\$(\d+)", repl, line)
+        if m.group(1) is not None:                 # ${key[:default]}
+            val = arg(m.group(1))
+            return val if val not in (None, "") else (m.group(2) or "")
+        if m.group(3) is not None:                 # $N
+            return arg(m.group(3)) or ""
+        val = named.get(m.group(4))                # $name
+        return tok if val is None else val
+    return _MACRO_TOKEN_RE.sub(repl, line)
 
 
 # ---- macro control flow (if / elif / else / repeat) ---------------------
@@ -14841,13 +15134,17 @@ for _subs, _usage in (
 @registry.command(
     "macro",
     raw_args=True,
-    usage="!macro <set|run|list|show|remove> ...",
+    usage="!macro <set|run|list|show|remove|rename|copy> ...",
     desc=(
         "Reusable named command sequences (a step up from !batch/!run). "
         "`set <name> <commands>` stores a macro — commands separated by `\\n`; "
         "lines may use $1/$2/... and $@ for run-time args (a `$N` past the "
         "args given becomes empty text; test an optional one with "
-        "`if \"$3\" != \"\"`). CONTROL FLOW: a "
+        "`if \"$3\" != \"\"`), `${2:5}` for an arg with a default (used when "
+        "it is missing or empty), and named args: a body that uses `$count` "
+        "(or `${count:3}`) takes `count=<value>` from the run line (a "
+        "`key=value` token the body never names stays positional; a `$name` "
+        "with no such arg is left as written). CONTROL FLOW: a "
         "line `if <formula>` / `elif <formula>` / `else` / `end` branches on a "
         "READ-ONLY formula (truthy = run the block); `repeat <count>` / `end` "
         "loops a block `count` times (count is a read-only formula too), with "
@@ -14864,6 +15161,18 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(f"**{title}**\n{body}")
     m = active_match(mgr, ctx)
     sub = args[0].lower()
+
+    if sub in ("rename", "copy"):
+        if await return_help_if_not_enough_args(ctx, args, 3, "macro", sub):
+            return
+        _check_tail(args, 3, (), f"!macro {sub} <name> <new_name>")
+        if sub == "copy":
+            _copy_entry(m.macros, args[1], args[2], "macro")
+            return await ctx.send(f"Copied macro `{args[1]}` to `{args[2]}`.")
+        m.macros = _rename_entry(m.macros, args[1], args[2], "macro")
+        note = _mentions_note(m, args[1], "macro")
+        return await ctx.send(f"Renamed macro `{args[1]}` to `{args[2]}`."
+                              + (f"\n{note}" if note else ""))
 
     if sub == "set":
         if await return_help_if_not_enough_args(ctx, args, 3, "macro", "set"):
@@ -14888,7 +15197,7 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         name = args[1]
         if name not in m.macros:
             return await ctx.send(f"❌ no macro `{name}`.")
-        mac_args = args[2:]
+        mac_args = _macro_args(m.macros[name], args[2:])
         try:
             nodes = _parse_macro(m.macros[name])
         except _MacroError as ex:
@@ -14952,7 +15261,7 @@ for _subs, _usage in (
 
 @registry.command(
     "table",
-    usage="!table <def|roll|list|show|remove> ...",
+    usage="!table <def|roll|list|show|remove|rename> ...",
     snapshot=False,
     desc=(
         "Named random tables (Match.tables) — store a weighted table once and "
@@ -14970,6 +15279,15 @@ async def table_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(f"**{title}**\n{body}")
     m = active_match(mgr, ctx)
     sub = args[0].lower()
+
+    if sub == "rename":
+        if await return_help_if_not_enough_args(ctx, args, 3, "table", "rename"):
+            return
+        _check_tail(args, 3, (), "!table rename <name> <new_name>")
+        m.tables = _rename_entry(m.tables, args[1], args[2], "table")
+        note = _mentions_note(m, args[1], "table")
+        return await ctx.send(f"Renamed table `{args[1]}` to `{args[2]}`."
+                              + (f"\n{note}" if note else ""))
 
     if sub == "def":
         if await return_help_if_not_enough_args(ctx, args, 3, "table", "def"):
