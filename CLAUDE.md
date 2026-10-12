@@ -250,7 +250,10 @@ Each of these was learned from a shipped bug.
   Changing a rule mid-game must leave derived state consistent (switching
   `persist_undo_history` off once lost every snapshot already on disk). A
   rule that names a unit var goes in `logic.VAR_NAME_RULES` (§7.1; its value
-  is checked as one plain var name).
+  is checked as one plain var name). A dict / list rule: decide whether a
+  child system merges it entry by entry (`logic.MERGE_RULES`, §7.16) or
+  replaces it whole; read a system's value with `mgr.system_value(s, key)`
+  (it walks the inheritance chain), never from `s.settings`.
 - **A serialized Match field:** `to_dict` / `from_dict` with deep copies on
   BOTH sides; a runtime-only field goes in `action._rollback_match`'s preserve
   list (`_check_rollback_fields` raises if a field is neither); decide whether
@@ -412,7 +415,8 @@ switch workspaces with `!as server <key>` (scenarios 698-700).
   every server: server-wide commands still need that server's Administrator.
 - **System rules on load:** a system saved by an older build may name a
   gamerule that no longer exists — `GameSystem.from_dict` drops it with a
-  console note. A gamerule the save lacks needs nothing: systems store only
+  console note; a parent link to a missing system or one closing a loop is
+  dropped too (`MatchManager.check_system_links`). A gamerule the save lacks needs nothing: systems store only
   overrides, so it reads the RULES_REGISTRY default.
 - `!system default server|channel` (the old `global` scope and the per-server
   default map are gone — a workspace is one server). `!match` / `!match list`
@@ -468,6 +472,9 @@ plus `data/bot_settings.json` (owner limits + rule ceilings) and
   `action._rollback_match`, history from the index — and the user is warned.
   A commit that doesn't grow is always allowed. `!store save` / `!history
   export` check room first (`check_room`) and are refused if over.
+  `!server storage` lists the server's use by part, largest first
+  (`Storage.server_breakdown`: each match and its undo history, templates,
+  old template versions, saves, sprites, corrupt files, workspace / systems).
 - **Startup:** `storage.open_workspaces()` (bot.py, cli.py, gui.py) loads every
   server folder; a file that fails to load moves to `corrupt/` with a console
   note and the rest loads; unknown gamerules in systems are dropped. Data of
@@ -1335,7 +1342,7 @@ hardcodes**.
 ### 7.12 Zones, tiles and auras
 
 - **Tiles:** per-cell data (`!tile set/place/line/fill/copy/...`), templates
-  (`!tile def`, per system), precedence instance > template > rule for
+  (`!tile def` per match, `!system tile` per system, §7.16), precedence instance > template > rule for
   glyph / color / sprite / block / opaque; tile hooks (on_enter / on_exit /
   on_stop / time hooks).
 - **Zones:** named cell sets (`!zone ...`): data, hooks (boundary + per-cell
@@ -1488,11 +1495,67 @@ hardcodes**.
 - **Systems and rules:** a `GameSystem` holds rule overrides, tile
   templates, functions, aliases, default vars / passives / clamps. A match
   copies its system's rules into `match.rules` at creation and on every
-  `refresh_match_rules` (any `!system set` / `!system access`); per-match
+  `refresh_match_rules` (any `!system set` / `!system access`, which also
+  refreshes the matches of every system inheriting from it); per-match
   settings that must survive a refresh live in their own fields
   (`access_overrides`, `fog_enabled`, `fog_memory`, `border_*`,
   `render_mode`, `map_coords`, ...). Rules are left out of match files on
   disk and rebuilt from the system on load / restore.
+- **System inheritance** (user design: live link, everything inherited,
+  per-entry merge, refuse deleting a parent, multi-level, hiding allowed):
+  `GameSystem.parent` names the system it inherits from; its `settings` and
+  libraries hold only its OWN layer. `MatchManager.system_chain` (root
+  first), `system_value(s, key)` (nearest own value up the chain, else the
+  registry default; the MERGE_RULES — command_access, default_entity_vars,
+  event_log_format by key, default_clamps by path, default_entity_passives
+  by id — merge every layer over the parent's instead, a root's own value
+  replacing the default as before), `system_value_source`,
+  `system_library(s, kind)` (aliases / tile_templates / formula_functions,
+  copied into a NEW match at creation as before). Editors write an
+  effective value back through `system_rule_write` /
+  `system_library_write`, which store only the entries that differ from the
+  inherited ones plus `GameSystem.removed` for inherited entries taken
+  away (an entry equal to the inherited one isn't stored, so a later parent
+  edit still reaches it; a plain rule set on a child is stored even when
+  equal, pinning it — user call: a child system is a list of changes to
+  its parent, so a rule the GM set deliberately stays set, while partial
+  templates aim at consistency with their base). Commands: `!system new <name> [parent=]`, `!system
+  parent <name> <sys|none>` (none writes the inherited values into its own
+  layer; a loop and a chain past the owner limit `system_chain_depth`
+  (`logic.OWNER_LIMITS`, set with `!owner ceiling`, default 8) are refused),
+  `!system unset <name> <rule|rule:entry|library:name>`, `!system info`
+  grouping each rule under its source, `!system list` naming parents.
+  Deleting a system others inherit from is refused. A var-name rule renamed
+  on a parent moves the units of every inheriting system's matches and
+  renames their clamps / default vars (`_inheritors`); a child's own engine
+  formula equal to its parent's after a rename is dropped (753-756).
+- **System libraries** (aliases, tile templates, formula functions):
+  `!system alias|tile|func <action> <system> ...` edit them with the
+  grammar of `!alias` / `!tile def` / `!func` (action first, like alias),
+  through the effective library (editing an inherited entry makes it the
+  child's own whole entry; deleting one hides it). They reach NEW matches
+  only (copied at creation, user call); `!match sync <aliases|tiles|funcs>
+  [name] | all` copies the system's effective entries over a live match's
+  (match-only entries kept, an undo step), and `!system <lib> promote
+  <system> <name>` copies one from the channel's match into the system.
+  Formulas a system stores (rules, tile hooks / block / opaque, function
+  bodies) go through `_system_formula_warning`: a disallowed construct is
+  refused, a call to an unknown function is stored with a ⚠️ (a match may
+  define it later; a promote counts only the system's library) (757-759).
+- **System tooling:** `!system rename` (`MatchManager.rename_system`: the
+  matches on it, children's parent links, server / channel defaults follow;
+  `system_name` survives `_rollback_match` and `_restore_snapshot` keeps
+  the live one, since undo snapshots still name the old system), `!system
+  describe` (`GameSystem.description`, own, not inherited), `!system diff
+  <a> <b>` (effective rules and library entries, with each rule's source;
+  open to players), `!system lint <name>` (admin: every formula the system
+  and its matches store — formula rules, default passives, library tile
+  hooks / block / opaque / functions, and per match its functions,
+  passives, unit actions, watchers, status ticks, tile and zone hooks and
+  conditions; an unknown function at system level is a ⚠️), `!help rule
+  <rule>` (description, allowed values, default, value on this channel's
+  match and in the system chain with its source), `!match sync ... diff`
+  (what a sync would change) (760-762).
 - **Match vars:** `!match var`, `match_var_get` / `match_var_set` /
   `match_var_del`. **Groups:** `!ent group`, `group:<name>` selectors and
   group moves.
@@ -1580,8 +1643,16 @@ hardcodes**.
   lines like the GUI (`discord_commands._command_lines`), so an import
   anywhere in a pasted batch keeps its JSON lines.
 - **Formulas:** `summon_template` / `summon_template_near` (mutating),
-  `has_template` / `template_names` (read-only), via `CURRENT_WORKSPACE`
-  (718-726).
+  `has_template` / `template_names` / `template_data(name, path='')`
+  (read-only; the template resolved through `Match.expand_template`, the
+  same expansion `show ... expanded` prints), via `CURRENT_WORKSPACE`
+  (718-726, 764).
+- **Tooling:** `!template list [kind=] [by=] [prefix]`; `!template diff
+  <name> <other | unit=<id>>` (leaf paths of the expanded forms, parts
+  compared by their relative id; the unit form is host-only, as it shows
+  all its vars); `!template spawn ... count=N` (N copies on the free cells
+  nearest the target that fit their bodies, within `near=` if given, all or
+  nothing: `_spawn_many`) (763-764).
 
 ### 7.18 Partial templates
 

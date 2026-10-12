@@ -121,6 +121,12 @@ def _parse_seq(text: str, in_group: bool) -> tuple:
     return ("seq", nodes)
 
 
+# The binding under which the walker records the latest literal word it
+# matched (an action like `promote`, a kind like `tiles`); no placeholder is
+# named this.
+_LAST_LIT = " lit"
+
+
 class _Walk:
     """Walks typed words through a grammar; collects what may come next
     (expectations, with the words each slot consumed on the way) and the
@@ -145,10 +151,11 @@ class _Walk:
                 return
             if kind == "lit" and self.words[i].lower() != node[1]:
                 return
-            nb = binds
+            nb = dict(binds)
             if kind == "slot":
-                nb = dict(binds)
                 nb.setdefault(node[1], self.words[i])
+            else:
+                nb[_LAST_LIT] = node[1]  # the latest literal word typed
             k(i + 1, nb)
         elif kind == "seq":
             items = node[1]
@@ -318,6 +325,9 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
                 paths += _entity_ids(mgr, ctx)
             return paths
         return _entity_ids(mgr, ctx) if slot == "template_ref" else []
+    if root == "system" and slot in ("parent", "other"):
+        # `!system parent <name> <parent|none>` names a system, not a unit.
+        return sorted(mgr.systems)
     if slot in _ENTITY_SLOTS and not (root == "match" and slot == "id"):
         if root == "template" and slot == "part":
             t = mgr.templates.get(binds.get("name", ""))
@@ -329,7 +339,8 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         return _entity_ids(mgr, ctx)
     if slot == "corpse_id":
         return _corpse_ids(mgr, ctx)
-    if slot in ("template", "template_ref"):
+    if slot in ("template", "template_ref") or (
+            root == "template" and slot in ("other", "prefix")):
         return sorted(mgr.templates)
     if slot == "partial":
         return sorted(n for n, t in mgr.templates.items()
@@ -363,6 +374,14 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
     if slot == "name":
         if root == "template":
             return sorted(mgr.templates)
+        if root == "system" and sub in _SYSTEM_LIBS:
+            # A library entry: the system's (inherited ones too), plus the
+            # channel's match's for `promote`.
+            kind = _SYSTEM_LIBS[sub]
+            if binds.get(_LAST_LIT) == "promote":
+                return sorted(getattr(m, kind)) if m is not None else []
+            s = mgr.systems.get(binds.get("system", ""))
+            return sorted(mgr.system_library(s, kind)) if s else []
         if root == "system":
             return sorted(mgr.systems)
         if m is None:
@@ -386,11 +405,23 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
             return sorted(m.groups)
         if root == "match" and sub == "templates":
             return sorted(m.template_pins)
+        if root == "match" and sub == "sync":
+            s = mgr.systems.get(m.system_name)
+            kind = _SYNC_LIBS.get(binds.get(_LAST_LIT, ""))
+            return sorted(mgr.system_library(s, kind)) if s and kind else []
         if root in by_root:
             return sorted(str(x) for x in by_root[root])
     if slot in _FREE_SLOTS:
         return []
     return _general_pool(mgr, ctx)
+
+
+# `!system <sub>` library editors -> the library their `<name>` names.
+_SYSTEM_LIBS = {"alias": "aliases", "tile": "tile_templates",
+                "func": "formula_functions"}
+# `!match sync <kind>` -> the library named.
+_SYNC_LIBS = {"aliases": "aliases", "tiles": "tile_templates",
+              "funcs": "formula_functions"}
 
 
 # Placeholders _slot_names knows a source for (used to tell slots from

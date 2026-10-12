@@ -2493,8 +2493,9 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   summon_template(name, x, y)              -> new id (strict placement)
     #   summon_template_near(name, x, y, radius) -> new id (ring search)
     #   has_template(name) / template_names()    -> read the library
+    #   template_data(name, path="")             -> a template, resolved
     "summon_template", "summon_template_near", "has_template",
-    "template_names",
+    "template_names", "template_data",
     # Partial templates on a unit's vars:
     #   give_template(eid, path, name) -> True (build partial `name` at path)
     #   template_of(eid, path="")      -> the partial a container is built
@@ -2735,7 +2736,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
 # never silently expose a function in $() args. When unsure, classify a
 # function as MUTATING (leave it out of this set).
 ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
-    'has_template', 'template_names', 'template_of',
+    'has_template', 'template_names', 'template_of', 'template_data',
     'flanking', 'flanking_angle', 'flanking_line', 'nearest_cell',
     'visible_entities', 'random_cell', 'random_free_cell',
     'all_corpses', 'all_entities', 'aoe_origin', 'apply_mods',
@@ -6030,6 +6031,32 @@ class FormulaEngine:
             return isinstance(name, str) and \
                 name.strip().lower() in _workspace_templates()
 
+        def _template_data(name: Any, path: Any = "") -> Any:
+            """template_data(name, path=""): the server's saved template
+            `name` with every partial reference resolved, or the value at
+            `path` in it (a partial's paths start inside its data; an entity
+            template's at its top: `vars.hp`). A copy: read-only."""
+            if not isinstance(name, str) or not isinstance(path, str):
+                raise FormulaError("template_data(name, path): name and "
+                                   "path must be text.")
+            tpl = _workspace_templates().get(name.strip().lower())
+            if tpl is None:
+                raise FormulaError(f"template_data: this server has no "
+                                   f"template `{name}`.")
+            try:
+                data = match.expand_template(tpl)
+            except (VTTError, NotFound) as ex:
+                raise FormulaError(f"template_data: {ex}")
+            if path in ("", "."):
+                return data
+            node: Any = data
+            for k in path.split("."):
+                if not isinstance(node, dict) or k not in node:
+                    raise FormulaError(f"template_data: `{name}` has nothing "
+                                       f"at `{path}`.")
+                node = node[k]
+            return node
+
         def _template_names() -> List[str]:
             """template_names(): the server's saved template names, sorted.
             Loopable."""
@@ -6075,6 +6102,7 @@ class FormulaEngine:
         ns["summon_template_near"] = _summon_template_near
         ns["has_template"]         = _has_template
         ns["template_names"]       = _template_names
+        ns["template_data"]        = _template_data
         ns["entity_snapshot"] = _entity_snapshot
         ns["summon"]          = _summon
         ns["summon_near"]     = _summon_near

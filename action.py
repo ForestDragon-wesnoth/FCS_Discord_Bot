@@ -1439,6 +1439,10 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
         # from_dict builds an empty one; copying that over wiped every
         # autosave AND manual save on each failed action.
         "history",
+        # Serialized, but only `!system rename` changes it, and a rollback
+        # (a `!batch strict` that renamed a system, then failed) must not
+        # point the match back at a name that no longer exists.
+        "system_name",
     )
     _check_rollback_fields(preserved_attrs)
     preserved = {a: getattr(match, a) for a in preserved_attrs

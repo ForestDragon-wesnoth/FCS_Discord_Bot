@@ -20988,7 +20988,7 @@ SCENARIO 738 — Tab completion: commands, subcommands, literal words and option
 ?tab "!ent rm h"
 ?? healer  hero
 ?tab "!template spawn guard 1 1 "
-?? candidates: near=
+?? candidates: count=  near=
 ?tab "!map pan "
 ?? up_left
 ?! as=
@@ -21016,7 +21016,7 @@ follow the command's usage strings: `!ent` subcommands, unit ids for
 `<id>` (`!ent rm` is an alias spelling of `remove`), the literal words a
 form allows (`max` for `!ent hp`, `cw`/`ccw`/`toward` and the directions
 for `!ent face`, the `!undo` kinds, `!help`'s subcommands of `ent`), and
-`key=` options where the form allows one (`near=` after a template spawn's
+`key=` options where the form allows one (`count=` and `near=` after a template spawn's
 coordinates; `!map pan` takes none). After ` ; ` in `!batch`, the next
 command completes. A line without `!` or inside an open quote gets nothing;
 an alias completes like the command it expands to.
@@ -21669,3 +21669,642 @@ b, next in the order, takes the turn in round 5. A
 permanent stun (no tick) changes nothing, so the search stops after one
 round instead of burning skip_all_round_limit rounds; with the limit at
 0 it stops after the first all-skipped round as before.
+
+SCENARIO 753 — GameSystem inheritance: overrides, live link, chains, unset
+----------------------------------------------------------------------
+
+!system set default fog_range_mode manhattan
+!system new skirm parent=default
+?? Created GameSystem `skirm`, inheriting from `default`.
+!system new night parent=skirm
+!system set skirm allow_diagonal_movement true
+!system set night fog_range_mode euclidean
+!system list
+?? **night** (inherits from `skirm`)
+!match new t753 Night 10 10 --system night
+!match use t753
+!assert "rule_get('allow_diagonal_movement') == True and rule_get('fog_range_mode') == 'euclidean'"
+!system set default flanking_min_angle 120
+?? refreshed 1 live match
+!assert "rule_get('flanking_min_angle') == 120"
+!system set default allow_diagonal_movement false
+!assert "rule_get('allow_diagonal_movement') == True"
+!system info night
+?? Inherits from: `skirm` → `default` (nearest first)
+?? **Rules inherited from `skirm`:**
+!system unset skirm allow_diagonal_movement
+?? `skirm`: `allow_diagonal_movement` now inherited from `default`
+!assert "rule_get('allow_diagonal_movement') == False"
+!system unset night fog_range_mode
+!assert "rule_get('fog_range_mode') == 'manhattan'"
+!system unset default fog_range_mode
+?? back to the engine default
+!assert "rule_get('fog_range_mode') == 'square_radius'"
+
+Expected: A child system stores only its own overrides and reads the rest
+live from its parent chain. `night` (from `skirm`, from `default`) gets
+diagonal movement from `skirm` and its own fog metric; a later edit on
+`default` reaches the match on `night` at once, unless a nearer system
+sets the rule (skirm's diagonal movement beats default's). `!system info`
+names the chain and groups each rule under the system it comes from.
+`!system unset` drops an override so the inherited value (or the engine
+default) shows through.
+
+SCENARIO 754 — GameSystem inheritance: merged rules and libraries
+----------------------------------------------------------------------
+
+!system alias def default dmg ent hp $1 -$2
+!system alias def default heal ent hp $1 +$2
+!system new skirm parent=default
+!match new t754a Base 8 8
+!match use t754a
+!defvar add mana 5
+!gclamp add mana max=10
+!match new t754 Skirm 8 8 --system skirm
+!match use t754
+!defvar add stamina 3
+!defvar list
+?? `mana` = 5
+?? `stamina` = 3
+!gclamp remove mana
+!gclamp list
+?! `mana`
+!ent add a A 20 2 2 5
+!assert "entity[a].mana == 5 and entity[a].stamina == 3"
+!ent set_var a mana 50
+!assert "entity[a].mana == 50"
+!system unset skirm default_clamps:mana
+?? `default_clamps:mana` now inherited
+!ent set_var a mana 5
+!ent set_var a mana 50
+!assert "entity[a].mana == 10"
+!system access skirm set find host
+!system access skirm list
+?? `find` → host
+!system alias del skirm heal
+?? it hides the inherited one
+!system alias list skirm
+?? `!dmg` → `!ent hp $1 -$2` (inherited)
+?? Hidden here: `heal`
+!match new t754b Fresh 8 8 --system skirm
+!match use t754b
+!alias list
+?? `!dmg`
+?! `!heal`
+!system unset skirm aliases:heal
+!match new t754c Fresh2 8 8 --system skirm
+!match use t754c
+!alias list
+?? `!heal`
+!system info skirm
+?? - aliases: 2 (0 set here)
+
+Expected: The structured rules merge entry by entry: `skirm`'s default
+vars are default's `mana` plus its own `stamina`, and a unit spawned on
+it gets both. Removing an inherited entry in the child (`!gclamp remove
+mana`) hides it there only (mana goes past 10 on skirm), and `!system
+unset skirm default_clamps:mana` brings the inherited clamp back (a soft
+clamp, so the write that crosses it from 5 is held to 10). Aliases
+are inherited too: a new match on skirm starts with default's aliases
+except the one skirm hides, and unsetting the hide restores it for the
+next match (a match's aliases are copied when it's created).
+
+SCENARIO 755 — GameSystem inheritance: refusals, flattening, persistence
+----------------------------------------------------------------------
+
+!system new skirm parent=default
+!system new night parent=skirm
+!system parent default night
+?? ❌ `night` inherits from `default`: linking `default` to it would make a loop.
+!system parent skirm nope
+?? GameSystem 'nope' not found
+!system delete skirm
+?? ❌ GameSystem 'skirm' is inherited by `night`.
+!system new solo parent=default extra=1
+?? `!system new <name>` takes only `parent=<system>`.
+!system unset skirm flanking_min_angle
+?? sets nothing for `flanking_min_angle` itself
+!owner ceiling system_chain_depth 3
+?? `system_chain_depth` is now 3
+!system new deep parent=night
+?? the bot owner's limit is 3 (system_chain_depth)
+!owner ceiling system_chain_depth reset
+!system set skirm flanking_min_angle 150
+!system set default fog_range_mode manhattan
+!as restart
+!system info night
+?? Inherits from: `skirm` → `default`
+!match new t755 Night 8 8 --system night
+!match use t755
+!assert "rule_get('flanking_min_angle') == 150 and rule_get('fog_range_mode') == 'manhattan'"
+!system parent night none
+?? `night` no longer inherits from `skirm`; the values it inherited are now its own.
+!system set default fog_range_mode euclidean
+!assert "rule_get('flanking_min_angle') == 150 and rule_get('fog_range_mode') == 'manhattan'"
+!system parent night skirm
+!assert "rule_get('fog_range_mode') == 'manhattan'"
+!system unset night fog_range_mode
+!assert "rule_get('fog_range_mode') == 'euclidean'"
+!system delete night
+?? ❌ GameSystem 'night' is still used by 1 match(es): t755.
+!match delete t755
+!system delete skirm
+?? ❌ GameSystem 'skirm' is inherited by `night`.
+!system delete night
+!system delete skirm
+?? Deleted GameSystem `skirm`.
+
+Expected: HARNESS-ALLOWS-ERRORS. A parent link that would close a loop
+or names a missing system is refused, and so is deleting a system others
+inherit from. The bot owner's `system_chain_depth` (an owner limit, set
+with `!owner ceiling`) bounds new chains. Links survive a restart. `!system
+parent night none` writes the values `night` inherited into its own layer,
+so nothing changes and later edits to `default` no longer reach it;
+re-linking it keeps its own values until they're unset. A system still
+used by a match, or inherited by another, can't be deleted.
+
+SCENARIO 756 — GameSystem inheritance: var-name rules across the chain
+----------------------------------------------------------------------
+
+!system new skirm parent=default
+!match new t756 Skirm 8 8 --system skirm
+!match use t756
+!ent add a A 20 2 2 5
+!system set default hp_var health
+?? so do the systems inheriting it (`skirm`)
+!assert "entity[a].health == 20 and not var_has('a', 'hp')"
+!gclamp list
+?? `health`: max='max_hp'
+!system set skirm hp_var vigor
+!assert "entity[a].vigor == 20 and rule_get('death_condition') == 'entity[self].vigor <= 0'"
+!system unset skirm hp_var
+!assert "entity[a].health == 20 and rule_get('death_condition') == 'entity[self].health <= 0'"
+!system info skirm
+?! `hp_var` = 'vigor'
+!ent add b B 20 4 4 5
+!ent set_var b vim 3
+!system set default var_name_collision refuse
+!system set default hp_var vim
+?? ❌ `hp_var` stays `health`: t756: `b` already has a var `vim`
+!assert "entity[a].health == 20"
+
+Expected: HARNESS-ALLOWS-ERRORS. A var-name rule renamed on a parent
+moves the units of matches on every system that inherits it, and its
+default clamps and engine formulas follow. A child that names the var
+itself moves its units to its own name, and unsetting that moves them
+back, the child's engine formulas falling back to the parent's text.
+With var_name_collision refuse, a unit in the way on a child system's
+match refuses the parent's rename.
+
+SCENARIO 757 — GameSystem formula function library: !system func
+----------------------------------------------------------------------
+
+!system new skirm parent=default
+!system func def default dbl x "x * 2"
+?? Defined formula function `dbl(x)` on `default`
+!system func def default half - "1 / 2"
+!system func list skirm
+?? `dbl(x)` → x * 2 (inherited)
+!system func def skirm dbl x "x * 3"
+!system func info skirm dbl
+?? x * 3
+!system func info default dbl
+?? x * 2
+!match new t757 Skirm 6 6 --system skirm
+!match use t757
+!eval "[dbl(5), half()]"
+?? [15, 0.5]
+!system func del skirm half
+?? it hides the inherited one
+!match new t757b Second 6 6 --system skirm
+!match use t757b
+!eval "dbl(5)"
+?? 15
+!eval "half()"
+?? not allowed
+!system unset skirm formula_functions:half
+!system unset skirm formula_functions:dbl
+!match new t757c Third 6 6 --system skirm
+!match use t757c
+!eval "[dbl(5), half()]"
+?? [10, 0.5]
+!system func def default bad x "[i for i in range(x)]"
+?? ❌ invalid function body
+!system func def default len x "x"
+?? ❌ 'len' is a built-in formula function
+!system func def default twice x,x "x"
+?? ❌ duplicate parameter name 'x'
+!system func def default boom x "kaboom(x)"
+?? ⚠️ Function 'kaboom' isn't a built-in or a `!func` on this system or its matches yet
+
+Expected: HARNESS-ALLOWS-ERRORS. `!system func` edits a GameSystem's
+formula function library with the `!func` grammar. A child lists its
+parent's functions as inherited; redefining one makes it the child's own
+(the parent keeps x * 2), and deleting one hides it. New matches on the
+child get the effective library at creation: t757 sees dbl = x * 3 and
+half; t757b, made after the delete, has no half. Unsetting both entries
+brings the parent's back for a third match. A broken body, a built-in
+name and a duplicate parameter are refused; a call to an unknown
+function is stored with a ⚠️ (a match may define it later).
+
+SCENARIO 758 — GameSystem tile template library: !system tile, multi-tile use
+----------------------------------------------------------------------
+
+!system new skirm parent=default
+!system tile new default flame
+?? Defined empty tile template `flame` on system `default`
+!system tile data default flame burn 3
+!system tile data default flame glyph F
+!system tile hook default flame on_enter "entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, 'burn')"
+?? Set `default` tile template `flame` `on_enter` hook.
+!system tile data skirm flame burn 4
+!system tile info skirm flame
+?? "burn": 4
+!system tile info default flame
+?? "burn": 3
+!system tile list skirm
+?? `flame` (hooks: on_enter)
+!system tile new default flame
+?? ❌ tile template `flame` already exists on system `default`
+!system tile data default flame _template x
+?? ❌ template data may not use reserved keys
+!system tile hook default flame on_teleport "x = 1"
+?? ❌ Unknown tile hook 'on_teleport'
+!system tile hook default flame on_exit "[i for i in range(2)]"
+?? ❌ Invalid hook formula
+!system tile data default flame block "[i for i in range(2)]"
+?? ⚠️ `block` isn't a working formula
+!system tile del-data default flame block
+!system tile info nobody flame
+?? ❌
+!match new t758 Skirm 8 8 --system skirm
+!match use t758
+!tile place flame 3 2
+!tile place flame 3 3
+!ent add ogre Ogre 30 1 2 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent move ogre 1 right
+!assert "entity[ogre].hp == 22"
+!system tile del-hook skirm flame on_enter
+!system tile info skirm flame
+?! on_enter
+!system tile del default flame
+!system tile list default
+?? No tile templates on system `default`
+!system tile list skirm
+?? `flame`
+
+Expected: HARNESS-ALLOWS-ERRORS. `!system tile` edits a GameSystem's
+tile template library with the `!tile def` grammar. The child's data
+edit (burn 4) makes `flame` its own entry; the parent keeps burn 3.
+Duplicates, reserved data keys, unknown hook names and broken hook
+formulas are refused; a broken `block` formula is stored with a ⚠️ (it
+fails open). A match on the child gets the child's flame at creation: a
+2×2 ogre stepping right onto a column of two flames burns once per
+covered flame cell, 30 - 4 - 4 = 22. Dropping the child's hook and then
+deleting the parent's template leaves the child's own copy in place.
+
+SCENARIO 759 — System libraries: promote from a match, !match sync, undo, restart
+----------------------------------------------------------------------
+
+!match new t759 Lab 6 6
+!match use t759
+!func def helper x "x + 1"
+!func def calc x "helper(x) * 10"
+!tile def new pit
+!tile def data pit depth 2
+!tile def hook pit on_stop "entity[self].hp = entity[self].hp - tile_get(tile_x, tile_y, 'depth')"
+!alias def hit "ent hp"
+!system func promote default calc
+?? Promoted formula function `calc(x)` from match `t759` to `default`
+?? ⚠️ its body: Function 'helper' isn't a built-in or a `!func` on this system yet
+!system func promote default helper
+!system func promote default helper
+?? already equals match `t759`'s; nothing changed
+!system tile promote default pit
+!system alias promote default hit
+?? Promoted alias `!hit`
+!system func promote default nothere
+?? ❌ formula function `nothere` isn't defined on match `t759`
+!match new t759b Fresh 6 6
+!match use t759b
+!eval "calc(1)"
+?? 20
+!tile place pit 2 2
+!ent add a A 10 1 2 5
+!hit a 9
+!ent move a 1 right
+!assert "entity[a].hp == 7"
+!system func def default calc x "x * 100"
+!system tile data default pit depth 5
+!eval "calc(1)"
+?? 20
+!match sync funcs calc
+?? replaced `calc`
+!eval "calc(1)"
+?? 100
+!match sync tiles
+?? replaced `pit`
+!func def mine x "x"
+!match sync all
+?? funcs: 2 already the same
+?? aliases: 1 already the same
+!eval "[mine(4), calc(1)]"
+?? [4, 100]
+!undo command 4 confirm
+?? Undid 4 command(s)
+!eval "calc(1)"
+?? 20
+!eval "mine(1)"
+?? not allowed
+!match sync funcs nothere
+?? ❌ system `default` has no formula function `nothere`
+!match sync spells
+?? ❌ `spells` — sync one of: aliases, tiles, funcs, all.
+!match sync all calc
+?? ❌
+?tab "!system func info default ca"
+?? → '!system func info default calc '
+?tab "!system tile promote default p"
+?? → '!system tile promote default pit '
+?tab "!match sync tiles "
+?? candidates: diff  pit
+!as restart
+!system func info default calc
+?? x * 100
+!system tile info default pit
+?? "depth": 5
+!system alias info default hit
+?? → `!ent hp`
+
+Expected: HARNESS-ALLOWS-ERRORS. `promote` copies an alias, tile
+template or formula function the GM built in the channel's match into a
+system's library; promoting `calc` before its helper warns that the
+system can't resolve `helper` yet, and promoting an identical entry
+changes nothing. A new match gets all three: `calc(1)` = 20, the pit's
+on_stop hook takes 2 hp, and the `hit` alias sets hp. A later system edit
+leaves the live match alone until `!match sync` copies it over (one
+entry, a whole library, or all three, keeping match-only `mine`); undo
+reverts the syncs. Unknown entries, unknown kinds and a name with `all`
+are refused. The promoted libraries survive a restart.
+
+SCENARIO 760 — !system rename / describe / diff, and undo after a rename
+----------------------------------------------------------------------
+
+!system new skirm parent=default
+!system new duel parent=skirm
+!system set skirm fog_los true
+!system set duel friendlyfire true
+!system describe skirm Fast skirmishes on small maps.
+?? description set: Fast skirmishes on small maps.
+!system list
+?? **skirm** (inherits from `default`) — Fast skirmishes on small maps.
+!system default channel skirm
+!match new t760 Skirm 6 6 --system skirm
+!match use t760
+!ent add a A 10 2 2 5
+!ent hp a 7
+!system rename skirm skirmish
+?? Renamed GameSystem `skirm` to `skirmish` (1 match, 1 inheriting system, 1 channel default follow).
+!system info duel
+?? Inherits from: `skirmish` → `default`
+!match info
+?? system `skirmish`
+!undo command 2 confirm
+!assert "entity[a].hp == 10 and rule_get('fog_los') == True"
+!match info
+?? system `skirmish`
+!system diff skirmish duel
+?? `friendlyfire`: `skirmish` = `False` (default), `duel` = `True` (own)
+?! `fog_los`
+!system diff duel default
+?? `fog_los`: `duel` = `True` (from `skirmish`), `default` = `False` (default)
+!system diff default default
+?? is the same system
+!system rename skirmish duel
+?? ❌ GameSystem 'duel' already exists
+!system rename nothere x
+?? ❌
+!system describe skirmish -
+?? description cleared.
+!as restart
+!system info duel
+?? Inherits from: `skirmish`
+!match info
+?? system `skirmish`
+
+Expected: HARNESS-ALLOWS-ERRORS. `!system rename` moves the matches on
+the system, the systems inheriting from it and channel defaults to the
+new name. An undo past the rename restores the match's board (hp back to
+10) while the match stays on the renamed system with its rules (the
+snapshot still names `skirm`). `!system diff` lists the rules whose
+effective values differ and where each comes from: duel's own
+friendlyfire, and fog_los inherited from skirmish. A description shows
+in `!system list` and clears with `-`. Everything survives a restart.
+
+SCENARIO 761 — !system lint and !help rule
+----------------------------------------------------------------------
+
+!system new lab parent=default
+!system func def lab dbl x "x * 2"
+!system tile new lab trap
+!system tile hook lab trap on_enter "entity[self].hp = helper(entity[self].hp)"
+?? ⚠️ Function 'helper'
+!match new t761 Lab 6 6 --system lab
+!match use t761
+!func def own x "x + 1"
+!ent add a A 10 2 2 5
+!passive add a p1 on_turn_start "entity[self].hp = own(entity[self].hp)"
+!watch add w "dbl(entity[a].hp) > 30" "log('big')"
+!system lint lab
+?? 1 problem(s), 1 warning(s)
+?? ❌ match `t761` tile template `trap` hook `on_enter`: Function 'helper' is not allowed.
+?? ⚠️ tile template `trap` hook `on_enter`: calls `helper`, which isn't in the system's functions
+!func def helper x "x"
+!system lint lab
+?? 0 problem(s), 1 warning(s)
+!func del own
+!func del dbl
+!system lint lab
+?? 2 problem(s), 1 warning(s)
+?? ❌ match `t761` `a` passive `p1`: Function 'own' is not allowed.
+?? ❌ match `t761` watcher `w` condition: Function 'dbl' is not allowed.
+!system lint nothere
+?? ❌
+!system lint default
+?? all clean
+!help rule friendlyfire
+?? **`friendlyfire`**
+?? Allowed: bool
+?? On match `t761`: `False`
+?? System `lab`: `False` (the engine default)
+!system set default friendlyfire true
+!help rule friendlyfire
+?? System `lab`: `True` (inherited from `default`)
+!help rule hp_var
+?? Names a unit var
+!help rule frienlyfire
+?? did you mean `friendlyfire`
+!help rule death_condition
+?? a formula expression
+
+Expected: HARNESS-ALLOWS-ERRORS. `!system lint` checks every formula a
+system and its matches store in one report. The system's tile hook
+calling an undefined `helper` is a ⚠️ at system level (a match may
+define it), and a ❌ in t761's copy of the template until t761 defines
+`helper`; then only the system-level ⚠️ remains. Deleting the match's `own` and `dbl`
+breaks passive p1 and the watcher's condition. `!help rule` shows a
+rule's description, allowed values, its value on this channel's match
+and in the system chain with where it comes from, and suggests a near
+name for a typo.
+
+SCENARIO 762 — !match sync ... diff and the storage breakdown
+----------------------------------------------------------------------
+
+!match new t762 Lab 6 6
+!match use t762
+!system func def default calc x "x * 2"
+!system alias def default hit "ent hp"
+!system tile new default pit
+!system tile data default pit depth 2
+!match sync all
+!system func def default calc x "x * 3"
+!system tile data default pit depth 5
+!system tile hook default pit on_stop "entity[self].hp = entity[self].hp - 1"
+!system func def default extra - "7"
+!match sync funcs diff
+?? 🔎 A sync from system `default` (nothing changed yet):
+?? funcs: would add `extra`; would replace `calc`.
+?? `calc(x)`: x * 2 → x * 3
+!match sync tiles pit diff
+?? `pit`: data.depth: 2 → 5; hooks.on_stop: — → 'entity[self].hp = entity[sel
+!match sync all diff
+?? aliases: 1 already the same.
+!eval "calc(2)"
+?? 4
+!match sync all
+?? replaced `calc`
+!eval "calc(2)"
+?? 6
+!match sync funcs extra diff
+?? funcs: 1 already the same.
+!match sync spells diff
+?? ❌
+!ent add a A 10 2 2 5
+!history save before
+!server storage
+?? This server uses
+?? - match t762 undo history:
+?? - match t762:
+?? - workspace and systems:
+
+Expected: HARNESS-ALLOWS-ERRORS. A trailing `diff` on `!match sync`
+lists what a sync would add or replace and changes nothing: the
+function body before → after, a tile template's changed data keys and
+hooks. `calc(2)` stays 4 until the real sync makes it 6. `!server
+storage` lists the server's disk use by part, largest first: the
+match's undo history, its file, the workspace and systems files.
+
+SCENARIO 763 — !template list filters and !template diff
+----------------------------------------------------------------------
+
+!match new t763 Lab 8 8
+!match use t763
+!ent add a Gob 10 1 1 5
+!ent set_var a inventory.axe.damage 8
+!template save a axe path=inventory.axe
+!template give axe a inventory.axe
+!template save a goblin
+!ent set_var a inventory.axe.damage 10
+!template save a goblin_chief
+!template list
+?? **Templates (3):**
+!template list kind=partial
+?? **Templates (1 of 3):**
+?? `axe` — partial
+!template list gob
+?? **Templates (2 of 3):**
+!template list kind=entity by=cli
+?? **Templates (2 of 3):**
+!template list by=nobody
+?? No template matches those filters.
+!template list kind=npc
+?? ❌ kind= is `entity` or `partial`
+!template diff goblin goblin_chief
+?? 1 difference(s) (partials resolved)
+?? `vars.inventory.axe.damage`: 8 → 10
+!eval "template_data('goblin', 'vars.inventory.axe.damage')"
+?? 8
+!template diff goblin goblin
+?? are the same
+!ent hp a 4
+!template diff goblin_chief unit=a
+?? `vars.hp`: 10 → 4
+!template diff goblin
+?? ❌
+!template diff goblin goblin_chief unit=a
+?? ❌ Compare with one other template or one unit
+!as player bob
+!template diff goblin goblin_chief
+?? `vars.inventory.axe.damage`: 8 → 10
+!template diff goblin unit=a
+?? ❌ Comparing with a unit shows all its vars, which only a host may read
+?tab "!template diff gob"
+?? candidates: goblin  goblin_chief
+
+Expected: HARNESS-ALLOWS-ERRORS. `!template list` filters by kind,
+saver and name prefix. `!template diff` compares two templates with
+their partials resolved (goblin's axe comes from the `axe` partial at 8,
+the chief's is 10), or a template and a live unit (hp 10 → 4). Comparing
+with a unit shows its vars, so it is host-only; a player can still diff
+two templates, as template reads are open to everyone.
+
+SCENARIO 764 — !template spawn count= on a 2×2 body, and template_data
+----------------------------------------------------------------------
+
+!match new t764 Lab 8 8
+!match use t764
+!ent add ogre Ogre 30 1 1 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!template save ogre
+!ent remove ogre
+!ent add rock Rock 5 4 4 1
+!template spawn ogre 3 3 count=3
+?? ✨ Spawned 3 from template `ogre`: `ogre`
+!assert "len(all_entities()) == 4"
+!assert "footprint_width('ogre2') == 2 and footprint_height('ogre3') == 2"
+!template spawn ogre 1 1 count=20 near=2
+?? ❌ Only
+?? of 20 `ogre` fit within 2 of (1,1); spawned none
+!assert "len(all_entities()) == 4"
+!template spawn ogre 3 3 count=0
+?? ❌ count= must be a whole number >= 1.
+!eval "template_data('ogre', 'vars.hp')"
+?? 30
+!ent hp ogre2 5
+!func def reset u "entity[u].hp = template_data('ogre', 'vars.hp')"
+!eval "reset('ogre2')"
+!assert "entity[ogre2].hp == 30"
+!ent hp ogre3 "$(template_data('ogre', 'vars.hp') - 10)"
+!assert "entity[ogre3].hp == 20"
+!eval "get(template_data('ogre'), 'name')"
+?? Ogre
+!eval "template_data('nope')"
+?? no template `nope`
+!eval "template_data('ogre', 'vars.nothere')"
+?? has nothing at `vars.nothere`
+!part add ogre2 ohead head 10 10
+!template save ogre2 ogre_headed
+!ent hp ohead 4
+!template diff ogre_headed unit=ogre2
+?? 1 difference(s)
+?? .vars.hp`: 10 → 4
+
+Expected: HARNESS-ALLOWS-ERRORS. `count=3` spawns three 2×2 ogres on
+the free cells nearest (3,3) where a whole body fits around the rock at
+(4,4). Twenty can't fit within 2 of (1,1), so none are spawned and the
+reply says how many would have fit. `template_data` reads a saved
+template (resolved) from formulas: a `!func` resets a unit's hp to its
+template's, and as a read-only function it works inside a `$()` argument.
+A diff against a unit with a body part compares part by part: the
+head's hp is one line.
