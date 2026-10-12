@@ -391,6 +391,36 @@ class Storage:
             self._usage[key] = _dir_size(path) if os.path.isdir(path) else 0
         return self._usage[key]
 
+    def server_breakdown(self, key: str) -> List[Tuple[str, int]]:
+        """Server `key`'s disk use by part, largest first: each match (its
+        file) and its undo history, templates, their version trash, saves,
+        sprites, corrupt files and the workspace / systems files."""
+        sdir = os.path.join(self.root, key)
+        out: Dict[str, int] = {}
+        mdir = os.path.join(sdir, "matches")
+        if os.path.isdir(mdir):
+            for name in sorted(os.listdir(mdir)):
+                path = os.path.join(mdir, name)
+                if name.endswith(".json") and os.path.isfile(path):
+                    label = f"match {name[:-5]}"
+                    out[label] = out.get(label, 0) + _file_size(path)
+                elif os.path.isdir(path):
+                    label = f"match {name} undo history"
+                    out[label] = out.get(label, 0) + _dir_size(path)
+        tdir = os.path.join(sdir, "templates")
+        if os.path.isdir(tdir):
+            trash = _dir_size(os.path.join(tdir, TRASH_DIR))
+            out["templates"] = _dir_size(tdir) - trash
+            out["old template versions"] = trash
+        for sub, label in (("saves", "saves"), ("sprites", "sprites"),
+                           ("corrupt", "corrupt files")):
+            out[label] = _dir_size(os.path.join(sdir, sub))
+        out["workspace and systems"] = sum(
+            _file_size(os.path.join(sdir, f))
+            for f in ("workspace.json", "systems.json"))
+        return sorted(((k, v) for k, v in out.items() if v > 0),
+                      key=lambda kv: (-kv[1], kv[0]))
+
     def global_usage(self) -> int:
         if not self._usage:
             self.rescan()

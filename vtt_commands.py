@@ -24,6 +24,7 @@ from logic import ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, c
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution
 
 import os
+import difflib
 import re
 from fractions import Fraction
 import asyncio
@@ -157,7 +158,7 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
     "schedule":   frozenset({"list"}),
     "server":     frozenset({"storage"}),
     "status":     frozenset({"list", "info"}),
-    "system":     frozenset({"list", "info"}),
+    "system":     frozenset({"list", "info", "diff"}),
     # `!table roll <name>` only rolls a stored table (advances the RNG, no
     # board mutation), so players may roll a GM-defined table. def/remove stay
     # host-gated.
@@ -166,7 +167,7 @@ READ_ONLY_SUBCOMMANDS: Dict[str, frozenset] = {
     # delete check the saver themselves, spawn changes the match. `refs`
     # stays host-gated: it lists which of a unit's vars changed, and a
     # unit's vars are host-only (`!ent dump`).
-    "template":   frozenset({"list", "show", "trash"}),
+    "template":   frozenset({"list", "show", "trash", "diff"}),
     # team_data_visibility decides whose data a player may read.
     "team":       frozenset({"list", "get"}),
     "tile":       frozenset({"list", "info"}),
@@ -248,7 +249,7 @@ def _admin_required(name: str, args: List[str]) -> bool:
         # System-level defaults; `list` (and the bare usage form) only read.
         return bool(args) and sub != "list"
     if name == "system":
-        if not args or sub in ("list", "info", "rules"):
+        if not args or sub in ("list", "info", "rules", "diff"):
             return False
         if sub == "access":                 # !system access <sys> <action>
             return len(args) < 3 or args[2].lower() != "list"
@@ -2335,10 +2336,14 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if kind not in kinds and kind != "all":
             raise VTTError(f"`{args[1]}` — sync one of: aliases, tiles, "
                            f"funcs, all.")
-        _check_tail(args, 3 if kind != "all" else 2, (),
-                    "!match sync <aliases|tiles|funcs> [name] | "
-                    "!match sync all")
-        want = args[2] if len(args) > 2 else None
+        rest = args[2:]
+        preview = bool(rest) and rest[-1].lower() == "diff"
+        if preview:
+            rest = rest[:-1]
+        _check_tail(["sync", kind] + rest, 3 if kind != "all" else 2, (),
+                    "!match sync <aliases|tiles|funcs> [name] [diff] | "
+                    "!match sync all [diff]")
+        want = rest[0] if rest else None
         sysobj = mgr.get_system(m.system_name)
         lines: List[str] = []
         for word, lib_name in kinds.items():
@@ -2352,6 +2357,7 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 lib = {want: lib[want]}
             mine = getattr(m, lib_name)
             added, replaced, same = [], [], 0
+            changes: List[str] = []
             for n, entry in sorted(lib.items()):
                 if lib_name == "tile_templates":
                     new = SpecialTileTemplate.from_dict(entry)
@@ -2368,18 +2374,29 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     same += 1
                     continue
                 (replaced if old is not None else added).append(n)
-                mine[n] = new
+                if preview:
+                    changes.append(_sync_change(lib_name, n, old, new))
+                else:
+                    mine[n] = new
             if not lib:
                 lines.append(f"{word}: system `{m.system_name}` has none.")
                 continue
             bits = []
+            verbs = ("would add", "would replace") if preview else \
+                ("added", "replaced")
             if added:
-                bits.append("added " + ", ".join(f"`{n}`" for n in added))
+                bits.append(f"{verbs[0]} " + ", ".join(f"`{n}`" for n in added))
             if replaced:
-                bits.append("replaced " + ", ".join(f"`{n}`" for n in replaced))
+                bits.append(f"{verbs[1]} "
+                            + ", ".join(f"`{n}`" for n in replaced))
             if same:
                 bits.append(f"{same} already the same")
             lines.append(f"{word}: " + "; ".join(bits) + ".")
+            lines.extend(changes)
+        if preview:
+            return await ctx.send(
+                f"🔎 A sync from system `{m.system_name}` (nothing changed "
+                f"yet):\n" + "\n".join(lines))
         return await ctx.send(f"🔄 Synced from system `{m.system_name}`:\n"
                               + "\n".join(lines))
     if sub == "outcome":
@@ -2522,12 +2539,14 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "match", "sync",
-    usage="!match sync <aliases|tiles|funcs> [name] | !match sync all",
+    usage=("!match sync <aliases|tiles|funcs> [name] [diff] | "
+           "!match sync all [diff]"),
     desc=("Copy the GameSystem's aliases, tile templates or formula "
           "functions (its own and inherited ones; one by name, or all) over "
           "this match's. A system's libraries reach only matches created "
           "after an edit by themselves; this brings a live match up to date. "
-          "Entries only the match has are kept; undo reverts it. The other "
+          "Entries only the match has are kept; undo reverts it. A trailing "
+          "`diff` shows what would change and changes nothing. The other "
           "way: `!system <alias|tile|func> promote`."),
 )
 registry.annotate_sub(
@@ -2906,6 +2925,10 @@ async def owner_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     return await _help_fallback(ctx, ["owner"], args[0])
 
 
+# `!server storage` lists this many parts, largest first.
+_STORAGE_ROWS = 12
+
+
 def _owner_storage_or_fail(mgr: MatchManager):
     st = storage_of(mgr)
     if st is None:
@@ -3147,9 +3170,17 @@ async def server_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if st is None:
             return await ctx.send("This bot keeps nothing on disk, so there "
                                   "is no storage use to show.")
-        return await ctx.send(
-            f"This server uses {fmt_bytes(st.server_usage(mgr.guild_key))} of "
-            f"its {fmt_bytes(st.server_limit(mgr.guild_key))} storage limit.")
+        parts = st.server_breakdown(mgr.guild_key)
+        shown = parts[:_STORAGE_ROWS]
+        lines = [f"This server uses {fmt_bytes(st.server_usage(mgr.guild_key))} "
+                 f"of its {fmt_bytes(st.server_limit(mgr.guild_key))} storage "
+                 f"limit."]
+        lines += [f"- {label}: {fmt_bytes(n)}" for label, n in shown]
+        if len(parts) > len(shown):
+            rest = sum(n for _, n in parts[len(shown):])
+            lines.append(f"- {len(parts) - len(shown)} smaller part(s): "
+                         f"{fmt_bytes(rest)}")
+        return await ctx.send("\n".join(lines))
     if sub != "wipe":
         return await _help_fallback(ctx, ["server"], args[0])
     if st is not None and not st.persist:
@@ -3234,7 +3265,7 @@ async def server_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 
 registry.annotate_sub("server", "storage", usage="!server storage",
-                      desc="This server's disk use against its storage limit.")
+                      desc="This server's disk use against its storage limit, broken down largest first: each match and its undo history, templates, old template versions, saves, sprites, corrupt files and the workspace / systems files.")
 registry.annotate_sub("server", "wipe",
                       usage="!server wipe <matches | all | confirm <phrase ...> | undo>",
                       desc="Delete the server's matches (`all`: also systems, "
@@ -3658,23 +3689,74 @@ def _fmt_age(seconds: float) -> str:
 
 def _expanded_template(tpl: Dict[str, Any], m: Match) -> Dict[str, Any]:
     """`tpl` with every partial reference resolved (markers dropped): what a
-    spawn or a give gets."""
-    if _is_partial(tpl):
-        return strip_markers(m.template_materialize(tpl.get("data") or {},
-                                                    root=True))
-    out = {k: copy.deepcopy(v) for k, v in tpl.items()
-           if k not in ("saved_by", "saved_by_name")}
-    out["vars"] = strip_markers(m.template_materialize(out.get("vars") or {}))
-    parts = out.get("parts")
-    for p in (parts.values() if isinstance(parts, dict) else parts or []):
-        if isinstance(p, dict) and "vars" in p:
-            p["vars"] = strip_markers(m.template_materialize(p["vars"]))
+    spawn or a give gets (Match.expand_template)."""
+    return m.expand_template(tpl)
+
+
+def _spawn_many(m: Match, name: str, tpl: Dict[str, Any], x: int, y: int,
+                near: Optional[int], count: int) -> str:
+    """`!template spawn ... count=N`: N copies on the free cells nearest
+    (x, y) that fit their bodies (within `near` if given, else anywhere on
+    the map). All or nothing: if one doesn't fit, none stay."""
+    from action import _rollback_match
+    radius = near if near is not None else max(m.grid_width, m.grid_height)
+    pre = m.to_dict(include_history=False)
+    ids: List[str] = []
+    log: List[str] = []
+    try:
+        for _ in range(count):
+            new_id, more = m.spawn_template(name, tpl, x, y,
+                                            near_radius=radius)
+            ids.append(new_id)
+            log += [str(v) for v in more]
+    except VTTError as ex:
+        _rollback_match(m, None, pre)
+        raise VTTError(f"Only {len(ids)} of {count} `{name}` fit"
+                       + (f" within {near} of ({x},{y})" if near is not None
+                          else "") + f"; spawned none ({ex}).")
+    spots = ", ".join(f"`{i}` ({m.entities[i].x},{m.entities[i].y})"
+                      for i in ids if i in m.entities)
+    return "\n".join([f"✨ Spawned {count} from template `{name}`: {spots}."]
+                     + log)
+
+
+def _template_diff_lines(a: Any, b: Any, la: str, lb: str) -> List[str]:
+    """`!template diff`: the leaf paths where two expanded templates (or a
+    template and a unit captured as one) differ."""
+    def by_part(t: Any) -> Any:
+        # Listed parts compare part by part (by their template-relative id),
+        # so a part's changed var is one line.
+        parts = t.get("parts") if isinstance(t, dict) else None
+        if isinstance(parts, list):
+            t = dict(t)
+            t["parts"] = {str(p.get("id", i)) if isinstance(p, dict) else str(i): p
+                          for i, p in enumerate(parts)}
+        return t
+
+    fa: Dict[str, Any] = {}
+    fb: Dict[str, Any] = {}
+    _flatten_vars("", by_part(a), fa)
+    _flatten_vars("", by_part(b), fb)
+    out = []
+    for k in sorted(set(fa) | set(fb)):
+        if k in fa and k in fb:
+            if fa[k] != fb[k]:
+                out.append(f"- `{k}`: {_clip(repr(fa[k]), 40)} → "
+                           f"{_clip(repr(fb[k]), 40)}")
+        elif k in fa:
+            out.append(f"- `{k}`: only in {la} ({_clip(repr(fa[k]), 40)})")
+        else:
+            out.append(f"- `{k}`: only in {lb} ({_clip(repr(fb[k]), 40)})")
     return out
+
+
+# `!template diff` lists at most this many differing paths.
+_TEMPLATE_DIFF_ROWS = 40
 
 
 @registry.command(
     "template", snapshot=True,
-    usage="!template <save|spawn|give|list|show|import|set|unset|part|rename|copy|delete|trash|restore|resync|detach|refs> ...",
+    usage="!template <save|spawn|give|list|diff|show|import|set|unset|part|rename|copy|delete|trash|restore|resync|detach|refs> ...",
     desc=(
         "This server's library of saved templates, shared by all its matches "
         "and kept on disk (even when the CLI / GUI don't keep matches). An "
@@ -3702,14 +3784,72 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     sub = args[0].lower()
 
     if sub == "list":
-        _check_tail(args, 1, (), "!template list")
+        usage = "!template list [kind=<entity|partial>] [by=<user>] [prefix]"
+        words, opts = _template_options(args, 1, usage,
+                                        allowed=("kind", "by"))
+        if len(words) > 1:
+            raise VTTError(f"Unexpected `{' '.join(words[1:])}` — usage: "
+                           f"`{usage}`.")
+        kind = (opts.get("kind") or "").lower()
+        if kind not in ("", "entity", "partial"):
+            raise VTTError(f"kind= is `entity` or `partial`, not `{kind}`.")
+        by = (opts.get("by") or "").lower()
+        prefix = words[0].lower() if words else ""
         if not mgr.templates:
             return await ctx.send("This server has no saved templates "
                                   "(`!template save <unit> [name]`).")
-        lines = [f"**Templates ({len(mgr.templates)}):**"]
+        names = [n for n in sorted(mgr.templates)
+                 if n.startswith(prefix)
+                 and (not kind or (kind == "partial")
+                      == _is_partial(mgr.templates[n]))
+                 and (not by or by in (
+                     str(mgr.templates[n].get("saved_by_name") or "").lower(),
+                     str(mgr.templates[n].get("saved_by") or "").lower()))]
+        if not names:
+            return await ctx.send("No template matches those filters.")
+        filtered = len(names) != len(mgr.templates)
+        lines = [f"**Templates ({len(names)}"
+                 + (f" of {len(mgr.templates)}" if filtered else "") + "):**"]
         lines += [f"- {_template_summary(n, mgr.templates[n])}"
-                  for n in sorted(mgr.templates)]
+                  for n in names]
         return await ctx.send("\n".join(lines))
+
+    if sub == "diff":
+        if await return_help_if_not_enough_args(ctx, args, 3, "template", "diff"):
+            return
+        usage = "!template diff <name> <other | unit=<id>>"
+        words, opts = _template_options(args, 1, usage, allowed=("unit",))
+        name, tpl = _get_template(mgr, words[0] if words else "")
+        if ("unit" in opts) == (len(words) == 2) or len(words) > 2:
+            raise VTTError(f"Compare with one other template or one unit — "
+                           f"usage: `{usage}`.")
+        resolver = _template_resolver(mgr, ctx, library=True)
+        a = resolver.expand_template(tpl)
+        if "unit" in opts:
+            m = active_match(mgr, ctx)
+            # A unit's whole statblock: host-only, like `!ent dump`.
+            if not _acts_as_host(ctx, m):
+                raise VTTError("Comparing with a unit shows all its vars, "
+                               "which only a host may read (`!ent dump`).")
+            eid = _query_eid(ctx, m, opts["unit"])
+            other = f"unit `{eid}`"
+            b = m.expand_template(m.capture_template(m.entities[eid]))
+            if _is_partial(tpl):
+                b = b.get("vars") or {}
+        else:
+            oname, otpl = _get_template(mgr, words[1])
+            other = f"`{oname}`"
+            b = resolver.expand_template(otpl)
+        rows = _template_diff_lines(a, b, f"`{name}`", other)
+        if not rows:
+            return await ctx.send(f"`{name}` and {other} are the same "
+                                  f"(partials resolved).")
+        head = f"**`{name}` → {other}** — {len(rows)} difference(s) " \
+               f"(partials resolved):"
+        more = len(rows) - _TEMPLATE_DIFF_ROWS
+        return await ctx.send("\n".join(
+            [head] + rows[:_TEMPLATE_DIFF_ROWS]
+            + ([f"…and {more} more."] if more > 0 else [])))
 
     if sub == "show":
         if await return_help_if_not_enough_args(ctx, args, 2, "template", "show"):
@@ -4119,8 +4259,9 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "spawn":
         if await return_help_if_not_enough_args(ctx, args, 4, "template", "spawn"):
             return
-        _check_tail(args, 4, ("near",),
-                    "!template spawn <name> <x> <y> [near=<radius>]")
+        _check_tail(args, 4, ("near", "count"),
+                    "!template spawn <name> <x> <y> [near=<radius>] "
+                    "[count=<n>]")
         m = active_match(mgr, ctx)
         name, tpl = _get_template(mgr, args[1])
         if _is_partial(tpl):
@@ -4132,14 +4273,23 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         except ValueError:
             raise VTTError("x and y must be whole numbers.")
         near = None
+        count = 1
         for t in args[4:]:
-            if t.lower().startswith("near="):
-                try:
-                    near = int(t.split("=", 1)[1])
-                except ValueError:
-                    near = -1
-                if near < 0:
+            key, _, raw = t.partition("=")
+            try:
+                val = int(raw)
+            except ValueError:
+                val = -1
+            if key.lower() == "near":
+                if val < 0:
                     raise VTTError("near= must be a whole number >= 0.")
+                near = val
+            elif key.lower() == "count":
+                if val < 1:
+                    raise VTTError("count= must be a whole number >= 1.")
+                count = val
+        if count > 1:
+            return await ctx.send(_spawn_many(m, name, tpl, x, y, near, count))
         new_id, log = m.spawn_template(name, tpl, x, y, near_radius=near)
         e = m.entities.get(new_id)
         where = f" at ({e.x},{e.y})" if e is not None else ""
@@ -4242,14 +4392,23 @@ for _subs, _usage, _desc in (
          "named after its last key by default. Needs a host of this channel's "
          "match. Saving over an existing template replaces it (its saver or "
          "an administrator)."),
-        (("spawn",), "!template spawn <name> <x> <y> [near=<radius>]",
+        (("spawn",), "!template spawn <name> <x> <y> [near=<radius>] [count=<n>]",
          "Spawn an entity template at a cell (near=: the nearest free cell "
          "within the radius). Its id is the template name, numbered when "
-         "taken."),
+         "taken. count= spawns that many on the free cells nearest the cell "
+         "that fit their bodies (within near= if given): all or nothing, the "
+         "reply says how many fit when they don't all."),
         (("give",), "!template give <partial> <unit> <path>",
          "Build a partial template into a unit's var path (replacing what is "
          "there); the unit's own changes to it are recorded from then on."),
-        (("list",), "!template list", "This server's saved templates."),
+        (("list",), "!template list [kind=<entity|partial>] [by=<user>] [prefix]",
+         "This server's saved templates; kind= keeps entity or partial "
+         "templates, by= those a user saved, a prefix those whose name starts "
+         "with it."),
+        (("diff",), "!template diff <name> <other | unit=<id>>",
+         "The paths where two templates differ, or a template and a unit of "
+         "this channel's match (host only, it shows the unit's vars), with "
+         "every partial reference resolved on both sides."),
         (("show",), "!template show <name> [path] [compact] [expanded] [part=<part>]",
          "A template's JSON, or one field of it (`vars`, `vars.hp`; a "
          "partial's paths start inside its data); `part=` shows a body part; "
@@ -4702,6 +4861,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send("No game systems exist yet.")
         lines = [f"- **{name}**" + (f" (inherits from `{x.parent}`)"
                                     if x.parent else "")
+                 + (f" — {x.description}" if x.description else "")
                  for name, x in systems.items()]
         return await ctx.send("Current game systems:\n" + "\n".join(lines))
     if sub == "info":
@@ -4731,6 +4891,8 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             groups.setdefault(src, []).append(
                 f"- `{k}` = {val!r}{hide} — {desc} (type: {t}{extra})")
         parts = [f"**{name}**{default_badge} — rule breakdown"]
+        if s.description:
+            parts.append(s.description)
         if len(chain) > 1:
             parts.append("Inherits from: " + " → ".join(
                 f"`{x.name}`" for x in reversed(chain[:-1]))
@@ -4986,6 +5148,37 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         else:
             return await ctx.send("❌ Scope must be one of: server | channel")
 
+    if sub == "rename":
+        if await return_help_if_not_enough_args(ctx, args, 3, "system", "rename"):
+            return
+        moved = mgr.rename_system(args[1], args[2])
+        bits = [f"{n} {what}{'' if n == 1 else plural}"
+                for what, plural, n in (
+                    ("match", "es", moved["matches"]),
+                    ("inheriting system", "s", moved["children"]),
+                    ("channel default", "s", moved["channels"])) if n]
+        return await ctx.send(
+            f"Renamed GameSystem `{args[1]}` to `{args[2]}`"
+            + (f" ({', '.join(bits)} follow)." if bits else "."))
+    if sub == "describe":
+        if await return_help_if_not_enough_args(ctx, args, 3, "system", "describe"):
+            return
+        s = mgr.get_system(args[1])
+        text = " ".join(args[2:]).strip()
+        s.description = "" if text in ("-", "none") else text
+        return await ctx.send(
+            f"`{args[1]}`: description " + (f"set: {s.description}"
+                                            if s.description else "cleared."))
+    if sub == "diff":
+        if await return_help_if_not_enough_args(ctx, args, 3, "system", "diff"):
+            return
+        return await ctx.send(_system_diff(mgr, mgr.get_system(args[1]),
+                                           mgr.get_system(args[2])))
+    if sub == "lint":
+        if await return_help_if_not_enough_args(ctx, args, 2, "system", "lint"):
+            return
+        return await ctx.send(_system_lint(mgr, mgr.get_system(args[1])))
+
     # ---- system tile / func <action> <system> ... ----------------------
     # The system's tile template and formula function libraries, edited in
     # place with the grammar of `!tile def` / `!func`. Like aliases they
@@ -5129,6 +5322,219 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         )
 
     return await _help_fallback(ctx, ["system"], args[0] if args else None)
+def _source_label(mgr: MatchManager, s: Any, key: str) -> str:
+    """Where `s`'s value of rule `key` comes from, for `!system diff`."""
+    src = mgr.system_value_source(s, key)
+    return ("default" if src is None else "own" if src == s.name
+            else f"from `{src}`")
+
+
+def _system_diff(mgr: MatchManager, a: Any, b: Any) -> str:
+    """`!system diff <a> <b>`: the rules and library entries whose
+    effective values differ between two systems."""
+    if a.name == b.name:
+        return f"`{a.name}` is the same system."
+    rules = []
+    for k in sorted(RULES_REGISTRY):
+        va, vb = mgr.system_value(a, k), mgr.system_value(b, k)
+        if va != vb:
+            rules.append(
+                f"- `{k}`: `{a.name}` = `{_clip(repr(va), 40)}` "
+                f"({_source_label(mgr, a, k)}), `{b.name}` = "
+                f"`{_clip(repr(vb), 40)}` ({_source_label(mgr, b, k)})")
+    libs = []
+    for kind in SYSTEM_LIBRARIES:
+        la, lb = mgr.system_library(a, kind), mgr.system_library(b, kind)
+        only_a = sorted(set(la) - set(lb))
+        only_b = sorted(set(lb) - set(la))
+        differ = sorted(n for n in set(la) & set(lb) if la[n] != lb[n])
+        for names, what in ((only_a, f"only in `{a.name}`"),
+                            (only_b, f"only in `{b.name}`"),
+                            (differ, "different")):
+            if names:
+                libs.append(f"- {kind} {what}: "
+                            + ", ".join(f"`{n}`" for n in names))
+    if not rules and not libs:
+        return f"`{a.name}` and `{b.name}` have the same rules and libraries."
+    out = [f"**`{a.name}` vs `{b.name}`** — {len(rules)} rule(s) differ"]
+    out += rules
+    if libs:
+        out.append("**Libraries:**")
+        out += libs
+    return "\n".join(out)
+
+
+def _lint_one(src: Any, mode: str, known: frozenset,
+              params: frozenset = frozenset(),
+              action_mode: bool = False) -> Optional[str]:
+    """Why formula `src` can't run (None when it validates, or isn't a
+    formula). `mode` eval / exec; `action_mode` for action bodies."""
+    if not isinstance(src, str) or not src.strip():
+        return None
+    try:
+        if action_mode:
+            validate_program(src, known_funcs=known, action_mode=True)
+        else:
+            validate_formula(src, mode=mode, known_funcs=known,
+                             known_params=params)
+    except FormulaError as ex:
+        return str(ex)
+    return None
+
+
+def _system_lint(mgr: MatchManager, s: Any) -> str:
+    """`!system lint <name>`: every formula the system and its matches
+    store, checked at once. Each is checked when stored, but a function
+    deleted later, a rule edited on a parent or a match-side `!func`
+    removed leaves formulas that fail at use, mostly silently (fail-open
+    conditions). A call to a function the system's library lacks is a ⚠️
+    at system level (a match may define it); everything else is a ❌."""
+    from action import discover_actions
+    sys_known = frozenset(mgr.system_library(s, "formula_functions"))
+    bad: List[str] = []
+    warn: List[str] = []
+
+    def check(where: str, src: Any, mode: str, known: frozenset,
+              params: frozenset = frozenset(), action_mode: bool = False,
+              soft: bool = False) -> None:
+        err = _lint_one(src, mode, known, params, action_mode)
+        if err is None:
+            return
+        unknown = re.match(r"Function '(\w+)' is not allowed\.", err)
+        if soft and unknown:
+            warn.append(f"⚠️ {where}: calls `{unknown.group(1)}`, which "
+                        f"isn't in the system's functions (a match may "
+                        f"define it)")
+        else:
+            bad.append(f"❌ {where}: {err}")
+
+    n = 0
+    for k in sorted(RULES_REGISTRY):
+        mode = (RULES_REGISTRY[k].get("schema") or {}).get("formula")
+        if mode:
+            n += 1
+            check(f"rule `{k}`", mgr.system_value(s, k),
+                  "eval" if mode == "expression" else "exec", sys_known,
+                  soft=True)
+    for spec in mgr.system_value(s, "default_entity_passives") or []:
+        if isinstance(spec, dict):
+            n += 1
+            check(f"default passive `{spec.get('id')}`", spec.get("formula"),
+                  "exec", sys_known, soft=True)
+    for tname, tdef in sorted(mgr.system_library(s, "tile_templates").items()):
+        tdef = tdef if isinstance(tdef, dict) else {}
+        for when, src in sorted((tdef.get("hooks") or {}).items()):
+            n += 1
+            check(f"tile template `{tname}` hook `{when}`", src, "exec",
+                  sys_known, soft=True)
+        for key in ("block", "opaque"):
+            n += 1
+            check(f"tile template `{tname}` {key}",
+                  (tdef.get("data") or {}).get(key), "eval", sys_known,
+                  soft=True)
+    for fname, fdef in sorted(mgr.system_library(s, "formula_functions").items()):
+        fn = FormulaFunction.from_dict(fdef)
+        n += 1
+        check(f"function `{fname}`", fn.body, "exec", sys_known,
+              frozenset(fn.params), soft=True)
+    matches = sorted((m for m in mgr.matches.values()
+                      if m.system_name == s.name), key=lambda m: m.id)
+    for m in matches:
+        known = frozenset(m.formula_functions)
+        at = f"match `{m.id}`"
+        for fname, fn in sorted(m.formula_functions.items()):
+            n += 1
+            check(f"{at} function `{fname}`", fn.body, "exec", known,
+                  frozenset(fn.params))
+        passives = [(f"global passive `{pid}`", p)
+                    for pid, p in sorted(m.global_passives.items())]
+        for team, ps in sorted(m.team_passives.items()):
+            passives += [(f"team `{team}` passive `{pid}`", p)
+                         for pid, p in sorted(ps.items())]
+        for eid, e in sorted(m.entities.items()):
+            passives += [(f"`{eid}` passive `{pid}`", p)
+                         for pid, p in sorted(e.passives.items())]
+            for aname, acts in sorted(discover_actions(e, m.rules).items()):
+                for act in acts:
+                    n += 1
+                    check(f"{at} `{eid}` action `{act.full_path}`", act.body,
+                          "exec", known, action_mode=True)
+        for where, p in passives:
+            n += 1
+            check(f"{at} {where}", p.formula, "exec", known)
+        for wname, w in sorted(m.watchers.items()):
+            n += 2
+            check(f"{at} watcher `{wname}` condition", w.get("condition"),
+                  "eval", known)
+            check(f"{at} watcher `{wname}` effect", w.get("effect"), "exec",
+                  known)
+        for sname, sdef in sorted(m.status_definitions.items()):
+            n += 1
+            check(f"{at} status `{sname}` tick", sdef.get("tick"), "exec",
+                  known)
+        for tname, tpl in sorted(m.tile_templates.items()):
+            for when, src in sorted(tpl.hooks.items()):
+                n += 1
+                check(f"{at} tile template `{tname}` hook `{when}`", src,
+                      "exec", known)
+            for key in ("block", "opaque"):
+                n += 1
+                check(f"{at} tile template `{tname}` {key}",
+                      tpl.data.get(key), "eval", known)
+        for (x, y), tile in sorted(m.tiles.items()):
+            if not isinstance(tile, dict):
+                continue
+            for when, src in sorted((tile.get("hooks") or {}).items()):
+                n += 1
+                check(f"{at} tile ({x},{y}) hook `{when}`", src, "exec", known)
+            for key in ("block", "opaque"):
+                n += 1
+                check(f"{at} tile ({x},{y}) {key}", tile.get(key), "eval",
+                      known)
+        for zname, z in sorted(m.zones.items()):
+            for when, src in sorted((z.get("hooks") or {}).items()):
+                n += 1
+                check(f"{at} zone `{zname}` hook `{when}`", src, "exec", known)
+            for key in ("block", "opaque"):
+                n += 1
+                check(f"{at} zone `{zname}` {key}",
+                      (z.get("data") or {}).get(key), "eval", known)
+    head = (f"🔍 `{s.name}` and its {len(matches)} match"
+            f"{'es' if len(matches) != 1 else ''}: {n} formula slot(s) "
+            f"checked")
+    if not bad and not warn:
+        return head + " — all clean."
+    return "\n".join([head + f" — {len(bad)} problem(s), {len(warn)} "
+                      f"warning(s):"] + bad + warn)
+
+
+def _sync_change(lib_name: str, name: str, old: Any, new: Any) -> str:
+    """One line of `!match sync ... diff`: what syncing entry `name` would
+    change (`old` is the match's entry as a dict / text, None if absent)."""
+    if lib_name == "aliases":
+        return (f"  `!{name}`: " + (f"`!{old}` → " if old is not None else "")
+                + f"`!{new}`")
+    if lib_name == "formula_functions":
+        was = FormulaFunction.from_dict(old) if old is not None else None
+        return (f"  `{new.signature()}`: "
+                + (f"{_clip(was.body, 50)} → " if was is not None else "")
+                + _clip(new.body, 50))
+    nd = new.to_dict()
+    if old is None:
+        return f"  `{name}`: data keys {sorted(nd['data']) or '—'}, hooks " \
+               f"{sorted(nd['hooks']) or '—'}"
+    bits = []
+    for part in ("data", "hooks"):
+        a, b = old.get(part) or {}, nd[part]
+        for k in sorted(set(a) | set(b)):
+            if a.get(k) != b.get(k):
+                bits.append(f"{part}.{k}: "
+                            + (_clip(repr(a[k]), 30) if k in a else "—")
+                            + " → "
+                            + (_clip(repr(b[k]), 30) if k in b else "—"))
+    return f"  `{name}`: " + "; ".join(bits)
+
+
 def _promoted_line(kind: str, shown: str, match_id: str, sys_name: str,
                    replaced: bool, same: bool) -> str:
     """The reply of a `!system <alias|tile|func> promote`."""
@@ -5377,6 +5783,37 @@ registry.annotate_sub(
           "changes). A loop is refused, and a chain longer than the bot "
           "owner's system_chain_depth. Its matches and those of the systems "
           "inheriting from it refresh."))
+registry.annotate_sub(
+    "system", "rename",
+    usage="!system rename <name> <new_name>",
+    desc=("Rename a GameSystem. Its matches, the systems inheriting from "
+          "it and the server / channel defaults follow; undo snapshots that "
+          "still name the old system restore onto the renamed one."))
+registry.annotate_sub(
+    "system", "describe",
+    usage="!system describe <name> <text ...>",
+    desc=("Set a GameSystem's description (shown in `!system list` and "
+          "`!system info`); `-` clears it. Each system's own, not inherited."))
+registry.annotate_sub(
+    "system", "diff",
+    usage="!system diff <name> <other>",
+    desc=("The gamerules and library entries (aliases, tile templates, "
+          "formula functions) whose effective values differ between two "
+          "systems, each rule with where its value comes from (own, "
+          "inherited from a named system, or the engine default)."))
+registry.annotate_sub(
+    "system", "lint",
+    usage="!system lint <name>",
+    desc=("Check every formula a system and its matches store at once: "
+          "formula rules, default passives, the system's tile hooks and "
+          "functions, and in each match its functions, passives (global, "
+          "team, unit), unit actions, watchers, status ticks, tile and zone "
+          "hooks and block / opaque conditions. Each was checked when stored, "
+          "but a later edit (a deleted function, a rule changed on a parent) "
+          "can leave formulas that fail at use, many of them silently. A "
+          "call to a function the system's library lacks is a ⚠️ at system "
+          "level (a match may define it); anything else is a ❌. "
+          "Administrators only: it lists every match's units."))
 registry.annotate_sub(
     "system", "unset",
     usage="!system unset <name> <rule|rule:entry|library:name>",
@@ -9265,10 +9702,12 @@ def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot,
     # requests to the other), its name, who runs it, and its game system
     # (no command moves a match to another system; the board's units take
     # this system's var names below).
+    # The match keeps its live system: `!system rename` may have renamed
+    # it since the snapshot, which still names the old one.
+    new_match.system_name = old.system_name
     if new_match.id != old.id:
         new_match.id = old.id
         new_match.name = old.name
-        new_match.system_name = old.system_name
         new_match.owner = old.owner
         new_match.cohosts = copy.deepcopy(old.cohosts)
         new_match.access_overrides = copy.deepcopy(old.access_overrides)
@@ -15483,6 +15922,54 @@ def _clip(text: str, n: int) -> str:
     return text if len(text) <= n else text[:n - 1].rstrip() + "…"
 
 
+def _help_rule(ctx: ReplyContext, mgr: MatchManager, name: str) -> str:
+    """`!help rule <rule>`: one gamerule in full, with its value on this
+    channel's match (else the channel's default system) and its source."""
+    spec = RULES_REGISTRY.get(name)
+    if spec is None:
+        near = difflib.get_close_matches(name, list(RULES_REGISTRY), n=3)
+        raise NotFound(f"No gamerule `{name}`"
+                       + (f" — did you mean {', '.join(f'`{n}`' for n in near)}?"
+                          if near else "; `!help find <word>` searches them."))
+    schema = spec.get("schema") or {}
+    t = schema.get("type")
+    allowed = t or "?"
+    if t == "enum":
+        allowed += ": " + ", ".join(sorted(schema.get("choices", [])))
+    elif t == "int" and ("min" in schema or "max" in schema):
+        lo, hi = schema.get("min"), rule_max(name)
+        allowed += f", {lo}" + (f"-{hi}" if hi is not None else " or more")
+        if schema.get("unlimited"):
+            allowed += " (-1 = unlimited)"
+    if schema.get("formula"):
+        allowed += f", a formula {schema['formula']}"
+    if schema.get("ceiling"):
+        allowed += " (capped by the bot owner's ceiling)"
+    mid = mgr.active_by_channel.get(ctx.channel_key)
+    m = mgr.matches.get(mid) if mid is not None else None
+    sysobj = mgr.systems.get(m.system_name if m is not None
+                             else mgr.effective_system_name(ctx.channel_key))
+    lines = [f"**`{name}`** — {spec.get('desc', '')}",
+             f"Allowed: {allowed}",
+             f"Default: `{_clip(repr(DEFAULT_SYSTEM_SETTINGS.get(name)), 80)}`"]
+    if m is not None:
+        lines.append(f"On match `{m.id}`: "
+                     f"`{_clip(repr(m.rules.get(name)), 80)}`")
+    if sysobj is not None:
+        src = mgr.system_value_source(sysobj, name)
+        lines.append(
+            f"System `{sysobj.name}`: `{_clip(repr(mgr.system_value(sysobj, name)), 80)}` ("
+            + ("the engine default" if src is None else
+               "set by this system" if src == sysobj.name else
+               f"inherited from `{src}`") + ")")
+    if name in VAR_NAME_RULES:
+        lines.append("Names a unit var: changing it renames that var on "
+                     "every unit of the system's matches.")
+    if name in MERGE_RULES:
+        lines.append("A child system merges its entries over its parent's.")
+    return "\n".join(lines)
+
+
 def _help_find(ctx: ReplyContext, mgr: MatchManager, words: List[str]) -> str:
     """`!help find <word> [word ...]`: commands, subcommands and gamerules
     whose name, usage or description contains EVERY word (case-insensitive).
@@ -15540,10 +16027,13 @@ def _help_find(ctx: ReplyContext, mgr: MatchManager, words: List[str]) -> str:
     return "\n".join(out)
 
 
-@registry.command("help", access="all", usage="!help [command [sub]] | !help find <word> [word ...]", desc="Show command usage. Try `!help ent` or `!help ent move`. `!help find <word> [word ...]` searches every command, subcommand and gamerule (name and description, all words must match) and shows each matching rule's current value on this match. (`!help find` alone is the help for the `!find` command.)")
+@registry.command("help", access="all", usage="!help [command [sub]] | !help find <word> [word ...] | !help rule <rule>", desc="Show command usage. Try `!help ent` or `!help ent move`. `!help find <word> [word ...]` searches every command, subcommand and gamerule (name and description, all words must match) and shows each matching rule's current value on this match. `!help rule <rule>` shows one gamerule in full: description, allowed values, default, its value on this channel's match and the system in the inheritance chain that sets it. (`!help find` alone is the help for the `!find` command.)")
 async def help_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if len(args) >= 2 and args[0].lower() == "find":
         return await ctx.send(_help_find(ctx, mgr, args[1:]))
+    if len(args) >= 2 and args[0].lower() == "rule":
+        _check_tail(args, 2, (), "!help rule <rule>")
+        return await ctx.send(_help_rule(ctx, mgr, args[1]))
     title, body = registry.help_for(args)
     await ctx.send(f"**{title}**\n{body}")
 

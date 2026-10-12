@@ -325,7 +325,7 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
                 paths += _entity_ids(mgr, ctx)
             return paths
         return _entity_ids(mgr, ctx) if slot == "template_ref" else []
-    if root == "system" and slot == "parent":
+    if root == "system" and slot in ("parent", "other"):
         # `!system parent <name> <parent|none>` names a system, not a unit.
         return sorted(mgr.systems)
     if slot in _ENTITY_SLOTS and not (root == "match" and slot == "id"):
@@ -339,7 +339,8 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         return _entity_ids(mgr, ctx)
     if slot == "corpse_id":
         return _corpse_ids(mgr, ctx)
-    if slot in ("template", "template_ref"):
+    if slot in ("template", "template_ref") or (
+            root == "template" and slot in ("other", "prefix")):
         return sorted(mgr.templates)
     if slot == "partial":
         return sorted(n for n, t in mgr.templates.items()

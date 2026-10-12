@@ -20988,7 +20988,7 @@ SCENARIO 738 — Tab completion: commands, subcommands, literal words and option
 ?tab "!ent rm h"
 ?? healer  hero
 ?tab "!template spawn guard 1 1 "
-?? candidates: near=
+?? candidates: count=  near=
 ?tab "!map pan "
 ?? up_left
 ?! as=
@@ -21016,7 +21016,7 @@ follow the command's usage strings: `!ent` subcommands, unit ids for
 `<id>` (`!ent rm` is an alias spelling of `remove`), the literal words a
 form allows (`max` for `!ent hp`, `cw`/`ccw`/`toward` and the directions
 for `!ent face`, the `!undo` kinds, `!help`'s subcommands of `ent`), and
-`key=` options where the form allows one (`near=` after a template spawn's
+`key=` options where the form allows one (`count=` and `near=` after a template spawn's
 coordinates; `!map pan` takes none). After ` ; ` in `!batch`, the next
 command completes. A line without `!` or inside an open quote gets nothing;
 an alias completes like the command it expands to.
@@ -22028,7 +22028,7 @@ SCENARIO 759 — System libraries: promote from a match, !match sync, undo, rest
 ?tab "!system tile promote default p"
 ?? → '!system tile promote default pit '
 ?tab "!match sync tiles "
-?? → '!match sync tiles pit '
+?? candidates: diff  pit
 !as restart
 !system func info default calc
 ?? x * 100
@@ -22047,3 +22047,264 @@ leaves the live match alone until `!match sync` copies it over (one
 entry, a whole library, or all three, keeping match-only `mine`); undo
 reverts the syncs. Unknown entries, unknown kinds and a name with `all`
 are refused. The promoted libraries survive a restart.
+
+SCENARIO 760 — !system rename / describe / diff, and undo after a rename
+----------------------------------------------------------------------
+
+!system new skirm parent=default
+!system new duel parent=skirm
+!system set skirm fog_los true
+!system set duel friendlyfire true
+!system describe skirm Fast skirmishes on small maps.
+?? description set: Fast skirmishes on small maps.
+!system list
+?? **skirm** (inherits from `default`) — Fast skirmishes on small maps.
+!system default channel skirm
+!match new t760 Skirm 6 6 --system skirm
+!match use t760
+!ent add a A 10 2 2 5
+!ent hp a 7
+!system rename skirm skirmish
+?? Renamed GameSystem `skirm` to `skirmish` (1 match, 1 inheriting system, 1 channel default follow).
+!system info duel
+?? Inherits from: `skirmish` → `default`
+!match info
+?? system `skirmish`
+!undo command 2 confirm
+!assert "entity[a].hp == 10 and rule_get('fog_los') == True"
+!match info
+?? system `skirmish`
+!system diff skirmish duel
+?? `friendlyfire`: `skirmish` = `False` (default), `duel` = `True` (own)
+?! `fog_los`
+!system diff duel default
+?? `fog_los`: `duel` = `True` (from `skirmish`), `default` = `False` (default)
+!system diff default default
+?? is the same system
+!system rename skirmish duel
+?? ❌ GameSystem 'duel' already exists
+!system rename nothere x
+?? ❌
+!system describe skirmish -
+?? description cleared.
+!as restart
+!system info duel
+?? Inherits from: `skirmish`
+!match info
+?? system `skirmish`
+
+Expected: HARNESS-ALLOWS-ERRORS. `!system rename` moves the matches on
+the system, the systems inheriting from it and channel defaults to the
+new name. An undo past the rename restores the match's board (hp back to
+10) while the match stays on the renamed system with its rules (the
+snapshot still names `skirm`). `!system diff` lists the rules whose
+effective values differ and where each comes from: duel's own
+friendlyfire, and fog_los inherited from skirmish. A description shows
+in `!system list` and clears with `-`. Everything survives a restart.
+
+SCENARIO 761 — !system lint and !help rule
+----------------------------------------------------------------------
+
+!system new lab parent=default
+!system func def lab dbl x "x * 2"
+!system tile new lab trap
+!system tile hook lab trap on_enter "entity[self].hp = helper(entity[self].hp)"
+?? ⚠️ Function 'helper'
+!match new t761 Lab 6 6 --system lab
+!match use t761
+!func def own x "x + 1"
+!ent add a A 10 2 2 5
+!passive add a p1 on_turn_start "entity[self].hp = own(entity[self].hp)"
+!watch add w "dbl(entity[a].hp) > 30" "log('big')"
+!system lint lab
+?? 1 problem(s), 1 warning(s)
+?? ❌ match `t761` tile template `trap` hook `on_enter`: Function 'helper' is not allowed.
+?? ⚠️ tile template `trap` hook `on_enter`: calls `helper`, which isn't in the system's functions
+!func def helper x "x"
+!system lint lab
+?? 0 problem(s), 1 warning(s)
+!func del own
+!func del dbl
+!system lint lab
+?? 2 problem(s), 1 warning(s)
+?? ❌ match `t761` `a` passive `p1`: Function 'own' is not allowed.
+?? ❌ match `t761` watcher `w` condition: Function 'dbl' is not allowed.
+!system lint nothere
+?? ❌
+!system lint default
+?? all clean
+!help rule friendlyfire
+?? **`friendlyfire`**
+?? Allowed: bool
+?? On match `t761`: `False`
+?? System `lab`: `False` (the engine default)
+!system set default friendlyfire true
+!help rule friendlyfire
+?? System `lab`: `True` (inherited from `default`)
+!help rule hp_var
+?? Names a unit var
+!help rule frienlyfire
+?? did you mean `friendlyfire`
+!help rule death_condition
+?? a formula expression
+
+Expected: HARNESS-ALLOWS-ERRORS. `!system lint` checks every formula a
+system and its matches store in one report. The system's tile hook
+calling an undefined `helper` is a ⚠️ at system level (a match may
+define it), and a ❌ in t761's copy of the template until t761 defines
+`helper`; then only the system-level ⚠️ remains. Deleting the match's `own` and `dbl`
+breaks passive p1 and the watcher's condition. `!help rule` shows a
+rule's description, allowed values, its value on this channel's match
+and in the system chain with where it comes from, and suggests a near
+name for a typo.
+
+SCENARIO 762 — !match sync ... diff and the storage breakdown
+----------------------------------------------------------------------
+
+!match new t762 Lab 6 6
+!match use t762
+!system func def default calc x "x * 2"
+!system alias def default hit "ent hp"
+!system tile new default pit
+!system tile data default pit depth 2
+!match sync all
+!system func def default calc x "x * 3"
+!system tile data default pit depth 5
+!system tile hook default pit on_stop "entity[self].hp = entity[self].hp - 1"
+!system func def default extra - "7"
+!match sync funcs diff
+?? 🔎 A sync from system `default` (nothing changed yet):
+?? funcs: would add `extra`; would replace `calc`.
+?? `calc(x)`: x * 2 → x * 3
+!match sync tiles pit diff
+?? `pit`: data.depth: 2 → 5; hooks.on_stop: — → 'entity[self].hp = entity[sel
+!match sync all diff
+?? aliases: 1 already the same.
+!eval "calc(2)"
+?? 4
+!match sync all
+?? replaced `calc`
+!eval "calc(2)"
+?? 6
+!match sync funcs extra diff
+?? funcs: 1 already the same.
+!match sync spells diff
+?? ❌
+!ent add a A 10 2 2 5
+!history save before
+!server storage
+?? This server uses
+?? - match t762 undo history:
+?? - match t762:
+?? - workspace and systems:
+
+Expected: HARNESS-ALLOWS-ERRORS. A trailing `diff` on `!match sync`
+lists what a sync would add or replace and changes nothing: the
+function body before → after, a tile template's changed data keys and
+hooks. `calc(2)` stays 4 until the real sync makes it 6. `!server
+storage` lists the server's disk use by part, largest first: the
+match's undo history, its file, the workspace and systems files.
+
+SCENARIO 763 — !template list filters and !template diff
+----------------------------------------------------------------------
+
+!match new t763 Lab 8 8
+!match use t763
+!ent add a Gob 10 1 1 5
+!ent set_var a inventory.axe.damage 8
+!template save a axe path=inventory.axe
+!template give axe a inventory.axe
+!template save a goblin
+!ent set_var a inventory.axe.damage 10
+!template save a goblin_chief
+!template list
+?? **Templates (3):**
+!template list kind=partial
+?? **Templates (1 of 3):**
+?? `axe` — partial
+!template list gob
+?? **Templates (2 of 3):**
+!template list kind=entity by=cli
+?? **Templates (2 of 3):**
+!template list by=nobody
+?? No template matches those filters.
+!template list kind=npc
+?? ❌ kind= is `entity` or `partial`
+!template diff goblin goblin_chief
+?? 1 difference(s) (partials resolved)
+?? `vars.inventory.axe.damage`: 8 → 10
+!eval "template_data('goblin', 'vars.inventory.axe.damage')"
+?? 8
+!template diff goblin goblin
+?? are the same
+!ent hp a 4
+!template diff goblin_chief unit=a
+?? `vars.hp`: 10 → 4
+!template diff goblin
+?? ❌
+!template diff goblin goblin_chief unit=a
+?? ❌ Compare with one other template or one unit
+!as player bob
+!template diff goblin goblin_chief
+?? `vars.inventory.axe.damage`: 8 → 10
+!template diff goblin unit=a
+?? ❌ Comparing with a unit shows all its vars, which only a host may read
+?tab "!template diff gob"
+?? candidates: goblin  goblin_chief
+
+Expected: HARNESS-ALLOWS-ERRORS. `!template list` filters by kind,
+saver and name prefix. `!template diff` compares two templates with
+their partials resolved (goblin's axe comes from the `axe` partial at 8,
+the chief's is 10), or a template and a live unit (hp 10 → 4). Comparing
+with a unit shows its vars, so it is host-only; a player can still diff
+two templates, as template reads are open to everyone.
+
+SCENARIO 764 — !template spawn count= on a 2×2 body, and template_data
+----------------------------------------------------------------------
+
+!match new t764 Lab 8 8
+!match use t764
+!ent add ogre Ogre 30 1 1 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!template save ogre
+!ent remove ogre
+!ent add rock Rock 5 4 4 1
+!template spawn ogre 3 3 count=3
+?? ✨ Spawned 3 from template `ogre`: `ogre`
+!assert "len(all_entities()) == 4"
+!assert "footprint_width('ogre2') == 2 and footprint_height('ogre3') == 2"
+!template spawn ogre 1 1 count=20 near=2
+?? ❌ Only
+?? of 20 `ogre` fit within 2 of (1,1); spawned none
+!assert "len(all_entities()) == 4"
+!template spawn ogre 3 3 count=0
+?? ❌ count= must be a whole number >= 1.
+!eval "template_data('ogre', 'vars.hp')"
+?? 30
+!ent hp ogre2 5
+!func def reset u "entity[u].hp = template_data('ogre', 'vars.hp')"
+!eval "reset('ogre2')"
+!assert "entity[ogre2].hp == 30"
+!ent hp ogre3 "$(template_data('ogre', 'vars.hp') - 10)"
+!assert "entity[ogre3].hp == 20"
+!eval "get(template_data('ogre'), 'name')"
+?? Ogre
+!eval "template_data('nope')"
+?? no template `nope`
+!eval "template_data('ogre', 'vars.nothere')"
+?? has nothing at `vars.nothere`
+!part add ogre2 ohead head 10 10
+!template save ogre2 ogre_headed
+!ent hp ohead 4
+!template diff ogre_headed unit=ogre2
+?? 1 difference(s)
+?? .vars.hp`: 10 → 4
+
+Expected: HARNESS-ALLOWS-ERRORS. `count=3` spawns three 2×2 ogres on
+the free cells nearest (3,3) where a whole body fits around the rock at
+(4,4). Twenty can't fit within 2 of (1,1), so none are spawned and the
+reply says how many would have fit. `template_data` reads a saved
+template (resolved) from formulas: a `!func` resets a unit's hp to its
+template's, and as a read-only function it works inside a `$()` argument.
+A diff against a unit with a body part compares part by part: the
+head's hp is one line.

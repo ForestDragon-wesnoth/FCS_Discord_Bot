@@ -4632,6 +4632,9 @@ class GameSystem:
     # (MERGE_RULES) or a library's names ("aliases", "tile_templates",
     # "formula_functions") -> the keys hidden here.
     removed: Dict[str, List[str]] = field(default_factory=dict)
+    # A GM's note on what the system is for (`!system describe`), shown in
+    # `!system list` / `info`. Each system's own: not inherited.
+    description: str = ""
 
     def own(self, key: str) -> Any:
         """This system's own value of rule `key`, or None when it doesn't
@@ -4678,6 +4681,7 @@ class GameSystem:
             "parent": self.parent,
             "removed": {k: sorted(set(map(str, v)))
                         for k, v in sorted(self.removed.items()) if v},
+            "description": self.description,
         }
 
     @staticmethod
@@ -4738,6 +4742,7 @@ class GameSystem:
             aliases=sys_aliases,
             parent=parent if isinstance(parent, str) and parent else None,
             removed=removed,
+            description=str(d.get("description") or ""),
         )
 
 # -------------------------
@@ -12412,6 +12417,24 @@ class Match:
             d["saved_by_name"] = str(saved_by_name)
         return d
 
+    def expand_template(self, tpl: Dict[str, Any]) -> Dict[str, Any]:
+        """Template `tpl` with every partial reference resolved against this
+        match (its pins and rules) and the markers dropped: what a spawn or
+        a give gets. A partial gives its data; an entity template its
+        whole dict, parts included, minus who saved it."""
+        if tpl.get("kind") == "partial":
+            return strip_markers(self.template_materialize(
+                tpl.get("data") or {}, root=True))
+        out = {k: copy.deepcopy(v) for k, v in tpl.items()
+               if k not in ("saved_by", "saved_by_name")}
+        out["vars"] = strip_markers(self.template_materialize(
+            out.get("vars") or {}))
+        parts = out.get("parts")
+        for p in (parts.values() if isinstance(parts, dict) else parts or []):
+            if isinstance(p, dict) and "vars" in p:
+                p["vars"] = strip_markers(self.template_materialize(p["vars"]))
+        return out
+
     def spawn_template(self, name: str, template: Dict[str, Any], x: int, y: int,
                        near_radius: Optional[int] = None) -> Tuple[str, List[str]]:
         """Spawn a saved template at (x, y) (or the nearest free cell within
@@ -18427,6 +18450,36 @@ class MatchManager:
         self.default_system_per_channel = {
             k: v for k, v in self.default_system_per_channel.items() if v != name
         }
+
+    def rename_system(self, old: str, new: str) -> Dict[str, int]:
+        """Rename GameSystem `old` to `new`, following every place that
+        names it: the matches on it, the systems inheriting from it, the
+        server default and channel defaults. Returns how many of each
+        moved. Undo snapshots keep the old name; a restore keeps the
+        match's live system (_restore_snapshot), as does a rollback."""
+        s = self.get_system(old)
+        check_id("system name", new)
+        if new in self.systems:
+            raise DuplicateId(f"GameSystem '{new}' already exists")
+        del self.systems[old]
+        s.name = new
+        self.systems[new] = s
+        moved = {"matches": 0, "children": 0, "channels": 0}
+        for m in self.matches.values():
+            if m.system_name == old:
+                m.system_name = new
+                moved["matches"] += 1
+        for x in self.systems.values():
+            if x.parent == old:
+                x.parent = new
+                moved["children"] += 1
+        if self.default_system_name == old:
+            self.default_system_name = new
+        for k, v in list(self.default_system_per_channel.items()):
+            if v == old:
+                self.default_system_per_channel[k] = new
+                moved["channels"] += 1
+        return moved
 
     def set_default_system(self, name: str):
         self.get_system(name)

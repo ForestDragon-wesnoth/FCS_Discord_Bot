@@ -472,6 +472,9 @@ plus `data/bot_settings.json` (owner limits + rule ceilings) and
   `action._rollback_match`, history from the index — and the user is warned.
   A commit that doesn't grow is always allowed. `!store save` / `!history
   export` check room first (`check_room`) and are refused if over.
+  `!server storage` lists the server's use by part, largest first
+  (`Storage.server_breakdown`: each match and its undo history, templates,
+  old template versions, saves, sprites, corrupt files, workspace / systems).
 - **Startup:** `storage.open_workspaces()` (bot.py, cli.py, gui.py) loads every
   server folder; a file that fails to load moves to `corrupt/` with a console
   note and the rest loads; unknown gamerules in systems are dropped. Data of
@@ -1539,6 +1542,20 @@ hardcodes**.
   bodies) go through `_system_formula_warning`: a disallowed construct is
   refused, a call to an unknown function is stored with a ⚠️ (a match may
   define it later; a promote counts only the system's library) (757-759).
+- **System tooling:** `!system rename` (`MatchManager.rename_system`: the
+  matches on it, children's parent links, server / channel defaults follow;
+  `system_name` survives `_rollback_match` and `_restore_snapshot` keeps
+  the live one, since undo snapshots still name the old system), `!system
+  describe` (`GameSystem.description`, own, not inherited), `!system diff
+  <a> <b>` (effective rules and library entries, with each rule's source;
+  open to players), `!system lint <name>` (admin: every formula the system
+  and its matches store — formula rules, default passives, library tile
+  hooks / block / opaque / functions, and per match its functions,
+  passives, unit actions, watchers, status ticks, tile and zone hooks and
+  conditions; an unknown function at system level is a ⚠️), `!help rule
+  <rule>` (description, allowed values, default, value on this channel's
+  match and in the system chain with its source), `!match sync ... diff`
+  (what a sync would change) (760-762).
 - **Match vars:** `!match var`, `match_var_get` / `match_var_set` /
   `match_var_del`. **Groups:** `!ent group`, `group:<name>` selectors and
   group moves.
@@ -1626,8 +1643,16 @@ hardcodes**.
   lines like the GUI (`discord_commands._command_lines`), so an import
   anywhere in a pasted batch keeps its JSON lines.
 - **Formulas:** `summon_template` / `summon_template_near` (mutating),
-  `has_template` / `template_names` (read-only), via `CURRENT_WORKSPACE`
-  (718-726).
+  `has_template` / `template_names` / `template_data(name, path='')`
+  (read-only; the template resolved through `Match.expand_template`, the
+  same expansion `show ... expanded` prints), via `CURRENT_WORKSPACE`
+  (718-726, 764).
+- **Tooling:** `!template list [kind=] [by=] [prefix]`; `!template diff
+  <name> <other | unit=<id>>` (leaf paths of the expanded forms, parts
+  compared by their relative id; the unit form is host-only, as it shows
+  all its vars); `!template spawn ... count=N` (N copies on the free cells
+  nearest the target that fit their bodies, within `near=` if given, all or
+  nothing: `_spawn_many`) (763-764).
 
 ### 7.18 Partial templates
 
