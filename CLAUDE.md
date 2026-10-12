@@ -535,10 +535,20 @@ file-touching command, use `saves_path` AND list it in `_admin_required`.
 **Allowed AST nodes** (`_ALLOWED_NODES`): Module, Expression, Expr, Assign,
 If, Pass, For, Tuple, BinOp, UnaryOp, BoolOp, IfExp, Compare, Call, keyword,
 Attribute, Dict, List, Name, Constant, Load, Store, arithmetic and comparison
-operators (incl. In/NotIn), And, Or. **Banned:** Subscript (except
-`entity[X]`), Lambda, While, comprehensions, Import, Try, With, class/function
-defs, AugAssign, chained/tuple Assign, loop `break`. A Call's function must be
-a bare Name.
+operators (incl. In/NotIn), And, Or; Break / Continue only inside a `for`
+body; Lambda only as the function argument of `map_with` / `filter_with` /
+`sort_by` (`_HOF_FUNCS`: one plain parameter, an expression body validated
+like any formula, never assignable or storable). **Banned:** Subscript
+(except `entity[X]`), Lambda anywhere else, While, comprehensions, Import,
+Try, With, class/function defs, AugAssign, chained/tuple Assign. A Call's
+function must be a bare Name.
+
+**One namespace dict.** A formula runs with its namespace as globals AND
+locals (`exec(code, ns)`, `ns["__builtins__"] = {}`), so a lambda body
+resolves names (`__read`, action locals, a `!func`'s parameters) where its
+formula does. A local or loop variable named with a leading `__` is
+refused (`_check_binding_name`): binding `__builtins__` or `__read` would
+replace the engine's.
 
 **Two modes.** EXPRESSION formulas (conditions: block / opaque / visibility /
 alive / death conditions, watcher conditions, slot conditions, modifier
@@ -563,9 +573,10 @@ unit's position / display name, and nothing can be written at or under them.
 **Loops.** `for v in <call>` iterates only a `_LOOPABLE_FUNCS` function
 (`entities_within`, `parts`, `range`, `each`, `keys`, `team_members`, ...);
 `range(...)` gives counted loops and `each(value)` iterates a list or a dict's
-keys. No `break`: guard the body with a flag, or use a capped helper
-(`entities_in_line_until`, `lowest_var` / `highest_var`). Iterations are
-bounded by `formula_loop_limit`.
+keys. `break` / `continue` work inside a loop body. Iterations are bounded by
+`formula_loop_limit`, which the higher-order helpers charge per item
+(`map_with(items, f)`, `filter_with`, `sort_by(items, f, desc=False)`; `f` is
+a `!func` name or a lambda; banned in `$()`, since a `!func` may write).
 
 **Values.** Coordinates are LISTS (`[3, 3]`): built-in results are listified
 (`_listify`), a tuple literal compiles to a list, stored tuples become lists;
@@ -983,7 +994,8 @@ hardcodes**.
   shown at the end of the command in order (651).
 - **Schedules:** `schedule(delay, ...)` (round-based; raises under ATB),
   `schedule_on(eid, ...)` (turn-based), `cancel_schedule`; a removed unit's
-  schedules go with it.
+  schedules go with it. Read with `schedules_of(eid=None)` (names, loopable)
+  and `schedule_left(name)` (turns / rounds left, None when gone) (766).
 
 ### 7.3 Turns, rounds and ATB
 
@@ -1045,6 +1057,15 @@ hardcodes**.
   counters, `!ent status set` report the stored value), statuses a spawn /
   summon / transform brings (`_cap_unit_status_levels`); lowering it with
   `!status maxlevel` lowers live instances as status changes (740).
+- **Rename / copy:** `!status rename` (`Match.rename_status`: the
+  definition, live instances on units, parts and corpses (their parts
+  too), other definitions' `removes` / `blocked_by`, and `status_immune` /
+  `status_resist` / `__status_immune` / `__status_redirect` anywhere in
+  units' vars, tracked for partial templates; no status hooks; formulas
+  naming it as text are listed in a ⚠️). `!status copy`. Zones, tables
+  and macros rename the same way (`_rename_entry`; `_mentions_note` scans
+  `_match_formula_slots` and macro bodies for the old name); `!macro copy`,
+  `!tile def copy`, `!passive copy <eid> <pid> <dest> [new_pid]` (767).
 - **Prims:** `status_apply` / `status_force` / `status_get` / `status_set` /
   `status_has` / `status_tags` / `status_has_tag` / `statuses_with_tag` /
   `status_resist_of` / `is_status_immune` / counters / dispel / transfer.
@@ -1147,7 +1168,11 @@ hardcodes**.
   current `repeat` iteration) (single-pass substitution); a `$N` past the
   args given becomes empty text, with no refusal (user call): an optional
   arg is tested with `if "$3" != ""`, and a line that needed it fails after
-  the earlier lines ran; control flow `if / elif / else / repeat / end`
+  the earlier lines ran; `${N:default}` / `${name:default}` give defaults,
+  and a `key=value` run arg is NAMED when the body uses `$key` / `${key...}`
+  (`_macro_args`; otherwise it stays positional, user call), while a `$name`
+  with no such arg is left as written (so `!foreach`'s `$id` inside a macro
+  works); control flow `if / elif / else / repeat / end`
   with read-only conditions (a negative `repeat` count is refused);
   `macro_repeat_limit`, `macro_step_limit` (counts
   dispatches AND loop iterations), `macro_recursion_limit`; one undo step
@@ -1168,6 +1193,14 @@ hardcodes**.
 - **`!assert [--as eid] "<expr>" [msg]`**: read-only; a failure raises
   `AssertionStop`, and batch / run / foreach / macro stop on the `ASSERT_STOP`
   sentinel; in an action, `cmd('assert ...')` fails the action (601-603).
+- **`!dry <command ...>`** (hosts only) runs a command, shows its replies and
+  the diff of the channel's match, then restores every match
+  (`_snapshot_all_matches` / `_restore_all_matches`, the `!batch strict`
+  machinery) and each match's RNG state. `_DRY_ACTIVE` makes
+  `dispatch_no_snapshot` refuse, also inside a batch / macro / foreach it
+  runs, what a match rollback can't undo (`_dry_refusal`): server-wide
+  edits, files, template writes, undo / history (kept across a rollback),
+  approvals, `!match delete/pause/resume`, a nested `!dry` (768).
 - **`!again`** reruns the caller's last top-level command in the channel
   (runtime-only `mgr._last_commands`; never records `again` / `as` / clicks;
   refused inside dispatch_no_snapshot; always player-available) (639, 646).

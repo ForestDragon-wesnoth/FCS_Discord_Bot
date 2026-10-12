@@ -2531,6 +2531,10 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     #   schedule_on(eid, delay, body, name=None)    -> name (turns)
     #   cancel_schedule(name)                       -> count removed
     "schedule", "schedule_on", "cancel_schedule",
+    # schedules_of(eid=None) / schedule_left(name): read the pending queue.
+    "schedules_of", "schedule_left",
+    # Higher-order helpers (_HOF_FUNCS): a `!func` name or a lambda.
+    "map_with", "filter_with", "sort_by",
     # Append a custom entry to the match's structured event log (the
     # combat log). log(message) stringifies its arg; recorded when
     # event_log_enabled (the `custom` type bypasses the event_log_events
@@ -2721,6 +2725,8 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
     "summon_template", "summon_template_near", "give_template",
     "kill", "revive", "transform", "revert",
     "schedule", "schedule_on", "cancel_schedule",
+    # They run a `!func` or a lambda per item, and a `!func` may write.
+    "map_with", "filter_with", "sort_by",
     "log",
     "create_zone", "delete_zone", "zone_add_cell", "zone_remove_cell",
     "zone_fill", "zone_shift", "zone_set", "zone_del",
@@ -2737,6 +2743,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
 # function as MUTATING (leave it out of this set).
 ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'has_template', 'template_names', 'template_of', 'template_data',
+    'schedules_of', 'schedule_left',
     'flanking', 'flanking_angle', 'flanking_line', 'nearest_cell',
     'visible_entities', 'random_cell', 'random_free_cell',
     'all_corpses', 'all_entities', 'aoe_origin', 'apply_mods',
@@ -2880,7 +2887,18 @@ _ALLOWED_NODES: Tuple[type, ...] = (
     # in passives, etc. Read-only (no Python sandbox escape).
     ast.In, ast.NotIn,
     ast.And, ast.Or,
+    # Loop control. _validate_tree allows them only inside a `for` body.
+    ast.Break, ast.Continue,
+    # A lambda, allowed only as the function argument of the higher-order
+    # helpers (_HOF_FUNCS); _validate_tree refuses one anywhere else.
+    ast.Lambda, ast.arguments, ast.arg,
 )
+
+# Higher-order helpers: their second argument is a function, a `!func` name
+# or a restricted lambda (one parameter, an expression body, validated like
+# any formula). A lambda is legal ONLY there, so it can't be stored,
+# assigned or returned.
+_HOF_FUNCS: "frozenset[str]" = frozenset({"map_with", "filter_with", "sort_by"})
 
 
 # Functions whose call result is a known list/tuple suitable for a
@@ -2896,7 +2914,7 @@ _ALLOWED_NODES: Tuple[type, ...] = (
 # (cells_in_*). The for-loop target shape must match: a single Name for
 # the id case, a 2-tuple of Names for the coord case.
 _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
-    "template_names",
+    "template_names", "schedules_of", "map_with", "filter_with", "sort_by",
     "range",
     "each",
     "keys",
@@ -3200,8 +3218,18 @@ def _collect_action_locals(tree: ast.AST) -> "frozenset[str]":
         if isinstance(node, ast.Assign):
             for tgt in node.targets:
                 if isinstance(tgt, ast.Name):
+                    _check_binding_name(tgt.id, "a local")
                     locals_set.add(tgt.id)
     return frozenset(locals_set)
+
+
+def _check_binding_name(name: str, what: str) -> None:
+    """Refuse a `__`-prefixed name for a formula binding (a local, a loop
+    variable). The namespace is the formula's globals too, so binding
+    `__builtins__` (or an engine helper like `__read`) would replace it."""
+    if name.startswith("__"):
+        raise FormulaError(f"`{name}` can't be {what}'s name (names starting "
+                           f"with `__` are the engine's).")
 
 
 class _EntityAccessTransformer(ast.NodeTransformer):
@@ -3462,6 +3490,19 @@ class _EntityAccessTransformer(ast.NodeTransformer):
             raise FormulaError("entity[X] must be followed by .path.")
         raise FormulaError("Subscripting is not allowed (only entity[X].path).")
 
+    def visit_Lambda(self, node: ast.Lambda) -> ast.AST:
+        # A lambda's parameters are dynamic identifiers in its body, like
+        # loop variables (`lambda u: entity[u].hp`). The validator decides
+        # where a lambda may appear.
+        names = frozenset(a.arg for a in node.args.args)
+        saved = self.known_params
+        self.known_params = saved | names
+        try:
+            node.body = self.visit(node.body)
+        finally:
+            self.known_params = saved
+        return node
+
     def visit_For(self, node: ast.For) -> ast.AST:
         # Treat for-loop target variables as dynamic identifiers inside
         # the body, so `entity[<loop_var>]` resolves at runtime to the
@@ -3504,6 +3545,7 @@ def _for_target_names(target: ast.AST) -> List[str]:
     tuples, starred targets, attribute targets) is rejected — the
     sandbox keeps loop targets to plain bindings."""
     if isinstance(target, ast.Name):
+        _check_binding_name(target.id, "a loop variable")
         return [target.id]
     if isinstance(target, ast.Tuple):
         names = []
@@ -3513,6 +3555,7 @@ def _for_target_names(target: ast.AST) -> List[str]:
                     "for-loop target tuple must contain only plain names "
                     "(e.g. `for (cx, cy) in cells_in_burst(...)`)."
                 )
+            _check_binding_name(elt.id, "a loop variable")
             names.append(elt.id)
         if not names:
             raise FormulaError(
@@ -3655,23 +3698,54 @@ def _validate_tree(
                     )
                 raise FormulaError(f"Function '{fname}' is not allowed.")
 
-    def _walk(node: ast.AST, scope_params: "frozenset[str]") -> None:
+    def _walk(node: ast.AST, scope_params: "frozenset[str]",
+              in_loop: bool = False) -> None:
+        if isinstance(node, (ast.Break, ast.Continue)):
+            if not in_loop:
+                raise FormulaError(f"`{type(node).__name__.lower()}` is only "
+                                   f"allowed inside a for-loop.")
+            return
+        if isinstance(node, (ast.Lambda, ast.arguments, ast.arg)):
+            raise FormulaError(
+                "A lambda is only allowed as the function argument of "
+                + ", ".join(sorted(_HOF_FUNCS)) + ".")
         _check_node(node, scope_params)
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in _HOF_FUNCS and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Lambda)):
+            lam = node.args[1]
+            a = lam.args
+            if (a.posonlyargs or a.vararg or a.kwonlyargs or a.kwarg
+                    or a.defaults or a.kw_defaults or len(a.args) != 1):
+                raise FormulaError(
+                    f"{node.func.id}: a lambda takes exactly one plain "
+                    f"parameter (`lambda u: ...`).")
+            pname = a.args[0].arg
+            if pname.startswith("__") or pname == "entity" \
+                    or pname in _ALLOWED_FUNCS or pname in _MATCH_FUNC_NAMES:
+                raise FormulaError(f"{node.func.id}: `{pname}` can't be a "
+                                   f"lambda parameter name.")
+            _walk(node.func, scope_params, in_loop)
+            for i, arg in enumerate(node.args):
+                if i != 1:
+                    _walk(arg, scope_params, in_loop)
+            for kw in node.keywords:
+                _walk(kw, scope_params, in_loop)
+            _walk(lam.body, scope_params | {pname})
+            return
         if isinstance(node, ast.For):
             # Validate the iterable + target shape; recurse into the
             # body with the loop variables added to scope. The target
             # node itself does NOT need to be _check_node'd — its
             # Tuple/Name children are loop-binding shapes, not Loads.
-            _check_node(node.iter, scope_params)
-            for child in ast.iter_child_nodes(node.iter):
-                _walk(child, scope_params)
+            _walk(node.iter, scope_params, in_loop)
             _, loop_vars = _validate_for(node, action_mode=action_mode)
             body_scope = scope_params | loop_vars
             for stmt in node.body:
-                _walk(stmt, body_scope)
+                _walk(stmt, body_scope, True)
             return
         for child in ast.iter_child_nodes(node):
-            _walk(child, scope_params)
+            _walk(child, scope_params, in_loop)
 
     _walk(tree, known_params)
 
@@ -3914,7 +3988,12 @@ class FormulaEngine:
         # The area builders only list (and only visit) cells on the map.
         grid = ((self._match.grid_width, self._match.grid_height)
                 if self._match is not None else None)
+        # The namespace is the formula's globals AND locals: one dict, so
+        # a lambda body (#174) resolves names (`__read`, locals, a !func's
+        # parameters) where its formula does; with separate globals a nested
+        # scope sees only the globals. No builtins either way.
         ns: Dict[str, Any] = {
+            "__builtins__": {},
             "__read":  lambda who, path:        self._read(who, path, ctx),
             "__write": lambda who, path, value: self._write(who, path, value, ctx),
             "__read_match":  lambda path:        self._read_match(path),
@@ -6375,9 +6454,34 @@ class FormulaEngine:
                 raise FormulaError("cancel_schedule(name): name must be a string.")
             return match.cancel_scheduled(name)
 
+        def _schedules_of(eid_t: Any = None) -> List[str]:
+            """schedules_of(eid=None): the names of the pending schedules on
+            unit `eid` (schedule_on), or with no unit the match-level ones
+            (schedule), in queue order. Loopable."""
+            eid = None if eid_t in (None, "") else _eid(eid_t)
+            return [str(x.get("name")) for x in match.scheduled
+                    if x.get("eid") == eid]
+
+        def _schedule_left(name: Any) -> Any:
+            """schedule_left(name): how long until the schedule `name` fires:
+            its unit's turns for a schedule_on, rounds for a schedule (0 =
+            this round's start has passed it by), or None when no schedule
+            has that name (the earliest one, if several share it)."""
+            if not isinstance(name, str):
+                raise FormulaError("schedule_left(name): name must be text.")
+            for x in match.scheduled:
+                if x.get("name") == name:
+                    if x.get("kind") == "round":
+                        return max(0, int(x.get("fire_round", 0))
+                                   - int(match.round_number))
+                    return int(x.get("turns_left", 0))
+            return None
+
         ns["schedule"]        = _schedule
         ns["schedule_on"]     = _schedule_on
         ns["cancel_schedule"] = _cancel_schedule
+        ns["schedules_of"]    = _schedules_of
+        ns["schedule_left"]   = _schedule_left
 
         def _log(message: Any) -> bool:
             """log(message): append a custom entry to the match's event
@@ -8013,6 +8117,67 @@ class FormulaEngine:
         ns["can_see_losonly"] = _can_see_losonly
         ns["has_los"] = _has_los
 
+        # Higher-order helpers (_HOF_FUNCS). The function is a `!func` name
+        # or a lambda (the validator allows one only here). Each call is a
+        # loop iteration against formula_loop_limit.
+        def _hof_target(fn_name: str, f: Any) -> Callable[[Any], Any]:
+            if isinstance(f, str):
+                if f not in (getattr(match, "formula_functions", None) or {}):
+                    raise FormulaError(f"{fn_name}: no `!func` named `{f}` "
+                                       f"on this match.")
+                return ns[f]
+            if callable(f) and getattr(f, "__name__", "") == "<lambda>":
+                return f
+            raise FormulaError(f"{fn_name}: the function is a `!func` name "
+                               f"(text) or a lambda (`lambda u: ...`).")
+
+        def _hof_items(fn_name: str, items: Any) -> List[Any]:
+            if not isinstance(items, (list, tuple, dict)):
+                raise FormulaError(f"{fn_name}: the items must be a list or a "
+                                   f"dict (its keys).")
+            return _each(items, limit=size_limit)
+
+        def _map_with(items: Any, f: Any) -> List[Any]:
+            """map_with(items, f): [f(x) for each x in items]; f is a `!func`
+            name or `lambda x: ...`. A dict gives its keys."""
+            fn = _hof_target("map_with", f)
+            out = []
+            for x in _hof_items("map_with", items):
+                _loop_tick()
+                out.append(fn(x))
+            return out
+
+        def _filter_with(items: Any, f: Any) -> List[Any]:
+            """filter_with(items, f): the items x for which f(x) is truthy, in
+            order; f is a `!func` name or `lambda x: ...`."""
+            fn = _hof_target("filter_with", f)
+            out = []
+            for x in _hof_items("filter_with", items):
+                _loop_tick()
+                if fn(x):
+                    out.append(x)
+            return out
+
+        def _sort_by(items: Any, f: Any, desc: Any = False) -> List[Any]:
+            """sort_by(items, f, desc=False): the items ordered by f(x)
+            (stable; desc=True for highest first); f is a `!func` name or
+            `lambda x: ...`. The keys must all be numbers or all text."""
+            fn = _hof_target("sort_by", f)
+            keyed = []
+            for x in _hof_items("sort_by", items):
+                _loop_tick()
+                keyed.append((fn(x), x))
+            try:
+                keyed.sort(key=lambda kv: kv[0], reverse=bool(desc))
+            except TypeError:
+                raise FormulaError("sort_by: the keys must all be numbers or "
+                                   "all text.")
+            return [x for _, x in keyed]
+
+        ns["map_with"] = _map_with
+        ns["filter_with"] = _filter_with
+        ns["sort_by"] = _sort_by
+
         # User-defined formula functions. Each becomes a Python callable
         # in the namespace. The callable binds its arguments to the
         # function's parameters, then runs the (lazily compiled) body
@@ -8054,11 +8219,12 @@ class FormulaEngine:
                         call_ns[pname] = pval
                     self._fn_depth += 1
                     try:
+                        # One dict as globals and locals (see _namespace).
                         if body_code is not None:
-                            exec(body_code, {"__builtins__": {}}, call_ns)
+                            exec(body_code, call_ns)
                         if expr_code is None:
                             return None
-                        return eval(expr_code, {"__builtins__": {}}, call_ns)
+                        return eval(expr_code, call_ns)
                     finally:
                         self._fn_depth -= 1
                 return _call
@@ -8180,7 +8346,7 @@ class FormulaEngine:
         tree = self._prepare(src, "eval", known_funcs=self._known_funcs())
         code = compile(_guard_arith(tree), "<formula>", "eval")
         try:
-            return eval(code, {"__builtins__": {}}, self._namespace(ctx))
+            return eval(code, self._namespace(ctx))
         except FormulaError:
             raise
         except Exception as e:
@@ -8254,8 +8420,7 @@ class FormulaEngine:
             ns.update(action_bindings)
         try:
             if full.body:
-                exec(compile(_guard_arith(full), "<formula>", "exec"),
-                     {"__builtins__": {}}, ns)
+                exec(compile(_guard_arith(full), "<formula>", "exec"), ns)
             if trailing_expr is None:
                 return None
             expr_tree = ast.Expression(body=trailing_expr)
@@ -8268,7 +8433,7 @@ class FormulaEngine:
                 action_mode=action_mode,
             )
             return eval(compile(_guard_arith(expr_tree), "<formula>", "eval"),
-                        {"__builtins__": {}}, ns)
+                        ns)
         except FormulaError:
             raise
         except Exception as e:

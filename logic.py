@@ -11452,6 +11452,108 @@ class Match:
         }
         return self.status_definitions[name]
 
+    # Keys whose values name statuses (token lists, or a resist map's keys),
+    # wherever they sit in a unit's vars: the innate ones, an equipped
+    # item's, a body part's overrides.
+    _STATUS_TOKEN_VARS = ("status_immune", "__status_immune",
+                          "__status_redirect")
+    _STATUS_KEYED_VARS = ("status_resist",)
+
+    @staticmethod
+    def _rename_token(raw: Any, old: str, new: str) -> Any:
+        """A removes / blocked_by / immune field with token `old` renamed,
+        in its own shape (list or comma text); `tag:` tokens untouched."""
+        if isinstance(raw, str):
+            parts = [t.strip() for t in raw.split(",")]
+            if old not in parts:
+                return raw
+            return ", ".join(new if t == old else t for t in parts if t)
+        if isinstance(raw, list):
+            return [new if str(t).strip() == old else t for t in raw]
+        return raw
+
+    def rename_status(self, old: str, new: str) -> Dict[str, int]:
+        """Rename status definition `old` to `new`, with its live instances
+        (units, parts, corpses) and the references that name it: other
+        definitions' removes / blocked_by, and status_immune /
+        status_resist / __status_immune / __status_redirect anywhere in a
+        unit's vars. Formulas naming it as text are left as written (the
+        caller lists them). No status hooks fire: nothing was gained or
+        lost. Returns counts by kind."""
+        if old not in self.status_definitions:
+            raise NotFound(f"No status definition `{old}`.")
+        if not isinstance(new, str) or not new.strip() or new != new.strip() \
+                or any(c.isspace() for c in new) or new.startswith("tag:"):
+            raise VTTError(f"`{new}` can't be a status name (one word, not "
+                           f"`tag:...`).")
+        if new in self.status_definitions:
+            raise DuplicateId(f"Status definition '{new}' already exists.")
+        clash = sorted(e.id for e in self.entities.values()
+                       if old in e.status and new in e.status)
+        if clash:
+            raise VTTError(f"{', '.join(f'`{c}`' for c in clash)} already "
+                           f"carry a `{new}` status as well as `{old}`; "
+                           f"remove one first.")
+        counts = {"instances": 0, "corpses": 0, "definitions": 0, "vars": 0}
+        self.status_definitions = {
+            (new if k == old else k): v
+            for k, v in self.status_definitions.items()}
+        for sdef in self.status_definitions.values():
+            for fld in ("removes", "blocked_by"):
+                renamed = self._rename_token(sdef.get(fld), old, new)
+                if renamed != sdef.get(fld):
+                    sdef[fld] = renamed
+                    counts["definitions"] += 1
+
+        def rename_key(d: Dict[str, Any]) -> Dict[str, Any]:
+            return {(new if k == old else k): v for k, v in d.items()}
+
+        for e in self.entities.values():
+            if old in e.status:
+                e.status = rename_key(e.status)
+                counts["instances"] += 1
+            for path in self._rename_status_refs(e.vars, old, new, ""):
+                counts["vars"] += 1
+                self.track_template_change(e, path, deleted=False)
+        for _x, _y, _cid, corpse in self.all_corpses():
+            bodies = [corpse.get("entity")] + list(corpse.get("parts") or [])
+            hit = False
+            for body in bodies:
+                if not isinstance(body, dict):
+                    continue
+                st = body.get("status")
+                if isinstance(st, dict) and old in st and new not in st:
+                    body["status"] = rename_key(st)
+                    hit = True
+                if self._rename_status_refs(body.get("vars"), old, new, ""):
+                    hit = True
+            counts["corpses"] += hit
+        return counts
+
+    def _rename_status_refs(self, node: Any, old: str, new: str,
+                            prefix: str) -> List[str]:
+        """Rename status `old` in the status-naming vars under `node` (in
+        place); returns the dotted paths changed."""
+        changed: List[str] = []
+        if not isinstance(node, dict):
+            return changed
+        for key in list(node):
+            val = node[key]
+            path = f"{prefix}{key}"
+            if key in self._STATUS_TOKEN_VARS:
+                renamed = self._rename_token(val, old, new)
+                if renamed != val:
+                    node[key] = renamed
+                    changed.append(path)
+            elif key in self._STATUS_KEYED_VARS and isinstance(val, dict):
+                if old in val and new not in val:
+                    node[key] = {(new if k == old else k): v
+                                 for k, v in val.items()}
+                    changed.append(path)
+            elif isinstance(val, dict) and key != TEMPLATE_MARKER:
+                changed += self._rename_status_refs(val, old, new, path + ".")
+        return changed
+
     def remove_status_def(self, name: str) -> None:
         """Delete a status definition. Existing instances of that name on
         entities are left in place (they just lose their tick behaviour
