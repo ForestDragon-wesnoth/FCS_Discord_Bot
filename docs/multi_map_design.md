@@ -202,6 +202,29 @@ share. An even distribution per map is a loop over the maps.
   - Gamerules themselves are never overridden per map. A rule that would
     need to differ between maps becomes a map var named by a rule.
   - Formulas read map vars with `map_var(...)` (context map by default).
+  - **Map-var-name rules (decided).** Each rule names a map var, and
+    changing the rule renames that var on every map. When a map lacks
+    the var, the existing rule in the last column supplies the value,
+    read live, so a system edit reaches every map that hasn't set its own
+    value. Fog stops copying `fog_enabled_by_default` at match creation
+    and reads it live like the others.
+
+    | Rule | Var by default | Holds | Default when missing |
+    |---|---|---|---|
+    | `map_fog_var` | `fog` | on / off | `fog_enabled_by_default` |
+    | `map_fog_memory_var` | `fog_memory` | on / off | `fog_memory_enabled_by_default` |
+    | `map_background_var` | `background` | sprite key | `background_sprite` |
+    | `map_background_mode_var` | `background_mode` | stretch / tile / center | `background_mode` |
+    | `map_borders_var` | `borders` | on / off | `show_borders` |
+    | `map_border_color_var` | `border_color` | colour | `border_color` |
+    | `map_border_opacity_var` | `border_opacity` | 0–100 | `border_opacity` |
+    | `map_hidden_layers_var` | `hidden_layers` | list of layers | none hidden |
+  - **`default_map_vars`** rule for a GM's own map vars (darkness, gravity).
+    It works like `default_entity_vars`: filled into each new map, merged
+    entry by entry down a system chain, and edited with `!defvar map add
+    <path> <value>`.
+  - **The commands stay and write the var:** `!match fog on` (or `!map fog
+    on map=...`), `!map background`, `!map border`, `!map layer`.
   - **Display settings, decided:**
     - map vars: the **background**, the **borders** (show, colour,
       opacity) and the **hidden layers**;
@@ -219,8 +242,15 @@ share. An even distribution per map is a loop over the maps.
   is refused with the current total named. `max_grid_dimension` still
   bounds each map.
 - **`transfer_entity` formula** for cross-match moves (a mutating formula
-  function). It reaches only matches with the same owner as the source:
-  anything wider lets one table spam units into someone else's match. `!ent transfer` remains the command form. The journal stores
+  function). **The destination opts in:** a host (owner or co-host) of
+  match B runs `!match link A`, and from then on formulas in A may send
+  units into B. `!match links` lists what B accepts, and `!match unlink A`
+  revokes it; the links are saved with B. This way players can trigger
+  portals (a portal tile's `on_enter` runs during a player's move, with no
+  host involved), while a host of A with no rights in B can't push units
+  into B. The goal is to stop one table spamming units into another's
+  match. The `!ent transfer` command keeps its own check: the typist must
+  be a host (owner or co-host) of both matches. `!ent transfer` remains the command form. The journal stores
   both matches' changes as stored states.
 - **Map names.** Every match starts with one map named `main`. Names follow
   the id rules and are unique within a match. Renaming a map rewrites
@@ -286,7 +316,6 @@ share. An even distribution per map is a loop over the maps.
   - can the inside see the outer map (a rule, or per-map data)?
   - what happens to the interior's units when the map vehicle dies (below)?
   - could a mount slot point at an inner map?
-- **Map vars:** the names of the map-var-name rules.
 - **When a map vehicle dies** (user: it must vary per vehicle AND per
   occupant; mount deaths are to be revisited the same way later). The
   cases to cover:
