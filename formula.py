@@ -3019,6 +3019,9 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     # fires ONCE with from=(3,3), to=(7,5) — per-step observation is
     # via tile on_enter/on_exit.
     "from_x", "from_y", "to_x", "to_y",
+    # The maps of a move (on_entity_moved, on_entity_changed_map): equal
+    # for an ordinary move.
+    "from_map", "to_map",
     # Action-event bindings. Bound only during on_action_used firing
     # (see Match.fire_action_used); None elsewhere. action_name is
     # the bare action name; action_path is the full vars location
@@ -3986,8 +3989,13 @@ class FormulaEngine:
         cell_limit = _rule_int("formula_cell_limit", _DEFAULT_CELL_LIMIT)
         size_limit = _rule_int("formula_size_limit", _DEFAULT_SIZE_LIMIT)
         # The area builders only list (and only visit) cells on the map.
-        grid = ((self._match.get_map().grid_width, self._match.get_map().grid_height)
-                if self._match is not None else None)
+        # Resolved when a builder runs, so a formula that builds no area
+        # needs no map on a match with several.
+        def _grid():
+            if self._match is None:
+                return None
+            gm = self._match.get_map()
+            return (gm.grid_width, gm.grid_height)
         # The namespace is the formula's globals AND locals: one dict, so
         # a lambda body (#174) resolves names (`__read`, locals, a !func's
         # parameters) where its formula does; with separate globals a nested
@@ -4007,10 +4015,10 @@ class FormulaEngine:
             "__safe_mul": lambda a, b: _safe_mul(a, b, size_limit),
             "__safe_add": lambda a, b: _safe_add(a, b, size_limit),
             "__safe_mod": _safe_mod,
-            "cells_in_burst": lambda *a, **k: _cells_in_burst(*a, limit=cell_limit, bounds=grid, **k),
-            "cells_in_line": lambda *a, **k: _cells_in_line(*a, limit=cell_limit, bounds=grid, **k),
-            "cells_in_cone": lambda *a, **k: _cells_in_cone(*a, limit=cell_limit, bounds=grid, **k),
-            "cells_in_rect": lambda *a, **k: _cells_in_rect(*a, limit=cell_limit, bounds=grid, **k),
+            "cells_in_burst": lambda *a, **k: _cells_in_burst(*a, limit=cell_limit, bounds=_grid(), **k),
+            "cells_in_line": lambda *a, **k: _cells_in_line(*a, limit=cell_limit, bounds=_grid(), **k),
+            "cells_in_cone": lambda *a, **k: _cells_in_cone(*a, limit=cell_limit, bounds=_grid(), **k),
+            "cells_in_rect": lambda *a, **k: _cells_in_rect(*a, limit=cell_limit, bounds=_grid(), **k),
             "range": lambda *a: _range(*a, limit=size_limit),
             "each": lambda v: _each(v, limit=size_limit),
             "replace": lambda *a: _replace(*a, limit=size_limit),
@@ -6513,7 +6521,7 @@ class FormulaEngine:
 
         def _zone_exists(name: Any) -> bool:
             """zone_exists(name): True iff a zone with this name exists."""
-            return match.get_map().has_zone(_zone_name(name, "zone_exists"))
+            return match.has_zone(_zone_name(name, "zone_exists"))
 
         def _zones_at(x: Any, y: Any) -> list:
             """zones_at(x, y): list of zone names covering cell (x,y)
@@ -6524,7 +6532,7 @@ class FormulaEngine:
         def _cell_in_zone(x: Any, y: Any, name: Any) -> bool:
             """cell_in_zone(x, y, name): True iff (x,y) is in the zone."""
             xi, yi = _zone_xy(x, y, "cell_in_zone")
-            return match.get_map().cell_in_zone(xi, yi, _zone_name(name, "cell_in_zone"))
+            return match.cell_in_zone(xi, yi, _zone_name(name, "cell_in_zone"))
 
         def _in_zone(eid_t: Any, name: Any) -> bool:
             """in_zone(eid, name): True iff the entity's current cell is
@@ -6545,16 +6553,16 @@ class FormulaEngine:
         def _zone_cells(name: Any) -> list:
             """zone_cells(name): the zone's cells as [x,y] pairs (sorted;
             loop with `for (cx,cy) in zone_cells(name)`)."""
-            return match.get_map().zone_cell_list(_zone_name(name, "zone_cells"))
+            return match.zone_cell_list(_zone_name(name, "zone_cells"))
 
         def _zone_names() -> list:
             """zone_names(): every zone name (sorted; loopable)."""
-            return sorted(match.get_map().zones.keys())
+            return match.zone_names()
 
         def _zone_size(name: Any) -> int:
             """zone_size(name): number of cells in the zone (0 if it
             doesn't exist)."""
-            z = match.get_map().zones.get(_zone_name(name, "zone_size"))
+            z = match.find_zone(_zone_name(name, "zone_size"))
             return len(z["cells"]) if z is not None else 0
 
         def _zone_get(name: Any, path: Any) -> Any:
@@ -6563,7 +6571,7 @@ class FormulaEngine:
             if not isinstance(path, str) or not path:
                 raise FormulaError("zone_get(name, path): path must be a non-empty string.")
             try:
-                return match.get_map().zone_get_path(_zone_name(name, "zone_get"), path)
+                return match.zone_get_path(_zone_name(name, "zone_get"), path)
             except VTTError as ex:
                 raise FormulaError(str(ex))
 
@@ -6572,7 +6580,7 @@ class FormulaEngine:
             resolves on the zone (False on a missing zone)."""
             if not isinstance(path, str) or not path:
                 raise FormulaError("zone_has(name, path): path must be a non-empty string.")
-            return match.get_map().zone_has_path(_zone_name(name, "zone_has"), path)
+            return match.zone_has_path(_zone_name(name, "zone_has"), path)
 
         def _zone_keys(name: Any, path: Any = "") -> list:
             """zone_keys(name, path=""): keys at a dotted data path (""
@@ -6580,13 +6588,13 @@ class FormulaEngine:
             zn = _zone_name(name, "zone_keys")
             if not isinstance(path, str):
                 raise FormulaError("zone_keys(name, path): path must be a string.")
-            z = match.get_map().zones.get(zn)
+            z = match.find_zone(zn)
             if z is None:
                 raise FormulaError(f"zone_keys: zone '{zn}' not found.")
             cur: Any = z["data"]
             if path:
                 try:
-                    cur = match.get_map().zone_get_path(zn, path)
+                    cur = match.zone_get_path(zn, path)
                 except VTTError as ex:
                     raise FormulaError(str(ex))
             if not isinstance(cur, dict):
@@ -6603,7 +6611,7 @@ class FormulaEngine:
             if not isinstance(path, str) or not path:
                 raise FormulaError("zone_set(name, path, value): path must be a non-empty string.")
             try:
-                match.get_map().zone_set_path(_zone_name(name, "zone_set"), path, value)
+                match.zone_set_path(_zone_name(name, "zone_set"), path, value)
             except VTTError as ex:
                 raise FormulaError(str(ex))
             return value
@@ -6614,10 +6622,10 @@ class FormulaEngine:
             if not isinstance(path, str) or not path:
                 raise FormulaError("zone_del(name, path): path must be a non-empty string.")
             zn = _zone_name(name, "zone_del")
-            if not match.get_map().zone_has_path(zn, path):
+            if not match.zone_has_path(zn, path):
                 return False
             try:
-                match.get_map().zone_del_path(zn, path)
+                match.zone_del_path(zn, path)
             except VTTError as ex:
                 raise FormulaError(str(ex))
             return True
@@ -6626,18 +6634,18 @@ class FormulaEngine:
             """create_zone(name): make an empty zone. Returns True if
             created, False if it already existed."""
             zn = _zone_name(name, "create_zone")
-            if match.get_map().has_zone(zn):
+            if match.has_zone(zn):
                 return False
-            match.get_map().create_zone(zn)
+            match.create_zone(zn)
             return True
 
         def _delete_zone(name: Any) -> bool:
             """delete_zone(name): remove a zone entirely. Returns True iff
             it existed."""
             zn = _zone_name(name, "delete_zone")
-            if not match.get_map().has_zone(zn):
+            if not match.has_zone(zn):
                 return False
-            match.get_map().delete_zone(zn)
+            match.delete_zone(zn)
             return True
 
         def _zone_add_cell(name: Any, x: Any, y: Any) -> bool:
@@ -6645,7 +6653,7 @@ class FormulaEngine:
             needed). Returns True iff newly added. Off-grid raises."""
             xi, yi = _zone_xy(x, y, "zone_add_cell")
             try:
-                return match.get_map().zone_add_cell(_zone_name(name, "zone_add_cell"), xi, yi)
+                return match.zone_add_cell(_zone_name(name, "zone_add_cell"), xi, yi)
             except VTTError as ex:
                 raise FormulaError(str(ex))
 
@@ -6654,7 +6662,7 @@ class FormulaEngine:
             it was present."""
             xi, yi = _zone_xy(x, y, "zone_remove_cell")
             try:
-                return match.get_map().zone_remove_cell(_zone_name(name, "zone_remove_cell"), xi, yi)
+                return match.zone_remove_cell(_zone_name(name, "zone_remove_cell"), xi, yi)
             except VTTError as ex:
                 raise FormulaError(str(ex))
 
@@ -6665,7 +6673,7 @@ class FormulaEngine:
             ax, ay = _zone_xy(x1, y1, "zone_fill")
             bx, by = _zone_xy(x2, y2, "zone_fill")
             try:
-                return match.get_map().zone_fill_rect(_zone_name(name, "zone_fill"), ax, ay, bx, by)
+                return match.zone_fill_rect(_zone_name(name, "zone_fill"), ax, ay, bx, by)
             except VTTError as ex:
                 raise FormulaError(str(ex))
 
@@ -6675,7 +6683,7 @@ class FormulaEngine:
             count retained. The 'gas cloud drifts' primitive."""
             ddx, ddy = _zone_xy(dx, dy, "zone_shift")
             try:
-                return match.get_map().zone_shift(_zone_name(name, "zone_shift"), ddx, ddy)
+                return match.zone_shift(_zone_name(name, "zone_shift"), ddx, ddy)
             except VTTError as ex:
                 raise FormulaError(str(ex))
 
@@ -6708,7 +6716,7 @@ class FormulaEngine:
         def _zone_anchor_of(name: Any) -> str:
             """zone_anchor_of(name): the entity id a zone is anchored to,
             or '' if it isn't an aura (or doesn't exist)."""
-            z = match.get_map().zones.get(_zone_name(name, "zone_anchor_of"))
+            z = match.find_zone(_zone_name(name, "zone_anchor_of"))
             anc = z.get("anchor") if isinstance(z, dict) else None
             return str(anc) if anc else ""
 
@@ -7404,7 +7412,7 @@ class FormulaEngine:
             alive entity ids inside the cone (see cells_in_cone), sorted
             by (distance from origin, id)."""
             cells = set(_cells_in_cone(x, y, direction, length, half_angle,
-                                       limit=cell_limit, bounds=grid))
+                                       limit=cell_limit, bounds=_grid()))
             cx0 = _coord_int(x, "entities_in_cone", "x")
             cy0 = _coord_int(y, "entities_in_cone", "y")
             # Order by NEAREST covered cell to the origin (so a large entity
@@ -7423,7 +7431,7 @@ class FormulaEngine:
             axis-aligned rectangle (see cells_in_rect), sorted by
             (x, y, id)."""
             cells = set(_cells_in_rect(x1, y1, x2, y2, limit=cell_limit,
-                                       bounds=grid))
+                                       bounds=_grid()))
             return [eid for (_x, _y, eid) in sorted(_alive_at(cells))]
 
         def _entities_in_line_until(x1: Any, y1: Any, x2: Any, y2: Any,
@@ -7753,10 +7761,10 @@ class FormulaEngine:
             when any of its cells is inside. None for a zone with no cells
             (e.g. a suspended aura)."""
             _, e = _resolve_entity(eid_t, "zone_distance")
-            if not isinstance(zone, str) or zone not in match.get_map().zones:
+            if not isinstance(zone, str) or not match.has_zone(zone):
                 raise FormulaError(f"zone_distance: no zone named {zone!r}.")
             _distance(0, 0, 0, 0, mode)        # validates the metric name
-            cells = match.get_map().zones[zone].get("cells") or ()
+            cells = match.find_zone(zone).get("cells") or ()
             if not cells:
                 return None
             return min(match.cell_entity_distance(cx, cy, e, mode)
@@ -7933,7 +7941,7 @@ class FormulaEngine:
             rectangle (corners in any order) — the area random_cell /
             random_free_cell pick from."""
             if len(args) == 1 and isinstance(args[0], str):
-                z = match.get_map().zones.get(args[0])
+                z = match.find_zone(args[0])
                 if z is None:
                     raise FormulaError(f"{fname}: no zone named {args[0]!r}.")
                 return {c for c in (z.get("cells") or ())

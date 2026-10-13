@@ -38,7 +38,7 @@ _FREE_SLOTS = {
     "args", "tokens", "label", "user", "server", "metric",
     "anchor", "word", "type", "template_text", "winner", "stat", "pid",
     "passive_id", "path", "var.path", "key", "dest_path", "stash_path",
-    "shape args", "cmd1", "cmd2", "file", "seed", "pos",
+    "shape args", "cmd1", "cmd2", "file", "seed", "pos", "new_map",
 }
 # Placeholders that name a unit.
 _ENTITY_SLOTS = {
@@ -325,6 +325,8 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
                 paths += _entity_ids(mgr, ctx)
             return paths
         return _entity_ids(mgr, ctx) if slot == "template_ref" else []
+    if slot == "map":
+        return list(m.maps) if m is not None else []
     if root == "system" and slot in ("parent", "other"):
         # `!system parent <name> <parent|none>` names a system, not a unit.
         return sorted(mgr.systems)
@@ -426,7 +428,7 @@ _SYNC_LIBS = {"aliases": "aliases", "tiles": "tile_templates",
 
 # Placeholders _slot_names knows a source for (used to tell slots from
 # literal words inside groups).
-_KIND_SLOTS = {"name", "template", "template_ref", "partial", "system",
+_KIND_SLOTS = {"name", "template", "template_ref", "partial", "system", "map",
                "dest_match", "rule", "team", "when", "hook_name", "dir",
                "region", "layers", "cmd", "command", "subcommand", "token",
                "slot", "corpse_id", "key", "path", "sub"}
@@ -486,8 +488,13 @@ def _command_candidates(words: List[str], word: str, mgr, ctx) -> List[str]:
                                        mgr, ctx))
             except Exception:
                 pass             # a name source that can't be read: skip
+    if root == "map" and not args and m is not None:
+        out |= set(m.maps)       # `!map <name>` renders that map
     if "=" not in word:
         out |= {f"{k}=" for k in walk.keys}
+    elif (word.lower().startswith("map=") and "map" in walk.keys
+          and m is not None):
+        out |= {f"map={n}" for n in m.maps}
     return sorted(out)
 
 

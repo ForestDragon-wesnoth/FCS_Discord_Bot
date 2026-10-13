@@ -293,7 +293,8 @@ class DiscordCtxWrapper:
                 await _retire_board(ck, entry, entry.get("match_id", "?"))
 
     async def post_scene_image(self, m, pov, highlights=None,
-                               hidden=None, coords=None, legend=None) -> str:
+                               hidden=None, coords=None, legend=None,
+                               mp=None) -> str:
         """Render the match's graphics scene to a PNG and post it as an
         attachment. Called by `!map image` via getattr (Discord-only — other
         surfaces lack this method). Respects the resolved POV + the channel's
@@ -306,7 +307,8 @@ class DiscordCtxWrapper:
                     "(`pip install Pillow`).")
         mode = str(m.rules.get("viewport_mode", "auto"))
         enabled = mode != "off"
-        viewport = m.resolve_viewport(self.channel_key, enabled=enabled)
+        mp = mp or m.channel_map(self.channel_key, pov)
+        viewport = m.resolve_viewport(self.channel_key, enabled=enabled, mp=mp)
         try:
             import asyncio
             # Build the scene HERE (it reads the match) and only draw pixels
@@ -315,7 +317,8 @@ class DiscordCtxWrapper:
                                         highlights=highlights,
                                         hidden_layers=hidden, coords=coords,
                                         legend=(m.map_legend_enabled
-                                                if legend is None else legend))
+                                                if legend is None else legend),
+                                        mp=mp)
             data = await asyncio.to_thread(
                 render_scene_png, scene, _get_sprite_loader(self._mgr), cell)
         except RuntimeError as e:
@@ -667,14 +670,12 @@ def _board_render(m, channel_key: str) -> Tuple[str, bool]:
     pov = m.channel_pov(channel_key)
     mode = str(m.rules.get("viewport_mode", "auto"))
     enabled = mode != "off"   # Discord is viewport_capable; auto => on
-    viewport = m.resolve_viewport(channel_key, enabled=enabled)
+    mp = m.channel_map(channel_key, pov)
+    viewport = m.resolve_viewport(channel_key, enabled=enabled, mp=mp)
     legend = bool(getattr(m, "map_legend_enabled", False))
     colorize = bool(getattr(m, "color_enabled", True))
-    header = ""
-    if viewport:
-        vx, vy, vw, vh = viewport
-        header = (f"🗺️ viewport ({vx},{vy})–({vx + vw - 1},{vy + vh - 1}) "
-                  f"of {m.get_map().grid_width}×{m.get_map().grid_height}\n")
+    header = _board_header(m, mp, viewport) + ("\n" if len(m.maps) > 1
+                                              or viewport else "")
     coords = m.coords_on()
     # Richest first; each fallback drops one optional layer (the coordinate
     # rulers first: two-plus lines and a margin on every row).
@@ -683,7 +684,7 @@ def _board_render(m, channel_key: str) -> Tuple[str, bool]:
     text = ""
     for col, leg, crd in dict.fromkeys(attempts):
         body = m.render_ascii(pov, colorize=col, viewport=viewport, legend=leg,
-                              coords=crd)
+                              coords=crd, mp=mp)
         text = f"{header}```{'ansi' if col else ''}\n{body}\n```"
         if len(text) <= DISCORD_MAX_CONTENT:
             if (col, leg, crd) != attempts[0]:
@@ -711,18 +712,27 @@ async def _board_image(m, channel_key: str, mgr=None):
     pov = m.channel_pov(channel_key)
     vmode = str(m.rules.get("viewport_mode", "auto"))
     enabled = vmode != "off"
-    viewport = m.resolve_viewport(channel_key, enabled=enabled)
+    mp = m.channel_map(channel_key, pov)
+    viewport = m.resolve_viewport(channel_key, enabled=enabled, mp=mp)
     # Scene on the event loop (reads the match), pixels in a worker thread.
     scene, cell = scene_for_png(m, pov_team=pov, viewport=viewport,
-                                legend=bool(m.map_legend_enabled))
+                                legend=bool(m.map_legend_enabled), mp=mp)
     data = await asyncio.to_thread(
         render_scene_png, scene, _get_sprite_loader(mgr), cell)
-    header = ""
+    return _board_header(m, mp, viewport), data, bool(viewport)
+
+
+def _board_header(m, mp, viewport) -> str:
+    """A board's header line: the map's name on a match with several, and
+    the viewport window when one is engaged ("" when neither applies)."""
+    bits = []
+    if len(m.maps) > 1:
+        bits.append(f"map `{mp.name}`")
     if viewport:
         vx, vy, vw, vh = viewport
-        header = (f"🗺️ viewport ({vx},{vy})–({vx + vw - 1},{vy + vh - 1}) "
-                  f"of {m.get_map().grid_width}×{m.get_map().grid_height}")
-    return header, data, bool(viewport)
+        bits.append(f"viewport ({vx},{vy})–({vx + vw - 1},{vy + vh - 1}) "
+                    f"of {mp.grid_width}×{mp.grid_height}")
+    return ("🗺️ " + " · ".join(bits)) if bits else ""
 
 
 async def _apply_board(message, m, channel_key: str, mgr: MatchManager) -> bool:

@@ -59,28 +59,30 @@ class GuiCtx:
         self.app.log(message)
 
     def show_scene_view(self, pov, hidden=None, coords=None,
-                        legend=None) -> None:
+                        legend=None, mp=None) -> None:
         """A `!map` with its own view options (`as=`, `full`, `hide=`,
-        `coords=`, `legend=`): the canvas draws that view until the next
-        command, as the ASCII reply does."""
+        `coords=`, `legend=`, a map): the canvas draws that view until the
+        next command, as the ASCII reply does."""
         self.app._view = {"pov": pov, "hidden": hidden, "coords": coords,
-                          "legend": legend}
+                          "legend": legend,
+                          "map": mp.name if mp is not None else None}
 
     async def post_scene_image(self, m, pov, highlights=None, hidden=None,
-                               coords=None, legend=None) -> str:
+                               coords=None, legend=None, mp=None) -> str:
         """`!map image` (or a plain `!map` in image render mode): the
         canvas is the image here, so draw that view on it until the next
         command."""
-        self.show_scene_view(pov, hidden, coords, legend)
+        self.show_scene_view(pov, hidden, coords, legend, mp)
         if highlights:
             self.app._preview = highlights
         return ("🖼 Drawn on the canvas — "
                 + (f"`{pov}`'s view." if pov is not None else "everything."))
 
-    def show_preview(self, highlights) -> None:
+    def show_preview(self, highlights, mp=None) -> None:
         """`!map preview` hook: draw these highlight squares on the canvas
-        (over units) until the next command runs."""
+        (over units, on map `mp`) until the next command runs."""
         self.app._preview = highlights
+        self.app._preview_map = mp.name if mp is not None else None
 
     async def prompt_choice(self, prompt, options, lo, hi):
         from tkinter import simpledialog
@@ -135,6 +137,7 @@ class GuiApp:
         self.loader = SpriteLoader(
             sprites_dir, first=self.workspaces.storage.sprites_dir(LOCAL_WORKSPACE))
         self._preview = None  # highlight squares from `!map preview`
+        self._preview_map = None  # ... and the map they are on
         self._view = None     # a `!map` / `!map image` view, until the next command
         self.loop = asyncio.new_event_loop()
         self._photo = None  # keep a ref so Tk doesn't GC the image
@@ -482,18 +485,25 @@ class GuiApp:
         # The canvas shows the GUI channel's view, as `!map` would: the
         # channel's bound POV, or an `!as view <team>` preview (fog drawn).
         view = getattr(self, "_view", None)
-        hidden = coords = legend = None
+        hidden = coords = legend = map_name = None
         if view is not None:
             pov, hidden, coords = view["pov"], view["hidden"], view["coords"]
             legend = view.get("legend")
+            map_name = view.get("map")
         else:
+            map_name = getattr(self, "_preview_map", None)
             try:
                 pov = _view_pov(self.ctx, m, [])
             except Exception:
                 pov = None
         if legend is None:
             legend = bool(getattr(m, "map_legend_enabled", False))
-        scene = m.render_scene(pov_team=pov, hidden_layers=hidden, legend=legend)
+        # The map drawn: the one the view named, else the channel's map.
+        mp = m.maps.get(map_name) if map_name else None
+        if mp is None:
+            mp = m.channel_map(getattr(self.ctx, "channel_key", None), pov)
+        scene = m.render_scene(pov_team=pov, hidden_layers=hidden, legend=legend,
+                               mp=mp)
         if coords is not None:
             scene["coords"] = coords
         if getattr(self, "_preview", None):
@@ -527,6 +537,7 @@ class GuiApp:
         self._remember(block)
         self._last_tab = None
         self._preview = None  # a `!map preview` lasts until the next command
+        self._preview_map = None
         self._view = None     # so does a `!map` view
         # One command per `!` line; a `!template import <name> <json>`
         # continues over the lines that follow it without a `!` (pasted

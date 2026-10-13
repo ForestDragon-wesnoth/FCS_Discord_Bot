@@ -1213,15 +1213,16 @@ hardcodes**.
   dispatches AND loop iterations), `macro_recursion_limit`; one undo step
   (425-426, 544-546, 555-556).
 - **`!foreach <selector> ; <cmd> [; <cmd> ...]`**: the `!find` selector
-  grammar; `$id $name $x $y $team $i $n` substituted single-pass; targets
+  grammar; `$id $name $x $y $team $map $i $n` substituted single-pass; targets
   resolved before any command runs; one undo step. Host-gated, EXCEPT that a
   sweep whose every inner command is player-available downgrades to `all`
   (`_foreach_read_only`, default-deny: aliases, `$` in the command position,
   self-dispatching commands and elevated args keep it gated). A non-host's
   sweep skips units their POV can't see (486-490, 557-558, 564-565).
 - **`!find`** selectors: `var<op>value`, `status:`, `group:`, `action:`,
-  `near:<eid>:<r>` (a unit the query POV can't see reads as missing),
-  `within:<x>:<y>:<r>`, a leading `!` negates, `|`
+  `map:`, `near:<eid>:<r>` (a unit the query POV can't see reads as
+  missing; only its map), `within:<x>:<y>:<r>` (on one map, §7.8), a
+  leading `!` negates, `|`
   alternatives (an alternative that doesn't parse reuses the previous kind and
   key); `show:<csv>` (incl. `status`), `sort:<var>[:desc]`, `count`, `ids`
   (536-538, 631, 694-695).
@@ -1245,11 +1246,12 @@ hardcodes**.
 
 ### 7.8 Geometry, movement and blocking
 
-- **Maps** (`Map`, step 1 of `docs/multi_map_design.md`): a match holds
-  its grids in `Match.maps` (name -> Map, in creation order; a new match
-  has one, `main`, `DEFAULT_MAP_NAME`). A Map is the grid alone: size,
-  tiles, zones (stored per map), fog memory (`explored`) and reveals, with
-  the methods that need nothing else (`in_bounds`, `tile_*`, `zone_*`,
+- **Maps** (`Map`; `docs/multi_map_design.md`, steps 1-2a built): a match
+  holds its grids in `Match.maps` (name -> Map, in creation order, saved
+  as `map_order` since files sort keys; a new match has one, `main`,
+  `DEFAULT_MAP_NAME`). A Map is the grid alone: size, tiles, zones (stored
+  per map), fog memory (`explored`), reveals and map vars, with the
+  methods that need nothing else (`in_bounds`, `tile_*`, `zone_*`,
   `zones_at`, `to_dict` / `from_dict`). Units stay in the match's one pool
   and name their map in `Entity.map` (set by `spawn(..., map_name=)`;
   parts, segments, revived corpses and clones take their parent's /
@@ -1259,11 +1261,69 @@ hardcodes**.
   so a call site that forgot its map fails loudly instead of using the
   wrong one), `_map_for(mp, e)` (given, else the unit's, else the only
   one). Occupancy, sight, fog, blocking, hooks and rendering all filter
-  units by map; a team sees a map only through its units on it. The
-  command and formula layers still call `get_map()` (step 2 adds `map=`).
-  Corpses: `find_corpse(id)` -> (x, y, corpse, map) on any map,
-  `all_corpses(mp)` one map, `every_corpse()` all of them. Templates,
-  statblocks and summon snapshots strip `map` like x / y.
+  units by map; a team sees a map only through its units on it. Corpses:
+  `find_corpse(id)` -> (x, y, corpse, map) on any map, `all_corpses(mp)`
+  one map, `every_corpse()` all of them. Templates, statblocks and summon
+  snapshots strip `map` like x / y. Formulas still call `get_map()` (step
+  2b adds `map=` there); the area builders resolve their bounds only when
+  called, so a formula that builds no area works on any match.
+- **Map management** (`!map new <name> <w> <h> | list | delete | rename |
+  copy | use | var`, `_map_manage`): names follow `check_map_name`; the
+  `!map` subcommand words plus all / view / clear / full / none are
+  reserved (`MAP_RESERVED_NAMES`, drift-guarded), so `!map <name>`
+  renders that map. `match_cell_limit` (ceiling) bounds the summed area
+  (new, copy, a growing resize). `delete` follows `map_delete_mode`
+  (refuse lists the units; kill kills them in id order, then drops tiles,
+  zones, corpses, fog and channel state naming the map); the last map
+  can't go. `rename` rewrites every stored `[x, y, map]` list naming it
+  (`_rename_map_coords`: unit vars, corpses, match vars, team data, tiles,
+  zones). `copy` takes size, tiles (no corpses), zones and map vars,
+  renaming each zone `<zone>_<new>` and leaving auras with their units.
+  Zone names are unique across the match (`Match.zone_map`, `find_zone`
+  and the zone wrappers find a zone's map by name; creating one needs a
+  map on a match with several) (782-785).
+- **Map vars and settings:** `!map var set|get|del|list` (free-form,
+  dotted). Every per-map display setting IS a map var: fog, fog memory,
+  background (+ mode), borders (+ colour, opacity), hidden layers, named
+  by `MAP_VAR_NAME_RULES` (`map_fog_var`, ...); a map without the var
+  reads the old rule live (`fog_enabled_by_default`, `show_borders`, ...,
+  `Match.map_setting`). Each map remembers its var names (`Map.var_names`,
+  stamped at creation by `fill_default_map_vars`); a rule change moves
+  the var on every map (`sync_map_var_names`, `var_name_collision`;
+  `_rename_system_map_var` refuses a shared name or, under refuse, a taken
+  one, and moves the `default_map_vars` key). `default_map_vars` (MERGE
+  rule, `!defvar map`) fills a NEW map's missing vars (786-788).
+- **Which map a command means** (`vtt_commands._resolve_maps`): `map=`
+  (a name, `a,b`, `all`, `view`) > the unit the command names > the only
+  map > the channel's map (`Match.channel_map`: `!map use <name>`, else
+  the followed map). `strict` callers (tile edits, zone creation,
+  `!reveal_fog`, setting writes, `!ent add`, `!template spawn`) refuse the
+  followed-map guess with the map list and syntax; a `!map use` choice
+  satisfies them. `many` callers fan out (`_fan_out`: one run per map
+  under `Map <name>:`, a map's ❌ doesn't stop the rest); placements take
+  one map. Replies name the map on a multi-map match (`_on_map`); so do
+  `!ent info` (`{map_shown}` in entity_info_format) and `!ent dump`
+  (789).
+- **Following** (`Match.followed_map`): each turn start records the actor
+  per team and for the omniscient view (`last_actors`, saved); a board
+  follows where that unit stands now, else its last map (a cross-map move
+  updates the record), else before any turn the team's first unit, else
+  the first map. `channel_maps` (`!map use`) and `channel_views` (cameras,
+  per map) are per channel and follow undo like the cameras (790).
+- **Cross-map moves** (`Match.move_to_map`, `!ent tp <id> <x> <y>
+  [<map>]`): the whole carried body (`carried_body`: parts, riders,
+  segments resettled behind the head, located parts at their anchor
+  offset) and its auras move; all or nothing (footprint and every located
+  part must fit). Exit hooks on the old map, enter / stop on the new,
+  `on_entity_moved` (`from_map` / `to_map`, equal for an ordinary move),
+  then `on_entity_changed_map`. `!ent add` / `!ent clone` / `!template
+  spawn` take `map=` (791, 793).
+- **Queries:** units on different maps have no distance (`!dist`
+  refuses); `!find` / `!foreach` take a `map:<name>` selector, `near:`
+  matches only the reference's map, `within:` reads its cell on the
+  `map:` word's map else the channel's (`_bind_find_maps`); `!foreach`
+  substitutes `$map` (792). Death / revive line tags carry the map
+  (`UNIT_LINE_TAG` `<match>|<unit>|<x>|<y>|<map>`).
 - **Grid:** square cells, 1-based; `max_grid_dimension` (default 500, owner
   ceiling) checked on create and resize. `!map resize <w> <h> [anchor]`
   shifts everything coordinate-bearing by the anchor's offset (units, tiles,
@@ -1463,11 +1523,12 @@ hardcodes**.
   All through `Match._visibility_visible`; `entity_visible_to` etc. Your own
   team's units (root body's team) are always visible to you while
   `pov_own_team_visible` is on (`own_team_unit`).
-- **Fog** (`Match.fog_enabled`, per match, `!match fog on|off`): a team sees
+- **Fog** (per map: the `fog` map var, `!match fog on|off [map=]`, §7.8;
+  `Match.fog_on(mp)`): a team sees
   the union of cells within each alive member's `fog_vision_radius` var
   (metric `fog_range_mode`), from every footprint cell. With `fog_los` the
   fog also needs a clear line. Memory (`!match fog memory on|off`,
-  `Match.explored`, `fog_memory_mode` full / terrain). `!reveal_fog <team>
+  the map's `explored`, `fog_memory_mode` full / terrain). `!reveal_fog <team>
   ...` adds reveals (`all`, `at`, `rect`, `around`, `cone <x> <y> <dir>
   <len> [half_angle]`, `line <x1> <y1> <x2> <y2>`: the cells_in_*
   builders), optionally temporary (`turns=N`, keyed to whichever clock
@@ -1558,10 +1619,11 @@ hardcodes**.
   path over the same predicates) emits a declarative model; the engine never
   loads an image. Sprite keys mirror glyphs (`sprite` / `sprites.<facing>`,
   `sprite_mirror` fills missing facings, `fallback_sprite`), tile / zone /
-  corpse sprites, background (`background_sprite` default `ground_default`,
-  `background_mode`, placed on the whole grid), fog (`fog_sprite` default
-  `fog_default`, `fog_opacity`), borders (`show_borders`, per-match `!map
-  border`, per-tile overrides), `sprite_mode` (stretch default / single /
+  corpse sprites, background (per-map var, `!map background`; else
+  `background_sprite` default `ground_default` and `background_mode`,
+  placed on the whole grid), fog (`fog_sprite` default `fog_default`,
+  `fog_opacity`), borders (per-map vars, `!map border`; else
+  `show_borders`; per-tile overrides), `sprite_mode` (stretch default / single /
   tile), z-layers (`sprite_layer_*`, per-item `sprite_layer`), overlays
   (status definition / instance `sprite`, the `overlays` var), corpse look
   (`corpse_sprite(s)` > `corpse_default_sprite` > the living sprite greyed by
@@ -1611,8 +1673,8 @@ hardcodes**.
   `refresh_match_rules` (any `!system set` / `!system access`, which also
   refreshes the matches of every system inheriting from it); per-match
   settings that must survive a refresh live in their own fields
-  (`access_overrides`, `fog_enabled`, `fog_memory`, `border_*`,
-  `render_mode`, `map_coords`, ...). Rules are left out of match files on
+  (`access_overrides`, `render_mode`, `map_coords`, ...; per-map
+  settings are map vars, §7.8). Rules are left out of match files on
   disk and rebuilt from the system on load / restore.
 - **System inheritance** (user design: live link, everything inherited,
   per-entry merge, refuse deleting a parent, multi-level, hiding allowed):
@@ -1960,7 +2022,11 @@ rejected already. Update this section in the PR that resolves an item.
   the user over a long discussion; the agreed decisions, deferred points, build
   order and test requirements (20+ scenarios) are in
   `docs/multi_map_design.md`. Read it whole before touching either; ask
-  before deviating from it.
+  before deviating from it. Built: step 1 (the Map model) and step 2a
+  (management, map vars, command map resolution, following, cross-map
+  moves; §7.8). Next: 2b formulas (`map=`, `[x, y, map]` coordinates,
+  `map_of`, map var functions), 2c channels / unseen maps / roster,
+  2d `transfer_entity` and `!match link`, then nested maps.
 - **Later:** graphics mouse select / drag and
   animation ("foreseeable future"); a per-entity ATB threshold; arbitrary /
   L-shaped footprints and footprint rotation; per-rider footprints inside a

@@ -758,7 +758,8 @@ def scene_for_png(match, pov_team: Optional[str] = None,
                   highlights: Optional[list] = None,
                   hidden_layers: Optional[set] = None,
                   coords: Optional[bool] = None,
-                  legend: bool = False) -> Tuple[Dict[str, Any], int]:
+                  legend: bool = False, mp: Any = None
+                  ) -> Tuple[Dict[str, Any], int]:
     """(scene model, cell size) for a PNG render — the part that READS THE
     MATCH. render_scene switches on the match's shared vision memo while it
     runs, so running it in a worker thread while commands mutate the match
@@ -772,7 +773,7 @@ def scene_for_png(match, pov_team: Optional[str] = None,
         except (TypeError, ValueError):
             cell_size = 100
     scene = match.render_scene(pov_team=pov_team, hidden_layers=hidden_layers,
-                               viewport=viewport, legend=legend)
+                               viewport=viewport, legend=legend, mp=mp)
     if coords is not None:
         scene["coords"] = bool(coords)
     if highlights:
