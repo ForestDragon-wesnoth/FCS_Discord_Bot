@@ -874,6 +874,12 @@ return):
 - **Features:** as many questions as possible UPFRONT, then build everything
   certain, and save questions that come up during the work for the end. Ask
   mid-way only when the answer blocks development or testing.
+- **Large features** (a subsystem spanning several PRs, like multiple maps):
+  settle about 95% of the design in discussion BEFORE any code, written
+  down in a design doc (`docs/multi_map_design.md` is the model), then build
+  from it. The user prefers this over many questions mid-implementation:
+  the multi-map build needed only three follow-up questions, each about a
+  gap the doc hadn't reached.
 
 ### Communicating
 
