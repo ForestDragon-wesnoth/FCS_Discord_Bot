@@ -285,6 +285,17 @@ Each of these was learned from a shipped bug.
   detector (§5).
 - **Anything iterating units and firing hooks:** re-check
   `eid in m.entities` after each hook (§5 "ghost firing").
+- **A command whose effect on a match depends on more than that match**
+  (its undo history, a file, another match, a runtime queue): add it to
+  `_JOURNAL_STATE_ROOTS` / `_JOURNAL_STATE_SUBS`, so the command journal
+  stores the state it left instead of a command a replay can't redo.
+  Anything a match state names (a generated name, an id) comes from the
+  match RNG or a saved counter, never `uuid` / the clock, or every replay
+  of it diverges (`sched_<n>` came from uuid). Re-run the replay
+  differential (§5).
+- **A change to server-wide state outside the systems** (a file, the
+  template library, a deleted match): call `audit_note(...)` so `!server
+  audit` names it.
 
 ### Usage strings are authoritative (stray-word check)
 
@@ -336,6 +347,9 @@ back, load the schema with `ToolSearch` before calling
   `Snapshot.state` is `Match.to_dict(include_history=False)`, read lazily
   from disk once persisted.
 - **`storage.py`**: the data folder on disk (§3 "Persistence").
+- **`journal.py`**: the per-match command journal (segments, entries, the
+  state hash, the export bundle); recorded from `CommandRegistry._run`,
+  replayed by `!match replay` (§7.16).
 - **`completion.py`**: Tab completion for a typed line, shared by gui.py and
   cli.py (readline). It walks the typed words through the command's usage
   strings (`_usage_tails` / `_usage_tokens`, the stray-word check's
@@ -368,7 +382,7 @@ back, load the schema with `ToolSearch` before calling
 |---|---|---|
 | `Entity.write_var` / `remove_var` | every var write / delete | store checks (vitals, reserved paths, footprint fit, partial-template markers), clamps, partial-template change tracking, var hooks (`on_var_*`), death check (top level only) |
 | `Match._emit_status_diff` | every status change | status hooks (`on_status_*`), death check |
-| `CommandRegistry.run` → `_run_top` / `_run` | every typed `!command` | command lock, alias resolution, access / admin gate, pause, inline `$()`, undo snapshot, formula log sink, `CURRENT_WORKSPACE`, watcher poll, storage commit |
+| `CommandRegistry.run` → `_run_top` / `_run` | every typed `!command` | command lock, alias resolution, access / admin gate, pause, inline `$()`, undo snapshot, formula log sink, `CURRENT_WORKSPACE`, watcher poll, storage commit, `!system undo` step + `!server audit` entry (`_record_server_changes`), command journal (`_journal_command`, `_journal_before` / `_after`) |
 | `dispatch_no_snapshot` | batch / run / macro / foreach lines, action `cmd()` | admin check, inline `$()`, `!assert` stop sentinel, no gate (reached only from an already-gated command) |
 | `action.run_action` | every action | pre-state for rollback, `_action_depth`, choice replay, on_action_used / failed / on_target |
 | `Match.summon_entity` / `Entity.spawn` | every dynamic creation | id minting, placement, `default_entity_vars`, `checked_unit_vars`, on_entity_spawned, summon budget |
@@ -442,8 +456,12 @@ switch workspaces with `!as server <key>` (scenarios 698-700).
 Everything persists to `data/` (`storage.DATA_DIR_DEFAULT`, git-ignored),
 one folder per server (`local` for the CLI / GUI):
 `workspace.json` (channel pointers, default system, per-channel defaults),
-`systems.json`, `matches/<id>.json`, `matches/<id>/history/` (`index.json` +
-one `<sequence>.json` per undo snapshot), `saves/`, `sprites/`, `templates/`
+`systems.json`, `system_history.json` (`!system undo` steps), `audit.json`
+(`!server audit`), `matches/<id>.json`, `matches/<id>/history/`
+(`index.json` + one `<sequence>.json` per undo snapshot),
+`matches/<id>/journal/` (per segment `<n>.json` = its starting state and
+`<n>.jsonl` = its entries, appended to; `Storage.write_journals` after each
+commit, `_truncate_journal` on a rollback), `saves/`, `sprites/`, `templates/`
 (entity templates, outside commits; `templates/.trash/` = their replaced /
 edited / deleted versions, 24 h), `corrupt/`;
 plus `data/bot_settings.json` (owner limits + rule ceilings) and
@@ -675,7 +693,8 @@ Every class below shipped at least once and was fixed in an audit pass
   summon budget, pending requests, held commands, undo history, ...); a
   stale list once wiped live emit frames and all undo history on any failed
   action. `_restore_snapshot` carries the approval queue and held commands,
-  keeps live bindings per `undo_channel_bindings_mode`, keeps `paused`, and
+  keeps live bindings per `undo_channel_bindings_mode`, keeps `paused`, the
+  RNG (seed, position, live generator) and the command journal, and
   re-copies `rules` from the system.
 - **Discord concurrency.** Each message is its own asyncio task and handlers
   await their replies, so commands interleaved: one command's changes landed
@@ -760,6 +779,11 @@ descriptions (pass numbers point at `docs/audit_history.md`):
   `vtt_commands.SAVES_DIR` at a temp dir first.
 - **Huge-number timing fuzzer** (34): 10⁹ / -10⁹ in every numeric position of
   every command and every state-changing function, under SIGALRM.
+- **Replay differential** (journal): run every scenario, export each
+  match's journal, replay it into a fresh workspace, compare the final
+  state hash and the replay's own divergence report (808/808 journals
+  matched when it shipped). Pair it with a memory-equals-disk check of
+  the journals, system_history.json and audit.json after every command.
 - **Reload differential** (34, 35): the same random commands on a live
   manager and on a save/load copy taken mid-game, comparing every reply and
   the full state each step (exclude the runtime-only queues).
@@ -1644,15 +1668,59 @@ hardcodes**.
   `undo_channel_bindings_mode` (keep / revert / confirm, `bindings=`
   override). The diff (`_format_snapshot_diff`) reports positions, vars,
   statuses, names, links, tiles, zones, groups, match vars, team data, the
-  turn and "other changes". The seeded RNG position is not in snapshots
-  (user: fine).
+  turn and "other changes". The RNG's seed and position are saved with
+  the match but aren't undo state: an undo keeps rolling from the live
+  position.
 - **Team data:** `!team set/get/add/list/clear/passive`, `team_get/set/add`;
   a `modifiers` bundle applies to every member.
 - **Dice and tables:** `roll("NdM±k")` with explode `!` and keep `kh<n>` /
   `kl<n>` (n ≥ 1); `!roll`, `!roll odds` (exact distributions); `roll_table`
   (finite weights, keyed entries), `band` (ranges may be negative; an
   unreadable or backwards band is refused), named tables (`!table`, `table_roll`); `pick` / `shuffle`. All use
-  `Match.formula_rng()` (honours `random_seed`, replay-safe).
+  `Match.formula_rng()`: a `logic.CountingRandom` seeded with the
+  `random_seed` rule when set, else the match's own `rng_seed` (made at
+  creation, fresh for a clone), counting the 32-bit words drawn
+  (`rng_pos`, saved, so a reload resumes the sequence; `advance` skips
+  words, bounded by `RNG_ADVANCE_LIMIT`). `!match rng [set <seed>
+  [<pos>]]` (seed `auto` = a fresh one; host only: the seed predicts every roll; not an undo step, and
+  `!dry` refuses it) (777).
+- **Server-wide undo and audit:** every typed command that changes
+  `MatchManager.server_state()` (every system and the default-system
+  pointers) is one step on the server's stack (`system_history`, the state
+  before it plus each match's system then, owner limit
+  `system_undo_steps`); `!system history [n]` / `!system undo [n]
+  [preview|confirm]` (admin) put every system back and re-apply rules to
+  every match, so units move back to the var names those rules give
+  (refused whole under var_name_collision refuse, or while a match uses a
+  system that didn't exist then; a match follows a system rename back by
+  its recorded system). `!store load` / `!server wipe` replace the server
+  and clear the stack. `!server audit [n]` (admin, owner limit
+  `audit_log_entries`) lists who changed what server-wide: each such
+  command's system diff (`_server_state_diff`) plus its `audit_note`s
+  (files, templates, deleted matches) (774-776).
+- **Command journal** (`journal.py`, rule `command_journal_limit`, -1 =
+  the owner's ceiling, 0 = off): per match, segments of a starting state
+  (match state, its system chain, the server's templates) plus entries:
+  `cmd` (a command that changed the match per the undo test, as typed —
+  `$()` unevaluated — with author, channel, RNG [seed, before, after] and
+  the state hash after it, watchers included; an `!approve`d / `!again`
+  command is recorded as the command that ran, not the wrapper, via
+  `_JOURNALED_IN`; interactive choice answers become `answer=` tokens),
+  `state` (undo, history restore, `!run`, `!ent transfer`, `!match resume`,
+  or a change made from a channel showing another match, found from the
+  storage commit's `last_changed`), `systems` (the chain after a
+  server-wide edit, when it differs from the last recorded), `template`
+  (every library save / rename / delete). A journal starts before a
+  match's first command (`_journal_before`) or when the match is created;
+  a full segment starts the next from the state then and the one before is
+  dropped. `!match journal [n]` (host only), `!match journal export
+  <file>` (admin) writes the bundle; `!match replay <file> [upto=N]
+  [as=<id>] [verbose]` (admin) builds the systems (replacing same-named
+  ones no match here uses), templates and match, then runs each entry as
+  a top-level command (`_ReplayCtx`: the author's identity and channel, no
+  prompts, replies collected) with the RNG restored, and reports the first
+  entry whose state hash differs; the rebuilt match takes the recording as
+  its journal (`_REPLAYING`) (778-780).
 - **Other:** `!help find <words>` (commands, subcommands and rules),
   `!whoami`, `!log` (event log rules), `!state`, `!list`, `!dist`, string
   helpers (`upper` ... `fmt`, a safe field parser), list helpers (`sum`,

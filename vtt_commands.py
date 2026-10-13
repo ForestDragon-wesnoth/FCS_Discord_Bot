@@ -3,7 +3,7 @@
 from __future__ import annotations
 from typing import Callable, Dict, List, Optional, Protocol, Any, Tuple
 from logic import MatchManager, Match, Entity, VTTError, OutOfBounds, Occupied, NotFound, DuplicateId, ReservedId, _coerce_rule_value, _parse_bool
-from match_history import MatchHistory, Snapshot, HistoryError
+from match_history import MatchHistory, Snapshot, HistoryError, _now_iso
 from storage import storage_of, valid_id, fmt_bytes
 
 #used for Gamesystem-related commands
@@ -18,7 +18,9 @@ from logic import (
 from logic import COMMAND_USER, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit
 
 # Clamp system
-from logic import ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS
+from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
+from journal import UNDO_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT
+from logic import check_id, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution
@@ -229,6 +231,15 @@ _ELEVATED_READ_FORMS = frozenset({("map", "layer", "list"),
 # workspace (logic.Workspaces), so none of this reaches another server.
 _ADMIN_MSG = ("❌ Only a server administrator can do that — it changes "
               "server-wide state shared by every match on this server.")
+_ADMIN_READ_MSG = ("❌ Only a server administrator can read that — it "
+                   "names who changed what server-wide.")
+
+
+def _admin_msg(name: str, args: List[str]) -> str:
+    sub = args[0].lower() if args else ""
+    if (name, sub) in (("server", "audit"), ("system", "history")):
+        return _ADMIN_READ_MSG
+    return _ADMIN_MSG
 
 
 # `!server` (wipe) runs only when typed as its own command: never inside a
@@ -244,7 +255,7 @@ def _admin_required(name: str, args: List[str]) -> bool:
     if name in ("store", "run"):
         return True
     if name == "server":
-        return sub == "wipe"
+        return sub in ("wipe", "audit")
     if name in ("defvar", "defpassive", "gclamp"):
         # System-level defaults; `list` (and the bare usage form) only read.
         return bool(args) and sub != "list"
@@ -258,6 +269,11 @@ def _admin_required(name: str, args: List[str]) -> bool:
         return True
     if name == "history":
         return sub in ("export", "import")  # host disk I/O
+    if name == "match":
+        # `!match replay <file>` reads a saves file and builds systems,
+        # templates and a match; `!match journal export` writes a file.
+        return sub == "replay" or (sub == "journal" and len(args) > 1
+                                   and args[1].lower() == "export")
     if name == "log":
         # `!log format <type> ...` sets/resets a template ON THE GAME SYSTEM
         # (every match on it refreshes); bare `!log format` only lists.
@@ -463,7 +479,7 @@ class CommandRegistry:
         # (batch / macro / foreach / run lines, action cmd()), so without the
         # check a host could wrap `!system set` in a `!batch`.
         if _admin_required(name, args) and not ctx_is_admin(ctx):
-            await ctx.send(_ADMIN_MSG)
+            await ctx.send(_admin_msg(name, args))
             return
         # Inline-formula `$(...)` substitution for sub-command lines (a macro /
         # batch / foreach inner command), so $() resolves per line in the
@@ -511,7 +527,9 @@ class CommandRegistry:
             # command, so access overrides don't apply to it.
             return "all"
         base = self._access.get(name, "host")
-        if base == "host" and args and args[0].lower() in READ_ONLY_SUBCOMMANDS.get(name, ()):
+        if base == "host" and args and (name, args[0].lower()) in _HOST_ONLY_SUBS:
+            base = "host_only"
+        elif base == "host" and args and args[0].lower() in READ_ONLY_SUBCOMMANDS.get(name, ()):
             base = "all"
         elif base == "host" and not args and name in READ_ONLY_BARE_ROOTS:
             # Bare view form of a root that mutates only via subcommands.
@@ -748,6 +766,21 @@ class CommandRegistry:
         user_token = COMMAND_USER.set(ctx_user_name(ctx) if ctx_user(ctx)
                                       or getattr(ctx, "user_name", None)
                                       else None)
+        # A typed command (not a nested run: an approval, `!again`) is one
+        # `!system undo` step and one `!server audit` entry when it changes
+        # anything server-wide. `!as` can swap the whole workspace.
+        # (`!again` runs its command at depth 1 again: the `!again` itself
+        # is the typed command.)
+        outer = (_RUN_DEPTH.get() == 1 and name.lower() != "as"
+                 and not _AGAIN_ACTIVE.get())
+        audit_token = _AUDIT_NOTES.set([]) if outer else None
+        pre_text = mgr.server_state_text() if outer else ""
+        pre_matches = ({mid: m.system_name for mid, m in mgr.matches.items()}
+                       if outer else {})
+        if outer and not _DRY_ACTIVE.get():
+            _journal_before(mgr)
+            mgr._journal_label = [name] + list(args)
+            mgr._journal_by = COMMAND_USER.get() or ""
         try:
             # Judged on the alias-RESOLVED name: an alias of `again` stored as
             # the last command made `!again` rerun itself forever.
@@ -755,10 +788,18 @@ class CommandRegistry:
                     and self._resolve_alias(name, args, mgr, ctx)[0].lower()
                     not in ("again", "as", "server")):
                 _remember_command(mgr, ctx, name, args)
-            result = await self._run(name, args, ctx, mgr)
+            try:
+                result = await self._run(name, args, ctx, mgr)
+            finally:
+                if outer:
+                    _record_server_changes(mgr, ctx, name, args, pre_text,
+                                           pre_matches, _AUDIT_NOTES.get())
+                    _journal_after(mgr)
             await _flush_formula_log(ctx)
             return result
         finally:
+            if audit_token is not None:
+                _AUDIT_NOTES.reset(audit_token)
             COMMAND_USER.reset(user_token)
             PARTIAL_CACHE.reset(cache_token)
             CURRENT_WORKSPACE.reset(ws_token)
@@ -769,6 +810,7 @@ class CommandRegistry:
         # Alias resolution happens BEFORE handler lookup so an alias can
         # shadow a built-in name on this match.
         typed = name
+        typed_args = list(args)
         name, args = self._resolve_alias(name, args, mgr, ctx)
         if name == "server" and typed.lower() != "server":
             await ctx.send(_SERVER_TYPED_ONLY)
@@ -792,7 +834,7 @@ class CommandRegistry:
         # its overrides. Rejected outright — no match host can approve them.
         admin_cmd = _admin_required(name, args)
         if admin_cmd and not ctx_is_admin(ctx):
-            await ctx.send(_ADMIN_MSG)
+            await ctx.send(_admin_msg(name, args))
             return
 
         # Host / approval gate. Resolved against the channel's ACTIVE
@@ -847,6 +889,20 @@ class CommandRegistry:
             if (int(m_pre.rules.get("autosave_command_retention_turns", 3)) != 0
                     and getattr(m_pre, "_action_depth", 0) == 0):
                 pre_state = m_pre.to_dict(include_history=False)
+        # The command journal (journal.py): the channel's match before the
+        # command, to tell after it (and its watchers) whether it changed.
+        jm = mgr.matches.get(pre_active_mid) if pre_active_mid else None
+        jpre = None
+        if (jm is not None and not _DRY_ACTIVE.get()
+                and getattr(jm, "_action_depth", 0) == 0
+                and journal_limit(jm) != 0
+                and (not admin_cmd or name in _JOURNAL_STATE_ROOTS)):
+            jpre = (pre_state if pre_state is not None
+                    else jm.to_dict(include_history=False))
+            jrng = (effective_seed(jm), jm.rng_position())
+            handled = getattr(mgr, "_journal_handled", None)
+            if handled is not None:
+                handled.add(jm.id)
 
         # Reset the per-command summon budget on the active match.
         # summon_entity increments _summon_count and caps it at the
@@ -880,6 +936,12 @@ class CommandRegistry:
                 await ctx.send(f"❌ inline $() argument: {e}")
                 return
 
+        # The runs this one nests (an approval, `!again`) report the
+        # matches they journaled here; the parent run's set gets ours.
+        jparent = _JOURNALED_IN.get()
+        jmine: set = set()
+        jtoken = _JOURNALED_IN.set(jmine)
+        _INTERACTIVE_ANSWERS.set([])
         result = None
         try:
             result = await h(ctx, args, mgr)
@@ -887,6 +949,8 @@ class CommandRegistry:
             await ctx.send(f"❌ {e}")
         except Exception as e:
             await ctx.send(f"💥 Unexpected error: {e}")
+        finally:
+            _JOURNALED_IN.reset(jtoken)
         # Even a failed command goes through the bookkeeping below: it only
         # records a snapshot when the state REALLY changed, so a clean failure
         # stays a no-op, while a command that mutated and THEN failed (a hook
@@ -899,6 +963,7 @@ class CommandRegistry:
         # command was mutating and we record a pre-state snapshot. The
         # snapshot represents "the state to roll back to if you undo
         # this command".
+        post_state = None
         if pre_state is not None and pre_active_mid in mgr.matches:
             m_post = mgr.matches[pre_active_mid]
             post_state = m_post.to_dict(include_history=False)
@@ -925,11 +990,85 @@ class CommandRegistry:
         await _flush_formula_log(ctx)
         mid_now = mgr.active_by_channel.get(ctx.channel_key)
         if mid_now is not None and mid_now in mgr.matches:
+            if mgr.matches[mid_now].watchers:
+                post_state = None       # a watcher may change it after
             for line in mgr.matches[mid_now].fire_watchers():
                 await ctx.send(line)
+        if jpre is not None:
+            _journal_command(mgr, ctx, jm, pre_active_mid, name, typed,
+                             typed_args, jpre, jrng, jmine,
+                             str(args[0]).lower() if args else "",
+                             post_state)
+        if jparent is not None:
+            jparent.update(jmine)
         return result
 
 registry = CommandRegistry()
+
+
+# The match `!match replay` is rebuilding: it takes the replayed entries as
+# its journal, so they aren't journaled again as they run.
+_REPLAYING: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "vtt_replaying", default=None)
+
+# Roots whose change to the match is journaled as a stored state: what they
+# do depends on more than the match (its undo history, a file).
+_JOURNAL_STATE_ROOTS = frozenset({"undo", "history", "run"})
+# ... and subcommands: a transfer needs the other match, a resume runs the
+# commands held while paused.
+_JOURNAL_STATE_SUBS = frozenset({("ent", "transfer"), ("match", "resume")})
+# Ids of the matches journaled by the runs a run nests (an approval,
+# `!again`, a replayed entry): the outer run leaves a match one of them
+# recorded.
+_JOURNALED_IN: "contextvars.ContextVar[Optional[set]]" = \
+    contextvars.ContextVar("vtt_journaled_in", default=None)
+
+
+def _journal_command(mgr: MatchManager, ctx: ReplyContext, jm: Match,
+                     mid: str, name: str, typed: str, typed_args: List[str],
+                     jpre: Dict[str, Any], jrng: Tuple[str, int],
+                     done: set, sub: str,
+                     post: Optional[Dict[str, Any]] = None) -> None:
+    """Journal a command that changed the channel's match `jm`: as the
+    command (replayable from the match) or, for an undo / history restore /
+    `!run` file, as the state it left."""
+    post_m = mgr.matches.get(mid)
+    if post_m is None:
+        # Renamed by the command: the same object under another id.
+        post_m = next((x for x in mgr.matches.values() if x is jm), None)
+    if post_m is None:
+        return
+    if post_m.id in done or post_m.id == _REPLAYING.get():
+        return          # a nested run journaled it / a replay copies its own
+    if post is None or post_m is not jm:
+        post = post_m.to_dict(include_history=False)
+    if not _differs_in_undo_state(jpre, post):
+        return
+    # A typed command started every journal before it ran
+    # (_journal_before); a Discord button's approval has no typed command
+    # around it, so a journal starting here starts from the state before.
+    j = ensure_journal(mgr, post_m, state=jpre)
+    if j is None:
+        return
+    entry = {"kind": "cmd", "at": _now_iso(),
+             "by": COMMAND_USER.get() or "", "uid": ctx_user(ctx),
+             "ch": ctx.channel_key, "cmd": [typed] + list(typed_args),
+             "rng": [jrng[0], jrng[1], post_m.rng_position()],
+             "hash": state_hash(post)}
+    answers = _INTERACTIVE_ANSWERS.get()
+    if answers and name == "action":
+        # Answers typed at a prompt replay as `answer=` tokens.
+        entry["cmd"] += [f"answer={a}" for a in answers]
+    if name in _JOURNAL_STATE_ROOTS or (name, sub) in _JOURNAL_STATE_SUBS:
+        entry["kind"] = "state"
+        entry["state"] = journal_state(post)
+        if effective_seed(post_m) != jrng[0]:
+            entry["rng"][0] = effective_seed(post_m)
+    j.add(entry)
+    done.add(post_m.id)
+    handled = getattr(mgr, "_journal_handled", None)
+    if handled is not None:
+        handled.add(post_m.id)
 
 
 def _grid_box(m: Match, x1: int, y1: int, x2: int, y2: int) -> set:
@@ -1103,16 +1242,41 @@ async def persist_workspace(mgr: MatchManager, ctx: Optional[ReplyContext]) -> N
     cut to fit the storage limit, or the command undone because it didn't
     fit. A no-op when nothing persists."""
     st = storage_of(mgr)
+    handled = getattr(mgr, "_journal_handled", None)
+    mgr._journal_handled = None
     if st is None:
         return
     try:
         msgs = st.commit(mgr)
+        if handled is not None:
+            _journal_outside(mgr, handled,
+                             st.last_changed.get(mgr.guild_key) or set())
+        st.write_journals(mgr)
     except Exception as ex:  # noqa: BLE001 - a disk error must not crash a command
         print(f"⚠️ [{mgr.guild_key}] saving to disk failed: {ex!r}")
         msgs = [f"⚠️ Saving to disk failed ({type(ex).__name__}); the change "
                 f"is kept in memory and saved with the next command."]
     if msgs and ctx is not None:
         await ctx.send("\n".join(msgs))
+
+
+def _journal_outside(mgr: MatchManager, handled: set, changed: set) -> None:
+    """A journaled match the command changed without it being the channel's
+    match (a unit transferred in, a batch line that switched matches) gets
+    its state stored: no command of its own replays that change."""
+    label = getattr(mgr, "_journal_label", None) or ["?"]
+    for mid in sorted(changed - handled):
+        m = mgr.matches.get(mid)
+        if m is None or m.journal is None:
+            continue
+        post = m.to_dict(include_history=False)
+        m.journal.add({"kind": "state", "at": _now_iso(),
+                       "by": getattr(mgr, "_journal_by", "") or "",
+                       "cmd": list(label), "outside": True,
+                       "rng": [effective_seed(m), m.rng_position(),
+                               m.rng_position()],
+                       "state": journal_state(post),
+                       "hash": state_hash(post)})
 
 
 # Whether this asyncio task holds its manager's command lock (see run()).
@@ -1140,6 +1304,189 @@ _AGAIN_ACTIVE: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
 # True while `!dry` runs a command (see dry_cmd and _dry_refusal).
 _DRY_ACTIVE: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
     "vtt_dry_active", default=False)
+# Lines for the `!server audit` entry of the typed command running now (see
+# audit_note); None outside a top-level command.
+_AUDIT_NOTES: "contextvars.ContextVar[Optional[List[str]]]" = \
+    contextvars.ContextVar("vtt_audit_notes", default=None)
+
+
+def audit_note(text: str) -> None:
+    """Add a line to the `!server audit` entry of the command running now:
+    a change outside the systems (a file, a template, a deleted match) that
+    the server-state comparison can't see."""
+    notes = _AUDIT_NOTES.get()
+    if notes is not None:
+        notes.append(text)
+
+
+def _template_changed(mgr: MatchManager, name: str, what: str,
+                      new_name: Optional[str] = None) -> None:
+    """A template was saved, replaced, renamed or deleted: an audit line,
+    and an entry in every match journal (a replay keeps the library as it
+    was at each point)."""
+    audit_note(f"template `{name}` {what}")
+    data = mgr.templates.get(new_name or name)
+    for m in mgr.matches.values():
+        if m.journal is not None and m.id != _REPLAYING.get():
+            m.journal.add({"kind": "template", "at": _now_iso(),
+                           "by": COMMAND_USER.get() or "", "name": name,
+                           "new_name": new_name, "what": what,
+                           "data": copy.deepcopy(data)})
+
+
+# Commands whose server-state changes replace the server wholesale: they are
+# no `!system undo` step, and the steps before them stop describing it.
+_SERVER_REPLACING_ROOTS = frozenset({"store", "server"})
+
+
+def _command_label(name: str, args: List[str]) -> str:
+    label = f"!{name} {' '.join(args)}".strip()
+    return label if len(label) <= 80 else label[:77] + "..."
+
+
+def _record_server_changes(mgr: MatchManager, ctx: ReplyContext, name: str,
+                           args: List[str], pre_text: str,
+                           pre_matches: Dict[str, str],
+                           notes: List[str]) -> None:
+    """After a typed command: keep a `!system undo` step when it changed the
+    server state, and a `!server audit` entry when it changed anything
+    server-wide."""
+    skip_step = getattr(mgr, "_skip_system_step", False)
+    mgr._skip_system_step = False
+    post_text = mgr.server_state_text()
+    changed = post_text != pre_text
+    if not changed and not notes:
+        return
+    label = _command_label(name, args)
+    who = COMMAND_USER.get() or ""
+    uid = ctx_user(ctx)
+    by = who if not uid or str(uid) == who else f"{who} ({uid})"
+    lines = list(notes)
+    if changed:
+        lines = _server_state_diff(json.loads(pre_text),
+                                   json.loads(post_text))[:6] + lines
+        if name.lower() in _SERVER_REPLACING_ROOTS:
+            if mgr.system_history:
+                mgr.system_history = []
+                lines.append("system undo history cleared")
+        elif not skip_step:
+            mgr.record_system_step(pre_text, pre_matches, label, by)
+    mgr.record_audit(label, by, lines)
+    if changed and name.lower() not in _SERVER_REPLACING_ROOTS:
+        _journal_systems(mgr, ctx, json.loads(pre_text), json.loads(post_text),
+                         pre_matches, name, args)
+
+
+def _journal_systems(mgr: MatchManager, ctx: ReplyContext,
+                     pre: Dict[str, Any], post: Dict[str, Any],
+                     pre_matches: Dict[str, str], name: str,
+                     args: List[str]) -> None:
+    """A server-wide edit changed systems: each journaled match whose chain
+    holds one of them records its chain as it is now."""
+    ps, qs = pre.get("systems") or {}, post.get("systems") or {}
+    changed = {n for n in set(ps) | set(qs) if ps.get(n) != qs.get(n)}
+    for mid, m in mgr.matches.items():
+        if (m.journal is None or m.system_name not in mgr.systems
+                or mid == _REPLAYING.get()):
+            continue
+        chain = {x.name for x in mgr.system_chain(mgr.systems[m.system_name])}
+        if not (chain & changed) and pre_matches.get(mid) == m.system_name:
+            continue
+        now = chain_systems(mgr, m)
+        if now == _journal_known_systems(m.journal):
+            continue                # it already holds these (a replay)
+        m.journal.add({"kind": "systems", "at": _now_iso(),
+                       "by": COMMAND_USER.get() or "", "uid": ctx_user(ctx),
+                       "cmd": [name] + list(args),
+                       "system_name": m.system_name,
+                       "systems": now})
+        handled = getattr(mgr, "_journal_handled", None)
+        if handled is not None:
+            handled.add(mid)
+
+
+def _journal_known_systems(j: Journal) -> Dict[str, Any]:
+    """The system chain a journal last recorded."""
+    for seg in reversed(j.segments):
+        for e in reversed(seg["entries"]):
+            if e.get("kind") == "systems":
+                return e.get("systems") or {}
+        return seg["start"].get("systems") or {}
+    return {}
+
+
+def _journal_before(mgr: MatchManager) -> None:
+    """Before a typed command: every match with its journal on has one
+    (started from its state now, before the command) and room in it."""
+    mgr._journal_handled = set()
+    for m in list(mgr.matches.values()):
+        if m.journal is None:
+            ensure_journal(mgr, m, "started")
+        elif journal_limit(m) == 0:
+            m.journal = None
+        else:
+            maybe_roll(mgr, m)
+
+
+def _journal_after(mgr: MatchManager) -> None:
+    """After a typed command: a match it created starts its journal from
+    the state it was created with."""
+    handled = getattr(mgr, "_journal_handled", None)
+    for mid, m in mgr.matches.items():
+        if m.journal is None and ensure_journal(mgr, m, "created"):
+            if handled is not None:
+                handled.add(mid)
+
+
+def _rule_brief(names: List[str]) -> str:
+    shown = ", ".join(names[:4])
+    return shown + (f" (+{len(names) - 4} more)" if len(names) > 4 else "")
+
+
+def _server_state_diff(old: Dict[str, Any], new: Dict[str, Any]) -> List[str]:
+    """What changed between two server states (MatchManager.server_state),
+    one line per system and pointer."""
+    out: List[str] = []
+    osys, nsys = old.get("systems") or {}, new.get("systems") or {}
+    for n in sorted(set(nsys) - set(osys)):
+        out.append(f"system `{n}` added")
+    for n in sorted(set(osys) - set(nsys)):
+        out.append(f"system `{n}` removed")
+    for n in sorted(set(osys) & set(nsys)):
+        a, b = osys[n], nsys[n]
+        bits: List[str] = []
+        sa, sb = a.get("settings") or {}, b.get("settings") or {}
+        rules = sorted(k for k in set(sa) | set(sb)
+                       if (sa.get(k) or {}).get("value")
+                       != (sb.get(k) or {}).get("value")
+                       or (k in sa) != (k in sb))
+        if rules:
+            bits.append("rules " + _rule_brief(rules))
+        for lib, word in (("aliases", "aliases"), ("tile_templates", "tiles"),
+                          ("formula_functions", "functions")):
+            la, lb = a.get(lib) or {}, b.get(lib) or {}
+            names = sorted(k for k in set(la) | set(lb)
+                           if la.get(k) != lb.get(k))
+            if names:
+                bits.append(f"{word} " + _rule_brief(names))
+        if a.get("parent") != b.get("parent"):
+            bits.append(f"parent {a.get('parent') or 'none'} → "
+                        f"{b.get('parent') or 'none'}")
+        if a.get("removed") != b.get("removed"):
+            bits.append("hidden inherited entries")
+        if a.get("description") != b.get("description"):
+            bits.append("description")
+        if bits:
+            out.append(f"system `{n}`: " + "; ".join(bits))
+    if old.get("default_system_name") != new.get("default_system_name"):
+        out.append(f"server default system {old.get('default_system_name')} "
+                   f"→ {new.get('default_system_name')}")
+    oc = old.get("default_system_per_channel") or {}
+    nc = new.get("default_system_per_channel") or {}
+    if oc != nc:
+        n = sum(1 for k in set(oc) | set(nc) if oc.get(k) != nc.get(k))
+        out.append(f"channel default system changed in {n} channel(s)")
+    return out
 
 
 # ---- stray-word check (usage strings are authoritative) -------------------
@@ -1345,7 +1692,7 @@ def _remember_command(mgr: MatchManager, ctx: ReplyContext, name: str,
 # Snapshot fields an undo leaves alone, so a change to them alone is not an
 # undo step: the pause (table management, see _restore_snapshot) and the
 # rules (a copy of the GameSystem's, changed only by server-wide system edits).
-_NOT_UNDO_STATE = ("paused", "rules")
+_NOT_UNDO_STATE = UNDO_IGNORED
 
 
 def _differs_in_undo_state(pre: Dict[str, Any], post: Dict[str, Any]) -> bool:
@@ -1361,11 +1708,17 @@ def _differs_in_undo_state(pre: Dict[str, Any], post: Dict[str, Any]) -> bool:
 # Host-only READS: gated to hosts (they show hidden data) but they change
 # nothing, so a pause with pause_affects_hosts never holds them. root ->
 # the read subcommands (args[0]); None = the whole root is a read.
+# Subcommands a non-host can't even request (never queued for approval):
+# `!match rng` shows the seed, which predicts every roll; `!match journal`
+# lists every command, hidden units' included.
+_HOST_ONLY_SUBS = frozenset({("match", "rng"), ("match", "journal")})
+
 _HOST_READS: Dict[str, Optional[frozenset]] = {
     "assert": None, "pending": None,
     "ent": frozenset({"dump", "diff"}),
     "template": frozenset({"refs"}),
-    "match": frozenset({"list", "info", "channels", "hosts", "outcome"}),
+    "match": frozenset({"list", "info", "channels", "hosts", "outcome",
+                        "journal"}),
     "host": frozenset({"list"}),
     "map": frozenset({"full"}),
     "list": frozenset({"full"}),
@@ -2256,6 +2609,7 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             raise NotFound(f"Match '{args[1]}' not found.")
         require_target_host(ctx, target, "delete it", owner=True)
         mgr.delete_match(args[1])
+        audit_note(f"deleted match `{args[1]}`")
         return await ctx.send(f"Deleted `{args[1]}`.")
     if sub == "clone":
         # !match clone <new_id> [name ...] — duplicate THIS channel's match
@@ -2428,6 +2782,36 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"yet):\n" + "\n".join(lines))
         return await ctx.send(f"🔄 Synced from system `{m.system_name}`:\n"
                               + "\n".join(lines))
+    if sub == "journal":
+        return await _match_journal(ctx, args, mgr)
+    if sub == "replay":
+        return await _match_replay(ctx, args, mgr)
+    if sub == "rng":
+        m = active_match(mgr, ctx)
+        rule_seed = str(m.rules.get("random_seed", "") or "")
+        if len(args) == 1:
+            src = ("the system's random_seed rule" if rule_seed
+                   else "the match's own seed")
+            return await ctx.send(
+                f"🎲 `{m.id}` rolls from {src} `{rule_seed or m.rng_seed}`, "
+                f"{m.rng_position()} word(s) in.")
+        if args[1].lower() != "set" or len(args) not in (3, 4):
+            raise VTTError("Usage: `!match rng [set <seed> [<pos>]]` "
+                           "(seed `auto` = a fresh one).")
+        seed = new_rng_seed() if args[2].lower() == "auto" else args[2]
+        pos = None
+        if len(args) == 4:
+            try:
+                pos = int(args[3])
+            except ValueError:
+                raise VTTError(f"`{args[3]}` isn't a position (a whole "
+                               f"number of words drawn).")
+        m.set_rng(seed, pos)
+        note = (" The system's random_seed rule overrides it while set."
+                if rule_seed else "")
+        return await ctx.send(
+            f"🎲 `{m.id}` now rolls from seed `{m.rng_seed}`, "
+            f"{m.rng_pos} word(s) in.{note}")
     if sub == "outcome":
         m = active_match(mgr, ctx)
         if m.outcome is None:
@@ -2566,6 +2950,34 @@ registry.annotate_sub(
           "`refresh` drops every pin (or one), so the next use pins the "
           "library's current version; undo restores dropped pins."),
 )
+registry.annotate_sub(
+    "match", "journal", usage="!match journal [n] | !match journal export <file>",
+    desc=("The match's command journal, newest first (default the last 15): "
+          "every command that changed it, with who ran it and when, plus "
+          "stored states (an undo or history restore, a `!run` file, a "
+          "change made from another channel), edits to its systems and the "
+          "server's templates. `export <file>` writes it, with the state, "
+          "systems and templates it starts from, to the saves folder for "
+          "`!match replay` (administrators). Hosts only; its size is the "
+          "command_journal_limit rule."))
+registry.annotate_sub(
+    "match", "replay", usage="!match replay <file> [upto=N] [as=<id>] [verbose]",
+    desc=("Rebuild a match from a journal export: its systems and templates "
+          "(refused when this server holds different versions — replay on "
+          "a fresh server), its starting state, then each entry in order, "
+          "every command run as its author in its channel with the RNG "
+          "where it was. `upto=N` stops after entry N; `as=` names the new "
+          "match; `verbose` shows every replayed command's replies. Reports "
+          "the first entry after which the state differs from the "
+          "recording. Administrators only."))
+registry.annotate_sub(
+    "match", "rng", usage="!match rng [set <seed> [<pos>]]",
+    desc=("Show the seed this match rolls from and how far into its "
+          "sequence it is (32-bit words drawn), or set the match's own seed "
+          "(`auto` = a fresh one) and optionally a position, so the next "
+          "rolls are the ones that seed gives from there. Every match has "
+          "its own seed unless the system sets random_seed. Hosts only "
+          "(the seed predicts every roll); not an undo step."))
 registry.annotate_sub(
     "match", "sync",
     usage=("!match sync <aliases|tiles|funcs> [name] [diff] | "
@@ -3203,7 +3615,7 @@ def _wipe_blockers(mgr: MatchManager, scope: str) -> List[str]:
 
 @registry.command(
     "server", snapshot=False,
-    usage="!server <wipe|storage> ...",
+    usage="!server <wipe|storage|audit> ...",
     desc=(
         "This server's data. `!server storage` shows how much disk it uses "
         "against its limit. `!server wipe matches|all` (server "
@@ -3235,6 +3647,19 @@ async def server_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             rest = sum(n for _, n in parts[len(shown):])
             lines.append(f"- {len(parts) - len(shown)} smaller part(s): "
                          f"{fmt_bytes(rest)}")
+        return await ctx.send("\n".join(lines))
+    if sub == "audit":
+        n = _parse_count(args[1], "!server audit [n]") if len(args) > 1 else 15
+        _check_tail(args, 2, (), "!server audit [n]")
+        log = mgr.audit_log
+        if not log:
+            return await ctx.send("Nothing server-wide has changed yet (or "
+                                  "the audit log is off: audit_log_entries).")
+        lines = [f"**Server audit** ({len(log)} kept, newest first):"]
+        for e in reversed(log[-n:]):
+            by = f" by {e['by']}" if e.get("by") else ""
+            lines.append(f"- {e.get('at', '?')}{by}: `{e.get('label', '?')}`")
+            lines += [f"  · {x}" for x in e.get("notes") or []]
         return await ctx.send("\n".join(lines))
     if sub != "wipe":
         return await _help_fallback(ctx, ["server"], args[0])
@@ -3288,6 +3713,7 @@ async def server_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             mgr.default_system_name = "default"
             mgr.default_system_per_channel = {}
             mgr.templates = {}
+        audit_note(f"wiped {scope}")
         tail = ("Changed your mind? `!server wipe undo` within 24 hours."
                 if st is not None else
                 "This bot keeps nothing on disk, so it can't be undone.")
@@ -3312,6 +3738,7 @@ async def server_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 "would overwrite. Remove them first: " + "; ".join(blockers)
                 + ".")
         st.restore_from_trash(mgr, path, scope)
+        audit_note(f"undid the wipe ({scope})")
         return await ctx.send(
             f"♻️ Undid the wipe ({scope}): {len(mgr.matches)} match(es) "
             f"back" + (", with the game systems, saves and templates"
@@ -3321,6 +3748,8 @@ async def server_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 registry.annotate_sub("server", "storage", usage="!server storage",
                       desc="This server's disk use against its storage limit, broken down largest first: each match and its undo history, templates, old template versions, saves, sprites, corrupt files and the workspace / systems files.")
+registry.annotate_sub("server", "audit", usage="!server audit [n]",
+                      desc="Who changed what server-wide, newest first (default the last 15): system edits and their undo, default vars / passives / clamps, log formats, `!store save/load`, `!run`, `!history export/import`, wipes and their undo, template saves / edits / renames / deletes, deleted matches. Administrators only; the bot owner sets how many entries a server keeps (audit_log_entries).")
 registry.annotate_sub("server", "wipe",
                       usage="!server wipe <matches | all | confirm <phrase ...> | undo>",
                       desc="Delete the server's matches (`all`: also systems, "
@@ -3523,6 +3952,7 @@ def _store_template(ctx: ReplyContext, mgr: MatchManager, name: str,
                          f"(`!template restore {name}`).")
     mgr.templates[name] = data
     invalidate_partial_cache()
+    _template_changed(mgr, name, "replaced" if old is not None else "saved")
     return ("Replaced" if old is not None else "Saved"), notes
 
 
@@ -4156,6 +4586,8 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             st.rename_template_file(mgr, name, new_name)
         mgr.templates[new_name] = mgr.templates.pop(name)
         invalidate_partial_cache()
+        _template_changed(mgr, name, f"renamed to `{new_name}`",
+                          new_name=new_name)
         for d in deps:
             dt = mgr.templates[d]
             _v, more = _store_template(
@@ -4222,6 +4654,7 @@ async def template_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         kept = st is not None and st.trash_template(mgr, name)
         del mgr.templates[name]
         invalidate_partial_cache()
+        _template_changed(mgr, name, "deleted")
         notes = []
         for d, new in inlined.items():
             dt = mgr.templates[d]
@@ -4649,6 +5082,293 @@ async def _run_approved(req: dict, ctx: ReplyContext, mgr: MatchManager):
     await run_approved_request(req, ctx, mgr)
 
 
+async def _match_journal(ctx: ReplyContext, args: List[str],
+                         mgr: MatchManager):
+    """`!match journal [n] | export <file>`."""
+    m = active_match(mgr, ctx)
+    j = m.journal
+    if len(args) > 1 and args[1].lower() == "export":
+        if len(args) != 3:
+            raise VTTError("Usage: `!match journal export <file>`.")
+        if j is None:
+            raise VTTError(f"`{m.id}` keeps no journal "
+                           f"(command_journal_limit is 0).")
+        full, path = saves_path(args[2], mgr, write=True)
+        _write_save_file(mgr, full, path, journal_bundle(mgr, m))
+        audit_note(f"exported the journal of `{m.id}` to `{path}`")
+        ns = [e["n"] for e in j.entries()]
+        span = f"#{ns[0]}–#{ns[-1]}" if ns else "no entries yet"
+        return await ctx.send(
+            f"📼 Wrote the journal of `{m.id}` ({len(ns)} entr"
+            f"{'y' if len(ns) == 1 else 'ies'}, {span}) to `{path}`. "
+            f"`!match replay {args[2]}` rebuilds the match from it.")
+    n = _parse_count(args[1], "!match journal [n]") if len(args) > 1 else 15
+    _check_tail(args, 2, (), "!match journal [n]")
+    if j is None:
+        return await ctx.send(f"`{m.id}` keeps no journal "
+                              f"(command_journal_limit is 0).")
+    entries = list(j.entries())
+    start = j.segments[0]["start"]
+    lines = [f"**Journal of `{m.id}`** — from a stored state "
+             f"({start.get('reason', '?')}, {start.get('at', '?')}); "
+             f"{len(entries)} entr{'y' if len(entries) == 1 else 'ies'}"
+             + (", newest first:" if entries else ".")]
+    lines += [journal_entry_text(e) for e in reversed(entries[-n:])]
+    return await ctx.send("\n".join(lines))
+
+
+class _ReplayCtx:
+    """The replaying admin's context, re-pointed at one journal entry: its
+    author's identity and channel, no prompts (answers replay as `answer=`
+    tokens), replies collected instead of sent."""
+
+    def __init__(self, inner: ReplyContext, channel_key: str,
+                 user_id: Optional[str], user_name: str):
+        self._inner = inner
+        self.channel_key = channel_key
+        self.user_id = user_id
+        self.user_name = user_name or user_id
+        self.prompt_choice = None
+        self.offer_resume = None
+        self.replies: List[str] = []
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    async def send(self, message: Any = None, *a: Any, **k: Any) -> None:
+        if message is not None:
+            self.replies.append(str(message))
+
+
+def _replay_rng(m: Match, rng: Any) -> None:
+    """Put the match's RNG where the recording had it before an entry."""
+    if not isinstance(rng, list) or len(rng) < 2:
+        return
+    seed, pos = str(rng[0]), int(rng[1])
+    if effective_seed(m) == seed and m.rng_position() == pos:
+        return
+    rule_seed = str(m.rules.get("random_seed", "") or "")
+    m.set_rng(None if rule_seed == seed else seed, pos)
+
+
+def _replay_template(mgr: MatchManager, e: Dict[str, Any]) -> None:
+    st = storage_of(mgr)
+    name, new_name, data = e.get("name"), e.get("new_name"), e.get("data")
+    if new_name:
+        if name in mgr.templates:
+            if st is not None:
+                st.rename_template_file(mgr, name, new_name)
+            mgr.templates[new_name] = mgr.templates.pop(name)
+    elif data is None:
+        if name in mgr.templates:
+            if st is not None:
+                st.delete_template(mgr, name)
+            del mgr.templates[name]
+    else:
+        if st is not None:
+            st.write_template(mgr, name, copy.deepcopy(data))
+        mgr.templates[name] = copy.deepcopy(data)
+    invalidate_partial_cache()
+    _template_changed(mgr, name, e.get("what") or "changed",
+                      new_name=new_name)
+
+
+async def _match_replay(ctx: ReplyContext, args: List[str],
+                        mgr: MatchManager):
+    """`!match replay <file> [upto=N] [as=<id>] [verbose]`: rebuild a match
+    from a journal bundle (`!match journal export`)."""
+    if len(args) < 2:
+        raise VTTError("Usage: `!match replay <file> [upto=N] [as=<id>] "
+                       "[verbose]`.")
+    verbose = False
+    opts: List[str] = []
+    for a in args[2:]:
+        if a.lower() == "verbose":
+            verbose = True
+        else:
+            opts.append(a)
+    _check_options(opts, {"upto", "as"}, "!match replay")
+    kv = dict(o.split("=", 1) for o in opts)
+    upto = None
+    if "upto" in kv:
+        upto = _parse_count(kv["upto"], "!match replay <file> upto=N")
+    full, path = saves_path(args[1], mgr)
+    try:
+        with open(full, encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        raise VTTError(f"File not found: `{path}`.")
+    except (OSError, ValueError) as ex:
+        raise VTTError(f"Can't read `{path}`: {ex}")
+    if not isinstance(raw, dict) or raw.get("format") != JOURNAL_FORMAT \
+            or not raw.get("segments"):
+        raise VTTError(f"`{path}` isn't a journal export "
+                       f"(`!match journal export` writes one).")
+    segs = raw["segments"]
+    start = segs[0]["start"]
+    mid = kv.get("as") or str(raw.get("match") or start.get("match") or "")
+    check_id("match id", mid)
+    if mid in mgr.matches:
+        raise VTTError(f"This server already has a match `{mid}`: replay "
+                       f"with `as=<new id>`.")
+    # A system of the same name is replaced when no match here reads it
+    # (a fresh server's `default`); one a match uses is refused.
+    in_use = set()
+    for x in mgr.matches.values():
+        if x.system_name in mgr.systems:
+            in_use.update(y.name for y in
+                          mgr.system_chain(mgr.systems[x.system_name]))
+    clash = [f"system `{n}`" for n, d in (start.get("systems") or {}).items()
+             if n in in_use and mgr.systems[n].to_dict() != d]
+    clash += [f"template `{n}`"
+              for n, d in (start.get("templates") or {}).items()
+              if n in mgr.templates and mgr.templates[n] != d]
+    if clash:
+        raise VTTError(
+            "This server holds different versions of what the journal "
+            "starts with: " + ", ".join(clash[:6])
+            + (f" (+{len(clash) - 6} more)" if len(clash) > 6 else "")
+            + " (a match here uses them). Replay on a server without them "
+            "(in the CLI: `!as server <new>`).")
+    # Systems and templates the journal starts with.
+    for n, d in (start.get("systems") or {}).items():
+        if n not in in_use:
+            mgr.systems[n] = GameSystem.from_dict(copy.deepcopy(d))
+    st = storage_of(mgr)
+    for n, d in (start.get("templates") or {}).items():
+        if n not in mgr.templates:
+            if st is not None:
+                st.write_template(mgr, n, copy.deepcopy(d))
+            mgr.templates[n] = copy.deepcopy(d)
+    invalidate_partial_cache()
+    state = copy.deepcopy(start["state"])
+    state["id"] = mid
+    m = Match.from_dict(state)
+    if m.system_name not in mgr.systems:
+        raise VTTError(f"The journal's match is on system "
+                       f"`{m.system_name}`, which it doesn't carry.")
+    m.paused = None
+    m.held_commands = []
+    mgr.matches[mid] = m
+    mgr.apply_system_rules(m)
+    ensure_journal(mgr, m, "replay")
+    handled = getattr(mgr, "_journal_handled", None)
+    if handled is not None:
+        handled.add(mid)
+    # Later segments' starting states, to check the replay against.
+    checks = {seg["start"].get("first_n"): seg["start"] for seg in segs[1:]}
+    ran = 0
+    first_off: Optional[str] = None
+    out: List[str] = []
+    replaying = _REPLAYING.set(mid)
+    try:
+        last_n = await _replay_entries(ctx, mgr, mid, segs, upto, checks,
+                                       verbose, out)
+    finally:
+        _REPLAYING.reset(replaying)
+    ran, first_off = last_n["ran"], last_n["off"]
+    # The rebuilt match's journal is the recording's, up to where it stopped.
+    m = mgr.matches.get(mid)
+    if m is not None:
+        j = Journal()
+        for seg in segs:
+            kept = [copy.deepcopy(e) for e in seg.get("entries") or []
+                    if upto is None or not isinstance(e.get("n"), int)
+                    or e["n"] <= upto]
+            if j.segments and upto is not None and \
+                    seg["start"].get("first_n", 0) > upto:
+                break
+            j.segments.append({"no": seg.get("no", len(j.segments) + 1),
+                               "start": copy.deepcopy(seg["start"]),
+                               "entries": kept})
+        ns = [e.get("n", 0) for e in j.entries()]
+        j.next_n = (max(ns) + 1 if ns
+                    else j.segments[-1]["start"].get("first_n", 1))
+        m.journal = j
+    mgr.active_by_channel[ctx.channel_key] = mid
+    head = (f"📼 Replayed {ran} journal entr{'y' if ran == 1 else 'ies'} of "
+            f"`{path}` into `{mid}`"
+            + (f" (up to #{upto})" if upto is not None else "")
+            + ". This channel now shows it.")
+    tail = ("✅ The state matched the recording after every command."
+            if first_off is None else
+            f"⚠️ The replay stopped matching the recording {first_off}.")
+    await ctx.send("\n".join([head] + out + [tail]))
+
+
+async def _replay_entries(ctx: ReplyContext, mgr: MatchManager, mid: str,
+                          segs: List[Dict[str, Any]], upto: Optional[int],
+                          checks: Dict[Any, Any], verbose: bool,
+                          out: List[str]) -> Dict[str, Any]:
+    """Run a journal's entries on match `mid` (see _match_replay)."""
+    ran = 0
+    first_off: Optional[str] = None
+    for seg in segs:
+        for e in seg.get("entries") or []:
+            n = e.get("n")
+            if upto is not None and isinstance(n, int) and n > upto:
+                break
+            m = mgr.matches.get(mid)
+            if m is None:
+                out.append(f"#{n}: the match is gone; replay stopped.")
+                break
+            chk = checks.get(n)
+            if chk is not None and first_off is None and state_hash(
+                    m.to_dict(include_history=False)) != state_hash(
+                        chk.get("state") or {}):
+                first_off = f"before #{n} (the stored state there differs)"
+            m.paused = None
+            kind = e.get("kind")
+            if kind == "cmd":
+                _replay_rng(m, e.get("rng"))
+                toks = [str(t) for t in e.get("cmd") or []]
+                if not toks:
+                    continue
+                rctx = _ReplayCtx(ctx, str(e.get("ch") or ctx.channel_key),
+                                  e.get("uid"), str(e.get("by") or ""))
+                with _channel_pointed_at(mgr, rctx.channel_key, mid):
+                    await registry.run(toks[0], toks[1:], rctx, mgr)
+                if verbose:
+                    out.append(f"#{n} `!{' '.join(toks)}`")
+                    out += [f"  {r}" for r in rctx.replies]
+                m = mgr.matches.get(mid)
+                if (m is not None and first_off is None and e.get("hash")
+                        and state_hash(m.to_dict(include_history=False))
+                        != e["hash"]):
+                    first_off = (f"at #{n} `!{' '.join(toks)}`"[:120])
+            elif kind == "state":
+                from action import _rollback_match
+                st_state = copy.deepcopy(e.get("state") or {})
+                st_state["id"] = mid        # `as=` renames the match
+                _rollback_match(m, mgr, st_state)
+                if m.system_name in mgr.systems:
+                    mgr.apply_system_rules(m)
+                rng = e.get("rng")
+                if isinstance(rng, list) and len(rng) >= 3:
+                    _replay_rng(m, [rng[0], rng[2]])
+                if verbose:
+                    out.append(journal_entry_text(e))
+            elif kind == "systems":
+                for sn, d in (e.get("systems") or {}).items():
+                    mgr.systems[sn] = GameSystem.from_dict(copy.deepcopy(d))
+                if e.get("system_name") in mgr.systems:
+                    m.system_name = e["system_name"]
+                for x in mgr.matches.values():
+                    if x.system_name in mgr.systems:
+                        mgr.apply_system_rules(x)
+                if verbose:
+                    out.append(journal_entry_text(e))
+            elif kind == "template":
+                _replay_template(mgr, e)
+                if verbose:
+                    out.append(journal_entry_text(e))
+            ran += 1
+        else:
+            continue
+        break
+    return {"ran": ran, "off": first_off}
+
+
 class _RequesterChannelCtx:
     """The approver's context re-pointed at the channel the request came
     from: the approver's identity and authority, the approver's replies,
@@ -4906,6 +5626,133 @@ def _rel_has(d: Any, path: str) -> bool:
             return False
         d = d[k]
     return True
+
+
+def _parse_count(token: str, usage: str) -> int:
+    """A positive whole count typed by the user, or a clean refusal."""
+    try:
+        n = int(token)
+    except ValueError:
+        raise VTTError(f"`{token}` isn't a count (usage: `{usage}`).")
+    if n < 1:
+        raise VTTError(f"The count must be at least 1 (`{usage}`).")
+    return n
+
+
+def _step_line(i: int, step: Dict[str, Any]) -> str:
+    by = f" by {step['by']}" if step.get("by") else ""
+    return f"{i}. `{step.get('label', '?')}`{by} ({step.get('at', '?')})"
+
+
+async def _system_history(ctx: ReplyContext, args: List[str],
+                          mgr: MatchManager):
+    n = _parse_count(args[1], "!system history") if len(args) > 1 else 10
+    _check_tail(args, 2, (), "!system history [n]")
+    hist = mgr.system_history
+    if not hist:
+        return await ctx.send("No server-wide edits to undo.")
+    lines = [f"**Server-wide edits** ({len(hist)} kept, newest first; "
+             f"`!system undo N` undoes the newest N):"]
+    lines += [_step_line(i, step)
+              for i, step in enumerate(reversed(hist[-n:]), 1)]
+    return await ctx.send("\n".join(lines))
+
+
+def _apply_server_state(mgr: MatchManager, state: Dict[str, Any]) -> None:
+    mgr.systems = {n: GameSystem.from_dict(copy.deepcopy(d))
+                   for n, d in (state.get("systems") or {}).items()}
+    mgr.default_system_name = state.get("default_system_name") or "default"
+    mgr.default_system_per_channel = dict(
+        state.get("default_system_per_channel") or {})
+
+
+async def _system_undo(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    """`!system undo [N] [preview|confirm]`: put the systems and default
+    pointers back as they were before the newest N server-wide edits, and
+    re-apply rules to every match (its units take the var names those rules
+    give back)."""
+    rest = [a.lower() for a in args[1:]]
+    mode = None
+    if rest and rest[-1] in ("preview", "confirm"):
+        mode = rest.pop()
+    if len(rest) > 1:
+        raise VTTError("Usage: `!system undo [N] [preview|confirm]`.")
+    n = _parse_count(rest[0], "!system undo") if rest else 1
+    hist = mgr.system_history
+    if not hist:
+        raise VTTError("There's no server-wide edit to undo.")
+    if n > len(hist):
+        raise VTTError(f"Only {len(hist)} server-wide edit(s) are kept.")
+    step = hist[-n]
+    target = step["state"]
+    tsys = target.get("systems") or {}
+    after: Dict[str, str] = {}
+    blockers: List[str] = []
+    for mid, m in sorted(mgr.matches.items()):
+        name = m.system_name
+        if name not in tsys:
+            old = step["matches"].get(mid)
+            if old in tsys:
+                name = old
+            else:
+                blockers.append(f"match `{mid}` uses `{m.system_name}`, which "
+                                f"didn't exist then")
+        after[mid] = name
+    if blockers:
+        raise VTTError("Can't undo: " + "; ".join(blockers) + ". Move or "
+                       "delete those matches first.")
+    diff = _server_state_diff(mgr.server_state(), target)
+    undone = [_step_line(i, s)
+              for i, s in enumerate(reversed(hist[-n:]), 1)]
+    if mode == "preview" or (n > 1 and mode != "confirm"):
+        head = ("Undoing" if mode == "preview" else
+                f"This undoes {n} server-wide edits; add `confirm` to go "
+                f"ahead. Undoing")
+        lines = [f"{head}:"] + undone + ["Changes:"]
+        lines += [f"- {d}" for d in diff] or ["- (nothing)"]
+        return await ctx.send("\n".join(lines))
+    pre_state = mgr.server_state()
+    pre_names = {mid: m.system_name for mid, m in mgr.matches.items()}
+    snap = _snapshot_all_matches(mgr)
+    named = {(mid, eid): dict(e.var_names) for mid, m in mgr.matches.items()
+             for eid, e in m.entities.items()}
+    notes: List[str] = []
+    try:
+        _apply_server_state(mgr, target)
+        # As `!system set` does: under var_name_collision refuse, a var in
+        # the way of a rename refuses the whole undo.
+        conflicts: List[str] = []
+        for mid, m in sorted(mgr.matches.items()):
+            trial = mgr._build_rules_dict(mgr.systems[after[mid]])
+            if str(trial.get("var_name_collision")) == "refuse":
+                conflicts += [f"{mid}: {c}"
+                              for c in m.var_name_conflicts(trial)]
+        if conflicts:
+            raise VTTError("Can't undo: " + " ".join(conflicts[:5])
+                           + (f" (and {len(conflicts) - 5} more)"
+                              if len(conflicts) > 5 else ""))
+        for mid, m in mgr.matches.items():
+            m.system_name = after[mid]
+        for m in mgr.matches.values():
+            notes += mgr.apply_system_rules(m)
+    except VTTError:
+        _apply_server_state(mgr, pre_state)
+        for mid, m in mgr.matches.items():
+            m.system_name = pre_names[mid]
+        _restore_all_matches(mgr, snap)
+        raise
+    del hist[-n:]
+    mgr._skip_system_step = True
+    lines = [f"↩️ Undid {n} server-wide edit(s):"] + undone
+    lines += [f"- {d}" for d in diff]
+    moved = sum(1 for mid, m in mgr.matches.items()
+                for eid, e in m.entities.items()
+                if (mid, eid) in named and named[(mid, eid)] != e.var_names)
+    if moved:
+        lines.append(f"{moved} unit(s) moved their vars to the names the "
+                     f"restored rules give.")
+    lines += notes
+    return await ctx.send("\n".join(lines))
 
 
 #TODO: add "delete" command for gamesystems (but TEST IT VERY CAREFULLY, like making sure there is always at least one gamesystem per server that's defaulted to, etc.)
@@ -5239,6 +6086,10 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 2, "system", "lint"):
             return
         return await ctx.send(_system_lint(mgr, mgr.get_system(args[1])))
+    if sub == "history":
+        return await _system_history(ctx, args, mgr)
+    if sub == "undo":
+        return await _system_undo(ctx, args, mgr)
 
     # ---- system tile / func <action> <system> ... ----------------------
     # The system's tile template and formula function libraries, edited in
@@ -5872,6 +6723,8 @@ async def _system_func(ctx: ReplyContext, args: List[str],
 
 
 registry.annotate_sub("system", "list", usage="!system list", desc="List existing GameSystems.")
+registry.annotate_sub("system", "history", usage="!system history [n]", desc="The server-wide edits `!system undo` can take back (system rules, libraries, defaults, `!defvar` / `!defpassive` / `!gclamp`, log formats, default-system pointers), newest first, with who ran each and when. Administrators only.")
+registry.annotate_sub("system", "undo", usage="!system undo [n] [preview|confirm]", desc="Put every system and the default-system pointers back as they were before the newest n (default 1) server-wide edits, and re-apply the rules to every match (units take the var names those rules give). More than one step asks for `confirm`; `preview` lists the changes. Refused while a match uses a system that didn't exist then. `!store load` and `!server wipe` clear this history. Administrators only; the bot owner sets how many steps a server keeps (system_undo_steps).")
 registry.annotate_sub("system", "info", usage="!system info <name>", desc="Show a GameSystem's settings.")
 registry.annotate_sub("system", "rules", usage="!system rules", desc="List all available rules, their defaults, their types, and descriptions")
 registry.annotate_sub("system", "new", usage="!system new <name> [parent=<system>]", desc="Create a GameSystem, optionally inheriting from another: a child holds only its own overrides and reads everything else (rules, structured rules, aliases, tile templates, formula functions) live from its parent chain.")
@@ -9893,6 +10746,13 @@ def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot,
     # the table, and host commands held for `!match resume` stay held.
     new_match.paused = old.paused
     new_match.held_commands = old.held_commands
+    # The RNG keeps rolling from where it is: an undo followed by the same
+    # roll gets new numbers, as before the RNG had a saved position.
+    new_match.rng_seed = old.rng_seed
+    new_match.rng_pos = old.rng_position()
+    new_match._rng, new_match._rng_seed = old._rng, old._rng_seed
+    # The journal records the restore as a stored state (see _run).
+    new_match.journal = old.journal
     # A snapshot `!history import`ed from ANOTHER match restores that board
     # here, but the match stays itself: its id (the key everything files
     # under — two matches reporting one id sent this match's approval
@@ -10355,6 +11215,7 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         full, path = saves_path(args[2], mgr, write=True)
         snap = _resolve_snapshot_selector(m, selector)
         _write_save_file(mgr, full, path, snap.to_dict())
+        audit_note(f"exported a snapshot of `{m.id}` to `{path}`")
         return await ctx.send(
             f"Exported {snap.kind} snapshot (seq {snap.sequence}) to `{path}`."
         )
@@ -10407,6 +11268,7 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         snap.kind = "manual"
         snap.label = name
         m.history.manual_saves[name] = snap
+        audit_note(f"imported `{path}` into `{m.id}` as manual save `{name}`")
         return await ctx.send(
             f"Imported snapshot from `{path}` as manual save `{name}` "
             f"(round {snap.round_at_snapshot})."
@@ -10652,6 +11514,7 @@ _DIFF_SKIP_KEYS = frozenset({
     "round_number", "active_index", "turn_order", "rules", "entities",
     "global_passives", "groups", "tiles", "zones", "vars", "team_data",
     "outcome", "event_log", "turns_elapsed", "turn_vacated", "round_started",
+    "rng_seed", "rng_pos",
 })
 
 
@@ -11020,6 +11883,7 @@ async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         path, shown = saves_path(args[1], mgr, write=True)
         _write_save_file(mgr, path, shown,
                          mgr.save_data(include_history=include_history))
+        audit_note(f"saved the server to `{shown}`")
         suffix = " (with autosave history)" if include_history else ""
         return await ctx.send(f"Saved to `{shown}`{suffix}")
     if sub == "load":# and len(args) >= 2:
@@ -11032,6 +11896,7 @@ async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             # MatchManager.load names the absolute path it failed on; report
             # the saves-relative name instead so no host path leaks.
             raise VTTError(str(ex).replace(path, shown))
+        audit_note(f"loaded the server from `{shown}`")
         return await ctx.send(f"Loaded from `{shown}`"
                               + "".join(f"\n⚠️ {n}" for n in notes))
     # Fallback: show authoritative help
@@ -12825,7 +13690,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"place {count}. (place_random fills cells with no "
                 f"existing tile data.)"
             )
-        chosen = random.sample(empty, count)
+        chosen = m.formula_rng().sample(empty, count)
         for px, py in chosen:
             m.place_tile_template(name, px, py, overrides=overrides or None)
         chosen.sort()
@@ -14882,7 +15747,7 @@ def _dry_refusal(name: str, args: List[str]) -> Optional[str]:
         why = "its effect lives outside the match, which a dry run can't undo"
     elif name == "template" and sub not in _DRY_TEMPLATE_READS:
         why = "the template library is written straight to disk"
-    elif name == "match" and sub in ("delete", "pause", "resume"):
+    elif name == "match" and sub in ("delete", "pause", "resume", "rng"):
         why = "a dry run can't put that back as it was"
     if why is None:
         return None
@@ -15083,6 +15948,7 @@ async def run_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(
             f"❌ `{path}`: nesting limit ({rec_limit}) exceeded — a script or "
             f"macro keeps running itself (macro_recursion_limit).")
+    audit_note(f"ran `{path}` ({len(subcommands)} command(s))")
     await ctx.send(
         f"Running {len(subcommands)} command(s) from `{path}`..."
     )

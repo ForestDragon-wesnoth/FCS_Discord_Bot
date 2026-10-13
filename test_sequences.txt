@@ -22810,3 +22810,349 @@ player's own overrides): bob runs `!ent` and even `!ent dump` without
 approval while carol's hp change queues and her dump is refused; a
 per-player `ent dump` host_only then closes the dump to bob alone.
 Clearing bob's `ent` override puts him back under the match-wide rules.
+
+SCENARIO 774 — Server-wide undo (!system history / !system undo) on a multi-tile unit
+----------------------------------------------------------------------
+
+!system new base
+!system new skirm parent=base
+!match new s774 Lab 8 8 system=skirm
+!match use s774
+!ent add hero Hero 10 2 2
+!ent add ogre Ogre 30 5 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!system set base hp_var life
+!system set skirm friendlyfire true
+!assert "entity[ogre].life == 30 and entity[hero].life == 10"
+!system history
+?? 1. `!system set skirm friendlyfire true` by cli
+?? 2. `!system set base hp_var life` by cli
+!system undo 2
+?? This undoes 2 server-wide edits; add `confirm` to go ahead.
+?? - system `skirm`: rules friendlyfire
+!assert "entity[ogre].life == 30"
+!system undo preview
+?? Undoing:
+?? 1. `!system set skirm friendlyfire true`
+!system undo 2 confirm
+?? ↩️ Undid 2 server-wide edit(s):
+?? - system `base`: rules death_condition, default_clamps, default_kill_function_effects, default_revive_function_effects (+1 more)
+?? 2 unit(s) moved their vars to the names the restored rules give.
+!assert "entity[ogre].hp == 30 and entity[hero].hp == 10"
+!assert "footprint_width('ogre') == 2"
+!ent hp ogre -5
+!assert "entity[ogre].hp == 25"
+!system history
+?? 1. `!system new skirm parent=base` by cli
+!as restart
+!system history
+?? 1. `!system new skirm parent=base` by cli
+?? 2. `!system new base` by cli
+!defvar add armor 3
+!system undo
+?? - system `skirm`: rules default_entity_vars
+!system history 1
+?? 1. `!system new skirm parent=base` by cli
+?! `!defvar add armor 3`
+
+Expected: Every typed command that changes server-wide state (a system's
+rules or libraries, `!defvar` / `!defpassive` / `!gclamp`, the default
+system pointers) is one `!system undo` step, listed newest first by
+`!system history` with who ran it and when. Undoing the hp_var rename
+moves the units' `life` back to `hp`, the 2×2 ogre included, and the
+match keeps playing on the restored rules (the ogre takes 5 damage on
+`hp`). More than one step asks for `confirm`; `preview` lists what would
+change. The steps survive a restart (system_history.json). The undo
+itself is no new step: after undoing `!defvar add`, the history ends at
+`!system new skirm`.
+
+SCENARIO 775 — !system undo refusals: blocking matches, var collisions, renames, store load
+----------------------------------------------------------------------
+
+!system new base
+!match new s775 Lab 6 6 system=base
+!match use s775
+!ent add hero Hero 10 2 2
+!system new other
+!match new s775b Other 4 4 system=other
+!match use s775
+!system undo
+?? ❌ Can't undo: match `s775b` uses `other`, which didn't exist then. Move or delete those matches first.
+!match delete s775b
+!system undo
+?? - system `other` removed
+!system set base var_name_collision refuse
+!system set base hp_var life
+!ent set_var hero hp 3
+!system undo
+?? ❌ Can't undo: s775: `hero` already has a var `hp`
+!assert "entity[hero].life == 10 and entity[hero].hp == 3"
+!ent delete_var hero hp
+!system undo
+?? ↩️ Undid 1 server-wide edit(s):
+!assert "entity[hero].hp == 10"
+!system rename base core
+!match info
+?? system `core`
+!system undo
+?? - system `base` added
+?? - system `core` removed
+!match info
+?? system `base`
+!store save s775save
+!system set base friendlyfire true
+!store load s775save
+!system history
+?? No server-wide edits to undo.
+!system undo
+?? ❌ There's no server-wide edit to undo.
+!as player bob
+!system history
+?? ❌ Only a server administrator can read that
+!system undo
+?? ❌ Only a server administrator can do that
+
+Expected: HARNESS-ALLOWS-ERRORS. An undo that would remove a system a
+match uses now is refused with the match named. Under
+var_name_collision refuse a var in the way of the rename back refuses
+the whole undo and changes nothing (hero keeps `life` 10 and the `hp` 3
+it was given); once the var is gone the undo runs. A `!system rename` is
+undone with the match following the name back. `!store load` replaces
+the server, so the steps before it go. History and undo are for
+administrators only.
+
+SCENARIO 776 — Server audit log (!server audit)
+----------------------------------------------------------------------
+
+!system new base
+!match new s776 Lab 6 6 system=base
+!match use s776
+!ent add hero Hero 10 2 2
+!system set base friendlyfire true
+!template save hero champ
+!template rename champ champion
+!template delete champion
+!match new s776b Other 4 4
+!match delete s776b
+!store save s776save
+!batch !system set base friendlyfire false ; !defvar add armor 2
+!server audit
+?? `!batch system set base friendlyfire false ; defvar add armor 2`
+?? · system `base`: rules default_entity_vars, friendlyfire
+?? · saved the server to `saves/s776save`
+?? · deleted match `s776b`
+?? · template `champion` deleted
+?? · template `champ` renamed to `champion`
+?? · template `champ` saved
+?? · system `base`: rules friendlyfire
+?? · system `base` added
+?! `!ent add hero
+!server audit 1
+?? `!batch system set base friendlyfire false ; defvar add armor 2`
+?! s776save
+!as restart
+!server audit 2
+?? · saved the server to `saves/s776save`
+!as player bob
+!server audit
+?? ❌ Only a server administrator can read that
+
+Expected: HARNESS-ALLOWS-ERRORS. `!server audit` lists, newest first, who
+changed what server-wide: system edits (with the systems and rules
+they touched; a batch of them is one entry), template saves, renames and
+deletes, a deleted match, a server save. Match commands (`!ent add`)
+aren't in it. The log survives a restart (audit.json) and is for
+administrators only.
+
+SCENARIO 777 — Per-match RNG (!match rng): seeds, positions, restart, undo, clone
+----------------------------------------------------------------------
+
+!match new r777 Lab 6 6
+!match use r777
+!match rng set alpha
+?? 🎲 `r777` now rolls from seed `alpha`, 0 word(s) in.
+!match var set first "$(roll('1d1000'))"
+!match var set second "$(roll('1d1000'))"
+!match rng
+?? `alpha`
+!match rng set alpha
+!assert "roll('1d1000') == match_var_get('first')"
+!as restart
+!assert "roll('1d1000') == match_var_get('second')"
+!match rng set alpha 0
+!match var set third "$(roll('1d1000'))"
+!undo command
+!assert "roll('1d1000') == match_var_get('second')"
+!match rng set auto
+?! `alpha`
+!match clone r777c
+!match use r777c
+!match rng
+?! `alpha`
+?? 0 word(s) in
+!history list commands
+?! rng
+!system set default random_seed fixed
+!match rng
+?? the system's random_seed rule `fixed`
+!as player bob
+!match rng
+?? ❌ Only a host can do that.
+
+Expected: HARNESS-ALLOWS-ERRORS. Every match rolls from its own seed (or
+the system's random_seed rule when set) and counts how far into the
+sequence it is. Setting a seed restarts the sequence, so the first roll
+after re-seeding `alpha` repeats the first one; the position survives a
+restart (the roll after `!as restart` continues where it was). An undo
+keeps rolling from the live position: after undoing the command that
+rolled `third`, the next roll is the sequence's second number. A
+clone gets a fresh seed. Seed changes aren't undo steps. Players can't
+read the seed (it predicts every roll).
+
+SCENARIO 778 — Command journal: what it records (!match journal)
+----------------------------------------------------------------------
+
+!system new base
+!match new j778 Lab 8 8 system=base
+!match use j778
+!ent add hero Hero 10 2 2
+!ent add ogre Ogre 30 5 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!roll 1d20
+!ent hp ogre "-$(roll('1d6'))"
+!ent info hero
+!ent move hero 2 right
+!undo command
+!system set base friendlyfire true
+!template save hero champ
+!as player bob
+!ent hp hero 7
+!as host
+!approve all
+!match journal
+?! `!ent info
+?! `!roll
+?! `!approve
+?? `!ent hp hero 7`
+?? template `champ` saved
+?? systems `base` changed
+?? stored state after `!undo command`
+?? `!ent move hero 2 right`
+?? `!ent hp ogre -$(roll('1d6'))`
+?? `!ent set_vars ogre footprint_w=2 footprint_h=2`
+!as restart
+!match journal 2
+?? `!ent hp hero 7`
+?? template `champ` saved
+?! systems
+!as player bob
+!match journal
+?? ❌ Only a host can do that.
+
+Expected: HARNESS-ALLOWS-ERRORS. The journal lists every command that
+changed the match, as typed (an inline `$()` stays unevaluated: a replay
+re-evaluates it with the RNG where it was), with its author. Reads
+(`!ent info`) and rolls that change nothing (`!roll`) aren't entries;
+the RNG position each entry records covers them. An undo is a stored
+state. A system edit and a template save are entries too. A player's
+approved command is recorded as the command that ran (the `!approve`
+around it isn't). The journal survives a restart; players can't read it.
+
+SCENARIO 779 — Journal export and !match replay rebuild the match
+----------------------------------------------------------------------
+
+!store save blank779
+!system new base
+!match new j779 Lab 8 8 system=base
+!match use j779
+!ent add hero Hero 10 2 2
+!ent add ogre Ogre 30 5 5
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent set_var hero dmg "$(roll('1d6'))"
+!ent hp ogre "-$(roll('2d6'))"
+!ent move ogre 1 left
+!system set base hp_var life
+!template save hero champ
+!template spawn champ 1 7
+!undo command
+!ent hp hero -3
+!match var set ogre_life "$(entity[ogre].life)"
+!match var set dmg "$(entity[hero].dmg)"
+!match journal export j779.json
+?? 📼 Wrote the journal of `j779`
+!store save j779save
+!store load blank779
+!match replay j779.json
+?? ✅ The state matched the recording after every command.
+!assert "entity[hero].life == 7 and footprint_width('ogre') == 2"
+!assert "entity[ogre].x == 4"
+!match journal
+?? `!match var set dmg $(entity[hero].dmg)`
+!store load blank779
+!match replay j779.json upto=6 as=j779b verbose
+?? (up to #6)
+?? `!ent set_var hero dmg $(roll('1d6'))`
+?! systems
+!assert "entity[ogre].hp < 30 and entity[hero].dmg >= 1"
+!match journal 2
+?? **Journal of `j779b`**
+?! #7
+
+Expected: HARNESS-ALLOWS-ERRORS. `!match journal export` writes the
+journal with the state, systems and templates it starts from. After
+`!store load` puts the server back to empty, `!match replay` rebuilds
+the match: the system, then each entry in order — every command as its
+author, with the RNG where it was (the d6 and 2d6 roll the same numbers),
+the system edit, the template save, the stored state after the undo —
+and reports that the state matched the recording after every command.
+`upto=6` stops after entry 6 (the ogre has taken its 2d6, the system
+edit hasn't happened), `as=` names the new match, `verbose` shows each
+command's replies. The rebuilt match's journal is the recording's, up to
+where the replay stopped.
+
+SCENARIO 780 — !match replay refusals and journal limits
+----------------------------------------------------------------------
+
+!system new base
+!match new j780 Lab 6 6 system=base
+!match use j780
+!ent add hero Hero 10 2 2
+!match journal export j780.json
+!match replay j780.json
+?? ❌ This server already has a match `j780`: replay with `as=<new id>`.
+!system set base friendlyfire true
+!match replay j780.json as=j780b
+?? ❌ This server holds different versions of what the journal starts with: system `base`
+!store save notjournal
+!match replay notjournal
+?? isn't a journal export
+!match replay missing.json
+?? ❌ File not found
+!system set base command_journal_limit 2
+!ent hp hero 9
+!ent hp hero 8
+!ent hp hero 7
+!ent hp hero 6
+!ent hp hero 5
+!match journal
+?? from a stored state (rollover
+?? `!ent hp hero 5`
+?? `!ent hp hero 6`
+?! `!ent hp hero 9`
+!system set base command_journal_limit 0
+!ent hp hero 4
+!match journal
+?? keeps no journal (command_journal_limit is 0)
+!match journal export x.json
+?? ❌ `j780` keeps no journal
+!as player bob
+!match replay j780.json as=j780c
+?? ❌ Only a server administrator can do that
+
+Expected: HARNESS-ALLOWS-ERRORS. A replay is refused when the match id
+is taken (`as=` picks another), when a system a match here uses differs
+from the journal's, and for a file that isn't a journal export. With
+command_journal_limit 2 a journal keeps between 2 and 4 entries: a full
+stretch starts a new one from the state then and the stretch before it
+goes. 0 turns the journal off and drops it. Replays are for
+administrators.

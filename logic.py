@@ -137,7 +137,7 @@ class ReservedId(VTTError):
 # VTTError for HistoryError. logic and match_history have a circular
 # dependency, broken by importing match_history late here and importing
 # VTTError eagerly from match_history's side.
-from match_history import MatchHistory
+from match_history import MatchHistory, _now_iso as _utc_now
 
 # -------------------------
 # Data Models
@@ -2657,17 +2657,16 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "default": "",
         "schema": {"type": "str"},
         "desc": (
-            "Seed for the match's formula RNG (random_int / random_string). "
-            "Empty (default) means UNSEEDED — every roll is independent. "
-            "Set a non-empty value to make rolls reproducible: the match "
-            "uses a dedicated random.Random seeded with this string, so a "
-            "given sequence of rolls replays identically. The RNG resets "
-            "to the seed when the match (re)loads or when the seed value "
-            "changes — the seed itself is saved with the match, but the "
-            "live RNG cursor position is not, so reproducibility is from "
-            "the seed-set / load point, not across arbitrary mid-session "
-            "save/load. Mainly useful for testing encounters and for "
-            "deterministic replays."
+            "Seed for every match's RNG on this system (rolls, tables, "
+            "random cells, damage_spread fragments). Empty (default): each "
+            "match uses its own seed, made when it is created (a clone gets "
+            "a new one; `!match rng` shows or sets it). Set: every match on "
+            "the system rolls the same sequence from this seed, so an "
+            "encounter can be tested identically. Either way the RNG's "
+            "position is saved with the match (a reload continues the "
+            "sequence; an undo keeps rolling from where it is) and the "
+            "command journal records it, so `!match replay` rolls the same "
+            "numbers. Changing the seed starts its sequence from the top."
         ),
     },
     # ---- Match history / autosave / undo --------------------------------
@@ -2681,6 +2680,25 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     #
     # For all six values, -1 means "unlimited / disable check" and 0
     # means "disable that snapshot kind / prompt entirely".
+    "command_journal_limit": {
+        "default": 5000,
+        "schema": {"type": "int", "min": 0, "max": 100000, "unlimited": True,
+                   "ceiling": True},
+        "desc": (
+            "Size of each match's command journal (`!match journal`): every "
+            "command that changed the match, with who ran it, when and the "
+            "RNG position, plus edits to its system and the server's "
+            "templates; `!match journal export` writes it as a bundle that "
+            "`!match replay` rebuilds the match from. The journal starts "
+            "from a stored state (the match's creation, or its first command "
+            "after the journal was turned on); once this many entries "
+            "follow it, a new stored state starts the next stretch and the "
+            "stretch before the previous one is dropped, so an export always "
+            "covers between this many and twice this many entries. 0 = no "
+            "journal (an existing one is dropped); -1 = as many as the bot "
+            "owner's ceiling allows."
+        ),
+    },
     "autosave_round_retention": {
         "default": -1,
         "schema": {"type": "int", "min": 0, "unlimited": True},
@@ -4638,7 +4656,67 @@ OWNER_LIMITS: Dict[str, Dict[str, Any]] = {
         "desc": "How many systems an inheritance chain may hold, the system "
                 "itself included (base -> skirmish -> night is 3).",
     },
+    "system_undo_steps": {
+        "default": 50, "min": 0, "max": 1000,
+        "desc": "How many server-wide edits each server keeps for "
+                "`!system undo` (0 = none).",
+    },
+    "audit_log_entries": {
+        "default": 500, "min": 0, "max": 10000,
+        "desc": "How many entries each server's `!server audit` log keeps "
+                "(0 = no log).",
+    },
 }
+
+
+# The furthest `CountingRandom.advance` goes (a typed `!match rng set` or a
+# saved position): skipping words costs time.
+RNG_ADVANCE_LIMIT = 100_000_000
+
+
+def new_rng_seed() -> str:
+    """A fresh seed for a match's own RNG."""
+    import secrets
+    return secrets.token_hex(8)
+
+
+class CountingRandom(random.Random):
+    """random.Random counting the 32-bit words it draws (`drawn`), so a
+    point in its sequence is one number: random() draws two, getrandbits(k)
+    one per started 32 bits, and every other method draws through those.
+    advance(n) skips n words, getstate / setstate carry the count."""
+
+    def __init__(self, seed: Any = None):
+        self.drawn = 0
+        super().__init__(seed)
+
+    def seed(self, a: Any = None, version: int = 2) -> None:
+        super().seed(a, version)
+        self.drawn = 0
+
+    def random(self) -> float:
+        self.drawn += 2
+        return super().random()
+
+    def getrandbits(self, k: int) -> int:
+        if k > 0:
+            self.drawn += (k + 31) // 32
+        return super().getrandbits(k)
+
+    def getstate(self) -> Any:
+        return (super().getstate(), self.drawn)
+
+    def setstate(self, state: Any) -> None:
+        super().setstate(state[0])
+        self.drawn = state[1]
+
+    def advance(self, n: int) -> None:
+        n = int(n)
+        while n > 0:
+            step = min(n, 100_000)
+            super().getrandbits(32 * step)
+            self.drawn += step
+            n -= step
 
 
 def owner_limit(key: str) -> int:
@@ -6239,6 +6317,13 @@ class Match:
     # what turn-based durations key on. Never decremented (a history restore
     # rolls it back with the rest of the state).
     turns_elapsed: int = 0
+    # The match's own RNG seed (made at creation; the random_seed rule, when
+    # set, overrides it) and the position its RNG had reached, in 32-bit
+    # words drawn (CountingRandom), so every match's rolls can be replayed
+    # from its command journal and a reload resumes the sequence. Neither
+    # is undo state: an undo keeps rolling from the live position.
+    rng_seed: str = field(default_factory=lambda: new_rng_seed())
+    rng_pos: int = 0
     # Tracks whether the very first `on_round_start`/`on_turn_start` have fired
     # for this match. False until the first `Match.next_turn()` call. Used to
     # make that first call begin the round (fire start-hooks for active_index)
@@ -6380,6 +6465,8 @@ class Match:
     # entity dies" contract. Serialized with the match. See
     # Match.add_scheduled / fire_scheduled_round / fire_scheduled_turn.
     scheduled: List[Dict[str, Any]] = field(default_factory=list)
+    # The counter behind generated schedule names (_mint_schedule_name).
+    schedule_seq: int = 0
 
     # Structured event log (the combat log). Each entry is a dict with at
     # least {type, round, turn, ...type-specific fields}. The engine
@@ -6613,6 +6700,10 @@ class Match:
     # reloaded match reseeds from scratch. _rng_seed tracks which seed
     # _rng was built with so a seed change triggers a rebuild.
     _rng: Any = field(default=None, repr=False, compare=False)
+    # The command journal (journal.Journal), or None until it starts.
+    # Runtime state kept beside the match: not in to_dict / undo snapshots;
+    # storage.py writes it under matches/<id>/journal/.
+    journal: Any = field(default=None, repr=False, compare=False)
     _rng_seed: Any = field(default=None, repr=False, compare=False)
     # One-time latch: warn once per match session that on_round_* logic is
     # dormant while ATB is active. Reset when ATB is found off in next_turn.
@@ -10332,22 +10423,41 @@ class Match:
 
     # ------------- turns -------------
 
-    def formula_rng(self):
-        """The match's RNG: a random.Random seeded from the random_seed rule
-        (built on first use, rebuilt when the seed changes), or the global
-        `random` module when unseeded. Every roll goes through here —
-        formulas, !roll, !table roll, damage_spread — so a seed holds from
-        the first roll. (It used to be built only when a formula engine
-        started, so a !roll before any formula ignored the seed.)"""
-        seed = self.rules.get("random_seed", "")
-        if not seed:
-            self._rng = None
-            self._rng_seed = None
-            return random
+    def formula_rng(self) -> "CountingRandom":
+        """The match's RNG, seeded with the random_seed rule when it is set
+        and with the match's own rng_seed otherwise. Built on first use at
+        the saved position (rng_pos), so a reload resumes the sequence; a
+        changed seed starts its sequence from the top. Every roll goes
+        through here — formulas, !roll, !table roll, damage_spread."""
+        seed = str(self.rules.get("random_seed", "") or "") or self.rng_seed
         if self._rng is None or self._rng_seed != seed:
-            self._rng = random.Random(seed)
+            fresh = self._rng is None
+            self._rng = CountingRandom(seed)
             self._rng_seed = seed
+            if fresh and self.rng_pos:
+                self._rng.advance(self.rng_pos)
+            self.rng_pos = self._rng.drawn
         return self._rng
+
+    def rng_position(self) -> int:
+        """Words the match's RNG has drawn since its seed (see formula_rng)."""
+        return self._rng.drawn if self._rng is not None else self.rng_pos
+
+    def set_rng(self, seed: Optional[str] = None,
+                pos: Optional[int] = None) -> None:
+        """Re-seed the match's own RNG and / or move it to word `pos` of its
+        sequence (`!match rng set`, a replay)."""
+        if seed is not None:
+            self.rng_seed = str(seed)
+        if pos is not None:
+            if not 0 <= int(pos) <= RNG_ADVANCE_LIMIT:
+                raise VTTError(f"An RNG position is 0 to "
+                               f"{RNG_ADVANCE_LIMIT}.")
+            self.rng_pos = int(pos)
+        elif seed is not None:
+            self.rng_pos = 0
+        self._rng = None
+        self._rng_seed = None
 
     def _rebuild_turn_order(self):
         """Sort the alive, initiative-bearing entities into `self.turn_order`
@@ -15504,9 +15614,16 @@ class Match:
             raise VTTError(f"schedule: invalid body: {ex}")
         return src
 
-    @staticmethod
-    def _mint_schedule_name() -> str:
-        return f"sched_{uuid.uuid4().hex[:8]}"
+    def _mint_schedule_name(self) -> str:
+        """`sched_<n>` from a counter saved with the match: the same names on
+        every run, so a replay matches (a random suffix made each replayed
+        schedule a new name)."""
+        taken = {s.get("name") for s in self.scheduled}
+        while True:
+            self.schedule_seq += 1
+            nm = f"sched_{self.schedule_seq}"
+            if nm not in taken:
+                return nm
 
     def add_scheduled(self, delay: Any, body: Any,
                       name: Optional[str] = None) -> str:
@@ -15717,6 +15834,9 @@ class Match:
             "rules": copy.deepcopy(self.rules),
             "round_number": self.round_number,
             "turns_elapsed": self.turns_elapsed,
+            "rng_seed": self.rng_seed,
+            "schedule_seq": self.schedule_seq,
+            "rng_pos": self.rng_position(),
             "round_started": self.round_started,
             "turn_vacated": self.turn_vacated,
             "global_passives": {pid: p.to_dict() for pid, p in self.global_passives.items()},
@@ -15837,6 +15957,16 @@ class Match:
         # m.rules already set above
         m.round_number = int(d.get("round_number", 1))
         m.turns_elapsed = int(d.get("turns_elapsed", 0))
+        try:
+            m.schedule_seq = max(0, int(d.get("schedule_seq", 0)))
+        except (TypeError, ValueError):
+            m.schedule_seq = 0
+        if d.get("rng_seed"):
+            m.rng_seed = str(d["rng_seed"])
+            try:
+                m.rng_pos = max(0, int(d.get("rng_pos", 0)))
+            except (TypeError, ValueError):
+                m.rng_pos = 0
         m.round_started = bool(d.get("round_started", False))
         m.turn_vacated = d.get("turn_vacated") if d.get("turn_vacated") in (
             "same", "wrap") else None
@@ -18467,6 +18597,45 @@ class MatchManager:
         # written to templates/<name>.json as each is saved (storage.py),
         # outside undo.
         self.templates: Dict[str, Dict[str, Any]] = {}
+        # `!system undo`: the server-wide state (server_state) as it was
+        # before each command that changed it, oldest first, with who ran
+        # the command and when (record_system_step). Saved as
+        # system_history.json; kept to the owner's system_undo_steps.
+        self.system_history: List[Dict[str, Any]] = []
+        # `!server audit`: who changed what server-wide, oldest first
+        # (record_audit). Saved as audit.json; kept to audit_log_entries.
+        self.audit_log: List[Dict[str, Any]] = []
+
+    # ----- server-wide undo and audit -----
+    def server_state(self) -> Dict[str, Any]:
+        """What `!system undo` puts back: every system and the server /
+        channel default-system pointers."""
+        return {"systems": {n: s.to_dict() for n, s in self.systems.items()},
+                "default_system_name": self.default_system_name,
+                "default_system_per_channel":
+                    dict(self.default_system_per_channel)}
+
+    def server_state_text(self) -> str:
+        return json.dumps(self.server_state(), sort_keys=True, default=str)
+
+    def record_system_step(self, pre_text: str, matches: Dict[str, str],
+                           label: str, by: str) -> None:
+        """Keep the server state from before a command that changed it
+        (`pre_text`, server_state_text) with the system each match was on
+        then, so `!system undo` can follow a system rename back."""
+        self.system_history.append({
+            "label": label, "by": by, "at": _utc_now(),
+            "state": json.loads(pre_text), "matches": dict(matches)})
+        keep = owner_limit("system_undo_steps")
+        if len(self.system_history) > keep:
+            del self.system_history[:len(self.system_history) - keep]
+
+    def record_audit(self, label: str, by: str, notes: List[str]) -> None:
+        self.audit_log.append({"label": label, "by": by, "at": _utc_now(),
+                               "notes": [str(n) for n in notes]})
+        keep = owner_limit("audit_log_entries")
+        if len(self.audit_log) > keep:
+            del self.audit_log[:len(self.audit_log) - keep]
 
     # ----- game systems -----
     def list_systems(self) -> List[str]:
@@ -19052,6 +19221,9 @@ class MatchManager:
         m.pending_requests = {}
         # A pause belongs to the table that paused it; the copy starts live.
         m.paused = None
+        # Its own dice: a copy rolling the original's numbers would let one
+        # table read the other's future.
+        m.set_rng(new_rng_seed())
         self.matches[m.id] = m
         return m
 
