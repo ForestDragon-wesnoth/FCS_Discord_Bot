@@ -9612,7 +9612,15 @@ SCENARIO 374 — !map resize: anchors, content shift, block vs kill on shrink
 !match use rs
 !ent add hero Hero 30 1 1 9
 !tile set 2 2 glyph T
+!match fog on
+!reveal_fog red at 2 2 0
 !map resize 6 6 bottom-right
+!map cell 4 4 as=red
+?? Tile: `{"glyph": "T"}`
+?! unseen
+!map cell 2 2 as=red
+?? unseen (fog)
+!match fog off
 !ent add far Far 10 6 1 9
 !map resize 3 3
 !system set default map_resize_shrink_mode kill
@@ -9622,7 +9630,11 @@ SCENARIO 374 — !map resize: anchors, content shift, block vs kill on shrink
 Expected: The grid starts 4x4 with Hero at (1,1) and a 'T' tile
 at (2,2). `!map resize 6 6 bottom-right` grows to 6x6 anchored at
 the bottom-right, so all content shifts by the full delta (+2,+2):
-Hero is now at (3,3) and the tile at (4,4). A second entity Far is
+Hero is now at (3,3) and the tile at (4,4). Fog reveals move with
+the content: team red (no units, fog on) had (2,2) revealed, and
+after the resize `!map cell 4 4 as=red` shows the tile there while
+(2,2) reads "unseen (fog)" (the reveal used to stay at (2,2)). Fog
+goes back off. A second entity Far is
 added at (6,1). `!map resize 3 3` (default top-left anchor, no
 shift) would cut everything past column/row 3: Far at (6,1) falls
 off-grid. With the default map_resize_shrink_mode=block the resize

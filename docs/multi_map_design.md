@@ -1,7 +1,8 @@
 # Multiple maps per match (#40) and nested maps (#164): agreed design
 
-Status: design in discussion with the user; nothing is built yet. Each item
-below was decided in chat unless it sits under "Open". Read this whole file
+Status: design agreed with the user. Step 1 of the build order (§8, the
+`Map` extraction) is built; the rest is not. Each item below was decided in
+chat; §11 lists what is deferred. Read this whole file
 before starting either feature: every decision here has long-term
 consequences, and the user made each one deliberately.
 
@@ -14,17 +15,16 @@ consequences, and the user made each one deliberately.
   a host: `on_host_death` reads as "the GM died". (The mount rule that
   broke this was renamed to `mount_on_vehicle_death`.)
 - **#164 Nested maps.** A map attached to a unit (a ship's deck, a building
-  interior) that travels with it. Its discussion is postponed (see the end
-  of this file); #40 comes first.
+  interior) that travels with it (§10). #40 comes first.
 
 ## 1. Model
 
-- **Match and Map split.** Today `Match` fuses the match and its one map. A
-  new `Map` class holds what is spatial:
+- **Match and Map split.** A `Map` holds what is spatial:
   - grid size, tiles and zones;
   - fog memory (`explored`) and fog reveals;
-  - background, borders, hidden layers;
-  - the map display settings (coords, legend, render mode).
+  - the per-map settings of §7 (fog, background, borders, hidden layers)
+    as map vars. Render mode, colour, rulers and the legend stay per match
+    (§7).
 
   `Match` keeps everything else: units, the turn order, rounds, rules,
   passives, definitions, functions, aliases, macros, tables, watchers, match
@@ -98,6 +98,14 @@ or `all` and return `[x, y, map]`), `cells_in_rect` / `_area` / `_cone` /
   `self`.
 - The map argument also takes shortcuts: the channel's viewed map (tier 4)
   and "this unit's map". Section 10 lists the open details.
+
+**Zones and hooks (decided).** Zone names are per map: two maps may each
+have a `fire` zone, `!map copy` copies zones without renaming them, and an
+aura moves with its unit to a new map. The zone formula functions
+(`zone_get`, `zone_cells`, ...) therefore follow the unit-less rule above
+and need `map=` once a match has several maps. Inside a tile or zone hook,
+formulas default to the hook's own map (so `tile_get(tile_x, tile_y, ...)`
+works without `map=`), and the hook binds `tile_map` / `zone_map` naming it.
 
 **Scattering across maps: N in total.** `!tile place_random N <kind>
 map=all` (or a list of maps) places N in total, with every eligible cell
@@ -277,7 +285,10 @@ share. An even distribution per map is a loop over the maps.
    `map` field. Every spatial function takes its map explicitly. Behaviour
    stays identical, proven by the full regression and the replay
    differential. This step goes in its own PR, with no new features
-   alongside.
+   alongside. **Built:** the grid size, tiles, zones, fog memory and
+   reveals moved to `Map`; the fog toggles, background, borders, hidden
+   layers and camera views stay on the match until step 2 makes them map
+   vars / per-map state (CLAUDE.md §7.8).
 2. **Multiple maps:**
    - `!map new/list/delete/resize/view/set`;
    - the map argument on the placement verbs;
@@ -308,14 +319,25 @@ share. An even distribution per map is a loop over the maps.
   - renderer parity on blank boards;
   - the memory-equals-disk check.
 
-## 10. Open
+## 10. Nested maps (#164)
 
-- **The rest of #164.** Postponed by the user. Points raised so far:
-  - does a unit inside count as standing on the map vehicle's cells for outer
-    distance (a rule)?
-  - can the inside see the outer map (a rule, or per-map data)?
-  - what happens to the interior's units when the map vehicle dies (below)?
-  - could a mount slot point at an inner map?
+- **What it is for.** An inner map carried by a unit, the map vehicle: a
+  spaceship's decks, a building's interior. Its occupants interact with the
+  outer map THROUGH the vehicle (a crew fires the ship's cannons). A mount
+  covers the other need: a rider on a horse or in a car is exposed and
+  interacts with the outside directly (§7.10 of CLAUDE.md). The two stay
+  separate features.
+- **Outer distance:** a unit on the inner map does NOT count as standing on
+  the vehicle's cells when distances are measured on the outer map. Units
+  on different maps have no relation (§2), and the inner map is a
+  different map. A cannon's range from the vehicle is written in the
+  cannon's action formulas, which measure from the vehicle unit.
+- **Vision:** units inside don't see out, and units outside don't see in.
+- **Mount slots** can't point at an inner map.
+- **`on_map_vehicle_moved`:** a hook fired for the units on the inner map
+  when the map vehicle completes a move (from `fire_entity_moved`), with
+  `map_vehicle` bound, so a GM can compose seasickness, a lurch, or a
+  passenger falling over.
 - **When a map vehicle dies** (user: it must vary per vehicle AND per
   occupant; mount deaths are to be revisited the same way later). The
   cases to cover:
@@ -327,7 +349,7 @@ share. An even distribution per map is a loop over the maps.
     because the vehicle is destroyed. Opposing teams can share an inner
     map.
 
-  Agreed so far:
+  Agreed:
   1. **Per-occupant effect program**, run once per occupant in turn order
      with `self` = occupant and `map_vehicle` bound. The program comes from
      the occupant's var (`__map_vehicle_death_effect`), else the vehicle's
@@ -364,3 +386,14 @@ share. An even distribution per map is a loop over the maps.
      them. The other choice loses them with the map, which suits a
      spaceship breaking up in space, where corpse tiles would only get in
      the way.
+
+## 11. Deferred
+
+- **Vision between an inner map and the outer one** (seeing out of a
+  ship's windows, seeing onto an open deck).
+- **Mount slots pointing at an inner map.**
+- **Cross-vehicle attacks** (one naval ship's crew attacking another
+  ship's deck directly): naval ships sit between a mount and a map
+  vehicle. Saved for later, outside the PR that builds nested maps.
+- **Mount deaths revisited** with per-vehicle and per-rider effects, as
+  map vehicle deaths have.

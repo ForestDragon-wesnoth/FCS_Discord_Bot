@@ -674,7 +674,7 @@ def _board_render(m, channel_key: str) -> Tuple[str, bool]:
     if viewport:
         vx, vy, vw, vh = viewport
         header = (f"🗺️ viewport ({vx},{vy})–({vx + vw - 1},{vy + vh - 1}) "
-                  f"of {m.grid_width}×{m.grid_height}\n")
+                  f"of {m.get_map().grid_width}×{m.get_map().grid_height}\n")
     coords = m.coords_on()
     # Richest first; each fallback drops one optional layer (the coordinate
     # rulers first: two-plus lines and a margin on every row).
@@ -721,7 +721,7 @@ async def _board_image(m, channel_key: str, mgr=None):
     if viewport:
         vx, vy, vw, vh = viewport
         header = (f"🗺️ viewport ({vx},{vy})–({vx + vw - 1},{vy + vh - 1}) "
-                  f"of {m.grid_width}×{m.grid_height}")
+                  f"of {m.get_map().grid_width}×{m.get_map().grid_height}")
     return header, data, bool(viewport)
 
 

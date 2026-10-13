@@ -20,7 +20,7 @@ from logic import COMMAND_USER, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Pas
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT
-from logic import check_id, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS
+from logic import check_id, default_maps, Map, DEFAULT_MAP_NAME, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution
@@ -1075,8 +1075,8 @@ def _grid_box(m: Match, x1: int, y1: int, x2: int, y2: int) -> set:
     """The on-grid cells of the rectangle between two corners. Clipped while
     it is built, so a typo'd radius (`!reveal_fog red at 1 1 1000000`) costs
     at most the grid instead of trillions of off-grid cells."""
-    lx, hx = max(1, min(x1, x2)), min(m.grid_width, max(x1, x2))
-    ly, hy = max(1, min(y1, y2)), min(m.grid_height, max(y1, y2))
+    lx, hx = max(1, min(x1, x2)), min(m.get_map().grid_width, max(x1, x2))
+    ly, hy = max(1, min(y1, y2)), min(m.get_map().grid_height, max(y1, y2))
     return {(x, y) for x in range(lx, hx + 1) for y in range(ly, hy + 1)}
 
 
@@ -2348,7 +2348,7 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                  else f"round {m.round_number}")
         return await ctx.send(
             f"**{m.name}** (`{m.id}`) — system `{m.system_name}`, grid "
-            f"{m.grid_width}×{m.grid_height}, {clock}, current turn: {turn}, "
+            f"{m.get_map().grid_width}×{m.get_map().grid_height}, {clock}, current turn: {turn}, "
             f"fog {'on' if m.fog_enabled else 'off'}, owner "
             f"{_mention(m.owner) if m.owner else '(none)'}."
             + (f"\n{_paused_msg(m)}" if m.paused else ""))
@@ -2578,9 +2578,10 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 for team in {e.team for e in m.entities.values() if e.team}:
                     m._record_vision(team)
             else:
-                # Off = reset: drop remembered cells (render falls back to
-                # current vision only).
-                m.explored.clear()
+                # Off = reset: drop remembered cells on every map (render
+                # falls back to current vision only).
+                for mp in m.maps.values():
+                    mp.explored.clear()
             return await ctx.send(
                 f"Fog memory **{'on' if m.fog_memory else 'off'}** for "
                 f"**{m.name}**."
@@ -4008,7 +4009,7 @@ def _template_resolver(mgr: MatchManager, ctx: ReplyContext,
     if not library and mid and mid in mgr.matches:
         return mgr.matches[mid]
     sysname = mgr.default_system_name
-    return Match(id="_templates", name="", grid_width=1, grid_height=1,
+    return Match(id="_templates", name="", maps=default_maps(1, 1),
                  system_name=sysname,
                  rules=mgr._build_rules_dict(mgr.systems[sysname]))
 
@@ -4184,7 +4185,7 @@ def _spawn_many(m: Match, name: str, tpl: Dict[str, Any], x: int, y: int,
     (x, y) that fit their bodies (within `near` if given, else anywhere on
     the map). All or nothing: if one doesn't fit, none stay."""
     from action import _rollback_match
-    radius = near if near is not None else max(m.grid_width, m.grid_height)
+    radius = near if near is not None else max(m.get_map().grid_width, m.get_map().grid_height)
     pre = m.to_dict(include_history=False)
     ids: List[str] = []
     log: List[str] = []
@@ -6331,7 +6332,7 @@ def _match_formula_slots(m: Match):
         for key in ("block", "opaque"):
             yield (f"tile template `{tname}` {key}", tpl.data.get(key), "eval",
                    frozenset(), False)
-    for (x, y), tile in sorted(m.tiles.items()):
+    for (x, y), tile in sorted(m.get_map().tiles.items()):
         if not isinstance(tile, dict):
             continue
         for when, src in sorted((tile.get("hooks") or {}).items()):
@@ -6340,7 +6341,7 @@ def _match_formula_slots(m: Match):
         for key in ("block", "opaque"):
             yield (f"tile ({x},{y}) {key}", tile.get(key), "eval", frozenset(),
                    False)
-    for zname, z in sorted(m.zones.items()):
+    for zname, z in sorted(m.get_map().zones.items()):
         for when, src in sorted((z.get("hooks") or {}).items()):
             yield (f"zone `{zname}` hook `{when}`", src, "exec", frozenset(),
                    False)
@@ -7808,9 +7809,9 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     f"❌ entity id `{cid}` already exists (or is "
                     f"duplicated in this batch)."
                 )
-            if not m.in_bounds(x, y):
+            if not m.get_map().in_bounds(x, y):
                 return await ctx.send(
-                    f"❌ ({x},{y}) outside {m.grid_width}x{m.grid_height}."
+                    f"❌ ({x},{y}) outside {m.get_map().grid_width}x{m.get_map().grid_height}."
                 )
             if (x, y) in seen_cells or (not src_stackable and m.is_occupied(x, y)):
                 return await ctx.send(
@@ -7881,7 +7882,8 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                         px, py = x + (oe.x - src.x), y + (oe.y - src.y)
                     clone = Entity.from_dict(payload)
                     _, spawn_log = clone.spawn(
-                        m, px, py, initiative=(src.initiative if oid == src_id else None))
+                        m, px, py, initiative=(src.initiative if oid == src_id else None),
+                        map_name=src.map)
                     clone.facing = oe.facing
                     logs.extend(spawn_log)
                 m._restamp_parts_for(idmap[src_id])
@@ -8705,9 +8707,9 @@ def _unit_line_shown(ctx: ReplyContext, mgr: MatchManager, mid: str,
         return not _pov_hides(m, pov, eid)
     loc = m.find_corpse(eid)
     if loc is not None:
-        cx, cy, corpse = loc
-        return m.corpse_visible_to(eid, corpse, cx, cy, pov)
-    return m.in_bounds(x, y) and m.tile_visible_to(x, y, pov)
+        cx, cy, corpse, cmap = loc
+        return m.corpse_visible_to(eid, corpse, cx, cy, pov, cmap)
+    return m.get_map().in_bounds(x, y) and m.tile_visible_to(x, y, pov)
 
 
 def _filter_unit_lines(text: str, ctx: ReplyContext, mgr: MatchManager) -> str:
@@ -8893,7 +8895,7 @@ def _map_render_reply(ctx: ReplyContext, m, args: List[str],
     if viewport:
         vx, vy, vw, vh = viewport
         header = (f"🗺️ viewport ({vx},{vy})–({vx + vw - 1},{vy + vh - 1}) "
-                  f"of {m.grid_width}×{m.grid_height} · "
+                  f"of {m.get_map().grid_width}×{m.get_map().grid_height} · "
                   f"`!map pan <dir> [n]` / `!map center <eid>`\n")
     block = _map_block(ctx, m, pov, hidden, viewport=viewport, legend=legend,
                        coords=coords)
@@ -8921,9 +8923,9 @@ def _visible_tile_data(m, x: int, y: int,
     tile or it's hidden. Corpses are stored inside tile data, so the ones
     the POV can't see (corpse_visibility_condition, fog) are dropped; a tile
     holding only hidden corpses reads as no tile."""
-    if (x, y) not in m.tiles or not m.tile_visible_to(x, y, pov):
+    if (x, y) not in m.get_map().tiles or not m.tile_visible_to(x, y, pov):
         return None
-    data = m.tiles[(x, y)]
+    data = m.get_map().tiles[(x, y)]
     if pov is None or not isinstance(data.get("corpses"), dict):
         return data
     seen = {cid: c for cid, c in data["corpses"].items()
@@ -8939,7 +8941,7 @@ def _cell_spec_source(m, x: int, y: int, key: str,
     """The tile-layer `block` / `opaque` spec governing (x, y) and where it
     comes from: the tile itself, its template, or the rule. ("", "") when
     nothing applies."""
-    cell = m.tiles.get((x, y))
+    cell = m.get_map().tiles.get((x, y))
     if cell is not None:
         if cell.get(key) not in (None, ""):
             return cell[key], "tile"
@@ -8975,8 +8977,8 @@ def _map_cell(ctx: ReplyContext, m, args: List[str]) -> str:
         if "=" not in a:
             raise VTTError(f"Unexpected `{a}`. Usage: `!map cell <x> <y> "
                            f"[for=<eid>]`.")
-    if not m.in_bounds(x, y):
-        raise VTTError(f"({x}, {y}) is off the {m.grid_width}×{m.grid_height} "
+    if not m.get_map().in_bounds(x, y):
+        raise VTTError(f"({x}, {y}) is off the {m.get_map().grid_width}×{m.get_map().grid_height} "
                        f"map.")
     pov = _view_pov(ctx, m, args[3:])
     mover = None
@@ -8984,7 +8986,7 @@ def _map_cell(ctx: ReplyContext, m, args: List[str]) -> str:
         if a.lower().startswith("for="):
             mover = _query_eid(ctx, m, a[4:])
     head = _as_note(args[3:]) + f"📍 **Cell ({x}, {y})**"
-    if not m._fog_terrain_visible(pov, x, y):
+    if not m._fog_terrain_visible(pov, x, y, m.get_map()):
         return head + " — unseen (fog)."
     lines = [head]
     units = []
@@ -9007,7 +9009,7 @@ def _map_cell(ctx: ReplyContext, m, args: List[str]) -> str:
         lines.append(f"Tile: `{shown}`")
     else:
         lines.append("Tile: none")
-    zones = sorted(n for n, z in m.zones.items()
+    zones = sorted(n for n, z in m.get_map().zones.items()
                    if (x, y) in z.get("cells", ()) and m.zone_visible_to(n, pov))
     lines.append("Zones: " + (", ".join(f"`{n}`" for n in zones) or "none"))
     corpses = [(cid, c) for cx, cy, cid, c in m.all_corpses()
@@ -9029,7 +9031,7 @@ def _map_cell(ctx: ReplyContext, m, args: List[str]) -> str:
             if src:
                 parts.append(f"{src}: {_fmt_spec(spec)}")
         for n in zones:
-            zspec = (m.zones[n].get("data") or {}).get(key)
+            zspec = (m.get_map().zones[n].get("data") or {}).get(key)
             if zspec not in (None, ""):
                 parts.append(f"zone `{n}`: {_fmt_spec(zspec)}")
             elif m.rules.get(zone_rule, "") not in (None, ""):
@@ -9045,13 +9047,13 @@ def _map_cell(ctx: ReplyContext, m, args: List[str]) -> str:
         berr: List[str] = []
         oerr: List[str] = []
         if show_tile:
-            blocks = m._eval_block_spec(m._tile_block_spec(x, y), mover,
+            blocks = m._eval_block_spec(m._tile_block_spec(x, y, m.get_map()), mover,
                                         {"tile_x": x, "tile_y": y}, berr)
             sees_blocked = m._eval_opaque_spec(
-                m._tile_opaque_spec(x, y), mover, {"tile_x": x, "tile_y": y},
+                m._tile_opaque_spec(x, y, m.get_map()), mover, {"tile_x": x, "tile_y": y},
                 oerr)
         for n in zones:
-            zd = m.zones[n].get("data") or {}
+            zd = m.get_map().zones[n].get("data") or {}
             bspec = zd.get("block")
             if bspec in (None, ""):
                 bspec = m.rules.get("zone_block_condition", "")
@@ -9198,7 +9200,7 @@ def _preview_cells(ctx, m, toks: List[str]) -> Tuple[str, List[Tuple[int, int]]]
         desc = f"rect ({x1},{y1}) to ({x2},{y2})"
     else:
         raise VTTError(f"Unknown preview shape `{toks[0]}`. Usage: {_PREVIEW_USAGE}")
-    return desc, sorted({(cx, cy) for (cx, cy) in cells if m.in_bounds(cx, cy)})
+    return desc, sorted({(cx, cy) for (cx, cy) in cells if m.get_map().in_bounds(cx, cy)})
 
 
 async def _map_preview(ctx, m, args: List[str]):
@@ -9312,7 +9314,8 @@ async def _map_ent_sight(ctx, m, args: List[str]):
     if pov is not None:
         # Mark only what the channel's own view shows: a sight shape drawn
         # over fog would trace the walls hidden in it.
-        cells = [c for c in cells if m._fog_terrain_visible(pov, *c)]
+        cells = [c for c in cells
+                 if m._fog_terrain_visible(pov, *c, m.map_of(e))]
     area = set(cells)
     seen = []
     for o in m.entities_in_turn_order() + [
@@ -9506,7 +9509,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         breakdown = ", ".join(f"{k}:{v}" for k, v in sorted(kinds.items())) or "none"
         fog_key = scene["fog"][0].get("sprite") if scene["fog"] else None
         lines = [
-            f"Scene ({m.grid_width}x{m.grid_height}): "
+            f"Scene ({m.get_map().grid_width}x{m.get_map().grid_height}): "
             f"{len(scene['placements'])} placement(s) [{breakdown}], "
             f"{len(scene['fog'])} fogged cell(s)"
             + (f" (sprite {fog_key or 'none'})" if scene["fog"] else "") + ", "
@@ -9697,7 +9700,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if args and args[0].lower() == "pan":
         if not m.viewport_engaged():
             return await ctx.send(
-                f"Map ({m.grid_width}×{m.grid_height}) fits the viewport "
+                f"Map ({m.get_map().grid_width}×{m.get_map().grid_height}) fits the viewport "
                 f"({m.rules.get('viewport_width')}×"
                 f"{m.rules.get('viewport_height')}); nothing to pan.")
         if len(args) < 2:
@@ -9715,7 +9718,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if args and args[0].lower() == "center":
         if not m.viewport_engaged():
             return await ctx.send(
-                f"Map ({m.grid_width}×{m.grid_height}) fits the viewport; "
+                f"Map ({m.get_map().grid_width}×{m.get_map().grid_height}) fits the viewport; "
                 f"nothing to center.")
         if len(args) == 2:
             eid = _resolve_eid(m, args[1])
@@ -10468,11 +10471,11 @@ async def reveal_fog_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(f"**{title}**\n{body}")
     m = active_match(mgr, ctx)
     if args[0].lower() == "list":
-        if not m.fog_reveals:
+        if not m.get_map().fog_reveals:
             return await ctx.send("No active fog reveals.")
         lines = ["**Fog reveals:**"]
-        for team in sorted(m.fog_reveals):
-            recs = m._active_reveals(team)
+        for team in sorted(m.get_map().fog_reveals):
+            recs = m._active_reveals(team, m.get_map())
             if not recs:
                 continue
             cnt = sum(len(r.get("cells", ())) for r in recs)
@@ -10514,8 +10517,8 @@ async def reveal_fog_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     cells = set()
     try:
         if form == "all":
-            cells = {(x, y) for x in range(1, m.grid_width + 1)
-                     for y in range(1, m.grid_height + 1)}
+            cells = {(x, y) for x in range(1, m.get_map().grid_width + 1)
+                     for y in range(1, m.get_map().grid_height + 1)}
         elif form == "at":
             cx, cy, r = int(rest[0]), int(rest[1]), int(rest[2])
             if r < 0:
@@ -10537,7 +10540,7 @@ async def reveal_fog_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         elif form in ("cone", "line"):
             from formula import _cells_in_cone, _cells_in_line
             limit = int(m.rules.get("formula_cell_limit", 100_000))
-            grid = (m.grid_width, m.grid_height)
+            grid = (m.get_map().grid_width, m.get_map().grid_height)
             if form == "cone":
                 # cone <x> <y> <dir> <length> [half_angle]
                 cx, cy, ln = int(rest[0]), int(rest[1]), int(rest[3])
@@ -10553,7 +10556,7 @@ async def reveal_fog_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 got = _cells_in_line(*(int(v) for v in rest), limit=limit,
                                      bounds=grid)
             cells = {(int(c[0]), int(c[1])) for c in got
-                     if m.in_bounds(int(c[0]), int(c[1]))}
+                     if m.get_map().in_bounds(int(c[0]), int(c[1]))}
         else:
             return await ctx.send(
                 "Usage: `!reveal_fog <team> all|at|rect|around|cone|line|clear "
@@ -11512,7 +11515,7 @@ def _diff_entity(eid: str, ea: Dict[str, Any], eb: Dict[str, Any],
 # command appends to it, so it would appear in every diff.
 _DIFF_SKIP_KEYS = frozenset({
     "round_number", "active_index", "turn_order", "rules", "entities",
-    "global_passives", "groups", "tiles", "zones", "vars", "team_data",
+    "global_passives", "groups", "maps", "vars", "team_data",
     "outcome", "event_log", "turns_elapsed", "turn_vacated", "round_started",
     "rng_seed", "rng_pos",
 })
@@ -11596,32 +11599,48 @@ def _format_snapshot_diff(snap_a: Snapshot, snap_b: Snapshot,
     if entity_change_lines:
         lines.append("- Entities changed:")
         lines.extend(entity_change_lines)
-    # Map: tiles per cell (their data flattened), zones and groups by name.
-    ta, tb = sa.get("tiles") or {}, sb.get("tiles") or {}
+    # Maps: tiles per cell (their data flattened), zones by name; with more
+    # than one map each line names its map. A map's other fields (size, fog
+    # memory, reveals) go to "Other changes".
+    maps_a, maps_b = sa.get("maps") or {}, sb.get("maps") or {}
+    many = len(set(maps_a) | set(maps_b)) > 1
     tile_lines: List[str] = []
-    for cell in sorted(set(ta) | set(tb), key=str):
-        if cell not in ta:
-            tile_lines.append(f"  + tile ({cell}): {tb[cell]!r}")
-        elif cell not in tb:
-            tile_lines.append(f"  - tile ({cell})")
-        else:
-            tile_lines.extend(_diff_flat(f"tile ({cell})", ta[cell], tb[cell], "  "))
+    zone_lines: List[str] = []
+    map_other: List[str] = []
+    for mname in list(maps_a) + [n for n in maps_b if n not in maps_a]:
+        if mname not in maps_a or mname not in maps_b:
+            map_other.append(f"map `{mname}` "
+                             + ("added" if mname in maps_b else "removed"))
+            continue
+        ma, mb = maps_a[mname], maps_b[mname]
+        at = f" on `{mname}`" if many else ""
+        ta, tb = ma.get("tiles") or {}, mb.get("tiles") or {}
+        for cell in sorted(set(ta) | set(tb), key=str):
+            if cell not in ta:
+                tile_lines.append(f"  + tile ({cell}){at}: {tb[cell]!r}")
+            elif cell not in tb:
+                tile_lines.append(f"  - tile ({cell}){at}")
+            else:
+                tile_lines.extend(_diff_flat(f"tile ({cell}){at}", ta[cell],
+                                             tb[cell], "  "))
+        za, zb = ma.get("zones") or {}, mb.get("zones") or {}
+        for name in sorted(set(za) | set(zb), key=str):
+            if name not in za:
+                zone_lines.append(f"  + zone `{name}`{at} ({len(zb[name].get('cells') or [])} cell(s))")
+            elif name not in zb:
+                zone_lines.append(f"  - zone `{name}`{at}")
+            elif za[name] != zb[name]:
+                ca, cb = len(za[name].get("cells") or []), len(zb[name].get("cells") or [])
+                what = (f"{ca} -> {cb} cell(s)" if ca != cb
+                        else "cells moved" if za[name].get("cells") != zb[name].get("cells")
+                        else "changed")
+                zone_lines.append(f"  ~ zone `{name}`{at}: {what}")
+        for k in sorted(set(ma) | set(mb)):
+            if k not in ("tiles", "zones") and ma.get(k) != mb.get(k):
+                map_other.append(f"`{mname}.{k}`" if many else f"`{k}`")
     if tile_lines:
         lines.append("- Tiles:")
         lines.extend(tile_lines)
-    zone_lines: List[str] = []
-    za, zb = sa.get("zones") or {}, sb.get("zones") or {}
-    for name in sorted(set(za) | set(zb), key=str):
-        if name not in za:
-            zone_lines.append(f"  + zone `{name}` ({len(zb[name].get('cells') or [])} cell(s))")
-        elif name not in zb:
-            zone_lines.append(f"  - zone `{name}`")
-        elif za[name] != zb[name]:
-            ca, cb = len(za[name].get("cells") or []), len(zb[name].get("cells") or [])
-            what = (f"{ca} -> {cb} cell(s)" if ca != cb
-                    else "cells moved" if za[name].get("cells") != zb[name].get("cells")
-                    else "changed")
-            zone_lines.append(f"  ~ zone `{name}`: {what}")
     if zone_lines:
         lines.append("- Zones:")
         lines.extend(zone_lines)
@@ -11648,10 +11667,11 @@ def _format_snapshot_diff(snap_a: Snapshot, snap_b: Snapshot,
     if gp_changes:
         lines.append("- Global passives:")
         lines.extend(gp_changes)
-    other = sorted(k for k in set(sa) | set(sb)
-                   if k not in _DIFF_SKIP_KEYS and sa.get(k) != sb.get(k))
+    other = sorted([f"`{k}`" for k in set(sa) | set(sb)
+                    if k not in _DIFF_SKIP_KEYS and sa.get(k) != sb.get(k)]
+                   + map_other)
     if other:
-        lines.append("- Other changes: " + ", ".join(f"`{k}`" for k in other))
+        lines.append("- Other changes: " + ", ".join(other))
     if len(lines) == 1:
         lines.append("(no differences)")
     return lines
@@ -13174,7 +13194,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         x, y = _parse_xy(args)
         path = args[3]
         value = _parse_scalar(args[4])
-        m.tile_set_path(x, y, path, value)
+        m.get_map().tile_set_path(x, y, path, value)
         ack = f"tile ({x},{y}).{path} = {value!r}" + _cell_formula_warning(m, path, value)
         # Advisory for a likely-bad render color (same spirit as entity
         # set_var): the renderer reads the top-level `color` field, which may
@@ -13194,9 +13214,9 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         x, y = _parse_xy(args)
         path = args[3] if len(args) >= 4 else None
-        if (x, y) not in m.tiles:
+        if (x, y) not in m.get_map().tiles:
             return await ctx.send(f"tile ({x},{y}) has no data.")
-        m.tile_del_path(x, y, path)
+        m.get_map().tile_del_path(x, y, path)
         if path:
             return await ctx.send(f"Removed `{path}` from tile ({x},{y}).")
         return await ctx.send(f"Cleared tile ({x},{y}).")
@@ -13211,12 +13231,12 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if extra not in ([], ["move"]):
             raise VTTError("Usage: `!tile copy <x1> <y1> <x2> <y2> [move]`.")
         move = extra == ["move"]
-        if not m.in_bounds(x2, y2):
-            raise VTTError(f"({x2}, {y2}) is off the {m.grid_width}×"
-                           f"{m.grid_height} map.")
+        if not m.get_map().in_bounds(x2, y2):
+            raise VTTError(f"({x2}, {y2}) is off the {m.get_map().grid_width}×"
+                           f"{m.get_map().grid_height} map.")
         if (x1, y1) == (x2, y2):
             raise VTTError("The source and destination are the same cell.")
-        src = m.tiles.get((x1, y1))
+        src = m.get_map().tiles.get((x1, y1))
         # Corpses are bodies lying on the cell, stored in its tile data:
         # they stay where they are (a copy would duplicate corpse ids).
         data = {k: copy.deepcopy(v) for k, v in (src or {}).items()
@@ -13224,18 +13244,18 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if not data:
             return await ctx.send(f"❌ tile ({x1},{y1}) has no tile data to "
                                   f"{'move' if move else 'copy'}.")
-        dest_corpses = (m.tiles.get((x2, y2)) or {}).get("corpses")
+        dest_corpses = (m.get_map().tiles.get((x2, y2)) or {}).get("corpses")
         if dest_corpses:
             data["corpses"] = dest_corpses
-        replaced = (x2, y2) in m.tiles and any(
-            k != "corpses" for k in m.tiles[(x2, y2)])
-        m.tiles[(x2, y2)] = data
+        replaced = (x2, y2) in m.get_map().tiles and any(
+            k != "corpses" for k in m.get_map().tiles[(x2, y2)])
+        m.get_map().tiles[(x2, y2)] = data
         if move:
             src_corpses = src.get("corpses")
             if src_corpses:
-                m.tiles[(x1, y1)] = {"corpses": src_corpses}
+                m.get_map().tiles[(x1, y1)] = {"corpses": src_corpses}
             else:
-                del m.tiles[(x1, y1)]
+                del m.get_map().tiles[(x1, y1)]
         verb = "Moved" if move else "Copied"
         return await ctx.send(
             f"{verb} tile ({x1},{y1}) to ({x2},{y2})"
@@ -13264,7 +13284,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # of hidden traps from a player channel).
         pov = _view_pov(ctx, m, args)
         views = {(x, y): _visible_tile_data(m, x, y, pov)
-                 for (x, y) in sorted(m.tiles.keys())}
+                 for (x, y) in sorted(m.get_map().tiles.keys())}
         coords = [c for c, v in views.items() if v is not None]
         if not coords:
             return await ctx.send("No special tiles in this match.")
@@ -13282,7 +13302,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # confirm, mirroring the !history undo confirmation pattern.
     if sub == "clear":
         confirmed = "confirm" in (a.lower() for a in args[1:])
-        n = len(m.tiles)
+        n = len(m.get_map().tiles)
         if n == 0:
             return await ctx.send("No tile data to clear.")
         if not confirmed:
@@ -13290,7 +13310,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"⚠️ This would clear all {n} special tile(s) in this match. "
                 f"To proceed: `!tile clear confirm`."
             )
-        m.tiles.clear()
+        m.get_map().tiles.clear()
         return await ctx.send(f"Cleared {n} tile(s).")
 
     # ---- hook add|del|list ----
@@ -13323,7 +13343,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 validate_formula(formula_src, mode="exec", known_funcs=frozenset(m.formula_functions.keys()))
             except FormulaError as ex:
                 return await ctx.send(f"❌ Invalid hook formula: {ex}")
-            m.tile_set_path(x, y, f"hooks.{when}", formula_src)
+            m.get_map().tile_set_path(x, y, f"hooks.{when}", formula_src)
             return await ctx.send(
                 f"Set tile ({x},{y}) `{when}` hook."
             )
@@ -13340,7 +13360,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     f"❌ Unknown tile hook '{when}'. Allowed: {allowed}."
                 )
             try:
-                m.tile_del_path(x, y, f"hooks.{when}")
+                m.get_map().tile_del_path(x, y, f"hooks.{when}")
             except NotFound:
                 return await ctx.send(
                     f"tile ({x},{y}) has no `{when}` hook."
@@ -13352,7 +13372,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if await return_help_if_not_enough_args(ctx, args, 4, "tile", "hook"):
                 return
             x, y = _parse_xy(args, offset=2)
-            data = m.tiles.get((x, y), {})
+            data = m.get_map().tiles.get((x, y), {})
             hooks = data.get("hooks") if isinstance(data, dict) else None
             if not isinstance(hooks, dict) or not hooks:
                 return await ctx.send(f"tile ({x},{y}): no hooks.")
@@ -13463,7 +13483,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return await ctx.send(f"❌ template `{name}` not found.")
             confirmed = "confirm" in (a.lower() for a in args[3:])
             instance_count = sum(
-                1 for t in m.tiles.values()
+                1 for t in m.get_map().tiles.values()
                 if isinstance(t, dict) and t.get("_template") == name
             )
             if instance_count and not confirmed:
@@ -13502,7 +13522,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             for tname in sorted(m.tile_templates.keys()):
                 tpl = m.tile_templates[tname]
                 placed = sum(
-                    1 for t in m.tiles.values()
+                    1 for t in m.get_map().tiles.values()
                     if isinstance(t, dict) and t.get("_template") == tname
                 )
                 hook_keys = ", ".join(sorted(tpl.hooks.keys())) or "—"
@@ -13519,7 +13539,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return await ctx.send(f"❌ template `{name}` not found.")
             tpl = m.tile_templates[name]
             placed = sum(
-                1 for t in m.tiles.values()
+                1 for t in m.get_map().tiles.values()
                 if isinstance(t, dict) and t.get("_template") == name
             )
             import json as _json
@@ -13595,10 +13615,10 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # fill that the GM has to clean up. The four corners are
         # representative because the rectangle is axis-aligned.
         for cx, cy in ((xa, ya), (xb, yb)):
-            if not m.in_bounds(cx, cy):
+            if not m.get_map().in_bounds(cx, cy):
                 return await ctx.send(
                     f"❌ corner ({cx},{cy}) is outside the "
-                    f"{m.grid_width}x{m.grid_height} grid."
+                    f"{m.get_map().grid_width}x{m.get_map().grid_height} grid."
                 )
         placed = 0
         for px in range(xa, xb + 1):
@@ -13642,7 +13662,7 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"Use `!tile def list` to see available templates.)"
             )
         coords = sorted(
-            (x, y) for (x, y), data in m.tiles.items()
+            (x, y) for (x, y), data in m.get_map().tiles.items()
             if isinstance(data, dict) and data.get("_template") == name
         )
         if not coords:
@@ -13680,9 +13700,9 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # Empty = in-bounds cell with no existing tile data.
         empty = [
             (x, y)
-            for x in range(1, m.grid_width + 1)
-            for y in range(1, m.grid_height + 1)
-            if (x, y) not in m.tiles
+            for x in range(1, m.get_map().grid_width + 1)
+            for y in range(1, m.get_map().grid_height + 1)
+            if (x, y) not in m.get_map().tiles
         ]
         if len(empty) < count:
             return await ctx.send(
@@ -13748,10 +13768,10 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     continue  # skip char (hole)
                 px = ax + col_idx
                 py = ay + row_idx
-                if not m.in_bounds(px, py):
+                if not m.get_map().in_bounds(px, py):
                     return await ctx.send(
                         f"❌ pattern cell ({px},{py}) is outside the "
-                        f"{m.grid_width}x{m.grid_height} grid."
+                        f"{m.get_map().grid_width}x{m.get_map().grid_height} grid."
                     )
                 placements.append((px, py, legend[ch]))
         if not placements:
@@ -13799,9 +13819,9 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(
                 f"❌ unknown tile hook `{hook_name}`. Allowed: {allowed}."
             )
-        if not m.in_bounds(x, y):
+        if not m.get_map().in_bounds(x, y):
             return await ctx.send(
-                f"❌ ({x},{y}) outside {m.grid_width}x{m.grid_height}."
+                f"❌ ({x},{y}) outside {m.get_map().grid_width}x{m.get_map().grid_height}."
             )
         log = m.fire_tile_hook(hook_name, eid, x, y)
         if not log:
@@ -13836,9 +13856,9 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                            key=lambda c: (c[1], c[0]))
         n = 0
         for c in cells:
-            if not m.in_bounds(*c):
+            if not m.get_map().in_bounds(*c):
                 continue
-            m.tile_set_path(c[0], c[1], path, value)
+            m.get_map().tile_set_path(c[0], c[1], path, value)
             n += 1
         skipped = (len(cells) if sub == "line" else area) - n
         tail = f" ({skipped} off-grid cell(s) skipped)" if skipped else ""
@@ -14068,7 +14088,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         name = args[1]
         try:
-            m.create_zone(name)
+            m.get_map().create_zone(name)
         except (VTTError, DuplicateId) as ex:
             return await ctx.send(f"❌ {ex}")
         return await ctx.send(f"Created empty zone `{name}`.")
@@ -14078,7 +14098,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "zone", "rename"):
             return
         _check_tail(args, 3, (), "!zone rename <name> <new_name>")
-        m.zones = _rename_entry(m.zones, args[1], args[2], "zone")
+        m.get_map().zones = _rename_entry(m.get_map().zones, args[1], args[2], "zone")
         note = _mentions_note(m, args[1], "zone")
         return await ctx.send(f"Renamed zone `{args[1]}` to `{args[2]}`."
                               + (f"\n{note}" if note else ""))
@@ -14088,11 +14108,11 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 2, "zone", "drop"):
             return
         name = args[1]
-        z = m.zones.get(name)
+        z = m.get_map().zones.get(name)
         if z is None:
             return await ctx.send(f"❌ Zone '{name}' not found.")
         n = len(z.get("cells") or ())
-        m.delete_zone(name)
+        m.get_map().delete_zone(name)
         return await ctx.send(f"Dropped zone `{name}` ({n} cell(s)).")
 
     # ---- add <name> <x> <y> ----  (add one cell; creates the zone)
@@ -14106,13 +14126,13 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         name = args[1]
         x, y = _parse_xy(args, offset=2)
         try:
-            added = m.zone_add_cell(name, x, y)
+            added = m.get_map().zone_add_cell(name, x, y)
         except (VTTError, OutOfBounds) as ex:
             return await ctx.send(f"❌ {ex}")
         verb = "Added" if added else "Already in zone:"
         prep = "to" if added else "for"
         return await ctx.send(
-            f"{verb} ({x},{y}) {prep} `{name}` ({m.zone_size(name)} cell(s))."
+            f"{verb} ({x},{y}) {prep} `{name}` ({m.get_map().zone_size(name)} cell(s))."
         )
 
     # ---- remove <name> <x> <y> ----  (drop one cell)
@@ -14122,13 +14142,13 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         name = args[1]
         x, y = _parse_xy(args, offset=2)
         try:
-            removed = m.zone_remove_cell(name, x, y)
+            removed = m.get_map().zone_remove_cell(name, x, y)
         except NotFound as ex:
             return await ctx.send(f"❌ {ex}")
         if not removed:
             return await ctx.send(f"({x},{y}) was not in zone `{name}`.")
         return await ctx.send(
-            f"Removed ({x},{y}) from `{name}` ({m.zone_size(name)} cell(s))."
+            f"Removed ({x},{y}) from `{name}` ({m.get_map().zone_size(name)} cell(s))."
         )
 
     # ---- fill <name> <x1> <y1> <x2> <y2> ----  (rect, creates the zone)
@@ -14139,12 +14159,12 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         x1, y1 = _parse_xy(args, offset=2)
         x2, y2 = _parse_xy(args, offset=4)
         try:
-            added = m.zone_fill_rect(name, x1, y1, x2, y2)
+            added = m.get_map().zone_fill_rect(name, x1, y1, x2, y2)
         except VTTError as ex:
             return await ctx.send(f"❌ {ex}")
         return await ctx.send(
             f"Filled `{name}` over ({x1},{y1})-({x2},{y2}): +{added} cell(s), "
-            f"{m.zone_size(name)} total."
+            f"{m.get_map().zone_size(name)} total."
         )
 
     # ---- shift <name> <dx> <dy> ----  (translate the footprint)
@@ -14156,11 +14176,11 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             dx = int(args[2]); dy = int(args[3])
         except (ValueError, IndexError):
             return await ctx.send("❌ expected integer dx and dy.")
-        z = m.zones.get(name)
+        z = m.get_map().zones.get(name)
         if z is None:
             return await ctx.send(f"❌ Zone '{name}' not found.")
         before = len(z.get("cells") or ())
-        kept = m.zone_shift(name, dx, dy)
+        kept = m.get_map().zone_shift(name, dx, dy)
         dropped = before - kept
         tail = f" ({dropped} pushed off-grid)" if dropped else ""
         return await ctx.send(
@@ -14203,7 +14223,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if not was:
             return await ctx.send(f"Zone `{name}` was not anchored.")
         return await ctx.send(
-            f"Detached `{name}`'s anchor; its {m.zone_size(name)} cell(s) "
+            f"Detached `{name}`'s anchor; its {m.get_map().zone_size(name)} cell(s) "
             f"are now static."
         )
 
@@ -14215,7 +14235,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         path = args[2]
         value = _parse_scalar(args[3])
         try:
-            m.zone_set_path(name, path, value)
+            m.get_map().zone_set_path(name, path, value)
         except VTTError as ex:
             return await ctx.send(f"❌ {ex}")
         return await ctx.send(f"zone `{name}`.{path} = {value!r}"
@@ -14228,7 +14248,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         name = args[1]
         path = args[2]
         try:
-            m.zone_del_path(name, path)
+            m.get_map().zone_del_path(name, path)
         except (NotFound, VTTError) as ex:
             return await ctx.send(f"❌ {ex}")
         return await ctx.send(f"Removed `{path}` from zone `{name}`.")
@@ -14239,7 +14259,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         name = args[1]
         try:
-            n = m.zone_clear_data(name)
+            n = m.get_map().zone_clear_data(name)
         except NotFound as ex:
             return await ctx.send(f"❌ {ex}")
         return await ctx.send(f"Cleared {n} data key(s) from zone `{name}`.")
@@ -14249,7 +14269,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "zone", "glyph"):
             return
         name = args[1]
-        z = m.zones.get(name)
+        z = m.get_map().zones.get(name)
         if z is None:
             return await ctx.send(f"❌ Zone '{name}' not found.")
         g = args[2]
@@ -14269,7 +14289,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "zone", "legend"):
             return
         name = args[1]
-        z = m.zones.get(name)
+        z = m.get_map().zones.get(name)
         if z is None:
             return await ctx.send(f"❌ Zone '{name}' not found.")
         text = " ".join(args[2:]).strip()
@@ -14290,7 +14310,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "zone", "sprite"):
             return
         name = args[1]
-        z = m.zones.get(name)
+        z = m.get_map().zones.get(name)
         if z is None:
             return await ctx.send(f"❌ Zone '{name}' not found.")
         key = args[2]
@@ -14304,7 +14324,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "zone", "color"):
             return
         name = args[1]
-        z = m.zones.get(name)
+        z = m.get_map().zones.get(name)
         if z is None:
             return await ctx.send(f"❌ Zone '{name}' not found.")
         val = args[2]
@@ -14337,7 +14357,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if not m.zone_visible_to(name, _view_pov(ctx, m, args)):
             return await ctx.send(f"❌ zone `{name}`: not found.")
         try:
-            cells = m.zone_cell_list(name)
+            cells = m.get_map().zone_cell_list(name)
         except NotFound as ex:
             return await ctx.send(f"❌ {ex}")
         if not cells:
@@ -14352,10 +14372,10 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 2, "zone", "info"):
             return
         name = args[1]
-        z = m.zones.get(name)
+        z = m.get_map().zones.get(name)
         if z is None or not m.zone_visible_to(name, _view_pov(ctx, m, args)):
             return await ctx.send(f"❌ zone `{name}`: not found.")
-        cells = m.zone_cell_list(name)
+        cells = m.get_map().zone_cell_list(name)
         view = {
             "cells": cells,
             "data": z.get("data") or {},
@@ -14377,12 +14397,12 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # ---- list ----
     if sub == "list":
         pov = _view_pov(ctx, m, args)
-        names = [n for n in sorted(m.zones.keys()) if m.zone_visible_to(n, pov)]
+        names = [n for n in sorted(m.get_map().zones.keys()) if m.zone_visible_to(n, pov)]
         if not names:
             return await ctx.send("No zones in this match.")
         lines = ["**Zones:**"]
         for name in names:
-            z = m.zones[name]
+            z = m.get_map().zones[name]
             n = len(z.get("cells") or ())
             hooks = sorted((z.get("hooks") or {}).keys())
             extras = []
@@ -14434,9 +14454,9 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 )
             except FormulaError as ex:
                 return await ctx.send(f"❌ Invalid hook formula: {ex}")
-            z = m.zones.get(name)
+            z = m.get_map().zones.get(name)
             if z is None:
-                z = m.create_zone(name)
+                z = m.get_map().create_zone(name)
             z["hooks"][when] = formula_src
             return await ctx.send(f"Set zone `{name}` `{when}` hook.")
 
@@ -14446,7 +14466,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return
             name = args[2]
             when = args[3]
-            z = m.zones.get(name)
+            z = m.get_map().zones.get(name)
             if z is None:
                 return await ctx.send(f"❌ Zone '{name}' not found.")
             if when not in (z.get("hooks") or {}):
@@ -14459,7 +14479,7 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if await return_help_if_not_enough_args(ctx, args, 3, "zone", "hook"):
                 return
             name = args[2]
-            z = m.zones.get(name)
+            z = m.get_map().zones.get(name)
             if z is None:
                 return await ctx.send(f"❌ Zone '{name}' not found.")
             hooks = z.get("hooks") or {}

@@ -4956,6 +4956,10 @@ class Entity:
     x: int
     y: int
     id: str# explicit, user-provided
+    # The name of the map (Match.maps) the unit stands on; x / y are cells
+    # of that map. Set when the unit is placed (spawn); "" until then.
+    # Parts, riders and segments are on their root body's map.
+    map: str = ""
     # Team lives in vars under the key configured by the team_var rule
     # (default "team"), same as hp/max_hp/initiative. Read/write goes
     # through the team property pair below so external callers using
@@ -5147,10 +5151,11 @@ class Entity:
     #bind this entity to a specific match
     def bind(self, match: "Match", *, set_spawn_facing: bool = True):
         self._match = match
-        if set_spawn_facing and match.in_bounds(self.x, self.y):
+        mp = match.maps.get(self.map)
+        if set_spawn_facing and mp is not None and mp.in_bounds(self.x, self.y):
             try:
                 # Initial facing according to system (only when spawning, not loading)
-                self.facing = match._spawn_facing(self.x, self.y)
+                self.facing = match._spawn_facing(self.x, self.y, mp)
             except Exception:
                 pass
 
@@ -5324,9 +5329,11 @@ class Entity:
         self.hp = self.hp + max(0, amount)
 
     # ---------- high-level actions (Entity-owned) ----------
-    def spawn(self, match: "Match", x: int, y: int, initiative: Optional[int] = None) -> Tuple[str, List[str]]:
+    def spawn(self, match: "Match", x: int, y: int, initiative: Optional[int] = None,
+              map_name: Optional[str] = None) -> Tuple[str, List[str]]:
         """
-        Add this entity to a match at (x,y).
+        Add this entity to a match at (x,y) on the map `map_name` (None =
+        the match's only map).
         Validates bounds/occupancy, sets facing, registers in turn order.
         Also validates that the entity has the required vital variables
         (HP var) for the match's game system.
@@ -5338,6 +5345,7 @@ class Entity:
         """
         if self._match is not None:
             raise VTTError(f"Entity '{self.id}' is already in a match")
+        self.map = match.get_map(map_name).name
         # ID collision check honors `corpse_id_uniqueness` — under the
         # default true setting a corpse's id reserves the name too, so
         # spawning a fresh `goblin1` while a `goblin1` corpse exists
@@ -5589,6 +5597,7 @@ class Entity:
                                    block_mode=block_mode)
         allow_diag_move = bool(m.rules.get("allow_diagonal_movement", False))
         allow_diag_face = bool(m.rules.get("allow_diagonal_facing", False))
+        mp = m.map_of(self)
 
         # Phase 1: build the per-step path and validate bounds without
         # mutating. step_path is a list of (cell, facing) entries: each
@@ -5626,9 +5635,8 @@ class Entity:
                 # None skips the block check — callers that pre-validated
                 # the path (push/pull) pass None to avoid re-checking.
                 for cx, cy in m.entity_cells(self, nx, ny):
-                    if not m.in_bounds(cx, cy):
-                        raise OutOfBounds(
-                            f"({cx},{cy}) outside {m.grid_width}x{m.grid_height}")
+                    if not mp.in_bounds(cx, cy):
+                        raise OutOfBounds(f"({cx},{cy}) outside {mp.size_text()}")
                 if block_mode is not None:
                     for cx, cy in m.entity_cells(self, nx, ny):
                         if m._check_block(self.id, cx, cy, block_mode):
@@ -5644,7 +5652,7 @@ class Entity:
         if not self.is_cell_stackable:
             ig = m._occupancy_ignore(self)
             for cx, cy in m.entity_cells(self, x, y):
-                if m.cell_occupant(cx, cy, ig) is not None:
+                if m.cell_occupant(cx, cy, ig, mp) is not None:
                     raise Occupied(f"Cell ({cx},{cy}) already occupied")
 
         # Phase 2: commit each step, firing hooks. No more validation —
@@ -6233,6 +6241,7 @@ class Entity:
             "name": self.name,
             "x": self.x,
             "y": self.y,
+            "map": self.map,
             "id": self.id,
             "status": copy.deepcopy(self.status),
             # deepcopy, NOT dict(): vars hold nested dicts (inventory,
@@ -6258,6 +6267,7 @@ class Entity:
             x=int(data["x"]),
             y=int(data["y"]),
             id=str(data["id"]),
+            map=str(data.get("map") or ""),
             # status is now dict-per-flag; support both shapes so saves
             # written by clones via Entity.to_dict (the common path) load
             # cleanly. Anything else is treated as an empty status set.
@@ -6288,15 +6298,534 @@ _SEGMENT_LINK_VARS = ("__segment", "__follows", "__seg_path", "__seg_last")
 _ENGINE_STATE_VARS = _SEGMENT_LINK_VARS + ("__part_located", "__part_region",
                                            "__part_destroyed")
 
+# -------------------------
+# Map
+# -------------------------
+# The name of the map every new match starts with.
+DEFAULT_MAP_NAME = "main"
+# Distance metrics an aura (an entity-anchored zone) may use.
+AURA_METRICS = ("square_radius", "manhattan", "euclidean")
+
+
+@dataclass
+class Map:
+    """One grid of a match: its size, the tiles and zones on it, and the fog
+    memory and reveals each team has of it. A match holds its maps in
+    `Match.maps` (every match has at least one, `main`); units stay in the
+    match's one pool and name their map in `Entity.map`. Everything here is
+    about the grid alone: code that needs units (occupancy, sight, hooks)
+    lives on the Match and takes the Map it works on."""
+    name: str
+    grid_width: int
+    grid_height: int
+    # Special-tile data, sparse: (x, y) -> a free-form dict of named
+    # "features" (e.g. {"flame": {"burn_damage": 5}, "glyph": "*"}). Corpses
+    # live here too (`corpses.<id>`). Reads from formulas go through
+    # tile_get / tile_has. Serialized with "x,y" string keys.
+    tiles: Dict[Tuple[int, int], Dict[str, Any]] = field(default_factory=dict)
+    # Zone registry: name -> {"cells": Set[(x,y)], "data": {...}, "hooks":
+    # {when: src}, "glyph", "color", and an aura's "anchor" /
+    # "anchor_radius" / "anchor_metric"}. A zone is a named set of cells
+    # that can overlap tiles and other zones and be reshaped or shifted;
+    # `cells` is a set in memory, a sorted list of [x, y] on disk.
+    zones: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Per-team set of explored cells (fog memory): team -> {(x, y)} ever seen
+    # by that team while fog memory is on. Saved as row runs.
+    explored: Dict[str, "set"] = field(default_factory=dict)
+    # Per-team fog reveals: team -> [{cells: set[(x,y)], until: Optional[int],
+    # clock: "round"|"turn"}], cells forced visible to the team regardless of
+    # its units' vision (`!reveal_fog`). Saved as row runs.
+    fog_reveals: Dict[str, "list"] = field(default_factory=dict)
+
+    def size_text(self) -> str:
+        return f"{self.grid_width}x{self.grid_height}"
+
+    def in_bounds(self, x: int, y: int) -> bool:
+        return 1 <= x <= self.grid_width and 1 <= y <= self.grid_height
+
+    # ---- tile data helpers --------------------------------------------
+    # Tiles live in self.tiles keyed by (x, y) tuples. These methods are
+    # the chokepoints for set / get / delete so that JSON serialization,
+    # bounds checking, and intermediate-dict creation happen in one
+    # place — both !tile commands and the formula-side tile_get /
+    # tile_has functions reach for them.
+
+    def tile_data(self, x: int, y: int) -> Dict[str, Any]:
+        """Return the tile's data dict at (x, y), creating an empty
+        entry if the tile has no data yet. Caller mutates in place.
+        Out-of-bounds coordinates raise OutOfBounds — silently auto-
+        creating off-grid tiles would mask GM typos."""
+        if not self.in_bounds(x, y):
+            raise OutOfBounds(
+                f"({x},{y}) outside {self.grid_width}x{self.grid_height}"
+            )
+        return self.tiles.setdefault((x, y), {})
+
+    def tile_get_path(self, x: int, y: int, path: str) -> Any:
+        """Read tile_data[x,y][a][b][c] for a dotted path 'a.b.c'.
+        Raises NotFound on any missing segment so the user gets a
+        precise error like \"tile (5,5) has no feature 'flame'\"
+        rather than a Python KeyError. Empty-path '' is rejected —
+        the bare 'tile data dict' isn't a useful thing to expose."""
+        if not self.in_bounds(x, y):
+            raise OutOfBounds(
+                f"({x},{y}) outside {self.grid_width}x{self.grid_height}"
+            )
+        if not path:
+            raise VTTError("tile path cannot be empty.")
+        d: Any = self.tiles.get((x, y), {})
+        parts = path.split(".")
+        for i, key in enumerate(parts):
+            if not isinstance(d, dict) or key not in d:
+                # Build a useful path-prefix for the error so the GM
+                # knows where the chain broke.
+                where = ".".join(parts[:i + 1])
+                raise NotFound(
+                    f"tile ({x},{y}) has no value at '{where}'."
+                )
+            d = d[key]
+        return d
+
+    def tile_has_path(self, x: int, y: int, path: str) -> bool:
+        """Boolean version of tile_get_path. Out-of-bounds returns
+        False (a missing tile is conceptually 'has no feature' rather
+        than an error) so formulas can defensively guard against
+        passing entity coords that walked off-grid for some reason."""
+        if not self.in_bounds(x, y):
+            return False
+        if not path:
+            return False
+        d: Any = self.tiles.get((x, y), {})
+        for key in path.split("."):
+            if not isinstance(d, dict) or key not in d:
+                return False
+            d = d[key]
+        return True
+
+    def tile_set_path(self, x: int, y: int, path: str, value: Any) -> None:
+        """Set tile_data[x,y][a][b][c] = value, creating intermediate
+        dicts as needed (same write semantics as Entity.write_var,
+        but on tile dicts). Out-of-bounds raises; empty path raises;
+        path that collides with a non-dict value mid-traversal raises
+        (we don't silently clobber a scalar with a dict)."""
+        if not self.in_bounds(x, y):
+            raise OutOfBounds(
+                f"({x},{y}) outside {self.grid_width}x{self.grid_height}"
+            )
+        check_store_path(path, "tile path")
+        d = self.tiles.setdefault((x, y), {})
+        parts = path.split(".")
+        for i, key in enumerate(parts[:-1]):
+            existing = d.get(key)
+            if existing is not None and not isinstance(existing, dict):
+                where = ".".join(parts[:i + 1])
+                raise VTTError(
+                    f"tile ({x},{y}) value at '{where}' is "
+                    f"{type(existing).__name__}, not a dict — cannot "
+                    f"set a nested key under it without clobbering."
+                )
+            if key not in d:
+                d[key] = {}
+            d = d[key]
+        d[parts[-1]] = _own_value(value)
+
+    def tile_del_path(self, x: int, y: int, path: Optional[str]) -> None:
+        """Delete a dotted-path key from a tile's data, OR (when
+        path is None / empty) delete the entire tile entry from
+        self.tiles. After a path-delete, walk back up the chain and
+        drop any parent dict that became empty, finishing with the
+        (x,y) entry itself — every entry in self.tiles always has
+        at least one populated feature so the serialized form
+        stays sparse and !tile list doesn't show no-op coords."""
+        if (x, y) not in self.tiles:
+            return  # nothing to do — symmetric with remove_var_silent
+        if not path:
+            del self.tiles[(x, y)]
+            return
+        # Walk down, tracking each parent dict so we can prune empties
+        # on the way back up.
+        parts = path.split(".")
+        chain: List[Dict[str, Any]] = [self.tiles[(x, y)]]
+        for i, key in enumerate(parts[:-1]):
+            d = chain[-1]
+            if not isinstance(d, dict) or key not in d:
+                where = ".".join(parts[:i + 1])
+                raise NotFound(f"tile ({x},{y}) has no value at '{where}'.")
+            chain.append(d[key])
+        leaf_parent = chain[-1]
+        leaf_key = parts[-1]
+        if not isinstance(leaf_parent, dict) or leaf_key not in leaf_parent:
+            raise NotFound(f"tile ({x},{y}) has no value at '{path}'.")
+        del leaf_parent[leaf_key]
+        # Prune empty parents from the leaf back to the root. Each
+        # iteration drops the just-emptied dict from its grandparent
+        # under the key we descended through.
+        for i in range(len(chain) - 1, 0, -1):
+            if chain[i]:
+                break  # still has siblings — stop pruning
+            parent = chain[i - 1]
+            parent_key = parts[i - 1]
+            del parent[parent_key]
+        if not self.tiles[(x, y)]:
+            del self.tiles[(x, y)]
+
+    # ---- zones (named multi-cell regions) ----------------------------
+    # A zone is a named SET of cells plus a free-form data dict, optional
+    # hook formulas, and an optional map glyph (see the `zones` field and
+    # ZONE_HOOK_NAMES). These methods are the chokepoints the !zone
+    # command and the zone_* formula functions share. `cells` is held as
+    # a set of (x,y) tuples in memory; serialization encodes it as a
+    # sorted list of [x,y].
+    @staticmethod
+    def _zone_to_dict(z: Dict[str, Any]) -> Dict[str, Any]:
+        cells = z.get("cells") or set()
+        out: Dict[str, Any] = {
+            "cells": [[x, y] for (x, y) in sorted(cells)],
+            # deepcopy data/hooks: zone_set_path / the zone_set primitive mutate
+            # the zone data dict IN PLACE, so a by-reference snapshot would be
+            # corrupted by a later edit (defeats undo + action rollback).
+            "data": copy.deepcopy(z.get("data") or {}),
+            "hooks": copy.deepcopy(z.get("hooks") or {}),
+        }
+        g = z.get("glyph")
+        if isinstance(g, str) and len(g) == 1:
+            out["glyph"] = g
+        c = z.get("color")
+        if isinstance(c, str) and c:
+            out["color"] = c
+        # Aura binding (entity-anchored zone), if present.
+        if z.get("anchor"):
+            out["anchor"] = z["anchor"]
+            out["anchor_radius"] = int(z.get("anchor_radius", 0) or 0)
+            out["anchor_metric"] = str(z.get("anchor_metric", "square_radius"))
+        return out
+
+    def _zone_from_dict(self, zdef: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(zdef, dict):
+            return None
+        cells: Set[Tuple[int, int]] = set()
+        raw_cells = zdef.get("cells")
+        if isinstance(raw_cells, list):
+            for pair in raw_cells:
+                if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                    try:
+                        x, y = int(pair[0]), int(pair[1])
+                    except (TypeError, ValueError):
+                        continue
+                    if self.in_bounds(x, y):
+                        cells.add((x, y))
+        data = zdef.get("data")
+        hooks = zdef.get("hooks")
+        z: Dict[str, Any] = {
+            "cells": cells,
+            "data": copy.deepcopy(data) if isinstance(data, dict) else {},
+            "hooks": {
+                k: v for k, v in hooks.items()
+                if isinstance(k, str) and isinstance(v, str)
+            } if isinstance(hooks, dict) else {},
+        }
+        g = zdef.get("glyph")
+        if isinstance(g, str) and len(g) == 1:
+            z["glyph"] = g
+        c = zdef.get("color")
+        if isinstance(c, str) and c:
+            z["color"] = c
+        # Restore an aura binding. The cells were serialized at their
+        # last-stamped positions (and re-stamp on the next anchor move),
+        # so no recompute is needed at load time.
+        anchor = zdef.get("anchor")
+        if isinstance(anchor, str) and anchor:
+            z["anchor"] = anchor
+            try:
+                z["anchor_radius"] = max(0, int(zdef.get("anchor_radius", 0)))
+            except (TypeError, ValueError):
+                z["anchor_radius"] = 0
+            metric = str(zdef.get("anchor_metric", "square_radius"))
+            z["anchor_metric"] = metric if metric in AURA_METRICS else "square_radius"
+        return z
+
+    def has_zone(self, name: str) -> bool:
+        return name in self.zones
+
+    def _require_zone(self, name: str) -> Dict[str, Any]:
+        z = self.zones.get(name)
+        if z is None:
+            raise NotFound(f"Zone '{name}' not found.")
+        return z
+
+    def create_zone(self, name: str, *, overwrite: bool = False) -> Dict[str, Any]:
+        """Create an empty zone. Raises DuplicateId if it exists unless
+        overwrite=True."""
+        if not isinstance(name, str) or not name.strip():
+            raise VTTError("Zone name must be a non-empty string.")
+        if name in self.zones and not overwrite:
+            raise DuplicateId(f"Zone '{name}' already exists.")
+        self.zones[name] = {"cells": set(), "data": {}, "hooks": {}}
+        return self.zones[name]
+
+    def delete_zone(self, name: str) -> None:
+        if name not in self.zones:
+            raise NotFound(f"Zone '{name}' not found.")
+        del self.zones[name]
+
+    def zone_add_cell(self, name: str, x: int, y: int,
+                      *, create: bool = True) -> bool:
+        """Add cell (x,y) to a zone (creating the zone if missing and
+        create=True). Returns True iff newly added. Off-grid cells are
+        rejected."""
+        if not self.in_bounds(x, y):
+            raise OutOfBounds(
+                f"({x},{y}) outside {self.grid_width}x{self.grid_height}"
+            )
+        z = self.zones.get(name)
+        if z is None:
+            if not create:
+                raise NotFound(f"Zone '{name}' not found.")
+            z = self.create_zone(name)
+        if (x, y) in z["cells"]:
+            return False
+        z["cells"].add((x, y))
+        return True
+
+    def zone_remove_cell(self, name: str, x: int, y: int) -> bool:
+        """Remove cell (x,y) from a zone. Returns True iff it was present.
+        An emptied zone still exists (data/hooks preserved)."""
+        z = self._require_zone(name)
+        if (x, y) in z["cells"]:
+            z["cells"].discard((x, y))
+            return True
+        return False
+
+    def zone_fill_rect(self, name: str, x1: int, y1: int, x2: int, y2: int,
+                       *, create: bool = True) -> int:
+        """Add every in-bounds cell of the rectangle (x1,y1)-(x2,y2) to a
+        zone (corners in any order). Returns the count of NEWLY added
+        cells."""
+        z = self.zones.get(name)
+        if z is None:
+            if not create:
+                raise NotFound(f"Zone '{name}' not found.")
+            z = self.create_zone(name)
+        xa, xb = sorted((int(x1), int(x2)))
+        ya, yb = sorted((int(y1), int(y2)))
+        # Clipped to the grid before the walk: zone_fill(z, 1, 1, 10**6,
+        # 10**6) used to visit a trillion cells to keep the on-grid ones.
+        xa, xb = max(1, xa), min(self.grid_width, xb)
+        ya, yb = max(1, ya), min(self.grid_height, yb)
+        added = 0
+        for xx in range(xa, xb + 1):
+            for yy in range(ya, yb + 1):
+                if self.in_bounds(xx, yy) and (xx, yy) not in z["cells"]:
+                    z["cells"].add((xx, yy))
+                    added += 1
+        return added
+
+    def zone_shift(self, name: str, dx: int, dy: int) -> int:
+        """Translate every cell of the zone by (dx,dy). Cells that would
+        leave the grid are DROPPED (a zone may drift off the edge and,
+        with an opposite shift, partially return — only on-grid cells
+        survive each shift). Returns the number of cells retained."""
+        z = self._require_zone(name)
+        dx, dy = int(dx), int(dy)
+        new: Set[Tuple[int, int]] = set()
+        for (x, y) in z["cells"]:
+            nx, ny = x + dx, y + dy
+            if self.in_bounds(nx, ny):
+                new.add((nx, ny))
+        z["cells"] = new
+        return len(new)
+
+    def zone_cell_list(self, name: str) -> List[List[int]]:
+        z = self._require_zone(name)
+        return [[x, y] for (x, y) in sorted(z["cells"])]
+
+    def zone_size(self, name: str) -> int:
+        """Cell count of a zone (0 if the zone doesn't exist)."""
+        z = self.zones.get(name)
+        return len(z["cells"]) if z is not None else 0
+
+    def zones_at(self, x: int, y: int) -> Set[str]:
+        """Names of every zone whose footprint includes (x,y)."""
+        return {name for name, z in self.zones.items() if (x, y) in z["cells"]}
+
+    def cell_in_zone(self, x: int, y: int, name: str) -> bool:
+        z = self.zones.get(name)
+        return z is not None and (x, y) in z["cells"]
+
+    # ---- zone data accessors (dotted paths under zone["data"]) -------
+    def zone_get_path(self, name: str, path: str) -> Any:
+        z = self._require_zone(name)
+        if not path:
+            raise VTTError("zone path cannot be empty.")
+        cur: Any = z["data"]
+        for key in path.split("."):
+            if not isinstance(cur, dict) or key not in cur:
+                raise NotFound(f"zone '{name}' has no value at '{path}'.")
+            cur = cur[key]
+        return cur
+
+    def zone_has_path(self, name: str, path: str) -> bool:
+        z = self.zones.get(name)
+        if z is None or not path:
+            return False
+        cur: Any = z["data"]
+        for key in path.split("."):
+            if not isinstance(cur, dict) or key not in cur:
+                return False
+            cur = cur[key]
+        return True
+
+    def zone_set_path(self, name: str, path: str, value: Any,
+                      *, create: bool = True) -> None:
+        check_store_path(path, "zone path")
+        z = self.zones.get(name)
+        if z is None:
+            if not create:
+                raise NotFound(f"Zone '{name}' not found.")
+            z = self.create_zone(name)
+        d = z["data"]
+        parts = path.split(".")
+        for i, key in enumerate(parts[:-1]):
+            existing = d.get(key)
+            if existing is not None and not isinstance(existing, dict):
+                where = ".".join(parts[:i + 1])
+                raise VTTError(
+                    f"zone '{name}' value at '{where}' is "
+                    f"{type(existing).__name__}, not a dict — cannot set a "
+                    f"nested key under it without clobbering."
+                )
+            if key not in d:
+                d[key] = {}
+            d = d[key]
+        d[parts[-1]] = _own_value(value)
+
+    def zone_del_path(self, name: str, path: str) -> None:
+        """Delete a dotted key from a zone's data, pruning emptied
+        parents. Raises NotFound if the path is absent."""
+        z = self._require_zone(name)
+        if not path:
+            raise VTTError("zone path cannot be empty.")
+        parts = path.split(".")
+        chain: List[Dict[str, Any]] = [z["data"]]
+        cur: Any = z["data"]
+        for key in parts[:-1]:
+            if not isinstance(cur, dict) or key not in cur:
+                raise NotFound(f"zone '{name}' has no value at '{path}'.")
+            cur = cur[key]
+            chain.append(cur)
+        leaf_parent = chain[-1]
+        if not isinstance(leaf_parent, dict) or parts[-1] not in leaf_parent:
+            raise NotFound(f"zone '{name}' has no value at '{path}'.")
+        del leaf_parent[parts[-1]]
+        for i in range(len(chain) - 1, 0, -1):
+            if chain[i]:
+                break
+            del chain[i - 1][parts[i - 1]]
+
+    def zone_clear_data(self, name: str) -> int:
+        """Drop ALL data from a zone (keeps cells + hooks). Returns the
+        number of top-level keys removed."""
+        z = self._require_zone(name)
+        n = len(z["data"])
+        z["data"] = {}
+        return n
+
+    def to_dict(self) -> Dict[str, Any]:
+        # deepcopy each tile's data: tile_set_path / the tile_set primitive
+        # mutate tile dicts IN PLACE, so a by-reference snapshot would be
+        # corrupted by a later edit (defeating undo change-detection and
+        # action rollback — the same defect fixed for entity vars). Tile
+        # keys are "x,y" strings (JSON object keys), sorted for readable
+        # diffs of hand-edited saves.
+        return {
+            "grid_width": self.grid_width,
+            "grid_height": self.grid_height,
+            "tiles": {
+                f"{x},{y}": copy.deepcopy(dat)
+                for (x, y), dat in sorted(self.tiles.items())
+            },
+            "zones": {
+                name: self._zone_to_dict(z)
+                for name, z in sorted(self.zones.items())
+            },
+            # cell sets as row runs [y, x_from, x_to] (_cells_to_runs)
+            "explored": {
+                team: _cells_to_runs(cells)
+                for team, cells in self.explored.items()
+            },
+            "fog_reveals": {
+                team: [{"cells": _cells_to_runs(r.get("cells", ())),
+                        "until": r.get("until"),
+                        "clock": r.get("clock", "round")}
+                       for r in recs]
+                for team, recs in self.fog_reveals.items()
+            },
+        }
+
+    @staticmethod
+    def from_dict(name: str, d: Dict[str, Any]) -> "Map":
+        mp = Map(name=name, grid_width=int(d["grid_width"]),
+                 grid_height=int(d["grid_height"]))
+        # Only in-bounds tiles and zone cells are kept: one off the grid
+        # could never be reached by a command or formula. deepcopy: a
+        # snapshot's tile dict is loaded here, and sharing it would let a
+        # later in-place !tile set corrupt undo / rollback.
+        for key, val in (d.get("tiles") or {}).items():
+            try:
+                xs, ys = key.split(",", 1)
+                x, y = int(xs), int(ys)
+            except (ValueError, AttributeError):
+                continue
+            if mp.in_bounds(x, y) and isinstance(val, dict) and val:
+                mp.tiles[(x, y)] = copy.deepcopy(val)
+        for zname, zdef in (d.get("zones") or {}).items():
+            if not isinstance(zname, str) or not isinstance(zdef, dict):
+                continue
+            # An emptied zone still exists: its data / hooks are kept so a
+            # shift can bring it back on the grid.
+            z = mp._zone_from_dict(zdef)
+            if z is not None:
+                mp.zones[zname] = z
+        gw, gh = mp.grid_width, mp.grid_height
+        raw_expl = d.get("explored", {})
+        mp.explored = {
+            team: _runs_to_cells(cells, gw, gh)
+            for team, cells in raw_expl.items()
+            if isinstance(team, str) and isinstance(cells, list)
+        } if isinstance(raw_expl, dict) else {}
+        raw_rev = d.get("fog_reveals", {})
+        mp.fog_reveals = {
+            team: [
+                {"cells": _runs_to_cells(r.get("cells", []), gw, gh),
+                 "until": (int(r["until"]) if r.get("until") is not None else None),
+                 "clock": ("turn" if r.get("clock") == "turn" else "round")}
+                for r in recs if isinstance(r, dict)
+            ]
+            for team, recs in raw_rev.items()
+            if isinstance(team, str) and isinstance(recs, list)
+        } if isinstance(raw_rev, dict) else {}
+        return mp
+
+
+
+
+def default_maps(width: int, height: int) -> Dict[str, "Map"]:
+    """The maps of a new match: one, `main`, of the given size."""
+    return {DEFAULT_MAP_NAME: Map(DEFAULT_MAP_NAME, width, height)}
+
+
 @dataclass
 class Match:
     id: str
     name: str
-    grid_width: int
-    grid_height: int
 
     # Game system binding - currently NOT YET DIRECTLY CONNECTED TO A GAMESYSTEM CLASS, JUST COPYING THE NAME AND DICTIONARY OF RULES FROM IT.
     system_name: str
+
+    # The match's maps, name -> Map, in creation order. Every match has at
+    # least one; a new match starts with one named `main`
+    # (DEFAULT_MAP_NAME). Units name theirs in Entity.map.
+    maps: Dict[str, "Map"] = field(default_factory=dict)
 
     entities: Dict[str, Entity] = field(default_factory=dict)
     turn_order: List[str] = field(default_factory=list)
@@ -6361,41 +6890,6 @@ class Match:
     # insertion order, which is also the iteration order for any
     # command that targets the group.
     groups: Dict[str, List[str]] = field(default_factory=dict)
-
-    # Special-tile data store. Sparse dict keyed by (x, y) tuple — only
-    # coordinates the GM has explicitly written to live here. Each value
-    # is a free-form dict of named "features" (e.g. {"flame":
-    # {"burn_damage": 5}, "loot": {"gold": 50}, "glyph": "*"}); a single
-    # tile can hold any number of side-by-side features. Reads from
-    # formulas go through tile_get / tile_has in formula.py — the
-    # validator rejects raw attribute chains on non-entity objects, so
-    # tile data uses dotted-string paths instead of dot-attribute syntax.
-    #
-    # The "glyph" key, if set to a single character, overrides the
-    # blank-cell rendering in !map (entities still take precedence).
-    # Other keys are GM-defined and have no engine-level meaning until
-    # later PRs add hooks and tile-attached passives on top.
-    #
-    # JSON serialization rewrites tuple keys as "x,y" strings (see the
-    # _tile_key / _parse_tile_key helpers further down) because JSON
-    # objects can't have non-string keys.
-    tiles: Dict[Tuple[int, int], Dict[str, Any]] = field(default_factory=dict)
-
-    # Zone registry. A zone is a NAMED region — a set of cells plus a
-    # free-form data dict, optional hook formulas, and an optional map
-    # glyph. Keyed by zone name. Each value is a dict:
-    #   {"cells": Set[(x,y)], "data": {...}, "hooks": {when: src},
-    #    "glyph": "g"}
-    # Unlike tiles (one cell, keyed by coord), a zone spans many cells,
-    # can overlap other zones and tiles, and can be reshaped or shifted
-    # after creation (the "3x3 gas cloud that drifts" case). `cells` is a
-    # set of (x,y) tuples in memory for O(1) membership; to_dict encodes
-    # it as a sorted list of [x,y]. Data is read/written via the zone_*
-    # formula functions and the !zone command (dotted paths under
-    # "data"); hooks fire on zone-boundary crossings (on_enter/exit/stop),
-    # per cell within the zone (on_cell_enter/exit/stop), and at
-    # round/turn lifecycle moments. See the zone_* methods below.
-    zones: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     # Special-tile TEMPLATE registry. Reusable tile-kind definitions
     # (e.g. "flame", "spike", "treasure_chest"). Each template carries
@@ -6527,21 +7021,6 @@ class Match:
     # those cells stay revealed (per fog_memory_mode) even out of current
     # vision. When False, only current vision shows. Persisted.
     fog_memory: bool = False
-    # Per-team set of explored cells: team-name -> set of (x, y) ever seen
-    # by that team. Grows as units move/spawn (Match._record_vision) while
-    # fog_memory is on; cleared when memory is toggled off. Serialized as
-    # lists of [x, y]. Runtime type is set for fast membership tests.
-    explored: Dict[str, "set"] = field(default_factory=dict)
-
-    # ---- fog reveals (scout / clairvoyance) ----
-    # Per-team list of reveal records {cells: set[(x,y)], until: Optional[int]}
-    # that force cells visible to a team independent of unit vision (a scout
-    # ping, clairvoyance, GM reveal). `until` is the round number the reveal
-    # is active THROUGH (a reveal expires once round_number > until); None =
-    # permanent. A revealed cell shows terrain AND live entities (current-
-    # vision-equivalent). Set via `!reveal_fog`. Serialized.
-    fog_reveals: Dict[str, "list"] = field(default_factory=dict)
-
     # ---- text-renderer customization ----
     # Per-team text color for the colorized renderer: team-name -> a
     # TEXT_COLORS name. An entity's own `color` var overrides this; absent
@@ -6788,9 +7267,52 @@ class Match:
         default_factory=set, repr=False, compare=False
     )
 
-    # ---- global constraints / helpers (unchanged in spirit) ----
-    def in_bounds(self, x: int, y: int) -> bool:
-        return 1 <= x <= self.grid_width and 1 <= y <= self.grid_height
+    # ---- maps ------------------------------------------------------------
+    def _map_for(self, mp: Optional["Map"],
+                 e: Optional["Entity"] = None) -> "Map":
+        """`mp` when given, else the map unit `e` names, else the match's
+        only map."""
+        if mp is not None:
+            return mp
+        if e is not None and e.map in self.maps:
+            return self.maps[e.map]
+        return self.get_map()
+
+    def get_map(self, name: Optional[str] = None) -> "Map":
+        """The map named `name`. With no name, the match's only map; a match
+        with several refuses, so the caller has to say which."""
+        if name is None:
+            if len(self.maps) == 1:
+                return next(iter(self.maps.values()))
+            names = ", ".join(f"`{n}`" for n in self.maps)
+            raise VTTError(
+                f"This match has {len(self.maps)} maps ({names}): name one "
+                f"with `map=<name>`.")
+        mp = self.maps.get(name)
+        if mp is None:
+            raise NotFound(
+                f"Could not find a map named `{name}`. Either this map does "
+                f"not exist, or this channel currently does not have "
+                f"permission to view it.")
+        return mp
+
+    def zone_names(self) -> List[str]:
+        """Every zone name on any map, sorted."""
+        return sorted({n for mp in self.maps.values() for n in mp.zones})
+
+    def find_zone(self, name: str) -> Optional[Dict[str, Any]]:
+        """The zone named `name` on the first map that has one, or None."""
+        for mp in self.maps.values():
+            if name in mp.zones:
+                return mp.zones[name]
+        return None
+
+    def map_of(self, e: "Entity") -> "Map":
+        """The map unit `e` stands on."""
+        mp = self.maps.get(e.map)
+        if mp is None:
+            raise VTTError(f"Unit `{e.id}` is on no map of this match.")
+        return mp
 
     @staticmethod
     def _shift_snake_path_vars(vars_dict: Dict[str, Any], ox: int, oy: int) -> None:
@@ -6814,9 +7336,10 @@ class Match:
             vars_dict["__seg_last"] = [last[0] + ox, last[1] + oy]
 
     def resize_grid(self, new_w: int, new_h: int,
-                    anchor: str = "top-left") -> Tuple[Dict[str, Any], List[str]]:
-        """Resize the grid to new_w x new_h, repositioning ALL content
-        (entities, tiles, corpses, zones, fog-explored memory) by an offset
+                    anchor: str = "top-left", mp: Optional["Map"] = None
+                    ) -> Tuple[Dict[str, Any], List[str]]:
+        """Resize map `mp` (None = the only map) to new_w x new_h, repositioning ALL content
+        (entities, tiles, corpses, zones, fog memory and reveals) by an offset
         derived from `anchor` — the 9-point compass point where existing
         content stays put. top-left (default) leaves coordinates unchanged
         and grows/cuts at the bottom-right; bottom-right shifts everything
@@ -6841,7 +7364,8 @@ class Match:
                 f"bottom-right."
             )
         h_kind, v_kind = _RESIZE_ANCHORS[key]
-        dw, dh = new_w - self.grid_width, new_h - self.grid_height
+        mp = mp or self.get_map()
+        dw, dh = new_w - mp.grid_width, new_h - mp.grid_height
         ox = 0 if h_kind == "left" else (dw if h_kind == "right" else dw // 2)
         oy = 0 if v_kind == "top" else (dh if v_kind == "bottom" else dh // 2)
 
@@ -6852,8 +7376,9 @@ class Match:
         # the new grid — a large entity is "cut" if ANY covered cell lands
         # off-grid.
         cut = sorted(e.id for e in self.entities.values()
-                     if not all(in_new(cx + ox, cy + oy)
-                                for cx, cy in self.entity_cells(e)))
+                     if e.map == mp.name
+                     and not all(in_new(cx + ox, cy + oy)
+                                 for cx, cy in self.entity_cells(e)))
         log: List[str] = []
         killed: List[str] = []
         if cut:
@@ -6881,26 +7406,29 @@ class Match:
                         log.extend(klog)
                         killed.append(eid)
                 cut = sorted(e.id for e in self.entities.values()
-                             if not all(in_new(cx + ox, cy + oy)
-                                        for cx, cy in self.entity_cells(e)))
+                             if e.map == mp.name
+                             and not all(in_new(cx + ox, cy + oy)
+                                         for cx, cy in self.entity_cells(e)))
 
         # Shift survivors — each is in-bounds by construction (the off-grid
         # ones were just killed or we'd have raised).
         for e in self.entities.values():
+            if e.map != mp.name:
+                continue
             e.x += ox
             e.y += oy
             self._shift_snake_path_vars(e.vars, ox, oy)
 
         # Re-key tiles (corpses ride along inside tile data); drop off-grid.
-        old_tiles = len(self.tiles)
-        self.tiles = {(x + ox, y + oy): cell
-                      for (x, y), cell in self.tiles.items()
-                      if in_new(x + ox, y + oy)}
-        dropped_tiles = old_tiles - len(self.tiles)
+        old_tiles = len(mp.tiles)
+        mp.tiles = {(x + ox, y + oy): cell
+                    for (x, y), cell in mp.tiles.items()
+                    if in_new(x + ox, y + oy)}
+        dropped_tiles = old_tiles - len(mp.tiles)
 
         # Shift + clip zone cells.
         clipped_cells = 0
-        for z in self.zones.values():
+        for z in mp.zones.values():
             cells = z.get("cells")
             if isinstance(cells, set):
                 before = len(cells)
@@ -6908,13 +7436,25 @@ class Match:
                               if in_new(x + ox, y + oy)}
                 clipped_cells += before - len(z["cells"])
 
-        # Shift + clip fog-explored memory.
-        if self.explored:
-            self.explored = {
+        # Shift + clip fog-explored memory and fog reveals (a reveal left
+        # behind used to show a cell beside what was revealed).
+        if mp.explored:
+            mp.explored = {
                 team: {(x + ox, y + oy) for (x, y) in cells
                        if in_new(x + ox, y + oy)}
-                for team, cells in self.explored.items()
+                for team, cells in mp.explored.items()
             }
+        for team in list(mp.fog_reveals):
+            recs = []
+            for r in mp.fog_reveals[team]:
+                cells = {(x + ox, y + oy) for (x, y) in r.get("cells", ())
+                         if in_new(x + ox, y + oy)}
+                if cells:
+                    recs.append({**r, "cells": cells})
+            if recs:
+                mp.fog_reveals[team] = recs
+            else:
+                del mp.fog_reveals[team]
         # Shift each channel's viewport CAMERA by the same offset so it keeps
         # framing the same content after a center/edge-anchored resize (the
         # camera is coordinate-bearing too). resolve_viewport re-clamps on
@@ -6924,303 +7464,11 @@ class Match:
                 if isinstance(off, (list, tuple)) and len(off) == 2:
                     self.channel_views[ck] = [off[0] + ox, off[1] + oy]
 
-        self.grid_width, self.grid_height = new_w, new_h
+        mp.grid_width, mp.grid_height = new_w, new_h
         return ({"offset": (ox, oy), "anchor": key, "killed": killed,
                  "dropped_tiles": dropped_tiles,
                  "clipped_zone_cells": clipped_cells}, log)
 
-
-    # ---- tile data helpers --------------------------------------------
-    # Tiles live in self.tiles keyed by (x, y) tuples. These methods are
-    # the chokepoints for set / get / delete so that JSON serialization,
-    # bounds checking, and intermediate-dict creation happen in one
-    # place — both !tile commands and the formula-side tile_get /
-    # tile_has functions reach for them.
-
-    def tile_data(self, x: int, y: int) -> Dict[str, Any]:
-        """Return the tile's data dict at (x, y), creating an empty
-        entry if the tile has no data yet. Caller mutates in place.
-        Out-of-bounds coordinates raise OutOfBounds — silently auto-
-        creating off-grid tiles would mask GM typos."""
-        if not self.in_bounds(x, y):
-            raise OutOfBounds(
-                f"({x},{y}) outside {self.grid_width}x{self.grid_height}"
-            )
-        return self.tiles.setdefault((x, y), {})
-
-    def tile_get_path(self, x: int, y: int, path: str) -> Any:
-        """Read tile_data[x,y][a][b][c] for a dotted path 'a.b.c'.
-        Raises NotFound on any missing segment so the user gets a
-        precise error like \"tile (5,5) has no feature 'flame'\"
-        rather than a Python KeyError. Empty-path '' is rejected —
-        the bare 'tile data dict' isn't a useful thing to expose."""
-        if not self.in_bounds(x, y):
-            raise OutOfBounds(
-                f"({x},{y}) outside {self.grid_width}x{self.grid_height}"
-            )
-        if not path:
-            raise VTTError("tile path cannot be empty.")
-        d: Any = self.tiles.get((x, y), {})
-        parts = path.split(".")
-        for i, key in enumerate(parts):
-            if not isinstance(d, dict) or key not in d:
-                # Build a useful path-prefix for the error so the GM
-                # knows where the chain broke.
-                where = ".".join(parts[:i + 1])
-                raise NotFound(
-                    f"tile ({x},{y}) has no value at '{where}'."
-                )
-            d = d[key]
-        return d
-
-    def tile_has_path(self, x: int, y: int, path: str) -> bool:
-        """Boolean version of tile_get_path. Out-of-bounds returns
-        False (a missing tile is conceptually 'has no feature' rather
-        than an error) so formulas can defensively guard against
-        passing entity coords that walked off-grid for some reason."""
-        if not self.in_bounds(x, y):
-            return False
-        if not path:
-            return False
-        d: Any = self.tiles.get((x, y), {})
-        for key in path.split("."):
-            if not isinstance(d, dict) or key not in d:
-                return False
-            d = d[key]
-        return True
-
-    def tile_set_path(self, x: int, y: int, path: str, value: Any) -> None:
-        """Set tile_data[x,y][a][b][c] = value, creating intermediate
-        dicts as needed (same write semantics as Entity.write_var,
-        but on tile dicts). Out-of-bounds raises; empty path raises;
-        path that collides with a non-dict value mid-traversal raises
-        (we don't silently clobber a scalar with a dict)."""
-        if not self.in_bounds(x, y):
-            raise OutOfBounds(
-                f"({x},{y}) outside {self.grid_width}x{self.grid_height}"
-            )
-        check_store_path(path, "tile path")
-        d = self.tiles.setdefault((x, y), {})
-        parts = path.split(".")
-        for i, key in enumerate(parts[:-1]):
-            existing = d.get(key)
-            if existing is not None and not isinstance(existing, dict):
-                where = ".".join(parts[:i + 1])
-                raise VTTError(
-                    f"tile ({x},{y}) value at '{where}' is "
-                    f"{type(existing).__name__}, not a dict — cannot "
-                    f"set a nested key under it without clobbering."
-                )
-            if key not in d:
-                d[key] = {}
-            d = d[key]
-        d[parts[-1]] = _own_value(value)
-
-    def tile_del_path(self, x: int, y: int, path: Optional[str]) -> None:
-        """Delete a dotted-path key from a tile's data, OR (when
-        path is None / empty) delete the entire tile entry from
-        self.tiles. After a path-delete, walk back up the chain and
-        drop any parent dict that became empty, finishing with the
-        (x,y) entry itself — every entry in self.tiles always has
-        at least one populated feature so the serialized form
-        stays sparse and !tile list doesn't show no-op coords."""
-        if (x, y) not in self.tiles:
-            return  # nothing to do — symmetric with remove_var_silent
-        if not path:
-            del self.tiles[(x, y)]
-            return
-        # Walk down, tracking each parent dict so we can prune empties
-        # on the way back up.
-        parts = path.split(".")
-        chain: List[Dict[str, Any]] = [self.tiles[(x, y)]]
-        for i, key in enumerate(parts[:-1]):
-            d = chain[-1]
-            if not isinstance(d, dict) or key not in d:
-                where = ".".join(parts[:i + 1])
-                raise NotFound(f"tile ({x},{y}) has no value at '{where}'.")
-            chain.append(d[key])
-        leaf_parent = chain[-1]
-        leaf_key = parts[-1]
-        if not isinstance(leaf_parent, dict) or leaf_key not in leaf_parent:
-            raise NotFound(f"tile ({x},{y}) has no value at '{path}'.")
-        del leaf_parent[leaf_key]
-        # Prune empty parents from the leaf back to the root. Each
-        # iteration drops the just-emptied dict from its grandparent
-        # under the key we descended through.
-        for i in range(len(chain) - 1, 0, -1):
-            if chain[i]:
-                break  # still has siblings — stop pruning
-            parent = chain[i - 1]
-            parent_key = parts[i - 1]
-            del parent[parent_key]
-        if not self.tiles[(x, y)]:
-            del self.tiles[(x, y)]
-
-    # ---- zones (named multi-cell regions) ----------------------------
-    # A zone is a named SET of cells plus a free-form data dict, optional
-    # hook formulas, and an optional map glyph (see the `zones` field and
-    # ZONE_HOOK_NAMES). These methods are the chokepoints the !zone
-    # command and the zone_* formula functions share. `cells` is held as
-    # a set of (x,y) tuples in memory; serialization encodes it as a
-    # sorted list of [x,y].
-    @staticmethod
-    def _zone_to_dict(z: Dict[str, Any]) -> Dict[str, Any]:
-        cells = z.get("cells") or set()
-        out: Dict[str, Any] = {
-            "cells": [[x, y] for (x, y) in sorted(cells)],
-            # deepcopy data/hooks: zone_set_path / the zone_set primitive mutate
-            # the zone data dict IN PLACE, so a by-reference snapshot would be
-            # corrupted by a later edit (defeats undo + action rollback).
-            "data": copy.deepcopy(z.get("data") or {}),
-            "hooks": copy.deepcopy(z.get("hooks") or {}),
-        }
-        g = z.get("glyph")
-        if isinstance(g, str) and len(g) == 1:
-            out["glyph"] = g
-        c = z.get("color")
-        if isinstance(c, str) and c:
-            out["color"] = c
-        # Aura binding (entity-anchored zone), if present.
-        if z.get("anchor"):
-            out["anchor"] = z["anchor"]
-            out["anchor_radius"] = int(z.get("anchor_radius", 0) or 0)
-            out["anchor_metric"] = str(z.get("anchor_metric", "square_radius"))
-        return out
-
-    def _zone_from_dict(self, zdef: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        if not isinstance(zdef, dict):
-            return None
-        cells: Set[Tuple[int, int]] = set()
-        raw_cells = zdef.get("cells")
-        if isinstance(raw_cells, list):
-            for pair in raw_cells:
-                if isinstance(pair, (list, tuple)) and len(pair) == 2:
-                    try:
-                        x, y = int(pair[0]), int(pair[1])
-                    except (TypeError, ValueError):
-                        continue
-                    if self.in_bounds(x, y):
-                        cells.add((x, y))
-        data = zdef.get("data")
-        hooks = zdef.get("hooks")
-        z: Dict[str, Any] = {
-            "cells": cells,
-            "data": copy.deepcopy(data) if isinstance(data, dict) else {},
-            "hooks": {
-                k: v for k, v in hooks.items()
-                if isinstance(k, str) and isinstance(v, str)
-            } if isinstance(hooks, dict) else {},
-        }
-        g = zdef.get("glyph")
-        if isinstance(g, str) and len(g) == 1:
-            z["glyph"] = g
-        c = zdef.get("color")
-        if isinstance(c, str) and c:
-            z["color"] = c
-        # Restore an aura binding. The cells were serialized at their
-        # last-stamped positions (and re-stamp on the next anchor move),
-        # so no recompute is needed at load time.
-        anchor = zdef.get("anchor")
-        if isinstance(anchor, str) and anchor:
-            z["anchor"] = anchor
-            try:
-                z["anchor_radius"] = max(0, int(zdef.get("anchor_radius", 0)))
-            except (TypeError, ValueError):
-                z["anchor_radius"] = 0
-            metric = str(zdef.get("anchor_metric", "square_radius"))
-            z["anchor_metric"] = metric if metric in self._AURA_METRICS else "square_radius"
-        return z
-
-    def has_zone(self, name: str) -> bool:
-        return name in self.zones
-
-    def _require_zone(self, name: str) -> Dict[str, Any]:
-        z = self.zones.get(name)
-        if z is None:
-            raise NotFound(f"Zone '{name}' not found.")
-        return z
-
-    def create_zone(self, name: str, *, overwrite: bool = False) -> Dict[str, Any]:
-        """Create an empty zone. Raises DuplicateId if it exists unless
-        overwrite=True."""
-        if not isinstance(name, str) or not name.strip():
-            raise VTTError("Zone name must be a non-empty string.")
-        if name in self.zones and not overwrite:
-            raise DuplicateId(f"Zone '{name}' already exists.")
-        self.zones[name] = {"cells": set(), "data": {}, "hooks": {}}
-        return self.zones[name]
-
-    def delete_zone(self, name: str) -> None:
-        if name not in self.zones:
-            raise NotFound(f"Zone '{name}' not found.")
-        del self.zones[name]
-
-    def zone_add_cell(self, name: str, x: int, y: int,
-                      *, create: bool = True) -> bool:
-        """Add cell (x,y) to a zone (creating the zone if missing and
-        create=True). Returns True iff newly added. Off-grid cells are
-        rejected."""
-        if not self.in_bounds(x, y):
-            raise OutOfBounds(
-                f"({x},{y}) outside {self.grid_width}x{self.grid_height}"
-            )
-        z = self.zones.get(name)
-        if z is None:
-            if not create:
-                raise NotFound(f"Zone '{name}' not found.")
-            z = self.create_zone(name)
-        if (x, y) in z["cells"]:
-            return False
-        z["cells"].add((x, y))
-        return True
-
-    def zone_remove_cell(self, name: str, x: int, y: int) -> bool:
-        """Remove cell (x,y) from a zone. Returns True iff it was present.
-        An emptied zone still exists (data/hooks preserved)."""
-        z = self._require_zone(name)
-        if (x, y) in z["cells"]:
-            z["cells"].discard((x, y))
-            return True
-        return False
-
-    def zone_fill_rect(self, name: str, x1: int, y1: int, x2: int, y2: int,
-                       *, create: bool = True) -> int:
-        """Add every in-bounds cell of the rectangle (x1,y1)-(x2,y2) to a
-        zone (corners in any order). Returns the count of NEWLY added
-        cells."""
-        z = self.zones.get(name)
-        if z is None:
-            if not create:
-                raise NotFound(f"Zone '{name}' not found.")
-            z = self.create_zone(name)
-        xa, xb = sorted((int(x1), int(x2)))
-        ya, yb = sorted((int(y1), int(y2)))
-        # Clipped to the grid before the walk: zone_fill(z, 1, 1, 10**6,
-        # 10**6) used to visit a trillion cells to keep the on-grid ones.
-        xa, xb = max(1, xa), min(self.grid_width, xb)
-        ya, yb = max(1, ya), min(self.grid_height, yb)
-        added = 0
-        for xx in range(xa, xb + 1):
-            for yy in range(ya, yb + 1):
-                if self.in_bounds(xx, yy) and (xx, yy) not in z["cells"]:
-                    z["cells"].add((xx, yy))
-                    added += 1
-        return added
-
-    def zone_shift(self, name: str, dx: int, dy: int) -> int:
-        """Translate every cell of the zone by (dx,dy). Cells that would
-        leave the grid are DROPPED (a zone may drift off the edge and,
-        with an opposite shift, partially return — only on-grid cells
-        survive each shift). Returns the number of cells retained."""
-        z = self._require_zone(name)
-        dx, dy = int(dx), int(dy)
-        new: Set[Tuple[int, int]] = set()
-        for (x, y) in z["cells"]:
-            nx, ny = x + dx, y + dy
-            if self.in_bounds(nx, ny):
-                new.add((nx, ny))
-        z["cells"] = new
-        return len(new)
 
     # ---- entity-anchored auras --------------------------------------
     # An aura is a zone bound to an entity: its `anchor` field holds the
@@ -7232,7 +7480,6 @@ class Match:
     # `anchor_radius` of ANY of the anchor's footprint cells (radius 0 =
     # exactly the footprint), matching how large-entity vision/AoE behave.
 
-    _AURA_METRICS = ("square_radius", "manhattan", "euclidean")
 
     def _within_radius(self, ux: int, uy: int, x: int, y: int,
                        radius: int, metric: str) -> bool:
@@ -7243,25 +7490,26 @@ class Match:
             return dx * dx + dy * dy <= radius * radius
         return max(dx, dy) <= radius   # square_radius (Chebyshev)
 
-    def _stamp_anchored_zone(self, name: str) -> None:
-        """Recompute an anchored zone's cells from its anchor entity's
-        current footprint + radius. No-op for a non-anchored zone or one
-        whose anchor entity is gone (the anchor-loss path handles that)."""
-        z = self.zones.get(name)
+    def _stamp_anchored_zone(self, name: str, mp: "Map") -> None:
+        """Recompute an anchored zone's cells (zone `name` on map `mp`) from
+        its anchor entity's current footprint + radius. No-op for a
+        non-anchored zone, or one whose anchor entity is gone or on another
+        map (the anchor-loss path handles that)."""
+        z = mp.zones.get(name)
         if not isinstance(z, dict):
             return
         eid = z.get("anchor")
         if not eid:
             return
         e = self.entities.get(eid)
-        if e is None or not e.is_alive:
+        if e is None or not e.is_alive or e.map != mp.name:
             return
         r = max(0, int(z.get("anchor_radius", 0) or 0))
         metric = str(z.get("anchor_metric", "square_radius"))
         new: Set[Tuple[int, int]] = set()
         for (fx, fy) in self.entity_cells(e):
-            for yy in range(max(1, fy - r), min(self.grid_height, fy + r) + 1):
-                for xx in range(max(1, fx - r), min(self.grid_width, fx + r) + 1):
+            for yy in range(max(1, fy - r), min(mp.grid_height, fy + r) + 1):
+                for xx in range(max(1, fx - r), min(mp.grid_width, fx + r) + 1):
                     if (xx, yy) in new:
                         continue
                     if self._within_radius(fx, fy, xx, yy, r, metric):
@@ -7270,9 +7518,10 @@ class Match:
 
     def _restamp_anchors_for(self, eid: str) -> None:
         """Re-stamp every aura anchored to `eid` (called when it moves)."""
-        for name, z in self.zones.items():
-            if isinstance(z, dict) and z.get("anchor") == eid:
-                self._stamp_anchored_zone(name)
+        for mp in self.maps.values():
+            for name, z in mp.zones.items():
+                if isinstance(z, dict) and z.get("anchor") == eid:
+                    self._stamp_anchored_zone(name, mp)
 
     # ---------- body parts (locational damage) ----------
     def entity_parts(self, parent_id: str) -> List["Entity"]:
@@ -7481,10 +7730,11 @@ class Match:
         bdx, bdy = -bdx, -bdy            # behind = opposite of facing
         body = {head_id} | {s.id for s in chain}
         used: Set[Tuple[int, int]] = {tuple(c) for c in self.entity_cells(head)}
+        mp = self.map_of(head)
 
         def free(cx: int, cy: int) -> bool:
-            return (self.in_bounds(cx, cy) and (cx, cy) not in used
-                    and self.cell_occupant(cx, cy, ignore=tuple(body)) is None)
+            return (mp.in_bounds(cx, cy) and (cx, cy) not in used
+                    and self.cell_occupant(cx, cy, tuple(body), mp) is None)
 
         # Straight behind first, then the directions closest to it (the
         # body bends before it doubles back past the head).
@@ -7506,10 +7756,9 @@ class Match:
                          for dx, dy in dirs
                          if free(px + dx * spacing, py + dy * spacing)), None)
             if spot is None:
-                for r in range(1, max(self.grid_width,
-                                                self.grid_height) + 1):
+                for r in range(1, max(mp.grid_width, mp.grid_height) + 1):
                     spot = next(((cx, cy) for cx, cy in self._ring_cells(
-                        px, py, r) if free(cx, cy)), None)
+                        px, py, r, mp) if free(cx, cy)), None)
                     if spot is not None:
                         break
             if spot is None:
@@ -7528,9 +7777,9 @@ class Match:
                                  "segment_follow_mode")) == "path":
             head.vars["__seg_path"] = path
 
-    def _find_segment_cell(self, px: int, py: int,
-                           bdx: int, bdy: int) -> Optional[Tuple[int, int]]:
-        """A free, in-bounds cell to place a new segment near (px, py),
+    def _find_segment_cell(self, px: int, py: int, bdx: int, bdy: int,
+                           mp: "Map") -> Optional[Tuple[int, int]]:
+        """A free, in-bounds cell of map `mp` to place a new segment near (px, py),
         preferring the cell directly 'behind' (px+bdx, py+bdy) then a ring
         around the predecessor and the behind cell."""
         cands = [(px + bdx, py + bdy)]
@@ -7544,7 +7793,7 @@ class Match:
             if (cx, cy) in seen:
                 continue
             seen.add((cx, cy))
-            if self.in_bounds(cx, cy) and self.cell_occupant(cx, cy) is None:
+            if mp.in_bounds(cx, cy) and self.cell_occupant(cx, cy, mp=mp) is None:
                 return (cx, cy)
         return None
 
@@ -7572,7 +7821,8 @@ class Match:
         chain = self.snake_segments(head_id)
         pred = chain[-1] if chain else head
         bdx, bdy = FACING_VECTORS.get(getattr(head, "facing", "up"), (0, -1))
-        cell = self._find_segment_cell(pred.x, pred.y, -bdx, -bdy)
+        cell = self._find_segment_cell(pred.x, pred.y, -bdx, -bdy,
+                                       self.map_of(head))
         if cell is None:
             raise VTTError(
                 f"No free cell behind `{pred.id}` to place the segment.")
@@ -7586,7 +7836,7 @@ class Match:
             svars.update(extra_vars)
         e = Entity(id=seg_id, name=name, x=cell[0], y=cell[1],
                    vars=svars, part_of=head_id)
-        _, log = e.spawn(self, cell[0], cell[1])
+        _, log = e.spawn(self, cell[0], cell[1], map_name=head.map)
         head.vars.setdefault("__seg_last", [head.x, head.y])
         # Seed the path (for `path` follow mode) with the head's current cell
         # so segments reach full spacing without a warm-up lag.
@@ -7614,7 +7864,7 @@ class Match:
             pvars.update(extra_vars)
         e = Entity(id=part_id, name=name, x=parent.x, y=parent.y,
                    vars=pvars, part_of=parent_id)
-        _, log = e.spawn(self, parent.x, parent.y)
+        _, log = e.spawn(self, parent.x, parent.y, map_name=parent.map)
         return e, log
 
     def attach_part(self, parent_id: str, part_id: str) -> "Entity":
@@ -8041,12 +8291,13 @@ class Match:
         # hold a nearer cell. (A scan of the whole grid made one dismount on
         # a 500x500 map take 12 s.)
         cx0, cy0 = math.floor(ox + 0.5), math.floor(oy + 0.5)
+        mp = self.map_of(veh if veh is not None else rider)
         best: Optional[Tuple[float, int, int]] = None
         for r in self._ring_radii(cx0, cy0,
-                                  self.grid_width + self.grid_height):
-            for gx, gy in self._ring_cells(cx0, cy0, r):
-                if self.footprint_in_bounds(rider, gx, gy) and \
-                        not self._footprint_blocked_by_others(rider, gx, gy):
+                                  mp.grid_width + mp.grid_height, mp):
+            for gx, gy in self._ring_cells(cx0, cy0, r, mp):
+                if self.footprint_in_bounds(rider, gx, gy, mp) and \
+                        not self._footprint_blocked_by_others(rider, gx, gy, mp):
                     key = ((gx - ox) ** 2 + (gy - oy) ** 2, gy, gx)
                     if best is None or key < best:
                         best = key
@@ -8054,12 +8305,13 @@ class Match:
                 break
         return (best[2], best[1]) if best is not None else None
 
-    def _footprint_blocked_by_others(self, e: "Entity",
-                                     ax: int, ay: int) -> bool:
+    def _footprint_blocked_by_others(self, e: "Entity", ax: int, ay: int,
+                                     mp: "Map") -> bool:
         """True if some OTHER non-stackable entity covers any cell of `e`'s
-        footprint anchored at (ax, ay). (Placement helper for dismount.)"""
+        footprint anchored at (ax, ay) of map `mp`. (Placement helper for
+        dismount.)"""
         for cx, cy in self.entity_cells(e, ax, ay):
-            occ = self.cell_occupant(cx, cy, ignore=(e.id,))
+            occ = self.cell_occupant(cx, cy, (e.id,), mp)
             if occ is not None:
                 return True
         return False
@@ -8569,20 +8821,22 @@ class Match:
         aura resumes (re-stamps) if the anchor is revived/healed — see
         _resume_anchored_zones."""
         mode = str(self.rules.get("anchored_zone_on_anchor_loss", "delete"))
-        for name in [n for n, z in self.zones.items()
-                     if isinstance(z, dict) and z.get("anchor") == eid]:
-            z = self.zones[name]
-            if mode == "freeze":
-                z.pop("anchor", None)
-                z.pop("anchor_radius", None)
-                z.pop("anchor_metric", None)
-            elif mode == "suspend":
-                # Inert but still bound: empty cells (no render/hooks/
-                # membership) while the anchor is dead; _restamp re-fills it
-                # once the anchor is alive again (revive / part heal).
-                z["cells"] = set()
-            else:
-                del self.zones[name]
+        for mp in self.maps.values():
+            for name in [n for n, z in mp.zones.items()
+                         if isinstance(z, dict) and z.get("anchor") == eid]:
+                z = mp.zones[name]
+                if mode == "freeze":
+                    z.pop("anchor", None)
+                    z.pop("anchor_radius", None)
+                    z.pop("anchor_metric", None)
+                elif mode == "suspend":
+                    # Inert but still bound: empty cells (no render/hooks/
+                    # membership) while the anchor is dead; _restamp
+                    # re-fills it once the anchor is alive again (revive /
+                    # part heal).
+                    z["cells"] = set()
+                else:
+                    del mp.zones[name]
 
     def _resume_anchored_zones(self, eid: str) -> None:
         """Re-stamp any auras still bound to `eid` after it comes back alive
@@ -8593,54 +8847,43 @@ class Match:
         self._restamp_anchors_for(eid)
 
     def anchor_zone(self, name: str, eid: str, radius: int = 0,
-                    metric: str = "square_radius") -> int:
-        """Bind zone `name` to entity `eid` as an aura of `radius`, then
-        stamp its cells immediately. Returns the resulting cell count.
-        Raises NotFound for an unknown zone or entity, VTTError on a bad
-        radius/metric. Re-anchoring an already-anchored zone just rebinds."""
-        z = self._require_zone(name)
+                    metric: str = "square_radius",
+                    mp: Optional["Map"] = None) -> int:
+        """Bind zone `name` (on map `mp`, None = the only map) to entity
+        `eid` as an aura of `radius`, then stamp its cells immediately.
+        Returns the resulting cell count. Raises NotFound for an unknown
+        zone or entity, VTTError on a bad radius/metric or a unit on another
+        map. Re-anchoring an already-anchored zone just rebinds."""
+        mp = mp or self.get_map()
+        z = mp._require_zone(name)
         if eid not in self.entities:
             raise NotFound(f"Entity '{eid}' not found.")
+        if self.entities[eid].map != mp.name:
+            raise VTTError(
+                f"anchor: `{eid}` is not on the zone's map `{mp.name}`.")
         if not isinstance(radius, int) or isinstance(radius, bool) or radius < 0:
             raise VTTError("anchor: radius must be a non-negative integer.")
         metric = str(metric)
-        if metric not in self._AURA_METRICS:
+        if metric not in AURA_METRICS:
             raise VTTError(
                 f"anchor: unknown metric '{metric}'. Use one of: "
-                f"{', '.join(self._AURA_METRICS)}.")
+                f"{', '.join(AURA_METRICS)}.")
         z["anchor"] = eid
         z["anchor_radius"] = radius
         z["anchor_metric"] = metric
-        self._stamp_anchored_zone(name)
+        self._stamp_anchored_zone(name, mp)
         return len(z["cells"])
 
-    def unanchor_zone(self, name: str) -> bool:
+    def unanchor_zone(self, name: str, mp: Optional["Map"] = None) -> bool:
         """Detach an aura's anchor, leaving its current cells as a static
         zone. Returns True iff the zone was anchored. Raises for an
         unknown zone."""
-        z = self._require_zone(name)
+        z = (mp or self.get_map())._require_zone(name)
         was = bool(z.get("anchor"))
         z.pop("anchor", None)
         z.pop("anchor_radius", None)
         z.pop("anchor_metric", None)
         return was
-
-    def zone_cell_list(self, name: str) -> List[List[int]]:
-        z = self._require_zone(name)
-        return [[x, y] for (x, y) in sorted(z["cells"])]
-
-    def zone_size(self, name: str) -> int:
-        """Cell count of a zone (0 if the zone doesn't exist)."""
-        z = self.zones.get(name)
-        return len(z["cells"]) if z is not None else 0
-
-    def zones_at(self, x: int, y: int) -> Set[str]:
-        """Names of every zone whose footprint includes (x,y)."""
-        return {name for name, z in self.zones.items() if (x, y) in z["cells"]}
-
-    def cell_in_zone(self, x: int, y: int, name: str) -> bool:
-        z = self.zones.get(name)
-        return z is not None and (x, y) in z["cells"]
 
     def entity_zones(self, eid: str) -> Set[str]:
         """Names of every zone the entity currently stands in — any zone
@@ -8649,98 +8892,24 @@ class Match:
         e = self.entities.get(eid)
         if e is None:
             return set()
-        return self._zones_over(self.entity_cells(e))
+        return self._zones_over(self.entity_cells(e), self.map_of(e))
 
-    def entities_in_zone(self, name: str) -> List[str]:
-        """Ids of every alive entity with ANY footprint cell in the zone,
-        in insertion order. [] for a missing zone."""
-        z = self.zones.get(name)
+    def entities_in_zone(self, name: str,
+                         mp: Optional["Map"] = None) -> List[str]:
+        """Ids of every alive entity with ANY footprint cell in zone `name`
+        of map `mp` (None = the only map), in insertion order. [] for a
+        missing zone."""
+        mp = mp or self.get_map()
+        z = mp.zones.get(name)
         if z is None:
             return []
         cells = z["cells"]
         return [
             eid for eid, e in self.entities.items()
-            if getattr(e, "is_alive", True) and not e.is_glued_part
+            if e.map == mp.name
+            and getattr(e, "is_alive", True) and not e.is_glued_part
             and any(c in cells for c in self.entity_cells(e))
         ]
-
-    # ---- zone data accessors (dotted paths under zone["data"]) -------
-    def zone_get_path(self, name: str, path: str) -> Any:
-        z = self._require_zone(name)
-        if not path:
-            raise VTTError("zone path cannot be empty.")
-        cur: Any = z["data"]
-        for key in path.split("."):
-            if not isinstance(cur, dict) or key not in cur:
-                raise NotFound(f"zone '{name}' has no value at '{path}'.")
-            cur = cur[key]
-        return cur
-
-    def zone_has_path(self, name: str, path: str) -> bool:
-        z = self.zones.get(name)
-        if z is None or not path:
-            return False
-        cur: Any = z["data"]
-        for key in path.split("."):
-            if not isinstance(cur, dict) or key not in cur:
-                return False
-            cur = cur[key]
-        return True
-
-    def zone_set_path(self, name: str, path: str, value: Any,
-                      *, create: bool = True) -> None:
-        check_store_path(path, "zone path")
-        z = self.zones.get(name)
-        if z is None:
-            if not create:
-                raise NotFound(f"Zone '{name}' not found.")
-            z = self.create_zone(name)
-        d = z["data"]
-        parts = path.split(".")
-        for i, key in enumerate(parts[:-1]):
-            existing = d.get(key)
-            if existing is not None and not isinstance(existing, dict):
-                where = ".".join(parts[:i + 1])
-                raise VTTError(
-                    f"zone '{name}' value at '{where}' is "
-                    f"{type(existing).__name__}, not a dict — cannot set a "
-                    f"nested key under it without clobbering."
-                )
-            if key not in d:
-                d[key] = {}
-            d = d[key]
-        d[parts[-1]] = _own_value(value)
-
-    def zone_del_path(self, name: str, path: str) -> None:
-        """Delete a dotted key from a zone's data, pruning emptied
-        parents. Raises NotFound if the path is absent."""
-        z = self._require_zone(name)
-        if not path:
-            raise VTTError("zone path cannot be empty.")
-        parts = path.split(".")
-        chain: List[Dict[str, Any]] = [z["data"]]
-        cur: Any = z["data"]
-        for key in parts[:-1]:
-            if not isinstance(cur, dict) or key not in cur:
-                raise NotFound(f"zone '{name}' has no value at '{path}'.")
-            cur = cur[key]
-            chain.append(cur)
-        leaf_parent = chain[-1]
-        if not isinstance(leaf_parent, dict) or parts[-1] not in leaf_parent:
-            raise NotFound(f"zone '{name}' has no value at '{path}'.")
-        del leaf_parent[parts[-1]]
-        for i in range(len(chain) - 1, 0, -1):
-            if chain[i]:
-                break
-            del chain[i - 1][parts[i - 1]]
-
-    def zone_clear_data(self, name: str) -> int:
-        """Drop ALL data from a zone (keeps cells + hooks). Returns the
-        number of top-level keys removed."""
-        z = self._require_zone(name)
-        n = len(z["data"])
-        z["data"] = {}
-        return n
 
     # ---- host / access control ---------------------------------------
     def is_owner(self, user: Optional[str]) -> bool:
@@ -8846,12 +9015,14 @@ class Match:
         # square_radius (Chebyshev) — the default
         return max(dx, dy) <= radius
 
-    def team_sees_cell(self, pov_team: Optional[str], x: int, y: int) -> bool:
-        """Does team `pov_team` see cell (x, y) by RANGE (any alive member
-        within its vision radius — union team vision)? Omniscient / empty
-        pov_team sees all. Does NOT consult fog_enabled or LOS; it's the raw
-        range query. LOS-aware team vision is _team_sees(..., los=True)."""
-        return self._team_sees(pov_team, x, y, los=False)
+    def team_sees_cell(self, pov_team: Optional[str], x: int, y: int,
+                       mp: Optional["Map"] = None) -> bool:
+        """Does team `pov_team` see cell (x, y) of map `mp` (None = the only
+        map) by RANGE (any alive member within its vision radius — union
+        team vision)? Omniscient / empty pov_team sees all. Does NOT consult
+        fog_enabled or LOS; it's the raw range query. LOS-aware team vision
+        is _team_sees(..., los=True)."""
+        return self._team_sees(pov_team, x, y, mp or self.get_map(), los=False)
 
     def _team_sees_entity(self, pov_team: Optional[str], eid: str,
                           *, los: bool) -> bool:
@@ -8861,7 +9032,8 @@ class Match:
         e = self.entities.get(eid)
         if e is None:
             return False
-        return any(self._team_sees(pov_team, cx, cy, los=los)
+        mp = self.map_of(e)
+        return any(self._team_sees(pov_team, cx, cy, mp, los=los)
                    for cx, cy in self.entity_cells(e))
 
     def _team_has_los_entity(self, pov_team: Optional[str], eid: str) -> bool:
@@ -8870,7 +9042,8 @@ class Match:
         e = self.entities.get(eid)
         if e is None:
             return False
-        return any(self._team_has_los(pov_team, cx, cy)
+        mp = self.map_of(e)
+        return any(self._team_has_los(pov_team, cx, cy, mp)
                    for cx, cy in self.entity_cells(e))
 
     def team_sees_entity(self, pov_team: Optional[str], eid: str) -> bool:
@@ -8878,10 +9051,12 @@ class Match:
         for unknown."""
         return self._team_sees_entity(pov_team, eid, los=False)
 
-    def entity_can_see(self, viewer_eid: str, x: int, y: int) -> bool:
-        """Does the single unit `viewer_eid` see (x, y) by RANGE (within its
-        own vision radius, any team)? False for unknown viewer."""
-        return self._entity_sees(viewer_eid, x, y, los=False)
+    def entity_can_see(self, viewer_eid: str, x: int, y: int,
+                       mp: Optional["Map"] = None) -> bool:
+        """Does the single unit `viewer_eid` see (x, y) of map `mp` (None:
+        its own) by RANGE (within its own vision radius, any team)? False
+        for unknown viewer."""
+        return self._entity_sees(viewer_eid, x, y, los=False, mp=mp)
 
     # ---- opacity (line-of-sight blocking) ---------------------------
     # Opacity mirrors the movement-block system: a per-cell condition,
@@ -8894,10 +9069,10 @@ class Match:
     # as NOT opaque (a typo must not blind the table). SEPARATE from
     # `block` — a window is transparent+impassable, smoke opaque+passable.
 
-    def _tile_opaque_spec(self, x: int, y: int) -> Any:
-        """Opacity spec for the tile at (x, y): instance `opaque` data, else
-        its template's, else the tile_opaque_condition rule."""
-        cell = self.tiles.get((x, y))
+    def _tile_opaque_spec(self, x: int, y: int, mp: "Map") -> Any:
+        """Opacity spec for the tile at (x, y) of map `mp`: instance `opaque`
+        data, else its template's, else the tile_opaque_condition rule."""
+        cell = mp.tiles.get((x, y))
         if cell is not None:
             inst = cell.get("opaque")
             if inst not in (None, ""):
@@ -8938,16 +9113,25 @@ class Match:
                 errors.append(f"`{cond}`: {ex}")
             return False
 
-    def cell_opaque(self, viewer_id: Optional[str], x: int, y: int) -> bool:
-        """True iff the tile or any zone covering (x, y) blocks the sight of
-        `viewer_id`. The raw opacity query (ignores fog toggles). A cell off
-        the map is never opaque (the sight walks skip it, see _line_span)."""
-        if not self.in_bounds(x, y):
+    def _viewer_map(self, mp: Optional["Map"],
+                    viewer_id: Optional[str]) -> "Map":
+        """`mp`, else the viewer's map, else the only map."""
+        return self._map_for(
+            mp, self.entities.get(viewer_id) if viewer_id else None)
+
+    def cell_opaque(self, viewer_id: Optional[str], x: int, y: int,
+                    mp: Optional["Map"] = None) -> bool:
+        """True iff the tile or any zone covering (x, y) of map `mp` (None:
+        the viewer's) blocks the sight of `viewer_id`. The raw opacity query
+        (ignores fog toggles). A cell off the map is never opaque (the sight
+        walks skip it, see _line_span)."""
+        mp = self._viewer_map(mp, viewer_id)
+        if not mp.in_bounds(x, y):
             return False
-        if self._eval_opaque_spec(self._tile_opaque_spec(x, y), viewer_id,
+        if self._eval_opaque_spec(self._tile_opaque_spec(x, y, mp), viewer_id,
                                   {"tile_x": x, "tile_y": y}):
             return True
-        for name, z in self.zones.items():
+        for name, z in mp.zones.items():
             cells = z.get("cells", ())
             if (x, y) not in cells:
                 continue
@@ -8961,7 +9145,8 @@ class Match:
         return False
 
     def _los_stop(self, viewer_id: Optional[str], x1: int, y1: int,
-                  x2: int, y2: int) -> Tuple[Tuple[int, int], bool, Optional[Tuple[int, int]]]:
+                  x2: int, y2: int, mp: Optional["Map"] = None
+                  ) -> Tuple[Tuple[int, int], bool, Optional[Tuple[int, int]]]:
         """Walk the thin LOS line (x1,y1)->(x2,y2) near->far with the SAME
         corner-mode flanker logic as sight, tracking where the line stops.
         Returns (last_clear, blocked, blocker):
@@ -8979,9 +9164,10 @@ class Match:
         block."""
         if (x1, y1) == (x2, y2):
             return ((x2, y2), False, None)
+        mp = self._viewer_map(mp, viewer_id)
         # Only the map's part of the line is walked (off-map cells are never
         # opaque, see _line_span), so the cost follows the map's size.
-        span = self._line_span(x1, y1, x2, y2)
+        span = self._line_span(x1, y1, x2, y2, mp)
         if span is None:
             return ((x2, y2), False, None)
         mode = str(self.rules.get("los_corner_mode", "permissive"))
@@ -9011,12 +9197,12 @@ class Match:
                     f1 = (cx + sx, cy)
                     f2 = (cx, cy + sy)
                     if mode == "strict":
-                        if self.cell_opaque(viewer_id, *f1) or \
-                           self.cell_opaque(viewer_id, *f2):
+                        if self.cell_opaque(viewer_id, *f1, mp) or \
+                           self.cell_opaque(viewer_id, *f2, mp):
                             return (last, True, None)
                     elif mode != "open":  # permissive (default)
-                        if self.cell_opaque(viewer_id, *f1) and \
-                           self.cell_opaque(viewer_id, *f2):
+                        if self.cell_opaque(viewer_id, *f1, mp) and \
+                           self.cell_opaque(viewer_id, *f2, mp):
                             return (last, True, None)
                     cx += sx; cy += sy; nx += 1; ny += 1
                 elif a < b:
@@ -9025,13 +9211,13 @@ class Match:
                     cy += sy; ny += 1
             if (cx, cy) == (x2, y2):
                 return ((x2, y2), False, None)
-            if self.cell_opaque(viewer_id, cx, cy):
+            if self.cell_opaque(viewer_id, cx, cy, mp):
                 return (last, True, (cx, cy))
             last = (cx, cy)
         return ((x2, y2), False, None)
 
     def has_los(self, viewer_id: Optional[str], x1: int, y1: int,
-                x2: int, y2: int) -> bool:
+                x2: int, y2: int, mp: Optional["Map"] = None) -> bool:
         """Clear line of sight between the centers of (x1,y1) and (x2,y2)
         for `viewer_id`? Blocked by an opaque cell strictly between the
         endpoints; diagonal corner crossings obey los_corner_mode
@@ -9040,8 +9226,8 @@ class Match:
         viewer's own cell and the target's own opacity never block. viewer_id
         None -> viewer-conditional opacity reads transparent. Thin wrapper over
         the shared _los_stop walk so sight / first_opaque / raycast never
-        drift on the corner rule."""
-        return not self._los_stop(viewer_id, x1, y1, x2, y2)[1]
+        drift on the corner rule. `mp`: the map (None: the viewer's)."""
+        return not self._los_stop(viewer_id, x1, y1, x2, y2, mp)[1]
 
     def _check_line_budget(self, x1: int, y1: int, x2: int, y2: int,
                            what: str = "sight line") -> None:
@@ -9061,10 +9247,10 @@ class Match:
                 f"cells, over the formula_cell_limit of {limit}."
             )
 
-    def _line_span(self, x1: int, y1: int, x2: int, y2: int
+    def _line_span(self, x1: int, y1: int, x2: int, y2: int, mp: "Map"
                    ) -> Optional[Tuple[int, int, int, int]]:
         """The part of the segment between the centres of cells (x1,y1) and
-        (x2,y2) that crosses the map, in line-walk steps: (nx0, ny0, nx1,
+        (x2,y2) that crosses map `mp`, in line-walk steps: (nx0, ny0, nx1,
         ny1), where the walk's x / y boundary crossings numbered nx0..nx1-1 /
         ny0..ny1-1 are the ones on or inside the map's edge. Starting the walk
         at crossing (nx0, ny0) puts it on the cell just before the line enters
@@ -9079,9 +9265,9 @@ class Match:
         # Liang-Barsky against the closed rectangle [0.5, W+0.5] x [0.5, H+0.5]
         # (cell (x, y) spans x-0.5..x+0.5).
         for p, q in ((-dx, Fraction(x1) - Fraction(1, 2)),
-                     (dx, Fraction(self.grid_width) + Fraction(1, 2) - x1),
+                     (dx, Fraction(mp.grid_width) + Fraction(1, 2) - x1),
                      (-dy, Fraction(y1) - Fraction(1, 2)),
-                     (dy, Fraction(self.grid_height) + Fraction(1, 2) - y1)):
+                     (dy, Fraction(mp.grid_height) + Fraction(1, 2) - y1)):
             if p == 0:
                 if q < 0:
                     return None
@@ -9111,22 +9297,26 @@ class Match:
                 crossings(adx, t1, False), crossings(ady, t1, False))
 
     def _line_cells(self, x1: int, y1: int, x2: int, y2: int, *,
-                    clip: bool = True) -> List[Tuple[int, int]]:
+                    clip: bool = True,
+                    mp: Optional["Map"] = None) -> List[Tuple[int, int]]:
         """The ordered cells the segment (x1,y1)->(x2,y2) passes through,
         near->far — the same thin line the LOS walk uses (a diagonal step at
         an exact corner). Geometry only, no opacity. The shared path behind
         first_opaque / entities_on_los / entities_in_line_ignorelos. With
         `clip` (default) only cells ON the map are listed (endpoints included
         when on the map) and the walk covers only the map's part of the line
-        (_line_span); without it, every cell of the line, endpoints included."""
+        (_line_span); without it, every cell of the line, endpoints included.
+        `mp`: the map clipped to (None = the only map)."""
+        if clip:
+            mp = mp or self.get_map()
         if (x1, y1) == (x2, y2):
-            return [(x1, y1)] if (not clip or self.in_bounds(x1, y1)) else []
+            return [(x1, y1)] if (not clip or mp.in_bounds(x1, y1)) else []
         dx, dy = x2 - x1, y2 - y1
         sx = 1 if dx > 0 else (-1 if dx < 0 else 0)
         sy = 1 if dy > 0 else (-1 if dy < 0 else 0)
         adx, ady = abs(dx), abs(dy)
         if clip:
-            span = self._line_span(x1, y1, x2, y2)
+            span = self._line_span(x1, y1, x2, y2, mp)
             if span is None:
                 return []
             nx, ny, nx1, ny1 = span
@@ -9153,11 +9343,12 @@ class Match:
                     cy += sy; ny += 1
             cells.append((cx, cy))
         if clip:
-            cells = [c for c in cells if self.in_bounds(*c)]
+            cells = [c for c in cells if mp.in_bounds(*c)]
         return cells
 
     def first_opaque(self, viewer_id: Optional[str], x1: int, y1: int,
-                     x2: int, y2: int) -> Optional[Tuple[int, int]]:
+                     x2: int, y2: int,
+                     mp: Optional["Map"] = None) -> Optional[Tuple[int, int]]:
         """The cell where sight stops between (x1,y1) and (x2,y2) for
         `viewer_id`, near->far, or None if the line is clear of terrain. For an
         ON-PATH opaque cell that's the opaque cell itself (the cell a beam
@@ -9165,13 +9356,13 @@ class Match:
         pre-corner cell where the line stops (the blocker is the diagonal
         flankers, not on the path). Corner-aware via the shared _los_stop walk,
         so it AGREES with has_los: clear iff has_los is clear."""
-        last, blocked, blocker = self._los_stop(viewer_id, x1, y1, x2, y2)
+        last, blocked, blocker = self._los_stop(viewer_id, x1, y1, x2, y2, mp)
         if not blocked:
             return None
         return blocker if blocker is not None else last
 
     def raycast(self, viewer_id: Optional[str], x1: int, y1: int,
-                x2: int, y2: int) -> Tuple[int, int]:
+                x2: int, y2: int, mp: Optional["Map"] = None) -> Tuple[int, int]:
         """The IMPACT point of a beam cast from (x1,y1) toward (x2,y2) for
         `viewer_id`: the farthest cell with clear sight before terrain stops
         it, or (x2,y2) if the whole line is clear. The companion to
@@ -9180,20 +9371,24 @@ class Match:
         pre-corner cell on an off-path corner-X block), so it agrees with
         has_los. The viewer's own cell never blocks; the target's own opacity
         never blocks. If the cell adjacent to the origin is opaque the impact
-        is the origin itself."""
-        last, _blocked, _blocker = self._los_stop(viewer_id, x1, y1, x2, y2)
+        is the origin itself. `mp`: the map (None: the viewer's)."""
+        last, _blocked, _blocker = self._los_stop(viewer_id, x1, y1, x2, y2, mp)
         return last
 
     # ---- combined vision (range and/or LOS) -------------------------
-    def _member_sees(self, e: "Entity", x: int, y: int, *, los: bool) -> bool:
+    def _member_sees(self, e: "Entity", x: int, y: int, mp: "Map", *,
+                     los: bool) -> bool:
         # A large viewer sees from its WHOLE body: (x,y) is seen if any
         # footprint cell is within vision radius (and — under LOS — has a
         # clear line from that cell). The radius is measured per cell, so
         # a 3×3 scout projects its sight disc from every cell it covers.
+        # A unit sees only its own map.
+        if e.map != mp.name:
+            return False
         r = self._vision_radius_of(e)
         for (ex, ey) in self.entity_cells(e):
             if self._within_vision(ex, ey, x, y, r) and (
-                    (not los) or self.has_los(e.id, ex, ey, x, y)):
+                    (not los) or self.has_los(e.id, ex, ey, x, y, mp)):
                 return True
         return False
 
@@ -9211,43 +9406,51 @@ class Match:
         return True
 
     def _team_sees(self, pov_team: Optional[str], x: int, y: int,
-                   *, los: bool) -> bool:
+                   mp: "Map", *, los: bool) -> bool:
         if not pov_team:
             return True
         for e in self.entities.values():
             if self._vision_member_ok(e, pov_team) and \
-               self._member_sees(e, x, y, los=los):
+               self._member_sees(e, x, y, mp, los=los):
                 return True
         return False
 
-    def _team_has_los(self, pov_team: Optional[str], x: int, y: int) -> bool:
-        """Any alive member of `pov_team` has a clear line to (x,y),
-        IGNORING range (the losonly team query)."""
+    def _team_has_los(self, pov_team: Optional[str], x: int, y: int,
+                      mp: "Map") -> bool:
+        """Any alive member of `pov_team` on map `mp` has a clear line to
+        (x,y), IGNORING range (the losonly team query)."""
         if not pov_team:
             return True
         for e in self.entities.values():
             if self._vision_member_ok(e, pov_team) and \
-               self._entity_has_los(e.id, x, y):
+               self._entity_has_los(e.id, x, y, mp):
                 return True
         return False
 
-    def _entity_sees(self, eid: str, x: int, y: int, *, los: bool) -> bool:
+    def _entity_sees(self, eid: str, x: int, y: int, *, los: bool,
+                     mp: Optional["Map"] = None) -> bool:
+        """Unit `eid` sees (x, y) of map `mp` (None: its own map)."""
         e = self.entities.get(eid)
         if e is None:
             return False
-        return self._member_sees(e, x, y, los=los)
+        return self._member_sees(e, x, y, self._map_for(mp, e), los=los)
 
-    def _entity_has_los(self, eid: str, x: int, y: int) -> bool:
+    def _entity_has_los(self, eid: str, x: int, y: int,
+                        mp: Optional["Map"] = None) -> bool:
         # A large viewer casts LOS from its WHOLE body — clear from ANY
         # footprint cell counts (mirrors _member_sees, which checks every
-        # cell for the range+LOS query).
+        # cell for the range+LOS query). No line reaches another map.
         e = self.entities.get(eid)
         if e is None:
             return False
-        return any(self.has_los(eid, ex, ey, x, y)
+        mp = self._map_for(mp, e)
+        if e.map != mp.name:
+            return False
+        return any(self.has_los(eid, ex, ey, x, y, mp)
                    for (ex, ey) in self.entity_cells(e))
 
-    def _fog_team_sees(self, pov_team: Optional[str], x: int, y: int) -> bool:
+    def _fog_team_sees(self, pov_team: Optional[str], x: int, y: int,
+                       mp: "Map") -> bool:
         """Team vision for the FOG feature: range, plus LOS when the fog_los
         rule is on. The single switch behind fog hiding + explored memory.
 
@@ -9260,29 +9463,31 @@ class Match:
         memo = self._vision_memo
         if memo is None:
             return self._team_sees(
-                pov_team, x, y, los=bool(self.rules.get("fog_los", False)))
-        key = (pov_team, x, y)
+                pov_team, x, y, mp, los=bool(self.rules.get("fog_los", False)))
+        key = (pov_team, mp.name, x, y)
         cached = memo.get(key)
         if cached is None:
             cached = self._team_sees(
-                pov_team, x, y, los=bool(self.rules.get("fog_los", False)))
+                pov_team, x, y, mp, los=bool(self.rules.get("fog_los", False)))
             memo[key] = cached
         return cached
 
-    def _cell_remembered(self, pov_team: Optional[str], x: int, y: int) -> bool:
-        """True iff fog memory is on and `pov_team` has explored (x, y)."""
+    def _cell_remembered(self, pov_team: Optional[str], x: int, y: int,
+                         mp: "Map") -> bool:
+        """True iff fog memory is on and `pov_team` has explored (x, y) of
+        map `mp`."""
         if not self.fog_memory or not pov_team:
             return False
-        return (x, y) in self.explored.get(pov_team, ())
+        return (x, y) in mp.explored.get(pov_team, ())
 
     # ---- fog reveals (scout / clairvoyance) ----
-    def _active_reveals(self, team: str) -> "list":
-        """The team's non-expired reveal records, pruning expired ones in
+    def _active_reveals(self, team: str, mp: "Map") -> "list":
+        """The team's non-expired reveal records on map `mp`, pruning expired ones in
         place. Each record is compared against the clock it was CREATED
         under — `clock: "turn"` (ATB, where round_number never moves) against
         turns_elapsed, anything else against round_number. A record with no
         `clock` predates the field and is treated as round-keyed."""
-        recs = self.fog_reveals.get(team)
+        recs = mp.fog_reveals.get(team)
         if not recs:
             return []
 
@@ -9296,26 +9501,30 @@ class Match:
         live = [r for r in recs if _live(r)]
         if len(live) != len(recs):
             if live:
-                self.fog_reveals[team] = live
+                mp.fog_reveals[team] = live
             else:
-                self.fog_reveals.pop(team, None)
+                mp.fog_reveals.pop(team, None)
         return live
 
-    def _cell_revealed(self, pov_team: Optional[str], x: int, y: int) -> bool:
-        """True iff `pov_team` has an active reveal covering (x, y)."""
+    def _cell_revealed(self, pov_team: Optional[str], x: int, y: int,
+                       mp: "Map") -> bool:
+        """True iff `pov_team` has an active reveal covering (x, y) of map
+        `mp`."""
         if not pov_team:
             return False
-        for r in self._active_reveals(pov_team):
+        for r in self._active_reveals(pov_team, mp):
             if (x, y) in r.get("cells", ()):
                 return True
         return False
 
-    def reveal_cells(self, team: str, cells, duration: Optional[int] = None) -> int:
-        """Reveal a set of cells to `team` for `duration` rounds (None =
-        permanent), independent of unit vision. Returns the cell count.
-        Clipped to the grid."""
+    def reveal_cells(self, team: str, cells, duration: Optional[int] = None,
+                     mp: Optional["Map"] = None) -> int:
+        """Reveal a set of cells of map `mp` (None = the only map) to `team`
+        for `duration` rounds (None = permanent), independent of unit
+        vision. Returns the cell count. Clipped to the grid."""
+        mp = mp or self.get_map()
         clipped = {(int(x), int(y)) for (x, y) in cells
-                   if self.in_bounds(int(x), int(y))}
+                   if mp.in_bounds(int(x), int(y))}
         if not clipped:
             return 0
         # Key the deadline to whichever clock actually ADVANCES. Under ATB
@@ -9337,7 +9546,7 @@ class Match:
         # interchangeable. Without this a scout that reveals every turn
         # piles up one record per use, and every fog check scans them all:
         # a 60x60 render went 19 ms -> 166 ms at 300 permanent records.
-        recs = self.fog_reveals.setdefault(team, [])
+        recs = mp.fog_reveals.setdefault(team, [])
         for r in recs:
             if (r.get("until") == rec["until"]
                     and (rec["until"] is None
@@ -9347,31 +9556,34 @@ class Match:
         recs.append(rec)
         return len(clipped)
 
-    def clear_reveals(self, team: str) -> int:
-        """Drop all reveals for `team`. Returns the number of records removed."""
-        return len(self.fog_reveals.pop(team, []) or [])
+    def clear_reveals(self, team: str, mp: Optional["Map"] = None) -> int:
+        """Drop all reveals for `team` on map `mp` (None = the only map).
+        Returns the number of records removed."""
+        return len((mp or self.get_map()).fog_reveals.pop(team, []) or [])
 
-    def _fog_terrain_visible(self, pov_team: Optional[str], x: int, y: int) -> bool:
+    def _fog_terrain_visible(self, pov_team: Optional[str], x: int, y: int,
+                             mp: "Map") -> bool:
         """Fog gate for STATIC features (tiles, zones, corpses) and the map
-        overlay: visible when fog is off, omniscient, currently seen (range
-        + LOS per fog_los), OR (memory on) explored."""
+        overlay of map `mp`: visible when fog is off, omniscient, currently
+        seen (range + LOS per fog_los), OR (memory on) explored."""
         if not self.fog_enabled or pov_team is None:
             return True
-        return (self._fog_team_sees(pov_team, x, y)
-                or self._cell_remembered(pov_team, x, y)
-                or self._cell_revealed(pov_team, x, y))
+        return (self._fog_team_sees(pov_team, x, y, mp)
+                or self._cell_remembered(pov_team, x, y, mp)
+                or self._cell_revealed(pov_team, x, y, mp))
 
-    def _fog_entity_visible(self, pov_team: Optional[str], x: int, y: int) -> bool:
-        """Fog gate for LIVE entities: visible on current vision (range +
-        LOS per fog_los); on a remembered cell only when fog_memory_mode is
-        'full'."""
+    def _fog_entity_visible(self, pov_team: Optional[str], x: int, y: int,
+                            mp: "Map") -> bool:
+        """Fog gate for LIVE entities on map `mp`: visible on current vision
+        (range + LOS per fog_los); on a remembered cell only when
+        fog_memory_mode is 'full'."""
         if not self.fog_enabled or pov_team is None:
             return True
-        if self._fog_team_sees(pov_team, x, y):
+        if self._fog_team_sees(pov_team, x, y, mp):
             return True
-        if self._cell_revealed(pov_team, x, y):
+        if self._cell_revealed(pov_team, x, y, mp):
             return True  # a reveal shows live entities too (clairvoyance)
-        if self._cell_remembered(pov_team, x, y):
+        if self._cell_remembered(pov_team, x, y, mp):
             return str(self.rules.get("fog_memory_mode", "full")) == "full"
         return False
 
@@ -9382,22 +9594,25 @@ class Match:
         a clear line — so explored grows 'as cells are revealed'."""
         if not self.fog_enabled or not self.fog_memory or not team:
             return
-        seen = self.explored.setdefault(team, set())
         use_los = bool(self.rules.get("fog_los", False))
         for e in self.entities.values():
             if not self._vision_member_ok(e, team):
                 continue
+            mp = self.maps.get(e.map)
+            if mp is None:
+                continue
+            seen = mp.explored.setdefault(team, set())
             r = self._vision_radius_of(e)
             # A large viewer reveals the UNION of every footprint cell's
             # vision-radius neighbourhood (LOS measured from that cell).
             for (ex, ey) in self.entity_cells(e):
-                for yy in range(max(1, ey - r), min(self.grid_height, ey + r) + 1):
-                    for xx in range(max(1, ex - r), min(self.grid_width, ex + r) + 1):
+                for yy in range(max(1, ey - r), min(mp.grid_height, ey + r) + 1):
+                    for xx in range(max(1, ex - r), min(mp.grid_width, ex + r) + 1):
                         if (xx, yy) in seen:
                             continue
                         if not self._within_vision(ex, ey, xx, yy, r):
                             continue
-                        if use_los and not self.has_los(e.id, ex, ey, xx, yy):
+                        if use_los and not self.has_los(e.id, ex, ey, xx, yy, mp):
                             continue
                         seen.add((xx, yy))
 
@@ -9453,7 +9668,11 @@ class Match:
 
         `budget` ([cells left]) charges every sight line walked, so a call
         over many big bodies that can't see each other (each pair of cells
-        walked) stops with an error instead of running for minutes."""
+        walked) stops with an error instead of running for minutes. Units
+        on different maps never see each other."""
+        if viewer.map != other.map:
+            return False
+        mp = self.map_of(viewer)
         r = self._vision_radius_of(viewer)
         vcells = self.entity_cells(viewer)
         seen = False
@@ -9468,7 +9687,7 @@ class Match:
                             "visible_entities(...): the sight lines to check "
                             "cross more cells than the formula_cell_limit "
                             "allows (big bodies far apart).")
-                if self.has_los(viewer.id, vx, vy, tx, ty):
+                if self.has_los(viewer.id, vx, vy, tx, ty, mp):
                     seen = True
                     break
             if seen:
@@ -9497,12 +9716,13 @@ class Match:
             except (TypeError, ValueError):
                 budget = 1000000
         left = budget
+        mp = self.map_of(viewer)
         r = self._vision_radius_of(viewer)
         body = self.entity_cells(viewer)
         xs = [c[0] for c in body]
         ys = [c[1] for c in body]
-        x0, x1 = max(1, min(xs) - r), min(self.grid_width, max(xs) + r)
-        y0, y1 = max(1, min(ys) - r), min(self.grid_height, max(ys) + r)
+        x0, x1 = max(1, min(xs) - r), min(mp.grid_width, max(xs) + r)
+        y0, y1 = max(1, min(ys) - r), min(mp.grid_height, max(ys) + r)
         cells: List[Tuple[int, int]] = []
         for y in range(y0, y1 + 1):
             for x in range(x0, x1 + 1):
@@ -9518,7 +9738,7 @@ class Match:
                             f"the sight_check_limit of {budget} (its vision "
                             f"radius is {r}).")
                     if self._within_vision(vx, vy, x, y, r) and \
-                            self.has_los(viewer.id, vx, vy, x, y):
+                            self.has_los(viewer.id, vx, vy, x, y, mp):
                         cells.append((x, y))
                         break
         return cells
@@ -9545,41 +9765,49 @@ class Match:
         # entity fog gate (current vision, or remembered when memory mode
         # is 'full') — so a giant is hidden only when its whole body is
         # in fog.
-        if not any(self._fog_entity_visible(pov_team, cx, cy)
+        mp = self.map_of(e)
+        if not any(self._fog_entity_visible(pov_team, cx, cy, mp)
                    for cx, cy in self.entity_cells(e)):
             return False
         return self._visibility_visible(
             "entity_visibility_condition", pov_team, target=eid)
 
-    def tile_visible_to(self, x: int, y: int, pov_team: Optional[str]) -> bool:
-        """Whether the tile at (x, y) — its map glyph and its !tile
-        list/info/cells rows — is visible to `pov_team`. Binds tile_x /
-        tile_y (inspect data via tile_get/tile_has). See
-        tile_visibility_condition."""
-        if pov_team is not None and not self._fog_terrain_visible(pov_team, x, y):
+    def tile_visible_to(self, x: int, y: int, pov_team: Optional[str],
+                        mp: Optional["Map"] = None) -> bool:
+        """Whether the tile at (x, y) of map `mp` (None = the only map) — its
+        map glyph and its !tile list/info/cells rows — is visible to
+        `pov_team`. Binds tile_x / tile_y (inspect data via
+        tile_get/tile_has). See tile_visibility_condition."""
+        if pov_team is not None and not self._fog_terrain_visible(
+                pov_team, x, y, mp or self.get_map()):
             return False
         return self._visibility_visible(
             "tile_visibility_condition", pov_team,
             extras={"tile_x": x, "tile_y": y})
 
-    def zone_visible_to(self, name: str, pov_team: Optional[str]) -> bool:
+    def zone_visible_to(self, name: str, pov_team: Optional[str],
+                        mp: Optional["Map"] = None) -> bool:
         """Whether zone `name` — its map glyph and its !zone listing row
         — is visible to `pov_team`. Binds zone_name (inspect via
         zone_get/zone_has). See zone_visibility_condition. Under fog a
         zone is revealed if the team sees ANY of its cells (the seen part
-        shows; the fog overlay still covers its unseen cells on the map)."""
+        shows; the fog overlay still covers its unseen cells on the map).
+        `mp`: the zone's map (None = the only map)."""
         if pov_team is not None and self.fog_enabled:
-            z = self.zones.get(name)
+            mp = mp or self.get_map()
+            z = mp.zones.get(name)
             cells = z.get("cells", ()) if isinstance(z, dict) else ()
             if cells and not any(
-                self._fog_terrain_visible(pov_team, cx, cy) for (cx, cy) in cells
+                self._fog_terrain_visible(pov_team, cx, cy, mp)
+                for (cx, cy) in cells
             ):
                 return False
         return self._visibility_visible(
             "zone_visibility_condition", pov_team,
             extras={"zone_name": name})
 
-    def _corpse_footprint(self, corpse: Dict[str, Any]) -> Tuple[int, int]:
+    def _corpse_footprint(self, corpse: Dict[str, Any],
+                          mp: Optional["Map"] = None) -> Tuple[int, int]:
         """(w, h) of a corpse's footprint, read from the dead entity's
         stored footprint vars (1×1 when absent) — so a large entity
         leaves a large corpse. One stored corpse identity, footprint
@@ -9590,24 +9818,26 @@ class Match:
         if isinstance(cv, dict):
             try:
                 w = self._cap_footprint(int(cv.get(str(self.rules.get(
-                    "footprint_width_var", "footprint_w")))), "footprint_width_var")
+                    "footprint_width_var", "footprint_w")))), "footprint_width_var", mp)
             except (TypeError, ValueError, OverflowError):
                 w = 1
             try:
                 h = self._cap_footprint(int(cv.get(str(self.rules.get(
-                    "footprint_height_var", "footprint_h")))), "footprint_height_var")
+                    "footprint_height_var", "footprint_h")))), "footprint_height_var", mp)
             except (TypeError, ValueError, OverflowError):
                 h = 1
         return w, h
 
-    def corpse_cells(self, x: int, y: int,
-                     corpse: Dict[str, Any]) -> List[Tuple[int, int]]:
-        """The cells a corpse covers, anchored at its tile (x, y)."""
-        w, h = self._corpse_footprint(corpse)
+    def corpse_cells(self, x: int, y: int, corpse: Dict[str, Any],
+                     mp: Optional["Map"] = None) -> List[Tuple[int, int]]:
+        """The cells a corpse covers, anchored at its tile (x, y) of map
+        `mp`."""
+        w, h = self._corpse_footprint(corpse, mp)
         return [(x + dx, y + dy) for dy in range(h) for dx in range(w)]
 
     def corpse_visible_to(self, eid: str, corpse: Dict[str, Any],
-                          x: int, y: int, pov_team: Optional[str]) -> bool:
+                          x: int, y: int, pov_team: Optional[str],
+                          mp: Optional["Map"] = None) -> bool:
         """Whether a corpse (Dead: row) is visible to `pov_team`. A
         corpse is a stored snapshot, not a live entity, so the formula
         gets corpse_team (the dead entity's team_var value at death) +
@@ -9616,8 +9846,9 @@ class Match:
         corpse_visibility_condition."""
         if pov_team is None:
             return True
-        if not any(self._fog_terrain_visible(pov_team, cx, cy)
-                   for cx, cy in self.corpse_cells(x, y, corpse)):
+        mp = mp or self.get_map()
+        if not any(self._fog_terrain_visible(pov_team, cx, cy, mp)
+                   for cx, cy in self.corpse_cells(x, y, corpse, mp)):
             return False
         team_var = str(self.rules.get("team_var", "team"))
         corpse_team = ""
@@ -9727,17 +9958,19 @@ class Match:
             raise NotFound(f"tile template '{name}' not found.")
         del self.tile_templates[name]
         orphan_count = 0
-        for tile in self.tiles.values():
-            if isinstance(tile, dict) and tile.get("_template") == name:
-                orphan_count += 1
+        for mp in self.maps.values():
+            for tile in mp.tiles.values():
+                if isinstance(tile, dict) and tile.get("_template") == name:
+                    orphan_count += 1
         return orphan_count
 
     def place_tile_template(
         self, name: str, x: int, y: int,
         *, overrides: Optional[Dict[str, Any]] = None,
-        replace: bool = True,
+        replace: bool = True, mp: Optional["Map"] = None,
     ) -> Dict[str, Any]:
-        """Instantiate template `name` at (x, y), returning the resulting
+        """Instantiate template `name` at (x, y) of map `mp` (None = the
+        only map), returning the resulting
         tile dict. Default `replace=True` discards any existing tile data
         at (x, y) — the GM is explicitly placing a new instance, not
         merging onto an existing tile. Set `replace=False` to error
@@ -9754,11 +9987,10 @@ class Match:
         """
         if name not in self.tile_templates:
             raise NotFound(f"tile template '{name}' not found.")
-        if not self.in_bounds(x, y):
-            raise OutOfBounds(
-                f"({x},{y}) outside {self.grid_width}x{self.grid_height}"
-            )
-        if not replace and (x, y) in self.tiles:
+        mp = mp or self.get_map()
+        if not mp.in_bounds(x, y):
+            raise OutOfBounds(f"({x},{y}) outside {mp.size_text()}")
+        if not replace and (x, y) in mp.tiles:
             raise DuplicateId(
                 f"tile ({x},{y}) already has data; pass replace=True "
                 f"or delete first."
@@ -9774,18 +10006,21 @@ class Match:
                 )
             tile.update(copy.deepcopy(overrides))
         tile["_template"] = name
-        self.tiles[(x, y)] = tile
+        mp.tiles[(x, y)] = tile
         return tile
 
-    def tile_template_for(self, x: int, y: int) -> Optional[SpecialTileTemplate]:
+    def tile_template_for(self, x: int, y: int, mp: Optional["Map"] = None
+                          ) -> Optional[SpecialTileTemplate]:
         """Return the SpecialTileTemplate this tile was placed from, or
         None if the tile is ad-hoc / off-grid / has a dangling
         `_template` reference (template was deleted after placement).
         The dangling case is intentional: fire_tile_hook returns a
-        warning for it rather than silently swallowing the miss."""
-        if not self.in_bounds(x, y):
+        warning for it rather than silently swallowing the miss. `mp`: the
+        tile's map (None = the only map)."""
+        mp = mp or self.get_map()
+        if not mp.in_bounds(x, y):
             return None
-        tile = self.tiles.get((x, y))
+        tile = mp.tiles.get((x, y))
         if not isinstance(tile, dict):
             return None
         tpl_name = tile.get("_template")
@@ -9853,15 +10088,18 @@ class Match:
             v = int(e.vars.get(var))
         except (TypeError, ValueError, OverflowError):
             return 1
-        return self._cap_footprint(v, rule_key)
+        return self._cap_footprint(v, rule_key, self.maps.get(e.map))
 
-    def _cap_footprint(self, v: int, rule_key: str) -> int:
-        """A footprint side, at least 1 and at most one past the grid side.
+    def _cap_footprint(self, v: int, rule_key: str,
+                       mp: Optional["Map"] = None) -> int:
+        """A footprint side, at least 1 and at most one past the side of
+        map `mp` (None, for a unit on no map yet: the largest map's side).
         Every larger value is just as off-grid, and `footprint_w 30000` used
         to make every cell walk (render, occupancy, vision) build 9*10^8
         cells and hang the bot."""
-        side = (self.grid_width if rule_key == "footprint_width_var"
-                else self.grid_height)
+        maps = [mp] if mp is not None else list(self.maps.values())
+        side = max((m.grid_width if rule_key == "footprint_width_var"
+                    else m.grid_height) for m in maps)
         return max(1, min(v, max(1, side) + 1))
 
     def entity_footprint(self, e: "Entity") -> Tuple[int, int]:
@@ -9940,13 +10178,16 @@ class Match:
         return self._rect_gap(x, y, 1, 1, e.x, e.y, ow, oh, mode)
 
     def cell_occupant(self, x: int, y: int,
-                      ignore: Tuple[str, ...] = ()) -> Optional[str]:
+                      ignore: Tuple[str, ...] = (),
+                      mp: Optional["Map"] = None) -> Optional[str]:
         """The id of the first alive, non-stackable entity whose
-        FOOTPRINT covers (x, y), skipping any id in `ignore`; None when
-        the cell is free of blockers. The footprint-aware core behind
-        is_occupied — a large entity blocks every cell it spans."""
+        FOOTPRINT covers (x, y) of map `mp` (None = the only map), skipping
+        any id in `ignore`; None when the cell is free of blockers. The
+        footprint-aware core behind is_occupied — a large entity blocks
+        every cell it spans."""
+        on = (mp or self.get_map()).name
         for eid, e in self.entities.items():
-            if eid in ignore:
+            if eid in ignore or e.map != on:
                 continue
             # Glued body parts ride on the parent's cell and never block —
             # the parent is the occupant. A LOCATED part has its own cell
@@ -9974,7 +10215,8 @@ class Match:
             ids += tuple(s.id for s in self.snake_segments(e.id))
         return ids
 
-    def is_occupied(self, x: int, y: int, ignore_entity_id: Optional[str] = None) -> bool:
+    def is_occupied(self, x: int, y: int, ignore_entity_id: Optional[str] = None,
+                    mp: Optional["Map"] = None) -> bool:
         """True when the cell (x, y) is covered by the footprint of an
         entity that BLOCKS others from entering — i.e. an alive
         non-stackable entity (a W×H entity blocks all W*H of its cells).
@@ -9986,7 +10228,7 @@ class Match:
         stackable, so a stackable entity can also enter a cell that has
         a non-stackable resident."""
         ignore = (ignore_entity_id,) if ignore_entity_id else ()
-        return self.cell_occupant(x, y, ignore) is not None
+        return self.cell_occupant(x, y, ignore, mp) is not None
 
     # ---- footprint-aware placement validation ------------------------
     # The single gate every validated placement (tp / move_dirs final /
@@ -9994,10 +10236,12 @@ class Match:
     # live in one place. The raw move_to primitive and direct position
     # writes stay single-cell and ungated, as before.
 
-    def footprint_in_bounds(self, e: "Entity", ax: int, ay: int) -> bool:
+    def footprint_in_bounds(self, e: "Entity", ax: int, ay: int,
+                            mp: Optional["Map"] = None) -> bool:
         """True iff every cell of `e`'s footprint anchored at (ax, ay)
-        is on the grid."""
-        return all(self.in_bounds(cx, cy) for cx, cy in self.entity_cells(e, ax, ay))
+        is on map `mp` (None = the unit's own)."""
+        mp = mp or self.map_of(e)
+        return all(mp.in_bounds(cx, cy) for cx, cy in self.entity_cells(e, ax, ay))
 
     def check_body_fits(self, e: "Entity", trial_vars: Dict[str, Any],
                         where: str, extra_ignore: Tuple[str, ...] = ()) -> None:
@@ -10032,24 +10276,25 @@ class Match:
                 else:
                     h = raw
         size = f"{w}x{h}"
+        mp = self.map_of(e)
         for cx, cy in grown:
-            if not self.in_bounds(cx, cy):
+            if not mp.in_bounds(cx, cy):
                 raise OutOfBounds(
                     f"{where}: `{e.id}` can't become {size} at ({e.x},{e.y}) — "
-                    f"({cx},{cy}) is outside the {self.grid_width}x"
-                    f"{self.grid_height} grid.")
+                    f"({cx},{cy}) is outside the {mp.size_text()} grid.")
         if e.is_cell_stackable:
             return
         ignore = self._occupancy_ignore(e, extra_ignore)
         for cx, cy in grown:
-            other = self.cell_occupant(cx, cy, ignore)
+            other = self.cell_occupant(cx, cy, ignore, mp)
             if other is not None:
                 raise Occupied(
                     f"{where}: `{e.id}` can't become {size} at ({e.x},{e.y}) — "
                     f"({cx},{cy}) is taken by `{other}`.")
 
     def _validate_placement(self, e: "Entity", ax: int, ay: int,
-                            mode: Optional[str]) -> None:
+                            mode: Optional[str],
+                            mp: Optional["Map"] = None) -> None:
         """Validate that `e` can occupy the footprint anchored at
         (ax, ay): every cell in bounds, none occupied by another entity
         (skipped when `e` is stackable), and — when `mode` is not None —
@@ -10057,12 +10302,13 @@ class Match:
         Raises OutOfBounds / Occupied / Blocked naming the offending
         cell. `e`'s own footprint is always ignored for occupancy, so a
         large entity stepping forward doesn't collide with the cells it
-        is vacating. Shared by tp / move_dirs / spawn / summon."""
+        is vacating. Shared by tp / move_dirs / spawn / summon. `mp` is the
+        map the footprint lands on (None = the unit's own)."""
+        mp = mp or self.map_of(e)
         cells = self.entity_cells(e, ax, ay)
         for cx, cy in cells:
-            if not self.in_bounds(cx, cy):
-                raise OutOfBounds(
-                    f"({cx},{cy}) outside {self.grid_width}x{self.grid_height}")
+            if not mp.in_bounds(cx, cy):
+                raise OutOfBounds(f"({cx},{cy}) outside {mp.size_text()}")
         # GLUED body parts ride on the parent's cell and never collide
         # (non-occupying), so they skip the occupancy gate like a stackable
         # entity. A LOCATED part (own cell) DOES get the occupancy check.
@@ -10073,11 +10319,11 @@ class Match:
         if not e.is_cell_stackable and not glued:
             ignore_ids = self._occupancy_ignore(e)
             for cx, cy in cells:
-                if self.cell_occupant(cx, cy, ignore_ids) is not None:
+                if self.cell_occupant(cx, cy, ignore_ids, mp) is not None:
                     raise Occupied(f"Cell ({cx},{cy}) already occupied")
         if mode is not None:
             for cx, cy in cells:
-                if self._check_block(e.id, cx, cy, mode):
+                if self._check_block(e.id, cx, cy, mode, mp):
                     raise Blocked(f"Cell ({cx},{cy}) blocks `{e.id}`")
 
     # ---- movement blocking (impassable tiles / zones) ----------------
@@ -10088,11 +10334,11 @@ class Match:
     # zone_block_condition rule. A spec is a formula STRING (evaluated with
     # `self`=mover + tile_x/tile_y or zone_name) or a bare bool/number.
 
-    def _tile_block_spec(self, x: int, y: int) -> Any:
-        """The block spec governing the tile at (x, y): the instance's
-        `block` data, else its template's `block`, else the
+    def _tile_block_spec(self, x: int, y: int, mp: "Map") -> Any:
+        """The block spec governing the tile at (x, y) of map `mp`: the
+        instance's `block` data, else its template's `block`, else the
         tile_block_condition rule. Returns "" when nothing applies."""
-        cell = self.tiles.get((x, y))
+        cell = mp.tiles.get((x, y))
         if cell is not None:
             inst = cell.get("block")
             if inst not in (None, ""):
@@ -10134,15 +10380,18 @@ class Match:
                 errors.append(f"`{cond}`: {ex}")
             return False
 
-    def cell_blocks(self, mover_id: str, x: int, y: int) -> bool:
-        """True iff the tile or any zone covering (x, y) blocks `mover_id`
-        from entering. The raw geometry query — does NOT consult the
-        block_* movement-mode rules (use _check_block for that)."""
+    def cell_blocks(self, mover_id: str, x: int, y: int,
+                    mp: Optional["Map"] = None) -> bool:
+        """True iff the tile or any zone covering (x, y) of map `mp` (None:
+        the mover's map, else the only map) blocks `mover_id` from entering.
+        The raw geometry query — does NOT consult the block_* movement-mode
+        rules (use _check_block for that)."""
+        mp = self._map_for(mp, self.entities.get(mover_id))
         if self._eval_block_spec(
-                self._tile_block_spec(x, y), mover_id,
+                self._tile_block_spec(x, y, mp), mover_id,
                 {"tile_x": x, "tile_y": y}):
             return True
-        for name, z in self.zones.items():
+        for name, z in mp.zones.items():
             cells = z.get("cells", ())
             if (x, y) not in cells:
                 continue
@@ -10157,8 +10406,8 @@ class Match:
         cspec = self.rules.get("corpse_block_condition", "")
         if cspec not in (None, ""):
             team_var = str(self.rules.get("team_var", "team"))
-            for cx, cy, cid, corpse in self.all_corpses():
-                if (x, y) not in self.corpse_cells(cx, cy, corpse):
+            for cx, cy, cid, corpse in self.all_corpses(mp):
+                if (x, y) not in self.corpse_cells(cx, cy, corpse, mp):
                     continue
                 ct = ""
                 ent = corpse.get("entity") if isinstance(corpse, dict) else None
@@ -10173,13 +10422,15 @@ class Match:
                     return True
         return False
 
-    def _check_block(self, mover_id: str, x: int, y: int, mode: str) -> bool:
+    def _check_block(self, mover_id: str, x: int, y: int, mode: str,
+                     mp: Optional["Map"] = None) -> bool:
         """Whether a movement of kind `mode` ('walk'/'tp'/'push'/'swap')
-        onto (x, y) is blocked for `mover_id` — i.e. the matching block_<mode>
-        rule is on AND the cell blocks the mover."""
+        onto (x, y) of map `mp` (None: the mover's) is blocked for
+        `mover_id` — i.e. the matching block_<mode> rule is on AND the cell
+        blocks the mover."""
         if not self.rules.get(f"block_{mode}", True):
             return False
-        return self.cell_blocks(mover_id, x, y)
+        return self.cell_blocks(mover_id, x, y, mp)
 
     def push_entity(self, eid: str, direction: str, n: int = 1) -> Tuple[int, List[str]]:
         """Forced movement: step `eid` up to `n` cells in `direction`,
@@ -10238,7 +10489,8 @@ class Match:
             if not self.footprint_in_bounds(e, nx, ny):
                 break
             if not stackable and any(
-                    self.cell_occupant(cx, cy, self._occupancy_ignore(e)) is not None
+                    self.cell_occupant(cx, cy, self._occupancy_ignore(e),
+                                       self.map_of(e)) is not None
                     for cx, cy in self.entity_cells(e, nx, ny)):
                 break
             # A blocked cell stops the push at the cell before it (knockback
@@ -10321,7 +10573,8 @@ class Match:
             if not self.footprint_in_bounds(e, nx, ny):
                 break
             if not stackable and any(
-                    self.cell_occupant(cx, cy, self._occupancy_ignore(e)) is not None
+                    self.cell_occupant(cx, cy, self._occupancy_ignore(e),
+                                       self.map_of(e)) is not None
                     for cx, cy in self.entity_cells(e, nx, ny)):
                 break
             # Blocking stops the drag at the cell before a blocked one,
@@ -10378,16 +10631,20 @@ class Match:
         # before any hook fires — all-or-nothing. Block (swap mode) is
         # checked per covered cell.
         pair = (a, b)
+        if ea.map != eb.map:
+            raise VTTError(
+                f"swap: `{a}` and `{b}` are on different maps.")
+        mp = self.map_of(ea)
         for mover, mx, my in ((ea, bx, by), (eb, ax, ay)):
             for cx, cy in self.entity_cells(mover, mx, my):
-                if not self.in_bounds(cx, cy):
+                if not mp.in_bounds(cx, cy):
                     raise OutOfBounds(
                         f"swap: ({cx},{cy}) outside "
-                        f"{self.grid_width}x{self.grid_height} for `{mover.id}`")
+                        f"{mp.size_text()} for `{mover.id}`")
             if not mover.is_cell_stackable:
                 ig = self._occupancy_ignore(mover, extra=pair)
                 for cx, cy in self.entity_cells(mover, mx, my):
-                    if self.cell_occupant(cx, cy, ig) is not None:
+                    if self.cell_occupant(cx, cy, ig, mp) is not None:
                         raise Occupied(
                             f"swap: cell ({cx},{cy}) occupied — `{mover.id}` "
                             f"doesn't fit at the swap target")
@@ -11066,14 +11323,15 @@ class Match:
         for tpl in self.tile_templates.values():
             if any(k in (tpl.hooks or {}) for k in rnames):
                 return True
-        for cell in self.tiles.values():
-            h = cell.get("hooks") if isinstance(cell, dict) else None
-            if isinstance(h, dict) and any(k in h for k in rnames):
-                return True
-        for z in self.zones.values():
-            h = z.get("hooks") if isinstance(z, dict) else None
-            if isinstance(h, dict) and any(k in h for k in rnames):
-                return True
+        for mp in self.maps.values():
+            for cell in mp.tiles.values():
+                h = cell.get("hooks") if isinstance(cell, dict) else None
+                if isinstance(h, dict) and any(k in h for k in rnames):
+                    return True
+            for z in mp.zones.values():
+                h = z.get("hooks") if isinstance(z, dict) else None
+                if isinstance(h, dict) and any(k in h for k in rnames):
+                    return True
         return False
 
     def _atb_next_turn(self) -> Tuple[Optional[str], List[str]]:
@@ -11312,8 +11570,10 @@ class Match:
                     continue
         return None
 
-    def fire_tile_hook(self, when: str, entity_id: Optional[str], x: int, y: int) -> List[str]:
-        """Fire the tile hook at (x, y) of the given `when`.
+    def fire_tile_hook(self, when: str, entity_id: Optional[str], x: int, y: int,
+                       mp: Optional["Map"] = None) -> List[str]:
+        """Fire the tile hook at (x, y) of map `mp` (None: the bound
+        entity's map, else the only map) of the given `when`.
 
         Returns log lines: one info line per successful fire, one warning
         line per formula failure. Empty list when no hook is registered
@@ -11346,9 +11606,10 @@ class Match:
         """
         if when not in TILE_HOOK_NAMES:
             return []
-        if not self.in_bounds(x, y):
+        mp = self._map_for(mp, self.entities.get(entity_id) if entity_id else None)
+        if not mp.in_bounds(x, y):
             return []
-        data = self.tiles.get((x, y))
+        data = mp.tiles.get((x, y))
         if not data:
             return []
         # Resolution order: ad-hoc instance hook wins, falling back to
@@ -11421,7 +11682,8 @@ class Match:
     # on_exit / on_enter+on_stop calls); fire_zone_time_hooks fires the
     # round/turn hooks across all zones.
     def fire_zone_hook(self, when: str, name: str,
-                       entity_id: Optional[str], x: int, y: int) -> List[str]:
+                       entity_id: Optional[str], x: int, y: int,
+                       mp: Optional["Map"] = None) -> List[str]:
         """Fire zone `name`'s hook of `when`. Bindings: self = the bound
         entity (or None -> unbound), this = current entity, zone_name =
         `name`, tile_x/tile_y = (x,y) (the crossed/stepped cell), and
@@ -11429,7 +11691,8 @@ class Match:
         missing zone, or a zone with no hook of that name."""
         if when not in ZONE_HOOK_NAMES:
             return []
-        z = self.zones.get(name)
+        mp = self._map_for(mp, self.entities.get(entity_id) if entity_id else None)
+        z = mp.zones.get(name)
         if not z:
             return []
         hooks = z.get("hooks")
@@ -11464,58 +11727,64 @@ class Match:
         return [f"⚙️ zone `{name}` hook `{when}` fired {tag}"]
 
     def fire_zone_exit_hooks(self, entity_id: Optional[str],
-                             fx: int, fy: int, tx: int, ty: int) -> List[str]:
+                             fx: int, fy: int, tx: int, ty: int,
+                             mp: Optional["Map"] = None) -> List[str]:
         """PRE-move zone firing for a step (fx,fy) -> (tx,ty). Fires the
         per-cell on_cell_exit for every zone containing the FROM cell, and
         the boundary on_exit for every zone the entity is LEAVING (FROM
         cell in the zone, TO cell not). Moving within a zone fires only
         on_cell_exit, not on_exit. Zone-name sets are snapshotted before
         firing so a hook that reshapes zones can't disturb the iteration."""
-        from_zones = self.zones_at(fx, fy)
+        mp = self._map_for(mp, self.entities.get(entity_id) if entity_id else None)
+        from_zones = mp.zones_at(fx, fy)
         if not from_zones:
             return []
-        to_zones = self.zones_at(tx, ty)
+        to_zones = mp.zones_at(tx, ty)
         log: List[str] = []
         for name in sorted(from_zones):
             # Boundary exit first (you cross the edge), then per-cell.
             if name not in to_zones:
-                log.extend(self.fire_zone_hook("on_exit", name, entity_id, fx, fy))
-            log.extend(self.fire_zone_hook("on_cell_exit", name, entity_id, fx, fy))
+                log.extend(self.fire_zone_hook("on_exit", name, entity_id, fx, fy, mp))
+            log.extend(self.fire_zone_hook("on_cell_exit", name, entity_id, fx, fy, mp))
         return log
 
     def fire_zone_enter_hooks(self, entity_id: Optional[str],
                               fx: int, fy: int, tx: int, ty: int,
-                              is_final: bool) -> List[str]:
+                              is_final: bool,
+                              mp: Optional["Map"] = None) -> List[str]:
         """POST-move zone firing for a step (fx,fy) -> (tx,ty). Fires the
         boundary on_enter for every zone the entity is ENTERING (TO cell
         in the zone, FROM cell not) and the per-cell on_cell_enter for
         every zone containing the TO cell. When is_final (the step that
         ends the whole move), also fires the boundary on_stop and per-cell
         on_cell_stop for every zone containing the final cell."""
-        to_zones = self.zones_at(tx, ty)
+        mp = self._map_for(mp, self.entities.get(entity_id) if entity_id else None)
+        to_zones = mp.zones_at(tx, ty)
         if not to_zones:
             return []
-        from_zones = self.zones_at(fx, fy)
+        from_zones = mp.zones_at(fx, fy)
         log: List[str] = []
         for name in sorted(to_zones):
             if name not in from_zones:
-                log.extend(self.fire_zone_hook("on_enter", name, entity_id, tx, ty))
-            log.extend(self.fire_zone_hook("on_cell_enter", name, entity_id, tx, ty))
+                log.extend(self.fire_zone_hook("on_enter", name, entity_id, tx, ty, mp))
+            log.extend(self.fire_zone_hook("on_cell_enter", name, entity_id, tx, ty, mp))
         if is_final:
-            log.extend(self.fire_zone_stop_hooks(entity_id, tx, ty))
+            log.extend(self.fire_zone_stop_hooks(entity_id, tx, ty, mp))
         return log
 
     def fire_zone_stop_hooks(self, entity_id: Optional[str],
-                             x: int, y: int) -> List[str]:
+                             x: int, y: int,
+                             mp: Optional["Map"] = None) -> List[str]:
         """Fire boundary on_stop + per-cell on_cell_stop for every zone
         containing (x,y). Split out from fire_zone_enter_hooks so a
         stepwise mover can fire the stop ONCE at its final cell (after the
         per-step enter loop), mirroring how tile on_stop fires once after
         the move_dirs loop."""
+        mp = self._map_for(mp, self.entities.get(entity_id) if entity_id else None)
         log: List[str] = []
-        for name in sorted(self.zones_at(x, y)):
-            log.extend(self.fire_zone_hook("on_stop", name, entity_id, x, y))
-            log.extend(self.fire_zone_hook("on_cell_stop", name, entity_id, x, y))
+        for name in sorted(mp.zones_at(x, y)):
+            log.extend(self.fire_zone_hook("on_stop", name, entity_id, x, y, mp))
+            log.extend(self.fire_zone_hook("on_cell_stop", name, entity_id, x, y, mp))
         return log
 
     # ---- footprint-aware movement hook firing ------------------------
@@ -11528,86 +11797,104 @@ class Match:
     # relevant cell); per-cell zone hooks fire per covered cell. For a
     # 1×1 entity these reduce exactly to the single-cell firings.
 
-    def _zones_over(self, cells) -> set:
+    @staticmethod
+    def _zones_over(cells, mp: "Map") -> set:
         names: set = set()
         for (cx, cy) in cells:
-            names |= set(self.zones_at(cx, cy))
+            names |= set(mp.zones_at(cx, cy))
         return names
 
+    # The footprint hook firers take the map the cells are on (None: the
+    # unit's own map).
+    def _hook_map(self, mp: Optional["Map"], eid: Optional[str]) -> "Map":
+        return self._map_for(mp, self.entities.get(eid) if eid else None)
+
     def fire_footprint_tile_exit(self, eid: Optional[str],
-                                 old_cells, new_cells) -> List[str]:
+                                 old_cells, new_cells,
+                                 mp: Optional["Map"] = None) -> List[str]:
+        mp = self._hook_map(mp, eid)
         nc = set(new_cells)
         log: List[str] = []
         for (cx, cy) in old_cells:
             if (cx, cy) not in nc:
-                log.extend(self.fire_tile_hook("on_exit", eid, cx, cy))
+                log.extend(self.fire_tile_hook("on_exit", eid, cx, cy, mp))
         return log
 
     def fire_footprint_tile_enter(self, eid: Optional[str],
-                                  old_cells, new_cells) -> List[str]:
+                                  old_cells, new_cells,
+                                  mp: Optional["Map"] = None) -> List[str]:
+        mp = self._hook_map(mp, eid)
         oc = set(old_cells)
         log: List[str] = []
         for (cx, cy) in new_cells:
             if (cx, cy) not in oc:
-                log.extend(self.fire_tile_hook("on_enter", eid, cx, cy))
+                log.extend(self.fire_tile_hook("on_enter", eid, cx, cy, mp))
         return log
 
-    def fire_footprint_tile_stop(self, eid: Optional[str], cells) -> List[str]:
+    def fire_footprint_tile_stop(self, eid: Optional[str], cells,
+                                 mp: Optional["Map"] = None) -> List[str]:
+        mp = self._hook_map(mp, eid)
         log: List[str] = []
         for (cx, cy) in cells:
-            log.extend(self.fire_tile_hook("on_stop", eid, cx, cy))
+            log.extend(self.fire_tile_hook("on_stop", eid, cx, cy, mp))
         return log
 
     def fire_footprint_zone_exit(self, eid: Optional[str],
-                                 old_cells, new_cells) -> List[str]:
+                                 old_cells, new_cells,
+                                 mp: Optional["Map"] = None) -> List[str]:
         """PRE-move: per-cell on_cell_exit for every vacated cell in a
         zone, plus boundary on_exit ONCE for each zone the whole footprint
         is leaving (was overlapped, now disjoint)."""
+        mp = self._hook_map(mp, eid)
         nc = set(new_cells)
-        leaving = self._zones_over(old_cells) - self._zones_over(new_cells)
+        leaving = self._zones_over(old_cells, mp) - self._zones_over(new_cells, mp)
         log: List[str] = []
         for (cx, cy) in old_cells:
             if (cx, cy) in nc:
                 continue
-            for name in sorted(set(self.zones_at(cx, cy))):
+            for name in sorted(set(mp.zones_at(cx, cy))):
                 if name in leaving:
-                    log.extend(self.fire_zone_hook("on_exit", name, eid, cx, cy))
+                    log.extend(self.fire_zone_hook("on_exit", name, eid, cx, cy, mp))
                     leaving.discard(name)
-                log.extend(self.fire_zone_hook("on_cell_exit", name, eid, cx, cy))
+                log.extend(self.fire_zone_hook("on_cell_exit", name, eid, cx, cy, mp))
         return log
 
     def fire_footprint_zone_enter(self, eid: Optional[str],
                                   old_cells, new_cells,
-                                  is_final: bool) -> List[str]:
+                                  is_final: bool,
+                                  mp: Optional["Map"] = None) -> List[str]:
         """POST-move: boundary on_enter ONCE for each newly-overlapped
         zone + per-cell on_cell_enter for every newly-covered cell in a
         zone. When is_final, also fire the footprint stop hooks."""
+        mp = self._hook_map(mp, eid)
         oc = set(old_cells)
-        entering = self._zones_over(new_cells) - self._zones_over(old_cells)
+        entering = self._zones_over(new_cells, mp) - self._zones_over(old_cells, mp)
         log: List[str] = []
         for (cx, cy) in new_cells:
             if (cx, cy) in oc:
                 continue
-            for name in sorted(set(self.zones_at(cx, cy))):
+            for name in sorted(set(mp.zones_at(cx, cy))):
                 if name in entering:
-                    log.extend(self.fire_zone_hook("on_enter", name, eid, cx, cy))
+                    log.extend(self.fire_zone_hook("on_enter", name, eid, cx, cy, mp))
                     entering.discard(name)
-                log.extend(self.fire_zone_hook("on_cell_enter", name, eid, cx, cy))
+                log.extend(self.fire_zone_hook("on_cell_enter", name, eid, cx, cy, mp))
         if is_final:
-            log.extend(self.fire_footprint_zone_stop(eid, new_cells))
+            log.extend(self.fire_footprint_zone_stop(eid, new_cells, mp))
         return log
 
-    def fire_footprint_zone_stop(self, eid: Optional[str], cells) -> List[str]:
+    def fire_footprint_zone_stop(self, eid: Optional[str], cells,
+                                 mp: Optional["Map"] = None) -> List[str]:
         """Boundary on_stop ONCE per zone the footprint ends in, plus
         per-cell on_cell_stop for every final cell in a zone."""
+        mp = self._hook_map(mp, eid)
         log: List[str] = []
         stopped: set = set()
         for (cx, cy) in cells:
-            for name in sorted(set(self.zones_at(cx, cy))):
+            for name in sorted(set(mp.zones_at(cx, cy))):
                 if name not in stopped:
-                    log.extend(self.fire_zone_hook("on_stop", name, eid, cx, cy))
+                    log.extend(self.fire_zone_hook("on_stop", name, eid, cx, cy, mp))
                     stopped.add(name)
-                log.extend(self.fire_zone_hook("on_cell_stop", name, eid, cx, cy))
+                log.extend(self.fire_zone_hook("on_cell_stop", name, eid, cx, cy, mp))
         return log
 
     def fire_zone_time_hooks(self, when: str) -> List[str]:
@@ -11622,24 +11909,29 @@ class Match:
             return []
         cur = self.current_entity_id()
         log: List[str] = []
-        for name in sorted(self.zones.keys()):
-            if name not in self.zones:
+        # Every map's zones, maps in order. A hook can delete a map.
+        for mname in list(self.maps):
+            mp = self.maps.get(mname)
+            if mp is None:
                 continue
-            # tile_x/tile_y default to None for time hooks (no single
-            # firing cell); fire_zone_hook still binds zone_name.
-            z = self.zones.get(name)
-            hooks = z.get("hooks") if z else None
-            if not (isinstance(hooks, dict) and hooks.get(when)):
-                continue
-            log.extend(self._fire_zone_time_hook(when, name, cur))
+            for name in sorted(mp.zones.keys()):
+                if name not in mp.zones:
+                    continue
+                # tile_x/tile_y default to None for time hooks (no single
+                # firing cell); fire_zone_hook still binds zone_name.
+                z = mp.zones.get(name)
+                hooks = z.get("hooks") if z else None
+                if not (isinstance(hooks, dict) and hooks.get(when)):
+                    continue
+                log.extend(self._fire_zone_time_hook(when, name, cur, mp))
         return log
 
     def _fire_zone_time_hook(self, when: str, name: str,
-                             entity_id: Optional[str]) -> List[str]:
+                             entity_id: Optional[str], mp: "Map") -> List[str]:
         """fire_zone_hook variant for time hooks: binds tile_x/tile_y to
         None (no single firing cell) rather than a real coordinate."""
         from formula import FormulaEngine, EvalCtx, FormulaError
-        z = self.zones.get(name)
+        z = mp.zones.get(name)
         if not z:
             return []
         formula_src = (z.get("hooks") or {}).get(when)
@@ -11758,7 +12050,7 @@ class Match:
             for path in self._rename_status_refs(e.vars, old, new, ""):
                 counts["vars"] += 1
                 self.track_template_change(e, path, deleted=False)
-        for _x, _y, _cid, corpse in self.all_corpses():
+        for _mp, _x, _y, _cid, corpse in self.every_corpse():
             bodies = [corpse.get("entity")] + list(corpse.get("parts") or [])
             hit = False
             for body in bodies:
@@ -13391,7 +13683,7 @@ class Match:
         mint_entity_id and Entity.spawn so the two stay consistent."""
         taken: set = set(self.entities.keys())
         if bool(self.rules.get("corpse_id_uniqueness", True)):
-            for (_x, _y, eid, _c) in self.all_corpses():
+            for (_mp, _x, _y, eid, _c) in self.every_corpse():
                 taken.add(eid)
         return taken
 
@@ -13419,8 +13711,10 @@ class Match:
         self, template: Any, x: int, y: int, *,
         id_prefix: Optional[str] = None,
         near_radius: Optional[int] = None,
+        mp: Optional["Map"] = None,
     ) -> Tuple[str, List[str]]:
-        """Instantiate a live entity from a template dict and place it.
+        """Instantiate a live entity from a template dict and place it on
+        map `mp` (None = the only map).
 
         template     an entity-shaped dict (Entity.to_dict output, with
                      id/x/y optional — they're overridden here).
@@ -13457,6 +13751,7 @@ class Match:
         if not isinstance(x, int) or isinstance(x, bool) \
                 or not isinstance(y, int) or isinstance(y, bool):
             raise VTTError("summon: x and y must be integers.")
+        mp = mp or self.get_map()
 
         # Build the concrete entity FIRST (so its footprint — including any
         # size supplied by default_entity_vars — is known before we search
@@ -13471,6 +13766,7 @@ class Match:
         # `parts` key, mounting through mount().
         for k in ("part_of", "mounted_on", "mount_slot"):
             d.pop(k, None)
+        d["map"] = mp.name
         if isinstance(d.get("vars"), dict):
             d["vars"].pop("__follows", None)   # a segment's link ahead
         # Partial-template references in the vars are materialized now, so
@@ -13498,7 +13794,8 @@ class Match:
 
         place_x, place_y = x, y
         if near_radius is not None:
-            place = self._find_free_cell_near(x, y, int(near_radius), e=e)
+            place = self._find_free_cell_near(x, y, int(near_radius), e=e,
+                                              mp=mp)
             if place is None:
                 fw, fh = self.entity_footprint(e)
                 raise Occupied(
@@ -13509,13 +13806,13 @@ class Match:
         else:
             # Footprint-aware pre-check for a friendly message; spawn's
             # _validate_placement is the authoritative gate.
-            if not self.footprint_in_bounds(e, place_x, place_y):
+            if not self.footprint_in_bounds(e, place_x, place_y, mp):
                 raise OutOfBounds(
                     f"summon: footprint anchored at ({place_x},{place_y}) is "
-                    f"off-grid ({self.grid_width}x{self.grid_height})."
+                    f"off-grid ({mp.size_text()})."
                 )
             if not stackable_template and any(
-                    self.cell_occupant(cx, cy) is not None
+                    self.cell_occupant(cx, cy, mp=mp) is not None
                     for cx, cy in self.entity_cells(e, place_x, place_y)):
                 raise Occupied(
                     f"summon: footprint at ({place_x},{place_y}) is occupied. "
@@ -13529,7 +13826,7 @@ class Match:
         # fires on_entity_spawned. We pre-validated for a clean error
         # message; spawn's checks are the authoritative gate.
         self._summon_count += 1
-        _, log = e.spawn(self, place_x, place_y)
+        _, log = e.spawn(self, place_x, place_y, map_name=mp.name)
         # Consume a `parts` body spec (locational damage): a dict
         # {role: part-template} or a list of part-template dicts. Each is
         # auto-spawned at the parent's cell and linked via part_of. A dict
@@ -13564,7 +13861,7 @@ class Match:
                 ptc["name"] = str(pvars.get(name_var, pid))
             try:
                 pe = Entity.from_dict(ptc)
-                _, plog = pe.spawn(self, place_x, place_y)
+                _, plog = pe.spawn(self, place_x, place_y, map_name=mp.name)
                 log += plog
             except VTTError as ex:
                 # A malformed part entry (missing hp var, id clash) is
@@ -13604,9 +13901,10 @@ class Match:
 
     def _find_free_cell_near(
         self, x: int, y: int, radius: int,
-        e: Optional["Entity"] = None,
+        e: Optional["Entity"] = None, mp: Optional["Map"] = None,
     ) -> Optional[Tuple[int, int]]:
-        """Ring-search outward from (x,y) for the first in-bounds cell
+        """Ring-search outward from (x,y) of map `mp` (None: `e`'s map, else
+        the only map) for the first in-bounds cell
         where an entity can be placed, distance 0..radius (Chebyshev).
         Returns the ANCHOR (cx,cy) or None. When `e` is given the search
         is footprint-aware: the whole W×H footprint anchored at the
@@ -13614,37 +13912,41 @@ class Match:
         clear; otherwise it's the plain single-cell test. Deterministic
         order: rings nearest-first, within a ring by (dy, dx) so
         placement is reproducible."""
+        mp = self._map_for(mp, e)
+
         def fits(cx: int, cy: int) -> bool:
             if e is None:
-                return self.in_bounds(cx, cy) and not self.is_occupied(cx, cy)
-            if not self.footprint_in_bounds(e, cx, cy):
+                return mp.in_bounds(cx, cy) and not self.is_occupied(
+                    cx, cy, mp=mp)
+            if not self.footprint_in_bounds(e, cx, cy, mp):
                 return False
             if e.is_cell_stackable:
                 return True
-            return all(self.cell_occupant(fx, fy) is None
+            return all(self.cell_occupant(fx, fy, mp=mp) is None
                        for fx, fy in self.entity_cells(e, cx, cy))
-        for r in self._ring_radii(x, y, radius):
-            for cx, cy in self._ring_cells(x, y, r):
+        for r in self._ring_radii(x, y, radius, mp):
+            for cx, cy in self._ring_cells(x, y, r, mp):
                 if fits(cx, cy):
                     return (cx, cy)
         return None
 
-    def _ring_radii(self, x: int, y: int, radius: int) -> range:
+    def _ring_radii(self, x: int, y: int, radius: int, mp: "Map") -> range:
         """The Chebyshev rings around (x, y), up to `radius`, that hold an
         on-grid cell: from the first that reaches the map to the farthest
         grid corner (summon_near(t, x, y, 10**6) on a full board used to walk
         every ring out to a million; a part stored a billion cells off the
         map walked 500 empty rings)."""
-        w, h = self.grid_width, self.grid_height
+        w, h = mp.grid_width, mp.grid_height
         start = max(0, 1 - x, x - w, 1 - y, y - h)
         reach = max(abs(x - 1), abs(x - w), abs(y - 1), abs(y - h))
         return range(start, min(max(0, radius), reach) + 1)
 
-    def _ring_cells(self, x: int, y: int, r: int) -> List[Tuple[int, int]]:
-        """The on-grid cells at exactly Chebyshev distance r from (x, y), by
-        (dy, dx): the ring's edge only, 8r cells at most (walking the whole
-        (2r+1)² square for it made a radius-500 search ~10⁸ steps)."""
-        w, h = self.grid_width, self.grid_height
+    def _ring_cells(self, x: int, y: int, r: int,
+                    mp: "Map") -> List[Tuple[int, int]]:
+        """The cells of map `mp` at exactly Chebyshev distance r from (x, y),
+        by (dy, dx): the ring's edge only, 8r cells at most (walking the
+        whole (2r+1)² square for it made a radius-500 search ~10⁸ steps)."""
+        w, h = mp.grid_width, mp.grid_height
         if r == 0:
             return [(x, y)] if 1 <= x <= w and 1 <= y <= h else []
         out: List[Tuple[int, int]] = []
@@ -13657,17 +13959,20 @@ class Match:
         return out
 
     def free_cell_near(self, x: int, y: int, radius: int,
-                       e: Optional["Entity"] = None) -> Optional[Tuple[int, int]]:
+                       e: Optional["Entity"] = None,
+                       mp: Optional["Map"] = None) -> Optional[Tuple[int, int]]:
         """The nearest cell (same ring order as _find_free_cell_near) where a
         unit could stand: with `e`, its whole footprint anchored there is in
         bounds, clear of other units (its own body, snake segments and
         riders don't count) and not movement-blocked for it; without `e`, a
         single in-bounds unoccupied cell. Returns the anchor or None. The
-        read-only query behind the free_cell_near formula function."""
+        read-only query behind the free_cell_near formula function. `mp`:
+        the map searched (None: `e`'s map, else the only map)."""
+        mp = self._map_for(mp, e)
         ignore = self._stand_ignore(e)
-        for r in self._ring_radii(x, y, radius):
-            for cx, cy in self._ring_cells(x, y, r):
-                if self._can_stand_at(e, cx, cy, ignore):
+        for r in self._ring_radii(x, y, radius, mp):
+            for cx, cy in self._ring_cells(x, y, r, mp):
+                if self._can_stand_at(e, cx, cy, ignore, mp):
                     return (cx, cy)
         return None
 
@@ -13680,27 +13985,28 @@ class Match:
             e, tuple(r.id for r in self.vehicle_riders(e.id)))
 
     def _can_stand_at(self, e: Optional["Entity"], cx: int, cy: int,
-                      ignore: Tuple[str, ...] = ()) -> bool:
-        """The free_cell_near test for one anchor: with `e`, its whole body
-        anchored at (cx, cy) is on the map, clear of other units (unless
-        stackable) and not movement-blocked for it; without, one on-map
-        empty cell."""
+                      ignore: Tuple[str, ...], mp: "Map") -> bool:
+        """The free_cell_near test for one anchor of map `mp`: with `e`, its
+        whole body anchored at (cx, cy) is on the map, clear of other units
+        (unless stackable) and not movement-blocked for it; without, one
+        on-map empty cell."""
         if e is None:
-            return self.in_bounds(cx, cy) and not self.is_occupied(cx, cy)
-        if not self.footprint_in_bounds(e, cx, cy):
+            return mp.in_bounds(cx, cy) and not self.is_occupied(cx, cy, mp=mp)
+        if not self.footprint_in_bounds(e, cx, cy, mp):
             return False
         cells = self.entity_cells(e, cx, cy)
         if not e.is_cell_stackable and any(
-                self.cell_occupant(fx, fy, ignore) is not None
+                self.cell_occupant(fx, fy, ignore, mp) is not None
                 for fx, fy in cells):
             return False
-        return not any(self.cell_blocks(e.id, fx, fy) for fx, fy in cells)
+        return not any(self.cell_blocks(e.id, fx, fy, mp) for fx, fy in cells)
 
     RANDOM_CELL_FITS = ("body", "center", "any", "anchor")
 
     def free_anchors_in_area(self, area: Set[Tuple[int, int]],
                              e: Optional["Entity"], fit: str = "body",
-                             limit: Optional[int] = None) -> List[Tuple[int, int]]:
+                             limit: Optional[int] = None,
+                             mp: Optional["Map"] = None) -> List[Tuple[int, int]]:
         """Every anchor where `e` could stand (_can_stand_at) with its body
         placed in `area` by `fit`: `body` = every cell of the body in the
         area, `center` = its centre cell (rounded down for even sizes, like
@@ -13712,6 +14018,7 @@ class Match:
             raise VTTError(
                 f"fit must be one of {', '.join(self.RANDOM_CELL_FITS)}, "
                 f"got {fit!r}.")
+        mp = self._map_for(mp, e)
         ignore = self._stand_ignore(e)
         if e is None:
             w = h = 1
@@ -13734,7 +14041,7 @@ class Match:
             if (e is not None and fit == "body"
                     and any(c not in area for c in self.entity_cells(e, ax, ay))):
                 continue
-            if self._can_stand_at(e, ax, ay, ignore):
+            if self._can_stand_at(e, ax, ay, ignore, mp):
                 out.append((ax, ay))
         return out
 
@@ -14403,7 +14710,7 @@ class Match:
         `corpses.<eid>`. Stores the full Entity.to_dict (including id,
         x, y) so revive can spawn it back exactly. Multi-corpse-per-
         cell: existing corpses on the cell aren't disturbed."""
-        cell = self.tile_data(e.x, e.y)
+        cell = self.map_of(e).tile_data(e.x, e.y)
         corpses = cell.setdefault("corpses", {})
         if not isinstance(corpses, dict):
             # Tile data shape was hand-written into something else;
@@ -14433,27 +14740,36 @@ class Match:
         if part_dicts:
             corpses[e.id]["parts"] = part_dicts
 
-    def find_corpse(self, eid: str) -> Optional[Tuple[int, int, Dict[str, Any]]]:
-        """Locate a corpse by its dead-entity id. Returns
-        (x, y, corpse_dict) or None. The tile coords are the
+    def find_corpse(self, eid: str
+                    ) -> Optional[Tuple[int, int, Dict[str, Any], "Map"]]:
+        """Locate a corpse by its dead-entity id, on any map. Returns
+        (x, y, corpse_dict, map) or None. The tile coords are the
         AUTHORITATIVE position; the embedded entity dict's x/y are
         the snapshot at death and may differ if a (rare) GM hack
         moved corpses around manually — engine code never reads them
         for placement, this method always returns the tile's coords."""
-        for (x, y), cell in self.tiles.items():
-            corpses = cell.get("corpses") if isinstance(cell, dict) else None
-            if isinstance(corpses, dict) and eid in corpses:
-                return x, y, corpses[eid]
+        for mp in self.maps.values():
+            for (x, y), cell in mp.tiles.items():
+                corpses = cell.get("corpses") if isinstance(cell, dict) else None
+                if isinstance(corpses, dict) and eid in corpses:
+                    return x, y, corpses[eid], mp
         return None
 
-    def all_corpses(self) -> List[Tuple[int, int, str, Dict[str, Any]]]:
-        """List every corpse in the match as
+    def every_corpse(self) -> List[Tuple["Map", int, int, str, Dict[str, Any]]]:
+        """Every corpse on every map, as (map, x, y, eid, corpse_dict)."""
+        return [(mp, x, y, eid, c) for mp in self.maps.values()
+                for (x, y, eid, c) in self.all_corpses(mp)]
+
+    def all_corpses(self, mp: Optional["Map"] = None
+                    ) -> List[Tuple[int, int, str, Dict[str, Any]]]:
+        """List every corpse on map `mp` (None = the only map) as
         (x, y, eid, corpse_dict). Sorted by (x, y, eid) for stable
         iteration; the order matches what `!list`'s Dead: section
         renders."""
+        mp = mp or self.get_map()
         out: List[Tuple[int, int, str, Dict[str, Any]]] = []
-        for (x, y) in sorted(self.tiles.keys()):
-            cell = self.tiles[(x, y)]
+        for (x, y) in sorted(mp.tiles.keys()):
+            cell = mp.tiles[(x, y)]
             corpses = cell.get("corpses") if isinstance(cell, dict) else None
             if isinstance(corpses, dict):
                 for eid in sorted(corpses.keys()):
@@ -14482,7 +14798,7 @@ class Match:
         loc = self.find_corpse(eid)
         if loc is None:
             raise NotFound(f"No corpse with id '{eid}'.")
-        x, y, corpse = loc
+        x, y, corpse, cmap = loc
         entity_dict = copy.deepcopy(corpse.get("entity") or {})
         if not entity_dict:
             raise VTTError(f"Corpse '{eid}' has no entity data to revive.")
@@ -14497,7 +14813,7 @@ class Match:
         # Remove corpse FIRST so spawn doesn't see its own cell as
         # already-corpse-occupied for any future invariants and so the
         # tile's `corpses` key is gone if it becomes empty.
-        cell = self.tiles.get((x, y), {})
+        cell = cmap.tiles.get((x, y), {})
         corpses = cell.get("corpses") if isinstance(cell, dict) else None
         if isinstance(corpses, dict) and eid in corpses:
             del corpses[eid]
@@ -14505,7 +14821,7 @@ class Match:
                 cell.pop("corpses", None)
             # Drop an empty tile dict entirely so tile listings stay clean.
             if isinstance(cell, dict) and not cell:
-                self.tiles.pop((x, y), None)
+                cmap.tiles.pop((x, y), None)
         # Suppress death checks FOR THIS ENTITY across the spawn +
         # revive-effects window. The corpse snapshot carries the entity's
         # DEATH-state vars (typically hp<=0), so the entity momentarily
@@ -14521,7 +14837,7 @@ class Match:
         # the window (below).
         self._death_check_suppressed_ids.add(e.id)
         try:
-            _, spawn_log = e.spawn(self, x, y)
+            _, spawn_log = e.spawn(self, x, y, map_name=cmap.name)
             # Restore the creature's body parts at the parent's cell. Each
             # snapshot carries its part_of (-> e.id) so it re-attaches; a
             # part already taking that id (somehow still alive) is skipped.
@@ -14550,7 +14866,8 @@ class Match:
                     pdc["x"], pdc["y"] = px, py
                     try:
                         try:
-                            _, plog = Entity.from_dict(pdc).spawn(self, px, py)
+                            _, plog = Entity.from_dict(pdc).spawn(
+                                self, px, py, map_name=cmap.name)
                         except VTTError as ex:
                             if not located:
                                 raise
@@ -14558,12 +14875,12 @@ class Match:
                                 deferred.add(pid)
                                 continue
                             near = self._find_free_cell_near(
-                                px, py, max(self.grid_width, self.grid_height),
-                                e=Entity.from_dict(pdc))
+                                px, py, max(cmap.grid_width, cmap.grid_height),
+                                e=Entity.from_dict(pdc), mp=cmap)
                             if near is None or near == (px, py):
                                 raise
                             _, plog = Entity.from_dict(pdc).spawn(
-                                self, near[0], near[1])
+                                self, near[0], near[1], map_name=cmap.name)
                             plog = [f"⚠️ part `{pid}` couldn't return to "
                                     f"({px},{py}) ({ex}); placed at "
                                     f"({near[0]},{near[1]})."] + list(plog)
@@ -14680,7 +14997,7 @@ class Match:
                 notes += self.sync_var_names(e)
             except VTTError as ex:
                 notes.append(f"{ex} It keeps its old var names.")
-        for _x, _y, cid, corpse in self.all_corpses():
+        for _mp, _x, _y, cid, corpse in self.every_corpse():
             for d in [corpse.get("entity")] + list(corpse.get("parts") or []):
                 if not isinstance(d, dict):
                     continue
@@ -14696,7 +15013,7 @@ class Match:
         refuse (var_name_collision=refuse), without changing anything."""
         out: List[str] = []
         dicts = [e.to_dict() for e in self.entities.values()]
-        for _x, _y, _cid, corpse in self.all_corpses():
+        for _mp, _x, _y, _cid, corpse in self.every_corpse():
             dicts += [d for d in [corpse.get("entity")]
                       + list(corpse.get("parts") or []) if isinstance(d, dict)]
         for d in dicts:
@@ -14714,11 +15031,13 @@ class Match:
         part/mount links — is NOT captured (it stays on the live entity across
         a transform). The returned dict doubles as a transform template."""
         d = e.to_dict()
-        for k in ("id", "x", "y", "part_of", "mounted_on", "mount_slot"):
+        for k in ("id", "x", "y", "map", "part_of", "mounted_on", "mount_slot"):
             d.pop(k, None)
         subtree = self.entity_part_subtree(e.id)
         if subtree:
-            d["parts"] = [p.to_dict() for p in subtree]
+            # A part stands on its parent's map, wherever that is then.
+            d["parts"] = [{k: v for k, v in p.to_dict().items() if k != "map"}
+                          for p in subtree]
         return d
 
     def _apply_statblock_parts(self, parent: "Entity",
@@ -14797,7 +15116,7 @@ class Match:
             try:
                 pe = Entity.from_dict(spec)
                 try:
-                    _, slog = pe.spawn(self, px, py)
+                    _, slog = pe.spawn(self, px, py, map_name=parent.map)
                 except VTTError as ex:
                     # A located part (a snake segment, a turret on its own
                     # cell) whose stored cell is now taken or off-grid goes
@@ -14806,12 +15125,15 @@ class Match:
                         raise
                     if not relocate:
                         return False
+                    pmap = self.map_of(parent)
                     near = self._find_free_cell_near(
-                        px, py, max(self.grid_width, self.grid_height), e=pe)
+                        px, py, max(pmap.grid_width, pmap.grid_height), e=pe,
+                        mp=pmap)
                     if near is None or near == (px, py):
                         raise
                     pe = Entity.from_dict(spec)
-                    _, slog = pe.spawn(self, near[0], near[1])
+                    _, slog = pe.spawn(self, near[0], near[1],
+                                       map_name=parent.map)
                     slog = [f"⚠️ part `{spec['id']}` couldn't return to "
                             f"({px},{py}) ({ex}); placed at "
                             f"({near[0]},{near[1]})."] + list(slog)
@@ -15122,16 +15444,20 @@ class Match:
         if when not in TILE_HOOK_NAMES:
             return []
         cur = self.current_entity_id()
-        coords = sorted(self.tiles.keys())
         log: List[str] = []
-        for (x, y) in coords:
-            # Skip tiles cleared mid-iteration (e.g. by a previous tile's
-            # hook calling tile_clear on this one). Also skip if no hook
-            # of this kind is registered — fire_tile_hook handles all
-            # the per-tile lookup so we just delegate.
-            if (x, y) not in self.tiles:
+        # Every map's tiles, maps in order (a hook can delete a map).
+        for mname in list(self.maps):
+            mp = self.maps.get(mname)
+            if mp is None:
                 continue
-            log.extend(self.fire_tile_hook(when, cur, x, y))
+            for (x, y) in sorted(mp.tiles.keys()):
+                # Skip tiles cleared mid-iteration (e.g. by a previous
+                # tile's hook calling tile_clear on this one). Also skip if
+                # no hook of this kind is registered — fire_tile_hook
+                # handles all the per-tile lookup so we just delegate.
+                if (x, y) not in mp.tiles:
+                    continue
+                log.extend(self.fire_tile_hook(when, cur, x, y, mp))
         return log
 
     def _firing_passives(self, target_eid):
@@ -15816,8 +16142,7 @@ class Match:
         d: Dict[str, Any] = {
             "id": self.id,
             "name": self.name,
-            "grid_width": self.grid_width,
-            "grid_height": self.grid_height,
+            "maps": {name: mp.to_dict() for name, mp in self.maps.items()},
             "entities": {eid: e.to_dict() for eid, e in self.entities.items()},
             # COPY, don't alias: Entity.remove mutates turn_order IN PLACE
             # (m.turn_order.remove(id)), so storing the live list by reference
@@ -15841,23 +16166,6 @@ class Match:
             "turn_vacated": self.turn_vacated,
             "global_passives": {pid: p.to_dict() for pid, p in self.global_passives.items()},
             "groups": {name: list(members) for name, members in self.groups.items()},
-            # Tile keys are tuples internally; JSON object keys must be
-            # strings, so encode as "x,y". Order doesn't matter (the
-            # match doesn't iterate tiles by position), but sorting the
-            # serialized output keeps save-file diffs readable when a
-            # GM edits tiles by hand.
-            # deepcopy each tile's data: tile_set_path / the tile_set primitive
-            # mutate tile dicts IN PLACE, so a by-reference snapshot would be
-            # corrupted by a later edit (defeating undo change-detection and
-            # action rollback — the same defect fixed for entity vars).
-            "tiles": {
-                f"{x},{y}": copy.deepcopy(dat)
-                for (x, y), dat in sorted(self.tiles.items())
-            },
-            "zones": {
-                name: self._zone_to_dict(z)
-                for name, z in sorted(self.zones.items())
-            },
             "tile_templates": {
                 name: tpl.to_dict()
                 for name, tpl in sorted(self.tile_templates.items())
@@ -15891,18 +16199,6 @@ class Match:
             "bound_channels": copy.deepcopy(self.bound_channels),
             "fog_enabled": bool(self.fog_enabled),
             "fog_memory": bool(self.fog_memory),
-            # cell sets as row runs [y, x_from, x_to] (_cells_to_runs)
-            "explored": {
-                team: _cells_to_runs(cells)
-                for team, cells in self.explored.items()
-            },
-            "fog_reveals": {
-                team: [{"cells": _cells_to_runs(r.get("cells", ())),
-                        "until": r.get("until"),
-                        "clock": r.get("clock", "round")}
-                       for r in recs]
-                for team, recs in self.fog_reveals.items()
-            },
             "team_colors": dict(self.team_colors),
             "color_enabled": bool(self.color_enabled),
             "channel_views": {k: [int(v[0]), int(v[1])]
@@ -15923,11 +16219,15 @@ class Match:
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "Match":
+        maps = {str(name): Map.from_dict(str(name), md)
+                for name, md in (d.get("maps") or {}).items()
+                if isinstance(md, dict)}
+        if not maps:
+            raise VTTError("A match needs at least one map.")
         m = Match(
             id=d["id"],
             name=d["name"],
-            grid_width=d["grid_width"],
-            grid_height=d["grid_height"],
+            maps=maps,
             system_name=d.get("system_name", "default"),
             # Every rule present: a snapshot or save written before a rule
             # existed lacks its key, and the scattered rules.get(key, x)
@@ -15937,8 +16237,13 @@ class Match:
             rules={**copy.deepcopy(DEFAULT_SYSTEM_SETTINGS),
                    **copy.deepcopy(d.get("rules") or {})},
         )
+        first_map = next(iter(maps))
         for eid, ed in d.get("entities", {}).items():
             e = Entity.from_dict(ed)
+            # A unit naming no map of this match (hand-edited state) stands
+            # on the first one.
+            if e.map not in maps:
+                e.map = first_map
             e.bind(m, set_spawn_facing=False)
             m.entities[eid] = e
         # COPY on load too (the load-side twin): otherwise the restored match
@@ -15983,36 +16288,6 @@ class Match:
             name: [eid for eid in members if eid in m.entities]
             for name, members in raw_groups.items()
         }
-        # Filter tiles to in-bounds coords so a grid-resize between save
-        # and load doesn't leave orphaned data. Match's bounds are
-        # authoritative — an out-of-bounds tile would never be reachable
-        # from any command or formula anyway.
-        raw_tiles = d.get("tiles", {}) or {}
-        m.tiles = {}
-        for key, val in raw_tiles.items():
-            try:
-                xs, ys = key.split(",", 1)
-                x, y = int(xs), int(ys)
-            except (ValueError, AttributeError):
-                continue
-            if m.in_bounds(x, y) and isinstance(val, dict) and val:
-                # deepcopy: a snapshot's tile dict is loaded here; reusing it
-                # by reference would re-share it with the retained snapshot, so
-                # a later in-place !tile set would corrupt undo/rollback (the
-                # load-side twin of the to_dict deepcopy above).
-                m.tiles[(x, y)] = copy.deepcopy(val)
-        raw_zones = d.get("zones", {}) or {}
-        m.zones = {}
-        for zname, zdef in raw_zones.items():
-            if not isinstance(zname, str) or not isinstance(zdef, dict):
-                continue
-            z = m._zone_from_dict(zdef)
-            # Keep only in-bounds cells (a grid resize between save and
-            # load shouldn't leave dangling cells). An emptied zone still
-            # exists — its data/hooks are preserved so a shift could bring
-            # it back on-grid; consistent with keeping empty groups.
-            if z is not None:
-                m.zones[zname] = z
         raw_templates = d.get("tile_templates", {}) or {}
         m.tile_templates = {}
         for tname, tdef in raw_templates.items():
@@ -16118,24 +16393,6 @@ class Match:
         } if isinstance(raw_bound, dict) else {}
         m.fog_enabled = bool(d.get("fog_enabled", False))
         m.fog_memory = bool(d.get("fog_memory", False))
-        raw_expl = d.get("explored", {})
-        gw, gh = m.grid_width, m.grid_height
-        m.explored = {
-            team: _runs_to_cells(cells, gw, gh)
-            for team, cells in raw_expl.items()
-            if isinstance(team, str) and isinstance(cells, list)
-        } if isinstance(raw_expl, dict) else {}
-        raw_rev = d.get("fog_reveals", {})
-        m.fog_reveals = {
-            team: [
-                {"cells": _runs_to_cells(r.get("cells", []), gw, gh),
-                 "until": (int(r["until"]) if r.get("until") is not None else None),
-                 "clock": ("turn" if r.get("clock") == "turn" else "round")}
-                for r in recs if isinstance(r, dict)
-            ]
-            for team, recs in raw_rev.items()
-            if isinstance(team, str) and isinstance(recs, list)
-        } if isinstance(raw_rev, dict) else {}
         raw_tc = d.get("team_colors", {})
         m.team_colors = {
             str(k): str(v) for k, v in raw_tc.items()
@@ -16322,8 +16579,8 @@ class Match:
                 val = tpl.data.get("legend")
         return self._legend_value(val, default)
 
-    def legend_label_zone(self, name: str) -> Optional[str]:
-        z = self.zones.get(name)
+    def legend_label_zone(self, name: str, mp: "Map") -> Optional[str]:
+        z = mp.zones.get(name)
         return self._legend_value(z.get("legend") if isinstance(z, dict)
                                   else None, f"zone: {name}")
 
@@ -16360,11 +16617,12 @@ class Match:
         res = str(res) if res is not None else ""
         return res if res in TEXT_COLORS else None
 
-    def tile_color(self, x: int, y: int) -> Optional[str]:
-        """The resolved color name for the tile at (x, y): its instance
-        `color` data wins, else its template's `color`. Literal-or-formula
-        (see _resolve_color_value). None when unset/unresolved."""
-        cell = self.tiles.get((x, y))
+    def tile_color(self, x: int, y: int, mp: "Map") -> Optional[str]:
+        """The resolved color name for the tile at (x, y) of map `mp`: its
+        instance `color` data wins, else its template's `color`.
+        Literal-or-formula (see _resolve_color_value). None when
+        unset/unresolved."""
+        cell = mp.tiles.get((x, y))
         if not isinstance(cell, dict):
             return None
         val = cell.get("color")
@@ -16376,10 +16634,10 @@ class Match:
                     val = tpl.data.get("color")
         return self._resolve_color_value(val, {"tile_x": x, "tile_y": y})
 
-    def zone_color(self, name: str) -> Optional[str]:
-        """The resolved color name for zone `name` (its `color` field,
-        literal-or-formula), or None."""
-        z = self.zones.get(name)
+    def zone_color(self, name: str, mp: "Map") -> Optional[str]:
+        """The resolved color name for zone `name` of map `mp` (its `color`
+        field, literal-or-formula), or None."""
+        z = mp.zones.get(name)
         if not isinstance(z, dict):
             return None
         return self._resolve_color_value(z.get("color"), {"zone_name": name})
@@ -16543,10 +16801,10 @@ class Match:
                     out.append(rec)
         return out
 
-    def tile_sprite(self, x: int, y: int) -> Optional[str]:
-        """The sprite key for the tile at (x, y): instance `sprite` data >
-        the template's `sprite`. None when unset."""
-        cell = self.tiles.get((x, y))
+    def tile_sprite(self, x: int, y: int, mp: "Map") -> Optional[str]:
+        """The sprite key for the tile at (x, y) of map `mp`: instance
+        `sprite` data > the template's `sprite`. None when unset."""
+        cell = mp.tiles.get((x, y))
         if not isinstance(cell, dict):
             return None
         k = cell.get("sprite")
@@ -16561,9 +16819,10 @@ class Match:
                     return tk
         return None
 
-    def zone_sprite(self, name: str) -> Optional[str]:
-        """The sprite key for zone `name` (its `sprite` field), or None."""
-        z = self.zones.get(name)
+    def zone_sprite(self, name: str, mp: "Map") -> Optional[str]:
+        """The sprite key for zone `name` of map `mp` (its `sprite` field),
+        or None."""
+        z = mp.zones.get(name)
         if not isinstance(z, dict):
             return None
         k = z.get("sprite")
@@ -16588,10 +16847,11 @@ class Match:
                     else "stretch"}
         return None
 
-    def tile_glyph(self, x: int, y: int) -> Optional[str]:
-        """The glyph for the tile at (x, y): instance > template (mirrors the
-        inline resolution in _render_ascii_impl). None when unset."""
-        cell = self.tiles.get((x, y))
+    def tile_glyph(self, x: int, y: int, mp: "Map") -> Optional[str]:
+        """The glyph for the tile at (x, y) of map `mp`: instance > template
+        (mirrors the inline resolution in _render_ascii_impl). None when
+        unset."""
+        cell = mp.tiles.get((x, y))
         if not isinstance(cell, dict):
             return None
         g = cell.get("glyph")
@@ -16681,67 +16941,78 @@ class Match:
     # per-channel offset (channel_views[ch]) is the top-left anchor,
     # clamped so the window never runs off the grid.
 
-    def _viewport_dims(self) -> Tuple[int, int]:
+    # The viewport functions work on map `mp` (None = the only map).
+    def _viewport_dims(self, mp: Optional["Map"] = None) -> Tuple[int, int]:
         """The window size (w, h) = min(cap, grid) per axis."""
+        mp = mp or self.get_map()
         cw = max(1, int(self.rules.get("viewport_width", 30)))
         ch = max(1, int(self.rules.get("viewport_height", 30)))
-        return min(cw, self.grid_width), min(ch, self.grid_height)
+        return min(cw, mp.grid_width), min(ch, mp.grid_height)
 
-    def viewport_engaged(self) -> bool:
+    def viewport_engaged(self, mp: Optional["Map"] = None) -> bool:
         """True iff the grid exceeds a cap on either axis (so a window is
         needed). Independent of the surface toggle (viewport_mode) — the
         command layer ANDs this with whether the surface opts in."""
+        mp = mp or self.get_map()
         cw = max(1, int(self.rules.get("viewport_width", 30)))
         ch = max(1, int(self.rules.get("viewport_height", 30)))
-        return self.grid_width > cw or self.grid_height > ch
+        return mp.grid_width > cw or mp.grid_height > ch
 
-    def _clamp_view(self, x: int, y: int,
-                    vw: int, vh: int) -> Tuple[int, int]:
+    @staticmethod
+    def _clamp_view(x: int, y: int, vw: int, vh: int,
+                    mp: "Map") -> Tuple[int, int]:
         """Clamp a top-left anchor so the vw x vh window stays on the grid."""
-        x = max(1, min(int(x), self.grid_width - vw + 1))
-        y = max(1, min(int(y), self.grid_height - vh + 1))
+        x = max(1, min(int(x), mp.grid_width - vw + 1))
+        y = max(1, min(int(y), mp.grid_height - vh + 1))
         return x, y
 
-    def resolve_viewport(self, channel_key: str, *,
-                         enabled: bool) -> Optional[Tuple[int, int, int, int]]:
+    def resolve_viewport(self, channel_key: str, *, enabled: bool,
+                         mp: Optional["Map"] = None
+                         ) -> Optional[Tuple[int, int, int, int]]:
         """The (vx, vy, vw, vh) window to render for `channel_key`, or None
         for the whole grid. None when the viewport is disabled for this
         surface (enabled=False) or the grid fits both caps. The offset comes
         from channel_views (default top-left), clamped to the grid."""
-        if not enabled or not self.viewport_engaged():
+        mp = mp or self.get_map()
+        if not enabled or not self.viewport_engaged(mp):
             return None
-        vw, vh = self._viewport_dims()
+        vw, vh = self._viewport_dims(mp)
         off = self.channel_views.get(channel_key)
         ox, oy = (off[0], off[1]) if isinstance(off, (list, tuple)) and \
             len(off) == 2 else (1, 1)
-        vx, vy = self._clamp_view(ox, oy, vw, vh)
+        vx, vy = self._clamp_view(ox, oy, vw, vh, mp)
         return (vx, vy, vw, vh)
 
-    def set_view(self, channel_key: str, x: int, y: int) -> Tuple[int, int]:
+    def set_view(self, channel_key: str, x: int, y: int,
+                 mp: Optional["Map"] = None) -> Tuple[int, int]:
         """Set a channel's viewport top-left to (x, y) (clamped). Returns the
         stored (clamped) anchor."""
-        vw, vh = self._viewport_dims()
-        vx, vy = self._clamp_view(x, y, vw, vh)
+        mp = mp or self.get_map()
+        vw, vh = self._viewport_dims(mp)
+        vx, vy = self._clamp_view(x, y, vw, vh, mp)
         self.channel_views[channel_key] = [vx, vy]
         return vx, vy
 
-    def center_view(self, channel_key: str,
-                    cx: int, cy: int) -> Tuple[int, int]:
+    def center_view(self, channel_key: str, cx: int, cy: int,
+                    mp: Optional["Map"] = None) -> Tuple[int, int]:
         """Center a channel's viewport on (cx, cy) as nearly as the grid
         allows (the "move the camera to the protagonist" helper). Returns the
         stored (clamped) top-left anchor."""
-        vw, vh = self._viewport_dims()
-        return self.set_view(channel_key, cx - vw // 2, cy - vh // 2)
+        mp = mp or self.get_map()
+        vw, vh = self._viewport_dims(mp)
+        return self.set_view(channel_key, cx - vw // 2, cy - vh // 2, mp)
 
-    def pan_view(self, channel_key: str, dx: int, dy: int) -> Tuple[int, int]:
+    def pan_view(self, channel_key: str, dx: int, dy: int,
+                 mp: Optional["Map"] = None) -> Tuple[int, int]:
         """Shift a channel's viewport by (dx, dy) tiles from its current
         (clamped) anchor. Returns the new (clamped) anchor."""
-        vw, vh = self._viewport_dims()
+        mp = mp or self.get_map()
+        vw, vh = self._viewport_dims(mp)
         off = self.channel_views.get(channel_key)
         ox, oy = (off[0], off[1]) if isinstance(off, (list, tuple)) and \
             len(off) == 2 else (1, 1)
-        ox, oy = self._clamp_view(ox, oy, vw, vh)
-        return self.set_view(channel_key, ox + int(dx), oy + int(dy))
+        ox, oy = self._clamp_view(ox, oy, vw, vh, mp)
+        return self.set_view(channel_key, ox + int(dx), oy + int(dy), mp)
 
     def clear_view(self, channel_key: str) -> None:
         """Forget a channel's viewport offset (snaps back to top-left)."""
@@ -16754,8 +17025,9 @@ class Match:
                      legend: bool = False,
                      marks: Optional["set[Tuple[int, int]]"] = None,
                      mark_glyph: str = "*",
-                     coords: Optional[bool] = None) -> str:
-        """Render the ASCII map. Thin wrapper that activates the read-only
+                     coords: Optional[bool] = None,
+                     mp: Optional["Map"] = None) -> str:
+        """Render map `mp` (None = the only map) as ASCII. Thin wrapper that activates the read-only
         _fog_team_sees memo for the duration of the render, so the per-cell,
         per-layer fog scan doesn't recompute the same team-sight (each
         recompute loops every team member with a per-member LOS walk). The
@@ -16779,7 +17051,8 @@ class Match:
             return self._render_ascii_impl(pov_team, colorize, hidden,
                                            viewport=viewport, legend=legend,
                                            marks=marks, mark_glyph=mark_glyph,
-                                           coords=coords)
+                                           coords=coords,
+                                           mp=mp or self.get_map())
         finally:
             self._vision_memo = prev
 
@@ -16790,7 +17063,10 @@ class Match:
                            legend: bool = False,
                            marks: Optional["set[Tuple[int, int]]"] = None,
                            mark_glyph: str = "*",
-                           coords: bool = False) -> str:
+                           coords: bool = False,
+                           mp: Optional["Map"] = None) -> str:
+        mp = mp or self.get_map()
+        gw, gh = mp.grid_width, mp.grid_height
         # `pov_team` filters EVERY layer through its visibility rule: a
         # zone / tile / entity hidden from that team isn't painted (its
         # cell falls back to whatever layer is visible underneath, so the
@@ -16803,14 +17079,9 @@ class Match:
         # (keeping the existing entity > tile > zone layering). A zone/tile
         # with a color but no glyph still tints its cell (the '.'), the
         # "fill empty cells" behavior.
-        grid = [
-            ["." for _ in range(self.grid_width + 1)]
-            for _ in range(self.grid_height + 1)
-        ]
+        grid = [["." for _ in range(gw + 1)] for _ in range(gh + 1)]
         colors: List[List[Optional[str]]] = [
-            [None for _ in range(self.grid_width + 1)]
-            for _ in range(self.grid_height + 1)
-        ]
+            [None for _ in range(gw + 1)] for _ in range(gh + 1)]
         # `meanings` (only allocated for the auto-legend) is a parallel grid
         # of "what is this glyph" strings, set alongside each painted glyph
         # so the legend reflects the FINAL top-layer glyph actually shown
@@ -16818,40 +17089,37 @@ class Match:
         # explain (the background '.').
         meanings: Optional[List[List[Optional[str]]]] = None
         if legend:
-            meanings = [
-                [None for _ in range(self.grid_width + 1)]
-                for _ in range(self.grid_height + 1)
-            ]
+            meanings = [[None for _ in range(gw + 1)] for _ in range(gh + 1)]
 
         # Zone layer (lowest): a single-char `glyph` paints all the zone's
         # cells; a `color` tints them (the glyph if present, else the '.').
         # Overlapping zones: later-iterated wins for both.
-        for zname, z in (self.zones.items() if "zones" not in hidden else ()):
-            if not self.zone_visible_to(zname, pov_team):
+        for zname, z in (mp.zones.items() if "zones" not in hidden else ()):
+            if not self.zone_visible_to(zname, pov_team, mp):
                 continue
             g = z.get("glyph")
             has_glyph = isinstance(g, str) and len(g) == 1
-            zc = self.zone_color(zname)
+            zc = self.zone_color(zname, mp)
             if not has_glyph and zc is None:
                 continue
             for (zx, zy) in z.get("cells", ()):
-                if not self.in_bounds(zx, zy):
+                if not mp.in_bounds(zx, zy):
                     continue
                 if has_glyph:
                     grid[zy][zx] = g
                     colors[zy][zx] = zc
                     if meanings is not None:
-                        meanings[zy][zx] = self.legend_label_zone(zname)
+                        meanings[zy][zx] = self.legend_label_zone(zname, mp)
                 elif zc is not None:
                     colors[zy][zx] = zc
 
         # Tile layer: instance `glyph` wins, else the template's. A tile
         # `color` (instance > template) tints the cell — overriding any zone
         # tint underneath, since the tile is the higher layer.
-        for (tx, ty), data in (self.tiles.items() if "tiles" not in hidden else ()):
-            if not self.in_bounds(tx, ty):
+        for (tx, ty), data in (mp.tiles.items() if "tiles" not in hidden else ()):
+            if not mp.in_bounds(tx, ty):
                 continue
-            if not self.tile_visible_to(tx, ty, pov_team):
+            if not self.tile_visible_to(tx, ty, pov_team, mp):
                 continue
             glyph = data.get("glyph")
             if not (isinstance(glyph, str) and len(glyph) == 1):
@@ -16863,7 +17131,7 @@ class Match:
                         if isinstance(cand, str) and len(cand) == 1:
                             glyph = cand
             has_glyph = isinstance(glyph, str) and len(glyph) == 1
-            tc = self.tile_color(tx, ty)
+            tc = self.tile_color(tx, ty, mp)
             if has_glyph:
                 grid[ty][tx] = glyph
                 colors[ty][tx] = tc            # tile owns the cell (tc may be None)
@@ -16889,14 +17157,15 @@ class Match:
             # to a priority pass below. Mounted riders are aboard: hidden
             # ones don't draw (the vehicle does); visible (region-slot) ones
             # draw over the vehicle in the priority pass below.
-            if e.is_glued_part or e.is_region_part or e.is_mounted:
+            if e.is_glued_part or e.is_region_part or e.is_mounted \
+                    or e.map != mp.name:
                 continue
             if not self.entity_visible_to(e.id, pov_team):
                 continue
             sym = self.entity_glyph(e, pov_team)
             ecol = self.entity_color(e, pov_team)
             for (cx, cy) in self.entity_cells(e):
-                if self.in_bounds(cx, cy):
+                if mp.in_bounds(cx, cy):
                     grid[cy][cx] = sym
                     colors[cy][cx] = ecol
                     unit_shown.add((cx, cy))
@@ -16906,14 +17175,15 @@ class Match:
         # Visible-rider priority pass: a rider in a region slot sits ON the
         # vehicle, so it draws over the vehicle glyph at its slot cell.
         for e in (self.entities.values() if "entities" not in hidden else ()):
-            if not e.is_visible_rider or not getattr(e, "is_alive", True):
+            if not e.is_visible_rider or not getattr(e, "is_alive", True) \
+                    or e.map != mp.name:
                 continue
             if not self.entity_visible_to(e.id, pov_team):
                 continue
             sym = self.entity_glyph(e, pov_team)
             ecol = self.entity_color(e, pov_team)
             for (cx, cy) in self.entity_cells(e):
-                if self.in_bounds(cx, cy):
+                if mp.in_bounds(cx, cy):
                     grid[cy][cx] = sym
                     colors[cy][cx] = ecol
                     unit_shown.add((cx, cy))
@@ -16927,14 +17197,15 @@ class Match:
         # wins. Drawn regardless of hp so structural 0/0 zones still show.
         if bool(self.rules.get("part_custom_glyph_priority", True)) and "entities" not in hidden:
             for e in self.entities.values():
-                if not e.is_region_part or not self.entity_has_custom_glyph(e):
+                if not e.is_region_part or e.map != mp.name \
+                        or not self.entity_has_custom_glyph(e):
                     continue
                 if not self.entity_visible_to(e.id, pov_team):
                     continue
                 sym = self.entity_glyph(e, pov_team)
                 ecol = self.entity_color(e, pov_team)
                 for (cx, cy) in self.entity_cells(e):
-                    if self.in_bounds(cx, cy):
+                    if mp.in_bounds(cx, cy):
                         grid[cy][cx] = sym
                         colors[cy][cx] = ecol
                         unit_shown.add((cx, cy))
@@ -16946,9 +17217,9 @@ class Match:
         if self.fog_enabled and pov_team is not None and "fog" not in hidden:
             fog_glyph = str(self.rules.get("fog_glyph", "?"))
             fg = fog_glyph[0] if fog_glyph else "."
-            for yy in range(1, self.grid_height + 1):
-                for xx in range(1, self.grid_width + 1):
-                    if not self._fog_terrain_visible(pov_team, xx, yy):
+            for yy in range(1, gh + 1):
+                for xx in range(1, gw + 1):
+                    if not self._fog_terrain_visible(pov_team, xx, yy, mp):
                         grid[yy][xx] = fg
                         colors[yy][xx] = None
                         unit_shown.discard((xx, yy))
@@ -16962,7 +17233,7 @@ class Match:
         if marks:
             mg = (mark_glyph or "*")[0]
             for (mx, my) in marks:
-                if self.in_bounds(mx, my) and (mx, my) not in unit_shown:
+                if mp.in_bounds(mx, my) and (mx, my) not in unit_shown:
                     grid[my][mx] = mg
                     colors[my][mx] = None
                     if meanings is not None:
@@ -16974,10 +17245,10 @@ class Match:
             vx, vy, vw, vh = viewport
             x0 = max(1, vx)
             y0 = max(1, vy)
-            x1 = min(self.grid_width, vx + vw - 1)
-            y1 = min(self.grid_height, vy + vh - 1)
+            x1 = min(gw, vx + vw - 1)
+            y1 = min(gh, vy + vh - 1)
         else:
-            x0, y0, x1, y1 = 1, 1, self.grid_width, self.grid_height
+            x0, y0, x1, y1 = 1, 1, gw, gh
 
         # Compose. When colorizing, a color code is emitted once per RUN of
         # same-colored cells (reset at each change and at row end) rather than
@@ -17062,19 +17333,21 @@ class Match:
     def render_scene(self, pov_team: Optional[str] = None,
                      hidden_layers: Optional["set[str]"] = None,
                      viewport: Optional[Tuple[int, int, int, int]] = None,
-                     legend: bool = False
+                     legend: bool = False,
+                     mp: Optional["Map"] = None
                      ) -> Dict[str, Any]:
-        """Build the graphics render model (see _render_scene_impl). Activates
-        the read-only fog-sight memo for the duration, exactly like
-        render_ascii."""
+        """Build the graphics render model of map `mp` (None = the only map;
+        see _render_scene_impl). Activates the read-only fog-sight memo for
+        the duration, exactly like render_ascii."""
+        mp = mp or self.get_map()
         hidden = self.hidden_layers if hidden_layers is None else hidden_layers
         prev = self._vision_memo
         if prev is None:
             self._vision_memo = {}
         try:
-            scene = self._render_scene_impl(pov_team, hidden, viewport)
+            scene = self._render_scene_impl(pov_team, hidden, viewport, mp)
             if legend:
-                scene["legend"] = self._scene_legend(scene, pov_team)
+                scene["legend"] = self._scene_legend(scene, pov_team, mp)
             return scene
         finally:
             self._vision_memo = prev
@@ -17100,8 +17373,8 @@ class Match:
     _LEGEND_LOOK = ("kind", "sprite", "glyph", "tint", "opacity",
                     "glyph_tint", "glyph_opacity", "flip_h", "flip_v")
 
-    def _scene_legend(self, scene: Dict[str, Any],
-                      pov_team: Optional[str]) -> List[Dict[str, Any]]:
+    def _scene_legend(self, scene: Dict[str, Any], pov_team: Optional[str],
+                      mp: "Map") -> List[Dict[str, Any]]:
         """The image legend: one entry per distinct look among the placements
         inside the rendered window (overlays left out), with every meaning
         that look has — the graphics counterpart of the ASCII legend, and
@@ -17114,7 +17387,7 @@ class Match:
             x0, y0 = vp["x"], vp["y"]
             x1, y1 = x0 + vp["w"] - 1, y0 + vp["h"] - 1
         else:
-            x0, y0, x1, y1 = 1, 1, self.grid_width, self.grid_height
+            x0, y0, x1, y1 = 1, 1, mp.grid_width, mp.grid_height
         entries: Dict[Tuple, Dict[str, Any]] = {}
         for p in scene.get("placements", []):
             if p.get("kind") == "overlay":
@@ -17136,10 +17409,10 @@ class Match:
                     tx, ty = (int(v) for v in str(ref).split(","))
                 except ValueError:
                     tx = ty = None
-                data = self.tiles.get((tx, ty)) if tx is not None else None
+                data = mp.tiles.get((tx, ty)) if tx is not None else None
                 label = self.legend_label_tile(data)
             elif kind == "zone":
-                label = self.legend_label_zone(ref)
+                label = self.legend_label_zone(ref, mp)
             elif kind == "corpse":
                 label = self.legend_label_corpse(ref)
             else:
@@ -17166,8 +17439,9 @@ class Match:
         return out
 
     def _emit_entity_placement(self, out: List[Dict[str, Any]], e: "Entity",
-                               pov_team: Optional[str], layer: int) -> None:
-        rects = self._cell_rects(self.entity_cells(e))
+                               pov_team: Optional[str], layer: int,
+                               mp: "Map") -> None:
+        rects = self._cell_rects(self.entity_cells(e), mp)
         spr = self.entity_sprite(e, pov_team)
         key, fh, fv = spr if spr is not None else (None, False, False)
         body_mode = self.entity_sprite_mode(e)
@@ -17200,10 +17474,11 @@ class Match:
                     "flip_h": False, "flip_v": False, "layer": ov["layer"],
                 })
 
-    def _cell_rects(self, cells) -> List[Tuple[int, int, int, int]]:
+    @staticmethod
+    def _cell_rects(cells, mp: "Map") -> List[Tuple[int, int, int, int]]:
         """(x, y, w, h) rectangles to draw a unit's on-map cells as: one
         bounding rectangle when the cells fill it, else one per cell."""
-        cs = {(cx, cy) for (cx, cy) in cells if self.in_bounds(cx, cy)}
+        cs = {(cx, cy) for (cx, cy) in cells if mp.in_bounds(cx, cy)}
         if not cs:
             return []
         xs = [c[0] for c in cs]
@@ -17221,7 +17496,7 @@ class Match:
             return bool(self.map_coords)
         return bool(self.rules.get("map_coords", True))
 
-    def _scene_borders(self) -> Dict[str, Any]:
+    def _scene_borders(self, mp: "Map") -> Dict[str, Any]:
         """Border (grid-line) config for the scene: the show_borders /
         border_color / border_opacity rules, with per-MATCH overrides
         (border_show / border_color / border_opacity fields) winning over the
@@ -17243,7 +17518,7 @@ class Match:
         except (TypeError, ValueError):
             op = 100
         overrides: Dict[str, Any] = {}
-        for (tx, ty), data in self.tiles.items():
+        for (tx, ty), data in mp.tiles.items():
             if not isinstance(data, dict):
                 continue
             bc, bo = data.get("border_color"), data.get("border_opacity")
@@ -17259,8 +17534,8 @@ class Match:
 
     def _render_scene_impl(self, pov_team: Optional[str],
                            hidden: "set[str]",
-                           viewport: Optional[Tuple[int, int, int, int]]
-                           ) -> Dict[str, Any]:
+                           viewport: Optional[Tuple[int, int, int, int]],
+                           mp: "Map") -> Dict[str, Any]:
         placements: List[Dict[str, Any]] = []
         # Z-layer defaults per kind (configurable via the sprite_layer_* rules;
         # per-item overrides handled at each emission). Background is the floor.
@@ -17271,17 +17546,17 @@ class Match:
         rider_layer = self._layer_rule("sprite_layer_rider", 110)
 
         # Zone layer: a sprite / glyph / color per covered cell.
-        for zname, z in (self.zones.items() if "zones" not in hidden else ()):
-            if not self.zone_visible_to(zname, pov_team):
+        for zname, z in (mp.zones.items() if "zones" not in hidden else ()):
+            if not self.zone_visible_to(zname, pov_team, mp):
                 continue
-            spr = self.zone_sprite(zname)
+            spr = self.zone_sprite(zname, mp)
             g = z.get("glyph")
             g = g if isinstance(g, str) and len(g) == 1 else None
-            tint = self.zone_color(zname)
+            tint = self.zone_color(zname, mp)
             if spr is None and g is None and tint is None:
                 continue
             for (zx, zy) in z.get("cells", ()):
-                if not self.in_bounds(zx, zy):
+                if not mp.in_bounds(zx, zy):
                     continue
                 placements.append({
                     "kind": "zone", "ref": zname, "x": zx, "y": zy,
@@ -17290,12 +17565,13 @@ class Match:
                     "flip_h": False, "flip_v": False, "layer": zone_layer})
 
         # Tile layer (20).
-        for (tx, ty), data in (self.tiles.items() if "tiles" not in hidden else ()):
-            if not self.in_bounds(tx, ty) or not self.tile_visible_to(tx, ty, pov_team):
+        for (tx, ty), data in (mp.tiles.items() if "tiles" not in hidden else ()):
+            if not mp.in_bounds(tx, ty) or not self.tile_visible_to(
+                    tx, ty, pov_team, mp):
                 continue
-            spr = self.tile_sprite(tx, ty)
-            g = self.tile_glyph(tx, ty)
-            tint = self.tile_color(tx, ty)
+            spr = self.tile_sprite(tx, ty, mp)
+            g = self.tile_glyph(tx, ty, mp)
+            tint = self.tile_color(tx, ty, mp)
             if spr is None and g is None and tint is None:
                 continue
             # Per-tile override: a `sprite_layer` data field wins over the rule.
@@ -17319,8 +17595,8 @@ class Match:
             except (TypeError, ValueError):
                 c_op = 50
             c_op = max(0, min(100, c_op))
-            for (cx, cy, cid, corpse) in self.all_corpses():
-                if not self.corpse_visible_to(cid, corpse, cx, cy, pov_team):
+            for (cx, cy, cid, corpse) in self.all_corpses(mp):
+                if not self.corpse_visible_to(cid, corpse, cx, cy, pov_team, mp):
                     continue
                 spr, own = self.corpse_sprite_info(corpse)
                 # Drawn when the dead unit had a sprite or a custom glyph (or
@@ -17331,7 +17607,7 @@ class Match:
                 if spr is None and self.corpse_glyph(corpse, custom_only=True) is None:
                     continue
                 gl = self.corpse_glyph(corpse)
-                cw, ch = self._corpse_footprint(corpse)
+                cw, ch = self._corpse_footprint(corpse, mp)
                 c_mode = (self._sprite_mode_of(
                               (corpse.get("entity") or {}).get("vars") or {})
                           if (cw > 1 or ch > 1) else "single")
@@ -17351,29 +17627,34 @@ class Match:
             for e in self.entities.values():
                 if not getattr(e, "is_alive", True):
                     continue
-                if e.is_glued_part or e.is_region_part or e.is_mounted:
+                if e.is_glued_part or e.is_region_part or e.is_mounted \
+                        or e.map != mp.name:
                     continue
                 if not self.entity_visible_to(e.id, pov_team):
                     continue
-                self._emit_entity_placement(placements, e, pov_team, entity_layer)
+                self._emit_entity_placement(placements, e, pov_team,
+                                            entity_layer, mp)
             # Visible riders, over their vehicle.
             for e in self.entities.values():
-                if not e.is_visible_rider or not getattr(e, "is_alive", True):
+                if not e.is_visible_rider or not getattr(e, "is_alive", True) \
+                        or e.map != mp.name:
                     continue
                 if not self.entity_visible_to(e.id, pov_team):
                     continue
-                self._emit_entity_placement(placements, e, pov_team, rider_layer)
+                self._emit_entity_placement(placements, e, pov_team,
+                                            rider_layer, mp)
             # Region parts with a custom sprite/glyph, over their parent.
             if bool(self.rules.get("part_custom_glyph_priority", True)):
                 for e in self.entities.values():
-                    if not e.is_region_part:
+                    if not e.is_region_part or e.map != mp.name:
                         continue
                     if not (self.entity_has_custom_sprite(e)
                             or self.entity_has_custom_glyph(e)):
                         continue
                     if not self.entity_visible_to(e.id, pov_team):
                         continue
-                    self._emit_entity_placement(placements, e, pov_team, rider_layer)
+                    self._emit_entity_placement(placements, e, pov_team,
+                                                rider_layer, mp)
 
         # Fog: cells the POV team can't see (always drawn last / on top).
         fog: List[Dict[str, Any]] = []
@@ -17384,9 +17665,9 @@ class Match:
             except (TypeError, ValueError):
                 fog_op = 60
             fog_op = max(0, min(100, fog_op))
-            for yy in range(1, self.grid_height + 1):
-                for xx in range(1, self.grid_width + 1):
-                    if not self._fog_terrain_visible(pov_team, xx, yy):
+            for yy in range(1, mp.grid_height + 1):
+                for xx in range(1, mp.grid_width + 1):
+                    if not self._fog_terrain_visible(pov_team, xx, yy, mp):
                         fog.append({"x": xx, "y": yy,
                                     "sprite": fog_sprite, "opacity": fog_op})
 
@@ -17395,10 +17676,10 @@ class Match:
             vx, vy, vw, vh = viewport
             vp = {"x": vx, "y": vy, "w": vw, "h": vh}
         return {
-            "grid_width": self.grid_width, "grid_height": self.grid_height,
+            "grid_width": mp.grid_width, "grid_height": mp.grid_height,
             "viewport": vp, "background": self.background_layer(),
             "placements": placements, "fog": fog,
-            "borders": self._scene_borders(),
+            "borders": self._scene_borders(mp),
             "coords": self.coords_on(),
             "sprite_cell_size": self._layer_rule("sprite_cell_size", 100),
             "unit_style": {
@@ -17466,11 +17747,12 @@ class Match:
         bearing = math.degrees(math.atan2(dx, -dy)) % 360
         return DIRECTION_CW_ORDER_8[int((bearing + 22.5) // 45) % 8]
 
-    def _spawn_facing(self, x: int, y: int) -> Direction:
+    def _spawn_facing(self, x: int, y: int, mp: "Map") -> Direction:
+        """The facing a unit placed at (x, y) of map `mp` starts with."""
         eight_way = bool(self.rules.get("allow_diagonal_facing", False))
         if self.rules.get("spawn_face_toward_center", True):
             return _default_facing_for(
-                x, y, self.grid_width, self.grid_height, eight_way=eight_way,
+                x, y, mp.grid_width, mp.grid_height, eight_way=eight_way,
             )
         d = self.rules.get("spawn_default_facing", "up")
         if d not in ALLOWED_DIRECTIONS:
@@ -17647,7 +17929,7 @@ class Match:
                     # passed through; only the FINAL footprint is occupancy-
                     # checked (below).
                     for cx, cy in self.entity_cells(e, nx, ny):
-                        if not self.in_bounds(cx, cy):
+                        if not self.map_of(e).in_bounds(cx, cy):
                             raise OutOfBounds(
                                 f"Group '{group_name}' move aborted: member "
                                 f"'{eid}' would leave the grid at ({cx},{cy})."
@@ -17669,7 +17951,7 @@ class Match:
             if not e.is_cell_stackable and not glued:
                 ignore = self._occupancy_ignore(e, extra=tuple(member_set))
                 for cx, cy in self.entity_cells(e, x, y):
-                    occ = self.cell_occupant(cx, cy, ignore)
+                    occ = self.cell_occupant(cx, cy, ignore, self.map_of(e))
                     if occ is not None:
                         raise Occupied(
                             f"Group '{group_name}' move aborted: member "
@@ -17827,7 +18109,8 @@ LOCAL_WORKSPACE = "local"
 # (see Match.capture_template); its NAME is the id spawned units take.
 TEMPLATE_ROOT = "@root"
 _TEMPLATE_META_KEYS = ("saved_by", "saved_by_name")
-_TEMPLATE_IDENTITY_KEYS = ("id", "x", "y", "part_of", "mounted_on", "mount_slot")
+_TEMPLATE_IDENTITY_KEYS = ("id", "x", "y", "map", "part_of", "mounted_on",
+                           "mount_slot")
 
 
 def check_template_name(name: Any) -> str:
@@ -19038,7 +19321,7 @@ class MatchManager:
         )
         rules = self._build_rules_dict(sysobj)
         check_grid_dimensions(width, height, rules, "New match")
-        m = Match(id=match_id, name=name, grid_width=width, grid_height=height,
+        m = Match(id=match_id, name=name, maps=default_maps(width, height),
                   system_name=sysobj.name, rules=rules)
         # The creator becomes the match owner (full privileges + sole host
         # manager). The creating channel isn't bound here — binding tracks

@@ -285,7 +285,7 @@ def _general_pool(mgr, ctx) -> List[str]:
     out = set(_entity_ids(mgr, ctx)) | set(mgr.templates) | set(mgr.matches) \
         | set(mgr.systems)
     if m is not None:
-        out |= set(m.zones) | set(m.status_definitions) | set(m.macros) \
+        out |= set(m.zone_names()) | set(m.status_definitions) | set(m.macros) \
             | set(m.tables) | set(m.groups)
     return sorted(str(x) for x in out)
 
@@ -313,7 +313,7 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         if root == "match" and m is not None:
             return _var_paths(m.vars, word)
         if root == "zone" and m is not None:
-            return _var_paths((m.zones.get(binds.get("name", "")) or {})
+            return _var_paths((m.find_zone(binds.get("name", "")) or {})
                               .get("data"), word)
         if root == "system" and slot == "key":
             return sorted(logic.RULES_REGISTRY)
@@ -398,7 +398,7 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         by_root = {
             "macro": m.macros, "table": m.tables, "alias": m.aliases,
             "func": m.formula_functions, "status": m.status_definitions,
-            "zone": m.zones, "watch": m.watchers, "tile": m.tile_templates,
+            "zone": m.zone_names(), "watch": m.watchers, "tile": m.tile_templates,
             "history": m.history.manual_saves,
         }
         if root == "ent" and sub == "group":
