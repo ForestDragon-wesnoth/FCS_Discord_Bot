@@ -23209,6 +23209,25 @@ SCENARIO 781 — Per-item legend labels: hide or rename a unit, tile, zone or co
 !map scene list legend=on
 ?? = corpse: Thug
 ?! corpse: Guard
+!system set default entity_visibility_condition "entity[self].name != 'Hero' or pov_team == 'red'"
+!system set default tile_visibility_condition "tile_x != 3 or pov_team == 'red'"
+!map legend=on as=blue
+?! Hero
+?! # —
+?? v — Big rock
+!map scene list legend=on as=blue
+?! Hero
+?! glyph # =
+!ent set_vars hero team=blue fog_vision_radius=0
+!match fog on
+!map legend=on as=blue
+?? > — Hero
+?? fog (unseen)
+?! Big rock
+?! floor
+!map scene list legend=on as=blue
+?! Big rock
+?! = floor
 
 Expected: Each thing on the map can set what the
 legend calls it: a unit's `legend` var, a tile's `legend` data (or its
@@ -23220,4 +23239,9 @@ zone have no legend line. A text replaces the label: the 2×2 ogre is
 key, never the real unit's label) and "Spy (real)" in the omniscient
 view. ASCII and the image legend (`!map scene list`) agree. The dead
 guard's corpse keeps its `legend` false, so the image legend leaves it
-out, while the thug's corpse is listed as `corpse: Thug`.
+out, while the thug's corpse is listed as `corpse: Thug`. Nothing the
+view can't see is ever listed, label or not: with the hero hidden from
+blue by the visibility rule and the `#` tile hidden by the tile rule,
+blue's legend names neither; with fog on and the (now blue) hero seeing
+only his own cell, blue's legend lists the hero and the fog, and none of
+the fogged rock, pit or zone.

@@ -1526,7 +1526,9 @@ hardcodes**.
   template's, a zone's field (`!zone legend`), a disguise's key, a
   corpse's snapshot var: `false` leaves it out, a text replaces the label;
   `Match.legend_label_*`, shared by both renderers; a disguised unit's
-  label comes only from the disguise) (781), coordinate rulers
+  label comes only from the disguise; both legends are built from what
+  the view actually draws, so nothing hidden, fogged or invisible to the
+  POV is ever listed) (781), coordinate rulers
   (`map_coords`, `!map coords`, stacked column digits), hidden layers (`!map
   layer`, `hide=`), preview / sight marks (`preview_glyph`), viewport.
 - **Viewport** (`viewport_width/height` 28, `viewport_mode` auto = only

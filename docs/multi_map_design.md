@@ -208,6 +208,9 @@ share. An even distribution per map is a loop over the maps.
     - staying per match: the **render mode** (text / image), **colour**
       on/off, the **coordinate rulers** and the **legend**. These are
       table preferences, and one match won't mix art styles.
+  - A legend lists only what its view draws: a map's legend never names
+    anything hidden, fogged or invisible to the POV (already true of the
+    one-map legend, scenario 781; it must stay true per map).
   - Keeping a thing out of the legend for secrecy belongs to that tile /
     unit / zone, never to a map (the per-item `legend` value shipped with
     this design record, scenario 781).
@@ -216,7 +219,8 @@ share. An even distribution per map is a loop over the maps.
   is refused with the current total named. `max_grid_dimension` still
   bounds each map.
 - **`transfer_entity` formula** for cross-match moves (a mutating formula
-  function). `!ent transfer` remains the command form. The journal stores
+  function). It reaches only matches with the same owner as the source:
+  anything wider lets one table spam units into someone else's match. `!ent transfer` remains the command form. The journal stores
   both matches' changes as stored states.
 - **Map names.** Every match starts with one map named `main`. Names follow
   the id rules and are unique within a match. Renaming a map rewrites
@@ -283,8 +287,6 @@ share. An even distribution per map is a loop over the maps.
   - what happens to the interior's units when the map vehicle dies (below)?
   - could a mount slot point at an inner map?
 - **Map vars:** the names of the map-var-name rules.
-- **`transfer_entity`:** which matches it may reach (the original #40
-  wording: only matches with the same owner).
 - **When a map vehicle dies** (user: it must vary per vehicle AND per
   occupant; mount deaths are to be revisited the same way later). The
   cases to cover:
