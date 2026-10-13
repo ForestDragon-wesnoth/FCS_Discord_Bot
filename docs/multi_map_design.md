@@ -1,7 +1,8 @@
 # Multiple maps per match (#40) and nested maps (#164): agreed design
 
-Status: design agreed with the user; nothing is built yet. Each item below
-was decided in chat; §11 lists what is deferred. Read this whole file
+Status: design agreed with the user. Step 1 of the build order (§8, the
+`Map` extraction) is built; the rest is not. Each item below was decided in
+chat; §11 lists what is deferred. Read this whole file
 before starting either feature: every decision here has long-term
 consequences, and the user made each one deliberately.
 
@@ -18,12 +19,12 @@ consequences, and the user made each one deliberately.
 
 ## 1. Model
 
-- **Match and Map split.** Today `Match` fuses the match and its one map. A
-  new `Map` class holds what is spatial:
+- **Match and Map split.** A `Map` holds what is spatial:
   - grid size, tiles and zones;
   - fog memory (`explored`) and fog reveals;
-  - background, borders, hidden layers;
-  - the map display settings (coords, legend, render mode).
+  - the per-map settings of §7 (fog, background, borders, hidden layers)
+    as map vars. Render mode, colour, rulers and the legend stay per match
+    (§7).
 
   `Match` keeps everything else: units, the turn order, rounds, rules,
   passives, definitions, functions, aliases, macros, tables, watchers, match
@@ -276,7 +277,10 @@ share. An even distribution per map is a loop over the maps.
    `map` field. Every spatial function takes its map explicitly. Behaviour
    stays identical, proven by the full regression and the replay
    differential. This step goes in its own PR, with no new features
-   alongside.
+   alongside. **Built:** the grid size, tiles, zones, fog memory and
+   reveals moved to `Map`; the fog toggles, background, borders, hidden
+   layers and camera views stay on the match until step 2 makes them map
+   vars / per-map state (CLAUDE.md §7.8).
 2. **Multiple maps:**
    - `!map new/list/delete/resize/view/set`;
    - the map argument on the placement verbs;

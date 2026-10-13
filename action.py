@@ -631,9 +631,10 @@ class SourceProxy:
 def _check_on_map(match: Any, x: int, y: int) -> None:
     """A location target names a cell of the map (one off it used to run
     the body on a cell nothing can occupy)."""
-    if not match.in_bounds(x, y):
+    mp = match.get_map()
+    if not mp.in_bounds(x, y):
         raise VTTError(f"location ({x},{y}) is off the map "
-                       f"({match.grid_width}x{match.grid_height}).")
+                       f"({mp.size_text()}).")
 
 
 class Coord:
@@ -1387,8 +1388,8 @@ def _check_rollback_fields(preserved_attrs) -> None:
     if _ROLLBACK_FIELDS_CHECKED:
         return
     import dataclasses
-    from logic import Match
-    probe = Match(id="_probe", name="_probe", grid_width=1, grid_height=1,
+    from logic import Match, default_maps
+    probe = Match(id="_probe", name="_probe", maps=default_maps(1, 1),
                   system_name="default")
     carried = probe.to_dict(include_history=False)
     missing = [f.name for f in dataclasses.fields(Match)

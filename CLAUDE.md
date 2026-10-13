@@ -323,8 +323,8 @@ back, load the schema with `ToolSearch` before calling
 
 ### Files (with role)
 
-- **`logic.py`**: the domain model — `Entity`, `Match`, `MatchManager`,
-  `Workspaces`, `Passive`, `ClampSpec`, `SpecialTileTemplate`,
+- **`logic.py`**: the domain model — `Entity`, `Map`, `Match`,
+  `MatchManager`, `Workspaces`, `Passive`, `ClampSpec`, `SpecialTileTemplate`,
   `FormulaFunction`, `GameSystem`, the store helpers (`_own_value`,
   `check_store_path`, `checked_unit_vars`, ...) and the template helpers.
   **`RULES_REGISTRY`** at the top is the single source of truth for every
@@ -1245,6 +1245,25 @@ hardcodes**.
 
 ### 7.8 Geometry, movement and blocking
 
+- **Maps** (`Map`, step 1 of `docs/multi_map_design.md`): a match holds
+  its grids in `Match.maps` (name -> Map, in creation order; a new match
+  has one, `main`, `DEFAULT_MAP_NAME`). A Map is the grid alone: size,
+  tiles, zones (stored per map), fog memory (`explored`) and reveals, with
+  the methods that need nothing else (`in_bounds`, `tile_*`, `zone_*`,
+  `zones_at`, `to_dict` / `from_dict`). Units stay in the match's one pool
+  and name their map in `Entity.map` (set by `spawn(..., map_name=)`;
+  parts, segments, revived corpses and clones take their parent's /
+  corpse's / source's map). Match code that needs units takes the Map it
+  works on: `mp` params, resolved by `map_of(e)` (a unit's map),
+  `get_map(name)` (None = the only map; a match with several refuses,
+  so a call site that forgot its map fails loudly instead of using the
+  wrong one), `_map_for(mp, e)` (given, else the unit's, else the only
+  one). Occupancy, sight, fog, blocking, hooks and rendering all filter
+  units by map; a team sees a map only through its units on it. The
+  command and formula layers still call `get_map()` (step 2 adds `map=`).
+  Corpses: `find_corpse(id)` -> (x, y, corpse, map) on any map,
+  `all_corpses(mp)` one map, `every_corpse()` all of them. Templates,
+  statblocks and summon snapshots strip `map` like x / y.
 - **Grid:** square cells, 1-based; `max_grid_dimension` (default 500, owner
   ceiling) checked on create and resize. `!map resize <w> <h> [anchor]`
   shifts everything coordinate-bearing by the anchor's offset (units, tiles,
