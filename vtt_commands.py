@@ -2336,8 +2336,9 @@ def _resolve_maps(ctx: ReplyContext, m: "Match", spec: Optional[str], *,
     and `all` only where `many`); 2. the map of the unit the command is
     about; 3. the match's only map; 4. the channel's map (`!map use`, else
     the map its board follows). `strict` (broad per-map edits, single
-    placements) refuses to guess the followed map on a match with several
-    maps; a map the host set with `!map use` is no guess."""
+    placements) refuses tier 4 on a match with several maps, `!map use`
+    included (a host who forgot it would edit the wrong map); `map=view`
+    names the channel's map on purpose."""
     if spec is not None:
         spec = spec.strip()
         if spec.lower() == "all":
@@ -2361,10 +2362,6 @@ def _resolve_maps(ctx: ReplyContext, m: "Match", spec: Optional[str], *,
         return [m.map_of(unit)]
     if len(m.maps) == 1:
         return [next(iter(m.maps.values()))]
-    chosen = m.channel_maps.get(ctx.channel_key)
-    if chosen in m.maps:
-        # The host picked this channel's map with `!map use`: no guess.
-        return [m.maps[chosen]]
     if strict:
         raise VTTError(_maps_hint(m, many))
     return [m.channel_map(ctx.channel_key, _view_pov(ctx, m, []))]

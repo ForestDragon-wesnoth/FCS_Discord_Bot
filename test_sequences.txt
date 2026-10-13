@@ -23666,10 +23666,14 @@ SCENARIO 789 — Which map a command means: strict edits and placements, map= li
 !map use cellar
 ?? This channel now uses map `cellar`.
 !tile set 2 2 moss true
+?? This match has 2 maps (`main`, `cellar`): add `map=<name>`, `map=a,b` or `map=all`.
+!tile set 2 2 moss true map=view
 ?? tile (2,2).moss = True
 !ent add rat Rat 3 4 1 2
+?? add `map=<name>`
+!ent add rat Rat 3 4 1 2 map=view
 ?? at (4,1) on `cellar`
-!zone new mud
+!zone new mud map=view
 ?? Created empty zone `mud` on `cellar`.
 !map cell 2 2
 ?? on `cellar`
@@ -23701,9 +23705,10 @@ under a `Map <name>:` line; a map where it fails (a cell off that map)
 says so and the others still run. A placement takes exactly one map. A
 command about a unit acts on that unit's map without asking (`!ent hp`),
 and reads (`!tile info`, `!map cell`, `!map`) use the channel's map, naming
-it. `!map use <name>` sets the channel's map: then edits and placements
-without `map=` go there too (the host chose it), until `!map use clear`
-goes back to following the board. `!map <name>` renders another map. Tab
+it. `!map use <name>` sets the channel's map for reads and renders until
+`!map use clear` goes back to following the board; edits and placements
+stay strict under it (a host who forgot it would edit the wrong map), and
+`map=view` names the channel's map on purpose. `!map <name>` renders another map. Tab
 completes map names after `map=`, after `!map`, `!map use` and as `!ent
 tp`'s map word.
 

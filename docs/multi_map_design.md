@@ -316,14 +316,17 @@ share. An even distribution per map is a loop over the maps.
    maps, two-sided wording, counts, roster grouping, completion filtering.
    **2d** `transfer_entity` and `!match link`.
 
-   Decisions made while building 2a (to confirm with the user):
-   - a map set with `!map use` satisfies strictness (the host chose it);
-     the followed map is still a guess and refuses;
+   Decided after 2a (user):
+   - strict commands stay strict under `!map use` (a host who forgot it
+     would edit the wrong map); `map=view` names the channel's map on
+     purpose;
    - a located body part crossing maps keeps its offset from the anchor,
      and a move where it would land off the map or on a taken cell is
-     refused whole;
+     refused whole (the host rearranges the parts or picks another cell);
    - a board whose actor was removed stays on the actor's last map (a
-     cross-map move updates the record);
+     cross-map move updates the record).
+
+   Built in 2a, not yet confirmed with the user:
    - `map=a,b` / `map=all` fan-outs run every map even when one refuses;
    - `!find` gained a `map:<name>` selector, and `within:` reads its cell
      on that map, else the channel's.

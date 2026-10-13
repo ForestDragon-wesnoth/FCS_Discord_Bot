@@ -1298,8 +1298,9 @@ hardcodes**.
   map > the channel's map (`Match.channel_map`: `!map use <name>`, else
   the followed map). `strict` callers (tile edits, zone creation,
   `!reveal_fog`, setting writes, `!ent add`, `!template spawn`) refuse the
-  followed-map guess with the map list and syntax; a `!map use` choice
-  satisfies them. `many` callers fan out (`_fan_out`: one run per map
+  channel's map with the map list and syntax, `!map use` included (user
+  call: a host who forgot it would edit the wrong map); `map=view` names
+  it on purpose. `many` callers fan out (`_fan_out`: one run per map
   under `Map <name>:`, a map's ❌ doesn't stop the rest); placements take
   one map. Replies name the map on a multi-map match (`_on_map`); so do
   `!ent info` (`{map_shown}` in entity_info_format) and `!ent dump`
