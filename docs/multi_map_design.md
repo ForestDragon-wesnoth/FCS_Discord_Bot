@@ -55,7 +55,7 @@ Resolution order (the "4-tier hierarchy"):
 2. The map of the unit the command or formula is about (`self`, the actor,
    the action's source, the unit a command names).
 3. The match's only map, when it has one.
-4. The channel's map. This is the map set with `!map view <name>` when one
+4. The channel's map. This is the map set with `!map use <name>` when one
    is set; otherwise it is the map the channel's board follows (§5).
    Buttons and browsing never change it.
 
@@ -99,13 +99,19 @@ or `all` and return `[x, y, map]`), `cells_in_rect` / `_area` / `_cone` /
 - The map argument also takes shortcuts: the channel's viewed map (tier 4)
   and "this unit's map". Section 10 lists the open details.
 
-**Zones and hooks (decided).** Zone names are per map: two maps may each
-have a `fire` zone, `!map copy` copies zones without renaming them, and an
-aura moves with its unit to a new map. The zone formula functions
-(`zone_get`, `zone_cells`, ...) therefore follow the unit-less rule above
-and need `map=` once a match has several maps. Inside a tile or zone hook,
-formulas default to the hook's own map (so `tile_get(tile_x, tile_y, ...)`
-works without `map=`), and the hook binds `tile_map` / `zone_map` naming it.
+**Zones and hooks (decided).** Zone names are unique across the whole
+match (the user revised an earlier "per map" answer): a zone lives on one
+map, but its name means that zone everywhere, so the zone functions
+(`zone_get`, `zone_cells`, ...) never need `map=`, and an aura moving with
+its unit to another map never clashes. Creating a zone whose name another
+map already uses is refused. `!map copy` renames the zones it copies and
+says how. Inside a tile or zone hook, formulas default to the hook's own
+map (so `tile_get(tile_x, tile_y, ...)` works without `map=`), and the hook
+binds `tile_map` / `zone_map` naming it.
+
+**The channel's map command (decided):** `!map use <name>` sets it (tier 4)
+and `!map use clear` goes back to following the board; `!map view` keeps
+meaning the camera.
 
 **Scattering across maps: N in total.** `!tile place_random N <kind>
 map=all` (or a list of maps) places N in total, with every eligible cell
@@ -287,8 +293,8 @@ share. An even distribution per map is a loop over the maps.
    differential. This step goes in its own PR, with no new features
    alongside. **Built:** the grid size, tiles, zones, fog memory and
    reveals moved to `Map`; the fog toggles, background, borders, hidden
-   layers and camera views stay on the match until step 2 makes them map
-   vars / per-map state (CLAUDE.md §7.8).
+   layers and camera views became map vars / per-map state in 2a
+   (CLAUDE.md §7.8).
 2. **Multiple maps:**
    - `!map new/list/delete/resize/view/set`;
    - the map argument on the placement verbs;
@@ -298,6 +304,29 @@ share. An even distribution per map is a loop over the maps.
    - `random_*` with `map=`;
    - completion;
    - the POV filtering of map lists.
+
+   Split into PRs: **2a (built)** map management, map vars and the
+   map-var-name rules, `default_map_vars`, command map resolution with
+   strictness and fan-out, `!map use`, board following, cross-map `!ent
+   tp` / `map=` on placements, `!find` / `!foreach` / `!dist` across maps,
+   map-name completion (scenarios 782-793). **2b** formulas (`map=`,
+   `view`, `[x, y, map]` coordinates, scatter, the hook map and
+   `tile_map` / `zone_map`, `map_of`, `entity[x].map`, map var functions,
+   `move_entity` with a map). **2c** channels and boards, unseen and hidden
+   maps, two-sided wording, counts, roster grouping, completion filtering.
+   **2d** `transfer_entity` and `!match link`.
+
+   Decisions made while building 2a (to confirm with the user):
+   - a map set with `!map use` satisfies strictness (the host chose it);
+     the followed map is still a guess and refuses;
+   - a located body part crossing maps keeps its offset from the anchor,
+     and a move where it would land off the map or on a taken cell is
+     refused whole;
+   - a board whose actor was removed stays on the actor's last map (a
+     cross-map move updates the record);
+   - `map=a,b` / `map=all` fan-outs run every map even when one refuses;
+   - `!find` gained a `map:<name>` selector, and `within:` reads its cell
+     on that map, else the channel's.
 3. **Nested maps (#164).**
 
 ## 9. Tests (user requirement)

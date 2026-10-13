@@ -30,11 +30,11 @@ COMMAND_USER: "contextvars.ContextVar[Optional[str]]" = (
     contextvars.ContextVar("vtt_command_user", default=None))
 
 # A line about one unit (a death, a revive) is prefixed with this tag —
-# UNIT_LINE_TAG + "<match>|<unit>|<x>|<y>" + UNIT_LINE_TAG — so the command
+# UNIT_LINE_TAG + "<match>|<unit>|<x>|<y>|<map>" + UNIT_LINE_TAG — so the command
 # layer, which knows the channel's view, can drop it where that view can't
 # see the unit (vtt_commands._filter_unit_lines) and strips it everywhere.
 UNIT_LINE_TAG = "\u2063"
-UNIT_LINE_RE = re.compile("\u2063([^|\u2063]*)\\|([^|\u2063]*)\\|(-?\\d+)\\|(-?\\d+)\u2063")
+UNIT_LINE_RE = re.compile("\u2063([^|\u2063]*)\\|([^|\u2063]*)\\|(-?\\d+)\\|(-?\\d+)\\|([^|\u2063]*)\u2063")
 
 # The workspace (MatchManager) whose command is running: formulas reach the
 # server's saved entity templates through it (summon_template). Set by each
@@ -1383,6 +1383,31 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "zone cells clipped either way (only entities trigger block)."
         ),
     },
+    "match_cell_limit": {
+        "default": 1000000,
+        "schema": {"type": "int", "min": 1, "max": 4000000, "ceiling": True,
+                   "unlimited": -1},
+        "desc": (
+            "Largest total area (width x height summed over every map) a "
+            "match may have. `!map new`, `!map copy` and a growing `!map "
+            "resize` are refused past it, naming the current total. "
+            "max_grid_dimension still bounds each map's sides. Every map "
+            "is saved and copied into each undo snapshot, so this keeps "
+            "one match from growing without bound. Capped by the bot "
+            "owner's ceiling (`!owner ceiling`, default 4000000)."
+        ),
+    },
+    "map_delete_mode": {
+        "default": "refuse",
+        "schema": {"type": "enum", "choices": ["refuse", "kill"]},
+        "desc": (
+            "What `!map delete` does with units still on the map. "
+            "'refuse' (default) lists them and deletes nothing; 'kill' runs "
+            "the kill function (default_kill_function_effects + the death "
+            "pipeline) on each, then deletes the map. Either way the map's "
+            "tiles, zones, corpses and fog memory go with it."
+        ),
+    },
     # ---- Directional / facing-relative geometry ----
     "directional_corner_arc": {
         "default": 30,
@@ -1498,7 +1523,9 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Placeholders: {key} substitutes a value; {?key?}...{/?} renders inner "
             "only if the key is present and truthy. Dotted paths supported: "
             "{inventory.sword.damage}. Built-in keys: id, name, x, y, facing, team, "
-            "initiative, hp, max_hp, status_csv, passives_csv. Any top-level "
+            "initiative, hp, max_hp, status_csv, passives_csv, map (the "
+            "unit's map), map_shown (the same, but empty while the match has "
+            "one map). Any top-level "
             "entity var is also available by name. Use \\n for newlines."
         ),
     },
@@ -1520,7 +1547,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     "entity_info_format": {
         "default": (
             "**{name}** (`{id}`)\\n"
-            "HP: {hp}/{max_hp}   Position: ({x},{y}) facing {facing}"
+            "HP: {hp}/{max_hp}   Position: ({x},{y}){?map_shown?} on "
+            "{map_shown}{/?} facing {facing}"
             "{?team?}   Team: {team}{/?}\\n"
             "{?status_csv?}Status: {status_csv}\\n{/?}"
             "{?passives_csv?}Passives: {passives_csv}\\n{/?}"
@@ -2021,11 +2049,110 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "default": False,
         "schema": {"type": "bool"},
         "desc": (
-            "Whether NEW matches start with fog of war on. This only "
-            "SEEDS a match's per-match fog toggle at creation; flip fog "
-            "live per match with `!match fog on|off` (it's match state, "
-            "not a rule, so a system refresh won't change it). Default "
+            "Whether fog of war is on for a map that doesn't set its own "
+            "fog map var (map_fog_var, default `fog`). Read live: changing "
+            "it reaches every such map. `!match fog on|off [map=]` sets a "
+            "map's own value, which this rule no longer changes. Default "
             "False — fog is opt-in."
+        ),
+    },
+    "map_fog_var": {
+        "default": "fog",
+        "schema": {"type": "str"},
+        "desc": (
+            "Map var holding each map's fog of war switch (on / off; `!match fog on|off`). A map without the var "
+            "uses the fog_enabled_by_default rule, read live, so a system edit reaches every map that "
+            "hasn't set its own value. Set per map with `!map var set "
+            "<path> <value> map=<name>` (or the command that writes it). "
+            "Changing this rule renames the var on every map."
+        ),
+    },
+    "map_fog_memory_var": {
+        "default": "fog_memory",
+        "schema": {"type": "str"},
+        "desc": (
+            "Map var holding each map's fog memory switch (on / off; `!match fog memory on|off`). A map without the var "
+            "uses the fog_memory_enabled_by_default rule, read live, so a system edit reaches every map that "
+            "hasn't set its own value. Set per map with `!map var set "
+            "<path> <value> map=<name>` (or the command that writes it). "
+            "Changing this rule renames the var on every map."
+        ),
+    },
+    "map_background_var": {
+        "default": "background",
+        "schema": {"type": "str"},
+        "desc": (
+            "Map var holding each map's background sprite key (`!map background`). A map without the var "
+            "uses the background_sprite rule, read live, so a system edit reaches every map that "
+            "hasn't set its own value. Set per map with `!map var set "
+            "<path> <value> map=<name>` (or the command that writes it). "
+            "Changing this rule renames the var on every map."
+        ),
+    },
+    "map_background_mode_var": {
+        "default": "background_mode",
+        "schema": {"type": "str"},
+        "desc": (
+            "Map var holding each map's background mode (stretch / tile / center). A map without the var "
+            "uses the background_mode rule, read live, so a system edit reaches every map that "
+            "hasn't set its own value. Set per map with `!map var set "
+            "<path> <value> map=<name>` (or the command that writes it). "
+            "Changing this rule renames the var on every map."
+        ),
+    },
+    "map_borders_var": {
+        "default": "borders",
+        "schema": {"type": "str"},
+        "desc": (
+            "Map var holding each map's grid borders switch (on / off; `!map border on|off`). A map without the var "
+            "uses the show_borders rule, read live, so a system edit reaches every map that "
+            "hasn't set its own value. Set per map with `!map var set "
+            "<path> <value> map=<name>` (or the command that writes it). "
+            "Changing this rule renames the var on every map."
+        ),
+    },
+    "map_border_color_var": {
+        "default": "border_color",
+        "schema": {"type": "str"},
+        "desc": (
+            "Map var holding each map's grid border colour (`!map border color`). A map without the var "
+            "uses the border_color rule, read live, so a system edit reaches every map that "
+            "hasn't set its own value. Set per map with `!map var set "
+            "<path> <value> map=<name>` (or the command that writes it). "
+            "Changing this rule renames the var on every map."
+        ),
+    },
+    "map_border_opacity_var": {
+        "default": "border_opacity",
+        "schema": {"type": "str"},
+        "desc": (
+            "Map var holding each map's grid border opacity 0-100 (`!map border opacity`). A map without the var "
+            "uses the border_opacity rule, read live, so a system edit reaches every map that "
+            "hasn't set its own value. Set per map with `!map var set "
+            "<path> <value> map=<name>` (or the command that writes it). "
+            "Changing this rule renames the var on every map."
+        ),
+    },
+    "map_hidden_layers_var": {
+        "default": "hidden_layers",
+        "schema": {"type": "str"},
+        "desc": (
+            "Map var holding each map's hidden render layers, a list of zones / tiles / entities / fog (`!map layer`). A map without the var "
+            "uses nothing hidden, so a system edit reaches every map that "
+            "hasn't set its own value. Set per map with `!map var set "
+            "<path> <value> map=<name>` (or the command that writes it). "
+            "Changing this rule renames the var on every map."
+        ),
+    },
+    "default_map_vars": {
+        "default": {},
+        "schema": {"type": "dict"},
+        "desc": (
+            "Map of var-path -> default value given to every new map "
+            "(`!map new`, `!map copy`, the first map of a new match), "
+            "filling only vars it lacks. A GM's own map data (darkness, "
+            "gravity) lives here. Merged entry by entry down a system "
+            "chain. Edit via `!defvar map add/remove/list`."
         ),
     },
     "fog_vision_radius_var": {
@@ -2144,8 +2271,9 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "str"},
         "desc": (
             "System-default background sprite KEY, drawn as the BOTTOM layer "
-            "(beneath zones) across the whole grid. A per-match background "
-            "(`!map background <key> [mode]`) overrides this. Empty = none. "
+            "(beneath zones) across the whole grid. A map's own background "
+            "(its `background` map var, map_background_var; `!map "
+            "background <key> [mode] [map=]`) overrides this. Empty = none. "
             "Defaults to `ground_default` (a tiled ground texture from the "
             "sprites folder); if that PNG is missing the renderer paints a "
             "flat ground colour so cells stay visible."
@@ -2159,8 +2287,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "How the background sprite fills the grid: 'stretch' (scale to the "
             "whole map), 'tile' (repeat), or 'center' (one copy centered). "
             "Default for the background_sprite rule (tile, so a small ground "
-            "texture repeats per cell); a per-match background carries its "
-            "own mode."
+            "texture repeats per cell); a map's own background carries its "
+            "own mode (the `background_mode` map var)."
         ),
     },
     "fog_sprite": {
@@ -2243,8 +2371,9 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "above the ground/background but below tiles, zones, and entities "
             "for visual clarity). Color + opacity come from border_color / "
             "border_opacity; a tile may override its own edge via "
-            "`border_color` / `border_opacity` data. Per-match override: "
-            "`!map border on|off`."
+            "`border_color` / `border_opacity` data. A map's own value "
+            "(its `borders` map var, map_borders_var; `!map border on|off "
+            "[map=]`) overrides this rule, which is read live."
         ),
     },
     "border_color": {
@@ -2253,8 +2382,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "desc": (
             "Color of the grid border lines (a name or hex the surface "
             "understands, e.g. 'white' / '#FFFFFF'). Per-tile override: the "
-            "tile's `border_color` data. Per-match override: `!map border "
-            "color <name>`."
+            "tile's `border_color` data. Per-map override (the "
+            "`border_color` map var): `!map border color <name> [map=]`."
         ),
     },
     "border_opacity": {
@@ -2263,7 +2392,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "desc": (
             "Opacity (0-100 percent) of the grid border lines. Default 50 (a "
             "subtle grid). Per-tile override: the tile's `border_opacity` "
-            "data. Per-match override: `!map border opacity <n>`."
+            "data. Per-map override (the `border_opacity` map var): `!map "
+            "border opacity <n> [map=]`."
         ),
     },
     # ---- graphics: sprite Z-LAYER (draw order) per kind ----
@@ -2465,13 +2595,12 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "default": False,
         "schema": {"type": "bool"},
         "desc": (
-            "Whether NEW matches start with fog MEMORY on. Only SEEDS a "
-            "match's per-match memory toggle at creation; flip it live per "
-            "match with `!match fog memory on|off` (match state, survives "
-            "a rule refresh). Default False — explored fog resets to "
-            "current vision each time (no memory). Memory has no effect "
-            "unless fog itself is on (fog_enabled_by_default / !match "
-            "fog)."
+            "Whether fog MEMORY is on for a map that doesn't set its own "
+            "memory map var (map_fog_memory_var, default `fog_memory`); "
+            "read live. `!match fog memory on|off [map=]` sets a map's own "
+            "value. Default False — explored fog resets to current vision "
+            "each time (no memory). Memory has no effect unless fog itself "
+            "is on for that map."
         ),
     },
     "fog_memory_mode": {
@@ -3263,6 +3392,8 @@ def _coerce_rule_value(key: str, raw_value: str):
         # (you can extend later to join the rest of args for multi-word strings)
         if key in VAR_NAME_RULES:
             return check_var_name_rule(key, raw_value)
+        if key in MAP_VAR_NAME_RULES:
+            return check_map_var_name_rule(key, raw_value)
         words = spec.get("word_list")
         if words is not None:
             # A comma list of known words; a typo'd one used to be ignored.
@@ -3344,6 +3475,28 @@ RESERVED_IDS: Set[str] = {"current", "this", "self", "parent"}
 # refuses), so a read can never be ambiguous. Formula writes are refused too;
 # `name` changes via `!ent rename`, x/y via `!ent tp`.
 RESERVED_VAR_PATHS: Tuple[str, ...] = ("x", "y", "name")
+
+
+# Words a map can't be named: `view` and `all` are map VALUES (the channel's
+# viewed map, every map), and the rest are `!map` subcommands or words, so
+# `!map <name>` (render that map) never shadows one. vtt_commands checks at
+# import that every `!map` subcommand is listed here.
+MAP_RESERVED_NAMES = frozenset({
+    "view", "all", "clear", "full", "none",
+    "colors", "cell", "preview", "ent_sight", "background", "border", "mode",
+    "scene", "image", "color", "teamcolor", "resize", "layer", "autoupdate",
+    "legend", "coords", "pan", "center", "new", "list", "delete", "rename",
+    "copy", "use", "var", "fog"})
+
+
+def check_map_name(name: Any) -> None:
+    """Raise unless `name` can name a map: id characters, not reserved."""
+    if not isinstance(name, str) or not ID_RE.fullmatch(name):
+        raise VTTError(
+            f"A map name can use letters, digits, `_` and `-` only (1-40 "
+            f"characters); `{name}` can't be one.")
+    if name.lower() in MAP_RESERVED_NAMES:
+        raise VTTError(f"`{name}` is a reserved word, so it can't name a map.")
 
 
 def check_grid_dimensions(width: Any, height: Any, rules: Dict[str, Any],
@@ -3682,6 +3835,12 @@ HOOK_NAMES: Set[str] = {
     # logic; on_entity_moved is the entity-side complement so a
     # passive can react regardless of which tile is involved.
     "on_entity_moved",
+    # Map change: a unit moved to another map (`!ent tp <id> <x> <y>
+    # <map>`, move_entity(..., map)). Fires on the unit after its
+    # on_entity_moved, with from_map / to_map bound (on_entity_moved has
+    # them too; they are equal for an ordinary move), so a GM who only
+    # cares about map changes needs no test.
+    "on_entity_changed_map",
     # Action usage event. Fires AFTER an action body has run to
     # completion (and after its outer snapshot has been committed). A
     # passive watching this hook sees the final state, not an in-flight
@@ -4641,6 +4800,7 @@ def check_formula_function(name: Any, params: List[Any]) -> None:
 # GameSystem.removed under the same names.
 MERGE_RULES: Dict[str, Optional[str]] = {
     "command_access": None, "default_entity_vars": None,
+    "default_map_vars": None,
     "event_log_format": None, "default_clamps": "path",
     "default_entity_passives": "id",
 }
@@ -4875,9 +5035,10 @@ class GameSystem:
             if k not in RULES_REGISTRY:
                 dropped.append(k)
                 continue
-            if k in VAR_NAME_RULES:
+            if k in VAR_NAME_RULES or k in MAP_VAR_NAME_RULES:
                 try:
-                    check_var_name_rule(k, (v or {}).get("value"))
+                    (check_var_name_rule if k in VAR_NAME_RULES
+                     else check_map_var_name_rule)(k, (v or {}).get("value"))
                 except VTTError:
                     dropped.append(f"{k} (invalid var name "
                                    f"{(v or {}).get('value')!r})")
@@ -5504,8 +5665,10 @@ class Entity:
         return log
 
     # Teleport (absolute move)
-    def tp(self, x: int, y: int, *, fire_hooks: bool = True) -> List[str]:
-        """Teleport this entity to (x, y).
+    def tp(self, x: int, y: int, *, fire_hooks: bool = True,
+           map_name: Optional[str] = None) -> List[str]:
+        """Teleport this entity to (x, y) (of map `map_name`, None = its
+        own map; another map moves the whole body there, Match.move_to_map).
 
         Validates bounds and occupancy, then mutates the position. Tile
         hooks fire (when `fire_hooks=True`, the default) in this order:
@@ -5527,7 +5690,9 @@ class Entity:
         # passenger. The vehicle carries everyone via _restamp_riders_for.
         mover = self._mount_move_redirect()
         if mover is not self:
-            return mover.tp(x, y, fire_hooks=fire_hooks)
+            return mover.tp(x, y, fire_hooks=fire_hooks, map_name=map_name)
+        if map_name is not None and map_name != self.map:
+            return m.move_to_map(self, x, y, map_name, fire_hooks=fire_hooks)
         # Validate the WHOLE destination footprint in one shot: every
         # covered cell in bounds, unoccupied (stackable movers skip
         # occupancy — they may enter cells holding non-stackable
@@ -6298,6 +6463,24 @@ _SEGMENT_LINK_VARS = ("__segment", "__follows", "__seg_path", "__seg_last")
 _ENGINE_STATE_VARS = _SEGMENT_LINK_VARS + ("__part_located", "__part_region",
                                            "__part_destroyed")
 
+def _rename_map_coords(value: Any, old: str, new: str) -> int:
+    """Rewrite every stored [x, y, old] coordinate inside `value` (a var
+    tree) to [x, y, new], in place. Returns how many it rewrote."""
+    n = 0
+    if isinstance(value, dict):
+        for v in value.values():
+            n += _rename_map_coords(v, old, new)
+    elif isinstance(value, list):
+        if (len(value) == 3 and value[2] == old
+                and all(isinstance(c, int) and not isinstance(c, bool)
+                        for c in value[:2])):
+            value[2] = new
+            return 1
+        for v in value:
+            n += _rename_map_coords(v, old, new)
+    return n
+
+
 # -------------------------
 # Map
 # -------------------------
@@ -6336,6 +6519,13 @@ class Map:
     # clock: "round"|"turn"}], cells forced visible to the team regardless of
     # its units' vision (`!reveal_fog`). Saved as row runs.
     fog_reveals: Dict[str, "list"] = field(default_factory=dict)
+    # Map vars: the map's own data (dotted paths, like match vars) and its
+    # settings under the names the map-var-name rules give (fog, background,
+    # borders, hidden layers; Match.map_setting). Serialized.
+    vars: Dict[str, Any] = field(default_factory=dict)
+    # The var names this map's settings use: map-var-name rule -> name, so
+    # a rule change can move the var (Match.sync_map_var_names).
+    var_names: Dict[str, str] = field(default_factory=dict)
 
     def size_text(self) -> str:
         return f"{self.grid_width}x{self.grid_height}"
@@ -6740,6 +6930,8 @@ class Map:
         return {
             "grid_width": self.grid_width,
             "grid_height": self.grid_height,
+            "vars": copy.deepcopy(self.vars),
+            "var_names": dict(self.var_names),
             "tiles": {
                 f"{x},{y}": copy.deepcopy(dat)
                 for (x, y), dat in sorted(self.tiles.items())
@@ -6766,6 +6958,12 @@ class Map:
     def from_dict(name: str, d: Dict[str, Any]) -> "Map":
         mp = Map(name=name, grid_width=int(d["grid_width"]),
                  grid_height=int(d["grid_height"]))
+        raw_vars = d.get("vars")
+        mp.vars = copy.deepcopy(raw_vars) if isinstance(raw_vars, dict) else {}
+        raw_vn = d.get("var_names")
+        mp.var_names = {str(k): str(v) for k, v in raw_vn.items()
+                        if k in MAP_VAR_NAME_RULES and isinstance(v, str)
+                        } if isinstance(raw_vn, dict) else {}
         # Only in-bounds tiles and zone cells are kept: one off the grid
         # could never be reached by a command or formula. deepcopy: a
         # snapshot's tile dict is loaded here, and sharing it would let a
@@ -7004,23 +7202,6 @@ class Match:
     # channel makes the match active there). Persisted with the match.
     bound_channels: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
-    # Per-match fog-of-war toggle. Seeded at match creation from the
-    # `fog_enabled_by_default` rule, then independent of the game system
-    # (toggled live via `!match fog on|off`) — it lives in its OWN field,
-    # NOT in `rules`, so a system rule refresh can't flip it, the same
-    # reasoning as access_overrides. When True (and a channel renders from
-    # a team POV, i.e. pov_team is not None), the engine hides anything in
-    # a cell that team can't currently see (union of its units' vision
-    # radii) and paints the fog_glyph over unseen cells. Persisted.
-    fog_enabled: bool = False
-
-    # Per-match fog MEMORY toggle (only meaningful when fog_enabled).
-    # Seeded at creation from fog_memory_enabled_by_default, then match
-    # state (toggled via `!match fog memory on|off`, survives refresh).
-    # When True, `explored` accumulates every cell each team has seen and
-    # those cells stay revealed (per fog_memory_mode) even out of current
-    # vision. When False, only current vision shows. Persisted.
-    fog_memory: bool = False
     # ---- text-renderer customization ----
     # Per-team text color for the colorized renderer: team-name -> a
     # TEXT_COLORS name. An entity's own `color` var overrides this; absent
@@ -7035,13 +7216,23 @@ class Match:
     color_enabled: bool = True
 
     # ---- map viewport (panning) + auto-legend ----
-    # Per-CHANNEL viewport offset: channel_key -> [x, y], the top-left
-    # anchor of that channel's render window. Auto-created on the first pan
-    # / view command, clamped so the window stays on the grid; only used
-    # when the viewport engages (a grid dimension exceeds its cap and the
-    # surface opts in). Per-channel so different channels pan independently
-    # (the panning analog of per-channel POV). Serialized.
-    channel_views: Dict[str, List[int]] = field(default_factory=dict)
+    # Per-CHANNEL, per-MAP viewport offset: channel_key -> {map name: [x, y]},
+    # the top-left anchor of that channel's render window on that map.
+    # Auto-created on the first pan / view command, clamped so the window
+    # stays on the grid; only used when the viewport engages (a grid
+    # dimension exceeds its cap and the surface opts in). Per-channel so
+    # different channels pan independently (the panning analog of
+    # per-channel POV). Serialized.
+    channel_views: Dict[str, Dict[str, List[int]]] = field(default_factory=dict)
+    # The map each channel set with `!map use <name>` (tier 4 of the
+    # command map hierarchy): channel_key -> map name. A channel without one
+    # follows its board (followed_map). Serialized.
+    channel_maps: Dict[str, str] = field(default_factory=dict)
+    # Who each team acted with last: team (str(team); "" = any team, the
+    # omniscient view) -> [unit id, map name at that turn's start]. Written
+    # at every turn start (_begin_turn); a board follows it (followed_map).
+    # Serialized.
+    last_actors: Dict[str, List[str]] = field(default_factory=dict)
     # Per-match auto-legend toggle (seeded from the map_legend_by_default
     # rule at creation; flip with `!map legend on|off`). When on, a
     # glyph->meaning key is appended under the rendered map. Serialized.
@@ -7073,26 +7264,6 @@ class Match:
     # `last` is runtime edge-state (serialized so a reload doesn't re-fire).
     watchers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
-    # ---- toggleable map layers (114) ----
-    # Names of render layers HIDDEN for this match (persistent, serialized).
-    # Empty = everything drawn. Layers: zones / tiles / entities / fog.
-    # Toggled with `!map layer <name> on|off`; a one-off `!map hide=...`
-    # arg hides extra layers for a single render without storing them.
-    hidden_layers: "set[str]" = field(default_factory=set)
-
-    # ---- graphics: per-match background image ----
-    # None = use the background_sprite rule (if any). Else a dict
-    # {"sprite": <key>, "mode": stretch|tile|center} drawn as the bottom
-    # render-scene layer. Set via `!map background <key> [mode]`. Serialized.
-    background: Optional[Dict[str, Any]] = None
-
-    # ---- graphics: per-match grid-border override ----
-    # Each None = fall through to the show_borders / border_color /
-    # border_opacity rules; a non-None value overrides that rule for THIS
-    # match. Set via `!map border ...`. Serialized.
-    border_show: Optional[bool] = None
-    border_color: Optional[str] = None
-    border_opacity: Optional[int] = None
     # Coordinate rulers: None = the map_coords rule, else this match's
     # override (`!map coords on|off|clear`). Serialized.
     map_coords: Optional[bool] = None
@@ -7301,11 +7472,370 @@ class Match:
         return sorted({n for mp in self.maps.values() for n in mp.zones})
 
     def find_zone(self, name: str) -> Optional[Dict[str, Any]]:
-        """The zone named `name` on the first map that has one, or None."""
+        """The zone named `name` (on whichever map holds it), or None."""
+        mp = self.zone_map(name)
+        return mp.zones[name] if mp is not None else None
+
+    # ---- zones by name ---------------------------------------------------
+    # Zone names are unique across the match (a zone lives on one map, but
+    # its name means that zone everywhere), so every operation on an
+    # existing zone finds its map by name; only CREATING one needs a map
+    # (`mp`, None = the only map).
+    def zone_map(self, name: str) -> Optional["Map"]:
+        """The map holding zone `name`, or None."""
         for mp in self.maps.values():
             if name in mp.zones:
-                return mp.zones[name]
+                return mp
         return None
+
+    def _zone_owner(self, name: str) -> "Map":
+        mp = self.zone_map(name)
+        if mp is None:
+            raise NotFound(f"Zone '{name}' not found.")
+        return mp
+
+    def has_zone(self, name: str) -> bool:
+        return self.zone_map(name) is not None
+
+    def create_zone(self, name: str, mp: Optional["Map"] = None, *,
+                    overwrite: bool = False) -> Dict[str, Any]:
+        """Create an empty zone on map `mp`. Refused when a zone of that
+        name exists on any map (unless overwrite, and only on the same
+        map)."""
+        mp = mp or self.get_map()
+        other = self.zone_map(name)
+        if other is not None and other is not mp:
+            raise DuplicateId(
+                f"Zone '{name}' already exists on map `{other.name}` (zone "
+                f"names are unique across the match).")
+        return mp.create_zone(name, overwrite=overwrite)
+
+    def delete_zone(self, name: str) -> None:
+        self._zone_owner(name).delete_zone(name)
+
+    def _zone_for_write(self, name: str, create: bool,
+                        mp: Optional["Map"]) -> "Map":
+        """The map of zone `name`, creating the zone on `mp` (None = the
+        only map) when it doesn't exist and `create`."""
+        owner = self.zone_map(name)
+        if owner is not None:
+            return owner
+        if not create:
+            raise NotFound(f"Zone '{name}' not found.")
+        owner = mp or self.get_map()
+        self.create_zone(name, owner)
+        return owner
+
+    def zone_add_cell(self, name: str, x: int, y: int, *,
+                      create: bool = True, mp: Optional["Map"] = None) -> bool:
+        return self._zone_for_write(name, create, mp).zone_add_cell(
+            name, x, y, create=False)
+
+    def zone_remove_cell(self, name: str, x: int, y: int) -> bool:
+        return self._zone_owner(name).zone_remove_cell(name, x, y)
+
+    def zone_fill_rect(self, name: str, x1: int, y1: int, x2: int, y2: int,
+                       *, create: bool = True,
+                       mp: Optional["Map"] = None) -> int:
+        return self._zone_for_write(name, create, mp).zone_fill_rect(
+            name, x1, y1, x2, y2, create=False)
+
+    def zone_shift(self, name: str, dx: int, dy: int) -> int:
+        return self._zone_owner(name).zone_shift(name, dx, dy)
+
+    def zone_cell_list(self, name: str) -> List[List[int]]:
+        return self._zone_owner(name).zone_cell_list(name)
+
+    def zone_size(self, name: str) -> int:
+        mp = self.zone_map(name)
+        return mp.zone_size(name) if mp is not None else 0
+
+    def cell_in_zone(self, x: int, y: int, name: str) -> bool:
+        mp = self.zone_map(name)
+        return mp is not None and mp.cell_in_zone(x, y, name)
+
+    def zone_get_path(self, name: str, path: str) -> Any:
+        return self._zone_owner(name).zone_get_path(name, path)
+
+    def zone_has_path(self, name: str, path: str) -> bool:
+        mp = self.zone_map(name)
+        return mp is not None and mp.zone_has_path(name, path)
+
+    def zone_set_path(self, name: str, path: str, value: Any, *,
+                      create: bool = True, mp: Optional["Map"] = None) -> None:
+        self._zone_for_write(name, create, mp).zone_set_path(
+            name, path, value, create=False)
+
+    def zone_del_path(self, name: str, path: str) -> None:
+        self._zone_owner(name).zone_del_path(name, path)
+
+    def zone_clear_data(self, name: str) -> int:
+        return self._zone_owner(name).zone_clear_data(name)
+
+    # ---- map vars and settings --------------------------------------------
+    def map_var_name(self, setting: str) -> str:
+        """The map var name the rules give a map setting (`fog`, ...)."""
+        rule = MAP_SETTING_RULES[setting]
+        return str(self.rules.get(rule, RULES_REGISTRY[rule]["default"]))
+
+    def map_setting(self, mp: "Map", setting: str) -> Any:
+        """Map `mp`'s value for a setting: its map var when set, else the
+        rule named in MAP_VAR_NAME_RULES (read live), else None."""
+        var = self.map_var_name(setting)
+        if var in mp.vars:
+            return mp.vars[var]
+        src = MAP_VAR_NAME_RULES[MAP_SETTING_RULES[setting]][1]
+        return self.rules.get(src) if src else None
+
+    def set_map_setting(self, mp: "Map", setting: str, value: Any) -> None:
+        """Write a map setting into its map var (None removes it, so the
+        rule's value applies again)."""
+        var = self.map_var_name(setting)
+        if value is None:
+            mp.vars.pop(var, None)
+        else:
+            mp.vars[var] = _own_value(value)
+        mp.var_names[MAP_SETTING_RULES[setting]] = var
+
+    @staticmethod
+    def _switch(v: Any) -> bool:
+        """A map var read as on / off (bool, number, or on/off/true/false
+        text)."""
+        if isinstance(v, str):
+            return v.strip().lower() in ("on", "true", "yes", "1")
+        return bool(v)
+
+    def fog_on(self, mp: "Map") -> bool:
+        return self._switch(self.map_setting(mp, "fog"))
+
+    def fog_memory_on(self, mp: "Map") -> bool:
+        return self._switch(self.map_setting(mp, "fog_memory"))
+
+    def hidden_layers_of(self, mp: "Map") -> "set[str]":
+        v = self.map_setting(mp, "hidden_layers")
+        if isinstance(v, str):
+            v = [x.strip() for x in v.split(",")]
+        return {str(x) for x in v if x} if isinstance(v, (list, tuple, set)) \
+            else set()
+
+    def fill_default_map_vars(self, mp: "Map") -> None:
+        """Set up a new map: record the setting var names the rules give
+        (a later rule change renames from them) and fill the vars the
+        default_map_vars rule gives that `mp` lacks."""
+        for rule in MAP_VAR_NAME_RULES:
+            mp.var_names[rule] = str(self.rules.get(
+                rule, RULES_REGISTRY[rule]["default"]))
+        for path, value in (self.rules.get("default_map_vars") or {}).items():
+            cur: Any = mp.vars
+            parts = str(path).split(".")
+            ok = True
+            for key in parts[:-1]:
+                nxt = cur.get(key) if isinstance(cur, dict) else None
+                if nxt is None:
+                    nxt = cur.setdefault(key, {}) if isinstance(cur, dict) else None
+                if not isinstance(nxt, dict):
+                    ok = False
+                    break
+                cur = nxt
+            if ok and isinstance(cur, dict) and parts[-1] not in cur:
+                cur[parts[-1]] = _own_value(value)
+
+    def _map_var_moves(self, mp: "Map", rules: Dict[str, Any]
+                       ) -> List[Tuple[str, str]]:
+        """(old, new) map var renames `rules` would make on `mp`."""
+        out = []
+        for rule in MAP_VAR_NAME_RULES:
+            want = str(rules.get(rule, RULES_REGISTRY[rule]["default"]))
+            have = mp.var_names.get(rule, want)
+            if have != want and have in mp.vars:
+                out.append((have, want))
+        return out
+
+    def map_var_conflicts(self, rules: Dict[str, Any]) -> List[str]:
+        """Map var renames `rules` would make onto a var already set
+        (refused under var_name_collision=refuse)."""
+        return [f"map `{mp.name}`: `{new}` is already set (renaming `{old}`)"
+                for mp in self.maps.values()
+                for old, new in self._map_var_moves(mp, rules)
+                if new in mp.vars]
+
+    def sync_map_var_names(self) -> List[str]:
+        """Move every map's setting vars to the names this match's rules
+        give (a rule change renames them). A var already under the new name
+        follows var_name_collision: `existing` keeps it, otherwise the
+        moved value wins."""
+        notes: List[str] = []
+        keep_existing = str(self.rules.get("var_name_collision",
+                                           "tracked")) == "existing"
+        for mp in self.maps.values():
+            for old, new in self._map_var_moves(mp, self.rules):
+                val = mp.vars.pop(old)
+                if new in mp.vars and keep_existing:
+                    notes.append(f"map `{mp.name}`: kept `{new}`, dropped "
+                                 f"`{old}`.")
+                    continue
+                mp.vars[new] = val
+            for rule in MAP_VAR_NAME_RULES:
+                mp.var_names[rule] = str(self.rules.get(
+                    rule, RULES_REGISTRY[rule]["default"]))
+        return notes
+
+    # ---- map lifecycle -----------------------------------------------------
+    def cells_total(self, skip: Optional[str] = None) -> int:
+        """Summed area of every map (bar `skip`)."""
+        return sum(mp.grid_width * mp.grid_height
+                   for mp in self.maps.values() if mp.name != skip)
+
+    def check_cell_limit(self, extra: int, where: str,
+                         skip: Optional[str] = None) -> None:
+        """Refuse when the maps (bar `skip`) plus `extra` cells would pass
+        the match_cell_limit rule."""
+        try:
+            cap = int(self.rules.get("match_cell_limit", 1000000))
+        except (TypeError, ValueError):
+            cap = 1000000
+        total = self.cells_total(skip)
+        if cap >= 0 and total + extra > cap:
+            raise VTTError(
+                f"{where}: the match's maps would cover {total + extra} cells, "
+                f"over the match_cell_limit of {cap} (now "
+                f"{self.cells_total()}).")
+
+    def add_map(self, name: str, width: int, height: int) -> "Map":
+        """A new empty map, after every existing one."""
+        check_map_name(name)
+        if name in self.maps:
+            raise DuplicateId(f"This match already has a map `{name}`.")
+        for v in (width, height):
+            if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+                raise VTTError("A map's width and height must be whole "
+                               "numbers of at least 1.")
+        check_grid_dimensions(width, height, self.rules, "!map new")
+        self.check_cell_limit(width * height, "!map new")
+        mp = Map(name, width, height)
+        self.fill_default_map_vars(mp)
+        self.maps[name] = mp
+        return mp
+
+    def units_on_map(self, name: str) -> List["Entity"]:
+        """The units standing on map `name`, in insertion order."""
+        return [e for e in self.entities.values() if e.map == name]
+
+    def delete_map(self, name: str) -> List[str]:
+        """Delete map `name` with its tiles, zones, corpses and fog memory.
+        Units on it follow the map_delete_mode rule: refuse (listing them)
+        or kill. The last map can't go. Returns the kill log."""
+        mp = self.get_map(name)
+        if len(self.maps) == 1:
+            raise VTTError(f"`{name}` is this match's only map; a match "
+                           f"needs one.")
+        log: List[str] = []
+        # Sorted: a reloaded match holds its units in id order (files are
+        # written with sorted keys), so dict order would differ in a replay.
+        roots = sorted(e.id for e in self.units_on_map(name) if not e.part_of)
+        if roots:
+            if str(self.rules.get("map_delete_mode", "refuse")) != "kill":
+                ids = ", ".join(f"`{i}`" for i in roots)
+                raise VTTError(
+                    f"Map `{name}` still has unit(s) on it ({ids}). Move them "
+                    f"off first, or set map_delete_mode=kill to kill them.")
+            # Kill until nothing is left on it (a death hook can summon onto
+            # the map); bounded by summon_event_limit like resize.
+            while roots:
+                for eid in roots:
+                    if eid in self.entities:
+                        _, klog = self.kill_entity(eid)
+                        log.extend(klog)
+                roots = sorted(e.id for e in self.units_on_map(name)
+                               if not e.part_of)
+        # A corpse-less death leaves nothing; any unit still naming the map
+        # (a dead part) leaves with it.
+        for e in list(self.units_on_map(name)):
+            if e.id in self.entities:
+                log.extend(e.remove())
+        del self.maps[mp.name]
+        self._forget_map(mp.name)
+        return log
+
+    def _forget_map(self, name: str) -> None:
+        """Drop per-channel state that names map `name`."""
+        for ck in [k for k, v in self.channel_maps.items() if v == name]:
+            del self.channel_maps[ck]
+        for views in self.channel_views.values():
+            if isinstance(views, dict):
+                views.pop(name, None)
+
+    def rename_map(self, old: str, new: str) -> int:
+        """Rename map `old` to `new`: the units on it, stored [x, y, map]
+        values in unit / corpse / match / team / map vars, channel maps,
+        cameras and the followed maps all move to the new name. Returns how
+        many stored coordinates were rewritten."""
+        mp = self.get_map(old)
+        check_map_name(new)
+        if new in self.maps:
+            raise DuplicateId(f"This match already has a map `{new}`.")
+        self.maps = {(new if k == old else k): v for k, v in self.maps.items()}
+        mp.name = new
+        for e in self.entities.values():
+            if e.map == old:
+                e.map = new
+        for ck, v in list(self.channel_maps.items()):
+            if v == old:
+                self.channel_maps[ck] = new
+        for views in self.channel_views.values():
+            if isinstance(views, dict) and old in views:
+                views[new] = views.pop(old)
+        for rec in self.last_actors.values():
+            if isinstance(rec, list) and len(rec) == 2 and rec[1] == old:
+                rec[1] = new
+        n = 0
+        stores: List[Any] = [self.vars, self.team_data]
+        stores += [e.vars for e in self.entities.values()]
+        stores += [m2.vars for m2 in self.maps.values()]
+        for _mp, _x, _y, _cid, corpse in self.every_corpse():
+            for body in [corpse.get("entity")] + list(corpse.get("parts") or []):
+                if isinstance(body, dict):
+                    if body.get("map") == old:
+                        body["map"] = new
+                    stores.append(body.get("vars"))
+        for st in stores:
+            n += _rename_map_coords(st, old, new)
+        return n
+
+    def copy_map(self, name: str, new: str) -> Tuple["Map", Dict[str, str]]:
+        """A copy of map `name` called `new`: its size, tiles (without
+        corpses), zones and map vars; no units, corpses or fog memory.
+        Zone names are unique across the match, so each copied zone gets a
+        new name (`<zone>_<new>`, numbered on a clash); auras (zones bound
+        to a unit) are left out. Returns the map and {old zone: new zone}."""
+        src = self.get_map(name)
+        check_map_name(new)
+        if new in self.maps:
+            raise DuplicateId(f"This match already has a map `{new}`.")
+        self.check_cell_limit(src.grid_width * src.grid_height, "!map copy")
+        mp = Map.from_dict(new, src.to_dict())
+        mp.explored, mp.fog_reveals = {}, {}
+        for key in list(mp.tiles):
+            cell = mp.tiles[key]
+            cell.pop("corpses", None)
+            if not cell:
+                del mp.tiles[key]
+        renamed: Dict[str, str] = {}
+        zones: Dict[str, Dict[str, Any]] = {}
+        taken = set(self.zone_names())
+        for zname, z in mp.zones.items():
+            if z.get("anchor"):
+                continue
+            cand, i = f"{zname}_{new}", 2
+            while cand in taken:
+                cand, i = f"{zname}_{new}_{i}", i + 1
+            taken.add(cand)
+            zones[cand] = z
+            renamed[zname] = cand
+        mp.zones = zones
+        self.fill_default_map_vars(mp)
+        self.maps[new] = mp
+        return mp, renamed
 
     def map_of(self, e: "Entity") -> "Map":
         """The map unit `e` stands on."""
@@ -7365,6 +7895,8 @@ class Match:
             )
         h_kind, v_kind = _RESIZE_ANCHORS[key]
         mp = mp or self.get_map()
+        if new_w * new_h > mp.grid_width * mp.grid_height:
+            self.check_cell_limit(new_w * new_h, "!map resize", skip=mp.name)
         dw, dh = new_w - mp.grid_width, new_h - mp.grid_height
         ox = 0 if h_kind == "left" else (dw if h_kind == "right" else dw // 2)
         oy = 0 if v_kind == "top" else (dh if v_kind == "bottom" else dh // 2)
@@ -7459,10 +7991,10 @@ class Match:
         # framing the same content after a center/edge-anchored resize (the
         # camera is coordinate-bearing too). resolve_viewport re-clamps on
         # read, so an offset that lands off the (resized) grid self-corrects.
-        if self.channel_views:
-            for ck, off in self.channel_views.items():
-                if isinstance(off, (list, tuple)) and len(off) == 2:
-                    self.channel_views[ck] = [off[0] + ox, off[1] + oy]
+        for views in self.channel_views.values():
+            off = views.get(mp.name) if isinstance(views, dict) else None
+            if isinstance(off, (list, tuple)) and len(off) == 2:
+                views[mp.name] = [off[0] + ox, off[1] + oy]
 
         mp.grid_width, mp.grid_height = new_w, new_h
         return ({"offset": (ox, oy), "anchor": key, "killed": killed,
@@ -8854,7 +9386,7 @@ class Match:
         Returns the resulting cell count. Raises NotFound for an unknown
         zone or entity, VTTError on a bad radius/metric or a unit on another
         map. Re-anchoring an already-anchored zone just rebinds."""
-        mp = mp or self.get_map()
+        mp = mp or self._zone_owner(name)
         z = mp._require_zone(name)
         if eid not in self.entities:
             raise NotFound(f"Entity '{eid}' not found.")
@@ -8878,7 +9410,7 @@ class Match:
         """Detach an aura's anchor, leaving its current cells as a static
         zone. Returns True iff the zone was anchored. Raises for an
         unknown zone."""
-        z = (mp or self.get_map())._require_zone(name)
+        z = (mp or self._zone_owner(name))._require_zone(name)
         was = bool(z.get("anchor"))
         z.pop("anchor", None)
         z.pop("anchor_radius", None)
@@ -9476,7 +10008,7 @@ class Match:
                          mp: "Map") -> bool:
         """True iff fog memory is on and `pov_team` has explored (x, y) of
         map `mp`."""
-        if not self.fog_memory or not pov_team:
+        if not self.fog_memory_on(mp) or not pov_team:
             return False
         return (x, y) in mp.explored.get(pov_team, ())
 
@@ -9566,7 +10098,7 @@ class Match:
         """Fog gate for STATIC features (tiles, zones, corpses) and the map
         overlay of map `mp`: visible when fog is off, omniscient, currently
         seen (range + LOS per fog_los), OR (memory on) explored."""
-        if not self.fog_enabled or pov_team is None:
+        if pov_team is None or not self.fog_on(mp):
             return True
         return (self._fog_team_sees(pov_team, x, y, mp)
                 or self._cell_remembered(pov_team, x, y, mp)
@@ -9577,7 +10109,7 @@ class Match:
         """Fog gate for LIVE entities on map `mp`: visible on current vision
         (range + LOS per fog_los); on a remembered cell only when
         fog_memory_mode is 'full'."""
-        if not self.fog_enabled or pov_team is None:
+        if pov_team is None or not self.fog_on(mp):
             return True
         if self._fog_team_sees(pov_team, x, y, mp):
             return True
@@ -9592,14 +10124,14 @@ class Match:
         fog AND fog memory are on. Iterates each alive member's vision-radius
         NEIGHBOURHOOD (not the whole grid) and, when fog_los is on, requires
         a clear line — so explored grows 'as cells are revealed'."""
-        if not self.fog_enabled or not self.fog_memory or not team:
+        if not team:
             return
         use_los = bool(self.rules.get("fog_los", False))
         for e in self.entities.values():
             if not self._vision_member_ok(e, team):
                 continue
             mp = self.maps.get(e.map)
-            if mp is None:
+            if mp is None or not self.fog_on(mp) or not self.fog_memory_on(mp):
                 continue
             seen = mp.explored.setdefault(team, set())
             r = self._vision_radius_of(e)
@@ -9792,9 +10324,9 @@ class Match:
         zone_get/zone_has). See zone_visibility_condition. Under fog a
         zone is revealed if the team sees ANY of its cells (the seen part
         shows; the fog overlay still covers its unseen cells on the map).
-        `mp`: the zone's map (None = the only map)."""
-        if pov_team is not None and self.fog_enabled:
-            mp = mp or self.get_map()
+        `mp`: the zone's map (None = the map holding it)."""
+        mp = mp or self.zone_map(name) or self.get_map()
+        if pov_team is not None and self.fog_on(mp):
             z = mp.zones.get(name)
             cells = z.get("cells", ()) if isinstance(z, dict) else ()
             if cells and not any(
@@ -11177,7 +11709,57 @@ class Match:
         MatchHistory._turn_index. Kept as one helper rather than bumping the
         counter at each site so the two can't drift apart."""
         self.turns_elapsed += 1
+        self._note_actor()
         self.history.record_turn(self)
+
+    def _note_actor(self) -> None:
+        """Record the unit whose turn starts as its team's (and the table's)
+        latest actor, for the boards that follow it (followed_map)."""
+        eid = self.current_entity_id()
+        e = self.entities.get(eid) if eid else None
+        if e is None:
+            return
+        rec = [e.id, e.map]
+        self.last_actors[""] = list(rec)
+        team = self._root_team(e)
+        if team is not None:
+            self.last_actors[str(team)] = list(rec)
+
+    def _root_team(self, e: "Entity") -> Any:
+        """The team of `e`'s root body (a part counts as its parent's)."""
+        root, seen = e, set()
+        while root.part_of and root.part_of in self.entities \
+                and root.id not in seen:
+            seen.add(root.id)
+            root = self.entities[root.part_of]
+        return root.team
+
+    def followed_map(self, pov_team: Optional[str]) -> "Map":
+        """The map a board for `pov_team` (None = omniscient) follows: the
+        map its team's current or latest actor is on now; if that unit is
+        gone, the last map it stood on; before any turn, the map of the
+        team's first unit in turn order; else the first map."""
+        rec = self.last_actors.get("" if pov_team is None else str(pov_team))
+        if rec:
+            e = self.entities.get(rec[0])
+            if e is not None and e.map in self.maps:
+                return self.maps[e.map]
+            if rec[1] in self.maps:
+                return self.maps[rec[1]]
+        if pov_team is not None:
+            for e in self.entities_in_turn_order():
+                if e.map in self.maps and str(self._root_team(e)) == str(pov_team):
+                    return self.maps[e.map]
+        return next(iter(self.maps.values()))
+
+    def channel_map(self, channel_key: Optional[str],
+                    pov_team: Optional[str]) -> "Map":
+        """Tier 4 of the map hierarchy: the map the channel set with `!map
+        use`, else the one its board follows."""
+        name = self.channel_maps.get(channel_key) if channel_key else None
+        if name in self.maps:
+            return self.maps[name]
+        return self.followed_map(pov_team)
 
     # ---- Active Time Battle ------------------------------------------------
     @staticmethod
@@ -12720,17 +13302,108 @@ class Match:
             log.extend(self.check_death(entity_id))
         return log
 
+    def carried_body(self, e: "Entity") -> List["Entity"]:
+        """`e` and everything that travels with it: its part subtree
+        (segments included) and its riders, theirs in turn."""
+        out: List["Entity"] = []
+        seen: Set[str] = set()
+        todo = [e]
+        while todo:
+            u = todo.pop(0)
+            if u.id in seen:
+                continue
+            seen.add(u.id)
+            out.append(u)
+            todo += [p for p in self.entities.values() if p.part_of == u.id]
+            todo += self.vehicle_riders(u.id)
+        return out
+
+    def move_to_map(self, e: "Entity", x: int, y: int, map_name: str, *,
+                    fire_hooks: bool = True) -> List[str]:
+        """Move unit `e` to (x, y) of another map, with its whole body:
+        parts (a located part keeps its offset from the anchor; snake
+        segments are laid behind the head), riders and the auras anchored
+        to any of them. All or nothing: the body's footprint and every
+        located part's cell must fit (in bounds, free, not tp-blocked) on
+        the destination. Exit hooks fire on the old map, enter / stop hooks
+        on the new one, then on_entity_moved and on_entity_changed_map
+        (from_map / to_map bound)."""
+        dest = self.get_map(map_name)
+        src = self.map_of(e)
+        if dest is src:
+            return e.tp(x, y, fire_hooks=fire_hooks)
+        body = self.carried_body(e)
+        ids = tuple(u.id for u in body)
+        self._validate_placement(e, x, y, "tp", dest)
+        located = [p for p in body if p is not e and p.vars.get("__part_located")
+                   and not p.vars.get("__segment") and not p.is_mounted]
+        offsets = {p.id: (x + p.x - e.x, y + p.y - e.y) for p in located}
+        for p in located:
+            px, py = offsets[p.id]
+            for cx, cy in self.entity_cells(p, px, py):
+                if not dest.in_bounds(cx, cy):
+                    raise OutOfBounds(
+                        f"part `{p.id}` would land at ({cx},{cy}), outside "
+                        f"map `{dest.name}` ({dest.size_text()}).")
+                if not p.is_cell_stackable and self.cell_occupant(
+                        cx, cy, ids, dest) is not None:
+                    raise Occupied(f"part `{p.id}` would land on ({cx},{cy}) "
+                                   f"of map `{dest.name}`, which is taken.")
+        log: List[str] = []
+        old_x, old_y = e.x, e.y
+        old_cells = self.entity_cells(e)
+        if fire_hooks:
+            log.extend(self.fire_footprint_tile_exit(e.id, old_cells, [], src))
+            log.extend(self.fire_footprint_zone_exit(e.id, old_cells, [], src))
+            if e.id not in self.entities:
+                return log
+        # Auras anchored to anything in the body move to the new map (zone
+        # names are unique across the match, so they can't clash).
+        moving = set(ids)
+        for zname in [n for n, z in src.zones.items()
+                      if isinstance(z, dict) and z.get("anchor") in moving]:
+            dest.zones[zname] = src.zones.pop(zname)
+        for u in body:
+            u.map = dest.name
+        # A board following a unit stays on its last map if it then goes.
+        for rec in self.last_actors.values():
+            if rec and rec[0] in moving:
+                rec[1] = dest.name
+        for p in located:
+            p.move_to(*offsets[p.id])
+        e.move_to(x, y)
+        new_cells = self.entity_cells(e)
+        if fire_hooks:
+            log.extend(self.fire_footprint_tile_enter(e.id, [], new_cells, dest))
+            log.extend(self.fire_footprint_tile_stop(e.id, new_cells, dest))
+            log.extend(self.fire_footprint_zone_enter(e.id, [], new_cells,
+                                                      True, dest))
+        if e.id not in self.entities:
+            return log
+        log.extend(self.fire_entity_moved(e.id, old_x, old_y, x, y,
+                                          from_map=src.name))
+        if fire_hooks and e.id in self.entities:
+            log.extend(self.fire_hook(
+                "on_entity_changed_map", target_ids=[e.id],
+                extras={"from_map": src.name, "to_map": dest.name}))
+        return log
+
     def fire_entity_moved(
         self, entity_id: str,
         from_x: int, from_y: int, to_x: int, to_y: int,
+        from_map: Optional[str] = None,
     ) -> List[str]:
         """Fire on_entity_moved passives for an entity that just changed
-        position. Context bindings: from_x / from_y / to_x / to_y. The
-        entity-side complement of tile on_enter / on_exit hooks — a
-        passive can react to "any movement" without caring which tile."""
+        position. Context bindings: from_x / from_y / to_x / to_y and
+        from_map / to_map (`from_map` defaults to the unit's map: the same
+        for an ordinary move). The entity-side complement of tile on_enter
+        / on_exit hooks — a passive can react to "any movement" without
+        caring which tile."""
         e = self.entities.get(entity_id)
         if e is None:
             return []
+        if from_map is None:
+            from_map = e.map
         # Re-stamp any aura anchored to this entity so it rides along with
         # the move (before on_entity_moved passives fire, so they observe
         # the repositioned aura). Like zone_shift, the restamp just moves
@@ -12760,11 +13433,17 @@ class Match:
         extras = {
             "from_x": from_x, "from_y": from_y,
             "to_x": to_x, "to_y": to_y,
+            "from_map": from_map, "to_map": e.map,
             "hook_name": "on_entity_moved",
         }
         ctx = EvalCtx(this=this_id, target=entity_id, extras=extras)
-        self.log_event("move", entity=entity_id, name=e.name,
-                       from_x=from_x, from_y=from_y, to_x=to_x, to_y=to_y)
+        if from_map != e.map:
+            self.log_event("move", entity=entity_id, name=e.name,
+                           from_x=from_x, from_y=from_y, to_x=to_x, to_y=to_y,
+                           from_map=from_map, to_map=e.map)
+        else:
+            self.log_event("move", entity=entity_id, name=e.name,
+                           from_x=from_x, from_y=from_y, to_x=to_x, to_y=to_y)
         log: List[str] = []
         for p in self._firing_passives(entity_id):
             if p.when == "on_entity_moved":
@@ -13073,7 +13752,8 @@ class Match:
         return out
 
     def spawn_template(self, name: str, template: Dict[str, Any], x: int, y: int,
-                       near_radius: Optional[int] = None) -> Tuple[str, List[str]]:
+                       near_radius: Optional[int] = None,
+                       mp: Optional["Map"] = None) -> Tuple[str, List[str]]:
         """Spawn a saved template at (x, y) (or the nearest free cell within
         `near_radius`): the unit through summon_entity — id minted from the
         template name (`guardsman`, `guardsman2`, ...), summon budget,
@@ -13091,7 +13771,7 @@ class Match:
             root["name"] = name
         try:
             new_id, log = self.summon_entity(root, x, y, id_prefix=name,
-                                             near_radius=near_radius)
+                                             near_radius=near_radius, mp=mp)
             e = self.entities.get(new_id)
             if e is not None and template.get("facing") \
                     and template.get("facing") != e.facing:
@@ -14145,7 +14825,7 @@ class Match:
         self._death_processing += 1
         # Capture identity/position now — after e.remove() the entity is
         # detached, so the log event must read these up front.
-        dead_name, dead_x, dead_y = e.name, e.x, e.y
+        dead_name, dead_x, dead_y, dead_map = e.name, e.x, e.y, e.map
         dead_vars = copy.deepcopy(e.vars)
         try:
             log = self.fire_hook("on_death", target_ids=[entity_id])
@@ -14156,7 +14836,7 @@ class Match:
                 self.log_event("death", entity=entity_id, name=dead_name,
                                x=dead_x, y=dead_y)
                 self._announce("death_message_format", entity_id, dead_name,
-                               dead_x, dead_y, dead_vars)
+                               dead_x, dead_y, dead_vars, map_name=dead_map)
                 return log
             result = self._effective_death_result(e)
             if result == "corpse":
@@ -14177,7 +14857,7 @@ class Match:
             self.log_event("death", entity=entity_id, name=dead_name,
                            x=dead_x, y=dead_y)
             self._announce("death_message_format", entity_id, dead_name,
-                           dead_x, dead_y, dead_vars)
+                           dead_x, dead_y, dead_vars, map_name=dead_map)
         finally:
             self._death_processing = max(0, self._death_processing - 1)
         return log
@@ -14185,7 +14865,8 @@ class Match:
     _MSG_FMT_RE = re.compile(r"\{([\w.]+)\}")
 
     def _announce(self, rule: str, eid: str, name: str, x: Any, y: Any,
-                  unit_vars: Dict[str, Any], part_of: str = "") -> None:
+                  unit_vars: Dict[str, Any], part_of: str = "",
+                  map_name: Optional[str] = None) -> None:
         """Show the `rule` line (death_message_format /
         revive_message_format) for unit `eid`, tagged for the channel-view
         filter, through surface_log (the running command shows it last)."""
@@ -14209,8 +14890,8 @@ class Match:
                 cur = cur[seg]
             return str(cur)
         text = self._MSG_FMT_RE.sub(sub, fmt)
-        self.surface_log([f"{UNIT_LINE_TAG}{self.id}|{eid}|{x}|{y}"
-                          f"{UNIT_LINE_TAG}{text}"])
+        self.surface_log([f"{UNIT_LINE_TAG}{self.id}|{eid}|{x}|{y}|"
+                          f"{map_name or ''}{UNIT_LINE_TAG}{text}"])
 
     def kill_entity(self, eid: str) -> Tuple[bool, List[str]]:
         """Unconditionally kill `eid`, bypassing the death CONDITION so
@@ -14411,7 +15092,7 @@ class Match:
         self.log_event("part_destroyed", entity=p.id, name=p.name,
                        part_of=p.part_of or "")
         self._announce("death_message_format", p.id, p.name, p.x, p.y,
-                       p.vars, part_of=p.part_of or "")
+                       p.vars, part_of=p.part_of or "", map_name=p.map)
         log = self.fire_hook("on_death", target_ids=[p.id])
         # A destroyed limb LINGERS attached (it doesn't route through
         # Entity.remove), so resolve its anchored auras here too — same
@@ -14924,7 +15605,7 @@ class Match:
         if e.id in self.entities:
             self.log_event("revive", entity=e.id, name=e.name)
             self._announce("revive_message_format", e.id, e.name, e.x, e.y,
-                           e.vars, part_of=e.part_of or "")
+                           e.vars, part_of=e.part_of or "", map_name=e.map)
         death_log: List[str] = []
         if e.id in self.entities:
             death_log = self.check_death(e.id)
@@ -15009,9 +15690,12 @@ class Match:
         return notes
 
     def var_name_conflicts(self, rules: Dict[str, Any]) -> List[str]:
-        """What renaming every unit and corpse to `rules`' var names would
-        refuse (var_name_collision=refuse), without changing anything."""
+        """What renaming every unit and corpse (and every map's setting
+        vars) to `rules`' var names would refuse (var_name_collision=
+        refuse), without changing anything."""
         out: List[str] = []
+        if str(rules.get("var_name_collision", "tracked")) == "refuse":
+            out += self.map_var_conflicts(rules)
         dicts = [e.to_dict() for e in self.entities.values()]
         for _mp, _x, _y, _cid, corpse in self.every_corpse():
             dicts += [d for d in [corpse.get("entity")]
@@ -16143,6 +16827,9 @@ class Match:
             "id": self.id,
             "name": self.name,
             "maps": {name: mp.to_dict() for name, mp in self.maps.items()},
+            # Files are written with sorted keys: the creation order (the
+            # first map is the default board) is kept here.
+            "map_order": list(self.maps),
             "entities": {eid: e.to_dict() for eid, e in self.entities.items()},
             # COPY, don't alias: Entity.remove mutates turn_order IN PLACE
             # (m.turn_order.remove(id)), so storing the live list by reference
@@ -16183,7 +16870,6 @@ class Match:
             "tables": dict(self.tables),
             "template_pins": copy.deepcopy(self.template_pins),
             "watchers": copy.deepcopy(self.watchers),
-            "hidden_layers": sorted(self.hidden_layers),
             "outcome": copy.deepcopy(self.outcome),
             "team_data": copy.deepcopy(self.team_data),
             "team_passives": {
@@ -16197,18 +16883,16 @@ class Match:
             "cohosts": list(self.cohosts),
             "access_overrides": dict(self.access_overrides),
             "bound_channels": copy.deepcopy(self.bound_channels),
-            "fog_enabled": bool(self.fog_enabled),
-            "fog_memory": bool(self.fog_memory),
             "team_colors": dict(self.team_colors),
             "color_enabled": bool(self.color_enabled),
-            "channel_views": {k: [int(v[0]), int(v[1])]
-                              for k, v in self.channel_views.items()
-                              if isinstance(v, (list, tuple)) and len(v) == 2},
+            "channel_views": {
+                ck: {mn: [int(v[0]), int(v[1])] for mn, v in views.items()
+                     if isinstance(v, (list, tuple)) and len(v) == 2}
+                for ck, views in self.channel_views.items()
+                if isinstance(views, dict)},
+            "channel_maps": dict(self.channel_maps),
+            "last_actors": {k: list(v) for k, v in self.last_actors.items()},
             "map_legend_enabled": bool(self.map_legend_enabled),
-            "background": copy.deepcopy(self.background),
-            "border_show": self.border_show,
-            "border_color": self.border_color,
-            "border_opacity": self.border_opacity,
             "map_coords": self.map_coords,
             "render_mode": self.render_mode,
             "paused": copy.deepcopy(self.paused),
@@ -16219,9 +16903,11 @@ class Match:
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "Match":
-        maps = {str(name): Map.from_dict(str(name), md)
-                for name, md in (d.get("maps") or {}).items()
-                if isinstance(md, dict)}
+        raw_maps = d.get("maps") or {}
+        order = [str(n) for n in (d.get("map_order") or []) if n in raw_maps]
+        order += [str(n) for n in raw_maps if str(n) not in order]
+        maps = {name: Map.from_dict(name, raw_maps[name]) for name in order
+                if isinstance(raw_maps[name], dict)}
         if not maps:
             raise VTTError("A match needs at least one map.")
         m = Match(
@@ -16341,9 +17027,6 @@ class Match:
             str(k): copy.deepcopy(v) for k, v in raw_watch.items()
             if isinstance(k, str) and isinstance(v, dict)
         } if isinstance(raw_watch, dict) else {}
-        raw_layers = d.get("hidden_layers", []) or []
-        m.hidden_layers = {str(x) for x in raw_layers
-                           if isinstance(x, str)} if isinstance(raw_layers, (list, tuple, set)) else set()
         raw_outcome = d.get("outcome")
         m.outcome = copy.deepcopy(raw_outcome) if isinstance(raw_outcome, dict) else None
         raw_td = d.get("team_data", {}) or {}
@@ -16391,8 +17074,6 @@ class Match:
             k: (copy.deepcopy(v) if isinstance(v, dict) else {})
             for k, v in raw_bound.items() if isinstance(k, str)
         } if isinstance(raw_bound, dict) else {}
-        m.fog_enabled = bool(d.get("fog_enabled", False))
-        m.fog_memory = bool(d.get("fog_memory", False))
         raw_tc = d.get("team_colors", {})
         m.team_colors = {
             str(k): str(v) for k, v in raw_tc.items()
@@ -16401,21 +17082,23 @@ class Match:
         m.color_enabled = bool(d.get("color_enabled", True))
         raw_views = d.get("channel_views", {})
         m.channel_views = {
-            str(k): [int(v[0]), int(v[1])] for k, v in raw_views.items()
-            if isinstance(k, str) and isinstance(v, (list, tuple)) and len(v) == 2
+            str(ck): {str(mn): [int(v[0]), int(v[1])]
+                      for mn, v in views.items()
+                      if mn in m.maps and isinstance(v, (list, tuple))
+                      and len(v) == 2}
+            for ck, views in raw_views.items() if isinstance(views, dict)
         } if isinstance(raw_views, dict) else {}
+        raw_cm = d.get("channel_maps", {})
+        m.channel_maps = {str(k): str(v) for k, v in raw_cm.items()
+                          if v in m.maps} if isinstance(raw_cm, dict) else {}
+        raw_la = d.get("last_actors", {})
+        m.last_actors = {
+            str(k): [str(v[0]), str(v[1])] for k, v in raw_la.items()
+            if isinstance(v, (list, tuple)) and len(v) == 2
+        } if isinstance(raw_la, dict) else {}
         m.map_legend_enabled = bool(d.get("map_legend_enabled", False))
-        raw_bg = d.get("background")
-        m.background = copy.deepcopy(raw_bg) if isinstance(raw_bg, dict) else None
-        bs = d.get("border_show")
-        m.border_show = bool(bs) if isinstance(bs, bool) else None
         mc = d.get("map_coords")
         m.map_coords = mc if isinstance(mc, bool) else None
-        bcol = d.get("border_color")
-        m.border_color = bcol if isinstance(bcol, str) and bcol else None
-        bop = d.get("border_opacity")
-        m.border_opacity = int(bop) if isinstance(bop, (int, float)) \
-            and not isinstance(bop, bool) else None
         rm = d.get("render_mode")
         m.render_mode = rm if rm in ("text", "image") else "text"
         pz = d.get("paused")
@@ -16828,24 +17511,19 @@ class Match:
         k = z.get("sprite")
         return k if isinstance(k, str) and k else None
 
-    def background_layer(self) -> Optional[Dict[str, Any]]:
-        """The resolved background as {sprite, mode}, or None: the per-match
-        `background` field > the background_sprite rule (+ background_mode)."""
-        bg = self.background
-        if isinstance(bg, dict):
-            key = bg.get("sprite")
-            if isinstance(key, str) and key:
-                mode = bg.get("mode")
-                return {"sprite": key,
-                        "mode": mode if mode in ("stretch", "tile", "center")
-                        else "stretch"}
-        key = str(self.rules.get("background_sprite", "")).strip()
-        if key:
-            mode = str(self.rules.get("background_mode", "stretch"))
-            return {"sprite": key,
-                    "mode": mode if mode in ("stretch", "tile", "center")
-                    else "stretch"}
-        return None
+    def background_layer(self, mp: Optional["Map"] = None
+                         ) -> Optional[Dict[str, Any]]:
+        """Map `mp`'s resolved background as {sprite, mode}, or None: its
+        background / background_mode map vars, else the background_sprite /
+        background_mode rules."""
+        mp = mp or self.get_map()
+        key = str(self.map_setting(mp, "background") or "").strip()
+        if not key:
+            return None
+        mode = str(self.map_setting(mp, "background_mode") or "stretch")
+        return {"sprite": key,
+                "mode": mode if mode in ("stretch", "tile", "center")
+                else "stretch"}
 
     def tile_glyph(self, x: int, y: int, mp: "Map") -> Optional[str]:
         """The glyph for the tile at (x, y) of map `mp`: instance > template
@@ -16977,7 +17655,7 @@ class Match:
         if not enabled or not self.viewport_engaged(mp):
             return None
         vw, vh = self._viewport_dims(mp)
-        off = self.channel_views.get(channel_key)
+        off = (self.channel_views.get(channel_key) or {}).get(mp.name)
         ox, oy = (off[0], off[1]) if isinstance(off, (list, tuple)) and \
             len(off) == 2 else (1, 1)
         vx, vy = self._clamp_view(ox, oy, vw, vh, mp)
@@ -16990,7 +17668,7 @@ class Match:
         mp = mp or self.get_map()
         vw, vh = self._viewport_dims(mp)
         vx, vy = self._clamp_view(x, y, vw, vh, mp)
-        self.channel_views[channel_key] = [vx, vy]
+        self.channel_views.setdefault(channel_key, {})[mp.name] = [vx, vy]
         return vx, vy
 
     def center_view(self, channel_key: str, cx: int, cy: int,
@@ -17008,15 +17686,22 @@ class Match:
         (clamped) anchor. Returns the new (clamped) anchor."""
         mp = mp or self.get_map()
         vw, vh = self._viewport_dims(mp)
-        off = self.channel_views.get(channel_key)
+        off = (self.channel_views.get(channel_key) or {}).get(mp.name)
         ox, oy = (off[0], off[1]) if isinstance(off, (list, tuple)) and \
             len(off) == 2 else (1, 1)
         ox, oy = self._clamp_view(ox, oy, vw, vh, mp)
         return self.set_view(channel_key, ox + int(dx), oy + int(dy), mp)
 
-    def clear_view(self, channel_key: str) -> None:
-        """Forget a channel's viewport offset (snaps back to top-left)."""
-        self.channel_views.pop(channel_key, None)
+    def clear_view(self, channel_key: str,
+                   mp: Optional["Map"] = None) -> None:
+        """Forget a channel's viewport offset on map `mp` (None = the only
+        map; snaps back to top-left)."""
+        mp = mp or self.get_map()
+        views = self.channel_views.get(channel_key)
+        if isinstance(views, dict):
+            views.pop(mp.name, None)
+            if not views:
+                del self.channel_views[channel_key]
 
     def render_ascii(self, pov_team: Optional[str] = None,
                      colorize: bool = False,
@@ -17034,14 +17719,15 @@ class Match:
         memo is torn down in `finally` and is never held across a mutation, so
         it can't go stale. See _render_ascii_impl for the actual rendering.
 
-        `hidden_layers` (None = use this match's persistent self.hidden_layers)
+        `hidden_layers` (None = the map's hidden_layers setting)
         suppresses render layers by name: zones / tiles / entities / fog.
 
         `marks` (a set of (x, y) cells, used by `!map preview`) paints
         `mark_glyph` on each of those cells that isn't showing a unit.
 
         `coords` (None = coords_on()) adds the coordinate rulers."""
-        hidden = self.hidden_layers if hidden_layers is None else hidden_layers
+        mp = mp or self.get_map()
+        hidden = self.hidden_layers_of(mp) if hidden_layers is None else hidden_layers
         if coords is None:
             coords = self.coords_on()
         prev = self._vision_memo
@@ -17214,7 +17900,7 @@ class Match:
 
         # Fog overlay (last): an unrevealed cell shows fog_glyph and no
         # color (fog hides whatever tint was there).
-        if self.fog_enabled and pov_team is not None and "fog" not in hidden:
+        if pov_team is not None and self.fog_on(mp) and "fog" not in hidden:
             fog_glyph = str(self.rules.get("fog_glyph", "?"))
             fg = fog_glyph[0] if fog_glyph else "."
             for yy in range(1, gh + 1):
@@ -17340,7 +18026,7 @@ class Match:
         see _render_scene_impl). Activates the read-only fog-sight memo for
         the duration, exactly like render_ascii."""
         mp = mp or self.get_map()
-        hidden = self.hidden_layers if hidden_layers is None else hidden_layers
+        hidden = self.hidden_layers_of(mp) if hidden_layers is None else hidden_layers
         prev = self._vision_memo
         if prev is None:
             self._vision_memo = {}
@@ -17497,22 +18183,13 @@ class Match:
         return bool(self.rules.get("map_coords", True))
 
     def _scene_borders(self, mp: "Map") -> Dict[str, Any]:
-        """Border (grid-line) config for the scene: the show_borders /
-        border_color / border_opacity rules, with per-MATCH overrides
-        (border_show / border_color / border_opacity fields) winning over the
-        rule, plus per-TILE `border_color` / `border_opacity` data overrides
-        (keyed 'x,y')."""
-        # Per-match override (field) > rule.
-        if self.border_show is not None:
-            show = bool(self.border_show)
-        else:
-            show = bool(self.rules.get("show_borders", True))
-        if isinstance(self.border_color, str) and self.border_color:
-            color = self.border_color
-        else:
-            color = str(self.rules.get("border_color", "white"))
-        raw_op = self.border_opacity if self.border_opacity is not None \
-            else self.rules.get("border_opacity", 100)
+        """Border (grid-line) config for the scene: map `mp`'s borders /
+        border_color / border_opacity map vars (else the show_borders /
+        border_color / border_opacity rules), plus per-TILE `border_color` /
+        `border_opacity` data overrides (keyed 'x,y')."""
+        show = self._switch(self.map_setting(mp, "borders"))
+        color = str(self.map_setting(mp, "border_color") or "white")
+        raw_op = self.map_setting(mp, "border_opacity")
         try:
             op = int(raw_op)
         except (TypeError, ValueError):
@@ -17658,7 +18335,7 @@ class Match:
 
         # Fog: cells the POV team can't see (always drawn last / on top).
         fog: List[Dict[str, Any]] = []
-        if self.fog_enabled and pov_team is not None and "fog" not in hidden:
+        if pov_team is not None and self.fog_on(mp) and "fog" not in hidden:
             fog_sprite = str(self.rules.get("fog_sprite", "")).strip() or None
             try:
                 fog_op = int(self.rules.get("fog_opacity", 60))
@@ -17677,7 +18354,7 @@ class Match:
             vp = {"x": vx, "y": vy, "w": vw, "h": vh}
         return {
             "grid_width": mp.grid_width, "grid_height": mp.grid_height,
-            "viewport": vp, "background": self.background_layer(),
+            "viewport": vp, "background": self.background_layer(mp),
             "placements": placements, "fog": fog,
             "borders": self._scene_borders(mp),
             "coords": self.coords_on(),
@@ -18631,6 +19308,36 @@ VAR_NAME_RULES = ("hp_var", "max_hp_var", "turnorder_var", "team_var",
                   "overlay_var")
 
 
+# Map-var-name rules: rule -> (the setting it names, the rule giving the
+# value on a map without that var, or None for "nothing"). Each map stores
+# its settings as map vars under these names (Match.map_setting), and
+# remembers the names it uses (Map.var_names), so a rule change renames
+# the var on every map (Match.sync_map_var_names).
+MAP_VAR_NAME_RULES: Dict[str, Tuple[str, Optional[str]]] = {
+    "map_fog_var": ("fog", "fog_enabled_by_default"),
+    "map_fog_memory_var": ("fog_memory", "fog_memory_enabled_by_default"),
+    "map_background_var": ("background", "background_sprite"),
+    "map_background_mode_var": ("background_mode", "background_mode"),
+    "map_borders_var": ("borders", "show_borders"),
+    "map_border_color_var": ("border_color", "border_color"),
+    "map_border_opacity_var": ("border_opacity", "border_opacity"),
+    "map_hidden_layers_var": ("hidden_layers", None),
+}
+# setting -> its rule
+MAP_SETTING_RULES: Dict[str, str] = {v[0]: k for k, v in MAP_VAR_NAME_RULES.items()}
+
+
+def check_map_var_name_rule(key: str, value: Any) -> str:
+    """A MAP_VAR_NAME_RULES value: one top-level map var name (an
+    identifier that isn't a keyword or an engine `__` name)."""
+    v = str(value or "")
+    if not v.isidentifier() or keyword.iskeyword(v) or v.startswith("__"):
+        raise VTTError(
+            f"Setting '{key}' names a map var: one word of letters, digits "
+            f"and _ (not starting with a digit or __), got '{v}'.")
+    return v
+
+
 def check_var_name_rule(key: str, value: Any) -> str:
     """A VAR_NAME_RULES value: one top-level var name the engine's formulas
     can spell as `entity[X].<name>` (the vital accessors read a top-level
@@ -19328,11 +20035,11 @@ class MatchManager:
         # channels that ACTIVATE the match, which happens on `match use` /
         # `match bind` (the creator's `match new` is followed by a `use`).
         m.owner = owner
-        # Seed the per-match fog toggle from the system default. After this
-        # it's match state (toggled via `!match fog`), independent of the
-        # rule — a refresh won't flip it.
-        m.fog_enabled = bool(rules.get("fog_enabled_by_default", False))
-        m.fog_memory = bool(rules.get("fog_memory_enabled_by_default", False))
+        # The first map's default vars; its settings read the rules live
+        # until a command writes them (Match.map_setting).
+        for mp in m.maps.values():
+            m.fill_default_map_vars(mp)
+        m.sync_map_var_names()
         # Seed the per-match auto-legend toggle from the system default
         # (then match state, flipped via `!map legend on|off`).
         m.map_legend_enabled = bool(rules.get("map_legend_by_default", False))
@@ -19492,7 +20199,7 @@ class MatchManager:
         rename notes."""
         old = m.rules or {}
         m.rules = self._build_rules_dict(self.systems[m.system_name])
-        notes = m.sync_all_var_names()
+        notes = m.sync_all_var_names() + m.sync_map_var_names()
         # A changed turn-order rule re-sorts the order (as a changed
         # initiative does, under turnorder_change_policy); a match loaded
         # from disk has no rules to compare yet and keeps its saved order.
@@ -19551,6 +20258,7 @@ class MatchManager:
         m.cohosts = [c for c in m.cohosts if c != m.owner]
         m.bound_channels = {}
         m.channel_views = {}
+        m.channel_maps = {}
         m.pending_requests = {}
         # A pause belongs to the table that paused it; the copy starts live.
         m.paused = None

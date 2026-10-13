@@ -18448,7 +18448,7 @@ SCENARIO 676 — words past the end of a command's usage are refused
 !system rules spaceship
 ?? Unexpected `spaceship`
 !map layer list x
-?? usage: `!map layer <list | <name> <on|off>>`
+?? usage: `!map layer <list | <name> <on|off>> [map=<map>]`
 !map pna up
 ?? `pna` isn't a `!map` subcommand either
 !ent status a add burn level=3
@@ -21001,7 +21001,7 @@ SCENARIO 738 — Tab completion: commands, subcommands, literal words and option
 ?tab "!ent rm h"
 ?? healer  hero
 ?tab "!template spawn guard 1 1 "
-?? candidates: count=  near=
+?? candidates: count=  map=  near=
 ?tab "!map pan "
 ?? up_left
 ?! as=
@@ -21029,7 +21029,7 @@ follow the command's usage strings: `!ent` subcommands, unit ids for
 `<id>` (`!ent rm` is an alias spelling of `remove`), the literal words a
 form allows (`max` for `!ent hp`, `cw`/`ccw`/`toward` and the directions
 for `!ent face`, the `!undo` kinds, `!help`'s subcommands of `ent`), and
-`key=` options where the form allows one (`count=` and `near=` after a template spawn's
+`key=` options where the form allows one (`count=`, `map=` and `near=` after a template spawn's
 coordinates; `!map pan` takes none). After ` ; ` in `!batch`, the next
 command completes. A line without `!` or inside an open quote gets nothing;
 an alias completes like the command it expands to.
@@ -23257,3 +23257,709 @@ blue by the visibility rule and the `#` tile hidden by the tile rule,
 blue's legend names neither; with fog on and the (now blue) hero seeing
 only his own cell, blue's legend lists the hero and the fog, and none of
 the fogged rock, pit or zone.
+
+SCENARIO 782 — Maps: create, list, rename, delete (refuse or kill the units on it)
+----------------------------------------------------------------------------------
+
+!match new mm Manor 8 6
+!match use mm
+!map list
+?? - `main`: 8x6, 0 units ← this channel
+!map new cellar 6 4
+?? Created map `cellar` (6x4) on **Manor** (2 maps).
+!map new cellar 3 3
+?? already has a map `cellar`
+!map new all 3 3
+?? `all` is a reserved word
+!map new view 3 3
+?? `view` is a reserved word
+!map new legend 3 3
+?? `legend` is a reserved word
+!map new pit 0 4
+?? at least 1
+!ent add hero Hero 10 2 2 5 map=main
+!ent add rat Rat 4 3 3 1 map=cellar
+!ent add bat Bat 4 5 2 1 map=cellar
+!map list
+?? - `cellar`: 6x4, 2 units
+!map cellar
+?? 🗺️ map `cellar` (6x4)
+!ent info rat
+?? Position: (3,3) on cellar
+!map rename cellar vault
+?? Renamed map `cellar` to `vault`.
+!ent info rat
+?? Position: (3,3) on vault
+!map delete vault
+?? still has unit(s) on it (`bat`, `rat`)
+!find ids
+?? hero bat rat
+!system set default map_delete_mode kill
+!map delete vault
+?? Deleted map `vault`.
+?? **Bat** (`bat`) died.
+!find ids
+?? hero
+?! rat
+!map list
+?! vault
+!ent info hero
+?! on main
+!map delete main
+?? `main` is this match's only map
+
+Expected: `!map new <name> <w> <h>` adds a map; names are unique per match
+and the `!map` subcommand words plus `all` / `view` / `clear` / `full` /
+`none` are reserved (so `!map <name>` can render a map by name). `!map
+list` counts each map's units and marks the one this channel shows.
+`!ent info` names the unit's map while the match has several. A rename
+moves the units with it. `!map delete` refuses while units stand on the map
+(`map_delete_mode` refuse, the default) and names them; under `kill` the
+units die through the kill function (death lines shown), then the map goes.
+With one map left, `!ent info` stops naming it, and the last map can't be
+deleted.
+
+SCENARIO 783 — match_cell_limit caps the summed area of a match's maps
+----------------------------------------------------------------------
+
+!match new cl Limits 6 5
+!match use cl
+!system set default match_cell_limit 50
+!map new loft 4 5
+?? Created map `loft` (4x5)
+!map new attic 3 3
+?? !map new: the match's maps would cover 59 cells, over the match_cell_limit of 50 (now 50).
+!map copy loft loft2
+?? !map copy: the match's maps would cover 70 cells
+!map resize 5 5 map=loft
+?? !map resize: the match's maps would cover 55 cells, over the match_cell_limit of 50 (now 50).
+!map resize 2 2 map=loft
+?? Resized map `loft` to 2x2
+!map new attic 3 3
+?? Created map `attic` (3x3)
+!map list
+?? - `loft`: 2x2
+?? - `attic`: 3x3
+!system set default match_cell_limit -1
+!map new hall 20 20
+?? Created map `hall` (20x20)
+
+Expected: `match_cell_limit` (default 1,000,000, -1 = unlimited, capped
+by the owner's ceiling) bounds the area of all of a match's maps together,
+so one match can't grow without end (every map rides in each undo
+snapshot). `!map new`, `!map copy` and a growing `!map resize` are refused
+past it, naming the total they would reach and the current one; a shrink
+frees room for another map.
+
+SCENARIO 784 — !map copy: terrain, zones and map vars; zone names stay unique across the match
+------------------------------------------------------------------------------------------------
+
+!match new zc Zones 6 4
+!match use zc
+!map new crypt 5 4
+!zone new pool
+?? This match has 2 maps (`main`, `crypt`): add `map=<name>`.
+!zone new pool map=crypt
+?? Created empty zone `pool` on `crypt`.
+!zone add pool 1 1
+?? Added (1,1) to `pool`
+!zone add pool 2 1 map=main
+?? Zone `pool` is on map `crypt`.
+!zone new pool map=main
+?? already exists on map `crypt` (zone names are unique across the match)
+!zone set pool depth 3
+!tile set 2 2 rubble true map=crypt
+!map var set damp true map=crypt
+!ent add ghoul Ghoul 5 3 3 2 map=crypt
+!zone anchor stench ghoul 1
+?? Zone 'stench' not found.
+!zone new stench map=crypt
+!zone anchor stench ghoul 1
+!map copy crypt crypt2
+?? Copied map `crypt` to `crypt2` (5x4)
+?? Zones renamed (zone names are unique across the match): `pool` → `pool_crypt2`.
+?? Auras stay with their units: `stench`.
+!zone list
+?? - `pool` on `crypt`: 1 cell(s)
+?? - `pool_crypt2` on `crypt2`: 1 cell(s)
+!zone info pool_crypt2
+?? "depth": 3
+!tile info 2 2 map=crypt2
+?? "rubble": true
+!map var get damp map=crypt2
+?? map `crypt2` var `damp` = True
+!map list
+?? - `crypt2`: 5x4, 0 units
+!map copy crypt crypt3
+?? `pool` → `pool_crypt3`
+!zone rename pool_crypt3 pool_crypt2
+?? already exists
+
+Expected: Zones live on one map, but a zone's name means that zone across
+the whole match: creating one needs a map on a match with several, adding
+cells works on its own map only, and a name another map already uses is
+refused. `!map copy <name> <new>` copies the size, tiles (corpses left out),
+zones and map vars; units stay behind. Every copied zone gets a new name
+(`<zone>_<new map>`), listed in the reply, and an aura (a zone anchored to a
+unit) stays with its unit, also listed. Renaming a zone onto a taken name is
+refused like creating one.
+
+SCENARIO 785 — !map rename rewrites the stored [x, y, map] coordinates that name the map
+---------------------------------------------------------------------------------------
+
+!match new rn Rename 6 4
+!match use rn
+!map new cellar 5 3
+!ent add hero Hero 10 2 2 5 map=main
+!eval "entity[hero].mark = [3, 2, 'cellar']"
+!eval "entity[hero].trail = [[1, 1, 'cellar'], [2, 2, 'main'], [4, 3]]"
+!eval "match_var_set('spot', [5, 1, 'cellar'])"
+!eval "team_set('red', 'base', [1, 3, 'cellar'])"
+!map rename cellar vault
+?? Renamed map `cellar` to `vault` (4 stored coordinate(s) updated).
+!assert "get(entity[hero].mark, 2) == 'vault'"
+!assert "get(get(entity[hero].trail, 0), 2) == 'vault'"
+!assert "get(get(entity[hero].trail, 1), 2) == 'main'"
+!assert "len(get(entity[hero].trail, 2)) == 2"
+!assert "get(match_var_get('spot'), 2) == 'vault'"
+!assert "get(team_get('red', 'base'), 2) == 'vault'"
+!map rename vault main
+?? already has a map `main`
+!map rename vault all
+?? `all` is a reserved word
+
+Expected: A coordinate that names its map is a list `[x, y, map]`. Renaming
+a map rewrites every such list naming it, in unit vars, match vars and
+team data (the reply counts them), and leaves plain `[x, y]` pairs and
+coordinates on other maps alone. Renaming onto an existing map or a
+reserved word is refused.
+
+SCENARIO 786 — Map vars: !map var on one map or several; default_map_vars fills new maps
+-----------------------------------------------------------------------------------------
+
+!match new mv MapVars 6 4
+!match use mv
+!defvar map add light.level 2
+?? Default map var `light.level` = 2 on system `default`
+!defvar map list
+?? - `light.level` = 2
+!map new cave 5 5
+!map var list map=cave
+?? - `light` = {'level': 2}
+!map var list
+?? No vars set on map `main`.
+!map var set gravity 0.5
+?? This match has 2 maps (`main`, `cave`): add `map=<name>`, `map=a,b` or `map=all`.
+!map var set gravity 0.5 map=cave
+?? map `cave` var `gravity` = 0.5
+!map var set light.level 0 map=cave
+!map var get light.level map=cave
+?? map `cave` var `light.level` = 0
+!map var get gravity map=main
+?? Map var 'gravity' is not set on `main`.
+!map var set gravity.x 1 map=cave
+?? cannot set a nested key under it
+!map var set wet true map=all
+?? Map `main`:
+?? map `main` var `wet` = True
+?? Map `cave`:
+?? map `cave` var `wet` = True
+!map var del gravity map=all
+?? Map `main`:
+?? Map var 'gravity' is not set on `main`.
+?? Map `cave`:
+?? Removed map `cave` var `gravity`.
+!map var del wet map=main,cave
+!map var list map=main
+?? No vars set on map `main`.
+!defvar map remove light.level
+!map new pit 2 2
+!map var list map=pit
+?? No vars set on map `pit`.
+!as player pat
+!map var list map=cave
+?? Vars of map `cave`
+!map var set x 1 map=cave
+?? needs host approval
+!as host
+
+Expected: A map holds free-form vars (`!map var set|get|del|list`),
+dotted paths like unit vars. Writes are per-map edits: on a match with
+several maps they need `map=<name>`, `map=a,b` or `map=all`, and several
+maps run the edit once each, under a `Map <name>:` line, each map reporting
+its own refusal (deleting a var only one map has removes it there and says
+the other lacks it). A read without `map=` uses the channel's map (here
+`main`, the map the board follows). The
+`default_map_vars` rule (`!defvar map add|remove|list`, admin) fills the
+vars a NEW map lacks; it doesn't touch existing maps. Players may read map
+vars; a write is queued for a host like other host commands.
+
+SCENARIO 787 — Map settings are map vars: fog per map, borders, background; the rule is the live default
+--------------------------------------------------------------------------------------------------------
+
+!match new ms Settings 6 4
+!match use ms
+!map new cellar 5 3
+!ent add knight Knight 10 1 1 9 map=main
+!ent set_vars knight team=red fog_vision_radius=1
+!ent add rogue Rogue 10 2 2 7 map=cellar
+!ent set_vars rogue team=blue fog_vision_radius=1
+!ent add mage Mage 10 5 3 5 map=cellar
+!ent set_vars mage team=red fog_vision_radius=1
+!match fog on
+?? This match has 2 maps
+!match fog on map=cellar
+?? Fog of war **on** for map `cellar`.
+!match fog
+?? `main` fog off, memory off, `cellar` fog on, memory off.
+!map var list map=cellar
+?? - `fog` = True
+!match info
+?? maps `main` 6x4, `cellar` 5x3 (fog)
+!map cellar as=red
+?? 1 ? ? ? ? ?
+?? 3 ? ? ? . <
+!map main as=red
+?? 1 v . . . . .
+!map cellar as=blue
+?? 2 . > . ? ?
+!reveal_fog red at 1 1 1
+?? This match has 2 maps
+!reveal_fog red at 1 1 1 map=cellar
+!map cellar as=red
+?? 1 . . ? ? ?
+!reveal_fog list
+?? - `red` on `cellar`: 4 cell(s) [permanent]
+!map var set fog false map=cellar
+!map cellar as=red
+?? 1 . . . . .
+!map var del fog map=cellar
+!system set default fog_enabled_by_default true
+!match fog
+?? `main` fog on, memory off, `cellar` fog on, memory off.
+!match fog off map=main
+!system set default fog_enabled_by_default false
+!match fog
+?? `main` fog off, memory off, `cellar` fog off, memory off.
+!map border off map=main
+?? Grid borders OFF for map `main`.
+!map var get borders map=main
+?? = False
+!map background stone map=cellar
+?? Background sprite `stone` (stretch) on `cellar`.
+!map var list map=cellar
+?? - `background` = 'stone'
+?? - `background_mode` = 'stretch'
+!map layer zones off map=cellar
+!map var get hidden_layers map=cellar
+?? zones
+!map scene map=main
+?? background=ground_default
+!map scene map=cellar
+?? background=stone
+
+Expected: Every per-map display setting is a map var: fog and fog memory
+(`!match fog [memory] on|off map=`), grid borders (`!map border`),
+background (`!map background`), hidden layers (`!map layer`). Changing
+one is a per-map edit, so a match with several maps names the map. A map
+without the var follows the rule (`fog_enabled_by_default`,
+`fog_memory_enabled_by_default`, `show_borders`, `border_color`,
+`border_opacity`, `background_sprite`, `background_mode`), read live: a
+rule change reaches every map that doesn't set its own value, while a map
+that set one keeps it. Fog is per map: red sees the cellar only around its
+mage, and blue only around its rogue; the main map has no fog. Reveals are
+per map too (`!reveal_fog ... map=`, listed with their map).
+
+SCENARIO 788 — Map-var-name rules: a setting's var renames on every map; collisions follow var_name_collision
+--------------------------------------------------------------------------------------------------------------
+
+!match new vn VarNames 6 4
+!match use vn
+!map new cellar 5 3
+!match fog on map=cellar
+!defvar map add fog false
+!map var list map=cellar
+?? - `fog` = True
+!system set default map_fog_var shroud
+?? `default`.map_fog_var = 'shroud'
+?? moved `fog` → `shroud` on 1 map(s); the system's default map vars follow.
+!map var list map=cellar
+?? - `shroud` = True
+?! `fog`
+!defvar map list
+?? - `shroud` = False
+!match fog
+?? `cellar` fog on
+!system set default map_fog_var fog_memory
+?? `fog_memory` is already the map var of `map_fog_memory_var`
+!system set default map_fog_var 2fog
+?? names a map var
+!map var set fog 1 map=cellar
+!system set default var_name_collision refuse
+!system set default map_fog_var fog
+?? `map_fog_var` stays `shroud`: vn: map `cellar`: `fog` is already set (renaming `shroud`)
+!map var list map=cellar
+?? - `shroud` = True
+!system set default var_name_collision existing
+!system set default map_fog_var fog
+!map var list map=cellar
+?? - `fog` = 1
+?! shroud
+!match fog
+?? `cellar` fog on
+!system unset default map_fog_var
+!system set default map_fog_var lit
+!system unset default map_fog_var
+?? moved `lit` → `fog`
+!map new attic 2 2
+!map var list map=attic
+?? - `fog` = False
+
+Expected: Each per-map setting reads the map var its rule names
+(`map_fog_var`, `map_fog_memory_var`, `map_background_var`,
+`map_background_mode_var`, `map_borders_var`, `map_border_color_var`,
+`map_border_opacity_var`, `map_hidden_layers_var`; defaults `fog`, ...).
+Changing the rule moves the var on every map of the matches on that system
+(and on its inheritors), and the system's `default_map_vars` key follows.
+Two settings can't share one var, and a name must be one plain word. When
+the new name is already set on a map, `var_name_collision` decides: refuse
+changes nothing and names the map; existing keeps the map's var under the
+new name (the old one is dropped). `!system unset` moves the var back to
+the inherited name like any rename.
+
+SCENARIO 789 — Which map a command means: strict edits and placements, map= lists, !map use
+--------------------------------------------------------------------------------------------
+
+!match new st Strict 6 4
+!match use st
+!map new cellar 5 3
+!tile set 1 1 lava true
+?? This match has 2 maps (`main`, `cellar`): add `map=<name>`, `map=a,b` or `map=all`.
+!tile fill 1 1 9 9 wet true map=all
+?? Map `main`:
+?? Set `wet` = True on 24 tile(s) (fill 1,1 → 9,9). (57 off-grid cell(s) skipped)
+?? Map `cellar`:
+?? Set `wet` = True on 15 tile(s)
+!tile set 6 4 deep true map=main,cellar
+?? Map `main`:
+?? tile (6,4).deep = True
+?? Map `cellar`:
+?? ❌ (6,4) outside 5x3
+!tile info 6 4 map=cellar
+?? tile (6,4): no data.
+!ent add bat Bat 3 1 1 2
+?? This match has 2 maps (`main`, `cellar`): add `map=<name>`.
+!ent add bat Bat 3 1 1 2 map=all
+?? `map=all` names every map, but this acts on one
+!ent add bat Bat 3 1 1 2 map=main,cellar
+?? This acts on one map
+!ent add bat Bat 3 1 1 2 map=cellar
+?? at (1,1) on `cellar`
+!ent hp bat -1
+?? Damaged `bat` by 1.
+!zone new mud
+?? add `map=<name>`
+!tile info 1 1
+?? "wet": true
+!map cell 1 1
+?? on `main`
+!map use cellar
+?? This channel now uses map `cellar`.
+!tile set 2 2 moss true
+?? tile (2,2).moss = True
+!ent add rat Rat 3 4 1 2
+?? at (4,1) on `cellar`
+!zone new mud
+?? Created empty zone `mud` on `cellar`.
+!map cell 2 2
+?? on `cellar`
+?? moss
+!map
+?? map `cellar`
+!map use clear
+!tile set 3 3 x 1
+?? This match has 2 maps
+!map main
+?? map `main`
+!ent tp bat 2 2 nowhere
+?? Could not find a map named `nowhere`
+?tab "!tile set 1 1 x 1 map="
+?? candidates: map=cellar  map=main
+?tab "!map ce"
+?? cell  cellar  center
+?tab "!ent tp bat 2 2 c"
+?? → '!ent tp bat 2 2 cellar '
+?tab "!map use "
+?? cellar  clear  main
+
+Expected: On a match with several maps, a command that edits broadly
+(tile set / fill / line / clear, zone cell edits, `!reveal_fog`, `!tile
+place_random`, setting writes) or places one thing (`!ent add`, `!template
+spawn`, `!zone new`) refuses to guess and names the maps and the syntax.
+Per-map edits take `map=<name>`, `map=a,b` or `map=all` and run once per map
+under a `Map <name>:` line; a map where it fails (a cell off that map)
+says so and the others still run. A placement takes exactly one map. A
+command about a unit acts on that unit's map without asking (`!ent hp`),
+and reads (`!tile info`, `!map cell`, `!map`) use the channel's map, naming
+it. `!map use <name>` sets the channel's map: then edits and placements
+without `map=` go there too (the host chose it), until `!map use clear`
+goes back to following the board. `!map <name>` renders another map. Tab
+completes map names after `map=`, after `!map`, `!map use` and as `!ent
+tp`'s map word.
+
+SCENARIO 790 — Boards follow the acting unit's map, per team view
+----------------------------------------------------------------
+
+!match new fw Follow 6 4
+!match use fw
+!map new cellar 5 3
+!ent add knight Knight 10 1 1 9 map=main
+!ent set_var knight team red
+!ent add rogue Rogue 10 2 2 7 map=cellar
+!ent set_var rogue team blue
+!ent add mage Mage 10 3 3 5 map=cellar
+!ent set_var mage team red
+!map use
+?? This channel follows its board (now map `main`).
+!as view blue
+!map use
+?? (now map `cellar`)
+!map
+?? map `cellar`
+!as view omniscient
+!turn next
+?? Knight
+!turn next
+?? Rogue
+!map use
+?? (now map `cellar`)
+!as view red
+!map use
+?? (now map `main`)
+!as view omniscient
+!turn next
+?? Mage
+!as view red
+!map use
+?? (now map `cellar`)
+!as view omniscient
+!ent tp mage 2 1 main
+!as view red
+!map use
+?? (now map `main`)
+!as view omniscient
+!ent remove mage
+!as view red
+!map use
+?? (now map `main`)
+!as view omniscient
+!map use cellar
+!as view red
+!map
+?? map `cellar`
+!as view omniscient
+!map use clear
+?? This channel follows its board again (now map `main`).
+
+Expected: Without `!map use`, a channel shows the map its board follows:
+the map the view's team acted on last (each turn start records the acting
+unit for its team and for the omniscient view), taken from where that unit
+stands NOW (a teleport carries the board along), or, if the unit is gone,
+the last map it stood on (red's board stays on main after the mage, who
+acted in the cellar and then went to main, is removed). Before any turn a team view follows its first unit in
+turn order (blue → the rogue's cellar), and the omniscient view the first
+map. Each team view follows its own team: after the rogue's turn the
+omniscient board shows the cellar while red's still shows the knight's
+main map. `!map use` pins the channel's map for every view until `!map use
+clear`.
+
+SCENARIO 791 — Cross-map !ent tp carries the whole body: footprint, located part, rider, aura, snake; hooks on both maps
+-------------------------------------------------------------------------------------------------------------------------
+
+!match new xm CrossMap 12 8
+!match use xm
+!map new cellar 8 6
+!ent add ogre Ogre 30 2 2 5 map=main
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!part add ogre oarm Arm 10 10
+!part locate oarm 4 2
+!ent set_var ogre slots.back.capacity 1
+!ent add imp Imp 5 8 8 3 map=main
+!mount imp ogre back
+!zone new stink map=main
+!zone anchor stink ogre 1
+!ent add worm Worm 10 6 6 2 map=main
+!part segment worm w0 Seg0 5 5
+!part segment worm w1 Seg1 5 5
+!tile hook add 2 2 on_exit "entity[self].left_main = 1" map=main
+!tile hook add 2 3 on_enter "entity[self].entered = tile_x * 10 + tile_y" map=cellar
+!gpassive add hop on_entity_changed_map "entity[self].went = from_map + '>' + to_map"
+!gpassive add mv on_entity_moved "entity[self].moved = from_map + '>' + to_map"
+!ent add block Block 5 1 6 1 map=cellar
+!ent tp ogre 1 5 cellar
+?? already occupied
+!ent tp ogre 7 3 cellar
+?? part `oarm` would land at (9,3), outside map `cellar` (8x6).
+!find map:cellar ids
+?? block
+?! ogre
+!ent tp ogre 2 3 cellar
+?? Teleported `ogre` to (2,3) on map `cellar` (from `main`).
+!assert "entity[ogre].went == 'main>cellar' and entity[ogre].moved == 'main>cellar'"
+!assert "entity[ogre].left_main == 1 and entity[ogre].entered == 23"
+!assert "entity[oarm].x == 4 and entity[oarm].y == 3"
+!ent info oarm
+?? on cellar
+!ent info imp
+?? Position: (2,3) on cellar
+!zone list
+?? - `stink` on `cellar`: 16 cell(s) — aura→`ogre` r1
+!map cellar
+?? 3 . > > > . . . .
+!find map:main ids
+?? worm w0 w1
+!ent tp worm 7 4 cellar
+?? on map `cellar` (from `main`)
+!find map:cellar ids
+?? ogre
+?? worm
+?? w0
+?? w1
+!find map:main count
+?? **0** matches.
+!ent tp ogre 5 2 cellar
+?? Teleported `ogre` to (5,2).
+!assert "entity[ogre].moved == 'cellar>cellar' and entity[ogre].went == 'main>cellar'"
+!ent tp ogre 3 1 main
+?? on map `main` (from `cellar`)
+!assert "entity[ogre].went == 'cellar>main'"
+!zone list
+?? - `stink` on `main`
+
+Expected: `!ent tp <id> <x> <y> <map>` moves a unit to another map with
+everything attached to it: its W×H footprint, body parts (a located part
+keeps its offset from the anchor, a snake's segments are laid behind the
+head), riders (here a hidden rider in the ogre's back slot) and the auras
+anchored to any of them, which move to the new map's zones. It's all or
+nothing: a body that doesn't fit, or a located part that would land off
+the map or on a taken cell, refuses the whole move and nothing changes.
+(A same-map teleport leaves a located part where it stands, so its offset
+from the anchor, and where it lands on the next map change, follows.) Exit hooks fire on the old map (`on_exit` at
+(2,2) of main), enter / stop hooks on the new one (`on_enter` at (2,3)
+of the cellar), then `on_entity_moved` and `on_entity_changed_map`, both
+with `from_map` / `to_map` bound; an ordinary move on one map binds both
+to that map and fires no on_entity_changed_map.
+
+SCENARIO 792 — !dist, !find and !foreach across maps: map: selector, within: on one map, $map
+-----------------------------------------------------------------------------------------------
+
+!match new df Queries 6 4
+!match use df
+!map new cellar 5 3
+!ent add knight Knight 10 1 1 9 map=main
+!ent add rogue Rogue 10 2 2 7 map=cellar
+!ent add mage Mage 10 3 2 5 map=cellar
+!dist knight rogue
+?? ❌ `knight` is on map `main` and `rogue` on `cellar`: units on different maps have no distance.
+!dist rogue mage
+?? 📏 `rogue` → `mage` on `cellar`: **1** (square_radius)
+!dist knight 3 3
+?? 📏 `knight` → (3,3) on `main`: **2**
+!dist knight 3 3 map=cellar
+?? ❌ `knight` is on map `main`, not `cellar`.
+!dist 1 1 3 3 map=cellar
+?? (1,1) → (3,3) on `cellar`
+!find within:2:2:1 ids
+?? knight
+?! rogue
+!find within:2:2:1 map:cellar ids
+?? rogue mage
+!find map:cellar ids
+?? rogue mage
+!find !map:cellar ids
+?? knight
+?! rogue
+!find map:main|cellar count
+?? **3** matches.
+!find map:nowhere
+?? Could not find a map named `nowhere`
+!find near:rogue:9 ids
+?? rogue mage
+?! knight
+!find map:main map:cellar within:1:1:9 count
+?? **0** matches.
+!foreach map:cellar ; ent set_var $id home $map
+?? `mage` vars.home = 'cellar'
+!assert "entity[rogue].home == 'cellar' and entity[mage].home == 'cellar'"
+!map use cellar
+!find within:2:2:1 ids
+?? rogue mage
+
+Expected: Units on different maps have no distance: `!dist` refuses
+naming both maps, and replies name the map on a match with several. A
+cell given with a unit is on that unit's map; bare cells use the channel's
+map or `map=`. `!find` / `!foreach` take a `map:<name>` selector (with
+`!` and `|` like the others); `near:<eid>:<r>` matches only units on that
+unit's map, and `within:<x>:<y>:<r>` reads its cell on the map a `map:`
+word names, else on the channel's map (main here until `!map use cellar`).
+Two different `map:` words match nothing (a unit is on one map).
+`!foreach` substitutes `$map` with each unit's map.
+
+SCENARIO 793 — Clone and template spawn onto a map; maps, map vars and the channel's map survive a restart and undo
+--------------------------------------------------------------------------------------------------------------------
+
+!match new cp Copies 6 4
+!match use cp
+!map new cellar 5 3
+!ent add knight Knight 10 1 1 9 map=main
+!ent clone knight squire 2 1
+?? Cloned `knight` → `squire` at (2,1) on `main`.
+!ent clone knight shade 1 1 map=cellar
+?? Cloned `knight` → `shade` at (1,1) on `cellar`.
+!ent clone knight ghost 6 4 map=cellar
+?? ❌ (6,4) outside 5x3 on `cellar`.
+!ent info shade
+?? on cellar
+!template save knight knightling
+!template spawn knightling 3 3
+?? This match has 2 maps
+!template spawn knightling 3 3 map=cellar
+?? on `cellar`
+!find map:cellar ids
+?? knightling shade
+!ent dump knightling
+?? Position: (3, 3) on `cellar`
+!map var set damp 1 map=cellar
+!map use cellar
+!as restart
+!map use
+?? This channel uses map `cellar`.
+!map var get damp map=cellar
+?? = 1
+!map list
+?? - `cellar`: 5x3, 2 units ← this channel
+!map delete cellar
+?? still has unit(s)
+!system set default map_delete_mode kill
+!map delete cellar
+?? Deleted map `cellar`.
+!undo command
+!map list
+?? - `cellar`: 5x3, 2 units
+!find map:cellar ids
+?? knightling shade
+!ent tp shade 1 1 main
+?? already occupied
+!ent tp shade 3 3 main
+?? on map `main` (from `cellar`)
+!undo command
+!ent info shade
+?? on cellar
+
+Expected: `!ent clone` puts the copies on the source's map, or on the map
+`map=` names; `!template spawn` is a placement, so a match with several maps
+names the map. `!ent dump` names the unit's map. Maps, map vars and the
+channel's `!map use` choice are saved with the match (`!as restart` reloads
+them). Deleting a map (killing its units) and a cross-map teleport are
+each one undo step, and `!undo command` brings the map, its units and
+their positions back.
