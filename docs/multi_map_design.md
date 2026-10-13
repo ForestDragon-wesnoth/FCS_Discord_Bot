@@ -77,10 +77,16 @@ maps: add `map=<name>`, `map=a,b` or `map=all`". Tab completion offers map
 names after `map=`. A GM's existing macros start refusing once a second map
 exists; that is intended.
 
-**`random_free_cell` / `random_cell`** take `map=` (a name, a list or `all`)
-and return `[x, y, map]`. Without `map=` they work only when the match has
-exactly one map; otherwise they refuse for the missing argument. The
-`self` fallback does not apply to them.
+**Unit-less coordinate formula functions require a map** on a multi-map
+match. These are `random_free_cell` / `random_cell` (which also take a list
+or `all` and return `[x, y, map]`), `cells_in_rect` / `_area` / `_cone` /
+`_line`, `cell_blocked`, `entities_at`, `cell_entity`, `nearest_cell`,
+`in_bounds`, `tile_get` and the like.
+- Without `map=` they work only when the match has exactly one map;
+  otherwise they refuse for the missing argument. They don't fall back on
+  `self`.
+- The map argument also takes shortcuts: the channel's viewed map (tier 4)
+  and "this unit's map". Section 10 lists the open details.
 
 **Scattering across maps: N in total.** `!tile place_random N <kind>
 map=all` (or a list of maps) places N in total, with every eligible cell
@@ -167,21 +173,45 @@ share. An even distribution per map is a loop over the maps.
   from this channel's view". Today a hidden unit gets "Entity 'x' not
   found.", which reads as a confirmation that the unit doesn't exist.
 
-## 7. Other agreed or recommended points
+## 7. Map settings, limits and map management
 
-- **Per-map settings** live on the map: fog toggle, background, borders,
-  display. Map-specific behaviour (darkness, gravity) comes from **map
-  vars** that formulas read (`map_var(...)`). There are no per-map rule
-  overrides. This was recommended; confirm it before building.
-- **Size limits.** `max_grid_dimension` bounds each map. A per-match
-  total-cell budget, as a gamerule with an owner ceiling, keeps ten
-  500×500 floors from multiplying the worst case. This was recommended;
-  confirm it before building.
+- **Map settings live in map vars, and gamerules stay per match at the
+  finest.** The old fields assumed one match = one map, so a match
+  couldn't have a fog-less outdoor area and a dark indoor dungeon. That
+  now works:
+  - Everything that may differ between maps becomes a **map var** on each
+    map: the fog toggle, fog memory, background, borders, darkness, and
+    so on.
+  - The gamerules say **which map var means what** and **what its default
+    is**, in the same way `hp_var` names a unit var and `default_entity_vars`
+    fills missing ones: map-var-name rules and a default map vars rule.
+  - Gamerules themselves are never overridden per map. A rule that would
+    need to differ between maps becomes a map var named by a rule.
+  - Formulas read map vars with `map_var(...)` (context map by default).
+- **`match_cell_limit`:** a gamerule with an owner ceiling capping the
+  summed area of every map in a match. Creating or resizing a map past it
+  is refused with the current total named. `max_grid_dimension` still
+  bounds each map.
+- **`transfer_entity` formula** for cross-match moves (a mutating formula
+  function). `!ent transfer` remains the command form. The journal stores
+  both matches' changes as stored states.
+- **Map names.** Every match starts with one map named `main`. Names follow
+  the id rules and are unique within a match. Renaming a map rewrites
+  everything that names it: unit `map` fields, stored `[x, y, map]` values
+  in vars, channel views. Formulas that name it as text are listed in a
+  ⚠️, as `!status rename` does.
+- **Deleting a map with units on it:** a gamerule, `refuse` (default, the
+  units are listed) or `kill`. Corpses and fog memory on the map go with
+  it either way.
+- **`!map copy <name> <new>`** copies terrain, zones and settings. Its usage
+  hint says that it **does not copy units or corpses**.
+- **Map size:** each map has its own size; `!map resize` takes `map=`, and
+  a shrink follows `map_resize_shrink_mode` as today.
+- **Roster** (`!state` / `!list`): units grouped by map, with each map's
+  heading under the same unseen / hidden rules as boards. A gamerule picks
+  the grouping order: team first then map, or map first then team.
 - **Undo and journal cost.** Snapshots copy every map, so the "Large match
   state" item in CLAUDE.md §8 gets more pressing.
-- **#40's cross-match portals.** Once a match holds several maps,
-  cross-match transfer stays the existing `!ent transfer`. Confirm whether
-  anything more is wanted.
 
 ## 8. Build order
 
@@ -229,8 +259,15 @@ share. An even distribution per map is a loop over the maps.
   - what happens to the interior's units when the host dies (eject / kill
     / keep, mirroring `mount_on_host_death`)?
   - could a mount slot point at an inner map?
-- **Unit-less coordinate formula functions** other than `random_*`
-  (`cells_in_rect`, `cell_blocked`, ...): do they use the hierarchy, or
-  refuse without `map=` on multi-map matches like `random_*`?
+- **The map argument's shortcuts:** the spelling for "the viewed map" (a
+  reserved word such as `view`, which can then never be a map name) and for
+  "unit X's map" (`map_of('hero')` passed as the argument, or the unit id
+  itself). What "the viewed map" means for a formula run with no channel.
+- **Map vars:** the names of the map-var-name rules, and whether display
+  settings (borders, coords, legend, render mode) become map vars too or
+  stay plain map fields.
+- **`transfer_entity`:** which matches it may reach (the original #40
+  wording: only matches with the same owner).
+- **Roster grouping:** the rule's default order.
 - **The hook for map changes:** a binding on `on_entity_moved`, or a
   separate hook.
