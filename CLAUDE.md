@@ -1938,7 +1938,7 @@ rejected already. Update this section in the PR that resolves an item.
 - **Decide later (user):** configurable side NAMES for directional prims;
   per-damage-type `to_main_percent`.
 - **Multiple maps per match (#40) and nested maps (#164):** designed with
-  the user over a long discussion; the agreed decisions, open points, build
+  the user over a long discussion; the agreed decisions, deferred points, build
   order and test requirements (20+ scenarios) are in
   `docs/multi_map_design.md`. Read it whole before touching either; ask
   before deviating from it.
