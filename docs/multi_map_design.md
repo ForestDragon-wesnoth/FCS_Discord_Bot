@@ -8,6 +8,11 @@ consequences, and the user made each one deliberately.
 - **#40 Multiple maps per match.** A match holds any number of maps. Portals,
   floors and stairs are composed from tiles and the movement primitives
   (below); the engine has no portal system.
+- **Terminology (user rule): "host" means only the user who runs a match
+  as GM.** The unit that carries an inner map is the **map vehicle**
+  (binding `map_vehicle`, names like `on_map_vehicle_death`). Never call it
+  a host: `on_host_death` reads as "the GM died". The existing rule
+  `mount_on_host_death` breaks this rule too and is to be renamed.
 - **#164 Nested maps.** A map attached to a unit (a ship's deck, a building
   interior) that travels with it. Its discussion is postponed (see the end
   of this file); #40 comes first.
@@ -262,11 +267,10 @@ share. An even distribution per map is a loop over the maps.
 ## 10. Open
 
 - **The rest of #164.** Postponed by the user. Points raised so far:
-  - does a unit inside count as standing on the host's cells for outer
+  - does a unit inside count as standing on the map vehicle's cells for outer
     distance (a rule)?
   - can the inside see the outer map (a rule, or per-map data)?
-  - what happens to the interior's units when the host dies (eject / kill
-    / keep, mirroring `mount_on_host_death`)?
+  - what happens to the interior's units when the map vehicle dies (below)?
   - could a mount slot point at an inner map?
 - **Map vars:** the names of the map-var-name rules, and which display
   settings become map vars. The candidates: background, borders,
@@ -275,7 +279,7 @@ share. An even distribution per map is a loop over the maps.
 - **`transfer_entity`:** which matches it may reach (the original #40
   wording: only matches with the same owner).
 - **Roster grouping:** the rule's default order.
-- **What happens to an inner map's units when the host dies** (the user
+- **What happens to an inner map's units when the map vehicle dies** (the user
   wants this to vary per vehicle AND per occupant; mounts are to be
   revisited the same way later). The cases to cover:
   - a ground vehicle blows up: soldiers take damage, survivors are
@@ -287,6 +291,7 @@ share. An even distribution per map is a loop over the maps.
     inner map.
 
   The proposal under discussion: a per-occupant effect program chosen
-  occupant var > host var > gamerule default, run with self = occupant and
-  `host` bound; an `on_host_death` hook per occupant; then survivors handled
+  occupant var > map vehicle var > gamerule default, run with self =
+  occupant and `map_vehicle` bound; an `on_map_vehicle_death` hook per
+  occupant; then survivors handled
   by a rule (eject / keep the map as a wreck / kill).
