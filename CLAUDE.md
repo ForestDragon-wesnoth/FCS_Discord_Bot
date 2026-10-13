@@ -1374,7 +1374,7 @@ hardcodes**.
   Moving the vehicle carries riders, nested (`_restamp_riders_for`); a
   driver's own move moves the rig. Hidden riders are off the ground,
   unrendered, unseen and grant no vision (`hidden_rider_grants_vision`).
-  `mount_on_host_death` (eject / kill / keep); dismount and eject take the
+  `mount_on_vehicle_death` (eject / kill / keep); dismount and eject take the
   free cell nearest the vehicle's centre (rings outward, ties by y then x);
   a dead rider revives
   unmounted; transform re-checks a mounted rider's slot (and a vehicle's

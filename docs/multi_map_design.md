@@ -11,8 +11,8 @@ consequences, and the user made each one deliberately.
 - **Terminology (user rule): "host" means only the user who runs a match
   as GM.** The unit that carries an inner map is the **map vehicle**
   (binding `map_vehicle`, names like `on_map_vehicle_death`). Never call it
-  a host: `on_host_death` reads as "the GM died". The existing rule
-  `mount_on_host_death` breaks this rule too and is to be renamed.
+  a host: `on_host_death` reads as "the GM died". (The mount rule that
+  broke this was renamed to `mount_on_vehicle_death`.)
 - **#164 Nested maps.** A map attached to a unit (a ship's deck, a building
   interior) that travels with it. Its discussion is postponed (see the end
   of this file); #40 comes first.
@@ -279,19 +279,36 @@ share. An even distribution per map is a loop over the maps.
 - **`transfer_entity`:** which matches it may reach (the original #40
   wording: only matches with the same owner).
 - **Roster grouping:** the rule's default order.
-- **What happens to an inner map's units when the map vehicle dies** (the user
-  wants this to vary per vehicle AND per occupant; mounts are to be
-  revisited the same way later). The cases to cover:
+- **When a map vehicle dies** (user: it must vary per vehicle AND per
+  occupant; mount deaths are to be revisited the same way later). The
+  cases to cover:
   - a ground vehicle blows up: soldiers take damage, survivors are
     ejected, the dead die;
   - a spaceship breaks up: everyone dies except a vacuum-proof alien,
     which takes damage and is ejected;
-  - no cheese: a boss lured into the players' own vehicle must not die
-    just because the vehicle is destroyed. Opposing teams can share an
-    inner map.
+  - no cheese: a boss lured into the players' vehicle must not die just
+    because the vehicle is destroyed. Opposing teams can share an inner
+    map.
 
-  The proposal under discussion: a per-occupant effect program chosen
-  occupant var > map vehicle var > gamerule default, run with self =
-  occupant and `map_vehicle` bound; an `on_map_vehicle_death` hook per
-  occupant; then survivors handled
-  by a rule (eject / keep the map as a wreck / kill).
+  Agreed so far:
+  1. **Per-occupant effect program**, run once per occupant in turn order
+     with `self` = occupant and `map_vehicle` bound. The program comes from
+     the occupant's var (`__map_vehicle_death_effect`), else the vehicle's
+     effect var (name set by a gamerule), else a gamerule default (empty =
+     nothing). **An occupant's effect replaces the vehicle's** (default
+     precedence).
+  2. **`on_map_vehicle_death`** fires per occupant (passives) after the
+     effect.
+  3. **Survivors** are ejected to the free cells nearest the vehicle's
+     body, searching outward rings as dismount does. If nothing fits
+     anywhere, the survivor stays on the inner map with a ⚠️, never killed
+     silently.
+  4. **The inner map's fate is configurable:**
+     - **destroyed:** every occupant that wasn't ejected dies with it;
+     - **kept as a wreck:** the map stays. A wreck formula (a program run on
+       the map) can change it, for example scattering fire and debris
+       tiles. A reserved map var (`__delete_when_empty`) deletes the wreck
+       once no units are left in it.
+
+  Still open: the names and defaults of the fate rule and the wreck formula
+  rule, and whether corpses count as units for `__delete_when_empty`.
