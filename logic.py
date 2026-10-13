@@ -1237,8 +1237,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # Who is the action's `source` when a RIDER triggers a vehicle action
     # (a slot-granted action, or a vehicle action whose allowed_slots
     # includes the rider's slot). 'rider' (default) runs it as the rider
-    # (source = the rider) with a `vehicle` binding pointing at the host;
-    # 'vehicle' runs it as the vehicle (source = the host) with a `rider`
+    # (source = the rider) with a `vehicle` binding pointing at the vehicle;
+    # 'vehicle' runs it as the vehicle (source = the vehicle) with a `rider`
     # binding pointing at the triggering occupant. Either way BOTH bindings
     # are available in the body. Per-vehicle override: the vehicle's
     # `mount_action_actor` var.
@@ -1248,7 +1248,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "desc": (
             "Who acts when a rider triggers a vehicle/slot action: 'rider' "
             "(source = the occupant, with a `vehicle` binding) or 'vehicle' "
-            "(source = the host, with a `rider` binding). Both bindings are "
+            "(source = the vehicle, with a `rider` binding). Both bindings are "
             "always available; this only sets which is `source`. Override per "
             "vehicle with its `mount_action_actor` var."
         ),
@@ -1257,7 +1257,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     # match. 'eject' (default) dismounts everyone to free cells near the
     # vehicle's last position (offboard but alive); 'kill' runs the kill
     # function on each rider; 'keep' leaves them mounted for manual cleanup.
-    "mount_on_host_death": {
+    "mount_on_vehicle_death": {
         "default": "eject",
         "schema": {"type": "enum", "choices": ["eject", "kill", "keep"]},
         "desc": (
@@ -2311,7 +2311,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "int"},
         "desc": (
             "Z-layer (draw order) for visible riders and region body-parts, "
-            "drawn over their host/parent entity. Higher = on top. Per-entity "
+            "drawn over their vehicle / parent entity. Higher = on top. Per-entity "
             "override: the part/rider's `sprite_layer` var."
         ),
     },
@@ -3765,11 +3765,11 @@ HOOK_NAMES: Set[str] = {
     "on_var_write_attempt",
     # Mount lifecycle (mounts/vehicles). Fire on the RIDER entity (`self`
     # = the rider; `this` = current-turn entity). Context bindings:
-    #   vehicle   — the host vehicle's id (new HOOK_CONTEXT name)
+    #   vehicle   — the vehicle's id (new HOOK_CONTEXT name)
     #   slot      — the slot name the rider entered / left
     # on_mounted fires after a rider boards (or switches slots — the
     # switch fires on_dismounted from the old slot then on_mounted in the
-    # new); on_dismounted fires after a rider leaves (also on host-death
+    # new); on_dismounted fires after a rider leaves (also on vehicle-death
     # eject). Lets the GM grant a "buckled in" status, deduct fuel, etc.
     "on_mounted",
     "on_dismounted",
@@ -5004,7 +5004,7 @@ class Entity:
     part_of: "str | None" = field(default=None)
 
     # Mounts / vehicles: when this entity is RIDING another (a vehicle),
-    # `mounted_on` holds the host vehicle's id and `mount_slot` the slot
+    # `mounted_on` holds the vehicle's id and `mount_slot` the slot
     # name it occupies. A rider is a normal independent entity (keeps its
     # own hp/turn/actions) that is carried by the vehicle's movement and
     # hidden from / excluded from the ground (occupancy + spatial targeting)
@@ -5243,9 +5243,9 @@ class Entity:
     @property
     def is_mounted(self) -> bool:
         """True when this entity is RIDING a vehicle (its `mounted_on`
-        points at a live host). A rider keeps its own hp/turn/actions but is
+        points at a live vehicle). A rider keeps its own hp/turn/actions but is
         carried by the vehicle's movement and is off the ground while
-        aboard. The link is ignored if the host no longer exists (a dangling
+        aboard. The link is ignored if the vehicle no longer exists (a dangling
         rider reads as an ordinary entity)."""
         mo = self.mounted_on
         return bool(mo) and self._match is not None and mo in self._match.entities
@@ -5447,7 +5447,7 @@ class Entity:
             if self._match is not m or self.id not in m.entities:
                 return log
         # Resolve any riders this entity was carrying (death OR despawn both
-        # route here) per the mount_on_host_death rule — done while `self` is
+        # route here) per the mount_on_vehicle_death rule — done while `self` is
         # still in the match so the eject search can use its footprint.
         m._release_riders(self.id)
         # A removed snake segment closes the chain behind it, or the next
@@ -8066,7 +8066,7 @@ class Match:
 
     def _release_riders(self, vid: str, mode: Optional[str] = None) -> List[str]:
         """Resolve a vehicle's riders when it dies / despawns, per the
-        mount_on_host_death rule: 'eject' (dismount to nearby cells),
+        mount_on_vehicle_death rule: 'eject' (dismount to nearby cells),
         'kill' (run the kill function on each), 'keep' (leave them linked).
         Called from Entity.remove. An explicit `mode` overrides the rule (the
         transform eject path passes 'eject'). Returns log."""
@@ -8074,7 +8074,7 @@ class Match:
         if not riders:
             return []
         if mode is None:
-            mode = str(self.rules.get("mount_on_host_death", "eject"))
+            mode = str(self.rules.get("mount_on_vehicle_death", "eject"))
         veh = self.entities.get(vid)
         log: List[str] = []
         for rider in riders:
@@ -16281,6 +16281,61 @@ class Match:
                 return n
         return e.name or e.id
 
+    # ---- legend labels ------------------------------------------------
+    # What the map legend calls a thing: a `legend` value on the thing itself
+    # (a unit's var, a tile's data or its template's, a zone's field, a
+    # disguise's key) — False leaves it out of the legend, a text replaces
+    # the label (a pit trap listed as "floor"); anything else keeps the
+    # default label. None = not listed.
+    @staticmethod
+    def _legend_value(val: Any, default: str) -> Optional[str]:
+        if val is False:
+            return None
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        return default
+
+    def legend_label_entity(self, e: "Entity",
+                            pov_team: Optional[str] = None) -> Optional[str]:
+        """A unit's legend label. Under a disguise it comes from the
+        disguise (its own `legend` key, else its name), never the real
+        unit, so a label can't give a disguise away."""
+        dis = self._effective_disguise(e, pov_team)
+        if dis is not None:
+            return self._legend_value(dis.get("legend"),
+                                      self.entity_display_name(e, pov_team))
+        return self._legend_value(e.vars.get("legend"),
+                                  self.entity_display_name(e, pov_team))
+
+    def legend_label_tile(self, data: Any) -> Optional[str]:
+        """A tile's legend label: its own `legend` data, else its
+        template's, else `tile: <template>` / `tile`."""
+        if not isinstance(data, dict):
+            return "tile"
+        tname = data.get("_template")
+        default = (f"tile: {tname}" if isinstance(tname, str) and tname
+                   else "tile")
+        val = data.get("legend")
+        if val is None and isinstance(tname, str):
+            tpl = self.tile_templates.get(tname)
+            if tpl is not None:
+                val = tpl.data.get("legend")
+        return self._legend_value(val, default)
+
+    def legend_label_zone(self, name: str) -> Optional[str]:
+        z = self.zones.get(name)
+        return self._legend_value(z.get("legend") if isinstance(z, dict)
+                                  else None, f"zone: {name}")
+
+    def legend_label_corpse(self, eid: str) -> Optional[str]:
+        c = self.find_corpse(eid)
+        ent = (c[2].get("entity") or {}) if (
+            isinstance(c, tuple) and len(c) >= 3 and isinstance(c[2], dict)
+        ) else {}
+        name = ent.get("name") or eid
+        return self._legend_value((ent.get("vars") or {}).get("legend"),
+                                  f"corpse: {name}")
+
     def _resolve_color_value(self, val: Any, extras: Dict[str, Any],
                              target: Optional[str] = None) -> Optional[str]:
         """Resolve a tile/zone `color` data value to a palette NAME or None.
@@ -16786,7 +16841,7 @@ class Match:
                     grid[zy][zx] = g
                     colors[zy][zx] = zc
                     if meanings is not None:
-                        meanings[zy][zx] = f"zone: {zname}"
+                        meanings[zy][zx] = self.legend_label_zone(zname)
                 elif zc is not None:
                     colors[zy][zx] = zc
 
@@ -16813,10 +16868,7 @@ class Match:
                 grid[ty][tx] = glyph
                 colors[ty][tx] = tc            # tile owns the cell (tc may be None)
                 if meanings is not None:
-                    tname = data.get("_template")
-                    meanings[ty][tx] = (f"tile: {tname}"
-                                        if isinstance(tname, str) and tname
-                                        else "tile")
+                    meanings[ty][tx] = self.legend_label_tile(data)
             elif tc is not None:
                 colors[ty][tx] = tc
 
@@ -16849,7 +16901,7 @@ class Match:
                     colors[cy][cx] = ecol
                     unit_shown.add((cx, cy))
                     if meanings is not None:
-                        meanings[cy][cx] = self.entity_display_name(e, pov_team)
+                        meanings[cy][cx] = self.legend_label_entity(e, pov_team)
 
         # Visible-rider priority pass: a rider in a region slot sits ON the
         # vehicle, so it draws over the vehicle glyph at its slot cell.
@@ -16866,7 +16918,7 @@ class Match:
                     colors[cy][cx] = ecol
                     unit_shown.add((cx, cy))
                     if meanings is not None:
-                        meanings[cy][cx] = self.entity_display_name(e, pov_team)
+                        meanings[cy][cx] = self.legend_label_entity(e, pov_team)
 
         # Region-part priority pass: a region part overlaps its parent, so by
         # default it only draws over the parent when it has a CUSTOM glyph (a
@@ -16887,7 +16939,7 @@ class Match:
                         colors[cy][cx] = ecol
                         unit_shown.add((cx, cy))
                         if meanings is not None:
-                            meanings[cy][cx] = self.entity_display_name(e, pov_team)
+                            meanings[cy][cx] = self.legend_label_entity(e, pov_team)
 
         # Fog overlay (last): an unrevealed cell shows fog_glyph and no
         # color (fog hides whatever tint was there).
@@ -17077,25 +17129,23 @@ class Match:
             kind, ref = p.get("kind"), p.get("ref")
             if kind == "entity":
                 e = self.entities.get(ref)
-                label = self.entity_display_name(e, pov_team) if e else str(ref)
+                label = (self.legend_label_entity(e, pov_team) if e
+                         else str(ref))
             elif kind == "tile":
                 try:
                     tx, ty = (int(v) for v in str(ref).split(","))
                 except ValueError:
                     tx = ty = None
                 data = self.tiles.get((tx, ty)) if tx is not None else None
-                tname = data.get("_template") if isinstance(data, dict) else None
-                label = f"tile: {tname}" if isinstance(tname, str) and tname else "tile"
+                label = self.legend_label_tile(data)
             elif kind == "zone":
-                label = f"zone: {ref}"
+                label = self.legend_label_zone(ref)
             elif kind == "corpse":
-                c = self.find_corpse(ref) if hasattr(self, "find_corpse") else None
-                name = None
-                if isinstance(c, tuple) and len(c) >= 3 and isinstance(c[2], dict):
-                    name = (c[2].get("entity") or {}).get("name")
-                label = f"corpse: {name or ref}"
+                label = self.legend_label_corpse(ref)
             else:
                 continue
+            if label is None:
+                continue                # left out of the legend
             look = tuple(p.get(k) for k in self._LEGEND_LOOK)
             ent = entries.get(look)
             if ent is None:
@@ -17306,7 +17356,7 @@ class Match:
                 if not self.entity_visible_to(e.id, pov_team):
                     continue
                 self._emit_entity_placement(placements, e, pov_team, entity_layer)
-            # Visible riders, over their host.
+            # Visible riders, over their vehicle.
             for e in self.entities.values():
                 if not e.is_visible_rider or not getattr(e, "is_alive", True):
                     continue

@@ -11877,7 +11877,7 @@ Expected: sailor boards the deck, cap takes the helm. `!mount switch sailor helm
 is REFUSED (helm is capacity 1, cap is in it) — sailor stays on deck. Switching
 sailor to deck (already there) is a no-op ❌. `!mount list boat` shows helm with
 cap, deck with sailor. Setting the boat's hp to 0 KILLS it (default death
-condition hp<=0); the default `mount_on_host_death` is `eject`, so both riders
+condition hp<=0); the default `mount_on_vehicle_death` is `eject`, so both riders
 are dismounted to free cells near the boat's last position and survive. `!list`
 no longer shows the boat but shows sailor + cap as ordinary ground entities.
 
@@ -14514,7 +14514,7 @@ copy`) now strips both fields, the same way the corpse snapshot and `!ent clone`
 already do. The transferred rider arrives DISMOUNTED: `!ent dump rider` shows no
 mount, `!mount list` shows no riders on the new `car`, and the rider renders and
 occupies its cell normally. Transferring a VEHICLE instead ejects its riders in
-the source (mount_on_host_death / _release_riders), so a rider and its vehicle
+the source (mount_on_vehicle_death / _release_riders), so a rider and its vehicle
 never travel together — dismounting on arrival is the consistent outcome.
 
 
@@ -23156,3 +23156,92 @@ command_journal_limit 2 a journal keeps between 2 and 4 entries: a full
 stretch starts a new one from the state then and the stretch before it
 goes. 0 turns the journal off and drops it. Replays are for
 administrators.
+
+SCENARIO 781 — Per-item legend labels: hide or rename a unit, tile, zone or corpse in the legend
+----------------------------------------------------------------------
+
+!match new l781 Lab 8 4
+!match use l781
+!tile def new pit
+!tile def data pit glyph _
+!tile def data pit legend floor
+!tile place pit 2 2
+!tile set 3 2 glyph #
+!tile set 4 2 glyph %
+!tile set 4 2 legend false
+!ent add hero Hero 10 1 1
+!ent add ogre Ogre 30 5 1
+!ent set_vars ogre footprint_w=2 footprint_h=2 legend="Big rock"
+!ent add spy Spy 10 8 4
+!ent set_var spy team red
+!ent set_var spy legend "Spy (real)"
+!ent set_var spy disguise.name Peasant
+!ent set_var spy disguise.legend "a villager"
+!zone new mist
+!zone add mist 7 1
+!zone glyph mist ~
+!zone legend mist false
+?? Zone `mist` is left out of the legend.
+!map legend=on
+?? _ — floor
+?? v — Big rock
+?? < — Spy (real)
+?? # — tile
+?! pit
+?! % —
+?! mist
+!map legend=on as=blue
+?? < — a villager
+?! Spy (real)
+!map scene list legend=on as=blue
+?? Legend: glyph v = Big rock
+?? = a villager
+?! = zone: mist
+!zone legend mist -
+!map legend=on
+?? ~ — zone: mist
+!ent add guard Guard 5 1 4
+!ent set_vars guard legend=false sprite=guard
+!ent add thug Thug 5 2 4
+!ent set_var thug sprite thug
+!ent kill guard
+!ent kill thug
+!map scene list legend=on
+?? = corpse: Thug
+?! corpse: Guard
+!system set default entity_visibility_condition "entity[self].name != 'Hero' or pov_team == 'red'"
+!system set default tile_visibility_condition "tile_x != 3 or pov_team == 'red'"
+!map legend=on as=blue
+?! Hero
+?! # —
+?? v — Big rock
+!map scene list legend=on as=blue
+?! Hero
+?! glyph # =
+!ent set_vars hero team=blue fog_vision_radius=0
+!match fog on
+!map legend=on as=blue
+?? > — Hero
+?? fog (unseen)
+?! Big rock
+?! floor
+!map scene list legend=on as=blue
+?! Big rock
+?! = floor
+
+Expected: Each thing on the map can set what the
+legend calls it: a unit's `legend` var, a tile's `legend` data (or its
+template's: every `pit` reads as "floor", so the trap's name never shows),
+a zone's `!zone legend <name> <text|false|->`, a disguise's `legend` key.
+`false` leaves the thing out of the legend: the `%` tile and the mist
+zone have no legend line. A text replaces the label: the 2×2 ogre is
+"Big rock". The disguised spy is "a villager" to blue (the disguise's
+key, never the real unit's label) and "Spy (real)" in the omniscient
+view. ASCII and the image legend (`!map scene list`) agree. The dead
+guard's corpse keeps its `legend` false, so the image legend leaves it
+out, while the thug's corpse is listed as `corpse: Thug`. Nothing the
+view can't see is ever listed, label or not: with the hero hidden from
+blue by the visibility rule and the `#` tile hidden by the tile rule,
+blue's legend names neither; with fog on and the (now blue) hero seeing
+only his own cell, blue's legend lists the hero and the fog, and none of
+the fogged rock, pit or zone.

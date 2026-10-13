@@ -14263,6 +14263,27 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         z["glyph"] = g
         return await ctx.send(f"Zone `{name}` map glyph set to `{g}`.")
 
+    if sub == "legend":
+        # !zone legend <name> <text ...|false|->  — what the map legend calls
+        # the zone: a label, `false` to leave it out, `-` for the default.
+        if await return_help_if_not_enough_args(ctx, args, 3, "zone", "legend"):
+            return
+        name = args[1]
+        z = m.zones.get(name)
+        if z is None:
+            return await ctx.send(f"❌ Zone '{name}' not found.")
+        text = " ".join(args[2:]).strip()
+        if text in ("-", "clear"):
+            z.pop("legend", None)
+            return await ctx.send(f"Zone `{name}` shows as `zone: {name}` "
+                                  f"in the legend again.")
+        if text.lower() == "false":
+            z["legend"] = False
+            return await ctx.send(f"Zone `{name}` is left out of the legend.")
+        z["legend"] = text
+        return await ctx.send(f"Zone `{name}` shows as \"{text}\" in the "
+                              f"legend.")
+
     if sub == "sprite":
         # !zone sprite <name> <key|->  — a dedicated field (like glyph), drawn
         # by the graphics surface; cleared with `-`.
@@ -17475,6 +17496,12 @@ _SUB_DESCS = {
         "reason, or `clear` the outcome. Fires the `match_outcome` event "
         "(winner / reason / round)."),
     ("match", "outcome"): "Show the declared winner and reason, if any.",
+    ("zone", "legend"): (
+        "What the map legend calls this zone: a label of your own (a trap "
+        "zone listed as \"floor\"), `false` to leave it out, or `-` for the "
+        "default `zone: <name>`. Units take a `legend` var and tiles "
+        "`legend` data (or their template's) the same way; a disguise's "
+        "`legend` key labels the disguised unit."),
 }
 for _root, _sub, _usage in (
         ("ent", "copy", "!ent copy <id> <dest_match> [x y]"),
@@ -17485,7 +17512,8 @@ for _root, _sub, _usage in (
         ("tile", "fill", "!tile fill <x1> <y1> <x2> <y2> <path> <value>"),
         ("zone", "anchor", "!zone anchor <name> <eid> [radius] [metric]"),
         ("zone", "unanchor", "!zone unanchor <name>"),
-        ("zone", "sprite", "!zone sprite <name> <key|clear>")):
+        ("zone", "sprite", "!zone sprite <name> <key|clear>"),
+        ("zone", "legend", "!zone legend <name> <text ...>")):
     registry.annotate_sub(_root, _sub, usage=_usage,
                           desc=_SUB_DESCS.get((_root, _sub)))
 # Alias spellings each handler accepts for a subcommand; the stray-word

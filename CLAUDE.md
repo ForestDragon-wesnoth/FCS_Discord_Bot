@@ -375,6 +375,8 @@ back, load the schema with `ToolSearch` before calling
 - **`docs/audit_history.md`**: the narratives of audit passes 2-40 — what was
   swept, verified clean, measured. Read the relevant passes before auditing
   an area again.
+- **`docs/multi_map_design.md`**: the agreed design for multiple maps per
+  match and nested maps (not built yet).
 
 ### The cross-cutting chokepoints (memorize these)
 
@@ -1372,7 +1374,7 @@ hardcodes**.
   Moving the vehicle carries riders, nested (`_restamp_riders_for`); a
   driver's own move moves the rig. Hidden riders are off the ground,
   unrendered, unseen and grant no vision (`hidden_rider_grants_vision`).
-  `mount_on_host_death` (eject / kill / keep); dismount and eject take the
+  `mount_on_vehicle_death` (eject / kill / keep); dismount and eject take the
   free cell nearest the vehicle's centre (rings outward, ties by y then x);
   a dead rider revives
   unmounted; transform re-checks a mounted rider's slot (and a vehicle's
@@ -1519,7 +1521,14 @@ hardcodes**.
   shared by both renderers via `entity_color` (772) — > `team_colors` /
   a palette-named team;
   ANSI only when `ctx.supports_color`, one code per run), legend
-  (`map_legend_by_default`, `!map legend`, `legend=`), coordinate rulers
+  (`map_legend_by_default`, `!map legend`, `legend=`; each thing names
+  itself through a `legend` value — a unit's var, a tile's data or its
+  template's, a zone's field (`!zone legend`), a disguise's key, a
+  corpse's snapshot var: `false` leaves it out, a text replaces the label;
+  `Match.legend_label_*`, shared by both renderers; a disguised unit's
+  label comes only from the disguise; both legends are built from what
+  the view actually draws, so nothing hidden, fogged or invisible to the
+  POV is ever listed) (781), coordinate rulers
   (`map_coords`, `!map coords`, stacked column digits), hidden layers (`!map
   layer`, `hide=`), preview / sight marks (`preview_glyph`), viewport.
 - **Viewport** (`viewport_width/height` 28, `viewport_mode` auto = only
@@ -1928,7 +1937,12 @@ rejected already. Update this section in the PR that resolves an item.
   menus for `choose()` (Discord relies on `answer=` tokens today).
 - **Decide later (user):** configurable side NAMES for directional prims;
   per-damage-type `to_main_percent`.
-- **Later:** nested maps per match (wanted); graphics mouse select / drag and
+- **Multiple maps per match (#40) and nested maps (#164):** designed with
+  the user over a long discussion; the agreed decisions, open points, build
+  order and test requirements (20+ scenarios) are in
+  `docs/multi_map_design.md`. Read it whole before touching either; ask
+  before deviating from it.
+- **Later:** graphics mouse select / drag and
   animation ("foreseeable future"); a per-entity ATB threshold; arbitrary /
   L-shaped footprints and footprint rotation; per-rider footprints inside a
   vehicle, shared vehicle fuel / initiative, positional cover for riders;

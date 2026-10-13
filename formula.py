@@ -3089,7 +3089,7 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     # Mounts / vehicles. `vehicle` and `rider` are entity ids (usable in
     # entity[vehicle] / entity[rider]); `slot` is the slot name string.
     # Bound during slot cost/condition evaluation (Match.can_mount etc.) —
-    # `self` is the rider, `vehicle` the host — and during a rider-triggered
+    # `self` is the rider, `vehicle` the vehicle unit — and during a rider-triggered
     # vehicle/slot action body (both ids bound so the action can affect
     # either party regardless of the mount_action_actor setting). The
     # on_mounted / on_dismounted hooks bind `vehicle` + `slot`. None
