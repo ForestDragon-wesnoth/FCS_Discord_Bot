@@ -310,5 +310,20 @@ share. An even distribution per map is a loop over the maps.
        tiles. A reserved map var (`__delete_when_empty`) deletes the wreck
        once no units are left in it.
 
-  Still open: the names and defaults of the fate rule and the wreck formula
-  rule, and whether corpses count as units for `__delete_when_empty`.
+  5. **Names and defaults:**
+     - rule `map_vehicle_death_map`, `destroy` (default) or `wreck`, with a
+       per-vehicle override var;
+     - the wreck formula is a rule-named var on the vehicle (so a ship and a
+       tank wreck differently), with a gamerule default that does nothing.
+  6. **The wreck formula** runs once, right after the survivors are
+     handled. Its context map is the wreck, and `map_vehicle` is bound to
+     the dead vehicle (its corpse, if it left one).
+  7. **`__delete_when_empty` counts only living units.** Corpses on the
+     wreck are deleted with it, as when any map is deleted.
+  8. **Corpses of occupants killed by a destroyed map:** a gamerule with a
+     per-vehicle override, defaulting to **ejecting the corpses** to the
+     outer map, at the nearest free corpse cells around the vehicle's body.
+     A tank's dead land beside the wreck, where a medic or looter can reach
+     them. The other choice loses them with the map, which suits a
+     spaceship breaking up in space, where corpse tiles would only get in
+     the way.
