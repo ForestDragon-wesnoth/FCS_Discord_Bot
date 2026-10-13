@@ -749,6 +749,14 @@ passes. Use subagents only for mechanical, local lookups, and verify every
 claim an agent makes against the code before acting on it or repeating it.
 The freshest code is the highest-yield target.
 
+**Reports from another LLM.** The user sometimes runs a separate,
+read-only LLM for bug-finding passes and forwards its findings. Treat each
+finding as a bug report: reproduce it (a probe or a scenario) against
+current main before fixing, say which findings didn't reproduce and why,
+and ask the user when a finding is a design question rather than a defect.
+Fix confirmed ones like any bug (scenario, regression, the relevant
+harness from the toolkit below).
+
 ### Audit toolkit
 
 Throwaway harnesses that found real bugs; rebuild them from these
