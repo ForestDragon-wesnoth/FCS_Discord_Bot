@@ -202,6 +202,15 @@ share. An even distribution per map is a loop over the maps.
   - Gamerules themselves are never overridden per map. A rule that would
     need to differ between maps becomes a map var named by a rule.
   - Formulas read map vars with `map_var(...)` (context map by default).
+  - **Display settings, decided:**
+    - map vars: the **background**, the **borders** (show, colour,
+      opacity) and the **hidden layers**;
+    - staying per match: the **render mode** (text / image), **colour**
+      on/off, the **coordinate rulers** and the **legend**. These are
+      table preferences, and one match won't mix art styles.
+  - Keeping a thing out of the legend for secrecy belongs to that tile /
+    unit / zone, never to a map. There is no per-item legend exclusion
+    yet.
 - **`match_cell_limit`:** a gamerule with an owner ceiling capping the
   summed area of every map in a match. Creating or resizing a map past it
   is refused with the current total named. `max_grid_dimension` still
@@ -223,7 +232,8 @@ share. An even distribution per map is a loop over the maps.
   a shrink follows `map_resize_shrink_mode` as today.
 - **Roster** (`!state` / `!list`): units grouped by map, with each map's
   heading under the same unseen / hidden rules as boards. A gamerule picks
-  the grouping order: team first then map, or map first then team.
+  the grouping order: map first then team (default), or team first then
+  map.
 - **Undo and journal cost.** Snapshots copy every map, so the "Large match
   state" item in CLAUDE.md §8 gets more pressing.
 
@@ -272,13 +282,9 @@ share. An even distribution per map is a loop over the maps.
   - can the inside see the outer map (a rule, or per-map data)?
   - what happens to the interior's units when the map vehicle dies (below)?
   - could a mount slot point at an inner map?
-- **Map vars:** the names of the map-var-name rules, and which display
-  settings become map vars. The candidates: background, borders,
-  coordinate rulers, legend, render mode (text / image), colour on/off,
-  hidden layers.
+- **Map vars:** the names of the map-var-name rules.
 - **`transfer_entity`:** which matches it may reach (the original #40
   wording: only matches with the same owner).
-- **Roster grouping:** the rule's default order.
 - **When a map vehicle dies** (user: it must vary per vehicle AND per
   occupant; mount deaths are to be revisited the same way later). The
   cases to cover:
