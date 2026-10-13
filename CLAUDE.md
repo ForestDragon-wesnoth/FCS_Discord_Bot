@@ -375,6 +375,8 @@ back, load the schema with `ToolSearch` before calling
 - **`docs/audit_history.md`**: the narratives of audit passes 2-40 — what was
   swept, verified clean, measured. Read the relevant passes before auditing
   an area again.
+- **`docs/multi_map_design.md`**: the agreed design for multiple maps per
+  match and nested maps (not built yet).
 
 ### The cross-cutting chokepoints (memorize these)
 
@@ -1928,7 +1930,12 @@ rejected already. Update this section in the PR that resolves an item.
   menus for `choose()` (Discord relies on `answer=` tokens today).
 - **Decide later (user):** configurable side NAMES for directional prims;
   per-damage-type `to_main_percent`.
-- **Later:** nested maps per match (wanted); graphics mouse select / drag and
+- **Multiple maps per match (#40) and nested maps (#164):** designed with
+  the user over a long discussion; the agreed decisions, open points, build
+  order and test requirements (20+ scenarios) are in
+  `docs/multi_map_design.md`. Read it whole before touching either; ask
+  before deviating from it.
+- **Later:** graphics mouse select / drag and
   animation ("foreseeable future"); a per-entity ATB threshold; arbitrary /
   L-shaped footprints and footprint rotation; per-rider footprints inside a
   vehicle, shared vehicle fuel / initiative, positional cover for riders;

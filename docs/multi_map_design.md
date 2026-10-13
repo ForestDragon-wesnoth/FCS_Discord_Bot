@@ -1,0 +1,236 @@
+# Multiple maps per match (#40) and nested maps (#164): agreed design
+
+Status: design in discussion with the user; nothing is built yet. Each item
+below was decided in chat unless it sits under "Open". Read this whole file
+before starting either feature: every decision here has long-term
+consequences, and the user made each one deliberately.
+
+- **#40 Multiple maps per match.** A match holds any number of maps. Portals,
+  floors and stairs are composed from tiles and the movement primitives
+  (below); the engine has no portal system.
+- **#164 Nested maps.** A map attached to a unit (a ship's deck, a building
+  interior) that travels with it. Its discussion is postponed (see the end
+  of this file); #40 comes first.
+
+## 1. Model
+
+- **Match and Map split.** Today `Match` fuses the match and its one map. A
+  new `Map` class holds what is spatial:
+  - grid size, tiles and zones;
+  - fog memory (`explored`) and fog reveals;
+  - background, borders, hidden layers;
+  - the map display settings (coords, legend, render mode).
+
+  `Match` keeps everything else: units, the turn order, rounds, rules,
+  passives, definitions, functions, aliases, macros, tables, watchers, match
+  vars, team data, schedules, the event log, hosts, access, approvals, RNG,
+  the journal and undo history.
+- **Units stay in one pool on the match**, each with a `map` field. Ids stay
+  unique match-wide and non-spatial loops are unchanged; only spatial code
+  filters by map. Parts, riders and segments take their root body's map.
+- **One turn clock per match**, shared by all its maps. This was recommended
+  and not contested; separate clocks are what separate matches are for.
+
+## 2. Coordinates
+
+- A coordinate is `[x, y]` on the context map, or `[x, y, map]` naming one.
+  Every function and command that takes a cell accepts the third element.
+  Results carry the map whenever it differs from the context map.
+- **Spatial questions across two maps get "no relation", never an error:**
+  - distance is None;
+  - `has_los` / `can_see` are false;
+  - area membership is false.
+
+## 3. Which map a command or formula means
+
+Resolution order (the "4-tier hierarchy"):
+
+1. An explicit map: the third coordinate element, `map=`, or the extra
+   argument on `!ent tp`.
+2. The map of the unit the command or formula is about (`self`, the actor,
+   the action's source, the unit a command names).
+3. The match's only map, when it has one.
+4. The channel's map. This is the map set with `!map view <name>` when one
+   is set; otherwise it is the map the channel's board follows (§5).
+   Buttons and browsing never change it.
+
+**Strictness for broad commands.** With several maps, unit-less commands
+that act broadly make the host name the map. These are tile fill / line /
+set / clear, zone cell edits, `!reveal_fog` and `!tile place_random`. With
+one map they stay as lenient as today. Commands fall into three kinds:
+
+- **Per-map edits** take `map=<name>`, `map=a,b` or `map=all`. Each map gets
+  its own share: a fill rectangle is clipped to each map's size, and a
+  reveal applies per map.
+- **Placing one thing** (`!ent add`, `!template spawn`, `!ent tp`) needs
+  exactly one map. `map=all` is refused there. A unit the command names
+  supplies its map (tier 2).
+- **Reads** (`!map preview`, `!map cell`, `!dist` with coordinates) use the
+  hierarchy and name the map in their reply.
+
+Where strictness doesn't apply, or the host can't be asked, the hierarchy
+decides. Mid-turn formulas have nobody to ask, so a formula with `self`
+uses `self`'s map.
+
+The refusal names the maps and the syntax, for example: "this match has 3
+maps: add `map=<name>`, `map=a,b` or `map=all`". Tab completion offers map
+names after `map=`. A GM's existing macros start refusing once a second map
+exists; that is intended.
+
+**`random_free_cell` / `random_cell`** take `map=` (a name, a list or `all`)
+and return `[x, y, map]`. Without `map=` they work only when the match has
+exactly one map; otherwise they refuse for the missing argument. The
+`self` fallback does not apply to them.
+
+**Scattering across maps: N in total.** `!tile place_random N <kind>
+map=all` (or a list of maps) places N in total, with every eligible cell
+across the chosen maps equally likely. A big map therefore gets a bigger
+share. An even distribution per map is a loop over the maps.
+
+## 4. Moving between maps
+
+- **No separate `move_to_map` primitive.** The placement verbs take the map:
+  - `!ent tp <id> <x> <y> [map]`;
+  - `move_entity(eid, x, y[, map])`, or a three-element coordinate;
+  - `summon`, `summon_near`, `summon_template`, `!template spawn`;
+  - `!ent add ... map=<name>`. Its usage already ends in an optional
+    `[init]`, so a bare map word would be ambiguous there.
+- **Step verbs stay on the unit's map:** `!ent move`, `push`, `pull`,
+  `swap`, `move_step`. A path can't cross grids. A walk that ends on a
+  stairs tile changes maps through the tile's `on_enter`.
+- **A cross-map move is a full move.** It validates the whole footprint on
+  the destination map. The whole body travels with it: parts, riders,
+  segments. Enter hooks fire for the cells it lands on, and a hook binding
+  (or a dedicated hook) reports the old and new map.
+- **Portals, stairs, teleporters and doors are composed:** a tile's
+  `on_enter` calls the movement primitive. There is no portal system.
+
+## 5. Channels, POV and boards
+
+- **A channel binding carries POV only (a team's view).** A channel is never
+  bound to a map. That would need one channel per team per map (40 channels
+  for 4 teams × 10 maps), or constant rebinding.
+- **Vision stays team-wide.** Per-unit vision is out of scope; the user may
+  be open to it later.
+- **Which map a team channel's board follows.** It shows the map of that
+  team's current or most recent acting unit. With turn order red1, red2,
+  blue1, blue2: during blue1's turn, the red board shows red2's map and the
+  blue board shows blue1's. An omniscient (GM) channel follows whoever is
+  acting. In detail:
+  - **No unit of the team has acted yet this round:** follow the team's
+    last actor from the previous round. Before the first turn ever, show
+    the map the team's first unit is on, or the default map. This works the
+    same under ATB.
+  - **The followed unit changed maps after acting** (a portal at the end of
+    its turn, being pulled through one): follow where it is now.
+  - **The followed unit died or was removed:** keep showing its map until
+    another unit of that team starts a turn.
+  - **An acting unit the channel's POV can't see:** the board doesn't
+    follow it. That would leak which map a hidden enemy is on.
+- **Browsing.** Autoupdate boards can scroll between maps: ◀ ▶ buttons, or a
+  select menu when there are many maps. The GUI uses a dropdown and the CLI
+  `!map <name>`.
+  - Browsing is temporary. The next turn change, any team's, returns the
+    board to its followed map.
+  - Browsing is display state on that board only. Nothing reads it, and
+    several boards in one channel can show different maps.
+
+## 6. Unseen maps and hidden maps
+
+- **Rule `unseen_map_display`:** `show` / `blank_named` / `blank_unnamed` /
+  `hidden`, default `blank_unnamed`. Each map can override it (for example
+  `!map set <name> unseen=<mode>`, or `default` to use the rule).
+- A map is **unseen** by a team when fog is on and the team has no visible
+  cell there (no own units, no reveals) and no fog memory of it. The
+  override applies only while the map is unseen; once seen, the map shows
+  normally. A `hidden` vault appears in a team's list the moment one of its
+  units steps in.
+- **Blank boards** show a text, set by its own format rule, along the lines
+  of "you have not seen this map yet". ASCII and graphics must agree, so
+  the renderer parity pass applies.
+- **`hidden` hides a map from everything a player can query:** board
+  scrolling, `!map list`, `!map <name>`, `map=` arguments, completion and
+  "did you mean" suggestions. Host-only commands state the facts. A host
+  typing in a team's channel sees that team's view unless they add `full`,
+  the same as unit hiding.
+- **Counts.** `blank_unnamed` maps count in public map counts ("unexplored
+  map, 3 of 7"). `hidden` maps never count publicly. Host-only commands
+  count everything. Document this.
+- **Refusal wording.** It must be identical for a hidden map and a
+  nonexistent one, so the reply never proves the map exists:
+
+  > Could not find a map named `NAME`. Either this map does not exist, or
+  > this channel currently does not have permission to view it.
+
+  **Unit lookups switch to the same two-sided wording** as part of this
+  work, along the lines of "either this entity does not exist or is hidden
+  from this channel's view". Today a hidden unit gets "Entity 'x' not
+  found.", which reads as a confirmation that the unit doesn't exist.
+
+## 7. Other agreed or recommended points
+
+- **Per-map settings** live on the map: fog toggle, background, borders,
+  display. Map-specific behaviour (darkness, gravity) comes from **map
+  vars** that formulas read (`map_var(...)`). There are no per-map rule
+  overrides. This was recommended; confirm it before building.
+- **Size limits.** `max_grid_dimension` bounds each map. A per-match
+  total-cell budget, as a gamerule with an owner ceiling, keeps ten
+  500×500 floors from multiplying the worst case. This was recommended;
+  confirm it before building.
+- **Undo and journal cost.** Snapshots copy every map, so the "Large match
+  state" item in CLAUDE.md §8 gets more pressing.
+- **#40's cross-match portals.** Once a match holds several maps,
+  cross-match transfer stays the existing `!ent transfer`. Confirm whether
+  anything more is wanted.
+
+## 8. Build order
+
+1. **Extract `Map`** with a single default map (`main`) and add the unit
+   `map` field. Every spatial function takes its map explicitly. Behaviour
+   stays identical, proven by the full regression and the replay
+   differential. This step goes in its own PR, with no new features
+   alongside.
+2. **Multiple maps:**
+   - `!map new/list/delete/resize/view/set`;
+   - the map argument on the placement verbs;
+   - per-map fog, boards and following;
+   - unseen and hidden maps;
+   - strictness and the refusal wording;
+   - `random_*` with `map=`;
+   - completion;
+   - the POV filtering of map lists.
+3. **Nested maps (#164).**
+
+## 9. Tests (user requirement)
+
+- **At least 20 scenarios** for #40, each on a different facet. They must
+  include:
+  - scatter N in total across maps;
+  - the per-map loop;
+  - a multi-tile unit crossing maps with its parts and riders;
+  - strictness refusals and `map=all`;
+  - unseen and hidden maps per mode, with counts and refusal wording;
+  - board following, including the red/blue example;
+  - the hierarchy tiers.
+- **Beyond scenarios:**
+  - the replay differential with journals spanning several maps;
+  - the existence-oracle detector with hidden maps against nonexistent
+    ones;
+  - the POV leak detector;
+  - renderer parity on blank boards;
+  - the memory-equals-disk check.
+
+## 10. Open
+
+- **The rest of #164.** Postponed by the user. Points raised so far:
+  - does a unit inside count as standing on the host's cells for outer
+    distance (a rule)?
+  - can the inside see the outer map (a rule, or per-map data)?
+  - what happens to the interior's units when the host dies (eject / kill
+    / keep, mirroring `mount_on_host_death`)?
+  - could a mount slot point at an inner map?
+- **Unit-less coordinate formula functions** other than `random_*`
+  (`cells_in_rect`, `cell_blocked`, ...): do they use the hierarchy, or
+  refuse without `map=` on multi-map matches like `random_*`?
+- **The hook for map changes:** a binding on `on_entity_moved`, or a
+  separate hook.
