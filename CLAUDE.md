@@ -1267,9 +1267,9 @@ hardcodes**.
 - **Grid:** square cells, 1-based; `max_grid_dimension` (default 500, owner
   ceiling) checked on create and resize. `!map resize <w> <h> [anchor]`
   shifts everything coordinate-bearing by the anchor's offset (units, tiles,
-  corpses, zones, fog memory, camera views, snake trail vars); a shrink that
-  pushes units off follows `map_resize_shrink_mode` (block / kill, looping
-  until nothing is off-grid).
+  corpses, zones, fog memory and reveals, camera views, snake trail vars);
+  a shrink that pushes units off follows `map_resize_shrink_mode` (block /
+  kill, looping until nothing is off-grid).
 - **Movement verbs:** `!ent tp` / `move` (count first, `allow_diagonal_movement`)
   / `push` / `pull` / `swap`, group moves (`group:<name>`,
   `mount_group_move_mode`), formula `move_entity` / `move_step` (a real

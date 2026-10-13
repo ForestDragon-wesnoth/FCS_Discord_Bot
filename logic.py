@@ -7339,7 +7339,7 @@ class Match:
                     anchor: str = "top-left", mp: Optional["Map"] = None
                     ) -> Tuple[Dict[str, Any], List[str]]:
         """Resize map `mp` (None = the only map) to new_w x new_h, repositioning ALL content
-        (entities, tiles, corpses, zones, fog-explored memory) by an offset
+        (entities, tiles, corpses, zones, fog memory and reveals) by an offset
         derived from `anchor` — the 9-point compass point where existing
         content stays put. top-left (default) leaves coordinates unchanged
         and grows/cuts at the bottom-right; bottom-right shifts everything
@@ -7436,13 +7436,25 @@ class Match:
                               if in_new(x + ox, y + oy)}
                 clipped_cells += before - len(z["cells"])
 
-        # Shift + clip fog-explored memory.
+        # Shift + clip fog-explored memory and fog reveals (a reveal left
+        # behind used to show a cell beside what was revealed).
         if mp.explored:
             mp.explored = {
                 team: {(x + ox, y + oy) for (x, y) in cells
                        if in_new(x + ox, y + oy)}
                 for team, cells in mp.explored.items()
             }
+        for team in list(mp.fog_reveals):
+            recs = []
+            for r in mp.fog_reveals[team]:
+                cells = {(x + ox, y + oy) for (x, y) in r.get("cells", ())
+                         if in_new(x + ox, y + oy)}
+                if cells:
+                    recs.append({**r, "cells": cells})
+            if recs:
+                mp.fog_reveals[team] = recs
+            else:
+                del mp.fog_reveals[team]
         # Shift each channel's viewport CAMERA by the same offset so it keeps
         # framing the same content after a center/edge-anchored resize (the
         # camera is coordinate-bearing too). resolve_viewport re-clamps on
