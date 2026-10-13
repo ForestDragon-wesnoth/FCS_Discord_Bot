@@ -77,6 +77,12 @@ maps: add `map=<name>`, `map=a,b` or `map=all`". Tab completion offers map
 names after `map=`. A GM's existing macros start refusing once a second map
 exists; that is intended.
 
+**Map shortcuts (decided).** `map_of('hero')` and `entity['hero'].map`
+both read a unit's map. `map` joins `x` / `y` / `name` as a reserved var
+path, so a unit can no longer hold a var named `map`. The reserved map
+value `view` means the channel's viewed map (tier 4); a formula with no
+channel refuses it. `view` and `all` can't be map names.
+
 **Unit-less coordinate formula functions require a map** on a multi-map
 match. These are `random_free_cell` / `random_cell` (which also take a list
 or `all` and return `[x, y, map]`), `cells_in_rect` / `_area` / `_cone` /
@@ -106,8 +112,11 @@ share. An even distribution per map is a loop over the maps.
   stairs tile changes maps through the tile's `on_enter`.
 - **A cross-map move is a full move.** It validates the whole footprint on
   the destination map. The whole body travels with it: parts, riders,
-  segments. Enter hooks fire for the cells it lands on, and a hook binding
-  (or a dedicated hook) reports the old and new map.
+  segments. Enter hooks fire for the cells it lands on.
+- **Hooks for map changes: both.** Every move fires `on_entity_moved` with
+  `from_map` / `to_map` bindings, which are equal for an ordinary move. A
+  move between maps also fires `on_entity_changed_map`, so a GM who only
+  cares about map changes needs no from / to test.
 - **Portals, stairs, teleporters and doors are composed:** a tile's
   `on_enter` calls the movement primitive. There is no portal system.
 
@@ -259,15 +268,25 @@ share. An even distribution per map is a loop over the maps.
   - what happens to the interior's units when the host dies (eject / kill
     / keep, mirroring `mount_on_host_death`)?
   - could a mount slot point at an inner map?
-- **The map argument's shortcuts:** the spelling for "the viewed map" (a
-  reserved word such as `view`, which can then never be a map name) and for
-  "unit X's map" (`map_of('hero')` passed as the argument, or the unit id
-  itself). What "the viewed map" means for a formula run with no channel.
-- **Map vars:** the names of the map-var-name rules, and whether display
-  settings (borders, coords, legend, render mode) become map vars too or
-  stay plain map fields.
+- **Map vars:** the names of the map-var-name rules, and which display
+  settings become map vars. The candidates: background, borders,
+  coordinate rulers, legend, render mode (text / image), colour on/off,
+  hidden layers.
 - **`transfer_entity`:** which matches it may reach (the original #40
   wording: only matches with the same owner).
 - **Roster grouping:** the rule's default order.
-- **The hook for map changes:** a binding on `on_entity_moved`, or a
-  separate hook.
+- **What happens to an inner map's units when the host dies** (the user
+  wants this to vary per vehicle AND per occupant; mounts are to be
+  revisited the same way later). The cases to cover:
+  - a ground vehicle blows up: soldiers take damage, survivors are
+    ejected, the dead die;
+  - a spaceship breaks up: everyone dies except a vacuum-proof alien,
+    which takes damage and is ejected;
+  - no cheese: a boss lured into the players' own vehicle must not die
+    just because the vehicle is destroyed. Opposing teams can share an
+    inner map.
+
+  The proposal under discussion: a per-occupant effect program chosen
+  occupant var > host var > gamerule default, run with self = occupant and
+  `host` bound; an `on_host_death` hook per occupant; then survivors handled
+  by a rule (eject / keep the map as a wreck / kill).
