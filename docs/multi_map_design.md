@@ -209,8 +209,8 @@ share. An even distribution per map is a loop over the maps.
       on/off, the **coordinate rulers** and the **legend**. These are
       table preferences, and one match won't mix art styles.
   - Keeping a thing out of the legend for secrecy belongs to that tile /
-    unit / zone, never to a map. There is no per-item legend exclusion
-    yet.
+    unit / zone, never to a map (the per-item `legend` value shipped with
+    this design record, scenario 781).
 - **`match_cell_limit`:** a gamerule with an owner ceiling capping the
   summed area of every map in a match. Creating or resizing a map past it
   is refused with the current total named. `max_grid_dimension` still

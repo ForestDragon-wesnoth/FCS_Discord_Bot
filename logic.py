@@ -16281,6 +16281,61 @@ class Match:
                 return n
         return e.name or e.id
 
+    # ---- legend labels ------------------------------------------------
+    # What the map legend calls a thing: a `legend` value on the thing itself
+    # (a unit's var, a tile's data or its template's, a zone's field, a
+    # disguise's key) — False leaves it out of the legend, a text replaces
+    # the label (a pit trap listed as "floor"); anything else keeps the
+    # default label. None = not listed.
+    @staticmethod
+    def _legend_value(val: Any, default: str) -> Optional[str]:
+        if val is False:
+            return None
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        return default
+
+    def legend_label_entity(self, e: "Entity",
+                            pov_team: Optional[str] = None) -> Optional[str]:
+        """A unit's legend label. Under a disguise it comes from the
+        disguise (its own `legend` key, else its name), never the real
+        unit, so a label can't give a disguise away."""
+        dis = self._effective_disguise(e, pov_team)
+        if dis is not None:
+            return self._legend_value(dis.get("legend"),
+                                      self.entity_display_name(e, pov_team))
+        return self._legend_value(e.vars.get("legend"),
+                                  self.entity_display_name(e, pov_team))
+
+    def legend_label_tile(self, data: Any) -> Optional[str]:
+        """A tile's legend label: its own `legend` data, else its
+        template's, else `tile: <template>` / `tile`."""
+        if not isinstance(data, dict):
+            return "tile"
+        tname = data.get("_template")
+        default = (f"tile: {tname}" if isinstance(tname, str) and tname
+                   else "tile")
+        val = data.get("legend")
+        if val is None and isinstance(tname, str):
+            tpl = self.tile_templates.get(tname)
+            if tpl is not None:
+                val = tpl.data.get("legend")
+        return self._legend_value(val, default)
+
+    def legend_label_zone(self, name: str) -> Optional[str]:
+        z = self.zones.get(name)
+        return self._legend_value(z.get("legend") if isinstance(z, dict)
+                                  else None, f"zone: {name}")
+
+    def legend_label_corpse(self, eid: str) -> Optional[str]:
+        c = self.find_corpse(eid)
+        ent = (c[2].get("entity") or {}) if (
+            isinstance(c, tuple) and len(c) >= 3 and isinstance(c[2], dict)
+        ) else {}
+        name = ent.get("name") or eid
+        return self._legend_value((ent.get("vars") or {}).get("legend"),
+                                  f"corpse: {name}")
+
     def _resolve_color_value(self, val: Any, extras: Dict[str, Any],
                              target: Optional[str] = None) -> Optional[str]:
         """Resolve a tile/zone `color` data value to a palette NAME or None.
@@ -16786,7 +16841,7 @@ class Match:
                     grid[zy][zx] = g
                     colors[zy][zx] = zc
                     if meanings is not None:
-                        meanings[zy][zx] = f"zone: {zname}"
+                        meanings[zy][zx] = self.legend_label_zone(zname)
                 elif zc is not None:
                     colors[zy][zx] = zc
 
@@ -16813,10 +16868,7 @@ class Match:
                 grid[ty][tx] = glyph
                 colors[ty][tx] = tc            # tile owns the cell (tc may be None)
                 if meanings is not None:
-                    tname = data.get("_template")
-                    meanings[ty][tx] = (f"tile: {tname}"
-                                        if isinstance(tname, str) and tname
-                                        else "tile")
+                    meanings[ty][tx] = self.legend_label_tile(data)
             elif tc is not None:
                 colors[ty][tx] = tc
 
@@ -16849,7 +16901,7 @@ class Match:
                     colors[cy][cx] = ecol
                     unit_shown.add((cx, cy))
                     if meanings is not None:
-                        meanings[cy][cx] = self.entity_display_name(e, pov_team)
+                        meanings[cy][cx] = self.legend_label_entity(e, pov_team)
 
         # Visible-rider priority pass: a rider in a region slot sits ON the
         # vehicle, so it draws over the vehicle glyph at its slot cell.
@@ -16866,7 +16918,7 @@ class Match:
                     colors[cy][cx] = ecol
                     unit_shown.add((cx, cy))
                     if meanings is not None:
-                        meanings[cy][cx] = self.entity_display_name(e, pov_team)
+                        meanings[cy][cx] = self.legend_label_entity(e, pov_team)
 
         # Region-part priority pass: a region part overlaps its parent, so by
         # default it only draws over the parent when it has a CUSTOM glyph (a
@@ -16887,7 +16939,7 @@ class Match:
                         colors[cy][cx] = ecol
                         unit_shown.add((cx, cy))
                         if meanings is not None:
-                            meanings[cy][cx] = self.entity_display_name(e, pov_team)
+                            meanings[cy][cx] = self.legend_label_entity(e, pov_team)
 
         # Fog overlay (last): an unrevealed cell shows fog_glyph and no
         # color (fog hides whatever tint was there).
@@ -17077,25 +17129,23 @@ class Match:
             kind, ref = p.get("kind"), p.get("ref")
             if kind == "entity":
                 e = self.entities.get(ref)
-                label = self.entity_display_name(e, pov_team) if e else str(ref)
+                label = (self.legend_label_entity(e, pov_team) if e
+                         else str(ref))
             elif kind == "tile":
                 try:
                     tx, ty = (int(v) for v in str(ref).split(","))
                 except ValueError:
                     tx = ty = None
                 data = self.tiles.get((tx, ty)) if tx is not None else None
-                tname = data.get("_template") if isinstance(data, dict) else None
-                label = f"tile: {tname}" if isinstance(tname, str) and tname else "tile"
+                label = self.legend_label_tile(data)
             elif kind == "zone":
-                label = f"zone: {ref}"
+                label = self.legend_label_zone(ref)
             elif kind == "corpse":
-                c = self.find_corpse(ref) if hasattr(self, "find_corpse") else None
-                name = None
-                if isinstance(c, tuple) and len(c) >= 3 and isinstance(c[2], dict):
-                    name = (c[2].get("entity") or {}).get("name")
-                label = f"corpse: {name or ref}"
+                label = self.legend_label_corpse(ref)
             else:
                 continue
+            if label is None:
+                continue                # left out of the legend
             look = tuple(p.get(k) for k in self._LEGEND_LOOK)
             ent = entries.get(look)
             if ent is None:

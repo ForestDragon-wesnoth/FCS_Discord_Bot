@@ -1521,7 +1521,12 @@ hardcodes**.
   shared by both renderers via `entity_color` (772) — > `team_colors` /
   a palette-named team;
   ANSI only when `ctx.supports_color`, one code per run), legend
-  (`map_legend_by_default`, `!map legend`, `legend=`), coordinate rulers
+  (`map_legend_by_default`, `!map legend`, `legend=`; each thing names
+  itself through a `legend` value — a unit's var, a tile's data or its
+  template's, a zone's field (`!zone legend`), a disguise's key, a
+  corpse's snapshot var: `false` leaves it out, a text replaces the label;
+  `Match.legend_label_*`, shared by both renderers; a disguised unit's
+  label comes only from the disguise) (781), coordinate rulers
   (`map_coords`, `!map coords`, stacked column digits), hidden layers (`!map
   layer`, `hide=`), preview / sight marks (`preview_glyph`), viewport.
 - **Viewport** (`viewport_width/height` 28, `viewport_mode` auto = only
