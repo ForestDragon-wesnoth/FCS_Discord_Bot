@@ -99,6 +99,14 @@ or `all` and return `[x, y, map]`), `cells_in_rect` / `_area` / `_cone` /
 - The map argument also takes shortcuts: the channel's viewed map (tier 4)
   and "this unit's map". Section 10 lists the open details.
 
+**Zones and hooks (decided).** Zone names are per map: two maps may each
+have a `fire` zone, `!map copy` copies zones without renaming them, and an
+aura moves with its unit to a new map. The zone formula functions
+(`zone_get`, `zone_cells`, ...) therefore follow the unit-less rule above
+and need `map=` once a match has several maps. Inside a tile or zone hook,
+formulas default to the hook's own map (so `tile_get(tile_x, tile_y, ...)`
+works without `map=`), and the hook binds `tile_map` / `zone_map` naming it.
+
 **Scattering across maps: N in total.** `!tile place_random N <kind>
 map=all` (or a list of maps) places N in total, with every eligible cell
 across the chosen maps equally likely. A big map therefore gets a bigger
