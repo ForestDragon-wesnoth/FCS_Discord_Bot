@@ -20,7 +20,7 @@ from logic import COMMAND_USER, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Pas
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
 from journal import UNDO_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT
-from logic import check_id, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS
+from logic import check_id, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution
@@ -219,9 +219,11 @@ ELEVATED_ARGS: Dict[str, frozenset] = {
 # `!map teamcolor list` only SHOW settings, so they stay open while the
 # setting-changing forms of the same subcommand are host-gated.
 _ELEVATED_READ_FORMS = frozenset({("map", "layer", "list"),
-                                  ("map", "teamcolor", "list"),
-                                  ("map", "var", "list"),
-                                  ("map", "var", "get")})
+                                  ("map", "teamcolor", "list")})
+# Elevated subcommands whose BARE form only reports (`!map use` names the
+# channel's map). Map vars are the GM's data, so `!map var` stays host-gated
+# like `!match var` (user call).
+_ELEVATED_BARE_READS = frozenset({("map", "use")})
 
 # Commands that act on SERVER-WIDE state — the server's GameSystems (every
 # match on a system picks up an edit on its next rule refresh), its save store
@@ -546,7 +548,9 @@ class CommandRegistry:
               and words[0].lower() in ELEVATED_ARGS.get(name, ())
               and not (len(words) >= 2 and (name, words[0].lower(),
                                             words[1].lower())
-                       in _ELEVATED_READ_FORMS)):
+                       in _ELEVATED_READ_FORMS)
+              and not (len(words) == 1 and (name, words[0].lower())
+                       in _ELEVATED_BARE_READS)):
             # Full-reveal flag on a normally-open read -> host-gated.
             base = "host"
         if base == "host" and name == "foreach" and self._foreach_read_only(args, m):
@@ -1294,6 +1298,27 @@ _HOLDS_COMMAND_LOCK: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
     "vtt_holds_command_lock", default=False)
 
 
+@contextlib.asynccontextmanager
+async def holding_command_lock(mgr: MatchManager,
+                               ctx: Optional[ReplyContext] = None):
+    """Run a change made outside a typed command (a Discord button click)
+    the way a command runs: one at a time on the server, never in the
+    middle of another command, then committed to disk (storage notes go
+    to `ctx`)."""
+    if _HOLDS_COMMAND_LOCK.get():
+        yield
+        return
+    async with _command_lock(mgr):
+        token = _HOLDS_COMMAND_LOCK.set(True)
+        try:
+            yield
+        finally:
+            try:
+                await persist_workspace(mgr, ctx)
+            finally:
+                _HOLDS_COMMAND_LOCK.reset(token)
+
+
 def _command_lock(mgr: MatchManager) -> "asyncio.Lock":
     """The lock that runs one command at a time on `mgr` (runtime-only).
     Each server has its own manager (logic.Workspaces), so servers never
@@ -2021,6 +2046,7 @@ def _corpse_template_context(
 
 def _corpse_line(
     m: Match, x: int, y: int, eid: str, corpse: Dict[str, Any],
+    mp: Optional["Map"] = None,
 ) -> str:
     """Single-line corpse summary, rendered from the active match's
     corpse_line_format rule. Falls back to the engine default if the
@@ -2031,7 +2057,11 @@ def _corpse_line(
             "corpse_line_format",
             "{name} (`{id}`): HP: {hp}/{max_hp} X,Y: {x},{y} (corpse)",
         )
-    return _render_template(tmpl, _corpse_template_context(m, x, y, eid, corpse))
+    tctx = _corpse_template_context(m, x, y, eid, corpse)
+    tctx["map"] = mp.name if mp is not None else ""
+    tctx["map_shown"] = (mp.name if mp is not None and len(m.maps) > 1
+                         else "")
+    return _render_template(tmpl, tctx)
 
 
 def _part_status_str(m, p: Entity) -> str:
@@ -5533,8 +5563,12 @@ async def run_approved_request(req: dict, ctx: ReplyContext,
     # at the top level, where run() would record it.
     depth = _RUN_DEPTH.set(max(_RUN_DEPTH.get(), 1))
     try:
-        with _channel_pointed_at(mgr, ch, req.get("match_id")):
-            await registry.run(req["name"], req["args"], run_ctx, mgr)
+        # The lock first, then the re-point: a command running in the
+        # requester's channel must finish before the channel shows the
+        # request's match (a button click used to re-point it mid-batch).
+        async with holding_command_lock(mgr, run_ctx):
+            with _channel_pointed_at(mgr, ch, req.get("match_id")):
+                await registry.run(req["name"], req["args"], run_ctx, mgr)
     finally:
         _RUN_DEPTH.reset(depth)
 
@@ -7870,6 +7904,9 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if len(tail) == 1:
                 tid = _query_eid(ctx, m, tail[0])
                 t = m.entities[tid]
+                if t.map != e.map:
+                    return await ctx.send(
+                        f"❌ `{eid}` and `{tid}` are on different maps.")
                 tw, th = m.entity_footprint(t)
                 tx, ty = t.x + (tw - 1) / 2, t.y + (th - 1) / 2
                 what = f"`{tid}`"
@@ -8503,7 +8540,8 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "ent", "face",
-    usage="!ent face <id> <dir|cw|ccw> | !ent face <id> toward <eid | x y>",
+    usage=("!ent face <id> <dir|cw|ccw> | !ent face <id> toward <eid> | "
+           "!ent face <id> toward <x> <y>"),
     desc=(
         "Set or rotate facing. <dir> accepts the same direction aliases as "
         "!ent move (cardinals always; diagonals only when "
@@ -9267,11 +9305,11 @@ def _map_cell(ctx: ReplyContext, m, args: List[str], mp: "Map") -> str:
         berr: List[str] = []
         oerr: List[str] = []
         if show_tile:
+            tx = {"tile_x": x, "tile_y": y, "tile_map": mp.name}
             blocks = m._eval_block_spec(m._tile_block_spec(x, y, mp), mover,
-                                        {"tile_x": x, "tile_y": y}, berr)
+                                        dict(tx), berr)
             sees_blocked = m._eval_opaque_spec(
-                m._tile_opaque_spec(x, y, mp), mover, {"tile_x": x, "tile_y": y},
-                oerr)
+                m._tile_opaque_spec(x, y, mp), mover, dict(tx), oerr)
         for n in zones:
             zd = m.find_zone(n).get("data") or {}
             bspec = zd.get("block")
@@ -9280,10 +9318,12 @@ def _map_cell(ctx: ReplyContext, m, args: List[str], mp: "Map") -> str:
             ospec = zd.get("opaque")
             if ospec in (None, ""):
                 ospec = m.rules.get("zone_opaque_condition", "")
-            blocks = m._eval_block_spec(bspec, mover, {"zone_name": n},
+            blocks = m._eval_block_spec(bspec, mover, {"zone_name": n,
+                                                       "zone_map": mp.name},
                                         berr) or blocks
             sees_blocked = m._eval_opaque_spec(
-                ospec, mover, {"zone_name": n, "tile_x": x, "tile_y": y},
+                ospec, mover, {"zone_name": n, "tile_x": x, "tile_y": y,
+                               "zone_map": mp.name},
                 oerr) or sees_blocked
         cspec = m.rules.get("corpse_block_condition", "")
         if cspec not in (None, ""):
@@ -9291,7 +9331,8 @@ def _map_cell(ctx: ReplyContext, m, args: List[str], mp: "Map") -> str:
             for cid, c in corpses:
                 cv = (c.get("entity") or {}).get("vars") or {}
                 if m._eval_block_spec(cspec, mover, {
-                        "tile_x": x, "tile_y": y, "corpse_id": cid,
+                        "tile_x": x, "tile_y": y, "tile_map": mp.name,
+                        "corpse_id": cid,
                         "corpse_team": str(cv.get(team_var, "") or "")},
                         berr):
                     blocks = True
@@ -9375,6 +9416,9 @@ def _preview_cells(ctx, m, toks: List[str],
     if not toks:
         raise VTTError(f"Usage: {_PREVIEW_USAGE}")
     limit = int(m.rules.get("formula_cell_limit", 100000))
+    # Clipped to the map while building, like the formula functions, so
+    # the cost follows the map, not the numbers typed.
+    bounds = (mp.grid_width, mp.grid_height)
     shape = toks[0].lower()
 
     def done(i: int, maxn: int) -> None:
@@ -9393,7 +9437,7 @@ def _preview_cells(ctx, m, toks: List[str],
                                f"square_radius, manhattan or euclidean.")
             metric = _DIST_METRICS[low]
         done(i, i + 2)
-        cells = _cells_in_burst(x, y, r, metric, limit=limit)
+        cells = _cells_in_burst(x, y, r, metric, limit=limit, bounds=bounds)
         desc = f"burst r{r} at ({x},{y}) [{metric}]"
     elif shape == "cone":
         x, y, i = _preview_point(ctx, m, toks, 1, "the origin", mp)
@@ -9409,19 +9453,20 @@ def _preview_cells(ctx, m, toks: List[str],
         length = _preview_num(toks, i + 1, "the length")
         half = _preview_num(toks, i + 2, "the half-angle") if i + 2 < len(toks) else 45
         done(i, i + 3)
-        cells = _cells_in_cone(x, y, direction, length, half, limit=limit)
+        cells = _cells_in_cone(x, y, direction, length, half, limit=limit,
+                               bounds=bounds)
         desc = f"cone {toks[i]} length {length} from ({x},{y})"
     elif shape == "line":
         x1, y1, i = _preview_point(ctx, m, toks, 1, "the start", mp)
         x2, y2, i = _preview_point(ctx, m, toks, i, "the end", mp)
         done(i, i)
-        cells = _cells_in_line(x1, y1, x2, y2, limit=limit)
+        cells = _cells_in_line(x1, y1, x2, y2, limit=limit, bounds=bounds)
         desc = f"line ({x1},{y1}) to ({x2},{y2})"
     elif shape == "rect":
         x1, y1, i = _preview_point(ctx, m, toks, 1, "the first corner", mp)
         x2, y2, i = _preview_point(ctx, m, toks, i, "the second corner", mp)
         done(i, i)
-        cells = _cells_in_rect(x1, y1, x2, y2, limit=limit)
+        cells = _cells_in_rect(x1, y1, x2, y2, limit=limit, bounds=bounds)
         desc = f"rect ({x1},{y1}) to ({x2},{y2})"
     else:
         raise VTTError(f"Unknown preview shape `{toks[0]}`. Usage: {_PREVIEW_USAGE}")
@@ -9628,6 +9673,44 @@ assert not _unreserved, f"add {_unreserved} to logic.MAP_RESERVED_NAMES"
 _MAP_MANAGE_SUBS = ("new", "list", "delete", "rename", "copy", "use", "var")
 
 
+def _map_setting_value(setting: str, value: Any) -> Any:
+    """`value` checked for map setting `setting` the way its own command
+    checks it (VTTError otherwise)."""
+    if setting in ("fog", "fog_memory", "borders"):
+        word = str(value).strip().lower()
+        if isinstance(value, bool):
+            return value
+        if word in ("on", "true", "yes", "1"):
+            return True
+        if word in ("off", "false", "no", "0"):
+            return False
+        raise VTTError(f"The {setting} setting is on or off, got `{value}`.")
+    if setting == "border_opacity":
+        if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or not 0 <= value <= 100:
+            raise VTTError(f"The border opacity is a number 0-100, got "
+                           f"`{value}`.")
+        return int(value)
+    if setting == "background_mode":
+        if str(value).lower() not in ("stretch", "tile", "center"):
+            raise VTTError(f"The background mode is stretch, tile or center, "
+                           f"got `{value}`.")
+        return str(value).lower()
+    if setting == "hidden_layers":
+        words = ([str(v) for v in value] if isinstance(value, list)
+                 else [w.strip() for w in str(value).split(",") if w.strip()])
+        bad = [w for w in words if w not in _MAP_LAYERS]
+        if bad:
+            raise VTTError(f"Unknown layer(s) {', '.join(bad)}: the layers are "
+                           f"{', '.join(_MAP_LAYERS)}.")
+        return sorted(set(words))
+    # background (a sprite key) and border_color (a colour name or hex).
+    if not isinstance(value, str) or not value:
+        raise VTTError(f"The {setting.replace('_', ' ')} setting is a word, "
+                       f"got `{value}`.")
+    return value
+
+
 async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
                       args: List[str], mapspec: Optional[str]):
     """`!map new / list / delete / rename / copy / use / var`."""
@@ -9646,9 +9729,13 @@ async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
     if sub == "list":
         _check_tail(args, 1, (), "!map list")
         here = m.channel_map(ctx.channel_key, _view_pov(ctx, m, []))
+        pov = _query_pov(ctx, m)
         lines = [f"**Maps of {m.name}:**"]
         for mp in m.maps.values():
-            n = sum(1 for e in m.units_on_map(mp.name) if not e.part_of)
+            # Only the units this channel's view may list (a hidden unit
+            # isn't counted, as !find doesn't list it).
+            n = sum(1 for e in m.units_on_map(mp.name)
+                    if not e.part_of and not _pov_hides(m, pov, e.id))
             bits = [mp.size_text(), f"{n} unit{'s' if n != 1 else ''}"]
             if m.fog_on(mp):
                 bits.append("fog")
@@ -9721,6 +9808,16 @@ async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
         if len(args) < 4:
             raise VTTError("Usage: `!map var set <path> <value>`.")
         value = _parse_scalar(args[3])
+        setting = {m.map_var_name(k): k for k in MAP_SETTING_RULES}.get(
+            args[2].split(".")[0])
+        if setting is not None:
+            # A setting's var takes what its own command would store
+            # (`!match fog`, `!map border`, `!map background`, `!map
+            # layer`): a value it can't read used to fall back silently.
+            if "." in args[2]:
+                raise VTTError(f"`{args[2].split('.')[0]}` is the map's "
+                               f"{setting} setting: it holds one value.")
+            value = _map_setting_value(setting, value)
         check_no_value_ancestor(mp.vars, args[2], "map var")
         _set_path(mp.vars, args[2], _own_value(value))
         return await ctx.send(f"{where} var `{args[2]}` = {value!r}")
@@ -9755,7 +9852,7 @@ async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
                    f"del / list.")
 
 
-@registry.command("map", access="all", usage="!map [full] [as=<team>] [hide=<layers>] [legend=on|off] [coords=on|off] [map=<map>] | !map cell <x> <y> [for=<eid>] | !map preview <burst|cone|line|rect> ... | !map ent_sight <eid> | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 28), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map preview burst|cone|line|rect ...` shows the cells an area shape would cover (marked with the preview_glyph rule's character on cells without a unit; graphics surfaces draw translucent squares above units, colour/opacity from the preview_color / preview_opacity rules or `color=` / `opacity=`) and lists the visible units inside — nothing happens to them. `!map ent_sight <eid>` marks the cells that unit sees right now (range + line of sight from its whole body, like can_see) and lists the units it sees; under a team POV players may ask about their own team's units only. `!map full` (host-gated) forces the omniscient view; `as=<team>` (host-only) previews what that team sees (`as=omniscient` = everything), without binding a channel. `!map cell <x> <y> [for=<eid>]` reports everything at one cell the channel can see — units, tile data, zones, corpses, and where its movement / sight block settings come from; `for=<eid>` adds whether the cell blocks that unit (hidden layers are left out). `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets a per-match background sprite; `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). `!map border on|off` / `color <name>` / `opacity <0-100>` / `clear` (host-gated) overrides the grid-line border rules per match (borders draw above the ground, below tiles/entities). `!map mode text|image` (host-gated) sets the per-match default render mode — `image` makes a plain `!map` and the auto-update board render graphically on Discord (text surfaces fall back to ASCII). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
+@registry.command("map", access="all", usage="!map [full] [as=<team>] [hide=<layers>] [legend=on|off] [coords=on|off] [map=<map>] | !map cell <x> <y> [for=<eid>] | !map preview <burst|cone|line|rect> ... | !map ent_sight <eid> | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 28), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map preview burst|cone|line|rect ...` shows the cells an area shape would cover (marked with the preview_glyph rule's character on cells without a unit; graphics surfaces draw translucent squares above units, colour/opacity from the preview_color / preview_opacity rules or `color=` / `opacity=`) and lists the visible units inside — nothing happens to them. `!map ent_sight <eid>` marks the cells that unit sees right now (range + line of sight from its whole body, like can_see) and lists the units it sees; under a team POV players may ask about their own team's units only. `!map full` (host-gated) forces the omniscient view; `as=<team>` (host-only) previews what that team sees (`as=omniscient` = everything), without binding a channel. `!map cell <x> <y> [for=<eid>]` reports everything at one cell the channel can see — units, tile data, zones, corpses, and where its movement / sight block settings come from; `for=<eid>` adds whether the cell blocks that unit (hidden layers are left out). `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets the map's background sprite (a map var); `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). `!map border on|off` / `color <name>` / `opacity <0-100>` / `clear` (host-gated) overrides the grid-line border rules for one map, in its map vars (borders draw above the ground, below tiles/entities). MAPS: `!map new|list|delete|rename|copy|use`; `!map var set|get|del|list` keeps free-form data per map, host-gated like `!match var` (the setting vars — fog, fog memory, background, borders, hidden layers — take the same values as their commands). `!map mode text|image` (host-gated) sets the per-match default render mode — `image` makes a plain `!map` and the auto-update board render graphically on Discord (text surfaces fall back to ASCII). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     args, mapspec = _pop_map_opt(args)
@@ -9783,7 +9880,9 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                   and args[1].lower() != "list"))
     unit = None
     named = (args[1:2] if sub in ("center", "ent_sight")
-             else args[2:3] if sub == "preview" else [])
+             else args[2:3] if sub == "preview"
+             else [a[4:] for a in args[3:] if a.lower().startswith("for=")]
+             if sub == "cell" else [])
     for tok in named:
         ce = m.entities.get(_resolve_eid(m, tok))
         if ce is not None and not _pov_hides(m, _query_pov(ctx, m), ce.id):
@@ -10239,14 +10338,15 @@ async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # Gated by show_corpses_in_entity_list — when false we silently
     # omit the section (corpses still exist in tile data).
     if bool(m.rules.get("show_corpses_in_entity_list", True)):
-        corpses = [(x, y, eid, c) for (x, y, eid, c) in m.all_corpses()
-                   if m.corpse_visible_to(eid, c, x, y, pov)]
+        corpses = [(x, y, eid, c, cmp) for (cmp, x, y, eid, c)
+                   in m.every_corpse()
+                   if m.corpse_visible_to(eid, c, x, y, pov, cmp)]
         if corpses:
             if lines:
                 lines.append("")  # blank line separates living from dead
             lines.append("Dead:")
-            for (x, y, eid, corpse) in corpses:
-                lines.append(f"   {_corpse_line(m, x, y, eid, corpse)}")
+            for (x, y, eid, corpse, cmp) in corpses:
+                lines.append(f"   {_corpse_line(m, x, y, eid, corpse, cmp)}")
     if not lines:
         return await ctx.send(_as_note(args) + "(no entities)")
     return await ctx.send(_as_note(args) + "\n".join(lines))
@@ -10372,7 +10472,9 @@ def _entity_path_value(m: Match, e: Entity, path: str,
     logic.RESERVED_VAR_PATHS) come from the entity's own fields, matching
     `entity[X].path` in formulas; anything else walks the vars. `name` is
     the name shown to `pov`, so a disguise's decoy name is what a fooled
-    team can search and sort by."""
+    team can search and sort by, and every other path reads the disguise's
+    `vars` over the real ones (the disguise var itself left out), as `!ent
+    info` shows them."""
     seg0 = path.split(".", 1)[0]
     if seg0 in RESERVED_VAR_PATHS:
         if "." in path:
@@ -10380,7 +10482,7 @@ def _entity_path_value(m: Match, e: Entity, path: str,
         if seg0 == "name":
             return True, m.entity_display_name(e, pov)
         return True, getattr(e, seg0)
-    return _resolve_dotted_var(e.vars, path)
+    return _resolve_dotted_var(m.presented_vars(e, pov), path)
 
 
 def _coerce_for_compare(s: str) -> Any:
@@ -11956,8 +12058,8 @@ def _diff_named(label: str, a: Dict[str, Any], b: Dict[str, Any]) -> List[str]:
 
 def _diff_entity(eid: str, ea: Dict[str, Any], eb: Dict[str, Any],
                  words: Tuple[str, str] = ("removed", "added")) -> List[str]:
-    """Per-entity diff lines: name, position, facing, body-part / mount
-    links, vars (flattened to leaves), statuses, passives and clamps. Only
+    """Per-entity diff lines: name, position (with the map when it
+    changed), facing, body-part / mount links, vars (flattened to leaves), statuses, passives and clamps. Only
     fields that actually differ contribute lines. `words` names a status /
     passive / clamp present only on the first / only on the second side."""
     gone, new = words
@@ -11965,7 +12067,11 @@ def _diff_entity(eid: str, ea: Dict[str, Any], eb: Dict[str, Any],
     if ea.get("name") != eb.get("name"):
         lines.append(f"    name: {ea.get('name')!r} -> {eb.get('name')!r}")
     pa, pb = (ea.get("x"), ea.get("y")), (eb.get("x"), eb.get("y"))
-    if pa != pb:
+    ma, mb = ea.get("map"), eb.get("map")
+    if ma != mb:
+        lines.append(f"    position: ({pa[0]},{pa[1]}) on `{ma}` -> "
+                     f"({pb[0]},{pb[1]}) on `{mb}`")
+    elif pa != pb:
         lines.append(f"    position: ({pa[0]},{pa[1]}) -> ({pb[0]},{pb[1]})")
     for field_name in ("facing", "part_of", "mounted_on", "mount_slot"):
         va, vb = ea.get(field_name), eb.get(field_name)
@@ -14596,7 +14702,7 @@ registry.annotate_sub(
 
 @registry.command(
     "zone",
-    usage=("!zone <new|drop|rename|add|remove|fill|shift|anchor|unanchor|set|del|clear|glyph|sprite|color|info|list|cells> ..."),
+    usage=("!zone <new|drop|rename|add|remove|fill|shift|anchor|unanchor|set|del|clear|glyph|sprite|color|legend|info|list|cells|hook> ..."),
     desc=(
         "Named multi-cell regions. A zone is a SET of cells plus a "
         "free-form data dict, optional hooks, and an optional map glyph "
@@ -14607,8 +14713,9 @@ registry.annotate_sub(
         "(`set`/`del`/`clear`/`info`) exactly like tile data, and is "
         "readable from formulas via zone_get/zone_has plus membership "
         "queries (zones_at, in_zone, entities_in_zone, ...). Subcommands: "
-        "new, drop, add, remove, fill, shift, set, del, clear, glyph, "
-        "sprite (a graphics sprite key, like glyph), info, list, cells, hook."
+        "new, drop, rename, add, remove, fill, shift, anchor, "
+        "unanchor, set, del, clear, glyph, sprite (a graphics sprite key, "
+        "like glyph), color, legend, info, list, cells, hook."
     ),
 )
 async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -14938,8 +15045,9 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             "data": z.get("data") or {},
             "hooks": sorted((z.get("hooks") or {}).keys()),
         }
-        if isinstance(z.get("glyph"), str):
-            view["glyph"] = z["glyph"]
+        for key in ("glyph", "color", "sprite", "legend"):
+            if isinstance(z.get(key), str) or z.get(key) is False:
+                view[key] = z[key]
         if len(m.maps) > 1:
             view["map"] = m.zone_map(name).name
         if z.get("anchor"):
@@ -15995,7 +16103,8 @@ registry.annotate_sub(
     usage="!zone info <name>",
     desc=(
         "Show a zone's full state: its cells, data dict, registered hook "
-        "names, and glyph (if any)."
+        "names, its glyph, colour, sprite and legend label (when set), its "
+        "aura binding and, on a match with several maps, its map."
     ),
 )
 registry.annotate_sub(
@@ -17855,7 +17964,7 @@ async def _run_action_dispatch(
     # Parse the target tokens off the front, then args off the rest.
     try:
         target_value, remaining = parse_target(
-            action.target_type, pruned, m,
+            action.target_type, pruned, m, actor_id,
         )
         args_dict = parse_args_tokens(remaining)
     except VTTError as ex:
@@ -18076,6 +18185,19 @@ _SUB_DESCS = {
         "reason, or `clear` the outcome. Fires the `match_outcome` event "
         "(winner / reason / round)."),
     ("match", "outcome"): "Show the declared winner and reason, if any.",
+    ("zone", "anchor"): (
+        "Bind the zone to a unit as an AURA: its cells become every cell "
+        "within [radius] (default 0 = the body) of any cell the unit "
+        "covers, by [metric] (square_radius, manhattan or euclidean), and "
+        "follow the unit as it moves. Anchor loss follows the "
+        "anchored_zone_on_anchor_loss rule."),
+    ("zone", "unanchor"): (
+        "Release an aura: the zone keeps its current cells and stops "
+        "following its unit."),
+    ("zone", "sprite"): (
+        "The graphics sprite drawn on the zone's cells (a key from the "
+        "sprites folder), like `!zone glyph` for text; `clear` / `-` "
+        "removes it."),
     ("zone", "legend"): (
         "What the map legend calls this zone: a label of your own (a trap "
         "zone listed as \"floor\"), `false` to leave it out, or `-` for the "

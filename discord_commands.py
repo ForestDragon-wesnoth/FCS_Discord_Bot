@@ -582,9 +582,11 @@ class _ResumeView(discord.ui.View):
         # A click is not a typed command, so it isn't the clicker's `!again`.
         depth = vtt_commands._RUN_DEPTH.set(1)
         try:
-            with vtt_commands._channel_pointed_at(
-                    self._mgr, ictx.channel_key, self._mid):
-                await registry.run("match", ["resume"], ictx, self._mgr)
+            # The lock before the re-point (see run_approved_request).
+            async with vtt_commands.holding_command_lock(self._mgr, ictx):
+                with vtt_commands._channel_pointed_at(
+                        self._mgr, ictx.channel_key, self._mid):
+                    await registry.run("match", ["resume"], ictx, self._mgr)
         finally:
             vtt_commands._RUN_DEPTH.reset(depth)
         if _boards:
@@ -791,17 +793,22 @@ class _PanView(discord.ui.View):
                 entry["message"] = interaction.message
                 await _retire_board(self.channel_key, entry, mid)
             return
-        if m is None or not m.viewport_engaged():
+        # The map the board shows (a match with several maps has a camera
+        # per map).
+        mp = m.channel_map(self.channel_key, m.channel_pov(self.channel_key)) \
+            if m is not None else None
+        if m is None or not m.viewport_engaged(mp):
             try:
                 await interaction.response.defer()
             except Exception:
                 pass
             return
-        vw, vh = m._viewport_dims()
-        m.pan_view(self.channel_key,
-                   dx * _pan_step(m, vw), dy * _pan_step(m, vh))
-        # The camera is match state, but a click isn't a command: save it.
-        await vtt_commands.persist_workspace(self._mgr, None)
+        # A click isn't a command, but it changes the camera like one: it
+        # waits for the command running on this server and is saved after.
+        async with vtt_commands.holding_command_lock(self._mgr):
+            vw, vh = m._viewport_dims(mp)
+            m.pan_view(self.channel_key,
+                       dx * _pan_step(m, vw), dy * _pan_step(m, vh), mp)
         entry = _boards.get(self.channel_key)
         if entry is not None:
             entry["message"] = interaction.message

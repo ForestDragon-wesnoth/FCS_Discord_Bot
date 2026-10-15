@@ -628,10 +628,13 @@ class SourceProxy:
             m.surface_log(log)
 
 
-def _check_on_map(match: Any, x: int, y: int) -> None:
+def _check_on_map(match: Any, x: int, y: int,
+                  actor: Optional[str] = None) -> None:
     """A location target names a cell of the map (one off it used to run
-    the body on a cell nothing can occupy)."""
-    mp = match.get_map()
+    the body on a cell nothing can occupy): the acting unit's map, else
+    the match's only map."""
+    ae = match.entities.get(actor) if actor else None
+    mp = match.map_of(ae) if ae is not None else match.get_map()
     if not mp.in_bounds(x, y):
         raise VTTError(f"location ({x},{y}) is off the map "
                        f"({mp.size_text()}).")
@@ -756,6 +759,7 @@ def parse_args_tokens(tokens: List[str]) -> Dict[str, Any]:
 
 def parse_target(
     target_type: str, tokens: List[str], match: "Match",
+    actor: Optional[str] = None,
 ) -> Tuple[Any, List[str]]:
     """Consume the leading tokens that constitute the target and
     return `(target_value, remaining_tokens)`. The remaining tokens
@@ -798,7 +802,7 @@ def parse_target(
                 f"location target needs integer coords; got "
                 f"`{tokens[0]} {tokens[1]}`."
             )
-        _check_on_map(match, x, y)
+        _check_on_map(match, x, y, actor)
         return Coord(x, y), list(tokens[2:])
     if target_type == "entity_list":
         eids: List[str] = []
@@ -820,7 +824,7 @@ def parse_target(
                 x = int(tokens[i]); y = int(tokens[i + 1])
             except ValueError:
                 break
-            _check_on_map(match, x, y)
+            _check_on_map(match, x, y, actor)
             coords.append(Coord(x, y))
             i += 2
         if not coords:
@@ -893,7 +897,7 @@ def dedupe_targets(target_type: str, value: Any,
 
 
 def coerce_target(target_type: str, value: Any, match: "Match",
-                  name: str) -> Any:
+                  name: str, actor: Optional[str] = None) -> Any:
     """use_action()'s target turned into what the action's body gets from
     `!action` (parse_target): an entity id, a Coord (from [x, y] or a
     Coord), a list of either, a corpse id or None, checked the same way.
@@ -909,7 +913,7 @@ def coerce_target(target_type: str, value: Any, match: "Match",
         else:
             raise VTTError(f"action `{name}` takes a location target: "
                            f"[x, y], got {v!r}.")
-        _check_on_map(match, x, y)
+        _check_on_map(match, x, y, actor)
         return Coord(x, y)
 
     def _eid(v: Any) -> str:

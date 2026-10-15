@@ -19917,7 +19917,7 @@ SCENARIO 717 — Graphics: the image legend
 !match fog on
 !as view red
 !map scene list legend=on
-?? Legend: glyph s, color blue = Merchant
+?? Legend: glyph s = Merchant
 ?? Legend: sprite fog_default = fog (unseen)
 ?! Ghost
 !as view clear
@@ -19934,8 +19934,10 @@ the match), graphics draw a legend below the map: one row per distinct look
 has, in the order the looks first appear row by row — units by their shown
 name, `tile: <template>` / `tile`, `zone: <name>`, `corpse: <name>`, then
 `fog (unseen)`. `!map scene list` prints those entries. It follows the
-channel's view: under red's view the spy shows as its disguise, Merchant, the
-ghost in the fog is left out, and fog gets an entry. The harness has no image
+channel's view: under red's view the spy shows as its disguise, Merchant,
+without its real team's blue (a disguise is drawn in its own `color`, else its
+`vars.team`'s colour, else none), the ghost in the fog is left out, and fog
+gets an entry. The harness has no image
 surface, so `!map image legend=on` reports that images are drawn on Discord
 and in gui.py.
 
@@ -23478,9 +23480,11 @@ SCENARIO 786 — Map vars: !map var on one map or several; default_map_vars fill
 ?? No vars set on map `pit`.
 !as player pat
 !map var list map=cave
-?? Vars of map `cave`
+?? needs host approval
 !map var set x 1 map=cave
 ?? needs host approval
+!map use
+?? This channel follows its board
 !as host
 
 Expected: A map holds free-form vars (`!map var set|get|del|list`),
@@ -23491,8 +23495,10 @@ its own refusal (deleting a var only one map has removes it there and says
 the other lacks it). A read without `map=` uses the channel's map (here
 `main`, the map the board follows). The
 `default_map_vars` rule (`!defvar map add|remove|list`, admin) fills the
-vars a NEW map lacks; it doesn't touch existing maps. Players may read map
-vars; a write is queued for a host like other host commands.
+vars a NEW map lacks; it doesn't touch existing maps. Map vars are the
+GM's data, so a player's read is queued for a host like `!match var get`
+(and a write like any host command); a player may still ask which map the
+channel uses (bare `!map use`).
 
 SCENARIO 787 — Map settings are map vars: fog per map, borders, background; the rule is the live default
 --------------------------------------------------------------------------------------------------------
@@ -23968,3 +23974,387 @@ channel's `!map use` choice are saved with the match (`!as restart` reloads
 them). Deleting a map (killing its units) and a cross-map teleport are
 each one undo step, and `!undo command` brings the map, its units and
 their positions back.
+
+SCENARIO 794 — Two maps: tile conditions, zones, location actions and the roster read their own map
+---------------------------------------------------------------------------------------------------
+
+!match new tc TwoMaps 8 8
+!match use tc
+!ent add hero Hero 30 3 3 9
+!ent set_var hero team red
+!tile set 4 3 wall solid
+!system set default tile_block_condition "tile_get(tile_x, tile_y, 'wall') == 'solid'"
+!map new attic 4 4
+!ent move hero 1 right
+?? blocks `hero`
+!map cell 4 3 for=hero
+?? For `hero`: blocks movement: yes
+!tile set 2 1 wall solid map=attic
+!ent add bat Bat 5 1 1 3 map=attic
+!ent move bat 1 right
+?? blocks `bat`
+!system set default tile_visibility_condition "not tile_has(tile_x, tile_y, 'hidden')"
+!tile set 6 6 glyph T map=main
+!tile set 6 6 hidden true map=main
+!tile set 7 7 glyph V map=main
+!as view red
+!tile list
+?? (7,7)
+?! (6,6)
+!as view clear
+!zone new roost map=attic
+!zone fill roost 1 1 2 2
+!eval "entities_in_zone('roost')"
+?? ['bat']
+!ent set_var hero actions.blink.target location
+!ent set_var hero actions.blink.body "move_entity('hero', target.x, target.y)"
+!action hero blink 5 5
+!assert "entity[hero].x == 5 and entity[hero].y == 5"
+!action hero blink 9 9
+?? ❌
+!ent kill bat
+!list
+?? Hero
+?? Bat
+!state
+?? Hero
+
+Expected: A tile or zone condition reads the map of the cell it judges, so
+`tile_get(tile_x, tile_y, ...)` works without `map=` on a match with two maps:
+the wall on `main` still blocks `hero`, the wall on `attic` blocks `bat`, and
+the hidden tile stays out of red's `!tile list`. `entities_in_zone` finds the
+zone's own map by its name. A location target is checked against the actor's
+map (5 5 is on main; 9 9 is off it). `!list` and `!state` list the units and,
+under Dead:, the corpses of every map.
+
+SCENARIO 795 — Unit-relative queries, facing, mounts and part attach stay on the unit's map
+------------------------------------------------------------------------------------------
+
+!match new xm X 10 10
+!match use xm
+!map new b 10 10
+!ent add a1 A1 10 3 3 5 map=main
+!ent add a2 A2 10 6 3 4 map=main
+!ent add b1 B1 10 3 4 3 map=b
+!zone new zb map=b
+!zone fill zb 3 3 5 5
+!eval "entities_within('a1', 3)"
+?? = `['a2']`
+!eval "nearest_entity('a1')"
+?? = `'a2'`
+!eval "chain_targets('a1', 2)"
+?? = `['a2']`
+!eval "entity_distance('a1', 'b1')"
+?? = `None`
+!eval "zone_distance('a1', 'zb')"
+?? = `None`
+!eval "nearest_cell('a1', 'b1')"
+?? = `None`
+!eval "entities_at(3, 4)"
+?? This match has 2 maps
+!ent face a1 toward b1
+?? ❌ `a1` and `b1` are on different maps.
+!ent face a1 toward 6 3
+?? `a1` now faces right, toward (6, 3).
+!eval "face_toward('a1', 'b1')"
+?? different maps
+!ent set_var a1 slots.back.capacity 1
+!mount b1 a1 back
+?? different maps
+!part attach b1 a1
+?? different maps
+!assert "entity[b1].x == 3 and entity[b1].y == 4"
+
+Expected: Queries centred on a unit see only its map: `entities_within`,
+`nearest_entity` and `chain_targets` from a1 skip b1 on map b, and distances
+between units (or a unit and a zone) on different maps are None. A cell query
+with no unit (`entities_at`) needs a map on a match with two. Turning toward,
+mounting and attaching refuse across maps, and b1 stays where it was.
+
+SCENARIO 796 — A loaded vehicle boarding another carries its riders; parts and segments move only with their body
+-----------------------------------------------------------------------------------------------------------------
+
+!match new mv Vehicles 12 8
+!match use mv
+!ent add a A 20 2 2 5
+!ent add b B 20 4 4 4
+!ent set_var b slots.seat.capacity 1
+!ent set_var b slots.seat.region all
+!ent add c C 20 6 6 3
+!ent set_var c slots.seat.capacity 1
+!ent set_var c slots.seat.region all
+!mount a b seat
+!mount b c seat
+!assert "entity[a].x == 6 and entity[a].y == 6"
+!ent add x X 20 4 5 1
+!eval "entities_within('x', 1)"
+?! 'a'
+!map new cellar 8 6
+!map new closet 1 1
+!ent add ogre Ogre 30 2 2 5 map=main
+!part add ogre oarm Arm 10 10
+!part locate oarm 4 2
+!ent tp oarm 2 2 cellar
+?? ❌ `oarm` is a body part of `ogre`: move `ogre` to another map to take it along.
+!ent tp ogre 7 2 cellar
+?? ❌
+!ent info oarm
+?? on main
+!ent tp ogre 2 2 cellar
+?? on map `cellar` (from `main`)
+!ent info oarm
+?? on cellar
+!ent add worm Worm 10 9 7 5 map=main
+!part segment worm w1 W1 5 5
+!part segment worm w2 W2 5 5
+!ent tp w1 3 3 cellar
+?? ❌ `w1` is a body part of `worm`
+!ent tp worm 1 1 closet
+?? ❌ no room on map `closet` for segment(s)
+!ent info worm
+?? on main
+!ent tp worm 5 5 cellar
+!find map:cellar ids
+?? w1 w2
+?? worm
+
+Expected: Mounting `b` (carrying `a`) onto `c` re-seats `a` with it, so `a`
+stands at c's cell and an area query around b's old cell no longer finds it.
+A body part or snake segment can't be teleported to another map on its own:
+the reply names its root. A cross-map teleport moves the whole body or
+nothing: the ogre's arm would land off cellar's 8-wide grid at (9,2), and
+the closet has no cell for the worm's segments, so both refuse and leave
+everything on main. With room, the parts and segments arrive with their body.
+
+SCENARIO 797 — !map resize in kill mode with a located part and snake segments off the new edge
+-------------------------------------------------------------------------------------------------
+
+!match new rk Resize 10 8
+!match use rk
+!ent add ogre Ogre 30 5 4 5
+!part add ogre arm Arm 10 10
+!part locate arm 1 4
+!ent add worm Worm 10 8 7 5
+!part segment worm w1 W1 5 5
+!part segment worm w2 W2 5 5
+!ent move worm 3 left
+!assert "entity[w1].x == 6 and entity[w2].x == 7"
+!system set default map_resize_shrink_mode kill
+!map resize 9 8 right
+?? killed `arm`
+!assert "not has_part('ogre', 'arm')"
+!assert "entity[ogre].x == 4 and entity[worm].x == 4"
+!map resize 4 8 left
+?? killed `w1`, `w2`
+!part list worm
+?? has no body parts
+!assert "entity[worm].x == 4 and entity[worm].y == 7"
+
+Expected: A body part or snake segment that would land off the new grid is
+killed (its on_death fires, a vital part would kill its body) and then
+removed, since a part destroyed in place would still stand off the grid.
+Before this fix the loop killed the lingering part again forever and the bot
+froze. The bodies themselves stay and shift with the map.
+
+SCENARIO 798 — !map rename rewrites coordinates in tile, zone and status data; diffs and !map cell for= name the right map
+--------------------------------------------------------------------------------------------------------------------------
+
+!match new rn Rename 10 10
+!match use rn
+!ent add a A 10 2 2 5
+!ent add d D 10 5 5 5
+!eval "tile_set(6, 6, 'portal_dest', [2, 2, 'cellar'])"
+!zone new zz
+!zone fill zz 1 1 2 2
+!eval "zone_set('zz', 'dest', [4, 4, 'cellar'])"
+!eval "entity[a].home = [3, 3, 'cellar']"
+!eval "entity[d].home = [3, 3, 'cellar']"
+!ent kill d
+!map new cellar 6 6
+!status def marked
+!eval "status_apply('a', 'marked', 1, 3)"
+!eval "status_set('a', 'marked', 'spot', [1, 1, 'cellar'])"
+!map rename cellar basement
+?? (5 stored coordinate(s) updated)
+!tile info 6 6 map=main
+?? "basement"
+?! "cellar"
+!assert "zone_get('zz', 'dest') == [4, 4, 'basement']"
+!assert "entity[a].home == [3, 3, 'basement']"
+!assert "status_get('a', 'marked', 'spot') == [1, 1, 'basement']"
+!assert "corpse_var('d', 'home') == [3, 3, 'basement']"
+!ent tp a 3 3 basement
+!undo command preview
+?? position: (3,3) on `basement` -> (2,2) on `main`
+!dry ent tp a 2 2 main
+?? position: (3,3) on `basement` -> (2,2) on `main`
+!map use main
+!tile set 4 3 block true map=basement
+!ent move a 1 right
+?? blocks `a`
+!map cell 4 3 for=a
+?? on `basement`
+?? For `a`: blocks movement: yes
+
+Expected: Renaming a map rewrites every stored `[x, y, map]` naming it: in
+unit vars, corpses, tile data, zone data and status instances (five here).
+The undo preview and `!dry` show a move between maps as a position change
+with each side's map. `!map cell ... for=<unit>` explains the cell on that
+unit's map, although the channel uses `main`.
+
+SCENARIO 799 — !map list counts only units the view may list; the setting map vars take only valid values
+-----------------------------------------------------------------------------------------------------------
+
+!match new ml Counts 10 10
+!match use ml
+!ent add hero Hero 10 2 2 5
+!ent set_vars hero team=red fog_vision_radius=1
+!ent add spy Spy 10 9 9 4
+!ent set_var spy team blue
+!ent add spy2 Spy 10 9 7 4
+!ent set_var spy2 team blue
+!map var set fog_memory maybe
+?? ❌ The fog_memory setting is on or off
+!map var set border_opacity abc
+?? ❌ The border opacity is a number 0-100
+!map var set border_opacity 150
+?? ❌
+!map var set background.sprite stone
+?? ❌ `background` is the map's background setting: it holds one value.
+!map var set hidden_layers "fog,legend"
+?? ❌ Unknown layer(s) legend
+!map var set background_mode spin
+?? ❌ The background mode is stretch, tile or center
+!map var set border_opacity 40
+?? = 40
+!map var set hidden_layers "zones,tiles"
+!map var get hidden_layers
+?? ['tiles', 'zones']
+!map var set fog on
+!match bind pov=red
+!as player alice
+!map list
+?? `main`: 10x10, 1 unit, fog
+!as host
+!match unbind
+!match use ml
+!map list
+?? `main`: 10x10, 3 units, fog
+
+Expected: `!map var set` on a setting var (fog, fog memory, background and
+its mode, borders and their colour / opacity, hidden layers) takes the same
+values as the setting's own command and refuses anything else, including a
+nested path under it. Under red's view `!map list` counts the one unit red
+can see; the omniscient view counts all three.
+
+SCENARIO 800 — Zone sprite, legend and colour are saved: they survive a failed action, an undo and a restart
+-------------------------------------------------------------------------------------------------------------
+
+!match new zs Zones 6 6
+!match use zs
+!ent add hero Hero 10 1 1 5
+!ent set_vars hero team=red fog_vision_radius=9
+!zone new trap
+!zone fill trap 3 3 3 3
+!zone glyph trap .
+!zone legend trap false
+!zone sprite trap spikes
+!zone color trap red
+!ent set_var hero actions.oops.target none
+!ent set_var hero actions.oops.body "fail('no')"
+!action hero oops
+?? ❌
+!map legend=on as=red
+?! zone: trap
+!zone info trap
+?? "legend": false
+?? "sprite": "spikes"
+?? "color": "red"
+!ent hp hero 9
+!undo command
+!zone info trap
+?? "sprite": "spikes"
+!zone legend trap Floor
+!as restart
+!match use zs
+!zone info trap
+?? "legend": "Floor"
+?? "sprite": "spikes"
+!map legend=on
+?? . — Floor
+
+Expected: A zone's sprite and legend label are part of the match state like
+its glyph and colour, so a failed action's rollback, an undo and a restart
+keep them, and a zone left out of the legend stays out. `!zone info` shows
+the glyph, colour, sprite and legend label.
+
+SCENARIO 801 — A disguise holds in !find predicates, show:, sort: and the unit's colour
+--------------------------------------------------------------------------------------
+
+!match new dg Disguise 6 6
+!match use dg
+!ent add hero Hero 10 1 1 5
+!ent set_vars hero team=red fog_vision_radius=9
+!ent add spy Spy 40 3 3 5
+!ent set_var spy team blue
+!eval "entity[spy].disguise = {'name': 'Guard', 'glyph': 'G', 'vars': {'team': 'red', 'hp': 10, 'max_hp': 10}}"
+!map teamcolor blue blue
+!map teamcolor red red
+!match fog on
+!match bind pov=red
+!as player alice
+!find team=blue
+?? No entities match.
+!find hp>20
+?? No entities match.
+!find hp>0 show:team,hp sort:hp:desc
+?? Guard (spy): HP: 10/10 X,Y: 3,3 facing up  [team=red, hp=10]
+?! hp=40
+!find disguise.name=Guard
+?? No entities match.
+!foreach team=blue ; ent info $id
+?? No entities match
+!as host
+!map scene list as=red
+?? entity `spy` at (3,3) — glyph G, color red
+!map scene list as=blue
+?? entity `spy` at (3,3) — glyph ^, color blue
+
+Expected: Under red's view the spy is the red Guard on 10 hp everywhere:
+`!find` predicates, `show:` columns and `sort:` read the disguise's vars over
+the real ones, and the disguise var itself can't be searched. A disguised
+unit's colour comes from the disguise (its `color`, else its fake team's
+colour), so the Guard draws red; its own team sees the real blue spy.
+
+SCENARIO 802 — Skipped-turn and status-tick failure lines follow the channel's view
+------------------------------------------------------------------------------------
+
+!match new sk Skips 10 10
+!match use sk
+!ent add hero Hero 10 1 1 5
+!ent set_vars hero team=red fog_vision_radius=1
+!ent add assassin Assassin 10 9 9 9
+!ent set_var assassin team blue
+!status def stun
+!status data stun skips_turn true
+!status tick stun "entity[nobody].hp = 1"
+!status apply assassin stun 1 2
+!match fog on
+!match bind pov=red
+!turn next
+?! assassin
+?? It is now **Hero**'s turn
+!match unbind
+!match use sk
+!turn next
+?? ⏭️ `assassin`'s turn skipped (stun).
+?? ⚠️ status_tick on `assassin.stun` (turn_end) FAILED
+!system set default atb_enabled true
+!match bind pov=red
+!turn next
+?! assassin
+
+Expected: The "turn skipped" line and a failing status tick name the unit
+they are about, so a channel whose view can't see that unit drops them (as
+death lines are dropped); the omniscient view shows both. Under ATB the same
+holds.

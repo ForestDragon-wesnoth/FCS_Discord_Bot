@@ -1862,7 +1862,9 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "conditionals, \\n for newlines. Built-in keys: id, name, "
             "x, y (the AUTHORITATIVE tile coords, NOT the embedded "
             "snapshot's x/y), facing, hp, max_hp, status_csv, "
-            "passives_csv, died_round. Any vars on the snapshot are "
+            "passives_csv, died_round, map / map_shown (the corpse's map; "
+            "map_shown is empty while the match has one map). Any vars on "
+            "the snapshot are "
             "available by name; useful for system-specific death "
             "info like `{?death_cause?}slain by {death_cause}{/?}`."
         ),
@@ -6683,6 +6685,12 @@ class Map:
         c = z.get("color")
         if isinstance(c, str) and c:
             out["color"] = c
+        sp = z.get("sprite")
+        if isinstance(sp, str) and sp:
+            out["sprite"] = sp
+        lg = z.get("legend")
+        if lg is False or (isinstance(lg, str) and lg):
+            out["legend"] = lg
         # Aura binding (entity-anchored zone), if present.
         if z.get("anchor"):
             out["anchor"] = z["anchor"]
@@ -6720,6 +6728,12 @@ class Map:
         c = zdef.get("color")
         if isinstance(c, str) and c:
             z["color"] = c
+        sp = zdef.get("sprite")
+        if isinstance(sp, str) and sp:
+            z["sprite"] = sp
+        lg = zdef.get("legend")
+        if lg is False or (isinstance(lg, str) and lg):
+            z["legend"] = lg
         # Restore an aura binding. The cells were serialized at their
         # last-stamped positions (and re-stamp on the next anchor move),
         # so no recompute is needed at load time.
@@ -7740,12 +7754,20 @@ class Match:
                     f"Map `{name}` still has unit(s) on it ({ids}). Move them "
                     f"off first, or set map_delete_mode=kill to kill them.")
             # Kill until nothing is left on it (a death hook can summon onto
-            # the map); bounded by summon_event_limit like resize.
+            # the map); bounded by summon_event_limit like resize, and a
+            # unit a death hook brought back is removed outright.
+            handled: Set[str] = set()
             while roots:
                 for eid in roots:
-                    if eid in self.entities:
-                        _, klog = self.kill_entity(eid)
-                        log.extend(klog)
+                    e = self.entities.get(eid)
+                    if e is None:
+                        continue
+                    if eid in handled:
+                        log.extend(e.remove())
+                        continue
+                    handled.add(eid)
+                    _, klog = self.kill_entity(eid)
+                    log.extend(klog)
                 roots = sorted(e.id for e in self.units_on_map(name)
                                if not e.part_of)
         # A corpse-less death leaves nothing; any unit still naming the map
@@ -7767,9 +7789,10 @@ class Match:
 
     def rename_map(self, old: str, new: str) -> int:
         """Rename map `old` to `new`: the units on it, stored [x, y, map]
-        values in unit / corpse / match / team / map vars, channel maps,
-        cameras and the followed maps all move to the new name. Returns how
-        many stored coordinates were rewritten."""
+        values in unit / corpse / match / team / map vars, tile data, zone
+        data, statuses and status definitions, channel maps, cameras and
+        the followed maps all move to the new name. Returns how many stored
+        coordinates were rewritten."""
         mp = self.get_map(old)
         check_map_name(new)
         if new in self.maps:
@@ -7791,13 +7814,16 @@ class Match:
         n = 0
         stores: List[Any] = [self.vars, self.team_data]
         stores += [e.vars for e in self.entities.values()]
-        stores += [m2.vars for m2 in self.maps.values()]
+        stores += [e.status for e in self.entities.values()]
+        stores += [d.get("data") for d in self.status_definitions.values()]
+        for m2 in self.maps.values():
+            # Tile data holds the corpses too: their vars and statuses.
+            stores += [m2.vars, m2.tiles]
+            stores += [z.get("data") for z in m2.zones.values()]
         for _mp, _x, _y, _cid, corpse in self.every_corpse():
             for body in [corpse.get("entity")] + list(corpse.get("parts") or []):
-                if isinstance(body, dict):
-                    if body.get("map") == old:
-                        body["map"] = new
-                    stores.append(body.get("vars"))
+                if isinstance(body, dict) and body.get("map") == old:
+                    body["map"] = new
         for st in stores:
             n += _rename_map_coords(st, old, new)
         return n
@@ -7928,15 +7954,25 @@ class Match:
             # shifts off-grid (which, being in the cut region, it does).
             # Death hooks can SPAWN units (a summon-on-death) after the cut
             # list was taken; one landing in the cut region would then shift
-            # off the new grid. Repeat until nothing would be cut. Terminates:
-            # every pass kills at least one unit, and summons per command are
-            # capped by summon_event_limit.
+            # off the new grid. Repeat until nothing would be cut. A unit
+            # still cut after its kill (a body part or segment, destroyed in
+            # place; a unit a death hook brought back) is removed outright.
+            # Terminates: every pass kills or removes a unit, each id is
+            # killed once, and summons per command are capped by
+            # summon_event_limit.
+            handled: Set[str] = set()
             while cut:
                 for eid in cut:
-                    if eid in self.entities:
-                        _, klog = self.kill_entity(eid)
-                        log.extend(klog)
-                        killed.append(eid)
+                    e = self.entities.get(eid)
+                    if e is None:
+                        continue
+                    if eid in handled:
+                        log.extend(e.remove())
+                        continue
+                    handled.add(eid)
+                    _, klog = self.kill_entity(eid)
+                    log.extend(klog)
+                    killed.append(eid)
                 cut = sorted(e.id for e in self.entities.values()
                              if e.map == mp.name
                              and not all(in_new(cx + ox, cy + oy)
@@ -8239,20 +8275,23 @@ class Match:
             idx = min((i + 1) * spacing - 1, len(trail) - 1)
             s.x, s.y = trail[idx][0], trail[idx][1]
 
-    def _resettle_snake(self, head_id: str) -> None:
-        """Re-lay a snake's body behind the head, used after a discontinuous
-        head move (teleport / swap / push) where there were no per-cell
-        steps to trail through. Each segment goes `spacing` cells on from
-        the one before it, straight behind the head where it can, else
-        turning (other directions, then the nearest free cell): a straight
-        line running off the map used to leave those segments where they
-        were, anywhere on the map, and the line ignored other units."""
-        head = self.entities.get(head_id)
-        if head is None:
-            return
-        chain = self.snake_segments(head_id)
+    def _snake_layout(self, head: "Entity", mp: "Map",
+                      hx: Optional[int] = None, hy: Optional[int] = None,
+                      ignore: Tuple[str, ...] = ()
+                      ) -> List[Tuple["Entity", Optional[Tuple[int, int]]]]:
+        """Where a re-lay would put each segment of `head`'s snake with the
+        head anchored at (hx, hy) (None: where it stands) on map `mp`:
+        [(segment, anchor or None when nothing fits)], changing nothing.
+        Each segment goes `spacing` cells on from the one before it,
+        straight behind the head where it can, else turning (other
+        directions, then the nearest free cell); a multi-tile segment needs
+        every cell it would cover on the map and free. `ignore`: ids whose
+        bodies don't count as in the way (they move with the head)."""
+        chain = self.snake_segments(head.id)
         if not chain:
-            return
+            return []
+        hx = head.x if hx is None else hx
+        hy = head.y if hy is None else hy
         try:
             spacing = max(1, int(self._segment_cfg(
                 head, "__segment_spacing", "segment_spacing")))
@@ -8260,13 +8299,18 @@ class Match:
             spacing = 1
         bdx, bdy = FACING_VECTORS.get(getattr(head, "facing", "up"), (0, -1))
         bdx, bdy = -bdx, -bdy            # behind = opposite of facing
-        body = {head_id} | {s.id for s in chain}
-        used: Set[Tuple[int, int]] = {tuple(c) for c in self.entity_cells(head)}
-        mp = self.map_of(head)
+        body = tuple({head.id} | {s.id for s in chain} | set(ignore))
+        head_cells = [tuple(c) for c in self.entity_cells(head, hx, hy)]
+        used: Set[Tuple[int, int]] = set(head_cells)
 
-        def free(cx: int, cy: int) -> bool:
-            return (mp.in_bounds(cx, cy) and (cx, cy) not in used
-                    and self.cell_occupant(cx, cy, tuple(body), mp) is None)
+        def free(seg: "Entity", cx: int, cy: int) -> bool:
+            for c in self.entity_cells(seg, cx, cy):
+                c = tuple(c)
+                if (not mp.in_bounds(*c) or c in used
+                        or self.cell_occupant(c[0], c[1], body, mp)
+                        is not None):
+                    return False
+            return True
 
         # Straight behind first, then the directions closest to it (the
         # body bends before it doubles back past the head).
@@ -8276,30 +8320,49 @@ class Match:
                       / math.hypot(*d))
         # Start from the body's back edge (its middle cell there): for a
         # larger head the anchor is a front or side corner.
-        cx2 = sum(c[0] for c in self.entity_cells(head)) / len(used)
-        cy2 = sum(c[1] for c in self.entity_cells(head)) / len(used)
-        px, py = max(used, key=lambda c: (c[0] * bdx + c[1] * bdy,
-                                          -abs(c[0] - cx2) - abs(c[1] - cy2),
-                                          -c[1], -c[0]))
-        path = [[head.x, head.y]]
-        stray: List[str] = []
+        cx2 = sum(c[0] for c in head_cells) / len(head_cells)
+        cy2 = sum(c[1] for c in head_cells) / len(head_cells)
+        px, py = max(head_cells, key=lambda c: (c[0] * bdx + c[1] * bdy,
+                                                -abs(c[0] - cx2)
+                                                - abs(c[1] - cy2),
+                                                -c[1], -c[0]))
+        out: List[Tuple["Entity", Optional[Tuple[int, int]]]] = []
         for s in chain:
             spot = next(((px + dx * spacing, py + dy * spacing)
                          for dx, dy in dirs
-                         if free(px + dx * spacing, py + dy * spacing)), None)
+                         if free(s, px + dx * spacing, py + dy * spacing)),
+                        None)
             if spot is None:
                 for r in range(1, max(mp.grid_width, mp.grid_height) + 1):
                     spot = next(((cx, cy) for cx, cy in self._ring_cells(
-                        px, py, r, mp) if free(cx, cy)), None)
+                        px, py, r, mp) if free(s, cx, cy)), None)
                     if spot is not None:
                         break
+            out.append((s, spot))
+            if spot is not None:
+                used.update(tuple(c) for c in self.entity_cells(s, *spot))
+                px, py = spot
+        return out
+
+    def _resettle_snake(self, head_id: str) -> None:
+        """Re-lay a snake's body behind the head, used after a discontinuous
+        head move (teleport / swap / push) where there were no per-cell
+        steps to trail through (_snake_layout picks the cells). A segment
+        with nowhere to go stays where it was, with a ⚠️."""
+        head = self.entities.get(head_id)
+        if head is None:
+            return
+        layout = self._snake_layout(head, self.map_of(head))
+        if not layout:
+            return
+        path = [[head.x, head.y]]
+        stray: List[str] = []
+        for s, spot in layout:
             if spot is None:
                 stray.append(s.id)
                 spot = (s.x, s.y)
-            used.add(spot)
             s.x, s.y = spot
-            px, py = spot
-            path.append([px, py])
+            path.append([spot[0], spot[1]])
         if stray:
             self.surface_log([f"⚠️ no free cell to lay segment(s) "
                               f"{', '.join(f'`{i}`' for i in stray)} of "
@@ -8411,6 +8474,9 @@ class Match:
             raise NotFound(f"Entity '{part_id}' not found.")
         if part_id == parent_id:
             raise VTTError("An entity can't be a body part of itself.")
+        if p.map != parent.map:
+            raise VTTError(f"`{part_id}` and `{parent_id}` are on different "
+                           f"maps.")
         p.part_of = parent_id
         p.x, p.y = parent.x, parent.y
         self._rebuild_turn_order()
@@ -8664,6 +8730,9 @@ class Match:
             return False, "an entity can't mount itself."
         if rider.is_part:
             return False, f"'{rider_id}' is a body part — mount its owner."
+        if rider.map != veh.map:
+            return False, (f"`{rider_id}` and `{vid}` are on different "
+                           f"maps.")
         sd = self.slot_def(vid, slot)
         if sd is None:
             names = ", ".join(sorted(self.vehicle_slots(vid))) or "(none)"
@@ -8750,6 +8819,11 @@ class Match:
         rider.mount_slot = slot
         cx, cy = self.rider_cell(vid, rider)
         rider.move_to(cx, cy)
+        # The boarding unit's cargo comes along to its new cell: its auras,
+        # parts and (a vehicle boarding a vehicle) its own riders.
+        self._restamp_anchors_for(rider_id)
+        self._restamp_parts_for(rider_id)
+        self._restamp_riders_for(rider_id)
         # Occupancy changed (rider left the ground); rebuild turn order so a
         # large rider no longer blocks, etc. (the rider keeps its initiative).
         self._rebuild_turn_order()
@@ -8775,6 +8849,9 @@ class Match:
         rider.mount_slot = new_slot
         cx, cy = self.rider_cell(vid, rider)
         rider.move_to(cx, cy)
+        self._restamp_anchors_for(rider_id)
+        self._restamp_parts_for(rider_id)
+        self._restamp_riders_for(rider_id)
         log.extend(self.fire_hook("on_mounted", target_ids=[rider_id],
                                   extras={"vehicle": vid, "slot": new_slot}))
         return log
@@ -9429,9 +9506,11 @@ class Match:
     def entities_in_zone(self, name: str,
                          mp: Optional["Map"] = None) -> List[str]:
         """Ids of every alive entity with ANY footprint cell in zone `name`
-        of map `mp` (None = the only map), in insertion order. [] for a
-        missing zone."""
-        mp = mp or self.get_map()
+        of map `mp` (None = the map holding it: zone names are unique
+        across the match), in insertion order. [] for a missing zone."""
+        mp = mp or self.zone_map(name)
+        if mp is None:
+            return []
         z = mp.zones.get(name)
         if z is None:
             return []
@@ -9661,7 +9740,8 @@ class Match:
         if not mp.in_bounds(x, y):
             return False
         if self._eval_opaque_spec(self._tile_opaque_spec(x, y, mp), viewer_id,
-                                  {"tile_x": x, "tile_y": y}):
+                                  {"tile_x": x, "tile_y": y,
+                                   "tile_map": mp.name}):
             return True
         for name, z in mp.zones.items():
             cells = z.get("cells", ())
@@ -9672,7 +9752,8 @@ class Match:
                 zspec = self.rules.get("zone_opaque_condition", "")
             if self._eval_opaque_spec(
                     zspec, viewer_id,
-                    {"zone_name": name, "tile_x": x, "tile_y": y}):
+                    {"zone_name": name, "tile_x": x, "tile_y": y,
+                     "zone_map": mp.name}):
                 return True
         return False
 
@@ -10310,12 +10391,13 @@ class Match:
         map glyph and its !tile list/info/cells rows — is visible to
         `pov_team`. Binds tile_x / tile_y (inspect data via
         tile_get/tile_has). See tile_visibility_condition."""
+        mp = mp or self.get_map()
         if pov_team is not None and not self._fog_terrain_visible(
-                pov_team, x, y, mp or self.get_map()):
+                pov_team, x, y, mp):
             return False
         return self._visibility_visible(
             "tile_visibility_condition", pov_team,
-            extras={"tile_x": x, "tile_y": y})
+            extras={"tile_x": x, "tile_y": y, "tile_map": mp.name})
 
     def zone_visible_to(self, name: str, pov_team: Optional[str],
                         mp: Optional["Map"] = None) -> bool:
@@ -10336,7 +10418,7 @@ class Match:
                 return False
         return self._visibility_visible(
             "zone_visibility_condition", pov_team,
-            extras={"zone_name": name})
+            extras={"zone_name": name, "zone_map": mp.name})
 
     def _corpse_footprint(self, corpse: Dict[str, Any],
                           mp: Optional["Map"] = None) -> Tuple[int, int]:
@@ -10391,7 +10473,8 @@ class Match:
                 corpse_team = str(cv.get(team_var, "") or "")
         return self._visibility_visible(
             "corpse_visibility_condition", pov_team,
-            extras={"corpse_team": corpse_team, "tile_x": x, "tile_y": y})
+            extras={"corpse_team": corpse_team, "tile_x": x, "tile_y": y,
+                    "tile_map": mp.name})
 
     def unbind_channel(self, channel_key: str) -> bool:
         """Unbind a channel. Returns False if it wasn't bound."""
@@ -10921,7 +11004,7 @@ class Match:
         mp = self._map_for(mp, self.entities.get(mover_id))
         if self._eval_block_spec(
                 self._tile_block_spec(x, y, mp), mover_id,
-                {"tile_x": x, "tile_y": y}):
+                {"tile_x": x, "tile_y": y, "tile_map": mp.name}):
             return True
         for name, z in mp.zones.items():
             cells = z.get("cells", ())
@@ -10930,7 +11013,8 @@ class Match:
             zspec = (z.get("data") or {}).get("block")
             if zspec in (None, ""):
                 zspec = self.rules.get("zone_block_condition", "")
-            if self._eval_block_spec(zspec, mover_id, {"zone_name": name}):
+            if self._eval_block_spec(zspec, mover_id, {"zone_name": name,
+                                                       "zone_map": mp.name}):
                 return True
         # Corpses can block, per corpse_block_condition (off by default).
         # Gated on the rule being set so there's zero cost when corpses are
@@ -10949,7 +11033,7 @@ class Match:
                         ct = str(cv.get(team_var, "") or "")
                 if self._eval_block_spec(
                         cspec, mover_id,
-                        {"tile_x": x, "tile_y": y,
+                        {"tile_x": x, "tile_y": y, "tile_map": mp.name,
                          "corpse_id": cid, "corpse_team": ct}):
                     return True
         return False
@@ -11645,8 +11729,9 @@ class Match:
                 )
                 return cur
             if skipped_rounds:
-                log.append(f"⏭️ everyone was skipped for {skipped_rounds} "
-                           f"round(s); `{cur}` is the first able to act.")
+                log.append(self.unit_line(
+                    cur, f"⏭️ everyone was skipped for {skipped_rounds} "
+                         f"round(s); `{cur}` is the first able to act."))
             order_before = list(self.turn_order)
             idx = self.active_index
             log.extend(self.fire_hook(
@@ -11955,7 +12040,8 @@ class Match:
             self._atb_last_skipped = bool(skipping)
             if skipping:
                 matched = ", ".join(sorted(skipping))
-                log.append(f"⏭️ `{new_cur}`'s turn skipped ({matched}).")
+                log.append(self.unit_line(
+                    new_cur, f"⏭️ `{new_cur}`'s turn skipped ({matched})."))
                 log.extend(self.fire_hook(
                     "on_turn_skipped", target_ids=[new_cur],
                     extras={"skip_status": matched}))
@@ -12098,7 +12184,8 @@ class Match:
                 return False
             seen.add(cur)
             matched = ", ".join(sorted(skipping))
-            log.append(f"⏭️ `{cur}`'s turn skipped ({matched}).")
+            log.append(self.unit_line(
+                cur, f"⏭️ `{cur}`'s turn skipped ({matched})."))
             log.extend(self.fire_hook(
                 "on_turn_skipped", target_ids=[cur],
                 extras={"skip_status": matched}))
@@ -12232,6 +12319,7 @@ class Match:
         extras = {
             "tile_x": x,
             "tile_y": y,
+            "tile_map": mp.name,
             "hook_name": when,
         }
         ctx = EvalCtx(
@@ -12289,6 +12377,7 @@ class Match:
             "zone_name": name,
             "tile_x": x,
             "tile_y": y,
+            "zone_map": mp.name,
             "hook_name": when,
         }
         ctx = EvalCtx(
@@ -12524,7 +12613,7 @@ class Match:
             this=self.current_entity_id(),
             target=entity_id or None,
             extras={"zone_name": name, "tile_x": None, "tile_y": None,
-                    "hook_name": when},
+                    "zone_map": mp.name, "hook_name": when},
         )
         tag = f"for `{entity_id}`" if entity_id else "(no acting entity)"
         try:
@@ -13179,16 +13268,14 @@ class Match:
                 try:
                     engine.eval_program(src, ctx)
                 except FormulaError as ex:
-                    log.append(
-                        f"⚠️ status_tick on `{eid}.{sname}` "
-                        f"({when}) FAILED: {ex}"
-                    )
+                    log.append(self.unit_line(
+                        eid, f"⚠️ status_tick on `{eid}.{sname}` "
+                             f"({when}) FAILED: {ex}"))
                 except Exception as ex:
-                    log.append(
-                        f"⚠️ status_tick on `{eid}.{sname}` "
-                        f"({when}) CRASHED: "
-                        f"{type(ex).__name__}: {ex}"
-                    )
+                    log.append(self.unit_line(
+                        eid, f"⚠️ status_tick on `{eid}.{sname}` "
+                             f"({when}) CRASHED: "
+                             f"{type(ex).__name__}: {ex}"))
         return log
 
     def fire_status_event(
@@ -13332,9 +13419,29 @@ class Match:
         src = self.map_of(e)
         if dest is src:
             return e.tp(x, y, fire_hooks=fire_hooks)
+        if e.part_of:
+            # A part (a located limb, a snake segment) is on its body's
+            # map: the body moves and takes it along.
+            root = e
+            while root.part_of and root.part_of in self.entities:
+                root = self.entities[root.part_of]
+            raise VTTError(
+                f"`{e.id}` is a body part of `{root.id}`: move `{root.id}` "
+                f"to another map to take it along.")
         body = self.carried_body(e)
         ids = tuple(u.id for u in body)
         self._validate_placement(e, x, y, "tp", dest)
+        # Every snake segment needs a cell on the destination too (all or
+        # nothing, like the located parts below).
+        for head in [u for u in body if self.snake_segments(u.id)]:
+            hx, hy = (x, y) if head is e else (x + head.x - e.x,
+                                               y + head.y - e.y)
+            lost = [s.id for s, spot in self._snake_layout(
+                head, dest, hx, hy, ids) if spot is None]
+            if lost:
+                raise Occupied(
+                    f"no room on map `{dest.name}` for segment(s) "
+                    f"{', '.join(f'`{i}`' for i in lost)} of `{head.id}`.")
         located = [p for p in body if p is not e and p.vars.get("__part_located")
                    and not p.vars.get("__segment") and not p.is_mounted]
         offsets = {p.id: (x + p.x - e.x, y + p.y - e.y) for p in located}
@@ -14892,6 +14999,15 @@ class Match:
         text = self._MSG_FMT_RE.sub(sub, fmt)
         self.surface_log([f"{UNIT_LINE_TAG}{self.id}|{eid}|{x}|{y}|"
                           f"{map_name or ''}{UNIT_LINE_TAG}{text}"])
+
+    def unit_line(self, eid: str, text: str) -> str:
+        """`text` tagged as a line about unit `eid` (UNIT_LINE_TAG at its
+        cell), so a channel whose view can't see the unit drops it."""
+        e = self.entities.get(eid)
+        if e is None:
+            return text
+        return (f"{UNIT_LINE_TAG}{self.id}|{eid}|{e.x}|{e.y}|{e.map or ''}"
+                f"{UNIT_LINE_TAG}{text}")
 
     def kill_entity(self, eid: str) -> Tuple[bool, List[str]]:
         """Unconditionally kill `eid`, bypassing the death CONDITION so
@@ -17187,12 +17303,18 @@ class Match:
         result is one; an unreadable one falls through), else its team's color — the match team_colors map, defaulting to
         the team's own name when that name is itself a palette color (so a
         team literally named 'red' renders red). Unknown names -> None. When
-        `e` is disguised to `pov_team` (116), the disguise's `color` wins."""
+        `e` is disguised to `pov_team` (116), only the disguise speaks: its
+        `color`, else the colour of the team its `vars` give, else none (the
+        real unit's colour would give it away)."""
         dis = self._effective_disguise(e, pov_team)
         if dis is not None:
             dc = dis.get("color")
             if isinstance(dc, str) and dc in TEXT_COLORS:
                 return dc
+            dvars = dis.get("vars")
+            dteam = (dvars.get(e._team_var_name())
+                     if isinstance(dvars, dict) else None)
+            return self._team_color(dteam)
         c = e.vars.get("color")
         if isinstance(c, str) and c:
             # A palette name, or a formula with self = the unit (and
@@ -17201,14 +17323,32 @@ class Match:
                                             target=e.id)
             if got is not None:
                 return got
-        team = e.team
-        if team:
-            tc = self.team_colors.get(team)
-            if isinstance(tc, str) and tc in TEXT_COLORS:
-                return tc
-            if team in TEXT_COLORS:
-                return team
-        return None
+        return self._team_color(e.team)
+
+    def _team_color(self, team: Any) -> Optional[str]:
+        """A team's colour: the match's team_colors entry, else the team's
+        own name when it is a palette colour; None for no team."""
+        if team is None or team == "":
+            return None
+        tc = self.team_colors.get(str(team))
+        if isinstance(tc, str) and tc in TEXT_COLORS:
+            return tc
+        return str(team) if str(team) in TEXT_COLORS else None
+
+    def presented_vars(self, e: "Entity",
+                       pov_team: Optional[str] = None) -> Dict[str, Any]:
+        """The vars `e` presents to `pov_team`: the real ones, or under a
+        disguise its `vars` over them, without the disguise var itself (a
+        fooled viewer can't read that the unit is disguised). Read-only."""
+        dis = self._effective_disguise(e, pov_team)
+        if dis is None:
+            return e.vars
+        out = {k: v for k, v in e.vars.items()
+               if k != str(self.rules.get("disguise_var", "disguise"))}
+        dvars = dis.get("vars")
+        if isinstance(dvars, dict):
+            out.update(dvars)
+        return out
 
     def entity_display_name(self, e: "Entity",
                             pov_team: Optional[str] = None) -> str:
@@ -17315,7 +17455,8 @@ class Match:
                 tpl = self.tile_templates.get(tpl_name)
                 if tpl is not None:
                     val = tpl.data.get("color")
-        return self._resolve_color_value(val, {"tile_x": x, "tile_y": y})
+        return self._resolve_color_value(val, {"tile_x": x, "tile_y": y,
+                                                "tile_map": mp.name})
 
     def zone_color(self, name: str, mp: "Map") -> Optional[str]:
         """The resolved color name for zone `name` of map `mp` (its `color`
@@ -17323,7 +17464,8 @@ class Match:
         z = mp.zones.get(name)
         if not isinstance(z, dict):
             return None
-        return self._resolve_color_value(z.get("color"), {"zone_name": name})
+        return self._resolve_color_value(z.get("color"), {"zone_name": name,
+                                                          "zone_map": mp.name})
 
     # ---- sprite resolution (graphics render model) ------------------
     # Sprites are KEY strings stored in data, mirroring glyphs: a per-facing
