@@ -29,6 +29,13 @@ FORMULA_LOG_SINK: "contextvars.ContextVar[Optional[List[str]]]" = (
 COMMAND_USER: "contextvars.ContextVar[Optional[str]]" = (
     contextvars.ContextVar("vtt_command_user", default=None))
 
+# The channel map of the running command (tier 4 of the map hierarchy):
+# a function of a Match giving the map name the command's channel views
+# there. Formulas resolve `map='view'` through it; None outside a command
+# (a formula with no channel refuses `view`).
+COMMAND_VIEW: "contextvars.ContextVar[Optional[Any]]" = (
+    contextvars.ContextVar("vtt_command_view", default=None))
+
 # A line about one unit (a death, a revive) is prefixed with this tag —
 # UNIT_LINE_TAG + "<match>|<unit>|<x>|<y>|<map>" + UNIT_LINE_TAG — so the command
 # layer, which knows the channel's view, can drop it where that view can't
@@ -3524,7 +3531,7 @@ def unreachable_id(eid: Any) -> bool:
 # names are reserved: no entity var may be created under them (write_var
 # refuses), so a read can never be ambiguous. Formula writes are refused too;
 # `name` changes via `!ent rename`, x/y via `!ent tp`.
-RESERVED_VAR_PATHS: Tuple[str, ...] = ("x", "y", "name")
+RESERVED_VAR_PATHS: Tuple[str, ...] = ("x", "y", "name", "map")
 
 
 # Words a map can't be named: `view` and `all` are map VALUES (the channel's
@@ -3697,11 +3704,17 @@ def reserved_var_path_error(path: str, where: str) -> Optional[str]:
     seg0 = path.split(".", 1)[0]
     if seg0 not in RESERVED_VAR_PATHS:
         return None
-    fix = ("`!ent rename <id> <name>`" if seg0 == "name"
-           else "`!ent tp <id> <x> <y>`")
+    fix = {"name": "`!ent rename <id> <name>`",
+           "map": "`!ent tp <id> <x> <y> <map>`"}.get(
+               seg0, "`!ent tp <id> <x> <y>`")
     return (f"{where}: `{seg0}` is a reserved var path (the entity's own "
-            f"{'display name' if seg0 == 'name' else 'position'}); it can't "
-            f"be written or nested under. Use {fix}.")
+            f"{reserved_path_meaning(seg0)}); it can't be written or nested "
+            f"under. Use {fix}.")
+
+
+def reserved_path_meaning(seg0: str) -> str:
+    """What reserved var path `seg0` reads on a unit, for messages."""
+    return {"name": "display name", "map": "map"}.get(seg0, "position")
 
 def checked_unit_vars(vars_: Any, vitals: Iterable[str], where: str) -> Dict[str, Any]:
     """`vars_` ready to become a whole unit's vars, held to the rules
@@ -3723,7 +3736,7 @@ def checked_unit_vars(vars_: Any, vitals: Iterable[str], where: str) -> Dict[str
         if k in RESERVED_VAR_PATHS:
             raise VTTError(
                 f"{where}: `{k}` is a reserved var path (the unit's own "
-                f"{'display name' if k == 'name' else 'position'}), so a "
+                f"{reserved_path_meaning(k)}), so a "
                 f"template or statblock can't carry a var by that name.")
     for k in vitals:
         if k not in out:
@@ -19935,6 +19948,48 @@ MAP_VAR_NAME_RULES: Dict[str, Tuple[str, Optional[str]]] = {
 # setting -> its rule
 MAP_SETTING_RULES: Dict[str, str] = {v[0]: k for k, v in MAP_VAR_NAME_RULES.items()}
 
+# The layers a map can hide from its render (`!map layer`, the
+# hidden_layers map setting).
+MAP_LAYERS = ("zones", "tiles", "entities", "fog")
+
+
+def map_setting_value(setting: str, value: Any) -> Any:
+    """`value` checked for map setting `setting` the way its own command
+    checks it (VTTError otherwise)."""
+    if setting in ("fog", "fog_memory", "borders"):
+        word = str(value).strip().lower()
+        if isinstance(value, bool):
+            return value
+        if word in ("on", "true", "yes", "1"):
+            return True
+        if word in ("off", "false", "no", "0"):
+            return False
+        raise VTTError(f"The {setting} setting is on or off, got `{value}`.")
+    if setting == "border_opacity":
+        if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or not 0 <= value <= 100:
+            raise VTTError(f"The border opacity is a number 0-100, got "
+                           f"`{value}`.")
+        return int(value)
+    if setting == "background_mode":
+        if str(value).lower() not in ("stretch", "tile", "center"):
+            raise VTTError(f"The background mode is stretch, tile or center, "
+                           f"got `{value}`.")
+        return str(value).lower()
+    if setting == "hidden_layers":
+        words = ([str(v) for v in value] if isinstance(value, list)
+                 else [w.strip() for w in str(value).split(",") if w.strip()])
+        bad = [w for w in words if w not in MAP_LAYERS]
+        if bad:
+            raise VTTError(f"Unknown layer(s) {', '.join(bad)}: the layers are "
+                           f"{', '.join(MAP_LAYERS)}.")
+        return sorted(set(words))
+    # background (a sprite key) and border_color (a colour name or hex).
+    if not isinstance(value, str) or not value:
+        raise VTTError(f"The {setting.replace('_', ' ')} setting is a word, "
+                       f"got `{value}`.")
+    return value
+
 
 def check_map_var_name_rule(key: str, value: Any) -> str:
     """A MAP_VAR_NAME_RULES value: one top-level map var name (an
@@ -19962,7 +20017,7 @@ def check_var_name_rule(key: str, value: Any) -> str:
     if v in RESERVED_VAR_PATHS or v.startswith("__"):
         raise VTTError(
             f"Setting '{key}' can't be '{v}': "
-            + ("x, y and name are the unit's position and display name."
+            + ("x, y, name and map are the unit's position, display name and map."
                if v in RESERVED_VAR_PATHS else
                "names starting with __ belong to the engine."))
     return v

@@ -21281,7 +21281,7 @@ SCENARIO 743 — Var-name rules: only plain var names; undo preview after a rena
 !system set default team_var "h p"
 ?? got 'h p'
 !system set default hp_var x
-?? x, y and name are the unit's position and display name
+?? x, y, name and map are the unit's position, display name and map
 !system set default hp_var __hp
 ?? names starting with __ belong to the engine
 !system set default hp_var for
@@ -25531,3 +25531,209 @@ worm brings both segments, trailing behind it as the original's do, and
 moves as one. `store_entity_into_var`
 stores the same form, so transforming X into it gives X the claw at its
 offset, and `revert` (after a move) restores X without parts.
+
+SCENARIO 831 — Formulas name a map: map= a name, 'view' or '@unit'
+----------------------------------------------------------------------
+
+!match new fm FM 8 6
+!match use fm
+!map new cave 5 5
+!ent add hero Hero 10 2 2 map=main
+!ent add bat Bat 5 3 3 map=cave
+!eval "tile_get(1, 1, 'ore')"
+?? ❌ This match has 2 maps (`main`, `cave`): name one with `map=<name>`.
+!eval "tile_set(2, 2, 'ore', 4, map='cave')"
+!assert "tile_get(2, 2, 'ore', map='cave') == 4 and not tile_has(2, 2, 'ore', map='main')"
+!assert "[grid_width(map='cave'), grid_width(map='@hero'), grid_height(map='@bat')] == [5, 8, 5]"
+!assert "entities_at(3, 3, map='@bat') == ['bat'] and entities_at(3, 3, map='main') == []"
+!assert "cells_in_rect(1, 1, 2, 1, map='cave') == [[1, 1, 'cave'], [2, 1, 'cave']]"
+!assert "free_cell_near(3, 3, 0, map='main') == [3, 3, 'main']"
+!map use cave
+!assert "tile_get(2, 2, 'ore', map='view') == 4 and in_bounds(7, 1, map='view') == False"
+!map use clear
+!assert "in_bounds(7, 1, map='view')"
+!eval "in_bounds(1, 1, map='attic')"
+?? ❌ in_bounds(...): this match has no map named `attic` (maps: main, cave).
+!eval "in_bounds(1, 1, map='@ghost')"
+?? ❌
+!ent set_var hero w "$(grid_width(map='cave'))"
+!assert "entity[hero].w == 5"
+!eval "tile_get(2, 2, 'ore', map=['main', 'cave'])"
+?? map= names one map here
+
+Expected: HARNESS-ALLOWS-ERRORS. On a match with two maps a unit-less
+function refuses without a map and names the maps. `map=` takes a map
+name, `@<unit>` (that unit's map) or `view` (the channel's map: the
+one `!map use` set, else the board's followed map, here `main`). A cell
+result on a map other than the formula's own carries the map
+(`[1, 1, 'cave']`); `free_cell_near` with map=main does too, since a
+match with two maps has no map of its own outside a hook. An unknown
+map or unit is refused, `$()` args take `map=` (read-only), and a list
+is refused where one map is meant.
+
+SCENARIO 832 — Scatter across maps: N in total, and the per-map loop
+----------------------------------------------------------------------
+
+!match new sc SC 6 4
+!match use sc
+!map new loft 3 3
+!ent add ogre Ogre 10 1 1 map=main
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!func def scatter n "for i in range(n):\n    match.c = random_free_cell(1, 1, 6, 4, map='all')\n    summon({'name': 'Rat', 'vars': {'hp': 1}}, coord_x(match.c), coord_y(match.c), map=coord_map(match.c))\nn"
+!eval "scatter(6)"
+!find name=Rat count
+?? **6** matches.
+!eval "match.c = random_free_cell(1, 1, 6, 4, 'ogre', map=['main', 'loft'])\nmove_entity('ogre', match.c)"
+!assert "map_of('ogre') == 'main'"
+!func def per_map none "for m in maps():\n    match.c = random_cell(1, 1, 1, 1, map=m)\n    tile_set(coord_x(match.c), coord_y(match.c), 'mark', m, map=m)\nlen(maps())"
+!eval "per_map()"
+!assert "tile_get(1, 1, 'mark', map='main') == 'main' and tile_get(1, 1, 'mark', map='loft') == 'loft'"
+!assert "random_cell(1, 1, 1, 1, map=['loft']) == [1, 1, 'loft']"
+
+Expected: `random_free_cell(..., map='all')` picks among the free cells
+of every map (each equally likely, so the 6x4 map gets a bigger share
+than the 3x3 loft) and returns `[x, y, map]`; six calls place six rats
+in total across both maps. Only `main` has room for the 2x2 ogre, so a
+pick for it with `map=['main', 'loft']` lands on main and
+`move_entity(ogre, match.c)` takes the triple. Looping `for m in maps()` with
+`map=m` is the per-map form: one mark on each map. A list naming one
+map still returns the triple.
+
+SCENARIO 833 — Map vars from formulas
+----------------------------------------------------------------------
+
+!match new mv MV 6 4
+!match use mv
+!map new crypt 4 4
+!eval "map_var_set('darkness', 3, map='crypt')"
+!eval "map_var_set('weather.rain', true, map='main')"
+!assert "map_var_get('darkness', map='crypt') == 3 and map_var_get('darkness', 0, map='main') == 0"
+!assert "map_var_has('weather.rain', map='main') and map_var_keys('weather', map='main') == ['rain']"
+!map var get darkness map=crypt
+?? = 3
+!eval "map_var_set('fog', 'sometimes', map='crypt')"
+?? ❌ map_var_set: The fog setting is on or off, got `sometimes`.
+!eval "map_var_set('fog', 'on', map='crypt')"
+!map var get fog map=crypt
+?? = True
+!eval "map_var_get('darkness')"
+?? ❌ This match has 2 maps
+!tile hook add 2 2 on_enter "entity[self].dark = map_var_get('darkness')" map=crypt
+!ent add ghoul Ghoul 5 1 2 map=crypt
+!ent move ghoul 1 right
+!assert "entity[ghoul].dark == 3"
+!eval "[map_var_del('darkness', map='crypt'), map_var_del('darkness', map='crypt')]"
+?? = `[True, False]`
+!ent set_var ghoul q "$(map_var_set('x', 1, map='crypt'))"
+?? ❌
+!assert "not map_var_has('x', map='crypt')"
+
+Expected: HARNESS-ALLOWS-ERRORS. `map_var_set` / `_get` / `_has` /
+`_keys` / `_del` read and write a map's vars by dotted path, the same
+store `!map var` shows. A setting var (fog here) takes what its command
+would store, so `sometimes` is refused and `on` stores True. Without
+`map=` the call refuses on a two-map match, except inside a tile hook,
+which defaults to its own map: the crypt tile's hook reads the crypt's
+darkness. A missing var gives the default or False; `map_var_set` is a
+mutator, refused inside `$()`.
+
+SCENARIO 834 — move_entity across maps carries the whole body; map is reserved
+----------------------------------------------------------------------
+
+!match new mx MX 8 6
+!match use mx
+!map new deck 6 6
+!ent add tank Tank 20 2 2 map=main
+!ent set_vars tank footprint_w=2 footprint_h=2
+!part add tank gun Gun 5 5
+!part locate gun 4 2
+!ent set_var tank slots.seat.capacity 1
+!ent add crew Crew 5 6 5 map=main
+!mount crew tank seat
+!gpassive add hop on_entity_changed_map "entity[self].went = from_map + '>' + to_map"
+!eval "move_entity('tank', 2, 3, map='deck')"
+?? = `[2, 3, 'deck']`
+!assert "map_of('tank') == 'deck' and map_of('gun') == 'deck' and map_of('crew') == 'deck'"
+!assert "entity[gun].x == 4 and entity[gun].y == 3 and entity[tank].went == 'main>deck'"
+!assert "entity[tank].map == 'deck'"
+!ent add rock Rock 9 3 3 map=main
+!eval "move_entity('tank', [2, 2, 'main'])"
+?? ❌ move_entity: Cell (3,3) already occupied
+!assert "map_of('tank') == 'deck'"
+!eval "move_entity('tank', [1, 1])"
+?? = `[1, 1]`
+!ent set_var tank map deck
+?? ❌ Writing 'map' on `tank`: `map` is a reserved var path (the entity's own map)
+!eval "entity[tank].map = 'main'"
+?? ❌
+
+Expected: HARNESS-ALLOWS-ERRORS. `move_entity(eid, x, y, map=)` moves
+the 2x2 tank to the deck with its located gun (same offset, now (4,3))
+and its rider, fires on_entity_changed_map and returns `[x, y, map]`. A
+coordinate triple works as the target; the move back is refused whole
+while the rock covers part of the destination. A plain `[x, y]` moves
+the tank on its own map. `entity[x].map` reads the unit's map, and
+`map` is a reserved var path: no unit var can take the name.
+
+SCENARIO 835 — Hooks default to their own map; summons to self's map
+----------------------------------------------------------------------
+
+!match new hk HK 6 4
+!match use hk
+!map new vault 5 5
+!tile set 3 3 gold 7 map=vault
+!tile hook add 2 2 on_enter "entity[self].found = tile_get(3, 3, 'gold')\nsummon({'name': 'Mimic', 'vars': {'hp': 3}}, 3, 3)" map=vault
+!ent add thief Thief 10 1 2 map=vault
+!ent move thief 1 right
+!assert "entity[thief].found == 7 and map_of('mimic') == 'vault'"
+!ent add mage Mage 10 1 1 map=main
+!eval --as mage "summon({'name': 'Imp', 'vars': {'hp': 2}}, 2, 1)"
+!assert "map_of('imp') == 'main'"
+!eval --as thief "summon({'name': 'Imp', 'vars': {'hp': 2}}, 1, 1)"
+!assert "map_of('imp2') == 'vault'"
+!eval "summon({'name': 'Imp', 'vars': {'hp': 2}}, 1, 4)"
+?? ❌ This match has 2 maps
+
+Expected: HARNESS-ALLOWS-ERRORS. Inside the vault tile's hook a
+formula reads the vault's tiles and summons on the vault without
+naming it. A summon with `self` bound places on self's map (the mage on
+main, the thief in the vault); with no self, no hook and no `map=` on a
+two-map match it is refused.
+
+SCENARIO 836 — Coordinates with a map: action targets, sight and nearness across maps
+----------------------------------------------------------------------
+
+!match new ct CT 6 6
+!match use ct
+!map new pit 4 4
+!ent add sage Sage 10 2 2 map=pit
+!ent set_var sage fog_vision_radius 9
+!ent set_var sage magic.actions.mark.target location
+!ent set_var sage magic.actions.mark.body "entity[self].spot = target\nentity[self].spot_map = target.map"
+!action sage mark 3 3
+!assert "entity[sage].spot == [3, 3] and entity[sage].spot_map == 'pit'"
+!ent set_var sage magic.actions.far.target none
+!ent set_var sage magic.actions.far.body "use_action(self, 'mark', [5, 5, 'main'])"
+!action sage far
+!assert "entity[sage].spot == [5, 5, 'main'] and entity[sage].spot_map == 'main'"
+!ent set_var sage magic.actions.near.target none
+!ent set_var sage magic.actions.near.body "use_action(self, 'mark', [5, 5])"
+!action sage near
+?? ❌
+!ent add guard Guard 10 5 5 map=main
+!assert "can_see('sage', 2, 3) and not can_see('sage', 5, 5, map='main')"
+!assert "has_los(1, 1, 3, 3, 'sage', map='main') == False and has_los(1, 1, 3, 3, 'sage')"
+!assert "nearest_cell('sage', [5, 5, 'main']) == None and nearest_cell('sage', [4, 4, 'pit']) == [2, 2]"
+!eval "face_toward('sage', [5, 5, 'main'])"
+?? ❌ face_toward: `sage` is on map `pit`, the cell on `main`.
+!assert "coord_map([1, 2]) == None and coord_x([1, 2, 'pit']) == 1 and coord_y([1, 2, 'pit']) == 2"
+!assert "clip_cells([[1, 1, 'pit'], [6, 6, 'pit'], [6, 6, 'main']]) == [[1, 1, 'pit'], [6, 6, 'main']]"
+
+Expected: HARNESS-ALLOWS-ERRORS. A location target reads `target.map`
+(the acting unit's map for `!action sage mark 3 3`); `use_action` takes
+`[x, y, map]` and a stored target names its map when it isn't the
+actor's. (5,5) is off the pit, so the plain pair is refused. Across maps
+there is no relation: `can_see` / `has_los` with another map are False,
+`nearest_cell` toward a cell on another map is None and `face_toward`
+refuses. `coord_x` / `coord_y` read triples and `coord_map` names the
+map (None for a pair); `clip_cells` clips each triple to its own map.

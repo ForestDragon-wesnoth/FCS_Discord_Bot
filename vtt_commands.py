@@ -15,7 +15,7 @@ from logic import (
 )
 
 # Passive system
-from logic import COMMAND_USER, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES
+from logic import COMMAND_USER, COMMAND_VIEW, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -817,6 +817,12 @@ class CommandRegistry:
         user_token = COMMAND_USER.set(ctx_user_name(ctx) if ctx_user(ctx)
                                       or getattr(ctx, "user_name", None)
                                       else None)
+        # `map='view'` in a formula: the map this channel views on the
+        # match the formula runs in.
+        view_ctx = ctx
+        view_token = COMMAND_VIEW.set(
+            lambda vm: vm.channel_map(view_ctx.channel_key,
+                                      _view_pov(view_ctx, vm, [])).name)
         # A typed command (not a nested run: an approval, `!again`) is one
         # `!system undo` step and one `!server audit` entry when it changes
         # anything server-wide. `!as` can swap the whole workspace.
@@ -851,6 +857,7 @@ class CommandRegistry:
         finally:
             if audit_token is not None:
                 _AUDIT_NOTES.reset(audit_token)
+            COMMAND_VIEW.reset(view_token)
             COMMAND_USER.reset(user_token)
             PARTIAL_CACHE.reset(cache_token)
             CURRENT_WORKSPACE.reset(ws_token)
@@ -9324,7 +9331,7 @@ def _query_eid(ctx: ReplyContext, m: "Match", token: str) -> str:
     return eid
 
 
-_MAP_LAYERS = ("zones", "tiles", "entities", "fog")
+_MAP_LAYERS = MAP_LAYERS
 
 
 def _map_block(ctx: ReplyContext, m, pov, hidden=None, *,
@@ -9920,44 +9927,6 @@ assert not _unreserved, f"add {_unreserved} to logic.MAP_RESERVED_NAMES"
 _MAP_MANAGE_SUBS = ("new", "list", "delete", "rename", "copy", "use", "var")
 
 
-def _map_setting_value(setting: str, value: Any) -> Any:
-    """`value` checked for map setting `setting` the way its own command
-    checks it (VTTError otherwise)."""
-    if setting in ("fog", "fog_memory", "borders"):
-        word = str(value).strip().lower()
-        if isinstance(value, bool):
-            return value
-        if word in ("on", "true", "yes", "1"):
-            return True
-        if word in ("off", "false", "no", "0"):
-            return False
-        raise VTTError(f"The {setting} setting is on or off, got `{value}`.")
-    if setting == "border_opacity":
-        if isinstance(value, bool) or not isinstance(value, (int, float)) \
-                or not 0 <= value <= 100:
-            raise VTTError(f"The border opacity is a number 0-100, got "
-                           f"`{value}`.")
-        return int(value)
-    if setting == "background_mode":
-        if str(value).lower() not in ("stretch", "tile", "center"):
-            raise VTTError(f"The background mode is stretch, tile or center, "
-                           f"got `{value}`.")
-        return str(value).lower()
-    if setting == "hidden_layers":
-        words = ([str(v) for v in value] if isinstance(value, list)
-                 else [w.strip() for w in str(value).split(",") if w.strip()])
-        bad = [w for w in words if w not in _MAP_LAYERS]
-        if bad:
-            raise VTTError(f"Unknown layer(s) {', '.join(bad)}: the layers are "
-                           f"{', '.join(_MAP_LAYERS)}.")
-        return sorted(set(words))
-    # background (a sprite key) and border_color (a colour name or hex).
-    if not isinstance(value, str) or not value:
-        raise VTTError(f"The {setting.replace('_', ' ')} setting is a word, "
-                       f"got `{value}`.")
-    return value
-
-
 async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
                       args: List[str], mapspec: Optional[str]):
     """`!map new / list / delete / rename / copy / use / var`."""
@@ -10064,7 +10033,7 @@ async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
             if "." in args[2]:
                 raise VTTError(f"`{args[2].split('.')[0]}` is the map's "
                                f"{setting} setting: it holds one value.")
-            value = _map_setting_value(setting, value)
+            value = map_setting_value(setting, value)
         check_no_value_ancestor(mp.vars, args[2], "map var")
         _set_path(mp.vars, args[2], _own_value(value))
         return await ctx.send(f"{where} var `{args[2]}` = {value!r}")

@@ -644,15 +644,19 @@ class SourceProxy:
 
 
 def _check_on_map(match: Any, x: int, y: int,
-                  actor: Optional[str] = None) -> None:
+                  actor: Optional[str] = None,
+                  map_name: Optional[str] = None) -> "Coord":
     """A location target names a cell of the map (one off it used to run
-    the body on a cell nothing can occupy): the acting unit's map, else
-    the match's only map."""
+    the body on a cell nothing can occupy): the map it names, else the
+    acting unit's map, else the match's only map. Returns the Coord, which
+    carries that map."""
     ae = match.entities.get(actor) if actor else None
-    mp = match.map_of(ae) if ae is not None else match.get_map()
+    home = match.map_of(ae) if ae is not None else match.get_map()
+    mp = home if map_name is None else match.get_map(map_name)
     if not mp.in_bounds(x, y):
         raise VTTError(f"location ({x},{y}) is off the map "
                        f"({mp.size_text()}).")
+    return Coord(x, y, mp.name, named=mp is not home)
 
 
 class Coord:
@@ -668,18 +672,26 @@ class Coord:
     wraps each tuple individually so a `for loc in target:` loop
     binds `loc` to one Coord per iteration."""
 
-    __slots__ = ("x", "y")
+    __slots__ = ("x", "y", "map", "named")
 
-    def __init__(self, x: int, y: int):
+    def __init__(self, x: int, y: int, map: Optional[str] = None,
+                 named: bool = False):
         self.x = x
         self.y = y
+        # The map the cell is on (`target.map`); `named` when it isn't the
+        # acting unit's, so a stored copy says which map.
+        self.map = map
+        self.named = named
 
     def __repr__(self) -> str:
         return f"Coord({self.x}, {self.y})"
 
-    def store_value(self) -> List[int]:
+    def store_value(self) -> List[Any]:
         """How a var stores it: a coordinate list [x, y], like every other
-        stored coordinate (logic._own_value)."""
+        stored coordinate (logic._own_value), or [x, y, map] for a cell on
+        another map than the acting unit's."""
+        if self.named and self.map is not None:
+            return [self.x, self.y, self.map]
         return [self.x, self.y]
 
     def __iter__(self):
@@ -817,8 +829,7 @@ def parse_target(
                 f"location target needs integer coords; got "
                 f"`{tokens[0]} {tokens[1]}`."
             )
-        _check_on_map(match, x, y, actor)
-        return Coord(x, y), list(tokens[2:])
+        return _check_on_map(match, x, y, actor), list(tokens[2:])
     if target_type == "entity_list":
         eids: List[str] = []
         i = 0
@@ -839,8 +850,7 @@ def parse_target(
                 x = int(tokens[i]); y = int(tokens[i + 1])
             except ValueError:
                 break
-            _check_on_map(match, x, y, actor)
-            coords.append(Coord(x, y))
+            coords.append(_check_on_map(match, x, y, actor))
             i += 2
         if not coords:
             raise VTTError(
@@ -919,17 +929,19 @@ def coerce_target(target_type: str, value: Any, match: "Match",
     A coordinate list used to reach the body as a list, so `target.x`
     failed with a Python error."""
     def _coord(v: Any) -> "Coord":
+        mname = None
         if isinstance(v, Coord):
-            x, y = v.x, v.y
-        elif (isinstance(v, (list, tuple)) and len(v) == 2
+            x, y, mname = v.x, v.y, v.map
+        elif (isinstance(v, (list, tuple)) and len(v) in (2, 3)
               and all(isinstance(c, int) and not isinstance(c, bool)
-                      for c in v)):
-            x, y = v
+                      for c in v[:2])
+              and (len(v) == 2 or isinstance(v[2], str))):
+            x, y = v[0], v[1]
+            mname = v[2] if len(v) == 3 else None
         else:
             raise VTTError(f"action `{name}` takes a location target: "
-                           f"[x, y], got {v!r}.")
-        _check_on_map(match, x, y, actor)
-        return Coord(x, y)
+                           f"[x, y] or [x, y, map], got {v!r}.")
+        return _check_on_map(match, x, y, actor, mname)
 
     def _eid(v: Any) -> str:
         if not isinstance(v, str) or not v:

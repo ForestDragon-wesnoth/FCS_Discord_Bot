@@ -393,7 +393,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number
+from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number
 
 
 class FormulaError(VTTError):
@@ -1893,11 +1893,11 @@ def _relative_side_name(rel: float, sides: int, corner_arc: float) -> str:
 # subscript and attribute-on-call-result, so these are the read convention
 # for a returned coord: coord_x(first_opaque(...)), coord_y(c).
 def _coord_x(c: Any) -> Any:
-    """coord_x(c): the x component of a coordinate (an (x, y) pair or a
-    Coord). Raises on None / a non-coordinate (check `c == None` first when
-    a function may return 'no coordinate')."""
+    """coord_x(c): the x component of a coordinate (an (x, y) pair, an
+    [x, y, map] triple or a Coord). Raises on None / a non-coordinate (check
+    `c == None` first when a function may return 'no coordinate')."""
     if isinstance(c, (list, tuple)):
-        if len(c) == 2:
+        if len(c) in (2, 3):
             return c[0]
     elif hasattr(c, "x"):
         return c.x
@@ -1907,15 +1907,31 @@ def _coord_x(c: Any) -> Any:
 
 
 def _coord_y(c: Any) -> Any:
-    """coord_y(c): the y component of a coordinate (an (x, y) pair or a
-    Coord). Raises on None / a non-coordinate."""
+    """coord_y(c): the y component of a coordinate (an (x, y) pair, an
+    [x, y, map] triple or a Coord). Raises on None / a non-coordinate."""
     if isinstance(c, (list, tuple)):
-        if len(c) == 2:
+        if len(c) in (2, 3):
             return c[1]
     elif hasattr(c, "y"):
         return c.y
     raise FormulaError(
         f"coord_y(...): expected an (x, y) coordinate, got "
+        f"{'None' if c is None else type(c).__name__}.")
+
+
+def _coord_map(c: Any) -> Any:
+    """coord_map(c): the map a coordinate names — the third element of an
+    [x, y, map] triple, a location target's map — or None for a plain
+    [x, y] (a cell on the formula's own map)."""
+    if isinstance(c, (list, tuple)):
+        if len(c) == 3:
+            return c[2]
+        if len(c) == 2:
+            return None
+    elif hasattr(c, "x") and hasattr(c, "y"):
+        return getattr(c, "map", None)
+    raise FormulaError(
+        f"coord_map(...): expected an (x, y) coordinate, got "
         f"{'None' if c is None else type(c).__name__}.")
 
 
@@ -2335,6 +2351,7 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
     "relative_angle": _relative_angle,
     "coord_x": _coord_x,
     "coord_y": _coord_y,
+    "coord_map": _coord_map,
     "range": _range,
     "each": _each,
     "sum": _sum,
@@ -2381,6 +2398,10 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
 # But a passive that mutates groups can still cascade indirectly via
 # subsequent commands; that's the GM's problem to design around.
 _MATCH_FUNC_NAMES: Tuple[str, ...] = (
+    # Maps (multi_map_design §3): a unit's map, the match's map names, and
+    # each map's own vars (context map, or map=).
+    "map_of", "maps", "map_var_get", "map_var_set", "map_var_del",
+    "map_var_keys", "map_var_has",
     "group_has", "group_size", "group_add", "group_remove",
     "self_id", "current_id",
     # Tile data access. Tiles live on Match.tiles as a sparse dict of
@@ -2800,6 +2821,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
 # reminder, never a silent default-allow). The _ALLOWED_FUNCS pure helpers
 # (min/max/roll/distance/band/...) are all read-only and always permitted.
 ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
+    "map_var_set", "map_var_del",
     "group_add", "group_remove",
     "tile_set", "tile_del", "tile_clear",
     "move_entity", "move_step", "push_entity", "pull_entity", "swap_entities",
@@ -2836,6 +2858,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
 # never silently expose a function in $() args. When unsure, classify a
 # function as MUTATING (leave it out of this set).
 ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
+    'map_of', 'maps', 'map_var_get', 'map_var_keys', 'map_var_has',
     'has_template', 'template_names', 'template_of', 'template_data',
     'schedules_of', 'schedule_left',
     'flanking', 'flanking_angle', 'flanking_line', 'nearest_cell',
@@ -2904,6 +2927,28 @@ ARG_SAFE_FUNC_NAMES: "frozenset[str]" = frozenset(_ALLOWED_FUNCS) | ARG_SAFE_MAT
 # Built-in functions whose results _namespace passes through _listify (see
 # there): every match function and pure helper.
 _TUPLE_FREE_FUNCS = frozenset(_MATCH_FUNC_NAMES) | frozenset(_ALLOWED_FUNCS)
+
+# The unit-less spatial functions that take `map=` (a map name, 'view' or
+# '@<unit>'; FormulaEngine._namespace wraps them): on a match with several
+# maps they need it, outside a tile / zone hook (whose map they default
+# to). random_cell / random_free_cell, the map_var_* functions,
+# move_entity and the summons take `map=` themselves. The cell-returning
+# ones give [x, y, map] when the map isn't the formula's own.
+_MAP_CELL_RESULT_FUNCS: "frozenset[str]" = frozenset({
+    "first_opaque", "raycast", "free_cell_near", "clip_cells",
+    "cells_in_burst", "cells_in_line", "cells_in_cone", "cells_in_rect",
+})
+_MAP_ARG_FUNCS: "frozenset[str]" = _MAP_CELL_RESULT_FUNCS | frozenset({
+    "tile_get", "tile_has", "tile_set", "tile_del", "tile_clear", "tile_keys",
+    "fire_tile_hook", "cell_entity", "entities_at", "zones_at",
+    "entities_in_area", "entities_in_cone", "entities_in_rect",
+    "entities_in_line_ignorelos", "entities_on_los", "entities_in_line_until",
+    "cell_opaque", "cell_blocked", "in_bounds", "grid_width", "grid_height",
+    "team_sees_cell", "team_sees_cell_rangeonly", "team_sees_cell_losonly",
+    "can_see", "can_see_rangeonly", "can_see_losonly", "has_los",
+})
+assert _MAP_ARG_FUNCS <= _TUPLE_FREE_FUNCS, (
+    _MAP_ARG_FUNCS - _TUPLE_FREE_FUNCS)
 
 
 def validate_arg_safe(src: str) -> None:
@@ -3008,6 +3053,7 @@ _HOF_FUNCS: "frozenset[str]" = frozenset({"map_with", "filter_with", "sort_by"})
 # (cells_in_*). The for-loop target shape must match: a single Name for
 # the id case, a 2-tuple of Names for the coord case.
 _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
+    "maps", "map_var_keys",
     "template_names", "schedules_of", "map_with", "filter_with", "sort_by",
     "range",
     "each",
@@ -3955,7 +4001,7 @@ def _read_entity_path(e: Any, path: str) -> Any:
         if "." in path:
             raise FormulaError(
                 f"`{e.id}`.{seg0} is the entity's "
-                f"{'display name' if seg0 == 'name' else 'position'}, "
+                f"{reserved_path_meaning(seg0)}, "
                 f"which has no fields ('{path}').")
         return getattr(e, seg0)
     return _get_path(e.vars, path)
@@ -4127,14 +4173,113 @@ class FormulaEngine:
                 return default
         cell_limit = _rule_int("formula_cell_limit", _DEFAULT_CELL_LIMIT)
         size_limit = _rule_int("formula_size_limit", _DEFAULT_SIZE_LIMIT)
-        # The map unit-less lookups use: inside a tile or zone hook or
-        # condition, the hook's own map (tile_map / zone_map); else the
-        # match's only map (a match with several refuses, naming them).
-        def _cur_map():
+        # The map unit-less lookups use: the map a call names (`map=`,
+        # _map_stack); inside a tile or zone hook or condition, the hook's
+        # own map (tile_map / zone_map); else the match's only map (a match
+        # with several refuses, naming them).
+        _map_stack: List[Any] = []
+
+        def _default_map_name() -> Optional[str]:
+            """The map a formula means when no call names one: the hook's,
+            else the match's only map, else None (several maps)."""
             name = extras.get("tile_map") or extras.get("zone_map")
             if name and name in self._match.maps:
+                return name
+            if len(self._match.maps) == 1:
+                return next(iter(self._match.maps))
+            return None
+
+        def _cur_map():
+            if _map_stack:
+                return _map_stack[-1]
+            name = _default_map_name()
+            if name is not None:
                 return self._match.maps[name]
-            return self._match.get_map()
+            try:
+                return self._match.get_map()
+            except VTTError as ex:
+                raise FormulaError(str(ex))
+
+        def _map_arg(v: Any, fname: str, many: bool = False) -> Any:
+            """The Map a `map=` value names: a map name, 'view' (the map the
+            command's channel views), '@<unit>' (that unit's map); with
+            `many`, also a list of those or 'all' (a list of Maps)."""
+            m_ = self._match
+            if many and v == "all":
+                return list(m_.maps.values())
+            if isinstance(v, (list, tuple)):
+                if not many:
+                    raise FormulaError(f"{fname}(...): map= names one map "
+                                       f"here, got a list.")
+                out = []
+                for w in v:
+                    mp = _map_arg(w, fname)
+                    if mp not in out:
+                        out.append(mp)
+                if not out:
+                    raise FormulaError(f"{fname}(...): map= got an empty "
+                                       f"list.")
+                return out
+            if not isinstance(v, str) or not v:
+                raise FormulaError(f"{fname}(...): map= takes a map name, "
+                                   f"'view' or '@<unit>', got {v!r}.")
+            if v.startswith("@"):
+                _, ue = _resolve_entity(v[1:], fname)
+                return m_.map_of(ue)
+            if v == "view":
+                view = COMMAND_VIEW.get()
+                if view is None:
+                    raise FormulaError(
+                        f"{fname}(...): map='view' is the map a channel "
+                        f"views, and this formula runs outside a command.")
+                try:
+                    v = view(m_)
+                except VTTError as ex:
+                    raise FormulaError(f"{fname}(...): {ex}")
+            mp = m_.maps.get(v)
+            if mp is None:
+                raise FormulaError(
+                    f"{fname}(...): this match has no map named `{v}` "
+                    f"(maps: {', '.join(m_.maps)}).")
+            return mp
+
+        def _explicit_map():
+            """The map the running call names with `map=`, else None."""
+            return _map_stack[-1] if _map_stack else None
+
+        def _is_cell(c: Any) -> bool:
+            return (isinstance(c, list) and len(c) == 2
+                    and all(isinstance(v, int) and not isinstance(v, bool)
+                            for v in c))
+
+        def _tag_cells(res: Any, name: str) -> Any:
+            """A cell result named on map `name`: [x, y] -> [x, y, name], for
+            one cell or a list of cells (coordinates carry their map when it
+            isn't the formula's own)."""
+            if _is_cell(res):
+                return res + [name]
+            if isinstance(res, list) and res and all(_is_cell(c) for c in res):
+                return [c + [name] for c in res]
+            return res
+
+        def _with_map(fname: str, fn: Any, cells: bool = False) -> Any:
+            """`fn` taking `map=`: the call runs on that map (_cur_map), and
+            with `cells` its cell results carry the map when it isn't the
+            formula's own."""
+            def _call(*a: Any, **k: Any) -> Any:
+                mv = k.pop("map", None)
+                if mv is None:
+                    return fn(*a, **k)
+                mp = _map_arg(mv, fname)
+                _map_stack.append(mp)
+                try:
+                    res = fn(*a, **k)
+                finally:
+                    _map_stack.pop()
+                if cells and mp.name != _default_map_name():
+                    res = _tag_cells(res, mp.name)
+                return res
+            return _call
         # The area builders only list (and only visit) cells on the map.
         # Resolved when a builder runs, so a formula that builds no area
         # needs no map on a match with several.
@@ -4469,17 +4614,29 @@ class FormulaEngine:
             Blocked as _Blocked,
         )
 
-        def _move_entity(eid_t: Any, x: Any, y: Any) -> tuple:
-            """move_entity(eid, x, y): teleport the entity to (x, y) with
-            full tp() semantics (bounds + occupancy validated, tile
-            hooks + on_entity_moved fire). Returns (x, y) on success;
-            raises FormulaError on validation failure, so check first:
-            in_bounds(x, y), cell_entity(x, y) == '', cell_blocked(eid,
-            x, y, 'tp') — or ask free_cell_near for a cell that fits."""
+        def _move_entity(eid_t: Any, x: Any, y: Any = None,
+                         map: Any = None) -> Any:
+            """move_entity(eid, x, y, map=None) / move_entity(eid, coord):
+            teleport the entity to (x, y) with full tp() semantics (bounds +
+            occupancy validated, tile hooks + on_entity_moved fire). A map
+            (map=, or a coordinate's third element) other than the unit's
+            moves its whole body there (parts, riders, segments, auras;
+            on_entity_changed_map fires too). Returns the cell, [x, y, map]
+            after a change of maps; raises FormulaError on validation
+            failure, so check first: in_bounds(x, y), cell_entity(x, y) ==
+            '', cell_blocked(eid, x, y, 'tp') — or ask free_cell_near for a
+            cell that fits."""
             eid = _eid(eid_t)
             e = match.entities.get(eid)
             if e is None:
                 raise FormulaError(f"move_entity: unknown entity id '{eid}'.")
+            if y is None and (isinstance(x, (list, tuple))
+                              or hasattr(x, "x")):
+                c = x
+                x, y = _coord_x(c), _coord_y(c)
+                if map is None:
+                    map = _coord_map(c)
+            dest = _map_arg(map, "move_entity") if map is not None else None
             if not isinstance(x, int) or isinstance(x, bool):
                 raise FormulaError(
                     f"move_entity(eid, x, y): x must be int, got "
@@ -4490,6 +4647,13 @@ class FormulaEngine:
                     f"move_entity(eid, x, y): y must be int, got "
                     f"{type(y).__name__}."
                 )
+            if dest is not None and dest.name != e.map:
+                try:
+                    match.surface_log(match.move_to_map(e, x, y, dest.name))
+                except VTTError as ex:
+                    raise FormulaError(f"move_entity: {ex}")
+                self._note_affected(eid)
+                return [x, y, dest.name]
             try:
                 match.surface_log(e.tp(x, y))
             except (_OutOfBounds, _Occupied) as ex:
@@ -5758,6 +5922,107 @@ class FormulaEngine:
             del cur[keys[-1]]
             return True
 
+        # ---- maps: a unit's map, the map names, each map's own vars ------
+        def _map_of(eid_t: Any) -> str:
+            """map_of(eid): the name of the map the unit stands on (also
+            entity[eid].map)."""
+            _, e = _resolve_entity(eid_t, "map_of")
+            return e.map
+
+        def _maps() -> list:
+            """maps(): the match's map names, in creation order. Loopable."""
+            return list(match.maps)
+
+        def _var_map(fname: str, mv: Any) -> Any:
+            return _map_arg(mv, fname) if mv is not None else _cur_map()
+
+        def _map_var_path(fname: str, path: Any, allow_empty: bool = False):
+            if not isinstance(path, str) or (not path and not allow_empty):
+                raise FormulaError(f"{fname}(path): path must be a "
+                                   f"non-empty string.")
+
+        def _map_var_has(path: Any, map: Any = None) -> bool:
+            """map_var_has(path, map=None): True iff the dotted path is set
+            in the map's vars (the formula's map, or map=)."""
+            _map_var_path("map_var_has", path)
+            cur: Any = _var_map("map_var_has", map).vars
+            for k in path.split("."):
+                if not isinstance(cur, dict) or k not in cur:
+                    return False
+                cur = cur[k]
+            return True
+
+        def _map_var_get(path: Any, default: Any = _MVG_MISSING,
+                         map: Any = None) -> Any:
+            """map_var_get(path[, default], map=None): a map var at a dotted
+            path (the formula's map, or map=); raises on a missing path
+            unless a default is given."""
+            _map_var_path("map_var_get", path)
+            mp = _var_map("map_var_get", map)
+            try:
+                return copy.deepcopy(_get_path(mp.vars, path))
+            except FormulaError:
+                if default is _MVG_MISSING:
+                    raise FormulaError(f"map_var_get: `{path}` is not set "
+                                       f"on map `{mp.name}`.")
+                return default
+
+        def _map_var_keys(path: Any = "", map: Any = None) -> list:
+            """map_var_keys(path='', map=None): the keys at a dotted path of
+            the map's vars (empty = the top-level names). Loopable."""
+            _map_var_path("map_var_keys", path, allow_empty=True)
+            mp = _var_map("map_var_keys", map)
+            v = mp.vars if not path else _get_path(mp.vars, path)
+            if not isinstance(v, dict):
+                raise FormulaError(f"map_var_keys('{path}'): not a dict "
+                                   f"({type(v).__name__}).")
+            return list(v.keys())
+
+        def _map_var_set(path: Any, value: Any, map: Any = None) -> Any:
+            """map_var_set(path, value, map=None): write a map var (the
+            formula's map, or map=); a setting var (fog, borders, ...) takes
+            what its command would store. Returns the stored value."""
+            _map_var_path("map_var_set", path)
+            mp = _var_map("map_var_set", map)
+            setting = {match.map_var_name(k): k for k in MAP_SETTING_RULES}.get(
+                path.split(".")[0])
+            try:
+                check_store_path(path, "map var")
+                if setting is not None:
+                    if "." in path:
+                        raise VTTError(f"`{path.split('.')[0]}` is the map's "
+                                       f"{setting} setting: it holds one "
+                                       f"value.")
+                    value = map_setting_value(setting, value)
+                check_no_value_ancestor(mp.vars, path, "map var")
+                stored = _own_value(value)
+            except VTTError as ex:
+                raise FormulaError(f"map_var_set: {ex}")
+            _set_path(mp.vars, path, stored)
+            return copy.deepcopy(stored)
+
+        def _map_var_del(path: Any, map: Any = None) -> bool:
+            """map_var_del(path, map=None): remove a map var; True iff it
+            existed."""
+            _map_var_path("map_var_del", path)
+            mp = _var_map("map_var_del", map)
+            keys = path.split(".")
+            cur: Any = mp.vars
+            for k in keys[:-1]:
+                cur = cur.get(k) if isinstance(cur, dict) else None
+            if not isinstance(cur, dict) or keys[-1] not in cur:
+                return False
+            del cur[keys[-1]]
+            return True
+
+        ns["map_of"] = _map_of
+        ns["maps"] = _maps
+        ns["map_var_has"] = _map_var_has
+        ns["map_var_get"] = _map_var_get
+        ns["map_var_keys"] = _map_var_keys
+        ns["map_var_set"] = _map_var_set
+        ns["map_var_del"] = _map_var_del
+
         ns["match_var_keys"] = _match_var_keys
         ns["match_var_has"]  = _match_var_has
         ns["match_var_get"]  = _match_var_get
@@ -6149,18 +6414,32 @@ class FormulaEngine:
             _, e = _resolve_entity(eid_t, "entity_snapshot")
             return match.capture_statblock(e)
 
-        def _summon(template: Any, x: Any, y: Any, id_prefix: Any = None) -> str:
+        def _place_map(fname: str, mv: Any) -> Any:
+            """The map a summon places on: map=, else the hook's map, else
+            `self`'s map, else the match's only map."""
+            if mv is not None:
+                return _map_arg(mv, fname)
+            hook = extras.get("tile_map") or extras.get("zone_map")
+            if _map_stack or (hook and hook in match.maps):
+                return _cur_map()
+            se = match.entities.get(ctx.target) if ctx.target else None
+            return match.map_of(se) if se is not None else _cur_map()
+
+        def _summon(template: Any, x: Any, y: Any, id_prefix: Any = None,
+                    map: Any = None) -> str:
             """summon(template, x, y, id_prefix=None): instantiate a
             live entity from a template dict at exactly (x, y). Raises
             (off-grid / occupied) if the cell isn't free — use
             summon_near to ring-search. Returns the new entity id.
             id_prefix overrides the auto-derived id base (template
             name, else 'summon'); the engine appends a counter to keep
-            ids unique."""
+            ids unique. map= places it on another map (default: the hook's
+            map, else self's, else the only one)."""
             prefix = None if id_prefix is None else str(id_prefix)
+            mp = _place_map("summon", map)
             try:
                 new_id, _log = match.summon_entity(
-                    template, x, y, id_prefix=prefix,
+                    template, x, y, id_prefix=prefix, mp=mp,
                 )
                 match.surface_log(_log)
             except (VTTError, NotFound) as ex:
@@ -6169,7 +6448,7 @@ class FormulaEngine:
             return new_id
 
         def _summon_near(template: Any, x: Any, y: Any, radius: Any,
-                         id_prefix: Any = None) -> str:
+                         id_prefix: Any = None, map: Any = None) -> str:
             """summon_near(template, x, y, radius, id_prefix=None): like
             summon, but searches outward (Chebyshev rings, nearest
             first) up to `radius` for the first free in-bounds cell.
@@ -6178,9 +6457,11 @@ class FormulaEngine:
             if not isinstance(radius, int) or isinstance(radius, bool):
                 raise FormulaError("summon_near: radius must be an int.")
             prefix = None if id_prefix is None else str(id_prefix)
+            mp = _place_map("summon_near", map)
             try:
                 new_id, _log = match.summon_entity(
                     template, x, y, id_prefix=prefix, near_radius=radius,
+                    mp=mp,
                 )
                 match.surface_log(_log)
             except (VTTError, NotFound) as ex:
@@ -6188,7 +6469,8 @@ class FormulaEngine:
             engine._note_affected(new_id)
             return new_id
 
-        def _summon_from(path: Any, x: Any, y: Any, id_prefix: Any = None) -> str:
+        def _summon_from(path: Any, x: Any, y: Any, id_prefix: Any = None,
+                         map: Any = None) -> str:
             """summon_from(path, x, y, id_prefix=None): read a template
             from `self`'s vars at the dotted `path`, then summon it
             (strict placement). Convenience for the common case where
@@ -6217,7 +6499,7 @@ class FormulaEngine:
                         f"vars '{path}'."
                     )
                 cur = cur[seg]
-            return _summon(cur, x, y, id_prefix)
+            return _summon(cur, x, y, id_prefix, map)
 
         def _remove_entity(eid_t: Any) -> bool:
             """remove_entity(eid): despawn an entity — the complement of
@@ -6235,7 +6517,7 @@ class FormulaEngine:
             return getattr(ws, "templates", None) or {}
 
         def _template_spawn(fn: str, name: Any, x: Any, y: Any,
-                            radius: Any) -> str:
+                            radius: Any, mv: Any = None) -> str:
             if not isinstance(name, str):
                 raise FormulaError(f"{fn}: the template name must be text.")
             for v, what in ((x, "x"), (y, "y")):
@@ -6246,30 +6528,33 @@ class FormulaEngine:
             if tpl is None:
                 raise FormulaError(f"{fn}: this server has no template "
                                    f"`{name}` (see `!template list`).")
+            mp = _place_map(fn, mv)
             try:
                 new_id, _log = match.spawn_template(key, tpl, x, y,
-                                                    near_radius=radius)
+                                                    near_radius=radius, mp=mp)
                 match.surface_log(_log)
             except (VTTError, NotFound) as ex:
                 raise FormulaError(f"{fn}: {ex}")
             engine._note_affected(new_id)
             return new_id
 
-        def _summon_template(name: Any, x: Any, y: Any) -> str:
+        def _summon_template(name: Any, x: Any, y: Any, map: Any = None) -> str:
             """summon_template(name, x, y): spawn the server's saved template
             `name` (`!template save`) at exactly (x, y), with its body parts.
             Its id is the template name (`guardsman`, then `guardsman2`,
             ...). Returns the new id."""
-            return _template_spawn("summon_template", name, x, y, None)
+            return _template_spawn("summon_template", name, x, y, None, map)
 
-        def _summon_template_near(name: Any, x: Any, y: Any, radius: Any) -> str:
+        def _summon_template_near(name: Any, x: Any, y: Any, radius: Any,
+                                  map: Any = None) -> str:
             """summon_template_near(name, x, y, radius): summon_template, but
             at the nearest free cell within `radius` (Chebyshev rings)."""
             if not isinstance(radius, int) or isinstance(radius, bool) \
                     or radius < 0:
                 raise FormulaError("summon_template_near: radius must be a "
                                    "whole number >= 0.")
-            return _template_spawn("summon_template_near", name, x, y, radius)
+            return _template_spawn("summon_template_near", name, x, y, radius,
+                                   map)
 
         def _has_template(name: Any) -> bool:
             """has_template(name): True when this server has a saved template
@@ -7490,8 +7775,10 @@ class FormulaEngine:
         # cells_in_* helpers. Each builds the shape's cells then collects
         # the alive entities standing on them.
         def _view_map(vid):
-            """The map a viewer-relative query reads: the viewer's map, else
-            the formula's map (_cur_map)."""
+            """The map a viewer-relative query reads: the map the call names
+            (map=), else the viewer's map, else the formula's map."""
+            if _map_stack:
+                return _map_stack[-1]
             ve = match.entities.get(vid) if vid else None
             return match.map_of(ve) if ve is not None else _cur_map()
 
@@ -7689,18 +7976,22 @@ class FormulaEngine:
         def _clip_cells(cells: Any) -> list:
             """clip_cells(cells): the subset of an (x,y) cell list that is
             on the grid. Wrap a cells_in_* call to drop off-grid cells, e.g.
-            clip_cells(cells_in_burst(x, y, 3))."""
+            clip_cells(cells_in_burst(x, y, 3)). An [x, y, map] cell is
+            clipped to its own map and keeps its map."""
             if not isinstance(cells, (list, tuple)):
                 raise FormulaError(
                     "clip_cells(...): expects a list of (x, y) cells.")
             out = []
             for c in cells:
-                if not isinstance(c, (list, tuple)) or len(c) != 2:
+                if not isinstance(c, (list, tuple)) or len(c) not in (2, 3):
                     raise FormulaError(
                         "clip_cells(...): each cell must be an (x, y) pair.")
                 cxv = _coord_int(c[0], "clip_cells", "x")
                 cyv = _coord_int(c[1], "clip_cells", "y")
-                if _cur_map().in_bounds(cxv, cyv):
+                if len(c) == 3:
+                    if _map_arg(c[2], "clip_cells").in_bounds(cxv, cyv):
+                        out.append((cxv, cyv, c[2]))
+                elif _cur_map().in_bounds(cxv, cyv):
                     out.append((cxv, cyv))
             return out
         ns["clip_cells"] = _clip_cells
@@ -7851,6 +8142,11 @@ class FormulaEngine:
                 tw, th = match.entity_footprint(t)
                 tx, ty = t.x + (tw - 1) / 2, t.y + (th - 1) / 2
             elif b is None:
+                cm = _coord_map(a)
+                if cm is not None and cm != e.map:
+                    raise FormulaError(
+                        f"face_toward: `{e.id}` is on map `{e.map}`, the "
+                        f"cell on `{cm}`.")
                 tx = _cell_arg(_coord_x(a), "face_toward", "x")
                 ty = _cell_arg(_coord_y(a), "face_toward", "y")
             else:
@@ -7898,15 +8194,16 @@ class FormulaEngine:
             eid, _ = _resolve_entity(eid_t, "cell_blocked")
             cx = _cell_arg(x, "cell_blocked", "x")
             cy = _cell_arg(y, "cell_blocked", "y")
-            if not match.map_of(match.entities[eid]).in_bounds(cx, cy):
+            bmp = _explicit_map() or match.map_of(match.entities[eid])
+            if not bmp.in_bounds(cx, cy):
                 return True
             if mode is None:
-                return match.cell_blocks(eid, cx, cy)
+                return match.cell_blocks(eid, cx, cy, bmp)
             if mode not in ("walk", "tp", "push", "swap"):
                 raise FormulaError(
                     "cell_blocked(...): mode must be 'walk', 'tp', 'push' or "
                     "'swap'.")
-            return match._check_block(eid, cx, cy, mode)
+            return match._check_block(eid, cx, cy, mode, bmp)
 
         def _cell_opaque(x: Any, y: Any, viewer: Any = None) -> bool:
             """cell_opaque(x, y, viewer=None): whether (x, y) blocks sight —
@@ -7936,7 +8233,8 @@ class FormulaEngine:
                 _, e = _resolve_entity(eid_t, "free_cell_near")
             return match.free_cell_near(
                 cx, cy, radius, e,
-                mp=match.map_of(e) if e is not None else _cur_map())
+                mp=_explicit_map() or (match.map_of(e) if e is not None
+                                       else _cur_map()))
 
         def _team_members(team: Any) -> list:
             """team_members(team): ids of the alive units on `team`, in turn
@@ -8118,6 +8416,9 @@ class FormulaEngine:
                     return None                # no nearest cell across maps
                 targets = match.entity_cells(o)
             elif b is None:
+                cm = _coord_map(a)
+                if cm is not None and cm != e.map:
+                    return None                # no nearest cell across maps
                 targets = [(_cell_arg(_coord_x(a), "nearest_cell", "x"),
                             _cell_arg(_coord_y(a), "nearest_cell", "y"))]
             else:
@@ -8159,6 +8460,8 @@ class FormulaEngine:
                 z = match.find_zone(args[0])
                 if z is None:
                     raise FormulaError(f"{fname}: no zone named {args[0]!r}.")
+                if match.zone_map(args[0]) is not _cur_map():
+                    return set()           # the zone lies on another map
                 return {c for c in (z.get("cells") or ())
                         if _cur_map().in_bounds(*c)}
             if len(args) == 4:
@@ -8174,16 +8477,46 @@ class FormulaEngine:
             raise FormulaError(
                 f"{fname}(...): give a zone name or x1, y1, x2, y2.")
 
-        def _random_cell(*args: Any) -> Any:
+        def _scatter(fname: str, args: tuple, mv: Any, pick: Any) -> Any:
+            """One random pick from the cells `pick()` lists on each map the
+            call names (map= a name, a list or 'all'; a zone names its own
+            map), every cell across them equally likely, so a bigger map
+            gets a bigger share. A cell on another map than the formula's,
+            or any cell when several maps were named, is [x, y, map]."""
+            if mv is None and len(args) == 1 and isinstance(args[0], str) \
+                    and match.find_zone(args[0]) is not None:
+                mv = match.zone_map(args[0]).name
+            if mv is None:
+                pool = [list(c) for c in pick()]
+            else:
+                chosen = _map_arg(mv, fname, many=True)
+                if not isinstance(chosen, list):
+                    chosen = [chosen]
+                here = _default_map_name()
+                pool = []
+                for mp in chosen:
+                    _map_stack.append(mp)
+                    try:
+                        cells = pick()
+                    finally:
+                        _map_stack.pop()
+                    tag = len(chosen) > 1 or mp.name != here
+                    pool += [[c[0], c[1], mp.name] if tag else [c[0], c[1]]
+                             for c in cells]
+            return list(_active_rng().choice(pool)) if pool else None
+
+        def _random_cell(*args: Any, map: Any = None) -> Any:
             """random_cell(zone) / random_cell(x1, y1, x2, y2): a random cell
             of the zone or rectangle (clipped to the map) as [x, y], or None
-            when it has no cell on the map. Uses the match RNG (random_seed,
-            choose() replay)."""
-            cells = sorted(_area_cells("random_cell", args),
-                           key=lambda c: (c[1], c[0]))
-            return list(_active_rng().choice(cells)) if cells else None
+            when it has no cell on the map. `map=` a map name, a list of
+            them or 'all' picks across those maps (each eligible cell
+            equally likely), as [x, y, map]. Uses the match RNG
+            (random_seed, choose() replay)."""
+            return _scatter("random_cell", args, map, lambda: sorted(
+                _area_cells("random_cell", args), key=lambda c: (c[1], c[0])))
 
-        def _random_free_cell(*args: Any, fit: Any = "body") -> Any:
+        def _random_free_cell(*args: Any, fit: Any = "body",
+                              map: Any = None) -> Any:
             """random_free_cell(zone[, eid], fit='body') /
             random_free_cell(x1, y1, x2, y2[, eid], fit='body'): a random spot
             in the area where the unit could stand (its whole body on the map,
@@ -8192,7 +8525,9 @@ class FormulaEngine:
             body must sit in the area: 'body' (every cell inside, the
             default), 'center' (its centre cell inside), 'any' (at least one
             cell inside) or 'anchor' (its top-left cell inside). Without eid,
-            a random empty cell of the area. Uses the match RNG."""
+            a random empty cell of the area. `map=` a map name, a list of
+            them or 'all' picks across those maps (each spot equally
+            likely), as [x, y, map]. Uses the match RNG."""
             e = None
             area_args = args
             if len(args) in (2, 5):
@@ -8200,13 +8535,15 @@ class FormulaEngine:
                 _, e = _resolve_entity(args[-1], "random_free_cell")
             if not isinstance(fit, str):
                 raise FormulaError("random_free_cell(...): fit must be text.")
-            area = _area_cells("random_free_cell", area_args)
-            try:
-                spots = match.free_anchors_in_area(area, e, fit, cell_limit,
-                                                   mp=_cur_map())
-            except VTTError as ex:
-                raise FormulaError(f"random_free_cell(...): {ex}")
-            return list(_active_rng().choice(spots)) if spots else None
+
+            def pick() -> list:
+                area = _area_cells("random_free_cell", area_args)
+                try:
+                    return match.free_anchors_in_area(area, e, fit, cell_limit,
+                                                      mp=_cur_map())
+                except VTTError as ex:
+                    raise FormulaError(f"random_free_cell(...): {ex}")
+            return _scatter("random_free_cell", area_args, map, pick)
 
         ns["random_cell"] = _random_cell
         ns["random_free_cell"] = _random_free_cell
@@ -8310,13 +8647,26 @@ class FormulaEngine:
         def _team_sees_entity_losonly(team: Any, eid_t: Any) -> bool:
             return match._team_has_los_entity(_tm(team), _eid(eid_t))
 
+        def _off_map_of(eid_t: Any, fname: str) -> bool:
+            """Whether the call names (map=) a map other than the unit's."""
+            if not _map_stack:
+                return False
+            _, ue = _resolve_entity(eid_t, fname)
+            return ue.map != _map_stack[-1].name
+
         def _can_see(eid_t: Any, x: Any, y: Any) -> bool:
+            if _off_map_of(eid_t, "can_see"):
+                return False               # no sight across maps
             return match._entity_sees(_eid(eid_t), _cell_arg(x, "can_see", "x"), _cell_arg(y, "can_see", "y"), los=True)
 
         def _can_see_rangeonly(eid_t: Any, x: Any, y: Any) -> bool:
+            if _off_map_of(eid_t, "can_see_rangeonly"):
+                return False               # no sight across maps
             return match.entity_can_see(_eid(eid_t), _cell_arg(x, "can_see_rangeonly", "x"), _cell_arg(y, "can_see_rangeonly", "y"))
 
         def _can_see_losonly(eid_t: Any, x: Any, y: Any) -> bool:
+            if _off_map_of(eid_t, "can_see_losonly"):
+                return False               # no sight across maps
             return match._entity_has_los(_eid(eid_t), _cell_arg(x, "can_see_losonly", "x"), _cell_arg(y, "can_see_losonly", "y"))
 
         def _has_los(x1: Any, y1: Any, x2: Any, y2: Any,
@@ -8325,10 +8675,14 @@ class FormulaEngine:
             two cells? Pass a viewer entity for viewer-conditional opacity
             (without one, such conditions read transparent)."""
             vid = None if viewer is None else _eid(viewer)
+            ve = match.entities.get(vid) if vid else None
+            if _map_stack and ve is not None and ve.map != _map_stack[-1].name:
+                return False               # no sight across maps
             return match.has_los(vid, _cell_arg(x1, "has_los", "x1"),
                                  _cell_arg(y1, "has_los", "y1"),
                                  _cell_arg(x2, "has_los", "x2"),
-                                 _cell_arg(y2, "has_los", "y2"))
+                                 _cell_arg(y2, "has_los", "y2"),
+                                 _view_map(vid))
 
         ns["team_sees_cell"] = _team_sees_cell
         ns["team_sees_cell_rangeonly"] = _team_sees_cell_rangeonly
@@ -8468,6 +8822,12 @@ class FormulaEngine:
             fn = ns.get(fname)
             if callable(fn):
                 ns[fname] = _lists_out(fn)
+        # `map=` on the unit-less spatial functions (multi_map_design §3):
+        # the call runs on that map, and a cell result names it when it
+        # isn't the formula's own map.
+        for fname in _MAP_ARG_FUNCS:
+            ns[fname] = _with_map(fname, ns[fname],
+                                  cells=fname in _MAP_CELL_RESULT_FUNCS)
         return ns
 
     def _compile_function_body(self, fdef):
