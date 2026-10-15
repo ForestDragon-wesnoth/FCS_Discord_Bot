@@ -2182,6 +2182,67 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Changing this rule renames the var on every map."
         ),
     },
+    "map_unseen_var": {
+        "default": "unseen",
+        "schema": {"type": "str"},
+        "desc": (
+            "Map var holding how a map shows to a team that hasn't seen it "
+            "(show / blank_named / blank_unnamed / hidden, `!map unseen`). "
+            "A map without the var uses the unseen_map_display rule, so a "
+            "system edit reaches every map that hasn't set its own value. "
+            "Changing this rule renames the var on every map."
+        ),
+    },
+    "unseen_map_display": {
+        "default": "blank_unnamed",
+        "schema": {"type": "enum",
+                   "choices": ["show", "blank_named", "blank_unnamed",
+                               "hidden"]},
+        "desc": (
+            "How a map a team hasn't seen shows to that team's channels. A "
+            "map is unseen by a team when fog is on there and the team has "
+            "no unit on it, no reveal on it and no fog memory of it; an "
+            "omniscient view and a fog-less map always see it. 'show' "
+            "renders it (all fog); 'blank_named' gives a blank board "
+            "naming it (unseen_map_message_format); 'blank_unnamed' "
+            "(default) gives a blank board without its name: it counts in "
+            "the map list as an unexplored map, but naming it is refused "
+            "like a map that doesn't exist; 'hidden' leaves it out of "
+            "everything the team can query (lists, boards, `map=`, `!map "
+            "<name>`, completion) and out of its map counts, until a unit "
+            "of the team steps in. Each map can override it (`!map unseen "
+            "<mode> map=<name>`, the map var named by map_unseen_var)."
+        ),
+    },
+    "unseen_map_message_format": {
+        "default": "🌫️ {map}: your side hasn't seen this map yet.",
+        "schema": {"type": "str"},
+        "desc": (
+            "The text of a blank board (an unseen map under blank_named / "
+            "blank_unnamed, see unseen_map_display). {map} is the map's "
+            "name, or unseen_map_unnamed_label when the map shows "
+            "unnamed. ASCII and image boards show the same text."
+        ),
+    },
+    "unseen_map_unnamed_label": {
+        "default": "Unexplored map",
+        "schema": {"type": "str"},
+        "desc": (
+            "What a map showing unnamed (unseen under blank_unnamed) is "
+            "called in map lists, board headers and blank boards."
+        ),
+    },
+    "roster_map_grouping": {
+        "default": "map_team",
+        "schema": {"type": "enum", "choices": ["map_team", "team_map"]},
+        "desc": (
+            "How `!list` / `!state` group units on a match with several "
+            "maps: 'map_team' (default) a heading per map, then per team "
+            "within it; 'team_map' a heading per team, then per map within "
+            "it. Map headings follow unseen_map_display. A match with one "
+            "map lists units in turn order as before."
+        ),
+    },
     "default_map_vars": {
         "default": {},
         "schema": {"type": "dict"},
@@ -3543,7 +3604,7 @@ MAP_RESERVED_NAMES = frozenset({
     "colors", "cell", "preview", "ent_sight", "background", "border", "mode",
     "scene", "image", "color", "teamcolor", "resize", "layer", "autoupdate",
     "legend", "coords", "pan", "center", "new", "list", "delete", "rename",
-    "copy", "use", "var", "fog"})
+    "copy", "use", "var", "fog", "unseen"})
 
 
 def check_map_name(name: Any) -> None:
@@ -7824,6 +7885,84 @@ class Match:
 
     def fog_memory_on(self, mp: "Map") -> bool:
         return self._switch(self.map_setting(mp, "fog_memory"))
+
+    # ---- unseen and hidden maps (multi_map_design §6) ----------------------
+    def map_seen_by(self, mp: "Map", pov: Optional[str]) -> bool:
+        """Whether team `pov` has seen map `mp`: always for an omniscient
+        view (None) or a map without fog; else when the team has a unit
+        there, a reveal there, or fog memory of it."""
+        if pov is None or not self.fog_on(mp):
+            return True
+        pov = str(pov)
+        for e in self.entities.values():
+            if e.map != mp.name or not e.is_alive:
+                continue
+            root, seen = e, set()
+            while root.part_of and root.part_of in self.entities \
+                    and root.id not in seen:
+                seen.add(root.id)
+                root = self.entities[root.part_of]
+            if root.team == pov:
+                return True
+        return bool(mp.fog_reveals.get(pov)) or bool(mp.explored.get(pov))
+
+    def map_display(self, mp: "Map", pov: Optional[str]) -> str:
+        """How `mp` shows to team `pov`: 'show' once seen, else its unseen
+        mode (the map's own setting, else unseen_map_display)."""
+        if self.map_seen_by(mp, pov):
+            return "show"
+        return self.map_unseen_mode(mp)
+
+    def map_unseen_mode(self, mp: "Map") -> str:
+        """How `mp` shows to a team that hasn't seen it: its unseen setting,
+        else the unseen_map_display rule."""
+        mode = str(self.map_setting(mp, "unseen") or "").lower()
+        return mode if mode in UNSEEN_MAP_MODES else "blank_unnamed"
+
+    def listed_maps(self, pov: Optional[str]) -> List["Map"]:
+        """The maps team `pov` can know of, in creation order: every map
+        but those its unseen mode hides (the public count)."""
+        return [mp for mp in self.maps.values()
+                if self.map_display(mp, pov) != "hidden"]
+
+    def map_named_for(self, mp: "Map", pov: Optional[str]) -> bool:
+        """Whether team `pov` may name `mp` (map=, `!map <name>`, `!map
+        use`): seen, or unseen under show / blank_named. A blank_unnamed or
+        hidden map reads like one that doesn't exist."""
+        return self.map_display(mp, pov) in ("show", "blank_named")
+
+    def map_label(self, mp: "Map", pov: Optional[str]) -> str:
+        """What team `pov` calls `mp`: its name, or the unnamed label."""
+        if self.map_display(mp, pov) in ("blank_unnamed", "hidden"):
+            return str(self.rules.get("unseen_map_unnamed_label",
+                                      "Unexplored map"))
+        return f"`{mp.name}`"
+
+    def map_heading(self, mp: "Map", pov: Optional[str]) -> str:
+        """A board's map title for team `pov`: "map `cave` (2 of 3)", the
+        unnamed label for a map it may not name, counted among the maps it
+        knows of (hidden ones never count)."""
+        listed = self.listed_maps(pov)
+        label = self.map_label(mp, pov)
+        title = f"map {label}" if label.startswith("`") else label
+        if mp in listed:
+            title += f" ({listed.index(mp) + 1} of {len(listed)})"
+        return title
+
+    def map_blank_text(self, mp: "Map", pov: Optional[str]) -> Optional[str]:
+        """The blank board text when `mp` shows blank to `pov`, else None
+        (it renders). A hidden map that is shown anyway (a board still
+        following a unit that left it) reads as unnamed."""
+        mode = self.map_display(mp, pov)
+        if mode == "show":
+            return None
+        label = (mp.name if mode == "blank_named" else
+                 str(self.rules.get("unseen_map_unnamed_label",
+                                    "Unexplored map")))
+        fmt = str(self.rules.get("unseen_map_message_format",
+                                 "🌫️ {map}: your side hasn't seen this map "
+                                 "yet."))
+        return fmt.replace("{map}", label)
 
     def hidden_layers_of(self, mp: "Map") -> "set[str]":
         v = self.map_setting(mp, "hidden_layers")
@@ -18312,8 +18451,14 @@ class Match:
         `marks` (a set of (x, y) cells, used by `!map preview`) paints
         `mark_glyph` on each of those cells that isn't showing a unit.
 
-        `coords` (None = coords_on()) adds the coordinate rulers."""
+        `coords` (None = coords_on()) adds the coordinate rulers.
+
+        A map the team hasn't seen and that shows blank to it
+        (unseen_map_display) renders as its blank text only."""
         mp = mp or self.get_map()
+        blank = self.map_blank_text(mp, pov_team)
+        if blank is not None:
+            return blank
         hidden = self.hidden_layers_of(mp) if hidden_layers is None else hidden_layers
         if coords is None:
             coords = self.coords_on()
@@ -18611,8 +18756,16 @@ class Match:
                      ) -> Dict[str, Any]:
         """Build the graphics render model of map `mp` (None = the only map;
         see _render_scene_impl). Activates the read-only fog-sight memo for
-        the duration, exactly like render_ascii."""
+        the duration, exactly like render_ascii. A map that shows blank to
+        the team is a scene with no grid content and its `blank` text,
+        which both renderers show."""
         mp = mp or self.get_map()
+        blank = self.map_blank_text(mp, pov_team)
+        if blank is not None:
+            return {"grid_width": 1, "grid_height": 1, "viewport": None,
+                    "background": None, "placements": [], "fog": [],
+                    "borders": {}, "coords": False, "blank": blank,
+                    "legend": [] if legend else None}
         hidden = self.hidden_layers_of(mp) if hidden_layers is None else hidden_layers
         prev = self._vision_memo
         if prev is None:
@@ -19944,9 +20097,14 @@ MAP_VAR_NAME_RULES: Dict[str, Tuple[str, Optional[str]]] = {
     "map_border_color_var": ("border_color", "border_color"),
     "map_border_opacity_var": ("border_opacity", "border_opacity"),
     "map_hidden_layers_var": ("hidden_layers", None),
+    "map_unseen_var": ("unseen", "unseen_map_display"),
 }
 # setting -> its rule
 MAP_SETTING_RULES: Dict[str, str] = {v[0]: k for k, v in MAP_VAR_NAME_RULES.items()}
+
+# How a map a team hasn't seen shows to it (unseen_map_display, the unseen
+# map setting).
+UNSEEN_MAP_MODES = ("show", "blank_named", "blank_unnamed", "hidden")
 
 # The layers a map can hide from its render (`!map layer`, the
 # hidden_layers map setting).
@@ -19956,6 +20114,12 @@ MAP_LAYERS = ("zones", "tiles", "entities", "fog")
 def map_setting_value(setting: str, value: Any) -> Any:
     """`value` checked for map setting `setting` the way its own command
     checks it (VTTError otherwise)."""
+    if setting == "unseen":
+        word = str(value).strip().lower()
+        if word not in UNSEEN_MAP_MODES:
+            raise VTTError(f"The unseen setting is one of "
+                           f"{', '.join(UNSEEN_MAP_MODES)}, got `{value}`.")
+        return word
     if setting in ("fog", "fog_memory", "borders"):
         word = str(value).strip().lower()
         if isinstance(value, bool):

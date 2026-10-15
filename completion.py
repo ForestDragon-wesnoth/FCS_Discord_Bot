@@ -24,7 +24,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 import logic
 from vtt_commands import (registry, _usage_tokens, _split_top, _usage_tails,
                           _is_option_group, _is_variadic, _OPTION_WORD,
-                          _SUB_ALIASES, _query_pov, _pov_hides, _MAP_LAYERS)
+                          _SUB_ALIASES, _query_pov, _pov_hides, _MAP_LAYERS,
+                          _view_pov)
 
 # Placeholder names whose words are free values (numbers, formulas, text,
 # new names): nothing to offer.
@@ -290,6 +291,18 @@ def _view(m, ctx) -> Optional[str]:
         return None
 
 
+def _map_names(m: Any, ctx: Any) -> List[str]:
+    """The map names the channel's view may name (unseen_map_display: an
+    unseen blank_unnamed or hidden map isn't offered)."""
+    if m is None:
+        return []
+    try:
+        pov = _view_pov(ctx, m, [])
+    except Exception:
+        pov = None
+    return [n for n, mp in m.maps.items() if m.map_named_for(mp, pov)]
+
+
 def _zones(m, ctx) -> List[str]:
     """Zone names the channel's view may see (zone_visibility_condition)."""
     pov = _view(m, ctx)
@@ -356,7 +369,7 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
             return paths
         return _entity_ids(mgr, ctx) if slot == "template_ref" else []
     if slot == "map":
-        return list(m.maps) if m is not None else []
+        return _map_names(m, ctx)
     if root == "system" and slot in ("parent", "other"):
         # `!system parent <name> <parent|none>` names a system, not a unit.
         return sorted(mgr.systems)
@@ -519,12 +532,12 @@ def _command_candidates(words: List[str], word: str, mgr, ctx) -> List[str]:
             except Exception:
                 pass             # a name source that can't be read: skip
     if root == "map" and not args and m is not None:
-        out |= set(m.maps)       # `!map <name>` renders that map
+        out |= set(_map_names(m, ctx))   # `!map <name>` renders that map
     if "=" not in word:
         out |= {f"{k}=" for k in walk.keys}
     elif (word.lower().startswith("map=") and "map" in walk.keys
           and m is not None):
-        out |= {f"map={n}" for n in m.maps}
+        out |= {f"map={n}" for n in _map_names(m, ctx)}
     return sorted(out)
 
 

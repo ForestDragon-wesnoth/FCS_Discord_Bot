@@ -376,7 +376,7 @@ back, load the schema with `ToolSearch` before calling
   swept, verified clean, measured. Read the relevant passes before auditing
   an area again.
 - **`docs/multi_map_design.md`**: the agreed design for multiple maps per
-  match and nested maps (steps 1, 2a and 2b built; §8).
+  match and nested maps (steps 1 and 2a-2c built; §8).
 - **`docs/feature_ideas.md`**: the open, numbered feature-idea list the user
   picks from by number (shipped / struck items listed at its top). Check it
   before proposing a feature, and keep it current when one ships.
@@ -1315,7 +1315,7 @@ hardcodes**.
 
 ### 7.8 Geometry, movement and blocking
 
-- **Maps** (`Map`; `docs/multi_map_design.md`, steps 1-2b built): a match
+- **Maps** (`Map`; `docs/multi_map_design.md`, steps 1-2c built): a match
   holds its grids in `Match.maps` (name -> Map, in creation order, saved
   as `map_order` since files sort keys; a new match has one, `main`,
   `DEFAULT_MAP_NAME`). A Map is the grid alone: size, tiles, zones (stored
@@ -1409,6 +1409,33 @@ hardcodes**.
   an undo (`UNDO_IGNORED`), so a player's pans can't fill the undo window;
   the journal still records a `!map use` (`JOURNAL_IGNORED` leaves
   channel_maps in), since `map=view` and strict edits read it (790, 815).
+- **Unseen and hidden maps** (step 2c): a team has seen a map when fog
+  is off there, or it has a living unit (root body's team), a reveal or
+  fog memory there (`Match.map_seen_by`; an omniscient view sees all).
+  An unseen map shows per its `unseen` setting (map var named by
+  `map_unseen_var`, `!map unseen <mode>|default`), else the
+  `unseen_map_display` rule: `show` (renders, all fog), `blank_named`
+  (blank board naming it), `blank_unnamed` (default; listed and counted
+  as `unseen_map_unnamed_label`, naming it refused), `hidden` (not
+  listed, not counted, not nameable) (`map_display`, `listed_maps`,
+  `map_named_for`, `map_label`, `map_heading` "map `x` (2 of 3)"). A
+  blank board is `map_blank_text` (`unseen_map_message_format`): ASCII
+  renders the text alone, `render_scene` returns a scene with `blank`,
+  which `SceneRenderer` draws as that text (parity). Reads under a team
+  view (`_resolve_maps` when not strict, `!map <name>`, `!map use`,
+  `!find map:`, completion) refuse a map the view may not name with the
+  same two-sided wording as a missing one (`_map_for_view` /
+  `_no_such_map`); host-only strict edits state the facts. `!map list`
+  under a view lists what it may know of, "not seen yet" rows without
+  size; the omniscient list names each map's unseen mode. Boards: a
+  Discord board browses maps (◀ ▶, a select menu past 5 maps,
+  `_BoardView`; `_board_map` keeps the browsed map until `turns_elapsed`
+  changes); the GUI has a map dropdown with the same rule; the CLI uses
+  `!map <name>` (837-838, 841).
+- **Roster on several maps:** `!list` / `!state` group units by map then
+  team, or team then map (`roster_map_grouping`; teams in order of first
+  turn, the team a disguise shows), corpses by map (`_roster_groups`); a
+  one-map match lists as before (840).
 - **Cross-map moves** (`Match.move_to_map`, `!ent tp <id> <x> <y>
   [<map>]`): the whole carried body (`carried_body`: parts, riders,
   segments resettled behind the head, located parts at their anchor
@@ -1697,7 +1724,10 @@ hardcodes**.
   absent = omniscient), or a CLI `!as view` preview, or a host's one-off
   `as=<team>` (`_view_pov`). `full` forces omniscient (host).
   `pov_filters_queries` (default on): under a team view `_query_eid` makes a
-  hidden unit read exactly like a missing one and listings skip it
+  hidden unit read exactly like a missing one (two-sided wording: "Could
+  not find a unit named `x`. Either it does not exist, or this channel
+  currently does not have permission to view it."; an omniscient view
+  keeps "Entity 'x' not found.", 839) and listings skip it
   (`_pov_hides`) across `!ent info`, `!dist`, `!find`, `!foreach`, `!turn`,
   `!map center/cell`, `!part`, `!mount`, `!action`, `!passive`, `!clamp`,
   `!mod`, `!schedule`, `!tile info` (corpses inside tile data too);
@@ -2170,8 +2200,9 @@ rejected already. Update this section in the PR that resolves an item.
   `docs/multi_map_design.md`. Read it whole before touching either; ask
   before deviating from it. Built: step 1 (the Map model), step 2a
   (management, map vars, command map resolution, following, cross-map
-  moves) and step 2b (formulas; §7.8). Next: 2c channels / unseen maps /
-  roster, 2d `transfer_entity` and `!match link`, then nested maps.
+  moves), step 2b (formulas) and step 2c (unseen / hidden maps, board
+  browsing, roster grouping; §7.8). Next: 2d `transfer_entity` and
+  `!match link`, then nested maps.
 - **Later:** graphics mouse select / drag and
   animation ("foreseeable future"); a per-entity ATB threshold; arbitrary /
   L-shaped footprints and footprint rotation; per-rider footprints inside a
