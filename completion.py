@@ -280,13 +280,32 @@ def _template_tree(mgr, name: Optional[str]) -> Any:
     return t.get("data") if t.get("kind") == "partial" else t
 
 
+def _view(m, ctx) -> Optional[str]:
+    """The team view completion follows (None = everything)."""
+    if m is None:
+        return None
+    try:
+        return _query_pov(ctx, m)
+    except Exception:
+        return None
+
+
+def _zones(m, ctx) -> List[str]:
+    """Zone names the channel's view may see (zone_visibility_condition)."""
+    pov = _view(m, ctx)
+    return [z for z in m.zone_names()
+            if pov is None or m.zone_visible_to(z, pov)]
+
+
 def _general_pool(mgr, ctx) -> List[str]:
     m = _match(mgr, ctx)
     out = set(_entity_ids(mgr, ctx)) | set(mgr.templates) | set(mgr.matches) \
         | set(mgr.systems)
     if m is not None:
-        out |= set(m.zone_names()) | set(m.status_definitions) | set(m.macros) \
-            | set(m.tables) | set(m.groups)
+        out |= set(_zones(m, ctx)) | set(m.status_definitions) \
+            | set(m.macros) | set(m.tables)
+        if _view(m, ctx) is None:
+            out |= set(m.groups)      # group reads are a host's
     return sorted(str(x) for x in out)
 
 
@@ -308,13 +327,24 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
                 "template_ref"):
         if root == "template" and slot == "path" and "name" in binds:
             return _var_paths(_template_tree(mgr, binds.get("name")), word)
+        # Under a team view, only what that view's reads show: its own
+        # team's data (team_data_visibility), no match vars (a host's
+        # read), the data of zones it can see.
+        pov = _view(m, ctx)
         if root == "team" and m is not None:
-            return _var_paths(m.team_data.get(binds.get("team", "")), word)
+            team = binds.get("team", "")
+            vis = str(m.rules.get("team_data_visibility", "own"))
+            if pov is not None and (vis == "host" or (
+                    vis == "own" and team != str(pov))):
+                return []
+            return _var_paths(m.team_data.get(team), word)
         if root == "match" and m is not None:
-            return _var_paths(m.vars, word)
+            return _var_paths(m.vars, word) if pov is None else []
         if root == "zone" and m is not None:
-            return _var_paths((m.find_zone(binds.get("name", "")) or {})
-                              .get("data"), word)
+            zname = binds.get("name", "")
+            if zname not in _zones(m, ctx):
+                return []
+            return _var_paths((m.find_zone(zname) or {}).get("data"), word)
         if root == "system" and slot == "key":
             return sorted(logic.RULES_REGISTRY)
         if slot == "dest_path":
@@ -400,11 +430,11 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         by_root = {
             "macro": m.macros, "table": m.tables, "alias": m.aliases,
             "func": m.formula_functions, "status": m.status_definitions,
-            "zone": m.zone_names(), "watch": m.watchers, "tile": m.tile_templates,
+            "zone": _zones(m, ctx), "watch": m.watchers, "tile": m.tile_templates,
             "history": m.history.manual_saves,
         }
         if root == "ent" and sub == "group":
-            return sorted(m.groups)
+            return sorted(m.groups) if _view(m, ctx) is None else []
         if root == "match" and sub == "templates":
             return sorted(m.template_pins)
         if root == "match" and sub == "sync":
@@ -480,7 +510,7 @@ def _command_candidates(words: List[str], word: str, mgr, ctx) -> List[str]:
         if node[0] == "lit":
             out.add(node[1])
             if node[1] == "group:" and word.lower().startswith("group:") \
-                    and m is not None:
+                    and m is not None and _view(m, ctx) is None:
                 out |= {f"group:{g}" for g in m.groups}
         else:
             try:

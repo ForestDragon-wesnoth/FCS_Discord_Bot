@@ -20900,12 +20900,12 @@ SCENARIO 736 — Snapshots and summons don't carry links to other units
 !match use t736
 !ent add cart Cart 20 3 3 1
 !ent set_var cart slots.seat.capacity 1
-!ent add rider Rider 10 6 6 3
-!mount rider cart seat
-!ent store_entity_into_var rider rider form
-!assert "not var_has('rider', 'form.mounted_on') and not var_has('rider', 'form.mount_slot')"
-!eval --as rider "summon_from('form', 8, 8)"
-!assert "slot_riders('cart', 'seat') == ['rider'] and entity[rider2].x == 8"
+!ent add jockey Jockey 10 6 6 3
+!mount jockey cart seat
+!ent store_entity_into_var jockey jockey form
+!assert "not var_has('jockey', 'form.mounted_on') and not var_has('jockey', 'form.mount_slot')"
+!eval --as jockey "summon_from('form', 8, 8)"
+!assert "slot_riders('cart', 'seat') == ['jockey'] and entity[jockey2].x == 8"
 !ent add w Worm 20 6 2 3
 !part segment w w_s1 S 3 3
 !eval "var_set('w', 'snap', entity_snapshot('w_s1'))"
@@ -20919,7 +20919,7 @@ entity_snapshot used to keep the unit's links to other units: a summon
 from a mounted rider's snapshot created a second rider of the cart's
 one-person seat, standing at (8,8) away from the cart. Snapshots now drop
 part and mount links, and a summon strips them (and a segment's
-`__follows`) from any dict it is given: `rider2` is a free unit, the
+`__follows`) from any dict it is given: `jockey2` is a free unit, the
 snapshot of a worm segment summons as a plain unit that doesn't follow the
 worm.
 

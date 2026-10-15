@@ -75,9 +75,23 @@ class _BufferCtx:
     channel_key mirrors the real context so active-match lookups inside
     the dispatched command resolve to the same match."""
 
-    def __init__(self, channel_key: str):
+    def __init__(self, channel_key: str, user_id: Optional[str] = None,
+                 user_name: Optional[str] = None):
         self.channel_key = channel_key
+        # Who ran the action: every identity check a cmd() line meets
+        # (a transfer into another match needs its host) sees that user. An
+        # identity-less context passed those checks (the gate's no-op for
+        # single-operator surfaces), so a cmd() line reached any match.
+        # Never an administrator (`is_admin` unset: default-deny).
+        self.user_id = user_id
+        self.user_name = user_name
         self.out: List[str] = []
+
+    @classmethod
+    def for_ctx(cls, ctx: Any) -> "_BufferCtx":
+        return cls(getattr(ctx, "channel_key", "CLI"),
+                   getattr(ctx, "user_id", None),
+                   getattr(ctx, "user_name", None))
 
     async def send(self, message: str) -> None:
         self.out.append(message)
@@ -1038,12 +1052,12 @@ async def run_action(
     # Nested sub-actions reuse the top-level buffer (stored on the
     # match) so all command echoes flush together, once, at the top.
     if is_top_level:
-        buffer_ctx = _BufferCtx(getattr(ctx, "channel_key", "CLI"))
+        buffer_ctx = _BufferCtx.for_ctx(ctx)
         match._runtime_buffer = buffer_ctx
     else:
         buffer_ctx = getattr(match, "_runtime_buffer", None)
         if buffer_ctx is None:
-            buffer_ctx = _BufferCtx(getattr(ctx, "channel_key", "CLI"))
+            buffer_ctx = _BufferCtx.for_ctx(ctx)
             match._runtime_buffer = buffer_ctx
 
     # Build the action's eval bindings. SourceProxy/ArgsProxy
@@ -1113,12 +1127,20 @@ async def run_action(
         # suppressed because match._action_depth > 0 (set below).
         # Use the CURRENT buffer (the replay loop swaps in a fresh one
         # per attempt, so reference it dynamically rather than capturing).
+        from vtt_commands import _GATE_LINES  # noqa: PLC0415
         coro = registry.dispatch_no_snapshot(
             tokens[0], tokens[1:], match._runtime_buffer or buffer_ctx, mgr,
         )
+        # The body is GM-written: its lines aren't a caller's typed lines,
+        # even when the action ran from a batch (_GATE_LINES).
+        gate_token = _GATE_LINES.set(False)
+        try:
+            result = _sync_dispatch_returning(coro)
+        finally:
+            _GATE_LINES.reset(gate_token)
         # A failed `!assert` line stops the body like fail() does (rolled
         # back); the ❌ Assertion failed line is already in the buffer.
-        if _sync_dispatch_returning(coro) == ASSERT_STOP:
+        if result == ASSERT_STOP:
             raise ActionFail(f"cmd(): `{line}` failed its assertion.",
                              reason="assert")
 
@@ -1282,7 +1304,7 @@ async def run_action(
                 _restore_rng(match, rng_state)
                 # Fresh output buffer per attempt — rolled-back attempts'
                 # command echoes must not leak into the committed run.
-                match._runtime_buffer = _BufferCtx(getattr(ctx, "channel_key", "CLI"))
+                match._runtime_buffer = _BufferCtx.for_ctx(ctx)
             try:
                 engine.eval_program(
                     action.body, eval_ctx,
@@ -1510,6 +1532,7 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
         "_choice_answers", "_choice_cursor",
         # In-flight operation guards/state that span a nested rollback.
         "_summon_count", "_death_processing", "_death_check_suppressed_ids",
+        "_death_check_deferred_ids",
         "_alive_eval_depth", "_vision_memo", "_turn_order_dirty",
         "_request_seq", "pending_requests", "held_commands",
         # Event bus: the live emit stack/depth + warning latch. Resetting

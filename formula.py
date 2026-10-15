@@ -3418,6 +3418,10 @@ class _EntityAccessTransformer(ast.NodeTransformer):
             return ast.Constant(value=slice_node.id)
         if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, str):
             return ast.Constant(value=slice_node.value)
+        if (isinstance(slice_node, ast.Constant)
+                and type(slice_node.value) is int and slice_node.value >= 0):
+            # A digits-only id (`entity[123]`) is that id as text.
+            return ast.Constant(value=str(slice_node.value))
         # Any other expression -> dynamic. Recursively transform it so it
         # may itself contain entity[...] reads / function calls, then use
         # its runtime value as the entity id.
@@ -4178,19 +4182,27 @@ class FormulaEngine:
         # lives on the match and advances across calls (so a SEQUENCE of
         # rolls is deterministic, not every roll identical). It's rebuilt
         # when the seed changes or the match reloads (runtime-only state).
+        # Closures over `rng` (no `_r=rng` default): an extra positional
+        # argument used to land on the RNG parameter (a raw Python error).
         rng = self._match.formula_rng() if self._match else random
         if rng is not random:
-            ns["random_int"] = (
-                lambda lo, hi, _r=rng: _random_int_impl(_r, lo, hi)
-            )
-            ns["random_string"] = (
-                lambda *choices, _r=rng: _random_string_impl(_r, choices)
-            )
-            ns["pick"] = lambda v, _r=rng: _pick_impl(_r, v)
-            ns["shuffle"] = lambda v, _r=rng: _shuffle_impl(_r, v)
-            ns["roll"] = (
-                lambda spec, _r=rng: _roll_impl(_r, spec)
-            )
+            def random_int(lo, hi):
+                return _random_int_impl(rng, lo, hi)
+
+            def random_string(*choices):
+                return _random_string_impl(rng, choices)
+
+            def pick(v):
+                return _pick_impl(rng, v)
+
+            def shuffle(v):
+                return _shuffle_impl(rng, v)
+
+            def roll(spec):
+                return _roll_impl(rng, spec)
+            for fn in (random_int, random_string, pick, shuffle, roll):
+                fn.__qualname__ = fn.__name__     # "pick() takes 1 ..."
+                ns[fn.__name__] = fn
 
         # Match-bound group functions. Each takes string args; entity-id
         # args go through ctx.resolve_who so the special tokens "self",
@@ -4412,7 +4424,7 @@ class FormulaEngine:
                 )
             if (x, y) not in _cur_map().tiles:
                 return False
-            del _cur_map().tiles[(x, y)]
+            _cur_map().clear_tile_keep_corpses(x, y)   # bodies stay
             return True
 
         ns["tile_set"] = _tile_set

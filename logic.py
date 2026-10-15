@@ -3479,6 +3479,22 @@ def _default_facing_for(
 
 RESERVED_IDS: Set[str] = {"current", "this", "self", "parent"}
 
+_UNREACHABLE_IDS: Optional[frozenset] = None
+
+
+def unreachable_id(eid: Any) -> bool:
+    """Whether `entity[<eid>]` would read something else than the unit with
+    that id: a hook / action binding (`target`, `actor`, `slot`, ...), a
+    Python keyword or `True` / `None`. Such ids are refused when a unit is
+    created, like the RESERVED_IDS tokens."""
+    global _UNREACHABLE_IDS
+    if _UNREACHABLE_IDS is None:
+        from formula import HOOK_CONTEXT_NAMES, _ACTION_BINDING_NAMES
+        _UNREACHABLE_IDS = frozenset(
+            set(HOOK_CONTEXT_NAMES) | set(_ACTION_BINDING_NAMES)
+            | set(keyword.kwlist) | {"entity"})
+    return str(eid) in _UNREACHABLE_IDS
+
 # Reserved var PATHS: entity FIELDS that formulas read as if they were vars
 # (`entity[x].name`, `entity[x].x`), resolved from the Entity itself. Their
 # names are reserved: no entity var may be created under them (write_var
@@ -4686,7 +4702,10 @@ def _run_passive_safely(engine, p: "Passive", ctx, *, target_id: str, is_global:
 # don't need a template — they're written as ad-hoc instances via
 # !tile set + !tile hook add, which keep working unchanged. Templates
 # exist purely as a reuse convenience for tile KINDS that recur.
-TILE_RESERVED_KEYS = frozenset({"_template", "hooks"})
+TILE_RESERVED_KEYS = frozenset({"_template", "hooks", "corpses"})
+_CORPSES_RESERVED = ("`corpses` in tile data is where the engine keeps the "
+                     "dead lying there: it can't be set or deleted as tile "
+                     "data.")
 # Keys in a tile dict that aren't user data:
 #   _template — name of the template this instance was placed from
 #               (absent on ad-hoc instances)
@@ -5291,6 +5310,11 @@ class Entity:
         # Disallow reserved ids that the CLI uses as shorthands (current/this are used if you want to get the id of the entity whose turn it is right now)
         if tested_id in RESERVED_IDS:
             raise ReservedId(f"Entity id '{tested_id}' is a special reserved id and cannot be used when creating entities. Reserved ids are used for formulas and commands, like 'this' being used to automatically get the id of the entity whose turn it is.")
+        if unreachable_id(self.id.strip()):
+            raise ReservedId(
+                f"Entity id '{self.id.strip()}' names a formula binding or "
+                f"keyword, so `entity[{self.id.strip()}]` couldn't reach the "
+                f"unit; pick another id.")
         if self.facing not in ALLOWED_DIRECTIONS:
             self.facing = "up"
 
@@ -6202,6 +6226,7 @@ class Entity:
         self._set_path(path, value)
         if self._match is not None:
             self._match.track_template_change(self, path, deleted=False)
+            self._match._body_reshaped(self, path)
         # A heal that lifts a destroyed body part back above 0 clears the
         # destroyed latch, so it can break (and re-fire on_death) again, and
         # RESUMES any aura suspended when it broke (a no-op unless
@@ -6389,6 +6414,7 @@ class Entity:
         self._del_path(path)
         if self._match is not None:
             self._match.track_template_change(self, path, deleted=True)
+            self._match._body_reshaped(self, path)
         events = _diff_subtree(path, old, _MISSING)
         log = self._fire_var_events(events)
         # Removing the init or team var also dirties turn order — same
@@ -6707,6 +6733,15 @@ class Map:
             d = d[key]
         return True
 
+    def clear_tile_keep_corpses(self, x: int, y: int) -> None:
+        """Drop cell (x, y)'s tile data but not the corpses lying on it."""
+        cell = self.tiles.get((x, y))
+        corpses = cell.get("corpses") if isinstance(cell, dict) else None
+        if corpses:
+            self.tiles[(x, y)] = {"corpses": corpses}
+        else:
+            self.tiles.pop((x, y), None)
+
     def tile_set_path(self, x: int, y: int, path: str, value: Any) -> None:
         """Set tile_data[x,y][a][b][c] = value, creating intermediate
         dicts as needed (same write semantics as Entity.write_var,
@@ -6718,6 +6753,8 @@ class Map:
                 f"({x},{y}) outside {self.grid_width}x{self.grid_height}"
             )
         check_store_path(path, "tile path")
+        if path.split(".")[0] == "corpses":
+            raise VTTError(_CORPSES_RESERVED)
         d = self.tiles.setdefault((x, y), {})
         parts = path.split(".")
         for i, key in enumerate(parts[:-1]):
@@ -6745,8 +6782,11 @@ class Map:
         if (x, y) not in self.tiles:
             return  # nothing to do — symmetric with remove_var_silent
         if not path:
-            del self.tiles[(x, y)]
+            # The corpses lying there stay: bodies, not terrain.
+            self.clear_tile_keep_corpses(x, y)
             return
+        if path.split(".")[0] == "corpses":
+            raise VTTError(_CORPSES_RESERVED)
         # Walk down, tracking each parent dict so we can prune empties
         # on the way back up.
         parts = path.split(".")
@@ -7429,8 +7469,8 @@ class Match:
     # `!match resume`.
     paused: Optional[Dict[str, Any]] = None
     # Host commands held while paused (pause_affects_hosts): dicts {user,
-    # user_name, channel_key, name, args}. Runtime-only, like the approval
-    # queue below.
+    # user_name, channel_key, name, args}. Saved inside `paused` (to_dict),
+    # so a restart keeps them; an undo keeps the live ones.
     held_commands: List[Dict[str, Any]] = field(default_factory=list,
                                                 repr=False)
 
@@ -7562,6 +7602,13 @@ class Match:
     # would). Explicit kill() bypasses check_death and so is unaffected —
     # only the automatic condition check is deferred. Not serialized.
     _death_check_suppressed_ids: Set[str] = field(
+        default_factory=set, repr=False, compare=False
+    )
+    # Units whose automatic death check waits until a multi-var command
+    # (`!ent set_vars`) has written every var; the command runs the check
+    # itself afterwards. Unlike _death_check_suppressed_ids it leaves the
+    # damage / heal / spawn events alone. Not serialized.
+    _death_check_deferred_ids: Set[str] = field(
         default_factory=set, repr=False, compare=False
     )
 
@@ -8197,6 +8244,18 @@ class Match:
                         new.add((xx, yy))
         z["cells"] = new
 
+    def _body_reshaped(self, e: "Entity", path: str) -> None:
+        """After a write or delete of `e`'s footprint var: re-stamp the
+        auras anchored to it and re-seat its riders, which follow the
+        body's cells (a move does the same through fire_entity_moved)."""
+        if "." in path or path not in (
+                self.rules.get("footprint_width_var", "footprint_w"),
+                self.rules.get("footprint_height_var", "footprint_h")):
+            return
+        if e.id in self.entities:
+            self._restamp_anchors_for(e.id)
+            self._restamp_riders_for(e.id)
+
     def _restamp_anchors_for(self, eid: str) -> None:
         """Re-stamp every aura anchored to `eid` (called when it moves)."""
         for mp in self.maps.values():
@@ -8358,6 +8417,13 @@ class Match:
             for i in range(1, len(chain)):
                 chain[i].x, chain[i].y = old[i - 1]
         head.vars["__seg_last"] = [head.x, head.y]
+        # The trail moves segments by their anchor cell: a multi-tile
+        # segment can then reach past the map's edge. Re-lay the body
+        # (footprint-aware, _snake_layout) when one does.
+        mp = self.map_of(head)
+        if any(not mp.in_bounds(*c) for sg in chain
+               for c in self.entity_cells(sg)):
+            self._resettle_snake(head_id)
 
     def _advance_snake_path(self, head: "Entity", chain: List["Entity"],
                             prev_x: int, prev_y: int) -> None:
@@ -10744,6 +10810,10 @@ class Match:
                 )
             tile.update(copy.deepcopy(overrides))
         tile["_template"] = name
+        # Placing terrain keeps the corpses lying on the cell.
+        old = mp.tiles.get((x, y))
+        if isinstance(old, dict) and old.get("corpses"):
+            tile["corpses"] = old["corpses"]
         mp.tiles[(x, y)] = tile
         return tile
 
@@ -14640,7 +14710,8 @@ class Match:
             if ch.isalnum() or ch in ("_", "-")
         ) or "summon"
         taken = self._taken_entity_ids()
-        if base not in taken:
+        if (base not in taken and base not in RESERVED_IDS
+                and not unreachable_id(base)):
             return base
         n = 2
         while f"{base}{n}" in taken:
@@ -15043,7 +15114,8 @@ class Match:
         revive state settles)."""
         if self._death_processing > 0:
             return []
-        if entity_id in self._death_check_suppressed_ids:
+        if (entity_id in self._death_check_suppressed_ids
+                or entity_id in self._death_check_deferred_ids):
             return []
         e = self.entities.get(entity_id)
         if e is None:
@@ -17188,7 +17260,12 @@ class Match:
             "map_legend_enabled": bool(self.map_legend_enabled),
             "map_coords": self.map_coords,
             "render_mode": self.render_mode,
-            "paused": copy.deepcopy(self.paused),
+            # Host commands held by the pause travel with it, so a restart
+            # doesn't drop them (both stay out of undo state).
+            "paused": (dict(copy.deepcopy(self.paused),
+                            held=copy.deepcopy(self.held_commands))
+                       if self.paused and self.held_commands
+                       else copy.deepcopy(self.paused)),
         }
         if include_history:
             d["history"] = self.history.to_dict()
@@ -17396,6 +17473,12 @@ class Match:
         m.render_mode = rm if rm in ("text", "image") else "text"
         pz = d.get("paused")
         m.paused = copy.deepcopy(pz) if isinstance(pz, dict) else None
+        if m.paused is not None:
+            held = m.paused.pop("held", None)
+            m.held_commands = [h for h in held if isinstance(h, dict)
+                               and isinstance(h.get("name"), str)
+                               and isinstance(h.get("args"), list)] \
+                if isinstance(held, list) else []
         # History is optional in saved dicts. It's only present when the
         # original save was made with include_history=True. A snapshot's
         # state.dict deliberately omits history (snapshots-within-
@@ -19119,7 +19202,7 @@ def check_template_name(name: Any) -> str:
     lower-case so two names can't differ only by case (one file on Windows)."""
     n = str(name).strip().lower()
     check_id("template name", n)
-    if n in RESERVED_IDS:
+    if n in RESERVED_IDS or unreachable_id(n):
         raise VTTError(f"`{n}` is a reserved name and can't name a template.")
     return n
 
@@ -20375,10 +20458,23 @@ class MatchManager:
                 rules[k] = hi
         return rules
 
+    def _check_match_id_case(self, mid: str, renaming: Optional[str] = None
+                             ) -> None:
+        """Refuse a match id equal to another's but for case: a match's
+        files are named by its id, and Windows and macOS file systems ignore
+        case, so the two would share one file and folder."""
+        for other in self.matches:
+            if other != renaming and other != mid \
+                    and other.lower() == mid.lower():
+                raise DuplicateId(
+                    f"Match `{other}` exists: ids differing only in case "
+                    f"would share files on Windows and macOS.")
+
     def create_match(self, match_id: str, name: str, width: int, height: int, channel_key: Optional[str] = None, system_name: Optional[str] = None, owner: Optional[str] = None) -> str:
         check_id("match id", match_id)
         if match_id in self.matches:
             raise DuplicateId(f"Match id '{match_id}' already exists")
+        self._check_match_id_case(match_id)
         sysobj = self.get_system(system_name) if system_name else (
             self.effective_system(channel_key or "CLI")
         )
@@ -20600,6 +20696,7 @@ class MatchManager:
         check_id("match id", new_id)
         if new_id in self.matches:
             raise DuplicateId(f"Match id '{new_id}' already exists")
+        self._check_match_id_case(new_id)
         d = src.to_dict(include_history=False)
         d["id"] = new_id
         d["name"] = new_name or f"{src.name} (copy)"

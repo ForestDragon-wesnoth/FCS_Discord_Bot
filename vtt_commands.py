@@ -259,6 +259,11 @@ _SYSTEM_UNDO_TYPED_ONLY = ("❌ `!system undo` only runs when typed on its own "
                            "— not inside a batch, macro, alias or action.")
 
 
+# True while a `!batch` / `!foreach` dispatches the lines its caller typed:
+# each passes the access gate as the caller (dispatch_no_snapshot).
+_GATE_LINES: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "vtt_gate_lines", default=False)
+
 _INLINE_ARGS_HOST_ONLY = ("❌ inline `$()` arguments are host-only on this "
                           "match (inline_args_access).")
 
@@ -503,6 +508,18 @@ class CommandRegistry:
         # check a host could wrap `!system set` in a `!batch`.
         if _admin_required(name, args) and not ctx_is_admin(ctx):
             await ctx.send(_admin_msg(name, args))
+            return
+        # A line a caller typed into `!batch` / `!foreach` runs only if the
+        # caller could run it directly: an access override opening the
+        # container to players used to open every command inside it (a
+        # player appointed themselves co-host). Action cmd() lines and a
+        # macro's host-written body aren't typed lines (_GATE_LINES off).
+        if _GATE_LINES.get() and not getattr(ctx, "auto_approve", False) \
+                and ctx_user(ctx) is not None \
+                and self._gate_decision(name, args, ctx, mgr) != "allow":
+            await ctx.send(f"❌ `!{name}` can't run inside a batch or "
+                           f"foreach for you: it needs a host (send it on "
+                           f"its own).")
             return
         # Inline-formula `$(...)` substitution for sub-command lines (a macro /
         # batch / foreach inner command), so $() resolves per line in the
@@ -1819,10 +1836,13 @@ _HOST_READS: Dict[str, Optional[frozenset]] = {
 def _pause_control(name: str, args: List[str]) -> bool:
     """What a host may still run while paused with pause_affects_hosts:
     `!match pause` / `!match resume`, the host-only reads (`!assert`,
-    `!ent dump`, `!map full`, a bare `!match`, ...), and an undo `preview`."""
+    `!ent dump`, `!map full`, a bare `!match`, ...), an undo `preview` and
+    `!dry` (it restores everything it ran)."""
     root = name.lower()
     sub = str(args[0]).lower() if args else None
     if root == "match" and sub in ("pause", "resume"):
+        return True
+    if root == "dry":
         return True
     if root in ("undo", "history") and any(
             str(a).lower() == "preview" for a in args):
@@ -2360,6 +2380,11 @@ def _parse_clamp_bound(raw: str) -> Any:
         return float(s)
     except ValueError:
         pass
+    # A path: plain dotted var names. Anything else (a formula, brackets,
+    # spaces) can never name a var, so it would mean "no bound" forever.
+    if not re.match(r"[A-Za-z_]\w*(\.\w+)*\Z", s):
+        raise VTTError(f"A clamp bound is a number or a var path "
+                       f"(`max_hp`, `stats.cap`), got `{raw}`.")
     return s  # treat as path
 
 
@@ -3284,16 +3309,20 @@ async def host_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # user=<mention|id>: the override applies to that player only
         # (stored as `@<id> <key>` among the match's overrides).
         who = None
+        who_raw = ""
         plain = []
         for tok in args:
             if tok.lower().startswith("user="):
-                who = _normalize_user_token(tok.split("=", 1)[1])
+                who_raw = tok.split("=", 1)[1]
+                who = _normalize_user_token(who_raw)
                 if not who:
                     raise VTTError("user= names a player (a mention or id).")
             else:
                 plain.append(tok)
         args = plain
         asub = args[1].lower() if len(args) >= 2 else "list"
+        if who and asub == "set":
+            who = _user_target(ctx, who_raw)
         if asub == "list":
             if not m.access_overrides:
                 return await ctx.send(
@@ -3341,7 +3370,8 @@ async def host_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub in ("add", "remove"):
         if await return_help_if_not_enough_args(ctx, args, 2, "host", sub):
             return
-        target = _normalize_user_token(args[1])
+        target = (_user_target(ctx, args[1]) if sub == "add"
+                  else _normalize_user_token(args[1]))
         if sub == "add":
             if target == m.owner:
                 return await ctx.send(f"{_mention(target)} is already the owner.")
@@ -3360,6 +3390,18 @@ async def host_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(f"Removed co-host {_mention(target)} from **{m.name}**.")
 
     return await _help_fallback(ctx, ["host"], args[0] if args else None)
+
+
+def _user_target(ctx, tok: str) -> str:
+    """A user named by `!host add` / `user=`: normalized, and on a surface
+    whose users are numeric ids (Discord, `numeric_user_ids`) refused
+    unless it is a mention or an id, since a typed name never matches."""
+    who = _normalize_user_token(tok)
+    if getattr(ctx, "numeric_user_ids", False) and not who.isdigit():
+        raise VTTError(
+            f"`{tok}` isn't a user: mention them (pick the name from the @ "
+            f"list so it becomes a mention) or give their user id.")
+    return who
 
 
 def _normalize_user_token(tok: str) -> str:
@@ -4009,7 +4051,7 @@ def split_command_args(root: str, tail: str) -> List[str]:
                 out.append(";")
             piece = piece.strip()
             if i == 0 and low == "foreach":
-                out += shlex.split(piece)
+                out += shlex.split(_straight_quotes(piece))
                 continue
             if i == 0 and low == "batch" and re.match(r"strict(\s|$)", piece):
                 out.append("strict")
@@ -4027,7 +4069,16 @@ def split_command_args(root: str, tail: str) -> List[str]:
             elif len(raw) >= 2 and raw[0] == raw[-1] == "'":
                 raw = raw[1:-1]
             return [m.group(1), m.group(2).strip("'\""), raw]
-    return shlex.split(tail)
+    return shlex.split(_straight_quotes(tail))
+
+
+def _straight_quotes(text: str) -> str:
+    """Phone keyboards type “ ” and ‘ ’ (iOS Smart Punctuation, passed on
+    by Discord): read them as the quotes they stand for. A lone ’ is an
+    apostrophe (Bob’s) and stays."""
+    text = text.replace("\u201c", '"').replace("\u201d", '"') \
+               .replace("\u201e", '"')
+    return re.sub("\u2018([^\u2019]*)\u2019", r"'\1'", text)
 
 
 _IMPORT_HEAD = re.compile(r"!?\s*template\s+import\s+\S+\s*(.*)\Z",
@@ -5440,6 +5491,7 @@ async def _match_replay(ctx: ReplyContext, args: List[str],
     if mid in mgr.matches:
         raise VTTError(f"This server already has a match `{mid}`: replay "
                        f"with `as=<new id>`.")
+    mgr._check_match_id_case(mid)
     # A system of the same name is replaced when no match here reads it
     # (a fresh server's `default`); one a match uses is refused.
     in_use = set()
@@ -6461,7 +6513,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if action == "info":
             if len(args) < 4:
                 return await ctx.send(
-                    "Usage: `!system alias info <system> <name>`."
+                    "❌ Usage: `!system alias info <system> <name>`."
                 )
             aname = args[3]
             exp = lib.get(aname)
@@ -6479,7 +6531,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             # allowed to chain into other aliases either.
             if len(args) < 5:
                 return await ctx.send(
-                    "Usage: `!system alias def <system> <name> <expansion>`."
+                    "❌ Usage: `!system alias def <system> <name> <expansion>`."
                 )
             aname = args[3]
             expansion = " ".join(args[4:]).strip()
@@ -6517,7 +6569,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if action in ("del", "delete", "remove", "rm"):
             if len(args) < 4:
                 return await ctx.send(
-                    "Usage: `!system alias del <system> <name>`."
+                    "❌ Usage: `!system alias del <system> <name>`."
                 )
             aname = args[3]
             if aname not in lib:
@@ -6536,7 +6588,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if action == "promote":
             if len(args) < 4:
                 return await ctx.send(
-                    "Usage: `!system alias promote <system> <name>`."
+                    "❌ Usage: `!system alias promote <system> <name>`."
                 )
             aname = args[3]
             m = active_match(mgr, ctx)
@@ -8343,6 +8395,14 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         shown: List[str] = []
         notes: List[str] = []
         hook_log: List[str] = []
+        # The unit's death check waits until every var is written, so the
+        # order of the pairs doesn't decide whether the later ones land
+        # (`hp=0 f=3` sets both, like `f=3 hp=0`).
+        sink = FORMULA_LOG_SINK.get()
+        sink_mark = len(sink) if sink is not None else 0
+        deferred = eid not in m._death_check_deferred_ids
+        if deferred:
+            m._death_check_deferred_ids.add(eid)
         try:
             for key, value in pairs:
                 if eid not in m.entities:
@@ -8357,7 +8417,15 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     notes.append(warn.strip())
         except VTTError as ex:
             _rollback_match(m, mgr, pre)
+            if sink is not None:
+                # Lines surfaced by the undone writes (a death line) go too.
+                del sink[sink_mark:]
             raise VTTError(f"{ex} Nothing was set.")
+        finally:
+            if deferred:
+                m._death_check_deferred_ids.discard(eid)
+        if deferred:
+            hook_log += m.check_death(eid)
         ack = f"`{eid}` vars: " + ", ".join(shown)
         if bypass_clamp:
             ack += " (clamp bypassed)"
@@ -10037,7 +10105,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         mode = args[2].lower() if len(args) >= 3 else "stretch"
         if mode not in ("stretch", "tile", "center"):
             return await ctx.send(
-                "Usage: `!map background <key> [stretch|tile|center]` | `clear`.")
+                "❌ Usage: `!map background <key> [stretch|tile|center]` | `clear`.")
         m.set_map_setting(mp, "background", key)
         m.set_map_setting(mp, "background_mode", mode)
         return await ctx.send(f"Background sprite `{key}` ({mode})"
@@ -10085,7 +10153,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             m.set_map_setting(mp, "border_opacity", val)
             return await ctx.send(f"Grid border opacity set to {val}%.")
         return await ctx.send(
-            "Usage: `!map border on|off` | `color <name>` | "
+            "❌ Usage: `!map border on|off` | `color <name>` | "
             "`opacity <0-100>` | `clear`.")
     if args and args[0].lower() == "mode":
         # !map mode [text|image] — per-match default render mode. `image` makes
@@ -10221,7 +10289,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         from logic import TEXT_COLORS
         if len(args) < 2:
             return await ctx.send(
-                "Usage: `!map teamcolor <team> <color>` | `clear <team>` | `list`.")
+                "❌ Usage: `!map teamcolor <team> <color>` | `clear <team>` | `list`.")
         op = args[1].lower()
         if op == "list":
             if not m.team_colors:
@@ -10245,7 +10313,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if args and args[0].lower() == "resize":
         if len(args) < 3:
             return await ctx.send(
-                "Usage: `!map resize <width> <height> [anchor]` (anchor "
+                "❌ Usage: `!map resize <width> <height> [anchor]` (anchor "
                 "default top-left; e.g. center, bottom-right)."
             )
         try:
@@ -11123,7 +11191,7 @@ async def dist_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             label = f"({x1},{y1}) → ({x2},{y2})"
         else:
             return await ctx.send(
-                "Usage: `!dist <a> <b>` | `!dist <eid> <x> <y>` | "
+                "❌ Usage: `!dist <a> <b>` | `!dist <eid> <x> <y>` | "
                 "`!dist <x1> <y1> <x2> <y2>` [metric] [los].")
     except NotFound as ex:
         return await ctx.send(f"❌ {ex}")
@@ -11193,7 +11261,7 @@ async def reveal_fog_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                               else "No active fog reveals.")
     if len(args) < 2:
         return await ctx.send(
-            "Usage: `!reveal_fog <team> all|at|rect|around|cone|line|clear "
+            "❌ Usage: `!reveal_fog <team> all|at|rect|around|cone|line|clear "
             "...`.")
     team = args[0]
     form = args[1].lower()
@@ -11271,7 +11339,7 @@ async def reveal_fog_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                      if mp.in_bounds(int(c[0]), int(c[1]))}
         else:
             return await ctx.send(
-                "Usage: `!reveal_fog <team> all|at|rect|around|cone|line|clear "
+                "❌ Usage: `!reveal_fog <team> all|at|rect|around|cone|line|clear "
                 "...`.")
     except (IndexError, ValueError):
         return await ctx.send(
@@ -11365,6 +11433,27 @@ def _split_foreach_commands(cmd_tokens: List[str]) -> List[List[str]]:
     ),
 )
 async def foreach_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    # Nested batches / foreach sweeps count toward macro_recursion_limit
+    # with macro runs: an alias expanding to a batch holding itself
+    # recursed until Python's stack overflowed.
+    depth = getattr(mgr, "_macro_depth", 0)
+    mid = mgr.active_by_channel.get(ctx.channel_key)
+    m = mgr.matches.get(mid) if mid is not None else None
+    limit = int(m.rules.get("macro_recursion_limit", 20)) if m else 20
+    if depth >= limit:
+        return await ctx.send(
+            f"❌ `!foreach`: nesting limit ({limit}) exceeded "
+            f"(macro_recursion_limit).")
+    mgr._macro_depth = depth + 1
+    token = _GATE_LINES.set(True)
+    try:
+        return await _foreach_cmd(ctx, args, mgr)
+    finally:
+        _GATE_LINES.reset(token)
+        mgr._macro_depth = depth
+
+
+async def _foreach_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
         title, body = registry.help_for(["foreach"])
         return await ctx.send(f"**{title}**\n{body}")
@@ -11797,7 +11886,7 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             # Form: !history undo to round X [confirm]
             if len(args) < 4 or args[2].lower() not in ("round", "rounds"):
                 return await ctx.send(
-                    "Usage: `!history undo to round <X> [confirm]`."
+                    "❌ Usage: `!history undo to round <X> [confirm]`."
                 )
             try:
                 target_round = int(args[3])
@@ -13095,9 +13184,16 @@ async def clamp_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"Remove it first with !clamp remove, or replace by remove+add."
             )
         e.clamps[path] = spec
+        # A bound path the unit doesn't hold reads as "no bound" until it
+        # does: say so, so a typo (`max_hpp`) doesn't leave it unbounded
+        # unnoticed.
+        missing = [b for b in (spec.max, spec.min) if isinstance(b, str)
+                   and not _resolve_dotted_var(e.vars, b)[0]]
+        note = (f"\n⚠️ `{eid}` has no var {', '.join(f'`{b}`' for b in missing)}"
+                f": that bound applies once it exists." if missing else "")
         return await ctx.send(
             f"Added clamp on `{eid}.{path}` ({_format_clamp_line(path, spec)})"
-        )
+            + note)
 
     if sub in ("remove", "del", "rm"):
         if await return_help_if_not_enough_args(ctx, args, 3, "clamp", "remove"):
@@ -13844,6 +13940,18 @@ async def log_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"Expected a number, `type=`, `who=`, `round=`, `by=`, "
                 f"'clear', or 'format'; got '{tok}'."
             )
+        if n < 1:
+            raise VTTError(f"`!log <n>` shows the last n entries; n is 1 or "
+                           f"more, not `{tok}`.")
+    if "type" in filters:
+        known = set(RULES_REGISTRY["event_log_events"]["schema"]["word_list"])
+        known.add("custom")
+        bad = [t for t in (w.strip() for w in filters["type"].split(","))
+               if t and t not in known]
+        if bad:
+            raise VTTError(
+                f"Unknown event type(s) {', '.join(f'`{t}`' for t in bad)}; "
+                f"the types are {', '.join(sorted(known))}.")
     # The log names every unit's spawns, moves, damage and statuses, hidden
     # ones included (pov_filters_queries).
     if _whole_board_read_blocked(ctx, m):
@@ -14085,8 +14193,11 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"⚠️ This would clear all {n} special tile(s) in this match. "
                 f"To proceed: `!tile clear confirm`."
             )
-        mp.tiles.clear()
-        return await ctx.send(f"Cleared {n} tile(s).")
+        for key in list(mp.tiles):
+            mp.clear_tile_keep_corpses(*key)
+        return await ctx.send(f"Cleared {n} tile(s)."
+                              + (" Corpses stay where they lie."
+                                 if mp.tiles else ""))
 
     # ---- hook add|del|list ----
     # Tile hooks are formulas stored under tiles[(x,y)]["hooks"][when]
@@ -16707,6 +16818,27 @@ async def dry_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     ),
 )
 async def batch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    # Nested batches / foreach sweeps count toward macro_recursion_limit
+    # with macro runs: an alias expanding to a batch holding itself
+    # recursed until Python's stack overflowed.
+    depth = getattr(mgr, "_macro_depth", 0)
+    mid = mgr.active_by_channel.get(ctx.channel_key)
+    m = mgr.matches.get(mid) if mid is not None else None
+    limit = int(m.rules.get("macro_recursion_limit", 20)) if m else 20
+    if depth >= limit:
+        return await ctx.send(
+            f"❌ `!batch`: nesting limit ({limit}) exceeded "
+            f"(macro_recursion_limit).")
+    mgr._macro_depth = depth + 1
+    token = _GATE_LINES.set(True)
+    try:
+        return await _batch_cmd(ctx, args, mgr)
+    finally:
+        _GATE_LINES.reset(token)
+        mgr._macro_depth = depth
+
+
+async def _batch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
         title, body = registry.help_for(["batch"])
         return await ctx.send(f"**{title}**\n{body}")
@@ -17198,6 +17330,7 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"(macro_recursion_limit).")
         mgr._macro_depth = depth + 1
         mgr._macro_budget = budget
+        gate_token = _GATE_LINES.set(False)   # the body is host-written
         try:
             if await _exec_macro(nodes, ctx, mgr, mac_args, None, name,
                                  budget) == ASSERT_STOP:
@@ -17207,6 +17340,7 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 raise   # the outermost run reports it, once, and stops
             await ctx.send(f"❌ macro `{name}`: {ex}")
         finally:
+            _GATE_LINES.reset(gate_token)
             mgr._macro_depth = depth
             mgr._macro_budget = outer_budget if depth > 0 else None
         return
