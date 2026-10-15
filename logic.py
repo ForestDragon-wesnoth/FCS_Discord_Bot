@@ -1768,8 +1768,10 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "that holds ten references ...), so this keeps a few small "
             "partials from expanding into millions of values and stalling "
             "the bot. Saving or importing a template that would expand past "
-            "it is refused. Default 20000; the bot owner's ceiling (`!owner "
-            "ceiling`) caps how high a server may set it."
+            "it is refused (a plain template is counted the same way). "
+            "`template_data` charges the values its calls return in one "
+            "command to the same budget. Default 20000; the bot owner's "
+            "ceiling (`!owner ceiling`) caps how high a server may set it."
         ),
     },
     "partial_template_depth_limit": {
@@ -2787,6 +2789,9 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
     "random_seed": {
         "default": "",
         "schema": {"type": "str"},
+        # The seed predicts every roll: its value is shown only to
+        # administrators and the channel's hosts (SECRET_RULES).
+        "secret": True,
         "desc": (
             "Seed for every match's RNG on this system (rolls, tables, "
             "random cells, damage_spread fragments). Empty (default): each "
@@ -3547,25 +3552,52 @@ def check_no_value_ancestor(root: Any, path: str, where: str) -> None:
                 f"— cannot set a nested key under it without clobbering.")
 
 
-def _own_value(value: Any) -> Any:
+# Bounds on one stored value (_own_value): deeper nesting can't be copied or
+# written to JSON (Python's recursion limit, ~500 levels), and a value
+# holding the same big list many times, small in memory, is written out in
+# full: past either, every save of the server would fail from then on.
+STORE_DEPTH_LIMIT = 100
+STORE_SIZE_LIMIT = 1_000_000
+# Python's int-to-text limit: a longer integer can't be shown or saved.
+STORE_INT_DIGITS = 4300
+
+
+def _own_value(value: Any, _budget: Optional[List[int]] = None,
+               _depth: int = 0) -> Any:
     """`value` ready to store: a dict or list is deep-copied so the store owns
     it (no object shared with another var, team, tile, zone or status),
     scalars pass through unchanged. Dict keys become strings, as a save/load
     makes them: `{1: 5}` stored by a formula couldn't be reached by the path
     `d.1` until a reload turned the key into '1'. Tuples become lists for the
     same reason (a stored coordinate stops equalling (3, 3) after a reload
-    otherwise)."""
+    otherwise). A value that couldn't be saved is refused: nested deeper than
+    STORE_DEPTH_LIMIT, more than STORE_SIZE_LIMIT values in all, or an
+    integer over STORE_INT_DIGITS digits."""
+    if _budget is None:
+        _budget = [STORE_SIZE_LIMIT]
+    _budget[0] -= 1
+    if _budget[0] < 0:
+        raise VTTError(f"Can't store a value holding more than "
+                       f"{STORE_SIZE_LIMIT} values in all.")
+    if isinstance(value, (dict, list, tuple)) and _depth >= STORE_DEPTH_LIMIT:
+        raise VTTError(f"Can't store a value nested more than "
+                       f"{STORE_DEPTH_LIMIT} levels deep.")
     if isinstance(value, dict):
-        return {str(k): _own_value(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_own_value(v) for v in value]
-    if isinstance(value, tuple):
+        return {str(k): _own_value(v, _budget, _depth + 1)
+                for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
         # Coordinates are lists (a save/load turns tuples into lists).
-        return [_own_value(v) for v in value]
+        return [_own_value(v, _budget, _depth + 1) for v in value]
     store = getattr(type(value), "store_value", None)
     if store is not None:
         # An action's `location` target (action.Coord) stores as [x, y].
-        return _own_value(store(value))
+        return _own_value(store(value), _budget, _depth)
+    if (isinstance(value, int) and not isinstance(value, bool)
+            and value.bit_length() > 3.3 * STORE_INT_DIGITS
+            and (value >= 10 ** STORE_INT_DIGITS
+                 or value <= -10 ** STORE_INT_DIGITS)):
+        raise VTTError(f"Can't store an integer of more than "
+                       f"{STORE_INT_DIGITS} digits.")
     if isinstance(value, float) and not math.isfinite(value):
         # JSON has no inf / nan: a stored one was written as `Infinity`,
         # which other JSON readers refuse.
@@ -4746,6 +4778,11 @@ class FormulaFunction:
         )
 
 
+# Action built-ins and bindings a `!func` name would never reach.
+_FORMULA_RESERVED_NAMES = frozenset({"cmd", "fail", "choose", "choose_number",
+                                     "source", "args"})
+
+
 def check_formula_function(name: Any, params: List[Any]) -> None:
     """Refuse a formula function name or parameter list that can't work:
     names must be identifiers that don't shadow a built-in, parameters
@@ -4760,12 +4797,23 @@ def check_formula_function(name: Any, params: List[Any]) -> None:
         )
     # Lazy import to avoid a logic <-> formula import cycle at module
     # load. We only need the reserved-name set.
-    from formula import _ALLOWED_FUNCS, _MATCH_FUNC_NAMES
+    from formula import (_ALLOWED_FUNCS, _MATCH_FUNC_NAMES,
+                         HOOK_CONTEXT_NAMES, _ENTITY_TOKEN_NAMES)
     if name in _ALLOWED_FUNCS or name in _MATCH_FUNC_NAMES:
         raise VTTError(
             f"'{name}' is a built-in formula function and cannot be "
             f"redefined."
         )
+    # A name the engine resolves first could never be called (`self`, a
+    # hook binding, an action built-in), and a `__` name would replace one
+    # of the engine's own helpers (`__read`, `__safe_add`) in every formula.
+    if (name.startswith("__") or name == "entity" or keyword.iskeyword(name)
+            or name in ("True", "False", "None")
+            or name in _ENTITY_TOKEN_NAMES or name in HOOK_CONTEXT_NAMES
+            or name in _FORMULA_RESERVED_NAMES):
+        raise VTTError(
+            f"'{name}' is reserved by the formula engine; pick a different "
+            f"name.")
     seen = set()
     for p in params:
         if not isinstance(p, str) or not _FUNC_NAME_RE.match(p):
@@ -4831,9 +4879,10 @@ OWNER_LIMITS: Dict[str, Dict[str, Any]] = {
 }
 
 
-# The furthest `CountingRandom.advance` goes (a typed `!match rng set` or a
-# saved position): skipping words costs time.
-RNG_ADVANCE_LIMIT = 100_000_000
+# Words of one RNG epoch: CountingRandom re-seeds itself (`<seed>#<k>`)
+# every RNG_EPOCH words, so any position of a sequence is reached by at most
+# one epoch's skipping (a reload, `!match rng set`, a replay).
+RNG_EPOCH = 1 << 20
 
 
 def new_rng_seed() -> str:
@@ -4846,39 +4895,81 @@ class CountingRandom(random.Random):
     """random.Random counting the 32-bit words it draws (`drawn`), so a
     point in its sequence is one number: random() draws two, getrandbits(k)
     one per started 32 bits, and every other method draws through those.
-    advance(n) skips n words, getstate / setstate carry the count."""
+    The sequence runs in epochs of RNG_EPOCH words: epoch 0 is the plain
+    seed's sequence, epoch k re-seeds with `<seed>#<k>`, and a draw that
+    crosses a boundary is put together word by word in CPython's order
+    (little-endian words, the top one shifted). advance(n) skips n words,
+    jumping straight to the target epoch; getstate / setstate carry the
+    count."""
 
     def __init__(self, seed: Any = None):
         self.drawn = 0
+        self._base_seed = seed
+        self._epoch = 0
         super().__init__(seed)
 
     def seed(self, a: Any = None, version: int = 2) -> None:
         super().seed(a, version)
+        self._base_seed = a
+        self._epoch = 0
         self.drawn = 0
 
+    def _enter_epoch(self, e: int) -> None:
+        random.Random.seed(self, self._base_seed if e == 0
+                           else f"{self._base_seed}#{e}")
+        self._epoch = e
+
+    def _room(self) -> int:
+        """Words left in the current epoch (re-seeding at a boundary)."""
+        e = self.drawn // RNG_EPOCH
+        if e != self._epoch:
+            self._enter_epoch(e)
+        return RNG_EPOCH - self.drawn % RNG_EPOCH
+
     def random(self) -> float:
-        self.drawn += 2
-        return super().random()
+        if self._room() >= 2:
+            self.drawn += 2
+            return super().random()
+        # CPython's random(): two words, 27 and 26 of their top bits.
+        a, b = self.getrandbits(27), self.getrandbits(26)
+        return (a * 67108864.0 + b) * (1.0 / 9007199254740992.0)
 
     def getrandbits(self, k: int) -> int:
-        if k > 0:
-            self.drawn += (k + 31) // 32
-        return super().getrandbits(k)
+        if k <= 0:
+            return super().getrandbits(k)
+        words = (k + 31) // 32
+        if words <= self._room():
+            self.drawn += words
+            return super().getrandbits(k)
+        out, shift, bits = 0, 0, k
+        while words:
+            c = min(words, self._room())
+            chunk = bits if c == words else 32 * c
+            out |= super().getrandbits(chunk) << shift
+            self.drawn += c
+            shift += 32 * c
+            words -= c
+            bits -= chunk
+        return out
 
     def getstate(self) -> Any:
-        return (super().getstate(), self.drawn)
+        return (super().getstate(), self.drawn, self._epoch)
 
     def setstate(self, state: Any) -> None:
         super().setstate(state[0])
         self.drawn = state[1]
+        self._epoch = state[2] if len(state) > 2 else state[1] // RNG_EPOCH
 
     def advance(self, n: int) -> None:
-        n = int(n)
-        while n > 0:
-            step = min(n, 100_000)
+        target = self.drawn + max(0, int(n))
+        e = target // RNG_EPOCH
+        if e > self.drawn // RNG_EPOCH:
+            self._enter_epoch(e)
+            self.drawn = e * RNG_EPOCH
+        while self.drawn < target:
+            step = min(target - self.drawn, 100_000, self._room())
             super().getrandbits(32 * step)
             self.drawn += step
-            n -= step
 
 
 def owner_limit(key: str) -> int:
@@ -11323,9 +11414,8 @@ class Match:
         if seed is not None:
             self.rng_seed = str(seed)
         if pos is not None:
-            if not 0 <= int(pos) <= RNG_ADVANCE_LIMIT:
-                raise VTTError(f"An RNG position is 0 to "
-                               f"{RNG_ADVANCE_LIMIT}.")
+            if int(pos) < 0:
+                raise VTTError("An RNG position is 0 or more.")
             self.rng_pos = int(pos)
         elif seed is not None:
             self.rng_pos = 0
@@ -14018,9 +14108,10 @@ class Match:
             return
         b[0] -= n
         if b[0] < 0:
-            raise VTTError(f"Partial templates expand past "
-                           f"partial_template_size_limit ({b[1]} values) — "
-                           f"references nested inside references multiply.")
+            raise VTTError(f"Templates expand past "
+                           f"partial_template_size_limit ({b[1]} values): "
+                           f"the template is that big, or references nested "
+                           f"inside references multiply.")
 
     def template_materialize(self, node: Any, *, root: bool = False,
                              _chain: Tuple[str, ...] = ()) -> Any:
@@ -14545,9 +14636,12 @@ class Match:
         # for / validate a placement). Deep-copy so the summoned entity
         # doesn't alias the stored template's nested dicts (mutating the
         # minion later must not edit the stored blueprint).
+        d = copy.deepcopy(template)
+        # Its passives, clamps, statuses and name as a stored template's are
+        # checked (they used to fail as raw "Runtime error: 'id'").
+        check_unit_form(d, "summon")
         prefix = id_prefix or template.get("name") or template.get("id") or "summon"
         new_id = self.mint_entity_id(prefix)
-        d = copy.deepcopy(template)
         # A dict naming a parent / vehicle (an old snapshot, a hand-built
         # one) must not attach the new unit to it: parts come through the
         # `parts` key, mounting through mount().
@@ -16013,6 +16107,10 @@ class Match:
         if not isinstance(statblock, dict):
             raise VTTError("transform: statblock must be a dict.")
         sb = copy.deepcopy(statblock)
+        # Checked before anything changes: a form kept in a var is data a
+        # GM edits freely, and a bad field used to crash halfway, after the
+        # unit's parts were gone.
+        check_unit_form(sb, "transform")
         # Vehicle riders: if the entity currently carries riders, the new form
         # must still have a slot for each, or the riders would be orphaned
         # (flagged mounted to a slot-less form). If every rider's slot exists
@@ -16146,6 +16244,14 @@ class Match:
                     f"transform: the new form can't stay in slot "
                     f"'{e.mount_slot}' of `{veh.id}`: {why} Dismount first "
                     f"(or set transform_rider_mismatch_mode=eject).")
+        try:
+            new_passives = {pid: Passive.from_dict(pd)
+                            for pid, pd in (sb.get("passives") or {}).items()}
+            new_clamps = {path: ClampSpec.from_dict(cd)
+                          for path, cd in (sb.get("clamps") or {}).items()}
+        except (KeyError, TypeError, ValueError, AttributeError) as ex:
+            raise VTTError(f"transform: the new form's passives or clamps "
+                           f"aren't valid ({ex!r}).")
         drop_log: List[str] = []
         for p in reversed(self.entity_part_subtree(e.id)):
             if p.id in self.entities:
@@ -16159,11 +16265,9 @@ class Match:
         log: List[str] = list(drop_log)
         try:
             e.vars = new_vars
-            e.name = sb.get("name", e.name)
-            e.passives = {pid: Passive.from_dict(pd)
-                          for pid, pd in (sb.get("passives") or {}).items()}
-            e.clamps = {path: ClampSpec.from_dict(cd)
-                        for path, cd in (sb.get("clamps") or {}).items()}
+            e.name = sb.get("name") or e.name
+            e.passives = new_passives
+            e.clamps = new_clamps
             e.status = copy.deepcopy(sb.get("status") or {})
             e.var_names = new_names
             self._cap_unit_status_levels(e)
@@ -19036,6 +19140,30 @@ def _check_template_passives_clamps(spec: Dict[str, Any], what: str) -> None:
                                f"program it runs.")
 
 
+def check_unit_form(spec: Dict[str, Any], what: str) -> None:
+    """A unit form's own fields, as a stored template checks them: passives
+    and clamps (_check_template_passives_clamps, which fills in a missing
+    id / path), `status` an object of objects with valid numbers, and a
+    `name` that is text. For forms that never went through check_template:
+    a statblock kept in a var (`!ent store_entity_into_var`, edited with
+    `!ent set_var`) before `!ent transform` applies it."""
+    _check_template_passives_clamps(spec, what)
+    st = spec.get("status")
+    if st is not None:
+        if not isinstance(st, dict):
+            raise VTTError(f"{what}: `status` must be an object.")
+        for sname, inst in st.items():
+            if not isinstance(inst, dict):
+                raise VTTError(f"{what}: status `{sname}` must be an object.")
+            for f in STATUS_NUMBER_FIELDS:
+                if f in inst:
+                    checked_status_value(f, inst[f],
+                                         f"{what} status `{sname}`")
+    nm = spec.get("name")
+    if nm is not None and (not isinstance(nm, str) or not nm.strip()):
+        raise VTTError(f"{what}: `name` must be text, got {nm!r}.")
+
+
 def check_template(data: Any, name: str,
                    library: Optional[Dict[str, Any]] = None
                    ) -> Tuple[Dict[str, Any], List[str]]:
@@ -19088,7 +19216,7 @@ def check_template(data: Any, name: str,
             d[k] = str(d[k])
 
     def probe(spec: Dict[str, Any], what: str) -> None:
-        _check_template_passives_clamps(spec, what)
+        check_unit_form(spec, what)
         trial = copy.deepcopy(spec)
         trial.pop("parts", None)
         trial.pop("segments", None)
@@ -19444,6 +19572,13 @@ def _rel_del(d: Any, path: str) -> bool:
 
 # The rules that name a unit var. A unit remembers the names it uses
 # (Entity.var_names); rename_unit_vars moves its vars when a rule changes.
+# Rules whose value a player mustn't read (`"secret": True` on the spec):
+# `!help rule`, `!help find`, `!system info` and `!system diff` show them as
+# (hidden) unless the caller is an administrator or a host of the channel's
+# match, and a `$()` argument can't read them with rule_get.
+SECRET_RULES = frozenset(n for n, spec in RULES_REGISTRY.items()
+                         if spec.get("secret"))
+
 VAR_NAME_RULES = ("hp_var", "max_hp_var", "turnorder_var", "team_var",
                   "part_name_var", "footprint_width_var", "footprint_height_var",
                   "atb_charge_var", "disguise_var", "fog_vision_radius_var",
@@ -20153,11 +20288,13 @@ class MatchManager:
         for k in keys:
             rules[k] = self.system_value(sysobj, k)
         # A value set before the owner lowered a ceiling (or loaded from an
-        # older save) is held to the ceiling.
+        # older save) is held to the ceiling, and a ceiling rule's -1
+        # ("unlimited") means the ceiling: a server can't lift the owner's
+        # bound by asking for no bound.
         for k, v in rules.items():
             hi = rule_max(k) if RULES_REGISTRY.get(k, {}).get(
                 "schema", {}).get("ceiling") else None
-            if hi is not None and isinstance(v, int) and v > hi:
+            if hi is not None and isinstance(v, int) and (v > hi or v < 0):
                 rules[k] = hi
         return rules
 

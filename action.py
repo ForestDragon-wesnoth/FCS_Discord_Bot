@@ -47,6 +47,7 @@ surface (vtt_commands.py) gains `!action`.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
+import copy
 import contextvars
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
@@ -1050,6 +1051,15 @@ async def run_action(
     source = SourceProxy(actor, action.container_path)
     args_proxy = ArgsProxy(args)
     cmd_allowlist = parse_cmd_allowlist(match.rules)
+    # The other matches as they were before this level's first cmd() line
+    # that can change them (see _cmd); None until one runs.
+    cross: Dict[str, Any] = {"snap": None}
+
+    def _rollback_all() -> None:
+        _rollback_match(match, mgr, pre_state)
+        if cross["snap"] is not None:
+            _restore_other_matches(mgr, match, cross["snap"])
+            cross["snap"] = None
 
     def _cmd(line: Any) -> None:
         """cmd('<command line>'): dispatch the line as if the GM
@@ -1079,6 +1089,16 @@ async def run_action(
                 f"cmd(): command `{name}` is not on this system's "
                 f"action_cmd_allowlist. Allowed: {allowed}."
             )
+        # A line that can change ANOTHER match (`ent transfer` / `ent copy`
+        # into it, `match ...`): the other matches are saved before the
+        # first such line of this action level, so a rollback puts them
+        # back with this match (a failed send-to-another-battlefield action
+        # left the unit in both matches).
+        sub = tokens[1].lower() if len(tokens) > 1 else ""
+        if cross["snap"] is None and (
+                name == "match" or (name == "ent"
+                                    and sub in ("transfer", "copy"))):
+            cross["snap"] = _snapshot_other_matches(mgr, match)
         # Dispatch into the synchronous buffer context. Because
         # _BufferCtx.send never suspends on a real future, the
         # dispatched (async) command coroutine runs to completion
@@ -1268,7 +1288,7 @@ async def run_action(
             except ChoiceNeeded as nc:
                 if not is_top_level:
                     raise  # the top-level loop owns replay
-                _rollback_match(match, mgr, pre_state)
+                _rollback_all()
                 if len(match._choice_answers) >= choice_limit:
                     match._action_depth = pre_action_depth
                     match._runtime_buffer = None
@@ -1290,18 +1310,18 @@ async def run_action(
                 # Clean GM-initiated abort. Roll back, then finish.
                 # Buffered command echoes are DISCARDED — the action
                 # rolled back, so its partial output would mislead.
-                _rollback_match(match, mgr, pre_state)
+                _rollback_all()
                 return _finish_action_fail(af)
             except ActionEngineFault:
                 # Engine refusal (recursion / choice limit). Roll back
                 # AND re-raise so every level unwinds.
-                _rollback_match(match, mgr, pre_state)
+                _rollback_all()
                 match._action_depth = pre_action_depth
                 if is_top_level:
                     match._runtime_buffer = None
                 raise
             except Exception:
-                _rollback_match(match, mgr, pre_state)
+                _rollback_all()
                 match._action_depth = pre_action_depth
                 if is_top_level:
                     match._runtime_buffer = None
@@ -1405,6 +1425,37 @@ def _check_rollback_fields(preserved_attrs) -> None:
             f"them. Add them to preserved_attrs (runtime state) or to "
             f"Match.to_dict (game state).")
     _ROLLBACK_FIELDS_CHECKED = True
+
+
+def _snapshot_other_matches(mgr: Any, match: "Match") -> Dict[str, Any]:
+    """Every match of the server but `match`, serialized, and the channel
+    pointers: what an action's cmd() line may change elsewhere."""
+    return {"matches": {mid: m.to_dict(include_history=False)
+                        for mid, m in mgr.matches.items() if m is not match},
+            "active": dict(mgr.active_by_channel)}
+
+
+def _restore_other_matches(mgr: Any, match: "Match",
+                           snap: Dict[str, Any]) -> None:
+    """Put the other matches back as `snap` (_snapshot_other_matches) holds
+    them: a match made since goes, a deleted one returns, a changed one is
+    rolled back in place (keeping its undo history); channel pointers too."""
+    from logic import Match as _Match
+    pre = snap["matches"]
+    for mid in [mid for mid, m in mgr.matches.items()
+                if m is not match and mid not in pre]:
+        del mgr.matches[mid]
+    for mid, state in pre.items():
+        m = mgr.matches.get(mid)
+        if m is None:
+            m = _Match.from_dict(copy.deepcopy(state))
+            mgr.matches[mid] = m
+        elif m.to_dict(include_history=False) != state:
+            _rollback_match(m, mgr, state)
+        if m.system_name in mgr.systems:
+            mgr.apply_system_rules(m)
+    mgr.active_by_channel.clear()
+    mgr.active_by_channel.update(snap["active"])
 
 
 def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None:

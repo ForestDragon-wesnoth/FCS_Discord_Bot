@@ -388,11 +388,12 @@ import math
 import itertools
 import json
 import re
+import contextvars
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import CURRENT_WORKSPACE, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number
+from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number
 
 
 class FormulaError(VTTError):
@@ -1147,14 +1148,93 @@ def _int_too_big(msg: str) -> FormulaError:
     )
 
 
+_INT_CAP_CACHE: Dict[int, int] = {}
+
+
+def _int_ok(r: Any, what: str) -> Any:
+    """`r` when it isn't an integer past _max_int_digits() digits (one that
+    can't be shown, hashed or saved), else a refusal. Cheap: a comparison
+    with a cached power of ten."""
+    if isinstance(r, int) and not isinstance(r, bool):
+        lim = _max_int_digits()
+        cap = _INT_CAP_CACHE.get(lim)
+        if cap is None:
+            cap = _INT_CAP_CACHE[lim] = 10 ** lim
+        if r >= cap or r <= -cap:
+            raise _int_too_big(what)
+    return r
+
+
+def _item_count(v: Any, cap: int) -> int:
+    """How many items list / dict `v` holds, nested ones included (a list
+    of three lists of four counts 15), stopping past `cap`."""
+    n, stack = 0, [v]
+    while stack and n <= cap:
+        x = stack.pop()
+        items = x.values() if isinstance(x, dict) else x
+        n += len(x)
+        stack.extend(y for y in items
+                     if isinstance(y, (list, tuple, dict)) and y)
+    return n
+
+
+def _size_of(v: Any, cap: int) -> int:
+    """About how many characters `v` writes as text, counted without
+    building it and stopping past `cap`: a text its length, a number its
+    digits, a list / dict one per item plus its items. A list holding the
+    same big list many times counts each time, as its text would."""
+    n, stack = 0, [v]
+    while stack and n <= cap:
+        x = stack.pop()
+        if isinstance(x, str):
+            n += len(x) + 2
+        elif isinstance(x, dict):
+            n += 2 + len(x)
+            stack.extend(x.keys())
+            stack.extend(x.values())
+        elif isinstance(x, (list, tuple)):
+            n += 2 + len(x)
+            stack.extend(x)
+        elif isinstance(x, int) and not isinstance(x, bool):
+            n += x.bit_length() // 3 + 1
+        else:
+            n += 5
+    return n
+
+
+def _text_of(v: Any, limit: int = _DEFAULT_SIZE_LIMIT,
+             what: str = "str") -> str:
+    """str(v), refused when the text would pass formula_size_limit: a list
+    holding the same big list many times is small in memory but huge as
+    text (gigabytes from one `$()`)."""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (list, tuple, dict)) and _size_of(v, limit) > limit:
+        raise FormulaError(
+            f"{what}(...): the text would be over the formula_size_limit of "
+            f"{limit} characters.")
+    return str(v)
+
+
+def _round(x: Any, ndigits: Any = None) -> Any:
+    """round(x, ndigits=None), as Python's, without computing 10**-ndigits
+    for a whole number rounded to a huge negative ndigits (minutes of CPU
+    for round(5, -10**8)): past the largest integer's digits it is 0."""
+    if (isinstance(x, int) and not isinstance(x, bool)
+            and isinstance(ndigits, int) and not isinstance(ndigits, bool)
+            and ndigits < -(_max_int_digits() + 1)):
+        return 0
+    return round(x, ndigits) if ndigits is not None else round(x)
+
+
 def _safe_pow(a: Any, b: Any) -> Any:
     """`a ** b` with the integer result size checked BEFORE computing it
     (9**9**9 is ~370 million digits and takes hours). Float overflow is
     already fast (OverflowError)."""
     if (isinstance(a, int) and isinstance(b, int) and b > 1
-            and abs(a) > 1 and b * math.log10(abs(a)) > _max_int_digits()):
+            and abs(a) > 1 and b * math.log10(abs(a)) >= _max_int_digits()):
         raise _int_too_big("** / pow")
-    return a ** b
+    return _int_ok(a ** b, "** / pow")
 
 
 def _safe_mul(a: Any, b: Any, limit: int = _DEFAULT_SIZE_LIMIT) -> Any:
@@ -1163,16 +1243,21 @@ def _safe_mul(a: Any, b: Any, limit: int = _DEFAULT_SIZE_LIMIT) -> Any:
     if isinstance(a, int) and isinstance(b, (str, list, tuple)):
         a, b = b, a
     if isinstance(a, (str, list, tuple)) and isinstance(b, int):
-        if b > 0 and len(a) * b > limit:
+        # A list's items count with everything nested in them: [r] * n
+        # holds n references to r, and its text, copies and comparisons
+        # cost n times r.
+        n = len(a) if isinstance(a, str) else _item_count(a, limit)
+        if b > 0 and n * b > limit:
             raise FormulaError(
-                f"*: would build a {type(a).__name__} of length "
-                f"{len(a) * b}, over the formula_size_limit of {limit}."
+                f"*: would build a {type(a).__name__} of "
+                f"{'length' if isinstance(a, str) else 'size'} "
+                f"{n * b}, over the formula_size_limit of {limit}."
             )
     elif (isinstance(a, int) and isinstance(b, int) and a and b
           and (a.bit_length() + b.bit_length()) * 0.30103
           > _max_int_digits() + 1):
         raise _int_too_big("*")
-    return a * b
+    return _int_ok(a * b, "*")
 
 
 def _safe_add(a: Any, b: Any, limit: int = _DEFAULT_SIZE_LIMIT) -> Any:
@@ -1184,7 +1269,7 @@ def _safe_add(a: Any, b: Any, limit: int = _DEFAULT_SIZE_LIMIT) -> Any:
             f"+: would build a {type(a).__name__} of length "
             f"{len(a) + len(b)}, over the formula_size_limit of {limit}."
         )
-    return a + b
+    return _int_ok(a + b, "+")
 
 
 def _safe_mod(a: Any, b: Any) -> Any:
@@ -1919,7 +2004,7 @@ def _sum(v: Any) -> Any:
     if bad:
         raise FormulaError(
             f"sum(list): every item must be a number, got {bad[0]!r}.")
-    return sum(items)
+    return _int_ok(sum(items), "sum")
 
 
 def _sorted(v: Any, desc: Any = False) -> list:
@@ -1946,7 +2031,13 @@ def _all(v: Any) -> bool:
 
 def _count(v: Any, value: Any) -> int:
     """count(list, value): how many items equal `value`."""
-    return sum(1 for x in _list_arg(v, "count") if x == value)
+    items = _list_arg(v, "count")
+    if isinstance(value, (list, dict)) and _size_of(
+            items, _DEFAULT_SIZE_LIMIT) > _DEFAULT_SIZE_LIMIT:
+        raise FormulaError(f"count(list, value): the list is too big to "
+                           f"compare its items (over {_DEFAULT_SIZE_LIMIT} "
+                           f"values).")
+    return sum(1 for x in items if x == value)
 
 
 # ---- container reads -----------------------------------------------------
@@ -2044,7 +2135,11 @@ def _unique(v: Any) -> list:
     seen_h: set = set()
     seen_u: set = set()
     out = []
-    for x in _list_arg(v, "unique"):
+    items = _list_arg(v, "unique")
+    if _size_of(items, _DEFAULT_SIZE_LIMIT) > _DEFAULT_SIZE_LIMIT:
+        raise FormulaError(f"unique(list): the list is too big to compare "
+                           f"its items (over {_DEFAULT_SIZE_LIMIT} values).")
+    for x in items:
         try:
             if x in seen_h:
                 continue
@@ -2141,8 +2236,7 @@ def _join(items: Any, sep: Any = "", *,
           limit: int = _DEFAULT_SIZE_LIMIT) -> str:
     """join(list, sep=""): the items as one text, `sep` between them.
     Numbers and other values are written as str() would."""
-    parts = [x if isinstance(x, str) else str(x)
-             for x in _list_arg(items, "join")]
+    parts = [_text_of(x, limit, "join") for x in _list_arg(items, "join")]
     sep = _text_arg(sep, "join", "sep")
     size = sum(len(p) for p in parts) + len(sep) * max(0, len(parts) - 1)
     if size > limit:
@@ -2205,7 +2299,7 @@ def _fmt(template: Any, *args: Any, _limit: int = _DEFAULT_SIZE_LIMIT,
             except (ValueError, TypeError) as ex:
                 raise FormulaError(f"fmt(...): {{{m.group(1)}}}: {ex}")
         else:
-            piece = val if isinstance(val, str) else str(val)
+            piece = _text_of(val, _limit, "fmt")
         out.append(piece)
         if sum(len(x) for x in out) > _limit:
             raise FormulaError(
@@ -2216,8 +2310,8 @@ def _fmt(template: Any, *args: Any, _limit: int = _DEFAULT_SIZE_LIMIT,
 
 
 _ALLOWED_FUNCS: Dict[str, Any] = {
-    "min": min, "max": max, "abs": abs, "round": round,
-    "int": int, "float": float, "str": str,
+    "min": min, "max": max, "abs": abs, "round": _round,
+    "int": int, "float": float, "str": lambda *a: _text_of(a[0]) if len(a) == 1 else str(*a),
     "len": _len,
     "random_int": _random_int,
     "random_string": _random_string,
@@ -3231,6 +3325,21 @@ def _collect_action_locals(tree: ast.AST) -> "frozenset[str]":
     return frozenset(locals_set)
 
 
+def _refuse_engine_names(tree: ast.AST) -> None:
+    """Refuse a `__` name a formula's SOURCE reads. The entity-access
+    transformer injects calls to the engine's own helpers (`__read`,
+    `__write`, `__safe_add`, ...) and the validator allows those names, so
+    one typed in the source would pass as theirs (a "read-only" condition
+    calling `__write`). Run on the parsed source before the transformer;
+    binding such a name is refused by _check_binding_name."""
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Name) and node.id.startswith("__")
+                and isinstance(node.ctx, ast.Load)):
+            raise FormulaError(f"`{node.id}` isn't a name a formula can use "
+                               f"(names starting with `__` are the "
+                               f"engine's).")
+
+
 def _check_binding_name(name: str, what: str) -> None:
     """Refuse a `__`-prefixed name for a formula binding (a local, a loop
     variable). The namespace is the formula's globals too, so binding
@@ -4036,6 +4145,8 @@ class FormulaEngine:
             "each": lambda v: _each(v, limit=size_limit),
             "replace": lambda *a: _replace(*a, limit=size_limit),
             "join": lambda *a: _join(*a, limit=size_limit),
+            "str": lambda *a: (_text_of(a[0], size_limit) if len(a) == 1
+                               else str(*a)),
             "fmt": lambda *a, **k: _fmt(*a, _limit=size_limit, **k),
         }
         # Per-name default: was_clamped is boolean-flavored (default False);
@@ -6141,23 +6252,47 @@ class FormulaEngine:
             if not isinstance(name, str) or not isinstance(path, str):
                 raise FormulaError("template_data(name, path): name and "
                                    "path must be text.")
-            tpl = _workspace_templates().get(name.strip().lower())
+            key_name = name.strip().lower()
+            tpl = _workspace_templates().get(key_name)
             if tpl is None:
                 raise FormulaError(f"template_data: this server has no "
                                    f"template `{name}`.")
-            try:
-                data = match.expand_template(tpl)
-            except (VTTError, NotFound) as ex:
-                raise FormulaError(f"template_data: {ex}")
-            if path in ("", "."):
-                return data
+            # The expansion is made once per command (kept with the
+            # command's partial cache, which any template edit clears) and
+            # each call copies only the value at `path`; what the calls
+            # return is charged to partial_template_size_limit per command,
+            # so a loop can't copy a big template thousands of times.
+            cache = PARTIAL_CACHE.get()
+            ckey = ("template_data", getattr(CURRENT_WORKSPACE.get(),
+                                             "guild_key", None),
+                    match.id, bool(match.rules.get("template_pinning", False)),
+                    key_name)
+            data = cache.get(ckey) if cache is not None else None
+            if data is None:
+                try:
+                    data = match.expand_template(tpl)
+                except (VTTError, NotFound) as ex:
+                    raise FormulaError(f"template_data: {ex}")
+                if cache is not None:
+                    cache[ckey] = data
             node: Any = data
-            for k in path.split("."):
-                if not isinstance(node, dict) or k not in node:
-                    raise FormulaError(f"template_data: `{name}` has nothing "
-                                       f"at `{path}`.")
-                node = node[k]
-            return node
+            if path not in ("", "."):
+                for k in path.split("."):
+                    if not isinstance(node, dict) or k not in node:
+                        raise FormulaError(f"template_data: `{name}` has "
+                                           f"nothing at `{path}`.")
+                    node = node[k]
+            if cache is not None:
+                limit = int(match.rules.get("partial_template_size_limit",
+                                            20000))
+                spent = cache.get("template_data_spent", 0) + _node_count(node)
+                if spent > limit:
+                    raise FormulaError(
+                        f"template_data: this command has read {spent} "
+                        f"values from templates, past "
+                        f"partial_template_size_limit ({limit}) per command.")
+                cache["template_data_spent"] = spent
+            return copy.deepcopy(node)
 
         def _template_names() -> List[str]:
             """template_names(): the server's saved template names, sorted.
@@ -6855,6 +6990,10 @@ class FormulaEngine:
             existence)."""
             if not isinstance(name, str):
                 raise FormulaError("rule_get(name): name must be a string.")
+            if name in SECRET_RULES and _IN_ARG_TOKEN.get():
+                raise FormulaError(
+                    f"rule_get('{name}') can't be read in a `$()` argument "
+                    f"(its value is for hosts: `!help rule {name}`).")
             return match.rules.get(name)
         ns["rule_get"] = _rule_get
 
@@ -8282,7 +8421,11 @@ class FormulaEngine:
                 return _call
 
             for fname, fdef in funcs.items():
-                ns[fname] = _make_callable(fdef)
+                # A `__` name from an older save would replace one of the
+                # engine's helpers (`__read`, `__safe_add`); `!system lint`
+                # reports it, and it is never bound.
+                if not fname.startswith("__"):
+                    ns[fname] = _make_callable(fdef)
 
         # Coordinates are lists in formulas: every built-in function's
         # result has its tuples turned into lists, so a coordinate from
@@ -8320,6 +8463,7 @@ class FormulaEngine:
             raise FormulaError(
                 f"function '{fdef.name}' body syntax error: {e.msg}"
             )
+        _refuse_engine_names(full)
         trailing_expr = None
         if full.body and isinstance(full.body[-1], ast.Expr):
             trailing_expr = full.body.pop().value
@@ -8366,6 +8510,7 @@ class FormulaEngine:
         # forward references (e.g. `x = x + 1` at line 1 — Python
         # exec will UnboundLocalError if x is never assigned before
         # that point, but the validator accepts the static program).
+        _refuse_engine_names(tree)
         if action_mode:
             known_params = known_params | _collect_action_locals(tree)
         tree = _EntityAccessTransformer(
@@ -8439,6 +8584,7 @@ class FormulaEngine:
             full = ast.parse(src, mode="exec")
         except SyntaxError as e:
             raise FormulaError(f"Syntax error: {e.msg}")
+        _refuse_engine_names(full)
 
         known = self._known_funcs()
         trailing_expr = None
@@ -8529,18 +8675,30 @@ def resolve_arg_token(token: str, match, self_id: Optional[str] = None) -> str:
     validate_arg_safe(body)
     this_id = match.current_entity_id() if hasattr(match, "current_entity_id") else None
     ctx = EvalCtx(this=this_id, target=self_id)
-    val = FormulaEngine(match).eval_expression(body, ctx)
-    return _stringify(val)
+    token = _IN_ARG_TOKEN.set(True)
+    try:
+        val = FormulaEngine(match).eval_expression(body, ctx)
+    finally:
+        _IN_ARG_TOKEN.reset(token)
+    rules = getattr(match, "rules", None) or {}
+    return _stringify(val, int(rules.get("formula_size_limit",
+                                         _DEFAULT_SIZE_LIMIT)))
 
 
-def _stringify(v: Any) -> str:
+# True while a `$()` command argument evaluates (resolve_arg_token): secret
+# rules (logic.SECRET_RULES) can't be read there.
+_IN_ARG_TOKEN: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "vtt_in_arg_token", default=False)
+
+
+def _stringify(v: Any, limit: int = _DEFAULT_SIZE_LIMIT) -> str:
     if isinstance(v, bool):
         return "true" if v else "false"
     if isinstance(v, float):
         return str(int(v)) if v.is_integer() else repr(v)
     if v is None:
         return ""
-    return str(v)
+    return _text_of(v, limit, "$()")
 
 
 # --- public validation helper -----------------------------------------------

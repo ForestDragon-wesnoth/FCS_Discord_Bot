@@ -15,7 +15,7 @@ from logic import (
 )
 
 # Passive system
-from logic import COMMAND_USER, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit
+from logic import COMMAND_USER, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -252,6 +252,19 @@ def _admin_msg(name: str, args: List[str]) -> str:
 # `!again`, or as an approved request.
 _SERVER_TYPED_ONLY = ("❌ `!server` commands only run when typed on their own "
                       "— not inside a batch, macro, alias or action.")
+# `!system undo` likewise: a container's own server-wide edits become one
+# undo step only when the typed command ends, so an undo inside it would pop
+# the step before the container and drop the container's earlier edits.
+_SYSTEM_UNDO_TYPED_ONLY = ("❌ `!system undo` only runs when typed on its own "
+                           "— not inside a batch, macro, alias or action.")
+
+
+_INLINE_ARGS_HOST_ONLY = ("❌ inline `$()` arguments are host-only on this "
+                          "match (inline_args_access).")
+
+
+def _is_system_undo(name: str, args: List[str]) -> bool:
+    return name == "system" and bool(args) and str(args[0]).lower() == "undo"
 
 
 def _admin_required(name: str, args: List[str]) -> bool:
@@ -473,6 +486,9 @@ class CommandRegistry:
         if name == "server":
             await ctx.send(_SERVER_TYPED_ONLY)
             return
+        if _is_system_undo(name, args):
+            await ctx.send(_SYSTEM_UNDO_TYPED_ONLY)
+            return
         if _DRY_ACTIVE.get():
             refusal = _dry_refusal(name, args)
             if refusal:
@@ -491,15 +507,14 @@ class CommandRegistry:
         # Inline-formula `$(...)` substitution for sub-command lines (a macro /
         # batch / foreach inner command), so $() resolves per line in the
         # caller's current context. Same raw_args gate as run().
+        mid = mgr.active_by_channel.get(ctx.channel_key)
+        if (self._has_inline_token(args) and self._inline_args_blocked(
+                ctx, mgr.matches.get(mid) if mid is not None else None)):
+            await ctx.send(_INLINE_ARGS_HOST_ONLY)
+            return
         if not self._raw_args.get(name, False):
-            mid = mgr.active_by_channel.get(ctx.channel_key)
             if mid is not None and mid in mgr.matches:
                 m_arg = mgr.matches[mid]
-                if self._has_inline_token(args) and self._inline_args_blocked(ctx, m_arg):
-                    await ctx.send(
-                        "❌ inline `$()` arguments are host-only on this match "
-                        "(inline_args_access).")
-                    return
                 try:
                     args = [resolve_arg_token(a, m_arg, self_id=None) for a in args]
                 except Exception as e:
@@ -828,6 +843,9 @@ class CommandRegistry:
         if name == "server" and typed.lower() != "server":
             await ctx.send(_SERVER_TYPED_ONLY)
             return
+        if _is_system_undo(name, args) and typed.lower() != "system":
+            await ctx.send(_SYSTEM_UNDO_TYPED_ONLY)
+            return
         h = self._handlers.get(name)
         if not h:
             # Did-you-mean: suggest close matches from registered
@@ -878,6 +896,15 @@ class CommandRegistry:
                 if (bool(pm.rules.get("pause_affects_hosts", False))
                         and not _pause_control(name, args)):
                     return await self._hold_command(pm, name, args, ctx)
+        # inline_args_access = host: a non-host's `$()` is refused here, for
+        # every command (`!ent` and `!foreach` resolve theirs themselves) and
+        # before a request is queued (approved, it would run with the
+        # approver's authority).
+        if not admin_cmd and self._has_inline_token(args):
+            m_gate = mgr.matches.get(mgr.active_by_channel.get(ctx.channel_key))
+            if self._inline_args_blocked(ctx, m_gate):
+                await ctx.send(_INLINE_ARGS_HOST_ONLY)
+                return
         if gate == "queue":
             return await self._queue_request(name, args, ctx, mgr)
         # gate == "allow" -> fall through and run normally.
@@ -906,9 +933,14 @@ class CommandRegistry:
         # command, to tell after it (and its watchers) whether it changed.
         jm = mgr.matches.get(pre_active_mid) if pre_active_mid else None
         jpre = None
+        # A read-only command (_JOURNAL_READS) skips the two whole-match
+        # serializations: a change it does make (a watcher firing after it)
+        # is found by the storage commit and journaled as its state
+        # (_journal_outside).
         if (jm is not None and not _DRY_ACTIVE.get()
                 and getattr(jm, "_action_depth", 0) == 0
                 and journal_limit(jm) != 0
+                and name not in _JOURNAL_READS
                 and (not admin_cmd or name in _JOURNAL_STATE_ROOTS)):
             jpre = (pre_state if pre_state is not None
                     else jm.to_dict(include_history=False))
@@ -935,11 +967,6 @@ class CommandRegistry:
         # Done AFTER the access gate so a $() can't alter the gated subcommand.
         if not self._raw_args.get(name, False) and pre_active_mid in mgr.matches:
             m_arg = mgr.matches[pre_active_mid]
-            if self._has_inline_token(args) and self._inline_args_blocked(ctx, m_arg):
-                await ctx.send(
-                    "❌ inline `$()` arguments are host-only on this match "
-                    "(inline_args_access).")
-                return
             try:
                 args = [resolve_arg_token(a, m_arg, self_id=None) for a in args]
             except Exception as e:
@@ -1274,6 +1301,12 @@ async def persist_workspace(mgr: MatchManager, ctx: Optional[ReplyContext]) -> N
         await ctx.send("\n".join(msgs))
 
 
+# Commands that only read the match (no undo snapshot either): the journal
+# doesn't serialize it around them.
+_JOURNAL_READS = frozenset({"assert", "dist", "dry", "find", "pending",
+                            "roll", "whoami"})
+
+
 def _journal_outside(mgr: MatchManager, handled: set, changed: set) -> None:
     """A journaled match the command changed without it being the channel's
     match (a unit transferred in, a batch line that switched matches) gets
@@ -1281,9 +1314,11 @@ def _journal_outside(mgr: MatchManager, handled: set, changed: set) -> None:
     label = getattr(mgr, "_journal_label", None) or ["?"]
     for mid in sorted(changed - handled):
         m = mgr.matches.get(mid)
-        if m is None or m.journal is None:
+        if m is None or m.journal is None or mid == _REPLAYING.get():
             continue
         post = m.to_dict(include_history=False)
+        if state_hash(post) == m.journal.last_state_hash():
+            continue    # only what an undo leaves alone moved (the RNG)
         m.journal.add({"kind": "state", "at": _now_iso(),
                        "by": getattr(mgr, "_journal_by", "") or "",
                        "cmd": list(label), "outside": True,
@@ -4121,9 +4156,8 @@ def _check_expansion(ctx: ReplyContext, mgr: MatchManager, name: str,
     """Refuse a template whose partial references expand past
     partial_template_size_limit, or whose expanded vars break a template
     rule (a reserved var name like `x` reached through a partial): what a
-    spawn would refuse, refused when it is saved."""
-    if not template_refs_of(data):
-        return
+    spawn would refuse, refused when it is saved. A plain template is
+    counted the same way, so one that saves can always be read expanded."""
     old = mgr.templates.get(name)
     mgr.templates[name] = data
     invalidate_partial_cache()
@@ -5338,6 +5372,28 @@ def _replay_template(mgr: MatchManager, e: Dict[str, Any]) -> None:
                       new_name=new_name)
 
 
+def _journal_bundle_ok(raw: Any) -> bool:
+    """Whether `raw` has the shape of a journal export: segments, each a
+    dict whose `start` holds a `state` dict, and entries that are dicts."""
+    if not isinstance(raw, dict) or raw.get("format") != JOURNAL_FORMAT:
+        return False
+    segs = raw.get("segments")
+    if not isinstance(segs, list) or not segs:
+        return False
+    for seg in segs:
+        if not isinstance(seg, dict) or not isinstance(seg.get("start"), dict) \
+                or not isinstance(seg["start"].get("state"), dict):
+            return False
+        ents = seg.get("entries", [])
+        if not isinstance(ents, list) or \
+                not all(isinstance(e, dict) for e in ents):
+            return False
+        for key in ("systems", "templates"):
+            if not isinstance(seg["start"].get(key) or {}, dict):
+                return False
+    return True
+
+
 async def _match_replay(ctx: ReplyContext, args: List[str],
                         mgr: MatchManager):
     """`!match replay <file> [upto=N] [as=<id>] [verbose]`: rebuild a match
@@ -5352,6 +5408,10 @@ async def _match_replay(ctx: ReplyContext, args: List[str],
             verbose = True
         else:
             opts.append(a)
+    for a in opts:
+        if "=" not in a:
+            raise VTTError(f"Unexpected `{a}` — usage: `!match replay <file> "
+                           f"[upto=N] [as=<id>] [verbose]`.")
     _check_options(opts, {"upto", "as"}, "!match replay")
     kv = dict(o.split("=", 1) for o in opts)
     upto = None
@@ -5365,8 +5425,7 @@ async def _match_replay(ctx: ReplyContext, args: List[str],
         raise VTTError(f"File not found: `{path}`.")
     except (OSError, ValueError) as ex:
         raise VTTError(f"Can't read `{path}`: {ex}")
-    if not isinstance(raw, dict) or raw.get("format") != JOURNAL_FORMAT \
-            or not raw.get("segments"):
+    if not _journal_bundle_ok(raw):
         raise VTTError(f"`{path}` isn't a journal export "
                        f"(`!match journal export` writes one).")
     segs = raw["segments"]
@@ -5383,18 +5442,38 @@ async def _match_replay(ctx: ReplyContext, args: List[str],
         if x.system_name in mgr.systems:
             in_use.update(y.name for y in
                           mgr.system_chain(mgr.systems[x.system_name]))
-    clash = [f"system `{n}`" for n, d in (start.get("systems") or {}).items()
-             if n in in_use and mgr.systems[n].to_dict() != d]
-    clash += [f"template `{n}`"
-              for n, d in (start.get("templates") or {}).items()
-              if n in mgr.templates and mgr.templates[n] != d]
+    # The journal writes systems and templates as it goes (its `systems`
+    # and `template` entries), not only at its start: each write must leave
+    # this server's own versions alone, so one that would change a system
+    # a match here uses, or any template the server already holds, refuses
+    # the whole replay before anything runs.
+    clash = []
+    for n, d in (start.get("systems") or {}).items():
+        if n in in_use and mgr.systems[n].to_dict() != d:
+            clash.append(f"system `{n}`")
+    for n, d in (start.get("templates") or {}).items():
+        if n in mgr.templates and mgr.templates[n] != d:
+            clash.append(f"template `{n}`")
+    for seg in segs:
+        for e in seg.get("entries") or []:
+            if e.get("kind") == "systems":
+                for n, d in (e.get("systems") or {}).items():
+                    if n in in_use and mgr.systems[n].to_dict() != d:
+                        clash.append(f"system `{n}`")
+            elif e.get("kind") == "template":
+                for n in (e.get("name"), e.get("new_name")):
+                    if (n in mgr.templates and (e.get("new_name")
+                            or mgr.templates[n] != e.get("data"))):
+                        clash.append(f"template `{n}`")
+    clash = list(dict.fromkeys(clash))
     if clash:
         raise VTTError(
-            "This server holds different versions of what the journal "
-            "starts with: " + ", ".join(clash[:6])
+            "This server holds other versions of what the journal writes "
+            "(a system a match here uses, or a template of the library): "
+            + ", ".join(clash[:6])
             + (f" (+{len(clash) - 6} more)" if len(clash) > 6 else "")
-            + " (a match here uses them). Replay on a server without them "
-            "(in the CLI: `!as server <new>`).")
+            + ". Replay on a server without them (in the CLI: "
+            "`!as server <new>`).")
     # Systems and templates the journal starts with.
     for n, d in (start.get("systems") or {}).items():
         if n not in in_use:
@@ -5518,9 +5597,10 @@ async def _replay_entries(ctx: ReplyContext, mgr: MatchManager, mid: str,
                     mgr.systems[sn] = GameSystem.from_dict(copy.deepcopy(d))
                 if e.get("system_name") in mgr.systems:
                     m.system_name = e["system_name"]
-                for x in mgr.matches.values():
-                    if x.system_name in mgr.systems:
-                        mgr.apply_system_rules(x)
+                # Only the replay's match: the other matches' systems were
+                # checked unchanged before the replay began.
+                if m.system_name in mgr.systems:
+                    mgr.apply_system_rules(m)
                 if verbose:
                     out.append(journal_entry_text(e))
             elif kind == "template":
@@ -5528,6 +5608,9 @@ async def _replay_entries(ctx: ReplyContext, mgr: MatchManager, mid: str,
                 if verbose:
                     out.append(journal_entry_text(e))
             ran += 1
+            # One bot process serves every server: let the others run
+            # between entries (this server's command lock stays held).
+            await asyncio.sleep(0)
         else:
             continue
         break
@@ -6012,7 +6095,8 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             hide = (f" (removes inherited: {', '.join(map(str, gone))})"
                     if gone else "")
             groups.setdefault(src, []).append(
-                f"- `{k}` = {val!r}{hide} — {desc} (type: {t}{extra})")
+                f"- `{k}` = {_rule_value_text(ctx, mgr, k, val) if k in SECRET_RULES else repr(val)}{hide}"
+                f" — {desc} (type: {t}{extra})")
         parts = [f"**{name}**{default_badge} — rule breakdown"]
         if s.description:
             parts.append(s.description)
@@ -6084,7 +6168,25 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         s = mgr.get_system(name)
         old_parent = s.parent
         new_parent = None if target.lower() == "none" else target
+        pre_state = mgr.server_state()
         mgr.set_system_parent(name, new_parent)
+        # A new parent can rename var-name rules for this system and the
+        # ones inheriting from it: under var_name_collision refuse, a var in
+        # the way refuses the link, as `!system set` does.
+        affected = {name} | set(mgr.system_descendants(name))
+        conflicts: List[str] = []
+        for mid, m in sorted(mgr.matches.items()):
+            if m.system_name in affected and m.system_name in mgr.systems:
+                trial = mgr._build_rules_dict(mgr.systems[m.system_name])
+                if str(trial.get("var_name_collision")) == "refuse":
+                    conflicts += [f"{mid}: {c}"
+                                  for c in m.var_name_conflicts(trial)]
+        if conflicts:
+            _apply_server_state(mgr, pre_state)
+            raise VTTError(
+                f"Can't link `{name}` to `{target}`: " + " ".join(conflicts[:5])
+                + (f" (and {len(conflicts) - 5} more)"
+                   if len(conflicts) > 5 else ""))
         notes: List[str] = []
         refreshed = mgr.refresh_match_rules(name, notes)
         suffix = (f" (refreshed {refreshed} live match"
@@ -6296,7 +6398,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "diff":
         if await return_help_if_not_enough_args(ctx, args, 3, "system", "diff"):
             return
-        return await ctx.send(_system_diff(mgr, mgr.get_system(args[1]),
+        return await ctx.send(_system_diff(ctx, mgr, mgr.get_system(args[1]),
                                            mgr.get_system(args[2])))
     if sub == "lint":
         if await return_help_if_not_enough_args(ctx, args, 2, "system", "lint"):
@@ -6457,7 +6559,8 @@ def _source_label(mgr: MatchManager, s: Any, key: str) -> str:
             else f"from `{src}`")
 
 
-def _system_diff(mgr: MatchManager, a: Any, b: Any) -> str:
+def _system_diff(ctx: ReplyContext, mgr: MatchManager, a: Any,
+                 b: Any) -> str:
     """`!system diff <a> <b>`: the rules and library entries whose
     effective values differ between two systems."""
     if a.name == b.name:
@@ -6467,9 +6570,10 @@ def _system_diff(mgr: MatchManager, a: Any, b: Any) -> str:
         va, vb = mgr.system_value(a, k), mgr.system_value(b, k)
         if va != vb:
             rules.append(
-                f"- `{k}`: `{a.name}` = `{_clip(repr(va), 40)}` "
+                f"- `{k}`: `{a.name}` = `{_rule_value_text(ctx, mgr, k, va, 40)}` "
                 f"({_source_label(mgr, a, k)}), `{b.name}` = "
-                f"`{_clip(repr(vb), 40)}` ({_source_label(mgr, b, k)})")
+                f"`{_rule_value_text(ctx, mgr, k, vb, 40)}` "
+                f"({_source_label(mgr, b, k)})")
     libs = []
     for kind in SYSTEM_LIBRARIES:
         la, lb = mgr.system_library(a, kind), mgr.system_library(b, kind)
@@ -6657,14 +6761,26 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
             check(f"tile template `{tname}` {key}",
                   (tdef.get("data") or {}).get(key), "eval", sys_known,
                   soft=True)
+    def check_name(where: str, fname: str, params: List[Any]) -> None:
+        # A name stored before the reserved names were refused (an older
+        # save) would shadow an engine helper or never be called.
+        try:
+            check_formula_function(fname, list(params))
+        except VTTError as ex:
+            bad.append(f"❌ {where}: {ex}")
+
     for fname, fdef in sorted(mgr.system_library(s, "formula_functions").items()):
         fn = FormulaFunction.from_dict(fdef)
         n += 1
+        check_name(f"function `{fname}`", fname, fn.params)
         check(f"function `{fname}`", fn.body, "exec", sys_known,
               frozenset(fn.params), soft=True)
     matches = sorted((m for m in mgr.matches.values()
                       if m.system_name == s.name), key=lambda m: m.id)
     for m in matches:
+        for fname, fn in sorted(m.formula_functions.items()):
+            check_name(f"match `{m.id}` function `{fname}`", fname,
+                       getattr(fn, "params", []))
         known = frozenset(m.formula_functions)
         for where, src, mode, params, action_mode in _match_formula_slots(m):
             n += 1
@@ -16490,8 +16606,12 @@ async def dry_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     mid = m.id
     snap = _snapshot_all_matches(mgr)
-    rngs = {k: x._rng.getstate() for k, x in mgr.matches.items()
-            if getattr(x, "_rng", None) is not None}
+    # Each match's RNG as it stands: its generator's state, or (none built
+    # yet: after a restart or `!match rng set`) the saved position, so a
+    # generator the dry run builds is dropped again.
+    rngs = {k: (x._rng.getstate() if x._rng is not None else None,
+                x._rng_seed, x.rng_position())
+            for k, x in mgr.matches.items()}
     await ctx.send(f"🧪 Dry run of `!{' '.join([name] + rest)}` — none of "
                    f"this is kept:")
     token = _DRY_ACTIVE.set(True)
@@ -16503,10 +16623,17 @@ async def dry_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         post = after.to_dict(include_history=False) if after is not None \
             else None
         _restore_all_matches(mgr, snap)
-        for k, state in rngs.items():
+        for k, (state, gen_seed, pos) in rngs.items():
             x = mgr.matches.get(k)
-            if x is not None and getattr(x, "_rng", None) is not None:
+            if x is None:
+                continue
+            if state is None:
+                x._rng, x._rng_seed, x.rng_pos = None, None, pos
+            else:
+                if x._rng is None:
+                    x._rng = CountingRandom(gen_seed)
                 x._rng.setstate(state)
+                x._rng_seed = gen_seed
     pre = snap["matches"].get(mid)
     if post is None:
         return await ctx.send("🧪 It would have deleted this match; rolled "
@@ -17006,28 +17133,35 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             nodes = _parse_macro(m.macros[name])
         except _MacroError as ex:
             return await ctx.send(f"❌ macro `{name}` structure error: {ex}")
-        budget = [int(m.rules.get("macro_step_limit", 10000))]
-        # Recursion-depth guard: a macro line can `!macro run <other>`, and each
-        # `!macro run` allocates its OWN fresh step budget — so the step limit
-        # alone can't stop a self/mutually-recursive macro from recursing until
-        # the Python stack overflows (a 💥). Bound the nested-run depth here.
-        # Tracked on the manager (the dispatch stack), so it accumulates even if
-        # a macro line switches the active match mid-recursion.
+        # Recursion-depth guard: a macro line can `!macro run <other>`, which
+        # would recurse until the Python stack overflows (a 💥). Bound the
+        # nested-run depth here. Tracked on the manager (the dispatch
+        # stack), so it accumulates even if a macro line switches the active
+        # match mid-recursion. A nested run shares the outermost run's step
+        # budget: with a fresh one per run, a macro running itself twice ran
+        # 2^depth times.
         depth = getattr(mgr, "_macro_depth", 0)
+        outer_budget = getattr(mgr, "_macro_budget", None)
+        budget = (outer_budget if depth > 0 and outer_budget is not None
+                  else [int(m.rules.get("macro_step_limit", 10000))])
         rec_limit = int(m.rules.get("macro_recursion_limit", 20))
         if depth >= rec_limit:
             return await ctx.send(
                 f"❌ macro `{name}`: recursion limit ({rec_limit}) exceeded "
                 f"(macro_recursion_limit).")
         mgr._macro_depth = depth + 1
+        mgr._macro_budget = budget
         try:
             if await _exec_macro(nodes, ctx, mgr, mac_args, None, name,
                                  budget) == ASSERT_STOP:
                 return await _stop_after_assert(ctx, f"macro `{name}`", 0)
         except _MacroError as ex:
+            if depth > 0:
+                raise   # the outermost run reports it, once, and stops
             await ctx.send(f"❌ macro `{name}`: {ex}")
         finally:
             mgr._macro_depth = depth
+            mgr._macro_budget = outer_budget if depth > 0 else None
         return
 
     if sub == "list":
@@ -18044,6 +18178,20 @@ def _clip(text: str, n: int) -> str:
     return text if len(text) <= n else text[:n - 1].rstrip() + "…"
 
 
+def _rule_value_text(ctx: ReplyContext, mgr: MatchManager, name: str,
+                     value: Any, width: int = 80) -> str:
+    """A rule's value as replies print it: `(hidden)` for a secret rule
+    (logic.SECRET_RULES) with a value, unless the caller is an administrator
+    or a host of the channel's match."""
+    if name in SECRET_RULES and value not in (None, "") \
+            and not ctx_is_admin(ctx):
+        mid = mgr.active_by_channel.get(ctx.channel_key)
+        m = mgr.matches.get(mid) if mid is not None else None
+        if m is None or not _acts_as_host(ctx, m):
+            return "(hidden)"
+    return _clip(repr(value), width)
+
+
 def _help_rule(ctx: ReplyContext, mgr: MatchManager, name: str) -> str:
     """`!help rule <rule>`: one gamerule in full, with its value on this
     channel's match (else the channel's default system) and its source."""
@@ -18076,11 +18224,13 @@ def _help_rule(ctx: ReplyContext, mgr: MatchManager, name: str) -> str:
              f"Default: `{_clip(repr(DEFAULT_SYSTEM_SETTINGS.get(name)), 80)}`"]
     if m is not None:
         lines.append(f"On match `{m.id}`: "
-                     f"`{_clip(repr(m.rules.get(name)), 80)}`")
+                     f"`{_rule_value_text(ctx, mgr, name, m.rules.get(name))}`")
     if sysobj is not None:
         src = mgr.system_value_source(sysobj, name)
+        shown = _rule_value_text(ctx, mgr, name,
+                                 mgr.system_value(sysobj, name))
         lines.append(
-            f"System `{sysobj.name}`: `{_clip(repr(mgr.system_value(sysobj, name)), 80)}` ("
+            f"System `{sysobj.name}`: `{shown}` ("
             + ("the engine default" if src is None else
                "set by this system" if src == sysobj.name else
                f"inherited from `{src}`") + ")")
@@ -18128,7 +18278,7 @@ def _help_find(ctx: ReplyContext, mgr: MatchManager, words: List[str]) -> str:
             val = (m.rules.get(name, DEFAULT_SYSTEM_SETTINGS.get(name))
                    if m is not None else DEFAULT_SYSTEM_SETTINGS.get(name))
             rules.append((name_hit(name),
-                          f"- `{name}` = `{_clip(repr(val), 40)}` — "
+                          f"- `{name}` = `{_rule_value_text(ctx, mgr, name, val, 40)}` — "
                           f"{_clip(spec.get('desc'), 110)}"))
     if not cmds and not rules:
         return (f"🔎 Nothing matches `{' '.join(words)}`. Try fewer or "

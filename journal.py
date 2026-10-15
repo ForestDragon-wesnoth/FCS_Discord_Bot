@@ -94,6 +94,18 @@ class Journal:
         self.segments[-1]["entries"].append(entry)
         return entry
 
+    def last_state_hash(self) -> Optional[str]:
+        """The state hash the journal last recorded: its newest entry that
+        carries one, else its newest segment's starting state."""
+        for seg in reversed(self.segments):
+            for e in reversed(seg["entries"]):
+                if e.get("hash"):
+                    return e["hash"]
+            st = (seg.get("start") or {}).get("state")
+            if isinstance(st, dict):
+                return state_hash(st)
+        return None
+
     def start_segment(self, header: Dict[str, Any]) -> None:
         header["no"] = (self.segments[-1]["no"] + 1) if self.segments else 1
         header["first_n"] = self.next_n
