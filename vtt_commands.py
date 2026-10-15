@@ -3192,7 +3192,7 @@ registry.annotate_sub(
           "library's current version; undo restores dropped pins."),
 )
 registry.annotate_sub(
-    "match", "journal", usage="!match journal [n] | !match journal export <file>",
+    "match", "journal", usage="!match journal [n] | !match journal export <file> [overwrite]",
     desc=("The match's command journal, newest first (default the last 15): "
           "every command that changed it, with who ran it and when, plus "
           "stored states (an undo or history restore, a `!run` file, a "
@@ -5361,12 +5361,15 @@ async def _match_journal(ctx: ReplyContext, args: List[str],
     m = active_match(mgr, ctx)
     j = m.journal
     if len(args) > 1 and args[1].lower() == "export":
+        overwrite = _take_overwrite(args)
         if len(args) != 3:
-            raise VTTError("Usage: `!match journal export <file>`.")
+            raise VTTError("Usage: `!match journal export <file> "
+                           "[overwrite]`.")
         if j is None:
             raise VTTError(f"`{m.id}` keeps no journal "
                            f"(command_journal_limit is 0).")
         full, path = saves_path(args[2], mgr, write=True)
+        _check_overwrite(full, path, overwrite)
         _write_save_file(mgr, full, path, journal_bundle(mgr, m))
         audit_note(f"exported the journal of `{m.id}` to `{path}`")
         ns = [e["n"] for e in j.entries()]
@@ -8645,11 +8648,20 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 x, y = int(args[3]), int(args[4])
             except ValueError:
                 return await ctx.send("❌ x and y must be integers.")
+        dest_pre = mgr.matches[dest_mid].to_dict(include_history=False)
         try:
             new_id, log = mgr.copy_entity(
                 m.id, dest_mid, src_id, x, y, move=(sub == "transfer"))
         except (VTTError, NotFound) as ex:
             return await ctx.send(f"❌ {ex}")
+        # The arrival is an undo step of the destination (the source's own
+        # step is the command's): each match undoes only its side.
+        dm = mgr.matches.get(dest_mid)
+        if dm is not None and _differs_in_undo_state(
+                dest_pre, dm.to_dict(include_history=False)):
+            dm.history.record_command(
+                dm, f"!ent {sub} {src_id} (arrival from {m.id})",
+                pre_state=dest_pre, by=COMMAND_USER.get() or "")
         tail = ("\n" + "\n".join(log)) if log else ""
         if new_id is None:   # died on the way out; the log says so
             return await ctx.send(tail.lstrip("\n"))
@@ -8659,9 +8671,15 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         ne = dest.entities.get(new_id)
         # A destination on_entity_spawned handler may already have removed it.
         where = f" at ({ne.x},{ne.y})" if ne is not None else ""
+        note = ""
+        if sub == "transfer":
+            note = (f"\n⚠️ Undo is per match: `!undo command` here brings "
+                    f"`{src_id}` back without removing it from **{dest.name}**"
+                    f"; one in **{dest.name}** removes it there without "
+                    f"bringing it back here.")
         return await ctx.send(
             f"{verb} `{src_id}` to **{dest.name}** "
-            f"({dest_mid}){rid}{where}.{tail}")
+            f"({dest_mid}){rid}{where}.{tail}{note}")
 
     # Fallback: show authoritative help for the root command
     return await _help_fallback(ctx, ["ent"], args[0] if args else None)
@@ -11593,6 +11611,13 @@ def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot,
     # The restored match may pin other partial versions.
     invalidate_partial_cache()
     old = mgr.matches[mid]
+    # A transfer is two undo steps, one per match: undoing either side
+    # leaves the other match as it is.
+    if notes is not None and any(
+            x.sequence >= snapshot.sequence
+            and str(x.label).startswith(_TRANSFER_LABELS)
+            for x in old.history.command_saves):
+        notes.append(_TRANSFER_UNDO_NOTE)
     new_match = Match.from_dict(snapshot.state)
     # Transfer history pointer first so the truncate below targets the
     # same object we just attached to the new match.
@@ -11743,8 +11768,33 @@ async def _resolve_bindings_mode(ctx, m: Match, snap: Snapshot,
     return None
 
 
+_TRANSFER_LABELS = ("!ent transfer",)
+_TRANSFER_UNDO_NOTE = (
+    "⚠️ This undid a unit moving between matches on THIS match only: the "
+    "other match keeps its side (undo there separately).")
+
+
+def _take_overwrite(args: List[str]) -> bool:
+    """Remove a trailing-option `overwrite` word from `args` (in place)."""
+    if any(str(a).lower() == "overwrite" for a in args[2:]):
+        args[:] = args[:2] + [a for a in args[2:]
+                              if str(a).lower() != "overwrite"]
+        return True
+    return False
+
+
+def _check_overwrite(full: str, shown: str, overwrite: bool) -> None:
+    """Refuse to replace an existing saves file unless `overwrite` was given."""
+    if os.path.exists(full) and not overwrite:
+        raise VTTError(f"`{shown}` already exists; add `overwrite` to "
+                       f"replace it.")
+
+
 def _bindings_suffix(notes: List[str]) -> str:
-    return (" Channels: " + "; ".join(notes) + ".") if notes else ""
+    warn = [n for n in notes if n == _TRANSFER_UNDO_NOTE]
+    rest = [n for n in notes if n != _TRANSFER_UNDO_NOTE]
+    return ((" Channels: " + "; ".join(rest) + ".") if rest else "") + \
+        "".join("\n" + w for w in warn)
 
 
 def _parse_int_or(default: int, token: Optional[str]) -> int:
@@ -12084,7 +12134,9 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "history", "export"):
             return
         selector = args[1]
+        overwrite = _take_overwrite(args)
         full, path = saves_path(args[2], mgr, write=True)
+        _check_overwrite(full, path, overwrite)
         snap = _resolve_snapshot_selector(m, selector)
         _write_save_file(mgr, full, path, snap.to_dict())
         audit_note(f"exported a snapshot of `{m.id}` to `{path}`")
@@ -12604,7 +12656,7 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "history", "export",
-    usage="!history export <selector> <path>",
+    usage="!history export <selector> <path> [overwrite]",
     desc=(
         "Write one snapshot to a JSON file. Selectors: manual:<name>, "
         "round:<N>, turn:<seq>, command:<seq>, latest:round, "
@@ -12769,11 +12821,13 @@ async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # autosave history into the save file. Off by default to keep
         # files small; on for full campaign backups.
         include_history = False
+        overwrite = _take_overwrite(args)
         _check_options(args[2:], {"include_history"}, "!store save")
         for extra in args[2:]:
             if extra.startswith("include_history="):
                 include_history = _parse_bool(extra[len("include_history="):])
         path, shown = saves_path(args[1], mgr, write=True)
+        _check_overwrite(path, shown, overwrite)
         _write_save_file(mgr, path, shown,
                          mgr.save_data(include_history=include_history))
         audit_note(f"saved the server to `{shown}`")
@@ -12797,7 +12851,7 @@ async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 #annonate subcommands next to the command itself:
 registry.annotate_sub(
     "store", "save",
-    usage="!store save <name> [include_history=yes]",
+    usage="!store save <name> [include_history=yes] [overwrite]",
     desc=(
         "Save this server's matches, game systems and channel bindings to a "
         "JSON file in its saves folder (plain names only; server "

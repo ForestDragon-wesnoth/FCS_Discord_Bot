@@ -1536,7 +1536,8 @@ hardcodes**.
   no tile write sets, and every tile edit keeps it: place, fill, del,
   clear, `tile_clear`); `corpse_id_uniqueness`. A revive puts the corpse
   back when the unit can't be placed and rebuilds the turn order once the
-  unit is alive (814, 820). `kill` /
+  unit is alive; the corpse records the groups of the body and its parts
+  (`groups`) and a revive rejoins those that still exist (814, 820, 824). `kill` /
   `revive` run `default_kill_function_effects` /
   `default_revive_function_effects`. Prims: has_corpse, corpse_at,
   all_corpses, corpse_var / corpse_has, corpse_status_has / _get / _names;
@@ -1804,6 +1805,13 @@ hardcodes**.
   `corpse_line_format`, `body_part_entity_line_suffix`,
   `mount_entity_line_suffix`, `show_corpses_in_entity_list`; `{placeholder}`
   templates over vars. Event log: `!log`, `event_log_*` rules, `log()`.
+- **Transfers and undo:** `!ent transfer` is one undo step per match: the
+  source's command step and an `(arrival from <src>)` step on the
+  destination; undoing either changes only its own match, and the
+  transfer and both undos say so (`_TRANSFER_UNDO_NOTE`) (824).
+- **Saves files** (`!store save`, `!history export`, `!match journal
+  export`) refuse to replace an existing file unless `overwrite` is given
+  (`_check_overwrite`) (824).
 - **Whole-server saves:** `!store save/load <name>` (admin, saves folder;
   load is all-or-nothing); `!history export/import` (a snapshot from another
   match restores only the board: the match keeps its id, name, hosts and
@@ -2064,12 +2072,10 @@ rejected already. Update this section in the PR that resolves an item.
 - **Pass 43 questions** (asked after the audit-fix PR): a mid-round
   initiative change under `immediate` can cost a unit its turn or give it
   a second (T3); `!turn set` moves the pointer without ending / starting
-  turns, so under ATB the unit acts twice (T4); whether a revived unit
-  rejoins its groups; a refuse / nearest choice when a revive's cell is
-  taken; a snake trailing onto cells of units its head passed over (K1);
-  snapshots and `!ent transform <id> <id>` leaving out body parts (S6);
-  undoing a cross-match transfer leaves the unit in both matches (X3);
-  saves files overwritten without a prompt (I2); compact journal `state`
+  turns, so under ATB the unit acts twice (T4); a refuse / nearest choice
+  when a revive's cell is taken; a snake trailing onto cells of units its
+  head passed over (K1); snapshots and `!ent transform <id> <id>` leaving
+  out body parts (S6); compact journal `state`
   entries (J2 follow-up); watchers chained through another watcher fire
   after the next command of any kind, read-only ones included, with no
   undo step of their own (L7); `true` / `false` in formulas (M4).
@@ -2082,8 +2088,8 @@ rejected already. Update this section in the PR that resolves an item.
 
 ### Deferred (the user wants these tracked)
 
-- **Per-server CPU work budget** (revisit before any public rollout; the
-  pass 43 report's X4 measured the doubling case: a `!func`, event handler
+- **Per-server CPU work budget** (revisit before any public rollout; X4
+  folded in here by the user; the pass 43 report's X4 measured the doubling case: a `!func`, event handler
   or action calling itself twice runs 2^depth times within its depth
   limit, `f(20)` 5.9 s; macros and nested batch / foreach runs now share
   macro_step_limit, the rest wait for this budget): the

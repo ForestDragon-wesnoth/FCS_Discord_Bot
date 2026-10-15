@@ -25251,3 +25251,68 @@ binding gone the omniscient view completes them again. `!ent face <id>
 toward <x> <y>` turns the unit toward a cell (down, with diagonal
 facing off; the usage string read the
 cell form as one word, so the stray-word check refused it).
+
+SCENARIO 824 — A transfer is one undo step per match; saves files need overwrite; a revived unit rejoins its groups
+--------------------------------------------------------------------------------------------------------------------
+
+!match new tb Dest 6 6
+!match new ta Source 6 6
+!match use ta
+!ent add v V 10 2 2 3
+!ent transfer v tb
+?? ⚠️ Undo is per match
+!undo command
+?? Reverted past `!ent transfer v tb`
+?? on THIS match only
+!list
+?? V (v)
+!match use tb
+!list
+?? V (v)
+!undo command
+?? (arrival from ta)
+?? on THIS match only
+!list
+?! V (v)
+!match use ta
+!history export latest:command ta.json
+!history export latest:command ta.json
+?? ❌ `saves/ta.json` already exists; add `overwrite` to replace it.
+!history export latest:command ta.json overwrite
+?! ❌
+!store save srv
+!store save srv
+?? already exists
+!store save srv overwrite
+?! ❌
+!match journal export j.json
+!match journal export j.json
+?? already exists
+!ent add w W 10 4 4 1
+!ent add k K 10 5 5 1
+!ent group new party
+!ent group add party w k
+!ent kill w
+!ent group info party
+?! `w`
+!ent revive w
+!ent group info party
+?? `w`
+!ent group delete party
+!ent kill k
+!ent group new party2
+!ent revive k
+!list
+?? K (k)
+!ent group info party2
+?! `k`
+
+Expected: HARNESS-ALLOWS-ERRORS. `!ent transfer` is two undo steps, one
+per match, and says so: undoing it in the source brings `v` back there
+while the destination keeps its copy, and undoing the arrival in the
+destination (its own step, labelled "arrival from ta") removes it there
+without touching the source; both undos warn that only this match
+changed. `!history export`, `!store save` and `!match journal export`
+refuse to replace an existing saves file unless `overwrite` is given. A
+revived unit rejoins the groups it belonged to when it died, if they still
+exist (`party` was deleted before `k` came back, so it joins nothing).

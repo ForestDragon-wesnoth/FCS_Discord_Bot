@@ -15754,6 +15754,13 @@ class Match:
             "entity": snap,
             "died_round": self.round_number,
         }
+        # The groups the body (parts too) belonged to; a revive rejoins
+        # those that still exist.
+        member = {u.id: self.groups_for(u.id)
+                  for u in [e] + self.entity_part_subtree(e.id)}
+        member = {k: v for k, v in member.items() if v}
+        if member:
+            corpses[e.id]["groups"] = member
         # Snapshot the whole attached part SUBTREE (parts, their parts, ...)
         # alongside the parent so a later revive_corpse restores the whole
         # creature — multi-level limbs included (BFS order = parents before
@@ -15972,6 +15979,11 @@ class Match:
             # corpse's hp (not alive, so left out); now that it lives, it
             # rejoins.
             self._rebuild_turn_order()
+        for uid, names in (corpse.get("groups") or {}).items():
+            if uid in self.entities and isinstance(names, list):
+                for name in names:
+                    if name in self.groups and uid not in self.groups[name]:
+                        self.groups[name].append(uid)
         return e.id, spawn_log + revive_log + death_log
 
     # ---------- polymorph / transform (identity-preserving statblock swap) -----
