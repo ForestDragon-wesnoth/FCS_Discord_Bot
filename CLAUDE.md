@@ -572,7 +572,9 @@ locals (`exec(code, ns)`, `ns["__builtins__"] = {}`), so a lambda body
 resolves names (`__read`, action locals, a `!func`'s parameters) where its
 formula does. A local or loop variable named with a leading `__` is
 refused (`_check_binding_name`): binding `__builtins__` or `__read` would
-replace the engine's.
+replace the engine's. Any formula naming the engine's own `__` helpers
+(`__read`, `__write`, ...) is refused at compile (`_refuse_engine_names`,
+every parse path), and a `!func` can't take such a name (809).
 
 **Two modes.** EXPRESSION formulas (conditions: block / opaque / visibility /
 alive / death conditions, watcher conditions, slot conditions, modifier
@@ -951,7 +953,16 @@ hardcodes**.
   goes through `_own_value` (deep copy, string dict keys, JSON values only),
   `check_store_path` (no empty path segment) and `check_no_value_ancestor`
   (no `k.x` while k = 5). Status number fields (level, duration) via
-  `checked_status_value`.
+  `checked_status_value`. A stored value is bounded: nesting depth
+  `STORE_DEPTH_LIMIT`, total items `STORE_SIZE_LIMIT`, integer digits
+  `STORE_INT_DIGITS` (a value past them couldn't be saved or printed).
+- **Unit ids** follow `ID_RE`; `RESERVED_IDS` (self / this / current /
+  parent) and ids `entity[X]` would read as something else
+  (`unreachable_id`: hook and action bindings such as target / actor /
+  rider, Python keywords, True / None) are refused at creation
+  (`Entity.__post_init__`) and as template names; `mint_entity_id` skips
+  them. A digits-only id works: `entity[123]` reads unit "123". Ids that
+  aren't identifiers (`orc-1`) are read with `entity['orc-1']`.
 - **`default_entity_vars`** (`!defvar`) fills MISSING vars at spawn, before
   vital validation; `!ent add` / template values win.
 - **Clamps** (entity + system `default_clamps`, `!clamp` / `!gclamp`): hard
@@ -967,7 +978,9 @@ hardcodes**.
   group / action / store_entity_into_var. `!ent hp` SETS by default (`5`, `=-3`, `max`, `$(...)`);
   a leading sign changes (`+5` heals, `-5` damages); one `write_var`, hook
   output and deaths reported (633-634, 647). `!ent set_vars <id> k=v ...` is
-  one all-or-nothing undo step (684). `!ent set_var` coerces only lowercase
+  one all-or-nothing undo step (684); the unit's death check runs once,
+  after every var is written (`_death_check_deferred_ids`), and a rollback
+  drops the lines its writes surfaced. `!ent set_var` coerces only lowercase
   `true` / `false` to bools and keeps `inf` / `nan` as text.
 - **Container helpers** (the engine has no inventory concept): `var_add`,
   `var_move` (looting), `var_copy`, `var_sum_field`, `item_add` /
@@ -1088,7 +1101,9 @@ hardcodes**.
   (reveals record which clock they used) (566-567).
 - **Pause:** `!match pause [reason]` refuses players' state-changing
   commands; `pause_affects_hosts` holds hosts' commands until `!match
-  resume` runs them (`resume drop` discards); never an undo step (637-638).
+  resume` runs them (`resume drop` discards); held commands are saved with
+  the match (`paused.held`), so a restart keeps them; never an undo step;
+  `!dry` runs during a pause (637-638, 822).
 
 ### 7.4 Statuses
 
@@ -1183,8 +1198,12 @@ hardcodes**.
   history preserved). A failing NESTED action rolls back only its own
   effects (check `use_action`'s result to abort the outer one).
   `action_recursion_limit`. `cmd('...')` dispatches commands on
-  `action_cmd_allowlist` (default `ent`) through `_BufferCtx`; action bodies
-  can't run admin commands or save templates (no admin flag, no identity).
+  `action_cmd_allowlist` (default `ent`) through `_BufferCtx`, which carries
+  the channel and identity of the command that ran the action
+  (`_BufferCtx.for_ctx`), so target-host checks (`!ent transfer` / `copy`)
+  apply; action bodies can't run admin commands or save templates (no
+  admin flag). A `cmd()` that can change another match snapshots the
+  other matches first and a failed action restores them too (812, 818).
 - **Choices:** `choose(prompt, options)` / `choose_number(prompt, lo, hi)`
   replay the body: on an unanswered choice the attempt rolls back and re-runs
   with answers replayed in order (`answer=` tokens, else the surface's
@@ -1211,8 +1230,19 @@ hardcodes**.
 - **`!batch a ; b ; ...`** = one undo step; `!batch strict` stops at the first
   ❌ and undoes the lines before it (every match restored in place, created
   matches removed, deleted ones restored, pointers and rules restored;
-  bot-wide settings are not) (692-693). **`!run <file>`** reads a saves-folder
-  file (admin). Both nest within `macro_recursion_limit`.
+  bot-wide settings are not; a line that crashes undoes like a ❌, and a
+  deleted match comes back with its history, saves and journal) (692-693,
+  816). **`!run <file>`** reads a saves-folder file (admin). Both nest
+  within `macro_recursion_limit`.
+- **Lines of `!batch` / `!foreach` are gated** (`_GATE_LINES`, checked in
+  `dispatch_no_snapshot`): each typed line passes the per-match gate as its
+  caller, so an access override opening the container opens only the
+  container; a macro body, action `cmd()` lines and an approved request
+  aren't gated again. Nested batch / foreach runs (`_run_container`) count
+  toward `macro_recursion_limit` with macro runs, and the nested runs of
+  one top-level container share `macro_step_limit` (one step per nested
+  run: a sweep rerunning itself per unit fans out); either limit is
+  reported once and the rest of the nested runs stop quietly (818).
 - **Macros** (`!macro set/run/list/show/remove`): `$1..$N`, `$@`, `$#` (the
   current `repeat` iteration) (single-pass substitution); a `$N` past the
   args given becomes empty text, with no refusal (user call): an optional
@@ -1224,8 +1254,10 @@ hardcodes**.
   works); control flow `if / elif / else / repeat / end`
   with read-only conditions (a negative `repeat` count is refused);
   `macro_repeat_limit`, `macro_step_limit` (counts
-  dispatches AND loop iterations), `macro_recursion_limit`; one undo step
-  (425-426, 544-546, 555-556).
+  dispatches AND loop iterations, shared by nested runs through
+  `mgr._macro_budget`), `macro_recursion_limit`; an `if` whose condition
+  can't be read stops the macro; one undo step
+  (425-426, 544-546, 555-556, 817).
 - **`!foreach <selector> ; <cmd> [; <cmd> ...]`**: the `!find` selector
   grammar; `$id $name $x $y $team $map $i $n` substituted single-pass; targets
   resolved before any command runs; one undo step. Host-gated, EXCEPT that a
@@ -1324,7 +1356,10 @@ hardcodes**.
   follows where that unit stands now, else its last map (a cross-map move
   updates the record), else before any turn the team's first unit, else
   the first map. `channel_maps` (`!map use`) and `channel_views` (cameras,
-  per map) are per channel and follow undo like the cameras (790).
+  per map) are per channel display state: no undo step, kept live across
+  an undo (`UNDO_IGNORED`), so a player's pans can't fill the undo window;
+  the journal still records a `!map use` (`JOURNAL_IGNORED` leaves
+  channel_maps in), since `map=view` and strict edits read it (790, 815).
 - **Cross-map moves** (`Match.move_to_map`, `!ent tp <id> <x> <y>
   [<map>]`): the whole carried body (`carried_body`: parts, riders,
   segments resettled behind the head, located parts at their anchor
@@ -1370,7 +1405,9 @@ hardcodes**.
   for one and `down_right` for the other (613-614). New units face per
   `spawn_face_toward_center` / `spawn_default_facing`; template spawns and
   restored parts keep their saved facing.
-- **Teams and relations:** a unit's team is the `team_var` var. `relation`
+- **Teams and relations:** a unit's team is the `team_var` var, read as
+  text (`Entity.team`: a team typed as 1 and "1" from a formula are one
+  team; None / "" = no team). `relation`
   arguments filter any / hostile / ally / same_team / attackable
   (`is_hostile`; `is_attackable` honours `friendlyfire`).
 - **Directional sides:** `relative_angle`, `relative_side`, `side_hit(target,
@@ -1468,7 +1505,9 @@ hardcodes**.
   Moving the vehicle carries riders, nested (`_restamp_riders_for`); a
   driver's own move moves the rig. Hidden riders are off the ground,
   unrendered, unseen and grant no vision (`hidden_rider_grants_vision`).
-  `mount_on_vehicle_death` (eject / kill / keep); dismount and eject take the
+  `mount_on_vehicle_death` (eject / kill / keep; keep holds only when the
+  vehicle leaves a corpse, any other removal ejects, 814); a vehicle's
+  riders don't block its own placement; dismount and eject take the
   free cell nearest the vehicle's centre (rings outward, ties by y then x);
   a dead rider revives
   unmounted; transform re-checks a mounted rider's slot (and a vehicle's
@@ -1493,7 +1532,11 @@ hardcodes**.
   way; turn-flow lines name no unit (769).
 - **Death** (`_process_death`): `death_result` (corpse / delete, per-unit
   `__death_result`); a corpse is the unit's snapshot in its cell's tile data
-  (`corpses.<id>`, mount links stripped); `corpse_id_uniqueness`. `kill` /
+  (`corpses.<id>`, mount links stripped; `corpses` is a reserved tile key
+  no tile write sets, and every tile edit keeps it: place, fill, del,
+  clear, `tile_clear`); `corpse_id_uniqueness`. A revive puts the corpse
+  back when the unit can't be placed and rebuilds the turn order once the
+  unit is alive (814, 820). `kill` /
   `revive` run `default_kill_function_effects` /
   `default_revive_function_effects`. Prims: has_corpse, corpse_at,
   all_corpses, corpse_var / corpse_has, corpse_status_has / _get / _names;
@@ -1523,7 +1566,8 @@ hardcodes**.
   prims, `zone_distance`.
 - **Auras:** a zone anchored to a unit (`!zone anchor <name> <eid> [radius]
   [metric]`): cells re-stamped around every footprint cell when the anchor
-  moves, without firing the aura's own enter/exit. On anchor loss
+  moves or its footprint var changes (`_body_reshaped`, which also re-seats
+  riders), without firing the aura's own enter/exit. On anchor loss
   `anchored_zone_on_anchor_loss`: delete / freeze / suspend (cells cleared,
   binding kept, resumes on revive or a part heal). The binding is by id, so
   a suspended aura also resumes around a LATER unit that reuses the id
@@ -1681,7 +1725,9 @@ hardcodes**.
   co-host clones the original owner becomes a co-host. Ids follow `ID_RE`;
   an id that becomes a file or folder name (match, template, save, server
   key) also passes `logic.is_file_id`, which refuses Windows device names
-  (`CON`, `NUL`, `COM1`, ...) the bot could not write on Windows.
+  (`CON`, `NUL`, `COM1`, ...) the bot could not write on Windows; a match
+  id differing from an existing one only by case is refused
+  (`_check_match_id_case`: one file on Windows / macOS).
 - **Systems and rules:** a `GameSystem` holds rule overrides, tile
   templates, functions, aliases, default vars / passives / clamps. A match
   copies its system's rules into `match.rules` at creation and on every
@@ -1753,7 +1799,7 @@ hardcodes**.
   (`Snapshot.by`) and each event-log entry its command's author
   (`logic.COMMAND_USER`, set in `_run_top`); `command_attribution` (words
   history / log / diff) picks where it shows. `!log [n] type= who= round=
-  by=` filters (771).
+  by=` filters (n ≥ 1; an unknown type is refused) (771, 822).
 - **Roster text:** `entity_line_format`, `entity_info_format`,
   `corpse_line_format`, `body_part_entity_line_suffix`,
   `mount_entity_line_suffix`, `show_corpses_in_entity_list`; `{placeholder}`
@@ -1775,7 +1821,10 @@ hardcodes**.
   statuses, names, links, tiles, zones, groups, match vars, team data, the
   turn and "other changes". The RNG's seed and position are saved with
   the match but aren't undo state: an undo keeps rolling from the live
-  position.
+  position. A rollback (`!dry`, `!batch strict`, a failed action) rewinds
+  the history to a mark taken before it (`MatchHistory.mark` / `rewind`):
+  autosaves of turns that never happened go, autosaves pruned meanwhile
+  come back (816). `!alias`, `!table` and `!turn set` are undo steps.
 - **Team data:** `!team set/get/add/list/clear/passive`, `team_get/set/add`;
   a `modifiers` bundle applies to every member.
 - **Dice and tables:** `roll("NdM±k")` with explode `!` and keep `kh<n>` /
@@ -1785,10 +1834,14 @@ hardcodes**.
   `Match.formula_rng()`: a `logic.CountingRandom` seeded with the
   `random_seed` rule when set, else the match's own `rng_seed` (made at
   creation, fresh for a clone), counting the 32-bit words drawn
-  (`rng_pos`, saved, so a reload resumes the sequence; `advance` skips
-  words, bounded by `RNG_ADVANCE_LIMIT`). `!match rng [set <seed>
-  [<pos>]]` (seed `auto` = a fresh one; host only: the seed predicts every roll; not an undo step, and
-  `!dry` refuses it) (777).
+  (`rng_pos`, saved, so a reload resumes the sequence). The sequence runs
+  in epochs of `RNG_EPOCH` words (epoch k re-seeds with `<seed>#<k>`), so
+  `advance` reaches any position by skipping at most one epoch. `!match
+  rng [set <seed> [<pos>]]` (seed `auto` = a fresh one; host only: the
+  seed predicts every roll; not an undo step, and `!dry` refuses it);
+  `!dry` restores the RNG it used (777, 804). `random_seed` is a SECRET
+  rule (`SECRET_RULES`): its value is hidden from players in `!help rule`,
+  `!system info` / `diff` and `rule_get` inside `$()` (805).
 - **Server-wide undo and audit:** every typed command that changes
   `MatchManager.server_state()` (every system and the default-system
   pointers) is one step on the server's stack (`system_history`, the state
@@ -1808,11 +1861,15 @@ hardcodes**.
   (match state, its system chain, the server's templates) plus entries:
   `cmd` (a command that changed the match per the undo test, as typed —
   `$()` unevaluated — with author, channel, RNG [seed, before, after] and
-  the state hash after it, watchers included; an `!approve`d / `!again`
+  the state hash after it, watchers included; the reads in
+  `_JOURNAL_READS` skip the journal's before-check; an `!approve`d / `!again`
   command is recorded as the command that ran, not the wrapper, via
   `_JOURNALED_IN`; interactive choice answers become `answer=` tokens),
   `state` (undo, history restore, `!run`, `!ent transfer`, `!match resume`,
-  or a change made from a channel showing another match, found from the
+  a command one of whose batch / macro / foreach lines or action `cmd()`
+  lines is one of those (`_JOURNAL_AS_STATE`, set in
+  `dispatch_no_snapshot`), or a change made from a channel showing another
+  match, found from the
   storage commit's `last_changed`), `systems` (the chain after a
   server-wide edit, when it differs from the last recorded), `template`
   (every library save / rename / delete). A journal starts before a
@@ -1823,7 +1880,8 @@ hardcodes**.
   [as=<id>] [verbose]` (admin) builds the systems (replacing same-named
   ones no match here uses), templates and match, then runs each entry as
   a top-level command (`_ReplayCtx`: the author's identity and channel, no
-  prompts, replies collected) with the RNG restored, and reports the first
+  prompts, replies collected, a fresh partial cache per entry) with the
+  RNG restored, and reports the first
   entry whose state hash differs; the rebuilt match takes the recording as
   its journal (`_REPLAYING`) (778-780).
 - **Other:** `!help find <words>` (commands, subcommands and rules),
@@ -2003,6 +2061,18 @@ rejected already. Update this section in the PR that resolves an item.
   on the nearest free cell with a ⚠️. Whether spawns should recreate the
   overlap is open.
 
+- **Pass 43 questions** (asked after the audit-fix PR): a mid-round
+  initiative change under `immediate` can cost a unit its turn or give it
+  a second (T3); `!turn set` moves the pointer without ending / starting
+  turns, so under ATB the unit acts twice (T4); whether a revived unit
+  rejoins its groups; a refuse / nearest choice when a revive's cell is
+  taken; a snake trailing onto cells of units its head passed over (K1);
+  snapshots and `!ent transform <id> <id>` leaving out body parts (S6);
+  undoing a cross-match transfer leaves the unit in both matches (X3);
+  saves files overwritten without a prompt (I2); compact journal `state`
+  entries (J2 follow-up); watchers chained through another watcher fire
+  after the next command of any kind, read-only ones included, with no
+  undo step of their own (L7); `true` / `false` in formulas (M4).
 - **Large match state, per-command cost** (user: discuss later): after a
   whole-map tile fill on 500x500 every command costs ~3.5 s (three full
   serializations per command; numbers under "Undo history disk growth"
@@ -2012,7 +2082,11 @@ rejected already. Update this section in the PR that resolves an item.
 
 ### Deferred (the user wants these tracked)
 
-- **Per-server CPU work budget** (revisit before any public rollout): the
+- **Per-server CPU work budget** (revisit before any public rollout; the
+  pass 43 report's X4 measured the doubling case: a `!func`, event handler
+  or action calling itself twice runs 2^depth times within its depth
+  limit, `f(20)` 5.9 s; macros and nested batch / foreach runs now share
+  macro_step_limit, the rest wait for this budget): the
   per-call limits multiply — 10,000 loop iterations × a 1,000-cell line on a
   500×500 map is still ~7 s of a frozen bot for every server. Preferred
   shape: a deterministic work counter charged per cell walked, loop

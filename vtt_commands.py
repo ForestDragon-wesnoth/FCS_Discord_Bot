@@ -19,7 +19,7 @@ from logic import COMMAND_USER, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Pas
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
-from journal import UNDO_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT
+from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT
 from logic import check_id, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
@@ -494,6 +494,12 @@ class CommandRegistry:
         if _is_system_undo(name, args):
             await ctx.send(_SYSTEM_UNDO_TYPED_ONLY)
             return
+        jstate = _JOURNAL_AS_STATE.get()
+        if jstate is not None and (
+                name in _JOURNAL_STATE_ROOTS or (name, str(args[0]).lower()
+                                                 if args else "")
+                in _JOURNAL_STATE_SUBS):
+            jstate[0] = True
         if _DRY_ACTIVE.get():
             refusal = _dry_refusal(name, args)
             if refusal:
@@ -999,6 +1005,8 @@ class CommandRegistry:
         jparent = _JOURNALED_IN.get()
         jmine: set = set()
         jtoken = _JOURNALED_IN.set(jmine)
+        jstate = [False]
+        jstate_token = _JOURNAL_AS_STATE.set(jstate)
         _INTERACTIVE_ANSWERS.set([])
         result = None
         try:
@@ -1009,6 +1017,7 @@ class CommandRegistry:
             await ctx.send(f"💥 Unexpected error: {e}")
         finally:
             _JOURNALED_IN.reset(jtoken)
+            _JOURNAL_AS_STATE.reset(jstate_token)
         # Even a failed command goes through the bookkeeping below: it only
         # records a snapshot when the state REALLY changed, so a clean failure
         # stays a no-op, while a command that mutated and THEN failed (a hook
@@ -1056,7 +1065,7 @@ class CommandRegistry:
             _journal_command(mgr, ctx, jm, pre_active_mid, name, typed,
                              typed_args, jpre, jrng, jmine,
                              str(args[0]).lower() if args else "",
-                             post_state)
+                             post_state, as_state=jstate[0])
         if jparent is not None:
             jparent.update(jmine)
         return result
@@ -1075,6 +1084,11 @@ _JOURNAL_STATE_ROOTS = frozenset({"undo", "history", "run"})
 # ... and subcommands: a transfer needs the other match, a resume runs the
 # commands held while paused.
 _JOURNAL_STATE_SUBS = frozenset({("ent", "transfer"), ("match", "resume")})
+# Set by a line of the running command (a batch / macro / foreach line, an
+# action's cmd()) that is one of those: the command is journaled as its
+# state too, since replaying it would redo that line without its context.
+_JOURNAL_AS_STATE: "contextvars.ContextVar[Optional[list]]" = \
+    contextvars.ContextVar("vtt_journal_as_state", default=None)
 # Ids of the matches journaled by the runs a run nests (an approval,
 # `!again`, a replayed entry): the outer run leaves a match one of them
 # recorded.
@@ -1086,7 +1100,8 @@ def _journal_command(mgr: MatchManager, ctx: ReplyContext, jm: Match,
                      mid: str, name: str, typed: str, typed_args: List[str],
                      jpre: Dict[str, Any], jrng: Tuple[str, int],
                      done: set, sub: str,
-                     post: Optional[Dict[str, Any]] = None) -> None:
+                     post: Optional[Dict[str, Any]] = None,
+                     as_state: bool = False) -> None:
     """Journal a command that changed the channel's match `jm`: as the
     command (replayable from the match) or, for an undo / history restore /
     `!run` file, as the state it left."""
@@ -1100,7 +1115,7 @@ def _journal_command(mgr: MatchManager, ctx: ReplyContext, jm: Match,
         return          # a nested run journaled it / a replay copies its own
     if post is None or post_m is not jm:
         post = post_m.to_dict(include_history=False)
-    if not _differs_in_undo_state(jpre, post):
+    if not _differs_in_undo_state(jpre, post, JOURNAL_IGNORED):
         return
     # A typed command started every journal before it ran
     # (_journal_before); a Discord button's approval has no typed command
@@ -1117,7 +1132,8 @@ def _journal_command(mgr: MatchManager, ctx: ReplyContext, jm: Match,
     if answers and name == "action":
         # Answers typed at a prompt replay as `answer=` tokens.
         entry["cmd"] += [f"answer={a}" for a in answers]
-    if name in _JOURNAL_STATE_ROOTS or (name, sub) in _JOURNAL_STATE_SUBS:
+    if (as_state or name in _JOURNAL_STATE_ROOTS
+            or (name, sub) in _JOURNAL_STATE_SUBS):
         entry["kind"] = "state"
         entry["state"] = journal_state(post)
         if effective_seed(post_m) != jrng[0]:
@@ -1802,14 +1818,16 @@ def _remember_command(mgr: MatchManager, ctx: ReplyContext, name: str,
 _NOT_UNDO_STATE = UNDO_IGNORED
 
 
-def _differs_in_undo_state(pre: Dict[str, Any], post: Dict[str, Any]) -> bool:
-    """Whether two match snapshots differ in anything an undo restores."""
+def _differs_in_undo_state(pre: Dict[str, Any], post: Dict[str, Any],
+                           ignored: Tuple[str, ...] = _NOT_UNDO_STATE) -> bool:
+    """Whether two match snapshots differ in anything an undo restores (or,
+    with `ignored=JOURNAL_IGNORED`, anything a replay must redo)."""
     if pre == post:
         return False
-    if all(pre.get(k) == post.get(k) for k in _NOT_UNDO_STATE):
+    if all(pre.get(k) == post.get(k) for k in ignored):
         return True
-    return ({k: v for k, v in pre.items() if k not in _NOT_UNDO_STATE}
-            != {k: v for k, v in post.items() if k not in _NOT_UNDO_STATE})
+    return ({k: v for k, v in pre.items() if k not in ignored}
+            != {k: v for k, v in post.items() if k not in ignored})
 
 
 # Host-only READS: gated to hosts (they show hidden data) but they change
@@ -5627,8 +5645,14 @@ async def _replay_entries(ctx: ReplyContext, mgr: MatchManager, mid: str,
                     continue
                 rctx = _ReplayCtx(ctx, str(e.get("ch") or ctx.channel_key),
                                   e.get("uid"), str(e.get("by") or ""))
-                with _channel_pointed_at(mgr, rctx.channel_key, mid):
-                    await registry.run(toks[0], toks[1:], rctx, mgr)
+                # Each entry was a top-level command with its own partial
+                # cache, whose template_data budget it spent alone.
+                cache_token = PARTIAL_CACHE.set({})
+                try:
+                    with _channel_pointed_at(mgr, rctx.channel_key, mid):
+                        await registry.run(toks[0], toks[1:], rctx, mgr)
+                finally:
+                    PARTIAL_CACHE.reset(cache_token)
                 if verbose:
                     out.append(f"#{n} `!{' '.join(toks)}`")
                     out += [f"  {r}" for r in rctx.replies]
@@ -11436,21 +11460,50 @@ async def foreach_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # Nested batches / foreach sweeps count toward macro_recursion_limit
     # with macro runs: an alias expanding to a batch holding itself
     # recursed until Python's stack overflowed.
+    return await _run_container(ctx, args, mgr, "foreach", _foreach_cmd)
+
+
+async def _run_container(ctx: ReplyContext, args: List[str],
+                         mgr: MatchManager, label: str, inner) -> Any:
+    """Run a `!batch` / `!foreach` with its lines gated (_GATE_LINES) and
+    its nesting bounded: depth by macro_recursion_limit, and the nested
+    runs of one top-level container together by macro_step_limit (one
+    step per nested run), since a sweep that runs itself per unit fans
+    out (two units, twenty levels: a million runs). Once either limit is
+    hit, the other nested runs of that top-level container stop quietly."""
     depth = getattr(mgr, "_macro_depth", 0)
     mid = mgr.active_by_channel.get(ctx.channel_key)
     m = mgr.matches.get(mid) if mid is not None else None
     limit = int(m.rules.get("macro_recursion_limit", 20)) if m else 20
+    budget = getattr(mgr, "_nest_budget", None)
+    if budget is not None and budget[1]:
+        return None             # out of steps, already reported
     if depth >= limit:
+        if budget is not None:
+            budget[1] = True    # the other branches stop quietly too
         return await ctx.send(
-            f"❌ `!foreach`: nesting limit ({limit}) exceeded "
-            f"(macro_recursion_limit).")
+            f"❌ `!{label}`: nesting limit ({limit}) exceeded "
+            f"(macro_recursion_limit); the rest are skipped.")
+    owner = budget is None
+    if owner:
+        steps = int(m.rules.get("macro_step_limit", 10000)) if m else 10000
+        budget = mgr._nest_budget = [steps, False]
+    elif depth > 0:
+        budget[0] -= 1
+        if budget[0] < 0:
+            budget[1] = True
+            return await ctx.send(
+                f"❌ `!{label}`: nested batch / foreach runs exceeded "
+                f"macro_step_limit; the rest are skipped.")
     mgr._macro_depth = depth + 1
     token = _GATE_LINES.set(True)
     try:
-        return await _foreach_cmd(ctx, args, mgr)
+        return await inner(ctx, args, mgr)
     finally:
         _GATE_LINES.reset(token)
         mgr._macro_depth = depth
+        if owner:
+            mgr._nest_budget = None
 
 
 async def _foreach_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -16821,21 +16874,7 @@ async def batch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # Nested batches / foreach sweeps count toward macro_recursion_limit
     # with macro runs: an alias expanding to a batch holding itself
     # recursed until Python's stack overflowed.
-    depth = getattr(mgr, "_macro_depth", 0)
-    mid = mgr.active_by_channel.get(ctx.channel_key)
-    m = mgr.matches.get(mid) if mid is not None else None
-    limit = int(m.rules.get("macro_recursion_limit", 20)) if m else 20
-    if depth >= limit:
-        return await ctx.send(
-            f"❌ `!batch`: nesting limit ({limit}) exceeded "
-            f"(macro_recursion_limit).")
-    mgr._macro_depth = depth + 1
-    token = _GATE_LINES.set(True)
-    try:
-        return await _batch_cmd(ctx, args, mgr)
-    finally:
-        _GATE_LINES.reset(token)
-        mgr._macro_depth = depth
+    return await _run_container(ctx, args, mgr, "batch", _batch_cmd)
 
 
 async def _batch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):

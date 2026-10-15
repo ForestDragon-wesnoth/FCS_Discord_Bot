@@ -40,6 +40,9 @@ JOURNAL_VERSION = 1
 # `!map use` choice: display state (a player panning took undo steps).
 UNDO_IGNORED = ("paused", "rules", "rng_seed", "rng_pos", "channel_views",
                 "channel_maps")
+# The journal records a `!map use` all the same: a later `map=view` or a
+# strict edit's channel map reads it, so a replay needs it.
+JOURNAL_IGNORED = tuple(k for k in UNDO_IGNORED if k != "channel_maps")
 
 # Segments kept: the newest and the one before it.
 KEPT_SEGMENTS = 2

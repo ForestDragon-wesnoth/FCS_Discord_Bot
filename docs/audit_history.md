@@ -2156,3 +2156,67 @@ overflow with a warning; `!store load` shows its var-name notes.
     never wore off; it ticks now, and an all-skipped table cycles rounds
     until a unit is free (`skip_all_round_limit`, stopping early when a
     round changes no status).
+
+## Pass 43
+
+Findings report from a separate read-only LLM pass (eleven sub-passes on
+`fb72cb8`: multi-map sweeps, journal / replay, rule ceilings, sandbox,
+round-trip and reload detectors, existence oracles, model-based undo,
+renderer parity, chaos, engine-var and stored-value sweeps, turn-order and
+movement-hook model checkers, an undo-step detector, a `!dry` leak detector,
+an approval differential). Every finding was reproduced against current
+code before fixing; scenarios 794-823 cover them. Verified after: 823/823,
+replay differential 867/867 journals, memory-equals-disk 868 checks.
+  - **Multiple maps (F1-F17, Z1, V1, V2):** unit-relative queries,
+    conditions, location actions, the roster, mounts / attach, resize and
+    delete in kill mode, rename's stored coordinates, zone sprite / legend
+    serialization, disguise and skip-line leaks.
+  - **Journal and replay (J1-J9):** replays refuse to overwrite library
+    templates, malformed bundles, `!system undo` only typed, RNG epochs (any
+    position reachable quickly), `!dry` restoring the RNG, journal growth
+    counted toward the storage limit (older segments dropped before
+    autosaves), reads skipping the before-serialization.
+  - **Systems, templates, sandbox, bounds (S1-S6, P1-P2, X1-X4):** a ceiling
+    rule's -1, var-name conflicts across a parent link, template_data
+    budget, form checks before transform / summon, engine `__` helpers
+    unreachable from formulas, bounded str / join / fmt / pow / stores,
+    secret random_seed, `$()` host-only covering `!ent` / `!foreach` /
+    queued requests, cross-match rollback of an action's `cmd()`, a shared
+    step budget for nested macro runs.
+  - **Turns, undo, rollbacks (T1, T2, T5, U1-U5, B1):** save files keep key
+    order (insertion_order ties and hook order survived only until a
+    restart); a second removal after the wrap keeps it; random_stable
+    hashes the RNG seed; kept riders only with a corpse; cameras and `!map
+    use` out of undo; `!alias` / `!table` / `!turn set` undo steps;
+    rollbacks rewind the undo history; a crashing strict-batch line undoes.
+  - **Gameplay (R1, R2, A1, M3, M4, N1-N3, K2, K3, C1):** a revived unit
+    rejoins the turn order; a failed revive keeps the corpse; a text ATB
+    charge; modifier op order; macro `if` errors stop the macro; teams,
+    glyphs, legends and decoy names as text; tile edits keep corpses; tall
+    snake segments placed by footprint; clamp bounds checked.
+  - **Access (A2, G1-G3):** an action's `cmd()` carries its caller's
+    identity (transfers into other users' matches); `!batch` / `!foreach`
+    lines gated as their caller.
+  - **Smaller (B2, D1-D4, I1, L1-L7):** alias recursion through batch /
+    foreach (depth AND a shared step budget for nested runs: a self-calling
+    foreach over two units otherwise makes a million runs inside the depth
+    limit), the Discord pan / resume locks and long prompts, smart quotes,
+    match ids by case, ❌ on usage refusals, completion leaks under a team
+    view, RNG helpers' arity, held commands persisted, unreachable unit ids
+    refused, `!dry` during a pause, auras re-stamped on a footprint write,
+    `!log` validation, `!ent set_vars` death order, Discord user names.
+  - Found while verifying: the U2 change stopped journaling `!map use`, so
+    a replayed `map=view` resolved to another map (the journal now keeps
+    channel_maps in its change test); a replay shared one partial cache
+    (and template_data budget) across its entries; an action whose `cmd()`
+    transferred a unit to another match was journaled as a command a replay
+    can't redo (now its state, `_JOURNAL_AS_STATE`).
+  - Did not reproduce: template names differing by case (I1: already
+    lower-cased); D3 is covered by the pan lock and the camera change.
+  - Left as questions for the user: T3 (immediate initiative policy
+    mid-round), T4 (`!turn set` semantics under ATB), groups on revive,
+    a revive_blocked mode, K1 (snake trailing onto occupied cells), S6,
+    X3 (undo of transfers across matches), X4 (a general per-command call
+    budget), I2 (saves overwrite policy), compact journal state entries
+    (J2 follow-up), watcher chains firing after read commands (L7), and
+    whether `true` / `false` should parse in formulas (M4).

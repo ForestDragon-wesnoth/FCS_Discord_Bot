@@ -24711,3 +24711,543 @@ failed action rolls them back with its own: the unit doesn't end up in
 both matches. A macro that runs itself twice per level shares the outermost
 run's macro_step_limit across every nested run (it used to start a fresh
 budget per run, 2^depth runs), and the limit is reported once.
+
+SCENARIO 813 — Turn order keeps creation order through a restart; two deaths after the last turn; random_stable ties replay
+---------------------------------------------------------------------------------------------------------------------------
+
+!match new mto8 Ties 8 8
+!match use mto8
+!system set default turnorder_tiebreaker insertion_order
+!ent add zara Zara 30 1 1 10
+!ent add alice Alice 30 2 2 10
+!ent add bob Bob 30 3 3 10
+!turn next
+?? It is now **Zara**'s turn
+!turn next
+?? It is now **Alice**'s turn
+!as restart
+!turn next
+?? It is now **Bob**'s turn
+!turn next
+?? — Round 2 —
+?? It is now **Zara**'s turn
+!match new t2 Wrap 8 8
+!match use t2
+!ent add a A 10 1 1 5
+!ent add b B 10 2 2 4
+!ent add c C 10 3 3 3
+!ent add d D 10 4 4 2
+!turn next
+!turn next
+!turn next
+!turn next
+?? It is now **D**'s turn
+!ent kill d
+!ent kill a
+!turn next
+?? — Round 2 —
+?? It is now **B**'s turn
+!turn next
+?? It is now **C**'s turn
+!system set default turnorder_tiebreaker random_stable
+!match new jr Stable 8 8
+!match use jr
+!ent add a A 10 1 1 5
+!ent add b B 10 2 2 5
+!ent add c C 10 3 3 5
+!ent add d D 10 4 4 5
+!turn next
+!match journal export j813.json
+!match replay j813.json as=jr2
+?? The state matched the recording after every command
+
+Expected: Save files keep key order, so after `!as restart` the units
+come back in creation order: under `insertion_order` Bob takes the third
+turn of round 1 and Zara opens round 2 (Zara used to act twice in round
+1). Killing the last unit to act (D) and then the first in the order (A)
+keeps the wrap, so the next turn starts round 2 with B (it used to give B
+and C a second round-1 turn). `random_stable` ties hash the match's RNG
+seed, which a replay restores, so a replay under another id (`as=jr2`)
+plays the same order and matches the recording.
+
+SCENARIO 814 — A removed vehicle releases kept riders; a revive that can't place the unit keeps its corpse; a revived unit rejoins the turn order
+--------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new mb MB 9 9
+!match use mb
+!ent add a A 20 2 2 5
+!ent set_var a slots.seat.capacity 2
+!ent add r R 10 5 5 4
+!mount r a seat
+!system set default mount_on_vehicle_death keep
+!ent remove a
+!assert "not is_mounted('r')"
+!ent add a Cart 20 6 6 5
+!assert "riders('a') == []"
+!match new rv Revive 8 8
+!match use rv
+!ent add cart Cart 20 2 2 5
+!ent set_var cart slots.seat.capacity 1
+!ent add r Rider 10 4 4 3
+!ent add c C 10 6 6 1
+!mount r cart seat
+!ent kill r
+!ent revive r
+?? ❌ Cell (2,2) already occupied
+!assert "has_corpse('r')"
+!ent tp cart 4 4
+!turn next
+?? It is now **Cart**'s turn
+!ent revive r
+?? Revived corpse `r`
+!turn
+?? `r` **Rider**
+!turn next
+?? It is now **Rider**'s turn
+!turn next
+?? It is now **C**'s turn
+
+Expected: HARNESS-ALLOWS-ERRORS. Under `mount_on_vehicle_death keep` a
+vehicle's riders stay linked only when it leaves a corpse; a plain
+removal ejects them, so a later unit taking the id `a` doesn't inherit
+`r`. A revive whose cell is taken (the cart stands on the rider's corpse) is
+refused and leaves the corpse in place: the rider killed in the saddle
+lies under the cart, and its corpse used to be deleted. Once the cart
+moves the rider revives and rejoins the turn order at once, taking its
+turn after the cart's (a revived unit used to stay out of the order until
+something rebuilt it).
+
+SCENARIO 815 — Cameras aren't undo steps; !alias, !table and !turn set are
+--------------------------------------------------------------------------
+
+!match new cu Cams 40 40
+!match use cu
+!ent add u U 10 1 1 1
+!ent add w W 10 3 3 2
+!ent hp u -3
+!as player alice
+!map pan right 1
+!map pan left 1
+!map center 5 5
+!as host
+!undo command
+?? Reverted past `!ent hp u -3`
+!assert "entity[u].hp == 10"
+!alias def dmg "ent hp u -1"
+!table def loot gold:3,gem:1
+!ent hp u -1
+!undo command
+!alias list
+?? dmg
+!table list
+?? loot
+!undo command
+!table list
+?! loot
+!alias list
+?? dmg
+!undo command
+!alias list
+?! dmg
+!turn
+?? ➡️ `w`
+!turn set u
+!undo command
+?? Reverted past `!turn set u`
+!turn
+?? ➡️ `w`
+
+Expected: A player's `!map pan` / `!map center` move only the channel's
+camera, which is display state: no undo step, so `!undo command` undoes the
+host's `!ent hp u -3` behind them (pans used to fill the undo window and an
+undo reverted a pan). `!alias`, `!table` and `!turn set` take an undo step
+each, so undoing the hp change leaves the alias and table, and each later
+undo removes one of them in turn; `!turn set u` is undone on its own.
+
+SCENARIO 816 — Rollbacks drop the autosaves of the turns they undo; a strict batch brings a deleted match back whole
+--------------------------------------------------------------------------------------------------------------------
+
+!match new ua A 6 6
+!match use ua
+!ent add a A 10 1 1 5
+!ent add b B 10 2 2 4
+!ent add c C 10 3 3 3
+!turn next
+!turn next
+?? It is now **B**'s turn
+!dry turn next
+?? It is now **C**'s turn
+!dry turn next
+!history list turns
+?! c's turn
+!ent hp a -2
+!undo turn
+?? b's turn
+!assert "entity[a].hp == 10"
+!turn
+?? ➡️ `b`
+!match new gone Gone 5 5
+!match use gone
+!ent add g G 10 1 1 1
+!ent hp g -2
+!history save keep
+!match use ua
+!batch strict match delete gone ; ent hp nobody -1
+?? Deleted `gone`
+?? 1 line(s) before it were undone
+!match use gone
+!history list manual
+?? keep
+!undo command
+!assert "entity[g].hp == 10"
+
+Expected: HARNESS-ALLOWS-ERRORS. A rolled-back `!turn next` (here two
+`!dry` previews) leaves no turn autosave behind, so `!undo turn` after a
+later command goes back to the start of b's turn, the turn the match is
+really in (it used to jump forward to c's turn and undo the damage at the
+same time). A strict batch that deleted a match and then failed brings
+the match back with its undo history and manual saves.
+
+SCENARIO 817 — A text ATB charge, unlisted modifier ops, a macro if that can't be read, a clamp bound that isn't a path
+------------------------------------------------------------------------------------------------------------------------
+
+!match new at ATB 6 6
+!match use at
+!system set default atb_enabled true
+!ent add u U 10 1 1 5
+!ent add q Q 10 2 2 3
+!ent set_var q atb_charge full
+!turn next
+?? atb_charge
+?? It is now
+!system set default atb_enabled false
+!system set default modifier_op_priority "add:0,inc%:0,more%:0,set:0,min:0,max:0"
+!system set default modifier_op_order "add"
+!ent set_var u modifiers.m1.stat atk
+!ent set_var u modifiers.m1.op set
+!ent set_var u modifiers.m1.value 50
+!ent set_var u modifiers.m2.stat atk
+!ent set_var u modifiers.m2.op max
+!ent set_var u modifiers.m2.value 20
+!ent set_var u modifiers.m3.stat atk
+!ent set_var u modifiers.m3.op more%
+!ent set_var u modifiers.m3.value 100
+!assert "apply_mods('u', 'atk', 10) == 40"
+!macro set heal "if true\nent hp u +5\nelse\nent hp u -5\nend"
+!macro run heal
+?? bad `if` condition
+!assert "entity[u].hp == 10"
+!clamp add u hp max=max_hp+1
+?? ❌ A clamp bound is a number or a var path
+!clamp add u hp max=stats.cap
+!ent hp u 50
+!assert "entity[u].hp == 50"
+
+Expected: HARNESS-ALLOWS-ERRORS. A unit whose ATB charge var holds text
+reads as charge 0 with a warning naming the var, and the turn passes (every
+`!turn next` used to crash). Ops missing from modifier_op_order fold in
+the order their records come (set 50, max 20, more% 100 → 40) in every
+run (the order used to follow Python's hash seed: 20, 40 or 50). A macro
+`if` whose condition can't be read (`true` is spelled `True`) stops the
+macro instead of running the else branch, so u keeps its hp. A clamp
+bound that can't be a var path is refused; a path the unit lacks
+(`stats.cap`) is accepted with a ⚠️ and means no bound while it is
+missing: the unit's own hp clamp replaces the default one, so hp 50
+holds.
+
+SCENARIO 818 — An action's cmd() runs as its caller; batch and foreach lines pass the gate; an alias can't recurse through them
+-------------------------------------------------------------------------------------------------------------------------------
+
+!match new bobs Bobs 6 6
+!match use bobs
+!ent add hero Hero 30 1 1 5
+!match new al Al 8 8
+!match use al
+!host add alice
+!as player alice
+!ent add w Imp 10 4 4 9
+!ent transfer w bobs
+?? ❌ Only a host of `bobs`
+!ent set_var w actions.go.body "cmd('ent transfer w bobs 6 6')"
+!action w go
+?? ❌ Only a host of `bobs`
+!list
+?? Imp (w)
+!as host
+!match use bobs
+!list
+?! Imp
+!ent add spy Spy 10 5 5 4
+!host access set batch all user=alice
+!host access set foreach all user=alice
+!as player alice
+!batch ent dump spy
+?? ❌ `!ent` can't run inside a batch or foreach for you
+!batch host add alice
+?? ❌ `!host` can't run inside a batch or foreach for you
+!foreach hp>0 ; ent hp $id 1
+?? can't run inside a batch or foreach
+!as host
+!assert "entity[hero].hp == 30 and entity[spy].hp == 10"
+!host list
+?! alice
+!alias def x "batch ent hp hero -1 ; x"
+!x
+?? macro_recursion_limit
+!alias def y "foreach hp>0 ; y"
+!y
+?? macro_recursion_limit); the rest are skipped
+!system set default macro_step_limit 50
+!system set default macro_recursion_limit 100
+!y
+?? exceeded macro_step_limit
+
+Expected: HARNESS-ALLOWS-ERRORS. An action body's `cmd()` lines run with
+the identity of the user who ran the action, so alice, a co-host of `al`
+only, can no more move her imp into `bobs` through an action than by
+typing `!ent transfer`
+(the action used to pass the target-host check with no identity at all).
+An access override that opens `!batch` / `!foreach` to alice opens only
+the container: each line still passes the per-match gate as alice, so
+`!ent dump`, `!host add` and a state change she'd need approval for are
+refused (she used to dump hidden units and appoint herself co-host). An
+alias expanding to a batch or foreach that contains itself stops at
+macro_recursion_limit (it used to overflow Python's stack), and the
+nested runs of one top-level command share macro_step_limit, one step
+per nested run: a foreach that reruns itself for each of its two units
+would otherwise make a million runs within the depth limit. Either limit
+is reported once and the remaining nested runs stop quietly.
+
+SCENARIO 819 — Teams and display values typed as numbers read as text
+---------------------------------------------------------------------
+
+!match new nt Numbers 6 6
+!match use nt
+!ent add p P 10 2 2 5
+!ent set_vars p team=1 fog_vision_radius=1
+!ent add q Q 10 4 4 5
+!eval "entity[q].team = '1'"
+!team passive add 1 tp on_turn_start "entity[self].k = 1"
+!turn next
+!assert "var_has('p', 'k') and is_same_team('p', 'q') and sorted(team_members('1')) == ['p', 'q']"
+!find team=1 ids
+?? p
+?? q
+!system set default turnorder_team_grouping highest_per_team
+!ent add s S 10 5 5 5
+!turn
+?? `s` **S**
+!ent add u U 10 1 1 1
+!ent set_var u glyph 7
+!tile set 3 2 glyph 4
+!ent add spy Spy 10 5 3 1
+!ent set_var spy team blue
+!ent set_var spy disguise.name 9
+!ent set_var spy disguise.glyph 3
+!ent set_var u legend 12
+!map legend=on
+?? 7 — 12
+!as view red
+!list
+?? 9 (spy)
+?! Spy (spy)
+!map legend=on
+?? 3 — 9
+
+Expected: A team stored as a number (`team=1` typed) is the same team as
+the text "1" a formula writes: team passives fire for it, is_same_team
+and team_members agree, `!find team=1` lists both, and team grouping in
+the turn order works (it crashed every rebuild, so `s` never joined the
+order). Glyphs, legend labels and disguise names and glyphs typed as
+numbers are read as text: `u` draws as 7 with its legend label 12, and
+the red view sees the spy under its decoy name 9 with glyph 3 (the
+real name used to show).
+
+SCENARIO 820 — Painting tiles keeps the corpses on them; a re-laid snake fits its tall segments on the grid
+-----------------------------------------------------------------------------------------------------------
+
+!match new tc Tiles 8 8
+!match use tc
+!tile def new wall
+!tile def data wall block true
+!ent add g1 G1 10 2 2 1
+!ent add g2 G2 10 3 3 1
+!ent add g3 G3 10 4 4 1
+!ent add g4 G4 10 5 5 1
+!ent add g5 G5 10 6 6 1
+!ent kill g1
+!ent kill g2
+!ent kill g3
+!ent kill g4
+!ent kill g5
+!tile place wall 2 2
+!tile place_area wall 3 3 3 3
+!tile fill_pattern 4 4 "#=wall" "#"
+!tile del 5 5
+!eval "tile_clear(6, 6)"
+!assert "len(all_corpses()) == 5"
+!tile set 2 2 corpses.fake 1
+?? ❌
+!ent revive g1
+?? Revived corpse `g1`
+!match new sn Snake 8 5
+!match use sn
+!ent add worm Worm 10 3 2 2
+!part segment worm wa WA 5 5
+!ent set_var wa footprint_h 2
+!ent face worm up
+!ent tp worm 5 4
+!assert "footprint_cells('wa') == [[6, 4], [6, 5]]"
+
+Expected: HARNESS-ALLOWS-ERRORS. Corpses lie in tile data under the
+reserved `corpses` key, and every tile edit keeps them: `!tile place`,
+`place_area`, `fill_pattern`, `del` and `tile_clear()` repaint or clear
+the terrain and leave the five bodies where they fell (they used to
+delete them, so `!ent revive g1` found no corpse). No tile write can set
+`corpses` itself. A snake teleported to row 4 of a 5-row map re-lays its
+1x2 segment by its whole footprint: straight behind the head it would
+cover rows 5 and 6, so it bends to (6,4)-(6,5) (it used to be placed by
+its anchor cell alone, half off the map).
+
+SCENARIO 821 — Smart quotes, match ids by case, refusals marked ❌, RNG helpers' arity, unreachable unit ids
+-----------------------------------------------------------------------------------------------------------
+
+!match new sq Quotes 6 6
+!match use sq
+!ent add u U 10 1 1 1
+!eval “1+1”
+?? = `2`
+!ent set_var u note “hello world”
+?? vars.note = 'hello world'
+!ent add v “Big Orc” 10 2 2 1
+?? Added `Big Orc`
+!match new SQ Other 6 6
+?? ❌
+!map new cellar 6 6
+!map background stone map=cellar zqxstray
+?? ❌ Usage
+!dist 1 1 3 3 map=cellar zqxstray
+?? ❌ Usage
+!eval "pick([[1, 1], [2, 2]], 'ghost')"
+?? ❌
+?! object has no attribute
+!eval "roll('1d6', 'x')"
+?! object has no attribute
+!ent add target T 10 3 3 1 map=main
+?? ❌ Entity id 'target' names a formula binding or keyword
+!ent add None N 10 3 3 1 map=main
+?? names a formula binding or keyword
+!ent add 123 N 10 3 3 1 map=main
+!assert "entity[123].hp == 10"
+!template import rider {"name": "R", "vars": {"hp": 3}}
+?? ❌ `rider` is a reserved name
+
+Expected: HARNESS-ALLOWS-ERRORS. Curly quotes (a phone keyboard's
+default) quote arguments like straight ones: `!eval “1+1”` is 2, a quoted
+value with a space is one argument, and a quoted name with a space names
+the unit. A match id that differs from an existing one only by case is
+refused (both would be one file on Windows and macOS). The `!map
+background` and `!dist` usage refusals carry ❌ (they replied with a bare
+"Usage:" before, which a fan-out showed as a success). `pick` and `roll`
+refuse an extra argument by arity instead of a raw Python error. Unit ids
+that `entity[...]` can't reach are refused at creation: hook and action
+bindings (`target`) and keywords (`None`); a digits-only id works and
+`entity[123]` reads it. A template can't take such a name either.
+
+SCENARIO 822 — Held commands survive a restart; !dry passes a pause; auras follow a footprint write; !log filters; !ent set_vars and deaths
+-------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new ph Pause 8 8
+!match use ph
+!ent add u U 10 1 1 1
+!system set default pause_affects_hosts true
+!match pause break
+!ent hp u -3
+?? is held
+!dry ent hp u 2
+?? Dry run of `!ent hp u 2`
+!as restart
+!match resume
+?? `!ent hp u -3`
+!assert "entity[u].hp == 7"
+!ent add b B 5 4 4 2
+!zone add halo 4 4
+!zone anchor halo b 1
+!assert "len(zone_cells('halo')) == 9"
+!ent set_vars b footprint_w=3 footprint_h=3
+!assert "len(zone_cells('halo')) == 25"
+!ent delete_var b footprint_w
+!assert "len(zone_cells('halo')) == 15"
+!ent add w W 5 7 7 1
+!ent set_vars w hp=0 note=gone
+?? `w` vars: hp = 0, note = 'gone'
+?? died
+!assert "has_corpse('w') and corpse_var('w', 'note') == 'gone'"
+!gpassive add killer on_var_written "if changed_key == 'f':\n  kill('u')"
+!ent set_vars u f=3 g=1
+?? Nothing was set
+?! died
+!assert "entity[u].hp == 7 and not var_has('u', 'f')"
+!log 0
+?? ❌
+!log -5
+?? ❌
+!log type=nonsense
+?? ❌ Unknown event type(s) `nonsense`
+!log type=death
+?? W (`w`) died
+
+Expected: HARNESS-ALLOWS-ERRORS. Commands held by a pause are saved with
+the match, so after a restart `!match resume` still runs the held `!ent
+hp u -3` (it used to drop it silently). A host's `!dry` runs during the
+pause, since it keeps nothing. Writing or deleting a footprint var
+re-stamps the auras anchored to the unit (9 → 25 → 15 cells) at once
+instead of at its next move. `!ent set_vars` checks the unit's death
+after all its vars are written, so `hp=0 note=gone` sets both and the
+corpse keeps the note; when a triggered effect removes the unit midway,
+the rollback also drops the death line it printed. `!log` refuses a count
+below 1 and names an unknown type.
+
+SCENARIO 823 — Tab completion under a team view leaves out hidden zones, team data, match vars and groups; face toward a cell
+-----------------------------------------------------------------------------------------------------------------------------
+
+!match new cv Completion 8 8
+!match use cv
+!ent add hero Hero 10 1 1 5
+!ent set_var hero team red
+!ent add spy Spy 10 7 7 4
+!ent set_var spy team blue
+!zone add zqxpit 5 5
+!zone add zqxopen 3 3
+!system set default zone_visibility_condition "zone_name != 'zqxpit' or pov_team == 'blue'"
+!team set blue zqxteamkey 1
+!match var set zqxmatchvar 1
+!ent group new zqxgroup
+!match bind pov=red
+?tab "!zone info zqx"
+?? zqxopen
+?! zqxpit
+?tab "!team get blue "
+?! zqxteamkey
+?tab "!match var get "
+?! zqxmatchvar
+?tab "!ent group info "
+?! zqxgroup
+!match unbind
+!match use cv
+?tab "!zone info zqx"
+?? zqxpit
+?tab "!team get blue "
+?? zqxteamkey
+!ent face hero up
+!ent face hero toward 5 5
+?? now faces down, toward (5, 5)
+
+Expected: Under the red view, Tab offers only what that view's queries
+show: the zone hidden by zone_visibility_condition, blue's team data
+(team_data_visibility own), match var names and group names (host reads
+while the view is filtered) are left out; they used to complete. With the
+binding gone the omniscient view completes them again. `!ent face <id>
+toward <x> <y>` turns the unit toward a cell (down, with diagonal
+facing off; the usage string read the
+cell form as one word, so the stray-word check refused it).
