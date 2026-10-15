@@ -8542,7 +8542,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if dest_id not in m.entities:
             raise NotFound(f"Destination entity '{dest_id}' not found.")
         dest_path = args[3]
-        template = m.entity_template_dict(m.entities[src_id])
+        template = m.capture_statblock(m.entities[src_id])
         m.entities[dest_id].write_var(dest_path, template)
         return await ctx.send(
             f"Stored a template of `{src_id}` into `{dest_id}` "
@@ -8579,7 +8579,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         else:
             other = _resolve_eid(m, ref)
             if other in m.entities:
-                template = m.entity_template_dict(m.entities[other])
+                template = m.capture_statblock(m.entities[other])
             else:
                 return await ctx.send(
                     f"❌ No template found: `{ref}` is neither a dict var on "

@@ -1010,7 +1010,13 @@ hardcodes**.
   store_entity_into_var` make such a dict (identity and links stripped:
   id, x, y, `part_of`, `mounted_on`, `mount_slot`; a summon also drops
   `__follows`, so a snapshot of a rider or a segment summons a free unit);
-  `remove_entity` despawns. Server templates (§7.17) build on the same
+  `remove_entity` despawns. A snapshot (`capture_statblock`, also the
+  transform stash and a transform into a live unit's form) holds the
+  whole part subtree, segments included, at offsets from the anchor, so
+  a summon or transform rebuilds the body around the new unit
+  (`_apply_statblock_parts`; a part id under the unit's follows the new
+  unit's, another is kept or minted anew, 830). Server templates (§7.17)
+  build on the same
   path.
 - **Occupancy:** one unit per cell, except units with the `__cell_stackable`
   var; `cell_entity` names the blocker, `entities_at` everyone covering a cell.
@@ -1050,9 +1056,12 @@ hardcodes**.
   was chosen because `fire_hook` runs globals once PER TARGET unit
   (437-439, 568).
 - **Watchers** (`!watch`, `Match.watchers`): an expression condition +
-  program effect, EDGE-triggered (false → true), polled once after each
-  top-level command settles; `once` removes after firing; `last`
-  serialized; a malformed condition reads as not met (427-428).
+  program effect, EDGE-triggered (false → true), polled after each
+  top-level command settles and re-checked until a pass fires nothing
+  new (a chain settles in the command that started it and shares its
+  undo step), at most `watcher_chain_limit` passes (a ⚠️ when it stops a
+  loop); `once` removes after firing; `last` serialized; a malformed
+  condition reads as not met (427-428, 826).
 - **Output:** every formula-driven change hands its log to
   `Match.surface_log` (action buffer, else the command's `FORMULA_LOG_SINK`),
   shown at the end of the command in order (651).
@@ -1070,8 +1079,12 @@ hardcodes**.
   immediate / deferred). A write to the tiebreak var and a changed
   `turnorder_*` rule (`apply_system_rules`) re-sort it like an initiative
   write (770). Before the first `!turn next` the pointer sits at
-  the top of the order (a pre-start `!turn set` is lost if units are added
-  after it — set the opener last, user call).
+  the top of the order.
+- **`!turn set <id>`** (`Match.set_turn`) is a turn change: the acting
+  unit's turn ends (turn_end hooks, ticks), <id>'s starts (turn_start,
+  schedules, the turn autosave); under ATB <id>'s bar resets as if it had
+  filled; before the first turn it starts round 1 at <id>. `!turn set
+  <id> quiet` only moves the pointer (53, 827).
 - **`!turn next`** (`Match.next_turn`): turn-end hooks / ticks → advance (round
   wrap fires round hooks, ticks, `round_start_message_format` line) → skip
   units whose statuses carry `skips_turn` (each skip fires on_turn_skipped
@@ -1497,6 +1510,9 @@ hardcodes**.
   re-lays the body (`_resettle_snake`: straight behind the head where the
   cells are free and on the map, else bending toward the nearest free
   cells, a ⚠️ for a segment with nowhere to go); `segment_self_collision`.
+  A walk checks the whole body's final cells: a segment that would end on
+  another unit's cell refuses the move (single and group moves,
+  `_check_snake_trail`; the head may still pass over units, 829).
   Segments go on the head only (a segment of a segment would branch).
   `segment_death_mode` (none default / solid / cascade / split, with
   `segment_split_head_template`) when a segment is destroyed;
@@ -1542,8 +1558,11 @@ hardcodes**.
   (`corpses.<id>`, mount links stripped; `corpses` is a reserved tile key
   no tile write sets, and every tile edit keeps it: place, fill, del,
   clear, `tile_clear`); `corpse_id_uniqueness`. A revive puts the corpse
-  back when the unit can't be placed and rebuilds the turn order once the
-  unit is alive; the corpse records the groups of the body and its parts
+  back when the unit can't be placed (`revive_blocked_mode`: refuse,
+  default, or nearest = the free cell nearest the body that fits all of
+  it, searched like a dismount, located parts keeping their offsets, the
+  reply naming the cell, 828) and rebuilds the turn order once the unit
+  is alive; the corpse records the groups of the body and its parts
   (`groups`) and a revive rejoins those that still exist (814, 820, 824). `kill` /
   `revive` run `default_kill_function_effects` /
   `default_revive_function_effects`. Prims: has_corpse, corpse_at,
@@ -2076,24 +2095,6 @@ rejected already. Update this section in the PR that resolves an item.
   on the nearest free cell with a ⚠️. Whether spawns should recreate the
   overlap is open.
 
-- **Pass 43, decided by the user (being built on the branch after #134):**
-  - T4: `!turn set <id>` is a real turn change (the acting unit's turn
-    ends, <id>'s starts, with hooks, ticks, schedules, the turn autosave;
-    under ATB the bar resets as if it filled; before the first turn it
-    starts round 1 at <id>); `!turn set <id> quiet` keeps the old
-    pointer-only move (`Match.set_turn`).
-  - Blocked revive: a `revive_blocked_mode` rule, `refuse` (default) /
-    `nearest` (the nearest free cell the whole body fits, searched like
-    dismount), the reply saying which.
-  - K1: a move checks the whole snake body's final cells; a segment that
-    would end on an occupied cell refuses the move, like a unit's own
-    final cell (finer pass-through rules may come later).
-  - S6: `entity_snapshot` / `!ent store_entity_into_var` include the part
-    subtree and segments, so summons rebuild them, and a transform into a
-    live unit's form brings its parts.
-  - L7: watchers re-checked until a pass fires nothing new, capped by a
-    `watcher_chain_limit` rule (ceiling), so a chain settles in the
-    command that started it and shares its undo step.
 - **Pass 43, deferred by the user ("decide later"):** T3 (a mid-round
   initiative change under `immediate` can cost a unit its turn or give it
   a second; options: remember who acted this round, keep as is, or make

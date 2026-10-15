@@ -6147,7 +6147,7 @@ class FormulaEngine:
             var_set / tile_set to store it, then summon / summon_from
             to instantiate copies."""
             _, e = _resolve_entity(eid_t, "entity_snapshot")
-            return match.entity_template_dict(e)
+            return match.capture_statblock(e)
 
         def _summon(template: Any, x: Any, y: Any, id_prefix: Any = None) -> str:
             """summon(template, x, y, id_prefix=None): instantiate a
