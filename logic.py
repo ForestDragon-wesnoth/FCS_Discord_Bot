@@ -3492,7 +3492,7 @@ def unreachable_id(eid: Any) -> bool:
         from formula import HOOK_CONTEXT_NAMES, _ACTION_BINDING_NAMES
         _UNREACHABLE_IDS = frozenset(
             set(HOOK_CONTEXT_NAMES) | set(_ACTION_BINDING_NAMES)
-            | set(keyword.kwlist) | {"entity"})
+            | set(keyword.kwlist) | {"entity", "true", "false", "none"})
     return str(eid) in _UNREACHABLE_IDS
 
 # Reserved var PATHS: entity FIELDS that formulas read as if they were vars
@@ -4830,7 +4830,7 @@ def check_formula_function(name: Any, params: List[Any]) -> None:
     # hook binding, an action built-in), and a `__` name would replace one
     # of the engine's own helpers (`__read`, `__safe_add`) in every formula.
     if (name.startswith("__") or name == "entity" or keyword.iskeyword(name)
-            or name in ("True", "False", "None")
+            or name in ("True", "False", "None", "true", "false", "none")
             or name in _ENTITY_TOKEN_NAMES or name in HOOK_CONTEXT_NAMES
             or name in _FORMULA_RESERVED_NAMES):
         raise VTTError(
@@ -4854,7 +4854,8 @@ def check_formula_function(name: Any, params: List[Any]) -> None:
         # names are transformer-injected internals; a parameter
         # using either would either shadow the accessor or never be
         # reachable. Reject both up front.
-        if p == "entity" or p.startswith("__"):
+        if p == "entity" or p.startswith("__") or p in (
+                "true", "false", "none"):
             raise VTTError(
                 f"parameter name '{p}' is reserved; pick a different "
                 f"name."

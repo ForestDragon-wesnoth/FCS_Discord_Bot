@@ -574,7 +574,11 @@ formula does. A local or loop variable named with a leading `__` is
 refused (`_check_binding_name`): binding `__builtins__` or `__read` would
 replace the engine's. Any formula naming the engine's own `__` helpers
 (`__read`, `__write`, ...) is refused at compile (`_refuse_engine_names`,
-every parse path), and a `!func` can't take such a name (809).
+every parse path), and a `!func` can't take such a name (809). The same
+pass rewrites lowercase `true` / `false` / `none` to the constants
+(`LOWERCASE_CONSTANTS`, as commands and rules spell them), so those three
+can't name a local, loop variable, lambda parameter, `!func`, parameter
+or unit (825).
 
 **Two modes.** EXPRESSION formulas (conditions: block / opaque / visibility /
 alive / death conditions, watcher conditions, slot conditions, modifier
@@ -2078,7 +2082,7 @@ rejected already. Update this section in the PR that resolves an item.
   out body parts (S6); compact journal `state`
   entries (J2 follow-up); watchers chained through another watcher fire
   after the next command of any kind, read-only ones included, with no
-  undo step of their own (L7); `true` / `false` in formulas (M4).
+  undo step of their own (L7).
 - **Large match state, per-command cost** (user: discuss later): after a
   whole-map tile fill on 500x500 every command costs ~3.5 s (three full
   serializations per command; numbers under "Undo history disk growth"

@@ -24933,7 +24933,7 @@ SCENARIO 817 — A text ATB charge, unlisted modifier ops, a macro if that can't
 !ent set_var u modifiers.m3.op more%
 !ent set_var u modifiers.m3.value 100
 !assert "apply_mods('u', 'atk', 10) == 40"
-!macro set heal "if true\nent hp u +5\nelse\nent hp u -5\nend"
+!macro set heal "if healthy\nent hp u +5\nelse\nent hp u -5\nend"
 !macro run heal
 ?? bad `if` condition
 !assert "entity[u].hp == 10"
@@ -24948,7 +24948,7 @@ reads as charge 0 with a warning naming the var, and the turn passes (every
 `!turn next` used to crash). Ops missing from modifier_op_order fold in
 the order their records come (set 50, max 20, more% 100 → 40) in every
 run (the order used to follow Python's hash seed: 20, 40 or 50). A macro
-`if` whose condition can't be read (`true` is spelled `True`) stops the
+`if` whose condition can't be read (`healthy` names nothing) stops the
 macro instead of running the else branch, so u keeps its hp. A clamp
 bound that can't be a var path is refused; a path the unit lacks
 (`stats.cap`) is accepted with a ⚠️ and means no bound while it is
@@ -25316,3 +25316,30 @@ changed. `!history export`, `!store save` and `!match journal export`
 refuse to replace an existing saves file unless `overwrite` is given. A
 revived unit rejoins the groups it belonged to when it died, if they still
 exist (`party` was deleted before `k` came back, so it joins nothing).
+
+SCENARIO 825 — Formulas read true / false / none as the constants
+-----------------------------------------------------------------
+
+!match new lc Lower 6 6
+!match use lc
+!ent add u U 10 1 1 1
+!eval "[true, false, none, true and not false]"
+?? = `[True, False, None, True]`
+!macro set heal "if true\nent hp u 5\nelse\nent hp u 1\nend"
+!macro run heal
+!assert "entity[u].hp == 5 and [none, false] == [None, False]"
+!ent set_var u flag true
+!assert "entity[u].flag == true"
+!eval "for none in range(2):\n  pass"
+?? ❌ `none` can't be a loop variable's name
+!eval "map_with([1], lambda false: false)"
+?? ❌ map_with: `false` can't be a lambda parameter name
+!ent add none N 10 2 2 1
+?? ❌ Entity id 'none' names a formula binding or keyword
+
+Expected: HARNESS-ALLOWS-ERRORS. Formulas read lowercase `true`, `false`
+and `none` as True, False and None, as commands, rules and `!find` write
+them, so a macro `if true` runs its first branch and a var set with `!ent
+set_var u flag true` compares equal to `true`. The three words are
+reserved: they can't name a loop variable, a local, a lambda parameter, a
+`!func` or its parameters, or a unit.

@@ -3325,6 +3325,20 @@ def _collect_action_locals(tree: ast.AST) -> "frozenset[str]":
     return frozenset(locals_set)
 
 
+# Lowercase spellings of the constants, as commands, rules and `!find` write
+# them: a formula reads `true` / `false` / `none` as True / False / None,
+# so the three can't name a local, a loop variable or a unit.
+LOWERCASE_CONSTANTS = {"true": True, "false": False, "none": None}
+
+
+class _LowercaseConstants(ast.NodeTransformer):
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        if node.id in LOWERCASE_CONSTANTS and isinstance(node.ctx, ast.Load):
+            return ast.copy_location(
+                ast.Constant(value=LOWERCASE_CONSTANTS[node.id]), node)
+        return node
+
+
 def _refuse_engine_names(tree: ast.AST) -> None:
     """Refuse a `__` name a formula's SOURCE reads. The entity-access
     transformer injects calls to the engine's own helpers (`__read`,
@@ -3338,6 +3352,9 @@ def _refuse_engine_names(tree: ast.AST) -> None:
             raise FormulaError(f"`{node.id}` isn't a name a formula can use "
                                f"(names starting with `__` are the "
                                f"engine's).")
+    # Every parse path passes here first, so the constants' lowercase
+    # spellings are rewritten here too (in place: the root is never a Name).
+    _LowercaseConstants().visit(tree)
 
 
 def _check_binding_name(name: str, what: str) -> None:
@@ -3347,6 +3364,9 @@ def _check_binding_name(name: str, what: str) -> None:
     if name.startswith("__"):
         raise FormulaError(f"`{name}` can't be {what}'s name (names starting "
                            f"with `__` are the engine's).")
+    if name in LOWERCASE_CONSTANTS:
+        raise FormulaError(f"`{name}` can't be {what}'s name: formulas read "
+                           f"it as {LOWERCASE_CONSTANTS[name]}.")
 
 
 class _EntityAccessTransformer(ast.NodeTransformer):
@@ -3843,6 +3863,7 @@ def _validate_tree(
                     f"parameter (`lambda u: ...`).")
             pname = a.args[0].arg
             if pname.startswith("__") or pname == "entity" \
+                    or pname in LOWERCASE_CONSTANTS \
                     or pname in _ALLOWED_FUNCS or pname in _MATCH_FUNC_NAMES:
                 raise FormulaError(f"{node.func.id}: `{pname}` can't be a "
                                    f"lambda parameter name.")
