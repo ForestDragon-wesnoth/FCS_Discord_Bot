@@ -376,7 +376,10 @@ back, load the schema with `ToolSearch` before calling
   swept, verified clean, measured. Read the relevant passes before auditing
   an area again.
 - **`docs/multi_map_design.md`**: the agreed design for multiple maps per
-  match and nested maps (not built yet).
+  match and nested maps (steps 1 and 2a built; §8).
+- **`docs/feature_ideas.md`**: the open, numbered feature-idea list the user
+  picks from by number (shipped / struck items listed at its top). Check it
+  before proposing a feature, and keep it current when one ships.
 
 ### The cross-cutting chokepoints (memorize these)
 
@@ -2073,16 +2076,30 @@ rejected already. Update this section in the PR that resolves an item.
   on the nearest free cell with a ⚠️. Whether spawns should recreate the
   overlap is open.
 
-- **Pass 43 questions** (asked after the audit-fix PR): a mid-round
+- **Pass 43, decided by the user (being built on the branch after #134):**
+  - T4: `!turn set <id>` is a real turn change (the acting unit's turn
+    ends, <id>'s starts, with hooks, ticks, schedules, the turn autosave;
+    under ATB the bar resets as if it filled; before the first turn it
+    starts round 1 at <id>); `!turn set <id> quiet` keeps the old
+    pointer-only move (`Match.set_turn`).
+  - Blocked revive: a `revive_blocked_mode` rule, `refuse` (default) /
+    `nearest` (the nearest free cell the whole body fits, searched like
+    dismount), the reply saying which.
+  - K1: a move checks the whole snake body's final cells; a segment that
+    would end on an occupied cell refuses the move, like a unit's own
+    final cell (finer pass-through rules may come later).
+  - S6: `entity_snapshot` / `!ent store_entity_into_var` include the part
+    subtree and segments, so summons rebuild them, and a transform into a
+    live unit's form brings its parts.
+  - L7: watchers re-checked until a pass fires nothing new, capped by a
+    `watcher_chain_limit` rule (ceiling), so a chain settles in the
+    command that started it and shares its undo step.
+- **Pass 43, deferred by the user ("decide later"):** T3 (a mid-round
   initiative change under `immediate` can cost a unit its turn or give it
-  a second (T3); `!turn set` moves the pointer without ending / starting
-  turns, so under ATB the unit acts twice (T4); a refuse / nearest choice
-  when a revive's cell is taken; a snake trailing onto cells of units its
-  head passed over (K1); snapshots and `!ent transform <id> <id>` leaving
-  out body parts (S6); compact journal `state`
-  entries (J2 follow-up); watchers chained through another watcher fire
-  after the next command of any kind, read-only ones included, with no
-  undo step of their own (L7).
+  a second; options: remember who acted this round, keep as is, or make
+  `deferred` the default) and the J2 follow-up (compact journal `state`
+  entries and one template library per segment; options: diffs now, leave
+  it, or fold into the large-match-state discussion).
 - **Large match state, per-command cost** (user: discuss later): after a
   whole-map tile fill on 500x500 every command costs ~3.5 s (three full
   serializations per command; numbers under "Undo history disk growth"
