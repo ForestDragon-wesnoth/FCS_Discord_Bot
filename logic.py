@@ -1440,6 +1440,18 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "single warning is logged). Mirrors var_hook_recursion_limit."
         ),
     },
+    "watcher_chain_limit": {
+        "default": 16,
+        "schema": {"type": "int", "min": 1, "max": 256, "ceiling": True},
+        "desc": (
+            "How many times watchers are re-checked after one command. A "
+            "watcher's effect can make another watcher's condition true; "
+            "the checks repeat until a pass fires nothing new, so a chain "
+            "settles inside the command that started it (and shares its "
+            "undo step). Past the limit the rest of the chain waits for "
+            "the next command, with a warning."
+        ),
+    },
     "macro_repeat_limit": {
         "default": 1000,
         "schema": {"type": "int", "min": 0, "max": 10000, "ceiling": True},
@@ -9524,14 +9536,31 @@ class Match:
 
     # ---------- condition-watchers (edge-triggered) ----------
     def fire_watchers(self) -> List[str]:
-        """Re-check every watcher; fire its effect on a false->true edge
-        (the condition newly becoming true). Single pass per call — all edges
-        are recorded BEFORE any effect runs, so one effect can't perturb
-        another watcher's reading this pass (a change it makes is caught on
-        the next call). A `once` watcher is removed after firing. A malformed
-        condition reads as not-met (fail-safe). Returns effect-error notes."""
+        """Re-check the watchers until a pass fires nothing new (at most
+        watcher_chain_limit passes), so a watcher made true by another's
+        effect fires in the same command. Returns effect-error notes."""
+        log: List[str] = []
+        limit = max(1, int(self.rules.get("watcher_chain_limit", 16)))
+        for _ in range(limit):
+            fired, notes = self._watcher_pass()
+            log += notes
+            if not fired:
+                return log
+        if self.watchers and self._watcher_pass(peek=True)[0]:
+            log.append(f"⚠ watchers still firing after {limit} passes "
+                       f"(watcher_chain_limit); the rest wait for the next "
+                       f"command.")
+        return log
+
+    def _watcher_pass(self, peek: bool = False) -> Tuple[List[str], List[str]]:
+        """One check of every watcher; fire its effect on a false->true edge
+        (the condition newly becoming true). All edges are recorded BEFORE
+        any effect runs, so one effect can't perturb another watcher's
+        reading this pass. A `once` watcher is removed after firing. A
+        malformed condition reads as not-met (fail-safe). `peek` only
+        reports which would fire. Returns (fired names, effect notes)."""
         if not self.watchers:
-            return []
+            return [], []
         from formula import FormulaEngine, EvalCtx, FormulaError
         this_id = self.current_entity_id()
         engine = FormulaEngine(self)
@@ -9545,9 +9574,12 @@ class Match:
                 except FormulaError:
                     now = False
             was = bool(w.get("last", False))
-            w["last"] = now
+            if not peek:
+                w["last"] = now
             if now and not was:
                 fired.append(name)
+        if peek:
+            return fired, []
         log: List[str] = []
         for name in fired:
             w = self.watchers.get(name)
@@ -9563,7 +9595,7 @@ class Match:
             self.log_event("watcher_fired", name=name)
             if w.get("once"):
                 self.watchers.pop(name, None)
-        return log
+        return fired, log
 
     # ---- match outcome / victory (100) -------------------------------
     # No built-in objective evaluator: a win CONDITION is composed by the
@@ -11877,6 +11909,44 @@ class Match:
         new_cur = self._start_current_turn(log)
         self._begin_turn()
         return (new_cur, log)
+
+    def set_turn(self, eid: str) -> List[str]:
+        """`!turn set <id>` as a real turn change: the acting unit's turn
+        ends (turn_end ticks, hooks), the turn goes to `eid` and starts
+        (under ATB its charge bar resets as if the bar had picked it), and
+        the turn clock and autosave advance as for `!turn next`. Before
+        the first turn it starts round 1 at `eid`. The GM picked the unit,
+        so skip statuses don't move the turn past it. Returns log lines."""
+        if eid not in self.turn_order:
+            raise NotFound(f"Entity '{eid}' not in turn order.")
+        atb = bool(self.rules.get("atb_enabled"))
+        if not atb and not self.round_started:
+            self.active_index = self.turn_order.index(eid)
+            self.turn_vacated = None
+            return self.next_turn()[1]
+        log: List[str] = []
+        vacated, self.turn_vacated = self.turn_vacated, None
+        if (self.round_started and not vacated
+                and 0 <= self.active_index < len(self.turn_order)):
+            cur = self.turn_order[self.active_index]
+            if cur in self.entities:
+                log.extend(self._atb_turn_phase(
+                    cur, "turn_end",
+                    act=not (atb and self._atb_last_skipped)))
+        self.round_started = True
+        if eid not in self.turn_order or eid not in self.entities:
+            log.append(f"⏭ `{eid}` left the turn order as the turn ended; "
+                       f"the turn stays where it was.")
+            self._begin_turn()
+            return log
+        self.active_index = self.turn_order.index(eid)
+        if atb:
+            log.extend(self._atb_reset_actor(self.entities[eid]))
+            self._atb_last_skipped = False
+        log.extend(self._atb_turn_phase(eid, "turn_start", act=True))
+        self.turn_vacated = None
+        self._begin_turn()
+        return log
 
     def _start_current_turn(self, log: List[str]) -> Optional[str]:
         """Start the turn of the unit at active_index: skip past skippable
