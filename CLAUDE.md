@@ -376,7 +376,7 @@ back, load the schema with `ToolSearch` before calling
   swept, verified clean, measured. Read the relevant passes before auditing
   an area again.
 - **`docs/multi_map_design.md`**: the agreed design for multiple maps per
-  match and nested maps (steps 1 and 2a-2c built; §8).
+  match and nested maps (step 1 and 2a-2d built; §8).
 - **`docs/feature_ideas.md`**: the open, numbered feature-idea list the user
   picks from by number (shipped / struck items listed at its top). Check it
   before proposing a feature, and keep it current when one ships.
@@ -1315,7 +1315,7 @@ hardcodes**.
 
 ### 7.8 Geometry, movement and blocking
 
-- **Maps** (`Map`; `docs/multi_map_design.md`, steps 1-2c built): a match
+- **Maps** (`Map`; `docs/multi_map_design.md`, steps 1-2d built): a match
   holds its grids in `Match.maps` (name -> Map, in creation order, saved
   as `map_order` since files sort keys; a new match has one, `main`,
   `DEFAULT_MAP_NAME`). A Map is the grid alone: size, tiles, zones (stored
@@ -1893,7 +1893,25 @@ hardcodes**.
 - **Transfers and undo:** `!ent transfer` is one undo step per match: the
   source's command step and an `(arrival from <src>)` step on the
   destination; undoing either changes only its own match, and the
-  transfer and both undos say so (`_TRANSFER_UNDO_NOTE`) (824).
+  transfer and both undos say so (`_TRANSFER_UNDO_NOTE`,
+  `_is_transfer_label`) (824). `!ent copy|transfer ... map=<map>` names
+  the destination's map (`MatchManager.copy_entity(dest_map=)`).
+- **Links and transfer_entity** (step 2d): `transfer_entity(eid, match,
+  x=None, y=None, map=None)` (mutating; a coordinate works as x) moves a
+  unit with its whole body into another match of the server, but only one
+  that accepts the sender: a host of the DESTINATION runs `!match link
+  <sender>` (`Match.links`, saved; `!match unlink`, `!match links`, which
+  players may read; deleting a match removes it from every list, and an
+  undo can't bring back a link to a deleted match), so a
+  player's move onto a portal tile can send units without a host, and one
+  table can't push units into another's match. The destination records
+  its own `transfer_entity <eid> (arrival from <src>)` undo step; the
+  sender's command step gets ` [transfer_entity]` (`MATCHES_SENT_UNITS`),
+  so undoing either says it changes one side only. Inside an action the
+  other matches are saved first (`logic.CROSS_MATCH_GUARD`, set by
+  `run_action`), so a failed action restores the destination too. The
+  command journals as state (`logic.JOURNAL_AS_STATE`); `!match link` and
+  `!match delete` are journal state commands too (842-843).
 - **Saves files** (`!store save`, `!history export`, `!match journal
   export`) refuse to replace an existing file unless `overwrite` is given
   (`_check_overwrite`) (824).
@@ -2200,9 +2218,9 @@ rejected already. Update this section in the PR that resolves an item.
   `docs/multi_map_design.md`. Read it whole before touching either; ask
   before deviating from it. Built: step 1 (the Map model), step 2a
   (management, map vars, command map resolution, following, cross-map
-  moves), step 2b (formulas) and step 2c (unseen / hidden maps, board
-  browsing, roster grouping; §7.8). Next: 2d `transfer_entity` and
-  `!match link`, then nested maps.
+  moves), step 2b (formulas), step 2c (unseen / hidden maps, board
+  browsing, roster grouping; §7.8) and step 2d (`transfer_entity`,
+  `!match link`; §7.16). Next: nested maps (step 3).
 - **Later:** graphics mouse select / drag and
   animation ("foreseeable future"); a per-entity ATB threshold; arbitrary /
   L-shaped footprints and footprint rotation; per-rider footprints inside a

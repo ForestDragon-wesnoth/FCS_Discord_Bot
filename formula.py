@@ -393,7 +393,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number
+from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number
 
 
 class FormulaError(VTTError):
@@ -2402,6 +2402,8 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # each map's own vars (context map, or map=).
     "map_of", "maps", "map_var_get", "map_var_set", "map_var_del",
     "map_var_keys", "map_var_has",
+    # Cross-match moves into a match that accepts this one (`!match link`).
+    "transfer_entity",
     "group_has", "group_size", "group_add", "group_remove",
     "self_id", "current_id",
     # Tile data access. Tiles live on Match.tiles as a sparse dict of
@@ -2821,7 +2823,7 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
 # reminder, never a silent default-allow). The _ALLOWED_FUNCS pure helpers
 # (min/max/roll/distance/band/...) are all read-only and always permitted.
 ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
-    "map_var_set", "map_var_del",
+    "map_var_set", "map_var_del", "transfer_entity",
     "group_add", "group_remove",
     "tile_set", "tile_del", "tile_clear",
     "move_entity", "move_step", "push_entity", "pull_entity", "swap_entities",
@@ -6501,6 +6503,81 @@ class FormulaEngine:
                 cur = cur[seg]
             return _summon(cur, x, y, id_prefix, map)
 
+        def _transfer_entity(eid_t: Any, dest_t: Any, x: Any = None,
+                             y: Any = None, map: Any = None) -> Any:
+            """transfer_entity(eid, match, x=None, y=None, map=None): move the
+            unit, with its whole body (parts, segments), into another match
+            of this server — a portal, a gate to another table. The
+            destination must accept units from this match (a host of it ran
+            `!match link <this match>`). It lands at (x, y) (default: its
+            current cell; a coordinate works as x) on the destination's map
+            `map` (needed when it has several). Returns its id there (a
+            colliding id gets a suffix), or None when it died leaving. Each
+            match takes its own undo step: undoing either side changes only
+            that match."""
+            eid, e = _resolve_entity(eid_t, "transfer_entity")
+            mgr = CURRENT_WORKSPACE.get()
+            if mgr is None or mgr.matches.get(match.id) is not match:
+                raise FormulaError("transfer_entity: this formula runs "
+                                   "outside a server's matches.")
+            dest_id = str(dest_t) if isinstance(dest_t, str) else None
+            dest = mgr.matches.get(dest_id) if dest_id else None
+            if dest is None:
+                raise FormulaError(f"transfer_entity: no match with id "
+                                   f"{dest_t!r}.")
+            if dest is match:
+                raise FormulaError("transfer_entity: the unit is already in "
+                                   "that match (move_entity moves it here).")
+            if match.id not in dest.links:
+                raise FormulaError(
+                    f"transfer_entity: `{dest_id}` doesn't accept units from "
+                    f"`{match.id}` (a host of `{dest_id}` runs `!match link "
+                    f"{match.id}` there).")
+            if y is None and x is not None and (
+                    isinstance(x, (list, tuple)) or hasattr(x, "x")):
+                c = x
+                x, y = _coord_x(c), _coord_y(c)
+                if map is None:
+                    map = _coord_map(c)
+            for v, what in ((x, "x"), (y, "y")):
+                if v is not None and (not isinstance(v, int)
+                                      or isinstance(v, bool)):
+                    raise FormulaError(f"transfer_entity: {what} must be a "
+                                       f"whole number.")
+            if (x is None) != (y is None):
+                raise FormulaError("transfer_entity: give both x and y, or "
+                                   "neither.")
+            if map is not None and not isinstance(map, str):
+                raise FormulaError("transfer_entity: map= is a map name of "
+                                   "the destination match.")
+            # Inside an action, the other matches are saved first, so a
+            # failed action puts the destination back too.
+            guard = CROSS_MATCH_GUARD.get()
+            if guard is not None:
+                guard()
+            dest_pre = dest.to_dict(include_history=False)
+            try:
+                new_id, log = mgr.copy_entity(match.id, dest.id, eid, x, y,
+                                              move=True, dest_map=map)
+            except (VTTError, NotFound) as ex:
+                raise FormulaError(f"transfer_entity: {ex}")
+            match.surface_log(log)
+            if dest.to_dict(include_history=False) != dest_pre:
+                # The arrival is the destination's own undo step; the
+                # departure is part of this command's step here.
+                dest.history.record_command(
+                    dest, f"transfer_entity {eid} (arrival from {match.id})",
+                    pre_state=dest_pre, by=COMMAND_USER.get() or "")
+            # A replay of this command couldn't redo the transfer without
+            # the other match: journal the state it left.
+            jstate = JOURNAL_AS_STATE.get()
+            if jstate is not None:
+                jstate[0] = True
+            sent = MATCHES_SENT_UNITS.get()
+            if sent is not None:
+                sent.add(match.id)
+            return new_id
+
         def _remove_entity(eid_t: Any) -> bool:
             """remove_entity(eid): despawn an entity — the complement of
             summon. Removes it from the match, turn order, and any
@@ -6661,6 +6738,7 @@ class FormulaEngine:
         ns["entity_snapshot"] = _entity_snapshot
         ns["summon"]          = _summon
         ns["summon_near"]     = _summon_near
+        ns["transfer_entity"] = _transfer_entity
         ns["summon_from"]     = _summon_from
         ns["remove_entity"]   = _remove_entity
 

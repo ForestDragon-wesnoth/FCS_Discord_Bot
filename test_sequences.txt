@@ -25978,3 +25978,117 @@ spy teleports to main, red has no unit, reveal or memory in the lair
 counts (1 of 1). Blue's view of main renders its scene; blue can't name
 the lair. The omniscient view always renders every map, and red's view
 refuses the lair like a map that doesn't exist.
+
+SCENARIO 842 — transfer_entity: the destination opts in with !match link
+----------------------------------------------------------------------
+
+!match new town Town 8 6
+!match new dungeon Dungeon 8 6
+!match use dungeon
+!map new depths 6 6
+!match links
+?? accepts units from no other match
+!match use town
+!ent add ogre Ogre 20 2 2
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!part add ogre club Club 5 5
+!part locate club 4 2
+!eval "transfer_entity('ogre', 'dungeon', 3, 3, map='depths')"
+?? ❌ transfer_entity: `dungeon` doesn't accept units from `town` (a host of `dungeon` runs `!match link town` there).
+!match use dungeon
+!match link town
+?? **Dungeon** now accepts units that formulas in `town` send with transfer_entity
+!match link dungeon
+?? ❌ A match can't link to itself.
+!match link nowhere
+?? ❌ No match with id `nowhere`
+!match links
+?? accepts units sent by transfer_entity from: `town`.
+!match use town
+!tile hook add 6 5 on_enter "transfer_entity(self, 'dungeon', 3, 4, map='depths')"
+!ent move ogre 3 down
+!ent move ogre 3 right
+?! FAILED
+!list
+?! Ogre
+!match use dungeon
+!list
+?? Ogre (ogre)
+?? Club (club)
+!assert "map_of('ogre') == 'depths' and entity[ogre].x == 3 and entity[club].x == 2 and entity[club].y == 1"
+!undo command
+?? This undid a unit moving between matches on THIS match only
+!list
+?! Ogre
+!match use town
+!undo command
+?? This undid a unit moving between matches on THIS match only
+!list
+?? Ogre (ogre)
+!match use dungeon
+!match unlink town
+?? no longer accepts units from `town`
+!match link town
+!match delete town
+!match links
+?? accepts units from no other match
+
+Expected: HARNESS-ALLOWS-ERRORS. A formula in town can send a unit into
+dungeon only once a host of dungeon runs `!match link town` there (the
+destination opts in; a self-link or an unknown id is refused). A tile
+hook in town calls `transfer_entity(self, 'dungeon', 3, 4,
+map='depths')`: the 2x2 ogre walking onto it (its body enters (6,5) when
+it reaches (5,5)) moves to the dungeon's depths map, its located club
+(left at (4,2) as it walked) at the same offset from the anchor, (2,1). Each match took
+its own undo step and says so: undoing in the dungeon removes the ogre
+there only, undoing in town brings it back there. `!match unlink`
+revokes a link, and deleting town removes it from every match's links.
+
+SCENARIO 843 — transfer_entity in actions, refusals, and !ent transfer map=
+----------------------------------------------------------------------
+
+!match new keep Keep 6 6
+!match new gate Gate 6 6
+!match use gate
+!map new yard 4 4
+!match link keep
+!match use keep
+!ent add mage Mage 10 1 1
+!ent add imp Imp 5 2 2
+!part add imp tail Tail 2 2
+!ent set_var mage spells.actions.banish.target entity
+!ent set_var mage spells.actions.banish.body "transfer_entity(target, 'gate', 2, 2, map='yard')\nfail('the spell fizzles')"
+!action mage banish imp
+?? the spell fizzles
+!assert "has_part('imp', 'tail') and entity[imp].x == 2"
+!match use gate
+!list
+?! Imp
+!history list command
+?! arrival
+!match use keep
+!ent set_var mage spells.actions.send.target entity
+!ent set_var mage spells.actions.send.body "transfer_entity(target, 'gate', 2, 2, map='yard')"
+!action mage send imp
+!match use gate
+!assert "map_of('imp') == 'yard' and has_part('imp', 'tail')"
+!match use keep
+!eval "transfer_entity('mage', 'gate', 1, 1)"
+?? This match has 2 maps
+!eval "transfer_entity('mage', 'keep')"
+?? the unit is already in that match
+!ent set_var mage x2 "$(transfer_entity('mage', 'gate', 1, 1, map='yard'))"
+?? banned in a $() inline argument
+!ent transfer mage gate 3 3 map=yard
+?? Moved `mage` to **Gate** (gate) at (3,3).
+!match use gate
+!assert "map_of('mage') == 'yard'"
+
+Expected: HARNESS-ALLOWS-ERRORS. An action whose body transfers its
+target and then fails rolls back both matches: the imp stays in the keep
+with its tail, and the gate has neither the imp nor an arrival undo step.
+The same action without the failure sends the imp, tail included, to the
+gate's yard map. A destination with several maps needs `map=`; a unit
+can't be transferred into its own match; transfer_entity is a mutator,
+refused in `$()`. `!ent transfer` takes `map=` for the destination's map
+too.

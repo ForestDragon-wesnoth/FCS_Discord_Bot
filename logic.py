@@ -29,6 +29,24 @@ FORMULA_LOG_SINK: "contextvars.ContextVar[Optional[List[str]]]" = (
 COMMAND_USER: "contextvars.ContextVar[Optional[str]]" = (
     contextvars.ContextVar("vtt_command_user", default=None))
 
+# Set by the running command (CommandRegistry._run) to a one-item list; a
+# change the command's own replay couldn't redo (a line that needs another
+# match, transfer_entity) sets its item True, and the command is journaled
+# as the state it left instead.
+JOURNAL_AS_STATE: "contextvars.ContextVar[Optional[list]]" = (
+    contextvars.ContextVar("vtt_journal_as_state", default=None))
+
+# Ids of the matches the running command sent units out of with
+# transfer_entity: their undo step says it only undoes their side.
+MATCHES_SENT_UNITS: "contextvars.ContextVar[Optional[set]]" = (
+    contextvars.ContextVar("vtt_matches_sent_units", default=None))
+
+# Set by a running action to a function that saves the other matches
+# before the first change one of its formulas makes to another match
+# (transfer_entity), so a failed action puts them back too.
+CROSS_MATCH_GUARD: "contextvars.ContextVar[Optional[Any]]" = (
+    contextvars.ContextVar("vtt_cross_match_guard", default=None))
+
 # The channel map of the running command (tier 4 of the map hierarchy):
 # a function of a Match giving the map name the command's channel views
 # there. Formulas resolve `map='view'` through it; None outside a command
@@ -7451,6 +7469,11 @@ class Match:
     # with the match; the owner is set at creation by MatchManager.
     owner: Optional[str] = None
     cohosts: List[str] = field(default_factory=list)
+    # Matches whose formulas may send units into this one with
+    # transfer_entity (`!match link <id>`, set by a host of THIS match: the
+    # destination opts in). Saved with the match; a deleted match leaves
+    # every list.
+    links: List[str] = field(default_factory=list)
 
     # Per-match host overrides for the command access gate, keyed by
     # command name or "name sub" -> level ("all"/"host"/"host_only"/
@@ -17566,6 +17589,7 @@ class Match:
             "event_log": copy.deepcopy(self.event_log),
             "owner": self.owner,
             "cohosts": list(self.cohosts),
+            "links": list(self.links),
             "access_overrides": dict(self.access_overrides),
             "bound_channels": copy.deepcopy(self.bound_channels),
             "team_colors": dict(self.team_colors),
@@ -17754,6 +17778,9 @@ class Match:
             [c for c in raw_cohosts if isinstance(c, str)]
             if isinstance(raw_cohosts, list) else []
         )
+        raw_links = d.get("links", [])
+        m.links = ([c for c in raw_links if isinstance(c, str)]
+                   if isinstance(raw_links, list) else [])
         raw_acc = d.get("access_overrides", {})
         m.access_overrides = {
             k: str(v) for k, v in raw_acc.items()
@@ -20914,7 +20941,8 @@ class MatchManager:
 
     def copy_entity(self, src_mid: str, dest_mid: str, eid: str,
                     x: Optional[int] = None, y: Optional[int] = None,
-                    *, move: bool = False) -> Tuple[str, List[str]]:
+                    *, move: bool = False,
+                    dest_map: Optional[str] = None) -> Tuple[str, List[str]]:
         """Copy (move=False) or MOVE (move=True) an entity — with its vars,
         statuses, passives, clamps, facing, and its whole body-part subtree —
         from one live match to another. Returns (new_id, spawn_log); new_id
@@ -20923,6 +20951,8 @@ class MatchManager:
         destination is left as it was.
 
         Placement defaults to the entity's current cell; pass x/y to override.
+        `dest_map` names the destination map (None: the destination's only
+        map, a destination with several refuses).
         Parts ride along: glued/region parts are re-stamped onto the new
         anchor, a located part keeps its offset from the anchor. Ids that
         collide in the destination are auto-suffixed (`goblin` -> `goblin_2`),
@@ -20965,6 +20995,7 @@ class MatchManager:
             taken.add(nid)
         tx = e.x if x is None else int(x)
         ty = e.y if y is None else int(y)
+        dmap = dest.get_map(dest_map).name
         log: List[str] = []
         # The destination is restored exactly if the transfer can't finish:
         # a part that can't be placed used to leave the parts spawned before
@@ -20974,7 +21005,7 @@ class MatchManager:
         from action import _rollback_match
         pre_dest = dest.to_dict(include_history=False)
         try:
-            self._spawn_copies(src, dest, e, order, idmap, tx, ty, log)
+            self._spawn_copies(src, dest, e, order, idmap, tx, ty, log, dmap)
         except Exception:
             _rollback_match(dest, self, pre_dest)
             raise
@@ -20993,9 +21024,10 @@ class MatchManager:
 
     def _spawn_copies(self, src: "Match", dest: "Match", e: "Entity",
                       order: List[str], idmap: Dict[str, str],
-                      tx: int, ty: int, log: List[str]) -> None:
+                      tx: int, ty: int, log: List[str],
+                      dmap: str) -> None:
         """copy_entity's spawn pass: each unit of the body (parents first)
-        into `dest`, anchored at (tx, ty)."""
+        into `dest`, anchored at (tx, ty) of its map `dmap`."""
         for oid in order:
             oe = src.entities[oid]
             ne = Entity.from_dict(oe.to_dict())
@@ -21031,7 +21063,7 @@ class MatchManager:
                 px, py = tx, ty
             else:  # a located part keeps its offset from the anchor
                 px, py = tx + (oe.x - e.x), ty + (oe.y - e.y)
-            _, slog = ne.spawn(dest, px, py)
+            _, slog = ne.spawn(dest, px, py, map_name=dmap)
             log.extend(slog)
         dest._restamp_parts_for(idmap[e.id])
 
@@ -21116,6 +21148,11 @@ class MatchManager:
         if match_id not in self.matches:
             raise NotFound("Match not found")
         del self.matches[match_id]
+        # A match made later under the same id must not inherit the trust
+        # other matches gave this one.
+        for other in self.matches.values():
+            if match_id in other.links:
+                other.links.remove(match_id)
         # clean up any actives
         to_remove = [ch for ch, mid in self.active_by_channel.items() if mid == match_id]
         for ch in to_remove:
