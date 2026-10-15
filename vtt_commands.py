@@ -15,7 +15,7 @@ from logic import (
 )
 
 # Passive system
-from logic import COMMAND_USER, COMMAND_VIEW, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES
+from logic import COMMAND_USER, COMMAND_VIEW, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -1014,6 +1014,7 @@ class CommandRegistry:
         jtoken = _JOURNALED_IN.set(jmine)
         jstate = [False]
         jstate_token = _JOURNAL_AS_STATE.set(jstate)
+        sent_token = MATCHES_SENT_UNITS.set(set())
         _INTERACTIVE_ANSWERS.set([])
         result = None
         try:
@@ -1025,6 +1026,8 @@ class CommandRegistry:
         finally:
             _JOURNALED_IN.reset(jtoken)
             _JOURNAL_AS_STATE.reset(jstate_token)
+            sent = MATCHES_SENT_UNITS.get() or set()
+            MATCHES_SENT_UNITS.reset(sent_token)
         # Even a failed command goes through the bookkeeping below: it only
         # records a snapshot when the state REALLY changed, so a clean failure
         # stays a no-op, while a command that mutated and THEN failed (a hook
@@ -1051,6 +1054,10 @@ class CommandRegistry:
                 label = f"!{name} {' '.join(args)}".strip()
                 if len(label) > 80:
                     label = label[:77] + "..."
+                if pre_active_mid in sent:
+                    # A formula sent units to another match: undoing this
+                    # step changes this match only (_is_transfer_label).
+                    label += _TRANSFER_OUT_MARK
                 m_post.history.record_command(m_post, label,
                                               pre_state=pre_state,
                                               by=COMMAND_USER.get() or "")
@@ -1088,14 +1095,15 @@ _REPLAYING: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
 # Roots whose change to the match is journaled as a stored state: what they
 # do depends on more than the match (its undo history, a file).
 _JOURNAL_STATE_ROOTS = frozenset({"undo", "history", "run"})
-# ... and subcommands: a transfer needs the other match, a resume runs the
-# commands held while paused.
-_JOURNAL_STATE_SUBS = frozenset({("ent", "transfer"), ("match", "resume")})
+# ... and subcommands: a transfer and a link need the other match (and
+# deleting another match drops it from this one's links), a resume runs
+# the commands held while paused.
+_JOURNAL_STATE_SUBS = frozenset({("ent", "transfer"), ("match", "resume"),
+                                 ("match", "link"), ("match", "delete")})
 # Set by a line of the running command (a batch / macro / foreach line, an
 # action's cmd()) that is one of those: the command is journaled as its
 # state too, since replaying it would redo that line without its context.
-_JOURNAL_AS_STATE: "contextvars.ContextVar[Optional[list]]" = \
-    contextvars.ContextVar("vtt_journal_as_state", default=None)
+_JOURNAL_AS_STATE = JOURNAL_AS_STATE
 # Ids of the matches journaled by the runs a run nests (an approval,
 # `!again`, a replayed entry): the outer run leaves a match one of them
 # recorded.
@@ -1850,7 +1858,7 @@ _HOST_READS: Dict[str, Optional[frozenset]] = {
     "ent": frozenset({"dump", "diff"}),
     "template": frozenset({"refs"}),
     "match": frozenset({"list", "info", "channels", "hosts", "outcome",
-                        "journal"}),
+                        "journal", "links"}),
     "host": frozenset({"list"}),
     "map": frozenset({"full"}),
     "list": frozenset({"full"}),
@@ -2905,6 +2913,42 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"{len(c.entities)} entit{'y' if len(c.entities) == 1 else 'ies'}, "
             f"round {c.round_number}. This channel still shows `{src.id}`; "
             f"`!match use {c.id}` switches to the copy.")
+    if sub in ("link", "unlink", "links"):
+        # The destination opts in: a host of THIS match lets formulas in
+        # another match send units here with transfer_entity (portals a
+        # player's move can trigger, with no host of this match involved).
+        m = active_match(mgr, ctx)
+        if sub == "links":
+            _check_tail(args, 1, (), "!match links")
+            if not m.links:
+                return await ctx.send(
+                    f"**{m.name}** accepts units from no other match "
+                    f"(`!match link <id>` lets one send them).")
+            return await ctx.send(
+                f"**{m.name}** accepts units sent by transfer_entity from: "
+                + ", ".join(f"`{i}`" for i in m.links) + ".")
+        if await return_help_if_not_enough_args(ctx, args, 2, "match", sub):
+            return
+        _check_tail(args, 2, (), f"!match {sub} <id>")
+        other = args[1]
+        if sub == "unlink":
+            if other not in m.links:
+                raise VTTError(f"**{m.name}** doesn't accept units from "
+                               f"`{other}`.")
+            m.links.remove(other)
+            return await ctx.send(f"**{m.name}** no longer accepts units "
+                                  f"from `{other}`.")
+        if other == m.id:
+            raise VTTError("A match can't link to itself.")
+        if other not in mgr.matches:
+            raise NotFound(f"No match with id `{other}` (see `!match list`).")
+        if other in m.links:
+            return await ctx.send(f"**{m.name}** already accepts units from "
+                                  f"`{other}`.")
+        m.links.append(other)
+        return await ctx.send(
+            f"**{m.name}** now accepts units that formulas in `{other}` send "
+            f"with transfer_entity (`!match unlink {other}` revokes it).")
     if sub == "rename":
         if await return_help_if_not_enough_args(ctx, args, 3, "match", "rename"):
             return
@@ -3297,6 +3341,26 @@ registry.annotate_sub(
     "match", "rename",
     usage="!match rename <id> <new_name>",
     desc="Rename a selected match."
+)
+registry.annotate_sub(
+    "match", "link",
+    usage="!match link <id>",
+    desc=("Let formulas in match <id> send units into THIS match with "
+          "transfer_entity (a portal tile's hook, an action). The "
+          "destination opts in, so a table can't push units into another's "
+          "match. Saved with this match; `!match unlink <id>` revokes it, "
+          "`!match links` lists them. `!ent transfer` keeps its own check "
+          "(a host of both matches).")
+)
+registry.annotate_sub(
+    "match", "unlink",
+    usage="!match unlink <id>",
+    desc="Stop accepting units that formulas in match <id> send here."
+)
+registry.annotate_sub(
+    "match", "links",
+    usage="!match links",
+    desc="The matches whose formulas may send units into this one."
 )
 registry.annotate_sub(
     "match", "clone",
@@ -8664,6 +8728,8 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # statuses, passives, clamps, facing, and the whole body-part subtree ride
     # along; colliding ids are auto-suffixed in the destination.
     if sub in ("copy", "transfer"):
+        # `map=` names the destination's map (needed when it has several).
+        args, dest_map = _pop_map_opt(args)
         if await return_help_if_not_enough_args(ctx, args, 3, "ent", sub):
             return
         src_id = _resolve_eid(m, args[1])
@@ -8689,7 +8755,8 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         dest_pre = mgr.matches[dest_mid].to_dict(include_history=False)
         try:
             new_id, log = mgr.copy_entity(
-                m.id, dest_mid, src_id, x, y, move=(sub == "transfer"))
+                m.id, dest_mid, src_id, x, y, move=(sub == "transfer"),
+                dest_map=dest_map)
         except (VTTError, NotFound) as ex:
             return await ctx.send(f"❌ {ex}")
         # The arrival is an undo step of the destination (the source's own
@@ -11727,10 +11794,13 @@ def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot,
     # leaves the other match as it is.
     if notes is not None and any(
             x.sequence >= snapshot.sequence
-            and str(x.label).startswith(_TRANSFER_LABELS)
+            and _is_transfer_label(x.label)
             for x in old.history.command_saves):
         notes.append(_TRANSFER_UNDO_NOTE)
     new_match = Match.from_dict(snapshot.state)
+    # A link to a match deleted since stays gone (deleting a match drops
+    # it from every match's links).
+    new_match.links = [i for i in new_match.links if i in mgr.matches]
     # Transfer history pointer first so the truncate below targets the
     # same object we just attached to the new match.
     new_match.history = old.history
@@ -11880,7 +11950,17 @@ async def _resolve_bindings_mode(ctx, m: Match, snap: Snapshot,
     return None
 
 
-_TRANSFER_LABELS = ("!ent transfer",)
+_TRANSFER_LABELS = ("!ent transfer", "transfer_entity")
+# Ends the label of a command step whose formulas sent units out with
+# transfer_entity.
+_TRANSFER_OUT_MARK = " [transfer_entity]"
+
+
+def _is_transfer_label(label: Any) -> bool:
+    """Whether an undo step moved a unit between matches (either side)."""
+    label = str(label)
+    return label.startswith(_TRANSFER_LABELS) or label.endswith(
+        _TRANSFER_OUT_MARK)
 _TRANSFER_UNDO_NOTE = (
     "⚠️ This undid a unit moving between matches on THIS match only: the "
     "other match keeps its side (undo there separately).")
@@ -18751,8 +18831,8 @@ _SUB_DESCS = {
         "`legend` key labels the disguised unit."),
 }
 for _root, _sub, _usage in (
-        ("ent", "copy", "!ent copy <id> <dest_match> [x y]"),
-        ("ent", "transfer", "!ent transfer <id> <dest_match> [x y]"),
+        ("ent", "copy", "!ent copy <id> <dest_match> [x y] [map=<map>]"),
+        ("ent", "transfer", "!ent transfer <id> <dest_match> [x y] [map=<map>]"),
         ("match", "win", "!match win <clear | <winner> [reason ...]>"),
         ("match", "outcome", "!match outcome"),
         ("tile", "line", "!tile line <x1> <y1> <x2> <y2> <path> <value> [map=<map>]"),

@@ -51,7 +51,7 @@ import copy
 import contextvars
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
-from logic import VTTError, NotFound
+from logic import VTTError, NotFound, CROSS_MATCH_GUARD
 
 if TYPE_CHECKING:
     from logic import Match, Entity
@@ -1091,6 +1091,13 @@ async def run_action(
             _restore_other_matches(mgr, match, cross["snap"])
             cross["snap"] = None
 
+    def _guard_cross() -> None:
+        """Save the other matches before this level's first change to one
+        of them (a transfer_entity in the body), so _rollback_all puts
+        them back too."""
+        if cross["snap"] is None:
+            cross["snap"] = _snapshot_other_matches(mgr, match)
+
     def _cmd(line: Any) -> None:
         """cmd('<command line>'): dispatch the line as if the GM
         typed it. shlex-tokenized; first token must be an
@@ -1318,11 +1325,15 @@ async def run_action(
                 # command echoes must not leak into the committed run.
                 match._runtime_buffer = _BufferCtx.for_ctx(ctx)
             try:
-                engine.eval_program(
-                    action.body, eval_ctx,
-                    action_mode=True,
-                    action_bindings=bindings,
-                )
+                guard_token = CROSS_MATCH_GUARD.set(_guard_cross)
+                try:
+                    engine.eval_program(
+                        action.body, eval_ctx,
+                        action_mode=True,
+                        action_bindings=bindings,
+                    )
+                finally:
+                    CROSS_MATCH_GUARD.reset(guard_token)
             except ChoiceNeeded as nc:
                 if not is_top_level:
                     raise  # the top-level loop owns replay
