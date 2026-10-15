@@ -911,7 +911,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "'name' (default): alphabetical by display name, then id. "
             "'id': by entity id only. 'insertion_order': order entities "
             "were added to the match (oldest first). 'random_stable': "
-            "seeded by (match.id, round_number) so the order is stable "
+            "seeded by (the match's RNG seed, round_number) so the order is stable "
             "within a round but reshuffles between rounds — useful for "
             "systems that want randomized initiative ties without "
             "rerolling each turn."
@@ -1263,7 +1263,10 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "desc": (
             "Fate of riders when their vehicle dies or despawns: 'eject' "
             "(dismount to nearby free cells), 'kill' (run the kill function "
-            "on each), or 'keep' (leave them mounted for manual cleanup)."
+            "on each), or 'keep' (leave them mounted to the vehicle's "
+            "corpse: a revive brings the vehicle back with them aboard). "
+            "'keep' needs a corpse: a vehicle removed without one (a "
+            "despawn, death_result=delete, a transfer) ejects its riders."
         ),
     },
     # What happens to a vehicle's riders when the vehicle TRANSFORMS into a
@@ -5377,14 +5380,17 @@ class Entity:
 
     @property
     def team(self) -> Optional[str]:
-        """Team / faction name, sourced from vars[team_var]. None when
-        the entity isn't on a team (var absent OR set to None). The
-        getter doesn't coerce to str so that formula readers see the
-        actual stored type — a GM who sets the team var to an int via
-        !ent set_var still gets that int back through e.team, which
-        surfaces the type mismatch instead of silently hiding it."""
+        """Team / faction name, sourced from vars[team_var], always as
+        text. None when the entity isn't on a team (var absent OR set to
+        None or ""). A team typed through a command is stored as a number
+        (`!ent set_var u team 1`) while one from a formula or a template is
+        text; reading both as text keeps team "1" one team everywhere
+        (passives, POV, colours, relations, turn grouping). Formulas reading
+        `entity[u].team` still see the stored value."""
         v = self.vars.get(self._team_var_name())
-        return v if v is not None else None
+        if v is None or v == "":
+            return None
+        return str(v)
 
     @team.setter
     def team(self, value):
@@ -5691,7 +5697,8 @@ class Entity:
         match._record_vision(getattr(self, "team", None))
         return (self.id, log)
 
-    def remove(self, *, despawn: bool = True) -> List[str]:
+    def remove(self, *, despawn: bool = True,
+               corpse_kept: bool = False) -> List[str]:
         """
         Remove this entity from its match and turn order.
         Also scrubs the entity from every group it was a member of, so
@@ -5711,7 +5718,7 @@ class Entity:
         # Resolve any riders this entity was carrying (death OR despawn both
         # route here) per the mount_on_vehicle_death rule — done while `self` is
         # still in the match so the eject search can use its footprint.
-        m._release_riders(self.id)
+        m._release_riders(self.id, corpse_kept=corpse_kept)
         # A removed snake segment closes the chain behind it, or the next
         # segment would keep following an id that no longer exists.
         m._splice_out_segment(self)
@@ -5721,7 +5728,12 @@ class Entity:
         if self.id in m.turn_order:
             idx = m.turn_order.index(self.id)
             m.turn_order.remove(self.id)
-            if m.round_started and idx == m.active_index:
+            if m.turn_vacated == "wrap":
+                # No unit holds the turn: the next one opens a new round
+                # from the top, whoever else leaves meanwhile (a second
+                # removal at index 0 used to turn this into "same").
+                m.active_index = 0
+            elif m.round_started and idx == m.active_index:
                 # The unit whose turn it is is gone. The next unit in the
                 # order now sits at active_index — or, if it was last, the
                 # next turn opens a new round from the top. next_turn reads
@@ -6555,6 +6567,16 @@ _SEGMENT_LINK_VARS = ("__segment", "__follows", "__seg_path", "__seg_last")
 # unit's whole vars keeps them.
 _ENGINE_STATE_VARS = _SEGMENT_LINK_VARS + ("__part_located", "__part_region",
                                            "__part_destroyed")
+
+def glyph_of(v: Any) -> Any:
+    """A stored glyph as text: a digit 0-9 that `!ent set_var` / `!tile set`
+    stored as a number reads as that character (numbered tokens are a
+    common table need); anything else as stored, for the one-character
+    check that follows."""
+    if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 9:
+        return str(v)
+    return v
+
 
 def _rename_map_coords(value: Any, old: str, new: str) -> int:
     """Rewrite every stored [x, y, old] coordinate inside `value` (a var
@@ -9016,17 +9038,24 @@ class Match:
                 return True
         return False
 
-    def _release_riders(self, vid: str, mode: Optional[str] = None) -> List[str]:
+    def _release_riders(self, vid: str, mode: Optional[str] = None,
+                        corpse_kept: bool = False) -> List[str]:
         """Resolve a vehicle's riders when it dies / despawns, per the
         mount_on_vehicle_death rule: 'eject' (dismount to nearby cells),
         'kill' (run the kill function on each), 'keep' (leave them linked).
-        Called from Entity.remove. An explicit `mode` overrides the rule (the
-        transform eject path passes 'eject'). Returns log."""
+        'keep' holds only when the vehicle leaves a corpse its revive can
+        restore (`corpse_kept`); any other removal (a despawn, a death under
+        death_result=delete, a transfer) ejects, or the riders would name a
+        gone id that a later unit could take. Called from Entity.remove. An
+        explicit `mode` overrides the rule (the transform eject path passes
+        'eject'). Returns log."""
         riders = self.vehicle_riders(vid)
         if not riders:
             return []
         if mode is None:
             mode = str(self.rules.get("mount_on_vehicle_death", "eject"))
+        if mode == "keep" and not corpse_kept:
+            mode = "eject"
         veh = self.entities.get(vid)
         log: List[str] = []
         for rider in riders:
@@ -9336,7 +9365,10 @@ class Match:
             m["_eff"] = m["priority"] + offsets.get(m["op"], 0.0)
         for tier in sorted({m["_eff"] for m in mods}):
             tier_mods = [m for m in mods if m["_eff"] == tier]
-            for op in sorted({m["op"] for m in tier_mods}, key=order_key):
+            # Unlisted ops go last in source order (the rule's promise); a
+            # set here folded them in the process's hash order.
+            for op in sorted(dict.fromkeys(m["op"] for m in tier_mods),
+                             key=order_key):
                 vals = [m["value"] for m in tier_mods if m["op"] == op]
                 running = self._apply_modifier_op(running, op, vals)
         result = self._apply_stat_cap(stat, running)
@@ -10914,8 +10946,13 @@ class Match:
         """Ids a moving entity ignores for occupancy: always itself, PLUS its
         own snake-body segments when `e` is a snake head with self-collision
         OFF (the Destroyer passes through its own body; a classic-Snake head
-        is blocked by it). Other movers see segments as occupying normally."""
+        is blocked by it). Other movers see segments as occupying normally.
+        Its own riders are ignored too: a vehicle revived from its corpse
+        under mount_on_vehicle_death=keep finds them standing on that cell
+        (they read as ordinary units while it is dead)."""
         ids: Tuple[str, ...] = (e.id,) + tuple(extra)
+        ids += tuple(r.id for r in self.entities.values()
+                     if r.mounted_on == e.id and r.id != e.id)
         if self.is_snake_head(e.id) and not bool(self._segment_cfg(
                 e, "__segment_self_collision", "segment_self_collision")):
             ids += tuple(s.id for s in self.snake_segments(e.id))
@@ -11403,6 +11440,11 @@ class Match:
             self.rng_pos = self._rng.drawn
         return self._rng
 
+    def _tie_salt(self) -> str:
+        """What random_stable turn ties hash with: the seed the match rolls
+        from (the random_seed rule, else its own), kept by a replay."""
+        return str(self.rules.get("random_seed", "") or "") or self.rng_seed
+
     def rng_position(self) -> int:
         """Words the match's RNG has drawn since its seed (see formula_rng)."""
         return self._rng.drawn if self._rng is not None else self.rng_pos
@@ -11473,13 +11515,14 @@ class Match:
             if tiebreaker == "insertion_order":
                 return (insertion_index.get(e.id, 1_000_000),)
             if tiebreaker == "random_stable":
-                # Seeded by (match.id, round_number) so the same set of
-                # ties resolves identically every call within a round
-                # but reshuffles when the round bumps. Using a hash of
-                # the seed + entity id keeps it deterministic without
-                # needing a stored permutation.
+                # Seeded by (the match's RNG seed, round_number) so the
+                # same set of ties resolves identically every call within
+                # a round but reshuffles when the round bumps. The RNG
+                # seed (not the match id) travels with a replay under
+                # another id. Using a hash of the seed + entity id keeps
+                # it deterministic without needing a stored permutation.
                 import hashlib
-                seed = f"{self.id}:{self.round_number}:{e.id}"
+                seed = f"{self._tie_salt()}:{self.round_number}:{e.id}"
                 return (hashlib.sha256(seed.encode()).hexdigest(),)
             # default 'name'
             return (e.name.lower(), e.id)
@@ -11549,7 +11592,8 @@ class Match:
                     return (earliest, team_name)
                 if tiebreaker == "random_stable":
                     import hashlib
-                    seed = f"{self.id}:{self.round_number}:team:{team_name}"
+                    seed = (f"{self._tie_salt()}:{self.round_number}:"
+                            f"team:{team_name}")
                     return (hashlib.sha256(seed.encode()).hexdigest(),)
                 return (team_name.lower(), team_name)
 
@@ -11964,6 +12008,24 @@ class Match:
             return 0.0
         return float(val)
 
+    def _atb_charge(self, e: "Entity", log: Optional[List[str]] = None) -> float:
+        """`e`'s charge bar as a number: a value that isn't a finite number
+        (text, a list: the bar is an ordinary var formulas may write) reads
+        as 0, with a ⚠️ naming the unit, so one bad value can't stop the
+        turn flow."""
+        cvar = str(self.rules.get("atb_charge_var", "atb_charge"))
+        v = e.vars.get(cvar, 0)
+        if v is None:
+            return 0.0
+        if isinstance(v, (int, float)) and not isinstance(v, bool) \
+                and math.isfinite(v):
+            return float(v)
+        if log is not None:
+            log.append(self.unit_line(
+                e.id, f"⚠️ `{e.id}`'s ATB charge `{cvar}` = {v!r} isn't a "
+                      f"number; it counts as 0."))
+        return 0.0
+
     def _atb_reset_actor(self, e: "Entity") -> List[str]:
         """Reset the actor's charge bar after a (taken or skipped) turn.
         Empty atb_reset_formula = built-in subtract-threshold (keep overflow);
@@ -11974,7 +12036,7 @@ class Match:
         src = str(self.rules.get("atb_reset_formula", "")).strip()
 
         def _builtin():
-            cur = float(e.vars.get(cvar, 0) or 0)
+            cur = self._atb_charge(e)
             e.write_var(cvar, self._atb_clean_num(cur - thr))
 
         if not src:
@@ -12008,7 +12070,7 @@ class Match:
             rate = self._atb_charge_rate(e)
             if rate <= 0:
                 continue
-            cur = float(e.vars.get(cvar, 0) or 0)
+            cur = self._atb_charge(e, log)
             entries.append((max(0.0, (thr - cur) / rate), eid, rate))
         if not entries:
             log.append("⚠️ ATB: no entity has a positive charge rate — "
@@ -12021,7 +12083,7 @@ class Match:
             for (_t, eid, rate) in entries:
                 e = self.entities[eid]
                 e.write_var(cvar, self._atb_clean_num(
-                    float(e.vars.get(cvar, 0) or 0) + rate * min_time))
+                    self._atb_charge(e) + rate * min_time))
         actor = entries[0][1]
         try:
             self.active_index = self.turn_order.index(actor)
@@ -15044,7 +15106,7 @@ class Match:
                 self._store_corpse(e)   # also snapshots the parts
             # Remove from match (entity.remove handles turn-order
             # bookkeeping + group scrubbing) regardless of result.
-            e.remove(despawn=False)
+            e.remove(despawn=False, corpse_kept=(result == "corpse"))
             # Cascade: the creature is gone, so its body parts go with it
             # (no orphaned, suddenly-visible limbs). The WHOLE subtree —
             # parts, their parts, ... — is removed, not just direct parts,
@@ -15728,7 +15790,14 @@ class Match:
         # the window (below).
         self._death_check_suppressed_ids.add(e.id)
         try:
-            _, spawn_log = e.spawn(self, x, y, map_name=cmap.name)
+            try:
+                _, spawn_log = e.spawn(self, x, y, map_name=cmap.name)
+            except VTTError:
+                # Nothing was revived: the corpse goes back where it lay
+                # (it used to be lost with the refusal).
+                cmap.tiles.setdefault((x, y), {}).setdefault(
+                    "corpses", {})[eid] = corpse
+                raise
             # Restore the creature's body parts at the parent's cell. Each
             # snapshot carries its part_of (-> e.id) so it re-attaches; a
             # part already taking that id (somehow still alive) is skipped.
@@ -15827,6 +15896,10 @@ class Match:
             self._resume_anchored_zones(e.id)
             for part in self.entity_part_subtree(e.id):
                 self._resume_anchored_zones(part.id)
+            # The spawn rebuilt the turn order while the unit still had its
+            # corpse's hp (not alive, so left out); now that it lives, it
+            # rejoins.
+            self._rebuild_turn_order()
         return e.id, spawn_log + revive_log + death_log
 
     # ---------- polymorph / transform (identity-preserving statblock swap) -----
@@ -17372,18 +17445,18 @@ class Match:
         if dis is not None:
             dglyphs = dis.get("glyphs")
             if isinstance(dglyphs, dict):
-                dg = dglyphs.get(facing)
+                dg = glyph_of(dglyphs.get(facing))
                 if isinstance(dg, str) and len(dg) == 1:
                     return dg
-            dg = dis.get("glyph")
+            dg = glyph_of(dis.get("glyph"))
             if isinstance(dg, str) and len(dg) == 1:
                 return dg
         glyphs = e.vars.get("glyphs")
         if isinstance(glyphs, dict):
-            g = glyphs.get(facing)
+            g = glyph_of(glyphs.get(facing))
             if isinstance(g, str) and len(g) == 1:
                 return g
-        g = e.vars.get("glyph")
+        g = glyph_of(e.vars.get("glyph"))
         if isinstance(g, str) and len(g) == 1:
             return g
         return DIRECTION_ARROWS.get(facing, "@")
@@ -17394,10 +17467,10 @@ class Match:
         the part-over-parent render priority."""
         gd = e.vars.get("glyphs")
         if isinstance(gd, dict):
-            gg = gd.get(getattr(e, "facing", ""))
+            gg = glyph_of(gd.get(getattr(e, "facing", "")))
             if isinstance(gg, str) and len(gg) == 1:
                 return True
-        g = e.vars.get("glyph")
+        g = glyph_of(e.vars.get("glyph"))
         return isinstance(g, str) and len(g) == 1
 
     def entity_color(self, e: "Entity",
@@ -17461,6 +17534,8 @@ class Match:
         dis = self._effective_disguise(e, pov_team)
         if dis is not None:
             n = dis.get("name")
+            if isinstance(n, (int, float)) and not isinstance(n, bool):
+                n = str(n)      # a decoy name `!ent set_var` stored as 9
             if isinstance(n, str) and n:
                 return n
         return e.name or e.id
@@ -17475,6 +17550,8 @@ class Match:
     def _legend_value(val: Any, default: str) -> Optional[str]:
         if val is False:
             return None
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            val = str(val)      # `!ent set_var u legend 7` stores a number
         if isinstance(val, str) and val.strip():
             return val.strip()
         return default
@@ -17778,14 +17855,14 @@ class Match:
         cell = mp.tiles.get((x, y))
         if not isinstance(cell, dict):
             return None
-        g = cell.get("glyph")
+        g = glyph_of(cell.get("glyph"))
         if isinstance(g, str) and len(g) == 1:
             return g
         tpl_name = cell.get("_template")
         if isinstance(tpl_name, str):
             tpl = self.tile_templates.get(tpl_name)
             if tpl is not None:
-                tg = tpl.data.get("glyph")
+                tg = glyph_of(tpl.data.get("glyph"))
                 if isinstance(tg, str) and len(tg) == 1:
                     return tg
         return None
@@ -17816,10 +17893,10 @@ class Match:
         vars_ = ent.get("vars") or {}
         glyphs = vars_.get("glyphs")
         if isinstance(glyphs, dict):
-            g = glyphs.get(facing)
+            g = glyph_of(glyphs.get(facing))
             if isinstance(g, str) and len(g) == 1:
                 return g
-        g = vars_.get("glyph")
+        g = glyph_of(vars_.get("glyph"))
         if isinstance(g, str) and len(g) == 1:
             return g
         return None if custom_only else DIRECTION_ARROWS.get(facing, "@")
@@ -18053,13 +18130,13 @@ class Match:
                 continue
             if not self.tile_visible_to(tx, ty, pov_team, mp):
                 continue
-            glyph = data.get("glyph")
+            glyph = glyph_of(data.get("glyph"))
             if not (isinstance(glyph, str) and len(glyph) == 1):
                 tpl_name = data.get("_template")
                 if isinstance(tpl_name, str):
                     tpl = self.tile_templates.get(tpl_name)
                     if tpl is not None:
-                        cand = tpl.data.get("glyph")
+                        cand = glyph_of(tpl.data.get("glyph"))
                         if isinstance(cand, str) and len(cand) == 1:
                             glyph = cand
             has_glyph = isinstance(glyph, str) and len(glyph) == 1

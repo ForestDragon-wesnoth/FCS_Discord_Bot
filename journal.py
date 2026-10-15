@@ -35,8 +35,11 @@ JOURNAL_FORMAT = "fcs-journal"
 JOURNAL_VERSION = 1
 
 # Match fields an undo leaves alone (vtt_commands._NOT_UNDO_STATE): a change
-# to them alone is no journal entry, and the state hash leaves them out.
-UNDO_IGNORED = ("paused", "rules", "rng_seed", "rng_pos")
+# to them alone is no journal entry or undo step, and the state hash leaves
+# them out. channel_views / channel_maps are each channel's camera and
+# `!map use` choice: display state (a player panning took undo steps).
+UNDO_IGNORED = ("paused", "rules", "rng_seed", "rng_pos", "channel_views",
+                "channel_maps")
 
 # Segments kept: the newest and the one before it.
 KEPT_SEGMENTS = 2

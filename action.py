@@ -1026,6 +1026,7 @@ async def run_action(
     # pre-state dict (no history-snapshot append yet — that happens
     # in the dispatcher AFTER the action completes).
     pre_state = match.to_dict(include_history=False)
+    hist_mark = match.history.mark()
     pre_action_depth = match._action_depth
     is_top_level = (pre_action_depth == 0)
 
@@ -1057,6 +1058,9 @@ async def run_action(
 
     def _rollback_all() -> None:
         _rollback_match(match, mgr, pre_state)
+        # Autosaves the rolled-back body recorded (a turn advanced by a
+        # cmd() line) go too, and the ones pruned meanwhile return.
+        match.history.rewind(hist_mark)
         if cross["snap"] is not None:
             _restore_other_matches(mgr, match, cross["snap"])
             cross["snap"] = None
@@ -1432,6 +1436,10 @@ def _snapshot_other_matches(mgr: Any, match: "Match") -> Dict[str, Any]:
     pointers: what an action's cmd() line may change elsewhere."""
     return {"matches": {mid: m.to_dict(include_history=False)
                         for mid, m in mgr.matches.items() if m is not match},
+            "objs": {mid: m for mid, m in mgr.matches.items()
+                     if m is not match},
+            "hist": {mid: m.history.mark() for mid, m in mgr.matches.items()
+                     if m is not match},
             "active": dict(mgr.active_by_channel)}
 
 
@@ -1448,10 +1456,14 @@ def _restore_other_matches(mgr: Any, match: "Match",
     for mid, state in pre.items():
         m = mgr.matches.get(mid)
         if m is None:
-            m = _Match.from_dict(copy.deepcopy(state))
+            m = snap["objs"].get(mid) or _Match.from_dict(copy.deepcopy(state))
             mgr.matches[mid] = m
+            if m.to_dict(include_history=False) != state:
+                _rollback_match(m, mgr, state)
         elif m.to_dict(include_history=False) != state:
             _rollback_match(m, mgr, state)
+        if mid in snap["hist"]:
+            m.history.rewind(snap["hist"][mid])
         if m.system_name in mgr.systems:
             mgr.apply_system_rules(m)
     mgr.active_by_channel.clear()

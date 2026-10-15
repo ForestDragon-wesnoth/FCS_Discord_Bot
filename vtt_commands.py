@@ -922,7 +922,8 @@ class CommandRegistry:
         # flag-driven instead of routed through dispatch_no_snapshot.
         pre_state = None
         pre_active_mid = mgr.active_by_channel.get(ctx.channel_key)
-        if (self._snapshot.get(name, True)
+        if ((self._snapshot.get(name, True) or (
+                name, str(args[0]).lower() if args else "") in _SNAPSHOT_SUBS)
                 and pre_active_mid is not None
                 and pre_active_mid in mgr.matches):
             m_pre = mgr.matches[pre_active_mid]
@@ -1300,6 +1301,10 @@ async def persist_workspace(mgr: MatchManager, ctx: Optional[ReplyContext]) -> N
     if msgs and ctx is not None:
         await ctx.send("\n".join(msgs))
 
+
+# Subcommands of a command registered without undo snapshots that change
+# the match and take a command snapshot of their own.
+_SNAPSHOT_SUBS = frozenset({("turn", "set")})
 
 # Commands that only read the match (no undo snapshot either): the journal
 # doesn't serialize it around them.
@@ -1965,7 +1970,7 @@ def _entity_template_context(e: Entity,
     if pov_team is not None and e._match is not None:
         dis = e._match._effective_disguise(e, pov_team)
         if dis is not None:
-            n = dis.get("name")
+            n = e._match.entity_display_name(e, pov_team)
             if isinstance(n, str) and n:
                 ctx["name"] = n
             dvars = dis.get("vars")
@@ -4182,7 +4187,7 @@ def _reserve_template_room(mgr: MatchManager,
     st = storage_of(mgr)
     if st is None or not datas:
         return
-    total = sum(len((json.dumps(d, indent=2, sort_keys=True) + "\n")
+    total = sum(len((json.dumps(d, indent=2) + "\n")
                     .encode("utf-8")) + 256 for d in datas)
     st._room_for_template(mgr.guild_key, total)
 
@@ -10598,7 +10603,10 @@ def _entity_path_value(m: Match, e: Entity, path: str,
         if seg0 == "name":
             return True, m.entity_display_name(e, pov)
         return True, getattr(e, seg0)
-    return _resolve_dotted_var(m.presented_vars(e, pov), path)
+    found, val = _resolve_dotted_var(m.presented_vars(e, pov), path)
+    if found and path == e._team_var_name() and val is not None:
+        val = str(val)      # team 1 and team "1" are one team (Entity.team)
+    return found, val
 
 
 def _coerce_for_compare(s: str) -> Any:
@@ -10755,7 +10763,15 @@ def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Option
         found, lhs = _entity_path_value(m, e, key, pov)
         if not found:
             return False
-        rhs = _coerce_for_compare(val)
+        # A team is text (Entity.team): `team=1` names team "1".
+        rhs = val if key == e._team_var_name() else _coerce_for_compare(val)
+        # true / false aren't the numbers 1 / 0 here: `hp>=true` matched
+        # every unit and `flag<5` a flag set to true.
+        if (isinstance(lhs, (int, float)) and isinstance(rhs, (int, float))
+                and isinstance(lhs, bool) != isinstance(rhs, bool)):
+            if kind == "!=":
+                continue
+            return False
         # If lhs is numeric-ish and rhs coerced numeric, compare as numbers.
         # Otherwise the relational ops still attempt the comparison and a
         # TypeError is treated as "doesn't match".
@@ -11459,6 +11475,14 @@ def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot,
     new_match._rng, new_match._rng_seed = old._rng, old._rng_seed
     # The journal records the restore as a stored state (see _run).
     new_match.journal = old.journal
+    # Each channel's camera and `!map use` choice are display state, not
+    # undo state: the live ones stay (minus maps the restore removed).
+    new_match.channel_views = {
+        ck: {mn: copy.deepcopy(v) for mn, v in views.items()
+             if mn in new_match.maps}
+        for ck, views in old.channel_views.items() if isinstance(views, dict)}
+    new_match.channel_maps = {ck: mn for ck, mn in old.channel_maps.items()
+                              if mn in new_match.maps}
     # A snapshot `!history import`ed from ANOTHER match restores that board
     # here, but the match stays itself: its id (the key everything files
     # under — two matches reporting one id sent this match's approval
@@ -16341,7 +16365,6 @@ registry.annotate_sub(
         "system) and persist through save/load. Subcommands: def, del, "
         "list, info."
     ),
-    snapshot=False,
 )
 async def alias_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
@@ -16524,6 +16547,11 @@ def _snapshot_all_matches(mgr: MatchManager) -> Dict[str, Any]:
     return {
         "matches": {mid: m.to_dict(include_history=False)
                     for mid, m in mgr.matches.items()},
+        # The match objects and their undo histories: a match deleted
+        # meanwhile comes back as itself (history, saves, journal), and
+        # snapshots recorded by the undone work go (MatchHistory.rewind).
+        "objs": dict(mgr.matches),
+        "hist": {mid: m.history.mark() for mid, m in mgr.matches.items()},
         "active": dict(mgr.active_by_channel),
     }
 
@@ -16539,10 +16567,17 @@ def _restore_all_matches(mgr: MatchManager, snap: Dict[str, Any]) -> None:
     for mid, state in pre.items():
         m = mgr.matches.get(mid)
         if m is None:
-            m = Match.from_dict(copy.deepcopy(state))
+            m = snap.get("objs", {}).get(mid)
+            if m is None:
+                m = Match.from_dict(copy.deepcopy(state))
             mgr.matches[mid] = m
+            if m.to_dict(include_history=False) != state:
+                _rollback_match(m, mgr, state)
         elif m.to_dict(include_history=False) != state:
             _rollback_match(m, mgr, state)
+        mark = snap.get("hist", {}).get(mid)
+        if mark is not None:
+            m.history.rewind(mark)
         # Rules are a copy of the match's system, which isn't rolled back
         # (as in an undo, see _restore_snapshot).
         if m.system_name in mgr.systems:
@@ -16698,7 +16733,16 @@ async def batch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     snap = _snapshot_all_matches(mgr)
     watch = _ErrorWatchCtx(ctx)
     for i, sub in enumerate(parts):
-        result = await registry.dispatch_no_snapshot(sub[0], sub[1:], watch, mgr)
+        try:
+            result = await registry.dispatch_no_snapshot(sub[0], sub[1:],
+                                                         watch, mgr)
+        except Exception:
+            # A line that crashed undoes the lines before it too.
+            _restore_all_matches(mgr, snap)
+            sink = FORMULA_LOG_SINK.get()
+            if sink is not None:
+                sink.clear()
+            raise
         if watch.error_seen or result == ASSERT_STOP:
             _restore_all_matches(mgr, snap)
             # The output a rolled-back line queued for the end of the
@@ -16996,14 +17040,17 @@ async def _exec_macro(nodes, ctx, mgr, mac_args, loop_idx, name, budget):
             ran = False
             for cond, block in branches:
                 csrc = _macro_subst(cond, mac_args, loop_idx)
+                # A condition that can't be read stops the macro: running
+                # the other branch instead turned a typo into a game effect
+                # (a heal macro's `if true` killed the unit).
                 if m is None:
-                    break
+                    raise _MacroError(f"no active match to read the `if` "
+                                      f"condition `{csrc[:50]}`")
                 try:
                     truthy = bool(_macro_eval_readonly(csrc, m, name))
                 except FormulaError as ex:
-                    await ctx.send(f"❌ macro `{name}`: bad `if` condition "
-                                   f"`{csrc[:50]}`: {ex}")
-                    truthy = False
+                    raise _MacroError(f"bad `if` condition `{csrc[:50]}`: "
+                                      f"{ex} (the macro stops here)")
                 if truthy:
                     if await _exec_macro(block, ctx, mgr, mac_args, loop_idx,
                                          name, budget) == ASSERT_STOP:
@@ -17200,7 +17247,6 @@ for _subs, _usage in (
 @registry.command(
     "table",
     usage="!table <def|roll|list|show|remove|rename> ...",
-    snapshot=False,
     desc=(
         "Named random tables (Match.tables) — store a weighted table once and "
         "roll it by name. `def <name> <key:weight,...>` defines a table (the "
@@ -17339,11 +17385,21 @@ async def watch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         except FormulaError as ex:
             return await ctx.send(f"❌ invalid watcher formula: {ex}")
         verb = "Replaced" if name in m.watchers else "Added"
+        # Edge-triggered from now: a condition that already holds isn't a
+        # change, so it fires the next time it becomes true (it used to
+        # fire after whatever command came next).
+        try:
+            holds = bool(FormulaEngine(m).eval_expression(
+                cond, EvalCtx(this=m.current_entity_id())))
+        except FormulaError:
+            holds = False
         m.watchers[name] = {"condition": cond, "effect": effect,
-                            "once": once, "last": False}
+                            "once": once, "last": holds}
         return await ctx.send(
             f"{verb} watcher `{name}`{' (once)' if once else ''}. Fires when "
-            f"the condition becomes true.")
+            f"the condition becomes true"
+            + (" (it holds now, so the next time it turns true)." if holds
+               else "."))
 
     if sub == "list":
         if not m.watchers:

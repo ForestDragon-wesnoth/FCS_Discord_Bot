@@ -68,9 +68,11 @@ def valid_id(name: Any) -> bool:
 
 
 def _dump(obj: Any) -> str:
-    """The text written to disk: compact, keys sorted, so an unchanged state
-    serializes to the same text and the comparison finds no change."""
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+    """The text written to disk: compact, keys in their order in memory.
+    That order is meaningful (units, passives, statuses and watchers act in
+    creation order: turn ties under insertion_order, hook firing), so a
+    reload keeps it; an unchanged state still serializes to the same text."""
+    return json.dumps(obj, separators=(",", ":"))
 
 
 # Server-wide lists kept beside systems.json: `_written` key -> (file name,
@@ -230,7 +232,8 @@ class Storage:
         oldest first), so a refused write changes nothing on disk."""
         key = mgr.guild_key
         path = self.template_file(key, name)
-        text = json.dumps(data, indent=2, sort_keys=True) + "\n"
+        # Keys in their order (a template's passives fire in it).
+        text = json.dumps(data, indent=2) + "\n"
         size = len(text.encode("utf-8"))
         old = _file_size(path)
         kept = keep_old and os.path.isfile(path)
