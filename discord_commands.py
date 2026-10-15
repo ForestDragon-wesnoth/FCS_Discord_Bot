@@ -267,7 +267,7 @@ class DiscordCtxWrapper:
         if getattr(m, "render_mode", "text") == "image":
             try:
                 header, data, engaged = await _board_image(m, self.channel_key, self._mgr)
-                view = _PanView(self.channel_key, self._mgr) if engaged else None
+                view = _board_view(m, self.channel_key, self._mgr, engaged)
                 file = discord.File(io.BytesIO(data), filename=f"{m.id}.png")
                 msg = await self._ctx.send(header or "🗺️", file=file, view=view) \
                     if view else await self._ctx.send(header or "🗺️", file=file)
@@ -275,7 +275,7 @@ class DiscordCtxWrapper:
                 msg = None
         if msg is None:
             text, engaged = _board_render(m, self.channel_key)
-            view = _PanView(self.channel_key, self._mgr) if engaged else None
+            view = _board_view(m, self.channel_key, self._mgr, engaged)
             try:
                 msg = await self._ctx.send(text, view=view) if view \
                     else await self._ctx.send(text)
@@ -684,11 +684,13 @@ def _board_render(m, channel_key: str) -> Tuple[str, bool]:
     pov = m.channel_pov(channel_key)
     mode = str(m.rules.get("viewport_mode", "auto"))
     enabled = mode != "off"   # Discord is viewport_capable; auto => on
-    mp = m.channel_map(channel_key, pov)
+    mp = _board_map(m, channel_key)
     viewport = m.resolve_viewport(channel_key, enabled=enabled, mp=mp)
+    if m.map_blank_text(mp, pov) is not None:
+        viewport = None             # a blank board has nothing to pan
     legend = bool(getattr(m, "map_legend_enabled", False))
     colorize = bool(getattr(m, "color_enabled", True))
-    header = _board_header(m, mp, viewport) + ("\n" if len(m.maps) > 1
+    header = _board_header(m, mp, viewport, pov) + ("\n" if len(m.maps) > 1
                                               or viewport else "")
     coords = m.coords_on()
     # Richest first; each fallback drops one optional layer (the coordinate
@@ -726,23 +728,27 @@ async def _board_image(m, channel_key: str, mgr=None):
     pov = m.channel_pov(channel_key)
     vmode = str(m.rules.get("viewport_mode", "auto"))
     enabled = vmode != "off"
-    mp = m.channel_map(channel_key, pov)
+    mp = _board_map(m, channel_key)
     viewport = m.resolve_viewport(channel_key, enabled=enabled, mp=mp)
+    if m.map_blank_text(mp, pov) is not None:
+        viewport = None             # a blank board has nothing to pan
     # Scene on the event loop (reads the match), pixels in a worker thread.
     scene, cell = scene_for_png(m, pov_team=pov, viewport=viewport,
                                 legend=bool(m.map_legend_enabled), mp=mp)
     data = await asyncio.to_thread(
         render_scene_png, scene, _get_sprite_loader(mgr), cell)
-    return _board_header(m, mp, viewport), data, bool(viewport)
+    return _board_header(m, mp, viewport, pov), data, bool(viewport)
 
 
-def _board_header(m, mp, viewport) -> str:
-    """A board's header line: the map's name on a match with several, and
-    the viewport window when one is engaged ("" when neither applies)."""
+def _board_header(m, mp, viewport, pov=None) -> str:
+    """A board's header line: the map's title on a match with several (its
+    name and place among the maps the view knows of, or the unnamed label
+    of a map it hasn't seen), and the viewport window when one is engaged
+    ("" when neither applies)."""
     bits = []
     if len(m.maps) > 1:
-        bits.append(f"map `{mp.name}`")
-    if viewport:
+        bits.append(m.map_heading(mp, pov))
+    if viewport and m.map_blank_text(mp, pov) is None:
         vx, vy, vw, vh = viewport
         bits.append(f"viewport ({vx},{vy})–({vx + vw - 1},{vy + vh - 1}) "
                     f"of {mp.grid_width}×{mp.grid_height}")
@@ -758,7 +764,7 @@ async def _apply_board(message, m, channel_key: str, mgr: MatchManager) -> bool:
     if getattr(m, "render_mode", "text") == "image":
         try:
             header, data, engaged = await _board_image(m, channel_key, mgr)
-            view = _PanView(channel_key, mgr) if engaged else None
+            view = _board_view(m, channel_key, mgr, engaged)
             await message.edit(
                 content=(header or None),
                 attachments=[discord.File(io.BytesIO(data),
@@ -768,7 +774,7 @@ async def _apply_board(message, m, channel_key: str, mgr: MatchManager) -> bool:
         except Exception:
             pass  # fall through to a text board
     text, engaged = _board_render(m, channel_key)
-    view = _PanView(channel_key, mgr) if engaged else None
+    view = _board_view(m, channel_key, mgr, engaged)
     await message.edit(content=text, attachments=[], view=view)
     return engaged
 
@@ -780,40 +786,137 @@ def _pan_step(m, axis_dim: int) -> int:
     return step if step > 0 else max(1, axis_dim // 2)
 
 
-class _PanView(discord.ui.View):
-    """The 4 arrow buttons under an auto-update board. Each click pans that
-    channel's viewport by the button step and edits the board in place."""
+def _board_map(m, channel_key: str):
+    """The map a channel's board shows: the one a viewer browsed to with
+    the board's map buttons, until the next turn change (any team's) or
+    until the view may no longer list it; else the channel's map (`!map
+    use`, else the map the board follows). Browsing is the board's own
+    display state: nothing else reads it."""
+    entry = _boards.get(channel_key)
+    pov = m.channel_pov(channel_key)
+    browse = (entry or {}).get("browse")
+    if browse and browse.get("match") == m.id \
+            and browse.get("turn") == m.turns_elapsed:
+        mp = m.maps.get(browse.get("map"))
+        if mp is not None and mp in m.listed_maps(pov):
+            return mp
+    if entry is not None:
+        entry.pop("browse", None)
+    return m.channel_map(channel_key, pov)
 
-    def __init__(self, channel_key: str, mgr: MatchManager):
+
+def _board_view(m, channel_key: str, mgr: MatchManager, engaged: bool):
+    """The buttons under a board: the pan arrows while the viewport is
+    engaged, and map browsing while the channel's view knows of several
+    maps (None when neither applies)."""
+    maps = m.listed_maps(m.channel_pov(channel_key))
+    if not engaged and len(maps) < 2:
+        return None
+    return _BoardView(channel_key, mgr, engaged, len(maps))
+
+
+# More maps than this get a select menu instead of the ◀ ▶ buttons.
+_BOARD_MAP_BUTTONS_MAX = 5
+
+
+class _BoardView(discord.ui.View):
+    """The controls under an auto-update board: 4 pan arrows (each click
+    pans that channel's viewport on the shown map by the button step) and,
+    on a match with several maps the channel's view knows of, ◀ ▶ buttons
+    or a select menu that show another map until the next turn change.
+    Each click edits the board in place."""
+
+    def __init__(self, channel_key: str, mgr: MatchManager, pan: bool,
+                 n_maps: int):
         super().__init__(timeout=None)
         self.channel_key = channel_key
         self._mgr = mgr
+        if pan:
+            for label, dx, dy in (("⬆", 0, -1), ("⬇", 0, 1), ("⬅", -1, 0),
+                                  ("➡", 1, 0)):
+                btn = discord.ui.Button(label=label, row=0,
+                                        style=discord.ButtonStyle.secondary)
+                btn.callback = self._pan_cb(dx, dy)
+                self.add_item(btn)
+        if n_maps > _BOARD_MAP_BUTTONS_MAX:
+            m = self._match()
+            if m is not None:
+                pov = m.channel_pov(channel_key)
+                listed = m.listed_maps(pov)[:25]
+                opts = [discord.SelectOption(
+                            label=f"{i + 1}. {m.map_label(mp, pov)}".replace(
+                                "`", "")[:100], value=str(i))
+                        for i, mp in enumerate(listed)]
+                sel = discord.ui.Select(placeholder="Show another map",
+                                        options=opts, row=1)
 
-    async def _pan(self, interaction, dx: int, dy: int):
-        # Pan the match the BOARD shows (the channel may have switched its
-        # active match since); a board whose channel was unbound is retired.
+                async def _picked(interaction, sel=sel):
+                    await self._browse(interaction, index=int(sel.values[0]))
+                sel.callback = _picked
+                self.add_item(sel)
+        elif n_maps > 1:
+            for label, step in (("◀ map", -1), ("map ▶", 1)):
+                btn = discord.ui.Button(label=label, row=1,
+                                        style=discord.ButtonStyle.secondary)
+                btn.callback = self._browse_cb(step)
+                self.add_item(btn)
+
+    def _match(self):
         entry = _boards.get(self.channel_key)
         mid = (entry or {}).get("match_id") or \
             self._mgr.get_active_for_channel(self.channel_key)
-        m = self._mgr.matches.get(mid) if mid else None
+        return self._mgr.matches.get(mid) if mid else None
+
+    def _pan_cb(self, dx: int, dy: int):
+        async def _cb(interaction):
+            await self._pan(interaction, dx, dy)
+        return _cb
+
+    def _browse_cb(self, step: int):
+        async def _cb(interaction):
+            await self._browse(interaction, step=step)
+        return _cb
+
+    async def _ack(self, interaction) -> None:
+        try:
+            await interaction.response.defer()
+        except Exception:
+            pass
+
+    async def _usable_match(self, interaction):
+        """The match the BOARD shows (the channel may have switched its
+        active match since); None after retiring a board whose channel was
+        unbound."""
+        entry = _boards.get(self.channel_key)
+        m = self._match()
         if m is not None and self.channel_key not in m.bound_channels:
-            try:
-                await interaction.response.defer()
-            except Exception:
-                pass
+            await self._ack(interaction)
             if entry is not None:
                 entry["message"] = interaction.message
-                await _retire_board(self.channel_key, entry, mid)
+                await _retire_board(self.channel_key, entry, m.id)
+            return None
+        return m
+
+    async def _redraw(self, interaction, m) -> None:
+        entry = _boards.get(self.channel_key)
+        if entry is not None:
+            entry["message"] = interaction.message
+        await self._ack(interaction)
+        try:
+            await _apply_board(interaction.message, m, self.channel_key,
+                               self._mgr)
+        except Exception:
+            pass
+
+    async def _pan(self, interaction, dx: int, dy: int):
+        m = await self._usable_match(interaction)
+        if m is None:
             return
         # The map the board shows (a match with several maps has a camera
         # per map).
-        mp = m.channel_map(self.channel_key, m.channel_pov(self.channel_key)) \
-            if m is not None else None
-        if m is None or not m.viewport_engaged(mp):
-            try:
-                await interaction.response.defer()
-            except Exception:
-                pass
+        mp = _board_map(m, self.channel_key)
+        if not m.viewport_engaged(mp):
+            await self._ack(interaction)
             return
         # A click isn't a command, but it changes the camera like one: it
         # waits for the command running on this server and is saved after.
@@ -821,36 +924,29 @@ class _PanView(discord.ui.View):
             vw, vh = m._viewport_dims(mp)
             m.pan_view(self.channel_key,
                        dx * _pan_step(m, vw), dy * _pan_step(m, vh), mp)
+        await self._redraw(interaction, m)
+
+    async def _browse(self, interaction, step: int = 0,
+                      index: Optional[int] = None):
+        m = await self._usable_match(interaction)
+        if m is None:
+            return
         entry = _boards.get(self.channel_key)
-        if entry is not None:
-            entry["message"] = interaction.message
-        # Ack the click, then re-render the board in place (text OR image, via
-        # the unified _apply_board so panning works for both modes).
-        try:
-            await interaction.response.defer()
-        except Exception:
-            pass
-        try:
-            await _apply_board(interaction.message, m, self.channel_key,
-                               self._mgr)
-        except Exception:
-            pass
-
-    @discord.ui.button(label="⬆", style=discord.ButtonStyle.secondary)
-    async def up(self, interaction, button):
-        await self._pan(interaction, 0, -1)
-
-    @discord.ui.button(label="⬇", style=discord.ButtonStyle.secondary)
-    async def down(self, interaction, button):
-        await self._pan(interaction, 0, 1)
-
-    @discord.ui.button(label="⬅", style=discord.ButtonStyle.secondary)
-    async def left(self, interaction, button):
-        await self._pan(interaction, -1, 0)
-
-    @discord.ui.button(label="➡", style=discord.ButtonStyle.secondary)
-    async def right(self, interaction, button):
-        await self._pan(interaction, 1, 0)
+        listed = m.listed_maps(m.channel_pov(self.channel_key))
+        if entry is None or not listed:
+            await self._ack(interaction)
+            return
+        cur = _board_map(m, self.channel_key)
+        if index is None:
+            i = listed.index(cur) if cur in listed else 0
+            index = (i + step) % len(listed)
+        index = max(0, min(index, len(listed) - 1))
+        # Browsing is display state on this board only (no undo step, no
+        # journal entry); the next turn change returns it to its followed
+        # map (_board_map).
+        entry["browse"] = {"match": m.id, "map": listed[index].name,
+                           "turn": m.turns_elapsed}
+        await self._redraw(interaction, m)
 
 
 async def _refresh_boards_for_match(mgr: MatchManager, match_id: str) -> None:

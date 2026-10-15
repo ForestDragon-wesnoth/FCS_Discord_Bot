@@ -209,7 +209,7 @@ ELEVATED_ARGS: Dict[str, frozenset] = {
     "map": frozenset({"full", "resize", "color", "teamcolor", "layer",
                       "legend", "autoupdate", "background", "border", "mode",
                       "coords", "new", "delete", "rename", "copy", "use",
-                      "var"}),
+                      "var", "unseen"}),
     "list": frozenset({"full"}),
     # `!log` reads for anyone, but `clear` wipes the match's event log.
     "log": frozenset({"clear"}),
@@ -2448,9 +2448,34 @@ def _maps_hint(m: "Match", many: bool) -> str:
     return f"This match has {len(m.maps)} maps ({names}): add {opts}."
 
 
+# Sentinel distinguishing "no transient POV override on this ctx" (or no
+# view given) from "override is set to omniscient" (both render
+# everything, but absence means fall back to the channel binding).
+_NO_POV = object()
+
+
+def _map_for_view(m: "Match", name: str, pov: Optional[str]) -> "Map":
+    """Map `name` as a channel viewing as team `pov` may name it: a map the
+    team can't name (unseen and blank_unnamed / hidden) is refused exactly
+    like one that doesn't exist (Match.get_map's wording)."""
+    mp = m.maps.get(name)
+    if mp is not None and m.map_named_for(mp, pov):
+        return mp
+    return _no_such_map(name)
+
+
+def _no_such_map(name: str) -> "Map":
+    """The refusal for a map that doesn't exist, also given for one the
+    channel's view may not name, so the reply never proves it exists."""
+    raise NotFound(
+        f"Could not find a map named `{name}`. Either this map does not "
+        f"exist, or this channel currently does not have permission to "
+        f"view it.")
+
+
 def _resolve_maps(ctx: ReplyContext, m: "Match", spec: Optional[str], *,
                   unit: Optional["Entity"] = None, strict: bool = False,
-                  many: bool = False) -> List["Map"]:
+                  many: bool = False, pov: Any = _NO_POV) -> List["Map"]:
     """The map(s) a command acts on, by the hierarchy: 1. the explicit
     `map=` spec (a name, `a,b`, `all` or `view` = the channel's map; lists
     and `all` only where `many`); 2. the map of the unit the command is
@@ -2458,14 +2483,20 @@ def _resolve_maps(ctx: ReplyContext, m: "Match", spec: Optional[str], *,
     the map its board follows). `strict` (broad per-map edits, single
     placements) refuses tier 4 on a match with several maps, `!map use`
     included (a host who forgot it would edit the wrong map); `map=view`
-    names the channel's map on purpose."""
+    names the channel's map on purpose. A read (not `strict`: host-only
+    edits state the facts) under a team view names only the maps that team
+    may name (`pov`, default the channel's view; unseen_map_display)."""
+    if strict:
+        pov = None
+    elif pov is _NO_POV:
+        pov = _view_pov(ctx, m, [])
     if spec is not None:
         spec = spec.strip()
         if spec.lower() == "all":
             if not many:
                 raise VTTError("`map=all` names every map, but this acts "
                                "on one: add `map=<name>`.")
-            return list(m.maps.values())
+            return [mp for mp in m.maps.values() if m.map_named_for(mp, pov)]
         names = [n.strip() for n in spec.split(",") if n.strip()]
         if not names:
             raise VTTError("`map=` needs a map name.")
@@ -2474,7 +2505,7 @@ def _resolve_maps(ctx: ReplyContext, m: "Match", spec: Optional[str], *,
         out: List["Map"] = []
         for n in names:
             mp = (m.channel_map(ctx.channel_key, _view_pov(ctx, m, []))
-                  if n.lower() == "view" else m.get_map(n))
+                  if n.lower() == "view" else _map_for_view(m, n, pov))
             if mp not in out:
                 out.append(mp)
         return out
@@ -9137,11 +9168,6 @@ async def match_top_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             parts.append(f"- `{pid}` ({p.when}): `{p.formula}`")
     return await ctx.send("\n".join(parts))
 
-# Sentinel distinguishing "no transient POV override on this ctx" from
-# "override is set to omniscient" (both render everything, but absence
-# means fall back to the channel binding).
-_NO_POV = object()
-
 
 def _as_arg(args: List[str]) -> Any:
     """The team named by an `as=<team>` render arg (None for
@@ -9326,7 +9352,15 @@ def _query_eid(ctx: ReplyContext, m: "Match", token: str) -> str:
     channel's POV can't see exactly like a missing one (same message, which
     echoes what was typed — never the resolved id)."""
     eid = _resolve_eid(m, token)
-    if eid not in m.entities or _pov_hides(m, _query_pov(ctx, m), eid):
+    pov = _query_pov(ctx, m)
+    if eid not in m.entities or _pov_hides(m, pov, eid):
+        if pov is not None:
+            # Under a team view a hidden unit and a missing one read alike,
+            # and the wording says either may be the case.
+            raise NotFound(
+                f"Could not find a unit named `{token}`. Either it does not "
+                f"exist, or this channel currently does not have permission "
+                f"to view it.")
         raise NotFound(f"Entity '{token}' not found.")
     return eid
 
@@ -9400,11 +9434,13 @@ def _map_render_reply(ctx: ReplyContext, m, args: List[str],
         ctx.channel_key, enabled=_viewport_enabled(ctx, m), mp=mp)
     legend = _legend_flag(m, args)
     coords = _coords_flag(args)
-    header = (f"🗺️ map `{mp.name}` ({mp.size_text()})\n"
-              if len(m.maps) > 1 else "")
-    if viewport:
+    title = m.map_heading(mp, pov)
+    blank = m.map_blank_text(mp, pov) is not None
+    header = (f"🗺️ {title}" + ("" if blank else f" ({mp.size_text()})")
+              + "\n" if len(m.maps) > 1 else "")
+    if viewport and not blank:
         vx, vy, vw, vh = viewport
-        header = (f"🗺️ " + (f"map `{mp.name}` · " if len(m.maps) > 1 else "")
+        header = (f"🗺️ " + (f"{title} · " if len(m.maps) > 1 else "")
                   + f"viewport ({vx},{vy})–({vx + vw - 1},{vy + vh - 1}) "
                   f"of {mp.grid_width}×{mp.grid_height} · "
                   f"`!map pan <dir> [n]` / `!map center <eid>`\n")
@@ -9897,6 +9933,7 @@ for _sub, _usage in (
         ("ent_sight", "!map ent_sight <eid> [color=<r,g,b>] [opacity=<0-100>]"),
         ("background", "!map background <key|clear> [stretch|tile|center] [map=<map>]"),
         ("border", "!map border <on | off | clear | color <name> | opacity <0-100>> [map=<map>]"),
+        ("unseen", "!map unseen [show | blank_named | blank_unnamed | hidden | default] [map=<map>]"),
         ("mode", "!map mode <text|image>"),
         ("scene", "!map scene [full] [list] [as=<team>] [hide=<layers>] [coords=on|off] [legend=on|off] [map=<map>]"),
         ("image", "!map image [full] [as=<team>] [hide=<layers>] [coords=on|off] [legend=on|off] [map=<map>]"),
@@ -9944,10 +9981,21 @@ async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
                               f"on **{m.name}** ({len(m.maps)} maps).")
     if sub == "list":
         _check_tail(args, 1, (), "!map list")
-        here = m.channel_map(ctx.channel_key, _view_pov(ctx, m, []))
+        view = _view_pov(ctx, m, [])
+        here = m.channel_map(ctx.channel_key, view)
         pov = _query_pov(ctx, m)
-        lines = [f"**Maps of {m.name}:**"]
-        for mp in m.maps.values():
+        # A team's view lists the maps it may know of (unseen_map_display:
+        # a hidden one isn't listed or counted, an unnamed one is listed
+        # without its name); an omniscient view lists every map, and how
+        # each shows to a team that hasn't seen it.
+        listed = m.listed_maps(view)
+        lines = [f"**Maps of {m.name}** ({len(listed)}):"]
+        for mp in listed:
+            mark = " ← this channel" if mp is here else ""
+            shown = m.map_display(mp, view)
+            if shown != "show":
+                lines.append(f"- {m.map_label(mp, view)}: not seen yet{mark}")
+                continue
             # Only the units this channel's view may list (a hidden unit
             # isn't counted, as !find doesn't list it).
             n = sum(1 for e in m.units_on_map(mp.name)
@@ -9955,7 +10003,8 @@ async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
             bits = [mp.size_text(), f"{n} unit{'s' if n != 1 else ''}"]
             if m.fog_on(mp):
                 bits.append("fog")
-            mark = " ← this channel" if mp is here else ""
+                if view is None and m.map_unseen_mode(mp) != "show":
+                    bits.append(f"unseen: {m.map_unseen_mode(mp)}")
             lines.append(f"- `{mp.name}`: {', '.join(bits)}{mark}")
         return await ctx.send("\n".join(lines))
     if sub == "delete":
@@ -10005,7 +10054,7 @@ async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
             here = m.channel_map(ctx.channel_key, _view_pov(ctx, m, []))
             return await ctx.send(f"This channel follows its board again "
                                   f"(now map `{here.name}`).")
-        mp = m.get_map(args[1])
+        mp = _map_for_view(m, args[1], _view_pov(ctx, m, []))
         m.channel_maps[ctx.channel_key] = mp.name
         return await ctx.send(f"This channel now uses map `{mp.name}`.")
     # ---- var set|get|del|list ----
@@ -10072,8 +10121,10 @@ async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     args, mapspec = _pop_map_opt(args)
-    if args and args[0] in m.maps:
-        # `!map <name> [options]` renders that map.
+    if args and args[0] in m.maps and m.map_named_for(
+            m.maps[args[0]], _view_pov(ctx, m, args[1:])):
+        # `!map <name> [options]` renders that map (a map the channel's
+        # view may not name reads like an unknown word).
         if mapspec is not None:
             raise VTTError("Name the map once: `!map <name>` or "
                            "`!map map=<name>`.")
@@ -10091,7 +10142,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # reads or renders one map by the hierarchy (`!map center <eid>`
     # frames that unit's map).
     writes = (sub == "resize"
-              or (sub in ("background", "border") and len(args) >= 2)
+              or (sub in ("background", "border", "unseen") and len(args) >= 2)
               or (sub == "layer" and len(args) >= 2
                   and args[1].lower() != "list"))
     unit = None
@@ -10104,7 +10155,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if ce is not None and not _pov_hides(m, _query_pov(ctx, m), ce.id):
             unit = ce
     maps = _resolve_maps(ctx, m, mapspec, unit=unit, strict=writes,
-                         many=writes)
+                         many=writes, pov=_view_pov(ctx, m, args))
     if len(maps) > 1:
         return await _fan_out(ctx, map_cmd, mgr, args, maps)
     mp = maps[0]
@@ -10137,6 +10188,27 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         m.set_map_setting(mp, "background_mode", mode)
         return await ctx.send(f"Background sprite `{key}` ({mode})"
                               f"{_on_map(m, mp)}.")
+    if args and args[0].lower() == "unseen":
+        # How the map shows to a team that hasn't seen it: its own unseen
+        # setting (a map var), else the unseen_map_display rule.
+        _check_tail(args, 2, (), "!map unseen [<mode> | default]")
+        if len(args) < 2:
+            own = mp.vars.get(m.map_var_name("unseen"))
+            return await ctx.send(
+                f"Unseen{_on_map(m, mp)}: {m.map_unseen_mode(mp)} "
+                + ("(the map's own setting)." if own is not None else
+                   "(the unseen_map_display rule).")
+                + " Set: `!map unseen show|blank_named|blank_unnamed|"
+                  "hidden`, `default` for the rule.")
+        word = args[1].lower()
+        if word == "default":
+            m.set_map_setting(mp, "unseen", None)
+            return await ctx.send(
+                f"Unseen{_on_map(m, mp)}: back to the unseen_map_display "
+                f"rule ({m.map_unseen_mode(mp)}).")
+        m.set_map_setting(mp, "unseen", map_setting_value("unseen", word))
+        return await ctx.send(f"Unseen{_on_map(m, mp)}: {word} (how the map "
+                              f"shows to a team that hasn't seen it).")
     if args and args[0].lower() == "border":
         # !map border [on|off] | color <name> | opacity <0-100> | clear
         # Per-match override of the show_borders/border_color/border_opacity
@@ -10228,6 +10300,9 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             hidden_layers=(m.hidden_layers_of(mp) | scene_hidden)
             if scene_hidden else None,
             legend=_legend_flag(m, sub), mp=mp)
+        if scene.get("blank"):
+            # A map the view hasn't seen: a blank board in both renderers.
+            return await ctx.send(f"Scene: blank board — {scene['blank']}")
         coords = _coords_flag(sub)
         if coords is not None:
             scene["coords"] = coords
@@ -10524,6 +10599,47 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
              _coords_flag(args), _legend_flag(m, args), mp)
     return await ctx.send(reply)
 
+def _roster_groups(m: "Match", units: List["Entity"], pov: Optional[str],
+                   active_id: Optional[str]) -> List[str]:
+    """`!list` lines of a match with several maps: units grouped by map then
+    team, or team then map (roster_map_grouping), each group in turn
+    order; map headings name the map as the view may (map_label)."""
+    order = str(m.rules.get("roster_map_grouping", "map_team"))
+    maps = list(m.maps)
+
+    def team_head(t: Optional[str]) -> str:
+        return f"Team `{t}`:" if t else "No team:"
+
+    def map_head(name: str) -> str:
+        return f"Map {m.map_label(m.maps[name], pov)}:"
+    # The team the view sees: a disguise's team for a fooled team.
+    shown: Dict[str, Optional[str]] = {}
+    teams: List[Optional[str]] = []
+    for e in units:
+        t = m.presented_vars(e, pov).get(e._team_var_name())
+        shown[e.id] = None if t in (None, "") else str(t)
+        if shown[e.id] not in teams:
+            teams.append(shown[e.id])
+    keyed = [((maps.index(e.map), teams.index(shown[e.id]))
+              if order == "map_team"
+              else (teams.index(shown[e.id]), maps.index(e.map)), i, e)
+             for i, e in enumerate(units)]
+    out: List[str] = []
+    outer = inner = object()
+    for (a, b), _i, e in sorted(keyed, key=lambda k: (k[0], k[1])):
+        heads = ((map_head(maps[a]), team_head(teams[b])) if order == "map_team"
+                 else (team_head(teams[a]), map_head(maps[b])))
+        if a != outer:
+            out.append(heads[0])
+            outer, inner = a, object()
+        if b != inner:
+            out.append("  " + heads[1])
+            inner = b
+        marker = "→" if e.id == active_id else "  "
+        out.append(f"  {marker} {_entity_line(e, pov)}")
+    return out
+
+
 @registry.command("list", access="all", usage="!list [full] [as=<team>]", desc="List entities (turn order) from this channel's POV, plus a Dead: section of corpses when show_corpses_in_entity_list is enabled. `!list full` (host-gated) ignores visibility; `as=<team>` (host-only) previews what that team sees.")
 async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
@@ -10544,7 +10660,9 @@ async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                if m.roster_shows(e) and not _pov_hides(m, pov, e.id)]
     if visible:
         lines.append("Entities:")
-        for e in visible:
+        if len(m.maps) > 1:
+            lines.extend(_roster_groups(m, visible, pov, active_id))
+        for e in (visible if len(m.maps) == 1 else ()):
             marker = "→" if e.id == active_id else "  "
             lines.append(f"{marker} {_entity_line(e, pov)}")
     # Dead: section. Each corpse rendered via _corpse_line which honors
@@ -10561,7 +10679,13 @@ async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if lines:
                 lines.append("")  # blank line separates living from dead
             lines.append("Dead:")
-            for (x, y, eid, corpse, cmp) in corpses:
+            last_map = None
+            for (x, y, eid, corpse, cmp) in sorted(
+                    corpses, key=lambda c: list(m.maps).index(c[4].name)
+                    if len(m.maps) > 1 else 0):
+                if len(m.maps) > 1 and cmp is not last_map:
+                    lines.append(f"Map {m.map_label(cmp, pov)}:")
+                    last_map = cmp
                 lines.append(f"   {_corpse_line(m, x, y, eid, corpse, cmp)}")
     if not lines:
         return await ctx.send(_as_note(args) + "(no entities)")
@@ -10764,10 +10888,13 @@ def _bind_find_maps(ctx: ReplyContext, m: Match, selectors) -> list:
     channel's map by the hierarchy."""
     named = [alts[0][1] for neg, alts in selectors
              if not neg and len(alts) == 1 and alts[0][0] == "map"]
+    view = _view_pov(ctx, m, [])
     for neg, alts in selectors:
         for kind, key, _v in alts:
-            if kind == "map" and key not in m.maps:
-                m.get_map(key)        # refuses with the map list
+            if kind == "map":
+                # A map the channel's view may not name reads like a
+                # missing one.
+                _map_for_view(m, key, view)
     if not any(k == "within" for _n, alts in selectors for k, _k, _v in alts):
         return selectors
     if len(set(named)) > 1:

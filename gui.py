@@ -158,6 +158,15 @@ class GuiApp:
         self.zoom_label.pack(side="left", padx=6)
         tk.Label(bar, text="(drag to pan · wheel/Ctrl+wheel to zoom)",
                  bg="#0e0e12", fg="#707070").pack(side="left")
+        # Map browsing (a match with several maps the view knows of): shows
+        # another map until the next turn change, as a Discord board's map
+        # buttons do. Display state only; the labels follow the view
+        # (an unseen map may show unnamed, a hidden one isn't listed).
+        from tkinter import ttk
+        self._browse = None    # (match id, map name, turns_elapsed)
+        self._map_choices: List[Any] = []
+        self.map_pick = ttk.Combobox(bar, state="readonly", width=24)
+        self.map_pick.bind("<<ComboboxSelected>>", self._on_map_pick)
 
         # ---- Widget creation ----
         # Canvas + scrollbars (the map). Packed LAST (see below) so it's the
@@ -498,10 +507,19 @@ class GuiApp:
                 pov = None
         if legend is None:
             legend = bool(getattr(m, "map_legend_enabled", False))
-        # The map drawn: the one the view named, else the channel's map.
+        # The map drawn: the one the view named, else the one picked in the
+        # map menu (until the next turn change), else the channel's map.
+        listed = m.listed_maps(pov)
         mp = m.maps.get(map_name) if map_name else None
+        b = self._browse
+        if mp is None and b and b[0] == m.id and b[2] == m.turns_elapsed:
+            mp = m.maps.get(b[1])
+            if mp not in listed:
+                mp = None
         if mp is None:
+            self._browse = None
             mp = m.channel_map(getattr(self.ctx, "channel_key", None), pov)
+        self._update_map_pick(m, pov, listed, mp)
         scene = m.render_scene(pov_team=pov, hidden_layers=hidden, legend=legend,
                                mp=mp)
         if coords is not None:
@@ -523,6 +541,32 @@ class GuiApp:
         self.canvas.config(scrollregion=(0, 0, img.width, img.height))
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor="nw", image=self._photo)
+
+    def _update_map_pick(self, m, pov, listed, shown) -> None:
+        """Show the map menu on a match whose view knows of several maps,
+        listing them as the view names them, with the shown map selected."""
+        if len(listed) < 2:
+            self.map_pick.pack_forget()
+            return
+        self._map_choices = listed
+        labels = [f"{i + 1}. {m.map_label(mp, pov)}".replace("`", "")
+                  for i, mp in enumerate(listed)]
+        self.map_pick.configure(values=labels)
+        if shown in listed:
+            self.map_pick.current(listed.index(shown))
+        self.map_pick.pack(side="right", padx=4)
+
+    def _on_map_pick(self, _event=None) -> None:
+        m = self._active_match()
+        i = self.map_pick.current()
+        if m is None or not 0 <= i < len(self._map_choices):
+            return
+        self._view = None       # a `!map` view gives way to the pick
+        self._browse = (m.id, self._map_choices[i].name, m.turns_elapsed)
+        try:
+            self.redraw()
+        except Exception as e:
+            self.log(f"⚠️ render error: {e}")
 
     def _on_enter(self, _event=None):
         # Bound to <Return>: run all lines, and suppress the default newline

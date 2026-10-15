@@ -15183,8 +15183,9 @@ SCENARIO 579 — Queries respect the channel POV (pov_filters_queries)
 
 Expected: with the channel bound `pov=red` and fog on, the red scout sees 3 cells
 around (1,1). Player queries now hide what the red map hides: `!ent info ghost`
-and `!dist scout ghost` say "Entity 'ghost' not found" (the same message as a
-truly missing id), `!find hp>0` lists only scout, wall, jeep and pilot, and the
+and `!dist scout ghost` say "Could not find a unit named `ghost`. Either it
+does not exist, or this channel currently does not have permission to view
+it." (the same message as a truly missing id), `!find hp>0` lists only scout, wall, jeep and pilot, and the
 read-only `!foreach` sweep runs `ent info` for those four only. `!map center
 ghost` answers "no entity" (on a map big enough for the viewport it would
 otherwise frame the ghost's location). The 3-wide blue
@@ -19406,7 +19407,7 @@ SCENARIO 703 — !map ent_sight under a team POV: own units only, nothing past t
 !map ent_sight gob
 ?? You can check the sight of your own team's units only
 !map ent_sight orc
-?? Entity 'orc' not found
+?? Could not find a unit named `orc`. Either it does not exist
 !as host
 !map ent_sight gob
 ?? Gob (`gob`) sees 24 cell(s)
@@ -23288,7 +23289,7 @@ SCENARIO 782 — Maps: create, list, rename, delete (refuse or kill the units on
 !map list
 ?? - `cellar`: 6x4, 2 units
 !map cellar
-?? 🗺️ map `cellar` (6x4)
+?? 🗺️ map `cellar` (2 of 2) (6x4)
 !ent info rat
 ?? Position: (3,3) on cellar
 !map rename cellar vault
@@ -24672,7 +24673,7 @@ SCENARIO 811 — inline_args_access = host covers !ent, !foreach and queued requ
 ?? **Hero** (`hero`)
 !as host
 !ent info $(entity[hero].team)
-?? ❌ Entity 'red' not found.
+?? ❌ Could not find a unit named `red`. Either it does not exist
 
 Expected: A non-host's `$()` is refused for every command, `!ent` and
 `!foreach` included (they resolve their arguments themselves), and before a
@@ -25576,7 +25577,7 @@ SCENARIO 832 — Scatter across maps: N in total, and the per-map loop
 
 !match new sc SC 6 4
 !match use sc
-!map new loft 3 3
+!map new loft 3 1
 !ent add ogre Ogre 10 1 1 map=main
 !ent set_vars ogre footprint_w=2 footprint_h=2
 !func def scatter n "for i in range(n):\n    match.c = random_free_cell(1, 1, 6, 4, map='all')\n    summon({'name': 'Rat', 'vars': {'hp': 1}}, coord_x(match.c), coord_y(match.c), map=coord_map(match.c))\nn"
@@ -25592,7 +25593,7 @@ SCENARIO 832 — Scatter across maps: N in total, and the per-map loop
 
 Expected: `random_free_cell(..., map='all')` picks among the free cells
 of every map (each equally likely, so the 6x4 map gets a bigger share
-than the 3x3 loft) and returns `[x, y, map]`; six calls place six rats
+than the 3x1 loft) and returns `[x, y, map]`; six calls place six rats
 in total across both maps. Only `main` has room for the 2x2 ogre, so a
 pick for it with `map=['main', 'loft']` lands on main and
 `move_entity(ogre, match.c)` takes the triple. Looping `for m in maps()` with
@@ -25737,3 +25738,243 @@ there is no relation: `can_see` / `has_los` with another map are False,
 `nearest_cell` toward a cell on another map is None and `face_toward`
 refuses. `coord_x` / `coord_y` read triples and `coord_map` names the
 map (None for a pair); `clip_cells` clips each triple to its own map.
+
+SCENARIO 837 — Unseen maps per mode: lists, counts, blank boards and refusals
+----------------------------------------------------------------------
+
+!match new us US 6 4
+!match use us
+!map new crypt 4 4
+!map new vault 4 4
+!map new attic 4 4
+!map new shop 4 4
+!match fog on map=all
+!defvar add fog_vision_radius 2
+!ent add scout Scout 10 1 1 map=main
+!ent set_var scout team red
+!map unseen blank_named map=crypt
+!map unseen hidden map=vault
+!map unseen show map=shop
+!map list
+?? unseen: hidden
+!as view red
+!map list
+?? **Maps of US** (4):
+?? - `crypt`: not seen yet
+?? - Unexplored map: not seen yet
+?? - `shop`: 4x4, 0 units, fog
+?! vault
+?! attic
+!map crypt
+?? 🗺️ map `crypt` (2 of 4)
+?? 🌫️ crypt: your side hasn't seen this map yet.
+!map shop
+?? 🗺️ map `shop` (4 of 4) (4x4)
+!map map=vault
+?? ❌ Could not find a map named `vault`. Either this map does not exist, or this channel currently does not have permission to view it.
+!map map=attic
+?? ❌ Could not find a map named `attic`. Either this map does not exist, or this channel currently does not have permission to view it.
+!map map=nowhere
+?? ❌ Could not find a map named `nowhere`. Either this map does not exist, or this channel currently does not have permission to view it.
+!map attic
+?? isn't a valid
+!map use vault
+?? ❌ Could not find a map named `vault`.
+!find map:vault count
+?? ❌ Could not find a map named `vault`.
+?tab "!map map="
+?? map=crypt
+?? map=shop
+?! vault
+?! attic
+!as view clear
+!ent tp scout 2 2 vault
+!as view red
+!map list
+?? **Maps of US** (5):
+?? - `vault`: 4x4, 1 unit, fog ← this channel
+!map map=vault
+?? 🗺️ map `vault` (3 of 5) (4x4)
+
+Expected: HARNESS-ALLOWS-ERRORS. Fog is on everywhere and red's only unit
+stands on main, so red hasn't seen the other maps. Each map's `!map
+unseen` setting decides how it shows: crypt `blank_named` (listed by
+name, `!map crypt` gives a blank board naming it), attic the rule's
+default `blank_unnamed` (listed as "Unexplored map", counted, but naming
+it reads like a map that doesn't exist), vault `hidden` (neither listed
+nor counted: red knows of 4 maps), shop `show` (renders, all fog). The
+omniscient list says which mode applies. `map=vault`, `map=attic` and
+`map=nowhere` give the same two-sided refusal, as do `!map use` and
+`!find map:`; completion offers only crypt and shop (and main). Once the
+scout steps into the vault, red has seen it: it lists by name, counts (5)
+and renders.
+
+SCENARIO 838 — What counts as seen: fog off, reveals, fog memory; the rule and default
+----------------------------------------------------------------------
+
+!match new sn SN 6 4
+!match use sn
+!map new cave 4 4
+!map new pit 4 4
+!map new tomb 4 4
+!match fog on map=main,cave,pit
+!ent add rogue Rogue 10 1 1 map=main
+!ent set_var rogue team red
+!system set default unseen_map_display blank_named
+!as view red
+!map list
+?? - `cave`: not seen yet
+?? - `pit`: not seen yet
+?? - `tomb`: 4x4, 0 units
+!as view clear
+!reveal_fog red at 2 2 0 map=cave
+!match fog memory on map=pit
+!ent add bat Bat 3 2 2 map=pit
+!ent set_var bat team red
+!ent move bat 1 right
+!ent remove bat
+!as view red
+!map list
+?? - `cave`: 4x4, 0 units, fog
+?? - `pit`: 4x4, 0 units, fog
+!as view clear
+!system set default unseen_map_display hidden
+!map unseen default map=cave
+?? back to the unseen_map_display rule (hidden)
+!system set default unseen_map_message_format "Nobody from your side has been to {map}."
+!system set default unseen_map_unnamed_label "a dark place"
+!map new deep 3 3
+!match fog on map=deep
+!map unseen blank_unnamed map=deep
+!as view red
+!map deep
+?? isn't a valid
+!map list
+?? - a dark place: not seen yet
+!as view clear
+!map unseen sometimes map=deep
+?? ❌ The unseen setting is one of show, blank_named, blank_unnamed, hidden, got `sometimes`.
+!system set default unseen_map_display sideways
+?? ❌
+
+Expected: HARNESS-ALLOWS-ERRORS. A map counts as seen by a team when fog
+is off there (tomb), when the team has a unit on it, a reveal on it
+(`!reveal_fog red ... map=cave`) or fog memory of it: with fog memory on,
+the red bat explored part of the pit before it was removed, so the pit
+stays seen. The unseen_map_display rule applies to every map without its
+own setting (`!map unseen default` goes back to it); the message and the
+unnamed label are rules too. Unknown modes are refused.
+
+SCENARIO 839 — Two-sided wording for units under a team view
+----------------------------------------------------------------------
+
+!match new tw TW 8 4
+!match use tw
+!match fog on
+!defvar add fog_vision_radius 1
+!ent add elf Elf 10 1 1
+!ent set_var elf team red
+!ent add orc Orc 10 7 3
+!ent set_var orc team blue
+!as view red
+!ent info orc
+?? ❌ Could not find a unit named `orc`. Either it does not exist, or this channel currently does not have permission to view it.
+!ent info troll
+?? ❌ Could not find a unit named `troll`. Either it does not exist, or this channel currently does not have permission to view it.
+!as view clear
+!ent info troll
+?? Entity 'troll' not found.
+
+Expected: HARNESS-ALLOWS-ERRORS. Under red's view the fogged orc and a
+unit that doesn't exist get the same two-sided reply, so the reply never
+proves the orc exists. An omniscient view, where nothing is hidden,
+keeps the plain "not found".
+
+SCENARIO 840 — Roster grouped by map and team; the grouping rule
+----------------------------------------------------------------------
+
+!match new ro RO 6 4
+!match use ro
+!map new keep 4 4
+!ent add a1 Alf 10 1 1 5 map=main
+!ent set_var a1 team red
+!ent add b1 Bea 10 2 1 4 map=keep
+!ent set_var b1 team blue
+!ent add a2 Ann 10 3 1 3 map=keep
+!ent set_var a2 team red
+!ent add n1 Ned 10 4 1 2 map=main
+!list
+?? No team:
+?? Map `keep`:
+!system set default roster_map_grouping team_map
+!list
+?? Team `blue`:
+!ent kill b1
+!list
+?? Dead:
+!system set default roster_map_grouping by_color
+?? ❌
+
+Expected: HARNESS-ALLOWS-ERRORS. On a match with several maps `!list`
+groups units by map then team (teams in the order their first unit
+acts, each group in turn order):
+
+    Map `main`:
+      Team `red`:
+      → Alf ...
+      No team:
+         Ned ...
+    Map `keep`:
+      Team `red`:
+         Ann ...
+      Team `blue`:
+         Bea ...
+
+With roster_map_grouping team_map it groups by team, then map. Corpses
+in the Dead section group by map (`Map `keep`:` above Bea's corpse). A
+match with one map lists as before.
+
+SCENARIO 841 — Blank boards: the scene model, a followed map left behind, headers
+----------------------------------------------------------------------
+
+!match new bb BB 6 4
+!match use bb
+!map new lair 4 4
+!match fog on map=all
+!defvar add fog_vision_radius 1
+!ent add spy Spy 10 1 1 map=lair
+!ent set_var spy team red
+!ent add mole Mole 10 2 2 map=main
+!ent set_var mole team blue
+!map unseen hidden map=lair
+!turn set spy
+!as view red
+!map
+?? 🗺️ map `lair` (2 of 2) (4x4)
+!as view clear
+!ent tp spy 1 1 main
+!as view red
+!map
+?? 🗺️ map `main` (1 of 1) (6x4)
+!map list
+?! lair
+!as view blue
+!map scene map=main
+?? Scene (6x4)
+?! blank board
+!map lair
+?? isn't a valid
+!as view clear
+!map scene map=lair
+?! blank board
+!as view red
+!map scene map=lair
+?? ❌ Could not find a map named `lair`.
+
+Expected: HARNESS-ALLOWS-ERRORS. Red's spy acts in the hidden lair, so red
+has seen it: the board follows it there and counts it (2 of 2). After the
+spy teleports to main, red has no unit, reveal or memory in the lair
+(fog memory is off): it is hidden again, missing from red's list and
+counts (1 of 1). Blue's view of main renders its scene; blue can't name
+the lair. The omniscient view always renders every map, and red's view
+refuses the lair like a map that doesn't exist.

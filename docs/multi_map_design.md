@@ -1,7 +1,7 @@
 # Multiple maps per match (#40) and nested maps (#164): agreed design
 
-Status: design agreed with the user. Steps 1, 2a and 2b of the build
-order (§8) are built; 2c, 2d and nested maps are not. Each item below was decided in
+Status: design agreed with the user. Steps 1 and 2a-2c of the build
+order (§8) are built; 2d and nested maps are not. Each item below was decided in
 chat; §11 lists what is deferred. Read this whole file
 before starting either feature: every decision here has long-term
 consequences, and the user made each one deliberately.
@@ -317,7 +317,7 @@ share. An even distribution per map is a loop over the maps.
    map-name completion (scenarios 782-793). **2b (built)** formulas (`map=`,
    `view`, `[x, y, map]` coordinates, scatter, the hook map and
    `tile_map` / `zone_map`, `map_of`, `entity[x].map`, map var functions,
-   `move_entity` with a map; scenarios 831-836). **2c** channels and boards, unseen and hidden
+   `move_entity` with a map; scenarios 831-836). **2c (built)** channels and boards, unseen and hidden
    maps, two-sided wording, counts, roster grouping, completion filtering.
    **2d** `transfer_entity` and `!match link`.
 
@@ -330,6 +330,28 @@ share. An even distribution per map is a loop over the maps.
      refused whole (the host rearranges the parts or picks another cell);
    - a board whose actor was removed stays on the actor's last map (a
      cross-map move updates the record).
+
+   Built in 2c, not yet confirmed with the user (scenarios 837-841):
+   - the per-map override is the map var `unseen` (named by the
+     `map_unseen_var` rule, like the other map settings), set with
+     `!map unseen <mode>|default map=<name>` in place of the `!map set
+     <name> unseen=<mode>` this doc first sketched;
+   - a blank_unnamed map is listed and counted but can't be named: `!map
+     <name>`, `map=<name>` and `!map use` refuse it like a missing map
+     (naming it would prove the name);
+   - `show` renders an unseen map as the team's fog draws it (all fog);
+     a "not seen yet" list row gives no size;
+   - the two-sided unit wording applies under a team view only; an
+     omniscient channel, which can't be fooled, keeps "Entity 'x' not
+     found.";
+   - reads filter by the channel's view for hosts too (unless `full`);
+     host-only strict edits (tile / zone edits, `map=all` writes) state
+     the facts;
+   - roster grouping applies only on a match with several maps, with a
+     team heading per group ("No team:" for units without one);
+   - a Discord board switches from ◀ ▶ to a select menu past 5 maps;
+   - unseen_map_message_format / unseen_map_unnamed_label rules give the
+     blank board's text and the unnamed label.
 
    Built in 2b, not yet confirmed with the user:
    - a summon with no `map=` places on the hook's map, else `self`'s map

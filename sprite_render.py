@@ -272,7 +272,19 @@ class SceneRenderer:
         return mult
 
     # -- main entry ------------------------------------------------------
+    def _render_blank(self, text: str) -> "Image.Image":
+        """A blank board (a map the viewing team hasn't seen): its text on
+        the empty background, the same text the ASCII board shows."""
+        from PIL import ImageDraw
+        img = Image.new("RGBA", _blank_size(text), _BG_FILL)
+        draw = ImageDraw.Draw(img)
+        font = _load_font(self._font_source_for(text), 16)
+        draw.text((8, 14), text, fill=(220, 220, 220, 255), font=font)
+        return img
+
     def render(self, scene: Dict[str, Any]) -> "Image.Image":
+        if scene.get("blank"):
+            return self._render_blank(str(scene["blank"]))
         cell = self.cell
         vp = scene.get("viewport")
         if isinstance(vp, dict):
@@ -726,6 +738,8 @@ def fit_cell_size(scene: Dict[str, Any], cell: int, max_dim: int) -> int:
     cell = max(1, int(cell))
     if not max_dim:
         return cell
+    if scene.get("blank"):
+        return cell
     return max(1, min(cell, int(max_dim) // max(scene_dims(scene))))
 
 
@@ -749,6 +763,11 @@ def render_match_png(match, loader: "SpriteLoader",
     scene, cell_size = scene_for_png(match, pov_team, viewport, cell_size,
                                      max_dim)
     return render_scene_png(scene, loader, cell_size, max_dim)
+
+
+def _blank_size(text: str) -> Tuple[int, int]:
+    """The canvas of a blank board: wide enough for its text."""
+    return max(320, 16 + 8 * len(text)), 48
 
 
 def scene_for_png(match, pov_team: Optional[str] = None,
