@@ -1097,8 +1097,10 @@ SCENARIO 53 — Manually setting the current turn
 !turn set a3
 !list
 
-Expected: !turn set jumps the current-turn marker to a specific entity.
-Useful for GM adjudication (e.g. "wait, Gamma uses a delayed action").
+Expected: !turn set ends the acting unit's turn and starts the named
+unit's, as a turn change (hooks, ticks, schedules; scenario 827); `quiet`
+moves only the marker. Useful for GM adjudication (e.g. "wait, Gamma
+uses a delayed action").
 
 
 SCENARIO 54 — Changing initiative mid-match reshuffles turn order
@@ -10983,8 +10985,8 @@ true (no NEW edge), so alarms STAYS 1 — watchers fire on the transition,
 not every poll. (Re-arms only after the condition goes false again.)
 
 
-SCENARIO 428 — Watchers: single-pass, next-poll chaining, once-removal
-----------------------------------------------------------------------
+SCENARIO 428 — Watchers: a chain settles in one command, once-removal
+---------------------------------------------------------------------
 
 !match new wt2 WT2 8 4
 !match use wt2
@@ -10993,18 +10995,19 @@ SCENARIO 428 — Watchers: single-pass, next-poll chaining, once-removal
 !watch add w1 "entity[hero].hp < 70" "entity[hero].stage = 1"
 !watch add w2 "entity[hero].stage == 1" "entity[hero].stage = 2" once
 !ent hp hero -40
-!ent dump hero
+!assert "entity[hero].stage == 2"
 !ent face hero left
-!ent dump hero
+!assert "entity[hero].stage == 2"
 !watch list
+?! w2
 
-Expected: `ent hp hero -40` (hp 60) trips w1's edge; because all edges are
-recorded BEFORE any effect runs, w2 still reads stage 0 this pass and does
-NOT fire — first dump shows stage 1. The next command (`ent face`) polls
-again: w1's condition is still true (no new edge), but w2 now sees stage==1,
-fires (false→true), sets stage 2, and `once` removes it — second dump shows
-stage 2. `watch list` shows only w1 remaining. Single-pass + next-poll
-chaining + once.
+Expected: `ent hp hero -40` (hp 60) trips w1's edge; all edges of a pass
+are recorded BEFORE any effect runs, so w2 reads stage 0 in that pass.
+The watchers are re-checked until a pass fires nothing new
+(`watcher_chain_limit`), so the second pass sees stage 1 and w2 fires in
+the same command: stage 2, and `once` removes w2. The next command
+(`ent face`) fires nothing (w1 is still true, no new edge). `watch list`
+shows only w1.
 
 
 SCENARIO 429 — Team resources + team-scoped modifiers
@@ -25343,3 +25346,188 @@ them, so a macro `if true` runs its first branch and a var set with `!ent
 set_var u flag true` compares equal to `true`. The three words are
 reserved: they can't name a loop variable, a local, a lambda parameter, a
 `!func` or its parameters, or a unit.
+
+SCENARIO 826 — Watcher chains: a long chain settles, the limit stops a loop
+----------------------------------------------------------------------
+
+!match new wc WC 6 6
+!match use wc
+!ent add u U 10 1 1 1
+!ent set_var u n 0
+!watch add s1 "entity[u].n == 1" "entity[u].n = 2"
+!watch add s2 "entity[u].n == 2" "entity[u].n = 3"
+!watch add s3 "entity[u].n == 3" "entity[u].n = 4"
+!ent set_var u n 1
+!assert "entity[u].n == 4"
+!undo command
+!assert "entity[u].n == 0"
+!watch remove s1
+!watch remove s2
+!watch remove s3
+!ent set_var u flip 0
+!watch add up "entity[u].flip == 0" "entity[u].flip = 1"
+!watch add down "entity[u].flip == 1" "entity[u].flip = 0"
+!system set default watcher_chain_limit 3
+!ent set_var u flip 1
+?? watchers still firing after 3 passes (watcher_chain_limit)
+!system set default watcher_chain_limit 0
+?? ❌
+
+Expected: HARNESS-ALLOWS-ERRORS. Three watchers chained through `n`
+(1 → 2 → 3 → 4) settle in the command that set n to 1, and one undo
+step takes the whole chain back. Two watchers that flip a var back and
+forth would fire forever: with watcher_chain_limit 3 the command stops
+after three passes with a ⚠️, and the rest waits for the next command.
+The limit is at least 1.
+
+SCENARIO 827 — !turn set is a turn change; quiet moves only the marker
+----------------------------------------------------------------------
+
+!match new ts TS 6 6
+!match use ts
+!ent add a A 10 1 1 9
+!ent add b B 10 2 1 5
+!ent add c C 10 3 1 1
+!ent set_vars a starts=0 ends=0
+!ent set_vars b starts=0 ends=0
+!ent set_vars c starts=0 ends=0
+!gpassive add st on_turn_start "entity[self].starts = entity[self].starts + 1"
+!gpassive add en on_turn_end "entity[self].ends = entity[self].ends + 1"
+!turn set c
+?? It is now `c`'s turn (set by a host).
+!assert "entity[c].starts == 1 and entity[a].starts == 0 and turns_elapsed() == 1"
+!turn set b
+!assert "entity[c].ends == 1 and entity[b].starts == 1"
+!turn set a quiet
+?? no turn hooks ran
+!assert "entity[b].ends == 0 and entity[a].starts == 0"
+!turn next
+!assert "entity[a].ends == 1 and entity[b].starts == 2"
+!turn set b loud
+?? ❌ `loud` isn't an option of `!turn set` (only `quiet`).
+!system set default atb_enabled true
+!system set default atb_charge_formula "10"
+!match new ta TA 6 6
+!match use ta
+!ent add p P 10 1 1 1
+!ent add q Q 10 2 1 1
+!turn next
+!turn set q
+!assert "entity[q].atb_charge < atb_threshold() and current_id() == 'q'"
+!turn next
+!assert "current_id() == 'p'"
+
+Expected: HARNESS-ALLOWS-ERRORS. Before the first turn, `!turn set c`
+starts round 1 at c (its turn_start hook runs, one turn has elapsed).
+`!turn set b` ends c's turn (turn_end) and starts b's. `quiet` only
+moves the marker: no hook runs. `!turn next` then ends a's turn and
+passes on to b. A word other than `quiet` is refused. Under ATB the
+chosen unit's bar resets as if it had filled, so the next turn goes to
+the other unit instead of q acting twice in a row.
+
+SCENARIO 828 — revive_blocked_mode: refuse, or the nearest cell the body fits
+----------------------------------------------------------------------
+
+!match new rv RV 10 10
+!match use rv
+!ent add ogre Ogre 10 3 3
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!part add ogre arm Arm 5 5 __part_located=true
+!part locate arm 5 3
+!ent kill ogre
+!ent add blk Blk 5 4 4
+!ent revive ogre
+?? ❌ Cell (4,4) already occupied
+!assert "has_corpse('ogre')"
+!system set default revive_blocked_mode nearest
+!ent revive ogre
+?? revived at
+?? (revive_blocked_mode nearest)
+!assert "entity[ogre].hp == 10 and footprint_cells('ogre') == [[3, 2], [4, 2], [3, 3], [4, 3]]"
+!assert "entity[arm].x == 5 and entity[arm].y == 2"
+!ent kill ogre
+!ent revive ogre
+?? Revived corpse `ogre`
+?! revive_blocked_mode
+!system set default revive_blocked_mode sideways
+?? ❌
+
+Expected: HARNESS-ALLOWS-ERRORS. A 2x2 ogre with a located arm two cells
+to its right dies at (3,3); Blk then stands on (4,4), under the body.
+Under the default `refuse` the revive is refused and the corpse stays.
+Under `nearest` the ogre comes back at the nearest anchor where all four
+cells are free, (3,2), the reply says so, and the arm keeps its offset
+(5,2). A revive whose cell is free reads as before. The rule takes only
+refuse / nearest.
+
+SCENARIO 829 — A snake's whole body must end on free cells
+----------------------------------------------------------------------
+
+!match new sk SK 12 6
+!match use sk
+!ent add worm Worm 10 3 3 2
+!part segment worm w1 W1 5 5
+!part segment worm w2 W2 5 5
+!ent add guard Guard 20 4 3 6
+!ent move worm 3 right
+?? ❌ Segment `w2` of `worm` would end on (4,3), occupied by `guard`.
+!assert "entity[worm].x == 3 and entity[w2].x == 1"
+!ent move worm 4 right
+!assert "entity[worm].x == 7 and entity[w1].x == 6 and entity[w2].x == 5"
+!ent tp guard 8 2
+!ent group add g worm
+!ent move group:g 1 up 1 right 1 down
+?? ❌ Group 'g' move aborted: Segment `w1` of `worm` would end on (8,2), occupied by `guard`.
+!assert "entity[worm].x == 7 and entity[worm].y == 3"
+!ent move group:g 1 down 2 right 1 up
+!assert "entity[worm].x == 9 and entity[w2].x == 8 and entity[w2].y == 4"
+
+Expected: HARNESS-ALLOWS-ERRORS. A head may pass over units, but every
+segment's final cell must be free too, so a three-step move that would
+leave w2 on the guard is refused whole. A four-step move takes the body
+past the guard. Group moves check their snakes the same way: a walk
+up, right over the guard at (8,2) and down would leave w1 on it.
+
+SCENARIO 830 — Snapshots and live forms carry the part subtree and segments
+----------------------------------------------------------------------
+
+!match new sn SN 10 10
+!match use sn
+!ent add hero Hero 10 2 2
+!part add hero arm Arm 5 5
+!part locate arm 3 2
+!ent transform hero hero
+!assert "parts('hero') == ['arm'] and entity[arm].x == 3"
+!ent add ogre Ogre 10 2 6
+!part add ogre ogre_claw Claw 5 5
+!part add ogre_claw nail Nail 2 2
+!part locate ogre_claw 3 6
+!ent add worm Worm 10 6 2
+!part segment worm w1 W1 5 5
+!part segment worm w2 W2 5 5
+!eval "summon(entity_snapshot('ogre'), 5, 8)"
+?? = `'ogre2'`
+!assert "parts('ogre2') == ['ogre2_claw'] and parts('ogre2_claw') == ['nail2']"
+!assert "entity[ogre2_claw].x == 6 and entity[ogre2_claw].y == 8"
+!eval "summon(entity_snapshot('worm'), 8, 8)"
+!assert "parts('worm2') == ['w12', 'w22'] and [entity[w12].x, entity[w12].y, entity[w22].x, entity[w22].y] == [8, 7, 7, 7]"
+!ent move worm2 1 down
+!assert "[entity[w12].x, entity[w12].y, entity[w22].x, entity[w22].y] == [8, 8, 8, 7]"
+!ent add x X 4 8 4
+!ent store_entity_into_var ogre x form
+!ent transform x form st
+!assert "parts('x') == ['x_claw'] and entity[x_claw].x == 9 and entity[x_claw].y == 4"
+!ent tp x 6 3
+!ent revert x st
+!assert "parts('x') == [] and entity[x].name == 'X'"
+
+Expected: `!ent transform hero hero` keeps hero's arm `arm` at its cell
+(it used to be destroyed). A snapshot holds the whole part subtree at
+offsets from the anchor, so a summoned ogre comes with its claw and the
+claw's nail, the claw one cell right of the new ogre. A part id under
+the unit's (`ogre_claw`) follows the new unit's (`ogre2_claw`); another
+id is kept, or minted anew when taken (`nail2`, `w12`, `w22`). A summoned
+worm brings both segments, trailing behind it as the original's do, and
+moves as one. `store_entity_into_var`
+stores the same form, so transforming X into it gives X the claw at its
+offset, and `revert` (after a move) restores X without parts.

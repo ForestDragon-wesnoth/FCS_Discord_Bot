@@ -1440,6 +1440,18 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "single warning is logged). Mirrors var_hook_recursion_limit."
         ),
     },
+    "watcher_chain_limit": {
+        "default": 16,
+        "schema": {"type": "int", "min": 1, "max": 256, "ceiling": True},
+        "desc": (
+            "How many times watchers are re-checked after one command. A "
+            "watcher's effect can make another watcher's condition true; "
+            "the checks repeat until a pass fires nothing new, so a chain "
+            "settles inside the command that started it (and shares its "
+            "undo step). Past the limit the rest of the chain waits for "
+            "the next command, with a warning."
+        ),
+    },
     "macro_repeat_limit": {
         "default": 1000,
         "schema": {"type": "int", "min": 0, "max": 10000, "ceiling": True},
@@ -1855,6 +1867,18 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "(typically the negative value at death, so the entity "
             "would re-die immediately unless an on_revive passive "
             "heals it). Runs with `self` bound to the revived entity."
+        ),
+    },
+    "revive_blocked_mode": {
+        "default": "refuse",
+        "schema": {"type": "enum", "choices": ["refuse", "nearest"]},
+        "desc": (
+            "What a revive does when the corpse's cell (or any cell of "
+            "its body) is taken: 'refuse' (default) leaves the corpse "
+            "where it lies and reports the blocker; 'nearest' revives the "
+            "unit on the free cell nearest its body where the whole "
+            "footprint fits, searched outward like a dismount, and the "
+            "reply names the cell it used."
         ),
     },
     "corpse_line_format": {
@@ -5949,6 +5973,8 @@ class Entity:
             for cx, cy in m.entity_cells(self, x, y):
                 if m.cell_occupant(cx, cy, ig, mp) is not None:
                     raise Occupied(f"Cell ({cx},{cy}) already occupied")
+        # The body's final cells too (a head may pass over units).
+        m._check_snake_trail(self, step_path)
 
         # Phase 2: commit each step, firing hooks. No more validation —
         # phase 1 already proved the whole path is legal.
@@ -8426,6 +8452,48 @@ class Match:
                for c in self.entity_cells(sg)):
             self._resettle_snake(head_id)
 
+    def _check_snake_trail(self, head: "Entity",
+                           steps: List[Tuple[int, int, str]],
+                           extra: Tuple[str, ...] = ()) -> None:
+        """Raise Occupied when walking `head` along `steps` would leave one
+        of its segments on a cell another unit covers: the whole body's
+        final cells must be free, as the head's own are (a head may pass
+        over units, and its body used to trail onto them). Simulates the
+        trail on the live units and puts everything back; `extra`: ids
+        moving with the head (a group)."""
+        chain = self.snake_segments(head.id)
+        if not chain or not steps:
+            return
+        saved = [(u, u.x, u.y) for u in [head] + chain]
+        kept = {k: copy.deepcopy(head.vars[k])
+                for k in ("__seg_last", "__seg_path") if k in head.vars}
+        self.surface_log = lambda *a, **k: None   # a re-lay's ⚠️
+        try:
+            for nx, ny, _f in steps:
+                px, py = head.x, head.y
+                head.x, head.y = nx, ny
+                self._advance_snake(head.id, px, py)
+            final = [(sg, sg.x, sg.y) for sg in chain]
+        finally:
+            del self.surface_log
+            for u, ux, uy in saved:
+                u.x, u.y = ux, uy
+            for k in ("__seg_last", "__seg_path"):
+                head.vars.pop(k, None)
+            head.vars.update(kept)
+        ig = (self._occupancy_ignore(head, extra)
+              + tuple(p.id for p in self.entity_part_subtree(head.id)))
+        mp = self.map_of(head)
+        for sg, sx, sy in final:
+            if sg.is_cell_stackable:
+                continue
+            for cx, cy in self.entity_cells(sg, sx, sy):
+                occ = self.cell_occupant(cx, cy, ig, mp)
+                if occ is not None:
+                    raise Occupied(
+                        f"Segment `{sg.id}` of `{head.id}` would end on "
+                        f"({cx},{cy}), occupied by `{occ}`.")
+
     def _advance_snake_path(self, head: "Entity", chain: List["Entity"],
                             prev_x: int, prev_y: int) -> None:
         """`path` follow mode: prepend the head's current cell to the recorded
@@ -9079,8 +9147,16 @@ class Match:
         # nearest by distance then (y, x); stop once no farther ring can
         # hold a nearer cell. (A scan of the whole grid made one dismount on
         # a 500x500 map take 12 s.)
+        return self._nearest_fit_cell(
+            rider, ox, oy, self.map_of(veh if veh is not None else rider))
+
+    def _nearest_fit_cell(self, e: "Entity", ox: float, oy: float,
+                          mp: "Map") -> Optional[Tuple[int, int]]:
+        """The anchor cell nearest the point (ox, oy) where `e`'s whole
+        footprint is on map `mp` and covers no other unit (ties by y then
+        x). Shared by dismount and revive_blocked_mode nearest."""
+        rider = e
         cx0, cy0 = math.floor(ox + 0.5), math.floor(oy + 0.5)
-        mp = self.map_of(veh if veh is not None else rider)
         best: Optional[Tuple[float, int, int]] = None
         for r in self._ring_radii(cx0, cy0,
                                   mp.grid_width + mp.grid_height, mp):
@@ -9524,14 +9600,31 @@ class Match:
 
     # ---------- condition-watchers (edge-triggered) ----------
     def fire_watchers(self) -> List[str]:
-        """Re-check every watcher; fire its effect on a false->true edge
-        (the condition newly becoming true). Single pass per call — all edges
-        are recorded BEFORE any effect runs, so one effect can't perturb
-        another watcher's reading this pass (a change it makes is caught on
-        the next call). A `once` watcher is removed after firing. A malformed
-        condition reads as not-met (fail-safe). Returns effect-error notes."""
+        """Re-check the watchers until a pass fires nothing new (at most
+        watcher_chain_limit passes), so a watcher made true by another's
+        effect fires in the same command. Returns effect-error notes."""
+        log: List[str] = []
+        limit = max(1, int(self.rules.get("watcher_chain_limit", 16)))
+        for _ in range(limit):
+            fired, notes = self._watcher_pass()
+            log += notes
+            if not fired:
+                return log
+        if self.watchers and self._watcher_pass(peek=True)[0]:
+            log.append(f"⚠ watchers still firing after {limit} passes "
+                       f"(watcher_chain_limit); the rest wait for the next "
+                       f"command.")
+        return log
+
+    def _watcher_pass(self, peek: bool = False) -> Tuple[List[str], List[str]]:
+        """One check of every watcher; fire its effect on a false->true edge
+        (the condition newly becoming true). All edges are recorded BEFORE
+        any effect runs, so one effect can't perturb another watcher's
+        reading this pass. A `once` watcher is removed after firing. A
+        malformed condition reads as not-met (fail-safe). `peek` only
+        reports which would fire. Returns (fired names, effect notes)."""
         if not self.watchers:
-            return []
+            return [], []
         from formula import FormulaEngine, EvalCtx, FormulaError
         this_id = self.current_entity_id()
         engine = FormulaEngine(self)
@@ -9545,9 +9638,12 @@ class Match:
                 except FormulaError:
                     now = False
             was = bool(w.get("last", False))
-            w["last"] = now
+            if not peek:
+                w["last"] = now
             if now and not was:
                 fired.append(name)
+        if peek:
+            return fired, []
         log: List[str] = []
         for name in fired:
             w = self.watchers.get(name)
@@ -9563,7 +9659,7 @@ class Match:
             self.log_event("watcher_fired", name=name)
             if w.get("once"):
                 self.watchers.pop(name, None)
-        return log
+        return fired, log
 
     # ---- match outcome / victory (100) -------------------------------
     # No built-in objective evaluator: a win CONDITION is composed by the
@@ -11878,6 +11974,44 @@ class Match:
         self._begin_turn()
         return (new_cur, log)
 
+    def set_turn(self, eid: str) -> List[str]:
+        """`!turn set <id>` as a real turn change: the acting unit's turn
+        ends (turn_end ticks, hooks), the turn goes to `eid` and starts
+        (under ATB its charge bar resets as if the bar had picked it), and
+        the turn clock and autosave advance as for `!turn next`. Before
+        the first turn it starts round 1 at `eid`. The GM picked the unit,
+        so skip statuses don't move the turn past it. Returns log lines."""
+        if eid not in self.turn_order:
+            raise NotFound(f"Entity '{eid}' not in turn order.")
+        atb = bool(self.rules.get("atb_enabled"))
+        if not atb and not self.round_started:
+            self.active_index = self.turn_order.index(eid)
+            self.turn_vacated = None
+            return self.next_turn()[1]
+        log: List[str] = []
+        vacated, self.turn_vacated = self.turn_vacated, None
+        if (self.round_started and not vacated
+                and 0 <= self.active_index < len(self.turn_order)):
+            cur = self.turn_order[self.active_index]
+            if cur in self.entities:
+                log.extend(self._atb_turn_phase(
+                    cur, "turn_end",
+                    act=not (atb and self._atb_last_skipped)))
+        self.round_started = True
+        if eid not in self.turn_order or eid not in self.entities:
+            log.append(f"⏭ `{eid}` left the turn order as the turn ended; "
+                       f"the turn stays where it was.")
+            self._begin_turn()
+            return log
+        self.active_index = self.turn_order.index(eid)
+        if atb:
+            log.extend(self._atb_reset_actor(self.entities[eid]))
+            self._atb_last_skipped = False
+        log.extend(self._atb_turn_phase(eid, "turn_start", act=True))
+        self.turn_vacated = None
+        self._begin_turn()
+        return log
+
     def _start_current_turn(self, log: List[str]) -> Optional[str]:
         """Start the turn of the unit at active_index: skip past skippable
         units, then fire the turn-start surface (on_turn_start passives,
@@ -13982,20 +14116,6 @@ class Match:
     # philosophy: a summoner stores its minion as data, and the summon
     # primitive is the only engine-side machinery.
 
-    @staticmethod
-    def entity_template_dict(e: "Entity") -> Dict[str, Any]:
-        """Snapshot a live entity into a summon-ready template dict.
-        Strips id and position — those are assigned at summon time, so
-        a template never carries a stale id (which would collide) or a
-        fixed cell. Everything else (name, vars, status, passives,
-        clamps, facing) carries over. Links to other units (part_of, a
-        mount) are stripped too: a summoned copy is never a part or a rider
-        by its data, and the ids would latch onto the originals."""
-        d = e.to_dict()
-        for k in _TEMPLATE_IDENTITY_KEYS:
-            d.pop(k, None)
-        return d
-
     # ---- saved entity templates (the server's library; see MatchManager) ----
     def capture_template(self, e: "Entity", saved_by: Optional[str] = None,
                          saved_by_name: Optional[str] = None,
@@ -14020,7 +14140,7 @@ class Match:
     def _capture_template(self, e: "Entity", saved_by: Optional[str],
                           saved_by_name: Optional[str],
                           notes: Optional[List[str]]) -> Dict[str, Any]:
-        d = self.capture_statblock(e)
+        d = self.capture_statblock(e, template_ids=True)
         ax, ay = e.x, e.y
         Match._shift_snake_path_vars(d.get("vars") or {}, -ax, -ay)
         # Containers built from partial templates are saved as the partial's
@@ -14028,32 +14148,11 @@ class Match:
         d["vars"] = self.template_file_form(d.get("vars") or {}, notes,
                                             unit_vars=True)
 
-        def local(i: Any) -> Any:
-            # `dragon_head` of `dragon` -> `@root_head` and `torso` ->
-            # `@root_torso`: spawned as `<new id>_head` / `<new id>_torso`,
-            # so the second dragon's head is dragon2_head.
-            if not isinstance(i, str) or not i:
-                return i
-            if i == e.id:
-                return TEMPLATE_ROOT
-            if i.startswith(e.id + "_"):
-                return TEMPLATE_ROOT + i[len(e.id):]
-            return f"{TEMPLATE_ROOT}_{i}"
         parts = []
         for p in d.pop("parts", None) or []:
-            p = copy.deepcopy(p)
-            p.pop("mounted_on", None)
-            p.pop("mount_slot", None)
-            p["id"] = local(p.get("id"))
-            p["part_of"] = local(p.get("part_of"))
             pv = p.get("vars")
             if isinstance(pv, dict):
-                if "__follows" in pv:
-                    pv["__follows"] = local(pv["__follows"])
-                Match._shift_snake_path_vars(pv, -ax, -ay)
                 p["vars"] = self.template_file_form(pv, notes, unit_vars=True)
-            p["x"] = int(p.get("x", ax)) - ax
-            p["y"] = int(p.get("y", ay)) - ay
             parts.append(p)
         if parts:
             d["parts"] = parts
@@ -14114,40 +14213,6 @@ class Match:
             if e is not None:
                 Match._shift_snake_path_vars(e.vars, e.x, e.y)
                 parts = copy.deepcopy(template.get("parts"))
-                if isinstance(parts, dict):
-                    # The {role: part} form: each a direct part of the unit,
-                    # named <unit id>_<role>, at its offset like a listed one.
-                    name_var = self.part_name_var()
-                    listed = []
-                    for role, p in parts.items():
-                        if not isinstance(p, dict):
-                            continue
-                        p.setdefault("vars", {}).setdefault(name_var, role)
-                        p["id"] = f"{TEMPLATE_ROOT}_{role}"
-                        p["part_of"] = TEMPLATE_ROOT
-                        listed.append(p)
-                    parts = listed
-
-                def glob(i: Any) -> Any:
-                    if isinstance(i, str) and i.startswith(TEMPLATE_ROOT):
-                        return new_id + i[len(TEMPLATE_ROOT):]
-                    return i
-                if isinstance(parts, list):
-                    for p in parts:
-                        if not isinstance(p, dict):
-                            continue
-                        p["part_of"] = (None if p.get("part_of") in
-                                        (None, TEMPLATE_ROOT)
-                                        else glob(p.get("part_of")))
-                        if p.get("id"):
-                            p["id"] = glob(p["id"])
-                        pv = p.get("vars")
-                        if isinstance(pv, dict):
-                            if "__follows" in pv:
-                                pv["__follows"] = glob(pv["__follows"])
-                            Match._shift_snake_path_vars(pv, e.x, e.y)
-                        p["x"] = int(p.get("x", 0)) + e.x
-                        p["y"] = int(p.get("y", 0)) + e.y
                 if parts:
                     log += self._apply_statblock_parts(e, parts)
                     if new_id in self.entities:
@@ -14849,7 +14914,15 @@ class Match:
         # template doesn't carry one. Reserved top-level template key, so
         # Entity.from_dict ignores it for the parent itself.
         parts_spec = template.get("parts")
-        if isinstance(parts_spec, dict):
+        if isinstance(parts_spec, list) and any(
+                isinstance(pt, dict) and "part_of" in pt for pt in parts_spec):
+            # A captured body (entity_snapshot, a stored form): the whole
+            # part subtree, segments included, at its offsets.
+            log += self._apply_statblock_parts(e, parts_spec)
+            if new_id in self.entities:
+                self._restamp_parts_for(new_id)
+            part_items = []
+        elif isinstance(parts_spec, dict):
             part_items = list(parts_spec.items())
         elif isinstance(parts_spec, (list, tuple)):
             part_items = [(None, pt) for pt in parts_spec]
@@ -15870,14 +15943,44 @@ class Match:
         # the window (below).
         self._death_check_suppressed_ids.add(e.id)
         try:
+            moved_note: List[str] = []
             try:
-                _, spawn_log = e.spawn(self, x, y, map_name=cmap.name)
+                try:
+                    _, spawn_log = e.spawn(self, x, y, map_name=cmap.name)
+                except Occupied as ex:
+                    # revive_blocked_mode nearest: the free cell nearest
+                    # the body that fits all of it, searched like a
+                    # dismount; refuse keeps the refusal.
+                    if str(self.rules.get("revive_blocked_mode",
+                                          "refuse")) != "nearest":
+                        raise
+                    w, h = self.entity_footprint(e)
+                    near = self._nearest_fit_cell(
+                        e, x + (w - 1) / 2, y + (h - 1) / 2, cmap)
+                    if near is None:
+                        raise VTTError(f"{ex} No free cell on the map fits "
+                                       f"`{eid}`'s body.")
+                    e.x, e.y = near
+                    _, spawn_log = e.spawn(self, near[0], near[1],
+                                           map_name=cmap.name)
+                    moved_note.append(
+                        f"⚠️ `{eid}`'s cell ({x},{y}) is taken ({ex}); "
+                        f"revived at ({near[0]},{near[1]}) "
+                        f"(revive_blocked_mode nearest).")
+                    # Located parts keep their offset from the anchor.
+                    dx, dy = near[0] - x, near[1] - y
+                    for pd in stored_parts:
+                        if (pd.get("vars") or {}).get("__part_located"):
+                            pd["x"] = int(pd.get("x", x)) + dx
+                            pd["y"] = int(pd.get("y", y)) + dy
+                    x, y = near
             except VTTError:
                 # Nothing was revived: the corpse goes back where it lay
                 # (it used to be lost with the refusal).
-                cmap.tiles.setdefault((x, y), {}).setdefault(
+                cmap.tiles.setdefault((loc[0], loc[1]), {}).setdefault(
                     "corpses", {})[eid] = corpse
                 raise
+            spawn_log = moved_note + list(spawn_log)
             # Restore the creature's body parts at the parent's cell. Each
             # snapshot carries its part_of (-> e.id) so it re-attaches; a
             # part already taking that id (somehow still alive) is skipped.
@@ -16076,20 +16179,52 @@ class Match:
                 out.append(str(ex))
         return out
 
-    def capture_statblock(self, e: "Entity") -> Dict[str, Any]:
+    def capture_statblock(self, e: "Entity",
+                          template_ids: bool = False) -> Dict[str, Any]:
         """Snapshot `e`'s restorable statblock: name, vars, status, passives,
         clamps, facing, plus the whole attached part SUBTREE as full entity
-        dicts (BFS, parents before children). Identity — id, position,
+        dicts (BFS, parents before children), each at its offset from `e`'s
+        anchor with links to `e` reading TEMPLATE_ROOT, so the body rebuilds
+        around any unit (_apply_statblock_parts). Identity — id, position,
         part/mount links — is NOT captured (it stays on the live entity across
-        a transform). The returned dict doubles as a transform template."""
+        a transform). The returned dict doubles as a transform template, an
+        entity_snapshot and a summon template."""
         d = e.to_dict()
         for k in ("id", "x", "y", "map", "part_of", "mounted_on", "mount_slot"):
             d.pop(k, None)
-        subtree = self.entity_part_subtree(e.id)
-        if subtree:
-            # A part stands on its parent's map, wherever that is then.
-            d["parts"] = [{k: v for k, v in p.to_dict().items() if k != "map"}
-                          for p in subtree]
+        ax, ay = e.x, e.y
+
+        def local(i: Any) -> Any:
+            # `dragon_head` of `dragon` -> `@root_head`: rebuilt as `<new
+            # id>_head` (_apply_statblock_parts), so a second dragon's head
+            # is dragon2_head. Another id (`torso`) stays as it is (minted
+            # anew if taken), or for a template (`template_ids`) becomes
+            # `@root_torso`, so the library holds no unit id.
+            if not isinstance(i, str) or not i:
+                return i
+            if i == e.id:
+                return TEMPLATE_ROOT
+            if i.startswith(e.id + "_"):
+                return TEMPLATE_ROOT + i[len(e.id):]
+            return f"{TEMPLATE_ROOT}_{i}" if template_ids else i
+        parts = []
+        for part in self.entity_part_subtree(e.id):
+            # A part stands on its parent's map, wherever that is then, at
+            # its offset from the parent's anchor.
+            p = {k: v for k, v in part.to_dict().items()
+                 if k not in ("map", "mounted_on", "mount_slot")}
+            p["id"] = local(p.get("id"))
+            p["part_of"] = local(p.get("part_of"))
+            pv = p.get("vars")
+            if isinstance(pv, dict):
+                if "__follows" in pv:
+                    pv["__follows"] = local(pv["__follows"])
+                Match._shift_snake_path_vars(pv, -ax, -ay)
+            p["x"] = int(p.get("x", ax)) - ax
+            p["y"] = int(p.get("y", ay)) - ay
+            parts.append(p)
+        if parts:
+            d["parts"] = parts
         return d
 
     def _apply_statblock_parts(self, parent: "Entity",
@@ -16103,25 +16238,45 @@ class Match:
         if not parts_spec:
             return []
         name_var = self.part_name_var()
-        # Normalize to a list of part dicts. Dict form carries no ids/part_of
-        # (each is a direct child of `parent`); record the role as part_name.
+        # The {role: part} form: each a direct part of the unit, named
+        # <unit id>_<role>, at its offset like a listed one.
         if isinstance(parts_spec, dict):
             part_list = []
             for role, pt in parts_spec.items():
                 if not isinstance(pt, dict):
                     continue
                 d = copy.deepcopy(pt)
-                nv = d.setdefault("vars", {})
-                if role is not None and name_var not in nv:
-                    nv[name_var] = role
-                d.pop("id", None)
-                d.pop("part_of", None)
+                d.setdefault("vars", {}).setdefault(name_var, role)
+                d["id"] = f"{TEMPLATE_ROOT}_{role}"
+                d["part_of"] = TEMPLATE_ROOT
                 part_list.append(d)
         elif isinstance(parts_spec, (list, tuple)):
             part_list = [copy.deepcopy(p) for p in parts_spec
                          if isinstance(p, dict)]
         else:
             return []
+
+        def glob(i: Any) -> Any:
+            if isinstance(i, str) and i.startswith(TEMPLATE_ROOT):
+                return parent.id + i[len(TEMPLATE_ROOT):]
+            return i
+        # Relative form -> this parent: ids under the parent's, positions
+        # (and snake trails) from offsets to cells.
+        for d in part_list:
+            d["part_of"] = (None if d.get("part_of") in (None, TEMPLATE_ROOT)
+                            else glob(d.get("part_of")))
+            if d.get("id"):
+                d["id"] = glob(d["id"])
+            dv = d.get("vars")
+            if isinstance(dv, dict):
+                if "__follows" in dv:
+                    dv["__follows"] = glob(dv["__follows"])
+                Match._shift_snake_path_vars(dv, parent.x, parent.y)
+            try:
+                d["x"] = int(d.get("x", 0)) + parent.x
+                d["y"] = int(d.get("y", 0)) + parent.y
+            except (TypeError, ValueError):
+                d["x"], d["y"] = parent.x, parent.y
         if not part_list:
             return []
         # Re-mint ids; remember the mapping so intra-subtree part_of links
@@ -19054,6 +19209,10 @@ class Match:
                             f"'{eid}' would land on ({cx},{cy}), occupied by "
                             f"'{occ}'."
                         )
+            try:
+                self._check_snake_trail(e, path, tuple(member_set))
+            except Occupied as ex:
+                raise Occupied(f"Group '{group_name}' move aborted: {ex}")
             plans[eid] = path
 
         # Phase 2: commit per member, firing tile hooks step by step.

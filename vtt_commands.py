@@ -8542,7 +8542,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if dest_id not in m.entities:
             raise NotFound(f"Destination entity '{dest_id}' not found.")
         dest_path = args[3]
-        template = m.entity_template_dict(m.entities[src_id])
+        template = m.capture_statblock(m.entities[src_id])
         m.entities[dest_id].write_var(dest_path, template)
         return await ctx.send(
             f"Stored a template of `{src_id}` into `{dest_id}` "
@@ -8579,7 +8579,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         else:
             other = _resolve_eid(m, ref)
             if other in m.entities:
-                template = m.entity_template_dict(m.entities[other])
+                template = m.capture_statblock(m.entities[other])
             else:
                 return await ctx.send(
                     f"❌ No template found: `{ref}` is neither a dict var on "
@@ -9064,11 +9064,21 @@ async def turn_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 2, "turn", "set"):
             return
         eid = _resolve_eid(m, args[1])
+        quiet = len(args) > 2 and str(args[2]).lower() == "quiet"
+        if len(args) > 2 and not quiet:
+            raise VTTError(f"`{args[2]}` isn't an option of `!turn set` "
+                           f"(only `quiet`).")
         if eid not in m.turn_order:
             raise NotFound(f"Entity '{eid}' not in turn order.")
-        m.active_index = m.turn_order.index(eid)
-        m.turn_vacated = None   # the GM chose the current unit explicitly
-        return await ctx.send(f"Active turn set to `{eid}` (round {m.round_number})")
+        if quiet:
+            # A silent correction: only the pointer moves.
+            m.active_index = m.turn_order.index(eid)
+            m.turn_vacated = None
+            return await ctx.send(f"Active turn set to `{eid}` (round "
+                                  f"{m.round_number}; no turn hooks ran).")
+        log = m.set_turn(eid)
+        lines = list(log) + [f"It is now `{eid}`'s turn (set by a host)."]
+        return await ctx.send("\n".join(lines))
     # Fallback: show authoritative help
     return await _help_fallback(ctx, ["turn"], args[0] if args else None)
 #annonate subcommands next to the command itself:
@@ -9081,8 +9091,14 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "turn", "set",
-    usage="!turn set <id>",
-    desc="Set the current turn to be the turn of entity <id>"
+    usage="!turn set <id> [quiet]",
+    desc=("Give the turn to entity <id>: the acting unit's turn ends and "
+          "<id>'s starts, with their turn hooks, status ticks, schedules "
+          "and the turn autosave, as if `!turn next` had landed on it "
+          "(under ATB its charge bar resets as if it had filled; before "
+          "the first turn it starts round 1 at <id>). Skip statuses don't "
+          "move the turn past a unit chosen this way. `quiet` only moves "
+          "the pointer, a silent correction with no hooks.")
 )
 
 
