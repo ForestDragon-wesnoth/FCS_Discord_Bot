@@ -39,7 +39,7 @@ Key invariants:
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 import datetime
 import json
 
@@ -469,6 +469,24 @@ class MatchHistory:
         """Every snapshot this history holds (autosaves and manual saves)."""
         return (list(self.round_saves) + list(self.turn_saves)
                 + list(self.command_saves) + list(self.manual_saves.values()))
+
+    def mark(self) -> Tuple[Any, ...]:
+        """The history as it stands, for rewind(): a rollback window
+        (`!dry`, `!batch strict`, an action) takes one before it runs."""
+        return (self._turn_index, list(self.round_saves),
+                list(self.turn_saves), list(self.command_saves),
+                dict(self.manual_saves))
+
+    def rewind(self, mark: Tuple[Any, ...]) -> None:
+        """Back to `mark` (mark()): the snapshots recorded during work that
+        was rolled back go (a turn autosave of a turn that never happened
+        would be the next `!undo turn`), the ones pruned meanwhile return,
+        and the turn counter goes back. The sequence counter keeps counting,
+        so no number is reused."""
+        (self._turn_index, self.round_saves, self.turn_saves,
+         self.command_saves, self.manual_saves) = (
+            mark[0], list(mark[1]), list(mark[2]), list(mark[3]),
+            dict(mark[4]))
 
     def drop_sequences(self, seqs) -> None:
         """Remove the autosaves with these sequence numbers (the storage

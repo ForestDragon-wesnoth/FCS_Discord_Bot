@@ -68,9 +68,11 @@ def valid_id(name: Any) -> bool:
 
 
 def _dump(obj: Any) -> str:
-    """The text written to disk: compact, keys sorted, so an unchanged state
-    serializes to the same text and the comparison finds no change."""
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+    """The text written to disk: compact, keys in their order in memory.
+    That order is meaningful (units, passives, statuses and watchers act in
+    creation order: turn ties under insertion_order, hook firing), so a
+    reload keeps it; an unchanged state still serializes to the same text."""
+    return json.dumps(obj, separators=(",", ":"))
 
 
 # Server-wide lists kept beside systems.json: `_written` key -> (file name,
@@ -230,7 +232,8 @@ class Storage:
         oldest first), so a refused write changes nothing on disk."""
         key = mgr.guild_key
         path = self.template_file(key, name)
-        text = json.dumps(data, indent=2, sort_keys=True) + "\n"
+        # Keys in their order (a template's passives fire in it).
+        text = json.dumps(data, indent=2) + "\n"
         size = len(text.encode("utf-8"))
         old = _file_size(path)
         kept = keep_old and os.path.isfile(path)
@@ -816,10 +819,13 @@ class Storage:
         if not plan:
             self._maybe_purge_trash()
             return msgs
-        delta = self._plan_delta(plan)
+        # The command journals grow after the commit (write_journals): their
+        # growth counts toward the limit too.
+        delta = self._plan_delta(plan) + self._journal_pending(mgr)
         refusal = self._over_limit(key, delta)
         if refusal:
-            # Old template versions go first, then the oldest autosaves
+            # Old template versions go first, then the older segment of each
+            # match's journal, then the oldest autosaves
             # (storage_trim_autosaves), if that makes room; otherwise undo
             # the command.
             tcut = 0
@@ -831,6 +837,22 @@ class Storage:
             if tcut:
                 msgs.append(f"🗄️ Storage limit: cut the {tcut} oldest old "
                             f"template version(s) to make room.")
+            jcut = 0
+            for mid in sorted(mgr.matches):
+                if self._over_limit(key, delta) is None:
+                    break
+                j = mgr.matches[mid].journal
+                while j is not None and len(j.segments) > 1 \
+                        and self._over_limit(key, delta) is not None:
+                    seg = j.segments.pop(0)
+                    jdir = self._journal_dir(key, mid)
+                    delta -= sum(_file_size(os.path.join(jdir, f"{seg['no']}.{x}"))
+                                 for x in ("json", "jsonl"))
+                    delta -= self._segment_pending(key, mid, seg)
+                    jcut += 1
+            if jcut:
+                msgs.append(f"🗄️ Storage limit: dropped {jcut} older command "
+                            f"journal segment(s) to make room.")
             refusal = self._over_limit(key, delta)
         if refusal:
             cut: Dict[str, List[int]] = {}
@@ -847,7 +869,7 @@ class Storage:
                 msgs.append(f"🗄️ Storage limit: cut the {n} oldest undo "
                             f"autosave(s) to make room.")
                 plan, after = self._plan(mgr, w)
-                delta = self._plan_delta(plan)
+                delta = self._plan_delta(plan) + self._journal_pending(mgr)
                 refusal = self._over_limit(key, delta)
             if refusal:
                 self.rollback(mgr)
@@ -937,6 +959,27 @@ class Storage:
                      if j.segments else 1))
         if not j.segments:
             m.journal = None
+
+    def _segment_pending(self, key: str, mid: str, seg: Dict[str, Any]) -> int:
+        """Bytes write_journals would add for journal segment `seg` of match
+        `mid` (its header and entries not yet on disk)."""
+        done = self._jwritten.get(key, {}).get(mid, {})
+        n = len(seg["entries"])
+        no = seg["no"]
+        if no not in done or n < done[no]:
+            return (len(_dump(seg["start"]).encode("utf-8"))
+                    + sum(len((_dump(e) + "\n").encode("utf-8"))
+                          for e in seg["entries"]))
+        return sum(len((_dump(e) + "\n").encode("utf-8"))
+                   for e in seg["entries"][done[no]:])
+
+    def _journal_pending(self, mgr: MatchManager) -> int:
+        """Bytes the journals will add when written (write_journals)."""
+        total = 0
+        for mid, m in mgr.matches.items():
+            for seg in (m.journal.segments if m.journal else []):
+                total += self._segment_pending(mgr.guild_key, mid, seg)
+        return total
 
     def write_journals(self, mgr: MatchManager) -> None:
         """Bring each match's journal files in line with its journal: a new

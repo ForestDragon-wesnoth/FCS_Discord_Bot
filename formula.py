@@ -388,11 +388,12 @@ import math
 import itertools
 import json
 import re
+import contextvars
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import CURRENT_WORKSPACE, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number
+from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number
 
 
 class FormulaError(VTTError):
@@ -1147,14 +1148,93 @@ def _int_too_big(msg: str) -> FormulaError:
     )
 
 
+_INT_CAP_CACHE: Dict[int, int] = {}
+
+
+def _int_ok(r: Any, what: str) -> Any:
+    """`r` when it isn't an integer past _max_int_digits() digits (one that
+    can't be shown, hashed or saved), else a refusal. Cheap: a comparison
+    with a cached power of ten."""
+    if isinstance(r, int) and not isinstance(r, bool):
+        lim = _max_int_digits()
+        cap = _INT_CAP_CACHE.get(lim)
+        if cap is None:
+            cap = _INT_CAP_CACHE[lim] = 10 ** lim
+        if r >= cap or r <= -cap:
+            raise _int_too_big(what)
+    return r
+
+
+def _item_count(v: Any, cap: int) -> int:
+    """How many items list / dict `v` holds, nested ones included (a list
+    of three lists of four counts 15), stopping past `cap`."""
+    n, stack = 0, [v]
+    while stack and n <= cap:
+        x = stack.pop()
+        items = x.values() if isinstance(x, dict) else x
+        n += len(x)
+        stack.extend(y for y in items
+                     if isinstance(y, (list, tuple, dict)) and y)
+    return n
+
+
+def _size_of(v: Any, cap: int) -> int:
+    """About how many characters `v` writes as text, counted without
+    building it and stopping past `cap`: a text its length, a number its
+    digits, a list / dict one per item plus its items. A list holding the
+    same big list many times counts each time, as its text would."""
+    n, stack = 0, [v]
+    while stack and n <= cap:
+        x = stack.pop()
+        if isinstance(x, str):
+            n += len(x) + 2
+        elif isinstance(x, dict):
+            n += 2 + len(x)
+            stack.extend(x.keys())
+            stack.extend(x.values())
+        elif isinstance(x, (list, tuple)):
+            n += 2 + len(x)
+            stack.extend(x)
+        elif isinstance(x, int) and not isinstance(x, bool):
+            n += x.bit_length() // 3 + 1
+        else:
+            n += 5
+    return n
+
+
+def _text_of(v: Any, limit: int = _DEFAULT_SIZE_LIMIT,
+             what: str = "str") -> str:
+    """str(v), refused when the text would pass formula_size_limit: a list
+    holding the same big list many times is small in memory but huge as
+    text (gigabytes from one `$()`)."""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (list, tuple, dict)) and _size_of(v, limit) > limit:
+        raise FormulaError(
+            f"{what}(...): the text would be over the formula_size_limit of "
+            f"{limit} characters.")
+    return str(v)
+
+
+def _round(x: Any, ndigits: Any = None) -> Any:
+    """round(x, ndigits=None), as Python's, without computing 10**-ndigits
+    for a whole number rounded to a huge negative ndigits (minutes of CPU
+    for round(5, -10**8)): past the largest integer's digits it is 0."""
+    if (isinstance(x, int) and not isinstance(x, bool)
+            and isinstance(ndigits, int) and not isinstance(ndigits, bool)
+            and ndigits < -(_max_int_digits() + 1)):
+        return 0
+    return round(x, ndigits) if ndigits is not None else round(x)
+
+
 def _safe_pow(a: Any, b: Any) -> Any:
     """`a ** b` with the integer result size checked BEFORE computing it
     (9**9**9 is ~370 million digits and takes hours). Float overflow is
     already fast (OverflowError)."""
     if (isinstance(a, int) and isinstance(b, int) and b > 1
-            and abs(a) > 1 and b * math.log10(abs(a)) > _max_int_digits()):
+            and abs(a) > 1 and b * math.log10(abs(a)) >= _max_int_digits()):
         raise _int_too_big("** / pow")
-    return a ** b
+    return _int_ok(a ** b, "** / pow")
 
 
 def _safe_mul(a: Any, b: Any, limit: int = _DEFAULT_SIZE_LIMIT) -> Any:
@@ -1163,16 +1243,21 @@ def _safe_mul(a: Any, b: Any, limit: int = _DEFAULT_SIZE_LIMIT) -> Any:
     if isinstance(a, int) and isinstance(b, (str, list, tuple)):
         a, b = b, a
     if isinstance(a, (str, list, tuple)) and isinstance(b, int):
-        if b > 0 and len(a) * b > limit:
+        # A list's items count with everything nested in them: [r] * n
+        # holds n references to r, and its text, copies and comparisons
+        # cost n times r.
+        n = len(a) if isinstance(a, str) else _item_count(a, limit)
+        if b > 0 and n * b > limit:
             raise FormulaError(
-                f"*: would build a {type(a).__name__} of length "
-                f"{len(a) * b}, over the formula_size_limit of {limit}."
+                f"*: would build a {type(a).__name__} of "
+                f"{'length' if isinstance(a, str) else 'size'} "
+                f"{n * b}, over the formula_size_limit of {limit}."
             )
     elif (isinstance(a, int) and isinstance(b, int) and a and b
           and (a.bit_length() + b.bit_length()) * 0.30103
           > _max_int_digits() + 1):
         raise _int_too_big("*")
-    return a * b
+    return _int_ok(a * b, "*")
 
 
 def _safe_add(a: Any, b: Any, limit: int = _DEFAULT_SIZE_LIMIT) -> Any:
@@ -1184,7 +1269,7 @@ def _safe_add(a: Any, b: Any, limit: int = _DEFAULT_SIZE_LIMIT) -> Any:
             f"+: would build a {type(a).__name__} of length "
             f"{len(a) + len(b)}, over the formula_size_limit of {limit}."
         )
-    return a + b
+    return _int_ok(a + b, "+")
 
 
 def _safe_mod(a: Any, b: Any) -> Any:
@@ -1919,7 +2004,7 @@ def _sum(v: Any) -> Any:
     if bad:
         raise FormulaError(
             f"sum(list): every item must be a number, got {bad[0]!r}.")
-    return sum(items)
+    return _int_ok(sum(items), "sum")
 
 
 def _sorted(v: Any, desc: Any = False) -> list:
@@ -1946,7 +2031,13 @@ def _all(v: Any) -> bool:
 
 def _count(v: Any, value: Any) -> int:
     """count(list, value): how many items equal `value`."""
-    return sum(1 for x in _list_arg(v, "count") if x == value)
+    items = _list_arg(v, "count")
+    if isinstance(value, (list, dict)) and _size_of(
+            items, _DEFAULT_SIZE_LIMIT) > _DEFAULT_SIZE_LIMIT:
+        raise FormulaError(f"count(list, value): the list is too big to "
+                           f"compare its items (over {_DEFAULT_SIZE_LIMIT} "
+                           f"values).")
+    return sum(1 for x in items if x == value)
 
 
 # ---- container reads -----------------------------------------------------
@@ -2044,7 +2135,11 @@ def _unique(v: Any) -> list:
     seen_h: set = set()
     seen_u: set = set()
     out = []
-    for x in _list_arg(v, "unique"):
+    items = _list_arg(v, "unique")
+    if _size_of(items, _DEFAULT_SIZE_LIMIT) > _DEFAULT_SIZE_LIMIT:
+        raise FormulaError(f"unique(list): the list is too big to compare "
+                           f"its items (over {_DEFAULT_SIZE_LIMIT} values).")
+    for x in items:
         try:
             if x in seen_h:
                 continue
@@ -2141,8 +2236,7 @@ def _join(items: Any, sep: Any = "", *,
           limit: int = _DEFAULT_SIZE_LIMIT) -> str:
     """join(list, sep=""): the items as one text, `sep` between them.
     Numbers and other values are written as str() would."""
-    parts = [x if isinstance(x, str) else str(x)
-             for x in _list_arg(items, "join")]
+    parts = [_text_of(x, limit, "join") for x in _list_arg(items, "join")]
     sep = _text_arg(sep, "join", "sep")
     size = sum(len(p) for p in parts) + len(sep) * max(0, len(parts) - 1)
     if size > limit:
@@ -2205,7 +2299,7 @@ def _fmt(template: Any, *args: Any, _limit: int = _DEFAULT_SIZE_LIMIT,
             except (ValueError, TypeError) as ex:
                 raise FormulaError(f"fmt(...): {{{m.group(1)}}}: {ex}")
         else:
-            piece = val if isinstance(val, str) else str(val)
+            piece = _text_of(val, _limit, "fmt")
         out.append(piece)
         if sum(len(x) for x in out) > _limit:
             raise FormulaError(
@@ -2216,8 +2310,8 @@ def _fmt(template: Any, *args: Any, _limit: int = _DEFAULT_SIZE_LIMIT,
 
 
 _ALLOWED_FUNCS: Dict[str, Any] = {
-    "min": min, "max": max, "abs": abs, "round": round,
-    "int": int, "float": float, "str": str,
+    "min": min, "max": max, "abs": abs, "round": _round,
+    "int": int, "float": float, "str": lambda *a: _text_of(a[0]) if len(a) == 1 else str(*a),
     "len": _len,
     "random_int": _random_int,
     "random_string": _random_string,
@@ -3005,6 +3099,11 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
                         # matters if the hook moves the entity
                         # mid-fire via a future entity-tp formula).
     "tile_y",           # See tile_x.
+    "tile_map",         # The map of the firing / tested tile (tile hooks,
+                        # tile and corpse conditions). Unit-less map
+                        # lookups in the formula default to it.
+    "zone_map",         # The map of the firing / tested zone (zone hooks
+                        # and conditions); a default like tile_map.
     "status_name",      # The status being ticked. Bound only during
                         # status_tick_formula evaluation (see
                         # status_tick_when / status_tick_formula rules
@@ -3226,6 +3325,38 @@ def _collect_action_locals(tree: ast.AST) -> "frozenset[str]":
     return frozenset(locals_set)
 
 
+# Lowercase spellings of the constants, as commands, rules and `!find` write
+# them: a formula reads `true` / `false` / `none` as True / False / None,
+# so the three can't name a local, a loop variable or a unit.
+LOWERCASE_CONSTANTS = {"true": True, "false": False, "none": None}
+
+
+class _LowercaseConstants(ast.NodeTransformer):
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        if node.id in LOWERCASE_CONSTANTS and isinstance(node.ctx, ast.Load):
+            return ast.copy_location(
+                ast.Constant(value=LOWERCASE_CONSTANTS[node.id]), node)
+        return node
+
+
+def _refuse_engine_names(tree: ast.AST) -> None:
+    """Refuse a `__` name a formula's SOURCE reads. The entity-access
+    transformer injects calls to the engine's own helpers (`__read`,
+    `__write`, `__safe_add`, ...) and the validator allows those names, so
+    one typed in the source would pass as theirs (a "read-only" condition
+    calling `__write`). Run on the parsed source before the transformer;
+    binding such a name is refused by _check_binding_name."""
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Name) and node.id.startswith("__")
+                and isinstance(node.ctx, ast.Load)):
+            raise FormulaError(f"`{node.id}` isn't a name a formula can use "
+                               f"(names starting with `__` are the "
+                               f"engine's).")
+    # Every parse path passes here first, so the constants' lowercase
+    # spellings are rewritten here too (in place: the root is never a Name).
+    _LowercaseConstants().visit(tree)
+
+
 def _check_binding_name(name: str, what: str) -> None:
     """Refuse a `__`-prefixed name for a formula binding (a local, a loop
     variable). The namespace is the formula's globals too, so binding
@@ -3233,6 +3364,9 @@ def _check_binding_name(name: str, what: str) -> None:
     if name.startswith("__"):
         raise FormulaError(f"`{name}` can't be {what}'s name (names starting "
                            f"with `__` are the engine's).")
+    if name in LOWERCASE_CONSTANTS:
+        raise FormulaError(f"`{name}` can't be {what}'s name: formulas read "
+                           f"it as {LOWERCASE_CONSTANTS[name]}.")
 
 
 class _EntityAccessTransformer(ast.NodeTransformer):
@@ -3304,6 +3438,10 @@ class _EntityAccessTransformer(ast.NodeTransformer):
             return ast.Constant(value=slice_node.id)
         if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, str):
             return ast.Constant(value=slice_node.value)
+        if (isinstance(slice_node, ast.Constant)
+                and type(slice_node.value) is int and slice_node.value >= 0):
+            # A digits-only id (`entity[123]`) is that id as text.
+            return ast.Constant(value=str(slice_node.value))
         # Any other expression -> dynamic. Recursively transform it so it
         # may itself contain entity[...] reads / function calls, then use
         # its runtime value as the entity id.
@@ -3725,6 +3863,7 @@ def _validate_tree(
                     f"parameter (`lambda u: ...`).")
             pname = a.args[0].arg
             if pname.startswith("__") or pname == "entity" \
+                    or pname in LOWERCASE_CONSTANTS \
                     or pname in _ALLOWED_FUNCS or pname in _MATCH_FUNC_NAMES:
                 raise FormulaError(f"{node.func.id}: `{pname}` can't be a "
                                    f"lambda parameter name.")
@@ -3988,13 +4127,21 @@ class FormulaEngine:
                 return default
         cell_limit = _rule_int("formula_cell_limit", _DEFAULT_CELL_LIMIT)
         size_limit = _rule_int("formula_size_limit", _DEFAULT_SIZE_LIMIT)
+        # The map unit-less lookups use: inside a tile or zone hook or
+        # condition, the hook's own map (tile_map / zone_map); else the
+        # match's only map (a match with several refuses, naming them).
+        def _cur_map():
+            name = extras.get("tile_map") or extras.get("zone_map")
+            if name and name in self._match.maps:
+                return self._match.maps[name]
+            return self._match.get_map()
         # The area builders only list (and only visit) cells on the map.
         # Resolved when a builder runs, so a formula that builds no area
         # needs no map on a match with several.
         def _grid():
             if self._match is None:
                 return None
-            gm = self._match.get_map()
+            gm = _cur_map()
             return (gm.grid_width, gm.grid_height)
         # The namespace is the formula's globals AND locals: one dict, so
         # a lambda body (#174) resolves names (`__read`, locals, a !func's
@@ -4023,6 +4170,8 @@ class FormulaEngine:
             "each": lambda v: _each(v, limit=size_limit),
             "replace": lambda *a: _replace(*a, limit=size_limit),
             "join": lambda *a: _join(*a, limit=size_limit),
+            "str": lambda *a: (_text_of(a[0], size_limit) if len(a) == 1
+                               else str(*a)),
             "fmt": lambda *a, **k: _fmt(*a, _limit=size_limit, **k),
         }
         # Per-name default: was_clamped is boolean-flavored (default False);
@@ -4054,19 +4203,27 @@ class FormulaEngine:
         # lives on the match and advances across calls (so a SEQUENCE of
         # rolls is deterministic, not every roll identical). It's rebuilt
         # when the seed changes or the match reloads (runtime-only state).
+        # Closures over `rng` (no `_r=rng` default): an extra positional
+        # argument used to land on the RNG parameter (a raw Python error).
         rng = self._match.formula_rng() if self._match else random
         if rng is not random:
-            ns["random_int"] = (
-                lambda lo, hi, _r=rng: _random_int_impl(_r, lo, hi)
-            )
-            ns["random_string"] = (
-                lambda *choices, _r=rng: _random_string_impl(_r, choices)
-            )
-            ns["pick"] = lambda v, _r=rng: _pick_impl(_r, v)
-            ns["shuffle"] = lambda v, _r=rng: _shuffle_impl(_r, v)
-            ns["roll"] = (
-                lambda spec, _r=rng: _roll_impl(_r, spec)
-            )
+            def random_int(lo, hi):
+                return _random_int_impl(rng, lo, hi)
+
+            def random_string(*choices):
+                return _random_string_impl(rng, choices)
+
+            def pick(v):
+                return _pick_impl(rng, v)
+
+            def shuffle(v):
+                return _shuffle_impl(rng, v)
+
+            def roll(spec):
+                return _roll_impl(rng, spec)
+            for fn in (random_int, random_string, pick, shuffle, roll):
+                fn.__qualname__ = fn.__name__     # "pick() takes 1 ..."
+                ns[fn.__name__] = fn
 
         # Match-bound group functions. Each takes string args; entity-id
         # args go through ctx.resolve_who so the special tokens "self",
@@ -4185,7 +4342,7 @@ class FormulaEngine:
                     f"{type(path).__name__}."
                 )
             try:
-                return match.get_map().tile_get_path(x, y, path)
+                return _cur_map().tile_get_path(x, y, path)
             except VTTError as ex:
                 # OutOfBounds / NotFound / empty-path errors from
                 # tile_get_path are all VTTError subclasses; surface
@@ -4209,7 +4366,7 @@ class FormulaEngine:
                     f"tile_has(x, y, path): path must be str, got "
                     f"{type(path).__name__}."
                 )
-            return match.get_map().tile_has_path(x, y, path)
+            return _cur_map().tile_has_path(x, y, path)
 
         ns["tile_get"] = _tile_get
         ns["tile_has"] = _tile_has
@@ -4241,7 +4398,7 @@ class FormulaEngine:
                     f"{type(path).__name__}."
                 )
             try:
-                match.get_map().tile_set_path(x, y, path, value)
+                _cur_map().tile_set_path(x, y, path, value)
             except VTTError as ex:
                 raise FormulaError(str(ex))
             return value
@@ -4267,10 +4424,10 @@ class FormulaEngine:
             # tile_del calls would otherwise need a tile_has guard
             # for each one. Match.tile_del_path raises NotFound on
             # absent paths; we swallow that and return False.
-            if not match.get_map().tile_has_path(x, y, path):
+            if not _cur_map().tile_has_path(x, y, path):
                 return False
             try:
-                match.get_map().tile_del_path(x, y, path)
+                _cur_map().tile_del_path(x, y, path)
             except VTTError as ex:
                 raise FormulaError(str(ex))
             return True
@@ -4286,9 +4443,9 @@ class FormulaEngine:
                     f"tile_clear(x, y): y must be int, got "
                     f"{type(y).__name__}."
                 )
-            if (x, y) not in match.get_map().tiles:
+            if (x, y) not in _cur_map().tiles:
                 return False
-            del match.get_map().tiles[(x, y)]
+            _cur_map().clear_tile_keep_corpses(x, y)   # bodies stay
             return True
 
         ns["tile_set"] = _tile_set
@@ -4418,7 +4575,9 @@ class FormulaEngine:
             target_eid = ctx.target
             if eid_t is not None:
                 target_eid = _eid(eid_t)
-            log = match.fire_tile_hook(hook_name, target_eid, x, y)
+            log = match.fire_tile_hook(
+                hook_name, target_eid, x, y,
+                mp=None if target_eid in match.entities else _cur_map())
             return len(log)
 
         def _push_entity(eid_t: Any, direction: Any, n: Any = 1) -> int:
@@ -4593,7 +4752,7 @@ class FormulaEngine:
             if ref_e is None:
                 raise FormulaError(f"unknown entity id '{ref_eid}'.")
             for oid, oe in match.entities.items():
-                if oid == ref_eid:
+                if oid == ref_eid or oe.map != ref_e.map:
                     continue
                 if not oe.is_alive:
                     continue
@@ -4790,7 +4949,7 @@ class FormulaEngine:
             # The blocking entity covering (x,y), or "" if the cell is free.
             occ = match.cell_occupant(
                 _coord_int(x, "cell_entity", "x"),
-                _coord_int(y, "cell_entity", "y"))
+                _coord_int(y, "cell_entity", "y"), mp=_cur_map())
             return occ or ""
 
         def _entity_center(eid_t: Any) -> tuple:
@@ -5858,7 +6017,7 @@ class FormulaEngine:
                 raise FormulaError(f"tile_keys(x, y): x must be int, got {type(x).__name__}.")
             if isinstance(y, bool) or not isinstance(y, int):
                 raise FormulaError(f"tile_keys(x, y): y must be int, got {type(y).__name__}.")
-            data = match.get_map().tiles.get((x, y))
+            data = _cur_map().tiles.get((x, y))
             if not isinstance(data, dict):
                 return []
             return list(data.keys())
@@ -5956,7 +6115,7 @@ class FormulaEngine:
             from action import coerce_target, dedupe_targets
             try:
                 target_arg = coerce_target(action.target_type, target_arg,
-                                           match, name)
+                                           match, name, eid)
             except VTTError as ex:
                 raise FormulaError(f"use_action: {ex}")
             target_arg, dup_note = dedupe_targets(action.target_type,
@@ -6126,23 +6285,47 @@ class FormulaEngine:
             if not isinstance(name, str) or not isinstance(path, str):
                 raise FormulaError("template_data(name, path): name and "
                                    "path must be text.")
-            tpl = _workspace_templates().get(name.strip().lower())
+            key_name = name.strip().lower()
+            tpl = _workspace_templates().get(key_name)
             if tpl is None:
                 raise FormulaError(f"template_data: this server has no "
                                    f"template `{name}`.")
-            try:
-                data = match.expand_template(tpl)
-            except (VTTError, NotFound) as ex:
-                raise FormulaError(f"template_data: {ex}")
-            if path in ("", "."):
-                return data
+            # The expansion is made once per command (kept with the
+            # command's partial cache, which any template edit clears) and
+            # each call copies only the value at `path`; what the calls
+            # return is charged to partial_template_size_limit per command,
+            # so a loop can't copy a big template thousands of times.
+            cache = PARTIAL_CACHE.get()
+            ckey = ("template_data", getattr(CURRENT_WORKSPACE.get(),
+                                             "guild_key", None),
+                    match.id, bool(match.rules.get("template_pinning", False)),
+                    key_name)
+            data = cache.get(ckey) if cache is not None else None
+            if data is None:
+                try:
+                    data = match.expand_template(tpl)
+                except (VTTError, NotFound) as ex:
+                    raise FormulaError(f"template_data: {ex}")
+                if cache is not None:
+                    cache[ckey] = data
             node: Any = data
-            for k in path.split("."):
-                if not isinstance(node, dict) or k not in node:
-                    raise FormulaError(f"template_data: `{name}` has nothing "
-                                       f"at `{path}`.")
-                node = node[k]
-            return node
+            if path not in ("", "."):
+                for k in path.split("."):
+                    if not isinstance(node, dict) or k not in node:
+                        raise FormulaError(f"template_data: `{name}` has "
+                                           f"nothing at `{path}`.")
+                    node = node[k]
+            if cache is not None:
+                limit = int(match.rules.get("partial_template_size_limit",
+                                            20000))
+                spent = cache.get("template_data_spent", 0) + _node_count(node)
+                if spent > limit:
+                    raise FormulaError(
+                        f"template_data: this command has read {spent} "
+                        f"values from templates, past "
+                        f"partial_template_size_limit ({limit}) per command.")
+                cache["template_data_spent"] = spent
+            return copy.deepcopy(node)
 
         def _template_names() -> List[str]:
             """template_names(): the server's saved template names, sorted.
@@ -6527,7 +6710,7 @@ class FormulaEngine:
             """zones_at(x, y): list of zone names covering cell (x,y)
             (sorted; loopable)."""
             xi, yi = _zone_xy(x, y, "zones_at")
-            return sorted(match.get_map().zones_at(xi, yi))
+            return sorted(_cur_map().zones_at(xi, yi))
 
         def _cell_in_zone(x: Any, y: Any, name: Any) -> bool:
             """cell_in_zone(x, y, name): True iff (x,y) is in the zone."""
@@ -6840,6 +7023,10 @@ class FormulaEngine:
             existence)."""
             if not isinstance(name, str):
                 raise FormulaError("rule_get(name): name must be a string.")
+            if name in SECRET_RULES and _IN_ARG_TOKEN.get():
+                raise FormulaError(
+                    f"rule_get('{name}') can't be read in a `$()` argument "
+                    f"(its value is for hosts: `!help rule {name}`).")
             return match.rules.get(name)
         ns["rule_get"] = _rule_get
 
@@ -7287,8 +7474,10 @@ class FormulaEngine:
                     f"entities_in_area(...): n (the radius) must be a number, "
                     f"got {type(n).__name__}.")
             scored = []
+            here_map = _cur_map().name
             for eid, e in match.entities.items():
-                if not e.is_alive or e.is_glued_part or e.is_hidden_rider:
+                if not e.is_alive or e.is_glued_part or e.is_hidden_rider \
+                        or e.map != here_map:
                     continue
                 d = match.cell_entity_distance(x, y, e, mode)
                 if d <= n:
@@ -7300,20 +7489,30 @@ class FormulaEngine:
         # Shape-rooted entity queries: the entity-returning twins of the
         # cells_in_* helpers. Each builds the shape's cells then collects
         # the alive entities standing on them.
-        def _alive_at(cellset):
+        def _view_map(vid):
+            """The map a viewer-relative query reads: the viewer's map, else
+            the formula's map (_cur_map)."""
+            ve = match.entities.get(vid) if vid else None
+            return match.map_of(ve) if ve is not None else _cur_map()
+
+        def _alive_at(cellset, mp=None):
             # Footprint-aware membership: a large entity is "in" the shape
             # if ANY cell it covers is in cellset (listed once, by anchor).
+            # Only units on the shape's map (the formula's map).
+            mname = (mp or _cur_map()).name
             return [(e.x, e.y, eid) for eid, e in match.entities.items()
-                    if e.is_alive
+                    if e.is_alive and e.map == mname
                     and any(c in cellset for c in match.entity_cells(e))]
 
-        def _occupants() -> dict:
+        def _occupants(mp=None) -> dict:
             # Footprint-aware: a large entity registers under EVERY cell it
             # covers, so it's "on the line" / "in the way" if any part of
-            # its body is. Consumers dedupe across cells.
+            # its body is. Consumers dedupe across cells. Only units on map
+            # `mp` (the formula's map by default).
+            mname = (mp or _cur_map()).name
             here: dict = {}
             for eid, e in match.entities.items():
-                if e.is_alive:
+                if e.is_alive and e.map == mname:
                     for c in match.entity_cells(e):
                         here.setdefault(c, []).append(eid)
             return here
@@ -7331,10 +7530,11 @@ class FormulaEngine:
             cy1 = _coord_int(y1, "entities_in_line_ignorelos", "y1")
             cx2 = _coord_int(x2, "entities_in_line_ignorelos", "x2")
             cy2 = _coord_int(y2, "entities_in_line_ignorelos", "y2")
-            here = _occupants()
+            lmp = _cur_map()
+            here = _occupants(lmp)
             out: list = []
             seen: set = set()
-            for cell in match._line_cells(cx1, cy1, cx2, cy2):
+            for cell in match._line_cells(cx1, cy1, cx2, cy2, mp=lmp):
                 for eid in sorted(here.get(cell, ())):
                     if eid not in seen:
                         seen.add(eid)
@@ -7356,7 +7556,8 @@ class FormulaEngine:
             cx2 = _coord_int(x2, "entities_on_los", "x2")
             cy2 = _coord_int(y2, "entities_on_los", "y2")
             vid = None if viewer is None else _eid(viewer)
-            here = _occupants()
+            lmp = _view_map(vid)
+            here = _occupants(lmp)
             # Exclude the shooter and target BY ID, not just their anchor
             # cells: a large shooter/target's body can extend onto the
             # in-between cells, and those aren't "in the way" of its own shot.
@@ -7364,12 +7565,13 @@ class FormulaEngine:
             out: list = []
             seen: set = set(endpoint_ids)
             ends = ((cx1, cy1), (cx2, cy2))
-            for cell in [c for c in match._line_cells(cx1, cy1, cx2, cy2)
+            for cell in [c for c in match._line_cells(cx1, cy1, cx2, cy2,
+                                                      mp=lmp)
                          if c not in ends]:
                 ids = here.get(cell)
                 if not ids:
                     continue
-                if not match.has_los(vid, cx1, cy1, cell[0], cell[1]):
+                if not match.has_los(vid, cx1, cy1, cell[0], cell[1], lmp):
                     continue
                 for eid in sorted(ids):
                     if eid not in seen:
@@ -7388,7 +7590,7 @@ class FormulaEngine:
             cx2 = _coord_int(x2, "first_opaque", "x2")
             cy2 = _coord_int(y2, "first_opaque", "y2")
             vid = None if viewer is None else _eid(viewer)
-            return match.first_opaque(vid, cx1, cy1, cx2, cy2)
+            return match.first_opaque(vid, cx1, cy1, cx2, cy2, _view_map(vid))
 
         def _raycast(x1: Any, y1: Any, x2: Any, y2: Any,
                      viewer: Any = None) -> Any:
@@ -7404,7 +7606,7 @@ class FormulaEngine:
             cx2 = _coord_int(x2, "raycast", "x2")
             cy2 = _coord_int(y2, "raycast", "y2")
             vid = None if viewer is None else _eid(viewer)
-            return match.raycast(vid, cx1, cy1, cx2, cy2)
+            return match.raycast(vid, cx1, cy1, cx2, cy2, _view_map(vid))
 
         def _entities_in_cone(x: Any, y: Any, direction: Any, length: Any,
                               half_angle: Any = 45) -> list:
@@ -7457,14 +7659,16 @@ class FormulaEngine:
             if cap <= 0:
                 return []
             vid = None if viewer is None else _eid(viewer)
-            here = _occupants()
+            lmp = _view_map(vid)
+            here = _occupants(lmp)
             out: list = []
             seen: set = set()
-            for cell in match._line_cells(cx1, cy1, cx2, cy2):
+            for cell in match._line_cells(cx1, cy1, cx2, cy2, mp=lmp):
                 # With a viewer, stop the line at the first opaque cell
                 # (a wall halts the shot); the start cell never blocks.
                 if vid is not None and cell != (cx1, cy1) and \
-                        not match.has_los(vid, cx1, cy1, cell[0], cell[1]):
+                        not match.has_los(vid, cx1, cy1, cell[0], cell[1],
+                                          lmp):
                     break
                 for eid in sorted(here.get(cell, ())):
                     if eid not in seen:
@@ -7496,7 +7700,7 @@ class FormulaEngine:
                         "clip_cells(...): each cell must be an (x, y) pair.")
                 cxv = _coord_int(c[0], "clip_cells", "x")
                 cyv = _coord_int(c[1], "clip_cells", "y")
-                if match.get_map().in_bounds(cxv, cyv):
+                if _cur_map().in_bounds(cxv, cyv):
                     out.append((cxv, cyv))
             return out
         ns["clip_cells"] = _clip_cells
@@ -7640,6 +7844,10 @@ class FormulaEngine:
             eid, e = _resolve_entity(eid_t, "face_toward")
             if b is None and isinstance(a, str):
                 _, t = _resolve_entity(a, "face_toward")
+                if t.map != e.map:
+                    raise FormulaError(
+                        f"face_toward: `{e.id}` and `{t.id}` are on "
+                        f"different maps.")
                 tw, th = match.entity_footprint(t)
                 tx, ty = t.x + (tw - 1) / 2, t.y + (th - 1) / 2
             elif b is None:
@@ -7657,15 +7865,15 @@ class FormulaEngine:
 
         def _grid_width() -> int:
             """grid_width(): the map's width in cells."""
-            return match.get_map().grid_width
+            return _cur_map().grid_width
 
         def _grid_height() -> int:
             """grid_height(): the map's height in cells."""
-            return match.get_map().grid_height
+            return _cur_map().grid_height
 
         def _in_bounds(x: Any, y: Any) -> bool:
             """in_bounds(x, y): whether (x, y) is a cell on the map."""
-            return match.get_map().in_bounds(_cell_arg(x, "in_bounds", "x"),
+            return _cur_map().in_bounds(_cell_arg(x, "in_bounds", "x"),
                                    _cell_arg(y, "in_bounds", "y"))
 
         def _entity_distance(a_t: Any, b_t: Any,
@@ -7677,6 +7885,8 @@ class FormulaEngine:
             _, ea = _resolve_entity(a_t, "entity_distance")
             _, eb = _resolve_entity(b_t, "entity_distance")
             _distance(0, 0, 0, 0, mode)        # validates the metric name
+            if ea.map != eb.map:
+                return None                    # no distance across maps
             return match.entity_gap_distance(ea, eb, mode)
 
         def _cell_blocked(eid_t: Any, x: Any, y: Any, mode: Any = None) -> bool:
@@ -7688,7 +7898,7 @@ class FormulaEngine:
             eid, _ = _resolve_entity(eid_t, "cell_blocked")
             cx = _cell_arg(x, "cell_blocked", "x")
             cy = _cell_arg(y, "cell_blocked", "y")
-            if not match.get_map().in_bounds(cx, cy):
+            if not match.map_of(match.entities[eid]).in_bounds(cx, cy):
                 return True
             if mode is None:
                 return match.cell_blocks(eid, cx, cy)
@@ -7707,7 +7917,7 @@ class FormulaEngine:
             vid = None
             if viewer is not None:
                 vid, _ = _resolve_entity(viewer, "cell_opaque")
-            return match.cell_opaque(vid, cx, cy)
+            return match.cell_opaque(vid, cx, cy, _view_map(vid))
 
         def _free_cell_near(x: Any, y: Any, radius: Any, eid_t: Any = None):
             """free_cell_near(x, y, radius, eid=None): the nearest cell within
@@ -7724,7 +7934,9 @@ class FormulaEngine:
             e = None
             if eid_t is not None:
                 _, e = _resolve_entity(eid_t, "free_cell_near")
-            return match.free_cell_near(cx, cy, radius, e)
+            return match.free_cell_near(
+                cx, cy, radius, e,
+                mp=match.map_of(e) if e is not None else _cur_map())
 
         def _team_members(team: Any) -> list:
             """team_members(team): ids of the alive units on `team`, in turn
@@ -7765,8 +7977,8 @@ class FormulaEngine:
                 raise FormulaError(f"zone_distance: no zone named {zone!r}.")
             _distance(0, 0, 0, 0, mode)        # validates the metric name
             cells = match.find_zone(zone).get("cells") or ()
-            if not cells:
-                return None
+            if not cells or match.zone_map(zone).name != e.map:
+                return None                    # empty, or on another map
             return min(match.cell_entity_distance(cx, cy, e, mode)
                        for cx, cy in cells)
 
@@ -7778,9 +7990,10 @@ class FormulaEngine:
             other spatial queries. Loopable."""
             cx = _cell_arg(x, "entities_at", "x")
             cy = _cell_arg(y, "entities_at", "y")
+            mname = _cur_map().name
             return [e.id for e in match.entities_in_turn_order()
                     if e.is_alive and not e.is_glued_part
-                    and not e.is_hidden_rider
+                    and not e.is_hidden_rider and e.map == mname
                     and (cx, cy) in match.entity_cells(e)]
 
         ns["zone_distance"] = _zone_distance
@@ -7901,6 +8114,8 @@ class FormulaEngine:
             _, e = _resolve_entity(eid_t, "nearest_cell")
             if b is None and isinstance(a, str):
                 _, o = _resolve_entity(a, "nearest_cell")
+                if o.map != e.map:
+                    return None                # no nearest cell across maps
                 targets = match.entity_cells(o)
             elif b is None:
                 targets = [(_cell_arg(_coord_x(a), "nearest_cell", "x"),
@@ -7945,12 +8160,12 @@ class FormulaEngine:
                 if z is None:
                     raise FormulaError(f"{fname}: no zone named {args[0]!r}.")
                 return {c for c in (z.get("cells") or ())
-                        if match.get_map().in_bounds(*c)}
+                        if _cur_map().in_bounds(*c)}
             if len(args) == 4:
                 xs = sorted(_cell_arg(v, fname, "x") for v in args[0::2])
                 ys = sorted(_cell_arg(v, fname, "y") for v in args[1::2])
-                x1, x2 = max(xs[0], 1), min(xs[1], match.get_map().grid_width)
-                y1, y2 = max(ys[0], 1), min(ys[1], match.get_map().grid_height)
+                x1, x2 = max(xs[0], 1), min(xs[1], _cur_map().grid_width)
+                y1, y2 = max(ys[0], 1), min(ys[1], _cur_map().grid_height)
                 if x1 > x2 or y1 > y2:
                     return set()
                 _cell_budget((x2 - x1 + 1) * (y2 - y1 + 1), fname, cell_limit)
@@ -7987,7 +8202,8 @@ class FormulaEngine:
                 raise FormulaError("random_free_cell(...): fit must be text.")
             area = _area_cells("random_free_cell", area_args)
             try:
-                spots = match.free_anchors_in_area(area, e, fit, cell_limit)
+                spots = match.free_anchors_in_area(area, e, fit, cell_limit,
+                                                   mp=_cur_map())
             except VTTError as ex:
                 raise FormulaError(f"random_free_cell(...): {ex}")
             return list(_active_rng().choice(spots)) if spots else None
@@ -8076,13 +8292,13 @@ class FormulaEngine:
             return None if team is None else str(team)
 
         def _team_sees_cell(team: Any, x: Any, y: Any) -> bool:
-            return match._team_sees(_tm(team), _cell_arg(x, "team_sees_cell", "x"), _cell_arg(y, "team_sees_cell", "y"), match.get_map(), los=True)
+            return match._team_sees(_tm(team), _cell_arg(x, "team_sees_cell", "x"), _cell_arg(y, "team_sees_cell", "y"), _cur_map(), los=True)
 
         def _team_sees_cell_rangeonly(team: Any, x: Any, y: Any) -> bool:
-            return match._team_sees(_tm(team), _cell_arg(x, "team_sees_cell_rangeonly", "x"), _cell_arg(y, "team_sees_cell_rangeonly", "y"), match.get_map(), los=False)
+            return match._team_sees(_tm(team), _cell_arg(x, "team_sees_cell_rangeonly", "x"), _cell_arg(y, "team_sees_cell_rangeonly", "y"), _cur_map(), los=False)
 
         def _team_sees_cell_losonly(team: Any, x: Any, y: Any) -> bool:
-            return match._team_has_los(_tm(team), _cell_arg(x, "team_sees_cell_losonly", "x"), _cell_arg(y, "team_sees_cell_losonly", "y"), match.get_map())
+            return match._team_has_los(_tm(team), _cell_arg(x, "team_sees_cell_losonly", "x"), _cell_arg(y, "team_sees_cell_losonly", "y"), _cur_map())
 
         def _team_sees_entity(team: Any, eid_t: Any) -> bool:
             # Footprint-aware: a large target is seen if ANY of its cells is.
@@ -8238,7 +8454,11 @@ class FormulaEngine:
                 return _call
 
             for fname, fdef in funcs.items():
-                ns[fname] = _make_callable(fdef)
+                # A `__` name from an older save would replace one of the
+                # engine's helpers (`__read`, `__safe_add`); `!system lint`
+                # reports it, and it is never bound.
+                if not fname.startswith("__"):
+                    ns[fname] = _make_callable(fdef)
 
         # Coordinates are lists in formulas: every built-in function's
         # result has its tuples turned into lists, so a coordinate from
@@ -8276,6 +8496,7 @@ class FormulaEngine:
             raise FormulaError(
                 f"function '{fdef.name}' body syntax error: {e.msg}"
             )
+        _refuse_engine_names(full)
         trailing_expr = None
         if full.body and isinstance(full.body[-1], ast.Expr):
             trailing_expr = full.body.pop().value
@@ -8322,6 +8543,7 @@ class FormulaEngine:
         # forward references (e.g. `x = x + 1` at line 1 — Python
         # exec will UnboundLocalError if x is never assigned before
         # that point, but the validator accepts the static program).
+        _refuse_engine_names(tree)
         if action_mode:
             known_params = known_params | _collect_action_locals(tree)
         tree = _EntityAccessTransformer(
@@ -8395,6 +8617,7 @@ class FormulaEngine:
             full = ast.parse(src, mode="exec")
         except SyntaxError as e:
             raise FormulaError(f"Syntax error: {e.msg}")
+        _refuse_engine_names(full)
 
         known = self._known_funcs()
         trailing_expr = None
@@ -8485,18 +8708,30 @@ def resolve_arg_token(token: str, match, self_id: Optional[str] = None) -> str:
     validate_arg_safe(body)
     this_id = match.current_entity_id() if hasattr(match, "current_entity_id") else None
     ctx = EvalCtx(this=this_id, target=self_id)
-    val = FormulaEngine(match).eval_expression(body, ctx)
-    return _stringify(val)
+    token = _IN_ARG_TOKEN.set(True)
+    try:
+        val = FormulaEngine(match).eval_expression(body, ctx)
+    finally:
+        _IN_ARG_TOKEN.reset(token)
+    rules = getattr(match, "rules", None) or {}
+    return _stringify(val, int(rules.get("formula_size_limit",
+                                         _DEFAULT_SIZE_LIMIT)))
 
 
-def _stringify(v: Any) -> str:
+# True while a `$()` command argument evaluates (resolve_arg_token): secret
+# rules (logic.SECRET_RULES) can't be read there.
+_IN_ARG_TOKEN: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "vtt_in_arg_token", default=False)
+
+
+def _stringify(v: Any, limit: int = _DEFAULT_SIZE_LIMIT) -> str:
     if isinstance(v, bool):
         return "true" if v else "false"
     if isinstance(v, float):
         return str(int(v)) if v.is_integer() else repr(v)
     if v is None:
         return ""
-    return str(v)
+    return _text_of(v, limit, "$()")
 
 
 # --- public validation helper -----------------------------------------------

@@ -47,6 +47,7 @@ surface (vtt_commands.py) gains `!action`.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
+import copy
 import contextvars
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
@@ -74,9 +75,23 @@ class _BufferCtx:
     channel_key mirrors the real context so active-match lookups inside
     the dispatched command resolve to the same match."""
 
-    def __init__(self, channel_key: str):
+    def __init__(self, channel_key: str, user_id: Optional[str] = None,
+                 user_name: Optional[str] = None):
         self.channel_key = channel_key
+        # Who ran the action: every identity check a cmd() line meets
+        # (a transfer into another match needs its host) sees that user. An
+        # identity-less context passed those checks (the gate's no-op for
+        # single-operator surfaces), so a cmd() line reached any match.
+        # Never an administrator (`is_admin` unset: default-deny).
+        self.user_id = user_id
+        self.user_name = user_name
         self.out: List[str] = []
+
+    @classmethod
+    def for_ctx(cls, ctx: Any) -> "_BufferCtx":
+        return cls(getattr(ctx, "channel_key", "CLI"),
+                   getattr(ctx, "user_id", None),
+                   getattr(ctx, "user_name", None))
 
     async def send(self, message: str) -> None:
         self.out.append(message)
@@ -628,10 +643,13 @@ class SourceProxy:
             m.surface_log(log)
 
 
-def _check_on_map(match: Any, x: int, y: int) -> None:
+def _check_on_map(match: Any, x: int, y: int,
+                  actor: Optional[str] = None) -> None:
     """A location target names a cell of the map (one off it used to run
-    the body on a cell nothing can occupy)."""
-    mp = match.get_map()
+    the body on a cell nothing can occupy): the acting unit's map, else
+    the match's only map."""
+    ae = match.entities.get(actor) if actor else None
+    mp = match.map_of(ae) if ae is not None else match.get_map()
     if not mp.in_bounds(x, y):
         raise VTTError(f"location ({x},{y}) is off the map "
                        f"({mp.size_text()}).")
@@ -756,6 +774,7 @@ def parse_args_tokens(tokens: List[str]) -> Dict[str, Any]:
 
 def parse_target(
     target_type: str, tokens: List[str], match: "Match",
+    actor: Optional[str] = None,
 ) -> Tuple[Any, List[str]]:
     """Consume the leading tokens that constitute the target and
     return `(target_value, remaining_tokens)`. The remaining tokens
@@ -798,7 +817,7 @@ def parse_target(
                 f"location target needs integer coords; got "
                 f"`{tokens[0]} {tokens[1]}`."
             )
-        _check_on_map(match, x, y)
+        _check_on_map(match, x, y, actor)
         return Coord(x, y), list(tokens[2:])
     if target_type == "entity_list":
         eids: List[str] = []
@@ -820,7 +839,7 @@ def parse_target(
                 x = int(tokens[i]); y = int(tokens[i + 1])
             except ValueError:
                 break
-            _check_on_map(match, x, y)
+            _check_on_map(match, x, y, actor)
             coords.append(Coord(x, y))
             i += 2
         if not coords:
@@ -893,7 +912,7 @@ def dedupe_targets(target_type: str, value: Any,
 
 
 def coerce_target(target_type: str, value: Any, match: "Match",
-                  name: str) -> Any:
+                  name: str, actor: Optional[str] = None) -> Any:
     """use_action()'s target turned into what the action's body gets from
     `!action` (parse_target): an entity id, a Coord (from [x, y] or a
     Coord), a list of either, a corpse id or None, checked the same way.
@@ -909,7 +928,7 @@ def coerce_target(target_type: str, value: Any, match: "Match",
         else:
             raise VTTError(f"action `{name}` takes a location target: "
                            f"[x, y], got {v!r}.")
-        _check_on_map(match, x, y)
+        _check_on_map(match, x, y, actor)
         return Coord(x, y)
 
     def _eid(v: Any) -> str:
@@ -1021,6 +1040,7 @@ async def run_action(
     # pre-state dict (no history-snapshot append yet — that happens
     # in the dispatcher AFTER the action completes).
     pre_state = match.to_dict(include_history=False)
+    hist_mark = match.history.mark()
     pre_action_depth = match._action_depth
     is_top_level = (pre_action_depth == 0)
 
@@ -1032,12 +1052,12 @@ async def run_action(
     # Nested sub-actions reuse the top-level buffer (stored on the
     # match) so all command echoes flush together, once, at the top.
     if is_top_level:
-        buffer_ctx = _BufferCtx(getattr(ctx, "channel_key", "CLI"))
+        buffer_ctx = _BufferCtx.for_ctx(ctx)
         match._runtime_buffer = buffer_ctx
     else:
         buffer_ctx = getattr(match, "_runtime_buffer", None)
         if buffer_ctx is None:
-            buffer_ctx = _BufferCtx(getattr(ctx, "channel_key", "CLI"))
+            buffer_ctx = _BufferCtx.for_ctx(ctx)
             match._runtime_buffer = buffer_ctx
 
     # Build the action's eval bindings. SourceProxy/ArgsProxy
@@ -1046,6 +1066,18 @@ async def run_action(
     source = SourceProxy(actor, action.container_path)
     args_proxy = ArgsProxy(args)
     cmd_allowlist = parse_cmd_allowlist(match.rules)
+    # The other matches as they were before this level's first cmd() line
+    # that can change them (see _cmd); None until one runs.
+    cross: Dict[str, Any] = {"snap": None}
+
+    def _rollback_all() -> None:
+        _rollback_match(match, mgr, pre_state)
+        # Autosaves the rolled-back body recorded (a turn advanced by a
+        # cmd() line) go too, and the ones pruned meanwhile return.
+        match.history.rewind(hist_mark)
+        if cross["snap"] is not None:
+            _restore_other_matches(mgr, match, cross["snap"])
+            cross["snap"] = None
 
     def _cmd(line: Any) -> None:
         """cmd('<command line>'): dispatch the line as if the GM
@@ -1075,6 +1107,16 @@ async def run_action(
                 f"cmd(): command `{name}` is not on this system's "
                 f"action_cmd_allowlist. Allowed: {allowed}."
             )
+        # A line that can change ANOTHER match (`ent transfer` / `ent copy`
+        # into it, `match ...`): the other matches are saved before the
+        # first such line of this action level, so a rollback puts them
+        # back with this match (a failed send-to-another-battlefield action
+        # left the unit in both matches).
+        sub = tokens[1].lower() if len(tokens) > 1 else ""
+        if cross["snap"] is None and (
+                name == "match" or (name == "ent"
+                                    and sub in ("transfer", "copy"))):
+            cross["snap"] = _snapshot_other_matches(mgr, match)
         # Dispatch into the synchronous buffer context. Because
         # _BufferCtx.send never suspends on a real future, the
         # dispatched (async) command coroutine runs to completion
@@ -1085,12 +1127,20 @@ async def run_action(
         # suppressed because match._action_depth > 0 (set below).
         # Use the CURRENT buffer (the replay loop swaps in a fresh one
         # per attempt, so reference it dynamically rather than capturing).
+        from vtt_commands import _GATE_LINES  # noqa: PLC0415
         coro = registry.dispatch_no_snapshot(
             tokens[0], tokens[1:], match._runtime_buffer or buffer_ctx, mgr,
         )
+        # The body is GM-written: its lines aren't a caller's typed lines,
+        # even when the action ran from a batch (_GATE_LINES).
+        gate_token = _GATE_LINES.set(False)
+        try:
+            result = _sync_dispatch_returning(coro)
+        finally:
+            _GATE_LINES.reset(gate_token)
         # A failed `!assert` line stops the body like fail() does (rolled
         # back); the ❌ Assertion failed line is already in the buffer.
-        if _sync_dispatch_returning(coro) == ASSERT_STOP:
+        if result == ASSERT_STOP:
             raise ActionFail(f"cmd(): `{line}` failed its assertion.",
                              reason="assert")
 
@@ -1254,7 +1304,7 @@ async def run_action(
                 _restore_rng(match, rng_state)
                 # Fresh output buffer per attempt — rolled-back attempts'
                 # command echoes must not leak into the committed run.
-                match._runtime_buffer = _BufferCtx(getattr(ctx, "channel_key", "CLI"))
+                match._runtime_buffer = _BufferCtx.for_ctx(ctx)
             try:
                 engine.eval_program(
                     action.body, eval_ctx,
@@ -1264,7 +1314,7 @@ async def run_action(
             except ChoiceNeeded as nc:
                 if not is_top_level:
                     raise  # the top-level loop owns replay
-                _rollback_match(match, mgr, pre_state)
+                _rollback_all()
                 if len(match._choice_answers) >= choice_limit:
                     match._action_depth = pre_action_depth
                     match._runtime_buffer = None
@@ -1286,18 +1336,18 @@ async def run_action(
                 # Clean GM-initiated abort. Roll back, then finish.
                 # Buffered command echoes are DISCARDED — the action
                 # rolled back, so its partial output would mislead.
-                _rollback_match(match, mgr, pre_state)
+                _rollback_all()
                 return _finish_action_fail(af)
             except ActionEngineFault:
                 # Engine refusal (recursion / choice limit). Roll back
                 # AND re-raise so every level unwinds.
-                _rollback_match(match, mgr, pre_state)
+                _rollback_all()
                 match._action_depth = pre_action_depth
                 if is_top_level:
                     match._runtime_buffer = None
                 raise
             except Exception:
-                _rollback_match(match, mgr, pre_state)
+                _rollback_all()
                 match._action_depth = pre_action_depth
                 if is_top_level:
                     match._runtime_buffer = None
@@ -1403,6 +1453,45 @@ def _check_rollback_fields(preserved_attrs) -> None:
     _ROLLBACK_FIELDS_CHECKED = True
 
 
+def _snapshot_other_matches(mgr: Any, match: "Match") -> Dict[str, Any]:
+    """Every match of the server but `match`, serialized, and the channel
+    pointers: what an action's cmd() line may change elsewhere."""
+    return {"matches": {mid: m.to_dict(include_history=False)
+                        for mid, m in mgr.matches.items() if m is not match},
+            "objs": {mid: m for mid, m in mgr.matches.items()
+                     if m is not match},
+            "hist": {mid: m.history.mark() for mid, m in mgr.matches.items()
+                     if m is not match},
+            "active": dict(mgr.active_by_channel)}
+
+
+def _restore_other_matches(mgr: Any, match: "Match",
+                           snap: Dict[str, Any]) -> None:
+    """Put the other matches back as `snap` (_snapshot_other_matches) holds
+    them: a match made since goes, a deleted one returns, a changed one is
+    rolled back in place (keeping its undo history); channel pointers too."""
+    from logic import Match as _Match
+    pre = snap["matches"]
+    for mid in [mid for mid, m in mgr.matches.items()
+                if m is not match and mid not in pre]:
+        del mgr.matches[mid]
+    for mid, state in pre.items():
+        m = mgr.matches.get(mid)
+        if m is None:
+            m = snap["objs"].get(mid) or _Match.from_dict(copy.deepcopy(state))
+            mgr.matches[mid] = m
+            if m.to_dict(include_history=False) != state:
+                _rollback_match(m, mgr, state)
+        elif m.to_dict(include_history=False) != state:
+            _rollback_match(m, mgr, state)
+        if mid in snap["hist"]:
+            m.history.rewind(snap["hist"][mid])
+        if m.system_name in mgr.systems:
+            mgr.apply_system_rules(m)
+    mgr.active_by_channel.clear()
+    mgr.active_by_channel.update(snap["active"])
+
+
 def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None:
     """Restore a Match in-place to the given pre-state dict. Used by
     the action runner when the body raises. We swap the live Match
@@ -1443,6 +1532,7 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
         "_choice_answers", "_choice_cursor",
         # In-flight operation guards/state that span a nested rollback.
         "_summon_count", "_death_processing", "_death_check_suppressed_ids",
+        "_death_check_deferred_ids",
         "_alive_eval_depth", "_vision_memo", "_turn_order_dirty",
         "_request_seq", "pending_requests", "held_commands",
         # Event bus: the live emit stack/depth + warning latch. Resetting

@@ -35,8 +35,14 @@ JOURNAL_FORMAT = "fcs-journal"
 JOURNAL_VERSION = 1
 
 # Match fields an undo leaves alone (vtt_commands._NOT_UNDO_STATE): a change
-# to them alone is no journal entry, and the state hash leaves them out.
-UNDO_IGNORED = ("paused", "rules", "rng_seed", "rng_pos")
+# to them alone is no journal entry or undo step, and the state hash leaves
+# them out. channel_views / channel_maps are each channel's camera and
+# `!map use` choice: display state (a player panning took undo steps).
+UNDO_IGNORED = ("paused", "rules", "rng_seed", "rng_pos", "channel_views",
+                "channel_maps")
+# The journal records a `!map use` all the same: a later `map=view` or a
+# strict edit's channel map reads it, so a replay needs it.
+JOURNAL_IGNORED = tuple(k for k in UNDO_IGNORED if k != "channel_maps")
 
 # Segments kept: the newest and the one before it.
 KEPT_SEGMENTS = 2
@@ -93,6 +99,18 @@ class Journal:
         self.next_n += 1
         self.segments[-1]["entries"].append(entry)
         return entry
+
+    def last_state_hash(self) -> Optional[str]:
+        """The state hash the journal last recorded: its newest entry that
+        carries one, else its newest segment's starting state."""
+        for seg in reversed(self.segments):
+            for e in reversed(seg["entries"]):
+                if e.get("hash"):
+                    return e["hash"]
+            st = (seg.get("start") or {}).get("state")
+            if isinstance(st, dict):
+                return state_hash(st)
+        return None
 
     def start_segment(self, header: Dict[str, Any]) -> None:
         header["no"] = (self.segments[-1]["no"] + 1) if self.segments else 1

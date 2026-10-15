@@ -15,12 +15,12 @@ from logic import (
 )
 
 # Passive system
-from logic import COMMAND_USER, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit
+from logic import COMMAND_USER, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
-from journal import UNDO_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT
-from logic import check_id, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS
+from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journal_state, state_hash, effective_seed, ensure_journal, maybe_roll, bundle as journal_bundle, entry_text as journal_entry_text, chain_systems, JOURNAL_FORMAT
+from logic import check_id, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
 from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution
@@ -219,9 +219,11 @@ ELEVATED_ARGS: Dict[str, frozenset] = {
 # `!map teamcolor list` only SHOW settings, so they stay open while the
 # setting-changing forms of the same subcommand are host-gated.
 _ELEVATED_READ_FORMS = frozenset({("map", "layer", "list"),
-                                  ("map", "teamcolor", "list"),
-                                  ("map", "var", "list"),
-                                  ("map", "var", "get")})
+                                  ("map", "teamcolor", "list")})
+# Elevated subcommands whose BARE form only reports (`!map use` names the
+# channel's map). Map vars are the GM's data, so `!map var` stays host-gated
+# like `!match var` (user call).
+_ELEVATED_BARE_READS = frozenset({("map", "use")})
 
 # Commands that act on SERVER-WIDE state — the server's GameSystems (every
 # match on a system picks up an edit on its next rule refresh), its save store
@@ -250,6 +252,24 @@ def _admin_msg(name: str, args: List[str]) -> str:
 # `!again`, or as an approved request.
 _SERVER_TYPED_ONLY = ("❌ `!server` commands only run when typed on their own "
                       "— not inside a batch, macro, alias or action.")
+# `!system undo` likewise: a container's own server-wide edits become one
+# undo step only when the typed command ends, so an undo inside it would pop
+# the step before the container and drop the container's earlier edits.
+_SYSTEM_UNDO_TYPED_ONLY = ("❌ `!system undo` only runs when typed on its own "
+                           "— not inside a batch, macro, alias or action.")
+
+
+# True while a `!batch` / `!foreach` dispatches the lines its caller typed:
+# each passes the access gate as the caller (dispatch_no_snapshot).
+_GATE_LINES: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "vtt_gate_lines", default=False)
+
+_INLINE_ARGS_HOST_ONLY = ("❌ inline `$()` arguments are host-only on this "
+                          "match (inline_args_access).")
+
+
+def _is_system_undo(name: str, args: List[str]) -> bool:
+    return name == "system" and bool(args) and str(args[0]).lower() == "undo"
 
 
 def _admin_required(name: str, args: List[str]) -> bool:
@@ -471,6 +491,15 @@ class CommandRegistry:
         if name == "server":
             await ctx.send(_SERVER_TYPED_ONLY)
             return
+        if _is_system_undo(name, args):
+            await ctx.send(_SYSTEM_UNDO_TYPED_ONLY)
+            return
+        jstate = _JOURNAL_AS_STATE.get()
+        if jstate is not None and (
+                name in _JOURNAL_STATE_ROOTS or (name, str(args[0]).lower()
+                                                 if args else "")
+                in _JOURNAL_STATE_SUBS):
+            jstate[0] = True
         if _DRY_ACTIVE.get():
             refusal = _dry_refusal(name, args)
             if refusal:
@@ -486,18 +515,29 @@ class CommandRegistry:
         if _admin_required(name, args) and not ctx_is_admin(ctx):
             await ctx.send(_admin_msg(name, args))
             return
+        # A line a caller typed into `!batch` / `!foreach` runs only if the
+        # caller could run it directly: an access override opening the
+        # container to players used to open every command inside it (a
+        # player appointed themselves co-host). Action cmd() lines and a
+        # macro's host-written body aren't typed lines (_GATE_LINES off).
+        if _GATE_LINES.get() and not getattr(ctx, "auto_approve", False) \
+                and ctx_user(ctx) is not None \
+                and self._gate_decision(name, args, ctx, mgr) != "allow":
+            await ctx.send(f"❌ `!{name}` can't run inside a batch or "
+                           f"foreach for you: it needs a host (send it on "
+                           f"its own).")
+            return
         # Inline-formula `$(...)` substitution for sub-command lines (a macro /
         # batch / foreach inner command), so $() resolves per line in the
         # caller's current context. Same raw_args gate as run().
+        mid = mgr.active_by_channel.get(ctx.channel_key)
+        if (self._has_inline_token(args) and self._inline_args_blocked(
+                ctx, mgr.matches.get(mid) if mid is not None else None)):
+            await ctx.send(_INLINE_ARGS_HOST_ONLY)
+            return
         if not self._raw_args.get(name, False):
-            mid = mgr.active_by_channel.get(ctx.channel_key)
             if mid is not None and mid in mgr.matches:
                 m_arg = mgr.matches[mid]
-                if self._has_inline_token(args) and self._inline_args_blocked(ctx, m_arg):
-                    await ctx.send(
-                        "❌ inline `$()` arguments are host-only on this match "
-                        "(inline_args_access).")
-                    return
                 try:
                     args = [resolve_arg_token(a, m_arg, self_id=None) for a in args]
                 except Exception as e:
@@ -546,7 +586,9 @@ class CommandRegistry:
               and words[0].lower() in ELEVATED_ARGS.get(name, ())
               and not (len(words) >= 2 and (name, words[0].lower(),
                                             words[1].lower())
-                       in _ELEVATED_READ_FORMS)):
+                       in _ELEVATED_READ_FORMS)
+              and not (len(words) == 1 and (name, words[0].lower())
+                       in _ELEVATED_BARE_READS)):
             # Full-reveal flag on a normally-open read -> host-gated.
             base = "host"
         if base == "host" and name == "foreach" and self._foreach_read_only(args, m):
@@ -824,6 +866,9 @@ class CommandRegistry:
         if name == "server" and typed.lower() != "server":
             await ctx.send(_SERVER_TYPED_ONLY)
             return
+        if _is_system_undo(name, args) and typed.lower() != "system":
+            await ctx.send(_SYSTEM_UNDO_TYPED_ONLY)
+            return
         h = self._handlers.get(name)
         if not h:
             # Did-you-mean: suggest close matches from registered
@@ -874,6 +919,15 @@ class CommandRegistry:
                 if (bool(pm.rules.get("pause_affects_hosts", False))
                         and not _pause_control(name, args)):
                     return await self._hold_command(pm, name, args, ctx)
+        # inline_args_access = host: a non-host's `$()` is refused here, for
+        # every command (`!ent` and `!foreach` resolve theirs themselves) and
+        # before a request is queued (approved, it would run with the
+        # approver's authority).
+        if not admin_cmd and self._has_inline_token(args):
+            m_gate = mgr.matches.get(mgr.active_by_channel.get(ctx.channel_key))
+            if self._inline_args_blocked(ctx, m_gate):
+                await ctx.send(_INLINE_ARGS_HOST_ONLY)
+                return
         if gate == "queue":
             return await self._queue_request(name, args, ctx, mgr)
         # gate == "allow" -> fall through and run normally.
@@ -891,7 +945,8 @@ class CommandRegistry:
         # flag-driven instead of routed through dispatch_no_snapshot.
         pre_state = None
         pre_active_mid = mgr.active_by_channel.get(ctx.channel_key)
-        if (self._snapshot.get(name, True)
+        if ((self._snapshot.get(name, True) or (
+                name, str(args[0]).lower() if args else "") in _SNAPSHOT_SUBS)
                 and pre_active_mid is not None
                 and pre_active_mid in mgr.matches):
             m_pre = mgr.matches[pre_active_mid]
@@ -902,9 +957,14 @@ class CommandRegistry:
         # command, to tell after it (and its watchers) whether it changed.
         jm = mgr.matches.get(pre_active_mid) if pre_active_mid else None
         jpre = None
+        # A read-only command (_JOURNAL_READS) skips the two whole-match
+        # serializations: a change it does make (a watcher firing after it)
+        # is found by the storage commit and journaled as its state
+        # (_journal_outside).
         if (jm is not None and not _DRY_ACTIVE.get()
                 and getattr(jm, "_action_depth", 0) == 0
                 and journal_limit(jm) != 0
+                and name not in _JOURNAL_READS
                 and (not admin_cmd or name in _JOURNAL_STATE_ROOTS)):
             jpre = (pre_state if pre_state is not None
                     else jm.to_dict(include_history=False))
@@ -931,11 +991,6 @@ class CommandRegistry:
         # Done AFTER the access gate so a $() can't alter the gated subcommand.
         if not self._raw_args.get(name, False) and pre_active_mid in mgr.matches:
             m_arg = mgr.matches[pre_active_mid]
-            if self._has_inline_token(args) and self._inline_args_blocked(ctx, m_arg):
-                await ctx.send(
-                    "❌ inline `$()` arguments are host-only on this match "
-                    "(inline_args_access).")
-                return
             try:
                 args = [resolve_arg_token(a, m_arg, self_id=None) for a in args]
             except Exception as e:
@@ -950,6 +1005,8 @@ class CommandRegistry:
         jparent = _JOURNALED_IN.get()
         jmine: set = set()
         jtoken = _JOURNALED_IN.set(jmine)
+        jstate = [False]
+        jstate_token = _JOURNAL_AS_STATE.set(jstate)
         _INTERACTIVE_ANSWERS.set([])
         result = None
         try:
@@ -960,6 +1017,7 @@ class CommandRegistry:
             await ctx.send(f"💥 Unexpected error: {e}")
         finally:
             _JOURNALED_IN.reset(jtoken)
+            _JOURNAL_AS_STATE.reset(jstate_token)
         # Even a failed command goes through the bookkeeping below: it only
         # records a snapshot when the state REALLY changed, so a clean failure
         # stays a no-op, while a command that mutated and THEN failed (a hook
@@ -1007,7 +1065,7 @@ class CommandRegistry:
             _journal_command(mgr, ctx, jm, pre_active_mid, name, typed,
                              typed_args, jpre, jrng, jmine,
                              str(args[0]).lower() if args else "",
-                             post_state)
+                             post_state, as_state=jstate[0])
         if jparent is not None:
             jparent.update(jmine)
         return result
@@ -1026,6 +1084,11 @@ _JOURNAL_STATE_ROOTS = frozenset({"undo", "history", "run"})
 # ... and subcommands: a transfer needs the other match, a resume runs the
 # commands held while paused.
 _JOURNAL_STATE_SUBS = frozenset({("ent", "transfer"), ("match", "resume")})
+# Set by a line of the running command (a batch / macro / foreach line, an
+# action's cmd()) that is one of those: the command is journaled as its
+# state too, since replaying it would redo that line without its context.
+_JOURNAL_AS_STATE: "contextvars.ContextVar[Optional[list]]" = \
+    contextvars.ContextVar("vtt_journal_as_state", default=None)
 # Ids of the matches journaled by the runs a run nests (an approval,
 # `!again`, a replayed entry): the outer run leaves a match one of them
 # recorded.
@@ -1037,7 +1100,8 @@ def _journal_command(mgr: MatchManager, ctx: ReplyContext, jm: Match,
                      mid: str, name: str, typed: str, typed_args: List[str],
                      jpre: Dict[str, Any], jrng: Tuple[str, int],
                      done: set, sub: str,
-                     post: Optional[Dict[str, Any]] = None) -> None:
+                     post: Optional[Dict[str, Any]] = None,
+                     as_state: bool = False) -> None:
     """Journal a command that changed the channel's match `jm`: as the
     command (replayable from the match) or, for an undo / history restore /
     `!run` file, as the state it left."""
@@ -1051,7 +1115,7 @@ def _journal_command(mgr: MatchManager, ctx: ReplyContext, jm: Match,
         return          # a nested run journaled it / a replay copies its own
     if post is None or post_m is not jm:
         post = post_m.to_dict(include_history=False)
-    if not _differs_in_undo_state(jpre, post):
+    if not _differs_in_undo_state(jpre, post, JOURNAL_IGNORED):
         return
     # A typed command started every journal before it ran
     # (_journal_before); a Discord button's approval has no typed command
@@ -1068,7 +1132,8 @@ def _journal_command(mgr: MatchManager, ctx: ReplyContext, jm: Match,
     if answers and name == "action":
         # Answers typed at a prompt replay as `answer=` tokens.
         entry["cmd"] += [f"answer={a}" for a in answers]
-    if name in _JOURNAL_STATE_ROOTS or (name, sub) in _JOURNAL_STATE_SUBS:
+    if (as_state or name in _JOURNAL_STATE_ROOTS
+            or (name, sub) in _JOURNAL_STATE_SUBS):
         entry["kind"] = "state"
         entry["state"] = journal_state(post)
         if effective_seed(post_m) != jrng[0]:
@@ -1270,6 +1335,16 @@ async def persist_workspace(mgr: MatchManager, ctx: Optional[ReplyContext]) -> N
         await ctx.send("\n".join(msgs))
 
 
+# Subcommands of a command registered without undo snapshots that change
+# the match and take a command snapshot of their own.
+_SNAPSHOT_SUBS = frozenset({("turn", "set")})
+
+# Commands that only read the match (no undo snapshot either): the journal
+# doesn't serialize it around them.
+_JOURNAL_READS = frozenset({"assert", "dist", "dry", "find", "pending",
+                            "roll", "whoami"})
+
+
 def _journal_outside(mgr: MatchManager, handled: set, changed: set) -> None:
     """A journaled match the command changed without it being the channel's
     match (a unit transferred in, a batch line that switched matches) gets
@@ -1277,9 +1352,11 @@ def _journal_outside(mgr: MatchManager, handled: set, changed: set) -> None:
     label = getattr(mgr, "_journal_label", None) or ["?"]
     for mid in sorted(changed - handled):
         m = mgr.matches.get(mid)
-        if m is None or m.journal is None:
+        if m is None or m.journal is None or mid == _REPLAYING.get():
             continue
         post = m.to_dict(include_history=False)
+        if state_hash(post) == m.journal.last_state_hash():
+            continue    # only what an undo leaves alone moved (the RNG)
         m.journal.add({"kind": "state", "at": _now_iso(),
                        "by": getattr(mgr, "_journal_by", "") or "",
                        "cmd": list(label), "outside": True,
@@ -1292,6 +1369,27 @@ def _journal_outside(mgr: MatchManager, handled: set, changed: set) -> None:
 # Whether this asyncio task holds its manager's command lock (see run()).
 _HOLDS_COMMAND_LOCK: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
     "vtt_holds_command_lock", default=False)
+
+
+@contextlib.asynccontextmanager
+async def holding_command_lock(mgr: MatchManager,
+                               ctx: Optional[ReplyContext] = None):
+    """Run a change made outside a typed command (a Discord button click)
+    the way a command runs: one at a time on the server, never in the
+    middle of another command, then committed to disk (storage notes go
+    to `ctx`)."""
+    if _HOLDS_COMMAND_LOCK.get():
+        yield
+        return
+    async with _command_lock(mgr):
+        token = _HOLDS_COMMAND_LOCK.set(True)
+        try:
+            yield
+        finally:
+            try:
+                await persist_workspace(mgr, ctx)
+            finally:
+                _HOLDS_COMMAND_LOCK.reset(token)
 
 
 def _command_lock(mgr: MatchManager) -> "asyncio.Lock":
@@ -1720,14 +1818,16 @@ def _remember_command(mgr: MatchManager, ctx: ReplyContext, name: str,
 _NOT_UNDO_STATE = UNDO_IGNORED
 
 
-def _differs_in_undo_state(pre: Dict[str, Any], post: Dict[str, Any]) -> bool:
-    """Whether two match snapshots differ in anything an undo restores."""
+def _differs_in_undo_state(pre: Dict[str, Any], post: Dict[str, Any],
+                           ignored: Tuple[str, ...] = _NOT_UNDO_STATE) -> bool:
+    """Whether two match snapshots differ in anything an undo restores (or,
+    with `ignored=JOURNAL_IGNORED`, anything a replay must redo)."""
     if pre == post:
         return False
-    if all(pre.get(k) == post.get(k) for k in _NOT_UNDO_STATE):
+    if all(pre.get(k) == post.get(k) for k in ignored):
         return True
-    return ({k: v for k, v in pre.items() if k not in _NOT_UNDO_STATE}
-            != {k: v for k, v in post.items() if k not in _NOT_UNDO_STATE})
+    return ({k: v for k, v in pre.items() if k not in ignored}
+            != {k: v for k, v in post.items() if k not in ignored})
 
 
 # Host-only READS: gated to hosts (they show hidden data) but they change
@@ -1754,10 +1854,13 @@ _HOST_READS: Dict[str, Optional[frozenset]] = {
 def _pause_control(name: str, args: List[str]) -> bool:
     """What a host may still run while paused with pause_affects_hosts:
     `!match pause` / `!match resume`, the host-only reads (`!assert`,
-    `!ent dump`, `!map full`, a bare `!match`, ...), and an undo `preview`."""
+    `!ent dump`, `!map full`, a bare `!match`, ...), an undo `preview` and
+    `!dry` (it restores everything it ran)."""
     root = name.lower()
     sub = str(args[0]).lower() if args else None
     if root == "match" and sub in ("pause", "resume"):
+        return True
+    if root == "dry":
         return True
     if root in ("undo", "history") and any(
             str(a).lower() == "preview" for a in args):
@@ -1905,7 +2008,7 @@ def _entity_template_context(e: Entity,
     if pov_team is not None and e._match is not None:
         dis = e._match._effective_disguise(e, pov_team)
         if dis is not None:
-            n = dis.get("name")
+            n = e._match.entity_display_name(e, pov_team)
             if isinstance(n, str) and n:
                 ctx["name"] = n
             dvars = dis.get("vars")
@@ -2021,6 +2124,7 @@ def _corpse_template_context(
 
 def _corpse_line(
     m: Match, x: int, y: int, eid: str, corpse: Dict[str, Any],
+    mp: Optional["Map"] = None,
 ) -> str:
     """Single-line corpse summary, rendered from the active match's
     corpse_line_format rule. Falls back to the engine default if the
@@ -2031,7 +2135,11 @@ def _corpse_line(
             "corpse_line_format",
             "{name} (`{id}`): HP: {hp}/{max_hp} X,Y: {x},{y} (corpse)",
         )
-    return _render_template(tmpl, _corpse_template_context(m, x, y, eid, corpse))
+    tctx = _corpse_template_context(m, x, y, eid, corpse)
+    tctx["map"] = mp.name if mp is not None else ""
+    tctx["map_shown"] = (mp.name if mp is not None and len(m.maps) > 1
+                         else "")
+    return _render_template(tmpl, tctx)
 
 
 def _part_status_str(m, p: Entity) -> str:
@@ -2290,6 +2398,11 @@ def _parse_clamp_bound(raw: str) -> Any:
         return float(s)
     except ValueError:
         pass
+    # A path: plain dotted var names. Anything else (a formula, brackets,
+    # spaces) can never name a var, so it would mean "no bound" forever.
+    if not re.match(r"[A-Za-z_]\w*(\.\w+)*\Z", s):
+        raise VTTError(f"A clamp bound is a number or a var path "
+                       f"(`max_hp`, `stats.cap`), got `{raw}`.")
     return s  # treat as path
 
 
@@ -2336,8 +2449,9 @@ def _resolve_maps(ctx: ReplyContext, m: "Match", spec: Optional[str], *,
     and `all` only where `many`); 2. the map of the unit the command is
     about; 3. the match's only map; 4. the channel's map (`!map use`, else
     the map its board follows). `strict` (broad per-map edits, single
-    placements) refuses to guess the followed map on a match with several
-    maps; a map the host set with `!map use` is no guess."""
+    placements) refuses tier 4 on a match with several maps, `!map use`
+    included (a host who forgot it would edit the wrong map); `map=view`
+    names the channel's map on purpose."""
     if spec is not None:
         spec = spec.strip()
         if spec.lower() == "all":
@@ -2361,10 +2475,6 @@ def _resolve_maps(ctx: ReplyContext, m: "Match", spec: Optional[str], *,
         return [m.map_of(unit)]
     if len(m.maps) == 1:
         return [next(iter(m.maps.values()))]
-    chosen = m.channel_maps.get(ctx.channel_key)
-    if chosen in m.maps:
-        # The host picked this channel's map with `!map use`: no guess.
-        return [m.maps[chosen]]
     if strict:
         raise VTTError(_maps_hint(m, many))
     return [m.channel_map(ctx.channel_key, _view_pov(ctx, m, []))]
@@ -3082,7 +3192,7 @@ registry.annotate_sub(
           "library's current version; undo restores dropped pins."),
 )
 registry.annotate_sub(
-    "match", "journal", usage="!match journal [n] | !match journal export <file>",
+    "match", "journal", usage="!match journal [n] | !match journal export <file> [overwrite]",
     desc=("The match's command journal, newest first (default the last 15): "
           "every command that changed it, with who ran it and when, plus "
           "stored states (an undo or history restore, a `!run` file, a "
@@ -3217,16 +3327,20 @@ async def host_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # user=<mention|id>: the override applies to that player only
         # (stored as `@<id> <key>` among the match's overrides).
         who = None
+        who_raw = ""
         plain = []
         for tok in args:
             if tok.lower().startswith("user="):
-                who = _normalize_user_token(tok.split("=", 1)[1])
+                who_raw = tok.split("=", 1)[1]
+                who = _normalize_user_token(who_raw)
                 if not who:
                     raise VTTError("user= names a player (a mention or id).")
             else:
                 plain.append(tok)
         args = plain
         asub = args[1].lower() if len(args) >= 2 else "list"
+        if who and asub == "set":
+            who = _user_target(ctx, who_raw)
         if asub == "list":
             if not m.access_overrides:
                 return await ctx.send(
@@ -3274,7 +3388,8 @@ async def host_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub in ("add", "remove"):
         if await return_help_if_not_enough_args(ctx, args, 2, "host", sub):
             return
-        target = _normalize_user_token(args[1])
+        target = (_user_target(ctx, args[1]) if sub == "add"
+                  else _normalize_user_token(args[1]))
         if sub == "add":
             if target == m.owner:
                 return await ctx.send(f"{_mention(target)} is already the owner.")
@@ -3293,6 +3408,18 @@ async def host_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(f"Removed co-host {_mention(target)} from **{m.name}**.")
 
     return await _help_fallback(ctx, ["host"], args[0] if args else None)
+
+
+def _user_target(ctx, tok: str) -> str:
+    """A user named by `!host add` / `user=`: normalized, and on a surface
+    whose users are numeric ids (Discord, `numeric_user_ids`) refused
+    unless it is a mention or an id, since a typed name never matches."""
+    who = _normalize_user_token(tok)
+    if getattr(ctx, "numeric_user_ids", False) and not who.isdigit():
+        raise VTTError(
+            f"`{tok}` isn't a user: mention them (pick the name from the @ "
+            f"list so it becomes a mention) or give their user id.")
+    return who
 
 
 def _normalize_user_token(tok: str) -> str:
@@ -3942,7 +4069,7 @@ def split_command_args(root: str, tail: str) -> List[str]:
                 out.append(";")
             piece = piece.strip()
             if i == 0 and low == "foreach":
-                out += shlex.split(piece)
+                out += shlex.split(_straight_quotes(piece))
                 continue
             if i == 0 and low == "batch" and re.match(r"strict(\s|$)", piece):
                 out.append("strict")
@@ -3960,7 +4087,16 @@ def split_command_args(root: str, tail: str) -> List[str]:
             elif len(raw) >= 2 and raw[0] == raw[-1] == "'":
                 raw = raw[1:-1]
             return [m.group(1), m.group(2).strip("'\""), raw]
-    return shlex.split(tail)
+    return shlex.split(_straight_quotes(tail))
+
+
+def _straight_quotes(text: str) -> str:
+    """Phone keyboards type “ ” and ‘ ’ (iOS Smart Punctuation, passed on
+    by Discord): read them as the quotes they stand for. A lone ’ is an
+    apostrophe (Bob’s) and stays."""
+    text = text.replace("\u201c", '"').replace("\u201d", '"') \
+               .replace("\u201e", '"')
+    return re.sub("\u2018([^\u2019]*)\u2019", r"'\1'", text)
 
 
 _IMPORT_HEAD = re.compile(r"!?\s*template\s+import\s+\S+\s*(.*)\Z",
@@ -4094,9 +4230,8 @@ def _check_expansion(ctx: ReplyContext, mgr: MatchManager, name: str,
     """Refuse a template whose partial references expand past
     partial_template_size_limit, or whose expanded vars break a template
     rule (a reserved var name like `x` reached through a partial): what a
-    spawn would refuse, refused when it is saved."""
-    if not template_refs_of(data):
-        return
+    spawn would refuse, refused when it is saved. A plain template is
+    counted the same way, so one that saves can always be read expanded."""
     old = mgr.templates.get(name)
     mgr.templates[name] = data
     invalidate_partial_cache()
@@ -4121,7 +4256,7 @@ def _reserve_template_room(mgr: MatchManager,
     st = storage_of(mgr)
     if st is None or not datas:
         return
-    total = sum(len((json.dumps(d, indent=2, sort_keys=True) + "\n")
+    total = sum(len((json.dumps(d, indent=2) + "\n")
                     .encode("utf-8")) + 256 for d in datas)
     st._room_for_template(mgr.guild_key, total)
 
@@ -5226,12 +5361,15 @@ async def _match_journal(ctx: ReplyContext, args: List[str],
     m = active_match(mgr, ctx)
     j = m.journal
     if len(args) > 1 and args[1].lower() == "export":
+        overwrite = _take_overwrite(args)
         if len(args) != 3:
-            raise VTTError("Usage: `!match journal export <file>`.")
+            raise VTTError("Usage: `!match journal export <file> "
+                           "[overwrite]`.")
         if j is None:
             raise VTTError(f"`{m.id}` keeps no journal "
                            f"(command_journal_limit is 0).")
         full, path = saves_path(args[2], mgr, write=True)
+        _check_overwrite(full, path, overwrite)
         _write_save_file(mgr, full, path, journal_bundle(mgr, m))
         audit_note(f"exported the journal of `{m.id}` to `{path}`")
         ns = [e["n"] for e in j.entries()]
@@ -5311,6 +5449,28 @@ def _replay_template(mgr: MatchManager, e: Dict[str, Any]) -> None:
                       new_name=new_name)
 
 
+def _journal_bundle_ok(raw: Any) -> bool:
+    """Whether `raw` has the shape of a journal export: segments, each a
+    dict whose `start` holds a `state` dict, and entries that are dicts."""
+    if not isinstance(raw, dict) or raw.get("format") != JOURNAL_FORMAT:
+        return False
+    segs = raw.get("segments")
+    if not isinstance(segs, list) or not segs:
+        return False
+    for seg in segs:
+        if not isinstance(seg, dict) or not isinstance(seg.get("start"), dict) \
+                or not isinstance(seg["start"].get("state"), dict):
+            return False
+        ents = seg.get("entries", [])
+        if not isinstance(ents, list) or \
+                not all(isinstance(e, dict) for e in ents):
+            return False
+        for key in ("systems", "templates"):
+            if not isinstance(seg["start"].get(key) or {}, dict):
+                return False
+    return True
+
+
 async def _match_replay(ctx: ReplyContext, args: List[str],
                         mgr: MatchManager):
     """`!match replay <file> [upto=N] [as=<id>] [verbose]`: rebuild a match
@@ -5325,6 +5485,10 @@ async def _match_replay(ctx: ReplyContext, args: List[str],
             verbose = True
         else:
             opts.append(a)
+    for a in opts:
+        if "=" not in a:
+            raise VTTError(f"Unexpected `{a}` — usage: `!match replay <file> "
+                           f"[upto=N] [as=<id>] [verbose]`.")
     _check_options(opts, {"upto", "as"}, "!match replay")
     kv = dict(o.split("=", 1) for o in opts)
     upto = None
@@ -5338,8 +5502,7 @@ async def _match_replay(ctx: ReplyContext, args: List[str],
         raise VTTError(f"File not found: `{path}`.")
     except (OSError, ValueError) as ex:
         raise VTTError(f"Can't read `{path}`: {ex}")
-    if not isinstance(raw, dict) or raw.get("format") != JOURNAL_FORMAT \
-            or not raw.get("segments"):
+    if not _journal_bundle_ok(raw):
         raise VTTError(f"`{path}` isn't a journal export "
                        f"(`!match journal export` writes one).")
     segs = raw["segments"]
@@ -5349,6 +5512,7 @@ async def _match_replay(ctx: ReplyContext, args: List[str],
     if mid in mgr.matches:
         raise VTTError(f"This server already has a match `{mid}`: replay "
                        f"with `as=<new id>`.")
+    mgr._check_match_id_case(mid)
     # A system of the same name is replaced when no match here reads it
     # (a fresh server's `default`); one a match uses is refused.
     in_use = set()
@@ -5356,18 +5520,38 @@ async def _match_replay(ctx: ReplyContext, args: List[str],
         if x.system_name in mgr.systems:
             in_use.update(y.name for y in
                           mgr.system_chain(mgr.systems[x.system_name]))
-    clash = [f"system `{n}`" for n, d in (start.get("systems") or {}).items()
-             if n in in_use and mgr.systems[n].to_dict() != d]
-    clash += [f"template `{n}`"
-              for n, d in (start.get("templates") or {}).items()
-              if n in mgr.templates and mgr.templates[n] != d]
+    # The journal writes systems and templates as it goes (its `systems`
+    # and `template` entries), not only at its start: each write must leave
+    # this server's own versions alone, so one that would change a system
+    # a match here uses, or any template the server already holds, refuses
+    # the whole replay before anything runs.
+    clash = []
+    for n, d in (start.get("systems") or {}).items():
+        if n in in_use and mgr.systems[n].to_dict() != d:
+            clash.append(f"system `{n}`")
+    for n, d in (start.get("templates") or {}).items():
+        if n in mgr.templates and mgr.templates[n] != d:
+            clash.append(f"template `{n}`")
+    for seg in segs:
+        for e in seg.get("entries") or []:
+            if e.get("kind") == "systems":
+                for n, d in (e.get("systems") or {}).items():
+                    if n in in_use and mgr.systems[n].to_dict() != d:
+                        clash.append(f"system `{n}`")
+            elif e.get("kind") == "template":
+                for n in (e.get("name"), e.get("new_name")):
+                    if (n in mgr.templates and (e.get("new_name")
+                            or mgr.templates[n] != e.get("data"))):
+                        clash.append(f"template `{n}`")
+    clash = list(dict.fromkeys(clash))
     if clash:
         raise VTTError(
-            "This server holds different versions of what the journal "
-            "starts with: " + ", ".join(clash[:6])
+            "This server holds other versions of what the journal writes "
+            "(a system a match here uses, or a template of the library): "
+            + ", ".join(clash[:6])
             + (f" (+{len(clash) - 6} more)" if len(clash) > 6 else "")
-            + " (a match here uses them). Replay on a server without them "
-            "(in the CLI: `!as server <new>`).")
+            + ". Replay on a server without them (in the CLI: "
+            "`!as server <new>`).")
     # Systems and templates the journal starts with.
     for n, d in (start.get("systems") or {}).items():
         if n not in in_use:
@@ -5464,8 +5648,14 @@ async def _replay_entries(ctx: ReplyContext, mgr: MatchManager, mid: str,
                     continue
                 rctx = _ReplayCtx(ctx, str(e.get("ch") or ctx.channel_key),
                                   e.get("uid"), str(e.get("by") or ""))
-                with _channel_pointed_at(mgr, rctx.channel_key, mid):
-                    await registry.run(toks[0], toks[1:], rctx, mgr)
+                # Each entry was a top-level command with its own partial
+                # cache, whose template_data budget it spent alone.
+                cache_token = PARTIAL_CACHE.set({})
+                try:
+                    with _channel_pointed_at(mgr, rctx.channel_key, mid):
+                        await registry.run(toks[0], toks[1:], rctx, mgr)
+                finally:
+                    PARTIAL_CACHE.reset(cache_token)
                 if verbose:
                     out.append(f"#{n} `!{' '.join(toks)}`")
                     out += [f"  {r}" for r in rctx.replies]
@@ -5491,9 +5681,10 @@ async def _replay_entries(ctx: ReplyContext, mgr: MatchManager, mid: str,
                     mgr.systems[sn] = GameSystem.from_dict(copy.deepcopy(d))
                 if e.get("system_name") in mgr.systems:
                     m.system_name = e["system_name"]
-                for x in mgr.matches.values():
-                    if x.system_name in mgr.systems:
-                        mgr.apply_system_rules(x)
+                # Only the replay's match: the other matches' systems were
+                # checked unchanged before the replay began.
+                if m.system_name in mgr.systems:
+                    mgr.apply_system_rules(m)
                 if verbose:
                     out.append(journal_entry_text(e))
             elif kind == "template":
@@ -5501,6 +5692,9 @@ async def _replay_entries(ctx: ReplyContext, mgr: MatchManager, mid: str,
                 if verbose:
                     out.append(journal_entry_text(e))
             ran += 1
+            # One bot process serves every server: let the others run
+            # between entries (this server's command lock stays held).
+            await asyncio.sleep(0)
         else:
             continue
         break
@@ -5536,8 +5730,12 @@ async def run_approved_request(req: dict, ctx: ReplyContext,
     # at the top level, where run() would record it.
     depth = _RUN_DEPTH.set(max(_RUN_DEPTH.get(), 1))
     try:
-        with _channel_pointed_at(mgr, ch, req.get("match_id")):
-            await registry.run(req["name"], req["args"], run_ctx, mgr)
+        # The lock first, then the re-point: a command running in the
+        # requester's channel must finish before the channel shows the
+        # request's match (a button click used to re-point it mid-batch).
+        async with holding_command_lock(mgr, run_ctx):
+            with _channel_pointed_at(mgr, ch, req.get("match_id")):
+                await registry.run(req["name"], req["args"], run_ctx, mgr)
     finally:
         _RUN_DEPTH.reset(depth)
 
@@ -5981,7 +6179,8 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             hide = (f" (removes inherited: {', '.join(map(str, gone))})"
                     if gone else "")
             groups.setdefault(src, []).append(
-                f"- `{k}` = {val!r}{hide} — {desc} (type: {t}{extra})")
+                f"- `{k}` = {_rule_value_text(ctx, mgr, k, val) if k in SECRET_RULES else repr(val)}{hide}"
+                f" — {desc} (type: {t}{extra})")
         parts = [f"**{name}**{default_badge} — rule breakdown"]
         if s.description:
             parts.append(s.description)
@@ -6053,7 +6252,25 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         s = mgr.get_system(name)
         old_parent = s.parent
         new_parent = None if target.lower() == "none" else target
+        pre_state = mgr.server_state()
         mgr.set_system_parent(name, new_parent)
+        # A new parent can rename var-name rules for this system and the
+        # ones inheriting from it: under var_name_collision refuse, a var in
+        # the way refuses the link, as `!system set` does.
+        affected = {name} | set(mgr.system_descendants(name))
+        conflicts: List[str] = []
+        for mid, m in sorted(mgr.matches.items()):
+            if m.system_name in affected and m.system_name in mgr.systems:
+                trial = mgr._build_rules_dict(mgr.systems[m.system_name])
+                if str(trial.get("var_name_collision")) == "refuse":
+                    conflicts += [f"{mid}: {c}"
+                                  for c in m.var_name_conflicts(trial)]
+        if conflicts:
+            _apply_server_state(mgr, pre_state)
+            raise VTTError(
+                f"Can't link `{name}` to `{target}`: " + " ".join(conflicts[:5])
+                + (f" (and {len(conflicts) - 5} more)"
+                   if len(conflicts) > 5 else ""))
         notes: List[str] = []
         refreshed = mgr.refresh_match_rules(name, notes)
         suffix = (f" (refreshed {refreshed} live match"
@@ -6265,7 +6482,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "diff":
         if await return_help_if_not_enough_args(ctx, args, 3, "system", "diff"):
             return
-        return await ctx.send(_system_diff(mgr, mgr.get_system(args[1]),
+        return await ctx.send(_system_diff(ctx, mgr, mgr.get_system(args[1]),
                                            mgr.get_system(args[2])))
     if sub == "lint":
         if await return_help_if_not_enough_args(ctx, args, 2, "system", "lint"):
@@ -6323,7 +6540,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if action == "info":
             if len(args) < 4:
                 return await ctx.send(
-                    "Usage: `!system alias info <system> <name>`."
+                    "❌ Usage: `!system alias info <system> <name>`."
                 )
             aname = args[3]
             exp = lib.get(aname)
@@ -6341,7 +6558,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             # allowed to chain into other aliases either.
             if len(args) < 5:
                 return await ctx.send(
-                    "Usage: `!system alias def <system> <name> <expansion>`."
+                    "❌ Usage: `!system alias def <system> <name> <expansion>`."
                 )
             aname = args[3]
             expansion = " ".join(args[4:]).strip()
@@ -6379,7 +6596,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if action in ("del", "delete", "remove", "rm"):
             if len(args) < 4:
                 return await ctx.send(
-                    "Usage: `!system alias del <system> <name>`."
+                    "❌ Usage: `!system alias del <system> <name>`."
                 )
             aname = args[3]
             if aname not in lib:
@@ -6398,7 +6615,7 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if action == "promote":
             if len(args) < 4:
                 return await ctx.send(
-                    "Usage: `!system alias promote <system> <name>`."
+                    "❌ Usage: `!system alias promote <system> <name>`."
                 )
             aname = args[3]
             m = active_match(mgr, ctx)
@@ -6426,7 +6643,8 @@ def _source_label(mgr: MatchManager, s: Any, key: str) -> str:
             else f"from `{src}`")
 
 
-def _system_diff(mgr: MatchManager, a: Any, b: Any) -> str:
+def _system_diff(ctx: ReplyContext, mgr: MatchManager, a: Any,
+                 b: Any) -> str:
     """`!system diff <a> <b>`: the rules and library entries whose
     effective values differ between two systems."""
     if a.name == b.name:
@@ -6436,9 +6654,10 @@ def _system_diff(mgr: MatchManager, a: Any, b: Any) -> str:
         va, vb = mgr.system_value(a, k), mgr.system_value(b, k)
         if va != vb:
             rules.append(
-                f"- `{k}`: `{a.name}` = `{_clip(repr(va), 40)}` "
+                f"- `{k}`: `{a.name}` = `{_rule_value_text(ctx, mgr, k, va, 40)}` "
                 f"({_source_label(mgr, a, k)}), `{b.name}` = "
-                f"`{_clip(repr(vb), 40)}` ({_source_label(mgr, b, k)})")
+                f"`{_rule_value_text(ctx, mgr, k, vb, 40)}` "
+                f"({_source_label(mgr, b, k)})")
     libs = []
     for kind in SYSTEM_LIBRARIES:
         la, lb = mgr.system_library(a, kind), mgr.system_library(b, kind)
@@ -6626,14 +6845,26 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
             check(f"tile template `{tname}` {key}",
                   (tdef.get("data") or {}).get(key), "eval", sys_known,
                   soft=True)
+    def check_name(where: str, fname: str, params: List[Any]) -> None:
+        # A name stored before the reserved names were refused (an older
+        # save) would shadow an engine helper or never be called.
+        try:
+            check_formula_function(fname, list(params))
+        except VTTError as ex:
+            bad.append(f"❌ {where}: {ex}")
+
     for fname, fdef in sorted(mgr.system_library(s, "formula_functions").items()):
         fn = FormulaFunction.from_dict(fdef)
         n += 1
+        check_name(f"function `{fname}`", fname, fn.params)
         check(f"function `{fname}`", fn.body, "exec", sys_known,
               frozenset(fn.params), soft=True)
     matches = sorted((m for m in mgr.matches.values()
                       if m.system_name == s.name), key=lambda m: m.id)
     for m in matches:
+        for fname, fn in sorted(m.formula_functions.items()):
+            check_name(f"match `{m.id}` function `{fname}`", fname,
+                       getattr(fn, "params", []))
         known = frozenset(m.formula_functions)
         for where, src, mode, params, action_mode in _match_formula_slots(m):
             n += 1
@@ -7873,6 +8104,9 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if len(tail) == 1:
                 tid = _query_eid(ctx, m, tail[0])
                 t = m.entities[tid]
+                if t.map != e.map:
+                    return await ctx.send(
+                        f"❌ `{eid}` and `{tid}` are on different maps.")
                 tw, th = m.entity_footprint(t)
                 tx, ty = t.x + (tw - 1) / 2, t.y + (th - 1) / 2
                 what = f"`{tid}`"
@@ -8188,6 +8422,14 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         shown: List[str] = []
         notes: List[str] = []
         hook_log: List[str] = []
+        # The unit's death check waits until every var is written, so the
+        # order of the pairs doesn't decide whether the later ones land
+        # (`hp=0 f=3` sets both, like `f=3 hp=0`).
+        sink = FORMULA_LOG_SINK.get()
+        sink_mark = len(sink) if sink is not None else 0
+        deferred = eid not in m._death_check_deferred_ids
+        if deferred:
+            m._death_check_deferred_ids.add(eid)
         try:
             for key, value in pairs:
                 if eid not in m.entities:
@@ -8202,7 +8444,15 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     notes.append(warn.strip())
         except VTTError as ex:
             _rollback_match(m, mgr, pre)
+            if sink is not None:
+                # Lines surfaced by the undone writes (a death line) go too.
+                del sink[sink_mark:]
             raise VTTError(f"{ex} Nothing was set.")
+        finally:
+            if deferred:
+                m._death_check_deferred_ids.discard(eid)
+        if deferred:
+            hook_log += m.check_death(eid)
         ack = f"`{eid}` vars: " + ", ".join(shown)
         if bypass_clamp:
             ack += " (clamp bypassed)"
@@ -8398,11 +8648,20 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 x, y = int(args[3]), int(args[4])
             except ValueError:
                 return await ctx.send("❌ x and y must be integers.")
+        dest_pre = mgr.matches[dest_mid].to_dict(include_history=False)
         try:
             new_id, log = mgr.copy_entity(
                 m.id, dest_mid, src_id, x, y, move=(sub == "transfer"))
         except (VTTError, NotFound) as ex:
             return await ctx.send(f"❌ {ex}")
+        # The arrival is an undo step of the destination (the source's own
+        # step is the command's): each match undoes only its side.
+        dm = mgr.matches.get(dest_mid)
+        if dm is not None and _differs_in_undo_state(
+                dest_pre, dm.to_dict(include_history=False)):
+            dm.history.record_command(
+                dm, f"!ent {sub} {src_id} (arrival from {m.id})",
+                pre_state=dest_pre, by=COMMAND_USER.get() or "")
         tail = ("\n" + "\n".join(log)) if log else ""
         if new_id is None:   # died on the way out; the log says so
             return await ctx.send(tail.lstrip("\n"))
@@ -8412,9 +8671,15 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         ne = dest.entities.get(new_id)
         # A destination on_entity_spawned handler may already have removed it.
         where = f" at ({ne.x},{ne.y})" if ne is not None else ""
+        note = ""
+        if sub == "transfer":
+            note = (f"\n⚠️ Undo is per match: `!undo command` here brings "
+                    f"`{src_id}` back without removing it from **{dest.name}**"
+                    f"; one in **{dest.name}** removes it there without "
+                    f"bringing it back here.")
         return await ctx.send(
             f"{verb} `{src_id}` to **{dest.name}** "
-            f"({dest_mid}){rid}{where}.{tail}")
+            f"({dest_mid}){rid}{where}.{tail}{note}")
 
     # Fallback: show authoritative help for the root command
     return await _help_fallback(ctx, ["ent"], args[0] if args else None)
@@ -8506,7 +8771,8 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "ent", "face",
-    usage="!ent face <id> <dir|cw|ccw> | !ent face <id> toward <eid | x y>",
+    usage=("!ent face <id> <dir|cw|ccw> | !ent face <id> toward <eid> | "
+           "!ent face <id> toward <x> <y>"),
     desc=(
         "Set or rotate facing. <dir> accepts the same direction aliases as "
         "!ent move (cardinals always; diagonals only when "
@@ -9270,11 +9536,11 @@ def _map_cell(ctx: ReplyContext, m, args: List[str], mp: "Map") -> str:
         berr: List[str] = []
         oerr: List[str] = []
         if show_tile:
+            tx = {"tile_x": x, "tile_y": y, "tile_map": mp.name}
             blocks = m._eval_block_spec(m._tile_block_spec(x, y, mp), mover,
-                                        {"tile_x": x, "tile_y": y}, berr)
+                                        dict(tx), berr)
             sees_blocked = m._eval_opaque_spec(
-                m._tile_opaque_spec(x, y, mp), mover, {"tile_x": x, "tile_y": y},
-                oerr)
+                m._tile_opaque_spec(x, y, mp), mover, dict(tx), oerr)
         for n in zones:
             zd = m.find_zone(n).get("data") or {}
             bspec = zd.get("block")
@@ -9283,10 +9549,12 @@ def _map_cell(ctx: ReplyContext, m, args: List[str], mp: "Map") -> str:
             ospec = zd.get("opaque")
             if ospec in (None, ""):
                 ospec = m.rules.get("zone_opaque_condition", "")
-            blocks = m._eval_block_spec(bspec, mover, {"zone_name": n},
+            blocks = m._eval_block_spec(bspec, mover, {"zone_name": n,
+                                                       "zone_map": mp.name},
                                         berr) or blocks
             sees_blocked = m._eval_opaque_spec(
-                ospec, mover, {"zone_name": n, "tile_x": x, "tile_y": y},
+                ospec, mover, {"zone_name": n, "tile_x": x, "tile_y": y,
+                               "zone_map": mp.name},
                 oerr) or sees_blocked
         cspec = m.rules.get("corpse_block_condition", "")
         if cspec not in (None, ""):
@@ -9294,7 +9562,8 @@ def _map_cell(ctx: ReplyContext, m, args: List[str], mp: "Map") -> str:
             for cid, c in corpses:
                 cv = (c.get("entity") or {}).get("vars") or {}
                 if m._eval_block_spec(cspec, mover, {
-                        "tile_x": x, "tile_y": y, "corpse_id": cid,
+                        "tile_x": x, "tile_y": y, "tile_map": mp.name,
+                        "corpse_id": cid,
                         "corpse_team": str(cv.get(team_var, "") or "")},
                         berr):
                     blocks = True
@@ -9378,6 +9647,9 @@ def _preview_cells(ctx, m, toks: List[str],
     if not toks:
         raise VTTError(f"Usage: {_PREVIEW_USAGE}")
     limit = int(m.rules.get("formula_cell_limit", 100000))
+    # Clipped to the map while building, like the formula functions, so
+    # the cost follows the map, not the numbers typed.
+    bounds = (mp.grid_width, mp.grid_height)
     shape = toks[0].lower()
 
     def done(i: int, maxn: int) -> None:
@@ -9396,7 +9668,7 @@ def _preview_cells(ctx, m, toks: List[str],
                                f"square_radius, manhattan or euclidean.")
             metric = _DIST_METRICS[low]
         done(i, i + 2)
-        cells = _cells_in_burst(x, y, r, metric, limit=limit)
+        cells = _cells_in_burst(x, y, r, metric, limit=limit, bounds=bounds)
         desc = f"burst r{r} at ({x},{y}) [{metric}]"
     elif shape == "cone":
         x, y, i = _preview_point(ctx, m, toks, 1, "the origin", mp)
@@ -9412,19 +9684,20 @@ def _preview_cells(ctx, m, toks: List[str],
         length = _preview_num(toks, i + 1, "the length")
         half = _preview_num(toks, i + 2, "the half-angle") if i + 2 < len(toks) else 45
         done(i, i + 3)
-        cells = _cells_in_cone(x, y, direction, length, half, limit=limit)
+        cells = _cells_in_cone(x, y, direction, length, half, limit=limit,
+                               bounds=bounds)
         desc = f"cone {toks[i]} length {length} from ({x},{y})"
     elif shape == "line":
         x1, y1, i = _preview_point(ctx, m, toks, 1, "the start", mp)
         x2, y2, i = _preview_point(ctx, m, toks, i, "the end", mp)
         done(i, i)
-        cells = _cells_in_line(x1, y1, x2, y2, limit=limit)
+        cells = _cells_in_line(x1, y1, x2, y2, limit=limit, bounds=bounds)
         desc = f"line ({x1},{y1}) to ({x2},{y2})"
     elif shape == "rect":
         x1, y1, i = _preview_point(ctx, m, toks, 1, "the first corner", mp)
         x2, y2, i = _preview_point(ctx, m, toks, i, "the second corner", mp)
         done(i, i)
-        cells = _cells_in_rect(x1, y1, x2, y2, limit=limit)
+        cells = _cells_in_rect(x1, y1, x2, y2, limit=limit, bounds=bounds)
         desc = f"rect ({x1},{y1}) to ({x2},{y2})"
     else:
         raise VTTError(f"Unknown preview shape `{toks[0]}`. Usage: {_PREVIEW_USAGE}")
@@ -9631,6 +9904,44 @@ assert not _unreserved, f"add {_unreserved} to logic.MAP_RESERVED_NAMES"
 _MAP_MANAGE_SUBS = ("new", "list", "delete", "rename", "copy", "use", "var")
 
 
+def _map_setting_value(setting: str, value: Any) -> Any:
+    """`value` checked for map setting `setting` the way its own command
+    checks it (VTTError otherwise)."""
+    if setting in ("fog", "fog_memory", "borders"):
+        word = str(value).strip().lower()
+        if isinstance(value, bool):
+            return value
+        if word in ("on", "true", "yes", "1"):
+            return True
+        if word in ("off", "false", "no", "0"):
+            return False
+        raise VTTError(f"The {setting} setting is on or off, got `{value}`.")
+    if setting == "border_opacity":
+        if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or not 0 <= value <= 100:
+            raise VTTError(f"The border opacity is a number 0-100, got "
+                           f"`{value}`.")
+        return int(value)
+    if setting == "background_mode":
+        if str(value).lower() not in ("stretch", "tile", "center"):
+            raise VTTError(f"The background mode is stretch, tile or center, "
+                           f"got `{value}`.")
+        return str(value).lower()
+    if setting == "hidden_layers":
+        words = ([str(v) for v in value] if isinstance(value, list)
+                 else [w.strip() for w in str(value).split(",") if w.strip()])
+        bad = [w for w in words if w not in _MAP_LAYERS]
+        if bad:
+            raise VTTError(f"Unknown layer(s) {', '.join(bad)}: the layers are "
+                           f"{', '.join(_MAP_LAYERS)}.")
+        return sorted(set(words))
+    # background (a sprite key) and border_color (a colour name or hex).
+    if not isinstance(value, str) or not value:
+        raise VTTError(f"The {setting.replace('_', ' ')} setting is a word, "
+                       f"got `{value}`.")
+    return value
+
+
 async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
                       args: List[str], mapspec: Optional[str]):
     """`!map new / list / delete / rename / copy / use / var`."""
@@ -9649,9 +9960,13 @@ async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
     if sub == "list":
         _check_tail(args, 1, (), "!map list")
         here = m.channel_map(ctx.channel_key, _view_pov(ctx, m, []))
+        pov = _query_pov(ctx, m)
         lines = [f"**Maps of {m.name}:**"]
         for mp in m.maps.values():
-            n = sum(1 for e in m.units_on_map(mp.name) if not e.part_of)
+            # Only the units this channel's view may list (a hidden unit
+            # isn't counted, as !find doesn't list it).
+            n = sum(1 for e in m.units_on_map(mp.name)
+                    if not e.part_of and not _pov_hides(m, pov, e.id))
             bits = [mp.size_text(), f"{n} unit{'s' if n != 1 else ''}"]
             if m.fog_on(mp):
                 bits.append("fog")
@@ -9724,6 +10039,16 @@ async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
         if len(args) < 4:
             raise VTTError("Usage: `!map var set <path> <value>`.")
         value = _parse_scalar(args[3])
+        setting = {m.map_var_name(k): k for k in MAP_SETTING_RULES}.get(
+            args[2].split(".")[0])
+        if setting is not None:
+            # A setting's var takes what its own command would store
+            # (`!match fog`, `!map border`, `!map background`, `!map
+            # layer`): a value it can't read used to fall back silently.
+            if "." in args[2]:
+                raise VTTError(f"`{args[2].split('.')[0]}` is the map's "
+                               f"{setting} setting: it holds one value.")
+            value = _map_setting_value(setting, value)
         check_no_value_ancestor(mp.vars, args[2], "map var")
         _set_path(mp.vars, args[2], _own_value(value))
         return await ctx.send(f"{where} var `{args[2]}` = {value!r}")
@@ -9758,7 +10083,7 @@ async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
                    f"del / list.")
 
 
-@registry.command("map", access="all", usage="!map [full] [as=<team>] [hide=<layers>] [legend=on|off] [coords=on|off] [map=<map>] | !map cell <x> <y> [for=<eid>] | !map preview <burst|cone|line|rect> ... | !map ent_sight <eid> | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 28), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map preview burst|cone|line|rect ...` shows the cells an area shape would cover (marked with the preview_glyph rule's character on cells without a unit; graphics surfaces draw translucent squares above units, colour/opacity from the preview_color / preview_opacity rules or `color=` / `opacity=`) and lists the visible units inside — nothing happens to them. `!map ent_sight <eid>` marks the cells that unit sees right now (range + line of sight from its whole body, like can_see) and lists the units it sees; under a team POV players may ask about their own team's units only. `!map full` (host-gated) forces the omniscient view; `as=<team>` (host-only) previews what that team sees (`as=omniscient` = everything), without binding a channel. `!map cell <x> <y> [for=<eid>]` reports everything at one cell the channel can see — units, tile data, zones, corpses, and where its movement / sight block settings come from; `for=<eid>` adds whether the cell blocks that unit (hidden layers are left out). `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets a per-match background sprite; `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). `!map border on|off` / `color <name>` / `opacity <0-100>` / `clear` (host-gated) overrides the grid-line border rules per match (borders draw above the ground, below tiles/entities). `!map mode text|image` (host-gated) sets the per-match default render mode — `image` makes a plain `!map` and the auto-update board render graphically on Discord (text surfaces fall back to ASCII). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
+@registry.command("map", access="all", usage="!map [full] [as=<team>] [hide=<layers>] [legend=on|off] [coords=on|off] [map=<map>] | !map cell <x> <y> [for=<eid>] | !map preview <burst|cone|line|rect> ... | !map ent_sight <eid> | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 28), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map preview burst|cone|line|rect ...` shows the cells an area shape would cover (marked with the preview_glyph rule's character on cells without a unit; graphics surfaces draw translucent squares above units, colour/opacity from the preview_color / preview_opacity rules or `color=` / `opacity=`) and lists the visible units inside — nothing happens to them. `!map ent_sight <eid>` marks the cells that unit sees right now (range + line of sight from its whole body, like can_see) and lists the units it sees; under a team POV players may ask about their own team's units only. `!map full` (host-gated) forces the omniscient view; `as=<team>` (host-only) previews what that team sees (`as=omniscient` = everything), without binding a channel. `!map cell <x> <y> [for=<eid>]` reports everything at one cell the channel can see — units, tile data, zones, corpses, and where its movement / sight block settings come from; `for=<eid>` adds whether the cell blocks that unit (hidden layers are left out). `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets the map's background sprite (a map var); `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). `!map border on|off` / `color <name>` / `opacity <0-100>` / `clear` (host-gated) overrides the grid-line border rules for one map, in its map vars (borders draw above the ground, below tiles/entities). MAPS: `!map new|list|delete|rename|copy|use`; `!map var set|get|del|list` keeps free-form data per map, host-gated like `!match var` (the setting vars — fog, fog memory, background, borders, hidden layers — take the same values as their commands). `!map mode text|image` (host-gated) sets the per-match default render mode — `image` makes a plain `!map` and the auto-update board render graphically on Discord (text surfaces fall back to ASCII). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     args, mapspec = _pop_map_opt(args)
@@ -9786,7 +10111,9 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                   and args[1].lower() != "list"))
     unit = None
     named = (args[1:2] if sub in ("center", "ent_sight")
-             else args[2:3] if sub == "preview" else [])
+             else args[2:3] if sub == "preview"
+             else [a[4:] for a in args[3:] if a.lower().startswith("for=")]
+             if sub == "cell" else [])
     for tok in named:
         ce = m.entities.get(_resolve_eid(m, tok))
         if ce is not None and not _pov_hides(m, _query_pov(ctx, m), ce.id):
@@ -9820,7 +10147,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         mode = args[2].lower() if len(args) >= 3 else "stretch"
         if mode not in ("stretch", "tile", "center"):
             return await ctx.send(
-                "Usage: `!map background <key> [stretch|tile|center]` | `clear`.")
+                "❌ Usage: `!map background <key> [stretch|tile|center]` | `clear`.")
         m.set_map_setting(mp, "background", key)
         m.set_map_setting(mp, "background_mode", mode)
         return await ctx.send(f"Background sprite `{key}` ({mode})"
@@ -9868,7 +10195,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             m.set_map_setting(mp, "border_opacity", val)
             return await ctx.send(f"Grid border opacity set to {val}%.")
         return await ctx.send(
-            "Usage: `!map border on|off` | `color <name>` | "
+            "❌ Usage: `!map border on|off` | `color <name>` | "
             "`opacity <0-100>` | `clear`.")
     if args and args[0].lower() == "mode":
         # !map mode [text|image] — per-match default render mode. `image` makes
@@ -10004,7 +10331,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         from logic import TEXT_COLORS
         if len(args) < 2:
             return await ctx.send(
-                "Usage: `!map teamcolor <team> <color>` | `clear <team>` | `list`.")
+                "❌ Usage: `!map teamcolor <team> <color>` | `clear <team>` | `list`.")
         op = args[1].lower()
         if op == "list":
             if not m.team_colors:
@@ -10028,7 +10355,7 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if args and args[0].lower() == "resize":
         if len(args) < 3:
             return await ctx.send(
-                "Usage: `!map resize <width> <height> [anchor]` (anchor "
+                "❌ Usage: `!map resize <width> <height> [anchor]` (anchor "
                 "default top-left; e.g. center, bottom-right)."
             )
         try:
@@ -10242,14 +10569,15 @@ async def list_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # Gated by show_corpses_in_entity_list — when false we silently
     # omit the section (corpses still exist in tile data).
     if bool(m.rules.get("show_corpses_in_entity_list", True)):
-        corpses = [(x, y, eid, c) for (x, y, eid, c) in m.all_corpses()
-                   if m.corpse_visible_to(eid, c, x, y, pov)]
+        corpses = [(x, y, eid, c, cmp) for (cmp, x, y, eid, c)
+                   in m.every_corpse()
+                   if m.corpse_visible_to(eid, c, x, y, pov, cmp)]
         if corpses:
             if lines:
                 lines.append("")  # blank line separates living from dead
             lines.append("Dead:")
-            for (x, y, eid, corpse) in corpses:
-                lines.append(f"   {_corpse_line(m, x, y, eid, corpse)}")
+            for (x, y, eid, corpse, cmp) in corpses:
+                lines.append(f"   {_corpse_line(m, x, y, eid, corpse, cmp)}")
     if not lines:
         return await ctx.send(_as_note(args) + "(no entities)")
     return await ctx.send(_as_note(args) + "\n".join(lines))
@@ -10375,7 +10703,9 @@ def _entity_path_value(m: Match, e: Entity, path: str,
     logic.RESERVED_VAR_PATHS) come from the entity's own fields, matching
     `entity[X].path` in formulas; anything else walks the vars. `name` is
     the name shown to `pov`, so a disguise's decoy name is what a fooled
-    team can search and sort by."""
+    team can search and sort by, and every other path reads the disguise's
+    `vars` over the real ones (the disguise var itself left out), as `!ent
+    info` shows them."""
     seg0 = path.split(".", 1)[0]
     if seg0 in RESERVED_VAR_PATHS:
         if "." in path:
@@ -10383,7 +10713,10 @@ def _entity_path_value(m: Match, e: Entity, path: str,
         if seg0 == "name":
             return True, m.entity_display_name(e, pov)
         return True, getattr(e, seg0)
-    return _resolve_dotted_var(e.vars, path)
+    found, val = _resolve_dotted_var(m.presented_vars(e, pov), path)
+    if found and path == e._team_var_name() and val is not None:
+        val = str(val)      # team 1 and team "1" are one team (Entity.team)
+    return found, val
 
 
 def _coerce_for_compare(s: str) -> Any:
@@ -10540,7 +10873,15 @@ def _find_all_preds(m: Match, e: Entity, predicates: List[Tuple[str, str, Option
         found, lhs = _entity_path_value(m, e, key, pov)
         if not found:
             return False
-        rhs = _coerce_for_compare(val)
+        # A team is text (Entity.team): `team=1` names team "1".
+        rhs = val if key == e._team_var_name() else _coerce_for_compare(val)
+        # true / false aren't the numbers 1 / 0 here: `hp>=true` matched
+        # every unit and `flag<5` a flag set to true.
+        if (isinstance(lhs, (int, float)) and isinstance(rhs, (int, float))
+                and isinstance(lhs, bool) != isinstance(rhs, bool)):
+            if kind == "!=":
+                continue
+            return False
         # If lhs is numeric-ish and rhs coerced numeric, compare as numbers.
         # Otherwise the relational ops still attempt the comparison and a
         # TypeError is treated as "doesn't match".
@@ -10892,7 +11233,7 @@ async def dist_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             label = f"({x1},{y1}) → ({x2},{y2})"
         else:
             return await ctx.send(
-                "Usage: `!dist <a> <b>` | `!dist <eid> <x> <y>` | "
+                "❌ Usage: `!dist <a> <b>` | `!dist <eid> <x> <y>` | "
                 "`!dist <x1> <y1> <x2> <y2>` [metric] [los].")
     except NotFound as ex:
         return await ctx.send(f"❌ {ex}")
@@ -10962,7 +11303,7 @@ async def reveal_fog_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                               else "No active fog reveals.")
     if len(args) < 2:
         return await ctx.send(
-            "Usage: `!reveal_fog <team> all|at|rect|around|cone|line|clear "
+            "❌ Usage: `!reveal_fog <team> all|at|rect|around|cone|line|clear "
             "...`.")
     team = args[0]
     form = args[1].lower()
@@ -11040,7 +11381,7 @@ async def reveal_fog_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                      if mp.in_bounds(int(c[0]), int(c[1]))}
         else:
             return await ctx.send(
-                "Usage: `!reveal_fog <team> all|at|rect|around|cone|line|clear "
+                "❌ Usage: `!reveal_fog <team> all|at|rect|around|cone|line|clear "
                 "...`.")
     except (IndexError, ValueError):
         return await ctx.send(
@@ -11134,6 +11475,56 @@ def _split_foreach_commands(cmd_tokens: List[str]) -> List[List[str]]:
     ),
 )
 async def foreach_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    # Nested batches / foreach sweeps count toward macro_recursion_limit
+    # with macro runs: an alias expanding to a batch holding itself
+    # recursed until Python's stack overflowed.
+    return await _run_container(ctx, args, mgr, "foreach", _foreach_cmd)
+
+
+async def _run_container(ctx: ReplyContext, args: List[str],
+                         mgr: MatchManager, label: str, inner) -> Any:
+    """Run a `!batch` / `!foreach` with its lines gated (_GATE_LINES) and
+    its nesting bounded: depth by macro_recursion_limit, and the nested
+    runs of one top-level container together by macro_step_limit (one
+    step per nested run), since a sweep that runs itself per unit fans
+    out (two units, twenty levels: a million runs). Once either limit is
+    hit, the other nested runs of that top-level container stop quietly."""
+    depth = getattr(mgr, "_macro_depth", 0)
+    mid = mgr.active_by_channel.get(ctx.channel_key)
+    m = mgr.matches.get(mid) if mid is not None else None
+    limit = int(m.rules.get("macro_recursion_limit", 20)) if m else 20
+    budget = getattr(mgr, "_nest_budget", None)
+    if budget is not None and budget[1]:
+        return None             # out of steps, already reported
+    if depth >= limit:
+        if budget is not None:
+            budget[1] = True    # the other branches stop quietly too
+        return await ctx.send(
+            f"❌ `!{label}`: nesting limit ({limit}) exceeded "
+            f"(macro_recursion_limit); the rest are skipped.")
+    owner = budget is None
+    if owner:
+        steps = int(m.rules.get("macro_step_limit", 10000)) if m else 10000
+        budget = mgr._nest_budget = [steps, False]
+    elif depth > 0:
+        budget[0] -= 1
+        if budget[0] < 0:
+            budget[1] = True
+            return await ctx.send(
+                f"❌ `!{label}`: nested batch / foreach runs exceeded "
+                f"macro_step_limit; the rest are skipped.")
+    mgr._macro_depth = depth + 1
+    token = _GATE_LINES.set(True)
+    try:
+        return await inner(ctx, args, mgr)
+    finally:
+        _GATE_LINES.reset(token)
+        mgr._macro_depth = depth
+        if owner:
+            mgr._nest_budget = None
+
+
+async def _foreach_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
         title, body = registry.help_for(["foreach"])
         return await ctx.send(f"**{title}**\n{body}")
@@ -11220,6 +11611,13 @@ def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot,
     # The restored match may pin other partial versions.
     invalidate_partial_cache()
     old = mgr.matches[mid]
+    # A transfer is two undo steps, one per match: undoing either side
+    # leaves the other match as it is.
+    if notes is not None and any(
+            x.sequence >= snapshot.sequence
+            and str(x.label).startswith(_TRANSFER_LABELS)
+            for x in old.history.command_saves):
+        notes.append(_TRANSFER_UNDO_NOTE)
     new_match = Match.from_dict(snapshot.state)
     # Transfer history pointer first so the truncate below targets the
     # same object we just attached to the new match.
@@ -11244,6 +11642,14 @@ def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot,
     new_match._rng, new_match._rng_seed = old._rng, old._rng_seed
     # The journal records the restore as a stored state (see _run).
     new_match.journal = old.journal
+    # Each channel's camera and `!map use` choice are display state, not
+    # undo state: the live ones stay (minus maps the restore removed).
+    new_match.channel_views = {
+        ck: {mn: copy.deepcopy(v) for mn, v in views.items()
+             if mn in new_match.maps}
+        for ck, views in old.channel_views.items() if isinstance(views, dict)}
+    new_match.channel_maps = {ck: mn for ck, mn in old.channel_maps.items()
+                              if mn in new_match.maps}
     # A snapshot `!history import`ed from ANOTHER match restores that board
     # here, but the match stays itself: its id (the key everything files
     # under — two matches reporting one id sent this match's approval
@@ -11362,8 +11768,33 @@ async def _resolve_bindings_mode(ctx, m: Match, snap: Snapshot,
     return None
 
 
+_TRANSFER_LABELS = ("!ent transfer",)
+_TRANSFER_UNDO_NOTE = (
+    "⚠️ This undid a unit moving between matches on THIS match only: the "
+    "other match keeps its side (undo there separately).")
+
+
+def _take_overwrite(args: List[str]) -> bool:
+    """Remove a trailing-option `overwrite` word from `args` (in place)."""
+    if any(str(a).lower() == "overwrite" for a in args[2:]):
+        args[:] = args[:2] + [a for a in args[2:]
+                              if str(a).lower() != "overwrite"]
+        return True
+    return False
+
+
+def _check_overwrite(full: str, shown: str, overwrite: bool) -> None:
+    """Refuse to replace an existing saves file unless `overwrite` was given."""
+    if os.path.exists(full) and not overwrite:
+        raise VTTError(f"`{shown}` already exists; add `overwrite` to "
+                       f"replace it.")
+
+
 def _bindings_suffix(notes: List[str]) -> str:
-    return (" Channels: " + "; ".join(notes) + ".") if notes else ""
+    warn = [n for n in notes if n == _TRANSFER_UNDO_NOTE]
+    rest = [n for n in notes if n != _TRANSFER_UNDO_NOTE]
+    return ((" Channels: " + "; ".join(rest) + ".") if rest else "") + \
+        "".join("\n" + w for w in warn)
 
 
 def _parse_int_or(default: int, token: Optional[str]) -> int:
@@ -11558,7 +11989,7 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             # Form: !history undo to round X [confirm]
             if len(args) < 4 or args[2].lower() not in ("round", "rounds"):
                 return await ctx.send(
-                    "Usage: `!history undo to round <X> [confirm]`."
+                    "❌ Usage: `!history undo to round <X> [confirm]`."
                 )
             try:
                 target_round = int(args[3])
@@ -11703,7 +12134,9 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "history", "export"):
             return
         selector = args[1]
+        overwrite = _take_overwrite(args)
         full, path = saves_path(args[2], mgr, write=True)
+        _check_overwrite(full, path, overwrite)
         snap = _resolve_snapshot_selector(m, selector)
         _write_save_file(mgr, full, path, snap.to_dict())
         audit_note(f"exported a snapshot of `{m.id}` to `{path}`")
@@ -11959,8 +12392,8 @@ def _diff_named(label: str, a: Dict[str, Any], b: Dict[str, Any]) -> List[str]:
 
 def _diff_entity(eid: str, ea: Dict[str, Any], eb: Dict[str, Any],
                  words: Tuple[str, str] = ("removed", "added")) -> List[str]:
-    """Per-entity diff lines: name, position, facing, body-part / mount
-    links, vars (flattened to leaves), statuses, passives and clamps. Only
+    """Per-entity diff lines: name, position (with the map when it
+    changed), facing, body-part / mount links, vars (flattened to leaves), statuses, passives and clamps. Only
     fields that actually differ contribute lines. `words` names a status /
     passive / clamp present only on the first / only on the second side."""
     gone, new = words
@@ -11968,7 +12401,11 @@ def _diff_entity(eid: str, ea: Dict[str, Any], eb: Dict[str, Any],
     if ea.get("name") != eb.get("name"):
         lines.append(f"    name: {ea.get('name')!r} -> {eb.get('name')!r}")
     pa, pb = (ea.get("x"), ea.get("y")), (eb.get("x"), eb.get("y"))
-    if pa != pb:
+    ma, mb = ea.get("map"), eb.get("map")
+    if ma != mb:
+        lines.append(f"    position: ({pa[0]},{pa[1]}) on `{ma}` -> "
+                     f"({pb[0]},{pb[1]}) on `{mb}`")
+    elif pa != pb:
         lines.append(f"    position: ({pa[0]},{pa[1]}) -> ({pb[0]},{pb[1]})")
     for field_name in ("facing", "part_of", "mounted_on", "mount_slot"):
         va, vb = ea.get(field_name), eb.get(field_name)
@@ -12219,7 +12656,7 @@ registry.annotate_sub(
 )
 registry.annotate_sub(
     "history", "export",
-    usage="!history export <selector> <path>",
+    usage="!history export <selector> <path> [overwrite]",
     desc=(
         "Write one snapshot to a JSON file. Selectors: manual:<name>, "
         "round:<N>, turn:<seq>, command:<seq>, latest:round, "
@@ -12384,11 +12821,13 @@ async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # autosave history into the save file. Off by default to keep
         # files small; on for full campaign backups.
         include_history = False
+        overwrite = _take_overwrite(args)
         _check_options(args[2:], {"include_history"}, "!store save")
         for extra in args[2:]:
             if extra.startswith("include_history="):
                 include_history = _parse_bool(extra[len("include_history="):])
         path, shown = saves_path(args[1], mgr, write=True)
+        _check_overwrite(path, shown, overwrite)
         _write_save_file(mgr, path, shown,
                          mgr.save_data(include_history=include_history))
         audit_note(f"saved the server to `{shown}`")
@@ -12412,7 +12851,7 @@ async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 #annonate subcommands next to the command itself:
 registry.annotate_sub(
     "store", "save",
-    usage="!store save <name> [include_history=yes]",
+    usage="!store save <name> [include_history=yes] [overwrite]",
     desc=(
         "Save this server's matches, game systems and channel bindings to a "
         "JSON file in its saves folder (plain names only; server "
@@ -12852,9 +13291,16 @@ async def clamp_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"Remove it first with !clamp remove, or replace by remove+add."
             )
         e.clamps[path] = spec
+        # A bound path the unit doesn't hold reads as "no bound" until it
+        # does: say so, so a typo (`max_hpp`) doesn't leave it unbounded
+        # unnoticed.
+        missing = [b for b in (spec.max, spec.min) if isinstance(b, str)
+                   and not _resolve_dotted_var(e.vars, b)[0]]
+        note = (f"\n⚠️ `{eid}` has no var {', '.join(f'`{b}`' for b in missing)}"
+                f": that bound applies once it exists." if missing else "")
         return await ctx.send(
             f"Added clamp on `{eid}.{path}` ({_format_clamp_line(path, spec)})"
-        )
+            + note)
 
     if sub in ("remove", "del", "rm"):
         if await return_help_if_not_enough_args(ctx, args, 3, "clamp", "remove"):
@@ -13601,6 +14047,18 @@ async def log_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"Expected a number, `type=`, `who=`, `round=`, `by=`, "
                 f"'clear', or 'format'; got '{tok}'."
             )
+        if n < 1:
+            raise VTTError(f"`!log <n>` shows the last n entries; n is 1 or "
+                           f"more, not `{tok}`.")
+    if "type" in filters:
+        known = set(RULES_REGISTRY["event_log_events"]["schema"]["word_list"])
+        known.add("custom")
+        bad = [t for t in (w.strip() for w in filters["type"].split(","))
+               if t and t not in known]
+        if bad:
+            raise VTTError(
+                f"Unknown event type(s) {', '.join(f'`{t}`' for t in bad)}; "
+                f"the types are {', '.join(sorted(known))}.")
     # The log names every unit's spawns, moves, damage and statuses, hidden
     # ones included (pov_filters_queries).
     if _whole_board_read_blocked(ctx, m):
@@ -13842,8 +14300,11 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"⚠️ This would clear all {n} special tile(s) in this match. "
                 f"To proceed: `!tile clear confirm`."
             )
-        mp.tiles.clear()
-        return await ctx.send(f"Cleared {n} tile(s).")
+        for key in list(mp.tiles):
+            mp.clear_tile_keep_corpses(*key)
+        return await ctx.send(f"Cleared {n} tile(s)."
+                              + (" Corpses stay where they lie."
+                                 if mp.tiles else ""))
 
     # ---- hook add|del|list ----
     # Tile hooks are formulas stored under tiles[(x,y)]["hooks"][when]
@@ -14599,7 +15060,7 @@ registry.annotate_sub(
 
 @registry.command(
     "zone",
-    usage=("!zone <new|drop|rename|add|remove|fill|shift|anchor|unanchor|set|del|clear|glyph|sprite|color|info|list|cells> ..."),
+    usage=("!zone <new|drop|rename|add|remove|fill|shift|anchor|unanchor|set|del|clear|glyph|sprite|color|legend|info|list|cells|hook> ..."),
     desc=(
         "Named multi-cell regions. A zone is a SET of cells plus a "
         "free-form data dict, optional hooks, and an optional map glyph "
@@ -14610,8 +15071,9 @@ registry.annotate_sub(
         "(`set`/`del`/`clear`/`info`) exactly like tile data, and is "
         "readable from formulas via zone_get/zone_has plus membership "
         "queries (zones_at, in_zone, entities_in_zone, ...). Subcommands: "
-        "new, drop, add, remove, fill, shift, set, del, clear, glyph, "
-        "sprite (a graphics sprite key, like glyph), info, list, cells, hook."
+        "new, drop, rename, add, remove, fill, shift, anchor, "
+        "unanchor, set, del, clear, glyph, sprite (a graphics sprite key, "
+        "like glyph), color, legend, info, list, cells, hook."
     ),
 )
 async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -14941,8 +15403,9 @@ async def zone_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             "data": z.get("data") or {},
             "hooks": sorted((z.get("hooks") or {}).keys()),
         }
-        if isinstance(z.get("glyph"), str):
-            view["glyph"] = z["glyph"]
+        for key in ("glyph", "color", "sprite", "legend"):
+            if isinstance(z.get(key), str) or z.get(key) is False:
+                view[key] = z[key]
         if len(m.maps) > 1:
             view["map"] = m.zone_map(name).name
         if z.get("anchor"):
@@ -15998,7 +16461,8 @@ registry.annotate_sub(
     usage="!zone info <name>",
     desc=(
         "Show a zone's full state: its cells, data dict, registered hook "
-        "names, and glyph (if any)."
+        "names, its glyph, colour, sprite and legend label (when set), its "
+        "aura binding and, on a match with several maps, its map."
     ),
 )
 registry.annotate_sub(
@@ -16119,7 +16583,6 @@ registry.annotate_sub(
         "system) and persist through save/load. Subcommands: def, del, "
         "list, info."
     ),
-    snapshot=False,
 )
 async def alias_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
@@ -16302,6 +16765,11 @@ def _snapshot_all_matches(mgr: MatchManager) -> Dict[str, Any]:
     return {
         "matches": {mid: m.to_dict(include_history=False)
                     for mid, m in mgr.matches.items()},
+        # The match objects and their undo histories: a match deleted
+        # meanwhile comes back as itself (history, saves, journal), and
+        # snapshots recorded by the undone work go (MatchHistory.rewind).
+        "objs": dict(mgr.matches),
+        "hist": {mid: m.history.mark() for mid, m in mgr.matches.items()},
         "active": dict(mgr.active_by_channel),
     }
 
@@ -16317,10 +16785,17 @@ def _restore_all_matches(mgr: MatchManager, snap: Dict[str, Any]) -> None:
     for mid, state in pre.items():
         m = mgr.matches.get(mid)
         if m is None:
-            m = Match.from_dict(copy.deepcopy(state))
+            m = snap.get("objs", {}).get(mid)
+            if m is None:
+                m = Match.from_dict(copy.deepcopy(state))
             mgr.matches[mid] = m
+            if m.to_dict(include_history=False) != state:
+                _rollback_match(m, mgr, state)
         elif m.to_dict(include_history=False) != state:
             _rollback_match(m, mgr, state)
+        mark = snap.get("hist", {}).get(mid)
+        if mark is not None:
+            m.history.rewind(mark)
         # Rules are a copy of the match's system, which isn't rolled back
         # (as in an undo, see _restore_snapshot).
         if m.system_name in mgr.systems:
@@ -16384,8 +16859,12 @@ async def dry_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     mid = m.id
     snap = _snapshot_all_matches(mgr)
-    rngs = {k: x._rng.getstate() for k, x in mgr.matches.items()
-            if getattr(x, "_rng", None) is not None}
+    # Each match's RNG as it stands: its generator's state, or (none built
+    # yet: after a restart or `!match rng set`) the saved position, so a
+    # generator the dry run builds is dropped again.
+    rngs = {k: (x._rng.getstate() if x._rng is not None else None,
+                x._rng_seed, x.rng_position())
+            for k, x in mgr.matches.items()}
     await ctx.send(f"🧪 Dry run of `!{' '.join([name] + rest)}` — none of "
                    f"this is kept:")
     token = _DRY_ACTIVE.set(True)
@@ -16397,10 +16876,17 @@ async def dry_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         post = after.to_dict(include_history=False) if after is not None \
             else None
         _restore_all_matches(mgr, snap)
-        for k, state in rngs.items():
+        for k, (state, gen_seed, pos) in rngs.items():
             x = mgr.matches.get(k)
-            if x is not None and getattr(x, "_rng", None) is not None:
+            if x is None:
+                continue
+            if state is None:
+                x._rng, x._rng_seed, x.rng_pos = None, None, pos
+            else:
+                if x._rng is None:
+                    x._rng = CountingRandom(gen_seed)
                 x._rng.setstate(state)
+                x._rng_seed = gen_seed
     pre = snap["matches"].get(mid)
     if post is None:
         return await ctx.send("🧪 It would have deleted this match; rolled "
@@ -16439,6 +16925,13 @@ async def dry_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     ),
 )
 async def batch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
+    # Nested batches / foreach sweeps count toward macro_recursion_limit
+    # with macro runs: an alias expanding to a batch holding itself
+    # recursed until Python's stack overflowed.
+    return await _run_container(ctx, args, mgr, "batch", _batch_cmd)
+
+
+async def _batch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
         title, body = registry.help_for(["batch"])
         return await ctx.send(f"**{title}**\n{body}")
@@ -16465,7 +16958,16 @@ async def batch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     snap = _snapshot_all_matches(mgr)
     watch = _ErrorWatchCtx(ctx)
     for i, sub in enumerate(parts):
-        result = await registry.dispatch_no_snapshot(sub[0], sub[1:], watch, mgr)
+        try:
+            result = await registry.dispatch_no_snapshot(sub[0], sub[1:],
+                                                         watch, mgr)
+        except Exception:
+            # A line that crashed undoes the lines before it too.
+            _restore_all_matches(mgr, snap)
+            sink = FORMULA_LOG_SINK.get()
+            if sink is not None:
+                sink.clear()
+            raise
         if watch.error_seen or result == ASSERT_STOP:
             _restore_all_matches(mgr, snap)
             # The output a rolled-back line queued for the end of the
@@ -16763,14 +17265,17 @@ async def _exec_macro(nodes, ctx, mgr, mac_args, loop_idx, name, budget):
             ran = False
             for cond, block in branches:
                 csrc = _macro_subst(cond, mac_args, loop_idx)
+                # A condition that can't be read stops the macro: running
+                # the other branch instead turned a typo into a game effect
+                # (a heal macro's `if true` killed the unit).
                 if m is None:
-                    break
+                    raise _MacroError(f"no active match to read the `if` "
+                                      f"condition `{csrc[:50]}`")
                 try:
                     truthy = bool(_macro_eval_readonly(csrc, m, name))
                 except FormulaError as ex:
-                    await ctx.send(f"❌ macro `{name}`: bad `if` condition "
-                                   f"`{csrc[:50]}`: {ex}")
-                    truthy = False
+                    raise _MacroError(f"bad `if` condition `{csrc[:50]}`: "
+                                      f"{ex} (the macro stops here)")
                 if truthy:
                     if await _exec_macro(block, ctx, mgr, mac_args, loop_idx,
                                          name, budget) == ASSERT_STOP:
@@ -16900,28 +17405,37 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             nodes = _parse_macro(m.macros[name])
         except _MacroError as ex:
             return await ctx.send(f"❌ macro `{name}` structure error: {ex}")
-        budget = [int(m.rules.get("macro_step_limit", 10000))]
-        # Recursion-depth guard: a macro line can `!macro run <other>`, and each
-        # `!macro run` allocates its OWN fresh step budget — so the step limit
-        # alone can't stop a self/mutually-recursive macro from recursing until
-        # the Python stack overflows (a 💥). Bound the nested-run depth here.
-        # Tracked on the manager (the dispatch stack), so it accumulates even if
-        # a macro line switches the active match mid-recursion.
+        # Recursion-depth guard: a macro line can `!macro run <other>`, which
+        # would recurse until the Python stack overflows (a 💥). Bound the
+        # nested-run depth here. Tracked on the manager (the dispatch
+        # stack), so it accumulates even if a macro line switches the active
+        # match mid-recursion. A nested run shares the outermost run's step
+        # budget: with a fresh one per run, a macro running itself twice ran
+        # 2^depth times.
         depth = getattr(mgr, "_macro_depth", 0)
+        outer_budget = getattr(mgr, "_macro_budget", None)
+        budget = (outer_budget if depth > 0 and outer_budget is not None
+                  else [int(m.rules.get("macro_step_limit", 10000))])
         rec_limit = int(m.rules.get("macro_recursion_limit", 20))
         if depth >= rec_limit:
             return await ctx.send(
                 f"❌ macro `{name}`: recursion limit ({rec_limit}) exceeded "
                 f"(macro_recursion_limit).")
         mgr._macro_depth = depth + 1
+        mgr._macro_budget = budget
+        gate_token = _GATE_LINES.set(False)   # the body is host-written
         try:
             if await _exec_macro(nodes, ctx, mgr, mac_args, None, name,
                                  budget) == ASSERT_STOP:
                 return await _stop_after_assert(ctx, f"macro `{name}`", 0)
         except _MacroError as ex:
+            if depth > 0:
+                raise   # the outermost run reports it, once, and stops
             await ctx.send(f"❌ macro `{name}`: {ex}")
         finally:
+            _GATE_LINES.reset(gate_token)
             mgr._macro_depth = depth
+            mgr._macro_budget = outer_budget if depth > 0 else None
         return
 
     if sub == "list":
@@ -16960,7 +17474,6 @@ for _subs, _usage in (
 @registry.command(
     "table",
     usage="!table <def|roll|list|show|remove|rename> ...",
-    snapshot=False,
     desc=(
         "Named random tables (Match.tables) — store a weighted table once and "
         "roll it by name. `def <name> <key:weight,...>` defines a table (the "
@@ -17099,11 +17612,21 @@ async def watch_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         except FormulaError as ex:
             return await ctx.send(f"❌ invalid watcher formula: {ex}")
         verb = "Replaced" if name in m.watchers else "Added"
+        # Edge-triggered from now: a condition that already holds isn't a
+        # change, so it fires the next time it becomes true (it used to
+        # fire after whatever command came next).
+        try:
+            holds = bool(FormulaEngine(m).eval_expression(
+                cond, EvalCtx(this=m.current_entity_id())))
+        except FormulaError:
+            holds = False
         m.watchers[name] = {"condition": cond, "effect": effect,
-                            "once": once, "last": False}
+                            "once": once, "last": holds}
         return await ctx.send(
             f"{verb} watcher `{name}`{' (once)' if once else ''}. Fires when "
-            f"the condition becomes true.")
+            f"the condition becomes true"
+            + (" (it holds now, so the next time it turns true)." if holds
+               else "."))
 
     if sub == "list":
         if not m.watchers:
@@ -17858,7 +18381,7 @@ async def _run_action_dispatch(
     # Parse the target tokens off the front, then args off the rest.
     try:
         target_value, remaining = parse_target(
-            action.target_type, pruned, m,
+            action.target_type, pruned, m, actor_id,
         )
         args_dict = parse_args_tokens(remaining)
     except VTTError as ex:
@@ -17938,6 +18461,20 @@ def _clip(text: str, n: int) -> str:
     return text if len(text) <= n else text[:n - 1].rstrip() + "…"
 
 
+def _rule_value_text(ctx: ReplyContext, mgr: MatchManager, name: str,
+                     value: Any, width: int = 80) -> str:
+    """A rule's value as replies print it: `(hidden)` for a secret rule
+    (logic.SECRET_RULES) with a value, unless the caller is an administrator
+    or a host of the channel's match."""
+    if name in SECRET_RULES and value not in (None, "") \
+            and not ctx_is_admin(ctx):
+        mid = mgr.active_by_channel.get(ctx.channel_key)
+        m = mgr.matches.get(mid) if mid is not None else None
+        if m is None or not _acts_as_host(ctx, m):
+            return "(hidden)"
+    return _clip(repr(value), width)
+
+
 def _help_rule(ctx: ReplyContext, mgr: MatchManager, name: str) -> str:
     """`!help rule <rule>`: one gamerule in full, with its value on this
     channel's match (else the channel's default system) and its source."""
@@ -17970,11 +18507,13 @@ def _help_rule(ctx: ReplyContext, mgr: MatchManager, name: str) -> str:
              f"Default: `{_clip(repr(DEFAULT_SYSTEM_SETTINGS.get(name)), 80)}`"]
     if m is not None:
         lines.append(f"On match `{m.id}`: "
-                     f"`{_clip(repr(m.rules.get(name)), 80)}`")
+                     f"`{_rule_value_text(ctx, mgr, name, m.rules.get(name))}`")
     if sysobj is not None:
         src = mgr.system_value_source(sysobj, name)
+        shown = _rule_value_text(ctx, mgr, name,
+                                 mgr.system_value(sysobj, name))
         lines.append(
-            f"System `{sysobj.name}`: `{_clip(repr(mgr.system_value(sysobj, name)), 80)}` ("
+            f"System `{sysobj.name}`: `{shown}` ("
             + ("the engine default" if src is None else
                "set by this system" if src == sysobj.name else
                f"inherited from `{src}`") + ")")
@@ -18022,7 +18561,7 @@ def _help_find(ctx: ReplyContext, mgr: MatchManager, words: List[str]) -> str:
             val = (m.rules.get(name, DEFAULT_SYSTEM_SETTINGS.get(name))
                    if m is not None else DEFAULT_SYSTEM_SETTINGS.get(name))
             rules.append((name_hit(name),
-                          f"- `{name}` = `{_clip(repr(val), 40)}` — "
+                          f"- `{name}` = `{_rule_value_text(ctx, mgr, name, val, 40)}` — "
                           f"{_clip(spec.get('desc'), 110)}"))
     if not cmds and not rules:
         return (f"🔎 Nothing matches `{' '.join(words)}`. Try fewer or "
@@ -18079,6 +18618,19 @@ _SUB_DESCS = {
         "reason, or `clear` the outcome. Fires the `match_outcome` event "
         "(winner / reason / round)."),
     ("match", "outcome"): "Show the declared winner and reason, if any.",
+    ("zone", "anchor"): (
+        "Bind the zone to a unit as an AURA: its cells become every cell "
+        "within [radius] (default 0 = the body) of any cell the unit "
+        "covers, by [metric] (square_radius, manhattan or euclidean), and "
+        "follow the unit as it moves. Anchor loss follows the "
+        "anchored_zone_on_anchor_loss rule."),
+    ("zone", "unanchor"): (
+        "Release an aura: the zone keeps its current cells and stops "
+        "following its unit."),
+    ("zone", "sprite"): (
+        "The graphics sprite drawn on the zone's cells (a key from the "
+        "sprites folder), like `!zone glyph` for text; `clear` / `-` "
+        "removes it."),
     ("zone", "legend"): (
         "What the map legend calls this zone: a label of your own (a trap "
         "zone listed as \"floor\"), `false` to leave it out, or `-` for the "

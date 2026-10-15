@@ -210,6 +210,9 @@ class DiscordCtxWrapper:
     # Discord renders ANSI colors inside ```ansi code blocks, so the
     # colorized map renderer is enabled for this surface.
     supports_color = True
+    # Users are numeric ids: a typed name in `!host add` / `user=` can
+    # never match one, so those commands want a mention or an id.
+    numeric_user_ids = True
     # Discord messages are narrow, so the map viewport engages in 'auto'
     # mode on large maps (pan with `!map pan` / the arrow buttons).
     viewport_capable = True
@@ -338,7 +341,7 @@ class DiscordCtxWrapper:
         Falls back to a plain text prompt if the discord UI components
         aren't available. Called by the dispatcher when a non-host's
         command is queued (see CommandRegistry.run)."""
-        cmd = "!" + req["name"] + (" " + " ".join(req["args"]) if req["args"] else "")
+        cmd = _shown_cmd(req["name"], req["args"])
         text = (
             f"🕓 **{req['user_name']}** requests `{cmd}` "
             f"(id `{req['id']}`). A host can approve or deny."
@@ -357,7 +360,7 @@ class DiscordCtxWrapper:
         """A host's command held on a paused match (pause_affects_hosts):
         ask to unpause, with Resume & run / Cancel buttons. Called by the
         dispatcher (CommandRegistry._hold_command)."""
-        cmd = "!" + entry["name"] + (" " + " ".join(entry["args"]) if entry["args"] else "")
+        cmd = _shown_cmd(entry["name"], entry["args"])
         n = len(m.held_commands)
         text = (f"⏸ **{m.name}** is paused — `{cmd}` is held"
                 + (f" ({n} commands waiting)" if n > 1 else "")
@@ -371,6 +374,14 @@ class DiscordCtxWrapper:
                        "discards held commands.")
 
 
+def _shown_cmd(name: str, args: list) -> str:
+    """A command as a prompt shows it, cut to fit one Discord message
+    (2000 characters, the prompt's own text included): a near-limit command
+    queued a request whose prompt Discord refused."""
+    cmd = "!" + name + (" " + " ".join(args) if args else "")
+    return cmd if len(cmd) <= 1500 else cmd[:1499] + "…"
+
+
 class _InteractionCtx:
     """ReplyContext built from a button-click interaction, so an approved
     command runs with the CLICKER's identity (a host) against the
@@ -378,6 +389,7 @@ class _InteractionCtx:
     cli_mutable = False
     supports_color = True
     viewport_capable = True
+    numeric_user_ids = True
 
     def __init__(self, interaction, mgr=None):
         guild = getattr(interaction, "guild", None)
@@ -482,7 +494,7 @@ class _ApprovalView(discord.ui.View):
             return self._finish()
         await interaction.response.defer()
         ictx = _InteractionCtx(interaction, self._mgr)
-        cmd = "!" + req["name"] + (" " + " ".join(req["args"]) if req["args"] else "")
+        cmd = _shown_cmd(req["name"], req["args"])
         await ictx.send(
             f"✅ {ictx.user_name} approved `{cmd}` (by {req['user_name']})."
         )
@@ -508,7 +520,7 @@ class _ApprovalView(discord.ui.View):
                 "Already resolved.", ephemeral=True
             )
             return self._finish()
-        cmd = "!" + req["name"] + (" " + " ".join(req["args"]) if req["args"] else "")
+        cmd = _shown_cmd(req["name"], req["args"])
         await interaction.response.send_message(
             f"🚫 {interaction.user.display_name} denied `{cmd}` "
             f"(by {req['user_name']})."
@@ -582,9 +594,11 @@ class _ResumeView(discord.ui.View):
         # A click is not a typed command, so it isn't the clicker's `!again`.
         depth = vtt_commands._RUN_DEPTH.set(1)
         try:
-            with vtt_commands._channel_pointed_at(
-                    self._mgr, ictx.channel_key, self._mid):
-                await registry.run("match", ["resume"], ictx, self._mgr)
+            # The lock before the re-point (see run_approved_request).
+            async with vtt_commands.holding_command_lock(self._mgr, ictx):
+                with vtt_commands._channel_pointed_at(
+                        self._mgr, ictx.channel_key, self._mid):
+                    await registry.run("match", ["resume"], ictx, self._mgr)
         finally:
             vtt_commands._RUN_DEPTH.reset(depth)
         if _boards:
@@ -601,7 +615,7 @@ class _ResumeView(discord.ui.View):
         for i, h in enumerate(held):
             if h is self._entry:
                 del held[i]
-                cmd = "!" + h["name"] + (" " + " ".join(h["args"]) if h["args"] else "")
+                cmd = _shown_cmd(h["name"], h["args"])
                 await interaction.response.send_message(
                     f"🚫 Dropped held `{cmd}`; the match stays paused.")
                 return await self._disable(interaction)
@@ -791,17 +805,22 @@ class _PanView(discord.ui.View):
                 entry["message"] = interaction.message
                 await _retire_board(self.channel_key, entry, mid)
             return
-        if m is None or not m.viewport_engaged():
+        # The map the board shows (a match with several maps has a camera
+        # per map).
+        mp = m.channel_map(self.channel_key, m.channel_pov(self.channel_key)) \
+            if m is not None else None
+        if m is None or not m.viewport_engaged(mp):
             try:
                 await interaction.response.defer()
             except Exception:
                 pass
             return
-        vw, vh = m._viewport_dims()
-        m.pan_view(self.channel_key,
-                   dx * _pan_step(m, vw), dy * _pan_step(m, vh))
-        # The camera is match state, but a click isn't a command: save it.
-        await vtt_commands.persist_workspace(self._mgr, None)
+        # A click isn't a command, but it changes the camera like one: it
+        # waits for the command running on this server and is saved after.
+        async with vtt_commands.holding_command_lock(self._mgr):
+            vw, vh = m._viewport_dims(mp)
+            m.pan_view(self.channel_key,
+                       dx * _pan_step(m, vw), dy * _pan_step(m, vh), mp)
         entry = _boards.get(self.channel_key)
         if entry is not None:
             entry["message"] = interaction.message
