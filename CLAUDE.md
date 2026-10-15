@@ -376,7 +376,7 @@ back, load the schema with `ToolSearch` before calling
   swept, verified clean, measured. Read the relevant passes before auditing
   an area again.
 - **`docs/multi_map_design.md`**: the agreed design for multiple maps per
-  match and nested maps (steps 1 and 2a built; §8).
+  match and nested maps (steps 1, 2a and 2b built; §8).
 - **`docs/feature_ideas.md`**: the open, numbered feature-idea list the user
   picks from by number (shipped / struck items listed at its top). Check it
   before proposing a feature, and keep it current when one ships.
@@ -610,6 +610,9 @@ keys. `break` / `continue` work inside a loop body. Iterations are bounded by
 `formula_loop_limit`, which the higher-order helpers charge per item
 (`map_with(items, f)`, `filter_with`, `sort_by(items, f, desc=False)`; `f` is
 a `!func` name or a lambda; banned in `$()`, since a `!func` may write).
+
+**Maps.** A coordinate on another map is `[x, y, map]`; unit-less spatial
+functions take `map=` (§7.8 "Maps in formulas").
 
 **Values.** Coordinates are LISTS (`[3, 3]`): built-in results are listified
 (`_listify`), a tuple literal compiles to a list, stored tuples become lists;
@@ -1312,7 +1315,7 @@ hardcodes**.
 
 ### 7.8 Geometry, movement and blocking
 
-- **Maps** (`Map`; `docs/multi_map_design.md`, steps 1-2a built): a match
+- **Maps** (`Map`; `docs/multi_map_design.md`, steps 1-2b built): a match
   holds its grids in `Match.maps` (name -> Map, in creation order, saved
   as `map_order` since files sort keys; a new match has one, `main`,
   `DEFAULT_MAP_NAME`). A Map is the grid alone: size, tiles, zones (stored
@@ -1330,9 +1333,35 @@ hardcodes**.
   units by map; a team sees a map only through its units on it. Corpses:
   `find_corpse(id)` -> (x, y, corpse, map) on any map, `all_corpses(mp)`
   one map, `every_corpse()` all of them. Templates, statblocks and summon
-  snapshots strip `map` like x / y. Formulas still call `get_map()` (step
-  2b adds `map=` there); the area builders resolve their bounds only when
-  called, so a formula that builds no area works on any match.
+  snapshots strip `map` like x / y. Formulas: §7.8 "Maps in formulas".
+- **Maps in formulas** (step 2b): the unit-less spatial functions
+  (`formula._MAP_ARG_FUNCS`: tile_*, cell_entity, entities_at / in_* /
+  on_los, cells_in_*, free_cell_near, in_bounds, grid_width / height,
+  has_los, can_see, team_sees_cell, cell_blocked, clip_cells, ...) take
+  `map=`: a map name, `view` (the command channel's map, through the
+  `logic.COMMAND_VIEW` context var `_run_top` sets; refused outside a
+  command) or `@<unit>` (that unit's map; `map_of(unit)` reads the same).
+  The call runs on that map (`_map_stack`, read by `_cur_map()`).
+  Without it a formula uses its hook's map (tile_map / zone_map), else the
+  match's only map; on a match with several it refuses, naming them (no
+  fallback on `self`). A cell result on a map other than the formula's
+  own is `[x, y, map]` (`_tag_cells`). `random_cell` / `random_free_cell`
+  also take a list or `all` (one pick across those maps, every cell
+  equally likely, always `[x, y, map]`; a zone names its own map).
+  Summons (`summon*`, `summon_template*`) and `move_entity(eid, x, y,
+  map=)` / `move_entity(eid, coord)` take `map=` too; a summon defaults to
+  the hook's map, else `self`'s, else the only one; `move_entity` to
+  another map is a cross-map move (returns `[x, y, map]`). `coord_x` /
+  `coord_y` read triples, `coord_map` names the map (None for a pair);
+  `nearest_cell` / `face_toward` / `clip_cells` honour a triple's map;
+  across maps `can_see` / `has_los` are False and `nearest_cell` None. A
+  location target is a `Coord` with `.map` (the actor's, or a triple's
+  map via `use_action`; stored as `[x, y, map]` only when it isn't the
+  actor's). `maps()` (loopable), `map_var_get / set / del / keys / has`
+  (dotted paths on a map's vars, `map=` or the context map; a setting var
+  takes what its command stores, `logic.map_setting_value`). `map` is a
+  reserved var path like x / y / name: `entity[x].map` reads the unit's
+  map and no var can take the name (831-836).
 - **Map management** (`!map new <name> <w> <h> | list | delete | rename |
   copy | use | var`, `_map_manage`): names follow `check_map_name`; the
   `!map` subcommand words plus all / view / clear / full / none are
@@ -2139,11 +2168,10 @@ rejected already. Update this section in the PR that resolves an item.
   the user over a long discussion; the agreed decisions, deferred points, build
   order and test requirements (20+ scenarios) are in
   `docs/multi_map_design.md`. Read it whole before touching either; ask
-  before deviating from it. Built: step 1 (the Map model) and step 2a
+  before deviating from it. Built: step 1 (the Map model), step 2a
   (management, map vars, command map resolution, following, cross-map
-  moves; §7.8). Next: 2b formulas (`map=`, `[x, y, map]` coordinates,
-  `map_of`, map var functions), 2c channels / unseen maps / roster,
-  2d `transfer_entity` and `!match link`, then nested maps.
+  moves) and step 2b (formulas; §7.8). Next: 2c channels / unseen maps /
+  roster, 2d `transfer_entity` and `!match link`, then nested maps.
 - **Later:** graphics mouse select / drag and
   animation ("foreseeable future"); a per-entity ATB threshold; arbitrary /
   L-shaped footprints and footprint rotation; per-rider footprints inside a

@@ -1,7 +1,7 @@
 # Multiple maps per match (#40) and nested maps (#164): agreed design
 
-Status: design agreed with the user. Step 1 of the build order (§8, the
-`Map` extraction) is built; the rest is not. Each item below was decided in
+Status: design agreed with the user. Steps 1, 2a and 2b of the build
+order (§8) are built; 2c, 2d and nested maps are not. Each item below was decided in
 chat; §11 lists what is deferred. Read this whole file
 before starting either feature: every decision here has long-term
 consequences, and the user made each one deliberately.
@@ -96,8 +96,10 @@ or `all` and return `[x, y, map]`), `cells_in_rect` / `_area` / `_cone` /
 - Without `map=` they work only when the match has exactly one map;
   otherwise they refuse for the missing argument. They don't fall back on
   `self`.
-- The map argument also takes shortcuts: the channel's viewed map (tier 4)
-  and "this unit's map". Section 10 lists the open details.
+- The map argument also takes shortcuts (decided): `map='view'` is the
+  channel's viewed map (tier 4) and `map='@<unit>'` that unit's map;
+  `map=map_of('<unit>')` does the same as the second (the user wanted
+  both).
 
 **Zones and hooks (decided).** Zone names are unique across the whole
 match (the user revised an earlier "per map" answer): a zone lives on one
@@ -215,7 +217,10 @@ share. An even distribution per map is a loop over the maps.
     fills missing ones: map-var-name rules and a default map vars rule.
   - Gamerules themselves are never overridden per map. A rule that would
     need to differ between maps becomes a map var named by a rule.
-  - Formulas read map vars with `map_var(...)` (context map by default).
+  - Formulas read and write map vars with `map_var_get` / `map_var_set`
+    / `map_var_del` (plus `map_var_keys` / `map_var_has`), each taking
+    an optional `map=` (context map by default), mirroring
+    `match_var_*`; `maps()` lists the map names (decided).
   - **Map-var-name rules (decided).** Each rule names a map var, and
     changing the rule renames that var on every map. When a map lacks
     the var, the existing rule in the last column supplies the value,
@@ -309,10 +314,10 @@ share. An even distribution per map is a loop over the maps.
    map-var-name rules, `default_map_vars`, command map resolution with
    strictness and fan-out, `!map use`, board following, cross-map `!ent
    tp` / `map=` on placements, `!find` / `!foreach` / `!dist` across maps,
-   map-name completion (scenarios 782-793). **2b** formulas (`map=`,
+   map-name completion (scenarios 782-793). **2b (built)** formulas (`map=`,
    `view`, `[x, y, map]` coordinates, scatter, the hook map and
    `tile_map` / `zone_map`, `map_of`, `entity[x].map`, map var functions,
-   `move_entity` with a map). **2c** channels and boards, unseen and hidden
+   `move_entity` with a map; scenarios 831-836). **2c** channels and boards, unseen and hidden
    maps, two-sided wording, counts, roster grouping, completion filtering.
    **2d** `transfer_entity` and `!match link`.
 
@@ -325,6 +330,16 @@ share. An even distribution per map is a loop over the maps.
      refused whole (the host rearranges the parts or picks another cell);
    - a board whose actor was removed stays on the actor's last map (a
      cross-map move updates the record).
+
+   Built in 2b, not yet confirmed with the user:
+   - a summon with no `map=` places on the hook's map, else `self`'s map
+     (tier 2), else the only map; the unit-less queries still refuse
+     without a map;
+   - outside a hook on a match with several maps there is no "formula's
+     own map", so every cell result of a call with `map=` is
+     `[x, y, map]`;
+   - a location target (`Coord`) carries `.map`, and is stored as
+     `[x, y, map]` only when it isn't the acting unit's map.
 
    Built in 2a, not yet confirmed with the user:
    - `map=a,b` / `map=all` fan-outs run every map even when one refuses;
