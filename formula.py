@@ -623,10 +623,18 @@ def roll_detail(rng, spec: Any) -> "Tuple[int, list]":
             parts.append(f"{'+' if sgn > 0 else '-'}{int(fm.group(2))}")
             continue
         raise FormulaError(
-            f"roll(spec): malformed term '{term}' in '{spec}' — expected "
-            f"NdM (with optional !, kh<n>, kl<n>) or a flat integer."
+            f"roll(spec): malformed term '{_echo(term)}' in '{_echo(spec)}' "
+            f"— expected NdM (with optional !, kh<n>, kl<n>) or a flat "
+            f"integer."
         )
     return total, parts
+
+
+def _echo(text: Any, limit: int = 60) -> str:
+    """User input quoted back in an error, cut short: a refusal that echoed
+    a 100,000-character argument whole became a flood of messages."""
+    text = str(text)
+    return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
 # Work caps for dice_distribution: convolution steps (outcome-table size x die
@@ -681,8 +689,9 @@ def dice_distribution(spec: Any) -> "Tuple[Dict[int, Any], Any, bool]":
         dm = _ROLL_DIE_RE.match(term)
         if dm is None:
             raise FormulaError(
-                f"malformed term '{term}' in '{spec}' — expected NdM (with "
-                f"optional !, kh<n>, kl<n>) or a flat integer.")
+                f"malformed term '{_echo(term)}' in '{_echo(spec)}' — "
+                f"expected NdM (with optional !, kh<n>, kl<n>) or a flat "
+                f"integer.")
         sgn = -1 if dm.group(1) == "-" else 1
         count = int(dm.group(2)) if dm.group(2) else 1
         sides = int(dm.group(3))

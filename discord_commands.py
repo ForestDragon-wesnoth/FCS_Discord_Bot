@@ -125,8 +125,9 @@ def _is_comment_or_blank(line: str) -> bool:
 def _command_lines(content: str, prefix: str) -> List[str]:
     """The commands of a message, one per line (blank and `#` lines
     dropped), except that the lines after a `template import` line that
-    don't start with the prefix continue it (its JSON spans lines), as in
-    the GUI."""
+    don't start with the prefix continue it (its JSON spans lines), and so
+    do those after a line with a quote still open (a multi-line body), as
+    in the GUI."""
     out: List[str] = []
     for ln in content.splitlines():
         if _is_comment_or_blank(ln):
@@ -137,6 +138,11 @@ def _command_lines(content: str, prefix: str) -> List[str]:
                              _strip_prefix(out[-1].split("\n", 1)[0], prefix),
                              re.IGNORECASE)):
             out[-1] += "\n" + s
+        elif (out and not (prefix and s.startswith(prefix))
+                and vtt_commands.quote_unclosed(out[-1])):
+            # A quoted body typed over several lines: one command, its line
+            # breaks the `\n` a body reads (indentation kept).
+            out[-1] += "\\n" + ln.rstrip()
         else:
             out.append(ln)
     return out
@@ -241,14 +247,39 @@ class DiscordCtxWrapper:
         # guild Administrator permission — see vtt_commands.ctx_is_admin.
         self.is_admin = _is_guild_admin(author)
         self.is_bot_owner = _is_bot_owner(author, mgr)
+    def _reply_cap(self) -> int:
+        """The reply_message_cap rule of this channel's match (else of the
+        server's default system)."""
+        mgr = self._mgr
+        try:
+            mid = mgr.get_active_for_channel(self.channel_key) if mgr else None
+            m = mgr.matches.get(mid) if mid else None
+            if m is not None:
+                return max(1, int(m.rules.get("reply_message_cap", 8)))
+            s = mgr.systems.get(mgr.default_system_name) if mgr else None
+            if s is not None:
+                return max(1, int(mgr.system_value(s, "reply_message_cap")))
+        except Exception:
+            pass
+        return 8
+
     async def send(self, message: str):
         # Split over-long output at line boundaries so we never trip
         # Discord's content-length cap (see _split_for_discord). Discord also
         # rejects an EMPTY / whitespace-only message (API error 50006), so a
         # handler whose output happened to be empty must not crash the send.
-        for chunk in _split_for_discord(message):
-            if chunk.strip():
-                await self._ctx.send(chunk)
+        # One reply takes at most reply_message_cap messages: the server's
+        # command lock is held while they go out.
+        chunks = [c for c in _split_for_discord(message) if c.strip()]
+        cap = self._reply_cap()
+        if len(chunks) > cap:
+            cut = sum(len(c) for c in chunks[cap:])
+            chunks = chunks[:cap] + [
+                f"✂️ … {cut} more characters left out (reply_message_cap "
+                f"{cap}): narrow the command (a viewport, a page, fewer "
+                f"dice)."]
+        for chunk in chunks:
+            await self._ctx.send(chunk)
 
     async def set_autoupdate(self, m, on: bool) -> str:
         """Turn this channel's self-refreshing map board on/off. Posts the
@@ -382,18 +413,21 @@ def _shown_cmd(name: str, args: list) -> str:
     return cmd if len(cmd) <= 1500 else cmd[:1499] + "…"
 
 
-class _InteractionCtx:
+class _InteractionCtx(DiscordCtxWrapper):
     """ReplyContext built from a button-click interaction, so an approved
     command runs with the CLICKER's identity (a host) against the
-    interaction's channel."""
-    cli_mutable = False
-    supports_color = True
-    viewport_capable = True
-    numeric_user_ids = True
+    interaction's channel. It is the typed commands' adapter on the
+    interaction's channel, so a command run from Approve / Resume keeps the
+    Discord surface: image maps, auto-update boards, the message limit,
+    approval and resume prompts."""
 
     def __init__(self, interaction, mgr=None):
         guild = getattr(interaction, "guild", None)
         gid = getattr(guild, "id", "DM")
+        self._mgr = mgr
+        # channel.send takes what a command context's send takes (content,
+        # file=, view=), so the wrapper's hooks post through it.
+        self._ctx = interaction.channel
         self.channel_key = f"{gid}:{interaction.channel_id}"
         user = interaction.user
         self.is_admin = _is_guild_admin(user)
@@ -404,12 +438,7 @@ class _InteractionCtx:
             or getattr(user, "name", None)
             or self.user_id
         )
-        self._channel = interaction.channel
-
-    async def send(self, message: str):
-        for chunk in _split_for_discord(message):
-            if chunk.strip():   # Discord rejects empty messages (see above)
-                await self._channel.send(chunk)
+        self.cli_mutable = False
 
 
 class _ApprovalView(discord.ui.View):
@@ -928,6 +957,9 @@ class _BoardView(discord.ui.View):
             pass
 
     async def _pan(self, interaction, dx: int, dy: int):
+        # Acknowledge first: Discord fails a click not answered within 3 s,
+        # and the pan below waits for the command running on the server.
+        await self._ack(interaction)
         m = await self._usable_match(interaction)
         if m is None:
             return
@@ -1154,7 +1186,8 @@ def wire_commands(bot: commands.Bot, workspaces: Workspaces):
             mid = mgr.get_active_for_channel(f"{guild.id}:{ctx.channel.id}") \
                 if mgr is not None else None
             m = mgr.matches.get(mid) if mid else None
-            if name and m is not None and name in m.aliases:
+            if name and m is not None and (name in m.aliases
+                                           or name.lower() in m.aliases):
                 await _dispatch(ctx, name)
             return
         # Keep discord.py's default reporting for everything else.

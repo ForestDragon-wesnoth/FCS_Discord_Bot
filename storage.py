@@ -54,7 +54,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from logic import (GameSystem, is_file_id, Match, MatchManager,
                    RULE_CEILINGS, VTTError, Workspaces, check_template,
                    check_template_name, unreachable_id)
-from match_history import MatchHistory
+from match_history import MatchHistory, HistoryError
+from journal import start_header
 
 MB = 1024 * 1024
 DEFAULT_SERVER_LIMIT_MB = 1000
@@ -642,6 +643,11 @@ class Storage:
             raw = self._read_json(ipath)
             m.history = MatchHistory.from_index(
                 raw, lambda seq, k=key, mid=m.id: self._snap_file(k, mid, seq))
+            gone = [s.sequence for s in m.history.all_snapshots()
+                    if not os.path.exists(s.path)]
+            if gone:
+                m.history.discard(gone)
+                self._lost_note(key, m.id, gone)
         except Exception as ex:  # noqa: BLE001
             m.history = MatchHistory()
             dest_dir = os.path.join(self.server_dir(key), "corrupt")
@@ -736,12 +742,22 @@ class Storage:
             after["hist"][mid] = (h._seq, h._turn_index)
             old_seqs = w["seqs"].get(mid, set())
             if self._persists_history(m):
+                # A snapshot whose state is lost (a missing or unreadable
+                # file) leaves the history: planning its file would fail
+                # every commit of the server.
+                lost = []
+                for s in h.all_snapshots():
+                    if s.sequence not in old_seqs:
+                        try:
+                            plan[self._snap_file(key, mid, s.sequence)] = \
+                                self._snap_text(s)
+                        except HistoryError:
+                            lost.append(s.sequence)
+                if lost:
+                    h.discard(lost)
+                    self._lost_note(key, mid, lost)
                 snaps = h.all_snapshots()
                 seqs = {s.sequence for s in snaps}
-                for s in snaps:
-                    if s.sequence not in old_seqs:
-                        plan[self._snap_file(key, mid, s.sequence)] = \
-                            self._snap_text(s)
                 for seq in old_seqs - seqs:
                     plan[self._snap_file(key, mid, seq)] = None
                 itext = _dump(h.index())
@@ -754,13 +770,17 @@ class Storage:
                 # persist_undo_history was switched off: drop the files, after
                 # reading back the states they hold (a persisted snapshot
                 # keeps only its path in memory).
+                lost = []
                 for s in h.all_snapshots():
                     if s.path is not None:
                         try:
                             s.state
-                        except Exception:
-                            pass        # unreadable: it stays unusable
+                        except HistoryError:
+                            lost.append(s.sequence)
                         s.path = None
+                if lost:
+                    h.discard(lost)
+                    self._lost_note(key, mid, lost)
                 plan[self._history_dir(key, mid)] = None
                 after["index"].pop(mid, None)
                 after["seqs"].pop(mid, None)
@@ -771,6 +791,12 @@ class Storage:
                 for d in ("matches", "index", "seqs", "hist"):
                     after[d].pop(mid, None)
         return plan, after
+
+    @staticmethod
+    def _lost_note(key: str, mid: str, seqs: List[int]) -> None:
+        print(f"⚠️ [{key}] undo snapshot(s) {', '.join(map(str, sorted(seqs)))} "
+              f"of `{mid}` couldn't be read from disk; dropped from its "
+              f"undo history.")
 
     @staticmethod
     def _snap_text(s) -> str:
@@ -803,7 +829,10 @@ class Storage:
                 path = self._snap_file(mgr.guild_key, mid, s.sequence)
                 size = _file_size(path)
                 if not size:
-                    size = len(self._snap_text(s).encode("utf-8"))
+                    try:
+                        size = len(self._snap_text(s).encode("utf-8"))
+                    except HistoryError:
+                        continue    # lost: _plan drops it
                 out.append((s.timestamp, mid, s.sequence, size))
         out.sort(key=lambda t: (t[0], t[2]))
         return out
@@ -824,16 +853,25 @@ class Storage:
             self._maybe_purge_trash()
             return msgs
         # The command journals grow after the commit (write_journals): their
-        # growth counts toward the limit too.
-        delta = self._plan_delta(plan) + self._journal_pending(mgr)
-        refusal = self._over_limit(key, delta)
+        # growth counts toward the limit too, but only write_journals adds it
+        # to the usage counter (as it subtracts a dropped segment's files when
+        # it deletes them), so the counter follows the disk.
+        fdelta = self._plan_delta(plan)
+        jfreed = 0      # bytes on disk of journal segments dropped for room
+
+        def need() -> int:
+            return fdelta + self._journal_pending(mgr) - jfreed
+        refusal = self._over_limit(key, need())
+        kept_segments = {mid: list(m.journal.segments)
+                         for mid, m in mgr.matches.items() if m.journal}
         if refusal:
             # Old template versions go first, then the older segment of each
-            # match's journal, then the oldest autosaves
-            # (storage_trim_autosaves), if that makes room; otherwise undo
-            # the command.
+            # match's journal (a journal with one segment rolls over: a new
+            # segment from the state now, the old one dropped), then the
+            # oldest autosaves (storage_trim_autosaves), if that makes room;
+            # otherwise undo the command.
             tcut = 0
-            while self._over_limit(key, delta) is not None:
+            while self._over_limit(key, need()) is not None:
                 n, _freed = self._cut_template_trash(key, 1)
                 if not n:
                     break
@@ -843,50 +881,54 @@ class Storage:
                             f"template version(s) to make room.")
             jcut = 0
             for mid in sorted(mgr.matches):
-                if self._over_limit(key, delta) is None:
+                if self._over_limit(key, need()) is None:
                     break
-                j = mgr.matches[mid].journal
-                while j is not None and len(j.segments) > 1 \
-                        and self._over_limit(key, delta) is not None:
+                m = mgr.matches[mid]
+                j = m.journal
+                if j is None:
+                    continue
+                jdir = self._journal_dir(key, mid)
+                if len(j.segments) == 1 and j.segments[0]["entries"]:
+                    j.start_segment(start_header(mgr, m, "room"))
+                while len(j.segments) > 1 \
+                        and self._over_limit(key, need()) is not None:
                     seg = j.segments.pop(0)
-                    jdir = self._journal_dir(key, mid)
-                    delta -= sum(_file_size(os.path.join(jdir, f"{seg['no']}.{x}"))
-                                 for x in ("json", "jsonl"))
-                    delta -= self._segment_pending(key, mid, seg)
+                    jfreed += sum(
+                        _file_size(os.path.join(jdir, f"{seg['no']}.{x}"))
+                        for x in ("json", "jsonl"))
                     jcut += 1
             if jcut:
                 msgs.append(f"🗄️ Storage limit: dropped {jcut} older command "
                             f"journal segment(s) to make room.")
-            refusal = self._over_limit(key, delta)
+            refusal = self._over_limit(key, need())
         if refusal:
             cut: Dict[str, List[int]] = {}
             freed = 0
             for _ts, mid, seq, size in self._trim_candidates(mgr):
-                if self._over_limit(key, delta - freed) is None:
+                if self._over_limit(key, need() - freed) is None:
                     break
                 cut.setdefault(mid, []).append(seq)
                 freed += size
-            if cut and self._over_limit(key, delta - freed) is None:
+            if cut and self._over_limit(key, need() - freed) is None:
                 for mid, seqs in cut.items():
                     mgr.matches[mid].history.drop_sequences(seqs)
                 n = sum(len(v) for v in cut.values())
                 msgs.append(f"🗄️ Storage limit: cut the {n} oldest undo "
                             f"autosave(s) to make room.")
                 plan, after = self._plan(mgr, w)
-                delta = self._plan_delta(plan) + self._journal_pending(mgr)
-                refusal = self._over_limit(key, delta)
+                fdelta = self._plan_delta(plan)
+                refusal = self._over_limit(key, need())
             if refusal:
+                # The journals go back to what is on disk too.
+                for mid, segs in kept_segments.items():
+                    if mid in mgr.matches and mgr.matches[mid].journal:
+                        mgr.matches[mid].journal.segments = segs
                 self.rollback(mgr)
                 self.last_changed[key] = set()
                 return [refusal + " The command was undone."]
-        for path, text in plan.items():
-            if text is None:
-                _remove_path(path)
-        for path, text in plan.items():
-            if text is not None:
-                _write_text(path, text)
+        self._apply_plan(plan)
         self._written[key] = after
-        self._add_usage(key, delta)
+        self._add_usage(key, fdelta)
         self._trim_before[key] = {
             mid: bool(m.rules.get("storage_trim_autosaves", True))
             for mid, m in mgr.matches.items()}
@@ -898,6 +940,19 @@ class Storage:
                     s.release_state()
         self._maybe_purge_trash()
         return msgs
+
+    @staticmethod
+    def _apply_plan(plan: Dict[str, Optional[str]]) -> None:
+        """Write the new files (history index last), then delete the old:
+        a stop in between leaves extra files, never an index naming
+        snapshot files that are gone."""
+        writes = [(p, t) for p, t in plan.items() if t is not None]
+        writes.sort(key=lambda pt: os.path.basename(pt[0]) == "index.json")
+        for path, text in writes:
+            _write_text(path, text)
+        for path, text in plan.items():
+            if text is None:
+                _remove_path(path)
 
     def rollback(self, mgr: MatchManager) -> None:
         """Put server `mgr` back to what is on disk (the state after the last
@@ -1080,15 +1135,17 @@ class Storage:
         if not self.persist:
             return
         for _key, mgr in workspaces.items():
-            w = self._written.setdefault(mgr.guild_key, self._blank_written())
-            plan, after = self._plan(mgr, w)
-            for path, text in plan.items():
-                if text is None:
-                    _remove_path(path)
-                else:
-                    _write_text(path, text)
-            self._written[mgr.guild_key] = after
-            self.write_journals(mgr)
+            # One server failing must not keep the others from saving.
+            try:
+                w = self._written.setdefault(mgr.guild_key,
+                                             self._blank_written())
+                plan, after = self._plan(mgr, w)
+                self._apply_plan(plan)
+                self._written[mgr.guild_key] = after
+                self.write_journals(mgr)
+            except Exception as ex:  # noqa: BLE001
+                print(f"⚠️ [{mgr.guild_key}] saving to disk at shutdown "
+                      f"failed: {ex!r}")
 
     def forget(self, key: str) -> None:
         """Treat server `key` as having nothing on disk (after its files were

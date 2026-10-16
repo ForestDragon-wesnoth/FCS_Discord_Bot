@@ -26995,3 +26995,41 @@ the chain; the next command that changes the match (`!ent hp`) does, for
 another 3 passes. With undo snapshots held in memory they carry the
 match's rules, and a player's `!history diff` shows the secret
 `random_seed` as `(hidden)`; a host sees it.
+
+SCENARIO 861 — Capitalised command names; undo keeps working when the journal's one segment fills the storage limit
+------------------------------------------------------------------------------------------------------------------
+
+!match new c861 C 40 40
+!match use c861
+!Ent add u U 1000 1 1
+?? Added `U` with id `u`
+!ROLL 1d1
+?? 1
+!alias def hit "ent hp u -1"
+!Hit
+!assert "entity[u].hp == 999"
+!tile fill 1 1 40 40 terrain "grass with a long description that makes every tile hold some text"
+!owner limit local 0.8
+!ent hp u -1
+!undo command
+!ent hp u -1
+!undo command
+!ent hp u -1
+!undo command
+!ent hp u -1
+!undo command
+?? Undid 1 command(s)
+!ent hp u -1
+!undo command
+?? Undid 1 command(s)
+!assert "entity[u].hp == 999"
+!owner limit local 1000
+
+Expected: A command or alias typed with capitals (`!Ent`, `!ROLL`,
+`!Hit`) runs as the lower-case one (on Discord too, where discord.py
+used to ignore it). With the server limited to 0.8 MB, each undo
+stores the whole match in the command journal, whose one segment fills
+the room: the commit rolls that segment over (a new one starting from
+the state now, the old one dropped) before it would cut undo
+autosaves, so `!undo command` keeps working cycle after cycle and hp
+ends at 999.

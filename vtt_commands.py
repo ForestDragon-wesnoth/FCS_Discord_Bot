@@ -461,7 +461,8 @@ class CommandRegistry:
         # refused could lock `!alias`, `!match` and `!undo` away).
         if name.lower() in self._handlers:
             return name, args
-        expansion = mgr.matches[mid].aliases.get(name)
+        aliases = mgr.matches[mid].aliases
+        expansion = aliases.get(name) or aliases.get(name.lower())
         if not expansion:
             return name, args
         try:
@@ -781,6 +782,10 @@ class CommandRegistry:
         # that one reverted both), and a `!batch` stopped being one unit.
         # A run nested in this task (an approval, `!again`, a held command)
         # already holds the lock.
+        # Command names are lower case; a keyboard that capitalises the first
+        # word (`!Ent`) still names the command.
+        if name not in self._handlers and name.lower() in self._handlers:
+            name = name.lower()
         if _HOLDS_COMMAND_LOCK.get():
             return await self._run_top(name, args, ctx, mgr)
         async with _command_lock(mgr):
@@ -4258,6 +4263,16 @@ def _straight_quotes(text: str) -> str:
 
 _IMPORT_HEAD = re.compile(r"!?\s*template\s+import\s+\S+\s*(.*)\Z",
                           re.I | re.S)
+
+
+def quote_unclosed(line: str) -> bool:
+    """Whether `line` leaves a quote open: a quoted body typed over several
+    lines (Shift+Enter on Discord or in the GUI) continues on the next."""
+    try:
+        split_command_line(line)
+    except ValueError as ex:
+        return "closing quotation" in str(ex)
+    return False
 
 
 def import_unfinished(line: str) -> bool:

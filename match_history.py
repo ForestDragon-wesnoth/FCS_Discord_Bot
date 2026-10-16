@@ -498,6 +498,16 @@ class MatchHistory:
         self.command_saves = [s for s in self.command_saves
                               if s.sequence not in seqs]
 
+    def discard(self, seqs) -> None:
+        """Remove every snapshot with these sequence numbers, manual saves
+        included (storage dropping snapshots whose state is lost: a
+        missing or unreadable file)."""
+        seqs = set(seqs)
+        self.drop_sequences(seqs)
+        for name in [n for n, s in self.manual_saves.items()
+                     if s.sequence in seqs]:
+            del self.manual_saves[name]
+
     def index(self) -> Dict[str, Any]:
         """The history's shape without any state: what storage writes to
         the history index file (each snapshot's state is its own file)."""

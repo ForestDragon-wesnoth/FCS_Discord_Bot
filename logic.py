@@ -2889,6 +2889,16 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "exact n instead."
         ),
     },
+    "reply_message_cap": {
+        "default": 8,
+        "schema": {"type": "int", "min": 1, "max": 50, "ceiling": True},
+        "desc": (
+            "Discord: the most messages one reply may take. A longer reply "
+            "(a huge `!roll`, `!map` on a large map with the viewport off) "
+            "stops there with a note of how much was cut, so one command "
+            "can't flood the channel while the server waits on it."
+        ),
+    },
     # Auto-legend: a glyph->meaning key appended under the map. Seeds a new
     # match's per-match toggle (flip live with `!map legend on|off`); a
     # one-off `!map legend` / `!map nolegend` arg overrides per render.
