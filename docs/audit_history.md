@@ -2220,3 +2220,45 @@ replay differential 867/867 journals, memory-equals-disk 868 checks.
     budget), I2 (saves overwrite policy), compact journal state entries
     (J2 follow-up), watcher chains firing after read commands (L7), and
     whether `true` / `false` should parse in formulas (M4).
+
+## Pass 44
+
+Second findings report from the separate read-only LLM pass (document 2:
+passes 12-23 on `0fca008` and the earlier fix branch: Discord adapter, image
+rendering, replay authority, storage, the suite as a detector, least-audited
+libraries, recursion budgets, the multi-map build and nested maps, bodies
+across maps). Every finding was reproduced on current main before fixing;
+scenarios 852-861 cover the command-reachable ones. Verified after:
+861/861, replay differential 917/917 journals, usage drift 0 of 861
+scenarios, 80 random image renders pixel-identical to the old renderer.
+  - **Bodies and maps (K4, K5, U7, L13, F19, F18, U6, L12):** part loops
+    (a frozen bot on a cross-map teleport), swaps overlapping, map carriers
+    and segments / riders made parts, glued parts moving alone, deleting a
+    map under every other map's carrier, wreck records of deleted maps,
+    ejection into walls, boards following unseen maps.
+  - **Authority and visibility (J10, G4, G5, V3, V4, B3, W4):** replays ran
+    with the replayer's authority; player-written macros and action bodies
+    ran ungated; links trusted a reused id; hidden map names and hidden
+    units through `!action` / `!ent`; aliases taking command names; old ids
+    a later binding took failing to load.
+  - **Actions, hooks, formulas (X7/X3+, X6, C2, X1+, L8-L11, Q1, J8+):** a
+    nested transfer surviving the outer action's failure, move hooks
+    recursing to Python's limit (`move_hook_recursion_limit`), `var_move`
+    onto itself, list-building budgets, teams stored as text, clamp formula
+    bounds, overwrite placement, smart quotes in batches, corpses vs
+    place_random / resize, a stopped watcher chain running on reads, the
+    25-map board limit, scenarios 121 / 247 testing nothing, the secret
+    seed in a player's diff.
+  - **Storage, Discord, rendering (W1, W3, J2+, D5-D9, E1-E4):** one lost
+    snapshot file stopping a server's saves, the usage counter counting
+    journals twice, undo lost once a lone journal segment filled the limit,
+    capitalised commands ignored, button-run commands losing the Discord
+    surface, reply floods (`reply_message_cap`), multi-line quoted bodies
+    split, pan clicks acknowledged late, whole-body image renders (1.5 GB
+    for a 200x200 unit), quadratic legend shortening, stale sprites, narrow
+    legends.
+  - Already fixed before the report reached main: J11, J12, J13, D3++.
+  - Deferred to the CPU work budget (§8): X4+, X5.
+  - Left as questions for the user: W2 (a `systems.json` that fails to load
+    moves every match to `default`), `on_map_vehicle_moved` for maps nested
+    deeper than one level (L12).
