@@ -49,12 +49,13 @@ import os
 import shutil
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from logic import (GameSystem, is_file_id, Match, MatchManager,
                    RULE_CEILINGS, VTTError, Workspaces, check_template,
-                   check_template_name)
-from match_history import MatchHistory
+                   check_template_name, owner_limit, unreachable_id)
+from match_history import MatchHistory, HistoryError
+from journal import start_header
 
 MB = 1024 * 1024
 DEFAULT_SERVER_LIMIT_MB = 1000
@@ -77,6 +78,16 @@ def _dump(obj: Any) -> str:
 
 # Server-wide lists kept beside systems.json: `_written` key -> (file name,
 # MatchManager attribute).
+# The key of a match file holding a copy of its system chain
+# (system_load_failure = match_backup).
+SYSTEM_BACKUP_KEY = "system_backup"
+
+# The server files a copy is taken of each time they change (backups/,
+# `!server backups`): what a server can't be rebuilt without.
+BACKUP_DIR = "backups"
+BACKED_UP_FILES = ("systems.json", "workspace.json", "system_history.json",
+                   "audit.json")
+
 SERVER_LOGS: Dict[str, Tuple[str, str]] = {
     "syshist": ("system_history.json", "system_history"),
     "audit": ("audit.json", "audit_log"),
@@ -352,7 +363,7 @@ class Storage:
                 continue
             fpath = os.path.join(tdir, fname)
             try:
-                name = check_template_name(fname[:-5])
+                name = check_template_name(fname[:-5], legacy=True)
                 if name != fname[:-5]:
                     raise ValueError("file name isn't a template name")
                 data, _ = check_template(self._read_json(fpath), name)
@@ -435,7 +446,8 @@ class Storage:
             out["templates"] = _dir_size(tdir) - trash
             out["old template versions"] = trash
         for sub, label in (("saves", "saves"), ("sprites", "sprites"),
-                           ("corrupt", "corrupt files")):
+                           ("corrupt", "corrupt files"),
+                           (BACKUP_DIR, "server file backups")):
             out[label] = _dir_size(os.path.join(sdir, sub))
         out["workspace and systems"] = sum(
             _file_size(os.path.join(sdir, f))
@@ -543,6 +555,8 @@ class Storage:
         # Systems.
         systems = {"default": GameSystem("default", settings={})}
         sys_path = os.path.join(sdir, "systems.json")
+        sys_failed: Optional[str] = None
+        mgr.recovery = None
         if os.path.exists(sys_path):
             try:
                 raw = self._read_json(sys_path)
@@ -551,7 +565,8 @@ class Storage:
                     raise ValueError("no systems")
                 systems = loaded
             except Exception as ex:  # noqa: BLE001 - any bad file is quarantined
-                notes.append(self._quarantine(key, sys_path, type(ex).__name__))
+                sys_failed = type(ex).__name__
+                notes.append(self._quarantine(key, sys_path, sys_failed))
         mgr.systems = systems
         for note in mgr.check_system_links():
             notes.append(f"{key}: {note}")
@@ -560,10 +575,15 @@ class Storage:
         mgr.default_system_name = "default" if "default" in systems \
             else sorted(systems)[0]
         mgr.default_system_per_channel = {}
+        pointers: Dict[str, Any] = {}
         ws_path = os.path.join(sdir, "workspace.json")
         if os.path.exists(ws_path):
             try:
                 raw = self._read_json(ws_path)
+                pointers = {
+                    "default": raw.get("default_system_name"),
+                    "channels": dict(raw.get("default_system_per_channel")
+                                     or {})}
                 mgr.active_by_channel = {str(k): str(v) for k, v in
                                          (raw.get("active_by_channel") or {}).items()}
                 d = raw.get("default_system_name")
@@ -577,6 +597,7 @@ class Storage:
                 notes.append(self._quarantine(key, ws_path, type(ex).__name__))
         # Matches.
         mgr.matches = {}
+        backups: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         mdir = os.path.join(sdir, "matches")
         if os.path.isdir(mdir):
             for fname in sorted(os.listdir(mdir)):
@@ -585,7 +606,9 @@ class Storage:
                 mid = fname[:-5]
                 fpath = os.path.join(mdir, fname)
                 try:
-                    m = self._load_match(mgr, mid, fpath)
+                    m, backup = self._load_match(mgr, mid, fpath)
+                    if isinstance(backup, dict):
+                        backups[mid] = (os.path.getmtime(fpath), backup)
                 except Exception as ex:  # noqa: BLE001
                     notes.append(self._quarantine(key, fpath, type(ex).__name__))
                     continue
@@ -613,20 +636,115 @@ class Storage:
                     notes.append(self._quarantine(key, path,
                                                   type(ex).__name__))
         notes.extend(self.load_templates(mgr))
+        lost = any(m.system_name not in mgr.systems
+                   for m in mgr.matches.values())
+        notes.extend(self._settle_lost_systems(mgr, backups, sys_failed,
+                                               pointers))
         self._remember(mgr, w)
+        if sys_failed or lost:
+            # systems.json on disk isn't what the server holds: the next
+            # commit (once any lock is lifted) writes it and the workspace.
+            w["systems"] = None
+            w["workspace"] = None
         return notes
 
-    def _load_match(self, mgr: MatchManager, mid: str, path: str) -> Match:
+    def _settle_lost_systems(self, mgr: MatchManager,
+                             backups: Dict[str, Tuple[float, Dict[str, Any]]],
+                             sys_failed: Optional[str],
+                             pointers: Dict[str, Any]) -> List[str]:
+        """Matches naming a system the server didn't load (systems.json
+        unreadable or gone): rebuild their systems from the copies their
+        files carry (system_load_failure = match_backup), or, when any of
+        them has none, lock the server until an administrator recovers it
+        (`!server recover`; MatchManager.recovery)."""
+        key = mgr.guild_key
+        lost = {mid: m.system_name for mid, m in mgr.matches.items()
+                if m.system_name not in mgr.systems}
+        if not lost:
+            return []
+        sys_path = os.path.join(self.server_dir(key), "systems.json")
+        why = (f"systems.json failed to load ({sys_failed})" if sys_failed
+               else "systems.json is missing (a failed load moves it to "
+                    "corrupt/)" if not os.path.exists(sys_path)
+               else "systems.json doesn't hold every system the matches use")
+        covered = {mid: backups[mid][1] for mid in lost
+                   if mid in backups and lost[mid] in backups[mid][1]}
+        uncovered = {mid: name for mid, name in lost.items()
+                     if mid not in covered}
+        if uncovered:
+            mgr.recovery = {"reason": why, "uncovered": uncovered,
+                            "covered": {mid: lost[mid] for mid in covered},
+                            "backups": {mid: backups[mid] for mid in covered},
+                            "pointers": pointers}
+            return [f"🔒 [{key}] {why}: match(es) "
+                    + ", ".join(f"{mid} ({n})" for mid, n in
+                                sorted(uncovered.items()))
+                    + " lost their system and carry no backup of it. The "
+                    "server is locked (nothing runs or is saved) until an "
+                    "administrator runs `!server recover`."]
+        return self.rebuild_from_match_backups(
+            mgr, {mid: backups[mid] for mid in covered}, pointers, why)
+
+    @staticmethod
+    def rebuild_from_match_backups(
+            mgr: MatchManager,
+            backups: Dict[str, Tuple[float, Dict[str, Any]]],
+            pointers: Dict[str, Any], why: str) -> List[str]:
+        """Add the systems the matches' backups hold that the server lacks
+        (the newest file's copy wins a name two backups hold), point the
+        default pointers back where they were, and re-apply rules to those
+        matches. Returns notes."""
+        key = mgr.guild_key
+        found: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        for _mid, (mtime, chain) in backups.items():
+            for name, d in chain.items():
+                if name not in found or mtime > found[name][0]:
+                    found[name] = (mtime, d)
+        added = []
+        for name in sorted(found):
+            if name not in mgr.systems:
+                mgr.systems[name] = GameSystem.from_dict(found[name][1])
+                added.append(name)
+        notes = [f"♻️ [{key}] {why}: rebuilt system(s) "
+                 + ", ".join(added) + " from the copies the match files "
+                 "carry. Systems no match used are gone; a dated copy of "
+                 "systems.json may still hold them (`!server backups`)."]
+        notes += [f"{key}: {n}" for n in mgr.check_system_links()]
+        d = pointers.get("default")
+        if d in mgr.systems:
+            mgr.default_system_name = d
+        mgr.default_system_per_channel = {
+            str(ch): str(n) for ch, n in (pointers.get("channels")
+                                          or {}).items() if n in mgr.systems}
+        for mid in sorted(backups):
+            m = mgr.matches.get(mid)
+            if m is not None and m.system_name in mgr.systems:
+                notes += [f"[storage] {key}/{mid}: {n}"
+                          for n in mgr.apply_system_rules(m)]
+        return notes
+
+    def _load_match(self, mgr: MatchManager, mid: str, path: str
+                    ) -> Tuple[Match, Any]:
         if not valid_id(mid):
             raise ValueError("bad match id")
-        m = Match.from_dict(self._read_json(path))
+        raw = self._read_json(path)
+        backup = raw.pop(SYSTEM_BACKUP_KEY, None) if isinstance(raw, dict) \
+            else None
+        m = Match.from_dict(raw)
         if m.id != mid:
             raise ValueError("id doesn't match the file name")
-        if m.system_name not in mgr.systems:
-            m.system_name = mgr.default_system_name
-        for note in mgr.apply_system_rules(m):
-            print(f"[storage] {mgr.guild_key}/{m.id}: {note}")
-        return m
+        for eid in sorted(e for e in m.entities if unreachable_id(e)):
+            print(f"[storage] {mgr.guild_key}/{m.id}: unit `{eid}` has an id "
+                  f"a formula reads as a binding or keyword; reach it with "
+                  f"entity['{eid}'] (new units can't take the id).")
+        # A match whose system wasn't loaded keeps its name and units as
+        # they are: _settle_lost_systems rebuilds the system or locks the
+        # server (renaming its vars to another system's names would be
+        # saved over the good file).
+        if m.system_name in mgr.systems:
+            for note in mgr.apply_system_rules(m):
+                print(f"[storage] {mgr.guild_key}/{m.id}: {note}")
+        return m, backup
 
     def _load_history(self, mgr: MatchManager, m: Match) -> Optional[str]:
         key = mgr.guild_key
@@ -638,6 +756,11 @@ class Storage:
             raw = self._read_json(ipath)
             m.history = MatchHistory.from_index(
                 raw, lambda seq, k=key, mid=m.id: self._snap_file(k, mid, seq))
+            gone = [s.sequence for s in m.history.all_snapshots()
+                    if not os.path.exists(s.path)]
+            if gone:
+                m.history.discard(gone)
+                self._lost_note(key, m.id, gone)
         except Exception as ex:  # noqa: BLE001
             m.history = MatchHistory()
             dest_dir = os.path.join(self.server_dir(key), "corrupt")
@@ -678,7 +801,7 @@ class Storage:
         w["systems"] = _dump(self._systems_dict(mgr))
         for k, (_f, attr) in SERVER_LOGS.items():
             w[k] = _dump(getattr(mgr, attr))
-        w["matches"] = {mid: _dump(_disk_state(m.to_dict(include_history=False)))
+        w["matches"] = {mid: self._match_text(mgr, m)
                         for mid, m in mgr.matches.items()}
         w["index"] = {}
         w["seqs"] = {}
@@ -723,8 +846,14 @@ class Storage:
         if text != w["systems"]:
             plan[os.path.join(sdir, "systems.json")] = text
             after["systems"] = text
+        # A dated copy of each critical file the commit changes.
+        if owner_limit("server_backup_days") > 0:
+            for fname in BACKED_UP_FILES:
+                text = plan.get(os.path.join(sdir, fname))
+                if text is not None:
+                    plan[self._new_backup_path(key, fname)] = text
         for mid, m in mgr.matches.items():
-            text = _dump(_disk_state(m.to_dict(include_history=False)))
+            text = self._match_text(mgr, m)
             if text != w["matches"].get(mid):
                 plan[self._match_file(key, mid)] = text
                 after["matches"][mid] = text
@@ -732,12 +861,22 @@ class Storage:
             after["hist"][mid] = (h._seq, h._turn_index)
             old_seqs = w["seqs"].get(mid, set())
             if self._persists_history(m):
+                # A snapshot whose state is lost (a missing or unreadable
+                # file) leaves the history: planning its file would fail
+                # every commit of the server.
+                lost = []
+                for s in h.all_snapshots():
+                    if s.sequence not in old_seqs:
+                        try:
+                            plan[self._snap_file(key, mid, s.sequence)] = \
+                                self._snap_text(s)
+                        except HistoryError:
+                            lost.append(s.sequence)
+                if lost:
+                    h.discard(lost)
+                    self._lost_note(key, mid, lost)
                 snaps = h.all_snapshots()
                 seqs = {s.sequence for s in snaps}
-                for s in snaps:
-                    if s.sequence not in old_seqs:
-                        plan[self._snap_file(key, mid, s.sequence)] = \
-                            self._snap_text(s)
                 for seq in old_seqs - seqs:
                     plan[self._snap_file(key, mid, seq)] = None
                 itext = _dump(h.index())
@@ -750,13 +889,17 @@ class Storage:
                 # persist_undo_history was switched off: drop the files, after
                 # reading back the states they hold (a persisted snapshot
                 # keeps only its path in memory).
+                lost = []
                 for s in h.all_snapshots():
                     if s.path is not None:
                         try:
                             s.state
-                        except Exception:
-                            pass        # unreadable: it stays unusable
+                        except HistoryError:
+                            lost.append(s.sequence)
                         s.path = None
+                if lost:
+                    h.discard(lost)
+                    self._lost_note(key, mid, lost)
                 plan[self._history_dir(key, mid)] = None
                 after["index"].pop(mid, None)
                 after["seqs"].pop(mid, None)
@@ -767,6 +910,90 @@ class Storage:
                 for d in ("matches", "index", "seqs", "hist"):
                     after[d].pop(mid, None)
         return plan, after
+
+    # ---- critical-file copies (backups/) ----------------------------------
+    def backup_dir(self, key: str) -> str:
+        return os.path.join(self.server_dir(key), BACKUP_DIR)
+
+    def _new_backup_path(self, key: str, fname: str) -> str:
+        stem = fname[:-5]
+        stamp = int(time.time() * 1000)
+        while True:
+            path = os.path.join(self.backup_dir(key), f"{stem}.{stamp}.json")
+            if not os.path.exists(path):
+                return path
+            stamp += 1
+
+    def backups(self, key: str, fname: Optional[str] = None
+                ) -> List[Tuple[float, str, str]]:
+        """Server `key`'s copies of its critical files, newest first:
+        (unix time, file name, path); only `fname`'s when given."""
+        bdir = self.backup_dir(key)
+        out: List[Tuple[float, str, str]] = []
+        if not os.path.isdir(bdir):
+            return out
+        for entry in os.listdir(bdir):
+            parts = entry.split(".")
+            if len(parts) != 3 or parts[2] != "json" \
+                    or not parts[1].isdigit():
+                continue
+            name = parts[0] + ".json"
+            if name not in BACKED_UP_FILES or (fname and name != fname):
+                continue
+            out.append((int(parts[1]) / 1000.0, name,
+                        os.path.join(bdir, entry)))
+        out.sort(key=lambda t: (-t[0], t[1]))
+        return out
+
+    def prune_backups(self, key: str) -> None:
+        """Drop server `key`'s copies past server_backup_days or past
+        server_backup_count per file."""
+        days = owner_limit("server_backup_days")
+        count = owner_limit("server_backup_count")
+        now = time.time()
+        kept: Dict[str, int] = {}
+        for stamp, name, path in self.backups(key):
+            kept[name] = kept.get(name, 0) + 1
+            if kept[name] > count or now - stamp > days * 86400:
+                size = _file_size(path)
+                _remove_path(path)
+                self._add_usage(key, -size)
+
+    def _cut_backups(self, key: str, keep: Set[str]) -> int:
+        """Delete server `key`'s oldest copy (one), keeping the newest of
+        each file in `keep` (files no new copy replaces this commit).
+        Returns the bytes freed (0: nothing left to cut)."""
+        newest: Dict[str, str] = {}
+        allb = self.backups(key)
+        for _stamp, name, path in allb:
+            newest.setdefault(name, path)
+        for _stamp, name, path in reversed(allb):
+            if name in keep and newest.get(name) == path:
+                continue
+            size = _file_size(path)
+            _remove_path(path)
+            self._add_usage(key, -size)
+            return size or 1
+        return 0
+
+    @staticmethod
+    def _lost_note(key: str, mid: str, seqs: List[int]) -> None:
+        print(f"⚠️ [{key}] undo snapshot(s) {', '.join(map(str, sorted(seqs)))} "
+              f"of `{mid}` couldn't be read from disk; dropped from its "
+              f"undo history.")
+
+    @staticmethod
+    def _match_text(mgr: MatchManager, m: Match) -> str:
+        """A match's file text: its state without `rules`, plus, when its
+        system's system_load_failure rule is `match_backup`, a copy of its
+        system chain (SYSTEM_BACKUP_KEY) a load rebuilds lost systems from."""
+        d = _disk_state(m.to_dict(include_history=False))
+        sysobj = mgr.systems.get(m.system_name)
+        if sysobj is not None and str(mgr.system_value(
+                sysobj, "system_load_failure")) == "match_backup":
+            d[SYSTEM_BACKUP_KEY] = {x.name: x.to_dict()
+                                    for x in mgr.system_chain(sysobj)}
+        return _dump(d)
 
     @staticmethod
     def _snap_text(s) -> str:
@@ -799,7 +1026,10 @@ class Storage:
                 path = self._snap_file(mgr.guild_key, mid, s.sequence)
                 size = _file_size(path)
                 if not size:
-                    size = len(self._snap_text(s).encode("utf-8"))
+                    try:
+                        size = len(self._snap_text(s).encode("utf-8"))
+                    except HistoryError:
+                        continue    # lost: _plan drops it
                 out.append((s.timestamp, mid, s.sequence, size))
         out.sort(key=lambda t: (t[0], t[2]))
         return out
@@ -807,7 +1037,9 @@ class Storage:
     def commit(self, mgr: MatchManager) -> List[str]:
         """Write what changed in server `mgr` since the last commit. Returns
         lines to show the user (a trim note, or the rollback warning)."""
-        if not self.persist:
+        if not self.persist or mgr.recovery:
+            # A locked server (MatchManager.recovery) saves nothing: its
+            # files on disk are what a recovery works from.
             return []
         key = mgr.guild_key
         w = self._written.setdefault(key, self._blank_written())
@@ -820,16 +1052,25 @@ class Storage:
             self._maybe_purge_trash()
             return msgs
         # The command journals grow after the commit (write_journals): their
-        # growth counts toward the limit too.
-        delta = self._plan_delta(plan) + self._journal_pending(mgr)
-        refusal = self._over_limit(key, delta)
+        # growth counts toward the limit too, but only write_journals adds it
+        # to the usage counter (as it subtracts a dropped segment's files when
+        # it deletes them), so the counter follows the disk.
+        fdelta = self._plan_delta(plan)
+        jfreed = 0      # bytes on disk of journal segments dropped for room
+
+        def need() -> int:
+            return fdelta + self._journal_pending(mgr) - jfreed
+        refusal = self._over_limit(key, need())
+        kept_segments = {mid: list(m.journal.segments)
+                         for mid, m in mgr.matches.items() if m.journal}
         if refusal:
             # Old template versions go first, then the older segment of each
-            # match's journal, then the oldest autosaves
-            # (storage_trim_autosaves), if that makes room; otherwise undo
-            # the command.
+            # match's journal (a journal with one segment rolls over: a new
+            # segment from the state now, the old one dropped), then the
+            # oldest autosaves (storage_trim_autosaves), if that makes room;
+            # otherwise undo the command.
             tcut = 0
-            while self._over_limit(key, delta) is not None:
+            while self._over_limit(key, need()) is not None:
                 n, _freed = self._cut_template_trash(key, 1)
                 if not n:
                     break
@@ -837,52 +1078,71 @@ class Storage:
             if tcut:
                 msgs.append(f"🗄️ Storage limit: cut the {tcut} oldest old "
                             f"template version(s) to make room.")
+            # Then the oldest copies of the critical files, keeping the
+            # newest of each file this commit doesn't copy anew.
+            bdir = self.backup_dir(key)
+            renewed = {os.path.basename(p).split(".")[0] + ".json"
+                       for p in plan if os.path.dirname(p) == bdir}
+            bcut = 0
+            while self._over_limit(key, need()) is not None:
+                if not self._cut_backups(key, set(BACKED_UP_FILES) - renewed):
+                    break
+                bcut += 1
+            if bcut:
+                msgs.append(f"🗄️ Storage limit: cut the {bcut} oldest "
+                            f"server file backup(s) to make room.")
             jcut = 0
             for mid in sorted(mgr.matches):
-                if self._over_limit(key, delta) is None:
+                if self._over_limit(key, need()) is None:
                     break
-                j = mgr.matches[mid].journal
-                while j is not None and len(j.segments) > 1 \
-                        and self._over_limit(key, delta) is not None:
+                m = mgr.matches[mid]
+                j = m.journal
+                if j is None:
+                    continue
+                jdir = self._journal_dir(key, mid)
+                if len(j.segments) == 1 and j.segments[0]["entries"]:
+                    j.start_segment(start_header(mgr, m, "room"))
+                while len(j.segments) > 1 \
+                        and self._over_limit(key, need()) is not None:
                     seg = j.segments.pop(0)
-                    jdir = self._journal_dir(key, mid)
-                    delta -= sum(_file_size(os.path.join(jdir, f"{seg['no']}.{x}"))
-                                 for x in ("json", "jsonl"))
-                    delta -= self._segment_pending(key, mid, seg)
+                    jfreed += sum(
+                        _file_size(os.path.join(jdir, f"{seg['no']}.{x}"))
+                        for x in ("json", "jsonl"))
                     jcut += 1
             if jcut:
                 msgs.append(f"🗄️ Storage limit: dropped {jcut} older command "
                             f"journal segment(s) to make room.")
-            refusal = self._over_limit(key, delta)
+            refusal = self._over_limit(key, need())
         if refusal:
             cut: Dict[str, List[int]] = {}
             freed = 0
             for _ts, mid, seq, size in self._trim_candidates(mgr):
-                if self._over_limit(key, delta - freed) is None:
+                if self._over_limit(key, need() - freed) is None:
                     break
                 cut.setdefault(mid, []).append(seq)
                 freed += size
-            if cut and self._over_limit(key, delta - freed) is None:
+            if cut and self._over_limit(key, need() - freed) is None:
                 for mid, seqs in cut.items():
                     mgr.matches[mid].history.drop_sequences(seqs)
                 n = sum(len(v) for v in cut.values())
                 msgs.append(f"🗄️ Storage limit: cut the {n} oldest undo "
                             f"autosave(s) to make room.")
                 plan, after = self._plan(mgr, w)
-                delta = self._plan_delta(plan) + self._journal_pending(mgr)
-                refusal = self._over_limit(key, delta)
+                fdelta = self._plan_delta(plan)
+                refusal = self._over_limit(key, need())
             if refusal:
+                # The journals go back to what is on disk too.
+                for mid, segs in kept_segments.items():
+                    if mid in mgr.matches and mgr.matches[mid].journal:
+                        mgr.matches[mid].journal.segments = segs
                 self.rollback(mgr)
                 self.last_changed[key] = set()
                 return [refusal + " The command was undone."]
-        for path, text in plan.items():
-            if text is None:
-                _remove_path(path)
-        for path, text in plan.items():
-            if text is not None:
-                _write_text(path, text)
+        self._apply_plan(plan)
         self._written[key] = after
-        self._add_usage(key, delta)
+        self._add_usage(key, fdelta)
+        if any(os.path.dirname(p) == self.backup_dir(key) for p in plan):
+            self.prune_backups(key)
         self._trim_before[key] = {
             mid: bool(m.rules.get("storage_trim_autosaves", True))
             for mid, m in mgr.matches.items()}
@@ -894,6 +1154,19 @@ class Storage:
                     s.release_state()
         self._maybe_purge_trash()
         return msgs
+
+    @staticmethod
+    def _apply_plan(plan: Dict[str, Optional[str]]) -> None:
+        """Write the new files (history index last), then delete the old:
+        a stop in between leaves extra files, never an index naming
+        snapshot files that are gone."""
+        writes = [(p, t) for p, t in plan.items() if t is not None]
+        writes.sort(key=lambda pt: os.path.basename(pt[0]) == "index.json")
+        for path, text in writes:
+            _write_text(path, text)
+        for path, text in plan.items():
+            if text is None:
+                _remove_path(path)
 
     def rollback(self, mgr: MatchManager) -> None:
         """Put server `mgr` back to what is on disk (the state after the last
@@ -918,11 +1191,12 @@ class Storage:
             del mgr.matches[mid]
         for mid, text in w["matches"].items():
             state = json.loads(text)
+            state.pop(SYSTEM_BACKUP_KEY, None)
             m = mgr.matches.get(mid)
             if m is None:
                 m = Match.from_dict(state)
                 mgr.matches[mid] = m
-            elif _dump(_disk_state(m.to_dict(include_history=False))) != text:
+            elif self._match_text(mgr, m) != text:
                 _rollback_match(m, mgr, state)
             if m.system_name in mgr.systems:
                 mgr.apply_system_rules(m)
@@ -985,7 +1259,7 @@ class Storage:
         """Bring each match's journal files in line with its journal: a new
         segment writes its header and entries, a grown one appends its new
         entries, a dropped one is deleted."""
-        if not self.persist:
+        if not self.persist or mgr.recovery:
             return
         key = mgr.guild_key
         jw = self._jwritten.setdefault(key, {})
@@ -1076,15 +1350,20 @@ class Storage:
         if not self.persist:
             return
         for _key, mgr in workspaces.items():
-            w = self._written.setdefault(mgr.guild_key, self._blank_written())
-            plan, after = self._plan(mgr, w)
-            for path, text in plan.items():
-                if text is None:
-                    _remove_path(path)
-                else:
-                    _write_text(path, text)
-            self._written[mgr.guild_key] = after
-            self.write_journals(mgr)
+            # One server failing must not keep the others from saving; a
+            # locked one saves nothing.
+            if mgr.recovery:
+                continue
+            try:
+                w = self._written.setdefault(mgr.guild_key,
+                                             self._blank_written())
+                plan, after = self._plan(mgr, w)
+                self._apply_plan(plan)
+                self._written[mgr.guild_key] = after
+                self.write_journals(mgr)
+            except Exception as ex:  # noqa: BLE001
+                print(f"⚠️ [{mgr.guild_key}] saving to disk at shutdown "
+                      f"failed: {ex!r}")
 
     def forget(self, key: str) -> None:
         """Treat server `key` as having nothing on disk (after its files were
@@ -1116,7 +1395,12 @@ class Storage:
                     if now - stamp > TRASH_SECONDS:
                         _remove_path(os.path.join(sdir, entry))
             self._usage[TRASH_DIR] = _dir_size(root)
-        # Old template versions live in each server's templates/.trash.
+        # Old template versions live in each server's templates/.trash;
+        # critical-file copies past their days in backups/.
+        for server in os.listdir(self.root):
+            if valid_id(server) and os.path.isdir(
+                    os.path.join(self.root, server, BACKUP_DIR)):
+                self.prune_backups(server)
         for server in os.listdir(self.root):
             if valid_id(server) and os.path.isdir(
                     os.path.join(self.root, server, "templates", ".trash")):

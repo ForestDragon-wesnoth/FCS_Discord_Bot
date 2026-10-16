@@ -53,6 +53,74 @@ CROSS_MATCH_GUARD: "contextvars.ContextVar[Optional[Any]]" = (
 # (a formula with no channel refuses `view`).
 COMMAND_VIEW: "contextvars.ContextVar[Optional[Any]]" = (
     contextvars.ContextVar("vtt_command_view", default=None))
+# The team view of the running command's channel, as a function of a Match
+# (None: omniscient). Refusals that list a match's maps name only the maps
+# that view may name (Match.maps_text). None outside a command.
+COMMAND_POV: "contextvars.ContextVar[Optional[Any]]" = (
+    contextvars.ContextVar("vtt_command_pov", default=None))
+# Set while saved units are read back (a match file, an undo snapshot, a
+# save, a corpse revived): an id that names a formula binding (`target`,
+# `rider`, ...) is refused only where a unit is CREATED, so data saved
+# before a binding got its name still loads (the unit stays reachable as
+# entity['target']).
+LEGACY_IDS_OK: "contextvars.ContextVar[bool]" = (
+    contextvars.ContextVar("vtt_legacy_ids", default=False))
+# How deeply movement hooks are nested right now (a hook moving a unit fires
+# the next move's hooks inside itself; a transfer's arrival fires spawn
+# hooks in another match), and whether the limit's warning was given in
+# this chain. Context variables, so the count spans matches.
+MOVE_HOOK_DEPTH: "contextvars.ContextVar[int]" = (
+    contextvars.ContextVar("vtt_move_hook_depth", default=0))
+MOVE_HOOK_WARNED: "contextvars.ContextVar[bool]" = (
+    contextvars.ContextVar("vtt_move_hook_warned", default=False))
+
+
+def move_hook_limit(rules: Dict[str, Any]) -> int:
+    try:
+        return max(1, int(rules.get("move_hook_recursion_limit", 16)))
+    except (TypeError, ValueError):
+        return 16
+
+
+@contextlib.contextmanager
+def move_hook_level(rules: Dict[str, Any], log: List[str]):
+    """One nesting level of movement hooks: yields True to fire them, or
+    False past move_hook_recursion_limit (adding one ⚠️ per chain to
+    `log`)."""
+    depth = MOVE_HOOK_DEPTH.get()
+    if depth >= move_hook_limit(rules):
+        if not MOVE_HOOK_WARNED.get():
+            MOVE_HOOK_WARNED.set(True)
+            log.append(f"⚠️ Movement hooks nested past "
+                       f"move_hook_recursion_limit ({move_hook_limit(rules)}):"
+                       f" a hook keeps moving units; the deeper moves fired "
+                       f"no hooks.")
+        yield False
+        return
+    token = MOVE_HOOK_DEPTH.set(depth + 1)
+    warned = MOVE_HOOK_WARNED.set(False) if depth == 0 else None
+    try:
+        yield True
+    finally:
+        MOVE_HOOK_DEPTH.reset(token)
+        if warned is not None:
+            MOVE_HOOK_WARNED.reset(warned)
+
+
+def _bounded_move_hooks(fn):
+    """Decorator for the Match methods that fire movement hooks: past
+    move_hook_recursion_limit nested levels they fire nothing (one ⚠️ per
+    chain), so a hook that moves its unit again stops."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(self, *a, **k):
+        log: List[str] = []
+        with move_hook_level(self.rules, log) as ok:
+            if ok:
+                return fn(self, *a, **k)
+        return log
+    return wrapper
 
 # A line about one unit (a death, a revive) is prefixed with this tag —
 # UNIT_LINE_TAG + "<match>|<unit>|<x>|<y>|<map>" + UNIT_LINE_TAG — so the command
@@ -1581,6 +1649,21 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "single warning is logged). Mirrors var_hook_recursion_limit."
         ),
     },
+    "move_hook_recursion_limit": {
+        "default": 16,
+        "schema": {"type": "int", "min": 1, "max": 48, "ceiling": True},
+        "desc": (
+            "Max nesting depth of movement hooks: a tile / zone enter, exit "
+            "or stop hook, on_entity_step, on_entity_moved or "
+            "on_map_vehicle_moved that moves a unit fires the next move's "
+            "hooks inside itself, and a transfer_entity arrival's spawn "
+            "hooks may send the unit on (two linked matches bouncing it). "
+            "Past this depth further movement hooks don't fire (one "
+            "warning) and a transfer_entity is refused, so a hook that "
+            "moves its unit again can't recurse until the bot's stack runs "
+            "out."
+        ),
+    },
     "watcher_chain_limit": {
         "default": 16,
         "schema": {"type": "int", "min": 1, "max": 256, "ceiling": True},
@@ -1590,7 +1673,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "the checks repeat until a pass fires nothing new, so a chain "
             "settles inside the command that started it (and shares its "
             "undo step). Past the limit the rest of the chain waits for "
-            "the next command, with a warning."
+            "the next command that changes the match (a read such as "
+            "`!list` doesn't continue it), with a warning."
         ),
     },
     "macro_repeat_limit": {
@@ -2327,6 +2411,48 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Changing this rule renames the var on every map."
         ),
     },
+    "system_load_failure": {
+        "default": "hold",
+        "schema": {"type": "enum", "choices": ["hold", "match_backup"]},
+        "desc": (
+            "What happens to a match of this system if the server's "
+            "systems.json fails to load. 'hold' (default): the server is "
+            "locked (every command refused, nothing saved) until an "
+            "administrator recovers it with `!server recover` (restore a "
+            "dated copy of systems.json, `!server backups`, or accept moving "
+            "the matches to `default`). 'match_backup': the match's file also "
+            "carries a full copy of its system and the systems it inherits "
+            "from, and a load rebuilds them from it (larger match files). "
+            "The server is locked when any match on a lost system has no "
+            "backup."
+        ),
+    },
+    "map_nested_vehicle_moves_var": {
+        "default": "nested_vehicle_moves",
+        "schema": {"type": "str"},
+        "desc": (
+            "Map var holding whether on_map_vehicle_moved reaches a map "
+            "nested more than one level inside the moving unit (on / off). "
+            "A map without the var uses the nested_vehicle_moves rule. "
+            "Changing this rule renames the var on every map."
+        ),
+    },
+    "nested_vehicle_moves": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether a vehicle's move reaches the maps nested deeper inside "
+            "it: a hold carried by a box standing on the cabin map a wagon "
+            "carries. On (default): when the wagon moves, on_map_vehicle_"
+            "moved fires for the units on the cabin and on the hold too "
+            "(`map_vehicle` = the wagon, `context_map` = their map). The "
+            "maps the moving unit carries itself are always reached. Each "
+            "nested map can override it (`!map var set nested_vehicle_moves "
+            "off map=<name>`, the map var named by map_nested_vehicle_moves_"
+            "var); a map set off stops the chain, so the maps inside it "
+            "aren't reached either."
+        ),
+    },
     "unseen_map_display": {
         "default": "blank_unnamed",
         "schema": {"type": "enum",
@@ -2803,6 +2929,16 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Tiles per Discord pan-button click (0 = half the viewport — a "
             "half-screen scroll). The `!map pan <dir> [n]` command pans an "
             "exact n instead."
+        ),
+    },
+    "reply_message_cap": {
+        "default": 8,
+        "schema": {"type": "int", "min": 1, "max": 50, "ceiling": True},
+        "desc": (
+            "Discord: the most messages one reply may take. A longer reply "
+            "(a huge `!roll`, `!map` on a large map with the viewport off) "
+            "stops there with a note of how much was cut, so one command "
+            "can't flood the channel while the server waits on it."
         ),
     },
     # Auto-legend: a glyph->meaning key appended under the map. Seeds a new
@@ -3534,6 +3670,26 @@ def _coerce_vital_value(v: Any) -> Optional[int]:
     return None
 
 
+def team_text(v: Any) -> Any:
+    """A team var's value as the text the engine compares: a number or bool
+    becomes text (`1`, `1.0` and "1" are one team; True is "true"), None and
+    "" stay (no team), text stays as written. A dict or list is refused
+    (None returned). The team var is stored this way when written, so a
+    formula reading `entity[u].team` sees the same value `is_hostile`,
+    `team_members` and `team_get` use."""
+    if v is None or isinstance(v, str):
+        return v
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        if v != v or v in (float("inf"), float("-inf")):
+            return str(v)
+        return str(int(v)) if v.is_integer() else str(v)
+    return None
+
+
 def _parse_bool(token: str) -> bool:
     """Parse a boolean from a command-line token.
 
@@ -3706,6 +3862,18 @@ def _default_facing_for(
 RESERVED_IDS: Set[str] = {"current", "this", "self", "parent"}
 
 _UNREACHABLE_IDS: Optional[frozenset] = None
+
+
+def check_status_name(name: Any) -> None:
+    """Raise unless `name` can name a status: one word that a status token
+    can address (`removes`, `blocked_by`, immunity, dispel read `tag:<x>`
+    as a tag and a comma as a list)."""
+    if not isinstance(name, str) or not name or any(c.isspace() for c in name):
+        raise VTTError(f"`{name}` can't be a status name: one word, no "
+                       f"spaces.")
+    if name.startswith("tag:") or "," in name:
+        raise VTTError(f"`{name}` can't be a status name: a status token "
+                       f"reads `tag:...` as a tag and a comma as a list.")
 
 
 def unreachable_id(eid: Any) -> bool:
@@ -3911,7 +4079,8 @@ def reserved_path_meaning(seg0: str) -> str:
     """What reserved var path `seg0` reads on a unit, for messages."""
     return {"name": "display name", "map": "map"}.get(seg0, "position")
 
-def checked_unit_vars(vars_: Any, vitals: Iterable[str], where: str) -> Dict[str, Any]:
+def checked_unit_vars(vars_: Any, vitals: Iterable[str], where: str,
+                      team_var: Optional[str] = None) -> Dict[str, Any]:
     """`vars_` ready to become a whole unit's vars, held to the rules
     write_var applies one write at a time: each vital var present (hp /
     max_hp / initiative) is a whole number (a numeric string or float is
@@ -3941,6 +4110,12 @@ def checked_unit_vars(vars_: Any, vitals: Iterable[str], where: str) -> Dict[str
             raise VTTError(f"{where}: vital var '{k}' must be a finite "
                            f"whole number, got {out[k]!r}.")
         out[k] = coerced
+    if team_var and team_var in out:
+        t = team_text(out[team_var])
+        if t is None:
+            raise VTTError(f"{where}: team var '{team_var}' must be text or "
+                           f"a number, got {out[team_var]!r}.")
+        out[team_var] = t
     return out
 
 
@@ -4562,6 +4737,15 @@ class ClampSpec:
                     f"Clamp on '{self.path}' has {label}={b!r}: must be a number "
                     f"or var path string."
                 )
+            # A string bound names a var (`max_hp`, `stats.cap`); anything
+            # else (a formula, spaces) can never name one and meant "no
+            # bound" forever, from whichever route it came (a template, a
+            # transform form, a summon).
+            if isinstance(b, str) and not re.match(
+                    r"[A-Za-z_]\w*(\.\w+)*\Z", b.strip()):
+                raise VTTError(
+                    f"Clamp on '{self.path}' has {label}={b!r}: a bound is a "
+                    f"number or a var path (`max_hp`, `stats.cap`).")
         # If both bounds are numeric literals, validate min <= max at config time.
         # We can't validate when either is a path — those resolve at write time.
         if (isinstance(self.max, (int, float)) and not isinstance(self.max, bool)
@@ -5143,6 +5327,18 @@ OWNER_LIMITS: Dict[str, Dict[str, Any]] = {
         "desc": "How many entries each server's `!server audit` log keeps "
                 "(0 = no log).",
     },
+    "server_backup_days": {
+        "default": 7, "min": 0, "max": 365,
+        "desc": "How many days each server keeps the copies taken of its "
+                "critical files (systems, workspace, system undo history, "
+                "audit log) each time one changes (0 = no copies; "
+                "`!server backups`).",
+    },
+    "server_backup_count": {
+        "default": 200, "min": 1, "max": 10000,
+        "desc": "The most copies each server keeps of each critical file "
+                "(the oldest go first).",
+    },
     "map_nesting_depth": {
         "default": 4, "min": 1, "max": 32,
         "desc": "How deep maps may nest: a map a unit carries (`!map "
@@ -5560,7 +5756,7 @@ class Entity:
         # Disallow reserved ids that the CLI uses as shorthands (current/this are used if you want to get the id of the entity whose turn it is right now)
         if tested_id in RESERVED_IDS:
             raise ReservedId(f"Entity id '{tested_id}' is a special reserved id and cannot be used when creating entities. Reserved ids are used for formulas and commands, like 'this' being used to automatically get the id of the entity whose turn it is.")
-        if unreachable_id(self.id.strip()):
+        if unreachable_id(self.id.strip()) and not LEGACY_IDS_OK.get():
             raise ReservedId(
                 f"Entity id '{self.id.strip()}' names a formula binding or "
                 f"keyword, so `entity[{self.id.strip()}]` couldn't reach the "
@@ -5659,12 +5855,14 @@ class Entity:
         None or ""). A team typed through a command is stored as a number
         (`!ent set_var u team 1`) while one from a formula or a template is
         text; reading both as text keeps team "1" one team everywhere
-        (passives, POV, colours, relations, turn grouping). Formulas reading
-        `entity[u].team` still see the stored value."""
+        (passives, POV, colours, relations, turn grouping). write_var
+        stores the team var as this text (`team_text`), so formulas reading
+        `entity[u].team` see the same value."""
         v = self.vars.get(self._team_var_name())
         if v is None or v == "":
             return None
-        return str(v)
+        t = team_text(v)
+        return str(v) if t is None else t
 
     @team.setter
     def team(self, value):
@@ -5834,7 +6032,13 @@ class Entity:
         flagged `controls_movement`, returns the VEHICLE (the driver steers
         the whole rig; riders are carried via _restamp_riders_for). When
         riding a non-control slot, raises — a passenger can't move on its
-        own and must dismount first."""
+        own and must dismount first. A glued or region body part moves only
+        with its body, so it raises too."""
+        if self.is_part and not self.is_located_part:
+            root = self._match.body_root(self)
+            raise VTTError(
+                f"`{self.id}` is a body part sitting on `{root.id}`'s body: "
+                f"move `{root.id}` (or `!part locate` the part first).")
         if not self.is_mounted:
             return self
         m = self._match
@@ -5907,7 +6111,7 @@ class Entity:
             (match.rules.get("hp_var", "hp"),
              match.rules.get("max_hp_var", "max_hp"),
              match.rules.get("turnorder_var", "initiative")),
-            f"`{self.id}`")
+            f"`{self.id}`", match.rules.get("team_var", "team"))
 
         # Validate the WHOLE footprint anchored at (x, y): every covered
         # cell in bounds and unoccupied (stackable spawners skip
@@ -6401,6 +6605,17 @@ class Entity:
                         f"Vital var '{seg0}' must be a finite number, got {value!r} "
                         f"on `{self.id}`.")
                 value = coerced
+            elif seg0 == self._team_var_name():
+                if "." in path:
+                    raise VTTError(
+                        f"Cannot nest under the team var '{seg0}' (writing "
+                        f"'{path}') on `{self.id}`: a team is one name.")
+                t = team_text(value)
+                if t is None:
+                    raise VTTError(
+                        f"Team var '{seg0}' must be text or a number, got "
+                        f"{value!r} on `{self.id}`.")
+                value = t
         # A dict / list is stored as this unit's own copy. A formula can hand
         # over another unit's live object (`entity[a].inv = entity[b].inv`,
         # var_set(..., var_get(...))), which used to make both vars ONE object:
@@ -7632,6 +7847,14 @@ class Match:
     # destination opts in). Saved with the match; a deleted match leaves
     # every list.
     links: List[str] = field(default_factory=list)
+    # The identity (`uid`) each linked match had when it was linked: a link
+    # trusts that match only, never a later one under the same id (an undo
+    # or a replay brings back a link the id no longer deserves). A link
+    # saved before stamps existed has none and trusts the id.
+    link_stamps: Dict[str, str] = field(default_factory=dict)
+    # This match's own identity, made at creation (a clone gets a new one);
+    # what links stamp.
+    uid: str = field(default_factory=lambda: new_rng_seed())
 
     # Per-match host overrides for the command access gate, keyed by
     # command name or "name sub" -> level ("all"/"host"/"host_only"/
@@ -7692,6 +7915,11 @@ class Match:
     # run <name> [args...]`, which substitutes $1/$2/.../$@ and dispatches
     # each line under one undo entry. Per-match; serialized.
     macros: Dict[str, str] = field(default_factory=dict)
+    # Who last wrote each macro's body (`!macro set` / copy; the user id).
+    # A body a non-host wrote runs with every line gated as the runner,
+    # like a typed `!batch`; a host's (or one with no record) runs as
+    # written.
+    macro_authors: Dict[str, str] = field(default_factory=dict)
 
     # ---- named random tables ----
     # name -> a roll_table spec ("key:weight,..." CSV). Rolled by name via the
@@ -7893,6 +8121,15 @@ class Match:
     _death_check_deferred_ids: Set[str] = field(
         default_factory=set, repr=False, compare=False
     )
+    # Maps `delete_map` is deleting right now: a map vehicle dying on one
+    # doesn't eject its occupants onto it. Not serialized.
+    _deleting_maps: Set[str] = field(
+        default_factory=set, repr=False, compare=False
+    )
+    # fire_watchers stopped at watcher_chain_limit with watchers still
+    # firing: the rest of the chain waits for the next command that changes
+    # the match (a read doesn't continue it). Not serialized.
+    _watcher_backlog: bool = field(default=False, repr=False, compare=False)
 
     # ---- maps ------------------------------------------------------------
     def _map_for(self, mp: Optional["Map"],
@@ -7911,10 +8148,8 @@ class Match:
         if name is None:
             if len(self.maps) == 1:
                 return next(iter(self.maps.values()))
-            names = ", ".join(f"`{n}`" for n in self.maps)
-            raise VTTError(
-                f"This match has {len(self.maps)} maps ({names}): name one "
-                f"with `map=<name>`.")
+            raise VTTError(f"{self.maps_text()}: name one with "
+                           f"`map=<name>`.")
         mp = self.maps.get(name)
         if mp is None:
             raise NotFound(
@@ -8119,6 +8354,18 @@ class Match:
                                       "Unexplored map"))
         return f"`{mp.name}`"
 
+    def maps_text(self, pov: Any = ...) -> str:
+        """"This match has N maps (`a`, `b`, Unexplored map)" as team `pov`
+        may know them (the running command's channel view by default):
+        hidden maps aren't counted, unnamed ones show the unnamed label."""
+        if pov is ...:
+            fn = COMMAND_POV.get()
+            pov = fn(self) if fn is not None else None
+        listed = self.listed_maps(pov)
+        names = ", ".join(self.map_label(mp, pov) for mp in listed)
+        return (f"This match has {len(listed)} "
+                f"map{'' if len(listed) == 1 else 's'} ({names})")
+
     def map_heading(self, mp: "Map", pov: Optional[str]) -> str:
         """A board's map title for team `pov`: "map `cave` (2 of 3)", the
         unnamed label for a map it may not name, counted among the maps it
@@ -8273,15 +8520,65 @@ class Match:
                 raise VTTError(
                     f"Map `{name}` still has unit(s) on it ({ids}). Move them "
                     f"off first, or set map_delete_mode=kill to kill them.")
-            log.extend(self._kill_all_on_map(name))
-        # A corpse-less death leaves nothing; any unit still naming the map
-        # (a dead part) leaves with it.
-        for e in list(self.units_on_map(name)):
-            if e.id in self.entities:
-                log.extend(e.remove())
+            lost = self._maps_lost_with(name)
+            if not set(self.maps) - lost:
+                raise VTTError(
+                    f"Deleting map `{name}` would leave the match with no "
+                    f"map: every other map is carried by a unit on it and "
+                    f"would be destroyed with it ("
+                    + ", ".join(f"`{n}`" for n in sorted(lost - {name}))
+                    + "). Detach one first (`!map detach`).")
+        before = set(self.maps)
+        self._deleting_maps.add(name)
+        try:
+            if roots:
+                log.extend(self._kill_all_on_map(name))
+            # A corpse-less death leaves nothing; any unit still naming the
+            # map (a dead part) leaves with it.
+            for e in list(self.units_on_map(name)):
+                if e.id in self.entities:
+                    log.extend(e.remove())
+        finally:
+            self._deleting_maps.discard(name)
+        if len(self.maps) == 1:
+            # The deaths took every other map (a death effect or a hook
+            # did more than the fates predicted): keep this one.
+            log.append(f"⚠️ Map `{name}` was kept: the deaths on it took "
+                       f"every other map, and a match needs one.")
+            return log
         del self.maps[mp.name]
         self._forget_map(mp.name)
+        # A wreck's corpse no longer names it (a later map under the name
+        # isn't the wreck).
+        for _mp, _x, _y, _cid, corpse in self.every_corpse():
+            kept = corpse.get("maps")
+            if isinstance(kept, list) and name in kept:
+                corpse["maps"] = [k for k in kept if k != name]
+        # Tagged with the gone map: only an unfiltered view reads it.
+        for n in sorted(before - set(self.maps) - {name}):
+            log.append(f"{UNIT_LINE_TAG}{self.id}||0|0|{n}{UNIT_LINE_TAG}"
+                       f"Destroyed with it: map `{n}`.")
         return log
+
+    def _maps_lost_with(self, name: str) -> Set[str]:
+        """The maps deleting map `name` (killing everyone on it) would
+        destroy: `name`, and each map a dying carrier on a lost map holds
+        under the destroy fate (map_vehicle_death_map); a wreck survives."""
+        lost, todo = {name}, [name]
+        rule = str(self.rules.get("map_vehicle_death_map", "destroy"))
+        while todo:
+            cur = todo.pop()
+            for u in self.units_on_map(cur):
+                fate = u.vars.get("__map_vehicle_death_map")
+                if fate not in ("destroy", "wreck"):
+                    fate = rule
+                if fate != "destroy":
+                    continue
+                for inner in self.maps_carried_by(u.id):
+                    if inner.name not in lost:
+                        lost.add(inner.name)
+                        todo.append(inner.name)
+        return lost
 
     def _forget_map(self, name: str) -> None:
         """Drop per-channel state that names map `name`."""
@@ -8372,6 +8669,16 @@ class Match:
         return mp, renamed
 
     # ---- nested maps (map vehicles, `!map attach`) ------------------------
+    def body_root(self, e: "Entity") -> "Entity":
+        """The root body `e` belongs to (itself when not a part); a walk
+        that remembers the units it passed, so a part loop ends."""
+        root, seen = e, {e.id}
+        while root.part_of and root.part_of in self.entities \
+                and root.part_of not in seen:
+            root = self.entities[root.part_of]
+            seen.add(root.id)
+        return root
+
     def maps_carried_by(self, eid: str) -> List["Map"]:
         """The maps unit `eid` carries (its inner maps), in map order."""
         return [mp for mp in self.maps.values() if mp.vehicle == eid]
@@ -8390,6 +8697,28 @@ class Match:
             seen.add(cur.name)
             d, cur = d + 1, self.outer_map_of(cur)
         return d
+
+    def _vehicle_move_maps(self, eid: str) -> List["Map"]:
+        """The maps a move of unit `eid` reaches with on_map_vehicle_moved:
+        the maps it carries, then each map nested inside those whose own
+        nested_vehicle_moves setting is on (outermost first). A map set off
+        stops the chain: the maps inside it aren't reached either."""
+        out: List["Map"] = []
+        seen: Set[str] = set()
+        todo = list(self.maps_carried_by(eid))
+        first = {mp.name for mp in todo}
+        while todo:
+            mp = todo.pop(0)
+            if mp.name in seen:
+                continue
+            if mp.name not in first and not self._switch(
+                    self.map_setting(mp, "nested_vehicle_moves")):
+                continue
+            seen.add(mp.name)
+            out.append(mp)
+            for u in self.units_on_map(mp.name):
+                todo += self.maps_carried_by(u.id)
+        return out
 
     def maps_inside(self, eid: str) -> List["Map"]:
         """Every map inside unit `eid`: the maps it carries, the maps the
@@ -8495,7 +8824,9 @@ class Match:
         return sorted(units, key=lambda u: (pos.get(u.id, len(pos)), u.id))
 
     def _eject_spot(self, u: "Entity", outer: "Map",
-                    box: Tuple[int, int, int, int]) -> Optional[Tuple[int, int]]:
+                    box: Tuple[int, int, int, int],
+                    block_mode: Optional[str] = "tp"
+                    ) -> Optional[Tuple[int, int]]:
         """Where `u` (a unit, or a corpse's body) lands when it leaves a
         map vehicle with body `box` (x, y, w, h): the cell nearest the body
         that fits it, around the body as a dismount lands (so the vehicle's
@@ -8505,8 +8836,10 @@ class Match:
         w, h = self.entity_footprint(u)
         ox, oy = bx + (bw - 1) / 2 - (w - 1) / 2, by + (bh - 1) / 2 - (h - 1) / 2
         body = {(bx + i, by + j) for i in range(bw) for j in range(bh)}
-        return (self._nearest_fit_cell(u, ox, oy, outer, avoid=body)
-                or self._nearest_fit_cell(u, ox, oy, outer))
+        return (self._nearest_fit_cell(u, ox, oy, outer, avoid=body,
+                                       block_mode=block_mode)
+                or self._nearest_fit_cell(u, ox, oy, outer,
+                                          block_mode=block_mode))
 
     def _eject_from_maps(self, maps: List["Map"], outer: "Map",
                          box: Tuple[int, int, int, int], vid: str
@@ -8542,8 +8875,10 @@ class Match:
         if not maps:
             return []
         w, h = self.entity_footprint(e)
-        log = self._eject_from_maps(maps, self.map_of(e), (e.x, e.y, w, h),
-                                    e.id)
+        log: List[str] = []
+        if e.map not in self._deleting_maps:
+            log = self._eject_from_maps(maps, self.map_of(e),
+                                        (e.x, e.y, w, h), e.id)
         for mp in maps:
             mp.vehicle = None
         return log
@@ -8576,7 +8911,10 @@ class Match:
         if not maps:
             return []
         log: List[str] = []
-        outer = self.maps.get(outer_name)
+        # Its outer map is being deleted: nobody is ejected onto it (a
+        # wreck's crew stays aboard; a destroyed map's dies with it).
+        outer = (None if outer_name in self._deleting_maps
+                 else self.maps.get(outer_name))
         fate = vars_.get("__map_vehicle_death_map")
         if fate not in ("destroy", "wreck"):
             fate = str(self.rules.get("map_vehicle_death_map", "destroy"))
@@ -8635,7 +8973,7 @@ class Match:
             mp = self.maps.get(name)
             if mp is None:
                 continue
-            if fate == "wreck" or outer is None:
+            if fate == "wreck":
                 mp.vehicle = None
                 loc = self.find_corpse(vid)
                 if loc is not None:
@@ -8658,7 +8996,8 @@ class Match:
                 if corpses_mode == "eject" else []
             ids += [c for c in here if (name, c) in earlier] \
                 if old_mode == "eject" else []
-            log.extend(self._eject_corpses(mp, ids, outer, box))
+            if outer is not None:
+                log.extend(self._eject_corpses(mp, ids, outer, box))
             if name in self.maps:
                 log.extend(self.delete_map(name))
         return log
@@ -8674,8 +9013,13 @@ class Match:
             if loc is None or loc[3] is not mp:
                 continue
             x, y, corpse, _ = loc
-            body = Entity.from_dict(copy.deepcopy(corpse.get("entity") or {}))
-            spot = self._eject_spot(body, outer, box)
+            token = LEGACY_IDS_OK.set(True)
+            try:
+                body = Entity.from_dict(copy.deepcopy(corpse.get("entity")
+                                                      or {}))
+            finally:
+                LEGACY_IDS_OK.reset(token)
+            spot = self._eject_spot(body, outer, box, block_mode=None)
             cell = mp.tiles.get((x, y), {})
             del cell["corpses"][cid]
             if not cell["corpses"]:
@@ -8683,9 +9027,12 @@ class Match:
             if not cell:
                 mp.tiles.pop((x, y), None)
             if spot is None:
-                log.append(f"⚠️ No cell of map `{outer.name}` could take the "
-                           f"corpse of `{cid}`; it is lost with map "
-                           f"`{mp.name}`.")
+                # Tagged with the corpse's cell on the dying map: a view
+                # that couldn't see it there doesn't learn of it.
+                log.append(f"{UNIT_LINE_TAG}{self.id}|{cid}|{x}|{y}|"
+                           f"{mp.name}{UNIT_LINE_TAG}⚠️ No cell of map "
+                           f"`{outer.name}` could take the corpse of `{cid}`; "
+                           f"it is lost with map `{mp.name}`.")
                 continue
             dx, dy = spot[0] - x, spot[1] - y
             for d in [corpse.get("entity")] + list(corpse.get("parts") or []):
@@ -8729,8 +9076,11 @@ class Match:
                     and len(self.maps) > 1
                     and not self.units_on_map(mp.name)):
                 self.delete_map(mp.name)
-                log.append(f"Map `{mp.name}` was deleted: nobody is left on "
-                           f"it (__delete_when_empty).")
+                # Tagged with the gone map, so only an unfiltered view (a
+                # host's) reads it: a team view may not have known the map.
+                log.append(f"{UNIT_LINE_TAG}{self.id}||0|0|{mp.name}"
+                           f"{UNIT_LINE_TAG}Map `{mp.name}` was deleted: "
+                           f"nobody is left on it (__delete_when_empty).")
         return log
 
     def map_of(self, e: "Entity") -> "Map":
@@ -8859,6 +9209,11 @@ class Match:
 
         # Re-key tiles (corpses ride along inside tile data); drop off-grid.
         old_tiles = len(mp.tiles)
+        dropped_corpses = sorted(
+            str(cid)
+            for (x, y), cell in mp.tiles.items()
+            if not in_new(x + ox, y + oy) and isinstance(cell, dict)
+            for cid in (cell.get("corpses") or {}))
         mp.tiles = {(x + ox, y + oy): cell
                     for (x, y), cell in mp.tiles.items()
                     if in_new(x + ox, y + oy)}
@@ -8905,6 +9260,7 @@ class Match:
         mp.grid_width, mp.grid_height = new_w, new_h
         return ({"offset": (ox, oy), "anchor": key, "killed": killed,
                  "dropped_tiles": dropped_tiles,
+                 "dropped_corpses": dropped_corpses,
                  "clipped_zone_cells": clipped_cells}, log)
 
 
@@ -9395,8 +9751,10 @@ class Match:
 
     def attach_part(self, parent_id: str, part_id: str) -> "Entity":
         """Link an EXISTING entity as a body part of `parent_id`, moving it
-        onto the parent's cell. Raises NotFound / VTTError (self-attach or
-        already a part of someone else is allowed — it just re-points)."""
+        onto the parent's cell with its auras, riders and glued parts. Raises
+        NotFound / VTTError for itself, another map, a parent that is one of
+        its own parts (a loop), a map carrier, a snake segment or a mounted
+        rider; a part of someone else just re-points."""
         parent = self.entities.get(parent_id)
         if parent is None:
             raise NotFound(f"Entity '{parent_id}' not found.")
@@ -9408,8 +9766,34 @@ class Match:
         if p.map != parent.map:
             raise VTTError(f"`{part_id}` and `{parent_id}` are on different "
                            f"maps.")
+        # The new parent can't be one of the unit's own parts (or theirs):
+        # the two would hang off each other with no root body.
+        cur, seen = parent, set()
+        while cur is not None and cur.id not in seen:
+            if cur.id == part_id:
+                raise VTTError(
+                    f"`{parent_id}` is a body part of `{part_id}` (or of one "
+                    f"of its parts): a body can't be a part of its own part.")
+            seen.add(cur.id)
+            cur = self.entities.get(cur.part_of) if cur.part_of else None
+        carried = [mp.name for mp in self.maps_carried_by(part_id)]
+        if carried:
+            raise VTTError(
+                f"`{part_id}` carries map(s) "
+                + ", ".join(f"`{n}`" for n in carried)
+                + "; a body part can't carry a map (`!map detach` them first).")
+        if p.vars.get("__segment"):
+            raise VTTError(f"`{part_id}` is a snake segment; `!part detach` "
+                           f"it from its body first.")
+        if p.mounted_on and p.mounted_on in self.entities:
+            raise VTTError(f"`{part_id}` is riding `{p.mounted_on}`; "
+                           f"dismount it first.")
         p.part_of = parent_id
         p.x, p.y = parent.x, parent.y
+        # What it carries comes along: its auras, riders and glued parts.
+        self._restamp_anchors_for(part_id)
+        self._restamp_parts_for(part_id)
+        self._restamp_riders_for(part_id)
         self._rebuild_turn_order()
         return p
 
@@ -9429,6 +9813,15 @@ class Match:
         for k in ("__segment", "__follows"):
             p.vars.pop(k, None)
         p.part_of = None
+        # A living limb that sat on its body (glued or region) steps off it
+        # to the nearest free cell, as a dismount does: two living units
+        # don't share a cell. A dead one lies where it fell.
+        if p.is_alive and not p.is_cell_stackable and any(
+                self.cell_occupant(cx, cy, (p.id,), self.map_of(p)) is not None
+                for cx, cy in self.entity_cells(p)):
+            spot = self._nearest_fit_cell(p, p.x, p.y, self.map_of(p))
+            if spot is not None:
+                p.move_to(*spot)
         self._rebuild_turn_order()
         return p
 
@@ -9835,12 +10228,16 @@ class Match:
             rider, ox, oy, self.map_of(veh if veh is not None else rider))
 
     def _nearest_fit_cell(self, e: "Entity", ox: float, oy: float,
-                          mp: "Map", avoid: Optional[Set[Tuple[int, int]]] = None
+                          mp: "Map", avoid: Optional[Set[Tuple[int, int]]] = None,
+                          block_mode: Optional[str] = "tp"
                           ) -> Optional[Tuple[int, int]]:
         """The anchor cell nearest the point (ox, oy) where `e`'s whole
-        footprint is on map `mp` and covers no other unit (ties by y then
-        x), nor any cell of `avoid`. Shared by dismount, revive_blocked_mode
-        nearest and the ejection from a map vehicle."""
+        footprint is on map `mp`, covers no other unit (ties by y then x),
+        nor any cell of `avoid`, and no cell that blocks `e` for
+        `block_mode` (the block_<mode> rule; None = no block test, for a
+        corpse). Shared by dismount, revive_blocked_mode nearest and the
+        ejections from a dead vehicle, so each lands where the unit could
+        have walked."""
         rider = e
         cx0, cy0 = math.floor(ox + 0.5), math.floor(oy + 0.5)
         best: Optional[Tuple[float, int, int]] = None
@@ -9850,7 +10247,10 @@ class Match:
                 if self.footprint_in_bounds(rider, gx, gy, mp) and \
                         not self._footprint_blocked_by_others(rider, gx, gy, mp) \
                         and not (avoid and any(
-                            c in avoid for c in self.entity_cells(rider, gx, gy))):
+                            c in avoid for c in self.entity_cells(rider, gx, gy))) \
+                        and not (block_mode and any(
+                            self._check_block(rider.id, cx, cy, block_mode, mp)
+                            for cx, cy in self.entity_cells(rider, gx, gy))):
                     key = ((gx - ox) ** 2 + (gy - oy) ** 2, gy, gx)
                     if best is None or key < best:
                         best = key
@@ -10362,11 +10762,14 @@ class Match:
     def team_add(self, team: str, path: str, delta: float) -> Any:
         """Add `delta` to a numeric team value (0 if absent). Returns the new
         value."""
-        cur = self.team_get(team, path, 0) or 0
-        try:
-            new = cur + delta
-        except TypeError:
-            raise VTTError(f"team_add: `{team}`.{path} is not numeric.")
+        cur = self.team_get(team, path, 0)
+        if cur is None:
+            cur = 0
+        # A flag (true / false) isn't a number to add to, as var_add says.
+        if isinstance(cur, bool) or not isinstance(cur, (int, float)):
+            raise VTTError(f"team_add: `{team}`.{path} is {cur!r}, not a "
+                           f"number.")
+        new = cur + delta
         self.team_set(team, path, new)
         return new
 
@@ -10377,15 +10780,17 @@ class Match:
         effect fires in the same command. Returns effect-error notes."""
         log: List[str] = []
         limit = max(1, int(self.rules.get("watcher_chain_limit", 16)))
+        self._watcher_backlog = False
         for _ in range(limit):
             fired, notes = self._watcher_pass()
             log += notes
             if not fired:
                 return log
         if self.watchers and self._watcher_pass(peek=True)[0]:
+            self._watcher_backlog = True
             log.append(f"⚠ watchers still firing after {limit} passes "
                        f"(watcher_chain_limit); the rest wait for the next "
-                       f"command.")
+                       f"command that changes the match.")
         return log
 
     def _watcher_pass(self, peek: bool = False) -> Tuple[List[str], List[str]]:
@@ -12334,6 +12739,16 @@ class Match:
             for cx, cy in self.entity_cells(mover, mx, my):
                 if self._check_block(mover.id, cx, cy, "swap"):
                     raise Blocked(f"Cell ({cx},{cy}) blocks `{mover.id}`")
+        # The two new footprints must not overlap either: with unequal sizes
+        # a partner's new anchor can fall inside the other's new body.
+        if not (ea.is_cell_stackable or eb.is_cell_stackable):
+            both = set(self.entity_cells(ea, bx, by)) & set(
+                self.entity_cells(eb, ax, ay))
+            if both:
+                cx, cy = min(both, key=lambda c: (c[1], c[0]))
+                raise Occupied(
+                    f"swap: `{a}` and `{b}` would both cover ({cx},{cy}) — "
+                    f"they don't fit at each other's places")
         log: List[str] = []
         # Footprint cell sets for each partner at its old and new anchor.
         a_old = self.entity_cells(ea, ax, ay)
@@ -12935,17 +13350,25 @@ class Match:
         map its team's current or latest actor is on now; if that unit is
         gone, the last map it stood on; before any turn, the map of the
         team's first unit in turn order; else the first map."""
+        def ok(name: Optional[str]) -> bool:
+            # A team's board follows only a map the team has seen: one its
+            # last actor left (and died on) may now be unseen or hidden.
+            return name in self.maps and (
+                pov_team is None or self.map_seen_by(self.maps[name], pov_team))
         rec = self.last_actors.get("" if pov_team is None else str(pov_team))
         if rec:
             e = self.entities.get(rec[0])
-            if e is not None and e.map in self.maps:
+            if e is not None and ok(e.map):
                 return self.maps[e.map]
-            if rec[1] in self.maps:
+            if ok(rec[1]):
                 return self.maps[rec[1]]
         if pov_team is not None:
             for e in self.entities_in_turn_order():
-                if e.map in self.maps and str(self._root_team(e)) == str(pov_team):
+                if ok(e.map) and str(self._root_team(e)) == str(pov_team):
                     return self.maps[e.map]
+            listed = self.listed_maps(pov_team)
+            if listed:
+                return listed[0]
         return next(iter(self.maps.values()))
 
     def channel_map(self, channel_key: Optional[str],
@@ -13609,6 +14032,7 @@ class Match:
     def _hook_map(self, mp: Optional["Map"], eid: Optional[str]) -> "Map":
         return self._map_for(mp, self.entities.get(eid) if eid else None)
 
+    @_bounded_move_hooks
     def fire_footprint_tile_exit(self, eid: Optional[str],
                                  old_cells, new_cells,
                                  mp: Optional["Map"] = None) -> List[str]:
@@ -13620,6 +14044,7 @@ class Match:
                 log.extend(self.fire_tile_hook("on_exit", eid, cx, cy, mp))
         return log
 
+    @_bounded_move_hooks
     def fire_footprint_tile_enter(self, eid: Optional[str],
                                   old_cells, new_cells,
                                   mp: Optional["Map"] = None) -> List[str]:
@@ -13631,6 +14056,7 @@ class Match:
                 log.extend(self.fire_tile_hook("on_enter", eid, cx, cy, mp))
         return log
 
+    @_bounded_move_hooks
     def fire_footprint_tile_stop(self, eid: Optional[str], cells,
                                  mp: Optional["Map"] = None) -> List[str]:
         mp = self._hook_map(mp, eid)
@@ -13639,6 +14065,7 @@ class Match:
             log.extend(self.fire_tile_hook("on_stop", eid, cx, cy, mp))
         return log
 
+    @_bounded_move_hooks
     def fire_footprint_zone_exit(self, eid: Optional[str],
                                  old_cells, new_cells,
                                  mp: Optional["Map"] = None) -> List[str]:
@@ -13659,6 +14086,7 @@ class Match:
                 log.extend(self.fire_zone_hook("on_cell_exit", name, eid, cx, cy, mp))
         return log
 
+    @_bounded_move_hooks
     def fire_footprint_zone_enter(self, eid: Optional[str],
                                   old_cells, new_cells,
                                   is_final: bool,
@@ -13682,6 +14110,7 @@ class Match:
             log.extend(self.fire_footprint_zone_stop(eid, new_cells, mp))
         return log
 
+    @_bounded_move_hooks
     def fire_footprint_zone_stop(self, eid: Optional[str], cells,
                                  mp: Optional["Map"] = None) -> List[str]:
         """Boundary on_stop ONCE per zone the footprint ends in, plus
@@ -13773,8 +14202,7 @@ class Match:
     def define_status(self, name: str, *, overwrite: bool = False) -> Dict[str, Any]:
         """Create an empty status definition. Raises DuplicateId if it
         already exists unless overwrite=True."""
-        if not isinstance(name, str) or not name.strip():
-            raise VTTError("status definition name must be a non-empty string.")
+        check_status_name(name)
         if not overwrite and name in self.status_definitions:
             raise DuplicateId(f"Status definition '{name}' already exists.")
         self.status_definitions[name] = {
@@ -13817,10 +14245,7 @@ class Match:
         lost. Returns counts by kind."""
         if old not in self.status_definitions:
             raise NotFound(f"No status definition `{old}`.")
-        if not isinstance(new, str) or not new.strip() or new != new.strip() \
-                or any(c.isspace() for c in new) or new.startswith("tag:"):
-            raise VTTError(f"`{new}` can't be a status name (one word, not "
-                           f"`tag:...`).")
+        check_status_name(new)
         if new in self.status_definitions:
             raise DuplicateId(f"Status definition '{new}' already exists.")
         clash = sorted(e.id for e in self.entities.values()
@@ -14551,9 +14976,7 @@ class Match:
         if e.part_of:
             # A part (a located limb, a snake segment) is on its body's
             # map: the body moves and takes it along.
-            root = e
-            while root.part_of and root.part_of in self.entities:
-                root = self.entities[root.part_of]
+            root = self.body_root(e)
             raise VTTError(
                 f"`{e.id}` is a body part of `{root.id}`: move `{root.id}` "
                 f"to another map to take it along.")
@@ -14682,16 +15105,22 @@ class Match:
             self.log_event("move", entity=entity_id, name=e.name,
                            from_x=from_x, from_y=from_y, to_x=to_x, to_y=to_y)
         log: List[str] = []
-        for p in self._firing_passives(entity_id):
-            if p.when == "on_entity_moved":
-                log.append(_run_passive_safely(
-                    engine, p, ctx, target_id=entity_id, is_global=True,
-                ))
-        for p in e.passives.values():
-            if p.when == "on_entity_moved":
-                log.append(_run_passive_safely(
-                    engine, p, ctx, target_id=entity_id, is_global=False,
-                ))
+        # The passives are bounded by move_hook_recursion_limit (one moving
+        # its unit again fires the next move inside itself); the re-stamps
+        # above always run.
+        with move_hook_level(self.rules, log) as fire:
+            if fire:
+                for p in self._firing_passives(entity_id):
+                    if p.when == "on_entity_moved":
+                        log.append(_run_passive_safely(
+                            engine, p, ctx, target_id=entity_id,
+                            is_global=True))
+                if entity_id in self.entities:
+                    for p in list(e.passives.values()):
+                        if p.when == "on_entity_moved":
+                            log.append(_run_passive_safely(
+                                engine, p, ctx, target_id=entity_id,
+                                is_global=False))
         # Fog memory: a move can reveal new cells for the mover's team —
         # fold current vision into its explored set (no-op unless memory
         # on). Other entities a passive moved record via their own fires.
@@ -14699,15 +15128,18 @@ class Match:
         # Nested maps: the units on each map the moved body carries.
         if entity_id in self.entities and any(
                 mp.vehicle for mp in self.maps.values()):
-            for u in self.carried_body(e):
-                for mp in self.maps_carried_by(u.id):
-                    targets = [x.id for x in self._turn_sorted(
-                        [x for x in self.units_on_map(mp.name)
-                         if not x.part_of])]
-                    log.extend(self.fire_hook(
-                        "on_map_vehicle_moved", target_ids=targets,
-                        extras={"map_vehicle": u.id, "context_map": mp.name,
-                                "hook_name": "on_map_vehicle_moved"}))
+            with move_hook_level(self.rules, log) as fire:
+                if fire:
+                    for u in self.carried_body(e):
+                        for mp in self._vehicle_move_maps(u.id):
+                            targets = [x.id for x in self._turn_sorted(
+                                [x for x in self.units_on_map(mp.name)
+                                 if not x.part_of])]
+                            log.extend(self.fire_hook(
+                                "on_map_vehicle_moved", target_ids=targets,
+                                extras={"map_vehicle": u.id,
+                                        "context_map": mp.name,
+                                        "hook_name": "on_map_vehicle_moved"}))
         return log
 
     def fire_entity_step(
@@ -14738,16 +15170,19 @@ class Match:
         }
         ctx = EvalCtx(this=this_id, target=entity_id, extras=extras)
         log: List[str] = []
-        for p in self._firing_passives(entity_id):
-            if p.when == "on_entity_step":
-                log.append(_run_passive_safely(
-                    engine, p, ctx, target_id=entity_id, is_global=True,
-                ))
-        for p in e.passives.values():
-            if p.when == "on_entity_step":
-                log.append(_run_passive_safely(
-                    engine, p, ctx, target_id=entity_id, is_global=False,
-                ))
+        with move_hook_level(self.rules, log) as fire:
+            if fire:
+                for p in self._firing_passives(entity_id):
+                    if p.when == "on_entity_step":
+                        log.append(_run_passive_safely(
+                            engine, p, ctx, target_id=entity_id,
+                            is_global=True))
+                if entity_id in self.entities:
+                    for p in list(e.passives.values()):
+                        if p.when == "on_entity_step":
+                            log.append(_run_passive_safely(
+                                engine, p, ctx, target_id=entity_id,
+                                is_global=False))
         # Fog memory: capture cells revealed mid-path, per step (the
         # once-per-move record in fire_entity_moved would miss a stepwise
         # move's intermediate vision).
@@ -16677,6 +17112,16 @@ class Match:
         return out
 
     def revive_corpse(self, eid: str) -> Tuple[str, List[str]]:
+        """Resurrect the corpse keyed by `eid` (see _revive_corpse). Its
+        unit existed, so an id a later formula binding took still comes
+        back (LEGACY_IDS_OK)."""
+        token = LEGACY_IDS_OK.set(True)
+        try:
+            return self._revive_corpse(eid)
+        finally:
+            LEGACY_IDS_OK.reset(token)
+
+    def _revive_corpse(self, eid: str) -> Tuple[str, List[str]]:
         """Resurrect the corpse keyed by `eid`: spawn an entity from
         the stored dict at the corpse's TILE position, remove the
         corpse, run the `default_revive_function_effects` formula on
@@ -16790,8 +17235,16 @@ class Match:
                     pid = str(pdc.get("id", ""))
                     if relocate != (pid in deferred):
                         continue
-                    if not pid or pid in self._taken_entity_ids():
-                        continue   # an id clash: something else took the id
+                    if not pid:
+                        continue
+                    if pid in self._taken_entity_ids():
+                        # Another unit took the part's id while the body
+                        # lay dead: the part can't come back under it.
+                        if not relocate:
+                            spawn_log.append(
+                                f"⚠️ part `{pid}` couldn't be restored: "
+                                f"another unit has its id now.")
+                        continue
                     if not relocate and pdc.get("part_of") in deferred:
                         deferred.add(pid)   # waits for its own parent
                         continue
@@ -16877,8 +17330,14 @@ class Match:
             # corpse's hp (not alive, so left out); now that it lives, it
             # rejoins.
             self._rebuild_turn_order()
+        # Only the units this revive brought back rejoin: a stranger that
+        # took a part's id meanwhile isn't that part.
+        back = {e.id} | {str(pd.get("id")) for pd in stored_parts
+                         if str(pd.get("id")) in self.entities
+                         and self.body_root(self.entities[str(pd.get("id"))])
+                         is e}
         for uid, names in (corpse.get("groups") or {}).items():
-            if uid in self.entities and isinstance(names, list):
+            if uid in self.entities and uid in back and isinstance(names, list):
                 for name in names:
                     if name in self.groups and uid not in self.groups[name]:
                         self.groups[name].append(uid)
@@ -17322,7 +17781,7 @@ class Match:
                 new_vars[k] = copy.deepcopy(e.vars[k])
         # Checked BEFORE the old parts go, so a bad statblock changes nothing.
         new_vars = checked_unit_vars(new_vars, (hp_var, max_hp_var, turnorder_var),
-                                     "transform")
+                                     "transform", self.rules.get("team_var", "team"))
         if hp_var not in new_vars:
             raise VTTError(f"transform: the new form has no `{hp_var}`.")
         # The new body must fit where the unit stands (its own parts, which
@@ -18206,6 +18665,7 @@ class Match:
             },
             "aliases": dict(self.aliases),
             "macros": dict(self.macros),
+            "macro_authors": dict(self.macro_authors),
             "tables": dict(self.tables),
             "template_pins": copy.deepcopy(self.template_pins),
             "watchers": copy.deepcopy(self.watchers),
@@ -18221,6 +18681,8 @@ class Match:
             "owner": self.owner,
             "cohosts": list(self.cohosts),
             "links": list(self.links),
+            "link_stamps": dict(self.link_stamps),
+            "uid": self.uid,
             "access_overrides": dict(self.access_overrides),
             "bound_channels": copy.deepcopy(self.bound_channels),
             "team_colors": dict(self.team_colors),
@@ -18248,6 +18710,14 @@ class Match:
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "Match":
+        token = LEGACY_IDS_OK.set(True)
+        try:
+            return Match._from_dict(d)
+        finally:
+            LEGACY_IDS_OK.reset(token)
+
+    @staticmethod
+    def _from_dict(d: Dict[str, Any]) -> "Match":
         raw_maps = d.get("maps") or {}
         order = [str(n) for n in (d.get("map_order") or []) if n in raw_maps]
         order += [str(n) for n in raw_maps if str(n) not in order]
@@ -18279,8 +18749,20 @@ class Match:
             m.entities[eid] = e
         # A map naming a carrier that isn't here (hand-edited state) is a
         # map of its own.
+        # A part loop saved by an older build (two units each other's part)
+        # is cut where it closes, so every body has a root again; a map a
+        # body part carries is a map of its own (parts can't carry maps).
+        for e in m.entities.values():
+            cur, seen = e, set()
+            while cur.part_of and cur.part_of in m.entities \
+                    and cur.id not in seen:
+                seen.add(cur.id)
+                cur = m.entities[cur.part_of]
+            if cur.id in seen:
+                cur.part_of = None
         for mp in maps.values():
-            if mp.vehicle and mp.vehicle not in m.entities:
+            if mp.vehicle and (mp.vehicle not in m.entities
+                               or m.entities[mp.vehicle].part_of):
                 mp.vehicle = None
         # COPY on load too (the load-side twin): otherwise the restored match
         # shares the snapshot's list, and the next Entity.remove would mutate
@@ -18363,6 +18845,10 @@ class Match:
             str(k): str(v) for k, v in raw_macros.items()
             if isinstance(k, str) and isinstance(v, str)
         }
+        raw_ma = d.get("macro_authors")
+        m.macro_authors = ({str(k): str(v) for k, v in raw_ma.items()
+                            if k in m.macros and isinstance(v, str)}
+                           if isinstance(raw_ma, dict) else {})
         raw_tables = d.get("tables", {}) or {}
         m.tables = {
             str(k): str(v) for k, v in raw_tables.items()
@@ -18417,6 +18903,12 @@ class Match:
         raw_links = d.get("links", [])
         m.links = ([c for c in raw_links if isinstance(c, str)]
                    if isinstance(raw_links, list) else [])
+        raw_stamps = d.get("link_stamps")
+        m.link_stamps = ({str(k): str(v) for k, v in raw_stamps.items()
+                          if k in m.links and isinstance(v, str)}
+                         if isinstance(raw_stamps, dict) else {})
+        if isinstance(d.get("uid"), str) and d["uid"]:
+            m.uid = d["uid"]
         raw_acc = d.get("access_overrides", {})
         m.access_overrides = {
             k: str(v) for k, v in raw_acc.items()
@@ -20204,13 +20696,15 @@ _TEMPLATE_IDENTITY_KEYS = ("id", "x", "y", "map", "part_of", "mounted_on",
                            "mount_slot")
 
 
-def check_template_name(name: Any) -> str:
+def check_template_name(name: Any, legacy: bool = False) -> str:
     """A template name, lower-cased: it names the file and is the id spawned
     units take (`guardsman`, `guardsman2`, ...), so it follows the id rule;
-    lower-case so two names can't differ only by case (one file on Windows)."""
+    lower-case so two names can't differ only by case (one file on Windows).
+    `legacy` (a file read back) lets a name that a later formula binding
+    took through: spawns mint the next free id from it."""
     n = str(name).strip().lower()
     check_id("template name", n)
-    if n in RESERVED_IDS or unreachable_id(n):
+    if n in RESERVED_IDS or (unreachable_id(n) and not legacy):
         raise VTTError(f"`{n}` is a reserved name and can't name a template.")
     return n
 
@@ -20452,6 +20946,20 @@ def check_template(data: Any, name: str,
                             f"Template `{name}`: part `{pt.get('id', i + 1)}` "
                             f"`{k}` must be a whole-number offset.")
                 probe(pt, f"Template `{name}` part `{pt.get('id', i + 1)}`")
+            # Every part's chain reaches the unit: a part naming itself or
+            # two naming each other would never be spawned.
+            links = {p.get("id"): p.get("part_of", TEMPLATE_ROOT)
+                     for p in parts if isinstance(p, dict) and p.get("id")}
+            for pid in links:
+                cur, seen = pid, set()
+                while cur in links and cur not in seen:
+                    seen.add(cur)
+                    cur = links[cur]
+                if cur in seen:
+                    raise VTTError(
+                        f"Template `{name}`: part `{pid}` is part of a loop "
+                        f"of parts that never reaches the unit "
+                        f"(`{TEMPLATE_ROOT}`).")
         else:
             raise VTTError(f"Template `{name}`: `parts` must be a list or an "
                            f"object.")
@@ -20769,6 +21277,8 @@ MAP_VAR_NAME_RULES: Dict[str, Tuple[str, Optional[str]]] = {
     "map_border_opacity_var": ("border_opacity", "border_opacity"),
     "map_hidden_layers_var": ("hidden_layers", None),
     "map_unseen_var": ("unseen", "unseen_map_display"),
+    "map_nested_vehicle_moves_var": ("nested_vehicle_moves",
+                                     "nested_vehicle_moves"),
 }
 # setting -> its rule
 MAP_SETTING_RULES: Dict[str, str] = {v[0]: k for k, v in MAP_VAR_NAME_RULES.items()}
@@ -20791,7 +21301,7 @@ def map_setting_value(setting: str, value: Any) -> Any:
             raise VTTError(f"The unseen setting is one of "
                            f"{', '.join(UNSEEN_MAP_MODES)}, got `{value}`.")
         return word
-    if setting in ("fog", "fog_memory", "borders"):
+    if setting in ("fog", "fog_memory", "borders", "nested_vehicle_moves"):
         word = str(value).strip().lower()
         if isinstance(value, bool):
             return value
@@ -21144,6 +21654,12 @@ class MatchManager:
         # `!server audit`: who changed what server-wide, oldest first
         # (record_audit). Saved as audit.json; kept to audit_log_entries.
         self.audit_log: List[Dict[str, Any]] = []
+        # Set when the server loaded without systems some matches need
+        # (systems.json unreadable, and match files without a backup of
+        # theirs): every command but `!server recover` / `!server backups`
+        # is refused and nothing is saved until an administrator recovers
+        # it (storage.Storage.load_server). Not saved.
+        self.recovery: Optional[Dict[str, Any]] = None
 
     # ----- server-wide undo and audit -----
     def server_state(self) -> Dict[str, Any]:
@@ -21792,8 +22308,19 @@ class MatchManager:
         # Its own dice: a copy rolling the original's numbers would let one
         # table read the other's future.
         m.set_rng(new_rng_seed())
+        # Another match: links to the source don't trust the copy.
+        m.uid = new_rng_seed()
         self.matches[m.id] = m
         return m
+
+    def link_trusts(self, dest: "Match", sender: "Match") -> bool:
+        """Whether `dest` accepts units sent by `sender`: it links the
+        sender's id, and the link's stamp (when it has one) is this very
+        match, not another made later under the id."""
+        if sender.id not in dest.links:
+            return False
+        stamp = dest.link_stamps.get(sender.id)
+        return stamp is None or stamp == sender.uid
 
     def delete_match(self, match_id: str):
         if match_id not in self.matches:
@@ -21804,6 +22331,7 @@ class MatchManager:
         for other in self.matches.values():
             if match_id in other.links:
                 other.links.remove(match_id)
+            other.link_stamps.pop(match_id, None)
         # clean up any actives
         to_remove = [ch for ch, mid in self.active_by_channel.items() if mid == match_id]
         for ch in to_remove:

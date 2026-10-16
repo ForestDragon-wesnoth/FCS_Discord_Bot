@@ -39,7 +39,8 @@ intents.message_content = True
 # Replies echo text users and GMs typed (unit names, bad arguments, command
 # names), so a reply could carry @everyone, a role or a <@user> mention and
 # ping the server. The bot's messages never mean to ping anyone.
-bot = commands.Bot(command_prefix="!", intents=intents,
+# case_insensitive: a phone keyboard capitalising `!Ent` still names `!ent`.
+bot = commands.Bot(command_prefix="!", intents=intents, case_insensitive=True,
                    allowed_mentions=discord.AllowedMentions.none())
 # One workspace per Discord server (systems, matches, saves), loaded from the
 # data/ folder at startup and written back after every command.

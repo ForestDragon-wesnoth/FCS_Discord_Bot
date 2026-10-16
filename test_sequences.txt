@@ -2385,19 +2385,24 @@ SCENARIO 121 — Loops are constrained, not blanket-disallowed
 !match new rej121 Reject 6 6
 !match use rej121
 !ent add hero Hero 30 3 3 10
-!eval "for x in range(3): entity[hero].hp = x"
+!eval "for x in range(3): entity[hero].hp = 10 + x"
+!assert "entity[hero].hp == 12"
 !eval "for x in entity[hero].hp: entity[hero].hp = x"
+?? for-loop iterable must be a direct call to one of
+!eval "for x in [1, 2]: entity[hero].hp = x"
+?? for-loop iterable must be a direct call to one of
 !eval "while True: entity[hero].hp = 0"
+?? Disallowed syntax: While
+!assert "entity[hero].hp == 12"
 
-Expected: `while` loops are still fully disallowed ("Disallowed
-syntax: While"). `for` loops ARE allowed, but only over a direct
-call to one of the loopable builtins (entities_within,
-group_members, cells_in_burst, cells_in_line, cells_in_cone) — so
-`for x in range(3)` is rejected because `range` isn't an allowed
-function, and `for x in entity[hero].hp` is rejected because the
-iterable isn't a loopable call ("for-loop iterable must be a
-direct call to one of {...}"). See SCENARIO 246+ for the legal
-for-loop forms.
+Expected: `while` loops are fully disallowed ("Disallowed syntax:
+While"). `for` loops are allowed over a direct call to one of the
+loopable functions (`_LOOPABLE_FUNCS`): `range(3)` is one, so the
+first loop runs three times and leaves hp at 10 + 2 = 12. A loop
+over anything else is refused before it runs ("for-loop iterable
+must be a direct call to one of {...}"): a var read
+(`entity[hero].hp`) and a list literal alike, and hp stays 12.
+Scenarios 246+ show the legal for-loop forms.
 
 
 SCENARIO 122 — Disallowed: lambdas, comprehensions, imports
@@ -6040,8 +6045,11 @@ SCENARIO 247 — for-loop iterable validation + loop bound
 !match new mfor2 ForLimits 10 10
 !match use mfor2
 !ent add hero Hero 30 5 5 10
-!eval "for x in range(5): entity[x].hp = 0"
+!eval "for x in abs(5): entity[hero].hp = 0"
+?? for-loop iterable must be a direct call to one of
 !eval "for x in my_list: entity[x].hp = 0"
+?? Unknown identifier 'my_list'
+!assert "entity[hero].hp == 30"
 !eval "for [a, b] in cells_in_burst(5, 5, 1): tile_set(a, b, 'foo', 1)"
 !tile def new mark
 !system set default formula_loop_limit 5
@@ -6049,10 +6057,11 @@ SCENARIO 247 — for-loop iterable validation + loop bound
 !system set default formula_loop_limit 10000
 
 Expected: For-loops are validated up front. The iterable MUST be
-a direct call to one of: entities_within, group_members,
-cells_in_burst, cells_in_line, cells_in_cone. So `range(5)`
-errors with "iterable must be a direct call to one of {...}" and
-`my_list` errors as an unknown identifier. A loop target that's
+a direct call to one of the loopable functions (`_LOOPABLE_FUNCS`:
+entities_within, range, each, cells_in_burst, ...). So `abs(5)`, a
+function that isn't loopable, errors with "iterable must be a
+direct call to one of {...}" and `my_list` errors as an unknown
+identifier; neither loop runs, so the hero keeps 30 hp. A loop target that's
 neither a single name nor a tuple of names ("for [a, b] in ..."
 uses a List, not Tuple) is also rejected.
 
@@ -24986,11 +24995,11 @@ SCENARIO 818 — An action's cmd() runs as its caller; batch and foreach lines p
 !host access set foreach all user=alice
 !as player alice
 !batch ent dump spy
-?? ❌ `!ent` can't run inside a batch or foreach for you
+?? ❌ `!ent` can't run inside a batch, foreach or player-written macro for you
 !batch host add alice
-?? ❌ `!host` can't run inside a batch or foreach for you
+?? ❌ `!host` can't run inside a batch, foreach or player-written macro for you
 !foreach hp>0 ; ent hp $id 1
-?? can't run inside a batch or foreach
+?? can't run inside a batch, foreach or player-written macro
 !as host
 !assert "entity[hero].hp == 30 and entity[spy].hp == 10"
 !host list
@@ -26526,3 +26535,722 @@ horse unmarked, still carrying the bird. When the 2x2 second horse dies,
 only its direct rider gets the effect (the knight is marked, the bird
 isn't); the knight is ejected around the horse's body and the bird rides
 along on the knight.
+
+SCENARIO 852 — Part attach refuses loops, carriers, segments and riders; glued parts don't walk; swaps don't overlap
+----------------------------------------------------------------------
+
+!match new pl PL 9 9
+!match use pl
+!map new deck 4 4
+!ent add a A 10 2 2 map=main
+!ent add b B 10 5 5 map=main
+!ent add c C 10 7 7 map=main
+!part attach a b
+!part attach b a
+?? ❌ `b` is a body part of `a` (or of one of its parts): a body can't be a part of its own part.
+!part attach b c
+!part attach c a
+?? ❌ `c` is a body part of `a`
+!ent add worm Worm 10 8 2 map=main
+!part segment worm s1 S 8 3
+!part attach a s1
+?? ❌ `s1` is a snake segment; `!part detach` it from its body first.
+!ent add ship Ship 10 1 8 map=main
+!map attach deck ship
+!part attach a ship
+?? ❌ `ship` carries map(s) `deck`; a body part can't carry a map (`!map detach` them first).
+!ent add horse Horse 10 4 8 map=main
+!ent set_var horse slots.saddle.capacity 1
+!ent add jock Jock 10 1 1 map=main
+!mount jock horse saddle
+!part attach a jock
+?? ❌ `jock` is riding `horse`; dismount it first.
+!part attach a horse
+!assert "entity[horse].x == 2 and entity[horse].y == 2 and entity[jock].x == 2 and entity[jock].y == 2"
+!ent move horse 1 right
+?? ❌ `horse` is a body part sitting on `a`'s body: move `a` (or `!part locate` the part first).
+!part detach horse
+?? it's now a free entity at (2,1).
+!ent tp c 1 1 deck
+?? ❌ `c` is a body part sitting on `a`'s body: move `a` (or `!part locate` the part first).
+!ent add big Big 10 2 5 map=main
+!ent set_vars big footprint_w=2 footprint_h=2
+!ent add z Z 10 1 4 map=main
+!ent swap big z
+?? ❌ swap: `big` and `z` would both cover (2,5) — they don't fit at each other's places
+!assert "entity[big].x == 2 and entity[z].x == 1"
+!template import loopy {"name": "L", "vars": {"hp": 5}, "parts": [{"id": "p1", "part_of": "p2", "vars": {"hp": 1}}, {"id": "p2", "part_of": "p1", "vars": {"hp": 1}}]}
+?? ❌ Template `loopy`: part `p1` is part of a loop of parts that never reaches the unit (`@root`).
+
+Expected: HARNESS-ALLOWS-ERRORS. `!part attach` refuses a parent that is
+one of the unit's own parts (b under a can't take a; nor c, under b,
+take a), a snake segment, a unit carrying a map and a mounted rider. A
+loaded horse made a part brings its rider along to the new cell. A
+glued part can't move by itself; detached while alive it steps off its
+body to the nearest free cell. A part's move, cross-map included, is
+refused naming its root body (`c` under `b` under `a`); with a loop the
+cross-map refusal's walk to the root used to never end. Swapping a 2x2 with the 1x1 beside it
+would put them on one cell, so it is refused. A template whose parts
+name each other is refused at import.
+
+SCENARIO 853 — Deleting maps under carriers, wreck records, blocking-aware ejection, boards follow seen maps
+----------------------------------------------------------------------
+
+!match new zm ZM 6 6
+!match use zm
+!system set default map_delete_mode kill
+!map new deck 3 3
+!ent add ship Ship 20 2 2 map=main
+!ent add crew Crew 5 1 1 map=deck
+!map attach deck ship
+!map delete main
+?? ❌ Deleting map `main` would leave the match with no map: every other map is carried by a unit on it and would be destroyed with it (`deck`). Detach one first (`!map detach`).
+!assert "sorted(maps()) == ['deck', 'main']"
+!map new other 3 3
+!map delete main
+?? Destroyed with it: map `deck`.
+!assert "maps() == ['other']"
+!system set default map_vehicle_death_map wreck
+!match new zw ZW 6 6
+!match use zw
+!map new deck 3 3
+!map new lower 3 3
+!ent add ship Ship 20 2 2 map=main
+!ent add crew Crew 5 1 1 map=deck
+!map attach deck ship
+!ent kill ship
+!ent tp crew 1 1 main
+!map delete deck
+!map new deck 2 2
+!ent revive ship
+!assert "map_carrier('deck') == None"
+!map attach deck ship
+!ent add crew2 Crew 5 1 1 map=deck
+!map delete main
+!assert "sorted(maps()) == ['deck', 'lower'] and map_of('crew2') == 'deck' and map_carrier('deck') == None"
+!match new ue UE 7 7
+!match use ue
+!system set default map_vehicle_death_map destroy
+!system set default tile_block_condition "tile_has(tile_x, tile_y, 'water')"
+!map new hull 3 3
+!ent add boat Boat 20 4 4 map=main
+!map attach hull boat
+!ent add sailor Sailor 5 1 1 map=hull
+!tile fill 3 3 5 5 water true map=main
+!tile del 4 4 water map=main
+!ent kill boat
+!assert "map_of('sailor') == 'main' and not tile_has(entity[sailor].x, entity[sailor].y, 'water', map='main')"
+!ent add raft Raft 10 2 2 map=main
+!ent set_var raft slots.seat.capacity 1
+!mount sailor raft seat
+!tile fill 1 1 3 3 water true map=main
+!tile del 2 2 water map=main
+!mount dismount sailor
+!assert "not tile_has(entity[sailor].x, entity[sailor].y, 'water', map='main')"
+!match new fw FW 6 6
+!match use fw
+!system set default tile_block_condition ""
+!map new crypt 3 3
+!match fog on map=all
+!defvar add fog_vision_radius 1
+!map unseen hidden map=crypt
+!ent add hero Hero 10 1 1 map=main
+!ent set_var hero team red
+!ent add scout Scout 10 2 2 map=crypt
+!ent set_var scout team red
+!turn next
+!turn next
+!ent kill scout
+!as view red
+!map
+?! Unexplored map
+?? map `main`
+
+Expected: HARNESS-ALLOWS-ERRORS. Under map_delete_mode kill, deleting
+`main` is refused when its carrier holds every other map (destroying it
+would leave the match with none, which made the match unloadable); with
+a third map the deletion goes ahead and names the deck destroyed with
+it. A wreck's corpse forgets a deleted map, so a new `deck` doesn't ride
+the revived ship. Deleting the outer map under a wreck-mode carrier
+leaves its crew aboard the wreck (they used to be ejected onto the dying
+map and killed). The boat's crew lands on the dry cell, and a dismount
+skips the water. Red's board, whose last actor (the scout) died on the
+crypt hidden from red, follows red's hero on `main` again.
+
+SCENARIO 854 — Replays keep the author's authority; links trust one match; aliases can't take command names
+----------------------------------------------------------------------
+
+!as player gm
+!match new g G 6 6
+!match use g
+!ent add u U 10 1 1
+!host add cli
+!macro set m "ent hp u -1\nowner limit default 1\nsystem set default formula_cell_limit 4000"
+!macro run m
+?? Only the bot's owner can use `!owner`.
+!as host
+!match journal export jg
+!match replay jg as=g2 verbose
+?? ✅ The state matched the recording after every command.
+!owner limit
+?? Each server (default): 1000.0 MB
+!assert "rule_get('formula_cell_limit') == 100000"
+!match new dungeon D 6 6
+!match new town T 6 6
+!match use dungeon
+!match link town
+!ent add d1 D1 5 1 1
+!match use town
+!match delete town
+!match new town Evil 6 6
+!match use dungeon
+!undo command
+!match links
+?? `town` (no longer: the match it named is gone; `!match link town` trusts the one there now)
+!match use town
+!ent add bomb Bomb 5 2 2
+!eval "transfer_entity('bomb', 'dungeon', 4, 4)"
+?? doesn't accept units from `town`
+!match use dungeon
+!match link town
+!match use town
+!eval "transfer_entity('bomb', 'dungeon', 4, 4)"
+?? = `'bomb'`
+!alias def roll "roll 1d20"
+?? ❌ `roll` is a command's name; an alias can't take it (it would hide `!roll` everywhere this match is shown).
+!system alias def default undo "roll 1"
+?? ❌ `undo` is a command's name
+!alias def r20 "roll 1d20"
+?? Defined alias
+
+Expected: HARNESS-ALLOWS-ERRORS. A replay runs each recorded command
+with no more authority than its author had: the GM's macro lines that
+needed the bot owner and an admin were refused live and stay refused
+when the owner replays the match (they used to take effect bot-wide).
+A link names the match it was made to: after `town` is deleted and
+another `town` made, an undo brings the link back but it no longer
+trusts the new match, and `!match links` says so; linking again trusts
+it. An alias can't take a command's name (`roll`, `undo`), at match or
+system level.
+
+SCENARIO 855 — Team views: hidden map names, hidden units through !action and !ent, player-written macros and actions
+----------------------------------------------------------------------
+
+!match new nv NV 6 6
+!match use nv
+!map new zqxcrypt 3 3
+!match fog on map=all
+!defvar add fog_vision_radius 1
+!map unseen hidden map=zqxcrypt
+!ent add hero Hero 10 1 1 map=main
+!ent set_var hero team red
+!ent add zqxthief Thief 10 6 6 map=main
+!ent set_var zqxthief team blue
+!ent set_var zqxthief bag.actions.loot.target none
+!ent set_var zqxthief bag.actions.loot.body "entity[self].looted = True"
+!match bind nv pov=red
+!host access set action all
+!host access set ent all
+!host access set macro all
+!as player alice
+!match info
+?! zqxcrypt
+!zone cells nosuch
+?? This match has 1 map (`main`)
+?! zqxcrypt
+!action zqxthief loot
+?? ❌ Could not find a unit named `zqxthief`. Either it does not exist, or this channel currently does not have permission to view it.
+!action nosuch loot
+?? ❌ Could not find a unit named `nosuch`. Either it does not exist, or this channel currently does not have permission to view it.
+!ent hp zqxthief 1
+?? ❌ Could not find a unit named `zqxthief`.
+!ent set_var hero bag.actions.x.body "cmd('host add alice')"
+?? ❌ Only a host can write under an `actions` var
+!ent set_var hero note hello
+!macro set evil "host add alice\nent hp hero 1"
+!macro run evil
+?? ❌ `!host` can't run inside a batch, foreach or player-written macro for you
+!as host
+!assert "not var_has('zqxthief', 'looted') and entity[hero].note == 'hello' and entity[hero].hp == 1"
+!as view omniscient
+!match info
+?? `zqxcrypt` 3x3 (fog)
+
+Expected: HARNESS-ALLOWS-ERRORS. In red's channel the crypt, hidden
+from red, stays out of `!match info` and of the "name a map" refusal,
+which counts only the maps red may name. With `action` and `ent` opened
+to players, a hidden unit reads exactly like a missing one through
+`!action` and `!ent` (its action used to run). A player may write a
+note var but not an action body, and a macro the player wrote runs its
+lines gated as the player: `!host add` is refused, while `!ent hp hero
+1` (opened to players) runs. An omniscient view's `!match info` lists
+every map.
+
+SCENARIO 856 — A failed outer action undoes a nested action's transfer; move hooks that move again are bounded
+-------------------------------------------------------------------------------------------------------------
+
+!match new dst856 Dst 8 8
+!match new src856 Src 8 8
+!match use dst856
+!match link src856
+!match use src856
+!ent add a A 10 1 1
+!ent add v V 10 3 3
+!ent set_var a actions.send.target entity
+!ent set_var a actions.send.body "transfer_entity(target, 'dst856', 6, 6)"
+!ent set_var a actions.outer.target entity
+!ent set_var a actions.outer.body "use_action(self, 'send', target)\nfail('outer fails')"
+!action a outer v
+?? ❌ action `outer`: outer fails
+!assert "'v' in all_entities()"
+!match use dst856
+!assert "'v' not in all_entities()"
+!match use src856
+!action a send v
+!assert "'v' not in all_entities()"
+!match new hl856 HL 12 2
+!match use hl856
+!system set default move_hook_recursion_limit 4
+!tile def new slide
+!tile def hook slide on_enter "move_entity(self, entity[self].x + 1, entity[self].y)"
+!tile fill 2 1 12 1 _template slide
+!ent add u U 10 1 1
+!ent move u 1 right
+?? ⚠️ Movement hooks nested past move_hook_recursion_limit (4)
+!assert "entity[u].x == 6"
+!system set default move_hook_recursion_limit 16
+
+Expected: An outer action calls `send`, which moves `v` into the linked
+match `dst856`, then fails: the rollback brings `v` back to `src856` and
+`dst856` holds no copy (the cross-match guard covers every enclosing
+action level). Run on its own, `send` moves it. A slide tile whose
+on_enter hook moves the unit one cell on would recurse once per tile;
+`move_hook_recursion_limit` (4 here) stops it: the walk onto (2,1)
+starts the chain and the hooks of moves nested deeper than 4 don't fire,
+so the unit stops at (6,1) with a warning.
+
+
+SCENARIO 857 — Formula value budget for $() and map_with; var_move onto itself or into itself
+---------------------------------------------------------------------------------------------
+
+!match new f857 F 6 6
+!match use f857
+!ent add u U 10 1 1
+!as player alice
+!roll "$(len([range(99999), range(99999), range(99999), range(99999), range(99999), range(99999), range(99999), range(99999), range(99999), range(99999), range(99999)]))"
+?? built more than 1000000 list values (10 x formula_size_limit)
+!as host
+!eval "len(map_with(range(10000), lambda i: range(10000)))"
+?? built more than 1000000 list values
+!eval "len(map_with(range(1000), lambda i: range(100)))"
+?? = `1000`
+!ent set_var u bag.gem 1
+!eval "var_move('u', 'bag', 'u', 'bag')"
+?? = `True`
+!assert "var_get('u', 'bag.gem') == 1"
+!eval "var_move('u', 'bag', 'u', 'bag.inner')"
+?? ❌ var_move: `bag.inner` is inside `bag`, which the move deletes.
+!assert "var_get('u', 'bag.gem') == 1"
+
+Expected: HARNESS-ALLOWS-ERRORS. A formula is charged for the list values
+it builds (range, each, list repetition and concatenation) against 10 x
+formula_size_limit (1,000,000 by default): eleven `range(99999)` in one
+list literal pass a player's `$()` no more, and neither do 10,000 lists
+of 10,000 from `map_with`; 100,000 values are fine. `var_move` onto its
+own path changes nothing (it used to delete the item), and a move into
+its own subtree is refused, so `bag.gem` stays 1.
+
+
+SCENARIO 858 — Smaller refusals: clamp bounds in templates, overwrite placement, smart quotes, team data, status names, log formats
+----------------------------------------------------------------------------------------------------------------------------------
+
+!match new s858 S 6 6
+!match use s858
+!template import mage858 {"name": "Mage", "vars": {"hp": 5, "mana": 1, "max_mana": 5}, "clamps": {"mana": {"path": "mana", "max": "max_mana * 2", "mode": "hard"}}}
+?? a bound is a number or a var path
+!template import mage858 {"name": "Mage", "vars": {"hp": 5, "mana": 1, "max_mana": 5}, "clamps": {"mana": {"path": "mana", "max": "max_mana", "mode": "hard"}}}
+!template spawn mage858 3 3
+!ent set_var mage858 mana 999
+!assert "entity[mage858].mana == 5"
+!history export latest:command overwrite
+?? ❌ Name the file first, then add `overwrite`.
+!store save overwrite
+?? ❌ Name the file first, then add `overwrite`.
+!batch ent add u U 10 1 1 ; ent set_var u note “a ; b” ; ent hp u -1
+!assert "entity[u].note == 'a ; b' and entity[u].hp == 9"
+!team set red res.cp 3
+!team set red res.gold 2
+!team clear red res.cp
+!assert "not team_has('red', 'res.cp') and team_get('red', 'res.gold') == 2"
+!team clear nosuchteam
+?? ❌ team `nosuchteam` has no data or passives.
+!team set red flag true
+!team add red flag 1
+?? ❌ team_add: `red`.flag is True, not a number.
+!status def tag:fire
+?? ❌ `tag:fire` can't be a status name
+!status def a,b
+?? ❌ `a,b` can't be a status name
+!log format nosuchtype "x"
+?? ❌ `nosuchtype` isn't an event type the log records
+
+Expected: HARNESS-ALLOWS-ERRORS. A clamp bound written as a formula is
+refused wherever a clamp arrives (here a template import); a var-path
+bound (`max_mana`) holds, so `mana` stops at 5. `overwrite` in a file
+name's position is refused with a hint, for `!history export` (which
+used to crash) and `!store save` (which used to write a file named
+`overwrite`). Smart quotes group a ` ; ` inside a batch line like
+straight ones. `!team clear red res.cp` clears that one path, a team
+with nothing to clear is refused, and `team_add` refuses a flag. Status
+names a token can't address (`tag:` prefixed, with a comma) and a log
+format for an unknown event type are refused.
+
+
+SCENARIO 859 — Teams stored as text; corpses vs place_random and resize; a strict batch keeps a recreated match's journal
+------------------------------------------------------------------------------------------------------------------------
+
+!match new t859 T 3 1
+!match use t859
+!ent add a A 10 1 1
+!ent add b B 10 2 1
+!ent add c C 10 3 1
+!ent set_var a team 1
+?? vars.team = '1'
+!eval "entity[b].team = '1'"
+!eval "entity[c].team = 2 / 2"
+!assert "entity[a].team == entity[b].team and entity[a].team == entity[c].team"
+!assert "not is_hostile('a', 'c')"
+!team set 1 gold 5
+!assert "team_get(entity[a].team, 'gold') == 5"
+!ent set_var b team.x 1
+?? ❌ Cannot nest under the team var
+!ent kill c
+!tile def new grass glyph=,
+!tile place_random grass 3
+?? Placed template `grass` at 3 random cell(s): (1,1), (2,1), (3,1).
+!assert "has_corpse('c') and tile_get(3, 1, '_template') == 'grass'"
+!map resize 2 1
+?? the corpses of `c` were on the cut cells and are gone
+!assert "not has_corpse('c')"
+!ent hp a 5
+!batch strict match delete t859 ; match new t859 T2 4 4 ; ent hp nobody 3
+?? ⏹ strict batch stopped at line 3
+!match use t859
+!match journal
+?? `!ent hp a 5`
+!assert "entity[a].hp == 5"
+
+Expected: HARNESS-ALLOWS-ERRORS. The team var is stored as text when
+written (as vital vars are stored as numbers): a typed `1`, a formula's
+`'1'` and a computed `2 / 2` are one team "1" to formulas, relations and
+team data alike, and the team var takes no nested path. A cell holding
+only a corpse counts as empty for `!tile place_random` (corpses ride in
+tile data), so three grass tiles fit on the 3x1 map, and the corpse
+stays under its grass. Resizing the map off the corpse's
+cell names the corpse lost. A strict batch that deletes the match, makes
+a new one under its id and then fails brings the original match back with
+its own journal.
+
+
+SCENARIO 860 — A stopped watcher chain waits for a changing command; secret rules in a player's history diff
+-----------------------------------------------------------------------------------------------------------
+
+!system set default persist_undo_history false
+!match new w860 W 4 4
+!match use w860
+!ent add a A 10 1 1
+!system set default watcher_chain_limit 3
+!ent set_var a v 2
+!watch add up "entity[a].v == 0" "entity[a].v = 1"
+!watch add down "entity[a].v == 1" "entity[a].v = 0"
+!ent set_var a v 0
+?? ⚠ watchers still firing after 3 passes
+!assert "entity[a].v == 1"
+!list
+?! watchers still firing
+!dist a a
+?! watchers still firing
+!assert "entity[a].v == 1"
+!ent hp a 9
+?? watchers still firing
+!assert "entity[a].v == 0"
+!watch remove up
+!watch remove down
+!system set default watcher_chain_limit 16
+!system set default random_seed zqxSEED
+!ent hp a 8
+!as player pip
+!history diff command:1 latest:command
+?? rule `random_seed`: '' -> (hidden)
+?! zqxSEED
+!as host
+!history diff command:1 latest:command
+?? zqxSEED
+!system set default random_seed ""
+!system set default persist_undo_history true
+
+Expected: Two watchers flipping `v` stop at watcher_chain_limit (3) with
+a warning, leaving `v` at 1. A read (`!list`, `!dist`) doesn't continue
+the chain; the next command that changes the match (`!ent hp`) does, for
+another 3 passes. With undo snapshots held in memory they carry the
+match's rules, and a player's `!history diff` shows the secret
+`random_seed` as `(hidden)`; a host sees it.
+
+SCENARIO 861 — Capitalised command names; undo keeps working when the journal's one segment fills the storage limit
+------------------------------------------------------------------------------------------------------------------
+
+!match new c861 C 40 40
+!match use c861
+!Ent add u U 1000 1 1
+?? Added `U` with id `u`
+!ROLL 1d1
+?? 1
+!alias def hit "ent hp u -1"
+!Hit
+!assert "entity[u].hp == 999"
+!tile fill 1 1 40 40 terrain "grass with a long description that makes every tile hold some text"
+!owner limit local 0.8
+!ent hp u -1
+!undo command
+!ent hp u -1
+!undo command
+!ent hp u -1
+!undo command
+!ent hp u -1
+!undo command
+?? Undid 1 command(s)
+!ent hp u -1
+!undo command
+?? Undid 1 command(s)
+!assert "entity[u].hp == 999"
+!owner limit local 1000
+
+Expected: A command or alias typed with capitals (`!Ent`, `!ROLL`,
+`!Hit`) runs as the lower-case one (on Discord too, where discord.py
+used to ignore it). With the server limited to 0.8 MB, each undo
+stores the whole match in the command journal, whose one segment fills
+the room: the commit rolls that segment over (a new one starting from
+the state now, the old one dropped) before it would cut undo
+autosaves, so `!undo command` keeps working cycle after cycle and hp
+ends at 999.
+
+SCENARIO 862 — Vehicle moves reach nested maps unless a map is set off; the chain stops there
+-----------------------------------------------------------------------------------------------
+
+!match new nv NV 10 6
+!match use nv
+!map new cabin 5 4
+!map new hold 4 4
+!map new vault 3 3
+!ent add wagon Wagon 50 2 2 map=main
+!ent set_vars wagon footprint_w=2 footprint_h=2
+!map attach cabin wagon
+!ent add box Box 20 4 2 map=cabin
+!map attach hold box
+!ent add crate Crate 10 3 3 map=hold
+!map attach vault crate
+!ent add driver Driver 10 1 1 map=cabin
+!ent add mouse Mouse 3 1 1 map=hold
+!ent add gnome Gnome 3 2 2 map=vault
+!ent set_var box jolts 0
+!ent set_var crate jolts 0
+!ent set_var driver jolts 0
+!ent set_var mouse jolts 0
+!ent set_var gnome jolts 0
+!gpassive add jolt on_map_vehicle_moved "entity[self].jolts = entity[self].jolts + 1"
+!ent move wagon 1 right
+!assert "entity[driver].jolts == 1 and entity[mouse].jolts == 1 and entity[gnome].jolts == 1"
+!map var set nested_vehicle_moves off map=hold
+!ent move wagon 1 right
+!assert "entity[driver].jolts == 2 and entity[mouse].jolts == 1 and entity[gnome].jolts == 1"
+!map var del nested_vehicle_moves map=hold
+!system set default nested_vehicle_moves false
+!ent move wagon 1 right
+!assert "entity[driver].jolts == 3 and entity[mouse].jolts == 1 and entity[gnome].jolts == 1"
+!map var set nested_vehicle_moves on map=hold
+!ent move wagon 1 right
+!assert "entity[driver].jolts == 4 and entity[mouse].jolts == 2 and entity[gnome].jolts == 1"
+!ent move box 1 down
+!assert "entity[driver].jolts == 4 and entity[mouse].jolts == 3 and entity[gnome].jolts == 1"
+!system set default nested_vehicle_moves true
+
+Expected: A wagon carries the cabin map; a box on the cabin carries the
+hold; a crate in the hold carries the vault. With nested_vehicle_moves
+on (the default) a wagon move reaches all three maps: the driver, the
+mouse and the gnome each count one jolt. Setting the hold's map var off
+stops the chain at the hold, so neither the mouse nor the gnome (one
+level further in) is reached. With the rule off and no map var, only
+the cabin (the map the wagon carries itself) is reached; the hold's own
+var set on reaches the hold again, while the vault reads the rule (off)
+and stays out. The box's own move reaches the hold it carries itself
+(the mouse), and the vault, nested one level deeper, reads the rule
+(off), so the gnome stays at 1.
+
+SCENARIO 863 — Dated copies of the server files: listing, restoring systems, undoing the restore, retention
+-------------------------------------------------------------------------------------------------------------
+
+!match new bk Bk 4 4
+!match use bk
+!ent add u U 10 1 1
+!system set default hp_var health
+!system new extra
+!server backups systems
+?? systems.json 3
+?! systems.json 4
+!server backups
+?? workspace.json 1
+?? audit.json 1
+!server backups restore 9
+?? There are 3 copies of systems.json
+!server backups restore 3
+?? ♻️ Restored the systems from the copy of
+!assert "var_has('u', 'hp') and not var_has('u', 'health')"
+!system list
+?! extra
+!system undo
+?? `!server backups restore 3`
+?? 1 unit(s) moved their vars to the names the restored rules give.
+!assert "var_has('u', 'health')"
+!system list
+?? extra
+!as restart
+!assert "var_has('u', 'health')"
+!owner ceiling server_backup_count 2
+!system set default turnorder_direction lowest_first
+!server backups systems
+?? systems.json 2
+?! systems.json 3
+!server backups nonsense
+?? isn't a backed-up file
+!owner ceiling server_backup_count reset
+
+Expected: HARNESS-ALLOWS-ERRORS. Each commit that changes systems.json,
+workspace.json, system_history.json or audit.json also writes a dated
+copy of it; `!server backups` numbers each file's copies on their own,
+newest first. systems.json has three copies here (created, after the
+`hp_var` change, after `!system new extra`). Restoring copy 3, the
+oldest, puts `hp` back on the unit and drops `extra`; the restore is an
+ordinary server-wide step, so `!system undo` takes it back (`health`
+and `extra` again), which a restart keeps. A copy number past the list
+is refused. With server_backup_count lowered to 2 the next copy prunes
+systems.json down to its 2 newest. An unknown file name is refused.
+
+
+SCENARIO 864 — A server whose systems.json fails to load is locked until an administrator recovers it
+--------------------------------------------------------------------------------------------------------
+
+!system new pf
+!system set pf hp_var health
+!match new lk Lk 6 6 pf
+!match use lk
+!ent add u U 10 1 1
+!system new keep
+?file corrupt systems.json
+!as restart
+!list
+?? 🔒 This server is locked: systems.json failed to load (JSONDecodeError)
+!ent hp u 3
+?? 🔒 This server is locked
+!server recover
+?? Matches whose system is lost, with no backup of it: `lk` (`pf`)
+?? `!server recover backup <n>`
+!server recover accept
+?? This moves `lk` (from `pf`) to the `default` system
+!as restart
+!server recover
+?? systems.json is missing
+!server recover backup 1
+?? 🔓 Recovered: the systems are back from the copy of
+!assert "var_has('u', 'health')"
+!system list
+?? keep
+!ent hp u 3
+!as restart
+!assert "entity[u].health == 3"
+!server recover
+?? This server isn't locked
+
+Expected: HARNESS-ALLOWS-ERRORS. Match `lk` runs on system `pf`, whose
+hp var is `health`. Cutting the end off systems.json and restarting
+leaves `pf` unloadable and the match file carries no copy of it (the
+system_load_failure rule is `hold` by default), so the server is locked:
+every command but `!server recover`, `!server backups`, `!help` and `!as`
+is refused with the reason, and nothing is saved, so the unit keeps its
+`health` var on disk (the old load moved the match to `default` and
+renamed it to `hp`). `!server recover` names the match and the options;
+`accept` only previews without `confirm`. A second restart finds
+systems.json missing (the failed load moved it to corrupt/) and stays
+locked. Restoring the newest dated copy brings back `pf` and `keep`,
+unlocks the server, and the match plays and saves again.
+
+
+SCENARIO 865 — Matches carrying a backup of their system rebuild it; a match without one still locks the server
+-------------------------------------------------------------------------------------------------------------------
+
+!system new pf
+!system set pf hp_var health
+!system set pf system_load_failure match_backup
+!system new kid parent=pf
+!match new mb Mb 6 6 kid
+!match use mb
+!ent add u U 10 1 1
+!system default server kid
+!system new loose
+?file corrupt systems.json
+!as restart
+!assert "var_has('u', 'health')"
+!system list
+?? **kid** (inherits from `pf`)
+?! loose
+!system new plain
+!match new pl Pl 4 4 plain
+!match use pl
+!ent add v V 10 1 1
+!match use mb
+?file delete systems.json
+!as restart
+!server recover
+?? `pl` (`plain`)
+?? Matches whose file carries a backup of their system (rebuilt by either option): `mb` (`kid`)
+!server recover accept confirm
+?? 🔓 Recovered: 1 match(es) moved to `default`
+!assert "var_has('u', 'health')"
+!match use pl
+!assert "var_has('v', 'hp')"
+!match info
+?? system `default`
+
+Expected: HARNESS-ALLOWS-ERRORS. With `system_load_failure` set to
+`match_backup` on `pf` (and so on `kid`, which inherits it), match `mb`'s
+file carries a copy of `kid` and `pf`. When systems.json fails to load,
+the load rebuilds both from it (with kid's parent link and the server's
+default pointer), so the server isn't locked and the unit keeps
+`health`; `loose`, which no match used, is gone (a dated copy still
+holds it). A match on `plain`, which has no backup, locks the server
+when systems.json goes missing; `accept confirm` rebuilds `mb`'s systems
+from its backup and moves `pl` to `default`.
+
+
+SCENARIO 866 — An undo snapshot file lost from disk is dropped from the history; saving goes on
+-------------------------------------------------------------------------------------------------
+
+!match new ls Ls 6 6
+!match use ls
+!ent add u U 10 1 1
+!ent hp u -1
+!ent hp u -1
+!ent hp u -1
+?file delete matches/ls/history/2.json
+!as restart
+!ent hp u -1
+!as restart
+!assert "entity[u].hp == 6"
+!undo command
+?? Undid 1 command(s)
+!assert "entity[u].hp == 7"
+
+Expected: Deleting one undo snapshot's file (as a crash between a
+commit's writes and deletes used to leave it, or an operator pruning
+history) no longer stops the server from saving: the load drops the
+snapshot with a console note, the next command saves (hp 6 survives a
+restart), and undo works with the snapshots that remain.

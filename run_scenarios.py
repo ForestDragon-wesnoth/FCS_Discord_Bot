@@ -153,7 +153,8 @@ def parse_scenarios(path: str) -> List[Tuple[int, str, List[str], "frozenset[str
         for ln in body.splitlines():
             if ln.strip().lower().startswith("expected:"):
                 break
-            if ln.startswith(("!", _TAB_PREFIX)) or ln.startswith(_EXPECT_PREFIXES):
+            if ln.startswith(("!", _TAB_PREFIX, _FILE_PREFIX)) \
+                    or ln.startswith(_EXPECT_PREFIXES):
                 cmds.append(ln)
         out.append((num, title, cmds, allows))
     return out
@@ -161,6 +162,33 @@ def parse_scenarios(path: str) -> List[Tuple[int, str, List[str], "frozenset[str
 
 _EXPECT_PREFIXES = ("??", "?!")
 _TAB_PREFIX = "?tab "
+# `?file corrupt <path>` / `?file delete <path>`: damage a file of the
+# scenario's server folder (a path relative to it), as a crash or a careless
+# operator would, to test what a load does with it (`!as restart`).
+_FILE_PREFIX = "?file "
+
+
+def _file_action(line: str, workspaces, ctx) -> List[str]:
+    words = line[len(_FILE_PREFIX):].split()
+    st = getattr(workspaces, "storage", None)
+    if len(words) != 2 or words[0] not in ("corrupt", "delete") or st is None:
+        return ["💥 Usage: ?file corrupt|delete <path in the server folder>"]
+    path = os.path.join(st.server_dir(ctx.guild_key), words[1])
+    if not os.path.isfile(path):
+        return [f"💥 ?file: no file {words[1]}"]
+    if words[0] == "delete":
+        os.remove(path)
+        out = [f"(deleted {words[1]})"]
+    else:
+        with open(path, "r+", encoding="utf-8") as f:
+            text = f.read()
+            f.seek(0)
+            f.write(text[:max(0, len(text) - 5)])
+            f.truncate()
+        out = [f"(cut the end off {words[1]})"]
+    # The usage counter measures the folder again, as a restart would.
+    st.rescan()
+    return out
 
 
 def _tab_reply(line: str, mgr, ctx) -> List[str]:
@@ -221,6 +249,11 @@ async def _run_cmds(cmds: List[str], workspaces) -> List[Tuple[str, List[str]]]:
     for line in cmds:
         if line.startswith(_EXPECT_PREFIXES):
             transcript.append((line, [_check_expectation(line, previous)]))
+            continue
+        if line.startswith(_FILE_PREFIX):
+            out = _file_action(line, workspaces, ctx)
+            transcript.append((line, out))
+            previous = out
             continue
         if line.startswith(_TAB_PREFIX):
             try:

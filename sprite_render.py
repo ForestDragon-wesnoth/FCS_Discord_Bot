@@ -111,8 +111,13 @@ _PALETTE_RGB: Dict[str, Tuple[int, int, int]] = {
     "bright_magenta": (255, 85, 255), "bright_cyan": (85, 255, 255),
     "bright_white": (255, 255, 255),
 }
+# The largest side a loaded sprite keeps (a bigger PNG is scaled down once).
+_SPRITE_MAX_SIDE = 2048
 # Share of a stretch-mode body (each side) its glyph fallback fills.
 _GLYPH_FILL = 0.7
+# The largest size a stretch body's glyph fallback is drawn at; a larger body
+# scales the drawn shape up (only the part in the window is built).
+_GLYPH_DRAW_MAX = 2048
 
 
 # ----------------------------------------------------------------------------
@@ -132,7 +137,8 @@ class SpriteLoader:
         the same key wins)."""
         self.folder = os.path.abspath(folder)
         self.folders = ([os.path.abspath(first)] if first else []) + [self.folder]
-        self._cache: Dict[Optional[str], Optional["Image.Image"]] = {}
+        self._cache: Dict[Optional[str], Tuple[Optional[str], Optional[float],
+                                               Optional["Image.Image"]]] = {}
 
     def _safe_path(self, key: Any, folder: Optional[str] = None) -> Optional[str]:
         folder = folder or self.folder
@@ -151,24 +157,36 @@ class SpriteLoader:
         return full
 
     def get(self, key: Any) -> Optional["Image.Image"]:
+        """The sprite of `key`, re-read when the file it comes from changes
+        (a PNG dropped in or replaced while the bot runs shows on the next
+        render; the cache keeps the file's path and modification time)."""
         ck = key if isinstance(key, str) else None
-        if ck in self._cache:
-            return self._cache[ck]
-        img: Optional["Image.Image"] = None
-        path = None
+        path, mtime = None, None
         for folder in self.folders:
             cand = self._safe_path(key, folder)
             if cand and os.path.isfile(cand):
                 path = cand
+                try:
+                    mtime = os.path.getmtime(cand)
+                except OSError:
+                    mtime = None
                 break
+        hit = self._cache.get(ck)
+        if hit is not None and hit[0] == path and hit[1] == mtime:
+            return hit[2]
+        img: Optional["Image.Image"] = None
         if path:
             try:
                 with Image.open(path) as im:
                     if (im.format or "").upper() == "PNG":
                         img = im.convert("RGBA")
+                        # Cells are at most a few hundred pixels: a huge
+                        # PNG is kept at a size a render can use.
+                        if max(img.size) > _SPRITE_MAX_SIDE:
+                            img.thumbnail((_SPRITE_MAX_SIDE, _SPRITE_MAX_SIDE))
             except Exception:
                 img = None
-        self._cache[ck] = img
+        self._cache[ck] = (path, mtime, img)
         return img
 
     def clear(self) -> None:
@@ -357,6 +375,7 @@ class SceneRenderer:
     _LEGEND_SWATCH = 28
     _LEGEND_TEXT = 15
     _LEGEND_MAX = 40
+    _LEGEND_LABEL_MAX = 300     # characters; no image is wide enough for more
 
     def _legend_swatch(self, entry) -> "Image.Image":
         """A small square showing an entry's look, drawn as on the map."""
@@ -388,13 +407,19 @@ class SceneRenderer:
         S, T = self._LEGEND_SWATCH, self._LEGEND_TEXT
         shown = entries[:self._LEGEND_MAX]
         more = len(entries) - len(shown)
-        texts = [", ".join(e.get("labels") or []) for e in shown]
+        # No column is wider than the widest image, so a label longer than
+        # that many characters can't show anyway: it is cut first.
+        cap = self._LEGEND_LABEL_MAX
+        texts = []
+        for e in shown:
+            t = ", ".join(map(str, e.get("labels") or []))
+            texts.append(t if len(t) <= cap else t[:cap] + "…")
         if more:
             texts.append(f"…and {more} more")
         probe = ImageDraw.Draw(Image.new("L", (1, 1)))
 
-        def width(t: str) -> int:
-            f = self.font(int(T / 0.6), t)
+        def width(t: str, f=None) -> int:
+            f = f or self.font(int(T / 0.6), t)
             try:
                 b = probe.textbbox((0, 0), t, font=f)
                 return b[2] - b[0]
@@ -406,12 +431,24 @@ class SceneRenderer:
         room = colw - S - 2 * gap
         for i, t in enumerate(texts):
             if width(t) > room:
-                while len(t) > 1 and width(t + "…") > room:
-                    t = t[:-1]
-                texts[i] = t + "…"
+                # One font for the label and its "…" (resolving it per
+                # length tried rendered every character again), and the
+                # cut found by halving.
+                f = self.font(int(T / 0.6), t + "…")
+                lo, hi = 1, len(t)
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    if width(t[:mid] + "…", f) <= room:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                texts[i] = t[:lo] + "…"
         ncols = max(1, (canvas.width - 2 * pad) // colw)
         nrows = -(-len(texts) // ncols)
-        out = Image.new("RGBA", (canvas.width, canvas.height + 2 * pad + nrows * line),
+        # At least one column wide: on a map narrower than that, the legend
+        # widens the image (the map stays at the left).
+        out = Image.new("RGBA", (max(canvas.width, colw + 2 * pad),
+                                 canvas.height + 2 * pad + nrows * line),
                         _BG_FILL)
         out.alpha_composite(canvas, (0, 0))
         d = ImageDraw.Draw(out)
@@ -511,9 +548,10 @@ class SceneRenderer:
         canvas.alpha_composite(Image.new("RGBA", canvas.size, rgb))
 
     def _draw_placement(self, canvas, p, ox, oy, cols, rows):
-        """One placement: its whole body is drawn, then the part inside the
-        window is pasted (a body whose anchor is off the window can still
-        show its other cells)."""
+        """One placement. Only the part of its body inside the window (plus
+        a margin for the outline) is built, then pasted: a body whose anchor
+        is off the window still shows its other cells, and a huge body costs
+        what the window shows, never its whole area in pixels."""
         cell = self.cell
         gx, gy = int(p.get("x", 1)), int(p.get("y", 1))
         w, h = max(1, int(p.get("w", 1))), max(1, int(p.get("h", 1)))
@@ -527,6 +565,23 @@ class SceneRenderer:
         img = self.loader.get(key) if key else None
         opacity = int(p.get("opacity", 100))
         outline = None
+        if img is not None and p.get("kind") == "entity":
+            outline = self._rgb(p.get("tint"))
+        if outline is not None and self._unit["outline_width"] > 0:
+            margin = self._outline_px() + 2
+        else:
+            outline, margin = None, 0
+        # The body's pixels, and the box of them that is drawn: the window
+        # plus `margin` on each side (the outline reads its neighbours).
+        W, H = w * cell, h * cell
+        x0, y0 = (gx - ox) * cell, (gy - oy) * cell
+        box = (max(0, -x0 - margin), max(0, -y0 - margin),
+               min(W, cols * cell - x0 + margin),
+               min(H, rows * cell - y0 + margin))
+        if box[2] <= box[0] or box[3] <= box[1]:
+            return
+        piece = None        # one cell's look, tiled over the box
+        body = None         # the box's look, built directly
         if img is not None:
             if p.get("flip_h"):
                 img = ImageOps.mirror(img)
@@ -536,12 +591,17 @@ class SceneRenderer:
                 # A unit's colour: a blended tint (team_tint_opacity) and
                 # an outline around the sprite, added once the body is built.
                 img = self._tint(img, p.get("tint"), self._unit["tint_opacity"])
-                outline = self._rgb(p.get("tint"))
             else:
                 img = self._tint(img, p.get("tint"))
             img = self._scale_alpha(img, opacity)
-            piece = img.resize((cell, cell)) if mode != "stretch" \
-                else img.resize((w * cell, h * cell))
+            if mode == "stretch":
+                iw, ih = img.size
+                body = img.resize(
+                    (box[2] - box[0], box[3] - box[1]),
+                    box=(box[0] * iw / W, box[1] * ih / H,
+                         box[2] * iw / W, box[3] * ih / H))
+            else:
+                piece = img.resize((cell, cell))
         else:
             glyph = p.get("glyph")
             if not (isinstance(glyph, str) and glyph):
@@ -562,20 +622,28 @@ class SceneRenderer:
                 gtint = p.get("glyph_tint", p.get("tint"))
                 gop = int(p.get("glyph_opacity", opacity))
                 if mode == "stretch":
-                    piece = self._fill_glyph(glyph, w * cell, h * cell, gtint, gop)
+                    body = self._fill_glyph(glyph, W, H, gtint, gop, box)
                 else:
                     piece = self._glyph_layer(glyph, cell, gtint, gop)
-        body = piece
-        if mode == "tile":
-            body = Image.new("RGBA", (w * cell, h * cell), (0, 0, 0, 0))
-            for dy in range(h):
-                for dx in range(w):
-                    body.alpha_composite(piece, (dx * cell, dy * cell))
-        if outline is not None and self._unit["outline_width"] > 0:
+        if body is None:
+            body = Image.new("RGBA", (box[2] - box[0], box[3] - box[1]),
+                             (0, 0, 0, 0))
+            for dy in range(box[1] // cell, (box[3] - 1) // cell + 1):
+                for dx in range(box[0] // cell, (box[2] - 1) // cell + 1):
+                    px, py = dx * cell - box[0], dy * cell - box[1]
+                    body.alpha_composite(piece, (max(0, px), max(0, py)),
+                                         (max(0, -px), max(0, -py)))
+        if outline is not None:
             body = self._outline(body, outline)
-        x0, y0 = (gx - ox) * cell, (gy - oy) * cell
-        sx, sy = max(0, -x0), max(0, -y0)
-        canvas.alpha_composite(body, (x0 + sx, y0 + sy), (sx, sy))
+        bx, by = x0 + box[0], y0 + box[1]
+        sx, sy = max(0, -bx), max(0, -by)
+        canvas.alpha_composite(body, (bx + sx, by + sy), (sx, sy))
+
+    def _outline_px(self) -> int:
+        """team_outline_width at sprite_cell_size cells, scaled to this cell
+        size, in pixels."""
+        return max(1, round(self._unit["outline_width"] * self.cell
+                            / max(1, self._base)))
 
     def _outline(self, body, rgb):
         """`body` with an outline in `rgb` around its drawn shape:
@@ -584,7 +652,7 @@ class SceneRenderer:
         room, and just inside the body's edge where the shape reaches it."""
         from PIL import ImageFilter, ImageChops
         u = self._unit
-        wpx = max(1, round(u["outline_width"] * self.cell / max(1, self._base)))
+        wpx = self._outline_px()
         alpha = body.getchannel("A").point(lambda v: 255 if v >= 128 else 0)
         pad = Image.new("L", (body.width + 2 * wpx, body.height + 2 * wpx), 0)
         pad.paste(alpha, (wpx, wpx))
@@ -606,21 +674,36 @@ class SceneRenderer:
         out.alpha_composite(layer)
         return out
 
-    def _fill_glyph(self, glyph, bw, bh, tint, opacity):
-        """A bw x bh layer with the glyph's drawn shape scaled up (keeping
-        its proportions) to fill _GLYPH_FILL of the box, centred: the glyph
-        fallback of a stretch-mode body."""
-        side = max(bw, bh)
+    def _fill_glyph(self, glyph, bw, bh, tint, opacity, box=None):
+        """The glyph fallback of a stretch-mode body: on a bw x bh body, the
+        glyph's drawn shape scaled up (keeping its proportions) to fill
+        _GLYPH_FILL of it, centred. Returns the part inside `box` (body
+        pixels, default all of it). The glyph is drawn at most
+        _GLYPH_DRAW_MAX pixels high and scaled from there, so a huge body
+        costs what the box shows."""
+        if box is None:
+            box = (0, 0, bw, bh)
+        out = Image.new("RGBA", (box[2] - box[0], box[3] - box[1]),
+                        (0, 0, 0, 0))
+        side = min(max(bw, bh), _GLYPH_DRAW_MAX)
         layer = self._glyph_layer(glyph, side, tint, opacity)
-        out = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
         ink = layer.getchannel("A").getbbox()
         if not ink:
             return out
         shape = layer.crop(ink)
         k = min(bw * _GLYPH_FILL / shape.width, bh * _GLYPH_FILL / shape.height)
-        size = (max(1, round(shape.width * k)), max(1, round(shape.height * k)))
-        shape = shape.resize(size, Image.LANCZOS)
-        out.alpha_composite(shape, ((bw - size[0]) // 2, (bh - size[1]) // 2))
+        fw, fh = max(1, round(shape.width * k)), max(1, round(shape.height * k))
+        sx0, sy0 = (bw - fw) // 2, (bh - fh) // 2
+        ix0, iy0 = max(box[0], sx0), max(box[1], sy0)
+        ix1, iy1 = min(box[2], sx0 + fw), min(box[3], sy0 + fh)
+        if ix1 <= ix0 or iy1 <= iy0:
+            return out
+        kx, ky = shape.width / fw, shape.height / fh
+        part = shape.resize(
+            (ix1 - ix0, iy1 - iy0), Image.LANCZOS,
+            box=((ix0 - sx0) * kx, (iy0 - sy0) * ky,
+                 (ix1 - sx0) * kx, (iy1 - sy0) * ky))
+        out.alpha_composite(part, (ix0 - box[0], iy0 - box[1]))
         return out
 
     def _glyph_layer(self, glyph, side, tint, opacity):

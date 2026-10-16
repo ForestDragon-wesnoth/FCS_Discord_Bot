@@ -33,7 +33,7 @@ from sprite_render import (
 
 from logic import LOCAL_WORKSPACE
 from storage import open_workspaces, load_local_settings, local_persistence_note
-from vtt_commands import registry, _view_pov, split_command_line
+from vtt_commands import registry, _view_pov, split_command_line, quote_unclosed
 from completion import apply_completion, format_candidates
 
 
@@ -585,7 +585,8 @@ class GuiApp:
         self._view = None     # so does a `!map` view
         # One command per `!` line; a `!template import <name> <json>`
         # continues over the lines that follow it without a `!` (pasted
-        # JSON spans lines), wherever it sits in the block.
+        # JSON spans lines), wherever it sits in the block, and so does a
+        # line whose quote is still open (a multi-line body).
         lines: List[str] = []
         for raw in block.splitlines():
             ln = raw.strip()
@@ -595,6 +596,11 @@ class GuiApp:
                     and re.match(r"!template\s+import\s", lines[-1],
                                  re.IGNORECASE)):
                 lines[-1] += "\n" + ln
+            elif (lines and not ln.startswith("!")
+                    and quote_unclosed(lines[-1])):
+                # A quoted body typed over several lines (Shift+Enter): one
+                # command, its line breaks the `\n` a body reads.
+                lines[-1] += "\\n" + raw.rstrip()
             else:
                 lines.append(ln)
         if not lines:

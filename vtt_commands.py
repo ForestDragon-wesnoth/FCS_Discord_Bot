@@ -15,7 +15,7 @@ from logic import (
 )
 
 # Passive system
-from logic import COMMAND_USER, COMMAND_VIEW, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES
+from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -278,7 +278,7 @@ def _admin_required(name: str, args: List[str]) -> bool:
     if name in ("store", "run"):
         return True
     if name == "server":
-        return sub in ("wipe", "audit")
+        return sub in ("wipe", "audit", "backups", "recover")
     if name in ("defvar", "defpassive", "gclamp"):
         # System-level defaults; `list` (and the bare usage form) only read.
         if name == "defvar" and sub == "map":
@@ -457,7 +457,12 @@ class CommandRegistry:
         mid = mgr.active_by_channel.get(ctx.channel_key)
         if mid is None or mid not in mgr.matches:
             return name, args
-        expansion = mgr.matches[mid].aliases.get(name)
+        # A command's own name is never an alias (one saved before that was
+        # refused could lock `!alias`, `!match` and `!undo` away).
+        if name.lower() in self._handlers:
+            return name, args
+        aliases = mgr.matches[mid].aliases
+        expansion = aliases.get(name) or aliases.get(name.lower())
         if not expansion:
             return name, args
         try:
@@ -523,9 +528,9 @@ class CommandRegistry:
         if _GATE_LINES.get() and not getattr(ctx, "auto_approve", False) \
                 and ctx_user(ctx) is not None \
                 and self._gate_decision(name, args, ctx, mgr) != "allow":
-            await ctx.send(f"❌ `!{name}` can't run inside a batch or "
-                           f"foreach for you: it needs a host (send it on "
-                           f"its own).")
+            await ctx.send(f"❌ `!{name}` can't run inside a batch, "
+                           f"foreach or player-written macro for you: it "
+                           f"needs a host (send it on its own).")
             return
         # Inline-formula `$(...)` substitution for sub-command lines (a macro /
         # batch / foreach inner command), so $() resolves per line in the
@@ -777,6 +782,15 @@ class CommandRegistry:
         # that one reverted both), and a `!batch` stopped being one unit.
         # A run nested in this task (an approval, `!again`, a held command)
         # already holds the lock.
+        # Command names are lower case; a keyboard that capitalises the first
+        # word (`!Ent`) still names the command.
+        if name not in self._handlers and name.lower() in self._handlers:
+            name = name.lower()
+        # A server locked by a failed load (MatchManager.recovery) runs only
+        # what recovers it.
+        if getattr(mgr, "recovery", None) and not _runs_while_locked(name,
+                                                                      args):
+            return await ctx.send(_locked_text(mgr))
         if _HOLDS_COMMAND_LOCK.get():
             return await self._run_top(name, args, ctx, mgr)
         async with _command_lock(mgr):
@@ -823,6 +837,7 @@ class CommandRegistry:
         view_token = COMMAND_VIEW.set(
             lambda vm: vm.channel_map(view_ctx.channel_key,
                                       _view_pov(view_ctx, vm, [])).name)
+        pov_token = COMMAND_POV.set(lambda vm: _view_pov(view_ctx, vm, []))
         # A typed command (not a nested run: an approval, `!again`) is one
         # `!system undo` step and one `!server audit` entry when it changes
         # anything server-wide. `!as` can swap the whole workspace.
@@ -858,6 +873,7 @@ class CommandRegistry:
             if audit_token is not None:
                 _AUDIT_NOTES.reset(audit_token)
             COMMAND_VIEW.reset(view_token)
+            COMMAND_POV.reset(pov_token)
             COMMAND_USER.reset(user_token)
             PARTIAL_CACHE.reset(cache_token)
             CURRENT_WORKSPACE.reset(ws_token)
@@ -980,6 +996,14 @@ class CommandRegistry:
             if handled is not None:
                 handled.add(jm.id)
 
+        # A watcher chain stopped by watcher_chain_limit continues only
+        # after a command that changes the match: the state before it.
+        wpre = None
+        if (jm is not None and jm._watcher_backlog
+                and getattr(jm, "_action_depth", 0) == 0):
+            wpre = (jpre if jpre is not None else pre_state if pre_state
+                    is not None else jm.to_dict(include_history=False))
+
         # Reset the per-command summon budget on the active match.
         # summon_entity increments _summon_count and caps it at the
         # summon_event_limit rule; resetting here makes the budget
@@ -1070,7 +1094,14 @@ class CommandRegistry:
         # lines follow the change that triggered it.
         await _flush_formula_log(ctx)
         mid_now = mgr.active_by_channel.get(ctx.channel_key)
-        if mid_now is not None and mid_now in mgr.matches:
+        poll = not (name == "match" and args
+                    and str(args[0]).lower() == "replay")
+        if (poll and wpre is not None and mid_now == pre_active_mid
+                and mid_now in mgr.matches
+                and not _differs_in_undo_state(
+                    wpre, mgr.matches[mid_now].to_dict(include_history=False))):
+            poll = False        # unchanged: the stopped chain keeps waiting
+        if poll and mid_now is not None and mid_now in mgr.matches:
             if mgr.matches[mid_now].watchers:
                 post_state = None       # a watcher may change it after
             for line in mgr.matches[mid_now].fire_watchers():
@@ -1152,7 +1183,10 @@ def _journal_command(mgr: MatchManager, ctx: ReplyContext, jm: Match,
              "by": COMMAND_USER.get() or "", "uid": ctx_user(ctx),
              "ch": ctx.channel_key, "cmd": [typed] + list(typed_args),
              "rng": [jrng[0], jrng[1], post_m.rng_position()],
-             "hash": state_hash(post)}
+             "hash": state_hash(post),
+             # The author's server authority: a replay runs the command with
+             # no more than this (lines it refused live stay refused).
+             "auth": [ctx_is_admin(ctx), ctx_is_bot_owner(ctx)]}
     answers = _INTERACTIVE_ANSWERS.get()
     if answers and name == "action":
         # Answers typed at a prompt replay as `answer=` tokens.
@@ -1346,6 +1380,11 @@ async def persist_workspace(mgr: MatchManager, ctx: Optional[ReplyContext]) -> N
     mgr._journal_handled = None
     if st is None:
         return
+    ws = getattr(mgr, "workspaces", None)
+    if ws is not None and ws.peek(mgr.guild_key) is not mgr:
+        # `!as restart` replaced this manager with one loaded from disk:
+        # the old one's state must not be written over what was loaded.
+        return
     try:
         msgs = st.commit(mgr)
         if handled is not None:
@@ -1495,17 +1534,25 @@ def _record_server_changes(mgr: MatchManager, ctx: ReplyContext, name: str,
     uid = ctx_user(ctx)
     by = who if not uid or str(uid) == who else f"{who} ({uid})"
     lines = list(notes)
+    # A whole-server replace (wipe, store load) clears the undo stack; a
+    # restored systems.json copy is an ordinary step `!system undo` takes back.
+    replacing = name.lower() in _SERVER_REPLACING_ROOTS and not (
+        name.lower() == "server" and args and str(args[0]).lower() == "backups")
     if changed:
         lines = _server_state_diff(json.loads(pre_text),
                                    json.loads(post_text))[:6] + lines
-        if name.lower() in _SERVER_REPLACING_ROOTS:
+        if replacing:
             if mgr.system_history:
                 mgr.system_history = []
                 lines.append("system undo history cleared")
         elif not skip_step:
             mgr.record_system_step(pre_text, pre_matches, label, by)
     mgr.record_audit(label, by, lines)
-    if changed and name.lower() not in _SERVER_REPLACING_ROOTS:
+    # A recovery replaces the systems (no undo step across it), but the
+    # matches' journals still record the chains they run on from then.
+    recovering = name.lower() == "server" and args \
+        and str(args[0]).lower() == "recover"
+    if changed and (not replacing or recovering):
         _journal_systems(mgr, ctx, json.loads(pre_text), json.loads(post_text),
                          pre_matches, name, args)
 
@@ -2460,10 +2507,9 @@ def _pop_map_opt(args: List[str]) -> Tuple[List[str], Optional[str]]:
 
 
 def _maps_hint(m: "Match", many: bool) -> str:
-    names = ", ".join(f"`{n}`" for n in m.maps)
     opts = ("`map=<name>`, `map=a,b` or `map=all`" if many
             else "`map=<name>`")
-    return f"This match has {len(m.maps)} maps ({names}): add {opts}."
+    return f"{m.maps_text()}: add {opts}."
 
 
 # Sentinel distinguishing "no transient POV override on this ctx" (or no
@@ -2604,6 +2650,14 @@ def _format_clamp_line(path: str, c: "ClampSpec") -> str:
     return f"- `{path}`: {', '.join(parts)}"
 
 
+def _map_info_row(m: "Match", mp: "Map", view: Optional[str]) -> str:
+    """One map in `!match info` as `view` may know it: its name, size and
+    fog, or only its label while that view hasn't seen it."""
+    if m.map_display(mp, view) != "show":
+        return f"{m.map_label(mp, view)} (not seen yet)"
+    return f"`{mp.name}` {mp.size_text()}{' (fog)' if m.fog_on(mp) else ''}"
+
+
 # ---- Commands ----------------------------------------------------------------
 @registry.command("match", usage="!match <subcommand> ...", desc="List matches, create one, or switch the active match for this channel.")
 async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -2618,6 +2672,7 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # match the player may have no part in.
         m = active_match(mgr, ctx)
         pov = _query_pov(ctx, m)
+        view = _view_pov(ctx, m, [])
         cur = (m.turn_order[m.active_index]
                if m.round_started and 0 <= m.active_index < len(m.turn_order)
                else None)
@@ -2633,10 +2688,8 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"**{m.name}** (`{m.id}`) — system `{m.system_name}`, "
             + (f"grid {m.get_map().grid_width}×{m.get_map().grid_height}"
                if len(m.maps) == 1 else
-               "maps " + ", ".join(
-                   f"`{mp.name}` {mp.size_text()}"
-                   f"{' (fog)' if m.fog_on(mp) else ''}"
-                   for mp in m.maps.values()))
+               "maps " + ", ".join(_map_info_row(m, mp, view)
+                                   for mp in m.listed_maps(view)))
             + f", {clock}, current turn: {turn}, "
             + (f"fog {'on' if m.fog_on(m.get_map()) else 'off'}, "
                if len(m.maps) == 1 else "")
@@ -2863,9 +2916,12 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                         if word == "fog" else
                         f"Fog memory is **{onoff(m.fog_memory_on(mp))}** for "
                         f"**{m.name}** (fog itself is {onoff(m.fog_on(mp))}).")
+            view = _view_pov(ctx, m, [])
             return (f"Fog on **{m.name}**'s maps: " + ", ".join(
                 f"`{mp.name}` fog {onoff(m.fog_on(mp))}, memory "
-                f"{onoff(m.fog_memory_on(mp))}" for mp in m.maps.values()) + ".")
+                f"{onoff(m.fog_memory_on(mp))}"
+                for mp in m.listed_maps(view)
+                if m.map_named_for(mp, view)) + ".")
 
         memory = len(args) >= 2 and args[1].lower() == "memory"
         value = (args[2] if len(args) >= 3 else None) if memory else \
@@ -2934,9 +2990,15 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return await ctx.send(
                     f"**{m.name}** accepts units from no other match "
                     f"(`!match link <id>` lets one send them).")
+            def row(i: str) -> str:
+                o = mgr.matches.get(i)
+                if o is None or not mgr.link_trusts(m, o):
+                    return (f"`{i}` (no longer: the match it named is gone; "
+                            f"`!match link {i}` trusts the one there now)")
+                return f"`{i}`"
             return await ctx.send(
                 f"**{m.name}** accepts units sent by transfer_entity from: "
-                + ", ".join(f"`{i}`" for i in m.links) + ".")
+                + ", ".join(row(i) for i in m.links) + ".")
         if await return_help_if_not_enough_args(ctx, args, 2, "match", sub):
             return
         _check_tail(args, 2, (), f"!match {sub} <id>")
@@ -2946,16 +3008,19 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 raise VTTError(f"**{m.name}** doesn't accept units from "
                                f"`{other}`.")
             m.links.remove(other)
+            m.link_stamps.pop(other, None)
             return await ctx.send(f"**{m.name}** no longer accepts units "
                                   f"from `{other}`.")
         if other == m.id:
             raise VTTError("A match can't link to itself.")
         if other not in mgr.matches:
             raise NotFound(f"No match with id `{other}` (see `!match list`).")
-        if other in m.links:
+        if mgr.link_trusts(m, mgr.matches[other]):
             return await ctx.send(f"**{m.name}** already accepts units from "
                                   f"`{other}`.")
-        m.links.append(other)
+        if other not in m.links:
+            m.links.append(other)
+        m.link_stamps[other] = mgr.matches[other].uid
         return await ctx.send(
             f"**{m.name}** now accepts units that formulas in `{other}` send "
             f"with transfer_entity (`!match unlink {other}` revokes it).")
@@ -3987,7 +4052,7 @@ def _wipe_blockers(mgr: MatchManager, scope: str) -> List[str]:
 
 @registry.command(
     "server", snapshot=False,
-    usage="!server <wipe|storage|audit> ...",
+    usage="!server <wipe|storage|audit|backups|recover> ...",
     desc=(
         "This server's data. `!server storage` shows how much disk it uses "
         "against its limit. `!server wipe matches|all` (server "
@@ -4033,6 +4098,10 @@ async def server_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             lines.append(f"- {e.get('at', '?')}{by}: `{e.get('label', '?')}`")
             lines += [f"  · {x}" for x in e.get("notes") or []]
         return await ctx.send("\n".join(lines))
+    if sub == "backups":
+        return await _server_backups(ctx, args, mgr, st)
+    if sub == "recover":
+        return await _server_recover(ctx, args, mgr, st)
     if sub != "wipe":
         return await _help_fallback(ctx, ["server"], args[0])
     if st is not None and not st.persist:
@@ -4118,6 +4187,277 @@ async def server_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     return await _help_fallback(ctx, ["server", "wipe"], args[1])
 
 
+def _runs_while_locked(name: str, args: List[str]) -> bool:
+    """What a locked server still runs: its recovery, the copies it
+    recovers from, help, and the CLI's identity / restart switch."""
+    sub = str(args[0]).lower() if args else ""
+    return (name == "server" and sub in ("recover", "backups")) \
+        or name in ("help", "as")
+
+
+def _locked_text(mgr: MatchManager) -> str:
+    rec = mgr.recovery or {}
+    return (f"🔒 This server is locked: {rec.get('reason', 'a failed load')}. "
+            f"Nothing runs or is saved until an administrator runs "
+            f"`!server recover`.")
+
+
+async def _server_recover(ctx: ReplyContext, args: List[str],
+                          mgr: MatchManager, st: Any):
+    """`!server recover [backup <n> | accept [confirm]]`: lift the lock a
+    failed load set (MatchManager.recovery)."""
+    rec = mgr.recovery
+    if not rec:
+        _check_tail(args, 1, (), "!server recover")
+        return await ctx.send("This server isn't locked; there's nothing to "
+                              "recover.")
+    uncovered = rec.get("uncovered") or {}
+    covered = rec.get("covered") or {}
+    action = args[1].lower() if len(args) > 1 else ""
+    if not action:
+        sys_copies = list(enumerate(
+            st.backups(mgr.guild_key, "systems.json") if st else [], 1))
+        lines = [f"🔒 **Locked:** {rec.get('reason')}.",
+                 "Matches whose system is lost, with no backup of it: "
+                 + ", ".join(f"`{mid}` (`{n}`)"
+                             for mid, n in sorted(uncovered.items()))]
+        if covered:
+            lines.append("Matches whose file carries a backup of their system "
+                         "(rebuilt by either option): "
+                         + ", ".join(f"`{mid}` (`{n}`)"
+                                     for mid, n in sorted(covered.items())))
+        lines.append("Options:")
+        if sys_copies:
+            lines.append("- `!server recover backup <n>`: restore a dated copy "
+                         "of systems.json; the newest: "
+                         + "; ".join(f"{i}. {_backup_when(e[0])}"
+                                     for i, e in sys_copies[:5]))
+        else:
+            lines.append("- (no dated copy of systems.json to restore)")
+        lines.append("- `!server recover accept`: move those matches to the "
+                     f"`{mgr.default_system_name}` system (their units' vars "
+                     "take its names); shows what it does first.")
+        return await ctx.send("\n".join(lines))
+    if action == "backup":
+        _check_tail(args, 3, (), "!server recover backup <n>")
+        if len(args) < 3:
+            raise VTTError("Usage: `!server recover backup <n>` (the number "
+                           "`!server recover` or `!server backups` lists).")
+        n = _parse_count(args[2], "!server recover backup <n>")
+        stamp, path = _systems_copy(st, mgr, n)
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, ValueError) as ex:
+            raise VTTError(f"Backup {n} can't be read ({type(ex).__name__}).")
+        systems = _systems_from_raw(raw, f"Backup {n}")
+        # Matches whose own backup holds a system the copy lacks get it
+        # from there.
+        for mid, (_mt, chain) in (rec.get("backups") or {}).items():
+            for sname, d in chain.items():
+                if sname not in systems:
+                    systems[sname] = GameSystem.from_dict(copy.deepcopy(d))
+        still = sorted(f"`{mid}` (`{m.system_name}`)"
+                       for mid, m in mgr.matches.items()
+                       if m.system_name not in systems)
+        if still:
+            raise VTTError(f"Backup {n} doesn't hold the systems of "
+                           f"{', '.join(still)}; try an older copy or "
+                           f"`!server recover accept`.")
+        notes = _restore_systems(mgr, systems, f"restore backup {n}")
+        _repoint_defaults(mgr, rec.get("pointers") or {})
+        mgr.recovery = None
+        audit_note(f"recovered from the systems.json copy of "
+                   f"{_backup_when(stamp)}")
+        return await ctx.send("\n".join(
+            [f"🔓 Recovered: the systems are back from the copy of "
+             f"{_backup_when(stamp)}, and the server is unlocked."] + notes))
+    if action == "accept":
+        confirm = len(args) > 2 and args[2].lower() == "confirm"
+        _check_tail(args, 3 if confirm else 2, (),
+                    "!server recover accept [confirm]")
+        target = mgr.default_system_name
+        if not confirm:
+            return await ctx.send(
+                "This moves " + ", ".join(f"`{mid}` (from `{n}`)"
+                                          for mid, n in sorted(uncovered.items()))
+                + f" to the `{target}` system: its rules apply and the "
+                "units' vars take its var names. "
+                + (("Matches with a backup are rebuilt from it: "
+                    + ", ".join(f"`{m}`" for m in sorted(covered)) + ". ")
+                   if covered else "")
+                + "Type `!server recover accept confirm` to go ahead.")
+        notes: List[str] = []
+        if rec.get("backups"):
+            notes += st.rebuild_from_match_backups(
+                mgr, rec["backups"], rec.get("pointers") or {},
+                rec.get("reason", ""))
+        for mid in sorted(uncovered):
+            m = mgr.matches.get(mid)
+            if m is None:
+                continue
+            m.system_name = target
+            notes += [f"`{mid}`: {x}" for x in mgr.apply_system_rules(m)]
+        _repoint_defaults(mgr, rec.get("pointers") or {})
+        mgr.recovery = None
+        audit_note("recovered by moving " + ", ".join(sorted(uncovered))
+                   + f" to {target}")
+        return await ctx.send("\n".join(
+            [f"🔓 Recovered: {len(uncovered)} match(es) moved to `{target}`; "
+             f"the server is unlocked."] + notes))
+    return await _help_fallback(ctx, ["server", "recover"], args[1])
+
+
+def _repoint_defaults(mgr: MatchManager, pointers: Dict[str, Any]) -> None:
+    """The default-system pointers the workspace file named, for the
+    systems that exist again."""
+    d = pointers.get("default")
+    if d in mgr.systems:
+        mgr.default_system_name = d
+    for ch, n in (pointers.get("channels") or {}).items():
+        if n in mgr.systems:
+            mgr.default_system_per_channel[str(ch)] = str(n)
+
+
+def _systems_from_raw(raw: Any, where: str) -> Dict[str, GameSystem]:
+    """A systems.json value as the server's systems, or a clean refusal."""
+    if not isinstance(raw, dict) or not raw:
+        raise VTTError(f"{where} holds no systems.")
+    try:
+        return {str(n): GameSystem.from_dict(copy.deepcopy(d))
+                for n, d in raw.items()}
+    except Exception as ex:  # noqa: BLE001 - any malformed system
+        raise VTTError(f"{where} can't be read as systems "
+                       f"({type(ex).__name__}).")
+
+
+def _restore_systems(mgr: MatchManager, systems: Dict[str, GameSystem],
+                     what: str) -> List[str]:
+    """Make `systems` the server's systems (all or nothing, through
+    _switch_systems). A match whose system isn't among them refuses it; the
+    default pointers keep the names that still exist."""
+    raw = {n: s.to_dict() for n, s in systems.items()}
+    missing = sorted(f"`{mid}` (`{m.system_name}`)"
+                     for mid, m in mgr.matches.items()
+                     if m.system_name not in raw)
+    if missing:
+        raise VTTError(f"Can't {what}: these matches use systems it doesn't "
+                       f"hold: {', '.join(missing)}.")
+    default = mgr.default_system_name
+    if default not in raw:
+        default = "default" if "default" in raw else sorted(raw)[0]
+    target = {"systems": raw, "default_system_name": default,
+              "default_system_per_channel": {
+                  ch: n for ch, n in mgr.default_system_per_channel.items()
+                  if n in raw}}
+    after = {mid: m.system_name for mid, m in mgr.matches.items()}
+    notes = _switch_systems(mgr, target, after, what)
+    notes += mgr.check_system_links()
+    return notes
+
+
+def _systems_copy(st: Any, mgr: MatchManager, n: int) -> Tuple[float, str]:
+    """The n-th newest dated copy of systems.json: (time, path)."""
+    copies = st.backups(mgr.guild_key, "systems.json") if st else []
+    if n > len(copies):
+        raise VTTError(f"There are {len(copies)} copies of systems.json "
+                       f"(`!server backups systems` lists them).")
+    stamp, _name, path = copies[n - 1]
+    return stamp, path
+
+
+def _backup_when(stamp: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(stamp))
+
+
+async def _server_backups(ctx: ReplyContext, args: List[str],
+                          mgr: MatchManager, st: Any):
+    """`!server backups [file] | restore <n>`: the dated copies of the
+    server's critical files (storage.BACKED_UP_FILES), taken each time one
+    changes; `restore` puts a systems.json copy back."""
+    if st is None or not st.persist:
+        raise VTTError("This bot keeps nothing on disk, so there are no "
+                       "server file backups.")
+    from storage import BACKED_UP_FILES
+    if len(args) > 1 and args[1].lower() == "restore":
+        _check_tail(args, 3, (), "!server backups restore <n>")
+        if len(args) < 3:
+            raise VTTError("Usage: `!server backups restore <n>` (the number "
+                           "`!server backups` lists).")
+        n = _parse_count(args[2], "!server backups restore <n>")
+        stamp, path = _systems_copy(st, mgr, n)
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, ValueError) as ex:
+            raise VTTError(f"Backup {n} can't be read "
+                           f"({type(ex).__name__}).")
+        systems = _systems_from_raw(raw, f"Backup {n}")
+        notes = _restore_systems(mgr, systems,
+                                 f"restore backup {n}")
+        audit_note(f"restored systems.json from the copy of "
+                   f"{_backup_when(stamp)}")
+        lines = [f"♻️ Restored the systems from the copy of "
+                 f"{_backup_when(stamp)} ({len(systems)} system(s)); "
+                 f"`!system undo` takes it back."]
+        return await ctx.send("\n".join(lines + notes))
+    fname = None
+    if len(args) > 1:
+        fname = args[1].lower()
+        if not fname.endswith(".json"):
+            fname += ".json"
+        if fname not in BACKED_UP_FILES:
+            raise VTTError(f"`{args[1]}` isn't a backed-up file: "
+                           f"{', '.join(BACKED_UP_FILES)}.")
+        _check_tail(args, 2, (), "!server backups [file]")
+    # Each file's copies are numbered on their own, newest first; `restore
+    # <n>` takes the n-th systems.json copy.
+    shown = []
+    for name in BACKED_UP_FILES:
+        if fname is None or name == fname:
+            shown += [(i, e) for i, e in
+                      enumerate(st.backups(mgr.guild_key, name), 1)]
+    if not shown:
+        return await ctx.send(
+            "No backups yet: a copy is taken each time one of "
+            + ", ".join(BACKED_UP_FILES) + " changes (kept "
+            f"{owner_limit('server_backup_days')} day(s)).")
+    lines = ["**Server file backups** (newest first per file; "
+             "`!server backups restore <n>` restores systems.json copy n):"]
+    for i, (stamp, name, path) in shown[:_BACKUP_ROWS]:
+        lines.append(f"{name} {i} — {_backup_when(stamp)} "
+                     f"({fmt_bytes(os.path.getsize(path))})")
+    if len(shown) > _BACKUP_ROWS:
+        lines.append(f"… and {len(shown) - _BACKUP_ROWS} older.")
+    return await ctx.send("\n".join(lines))
+
+
+_BACKUP_ROWS = 25
+
+
+registry.annotate_sub("server", "backups",
+                      usage="!server backups [file] | restore <n>",
+                      desc="The dated copies of this server's critical files "
+                           "(systems, workspace, system undo history, audit "
+                           "log), taken each time one changes and kept for "
+                           "the days the bot owner sets (server_backup_days, "
+                           "server_backup_count), numbered per file, newest "
+                           "first. `restore <n>` puts systems.json copy n "
+                           "back, re-applying rules to "
+                           "every match (one `!system undo` step); the other "
+                           "files can be copied back by hand. Administrators "
+                           "only.")
+registry.annotate_sub("server", "recover",
+                      usage="!server recover [backup <n> | accept [confirm]]",
+                      desc="Unlock a server locked because systems.json failed "
+                           "to load and some match had no backup of its "
+                           "system (system_load_failure). Bare: why, which "
+                           "matches, the options. `backup <n>` restores a "
+                           "dated copy of systems.json (`!server backups`); "
+                           "`accept` moves the matches to the default system "
+                           "(their units' vars take its names), after a "
+                           "preview. Matches whose files carry a backup are "
+                           "rebuilt from it either way. Administrators only.")
 registry.annotate_sub("server", "storage", usage="!server storage",
                       desc="This server's disk use against its storage limit, broken down largest first: each match and its undo history, templates, old template versions, saves, sprites, corrupt files and the workspace / systems files.")
 registry.annotate_sub("server", "audit", usage="!server audit [n]",
@@ -4140,6 +4480,9 @@ _RAW_JSON_TAIL = re.compile(r"^\s*(import)\s+(\S+)\s+(.+?)\s*$",
 def _split_semicolons(text: str) -> List[str]:
     """`text` cut at every `;` standing as a word of its own outside quotes
     (the separator `!batch` / `!foreach` use), as raw text pieces."""
+    # Smart quotes count as the quotes they stand for, as the line splitter
+    # reads them (_straight_quotes).
+    text = _straight_quotes(text)
     pieces: List[str] = []
     cur: List[str] = []
     quote = None
@@ -4215,6 +4558,16 @@ _IMPORT_HEAD = re.compile(r"!?\s*template\s+import\s+\S+\s*(.*)\Z",
                           re.I | re.S)
 
 
+def quote_unclosed(line: str) -> bool:
+    """Whether `line` leaves a quote open: a quoted body typed over several
+    lines (Shift+Enter on Discord or in the GUI) continues on the next."""
+    try:
+        split_command_line(line)
+    except ValueError as ex:
+        return "closing quotation" in str(ex)
+    return False
+
+
 def import_unfinished(line: str) -> bool:
     """Whether `line` is a `template import` whose JSON is still open (a `{`
     / `[` not yet closed outside strings, or a ``` fence not yet closed):
@@ -4265,9 +4618,10 @@ def _template_may_save(ctx: ReplyContext, mgr: MatchManager) -> None:
     """Saving a template needs a host of this channel's match (or a server
     administrator), and an identity to record as its saver."""
     if ctx_user(ctx) is None:
-        raise VTTError("Templates can only be saved by a person typing the "
-                       "command (an action body has no one to record as the "
-                       "saver).")
+        raise VTTError("Templates can only be saved with an identity to "
+                       "record as the saver (a command a person runs, or an "
+                       "action they run with `template` on "
+                       "action_cmd_allowlist).")
     if ctx_is_admin(ctx):
         return
     mid = mgr.get_active_for_channel(ctx.channel_key)
@@ -5473,7 +5827,7 @@ async def _match_journal(ctx: ReplyContext, args: List[str],
     m = active_match(mgr, ctx)
     j = m.journal
     if len(args) > 1 and args[1].lower() == "export":
-        overwrite = _take_overwrite(args)
+        overwrite = _take_overwrite(args, 3)
         if len(args) != 3:
             raise VTTError("Usage: `!match journal export <file> "
                            "[overwrite]`.")
@@ -5508,7 +5862,9 @@ async def _match_journal(ctx: ReplyContext, args: List[str],
 class _ReplayCtx:
     """The replaying admin's context, re-pointed at one journal entry: its
     author's identity and channel, no prompts (answers replay as `answer=`
-    tokens), replies collected instead of sent."""
+    tokens), replies collected instead of sent. Its admin / bot-owner
+    flags are set per entry (the lower of the recorded author's and the
+    replayer's), never passed through."""
 
     def __init__(self, inner: ReplyContext, channel_key: str,
                  user_id: Optional[str], user_name: str):
@@ -5760,6 +6116,13 @@ async def _replay_entries(ctx: ReplyContext, mgr: MatchManager, mid: str,
                     continue
                 rctx = _ReplayCtx(ctx, str(e.get("ch") or ctx.channel_key),
                                   e.get("uid"), str(e.get("by") or ""))
+                # The lower of the author's recorded authority and the
+                # replaying admin's (an entry without a record has none).
+                auth = e.get("auth")
+                auth = auth if isinstance(auth, list) and len(auth) == 2 \
+                    else [False, False]
+                rctx.is_admin = bool(auth[0]) and ctx_is_admin(ctx)
+                rctx.is_bot_owner = bool(auth[1]) and ctx_is_bot_owner(ctx)
                 # Each entry was a top-level command with its own partial
                 # cache, whose template_data budget it spent alone.
                 cache_token = PARTIAL_CACHE.set({})
@@ -6152,6 +6515,42 @@ async def _system_history(ctx: ReplyContext, args: List[str],
     return await ctx.send("\n".join(lines))
 
 
+def _switch_systems(mgr: MatchManager, target: Dict[str, Any],
+                    after: Dict[str, str], what: str) -> List[str]:
+    """Put server state `target` (systems and default pointers) in place,
+    each match on system `after[mid]`, and re-apply rules to every match
+    (its units take the var names those rules give). All or nothing: under
+    var_name_collision refuse a var in the way refuses it whole. Returns
+    the rule notes."""
+    pre_state = mgr.server_state()
+    pre_names = {mid: m.system_name for mid, m in mgr.matches.items()}
+    snap = _snapshot_all_matches(mgr)
+    notes: List[str] = []
+    try:
+        _apply_server_state(mgr, target)
+        conflicts: List[str] = []
+        for mid, m in sorted(mgr.matches.items()):
+            trial = mgr._build_rules_dict(mgr.systems[after[mid]])
+            if str(trial.get("var_name_collision")) == "refuse":
+                conflicts += [f"{mid}: {c}"
+                              for c in m.var_name_conflicts(trial)]
+        if conflicts:
+            raise VTTError(f"Can't {what}: " + " ".join(conflicts[:5])
+                           + (f" (and {len(conflicts) - 5} more)"
+                              if len(conflicts) > 5 else ""))
+        for mid, m in mgr.matches.items():
+            m.system_name = after[mid]
+        for m in mgr.matches.values():
+            notes += mgr.apply_system_rules(m)
+    except VTTError:
+        _apply_server_state(mgr, pre_state)
+        for mid, m in mgr.matches.items():
+            m.system_name = pre_names[mid]
+        _restore_all_matches(mgr, snap)
+        raise
+    return notes
+
+
 def _apply_server_state(mgr: MatchManager, state: Dict[str, Any]) -> None:
     mgr.systems = {n: GameSystem.from_dict(copy.deepcopy(d))
                    for n, d in (state.get("systems") or {}).items()}
@@ -6205,36 +6604,9 @@ async def _system_undo(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         lines = [f"{head}:"] + undone + ["Changes:"]
         lines += [f"- {d}" for d in diff] or ["- (nothing)"]
         return await ctx.send("\n".join(lines))
-    pre_state = mgr.server_state()
-    pre_names = {mid: m.system_name for mid, m in mgr.matches.items()}
-    snap = _snapshot_all_matches(mgr)
     named = {(mid, eid): dict(e.var_names) for mid, m in mgr.matches.items()
              for eid, e in m.entities.items()}
-    notes: List[str] = []
-    try:
-        _apply_server_state(mgr, target)
-        # As `!system set` does: under var_name_collision refuse, a var in
-        # the way of a rename refuses the whole undo.
-        conflicts: List[str] = []
-        for mid, m in sorted(mgr.matches.items()):
-            trial = mgr._build_rules_dict(mgr.systems[after[mid]])
-            if str(trial.get("var_name_collision")) == "refuse":
-                conflicts += [f"{mid}: {c}"
-                              for c in m.var_name_conflicts(trial)]
-        if conflicts:
-            raise VTTError("Can't undo: " + " ".join(conflicts[:5])
-                           + (f" (and {len(conflicts) - 5} more)"
-                              if len(conflicts) > 5 else ""))
-        for mid, m in mgr.matches.items():
-            m.system_name = after[mid]
-        for m in mgr.matches.values():
-            notes += mgr.apply_system_rules(m)
-    except VTTError:
-        _apply_server_state(mgr, pre_state)
-        for mid, m in mgr.matches.items():
-            m.system_name = pre_names[mid]
-        _restore_all_matches(mgr, snap)
-        raise
+    notes = _switch_systems(mgr, target, after, "undo")
     del hist[-n:]
     mgr._skip_system_step = True
     lines = [f"↩️ Undid {n} server-wide edit(s):"] + undone
@@ -6681,6 +7053,8 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     f"❌ invalid alias name `{aname}`: names must be a "
                     f"single whitespace-free token."
                 )
+            if aname.lower() in registry._handlers:
+                return await ctx.send(_ALIAS_SHADOW.format(name=aname))
             try:
                 tokens = split_command_line(expansion)
             except ValueError as ex:
@@ -6735,6 +7109,8 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if exp is None:
                 raise NotFound(f"alias `{aname}` isn't defined on match "
                                f"`{m.id}`.")
+            if aname.lower() in registry._handlers:
+                return await ctx.send(_ALIAS_SHADOW.format(name=aname))
             prior = lib.get(aname)
             lib[aname] = exp
             mgr.system_library_write(s, "aliases", lib)
@@ -6748,6 +7124,12 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         )
 
     return await _help_fallback(ctx, ["system"], args[0] if args else None)
+# An alias can't take a command's name: it would replace the command in
+# every channel showing the match (`!alias`, `!match` and `!undo` with it).
+_ALIAS_SHADOW = ("❌ `{name}` is a command's name; an alias can't take it "
+                 "(it would hide `!{name}` everywhere this match is shown).")
+
+
 def _source_label(mgr: MatchManager, s: Any, key: str) -> str:
     """Where `s`'s value of rule `key` comes from, for `!system diff`."""
     src = mgr.system_value_source(s, key)
@@ -7712,6 +8094,26 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         args[i] = resolve_arg_token(args[i], m, self_id)
     # ---- end formula substitution ------------------------------------------
 
+    # A non-host (a subcommand an override opened to players) names units
+    # through the channel's view: a hidden unit reads like a missing one,
+    # in the two-sided wording, so the reply can't tell them apart.
+    if (sub not in ("add", "revive") and len(args) >= 2
+            and not _acts_as_host(ctx, m) and _query_pov(ctx, m) is not None):
+        _query_eid(ctx, m, args[1])
+        if sub == "swap" and len(args) >= 3:
+            _query_eid(ctx, m, args[2])
+    # An action's body runs its cmd() lines with no gate, so only a host
+    # writes one: a player who may write vars (a note-keeping override)
+    # can't author an action under any `actions` container.
+    if sub in ("set_var", "set_vars", "delete_var", "delete_var_silent") \
+            and not _acts_as_host(ctx, m):
+        paths = ([a.split("=", 1)[0] for a in args[2:] if "=" in a]
+                 if sub == "set_vars" else args[2:3])
+        if any("actions" in str(p).split(".") for p in paths):
+            return await ctx.send(
+                "❌ Only a host can write under an `actions` var: an "
+                "action's body runs commands with the host's reach.")
+
     # add
     if sub == "add":# and len(args) >= 6:
         args, mapspec = _pop_map_opt(args)
@@ -8489,6 +8891,9 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # to the resulting var events. We append them to the ack message so
         # the GM can see chain effects from a single write.
         hook_log = e.write_var(key_path, value, bypass_clamp=bypass_clamp)
+        if eid in m.entities and key_path.split(".", 1)[0] == m.rules.get("team_var", "team"):
+            # The team var is stored as text (logic.team_text).
+            value = e.vars.get(key_path, value)
         ack = f"`{eid}` vars.{key_path} = {value!r}"
         if bypass_clamp:
             ack += " (clamp bypassed)"
@@ -10558,6 +10963,10 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             notes.append("killed " + ", ".join(f"`{i}`" for i in summary["killed"]))
         if summary["dropped_tiles"]:
             notes.append(f"dropped {summary['dropped_tiles']} tile cell(s)")
+        if summary.get("dropped_corpses"):
+            notes.append("the corpses of " + ", ".join(
+                f"`{c}`" for c in summary["dropped_corpses"])
+                + " were on the cut cells and are gone")
         if summary["clipped_zone_cells"]:
             notes.append(f"clipped {summary['clipped_zone_cells']} zone cell(s)")
         if notes:
@@ -11857,6 +12266,8 @@ def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot,
     # A link to a match deleted since stays gone (deleting a match drops
     # it from every match's links).
     new_match.links = [i for i in new_match.links if i in mgr.matches]
+    new_match.link_stamps = {i: s for i, s in new_match.link_stamps.items()
+                             if i in new_match.links}
     # Transfer history pointer first so the truncate below targets the
     # same object we just attached to the new match.
     new_match.history = old.history
@@ -11897,6 +12308,8 @@ def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot,
     # The match keeps its live system: `!system rename` may have renamed
     # it since the snapshot, which still names the old one.
     new_match.system_name = old.system_name
+    # Its identity too: links other matches made to it keep trusting it.
+    new_match.uid = old.uid
     if new_match.id != old.id:
         new_match.id = old.id
         new_match.name = old.name
@@ -12022,13 +12435,18 @@ _TRANSFER_UNDO_NOTE = (
     "other match keeps its side (undo there separately).")
 
 
-def _take_overwrite(args: List[str]) -> bool:
-    """Remove a trailing-option `overwrite` word from `args` (in place)."""
-    if any(str(a).lower() == "overwrite" for a in args[2:]):
-        args[:] = args[:2] + [a for a in args[2:]
-                              if str(a).lower() != "overwrite"]
-        return True
-    return False
+def _take_overwrite(args: List[str], first_opt: int = 3) -> bool:
+    """Remove the option word `overwrite` from `args` (in place). It comes
+    after the file name: one in a name's place (index below `first_opt`)
+    is refused, so `!store save overwrite` doesn't save a file named
+    `overwrite` and `!history export <sel> overwrite` doesn't crash."""
+    at = [i for i, a in enumerate(args) if str(a).lower() == "overwrite"]
+    if not at:
+        return False
+    if any(i < first_opt for i in at):
+        raise VTTError("Name the file first, then add `overwrite`.")
+    args[:] = [a for i, a in enumerate(args) if i not in at]
+    return True
 
 
 def _check_overwrite(full: str, shown: str, overwrite: bool) -> None:
@@ -12382,7 +12800,7 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "history", "export"):
             return
         selector = args[1]
-        overwrite = _take_overwrite(args)
+        overwrite = _take_overwrite(args, 3)
         full, path = saves_path(args[2], mgr, write=True)
         _check_overwrite(full, path, overwrite)
         snap = _resolve_snapshot_selector(m, selector)
@@ -12463,7 +12881,9 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 "(pov_filters_queries).")
         snap_a = _resolve_snapshot_selector(m, args[1])
         snap_b = _resolve_snapshot_selector(m, args[2])
-        lines = _format_snapshot_diff(snap_a, snap_b, args[1], args[2])
+        lines = _format_snapshot_diff(
+            snap_a, snap_b, args[1], args[2],
+            _diff_rule_text(ctx, m))
         lines[1:1] = _authors_line(m, min(snap_a.sequence, snap_b.sequence),
                                    max(snap_a.sequence, snap_b.sequence))
         return await ctx.send("\n".join(lines))
@@ -12516,7 +12936,7 @@ async def _undo_preview(ctx, m: Match, snap: Snapshot, what: str):
     after.sync_all_var_names()
     lines = _format_snapshot_diff(
         now, SimpleNamespace(state=after.to_dict(include_history=False)),
-        "now", what)
+        "now", what, _diff_rule_text(ctx, m))
     lines[0] = (f"🔍 **Undo preview** — `{what}` would make these changes "
                 f"(nothing restored yet):")
     lines[1:1] = _authors_line(m, snap.sequence, None, undone=True)
@@ -12702,8 +13122,23 @@ def _active_id(state: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _diff_rule_text(ctx: ReplyContext, m: Match) -> Callable[[str, Any], str]:
+    """How a snapshot diff prints a rule value for this caller: a secret
+    rule's (logic.SECRET_RULES) as `(hidden)` unless they are an
+    administrator or a host of `m` (as _rule_value_text)."""
+    hide = not ctx_is_admin(ctx) and not _acts_as_host(ctx, m)
+
+    def text(k: str, v: Any) -> str:
+        if hide and k in SECRET_RULES and v not in (None, ""):
+            return "(hidden)"
+        return repr(v)
+    return text
+
+
 def _format_snapshot_diff(snap_a: Snapshot, snap_b: Snapshot,
-                          sel_a: str, sel_b: str) -> List[str]:
+                          sel_a: str, sel_b: str,
+                          rule_text: Optional[Callable[[str, Any], str]] = None
+                          ) -> List[str]:
     """Build a human-readable diff between two snapshot states. Focuses
     on what GMs actually want to see — entity-level changes, the turn
     clock, the map (tiles / zones / groups), match and team data, and rule
@@ -12737,13 +13172,16 @@ def _format_snapshot_diff(snap_a: Snapshot, snap_b: Snapshot,
         ra = rb = {}
     rule_keys = sorted(set(ra) | set(rb))
     rule_changes = []
+    # A secret rule's value (random_seed) shows as the caller may see it.
+    rt = rule_text or (lambda k, v: repr(v))
     for rk in rule_keys:
         if rk not in ra:
-            rule_changes.append(f"  + rule `{rk}` = {rb[rk]!r}")
+            rule_changes.append(f"  + rule `{rk}` = {rt(rk, rb[rk])}")
         elif rk not in rb:
-            rule_changes.append(f"  - rule `{rk}` (was {ra[rk]!r})")
+            rule_changes.append(f"  - rule `{rk}` (was {rt(rk, ra[rk])})")
         elif ra[rk] != rb[rk]:
-            rule_changes.append(f"  ~ rule `{rk}`: {ra[rk]!r} -> {rb[rk]!r}")
+            rule_changes.append(f"  ~ rule `{rk}`: {rt(rk, ra[rk])} -> "
+                                f"{rt(rk, rb[rk])}")
     if rule_changes:
         lines.append("- Rules:")
         lines.extend(rule_changes)
@@ -13069,7 +13507,7 @@ async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # autosave history into the save file. Off by default to keep
         # files small; on for full campaign backups.
         include_history = False
-        overwrite = _take_overwrite(args)
+        overwrite = _take_overwrite(args, 2)
         _check_options(args[2:], {"include_history"}, "!store save")
         for extra in args[2:]:
             if extra.startswith("include_history="):
@@ -14242,6 +14680,11 @@ async def _log_format_sub(ctx, fmt_args, mgr, m):
                 f"{'es' if refreshed != 1 else ''}]."
             )
         return await ctx.send(f"`{etype}` has no override (already default).")
+    known = set(RULES_REGISTRY["event_log_events"]["schema"]["word_list"])
+    if etype not in known:
+        return await ctx.send(
+            f"❌ `{etype}` isn't an event type the log records; known: "
+            + ", ".join(f"`{t}`" for t in sorted(known)) + ".")
     template = " ".join(fmt_args[1:])
     overrides[etype] = template
     refreshed = _write(overrides)
@@ -14938,15 +15381,20 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             overrides[k] = _parse_scalar(v)
         if name not in m.tile_templates:
             return await ctx.send(f"❌ template `{name}` not found.")
-        # Empty = in-bounds cell with no existing tile data. With several
-        # maps (map=a,b / all) the N are scattered over all their empty
-        # cells together, every cell equally likely.
+        # Empty = in-bounds cell with no existing tile data (a cell holding
+        # only corpses counts as empty: they ride inside tile data). With
+        # several maps (map=a,b / all) the N are scattered over all their
+        # empty cells together, every cell equally likely.
+        def _tile_empty(emp, x, y):
+            cell = emp.tiles.get((x, y))
+            return cell is None or (isinstance(cell, dict)
+                                    and set(cell) <= {"corpses"})
         empty = [
             (i, x, y)
             for i, emp in enumerate(maps)
             for x in range(1, emp.grid_width + 1)
             for y in range(1, emp.grid_height + 1)
-            if (x, y) not in emp.tiles
+            if _tile_empty(emp, x, y)
         ]
         if len(empty) < count:
             return await ctx.send(
@@ -15867,8 +16315,7 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "status", "copy"):
             return
         _check_tail(args, 3, (), "!status copy <name> <new_name>")
-        if args[2].startswith("tag:"):
-            raise VTTError(f"`{args[2]}` can't be a status name.")
+        check_status_name(args[2])
         _copy_entry(m.status_definitions, args[1], args[2], "status definition")
         return await ctx.send(f"Copied status definition `{args[1]}` to "
                               f"`{args[2]}`.")
@@ -16861,6 +17308,8 @@ async def alias_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"❌ invalid alias name `{name}`: names must be a single "
                 f"whitespace-free token."
             )
+        if name.lower() in registry._handlers:
+            return await ctx.send(_ALIAS_SHADOW.format(name=name))
         # Validate that the expansion's first token is a registered
         # command. We deliberately don't accept other aliases as the
         # target — resolution is one-shot, so a chained alias would just
@@ -17032,8 +17481,11 @@ def _restore_all_matches(mgr: MatchManager, snap: Dict[str, Any]) -> None:
         del mgr.matches[mid]
     for mid, state in pre.items():
         m = mgr.matches.get(mid)
-        if m is None:
-            m = snap.get("objs", {}).get(mid)
+        orig = snap.get("objs", {}).get(mid)
+        if m is None or (orig is not None and m is not orig):
+            # Deleted meanwhile, or deleted and made anew under its id:
+            # the original object comes back (its journal and history).
+            m = orig
             if m is None:
                 m = Match.from_dict(copy.deepcopy(state))
             mgr.matches[mid] = m
@@ -17148,7 +17600,8 @@ async def dry_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     from types import SimpleNamespace
     lines = _format_snapshot_diff(SimpleNamespace(state=pre),
                                   SimpleNamespace(state=post),
-                                  "before", "after")
+                                  "before", "after",
+                                  _diff_rule_text(ctx, m))
     return await ctx.send("\n".join(["🧪 It would change:"] + lines[1:]
                                      + ["Rolled back."]))
 
@@ -17582,6 +18035,15 @@ for _subs, _usage in (
     registry.annotate_sub('macro', *_subs, usage=_usage)
 
 
+def _set_macro_author(m: "Match", name: str, ctx: ReplyContext) -> None:
+    """Record who wrote macro `name` (none on a surface with no identity)."""
+    user = ctx_user(ctx)
+    if user is None or getattr(ctx, "auto_approve", False):
+        m.macro_authors.pop(name, None)
+    else:
+        m.macro_authors[name] = str(user)
+
+
 @registry.command(
     "macro",
     raw_args=True,
@@ -17619,8 +18081,11 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         _check_tail(args, 3, (), f"!macro {sub} <name> <new_name>")
         if sub == "copy":
             _copy_entry(m.macros, args[1], args[2], "macro")
+            _set_macro_author(m, args[2], ctx)
             return await ctx.send(f"Copied macro `{args[1]}` to `{args[2]}`.")
         m.macros = _rename_entry(m.macros, args[1], args[2], "macro")
+        if args[1] in m.macro_authors:
+            m.macro_authors[args[2]] = m.macro_authors.pop(args[1])
         note = _mentions_note(m, args[1], "macro")
         return await ctx.send(f"Renamed macro `{args[1]}` to `{args[2]}`."
                               + (f"\n{note}" if note else ""))
@@ -17639,6 +18104,7 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         except _MacroError as ex:
             return await ctx.send(f"❌ macro structure error: {ex}")
         m.macros[name] = body
+        _set_macro_author(m, name, ctx)
         n = len([l for l in body.split("\n") if l.strip()])
         return await ctx.send(f"Saved macro `{name}` ({n} line(s)).")
 
@@ -17671,7 +18137,12 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"(macro_recursion_limit).")
         mgr._macro_depth = depth + 1
         mgr._macro_budget = budget
-        gate_token = _GATE_LINES.set(False)   # the body is host-written
+        # A body a host wrote runs as written; one a player wrote (the
+        # access that lets players run macros also lets them write one) has
+        # each line gated as the runner, like a typed `!batch`.
+        author = m.macro_authors.get(name)
+        gate_token = _GATE_LINES.set(
+            author is not None and not m.is_host(author))
         try:
             if await _exec_macro(nodes, ctx, mgr, mac_args, None, name,
                                  budget) == ASSERT_STOP:
@@ -17705,6 +18176,7 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         name = args[1]
         if m.macros.pop(name, None) is None:
             return await ctx.send(f"❌ no macro `{name}`.")
+        m.macro_authors.pop(name, None)
         return await ctx.send(f"Removed macro `{name}`.")
 
     return await _help_fallback(ctx, ["macro"], args[0] if args else None)
@@ -18047,10 +18519,17 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         team = args[1]
         if len(args) >= 3:
-            d = m.team_data.get(team, {})
-            if d.pop(args[2], None) is None:
+            # A dotted path, as `!team set` / `get` / `add` take.
+            keys = args[2].split(".")
+            cur: Any = m.team_data.get(team, {})
+            for k in keys[:-1]:
+                cur = cur.get(k) if isinstance(cur, dict) else None
+            if not isinstance(cur, dict) or keys[-1] not in cur:
                 return await ctx.send(f"❌ team `{team}` has no `{args[2]}`.")
+            del cur[keys[-1]]
             return await ctx.send(f"Cleared team `{team}`.{args[2]}.")
+        if team not in m.team_data and team not in m.team_passives:
+            return await ctx.send(f"❌ team `{team}` has no data or passives.")
         m.team_data.pop(team, None)
         m.team_passives.pop(team, None)
         return await ctx.send(f"Cleared all data + passives for team `{team}`.")
@@ -18443,9 +18922,9 @@ async def action_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         actor_id = _query_eid(ctx, m, args[1])
         return await _action_info(ctx, m, actor_id, args[2])
 
-    actor_id = _resolve_eid(m, args[0])
-    if actor_id not in m.entities:
-        raise NotFound(f"Entity '{actor_id}' not found.")
+    # A unit the channel's view hides reads like a missing one, as in the
+    # list / info forms (it used to run, and its refusals named it).
+    actor_id = _query_eid(ctx, m, args[0])
     requested = args[1]
     tail = list(args[2:])
     await _run_action_dispatch(
@@ -18631,8 +19110,12 @@ async def _run_action_dispatch(
             pruned.append(tok)
     # Parse the target tokens off the front, then args off the rest.
     try:
+        def missing(eid: str, token: str) -> None:
+            # A unit the view hides reads like a missing one.
+            if eid not in m.entities or _pov_hides(m, _query_pov(ctx, m), eid):
+                _query_eid(ctx, m, token)
         target_value, remaining = parse_target(
-            action.target_type, pruned, m, actor_id,
+            action.target_type, pruned, m, actor_id, missing=missing,
         )
         args_dict = parse_args_tokens(remaining)
     except VTTError as ex:
