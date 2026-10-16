@@ -26243,6 +26243,8 @@ SCENARIO 846 — A map vehicle dies: effects per occupant, ejection, the map des
 !ent init medic 3
 !ent init alien 2
 !ent init ogre 1
+!ent add mummy Mummy 3 4 4 map=deck
+!ent kill mummy
 !passive add ship wreck on_death "match_var_set('order', 'ship')"
 !gpassive add shaken on_map_vehicle_death "match_var_set('order', match_var_get('order') + ',' + self_id() + '@' + map_vehicle)"
 !ent kill ship
@@ -26253,6 +26255,7 @@ SCENARIO 846 — A map vehicle dies: effects per occupant, ejection, the map des
 !assert "map_of('alien') == 'main' and entity[alien].hp == 5 and entity[alien].scarred"
 !assert "map_of('ogre') == 'main' and entity[ogre].hp == 30 and entity_distance('ogre', 'marine') >= 1"
 !assert "has_corpse('medic') and has_corpse('ship') and maps() == ['main']"
+!assert "has_corpse('mummy')"
 !map list
 ?? **Maps of ND** (1):
 !list
@@ -26261,15 +26264,17 @@ SCENARIO 846 — A map vehicle dies: effects per occupant, ejection, the map des
 !map new cabin 2 1
 !ent add pod Pod 5 1 1 map=rock
 !ent add boulder Boulder 5 1 2 map=rock
-!ent set_var pod __map_vehicle_corpses lose
+!ent set_vars pod __map_vehicle_corpses=lose __map_vehicle_existing_corpses=lose
 !map attach cabin pod
 !ent add pilot Pilot 5 1 1 map=cabin
 !ent add stowaway Stowaway 5 2 1 map=cabin
+!ent add rat Rat 1 2 1 map=cabin
+!ent kill rat
 !ent kill pod
 ?? ⚠️ `stowaway` couldn't leave map `cabin` with `pod` gone
 ?? 💀 **Stowaway** (`stowaway`) died.
 !assert "map_of('pilot') == 'rock' and entity[pilot].x == 1 and entity[pilot].y == 1"
-!assert "not has_corpse('stowaway') and has_corpse('pod') and 'cabin' not in maps()"
+!assert "not has_corpse('stowaway') and not has_corpse('rat') and has_corpse('pod') and 'cabin' not in maps()"
 
 Expected: HARNESS-ALLOWS-ERRORS. The ship's own on_death runs first;
 then each occupant in turn order (initiative 4, 3, 2, 1) gets its death
@@ -26279,9 +26284,12 @@ the medic (8 → -2, dies before its hook, so `order` skips it); the
 alien's own effect replaces the ship's (scarred, hp kept). The
 survivors land around the ship's body on main (its own cells stay clear
 for a revive), the 2x2 ogre on cells clear of the others; the medic's
-corpse is ejected too (map_vehicle_corpses eject), and the deck is gone. The pod's one free cell takes the
-pilot; the stowaway has no room (⚠️), dies with the cabin, and its
-corpse is lost (the pod's `__map_vehicle_corpses` = lose).
+corpse is ejected too (map_vehicle_corpses eject), and so is the mummy's,
+which lay on the deck before (map_vehicle_existing_corpses eject, the
+default); the deck is gone. The pod's one free cell takes the pilot; the
+stowaway has no room (⚠️) and dies with the cabin; its corpse and the
+rat's earlier one are lost (the pod's `__map_vehicle_corpses` and
+`__map_vehicle_existing_corpses` = lose).
 
 SCENARIO 847 — Wrecks: the wreck formula, revive re-attaches, delete when empty, despawn
 ----------------------------------------------------------------------
@@ -26295,10 +26303,13 @@ SCENARIO 847 — Wrecks: the wreck formula, revive re-attaches, delete when empt
 !ent set_var tank wreck_formula "tile_set(2, 2, 'fire', True)\nmap_var_set('wreck_of', map_vehicle)"
 !map attach hull tank
 !ent add driver Driver 10 1 1 map=hull
+!ent add rat Rat 1 3 3 map=hull
+!ent kill rat
 !ent kill tank
 ?? 💀 **Tank** (`tank`) died.
 !assert "map_of('driver') == 'main' and map_carrier('hull') == None"
 !assert "tile_get(2, 2, 'fire', map='hull') and map_var_get('wreck_of', map='hull') == 'tank'"
+!assert "corpse_at('rat') == [3, 3, 'hull'] and corpse_at('tank') == [2, 2, 'main']"
 !ent revive tank
 !assert "map_carrier('hull') == 'tank'"
 !map list
@@ -26320,7 +26331,9 @@ SCENARIO 847 — Wrecks: the wreck formula, revive re-attaches, delete when empt
 !assert "map_carrier('boot') == None and 'boot' in maps()"
 
 Expected: Under map_vehicle_death_map wreck the hull stays, a map of its
-own: the driver is ejected beside the tank's corpse, and the tank's wreck formula runs on the
+own: the driver is ejected beside the tank's corpse, the rat's earlier
+corpse stays on the wreck (map_vehicle_existing_corpses applies only to
+a destroyed map), and the tank's wreck formula runs on the
 hull (no map= needed) with map_vehicle bound. A revive carries the hull
 again. With `__delete_when_empty` set, the second death ejects the
 driver and the empty hull is deleted after the command; the next revive

@@ -1452,8 +1452,10 @@ hardcodes**.
   > the rule) and `on_map_vehicle_death`, then the survivors are ejected
   around the vehicle's body (`_eject_spot`; no room = stays, ⚠️), then
   `map_vehicle_death_map` (`__map_vehicle_death_map`): destroy kills the
-  rest and drops the map, its occupants' corpses ejected or lost per
-  `map_vehicle_corpses`; wreck keeps it, records it in the corpse
+  rest and drops the map, the corpses this death made ejected or lost
+  per `map_vehicle_corpses` and those already lying there per
+  `map_vehicle_existing_corpses` (both default eject, per-unit
+  `__`-prefixed overrides); wreck keeps it and every corpse on it, records it in the corpse
   (`maps`, a revive re-attaches it) and runs the wreck formula
   (`map_vehicle_wreck_var` / `_formula`) with the wreck as its map. A
   despawn ejects and detaches (`_release_inner_maps`, from

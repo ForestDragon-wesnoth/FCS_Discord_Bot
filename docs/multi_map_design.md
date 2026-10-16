@@ -506,9 +506,12 @@ share. An even distribution per map is a loop over the maps.
 
   Built details (step 3): ejection lands around the vehicle's body, as a
   dismount does, so its corpse's cells stay clear for a revive (its own
-  cells only when nothing around fits); the destroy fate ejects the
-  corpses of the occupants that died in that death (from an effect or
-  with the map), while corpses already lying on the map go with it; a
+  cells only when nothing around fits); under the destroy fate the
+  corpses that death made (from an effect or with the map) follow
+  `map_vehicle_corpses`, and the corpses already lying on the map follow
+  `map_vehicle_existing_corpses` (user: eject by default, a gamerule with
+  a per-vehicle override; a wreck keeps every corpse, an accessible
+  ruin); `corpse_at` returns `[x, y, map]` for a corpse on another map; a
   walk (`!ent move`, push, pull, group moves) ends where a hook put the
   walker, so a hatch mid-path doesn't drag it on along the path;
   `__delete_when_empty` applies to maps no unit carries.

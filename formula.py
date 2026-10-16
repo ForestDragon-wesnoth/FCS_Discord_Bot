@@ -6856,13 +6856,17 @@ class FormulaEngine:
 
         def _corpse_at(eid_t: Any) -> tuple:
             """corpse_at(eid): the (x, y) tile coordinates of the
-            corpse with id `eid`. Authoritative source (tile location,
+            corpse with id `eid` ([x, y, map] when it lies on a map other
+            than the formula's own). Authoritative source (tile location,
             never the embedded snapshot). Raises if no such corpse."""
             eid = str(_eid(eid_t))
             loc = match.find_corpse(eid)
             if loc is None:
                 raise FormulaError(f"corpse_at: no corpse with id '{eid}'.")
             x, y = loc[0], loc[1]
+            # A corpse on a map other than the formula's own carries it.
+            if loc[3].name != _default_map_name():
+                return [x, y, loc[3].name]
             return (x, y)
 
         def _all_corpses() -> list:

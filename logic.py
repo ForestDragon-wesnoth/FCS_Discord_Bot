@@ -1449,12 +1449,29 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "schema": {"type": "enum", "choices": ["eject", "lose"]},
         "desc": (
             "When map_vehicle_death_map destroys a dead unit's inner maps: "
-            "'eject' (default) puts the corpses of the occupants that died "
-            "in it on the cells nearest the unit's body that no living unit "
-            "covers (several may share a cell; one with no room is lost "
-            "with a ⚠️), where a medic or looter can reach them; 'lose' "
-            "deletes them with the map. A unit's `__map_vehicle_corpses` "
+            "'eject' (default) puts the corpses of the units that died in "
+            "its death (from a death effect or with the map) on the cells "
+            "nearest the unit's body that no living unit covers (several may "
+            "share a cell; one with no room is lost with a ⚠️), where a "
+            "medic or looter can reach them; 'lose' deletes them with the "
+            "map. Corpses already on the maps follow "
+            "map_vehicle_existing_corpses. A unit's `__map_vehicle_corpses` "
             "var (eject / lose) overrides the rule."
+        ),
+    },
+    "map_vehicle_existing_corpses": {
+        "default": "eject",
+        "schema": {"type": "enum", "choices": ["eject", "lose"]},
+        "desc": (
+            "When map_vehicle_death_map destroys a dead unit's inner maps: "
+            "what happens to the corpses that were already lying on them "
+            "before it died (map_vehicle_corpses covers the ones its death "
+            "makes). 'eject' (default) puts them on the cells nearest the "
+            "unit's body that no living unit covers, after the new dead; "
+            "'lose' deletes them with the map. A wreck (map_vehicle_death_"
+            "map wreck) keeps every corpse on it. A unit's "
+            "`__map_vehicle_existing_corpses` var (eject / lose) overrides "
+            "the rule."
         ),
     },
     "map_vehicle_death_effect_var": {
@@ -8531,6 +8548,15 @@ class Match:
         corpses_mode = vars_.get("__map_vehicle_corpses")
         if corpses_mode not in ("eject", "lose"):
             corpses_mode = str(self.rules.get("map_vehicle_corpses", "eject"))
+        old_mode = vars_.get("__map_vehicle_existing_corpses")
+        if old_mode not in ("eject", "lose"):
+            old_mode = str(self.rules.get("map_vehicle_existing_corpses",
+                                          "eject"))
+        # The corpses lying on its maps before this death: under destroy
+        # they follow map_vehicle_existing_corpses, the ones this death
+        # makes follow map_vehicle_corpses.
+        earlier = {(mp.name, cid) for mp in maps
+                   for (_x, _y, cid, _c) in self.all_corpses(mp)}
         veh_effect = vars_.get(str(self.rules.get(
             "map_vehicle_death_effect_var", "map_vehicle_death_effect")))
         if not isinstance(veh_effect, str):
@@ -8591,10 +8617,13 @@ class Match:
                     f"The wreck formula of `{vid}` on map `{name}`"))
                 continue
             log.extend(self._kill_all_on_map(name))
-            if corpses_mode == "eject":
-                log.extend(self._eject_corpses(
-                    mp, [oid for oid, n in occupants.items() if n == name],
-                    outer, box))
+            # Newest first: the dead of this death land nearest the body.
+            here = [cid for (_x, _y, cid, _c) in self.all_corpses(mp)]
+            ids = [c for c in here if (name, c) not in earlier] \
+                if corpses_mode == "eject" else []
+            ids += [c for c in here if (name, c) in earlier] \
+                if old_mode == "eject" else []
+            log.extend(self._eject_corpses(mp, ids, outer, box))
             if name in self.maps:
                 log.extend(self.delete_map(name))
         return log
