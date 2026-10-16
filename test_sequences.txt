@@ -27622,3 +27622,60 @@ back while undo then undid the edit before it, so it is refused. A unit
 whose id an older build allowed (`rider`, a formula binding now) loads
 and can be copied and transferred: the destination can't create the id,
 so it takes `rider_2` (then `rider_3`) as a collision does.
+
+
+SCENARIO 875 — Movement hooks that multiply stop at move_hook_event_limit; a chain of single moves runs to its end
+-------------------------------------------------------------------------------------------------------------------
+
+!match new mh MH 12 6
+!match use mh
+!system set default move_hook_event_limit 50
+!ent add u U 10 5 5
+!ent set_var u runs 0
+!passive add u bounce on_entity_moved "entity[self].runs = entity[self].runs + 1\nif entity[self].x == 5:\n    move_entity(self, 6, 5)\n    move_entity(self, 5, 5)\nelse:\n    move_entity(self, 5, 5)\n    move_entity(self, 6, 5)"
+!ent tp u 6 5
+?? ⚠️ Movement hooks made 50 moves from one move, move_hook_event_limit (50)
+?? ⚠️ Movement hooks nested past move_hook_recursion_limit (16)
+!assert "entity[u].runs == 50"
+!passive remove u bounce
+!ent add belt Belt 10 1 2
+!ent set_var belt runs 0
+!passive add belt conveyor on_entity_moved "entity[self].runs = entity[self].runs + 1\nif entity[self].x < 12:\n    move_entity(self, entity[self].x + 1, 2)"
+!ent tp belt 2 2
+?! ⚠️
+!assert "entity[belt].x == 12 and entity[belt].runs == 11"
+
+Expected: One move whose on_entity_moved passive moves its unit twice
+doubles the work at every level (16 levels deep would be 65,535 hook
+runs, about 100 s with the bot frozen). With move_hook_event_limit 50
+the chain stops after 50 moves made hooks run, with one ⚠️ in the reply
+(and on the console, naming the server and match). Its first branch
+also ran 16 levels deep, so the move_hook_recursion_limit warning shows
+too: each limit warns once per chain. A conveyor that
+moves its unit one cell per hook (a chain of single moves) runs its 11
+hops to the edge without a warning.
+
+
+SCENARIO 876 — The two log files keep only their newest copies
+-----------------------------------------------------------------
+
+!match new lc LC 4 4
+!match use lc
+!system set default friendlyfire false
+!system set default friendlyfire true
+!system set default friendlyfire false
+!system set default friendlyfire true
+!system set default friendlyfire false
+!server backups system_history
+?? system_history.json 3
+?! system_history.json 4
+!server backups audit
+?? audit.json 3
+?! audit.json 4
+!server backups systems
+?? systems.json 5
+
+Expected: Each server-wide edit changes systems.json, the `!system undo`
+history and the audit log. systems.json keeps a dated copy per change
+(five here); the two logs grow with every edit and are copied whole, so
+they keep only their newest server_backup_log_count (3) copies.

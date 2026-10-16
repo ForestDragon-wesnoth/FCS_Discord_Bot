@@ -89,7 +89,7 @@ SYSTEM_BACKUP_KEY = "system_backup"
 BACKUP_DIR = "backups"
 BACKED_UP_FILES = ("systems.json", "workspace.json", "system_history.json",
                    "audit.json")
-# Of those, the logs (copied at most once per server_backup_log_minutes).
+# Of those, the logs (only server_backup_log_count copies kept).
 BACKED_UP_LOGS = ("system_history.json", "audit.json")
 
 SERVER_LOGS: Dict[str, Tuple[str, str]] = {
@@ -912,7 +912,7 @@ class Storage:
         if owner_limit("server_backup_days") > 0:
             for fname in BACKED_UP_FILES:
                 text = plan.get(os.path.join(sdir, fname))
-                if text is not None and not self._log_copy_recent(key, fname):
+                if text is not None:
                     plan[self._new_backup_path(key, fname)] = text
         for mid, m in mgr.matches.items():
             text = self._match_text(mgr, m)
@@ -986,18 +986,6 @@ class Storage:
                 return path
             stamp += 1
 
-    def _log_copy_recent(self, key: str, fname: str) -> bool:
-        """Whether log file `fname` (BACKED_UP_LOGS) has a copy newer than
-        server_backup_log_minutes: the logs grow with each edit and are
-        copied whole, so a copy per change filled the server's quota."""
-        if fname not in BACKED_UP_LOGS:
-            return False
-        minutes = owner_limit("server_backup_log_minutes")
-        if minutes <= 0:
-            return False
-        newest = self.backups(key, fname)
-        return bool(newest) and time.time() - newest[0][0] < minutes * 60
-
     def backups(self, key: str, fname: Optional[str] = None
                 ) -> List[Tuple[float, str, str]]:
         """Server `key`'s copies of its critical files, newest first:
@@ -1021,14 +1009,17 @@ class Storage:
 
     def prune_backups(self, key: str) -> None:
         """Drop server `key`'s copies past server_backup_days or past
-        server_backup_count per file."""
+        server_backup_count per file (server_backup_log_count for the
+        two logs)."""
         days = owner_limit("server_backup_days")
         count = owner_limit("server_backup_count")
+        log_count = owner_limit("server_backup_log_count")
         now = time.time()
         kept: Dict[str, int] = {}
         for stamp, name, path in self.backups(key):
             kept[name] = kept.get(name, 0) + 1
-            if kept[name] > count or now - stamp > days * 86400:
+            cap = min(count, log_count) if name in BACKED_UP_LOGS else count
+            if kept[name] > cap or now - stamp > days * 86400:
                 size = _file_size(path)
                 _remove_path(path)
                 self._add_usage(key, -size)

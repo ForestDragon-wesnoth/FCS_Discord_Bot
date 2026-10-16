@@ -2299,15 +2299,20 @@ dragon with a 2-wide howdah, a 2-wide leg detached and located).
   - **L14:** group moves of glued parts, detach / locate leaving carried
     parts and auras behind, segments glued, snake heads and corpse riders
     attached, a double kill, a no-op backup restore, log copies filling the
-    quota (`server_backup_log_minutes`), legacy ids unable to leave a match.
+    quota (now the newest `server_backup_log_count` copies, user call),
+    legacy ids unable to leave a match.
     Not changed: a unit attached as a part leaves its located parts where
     they stand, as an ordinary teleport does (located parts keep their own
     cells); a revert from a stash an older build wrote with a formula bound
     is refused with a clean ❌ naming the clamp (the stash is GM data in a
     var, indistinguishable from new input).
-  - Deferred to the CPU work budget (§8): X4+ (including the move-hook
-    case: a hook making two moves runs 2^depth hooks within
-    `move_hook_recursion_limit`), X5.
+  - X4+'s move-hook case (a hook making two moves runs 2^depth hooks
+    within `move_hook_recursion_limit`, 98 s at 16) is bounded by the new
+    `move_hook_event_limit` (500 moves per chain, user call); the rest of
+    X4+ and X5 stay deferred to the CPU work budget (§8).
+  - Follow-ups the user asked for in the same PR: the GUI's map dropdown
+    gets a "Map:" label, shows whenever a match is (one map included) and
+    adds each seen map's size (scenarios 875-876 cover the two limits).
   - Found while verifying: the replay differential diverged on 868, since
     a load that changed data (a fixed template, an old match file) left
     the journals describing the old data. Loads now journal what they

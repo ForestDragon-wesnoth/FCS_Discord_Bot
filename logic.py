@@ -67,12 +67,16 @@ LEGACY_IDS_OK: "contextvars.ContextVar[bool]" = (
     contextvars.ContextVar("vtt_legacy_ids", default=False))
 # How deeply movement hooks are nested right now (a hook moving a unit fires
 # the next move's hooks inside itself; a transfer's arrival fires spawn
-# hooks in another match), and whether the limit's warning was given in
-# this chain. Context variables, so the count spans matches.
+# hooks in another match), whether a limit's warning was given in this
+# chain, and how many hook levels the chain has fired (a chain = one
+# outermost move and everything its hooks set off). Context variables, so
+# the counts span matches.
 MOVE_HOOK_DEPTH: "contextvars.ContextVar[int]" = (
     contextvars.ContextVar("vtt_move_hook_depth", default=0))
-MOVE_HOOK_WARNED: "contextvars.ContextVar[bool]" = (
-    contextvars.ContextVar("vtt_move_hook_warned", default=False))
+MOVE_HOOK_WARNED: "contextvars.ContextVar[Optional[Set[str]]]" = (
+    contextvars.ContextVar("vtt_move_hook_warned", default=None))
+MOVE_HOOK_FIRED: "contextvars.ContextVar[Optional[List[int]]]" = (
+    contextvars.ContextVar("vtt_move_hook_fired", default=None))
 
 
 def move_hook_limit(rules: Dict[str, Any]) -> int:
@@ -82,29 +86,73 @@ def move_hook_limit(rules: Dict[str, Any]) -> int:
         return 16
 
 
+def move_hook_event_limit(rules: Dict[str, Any]) -> int:
+    try:
+        return max(1, int(rules.get("move_hook_event_limit", 500)))
+    except (TypeError, ValueError):
+        return 500
+
+
+def _move_hook_warning(log: List[str], match_id: str, kind: str,
+                       text: str) -> None:
+    """One ⚠️ per limit per chain, in the reply and on the console (the
+    bot's operator sees which server and match ran into the limit)."""
+    warned = MOVE_HOOK_WARNED.get()
+    if warned is None or kind in warned:
+        return
+    warned.add(kind)
+    log.append(f"⚠️ {text}")
+    ws = CURRENT_WORKSPACE.get()
+    where = "/".join(x for x in (getattr(ws, "guild_key", None), match_id)
+                     if x)
+    print(f"⚠️ [{where or '?'}] {text}")
+
+
 @contextlib.contextmanager
-def move_hook_level(rules: Dict[str, Any], log: List[str]):
+def move_hook_level(rules: Dict[str, Any], log: List[str],
+                    match_id: str = "", move: bool = False):
     """One nesting level of movement hooks: yields True to fire them, or
-    False past move_hook_recursion_limit (adding one ⚠️ per chain to
-    `log`)."""
+    False past move_hook_recursion_limit levels deep or once the chain has
+    made move_hook_event_limit moves (adding one ⚠️ per chain to `log` and
+    the console). `move`: the level of a completed move's on_entity_moved
+    (fire_entity_moved), which counts that move."""
     depth = MOVE_HOOK_DEPTH.get()
+    fired = MOVE_HOOK_FIRED.get() if depth > 0 else None
     if depth >= move_hook_limit(rules):
-        if not MOVE_HOOK_WARNED.get():
-            MOVE_HOOK_WARNED.set(True)
-            log.append(f"⚠️ Movement hooks nested past "
-                       f"move_hook_recursion_limit ({move_hook_limit(rules)}):"
-                       f" a hook keeps moving units; the deeper moves fired "
-                       f"no hooks.")
+        _move_hook_warning(
+            log, match_id, "depth",
+            f"Movement hooks nested past move_hook_recursion_limit "
+            f"({move_hook_limit(rules)}): a hook keeps moving units; the "
+            f"deeper moves fired no hooks.")
+        yield False
+        return
+    if fired is not None and fired[0] >= move_hook_event_limit(rules):
+        _move_hook_warning(
+            log, match_id, "count",
+            f"Movement hooks made {fired[0]} moves from one move, "
+            f"move_hook_event_limit ({move_hook_event_limit(rules)}): hooks "
+            f"that move units several times each multiply; the later moves "
+            f"of this chain fired no hooks.")
         yield False
         return
     token = MOVE_HOOK_DEPTH.set(depth + 1)
-    warned = MOVE_HOOK_WARNED.set(False) if depth == 0 else None
+    if fired is None:
+        # A chain starts here (or under a transfer's hop, which nests
+        # without a level of its own).
+        fired = [0]
+        fired_token = MOVE_HOOK_FIRED.set(fired)
+        warned = MOVE_HOOK_WARNED.set(set())
+    else:
+        fired_token = warned = None
+    if move:
+        fired[0] += 1
     try:
         yield True
     finally:
         MOVE_HOOK_DEPTH.reset(token)
         if warned is not None:
             MOVE_HOOK_WARNED.reset(warned)
+            MOVE_HOOK_FIRED.reset(fired_token)
 
 
 def _bounded_move_hooks(fn):
@@ -116,7 +164,7 @@ def _bounded_move_hooks(fn):
     @functools.wraps(fn)
     def wrapper(self, *a, **k):
         log: List[str] = []
-        with move_hook_level(self.rules, log) as ok:
+        with move_hook_level(self.rules, log, self.id) as ok:
             if ok:
                 return fn(self, *a, **k)
         return log
@@ -1647,6 +1695,21 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "handler that re-emits its own event can't loop forever. Beyond "
             "the limit, further emit() calls in the chain are suppressed (a "
             "single warning is logged). Mirrors var_hook_recursion_limit."
+        ),
+    },
+    "move_hook_event_limit": {
+        "default": 500,
+        "schema": {"type": "int", "min": 1, "max": 100000, "ceiling": True},
+        "desc": (
+            "Max moves in one chain of movement hooks: one move and every "
+            "move its tile / zone / step / moved hooks set off in turn. "
+            "move_hook_recursion_limit bounds how deep moves nest, but a "
+            "hook that moves units twice doubles the work at every level "
+            "(16 levels = 65,535 hook runs, about 100 s with the bot "
+            "frozen for every server). Past this count the chain's later "
+            "moves fire no hooks, with one warning in the reply and on the "
+            "bot's console. A chain of single moves (a conveyor line, a "
+            "knockback pushing the next unit) makes one move per hop."
         ),
     },
     "move_hook_recursion_limit": {
@@ -5363,13 +5426,13 @@ OWNER_LIMITS: Dict[str, Dict[str, Any]] = {
         "desc": "The most copies each server keeps of each critical file "
                 "(the oldest go first).",
     },
-    "server_backup_log_minutes": {
-        "default": 60, "min": 0, "max": 10080,
-        "desc": "The two logs among the critical files (the system undo "
-                "history and the audit log) grow with every server-wide "
-                "edit and are copied whole: each is copied at most once per "
-                "this many minutes (0 = on every change, as the systems and "
-                "workspace files are).",
+    "server_backup_log_count": {
+        "default": 3, "min": 1, "max": 10000,
+        "desc": "The most copies each server keeps of its two logs (the "
+                "system undo history and the audit log): they grow with "
+                "every server-wide edit and are copied whole, so a few "
+                "recent copies cover a damaged file without filling the "
+                "server's quota.",
     },
     "map_nesting_depth": {
         "default": 4, "min": 1, "max": 32,
@@ -15167,9 +15230,10 @@ class Match:
                            from_x=from_x, from_y=from_y, to_x=to_x, to_y=to_y)
         log: List[str] = []
         # The passives are bounded by move_hook_recursion_limit (one moving
-        # its unit again fires the next move inside itself); the re-stamps
-        # above always run.
-        with move_hook_level(self.rules, log) as fire:
+        # its unit again fires the next move inside itself) and by
+        # move_hook_event_limit (this move counts); the re-stamps above
+        # always run.
+        with move_hook_level(self.rules, log, self.id, move=True) as fire:
             if fire:
                 for p in self._firing_passives(entity_id):
                     if p.when == "on_entity_moved":
@@ -15189,7 +15253,7 @@ class Match:
         # Nested maps: the units on each map the moved body carries.
         if entity_id in self.entities and any(
                 mp.vehicle for mp in self.maps.values()):
-            with move_hook_level(self.rules, log) as fire:
+            with move_hook_level(self.rules, log, self.id) as fire:
                 if fire:
                     for u in self.carried_body(e):
                         for mp in self._vehicle_move_maps(u.id):
@@ -15231,7 +15295,7 @@ class Match:
         }
         ctx = EvalCtx(this=this_id, target=entity_id, extras=extras)
         log: List[str] = []
-        with move_hook_level(self.rules, log) as fire:
+        with move_hook_level(self.rules, log, self.id) as fire:
             if fire:
                 for p in self._firing_passives(entity_id):
                     if p.when == "on_entity_step":

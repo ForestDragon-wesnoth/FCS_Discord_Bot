@@ -158,14 +158,19 @@ class GuiApp:
         self.zoom_label.pack(side="left", padx=6)
         tk.Label(bar, text="(drag to pan · wheel/Ctrl+wheel to zoom)",
                  bg="#0e0e12", fg="#707070").pack(side="left")
-        # Map browsing (a match with several maps the view knows of): shows
-        # another map until the next turn change, as a Discord board's map
-        # buttons do. Display state only; the labels follow the view
-        # (an unseen map may show unnamed, a hidden one isn't listed).
+        # Map menu (whenever a match is shown, so the drawn map is always
+        # named): picking another map shows it until the next turn change,
+        # as a Discord board's map buttons do. Display state only; the
+        # labels follow the view (an unseen map may show unnamed, a hidden
+        # one isn't listed, a size shows only for a map the view has seen).
         from tkinter import ttk
         self._browse = None    # (match id, map name, turns_elapsed)
         self._map_choices: List[Any] = []
-        self.map_pick = ttk.Combobox(bar, state="readonly", width=24)
+        self.map_box = tk.Frame(bar, bg="#0e0e12")
+        tk.Label(self.map_box, text="Map:", bg="#0e0e12",
+                 fg="#d0d0d0").pack(side="left")
+        self.map_pick = ttk.Combobox(self.map_box, state="readonly", width=30)
+        self.map_pick.pack(side="left")
         self.map_pick.bind("<<ComboboxSelected>>", self._on_map_pick)
 
         # ---- Widget creation ----
@@ -490,6 +495,7 @@ class GuiApp:
         m = self._active_match()
         if m is None:
             self.canvas.delete("all")
+            self.map_box.pack_forget()
             return
         # The canvas shows the GUI channel's view, as `!map` would: the
         # channel's bound POV, or an `!as view <team>` preview (fog drawn).
@@ -543,18 +549,23 @@ class GuiApp:
         self.canvas.create_image(0, 0, anchor="nw", image=self._photo)
 
     def _update_map_pick(self, m, pov, listed, shown) -> None:
-        """Show the map menu on a match whose view knows of several maps,
-        listing them as the view names them, with the shown map selected."""
-        if len(listed) < 2:
-            self.map_pick.pack_forget()
+        """The map menu: the maps the view knows of, as it names them (with
+        their size once seen), the shown map selected."""
+        if not listed:
+            self.map_box.pack_forget()
             return
         self._map_choices = listed
-        labels = [f"{i + 1}. {m.map_label(mp, pov)}".replace("`", "")
-                  for i, mp in enumerate(listed)]
-        self.map_pick.configure(values=labels)
+
+        def label(i, mp):
+            text = f"{i + 1}. {m.map_label(mp, pov)}".replace("`", "")
+            if m.map_seen_by(mp, pov):
+                text += f" ({mp.grid_width}x{mp.grid_height})"
+            return text
+        self.map_pick.configure(values=[label(i, mp)
+                                        for i, mp in enumerate(listed)])
         if shown in listed:
             self.map_pick.current(listed.index(shown))
-        self.map_pick.pack(side="right", padx=4)
+        self.map_box.pack(side="right", padx=4)
 
     def _on_map_pick(self, _event=None) -> None:
         m = self._active_match()

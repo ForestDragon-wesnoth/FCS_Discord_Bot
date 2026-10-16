@@ -561,8 +561,8 @@ plus `data/bot_settings.json` (owner limits + rule ceilings) and
   systems.json copy n back through `_restore_systems` (refused if a match's
   system isn't in it), an ordinary `!system undo` step (863); a copy equal
   to the systems now is refused, and the listing marks such copies (874).
-  The two logs (system_history.json, audit.json) are copied at most once
-  per owner limit `server_backup_log_minutes` (60): they grow with every
+  The two logs (system_history.json, audit.json) keep only their newest
+  owner limit `server_backup_log_count` (3) copies: they grow with every
   edit and are copied whole. The other
   files' copies are for an operator to copy back by hand. A commit over the
   limit cuts the oldest copies after old template versions, keeping each
@@ -1123,8 +1123,12 @@ hardcodes**.
   only their OWN passives (`own_only_targets`). Movement hooks per footprint
   cell (`fire_footprint_tile_*` / `fire_footprint_zone_*`) plus
   `on_entity_step` per step; a hook that moves units again nests at most
-  `move_hook_recursion_limit` deep (`move_hook_level`; deeper moves fire no
-  hooks, one ⚠️; re-stamps always run; each `transfer_entity` hop counts). Lifecycle: on_entity_spawned,
+  `move_hook_recursion_limit` deep, and one chain (an outermost move and
+  every move its hooks set off) makes at most `move_hook_event_limit`
+  (500) moves with hooks (`move_hook_level`, counted in
+  `fire_entity_moved`; past either, moves fire no hooks, with one ⚠️ per
+  limit per chain in the reply and on the console; re-stamps always run;
+  each `transfer_entity` hop counts for depth) (875). Lifecycle: on_entity_spawned,
   on_entity_despawned (every non-death removal, fired BEFORE the unit
   leaves; `Entity.remove(despawn=)` returns its log), on_death / on_revive,
   on_entity_moved, on_entity_changed_map, on_map_vehicle_moved / on_map_vehicle_death (§7.8), on_mounted / on_dismounted, on_turn_skipped (`skip_status`), on_status_*,
@@ -1527,8 +1531,10 @@ hardcodes**.
   Discord board browses maps (◀ ▶, a select menu past 5 maps, the 25
   around the shown map plus ◀ ▶ past 25,
   `_BoardView`; `_board_map` keeps the browsed map until `turns_elapsed`
-  changes); the GUI has a map dropdown with the same rule; the CLI uses
-  `!map <name>` (837-838, 841).
+  changes); the GUI has a "Map:" dropdown with the same rule, shown
+  whenever a match is (`1. main (8x6)`: a size only for a map the view
+  has seen; `GuiApp._update_map_pick`); the CLI uses `!map <name>`
+  (837-838, 841).
 - **Nested maps** (step 3, 844-848): `!map attach <map> <unit>` /
   `!map detach <map>` (host) make a unit carry a map (`Map.vehicle`,
   saved; a unit may carry several; a body part can't). A map can't be
@@ -2387,9 +2393,8 @@ rejected already. Update this section in the PR that resolves an item.
 - **Per-server CPU work budget** (revisit before any public rollout; X4
   folded in here by the user; the pass 43 report's X4 measured the doubling case: a `!func`, event handler
   or action calling itself twice runs 2^depth times within its depth
-  limit, `f(20)` 5.9 s; pass 45: a move hook making two moves runs
-  2^depth hooks within move_hook_recursion_limit, 98 s at the default 16;
-  macros and nested batch / foreach runs now share
+  limit, `f(20)` 5.9 s; pass 45 bounded the move-hook case, a hook
+  making two moves per level, with `move_hook_event_limit`; macros and nested batch / foreach runs now share
   macro_step_limit, the rest wait for this budget): the
   per-call limits multiply — 10,000 loop iterations × a 1,000-cell line on a
   500×500 map is still ~7 s of a frozen bot for every server. Preferred
