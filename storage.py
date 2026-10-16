@@ -44,6 +44,7 @@ grow the data is always allowed.
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -53,8 +54,9 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from logic import (GameSystem, is_file_id, Match, MatchManager,
                    RULE_CEILINGS, VTTError, Workspaces, check_template,
-                   check_template_name, owner_limit, unreachable_id)
-from match_history import MatchHistory, HistoryError
+                   check_template_name, legacy_template_fixes,
+                   LEGACY_IDS_OK, owner_limit, unreachable_id)
+from match_history import MatchHistory, HistoryError, _now_iso
 from journal import start_header
 
 MB = 1024 * 1024
@@ -87,6 +89,8 @@ SYSTEM_BACKUP_KEY = "system_backup"
 BACKUP_DIR = "backups"
 BACKED_UP_FILES = ("systems.json", "workspace.json", "system_history.json",
                    "audit.json")
+# Of those, the logs (only server_backup_log_count copies kept).
+BACKED_UP_LOGS = ("system_history.json", "audit.json")
 
 SERVER_LOGS: Dict[str, Tuple[str, str]] = {
     "syshist": ("system_history.json", "system_history"),
@@ -355,6 +359,7 @@ class Storage:
         key = mgr.guild_key
         notes: List[str] = []
         mgr.templates = {}
+        fixed: List[str] = []
         tdir = self.templates_dir(key)
         if not os.path.isdir(tdir):
             return notes
@@ -366,11 +371,31 @@ class Storage:
                 name = check_template_name(fname[:-5], legacy=True)
                 if name != fname[:-5]:
                     raise ValueError("file name isn't a template name")
-                data, _ = check_template(self._read_json(fpath), name)
+                raw = self._read_json(fpath)
+                fixes = legacy_template_fixes(raw, name)
+                for note in fixes:
+                    print(f"⚠️ [{key}] {note}")
+                token = LEGACY_IDS_OK.set(True)
+                try:
+                    data, _ = check_template(raw, name)
+                finally:
+                    LEGACY_IDS_OK.reset(token)
             except Exception as ex:  # noqa: BLE001 - any bad file is quarantined
                 notes.append(self._quarantine(key, fpath, type(ex).__name__))
                 continue
             mgr.templates[name] = data
+            if fixes:
+                fixed.append(name)
+        # A template the load changed is recorded in every match journal
+        # as a library save is, so a replay spawns what the server holds.
+        for name in fixed:
+            for m in mgr.matches.values():
+                if m.journal is not None:
+                    m.journal.add({
+                        "kind": "template", "name": name, "new_name": None,
+                        "at": _now_iso(),
+                        "by": "", "what": "updated at load",
+                        "data": copy.deepcopy(mgr.templates[name])})
         return notes
 
     # ---- bot settings -----------------------------------------------------
@@ -606,7 +631,10 @@ class Storage:
                 mid = fname[:-5]
                 fpath = os.path.join(mdir, fname)
                 try:
-                    m, backup = self._load_match(mgr, mid, fpath)
+                    m, backup = self._load_match(
+                        mgr, mid, fpath,
+                        stand_in=sys_failed is not None
+                        or not os.path.exists(sys_path))
                     if isinstance(backup, dict):
                         backups[mid] = (os.path.getmtime(fpath), backup)
                 except Exception as ex:  # noqa: BLE001
@@ -636,6 +664,7 @@ class Storage:
                     notes.append(self._quarantine(key, path,
                                                   type(ex).__name__))
         notes.extend(self.load_templates(mgr))
+        self._journal_load_changes(mgr)
         lost = any(m.system_name not in mgr.systems
                    for m in mgr.matches.values())
         notes.extend(self._settle_lost_systems(mgr, backups, sys_failed,
@@ -648,6 +677,26 @@ class Storage:
             w["workspace"] = None
         return notes
 
+    @staticmethod
+    def _journal_load_changes(mgr: MatchManager) -> None:
+        """A match the load changed (data an older build wrote, brought up
+        to date; a file edited by hand) no longer has the state its journal
+        last recorded: a `state` entry records the loaded one, so a replay
+        goes on from what the server holds."""
+        from journal import effective_seed, journal_state, state_hash
+        for m in mgr.matches.values():
+            if m.journal is None or not m.journal.segments:
+                continue
+            post = m.to_dict(include_history=False)
+            h = state_hash(post)
+            if h == m.journal.last_state_hash():
+                continue
+            m.journal.add({"kind": "state", "at": _now_iso(), "by": "",
+                           "cmd": ["(loaded from disk)"], "outside": True,
+                           "rng": [effective_seed(m), m.rng_position(),
+                                   m.rng_position()],
+                           "state": journal_state(post), "hash": h})
+
     def _settle_lost_systems(self, mgr: MatchManager,
                              backups: Dict[str, Tuple[float, Dict[str, Any]]],
                              sys_failed: Optional[str],
@@ -658,11 +707,18 @@ class Storage:
         them has none, lock the server until an administrator recovers it
         (`!server recover`; MatchManager.recovery)."""
         key = mgr.guild_key
+        sys_path = os.path.join(self.server_dir(key), "systems.json")
+        # Without a systems.json that loaded, the server's `default` is the
+        # registry's fresh one, a stand-in for whatever the server had
+        # (most servers customize it): its matches lost their system too.
+        placeholders = set() if (sys_failed is None
+                                 and os.path.exists(sys_path)) \
+            else set(mgr.systems)
         lost = {mid: m.system_name for mid, m in mgr.matches.items()
-                if m.system_name not in mgr.systems}
+                if m.system_name not in mgr.systems
+                or m.system_name in placeholders}
         if not lost:
             return []
-        sys_path = os.path.join(self.server_dir(key), "systems.json")
         why = (f"systems.json failed to load ({sys_failed})" if sys_failed
                else "systems.json is missing (a failed load moves it to "
                     "corrupt/)" if not os.path.exists(sys_path)
@@ -675,7 +731,8 @@ class Storage:
             mgr.recovery = {"reason": why, "uncovered": uncovered,
                             "covered": {mid: lost[mid] for mid in covered},
                             "backups": {mid: backups[mid] for mid in covered},
-                            "pointers": pointers}
+                            "pointers": pointers,
+                            "placeholders": sorted(placeholders)}
             return [f"🔒 [{key}] {why}: match(es) "
                     + ", ".join(f"{mid} ({n})" for mid, n in
                                 sorted(uncovered.items()))
@@ -683,15 +740,19 @@ class Storage:
                     "server is locked (nothing runs or is saved) until an "
                     "administrator runs `!server recover`."]
         return self.rebuild_from_match_backups(
-            mgr, {mid: backups[mid] for mid in covered}, pointers, why)
+            mgr, {mid: backups[mid] for mid in covered}, pointers, why,
+            placeholders)
 
     @staticmethod
     def rebuild_from_match_backups(
             mgr: MatchManager,
             backups: Dict[str, Tuple[float, Dict[str, Any]]],
-            pointers: Dict[str, Any], why: str) -> List[str]:
+            pointers: Dict[str, Any], why: str,
+            placeholders: Any = ()) -> List[str]:
         """Add the systems the matches' backups hold that the server lacks
-        (the newest file's copy wins a name two backups hold), point the
+        or holds only as `placeholders` (the registry's fresh `default` a
+        failed load builds; the newest file's copy wins a name two backups
+        hold), point the
         default pointers back where they were, and re-apply rules to those
         matches. Returns notes."""
         key = mgr.guild_key
@@ -702,7 +763,7 @@ class Storage:
                     found[name] = (mtime, d)
         added = []
         for name in sorted(found):
-            if name not in mgr.systems:
+            if name not in mgr.systems or name in placeholders:
                 mgr.systems[name] = GameSystem.from_dict(found[name][1])
                 added.append(name)
         notes = [f"♻️ [{key}] {why}: rebuilt system(s) "
@@ -723,8 +784,8 @@ class Storage:
                           for n in mgr.apply_system_rules(m)]
         return notes
 
-    def _load_match(self, mgr: MatchManager, mid: str, path: str
-                    ) -> Tuple[Match, Any]:
+    def _load_match(self, mgr: MatchManager, mid: str, path: str,
+                    stand_in: bool = False) -> Tuple[Match, Any]:
         if not valid_id(mid):
             raise ValueError("bad match id")
         raw = self._read_json(path)
@@ -740,8 +801,9 @@ class Storage:
         # A match whose system wasn't loaded keeps its name and units as
         # they are: _settle_lost_systems rebuilds the system or locks the
         # server (renaming its vars to another system's names would be
-        # saved over the good file).
-        if m.system_name in mgr.systems:
+        # saved over the good file). `stand_in`: systems.json didn't load,
+        # so even `default` is the registry's stand-in.
+        if m.system_name in mgr.systems and not stand_in:
             for note in mgr.apply_system_rules(m):
                 print(f"[storage] {mgr.guild_key}/{m.id}: {note}")
         return m, backup
@@ -947,14 +1009,17 @@ class Storage:
 
     def prune_backups(self, key: str) -> None:
         """Drop server `key`'s copies past server_backup_days or past
-        server_backup_count per file."""
+        server_backup_count per file (server_backup_log_count for the
+        two logs)."""
         days = owner_limit("server_backup_days")
         count = owner_limit("server_backup_count")
+        log_count = owner_limit("server_backup_log_count")
         now = time.time()
         kept: Dict[str, int] = {}
         for stamp, name, path in self.backups(key):
             kept[name] = kept.get(name, 0) + 1
-            if kept[name] > count or now - stamp > days * 86400:
+            cap = min(count, log_count) if name in BACKED_UP_LOGS else count
+            if kept[name] > cap or now - stamp > days * 86400:
                 size = _file_size(path)
                 _remove_path(path)
                 self._add_usage(key, -size)

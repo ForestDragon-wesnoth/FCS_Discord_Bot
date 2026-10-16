@@ -165,14 +165,24 @@ _TAB_PREFIX = "?tab "
 # `?file corrupt <path>` / `?file delete <path>`: damage a file of the
 # scenario's server folder (a path relative to it), as a crash or a careless
 # operator would, to test what a load does with it (`!as restart`).
+# `?file set <path> <a.b.c> <json>` writes a JSON value at a dotted path of
+# a JSON file and `?file replace <path> "<old>" "<new>"` replaces text in
+# it: data in the shape an older build wrote.
 _FILE_PREFIX = "?file "
+_FILE_USAGE = ("💥 Usage: ?file corrupt|delete <path> | set <path> <a.b.c> "
+               "<json> | replace <path> \"<old>\" \"<new>\" (a path in the "
+               "server folder)")
 
 
 def _file_action(line: str, workspaces, ctx) -> List[str]:
-    words = line[len(_FILE_PREFIX):].split()
+    words = line[len(_FILE_PREFIX):].split(maxsplit=3)
     st = getattr(workspaces, "storage", None)
-    if len(words) != 2 or words[0] not in ("corrupt", "delete") or st is None:
-        return ["💥 Usage: ?file corrupt|delete <path in the server folder>"]
+    if st is None or not words:
+        return [_FILE_USAGE]
+    if words[0] in ("set", "replace"):
+        return _file_edit(line, words, st, ctx)
+    if len(words) != 2 or words[0] not in ("corrupt", "delete"):
+        return [_FILE_USAGE]
     path = os.path.join(st.server_dir(ctx.guild_key), words[1])
     if not os.path.isfile(path):
         return [f"💥 ?file: no file {words[1]}"]
@@ -187,6 +197,38 @@ def _file_action(line: str, workspaces, ctx) -> List[str]:
             f.truncate()
         out = [f"(cut the end off {words[1]})"]
     # The usage counter measures the folder again, as a restart would.
+    st.rescan()
+    return out
+
+
+def _file_edit(line: str, words: List[str], st, ctx) -> List[str]:
+    import json
+    import shlex
+    if len(words) < 4:
+        return [_FILE_USAGE]
+    path = os.path.join(st.server_dir(ctx.guild_key), words[1])
+    if not os.path.isfile(path):
+        return [f"💥 ?file: no file {words[1]}"]
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    if words[0] == "replace":
+        pair = shlex.split(line[len(_FILE_PREFIX):])[2:]
+        if len(pair) != 2 or pair[0] not in text:
+            return [f"💥 ?file replace: `{pair[0] if pair else ''}` isn't "
+                    f"in {words[1]}" if pair else _FILE_USAGE]
+        text = text.replace(pair[0], pair[1])
+        out = [f"(replaced `{pair[0]}` in {words[1]})"]
+    else:
+        data = json.loads(text)
+        keys = words[2].split(".")
+        node = data
+        for k in keys[:-1]:
+            node = node.setdefault(k, {})
+        node[keys[-1]] = json.loads(words[3])
+        text = json.dumps(data, indent=1, sort_keys=True)
+        out = [f"(set {words[2]} in {words[1]})"]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
     st.rescan()
     return out
 

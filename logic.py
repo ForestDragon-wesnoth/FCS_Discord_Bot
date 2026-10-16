@@ -67,12 +67,16 @@ LEGACY_IDS_OK: "contextvars.ContextVar[bool]" = (
     contextvars.ContextVar("vtt_legacy_ids", default=False))
 # How deeply movement hooks are nested right now (a hook moving a unit fires
 # the next move's hooks inside itself; a transfer's arrival fires spawn
-# hooks in another match), and whether the limit's warning was given in
-# this chain. Context variables, so the count spans matches.
+# hooks in another match), whether a limit's warning was given in this
+# chain, and how many hook levels the chain has fired (a chain = one
+# outermost move and everything its hooks set off). Context variables, so
+# the counts span matches.
 MOVE_HOOK_DEPTH: "contextvars.ContextVar[int]" = (
     contextvars.ContextVar("vtt_move_hook_depth", default=0))
-MOVE_HOOK_WARNED: "contextvars.ContextVar[bool]" = (
-    contextvars.ContextVar("vtt_move_hook_warned", default=False))
+MOVE_HOOK_WARNED: "contextvars.ContextVar[Optional[Set[str]]]" = (
+    contextvars.ContextVar("vtt_move_hook_warned", default=None))
+MOVE_HOOK_FIRED: "contextvars.ContextVar[Optional[List[int]]]" = (
+    contextvars.ContextVar("vtt_move_hook_fired", default=None))
 
 
 def move_hook_limit(rules: Dict[str, Any]) -> int:
@@ -82,29 +86,73 @@ def move_hook_limit(rules: Dict[str, Any]) -> int:
         return 16
 
 
+def move_hook_event_limit(rules: Dict[str, Any]) -> int:
+    try:
+        return max(1, int(rules.get("move_hook_event_limit", 500)))
+    except (TypeError, ValueError):
+        return 500
+
+
+def _move_hook_warning(log: List[str], match_id: str, kind: str,
+                       text: str) -> None:
+    """One ⚠️ per limit per chain, in the reply and on the console (the
+    bot's operator sees which server and match ran into the limit)."""
+    warned = MOVE_HOOK_WARNED.get()
+    if warned is None or kind in warned:
+        return
+    warned.add(kind)
+    log.append(f"⚠️ {text}")
+    ws = CURRENT_WORKSPACE.get()
+    where = "/".join(x for x in (getattr(ws, "guild_key", None), match_id)
+                     if x)
+    print(f"⚠️ [{where or '?'}] {text}")
+
+
 @contextlib.contextmanager
-def move_hook_level(rules: Dict[str, Any], log: List[str]):
+def move_hook_level(rules: Dict[str, Any], log: List[str],
+                    match_id: str = "", move: bool = False):
     """One nesting level of movement hooks: yields True to fire them, or
-    False past move_hook_recursion_limit (adding one ⚠️ per chain to
-    `log`)."""
+    False past move_hook_recursion_limit levels deep or once the chain has
+    made move_hook_event_limit moves (adding one ⚠️ per chain to `log` and
+    the console). `move`: the level of a completed move's on_entity_moved
+    (fire_entity_moved), which counts that move."""
     depth = MOVE_HOOK_DEPTH.get()
+    fired = MOVE_HOOK_FIRED.get() if depth > 0 else None
     if depth >= move_hook_limit(rules):
-        if not MOVE_HOOK_WARNED.get():
-            MOVE_HOOK_WARNED.set(True)
-            log.append(f"⚠️ Movement hooks nested past "
-                       f"move_hook_recursion_limit ({move_hook_limit(rules)}):"
-                       f" a hook keeps moving units; the deeper moves fired "
-                       f"no hooks.")
+        _move_hook_warning(
+            log, match_id, "depth",
+            f"Movement hooks nested past move_hook_recursion_limit "
+            f"({move_hook_limit(rules)}): a hook keeps moving units; the "
+            f"deeper moves fired no hooks.")
+        yield False
+        return
+    if fired is not None and fired[0] >= move_hook_event_limit(rules):
+        _move_hook_warning(
+            log, match_id, "count",
+            f"Movement hooks made {fired[0]} moves from one move, "
+            f"move_hook_event_limit ({move_hook_event_limit(rules)}): hooks "
+            f"that move units several times each multiply; the later moves "
+            f"of this chain fired no hooks.")
         yield False
         return
     token = MOVE_HOOK_DEPTH.set(depth + 1)
-    warned = MOVE_HOOK_WARNED.set(False) if depth == 0 else None
+    if fired is None:
+        # A chain starts here (or under a transfer's hop, which nests
+        # without a level of its own).
+        fired = [0]
+        fired_token = MOVE_HOOK_FIRED.set(fired)
+        warned = MOVE_HOOK_WARNED.set(set())
+    else:
+        fired_token = warned = None
+    if move:
+        fired[0] += 1
     try:
         yield True
     finally:
         MOVE_HOOK_DEPTH.reset(token)
         if warned is not None:
             MOVE_HOOK_WARNED.reset(warned)
+            MOVE_HOOK_FIRED.reset(fired_token)
 
 
 def _bounded_move_hooks(fn):
@@ -116,7 +164,7 @@ def _bounded_move_hooks(fn):
     @functools.wraps(fn)
     def wrapper(self, *a, **k):
         log: List[str] = []
-        with move_hook_level(self.rules, log) as ok:
+        with move_hook_level(self.rules, log, self.id) as ok:
             if ok:
                 return fn(self, *a, **k)
         return log
@@ -1649,6 +1697,21 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "single warning is logged). Mirrors var_hook_recursion_limit."
         ),
     },
+    "move_hook_event_limit": {
+        "default": 500,
+        "schema": {"type": "int", "min": 1, "max": 100000, "ceiling": True},
+        "desc": (
+            "Max moves in one chain of movement hooks: one move and every "
+            "move its tile / zone / step / moved hooks set off in turn. "
+            "move_hook_recursion_limit bounds how deep moves nest, but a "
+            "hook that moves units twice doubles the work at every level "
+            "(16 levels = 65,535 hook runs, about 100 s with the bot "
+            "frozen for every server). Past this count the chain's later "
+            "moves fire no hooks, with one warning in the reply and on the "
+            "bot's console. A chain of single moves (a conveyor line, a "
+            "knockback pushing the next unit) makes one move per hop."
+        ),
+    },
     "move_hook_recursion_limit": {
         "default": 16,
         "schema": {"type": "int", "min": 1, "max": 48, "ceiling": True},
@@ -2939,6 +3002,17 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "(a huge `!roll`, `!map` on a large map with the viewport off) "
             "stops there with a note of how much was cut, so one command "
             "can't flood the channel while the server waits on it."
+        ),
+    },
+    "command_message_cap": {
+        "default": 20,
+        "schema": {"type": "int", "min": 1, "max": 200, "ceiling": True},
+        "desc": (
+            "Discord: the most messages one command may post in all (a "
+            "`!foreach` over many units, a long `!batch` or macro, each "
+            "line posting its own reply). Past it the command keeps "
+            "running, its further replies are left out and one note says "
+            "how many. Each reply is also capped by reply_message_cap."
         ),
     },
     # Auto-legend: a glyph->meaning key appended under the map. Seeds a new
@@ -4719,7 +4793,20 @@ class ClampSpec:
             raise VTTError(
                 f"Unknown clamp mode '{self.mode}'. Allowed: soft, hard."
             )
-        if self.max is None and self.min is None:
+        legacy_drop = False
+        if LEGACY_IDS_OK.get():
+            # Saved data from a build that took any text as a bound (it
+            # meant "no bound" there): drop it with a console note, so the
+            # file still loads; new input is refused below.
+            for label in ("max", "min"):
+                b = getattr(self, label)
+                if isinstance(b, str) and not re.match(
+                        r"[A-Za-z_]\w*(\.\w+)*\Z", b.strip()):
+                    print(f"⚠️ Clamp on '{self.path}': dropped the {label} "
+                          f"bound {b!r} (a bound is a number or a var path).")
+                    setattr(self, label, None)
+                    legacy_drop = True
+        if self.max is None and self.min is None and not legacy_drop:
             raise VTTError(
                 f"Clamp on '{self.path}' must specify at least one of max or min."
             )
@@ -5338,6 +5425,14 @@ OWNER_LIMITS: Dict[str, Dict[str, Any]] = {
         "default": 200, "min": 1, "max": 10000,
         "desc": "The most copies each server keeps of each critical file "
                 "(the oldest go first).",
+    },
+    "server_backup_log_count": {
+        "default": 3, "min": 1, "max": 10000,
+        "desc": "The most copies each server keeps of its two logs (the "
+                "system undo history and the audit log): they grow with "
+                "every server-wide edit and are copied whole, so a few "
+                "recent copies cover a damaged file without filling the "
+                "server's quota.",
     },
     "map_nesting_depth": {
         "default": 4, "min": 1, "max": 32,
@@ -6251,7 +6346,8 @@ class Entity:
         # part's own remove() handles its riders, auras and sub-parts.
         for part in m.entity_part_subtree(self.id):
             if part.id in m.entities and part._match is m:
-                log.extend(part.remove(despawn=despawn))
+                log.extend(part.remove(despawn=despawn,
+                                       defer_riders=defer_riders))
         self._match = None
         m._rebuild_turn_order()
         return log
@@ -7064,7 +7160,9 @@ class Entity:
         for pid, pd in (data.get("passives", {}) or {}).items():
             e.passives[pid] = Passive.from_dict(pd)
         for path, cd in (data.get("clamps", {}) or {}).items():
-            e.clamps[path] = ClampSpec.from_dict(cd)
+            spec = ClampSpec.from_dict(cd)
+            if spec.max is not None or spec.min is not None:
+                e.clamps[path] = spec   # (saved data: every bound dropped)
         return e
 
 # -------------------------
@@ -9785,7 +9883,13 @@ class Match:
         if p.vars.get("__segment"):
             raise VTTError(f"`{part_id}` is a snake segment; `!part detach` "
                            f"it from its body first.")
-        if p.mounted_on and p.mounted_on in self.entities:
+        if self.snake_segments(part_id):
+            raise VTTError(f"`{part_id}` is a snake head with segments; a "
+                           f"body part can't drag a chain (`!part detach` "
+                           f"its segments first).")
+        # A rider of a corpse (kept aboard under `keep`) is a rider still:
+        # a revive puts it back on its vehicle.
+        if p.mounted_on:
             raise VTTError(f"`{part_id}` is riding `{p.mounted_on}`; "
                            f"dismount it first.")
         p.part_of = parent_id
@@ -9822,6 +9926,11 @@ class Match:
             spot = self._nearest_fit_cell(p, p.x, p.y, self.map_of(p))
             if spot is not None:
                 p.move_to(*spot)
+                # What it carries goes with it: its auras, glued parts and
+                # riders.
+                self._restamp_anchors_for(p.id)
+                self._restamp_parts_for(p.id)
+                self._restamp_riders_for(p.id)
         self._rebuild_turn_order()
         return p
 
@@ -9846,6 +9955,10 @@ class Match:
             raise
         p.vars.pop("__part_region", None)   # locate and region are exclusive
         p.move_to(x, y)
+        # Its own auras, glued parts and riders come along.
+        self._restamp_anchors_for(p.id)
+        self._restamp_parts_for(p.id)
+        self._restamp_riders_for(p.id)
         return p
 
     def glue_part(self, part_id: str) -> "Entity":
@@ -9857,10 +9970,19 @@ class Match:
             raise NotFound(f"Entity '{part_id}' not found.")
         if not p.part_of:
             raise VTTError(f"`{part_id}` is not a body part.")
+        self._refuse_segment_mode(p, "glued")
         p.vars.pop("__part_located", None)
         p.vars.pop("__part_region", None)
         self._restamp_parts_for(p.part_of)
         return p
+
+    def _refuse_segment_mode(self, p: "Entity", mode: str) -> None:
+        """A snake segment is a located part that follows its chain: it
+        can't be glued or put on a region (the segment behind it would
+        follow a part sitting on the body)."""
+        if p.vars.get("__segment"):
+            raise VTTError(f"`{p.id}` is a snake segment and can't be "
+                           f"{mode}; `!part detach` it from its body first.")
 
     _PART_REGIONS = frozenset({
         "all", "front", "back", "left", "right", "center",
@@ -9876,6 +9998,7 @@ class Match:
             raise NotFound(f"Entity '{part_id}' not found.")
         if not p.part_of:
             raise VTTError(f"`{part_id}` is not a body part.")
+        self._refuse_segment_mode(p, "put on a region")
         region = str(region).strip().lower()
         if region not in self._PART_REGIONS:
             raise VTTError(
@@ -10309,13 +10432,14 @@ class Match:
     _MOUNT_FATES = ("eject", "kill", "keep")
 
     def _mount_vehicle_died(self, vid: str, vars_: Dict[str, Any],
-                            box: Tuple[int, int, int, int], map_name: str
-                            ) -> List[str]:
+                            box: Tuple[int, int, int, int], map_name: str,
+                            remains: bool = False) -> List[str]:
         """The riders of vehicle `vid`, which just died (its corpse, if any,
         is stored and the unit removed): each rider's death effect and
         on_mount_vehicle_death in turn order, then its fate (eject / kill /
         keep: rider var > slot key > vehicle var > mount_on_vehicle_death;
-        keep without a corpse ejects)."""
+        keep without a corpse ejects). `remains`: the vehicle stays in the
+        match (a body part destroyed as a dead limb), so keep holds."""
         riders = self._turn_sorted(self.vehicle_riders(vid))
         if not riders:
             return []
@@ -10355,7 +10479,7 @@ class Match:
                 finally:
                     self._death_processing += held
         # 2. Each rider still aboard: its fate.
-        corpse_kept = self.find_corpse(vid) is not None
+        corpse_kept = remains or self.find_corpse(vid) is not None
         mp = self.maps.get(map_name)
         for rid, slot in plan:
             u = self.entities.get(rid)
@@ -15106,9 +15230,10 @@ class Match:
                            from_x=from_x, from_y=from_y, to_x=to_x, to_y=to_y)
         log: List[str] = []
         # The passives are bounded by move_hook_recursion_limit (one moving
-        # its unit again fires the next move inside itself); the re-stamps
-        # above always run.
-        with move_hook_level(self.rules, log) as fire:
+        # its unit again fires the next move inside itself) and by
+        # move_hook_event_limit (this move counts); the re-stamps above
+        # always run.
+        with move_hook_level(self.rules, log, self.id, move=True) as fire:
             if fire:
                 for p in self._firing_passives(entity_id):
                     if p.when == "on_entity_moved":
@@ -15128,7 +15253,7 @@ class Match:
         # Nested maps: the units on each map the moved body carries.
         if entity_id in self.entities and any(
                 mp.vehicle for mp in self.maps.values()):
-            with move_hook_level(self.rules, log) as fire:
+            with move_hook_level(self.rules, log, self.id) as fire:
                 if fire:
                     for u in self.carried_body(e):
                         for mp in self._vehicle_move_maps(u.id):
@@ -15170,7 +15295,7 @@ class Match:
         }
         ctx = EvalCtx(this=this_id, target=entity_id, extras=extras)
         log: List[str] = []
-        with move_hook_level(self.rules, log) as fire:
+        with move_hook_level(self.rules, log, self.id) as fire:
             if fire:
                 for p in self._firing_passives(entity_id):
                     if p.when == "on_entity_step":
@@ -16457,6 +16582,8 @@ class Match:
         dead_name, dead_x, dead_y, dead_map = e.name, e.x, e.y, e.map
         dead_vars = copy.deepcopy(e.vars)
         dead_box = (e.x, e.y) + self.entity_footprint(e)
+        dead_vehicles: List[Tuple[str, Dict[str, Any], Tuple[int, int, int, int],
+                                  str]] = []
         try:
             log = self.fire_hook("on_death", target_ids=[entity_id])
             # Re-check entity still exists — a paranoid on_death passive
@@ -16471,6 +16598,16 @@ class Match:
             result = self._effective_death_result(e)
             if result == "corpse":
                 self._store_corpse(e)   # also snapshots the parts
+            # A part that carries riders (a howdah, a train car) dies with
+            # the creature: its riders go through the mount-death rules
+            # after the death, as the creature's own do (removal defers
+            # them, down the whole part subtree).
+            for part in self.entity_part_subtree(entity_id):
+                if self.vehicle_riders(part.id):
+                    dead_vehicles.append(
+                        (part.id, copy.deepcopy(part.vars),
+                         (part.x, part.y) + self.entity_footprint(part),
+                         part.map))
             # Remove from match (entity.remove handles turn-order
             # bookkeeping + group scrubbing) regardless of result.
             e.remove(despawn=False, corpse_kept=(result == "corpse"),
@@ -16484,7 +16621,7 @@ class Match:
             # limb destruction, not whole-creature death.
             for part in self.entity_part_subtree(entity_id):
                 if part.id in self.entities:
-                    part.remove(despawn=False)
+                    part.remove(despawn=False, defer_riders=True)
             self.log_event("death", entity=entity_id, name=dead_name,
                            x=dead_x, y=dead_y)
             self._announce("death_message_format", entity_id, dead_name,
@@ -16496,6 +16633,8 @@ class Match:
         # occupant (or a unit near it) runs that death.
         log.extend(self._mount_vehicle_died(entity_id, dead_vars, dead_box,
                                             dead_map))
+        for pid, pvars, pbox, pmap in dead_vehicles:
+            log.extend(self._mount_vehicle_died(pid, pvars, pbox, pmap))
         log.extend(self._map_vehicle_died(entity_id, dead_vars, dead_box,
                                           dead_map))
         return log
@@ -16556,6 +16695,10 @@ class Match:
         the `!ent kill` command."""
         if eid not in self.entities:
             return False, []
+        # The unit as it stands: a death the effects trip (and a revive a
+        # vehicle-death effect or hook runs after it) leaves another object
+        # under the id, which isn't killed again.
+        before = self.entities[eid]
         effects = str(self.rules.get("default_kill_function_effects", "")).strip()
         if effects:
             from formula import FormulaEngine, EvalCtx, FormulaError
@@ -16572,15 +16715,17 @@ class Match:
         # The effects formula (or a side-effect passive) may have already
         # tripped natural death and removed the entity; only run the
         # pipeline if it's still present.
-        was_part = eid in self.entities and self.entities[eid].is_part
+        was_part = before.is_part
         log: List[str] = []
-        if eid in self.entities:
+        if self.entities.get(eid) is before and not (
+                was_part and before.vars.get("__part_destroyed")):
             log = self._process_death(eid)
         # A killed body part is destroyed IN PLACE (lingers as a dead limb),
         # so "still in the match" does not mean "not killed" — count it as
         # killed once it carries the __part_destroyed latch.
         post = self.entities.get(eid)
-        killed = post is None or (was_part and bool(post.vars.get("__part_destroyed")))
+        killed = post is not before or (
+            was_part and bool(post.vars.get("__part_destroyed")))
         return killed, log
 
     # ---------- locational damage: routing + part death ----------
@@ -16741,6 +16886,12 @@ class Match:
         self._announce("death_message_format", p.id, p.name, p.x, p.y,
                        p.vars, part_of=p.part_of or "", map_name=p.map)
         log = self.fire_hook("on_death", target_ids=[p.id])
+        # A destroyed limb that carries riders: the mount-death rules, as
+        # for any vehicle's death (keep leaves them aboard the dead limb).
+        if p.id in self.entities and self.vehicle_riders(p.id):
+            log.extend(self._mount_vehicle_died(
+                p.id, copy.deepcopy(p.vars),
+                (p.x, p.y) + self.entity_footprint(p), p.map, remains=True))
         # A destroyed limb LINGERS attached (it doesn't route through
         # Entity.remove), so resolve its anchored auras here too — same
         # delete/freeze/suspend rule as any anchor loss. Idempotent if a
@@ -18764,6 +18915,33 @@ class Match:
             if mp.vehicle and (mp.vehicle not in m.entities
                                or m.entities[mp.vehicle].part_of):
                 mp.vehicle = None
+        # A team an older build stored as a number reads as the text every
+        # write now stores (so `1` and "1" are one team in formulas too),
+        # on units and in corpse snapshots alike.
+        def _team_as_text(vars_: Any, names: Any) -> None:
+            tv = (names or {}).get("team_var", "team") \
+                if isinstance(names, dict) else "team"
+            if isinstance(vars_, dict) and tv in vars_ \
+                    and not isinstance(vars_[tv], (str, dict, list)) \
+                    and vars_[tv] is not None:
+                vars_[tv] = team_text(vars_[tv])
+        for e in m.entities.values():
+            _team_as_text(e.vars, e.var_names)
+        for mp in maps.values():
+            for cell in mp.tiles.values():
+                corpses = cell.get("corpses") if isinstance(cell, dict) \
+                    else None
+                for c in (corpses or {}).values() \
+                        if isinstance(corpses, dict) else ():
+                    if isinstance(c, dict):
+                        ce = c.get("entity")
+                        if isinstance(ce, dict):
+                            _team_as_text(ce.get("vars"), ce.get("var_names"))
+                        for pd in c.get("parts") or () \
+                                if isinstance(c.get("parts"), list) else ():
+                            if isinstance(pd, dict):
+                                _team_as_text(pd.get("vars"),
+                                              pd.get("var_names"))
         # COPY on load too (the load-side twin): otherwise the restored match
         # shares the snapshot's list, and the next Entity.remove would mutate
         # the retained snapshot in place — corrupting it for a second restore.
@@ -20465,6 +20643,26 @@ class Match:
             if not members:
                 total = sum(max(1, int(n)) for _, n in moves)
                 return 0, total, []
+        # A glued or region body part moves only with its body: left out
+        # when its body is in the group too (the body carries it), else
+        # refused as a single move of it is.
+        sitting = [eid for eid in members
+                   if self.entities[eid].is_part
+                   and not self.entities[eid].is_located_part]
+        if sitting:
+            roots = {eid: self.body_root(self.entities[eid]).id
+                     for eid in sitting}
+            alone = [eid for eid in sitting if roots[eid] not in members]
+            if alone:
+                raise VTTError(
+                    f"Group '{group_name}' move refused: "
+                    + ", ".join(f"`{eid}` is a body part sitting on "
+                                f"`{roots[eid]}`'s body" for eid in alone)
+                    + " (move the body, or `!part locate` the part first).")
+            members = [eid for eid in members if eid not in roots]
+            if not members:
+                total = sum(max(1, int(n)) for _, n in moves)
+                return 0, total, []
         allow_diag_move = bool(self.rules.get("allow_diagonal_movement", False))
         allow_diag_face = bool(self.rules.get("allow_diagonal_facing", False))
         member_set = set(members)
@@ -20824,6 +21022,57 @@ def check_unit_form(spec: Dict[str, Any], what: str) -> None:
     nm = spec.get("name")
     if nm is not None and (not isinstance(nm, str) or not nm.strip()):
         raise VTTError(f"{what}: `name` must be text, got {nm!r}.")
+
+
+def legacy_template_fixes(data: Any, name: str) -> List[str]:
+    """Bring a template FILE an older build wrote up to what check_template
+    accepts, in place, returning a console note per change: a var under a
+    name now reserved (`map`) moves to `<name>_old`, and a clamp bound that
+    is neither a number nor a var path (it meant "no bound" then) is
+    dropped, the clamp with it when no bound is left. New input is still
+    refused (`!template import`)."""
+    notes: List[str] = []
+    if not isinstance(data, dict) or data.get("kind", "entity") != "entity":
+        return notes
+
+    def fix(spec: Any, what: str) -> None:
+        if not isinstance(spec, dict):
+            return
+        vs = spec.get("vars")
+        if isinstance(vs, dict):
+            for k in [k for k in vs if k in RESERVED_VAR_PATHS]:
+                new, n = f"{k}_old", 2
+                while new in vs:
+                    new, n = f"{k}_old{n}", n + 1
+                vs[new] = vs.pop(k)
+                notes.append(f"{what}: var `{k}` is a reserved name now; "
+                             f"moved to `{new}`.")
+        cl = spec.get("clamps")
+        if isinstance(cl, dict):
+            for path in list(cl):
+                cd = cl[path]
+                if not isinstance(cd, dict):
+                    continue
+                for label in ("max", "min"):
+                    b = cd.get(label)
+                    if isinstance(b, str) and not re.match(
+                            r"[A-Za-z_]\w*(\.\w+)*\Z", b.strip()):
+                        cd[label] = None
+                        notes.append(f"{what}: dropped the {label} bound "
+                                     f"{b!r} of the clamp on `{path}` (a "
+                                     f"bound is a number or a var path).")
+                if cd.get("max") is None and cd.get("min") is None:
+                    del cl[path]
+    fix(data, f"Template `{name}`")
+    parts = data.get("parts")
+    if isinstance(parts, dict):
+        for role, pt in parts.items():
+            fix(pt, f"Template `{name}` part `{role}`")
+    elif isinstance(parts, list):
+        for i, pt in enumerate(parts):
+            pid = pt.get("id", i + 1) if isinstance(pt, dict) else i + 1
+            fix(pt, f"Template `{name}` part `{pid}`")
+    return notes
 
 
 def check_template(data: Any, name: str,
@@ -22153,7 +22402,10 @@ class MatchManager:
         idmap: Dict[str, str] = {}
         for oid in order:
             nid = oid
-            if nid in taken:
+            # A legacy id (one a formula reads as a binding, kept from an
+            # older build) can't be created anew: it takes `<id>_2` as a
+            # collision does.
+            if nid in taken or unreachable_id(nid):
                 k = 2
                 while f"{oid}_{k}" in taken:
                     k += 1
@@ -22197,8 +22449,7 @@ class MatchManager:
         into `dest`, anchored at (tx, ty) of its map `dmap`."""
         for oid in order:
             oe = src.entities[oid]
-            ne = Entity.from_dict(oe.to_dict())
-            ne.id = idmap[oid]
+            ne = Entity.from_dict(dict(oe.to_dict(), id=idmap[oid]))
             # Mount linkage does NOT survive a cross-match copy/transfer: the
             # vehicle lives in the SOURCE match (transferring a vehicle ejects
             # its riders, so the pair can't travel together). Carrying a stale

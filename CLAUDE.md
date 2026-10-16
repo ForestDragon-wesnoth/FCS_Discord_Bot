@@ -159,7 +159,9 @@ code. How the harness works (`run_scenarios.py`, scenarios in
 - **Damaged files:** `?file corrupt <path>` (cuts the end off) / `?file
   delete <path>` change a file of the scenario's server folder behind the
   storage layer's back (it rescans its usage), then `!as restart` shows
-  what a load does with it (864-866).
+  what a load does with it (864-866). `?file set <path> <a.b.c> <json>` /
+  `?file replace <path> "<old>" "<new>"` write a file in the shape an
+  older build left it (868, 874).
 - **Tab completion** is tested in scenarios too: `?tab "<text>"` replies with
   what Tab does at the end of the text (`→ '<line>'` and `candidates: ...`)
   in the scenario's workspace; check it with `??` / `?!` (738-739).
@@ -539,11 +541,29 @@ plus `data/bot_settings.json` (owner limits + rule ceilings) and
   `backup <n>` restores a dated systems.json copy, `accept [confirm]`
   moves the uncovered matches to the default system; both rebuild what the
   match backups cover. After a lock or rebuild the next commit rewrites
-  systems.json and workspace.json (864-865).
+  systems.json and workspace.json (864-865). Without a systems.json that
+  loaded, `default` is the registry's stand-in (most servers customize
+  it), so its matches count as lost too and aren't renamed at load; a
+  match backup replaces the stand-in (869).
+- **Saved data from older builds loads** (`LEGACY_IDS_OK`, set while
+  saved units are read): legacy ids, a clamp bound that is neither a
+  number nor a var path (dropped with a console note, the clamp too when
+  no bound is left), a template file's var under a now-reserved name
+  (`legacy_template_fixes`: moved to `<name>_old`), a numeric team (read
+  as text at match load, corpses too). A refusal added for new input must
+  not move old files to `corrupt/` (868). What a load changes reaches the
+  command journals: a template it fixed as a `template` entry, a match
+  whose loaded state differs from its journal's last hash as a `state`
+  entry (`(loaded from disk)`, `Storage._journal_load_changes`), so a
+  replay goes on from what the server holds.
 - **Backups** (`!server backups [file] | restore <n>`, admin): each file's
   copies numbered on their own, newest first; `restore <n>` puts
   systems.json copy n back through `_restore_systems` (refused if a match's
-  system isn't in it), an ordinary `!system undo` step (863). The other
+  system isn't in it), an ordinary `!system undo` step (863); a copy equal
+  to the systems now is refused, and the listing marks such copies (874).
+  The two logs (system_history.json, audit.json) keep only their newest
+  owner limit `server_backup_log_count` (3) copies: they grow with every
+  edit and are copied whole. The other
   files' copies are for an operator to copy back by hand. A commit over the
   limit cuts the oldest copies after old template versions, keeping each
   file's newest unless this commit writes a new one.
@@ -668,7 +688,9 @@ values (numbers, text, bools, None, lists, dicts) can be stored.
 **Resource bounds.** `_ArithGuardTransformer` rewrites `** * + %` into bounded
 helpers before every compile (huge ints, huge strings / lists refused;
 `formula_size_limit`); a formula is also charged for every list value it
-builds (`range`, `each`, list `*` and `+`) against 10 x
+builds (`range`, `each`, list `*` in full; a list `+` the values it adds
+plus 1/100 of those it copies, so collecting n items one at a time costs
+about n + n²/200, 872) against 10 x
 `formula_size_limit`, so a `$()` list of `range()` calls or `map_with` over
 ranges stops early; geometry builders charge `formula_cell_limit`, sight
 lines `_check_line_budget`; `!func` recursion has its own limit. One bot
@@ -1101,8 +1123,12 @@ hardcodes**.
   only their OWN passives (`own_only_targets`). Movement hooks per footprint
   cell (`fire_footprint_tile_*` / `fire_footprint_zone_*`) plus
   `on_entity_step` per step; a hook that moves units again nests at most
-  `move_hook_recursion_limit` deep (`move_hook_level`; deeper moves fire no
-  hooks, one ⚠️; re-stamps always run; each `transfer_entity` hop counts). Lifecycle: on_entity_spawned,
+  `move_hook_recursion_limit` deep, and one chain (an outermost move and
+  every move its hooks set off) makes at most `move_hook_event_limit`
+  (500) moves with hooks (`move_hook_level`, counted in
+  `fire_entity_moved`; past either, moves fire no hooks, with one ⚠️ per
+  limit per chain in the reply and on the console; re-stamps always run;
+  each `transfer_entity` hop counts for depth) (875). Lifecycle: on_entity_spawned,
   on_entity_despawned (every non-death removal, fired BEFORE the unit
   leaves; `Entity.remove(despawn=)` returns its log), on_death / on_revive,
   on_entity_moved, on_entity_changed_map, on_map_vehicle_moved / on_map_vehicle_death (§7.8), on_mounted / on_dismounted, on_turn_skipped (`skip_status`), on_status_*,
@@ -1346,7 +1372,9 @@ hardcodes**.
   can't be read stops the macro; one undo step
   (425-426, 544-546, 555-556, 817). Each macro records its author
   (`Match.macro_authors`); a body a non-host wrote runs its lines gated as
-  the runner, like a typed batch (855).
+  the runner, like a typed batch (855). A non-host can't replace, rename
+  or remove a macro a host wrote (or one with no recorded author), and
+  `!macro list` / `show` mark a macro a non-host wrote (871).
 - **`!foreach <selector> ; <cmd> [; <cmd> ...]`**: the `!find` selector
   grammar; `$id $name $x $y $team $map $i $n` substituted single-pass; targets
   resolved before any command runs; one undo step. Host-gated, EXCEPT that a
@@ -1419,7 +1447,8 @@ hardcodes**.
   Summons (`summon*`, `summon_template*`) and `move_entity(eid, x, y,
   map=)` / `move_entity(eid, coord)` take `map=` too; a summon defaults to
   the hook's map, else `self`'s, else the only one; `move_entity` to
-  another map is a cross-map move (returns `[x, y, map]`). `coord_x` /
+  another map is a cross-map move (returns `[x, y, map]`; a passenger is
+  refused and a driver moves its vehicle, as `!ent tp`, 872). `coord_x` /
   `coord_y` read triples, `coord_map` names the map (None for a pair);
   `nearest_cell` / `face_toward` / `clip_cells` honour a triple's map;
   across maps `can_see` / `has_los` are False and `nearest_cell` None. A
@@ -1502,8 +1531,10 @@ hardcodes**.
   Discord board browses maps (◀ ▶, a select menu past 5 maps, the 25
   around the shown map plus ◀ ▶ past 25,
   `_BoardView`; `_board_map` keeps the browsed map until `turns_elapsed`
-  changes); the GUI has a map dropdown with the same rule; the CLI uses
-  `!map <name>` (837-838, 841).
+  changes); the GUI has a "Map:" dropdown with the same rule, shown
+  whenever a match is (`1. main (8x6)`: a size only for a map the view
+  has seen; `GuiApp._update_map_pick`); the CLI uses `!map <name>`
+  (837-838, 841).
 - **Nested maps** (step 3, 844-848): `!map attach <map> <unit>` /
   `!map detach <map>` (host) make a unit carry a map (`Map.vehicle`,
   saved; a unit may carry several; a body part can't). A map can't be
@@ -1643,10 +1674,14 @@ hardcodes**.
   templates (`parts` key, `{role: part}` or a list; a part loop is
   refused) or `!part
   add/attach/detach/remove/glue/locate/region/segment/list/info`. `attach`
-  refuses a loop, a map carrier, a snake segment and a mounted rider, and
+  refuses a loop, a map carrier, a snake segment, a snake head with
+  segments and a rider (a corpse's kept rider too), and
   re-stamps the unit's auras, riders and parts; a loaded loop is cut and a
   map a part carries freed. A living detached part steps to the nearest
-  free cell.
+  free cell; detach and locate carry the part's own auras, glued parts and
+  riders. `glue` / `region` refuse a snake segment. A group move leaves
+  out a glued / region part whose body is in the group and refuses one
+  whose body isn't (873).
 - **Kinds:** GLUED (mirrors the parent's anchor, skipped by occupancy, render,
   vision, enumerators, roster unless `roster_glued_parts` / `__roster_show`),
   LOCATED (`__part_located`: own cell, renders, occupies, targetable),
@@ -1708,6 +1743,10 @@ hardcodes**.
   death` > the slot's `on_vehicle_death` > the vehicle's
   `__mount_on_vehicle_death` > the `mount_on_vehicle_death` rule; an
   invalid value is skipped with a ⚠️; keep needs a corpse, else eject).
+  A body part with seats (a howdah, a train car) runs the same rules
+  when its creature dies (collected before the part subtree's removal,
+  run after the death) and when it is destroyed as a limb (keep holds:
+  the dead limb stays in the match) (867).
   A removal without death (despawn, transfer, transform eject) ejects
   with no effects (`_release_riders`). Ejection (`_eject_rider`) takes
   the cell around the vehicle's body nearest its centre (`_eject_spot`)
@@ -1750,7 +1789,9 @@ hardcodes**.
   it restored only (a part whose id was taken meanwhile is named in a ⚠️)
   (814, 820, 824). `kill` /
   `revive` run `default_kill_function_effects` /
-  `default_revive_function_effects`. Prims: has_corpse, corpse_at,
+  `default_revive_function_effects`; a kill whose effects already brought
+  a death (and maybe a revive by a vehicle-death effect) runs no second
+  death (873). Prims: has_corpse, corpse_at,
   all_corpses, corpse_var / corpse_has, corpse_status_has / _get / _names;
   corpse / corpse_list action targets.
 - **Transform** (`!ent transform <id> <ref> [stash]`, `transform` /
@@ -1857,8 +1898,11 @@ hardcodes**.
   not find a unit named `x`. Either it does not exist, or this channel
   currently does not have permission to view it."; an omniscient view
   keeps "Entity 'x' not found.", 839) and listings skip it
-  (`_pov_hides`) across `!ent info` (and every `!ent` subcommand opened to
-  a non-host), `!action` (actor and targets), `!dist`, `!find`, `!foreach`, `!turn`,
+  (`_pov_hides`) across `!ent info` (and every unit an `!ent` subcommand
+  opened to a non-host names: diff, store_entity_into_var and transform
+  name a second one; a strict `map=` follows the view's naming rule for a
+  non-host), `!action` (actor and targets; a corpse target and `!ent
+  revive` through `_query_corpse`, 870), `!dist`, `!find`, `!foreach`, `!turn`,
   `!map center/cell`, `!part`, `!mount`, `!action`, `!passive`, `!clamp`,
   `!mod`, `!schedule`, `!tile info` (corpses inside tile data too);
   whole-board reads (`!history diff`, `!log`, `!history list <kind>`, undo
@@ -1892,7 +1936,9 @@ hardcodes**.
   surfaces with `viewport_capable`): per-channel camera `Match.channel_views`
   (`!map pan/center/view`). Discord fits a 2000-char message by dropping
   rulers, then colour, then legend; one reply takes at most
-  `reply_message_cap` messages, then a cut note. Commands run from the
+  `reply_message_cap` messages, then a cut note, and one command at most
+  `command_message_cap` (20) in all (a sweep, batch or macro posts a reply
+  per line), then one note counting the rest (`flush_dropped`). Commands run from the
   Approve / Resume buttons use the same adapter (`_InteractionCtx` is a
   `DiscordCtxWrapper`); a pan click is acknowledged before it waits for
   the command lock.
@@ -2040,7 +2086,9 @@ hardcodes**.
   destination; undoing either changes only its own match, and the
   transfer and both undos say so (`_TRANSFER_UNDO_NOTE`,
   `_is_transfer_label`) (824). `!ent copy|transfer ... map=<map>` names
-  the destination's map (`MatchManager.copy_entity(dest_map=)`).
+  the destination's map (`MatchManager.copy_entity(dest_map=)`); an id
+  the destination can't create (a legacy id) is remapped like a
+  collision (`rider` -> `rider_2`, 874).
 - **Links and transfer_entity** (step 2d): `transfer_entity(eid, match,
   x=None, y=None, map=None)` (mutating; a coordinate works as x) moves a
   unit with its whole body into another match of the server, but only one
@@ -2345,7 +2393,8 @@ rejected already. Update this section in the PR that resolves an item.
 - **Per-server CPU work budget** (revisit before any public rollout; X4
   folded in here by the user; the pass 43 report's X4 measured the doubling case: a `!func`, event handler
   or action calling itself twice runs 2^depth times within its depth
-  limit, `f(20)` 5.9 s; macros and nested batch / foreach runs now share
+  limit, `f(20)` 5.9 s; pass 45 bounded the move-hook case, a hook
+  making two moves per level, with `move_hook_event_limit`; macros and nested batch / foreach runs now share
   macro_step_limit, the rest wait for this budget): the
   per-call limits multiply — 10,000 loop iterations × a 1,000-cell line on a
   500×500 map is still ~7 s of a frozen bot for every server. Preferred
