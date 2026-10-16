@@ -524,5 +524,5 @@ share. An even distribution per map is a loop over the maps.
 - **Cross-vehicle attacks** (one naval ship's crew attacking another
   ship's deck directly): naval ships sit between a mount and a map
   vehicle. Saved for later, outside the PR that builds nested maps.
-- **Mount deaths revisited** with per-vehicle and per-rider effects, as
-  map vehicle deaths have.
+- ~~Mount deaths revisited~~: built after step 3 (CLAUDE.md §7.10): per
+  rider, slot and vehicle effects and fates.

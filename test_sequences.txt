@@ -26394,3 +26394,135 @@ An attach survives undo (the detach is undone) and a restart. A wreck
 kept by the dead sub follows a map rename, so the revive carries the
 renamed bilge again; undoing the revive, the rename and the death puts
 the stoker back in the hold.
+
+SCENARIO 849 — A mount dies: each rider's death effect (rider > slot > vehicle > rule) and hook
+----------------------------------------------------------------------
+
+!match new md MD 8 8
+!match use md
+!ent add tank Tank 40 3 3
+!ent set_vars tank footprint_w=2 footprint_h=2
+!ent set_var tank slots.turret.capacity 1
+!ent set_var tank slots.turret.region front
+!ent set_var tank slots.turret.death_effect "entity[self].hp = entity[self].hp - 3"
+!ent set_var tank slots.bay.capacity 3
+!ent set_var tank mount_death_effect "entity[self].hp = entity[self].hp - 5"
+!system set default mount_death_effect "entity[self].hp = entity[self].hp - 1"
+!ent add gunner Gunner 10 1 1
+!ent add grunt Grunt 10 1 2
+!ent add medic Medic 4 1 3
+!ent add hero Hero 10 1 4
+!ent set_var hero __mount_death_effect "entity[self].brave = True"
+!ent init gunner 4
+!ent init grunt 3
+!ent init medic 2
+!ent init hero 1
+!mount gunner tank turret
+!mount grunt tank bay
+!mount medic tank bay
+!mount hero tank bay
+!eval "match_var_set('order', '')"
+!gpassive add shaken on_mount_vehicle_death "match_var_set('order', match_var_get('order') + self_id() + '@' + vehicle + ':' + slot + ',')"
+!ent kill tank
+?? 💀 **Tank** (`tank`) died.
+?? 💀 **Medic** (`medic`) died.
+!assert "match_var_get('order') == 'gunner@tank:turret,grunt@tank:bay,hero@tank:bay,'"
+!assert "entity[gunner].hp == 7 and entity[grunt].hp == 5 and entity[hero].hp == 10 and entity[hero].brave"
+!assert "has_corpse('medic') and not is_mounted('gunner') and not is_mounted('grunt') and not is_mounted('hero')"
+!assert "not (entity[gunner].x in [3, 4] and entity[gunner].y in [3, 4]) and not (entity[hero].x in [3, 4] and entity[hero].y in [3, 4])"
+
+Expected: Each rider of the dying 2x2 tank, in turn order (initiative
+4, 3, 2, 1), gets the first death effect found: its own
+`__mount_death_effect` (the hero: brave, hp kept), else its slot's
+`death_effect` (the turret: gunner 10 → 7), else the tank's
+`mount_death_effect` var (grunt 10 → 5, medic 4 → -1, which dies at
+once and gets no hook); the rule's default (-1) goes unused. Then
+on_mount_vehicle_death fires per living rider with `vehicle` and `slot`
+bound. The survivors are ejected (the default fate) to cells around the
+tank's body, keeping its cells clear for its corpse.
+
+SCENARIO 850 — Rider fates: rider > slot > vehicle > rule, keep needs a corpse
+----------------------------------------------------------------------
+
+!match new mf MF 8 8
+!match use mf
+!ent add van Van 30 4 4
+!ent set_var van slots.cab.capacity 1
+!ent set_var van slots.cab.on_vehicle_death kill
+!ent set_var van slots.back.capacity 3
+!ent set_var van __mount_on_vehicle_death keep
+!ent add driver Driver 10 1 1
+!ent add boss Boss 30 1 2
+!ent set_var boss __mount_on_vehicle_death eject
+!ent add crate Crate 5 1 3
+!ent add pup Pup 5 1 4
+!ent set_var pup __mount_on_vehicle_death ejct
+!mount driver van cab
+!mount boss van back
+!mount crate van back
+!mount pup van back
+!ent kill van
+?? 💀 **Driver** (`driver`) died.
+?? ⚠️ `pup`'s __mount_on_vehicle_death is 'ejct'; it takes eject / kill / keep, so it was skipped.
+!assert "has_corpse('driver') and not is_mounted('boss') and entity[boss].hp == 30"
+!ent revive van
+!assert "sorted(riders('van')) == ['crate', 'pup']"
+!ent set_var van __death_result delete
+!ent kill van
+!assert "not has_corpse('van') and not is_mounted('crate') and not is_mounted('pup')"
+!ent add cart Cart 10 7 7
+!ent set_var cart slots.seat.capacity 1
+!ent add mule Mule 5 7 1
+!mount mule cart seat
+!system set default mount_death_effect "entity[self].shaken = True"
+!system set default mount_on_vehicle_death kill
+!ent kill cart
+?? 💀 **Mule** (`mule`) died.
+!assert "corpse_var('mule', 'shaken')"
+
+Expected: HARNESS-ALLOWS-ERRORS. Each rider's fate is the first valid
+value of its own `__mount_on_vehicle_death`, its slot's
+`on_vehicle_death`, the vehicle's `__mount_on_vehicle_death`, then the
+rule: the driver dies with the cab (slot kill), the boss steps out (its
+own eject beats the van's keep), the crate stays aboard the corpse (the
+van's keep), and the pup's typo is reported and skipped, so the van's
+keep applies to it too. Kept riders read as unmounted while the van is
+a corpse; the revive brings the van back with both aboard.
+A van that leaves no corpse (`__death_result` delete) ejects even kept
+riders. A cart with no settings uses the rules: the rule's death effect
+marks the mule, which then dies (mount_on_vehicle_death kill); its
+corpse keeps the mark.
+
+SCENARIO 851 — Mount removal ejects with no effects; nested riders ride along
+----------------------------------------------------------------------
+
+!match new mx MX 8 8
+!match use mx
+!system set default mount_on_vehicle_death kill
+!system set default mount_death_effect "entity[self].hit = True"
+!ent add horse Horse 20 4 4
+!ent set_var horse slots.saddle.capacity 1
+!ent add knight Knight 10 1 1
+!ent set_var knight slots.shoulder.capacity 1
+!ent add bird Bird 2 1 2
+!mount knight horse saddle
+!mount bird knight shoulder
+!ent remove horse
+!assert "not is_mounted('knight') and not var_has('knight', 'hit') and riders('knight') == ['bird']"
+!assert "entity[bird].x == entity[knight].x and entity[bird].y == entity[knight].y"
+!system set default mount_on_vehicle_death eject
+!ent add horse2 Horse 20 6 6
+!ent set_var horse2 slots.saddle.capacity 1
+!ent set_vars horse2 footprint_w=2 footprint_h=2
+!mount knight horse2 saddle
+!ent kill horse2
+!assert "entity[knight].hit and not var_has('bird', 'hit') and riders('knight') == ['bird']"
+!assert "entity[bird].x == entity[knight].x and entity[bird].y == entity[knight].y"
+!assert "not (entity[knight].x in [6, 7] and entity[knight].y in [6, 7])"
+
+Expected: A despawned vehicle ejects its riders without death effects or
+fates, even under mount_on_vehicle_death kill: the knight steps off the
+horse unmarked, still carrying the bird. When the 2x2 second horse dies,
+only its direct rider gets the effect (the knight is marked, the bird
+isn't); the knight is ejected around the horse's body and the bird rides
+along on the knight.

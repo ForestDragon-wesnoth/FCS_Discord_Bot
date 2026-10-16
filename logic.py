@@ -1286,12 +1286,40 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         "default": "eject",
         "schema": {"type": "enum", "choices": ["eject", "kill", "keep"]},
         "desc": (
-            "Fate of riders when their vehicle dies or despawns: 'eject' "
-            "(dismount to nearby free cells), 'kill' (run the kill function "
-            "on each), or 'keep' (leave them mounted to the vehicle's "
-            "corpse: a revive brings the vehicle back with them aboard). "
-            "'keep' needs a corpse: a vehicle removed without one (a "
-            "despawn, death_result=delete, a transfer) ejects its riders."
+            "Fate of riders when their vehicle dies: 'eject' (dismount to "
+            "the free cells nearest the vehicle's body), 'kill' (run the "
+            "kill function on each), or 'keep' (leave them mounted to the "
+            "vehicle's corpse: a revive brings the vehicle back with them "
+            "aboard; a vehicle that leaves no corpse, under "
+            "death_result=delete, ejects them instead). Per rider the "
+            "first of these applies: the rider's `__mount_on_vehicle_death` "
+            "var, its slot's `on_vehicle_death` key, the vehicle's "
+            "`__mount_on_vehicle_death` var, this rule. Before the fates, "
+            "each rider's death effect runs (mount_death_effect) and "
+            "on_mount_vehicle_death fires. A vehicle removed without dying "
+            "(a despawn, a transfer) ejects its riders with no effects."
+        ),
+    },
+    "mount_death_effect_var": {
+        "default": "mount_death_effect",
+        "schema": {"type": "str"},
+        "desc": (
+            "Unit var holding a vehicle's death effect for its riders: a "
+            "formula program run once per rider when the vehicle dies "
+            "(self = the rider, `vehicle` and `slot` bound, in turn order), "
+            "before mount_on_vehicle_death decides each rider's fate. A "
+            "rider's own `__mount_death_effect` var replaces it, then its "
+            "slot's `death_effect` key; without any, mount_death_effect "
+            "applies."
+        ),
+    },
+    "mount_death_effect": {
+        "default": "",
+        "schema": {"type": "str", "formula": "program"},
+        "desc": (
+            "Default death effect for the riders of a dying vehicle (see "
+            "mount_death_effect_var); empty = nothing, so only "
+            "mount_on_vehicle_death applies."
         ),
     },
     # What happens to a vehicle's riders when the vehicle TRANSFORMS into a
@@ -4197,6 +4225,10 @@ HOOK_NAMES: Set[str] = {
     # eject). Lets the GM grant a "buckled in" status, deduct fuel, etc.
     "on_mounted",
     "on_dismounted",
+    # Fired for each rider of a dying vehicle, after its death effect
+    # (mount_death_effect) and before mount_on_vehicle_death settles its
+    # fate, with `vehicle` and `slot` bound.
+    "on_mount_vehicle_death",
 }
 
 # Custom event-bus subscription. A passive whose `when` is "event:<name>"
@@ -5940,7 +5972,8 @@ class Entity:
         return (self.id, log)
 
     def remove(self, *, despawn: bool = True,
-               corpse_kept: bool = False) -> List[str]:
+               corpse_kept: bool = False,
+               defer_riders: bool = False) -> List[str]:
         """
         Remove this entity from its match and turn order.
         Also scrubs the entity from every group it was a member of, so
@@ -5957,10 +5990,12 @@ class Entity:
             # A handler may already have removed (or killed) the unit.
             if self._match is not m or self.id not in m.entities:
                 return log
-        # Resolve any riders this entity was carrying (death OR despawn both
-        # route here) per the mount_on_vehicle_death rule — done while `self` is
-        # still in the match so the eject search can use its footprint.
-        m._release_riders(self.id, corpse_kept=corpse_kept)
+        # The riders it carries leave it while `self` is still in the match,
+        # so the eject search can use its footprint. A death defers them
+        # (`defer_riders`): Match._mount_vehicle_died runs their effects
+        # and fates after the death.
+        if not defer_riders:
+            log.extend(m._release_riders(self.id))
         # The maps it carries: a despawn ejects their units and detaches
         # them (a death runs Match._map_vehicle_died after the removal).
         if despawn:
@@ -9522,7 +9557,8 @@ class Match:
     #   formula consuming it (default 1); condition is a valid-rider formula
     #   gate; region positions/shows the rider (else hidden inside);
     #   controls_movement lets the occupant drive; actions is an optional
-    #   slot-scoped action bundle. The rider back-link is the protected
+    #   slot-scoped action bundle; death_effect / on_vehicle_death set the
+    #   slot's riders' death effect and fate (Match._mount_vehicle_died). The rider back-link is the protected
     #   Entity.mounted_on / mount_slot fields; occupancy is derived by
     #   scanning (no second structure), mirroring body parts.
 
@@ -9833,45 +9869,129 @@ class Match:
                 return True
         return False
 
-    def _release_riders(self, vid: str, mode: Optional[str] = None,
-                        corpse_kept: bool = False) -> List[str]:
-        """Resolve a vehicle's riders when it dies / despawns, per the
-        mount_on_vehicle_death rule: 'eject' (dismount to nearby cells),
-        'kill' (run the kill function on each), 'keep' (leave them linked).
-        'keep' holds only when the vehicle leaves a corpse its revive can
-        restore (`corpse_kept`); any other removal (a despawn, a death under
-        death_result=delete, a transfer) ejects, or the riders would name a
-        gone id that a later unit could take. Called from Entity.remove. An
-        explicit `mode` overrides the rule (the transform eject path passes
-        'eject'). Returns log."""
-        riders = self.vehicle_riders(vid)
-        if not riders:
-            return []
-        if mode is None:
-            mode = str(self.rules.get("mount_on_vehicle_death", "eject"))
-        if mode == "keep" and not corpse_kept:
-            mode = "eject"
+    def _release_riders(self, vid: str) -> List[str]:
+        """Eject vehicle `vid`'s riders when it leaves without dying (a
+        despawn, a transfer, the transform eject path): no death effects,
+        each to the free cell nearest its body. Called from Entity.remove;
+        a death goes through _mount_vehicle_died instead. Returns log."""
+        riders = self._turn_sorted(self.vehicle_riders(vid))
         veh = self.entities.get(vid)
+        if not riders or veh is None:
+            return []
+        box = (veh.x, veh.y) + self.entity_footprint(veh)
         log: List[str] = []
         for rider in riders:
-            if mode == "keep":
+            if rider.id in self.entities and rider.mounted_on == vid:
+                log.extend(self._eject_rider(rider, self.map_of(veh), box))
+        self._rebuild_turn_order()
+        return log
+
+    def _eject_rider(self, rider: "Entity", mp: "Map",
+                     box: Tuple[int, int, int, int]) -> List[str]:
+        """Dismount `rider` (on_dismounted) and put it on the free cell of
+        map `mp` nearest the vehicle body `box` (x, y, w, h), its own riders
+        carried; with no room it stays where it is, with a ⚠️."""
+        vid = rider.mounted_on
+        log = self._detach_rider(rider)
+        if rider.id not in self.entities:
+            return log
+        spot = self._eject_spot(rider, mp, box)
+        if spot is None:
+            log.append(self.unit_line(
+                rider.id, f"⚠️ No free cell fits `{rider.id}` near `{vid}`; "
+                          f"it stays at ({rider.x},{rider.y})."))
+            return log
+        ox, oy = rider.x, rider.y
+        rider.move_to(*spot)
+        log.extend(self.fire_entity_moved(rider.id, ox, oy, spot[0], spot[1]))
+        return log
+
+    _MOUNT_FATES = ("eject", "kill", "keep")
+
+    def _mount_vehicle_died(self, vid: str, vars_: Dict[str, Any],
+                            box: Tuple[int, int, int, int], map_name: str
+                            ) -> List[str]:
+        """The riders of vehicle `vid`, which just died (its corpse, if any,
+        is stored and the unit removed): each rider's death effect and
+        on_mount_vehicle_death in turn order, then its fate (eject / kill /
+        keep: rider var > slot key > vehicle var > mount_on_vehicle_death;
+        keep without a corpse ejects)."""
+        riders = self._turn_sorted(self.vehicle_riders(vid))
+        if not riders:
+            return []
+        log: List[str] = []
+        slots = vars_.get("slots") if isinstance(vars_.get("slots"), dict) else {}
+        veh_effect = vars_.get(str(self.rules.get(
+            "mount_death_effect_var", "mount_death_effect")))
+        if not isinstance(veh_effect, str):
+            veh_effect = str(self.rules.get("mount_death_effect", "") or "")
+        plan = [(r.id, r.mount_slot) for r in riders]
+
+        def slot_of(slot: Optional[str]) -> Dict[str, Any]:
+            sd = slots.get(slot) if slot else None
+            return sd if isinstance(sd, dict) else {}
+        # 1. Each rider: its death effect, then on_mount_vehicle_death.
+        for rid, slot in plan:
+            u = self.entities.get(rid)
+            if u is None or u.mounted_on != vid:
                 continue
-            if mode == "kill":
-                # Detach first so the rider is a normal entity for the kill
-                # pipeline, then run the configured kill function.
-                log.extend(self._detach_rider(rider))
+            own = u.vars.get("__mount_death_effect")
+            sd_eff = slot_of(slot).get("death_effect")
+            src = (own if isinstance(own, str) else
+                   sd_eff if isinstance(sd_eff, str) else veh_effect)
+            extras = {"vehicle": vid, "slot": slot,
+                      "hook_name": "on_mount_vehicle_death"}
+            log.extend(self._run_map_vehicle_program(
+                src, rid, extras, f"The death effect of `{vid}` on `{rid}`"))
+            if rid in self.entities:
+                log.extend(self.fire_hook("on_mount_vehicle_death",
+                                          target_ids=[rid], extras=extras))
+            # The effect's writes may have killed it; inside another death
+            # (a kill from an on_death passive) the guard held that check.
+            if rid in self.entities:
+                held, self._death_processing = self._death_processing, 0
                 try:
-                    self.kill_entity(rider.id)
-                except VTTError:
-                    pass
+                    log.extend(self.check_death(rid))
+                finally:
+                    self._death_processing += held
+        # 2. Each rider still aboard: its fate.
+        corpse_kept = self.find_corpse(vid) is not None
+        mp = self.maps.get(map_name)
+        for rid, slot in plan:
+            u = self.entities.get(rid)
+            if u is None or u.mounted_on != vid:
                 continue
-            # eject (default): place at a free cell near the vehicle.
-            log.extend(self._detach_rider(rider))
-            dest = self._find_dismount_cell(rider, veh)
-            if dest is not None:
-                rider.move_to(*dest)
-        if mode != "keep":
-            self._rebuild_turn_order()
+            fate = None
+            for where, val in ((f"`{rid}`'s __mount_on_vehicle_death",
+                                u.vars.get("__mount_on_vehicle_death")),
+                               (f"slot `{slot}`'s on_vehicle_death",
+                                slot_of(slot).get("on_vehicle_death")),
+                               (f"`{vid}`'s __mount_on_vehicle_death",
+                                vars_.get("__mount_on_vehicle_death"))):
+                if val is None:
+                    continue
+                if val in self._MOUNT_FATES:
+                    fate = val
+                    break
+                log.append(f"⚠️ {where} is {val!r}; it takes eject / kill / "
+                           f"keep, so it was skipped.")
+            if fate is None:
+                fate = str(self.rules.get("mount_on_vehicle_death", "eject"))
+            if fate == "keep" and corpse_kept:
+                continue
+            if fate == "kill":
+                log.extend(self._detach_rider(u))
+                if rid in self.entities:
+                    try:
+                        log.extend(self.kill_entity(rid)[1])
+                    except VTTError:
+                        pass
+                continue
+            if mp is not None:
+                log.extend(self._eject_rider(u, mp, box))
+            else:
+                log.extend(self._detach_rider(u))
+        self._rebuild_turn_order()
         return log
 
     # ---------- stat modifiers (derived / effective stats) ----------
@@ -15918,7 +16038,8 @@ class Match:
                 self._store_corpse(e)   # also snapshots the parts
             # Remove from match (entity.remove handles turn-order
             # bookkeeping + group scrubbing) regardless of result.
-            e.remove(despawn=False, corpse_kept=(result == "corpse"))
+            e.remove(despawn=False, corpse_kept=(result == "corpse"),
+                     defer_riders=True)
             # Cascade: the creature is gone, so its body parts go with it
             # (no orphaned, suddenly-visible limbs). The WHOLE subtree —
             # parts, their parts, ... — is removed, not just direct parts,
@@ -15935,9 +16056,11 @@ class Match:
                            dead_x, dead_y, dead_vars, map_name=dead_map)
         finally:
             self._death_processing = max(0, self._death_processing - 1)
-        # Nested maps: the occupants of the maps it carried. Outside the
-        # death guard, so a death effect that kills an occupant (or a unit
-        # near it) runs that death.
+        # Its riders, then the occupants of the maps it carried. Outside
+        # the death guard, so a death effect that kills a rider or an
+        # occupant (or a unit near it) runs that death.
+        log.extend(self._mount_vehicle_died(entity_id, dead_vars, dead_box,
+                                            dead_map))
         log.extend(self._map_vehicle_died(entity_id, dead_vars, dead_box,
                                           dead_map))
         return log
@@ -17113,6 +17236,7 @@ class Match:
         # transform_rider_mismatch_mode rule decides: 'block' (refuse, raise
         # before any change) or 'eject' (dismount all riders, then transform).
         riders = self.vehicle_riders(e.id)
+        eject_log: List[str] = []
         if riders:
             new_slots = (sb.get("vars") or {}).get("slots")
             new_slots = new_slots if isinstance(new_slots, dict) else {}
@@ -17121,7 +17245,7 @@ class Match:
             if missing:
                 mode = str(self.rules.get("transform_rider_mismatch_mode", "block"))
                 if mode == "eject":
-                    self._release_riders(e.id, mode="eject")
+                    eject_log = self._release_riders(e.id)
                 else:
                     raise VTTError(
                         f"transform: new form lacks slot(s) "
@@ -17247,7 +17371,7 @@ class Match:
         except (KeyError, TypeError, ValueError, AttributeError) as ex:
             raise VTTError(f"transform: the new form's passives or clamps "
                            f"aren't valid ({ex!r}).")
-        drop_log: List[str] = []
+        drop_log: List[str] = list(eject_log)
         for p in reversed(self.entity_part_subtree(e.id)):
             if p.id in self.entities:
                 drop_log.extend(p.remove())
@@ -20627,7 +20751,7 @@ VAR_NAME_RULES = ("hp_var", "max_hp_var", "turnorder_var", "team_var",
                   "part_name_var", "footprint_width_var", "footprint_height_var",
                   "atb_charge_var", "disguise_var", "fog_vision_radius_var",
                   "overlay_var", "map_vehicle_death_effect_var",
-                  "map_vehicle_wreck_var")
+                  "map_vehicle_wreck_var", "mount_death_effect_var")
 
 
 # Map-var-name rules: rule -> (the setting it names, the rule giving the

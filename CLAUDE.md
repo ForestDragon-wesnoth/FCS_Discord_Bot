@@ -1615,10 +1615,22 @@ hardcodes**.
   Moving the vehicle carries riders, nested (`_restamp_riders_for`); a
   driver's own move moves the rig. Hidden riders are off the ground,
   unrendered, unseen and grant no vision (`hidden_rider_grants_vision`).
-  `mount_on_vehicle_death` (eject / kill / keep; keep holds only when the
-  vehicle leaves a corpse, any other removal ejects, 814); a vehicle's
-  riders don't block its own placement; dismount and eject take the
-  free cell nearest the vehicle's centre (rings outward, ties by y then x);
+  A vehicle's death (`Match._mount_vehicle_died`, after `_process_death`
+  leaves its guard, before the map-vehicle handling): per rider in turn
+  order the death effect (`__mount_death_effect` > the slot's
+  `death_effect` > the vehicle's var named by `mount_death_effect_var` >
+  the `mount_death_effect` rule) and `on_mount_vehicle_death` (`vehicle`,
+  `slot` bound), then its fate, eject / kill / keep (`__mount_on_vehicle_
+  death` > the slot's `on_vehicle_death` > the vehicle's
+  `__mount_on_vehicle_death` > the `mount_on_vehicle_death` rule; an
+  invalid value is skipped with a ⚠️; keep needs a corpse, else eject).
+  A removal without death (despawn, transfer, transform eject) ejects
+  with no effects (`_release_riders`). Ejection (`_eject_rider`) takes
+  the cell around the vehicle's body nearest its centre (`_eject_spot`)
+  and fires on_dismounted then on_entity_moved, so a rider carries its
+  own riders (814, 849-851); a vehicle's riders don't block its own
+  placement; dismount takes the free cell nearest the vehicle's centre
+  (rings outward, ties by y then x);
   a dead rider revives
   unmounted; transform re-checks a mounted rider's slot (and a vehicle's
   riders) per `transform_rider_mismatch_mode`. Boarding legality is the GM's
