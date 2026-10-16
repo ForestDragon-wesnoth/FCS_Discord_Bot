@@ -53,6 +53,12 @@ from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from logic import VTTError, NotFound, CROSS_MATCH_GUARD
 
+# The other-matches guards of the action levels running now, outermost
+# first (each a run_action's `cross`): a level that changes another match
+# saves it for every level above that hasn't yet.
+_CROSS_LEVELS: "contextvars.ContextVar[tuple]" = contextvars.ContextVar(
+    "vtt_cross_levels", default=())
+
 if TYPE_CHECKING:
     from logic import Match, Entity
 
@@ -1100,9 +1106,16 @@ async def run_action(
     def _guard_cross() -> None:
         """Save the other matches before this level's first change to one
         of them (a transfer_entity in the body), so _rollback_all puts
-        them back too."""
-        if cross["snap"] is None:
-            cross["snap"] = _snapshot_other_matches(mgr, match)
+        them back too. Every enclosing action level that has no copy yet
+        takes the same one: a nested action that moved a unit and
+        succeeded used to leave it in both matches when its caller then
+        failed."""
+        levels = [lvl for lvl in _CROSS_LEVELS.get() + (cross,)
+                  if lvl["snap"] is None]
+        if levels:
+            snap = _snapshot_other_matches(mgr, match)
+            for lvl in levels:
+                lvl["snap"] = snap
 
     def _cmd(line: Any) -> None:
         """cmd('<command line>'): dispatch the line as if the GM
@@ -1138,10 +1151,8 @@ async def run_action(
         # back with this match (a failed send-to-another-battlefield action
         # left the unit in both matches).
         sub = tokens[1].lower() if len(tokens) > 1 else ""
-        if cross["snap"] is None and (
-                name == "match" or (name == "ent"
-                                    and sub in ("transfer", "copy"))):
-            cross["snap"] = _snapshot_other_matches(mgr, match)
+        if name == "match" or (name == "ent" and sub in ("transfer", "copy")):
+            _guard_cross()
         # Dispatch into the synchronous buffer context. Because
         # _BufferCtx.send never suspends on a real future, the
         # dispatched (async) command coroutine runs to completion
@@ -1332,6 +1343,8 @@ async def run_action(
                 match._runtime_buffer = _BufferCtx.for_ctx(ctx)
             try:
                 guard_token = CROSS_MATCH_GUARD.set(_guard_cross)
+                levels_token = _CROSS_LEVELS.set(_CROSS_LEVELS.get()
+                                                 + (cross,))
                 try:
                     engine.eval_program(
                         action.body, eval_ctx,
@@ -1339,6 +1352,7 @@ async def run_action(
                         action_bindings=bindings,
                     )
                 finally:
+                    _CROSS_LEVELS.reset(levels_token)
                     CROSS_MATCH_GUARD.reset(guard_token)
             except ChoiceNeeded as nc:
                 if not is_top_level:
@@ -1561,7 +1575,7 @@ def _rollback_match(match: "Match", mgr: Any, pre_state: Dict[str, Any]) -> None
         "_choice_answers", "_choice_cursor",
         # In-flight operation guards/state that span a nested rollback.
         "_summon_count", "_death_processing", "_death_check_suppressed_ids",
-        "_death_check_deferred_ids", "_deleting_maps",
+        "_death_check_deferred_ids", "_deleting_maps", "_watcher_backlog",
         "_alive_eval_depth", "_vision_memo", "_turn_order_dirty",
         "_request_seq", "pending_requests", "held_commands",
         # Event bus: the live emit stack/depth + warning latch. Resetting

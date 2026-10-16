@@ -393,7 +393,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
-from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number
+from logic import CURRENT_WORKSPACE, PARTIAL_CACHE, _node_count, SECRET_RULES, TEMPLATE_MARKER, VTTError, NotFound, RESERVED_VAR_PATHS, reserved_var_path_error, reserved_path_meaning, COMMAND_VIEW, MAP_SETTING_RULES, map_setting_value, COMMAND_USER, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, CROSS_MATCH_GUARD, MOVE_HOOK_DEPTH, move_hook_limit, _own_value, check_store_path, check_no_value_ancestor, checked_status_value, _coerce_number
 
 
 class FormulaError(VTTError):
@@ -4303,6 +4303,23 @@ class FormulaEngine:
         # a lambda body (#174) resolves names (`__read`, locals, a !func's
         # parameters) where its formula does; with separate globals a nested
         # scope sees only the globals. No builtins either way.
+        # Every list a formula builds (range, a list repeated or joined,
+        # each) is charged to one budget per evaluation, ten times
+        # formula_size_limit: each list alone stays under the limit, and a
+        # list literal of a hundred range() calls (or a map_with whose
+        # lambda builds one per item) used to build millions of values.
+        built = [0]
+        value_cap = size_limit * 10
+
+        def _charge(v: Any, what: str) -> Any:
+            if isinstance(v, list):
+                built[0] += len(v)
+                if built[0] > value_cap:
+                    raise FormulaError(
+                        f"{what}(...): this formula built more than "
+                        f"{value_cap} list values (10 x formula_size_limit).")
+            return v
+
         ns: Dict[str, Any] = {
             "__builtins__": {},
             "__read":  lambda who, path:        self._read(who, path, ctx),
@@ -4315,15 +4332,18 @@ class FormulaEngine:
             # The cells_in_* wrappers pass `limit` themselves, so a formula
             # passing its own `limit=` gets a duplicate-keyword error.
             "__safe_pow": _safe_pow,
-            "__safe_mul": lambda a, b: _safe_mul(a, b, size_limit),
-            "__safe_add": lambda a, b: _safe_add(a, b, size_limit),
+            "__safe_mul": lambda a, b: _charge(_safe_mul(a, b, size_limit),
+                                               "*"),
+            "__safe_add": lambda a, b: _charge(_safe_add(a, b, size_limit),
+                                               "+"),
             "__safe_mod": _safe_mod,
             "cells_in_burst": lambda *a, **k: _cells_in_burst(*a, limit=cell_limit, bounds=_grid(), **k),
             "cells_in_line": lambda *a, **k: _cells_in_line(*a, limit=cell_limit, bounds=_grid(), **k),
             "cells_in_cone": lambda *a, **k: _cells_in_cone(*a, limit=cell_limit, bounds=_grid(), **k),
             "cells_in_rect": lambda *a, **k: _cells_in_rect(*a, limit=cell_limit, bounds=_grid(), **k),
-            "range": lambda *a: _range(*a, limit=size_limit),
-            "each": lambda v: _each(v, limit=size_limit),
+            "range": lambda *a: _charge(_range(*a, limit=size_limit),
+                                        "range"),
+            "each": lambda v: _charge(_each(v, limit=size_limit), "each"),
             "replace": lambda *a: _replace(*a, limit=size_limit),
             "join": lambda *a: _join(*a, limit=size_limit),
             "str": lambda *a: (_text_of(a[0], size_limit) if len(a) == 1
@@ -5736,6 +5756,16 @@ class FormulaEngine:
             deid, de = _resolve_entity(dest_t, "var_move")
             if not _var_has(src_t, src_path):
                 return False
+            if seid == deid:
+                # Onto itself: already there (giving an item to yourself
+                # used to write it, then delete it). Into its own subtree:
+                # the delete would take the copy with it.
+                if dest_path == src_path:
+                    return True
+                if dest_path.startswith(src_path + "."):
+                    raise FormulaError(
+                        f"var_move: `{dest_path}` is inside `{src_path}`, "
+                        f"which the move deletes.")
             val = copy.deepcopy(_walk_vars(se, src_path, must_exist=True))
             match.surface_log(de.write_var(dest_path, val))
             try:
@@ -6586,12 +6616,25 @@ class FormulaEngine:
             guard = CROSS_MATCH_GUARD.get()
             if guard is not None:
                 guard()
+            # Arrival hooks may send the unit on (two linked matches each
+            # sending arrivals back): each hop counts as a nested movement
+            # hook, bounded by move_hook_recursion_limit.
+            depth = MOVE_HOOK_DEPTH.get()
+            if depth >= move_hook_limit(match.rules):
+                raise FormulaError(
+                    f"transfer_entity: transfers nested past "
+                    f"move_hook_recursion_limit "
+                    f"({move_hook_limit(match.rules)}): an arrival's hooks "
+                    f"keep sending units on.")
             dest_pre = dest.to_dict(include_history=False)
+            hop = MOVE_HOOK_DEPTH.set(depth + 1)
             try:
                 new_id, log = mgr.copy_entity(match.id, dest.id, eid, x, y,
                                               move=True, dest_map=map)
             except (VTTError, NotFound) as ex:
                 raise FormulaError(f"transfer_entity: {ex}")
+            finally:
+                MOVE_HOOK_DEPTH.reset(hop)
             match.surface_log(log)
             if dest.to_dict(include_history=False) != dest_pre:
                 # The arrival is the destination's own undo step; the

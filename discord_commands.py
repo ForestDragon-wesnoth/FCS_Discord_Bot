@@ -817,6 +817,8 @@ def _board_view(m, channel_key: str, mgr: MatchManager, engaged: bool):
 
 # More maps than this get a select menu instead of the ◀ ▶ buttons.
 _BOARD_MAP_BUTTONS_MAX = 5
+# Discord's limit on a select menu's options.
+_SELECT_MAX = 25
 
 
 class _BoardView(discord.ui.View):
@@ -842,11 +844,21 @@ class _BoardView(discord.ui.View):
             m = self._match()
             if m is not None:
                 pov = m.channel_pov(channel_key)
-                listed = m.listed_maps(pov)[:25]
+                listed = m.listed_maps(pov)
+                # A select menu holds 25 options (Discord's limit): past
+                # that it lists the 25 around the shown map, and ◀ ▶
+                # buttons step on from its ends.
+                start = 0
+                if len(listed) > _SELECT_MAX:
+                    cur = _board_map(m, channel_key)
+                    ci = listed.index(cur) if cur in listed else 0
+                    start = max(0, min(ci - _SELECT_MAX // 2,
+                                       len(listed) - _SELECT_MAX))
                 opts = [discord.SelectOption(
                             label=f"{i + 1}. {m.map_label(mp, pov)}".replace(
                                 "`", "")[:100], value=str(i))
-                        for i, mp in enumerate(listed)]
+                        for i, mp in enumerate(listed)
+                        if start <= i < start + _SELECT_MAX]
                 sel = discord.ui.Select(placeholder="Show another map",
                                         options=opts, row=1)
 
@@ -854,6 +866,13 @@ class _BoardView(discord.ui.View):
                     await self._browse(interaction, index=int(sel.values[0]))
                 sel.callback = _picked
                 self.add_item(sel)
+                if len(listed) > _SELECT_MAX:
+                    for label, step in (("◀ map", -1), ("map ▶", 1)):
+                        btn = discord.ui.Button(
+                            label=label, row=2,
+                            style=discord.ButtonStyle.secondary)
+                        btn.callback = self._browse_cb(step)
+                        self.add_item(btn)
         elif n_maps > 1:
             for label, step in (("◀ map", -1), ("map ▶", 1)):
                 btn = discord.ui.Button(label=label, row=1,

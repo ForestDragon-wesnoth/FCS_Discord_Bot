@@ -2385,19 +2385,24 @@ SCENARIO 121 — Loops are constrained, not blanket-disallowed
 !match new rej121 Reject 6 6
 !match use rej121
 !ent add hero Hero 30 3 3 10
-!eval "for x in range(3): entity[hero].hp = x"
+!eval "for x in range(3): entity[hero].hp = 10 + x"
+!assert "entity[hero].hp == 12"
 !eval "for x in entity[hero].hp: entity[hero].hp = x"
+?? for-loop iterable must be a direct call to one of
+!eval "for x in [1, 2]: entity[hero].hp = x"
+?? for-loop iterable must be a direct call to one of
 !eval "while True: entity[hero].hp = 0"
+?? Disallowed syntax: While
+!assert "entity[hero].hp == 12"
 
-Expected: `while` loops are still fully disallowed ("Disallowed
-syntax: While"). `for` loops ARE allowed, but only over a direct
-call to one of the loopable builtins (entities_within,
-group_members, cells_in_burst, cells_in_line, cells_in_cone) — so
-`for x in range(3)` is rejected because `range` isn't an allowed
-function, and `for x in entity[hero].hp` is rejected because the
-iterable isn't a loopable call ("for-loop iterable must be a
-direct call to one of {...}"). See SCENARIO 246+ for the legal
-for-loop forms.
+Expected: `while` loops are fully disallowed ("Disallowed syntax:
+While"). `for` loops are allowed over a direct call to one of the
+loopable functions (`_LOOPABLE_FUNCS`): `range(3)` is one, so the
+first loop runs three times and leaves hp at 10 + 2 = 12. A loop
+over anything else is refused before it runs ("for-loop iterable
+must be a direct call to one of {...}"): a var read
+(`entity[hero].hp`) and a list literal alike, and hp stays 12.
+Scenarios 246+ show the legal for-loop forms.
 
 
 SCENARIO 122 — Disallowed: lambdas, comprehensions, imports
@@ -6040,8 +6045,11 @@ SCENARIO 247 — for-loop iterable validation + loop bound
 !match new mfor2 ForLimits 10 10
 !match use mfor2
 !ent add hero Hero 30 5 5 10
-!eval "for x in range(5): entity[x].hp = 0"
+!eval "for x in abs(5): entity[hero].hp = 0"
+?? for-loop iterable must be a direct call to one of
 !eval "for x in my_list: entity[x].hp = 0"
+?? Unknown identifier 'my_list'
+!assert "entity[hero].hp == 30"
 !eval "for [a, b] in cells_in_burst(5, 5, 1): tile_set(a, b, 'foo', 1)"
 !tile def new mark
 !system set default formula_loop_limit 5
@@ -6049,10 +6057,11 @@ SCENARIO 247 — for-loop iterable validation + loop bound
 !system set default formula_loop_limit 10000
 
 Expected: For-loops are validated up front. The iterable MUST be
-a direct call to one of: entities_within, group_members,
-cells_in_burst, cells_in_line, cells_in_cone. So `range(5)`
-errors with "iterable must be a direct call to one of {...}" and
-`my_list` errors as an unknown identifier. A loop target that's
+a direct call to one of the loopable functions (`_LOOPABLE_FUNCS`:
+entities_within, range, each, cells_in_burst, ...). So `abs(5)`, a
+function that isn't loopable, errors with "iterable must be a
+direct call to one of {...}" and `my_list` errors as an unknown
+identifier; neither loop runs, so the hero keeps 30 hp. A loop target that's
 neither a single name nor a tuple of names ("for [a, b] in ..."
 uses a List, not Tuple) is also rejected.
 
@@ -26776,3 +26785,213 @@ note var but not an action body, and a macro the player wrote runs its
 lines gated as the player: `!host add` is refused, while `!ent hp hero
 1` (opened to players) runs. An omniscient view's `!match info` lists
 every map.
+
+SCENARIO 856 — A failed outer action undoes a nested action's transfer; move hooks that move again are bounded
+-------------------------------------------------------------------------------------------------------------
+
+!match new dst856 Dst 8 8
+!match new src856 Src 8 8
+!match use dst856
+!match link src856
+!match use src856
+!ent add a A 10 1 1
+!ent add v V 10 3 3
+!ent set_var a actions.send.target entity
+!ent set_var a actions.send.body "transfer_entity(target, 'dst856', 6, 6)"
+!ent set_var a actions.outer.target entity
+!ent set_var a actions.outer.body "use_action(self, 'send', target)\nfail('outer fails')"
+!action a outer v
+?? ❌ action `outer`: outer fails
+!assert "'v' in all_entities()"
+!match use dst856
+!assert "'v' not in all_entities()"
+!match use src856
+!action a send v
+!assert "'v' not in all_entities()"
+!match new hl856 HL 12 2
+!match use hl856
+!system set default move_hook_recursion_limit 4
+!tile def new slide
+!tile def hook slide on_enter "move_entity(self, entity[self].x + 1, entity[self].y)"
+!tile fill 2 1 12 1 _template slide
+!ent add u U 10 1 1
+!ent move u 1 right
+?? ⚠️ Movement hooks nested past move_hook_recursion_limit (4)
+!assert "entity[u].x == 6"
+!system set default move_hook_recursion_limit 16
+
+Expected: An outer action calls `send`, which moves `v` into the linked
+match `dst856`, then fails: the rollback brings `v` back to `src856` and
+`dst856` holds no copy (the cross-match guard covers every enclosing
+action level). Run on its own, `send` moves it. A slide tile whose
+on_enter hook moves the unit one cell on would recurse once per tile;
+`move_hook_recursion_limit` (4 here) stops it: the walk onto (2,1)
+starts the chain and the hooks of moves nested deeper than 4 don't fire,
+so the unit stops at (6,1) with a warning.
+
+
+SCENARIO 857 — Formula value budget for $() and map_with; var_move onto itself or into itself
+---------------------------------------------------------------------------------------------
+
+!match new f857 F 6 6
+!match use f857
+!ent add u U 10 1 1
+!as player alice
+!roll "$(len([range(99999), range(99999), range(99999), range(99999), range(99999), range(99999), range(99999), range(99999), range(99999), range(99999), range(99999)]))"
+?? built more than 1000000 list values (10 x formula_size_limit)
+!as host
+!eval "len(map_with(range(10000), lambda i: range(10000)))"
+?? built more than 1000000 list values
+!eval "len(map_with(range(1000), lambda i: range(100)))"
+?? = `1000`
+!ent set_var u bag.gem 1
+!eval "var_move('u', 'bag', 'u', 'bag')"
+?? = `True`
+!assert "var_get('u', 'bag.gem') == 1"
+!eval "var_move('u', 'bag', 'u', 'bag.inner')"
+?? ❌ var_move: `bag.inner` is inside `bag`, which the move deletes.
+!assert "var_get('u', 'bag.gem') == 1"
+
+Expected: HARNESS-ALLOWS-ERRORS. A formula is charged for the list values
+it builds (range, each, list repetition and concatenation) against 10 x
+formula_size_limit (1,000,000 by default): eleven `range(99999)` in one
+list literal pass a player's `$()` no more, and neither do 10,000 lists
+of 10,000 from `map_with`; 100,000 values are fine. `var_move` onto its
+own path changes nothing (it used to delete the item), and a move into
+its own subtree is refused, so `bag.gem` stays 1.
+
+
+SCENARIO 858 — Smaller refusals: clamp bounds in templates, overwrite placement, smart quotes, team data, status names, log formats
+----------------------------------------------------------------------------------------------------------------------------------
+
+!match new s858 S 6 6
+!match use s858
+!template import mage858 {"name": "Mage", "vars": {"hp": 5, "mana": 1, "max_mana": 5}, "clamps": {"mana": {"path": "mana", "max": "max_mana * 2", "mode": "hard"}}}
+?? a bound is a number or a var path
+!template import mage858 {"name": "Mage", "vars": {"hp": 5, "mana": 1, "max_mana": 5}, "clamps": {"mana": {"path": "mana", "max": "max_mana", "mode": "hard"}}}
+!template spawn mage858 3 3
+!ent set_var mage858 mana 999
+!assert "entity[mage858].mana == 5"
+!history export latest:command overwrite
+?? ❌ Name the file first, then add `overwrite`.
+!store save overwrite
+?? ❌ Name the file first, then add `overwrite`.
+!batch ent add u U 10 1 1 ; ent set_var u note “a ; b” ; ent hp u -1
+!assert "entity[u].note == 'a ; b' and entity[u].hp == 9"
+!team set red res.cp 3
+!team set red res.gold 2
+!team clear red res.cp
+!assert "not team_has('red', 'res.cp') and team_get('red', 'res.gold') == 2"
+!team clear nosuchteam
+?? ❌ team `nosuchteam` has no data or passives.
+!team set red flag true
+!team add red flag 1
+?? ❌ team_add: `red`.flag is True, not a number.
+!status def tag:fire
+?? ❌ `tag:fire` can't be a status name
+!status def a,b
+?? ❌ `a,b` can't be a status name
+!log format nosuchtype "x"
+?? ❌ `nosuchtype` isn't an event type the log records
+
+Expected: HARNESS-ALLOWS-ERRORS. A clamp bound written as a formula is
+refused wherever a clamp arrives (here a template import); a var-path
+bound (`max_mana`) holds, so `mana` stops at 5. `overwrite` in a file
+name's position is refused with a hint, for `!history export` (which
+used to crash) and `!store save` (which used to write a file named
+`overwrite`). Smart quotes group a ` ; ` inside a batch line like
+straight ones. `!team clear red res.cp` clears that one path, a team
+with nothing to clear is refused, and `team_add` refuses a flag. Status
+names a token can't address (`tag:` prefixed, with a comma) and a log
+format for an unknown event type are refused.
+
+
+SCENARIO 859 — Teams stored as text; corpses vs place_random and resize; a strict batch keeps a recreated match's journal
+------------------------------------------------------------------------------------------------------------------------
+
+!match new t859 T 3 1
+!match use t859
+!ent add a A 10 1 1
+!ent add b B 10 2 1
+!ent add c C 10 3 1
+!ent set_var a team 1
+?? vars.team = '1'
+!eval "entity[b].team = '1'"
+!eval "entity[c].team = 2 / 2"
+!assert "entity[a].team == entity[b].team and entity[a].team == entity[c].team"
+!assert "not is_hostile('a', 'c')"
+!team set 1 gold 5
+!assert "team_get(entity[a].team, 'gold') == 5"
+!ent set_var b team.x 1
+?? ❌ Cannot nest under the team var
+!ent kill c
+!tile def new grass glyph=,
+!tile place_random grass 3
+?? Placed template `grass` at 3 random cell(s): (1,1), (2,1), (3,1).
+!assert "has_corpse('c') and tile_get(3, 1, '_template') == 'grass'"
+!map resize 2 1
+?? the corpses of `c` were on the cut cells and are gone
+!assert "not has_corpse('c')"
+!ent hp a 5
+!batch strict match delete t859 ; match new t859 T2 4 4 ; ent hp nobody 3
+?? ⏹ strict batch stopped at line 3
+!match use t859
+!match journal
+?? `!ent hp a 5`
+!assert "entity[a].hp == 5"
+
+Expected: HARNESS-ALLOWS-ERRORS. The team var is stored as text when
+written (as vital vars are stored as numbers): a typed `1`, a formula's
+`'1'` and a computed `2 / 2` are one team "1" to formulas, relations and
+team data alike, and the team var takes no nested path. A cell holding
+only a corpse counts as empty for `!tile place_random` (corpses ride in
+tile data), so three grass tiles fit on the 3x1 map, and the corpse
+stays under its grass. Resizing the map off the corpse's
+cell names the corpse lost. A strict batch that deletes the match, makes
+a new one under its id and then fails brings the original match back with
+its own journal.
+
+
+SCENARIO 860 — A stopped watcher chain waits for a changing command; secret rules in a player's history diff
+-----------------------------------------------------------------------------------------------------------
+
+!system set default persist_undo_history false
+!match new w860 W 4 4
+!match use w860
+!ent add a A 10 1 1
+!system set default watcher_chain_limit 3
+!ent set_var a v 2
+!watch add up "entity[a].v == 0" "entity[a].v = 1"
+!watch add down "entity[a].v == 1" "entity[a].v = 0"
+!ent set_var a v 0
+?? ⚠ watchers still firing after 3 passes
+!assert "entity[a].v == 1"
+!list
+?! watchers still firing
+!dist a a
+?! watchers still firing
+!assert "entity[a].v == 1"
+!ent hp a 9
+?? watchers still firing
+!assert "entity[a].v == 0"
+!watch remove up
+!watch remove down
+!system set default watcher_chain_limit 16
+!system set default random_seed zqxSEED
+!ent hp a 8
+!as player pip
+!history diff command:1 latest:command
+?? rule `random_seed`: '' -> (hidden)
+?! zqxSEED
+!as host
+!history diff command:1 latest:command
+?? zqxSEED
+!system set default random_seed ""
+!system set default persist_undo_history true
+
+Expected: Two watchers flipping `v` stop at watcher_chain_limit (3) with
+a warning, leaving `v` at 1. A read (`!list`, `!dist`) doesn't continue
+the chain; the next command that changes the match (`!ent hp`) does, for
+another 3 passes. With undo snapshots held in memory they carry the
+match's rules, and a player's `!history diff` shows the secret
+`random_seed` as `(hidden)`; a host sees it.

@@ -65,6 +65,62 @@ COMMAND_POV: "contextvars.ContextVar[Optional[Any]]" = (
 # entity['target']).
 LEGACY_IDS_OK: "contextvars.ContextVar[bool]" = (
     contextvars.ContextVar("vtt_legacy_ids", default=False))
+# How deeply movement hooks are nested right now (a hook moving a unit fires
+# the next move's hooks inside itself; a transfer's arrival fires spawn
+# hooks in another match), and whether the limit's warning was given in
+# this chain. Context variables, so the count spans matches.
+MOVE_HOOK_DEPTH: "contextvars.ContextVar[int]" = (
+    contextvars.ContextVar("vtt_move_hook_depth", default=0))
+MOVE_HOOK_WARNED: "contextvars.ContextVar[bool]" = (
+    contextvars.ContextVar("vtt_move_hook_warned", default=False))
+
+
+def move_hook_limit(rules: Dict[str, Any]) -> int:
+    try:
+        return max(1, int(rules.get("move_hook_recursion_limit", 16)))
+    except (TypeError, ValueError):
+        return 16
+
+
+@contextlib.contextmanager
+def move_hook_level(rules: Dict[str, Any], log: List[str]):
+    """One nesting level of movement hooks: yields True to fire them, or
+    False past move_hook_recursion_limit (adding one ⚠️ per chain to
+    `log`)."""
+    depth = MOVE_HOOK_DEPTH.get()
+    if depth >= move_hook_limit(rules):
+        if not MOVE_HOOK_WARNED.get():
+            MOVE_HOOK_WARNED.set(True)
+            log.append(f"⚠️ Movement hooks nested past "
+                       f"move_hook_recursion_limit ({move_hook_limit(rules)}):"
+                       f" a hook keeps moving units; the deeper moves fired "
+                       f"no hooks.")
+        yield False
+        return
+    token = MOVE_HOOK_DEPTH.set(depth + 1)
+    warned = MOVE_HOOK_WARNED.set(False) if depth == 0 else None
+    try:
+        yield True
+    finally:
+        MOVE_HOOK_DEPTH.reset(token)
+        if warned is not None:
+            MOVE_HOOK_WARNED.reset(warned)
+
+
+def _bounded_move_hooks(fn):
+    """Decorator for the Match methods that fire movement hooks: past
+    move_hook_recursion_limit nested levels they fire nothing (one ⚠️ per
+    chain), so a hook that moves its unit again stops."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(self, *a, **k):
+        log: List[str] = []
+        with move_hook_level(self.rules, log) as ok:
+            if ok:
+                return fn(self, *a, **k)
+        return log
+    return wrapper
 
 # A line about one unit (a death, a revive) is prefixed with this tag —
 # UNIT_LINE_TAG + "<match>|<unit>|<x>|<y>|<map>" + UNIT_LINE_TAG — so the command
@@ -1593,6 +1649,21 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "single warning is logged). Mirrors var_hook_recursion_limit."
         ),
     },
+    "move_hook_recursion_limit": {
+        "default": 16,
+        "schema": {"type": "int", "min": 1, "max": 48, "ceiling": True},
+        "desc": (
+            "Max nesting depth of movement hooks: a tile / zone enter, exit "
+            "or stop hook, on_entity_step, on_entity_moved or "
+            "on_map_vehicle_moved that moves a unit fires the next move's "
+            "hooks inside itself, and a transfer_entity arrival's spawn "
+            "hooks may send the unit on (two linked matches bouncing it). "
+            "Past this depth further movement hooks don't fire (one "
+            "warning) and a transfer_entity is refused, so a hook that "
+            "moves its unit again can't recurse until the bot's stack runs "
+            "out."
+        ),
+    },
     "watcher_chain_limit": {
         "default": 16,
         "schema": {"type": "int", "min": 1, "max": 256, "ceiling": True},
@@ -1602,7 +1673,8 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "the checks repeat until a pass fires nothing new, so a chain "
             "settles inside the command that started it (and shares its "
             "undo step). Past the limit the rest of the chain waits for "
-            "the next command, with a warning."
+            "the next command that changes the match (a read such as "
+            "`!list` doesn't continue it), with a warning."
         ),
     },
     "macro_repeat_limit": {
@@ -3546,6 +3618,26 @@ def _coerce_vital_value(v: Any) -> Optional[int]:
     return None
 
 
+def team_text(v: Any) -> Any:
+    """A team var's value as the text the engine compares: a number or bool
+    becomes text (`1`, `1.0` and "1" are one team; True is "true"), None and
+    "" stay (no team), text stays as written. A dict or list is refused
+    (None returned). The team var is stored this way when written, so a
+    formula reading `entity[u].team` sees the same value `is_hostile`,
+    `team_members` and `team_get` use."""
+    if v is None or isinstance(v, str):
+        return v
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        if v != v or v in (float("inf"), float("-inf")):
+            return str(v)
+        return str(int(v)) if v.is_integer() else str(v)
+    return None
+
+
 def _parse_bool(token: str) -> bool:
     """Parse a boolean from a command-line token.
 
@@ -3718,6 +3810,18 @@ def _default_facing_for(
 RESERVED_IDS: Set[str] = {"current", "this", "self", "parent"}
 
 _UNREACHABLE_IDS: Optional[frozenset] = None
+
+
+def check_status_name(name: Any) -> None:
+    """Raise unless `name` can name a status: one word that a status token
+    can address (`removes`, `blocked_by`, immunity, dispel read `tag:<x>`
+    as a tag and a comma as a list)."""
+    if not isinstance(name, str) or not name or any(c.isspace() for c in name):
+        raise VTTError(f"`{name}` can't be a status name: one word, no "
+                       f"spaces.")
+    if name.startswith("tag:") or "," in name:
+        raise VTTError(f"`{name}` can't be a status name: a status token "
+                       f"reads `tag:...` as a tag and a comma as a list.")
 
 
 def unreachable_id(eid: Any) -> bool:
@@ -3923,7 +4027,8 @@ def reserved_path_meaning(seg0: str) -> str:
     """What reserved var path `seg0` reads on a unit, for messages."""
     return {"name": "display name", "map": "map"}.get(seg0, "position")
 
-def checked_unit_vars(vars_: Any, vitals: Iterable[str], where: str) -> Dict[str, Any]:
+def checked_unit_vars(vars_: Any, vitals: Iterable[str], where: str,
+                      team_var: Optional[str] = None) -> Dict[str, Any]:
     """`vars_` ready to become a whole unit's vars, held to the rules
     write_var applies one write at a time: each vital var present (hp /
     max_hp / initiative) is a whole number (a numeric string or float is
@@ -3953,6 +4058,12 @@ def checked_unit_vars(vars_: Any, vitals: Iterable[str], where: str) -> Dict[str
             raise VTTError(f"{where}: vital var '{k}' must be a finite "
                            f"whole number, got {out[k]!r}.")
         out[k] = coerced
+    if team_var and team_var in out:
+        t = team_text(out[team_var])
+        if t is None:
+            raise VTTError(f"{where}: team var '{team_var}' must be text or "
+                           f"a number, got {out[team_var]!r}.")
+        out[team_var] = t
     return out
 
 
@@ -4574,6 +4685,15 @@ class ClampSpec:
                     f"Clamp on '{self.path}' has {label}={b!r}: must be a number "
                     f"or var path string."
                 )
+            # A string bound names a var (`max_hp`, `stats.cap`); anything
+            # else (a formula, spaces) can never name one and meant "no
+            # bound" forever, from whichever route it came (a template, a
+            # transform form, a summon).
+            if isinstance(b, str) and not re.match(
+                    r"[A-Za-z_]\w*(\.\w+)*\Z", b.strip()):
+                raise VTTError(
+                    f"Clamp on '{self.path}' has {label}={b!r}: a bound is a "
+                    f"number or a var path (`max_hp`, `stats.cap`).")
         # If both bounds are numeric literals, validate min <= max at config time.
         # We can't validate when either is a path — those resolve at write time.
         if (isinstance(self.max, (int, float)) and not isinstance(self.max, bool)
@@ -5671,12 +5791,14 @@ class Entity:
         None or ""). A team typed through a command is stored as a number
         (`!ent set_var u team 1`) while one from a formula or a template is
         text; reading both as text keeps team "1" one team everywhere
-        (passives, POV, colours, relations, turn grouping). Formulas reading
-        `entity[u].team` still see the stored value."""
+        (passives, POV, colours, relations, turn grouping). write_var
+        stores the team var as this text (`team_text`), so formulas reading
+        `entity[u].team` see the same value."""
         v = self.vars.get(self._team_var_name())
         if v is None or v == "":
             return None
-        return str(v)
+        t = team_text(v)
+        return str(v) if t is None else t
 
     @team.setter
     def team(self, value):
@@ -5925,7 +6047,7 @@ class Entity:
             (match.rules.get("hp_var", "hp"),
              match.rules.get("max_hp_var", "max_hp"),
              match.rules.get("turnorder_var", "initiative")),
-            f"`{self.id}`")
+            f"`{self.id}`", match.rules.get("team_var", "team"))
 
         # Validate the WHOLE footprint anchored at (x, y): every covered
         # cell in bounds and unoccupied (stackable spawners skip
@@ -6419,6 +6541,17 @@ class Entity:
                         f"Vital var '{seg0}' must be a finite number, got {value!r} "
                         f"on `{self.id}`.")
                 value = coerced
+            elif seg0 == self._team_var_name():
+                if "." in path:
+                    raise VTTError(
+                        f"Cannot nest under the team var '{seg0}' (writing "
+                        f"'{path}') on `{self.id}`: a team is one name.")
+                t = team_text(value)
+                if t is None:
+                    raise VTTError(
+                        f"Team var '{seg0}' must be text or a number, got "
+                        f"{value!r} on `{self.id}`.")
+                value = t
         # A dict / list is stored as this unit's own copy. A formula can hand
         # over another unit's live object (`entity[a].inv = entity[b].inv`,
         # var_set(..., var_get(...))), which used to make both vars ONE object:
@@ -7929,6 +8062,10 @@ class Match:
     _deleting_maps: Set[str] = field(
         default_factory=set, repr=False, compare=False
     )
+    # fire_watchers stopped at watcher_chain_limit with watchers still
+    # firing: the rest of the chain waits for the next command that changes
+    # the match (a read doesn't continue it). Not serialized.
+    _watcher_backlog: bool = field(default=False, repr=False, compare=False)
 
     # ---- maps ------------------------------------------------------------
     def _map_for(self, mp: Optional["Map"],
@@ -8986,6 +9123,11 @@ class Match:
 
         # Re-key tiles (corpses ride along inside tile data); drop off-grid.
         old_tiles = len(mp.tiles)
+        dropped_corpses = sorted(
+            str(cid)
+            for (x, y), cell in mp.tiles.items()
+            if not in_new(x + ox, y + oy) and isinstance(cell, dict)
+            for cid in (cell.get("corpses") or {}))
         mp.tiles = {(x + ox, y + oy): cell
                     for (x, y), cell in mp.tiles.items()
                     if in_new(x + ox, y + oy)}
@@ -9032,6 +9174,7 @@ class Match:
         mp.grid_width, mp.grid_height = new_w, new_h
         return ({"offset": (ox, oy), "anchor": key, "killed": killed,
                  "dropped_tiles": dropped_tiles,
+                 "dropped_corpses": dropped_corpses,
                  "clipped_zone_cells": clipped_cells}, log)
 
 
@@ -10533,11 +10676,14 @@ class Match:
     def team_add(self, team: str, path: str, delta: float) -> Any:
         """Add `delta` to a numeric team value (0 if absent). Returns the new
         value."""
-        cur = self.team_get(team, path, 0) or 0
-        try:
-            new = cur + delta
-        except TypeError:
-            raise VTTError(f"team_add: `{team}`.{path} is not numeric.")
+        cur = self.team_get(team, path, 0)
+        if cur is None:
+            cur = 0
+        # A flag (true / false) isn't a number to add to, as var_add says.
+        if isinstance(cur, bool) or not isinstance(cur, (int, float)):
+            raise VTTError(f"team_add: `{team}`.{path} is {cur!r}, not a "
+                           f"number.")
+        new = cur + delta
         self.team_set(team, path, new)
         return new
 
@@ -10548,15 +10694,17 @@ class Match:
         effect fires in the same command. Returns effect-error notes."""
         log: List[str] = []
         limit = max(1, int(self.rules.get("watcher_chain_limit", 16)))
+        self._watcher_backlog = False
         for _ in range(limit):
             fired, notes = self._watcher_pass()
             log += notes
             if not fired:
                 return log
         if self.watchers and self._watcher_pass(peek=True)[0]:
+            self._watcher_backlog = True
             log.append(f"⚠ watchers still firing after {limit} passes "
                        f"(watcher_chain_limit); the rest wait for the next "
-                       f"command.")
+                       f"command that changes the match.")
         return log
 
     def _watcher_pass(self, peek: bool = False) -> Tuple[List[str], List[str]]:
@@ -13798,6 +13946,7 @@ class Match:
     def _hook_map(self, mp: Optional["Map"], eid: Optional[str]) -> "Map":
         return self._map_for(mp, self.entities.get(eid) if eid else None)
 
+    @_bounded_move_hooks
     def fire_footprint_tile_exit(self, eid: Optional[str],
                                  old_cells, new_cells,
                                  mp: Optional["Map"] = None) -> List[str]:
@@ -13809,6 +13958,7 @@ class Match:
                 log.extend(self.fire_tile_hook("on_exit", eid, cx, cy, mp))
         return log
 
+    @_bounded_move_hooks
     def fire_footprint_tile_enter(self, eid: Optional[str],
                                   old_cells, new_cells,
                                   mp: Optional["Map"] = None) -> List[str]:
@@ -13820,6 +13970,7 @@ class Match:
                 log.extend(self.fire_tile_hook("on_enter", eid, cx, cy, mp))
         return log
 
+    @_bounded_move_hooks
     def fire_footprint_tile_stop(self, eid: Optional[str], cells,
                                  mp: Optional["Map"] = None) -> List[str]:
         mp = self._hook_map(mp, eid)
@@ -13828,6 +13979,7 @@ class Match:
             log.extend(self.fire_tile_hook("on_stop", eid, cx, cy, mp))
         return log
 
+    @_bounded_move_hooks
     def fire_footprint_zone_exit(self, eid: Optional[str],
                                  old_cells, new_cells,
                                  mp: Optional["Map"] = None) -> List[str]:
@@ -13848,6 +14000,7 @@ class Match:
                 log.extend(self.fire_zone_hook("on_cell_exit", name, eid, cx, cy, mp))
         return log
 
+    @_bounded_move_hooks
     def fire_footprint_zone_enter(self, eid: Optional[str],
                                   old_cells, new_cells,
                                   is_final: bool,
@@ -13871,6 +14024,7 @@ class Match:
             log.extend(self.fire_footprint_zone_stop(eid, new_cells, mp))
         return log
 
+    @_bounded_move_hooks
     def fire_footprint_zone_stop(self, eid: Optional[str], cells,
                                  mp: Optional["Map"] = None) -> List[str]:
         """Boundary on_stop ONCE per zone the footprint ends in, plus
@@ -13962,8 +14116,7 @@ class Match:
     def define_status(self, name: str, *, overwrite: bool = False) -> Dict[str, Any]:
         """Create an empty status definition. Raises DuplicateId if it
         already exists unless overwrite=True."""
-        if not isinstance(name, str) or not name.strip():
-            raise VTTError("status definition name must be a non-empty string.")
+        check_status_name(name)
         if not overwrite and name in self.status_definitions:
             raise DuplicateId(f"Status definition '{name}' already exists.")
         self.status_definitions[name] = {
@@ -14006,10 +14159,7 @@ class Match:
         lost. Returns counts by kind."""
         if old not in self.status_definitions:
             raise NotFound(f"No status definition `{old}`.")
-        if not isinstance(new, str) or not new.strip() or new != new.strip() \
-                or any(c.isspace() for c in new) or new.startswith("tag:"):
-            raise VTTError(f"`{new}` can't be a status name (one word, not "
-                           f"`tag:...`).")
+        check_status_name(new)
         if new in self.status_definitions:
             raise DuplicateId(f"Status definition '{new}' already exists.")
         clash = sorted(e.id for e in self.entities.values()
@@ -14869,16 +15019,22 @@ class Match:
             self.log_event("move", entity=entity_id, name=e.name,
                            from_x=from_x, from_y=from_y, to_x=to_x, to_y=to_y)
         log: List[str] = []
-        for p in self._firing_passives(entity_id):
-            if p.when == "on_entity_moved":
-                log.append(_run_passive_safely(
-                    engine, p, ctx, target_id=entity_id, is_global=True,
-                ))
-        for p in e.passives.values():
-            if p.when == "on_entity_moved":
-                log.append(_run_passive_safely(
-                    engine, p, ctx, target_id=entity_id, is_global=False,
-                ))
+        # The passives are bounded by move_hook_recursion_limit (one moving
+        # its unit again fires the next move inside itself); the re-stamps
+        # above always run.
+        with move_hook_level(self.rules, log) as fire:
+            if fire:
+                for p in self._firing_passives(entity_id):
+                    if p.when == "on_entity_moved":
+                        log.append(_run_passive_safely(
+                            engine, p, ctx, target_id=entity_id,
+                            is_global=True))
+                if entity_id in self.entities:
+                    for p in list(e.passives.values()):
+                        if p.when == "on_entity_moved":
+                            log.append(_run_passive_safely(
+                                engine, p, ctx, target_id=entity_id,
+                                is_global=False))
         # Fog memory: a move can reveal new cells for the mover's team —
         # fold current vision into its explored set (no-op unless memory
         # on). Other entities a passive moved record via their own fires.
@@ -14886,15 +15042,18 @@ class Match:
         # Nested maps: the units on each map the moved body carries.
         if entity_id in self.entities and any(
                 mp.vehicle for mp in self.maps.values()):
-            for u in self.carried_body(e):
-                for mp in self.maps_carried_by(u.id):
-                    targets = [x.id for x in self._turn_sorted(
-                        [x for x in self.units_on_map(mp.name)
-                         if not x.part_of])]
-                    log.extend(self.fire_hook(
-                        "on_map_vehicle_moved", target_ids=targets,
-                        extras={"map_vehicle": u.id, "context_map": mp.name,
-                                "hook_name": "on_map_vehicle_moved"}))
+            with move_hook_level(self.rules, log) as fire:
+                if fire:
+                    for u in self.carried_body(e):
+                        for mp in self.maps_carried_by(u.id):
+                            targets = [x.id for x in self._turn_sorted(
+                                [x for x in self.units_on_map(mp.name)
+                                 if not x.part_of])]
+                            log.extend(self.fire_hook(
+                                "on_map_vehicle_moved", target_ids=targets,
+                                extras={"map_vehicle": u.id,
+                                        "context_map": mp.name,
+                                        "hook_name": "on_map_vehicle_moved"}))
         return log
 
     def fire_entity_step(
@@ -14925,16 +15084,19 @@ class Match:
         }
         ctx = EvalCtx(this=this_id, target=entity_id, extras=extras)
         log: List[str] = []
-        for p in self._firing_passives(entity_id):
-            if p.when == "on_entity_step":
-                log.append(_run_passive_safely(
-                    engine, p, ctx, target_id=entity_id, is_global=True,
-                ))
-        for p in e.passives.values():
-            if p.when == "on_entity_step":
-                log.append(_run_passive_safely(
-                    engine, p, ctx, target_id=entity_id, is_global=False,
-                ))
+        with move_hook_level(self.rules, log) as fire:
+            if fire:
+                for p in self._firing_passives(entity_id):
+                    if p.when == "on_entity_step":
+                        log.append(_run_passive_safely(
+                            engine, p, ctx, target_id=entity_id,
+                            is_global=True))
+                if entity_id in self.entities:
+                    for p in list(e.passives.values()):
+                        if p.when == "on_entity_step":
+                            log.append(_run_passive_safely(
+                                engine, p, ctx, target_id=entity_id,
+                                is_global=False))
         # Fog memory: capture cells revealed mid-path, per step (the
         # once-per-move record in fire_entity_moved would miss a stepwise
         # move's intermediate vision).
@@ -16987,8 +17149,16 @@ class Match:
                     pid = str(pdc.get("id", ""))
                     if relocate != (pid in deferred):
                         continue
-                    if not pid or pid in self._taken_entity_ids():
-                        continue   # an id clash: something else took the id
+                    if not pid:
+                        continue
+                    if pid in self._taken_entity_ids():
+                        # Another unit took the part's id while the body
+                        # lay dead: the part can't come back under it.
+                        if not relocate:
+                            spawn_log.append(
+                                f"⚠️ part `{pid}` couldn't be restored: "
+                                f"another unit has its id now.")
+                        continue
                     if not relocate and pdc.get("part_of") in deferred:
                         deferred.add(pid)   # waits for its own parent
                         continue
@@ -17074,8 +17244,14 @@ class Match:
             # corpse's hp (not alive, so left out); now that it lives, it
             # rejoins.
             self._rebuild_turn_order()
+        # Only the units this revive brought back rejoin: a stranger that
+        # took a part's id meanwhile isn't that part.
+        back = {e.id} | {str(pd.get("id")) for pd in stored_parts
+                         if str(pd.get("id")) in self.entities
+                         and self.body_root(self.entities[str(pd.get("id"))])
+                         is e}
         for uid, names in (corpse.get("groups") or {}).items():
-            if uid in self.entities and isinstance(names, list):
+            if uid in self.entities and uid in back and isinstance(names, list):
                 for name in names:
                     if name in self.groups and uid not in self.groups[name]:
                         self.groups[name].append(uid)
@@ -17519,7 +17695,7 @@ class Match:
                 new_vars[k] = copy.deepcopy(e.vars[k])
         # Checked BEFORE the old parts go, so a bad statblock changes nothing.
         new_vars = checked_unit_vars(new_vars, (hp_var, max_hp_var, turnorder_var),
-                                     "transform")
+                                     "transform", self.rules.get("team_var", "team"))
         if hp_var not in new_vars:
             raise VTTError(f"transform: the new form has no `{hp_var}`.")
         # The new body must fit where the unit stands (its own parts, which

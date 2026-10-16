@@ -15,7 +15,7 @@ from logic import (
 )
 
 # Passive system
-from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES
+from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -986,6 +986,14 @@ class CommandRegistry:
             if handled is not None:
                 handled.add(jm.id)
 
+        # A watcher chain stopped by watcher_chain_limit continues only
+        # after a command that changes the match: the state before it.
+        wpre = None
+        if (jm is not None and jm._watcher_backlog
+                and getattr(jm, "_action_depth", 0) == 0):
+            wpre = (jpre if jpre is not None else pre_state if pre_state
+                    is not None else jm.to_dict(include_history=False))
+
         # Reset the per-command summon budget on the active match.
         # summon_entity increments _summon_count and caps it at the
         # summon_event_limit rule; resetting here makes the budget
@@ -1076,7 +1084,14 @@ class CommandRegistry:
         # lines follow the change that triggered it.
         await _flush_formula_log(ctx)
         mid_now = mgr.active_by_channel.get(ctx.channel_key)
-        if mid_now is not None and mid_now in mgr.matches:
+        poll = not (name == "match" and args
+                    and str(args[0]).lower() == "replay")
+        if (poll and wpre is not None and mid_now == pre_active_mid
+                and mid_now in mgr.matches
+                and not _differs_in_undo_state(
+                    wpre, mgr.matches[mid_now].to_dict(include_history=False))):
+            poll = False        # unchanged: the stopped chain keeps waiting
+        if poll and mid_now is not None and mid_now in mgr.matches:
             if mgr.matches[mid_now].watchers:
                 post_state = None       # a watcher may change it after
             for line in mgr.matches[mid_now].fire_watchers():
@@ -4167,6 +4182,9 @@ _RAW_JSON_TAIL = re.compile(r"^\s*(import)\s+(\S+)\s+(.+?)\s*$",
 def _split_semicolons(text: str) -> List[str]:
     """`text` cut at every `;` standing as a word of its own outside quotes
     (the separator `!batch` / `!foreach` use), as raw text pieces."""
+    # Smart quotes count as the quotes they stand for, as the line splitter
+    # reads them (_straight_quotes).
+    text = _straight_quotes(text)
     pieces: List[str] = []
     cur: List[str] = []
     quote = None
@@ -4292,9 +4310,10 @@ def _template_may_save(ctx: ReplyContext, mgr: MatchManager) -> None:
     """Saving a template needs a host of this channel's match (or a server
     administrator), and an identity to record as its saver."""
     if ctx_user(ctx) is None:
-        raise VTTError("Templates can only be saved by a person typing the "
-                       "command (an action body has no one to record as the "
-                       "saver).")
+        raise VTTError("Templates can only be saved with an identity to "
+                       "record as the saver (a command a person runs, or an "
+                       "action they run with `template` on "
+                       "action_cmd_allowlist).")
     if ctx_is_admin(ctx):
         return
     mid = mgr.get_active_for_channel(ctx.channel_key)
@@ -5500,7 +5519,7 @@ async def _match_journal(ctx: ReplyContext, args: List[str],
     m = active_match(mgr, ctx)
     j = m.journal
     if len(args) > 1 and args[1].lower() == "export":
-        overwrite = _take_overwrite(args)
+        overwrite = _take_overwrite(args, 3)
         if len(args) != 3:
             raise VTTError("Usage: `!match journal export <file> "
                            "[overwrite]`.")
@@ -8555,6 +8574,9 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # to the resulting var events. We append them to the ack message so
         # the GM can see chain effects from a single write.
         hook_log = e.write_var(key_path, value, bypass_clamp=bypass_clamp)
+        if eid in m.entities and key_path.split(".", 1)[0] == m.rules.get("team_var", "team"):
+            # The team var is stored as text (logic.team_text).
+            value = e.vars.get(key_path, value)
         ack = f"`{eid}` vars.{key_path} = {value!r}"
         if bypass_clamp:
             ack += " (clamp bypassed)"
@@ -10624,6 +10646,10 @@ async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             notes.append("killed " + ", ".join(f"`{i}`" for i in summary["killed"]))
         if summary["dropped_tiles"]:
             notes.append(f"dropped {summary['dropped_tiles']} tile cell(s)")
+        if summary.get("dropped_corpses"):
+            notes.append("the corpses of " + ", ".join(
+                f"`{c}`" for c in summary["dropped_corpses"])
+                + " were on the cut cells and are gone")
         if summary["clipped_zone_cells"]:
             notes.append(f"clipped {summary['clipped_zone_cells']} zone cell(s)")
         if notes:
@@ -12092,13 +12118,18 @@ _TRANSFER_UNDO_NOTE = (
     "other match keeps its side (undo there separately).")
 
 
-def _take_overwrite(args: List[str]) -> bool:
-    """Remove a trailing-option `overwrite` word from `args` (in place)."""
-    if any(str(a).lower() == "overwrite" for a in args[2:]):
-        args[:] = args[:2] + [a for a in args[2:]
-                              if str(a).lower() != "overwrite"]
-        return True
-    return False
+def _take_overwrite(args: List[str], first_opt: int = 3) -> bool:
+    """Remove the option word `overwrite` from `args` (in place). It comes
+    after the file name: one in a name's place (index below `first_opt`)
+    is refused, so `!store save overwrite` doesn't save a file named
+    `overwrite` and `!history export <sel> overwrite` doesn't crash."""
+    at = [i for i, a in enumerate(args) if str(a).lower() == "overwrite"]
+    if not at:
+        return False
+    if any(i < first_opt for i in at):
+        raise VTTError("Name the file first, then add `overwrite`.")
+    args[:] = [a for i, a in enumerate(args) if i not in at]
+    return True
 
 
 def _check_overwrite(full: str, shown: str, overwrite: bool) -> None:
@@ -12452,7 +12483,7 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "history", "export"):
             return
         selector = args[1]
-        overwrite = _take_overwrite(args)
+        overwrite = _take_overwrite(args, 3)
         full, path = saves_path(args[2], mgr, write=True)
         _check_overwrite(full, path, overwrite)
         snap = _resolve_snapshot_selector(m, selector)
@@ -12533,7 +12564,9 @@ async def history_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 "(pov_filters_queries).")
         snap_a = _resolve_snapshot_selector(m, args[1])
         snap_b = _resolve_snapshot_selector(m, args[2])
-        lines = _format_snapshot_diff(snap_a, snap_b, args[1], args[2])
+        lines = _format_snapshot_diff(
+            snap_a, snap_b, args[1], args[2],
+            _diff_rule_text(ctx, m))
         lines[1:1] = _authors_line(m, min(snap_a.sequence, snap_b.sequence),
                                    max(snap_a.sequence, snap_b.sequence))
         return await ctx.send("\n".join(lines))
@@ -12586,7 +12619,7 @@ async def _undo_preview(ctx, m: Match, snap: Snapshot, what: str):
     after.sync_all_var_names()
     lines = _format_snapshot_diff(
         now, SimpleNamespace(state=after.to_dict(include_history=False)),
-        "now", what)
+        "now", what, _diff_rule_text(ctx, m))
     lines[0] = (f"🔍 **Undo preview** — `{what}` would make these changes "
                 f"(nothing restored yet):")
     lines[1:1] = _authors_line(m, snap.sequence, None, undone=True)
@@ -12772,8 +12805,23 @@ def _active_id(state: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _diff_rule_text(ctx: ReplyContext, m: Match) -> Callable[[str, Any], str]:
+    """How a snapshot diff prints a rule value for this caller: a secret
+    rule's (logic.SECRET_RULES) as `(hidden)` unless they are an
+    administrator or a host of `m` (as _rule_value_text)."""
+    hide = not ctx_is_admin(ctx) and not _acts_as_host(ctx, m)
+
+    def text(k: str, v: Any) -> str:
+        if hide and k in SECRET_RULES and v not in (None, ""):
+            return "(hidden)"
+        return repr(v)
+    return text
+
+
 def _format_snapshot_diff(snap_a: Snapshot, snap_b: Snapshot,
-                          sel_a: str, sel_b: str) -> List[str]:
+                          sel_a: str, sel_b: str,
+                          rule_text: Optional[Callable[[str, Any], str]] = None
+                          ) -> List[str]:
     """Build a human-readable diff between two snapshot states. Focuses
     on what GMs actually want to see — entity-level changes, the turn
     clock, the map (tiles / zones / groups), match and team data, and rule
@@ -12807,13 +12855,16 @@ def _format_snapshot_diff(snap_a: Snapshot, snap_b: Snapshot,
         ra = rb = {}
     rule_keys = sorted(set(ra) | set(rb))
     rule_changes = []
+    # A secret rule's value (random_seed) shows as the caller may see it.
+    rt = rule_text or (lambda k, v: repr(v))
     for rk in rule_keys:
         if rk not in ra:
-            rule_changes.append(f"  + rule `{rk}` = {rb[rk]!r}")
+            rule_changes.append(f"  + rule `{rk}` = {rt(rk, rb[rk])}")
         elif rk not in rb:
-            rule_changes.append(f"  - rule `{rk}` (was {ra[rk]!r})")
+            rule_changes.append(f"  - rule `{rk}` (was {rt(rk, ra[rk])})")
         elif ra[rk] != rb[rk]:
-            rule_changes.append(f"  ~ rule `{rk}`: {ra[rk]!r} -> {rb[rk]!r}")
+            rule_changes.append(f"  ~ rule `{rk}`: {rt(rk, ra[rk])} -> "
+                                f"{rt(rk, rb[rk])}")
     if rule_changes:
         lines.append("- Rules:")
         lines.extend(rule_changes)
@@ -13139,7 +13190,7 @@ async def store_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # autosave history into the save file. Off by default to keep
         # files small; on for full campaign backups.
         include_history = False
-        overwrite = _take_overwrite(args)
+        overwrite = _take_overwrite(args, 2)
         _check_options(args[2:], {"include_history"}, "!store save")
         for extra in args[2:]:
             if extra.startswith("include_history="):
@@ -14312,6 +14363,11 @@ async def _log_format_sub(ctx, fmt_args, mgr, m):
                 f"{'es' if refreshed != 1 else ''}]."
             )
         return await ctx.send(f"`{etype}` has no override (already default).")
+    known = set(RULES_REGISTRY["event_log_events"]["schema"]["word_list"])
+    if etype not in known:
+        return await ctx.send(
+            f"❌ `{etype}` isn't an event type the log records; known: "
+            + ", ".join(f"`{t}`" for t in sorted(known)) + ".")
     template = " ".join(fmt_args[1:])
     overrides[etype] = template
     refreshed = _write(overrides)
@@ -15008,15 +15064,20 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             overrides[k] = _parse_scalar(v)
         if name not in m.tile_templates:
             return await ctx.send(f"❌ template `{name}` not found.")
-        # Empty = in-bounds cell with no existing tile data. With several
-        # maps (map=a,b / all) the N are scattered over all their empty
-        # cells together, every cell equally likely.
+        # Empty = in-bounds cell with no existing tile data (a cell holding
+        # only corpses counts as empty: they ride inside tile data). With
+        # several maps (map=a,b / all) the N are scattered over all their
+        # empty cells together, every cell equally likely.
+        def _tile_empty(emp, x, y):
+            cell = emp.tiles.get((x, y))
+            return cell is None or (isinstance(cell, dict)
+                                    and set(cell) <= {"corpses"})
         empty = [
             (i, x, y)
             for i, emp in enumerate(maps)
             for x in range(1, emp.grid_width + 1)
             for y in range(1, emp.grid_height + 1)
-            if (x, y) not in emp.tiles
+            if _tile_empty(emp, x, y)
         ]
         if len(empty) < count:
             return await ctx.send(
@@ -15937,8 +15998,7 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "status", "copy"):
             return
         _check_tail(args, 3, (), "!status copy <name> <new_name>")
-        if args[2].startswith("tag:"):
-            raise VTTError(f"`{args[2]}` can't be a status name.")
+        check_status_name(args[2])
         _copy_entry(m.status_definitions, args[1], args[2], "status definition")
         return await ctx.send(f"Copied status definition `{args[1]}` to "
                               f"`{args[2]}`.")
@@ -17104,8 +17164,11 @@ def _restore_all_matches(mgr: MatchManager, snap: Dict[str, Any]) -> None:
         del mgr.matches[mid]
     for mid, state in pre.items():
         m = mgr.matches.get(mid)
-        if m is None:
-            m = snap.get("objs", {}).get(mid)
+        orig = snap.get("objs", {}).get(mid)
+        if m is None or (orig is not None and m is not orig):
+            # Deleted meanwhile, or deleted and made anew under its id:
+            # the original object comes back (its journal and history).
+            m = orig
             if m is None:
                 m = Match.from_dict(copy.deepcopy(state))
             mgr.matches[mid] = m
@@ -17220,7 +17283,8 @@ async def dry_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     from types import SimpleNamespace
     lines = _format_snapshot_diff(SimpleNamespace(state=pre),
                                   SimpleNamespace(state=post),
-                                  "before", "after")
+                                  "before", "after",
+                                  _diff_rule_text(ctx, m))
     return await ctx.send("\n".join(["🧪 It would change:"] + lines[1:]
                                      + ["Rolled back."]))
 
@@ -18138,10 +18202,17 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         team = args[1]
         if len(args) >= 3:
-            d = m.team_data.get(team, {})
-            if d.pop(args[2], None) is None:
+            # A dotted path, as `!team set` / `get` / `add` take.
+            keys = args[2].split(".")
+            cur: Any = m.team_data.get(team, {})
+            for k in keys[:-1]:
+                cur = cur.get(k) if isinstance(cur, dict) else None
+            if not isinstance(cur, dict) or keys[-1] not in cur:
                 return await ctx.send(f"❌ team `{team}` has no `{args[2]}`.")
+            del cur[keys[-1]]
             return await ctx.send(f"Cleared team `{team}`.{args[2]}.")
+        if team not in m.team_data and team not in m.team_passives:
+            return await ctx.send(f"❌ team `{team}` has no data or passives.")
         m.team_data.pop(team, None)
         m.team_passives.pop(team, None)
         return await ctx.send(f"Cleared all data + passives for team `{team}`.")
