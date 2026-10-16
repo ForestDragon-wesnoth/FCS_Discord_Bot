@@ -27254,3 +27254,371 @@ commit's writes and deletes used to leave it, or an operator pruning
 history) no longer stops the server from saving: the load drops the
 snapshot with a console note, the next command saves (hp 6 survives a
 restart), and undo works with the snapshots that remain.
+
+
+SCENARIO 867 — A body part that carries riders: its riders go through the mount-death rules
+-------------------------------------------------------------------------------------------
+
+!match new pv PV 12 12
+!match use pv
+!system set default mount_on_vehicle_death kill
+!system set default mount_death_effect "entity[self].shaken = True"
+!ent add dragon Dragon 50 5 5
+!part add dragon howdah Howdah 10 10
+!part locate howdah 6 5
+!ent set_var howdah slots.seat.capacity 1
+!ent add pilot Pilot 5 1 1
+!mount pilot howdah seat
+!eval "damage_part('howdah', 50)"
+?? 💀 **Pilot** (`pilot`) died.
+!assert "has_corpse('pilot') and corpse_var('pilot', 'shaken')"
+!ent hp howdah 10
+!ent add gunner Gunner 5 1 1
+!mount gunner howdah seat
+!system set default mount_on_vehicle_death keep
+!eval "damage_part('howdah', 50)"
+!assert "is_mounted('gunner') and entity[gunner].shaken"
+!ent hp howdah 10
+!system set default mount_on_vehicle_death kill
+!ent kill dragon
+?? 💀 **Gunner** (`gunner`) died.
+!assert "has_corpse('gunner')"
+!ent add loco Loco 20 10 2
+!part segment loco car Car 10 10
+!ent set_var car slots.seat.capacity 1
+!ent add rider2 Rider2 5 1 3
+!mount rider2 car seat
+!system set default mount_on_vehicle_death eject
+!ent kill loco
+!assert "entity[rider2].shaken and not is_mounted('rider2')"
+
+Expected: A howdah (a located part) with a seat. Destroyed as a limb by
+`damage_part`, it runs the mount-death rules for its rider: the
+rule's death effect marks the pilot, which then dies (kill). Under keep
+a gunner stays aboard the dead limb. Killing the dragon kills the
+gunner riding its repaired howdah (the dragon's death removes its
+parts, and each part that carries riders runs the rules after the
+death). A train car (a snake segment) does the same when its locomotive
+dies: under eject its rider is marked by the death effect and steps
+off alive.
+
+
+SCENARIO 868 — Saved data from an older build: text clamp bounds, a reserved var in a template, numeric teams
+--------------------------------------------------------------------------------------------------------------
+
+!match new camp Camp 8 8
+!match use camp
+!ent add orc Orc 10 2 2
+!ent set_var orc team blue
+!ent add ally Ally 10 4 4
+!ent set_var ally team 1
+!ent kill ally
+!ent set_var orc mana 5
+!template save orc
+?file set matches/camp.json entities.orc.clamps {"mana": {"path": "mana", "max": "max_mana * 2", "mode": "soft"}, "hp": {"path": "hp", "max": "max_hp", "min": "0 - 5", "mode": "hard"}}
+?file set matches/camp.json entities.orc.vars.team 1
+?file replace matches/camp.json "\"team\": \"1\"" "\"team\": 1"
+?file set templates/orc.json clamps {"mana": {"path": "mana", "max": "max_mana * 2", "mode": "soft"}}
+?file set templates/orc.json vars.map "old"
+!as restart
+!match use camp
+!assert "entity[orc].team == '1'"
+!assert "team_get(entity[orc].team, 'x', 0) == 0"
+!assert "corpse_var('ally', 'team') == '1'"
+!clamp list orc
+?? hp
+?! mana
+!ent hp orc 50
+!assert "entity[orc].hp == 10"
+!template spawn orc 5 5
+!assert "entity[orc2].map_old == 'old' and entity[orc2].mana == 5"
+!clamp list orc2
+?! mana
+
+Expected: Files written as an older build wrote them: a unit with a
+clamp whose bounds are formulas (they meant "no bound" then), an old
+numeric team on a unit and in a corpse, and a template with such a
+clamp and a var named `map` (a reserved name now). The match and the
+template load (each dropped bound and the moved var get a console note):
+the mana clamp, left with no bound, is gone; the hp clamp keeps its
+`max_hp` bound and loses `0 - 5`. The teams read as the text `1`, as
+every write stores them now. The template spawns with the old `map` var
+under `map_old` and no mana clamp.
+
+
+SCENARIO 869 — A customized default system lost with systems.json locks the server or comes back from a match backup
+----------------------------------------------------------------------------------------------------------------------
+
+!system set default hp_var health
+!system set default friendlyfire false
+!match new dm DM 6 6
+!match use dm
+!ent add hero Hero 20 2 2
+!ent hp hero 7
+?file corrupt systems.json
+!as restart
+!list
+?? 🔒 This server is locked
+!server recover
+?? `dm` (`default`)
+!server recover backup 1
+?? 🔓 Recovered
+!assert "entity[hero].health == 7 and rule_get('friendlyfire') == False"
+!system set default system_load_failure match_backup
+!system new pf parent=default
+!system set pf turn_start_message_format ""
+!match new pm PM 6 6 pf
+!match use pm
+!ent add hero2 Hero 20 2 2
+?file corrupt systems.json
+!as restart
+!match use pm
+!assert "entity[hero2].health == 20 and rule_get('friendlyfire') == False"
+!match use dm
+!assert "entity[hero].health == 7"
+
+Expected: Most servers customize `default` itself. When systems.json
+fails to load, the server's `default` is the registry's stand-in, so a
+match on it lost its system like any other: the server is locked (the
+units keep `health`, nothing is saved), `!server recover` names the
+match, and restoring the newest copy (nothing was saved over it while
+locked) brings the customized default back. With
+`system_load_failure match_backup` on default, each match file carries
+its system chain, so the next failed load rebuilds `default` and its
+child `pf` from the match files (replacing the stand-in) without a lock.
+
+
+SCENARIO 870 — Corpse targets, the second unit of !ent and map= follow a player's view
+---------------------------------------------------------------------------------------
+
+!match new pv PV 12 6
+!match use pv
+!ent add hero Hero 10 1 1
+!ent set_var hero team red
+!ent set_var hero fog_vision_radius 2
+!ent add zqxguard Guard 10 10 5
+!ent set_var zqxguard team blue
+!ent add zqxthief Thief 10 11 5
+!ent set_var zqxthief team blue
+!ent add fallen Fallen 10 2 2
+!ent set_var fallen team red
+!ent set_var hero bag.actions.loot.target corpse
+!ent set_var hero bag.actions.loot.body "entity[self].looted = target"
+!ent set_var hero bag.actions.lootall.target corpse_list
+!ent set_var hero bag.actions.lootall.body "pass"
+!ent kill zqxguard
+!ent kill fallen
+!match fog on
+!map new zqxvault 5 5
+!match fog on map=zqxvault
+!match bind pov=red
+!host access set action all
+!host access set ent all
+!as player alice
+!action hero loot zqxguard
+?? Could not find a corpse named `zqxguard`. Either it does not exist, or this channel currently does not have permission to view it.
+!action hero loot nosuch
+?? Could not find a corpse named `nosuch`. Either it does not exist, or this channel currently does not have permission to view it.
+!action hero lootall fallen zqxguard
+?? Could not find a corpse named `zqxguard`.
+!action hero loot fallen
+!assert "entity[hero].looted == 'fallen'"
+!ent diff hero zqxthief
+?? Could not find a unit named `zqxthief`. Either it does not exist
+!ent store_entity_into_var hero zqxthief loot
+?? Could not find a unit named `zqxthief`.
+!ent transform hero zqxthief
+?? Could not find a unit named `zqxthief`.
+!ent revive zqxguard
+?? Could not find a corpse named `zqxguard`.
+!ent add spy Spy 5 1 1 map=zqxvault
+?? Could not find a map named `zqxvault`. Either this map does not exist, or this channel currently does not have permission to view it.
+!as host
+!assert "has_corpse('zqxguard') and len(entities_at(1, 1, map='zqxvault')) == 0"
+
+Expected: A red player's channel, fogged, with `!action` and `!ent`
+opened to players. A blue guard's corpse in the fog reads exactly like
+a missing corpse, as an action target (`corpse` and `corpse_list`) and
+for `!ent revive`; the red corpse in sight is a target as before. The
+second unit of `!ent diff`, `!ent store_entity_into_var` and
+`!ent transform` goes through the view too, and so does `!ent add`'s
+`map=`: the vault, which red hasn't seen, reads like a missing map.
+
+
+SCENARIO 871 — A player can't change a macro a host wrote; macros a player wrote are marked
+---------------------------------------------------------------------------------------------
+
+!match new mo MO 6 6
+!match use mo
+!ent add hero Hero 20 1 1
+!ent add boss Boss 50 3 3
+!macro set heal "ent hp hero +5"
+!host access set macro all
+!as player alice
+!macro set heal "host add alice\nent hp boss 0"
+?? Macro `heal` was written by a host; only a host can change, rename or remove it.
+!macro rename heal heal2
+?? only a host can change, rename or remove it
+!macro remove heal
+?? only a host can change, rename or remove it
+!macro set mine "ent hp hero +1"
+!macro set mine "ent hp hero +2"
+?? Saved macro `mine`
+!macro list
+?? `mine` (by `alice`, not a host)
+!as host
+!macro show mine
+?? (by `alice`, not a host)
+!macro run heal
+!assert "entity[boss].hp == 50"
+!host list
+?! alice
+!macro set mine "ent hp hero +3"
+!macro list
+?! by `alice`
+
+Expected: HARNESS-ALLOWS-ERRORS. With macros opened to players, alice
+can't overwrite, rename or remove the host's `heal` (the host would run
+her lines with a host's reach under a name the host trusts); the
+host's run heals as written and alice stays a player. Her own macro is
+hers to rewrite, and `!macro list` / `!macro show` mark it as written by
+a non-host. Once the host rewrites it, the mark goes.
+
+
+SCENARIO 872 — Collecting a list one item at a time; move_entity to another map moves a driver's rig and refuses a passenger
+------------------------------------------------------------------------------------------------------------------------------
+
+!match new lb LB 60 60
+!match use lb
+!ent add u U 10 1 1
+!ent set_var u acts.actions.acc.target none
+!ent set_var u acts.actions.acc.body "cells = []\nfor x in range(1, args.n + 1):\n    for y in range(1, args.n + 1):\n        cells = cells + [[x, y]]\nentity[self].got = len(cells)"
+!action u acc n=60
+!assert "entity[u].got == 3600"
+!ent set_var u acts.actions.cp.target none
+!ent set_var u acts.actions.cp.body "l = range(100000)\nfor i in range(10000):\n    l = l + []\nentity[self].got = len(l)"
+!action u cp
+?? this formula built more than 1000000 list values
+!assert "entity[u].got == 3600"
+!map new deck 6 6
+!ent add cart Cart 10 4 4 map=main
+!ent set_var cart slots.seat.capacity 1
+!ent set_var cart slots.box.capacity 1
+!ent set_var cart slots.box.controls_movement true
+!ent add psg Psg 5 8 1 map=main
+!ent add drv Drv 5 9 1 map=main
+!mount psg cart seat
+!mount drv cart box
+!eval "move_entity('psg', [2, 2, 'deck'])"
+?? 'psg' is riding 'cart' in slot 'seat' and can't move on its own
+!assert "map_of('psg') == 'main'"
+!eval "move_entity('drv', [3, 3, 'deck'])"
+!assert "map_of('cart') == 'deck' and map_of('psg') == 'deck' and map_of('drv') == 'deck'"
+!assert "entity[cart].x == 3 and is_mounted('psg') and is_mounted('drv')"
+
+Expected: HARNESS-ALLOWS-ERRORS. The sandbox has no append, so an
+action collects cells with `cells = cells + [c]`. A list `+` is charged
+for the values it adds plus a hundredth of those it copies, so 3,600
+cells (a 60x60 area) collect fine, where charging each whole result
+stopped near 1,400 items. Copying a 100,000-item list ten thousand
+times still runs out of the budget, and the failed action changes
+nothing. `move_entity` to another map treats riders as `!ent tp` does:
+a passenger is refused and stays on `main`; a driver moves its cart to
+the deck with every rider aboard.
+
+
+SCENARIO 873 — Body fixes: group moves of glued parts, detach / locate carry what a unit carries, segments, attach refusals, one death per kill
+------------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new bf BF 12 12
+!match use bf
+!ent add body Body 20 2 2
+!part add body arm Arm 5 5
+!ent group new g
+!ent group add g arm
+!ent move group:g 1 right
+?? `arm` is a body part sitting on `body`'s body
+!ent group add g body
+!ent move group:g 1 right
+!assert "entity[body].x == 3 and entity[arm].x == 3"
+!ent add leg Leg 5 6 6
+!part add leg foot Foot 3 3
+!zone add aura 6 6
+!zone anchor aura leg 0
+!part attach body leg
+!part detach leg
+!assert "entity[foot].x == entity[leg].x and entity[foot].y == entity[leg].y"
+!assert "'aura' in zones_at(entity[leg].x, entity[leg].y)"
+!part attach body leg
+!part locate leg 9 9
+!assert "entity[foot].x == 9 and entity[foot].y == 9 and 'aura' in zones_at(9, 9)"
+!ent add head Head 10 10 2
+!part segment head s1 Seg 5 5
+!part glue s1
+?? `s1` is a snake segment and can't be glued
+!part region s1 front
+?? `s1` is a snake segment and can't be put on a region
+!part attach body head
+?? `head` is a snake head with segments
+!system set default mount_on_vehicle_death keep
+!ent add cart Cart 10 6 10
+!ent set_var cart slots.seat.capacity 1
+!ent add jo Jo 5 7 11
+!mount jo cart seat
+!ent kill cart
+!part attach body jo
+?? `jo` is riding `cart`; dismount it first.
+!system set default mount_on_vehicle_death eject
+!ent add boat Boat 10 1 10
+!ent set_var boat slots.seat.capacity 1
+!ent set_var boat mount_death_effect "revive('boat')"
+!ent add sailor Sailor 5 1 11
+!mount sailor boat seat
+!ent kill boat
+!log 5 type=death
+?? (showing 2 of 2 matching
+!assert "entity[boat].hp == 10"
+
+Expected: HARNESS-ALLOWS-ERRORS. A group move refuses a glued part
+whose body isn't in the group; with the body in the group the part
+rides along on the body. Detaching a leg that carries a foot (a glued
+part) and an aura moves them with it when it steps off its body, and
+locating it does the same. A snake segment can't be glued or put on a
+region, a snake head with segments can't become a part, and a rider
+kept aboard a corpse (under keep) is still a rider for `!part attach`.
+`!ent kill boat`, whose death effect revives the boat for its rider,
+kills it once (the log holds the cart's death and one of the boat's)
+and the revived boat stays.
+
+
+SCENARIO 874 — A backup restore that changes nothing is refused; a legacy-id unit leaves under a new id
+--------------------------------------------------------------------------------------------------------
+
+!match new bk BK 8 8
+!match new b2 B2 8 8
+!match use bk
+!system set default friendlyfire false
+!server backups systems
+?? systems.json 1 — 
+?? the systems as they are now
+!server backups restore 1
+?? Backup 1 holds the systems as they are now: there is nothing to restore
+!ent add tmp Tmp 5 2 2
+!ent add keep Keep 5 4 4
+?file replace matches/bk.json "\"tmp\"" "\"rider\""
+!as restart
+!match use bk
+!ent copy rider b2
+?? as `rider_2`
+!ent transfer rider b2 5 5
+?? as `rider_3`
+!match use b2
+!assert "entity[rider_2].hp == 5 and entity[rider_3].x == 5"
+
+Expected: HARNESS-ALLOWS-ERRORS. The newest dated copy of systems.json
+is the systems as they stand, and the listing says so; restoring it
+would change nothing and would answer that `!system undo` takes it
+back while undo then undid the edit before it, so it is refused. A unit
+whose id an older build allowed (`rider`, a formula binding now) loads
+and can be copied and transferred: the destination can't create the id,
+so it takes `rider_2` (then `rider_3`) as a collision does.

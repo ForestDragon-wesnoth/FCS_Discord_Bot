@@ -2265,3 +2265,45 @@ scenarios, 80 random image renders pixel-identical to the old renderer.
     dated copies of the critical server files (`!server backups`); L12
     became the `nested_vehicle_moves` rule and map var (default on, a map
     set off stops the chain).
+
+## Pass 45
+
+Third findings report from the separate read-only LLM pass (document 2.1,
+pass 24 on `b515036`: mount deaths, the document 2 fixes, server
+backups). Every finding was reproduced on current main before fixing;
+scenarios 867-874 cover them. Verified after: 874/874, replay
+differential REPLAYCOUNT, usage drift DRIFTCOUNT, a multi-tile smoke run (a 2x2
+dragon with a 2-wide howdah, a 2-wide leg detached and located).
+  - **U8:** a body part with seats escaped the mount-death rules: its
+    creature's death removed it through the despawn path (riders ejected
+    unharmed), and a part destroyed as a limb kept its riders aboard with
+    no rule run. Both now run `_mount_vehicle_died`.
+  - **W5 (and W4's / L9's residue):** refusals added for new input ran on
+    saved data: a formula clamp bound moved whole matches and templates to
+    `corrupt/`, a template's `map` var too; old numeric teams stayed
+    numbers. Loads now drop or move such data with a console note.
+  - **W2+:** a customized `default` lost with systems.json came back as the
+    registry's, unlocked, and the next commit saved the reset (units
+    renamed). `default` is now a stand-in that counts as lost.
+  - **V4+:** corpse action targets, `!ent revive`, the second unit of an
+    opened `!ent` subcommand and its `map=` skipped the view.
+  - **G4+:** a player with macro access could rewrite a host's macro, which
+    the host's next run executed with a host's reach.
+  - **X1++:** the list budget charged each `+` result whole, so collecting
+    items one at a time stopped near 1,400.
+  - **F20:** `move_entity` to another map moved a rider alone, still
+    mounted.
+  - **D7+:** a player's sweep posted a message per unit; now
+    `command_message_cap` per command.
+  - **L14:** group moves of glued parts, detach / locate leaving carried
+    parts and auras behind, segments glued, snake heads and corpse riders
+    attached, a double kill, a no-op backup restore, log copies filling the
+    quota (`server_backup_log_minutes`), legacy ids unable to leave a match.
+    Not changed: a unit attached as a part leaves its located parts where
+    they stand, as an ordinary teleport does (located parts keep their own
+    cells); a revert from a stash an older build wrote with a formula bound
+    is refused with a clean ❌ naming the clamp (the stash is GM data in a
+    var, indistinguishable from new input).
+  - Deferred to the CPU work budget (§8): X4+ (including the move-hook
+    case: a hook making two moves runs 2^depth hooks within
+    `move_hook_recursion_limit`), X5.
