@@ -53,7 +53,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from logic import (GameSystem, is_file_id, Match, MatchManager,
                    RULE_CEILINGS, VTTError, Workspaces, check_template,
-                   check_template_name, owner_limit, unreachable_id)
+                   check_template_name, legacy_template_fixes,
+                   LEGACY_IDS_OK, owner_limit, unreachable_id)
 from match_history import MatchHistory, HistoryError
 from journal import start_header
 
@@ -87,6 +88,8 @@ SYSTEM_BACKUP_KEY = "system_backup"
 BACKUP_DIR = "backups"
 BACKED_UP_FILES = ("systems.json", "workspace.json", "system_history.json",
                    "audit.json")
+# Of those, the logs (copied at most once per server_backup_log_minutes).
+BACKED_UP_LOGS = ("system_history.json", "audit.json")
 
 SERVER_LOGS: Dict[str, Tuple[str, str]] = {
     "syshist": ("system_history.json", "system_history"),
@@ -366,7 +369,14 @@ class Storage:
                 name = check_template_name(fname[:-5], legacy=True)
                 if name != fname[:-5]:
                     raise ValueError("file name isn't a template name")
-                data, _ = check_template(self._read_json(fpath), name)
+                raw = self._read_json(fpath)
+                for note in legacy_template_fixes(raw, name):
+                    print(f"⚠️ [{key}] {note}")
+                token = LEGACY_IDS_OK.set(True)
+                try:
+                    data, _ = check_template(raw, name)
+                finally:
+                    LEGACY_IDS_OK.reset(token)
             except Exception as ex:  # noqa: BLE001 - any bad file is quarantined
                 notes.append(self._quarantine(key, fpath, type(ex).__name__))
                 continue
@@ -606,7 +616,10 @@ class Storage:
                 mid = fname[:-5]
                 fpath = os.path.join(mdir, fname)
                 try:
-                    m, backup = self._load_match(mgr, mid, fpath)
+                    m, backup = self._load_match(
+                        mgr, mid, fpath,
+                        stand_in=sys_failed is not None
+                        or not os.path.exists(sys_path))
                     if isinstance(backup, dict):
                         backups[mid] = (os.path.getmtime(fpath), backup)
                 except Exception as ex:  # noqa: BLE001
@@ -658,11 +671,18 @@ class Storage:
         them has none, lock the server until an administrator recovers it
         (`!server recover`; MatchManager.recovery)."""
         key = mgr.guild_key
+        sys_path = os.path.join(self.server_dir(key), "systems.json")
+        # Without a systems.json that loaded, the server's `default` is the
+        # registry's fresh one, a stand-in for whatever the server had
+        # (most servers customize it): its matches lost their system too.
+        placeholders = set() if (sys_failed is None
+                                 and os.path.exists(sys_path)) \
+            else set(mgr.systems)
         lost = {mid: m.system_name for mid, m in mgr.matches.items()
-                if m.system_name not in mgr.systems}
+                if m.system_name not in mgr.systems
+                or m.system_name in placeholders}
         if not lost:
             return []
-        sys_path = os.path.join(self.server_dir(key), "systems.json")
         why = (f"systems.json failed to load ({sys_failed})" if sys_failed
                else "systems.json is missing (a failed load moves it to "
                     "corrupt/)" if not os.path.exists(sys_path)
@@ -675,7 +695,8 @@ class Storage:
             mgr.recovery = {"reason": why, "uncovered": uncovered,
                             "covered": {mid: lost[mid] for mid in covered},
                             "backups": {mid: backups[mid] for mid in covered},
-                            "pointers": pointers}
+                            "pointers": pointers,
+                            "placeholders": sorted(placeholders)}
             return [f"🔒 [{key}] {why}: match(es) "
                     + ", ".join(f"{mid} ({n})" for mid, n in
                                 sorted(uncovered.items()))
@@ -683,15 +704,19 @@ class Storage:
                     "server is locked (nothing runs or is saved) until an "
                     "administrator runs `!server recover`."]
         return self.rebuild_from_match_backups(
-            mgr, {mid: backups[mid] for mid in covered}, pointers, why)
+            mgr, {mid: backups[mid] for mid in covered}, pointers, why,
+            placeholders)
 
     @staticmethod
     def rebuild_from_match_backups(
             mgr: MatchManager,
             backups: Dict[str, Tuple[float, Dict[str, Any]]],
-            pointers: Dict[str, Any], why: str) -> List[str]:
+            pointers: Dict[str, Any], why: str,
+            placeholders: Any = ()) -> List[str]:
         """Add the systems the matches' backups hold that the server lacks
-        (the newest file's copy wins a name two backups hold), point the
+        or holds only as `placeholders` (the registry's fresh `default` a
+        failed load builds; the newest file's copy wins a name two backups
+        hold), point the
         default pointers back where they were, and re-apply rules to those
         matches. Returns notes."""
         key = mgr.guild_key
@@ -702,7 +727,7 @@ class Storage:
                     found[name] = (mtime, d)
         added = []
         for name in sorted(found):
-            if name not in mgr.systems:
+            if name not in mgr.systems or name in placeholders:
                 mgr.systems[name] = GameSystem.from_dict(found[name][1])
                 added.append(name)
         notes = [f"♻️ [{key}] {why}: rebuilt system(s) "
@@ -723,8 +748,8 @@ class Storage:
                           for n in mgr.apply_system_rules(m)]
         return notes
 
-    def _load_match(self, mgr: MatchManager, mid: str, path: str
-                    ) -> Tuple[Match, Any]:
+    def _load_match(self, mgr: MatchManager, mid: str, path: str,
+                    stand_in: bool = False) -> Tuple[Match, Any]:
         if not valid_id(mid):
             raise ValueError("bad match id")
         raw = self._read_json(path)
@@ -740,8 +765,9 @@ class Storage:
         # A match whose system wasn't loaded keeps its name and units as
         # they are: _settle_lost_systems rebuilds the system or locks the
         # server (renaming its vars to another system's names would be
-        # saved over the good file).
-        if m.system_name in mgr.systems:
+        # saved over the good file). `stand_in`: systems.json didn't load,
+        # so even `default` is the registry's stand-in.
+        if m.system_name in mgr.systems and not stand_in:
             for note in mgr.apply_system_rules(m):
                 print(f"[storage] {mgr.guild_key}/{m.id}: {note}")
         return m, backup
@@ -850,7 +876,7 @@ class Storage:
         if owner_limit("server_backup_days") > 0:
             for fname in BACKED_UP_FILES:
                 text = plan.get(os.path.join(sdir, fname))
-                if text is not None:
+                if text is not None and not self._log_copy_recent(key, fname):
                     plan[self._new_backup_path(key, fname)] = text
         for mid, m in mgr.matches.items():
             text = self._match_text(mgr, m)
@@ -923,6 +949,18 @@ class Storage:
             if not os.path.exists(path):
                 return path
             stamp += 1
+
+    def _log_copy_recent(self, key: str, fname: str) -> bool:
+        """Whether log file `fname` (BACKED_UP_LOGS) has a copy newer than
+        server_backup_log_minutes: the logs grow with each edit and are
+        copied whole, so a copy per change filled the server's quota."""
+        if fname not in BACKED_UP_LOGS:
+            return False
+        minutes = owner_limit("server_backup_log_minutes")
+        if minutes <= 0:
+            return False
+        newest = self.backups(key, fname)
+        return bool(newest) and time.time() - newest[0][0] < minutes * 60
 
     def backups(self, key: str, fname: Optional[str] = None
                 ) -> List[Tuple[float, str, str]]:

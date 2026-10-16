@@ -178,7 +178,11 @@ async def _parse_and_run_single_line(ctx, line: str, mgr, known_roots) -> bool:
 
         args = parts[1:]
         _dbg(ctx, batch_exec_line=line, parsed_root=root, parsed_args=args)
-        await registry.run(root, args, DiscordCtxWrapper(ctx, mgr), mgr)
+        wrapper = DiscordCtxWrapper(ctx, mgr)
+        try:
+            await registry.run(root, args, wrapper, mgr)
+        finally:
+            await wrapper.flush_dropped()
         return True
     except ValueError as e:
         _dbg(ctx, batch_parse_error=str(e), line=line)
@@ -247,21 +251,25 @@ class DiscordCtxWrapper:
         # guild Administrator permission — see vtt_commands.ctx_is_admin.
         self.is_admin = _is_guild_admin(author)
         self.is_bot_owner = _is_bot_owner(author, mgr)
-    def _reply_cap(self) -> int:
-        """The reply_message_cap rule of this channel's match (else of the
-        server's default system)."""
+        self._sent = 0
+        self._dropped = 0
+
+    def _reply_cap(self, rule: str = "reply_message_cap",
+                   default: int = 8) -> int:
+        """A message-cap rule of this channel's match (else of the server's
+        default system)."""
         mgr = self._mgr
         try:
             mid = mgr.get_active_for_channel(self.channel_key) if mgr else None
             m = mgr.matches.get(mid) if mid else None
             if m is not None:
-                return max(1, int(m.rules.get("reply_message_cap", 8)))
+                return max(1, int(m.rules.get(rule, default)))
             s = mgr.systems.get(mgr.default_system_name) if mgr else None
             if s is not None:
-                return max(1, int(mgr.system_value(s, "reply_message_cap")))
+                return max(1, int(mgr.system_value(s, rule)))
         except Exception:
             pass
-        return 8
+        return default
 
     async def send(self, message: str):
         # Split over-long output at line boundaries so we never trip
@@ -278,8 +286,24 @@ class DiscordCtxWrapper:
                 f"✂️ … {cut} more characters left out (reply_message_cap "
                 f"{cap}): narrow the command (a viewport, a page, fewer "
                 f"dice)."]
+        # And one command at most command_message_cap messages in all (a
+        # sweep, batch or macro posts one reply per line): the rest are
+        # counted and named in one note, sent once the command ends.
+        total = self._reply_cap("command_message_cap", 20)
         for chunk in chunks:
+            if self._sent >= total:
+                self._dropped += 1
+                continue
+            self._sent += 1
             await self._ctx.send(chunk)
+
+    async def flush_dropped(self) -> None:
+        """The note for the messages command_message_cap left out."""
+        if self._dropped:
+            n, self._dropped = self._dropped, 0
+            await self._ctx.send(
+                f"✂️ … {n} more message(s) of this command left out "
+                f"(command_message_cap {self._reply_cap('command_message_cap', 20)}).")
 
     async def set_autoupdate(self, m, on: bool) -> str:
         """Turn this channel's self-refreshing map board on/off. Posts the
@@ -439,6 +463,8 @@ class _InteractionCtx(DiscordCtxWrapper):
             or self.user_id
         )
         self.cli_mutable = False
+        self._sent = 0
+        self._dropped = 0
 
 
 class _ApprovalView(discord.ui.View):
@@ -530,7 +556,10 @@ class _ApprovalView(discord.ui.View):
         # Re-dispatch against the request's OWN match and channel, not whatever
         # is active where the button was clicked — and without permanently
         # re-pointing that channel (see vtt_commands.run_approved_request).
-        await run_approved_request(req, ictx, self._mgr)
+        try:
+            await run_approved_request(req, ictx, self._mgr)
+        finally:
+            await ictx.flush_dropped()
         if _boards:
             mid = req.get("match_id") or \
                 self._mgr.get_active_for_channel(ictx.channel_key)
@@ -630,6 +659,7 @@ class _ResumeView(discord.ui.View):
                     await registry.run("match", ["resume"], ictx, self._mgr)
         finally:
             vtt_commands._RUN_DEPTH.reset(depth)
+            await ictx.flush_dropped()
         if _boards:
             await _refresh_boards_for_match(self._mgr, self._mid)
         await self._disable(interaction)
@@ -1142,7 +1172,10 @@ def wire_commands(bot: commands.Bot, workspaces: Workspaces):
         _dbg(ctx, final_args=args)
         await _dbg_chat(ctx, f"root={bound_root} args={args}")
         wrapper = DiscordCtxWrapper(ctx, mgr)
-        await registry.run(bound_root, args, wrapper, mgr)
+        try:
+            await registry.run(bound_root, args, wrapper, mgr)
+        finally:
+            await wrapper.flush_dropped()
         # Auto-update boards (#24): after any command settles, re-render the
         # boards bound to this channel's active match (so a move/spawn/death
         # in one channel updates every channel watching the same match).

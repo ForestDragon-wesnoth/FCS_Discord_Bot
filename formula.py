@@ -4329,6 +4329,23 @@ class FormulaEngine:
                         f"{value_cap} list values (10 x formula_size_limit).")
             return v
 
+        # A list `+` is charged for the values it adds plus a hundredth of
+        # those it copies: collecting items one at a time (`l = l + [x]`,
+        # the sandbox has no append) costs about n + n^2/200 for n items,
+        # where charging every result in full stopped near 1,400 items,
+        # and copying a huge list over and over still runs out.
+        def _charge_add(a: Any, b: Any) -> Any:
+            r = _safe_add(a, b, size_limit)
+            if isinstance(r, list):
+                added = len(b) if isinstance(b, list) else len(r)
+                kept = len(a) if isinstance(a, list) else 0
+                built[0] += added + kept // 100
+                if built[0] > value_cap:
+                    raise FormulaError(
+                        f"+(...): this formula built more than {value_cap} "
+                        f"list values (10 x formula_size_limit).")
+            return r
+
         ns: Dict[str, Any] = {
             "__builtins__": {},
             "__read":  lambda who, path:        self._read(who, path, ctx),
@@ -4343,8 +4360,7 @@ class FormulaEngine:
             "__safe_pow": _safe_pow,
             "__safe_mul": lambda a, b: _charge(_safe_mul(a, b, size_limit),
                                                "*"),
-            "__safe_add": lambda a, b: _charge(_safe_add(a, b, size_limit),
-                                               "+"),
+            "__safe_add": _charge_add,
             "__safe_mod": _safe_mod,
             "cells_in_burst": lambda *a, **k: _cells_in_burst(*a, limit=cell_limit, bounds=_grid(), **k),
             "cells_in_line": lambda *a, **k: _cells_in_line(*a, limit=cell_limit, bounds=_grid(), **k),
@@ -4689,6 +4705,9 @@ class FormulaEngine:
                 )
             if dest is not None and dest.name != e.map:
                 try:
+                    # As `!ent tp` does: a passenger is refused and a
+                    # driver moves its vehicle (the rig, riders and all).
+                    e = e._mount_move_redirect() if e.is_mounted else e
                     match.surface_log(match.move_to_map(e, x, y, dest.name))
                 except VTTError as ex:
                     raise FormulaError(f"move_entity: {ex}")

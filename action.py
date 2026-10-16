@@ -794,6 +794,7 @@ def parse_target(
     target_type: str, tokens: List[str], match: "Match",
     actor: Optional[str] = None,
     missing: Optional[Any] = None,
+    missing_corpse: Optional[Any] = None,
 ) -> Tuple[Any, List[str]]:
     """Consume the leading tokens that constitute the target and
     return `(target_value, remaining_tokens)`. The remaining tokens
@@ -821,6 +822,13 @@ def parse_target(
             missing(eid, token)
         elif eid not in match.entities:
             raise NotFound(f"Entity '{eid}' not found.")
+
+    # `missing_corpse(cid)`: the same for a corpse (one the view hides).
+    def check_corpse(cid: str) -> None:
+        if missing_corpse is not None:
+            missing_corpse(cid)
+        elif match.find_corpse(cid) is None:
+            raise NotFound(f"No corpse with id '{cid}'.")
     if target_type == "none":
         return None, list(tokens)
     if target_type == "entity":
@@ -873,15 +881,13 @@ def parse_target(
         if not tokens:
             raise VTTError("expected a corpse id after the action name.")
         cid = tokens[0]
-        if match.find_corpse(cid) is None:
-            raise NotFound(f"No corpse with id '{cid}'.")
+        check_corpse(cid)
         return cid, list(tokens[1:])
     if target_type == "corpse_list":
         cids: List[str] = []
         i = 0
         while i < len(tokens) and "=" not in tokens[i]:
-            if match.find_corpse(tokens[i]) is None:
-                raise NotFound(f"No corpse with id '{tokens[i]}'.")
+            check_corpse(tokens[i])
             cids.append(tokens[i])
             i += 1
         if not cids:

@@ -2549,8 +2549,9 @@ def _resolve_maps(ctx: ReplyContext, m: "Match", spec: Optional[str], *,
     included (a host who forgot it would edit the wrong map); `map=view`
     names the channel's map on purpose. A read (not `strict`: host-only
     edits state the facts) under a team view names only the maps that team
-    may name (`pov`, default the channel's view; unseen_map_display)."""
-    if strict:
+    may name (`pov`, default the channel's view; unseen_map_display), and
+    so does an edit a non-host runs (a subcommand an override opened)."""
+    if strict and _acts_as_host(ctx, m):
         pov = None
     elif pov is _NO_POV:
         pov = _view_pov(ctx, m, [])
@@ -4291,7 +4292,7 @@ async def _server_recover(ctx: ReplyContext, args: List[str],
         if rec.get("backups"):
             notes += st.rebuild_from_match_backups(
                 mgr, rec["backups"], rec.get("pointers") or {},
-                rec.get("reason", ""))
+                rec.get("reason", ""), set(rec.get("placeholders") or ()))
         for mid in sorted(uncovered):
             m = mgr.matches.get(mid)
             if m is None:
@@ -4356,6 +4357,14 @@ def _restore_systems(mgr: MatchManager, systems: Dict[str, GameSystem],
     return notes
 
 
+def _same_systems(mgr: MatchManager, systems: Dict[str, GameSystem]) -> bool:
+    """Whether `systems` are the server's systems as they stand."""
+    def text(d: Dict[str, GameSystem]) -> str:
+        return json.dumps({n: s.to_dict() for n, s in d.items()},
+                          sort_keys=True, default=str)
+    return text(systems) == text(mgr.systems)
+
+
 def _systems_copy(st: Any, mgr: MatchManager, n: int) -> Tuple[float, str]:
     """The n-th newest dated copy of systems.json: (time, path)."""
     copies = st.backups(mgr.guild_key, "systems.json") if st else []
@@ -4393,6 +4402,10 @@ async def _server_backups(ctx: ReplyContext, args: List[str],
             raise VTTError(f"Backup {n} can't be read "
                            f"({type(ex).__name__}).")
         systems = _systems_from_raw(raw, f"Backup {n}")
+        if _same_systems(mgr, systems):
+            raise VTTError(f"Backup {n} holds the systems as they are now: "
+                           f"there is nothing to restore (`!server backups "
+                           f"systems` marks such copies).")
         notes = _restore_systems(mgr, systems,
                                  f"restore backup {n}")
         audit_note(f"restored systems.json from the copy of "
@@ -4425,8 +4438,17 @@ async def _server_backups(ctx: ReplyContext, args: List[str],
     lines = ["**Server file backups** (newest first per file; "
              "`!server backups restore <n>` restores systems.json copy n):"]
     for i, (stamp, name, path) in shown[:_BACKUP_ROWS]:
+        now = ""
+        if name == "systems.json":
+            try:
+                with open(path, encoding="utf-8") as f:
+                    if _same_systems(mgr, _systems_from_raw(
+                            json.load(f), "copy")):
+                        now = " — the systems as they are now"
+            except (OSError, ValueError, VTTError):
+                pass
         lines.append(f"{name} {i} — {_backup_when(stamp)} "
-                     f"({fmt_bytes(os.path.getsize(path))})")
+                     f"({fmt_bytes(os.path.getsize(path))}){now}")
     if len(shown) > _BACKUP_ROWS:
         lines.append(f"… and {len(shown) - _BACKUP_ROWS} older.")
     return await ctx.send("\n".join(lines))
@@ -8097,10 +8119,20 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     # A non-host (a subcommand an override opened to players) names units
     # through the channel's view: a hidden unit reads like a missing one,
     # in the two-sided wording, so the reply can't tell them apart.
-    if (sub not in ("add", "revive") and len(args) >= 2
+    if (sub != "add" and len(args) >= 2
             and not _acts_as_host(ctx, m) and _query_pov(ctx, m) is not None):
-        _query_eid(ctx, m, args[1])
-        if sub == "swap" and len(args) >= 3:
+        if sub == "revive":
+            _query_corpse(ctx, m, args[1])
+        else:
+            _query_eid(ctx, m, args[1])
+        # The second unit a subcommand names (a transform's form is a var
+        # path on the unit when one holds a dict there, else a unit).
+        if len(args) >= 3 and (
+                sub in ("swap", "diff", "store_entity_into_var",
+                        "store_entity")
+                or (sub == "transform" and not isinstance(
+                    _var_at(m.entities[_resolve_eid(m, args[1])].vars,
+                            args[2]), dict))):
             _query_eid(ctx, m, args[2])
     # An action's body runs its cmd() lines with no gate, so only a host
     # writes one: a player who may write vars (a note-keeping override)
@@ -9850,6 +9882,33 @@ def _query_eid(ctx: ReplyContext, m: "Match", token: str) -> str:
                 f"to view it.")
         raise NotFound(f"Entity '{token}' not found.")
     return eid
+
+
+def _var_at(node: Any, path: str) -> Any:
+    """The value at dotted `path` under `node`, or None."""
+    for key in str(path).split("."):
+        if not isinstance(node, dict) or key not in node:
+            return None
+        node = node[key]
+    return node
+
+
+def _query_corpse(ctx: ReplyContext, m: "Match", cid: str
+                  ) -> Tuple[int, int, Dict[str, Any], Any]:
+    """Find corpse `cid` for a query or a target, treating one the
+    channel's view can't see exactly like a missing one (the two-sided
+    wording under a team view)."""
+    loc = m.find_corpse(cid)
+    pov = _query_pov(ctx, m)
+    if loc is None or (pov is not None and not m.corpse_visible_to(
+            cid, loc[2], loc[0], loc[1], pov, loc[3])):
+        if pov is not None:
+            raise NotFound(
+                f"Could not find a corpse named `{cid}`. Either it does not "
+                f"exist, or this channel currently does not have permission "
+                f"to view it.")
+        raise NotFound(f"No corpse with id '{cid}'.")
+    return loc
 
 
 _MAP_LAYERS = MAP_LAYERS
@@ -18044,6 +18103,27 @@ def _set_macro_author(m: "Match", name: str, ctx: ReplyContext) -> None:
         m.macro_authors[name] = str(user)
 
 
+def _check_macro_owner(m: "Match", name: str, ctx: ReplyContext) -> None:
+    """A non-host may not replace, rename or remove a macro a host wrote
+    (or one with no recorded author): the host would run the player's
+    lines with a host's reach, under a name the host trusts."""
+    if name not in m.macros or _acts_as_host(ctx, m):
+        return
+    author = m.macro_authors.get(name)
+    if author is None or m.is_host(author):
+        raise VTTError(f"Macro `{name}` was written by a host; only a host "
+                       f"can change, rename or remove it.")
+
+
+def _macro_author_text(m: "Match", name: str) -> str:
+    """` (by <player>)` for a macro a non-host wrote: a host running it runs
+    that player's lines."""
+    author = m.macro_authors.get(name)
+    if author is None or m.is_host(author):
+        return ""
+    return f" (by {_mention(author)}, not a host)"
+
+
 @registry.command(
     "macro",
     raw_args=True,
@@ -18079,6 +18159,8 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 3, "macro", sub):
             return
         _check_tail(args, 3, (), f"!macro {sub} <name> <new_name>")
+        if sub == "rename":
+            _check_macro_owner(m, args[1], ctx)
         if sub == "copy":
             _copy_entry(m.macros, args[1], args[2], "macro")
             _set_macro_author(m, args[2], ctx)
@@ -18103,6 +18185,7 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             _parse_macro(body)
         except _MacroError as ex:
             return await ctx.send(f"❌ macro structure error: {ex}")
+        _check_macro_owner(m, name, ctx)
         m.macros[name] = body
         _set_macro_author(m, name, ctx)
         n = len([l for l in body.split("\n") if l.strip()])
@@ -18160,7 +18243,8 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if sub == "list":
         if not m.macros:
             return await ctx.send("No macros defined.")
-        return await ctx.send("Macros: " + ", ".join(f"`{n}`" for n in sorted(m.macros)))
+        return await ctx.send("Macros: " + ", ".join(
+            f"`{n}`{_macro_author_text(m, n)}" for n in sorted(m.macros)))
 
     if sub == "show":
         if await return_help_if_not_enough_args(ctx, args, 2, "macro", "show"):
@@ -18168,12 +18252,14 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         name = args[1]
         if name not in m.macros:
             return await ctx.send(f"❌ no macro `{name}`.")
-        return await ctx.send(f"**macro `{name}`**\n```\n{m.macros[name]}\n```")
+        return await ctx.send(f"**macro `{name}`**{_macro_author_text(m, name)}"
+                              f"\n```\n{m.macros[name]}\n```")
 
     if sub in ("remove", "del", "rm"):
         if await return_help_if_not_enough_args(ctx, args, 2, "macro", "remove"):
             return
         name = args[1]
+        _check_macro_owner(m, name, ctx)
         if m.macros.pop(name, None) is None:
             return await ctx.send(f"❌ no macro `{name}`.")
         m.macro_authors.pop(name, None)
@@ -19114,8 +19200,11 @@ async def _run_action_dispatch(
             # A unit the view hides reads like a missing one.
             if eid not in m.entities or _pov_hides(m, _query_pov(ctx, m), eid):
                 _query_eid(ctx, m, token)
+        def missing_corpse(cid: str) -> None:
+            _query_corpse(ctx, m, cid)
         target_value, remaining = parse_target(
             action.target_type, pruned, m, actor_id, missing=missing,
+            missing_corpse=missing_corpse,
         )
         args_dict = parse_args_tokens(remaining)
     except VTTError as ex:
