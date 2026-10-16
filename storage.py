@@ -53,7 +53,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from logic import (GameSystem, is_file_id, Match, MatchManager,
                    RULE_CEILINGS, VTTError, Workspaces, check_template,
-                   check_template_name)
+                   check_template_name, unreachable_id)
 from match_history import MatchHistory
 
 MB = 1024 * 1024
@@ -352,7 +352,7 @@ class Storage:
                 continue
             fpath = os.path.join(tdir, fname)
             try:
-                name = check_template_name(fname[:-5])
+                name = check_template_name(fname[:-5], legacy=True)
                 if name != fname[:-5]:
                     raise ValueError("file name isn't a template name")
                 data, _ = check_template(self._read_json(fpath), name)
@@ -622,6 +622,10 @@ class Storage:
         m = Match.from_dict(self._read_json(path))
         if m.id != mid:
             raise ValueError("id doesn't match the file name")
+        for eid in sorted(e for e in m.entities if unreachable_id(e)):
+            print(f"[storage] {mgr.guild_key}/{m.id}: unit `{eid}` has an id "
+                  f"a formula reads as a binding or keyword; reach it with "
+                  f"entity['{eid}'] (new units can't take the id).")
         if m.system_name not in mgr.systems:
             m.system_name = mgr.default_system_name
         for note in mgr.apply_system_rules(m):

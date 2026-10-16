@@ -53,6 +53,18 @@ CROSS_MATCH_GUARD: "contextvars.ContextVar[Optional[Any]]" = (
 # (a formula with no channel refuses `view`).
 COMMAND_VIEW: "contextvars.ContextVar[Optional[Any]]" = (
     contextvars.ContextVar("vtt_command_view", default=None))
+# The team view of the running command's channel, as a function of a Match
+# (None: omniscient). Refusals that list a match's maps name only the maps
+# that view may name (Match.maps_text). None outside a command.
+COMMAND_POV: "contextvars.ContextVar[Optional[Any]]" = (
+    contextvars.ContextVar("vtt_command_pov", default=None))
+# Set while saved units are read back (a match file, an undo snapshot, a
+# save, a corpse revived): an id that names a formula binding (`target`,
+# `rider`, ...) is refused only where a unit is CREATED, so data saved
+# before a binding got its name still loads (the unit stays reachable as
+# entity['target']).
+LEGACY_IDS_OK: "contextvars.ContextVar[bool]" = (
+    contextvars.ContextVar("vtt_legacy_ids", default=False))
 
 # A line about one unit (a death, a revive) is prefixed with this tag —
 # UNIT_LINE_TAG + "<match>|<unit>|<x>|<y>|<map>" + UNIT_LINE_TAG — so the command
@@ -5560,7 +5572,7 @@ class Entity:
         # Disallow reserved ids that the CLI uses as shorthands (current/this are used if you want to get the id of the entity whose turn it is right now)
         if tested_id in RESERVED_IDS:
             raise ReservedId(f"Entity id '{tested_id}' is a special reserved id and cannot be used when creating entities. Reserved ids are used for formulas and commands, like 'this' being used to automatically get the id of the entity whose turn it is.")
-        if unreachable_id(self.id.strip()):
+        if unreachable_id(self.id.strip()) and not LEGACY_IDS_OK.get():
             raise ReservedId(
                 f"Entity id '{self.id.strip()}' names a formula binding or "
                 f"keyword, so `entity[{self.id.strip()}]` couldn't reach the "
@@ -7638,6 +7650,14 @@ class Match:
     # destination opts in). Saved with the match; a deleted match leaves
     # every list.
     links: List[str] = field(default_factory=list)
+    # The identity (`uid`) each linked match had when it was linked: a link
+    # trusts that match only, never a later one under the same id (an undo
+    # or a replay brings back a link the id no longer deserves). A link
+    # saved before stamps existed has none and trusts the id.
+    link_stamps: Dict[str, str] = field(default_factory=dict)
+    # This match's own identity, made at creation (a clone gets a new one);
+    # what links stamp.
+    uid: str = field(default_factory=lambda: new_rng_seed())
 
     # Per-match host overrides for the command access gate, keyed by
     # command name or "name sub" -> level ("all"/"host"/"host_only"/
@@ -7698,6 +7718,11 @@ class Match:
     # run <name> [args...]`, which substitutes $1/$2/.../$@ and dispatches
     # each line under one undo entry. Per-match; serialized.
     macros: Dict[str, str] = field(default_factory=dict)
+    # Who last wrote each macro's body (`!macro set` / copy; the user id).
+    # A body a non-host wrote runs with every line gated as the runner,
+    # like a typed `!batch`; a host's (or one with no record) runs as
+    # written.
+    macro_authors: Dict[str, str] = field(default_factory=dict)
 
     # ---- named random tables ----
     # name -> a roll_table spec ("key:weight,..." CSV). Rolled by name via the
@@ -7922,10 +7947,8 @@ class Match:
         if name is None:
             if len(self.maps) == 1:
                 return next(iter(self.maps.values()))
-            names = ", ".join(f"`{n}`" for n in self.maps)
-            raise VTTError(
-                f"This match has {len(self.maps)} maps ({names}): name one "
-                f"with `map=<name>`.")
+            raise VTTError(f"{self.maps_text()}: name one with "
+                           f"`map=<name>`.")
         mp = self.maps.get(name)
         if mp is None:
             raise NotFound(
@@ -8130,6 +8153,18 @@ class Match:
                                       "Unexplored map"))
         return f"`{mp.name}`"
 
+    def maps_text(self, pov: Any = ...) -> str:
+        """"This match has N maps (`a`, `b`, Unexplored map)" as team `pov`
+        may know them (the running command's channel view by default):
+        hidden maps aren't counted, unnamed ones show the unnamed label."""
+        if pov is ...:
+            fn = COMMAND_POV.get()
+            pov = fn(self) if fn is not None else None
+        listed = self.listed_maps(pov)
+        names = ", ".join(self.map_label(mp, pov) for mp in listed)
+        return (f"This match has {len(listed)} "
+                f"map{'' if len(listed) == 1 else 's'} ({names})")
+
     def map_heading(self, mp: "Map", pov: Optional[str]) -> str:
         """A board's map title for team `pov`: "map `cave` (2 of 3)", the
         unnamed label for a map it may not name, counted among the maps it
@@ -8318,10 +8353,10 @@ class Match:
             kept = corpse.get("maps")
             if isinstance(kept, list) and name in kept:
                 corpse["maps"] = [k for k in kept if k != name]
-        gone = sorted(before - set(self.maps) - {name})
-        if gone:
-            log.append("Destroyed with it: " + ", ".join(
-                f"map `{n}`" for n in gone) + ".")
+        # Tagged with the gone map: only an unfiltered view reads it.
+        for n in sorted(before - set(self.maps) - {name}):
+            log.append(f"{UNIT_LINE_TAG}{self.id}||0|0|{n}{UNIT_LINE_TAG}"
+                       f"Destroyed with it: map `{n}`.")
         return log
 
     def _maps_lost_with(self, name: str) -> Set[str]:
@@ -8755,7 +8790,12 @@ class Match:
             if loc is None or loc[3] is not mp:
                 continue
             x, y, corpse, _ = loc
-            body = Entity.from_dict(copy.deepcopy(corpse.get("entity") or {}))
+            token = LEGACY_IDS_OK.set(True)
+            try:
+                body = Entity.from_dict(copy.deepcopy(corpse.get("entity")
+                                                      or {}))
+            finally:
+                LEGACY_IDS_OK.reset(token)
             spot = self._eject_spot(body, outer, box, block_mode=None)
             cell = mp.tiles.get((x, y), {})
             del cell["corpses"][cid]
@@ -8764,9 +8804,12 @@ class Match:
             if not cell:
                 mp.tiles.pop((x, y), None)
             if spot is None:
-                log.append(f"⚠️ No cell of map `{outer.name}` could take the "
-                           f"corpse of `{cid}`; it is lost with map "
-                           f"`{mp.name}`.")
+                # Tagged with the corpse's cell on the dying map: a view
+                # that couldn't see it there doesn't learn of it.
+                log.append(f"{UNIT_LINE_TAG}{self.id}|{cid}|{x}|{y}|"
+                           f"{mp.name}{UNIT_LINE_TAG}⚠️ No cell of map "
+                           f"`{outer.name}` could take the corpse of `{cid}`; "
+                           f"it is lost with map `{mp.name}`.")
                 continue
             dx, dy = spot[0] - x, spot[1] - y
             for d in [corpse.get("entity")] + list(corpse.get("parts") or []):
@@ -8810,8 +8853,11 @@ class Match:
                     and len(self.maps) > 1
                     and not self.units_on_map(mp.name)):
                 self.delete_map(mp.name)
-                log.append(f"Map `{mp.name}` was deleted: nobody is left on "
-                           f"it (__delete_when_empty).")
+                # Tagged with the gone map, so only an unfiltered view (a
+                # host's) reads it: a team view may not have known the map.
+                log.append(f"{UNIT_LINE_TAG}{self.id}||0|0|{mp.name}"
+                           f"{UNIT_LINE_TAG}Map `{mp.name}` was deleted: "
+                           f"nobody is left on it (__delete_when_empty).")
         return log
 
     def map_of(self, e: "Entity") -> "Map":
@@ -16818,6 +16864,16 @@ class Match:
         return out
 
     def revive_corpse(self, eid: str) -> Tuple[str, List[str]]:
+        """Resurrect the corpse keyed by `eid` (see _revive_corpse). Its
+        unit existed, so an id a later formula binding took still comes
+        back (LEGACY_IDS_OK)."""
+        token = LEGACY_IDS_OK.set(True)
+        try:
+            return self._revive_corpse(eid)
+        finally:
+            LEGACY_IDS_OK.reset(token)
+
+    def _revive_corpse(self, eid: str) -> Tuple[str, List[str]]:
         """Resurrect the corpse keyed by `eid`: spawn an entity from
         the stored dict at the corpse's TILE position, remove the
         corpse, run the `default_revive_function_effects` formula on
@@ -18347,6 +18403,7 @@ class Match:
             },
             "aliases": dict(self.aliases),
             "macros": dict(self.macros),
+            "macro_authors": dict(self.macro_authors),
             "tables": dict(self.tables),
             "template_pins": copy.deepcopy(self.template_pins),
             "watchers": copy.deepcopy(self.watchers),
@@ -18362,6 +18419,8 @@ class Match:
             "owner": self.owner,
             "cohosts": list(self.cohosts),
             "links": list(self.links),
+            "link_stamps": dict(self.link_stamps),
+            "uid": self.uid,
             "access_overrides": dict(self.access_overrides),
             "bound_channels": copy.deepcopy(self.bound_channels),
             "team_colors": dict(self.team_colors),
@@ -18389,6 +18448,14 @@ class Match:
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "Match":
+        token = LEGACY_IDS_OK.set(True)
+        try:
+            return Match._from_dict(d)
+        finally:
+            LEGACY_IDS_OK.reset(token)
+
+    @staticmethod
+    def _from_dict(d: Dict[str, Any]) -> "Match":
         raw_maps = d.get("maps") or {}
         order = [str(n) for n in (d.get("map_order") or []) if n in raw_maps]
         order += [str(n) for n in raw_maps if str(n) not in order]
@@ -18516,6 +18583,10 @@ class Match:
             str(k): str(v) for k, v in raw_macros.items()
             if isinstance(k, str) and isinstance(v, str)
         }
+        raw_ma = d.get("macro_authors")
+        m.macro_authors = ({str(k): str(v) for k, v in raw_ma.items()
+                            if k in m.macros and isinstance(v, str)}
+                           if isinstance(raw_ma, dict) else {})
         raw_tables = d.get("tables", {}) or {}
         m.tables = {
             str(k): str(v) for k, v in raw_tables.items()
@@ -18570,6 +18641,12 @@ class Match:
         raw_links = d.get("links", [])
         m.links = ([c for c in raw_links if isinstance(c, str)]
                    if isinstance(raw_links, list) else [])
+        raw_stamps = d.get("link_stamps")
+        m.link_stamps = ({str(k): str(v) for k, v in raw_stamps.items()
+                          if k in m.links and isinstance(v, str)}
+                         if isinstance(raw_stamps, dict) else {})
+        if isinstance(d.get("uid"), str) and d["uid"]:
+            m.uid = d["uid"]
         raw_acc = d.get("access_overrides", {})
         m.access_overrides = {
             k: str(v) for k, v in raw_acc.items()
@@ -20357,13 +20434,15 @@ _TEMPLATE_IDENTITY_KEYS = ("id", "x", "y", "map", "part_of", "mounted_on",
                            "mount_slot")
 
 
-def check_template_name(name: Any) -> str:
+def check_template_name(name: Any, legacy: bool = False) -> str:
     """A template name, lower-cased: it names the file and is the id spawned
     units take (`guardsman`, `guardsman2`, ...), so it follows the id rule;
-    lower-case so two names can't differ only by case (one file on Windows)."""
+    lower-case so two names can't differ only by case (one file on Windows).
+    `legacy` (a file read back) lets a name that a later formula binding
+    took through: spawns mint the next free id from it."""
     n = str(name).strip().lower()
     check_id("template name", n)
-    if n in RESERVED_IDS or unreachable_id(n):
+    if n in RESERVED_IDS or (unreachable_id(n) and not legacy):
         raise VTTError(f"`{n}` is a reserved name and can't name a template.")
     return n
 
@@ -21959,8 +22038,19 @@ class MatchManager:
         # Its own dice: a copy rolling the original's numbers would let one
         # table read the other's future.
         m.set_rng(new_rng_seed())
+        # Another match: links to the source don't trust the copy.
+        m.uid = new_rng_seed()
         self.matches[m.id] = m
         return m
+
+    def link_trusts(self, dest: "Match", sender: "Match") -> bool:
+        """Whether `dest` accepts units sent by `sender`: it links the
+        sender's id, and the link's stamp (when it has one) is this very
+        match, not another made later under the id."""
+        if sender.id not in dest.links:
+            return False
+        stamp = dest.link_stamps.get(sender.id)
+        return stamp is None or stamp == sender.uid
 
     def delete_match(self, match_id: str):
         if match_id not in self.matches:
@@ -21971,6 +22061,7 @@ class MatchManager:
         for other in self.matches.values():
             if match_id in other.links:
                 other.links.remove(match_id)
+            other.link_stamps.pop(match_id, None)
         # clean up any actives
         to_remove = [ch for ch, mid in self.active_by_channel.items() if mid == match_id]
         for ch in to_remove:

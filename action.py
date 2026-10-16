@@ -787,6 +787,7 @@ def parse_args_tokens(tokens: List[str]) -> Dict[str, Any]:
 def parse_target(
     target_type: str, tokens: List[str], match: "Match",
     actor: Optional[str] = None,
+    missing: Optional[Any] = None,
 ) -> Tuple[Any, List[str]]:
     """Consume the leading tokens that constitute the target and
     return `(target_value, remaining_tokens)`. The remaining tokens
@@ -807,6 +808,13 @@ def parse_target(
     args is "first token containing `=`". So `!action self lightning
     3 4 5 6 power=10` parses as target=[(3,4),(5,6)] and args={power:10}.
     """
+    # `missing(eid, token)`: the caller's test for a unit to treat as
+    # missing (one the channel's view hides), raising its own refusal.
+    def check(eid: str, token: str) -> None:
+        if missing is not None:
+            missing(eid, token)
+        elif eid not in match.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
     if target_type == "none":
         return None, list(tokens)
     if target_type == "entity":
@@ -814,8 +822,7 @@ def parse_target(
             raise VTTError("expected an entity id after the action name.")
         eid_token = tokens[0]
         eid = _resolve_eid_for_action(eid_token, match)
-        if eid not in match.entities:
-            raise NotFound(f"Entity '{eid}' not found.")
+        check(eid, eid_token)
         return eid, list(tokens[1:])
     if target_type == "location":
         if len(tokens) < 2:
@@ -835,8 +842,7 @@ def parse_target(
         i = 0
         while i < len(tokens) and "=" not in tokens[i]:
             eid = _resolve_eid_for_action(tokens[i], match)
-            if eid not in match.entities:
-                raise NotFound(f"Entity '{eid}' not found.")
+            check(eid, tokens[i])
             eids.append(eid)
             i += 1
         if not eids:

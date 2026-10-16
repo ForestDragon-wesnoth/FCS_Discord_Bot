@@ -24986,11 +24986,11 @@ SCENARIO 818 — An action's cmd() runs as its caller; batch and foreach lines p
 !host access set foreach all user=alice
 !as player alice
 !batch ent dump spy
-?? ❌ `!ent` can't run inside a batch or foreach for you
+?? ❌ `!ent` can't run inside a batch, foreach or player-written macro for you
 !batch host add alice
-?? ❌ `!host` can't run inside a batch or foreach for you
+?? ❌ `!host` can't run inside a batch, foreach or player-written macro for you
 !foreach hp>0 ; ent hp $id 1
-?? can't run inside a batch or foreach
+?? can't run inside a batch, foreach or player-written macro
 !as host
 !assert "entity[hero].hp == 30 and entity[spy].hp == 10"
 !host list
@@ -26667,3 +26667,112 @@ leaves its crew aboard the wreck (they used to be ejected onto the dying
 map and killed). The boat's crew lands on the dry cell, and a dismount
 skips the water. Red's board, whose last actor (the scout) died on the
 crypt hidden from red, follows red's hero on `main` again.
+
+SCENARIO 854 — Replays keep the author's authority; links trust one match; aliases can't take command names
+----------------------------------------------------------------------
+
+!as player gm
+!match new g G 6 6
+!match use g
+!ent add u U 10 1 1
+!host add cli
+!macro set m "ent hp u -1\nowner limit default 1\nsystem set default formula_cell_limit 4000"
+!macro run m
+?? Only the bot's owner can use `!owner`.
+!as host
+!match journal export jg
+!match replay jg as=g2 verbose
+?? ✅ The state matched the recording after every command.
+!owner limit
+?? Each server (default): 1000.0 MB
+!assert "rule_get('formula_cell_limit') == 100000"
+!match new dungeon D 6 6
+!match new town T 6 6
+!match use dungeon
+!match link town
+!ent add d1 D1 5 1 1
+!match use town
+!match delete town
+!match new town Evil 6 6
+!match use dungeon
+!undo command
+!match links
+?? `town` (no longer: the match it named is gone; `!match link town` trusts the one there now)
+!match use town
+!ent add bomb Bomb 5 2 2
+!eval "transfer_entity('bomb', 'dungeon', 4, 4)"
+?? doesn't accept units from `town`
+!match use dungeon
+!match link town
+!match use town
+!eval "transfer_entity('bomb', 'dungeon', 4, 4)"
+?? = `'bomb'`
+!alias def roll "roll 1d20"
+?? ❌ `roll` is a command's name; an alias can't take it (it would hide `!roll` everywhere this match is shown).
+!system alias def default undo "roll 1"
+?? ❌ `undo` is a command's name
+!alias def r20 "roll 1d20"
+?? Defined alias
+
+Expected: HARNESS-ALLOWS-ERRORS. A replay runs each recorded command
+with no more authority than its author had: the GM's macro lines that
+needed the bot owner and an admin were refused live and stay refused
+when the owner replays the match (they used to take effect bot-wide).
+A link names the match it was made to: after `town` is deleted and
+another `town` made, an undo brings the link back but it no longer
+trusts the new match, and `!match links` says so; linking again trusts
+it. An alias can't take a command's name (`roll`, `undo`), at match or
+system level.
+
+SCENARIO 855 — Team views: hidden map names, hidden units through !action and !ent, player-written macros and actions
+----------------------------------------------------------------------
+
+!match new nv NV 6 6
+!match use nv
+!map new zqxcrypt 3 3
+!match fog on map=all
+!defvar add fog_vision_radius 1
+!map unseen hidden map=zqxcrypt
+!ent add hero Hero 10 1 1 map=main
+!ent set_var hero team red
+!ent add zqxthief Thief 10 6 6 map=main
+!ent set_var zqxthief team blue
+!ent set_var zqxthief bag.actions.loot.target none
+!ent set_var zqxthief bag.actions.loot.body "entity[self].looted = True"
+!match bind nv pov=red
+!host access set action all
+!host access set ent all
+!host access set macro all
+!as player alice
+!match info
+?! zqxcrypt
+!zone cells nosuch
+?? This match has 1 map (`main`)
+?! zqxcrypt
+!action zqxthief loot
+?? ❌ Could not find a unit named `zqxthief`. Either it does not exist, or this channel currently does not have permission to view it.
+!action nosuch loot
+?? ❌ Could not find a unit named `nosuch`. Either it does not exist, or this channel currently does not have permission to view it.
+!ent hp zqxthief 1
+?? ❌ Could not find a unit named `zqxthief`.
+!ent set_var hero bag.actions.x.body "cmd('host add alice')"
+?? ❌ Only a host can write under an `actions` var
+!ent set_var hero note hello
+!macro set evil "host add alice\nent hp hero 1"
+!macro run evil
+?? ❌ `!host` can't run inside a batch, foreach or player-written macro for you
+!as host
+!assert "not var_has('zqxthief', 'looted') and entity[hero].note == 'hello' and entity[hero].hp == 1"
+!as view omniscient
+!match info
+?? `zqxcrypt` 3x3 (fog)
+
+Expected: HARNESS-ALLOWS-ERRORS. In red's channel the crypt, hidden
+from red, stays out of `!match info` and of the "name a map" refusal,
+which counts only the maps red may name. With `action` and `ent` opened
+to players, a hidden unit reads exactly like a missing one through
+`!action` and `!ent` (its action used to run). A player may write a
+note var but not an action body, and a macro the player wrote runs its
+lines gated as the player: `!host add` is refused, while `!ent hp hero
+1` (opened to players) runs. An omniscient view's `!match info` lists
+every map.

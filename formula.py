@@ -6559,7 +6559,7 @@ class FormulaEngine:
             if dest is match:
                 raise FormulaError("transfer_entity: the unit is already in "
                                    "that match (move_entity moves it here).")
-            if match.id not in dest.links:
+            if not mgr.link_trusts(dest, match):
                 raise FormulaError(
                     f"transfer_entity: `{dest_id}` doesn't accept units from "
                     f"`{match.id}` (a host of `{dest_id}` runs `!match link "

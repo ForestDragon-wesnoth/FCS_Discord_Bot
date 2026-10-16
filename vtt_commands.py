@@ -15,7 +15,7 @@ from logic import (
 )
 
 # Passive system
-from logic import COMMAND_USER, COMMAND_VIEW, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES
+from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -457,6 +457,10 @@ class CommandRegistry:
         mid = mgr.active_by_channel.get(ctx.channel_key)
         if mid is None or mid not in mgr.matches:
             return name, args
+        # A command's own name is never an alias (one saved before that was
+        # refused could lock `!alias`, `!match` and `!undo` away).
+        if name.lower() in self._handlers:
+            return name, args
         expansion = mgr.matches[mid].aliases.get(name)
         if not expansion:
             return name, args
@@ -523,9 +527,9 @@ class CommandRegistry:
         if _GATE_LINES.get() and not getattr(ctx, "auto_approve", False) \
                 and ctx_user(ctx) is not None \
                 and self._gate_decision(name, args, ctx, mgr) != "allow":
-            await ctx.send(f"❌ `!{name}` can't run inside a batch or "
-                           f"foreach for you: it needs a host (send it on "
-                           f"its own).")
+            await ctx.send(f"❌ `!{name}` can't run inside a batch, "
+                           f"foreach or player-written macro for you: it "
+                           f"needs a host (send it on its own).")
             return
         # Inline-formula `$(...)` substitution for sub-command lines (a macro /
         # batch / foreach inner command), so $() resolves per line in the
@@ -823,6 +827,7 @@ class CommandRegistry:
         view_token = COMMAND_VIEW.set(
             lambda vm: vm.channel_map(view_ctx.channel_key,
                                       _view_pov(view_ctx, vm, [])).name)
+        pov_token = COMMAND_POV.set(lambda vm: _view_pov(view_ctx, vm, []))
         # A typed command (not a nested run: an approval, `!again`) is one
         # `!system undo` step and one `!server audit` entry when it changes
         # anything server-wide. `!as` can swap the whole workspace.
@@ -858,6 +863,7 @@ class CommandRegistry:
             if audit_token is not None:
                 _AUDIT_NOTES.reset(audit_token)
             COMMAND_VIEW.reset(view_token)
+            COMMAND_POV.reset(pov_token)
             COMMAND_USER.reset(user_token)
             PARTIAL_CACHE.reset(cache_token)
             CURRENT_WORKSPACE.reset(ws_token)
@@ -1152,7 +1158,10 @@ def _journal_command(mgr: MatchManager, ctx: ReplyContext, jm: Match,
              "by": COMMAND_USER.get() or "", "uid": ctx_user(ctx),
              "ch": ctx.channel_key, "cmd": [typed] + list(typed_args),
              "rng": [jrng[0], jrng[1], post_m.rng_position()],
-             "hash": state_hash(post)}
+             "hash": state_hash(post),
+             # The author's server authority: a replay runs the command with
+             # no more than this (lines it refused live stay refused).
+             "auth": [ctx_is_admin(ctx), ctx_is_bot_owner(ctx)]}
     answers = _INTERACTIVE_ANSWERS.get()
     if answers and name == "action":
         # Answers typed at a prompt replay as `answer=` tokens.
@@ -2460,10 +2469,9 @@ def _pop_map_opt(args: List[str]) -> Tuple[List[str], Optional[str]]:
 
 
 def _maps_hint(m: "Match", many: bool) -> str:
-    names = ", ".join(f"`{n}`" for n in m.maps)
     opts = ("`map=<name>`, `map=a,b` or `map=all`" if many
             else "`map=<name>`")
-    return f"This match has {len(m.maps)} maps ({names}): add {opts}."
+    return f"{m.maps_text()}: add {opts}."
 
 
 # Sentinel distinguishing "no transient POV override on this ctx" (or no
@@ -2604,6 +2612,14 @@ def _format_clamp_line(path: str, c: "ClampSpec") -> str:
     return f"- `{path}`: {', '.join(parts)}"
 
 
+def _map_info_row(m: "Match", mp: "Map", view: Optional[str]) -> str:
+    """One map in `!match info` as `view` may know it: its name, size and
+    fog, or only its label while that view hasn't seen it."""
+    if m.map_display(mp, view) != "show":
+        return f"{m.map_label(mp, view)} (not seen yet)"
+    return f"`{mp.name}` {mp.size_text()}{' (fog)' if m.fog_on(mp) else ''}"
+
+
 # ---- Commands ----------------------------------------------------------------
 @registry.command("match", usage="!match <subcommand> ...", desc="List matches, create one, or switch the active match for this channel.")
 async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -2618,6 +2634,7 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # match the player may have no part in.
         m = active_match(mgr, ctx)
         pov = _query_pov(ctx, m)
+        view = _view_pov(ctx, m, [])
         cur = (m.turn_order[m.active_index]
                if m.round_started and 0 <= m.active_index < len(m.turn_order)
                else None)
@@ -2633,10 +2650,8 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"**{m.name}** (`{m.id}`) — system `{m.system_name}`, "
             + (f"grid {m.get_map().grid_width}×{m.get_map().grid_height}"
                if len(m.maps) == 1 else
-               "maps " + ", ".join(
-                   f"`{mp.name}` {mp.size_text()}"
-                   f"{' (fog)' if m.fog_on(mp) else ''}"
-                   for mp in m.maps.values()))
+               "maps " + ", ".join(_map_info_row(m, mp, view)
+                                   for mp in m.listed_maps(view)))
             + f", {clock}, current turn: {turn}, "
             + (f"fog {'on' if m.fog_on(m.get_map()) else 'off'}, "
                if len(m.maps) == 1 else "")
@@ -2863,9 +2878,12 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                         if word == "fog" else
                         f"Fog memory is **{onoff(m.fog_memory_on(mp))}** for "
                         f"**{m.name}** (fog itself is {onoff(m.fog_on(mp))}).")
+            view = _view_pov(ctx, m, [])
             return (f"Fog on **{m.name}**'s maps: " + ", ".join(
                 f"`{mp.name}` fog {onoff(m.fog_on(mp))}, memory "
-                f"{onoff(m.fog_memory_on(mp))}" for mp in m.maps.values()) + ".")
+                f"{onoff(m.fog_memory_on(mp))}"
+                for mp in m.listed_maps(view)
+                if m.map_named_for(mp, view)) + ".")
 
         memory = len(args) >= 2 and args[1].lower() == "memory"
         value = (args[2] if len(args) >= 3 else None) if memory else \
@@ -2934,9 +2952,15 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return await ctx.send(
                     f"**{m.name}** accepts units from no other match "
                     f"(`!match link <id>` lets one send them).")
+            def row(i: str) -> str:
+                o = mgr.matches.get(i)
+                if o is None or not mgr.link_trusts(m, o):
+                    return (f"`{i}` (no longer: the match it named is gone; "
+                            f"`!match link {i}` trusts the one there now)")
+                return f"`{i}`"
             return await ctx.send(
                 f"**{m.name}** accepts units sent by transfer_entity from: "
-                + ", ".join(f"`{i}`" for i in m.links) + ".")
+                + ", ".join(row(i) for i in m.links) + ".")
         if await return_help_if_not_enough_args(ctx, args, 2, "match", sub):
             return
         _check_tail(args, 2, (), f"!match {sub} <id>")
@@ -2946,16 +2970,19 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 raise VTTError(f"**{m.name}** doesn't accept units from "
                                f"`{other}`.")
             m.links.remove(other)
+            m.link_stamps.pop(other, None)
             return await ctx.send(f"**{m.name}** no longer accepts units "
                                   f"from `{other}`.")
         if other == m.id:
             raise VTTError("A match can't link to itself.")
         if other not in mgr.matches:
             raise NotFound(f"No match with id `{other}` (see `!match list`).")
-        if other in m.links:
+        if mgr.link_trusts(m, mgr.matches[other]):
             return await ctx.send(f"**{m.name}** already accepts units from "
                                   f"`{other}`.")
-        m.links.append(other)
+        if other not in m.links:
+            m.links.append(other)
+        m.link_stamps[other] = mgr.matches[other].uid
         return await ctx.send(
             f"**{m.name}** now accepts units that formulas in `{other}` send "
             f"with transfer_entity (`!match unlink {other}` revokes it).")
@@ -5508,7 +5535,9 @@ async def _match_journal(ctx: ReplyContext, args: List[str],
 class _ReplayCtx:
     """The replaying admin's context, re-pointed at one journal entry: its
     author's identity and channel, no prompts (answers replay as `answer=`
-    tokens), replies collected instead of sent."""
+    tokens), replies collected instead of sent. Its admin / bot-owner
+    flags are set per entry (the lower of the recorded author's and the
+    replayer's), never passed through."""
 
     def __init__(self, inner: ReplyContext, channel_key: str,
                  user_id: Optional[str], user_name: str):
@@ -5760,6 +5789,13 @@ async def _replay_entries(ctx: ReplyContext, mgr: MatchManager, mid: str,
                     continue
                 rctx = _ReplayCtx(ctx, str(e.get("ch") or ctx.channel_key),
                                   e.get("uid"), str(e.get("by") or ""))
+                # The lower of the author's recorded authority and the
+                # replaying admin's (an entry without a record has none).
+                auth = e.get("auth")
+                auth = auth if isinstance(auth, list) and len(auth) == 2 \
+                    else [False, False]
+                rctx.is_admin = bool(auth[0]) and ctx_is_admin(ctx)
+                rctx.is_bot_owner = bool(auth[1]) and ctx_is_bot_owner(ctx)
                 # Each entry was a top-level command with its own partial
                 # cache, whose template_data budget it spent alone.
                 cache_token = PARTIAL_CACHE.set({})
@@ -6681,6 +6717,8 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     f"❌ invalid alias name `{aname}`: names must be a "
                     f"single whitespace-free token."
                 )
+            if aname.lower() in registry._handlers:
+                return await ctx.send(_ALIAS_SHADOW.format(name=aname))
             try:
                 tokens = split_command_line(expansion)
             except ValueError as ex:
@@ -6735,6 +6773,8 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if exp is None:
                 raise NotFound(f"alias `{aname}` isn't defined on match "
                                f"`{m.id}`.")
+            if aname.lower() in registry._handlers:
+                return await ctx.send(_ALIAS_SHADOW.format(name=aname))
             prior = lib.get(aname)
             lib[aname] = exp
             mgr.system_library_write(s, "aliases", lib)
@@ -6748,6 +6788,12 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         )
 
     return await _help_fallback(ctx, ["system"], args[0] if args else None)
+# An alias can't take a command's name: it would replace the command in
+# every channel showing the match (`!alias`, `!match` and `!undo` with it).
+_ALIAS_SHADOW = ("❌ `{name}` is a command's name; an alias can't take it "
+                 "(it would hide `!{name}` everywhere this match is shown).")
+
+
 def _source_label(mgr: MatchManager, s: Any, key: str) -> str:
     """Where `s`'s value of rule `key` comes from, for `!system diff`."""
     src = mgr.system_value_source(s, key)
@@ -7711,6 +7757,26 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     for i in range(2, len(args)):
         args[i] = resolve_arg_token(args[i], m, self_id)
     # ---- end formula substitution ------------------------------------------
+
+    # A non-host (a subcommand an override opened to players) names units
+    # through the channel's view: a hidden unit reads like a missing one,
+    # in the two-sided wording, so the reply can't tell them apart.
+    if (sub not in ("add", "revive") and len(args) >= 2
+            and not _acts_as_host(ctx, m) and _query_pov(ctx, m) is not None):
+        _query_eid(ctx, m, args[1])
+        if sub == "swap" and len(args) >= 3:
+            _query_eid(ctx, m, args[2])
+    # An action's body runs its cmd() lines with no gate, so only a host
+    # writes one: a player who may write vars (a note-keeping override)
+    # can't author an action under any `actions` container.
+    if sub in ("set_var", "set_vars", "delete_var", "delete_var_silent") \
+            and not _acts_as_host(ctx, m):
+        paths = ([a.split("=", 1)[0] for a in args[2:] if "=" in a]
+                 if sub == "set_vars" else args[2:3])
+        if any("actions" in str(p).split(".") for p in paths):
+            return await ctx.send(
+                "❌ Only a host can write under an `actions` var: an "
+                "action's body runs commands with the host's reach.")
 
     # add
     if sub == "add":# and len(args) >= 6:
@@ -11857,6 +11923,8 @@ def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot,
     # A link to a match deleted since stays gone (deleting a match drops
     # it from every match's links).
     new_match.links = [i for i in new_match.links if i in mgr.matches]
+    new_match.link_stamps = {i: s for i, s in new_match.link_stamps.items()
+                             if i in new_match.links}
     # Transfer history pointer first so the truncate below targets the
     # same object we just attached to the new match.
     new_match.history = old.history
@@ -11897,6 +11965,8 @@ def _restore_snapshot(mgr: MatchManager, mid: str, snapshot: Snapshot,
     # The match keeps its live system: `!system rename` may have renamed
     # it since the snapshot, which still names the old one.
     new_match.system_name = old.system_name
+    # Its identity too: links other matches made to it keep trusting it.
+    new_match.uid = old.uid
     if new_match.id != old.id:
         new_match.id = old.id
         new_match.name = old.name
@@ -16861,6 +16931,8 @@ async def alias_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"❌ invalid alias name `{name}`: names must be a single "
                 f"whitespace-free token."
             )
+        if name.lower() in registry._handlers:
+            return await ctx.send(_ALIAS_SHADOW.format(name=name))
         # Validate that the expansion's first token is a registered
         # command. We deliberately don't accept other aliases as the
         # target — resolution is one-shot, so a chained alias would just
@@ -17582,6 +17654,15 @@ for _subs, _usage in (
     registry.annotate_sub('macro', *_subs, usage=_usage)
 
 
+def _set_macro_author(m: "Match", name: str, ctx: ReplyContext) -> None:
+    """Record who wrote macro `name` (none on a surface with no identity)."""
+    user = ctx_user(ctx)
+    if user is None or getattr(ctx, "auto_approve", False):
+        m.macro_authors.pop(name, None)
+    else:
+        m.macro_authors[name] = str(user)
+
+
 @registry.command(
     "macro",
     raw_args=True,
@@ -17619,8 +17700,11 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         _check_tail(args, 3, (), f"!macro {sub} <name> <new_name>")
         if sub == "copy":
             _copy_entry(m.macros, args[1], args[2], "macro")
+            _set_macro_author(m, args[2], ctx)
             return await ctx.send(f"Copied macro `{args[1]}` to `{args[2]}`.")
         m.macros = _rename_entry(m.macros, args[1], args[2], "macro")
+        if args[1] in m.macro_authors:
+            m.macro_authors[args[2]] = m.macro_authors.pop(args[1])
         note = _mentions_note(m, args[1], "macro")
         return await ctx.send(f"Renamed macro `{args[1]}` to `{args[2]}`."
                               + (f"\n{note}" if note else ""))
@@ -17639,6 +17723,7 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         except _MacroError as ex:
             return await ctx.send(f"❌ macro structure error: {ex}")
         m.macros[name] = body
+        _set_macro_author(m, name, ctx)
         n = len([l for l in body.split("\n") if l.strip()])
         return await ctx.send(f"Saved macro `{name}` ({n} line(s)).")
 
@@ -17671,7 +17756,12 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"(macro_recursion_limit).")
         mgr._macro_depth = depth + 1
         mgr._macro_budget = budget
-        gate_token = _GATE_LINES.set(False)   # the body is host-written
+        # A body a host wrote runs as written; one a player wrote (the
+        # access that lets players run macros also lets them write one) has
+        # each line gated as the runner, like a typed `!batch`.
+        author = m.macro_authors.get(name)
+        gate_token = _GATE_LINES.set(
+            author is not None and not m.is_host(author))
         try:
             if await _exec_macro(nodes, ctx, mgr, mac_args, None, name,
                                  budget) == ASSERT_STOP:
@@ -17705,6 +17795,7 @@ async def macro_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         name = args[1]
         if m.macros.pop(name, None) is None:
             return await ctx.send(f"❌ no macro `{name}`.")
+        m.macro_authors.pop(name, None)
         return await ctx.send(f"Removed macro `{name}`.")
 
     return await _help_fallback(ctx, ["macro"], args[0] if args else None)
@@ -18443,9 +18534,9 @@ async def action_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         actor_id = _query_eid(ctx, m, args[1])
         return await _action_info(ctx, m, actor_id, args[2])
 
-    actor_id = _resolve_eid(m, args[0])
-    if actor_id not in m.entities:
-        raise NotFound(f"Entity '{actor_id}' not found.")
+    # A unit the channel's view hides reads like a missing one, as in the
+    # list / info forms (it used to run, and its refusals named it).
+    actor_id = _query_eid(ctx, m, args[0])
     requested = args[1]
     tail = list(args[2:])
     await _run_action_dispatch(
@@ -18631,8 +18722,12 @@ async def _run_action_dispatch(
             pruned.append(tok)
     # Parse the target tokens off the front, then args off the rest.
     try:
+        def missing(eid: str, token: str) -> None:
+            # A unit the view hides reads like a missing one.
+            if eid not in m.entities or _pov_hides(m, _query_pov(ctx, m), eid):
+                _query_eid(ctx, m, token)
         target_value, remaining = parse_target(
-            action.target_type, pruned, m, actor_id,
+            action.target_type, pruned, m, actor_id, missing=missing,
         )
         args_dict = parse_args_tokens(remaining)
     except VTTError as ex:
