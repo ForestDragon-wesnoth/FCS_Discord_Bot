@@ -5834,7 +5834,13 @@ class Entity:
         flagged `controls_movement`, returns the VEHICLE (the driver steers
         the whole rig; riders are carried via _restamp_riders_for). When
         riding a non-control slot, raises — a passenger can't move on its
-        own and must dismount first."""
+        own and must dismount first. A glued or region body part moves only
+        with its body, so it raises too."""
+        if self.is_part and not self.is_located_part:
+            root = self._match.body_root(self)
+            raise VTTError(
+                f"`{self.id}` is a body part sitting on `{root.id}`'s body: "
+                f"move `{root.id}` (or `!part locate` the part first).")
         if not self.is_mounted:
             return self
         m = self._match
@@ -7893,6 +7899,11 @@ class Match:
     _death_check_deferred_ids: Set[str] = field(
         default_factory=set, repr=False, compare=False
     )
+    # Maps `delete_map` is deleting right now: a map vehicle dying on one
+    # doesn't eject its occupants onto it. Not serialized.
+    _deleting_maps: Set[str] = field(
+        default_factory=set, repr=False, compare=False
+    )
 
     # ---- maps ------------------------------------------------------------
     def _map_for(self, mp: Optional["Map"],
@@ -8273,15 +8284,65 @@ class Match:
                 raise VTTError(
                     f"Map `{name}` still has unit(s) on it ({ids}). Move them "
                     f"off first, or set map_delete_mode=kill to kill them.")
-            log.extend(self._kill_all_on_map(name))
-        # A corpse-less death leaves nothing; any unit still naming the map
-        # (a dead part) leaves with it.
-        for e in list(self.units_on_map(name)):
-            if e.id in self.entities:
-                log.extend(e.remove())
+            lost = self._maps_lost_with(name)
+            if not set(self.maps) - lost:
+                raise VTTError(
+                    f"Deleting map `{name}` would leave the match with no "
+                    f"map: every other map is carried by a unit on it and "
+                    f"would be destroyed with it ("
+                    + ", ".join(f"`{n}`" for n in sorted(lost - {name}))
+                    + "). Detach one first (`!map detach`).")
+        before = set(self.maps)
+        self._deleting_maps.add(name)
+        try:
+            if roots:
+                log.extend(self._kill_all_on_map(name))
+            # A corpse-less death leaves nothing; any unit still naming the
+            # map (a dead part) leaves with it.
+            for e in list(self.units_on_map(name)):
+                if e.id in self.entities:
+                    log.extend(e.remove())
+        finally:
+            self._deleting_maps.discard(name)
+        if len(self.maps) == 1:
+            # The deaths took every other map (a death effect or a hook
+            # did more than the fates predicted): keep this one.
+            log.append(f"⚠️ Map `{name}` was kept: the deaths on it took "
+                       f"every other map, and a match needs one.")
+            return log
         del self.maps[mp.name]
         self._forget_map(mp.name)
+        # A wreck's corpse no longer names it (a later map under the name
+        # isn't the wreck).
+        for _mp, _x, _y, _cid, corpse in self.every_corpse():
+            kept = corpse.get("maps")
+            if isinstance(kept, list) and name in kept:
+                corpse["maps"] = [k for k in kept if k != name]
+        gone = sorted(before - set(self.maps) - {name})
+        if gone:
+            log.append("Destroyed with it: " + ", ".join(
+                f"map `{n}`" for n in gone) + ".")
         return log
+
+    def _maps_lost_with(self, name: str) -> Set[str]:
+        """The maps deleting map `name` (killing everyone on it) would
+        destroy: `name`, and each map a dying carrier on a lost map holds
+        under the destroy fate (map_vehicle_death_map); a wreck survives."""
+        lost, todo = {name}, [name]
+        rule = str(self.rules.get("map_vehicle_death_map", "destroy"))
+        while todo:
+            cur = todo.pop()
+            for u in self.units_on_map(cur):
+                fate = u.vars.get("__map_vehicle_death_map")
+                if fate not in ("destroy", "wreck"):
+                    fate = rule
+                if fate != "destroy":
+                    continue
+                for inner in self.maps_carried_by(u.id):
+                    if inner.name not in lost:
+                        lost.add(inner.name)
+                        todo.append(inner.name)
+        return lost
 
     def _forget_map(self, name: str) -> None:
         """Drop per-channel state that names map `name`."""
@@ -8372,6 +8433,16 @@ class Match:
         return mp, renamed
 
     # ---- nested maps (map vehicles, `!map attach`) ------------------------
+    def body_root(self, e: "Entity") -> "Entity":
+        """The root body `e` belongs to (itself when not a part); a walk
+        that remembers the units it passed, so a part loop ends."""
+        root, seen = e, {e.id}
+        while root.part_of and root.part_of in self.entities \
+                and root.part_of not in seen:
+            root = self.entities[root.part_of]
+            seen.add(root.id)
+        return root
+
     def maps_carried_by(self, eid: str) -> List["Map"]:
         """The maps unit `eid` carries (its inner maps), in map order."""
         return [mp for mp in self.maps.values() if mp.vehicle == eid]
@@ -8495,7 +8566,9 @@ class Match:
         return sorted(units, key=lambda u: (pos.get(u.id, len(pos)), u.id))
 
     def _eject_spot(self, u: "Entity", outer: "Map",
-                    box: Tuple[int, int, int, int]) -> Optional[Tuple[int, int]]:
+                    box: Tuple[int, int, int, int],
+                    block_mode: Optional[str] = "tp"
+                    ) -> Optional[Tuple[int, int]]:
         """Where `u` (a unit, or a corpse's body) lands when it leaves a
         map vehicle with body `box` (x, y, w, h): the cell nearest the body
         that fits it, around the body as a dismount lands (so the vehicle's
@@ -8505,8 +8578,10 @@ class Match:
         w, h = self.entity_footprint(u)
         ox, oy = bx + (bw - 1) / 2 - (w - 1) / 2, by + (bh - 1) / 2 - (h - 1) / 2
         body = {(bx + i, by + j) for i in range(bw) for j in range(bh)}
-        return (self._nearest_fit_cell(u, ox, oy, outer, avoid=body)
-                or self._nearest_fit_cell(u, ox, oy, outer))
+        return (self._nearest_fit_cell(u, ox, oy, outer, avoid=body,
+                                       block_mode=block_mode)
+                or self._nearest_fit_cell(u, ox, oy, outer,
+                                          block_mode=block_mode))
 
     def _eject_from_maps(self, maps: List["Map"], outer: "Map",
                          box: Tuple[int, int, int, int], vid: str
@@ -8542,8 +8617,10 @@ class Match:
         if not maps:
             return []
         w, h = self.entity_footprint(e)
-        log = self._eject_from_maps(maps, self.map_of(e), (e.x, e.y, w, h),
-                                    e.id)
+        log: List[str] = []
+        if e.map not in self._deleting_maps:
+            log = self._eject_from_maps(maps, self.map_of(e),
+                                        (e.x, e.y, w, h), e.id)
         for mp in maps:
             mp.vehicle = None
         return log
@@ -8576,7 +8653,10 @@ class Match:
         if not maps:
             return []
         log: List[str] = []
-        outer = self.maps.get(outer_name)
+        # Its outer map is being deleted: nobody is ejected onto it (a
+        # wreck's crew stays aboard; a destroyed map's dies with it).
+        outer = (None if outer_name in self._deleting_maps
+                 else self.maps.get(outer_name))
         fate = vars_.get("__map_vehicle_death_map")
         if fate not in ("destroy", "wreck"):
             fate = str(self.rules.get("map_vehicle_death_map", "destroy"))
@@ -8635,7 +8715,7 @@ class Match:
             mp = self.maps.get(name)
             if mp is None:
                 continue
-            if fate == "wreck" or outer is None:
+            if fate == "wreck":
                 mp.vehicle = None
                 loc = self.find_corpse(vid)
                 if loc is not None:
@@ -8658,7 +8738,8 @@ class Match:
                 if corpses_mode == "eject" else []
             ids += [c for c in here if (name, c) in earlier] \
                 if old_mode == "eject" else []
-            log.extend(self._eject_corpses(mp, ids, outer, box))
+            if outer is not None:
+                log.extend(self._eject_corpses(mp, ids, outer, box))
             if name in self.maps:
                 log.extend(self.delete_map(name))
         return log
@@ -8675,7 +8756,7 @@ class Match:
                 continue
             x, y, corpse, _ = loc
             body = Entity.from_dict(copy.deepcopy(corpse.get("entity") or {}))
-            spot = self._eject_spot(body, outer, box)
+            spot = self._eject_spot(body, outer, box, block_mode=None)
             cell = mp.tiles.get((x, y), {})
             del cell["corpses"][cid]
             if not cell["corpses"]:
@@ -9395,8 +9476,10 @@ class Match:
 
     def attach_part(self, parent_id: str, part_id: str) -> "Entity":
         """Link an EXISTING entity as a body part of `parent_id`, moving it
-        onto the parent's cell. Raises NotFound / VTTError (self-attach or
-        already a part of someone else is allowed — it just re-points)."""
+        onto the parent's cell with its auras, riders and glued parts. Raises
+        NotFound / VTTError for itself, another map, a parent that is one of
+        its own parts (a loop), a map carrier, a snake segment or a mounted
+        rider; a part of someone else just re-points."""
         parent = self.entities.get(parent_id)
         if parent is None:
             raise NotFound(f"Entity '{parent_id}' not found.")
@@ -9408,8 +9491,34 @@ class Match:
         if p.map != parent.map:
             raise VTTError(f"`{part_id}` and `{parent_id}` are on different "
                            f"maps.")
+        # The new parent can't be one of the unit's own parts (or theirs):
+        # the two would hang off each other with no root body.
+        cur, seen = parent, set()
+        while cur is not None and cur.id not in seen:
+            if cur.id == part_id:
+                raise VTTError(
+                    f"`{parent_id}` is a body part of `{part_id}` (or of one "
+                    f"of its parts): a body can't be a part of its own part.")
+            seen.add(cur.id)
+            cur = self.entities.get(cur.part_of) if cur.part_of else None
+        carried = [mp.name for mp in self.maps_carried_by(part_id)]
+        if carried:
+            raise VTTError(
+                f"`{part_id}` carries map(s) "
+                + ", ".join(f"`{n}`" for n in carried)
+                + "; a body part can't carry a map (`!map detach` them first).")
+        if p.vars.get("__segment"):
+            raise VTTError(f"`{part_id}` is a snake segment; `!part detach` "
+                           f"it from its body first.")
+        if p.mounted_on and p.mounted_on in self.entities:
+            raise VTTError(f"`{part_id}` is riding `{p.mounted_on}`; "
+                           f"dismount it first.")
         p.part_of = parent_id
         p.x, p.y = parent.x, parent.y
+        # What it carries comes along: its auras, riders and glued parts.
+        self._restamp_anchors_for(part_id)
+        self._restamp_parts_for(part_id)
+        self._restamp_riders_for(part_id)
         self._rebuild_turn_order()
         return p
 
@@ -9429,6 +9538,15 @@ class Match:
         for k in ("__segment", "__follows"):
             p.vars.pop(k, None)
         p.part_of = None
+        # A living limb that sat on its body (glued or region) steps off it
+        # to the nearest free cell, as a dismount does: two living units
+        # don't share a cell. A dead one lies where it fell.
+        if p.is_alive and not p.is_cell_stackable and any(
+                self.cell_occupant(cx, cy, (p.id,), self.map_of(p)) is not None
+                for cx, cy in self.entity_cells(p)):
+            spot = self._nearest_fit_cell(p, p.x, p.y, self.map_of(p))
+            if spot is not None:
+                p.move_to(*spot)
         self._rebuild_turn_order()
         return p
 
@@ -9835,12 +9953,16 @@ class Match:
             rider, ox, oy, self.map_of(veh if veh is not None else rider))
 
     def _nearest_fit_cell(self, e: "Entity", ox: float, oy: float,
-                          mp: "Map", avoid: Optional[Set[Tuple[int, int]]] = None
+                          mp: "Map", avoid: Optional[Set[Tuple[int, int]]] = None,
+                          block_mode: Optional[str] = "tp"
                           ) -> Optional[Tuple[int, int]]:
         """The anchor cell nearest the point (ox, oy) where `e`'s whole
-        footprint is on map `mp` and covers no other unit (ties by y then
-        x), nor any cell of `avoid`. Shared by dismount, revive_blocked_mode
-        nearest and the ejection from a map vehicle."""
+        footprint is on map `mp`, covers no other unit (ties by y then x),
+        nor any cell of `avoid`, and no cell that blocks `e` for
+        `block_mode` (the block_<mode> rule; None = no block test, for a
+        corpse). Shared by dismount, revive_blocked_mode nearest and the
+        ejections from a dead vehicle, so each lands where the unit could
+        have walked."""
         rider = e
         cx0, cy0 = math.floor(ox + 0.5), math.floor(oy + 0.5)
         best: Optional[Tuple[float, int, int]] = None
@@ -9850,7 +9972,10 @@ class Match:
                 if self.footprint_in_bounds(rider, gx, gy, mp) and \
                         not self._footprint_blocked_by_others(rider, gx, gy, mp) \
                         and not (avoid and any(
-                            c in avoid for c in self.entity_cells(rider, gx, gy))):
+                            c in avoid for c in self.entity_cells(rider, gx, gy))) \
+                        and not (block_mode and any(
+                            self._check_block(rider.id, cx, cy, block_mode, mp)
+                            for cx, cy in self.entity_cells(rider, gx, gy))):
                     key = ((gx - ox) ** 2 + (gy - oy) ** 2, gy, gx)
                     if best is None or key < best:
                         best = key
@@ -12334,6 +12459,16 @@ class Match:
             for cx, cy in self.entity_cells(mover, mx, my):
                 if self._check_block(mover.id, cx, cy, "swap"):
                     raise Blocked(f"Cell ({cx},{cy}) blocks `{mover.id}`")
+        # The two new footprints must not overlap either: with unequal sizes
+        # a partner's new anchor can fall inside the other's new body.
+        if not (ea.is_cell_stackable or eb.is_cell_stackable):
+            both = set(self.entity_cells(ea, bx, by)) & set(
+                self.entity_cells(eb, ax, ay))
+            if both:
+                cx, cy = min(both, key=lambda c: (c[1], c[0]))
+                raise Occupied(
+                    f"swap: `{a}` and `{b}` would both cover ({cx},{cy}) — "
+                    f"they don't fit at each other's places")
         log: List[str] = []
         # Footprint cell sets for each partner at its old and new anchor.
         a_old = self.entity_cells(ea, ax, ay)
@@ -12935,17 +13070,25 @@ class Match:
         map its team's current or latest actor is on now; if that unit is
         gone, the last map it stood on; before any turn, the map of the
         team's first unit in turn order; else the first map."""
+        def ok(name: Optional[str]) -> bool:
+            # A team's board follows only a map the team has seen: one its
+            # last actor left (and died on) may now be unseen or hidden.
+            return name in self.maps and (
+                pov_team is None or self.map_seen_by(self.maps[name], pov_team))
         rec = self.last_actors.get("" if pov_team is None else str(pov_team))
         if rec:
             e = self.entities.get(rec[0])
-            if e is not None and e.map in self.maps:
+            if e is not None and ok(e.map):
                 return self.maps[e.map]
-            if rec[1] in self.maps:
+            if ok(rec[1]):
                 return self.maps[rec[1]]
         if pov_team is not None:
             for e in self.entities_in_turn_order():
-                if e.map in self.maps and str(self._root_team(e)) == str(pov_team):
+                if ok(e.map) and str(self._root_team(e)) == str(pov_team):
                     return self.maps[e.map]
+            listed = self.listed_maps(pov_team)
+            if listed:
+                return listed[0]
         return next(iter(self.maps.values()))
 
     def channel_map(self, channel_key: Optional[str],
@@ -14551,9 +14694,7 @@ class Match:
         if e.part_of:
             # A part (a located limb, a snake segment) is on its body's
             # map: the body moves and takes it along.
-            root = e
-            while root.part_of and root.part_of in self.entities:
-                root = self.entities[root.part_of]
+            root = self.body_root(e)
             raise VTTError(
                 f"`{e.id}` is a body part of `{root.id}`: move `{root.id}` "
                 f"to another map to take it along.")
@@ -18279,8 +18420,20 @@ class Match:
             m.entities[eid] = e
         # A map naming a carrier that isn't here (hand-edited state) is a
         # map of its own.
+        # A part loop saved by an older build (two units each other's part)
+        # is cut where it closes, so every body has a root again; a map a
+        # body part carries is a map of its own (parts can't carry maps).
+        for e in m.entities.values():
+            cur, seen = e, set()
+            while cur.part_of and cur.part_of in m.entities \
+                    and cur.id not in seen:
+                seen.add(cur.id)
+                cur = m.entities[cur.part_of]
+            if cur.id in seen:
+                cur.part_of = None
         for mp in maps.values():
-            if mp.vehicle and mp.vehicle not in m.entities:
+            if mp.vehicle and (mp.vehicle not in m.entities
+                               or m.entities[mp.vehicle].part_of):
                 mp.vehicle = None
         # COPY on load too (the load-side twin): otherwise the restored match
         # shares the snapshot's list, and the next Entity.remove would mutate
@@ -20452,6 +20605,20 @@ def check_template(data: Any, name: str,
                             f"Template `{name}`: part `{pt.get('id', i + 1)}` "
                             f"`{k}` must be a whole-number offset.")
                 probe(pt, f"Template `{name}` part `{pt.get('id', i + 1)}`")
+            # Every part's chain reaches the unit: a part naming itself or
+            # two naming each other would never be spawned.
+            links = {p.get("id"): p.get("part_of", TEMPLATE_ROOT)
+                     for p in parts if isinstance(p, dict) and p.get("id")}
+            for pid in links:
+                cur, seen = pid, set()
+                while cur in links and cur not in seen:
+                    seen.add(cur)
+                    cur = links[cur]
+                if cur in seen:
+                    raise VTTError(
+                        f"Template `{name}`: part `{pid}` is part of a loop "
+                        f"of parts that never reaches the unit "
+                        f"(`{TEMPLATE_ROOT}`).")
         else:
             raise VTTError(f"Template `{name}`: `parts` must be a list or an "
                            f"object.")

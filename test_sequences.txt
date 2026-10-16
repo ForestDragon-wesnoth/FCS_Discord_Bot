@@ -26526,3 +26526,144 @@ horse unmarked, still carrying the bird. When the 2x2 second horse dies,
 only its direct rider gets the effect (the knight is marked, the bird
 isn't); the knight is ejected around the horse's body and the bird rides
 along on the knight.
+
+SCENARIO 852 — Part attach refuses loops, carriers, segments and riders; glued parts don't walk; swaps don't overlap
+----------------------------------------------------------------------
+
+!match new pl PL 9 9
+!match use pl
+!map new deck 4 4
+!ent add a A 10 2 2 map=main
+!ent add b B 10 5 5 map=main
+!ent add c C 10 7 7 map=main
+!part attach a b
+!part attach b a
+?? ❌ `b` is a body part of `a` (or of one of its parts): a body can't be a part of its own part.
+!part attach b c
+!part attach c a
+?? ❌ `c` is a body part of `a`
+!ent add worm Worm 10 8 2 map=main
+!part segment worm s1 S 8 3
+!part attach a s1
+?? ❌ `s1` is a snake segment; `!part detach` it from its body first.
+!ent add ship Ship 10 1 8 map=main
+!map attach deck ship
+!part attach a ship
+?? ❌ `ship` carries map(s) `deck`; a body part can't carry a map (`!map detach` them first).
+!ent add horse Horse 10 4 8 map=main
+!ent set_var horse slots.saddle.capacity 1
+!ent add jock Jock 10 1 1 map=main
+!mount jock horse saddle
+!part attach a jock
+?? ❌ `jock` is riding `horse`; dismount it first.
+!part attach a horse
+!assert "entity[horse].x == 2 and entity[horse].y == 2 and entity[jock].x == 2 and entity[jock].y == 2"
+!ent move horse 1 right
+?? ❌ `horse` is a body part sitting on `a`'s body: move `a` (or `!part locate` the part first).
+!part detach horse
+?? it's now a free entity at (2,1).
+!ent tp c 1 1 deck
+?? ❌ `c` is a body part sitting on `a`'s body: move `a` (or `!part locate` the part first).
+!ent add big Big 10 2 5 map=main
+!ent set_vars big footprint_w=2 footprint_h=2
+!ent add z Z 10 1 4 map=main
+!ent swap big z
+?? ❌ swap: `big` and `z` would both cover (2,5) — they don't fit at each other's places
+!assert "entity[big].x == 2 and entity[z].x == 1"
+!template import loopy {"name": "L", "vars": {"hp": 5}, "parts": [{"id": "p1", "part_of": "p2", "vars": {"hp": 1}}, {"id": "p2", "part_of": "p1", "vars": {"hp": 1}}]}
+?? ❌ Template `loopy`: part `p1` is part of a loop of parts that never reaches the unit (`@root`).
+
+Expected: HARNESS-ALLOWS-ERRORS. `!part attach` refuses a parent that is
+one of the unit's own parts (b under a can't take a; nor c, under b,
+take a), a snake segment, a unit carrying a map and a mounted rider. A
+loaded horse made a part brings its rider along to the new cell. A
+glued part can't move by itself; detached while alive it steps off its
+body to the nearest free cell. A part's move, cross-map included, is
+refused naming its root body (`c` under `b` under `a`); with a loop the
+cross-map refusal's walk to the root used to never end. Swapping a 2x2 with the 1x1 beside it
+would put them on one cell, so it is refused. A template whose parts
+name each other is refused at import.
+
+SCENARIO 853 — Deleting maps under carriers, wreck records, blocking-aware ejection, boards follow seen maps
+----------------------------------------------------------------------
+
+!match new zm ZM 6 6
+!match use zm
+!system set default map_delete_mode kill
+!map new deck 3 3
+!ent add ship Ship 20 2 2 map=main
+!ent add crew Crew 5 1 1 map=deck
+!map attach deck ship
+!map delete main
+?? ❌ Deleting map `main` would leave the match with no map: every other map is carried by a unit on it and would be destroyed with it (`deck`). Detach one first (`!map detach`).
+!assert "sorted(maps()) == ['deck', 'main']"
+!map new other 3 3
+!map delete main
+?? Destroyed with it: map `deck`.
+!assert "maps() == ['other']"
+!system set default map_vehicle_death_map wreck
+!match new zw ZW 6 6
+!match use zw
+!map new deck 3 3
+!map new lower 3 3
+!ent add ship Ship 20 2 2 map=main
+!ent add crew Crew 5 1 1 map=deck
+!map attach deck ship
+!ent kill ship
+!ent tp crew 1 1 main
+!map delete deck
+!map new deck 2 2
+!ent revive ship
+!assert "map_carrier('deck') == None"
+!map attach deck ship
+!ent add crew2 Crew 5 1 1 map=deck
+!map delete main
+!assert "sorted(maps()) == ['deck', 'lower'] and map_of('crew2') == 'deck' and map_carrier('deck') == None"
+!match new ue UE 7 7
+!match use ue
+!system set default map_vehicle_death_map destroy
+!system set default tile_block_condition "tile_has(tile_x, tile_y, 'water')"
+!map new hull 3 3
+!ent add boat Boat 20 4 4 map=main
+!map attach hull boat
+!ent add sailor Sailor 5 1 1 map=hull
+!tile fill 3 3 5 5 water true map=main
+!tile del 4 4 water map=main
+!ent kill boat
+!assert "map_of('sailor') == 'main' and not tile_has(entity[sailor].x, entity[sailor].y, 'water', map='main')"
+!ent add raft Raft 10 2 2 map=main
+!ent set_var raft slots.seat.capacity 1
+!mount sailor raft seat
+!tile fill 1 1 3 3 water true map=main
+!tile del 2 2 water map=main
+!mount dismount sailor
+!assert "not tile_has(entity[sailor].x, entity[sailor].y, 'water', map='main')"
+!match new fw FW 6 6
+!match use fw
+!system set default tile_block_condition ""
+!map new crypt 3 3
+!match fog on map=all
+!defvar add fog_vision_radius 1
+!map unseen hidden map=crypt
+!ent add hero Hero 10 1 1 map=main
+!ent set_var hero team red
+!ent add scout Scout 10 2 2 map=crypt
+!ent set_var scout team red
+!turn next
+!turn next
+!ent kill scout
+!as view red
+!map
+?! Unexplored map
+?? map `main`
+
+Expected: HARNESS-ALLOWS-ERRORS. Under map_delete_mode kill, deleting
+`main` is refused when its carrier holds every other map (destroying it
+would leave the match with none, which made the match unloadable); with
+a third map the deletion goes ahead and names the deck destroyed with
+it. A wreck's corpse forgets a deleted map, so a new `deck` doesn't ride
+the revived ship. Deleting the outer map under a wreck-mode carrier
+leaves its crew aboard the wreck (they used to be ejected onto the dying
+map and killed). The boat's crew lands on the dry cell, and a dismount
+skips the water. Red's board, whose last actor (the scout) died on the
+crypt hidden from red, follows red's hero on `main` again.
