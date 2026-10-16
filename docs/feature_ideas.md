@@ -8,7 +8,8 @@ strikes or rejects one, move it to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#179-#181, #183, #186-#188, parts of #14.
+#179-#181, #183, #186-#188, #40 and #164 (multiple and nested maps, see
+`docs/multi_map_design.md`), parts of #14.
 
 **Off the list:**
 - Rejected: edge-aware boarding.
@@ -16,10 +17,10 @@ strikes or rejects one, move it to "Off the list".
   export` + `!history import` into a new match).
 - Struck by the user: #7, #44, #45, #156.
 
-**In progress:** #40 and #164 became the multiple-maps-per-match and nested-maps
-work; the agreed design, build order and status are in
-`docs/multi_map_design.md` (steps 1 and 2a are on main; next is 2b). Their
-entries below keep the original wording for reference.
+**Shipped from the list below:** #40 and #164 (multiple maps per match and
+nested maps; design, decisions and what stays deferred in
+`docs/multi_map_design.md`). Their entries below keep the original wording
+for reference.
 
 ## Small (a primitive, a rule, or a command)
 

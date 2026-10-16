@@ -209,7 +209,7 @@ ELEVATED_ARGS: Dict[str, frozenset] = {
     "map": frozenset({"full", "resize", "color", "teamcolor", "layer",
                       "legend", "autoupdate", "background", "border", "mode",
                       "coords", "new", "delete", "rename", "copy", "use",
-                      "var", "unseen"}),
+                      "var", "unseen", "attach", "detach"}),
     "list": frozenset({"full"}),
     # `!log` reads for anyone, but `clear` wipes the match's event log.
     "log": frozenset({"clear"}),
@@ -1075,6 +1075,16 @@ class CommandRegistry:
                 post_state = None       # a watcher may change it after
             for line in mgr.matches[mid_now].fire_watchers():
                 await ctx.send(line)
+            # Nested maps: a wreck marked __delete_when_empty goes once its
+            # last unit has left.
+            m_now = mgr.matches.get(mid_now)
+            if m_now is not None and any(
+                    mp.vars.get("__delete_when_empty") is True
+                    for mp in m_now.maps.values()):
+                swept = m_now.sweep_empty_maps()
+                if swept:
+                    post_state = None
+                    await ctx.send("\n".join(swept))
         if jpre is not None:
             _journal_command(mgr, ctx, jm, pre_active_mid, name, typed,
                              typed_args, jpre, jrng, jmine,
@@ -8040,6 +8050,7 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 moves.append((d, n)); i += 2
 
         total_steps = sum(max(1, int(n)) for _, n in moves)
+        pre_map = m.entities[eid].map
         try:
             hook_log = m.entities[eid].move_dirs(moves)
         except VTTError as e:
@@ -8049,6 +8060,10 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             # A hook on the way (a lethal tile/zone on_enter) removed it.
             msg = (f"Moved `{eid}` {total_steps} step(s), and it was removed "
                    f"on the way (a triggered effect).")
+        elif e.map != pre_map:
+            # A hook on the way (a hatch, a portal) took it to another map.
+            msg = (f"Moved `{eid}`; a triggered effect took it to "
+                   f"({e.x},{e.y}) on map `{e.map}`.")
         else:
             msg = f"Moved `{eid}` {total_steps} step(s) to ({e.x},{e.y}); facing {e.facing}."
         if hook_log:
@@ -10020,15 +10035,34 @@ for _sub, _usage in (
         ("rename", "!map rename <map> <new_map>"),
         ("copy", "!map copy <map> <new_map>"),
         ("use", "!map use [<map> | clear]"),
-        ("var", "!map var <set <path> <value> | get <path> | del <path> | list> [map=<map>]")):
+        ("var", "!map var <set <path> <value> | get <path> | del <path> | list> [map=<map>]"),
+        ("attach", "!map attach <map> <eid>"),
+        ("detach", "!map detach <map>")):
     registry.annotate_sub("map", _sub, usage=_usage)
+# Nested maps: the help a host reads, with the composed boarding pattern.
+registry.annotate_sub(
+    "map", "attach", usage="!map attach <map> <eid>",
+    desc="Make a unit carry a map (a map vehicle: a ship's decks, a "
+         "building's interior; a unit may carry several). The map moves "
+         "with it (on_map_vehicle_moved fires for its units), its units are "
+         "ejected beside it when it leaves, and its death follows "
+         "map_vehicle_death_map. Boarding is yours to compose: give units a "
+         "`board` action that checks the distance and calls "
+         "`move_entity(self, x, y, map=get(inner_maps(target), 0))`, and "
+         "put a hatch tile on the inner map whose on_enter moves the unit "
+         "back out: `move_entity(self, free_cell_near(entity[map_carrier()]"
+         ".x, entity[map_carrier()].y, 2, self, map=outer_map()))`. Nesting "
+         "depth is the owner's map_nesting_depth limit.")
+registry.annotate_sub("map", "detach", usage="!map detach <map>",
+                      desc="Make a carried map a map of its own again.")
 # Every `!map` subcommand word is a reserved map name, so `!map <name>`
 # (render that map) can never shadow one.
 _unreserved = set(registry._help["map"]["subs"]) - MAP_RESERVED_NAMES
 assert not _unreserved, f"add {_unreserved} to logic.MAP_RESERVED_NAMES"
 
 
-_MAP_MANAGE_SUBS = ("new", "list", "delete", "rename", "copy", "use", "var")
+_MAP_MANAGE_SUBS = ("new", "list", "delete", "rename", "copy", "use", "var",
+                    "attach", "detach")
 
 
 async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
@@ -10068,6 +10102,11 @@ async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
             n = sum(1 for e in m.units_on_map(mp.name)
                     if not e.part_of and not _pov_hides(m, pov, e.id))
             bits = [mp.size_text(), f"{n} unit{'s' if n != 1 else ''}"]
+            # A map vehicle is named only to a view that can see it, so the
+            # note never reveals a hidden unit.
+            if mp.vehicle and mp.vehicle in m.entities \
+                    and not _pov_hides(m, pov, mp.vehicle):
+                bits.append(f"carried by `{mp.vehicle}`")
             if m.fog_on(mp):
                 bits.append("fog")
                 if view is None and m.map_unseen_mode(mp) != "show":
@@ -10107,6 +10146,23 @@ async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
             msg += "\nZones renamed (zone names are unique across the match): " \
                 + ", ".join(f"`{a}` → `{b}`" for a, b in renamed.items()) + "."
         return await ctx.send(msg)
+    if sub == "attach":
+        _check_tail(args, 3, (), "!map attach <map> <eid>")
+        if len(args) < 3:
+            raise VTTError("Usage: `!map attach <map> <eid>`.")
+        mp = m.attach_map(args[1], args[2])
+        return await ctx.send(
+            f"Map `{mp.name}` is now carried by `{args[2]}` (a map vehicle): "
+            f"it moves with it, and its units are ejected when it dies or "
+            f"leaves (map_vehicle_death_map).")
+    if sub == "detach":
+        _check_tail(args, 2, (), "!map detach <map>")
+        if len(args) < 2:
+            raise VTTError("Usage: `!map detach <map>`.")
+        vid = m.get_map(args[1]).vehicle
+        mp = m.detach_map(args[1])
+        return await ctx.send(f"Map `{mp.name}` is no longer carried by "
+                              f"`{vid}`; it is a map of its own.")
     if sub == "use":
         _check_tail(args, 2, (), "!map use <name|clear>")
         if len(args) < 2:
@@ -10184,7 +10240,7 @@ async def _map_manage(ctx: ReplyContext, m: "Match", mgr: MatchManager,
                    f"del / list.")
 
 
-@registry.command("map", access="all", usage="!map [full] [as=<team>] [hide=<layers>] [legend=on|off] [coords=on|off] [map=<map>] | !map cell <x> <y> [for=<eid>] | !map preview <burst|cone|line|rect> ... | !map ent_sight <eid> | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 28), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map preview burst|cone|line|rect ...` shows the cells an area shape would cover (marked with the preview_glyph rule's character on cells without a unit; graphics surfaces draw translucent squares above units, colour/opacity from the preview_color / preview_opacity rules or `color=` / `opacity=`) and lists the visible units inside — nothing happens to them. `!map ent_sight <eid>` marks the cells that unit sees right now (range + line of sight from its whole body, like can_see) and lists the units it sees; under a team POV players may ask about their own team's units only. `!map full` (host-gated) forces the omniscient view; `as=<team>` (host-only) previews what that team sees (`as=omniscient` = everything), without binding a channel. `!map cell <x> <y> [for=<eid>]` reports everything at one cell the channel can see — units, tile data, zones, corpses, and where its movement / sight block settings come from; `for=<eid>` adds whether the cell blocks that unit (hidden layers are left out). `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets the map's background sprite (a map var); `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). `!map border on|off` / `color <name>` / `opacity <0-100>` / `clear` (host-gated) overrides the grid-line border rules for one map, in its map vars (borders draw above the ground, below tiles/entities). MAPS: `!map new|list|delete|rename|copy|use`; `!map var set|get|del|list` keeps free-form data per map, host-gated like `!match var` (the setting vars — fog, fog memory, background, borders, hidden layers — take the same values as their commands). `!map mode text|image` (host-gated) sets the per-match default render mode — `image` makes a plain `!map` and the auto-update board render graphically on Discord (text surfaces fall back to ASCII). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
+@registry.command("map", access="all", usage="!map [full] [as=<team>] [hide=<layers>] [legend=on|off] [coords=on|off] [map=<map>] | !map cell <x> <y> [for=<eid>] | !map preview <burst|cone|line|rect> ... | !map ent_sight <eid> | !map pan <dir> [n] | !map center <eid|x y> | !map view <x y|reset> | !map legend on|off | !map resize <w> <h> [anchor] | !map color on|off | !map teamcolor <team> <color>|clear|list | !map colors", desc="Render the ASCII map for the active match, from this channel's POV. On large maps a per-channel VIEWPORT shows a window you pan: `!map pan <up|down|left|right> [n]` (exact n tiles), `!map center <eid>` or `!map center <x> <y>` (camera to an entity/coord), `!map view <x> <y>` / `!map view reset` (set/clear the top-left). The viewport engages when either grid dimension exceeds viewport_width/height (default 28), on Discord by default (viewport_mode rule). `!map legend on|off` toggles a glyph→meaning key under the map. `!map preview burst|cone|line|rect ...` shows the cells an area shape would cover (marked with the preview_glyph rule's character on cells without a unit; graphics surfaces draw translucent squares above units, colour/opacity from the preview_color / preview_opacity rules or `color=` / `opacity=`) and lists the visible units inside — nothing happens to them. `!map ent_sight <eid>` marks the cells that unit sees right now (range + line of sight from its whole body, like can_see) and lists the units it sees; under a team POV players may ask about their own team's units only. `!map full` (host-gated) forces the omniscient view; `as=<team>` (host-only) previews what that team sees (`as=omniscient` = everything), without binding a channel. `!map cell <x> <y> [for=<eid>]` reports everything at one cell the channel can see — units, tile data, zones, corpses, and where its movement / sight block settings come from; `for=<eid>` adds whether the cell blocks that unit (hidden layers are left out). `!map resize <w> <h> [anchor]` (host-gated) changes the grid size. `!map color on|off` / `!map teamcolor <team> <color>` (clear/list) / `!map colors` control colors. GRAPHICS: `!map background <key> [stretch|tile|center]` / `clear` (host-gated) sets the map's background sprite (a map var); `!map scene` prints a textual summary of the graphics render model; `!map image [full]` posts a rendered PNG of the scene (Discord-only surface hook; `full` host-gated). `!map border on|off` / `color <name>` / `opacity <0-100>` / `clear` (host-gated) overrides the grid-line border rules for one map, in its map vars (borders draw above the ground, below tiles/entities). MAPS: `!map new|list|delete|rename|copy|use`; `!map attach <map> <eid>` makes a unit carry a map (a map vehicle: a ship's deck, a building's interior), `!map detach <map>` frees it; `!map var set|get|del|list` keeps free-form data per map, host-gated like `!match var` (the setting vars — fog, fog memory, background, borders, hidden layers — take the same values as their commands). `!map mode text|image` (host-gated) sets the per-match default render mode — `image` makes a plain `!map` and the auto-update board render graphically on Discord (text surfaces fall back to ASCII). Sprites are a parallel layer for gui.py / Discord image attachments — ASCII is unaffected.")
 async def map_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     m = active_match(mgr, ctx)
     args, mapspec = _pop_map_opt(args)

@@ -2402,6 +2402,9 @@ _MATCH_FUNC_NAMES: Tuple[str, ...] = (
     # each map's own vars (context map, or map=).
     "map_of", "maps", "map_var_get", "map_var_set", "map_var_del",
     "map_var_keys", "map_var_has",
+    # Nested maps: the unit carrying a map, the maps a unit carries, the map
+    # a carried map's vehicle stands on.
+    "map_carrier", "inner_maps", "outer_map",
     # Cross-match moves into a match that accepts this one (`!match link`).
     "transfer_entity",
     "group_has", "group_size", "group_add", "group_remove",
@@ -2861,6 +2864,7 @@ ARG_MUTATING_MATCH_FUNCS: "frozenset[str]" = frozenset({
 # function as MUTATING (leave it out of this set).
 ARG_SAFE_MATCH_FUNCS: "frozenset[str]" = frozenset({
     'map_of', 'maps', 'map_var_get', 'map_var_keys', 'map_var_has',
+    'map_carrier', 'inner_maps', 'outer_map',
     'has_template', 'template_names', 'template_of', 'template_data',
     'schedules_of', 'schedule_left',
     'flanking', 'flanking_angle', 'flanking_line', 'nearest_cell',
@@ -3055,7 +3059,7 @@ _HOF_FUNCS: "frozenset[str]" = frozenset({"map_with", "filter_with", "sort_by"})
 # (cells_in_*). The for-loop target shape must match: a single Name for
 # the id case, a 2-tuple of Names for the coord case.
 _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
-    "maps", "map_var_keys",
+    "maps", "map_var_keys", "inner_maps",
     "template_names", "schedules_of", "map_with", "filter_with", "sort_by",
     "range",
     "each",
@@ -3169,6 +3173,10 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
     # The maps of a move (on_entity_moved, on_entity_changed_map): equal
     # for an ordinary move.
     "from_map", "to_map",
+    # The unit carrying the map a nested-map hook is about
+    # (on_map_vehicle_moved, on_map_vehicle_death, the death effect and the
+    # wreck formula).
+    "map_vehicle",
     # Action-event bindings. Bound only during on_action_used firing
     # (see Match.fire_action_used); None elsewhere. action_name is
     # the bare action name; action_path is the full vars location
@@ -4184,7 +4192,8 @@ class FormulaEngine:
         def _default_map_name() -> Optional[str]:
             """The map a formula means when no call names one: the hook's,
             else the match's only map, else None (several maps)."""
-            name = extras.get("tile_map") or extras.get("zone_map")
+            name = (extras.get("tile_map") or extras.get("zone_map")
+                    or extras.get("context_map"))
             if name and name in self._match.maps:
                 return name
             if len(self._match.maps) == 1:
@@ -6017,6 +6026,27 @@ class FormulaEngine:
             del cur[keys[-1]]
             return True
 
+        def _map_carrier(mv: Any = None) -> Any:
+            """map_carrier(map=None): the id of the unit carrying the map (a
+            name, 'view' or '@<unit>'; none = the formula's map), or None
+            for a map of its own."""
+            return _var_map("map_carrier", mv).vehicle
+
+        def _inner_maps(eid_t: Any) -> list:
+            """inner_maps(eid): the names of the maps the unit carries, in
+            map order. Loopable."""
+            _, e = _resolve_entity(eid_t, "inner_maps")
+            return [mp.name for mp in match.maps_carried_by(e.id)]
+
+        def _outer_map(mv: Any = None) -> Any:
+            """outer_map(map=None): the name of the map the map's vehicle
+            stands on, or None for a map of its own."""
+            out = match.outer_map_of(_var_map("outer_map", mv))
+            return out.name if out is not None else None
+
+        ns["map_carrier"] = _map_carrier
+        ns["inner_maps"] = _inner_maps
+        ns["outer_map"] = _outer_map
         ns["map_of"] = _map_of
         ns["maps"] = _maps
         ns["map_var_has"] = _map_var_has
@@ -6421,7 +6451,8 @@ class FormulaEngine:
             `self`'s map, else the match's only map."""
             if mv is not None:
                 return _map_arg(mv, fname)
-            hook = extras.get("tile_map") or extras.get("zone_map")
+            hook = (extras.get("tile_map") or extras.get("zone_map")
+                    or extras.get("context_map"))
             if _map_stack or (hook and hook in match.maps):
                 return _cur_map()
             se = match.entities.get(ctx.target) if ctx.target else None
@@ -6825,13 +6856,17 @@ class FormulaEngine:
 
         def _corpse_at(eid_t: Any) -> tuple:
             """corpse_at(eid): the (x, y) tile coordinates of the
-            corpse with id `eid`. Authoritative source (tile location,
+            corpse with id `eid` ([x, y, map] when it lies on a map other
+            than the formula's own). Authoritative source (tile location,
             never the embedded snapshot). Raises if no such corpse."""
             eid = str(_eid(eid_t))
             loc = match.find_corpse(eid)
             if loc is None:
                 raise FormulaError(f"corpse_at: no corpse with id '{eid}'.")
             x, y = loc[0], loc[1]
+            # A corpse on a map other than the formula's own carries it.
+            if loc[3].name != _default_map_name():
+                return [x, y, loc[3].name]
             return (x, y)
 
         def _all_corpses() -> list:
