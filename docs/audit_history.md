@@ -2272,7 +2272,8 @@ Third findings report from the separate read-only LLM pass (document 2.1,
 pass 24 on `b515036`: mount deaths, the document 2 fixes, server
 backups). Every finding was reproduced on current main before fixing;
 scenarios 867-874 cover them. Verified after: 874/874, replay
-differential REPLAYCOUNT, usage drift DRIFTCOUNT, a multi-tile smoke run (a 2x2
+differential 933/933 journals, usage drift 0 of 874
+scenarios, a multi-tile smoke run (a 2x2
 dragon with a 2-wide howdah, a 2-wide leg detached and located).
   - **U8:** a body part with seats escaped the mount-death rules: its
     creature's death removed it through the despawn path (riders ejected
@@ -2307,3 +2308,7 @@ dragon with a 2-wide howdah, a 2-wide leg detached and located).
   - Deferred to the CPU work budget (§8): X4+ (including the move-hook
     case: a hook making two moves runs 2^depth hooks within
     `move_hook_recursion_limit`), X5.
+  - Found while verifying: the replay differential diverged on 868, since
+    a load that changed data (a fixed template, an old match file) left
+    the journals describing the old data. Loads now journal what they
+    change.
