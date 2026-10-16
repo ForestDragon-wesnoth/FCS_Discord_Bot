@@ -44,6 +44,7 @@ grow the data is always allowed.
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -55,7 +56,7 @@ from logic import (GameSystem, is_file_id, Match, MatchManager,
                    RULE_CEILINGS, VTTError, Workspaces, check_template,
                    check_template_name, legacy_template_fixes,
                    LEGACY_IDS_OK, owner_limit, unreachable_id)
-from match_history import MatchHistory, HistoryError
+from match_history import MatchHistory, HistoryError, _now_iso
 from journal import start_header
 
 MB = 1024 * 1024
@@ -358,6 +359,7 @@ class Storage:
         key = mgr.guild_key
         notes: List[str] = []
         mgr.templates = {}
+        fixed: List[str] = []
         tdir = self.templates_dir(key)
         if not os.path.isdir(tdir):
             return notes
@@ -370,7 +372,8 @@ class Storage:
                 if name != fname[:-5]:
                     raise ValueError("file name isn't a template name")
                 raw = self._read_json(fpath)
-                for note in legacy_template_fixes(raw, name):
+                fixes = legacy_template_fixes(raw, name)
+                for note in fixes:
                     print(f"⚠️ [{key}] {note}")
                 token = LEGACY_IDS_OK.set(True)
                 try:
@@ -381,6 +384,18 @@ class Storage:
                 notes.append(self._quarantine(key, fpath, type(ex).__name__))
                 continue
             mgr.templates[name] = data
+            if fixes:
+                fixed.append(name)
+        # A template the load changed is recorded in every match journal
+        # as a library save is, so a replay spawns what the server holds.
+        for name in fixed:
+            for m in mgr.matches.values():
+                if m.journal is not None:
+                    m.journal.add({
+                        "kind": "template", "name": name, "new_name": None,
+                        "at": _now_iso(),
+                        "by": "", "what": "updated at load",
+                        "data": copy.deepcopy(mgr.templates[name])})
         return notes
 
     # ---- bot settings -----------------------------------------------------
@@ -649,6 +664,7 @@ class Storage:
                     notes.append(self._quarantine(key, path,
                                                   type(ex).__name__))
         notes.extend(self.load_templates(mgr))
+        self._journal_load_changes(mgr)
         lost = any(m.system_name not in mgr.systems
                    for m in mgr.matches.values())
         notes.extend(self._settle_lost_systems(mgr, backups, sys_failed,
@@ -660,6 +676,26 @@ class Storage:
             w["systems"] = None
             w["workspace"] = None
         return notes
+
+    @staticmethod
+    def _journal_load_changes(mgr: MatchManager) -> None:
+        """A match the load changed (data an older build wrote, brought up
+        to date; a file edited by hand) no longer has the state its journal
+        last recorded: a `state` entry records the loaded one, so a replay
+        goes on from what the server holds."""
+        from journal import effective_seed, journal_state, state_hash
+        for m in mgr.matches.values():
+            if m.journal is None or not m.journal.segments:
+                continue
+            post = m.to_dict(include_history=False)
+            h = state_hash(post)
+            if h == m.journal.last_state_hash():
+                continue
+            m.journal.add({"kind": "state", "at": _now_iso(), "by": "",
+                           "cmd": ["(loaded from disk)"], "outside": True,
+                           "rng": [effective_seed(m), m.rng_position(),
+                                   m.rng_position()],
+                           "state": journal_state(post), "hash": h})
 
     def _settle_lost_systems(self, mgr: MatchManager,
                              backups: Dict[str, Tuple[float, Dict[str, Any]]],

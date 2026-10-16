@@ -551,7 +551,11 @@ plus `data/bot_settings.json` (owner limits + rule ceilings) and
   no bound is left), a template file's var under a now-reserved name
   (`legacy_template_fixes`: moved to `<name>_old`), a numeric team (read
   as text at match load, corpses too). A refusal added for new input must
-  not move old files to `corrupt/` (868).
+  not move old files to `corrupt/` (868). What a load changes reaches the
+  command journals: a template it fixed as a `template` entry, a match
+  whose loaded state differs from its journal's last hash as a `state`
+  entry (`(loaded from disk)`, `Storage._journal_load_changes`), so a
+  replay goes on from what the server holds.
 - **Backups** (`!server backups [file] | restore <n>`, admin): each file's
   copies numbered on their own, newest first; `restore <n>` puts
   systems.json copy n back through `_restore_systems` (refused if a match's
