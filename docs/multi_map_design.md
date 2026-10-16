@@ -1,7 +1,7 @@
 # Multiple maps per match (#40) and nested maps (#164): agreed design
 
-Status: design agreed with the user. Steps 1 and 2a-2d of the build
-order (§8) are built; nested maps (step 3) are not. Each item below was decided in
+Status: design agreed with the user. Every step of the build order (§8)
+is built: 1, 2a-2d and nested maps (step 3). Each item below was decided in
 chat; §11 lists what is deferred. Read this whole file
 before starting either feature: every decision here has long-term
 consequences, and the user made each one deliberately.
@@ -469,6 +469,49 @@ share. An even distribution per map is a loop over the maps.
      them. The other choice loses them with the map, which suits a
      spaceship breaking up in space, where corpse tiles would only get in
      the way.
+
+- **Decided before step 3 (user):**
+  1. **Attaching:** `!map attach <map> <unit>` / `!map detach <map>`,
+     stored on the map. A unit may carry several maps (a large ship's
+     decks). An inner map may hold a map vehicle of its own (a shuttle in
+     a hangar); a map can't be attached to a unit standing on it or inside
+     it, so nesting can't loop, and the depth is an owner limit.
+  2. **Boarding is composed:** an action (or a tile hook) calls
+     `move_entity` into the inner map, an exit hatch tile on the inner map
+     moves the unit back beside the vehicle. Formula helpers:
+     `map_carrier(map)` (built under this name: `map_vehicle` is the hook
+     binding, and a function of the same name would shadow it),
+     `inner_maps(eid)`, `outer_map(map)`. Scenario 845 and `!help map
+     attach` show the pattern and recommend the hatch tiles to hosts.
+  3. **Removal without death:** a despawned vehicle ejects the survivors
+     (no death effects) and the inner map detaches, staying an ordinary
+     map. `!ent transfer` / `transfer_entity` of a unit carrying a map are
+     refused for now (moving maps between matches is its own feature).
+  4. **Revive:** the corpse records the attached maps; a revive
+     re-attaches those that still exist (a kept wreck).
+  5. **Display:** inner maps are ordinary maps (lists, boards, following,
+     unseen rules, `map=`, formulas). `!map list` notes "carried by
+     `ship`" only when the view can see the vehicle, so the note never
+     reveals a hidden unit.
+  6. **Order on death:** the vehicle's own `on_death` and its corpse
+     first; then per occupant the effect program and
+     `on_map_vehicle_death`; then the survivors' ejection, the map's fate
+     and the wreck formula (`map_vehicle` names the corpse).
+  7. **Ejected corpses** go on the cell nearest the vehicle's body that no
+     living unit covers (corpses may share a cell); none on the outer map
+     = lost, with a ⚠️.
+  8. **`on_map_vehicle_moved`** fires on every completed move of the
+     vehicle (steps, teleports, map changes), once per move, for the units
+     on each map it carries.
+
+  Built details (step 3): ejection lands around the vehicle's body, as a
+  dismount does, so its corpse's cells stay clear for a revive (its own
+  cells only when nothing around fits); the destroy fate ejects the
+  corpses of the occupants that died in that death (from an effect or
+  with the map), while corpses already lying on the map go with it; a
+  walk (`!ent move`, push, pull, group moves) ends where a hook put the
+  walker, so a hatch mid-path doesn't drag it on along the path;
+  `__delete_when_empty` applies to maps no unit carries.
 
 ## 11. Deferred
 

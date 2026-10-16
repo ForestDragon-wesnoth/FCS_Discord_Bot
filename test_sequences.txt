@@ -26092,3 +26092,292 @@ gate's yard map. A destination with several maps needs `map=`; a unit
 can't be transferred into its own match; transfer_entity is a mutator,
 refused in `$()`. `!ent transfer` takes `map=` for the destination's map
 too.
+
+SCENARIO 844 — Map vehicles: attach, detach, refusals and the nesting limit
+----------------------------------------------------------------------
+
+!match new nv NV 8 8
+!match use nv
+!map new deck 4 4
+!map new hangar 3 3
+!map new bay 2 2
+!ent add ship Ship 50 2 2 map=main
+!ent add shuttle Shuttle 20 1 1 map=deck
+!ent add pod Pod 5 1 1 map=hangar
+!part add ship mast Mast 2 2
+!map attach deck ship
+?? Map `deck` is now carried by `ship`
+!map attach deck pod
+?? ❌ Map `deck` is already carried by `ship`; `!map detach deck` first.
+!map attach main ship
+?? ❌ `ship` stands on map `main` or on a map inside it
+!map attach hangar shuttle
+!map attach deck shuttle
+?? ❌ Map `deck` is already carried by `ship`
+!map detach deck
+?? Map `deck` is no longer carried by `ship`; it is a map of its own.
+!map attach deck pod
+?? ❌ `pod` stands on map `deck` or on a map inside it
+!map attach deck ship
+!map attach bay mast
+?? ❌ `mast` is a body part; attach the map to the unit it belongs to.
+!map attach bay nobody
+?? ❌ Entity 'nobody' not found.
+!eval "[inner_maps('ship'), map_carrier('hangar'), outer_map('hangar'), outer_map('deck'), map_carrier('main'), outer_map('main')]"
+?? = `[['deck'], 'shuttle', 'deck', 'main', None, None]`
+!owner ceiling map_nesting_depth 2
+!map attach bay pod
+?? ❌ Attaching map `bay` to `pod` would nest maps 3 deep, past the map_nesting_depth limit of 2
+!ent tp shuttle 1 1 bay
+?? Teleported `shuttle` to (1,1) on map `bay` (from `deck`).
+!ent tp pod 2 2 deck
+!ent tp shuttle 3 3 hangar
+?? ❌ Moving `shuttle`: map `hangar` is inside `shuttle` (it carries it, or a unit on a map it carries does); a unit can't stand inside itself.
+!owner ceiling map_nesting_depth 3
+!map attach bay pod
+!map list
+?? - `deck`: 4x4, 1 unit, carried by `ship`
+?? - `hangar`: 3x3, 0 units, carried by `shuttle`
+?? - `bay`: 2x2, 1 unit, carried by `pod`
+!ent tp pod 1 1 hangar
+?? ❌ Moving `pod`: map `hangar` is inside `pod`
+!map new cove 2 2
+!ent add raft Raft 5 8 8 map=main
+!map attach cove raft
+!ent tp raft 2 2 hangar
+?? ❌ Moving `raft`: the maps inside `raft` would nest 4 deep on map `hangar`, past the map_nesting_depth limit of 3
+!ent tp raft 1 1 deck
+?? Teleported `raft` to (1,1) on map `deck`
+!owner ceiling map_nesting_depth 4
+!ent set_var shuttle home "$(outer_map('hangar'))"
+!assert "entity[shuttle].home == 'bay'"
+?tab "!map att"
+?? → '!map attach '
+?tab "!map detach h"
+?? → '!map detach hangar '
+!map copy deck deck2
+!assert "map_carrier('deck2') == None and map_carrier('deck') == 'ship'"
+!ent remove pod
+!assert "map_carrier('bay') == None and map_of('shuttle') == 'deck'"
+
+Expected: HARNESS-ALLOWS-ERRORS. A map has one carrier; a unit can't
+carry the map it stands on or one holding it (the shuttle on the deck
+can't carry the deck), and a body part can't carry one. The helpers
+read the links. At map_nesting_depth 2 a third level (bay on the pod on
+the deck) is refused, and at 3 it fits. A move that would put a carrier
+inside itself is refused (the shuttle into its own hangar, the pod into
+the hangar on its bay), and so is one that would nest past the limit
+(the raft with its cove into the hangar, 3 + 1 deep); onto the deck it
+fits. The helpers are read-only, so `$()` takes them; Tab completes
+the new words and map names. A copy of a carried map is a map of its own; a despawned carrier's
+maps become maps of their own.
+
+SCENARIO 845 — Boarding a map vehicle: an action in, a hatch tile out, lurches
+----------------------------------------------------------------------
+
+!match new nb NB 8 8
+!match use nb
+!map new deck 4 3
+!ent add ship Ship 50 4 4 map=main
+!ent set_vars ship footprint_w=2 footprint_h=2
+!map attach deck ship
+!ent add sailor Sailor 10 3 4 map=main
+!ent set_var sailor lurches 0
+!ent set_var sailor gear.actions.board.target entity
+!ent set_var sailor gear.actions.board.body "if entity_distance(self, target) > 1:\n    fail('the hatch is out of reach')\nmove_entity(self, 2, 1, map=get(inner_maps(target), 0))"
+!passive add sailor lurch on_map_vehicle_moved "entity[self].lurches = entity[self].lurches + 1"
+!tile hook add 1 1 on_enter "move_entity(self, free_cell_near(entity[map_carrier()].x, entity[map_carrier()].y, 2, self, map=outer_map()))" map=deck
+!ent add crate Crate 5 3 2 map=deck
+!ent set_vars crate footprint_w=2 footprint_h=2
+!action sailor board ship
+!assert "map_of('sailor') == 'deck' and entity[sailor].x == 2 and entity[sailor].y == 1"
+!ent move ship 2 right
+!assert "entity[sailor].lurches == 1 and map_of('sailor') == 'deck'"
+!ent tp ship 1 6
+!assert "entity[sailor].lurches == 2"
+!ent move sailor 1 left
+!assert "map_of('sailor') == 'main' and entity[sailor].lurches == 2"
+!eval "entity_distance('sailor', 'ship') <= 2"
+?? = `True`
+!ent tp sailor 8 1
+!action sailor board ship
+?? the hatch is out of reach
+!ent move ship 1 right
+!assert "entity[sailor].lurches == 2"
+!tile hook add 3 1 on_enter "move_entity(self, free_cell_near(entity[map_carrier()].x, entity[map_carrier()].y, 2, self, map=outer_map()))" map=deck
+!ent tp sailor 4 1 deck
+!ent move sailor 2 left
+?? Moved `sailor`; a triggered effect took it to
+?? on map `main`.
+!assert "map_of('sailor') == 'main' and entity_distance('sailor', 'ship') <= 2"
+
+Expected: HARNESS-ALLOWS-ERRORS. Boarding is composed: the sailor's
+`board` action checks it stands beside the ship and moves it onto the
+ship's deck (inner_maps). A 2x2 ship moving two steps right lurches the
+deck's units once per move (on_map_vehicle_moved: the sailor's counter
+goes to 1), and a teleport lurches them again (2). The hatch tile on the
+deck moves a unit that steps on it beside the ship on its outer map
+(map_carrier / outer_map / free_cell_near), after which the ship's moves
+no longer reach it. Out of reach, the action fails. A walk ends where a
+hook put the walker: two steps left onto a second hatch leave the sailor
+beside the ship (the walk used to carry on with the same coordinates on
+the outer map).
+
+SCENARIO 846 — A map vehicle dies: effects per occupant, ejection, the map destroyed
+----------------------------------------------------------------------
+
+!match new nd ND 8 8
+!match use nd
+!map new deck 4 4
+!ent add ship Ship 50 4 4 map=main
+!ent set_vars ship footprint_w=2 footprint_h=2
+!ent set_var ship map_vehicle_death_effect "entity[self].hp = entity[self].hp - 10"
+!map attach deck ship
+!ent add marine Marine 20 1 1 map=deck
+!ent add medic Medic 8 2 1 map=deck
+!ent add alien Alien 5 3 1 map=deck
+!ent set_var alien __map_vehicle_death_effect "entity[self].scarred = True"
+!ent add ogre Ogre 40 1 3 map=deck
+!ent set_vars ogre footprint_w=2 footprint_h=2
+!ent init marine 4
+!ent init medic 3
+!ent init alien 2
+!ent init ogre 1
+!passive add ship wreck on_death "match_var_set('order', 'ship')"
+!gpassive add shaken on_map_vehicle_death "match_var_set('order', match_var_get('order') + ',' + self_id() + '@' + map_vehicle)"
+!ent kill ship
+?? 💀 **Ship** (`ship`) died.
+?? 💀 **Medic** (`medic`) died.
+!assert "match_var_get('order') == 'ship,marine@ship,alien@ship,ogre@ship'"
+!assert "map_of('marine') == 'main' and entity[marine].hp == 10"
+!assert "map_of('alien') == 'main' and entity[alien].hp == 5 and entity[alien].scarred"
+!assert "map_of('ogre') == 'main' and entity[ogre].hp == 30 and entity_distance('ogre', 'marine') >= 1"
+!assert "has_corpse('medic') and has_corpse('ship') and maps() == ['main']"
+!map list
+?? **Maps of ND** (1):
+!list
+?? Medic (`medic`)
+!map new rock 1 2
+!map new cabin 2 1
+!ent add pod Pod 5 1 1 map=rock
+!ent add boulder Boulder 5 1 2 map=rock
+!ent set_var pod __map_vehicle_corpses lose
+!map attach cabin pod
+!ent add pilot Pilot 5 1 1 map=cabin
+!ent add stowaway Stowaway 5 2 1 map=cabin
+!ent kill pod
+?? ⚠️ `stowaway` couldn't leave map `cabin` with `pod` gone
+?? 💀 **Stowaway** (`stowaway`) died.
+!assert "map_of('pilot') == 'rock' and entity[pilot].x == 1 and entity[pilot].y == 1"
+!assert "not has_corpse('stowaway') and has_corpse('pod') and 'cabin' not in maps()"
+
+Expected: HARNESS-ALLOWS-ERRORS. The ship's own on_death runs first;
+then each occupant in turn order (initiative 4, 3, 2, 1) gets its death
+effect, then on_map_vehicle_death (map_vehicle = ship). The ship's
+effect var takes 10 hp from the marine (20 → 10), the ogre (40 → 30) and
+the medic (8 → -2, dies before its hook, so `order` skips it); the
+alien's own effect replaces the ship's (scarred, hp kept). The
+survivors land around the ship's body on main (its own cells stay clear
+for a revive), the 2x2 ogre on cells clear of the others; the medic's
+corpse is ejected too (map_vehicle_corpses eject), and the deck is gone. The pod's one free cell takes the
+pilot; the stowaway has no room (⚠️), dies with the cabin, and its
+corpse is lost (the pod's `__map_vehicle_corpses` = lose).
+
+SCENARIO 847 — Wrecks: the wreck formula, revive re-attaches, delete when empty, despawn
+----------------------------------------------------------------------
+
+!match new nw NW 8 8
+!match use nw
+!system set default map_vehicle_death_map wreck
+!map new hull 3 3
+!map new boot 2 2
+!ent add tank Tank 30 2 2 map=main
+!ent set_var tank wreck_formula "tile_set(2, 2, 'fire', True)\nmap_var_set('wreck_of', map_vehicle)"
+!map attach hull tank
+!ent add driver Driver 10 1 1 map=hull
+!ent kill tank
+?? 💀 **Tank** (`tank`) died.
+!assert "map_of('driver') == 'main' and map_carrier('hull') == None"
+!assert "tile_get(2, 2, 'fire', map='hull') and map_var_get('wreck_of', map='hull') == 'tank'"
+!ent revive tank
+!assert "map_carrier('hull') == 'tank'"
+!map list
+?? - `hull`: 3x3, 0 units, carried by `tank`
+!ent tp driver 2 1 hull
+!map var set __delete_when_empty true map=hull
+!ent kill tank
+?? Map `hull` was deleted: nobody is left on it (__delete_when_empty).
+!assert "'hull' not in maps() and map_of('driver') == 'main'"
+!ent revive tank
+?! ⚠️
+!assert "inner_maps('tank') == []"
+!ent add jeep Jeep 10 6 6 map=main
+!ent set_var jeep __map_vehicle_death_map destroy
+!map attach boot jeep
+!ent add rat Rat 2 1 1 map=boot
+!ent remove jeep
+!assert "map_of('rat') == 'main' and entity_distance('rat', 'tank') >= 1"
+!assert "map_carrier('boot') == None and 'boot' in maps()"
+
+Expected: Under map_vehicle_death_map wreck the hull stays, a map of its
+own: the driver is ejected beside the tank's corpse, and the tank's wreck formula runs on the
+hull (no map= needed) with map_vehicle bound. A revive carries the hull
+again. With `__delete_when_empty` set, the second death ejects the
+driver and the empty hull is deleted after the command; the next revive
+finds no hull and says nothing. A despawned carrier ejects its
+occupants with no death effects and its map stays as a map of its own
+(the jeep's destroy override applies to deaths only).
+
+SCENARIO 848 — Map vehicles: hidden carriers, transfers refused, undo, restart, rename
+----------------------------------------------------------------------
+
+!match new nh NH 8 8
+!match use nh
+!match new other Other 4 4
+!map new hold 3 3
+!ent add sub Sub 20 7 7 map=main
+!ent set_var sub team blue
+!ent add scout Scout 10 1 1 map=main
+!ent set_var scout team red
+!ent add stoker Stoker 5 1 1 map=hold
+!ent set_var stoker team red
+!map attach hold sub
+!match fog on map=main
+!defvar add fog_vision_radius 2
+!as view red
+!map list
+?? - `hold`: 3x3, 1 unit
+?! carried by
+!as view clear
+!map list
+?? - `hold`: 3x3, 1 unit, carried by `sub`
+!ent transfer sub other 2 2
+?? ❌ `sub` carries map(s) `hold`; a unit carrying a map can't move to another match (`!map detach` them first).
+!match use other
+!match link nh
+!match use nh
+!eval "transfer_entity('sub', 'other', 1, 1)"
+?? carries map(s) `hold`
+!assert "map_carrier('hold') == 'sub'"
+!map detach hold
+!undo command
+!assert "map_carrier('hold') == 'sub'"
+!as restart
+!match use nh
+!assert "map_carrier('hold') == 'sub' and outer_map('hold') == 'main'"
+!system set default map_vehicle_death_map wreck
+!ent kill sub
+!map rename hold bilge
+!ent revive sub
+!assert "map_carrier('bilge') == 'sub' and map_of('stoker') == 'main'"
+!undo command 3
+!assert "map_carrier('hold') == 'sub' and map_of('stoker') == 'hold'"
+
+Expected: HARNESS-ALLOWS-ERRORS. Under red's view the sub is fogged, so
+`!map list` doesn't name it as the hold's carrier; the omniscient view
+does. `!ent transfer` and transfer_entity (into a match linked to this
+one) refuse a unit carrying a map.
+An attach survives undo (the detach is undone) and a restart. A wreck
+kept by the dead sub follows a map rename, so the revive carries the
+renamed bilge again; undoing the revive, the rename and the death puts
+the stoker back in the hold.

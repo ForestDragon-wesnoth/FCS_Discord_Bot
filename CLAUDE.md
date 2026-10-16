@@ -392,8 +392,8 @@ back, load the schema with `ToolSearch` before calling
 | `action.run_action` | every action | pre-state for rollback, `_action_depth`, choice replay, on_action_used / failed / on_target |
 | `Match.summon_entity` / `Entity.spawn` | every dynamic creation | id minting, placement, `default_entity_vars`, `checked_unit_vars`, on_entity_spawned, summon budget |
 | `Entity.remove` | every removal | part subtree, riders, auras, schedules, turn pointer (`turn_vacated`), on_entity_despawned |
-| `Match._process_death` | every death | on_death, corpse vs delete, part death routing, turn rebuild |
-| `Match.fire_entity_moved` | every completed move | part / aura / rider re-stamp, snake resettle, fog memory |
+| `Match._process_death` | every death | on_death, corpse vs delete, part death routing, turn rebuild, a map vehicle's occupants (`_map_vehicle_died`) |
+| `Match.fire_entity_moved` | every completed move | part / aura / rider re-stamp, snake resettle, fog memory, on_map_vehicle_moved |
 | `Match.surface_log` | log lines from formula-driven changes | the action buffer or the command's `FORMULA_LOG_SINK` |
 | `Storage.commit` | after every top-level command | disk mirror, limits, autosave / old-template cuts, rollback |
 
@@ -1049,7 +1049,7 @@ hardcodes**.
   `on_entity_step` per step. Lifecycle: on_entity_spawned,
   on_entity_despawned (every non-death removal, fired BEFORE the unit
   leaves; `Entity.remove(despawn=)` returns its log), on_death / on_revive,
-  on_entity_moved, on_mounted / on_dismounted, on_turn_skipped (`skip_status`), on_status_*,
+  on_entity_moved, on_entity_changed_map, on_map_vehicle_moved / on_map_vehicle_death (§7.8), on_mounted / on_dismounted, on_turn_skipped (`skip_status`), on_status_*,
   on_action_used / on_action_failed / on_action_used_on_target.
 - **Event bus:** `emit(name, payload, target)` / `!emit`. Global handlers
   fire ONCE (self = target, else the current unit); a directed event also
@@ -1432,6 +1432,35 @@ hardcodes**.
   `_BoardView`; `_board_map` keeps the browsed map until `turns_elapsed`
   changes); the GUI has a map dropdown with the same rule; the CLI uses
   `!map <name>` (837-838, 841).
+- **Nested maps** (step 3, 844-848): `!map attach <map> <unit>` /
+  `!map detach <map>` (host) make a unit carry a map (`Map.vehicle`,
+  saved; a unit may carry several; a body part can't). A map can't be
+  attached to a unit standing on it or inside it, and a move
+  (`move_to_map`, `check_map_nesting`) can't put a carrier inside itself;
+  nesting is bounded by the owner limit `map_nesting_depth` (default 4).
+  Helpers `maps_carried_by`, `outer_map_of`, `map_depth`, `maps_inside`;
+  formulas `map_carrier(map)`, `inner_maps(eid)` (loopable),
+  `outer_map(map)`. Inner maps are ordinary maps otherwise (lists,
+  boards, unseen rules, `map=`); `!map list` says "carried by `x`" only
+  when the view can see x. Boarding is composed (an action in, a hatch
+  tile out; `!help map attach`). `on_map_vehicle_moved` fires from
+  `fire_entity_moved` for the units on every map the moved body carries
+  (`map_vehicle` bound, the inner map as `context_map`). A carrier's
+  death (`Match._map_vehicle_died`, after `_process_death` leaves its
+  guard): per occupant in turn order the death effect (`__map_vehicle_
+  death_effect` > the vehicle's var named by `map_vehicle_death_effect_var`
+  > the rule) and `on_map_vehicle_death`, then the survivors are ejected
+  around the vehicle's body (`_eject_spot`; no room = stays, ⚠️), then
+  `map_vehicle_death_map` (`__map_vehicle_death_map`): destroy kills the
+  rest and drops the map, its occupants' corpses ejected or lost per
+  `map_vehicle_corpses`; wreck keeps it, records it in the corpse
+  (`maps`, a revive re-attaches it) and runs the wreck formula
+  (`map_vehicle_wreck_var` / `_formula`) with the wreck as its map. A
+  despawn ejects and detaches (`_release_inner_maps`, from
+  `Entity.remove`); transfers of a carrier are refused. The map var
+  `__delete_when_empty` deletes a map of its own once no unit is on it
+  (swept after each top-level command, `sweep_empty_maps`). A walk ends
+  where a hook put the walker (`move_dirs`, `move_group_dirs`).
 - **Roster on several maps:** `!list` / `!state` group units by map then
   team, or team then map (`roster_map_grouping`; teams in order of first
   turn, the team a disguise shows), corpses by map (`_roster_groups`); a
@@ -2219,8 +2248,9 @@ rejected already. Update this section in the PR that resolves an item.
   before deviating from it. Built: step 1 (the Map model), step 2a
   (management, map vars, command map resolution, following, cross-map
   moves), step 2b (formulas), step 2c (unseen / hidden maps, board
-  browsing, roster grouping; §7.8) and step 2d (`transfer_entity`,
-  `!match link`; §7.16). Next: nested maps (step 3).
+  browsing, roster grouping; §7.8), step 2d (`transfer_entity`,
+  `!match link`; §7.16) and step 3 (nested maps, §7.8). The design doc's
+  §11 lists what stays deferred (vision between nested maps, ...).
 - **Later:** graphics mouse select / drag and
   animation ("foreseeable future"); a per-entity ATB threshold; arbitrary /
   L-shaped footprints and footprint rotation; per-rider footprints inside a

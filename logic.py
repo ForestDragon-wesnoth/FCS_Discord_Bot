@@ -1425,6 +1425,77 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "owner's ceiling (`!owner ceiling`, default 4000000)."
         ),
     },
+    "map_vehicle_death_map": {
+        "default": "destroy",
+        "schema": {"type": "enum", "choices": ["destroy", "wreck"]},
+        "desc": (
+            "What happens to the maps a unit carries (`!map attach`) when it "
+            "dies: 'destroy' (default) deletes them, and every occupant "
+            "that wasn't ejected dies with them; 'wreck' keeps them as "
+            "ordinary maps, runs the wreck formula once "
+            "(map_vehicle_wreck_var / map_vehicle_wreck_formula), and a "
+            "revive of the unit re-attaches them. A unit's "
+            "`__map_vehicle_death_map` var (destroy / wreck) overrides the "
+            "rule. Before either, each occupant's death effect runs "
+            "(map_vehicle_death_effect), on_map_vehicle_death fires, and the "
+            "survivors are ejected to the free cells nearest the unit's "
+            "body on its map (one with no room stays, with a ⚠️). A map "
+            "var `__delete_when_empty` set to true deletes a map once no "
+            "living unit is on it (checked after each command)."
+        ),
+    },
+    "map_vehicle_corpses": {
+        "default": "eject",
+        "schema": {"type": "enum", "choices": ["eject", "lose"]},
+        "desc": (
+            "When map_vehicle_death_map destroys a dead unit's inner maps: "
+            "'eject' (default) puts the corpses of the occupants that died "
+            "in it on the cells nearest the unit's body that no living unit "
+            "covers (several may share a cell; one with no room is lost "
+            "with a ⚠️), where a medic or looter can reach them; 'lose' "
+            "deletes them with the map. A unit's `__map_vehicle_corpses` "
+            "var (eject / lose) overrides the rule."
+        ),
+    },
+    "map_vehicle_death_effect_var": {
+        "default": "map_vehicle_death_effect",
+        "schema": {"type": "str"},
+        "desc": (
+            "Unit var holding a map vehicle's death effect: a formula "
+            "program run once per occupant of its inner maps when it dies "
+            "(self = the occupant, map_vehicle bound, in turn order). An "
+            "occupant's own `__map_vehicle_death_effect` var replaces the "
+            "vehicle's; without either, map_vehicle_death_effect applies."
+        ),
+    },
+    "map_vehicle_death_effect": {
+        "default": "",
+        "schema": {"type": "str", "formula": "program"},
+        "desc": (
+            "Default death effect for the occupants of a dying map vehicle "
+            "(see map_vehicle_death_effect_var); empty = nothing, so the "
+            "occupants are only ejected (or die with a destroyed map)."
+        ),
+    },
+    "map_vehicle_wreck_var": {
+        "default": "wreck_formula",
+        "schema": {"type": "str"},
+        "desc": (
+            "Unit var holding a map vehicle's wreck formula: a program run "
+            "once on each inner map kept as a wreck (map_vehicle_death_map "
+            "wreck), right after the survivors leave, with that map as the "
+            "formula's map (tile_set etc. need no map=) and map_vehicle "
+            "bound. Without the var, map_vehicle_wreck_formula applies."
+        ),
+    },
+    "map_vehicle_wreck_formula": {
+        "default": "",
+        "schema": {"type": "str", "formula": "program"},
+        "desc": (
+            "Default wreck formula (see map_vehicle_wreck_var); empty = "
+            "nothing."
+        ),
+    },
     "map_delete_mode": {
         "default": "refuse",
         "schema": {"type": "enum", "choices": ["refuse", "kill"]},
@@ -3622,7 +3693,7 @@ MAP_RESERVED_NAMES = frozenset({
     "colors", "cell", "preview", "ent_sight", "background", "border", "mode",
     "scene", "image", "color", "teamcolor", "resize", "layer", "autoupdate",
     "legend", "coords", "pan", "center", "new", "list", "delete", "rename",
-    "copy", "use", "var", "fog", "unseen"})
+    "copy", "use", "var", "fog", "unseen", "attach", "detach"})
 
 
 def check_map_name(name: Any) -> None:
@@ -4010,6 +4081,14 @@ HOOK_NAMES: Set[str] = {
     # them too; they are equal for an ordinary move), so a GM who only
     # cares about map changes needs no test.
     "on_entity_changed_map",
+    # Nested maps: fired for the units on each map a unit carries (its
+    # inner maps, `!map attach`) when that unit completes a move — a
+    # step, a teleport, a change of maps — with `map_vehicle` bound.
+    "on_map_vehicle_moved",
+    # Fired for each occupant of a dying map vehicle's inner maps, after
+    # that occupant's death effect (map_vehicle_death_effect), with
+    # `map_vehicle` bound.
+    "on_map_vehicle_death",
     # Action usage event. Fires AFTER an action body has run to
     # completion (and after its outer snapshot has been committed). A
     # passive watching this hook sees the final state, not an in-flight
@@ -5015,6 +5094,11 @@ OWNER_LIMITS: Dict[str, Dict[str, Any]] = {
         "desc": "How many entries each server's `!server audit` log keeps "
                 "(0 = no log).",
     },
+    "map_nesting_depth": {
+        "default": 4, "min": 1, "max": 32,
+        "desc": "How deep maps may nest: a map a unit carries (`!map "
+                "attach`) is 1 deep, a map carried by a unit on it 2, ...",
+    },
 }
 
 
@@ -5860,6 +5944,12 @@ class Entity:
         # route here) per the mount_on_vehicle_death rule — done while `self` is
         # still in the match so the eject search can use its footprint.
         m._release_riders(self.id, corpse_kept=corpse_kept)
+        # The maps it carries: a despawn ejects their units and detaches
+        # them (a death runs Match._map_vehicle_died after the removal).
+        if despawn:
+            log.extend(m._release_inner_maps(self))
+            if self._match is not m or self.id not in m.entities:
+                return log
         # A removed snake segment closes the chain behind it, or the next
         # segment would keep following an id that no longer exists.
         m._splice_out_segment(self)
@@ -6072,12 +6162,19 @@ class Entity:
         # phase 1 already proved the whole path is legal.
         log: List[str] = []
         origin_x, origin_y = self.x, self.y
+        placed = (self.map, self.x, self.y)
         for nx, ny, step_facing in step_path:
             # A hook on an earlier step (a lethal tile/zone, a passive) may
             # have removed the mover: stop. Walking on would move a detached
             # unit and fire the remaining cells' hooks for it — a corpse
             # tripping traps down the rest of the path.
             if self._match is not m or self.id not in m.entities:
+                return log
+            # A hook moved it (a teleporter, a hatch onto another map): the
+            # walk ends where the hook put it, and that move fired its own
+            # stop and moved hooks. Walking on used to drag it back onto
+            # the path, or onto the same coordinates of the new map.
+            if (self.map, self.x, self.y) != placed:
                 return log
             step_from_x, step_from_y = self.x, self.y
             old_cells = m.entity_cells(self, step_from_x, step_from_y)
@@ -6090,6 +6187,7 @@ class Entity:
                 log.extend(m.fire_footprint_zone_exit(self.id, old_cells, new_cells))
             self.facing = step_facing
             self.move_to(nx, ny)
+            placed = (self.map, nx, ny)
             if fire_hooks:
                 # on_enter/on_cell_enter for the newly-covered cells; the
                 # stop hooks fire once after the loop at the final cells.
@@ -6107,6 +6205,8 @@ class Entity:
                 ))
         if self._match is not m or self.id not in m.entities:
             return log  # removed by the last step's hooks — no stop/moved hooks
+        if step_path and (self.map, self.x, self.y) != placed:
+            return log  # the last step's hooks moved it (their own hooks fired)
         if fire_hooks and step_path:
             # on_stop fires once per final footprint cell, even if no actual
             # movement happened (zero-step move_dirs) — empty step_path
@@ -6786,6 +6886,9 @@ class Map:
     # The var names this map's settings use: map-var-name rule -> name, so
     # a rule change can move the var (Match.sync_map_var_names).
     var_names: Dict[str, str] = field(default_factory=dict)
+    # The unit carrying this map (nested maps, `!map attach`): its map
+    # vehicle. None for a map of its own.
+    vehicle: Optional[str] = None
 
     def size_text(self) -> str:
         return f"{self.grid_width}x{self.grid_height}"
@@ -7218,6 +7321,7 @@ class Map:
             "grid_height": self.grid_height,
             "vars": copy.deepcopy(self.vars),
             "var_names": dict(self.var_names),
+            "vehicle": self.vehicle,
             "tiles": {
                 f"{x},{y}": copy.deepcopy(dat)
                 for (x, y), dat in sorted(self.tiles.items())
@@ -7246,6 +7350,8 @@ class Map:
                  grid_height=int(d["grid_height"]))
         raw_vars = d.get("vars")
         mp.vars = copy.deepcopy(raw_vars) if isinstance(raw_vars, dict) else {}
+        veh = d.get("vehicle")
+        mp.vehicle = veh if isinstance(veh, str) and veh else None
         raw_vn = d.get("var_names")
         mp.var_names = {str(k): str(v) for k, v in raw_vn.items()
                         if k in MAP_VAR_NAME_RULES and isinstance(v, str)
@@ -8115,23 +8221,7 @@ class Match:
                 raise VTTError(
                     f"Map `{name}` still has unit(s) on it ({ids}). Move them "
                     f"off first, or set map_delete_mode=kill to kill them.")
-            # Kill until nothing is left on it (a death hook can summon onto
-            # the map); bounded by summon_event_limit like resize, and a
-            # unit a death hook brought back is removed outright.
-            handled: Set[str] = set()
-            while roots:
-                for eid in roots:
-                    e = self.entities.get(eid)
-                    if e is None:
-                        continue
-                    if eid in handled:
-                        log.extend(e.remove())
-                        continue
-                    handled.add(eid)
-                    _, klog = self.kill_entity(eid)
-                    log.extend(klog)
-                roots = sorted(e.id for e in self.units_on_map(name)
-                               if not e.part_of)
+            log.extend(self._kill_all_on_map(name))
         # A corpse-less death leaves nothing; any unit still naming the map
         # (a dead part) leaves with it.
         for e in list(self.units_on_map(name)):
@@ -8186,6 +8276,9 @@ class Match:
             for body in [corpse.get("entity")] + list(corpse.get("parts") or []):
                 if isinstance(body, dict) and body.get("map") == old:
                     body["map"] = new
+            kept = corpse.get("maps")
+            if isinstance(kept, list):
+                corpse["maps"] = [new if k == old else k for k in kept]
         for st in stores:
             n += _rename_map_coords(st, old, new)
         return n
@@ -8203,6 +8296,7 @@ class Match:
         self.check_cell_limit(src.grid_width * src.grid_height, "!map copy")
         mp = Map.from_dict(new, src.to_dict())
         mp.explored, mp.fog_reveals = {}, {}
+        mp.vehicle = None
         for key in list(mp.tiles):
             cell = mp.tiles[key]
             cell.pop("corpses", None)
@@ -8224,6 +8318,356 @@ class Match:
         self.fill_default_map_vars(mp)
         self.maps[new] = mp
         return mp, renamed
+
+    # ---- nested maps (map vehicles, `!map attach`) ------------------------
+    def maps_carried_by(self, eid: str) -> List["Map"]:
+        """The maps unit `eid` carries (its inner maps), in map order."""
+        return [mp for mp in self.maps.values() if mp.vehicle == eid]
+
+    def outer_map_of(self, mp: "Map") -> Optional["Map"]:
+        """The map `mp`'s vehicle stands on; None for a map of its own."""
+        v = self.entities.get(mp.vehicle) if mp.vehicle else None
+        return self.maps.get(v.map) if v is not None else None
+
+    def map_depth(self, mp: "Map") -> int:
+        """How deep `mp` nests: 0 for a map of its own, 1 for a map a unit
+        on such a map carries, ..."""
+        d, seen = 0, {mp.name}
+        cur = self.outer_map_of(mp)
+        while cur is not None and cur.name not in seen:
+            seen.add(cur.name)
+            d, cur = d + 1, self.outer_map_of(cur)
+        return d
+
+    def maps_inside(self, eid: str) -> List["Map"]:
+        """Every map inside unit `eid`: the maps it carries, the maps the
+        units on those carry, and so on (outermost first)."""
+        out: List["Map"] = []
+        seen: Set[str] = set()
+        todo = self.maps_carried_by(eid)
+        while todo:
+            mp = todo.pop(0)
+            if mp.name in seen:
+                continue
+            seen.add(mp.name)
+            out.append(mp)
+            for u in self.units_on_map(mp.name):
+                todo += self.maps_carried_by(u.id)
+        return out
+
+    def _nest_height(self, eid: str, seen: Optional[Set[str]] = None) -> int:
+        """How many levels of maps unit `eid` holds (0 = it carries none)."""
+        seen = set() if seen is None else seen
+        best = 0
+        for mp in self.maps_carried_by(eid):
+            if mp.name in seen:
+                continue
+            seen.add(mp.name)
+            best = max(best, 1 + self._map_height(mp, seen))
+        return best
+
+    def _map_height(self, mp: "Map", seen: Optional[Set[str]] = None) -> int:
+        """How many levels of maps the units on `mp` hold."""
+        seen = set() if seen is None else seen
+        return max((self._nest_height(u.id, seen)
+                    for u in self.units_on_map(mp.name)), default=0)
+
+    def check_map_nesting(self, carriers: List["Entity"], dest: "Map",
+                          what: str) -> None:
+        """Refuse putting the map carriers `carriers` on map `dest` when
+        `dest` is inside one of them (nesting would loop) or the maps they
+        hold would nest deeper than the map_nesting_depth owner limit."""
+        cap = owner_limit("map_nesting_depth")
+        base = self.map_depth(dest)
+        for u in carriers:
+            inner = self.maps_inside(u.id)
+            if not inner:
+                continue
+            if any(mp is dest for mp in inner):
+                raise VTTError(
+                    f"{what}: map `{dest.name}` is inside `{u.id}` (it "
+                    f"carries it, or a unit on a map it carries does); a "
+                    f"unit can't stand inside itself.")
+            if base + self._nest_height(u.id) > cap:
+                raise VTTError(
+                    f"{what}: the maps inside `{u.id}` would nest "
+                    f"{base + self._nest_height(u.id)} deep on map "
+                    f"`{dest.name}`, past the map_nesting_depth limit of "
+                    f"{cap} (`!owner ceiling`).")
+
+    def attach_map(self, name: str, eid: str) -> "Map":
+        """Make unit `eid` carry map `name` (its map vehicle). Refuses a
+        body part, a map another unit carries, a unit standing on the map
+        or inside it, and nesting past the map_nesting_depth owner limit."""
+        mp = self.get_map(name)
+        e = self.entities.get(eid)
+        if e is None:
+            raise NotFound(f"Entity '{eid}' not found.")
+        if e.part_of:
+            raise VTTError(f"`{eid}` is a body part; attach the map to the "
+                           f"unit it belongs to.")
+        if mp.vehicle and mp.vehicle in self.entities:
+            raise VTTError(
+                f"Map `{name}` is already carried by `{mp.vehicle}`; "
+                f"`!map detach {name}` first.")
+        cur: Optional["Map"] = self.map_of(e)
+        seen: Set[str] = set()
+        while cur is not None and cur.name not in seen:
+            if cur is mp:
+                raise VTTError(
+                    f"`{eid}` stands on map `{name}` or on a map inside it; "
+                    f"a map can't be carried by a unit inside it.")
+            seen.add(cur.name)
+            cur = self.outer_map_of(cur)
+        cap = owner_limit("map_nesting_depth")
+        depth = self.map_depth(self.map_of(e)) + 1 + self._map_height(mp)
+        if depth > cap:
+            raise VTTError(
+                f"Attaching map `{name}` to `{eid}` would nest maps {depth} "
+                f"deep, past the map_nesting_depth limit of {cap} "
+                f"(`!owner ceiling`).")
+        mp.vehicle = eid
+        return mp
+
+    def detach_map(self, name: str) -> "Map":
+        """Make map `name` a map of its own again."""
+        mp = self.get_map(name)
+        if not mp.vehicle:
+            raise VTTError(f"Map `{name}` isn't carried by any unit.")
+        mp.vehicle = None
+        return mp
+
+    def _turn_sorted(self, units: List["Entity"]) -> List["Entity"]:
+        """`units` in turn order, then the rest by id."""
+        pos = {eid: i for i, eid in enumerate(self.turn_order)}
+        return sorted(units, key=lambda u: (pos.get(u.id, len(pos)), u.id))
+
+    def _eject_spot(self, u: "Entity", outer: "Map",
+                    box: Tuple[int, int, int, int]) -> Optional[Tuple[int, int]]:
+        """Where `u` (a unit, or a corpse's body) lands when it leaves a
+        map vehicle with body `box` (x, y, w, h): the cell nearest the body
+        that fits it, around the body as a dismount lands (so the vehicle's
+        own cells stay clear for a revive), on the body's cells only when
+        nothing around it fits."""
+        bx, by, bw, bh = box
+        w, h = self.entity_footprint(u)
+        ox, oy = bx + (bw - 1) / 2 - (w - 1) / 2, by + (bh - 1) / 2 - (h - 1) / 2
+        body = {(bx + i, by + j) for i in range(bw) for j in range(bh)}
+        return (self._nearest_fit_cell(u, ox, oy, outer, avoid=body)
+                or self._nearest_fit_cell(u, ox, oy, outer))
+
+    def _eject_from_maps(self, maps: List["Map"], outer: "Map",
+                         box: Tuple[int, int, int, int], vid: str
+                         ) -> List[str]:
+        """Move every free-standing unit on `maps` (riders go with their
+        mounts) to the cell of map `outer` nearest the vehicle body `box`
+        (x, y, w, h), as a dismount does; one with no room stays, with a
+        ⚠️."""
+        log: List[str] = []
+        for mp in maps:
+            for u in self._turn_sorted(
+                    [u for u in self.units_on_map(mp.name)
+                     if not u.part_of and not u.mounted_on]):
+                if u.id not in self.entities or u.map != mp.name:
+                    continue
+                spot = self._eject_spot(u, outer, box)
+                try:
+                    if spot is None:
+                        raise Occupied("no free cell fits its body")
+                    log.extend(self.move_to_map(u, spot[0], spot[1],
+                                                outer.name))
+                except VTTError as ex:
+                    log.append(self.unit_line(
+                        u.id, f"⚠️ `{u.id}` couldn't leave map `{mp.name}` "
+                              f"with `{vid}` gone ({ex}); it stays there."))
+        return log
+
+    def _release_inner_maps(self, e: "Entity") -> List[str]:
+        """A map vehicle leaving without a death (a despawn): the units on
+        its maps are ejected beside it, with no death effects, and the maps
+        become maps of their own."""
+        maps = self.maps_carried_by(e.id)
+        if not maps:
+            return []
+        w, h = self.entity_footprint(e)
+        log = self._eject_from_maps(maps, self.map_of(e), (e.x, e.y, w, h),
+                                    e.id)
+        for mp in maps:
+            mp.vehicle = None
+        return log
+
+    def _run_map_vehicle_program(self, src: str, target: Optional[str],
+                                 extras: Dict[str, Any], what: str
+                                 ) -> List[str]:
+        """Run a nested-map program (a death effect, a wreck formula);
+        an error becomes a ⚠️ line."""
+        if not src.strip():
+            return []
+        from formula import FormulaEngine, EvalCtx, FormulaError
+        engine = FormulaEngine(self)
+        ctx = EvalCtx(this=self.current_entity_id(), target=target,
+                      extras=extras)
+        try:
+            engine.eval_program(src, ctx)
+        except FormulaError as ex:
+            return [f"⚠️ {what} failed: {ex}"]
+        return []
+
+    def _map_vehicle_died(self, vid: str, vars_: Dict[str, Any],
+                          box: Tuple[int, int, int, int], outer_name: str
+                          ) -> List[str]:
+        """The maps of map vehicle `vid`, which just died (its corpse, if
+        any, is stored and the unit removed): each occupant's death effect
+        and on_map_vehicle_death, the survivors' ejection, then each map's
+        fate (map_vehicle_death_map) and the wreck formula."""
+        maps = self.maps_carried_by(vid)
+        if not maps:
+            return []
+        log: List[str] = []
+        outer = self.maps.get(outer_name)
+        fate = vars_.get("__map_vehicle_death_map")
+        if fate not in ("destroy", "wreck"):
+            fate = str(self.rules.get("map_vehicle_death_map", "destroy"))
+        corpses_mode = vars_.get("__map_vehicle_corpses")
+        if corpses_mode not in ("eject", "lose"):
+            corpses_mode = str(self.rules.get("map_vehicle_corpses", "eject"))
+        veh_effect = vars_.get(str(self.rules.get(
+            "map_vehicle_death_effect_var", "map_vehicle_death_effect")))
+        if not isinstance(veh_effect, str):
+            veh_effect = str(self.rules.get("map_vehicle_death_effect", "")
+                             or "")
+        names = [mp.name for mp in maps]
+        # 1. Each occupant (riders too), map by map in turn order: its
+        # death effect, then on_map_vehicle_death.
+        occupants: Dict[str, str] = {}
+        for name in names:
+            for u in self._turn_sorted([u for u in self.units_on_map(name)
+                                        if not u.part_of]):
+                occupants[u.id] = name
+        for oid, name in occupants.items():
+            u = self.entities.get(oid)
+            if u is None or u.map != name:
+                continue
+            own = u.vars.get("__map_vehicle_death_effect")
+            src = own if isinstance(own, str) else veh_effect
+            extras = {"map_vehicle": vid, "context_map": name,
+                      "hook_name": "on_map_vehicle_death"}
+            log.extend(self._run_map_vehicle_program(
+                src, oid, extras, f"The death effect of `{vid}` on `{oid}`"))
+            if oid in self.entities:
+                log.extend(self.fire_hook("on_map_vehicle_death",
+                                          target_ids=[oid], extras=extras))
+            # The effect's writes may have killed it; inside another death
+            # (a kill from an on_death passive) the guard held that check.
+            if oid in self.entities:
+                held, self._death_processing = self._death_processing, 0
+                try:
+                    log.extend(self.check_death(oid))
+                finally:
+                    self._death_processing += held
+        # 2. The survivors leave.
+        live = [self.maps[n] for n in names if n in self.maps]
+        if outer is not None:
+            log.extend(self._eject_from_maps(live, outer, box, vid))
+        # 3. Each map's fate.
+        for name in names:
+            mp = self.maps.get(name)
+            if mp is None:
+                continue
+            if fate == "wreck" or outer is None:
+                mp.vehicle = None
+                loc = self.find_corpse(vid)
+                if loc is not None:
+                    kept = loc[2].setdefault("maps", [])
+                    if name not in kept:
+                        kept.append(name)
+                wreck = vars_.get(str(self.rules.get(
+                    "map_vehicle_wreck_var", "wreck_formula")))
+                if not isinstance(wreck, str):
+                    wreck = str(self.rules.get("map_vehicle_wreck_formula",
+                                               "") or "")
+                log.extend(self._run_map_vehicle_program(
+                    wreck, None, {"map_vehicle": vid, "context_map": name},
+                    f"The wreck formula of `{vid}` on map `{name}`"))
+                continue
+            log.extend(self._kill_all_on_map(name))
+            if corpses_mode == "eject":
+                log.extend(self._eject_corpses(
+                    mp, [oid for oid, n in occupants.items() if n == name],
+                    outer, box))
+            if name in self.maps:
+                log.extend(self.delete_map(name))
+        return log
+
+    def _eject_corpses(self, mp: "Map", ids: List[str], outer: "Map",
+                       box: Tuple[int, int, int, int]) -> List[str]:
+        """Move the corpses of `ids` lying on map `mp` to the cells of map
+        `outer` nearest the body `box` that no living unit covers (corpses
+        may share a cell); one with no such cell is lost, with a ⚠️."""
+        log: List[str] = []
+        for cid in ids:
+            loc = self.find_corpse(cid)
+            if loc is None or loc[3] is not mp:
+                continue
+            x, y, corpse, _ = loc
+            body = Entity.from_dict(copy.deepcopy(corpse.get("entity") or {}))
+            spot = self._eject_spot(body, outer, box)
+            cell = mp.tiles.get((x, y), {})
+            del cell["corpses"][cid]
+            if not cell["corpses"]:
+                cell.pop("corpses")
+            if not cell:
+                mp.tiles.pop((x, y), None)
+            if spot is None:
+                log.append(f"⚠️ No cell of map `{outer.name}` could take the "
+                           f"corpse of `{cid}`; it is lost with map "
+                           f"`{mp.name}`.")
+                continue
+            dx, dy = spot[0] - x, spot[1] - y
+            for d in [corpse.get("entity")] + list(corpse.get("parts") or []):
+                if isinstance(d, dict):
+                    d["map"] = outer.name
+                    if isinstance(d.get("x"), int) and isinstance(d.get("y"), int):
+                        d["x"], d["y"] = d["x"] + dx, d["y"] + dy
+            outer.tile_data(*spot).setdefault("corpses", {})[cid] = corpse
+        return log
+
+    def _kill_all_on_map(self, name: str) -> List[str]:
+        """Kill every unit on map `name` until none is left (a death hook
+        can summon onto it; a unit a hook brought back is removed outright).
+        Ids in sorted order: a reloaded match holds its units in id order
+        (files are written with sorted keys), so dict order would differ in
+        a replay."""
+        log: List[str] = []
+        handled: Set[str] = set()
+        roots = sorted(e.id for e in self.units_on_map(name) if not e.part_of)
+        while roots:
+            for eid in roots:
+                e = self.entities.get(eid)
+                if e is None or e.map != name:
+                    continue
+                if eid in handled:
+                    log.extend(e.remove())
+                    continue
+                handled.add(eid)
+                _, klog = self.kill_entity(eid)
+                log.extend(klog)
+            roots = sorted(e.id for e in self.units_on_map(name)
+                           if not e.part_of)
+        return log
+
+    def sweep_empty_maps(self) -> List[str]:
+        """Delete each map of its own whose `__delete_when_empty` map var is
+        true once no unit is on it (a wreck whose last occupant left)."""
+        log: List[str] = []
+        for mp in list(self.maps.values()):
+            if (mp.vars.get("__delete_when_empty") is True and not mp.vehicle
+                    and len(self.maps) > 1
+                    and not self.units_on_map(mp.name)):
+                self.delete_map(mp.name)
+                log.append(f"Map `{mp.name}` was deleted: nobody is left on "
+                           f"it (__delete_when_empty).")
+        return log
 
     def map_of(self, e: "Entity") -> "Map":
         """The map unit `e` stands on."""
@@ -9326,10 +9770,12 @@ class Match:
             rider, ox, oy, self.map_of(veh if veh is not None else rider))
 
     def _nearest_fit_cell(self, e: "Entity", ox: float, oy: float,
-                          mp: "Map") -> Optional[Tuple[int, int]]:
+                          mp: "Map", avoid: Optional[Set[Tuple[int, int]]] = None
+                          ) -> Optional[Tuple[int, int]]:
         """The anchor cell nearest the point (ox, oy) where `e`'s whole
         footprint is on map `mp` and covers no other unit (ties by y then
-        x). Shared by dismount and revive_blocked_mode nearest."""
+        x), nor any cell of `avoid`. Shared by dismount, revive_blocked_mode
+        nearest and the ejection from a map vehicle."""
         rider = e
         cx0, cy0 = math.floor(ox + 0.5), math.floor(oy + 0.5)
         best: Optional[Tuple[float, int, int]] = None
@@ -9337,7 +9783,9 @@ class Match:
                                   mp.grid_width + mp.grid_height, mp):
             for gx, gy in self._ring_cells(cx0, cy0, r, mp):
                 if self.footprint_in_bounds(rider, gx, gy, mp) and \
-                        not self._footprint_blocked_by_others(rider, gx, gy, mp):
+                        not self._footprint_blocked_by_others(rider, gx, gy, mp) \
+                        and not (avoid and any(
+                            c in avoid for c in self.entity_cells(rider, gx, gy))):
                     key = ((gx - ox) ** 2 + (gy - oy) ** 2, gy, gx)
                     if best is None or key < best:
                         best = key
@@ -13962,6 +14410,7 @@ class Match:
                 f"to another map to take it along.")
         body = self.carried_body(e)
         ids = tuple(u.id for u in body)
+        self.check_map_nesting(body, dest, f"Moving `{e.id}`")
         self._validate_placement(e, x, y, "tp", dest)
         # Every snake segment needs a cell on the destination too (all or
         # nothing, like the located parts below).
@@ -14098,6 +14547,18 @@ class Match:
         # fold current vision into its explored set (no-op unless memory
         # on). Other entities a passive moved record via their own fires.
         self._record_vision(getattr(e, "team", None))
+        # Nested maps: the units on each map the moved body carries.
+        if entity_id in self.entities and any(
+                mp.vehicle for mp in self.maps.values()):
+            for u in self.carried_body(e):
+                for mp in self.maps_carried_by(u.id):
+                    targets = [x.id for x in self._turn_sorted(
+                        [x for x in self.units_on_map(mp.name)
+                         if not x.part_of])]
+                    log.extend(self.fire_hook(
+                        "on_map_vehicle_moved", target_ids=targets,
+                        extras={"map_vehicle": u.id, "context_map": mp.name,
+                                "hook_name": "on_map_vehicle_moved"}))
         return log
 
     def fire_entity_step(
@@ -15411,6 +15872,7 @@ class Match:
         # detached, so the log event must read these up front.
         dead_name, dead_x, dead_y, dead_map = e.name, e.x, e.y, e.map
         dead_vars = copy.deepcopy(e.vars)
+        dead_box = (e.x, e.y) + self.entity_footprint(e)
         try:
             log = self.fire_hook("on_death", target_ids=[entity_id])
             # Re-check entity still exists — a paranoid on_death passive
@@ -15444,6 +15906,11 @@ class Match:
                            dead_x, dead_y, dead_vars, map_name=dead_map)
         finally:
             self._death_processing = max(0, self._death_processing - 1)
+        # Nested maps: the occupants of the maps it carried. Outside the
+        # death guard, so a death effect that kills an occupant (or a unit
+        # near it) runs that death.
+        log.extend(self._map_vehicle_died(entity_id, dead_vars, dead_box,
+                                          dead_map))
         return log
 
     _MSG_FMT_RE = re.compile(r"\{([\w.]+)\}")
@@ -16263,6 +16730,17 @@ class Match:
                 for name in names:
                     if name in self.groups and uid not in self.groups[name]:
                         self.groups[name].append(uid)
+        # Nested maps kept as wrecks are carried again, where they still
+        # exist and nothing else carries them.
+        for name in (corpse.get("maps") or []):
+            if e.id not in self.entities or not isinstance(name, str) \
+                    or name not in self.maps:
+                continue
+            try:
+                self.attach_map(name, e.id)
+            except VTTError as ex:
+                death_log.append(f"⚠️ `{e.id}` doesn't carry map `{name}` "
+                                 f"again: {ex}")
         return e.id, spawn_log + revive_log + death_log
 
     # ---------- polymorph / transform (identity-preserving statblock swap) -----
@@ -17646,6 +18124,11 @@ class Match:
                 e.map = first_map
             e.bind(m, set_spawn_facing=False)
             m.entities[eid] = e
+        # A map naming a carrier that isn't here (hand-edited state) is a
+        # map of its own.
+        for mp in maps.values():
+            if mp.vehicle and mp.vehicle not in m.entities:
+                mp.vehicle = None
         # COPY on load too (the load-side twin): otherwise the restored match
         # shares the snapshot's list, and the next Entity.remove would mutate
         # the retained snapshot in place — corrupting it for a second restore.
@@ -19421,8 +19904,13 @@ class Match:
             if e is None:
                 continue
             origin_x, origin_y = e.x, e.y
+            placed = (e.map, e.x, e.y)
             for nx, ny, facing in path:
                 if eid not in self.entities:
+                    break
+                # A hook moved it (a teleporter, a hatch onto another map):
+                # its walk ends there (see Entity.move_dirs).
+                if (e.map, e.x, e.y) != placed:
                     break
                 # Footprint-aware per-step hooks (a multi-tile member must
                 # fire tile/zone hooks for EVERY covered cell it vacates /
@@ -19436,6 +19924,7 @@ class Match:
                     log.extend(self.fire_footprint_zone_exit(eid, old_cells, new_cells))
                 e.facing = facing
                 e.move_to(nx, ny)
+                placed = (e.map, nx, ny)
                 if fire_hooks:
                     log.extend(self.fire_footprint_tile_enter(eid, old_cells, new_cells))
                     log.extend(self.fire_footprint_zone_enter(
@@ -19447,7 +19936,8 @@ class Match:
                     log.extend(self.fire_entity_step(
                         eid, step_from_x, step_from_y, nx, ny,
                     ))
-            if fire_hooks and path and eid in self.entities:
+            if fire_hooks and path and eid in self.entities \
+                    and (e.map, e.x, e.y) == placed:
                 final_cells = self.entity_cells(e, e.x, e.y)
                 log.extend(self.fire_footprint_tile_stop(eid, final_cells))
                 log.extend(self.fire_footprint_zone_stop(eid, final_cells))
@@ -20107,7 +20597,8 @@ SECRET_RULES = frozenset(n for n, spec in RULES_REGISTRY.items()
 VAR_NAME_RULES = ("hp_var", "max_hp_var", "turnorder_var", "team_var",
                   "part_name_var", "footprint_width_var", "footprint_height_var",
                   "atb_charge_var", "disguise_var", "fog_vision_radius_var",
-                  "overlay_var")
+                  "overlay_var", "map_vehicle_death_effect_var",
+                  "map_vehicle_wreck_var")
 
 
 # Map-var-name rules: rule -> (the setting it names, the rule giving the
@@ -20973,6 +21464,13 @@ class MatchManager:
         if e.is_part:
             raise VTTError(
                 f"'{eid}' is a body part — transfer its parent instead.")
+        carried = src.maps_carried_by(eid)
+        if move and carried:
+            raise VTTError(
+                f"`{eid}` carries map(s) "
+                f"{', '.join(f'`{mp.name}`' for mp in carried)}; a unit "
+                f"carrying a map can't move to another match (`!map detach` "
+                f"them first).")
         # BFS the part subtree so parents are spawned before their children.
         order = [eid]
         i = 0
