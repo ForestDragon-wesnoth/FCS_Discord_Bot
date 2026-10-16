@@ -156,6 +156,10 @@ code. How the harness works (`run_scenarios.py`, scenarios in
   lines right after the command (see 633-645).
 - **Reading replies.** `python run_scenarios.py --review N ...` prints every
   command's full reply next to the Expected prose; `-v` prints a transcript.
+- **Damaged files:** `?file corrupt <path>` (cuts the end off) / `?file
+  delete <path>` change a file of the scenario's server folder behind the
+  storage layer's back (it rescans its usage), then `!as restart` shows
+  what a load does with it (864-866).
 - **Tab completion** is tested in scenarios too: `?tab "<text>"` replies with
   what Tab does at the end of the text (`→ '<line>'` and `candidates: ...`)
   in the scenario's workspace; check it with `??` / `?!` (738-739).
@@ -468,7 +472,11 @@ one folder per server (`local` for the CLI / GUI):
 `<n>.jsonl` = its entries, appended to; `Storage.write_journals` after each
 commit, `_truncate_journal` on a rollback), `saves/`, `sprites/`, `templates/`
 (entity templates, outside commits; `templates/.trash/` = their replaced /
-edited / deleted versions, 24 h), `corrupt/`;
+edited / deleted versions, 24 h), `backups/` (a dated copy of
+systems.json, workspace.json, system_history.json and audit.json, written
+by each commit that changes one, `<stem>.<unix ms>.json`; kept for the
+owner limits `server_backup_days` (7) and `server_backup_count` (200 per
+file), pruned after each copy and hourly), `corrupt/`;
 plus `data/bot_settings.json` (owner limits + rule ceilings) and
 `data/.trash/` (wiped data, 24 h). Mechanics:
 - **Commit after every top-level command** (`vtt_commands.persist_workspace`,
@@ -517,6 +525,31 @@ plus `data/bot_settings.json` (owner limits + rule ceilings) and
   server folder; a file that fails to load moves to `corrupt/` with a console
   note and the rest loads; unknown gamerules in systems are dropped. Data of
   servers the bot left is kept. On shutdown `commit_all` writes once more.
+- **Lost systems** (`Storage._settle_lost_systems`): a match whose system
+  didn't load (systems.json unreadable or gone) keeps its system name and
+  units untouched. If every such match's file carries a copy of its
+  system chain (the `system_load_failure` rule `match_backup`: `_match_text`
+  adds `system_backup` to the file), the load rebuilds those systems from
+  them (the newest file wins a name, default pointers restored); otherwise
+  the server is LOCKED (`MatchManager.recovery`, runtime): every command
+  but `!server recover`, `!server backups`, `!help` and `!as` is refused
+  (`_runs_while_locked`), and nothing is saved (commit, journals,
+  commit_all), so the files on disk stay what a recovery works from.
+  `!server recover` (admin) shows the reason, the matches and the options:
+  `backup <n>` restores a dated systems.json copy, `accept [confirm]`
+  moves the uncovered matches to the default system; both rebuild what the
+  match backups cover. After a lock or rebuild the next commit rewrites
+  systems.json and workspace.json (864-865).
+- **Backups** (`!server backups [file] | restore <n>`, admin): each file's
+  copies numbered on their own, newest first; `restore <n>` puts
+  systems.json copy n back through `_restore_systems` (refused if a match's
+  system isn't in it), an ordinary `!system undo` step (863). The other
+  files' copies are for an operator to copy back by hand. A commit over the
+  limit cuts the oldest copies after old template versions, keeping each
+  file's newest unless this commit writes a new one.
+- **A replaced manager doesn't save:** `persist_workspace` skips a manager
+  its workspace no longer holds (after `!as restart`, the old one's state
+  would overwrite what was loaded).
 - **cli.py / gui.py persist only when asked (user call).** They read
   `local_settings.json` beside the code (`storage.load_local_settings`;
   created on first start with `"match_persistence": false` and a `_comment`
@@ -1484,7 +1517,11 @@ hardcodes**.
   when the view can see x. Boarding is composed (an action in, a hatch
   tile out; `!help map attach`). `on_map_vehicle_moved` fires from
   `fire_entity_moved` for the units on every map the moved body carries
-  (`map_vehicle` bound, the inner map as `context_map`). A carrier's
+  (`map_vehicle` bound, the inner map as `context_map`), and for the
+  maps nested deeper inside those whose `nested_vehicle_moves` setting is
+  on (map var named by `map_nested_vehicle_moves_var`, else the rule,
+  default on; a map set off stops the chain, `_vehicle_move_maps`, 862).
+  A carrier's
   death (`Match._map_vehicle_died`, after `_process_death` leaves its
   guard): per occupant in turn order the death effect (`__map_vehicle_
   death_effect` > the vehicle's var named by `map_vehicle_death_effect_var`
@@ -2296,10 +2333,6 @@ rejected already. Update this section in the PR that resolves an item.
   `deferred` the default) and the J2 follow-up (compact journal `state`
   entries and one template library per segment; options: diffs now, leave
   it, or fold into the large-match-state discussion).
-- **Pass 44 (doc 2) questions, asked:** W2 (a `systems.json` that fails
-  to load puts every match on `default` and renames its units' vars; the
-  storage design says a bad file costs only itself) and whether
-  `on_map_vehicle_moved` reaches maps nested deeper than one level (L12).
 - **Large match state, per-command cost** (user: discuss later): after a
   whole-map tile fill on 500x500 every command costs ~3.5 s (three full
   serializations per command; numbers under "Undo history disk growth"

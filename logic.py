@@ -2411,6 +2411,48 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Changing this rule renames the var on every map."
         ),
     },
+    "system_load_failure": {
+        "default": "hold",
+        "schema": {"type": "enum", "choices": ["hold", "match_backup"]},
+        "desc": (
+            "What happens to a match of this system if the server's "
+            "systems.json fails to load. 'hold' (default): the server is "
+            "locked (every command refused, nothing saved) until an "
+            "administrator recovers it with `!server recover` (restore a "
+            "dated copy of systems.json, `!server backups`, or accept moving "
+            "the matches to `default`). 'match_backup': the match's file also "
+            "carries a full copy of its system and the systems it inherits "
+            "from, and a load rebuilds them from it (larger match files). "
+            "The server is locked when any match on a lost system has no "
+            "backup."
+        ),
+    },
+    "map_nested_vehicle_moves_var": {
+        "default": "nested_vehicle_moves",
+        "schema": {"type": "str"},
+        "desc": (
+            "Map var holding whether on_map_vehicle_moved reaches a map "
+            "nested more than one level inside the moving unit (on / off). "
+            "A map without the var uses the nested_vehicle_moves rule. "
+            "Changing this rule renames the var on every map."
+        ),
+    },
+    "nested_vehicle_moves": {
+        "default": True,
+        "schema": {"type": "bool"},
+        "desc": (
+            "Whether a vehicle's move reaches the maps nested deeper inside "
+            "it: a hold carried by a box standing on the cabin map a wagon "
+            "carries. On (default): when the wagon moves, on_map_vehicle_"
+            "moved fires for the units on the cabin and on the hold too "
+            "(`map_vehicle` = the wagon, `context_map` = their map). The "
+            "maps the moving unit carries itself are always reached. Each "
+            "nested map can override it (`!map var set nested_vehicle_moves "
+            "off map=<name>`, the map var named by map_nested_vehicle_moves_"
+            "var); a map set off stops the chain, so the maps inside it "
+            "aren't reached either."
+        ),
+    },
     "unseen_map_display": {
         "default": "blank_unnamed",
         "schema": {"type": "enum",
@@ -5284,6 +5326,18 @@ OWNER_LIMITS: Dict[str, Dict[str, Any]] = {
         "default": 500, "min": 0, "max": 10000,
         "desc": "How many entries each server's `!server audit` log keeps "
                 "(0 = no log).",
+    },
+    "server_backup_days": {
+        "default": 7, "min": 0, "max": 365,
+        "desc": "How many days each server keeps the copies taken of its "
+                "critical files (systems, workspace, system undo history, "
+                "audit log) each time one changes (0 = no copies; "
+                "`!server backups`).",
+    },
+    "server_backup_count": {
+        "default": 200, "min": 1, "max": 10000,
+        "desc": "The most copies each server keeps of each critical file "
+                "(the oldest go first).",
     },
     "map_nesting_depth": {
         "default": 4, "min": 1, "max": 32,
@@ -8643,6 +8697,28 @@ class Match:
             seen.add(cur.name)
             d, cur = d + 1, self.outer_map_of(cur)
         return d
+
+    def _vehicle_move_maps(self, eid: str) -> List["Map"]:
+        """The maps a move of unit `eid` reaches with on_map_vehicle_moved:
+        the maps it carries, then each map nested inside those whose own
+        nested_vehicle_moves setting is on (outermost first). A map set off
+        stops the chain: the maps inside it aren't reached either."""
+        out: List["Map"] = []
+        seen: Set[str] = set()
+        todo = list(self.maps_carried_by(eid))
+        first = {mp.name for mp in todo}
+        while todo:
+            mp = todo.pop(0)
+            if mp.name in seen:
+                continue
+            if mp.name not in first and not self._switch(
+                    self.map_setting(mp, "nested_vehicle_moves")):
+                continue
+            seen.add(mp.name)
+            out.append(mp)
+            for u in self.units_on_map(mp.name):
+                todo += self.maps_carried_by(u.id)
+        return out
 
     def maps_inside(self, eid: str) -> List["Map"]:
         """Every map inside unit `eid`: the maps it carries, the maps the
@@ -15055,7 +15131,7 @@ class Match:
             with move_hook_level(self.rules, log) as fire:
                 if fire:
                     for u in self.carried_body(e):
-                        for mp in self.maps_carried_by(u.id):
+                        for mp in self._vehicle_move_maps(u.id):
                             targets = [x.id for x in self._turn_sorted(
                                 [x for x in self.units_on_map(mp.name)
                                  if not x.part_of])]
@@ -21201,6 +21277,8 @@ MAP_VAR_NAME_RULES: Dict[str, Tuple[str, Optional[str]]] = {
     "map_border_opacity_var": ("border_opacity", "border_opacity"),
     "map_hidden_layers_var": ("hidden_layers", None),
     "map_unseen_var": ("unseen", "unseen_map_display"),
+    "map_nested_vehicle_moves_var": ("nested_vehicle_moves",
+                                     "nested_vehicle_moves"),
 }
 # setting -> its rule
 MAP_SETTING_RULES: Dict[str, str] = {v[0]: k for k, v in MAP_VAR_NAME_RULES.items()}
@@ -21223,7 +21301,7 @@ def map_setting_value(setting: str, value: Any) -> Any:
             raise VTTError(f"The unseen setting is one of "
                            f"{', '.join(UNSEEN_MAP_MODES)}, got `{value}`.")
         return word
-    if setting in ("fog", "fog_memory", "borders"):
+    if setting in ("fog", "fog_memory", "borders", "nested_vehicle_moves"):
         word = str(value).strip().lower()
         if isinstance(value, bool):
             return value
@@ -21576,6 +21654,12 @@ class MatchManager:
         # `!server audit`: who changed what server-wide, oldest first
         # (record_audit). Saved as audit.json; kept to audit_log_entries.
         self.audit_log: List[Dict[str, Any]] = []
+        # Set when the server loaded without systems some matches need
+        # (systems.json unreadable, and match files without a backup of
+        # theirs): every command but `!server recover` / `!server backups`
+        # is refused and nothing is saved until an administrator recovers
+        # it (storage.Storage.load_server). Not saved.
+        self.recovery: Optional[Dict[str, Any]] = None
 
     # ----- server-wide undo and audit -----
     def server_state(self) -> Dict[str, Any]:

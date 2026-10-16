@@ -2259,6 +2259,9 @@ scenarios, 80 random image renders pixel-identical to the old renderer.
     legends.
   - Already fixed before the report reached main: J11, J12, J13, D3++.
   - Deferred to the CPU work budget (§8): X4+, X5.
-  - Left as questions for the user: W2 (a `systems.json` that fails to load
-    moves every match to `default`), `on_map_vehicle_moved` for maps nested
-    deeper than one level (L12).
+  - Questions answered by the user and built in the same PR: W2 became the
+    `system_load_failure` rule (hold: the server locks until `!server
+    recover`; match_backup: match files carry their system chain), with
+    dated copies of the critical server files (`!server backups`); L12
+    became the `nested_vehicle_moves` rule and map var (default on, a map
+    set off stops the chain).

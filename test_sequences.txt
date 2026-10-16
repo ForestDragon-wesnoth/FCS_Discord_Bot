@@ -27033,3 +27033,224 @@ the room: the commit rolls that segment over (a new one starting from
 the state now, the old one dropped) before it would cut undo
 autosaves, so `!undo command` keeps working cycle after cycle and hp
 ends at 999.
+
+SCENARIO 862 — Vehicle moves reach nested maps unless a map is set off; the chain stops there
+-----------------------------------------------------------------------------------------------
+
+!match new nv NV 10 6
+!match use nv
+!map new cabin 5 4
+!map new hold 4 4
+!map new vault 3 3
+!ent add wagon Wagon 50 2 2 map=main
+!ent set_vars wagon footprint_w=2 footprint_h=2
+!map attach cabin wagon
+!ent add box Box 20 4 2 map=cabin
+!map attach hold box
+!ent add crate Crate 10 3 3 map=hold
+!map attach vault crate
+!ent add driver Driver 10 1 1 map=cabin
+!ent add mouse Mouse 3 1 1 map=hold
+!ent add gnome Gnome 3 2 2 map=vault
+!ent set_var box jolts 0
+!ent set_var crate jolts 0
+!ent set_var driver jolts 0
+!ent set_var mouse jolts 0
+!ent set_var gnome jolts 0
+!gpassive add jolt on_map_vehicle_moved "entity[self].jolts = entity[self].jolts + 1"
+!ent move wagon 1 right
+!assert "entity[driver].jolts == 1 and entity[mouse].jolts == 1 and entity[gnome].jolts == 1"
+!map var set nested_vehicle_moves off map=hold
+!ent move wagon 1 right
+!assert "entity[driver].jolts == 2 and entity[mouse].jolts == 1 and entity[gnome].jolts == 1"
+!map var del nested_vehicle_moves map=hold
+!system set default nested_vehicle_moves false
+!ent move wagon 1 right
+!assert "entity[driver].jolts == 3 and entity[mouse].jolts == 1 and entity[gnome].jolts == 1"
+!map var set nested_vehicle_moves on map=hold
+!ent move wagon 1 right
+!assert "entity[driver].jolts == 4 and entity[mouse].jolts == 2 and entity[gnome].jolts == 1"
+!ent move box 1 down
+!assert "entity[driver].jolts == 4 and entity[mouse].jolts == 3 and entity[gnome].jolts == 1"
+!system set default nested_vehicle_moves true
+
+Expected: A wagon carries the cabin map; a box on the cabin carries the
+hold; a crate in the hold carries the vault. With nested_vehicle_moves
+on (the default) a wagon move reaches all three maps: the driver, the
+mouse and the gnome each count one jolt. Setting the hold's map var off
+stops the chain at the hold, so neither the mouse nor the gnome (one
+level further in) is reached. With the rule off and no map var, only
+the cabin (the map the wagon carries itself) is reached; the hold's own
+var set on reaches the hold again, while the vault reads the rule (off)
+and stays out. The box's own move reaches the hold it carries itself
+(the mouse), and the vault, nested one level deeper, reads the rule
+(off), so the gnome stays at 1.
+
+SCENARIO 863 — Dated copies of the server files: listing, restoring systems, undoing the restore, retention
+-------------------------------------------------------------------------------------------------------------
+
+!match new bk Bk 4 4
+!match use bk
+!ent add u U 10 1 1
+!system set default hp_var health
+!system new extra
+!server backups systems
+?? systems.json 3
+?! systems.json 4
+!server backups
+?? workspace.json 1
+?? audit.json 1
+!server backups restore 9
+?? There are 3 copies of systems.json
+!server backups restore 3
+?? ♻️ Restored the systems from the copy of
+!assert "var_has('u', 'hp') and not var_has('u', 'health')"
+!system list
+?! extra
+!system undo
+?? `!server backups restore 3`
+?? 1 unit(s) moved their vars to the names the restored rules give.
+!assert "var_has('u', 'health')"
+!system list
+?? extra
+!as restart
+!assert "var_has('u', 'health')"
+!owner ceiling server_backup_count 2
+!system set default turnorder_direction lowest_first
+!server backups systems
+?? systems.json 2
+?! systems.json 3
+!server backups nonsense
+?? isn't a backed-up file
+!owner ceiling server_backup_count reset
+
+Expected: HARNESS-ALLOWS-ERRORS. Each commit that changes systems.json,
+workspace.json, system_history.json or audit.json also writes a dated
+copy of it; `!server backups` numbers each file's copies on their own,
+newest first. systems.json has three copies here (created, after the
+`hp_var` change, after `!system new extra`). Restoring copy 3, the
+oldest, puts `hp` back on the unit and drops `extra`; the restore is an
+ordinary server-wide step, so `!system undo` takes it back (`health`
+and `extra` again), which a restart keeps. A copy number past the list
+is refused. With server_backup_count lowered to 2 the next copy prunes
+systems.json down to its 2 newest. An unknown file name is refused.
+
+
+SCENARIO 864 — A server whose systems.json fails to load is locked until an administrator recovers it
+--------------------------------------------------------------------------------------------------------
+
+!system new pf
+!system set pf hp_var health
+!match new lk Lk 6 6 pf
+!match use lk
+!ent add u U 10 1 1
+!system new keep
+?file corrupt systems.json
+!as restart
+!list
+?? 🔒 This server is locked: systems.json failed to load (JSONDecodeError)
+!ent hp u 3
+?? 🔒 This server is locked
+!server recover
+?? Matches whose system is lost, with no backup of it: `lk` (`pf`)
+?? `!server recover backup <n>`
+!server recover accept
+?? This moves `lk` (from `pf`) to the `default` system
+!as restart
+!server recover
+?? systems.json is missing
+!server recover backup 1
+?? 🔓 Recovered: the systems are back from the copy of
+!assert "var_has('u', 'health')"
+!system list
+?? keep
+!ent hp u 3
+!as restart
+!assert "entity[u].health == 3"
+!server recover
+?? This server isn't locked
+
+Expected: HARNESS-ALLOWS-ERRORS. Match `lk` runs on system `pf`, whose
+hp var is `health`. Cutting the end off systems.json and restarting
+leaves `pf` unloadable and the match file carries no copy of it (the
+system_load_failure rule is `hold` by default), so the server is locked:
+every command but `!server recover`, `!server backups`, `!help` and `!as`
+is refused with the reason, and nothing is saved, so the unit keeps its
+`health` var on disk (the old load moved the match to `default` and
+renamed it to `hp`). `!server recover` names the match and the options;
+`accept` only previews without `confirm`. A second restart finds
+systems.json missing (the failed load moved it to corrupt/) and stays
+locked. Restoring the newest dated copy brings back `pf` and `keep`,
+unlocks the server, and the match plays and saves again.
+
+
+SCENARIO 865 — Matches carrying a backup of their system rebuild it; a match without one still locks the server
+-------------------------------------------------------------------------------------------------------------------
+
+!system new pf
+!system set pf hp_var health
+!system set pf system_load_failure match_backup
+!system new kid parent=pf
+!match new mb Mb 6 6 kid
+!match use mb
+!ent add u U 10 1 1
+!system default server kid
+!system new loose
+?file corrupt systems.json
+!as restart
+!assert "var_has('u', 'health')"
+!system list
+?? **kid** (inherits from `pf`)
+?! loose
+!system new plain
+!match new pl Pl 4 4 plain
+!match use pl
+!ent add v V 10 1 1
+!match use mb
+?file delete systems.json
+!as restart
+!server recover
+?? `pl` (`plain`)
+?? Matches whose file carries a backup of their system (rebuilt by either option): `mb` (`kid`)
+!server recover accept confirm
+?? 🔓 Recovered: 1 match(es) moved to `default`
+!assert "var_has('u', 'health')"
+!match use pl
+!assert "var_has('v', 'hp')"
+!match info
+?? system `default`
+
+Expected: HARNESS-ALLOWS-ERRORS. With `system_load_failure` set to
+`match_backup` on `pf` (and so on `kid`, which inherits it), match `mb`'s
+file carries a copy of `kid` and `pf`. When systems.json fails to load,
+the load rebuilds both from it (with kid's parent link and the server's
+default pointer), so the server isn't locked and the unit keeps
+`health`; `loose`, which no match used, is gone (a dated copy still
+holds it). A match on `plain`, which has no backup, locks the server
+when systems.json goes missing; `accept confirm` rebuilds `mb`'s systems
+from its backup and moves `pl` to `default`.
+
+
+SCENARIO 866 — An undo snapshot file lost from disk is dropped from the history; saving goes on
+-------------------------------------------------------------------------------------------------
+
+!match new ls Ls 6 6
+!match use ls
+!ent add u U 10 1 1
+!ent hp u -1
+!ent hp u -1
+!ent hp u -1
+?file delete matches/ls/history/2.json
+!as restart
+!ent hp u -1
+!as restart
+!assert "entity[u].hp == 6"
+!undo command
+?? Undid 1 command(s)
+!assert "entity[u].hp == 7"
+
+Expected: Deleting one undo snapshot's file (as a crash between a
+commit's writes and deletes used to leave it, or an operator pruning
+history) no longer stops the server from saving: the load drops the
+snapshot with a console note, the next command saves (hp 6 survives a
+restart), and undo works with the snapshots that remain.

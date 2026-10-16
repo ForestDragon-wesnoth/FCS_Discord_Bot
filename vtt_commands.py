@@ -278,7 +278,7 @@ def _admin_required(name: str, args: List[str]) -> bool:
     if name in ("store", "run"):
         return True
     if name == "server":
-        return sub in ("wipe", "audit")
+        return sub in ("wipe", "audit", "backups", "recover")
     if name in ("defvar", "defpassive", "gclamp"):
         # System-level defaults; `list` (and the bare usage form) only read.
         if name == "defvar" and sub == "map":
@@ -786,6 +786,11 @@ class CommandRegistry:
         # word (`!Ent`) still names the command.
         if name not in self._handlers and name.lower() in self._handlers:
             name = name.lower()
+        # A server locked by a failed load (MatchManager.recovery) runs only
+        # what recovers it.
+        if getattr(mgr, "recovery", None) and not _runs_while_locked(name,
+                                                                      args):
+            return await ctx.send(_locked_text(mgr))
         if _HOLDS_COMMAND_LOCK.get():
             return await self._run_top(name, args, ctx, mgr)
         async with _command_lock(mgr):
@@ -1375,6 +1380,11 @@ async def persist_workspace(mgr: MatchManager, ctx: Optional[ReplyContext]) -> N
     mgr._journal_handled = None
     if st is None:
         return
+    ws = getattr(mgr, "workspaces", None)
+    if ws is not None and ws.peek(mgr.guild_key) is not mgr:
+        # `!as restart` replaced this manager with one loaded from disk:
+        # the old one's state must not be written over what was loaded.
+        return
     try:
         msgs = st.commit(mgr)
         if handled is not None:
@@ -1524,17 +1534,25 @@ def _record_server_changes(mgr: MatchManager, ctx: ReplyContext, name: str,
     uid = ctx_user(ctx)
     by = who if not uid or str(uid) == who else f"{who} ({uid})"
     lines = list(notes)
+    # A whole-server replace (wipe, store load) clears the undo stack; a
+    # restored systems.json copy is an ordinary step `!system undo` takes back.
+    replacing = name.lower() in _SERVER_REPLACING_ROOTS and not (
+        name.lower() == "server" and args and str(args[0]).lower() == "backups")
     if changed:
         lines = _server_state_diff(json.loads(pre_text),
                                    json.loads(post_text))[:6] + lines
-        if name.lower() in _SERVER_REPLACING_ROOTS:
+        if replacing:
             if mgr.system_history:
                 mgr.system_history = []
                 lines.append("system undo history cleared")
         elif not skip_step:
             mgr.record_system_step(pre_text, pre_matches, label, by)
     mgr.record_audit(label, by, lines)
-    if changed and name.lower() not in _SERVER_REPLACING_ROOTS:
+    # A recovery replaces the systems (no undo step across it), but the
+    # matches' journals still record the chains they run on from then.
+    recovering = name.lower() == "server" and args \
+        and str(args[0]).lower() == "recover"
+    if changed and (not replacing or recovering):
         _journal_systems(mgr, ctx, json.loads(pre_text), json.loads(post_text),
                          pre_matches, name, args)
 
@@ -4034,7 +4052,7 @@ def _wipe_blockers(mgr: MatchManager, scope: str) -> List[str]:
 
 @registry.command(
     "server", snapshot=False,
-    usage="!server <wipe|storage|audit> ...",
+    usage="!server <wipe|storage|audit|backups|recover> ...",
     desc=(
         "This server's data. `!server storage` shows how much disk it uses "
         "against its limit. `!server wipe matches|all` (server "
@@ -4080,6 +4098,10 @@ async def server_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             lines.append(f"- {e.get('at', '?')}{by}: `{e.get('label', '?')}`")
             lines += [f"  · {x}" for x in e.get("notes") or []]
         return await ctx.send("\n".join(lines))
+    if sub == "backups":
+        return await _server_backups(ctx, args, mgr, st)
+    if sub == "recover":
+        return await _server_recover(ctx, args, mgr, st)
     if sub != "wipe":
         return await _help_fallback(ctx, ["server"], args[0])
     if st is not None and not st.persist:
@@ -4165,6 +4187,277 @@ async def server_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     return await _help_fallback(ctx, ["server", "wipe"], args[1])
 
 
+def _runs_while_locked(name: str, args: List[str]) -> bool:
+    """What a locked server still runs: its recovery, the copies it
+    recovers from, help, and the CLI's identity / restart switch."""
+    sub = str(args[0]).lower() if args else ""
+    return (name == "server" and sub in ("recover", "backups")) \
+        or name in ("help", "as")
+
+
+def _locked_text(mgr: MatchManager) -> str:
+    rec = mgr.recovery or {}
+    return (f"🔒 This server is locked: {rec.get('reason', 'a failed load')}. "
+            f"Nothing runs or is saved until an administrator runs "
+            f"`!server recover`.")
+
+
+async def _server_recover(ctx: ReplyContext, args: List[str],
+                          mgr: MatchManager, st: Any):
+    """`!server recover [backup <n> | accept [confirm]]`: lift the lock a
+    failed load set (MatchManager.recovery)."""
+    rec = mgr.recovery
+    if not rec:
+        _check_tail(args, 1, (), "!server recover")
+        return await ctx.send("This server isn't locked; there's nothing to "
+                              "recover.")
+    uncovered = rec.get("uncovered") or {}
+    covered = rec.get("covered") or {}
+    action = args[1].lower() if len(args) > 1 else ""
+    if not action:
+        sys_copies = list(enumerate(
+            st.backups(mgr.guild_key, "systems.json") if st else [], 1))
+        lines = [f"🔒 **Locked:** {rec.get('reason')}.",
+                 "Matches whose system is lost, with no backup of it: "
+                 + ", ".join(f"`{mid}` (`{n}`)"
+                             for mid, n in sorted(uncovered.items()))]
+        if covered:
+            lines.append("Matches whose file carries a backup of their system "
+                         "(rebuilt by either option): "
+                         + ", ".join(f"`{mid}` (`{n}`)"
+                                     for mid, n in sorted(covered.items())))
+        lines.append("Options:")
+        if sys_copies:
+            lines.append("- `!server recover backup <n>`: restore a dated copy "
+                         "of systems.json; the newest: "
+                         + "; ".join(f"{i}. {_backup_when(e[0])}"
+                                     for i, e in sys_copies[:5]))
+        else:
+            lines.append("- (no dated copy of systems.json to restore)")
+        lines.append("- `!server recover accept`: move those matches to the "
+                     f"`{mgr.default_system_name}` system (their units' vars "
+                     "take its names); shows what it does first.")
+        return await ctx.send("\n".join(lines))
+    if action == "backup":
+        _check_tail(args, 3, (), "!server recover backup <n>")
+        if len(args) < 3:
+            raise VTTError("Usage: `!server recover backup <n>` (the number "
+                           "`!server recover` or `!server backups` lists).")
+        n = _parse_count(args[2], "!server recover backup <n>")
+        stamp, path = _systems_copy(st, mgr, n)
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, ValueError) as ex:
+            raise VTTError(f"Backup {n} can't be read ({type(ex).__name__}).")
+        systems = _systems_from_raw(raw, f"Backup {n}")
+        # Matches whose own backup holds a system the copy lacks get it
+        # from there.
+        for mid, (_mt, chain) in (rec.get("backups") or {}).items():
+            for sname, d in chain.items():
+                if sname not in systems:
+                    systems[sname] = GameSystem.from_dict(copy.deepcopy(d))
+        still = sorted(f"`{mid}` (`{m.system_name}`)"
+                       for mid, m in mgr.matches.items()
+                       if m.system_name not in systems)
+        if still:
+            raise VTTError(f"Backup {n} doesn't hold the systems of "
+                           f"{', '.join(still)}; try an older copy or "
+                           f"`!server recover accept`.")
+        notes = _restore_systems(mgr, systems, f"restore backup {n}")
+        _repoint_defaults(mgr, rec.get("pointers") or {})
+        mgr.recovery = None
+        audit_note(f"recovered from the systems.json copy of "
+                   f"{_backup_when(stamp)}")
+        return await ctx.send("\n".join(
+            [f"🔓 Recovered: the systems are back from the copy of "
+             f"{_backup_when(stamp)}, and the server is unlocked."] + notes))
+    if action == "accept":
+        confirm = len(args) > 2 and args[2].lower() == "confirm"
+        _check_tail(args, 3 if confirm else 2, (),
+                    "!server recover accept [confirm]")
+        target = mgr.default_system_name
+        if not confirm:
+            return await ctx.send(
+                "This moves " + ", ".join(f"`{mid}` (from `{n}`)"
+                                          for mid, n in sorted(uncovered.items()))
+                + f" to the `{target}` system: its rules apply and the "
+                "units' vars take its var names. "
+                + (("Matches with a backup are rebuilt from it: "
+                    + ", ".join(f"`{m}`" for m in sorted(covered)) + ". ")
+                   if covered else "")
+                + "Type `!server recover accept confirm` to go ahead.")
+        notes: List[str] = []
+        if rec.get("backups"):
+            notes += st.rebuild_from_match_backups(
+                mgr, rec["backups"], rec.get("pointers") or {},
+                rec.get("reason", ""))
+        for mid in sorted(uncovered):
+            m = mgr.matches.get(mid)
+            if m is None:
+                continue
+            m.system_name = target
+            notes += [f"`{mid}`: {x}" for x in mgr.apply_system_rules(m)]
+        _repoint_defaults(mgr, rec.get("pointers") or {})
+        mgr.recovery = None
+        audit_note("recovered by moving " + ", ".join(sorted(uncovered))
+                   + f" to {target}")
+        return await ctx.send("\n".join(
+            [f"🔓 Recovered: {len(uncovered)} match(es) moved to `{target}`; "
+             f"the server is unlocked."] + notes))
+    return await _help_fallback(ctx, ["server", "recover"], args[1])
+
+
+def _repoint_defaults(mgr: MatchManager, pointers: Dict[str, Any]) -> None:
+    """The default-system pointers the workspace file named, for the
+    systems that exist again."""
+    d = pointers.get("default")
+    if d in mgr.systems:
+        mgr.default_system_name = d
+    for ch, n in (pointers.get("channels") or {}).items():
+        if n in mgr.systems:
+            mgr.default_system_per_channel[str(ch)] = str(n)
+
+
+def _systems_from_raw(raw: Any, where: str) -> Dict[str, GameSystem]:
+    """A systems.json value as the server's systems, or a clean refusal."""
+    if not isinstance(raw, dict) or not raw:
+        raise VTTError(f"{where} holds no systems.")
+    try:
+        return {str(n): GameSystem.from_dict(copy.deepcopy(d))
+                for n, d in raw.items()}
+    except Exception as ex:  # noqa: BLE001 - any malformed system
+        raise VTTError(f"{where} can't be read as systems "
+                       f"({type(ex).__name__}).")
+
+
+def _restore_systems(mgr: MatchManager, systems: Dict[str, GameSystem],
+                     what: str) -> List[str]:
+    """Make `systems` the server's systems (all or nothing, through
+    _switch_systems). A match whose system isn't among them refuses it; the
+    default pointers keep the names that still exist."""
+    raw = {n: s.to_dict() for n, s in systems.items()}
+    missing = sorted(f"`{mid}` (`{m.system_name}`)"
+                     for mid, m in mgr.matches.items()
+                     if m.system_name not in raw)
+    if missing:
+        raise VTTError(f"Can't {what}: these matches use systems it doesn't "
+                       f"hold: {', '.join(missing)}.")
+    default = mgr.default_system_name
+    if default not in raw:
+        default = "default" if "default" in raw else sorted(raw)[0]
+    target = {"systems": raw, "default_system_name": default,
+              "default_system_per_channel": {
+                  ch: n for ch, n in mgr.default_system_per_channel.items()
+                  if n in raw}}
+    after = {mid: m.system_name for mid, m in mgr.matches.items()}
+    notes = _switch_systems(mgr, target, after, what)
+    notes += mgr.check_system_links()
+    return notes
+
+
+def _systems_copy(st: Any, mgr: MatchManager, n: int) -> Tuple[float, str]:
+    """The n-th newest dated copy of systems.json: (time, path)."""
+    copies = st.backups(mgr.guild_key, "systems.json") if st else []
+    if n > len(copies):
+        raise VTTError(f"There are {len(copies)} copies of systems.json "
+                       f"(`!server backups systems` lists them).")
+    stamp, _name, path = copies[n - 1]
+    return stamp, path
+
+
+def _backup_when(stamp: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(stamp))
+
+
+async def _server_backups(ctx: ReplyContext, args: List[str],
+                          mgr: MatchManager, st: Any):
+    """`!server backups [file] | restore <n>`: the dated copies of the
+    server's critical files (storage.BACKED_UP_FILES), taken each time one
+    changes; `restore` puts a systems.json copy back."""
+    if st is None or not st.persist:
+        raise VTTError("This bot keeps nothing on disk, so there are no "
+                       "server file backups.")
+    from storage import BACKED_UP_FILES
+    if len(args) > 1 and args[1].lower() == "restore":
+        _check_tail(args, 3, (), "!server backups restore <n>")
+        if len(args) < 3:
+            raise VTTError("Usage: `!server backups restore <n>` (the number "
+                           "`!server backups` lists).")
+        n = _parse_count(args[2], "!server backups restore <n>")
+        stamp, path = _systems_copy(st, mgr, n)
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, ValueError) as ex:
+            raise VTTError(f"Backup {n} can't be read "
+                           f"({type(ex).__name__}).")
+        systems = _systems_from_raw(raw, f"Backup {n}")
+        notes = _restore_systems(mgr, systems,
+                                 f"restore backup {n}")
+        audit_note(f"restored systems.json from the copy of "
+                   f"{_backup_when(stamp)}")
+        lines = [f"♻️ Restored the systems from the copy of "
+                 f"{_backup_when(stamp)} ({len(systems)} system(s)); "
+                 f"`!system undo` takes it back."]
+        return await ctx.send("\n".join(lines + notes))
+    fname = None
+    if len(args) > 1:
+        fname = args[1].lower()
+        if not fname.endswith(".json"):
+            fname += ".json"
+        if fname not in BACKED_UP_FILES:
+            raise VTTError(f"`{args[1]}` isn't a backed-up file: "
+                           f"{', '.join(BACKED_UP_FILES)}.")
+        _check_tail(args, 2, (), "!server backups [file]")
+    # Each file's copies are numbered on their own, newest first; `restore
+    # <n>` takes the n-th systems.json copy.
+    shown = []
+    for name in BACKED_UP_FILES:
+        if fname is None or name == fname:
+            shown += [(i, e) for i, e in
+                      enumerate(st.backups(mgr.guild_key, name), 1)]
+    if not shown:
+        return await ctx.send(
+            "No backups yet: a copy is taken each time one of "
+            + ", ".join(BACKED_UP_FILES) + " changes (kept "
+            f"{owner_limit('server_backup_days')} day(s)).")
+    lines = ["**Server file backups** (newest first per file; "
+             "`!server backups restore <n>` restores systems.json copy n):"]
+    for i, (stamp, name, path) in shown[:_BACKUP_ROWS]:
+        lines.append(f"{name} {i} — {_backup_when(stamp)} "
+                     f"({fmt_bytes(os.path.getsize(path))})")
+    if len(shown) > _BACKUP_ROWS:
+        lines.append(f"… and {len(shown) - _BACKUP_ROWS} older.")
+    return await ctx.send("\n".join(lines))
+
+
+_BACKUP_ROWS = 25
+
+
+registry.annotate_sub("server", "backups",
+                      usage="!server backups [file] | restore <n>",
+                      desc="The dated copies of this server's critical files "
+                           "(systems, workspace, system undo history, audit "
+                           "log), taken each time one changes and kept for "
+                           "the days the bot owner sets (server_backup_days, "
+                           "server_backup_count), numbered per file, newest "
+                           "first. `restore <n>` puts systems.json copy n "
+                           "back, re-applying rules to "
+                           "every match (one `!system undo` step); the other "
+                           "files can be copied back by hand. Administrators "
+                           "only.")
+registry.annotate_sub("server", "recover",
+                      usage="!server recover [backup <n> | accept [confirm]]",
+                      desc="Unlock a server locked because systems.json failed "
+                           "to load and some match had no backup of its "
+                           "system (system_load_failure). Bare: why, which "
+                           "matches, the options. `backup <n>` restores a "
+                           "dated copy of systems.json (`!server backups`); "
+                           "`accept` moves the matches to the default system "
+                           "(their units' vars take its names), after a "
+                           "preview. Matches whose files carry a backup are "
+                           "rebuilt from it either way. Administrators only.")
 registry.annotate_sub("server", "storage", usage="!server storage",
                       desc="This server's disk use against its storage limit, broken down largest first: each match and its undo history, templates, old template versions, saves, sprites, corrupt files and the workspace / systems files.")
 registry.annotate_sub("server", "audit", usage="!server audit [n]",
@@ -6222,6 +6515,42 @@ async def _system_history(ctx: ReplyContext, args: List[str],
     return await ctx.send("\n".join(lines))
 
 
+def _switch_systems(mgr: MatchManager, target: Dict[str, Any],
+                    after: Dict[str, str], what: str) -> List[str]:
+    """Put server state `target` (systems and default pointers) in place,
+    each match on system `after[mid]`, and re-apply rules to every match
+    (its units take the var names those rules give). All or nothing: under
+    var_name_collision refuse a var in the way refuses it whole. Returns
+    the rule notes."""
+    pre_state = mgr.server_state()
+    pre_names = {mid: m.system_name for mid, m in mgr.matches.items()}
+    snap = _snapshot_all_matches(mgr)
+    notes: List[str] = []
+    try:
+        _apply_server_state(mgr, target)
+        conflicts: List[str] = []
+        for mid, m in sorted(mgr.matches.items()):
+            trial = mgr._build_rules_dict(mgr.systems[after[mid]])
+            if str(trial.get("var_name_collision")) == "refuse":
+                conflicts += [f"{mid}: {c}"
+                              for c in m.var_name_conflicts(trial)]
+        if conflicts:
+            raise VTTError(f"Can't {what}: " + " ".join(conflicts[:5])
+                           + (f" (and {len(conflicts) - 5} more)"
+                              if len(conflicts) > 5 else ""))
+        for mid, m in mgr.matches.items():
+            m.system_name = after[mid]
+        for m in mgr.matches.values():
+            notes += mgr.apply_system_rules(m)
+    except VTTError:
+        _apply_server_state(mgr, pre_state)
+        for mid, m in mgr.matches.items():
+            m.system_name = pre_names[mid]
+        _restore_all_matches(mgr, snap)
+        raise
+    return notes
+
+
 def _apply_server_state(mgr: MatchManager, state: Dict[str, Any]) -> None:
     mgr.systems = {n: GameSystem.from_dict(copy.deepcopy(d))
                    for n, d in (state.get("systems") or {}).items()}
@@ -6275,36 +6604,9 @@ async def _system_undo(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         lines = [f"{head}:"] + undone + ["Changes:"]
         lines += [f"- {d}" for d in diff] or ["- (nothing)"]
         return await ctx.send("\n".join(lines))
-    pre_state = mgr.server_state()
-    pre_names = {mid: m.system_name for mid, m in mgr.matches.items()}
-    snap = _snapshot_all_matches(mgr)
     named = {(mid, eid): dict(e.var_names) for mid, m in mgr.matches.items()
              for eid, e in m.entities.items()}
-    notes: List[str] = []
-    try:
-        _apply_server_state(mgr, target)
-        # As `!system set` does: under var_name_collision refuse, a var in
-        # the way of a rename refuses the whole undo.
-        conflicts: List[str] = []
-        for mid, m in sorted(mgr.matches.items()):
-            trial = mgr._build_rules_dict(mgr.systems[after[mid]])
-            if str(trial.get("var_name_collision")) == "refuse":
-                conflicts += [f"{mid}: {c}"
-                              for c in m.var_name_conflicts(trial)]
-        if conflicts:
-            raise VTTError("Can't undo: " + " ".join(conflicts[:5])
-                           + (f" (and {len(conflicts) - 5} more)"
-                              if len(conflicts) > 5 else ""))
-        for mid, m in mgr.matches.items():
-            m.system_name = after[mid]
-        for m in mgr.matches.values():
-            notes += mgr.apply_system_rules(m)
-    except VTTError:
-        _apply_server_state(mgr, pre_state)
-        for mid, m in mgr.matches.items():
-            m.system_name = pre_names[mid]
-        _restore_all_matches(mgr, snap)
-        raise
+    notes = _switch_systems(mgr, target, after, "undo")
     del hist[-n:]
     mgr._skip_system_step = True
     lines = [f"↩️ Undid {n} server-wide edit(s):"] + undone
