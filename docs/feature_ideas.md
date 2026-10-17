@@ -2,7 +2,7 @@
 
 The open idea list, kept in the repo so it survives between sessions. Numbers
 stay fixed so the user can pick by number; new ideas take the next free number
-(the highest so far is #199). Items marked (§8) come from CLAUDE.md's deferred
+(the highest so far is #200). Items marked (§8) come from CLAUDE.md's deferred
 list. When an idea ships, move its number to "Shipped" below; when the user
 strikes or rejects one, move it to "Off the list".
 
@@ -87,6 +87,7 @@ for reference.
 - **#182 Match threads on Discord.** `!match new ... thread` creates a thread and binds the new match to it.
 - **#184 Trail segment spacing above 1** (§8). `segment_spacing` works only in `path` follow mode today.
 - **#185 Forced and reflected status transfer** (§8). A transfer that ignores resistance and immunity on the destination, and a "reflect" form that bounces a status back at its source.
+- **#200 GUI option: keep the picked map.** A GUI setting (a toolbar checkbox, remembered in `local_settings.json`) so a map picked in the GUI's map menu stays shown until changed, as `!map use` does. Today a pick lasts until the next turn change, like a Discord board's map buttons; the user found that fine for now.
 
 ## Medium (a subsystem slice)
 
