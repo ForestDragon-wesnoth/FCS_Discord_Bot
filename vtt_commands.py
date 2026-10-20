@@ -15,7 +15,7 @@ from logic import (
 )
 
 # Passive system
-from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES
+from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -23,7 +23,7 @@ from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journ
 from logic import check_id, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
-from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution
+from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference
 
 import os
 import difflib
@@ -244,6 +244,9 @@ def _admin_msg(name: str, args: List[str]) -> str:
     sub = args[0].lower() if args else ""
     if (name, sub) in (("server", "audit"), ("system", "history")):
         return _ADMIN_READ_MSG
+    if (name, sub) == ("server", "errors"):
+        return ("❌ Only a server administrator can read that — it shows "
+                "the server's crash reports and the commands behind them.")
     return _ADMIN_MSG
 
 
@@ -278,7 +281,7 @@ def _admin_required(name: str, args: List[str]) -> bool:
     if name in ("store", "run"):
         return True
     if name == "server":
-        return sub in ("wipe", "audit", "backups", "recover")
+        return sub in ("wipe", "audit", "backups", "recover", "errors")
     if name in ("defvar", "defpassive", "gclamp"):
         # System-level defaults; `list` (and the bare usage form) only read.
         if name == "defvar" and sub == "map":
@@ -838,6 +841,14 @@ class CommandRegistry:
             lambda vm: vm.channel_map(view_ctx.channel_key,
                                       _view_pov(view_ctx, vm, [])).name)
         pov_token = COMMAND_POV.set(lambda vm: _view_pov(view_ctx, vm, []))
+        # What a crash during this command records (CrashLog.record).
+        ws = getattr(mgr, "workspaces", None)
+        crash_token = CRASH_CONTEXT.set({
+            "log": getattr(ws, "crashes", None),
+            "server": mgr.guild_key, "server_name": mgr.guild_name,
+            "match": mgr.active_by_channel.get(ctx.channel_key),
+            "user": ctx_user(ctx), "user_name": COMMAND_USER.get(),
+            "command": "!" + shlex.join([name] + [str(a) for a in args])})
         # A typed command (not a nested run: an approval, `!again`) is one
         # `!system undo` step and one `!server audit` entry when it changes
         # anything server-wide. `!as` can swap the whole workspace.
@@ -872,6 +883,7 @@ class CommandRegistry:
         finally:
             if audit_token is not None:
                 _AUDIT_NOTES.reset(audit_token)
+            CRASH_CONTEXT.reset(crash_token)
             COMMAND_VIEW.reset(view_token)
             COMMAND_POV.reset(pov_token)
             COMMAND_USER.reset(user_token)
@@ -1046,7 +1058,8 @@ class CommandRegistry:
         except VTTError as e:
             await ctx.send(f"❌ {e}")
         except Exception as e:
-            await ctx.send(f"💥 Unexpected error: {e}")
+            ref = crash_ref(f"command `{name}`", e)
+            await ctx.send(f"💥 Unexpected error{ref}: {e}")
         finally:
             _JOURNALED_IN.reset(jtoken)
             _JOURNAL_AS_STATE.reset(jstate_token)
@@ -1393,8 +1406,12 @@ async def persist_workspace(mgr: MatchManager, ctx: Optional[ReplyContext]) -> N
         st.write_journals(mgr)
     except Exception as ex:  # noqa: BLE001 - a disk error must not crash a command
         print(f"⚠️ [{mgr.guild_key}] saving to disk failed: {ex!r}")
-        msgs = [f"⚠️ Saving to disk failed ({type(ex).__name__}); the change "
-                f"is kept in memory and saved with the next command."]
+        ref = (ws.crashes.record("saving to disk", ex, server=mgr.guild_key)
+               if ws is not None else None)
+        msgs = [f"⚠️ Saving to disk failed ({type(ex).__name__}"
+                + (f", ref {ref}" if ref is not None else "")
+                + "); the change is kept in memory and saved with the next "
+                  "command."]
     if msgs and ctx is not None:
         await ctx.send("\n".join(msgs))
 
@@ -2045,6 +2062,27 @@ def _render_template(tmpl: str, ctx: Dict[str, Any]) -> str:
     return _TMPL_PLACE_RE.sub(_place_sub, s)
 
 
+def _statuses_text(m: Optional[Match], status: Dict[str, Any]) -> str:
+    """The `{statuses}` placeholder: each status through its definition's
+    `display` format, else the status_line_format rule, by name and joined
+    with `, ` (a status's fields are its placeholders)."""
+    if not status:
+        return ""
+    default = (m.rules.get("status_line_format") if m is not None else None) \
+        or "{name}"
+    defs = m.status_definitions if m is not None else {}
+    out = []
+    for name in sorted(status, key=str):
+        inst = status[name]
+        ctx: Dict[str, Any] = dict(inst) if isinstance(inst, dict) else {}
+        ctx["name"] = name
+        sdef = defs.get(name)
+        fmt = sdef.get("display") if isinstance(sdef, dict) else None
+        out.append(_render_template(fmt if isinstance(fmt, str) and fmt
+                                    else str(default), ctx))
+    return ", ".join(out)
+
+
 def _entity_template_context(e: Entity,
                              pov_team: Optional[str] = None) -> Dict[str, Any]:
     """Build the placeholder context for an Entity. When `pov_team` is a
@@ -2067,6 +2105,7 @@ def _entity_template_context(e: Entity,
         "hp": e.hp,
         "max_hp": e.max_hp if e.max_hp is not None else e.hp,
         "status_csv": ", ".join(sorted(e.status.keys())) if e.status else "",
+        "statuses": _statuses_text(e._match, e.status),
         "passives_csv": ", ".join(sorted(e.passives.keys())) if e.passives else "",
     }
     # Merge vars — vars win for keys NOT already in the well-known set above.
@@ -2185,6 +2224,8 @@ def _corpse_template_context(
         "hp": ent_vars.get(hp_var, "?"),
         "max_hp": ent_vars.get(max_hp_var, "?"),
         "status_csv": ", ".join(sorted(status.keys())) if status else "",
+        "statuses": _statuses_text(m, status if isinstance(status, dict)
+                                   else {}),
         "passives_csv": ", ".join(sorted(passives.keys())) if passives else "",
         "died_round": corpse.get("died_round", "?"),
     }
@@ -2436,6 +2477,33 @@ def _format_vars_blob(vars_dict: dict) -> str:
     return "**vars**:\n```json\n" + blob + "\n```"
 
 
+def _passive_opts(tokens: List[str]):
+    """The leading `target=` / `scope=` / `priority=` options of a passive
+    add, then the formula's words: (target, scope, priority, words). An
+    option-shaped word that is the last one is the formula (`x=1`), and a
+    mistyped option is refused, since it would otherwise start the formula
+    and fail as a bare "Syntax error"."""
+    target, scope, prio = "", "deep", 0
+    rest = list(tokens)
+    while len(rest) > 1 and re.fullmatch(r"[A-Za-z_]\w*=\S*", rest[0]):
+        key, _, val = rest.pop(0).partition("=")
+        if key == "target":
+            target = val
+        elif key == "scope":
+            scope = val.lower()
+        elif key == "priority":
+            prio = checked_priority(val, "priority=")
+        else:
+            raise VTTError(f"Unknown option `{key}=` (it takes: `target=`, "
+                           f"`scope=`, `priority=`).")
+    return target, scope, prio, rest
+
+
+def _priority_text(p) -> str:
+    """` pri N` for a passive with a priority (0 shows nothing)."""
+    return f" pri {p.priority}" if getattr(p, "priority", 0) else ""
+
+
 def _format_passive_line(label: str, p) -> str:
     """One-line summary of a passive for `!passive list` / `!gpassive list`.
 
@@ -2447,8 +2515,8 @@ def _format_passive_line(label: str, p) -> str:
     from logic import VAR_HOOKS
     if p.when in VAR_HOOKS:
         return (f"- `{label}` ({p.when} on `{p.target or '(root)'}` "
-                f"scope=`{p.scope}`): `{p.formula}`")
-    return f"- `{label}` ({p.when}): `{p.formula}`"
+                f"scope=`{p.scope}`{_priority_text(p)}): `{p.formula}`")
+    return f"- `{label}` ({p.when}{_priority_text(p)}): `{p.formula}`"
 
 
 def _parse_clamp_bound(raw: str) -> Any:
@@ -3644,7 +3712,7 @@ def _mention(user_id: Optional[str]) -> str:
 # ---- as (CLI identity switch for previewing host vs player) -----
 @registry.command(
     "as", access="all",
-    usage="!as host | !as owner | !as player [<name>] | !as view <team|omniscient|clear> | !as server [<key>|local] | !as restart | !as <identity>",
+    usage="!as host | !as owner | !as player [<name>] | !as view <team|omniscient|clear> | !as server [<key>|local] | !as restart | !as crash [<text ...>] | !as <identity>",
     desc=(
         "Switch your previewing identity OR point-of-view. CLI-only "
         "(on Discord both come from your account / the channel, so this "
@@ -3662,7 +3730,9 @@ def _mention(user_id: Optional[str]) -> str:
         "each server is separate; `!as server local` (or bare) returns. "
         "`!as restart` reloads every server from the data folder, as a bot "
         "restart would (unsaved runtime state — pending requests, `!again` — "
-        "is gone). Bare `!as` reports your identity and your effective POV."
+        "is gone). `!as crash [text]` raises an error no command expects "
+        "(a test hook for the error log, `!owner errors`). Bare `!as` "
+        "reports your identity and your effective POV."
     ),
 )
 async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -3684,6 +3754,10 @@ async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"Use `!as host`/`!as player [name]` or `!as view <team>`."
         )
     role = args[0].lower()
+    if role == "crash":
+        # A test hook: an exception no handler expects, so the CLI and the
+        # harness reach the 💥 path and the error log.
+        raise RuntimeError(" ".join(args[1:]) or "a test crash (`!as crash`)")
     if role == "restart":
         restart = getattr(ctx, "restart_workspaces", None)
         if restart is None:
@@ -3809,7 +3883,7 @@ async def whoami_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 @registry.command(
     "owner", access="all", snapshot=False,
-    usage="!owner <servers|limit|storage|ceiling> ...",
+    usage="!owner <servers|limit|storage|ceiling|errors> ...",
     desc=(
         "Bot-owner tools (the owner of the bot's Discord application, or its "
         "team). `!owner servers` lists every server workspace; `!owner limit` "
@@ -3842,7 +3916,85 @@ async def owner_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await _owner_storage(ctx, args[1:], mgr)
     if sub == "ceiling":
         return await _owner_ceiling(ctx, args[1:], mgr)
+    if sub == "errors":
+        return await _errors_cmd(ctx, args, mgr, "owner")
     return await _help_fallback(ctx, ["owner"], args[0])
+
+
+def _crash_log(mgr: MatchManager):
+    ws = getattr(mgr, "workspaces", None)
+    log = getattr(ws, "crashes", None)
+    if log is None:
+        raise VTTError("This bot keeps no error log.")
+    return log
+
+
+def _crash_line(e: Dict[str, Any], owner: bool) -> str:
+    where = ""
+    if owner:
+        name = e.get("server_name")
+        key = e.get("server")
+        where = (f" [{name} (`{key}`)]" if name and name != key
+                 else f" [`{key}`]" if key else " [no server]")
+    who = f" by {e['user_name'] or e['user']}" if (e.get("user_name")
+                                                   or e.get("user")) else ""
+    cmd = e.get("command") or e.get("where") or "?"
+    if len(cmd) > 80:
+        cmd = cmd[:77] + "..."
+    err = e.get("error") or "?"
+    if len(err) > 120:
+        err = err[:117] + "..."
+    return f"- **ref {e['ref']}** {e.get('at', '?')}{where}{who}: `{cmd}` → {err}"
+
+
+async def _errors_cmd(ctx, args: List[str], mgr: MatchManager, scope: str):
+    """`!owner errors` (every server) / `!server errors` (this one):
+    `[n]` lists the newest crashes, `show <ref>` one with its traceback,
+    `clear` (owner) empties the log."""
+    root = f"!{scope} errors"
+    owner = scope == "owner"
+    log = _crash_log(mgr)
+    mine = [e for e in log.entries
+            if owner or e.get("server") == mgr.guild_key]
+    if len(args) > 1 and args[1].lower() == "show":
+        _check_tail(args, 3, (), f"{root} show <ref>")
+        if len(args) < 3:
+            raise VTTError(f"Usage: `{root} show <ref>`.")
+        ref = _parse_count(args[2], f"{root} show <ref>")
+        e = next((x for x in mine if x["ref"] == ref), None)
+        if e is None:
+            raise VTTError(
+                f"No crash with ref {ref} in the log"
+                + ("" if owner else " for this server")
+                + " (the oldest are cut past error_log_entries).")
+        trace = (e.get("trace") or "").rstrip().replace("```", "`\u200b`\u200b`")
+        lines = [_crash_line(e, owner),
+                 f"Match: `{e['match']}`" if e.get("match") else "No match.",
+                 f"Command: `{e.get('command') or '(none)'}`",
+                 f"Where: {e.get('where') or '?'}",
+                 "```", trace, "```"]
+        return await ctx.send("\n".join(lines))
+    if len(args) > 1 and args[1].lower() == "clear":
+        if not owner:
+            raise VTTError("Only the bot's owner can clear the error log.")
+        _check_tail(args, 2, (), f"{root} clear")
+        n = len(log.entries)
+        log.entries = []
+        if log.save is not None:
+            log.save(log)
+        return await ctx.send(f"Cleared {n} crash(es) from the error log "
+                              f"(ref numbers go on from {log.next_ref}).")
+    n = _parse_count(args[1], f"{root} [n]") if len(args) > 1 else 10
+    _check_tail(args, 2, (), f"{root} [n]")
+    if not mine:
+        return await ctx.send(
+            "No crashes in the error log" + ("" if owner else
+                                             " for this server") + ".")
+    lines = [f"**Error log** ({len(mine)} kept"
+             + ("" if owner else " for this server")
+             + f", newest first; `{root} show <ref>` for the traceback):"]
+    lines += [_crash_line(e, owner) for e in reversed(mine[-n:])]
+    return await ctx.send("\n".join(lines))
 
 
 # `!server storage` lists this many parts, largest first.
@@ -4007,6 +4159,15 @@ async def _owner_ceiling(ctx, args: List[str], mgr: MatchManager):
                           f"every server.")
 
 
+registry.annotate_sub("owner", "errors",
+                      usage="!owner errors [<n>] | !owner errors show <ref> | !owner errors clear",
+                      desc="The bot's error log, every server: the newest "
+                           "crashes (default 10) with the ref number their "
+                           "`Unexpected error (ref N)` reply named, who ran what, and the error; `show "
+                           "<ref>` adds the traceback; `clear` empties it. A "
+                           "passive or hook that CRASHED is logged too. The "
+                           "log keeps error_log_entries crashes (`!owner "
+                           "ceiling`).")
 registry.annotate_sub("owner", "servers", usage="!owner servers",
                       desc="List every server workspace with its match and "
                            "system counts.")
@@ -4068,7 +4229,7 @@ def _wipe_blockers(mgr: MatchManager, scope: str) -> List[str]:
 
 @registry.command(
     "server", snapshot=False,
-    usage="!server <wipe|storage|audit|backups|recover> ...",
+    usage="!server <wipe|storage|audit|errors|backups|recover> ...",
     desc=(
         "This server's data. `!server storage` shows how much disk it uses "
         "against its limit. `!server wipe matches|all` (server "
@@ -4114,6 +4275,8 @@ async def server_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             lines.append(f"- {e.get('at', '?')}{by}: `{e.get('label', '?')}`")
             lines += [f"  · {x}" for x in e.get("notes") or []]
         return await ctx.send("\n".join(lines))
+    if sub == "errors":
+        return await _errors_cmd(ctx, args, mgr, "server")
     if sub == "backups":
         return await _server_backups(ctx, args, mgr, st)
     if sub == "recover":
@@ -4497,6 +4660,13 @@ registry.annotate_sub("server", "recover",
                            "rebuilt from it either way. Administrators only.")
 registry.annotate_sub("server", "storage", usage="!server storage",
                       desc="This server's disk use against its storage limit, broken down largest first: each match and its undo history, templates, old template versions, saves, sprites, corrupt files and the workspace / systems files.")
+registry.annotate_sub("server", "errors",
+                      usage="!server errors [<n>] | !server errors show <ref>",
+                      desc="This server's crashes from the bot's error log, "
+                           "newest first (default 10): the ref an `Unexpected "
+                           "error (ref N)` reply named, who ran what, the error; `show <ref>` adds "
+                           "the traceback, to pass on to the bot's owner. "
+                           "Administrators only.")
 registry.annotate_sub("server", "audit", usage="!server audit [n]",
                       desc="Who changed what server-wide, newest first (default the last 15): system edits and their undo, default vars / passives / clamps, log formats, `!store save/load`, `!run`, `!history export/import`, wipes and their undo, template saves / edits / renames / deletes, deleted matches. Administrators only; the bot owner sets how many entries a server keeps (audit_log_entries).")
 registry.annotate_sub("server", "wipe",
@@ -7259,6 +7429,11 @@ def _match_formula_slots(m: Match):
                frozenset(), False)
     for sname, sdef in sorted(m.status_definitions.items()):
         yield f"status `{sname}` tick", sdef.get("tick"), "exec", frozenset(), False
+        hooks = sdef.get("hooks")
+        for hook, src in sorted((hooks if isinstance(hooks, dict)
+                                 else {}).items()):
+            yield (f"status `{sname}` {hook} hook", src, "exec", frozenset(),
+                   False)
     for tname, tpl in sorted(m.tile_templates.items()):
         for when, src in sorted(tpl.hooks.items()):
             yield (f"tile template `{tname}` hook `{when}`", src, "exec",
@@ -11748,7 +11923,7 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 # ---- !roll --------------------------------------------------------------
 @registry.command(
     "roll", access="all",
-    usage="!roll <dice ...> | !roll odds <dice> [<op> <n>]",
+    usage="!roll [<n>x] <dice_or_list ...> | !roll odds <dice> [<op> <n>]",
     snapshot=False,
     desc=(
         "Roll dice and show the total plus the individual dice. Uses the same "
@@ -11760,13 +11935,60 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         "safe via the match's random_seed rule (a seeded match rolls "
         "reproducibly). Read-only — rolling never mutates the match. "
         "`!roll odds` works out probabilities instead of rolling (see "
-        "`!help roll odds`)."
+        "`!help roll odds`). A comma-separated list picks one item: "
+        "`!roll none, none, minicrit, crit`, and `item:weight` weights an "
+        "item like a table (`none:3, crit`). A leading `<n>x` rolls n times "
+        "(`!roll 6x 4d6kh3`, `!roll 2x none, crit`; at most the "
+        "roll_repeat_limit rule)."
     ),
 )
 async def roll_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
         title, body = registry.help_for(["roll"])
         return await ctx.send(f"**{title}**\n{body}")
+    # Use the match RNG when a match is active (honors random_seed); otherwise
+    # the global RNG, so `!roll` works even with no active match.
+    rng = random
+    rules: Dict[str, Any] = {}
+    try:
+        m = active_match(mgr, ctx)
+        rng = m.formula_rng()
+        rules = m.rules
+    except VTTError:
+        pass
+    reps = 1
+    if re.fullmatch(r"\d+x", args[0].lower()):
+        # `!roll 6x ...`: the same roll n times (#57).
+        reps = int(args[0][:-1])
+        cap = int(rules.get("roll_repeat_limit",
+                            RULES_REGISTRY["roll_repeat_limit"]["default"]))
+        if not 1 <= reps <= cap:
+            return await ctx.send(f"❌ `{args[0]}`: roll 1 to {cap} times "
+                                  f"(roll_repeat_limit).")
+        args = args[1:]
+        if not args:
+            return await ctx.send("❌ `!roll <n>x` needs dice or a list to "
+                                  "roll.")
+    text = " ".join(args)
+    if "," in text and args[0].lower() != "odds":
+        # A list roll: one item per roll, `item:weight` weighted like a
+        # table (`!roll none, none, crit`).
+        spec = ", ".join(p.strip() for p in text.split(","))
+        if any(not p.strip() for p in text.split(",")):
+            return await ctx.send("❌ A list roll needs an item between "
+                                  "every pair of commas.")
+        try:
+            picks = [roll_table_pick(rng, spec) for _ in range(reps)]
+        except FormulaError as ex:
+            return await ctx.send("❌ " + str(ex).replace(
+                "roll_table(...)", "list roll").replace(
+                "roll_table(spec)", "list roll"))
+        times = f"{reps}x " if reps > 1 else ""
+        return await ctx.send(f"🎲 {times}`{spec}` → "
+                              + ", ".join(f"**{p}**" for p in picks))
+    if args[0].lower() == "odds" and reps > 1:
+        return await ctx.send("❌ `!roll odds` works out chances; it takes "
+                              "no `<n>x`.")
     terms = args[1:] if args[0].lower() == "odds" else args
     # Joined below so `!roll 2d6 + 3` and `!roll 2d6+3` both work; two terms
     # with no operator between them (`1d6 1d6`) joined into the malformed
@@ -11780,22 +12002,24 @@ async def roll_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if args[0].lower() == "odds":
         return await _roll_odds(ctx, "".join(args[1:]))
     spec = "".join(args)
-    # Use the match RNG when a match is active (honors random_seed); otherwise
-    # the global RNG, so `!roll` works even with no active match.
-    rng = random
-    try:
-        m = active_match(mgr, ctx)
-        rng = m.formula_rng()
-    except VTTError:
-        pass
-    try:
-        total, parts = roll_detail(rng, spec)
-    except FormulaError as ex:
-        return await ctx.send(f"❌ {ex}")
-    breakdown = ", ".join(parts)
-    # Hide the breakdown when it's just the same single number (e.g. a flat).
-    tail = f"   ({breakdown})" if breakdown and breakdown != str(total) else ""
-    return await ctx.send(f"🎲 `{spec}` → **{total}**{tail}")
+    lines = []
+    for i in range(reps):
+        try:
+            total, parts = roll_detail(rng, spec)
+        except FormulaError as ex:
+            return await ctx.send(f"❌ {ex}")
+        breakdown = ", ".join(parts)
+        # Hide the breakdown when it's just the same single number (a flat).
+        tail = (f"   ({breakdown})" if breakdown and breakdown != str(total)
+                else "")
+        lines.append((total, tail))
+    if reps == 1:
+        total, tail = lines[0]
+        return await ctx.send(f"🎲 `{spec}` → **{total}**{tail}")
+    return await ctx.send(
+        f"🎲 {reps}x `{spec}` → " + ", ".join(f"**{t}**" for t, _ in lines)
+        + "".join(f"\n{i}. **{t}**{tail}" for i, (t, tail)
+                  in enumerate(lines, 1) if tail))
 
 
 _ODDS_OPS = {">=": "≥", "<=": "≤", "==": "=", "!=": "≠", "=": "=",
@@ -13682,7 +13906,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
     if sub == "add":
         # Syntax:
-        #   !passive add <eid> <pid> <when> [target=PATH] [scope=exact|children|deep] "<formula>"
+        #   !passive add <eid> <pid> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] "<formula>"
         #
         # target/scope are optional and only meaningful for var hooks
         # (on_var_*). For other hooks they're stored but ignored at fire time.
@@ -13700,22 +13924,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # the formula. Named args may appear in any order but must all
         # come before any formula content so simple cases stay terse
         # (`!pas add ... <formula>` without typing target=/scope=).
-        target_val = ""
-        scope_val = "deep"
-        formula_parts: List[str] = []
-        for tok in args[4:]:
-            if not formula_parts and tok.startswith("target="):
-                target_val = tok[len("target="):]
-            elif not formula_parts and tok.startswith("scope="):
-                scope_val = tok[len("scope="):].lower()
-            elif (not formula_parts and re.fullmatch(r"[A-Za-z_]\w*=\S*", tok)
-                    and len(args) > args.index(tok) + 1):
-                # A mistyped option (`scop=exact`) would otherwise become the
-                # start of the formula and fail as a bare "Syntax error".
-                raise VTTError(f"Unknown option `{tok.split('=', 1)[0]}=` "
-                               f"(it takes: `target=`, `scope=`).")
-            else:
-                formula_parts.append(tok)
+        target_val, scope_val, prio, formula_parts = _passive_opts(args[4:])
         # Translate `\n`/`\t` so a multi-line body typed at the CLI
         # (where shlex preserves literal backslash-n) compiles. See
         # formula.normalize_body_source.
@@ -13738,7 +13947,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # surface as a clear error rather than silently storing garbage.
         e.passives[pid] = Passive(
             id=pid, when=when, formula=formula,
-            target=target_val, scope=scope_val,
+            target=target_val, scope=scope_val, priority=prio,
         )
         # Mention target/scope in the ack only for var hooks where they apply
         scope_note = ""
@@ -13746,6 +13955,20 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if when in VAR_HOOKS:
             scope_note = f" watching `{target_val or '(root)'}` scope=`{scope_val}`"
         return await ctx.send(f"Added passive `{pid}` ({when}){scope_note} to `{eid}`.")
+
+    if sub == "priority":
+        if await return_help_if_not_enough_args(ctx, args, 4, "passive", "priority"):
+            return
+        _check_tail(args, 4, (), "!passive priority <entity_id> <passive_id> <n>")
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        p = m.entities[eid].passives.get(args[2])
+        if p is None:
+            raise NotFound(f"Passive '{args[2]}' not found on entity '{eid}'.")
+        p.priority = checked_priority(args[3], "priority")
+        return await ctx.send(f"Passive `{eid}.{p.id}` now has priority "
+                              f"{p.priority} (higher runs first).")
 
     if sub in ("remove", "del", "rm"):
         if await return_help_if_not_enough_args(ctx, args, 3, "passive", "remove"):
@@ -13804,6 +14027,8 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(
             f"**Passive `{eid}.{pid}`**\n"
             f"Hook: `{p.when}`\n"
+            + (f"Priority: {p.priority}\n" if p.priority else "") +
+            f""
             f"{scope_block}"
             f"Formula:\n```\n{p.formula}\n```"
         )
@@ -13812,7 +14037,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 registry.annotate_sub(
     "passive", "add",
-    usage='!passive add <entity_id> <passive_id> <when> [target=PATH] [scope=exact|children|deep] "<formula>"',
+    usage='!passive add <entity_id> <passive_id> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] "<formula>"',
     desc=(
         "Attach a passive to an entity. <when> must be one of the hook names "
         "(see `!passive hooks`). Formula is run as a program when the hook fires; "
@@ -13825,6 +14050,14 @@ registry.annotate_sub(
         "(catches every var-event on the entity). Inside a var-hook formula you "
         "also have access to: changed_key, old_value, new_value, hook_name."
     ),
+)
+registry.annotate_sub(
+    "passive", "priority",
+    usage="!passive priority <entity_id> <passive_id> <n>",
+    desc=("Set a passive's priority. Within one hook firing, passives run "
+          "highest priority first, across global, team and the unit's own "
+          "passives; equal priorities keep the order globals, team, own "
+          "(each in the order added). Default 0; any number."),
 )
 registry.annotate_sub(
     "passive", "remove",
@@ -13869,7 +14102,7 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
     if sub == "add":
         # Syntax:
-        #   !gpassive add <pid> <when> [target=PATH] [scope=exact|children|deep] "<formula>"
+        #   !gpassive add <pid> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] "<formula>"
         #
         # See passive_cmd `add` for the rationale on the named-arg parsing.
         # Globals follow the same per-entity iteration model — for var hooks,
@@ -13880,22 +14113,7 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         pid = args[1]
         when = args[2].lower()
 
-        target_val = ""
-        scope_val = "deep"
-        formula_parts: List[str] = []
-        for tok in args[3:]:
-            if not formula_parts and tok.startswith("target="):
-                target_val = tok[len("target="):]
-            elif not formula_parts and tok.startswith("scope="):
-                scope_val = tok[len("scope="):].lower()
-            elif (not formula_parts and re.fullmatch(r"[A-Za-z_]\w*=\S*", tok)
-                    and len(args) > args.index(tok) + 1):
-                # A mistyped option (`scop=exact`) would otherwise become the
-                # start of the formula and fail as a bare "Syntax error".
-                raise VTTError(f"Unknown option `{tok.split('=', 1)[0]}=` "
-                               f"(it takes: `target=`, `scope=`).")
-            else:
-                formula_parts.append(tok)
+        target_val, scope_val, prio, formula_parts = _passive_opts(args[3:])
         # Same `\n`/`\t` normalization as entity-scoped !passive add.
         formula = normalize_body_source(" ".join(formula_parts).strip())
 
@@ -13913,13 +14131,24 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             raise DuplicateId(f"Global passive '{pid}' already exists.")
         m.global_passives[pid] = Passive(
             id=pid, when=when, formula=formula,
-            target=target_val, scope=scope_val,
+            target=target_val, scope=scope_val, priority=prio,
         )
         scope_note = ""
         from logic import VAR_HOOKS
         if when in VAR_HOOKS:
             scope_note = f" watching `{target_val or '(root)'}` scope=`{scope_val}`"
         return await ctx.send(f"Added global passive `{pid}` ({when}){scope_note}.")
+
+    if sub == "priority":
+        if await return_help_if_not_enough_args(ctx, args, 3, "gpassive", "priority"):
+            return
+        _check_tail(args, 3, (), "!gpassive priority <passive_id> <n>")
+        p = m.global_passives.get(args[1])
+        if p is None:
+            raise NotFound(f"Global passive '{args[1]}' not found.")
+        p.priority = checked_priority(args[2], "priority")
+        return await ctx.send(f"Global passive `{p.id}` now has priority "
+                              f"{p.priority} (higher runs first).")
 
     if sub in ("remove", "del", "rm"):
         if await return_help_if_not_enough_args(ctx, args, 2, "gpassive", "remove"):
@@ -13955,6 +14184,8 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(
             f"**Global passive `{pid}`**\n"
             f"Hook: `{p.when}`\n"
+            + (f"Priority: {p.priority}\n" if p.priority else "") +
+            f""
             f"{scope_block}"
             f"Formula:\n```\n{p.formula}\n```"
         )
@@ -13963,7 +14194,7 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 registry.annotate_sub(
     "gpassive", "add",
-    usage='!gpassive add <passive_id> <when> [target=PATH] [scope=exact|children|deep] "<formula>"',
+    usage='!gpassive add <passive_id> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] "<formula>"',
     desc=(
         "Add a global passive. Fires once per entity in turn order on the given "
         "hook. Inside the formula: `self` = the entity being iterated, "
@@ -13974,6 +14205,12 @@ registry.annotate_sub(
         "deeper), or deep (this path or any descendant). Defaults: target=root, "
         "scope=deep (catches every var-event)."
     ),
+)
+registry.annotate_sub(
+    "gpassive", "priority",
+    usage="!gpassive priority <passive_id> <n>",
+    desc=("Set a global passive's priority (higher runs first within one "
+          "hook firing, across global, team and own passives; default 0)."),
 )
 registry.annotate_sub(
     "gpassive", "remove",
@@ -14292,22 +14529,7 @@ async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         pid = args[1]
         when = args[2].lower()
-        target_val = ""
-        scope_val = "deep"
-        formula_parts: List[str] = []
-        for tok in args[3:]:
-            if not formula_parts and tok.startswith("target="):
-                target_val = tok[len("target="):]
-            elif not formula_parts and tok.startswith("scope="):
-                scope_val = tok[len("scope="):].lower()
-            elif (not formula_parts and re.fullmatch(r"[A-Za-z_]\w*=\S*", tok)
-                    and len(args) > args.index(tok) + 1):
-                # A mistyped option (`scop=exact`) would otherwise become the
-                # start of the formula and fail as a bare "Syntax error".
-                raise VTTError(f"Unknown option `{tok.split('=', 1)[0]}=` "
-                               f"(it takes: `target=`, `scope=`).")
-            else:
-                formula_parts.append(tok)
+        target_val, scope_val, prio, formula_parts = _passive_opts(args[3:])
         formula = normalize_body_source(" ".join(formula_parts).strip())
         if not formula:
             raise VTTError("Passive formula cannot be empty.")
@@ -14320,7 +14542,7 @@ async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # then store its serialized form on the rule.
         spec = Passive(
             id=pid, when=when, formula=formula,
-            target=target_val, scope=scope_val,
+            target=target_val, scope=scope_val, priority=prio,
         )
         existing = _read_specs()
         if any(isinstance(s, dict) and s.get("id") == pid for s in existing):
@@ -14340,6 +14562,33 @@ async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"match{'es' if refreshed != 1 else ''}]. Applies to entities "
             f"created from now on."
         )
+
+    if sub == "priority":
+        if await return_help_if_not_enough_args(ctx, args, 3, "defpassive", "priority"):
+            return
+        _check_tail(args, 3, (), "!defpassive priority <id> <n>")
+        pid = args[1]
+        prio = checked_priority(args[2], "priority")
+        existing = _read_specs()
+        new_list = []
+        for spec in existing:
+            if isinstance(spec, dict) and spec.get("id") == pid:
+                spec = dict(spec)
+                if prio:
+                    spec["priority"] = prio
+                else:
+                    spec.pop("priority", None)
+            new_list.append(spec)
+        if new_list == existing and not any(
+                isinstance(sp, dict) and sp.get("id") == pid for sp in existing):
+            raise NotFound(
+                f"No default passive '{pid}' in system '{sys_name}'.")
+        refreshed = _write_specs(new_list)
+        return await ctx.send(
+            f"Default passive `{pid}` of system `{sys_name}` now has "
+            f"priority {prio} [refreshed {refreshed} live "
+            f"match{'es' if refreshed != 1 else ''}]. Already-spawned "
+            f"entities keep their copy.")
 
     if sub in ("remove", "del", "rm"):
         if await return_help_if_not_enough_args(ctx, args, 2, "defpassive", "remove"):
@@ -14382,7 +14631,7 @@ async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 registry.annotate_sub(
     "defpassive", "add",
-    usage='!defpassive add <id> <when> [target=PATH] [scope=exact|children|deep] "<formula>"',
+    usage='!defpassive add <id> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] "<formula>"',
     desc=(
         "Add a default passive to the game system: it is copied onto every "
         "entity at creation (add / summon / revive), applied before "
@@ -14391,6 +14640,12 @@ registry.annotate_sub(
         "entity). <when> must be a hook name (see !defpassive hooks). "
         "Removable per-entity afterward; not re-enforced."
     ),
+)
+registry.annotate_sub(
+    "defpassive", "priority",
+    usage="!defpassive priority <id> <n>",
+    desc=("Set a default passive's priority (higher runs first within one "
+          "hook firing; default 0). Reaches entities created from now on."),
 )
 registry.annotate_sub(
     "defpassive", "remove",
@@ -16312,6 +16567,8 @@ for _sub, _usage in (
         ("def", "!status def <name>"),
         ("drop", "!status drop <name>"),
         ("tick", "!status tick <name> <formula ...>"),
+        ("hook", "!status hook <name> <on_added|on_removed|on_changed> [<formula ...>]"),
+        ("display", "!status display <name> [<format ...>]"),
         ("when", "!status when <name> <turn_end|turn_start|round_start|round_end|never>"),
         ("stack", "!status stack <name> <refresh|add_level|extend|replace|none>"),
         ("maxlevel", "!status maxlevel <name> <n>"),
@@ -16333,7 +16590,7 @@ for _sub, _usage in (
 
 @registry.command(
     "status",
-    usage=("!status <def|drop|rename|copy|tick|when|stack|maxlevel|data|tags|"
+    usage=("!status <def|drop|rename|copy|tick|hook|display|when|stack|maxlevel|data|tags|"
            "removes|blockedby|resist|counter|dispel|transfer|sprite|list|info|"
            "apply|force> ..."),
     desc=(
@@ -16358,7 +16615,16 @@ for _sub, _usage in (
         "resistible move). `sprite <name> <key|clear> [opacity=<n>] [tint=<name>] "
         "[layer=<n>]` sets a graphics OVERLAY drawn over afflicted entities "
         "(e.g. a burning overlay; default layer 150, above entities). "
-        "Subcommands: def, drop, rename, copy, tick, when, stack, maxlevel, "
+        "`hook <name> <on_added|on_removed|on_changed> <formula>` stores "
+        "what the status does when it arrives, leaves or changes on a unit "
+        "(self = the bearer; status_name, old_value, new_value and, on "
+        "removal, removed_by: expired / dispel / transfer / removes / "
+        "removed), run after the on_status_* passives; no formula clears "
+        "it. "
+        "`display <name> <format>` sets how the status shows in the "
+        "`{statuses}` roster placeholder (its fields are placeholders, as in "
+        "the status_line_format rule); no format clears it. "
+        "Subcommands: def, drop, rename, copy, tick, hook, display, when, stack, maxlevel, "
         "data, list, info, apply, force, dispel, transfer, sprite."
     ),
 )
@@ -16438,6 +16704,52 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return await ctx.send(f"❌ Invalid tick formula: {ex}")
         m.status_definitions[name]["tick"] = body
         return await ctx.send(f"Set `{name}` tick formula.")
+
+    if sub == "hook":
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "hook"):
+            return
+        name, hook = args[1], args[2].lower()
+        if name not in m.status_definitions:
+            return await ctx.send(f"❌ No status definition `{name}`. Use `!status def {name}` first.")
+        names = sorted(STATUS_DEF_HOOKS.values())
+        if hook not in names:
+            return await ctx.send(f"❌ hook must be one of: "
+                                  f"{', '.join(names)}.")
+        body = normalize_body_source(" ".join(args[3:]).strip())
+        sdef = m.status_definitions[name]
+        hooks = sdef.get("hooks") if isinstance(sdef.get("hooks"), dict) else {}
+        if not body:
+            if hooks.pop(hook, None) is None:
+                return await ctx.send(f"❌ `{name}` has no {hook} hook.")
+            if hooks:
+                sdef["hooks"] = hooks
+            else:
+                sdef.pop("hooks", None)
+            return await ctx.send(f"Cleared `{name}`'s {hook} hook.")
+        try:
+            validate_formula(body, mode="exec",
+                             known_funcs=frozenset(m.formula_functions.keys()))
+        except FormulaError as ex:
+            return await ctx.send(f"❌ Invalid {hook} formula: {ex}")
+        hooks[hook] = body
+        sdef["hooks"] = hooks
+        return await ctx.send(f"Set `{name}`'s {hook} hook (runs after the "
+                              f"on_status_* passives).")
+
+    if sub == "display":
+        if await return_help_if_not_enough_args(ctx, args, 2, "status", "display"):
+            return
+        name = args[1]
+        if name not in m.status_definitions:
+            return await ctx.send(f"❌ No status definition `{name}`.")
+        fmt = " ".join(args[2:]).strip()
+        if not fmt:
+            if m.status_definitions[name].pop("display", None) is None:
+                return await ctx.send(f"❌ `{name}` has no display format.")
+            return await ctx.send(f"Cleared `{name}`'s display format "
+                                  f"(it uses status_line_format).")
+        m.status_definitions[name]["display"] = fmt
+        return await ctx.send(f"`{name}` shows as `{fmt}` in `{{statuses}}`.")
 
     if sub == "when":
         if await return_help_if_not_enough_args(ctx, args, 3, "status", "when"):
@@ -18585,7 +18897,7 @@ for _subs, _usage in (
         (('get',), '!team get <team> <path>'),
         (('list',), '!team list [team]'),
         (('clear',), '!team clear <team> [path]'),
-        (('passive',), '!team passive <add <team> <pid> <when> <formula ...> | remove <team> <pid> | list <team>>')):
+        (('passive',), '!team passive <add <team> <pid> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] <formula ...> | remove <team> <pid> | list <team> | priority <team> <pid> <n>>')):
     registry.annotate_sub('team', *_subs, usage=_usage)
 
 
@@ -18692,7 +19004,8 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if await return_help_if_not_enough_args(ctx, args, 6, "team", "passive"):
                 return
             team, pid, when = args[2], args[3], args[4]
-            formula = normalize_body_source(" ".join(args[5:]).strip())
+            target_val, scope_val, prio, words = _passive_opts(args[5:])
+            formula = normalize_body_source(" ".join(words).strip())
             if when not in HOOK_NAMES and not is_event_hook(when):
                 return await ctx.send(
                     f"❌ unknown hook `{when}`. Allowed: "
@@ -18706,8 +19019,22 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             bucket = m.team_passives.setdefault(team, {})
             if pid in bucket:
                 return await ctx.send(f"❌ team `{team}` already has passive `{pid}`.")
-            bucket[pid] = Passive(id=pid, when=when, formula=formula)
+            bucket[pid] = Passive(id=pid, when=when, formula=formula,
+                                  target=target_val, scope=scope_val,
+                                  priority=prio)
             return await ctx.send(f"Added team passive `{pid}` ({when}) to `{team}`.")
+        if psub == "priority":
+            if await return_help_if_not_enough_args(ctx, args, 5, "team", "passive"):
+                return
+            _check_tail(args, 5, (),
+                        "!team passive priority <team> <passive_id> <n>")
+            team, pid = args[2], args[3]
+            p = m.team_passives.get(team, {}).get(pid)
+            if p is None:
+                return await ctx.send(f"❌ team `{team}` has no passive `{pid}`.")
+            p.priority = checked_priority(args[4], "priority")
+            return await ctx.send(f"Team passive `{team}.{pid}` now has "
+                                  f"priority {p.priority} (higher runs first).")
         if psub in ("remove", "del", "rm"):
             if await return_help_if_not_enough_args(ctx, args, 4, "team", "passive"):
                 return
@@ -18724,9 +19051,9 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return await ctx.send(f"team `{args[2]}` has no passives.")
             lines = [f"Team passives for `{args[2]}`:"]
             for pid, p in bucket.items():
-                lines.append(f"  `{pid}` ({p.when}): `{p.formula}`")
+                lines.append(_format_passive_line(pid, p))
             return await ctx.send("\n".join(lines))
-        return await ctx.send("❌ Usage: `!team passive <add|remove|list> ...`")
+        return await ctx.send("❌ Usage: `!team passive <add|remove|list|priority> ...`")
 
     return await _help_fallback(ctx, ["team"], args[0] if args else None)
 
@@ -19449,6 +19776,12 @@ def _help_find(ctx: ReplyContext, mgr: MatchManager, words: List[str]) -> str:
                              f"{_clip(sm.get('desc'), 110)}"))
     mid = mgr.active_by_channel.get(ctx.channel_key)
     m = mgr.matches.get(mid) if mid is not None else None
+    funcs: List[Tuple[bool, str]] = []
+    for name, ref in function_reference().items():
+        if hit(name, ref["doc"]):
+            funcs.append((name_hit(name),
+                          f"- `{_clip(ref['signature'], 70)}` — "
+                          f"{_clip(_func_doc_body(ref), 110)}"))
     rules: List[Tuple[bool, str]] = []
     for name in sorted(RULES_REGISTRY):
         spec = RULES_REGISTRY[name]
@@ -19458,13 +19791,15 @@ def _help_find(ctx: ReplyContext, mgr: MatchManager, words: List[str]) -> str:
             rules.append((name_hit(name),
                           f"- `{name}` = `{_rule_value_text(ctx, mgr, name, val, 40)}` — "
                           f"{_clip(spec.get('desc'), 110)}"))
-    if not cmds and not rules:
+    if not cmds and not rules and not funcs:
         return (f"🔎 Nothing matches `{' '.join(words)}`. Try fewer or "
                 f"shorter words.")
     where = f"match `{m.id}`" if m is not None else "the defaults (no match here)"
     out = [f"🔎 `{' '.join(words)}` — {len(cmds)} command(s), "
+           f"{len(funcs)} formula function(s), "
            f"{len(rules)} gamerule(s) (rule values: {where})"]
-    for title, rows in (("Commands", cmds), ("Gamerules", rules)):
+    for title, rows in (("Commands", cmds), ("Formula functions", funcs),
+                        ("Gamerules", rules)):
         if not rows:
             continue
         rows = sorted(rows, key=lambda r: not r[0])    # name hits first, stable
@@ -19473,14 +19808,89 @@ def _help_find(ctx: ReplyContext, mgr: MatchManager, words: List[str]) -> str:
         if len(rows) > _HELP_FIND_CAP:
             out.append(f"…and {len(rows) - _HELP_FIND_CAP} more — add a word "
                        f"to narrow the search.")
-    out.append("Full text: `!help <command> [sub]`; all rules: `!system rules`.")
+    out.append("Full text: `!help <command> [sub]`, `!help function <name>`; "
+               "all rules: `!system rules`.")
     return "\n".join(out)
 
 
-@registry.command("help", access="all", usage="!help [command [sub]] | !help find <word> [word ...] | !help rule <rule>", desc="Show command usage. Try `!help ent` or `!help ent move`. `!help find <word> [word ...]` searches every command, subcommand and gamerule (name and description, all words must match) and shows each matching rule's current value on this match. `!help rule <rule>` shows one gamerule in full: description, allowed values, default, its value on this channel's match and the system in the inheritance chain that sets it. (`!help find` alone is the help for the `!find` command.)")
+_FUNC_KINDS = {"reads": "reads the match", "changes": "changes the match "
+               "(not allowed in `$()` arguments)", "pure": "a pure helper "
+               "(no match needed)"}
+
+
+def _func_doc_body(ref: Dict[str, Any]) -> str:
+    """A function's description without the signature its docstring opens
+    with."""
+    doc = ref["doc"]
+    head = doc.split(": ", 1)
+    if len(head) == 2 and head[0].split("(", 1)[0] == ref["signature"].split(
+            "(", 1)[0]:
+        return head[1]
+    return doc or "(no description)"
+
+
+def _help_function(m: Optional[Match], name: str) -> str:
+    """`!help function <name>`: a built-in formula function's signature,
+    description and what it may do, or the match's own `!func`."""
+    ref = function_reference().get(name)
+    if ref is None:
+        fdef = (m.formula_functions.get(name) if m is not None else None)
+        if fdef is not None:
+            return (f"**`{fdef.signature()}`** — a function of this match "
+                    f"(`!func`):\n```\n{fdef.body}\n```")
+        import difflib
+        near = difflib.get_close_matches(name, list(function_reference()),
+                                         n=3, cutoff=0.6)
+        hint = (" Did you mean " + ", ".join(f"`{n}`" for n in near) + "?"
+                if near else " `!help functions` lists them.")
+        return f"❌ No formula function `{name}`.{hint}"
+    notes = [_FUNC_KINDS[ref["kind"]]]
+    if ref["kind"] == "pure" or ref["in_args"]:
+        notes.append("usable in `$()`")
+    if ref["loopable"]:
+        notes.append("loopable (`for x in ...`)")
+    return (f"**`{ref['signature']}`** — {'; '.join(notes)}.\n"
+            f"{_func_doc_body(ref)}")
+
+
+_FUNC_LIST_KINDS = ("reads", "changes", "pure", "loopable")
+
+
+def _help_functions(kind: Optional[str]) -> str:
+    """`!help functions [reads|changes|pure|loopable]`: the built-in formula
+    functions by what they may do."""
+    ref = function_reference()
+    if kind is not None and kind not in _FUNC_LIST_KINDS:
+        raise VTTError(f"`{kind}` — list one of: "
+                       f"{', '.join(_FUNC_LIST_KINDS)} (or none for all).")
+    groups = ([kind] if kind is not None else ["reads", "changes", "pure"])
+    out = [f"**Formula functions** ({len(ref)}; `!help function <name>` "
+           f"for one)"]
+    for g in groups:
+        names = [n for n, r in ref.items()
+                 if (r["loopable"] if g == "loopable" else r["kind"] == g)]
+        title = ("Loopable (`for x in ...`)" if g == "loopable"
+                 else _FUNC_KINDS[g].capitalize())
+        out.append(f"**{title}** ({len(names)}): "
+                   + ", ".join(f"`{n}`" for n in names))
+    return "\n".join(out)
+
+
+@registry.command("help", access="all", usage="!help [command [sub]] | !help find <word> [word ...] | !help rule <rule> | !help function <function> | !help functions [reads|changes|pure|loopable]", desc="Show command usage. Try `!help ent` or `!help ent move`. `!help find <word> [word ...]` searches every command, subcommand, formula function and gamerule (name and description, all words must match) and shows each matching rule's current value on this match. `!help rule <rule>` shows one gamerule in full: description, allowed values, default, its value on this channel's match and the system in the inheritance chain that sets it. `!help function <name>` shows a formula function's signature, description and whether it reads or changes the match, works in `$()` and can be looped over (or one of this match's `!func`s); `!help functions [kind]` lists them. (`!help find` alone is the help for the `!find` command.)")
 async def help_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if len(args) >= 2 and args[0].lower() == "find":
         return await ctx.send(_help_find(ctx, mgr, args[1:]))
+    if args and args[0].lower() == "function":
+        if len(args) < 2:
+            return await ctx.send("❌ Usage: `!help function <function>`.")
+        _check_tail(args, 2, (), "!help function <function>")
+        mid = mgr.active_by_channel.get(ctx.channel_key)
+        return await ctx.send(_help_function(
+            mgr.matches.get(mid) if mid is not None else None, args[1]))
+    if args and args[0].lower() == "functions":
+        _check_tail(args, 2, (), "!help functions [reads|changes|pure|loopable]")
+        return await ctx.send(_help_functions(
+            args[1].lower() if len(args) > 1 else None))
     if len(args) >= 2 and args[0].lower() == "rule":
         _check_tail(args, 2, (), "!help rule <rule>")
         return await ctx.send(_help_rule(ctx, mgr, args[1]))

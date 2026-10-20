@@ -276,6 +276,7 @@ async def run_one(cmds: List[str]) -> List[Tuple[str, List[str]]]:
     data_root = tempfile.mkdtemp(prefix="fcs_data_")
     workspaces = Workspaces()
     workspaces.storage = Storage(data_root)
+    workspaces.storage.attach_crash_log(workspaces)
     try:
         return await _run_cmds(cmds, workspaces)
     finally:
@@ -337,7 +338,11 @@ def _flagged(transcript: List[Tuple[str, List[str]]],
         markers = markers + _ASSERT_MARKERS
     hits = []
     for cmd, outs in transcript:
+        # `!as crash` is the error log's test hook: its 💥 is the point.
+        crash_hook = cmd.split()[:2] == ["!as", "crash"]
         for o in outs:
+            if crash_hook and o.startswith("💥 Unexpected error (ref "):
+                continue
             if any(marker in o for marker in markers):
                 hits.append((cmd, o))
     return hits

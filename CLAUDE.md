@@ -142,7 +142,8 @@ code. How the harness works (`run_scenarios.py`, scenarios in
   mismatch or a duplicate number). Only lines ABOVE a scenario's first
   `Expected:` run: a staged scenario labels intermediate prose `Result:`
   (see 13, 26). Multi-line bodies use literal `\n` (`_interpret_escapes`).
-- **What it flags.** `💥` and "Syntax error" always; `❌ Runtime error:`,
+- **What it flags.** `💥` (except the `💥 Unexpected error (ref N)` reply of
+  `!as crash`, the error log's test hook) and "Syntax error" always; `❌ Runtime error:`,
   `❌ Unexpected error:`, an unknown subcommand ("isn't a valid command"),
   missing arguments ("is missing arguments"), a usage refusal (`❌ Usage:`)
   and stray words ("❌ Unexpected ... — usage:") unless the prose carries
@@ -242,7 +243,9 @@ Each of these was learned from a shipped bug.
   cost follows its arguments clips to the map or charges `formula_cell_limit`
   / `formula_loop_limit` / `sight_check_limit`. Loopable → `_LOOPABLE_FUNCS`.
   Exercise every new function: import-time checks prove only registration (a
-  nonexistent helper name once hid in a function body).
+  nonexistent helper name once hid in a function body). Its docstring is its
+  `!help function` entry (`formula.function_reference`: first line the call
+  form, then what it does; a wrapper in the namespace sets `__wrapped__`).
 - **A HOOK_CONTEXT binding:** `_who_arg` handles HOOK_CONTEXT_NAMES by set
   membership, so `entity[<binding>]` works automatically; check the binding is
   actually supplied in the fire site's extras.
@@ -443,7 +446,8 @@ switch workspaces with `!as server <key>` (scenarios 698-700).
   (`bot.application_info()`: the application's owner, or its team's members);
   `ctx_is_bot_owner` (Discord sets `is_bot_owner`; CLI/GUI = always; default-
   deny elsewhere). Owner-only commands live under `!owner` (`!owner servers`
-  lists every workspace); `!whoami` shows the badge. Owner is NOT admin of
+  lists every workspace, `!owner errors` the crash log, §7.16); `!whoami`
+  shows the badge. Owner is NOT admin of
   every server: server-wide commands still need that server's Administrator.
 - **System rules on load:** a system saved by an older build may name a
   gamerule that no longer exists — `GameSystem.from_dict` drops it with a
@@ -482,7 +486,8 @@ systems.json, workspace.json, system_history.json and audit.json, written
 by each commit that changes one, `<stem>.<unix ms>.json`; kept for the
 owner limits `server_backup_days` (7) and `server_backup_count` (200 per
 file), pruned after each copy and hourly), `corrupt/`;
-plus `data/bot_settings.json` (owner limits + rule ceilings) and
+plus `data/bot_settings.json` (owner limits + rule ceilings), `data/errors.json`
+(the crash log, §7.16) and
 `data/.trash/` (wiped data, 24 h). Mechanics:
 - **Commit after every top-level command** (`vtt_commands.persist_workspace`,
   called from `CommandRegistry.run` inside the command lock, also after a
@@ -654,8 +659,14 @@ or unit (825).
 **Two modes.** EXPRESSION formulas (conditions: block / opaque / visibility /
 alive / death conditions, watcher conditions, slot conditions, modifier
 values, `$()` args) can't assign. PROGRAMS (passives, ticks, watcher effects,
-`!func` bodies, actions) can. A rule's schema says which (`"formula":
-"expression"|"program"`), and `!system set` validates it.
+`!func` bodies, status hooks, actions) can, and every program binds
+bare-name LOCALS (`dealt = base - armor`; `_collect_program_locals`
+pre-collects them as known params, `_EntityAccessTransformer(locals_ok=)`):
+a local lives until the formula ends and is never stored (a `!func` call
+runs in its own namespace copy), and can't take the name of a function
+(built-in or the match's `!func`s), a hook / action binding, an entity
+token, `match`, `entity` or a `__` name (886). A rule's schema says which
+(`"formula": "expression"|"program"`), and `!system set` validates it.
 
 **Identifier surfaces** resolved at runtime: `_ALLOWED_FUNCS` (pure helpers),
 `_MATCH_FUNC_NAMES` (match-bound), `HOOK_CONTEXT_NAMES` (bindings a fire site
@@ -708,9 +719,7 @@ lines `_check_line_budget`; `!func` recursion has its own limit. One bot
 process serves every server, so a formula's cost must follow the map, never
 its arguments.
 
-**Action mode** (`action_mode=True`) adds: bare-name assignments become
-locals (the validator pre-collects assign targets, so later references
-validate); `source.<path>`, `args.<key>`, `target.x` etc. (any bare-Name root)
+**Action mode** (`action_mode=True`) adds: `source.<path>`, `args.<key>`, `target.x` etc. (any bare-Name root)
 pass through to runtime attribute resolution — Python dunders (`__x__`) are
 rejected there, engine dunder vars (`__follows`) are fine; `for x in target`
 when target is a list; the builtins `cmd`, `fail`, `choose`, `choose_number`.
@@ -1083,7 +1092,10 @@ hardcodes**.
   `item_consume` (drops the container at 0; `amount_field` rule; `var_move`
   onto its own path is a no-op, into its own subtree refused), `var_keys`,
   `var_sum`, `var_clear`, `get`, `keys` / `values` / `index_of` / `unique`
-  (547-548, 685-686). keys / values / each / len / pick / shuffle /
+  (547-548, 685-686); list surgery: `take` / `drop` / `slice` (0-based,
+  negative counts from the end), `remove_at` / `insert_at` (new lists),
+  `reverse`, `flatten` (one level), `zip` (pure, loopable, charged to the
+  list budget, 887). keys / values / each / len / pick / shuffle /
   roll_table skip a partial template's `__template` marker
   (`formula._data_items`), as var_keys skips every `__` key. Authoring notes: in an item's action `source.<path>` is
   the ITEM's container and `entity[self]` the HOLDER; dict keys are unique, so
@@ -1121,9 +1133,13 @@ hardcodes**.
 
 - **Passives** (`Passive`, `!passive` per unit, `!gpassive` global, `!team
   passive` per team, `default_entity_passives`): `when` is a HOOK_NAMES entry
-  or `event:<name>`. `Match._firing_passives(target)` yields global + the
-  target's team passives; then the unit's own. Before each own-handler loop
-  the unit's existence is re-checked (ghost firing, §5).
+  or `event:<name>`. Every fire site runs `Match._ordered_passives(target,
+  pred)` (via `_run_ordered`): the global, the target's team and its own
+  passives in one list, highest `priority` first (`Passive.priority`, any
+  finite number, default 0; `priority=` on every passive add, `!passive /
+  !gpassive / !team passive / !defpassive priority`), ties in the old order
+  (globals, team, own, each as added). An own passive is skipped once its
+  unit is gone (ghost firing, §5) (882).
 - **Var hooks** (`on_var_*`, `on_var_written`, `on_var_write_attempt`): run
   bottom-up for subtree writes; `self` is the CURRENT-TURN unit, and the
   extras carry changed_key / old_value / new_value / intended_value /
@@ -1231,6 +1247,15 @@ hardcodes**.
   drop/list/info`) describe a status ONCE; an instance resolves behaviour from
   the definition of the same name. Duration decrement and self-removal live
   in the GM's tick formula; the engine forces no decay (390-391).
+- **Definition hooks** (`!status hook <name> <on_added|on_removed|on_changed>
+  [formula]`, the definition's `hooks`; `logic.STATUS_DEF_HOOKS`): run by
+  `fire_status_event` after the on_status_* passives, self = the bearer,
+  while the unit exists. Removal hooks (passives too) bind `removed_by`:
+  `dispel`, `transfer`, `removes` (another status's `removes`), `expired`
+  (a counter reached 0, or the status's own tick removed it:
+  `logic.STATUS_TICKING`) or `removed`; `_emit_status_diff(removed_by=)`
+  carries a caller's cause (884). The formula status functions surface
+  the hook output they set off.
 - **Applying** (`apply_status` / `status_apply` / `!status apply`): stacking
   from the definition's `stack`, else `status_default_stack` (refresh /
   add_level / extend / replace / none). `max_level` is a hard ceiling on
@@ -1274,7 +1299,11 @@ hardcodes**.
   from the source unconditionally and re-applies on the destination through
   apply_status — resistible, consumed on rejection, and the moved instance
   keeps its custom data (`seed_data`) (528-529, 683).
-- **Display:** status sprite overlays (§7.13).
+- **Display:** status sprite overlays (§7.13); the `{statuses}` roster
+  placeholder (`vtt_commands._statuses_text`, in the default
+  entity_info_format): each status through its definition's `display`
+  format (`!status display`) else the `status_line_format` rule, its
+  instance fields as placeholders (885).
 
 ### 7.5 Modifiers (derived stats)
 
@@ -1288,7 +1317,10 @@ hardcodes**.
   `target` / `attacker` / `defender` / `other`.
 - **Fold** (`apply_modifiers`): effective priority = priority + per-op offset
   (`modifier_op_priority`), same-op combine within a tier (add sum, inc% sum,
-  more% product, set last, min floor, max cap), tiers ascending,
+  more% product, set last, min floor, max cap), HIGHEST tier first (the
+  engine-wide priority rule: passives run and shield pools drain highest
+  priority first too; the default op offsets run add 500 … max 0, so the
+  default order stays add, inc%, more%, set, min, max, 407, 883),
   `modifier_op_order` breaks ties; `modifier_stat_caps` clamps the result.
   An unknown op folds as add and `!mod show` flags it.
 - Pure query: the engine never applies modifiers; the GM threads
@@ -2100,7 +2132,8 @@ hardcodes**.
   (`logic.COMMAND_USER`, set in `_run_top`); `command_attribution` (words
   history / log / diff) picks where it shows. `!log [n] type= who= round=
   by=` filters (n ≥ 1; an unknown type is refused) (771, 822).
-- **Roster text:** `entity_line_format`, `entity_info_format`,
+- **Roster text:** `entity_line_format`, `entity_info_format` (`{statuses}`,
+  §7.4),
   `corpse_line_format`, `body_part_entity_line_suffix`,
   `mount_entity_line_suffix`, `show_corpses_in_entity_list`; `{placeholder}`
   templates over vars. Event log: `!log`, `event_log_*` rules, `log()`.
@@ -2163,7 +2196,10 @@ hardcodes**.
   dotted path and refuses a team with nothing to clear);
   a `modifiers` bundle applies to every member.
 - **Dice and tables:** `roll("NdM±k")` with explode `!` and keep `kh<n>` /
-  `kl<n>` (n ≥ 1); `!roll`, `!roll odds` (exact distributions); `roll_table`
+  `kl<n>` (n ≥ 1); `!roll`, `!roll odds` (exact distributions); `!roll
+  none, none, crit` (a comma list picks one item, `item:weight` weighted,
+  through `roll_table_pick`) and a leading `<n>x` repeating any roll, at
+  most `roll_repeat_limit` (owner ceiling) (888); `roll_table`
   (finite weights, keyed entries), `band` (ranges may be negative; an
   unreadable or backwards band is refused), named tables (`!table`, `table_roll`); `pick` / `shuffle`. All use
   `Match.formula_rng()`: a `logic.CountingRandom` seeded with the
@@ -2221,7 +2257,25 @@ hardcodes**.
   RNG restored, and reports the first
   entry whose state hash differs; the rebuilt match takes the recording as
   its journal (`_REPLAYING`) (778-780).
-- **Other:** `!help find <words>` (commands, subcommands and rules),
+- **Formula reference:** `formula.function_reference()` (built once from a
+  throwaway match's namespace) gives every function's signature, docstring
+  and kind (reads / changes the match, pure; loopable; allowed in `$()`).
+  `!help function <name>` shows one (a close-name suggestion when unknown;
+  a match `!func` shows its parameters and body), `!help functions
+  [reads|changes|pure|loopable]` lists them, `!help find` searches them, and
+  Tab completes the names (`function` slot) (889).
+- **Crash log** (`logic.CrashLog`, `Workspaces.crashes`, bot-wide, saved in
+  `data/errors.json` by `Storage.attach_crash_log`; memory only with match
+  persistence off): an exception a command handler didn't expect, a passive,
+  tile / zone hook or status tick that CRASHED, and a failed disk save each
+  record an entry (`crash_ref` / `CrashLog.record`: time, server, match,
+  user, the command as typed from the `CRASH_CONTEXT` `_run_top` sets, the
+  traceback with file names only) and the reply names it (`💥 Unexpected
+  error (ref N)`, `CRASHED (ref N)`). Refs count bot-wide past the owner
+  limit `error_log_entries` (200). `!owner errors [n] | show <ref> | clear`
+  (every server), `!server errors [n] | show <ref>` (admin, own server). `!as
+  crash [text]` (CLI / harness) raises one on purpose (890).
+- **Other:** `!help find <words>` (commands, subcommands, rules and formula functions),
   `!whoami`, `!log` (event log rules), `!state`, `!list`, `!dist`, string
   helpers (`upper` ... `fmt`, a safe field parser), list helpers (`sum`,
   `sorted`, `any`, `all`, `count`), `lowest_var` / `highest_var`.

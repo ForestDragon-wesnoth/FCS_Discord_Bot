@@ -13,7 +13,7 @@ to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#179-#181, #183, #186-#188, #40 and #164 (multiple and nested maps, see
+#179-#181, #183, #186-#188, #200-#202, #205, #206, #216, #217, #222, #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), parts of #14.
 
 **Off the list:**
@@ -41,7 +41,7 @@ for reference.
 - **#55 Enable/disable passives and watchers.** `!passive disable/enable`, the same on `!gpassive` and `!watch`, plus a formula function. Useful for testing and for "silenced" statuses.
 - **#56 Status source tracking.** An optional `source` on `status_apply` records who applied it. That gives kill credit for damage over time, "dispel only your own", and "the curse ends when the caster dies".
   - From the combat systems: covered by #227's `source=`; the source is a tracked reference (#209), so it clears when the unit that applied it leaves the match.
-- **#57 Repeated and labelled rolls.** `!roll 6x 4d6kh3` rolls six times; `!roll 1d20+5 attack` labels the result.
+- **#57 Labelled rolls.** `!roll 1d20+5 attack` labels the result. (Repeats, `!roll 6x 4d6kh3`, shipped with #217.)
 - **#59 `!turn roll [selector]`.** Rerolls initiative for the selected units with an `initiative_roll_formula` rule.
 - **#66 `!redo`.** Keeps the snapshots an undo dropped until the next state-changing command, so an undo can be taken back.
   - Note: undo replaces the Match object, and the journal records undo as state. Redo snapshots have to be dropped by any state change on the match from any channel, approvals and watchers included, and a redo needs its own journal entry.
@@ -98,25 +98,6 @@ for reference.
 - **#182 Match threads on Discord.** `!match new ... thread` creates a thread and binds the new match to it.
 - **#184 Trail segment spacing above 1** (§8). `segment_spacing` works only in `path` follow mode today.
 - **#185 Forced and reflected status transfer** (§8). A transfer that ignores resistance and immunity on the destination, and a "reflect" form that bounces a status back at its source.
-- **#200 Status definition hooks.**
-  - `!status hook <name> <on_added|on_removed|on_changed> <formula ...>` stores a program on the status definition. It runs with `self` = the unit carrying the status and the usual status bindings (`status_name`, old and new value), after the global, team and own `on_status_*` passives.
-  - Effects that belong to a status then live in it:
-    - poison's first hit on application;
-    - a stun that leaves a turn of stun immunity when it ends;
-    - a curse that jumps to a neighbour when removed;
-    - Solis Endurance raising max hp on arrival and capping hp on removal.
-  - Today a definition holds one program, `tick` (the `!status` usages, vtt_commands.py:16281). Anything on apply or removal goes into a global `on_status_added` passive branching on `status_name`, so one status's behaviour sits in two places and that passive grows a branch per status (D5). Tile templates and zones already carry their own hooks.
-  - Open choice: whether expiry, dispel and transfer should be told apart (a `removed_by` binding).
-- **#201 Passive priority.**
-  - An optional `priority` on every passive (unit, team, global, default). Within one hook firing, passives run by priority; ties keep today's order (globals, then team, then the unit's own, each in insertion order).
-  - Example of order mattering: armor reduction, then a shield absorbing the rest, then a "last stand" check, where the armor rule is a global passive and the shield an item's passive.
-  - Today that order is fixed in `fire_hook` (logic.py:18107) and `Passive` has no field for it, so such rules have to be merged into one passive to control their order.
-  - The per-passive re-checks that a unit still exists stay as they are.
-- **#202 Formula functions in `!help`.**
-  - `!help func <name>` shows the signature, the docstring, and whether the function reads or changes state and can be looped over.
-  - `!help find <words>` also searches function names and docstrings; `!help funcs [read|mutating|loopable]` lists them.
-  - Today 287 functions (235 match-bound, 52 pure) carry docstrings in formula.py, and none of it reaches chat: `!help find summon` returns six commands and four rules that mention summoning, and not `summon()` itself.
-  - #194 (formula Tab completion) can read the same table.
 - **#203 Where-used search.**
   - `!match search <text>` lists every stored formula and body containing the text, with its location: passives at every layer, unit actions, watchers, status ticks, tile and zone hooks and conditions, functions, aliases, macros, formula rules. `system=<name>` searches a system's rules and libraries.
   - The scanner exists: `_match_formula_slots` (vtt_commands.py:7217) already feeds `!system lint` and the "formulas still mention X" notes of the renames.
@@ -126,19 +107,6 @@ for reference.
   - Renames a GM var on every unit, part and corpse of the match, plus `default_entity_vars` and clamp paths, in one undo step. Partial-template markers record the move, and the formulas still naming the old path are listed through #203's scanner, the way `!status rename` lists them.
   - Today statuses, zones, tables, macros and the engine's var-name rules can be renamed (`rename_status`, `_rename_entry`, `rename_unit_vars`). A GM's own var can't: renaming `stance` mid-campaign takes a `!foreach` over every unit plus hand edits of the defaults and clamps.
   - Open choice: templates in the server library get rewritten, or listed.
-- **#205 List helpers.**
-  - `take(l, n)`, `drop(l, n)`, `slice(l, a, b)`, `remove_at(l, i)`, `insert_at(l, i, v)`, `reverse(l)`, `flatten(l)`, `zip(a, b)`.
-  - Today `+` appends and `filter_with` removes by value. Taking the first card off a deck needs `map_with(range(1, len(deck)), lambda i: get(deck, i))` (checked on 836e3af), which also charges the loop limit per card.
-  - Uses:
-    - card decks, where a draw is `take` + `drop` and a reshuffle is `shuffle` (Savage Worlds initiative cards, Gloomhaven attack-modifier decks);
-    - queues;
-    - "last three attackers" histories;
-    - "dodge the next N attacks" counters (an NCS design note).
-  - It composes today, so it falls under the "simplify only what GMs write over and over" rule; the user's call.
-- **#206 Crash log for the bot owner.**
-  - Every 💥 (an unexpected exception in a command) is recorded with time, server, match, user, the command as typed and the traceback, in a capped file under `data/` (an owner limit). `!owner errors [n]` lists them; `!owner errors <ref>` shows one.
-  - The 💥 reply carries the reference (`💥 Unexpected error (ref 17): ...`), so a player can quote it in a bug report.
-  - Today a handler exception replies `💥 Unexpected error: <message>` (vtt_commands.py:1049) and the traceback is dropped; only errors raised outside a handler reach the console (discord_commands.py:1228). On public servers, the 💥 line in someone else's channel would be the only trace of a bug.
 - **#207 `!hooks <eid> [when]`.**
   - One listing of everything that runs for a unit, per hook name, in the order the engine runs it: global passives, team passives, own passives, attached parts' own passives, status ticks at their `tick_when`, tile and zone hooks under its footprint, its schedules.
   - `!hooks <eid> fire <when> [key=value ...]` (hosts) fires one hook on the unit now. Inside `!dry` that becomes a test that keeps nothing.
@@ -165,16 +133,6 @@ for reference.
     - Names resolved per viewer: `say("{target} is hit")` shows a disguised unit's disguise to a POV that the disguise fools.
     - `say_to(team, text)` for information meant for one side.
     - One message per command on Discord: the `say()` lines of one command grouped into one reply.
-- **#216 Local variables in `!func`, passive and tick bodies.**
-  - Allow bare-name assignment (`dealt = base - armor`) in every formula program, as actions already do. A local lives until the formula ends and is never stored.
-  - Design point: a `!func` runs inline in its caller's frame (formula.py:217, "functions are inline macros running in the caller's frame"), so a function's locals would land in the caller's namespace. Calls need their own frame for locals (parameters already behave like locals), or a function's locals get a per-call prefix.
-  - Names that are functions, bindings or `match` stay refused, as do `__` names (`_check_binding_name`).
-  - The game need: the damage calculation each system applies to every hit (D6). Removes L7 and most of D6.
-- **#217 List rolls.**
-  - `!roll none, none, minicrit, crit` picks one item; `none:3, minicrit, crit` weights like a table; `!roll 2x none, crit` rolls twice (#57).
-  - All three rule documents write crit and loot rolls this way: Solis crit tables, FCS1 "Loot Roll: !roll none,none,none,none,none,club,buckler". Today each list needs a `!table def` before anyone can roll it (D11). In formulas, `pick` and `roll_table` already do it.
-  - From the combat systems:
-    - `!roll 6x none, none, crit` for six rolls at once (#57); `keep=best` for FCS1 Calculated Strikes ("roll twice, and if one of the rolls is a crit, pick that"), sharing #253's adjustments.
 - **#218 `tile_place(template, x, y, map=None)`.**
   - The formula twin of `!tile place`, for attacks that leave a tile behind: Solis Flame Throw places a fire tile when the attack is dodged; FCS1 Scorch Ground sets up to five tiles on fire. `tile_template_of(x, y)` reads it back.
   - Today a formula writes the internal `_template` key with `tile_set` (D10). It works (`solis1.out`: a tree turned into fire from its own turn hook) and relies on an implementation detail.
@@ -189,15 +147,6 @@ for reference.
 - **#221 Default passives on existing units.**
   - `!defpassive add ... existing` (or `!match sync passives`) also puts the new default passive on the units already in the system's matches; `!defpassive remove ... existing` takes it off them.
   - Today a default passive reaches only units created afterwards (`fcs1.out`), which surprises a GM who builds a system while units are already placed (D14).
-- **#222 Status details for players.**
-  - `!ent info` lists each status with level and duration (`burn ×2, 3 turns`).
-  - A `{statuses}` placeholder renders them in `entity_line_format` through a `status_line_format` rule (`{level}× {name} ({duration})`), with a per-definition override in the status's `display` data, so Solis burns can show each level's timer.
-  - Hidden statuses (#115) stay out of both.
-  - The game need: players of all three systems track status timers on their units (L6).
-  - From the combat systems:
-    - FCS1 shows end turns ("lvl 1 burn until turn x"): a `{until_turn}` placeholder computed from the duration and the turn clock.
-    - FCS1 charge progress ("charging Heavy Shot, damage: 25/100") from #235's damage count.
-    - FCS1 Umbral Rot's lost max hp shown as "(−30 max hp)": any field of the instance's data can be a placeholder.
 - **#223 `summoner` binding in `on_entity_spawned`.**
   - The unit (or `None`) whose action, passive or tick summoned the new one. The engine also stores it on the summon (`summoned_by`, a tracked reference under #209), so rules can read it later:
     - "dismiss my summons when I die";

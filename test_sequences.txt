@@ -10486,16 +10486,19 @@ SCENARIO 407 — Stat modifiers: set / min / max ops + priority tiers
 !ent set_var h modifiers.haste.stat speed
 !ent set_var h modifiers.haste.op set
 !ent set_var h modifiers.haste.value 3
-!ent set_var h modifiers.haste.priority 100
+!ent set_var h modifiers.haste.priority -100
 !mod show h speed 5
+?? → base 5 becomes 8
 
-Expected: in the default priority tier base 5 + add 10 = 15, then the max
+Expected: in the default priority tiers base 5 + add 10 = 15, then the max
 op CAPS it to 12 and the min op (floor 8) leaves it (12 ≥ 8) → first show 12.
-Adding a `set` modifier at priority 100 (its own higher tier) overrides the
-value to 3 — but the min/max clamp ops carry a high op-priority offset and
-so apply LAST, after the set: the floor (8) pulls 3 back up → second show 8.
-Demonstrates set/min(floor)/max(cap) and that bumping a record's priority
-pulls it into its own tier while clamp ops still land last.
+Modifiers fold highest effective priority first, and the op offsets
+(modifier_op_priority: add 500 … min 100, max 0) put the clamp ops last.
+Adding a `set` modifier at priority -100 moves it from its default tier
+(200) into the min op's tier (100), where modifier_op_order applies it
+before the floor: 3, then the floor (8) pulls it back up, then the cap
+leaves it → second show 8. Demonstrates set/min(floor)/max(cap) and that a
+record's priority moves it between tiers while clamp ops still land last.
 
 
 SCENARIO 408 — Stat modifiers: defender context role + scaling value formula
@@ -27896,3 +27899,424 @@ naming `map=`. `!tile test` used to drop a word that wasn't `--as
 harness didn't count it), `!dist` said "coordinates must be integers"
 for three integers, and the burst metric refusal didn't say where a map
 goes: each now names `map=`.
+
+
+SCENARIO 882 — Passive priority: global, team and own passives in one order, highest first
+---------------------------------------------------------------------------------------------
+
+!match new pp PP 8 8
+!match use pp
+!ent add u U 10 2 2 5
+!ent set_var u team red
+!ent set_var u trail ""
+!gpassive add g on_turn_start "entity[self].trail = entity[self].trail + 'g'"
+!team passive add red t on_turn_start priority=5 "entity[self].trail = entity[self].trail + 't'"
+!passive add u o on_turn_start priority=10 "entity[self].trail = entity[self].trail + 'o'"
+!passive add u p on_turn_start "entity[self].trail = entity[self].trail + 'p'"
+!turn next
+!assert "entity[u].trail == 'otgp'"
+!gpassive priority g 20
+?? Global passive `g` now has priority 20 (higher runs first).
+!passive priority u p -1
+!passive list u
+?? `o` (on_turn_start pri 10)
+?? `p` (on_turn_start pri -1)
+!team passive list red
+?? `t` (on_turn_start pri 5)
+!ent set_var u trail ""
+!turn next
+!assert "entity[u].trail == 'gotp'"
+!passive add u bad on_turn_start priority=x "1"
+?? ❌ priority= must be a number, got 'x'.
+!passive add u bad on_turn_start prio=3 "1"
+?? Unknown option `prio=`
+!gpassive add e1 event:ping priority=1 "entity[self].trail = entity[self].trail + 'a'"
+!passive add u e2 event:ping priority=2 "entity[self].trail = entity[self].trail + 'b'"
+!ent set_var u trail ""
+!emit ping to=u
+!assert "entity[u].trail == 'ba'"
+!defpassive add d on_turn_start priority=50 "entity[self].trail = entity[self].trail + 'd'"
+!ent add w W 10 4 4 1
+!ent set_var w trail ""
+!passive info w d
+?? Priority: 50
+
+Expected: HARNESS-ALLOWS-ERRORS. Within one hook firing, every passive
+that fires for the unit (the match's global ones, its team's and its own)
+runs highest priority first; equal priorities keep the old order
+(globals, team, own, each as added). Own 10, team 5, global 0 and own 0
+run o, t, g, p; raising the global to 20 and lowering p to -1 gives
+g, o, t, p. `priority=` takes any number on `!passive` / `!gpassive` /
+`!team passive` / `!defpassive add`, and `priority` subcommands change
+it; a non-number and an unknown option are refused. A directed event
+orders the target's own handler (2) before a global one (1). A default
+passive carries its priority onto units created after it.
+
+
+SCENARIO 883 — Modifiers fold highest priority first, as passives run
+-----------------------------------------------------------------------
+
+!match new mp MP 8 4
+!match use mp
+!ent add h Hero 100 2 2 9
+!ent set_var h modifiers.a.stat atk
+!ent set_var h modifiers.a.op set
+!ent set_var h modifiers.a.value 10
+!ent set_var h modifiers.b.stat atk
+!ent set_var h modifiers.b.op set
+!ent set_var h modifiers.b.value 20
+!ent set_var h modifiers.b.priority 50
+!assert "apply_mods('h', 'atk', 1) == 10"
+!ent set_var h modifiers.a.priority 100
+!assert "apply_mods('h', 'atk', 1) == 20"
+!ent set_var h modifiers.c.stat atk
+!ent set_var h modifiers.c.op add
+!ent set_var h modifiers.c.value 5
+!ent set_var h modifiers.c.priority -1000
+!assert "apply_mods('h', 'atk', 1) == 25"
+!help rule modifier_op_priority
+?? add:500,inc%:400,more%:300,set:200,min:100,max:0
+?? HIGHEST effective priority first
+
+Expected: A `set` modifier at priority 50 folds before one at 0, so the
+later one (0, value 10) wins: 10. Raising the first to 100 reverses it:
+the 50 one folds last and wins with 20. An `add` at priority -1000 folds
+after every `set` (its offset 500 - 1000 sits below both): 20 + 5 = 25.
+The default op offsets are flipped from the old ascending fold, so the
+default order stays add, inc%, more%, set, min, max.
+
+
+SCENARIO 884 — Status definition hooks: on_added / on_removed / on_changed, and why a status left
+---------------------------------------------------------------------------------------------------
+
+!match new sh SH 8 8
+!match use sh
+!ent add u U 50 2 2 5
+!ent add v V 10 3 3 4
+!status def endurance
+!status hook endurance on_added "entity[self].max_hp = entity[self].max_hp + 20 * status_get(self, 'endurance', 'level')\nentity[self].hp = entity[self].hp + 20 * status_get(self, 'endurance', 'level')"
+!status hook endurance on_removed "entity[self].max_hp = entity[self].max_hp - 20 * get(old_value, 'level')\nentity[self].hp = min(entity[self].hp, entity[self].max_hp)"
+!status apply u endurance 1 2
+?? ⚙️ status `endurance` on_added fired on `u` (on_status_added)
+!assert "entity[u].max_hp == 70 and entity[u].hp == 70"
+!status dispel u endurance
+!assert "entity[u].max_hp == 50 and entity[u].hp == 50"
+!gpassive add why on_status_removed "status_name + ':' + removed_by"
+!status def curse
+!status hook curse on_removed "if removed_by == 'dispel':\n    status_apply('v', 'curse', 1, 2)"
+!status hook curse on_changed "entity[self].changes = new_value"
+!status apply u curse 1 3
+!status apply u curse 2 5
+!assert "entity[u].changes.level == 1 and entity[u].changes.duration == 5"
+!status dispel u curse
+?? 'curse:dispel'
+!assert "status_has('v', 'curse') and not status_has('u', 'curse')"
+!status transfer v u curse
+?? 'curse:transfer'
+!status def burn
+!status removes burn curse
+!status tick burn "status_counter_add(self, 'burn', -1)"
+!status apply u burn 1 1
+?? 'curse:removes'
+!turn next
+!turn next
+?? 'burn:expired'
+!status def stun
+!status tick stun "status_remove(self, 'stun')"
+!status apply v stun
+!turn next
+?? 'stun:expired'
+!status apply u stun
+!eval "status_remove('u', 'stun')"
+?? 'stun:removed'
+!status hook curse on_changed
+?? Cleared `curse`'s on_changed hook.
+!status hook curse on_changed
+?? ❌ `curse` has no on_changed hook.
+!status hook curse on_gone "1"
+?? ❌ hook must be one of: on_added, on_changed, on_removed.
+
+Expected: HARNESS-ALLOWS-ERRORS. What a status does when it arrives,
+leaves or changes lives in its definition (`!status hook`), run with
+self = the bearer after the on_status_* passives. Solis Endurance raises
+max hp and hp by 20 per level on arrival and takes the max hp back on
+removal, capping hp at the normal max. A refresh (the default stacking)
+that changes the duration fires on_changed with the new instance.
+`removed_by` names why a status left, for
+the hook and for on_status_removed passives: dispel, transfer, removes
+(another status's `removes`), expired (a counter reached 0, or the
+status's own tick removed it) and removed (anything else). A curse that
+jumps to another unit only when dispelled reads it. `status_remove`
+inside `!eval` now shows the hook lines it fires (the status functions
+used to drop them). No formula clears a hook.
+
+
+SCENARIO 885 — Status details for players: {statuses}, status_line_format and a definition's display
+--------------------------------------------------------------------------------------------------------
+
+!match new sd SD 8 8
+!match use sd
+!ent add u U 10 2 2 5
+!status def burn
+!status apply u burn 2 3
+!ent status u add mark
+!ent info u
+?? Status: burn ×2 (3), mark
+!status def rot
+!status display rot "rot (-{lost} max hp)"
+?? `rot` shows as `rot (-{lost} max hp)` in `{statuses}`.
+!status apply u rot 1
+!ent status u set rot lost 30
+!system set default entity_line_format "{name}: {statuses}"
+!list
+?? U: burn ×2 (3), mark, rot (-30 max hp)
+!system set default status_line_format "{?level?}{level}x {/?}{name}"
+!status display rot
+!list
+?? U: 2x burn, mark, 1x rot
+!ent kill u
+!system set default corpse_line_format "{name} corpse: {statuses}"
+!list
+?? U corpse: 2x burn, mark, 1x rot
+
+Expected: `!ent info` lists each status with its level and duration
+(`burn ×2 (3)`); a status with neither shows its name. A `{statuses}`
+placeholder gives entity_line_format / entity_info_format /
+corpse_line_format the same text, each status through the
+status_line_format rule (any instance field is a placeholder) or its
+definition's own `display` format (Umbral Rot showing the max hp it took).
+`!status display <name>` with no format goes back to the rule.
+
+
+SCENARIO 886 — Local variables in every formula program: !func, passives, ticks, watchers
+--------------------------------------------------------------------------------------------
+
+!match new lv LV 8 8
+!match use lv
+!ent add u U 50 2 2 5
+!ent set_var u armor 3
+!func def dmg base "dealt = base - entity[self].armor\nif dealt < 0:\n    dealt = 0\ndealt"
+!eval --as u "dmg(10)"
+?? = `7`
+!eval --as u "dealt = 100\nz = dmg(5)\n[dealt, z]"
+?? = `[100, 2]`
+!passive add u p on_turn_start "hit = dmg(8)\nentity[self].hp = entity[self].hp - hit"
+!status def burn
+!status tick burn "amt = 2 * status_get(self, 'burn', 'level')\nentity[self].hp = entity[self].hp - amt"
+!status apply u burn 2 1
+!turn next
+!assert "entity[u].hp == 45"
+!turn next
+!assert "entity[u].hp == 36"
+!watch add w "entity[u].hp < 20" "t = 'low'\nentity[u].note = t"
+!ent hp u 10
+!assert "entity[u].note == 'low'"
+!eval "roll = 3"
+?? ❌ `roll` can't be a local's name: formulas read it as a function or binding.
+!eval "self = 3"
+?? ❌ `self` can't be a local's name
+!eval "dmg = 2"
+?? ❌ `dmg` can't be a local's name
+!eval "status_name = 'x'"
+?? ❌ `status_name` can't be a local's name
+!eval "__x = 2"
+?? ❌ `__x` can't be a local's name
+!eval "q = 1"
+!eval "q"
+?? ❌ Unknown identifier 'q'.
+
+Expected: HARNESS-ALLOWS-ERRORS. Every formula program (a `!func` body,
+a passive, a status tick, a watcher effect, `!eval`) binds bare-name
+locals, as action bodies did: the damage step `dealt = base - armor` reads
+as written. A local lives until its formula ends and is never stored: a
+`!func` call runs in its own namespace copy, so its `dealt` never reaches
+the caller's `dealt` (100), and the next `!eval` doesn't know `q`. The
+passive takes 8 - 3 = 5 (50 → 45); the next turn it takes 5 more and the
+burn tick 4 (45 → 36). A local can't take the name of a function (a
+built-in or the match's `!func`), a hook binding, an entity token or a
+`__` name.
+
+
+SCENARIO 887 — List helpers: a deck drawn with take / drop, and slice, insert_at, remove_at, reverse, flatten, zip
+--------------------------------------------------------------------------------------------------------------------
+
+!match new lh LH 8 8
+!match use lh
+!ent add u U 10 2 2 5
+!eval --as u "entity[self].deck = ['ace', 'king', 'queen', 'jack']"
+!eval --as u "card = get(take(entity[self].deck, 1), 0)\nentity[self].deck = drop(entity[self].deck, 1)\nentity[self].hand = [card]\ncard"
+?? = `'ace'`
+!assert "entity[u].deck == ['king', 'queen', 'jack'] and entity[u].hand == ['ace']"
+!eval "[take([1, 2, 3], -1), drop([1, 2, 3], -1), slice([1, 2, 3, 4], 1, 3), slice([1, 2, 3, 4], -2)]"
+?? = `[[1, 2], [3], [2, 3], [3, 4]]`
+!eval "[remove_at([1, 2, 3], -1), insert_at([1, 2, 3], 1, 9), reverse([1, 2, 3]), flatten([[1, 2], 3, [4, [5]]]), zip(['a', 'b', 'c'], [1, 2])]"
+?? = `[[1, 2], [1, 9, 2, 3], [3, 2, 1], [1, 2, 3, 4, [5]], [['a', 1], ['b', 2]]]`
+!eval --as u "n = 0\nfor pair in zip(['a', 'b'], [2, 3]):\n    n = n + get(pair, 1)\nn"
+?? = `5`
+!eval "remove_at([1, 2], 5)"
+?? ❌ remove_at(list, i): index 5 is outside a list of 2.
+!eval "take([1, 2], 'x')"
+?? ❌ take(...): n must be a whole number, got str.
+!eval "take('abc', 1)"
+?? ❌ take(list): expected a list, got str.
+!ent set_var u n "$(len(reverse([1, 2, 3])))"
+!assert "entity[u].n == 3"
+
+Expected: HARNESS-ALLOWS-ERRORS. Card decks, queues and histories need
+list surgery the sandbox couldn't do (no subscripts): drawing the top
+card was a map_with over range(). take / drop / slice (negative indexes
+count from the end), remove_at / insert_at (new lists; the original is
+untouched), reverse, flatten (one level) and zip (pairs, to the shorter
+list) are pure helpers, usable in `$()` and loopable, and each list they
+build is charged to the formula's list budget.
+
+
+SCENARIO 888 — List rolls and repeated rolls: !roll none, none, crit and !roll 6x
+-----------------------------------------------------------------------------------
+
+!match new lr LR 8 8
+!match use lr
+!match rng set seed1
+!roll none, none, minicrit, crit
+?? 🎲 `none, none, minicrit, crit` → **
+!roll 6x none, none, crit
+?? 🎲 6x `none, none, crit` →
+!roll none:3, crit:1
+?? 🎲 `none:3, crit:1` →
+!roll 3x 4d6kh3
+?? 🎲 3x `4d6kh3` →
+?? 3. **
+!roll small potion, nothing
+?? 🎲 `small potion, nothing` →
+!roll 25x d6
+?? ❌ `25x`: roll 1 to 20 times (roll_repeat_limit).
+!system set default roll_repeat_limit 30
+!roll 25x d6
+?? 🎲 25x `d6` →
+!roll a,,b
+?? ❌ A list roll needs an item between every pair of commas.
+!roll none:x, crit
+?? ❌ list roll: weight for 'none' must be a number.
+!roll 2x odds 2d6
+?? ❌ `!roll odds` works out chances; it takes no `<n>x`.
+!roll 3x
+?? ❌ `!roll <n>x` needs dice or a list to roll.
+
+Expected: All three rule documents write crit and loot rolls as lists
+(`!roll none,none,none,none,none,club,buckler`); `!roll` with a comma
+picks one item, `item:weight` weighting it like a table, with the match's
+RNG. A leading `<n>x` rolls n times (#57), dice too, each dice roll's
+breakdown on its own line; n past the roll_repeat_limit rule (20, owner
+ceiling) is refused.
+
+
+SCENARIO 889 — Formula function reference: !help function, !help functions, !help find
+-------------------------------------------------------------------------------------
+
+!match new fr FR 6 6
+!match use fr
+!help function summon_template
+?? summon_template(
+?? changes the match
+!help function entities_within
+?? reads the match
+?? loopable
+!help function clamp
+?? pure
+!help function summ
+?? ❌
+?? summon
+!help functions changes
+?? summon_template
+?! entities_within
+!help functions loopable
+?? entities_within
+!help functions pure
+?? clamp
+!help functions sideways
+?? ❌
+!func def twice x "x * 2"
+!help function twice
+?? `!func`
+?? x * 2
+!help find nearest
+?? Formula functions
+?? nearest_entity
+?tab "!help function summon_te"
+?? summon_template
+
+Expected: HARNESS-ALLOWS-ERRORS. Every formula function has a reference
+entry built from its signature and docstring: `!help function <name>`
+shows the call form, what it does, whether it reads or changes the match
+(or is pure), whether `for` can loop over it and whether `$()` allows it;
+a misspelled name suggests the close ones. `!help functions [kind]` lists
+them by kind, `!help find` searches function names and docs alongside
+commands and rules, and a match's own `!func` answers `!help function`
+too. Tab completes function names.
+
+
+SCENARIO 890 — Crash log: a 💥 reply names a ref; !server errors / !owner errors read it
+--------------------------------------------------------------------------------------
+
+!match new cl CL 6 6
+!match use cl
+!server errors
+?? No crashes in the error log for this server.
+!as crash boom one
+?? 💥 Unexpected error (ref 1): boom one
+!as crash boom two
+?? (ref 2)
+!server errors
+?? ref 2
+?? ref 1
+?? `!as crash boom one`
+?? RuntimeError: boom one
+!server errors show 1
+?? Match: `cl`
+?? Traceback
+?? File "vtt_commands.py"
+?! /home/
+!server errors 1
+?? ref 2
+?! ref 1
+!as server other
+!as crash elsewhere
+?? (ref 3)
+!server errors
+?? ref 3
+?! ref 1
+!as server local
+!server errors
+?! ref 3
+!server errors show 3
+?? ❌ No crash with ref 3 in the log for this server
+!owner errors
+?? ref 3
+?? ref 1
+?? [`other`]
+!as restart
+!owner errors show 2
+?? boom two
+!as player bob
+!server errors
+?? ❌ Only a server administrator can read that
+!owner errors
+?? ❌ Only the bot's owner
+!as host
+!owner errors clear
+?? Cleared 3 crash(es) from the error log (ref numbers go on from 4).
+!as crash again
+?? (ref 4)
+!server errors 0
+?? ❌ The count must be at least 1
+!server errors show
+?? ❌ Usage: `!server errors show <ref>`.
+
+Expected: HARNESS-ALLOWS-ERRORS. A command that raises an error nothing
+expected (`!as crash` is the test hook) replies `💥 Unexpected error (ref
+N)` and the crash goes into the bot's error log with its time, server,
+match, user, the command as typed, and the traceback (file names only, no
+host folders). `!server errors` (administrators) lists their own server's
+crashes and `show <ref>` adds the traceback; `!owner errors` lists every
+server's, and `clear` empties the log while ref numbers keep counting.
+The log is saved in data/errors.json, so a restart keeps it.

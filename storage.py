@@ -4,6 +4,8 @@ Layout under the data root (default `data/` next to the code):
 
     bot_settings.json           the bot owner's settings (storage limits,
                                 rule ceilings)
+    errors.json                 the error log (crashes with their ref
+                                numbers and tracebacks, `!owner errors`)
     .trash/<server>/<stamp>-<scope>/
                                 what a `!server wipe` removed, kept 24 h for
                                 `!server wipe undo` (counts toward the global
@@ -65,6 +67,8 @@ DEFAULT_GLOBAL_LIMIT_MB = 20 * 1024
 TRASH_SECONDS = 24 * 3600
 TRASH_DIR = ".trash"
 SETTINGS_FILE = "bot_settings.json"
+# The bot's error log (logic.CrashLog: `!owner errors`, `!server errors`).
+ERRORS_FILE = "errors.json"
 
 def valid_id(name: Any) -> bool:
     return is_file_id(name)
@@ -398,6 +402,30 @@ class Storage:
                         "data": copy.deepcopy(mgr.templates[name])})
         return notes
 
+    # ---- error log --------------------------------------------------------
+    def attach_crash_log(self, workspaces: Workspaces) -> None:
+        """Load errors.json into the workspaces' crash log and have each new
+        entry written back. Match persistence off: kept in memory only."""
+        log = workspaces.crashes
+        if not self.persist:
+            return
+        path = os.path.join(self.root, ERRORS_FILE)
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    raise ValueError("not an object")
+                log.load(data)
+            except (OSError, ValueError, TypeError) as ex:
+                print(f"⚠️ {ERRORS_FILE} couldn't be read ({ex}); starting "
+                      f"a new error log.")
+        log.save = self.save_crash_log
+
+    def save_crash_log(self, log: Any) -> None:
+        _write_text(os.path.join(self.root, ERRORS_FILE),
+                    json.dumps(log.to_dict(), indent=1, sort_keys=True))
+
     # ---- bot settings -----------------------------------------------------
     def _load_settings(self) -> None:
         path = os.path.join(self.root, SETTINGS_FILE)
@@ -488,7 +516,8 @@ class Storage:
         if not self._usage:
             self.rescan()
         return (sum(self._usage.values())
-                + _file_size(os.path.join(self.root, SETTINGS_FILE)))
+                + _file_size(os.path.join(self.root, SETTINGS_FILE))
+                + _file_size(os.path.join(self.root, ERRORS_FILE)))
 
     def _add_usage(self, key: str, delta: int) -> None:
         self._usage[key] = max(0, self.server_usage(key) + delta)
@@ -534,6 +563,7 @@ class Storage:
         (also printed): files that failed to load are moved to the server's
         corrupt/ folder and everything else still loads."""
         notes: List[str] = []
+        self.attach_crash_log(workspaces)
         if not self.persist:
             # Match persistence off: templates still load (they ignore it).
             for name in sorted(os.listdir(self.root)):
@@ -1665,6 +1695,8 @@ def reload_workspaces(workspaces: Workspaces) -> List[str]:
     notes = fresh.storage.load_all(fresh)
     workspaces._by_key = fresh._by_key
     workspaces.storage = fresh.storage
+    if st.persist:
+        workspaces.crashes = fresh.crashes
     for _key, mgr in workspaces.items():
         mgr.workspaces = workspaces
     return notes
