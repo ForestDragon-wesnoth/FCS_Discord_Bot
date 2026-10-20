@@ -795,6 +795,7 @@ def parse_target(
     actor: Optional[str] = None,
     missing: Optional[Any] = None,
     missing_corpse: Optional[Any] = None,
+    map_of: Optional[Any] = None,
 ) -> Tuple[Any, List[str]]:
     """Consume the leading tokens that constitute the target and
     return `(target_value, remaining_tokens)`. The remaining tokens
@@ -814,6 +815,12 @@ def parse_target(
     For the *_list variants the boundary between target tokens and
     args is "first token containing `=`". So `!action self lightning
     3 4 5 6 power=10` parses as target=[(3,4),(5,6)] and args={power:10}.
+
+    A location / location_list target takes `map=<map>` among the tokens
+    (anywhere): the map its cells are on (default the actor's), as every
+    other command with coordinates names one; `map_of(spec)` turns the word
+    into a map name (the caller's view rules), and the key is not an
+    action arg for those targets.
     """
     # `missing(eid, token)`: the caller's test for a unit to treat as
     # missing (one the channel's view hides), raising its own refusal.
@@ -829,6 +836,21 @@ def parse_target(
             missing_corpse(cid)
         elif match.find_corpse(cid) is None:
             raise NotFound(f"No corpse with id '{cid}'.")
+    map_name: Optional[str] = None
+    if target_type in ("location", "location_list"):
+        rest: List[str] = []
+        for t in tokens:
+            if t.startswith("map="):
+                if map_name is not None:
+                    raise VTTError("map= is given twice.")
+                map_name = t[4:]
+                if not map_name:
+                    raise VTTError("map= needs a map name.")
+            else:
+                rest.append(t)
+        tokens = rest
+        if map_name is not None and map_of is not None:
+            map_name = map_of(map_name)
     if target_type == "none":
         return None, list(tokens)
     if target_type == "entity":
@@ -850,7 +872,8 @@ def parse_target(
                 f"location target needs integer coords; got "
                 f"`{tokens[0]} {tokens[1]}`."
             )
-        return _check_on_map(match, x, y, actor), list(tokens[2:])
+        return (_check_on_map(match, x, y, actor, map_name),
+                list(tokens[2:]))
     if target_type == "entity_list":
         eids: List[str] = []
         i = 0
@@ -870,7 +893,7 @@ def parse_target(
                 x = int(tokens[i]); y = int(tokens[i + 1])
             except ValueError:
                 break
-            coords.append(_check_on_map(match, x, y, actor))
+            coords.append(_check_on_map(match, x, y, actor, map_name))
             i += 2
         if not coords:
             raise VTTError(

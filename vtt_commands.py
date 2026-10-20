@@ -2607,6 +2607,16 @@ async def _fan_out(ctx: ReplyContext, handler, mgr: "MatchManager",
             await ctx.send(f"❌ {ex}")
 
 
+def _map_word_note(m: "Match", *words: Any) -> str:
+    """` \`x\` is a map: a map goes in \`map=x\`.` when a word that didn't
+    fit a coordinate command's slot names one of the match's maps (a map
+    typed after `<x> <y>` the way `!ent tp` takes it)."""
+    for w in words:
+        if isinstance(w, str) and w in m.maps:
+            return f" `{w}` is a map: a map goes in `map={w}`."
+    return ""
+
+
 def _check_tail(args: List[str], n: int, allowed, usage: str) -> None:
     """Raise when anything past the first `n` args isn't one of the
     `allowed` options. A stray word used to be dropped: `!ent set_var h
@@ -3160,6 +3170,11 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                     changes.append(_sync_change(lib_name, n, old, new))
                 else:
                     mine[n] = new
+                    # The system's entry: an admin's, no player's record.
+                    if lib_name == "aliases":
+                        m.alias_authors.pop(n, None)
+                    elif lib_name == "formula_functions":
+                        m.func_authors.pop(n, None)
             if not lib:
                 lines.append(f"{word}: system `{m.system_name}` has none.")
                 continue
@@ -8548,17 +8563,16 @@ async def ent_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             tx = int(args[2]); ty = int(args[3])
         except ValueError:
             return await ctx.send(
-                f"Pull target must be integer x and y, got "
-                f"'{args[2]}' '{args[3]}'."
-            )
+                f"❌ Pull target must be integer x and y, got "
+                f"'{args[2]}' '{args[3]}'.")
         n = 1
         if len(args) >= 5:
             try:
                 n = int(args[4])
             except ValueError:
                 return await ctx.send(
-                    f"Pull distance must be an integer, got '{args[4]}'."
-                )
+                    f"❌ Pull distance must be an integer, got '{args[4]}'."
+                    + _map_word_note(m, args[4]))
         try:
             steps, hook_log = m.pull_entity(eid, tx, ty, n)
         except VTTError as e:
@@ -10270,7 +10284,8 @@ def _preview_cells(ctx, m, toks: List[str],
             low = toks[i + 1].lower()
             if low not in _DIST_METRICS:
                 raise VTTError(f"Unknown metric `{toks[i + 1]}` — use "
-                               f"square_radius, manhattan or euclidean.")
+                               f"square_radius, manhattan or euclidean."
+                               + _map_word_note(m, toks[i + 1]))
             metric = _DIST_METRICS[low]
         done(i, i + 2)
         cells = _cells_in_burst(x, y, r, metric, limit=limit, bounds=bounds)
@@ -11948,6 +11963,9 @@ async def dist_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return await ctx.send(
                 f"❌ `{last}` isn't a metric — use square_radius (or "
                 f"chebyshev), manhattan or euclidean, optionally with `los`.")
+        note = _map_word_note(m, *toks)
+        if note:
+            return await ctx.send(f"❌{note}")
         return await ctx.send("❌ coordinates must be integers.")
     dstr = f"{d:g}"
     out = f"📏 {label}{_on_map(m, dmp)}: **{dstr}** ({mode})"
@@ -14936,6 +14954,11 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         value = _parse_scalar(args[4])
         mp.tile_set_path(x, y, path, value)
         ack = f"tile ({x},{y}).{path} = {value!r}" + _cell_formula_warning(m, path, value)
+        if path in m.maps:
+            # `!tile set 3 3 main water`: a map typed where `!ent tp` takes
+            # one became the path.
+            ack += (f"\n⚠️ `{path}` is also a map's name; a map goes in "
+                    f"`map={path}`, and this stored `{path}` on the cell.")
         # Advisory for a likely-bad render color (same spirit as entity
         # set_var): the renderer reads the top-level `color` field, which may
         # be a palette name OR a color formula — so only nudge on a value
@@ -15568,6 +15591,13 @@ async def tile_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             eid = _resolve_eid(m, rest[1])
             if eid not in m.entities:
                 return await ctx.send(f"❌ entity `{eid}` not found.")
+            rest = rest[2:]
+        if rest:
+            # A word that isn't `--as <eid>` (it used to be dropped).
+            return await ctx.send(
+                f"❌ Unexpected `{' '.join(rest)}` — usage: `!tile test <x> "
+                f"<y> <hook_name> [--as <eid>] [map=<map>]`."
+                + _map_word_note(m, *rest))
         from logic import TILE_HOOK_NAMES as _THN
         if hook_name not in _THN:
             allowed = ", ".join(sorted(_THN))
@@ -17060,10 +17090,12 @@ async def func_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # the kind of edit that's easy to do by accident, so we surface
         # the before/after.
         prior = m.formula_functions.get(name)
+        _check_owner(m, "func", name, ctx)
         try:
             fn = m.define_formula_function(name, params, body)
         except (VTTError, DuplicateId) as ex:
             return await ctx.send(f"❌ {ex}")
+        _set_author(m, "func", name, ctx)
         if prior is not None:
             return await ctx.send(
                 f"Redefined formula function `{name}` (overwrote an "
@@ -17078,10 +17110,12 @@ async def func_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if await return_help_if_not_enough_args(ctx, args, 2, "func", "del"):
             return
         name = args[1]
+        _check_owner(m, "func", name, ctx)
         try:
             m.undefine_formula_function(name)
         except NotFound as ex:
             return await ctx.send(f"❌ {ex}")
+        m.func_authors.pop(name, None)
         return await ctx.send(f"Deleted formula function `{name}`.")
 
     # ---- list ----
@@ -17092,7 +17126,8 @@ async def func_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         for fname in sorted(m.formula_functions.keys()):
             fn = m.formula_functions[fname]
             snippet = fn.body if len(fn.body) <= 60 else fn.body[:57] + "..."
-            lines.append(f"- `{fn.signature()}` → {snippet}")
+            lines.append(f"- `{fn.signature()}`"
+                         f"{_author_text(m, 'func', fname)} → {snippet}")
         return await ctx.send("\n".join(lines))
 
     # ---- info <name> ----
@@ -17104,7 +17139,8 @@ async def func_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if fn is None:
             return await ctx.send(f"❌ formula function `{name}` not found.")
         return await ctx.send(
-            f"**`{fn.signature()}`**\n```\n{fn.body}\n```"
+            f"**`{fn.signature()}`**{_author_text(m, 'func', name)}"
+            f"\n```\n{fn.body}\n```"
         )
 
     return await _help_fallback(ctx, ["func"], args[0] if args else None)
@@ -17386,7 +17422,9 @@ async def alias_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"`{target}` is not a registered command."
             )
         prior = m.aliases.get(name)
+        _check_owner(m, "alias", name, ctx)
         m.aliases[name] = expansion
+        _set_author(m, "alias", name, ctx)
         if prior is not None:
             return await ctx.send(
                 f"Redefined alias `{name}` (overwrote an existing "
@@ -17403,7 +17441,9 @@ async def alias_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         name = args[1]
         if name not in m.aliases:
             return await ctx.send(f"❌ alias `{name}` not found.")
+        _check_owner(m, "alias", name, ctx)
         del m.aliases[name]
+        m.alias_authors.pop(name, None)
         return await ctx.send(f"Deleted alias `{name}`.")
 
     # ---- list ----
@@ -17414,7 +17454,8 @@ async def alias_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         for aname in sorted(m.aliases.keys()):
             exp = m.aliases[aname]
             snippet = exp if len(exp) <= 60 else exp[:57] + "..."
-            lines.append(f"- `!{aname}` → `!{snippet}`")
+            lines.append(f"- `!{aname}`{_author_text(m, 'alias', aname)} "
+                         f"→ `!{snippet}`")
         return await ctx.send("\n".join(lines))
 
     # ---- info <name> ----
@@ -17425,7 +17466,8 @@ async def alias_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         exp = m.aliases.get(name)
         if exp is None:
             return await ctx.send(f"❌ alias `{name}` not found.")
-        return await ctx.send(f"**`!{name}`** → `!{exp}`")
+        return await ctx.send(f"**`!{name}`**{_author_text(m, 'alias', name)}"
+                              f" → `!{exp}`")
 
     return await _help_fallback(ctx, ["alias"], args[0] if args else None)
 
@@ -18094,34 +18136,58 @@ for _subs, _usage in (
     registry.annotate_sub('macro', *_subs, usage=_usage)
 
 
-def _set_macro_author(m: "Match", name: str, ctx: ReplyContext) -> None:
-    """Record who wrote macro `name` (none on a surface with no identity)."""
+# The match libraries a player may write once a GM opens the command
+# (`!host access`): kind -> (the entries, their authors, the wording).
+_AUTHORED = {"macro": ("macros", "macro_authors", "Macro"),
+             "alias": ("aliases", "alias_authors", "Alias"),
+             "func": ("formula_functions", "func_authors",
+                      "Formula function")}
+
+
+def _set_author(m: "Match", kind: str, name: str, ctx: ReplyContext) -> None:
+    """Record who wrote entry `name` (none on a surface with no identity)."""
+    authors = getattr(m, _AUTHORED[kind][1])
     user = ctx_user(ctx)
     if user is None or getattr(ctx, "auto_approve", False):
-        m.macro_authors.pop(name, None)
+        authors.pop(name, None)
     else:
-        m.macro_authors[name] = str(user)
+        authors[name] = str(user)
 
 
-def _check_macro_owner(m: "Match", name: str, ctx: ReplyContext) -> None:
-    """A non-host may not replace, rename or remove a macro a host wrote
-    (or one with no recorded author): the host would run the player's
-    lines with a host's reach, under a name the host trusts."""
-    if name not in m.macros or _acts_as_host(ctx, m):
+def _check_owner(m: "Match", kind: str, name: str, ctx: ReplyContext) -> None:
+    """A non-host may not replace, rename or remove a macro, alias or
+    formula function a host wrote (or one with no recorded author): the
+    host would run the player's text with a host's reach, under a name the
+    host trusts (a host's passive calling the function, the host typing the
+    alias)."""
+    entries, authors, word = _AUTHORED[kind]
+    if name not in getattr(m, entries) or _acts_as_host(ctx, m):
         return
-    author = m.macro_authors.get(name)
+    author = getattr(m, authors).get(name)
     if author is None or m.is_host(author):
-        raise VTTError(f"Macro `{name}` was written by a host; only a host "
+        raise VTTError(f"{word} `{name}` was written by a host; only a host "
                        f"can change, rename or remove it.")
 
 
-def _macro_author_text(m: "Match", name: str) -> str:
-    """` (by <player>)` for a macro a non-host wrote: a host running it runs
-    that player's lines."""
-    author = m.macro_authors.get(name)
+def _author_text(m: "Match", kind: str, name: str) -> str:
+    """` (by <player>)` for an entry a non-host wrote: a host using it runs
+    that player's text."""
+    author = getattr(m, _AUTHORED[kind][1]).get(name)
     if author is None or m.is_host(author):
         return ""
     return f" (by {_mention(author)}, not a host)"
+
+
+def _set_macro_author(m: "Match", name: str, ctx: ReplyContext) -> None:
+    _set_author(m, "macro", name, ctx)
+
+
+def _check_macro_owner(m: "Match", name: str, ctx: ReplyContext) -> None:
+    _check_owner(m, "macro", name, ctx)
+
+
+def _macro_author_text(m: "Match", name: str) -> str:
+    return _author_text(m, "macro", name)
 
 
 @registry.command(
@@ -18975,7 +19041,9 @@ registry.annotate_sub("mount", "info",
         "(entity/location/entity_list/location_list/none). The leading "
         "tokens after the action name are the target (shape depends "
         "on the action's declared type); any `key=value` tokens after "
-        "that go into the `args` dict the body can read. On a clean "
+        "that go into the `args` dict the body can read; a location / "
+        "location_list target takes `map=<map>` for the map its cells are "
+        "on (default the actor's map; `target.map` in the body). On a clean "
         "`fail(reason, msg)` the runner rolls back and replies "
         "`❌ action <name>: [<reason>] <msg>`; on a successful run, "
         "`on_action_used` + per-target `on_action_used_on_target` "
@@ -19202,9 +19270,13 @@ async def _run_action_dispatch(
                 _query_eid(ctx, m, token)
         def missing_corpse(cid: str) -> None:
             _query_corpse(ctx, m, cid)
+        def map_of(spec: str) -> str:
+            # map= of a location target: a name or `view`, under the
+            # channel's view rules (a map it may not name reads as missing).
+            return _resolve_maps(ctx, m, spec)[0].name
         target_value, remaining = parse_target(
             action.target_type, pruned, m, actor_id, missing=missing,
-            missing_corpse=missing_corpse,
+            missing_corpse=missing_corpse, map_of=map_of,
         )
         args_dict = parse_args_tokens(remaining)
     except VTTError as ex:

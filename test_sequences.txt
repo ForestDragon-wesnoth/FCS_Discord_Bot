@@ -27317,12 +27317,14 @@ SCENARIO 868 — Saved data from an older build: text clamp bounds, a reserved v
 !template save orc
 ?file set matches/camp.json entities.orc.clamps {"mana": {"path": "mana", "max": "max_mana * 2", "mode": "soft"}, "hp": {"path": "hp", "max": "max_hp", "min": "0 - 5", "mode": "hard"}}
 ?file set matches/camp.json entities.orc.vars.team 1
+?file set matches/camp.json entities.orc.vars.map "mine"
 ?file replace matches/camp.json "\"team\": \"1\"" "\"team\": 1"
 ?file set templates/orc.json clamps {"mana": {"path": "mana", "max": "max_mana * 2", "mode": "soft"}}
 ?file set templates/orc.json vars.map "old"
 !as restart
 !match use camp
 !assert "entity[orc].team == '1'"
+!assert "entity[orc].map_old == 'mine' and entity[orc].map == 'main'"
 !assert "team_get(entity[orc].team, 'x', 0) == 0"
 !assert "corpse_var('ally', 'team') == '1'"
 !clamp list orc
@@ -27338,12 +27340,14 @@ SCENARIO 868 — Saved data from an older build: text clamp bounds, a reserved v
 Expected: Files written as an older build wrote them: a unit with a
 clamp whose bounds are formulas (they meant "no bound" then), an old
 numeric team on a unit and in a corpse, and a template with such a
-clamp and a var named `map` (a reserved name now). The match and the
-template load (each dropped bound and the moved var get a console note):
+clamp and a var named `map` (a reserved name now), and the unit's own
+`map` var. The match and the template load (each dropped bound and
+moved var gets a console note; the unit's `map` var read as its map and
+only `!ent delete_var` reached it):
 the mana clamp, left with no bound, is gone; the hp clamp keeps its
 `max_hp` bound and loses `0 - 5`. The teams read as the text `1`, as
-every write stores them now. The template spawns with the old `map` var
-under `map_old` and no mana clamp.
+every write stores them now. The unit and the template's spawn keep the
+old `map` var under `map_old`; the spawn has no mana clamp.
 
 
 SCENARIO 869 — A customized default system lost with systems.json locks the server or comes back from a match backup
@@ -27679,3 +27683,216 @@ Expected: Each server-wide edit changes systems.json, the `!system undo`
 history and the audit log. systems.json keeps a dated copy per change
 (five here); the two logs grow with every edit and are copied whole, so
 they keep only their newest server_backup_log_count (3) copies.
+
+
+SCENARIO 877 — The summons take the map after the coordinates, an id prefix only as id_prefix=, and a cell list anywhere coordinates go
+------------------------------------------------------------------------------------------------------------------------------------------
+
+!match new sm SM 8 8
+!match use sm
+!map new deck 6 6
+!ent add hero Hero 10 2 2 map=main
+!ent add mate Mate 10 2 2 map=deck
+!ent store_entity_into_var hero hero form
+!eval --as hero "summon(entity[hero].form, 3, 3, 'deck')"
+?? = `'hero2'`
+!eval --as hero "summon_near(entity[hero].form, 4, 4, 1, 'deck')"
+!eval --as hero "summon_from('form', 5, 5, 'deck')"
+!assert "map_of('hero2') == 'deck' and map_of('hero3') == 'deck' and map_of('hero4') == 'deck'"
+!eval --as hero "summon(entity[hero].form, 6, 6, 'mob')"
+?? this match has no map named `mob`
+?? an id prefix goes in id_prefix=
+!eval --as hero "summon(entity[hero].form, 6, 6, id_prefix='mob')"
+?? = `'mob'`
+!eval --as hero "summon(entity[hero].form, free_cell_near(1, 1, 1, map='deck'))"
+?? = `'hero5'`
+!eval --as hero "summon_near(entity[hero].form, [1, 5, 'deck'], 1, id_prefix='near')"
+!assert "map_of('mob') == 'main' and map_of('hero5') == 'deck' and entity[hero5].x == 1 and map_of('near') == 'deck'"
+!eval --as hero "occupies('mate', [2, 2, 'deck'])"
+?? = `True`
+!eval --as hero "occupies('hero', [2, 2, 'deck'])"
+?? the cell is on map `deck`, and occupies works on map `main`
+!eval --as hero "can_see('mate', [3, 3, 'deck'], map='main')"
+?? the cell is on map `deck` and map= names `main`
+!eval --as hero "distance([1, 1, 'deck'], [4, 5, 'main'])"
+?? the cells name different maps
+!eval --as hero "can_see('hero', 3, 3, 'deck')"
+?? `deck` is a map; a map goes in map='deck'
+!eval --as hero "angle(3, 3, 'deck', 5, 5)"
+?? `deck` is a map, and angle takes none
+!eval --as hero "tile_set([2, 3, 'deck'], 'mark', 1)"
+!assert "tile_get(2, 3, 'mark', map='deck') == 1"
+!eval --as hero "entity_center('mate')"
+?? = `[2, 2, 'deck']`
+!eval --as hero "footprint_cells('mate')"
+?? = `[[2, 2, 'deck']]`
+!eval --as hero "move_entity(self, free_cell_near(entity_center('mate'), 2, map='deck'))"
+!assert "map_of('hero') == 'deck'"
+
+Expected: HARNESS-ALLOWS-ERRORS. The placement functions all take the
+map in the slot after the coordinates (after the radius for the _near
+forms), as move_entity and summon_template do; summon / summon_near /
+summon_from used to read a fourth word as an id prefix, so
+`summon(form, 3, 3, 'deck')` made a unit named `deck` on the formula's
+own map. A word that is no map is refused, naming id_prefix=. A cell
+list goes wherever a function takes x and y: [x, y] fills both, and the
+map of an [x, y, map] cell (what free_cell_near, entity_center and
+footprint_cells return for another map) goes to the map slot of a
+function that has one; a function without one works on its unit's map
+and refuses a cell on another, two cells must name one map, and a cell
+can't disagree with map=. A map name typed after the coordinates of a
+function that refuses it is named in the refusal. entity_center,
+aoe_origin and footprint_cells give [x, y, map] for a unit on a map
+other than the formula's own, as corpse_at does.
+
+
+SCENARIO 878 — A player can't rewrite a host's alias or formula function; listings name a player's
+-----------------------------------------------------------------------------------------------------
+
+!match new af AF 8 8
+!match use af
+!ent add boss Boss 50 2 2
+!alias def atk "ent hp boss -5"
+!func def dmg n "n * 2"
+!host access set alias all
+!host access set func all
+!as player alice
+!alias def atk "host add alice"
+?? Alias `atk` was written by a host; only a host can change, rename or remove it.
+!func def dmg n "0 * kill('boss')"
+?? Formula function `dmg` was written by a host
+!alias del atk
+?? only a host can change
+!func del dmg
+?? only a host can change
+!alias def mine "ent hp boss -1"
+!func def twice n "n * 3"
+!alias list
+?? `!mine` (by `alice`, not a host)
+?! `!atk` (by
+!func list
+?? `twice(n)` (by `alice`, not a host)
+!as host
+!atk
+!assert "entity[boss].hp == 45"
+!eval "dmg(1)"
+?? = `2`
+!alias def mine "ent hp boss -2"
+!alias info mine
+?! not a host
+!as restart
+!match use af
+!func info twice
+?? (by `alice`, not a host)
+
+Expected: HARNESS-ALLOWS-ERRORS. Once a GM opens `!alias` or `!func` to
+players, a player could rewrite a host's alias (the host's next `!atk`
+ran `!host add alice` with the host's reach) or a host's formula
+function (a host's passive calling it ran the player's body). Each alias
+and function now records who wrote it, as macros do: a non-host can't
+replace or delete a host's entry, and `!alias list` / `info` and `!func
+list` / `info` name a player's. A host redefining a player's entry makes
+it the host's. The record is saved with the match.
+
+
+SCENARIO 879 — A snake segment carries its rider, its aura and a part glued to it
+-----------------------------------------------------------------------------------
+
+!match new sk SK 10 10
+!match use sk
+!map new deck 6 6
+!ent add head Head 10 3 3 map=main
+!part segment head seg Seg 3 2
+!ent set_var seg slots.back.capacity 1
+!ent add rid Rid 5 7 7 map=main
+!mount rid seg back
+!zone new au map=main
+!zone anchor au seg 0
+!ent add lamp Lamp 5 9 9 map=main
+!part attach seg lamp
+!assert "entity[rid].x == 3 and entity[rid].y == 2 and entity[lamp].y == 2"
+!ent tp head 8 8
+!assert "entity[seg].x == 8 and entity[seg].y == 7 and entity[rid].y == 7 and entity[lamp].y == 7 and cell_in_zone(8, 7, 'au')"
+!ent move head 1 up
+!assert "entity[seg].y == 8 and entity[rid].y == 8 and entity[lamp].y == 8 and cell_in_zone(8, 8, 'au')"
+!ent push head left 2
+!assert "entity[seg].x == 7 and entity[rid].x == 7 and entity[lamp].x == 7 and cell_in_zone(7, 7, 'au')"
+!ent tp head 4 4 deck
+!assert "map_of('rid') == 'deck' and entity[rid].x == entity[seg].x and entity[rid].y == entity[seg].y and entity[lamp].x == entity[seg].x and entity[lamp].y == entity[seg].y"
+!assert "cell_in_zone(entity[seg].x, entity[seg].y, 'au')"
+
+Expected: A snake's segments move without fire_entity_moved of their
+own, and nothing carried what a segment holds: a passenger in a train
+car stayed where it mounted, still mounted, an aura anchored to a
+segment never moved, and a part glued to a segment copied the segment's
+cell from before a teleport (so a cross-map move left it at the old
+map's coordinates). After the head moves the body is laid first, then
+each segment carries its riders and auras and the glued parts follow:
+on a teleport, a walk, a push and a move to another map.
+
+
+SCENARIO 880 — `!action ... map=<map>` aims a location action at another map
+--------------------------------------------------------------------------------
+
+!match new am AM 8 8
+!match use am
+!map new deck 6 6
+!ent add hero Hero 10 2 2 map=main
+!ent set_var hero actions.blink.target location
+!ent set_var hero actions.blink.body "entity[self].got = [target.x, target.y, target.map]\nmove_entity(self, target)"
+!action hero blink 4 4 map=deck
+?? `hero` used action `blink`.
+!assert "entity[hero].got == [4, 4, 'deck'] and map_of('hero') == 'deck' and entity[hero].x == 4"
+!action hero blink 3 3 map=nowhere
+?? Could not find a map named `nowhere`
+!action hero blink 3 3 map=deck map=main
+?? map= is given twice.
+!action hero blink 9 9 map=deck
+?? location (9,9) is off the map (6x6).
+!ent set_var hero actions.marks.target location_list
+!ent set_var hero actions.marks.body "for c in target:\n    tile_set(c, 'mark', args.power)"
+!action hero marks 1 1 2 2 map=main power=3
+!assert "tile_get(1, 1, 'mark', map='main') == 3 and tile_get(2, 2, 'mark', map='main') == 3"
+
+Expected: HARNESS-ALLOWS-ERRORS. `map=` is how commands name a map, but
+`!action hero blink 4 4 map=deck` ran on (4,4) of the actor's map with
+`args.map = 'deck'`: only a formula's use_action could aim at another
+map. For a location or location_list target, `map=` now names the map
+of its cells (`target.map`, a Coord the body passes whole to
+move_entity / tile_set), under the channel's view rules; it is no
+action arg there, and a second one is refused.
+
+
+SCENARIO 881 — A map name typed after the coordinates: refusals name `map=`, and nothing drops or stores it silently
+---------------------------------------------------------------------------------------------------------------------
+
+!match new mw MW 8 8
+!match use mw
+!ent add hero Hero 10 2 2
+!ent add foe Foe 10 6 6
+!tile set 3 3 main water
+?? ⚠️ `main` is also a map's name; a map goes in `map=main`
+!tile test 3 3 on_enter main
+?? ❌ Unexpected `main`
+?? `main` is a map: a map goes in `map=main`.
+!tile test 3 3 on_enter --as hero main
+?? ❌ Unexpected `main`
+!ent pull foe 3 3 main
+?? ❌ Pull distance must be an integer, got 'main'. `main` is a map: a map goes in `map=main`.
+!dist hero 3 3 main
+?? ❌ `main` is a map: a map goes in `map=main`.
+!map preview burst 3 3 2 main
+?? Unknown metric `main`
+?? `main` is a map: a map goes in `map=main`.
+!tile test 3 3 on_enter
+?? has no `on_enter` hook to fire
+
+Expected: HARNESS-ALLOWS-ERRORS. Only `!ent tp` takes a map as the word
+after `<x> <y>`; the other coordinate commands take `map=`, and a map
+name typed there fills their next slot. `!tile set 3 3 main water`
+still stores `main` on the cell (a path may be any word) with a ⚠️
+naming `map=`. `!tile test` used to drop a word that wasn't `--as
+<eid>` and now refuses it. The pull distance refusal had no ❌ (the
+harness didn't count it), `!dist` said "coordinates must be integers"
+for three integers, and the burst metric refusal didn't say where a map
+goes: each now names `map=`.

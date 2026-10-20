@@ -383,6 +383,7 @@ passives still fire.)
 """
 from __future__ import annotations
 import ast
+import inspect
 import copy
 import math
 import itertools
@@ -1356,6 +1357,44 @@ def _listify(v: Any) -> Any:
         changed = {k: _listify(x) for k, x in v.items()}
         return v if all(changed[k] is v[k] for k in v) else changed
     return v
+
+
+# The x / y parameter pairs a coordinate list can fill (FormulaEngine.
+# _namespace, _coord_lists), and the first parameters naming the unit whose
+# map a function without a map slot works on.
+_X_PARAMS = {"x": "y", "x1": "y1", "x2": "y2", "from_x": "from_y",
+             "origin_x": "origin_y"}
+_UNIT_REF_PARAMS = frozenset({"eid_t", "target_t", "target_token", "rider"})
+_COORD_PARAM_CACHE: Dict[Any, Optional[List[str]]] = {}
+
+
+def _coord_pair_params(fn: Callable) -> Optional[List[str]]:
+    """`fn`'s parameter names when it takes an x / y pair, else None
+    (cached per code object: namespaces are built per formula)."""
+    code = getattr(fn, "__code__", None)
+    key = code if code is not None else fn
+    if key in _COORD_PARAM_CACHE:
+        return _COORD_PARAM_CACHE[key]
+    out: Optional[List[str]] = None
+    try:
+        params = list(inspect.signature(fn).parameters)
+    except (TypeError, ValueError):
+        params = []
+    if any(p in _X_PARAMS and i + 1 < len(params)
+           and params[i + 1] == _X_PARAMS[p] for i, p in enumerate(params)):
+        out = params
+    _COORD_PARAM_CACHE[key] = out
+    return out
+
+
+def _is_coord_value(v: Any) -> bool:
+    """A cell value: [x, y], [x, y, map] or a location target (Coord)."""
+    if isinstance(v, (list, tuple)):
+        return (len(v) in (2, 3)
+                and all(isinstance(n, int) and not isinstance(n, bool)
+                        for n in v[:2])
+                and (len(v) == 2 or isinstance(v[2], str)))
+    return type(v).__name__ == "Coord" and hasattr(v, "x")
 
 
 def _lists_out(fn: Callable) -> Callable:
@@ -5158,10 +5197,18 @@ class FormulaEngine:
         def _footprint_height(eid_t: Any) -> int:
             return match.entity_footprint(_require_e(eid_t, "footprint_height"))[1]
 
+        def _unit_cells(e: Any, cells: Any) -> Any:
+            """A unit's cell(s), [x, y, map] when the unit is on a map
+            other than the formula's own (as corpse_at)."""
+            if e.map != _default_map_name():
+                return _tag_cells(_listify(cells), e.map)
+            return cells
+
         def _footprint_cells(eid_t: Any) -> list:
             # List of (x,y) the entity covers; loopable + coord-readable.
-            return [(cx, cy) for cx, cy in
-                    match.entity_cells(_require_e(eid_t, "footprint_cells"))]
+            e = _require_e(eid_t, "footprint_cells")
+            return _unit_cells(e, [(cx, cy) for cx, cy in
+                                   match.entity_cells(e)])
 
         def _occupies(eid_t: Any, x: Any, y: Any) -> bool:
             e = _require_e(eid_t, "occupies")
@@ -5180,16 +5227,16 @@ class FormulaEngine:
             # the result is always a covered integer cell).
             e = _require_e(eid_t, "entity_center")
             w, h = match.entity_footprint(e)
-            return (e.x + (w - 1) // 2, e.y + (h - 1) // 2)
+            return _unit_cells(e, (e.x + (w - 1) // 2, e.y + (h - 1) // 2))
 
         def _aoe_origin(eid_t: Any) -> tuple:
             # Where an area effect cast BY this entity originates: its
             # center cell or its anchor, per the aoe_origin_mode rule.
             e = _require_e(eid_t, "aoe_origin")
             if str(match.rules.get("aoe_origin_mode", "center")) == "anchor":
-                return (e.x, e.y)
+                return _unit_cells(e, (e.x, e.y))
             w, h = match.entity_footprint(e)
-            return (e.x + (w - 1) // 2, e.y + (h - 1) // 2)
+            return _unit_cells(e, (e.x + (w - 1) // 2, e.y + (h - 1) // 2))
 
         ns["footprint_width"] = _footprint_width
         ns["footprint_height"] = _footprint_height
@@ -6508,6 +6555,12 @@ class FormulaEngine:
             """The map a summon places on: map=, else the hook's map, else
             `self`'s map, else the match's only map."""
             if mv is not None:
+                if isinstance(mv, str) and mv not in match.maps \
+                        and mv != "view" and not mv.startswith("@"):
+                    raise FormulaError(
+                        f"{fname}(...): this match has no map named `{mv}` "
+                        f"(maps: {', '.join(match.maps)}); an id prefix "
+                        f"goes in id_prefix=.")
                 return _map_arg(mv, fname)
             hook = (extras.get("tile_map") or extras.get("zone_map")
                     or extras.get("context_map"))
@@ -6516,16 +6569,18 @@ class FormulaEngine:
             se = match.entities.get(ctx.target) if ctx.target else None
             return match.map_of(se) if se is not None else _cur_map()
 
-        def _summon(template: Any, x: Any, y: Any, id_prefix: Any = None,
-                    map: Any = None) -> str:
-            """summon(template, x, y, id_prefix=None): instantiate a
+        def _summon(template: Any, x: Any, y: Any, map: Any = None, *,
+                    id_prefix: Any = None) -> str:
+            """summon(template, x, y, map=None, id_prefix=None): instantiate a
             live entity from a template dict at exactly (x, y). Raises
             (off-grid / occupied) if the cell isn't free — use
             summon_near to ring-search. Returns the new entity id.
             id_prefix overrides the auto-derived id base (template
             name, else 'summon'); the engine appends a counter to keep
-            ids unique. map= places it on another map (default: the hook's
-            map, else self's, else the only one)."""
+            ids unique (keyword only). map (the slot after the coordinates,
+            as in move_entity and summon_template) places it on another map
+            (default: the hook's map, else self's, else the only one); a
+            cell [x, y, map] in the x slot names its map."""
             prefix = None if id_prefix is None else str(id_prefix)
             mp = _place_map("summon", map)
             try:
@@ -6539,8 +6594,8 @@ class FormulaEngine:
             return new_id
 
         def _summon_near(template: Any, x: Any, y: Any, radius: Any,
-                         id_prefix: Any = None, map: Any = None) -> str:
-            """summon_near(template, x, y, radius, id_prefix=None): like
+                         map: Any = None, *, id_prefix: Any = None) -> str:
+            """summon_near(template, x, y, radius, map=None, id_prefix=None): like
             summon, but searches outward (Chebyshev rings, nearest
             first) up to `radius` for the first free in-bounds cell.
             Raises only if no free cell is found in range. Ideal for
@@ -6560,9 +6615,9 @@ class FormulaEngine:
             engine._note_affected(new_id)
             return new_id
 
-        def _summon_from(path: Any, x: Any, y: Any, id_prefix: Any = None,
-                         map: Any = None) -> str:
-            """summon_from(path, x, y, id_prefix=None): read a template
+        def _summon_from(path: Any, x: Any, y: Any, map: Any = None, *,
+                         id_prefix: Any = None) -> str:
+            """summon_from(path, x, y, map=None, id_prefix=None): read a template
             from `self`'s vars at the dotted `path`, then summon it
             (strict placement). Convenience for the common case where
             the summoner stores its blueprint in its own vars — e.g. a
@@ -6590,7 +6645,7 @@ class FormulaEngine:
                         f"vars '{path}'."
                     )
                 cur = cur[seg]
-            return _summon(cur, x, y, id_prefix, map)
+            return _summon(cur, x, y, map, id_prefix=id_prefix)
 
         def _transfer_entity(eid_t: Any, dest_t: Any, x: Any = None,
                              y: Any = None, map: Any = None) -> Any:
@@ -9002,9 +9057,13 @@ class FormulaEngine:
         # result has its tuples turned into lists, so a coordinate from
         # free_cell_near / raycast / cells_in_* equals one read back from a
         # var (stored values are lists, as a save/load makes them).
+        coord_params = {}
         for fname in _TUPLE_FREE_FUNCS:
             fn = ns.get(fname)
             if callable(fn):
+                params = _coord_pair_params(fn)
+                if params is not None:
+                    coord_params[fname] = params
                 ns[fname] = _lists_out(fn)
         # `map=` on the unit-less spatial functions (multi_map_design §3):
         # the call runs on that map, and a cell result names it when it
@@ -9012,6 +9071,104 @@ class FormulaEngine:
         for fname in _MAP_ARG_FUNCS:
             ns[fname] = _with_map(fname, ns[fname],
                                   cells=fname in _MAP_CELL_RESULT_FUNCS)
+
+        # A coordinate where a function takes an x / y pair: [x, y] (or a
+        # location target) fills both slots, and the map of an [x, y, map]
+        # cell (one a function returned for another map) goes to the map
+        # slot of a function that has one; any other function works on one
+        # map (its unit's, its zone's), and a cell on another is refused.
+        def _ref_map(fname: str, params: List[str], a: List[Any]) -> Any:
+            first = params[0] if params else ""
+            if first in _UNIT_REF_PARAMS and a:
+                eid = _eid(a[0])
+                ue = self._match.entities.get(eid) if eid else None
+                return ue.map if ue is not None else None
+            if "name" in params and fname.startswith(("zone_", "cell_in_")):
+                i = params.index("name")
+                if i < len(a) and isinstance(a[i], str):
+                    zm = self._match.zone_map(a[i])
+                    return zm.name if zm is not None else None
+            return None
+
+        def _map_word_hint(fname: str, a: Any, params: List[str],
+                           takes_map: bool) -> Optional[str]:
+            """For a call that failed with a map's name among its plain
+            arguments (`can_see('hero', 3, 3, 'deck')`): where a map goes."""
+            for i, v in enumerate(a):
+                if not isinstance(v, str) or v not in self._match.maps:
+                    continue
+                p = params[i] if i < len(params) else ""
+                if p == "map" or p in _UNIT_REF_PARAMS:
+                    continue
+                if takes_map:
+                    return (f"{fname}(...): `{v}` is a map; a map goes in "
+                            f"map='{v}' (or a cell [x, y, '{v}']).")
+                return (f"{fname}(...): `{v}` is a map, and {fname} takes "
+                        f"none (it works on one map).")
+            return None
+
+        def _coord_lists(fname: str, fn: Any, params: List[str],
+                         xs: List[int], takes_map: bool) -> Any:
+            def _call(*a: Any, **k: Any) -> Any:
+                try:
+                    return _expand(*a, **k)
+                except (TypeError, FormulaError):
+                    hint = _map_word_hint(fname, a, params, takes_map)
+                    if hint is None:
+                        raise
+                    raise FormulaError(hint) from None
+
+            def _expand(*a: Any, **k: Any) -> Any:
+                if not any(_is_coord_value(v) for v in a):
+                    return fn(*a, **k)
+                args = list(a)
+                maps: List[str] = []
+                for xi in xs:
+                    if xi < len(args) and _is_coord_value(args[xi]):
+                        c = args[xi]
+                        args[xi:xi + 1] = [_coord_x(c), _coord_y(c)]
+                        mv = _coord_map(c)
+                        if mv is not None:
+                            maps.append(mv)
+                if not maps:
+                    return fn(*args, **k)
+                if len(set(maps)) > 1:
+                    raise FormulaError(
+                        f"{fname}(...): the cells name different maps "
+                        f"({', '.join(dict.fromkeys(maps))}).")
+                mv = maps[0]
+                if takes_map:
+                    named = k.get("map")
+                    if "map" in params and named is None:
+                        mi = params.index("map")
+                        named = args[mi] if mi < len(args) else None
+                        if named is None and mi < len(args):
+                            args[mi] = mv
+                        elif named is None:
+                            k["map"] = mv
+                    elif named is None:
+                        k["map"] = mv
+                    if named is not None and named != mv:
+                        raise FormulaError(
+                            f"{fname}(...): the cell is on map `{mv}` and "
+                            f"map= names `{named}`.")
+                    return fn(*args, **k)
+                ref = _ref_map(fname, params, args)
+                if ref is not None and ref != mv:
+                    raise FormulaError(
+                        f"{fname}(...): the cell is on map `{mv}`, and "
+                        f"{fname} works on map `{ref}`.")
+                return fn(*args, **k)
+            _call.__name__ = getattr(fn, "__name__", fname)
+            _call.__doc__ = getattr(fn, "__doc__", None)
+            return _call
+
+        for fname, params in coord_params.items():
+            xs = [i for i, p in enumerate(params) if p in _X_PARAMS
+                  and i + 1 < len(params) and params[i + 1] == _X_PARAMS[p]]
+            ns[fname] = _coord_lists(
+                fname, ns[fname], params, xs,
+                "map" in params or fname in _MAP_ARG_FUNCS)
         return ns
 
     def _compile_function_body(self, fdef):

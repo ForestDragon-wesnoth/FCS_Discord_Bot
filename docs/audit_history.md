@@ -2317,3 +2317,39 @@ dragon with a 2-wide howdah, a 2-wide leg detached and located).
     a load that changed data (a fixed template, an old match file) left
     the journals describing the old data. Loads now journal what they
     change.
+
+## Pass 46
+
+Fourth findings report from the separate read-only LLM pass (document 2.2,
+pass 25 on `b4e06d5`: the pass 24 fixes, and a map name typed or passed
+after a pair of coordinates). Every finding was reproduced on current main
+before fixing; scenarios 877-881 cover them, and 868 gained the match-unit
+case of W4. Verified after: 881/881, the replay differential, usage drift
+0 of 881 scenarios; a snake segment carrying a rider, an aura and a glued
+part through a teleport, a walk, a push and a cross-map move.
+  - **F21:** `summon`, `summon_near` and `summon_from` read the word after
+    the coordinates as an id prefix, where `move_entity`, `summon_template`
+    and `transfer_entity` read a map: `summon(t, 3, 3, 'deck')` made a unit
+    named `deck` on the formula's own map. The map now takes that slot in
+    all of them and the prefix is keyword-only (`id_prefix=`); a word that
+    is no map is refused, naming `id_prefix=`.
+  - **G4++:** aliases and `!func`s had the hole the macro-owner fix closed:
+    a player with access rewrote a host's alias (the host's next use ran
+    the player's command with a host's reach) or function (a host's passive
+    ran the player's body). Both record their author now.
+  - **K6:** a snake segment carried nothing: its riders and anchored auras
+    stayed behind, and a part glued to it copied its cell from before a
+    teleport (old coordinates on a new map after a cross-map move or a
+    vehicle's crew ejection). The body is laid before the glue, and each
+    segment carries its riders and auras.
+  - **F22:** `!action hero blink 4 4 map=deck` ran on the actor's map with
+    `args.map = 'deck'`; `map=` now names a location target's map.
+  - **L15:** the 48 x / y functions that refused a coordinate list take one
+    (`[x, y, map]` names the map, or is refused by a function that works on
+    another map); a map name among a failing call's arguments is named in
+    its refusal; `entity_center` / `aoe_origin` / `footprint_cells` tag a
+    unit's cell on another map; `!tile test` refuses a stray word; `!tile
+    set` warns when the path is a map's name; the pull, `!dist` and burst
+    refusals name `map=` (the pull one had no ❌); a match unit's or
+    corpse's old `map` var moves to `map_old` at load.
+  - X4+ and X5 stay deferred to the CPU work budget (§8).

@@ -8018,6 +8018,11 @@ class Match:
     # like a typed `!batch`; a host's (or one with no record) runs as
     # written.
     macro_authors: Dict[str, str] = field(default_factory=dict)
+    # The same record for aliases (`!alias def`) and formula functions
+    # (`!func def`): a non-host can't change a host's entry, and listings
+    # name a player's.
+    alias_authors: Dict[str, str] = field(default_factory=dict)
+    func_authors: Dict[str, str] = field(default_factory=dict)
 
     # ---- named random tables ----
     # name -> a roll_table spec ("key:weight,..." CSV). Rolled by name via the
@@ -9728,6 +9733,15 @@ class Match:
                 used.update(tuple(c) for c in self.entity_cells(s, *spot))
                 px, py = spot
         return out
+
+    def _restamp_segments(self, head_id: str) -> None:
+        """Carry what each segment of a snake holds after the body moved:
+        its anchored auras and its riders (a passenger in a train car).
+        Parts glued to a segment ride with the head's part subtree
+        (_restamp_parts_for)."""
+        for seg in self.snake_segments(head_id):
+            self._restamp_anchors_for(seg.id)
+            self._restamp_riders_for(seg.id)
 
     def _resettle_snake(self, head_id: str) -> None:
         """Re-lay a snake's body behind the head, used after a discontinuous
@@ -15193,6 +15207,18 @@ class Match:
         # the repositioned aura). Like zone_shift, the restamp just moves
         # cells — it does NOT fire the aura's own enter/exit hooks for
         # entities it sweeps over.
+        # Snake body: a stepwise move already trailed the chain per
+        # fire_entity_step (which left __seg_last == the head's cell). A
+        # discontinuous move (teleport / swap / push with no per-cell steps)
+        # leaves __seg_last stale, so re-lay the body straight behind the
+        # head. First, so the parts glued to a segment, its riders and its
+        # auras follow the segment's new cell below.
+        snake = self.is_snake_head(entity_id)
+        if snake:
+            last = e.vars.get("__seg_last")
+            if not (isinstance(last, list) and len(last) == 2
+                    and last[0] == e.x and last[1] == e.y):
+                self._resettle_snake(entity_id)
         self._restamp_anchors_for(entity_id)
         # Glue attached body parts to the parent's new cell (before
         # on_entity_moved passives fire, so they observe the moved parts).
@@ -15202,15 +15228,8 @@ class Match:
         # the part/anchor restamp, this just moves cells; it does NOT fire
         # the riders' own movement hooks (they're carried, not walking).
         self._restamp_riders_for(entity_id)
-        # Snake body: a stepwise move already trailed the chain per
-        # fire_entity_step (which left __seg_last == the head's cell). A
-        # discontinuous move (teleport / swap / push with no per-cell steps)
-        # leaves __seg_last stale, so re-lay the body straight behind the head.
-        if self.is_snake_head(entity_id):
-            last = e.vars.get("__seg_last")
-            if not (isinstance(last, list) and len(last) == 2
-                    and last[0] == e.x and last[1] == e.y):
-                self._resettle_snake(entity_id)
+        if snake:
+            self._restamp_segments(entity_id)
         from formula import FormulaEngine, EvalCtx
         engine = FormulaEngine(self)
         this_id = self.current_entity_id()
@@ -15285,6 +15304,8 @@ class Match:
         # position (from_x, from_y), before passives observe the move.
         if self.is_snake_head(entity_id):
             self._advance_snake(entity_id, from_x, from_y)
+            self._restamp_parts_for(entity_id)
+            self._restamp_segments(entity_id)
         from formula import FormulaEngine, EvalCtx
         engine = FormulaEngine(self)
         this_id = self.current_entity_id()
@@ -18817,6 +18838,8 @@ class Match:
             "aliases": dict(self.aliases),
             "macros": dict(self.macros),
             "macro_authors": dict(self.macro_authors),
+            "alias_authors": dict(self.alias_authors),
+            "func_authors": dict(self.func_authors),
             "tables": dict(self.tables),
             "template_pins": copy.deepcopy(self.template_pins),
             "watchers": copy.deepcopy(self.watchers),
@@ -18916,32 +18939,45 @@ class Match:
                                or m.entities[mp.vehicle].part_of):
                 mp.vehicle = None
         # A team an older build stored as a number reads as the text every
-        # write now stores (so `1` and "1" are one team in formulas too),
-        # on units and in corpse snapshots alike.
-        def _team_as_text(vars_: Any, names: Any) -> None:
+        # write now stores (so `1` and "1" are one team in formulas too), and
+        # a var under a name now reserved (`map`) moves to `<name>_old` with
+        # a console note, as in a template file (legacy_template_fixes): it
+        # read as the unit's position and only `delete_var` reached it. On
+        # units and in corpse snapshots alike.
+        def _legacy_vars(vars_: Any, names: Any, what: str) -> None:
+            if not isinstance(vars_, dict):
+                return
             tv = (names or {}).get("team_var", "team") \
                 if isinstance(names, dict) else "team"
-            if isinstance(vars_, dict) and tv in vars_ \
-                    and not isinstance(vars_[tv], (str, dict, list)) \
+            if tv in vars_ and not isinstance(vars_[tv], (str, dict, list)) \
                     and vars_[tv] is not None:
                 vars_[tv] = team_text(vars_[tv])
+            for k in [k for k in vars_ if k in RESERVED_VAR_PATHS]:
+                new, n = f"{k}_old", 2
+                while new in vars_:
+                    new, n = f"{k}_old{n}", n + 1
+                vars_[new] = vars_.pop(k)
+                print(f"⚠️ Match `{m.id}` {what}: var `{k}` is a reserved "
+                      f"name now; moved to `{new}`.")
         for e in m.entities.values():
-            _team_as_text(e.vars, e.var_names)
+            _legacy_vars(e.vars, e.var_names, f"unit `{e.id}`")
         for mp in maps.values():
             for cell in mp.tiles.values():
                 corpses = cell.get("corpses") if isinstance(cell, dict) \
                     else None
-                for c in (corpses or {}).values() \
+                for cid, c in (corpses or {}).items() \
                         if isinstance(corpses, dict) else ():
                     if isinstance(c, dict):
                         ce = c.get("entity")
                         if isinstance(ce, dict):
-                            _team_as_text(ce.get("vars"), ce.get("var_names"))
+                            _legacy_vars(ce.get("vars"), ce.get("var_names"),
+                                         f"corpse `{cid}`")
                         for pd in c.get("parts") or () \
                                 if isinstance(c.get("parts"), list) else ():
                             if isinstance(pd, dict):
-                                _team_as_text(pd.get("vars"),
-                                              pd.get("var_names"))
+                                _legacy_vars(pd.get("vars"),
+                                             pd.get("var_names"),
+                                             f"corpse `{cid}` part")
         # COPY on load too (the load-side twin): otherwise the restored match
         # shares the snapshot's list, and the next Entity.remove would mutate
         # the retained snapshot in place — corrupting it for a second restore.
@@ -19027,6 +19063,12 @@ class Match:
         m.macro_authors = ({str(k): str(v) for k, v in raw_ma.items()
                             if k in m.macros and isinstance(v, str)}
                            if isinstance(raw_ma, dict) else {})
+        for key, names in (("alias_authors", m.aliases),
+                           ("func_authors", m.formula_functions)):
+            raw_a = d.get(key)
+            setattr(m, key, {str(k): str(v) for k, v in raw_a.items()
+                             if k in names and isinstance(v, str)}
+                    if isinstance(raw_a, dict) else {})
         raw_tables = d.get("tables", {}) or {}
         m.tables = {
             str(k): str(v) for k, v in raw_tables.items()

@@ -386,6 +386,9 @@ back, load the schema with `ToolSearch` before calling
 - **`docs/feature_ideas.md`**: the open, numbered feature-idea list the user
   picks from by number (shipped / struck items listed at its top). Check it
   before proposing a feature, and keep it current when one ships.
+- **`docs/combat_systems_fit.md`**: three tabletop combat systems the user's
+  group wrote (Solis, FCS1, NCS), what the bot can't do for them and what
+  costs needless work; the background of ideas #200-#255.
 
 ### The cross-cutting chokepoints (memorize these)
 
@@ -548,9 +551,10 @@ plus `data/bot_settings.json` (owner limits + rule ceilings) and
 - **Saved data from older builds loads** (`LEGACY_IDS_OK`, set while
   saved units are read): legacy ids, a clamp bound that is neither a
   number nor a var path (dropped with a console note, the clamp too when
-  no bound is left), a template file's var under a now-reserved name
-  (`legacy_template_fixes`: moved to `<name>_old`), a numeric team (read
-  as text at match load, corpses too). A refusal added for new input must
+  no bound is left), a var under a now-reserved name (`map`) in a
+  template file (`legacy_template_fixes`) or on a match's unit or corpse
+  (at match load), moved to `<name>_old` with a console note, a numeric
+  team (read as text at match load, corpses too). A refusal added for new input must
   not move old files to `corrupt/` (868). What a load changes reaches the
   command journals: a template it fixed as a `template` entry, a match
   whose loaded state differs from its journal's last hash as a `state`
@@ -680,7 +684,14 @@ functions take `map=` (§7.8 "Maps in formulas").
 
 **Values.** Coordinates are LISTS (`[3, 3]`): built-in results are listified
 (`_listify`), a tuple literal compiles to a list, stored tuples become lists;
-read them with `coord_x` / `coord_y` or `get(c, 0)`. `get(container, key)`
+read them with `coord_x` / `coord_y` or `get(c, 0)`. A coordinate goes
+wherever a function takes an x / y pair (`formula._coord_lists`, every
+built-in with `x, y` / `x1, y1` / `from_x, from_y` / `origin_x,
+origin_y` parameters): `[x, y]` fills both, an `[x, y, map]` cell's map
+goes to the function's map slot, and a function without one (it works
+on its unit's or zone's map) refuses a cell on another map; a call that
+fails with a map's name among its plain arguments says where a map
+goes (877). `get(container, key)`
 reads a list index / dict key / dotted path (subscripts are banned). Stored
 values are deep copies with string dict keys (`_own_value`), and only JSON
 values (numbers, text, bools, None, lists, dicts) can be stored.
@@ -1297,7 +1308,9 @@ hardcodes**.
   `has_action`. A list target lists each unit / cell / corpse once: a repeat
   is merged with a ⚠️ (user call: to act on one twice, run the action
   twice; `dedupe_targets`). A location target must be on the map and is a `Coord`
-  (`.x` / `.y`) that stores as [x, y]; `use_action` coerces its target to
+  (`.x` / `.y` / `.map`) that stores as [x, y]; a typed `map=<map>` names
+  the map of a location / location_list target's cells (the actor's by
+  default; not an action arg there, 880); `use_action` coerces its target to
   the action's type the way `!action` parses it (`action.coerce_target`:
   [x, y] → location, ids checked, lists non-empty).
 - **`run_action`** is transactional: pre-state captured, body run,
@@ -1374,7 +1387,10 @@ hardcodes**.
   (`Match.macro_authors`); a body a non-host wrote runs its lines gated as
   the runner, like a typed batch (855). A non-host can't replace, rename
   or remove a macro a host wrote (or one with no recorded author), and
-  `!macro list` / `show` mark a macro a non-host wrote (871).
+  `!macro list` / `show` mark a macro a non-host wrote (871). Aliases and
+  `!func`s record their author the same way (`alias_authors` /
+  `func_authors`, `vtt_commands._AUTHORED`): a non-host can't change a
+  host's, and listings mark a player's (878).
 - **`!foreach <selector> ; <cmd> [; <cmd> ...]`**: the `!find` selector
   grammar; `$id $name $x $y $team $map $i $n` substituted single-pass; targets
   resolved before any command runs; one undo step. Host-gated, EXCEPT that a
@@ -1444,8 +1460,10 @@ hardcodes**.
   own is `[x, y, map]` (`_tag_cells`). `random_cell` / `random_free_cell`
   also take a list or `all` (one pick across those maps, every cell
   equally likely, always `[x, y, map]`; a zone names its own map).
-  Summons (`summon*`, `summon_template*`) and `move_entity(eid, x, y,
-  map=)` / `move_entity(eid, coord)` take `map=` too; a summon defaults to
+  Summons (`summon*`, `summon_template*`), `move_entity(eid, x, y,
+  map=)` / `move_entity(eid, coord)` and `transfer_entity` take the map
+  in the slot after the coordinates (after the radius for the `_near`
+  forms; `summon`'s id prefix only as `id_prefix=`, 877); a summon defaults to
   the hook's map, else `self`'s, else the only one; `move_entity` to
   another map is a cross-map move (returns `[x, y, map]`; a passenger is
   refused and a driver moves its vehicle, as `!ent tp`, 872). `coord_x` /
@@ -1454,7 +1472,10 @@ hardcodes**.
   across maps `can_see` / `has_los` are False and `nearest_cell` None. A
   location target is a `Coord` with `.map` (the actor's, or a triple's
   map via `use_action`; stored as `[x, y, map]` only when it isn't the
-  actor's). `maps()` (loopable), `map_var_get / set / del / keys / has`
+  actor's); a body passes `target` whole to a move or a summon, since
+  `target.x, target.y` drop its map. `entity_center`, `aoe_origin` and
+  `footprint_cells` give `[x, y, map]` for a unit on another map, as
+  `corpse_at`. `maps()` (loopable), `map_var_get / set / del / keys / has`
   (dotted paths on a map's vars, `map=` or the context map; a setting var
   takes what its command stores, `logic.map_setting_value`). `map` is a
   reserved var path like x / y / name: `entity[x].map` reads the unit's
@@ -1719,7 +1740,9 @@ hardcodes**.
   A walk checks the whole body's final cells: a segment that would end on
   another unit's cell refuses the move (single and group moves,
   `_check_snake_trail`; the head may still pass over units, 829).
-  Segments go on the head only (a segment of a segment would branch).
+  After the head moves, the body is laid first, then each segment
+  carries its riders and anchored auras (`_restamp_segments`) and the
+  parts glued to it follow (879). Segments go on the head only (a segment of a segment would branch).
   `segment_death_mode` (none default / solid / cascade / split, with
   `segment_split_head_template`) when a segment is destroyed;
   `segment_removal_mode` (close default / cascade / split / death) when a GM
