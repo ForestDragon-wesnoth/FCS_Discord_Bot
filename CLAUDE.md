@@ -386,6 +386,9 @@ back, load the schema with `ToolSearch` before calling
 - **`docs/feature_ideas.md`**: the open, numbered feature-idea list the user
   picks from by number (shipped / struck items listed at its top). Check it
   before proposing a feature, and keep it current when one ships.
+- **`docs/combat_systems_fit.md`**: three tabletop combat systems the user's
+  group wrote (Solis, FCS1, NCS), what the bot can't do for them and what
+  costs needless work; the background of ideas #200-#255.
 
 ### The cross-cutting chokepoints (memorize these)
 

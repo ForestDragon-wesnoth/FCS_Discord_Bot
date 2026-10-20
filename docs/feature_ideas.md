@@ -2,9 +2,14 @@
 
 The open idea list, kept in the repo so it survives between sessions. Numbers
 stay fixed so the user can pick by number; new ideas take the next free number
-(the highest so far is #200). Items marked (§8) come from CLAUDE.md's deferred
-list. When an idea ships, move its number to "Shipped" below; when the user
-strikes or rejects one, move it to "Off the list".
+(the highest so far is #256). Items marked (§8) come from CLAUDE.md's deferred
+list. #200-#255 come from the audit fork's review of three tabletop combat
+systems built inside the bot (Solis Hunting Lodge 2, FCS1 and the New Combat
+System); their background, the rule terms they use and the limits and costs
+they cite (L1-L15, D1-D18) are in `docs/combat_systems_fit.md`, and every
+"today" statement in them was checked on `836e3af`. When an idea ships, move
+its number to "Shipped" below; when the user strikes or rejects one, move it
+to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
@@ -28,16 +33,20 @@ for reference.
 
 - **#6 Map markers.** `!map mark <x> <y> [glyph] [label] [turns=N]` puts a temporary mark on the map, optionally visible to one team only. Marks show in the legend.
 - **#10 Once-per-turn / once-per-round limits on passives.** Today each one needs a counter var plus a second passive that resets it.
+  - Note: the limits should key on `turns_elapsed`, so they work under ATB. #24's `uses_per_turn` would cover them.
 - **#11 Summon lifetime.** An `expires_in` template field removes the summon after N turns. It counts on `turns_elapsed`, so it works under ATB.
 - **#14 Left-over follow-ups.** Two items remain, both marked "decide later" by you:
   - configurable side names for the directional functions;
   - `to_main_percent` per damage type.
 - **#55 Enable/disable passives and watchers.** `!passive disable/enable`, the same on `!gpassive` and `!watch`, plus a formula function. Useful for testing and for "silenced" statuses.
 - **#56 Status source tracking.** An optional `source` on `status_apply` records who applied it. That gives kill credit for damage over time, "dispel only your own", and "the curse ends when the caster dies".
+  - From the combat systems: covered by #227's `source=`; the source is a tracked reference (#209), so it clears when the unit that applied it leaves the match.
 - **#57 Repeated and labelled rolls.** `!roll 6x 4d6kh3` rolls six times; `!roll 1d20+5 attack` labels the result.
 - **#59 `!turn roll [selector]`.** Rerolls initiative for the selected units with an `initiative_roll_formula` rule.
 - **#66 `!redo`.** Keeps the snapshots an undo dropped until the next state-changing command, so an undo can be taken back.
+  - Note: undo replaces the Match object, and the journal records undo as state. Redo snapshots have to be dropped by any state change on the match from any channel, approvals and watchers included, and a redo needs its own journal entry.
 - **#70 Private vars.** A `private_var_prefix` rule hides GM notes and hidden stats from non-hosts, including reads through `$()`.
+  - Note (with #70 / #115): private vars and hidden statuses need the existence-oracle treatment that document 2's audits apply to unit queries: `!find hp>5`, `status:`, `sort:`, `count` and `$()` must all treat a private var or a hidden status as absent, or a selector answers the question the listing hides. #222's status display has to skip hidden statuses the same way.
 - **#71 Progress clocks.** `!clock add/tick` keeps named clocks, shown in the `!state` header, firing a `clock_filled` event when one fills.
 - **#73 `!rest <selector>`.** Runs a GM-defined `rest_formula` rule on each selected unit.
 - **#75 `!remind <n> <text>`.** Posts a message after N turns, counted so it works under ATB.
@@ -48,6 +57,7 @@ for reference.
 - **#89 `chance(percent)`** on the match RNG, so it respects `random_seed`.
 - **#90 `status_level` / `status_duration`.** Return 0 when the status is missing, so no `status_has` guard is needed.
 - **#93 `max_entities_per_match` rule,** a backstop against runaway summon loops in passives.
+  - Note: the rule sits next to `summon_event_limit`, which resets every command: a passive that summons one unit per turn stays under it forever, and only a per-match cap stops that. FCS1's Summoner, whose charged action summons units costing up to 300 arcana per cast, is the realistic case.
 - **#95 Vision radius through `apply_mods`,** so items and statuses can change sight.
 - **#98 Turn-order markers in `!list`.** Marks units that will skip their next turn and units with no initiative.
 - **#104 Dice pools in the dice grammar,** the same in `roll()`, `!roll` and `!roll odds`:
@@ -62,6 +72,7 @@ for reference.
 - **#112 Bar placeholders** for `entity_line_format` and #68: `{hp_bar}` (▰▰▰▱▱, width from a rule), and `{bar:mana:max_mana}` for any pair of vars.
 - **#114 Status glyph and color on the ASCII map.** A status definition's `glyph` / `color` (with a priority) show on the bearer. This is the text twin of status overlay sprites.
 - **#115 Hidden statuses.** A definition flag (or a visibility formula) keeps a status out of non-host views: `!ent info`, `show:status`, `status:` selectors. For curses and tracking marks.
+  - Note (with #70 / #115): private vars and hidden statuses need the existence-oracle treatment that document 2's audits apply to unit queries: `!find hp>5`, `status:`, `sort:`, `count` and `$()` must all treat a private var or a hidden status as absent, or a selector answers the question the listing hides. #222's status display has to skip hidden statuses the same way.
 - **#116 `max_duration` on status definitions,** the duration twin of `max_level`.
 - **#117 Zone and tile lifetimes.** `expires_in` on zones and placed tiles, counted on `turns_elapsed` (a 3-turn fire wall, a smoke cloud). It pairs with #11.
 - **#118 `zone_grow(name, n)` / `zone_shrink`, plus `!zone grow/shrink`.** Optionally stopped by block conditions; for spreading fire, expanding gas and a closing storm circle.
@@ -87,7 +98,223 @@ for reference.
 - **#182 Match threads on Discord.** `!match new ... thread` creates a thread and binds the new match to it.
 - **#184 Trail segment spacing above 1** (§8). `segment_spacing` works only in `path` follow mode today.
 - **#185 Forced and reflected status transfer** (§8). A transfer that ignores resistance and immunity on the destination, and a "reflect" form that bounces a status back at its source.
-- **#200 GUI option: keep the picked map.** A GUI setting (a toolbar checkbox, remembered in `local_settings.json`) so a map picked in the GUI's map menu stays shown until changed, as `!map use` does. Today a pick lasts until the next turn change, like a Discord board's map buttons; the user found that fine for now.
+- **#200 Status definition hooks.**
+  - `!status hook <name> <on_added|on_removed|on_changed> <formula ...>` stores a program on the status definition. It runs with `self` = the unit carrying the status and the usual status bindings (`status_name`, old and new value), after the global, team and own `on_status_*` passives.
+  - Effects that belong to a status then live in it:
+    - poison's first hit on application;
+    - a stun that leaves a turn of stun immunity when it ends;
+    - a curse that jumps to a neighbour when removed;
+    - Solis Endurance raising max hp on arrival and capping hp on removal.
+  - Today a definition holds one program, `tick` (the `!status` usages, vtt_commands.py:16281). Anything on apply or removal goes into a global `on_status_added` passive branching on `status_name`, so one status's behaviour sits in two places and that passive grows a branch per status (D5). Tile templates and zones already carry their own hooks.
+  - Open choice: whether expiry, dispel and transfer should be told apart (a `removed_by` binding).
+- **#201 Passive priority.**
+  - An optional `priority` on every passive (unit, team, global, default). Within one hook firing, passives run by priority; ties keep today's order (globals, then team, then the unit's own, each in insertion order).
+  - Example of order mattering: armor reduction, then a shield absorbing the rest, then a "last stand" check, where the armor rule is a global passive and the shield an item's passive.
+  - Today that order is fixed in `fire_hook` (logic.py:18107) and `Passive` has no field for it, so such rules have to be merged into one passive to control their order.
+  - The per-passive re-checks that a unit still exists stay as they are.
+- **#202 Formula functions in `!help`.**
+  - `!help func <name>` shows the signature, the docstring, and whether the function reads or changes state and can be looped over.
+  - `!help find <words>` also searches function names and docstrings; `!help funcs [read|mutating|loopable]` lists them.
+  - Today 287 functions (235 match-bound, 52 pure) carry docstrings in formula.py, and none of it reaches chat: `!help find summon` returns six commands and four rules that mention summoning, and not `summon()` itself.
+  - #194 (formula Tab completion) can read the same table.
+- **#203 Where-used search.**
+  - `!match search <text>` lists every stored formula and body containing the text, with its location: passives at every layer, unit actions, watchers, status ticks, tile and zone hooks and conditions, functions, aliases, macros, formula rules. `system=<name>` searches a system's rules and libraries.
+  - The scanner exists: `_match_formula_slots` (vtt_commands.py:7217) already feeds `!system lint` and the "formulas still mention X" notes of the renames.
+  - Host-only, since formulas name hidden units and vars.
+  - Answers "which passive writes `stance`?" in a system with dozens of passives.
+- **#204 `!var rename <old.path> <new.path>`.**
+  - Renames a GM var on every unit, part and corpse of the match, plus `default_entity_vars` and clamp paths, in one undo step. Partial-template markers record the move, and the formulas still naming the old path are listed through #203's scanner, the way `!status rename` lists them.
+  - Today statuses, zones, tables, macros and the engine's var-name rules can be renamed (`rename_status`, `_rename_entry`, `rename_unit_vars`). A GM's own var can't: renaming `stance` mid-campaign takes a `!foreach` over every unit plus hand edits of the defaults and clamps.
+  - Open choice: templates in the server library get rewritten, or listed.
+- **#205 List helpers.**
+  - `take(l, n)`, `drop(l, n)`, `slice(l, a, b)`, `remove_at(l, i)`, `insert_at(l, i, v)`, `reverse(l)`, `flatten(l)`, `zip(a, b)`.
+  - Today `+` appends and `filter_with` removes by value. Taking the first card off a deck needs `map_with(range(1, len(deck)), lambda i: get(deck, i))` (checked on 836e3af), which also charges the loop limit per card.
+  - Uses:
+    - card decks, where a draw is `take` + `drop` and a reshuffle is `shuffle` (Savage Worlds initiative cards, Gloomhaven attack-modifier decks);
+    - queues;
+    - "last three attackers" histories;
+    - "dodge the next N attacks" counters (an NCS design note).
+  - It composes today, so it falls under the "simplify only what GMs write over and over" rule; the user's call.
+- **#206 Crash log for the bot owner.**
+  - Every 💥 (an unexpected exception in a command) is recorded with time, server, match, user, the command as typed and the traceback, in a capped file under `data/` (an owner limit). `!owner errors [n]` lists them; `!owner errors <ref>` shows one.
+  - The 💥 reply carries the reference (`💥 Unexpected error (ref 17): ...`), so a player can quote it in a bug report.
+  - Today a handler exception replies `💥 Unexpected error: <message>` (vtt_commands.py:1049) and the traceback is dropped; only errors raised outside a handler reach the console (discord_commands.py:1228). On public servers, the 💥 line in someone else's channel would be the only trace of a bug.
+- **#207 `!hooks <eid> [when]`.**
+  - One listing of everything that runs for a unit, per hook name, in the order the engine runs it: global passives, team passives, own passives, attached parts' own passives, status ticks at their `tick_when`, tile and zone hooks under its footprint, its schedules.
+  - `!hooks <eid> fire <when> [key=value ...]` (hosts) fires one hook on the unit now. Inside `!dry` that becomes a test that keeps nothing.
+  - Today those layers come from seven commands (`!passive list`, `!gpassive list`, `!team passive`, `!status info`, `!tile info`, `!zone hook list`, `!schedule`), and the order is written down only in `fire_hook`.
+  - POV: host-only, or filtered to what `!passive list` shows a player today.
+- **#212 `!look [eid] [r]`.**
+  - A text answer to "what does my unit see": visible units with distance and compass direction (`goblin2: 3 NE, hostile`), tiles and zones with a `legend` label in range, corpses; POV-filtered through the `!find` helpers.
+  - For phones, where Discord wraps an ASCII map, and for play-by-post (#198).
+  - `!find near:<eid>:<r>` already lists the units, without directions, so this is a presentation shortcut and low priority.
+- **#214 CI and kept audit harnesses.**
+  - A GitHub Actions workflow running `python run_scenarios.py` and pyflakes on every push and PR. The repo has no `.github/` folder, so the regression runs only when a session runs it.
+  - The audit harnesses kept in the repo (`tools/audit/`: stateful chaos, POV leak and existence-oracle detectors, replay differential, renderer parity, suite-as-detector), with a short seeded chaos run in CI. CLAUDE.md §5 has each session rebuild them from descriptions; working copies live in this fork's `audit/doc2/harness/` and drift from main between passes.
+  - The combat prototypes in `audit/combat/` can run in CI as well, as a check that real systems keep working.
+- **#215 Player-facing output.**
+  - `say(text)` adds a line to the reply of the command that triggered it, from any formula: actions, passives, status ticks, tile and zone hooks, watchers, schedules.
+    - It goes through `Match.surface_log`, the path hook output already takes.
+    - It carries the hidden unit-line tag, so a POV that can't see the unit drops the line, as it drops death lines.
+  - `say(text, private=True)` reaches hosts only (hidden rolls, #33; GM notes).
+  - A rule `hook_output_lines`: `all` (today's "⚙️ … fired" lines), `with_result` (only when the formula returned or said something), `none`. Errors ("⚠️ … FAILED") always show to hosts.
+  - The game need: all three systems announce every hit ("Hunter1 hits Hopper1 (crit): 30 damage") and every damage-over-time tick to the players. Today an action's last value isn't shown and `log()` writes only to `!log` (L4, L5, D1).
+  - The death and revive lines already show the shape: `death_message_format` is player-facing text from an engine event, and `say()` gives GM formulas the same.
+  - From the combat systems:
+    - A `say_format` field on actions, printed after a successful run with the action's locals as placeholders (`"{self.name} hits {target.name} for {dealt}"`), so most attacks need no `say()` call.
+    - Names resolved per viewer: `say("{target} is hit")` shows a disguised unit's disguise to a POV that the disguise fools.
+    - `say_to(team, text)` for information meant for one side.
+    - One message per command on Discord: the `say()` lines of one command grouped into one reply.
+- **#216 Local variables in `!func`, passive and tick bodies.**
+  - Allow bare-name assignment (`dealt = base - armor`) in every formula program, as actions already do. A local lives until the formula ends and is never stored.
+  - Design point: a `!func` runs inline in its caller's frame (formula.py:217, "functions are inline macros running in the caller's frame"), so a function's locals would land in the caller's namespace. Calls need their own frame for locals (parameters already behave like locals), or a function's locals get a per-call prefix.
+  - Names that are functions, bindings or `match` stay refused, as do `__` names (`_check_binding_name`).
+  - The game need: the damage calculation each system applies to every hit (D6). Removes L7 and most of D6.
+- **#217 List rolls.**
+  - `!roll none, none, minicrit, crit` picks one item; `none:3, minicrit, crit` weights like a table; `!roll 2x none, crit` rolls twice (#57).
+  - All three rule documents write crit and loot rolls this way: Solis crit tables, FCS1 "Loot Roll: !roll none,none,none,none,none,club,buckler". Today each list needs a `!table def` before anyone can roll it (D11). In formulas, `pick` and `roll_table` already do it.
+  - From the combat systems:
+    - `!roll 6x none, none, crit` for six rolls at once (#57); `keep=best` for FCS1 Calculated Strikes ("roll twice, and if one of the rolls is a crit, pick that"), sharing #253's adjustments.
+- **#218 `tile_place(template, x, y, map=None)`.**
+  - The formula twin of `!tile place`, for attacks that leave a tile behind: Solis Flame Throw places a fire tile when the attack is dodged; FCS1 Scorch Ground sets up to five tiles on fire. `tile_template_of(x, y)` reads it back.
+  - Today a formula writes the internal `_template` key with `tile_set` (D10). It works (`solis1.out`: a tree turned into fire from its own turn hook) and relies on an implementation detail.
+- **#219 Directional patterns.**
+  - `cells_in_pattern(x, y, dir, offsets)`: offsets written for a unit facing `right` are rotated to `up`, `down` and `left`, clipped to the map and charged to `formula_cell_limit` like the other builders. Example: `[[1,-1],[1,0],[1,1],[2,-1],[2,0],[2,1]]` is FCS1 Frost Blast, a rectangle 2 deep and 3 wide in front of the caster. `!map preview pattern` draws it.
+  - Open choice: diagonal directions. Rotating a grid shape by 45° isn't exact, so a pattern could carry its own diagonal list, or diagonals could be refused.
+  - The game need: FCS1's directional area attacks (docs/combat_systems_fit.md §0.2). Removes D9.
+- **#220 Move context in block conditions.**
+  - Bindings `final` (true on the last cell of a walk and on the landing cell of a teleport) and `move_kind` (`walk`, `tp`, `push`, `pull`, `swap`) in tile, zone and corpse block conditions.
+  - FCS1's "units can walk over corpses but not stop on one" becomes `corpse_block_condition = final`. A moves-per-turn limit becomes `move_kind == 'walk' and moves_left <= 0`, which leaves knockback alone with no `current_id()` trick (the D3 trap).
+  - The `block_<kind>` rules stay as the coarse switches.
+- **#221 Default passives on existing units.**
+  - `!defpassive add ... existing` (or `!match sync passives`) also puts the new default passive on the units already in the system's matches; `!defpassive remove ... existing` takes it off them.
+  - Today a default passive reaches only units created afterwards (`fcs1.out`), which surprises a GM who builds a system while units are already placed (D14).
+- **#222 Status details for players.**
+  - `!ent info` lists each status with level and duration (`burn ×2, 3 turns`).
+  - A `{statuses}` placeholder renders them in `entity_line_format` through a `status_line_format` rule (`{level}× {name} ({duration})`), with a per-definition override in the status's `display` data, so Solis burns can show each level's timer.
+  - Hidden statuses (#115) stay out of both.
+  - The game need: players of all three systems track status timers on their units (L6).
+  - From the combat systems:
+    - FCS1 shows end turns ("lvl 1 burn until turn x"): a `{until_turn}` placeholder computed from the duration and the turn clock.
+    - FCS1 charge progress ("charging Heavy Shot, damage: 25/100") from #235's damage count.
+    - FCS1 Umbral Rot's lost max hp shown as "(−30 max hp)": any field of the instance's data can be a placeholder.
+- **#223 `summoner` binding in `on_entity_spawned`.**
+  - The unit (or `None`) whose action, passive or tick summoned the new one. The engine also stores it on the summon (`summoned_by`, a tracked reference under #209), so rules can read it later:
+    - "dismiss my summons when I die";
+    - "an Alpha Wolf may have two wolves at a time" (NCS);
+    - "a Bandit Ringleader can't summon while its last summon lives" (FCS1).
+  - Removes L10; possession can then make a possessed unit's summons possessed in a hook (Solis, FCS1).
+- **#224 Extra turns.**
+  - `grant_turn(eid)` (and `!turn grant <eid>`) inserts one extra turn for `eid` right after the current one. An option says whether its turn-start passives and status ticks run (default: passives yes, ticks no, so a bonus turn doesn't burn twice). Under ATB the unit acts next and its charge bar is untouched.
+  - The game need: NCS's planned Agility Potion ("gain an instant bonus turn").
+  - Today `turn set` restarts the turn and re-runs everything (L11).
+- **#225 `schedule_on` counting skipped turns.**
+  - `schedule_on(eid, delay, body, name, count_skipped=False)`, or a rule. With it on, a stunned or charging unit's delayed effect counts the turns it skips, as status ticks already do.
+  - Today the delay waits for turns the unit actually starts (L12), so a charged action built from a `skips_turn` status plus `schedule_on` never fires (`fcs1b.out`: still charging after four rounds).
+- **#226 Units without positions (roster mode).**
+  - `!ent add <id> <name> <hp>` with no `x y` places the unit on the first free cell of its side's row; `!map mode roster` makes `!map` and the Discord boards show the `!list` roster.
+  - For NCS-style fights with no map. The grid stays underneath (the square grid is fundamental), so distance-based functions keep working if a GM wants front and back rows.
+- **#228 Declared action arguments with defaults.**
+  - An action may carry `args: {crit: 'no', hits: 1}`. Missing ones take the default, unknown ones are refused with the list, `!action info` shows them, and Tab completion offers them; `arg(name, default)` reads one in a body.
+  - Today a missing `args.crit` raises (`out_test.out`) and a misspelled key is accepted silently (D12).
+- **#229 Shared turn for a rider and its mount.**
+  - A slot option `shared_turn`: the rider runs on the vehicle's turn the way an attached body part does (`_attached_tick_parts`), so its statuses tick and its turn passives run on the vehicle's turn, and the vehicle sorts at the pair's higher initiative.
+  - The game need: FCS1's mount rules (the rider and mount "share turns" and use "the highest awareness between the units"). Removes D13.
+- **#232 Statuses that grant status resistance and immunity.**
+  - A status instance's data may carry `status_resist` and `status_immune`, read the way its `modifiers` already are.
+  - The game need: temporary protection given by a potion or spell.
+    - FCS1 Antidote: "removes 2 levels of poison, and applies lvl1 poison resistance for 2 turns".
+    - FCS1 Insulating Potion: the same for burn and freeze.
+    - NCS "<status name> Immunity": "immunity to a certain status, but only while this status is active".
+  - Today resistance and immunity are gathered only from var roots, the innate vars plus `status_resist_sources` (logic.py:14493-14545), while modifiers already come from status instances too. A GM has to copy the record into a var when the status arrives and delete it when it leaves.
+- **#233 Opt-in automatic durations.**
+  - A definition field `duration_mode: manual | auto`. With `auto`, the engine lowers `duration` by one at the definition's tick time, after its tick formula runs, and removes the status at 0. `manual` stays the default, as the user decided when status ticks shipped (scenarios 390-391).
+  - `expires: next_turn_start`, for effects that last "until your next turn":
+    - FCS1 Rest (double damage taken, no blocking);
+    - Solis Take Cover (immune to ranged);
+    - NCS Bulwark (blocks everything) and NCS Rest (no reactions);
+    - Solis's crit penalty (a critted hunter loses several actions on their next turn).
+  - Every status in all three systems counts down the same way; each tick in the prototypes repeats the decrement and the removal.
+- **#235 Statuses that break on damage.**
+  - `removed_on_damage: true`: Sleep (all three systems; the turn is skipped, or spent resting in FCS1 and NCS) and Solis Shutdown last until the unit takes any damage.
+  - `break_at_damage: N` counts the damage taken while the status is active and removes it past N:
+    - FCS1 charged actions: "dealing 100 damage will cancel this action", progress shown as "damage: 25/100";
+    - FCS1 Umbral Hound Grab: "deal 400 damage or more in one turn to force the hound to drop them";
+    - FCS1 Focus Arcana: "if damaged, cancel this action".
+  - "Damage" is an hp decrease, or the GM names the var (`damage_var`).
+  - Today this is an hp var hook per status, filtered by status name (`ncs.txt` sleep, `fcs1b.txt` charging).
+- **#236 Short names for item actions.**
+  - `!action hero potion.use` (the item's container name plus the action name) and `!action hero use potion` both reach `inventory.potion.actions.use`.
+  - Today two items that both have an action called `use` make `!action hero use` ask for the full path, `inventory.potion.actions.use`, and `inventory.potion.use` is refused (`dupact.out`). Items in all three systems share action names (use, attack, block); the groups' old bot had `!use <item>`.
+- **#237 Explicit repeat counts in list targets.**
+  - `!action hero light gob*2`: a repeat asked for on purpose, kept apart from an accidental duplicate, which stays merged as the user decided (action.py:915).
+  - The game need: attacks that hit the same target several times in one action. NCS light attacks hit twice and "can only hit the same target"; FCS1's Repeater Crossbow "can be used multiple times (including on different targets)", and its Machine Crossbow up to five times.
+  - Today the action takes a count argument (`hits=2` in `ncs.txt`) and loops itself.
+- **#238 Requirement previews for players.**
+  - `!action hu1 melee ho1 check` reports what the action would refuse on (range, cost, cooldown, a forbidding status, not the unit's turn) and changes nothing.
+  - It never reports outcomes: `!dry` restores the RNG position, so a full preview would show the roll that will actually happen, and a player could preview until the crit comes up. Outcome previews stay with hosts (#230).
+- **#241 Fleeing as a state.**
+  - `flee(eid)` takes a unit out of play into the match's fled list (kept for the report, able to come back), and fires `on_entity_fled`.
+  - A rule `off_map_moves: refuse | flee`: with `flee`, a walk off the map's edge makes the unit flee. FCS1: "units can move off the map to flee the match". Solis: a unit "can choose to flee from combat if they are standing next to an edge of the map".
+  - Today a walk off the edge is refused ("(1,0) outside 6x3", `names.out`), and the flee action in `solis2.txt` deletes the unit, so nothing remembers that it fled.
+- **#242 Size scale.**
+  - A rule `size_scale` (an ordered list: small, medium, large, huge, colossal) with `size_var`, and functions `size_rank(eid)`, `size_at_most(eid, 'medium')`, `size_compare(a, b)`.
+  - The game need: all three systems test "medium or smaller" and "large or above":
+    - kicks pushing small targets further;
+    - launches and knockbacks that affect medium-or-smaller units;
+    - disorients limited by size;
+    - FCS1 Insect Killer (instakills small targets);
+    - Solis trees that large creatures trample.
+  - Today each test repeats `index_of([...], var_get(t, 'size'))` with the whole list typed out.
+  - Open choice: whether size can also follow from the footprint.
+- **#243 Per-turn scratch vars.**
+  - A var root (rule `turn_scratch_root`, default `this_turn`) emptied at the start of each of the unit's turns, after being copied to `last_turn`; `this_round` is emptied at round start.
+  - The game need: rules that remember something until the end of the turn.
+    - "Moved this turn", "already used this free action".
+    - FCS1 Lance: count the tiles moved toward the target this turn.
+    - FCS1 crossbows: "cannot load and sprint on the same turn"; Bat Form: "can't be used on the same turn as sprint".
+    - Solis Take Cover: "can't be done two turns in a row", which reads `last_turn`.
+  - Today each flag needs its own reset in a turn-start passive (D3). This covers much of D3 before #24 lands.
+- **#244 Visible initiative roll-offs.**
+  - `turnorder_tiebreaker roll`: ties are broken by a die roll shown in `!turn` ("Hunter1 and Hopper2 tied at 30: 14 against 6").
+  - The game need: Solis duels ("they must each do a !roll 20, and whoever rolls higher takes priority"); FCS1 and NCS ("use !roll to determine who goes first"). Today `random_stable` breaks ties silently.
+- **#245 Move take-back.**
+  - A player may undo their own last move (`!undo move`) while no other command has run since and nothing random happened during the move, so a misclick on Discord costs nothing (as in Battle for Wesnoth).
+  - Today undo is a host command over whole commands. Needs #28 to know whose move it was.
+- **#246 Step relation helper.**
+  - `step_relation(eid, x, y, from_eid)` returns `toward`, `away`, `sidestep` or `none` for a step from the unit's cell to (x, y), relative to another unit.
+  - The game need: Solis dodges ("you can't dodge in the direction of the attacking enemy", some attacks "can't be sidestepped" or "can't be dodged backwards") and FCS1 Lance ("only moves towards the target count").
+  - It composes today from two distance comparisons; it is a convenience, under the "simplify only what GMs repeat" rule.
+- **#247 HP change lines.**
+  - A rule `hp_change_message_format` ("{name} takes {amount} damage ({hp}/{max_hp})", plus a heal twin), printed through the same tagged path as the death lines, so a POV that can't see the unit drops it. Empty (the default) prints nothing.
+  - The game need: Solis's rules say "after each hp-affecting action, the host must edit the battlers' hp". Today a write from an action or a tick is silent; only `!ent hp` reports ("Damaged `b` by 3").
+- **#248 Roster after each action or turn.**
+  - A rule `post_roster: never | action | turn` appends a compact roster to the reply: one `entity_line_format` line per unit, or one line for everyone (`roster_compact_format`).
+  - The game need: Solis hosts post "Hawker 1 hp: 100/100, Hunter2 hp: 45/65, …" by hand after every action.
+  - The map boards (`!map autoupdate`) already refresh themselves; the roster has no equivalent.
+- **#250 A new match from a prepared one.**
+  - `!match new <id> <name> <w> <h> from=<prepared>` copies the prepared match's definitions only: no units, round 1, a fresh RNG.
+  - Today `!match clone` is the workaround (D15), and it also copies the units and the round (the test clone had "4 entities, round 2").
+- **#251 Templates with formulas evaluated at spawn.**
+  - A template var may hold `{"__spawn": "50 * level"}`, evaluated once at spawn against the template's other vars and a `level=` given to `!template spawn`.
+  - The game need:
+    - NCS races are written per level: "Hp: 50 * level, Stamina: 50 * level, Awareness: 50 + 10 per level";
+    - FCS1 mounts list a "stat increase per upgrade".
+  - One template per race then covers every level. Today it takes a template per level, or an `on_entity_spawned` passive that knows each race.
+- **#253 Table roll adjustments.**
+  - `!table roll loot remove=none:2` and `table_roll(name, remove={'none': 2})` take entries out of a table (or add them) for one roll; `keep=best` with an order rolls twice and keeps the better result.
+  - The game need, all FCS1:
+    - Accuracy removes one "none" from the crit table per level;
+    - every challenge modifier rewards "remove 2 'none's from enemy loot drops";
+    - Calculated Strikes rolls the crit table twice and keeps a crit.
+  - Today the GM builds the adjusted list in a formula.
+- **#254 Player shortcuts.**
+  - `!me` shows the player's controlled unit, and `!act <action> [target]` runs one of its actions: `!act slash Hopper1` does what `!action hu1 slash ho1` does today.
+  - Needs #28 (who controls what) and works best with #255.
+- **#255 Targets by display name.**
+  - `!action hu1 poke Hopper1` resolves a unique display name when no unit has that id; an ambiguous name lists the ids.
+  - Players see names on the map and in `!list`; today only ids work ("Entity 'Hopper1' not found", `names.out`).
+- **#256 GUI option: keep the picked map.** A GUI setting (a toolbar checkbox, remembered in `local_settings.json`) so a map picked in the GUI's map menu stays shown until changed, as `!map use` does. Today a pick lasts until the next turn change, like a Discord board's map buttons; the user found that fine for now.
 
 ## Medium (a subsystem slice)
 
@@ -104,16 +331,68 @@ for reference.
 - **#20 Vision cones.** A `fog_vision_arc` var combined with facing limits what a unit sees.
 - **#21 Cover primitive.** `cover_between(a, b)` gives the fraction of the line between two units that is obstructed, footprint-aware.
 - **#22 Action cooldowns and charges.** Fields on an action that count uses and turns; the engine refuses the action while on cooldown or out of charges.
+  - See #24's sketch, which covers #22, #23 and #24 together.
 - **#23 Declarative action targeting.** `range`, `requires_los` and `relation` fields on an action, checked before the body runs, with the refusal reason reported.
+  - See #24's sketch, which covers #22, #23 and #24 together.
 - **#24 Action economy.** `turn_resources` pools (actions, bonus actions, movement) refilled at turn start, plus a `cost` field on actions that spends from them.
+  - A sketch written against the combat systems (docs/combat_systems_fit.md):
+    - Action fields:
+      - `kind`: standard, free, reaction, follow_up, charged, combo;
+      - `cost`: `{stamina: 8}`, with `cost_fallback` for "pay the rest in hp" (FCS1 and NCS Lethal Determination, NCS Revenant);
+      - `cooldown` in the owner's own turns;
+      - `uses_per_turn`;
+      - `range` with a metric, `requires_los`, `relation`;
+      - `requires`: a condition with a message (melee against flyers, disarmed, blind);
+      - `charge`: `{turns, cancel_at_damage, release}`.
+    - A `turn_resources` rule (`{"standard": 1, "moves": "var:moves"}`) refilled at turn start:
+      - modifiers can raise a resource (FCS1 and NCS Efficiency: +1 standard action; Solis Agility: +1 move);
+      - cooldowns can carry a modifier (Solis Efficiency: every cooldown 1 turn shorter).
+    - Walking spends `moves` when a rule says so, only on the unit's own turn and only for walks; pushes never do (D3).
+    - The engine checks all of it before the body runs and refuses with the reason ("Hunter1 already used its standard action", "dodge: 2 turns of cooldown left"). `!action list <eid>` marks what is available now.
+    - Charged actions count down on the owner's turns, skipped ones included (D8, L12).
+  - From the combat systems:
+    - Combo groups: several different actions of one combo type in a turn, each at most once (Solis combo actions, e.g. foraging and attack combos).
+    - Follow-ups: `follow_up: {after: [heavy_attack], once_per: trigger}`. NCS Follow Up Strike (one light attack after any melee attack); FCS1 Riposte (an attack at half cost after blocking); FCS1 Unrelenting Assault (attack again after a blocked or dodged attack).
+    - Resource modifiers through the modifier fold:
+      - FCS1 and NCS Efficiency: +1 standard action;
+      - Solis Agility status: +1 standard move;
+      - Solis Slow: −2 sprint speed, and −1 move for units with more than one.
+    - Sprint as a resource exchange: Solis spends the standard action for 2 extra tiles; FCS1 pays stamina per extra tile ("cost 5 stamina per extra tile"). FCS1's "prevents the use of ranged attacks that turn" becomes a `this_turn` flag (#243).
 - **#25 Damage pipeline with interception.** `deal_damage` runs through GM-ordered steps, with `on_damage_taken` / `on_damage_dealt` handlers that can change the amount (shields, resistances, reflection).
+  - From the combat systems:
+    - Damage packets with several parts:
+      - Solis Fire Arrow: "+25% damage, with the added damage being fire damage", one hit with two damage types;
+      - FCS1 hits deal damage and stamina damage together;
+      - NCS has arcana damage.
+    - Conversions between pools as steps:
+      - FCS1 Brittle: stamina damage becomes hp damage;
+      - FCS1 Hollow Bones: a hit's damage grows by its stamina damage;
+      - FCS1 Freeze: stamina damage past 0 becomes hp damage;
+      - NCS Magical Body: stamina effects hit arcana.
+    - `true` damage that skips every step but the last (NCS true damage).
+  - Note: the three systems order their steps differently.
+  - Solis: armor, then weakness, then the resistance status.
+  - FCS1: block, then percentage buffs, then resistance with its own cap.
+  - NCS: block, then resistances up to 50%, then weaknesses.
+  - An ordered list of GM formulas per system fits all three; #216 makes each step readable.
 - **#26 Ready / delay a turn.** `!turn delay <after_eid>` moves the current unit to act after another unit this round.
 - **#27 ATB turn forecast.** `!turn forecast 8` lists the next eight turns; bare `!turn` shows each unit's charge %.
 - **#28 Player-controlled units.** A `controllers` list on a unit; a player's commands on their own unit skip approval.
+  - A sketch written against the combat systems (docs/combat_systems_fit.md):
+    - A `controllers` list per unit (user ids; `!ent control <eid> <@player ...> | clear`). Saved with the unit, stripped from templates and transfers like other identity data.
+    - Gate: a player's command whose unit argument they control skips approval when the command is on a `player_unit_commands` rule list (default: `action`, `ent move`, `ent face`, `mount`). Everything else still queues for approval.
+    - `caller()` in formulas returns the typing user's id (None for the host's CLI); `controls(user, eid)` tests it. An action can then refuse "not your unit" by itself.
+    - Possession: the status's add hook sets `controllers` from its data (#227 `data=`), and the removal hook restores them.
+    - The per-player access overrides that shipped (`@<user id>` keys) remain for whole commands.
+  - From the combat systems:
+    - Temporary control: possession sets the unit's `controllers` for as long as it lasts and restores them on removal.
+    - Summons follow their summoner's controllers (#223). FCS1: "summoned units are controlled by the user"; FCS1 Umbral Clone (a copy of the user, controlled by the user).
+    - A `!ent control` listing for hosts; a spectator role that can read and never act (#190).
 - **#30 ASCII map import.** A pasted text block plus a glyph → tile template (or unit template) legend builds a board.
 - **#31 Prefabs (on hold).** A saved board fragment (units, tiles and zones in a rectangle) stamped into a match at an offset.
 - **#32 Procedural generation.** `noise(x, y, seed)` plus room and cave helpers that write tiles.
 - **#33 Hidden rolls.** `!roll secret ...` shows the result to hosts only.
+  - Note: hidden formula rolls fall out of #215's `say(text, private=True)` for formula rolls; `!roll secret` remains for typed rolls.
 - **#34 Session recap export.** The event log as markdown, filtered by POV, for posting a session summary.
 - **#136 Status-granting zones (auras).**
   - A zone field `grants_status` puts the status on units inside the zone and removes it when they leave.
@@ -129,6 +408,7 @@ for reference.
   - A flyer passes over a ground unit or shares its cell, and block conditions can read the layer.
   - Elevation (#37) is separate: that one is terrain height.
 - **#140 System-wide status definitions, tables and macros.** `!defstatus`, `!deftable` and `!defmacro` give new matches on a system the GM's definitions, the way `!system tile` / `!system func` / `!system alias` now do for their libraries. Inheritance through the system chain comes with it.
+  - Note: this is D15 of docs/combat_systems_fit.md: today a prepared match cloned for each battle stands in for it.
 - **#141 User-defined commands.** `!cmd def <name> <usage> <body>` registers a command with named arguments, an access level and help text that runs an action or macro body. Players type `!attack goblin`, and the usage string feeds the stray-word check and Tab completion.
 - **#143 Team-based turns.** A `turn_mode` rule (`unit` | `team`). On a team's turn any of its units can act; `!turn next` passes to the next side, and hooks fire per side turn and per unit. Wesnoth / XCOM style.
 - **#144 Phase-based rounds.** A `round_phases` list (e.g. move, then act). `!turn next` cycles every unit through phase 1 before phase 2, with phase hooks.
@@ -138,6 +418,15 @@ for reference.
 - **#148 Live combat log channel.** Event-log lines posted as they happen to a channel bound as `log`, filtered by that channel's POV.
 - **#149 Per-unit watchers.** A watcher evaluated for each unit with its own edge state ("the first time any unit drops below 30%", with `self` bound). Today that takes one watcher per unit.
 - **#150 Independent status stacks.** A definition mode where each application is its own instance with its own duration (three bleeds on three timers). Today one instance per name carries a level.
+  - A sketch written against the combat systems (docs/combat_systems_fit.md):
+    - `stack: independent`: each application keeps its own level and timer. `stack_effect` decides what the stacks do together:
+      - `highest`: only the highest level acts, while every level keeps its own duration (Solis);
+      - `sum`: the levels add up;
+      - `each`: each stack ticks on its own (three bleeds on three timers).
+    - Removes D4. `status_get` and #222's display read the effective level and list the stacks.
+  - From the combat systems:
+    - Showing the stacks in #222's status line, in Solis's own format: "(5 lvl1 burn, 2 lvl2 burn)".
+    - Solis Plague and Steelmoss: damage that grows each turn while the stack lives, resets when it expires and is kept when the status is reapplied; a per-stack counter field holds the growth.
 - **#151 Named selectors.** `!selector def enemies "team!=red hp>0"`, usable as `!foreach @enemies ; ...` and as `select('enemies')` in formulas.
 - **#152 Directional armor and coverage** (§8 combat layers). Per-part, per-side armor values and coverage %, with `armor_at(target, part, side)` and a mitigation helper the GM's damage formula calls. Primitives only.
 - **#153 Vehicle follow-ups** (§8). Cover for riders inside a vehicle, a footprint per rider, and shared fuel or initiative between nested vehicles.
@@ -162,12 +451,124 @@ for reference.
 - **#194 Formula-aware Tab completion.** Inside a quoted formula (`!eval "...`, passive bodies, `!func def`) it completes function names, `entity[` ids and var paths.
 - **#195 Revive from a template** (§8). `revive(eid, template=...)` regrows lost parts and restores stats from a template.
 - **#196 Deep-illusion disguise** (§8). Today a disguise changes only what outsiders see. This one also fools their targeting and queries (relation filters, `!find`, `nearest_entity`).
+- **#208 Item-borne passives.**
+  - Passive records inside item data (`equipped.ring.passives.regen = {when, formula, target?, scope?}`) fire as the unit's own passives while the item sits under a `passive_sources` root (default `equipped`; per-unit replace / add vars in the shape of `modifier_sources`). `source` is bound to the item's container, as in an item's action.
+  - Equipping means moving the item into `equipped`, and unequipping ends it. No `!passive add` / `remove` bookkeeping, and a looted or transferred item takes its passive along.
+  - Today modifiers (`modifier_sources`) and actions (`discover_actions` containers) are found in item data, while passives have to be copied onto the unit and taken off again. That breaks "what X does is stored in X" for items.
+  - The game need: FCS1 Paladin Armor ("grants lvl2 regeneration status while worn") and Tournament Armor ("grants lvl2 resistance status while worn").
+  - To settle: var-hook passives inside items (are `target` paths relative to the item?), partial templates (an `axe_common` partial carrying its passive), whether `equipped` stays one root shared with modifiers.
+- **#209 Tracked unit references.**
+  - A rule `unit_ref_paths` (var paths, `*` for any key: `pet, grappling, summoner, minions.*`) names vars that hold unit ids. The engine treats them like its own link fields:
+    - removing the named unit clears the ref, and a list drops the entry;
+    - a clone or copy remaps refs that point inside the copied subtree;
+    - a template save stores them relative to the root, as part ids are;
+    - a transfer strips refs to units left behind.
+  - Probe on 836e3af: `hero.pet = summon(wolf)`, then `remove_entity(wolf)`, then a new, unrelated summon is minted `wolf` again, and `entity[entity[hero].pet].hp` reads the new wolf's 9. `!ent clone hero hero2` copies `pet = 'wolf'` too.
+  - This is CLAUDE.md §5's dangling-relational-id class moved into GM data, where nothing guards it. A smaller first step: a `reuse_unit_ids` rule (off = a match never mints an id it has used before, as `corpse_id_uniqueness` does for corpse ids).
+  - Builds on it: #56 (status source), #138 (tethers), #223 (`summoned_by`), NCS Taunted (the taunter), FCS1 Grab (the carried unit).
+- **#210 One coordinate grammar.**
+  - Commands: every `<x> <y>` slot also takes one word `x,y` or `x,y,map`, and `@point` once #76 exists; `map=` stays.
+  - Formulas: done in pass 46 (the document 2 pass 25 fixes, F21 / L15): every x, y pair takes a coordinate list in the x slot (`[x, y]` / `[x, y, map]`, `formula._coord_lists`), the summons take the map in the slot after the coordinates as `move_entity` and `summon_template` do, and `id_prefix` is keyword-only. Left: making every argument after the coordinates keyword-only (`summon_near(t, [3, 3, 'deck'], radius=2)`).
+  - `!action ... map=<map>` names a location target's map since pass 46 (F22).
+  - No command and no formula function takes arguments after its map slot: commands take `map=` anywhere, the spatial functions take `map` as a keyword, and the placement functions with a positional map slot have it last. So leaving the map out never needs a placeholder.
+- **#211 Hook timing report.**
+  - Each top-level command records the time spent in every passive, watcher, status tick, tile / zone hook and `!func` it ran (runtime-only, the last N commands per match). `!match perf [n]` lists the costliest by total and per-call time; `!owner perf` does the same across servers.
+  - Document 2 timed an 18-deep `!func` recursion at 2.0 s, one `emit` at 5.4 s and a 60 s command (X4, X5). A GM whose bot stalls has no way to see which formula did it.
+  - Pairs with #197: the work counter stops a runaway, this report names it.
+- **#213 Starter systems.**
+  - Two or three ready systems shipped with the bot as data, loadable on any server: status definitions, templates with actions, passives, tables, macros, a demo map.
+  - Solis is a natural first one: its core is already built in `audit/combat/solis1.txt` and `solis2.txt`, and it is the smallest of the three systems.
+  - The engine has no combat or inventory by design, so a new GM starts from an empty system. The scenarios show every piece on its own and none of them as a game. A starter system shows the composition, and doubles as a realistic board for the chaos harnesses.
+  - Shape depends on #162 (system packs) or a bundled `!store load` save, and on #140 (status definitions on systems).
+- **#227 Status application options.**
+  - `status_apply(eid, name, level=None, duration=None, data=None, source=None, cap=None)`, and the same keys on `!status apply`:
+    - `data` is merged into the instance before any add hook runs (L8: possession's new side, the taunter of a Taunted unit);
+    - `source` records who applied it, readable as `status_source(eid, name)` (#56: kill credit for damage over time, "dispel only your own", "the curse ends when the caster dies", NCS Taunted ending with its taunter);
+    - `cap` limits the resulting level for this application only (FCS1 weapons: "inflicts lvl 1 burn, can stack up to lvl 2"; the attack scales the cap by the attacker's damage buffs).
+  - Definition fields:
+    - `cancels: <token>` with `cancel_mode: remove_both | subtract` (Solis: a burn on a frozen unit removes the freeze and doesn't apply; FCS1: burn and freeze subtract levels and the remainder lands);
+    - `resist_mode: level | duration | both` (FCS1: resistance shortens statuses that have no levels).
+  - Removes D7 and most of D16. FCS1's "only on ≥ 1 damage" stays in the GM's attack, where the damage is known.
+  - From the combat systems:
+    - `source` feeds #239's kill credit for damage over time.
+    - FCS1 "statuses from attacks only apply if the target takes at least 1 point of damage" as an `on_damage_only` flag that the GM's damage step reads.
+- **#230 Balance simulator.**
+  - `!sim <n> <command ...>` runs the command n times on throwaway copies of the match (the `!dry` machinery, each run from a different RNG position) and reports what changed:
+    - per var, mean / min / max and how often it changed (`ho1.hp: −15 ×80%, −23 ×10%, −30 ×10%; mean −17`);
+    - statuses applied;
+    - units killed.
+  - For designing combat systems: a spear against a machine's armor, a crit table's real rate, whether a boss survives three rounds of a party's best attacks.
+  - Cost follows n × the command; an owner limit caps n, and the #197 work counter applies per run. Hosts only, refused inside batches like `!dry`.
+  - From the combat systems:
+    - Scripted duels: each side runs a fixed GM macro every turn until a condition holds (`until="match_over()"`), n times, reporting win rates and turn counts. The macros decide everything and the engine picks nothing, so there is no AI.
+    - `seed=` for reproducible runs, to compare two versions of a weapon.
+- **#231 Rules handbook export.**
+  - `!match handbook [file]` / `!system handbook <name> [file]` writes a Markdown file to the saves folder (or posts it in parts):
+    - status definitions with a `description` data field, levels, ticks and stacking in words;
+    - actions on templates with their descriptions, costs and ranges;
+    - tables;
+    - the rules that differ from the defaults.
+  - The user's groups keep their rules as documents (like the three evaluated here) and implement them by hand; this shows the bot's actual version next to the document and keeps the two in step.
+  - Reuses #202's function table for formulas it quotes.
+- **#234 Action tags, with statuses that forbid or protect.**
+  - Actions carry `tags` (melee, ranged, spell, rest, sprint, consumable, reaction, light, heavy, …).
+  - A status definition lists `forbids: [ranged, sprint]`: the bearer can't use actions with those tags, and the refusal names the status ("Blind: you can't use ranged actions").
+  - A status definition lists `protects: [melee]`: actions with those tags can't target the bearer, with an exception formula (`protects_unless: status_has(actor, 'flying')`). Examples:
+    - flying units can't be hit in melee except by other flyers;
+    - Take Cover makes the unit immune to ranged attacks;
+    - NCS Invisible: no direct attacks, area attacks still land;
+    - the FCS1 joke enemy's "executing" status blocks every attack.
+  - Solis alone has a dozen statuses of the forbidding shape:
+    - burn and poison forbid rest;
+    - freeze forbids sprint and rest (and dodge from level 3);
+    - shock forbids rest, dodge and every action with a cooldown;
+    - blind forbids ranged attacks and sprint;
+    - disorientation forbids crit rolls, sprint, dodge and ranged;
+    - rage forbids ranged and rest; fear forbids melee;
+    - immobilize forbids all movement;
+    - a critted hunter can't sprint, rest, heal, take cover or use consumables.
+  - FCS1 and NCS have their own lists. Today each one is a check at the top of every action it touches (D17).
+  - `!action list <eid>` marks each action a status forbids, and why.
+- **#239 Kill credit and damage attribution.**
+  - `on_death` binds `killer`: the unit whose action, reaction or status tick made the lethal write (a tick through the status's source, #227).
+  - The engine keeps a per-match tally of damage dealt and taken per pair of units.
+  - The game need: FCS1 rewards that depend on who killed whom.
+    - A base human gains 40% of their stamina capacity per kill; Bloodthirst adds more.
+    - Executioner refills its user after a kill.
+    - "You only receive rewards for the enemies that actually get killed."
+  - Today `on_death` binds no attacker (`dupact.out`: `attacker=None`). An action can credit itself by checking the target's hp after its hit; a kill by damage over time can't be credited.
+- **#240 Battle report.**
+  - `!match report`, and automatically after `declare_winner`: per unit damage dealt and taken, kills, statuses applied, turns taken, fled or dead.
+  - A GM `report_formula` per unit adds the system's own lines: FCS1 XP (an enemy's XP value scaled by comparing the gear tier with the match tier), FCS1 loot rolls, Solis value points ("fleeing hunters won't get any value points").
+  - Builds on #239 and #241.
+- **#249 Definitions as text.**
+  - `!match export defs` prints a match's definitions (status definitions, global and team passives, functions, tables, tile templates, watchers, macros, aliases) as one JSON block. `!match import defs <json>` loads them into another match, on any server, through the same checks as each command.
+  - This is how `!template import` already moves units between servers, and a step toward #162 system packs without the packaging.
 
 ## Large (arcs of several PRs)
 
 ### Still open
 
 - **#36 Reaction framework.** Interrupts during another unit's turn (block, dodge, counter, opportunity attack), answered through `choose()`. The choice-replay machinery is the groundwork; #137 can trigger it.
+  - A sketch written against the combat systems (docs/combat_systems_fit.md):
+    - In an action body, `offer_reaction(target, payload)` ends the body and stores a pending event on the match: attacker, target, the action, and the payload (`{'damage': 15, 'type': 'blunt', 'kind': 'melee'}`). It is saved, so it survives restarts and follows undo.
+    - Reaction actions carry `kind: reaction`, `reacts_to: [melee, ranged, spell, ...]` and an `available` condition (cooldown, stamina, not asleep). `reacts_for: adjacent_ally` covers FCS1 Protect, and a range covers Counterspell.
+    - The attack's reply names the options: "Hopper1 kicks Hunter1. Hunter1 can `!react hu1 block`, `!react hu1 dodge <x> <y>`, or `!react hu1 take`."
+    - `!react <eid> <reaction> [target] [k=v]` runs the reaction with `pending` bound. The reaction can change the payload (`pending.damage -= 10`) or cancel it (`pending.cancel = True`). Then the attack's `resolve` body runs with `pending` bound, and the attacker's costs are charged there, so a cancel (NCS First Strike) means they are never paid.
+    - With no reaction available, the attack resolves at once. A reaction may offer a reaction of its own, which stacks (NCS Disarming Hook answering a First Strike). `!state` lists the open stack, and `!turn next` warns while it isn't empty.
+    - Every `!react` is an ordinary command, with its own undo step, approval and journal entry. With #28, the defender's player answers without the host.
+  - From the combat systems:
+    - Windows, in the order an attack resolves:
+      - before the hit: NCS First Strike, FCS1 Preemptive Strike, Counterspell, Protect, Emergency Consumable;
+      - on the hit: block, dodge, NCS Smokescreen;
+      - after the hit: NCS Fiery Counter (a Fire Elemental hits back after being hit), FCS1's "One with the Rot" boon (adjacent attackers catch Umbral Rot), FCS1's spiked shield hurting a blocked melee attacker.
+    - Limits:
+      - one reaction per attack (NCS);
+      - one reaction until the unit's own next turn (Solis);
+      - a bypass flag (FCS1 Preemptive Strike "bypasses the reactionary limit").
+      - Modelled as a #24 resource refilled at the reacting unit's turn start.
+    - Redirects: a reaction may change the pending hit's target (FCS1 Protect: swap places with the attacked ally and take the hit at half damage).
+    - Multi-hit attacks offer one reaction per hit (NCS "blocking is done individually per incoming hit").
 - **#37 Elevation.** Per-cell height, high-ground LOS, `height_diff`, and a link to #16's `move_cost`.
 - **#38 Light and darkness.** Light sources with radii, per-cell light levels, darkvision; fog and visibility read them.
 - **#39 Arbitrary and rotating footprints.** L-shaped and other non-rectangular bodies, and bodies that rotate with facing.
@@ -175,6 +576,9 @@ for reference.
 - **#42 Discord interactive layer.** Select menus for `choose()`, action buttons, slash commands, turn pings and timers.
 - **#43 History replay.** Stepping through snapshots on a board, or an animated GIF of a session.
 - **#158 Campaign roster.** Characters stored at the server level, checked into a match and back out with their state (hp, inventory, XP vars). One roster serves a whole campaign of matches; it builds on the template library.
+  - From the combat systems:
+    - Levels and rebirth: a character keeps its gear and perks while its race template changes (NCS: "you can switch your race with rebirth"), with #251 recomputing the stats.
+    - Gear tiers per match: FCS1 compares a character's highest item tier with the match tier when computing XP; the roster can record tiers per character.
 - **#159 Per-player fog.** Vision per user: each player sees only what their own units see. Today vision is per team and per channel. Needs #28's controllers, plus DMs or per-player channels.
 - **#160 Simultaneous turns (WEGO).** Players queue orders, and the GM resolves them all at once in an order a rule decides.
 - **#161 Undo tree.** History branches: redoing after a different command keeps both timelines, with `!history branches` to switch. #66 is the small linear version.
@@ -193,6 +597,7 @@ for reference.
 - **#197 Scaling.**
   - Covers the spatial index (#154), diff-based undo snapshots (§8: ~3.5 s per command after a whole-map fill on 500×500) and the per-server CPU work budget (§8).
   - These three stand between the bot and public servers, and they share one measurement harness.
+  - Servers loaded on first use (from the combat-systems review): `open_workspaces` (storage.py:1647) loads every server folder at startup, so startup time and memory grow with every server the bot has ever joined. A server could load on its first command and unload after N idle hours; its state is on disk after every commit.
 - **#198 Play-by-post mode.**
   - Turn deadlines and a ping to the active unit's player (needs #28).
   - A digest of what happened since your last turn (#146).
@@ -202,6 +607,10 @@ for reference.
   - The tkinter GUI connects to the running bot and shows a Discord match with that channel's POV, as a richer client for players.
   - Today it only sees the local workspace.
   - Needs an auth token per user and the same security design as #163.
+- **#252 Derived vars.**
+  - A var declared as a formula (`max_hp := round(apply_mods(self, 'max_hp', 50 * level))`) whose value is computed when it is read.
+  - The game need: NCS multiplies HP bonuses from class, armor and items, and Solis Endurance raises max hp by a percentage. A derived max hp would need no recomputation when gear changes.
+  - Open questions: cycles between derived vars; whether var hooks fire when a derived value changes; how saves and undo store them; the cost per read. This is a larger shift than the rest of the list, since modifiers are pure queries today by design.
 
 ## Suggested groupings
 
@@ -211,3 +620,16 @@ for reference.
 - **Discord table play:** #128, #148, #182, then #28 and #198
 - **Tactical combat:** #16 → #24 → #137 → #36
 - **Scaling before a public rollout:** #177, #178, #197
+
+From the combat-systems review (docs/combat_systems_fit.md):
+
+- **Hosting turn-based combat systems:** #215 → #28 → #36 slice → #24 + #22 + #23 (with #243, #234, #233) → #227 + #232 → #150 → #222 → #220, #224, #225, #229, #235, #217, #218, #219, #228, #221, #226
+- **Status bundle for the three systems:** #233, #234, #235, #232, #227, #150, #222
+- **After the battle:** #239 → #240, #241; #158 with #251
+- **Discord table comfort:** #247, #248, #254, #255, #244, #245
+- **Behaviour kept in its data:** #200, #208, #201
+- **GM tooling:** #202, #203, #207, #211, #204, #230, #231, #249, #250
+- **Formula ergonomics:** #89, #90, #194, #205, #210, #216, #217, #219, #228
+- **Integrity of GM data:** #209, #210, #223
+- **Before a public rollout:** #177, #178, #197 (+ lazy servers), #206, #214
+- **Onboarding:** #213, #202, #231
