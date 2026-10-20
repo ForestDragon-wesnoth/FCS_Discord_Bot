@@ -13,7 +13,7 @@ to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#179-#181, #183, #186-#188, #40 and #164 (multiple and nested maps, see
+#179-#181, #183, #186-#188, #200, #201, #222, #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), parts of #14.
 
 **Off the list:**
@@ -98,20 +98,6 @@ for reference.
 - **#182 Match threads on Discord.** `!match new ... thread` creates a thread and binds the new match to it.
 - **#184 Trail segment spacing above 1** (§8). `segment_spacing` works only in `path` follow mode today.
 - **#185 Forced and reflected status transfer** (§8). A transfer that ignores resistance and immunity on the destination, and a "reflect" form that bounces a status back at its source.
-- **#200 Status definition hooks.**
-  - `!status hook <name> <on_added|on_removed|on_changed> <formula ...>` stores a program on the status definition. It runs with `self` = the unit carrying the status and the usual status bindings (`status_name`, old and new value), after the global, team and own `on_status_*` passives.
-  - Effects that belong to a status then live in it:
-    - poison's first hit on application;
-    - a stun that leaves a turn of stun immunity when it ends;
-    - a curse that jumps to a neighbour when removed;
-    - Solis Endurance raising max hp on arrival and capping hp on removal.
-  - Today a definition holds one program, `tick` (the `!status` usages, vtt_commands.py:16281). Anything on apply or removal goes into a global `on_status_added` passive branching on `status_name`, so one status's behaviour sits in two places and that passive grows a branch per status (D5). Tile templates and zones already carry their own hooks.
-  - Open choice: whether expiry, dispel and transfer should be told apart (a `removed_by` binding).
-- **#201 Passive priority.**
-  - An optional `priority` on every passive (unit, team, global, default). Within one hook firing, passives run by priority; ties keep today's order (globals, then team, then the unit's own, each in insertion order).
-  - Example of order mattering: armor reduction, then a shield absorbing the rest, then a "last stand" check, where the armor rule is a global passive and the shield an item's passive.
-  - Today that order is fixed in `fire_hook` (logic.py:18107) and `Passive` has no field for it, so such rules have to be merged into one passive to control their order.
-  - The per-passive re-checks that a unit still exists stay as they are.
 - **#202 Formula functions in `!help`.**
   - `!help func <name>` shows the signature, the docstring, and whether the function reads or changes state and can be looped over.
   - `!help find <words>` also searches function names and docstrings; `!help funcs [read|mutating|loopable]` lists them.
@@ -189,15 +175,6 @@ for reference.
 - **#221 Default passives on existing units.**
   - `!defpassive add ... existing` (or `!match sync passives`) also puts the new default passive on the units already in the system's matches; `!defpassive remove ... existing` takes it off them.
   - Today a default passive reaches only units created afterwards (`fcs1.out`), which surprises a GM who builds a system while units are already placed (D14).
-- **#222 Status details for players.**
-  - `!ent info` lists each status with level and duration (`burn ×2, 3 turns`).
-  - A `{statuses}` placeholder renders them in `entity_line_format` through a `status_line_format` rule (`{level}× {name} ({duration})`), with a per-definition override in the status's `display` data, so Solis burns can show each level's timer.
-  - Hidden statuses (#115) stay out of both.
-  - The game need: players of all three systems track status timers on their units (L6).
-  - From the combat systems:
-    - FCS1 shows end turns ("lvl 1 burn until turn x"): a `{until_turn}` placeholder computed from the duration and the turn clock.
-    - FCS1 charge progress ("charging Heavy Shot, damage: 25/100") from #235's damage count.
-    - FCS1 Umbral Rot's lost max hp shown as "(−30 max hp)": any field of the instance's data can be a placeholder.
 - **#223 `summoner` binding in `on_entity_spawned`.**
   - The unit (or `None`) whose action, passive or tick summoned the new one. The engine also stores it on the summon (`summoned_by`, a tracked reference under #209), so rules can read it later:
     - "dismiss my summons when I die";

@@ -3208,6 +3208,10 @@ HOOK_CONTEXT_NAMES: Tuple[str, ...] = (
                         # status_tick_formula evaluation (see
                         # status_tick_when / status_tick_formula rules
                         # and Match.fire_status_tick); None elsewhere.
+    "removed_by",       # on_status_removed passives and a definition's
+                        # on_removed hook: why the status left (expired,
+                        # dispel, transfer, removes, removed); None
+                        # elsewhere.
     "skip_status",      # on_turn_skipped: the status(es) whose skips_turn
                         # cost the unit its turn, sorted and comma-joined
                         # ("stunned" / "frozen, stunned"); None elsewhere.
@@ -5350,7 +5354,8 @@ class FormulaEngine:
                 cur = cur[k]
             cur[keys[-1]] = _own_value(value)
             after = copy.deepcopy(e.status[name])
-            match._emit_status_diff(eid, name, before, after)
+            match.surface_log(match._emit_status_diff(eid, name, before,
+                                                      after))
             self._note_affected(eid)
             # What is stored (a level is held to the definition's max_level).
             inst = e.status.get(name) if eid in match.entities else None
@@ -5385,7 +5390,8 @@ class FormulaEngine:
                     break
                 del chain[i - 1][keys[i - 1]]
             after = copy.deepcopy(match.entities[eid].status.get(name))
-            match._emit_status_diff(eid, name, before, after)
+            match.surface_log(match._emit_status_diff(eid, name, before,
+                                                      after))
             self._note_affected(eid)
             return True
 
@@ -5399,11 +5405,15 @@ class FormulaEngine:
             if name in e.status:
                 return False
             e.status[name] = {}
-            match._emit_status_diff(eid, name, None, {})
+            match.surface_log(match._emit_status_diff(eid, name, None, {}))
             self._note_affected(eid)
             return True
 
         def _status_remove(eid_t: Any, name: Any) -> bool:
+            return _remove_status(eid_t, name, None)
+
+        def _remove_status(eid_t: Any, name: Any, cause: Optional[str]) -> bool:
+            """status_remove with the removal's cause (`removed_by`)."""
             eid = _eid(eid_t)
             if not isinstance(name, str):
                 raise FormulaError("status_remove(eid, name): name must be a string.")
@@ -5414,7 +5424,8 @@ class FormulaEngine:
                 return False
             before = copy.deepcopy(e.status[name])
             del e.status[name]
-            match._emit_status_diff(eid, name, before, None)
+            match.surface_log(match._emit_status_diff(eid, name, before,
+                                                      None, removed_by=cause))
             self._note_affected(eid)
             return True
 
@@ -5594,7 +5605,8 @@ class FormulaEngine:
             if new == int(new):
                 new = int(new)
             if new <= 0:
-                _status_remove(eid_t, name)
+                # A counter run out is an expiry (`removed_by` expired).
+                _remove_status(eid_t, name, "expired")
                 return new
             return _status_set(eid_t, name, field, new)
 

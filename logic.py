@@ -47,6 +47,21 @@ MATCHES_SENT_UNITS: "contextvars.ContextVar[Optional[set]]" = (
 CROSS_MATCH_GUARD: "contextvars.ContextVar[Optional[Any]]" = (
     contextvars.ContextVar("vtt_cross_match_guard", default=None))
 
+# The (unit, status) whose tick formula is running: removing that status
+# from that unit inside its own tick is an expiry (`removed_by` expired).
+STATUS_TICKING: "contextvars.ContextVar[Optional[Tuple[str, str]]]" = (
+    contextvars.ContextVar("vtt_status_ticking", default=None))
+
+# The causes the on_status_removed bindings and a definition's on_removed
+# hook read as `removed_by`.
+STATUS_REMOVAL_CAUSES = ("expired", "dispel", "transfer", "removes",
+                         "removed")
+# A status definition's own hooks (`!status hook`), by the passive hook
+# each one follows.
+STATUS_DEF_HOOKS = {"on_status_added": "on_added",
+                    "on_status_removed": "on_removed",
+                    "on_status_changed": "on_changed"}
+
 # The channel map of the running command (tier 4 of the map hierarchy):
 # a function of a Match giving the map name the command's channel views
 # there. Formulas resolve `map='view'` through it; None outside a command
@@ -895,12 +910,13 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
     },
     "modifier_op_priority": {
-        "default": "add:0,inc%:100,more%:200,set:300,min:400,max:500",
+        "default": "add:500,inc%:400,more%:300,set:200,min:100,max:0",
         "schema": {"type": "str"},
         "desc": (
             "Per-op priority OFFSETS, added to each modifier's own "
-            "`priority` to get its effective priority. Modifiers fold in "
-            "ascending effective priority; same-op modifiers in a tier "
+            "`priority` to get its effective priority. Modifiers fold "
+            "HIGHEST effective priority first (as passives run and shield "
+            "pools drain); same-op modifiers in a tier "
             "combine naturally (add→sum, inc%→sum, more%→product, set→last, "
             "min→floor, max→cap). The defaults reproduce the classic "
             "((base+Σadd)×(1+Σinc%))×∏(1+more%) then set/clamp. Format "
@@ -1826,7 +1842,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "Placeholders: {key} substitutes a value; {?key?}...{/?} renders inner "
             "only if the key is present and truthy. Dotted paths supported: "
             "{inventory.sword.damage}. Built-in keys: id, name, x, y, facing, team, "
-            "initiative, hp, max_hp, status_csv, passives_csv, map (the "
+            "initiative, hp, max_hp, status_csv, statuses (each status with its level and duration, status_line_format), passives_csv, map (the "
             "unit's map), map_shown (the same, but empty while the match has "
             "one map). Any top-level "
             "entity var is also available by name. Use \\n for newlines."
@@ -1847,13 +1863,27 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "(see the roster_glued_parts rule and the `__roster_show` var)."
         ),
     },
+    "status_line_format": {
+        "default": "{name}{?level?} ×{level}{/?}{?duration?} ({duration}){/?}",
+        "schema": {"type": "str"},
+        "desc": (
+            "How one status shows in the `{statuses}` placeholder of "
+            "entity_line_format / entity_info_format / corpse_line_format "
+            "(statuses joined with `, `, by name). Placeholders: {name}, and "
+            "every field of the status instance ({level}, {duration}, any "
+            "custom field such as {lost_max_hp}); {?key?}...{/?} shows a part "
+            "only when the field is set. A status definition's own `display` "
+            "format (`!status display <name> <format>`) replaces this one "
+            "for that status, e.g. a burn that lists each level's timer."
+        ),
+    },
     "entity_info_format": {
         "default": (
             "**{name}** (`{id}`)\\n"
             "HP: {hp}/{max_hp}   Position: ({x},{y}){?map_shown?} on "
             "{map_shown}{/?} facing {facing}"
             "{?team?}   Team: {team}{/?}\\n"
-            "{?status_csv?}Status: {status_csv}\\n{/?}"
+            "{?statuses?}Status: {statuses}\\n{/?}"
             "{?passives_csv?}Passives: {passives_csv}\\n{/?}"
             "{?inventory?}Inventory: {inventory}\\n{/?}"
         ),
@@ -2178,7 +2208,7 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "entity_line_format: {key}, dotted paths, {?key?}...{/?} "
             "conditionals, \\n for newlines. Built-in keys: id, name, "
             "x, y (the AUTHORITATIVE tile coords, NOT the embedded "
-            "snapshot's x/y), facing, hp, max_hp, status_csv, "
+            "snapshot's x/y), facing, hp, max_hp, status_csv, statuses, "
             "passives_csv, died_round, map / map_shown (the corpse's map; "
             "map_shown is empty while the match has one map). Any vars on "
             "the snapshot are "
@@ -4588,6 +4618,20 @@ VAR_HOOKS: Set[str] = {
 PASSIVE_SCOPES: Set[str] = {"exact", "children", "deep"}
 
 
+def checked_priority(v: Any, what: str = "priority") -> Any:
+    """A priority: a finite number (an integral float reads as an int),
+    text holding one included; higher runs or folds first."""
+    if isinstance(v, str):
+        try:
+            v = float(v.strip())
+        except ValueError:
+            raise VTTError(f"{what} must be a number, got {v!r}.")
+    if isinstance(v, bool) or not isinstance(v, (int, float)) \
+            or not math.isfinite(v):
+        raise VTTError(f"{what} must be a finite number, got {v!r}.")
+    return int(v) if float(v).is_integer() else v
+
+
 @dataclass
 class Passive:
     """
@@ -4648,10 +4692,14 @@ class Passive:
     # ignore these fields entirely).
     target: str = ""
     scope: str = "deep"
+    # Order within one hook firing: highest first, across global, team and
+    # own passives (Match._ordered_passives); ties keep that order.
+    priority: float = 0
 
     def __post_init__(self):
         if not isinstance(self.id, str) or not self.id.strip():
             raise VTTError("Passive id must be a non-empty string.")
+        self.priority = checked_priority(self.priority, "Passive priority")
         if self.when not in HOOK_NAMES and not is_event_hook(self.when):
             allowed = ", ".join(sorted(HOOK_NAMES))
             raise VTTError(
@@ -4697,13 +4745,16 @@ class Passive:
         return False  # unreachable given __post_init__ validation
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d = {
             "id": self.id,
             "when": self.when,
             "formula": self.formula,
             "target": self.target,
             "scope": self.scope,
         }
+        if self.priority:
+            d["priority"] = self.priority
+        return d
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "Passive":
@@ -4716,6 +4767,7 @@ class Passive:
             formula=d["formula"],
             target=d.get("target", ""),
             scope=d.get("scope", "deep"),
+            priority=d.get("priority", 0),
         )
 
 
@@ -5165,7 +5217,8 @@ def _path_resolve(root: Any, path: str) -> Any:
     return cur
 
 
-def _run_passive_safely(engine, p: "Passive", ctx, *, target_id: str, is_global: bool) -> str:
+def _run_passive_safely(engine, p: "Passive", ctx, *, target_id: str,
+                        is_global: bool, label: Optional[str] = None) -> str:
     """
     Run a single passive's formula and return a one-line human-readable log
     string. Catches FormulaError (and any other exception, defensively) so one
@@ -5173,9 +5226,12 @@ def _run_passive_safely(engine, p: "Passive", ctx, *, target_id: str, is_global:
     """
     # Lazy import to avoid logic <-> formula import cycle.
     from formula import FormulaError
+    given = label
     label = f"global passive `{p.id}`" if is_global else f"passive `{target_id}.{p.id}`"
-    if is_global:
-        # The fire sites pass is_global for everything _firing_passives
+    if given is not None:
+        label = given
+    elif is_global:
+        # The fire sites pass is_global for everything _ordered_passives
         # yields, which includes TEAM passives — so a team passive used to be
         # logged as "global passive `regen`", sending a GM to `!gpassive
         # list` where it isn't. Name the table it actually lives in.
@@ -10816,7 +10872,8 @@ class Match:
 
         for m in mods:
             m["_eff"] = m["priority"] + offsets.get(m["op"], 0.0)
-        for tier in sorted({m["_eff"] for m in mods}):
+        # Higher priority folds first (the engine-wide priority rule).
+        for tier in sorted({m["_eff"] for m in mods}, reverse=True):
             tier_mods = [m for m in mods if m["_eff"] == tier]
             # Unlisted ops go last in source order (the rule's promise); a
             # set here folded them in the process's hash order.
@@ -14794,7 +14851,8 @@ class Match:
                 continue
             ob = copy.deepcopy(e.status[other])
             del e.status[other]
-            log = log + self._emit_status_diff(eid, other, ob, None)
+            log = log + self._emit_status_diff(eid, other, ob, None,
+                                               removed_by="removes")
         return log
 
     def dispel_statuses(self, eid: str, token: Any,
@@ -14822,7 +14880,8 @@ class Match:
                 continue
             before = copy.deepcopy(e.status[sname])
             del e.status[sname]
-            log += self._emit_status_diff(eid, sname, before, None)
+            log += self._emit_status_diff(eid, sname, before, None,
+                                          removed_by="dispel")
             removed += 1
         return removed, log
 
@@ -14853,7 +14912,8 @@ class Match:
         du = int(du) if isinstance(du, (int, float)) and not isinstance(du, bool) else None
         # Leave the source first (it's moving regardless of whether it sticks).
         del src.status[name]
-        log = self._emit_status_diff(from_eid, name, inst, None)
+        log = self._emit_status_diff(from_eid, name, inst, None,
+                                     removed_by="transfer")
         # The source's on_status_removed hook could have removed the dest.
         if to_eid not in self.entities:
             return False, log
@@ -14957,6 +15017,7 @@ class Match:
                     this=this_id, target=eid,
                     extras={"status_name": sname},
                 )
+                ticking = STATUS_TICKING.set((eid, sname))
                 try:
                     engine.eval_program(src, ctx)
                 except FormulaError as ex:
@@ -14968,12 +15029,15 @@ class Match:
                         eid, f"⚠️ status_tick on `{eid}.{sname}` "
                              f"({when}) CRASHED: "
                              f"{type(ex).__name__}: {ex}"))
+                finally:
+                    STATUS_TICKING.reset(ticking)
         return log
 
     def fire_status_event(
         self, when: str, entity_id: str, status_name: str,
         *, old_value: Optional[Dict[str, Any]] = None,
         new_value: Optional[Dict[str, Any]] = None,
+        removed_by: Optional[str] = None,
     ) -> List[str]:
         """Fire passives matching `when` for a status lifecycle event.
 
@@ -15009,27 +15073,33 @@ class Match:
             "old_value": dict(old_value) if isinstance(old_value, dict) else old_value,
             "new_value": dict(new_value) if isinstance(new_value, dict) else new_value,
             "hook_name": when,
+            "removed_by": removed_by,
         }
         ctx = EvalCtx(this=this_id, target=entity_id, extras=extras)
         log: List[str] = []
-        for p in self._firing_passives(entity_id):
-            if p.when == when:
-                log.append(_run_passive_safely(
-                    engine, p, ctx, target_id=entity_id, is_global=True,
-                ))
         # A global/team handler may have removed the entity (kill/remove);
-        # don't fire its own passives from beyond the grave.
-        if entity_id in self.entities:
-            for p in e.passives.values():
-                if p.when == when:
-                    log.append(_run_passive_safely(
-                        engine, p, ctx, target_id=entity_id, is_global=False,
-                    ))
+        # its own passives don't fire from beyond the grave.
+        self._run_ordered(engine, ctx, entity_id, lambda p: p.when == when,
+                          log)
+        # Then the status definition's own hook (`!status hook`): what a
+        # status does on arrival / removal / change lives in the status.
+        sdef = self.status_definitions.get(status_name)
+        hooks = sdef.get("hooks") if isinstance(sdef, dict) else None
+        src = (hooks.get(STATUS_DEF_HOOKS[when])
+               if isinstance(hooks, dict) else None)
+        if isinstance(src, str) and src.strip() \
+                and entity_id in self.entities:
+            hook = STATUS_DEF_HOOKS[when]
+            log.append(_run_passive_safely(
+                engine, Passive(id=f"{status_name}.{hook}", when=when,
+                                formula=src),
+                ctx, target_id=entity_id, is_global=False,
+                label=f"status `{status_name}` {hook}"))
         return log
 
     def _emit_status_diff(
         self, entity_id: str, status_name: str,
-        before: Any, after: Any,
+        before: Any, after: Any, removed_by: Optional[str] = None,
     ) -> List[str]:
         """Compare a status's data before vs after a mutation and fire
         the right lifecycle event (or none if data is unchanged).
@@ -15044,6 +15114,10 @@ class Match:
           None  {...}      on_status_added
           {...} None       on_status_removed
           {...} {...}      on_status_changed iff before != after
+
+        `removed_by` (a removal's cause, STATUS_REMOVAL_CAUSES) is bound
+        for the removal hooks: the caller's, else `expired` when the status
+        is removed inside its own tick on this unit, else `removed`.
         """
         log: List[str] = []
         if after is not None:
@@ -15060,9 +15134,12 @@ class Match:
             self.log_event("status_removed", entity=entity_id,
                            name=self._entity_name(entity_id),
                            status=status_name)
+            if removed_by is None:
+                removed_by = ("expired" if STATUS_TICKING.get()
+                              == (entity_id, status_name) else "removed")
             log = self.fire_status_event(
                 "on_status_removed", entity_id, status_name,
-                old_value=before, new_value=None,
+                old_value=before, new_value=None, removed_by=removed_by,
             )
         elif before != after:
             log = self.fire_status_event(
@@ -15254,17 +15331,8 @@ class Match:
         # always run.
         with move_hook_level(self.rules, log, self.id, move=True) as fire:
             if fire:
-                for p in self._firing_passives(entity_id):
-                    if p.when == "on_entity_moved":
-                        log.append(_run_passive_safely(
-                            engine, p, ctx, target_id=entity_id,
-                            is_global=True))
-                if entity_id in self.entities:
-                    for p in list(e.passives.values()):
-                        if p.when == "on_entity_moved":
-                            log.append(_run_passive_safely(
-                                engine, p, ctx, target_id=entity_id,
-                                is_global=False))
+                self._run_ordered(engine, ctx, entity_id,
+                                  lambda p: p.when == "on_entity_moved", log)
         # Fog memory: a move can reveal new cells for the mover's team —
         # fold current vision into its explored set (no-op unless memory
         # on). Other entities a passive moved record via their own fires.
@@ -15318,17 +15386,8 @@ class Match:
         log: List[str] = []
         with move_hook_level(self.rules, log, self.id) as fire:
             if fire:
-                for p in self._firing_passives(entity_id):
-                    if p.when == "on_entity_step":
-                        log.append(_run_passive_safely(
-                            engine, p, ctx, target_id=entity_id,
-                            is_global=True))
-                if entity_id in self.entities:
-                    for p in list(e.passives.values()):
-                        if p.when == "on_entity_step":
-                            log.append(_run_passive_safely(
-                                engine, p, ctx, target_id=entity_id,
-                                is_global=False))
+                self._run_ordered(engine, ctx, entity_id,
+                                  lambda p: p.when == "on_entity_step", log)
         # Fog memory: capture cells revealed mid-path, per step (the
         # once-per-move record in fire_entity_moved would miss a stepwise
         # move's intermediate vision).
@@ -15366,16 +15425,8 @@ class Match:
         }
         ctx = EvalCtx(this=this_id, target=actor_id, extras=extras)
         log: List[str] = []
-        for p in self._firing_passives(actor_id):
-            if p.when == "on_action_used":
-                log.append(_run_passive_safely(
-                    engine, p, ctx, target_id=actor_id, is_global=True,
-                ))
-        for p in e.passives.values():
-            if p.when == "on_action_used":
-                log.append(_run_passive_safely(
-                    engine, p, ctx, target_id=actor_id, is_global=False,
-                ))
+        self._run_ordered(engine, ctx, actor_id,
+                          lambda p: p.when == "on_action_used", log)
         return log
 
     def fire_action_used_on_target(
@@ -15412,16 +15463,8 @@ class Match:
         }
         ctx = EvalCtx(this=this_id, target=target_id, extras=extras)
         log: List[str] = []
-        for p in self._firing_passives(target_id):
-            if p.when == "on_action_used_on_target":
-                log.append(_run_passive_safely(
-                    engine, p, ctx, target_id=target_id, is_global=True,
-                ))
-        for p in e.passives.values():
-            if p.when == "on_action_used_on_target":
-                log.append(_run_passive_safely(
-                    engine, p, ctx, target_id=target_id, is_global=False,
-                ))
+        self._run_ordered(engine, ctx, target_id,
+                          lambda p: p.when == "on_action_used_on_target", log)
         return log
 
     def fire_action_failed(
@@ -15461,16 +15504,8 @@ class Match:
         }
         ctx = EvalCtx(this=this_id, target=actor_id, extras=extras)
         log: List[str] = []
-        for p in self._firing_passives(actor_id):
-            if p.when == "on_action_failed":
-                log.append(_run_passive_safely(
-                    engine, p, ctx, target_id=actor_id, is_global=True,
-                ))
-        for p in e.passives.values():
-            if p.when == "on_action_failed":
-                log.append(_run_passive_safely(
-                    engine, p, ctx, target_id=actor_id, is_global=False,
-                ))
+        self._run_ordered(engine, ctx, actor_id,
+                          lambda p: p.when == "on_action_failed", log)
         return log
 
     # ---- summon / entity-template helpers --------------------------------
@@ -18114,16 +18149,42 @@ class Match:
                 log.extend(self.fire_tile_hook(when, cur, x, y, mp))
         return log
 
-    def _firing_passives(self, target_eid):
-        """Passives that fire for an event on `target_eid` (self = target):
-        the match's global passives PLUS the target entity's team passives.
-        Entity-owned passives are iterated separately at each fire site."""
-        yield from self.global_passives.values()
+    def _ordered_passives(self, target_eid: Optional[str], pred, *,
+                          globals_: bool = True, team: bool = True,
+                          own: bool = True) -> List[Tuple["Passive", str]]:
+        """The passives a hook on `target_eid` fires whose `pred` holds, as
+        (passive, kind) pairs, kind `global`, `team` or `own`. Highest
+        `priority` first (the engine-wide rule, as modifiers fold and shield
+        pools drain); ties keep the order they had before priorities: the
+        match's globals, the target's team passives, then its own, each in
+        insertion order. Fire sites skip an `own` passive once the target is
+        gone (ghost firing)."""
+        out: List[Tuple["Passive", str]] = []
+        if globals_:
+            out += [(p, "global") for p in list(self.global_passives.values())
+                    if pred(p)]
         e = self.entities.get(target_eid) if target_eid else None
-        if e is not None and e.team is not None:
-            tp = self.team_passives.get(e.team)
-            if tp:
-                yield from tp.values()
+        if e is not None:
+            if team and e.team is not None:
+                out += [(p, "team") for p in
+                        list((self.team_passives.get(e.team) or {}).values())
+                        if pred(p)]
+            if own:
+                out += [(p, "own") for p in list(e.passives.values())
+                        if pred(p)]
+        out.sort(key=lambda t: -t[0].priority)
+        return out
+
+    def _run_ordered(self, engine: Any, ctx: Any, target_eid: str,
+                     pred, log: List[str], **kinds: bool) -> None:
+        """Run `_ordered_passives(target_eid, pred)` into `log`: self =
+        the target; an own passive is skipped once its unit is gone."""
+        for p, kind in self._ordered_passives(target_eid, pred, **kinds):
+            if kind == "own" and target_eid not in self.entities:
+                continue
+            log.append(_run_passive_safely(
+                engine, p, ctx, target_id=target_eid,
+                is_global=kind != "own"))
 
     def fire_hook(self, when: str, *, target_ids: Optional[List[str]] = None,
                   own_only_targets: Optional[List[str]] = None,
@@ -18163,30 +18224,17 @@ class Match:
             if e is None:
                 continue
             ctx = EvalCtx(this=this_id, target=tid, extras=extras)
-            # Globals first (in insertion order).
-            for p in self._firing_passives(tid):
-                if p.when != when:
-                    continue
-                log.append(_run_passive_safely(engine, p, ctx, target_id=tid, is_global=True))
-            # A global/team passive may have removed this entity; don't fire
-            # its own passives afterward.
-            if tid not in self.entities:
-                continue
-            # Then entity-owned passives.
-            for pid, p in list(e.passives.items()):
-                if p.when != when:
-                    continue
-                log.append(_run_passive_safely(engine, p, ctx, target_id=tid, is_global=False))
+            # Globals, team and own passives by priority; a passive that
+            # removed this entity stops its own passives firing afterward.
+            self._run_ordered(engine, ctx, tid, lambda p: p.when == when, log)
         # Attached parts riding the parent's clock: own passives only.
         for tid in (own_only_targets or ()):
             e = self.entities.get(tid)
             if e is None:
                 continue
             ctx = EvalCtx(this=this_id, target=tid, extras=extras)
-            for pid, p in list(e.passives.items()):
-                if p.when != when:
-                    continue
-                log.append(_run_passive_safely(engine, p, ctx, target_id=tid, is_global=False))
+            self._run_ordered(engine, ctx, tid, lambda p: p.when == when, log,
+                              globals_=False, team=False)
         return log
 
     def emit_event(self, name: str, payload: Optional[Dict[str, Any]] = None,
@@ -18226,30 +18274,22 @@ class Match:
             if target is not None:
                 extras["target"] = target
             gctx = EvalCtx(this=this_id, target=gself, extras=extras)
-            # Global handlers fire once.
-            for p in self.global_passives.values():
-                if p.when == when:
+            tctx = EvalCtx(this=this_id, target=target, extras=extras)
+            # Global handlers fire once (self = the target, else the current
+            # unit); a directed event also fires the target's team and own
+            # handlers (self = target). All by priority; a handler that
+            # removed the target stops its own handlers afterward.
+            for p, kind in self._ordered_passives(
+                    target, lambda p: p.when == when):
+                if kind == "own" and target not in self.entities:
+                    continue
+                if kind == "global":
                     log.append(_run_passive_safely(
                         engine, p, gctx, target_id=gself, is_global=True))
-            # Directed: the target's team + own handlers (self = target).
-            if target is not None:
-                e = self.entities.get(target)
-                if e is not None:
-                    tctx = EvalCtx(this=this_id, target=target, extras=extras)
-                    if e.team is not None:
-                        for p in (self.team_passives.get(e.team) or {}).values():
-                            if p.when == when:
-                                log.append(_run_passive_safely(
-                                    engine, p, tctx, target_id=target,
-                                    is_global=True))
-                    # A team handler may have removed the target; don't fire
-                    # its own handlers afterward.
-                    if target in self.entities:
-                        for p in list(e.passives.values()):
-                            if p.when == when:
-                                log.append(_run_passive_safely(
-                                    engine, p, tctx, target_id=target,
-                                    is_global=False))
+                else:
+                    log.append(_run_passive_safely(
+                        engine, p, tctx, target_id=target,
+                        is_global=kind == "team"))
         finally:
             self._event_stack.pop()
             self._event_depth -= 1
@@ -18342,33 +18382,14 @@ class Match:
 
         log: List[str] = []
 
-        # Helper to fire one passive if it matches the event
-        def _maybe_fire(p: "Passive", is_global: bool) -> None:
-            if not p.matches_event(ev.key):
-                return
-            log.append(_run_passive_safely(
-                engine, p, ctx, target_id=entity_id, is_global=is_global,
-            ))
-
-        # Wave 1: passives subscribed to the exact event kind
-        for p in self._firing_passives(entity_id):
-            if p.when == kind_hook:
-                _maybe_fire(p, is_global=True)
-        # A global/team handler may have removed the entity; don't fire its
-        # own passives from beyond the grave (mirrors fire_status_event).
-        if entity_id in self.entities:
-            for p in e.passives.values():
-                if p.when == kind_hook:
-                    _maybe_fire(p, is_global=False)
-
-        # Wave 2: on_var_written catch-all passives
-        for p in self._firing_passives(entity_id):
-            if p.when == "on_var_written":
-                _maybe_fire(p, is_global=True)
-        if entity_id in self.entities:
-            for p in e.passives.values():
-                if p.when == "on_var_written":
-                    _maybe_fire(p, is_global=False)
+        # Wave 1: passives subscribed to the exact event kind; wave 2: the
+        # on_var_written catch-alls. Each by priority; a handler that
+        # removed the entity stops its own passives (as fire_status_event).
+        for hook in (kind_hook, "on_var_written"):
+            self._run_ordered(
+                engine, ctx, entity_id,
+                lambda p, h=hook: p.when == h and p.matches_event(ev.key),
+                log)
 
         return log
 
@@ -18460,24 +18481,14 @@ class Match:
 
         log: List[str] = []
 
-        def _maybe_fire(p: "Passive", is_global: bool) -> None:
-            if not p.matches_event(path):
-                return
-            log.append(_run_passive_safely(
-                engine, p, ctx, target_id=entity_id, is_global=is_global,
-            ))
-
         # ONLY fire passives subscribed to on_var_write_attempt. We do NOT
         # fire on_var_written here — see comment on _fire_var_attempt.
-        for p in self._firing_passives(entity_id):
-            if p.when == "on_var_write_attempt":
-                _maybe_fire(p, is_global=True)
-        # A global/team handler may have removed the entity mid-fire; don't
-        # fire its own passives from beyond the grave.
-        if entity_id in self.entities:
-            for p in e.passives.values():
-                if p.when == "on_var_write_attempt":
-                    _maybe_fire(p, is_global=False)
+        # By priority; a handler that removed the entity mid-fire stops its
+        # own passives firing from beyond the grave.
+        self._run_ordered(
+            engine, ctx, entity_id,
+            lambda p: (p.when == "on_var_write_attempt"
+                       and p.matches_event(path)), log)
 
         return log
 

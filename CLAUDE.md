@@ -1121,9 +1121,13 @@ hardcodes**.
 
 - **Passives** (`Passive`, `!passive` per unit, `!gpassive` global, `!team
   passive` per team, `default_entity_passives`): `when` is a HOOK_NAMES entry
-  or `event:<name>`. `Match._firing_passives(target)` yields global + the
-  target's team passives; then the unit's own. Before each own-handler loop
-  the unit's existence is re-checked (ghost firing, §5).
+  or `event:<name>`. Every fire site runs `Match._ordered_passives(target,
+  pred)` (via `_run_ordered`): the global, the target's team and its own
+  passives in one list, highest `priority` first (`Passive.priority`, any
+  finite number, default 0; `priority=` on every passive add, `!passive /
+  !gpassive / !team passive / !defpassive priority`), ties in the old order
+  (globals, team, own, each as added). An own passive is skipped once its
+  unit is gone (ghost firing, §5) (882).
 - **Var hooks** (`on_var_*`, `on_var_written`, `on_var_write_attempt`): run
   bottom-up for subtree writes; `self` is the CURRENT-TURN unit, and the
   extras carry changed_key / old_value / new_value / intended_value /
@@ -1231,6 +1235,15 @@ hardcodes**.
   drop/list/info`) describe a status ONCE; an instance resolves behaviour from
   the definition of the same name. Duration decrement and self-removal live
   in the GM's tick formula; the engine forces no decay (390-391).
+- **Definition hooks** (`!status hook <name> <on_added|on_removed|on_changed>
+  [formula]`, the definition's `hooks`; `logic.STATUS_DEF_HOOKS`): run by
+  `fire_status_event` after the on_status_* passives, self = the bearer,
+  while the unit exists. Removal hooks (passives too) bind `removed_by`:
+  `dispel`, `transfer`, `removes` (another status's `removes`), `expired`
+  (a counter reached 0, or the status's own tick removed it:
+  `logic.STATUS_TICKING`) or `removed`; `_emit_status_diff(removed_by=)`
+  carries a caller's cause (884). The formula status functions surface
+  the hook output they set off.
 - **Applying** (`apply_status` / `status_apply` / `!status apply`): stacking
   from the definition's `stack`, else `status_default_stack` (refresh /
   add_level / extend / replace / none). `max_level` is a hard ceiling on
@@ -1274,7 +1287,11 @@ hardcodes**.
   from the source unconditionally and re-applies on the destination through
   apply_status — resistible, consumed on rejection, and the moved instance
   keeps its custom data (`seed_data`) (528-529, 683).
-- **Display:** status sprite overlays (§7.13).
+- **Display:** status sprite overlays (§7.13); the `{statuses}` roster
+  placeholder (`vtt_commands._statuses_text`, in the default
+  entity_info_format): each status through its definition's `display`
+  format (`!status display`) else the `status_line_format` rule, its
+  instance fields as placeholders (885).
 
 ### 7.5 Modifiers (derived stats)
 
@@ -1288,7 +1305,10 @@ hardcodes**.
   `target` / `attacker` / `defender` / `other`.
 - **Fold** (`apply_modifiers`): effective priority = priority + per-op offset
   (`modifier_op_priority`), same-op combine within a tier (add sum, inc% sum,
-  more% product, set last, min floor, max cap), tiers ascending,
+  more% product, set last, min floor, max cap), HIGHEST tier first (the
+  engine-wide priority rule: passives run and shield pools drain highest
+  priority first too; the default op offsets run add 500 … max 0, so the
+  default order stays add, inc%, more%, set, min, max, 407, 883),
   `modifier_op_order` breaks ties; `modifier_stat_caps` clamps the result.
   An unknown op folds as add and `!mod show` flags it.
 - Pure query: the engine never applies modifiers; the GM threads
@@ -2100,7 +2120,8 @@ hardcodes**.
   (`logic.COMMAND_USER`, set in `_run_top`); `command_attribution` (words
   history / log / diff) picks where it shows. `!log [n] type= who= round=
   by=` filters (n ≥ 1; an unknown type is refused) (771, 822).
-- **Roster text:** `entity_line_format`, `entity_info_format`,
+- **Roster text:** `entity_line_format`, `entity_info_format` (`{statuses}`,
+  §7.4),
   `corpse_line_format`, `body_part_entity_line_suffix`,
   `mount_entity_line_suffix`, `show_corpses_in_entity_list`; `{placeholder}`
   templates over vars. Event log: `!log`, `event_log_*` rules, `log()`.

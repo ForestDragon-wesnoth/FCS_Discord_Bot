@@ -15,7 +15,7 @@ from logic import (
 )
 
 # Passive system
-from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES
+from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -2045,6 +2045,27 @@ def _render_template(tmpl: str, ctx: Dict[str, Any]) -> str:
     return _TMPL_PLACE_RE.sub(_place_sub, s)
 
 
+def _statuses_text(m: Optional[Match], status: Dict[str, Any]) -> str:
+    """The `{statuses}` placeholder: each status through its definition's
+    `display` format, else the status_line_format rule, by name and joined
+    with `, ` (a status's fields are its placeholders)."""
+    if not status:
+        return ""
+    default = (m.rules.get("status_line_format") if m is not None else None) \
+        or "{name}"
+    defs = m.status_definitions if m is not None else {}
+    out = []
+    for name in sorted(status, key=str):
+        inst = status[name]
+        ctx: Dict[str, Any] = dict(inst) if isinstance(inst, dict) else {}
+        ctx["name"] = name
+        sdef = defs.get(name)
+        fmt = sdef.get("display") if isinstance(sdef, dict) else None
+        out.append(_render_template(fmt if isinstance(fmt, str) and fmt
+                                    else str(default), ctx))
+    return ", ".join(out)
+
+
 def _entity_template_context(e: Entity,
                              pov_team: Optional[str] = None) -> Dict[str, Any]:
     """Build the placeholder context for an Entity. When `pov_team` is a
@@ -2067,6 +2088,7 @@ def _entity_template_context(e: Entity,
         "hp": e.hp,
         "max_hp": e.max_hp if e.max_hp is not None else e.hp,
         "status_csv": ", ".join(sorted(e.status.keys())) if e.status else "",
+        "statuses": _statuses_text(e._match, e.status),
         "passives_csv": ", ".join(sorted(e.passives.keys())) if e.passives else "",
     }
     # Merge vars — vars win for keys NOT already in the well-known set above.
@@ -2185,6 +2207,8 @@ def _corpse_template_context(
         "hp": ent_vars.get(hp_var, "?"),
         "max_hp": ent_vars.get(max_hp_var, "?"),
         "status_csv": ", ".join(sorted(status.keys())) if status else "",
+        "statuses": _statuses_text(m, status if isinstance(status, dict)
+                                   else {}),
         "passives_csv": ", ".join(sorted(passives.keys())) if passives else "",
         "died_round": corpse.get("died_round", "?"),
     }
@@ -2436,6 +2460,33 @@ def _format_vars_blob(vars_dict: dict) -> str:
     return "**vars**:\n```json\n" + blob + "\n```"
 
 
+def _passive_opts(tokens: List[str]):
+    """The leading `target=` / `scope=` / `priority=` options of a passive
+    add, then the formula's words: (target, scope, priority, words). An
+    option-shaped word that is the last one is the formula (`x=1`), and a
+    mistyped option is refused, since it would otherwise start the formula
+    and fail as a bare "Syntax error"."""
+    target, scope, prio = "", "deep", 0
+    rest = list(tokens)
+    while len(rest) > 1 and re.fullmatch(r"[A-Za-z_]\w*=\S*", rest[0]):
+        key, _, val = rest.pop(0).partition("=")
+        if key == "target":
+            target = val
+        elif key == "scope":
+            scope = val.lower()
+        elif key == "priority":
+            prio = checked_priority(val, "priority=")
+        else:
+            raise VTTError(f"Unknown option `{key}=` (it takes: `target=`, "
+                           f"`scope=`, `priority=`).")
+    return target, scope, prio, rest
+
+
+def _priority_text(p) -> str:
+    """` pri N` for a passive with a priority (0 shows nothing)."""
+    return f" pri {p.priority}" if getattr(p, "priority", 0) else ""
+
+
 def _format_passive_line(label: str, p) -> str:
     """One-line summary of a passive for `!passive list` / `!gpassive list`.
 
@@ -2447,8 +2498,8 @@ def _format_passive_line(label: str, p) -> str:
     from logic import VAR_HOOKS
     if p.when in VAR_HOOKS:
         return (f"- `{label}` ({p.when} on `{p.target or '(root)'}` "
-                f"scope=`{p.scope}`): `{p.formula}`")
-    return f"- `{label}` ({p.when}): `{p.formula}`"
+                f"scope=`{p.scope}`{_priority_text(p)}): `{p.formula}`")
+    return f"- `{label}` ({p.when}{_priority_text(p)}): `{p.formula}`"
 
 
 def _parse_clamp_bound(raw: str) -> Any:
@@ -7259,6 +7310,11 @@ def _match_formula_slots(m: Match):
                frozenset(), False)
     for sname, sdef in sorted(m.status_definitions.items()):
         yield f"status `{sname}` tick", sdef.get("tick"), "exec", frozenset(), False
+        hooks = sdef.get("hooks")
+        for hook, src in sorted((hooks if isinstance(hooks, dict)
+                                 else {}).items()):
+            yield (f"status `{sname}` {hook} hook", src, "exec", frozenset(),
+                   False)
     for tname, tpl in sorted(m.tile_templates.items()):
         for when, src in sorted(tpl.hooks.items()):
             yield (f"tile template `{tname}` hook `{when}`", src, "exec",
@@ -13682,7 +13738,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
     if sub == "add":
         # Syntax:
-        #   !passive add <eid> <pid> <when> [target=PATH] [scope=exact|children|deep] "<formula>"
+        #   !passive add <eid> <pid> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] "<formula>"
         #
         # target/scope are optional and only meaningful for var hooks
         # (on_var_*). For other hooks they're stored but ignored at fire time.
@@ -13700,22 +13756,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # the formula. Named args may appear in any order but must all
         # come before any formula content so simple cases stay terse
         # (`!pas add ... <formula>` without typing target=/scope=).
-        target_val = ""
-        scope_val = "deep"
-        formula_parts: List[str] = []
-        for tok in args[4:]:
-            if not formula_parts and tok.startswith("target="):
-                target_val = tok[len("target="):]
-            elif not formula_parts and tok.startswith("scope="):
-                scope_val = tok[len("scope="):].lower()
-            elif (not formula_parts and re.fullmatch(r"[A-Za-z_]\w*=\S*", tok)
-                    and len(args) > args.index(tok) + 1):
-                # A mistyped option (`scop=exact`) would otherwise become the
-                # start of the formula and fail as a bare "Syntax error".
-                raise VTTError(f"Unknown option `{tok.split('=', 1)[0]}=` "
-                               f"(it takes: `target=`, `scope=`).")
-            else:
-                formula_parts.append(tok)
+        target_val, scope_val, prio, formula_parts = _passive_opts(args[4:])
         # Translate `\n`/`\t` so a multi-line body typed at the CLI
         # (where shlex preserves literal backslash-n) compiles. See
         # formula.normalize_body_source.
@@ -13738,7 +13779,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # surface as a clear error rather than silently storing garbage.
         e.passives[pid] = Passive(
             id=pid, when=when, formula=formula,
-            target=target_val, scope=scope_val,
+            target=target_val, scope=scope_val, priority=prio,
         )
         # Mention target/scope in the ack only for var hooks where they apply
         scope_note = ""
@@ -13746,6 +13787,20 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         if when in VAR_HOOKS:
             scope_note = f" watching `{target_val or '(root)'}` scope=`{scope_val}`"
         return await ctx.send(f"Added passive `{pid}` ({when}){scope_note} to `{eid}`.")
+
+    if sub == "priority":
+        if await return_help_if_not_enough_args(ctx, args, 4, "passive", "priority"):
+            return
+        _check_tail(args, 4, (), "!passive priority <entity_id> <passive_id> <n>")
+        eid = _resolve_eid(m, args[1])
+        if eid not in m.entities:
+            raise NotFound(f"Entity '{eid}' not found.")
+        p = m.entities[eid].passives.get(args[2])
+        if p is None:
+            raise NotFound(f"Passive '{args[2]}' not found on entity '{eid}'.")
+        p.priority = checked_priority(args[3], "priority")
+        return await ctx.send(f"Passive `{eid}.{p.id}` now has priority "
+                              f"{p.priority} (higher runs first).")
 
     if sub in ("remove", "del", "rm"):
         if await return_help_if_not_enough_args(ctx, args, 3, "passive", "remove"):
@@ -13804,6 +13859,8 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(
             f"**Passive `{eid}.{pid}`**\n"
             f"Hook: `{p.when}`\n"
+            + (f"Priority: {p.priority}\n" if p.priority else "") +
+            f""
             f"{scope_block}"
             f"Formula:\n```\n{p.formula}\n```"
         )
@@ -13812,7 +13869,7 @@ async def passive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 registry.annotate_sub(
     "passive", "add",
-    usage='!passive add <entity_id> <passive_id> <when> [target=PATH] [scope=exact|children|deep] "<formula>"',
+    usage='!passive add <entity_id> <passive_id> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] "<formula>"',
     desc=(
         "Attach a passive to an entity. <when> must be one of the hook names "
         "(see `!passive hooks`). Formula is run as a program when the hook fires; "
@@ -13825,6 +13882,14 @@ registry.annotate_sub(
         "(catches every var-event on the entity). Inside a var-hook formula you "
         "also have access to: changed_key, old_value, new_value, hook_name."
     ),
+)
+registry.annotate_sub(
+    "passive", "priority",
+    usage="!passive priority <entity_id> <passive_id> <n>",
+    desc=("Set a passive's priority. Within one hook firing, passives run "
+          "highest priority first, across global, team and the unit's own "
+          "passives; equal priorities keep the order globals, team, own "
+          "(each in the order added). Default 0; any number."),
 )
 registry.annotate_sub(
     "passive", "remove",
@@ -13869,7 +13934,7 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
     if sub == "add":
         # Syntax:
-        #   !gpassive add <pid> <when> [target=PATH] [scope=exact|children|deep] "<formula>"
+        #   !gpassive add <pid> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] "<formula>"
         #
         # See passive_cmd `add` for the rationale on the named-arg parsing.
         # Globals follow the same per-entity iteration model — for var hooks,
@@ -13880,22 +13945,7 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         pid = args[1]
         when = args[2].lower()
 
-        target_val = ""
-        scope_val = "deep"
-        formula_parts: List[str] = []
-        for tok in args[3:]:
-            if not formula_parts and tok.startswith("target="):
-                target_val = tok[len("target="):]
-            elif not formula_parts and tok.startswith("scope="):
-                scope_val = tok[len("scope="):].lower()
-            elif (not formula_parts and re.fullmatch(r"[A-Za-z_]\w*=\S*", tok)
-                    and len(args) > args.index(tok) + 1):
-                # A mistyped option (`scop=exact`) would otherwise become the
-                # start of the formula and fail as a bare "Syntax error".
-                raise VTTError(f"Unknown option `{tok.split('=', 1)[0]}=` "
-                               f"(it takes: `target=`, `scope=`).")
-            else:
-                formula_parts.append(tok)
+        target_val, scope_val, prio, formula_parts = _passive_opts(args[3:])
         # Same `\n`/`\t` normalization as entity-scoped !passive add.
         formula = normalize_body_source(" ".join(formula_parts).strip())
 
@@ -13913,13 +13963,24 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             raise DuplicateId(f"Global passive '{pid}' already exists.")
         m.global_passives[pid] = Passive(
             id=pid, when=when, formula=formula,
-            target=target_val, scope=scope_val,
+            target=target_val, scope=scope_val, priority=prio,
         )
         scope_note = ""
         from logic import VAR_HOOKS
         if when in VAR_HOOKS:
             scope_note = f" watching `{target_val or '(root)'}` scope=`{scope_val}`"
         return await ctx.send(f"Added global passive `{pid}` ({when}){scope_note}.")
+
+    if sub == "priority":
+        if await return_help_if_not_enough_args(ctx, args, 3, "gpassive", "priority"):
+            return
+        _check_tail(args, 3, (), "!gpassive priority <passive_id> <n>")
+        p = m.global_passives.get(args[1])
+        if p is None:
+            raise NotFound(f"Global passive '{args[1]}' not found.")
+        p.priority = checked_priority(args[2], "priority")
+        return await ctx.send(f"Global passive `{p.id}` now has priority "
+                              f"{p.priority} (higher runs first).")
 
     if sub in ("remove", "del", "rm"):
         if await return_help_if_not_enough_args(ctx, args, 2, "gpassive", "remove"):
@@ -13955,6 +14016,8 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(
             f"**Global passive `{pid}`**\n"
             f"Hook: `{p.when}`\n"
+            + (f"Priority: {p.priority}\n" if p.priority else "") +
+            f""
             f"{scope_block}"
             f"Formula:\n```\n{p.formula}\n```"
         )
@@ -13963,7 +14026,7 @@ async def gpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 registry.annotate_sub(
     "gpassive", "add",
-    usage='!gpassive add <passive_id> <when> [target=PATH] [scope=exact|children|deep] "<formula>"',
+    usage='!gpassive add <passive_id> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] "<formula>"',
     desc=(
         "Add a global passive. Fires once per entity in turn order on the given "
         "hook. Inside the formula: `self` = the entity being iterated, "
@@ -13974,6 +14037,12 @@ registry.annotate_sub(
         "deeper), or deep (this path or any descendant). Defaults: target=root, "
         "scope=deep (catches every var-event)."
     ),
+)
+registry.annotate_sub(
+    "gpassive", "priority",
+    usage="!gpassive priority <passive_id> <n>",
+    desc=("Set a global passive's priority (higher runs first within one "
+          "hook firing, across global, team and own passives; default 0)."),
 )
 registry.annotate_sub(
     "gpassive", "remove",
@@ -14292,22 +14361,7 @@ async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         pid = args[1]
         when = args[2].lower()
-        target_val = ""
-        scope_val = "deep"
-        formula_parts: List[str] = []
-        for tok in args[3:]:
-            if not formula_parts and tok.startswith("target="):
-                target_val = tok[len("target="):]
-            elif not formula_parts and tok.startswith("scope="):
-                scope_val = tok[len("scope="):].lower()
-            elif (not formula_parts and re.fullmatch(r"[A-Za-z_]\w*=\S*", tok)
-                    and len(args) > args.index(tok) + 1):
-                # A mistyped option (`scop=exact`) would otherwise become the
-                # start of the formula and fail as a bare "Syntax error".
-                raise VTTError(f"Unknown option `{tok.split('=', 1)[0]}=` "
-                               f"(it takes: `target=`, `scope=`).")
-            else:
-                formula_parts.append(tok)
+        target_val, scope_val, prio, formula_parts = _passive_opts(args[3:])
         formula = normalize_body_source(" ".join(formula_parts).strip())
         if not formula:
             raise VTTError("Passive formula cannot be empty.")
@@ -14320,7 +14374,7 @@ async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         # then store its serialized form on the rule.
         spec = Passive(
             id=pid, when=when, formula=formula,
-            target=target_val, scope=scope_val,
+            target=target_val, scope=scope_val, priority=prio,
         )
         existing = _read_specs()
         if any(isinstance(s, dict) and s.get("id") == pid for s in existing):
@@ -14340,6 +14394,33 @@ async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"match{'es' if refreshed != 1 else ''}]. Applies to entities "
             f"created from now on."
         )
+
+    if sub == "priority":
+        if await return_help_if_not_enough_args(ctx, args, 3, "defpassive", "priority"):
+            return
+        _check_tail(args, 3, (), "!defpassive priority <id> <n>")
+        pid = args[1]
+        prio = checked_priority(args[2], "priority")
+        existing = _read_specs()
+        new_list = []
+        for spec in existing:
+            if isinstance(spec, dict) and spec.get("id") == pid:
+                spec = dict(spec)
+                if prio:
+                    spec["priority"] = prio
+                else:
+                    spec.pop("priority", None)
+            new_list.append(spec)
+        if new_list == existing and not any(
+                isinstance(sp, dict) and sp.get("id") == pid for sp in existing):
+            raise NotFound(
+                f"No default passive '{pid}' in system '{sys_name}'.")
+        refreshed = _write_specs(new_list)
+        return await ctx.send(
+            f"Default passive `{pid}` of system `{sys_name}` now has "
+            f"priority {prio} [refreshed {refreshed} live "
+            f"match{'es' if refreshed != 1 else ''}]. Already-spawned "
+            f"entities keep their copy.")
 
     if sub in ("remove", "del", "rm"):
         if await return_help_if_not_enough_args(ctx, args, 2, "defpassive", "remove"):
@@ -14382,7 +14463,7 @@ async def defpassive_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 registry.annotate_sub(
     "defpassive", "add",
-    usage='!defpassive add <id> <when> [target=PATH] [scope=exact|children|deep] "<formula>"',
+    usage='!defpassive add <id> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] "<formula>"',
     desc=(
         "Add a default passive to the game system: it is copied onto every "
         "entity at creation (add / summon / revive), applied before "
@@ -14391,6 +14472,12 @@ registry.annotate_sub(
         "entity). <when> must be a hook name (see !defpassive hooks). "
         "Removable per-entity afterward; not re-enforced."
     ),
+)
+registry.annotate_sub(
+    "defpassive", "priority",
+    usage="!defpassive priority <id> <n>",
+    desc=("Set a default passive's priority (higher runs first within one "
+          "hook firing; default 0). Reaches entities created from now on."),
 )
 registry.annotate_sub(
     "defpassive", "remove",
@@ -16312,6 +16399,8 @@ for _sub, _usage in (
         ("def", "!status def <name>"),
         ("drop", "!status drop <name>"),
         ("tick", "!status tick <name> <formula ...>"),
+        ("hook", "!status hook <name> <on_added|on_removed|on_changed> [<formula ...>]"),
+        ("display", "!status display <name> [<format ...>]"),
         ("when", "!status when <name> <turn_end|turn_start|round_start|round_end|never>"),
         ("stack", "!status stack <name> <refresh|add_level|extend|replace|none>"),
         ("maxlevel", "!status maxlevel <name> <n>"),
@@ -16333,7 +16422,7 @@ for _sub, _usage in (
 
 @registry.command(
     "status",
-    usage=("!status <def|drop|rename|copy|tick|when|stack|maxlevel|data|tags|"
+    usage=("!status <def|drop|rename|copy|tick|hook|display|when|stack|maxlevel|data|tags|"
            "removes|blockedby|resist|counter|dispel|transfer|sprite|list|info|"
            "apply|force> ..."),
     desc=(
@@ -16358,7 +16447,16 @@ for _sub, _usage in (
         "resistible move). `sprite <name> <key|clear> [opacity=<n>] [tint=<name>] "
         "[layer=<n>]` sets a graphics OVERLAY drawn over afflicted entities "
         "(e.g. a burning overlay; default layer 150, above entities). "
-        "Subcommands: def, drop, rename, copy, tick, when, stack, maxlevel, "
+        "`hook <name> <on_added|on_removed|on_changed> <formula>` stores "
+        "what the status does when it arrives, leaves or changes on a unit "
+        "(self = the bearer; status_name, old_value, new_value and, on "
+        "removal, removed_by: expired / dispel / transfer / removes / "
+        "removed), run after the on_status_* passives; no formula clears "
+        "it. "
+        "`display <name> <format>` sets how the status shows in the "
+        "`{statuses}` roster placeholder (its fields are placeholders, as in "
+        "the status_line_format rule); no format clears it. "
+        "Subcommands: def, drop, rename, copy, tick, hook, display, when, stack, maxlevel, "
         "data, list, info, apply, force, dispel, transfer, sprite."
     ),
 )
@@ -16438,6 +16536,52 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return await ctx.send(f"❌ Invalid tick formula: {ex}")
         m.status_definitions[name]["tick"] = body
         return await ctx.send(f"Set `{name}` tick formula.")
+
+    if sub == "hook":
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "hook"):
+            return
+        name, hook = args[1], args[2].lower()
+        if name not in m.status_definitions:
+            return await ctx.send(f"❌ No status definition `{name}`. Use `!status def {name}` first.")
+        names = sorted(STATUS_DEF_HOOKS.values())
+        if hook not in names:
+            return await ctx.send(f"❌ hook must be one of: "
+                                  f"{', '.join(names)}.")
+        body = normalize_body_source(" ".join(args[3:]).strip())
+        sdef = m.status_definitions[name]
+        hooks = sdef.get("hooks") if isinstance(sdef.get("hooks"), dict) else {}
+        if not body:
+            if hooks.pop(hook, None) is None:
+                return await ctx.send(f"❌ `{name}` has no {hook} hook.")
+            if hooks:
+                sdef["hooks"] = hooks
+            else:
+                sdef.pop("hooks", None)
+            return await ctx.send(f"Cleared `{name}`'s {hook} hook.")
+        try:
+            validate_formula(body, mode="exec",
+                             known_funcs=frozenset(m.formula_functions.keys()))
+        except FormulaError as ex:
+            return await ctx.send(f"❌ Invalid {hook} formula: {ex}")
+        hooks[hook] = body
+        sdef["hooks"] = hooks
+        return await ctx.send(f"Set `{name}`'s {hook} hook (runs after the "
+                              f"on_status_* passives).")
+
+    if sub == "display":
+        if await return_help_if_not_enough_args(ctx, args, 2, "status", "display"):
+            return
+        name = args[1]
+        if name not in m.status_definitions:
+            return await ctx.send(f"❌ No status definition `{name}`.")
+        fmt = " ".join(args[2:]).strip()
+        if not fmt:
+            if m.status_definitions[name].pop("display", None) is None:
+                return await ctx.send(f"❌ `{name}` has no display format.")
+            return await ctx.send(f"Cleared `{name}`'s display format "
+                                  f"(it uses status_line_format).")
+        m.status_definitions[name]["display"] = fmt
+        return await ctx.send(f"`{name}` shows as `{fmt}` in `{{statuses}}`.")
 
     if sub == "when":
         if await return_help_if_not_enough_args(ctx, args, 3, "status", "when"):
@@ -18585,7 +18729,7 @@ for _subs, _usage in (
         (('get',), '!team get <team> <path>'),
         (('list',), '!team list [team]'),
         (('clear',), '!team clear <team> [path]'),
-        (('passive',), '!team passive <add <team> <pid> <when> <formula ...> | remove <team> <pid> | list <team>>')):
+        (('passive',), '!team passive <add <team> <pid> <when> [target=PATH] [scope=exact|children|deep] [priority=<n>] <formula ...> | remove <team> <pid> | list <team> | priority <team> <pid> <n>>')):
     registry.annotate_sub('team', *_subs, usage=_usage)
 
 
@@ -18692,7 +18836,8 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             if await return_help_if_not_enough_args(ctx, args, 6, "team", "passive"):
                 return
             team, pid, when = args[2], args[3], args[4]
-            formula = normalize_body_source(" ".join(args[5:]).strip())
+            target_val, scope_val, prio, words = _passive_opts(args[5:])
+            formula = normalize_body_source(" ".join(words).strip())
             if when not in HOOK_NAMES and not is_event_hook(when):
                 return await ctx.send(
                     f"❌ unknown hook `{when}`. Allowed: "
@@ -18706,8 +18851,22 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             bucket = m.team_passives.setdefault(team, {})
             if pid in bucket:
                 return await ctx.send(f"❌ team `{team}` already has passive `{pid}`.")
-            bucket[pid] = Passive(id=pid, when=when, formula=formula)
+            bucket[pid] = Passive(id=pid, when=when, formula=formula,
+                                  target=target_val, scope=scope_val,
+                                  priority=prio)
             return await ctx.send(f"Added team passive `{pid}` ({when}) to `{team}`.")
+        if psub == "priority":
+            if await return_help_if_not_enough_args(ctx, args, 5, "team", "passive"):
+                return
+            _check_tail(args, 5, (),
+                        "!team passive priority <team> <passive_id> <n>")
+            team, pid = args[2], args[3]
+            p = m.team_passives.get(team, {}).get(pid)
+            if p is None:
+                return await ctx.send(f"❌ team `{team}` has no passive `{pid}`.")
+            p.priority = checked_priority(args[4], "priority")
+            return await ctx.send(f"Team passive `{team}.{pid}` now has "
+                                  f"priority {p.priority} (higher runs first).")
         if psub in ("remove", "del", "rm"):
             if await return_help_if_not_enough_args(ctx, args, 4, "team", "passive"):
                 return
@@ -18724,9 +18883,9 @@ async def team_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 return await ctx.send(f"team `{args[2]}` has no passives.")
             lines = [f"Team passives for `{args[2]}`:"]
             for pid, p in bucket.items():
-                lines.append(f"  `{pid}` ({p.when}): `{p.formula}`")
+                lines.append(_format_passive_line(pid, p))
             return await ctx.send("\n".join(lines))
-        return await ctx.send("❌ Usage: `!team passive <add|remove|list> ...`")
+        return await ctx.send("❌ Usage: `!team passive <add|remove|list|priority> ...`")
 
     return await _help_fallback(ctx, ["team"], args[0] if args else None)
 
