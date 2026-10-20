@@ -28208,3 +28208,115 @@ picks one item, `item:weight` weighting it like a table, with the match's
 RNG. A leading `<n>x` rolls n times (#57), dice too, each dice roll's
 breakdown on its own line; n past the roll_repeat_limit rule (20, owner
 ceiling) is refused.
+
+
+SCENARIO 889 — Formula function reference: !help function, !help functions, !help find
+-------------------------------------------------------------------------------------
+
+!match new fr FR 6 6
+!match use fr
+!help function summon_template
+?? summon_template(
+?? changes the match
+!help function entities_within
+?? reads the match
+?? loopable
+!help function clamp
+?? pure
+!help function summ
+?? ❌
+?? summon
+!help functions changes
+?? summon_template
+?! entities_within
+!help functions loopable
+?? entities_within
+!help functions pure
+?? clamp
+!help functions sideways
+?? ❌
+!func def twice x "x * 2"
+!help function twice
+?? `!func`
+?? x * 2
+!help find nearest
+?? Formula functions
+?? nearest_entity
+?tab "!help function summon_te"
+?? summon_template
+
+Expected: HARNESS-ALLOWS-ERRORS. Every formula function has a reference
+entry built from its signature and docstring: `!help function <name>`
+shows the call form, what it does, whether it reads or changes the match
+(or is pure), whether `for` can loop over it and whether `$()` allows it;
+a misspelled name suggests the close ones. `!help functions [kind]` lists
+them by kind, `!help find` searches function names and docs alongside
+commands and rules, and a match's own `!func` answers `!help function`
+too. Tab completes function names.
+
+
+SCENARIO 890 — Crash log: a 💥 reply names a ref; !server errors / !owner errors read it
+--------------------------------------------------------------------------------------
+
+!match new cl CL 6 6
+!match use cl
+!server errors
+?? No crashes in the error log for this server.
+!as crash boom one
+?? 💥 Unexpected error (ref 1): boom one
+!as crash boom two
+?? (ref 2)
+!server errors
+?? ref 2
+?? ref 1
+?? `!as crash boom one`
+?? RuntimeError: boom one
+!server errors show 1
+?? Match: `cl`
+?? Traceback
+?? File "vtt_commands.py"
+?! /home/
+!server errors 1
+?? ref 2
+?! ref 1
+!as server other
+!as crash elsewhere
+?? (ref 3)
+!server errors
+?? ref 3
+?! ref 1
+!as server local
+!server errors
+?! ref 3
+!server errors show 3
+?? ❌ No crash with ref 3 in the log for this server
+!owner errors
+?? ref 3
+?? ref 1
+?? [`other`]
+!as restart
+!owner errors show 2
+?? boom two
+!as player bob
+!server errors
+?? ❌ Only a server administrator can read that
+!owner errors
+?? ❌ Only the bot's owner
+!as host
+!owner errors clear
+?? Cleared 3 crash(es) from the error log (ref numbers go on from 4).
+!as crash again
+?? (ref 4)
+!server errors 0
+?? ❌ The count must be at least 1
+!server errors show
+?? ❌ Usage: `!server errors show <ref>`.
+
+Expected: HARNESS-ALLOWS-ERRORS. A command that raises an error nothing
+expected (`!as crash` is the test hook) replies `💥 Unexpected error (ref
+N)` and the crash goes into the bot's error log with its time, server,
+match, user, the command as typed, and the traceback (file names only, no
+host folders). `!server errors` (administrators) lists their own server's
+crashes and `show <ref>` adds the traceback; `!owner errors` lists every
+server's, and `clear` empties the log while ref numbers keep counting.
+The log is saved in data/errors.json, so a restart keeps it.

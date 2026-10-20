@@ -39,7 +39,7 @@ _FREE_SLOTS = {
     "args", "tokens", "label", "user", "server", "metric",
     "anchor", "word", "type", "template_text", "winner", "stat", "pid",
     "passive_id", "path", "var.path", "key", "dest_path", "stash_path",
-    "shape args", "cmd1", "cmd2", "file", "seed", "pos", "new_map",
+    "shape args", "cmd1", "cmd2", "file", "seed", "pos", "new_map", "ref",
 }
 # Placeholders that name a unit.
 _ENTITY_SLOTS = {
@@ -394,6 +394,10 @@ def _slot_names(slot: str, root: str, sub: Optional[str],
         return sorted(mgr.systems if slot == "system" else mgr.matches)
     if slot == "rule":
         return sorted(logic.RULES_REGISTRY)
+    if slot == "function":
+        from formula import function_reference
+        own = (set(m.formula_functions) if m is not None else set())
+        return sorted(set(function_reference()) | own)
     if slot == "team":
         return _teams(mgr, ctx)
     if slot in ("when", "hook_name"):
@@ -472,7 +476,7 @@ _SYNC_LIBS = {"aliases": "aliases", "tiles": "tile_templates",
 # Placeholders _slot_names knows a source for (used to tell slots from
 # literal words inside groups).
 _KIND_SLOTS = {"name", "template", "template_ref", "partial", "system", "map",
-               "dest_match", "rule", "team", "when", "hook_name", "dir",
+               "dest_match", "rule", "function", "team", "when", "hook_name", "dir",
                "region", "layers", "cmd", "command", "subcommand", "token",
                "slot", "corpse_id", "key", "path", "sub"}
 

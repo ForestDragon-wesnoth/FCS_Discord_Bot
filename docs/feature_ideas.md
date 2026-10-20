@@ -13,7 +13,7 @@ to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#179-#181, #183, #186-#188, #200, #201, #205, #216, #217, #222, #40 and #164 (multiple and nested maps, see
+#179-#181, #183, #186-#188, #200-#202, #205, #206, #216, #217, #222, #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), parts of #14.
 
 **Off the list:**
@@ -98,11 +98,6 @@ for reference.
 - **#182 Match threads on Discord.** `!match new ... thread` creates a thread and binds the new match to it.
 - **#184 Trail segment spacing above 1** (§8). `segment_spacing` works only in `path` follow mode today.
 - **#185 Forced and reflected status transfer** (§8). A transfer that ignores resistance and immunity on the destination, and a "reflect" form that bounces a status back at its source.
-- **#202 Formula functions in `!help`.**
-  - `!help func <name>` shows the signature, the docstring, and whether the function reads or changes state and can be looped over.
-  - `!help find <words>` also searches function names and docstrings; `!help funcs [read|mutating|loopable]` lists them.
-  - Today 287 functions (235 match-bound, 52 pure) carry docstrings in formula.py, and none of it reaches chat: `!help find summon` returns six commands and four rules that mention summoning, and not `summon()` itself.
-  - #194 (formula Tab completion) can read the same table.
 - **#203 Where-used search.**
   - `!match search <text>` lists every stored formula and body containing the text, with its location: passives at every layer, unit actions, watchers, status ticks, tile and zone hooks and conditions, functions, aliases, macros, formula rules. `system=<name>` searches a system's rules and libraries.
   - The scanner exists: `_match_formula_slots` (vtt_commands.py:7217) already feeds `!system lint` and the "formulas still mention X" notes of the renames.
@@ -112,10 +107,6 @@ for reference.
   - Renames a GM var on every unit, part and corpse of the match, plus `default_entity_vars` and clamp paths, in one undo step. Partial-template markers record the move, and the formulas still naming the old path are listed through #203's scanner, the way `!status rename` lists them.
   - Today statuses, zones, tables, macros and the engine's var-name rules can be renamed (`rename_status`, `_rename_entry`, `rename_unit_vars`). A GM's own var can't: renaming `stance` mid-campaign takes a `!foreach` over every unit plus hand edits of the defaults and clamps.
   - Open choice: templates in the server library get rewritten, or listed.
-- **#206 Crash log for the bot owner.**
-  - Every 💥 (an unexpected exception in a command) is recorded with time, server, match, user, the command as typed and the traceback, in a capped file under `data/` (an owner limit). `!owner errors [n]` lists them; `!owner errors <ref>` shows one.
-  - The 💥 reply carries the reference (`💥 Unexpected error (ref 17): ...`), so a player can quote it in a bug report.
-  - Today a handler exception replies `💥 Unexpected error: <message>` (vtt_commands.py:1049) and the traceback is dropped; only errors raised outside a handler reach the console (discord_commands.py:1228). On public servers, the 💥 line in someone else's channel would be the only trace of a bug.
 - **#207 `!hooks <eid> [when]`.**
   - One listing of everything that runs for a unit, per hook name, in the order the engine runs it: global passives, team passives, own passives, attached parts' own passives, status ticks at their `tick_when`, tile and zone hooks under its footprint, its schedules.
   - `!hooks <eid> fire <when> [key=value ...]` (hosts) fires one hook on the unit now. Inside `!dry` that becomes a test that keeps nothing.

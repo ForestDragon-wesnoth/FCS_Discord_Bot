@@ -47,6 +47,11 @@ MATCHES_SENT_UNITS: "contextvars.ContextVar[Optional[set]]" = (
 CROSS_MATCH_GUARD: "contextvars.ContextVar[Optional[Any]]" = (
     contextvars.ContextVar("vtt_cross_match_guard", default=None))
 
+# What the running command is (CrashLog.record reads it): the crash log, the
+# server, match, user and the command as typed. Set by CommandRegistry._run_top.
+CRASH_CONTEXT: "contextvars.ContextVar[Optional[Dict[str, Any]]]" = (
+    contextvars.ContextVar("vtt_crash_context", default=None))
+
 # The (unit, status) whose tick formula is running: removing that status
 # from that unit inside its own tick is an expiry (`removed_by` expired).
 STATUS_TICKING: "contextvars.ContextVar[Optional[Tuple[str, str]]]" = (
@@ -5258,7 +5263,9 @@ def _run_passive_safely(engine, p: "Passive", ctx, *, target_id: str,
         return f"⚠️ {label} on `{target_id}` ({p.when}) FAILED: {ex}"
     except Exception as ex:
         # Defensive: programmer-error or unexpected bug shouldn't nuke a turn.
-        return f"💥 {label} on `{target_id}` ({p.when}) CRASHED: {type(ex).__name__}: {ex}"
+        ref = crash_ref(f"{label} on `{target_id}` ({p.when})", ex)
+        return (f"💥 {label} on `{target_id}` ({p.when}) CRASHED{ref}: "
+                f"{type(ex).__name__}: {ex}")
 
 
 # -------------------------
@@ -5497,6 +5504,12 @@ OWNER_LIMITS: Dict[str, Dict[str, Any]] = {
                 "every server-wide edit and are copied whole, so a few "
                 "recent copies cover a damaged file without filling the "
                 "server's quota.",
+    },
+    "error_log_entries": {
+        "default": 200, "min": 0, "max": 2000,
+        "desc": "How many crashes (an `Unexpected error (ref N)` reply, "
+                "a passive or hook that CRASHED) the bot keeps in its error log for `!owner "
+                "errors` / `!server errors` (0 = no log).",
     },
     "map_nesting_depth": {
         "default": 4, "min": 1, "max": 32,
@@ -14092,9 +14105,10 @@ class Match:
         except Exception as ex:
             # Defensive: any non-FormulaError exception is a bug, but
             # don't bring down the move on it.
+            ref = crash_ref(f"tile ({x},{y}) hook `{when}` {tag}", ex)
             return [
                 f"⚠️ tile ({x},{y}) hook `{when}` {tag} "
-                f"CRASHED: {type(ex).__name__}: {ex}"
+                f"CRASHED{ref}: {type(ex).__name__}: {ex}"
             ]
         return [f"⚙️ tile ({x},{y}) hook `{when}` fired {tag}"]
 
@@ -14146,9 +14160,10 @@ class Match:
         except FormulaError as ex:
             return [f"⚠️ zone `{name}` hook `{when}` {tag} FAILED: {ex}"]
         except Exception as ex:
+            ref = crash_ref(f"zone `{name}` hook `{when}` {tag}", ex)
             return [
                 f"⚠️ zone `{name}` hook `{when}` {tag} "
-                f"CRASHED: {type(ex).__name__}: {ex}"
+                f"CRASHED{ref}: {type(ex).__name__}: {ex}"
             ]
         return [f"⚙️ zone `{name}` hook `{when}` fired {tag}"]
 
@@ -14382,9 +14397,10 @@ class Match:
         except FormulaError as ex:
             return [f"⚠️ zone `{name}` hook `{when}` {tag} FAILED: {ex}"]
         except Exception as ex:
+            ref = crash_ref(f"zone `{name}` hook `{when}` {tag}", ex)
             return [
                 f"⚠️ zone `{name}` hook `{when}` {tag} "
-                f"CRASHED: {type(ex).__name__}: {ex}"
+                f"CRASHED{ref}: {type(ex).__name__}: {ex}"
             ]
         return [f"⚙️ zone `{name}` hook `{when}` fired {tag}"]
 
@@ -15033,9 +15049,11 @@ class Match:
                         eid, f"⚠️ status_tick on `{eid}.{sname}` "
                              f"({when}) FAILED: {ex}"))
                 except Exception as ex:
+                    ref = crash_ref(f"status_tick on `{eid}.{sname}` "
+                                    f"({when})", ex)
                     log.append(self.unit_line(
                         eid, f"⚠️ status_tick on `{eid}.{sname}` "
-                             f"({when}) CRASHED: "
+                             f"({when}) CRASHED{ref}: "
                              f"{type(ex).__name__}: {ex}"))
                 finally:
                     STATUS_TICKING.reset(ticking)
@@ -22759,6 +22777,96 @@ class MatchManager:
         return notes
 
 
+# A crash entry's traceback and command text are cut to these lengths.
+_CRASH_TRACE_MAX = 6000
+_CRASH_TEXT_MAX = 1000
+_TRACE_FILE_RE = re.compile(r'File "([^"]+)"')
+
+
+class CrashLog:
+    """The bot's error log: one entry per crash (an exception a command
+    handler didn't expect, or a passive / hook formula that CRASHED), with
+    a reference number the 💥 reply names, so a player can quote it and the
+    owner (`!owner errors`) or the server's admins (`!server errors`, their
+    server only) can read the traceback. Ref numbers run bot-wide and keep
+    counting after old entries are cut (owner limit `error_log_entries`).
+    `save` (set by storage) writes the log after each new entry."""
+
+    def __init__(self):
+        self.entries: List[Dict[str, Any]] = []
+        self.next_ref = 1
+        self.save: Any = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"next_ref": self.next_ref,
+                "entries": copy.deepcopy(self.entries)}
+
+    def load(self, data: Dict[str, Any]) -> None:
+        self.entries = [e for e in (data.get("entries") or [])
+                        if isinstance(e, dict)
+                        and isinstance(e.get("ref"), int)]
+        self.next_ref = max([int(data.get("next_ref") or 1)]
+                            + [e["ref"] + 1 for e in self.entries])
+
+    def find(self, ref: int) -> Optional[Dict[str, Any]]:
+        for e in self.entries:
+            if e["ref"] == ref:
+                return e
+        return None
+
+    def record(self, where: str, exc: BaseException,
+               server: Optional[str] = None) -> Optional[int]:
+        """Record the exception being handled (call from its except block)
+        with the running command's context (`server` names the server when
+        no command is running); return its ref, or None when the log keeps
+        nothing."""
+        import traceback
+        limit = owner_limit("error_log_entries")
+        if limit <= 0:
+            return None
+        c = CRASH_CONTEXT.get() or {}
+        trace = "".join(traceback.format_exception(
+            type(exc), exc, exc.__traceback__))
+        # File names only: an admin reading the log mustn't learn the
+        # host's folders.
+        trace = _TRACE_FILE_RE.sub(
+            lambda mt: f'File "{os.path.basename(mt.group(1))}"', trace)
+        if len(trace) > _CRASH_TRACE_MAX:
+            trace = "...\n" + trace[-_CRASH_TRACE_MAX:]
+        ref = self.next_ref
+        self.next_ref += 1
+        self.entries.append({
+            "ref": ref, "at": _utc_now(),
+            "server": c.get("server") or server,
+            "server_name": c.get("server_name"),
+            "match": c.get("match"), "user": c.get("user"),
+            "user_name": c.get("user_name"),
+            "command": (c.get("command") or "")[:_CRASH_TEXT_MAX],
+            "where": where[:_CRASH_TEXT_MAX],
+            "error": f"{type(exc).__name__}: {exc}"[:_CRASH_TEXT_MAX],
+            "trace": trace,
+        })
+        del self.entries[:-limit]
+        if self.save is not None:
+            try:
+                self.save(self)
+            except Exception as ex:  # noqa: BLE001 - logging must not crash
+                print(f"⚠️ The error log couldn't be saved ({ex}).")
+        return ref
+
+
+def crash_ref(where: str, exc: BaseException) -> str:
+    """Record a crash in the running command's error log; return the
+    ` (ref N)` text a reply line adds, or "" when nothing was recorded
+    (no command running, or the log keeps nothing)."""
+    c = CRASH_CONTEXT.get()
+    log = c.get("log") if c else None
+    if log is None:
+        return ""
+    ref = log.record(where, exc)
+    return f" (ref {ref})" if ref is not None else ""
+
+
 class Workspaces:
     """Every server's workspace, one MatchManager each, created on first
     use (a fresh `default` system, no matches). The Discord adapter routes
@@ -22774,6 +22882,8 @@ class Workspaces:
         self.owner_ids: Set[str] = set()
         # The disk mirror (storage.Storage), or None when nothing persists.
         self.storage: Any = None
+        # Every server's crashes (`!owner errors`, `!server errors`).
+        self.crashes = CrashLog()
 
     def get(self, guild_key: Any) -> MatchManager:
         key = str(guild_key)

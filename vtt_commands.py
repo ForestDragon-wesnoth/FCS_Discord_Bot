@@ -15,7 +15,7 @@ from logic import (
 )
 
 # Passive system
-from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES
+from logic import COMMAND_USER, COMMAND_VIEW, COMMAND_POV, check_status_name, JOURNAL_AS_STATE, MATCHES_SENT_UNITS, MAP_LAYERS, map_setting_value, UNIT_LINE_TAG, UNIT_LINE_RE, VAR_NAME_RULES, Passive, checked_priority, STATUS_DEF_HOOKS, HOOK_NAMES, is_event_hook, RESERVED_VAR_PATHS, FORMULA_LOG_SINK, CURRENT_WORKSPACE, TEMPLATE_ROOT, check_template, check_template_name, template_part, template_remove_part, TEMPLATE_MARKER, TEMPLATE_REMOVED, template_refs_of, check_template_refs, strip_markers, invalidate_partial_cache, PARTIAL_CACHE, check_store_path, check_no_value_ancestor, _coerce_vital_value, checked_status_value, write_json_file, write_text_file, json_text, LOCAL_WORKSPACE, rule_max, RULE_CEILINGS, WINDOWS_DEVICE_NAMES, MERGE_RULES, SYSTEM_LIBRARIES, OWNER_LIMITS, owner_limit, CountingRandom, SECRET_RULES, CRASH_CONTEXT, crash_ref
 
 # Clamp system
 from action import INTERACTIVE_ANSWERS as _INTERACTIVE_ANSWERS
@@ -23,7 +23,7 @@ from journal import UNDO_IGNORED, JOURNAL_IGNORED, Journal, journal_limit, journ
 from logic import check_id, default_maps, Map, DEFAULT_MAP_NAME, _own_value, MAP_RESERVED_NAMES, MAP_VAR_NAME_RULES, MAP_SETTING_RULES, new_rng_seed, ClampSpec, GameSystem, SpecialTileTemplate, FormulaFunction, check_formula_function, TILE_HOOK_NAMES, TILE_RESERVED_KEYS
 
 # Formula engine (expression-only $(...) substitution here; full program eval used by !eval)
-from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution
+from formula import resolve_arg_token, FormulaEngine, EvalCtx, FormulaError, validate_program, validate_formula, normalize_body_source, _get_path, _set_path, roll_detail, roll_table_pick, dice_distribution, function_reference
 
 import os
 import difflib
@@ -244,6 +244,9 @@ def _admin_msg(name: str, args: List[str]) -> str:
     sub = args[0].lower() if args else ""
     if (name, sub) in (("server", "audit"), ("system", "history")):
         return _ADMIN_READ_MSG
+    if (name, sub) == ("server", "errors"):
+        return ("❌ Only a server administrator can read that — it shows "
+                "the server's crash reports and the commands behind them.")
     return _ADMIN_MSG
 
 
@@ -278,7 +281,7 @@ def _admin_required(name: str, args: List[str]) -> bool:
     if name in ("store", "run"):
         return True
     if name == "server":
-        return sub in ("wipe", "audit", "backups", "recover")
+        return sub in ("wipe", "audit", "backups", "recover", "errors")
     if name in ("defvar", "defpassive", "gclamp"):
         # System-level defaults; `list` (and the bare usage form) only read.
         if name == "defvar" and sub == "map":
@@ -838,6 +841,14 @@ class CommandRegistry:
             lambda vm: vm.channel_map(view_ctx.channel_key,
                                       _view_pov(view_ctx, vm, [])).name)
         pov_token = COMMAND_POV.set(lambda vm: _view_pov(view_ctx, vm, []))
+        # What a crash during this command records (CrashLog.record).
+        ws = getattr(mgr, "workspaces", None)
+        crash_token = CRASH_CONTEXT.set({
+            "log": getattr(ws, "crashes", None),
+            "server": mgr.guild_key, "server_name": mgr.guild_name,
+            "match": mgr.active_by_channel.get(ctx.channel_key),
+            "user": ctx_user(ctx), "user_name": COMMAND_USER.get(),
+            "command": "!" + shlex.join([name] + [str(a) for a in args])})
         # A typed command (not a nested run: an approval, `!again`) is one
         # `!system undo` step and one `!server audit` entry when it changes
         # anything server-wide. `!as` can swap the whole workspace.
@@ -872,6 +883,7 @@ class CommandRegistry:
         finally:
             if audit_token is not None:
                 _AUDIT_NOTES.reset(audit_token)
+            CRASH_CONTEXT.reset(crash_token)
             COMMAND_VIEW.reset(view_token)
             COMMAND_POV.reset(pov_token)
             COMMAND_USER.reset(user_token)
@@ -1046,7 +1058,8 @@ class CommandRegistry:
         except VTTError as e:
             await ctx.send(f"❌ {e}")
         except Exception as e:
-            await ctx.send(f"💥 Unexpected error: {e}")
+            ref = crash_ref(f"command `{name}`", e)
+            await ctx.send(f"💥 Unexpected error{ref}: {e}")
         finally:
             _JOURNALED_IN.reset(jtoken)
             _JOURNAL_AS_STATE.reset(jstate_token)
@@ -1393,8 +1406,12 @@ async def persist_workspace(mgr: MatchManager, ctx: Optional[ReplyContext]) -> N
         st.write_journals(mgr)
     except Exception as ex:  # noqa: BLE001 - a disk error must not crash a command
         print(f"⚠️ [{mgr.guild_key}] saving to disk failed: {ex!r}")
-        msgs = [f"⚠️ Saving to disk failed ({type(ex).__name__}); the change "
-                f"is kept in memory and saved with the next command."]
+        ref = (ws.crashes.record("saving to disk", ex, server=mgr.guild_key)
+               if ws is not None else None)
+        msgs = [f"⚠️ Saving to disk failed ({type(ex).__name__}"
+                + (f", ref {ref}" if ref is not None else "")
+                + "); the change is kept in memory and saved with the next "
+                  "command."]
     if msgs and ctx is not None:
         await ctx.send("\n".join(msgs))
 
@@ -3695,7 +3712,7 @@ def _mention(user_id: Optional[str]) -> str:
 # ---- as (CLI identity switch for previewing host vs player) -----
 @registry.command(
     "as", access="all",
-    usage="!as host | !as owner | !as player [<name>] | !as view <team|omniscient|clear> | !as server [<key>|local] | !as restart | !as <identity>",
+    usage="!as host | !as owner | !as player [<name>] | !as view <team|omniscient|clear> | !as server [<key>|local] | !as restart | !as crash [<text ...>] | !as <identity>",
     desc=(
         "Switch your previewing identity OR point-of-view. CLI-only "
         "(on Discord both come from your account / the channel, so this "
@@ -3713,7 +3730,9 @@ def _mention(user_id: Optional[str]) -> str:
         "each server is separate; `!as server local` (or bare) returns. "
         "`!as restart` reloads every server from the data folder, as a bot "
         "restart would (unsaved runtime state — pending requests, `!again` — "
-        "is gone). Bare `!as` reports your identity and your effective POV."
+        "is gone). `!as crash [text]` raises an error no command expects "
+        "(a test hook for the error log, `!owner errors`). Bare `!as` "
+        "reports your identity and your effective POV."
     ),
 )
 async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
@@ -3735,6 +3754,10 @@ async def as_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             f"Use `!as host`/`!as player [name]` or `!as view <team>`."
         )
     role = args[0].lower()
+    if role == "crash":
+        # A test hook: an exception no handler expects, so the CLI and the
+        # harness reach the 💥 path and the error log.
+        raise RuntimeError(" ".join(args[1:]) or "a test crash (`!as crash`)")
     if role == "restart":
         restart = getattr(ctx, "restart_workspaces", None)
         if restart is None:
@@ -3860,7 +3883,7 @@ async def whoami_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 
 @registry.command(
     "owner", access="all", snapshot=False,
-    usage="!owner <servers|limit|storage|ceiling> ...",
+    usage="!owner <servers|limit|storage|ceiling|errors> ...",
     desc=(
         "Bot-owner tools (the owner of the bot's Discord application, or its "
         "team). `!owner servers` lists every server workspace; `!owner limit` "
@@ -3893,7 +3916,85 @@ async def owner_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await _owner_storage(ctx, args[1:], mgr)
     if sub == "ceiling":
         return await _owner_ceiling(ctx, args[1:], mgr)
+    if sub == "errors":
+        return await _errors_cmd(ctx, args, mgr, "owner")
     return await _help_fallback(ctx, ["owner"], args[0])
+
+
+def _crash_log(mgr: MatchManager):
+    ws = getattr(mgr, "workspaces", None)
+    log = getattr(ws, "crashes", None)
+    if log is None:
+        raise VTTError("This bot keeps no error log.")
+    return log
+
+
+def _crash_line(e: Dict[str, Any], owner: bool) -> str:
+    where = ""
+    if owner:
+        name = e.get("server_name")
+        key = e.get("server")
+        where = (f" [{name} (`{key}`)]" if name and name != key
+                 else f" [`{key}`]" if key else " [no server]")
+    who = f" by {e['user_name'] or e['user']}" if (e.get("user_name")
+                                                   or e.get("user")) else ""
+    cmd = e.get("command") or e.get("where") or "?"
+    if len(cmd) > 80:
+        cmd = cmd[:77] + "..."
+    err = e.get("error") or "?"
+    if len(err) > 120:
+        err = err[:117] + "..."
+    return f"- **ref {e['ref']}** {e.get('at', '?')}{where}{who}: `{cmd}` → {err}"
+
+
+async def _errors_cmd(ctx, args: List[str], mgr: MatchManager, scope: str):
+    """`!owner errors` (every server) / `!server errors` (this one):
+    `[n]` lists the newest crashes, `show <ref>` one with its traceback,
+    `clear` (owner) empties the log."""
+    root = f"!{scope} errors"
+    owner = scope == "owner"
+    log = _crash_log(mgr)
+    mine = [e for e in log.entries
+            if owner or e.get("server") == mgr.guild_key]
+    if len(args) > 1 and args[1].lower() == "show":
+        _check_tail(args, 3, (), f"{root} show <ref>")
+        if len(args) < 3:
+            raise VTTError(f"Usage: `{root} show <ref>`.")
+        ref = _parse_count(args[2], f"{root} show <ref>")
+        e = next((x for x in mine if x["ref"] == ref), None)
+        if e is None:
+            raise VTTError(
+                f"No crash with ref {ref} in the log"
+                + ("" if owner else " for this server")
+                + " (the oldest are cut past error_log_entries).")
+        trace = (e.get("trace") or "").rstrip().replace("```", "`\u200b`\u200b`")
+        lines = [_crash_line(e, owner),
+                 f"Match: `{e['match']}`" if e.get("match") else "No match.",
+                 f"Command: `{e.get('command') or '(none)'}`",
+                 f"Where: {e.get('where') or '?'}",
+                 "```", trace, "```"]
+        return await ctx.send("\n".join(lines))
+    if len(args) > 1 and args[1].lower() == "clear":
+        if not owner:
+            raise VTTError("Only the bot's owner can clear the error log.")
+        _check_tail(args, 2, (), f"{root} clear")
+        n = len(log.entries)
+        log.entries = []
+        if log.save is not None:
+            log.save(log)
+        return await ctx.send(f"Cleared {n} crash(es) from the error log "
+                              f"(ref numbers go on from {log.next_ref}).")
+    n = _parse_count(args[1], f"{root} [n]") if len(args) > 1 else 10
+    _check_tail(args, 2, (), f"{root} [n]")
+    if not mine:
+        return await ctx.send(
+            "No crashes in the error log" + ("" if owner else
+                                             " for this server") + ".")
+    lines = [f"**Error log** ({len(mine)} kept"
+             + ("" if owner else " for this server")
+             + f", newest first; `{root} show <ref>` for the traceback):"]
+    lines += [_crash_line(e, owner) for e in reversed(mine[-n:])]
+    return await ctx.send("\n".join(lines))
 
 
 # `!server storage` lists this many parts, largest first.
@@ -4058,6 +4159,15 @@ async def _owner_ceiling(ctx, args: List[str], mgr: MatchManager):
                           f"every server.")
 
 
+registry.annotate_sub("owner", "errors",
+                      usage="!owner errors [<n>] | !owner errors show <ref> | !owner errors clear",
+                      desc="The bot's error log, every server: the newest "
+                           "crashes (default 10) with the ref number their "
+                           "`Unexpected error (ref N)` reply named, who ran what, and the error; `show "
+                           "<ref>` adds the traceback; `clear` empties it. A "
+                           "passive or hook that CRASHED is logged too. The "
+                           "log keeps error_log_entries crashes (`!owner "
+                           "ceiling`).")
 registry.annotate_sub("owner", "servers", usage="!owner servers",
                       desc="List every server workspace with its match and "
                            "system counts.")
@@ -4119,7 +4229,7 @@ def _wipe_blockers(mgr: MatchManager, scope: str) -> List[str]:
 
 @registry.command(
     "server", snapshot=False,
-    usage="!server <wipe|storage|audit|backups|recover> ...",
+    usage="!server <wipe|storage|audit|errors|backups|recover> ...",
     desc=(
         "This server's data. `!server storage` shows how much disk it uses "
         "against its limit. `!server wipe matches|all` (server "
@@ -4165,6 +4275,8 @@ async def server_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             lines.append(f"- {e.get('at', '?')}{by}: `{e.get('label', '?')}`")
             lines += [f"  · {x}" for x in e.get("notes") or []]
         return await ctx.send("\n".join(lines))
+    if sub == "errors":
+        return await _errors_cmd(ctx, args, mgr, "server")
     if sub == "backups":
         return await _server_backups(ctx, args, mgr, st)
     if sub == "recover":
@@ -4548,6 +4660,13 @@ registry.annotate_sub("server", "recover",
                            "rebuilt from it either way. Administrators only.")
 registry.annotate_sub("server", "storage", usage="!server storage",
                       desc="This server's disk use against its storage limit, broken down largest first: each match and its undo history, templates, old template versions, saves, sprites, corrupt files and the workspace / systems files.")
+registry.annotate_sub("server", "errors",
+                      usage="!server errors [<n>] | !server errors show <ref>",
+                      desc="This server's crashes from the bot's error log, "
+                           "newest first (default 10): the ref an `Unexpected "
+                           "error (ref N)` reply named, who ran what, the error; `show <ref>` adds "
+                           "the traceback, to pass on to the bot's owner. "
+                           "Administrators only.")
 registry.annotate_sub("server", "audit", usage="!server audit [n]",
                       desc="Who changed what server-wide, newest first (default the last 15): system edits and their undo, default vars / passives / clamps, log formats, `!store save/load`, `!run`, `!history export/import`, wipes and their undo, template saves / edits / renames / deletes, deleted matches. Administrators only; the bot owner sets how many entries a server keeps (audit_log_entries).")
 registry.annotate_sub("server", "wipe",
@@ -19657,6 +19776,12 @@ def _help_find(ctx: ReplyContext, mgr: MatchManager, words: List[str]) -> str:
                              f"{_clip(sm.get('desc'), 110)}"))
     mid = mgr.active_by_channel.get(ctx.channel_key)
     m = mgr.matches.get(mid) if mid is not None else None
+    funcs: List[Tuple[bool, str]] = []
+    for name, ref in function_reference().items():
+        if hit(name, ref["doc"]):
+            funcs.append((name_hit(name),
+                          f"- `{_clip(ref['signature'], 70)}` — "
+                          f"{_clip(_func_doc_body(ref), 110)}"))
     rules: List[Tuple[bool, str]] = []
     for name in sorted(RULES_REGISTRY):
         spec = RULES_REGISTRY[name]
@@ -19666,13 +19791,15 @@ def _help_find(ctx: ReplyContext, mgr: MatchManager, words: List[str]) -> str:
             rules.append((name_hit(name),
                           f"- `{name}` = `{_rule_value_text(ctx, mgr, name, val, 40)}` — "
                           f"{_clip(spec.get('desc'), 110)}"))
-    if not cmds and not rules:
+    if not cmds and not rules and not funcs:
         return (f"🔎 Nothing matches `{' '.join(words)}`. Try fewer or "
                 f"shorter words.")
     where = f"match `{m.id}`" if m is not None else "the defaults (no match here)"
     out = [f"🔎 `{' '.join(words)}` — {len(cmds)} command(s), "
+           f"{len(funcs)} formula function(s), "
            f"{len(rules)} gamerule(s) (rule values: {where})"]
-    for title, rows in (("Commands", cmds), ("Gamerules", rules)):
+    for title, rows in (("Commands", cmds), ("Formula functions", funcs),
+                        ("Gamerules", rules)):
         if not rows:
             continue
         rows = sorted(rows, key=lambda r: not r[0])    # name hits first, stable
@@ -19681,14 +19808,89 @@ def _help_find(ctx: ReplyContext, mgr: MatchManager, words: List[str]) -> str:
         if len(rows) > _HELP_FIND_CAP:
             out.append(f"…and {len(rows) - _HELP_FIND_CAP} more — add a word "
                        f"to narrow the search.")
-    out.append("Full text: `!help <command> [sub]`; all rules: `!system rules`.")
+    out.append("Full text: `!help <command> [sub]`, `!help function <name>`; "
+               "all rules: `!system rules`.")
     return "\n".join(out)
 
 
-@registry.command("help", access="all", usage="!help [command [sub]] | !help find <word> [word ...] | !help rule <rule>", desc="Show command usage. Try `!help ent` or `!help ent move`. `!help find <word> [word ...]` searches every command, subcommand and gamerule (name and description, all words must match) and shows each matching rule's current value on this match. `!help rule <rule>` shows one gamerule in full: description, allowed values, default, its value on this channel's match and the system in the inheritance chain that sets it. (`!help find` alone is the help for the `!find` command.)")
+_FUNC_KINDS = {"reads": "reads the match", "changes": "changes the match "
+               "(not allowed in `$()` arguments)", "pure": "a pure helper "
+               "(no match needed)"}
+
+
+def _func_doc_body(ref: Dict[str, Any]) -> str:
+    """A function's description without the signature its docstring opens
+    with."""
+    doc = ref["doc"]
+    head = doc.split(": ", 1)
+    if len(head) == 2 and head[0].split("(", 1)[0] == ref["signature"].split(
+            "(", 1)[0]:
+        return head[1]
+    return doc or "(no description)"
+
+
+def _help_function(m: Optional[Match], name: str) -> str:
+    """`!help function <name>`: a built-in formula function's signature,
+    description and what it may do, or the match's own `!func`."""
+    ref = function_reference().get(name)
+    if ref is None:
+        fdef = (m.formula_functions.get(name) if m is not None else None)
+        if fdef is not None:
+            return (f"**`{fdef.signature()}`** — a function of this match "
+                    f"(`!func`):\n```\n{fdef.body}\n```")
+        import difflib
+        near = difflib.get_close_matches(name, list(function_reference()),
+                                         n=3, cutoff=0.6)
+        hint = (" Did you mean " + ", ".join(f"`{n}`" for n in near) + "?"
+                if near else " `!help functions` lists them.")
+        return f"❌ No formula function `{name}`.{hint}"
+    notes = [_FUNC_KINDS[ref["kind"]]]
+    if ref["kind"] == "pure" or ref["in_args"]:
+        notes.append("usable in `$()`")
+    if ref["loopable"]:
+        notes.append("loopable (`for x in ...`)")
+    return (f"**`{ref['signature']}`** — {'; '.join(notes)}.\n"
+            f"{_func_doc_body(ref)}")
+
+
+_FUNC_LIST_KINDS = ("reads", "changes", "pure", "loopable")
+
+
+def _help_functions(kind: Optional[str]) -> str:
+    """`!help functions [reads|changes|pure|loopable]`: the built-in formula
+    functions by what they may do."""
+    ref = function_reference()
+    if kind is not None and kind not in _FUNC_LIST_KINDS:
+        raise VTTError(f"`{kind}` — list one of: "
+                       f"{', '.join(_FUNC_LIST_KINDS)} (or none for all).")
+    groups = ([kind] if kind is not None else ["reads", "changes", "pure"])
+    out = [f"**Formula functions** ({len(ref)}; `!help function <name>` "
+           f"for one)"]
+    for g in groups:
+        names = [n for n, r in ref.items()
+                 if (r["loopable"] if g == "loopable" else r["kind"] == g)]
+        title = ("Loopable (`for x in ...`)" if g == "loopable"
+                 else _FUNC_KINDS[g].capitalize())
+        out.append(f"**{title}** ({len(names)}): "
+                   + ", ".join(f"`{n}`" for n in names))
+    return "\n".join(out)
+
+
+@registry.command("help", access="all", usage="!help [command [sub]] | !help find <word> [word ...] | !help rule <rule> | !help function <function> | !help functions [reads|changes|pure|loopable]", desc="Show command usage. Try `!help ent` or `!help ent move`. `!help find <word> [word ...]` searches every command, subcommand, formula function and gamerule (name and description, all words must match) and shows each matching rule's current value on this match. `!help rule <rule>` shows one gamerule in full: description, allowed values, default, its value on this channel's match and the system in the inheritance chain that sets it. `!help function <name>` shows a formula function's signature, description and whether it reads or changes the match, works in `$()` and can be looped over (or one of this match's `!func`s); `!help functions [kind]` lists them. (`!help find` alone is the help for the `!find` command.)")
 async def help_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if len(args) >= 2 and args[0].lower() == "find":
         return await ctx.send(_help_find(ctx, mgr, args[1:]))
+    if args and args[0].lower() == "function":
+        if len(args) < 2:
+            return await ctx.send("❌ Usage: `!help function <function>`.")
+        _check_tail(args, 2, (), "!help function <function>")
+        mid = mgr.active_by_channel.get(ctx.channel_key)
+        return await ctx.send(_help_function(
+            mgr.matches.get(mid) if mid is not None else None, args[1]))
+    if args and args[0].lower() == "functions":
+        _check_tail(args, 2, (), "!help functions [reads|changes|pure|loopable]")
+        return await ctx.send(_help_functions(
+            args[1].lower() if len(args) > 1 else None))
     if len(args) >= 2 and args[0].lower() == "rule":
         _check_tail(args, 2, (), "!help rule <rule>")
         return await ctx.send(_help_rule(ctx, mgr, args[1]))

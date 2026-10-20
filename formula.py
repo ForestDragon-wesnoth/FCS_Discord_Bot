@@ -1104,6 +1104,7 @@ def _num_arg(v: Any, fname: str, argname: str) -> Any:
 
 
 def _sqrt(v: Any) -> float:
+    """sqrt(value): the square root of a number >= 0."""
     _num_arg(v, "sqrt", "value")
     if v < 0:
         raise FormulaError(f"sqrt(value): value must be >= 0, got {v}.")
@@ -1111,11 +1112,13 @@ def _sqrt(v: Any) -> float:
 
 
 def _floor(v: Any) -> int:
+    """floor(value): the largest whole number not above `value`."""
     _num_arg(v, "floor", "value")
     return math.floor(v)
 
 
 def _ceil(v: Any) -> int:
+    """ceil(value): the smallest whole number not below `value`."""
     _num_arg(v, "ceil", "value")
     return math.ceil(v)
 
@@ -1402,6 +1405,7 @@ def _lists_out(fn: Callable) -> Callable:
         return _listify(fn(*a, **k))
     wrapped.__name__ = getattr(fn, "__name__", "fn")
     wrapped.__doc__ = getattr(fn, "__doc__", None)
+    wrapped.__wrapped__ = fn        # !help function reads the signature
     return wrapped
 
 
@@ -1412,6 +1416,8 @@ def _guard_arith(tree: ast.AST) -> ast.AST:
 
 
 def _pow(base: Any, exp: Any) -> Any:
+    """pow(base, exp): base raised to exp (whole numbers stay whole), bounded
+    like `**`."""
     _num_arg(base, "pow", "base")
     _num_arg(exp, "pow", "exp")
     # math via Python's ** so int**int stays int where possible (matches
@@ -4452,6 +4458,8 @@ class FormulaEngine:
                 if cells and mp.name != _default_map_name():
                     res = _tag_cells(res, mp.name)
                 return res
+            _call.__doc__ = getattr(fn, "__doc__", None)
+            _call.__wrapped__ = fn
             return _call
         # The area builders only list (and only visit) cells on the map.
         # Resolved when a builder runs, so a formula that builds no area
@@ -4633,16 +4641,21 @@ class FormulaEngine:
                 )
             return ctx.resolve_who(token)
         def _group_has(name: Any, eid_token: Any) -> bool:
+            """group_has(name, eid): whether the unit is in group `name`."""
             if not isinstance(name, str):
                 raise FormulaError("group_has(name, eid): name must be a string.")
             eid = _eid(eid_token)
             members = match.groups.get(name, [])
             return eid in members
         def _group_size(name: Any) -> int:
+            """group_size(name): how many units group `name` holds (0 for no
+            such group)."""
             if not isinstance(name, str):
                 raise FormulaError("group_size(name): name must be a string.")
             return len(match.groups.get(name, []))
         def _group_add(name: Any, eid_token: Any) -> bool:
+            """group_add(name, eid): put the unit in group `name` (made if
+            missing); True when it joined, False when it was already there."""
             if not isinstance(name, str):
                 raise FormulaError("group_add(name, eid): name must be a string.")
             eid = _eid(eid_token)
@@ -4651,6 +4664,8 @@ class FormulaEngine:
             except VTTError as ex:
                 raise FormulaError(str(ex))
         def _group_remove(name: Any, eid_token: Any) -> bool:
+            """group_remove(name, eid): take the unit out of group `name`;
+            False when it wasn't there (or no such group)."""
             if not isinstance(name, str):
                 raise FormulaError("group_remove(name, eid): name must be a string.")
             eid = _eid(eid_token)
@@ -4663,10 +4678,13 @@ class FormulaEngine:
                 return False
             return match.remove_from_group(name, eid)
         def _self_id() -> str:
+            """self_id(): the id `self` names in this formula (the passive's
+            unit, the action's actor, ...)."""
             if not ctx.target:
                 raise FormulaError("self_id(): self is unbound in this context.")
             return ctx.target
         def _current_id() -> str:
+            """current_id(): the id of the unit whose turn it is."""
             if not ctx.this:
                 raise FormulaError("current_id(): no current entity (turn order empty).")
             return ctx.this
@@ -4684,6 +4702,9 @@ class FormulaEngine:
         # so formulas can use it as a guard before tile_get. Both
         # accept integer coordinates and a dotted string path.
         def _tile_get(x: Any, y: Any, path: Any) -> Any:
+            """tile_get(x, y, path): read a field of a cell's tile data (a
+            dotted path; the tile's template fills fields it lacks); an
+            error when missing, so test with tile_has."""
             if not isinstance(x, int) or isinstance(x, bool):
                 raise FormulaError(
                     f"tile_get(x, y, path): x must be int, got "
@@ -4709,6 +4730,8 @@ class FormulaEngine:
                 raise FormulaError(str(ex))
 
         def _tile_has(x: Any, y: Any, path: Any) -> bool:
+            """tile_has(x, y, path): whether a cell's tile data (or its
+            template) has the field at the dotted path."""
             if not isinstance(x, int) or isinstance(x, bool):
                 raise FormulaError(
                     f"tile_has(x, y, path): x must be int, got "
@@ -4740,6 +4763,8 @@ class FormulaEngine:
         # are blocked); a hook can't reentrantly fire more tile hooks
         # from within itself.
         def _tile_set(x: Any, y: Any, path: Any, value: Any) -> Any:
+            """tile_set(x, y, path, value): set a field of a cell's tile data
+            (a dotted path) and return the value."""
             if not isinstance(x, int) or isinstance(x, bool):
                 raise FormulaError(
                     f"tile_set(x, y, path, value): x must be int, got "
@@ -4762,6 +4787,8 @@ class FormulaEngine:
             return value
 
         def _tile_del(x: Any, y: Any, path: Any) -> bool:
+            """tile_del(x, y, path): delete a field of a cell's tile data (a
+            dotted path); False when there was none."""
             if not isinstance(x, int) or isinstance(x, bool):
                 raise FormulaError(
                     f"tile_del(x, y, path): x must be int, got "
@@ -4791,6 +4818,8 @@ class FormulaEngine:
             return True
 
         def _tile_clear(x: Any, y: Any) -> bool:
+            """tile_clear(x, y): remove a cell's tile data (corpses lying there
+            stay); False when it had none."""
             if not isinstance(x, int) or isinstance(x, bool):
                 raise FormulaError(
                     f"tile_clear(x, y): x must be int, got "
@@ -5056,6 +5085,8 @@ class FormulaEngine:
             return t
 
         def _is_same_team(a_token: Any, b_token: Any) -> bool:
+            """is_same_team(a, b): whether a and b are on one team (False when
+            either has none)."""
             a = _eid(a_token); b = _eid(b_token)
             ta, tb = _team_of(a), _team_of(b)
             if ta is None or tb is None:
@@ -5063,12 +5094,16 @@ class FormulaEngine:
             return ta == tb
 
         def _is_hostile(a_token: Any, b_token: Any) -> bool:
+            """is_hostile(a, b): whether a and b are not on one team (a unit
+            with no team is hostile to everyone)."""
             # Inverse of is_same_team. Teamless entities are "hostile to
             # everyone" — they have no allies to spare from a friendly-
             # fire-off attack.
             return not _is_same_team(a_token, b_token)
 
         def _is_part_of_team(a_token: Any, team: Any) -> bool:
+            """is_part_of_team(eid, team): whether the unit's team (its body's,
+            for a part) is `team`."""
             if not isinstance(team, str):
                 raise FormulaError(
                     f"is_part_of_team(a, team): team must be a string, "
@@ -5086,6 +5121,9 @@ class FormulaEngine:
             return ta == team
 
         def _is_attackable(a_token: Any, b_token: Any) -> bool:
+            """is_attackable(a, b): whether a may attack b: hostile, or on the
+            same team while the friendlyfire rule is on; never a unit
+            itself."""
             a = _eid(a_token); b = _eid(b_token)
             # An entity is never attackable by itself, regardless of
             # the friendlyfire rule. Self-targeting belongs in
@@ -5159,6 +5197,10 @@ class FormulaEngine:
         def _entities_within(eid_token: Any, n: Any,
                              mode: Any = "square_radius_distance",
                              relation: Any = "") -> list:
+            """entities_within(eid, n, mode='square_radius_distance',
+            relation=''): ids of the units within distance n of the unit's
+            body (nearest footprint cells), nearest first; relation filters
+            any / hostile / ally / same_team / attackable. Loopable."""
             eid = _eid(eid_token)
             if isinstance(n, bool) or not isinstance(n, (int, float)):
                 raise FormulaError(
@@ -5179,6 +5221,10 @@ class FormulaEngine:
 
         def _nearest_entity(eid_token: Any, relation: Any = "",
                             mode: Any = "square_radius_distance") -> str:
+            """nearest_entity(eid, relation='', mode='square_radius_distance'):
+            the id of the unit nearest to this one's body ('' when none),
+            relation any / hostile / ally / same_team / attackable. The
+            relation comes SECOND."""
             eid = _eid(eid_token)
             if not isinstance(relation, str):
                 raise FormulaError(
@@ -5310,9 +5356,13 @@ class FormulaEngine:
             return e
 
         def _footprint_width(eid_t: Any) -> int:
+            """footprint_width(eid): the unit's body width in cells (1 for a
+            one-cell unit)."""
             return match.entity_footprint(_require_e(eid_t, "footprint_width"))[0]
 
         def _footprint_height(eid_t: Any) -> int:
+            """footprint_height(eid): the unit's body height in cells (1 for a
+            one-cell unit)."""
             return match.entity_footprint(_require_e(eid_t, "footprint_height"))[1]
 
         def _unit_cells(e: Any, cells: Any) -> Any:
@@ -5323,17 +5373,23 @@ class FormulaEngine:
             return cells
 
         def _footprint_cells(eid_t: Any) -> list:
+            """footprint_cells(eid): every cell the unit's body covers, anchor
+            first (loopable; [x, y, map] cells for a unit on another map)."""
             # List of (x,y) the entity covers; loopable + coord-readable.
             e = _require_e(eid_t, "footprint_cells")
             return _unit_cells(e, [(cx, cy) for cx, cy in
                                    match.entity_cells(e)])
 
         def _occupies(eid_t: Any, x: Any, y: Any) -> bool:
+            """occupies(eid, x, y): whether the unit's body covers the cell."""
             e = _require_e(eid_t, "occupies")
             return match.entity_occupies(
                 e, _coord_int(x, "occupies", "x"), _coord_int(y, "occupies", "y"))
 
         def _cell_entity(x: Any, y: Any) -> str:
+            """cell_entity(x, y): the id of the unit blocking the cell, or ''
+            when it is free (stackable units don't block; entities_at lists
+            everyone covering it)."""
             # The blocking entity covering (x,y), or "" if the cell is free.
             occ = match.cell_occupant(
                 _coord_int(x, "cell_entity", "x"),
@@ -5341,6 +5397,8 @@ class FormulaEngine:
             return occ or ""
 
         def _entity_center(eid_t: Any) -> tuple:
+            """entity_center(eid): the centre cell of the unit's body, rounded
+            down for an even size ([x, y, map] for a unit on another map)."""
             # The footprint's center CELL (rounding down for even sizes so
             # the result is always a covered integer cell).
             e = _require_e(eid_t, "entity_center")
@@ -5348,6 +5406,9 @@ class FormulaEngine:
             return _unit_cells(e, (e.x + (w - 1) // 2, e.y + (h - 1) // 2))
 
         def _aoe_origin(eid_t: Any) -> tuple:
+            """aoe_origin(eid): where an area effect cast by the unit starts:
+            its body's centre cell, or its anchor under the aoe_origin_mode
+            rule ([x, y, map] for a unit on another map)."""
             # Where an area effect cast BY this entity originates: its
             # center cell or its anchor, per the aoe_origin_mode rule.
             e = _require_e(eid_t, "aoe_origin")
@@ -5366,6 +5427,8 @@ class FormulaEngine:
 
         # ---- group iteration ----
         def _group_members(name: Any) -> list:
+            """group_members(name): the ids in group `name`, in the order they
+            joined (loopable; [] for no such group)."""
             if not isinstance(name, str):
                 raise FormulaError(
                     "group_members(name): name must be a string."
@@ -5395,6 +5458,7 @@ class FormulaEngine:
             return data, e
 
         def _status_has(eid_t: Any, name: Any) -> bool:
+            """status_has(eid, name): whether the unit has status `name`."""
             eid = _eid(eid_t)
             if not isinstance(name, str):
                 raise FormulaError("status_has(eid, name): name must be a string.")
@@ -5404,6 +5468,9 @@ class FormulaEngine:
             return name in e.status
 
         def _status_has_path(eid_t: Any, name: Any, path: Any) -> bool:
+            """status_has_path(eid, name, path): whether the unit's status
+            `name` has the field at the dotted path (False when it lacks the
+            status)."""
             eid = _eid(eid_t)
             if not isinstance(name, str):
                 raise FormulaError("status_has_path(eid, name, path): name must be a string.")
@@ -5420,6 +5487,9 @@ class FormulaEngine:
             return True
 
         def _status_get(eid_t: Any, name: Any, path: Any) -> Any:
+            """status_get(eid, name, path): read a field of the unit's status
+            instance (a dotted path such as 'level' or 'duration'); the unit
+            must have the status."""
             eid = _eid(eid_t)
             if not isinstance(name, str):
                 raise FormulaError("status_get(eid, name, path): name must be a string.")
@@ -5438,6 +5508,10 @@ class FormulaEngine:
             return cur
 
         def _status_set(eid_t: Any, name: Any, path: Any, value: Any) -> Any:
+            """status_set(eid, name, path, value): set a field of the unit's
+            status instance (a dotted path; a level is held to the
+            definition's max_level) and return what was stored.
+            on_status_changed fires."""
             eid = _eid(eid_t)
             if not isinstance(name, str):
                 raise FormulaError("status_set(eid, name, path, value): name must be a string.")
@@ -5479,6 +5553,9 @@ class FormulaEngine:
             return node if node is not None else value
 
         def _status_del(eid_t: Any, name: Any, path: Any) -> bool:
+            """status_del(eid, name, path): delete a field of the unit's status
+            instance (a dotted path); False when there was none.
+            on_status_changed fires."""
             eid = _eid(eid_t)
             if not isinstance(name, str):
                 raise FormulaError("status_del(eid, name, path): name must be a string.")
@@ -5510,6 +5587,9 @@ class FormulaEngine:
             return True
 
         def _status_add(eid_t: Any, name: Any) -> bool:
+            """status_add(eid, name): give the unit an empty status `name` (no
+            definition, stacking or resistance: status_apply does those);
+            False when it already has it. The status hooks fire."""
             eid = _eid(eid_t)
             if not isinstance(name, str):
                 raise FormulaError("status_add(eid, name): name must be a string.")
@@ -5524,6 +5604,9 @@ class FormulaEngine:
             return True
 
         def _status_remove(eid_t: Any, name: Any) -> bool:
+            """status_remove(eid, name): take status `name` off the unit; False
+            when it didn't have it. on_status_removed fires (removed_by
+            `removed`, or `expired` inside the status's own tick)."""
             return _remove_status(eid_t, name, None)
 
         def _remove_status(eid_t: Any, name: Any, cause: Optional[str]) -> bool:
@@ -6670,8 +6753,8 @@ class FormulaEngine:
         # summon_event_limit guard and turn-order/on_entity_spawned
         # wiring are shared.
         def _entity_snapshot(eid_t: Any) -> dict:
-            """entity_snapshot(eid): capture an entity into a summon-
-            ready template dict (id and position stripped). Pair with
+            """entity_snapshot(eid): capture an entity into a
+            summon-ready template dict (id and position stripped). Pair with
             var_set / tile_set to store it, then summon / summon_from
             to instantiate copies."""
             _, e = _resolve_entity(eid_t, "entity_snapshot")
@@ -6899,16 +6982,18 @@ class FormulaEngine:
             return new_id
 
         def _summon_template(name: Any, x: Any, y: Any, map: Any = None) -> str:
-            """summon_template(name, x, y): spawn the server's saved template
-            `name` (`!template save`) at exactly (x, y), with its body parts.
+            """summon_template(name, x, y, map=None): spawn the server's saved
+            template `name` (`!template save`) at exactly (x, y), with its
+            body parts.
             Its id is the template name (`guardsman`, then `guardsman2`,
             ...). Returns the new id."""
             return _template_spawn("summon_template", name, x, y, None, map)
 
         def _summon_template_near(name: Any, x: Any, y: Any, radius: Any,
                                   map: Any = None) -> str:
-            """summon_template_near(name, x, y, radius): summon_template, but
-            at the nearest free cell within `radius` (Chebyshev rings)."""
+            """summon_template_near(name, x, y, radius, map=None):
+            summon_template, but at the nearest free cell within `radius`
+            (Chebyshev rings)."""
             if not isinstance(radius, int) or isinstance(radius, bool) \
                     or radius < 0:
                 raise FormulaError("summon_template_near: radius must be a "
@@ -8052,6 +8137,8 @@ class FormulaEngine:
         ns["team_get"] = _team_get
 
         def _team_has(team: Any, path: Any) -> bool:
+            """team_has(team, path): whether a team's shared data has a value
+            at the dotted path."""
             if not isinstance(team, str) or not isinstance(path, str):
                 raise FormulaError("team_has(team, path): team and path must be strings.")
             return match.team_has(team, path)
@@ -8994,22 +9081,35 @@ class FormulaEngine:
             return None if team is None else str(team)
 
         def _team_sees_cell(team: Any, x: Any, y: Any) -> bool:
+            """team_sees_cell(team, x, y): whether any living unit of the team
+            sees the cell (range and line), whatever the fog toggles."""
             return match._team_sees(_tm(team), _cell_arg(x, "team_sees_cell", "x"), _cell_arg(y, "team_sees_cell", "y"), _cur_map(), los=True)
 
         def _team_sees_cell_rangeonly(team: Any, x: Any, y: Any) -> bool:
+            """team_sees_cell_rangeonly(team, x, y): whether the cell is within
+            any living team unit's fog_vision_radius, walls ignored."""
             return match._team_sees(_tm(team), _cell_arg(x, "team_sees_cell_rangeonly", "x"), _cell_arg(y, "team_sees_cell_rangeonly", "y"), _cur_map(), los=False)
 
         def _team_sees_cell_losonly(team: Any, x: Any, y: Any) -> bool:
+            """team_sees_cell_losonly(team, x, y): whether any living unit of
+            the team has a clear line to the cell, whatever the range."""
             return match._team_has_los(_tm(team), _cell_arg(x, "team_sees_cell_losonly", "x"), _cell_arg(y, "team_sees_cell_losonly", "y"), _cur_map())
 
         def _team_sees_entity(team: Any, eid_t: Any) -> bool:
+            """team_sees_entity(team, eid): whether the team sees any cell of
+            the unit's body (range and line)."""
             # Footprint-aware: a large target is seen if ANY of its cells is.
             return match._team_sees_entity(_tm(team), _eid(eid_t), los=True)
 
         def _team_sees_entity_rangeonly(team: Any, eid_t: Any) -> bool:
+            """team_sees_entity_rangeonly(team, eid): whether any cell of the
+            unit's body is within a team unit's fog_vision_radius, walls
+            ignored."""
             return match.team_sees_entity(_tm(team), _eid(eid_t))
 
         def _team_sees_entity_losonly(team: Any, eid_t: Any) -> bool:
+            """team_sees_entity_losonly(team, eid): whether the team has a
+            clear line to any cell of the unit's body, whatever the range."""
             return match._team_has_los_entity(_tm(team), _eid(eid_t))
 
         def _off_map_of(eid_t: Any, fname: str) -> bool:
@@ -9020,16 +9120,23 @@ class FormulaEngine:
             return ue.map != _map_stack[-1].name
 
         def _can_see(eid_t: Any, x: Any, y: Any) -> bool:
+            """can_see(eid, x, y): whether the unit sees the cell: in its
+            fog_vision_radius and with a clear line (False across maps). The
+            fog toggles don't matter."""
             if _off_map_of(eid_t, "can_see"):
                 return False               # no sight across maps
             return match._entity_sees(_eid(eid_t), _cell_arg(x, "can_see", "x"), _cell_arg(y, "can_see", "y"), los=True)
 
         def _can_see_rangeonly(eid_t: Any, x: Any, y: Any) -> bool:
+            """can_see_rangeonly(eid, x, y): whether the cell is within the
+            unit's fog_vision_radius, walls ignored."""
             if _off_map_of(eid_t, "can_see_rangeonly"):
                 return False               # no sight across maps
             return match.entity_can_see(_eid(eid_t), _cell_arg(x, "can_see_rangeonly", "x"), _cell_arg(y, "can_see_rangeonly", "y"))
 
         def _can_see_losonly(eid_t: Any, x: Any, y: Any) -> bool:
+            """can_see_losonly(eid, x, y): whether the unit has a clear line to
+            the cell, whatever the range."""
             if _off_map_of(eid_t, "can_see_losonly"):
                 return False               # no sight across maps
             return match._entity_has_los(_eid(eid_t), _cell_arg(x, "can_see_losonly", "x"), _cell_arg(y, "can_see_losonly", "y"))
@@ -9287,6 +9394,7 @@ class FormulaEngine:
                 return fn(*args, **k)
             _call.__name__ = getattr(fn, "__name__", fname)
             _call.__doc__ = getattr(fn, "__doc__", None)
+            _call.__wrapped__ = fn
             return _call
 
         for fname, params in coord_params.items():
@@ -9620,3 +9728,72 @@ def validate_program(
     FormulaEngine._prepare(
         src, "exec", known_funcs=known_funcs, action_mode=action_mode,
     )
+
+# ---- the formula function reference (`!help function`, #202) -------------
+# Built once from a throwaway match's namespace: every built-in function's
+# signature (through the wrappers' __wrapped__) and docstring, and what it
+# may do. Python built-ins in the sandbox get a line of their own.
+_BUILTIN_DOCS = {
+    "abs": "abs(x): the size of a number, its sign dropped.",
+    "float": "float(x): a number (or numeric text) as a decimal number.",
+    "int": "int(x): a number (or numeric text) as a whole number, rounded "
+           "toward zero.",
+    "max": "max(a, b, ...) or max(list): the largest value.",
+    "min": "min(a, b, ...) or min(list): the smallest value.",
+    "str": "str(value): the value as text (lists and dicts too).",
+}
+# Parameter spellings that read as implementation details in a signature.
+_PARAM_SHOWN = re.compile(r"_(t|token)$")
+_FUNCTION_REFERENCE: Optional[Dict[str, Dict[str, Any]]] = None
+
+
+def function_reference() -> Dict[str, Dict[str, Any]]:
+    """name -> {signature, doc, kind ('reads' / 'changes' / 'pure'),
+    loopable, in_args} for every built-in formula function."""
+    global _FUNCTION_REFERENCE
+    if _FUNCTION_REFERENCE is not None:
+        return _FUNCTION_REFERENCE
+    from logic import MatchManager
+    mgr = MatchManager()
+    mgr.create_match("ref", "ref", 2, 2)
+    ns = FormulaEngine(mgr.matches["ref"])._namespace(EvalCtx())
+    out: Dict[str, Dict[str, Any]] = {}
+    for name in sorted(set(_MATCH_FUNC_NAMES) | set(_ALLOWED_FUNCS)):
+        fn = _ALLOWED_FUNCS.get(name) or ns.get(name)
+        raw = inspect.unwrap(fn) if callable(fn) else fn
+        doc = _BUILTIN_DOCS.get(name) or inspect.getdoc(raw) or ""
+        try:
+            params = inspect.signature(raw).parameters.values()
+            shown = []
+            for p in params:
+                if p.name.startswith("_") or (
+                        p.kind == p.KEYWORD_ONLY
+                        and p.name in ("limit", "bounds")):
+                    continue
+                label = _PARAM_SHOWN.sub("", p.name)
+                if p.kind == p.VAR_POSITIONAL:
+                    label = f"*{label}"
+                elif p.default is not p.empty:
+                    label = f"{label}={p.default!r}"
+                shown.append(label)
+            if name in _MAP_ARG_FUNCS and not any(
+                    s.startswith("map") for s in shown):
+                shown.append("map=None")
+            sig = f"{name}({', '.join(shown)})"
+        except (TypeError, ValueError):
+            sig = f"{name}(...)"
+        if doc.startswith(name + "(") and name not in _BUILTIN_DOCS:
+            sig = doc.split(":", 1)[0] if ":" in doc.split("\n")[0] else sig
+            if name in _MAP_ARG_FUNCS and "map" not in sig \
+                    and sig.endswith(")"):
+                sig = sig[:-1] + ", map=None)"
+        out[name] = {
+            "signature": sig, "doc": " ".join(doc.split()),
+            "kind": ("changes" if name in ARG_MUTATING_MATCH_FUNCS
+                     else "reads" if name in ARG_SAFE_MATCH_FUNCS
+                     else "pure"),
+            "loopable": name in _LOOPABLE_FUNCS,
+            "in_args": name in ARG_SAFE_FUNC_NAMES,
+        }
+    _FUNCTION_REFERENCE = out
+    return out

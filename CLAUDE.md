@@ -142,7 +142,8 @@ code. How the harness works (`run_scenarios.py`, scenarios in
   mismatch or a duplicate number). Only lines ABOVE a scenario's first
   `Expected:` run: a staged scenario labels intermediate prose `Result:`
   (see 13, 26). Multi-line bodies use literal `\n` (`_interpret_escapes`).
-- **What it flags.** `💥` and "Syntax error" always; `❌ Runtime error:`,
+- **What it flags.** `💥` (except the `💥 Unexpected error (ref N)` reply of
+  `!as crash`, the error log's test hook) and "Syntax error" always; `❌ Runtime error:`,
   `❌ Unexpected error:`, an unknown subcommand ("isn't a valid command"),
   missing arguments ("is missing arguments"), a usage refusal (`❌ Usage:`)
   and stray words ("❌ Unexpected ... — usage:") unless the prose carries
@@ -242,7 +243,9 @@ Each of these was learned from a shipped bug.
   cost follows its arguments clips to the map or charges `formula_cell_limit`
   / `formula_loop_limit` / `sight_check_limit`. Loopable → `_LOOPABLE_FUNCS`.
   Exercise every new function: import-time checks prove only registration (a
-  nonexistent helper name once hid in a function body).
+  nonexistent helper name once hid in a function body). Its docstring is its
+  `!help function` entry (`formula.function_reference`: first line the call
+  form, then what it does; a wrapper in the namespace sets `__wrapped__`).
 - **A HOOK_CONTEXT binding:** `_who_arg` handles HOOK_CONTEXT_NAMES by set
   membership, so `entity[<binding>]` works automatically; check the binding is
   actually supplied in the fire site's extras.
@@ -443,7 +446,8 @@ switch workspaces with `!as server <key>` (scenarios 698-700).
   (`bot.application_info()`: the application's owner, or its team's members);
   `ctx_is_bot_owner` (Discord sets `is_bot_owner`; CLI/GUI = always; default-
   deny elsewhere). Owner-only commands live under `!owner` (`!owner servers`
-  lists every workspace); `!whoami` shows the badge. Owner is NOT admin of
+  lists every workspace, `!owner errors` the crash log, §7.16); `!whoami`
+  shows the badge. Owner is NOT admin of
   every server: server-wide commands still need that server's Administrator.
 - **System rules on load:** a system saved by an older build may name a
   gamerule that no longer exists — `GameSystem.from_dict` drops it with a
@@ -482,7 +486,8 @@ systems.json, workspace.json, system_history.json and audit.json, written
 by each commit that changes one, `<stem>.<unix ms>.json`; kept for the
 owner limits `server_backup_days` (7) and `server_backup_count` (200 per
 file), pruned after each copy and hourly), `corrupt/`;
-plus `data/bot_settings.json` (owner limits + rule ceilings) and
+plus `data/bot_settings.json` (owner limits + rule ceilings), `data/errors.json`
+(the crash log, §7.16) and
 `data/.trash/` (wiped data, 24 h). Mechanics:
 - **Commit after every top-level command** (`vtt_commands.persist_workspace`,
   called from `CommandRegistry.run` inside the command lock, also after a
@@ -2252,7 +2257,25 @@ hardcodes**.
   RNG restored, and reports the first
   entry whose state hash differs; the rebuilt match takes the recording as
   its journal (`_REPLAYING`) (778-780).
-- **Other:** `!help find <words>` (commands, subcommands and rules),
+- **Formula reference:** `formula.function_reference()` (built once from a
+  throwaway match's namespace) gives every function's signature, docstring
+  and kind (reads / changes the match, pure; loopable; allowed in `$()`).
+  `!help function <name>` shows one (a close-name suggestion when unknown;
+  a match `!func` shows its parameters and body), `!help functions
+  [reads|changes|pure|loopable]` lists them, `!help find` searches them, and
+  Tab completes the names (`function` slot) (889).
+- **Crash log** (`logic.CrashLog`, `Workspaces.crashes`, bot-wide, saved in
+  `data/errors.json` by `Storage.attach_crash_log`; memory only with match
+  persistence off): an exception a command handler didn't expect, a passive,
+  tile / zone hook or status tick that CRASHED, and a failed disk save each
+  record an entry (`crash_ref` / `CrashLog.record`: time, server, match,
+  user, the command as typed from the `CRASH_CONTEXT` `_run_top` sets, the
+  traceback with file names only) and the reply names it (`💥 Unexpected
+  error (ref N)`, `CRASHED (ref N)`). Refs count bot-wide past the owner
+  limit `error_log_entries` (200). `!owner errors [n] | show <ref> | clear`
+  (every server), `!server errors [n] | show <ref>` (admin, own server). `!as
+  crash [text]` (CLI / harness) raises one on purpose (890).
+- **Other:** `!help find <words>` (commands, subcommands, rules and formula functions),
   `!whoami`, `!log` (event log rules), `!state`, `!list`, `!dist`, string
   helpers (`upper` ... `fmt`, a safe field parser), list helpers (`sum`,
   `sorted`, `any`, `all`, `count`), `lowest_var` / `highest_var`.
