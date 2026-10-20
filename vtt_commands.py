@@ -11804,7 +11804,7 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
 # ---- !roll --------------------------------------------------------------
 @registry.command(
     "roll", access="all",
-    usage="!roll <dice ...> | !roll odds <dice> [<op> <n>]",
+    usage="!roll [<n>x] <dice_or_list ...> | !roll odds <dice> [<op> <n>]",
     snapshot=False,
     desc=(
         "Roll dice and show the total plus the individual dice. Uses the same "
@@ -11816,13 +11816,60 @@ async def find_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         "safe via the match's random_seed rule (a seeded match rolls "
         "reproducibly). Read-only — rolling never mutates the match. "
         "`!roll odds` works out probabilities instead of rolling (see "
-        "`!help roll odds`)."
+        "`!help roll odds`). A comma-separated list picks one item: "
+        "`!roll none, none, minicrit, crit`, and `item:weight` weights an "
+        "item like a table (`none:3, crit`). A leading `<n>x` rolls n times "
+        "(`!roll 6x 4d6kh3`, `!roll 2x none, crit`; at most the "
+        "roll_repeat_limit rule)."
     ),
 )
 async def roll_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if not args:
         title, body = registry.help_for(["roll"])
         return await ctx.send(f"**{title}**\n{body}")
+    # Use the match RNG when a match is active (honors random_seed); otherwise
+    # the global RNG, so `!roll` works even with no active match.
+    rng = random
+    rules: Dict[str, Any] = {}
+    try:
+        m = active_match(mgr, ctx)
+        rng = m.formula_rng()
+        rules = m.rules
+    except VTTError:
+        pass
+    reps = 1
+    if re.fullmatch(r"\d+x", args[0].lower()):
+        # `!roll 6x ...`: the same roll n times (#57).
+        reps = int(args[0][:-1])
+        cap = int(rules.get("roll_repeat_limit",
+                            RULES_REGISTRY["roll_repeat_limit"]["default"]))
+        if not 1 <= reps <= cap:
+            return await ctx.send(f"❌ `{args[0]}`: roll 1 to {cap} times "
+                                  f"(roll_repeat_limit).")
+        args = args[1:]
+        if not args:
+            return await ctx.send("❌ `!roll <n>x` needs dice or a list to "
+                                  "roll.")
+    text = " ".join(args)
+    if "," in text and args[0].lower() != "odds":
+        # A list roll: one item per roll, `item:weight` weighted like a
+        # table (`!roll none, none, crit`).
+        spec = ", ".join(p.strip() for p in text.split(","))
+        if any(not p.strip() for p in text.split(",")):
+            return await ctx.send("❌ A list roll needs an item between "
+                                  "every pair of commas.")
+        try:
+            picks = [roll_table_pick(rng, spec) for _ in range(reps)]
+        except FormulaError as ex:
+            return await ctx.send("❌ " + str(ex).replace(
+                "roll_table(...)", "list roll").replace(
+                "roll_table(spec)", "list roll"))
+        times = f"{reps}x " if reps > 1 else ""
+        return await ctx.send(f"🎲 {times}`{spec}` → "
+                              + ", ".join(f"**{p}**" for p in picks))
+    if args[0].lower() == "odds" and reps > 1:
+        return await ctx.send("❌ `!roll odds` works out chances; it takes "
+                              "no `<n>x`.")
     terms = args[1:] if args[0].lower() == "odds" else args
     # Joined below so `!roll 2d6 + 3` and `!roll 2d6+3` both work; two terms
     # with no operator between them (`1d6 1d6`) joined into the malformed
@@ -11836,22 +11883,24 @@ async def roll_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
     if args[0].lower() == "odds":
         return await _roll_odds(ctx, "".join(args[1:]))
     spec = "".join(args)
-    # Use the match RNG when a match is active (honors random_seed); otherwise
-    # the global RNG, so `!roll` works even with no active match.
-    rng = random
-    try:
-        m = active_match(mgr, ctx)
-        rng = m.formula_rng()
-    except VTTError:
-        pass
-    try:
-        total, parts = roll_detail(rng, spec)
-    except FormulaError as ex:
-        return await ctx.send(f"❌ {ex}")
-    breakdown = ", ".join(parts)
-    # Hide the breakdown when it's just the same single number (e.g. a flat).
-    tail = f"   ({breakdown})" if breakdown and breakdown != str(total) else ""
-    return await ctx.send(f"🎲 `{spec}` → **{total}**{tail}")
+    lines = []
+    for i in range(reps):
+        try:
+            total, parts = roll_detail(rng, spec)
+        except FormulaError as ex:
+            return await ctx.send(f"❌ {ex}")
+        breakdown = ", ".join(parts)
+        # Hide the breakdown when it's just the same single number (a flat).
+        tail = (f"   ({breakdown})" if breakdown and breakdown != str(total)
+                else "")
+        lines.append((total, tail))
+    if reps == 1:
+        total, tail = lines[0]
+        return await ctx.send(f"🎲 `{spec}` → **{total}**{tail}")
+    return await ctx.send(
+        f"🎲 {reps}x `{spec}` → " + ", ".join(f"**{t}**" for t, _ in lines)
+        + "".join(f"\n{i}. **{t}**{tail}" for i, (t, tail)
+                  in enumerate(lines, 1) if tail))
 
 
 _ODDS_OPS = {">=": "≥", "<=": "≤", "==": "=", "!=": "≠", "=": "=",

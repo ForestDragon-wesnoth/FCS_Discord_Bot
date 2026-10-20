@@ -1986,6 +1986,14 @@ RULES_REGISTRY: Dict[str, Dict[str, Any]] = {
             "`9**9**9` is refused instead of computed for hours."
         ),
     },
+    "roll_repeat_limit": {
+        "default": 20,
+        "schema": {"type": "int", "min": 1, "max": 1000, "ceiling": True},
+        "desc": (
+            "The most rolls one `!roll Nx ...` makes (`!roll 6x 4d6kh3`, "
+            "`!roll 2x none, crit`): N past it is refused."
+        ),
+    },
     "summon_event_limit": {
         "default": 50,
         "schema": {"type": "int", "min": 0, "max": 500, "ceiling": True},

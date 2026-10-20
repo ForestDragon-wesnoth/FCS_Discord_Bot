@@ -2192,6 +2192,79 @@ def _index_of(v: Any, value: Any) -> Any:
     return None
 
 
+def _whole(v: Any, fname: str, what: str) -> int:
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise FormulaError(f"{fname}(...): {what} must be a whole number, "
+                           f"got {'None' if v is None else type(v).__name__}.")
+    return v
+
+
+def _take(v: Any, n: Any) -> list:
+    """take(list, n): the first n items (a deck's top card is take(deck,
+    1)); a negative n leaves that many off the end. Indexes start at 0, as
+    in get(list, 0)."""
+    return _list_arg(v, "take")[:_whole(n, "take", "n")]
+
+
+def _drop(v: Any, n: Any) -> list:
+    """drop(list, n): the list without its first n items (the deck after a
+    draw); a negative n keeps only that many from the end."""
+    return _list_arg(v, "drop")[_whole(n, "drop", "n"):]
+
+
+def _slice(v: Any, start: Any, end: Any = None) -> list:
+    """slice(list, start, end=None): the items from index `start` up to
+    (not including) `end` (None = to the end); negative indexes count from
+    the end (-1 is the last item)."""
+    items = _list_arg(v, "slice")
+    a = _whole(start, "slice", "start")
+    b = None if end is None else _whole(end, "slice", "end")
+    return items[a:b]
+
+
+def _remove_at(v: Any, i: Any) -> list:
+    """remove_at(list, i): the list without the item at index i (negative
+    counts from the end); an index past either end is an error."""
+    items = _list_arg(v, "remove_at")
+    i = _whole(i, "remove_at", "the index")
+    if not -len(items) <= i < len(items):
+        raise FormulaError(f"remove_at(list, i): index {i} is outside a "
+                           f"list of {len(items)}.")
+    del items[i]
+    return items
+
+
+def _insert_at(v: Any, i: Any, value: Any) -> list:
+    """insert_at(list, i, value): the list with `value` placed before index
+    i (len(list) or past it = at the end; negative counts from the end)."""
+    items = _list_arg(v, "insert_at")
+    items.insert(_whole(i, "insert_at", "the index"), copy.deepcopy(value))
+    return items
+
+
+def _reverse(v: Any) -> list:
+    """reverse(list): the items in the opposite order."""
+    return _list_arg(v, "reverse")[::-1]
+
+
+def _flatten(v: Any) -> list:
+    """flatten(list): one level of nesting removed: [[1, 2], 3, [4]] gives
+    [1, 2, 3, 4] (deeper lists stay lists)."""
+    out: list = []
+    for x in _list_arg(v, "flatten"):
+        if isinstance(x, (list, tuple)):
+            out.extend(x)
+        else:
+            out.append(x)
+    return out
+
+
+def _zip(a: Any, b: Any) -> list:
+    """zip(a, b): pairs [a[0], b[0]], [a[1], b[1]], ... up to the shorter
+    list (names with their scores, units with their targets)."""
+    return [[x, y] for x, y in zip(_list_arg(a, "zip"), _list_arg(b, "zip"))]
+
+
 def _unique(v: Any) -> list:
     """unique(list): the list without repeats, keeping each item's first
     position. Items compare with ==, so 1 and 1.0 count as one; equal lists
@@ -2412,6 +2485,14 @@ _ALLOWED_FUNCS: Dict[str, Any] = {
     "values": _values,
     "index_of": _index_of,
     "unique": _unique,
+    "take": _take,
+    "drop": _drop,
+    "slice": _slice,
+    "remove_at": _remove_at,
+    "insert_at": _insert_at,
+    "reverse": _reverse,
+    "flatten": _flatten,
+    "zip": _zip,
     "upper": _upper,
     "lower": _lower,
     "strip": _strip,
@@ -3114,6 +3195,8 @@ _LOOPABLE_FUNCS: "frozenset[str]" = frozenset({
     "keys",
     "values",
     "unique",
+    "take", "drop", "slice", "remove_at", "insert_at", "reverse", "flatten",
+    "zip",
     "shuffle",
     "team_members",
     "entities_at",
@@ -3412,6 +3495,28 @@ _ACTION_BUILTINS = frozenset({"cmd", "fail", "choose", "choose_number"})
 _ACTION_LOOPABLE_NAMES = frozenset({"target"})
 
 
+def _collect_program_locals(tree: ast.AST,
+                            known_funcs: "frozenset[str]" = frozenset(),
+                            action_mode: bool = False) -> "frozenset[str]":
+    """The bare-name locals a formula PROGRAM binds (every program, not only
+    actions: a passive's or `!func`'s `dealt = base - armor`). A local
+    lives until the formula ends and is never stored. It can't take the
+    name of a function (built-in or the match's `!func`s), a hook or action
+    binding, an entity token, `match` or `entity`: the formula reads those
+    names as the engine's."""
+    names = _collect_action_locals(tree)
+    taken = (set(_ALLOWED_FUNCS) | set(_MATCH_FUNC_NAMES)
+             | set(HOOK_CONTEXT_NAMES) | set(_ENTITY_TOKEN_NAMES)
+             | {"match", "entity"} | set(known_funcs))
+    if action_mode:
+        taken |= set(_ACTION_BINDING_NAMES) | set(_ACTION_BUILTINS)
+    for n in sorted(names):
+        if n in taken:
+            raise FormulaError(f"`{n}` can't be a local's name: formulas "
+                               f"read it as a function or binding.")
+    return names
+
+
 def _collect_action_locals(tree: ast.AST) -> "frozenset[str]":
     """Pre-pass over an action body AST. Collects every bare Name
     that appears on the LHS of an Assign — those become the action's
@@ -3499,8 +3604,12 @@ class _EntityAccessTransformer(ast.NodeTransformer):
     """
 
     def __init__(self, known_params: "frozenset[str]" = frozenset(),
-                 action_mode: bool = False):
+                 action_mode: bool = False, locals_ok: bool = False):
         self.known_params = known_params
+        # A program (passive, tick, `!func`, watcher effect, hook) binds
+        # bare-name locals like an action: `dealt = base - armor`
+        # (_collect_program_locals put every one in known_params).
+        self.locals_ok = locals_ok
         # When True, three extra patterns are allowed and left
         # un-rewritten (the runtime namespace handles them):
         #   - bare Name = expr   (Python binds in the eval ns; the
@@ -3707,9 +3816,10 @@ class _EntityAccessTransformer(ast.NodeTransformer):
         #   2. <any-bare-name>.attr = expr -> Python setattr on the
         #      bound value. Covers source/args/target/coord loop vars
         #      uniformly.
+        if isinstance(target, ast.Name) and (self.action_mode
+                                             or self.locals_ok):
+            return node
         if self.action_mode:
-            if isinstance(target, ast.Name):
-                return node
             if isinstance(target, ast.Attribute) and self._is_action_attr_passthrough(target):
                 return node
         flat = self._flatten(target)
@@ -4412,6 +4522,10 @@ class FormulaEngine:
             "range": lambda *a: _charge(_range(*a, limit=size_limit),
                                         "range"),
             "each": lambda v: _charge(_each(v, limit=size_limit), "each"),
+            # The list helpers build lists too (#205).
+            **{n: (lambda f, n: lambda *a: _charge(f(*a), n))(_ALLOWED_FUNCS[n], n)
+               for n in ("take", "drop", "slice", "remove_at", "insert_at",
+                         "reverse", "flatten", "zip")},
             "replace": lambda *a: _replace(*a, limit=size_limit),
             "join": lambda *a: _join(*a, limit=size_limit),
             "str": lambda *a: (_text_of(a[0], size_limit) if len(a) == 1
@@ -9210,13 +9324,19 @@ class FormulaEngine:
                 f"function '{fdef.name}' body syntax error: {e.msg}"
             )
         _refuse_engine_names(full)
+        # The body's locals live in its call's own namespace (a fresh
+        # copy per call), so a function's `x = ...` never reaches its
+        # caller.
+        known_params = known_params | _collect_program_locals(
+            full, known_funcs)
         trailing_expr = None
         if full.body and isinstance(full.body[-1], ast.Expr):
             trailing_expr = full.body.pop().value
         # Pass known_params so the transformer treats parameter names used
         # as entity[<param>] indices as dynamic runtime values, not
         # literal ids.
-        full = _EntityAccessTransformer(known_params).visit(full)
+        full = _EntityAccessTransformer(known_params,
+                                        locals_ok=True).visit(full)
         ast.fix_missing_locations(full)
         _validate_tree(full, known_funcs=known_funcs,
                        known_params=known_params)
@@ -9257,10 +9377,12 @@ class FormulaEngine:
         # exec will UnboundLocalError if x is never assigned before
         # that point, but the validator accepts the static program).
         _refuse_engine_names(tree)
-        if action_mode:
-            known_params = known_params | _collect_action_locals(tree)
+        program = mode == "exec"
+        if program:
+            known_params = known_params | _collect_program_locals(
+                tree, known_funcs, action_mode)
         tree = _EntityAccessTransformer(
-            known_params, action_mode=action_mode,
+            known_params, action_mode=action_mode, locals_ok=program,
         ).visit(tree)
         ast.fix_missing_locations(tree)
         _validate_tree(
@@ -9337,21 +9459,17 @@ class FormulaEngine:
         if full.body and isinstance(full.body[-1], ast.Expr):
             trailing_expr = full.body.pop().value
 
-        if action_mode:
-            full_locals = _collect_action_locals(full)
-            # The trailing-expr branch parses the trailing piece
-            # separately below; collect locals from THAT too so a body
-            # whose trailing expr references an earlier-assigned local
-            # validates.
-            if trailing_expr is not None:
-                full_locals = full_locals | _collect_action_locals(
-                    ast.Expression(body=trailing_expr)
-                )
-        else:
-            full_locals = frozenset()
+        # Every program binds bare-name locals (actions always did). The
+        # trailing-expr branch parses the trailing piece separately below;
+        # collect locals from THAT too so a body whose trailing expr
+        # references an earlier-assigned local validates.
+        full_locals = _collect_program_locals(full, known, action_mode)
+        if trailing_expr is not None:
+            full_locals = full_locals | _collect_program_locals(
+                ast.Expression(body=trailing_expr), known, action_mode)
 
         full = _EntityAccessTransformer(
-            full_locals, action_mode=action_mode,
+            full_locals, action_mode=action_mode, locals_ok=True,
         ).visit(full)
         ast.fix_missing_locations(full)
         _validate_tree(

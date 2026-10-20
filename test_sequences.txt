@@ -28086,3 +28086,125 @@ corpse_line_format the same text, each status through the
 status_line_format rule (any instance field is a placeholder) or its
 definition's own `display` format (Umbral Rot showing the max hp it took).
 `!status display <name>` with no format goes back to the rule.
+
+
+SCENARIO 886 — Local variables in every formula program: !func, passives, ticks, watchers
+--------------------------------------------------------------------------------------------
+
+!match new lv LV 8 8
+!match use lv
+!ent add u U 50 2 2 5
+!ent set_var u armor 3
+!func def dmg base "dealt = base - entity[self].armor\nif dealt < 0:\n    dealt = 0\ndealt"
+!eval --as u "dmg(10)"
+?? = `7`
+!eval --as u "dealt = 100\nz = dmg(5)\n[dealt, z]"
+?? = `[100, 2]`
+!passive add u p on_turn_start "hit = dmg(8)\nentity[self].hp = entity[self].hp - hit"
+!status def burn
+!status tick burn "amt = 2 * status_get(self, 'burn', 'level')\nentity[self].hp = entity[self].hp - amt"
+!status apply u burn 2 1
+!turn next
+!assert "entity[u].hp == 45"
+!turn next
+!assert "entity[u].hp == 36"
+!watch add w "entity[u].hp < 20" "t = 'low'\nentity[u].note = t"
+!ent hp u 10
+!assert "entity[u].note == 'low'"
+!eval "roll = 3"
+?? ❌ `roll` can't be a local's name: formulas read it as a function or binding.
+!eval "self = 3"
+?? ❌ `self` can't be a local's name
+!eval "dmg = 2"
+?? ❌ `dmg` can't be a local's name
+!eval "status_name = 'x'"
+?? ❌ `status_name` can't be a local's name
+!eval "__x = 2"
+?? ❌ `__x` can't be a local's name
+!eval "q = 1"
+!eval "q"
+?? ❌ Unknown identifier 'q'.
+
+Expected: HARNESS-ALLOWS-ERRORS. Every formula program (a `!func` body,
+a passive, a status tick, a watcher effect, `!eval`) binds bare-name
+locals, as action bodies did: the damage step `dealt = base - armor` reads
+as written. A local lives until its formula ends and is never stored: a
+`!func` call runs in its own namespace copy, so its `dealt` never reaches
+the caller's `dealt` (100), and the next `!eval` doesn't know `q`. The
+passive takes 8 - 3 = 5 (50 → 45); the next turn it takes 5 more and the
+burn tick 4 (45 → 36). A local can't take the name of a function (a
+built-in or the match's `!func`), a hook binding, an entity token or a
+`__` name.
+
+
+SCENARIO 887 — List helpers: a deck drawn with take / drop, and slice, insert_at, remove_at, reverse, flatten, zip
+--------------------------------------------------------------------------------------------------------------------
+
+!match new lh LH 8 8
+!match use lh
+!ent add u U 10 2 2 5
+!eval --as u "entity[self].deck = ['ace', 'king', 'queen', 'jack']"
+!eval --as u "card = get(take(entity[self].deck, 1), 0)\nentity[self].deck = drop(entity[self].deck, 1)\nentity[self].hand = [card]\ncard"
+?? = `'ace'`
+!assert "entity[u].deck == ['king', 'queen', 'jack'] and entity[u].hand == ['ace']"
+!eval "[take([1, 2, 3], -1), drop([1, 2, 3], -1), slice([1, 2, 3, 4], 1, 3), slice([1, 2, 3, 4], -2)]"
+?? = `[[1, 2], [3], [2, 3], [3, 4]]`
+!eval "[remove_at([1, 2, 3], -1), insert_at([1, 2, 3], 1, 9), reverse([1, 2, 3]), flatten([[1, 2], 3, [4, [5]]]), zip(['a', 'b', 'c'], [1, 2])]"
+?? = `[[1, 2], [1, 9, 2, 3], [3, 2, 1], [1, 2, 3, 4, [5]], [['a', 1], ['b', 2]]]`
+!eval --as u "n = 0\nfor pair in zip(['a', 'b'], [2, 3]):\n    n = n + get(pair, 1)\nn"
+?? = `5`
+!eval "remove_at([1, 2], 5)"
+?? ❌ remove_at(list, i): index 5 is outside a list of 2.
+!eval "take([1, 2], 'x')"
+?? ❌ take(...): n must be a whole number, got str.
+!eval "take('abc', 1)"
+?? ❌ take(list): expected a list, got str.
+!ent set_var u n "$(len(reverse([1, 2, 3])))"
+!assert "entity[u].n == 3"
+
+Expected: HARNESS-ALLOWS-ERRORS. Card decks, queues and histories need
+list surgery the sandbox couldn't do (no subscripts): drawing the top
+card was a map_with over range(). take / drop / slice (negative indexes
+count from the end), remove_at / insert_at (new lists; the original is
+untouched), reverse, flatten (one level) and zip (pairs, to the shorter
+list) are pure helpers, usable in `$()` and loopable, and each list they
+build is charged to the formula's list budget.
+
+
+SCENARIO 888 — List rolls and repeated rolls: !roll none, none, crit and !roll 6x
+-----------------------------------------------------------------------------------
+
+!match new lr LR 8 8
+!match use lr
+!match rng set seed1
+!roll none, none, minicrit, crit
+?? 🎲 `none, none, minicrit, crit` → **
+!roll 6x none, none, crit
+?? 🎲 6x `none, none, crit` →
+!roll none:3, crit:1
+?? 🎲 `none:3, crit:1` →
+!roll 3x 4d6kh3
+?? 🎲 3x `4d6kh3` →
+?? 3. **
+!roll small potion, nothing
+?? 🎲 `small potion, nothing` →
+!roll 25x d6
+?? ❌ `25x`: roll 1 to 20 times (roll_repeat_limit).
+!system set default roll_repeat_limit 30
+!roll 25x d6
+?? 🎲 25x `d6` →
+!roll a,,b
+?? ❌ A list roll needs an item between every pair of commas.
+!roll none:x, crit
+?? ❌ list roll: weight for 'none' must be a number.
+!roll 2x odds 2d6
+?? ❌ `!roll odds` works out chances; it takes no `<n>x`.
+!roll 3x
+?? ❌ `!roll <n>x` needs dice or a list to roll.
+
+Expected: All three rule documents write crit and loot rolls as lists
+(`!roll none,none,none,none,none,club,buckler`); `!roll` with a comma
+picks one item, `item:weight` weighting it like a table, with the match's
+RNG. A leading `<n>x` rolls n times (#57), dice too, each dice roll's
+breakdown on its own line; n past the roll_repeat_limit rule (20, owner
+ceiling) is refused.

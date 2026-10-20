@@ -13,7 +13,7 @@ to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#179-#181, #183, #186-#188, #200, #201, #222, #40 and #164 (multiple and nested maps, see
+#179-#181, #183, #186-#188, #200, #201, #205, #216, #217, #222, #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), parts of #14.
 
 **Off the list:**
@@ -41,7 +41,7 @@ for reference.
 - **#55 Enable/disable passives and watchers.** `!passive disable/enable`, the same on `!gpassive` and `!watch`, plus a formula function. Useful for testing and for "silenced" statuses.
 - **#56 Status source tracking.** An optional `source` on `status_apply` records who applied it. That gives kill credit for damage over time, "dispel only your own", and "the curse ends when the caster dies".
   - From the combat systems: covered by #227's `source=`; the source is a tracked reference (#209), so it clears when the unit that applied it leaves the match.
-- **#57 Repeated and labelled rolls.** `!roll 6x 4d6kh3` rolls six times; `!roll 1d20+5 attack` labels the result.
+- **#57 Labelled rolls.** `!roll 1d20+5 attack` labels the result. (Repeats, `!roll 6x 4d6kh3`, shipped with #217.)
 - **#59 `!turn roll [selector]`.** Rerolls initiative for the selected units with an `initiative_roll_formula` rule.
 - **#66 `!redo`.** Keeps the snapshots an undo dropped until the next state-changing command, so an undo can be taken back.
   - Note: undo replaces the Match object, and the journal records undo as state. Redo snapshots have to be dropped by any state change on the match from any channel, approvals and watchers included, and a redo needs its own journal entry.
@@ -112,15 +112,6 @@ for reference.
   - Renames a GM var on every unit, part and corpse of the match, plus `default_entity_vars` and clamp paths, in one undo step. Partial-template markers record the move, and the formulas still naming the old path are listed through #203's scanner, the way `!status rename` lists them.
   - Today statuses, zones, tables, macros and the engine's var-name rules can be renamed (`rename_status`, `_rename_entry`, `rename_unit_vars`). A GM's own var can't: renaming `stance` mid-campaign takes a `!foreach` over every unit plus hand edits of the defaults and clamps.
   - Open choice: templates in the server library get rewritten, or listed.
-- **#205 List helpers.**
-  - `take(l, n)`, `drop(l, n)`, `slice(l, a, b)`, `remove_at(l, i)`, `insert_at(l, i, v)`, `reverse(l)`, `flatten(l)`, `zip(a, b)`.
-  - Today `+` appends and `filter_with` removes by value. Taking the first card off a deck needs `map_with(range(1, len(deck)), lambda i: get(deck, i))` (checked on 836e3af), which also charges the loop limit per card.
-  - Uses:
-    - card decks, where a draw is `take` + `drop` and a reshuffle is `shuffle` (Savage Worlds initiative cards, Gloomhaven attack-modifier decks);
-    - queues;
-    - "last three attackers" histories;
-    - "dodge the next N attacks" counters (an NCS design note).
-  - It composes today, so it falls under the "simplify only what GMs write over and over" rule; the user's call.
 - **#206 Crash log for the bot owner.**
   - Every 💥 (an unexpected exception in a command) is recorded with time, server, match, user, the command as typed and the traceback, in a capped file under `data/` (an owner limit). `!owner errors [n]` lists them; `!owner errors <ref>` shows one.
   - The 💥 reply carries the reference (`💥 Unexpected error (ref 17): ...`), so a player can quote it in a bug report.
@@ -151,16 +142,6 @@ for reference.
     - Names resolved per viewer: `say("{target} is hit")` shows a disguised unit's disguise to a POV that the disguise fools.
     - `say_to(team, text)` for information meant for one side.
     - One message per command on Discord: the `say()` lines of one command grouped into one reply.
-- **#216 Local variables in `!func`, passive and tick bodies.**
-  - Allow bare-name assignment (`dealt = base - armor`) in every formula program, as actions already do. A local lives until the formula ends and is never stored.
-  - Design point: a `!func` runs inline in its caller's frame (formula.py:217, "functions are inline macros running in the caller's frame"), so a function's locals would land in the caller's namespace. Calls need their own frame for locals (parameters already behave like locals), or a function's locals get a per-call prefix.
-  - Names that are functions, bindings or `match` stay refused, as do `__` names (`_check_binding_name`).
-  - The game need: the damage calculation each system applies to every hit (D6). Removes L7 and most of D6.
-- **#217 List rolls.**
-  - `!roll none, none, minicrit, crit` picks one item; `none:3, minicrit, crit` weights like a table; `!roll 2x none, crit` rolls twice (#57).
-  - All three rule documents write crit and loot rolls this way: Solis crit tables, FCS1 "Loot Roll: !roll none,none,none,none,none,club,buckler". Today each list needs a `!table def` before anyone can roll it (D11). In formulas, `pick` and `roll_table` already do it.
-  - From the combat systems:
-    - `!roll 6x none, none, crit` for six rolls at once (#57); `keep=best` for FCS1 Calculated Strikes ("roll twice, and if one of the rolls is a crit, pick that"), sharing #253's adjustments.
 - **#218 `tile_place(template, x, y, map=None)`.**
   - The formula twin of `!tile place`, for attacks that leave a tile behind: Solis Flame Throw places a fire tile when the attack is dodged; FCS1 Scorch Ground sets up to five tiles on fire. `tile_template_of(x, y)` reads it back.
   - Today a formula writes the internal `_template` key with `tile_set` (D10). It works (`solis1.out`: a tree turned into fire from its own turn hook) and relies on an implementation detail.

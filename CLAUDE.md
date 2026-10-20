@@ -654,8 +654,14 @@ or unit (825).
 **Two modes.** EXPRESSION formulas (conditions: block / opaque / visibility /
 alive / death conditions, watcher conditions, slot conditions, modifier
 values, `$()` args) can't assign. PROGRAMS (passives, ticks, watcher effects,
-`!func` bodies, actions) can. A rule's schema says which (`"formula":
-"expression"|"program"`), and `!system set` validates it.
+`!func` bodies, status hooks, actions) can, and every program binds
+bare-name LOCALS (`dealt = base - armor`; `_collect_program_locals`
+pre-collects them as known params, `_EntityAccessTransformer(locals_ok=)`):
+a local lives until the formula ends and is never stored (a `!func` call
+runs in its own namespace copy), and can't take the name of a function
+(built-in or the match's `!func`s), a hook / action binding, an entity
+token, `match`, `entity` or a `__` name (886). A rule's schema says which
+(`"formula": "expression"|"program"`), and `!system set` validates it.
 
 **Identifier surfaces** resolved at runtime: `_ALLOWED_FUNCS` (pure helpers),
 `_MATCH_FUNC_NAMES` (match-bound), `HOOK_CONTEXT_NAMES` (bindings a fire site
@@ -708,9 +714,7 @@ lines `_check_line_budget`; `!func` recursion has its own limit. One bot
 process serves every server, so a formula's cost must follow the map, never
 its arguments.
 
-**Action mode** (`action_mode=True`) adds: bare-name assignments become
-locals (the validator pre-collects assign targets, so later references
-validate); `source.<path>`, `args.<key>`, `target.x` etc. (any bare-Name root)
+**Action mode** (`action_mode=True`) adds: `source.<path>`, `args.<key>`, `target.x` etc. (any bare-Name root)
 pass through to runtime attribute resolution — Python dunders (`__x__`) are
 rejected there, engine dunder vars (`__follows`) are fine; `for x in target`
 when target is a list; the builtins `cmd`, `fail`, `choose`, `choose_number`.
@@ -1083,7 +1087,10 @@ hardcodes**.
   `item_consume` (drops the container at 0; `amount_field` rule; `var_move`
   onto its own path is a no-op, into its own subtree refused), `var_keys`,
   `var_sum`, `var_clear`, `get`, `keys` / `values` / `index_of` / `unique`
-  (547-548, 685-686). keys / values / each / len / pick / shuffle /
+  (547-548, 685-686); list surgery: `take` / `drop` / `slice` (0-based,
+  negative counts from the end), `remove_at` / `insert_at` (new lists),
+  `reverse`, `flatten` (one level), `zip` (pure, loopable, charged to the
+  list budget, 887). keys / values / each / len / pick / shuffle /
   roll_table skip a partial template's `__template` marker
   (`formula._data_items`), as var_keys skips every `__` key. Authoring notes: in an item's action `source.<path>` is
   the ITEM's container and `entity[self]` the HOLDER; dict keys are unique, so
@@ -2184,7 +2191,10 @@ hardcodes**.
   dotted path and refuses a team with nothing to clear);
   a `modifiers` bundle applies to every member.
 - **Dice and tables:** `roll("NdM±k")` with explode `!` and keep `kh<n>` /
-  `kl<n>` (n ≥ 1); `!roll`, `!roll odds` (exact distributions); `roll_table`
+  `kl<n>` (n ≥ 1); `!roll`, `!roll odds` (exact distributions); `!roll
+  none, none, crit` (a comma list picks one item, `item:weight` weighted,
+  through `roll_table_pick`) and a leading `<n>x` repeating any roll, at
+  most `roll_repeat_limit` (owner ceiling) (888); `roll_table`
   (finite weights, keyed entries), `band` (ranges may be negative; an
   unreadable or backwards band is refused), named tables (`!table`, `table_roll`); `pick` / `shuffle`. All use
   `Match.formula_rng()`: a `logic.CountingRandom` seeded with the
