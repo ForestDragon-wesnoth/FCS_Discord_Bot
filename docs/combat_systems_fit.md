@@ -222,9 +222,9 @@ Each recipe below was built and run. The cost is what a GM has to write or keep 
   - Recipe: re-add it per unit with `!foreach`, or use one `!gpassive` that filters.
   - Fix: #221.
 - **D15 Setting a system up again for every battle.**
-  - Status definitions, global passives, functions, tables, watchers and macros all live in the match.
-  - Recipe: keep a prepared match and `!match clone` it for each battle. The test clone carried the definitions, passives, functions and tile templates, and it also copied the prepared match's units and round.
-  - Fix: #140, #162.
+  - Global passives and watchers live in the match. Status definitions, tables, macros, functions, tile templates and aliases can live on the system (#140 shipped: `!system status|table|macro`), so a new match on it starts with them.
+  - Recipe for the rest: keep a prepared match and `!match clone` it for each battle (it also copies the prepared match's units and round), or re-add them with a macro the system ships.
+  - Fix: #162.
 - **D16 Possession** (§0.2).
   - Recipe: switch the unit's team in a global status hook, with the L8 wrapper carrying the new side. Who may control the unit can't be enforced (L1).
   - Fix: #227, #28.

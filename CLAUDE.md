@@ -1263,7 +1263,8 @@ hardcodes**.
 - **Instances** live in `entity.status[name]` (level, duration, any data);
   raw editing via `!ent status`. **Definitions** (`Match.status_definitions`,
   `!status def/tick/when/stack/maxlevel/data/tags/removes/blockedby/sprite/
-  drop/list/info`) describe a status ONCE; an instance resolves behaviour from
+  drop/list/info`; a system holds its own, `!system status`, copied into a
+  new match, §7.16) describe a status ONCE; an instance resolves behaviour from
   the definition of the same name. Duration decrement and self-removal live
   in the GM's tick formula; the engine forces no decay (390-391).
 - **Definition hooks** (`!status hook <name> <on_added|on_removed|on_changed>
@@ -2119,7 +2120,7 @@ hardcodes**.
   event_log_format by key, default_clamps by path, default_entity_passives
   by id — merge every layer over the parent's instead, a root's own value
   replacing the default as before), `system_value_source`,
-  `system_library(s, kind)` (aliases / tile_templates / formula_functions,
+  `system_library(s, kind)` (each of `SYSTEM_LIBRARIES`,
   copied into a NEW match at creation as before). Editors write an
   effective value back through `system_rule_write` /
   `system_library_write`, which store only the entries that differ from the
@@ -2138,19 +2139,28 @@ hardcodes**.
   on a parent moves the units of every inheriting system's matches and
   renames their clamps / default vars (`_inheritors`); a child's own engine
   formula equal to its parent's after a rename is dropped (753-756).
-- **System libraries** (aliases, tile templates, formula functions):
-  `!system alias|tile|func <action> <system> ...` edit them with the
-  grammar of `!alias` / `!tile def` / `!func` (action first, like alias),
-  through the effective library (editing an inherited entry makes it the
-  child's own whole entry; deleting one hides it). They reach NEW matches
-  only (copied at creation, user call); `!match sync <aliases|tiles|funcs>
+- **System libraries** (`SYSTEM_LIBRARIES`: aliases, tile templates,
+  formula functions, status definitions, tables, macros):
+  `!system alias|tile|func|status|table|macro <action> <system> ...` edit
+  them with the grammar of `!alias` / `!tile def` / `!func` / `!status` /
+  `!table` / `!macro` (action first, like alias), through the effective
+  library (editing an inherited entry makes it the child's own whole
+  entry; deleting one hides it). `!system status` runs the definition
+  subcommands of `!status` (`_status_def_sub`, shared with the match
+  command) on a scratch match holding the system's effective library
+  (`_system_scratch`) and writes it back. They reach NEW matches only
+  (copied at creation, user call; a system macro has no author, so it runs
+  as a host's); `!match sync <aliases|tiles|funcs|statuses|tables|macros>
   [name] | all` copies the system's effective entries over a live match's
-  (match-only entries kept, an undo step), and `!system <lib> promote
-  <system> <name>` copies one from the channel's match into the system.
+  (match-only entries kept, an undo step; a synced status definition
+  re-caps live instances like `!status maxlevel`), and `!system <lib>
+  promote <system> <name>` copies one from the channel's match into the
+  system.
   Formulas a system stores (rules, tile hooks / block / opaque, function
-  bodies) go through `_system_formula_warning`: a disallowed construct is
-  refused, a call to an unknown function is stored with a ⚠️ (a match may
-  define it later; a promote counts only the system's library) (757-759).
+  bodies, status ticks / hooks) go through `_system_formula_warning`: a
+  disallowed construct is refused, a call to an unknown function is
+  stored with a ⚠️ (a match may define it later; a promote counts only the
+  system's library) (757-759, 896-899).
 - **System tooling:** `!system rename` (`MatchManager.rename_system`: the
   matches on it, children's parent links, server / channel defaults follow;
   `system_name` survives `_rollback_match` and `_restore_snapshot` keeps
@@ -2159,7 +2169,8 @@ hardcodes**.
   <a> <b>` (effective rules and library entries, with each rule's source;
   open to players), `!system lint <name>` (admin: every formula the system
   and its matches store — formula rules, default passives, library tile
-  hooks / block / opaque / functions, and per match its functions,
+  hooks / block / opaque / functions / status ticks and hooks, and per
+  match its functions,
   passives, unit actions, watchers, status ticks, tile and zone hooks and
   conditions; an unknown function at system level is a ⚠️), `!help rule
   <rule>` (description, allowed values, default, value on this channel's

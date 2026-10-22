@@ -5559,7 +5559,9 @@ MERGE_RULES: Dict[str, Optional[str]] = {
     "default_entity_passives": "id",
 }
 SYSTEM_LIBRARIES: Tuple[str, ...] = ("aliases", "tile_templates",
-                                     "formula_functions")
+                                     "formula_functions",
+                                     "status_definitions", "tables",
+                                     "macros")
 
 # Bot-owner limits that aren't gamerules (a gamerule belongs to a system, so
 # it can't bound the system chain itself). Set with `!owner ceiling <key>
@@ -5790,13 +5792,20 @@ class GameSystem:
     # shorthands (`dmg`, `heal`, `mv`, ...) that every match in this
     # system starts with. Stored as plain `name -> expansion` strings.
     aliases: Dict[str, str] = field(default_factory=dict)
+    # Status definitions (`!system status`, the shape of
+    # Match.status_definitions), named dice tables (`!system table`, name
+    # -> table text) and macros (`!system macro`, name -> body), copied
+    # into a new match like the libraries above.
+    status_definitions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    tables: Dict[str, str] = field(default_factory=dict)
+    macros: Dict[str, str] = field(default_factory=dict)
     # The system this one inherits from (live: MatchManager resolves the
-    # chain on every read), or None for a root. `settings` and the three
+    # chain on every read), or None for a root. `settings` and the
     # libraries above then hold only this system's OWN overrides.
     parent: Optional[str] = None
     # Inherited entries this system removes: a merge rule's keys
-    # (MERGE_RULES) or a library's names ("aliases", "tile_templates",
-    # "formula_functions") -> the keys hidden here.
+    # (MERGE_RULES) or a library's names (SYSTEM_LIBRARIES) -> the keys
+    # hidden here.
     removed: Dict[str, List[str]] = field(default_factory=dict)
     # A GM's note on what the system is for (`!system describe`), shown in
     # `!system list` / `info`. Each system's own: not inherited.
@@ -5844,6 +5853,12 @@ class GameSystem:
                 aname: str(self.aliases[aname])
                 for aname in sorted(self.aliases.keys())
             },
+            "status_definitions": {
+                n: copy.deepcopy(d)
+                for n, d in sorted(self.status_definitions.items())
+            },
+            "tables": {n: str(t) for n, t in sorted(self.tables.items())},
+            "macros": {n: str(b) for n, b in sorted(self.macros.items())},
             "parent": self.parent,
             "removed": {k: sorted(set(map(str, v)))
                         for k, v in sorted(self.removed.items()) if v},
@@ -5892,6 +5907,14 @@ class GameSystem:
             str(k): str(v) for k, v in raw_sys_aliases.items()
             if isinstance(k, str) and isinstance(v, str)
         }
+        sys_statuses = {
+            k: copy.deepcopy(v)
+            for k, v in (d.get("status_definitions") or {}).items()
+            if isinstance(k, str) and isinstance(v, dict)}
+        sys_tables, sys_macros = (
+            {k: v for k, v in (d.get(key) or {}).items()
+             if isinstance(k, str) and isinstance(v, str)}
+            for key in ("tables", "macros"))
         if dropped:
             print(f"[systems] '{d.get('name')}': dropped gamerule(s) that no "
                   f"longer exist: {', '.join(sorted(map(str, dropped)))}")
@@ -5906,7 +5929,8 @@ class GameSystem:
         return GameSystem(
             name=d["name"], settings=settings,
             tile_templates=templates, formula_functions=funcs,
-            aliases=sys_aliases,
+            aliases=sys_aliases, status_definitions=sys_statuses,
+            tables=sys_tables, macros=sys_macros,
             parent=parent if isinstance(parent, str) and parent else None,
             removed=removed,
             description=str(d.get("description") or ""),
@@ -22364,8 +22388,8 @@ class MatchManager:
             s.set(key, copy.deepcopy(new))
 
     def system_library(self, s: "GameSystem", kind: str) -> Dict[str, Any]:
-        """`s`'s effective library `kind` (aliases / tile_templates /
-        formula_functions): each layer's entries over its parent's, minus
+        """`s`'s effective library `kind` (one of SYSTEM_LIBRARIES): each
+        layer's entries over its parent's, minus
         the names it hides. Copies."""
         out: Dict[str, Any] = {}
         for x in self.system_chain(s):
@@ -22664,6 +22688,10 @@ class MatchManager:
         for aname, expansion in self.system_library(sysobj, "aliases").items():
             if isinstance(aname, str) and isinstance(expansion, str):
                 m.aliases[aname] = expansion
+        # Status definitions, dice tables and macros, the same way. A
+        # system macro carries no author, so it runs as a host's.
+        for kind in ("status_definitions", "tables", "macros"):
+            setattr(m, kind, copy.deepcopy(self.system_library(sysobj, kind)))
         self.matches[m.id] = m
         return m.id
 

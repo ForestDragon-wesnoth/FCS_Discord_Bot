@@ -293,8 +293,10 @@ def _admin_required(name: str, args: List[str]) -> bool:
             return False
         if sub == "access":                 # !system access <sys> <action>
             return len(args) < 3 or args[2].lower() != "list"
-        if sub in ("alias", "tile", "func"):  # !system alias <action> <sys>
-            return len(args) < 2 or args[1].lower() not in ("list", "info")
+        if sub in ("alias", "tile", "func", "status", "table", "macro"):
+            # !system alias <action> <sys> ...
+            return len(args) < 2 or args[1].lower() not in ("list", "info",
+                                                            "show")
         return True
     if name == "history":
         return sub in ("export", "import")  # host disk I/O
@@ -1669,7 +1671,9 @@ def _server_state_diff(old: Dict[str, Any], new: Dict[str, Any]) -> List[str]:
         if rules:
             bits.append("rules " + _rule_brief(rules))
         for lib, word in (("aliases", "aliases"), ("tile_templates", "tiles"),
-                          ("formula_functions", "functions")):
+                          ("formula_functions", "functions"),
+                          ("status_definitions", "statuses"),
+                          ("tables", "tables"), ("macros", "macros")):
             la, lb = a.get(lib) or {}, b.get(lib) or {}
             names = sorted(k for k in set(la) | set(lb)
                            if la.get(k) != lb.get(k))
@@ -3198,23 +3202,29 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
             return
         m = active_match(mgr, ctx)
         kinds = {"aliases": "aliases", "tiles": "tile_templates",
-                 "funcs": "formula_functions"}
+                 "funcs": "formula_functions",
+                 "statuses": "status_definitions", "tables": "tables",
+                 "macros": "macros"}
         singular = {"aliases": "alias", "tiles": "tile template",
-                    "funcs": "formula function"}
+                    "funcs": "formula function",
+                    "statuses": "status definition", "tables": "table",
+                    "macros": "macro"}
         kind = args[1].lower()
         if kind not in kinds and kind != "all":
-            raise VTTError(f"`{args[1]}` — sync one of: aliases, tiles, "
-                           f"funcs, all.")
+            raise VTTError(f"`{args[1]}` — sync one of: "
+                           f"{', '.join(kinds)}, all.")
         rest = args[2:]
         preview = bool(rest) and rest[-1].lower() == "diff"
         if preview:
             rest = rest[:-1]
         _check_tail(["sync", kind] + rest, 3 if kind != "all" else 2, (),
-                    "!match sync <aliases|tiles|funcs> [name] [diff] | "
+                    "!match sync <aliases|tiles|funcs|statuses|tables|"
+                    "macros> [name] [diff] | "
                     "!match sync all [diff]")
         want = rest[0] if rest else None
         sysobj = mgr.get_system(m.system_name)
         lines: List[str] = []
+        hook_log: List[str] = []
         for word, lib_name in kinds.items():
             if kind not in (word, "all"):
                 continue
@@ -3252,6 +3262,12 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                         m.alias_authors.pop(n, None)
                     elif lib_name == "formula_functions":
                         m.func_authors.pop(n, None)
+                    elif lib_name == "macros":
+                        m.macro_authors.pop(n, None)
+                    elif lib_name == "status_definitions":
+                        # A lower max_level lowers live instances, as
+                        # `!status maxlevel` does.
+                        hook_log += m.recap_status(n)
             if not lib:
                 lines.append(f"{word}: system `{m.system_name}` has none.")
                 continue
@@ -3272,7 +3288,7 @@ async def match_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
                 f"🔎 A sync from system `{m.system_name}` (nothing changed "
                 f"yet):\n" + "\n".join(lines))
         return await ctx.send(f"🔄 Synced from system `{m.system_name}`:\n"
-                              + "\n".join(lines))
+                              + "\n".join(lines + hook_log))
     if sub == "journal":
         return await _match_journal(ctx, args, mgr)
     if sub == "replay":
@@ -3471,15 +3487,18 @@ registry.annotate_sub(
           "(the seed predicts every roll); not an undo step."))
 registry.annotate_sub(
     "match", "sync",
-    usage=("!match sync <aliases|tiles|funcs> [name] [diff] | "
-           "!match sync all [diff]"),
-    desc=("Copy the GameSystem's aliases, tile templates or formula "
-          "functions (its own and inherited ones; one by name, or all) over "
-          "this match's. A system's libraries reach only matches created "
-          "after an edit by themselves; this brings a live match up to date. "
-          "Entries only the match has are kept; undo reverts it. A trailing "
-          "`diff` shows what would change and changes nothing. The other "
-          "way: `!system <alias|tile|func> promote`."),
+    usage=("!match sync <aliases|tiles|funcs|statuses|tables|macros> "
+           "[name] [diff] | !match sync all [diff]"),
+    desc=("Copy the GameSystem's aliases, tile templates, formula "
+          "functions, status definitions, tables or macros (its own and "
+          "inherited ones; one by name, or all) over this match's. A "
+          "system's libraries reach only matches created after an edit by "
+          "themselves; this brings a live match up to date. Entries only "
+          "the match has are kept; undo reverts it. A synced status "
+          "definition with a lower max_level lowers live instances. A "
+          "trailing `diff` shows what would change and changes nothing. The "
+          "other way: `!system <alias|tile|func|status|table|macro> "
+          "promote`."),
 )
 registry.annotate_sub(
     "match", "fog",
@@ -7205,6 +7224,10 @@ async def system_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await _system_tile(ctx, args, mgr)
     if sub == "func":
         return await _system_func(ctx, args, mgr)
+    if sub == "status":
+        return await _system_status(ctx, args, mgr)
+    if sub in ("table", "macro"):
+        return await _system_text_lib(ctx, args, mgr, sub)
 
     # ---- system alias <subcommand> -----------------------------------
     # System-level alias library. These don't affect any currently live
@@ -7574,6 +7597,16 @@ def _system_lint(mgr: MatchManager, s: Any) -> str:
         check_name(f"function `{fname}`", fname, fn.params)
         check(f"function `{fname}`", fn.body, "exec", sys_known,
               frozenset(fn.params), soft=True)
+    for sname, sdef in sorted(
+            mgr.system_library(s, "status_definitions").items()):
+        sdef = sdef if isinstance(sdef, dict) else {}
+        hooks = sdef.get("hooks") if isinstance(sdef.get("hooks"), dict) else {}
+        for where, src in ([("tick", sdef.get("tick"))]
+                           + [(f"{h} hook", hooks[h]) for h in sorted(hooks)]):
+            if isinstance(src, str) and src.strip():
+                n += 1
+                check(f"status `{sname}` {where}", src, "exec", sys_known,
+                      soft=True)
     matches = sorted((m for m in mgr.matches.values()
                       if m.system_name == s.name), key=lambda m: m.id)
     for m in matches:
@@ -7600,6 +7633,17 @@ def _sync_change(lib_name: str, name: str, old: Any, new: Any) -> str:
     if lib_name == "aliases":
         return (f"  `!{name}`: " + (f"`!{old}` → " if old is not None else "")
                 + f"`!{new}`")
+    if lib_name in ("tables", "macros"):
+        return (f"  `{name}`: "
+                + (f"`{_clip(old, 40)}` → " if old is not None else "")
+                + f"`{_clip(new, 40)}`")
+    if lib_name == "status_definitions":
+        if old is None:
+            return f"  `{name}`: new definition"
+        keys = sorted(k for k in set(old) | set(new) if old.get(k) != new.get(k))
+        return f"  `{name}`: " + "; ".join(
+            f"{k}: " + (_clip(repr(old[k]), 30) if k in old else "—") + " → "
+            + (_clip(repr(new[k]), 30) if k in new else "—") for k in keys)
     if lib_name == "formula_functions":
         was = FormulaFunction.from_dict(old) if old is not None else None
         return (f"  `{new.signature()}`: "
@@ -7857,12 +7901,228 @@ async def _system_func(ctx: ReplyContext, args: List[str],
            f"formula_functions:{name}` brings it back)." if hid else "."))
 
 
+def _system_scratch(mgr: MatchManager, s: Any) -> Match:
+    """A throwaway match holding `s`'s effective status definitions,
+    tables, macros and functions, for running a match-side editor on the
+    system's library (its renames and mention notes included)."""
+    m = Match(id="_system", name="", maps=default_maps(1, 1),
+              system_name=s.name, rules=mgr._build_rules_dict(s))
+    for kind in ("status_definitions", "tables", "macros"):
+        setattr(m, kind, mgr.system_library(s, kind))
+    for fname, fdef in mgr.system_library(s, "formula_functions").items():
+        try:
+            m.formula_functions[fname] = FormulaFunction.from_dict(fdef)
+        except (KeyError, TypeError, VTTError):
+            continue
+    return m
+
+
+_SYSTEM_LIB_DELETES = ("del", "delete", "remove", "rm", "drop")
+
+
+def _system_deleted_line(mgr: MatchManager, s: Any, kind: str, what: str,
+                         name: str) -> str:
+    """The reply of deleting entry `name` from `s`'s library `kind`."""
+    hid = name in (s.removed.get(kind) or [])
+    return (f"Deleted {what} `{name}` from system `{s.name}`"
+            + (f" (it hides the inherited one; `!system unset {s.name} "
+               f"{kind}:{name}` brings it back)." if hid else "."))
+
+
+def _system_hidden_line(s: Any, kind: str) -> List[str]:
+    hidden = s.removed.get(kind) or []
+    return (["Hidden here: " + ", ".join(f"`{h}`" for h in hidden)]
+            if hidden else [])
+
+
+async def _system_status(ctx: ReplyContext, args: List[str],
+                         mgr: MatchManager):
+    """`!system status <action> <system> ...` — the definition subcommands
+    of `!status` on a system's library."""
+    if await return_help_if_not_enough_args(ctx, args, 3, "system", "status"):
+        return
+    action, sys_name = args[1].lower(), args[2]
+    s = mgr.get_system(sys_name)
+    kind = "status_definitions"
+    need = {k: v + 2 for k, v in _STATUS_DEF_SUBS.items()}
+    need.update({"list": 3, "info": 4, "promote": 4,
+                 **{d: 4 for d in _SYSTEM_LIB_DELETES}})
+    if action not in need:
+        return await _help_fallback(ctx, ["system", "status"], args[1])
+    if await return_help_if_not_enough_args(ctx, args, need[action],
+                                            "system", "status"):
+        return
+    lib = mgr.system_library(s, kind)
+    if action == "list":
+        _check_tail(args, 3, (), "!system status list <system>")
+        if not lib:
+            return await ctx.send(
+                f"No status definitions on system `{sys_name}`.")
+        lines = [f"**Status definitions on `{sys_name}`:**"]
+        for name in sorted(lib):
+            d = lib[name]
+            bits = [f"when={d.get('tick_when', 'turn_end')}"]
+            if d.get("stack"):
+                bits.append(f"stack={d['stack']}")
+            if d.get("max_level"):
+                bits.append(f"max_lvl={d['max_level']}")
+            if not (isinstance(d.get("tick"), str) and d["tick"].strip()):
+                bits.append("no tick")
+            src = "" if name in s.status_definitions else " (inherited)"
+            lines.append(f"- `{name}` ({', '.join(bits)}){src}")
+        return await ctx.send("\n".join(lines + _system_hidden_line(s, kind)))
+    name = args[3]
+    if action == "promote":
+        _check_tail(args, 4, (), "!system status promote <system> <name>")
+        m = active_match(mgr, ctx)
+        sdef = m.status_definitions.get(name)
+        if sdef is None:
+            raise NotFound(f"status definition `{name}` isn't defined on "
+                           f"match `{m.id}`.")
+        prior = lib.get(name)
+        lib[name] = copy.deepcopy(sdef)
+        mgr.system_library_write(s, kind, lib)
+        hooks = sdef.get("hooks") if isinstance(sdef.get("hooks"), dict) else {}
+        progs = ([("its tick", sdef["tick"])]
+                 if isinstance(sdef.get("tick"), str) and sdef["tick"].strip()
+                 else []) + [(f"its {h} hook", src)
+                             for h, src in sorted(hooks.items())]
+        warns = [_promote_warning(mgr, s, src, what) for what, src in progs]
+        return await ctx.send("\n".join(
+            [_promoted_line("status definition", f"`{name}`", m.id, sys_name,
+                            prior is not None, prior == lib[name])]
+            + [w for w in warns if w]))
+    if action == "info":
+        _check_tail(args, 4, (), "!system status info <system> <name>")
+        d = _system_lib_entry(mgr, s, kind, name, sys_name,
+                              "status definition")
+        src = "" if name in s.status_definitions else " (inherited)"
+        return await ctx.send(
+            f"**status def `{name}`** on `{sys_name}`{src}\n"
+            f"```{json.dumps(d, indent=2, sort_keys=True)}\n```")
+    if action in _SYSTEM_LIB_DELETES:
+        _check_tail(args, 4, (), f"!system status {action} <system> <name>")
+        _system_lib_entry(mgr, s, kind, name, sys_name, "status definition")
+        del lib[name]
+        mgr.system_library_write(s, kind, lib)
+        return await ctx.send(_system_deleted_line(
+            mgr, s, kind, "status definition", name))
+
+    def check(body: str, what: str) -> Optional[str]:
+        return _system_formula_warning(
+            mgr, s, body, "exec", f"Invalid {what} formula", "it fails")
+
+    scratch = _system_scratch(mgr, s)
+    reply = await _status_def_sub(ctx, [action] + args[3:], scratch,
+                                  "!system status {sub} " + sys_name, check)
+    mgr.system_library_write(s, kind, scratch.status_definitions)
+    if reply:
+        await ctx.send(reply)
+
+
+async def _system_text_lib(ctx: ReplyContext, args: List[str],
+                           mgr: MatchManager, sub: str):
+    """`!system table|macro <action> <system> ...` — the tables (`!table`
+    grammar) and macros (`!macro` grammar) of a system's library."""
+    if await return_help_if_not_enough_args(ctx, args, 3, "system", sub):
+        return
+    action, sys_name = args[1].lower(), args[2]
+    s = mgr.get_system(sys_name)
+    kind, what, write = (("tables", "table", "def") if sub == "table"
+                         else ("macros", "macro", "set"))
+    need = {"list": 3, "info": 4, "show": 4, "promote": 4, write: 5,
+            "rename": 5, "copy": 5, **{d: 4 for d in _SYSTEM_LIB_DELETES}}
+    if action not in need:
+        return await _help_fallback(ctx, ["system", sub], args[1])
+    if await return_help_if_not_enough_args(ctx, args, need[action],
+                                            "system", sub):
+        return
+    lib = mgr.system_library(s, kind)
+    own = getattr(s, kind)
+    if action == "list":
+        _check_tail(args, 3, (), f"!system {sub} list <system>")
+        if not lib:
+            return await ctx.send(f"No {what}s on system `{sys_name}`.")
+        lines = [f"**{what.capitalize()}s on `{sys_name}`:**"]
+        for name in sorted(lib):
+            text = lib[name] if sub == "table" else lib[name].split("\n")[0]
+            text = text if len(text) <= 60 else text[:57] + "..."
+            src = "" if name in own else " (inherited)"
+            lines.append(f"- `{name}`: `{text}`{src}")
+        return await ctx.send("\n".join(lines + _system_hidden_line(s, kind)))
+    name = args[3]
+    if action == "promote":
+        _check_tail(args, 4, (), f"!system {sub} promote <system> <name>")
+        m = active_match(mgr, ctx)
+        entry = getattr(m, kind).get(name)
+        if entry is None:
+            raise NotFound(f"{what} `{name}` isn't defined on match "
+                           f"`{m.id}`.")
+        prior = lib.get(name)
+        lib[name] = entry
+        mgr.system_library_write(s, kind, lib)
+        return await ctx.send(_promoted_line(what, f"`{name}`", m.id,
+                                             sys_name, prior is not None,
+                                             prior == entry))
+    if action in ("info", "show"):
+        _check_tail(args, 4, (), f"!system {sub} {action} <system> <name>")
+        entry = _system_lib_entry(mgr, s, kind, name, sys_name, what)
+        src = "" if name in own else " (inherited)"
+        if sub == "table":
+            return await ctx.send(f"**table `{name}`** on `{sys_name}`{src} "
+                                  f"= `{entry}`")
+        return await ctx.send(f"**macro `{name}`** on `{sys_name}`{src}"
+                              f"\n```\n{entry}\n```")
+    if action in _SYSTEM_LIB_DELETES:
+        _check_tail(args, 4, (), f"!system {sub} {action} <system> <name>")
+        _system_lib_entry(mgr, s, kind, name, sys_name, what)
+        del lib[name]
+        mgr.system_library_write(s, kind, lib)
+        return await ctx.send(_system_deleted_line(mgr, s, kind, what, name))
+    if action in ("rename", "copy"):
+        _check_tail(args, 5, (), f"!system {sub} {action} <system> <name> "
+                                 f"<new_name>")
+        new = args[4]
+        if action == "copy":
+            _copy_entry(lib, name, new, what)
+            mgr.system_library_write(s, kind, lib)
+            return await ctx.send(f"Copied {what} `{name}` to `{new}` on "
+                                  f"`{sys_name}`.")
+        scratch = _system_scratch(mgr, s)
+        lib = _rename_entry(lib, name, new, what)
+        mgr.system_library_write(s, kind, lib)
+        note = _mentions_note(scratch, name, what)
+        return await ctx.send(f"Renamed {what} `{name}` to `{new}` on "
+                              f"`{sys_name}`." + (f"\n{note}" if note else ""))
+    body = (" ".join(args[4:]).strip() if sub == "table"
+            else normalize_body_source(" ".join(args[4:]).strip()))
+    if sub == "table":
+        try:
+            roll_table_pick(random, body)
+        except FormulaError as ex:
+            raise VTTError(f"invalid table spec: {ex}")
+        reply = f"Defined table `{name}` = `{body}` on `{sys_name}`."
+    else:
+        try:
+            _parse_macro(body)
+        except _MacroError as ex:
+            raise VTTError(f"macro structure error: {ex}")
+        n = len([ln for ln in body.split("\n") if ln.strip()])
+        reply = f"Saved macro `{name}` ({n} line(s)) on `{sys_name}`."
+    prior = lib.get(name)
+    lib[name] = body
+    mgr.system_library_write(s, kind, lib)
+    if prior is not None and prior != body:
+        reply += " (Replaced the previous one.)"
+    return await ctx.send(reply)
+
+
 registry.annotate_sub("system", "list", usage="!system list", desc="List existing GameSystems.")
 registry.annotate_sub("system", "history", usage="!system history [n]", desc="The server-wide edits `!system undo` can take back (system rules, libraries, defaults, `!defvar` / `!defpassive` / `!gclamp`, log formats, default-system pointers), newest first, with who ran each and when. Administrators only.")
 registry.annotate_sub("system", "undo", usage="!system undo [n] [preview|confirm]", desc="Put every system and the default-system pointers back as they were before the newest n (default 1) server-wide edits, and re-apply the rules to every match (units take the var names those rules give). More than one step asks for `confirm`; `preview` lists the changes. Refused while a match uses a system that didn't exist then. `!store load` and `!server wipe` clear this history. Administrators only; the bot owner sets how many steps a server keeps (system_undo_steps).")
 registry.annotate_sub("system", "info", usage="!system info <name>", desc="Show a GameSystem's settings.")
 registry.annotate_sub("system", "rules", usage="!system rules", desc="List all available rules, their defaults, their types, and descriptions")
-registry.annotate_sub("system", "new", usage="!system new <name> [parent=<system>]", desc="Create a GameSystem, optionally inheriting from another: a child holds only its own overrides and reads everything else (rules, structured rules, aliases, tile templates, formula functions) live from its parent chain.")
+registry.annotate_sub("system", "new", usage="!system new <name> [parent=<system>]", desc="Create a GameSystem, optionally inheriting from another: a child holds only its own overrides and reads everything else (rules, structured rules, aliases, tile templates, formula functions, status definitions, tables, macros) live from its parent chain.")
 registry.annotate_sub(
     "system", "parent",
     usage="!system parent <name> <parent|none>",
@@ -7886,15 +8146,17 @@ registry.annotate_sub(
     "system", "diff",
     usage="!system diff <name> <other>",
     desc=("The gamerules and library entries (aliases, tile templates, "
-          "formula functions) whose effective values differ between two "
+          "formula functions, status definitions, tables, macros) whose "
+          "effective values differ between two "
           "systems, each rule with where its value comes from (own, "
           "inherited from a named system, or the engine default)."))
 registry.annotate_sub(
     "system", "lint",
     usage="!system lint <name>",
     desc=("Check every formula a system and its matches store at once: "
-          "formula rules, default passives, the system's tile hooks and "
-          "functions, and in each match its functions, passives (global, "
+          "formula rules, default passives, the system's tile hooks, "
+          "functions and status ticks / hooks, and in each match its "
+          "functions, passives (global, "
           "team, unit), unit actions, watchers, status ticks, tile and zone "
           "hooks and block / opaque conditions. Each was checked when stored, "
           "but a later edit (a deleted function, a rule changed on a parent) "
@@ -7910,7 +8172,8 @@ registry.annotate_sub(
           "(`default_entity_vars:mana`, `command_access:find`, "
           "`default_clamps:hp`, `default_entity_passives:<id>`, "
           "`event_log_format:<type>`), or one library entry "
-          "(`aliases:dmg`, `tile_templates:fire`, `formula_functions:crit`) "
+          "(`aliases:dmg`, `tile_templates:fire`, `formula_functions:crit`, "
+          "`status_definitions:burn`, `tables:loot`, `macros:setup`) "
           "it overrides or hides."))
 registry.annotate_sub(
     "system", "delete",
@@ -8002,6 +8265,62 @@ registry.annotate_sub(
         "<sys> formula_functions:<name>` brings it back)."
     ),
 )
+registry.annotate_sub(
+    "system", "status",
+    usage=(
+        "!system status <list <system> | info <system> <name> | "
+        "def <system> <name> | rename <system> <name> <new_name> | "
+        "copy <system> <name> <new_name> | tick <system> <name> <formula ...> | "
+        "hook <system> <name> <on_added|on_removed|on_changed> [<formula ...>] | "
+        "display <system> <name> [<format ...>] | "
+        "when <system> <name> <turn_end|turn_start|round_start|round_end|never> | "
+        "sprite <system> <name> <key|clear> [opacity=<n>] [tint=<color>] [layer=<n>] | "
+        "stack <system> <name> <refresh|add_level|extend|replace|none> | "
+        "maxlevel <system> <name> <n> | data <system> <name> <path> <value> | "
+        "tags <system> <name> <csv ...> | removes <system> <name> <tokens ...> | "
+        "blockedby <system> <name> <tokens ...> | del <system> <name> | "
+        "drop <system> <name> | delete <system> <name> | "
+        "remove <system> <name> | rm <system> <name> | "
+        "promote <system> <name>>"
+    ),
+    desc=(
+        "Manage a GameSystem's status definitions with the grammar of "
+        "`!status` (every definition subcommand, the system name after the "
+        "action). Copied into every NEW match on the system (and the "
+        "systems inheriting from it); a live match takes them with `!match "
+        "sync statuses`. `promote <sys> <name>` copies a definition from "
+        "the channel's match into the system. Editing an inherited "
+        "definition makes it this system's own; deleting one hides it "
+        "(`!system unset <sys> status_definitions:<name>` brings it back). "
+        "A tick or hook calling a function the system doesn't define is "
+        "stored with a ⚠️."
+    ),
+)
+for _sub, _write, _what, _gram in (
+        ("table", "def <system> <name> <spec ...>", "named dice tables",
+         "`!table`"),
+        ("macro", "set <system> <name> <body ...>", "macros", "`!macro`")):
+    registry.annotate_sub(
+        "system", _sub,
+        usage=(
+            f"!system {_sub} <list <system> | info <system> <name> | "
+            f"show <system> <name> | {_write} | "
+            f"rename <system> <name> <new_name> | "
+            f"copy <system> <name> <new_name> | del <system> <name> | "
+            f"drop <system> <name> | delete <system> <name> | "
+            f"remove <system> <name> | rm <system> <name> | "
+            f"promote <system> <name>>"),
+        desc=(
+            f"Manage a GameSystem's {_what} with the grammar of {_gram} (the "
+            f"system name after the action). Copied into every NEW match on "
+            f"the system (and the systems inheriting from it); a live match "
+            f"takes them with `!match sync {_sub}s`. `promote <sys> <name>` "
+            f"copies one from the channel's match into the system. Editing "
+            f"an inherited entry makes it this system's own; deleting one "
+            f"hides it (`!system unset <sys> {_sub}s:<name>` brings it "
+            f"back)." + (" A system macro has no author, so it runs as a "
+                         "host's." if _sub == "macro" else "")),
+    )
 registry.annotate_sub("system", "default", usage="!system default <server|channel> <name>", desc="Set the GameSystem new matches use: this server's default, or this channel's own.")
 
 # ---- group fan-out helpers -------------------------------------------------
@@ -16600,6 +16919,262 @@ for _sub, _usage in (
     registry.annotate_sub("status", _sub, usage=_usage)
 
 
+_TICK_WHENS = ("turn_end", "turn_start", "round_start", "round_end", "never")
+_STACK_MODES = ("refresh", "add_level", "extend", "replace", "none")
+# The `!status` subcommands that edit definitions, which `!system status`
+# runs on a system's library too: sub -> the words it needs.
+_STATUS_DEF_SUBS = {"def": 2, "rename": 3, "copy": 3, "drop": 2, "tick": 3,
+                    "hook": 3, "display": 2, "when": 3, "sprite": 3,
+                    "stack": 3, "maxlevel": 3, "data": 4, "tags": 2,
+                    "removes": 2, "blockedby": 2}
+
+
+def _match_program_check(m: Match):
+    """The formula check of a match's status ticks and hooks: a program
+    calling only built-ins and the match's `!func`s."""
+    def check(body: str, what: str) -> None:
+        try:
+            validate_formula(body, mode="exec",
+                             known_funcs=frozenset(m.formula_functions.keys()))
+        except FormulaError as ex:
+            raise VTTError(f"Invalid {what} formula: {ex}")
+    return check
+
+
+async def _status_def_sub(ctx: ReplyContext, args: List[str], m: Match,
+                          prefix: str, check) -> Optional[str]:
+    """Run definition subcommand `args[0]` of `!status` on `m`'s
+    status_definitions and return the reply ("" when help was sent), or
+    None when it isn't one. `prefix` is the command the hints name (a
+    format string over `sub`),
+    `check(body, what)` validates a tick / hook program (raises, or returns
+    a ⚠️ line)."""
+    sub = args[0].lower()
+    if sub == "def":
+        if await return_help_if_not_enough_args(ctx, args, 2, "status", "def"):
+            return ""
+        name = args[1]
+        try:
+            m.define_status(name)
+        except (VTTError, DuplicateId) as ex:
+            return (f"❌ {ex}")
+        return (
+            f"Defined status `{name}` (tick_when=turn_end, no tick yet). "
+            f"Set its effect with `{prefix.format(sub='tick')} {name} \"<formula>\"`."
+        )
+
+    if sub == "rename":
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "rename"):
+            return ""
+        _check_tail(args, 3, (), "!status rename <name> <new_name>")
+        n = m.rename_status(args[1], args[2])
+        bits = [f"{v} {k}" for k, v in (
+            ("live instance(s)", n["instances"]),
+            ("corpse(s)", n["corpses"]),
+            ("other definition(s)' removes / blocked_by", n["definitions"]),
+            ("immunity / resistance var(s)", n["vars"])) if v]
+        note = _mentions_note(m, args[1], "status")
+        return (
+            f"Renamed status `{args[1]}` to `{args[2]}`"
+            + (f" (with {', '.join(bits)})." if bits else ".")
+            + (f"\n{note}" if note else ""))
+
+    if sub == "copy":
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "copy"):
+            return ""
+        _check_tail(args, 3, (), "!status copy <name> <new_name>")
+        check_status_name(args[2])
+        _copy_entry(m.status_definitions, args[1], args[2], "status definition")
+        return (f"Copied status definition `{args[1]}` to "
+                              f"`{args[2]}`.")
+
+    if sub == "drop":
+        if await return_help_if_not_enough_args(ctx, args, 2, "status", "drop"):
+            return ""
+        try:
+            m.remove_status_def(args[1])
+        except NotFound as ex:
+            return (f"❌ {ex}")
+        return (
+            f"Removed status definition `{args[1]}`. Existing instances "
+            f"keep their data but lose tick behavior."
+        )
+
+    if sub == "tick":
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "tick"):
+            return ""
+        name = args[1]
+        if name not in m.status_definitions:
+            return (f"❌ No status definition `{name}`. Use `{prefix.format(sub='def')} {name}` first.")
+        body = normalize_body_source(" ".join(args[2:]).strip())
+        warn = check(body, "tick") if body else None
+        m.status_definitions[name]["tick"] = body
+        return f"Set `{name}` tick formula." + (f"\n{warn}" if warn else "")
+
+    if sub == "hook":
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "hook"):
+            return ""
+        name, hook = args[1], args[2].lower()
+        if name not in m.status_definitions:
+            return (f"❌ No status definition `{name}`. Use `{prefix.format(sub='def')} {name}` first.")
+        names = sorted(STATUS_DEF_HOOKS.values())
+        if hook not in names:
+            return (f"❌ hook must be one of: "
+                                  f"{', '.join(names)}.")
+        body = normalize_body_source(" ".join(args[3:]).strip())
+        sdef = m.status_definitions[name]
+        hooks = sdef.get("hooks") if isinstance(sdef.get("hooks"), dict) else {}
+        if not body:
+            if hooks.pop(hook, None) is None:
+                return (f"❌ `{name}` has no {hook} hook.")
+            if hooks:
+                sdef["hooks"] = hooks
+            else:
+                sdef.pop("hooks", None)
+            return (f"Cleared `{name}`'s {hook} hook.")
+        warn = check(body, hook)
+        hooks[hook] = body
+        sdef["hooks"] = hooks
+        return (f"Set `{name}`'s {hook} hook (runs after the "
+                f"on_status_* passives)." + (f"\n{warn}" if warn else ""))
+
+    if sub == "display":
+        if await return_help_if_not_enough_args(ctx, args, 2, "status", "display"):
+            return ""
+        name = args[1]
+        if name not in m.status_definitions:
+            return (f"❌ No status definition `{name}`.")
+        fmt = " ".join(args[2:]).strip()
+        if not fmt:
+            if m.status_definitions[name].pop("display", None) is None:
+                return (f"❌ `{name}` has no display format.")
+            return (f"Cleared `{name}`'s display format "
+                                  f"(it uses status_line_format).")
+        m.status_definitions[name]["display"] = fmt
+        return (f"`{name}` shows as `{fmt}` in `{{statuses}}`.")
+
+    if sub == "when":
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "when"):
+            return ""
+        name = args[1]
+        when = args[2].lower()
+        if name not in m.status_definitions:
+            return (f"❌ No status definition `{name}`.")
+        if when not in _TICK_WHENS:
+            return (f"❌ when must be one of: {', '.join(_TICK_WHENS)}.")
+        m.status_definitions[name]["tick_when"] = when
+        return (f"`{name}` ticks at {when}.")
+
+    if sub == "sprite":
+        # !status sprite <name> <key|clear> [opacity=<n>] [tint=<name>] [layer=<n>]
+        # The graphics overlay drawn over any entity carrying this status
+        # (e.g. a burning overlay). Definition-level; an entity's status
+        # INSTANCE can override the same fields. Graphics-only (no ASCII).
+        from logic import TEXT_COLORS
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "sprite"):
+            return ""
+        name = args[1]
+        if name not in m.status_definitions:
+            return (f"❌ No status definition `{name}`.")
+        sdef = m.status_definitions[name]
+        val = args[2]
+        if val.lower() in ("clear", "none", "-"):
+            sdef["sprite"] = ""
+            sdef["sprite_opacity"] = None
+            sdef["sprite_tint"] = ""
+            sdef["sprite_layer"] = None
+            return (f"Cleared overlay sprite for `{name}`.")
+        sdef["sprite"] = val
+        notes: List[str] = []
+        for a in args[3:]:
+            if "=" not in a:
+                continue
+            k, v = a.split("=", 1)
+            k = k.strip().lower()
+            if k == "opacity":
+                try:
+                    sdef["sprite_opacity"] = max(0, min(100, int(v)))
+                except ValueError:
+                    notes.append("opacity must be 0-100")
+            elif k == "tint":
+                sdef["sprite_tint"] = v
+                if v.lower() not in TEXT_COLORS and v.lower() not in ("gray", "grey"):
+                    notes.append(f"tint `{v}` is not a known palette name")
+            elif k == "layer":
+                try:
+                    sdef["sprite_layer"] = int(v)
+                except ValueError:
+                    notes.append("layer must be an integer")
+        extra = (" ⚠️ " + "; ".join(notes)) if notes else ""
+        return (
+            f"Set overlay sprite `{val}` for status `{name}` (drawn over "
+            f"afflicted entities on the graphics surface).{extra}")
+
+    if sub == "stack":
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "stack"):
+            return ""
+        name = args[1]
+        mode = args[2].lower()
+        if name not in m.status_definitions:
+            return (f"❌ No status definition `{name}`.")
+        if mode not in _STACK_MODES:
+            return (f"❌ stack mode must be one of: {', '.join(_STACK_MODES)}.")
+        m.status_definitions[name]["stack"] = mode
+        return (f"`{name}` stack mode = {mode}.")
+
+    if sub == "maxlevel":
+        if await return_help_if_not_enough_args(ctx, args, 3, "status", "maxlevel"):
+            return ""
+        name = args[1]
+        if name not in m.status_definitions:
+            return (f"❌ No status definition `{name}`.")
+        try:
+            n = int(args[2])
+        except ValueError:
+            return ("❌ maxlevel must be an integer (0 = uncapped).")
+        m.status_definitions[name]["max_level"] = max(0, n)
+        log = m.recap_status(name)
+        return ("\n".join([f"`{name}` max_level = {max(0, n)}."]
+                                         + log))
+
+    if sub == "data":
+        if await return_help_if_not_enough_args(ctx, args, 4, "status", "data"):
+            return ""
+        name = args[1]
+        if name not in m.status_definitions:
+            return (f"❌ No status definition `{name}`.")
+        path = args[2]
+        value = _parse_scalar(args[3])
+        check_store_path(path, "status data path")
+        value = checked_status_value(path, value, f"status def `{name}` data")
+        d = m.status_definitions[name].setdefault("data", {})
+        try:
+            _set_path(d, path, value)
+        except (VTTError, KeyError, TypeError) as ex:
+            return (f"❌ {ex}")
+        return (f"`{name}` default data.{path} = {value!r}")
+
+    if sub in ("tags", "removes", "blockedby"):
+        if await return_help_if_not_enough_args(ctx, args, 2, "status", sub):
+            return ""
+        name = args[1]
+        if name not in m.status_definitions:
+            return (f"❌ No status definition `{name}`.")
+        field = "blocked_by" if sub == "blockedby" else sub
+        raw = " ".join(args[2:]).strip()
+        if raw in ("", "-"):
+            m.status_definitions[name][field] = [] if sub == "tags" else ""
+            return (f"Cleared `{name}` {field}.")
+        toks = [t.strip() for t in raw.replace(",", " ").split() if t.strip()]
+        if sub == "tags":
+            m.status_definitions[name]["tags"] = toks
+        else:
+            m.status_definitions[name][field] = ",".join(toks)
+        return (f"`{name}` {field} = {', '.join(toks)}")
+
+    return None
+
+
 @registry.command(
     "status",
     usage=("!status <def|drop|rename|copy|tick|hook|display|when|stack|maxlevel|data|tags|"
@@ -16646,241 +17221,11 @@ async def status_cmd(ctx: ReplyContext, args: List[str], mgr: MatchManager):
         return await ctx.send(f"**{title}**\n{body}")
     m = active_match(mgr, ctx)
     sub = args[0].lower()
-    _TICK_WHENS = ("turn_end", "turn_start", "round_start", "round_end", "never")
-    _STACK_MODES = ("refresh", "add_level", "extend", "replace", "none")
 
-    if sub == "def":
-        if await return_help_if_not_enough_args(ctx, args, 2, "status", "def"):
-            return
-        name = args[1]
-        try:
-            m.define_status(name)
-        except (VTTError, DuplicateId) as ex:
-            return await ctx.send(f"❌ {ex}")
-        return await ctx.send(
-            f"Defined status `{name}` (tick_when=turn_end, no tick yet). "
-            f"Set its effect with `!status tick {name} \"<formula>\"`."
-        )
-
-    if sub == "rename":
-        if await return_help_if_not_enough_args(ctx, args, 3, "status", "rename"):
-            return
-        _check_tail(args, 3, (), "!status rename <name> <new_name>")
-        n = m.rename_status(args[1], args[2])
-        bits = [f"{v} {k}" for k, v in (
-            ("live instance(s)", n["instances"]),
-            ("corpse(s)", n["corpses"]),
-            ("other definition(s)' removes / blocked_by", n["definitions"]),
-            ("immunity / resistance var(s)", n["vars"])) if v]
-        note = _mentions_note(m, args[1], "status")
-        return await ctx.send(
-            f"Renamed status `{args[1]}` to `{args[2]}`"
-            + (f" (with {', '.join(bits)})." if bits else ".")
-            + (f"\n{note}" if note else ""))
-
-    if sub == "copy":
-        if await return_help_if_not_enough_args(ctx, args, 3, "status", "copy"):
-            return
-        _check_tail(args, 3, (), "!status copy <name> <new_name>")
-        check_status_name(args[2])
-        _copy_entry(m.status_definitions, args[1], args[2], "status definition")
-        return await ctx.send(f"Copied status definition `{args[1]}` to "
-                              f"`{args[2]}`.")
-
-    if sub == "drop":
-        if await return_help_if_not_enough_args(ctx, args, 2, "status", "drop"):
-            return
-        try:
-            m.remove_status_def(args[1])
-        except NotFound as ex:
-            return await ctx.send(f"❌ {ex}")
-        return await ctx.send(
-            f"Removed status definition `{args[1]}`. Existing instances "
-            f"keep their data but lose tick behavior."
-        )
-
-    if sub == "tick":
-        if await return_help_if_not_enough_args(ctx, args, 3, "status", "tick"):
-            return
-        name = args[1]
-        if name not in m.status_definitions:
-            return await ctx.send(f"❌ No status definition `{name}`. Use `!status def {name}` first.")
-        body = normalize_body_source(" ".join(args[2:]).strip())
-        if body:
-            try:
-                validate_formula(
-                    body, mode="exec",
-                    known_funcs=frozenset(m.formula_functions.keys()),
-                )
-            except FormulaError as ex:
-                return await ctx.send(f"❌ Invalid tick formula: {ex}")
-        m.status_definitions[name]["tick"] = body
-        return await ctx.send(f"Set `{name}` tick formula.")
-
-    if sub == "hook":
-        if await return_help_if_not_enough_args(ctx, args, 3, "status", "hook"):
-            return
-        name, hook = args[1], args[2].lower()
-        if name not in m.status_definitions:
-            return await ctx.send(f"❌ No status definition `{name}`. Use `!status def {name}` first.")
-        names = sorted(STATUS_DEF_HOOKS.values())
-        if hook not in names:
-            return await ctx.send(f"❌ hook must be one of: "
-                                  f"{', '.join(names)}.")
-        body = normalize_body_source(" ".join(args[3:]).strip())
-        sdef = m.status_definitions[name]
-        hooks = sdef.get("hooks") if isinstance(sdef.get("hooks"), dict) else {}
-        if not body:
-            if hooks.pop(hook, None) is None:
-                return await ctx.send(f"❌ `{name}` has no {hook} hook.")
-            if hooks:
-                sdef["hooks"] = hooks
-            else:
-                sdef.pop("hooks", None)
-            return await ctx.send(f"Cleared `{name}`'s {hook} hook.")
-        try:
-            validate_formula(body, mode="exec",
-                             known_funcs=frozenset(m.formula_functions.keys()))
-        except FormulaError as ex:
-            return await ctx.send(f"❌ Invalid {hook} formula: {ex}")
-        hooks[hook] = body
-        sdef["hooks"] = hooks
-        return await ctx.send(f"Set `{name}`'s {hook} hook (runs after the "
-                              f"on_status_* passives).")
-
-    if sub == "display":
-        if await return_help_if_not_enough_args(ctx, args, 2, "status", "display"):
-            return
-        name = args[1]
-        if name not in m.status_definitions:
-            return await ctx.send(f"❌ No status definition `{name}`.")
-        fmt = " ".join(args[2:]).strip()
-        if not fmt:
-            if m.status_definitions[name].pop("display", None) is None:
-                return await ctx.send(f"❌ `{name}` has no display format.")
-            return await ctx.send(f"Cleared `{name}`'s display format "
-                                  f"(it uses status_line_format).")
-        m.status_definitions[name]["display"] = fmt
-        return await ctx.send(f"`{name}` shows as `{fmt}` in `{{statuses}}`.")
-
-    if sub == "when":
-        if await return_help_if_not_enough_args(ctx, args, 3, "status", "when"):
-            return
-        name = args[1]
-        when = args[2].lower()
-        if name not in m.status_definitions:
-            return await ctx.send(f"❌ No status definition `{name}`.")
-        if when not in _TICK_WHENS:
-            return await ctx.send(f"❌ when must be one of: {', '.join(_TICK_WHENS)}.")
-        m.status_definitions[name]["tick_when"] = when
-        return await ctx.send(f"`{name}` ticks at {when}.")
-
-    if sub == "sprite":
-        # !status sprite <name> <key|clear> [opacity=<n>] [tint=<name>] [layer=<n>]
-        # The graphics overlay drawn over any entity carrying this status
-        # (e.g. a burning overlay). Definition-level; an entity's status
-        # INSTANCE can override the same fields. Graphics-only (no ASCII).
-        from logic import TEXT_COLORS
-        if await return_help_if_not_enough_args(ctx, args, 3, "status", "sprite"):
-            return
-        name = args[1]
-        if name not in m.status_definitions:
-            return await ctx.send(f"❌ No status definition `{name}`.")
-        sdef = m.status_definitions[name]
-        val = args[2]
-        if val.lower() in ("clear", "none", "-"):
-            sdef["sprite"] = ""
-            sdef["sprite_opacity"] = None
-            sdef["sprite_tint"] = ""
-            sdef["sprite_layer"] = None
-            return await ctx.send(f"Cleared overlay sprite for `{name}`.")
-        sdef["sprite"] = val
-        notes: List[str] = []
-        for a in args[3:]:
-            if "=" not in a:
-                continue
-            k, v = a.split("=", 1)
-            k = k.strip().lower()
-            if k == "opacity":
-                try:
-                    sdef["sprite_opacity"] = max(0, min(100, int(v)))
-                except ValueError:
-                    notes.append("opacity must be 0-100")
-            elif k == "tint":
-                sdef["sprite_tint"] = v
-                if v.lower() not in TEXT_COLORS and v.lower() not in ("gray", "grey"):
-                    notes.append(f"tint `{v}` is not a known palette name")
-            elif k == "layer":
-                try:
-                    sdef["sprite_layer"] = int(v)
-                except ValueError:
-                    notes.append("layer must be an integer")
-        extra = (" ⚠️ " + "; ".join(notes)) if notes else ""
-        return await ctx.send(
-            f"Set overlay sprite `{val}` for status `{name}` (drawn over "
-            f"afflicted entities on the graphics surface).{extra}")
-
-    if sub == "stack":
-        if await return_help_if_not_enough_args(ctx, args, 3, "status", "stack"):
-            return
-        name = args[1]
-        mode = args[2].lower()
-        if name not in m.status_definitions:
-            return await ctx.send(f"❌ No status definition `{name}`.")
-        if mode not in _STACK_MODES:
-            return await ctx.send(f"❌ stack mode must be one of: {', '.join(_STACK_MODES)}.")
-        m.status_definitions[name]["stack"] = mode
-        return await ctx.send(f"`{name}` stack mode = {mode}.")
-
-    if sub == "maxlevel":
-        if await return_help_if_not_enough_args(ctx, args, 3, "status", "maxlevel"):
-            return
-        name = args[1]
-        if name not in m.status_definitions:
-            return await ctx.send(f"❌ No status definition `{name}`.")
-        try:
-            n = int(args[2])
-        except ValueError:
-            return await ctx.send("❌ maxlevel must be an integer (0 = uncapped).")
-        m.status_definitions[name]["max_level"] = max(0, n)
-        log = m.recap_status(name)
-        return await ctx.send("\n".join([f"`{name}` max_level = {max(0, n)}."]
-                                         + log))
-
-    if sub == "data":
-        if await return_help_if_not_enough_args(ctx, args, 4, "status", "data"):
-            return
-        name = args[1]
-        if name not in m.status_definitions:
-            return await ctx.send(f"❌ No status definition `{name}`.")
-        path = args[2]
-        value = _parse_scalar(args[3])
-        check_store_path(path, "status data path")
-        value = checked_status_value(path, value, f"status def `{name}` data")
-        d = m.status_definitions[name].setdefault("data", {})
-        try:
-            _set_path(d, path, value)
-        except (VTTError, KeyError, TypeError) as ex:
-            return await ctx.send(f"❌ {ex}")
-        return await ctx.send(f"`{name}` default data.{path} = {value!r}")
-
-    if sub in ("tags", "removes", "blockedby"):
-        if await return_help_if_not_enough_args(ctx, args, 2, "status", sub):
-            return
-        name = args[1]
-        if name not in m.status_definitions:
-            return await ctx.send(f"❌ No status definition `{name}`.")
-        field = "blocked_by" if sub == "blockedby" else sub
-        raw = " ".join(args[2:]).strip()
-        if raw in ("", "-"):
-            m.status_definitions[name][field] = [] if sub == "tags" else ""
-            return await ctx.send(f"Cleared `{name}` {field}.")
-        toks = [t.strip() for t in raw.replace(",", " ").split() if t.strip()]
-        if sub == "tags":
-            m.status_definitions[name]["tags"] = toks
-        else:
-            m.status_definitions[name][field] = ",".join(toks)
-        return await ctx.send(f"`{name}` {field} = {', '.join(toks)}")
+    reply = await _status_def_sub(ctx, args, m, "!status {sub}",
+                                  _match_program_check(m))
+    if reply is not None:
+        return await ctx.send(reply) if reply else None
 
     if sub == "resist":
         if await return_help_if_not_enough_args(ctx, args, 3, "status", "resist"):

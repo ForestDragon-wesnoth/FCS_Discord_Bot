@@ -15,7 +15,7 @@ or rejects one, it moves to "Off the list".
 
 **Shipped:** #3, #4, #15, #29, #41, #60, #67, #68, #69, #72, #74, #81, #94,
 #99-#103, #106, #109, #110, #113, #125, #126 (as `!dry`), #132, #142, #165-#176,
-#75, #93, #127, #130, #179-#181, #183, #186-#188, #200-#202, #205, #206, #216-#218, #222, #40 and #164 (multiple and nested maps, see
+#75, #93, #127, #130, #140, #179-#181, #183, #186-#188, #200-#202, #205, #206, #216-#218, #222, #40 and #164 (multiple and nested maps, see
 `docs/multi_map_design.md`), parts of #14.
 
 **Off the list:**
@@ -345,8 +345,6 @@ or rejects one, it moves to "Off the list".
   - A per-unit `layer` (ground / air / burrow) with occupancy tracked per layer.
   - A flyer passes over a ground unit or shares its cell, and block conditions can read the layer.
   - Elevation (#37) is separate: that one is terrain height.
-- **#140 System-wide status definitions, tables and macros.** `!defstatus`, `!deftable` and `!defmacro` give new matches on a system the GM's definitions, the way `!system tile` / `!system func` / `!system alias` now do for their libraries. Inheritance through the system chain comes with it.
-  - Note: this is D15 of docs/combat_systems_fit.md: today a prepared match cloned for each battle stands in for it.
 - **#141 User-defined commands.** `!cmd def <name> <usage> <body>` registers a command with named arguments, an access level and help text that runs an action or macro body. Players type `!attack goblin`, and the usage string feeds the stray-word check and Tab completion.
 - **#143 Team-based turns.** A `turn_mode` rule (`unit` | `team`). On a team's turn any of its units can act; `!turn next` passes to the next side, and hooks fire per side turn and per unit. Wesnoth / XCOM style.
 - **#144 Phase-based rounds.** A `round_phases` list (e.g. move, then act). `!turn next` cycles every unit through phase 1 before phase 2, with phase hooks.
@@ -417,7 +415,7 @@ or rejects one, it moves to "Off the list".
   - Two or three ready systems shipped with the bot as data, loadable on any server: status definitions, templates with actions, passives, tables, macros, a demo map.
   - Solis is a natural first one: its core is already built in `audit/combat/solis1.txt` and `solis2.txt`, and it is the smallest of the three systems.
   - The engine has no combat or inventory by design, so a new GM starts from an empty system. The scenarios show every piece on its own and none of them as a game. A starter system shows the composition, and doubles as a realistic board for the chaos harnesses.
-  - Shape depends on #162 (system packs) or a bundled `!store load` save, and on #140 (status definitions on systems).
+  - Shape depends on #162 (system packs) or a bundled `!store load` save.
 - **#227 Status application options.**
   - `status_apply(eid, name, level=None, duration=None, data=None, source=None, cap=None)`, and the same keys on `!status apply`:
     - `data` is merged into the instance before any add hook runs (L8: possession's new side, the taunter of a Taunted unit);
@@ -522,7 +520,7 @@ or rejects one, it moves to "Off the list".
 - **#162 System packs.**
   - A versioned file bundling a system (with its parent chain), its status definitions, templates, partials, macros and tables.
   - Servers can share a ruleset and upgrade it.
-  - Per-server storage (#41) has shipped; the pack still needs #140.
+  - Per-server storage (#41) and system status definitions, tables and macros (#140) have shipped.
 - **#163 Read-only web viewer.** A browser page showing a match's live map from the scene model, with per-team views behind a link token. Needs a web server and real security design.
 
 ### New

@@ -22051,7 +22051,7 @@ SCENARIO 759 — System libraries: promote from a match, !match sync, undo, rest
 !match sync funcs nothere
 ?? ❌ system `default` has no formula function `nothere`
 !match sync spells
-?? ❌ `spells` — sync one of: aliases, tiles, funcs, all.
+?? ❌ `spells` — sync one of: aliases, tiles, funcs, statuses, tables, macros, all.
 !match sync all calc
 ?? ❌
 ?tab "!system func info default ca"
@@ -28585,3 +28585,214 @@ colour; active_unit_image_highlight false drops the image outline only).
 The head's own turn marks the dragon's 2x2 body that draws it (`!map scene
 list` names the acting placement). A team view that can't see the actor
 (red can't see the fogged blue scout) gets no line.
+
+SCENARIO 896 — System status definitions: edited on the system, inherited, copied into a new match
+----------------------------------------------------------------------------------------------------
+
+!system new base
+!system status def base burn
+?? Set its effect with `!system status tick base burn "<formula>"`.
+!system status tick base burn "entity[self].hp = entity[self].hp - 2"
+!system status when base burn turn_start
+!system status maxlevel base burn 3
+!system status data base burn level 1
+!system status tags base burn fire
+!system status hook base burn on_added "log('burning')"
+!system status display base burn "{name} x{level}"
+!system status def base wet
+!system status removes base wet tag:fire
+?tab "!system status tick base b"
+?? → '!system status tick base burn '
+!system status list base
+?? - `burn` (when=turn_start, max_lvl=3)
+?? - `wet` (when=turn_end, no tick)
+!system new night parent=base
+!system status stack night burn add_level
+!system status list night
+?? - `burn` (when=turn_start, stack=add_level, max_lvl=3)
+?? - `wet` (when=turn_end, no tick) (inherited)
+!system status del night wet
+?? it hides the inherited one; `!system unset night status_definitions:wet` brings it back
+!system status info night wet
+?? ❌ status definition `wet` isn't defined on system `night`.
+!system status list night
+?? Hidden here: `wet`
+!system status info base burn
+?? "tick_when": "turn_start"
+?? "on_added": "log('burning')"
+!match new nm Night 8 6 system=night
+!match use nm
+!ent add k Knight 20 2 2 10
+!status apply k burn
+!status apply k burn
+?? Applied `burn` to `k` (level=2
+!status list
+?? - `burn` (when=turn_start, stack=add_level, max_lvl=3)
+?! wet
+!assert "status_get('k', 'burn', 'level') == 2"
+!turn next
+!assert "entity[k].hp == 18"
+!system unset night status_definitions:wet
+!system status list night
+?? - `wet` (when=turn_end, no tick) (inherited)
+!match new bm Base 8 6 system=base
+!match use bm
+!status list
+?? - `burn` (when=turn_start, max_lvl=3)
+?? - `wet` (when=turn_end, no tick)
+
+Expected: HARNESS-ALLOWS-ERRORS. `!system status <action> <system> ...`
+runs every definition subcommand of `!status` on a system's library. The
+child `night` inherits `burn` and `wet`; setting burn's stack mode there
+makes it night's own (the list stops marking it inherited); deleting `wet`
+hides it until `!system unset` brings it back. A new match on night starts
+with night's effective definitions: two applications add a level
+(add_level), and the turn-start tick takes 2 hp. A match on base gets
+base's definitions, stack mode unset.
+
+SCENARIO 897 — System tables and macros: inherited, promoted, renamed, copied into a new match
+-----------------------------------------------------------------------------------------------
+
+!system new lib
+!system table def lib loot gold:3,sword:1
+?? Defined table `loot` = `gold:3,sword:1` on `lib`.
+!system macro set lib dmg "!ent hp $1 -$2\n!ent info $1"
+?? Saved macro `dmg` (2 line(s)) on `lib`.
+!system new lib2 parent=lib
+!system table list lib2
+?? - `loot`: `gold:3,sword:1` (inherited)
+!system macro show lib2 dmg
+?? **macro `dmg`** on `lib2` (inherited)
+!system macro copy lib2 dmg hurt
+!system macro list lib2
+?? - `dmg`: `!ent hp $1 -$2` (inherited)
+?? - `hurt`: `!ent hp $1 -$2`
+!system table rename lib loot spoils
+?? Renamed table `loot` to `spoils` on `lib`.
+!match new tm T 6 6 system=lib2
+!match use tm
+!ent add o Orc 12 2 2
+!macro list
+?? Macros: `dmg`, `hurt`
+!macro run hurt o 5
+?? HP: 7/12
+!table roll spoils
+?? 🎲 table `spoils` →
+!assert "table_roll('spoils') in ['gold', 'sword']"
+!table def herbs mint:1,sage:1
+!macro set heal "!ent hp $1 +$2"
+!system table promote lib2 herbs
+?? Promoted table `herbs` from match `tm` to `lib2`. New matches get it; live ones with `!match sync`.
+!system macro promote lib heal
+!system macro show lib2 heal
+?? **macro `heal`** on `lib2` (inherited)
+!system table list lib2
+?? - `herbs`: `mint:1,sage:1`
+?? - `spoils`: `gold:3,sword:1` (inherited)
+!system info lib2
+?? - tables: 2 (1 set here)
+?? - macros: 3 (1 set here)
+!system diff lib lib2
+?? - tables only in `lib2`: `herbs`
+?? - macros only in `lib2`: `hurt`
+!as restart
+!system macro list lib2
+?? - `heal`: `!ent hp $1 +$2` (inherited)
+?? - `hurt`: `!ent hp $1 -$2`
+
+Expected: `!system table` (the `!table` grammar: def) and `!system macro`
+(the `!macro` grammar: set) keep a system's tables and macros, inherited
+by child systems like the other libraries. A new match on lib2 starts with
+lib2's effective tables and macros and runs them (`hurt` takes 5 hp from
+the orc; `spoils` rolls). `promote` copies a match's table or macro into a
+system. Both libraries survive a restart.
+
+SCENARIO 898 — !match sync statuses / tables / macros into a live match, diff, undo
+------------------------------------------------------------------------------------
+
+!system new sy
+!match new sm S 6 6 system=sy
+!match use sm
+!ent add a A 10 2 2
+!status def burn
+!status maxlevel burn 5
+!status apply a burn 4
+!table def loot gold:1
+!macro set only "!roll 1d4"
+!system status def sy burn
+!system status maxlevel sy burn 2
+!system status def sy chill
+!system table def sy loot gold:1
+!system table def sy gems ruby:1,pearl:2
+!system macro set sy setup "!roll 1d6"
+!match sync statuses diff
+?? statuses: would add `chill`; would replace `burn`.
+?? `burn`: max_level: 5 → 2
+!assert "status_get('a', 'burn', 'level') == 4"
+!match sync statuses burn
+?? statuses: replaced `burn`.
+!assert "status_get('a', 'burn', 'level') == 2"
+!status list
+?! chill
+!match sync all
+?? statuses: added `chill`; 1 already the same.
+?? tables: added `gems`; 1 already the same.
+?? macros: added `setup`.
+!macro list
+?? Macros: `only`, `setup`
+!table list
+?? - `gems`: ruby:1,pearl:2
+!undo command
+!table list
+?! gems
+!macro list
+?! setup
+!match sync macros nope
+?? ❌ system `sy` has no macro `nope`.
+
+Expected: HARNESS-ALLOWS-ERRORS. `!match sync statuses|tables|macros
+[name]` copies the system's entries over the live match's, keeping
+match-only ones (`only`). A synced status definition with a lower
+max_level lowers the live instance (burn 4 → 2), as `!status maxlevel`
+does. `diff` shows the change first and changes nothing; undo takes a sync
+back.
+
+SCENARIO 899 — System status / table / macro refusals and lint
+--------------------------------------------------------------
+
+!system new bad
+!system status def bad sting
+!system status tick bad sting "zap(1)"
+?? ⚠️ Function 'zap' isn't a built-in or a `!func` on this system or its matches yet; it fails until one is defined.
+!system status hook bad sting on_removed "import os"
+?? ❌ Invalid on_removed formula:
+!system status tick nosystem sting "x = 1"
+?? ❌
+!system status when bad nosuch turn_end
+?? ❌ No status definition `nosuch`.
+!system status stack bad sting sideways
+?? ❌ stack mode must be one of
+!system table def bad t gold:x
+?? ❌ invalid table spec
+!system macro set bad m "if 1\n!roll 1d4"
+?? ❌ macro structure error
+!system macro promote bad nothing
+?? ❌ No active match
+!system table info bad nothing
+?? ❌ table `nothing` isn't defined on system `bad`.
+!system status apply bad sting
+?? ❌ Unexpected `apply bad sting`
+!system lint bad
+?? ⚠️ status `sting` tick: calls `zap`, which isn't in the system's functions
+!system func def bad zap n "n + 1"
+!system lint bad
+?? all clean
+!system status info bad sting
+?? "tick": "zap(1)"
+
+Expected: HARNESS-ALLOWS-ERRORS. A system status tick calling a function
+the system lacks is stored with a ⚠️ (a match may define it), a
+disallowed construct is refused; unknown definitions, stack modes, table
+specs and broken macro structure are refused as on a match. `!system
+lint` lists the system's status ticks and hooks; once the system defines
+`zap` it is clean.
